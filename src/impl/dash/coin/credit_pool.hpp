@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+/// Phase C-TEMPLATE step 13: DIP-0027 credit-pool state machine.
+///
+/// Tracks the running creditPoolBalance reported in CCbTx.creditPoolBalance
+/// (CCbTx.VERSION_CLSIG_AND_BALANCE / version 3+).
+///
+/// Per-block delta from dashcore evo/creditpool.cpp::DiffFromBlock:
+///   For each tx in the block (excluding coinbase):
+///     - Type 8 (TRANSACTION_ASSET_LOCK):
+///         pool += sum(payload.creditOutputs.value)
+///     - Type 9 (TRANSACTION_ASSET_UNLOCK):
+///         pool -= payload.fee + sum(tx.vout.value)
+///                                      // dashd unlocks the GROSS amount:
+///                                      // the withdrawal vouts PLUS the
+///                                      // payload.fee. The fee is paid to
+///                                      // the miner via the coinbase, but
+///                                      // it still LEAVES the pool, so it
+///                                      // is part of the deduction.
+///                                      // Verified against mainnet
+///                                      // 2,166,498 (4 unlocks, fee=190
+///                                      // each): cbTx creditPoolBalance
+///                                      // steps by −(Σvout + Σfee), not
+///                                      // −Σvout. See the KAT in
+///                                      // test_dash_coin_state_maintainer.
+///
+/// Bootstrap: seed from the first observed CCbTx.creditPoolBalance
+/// before applying any deltas (similar pattern to MnStateMachine
+/// bootstrap from snapshot). Persistence via CreditPoolDb (sister of
+/// SMLDb / QuorumDb / MnStateDb).
+///
+/// At MVP (this commit): in-memory only. Persistence + sentinel
+/// cross-check land in step 13b. Cold-start re-seeds from the first
+/// post-restart observed CCbTx.
+
+#include <impl/dash/coin/vendor/assetlock.hpp>
+#include <impl/dash/coin/vendor/cbtx.hpp>
+#include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/block.hpp>
+
+#include <core/log.hpp>
+
+#include <cstdint>
+#include <optional>
+
+namespace dash {
+namespace coin {
+
+class CreditPool
+{
+public:
+    /// Apply a block to the pool. Returns the per-block delta on
+    /// success, or std::nullopt if the pool is uninitialized (no seed
+    /// observed yet — caller should seed from CCbTx.creditPoolBalance).
+    ///
+    /// reward_accrual is the platform-reward term dashcore adds to the credit
+    /// pool for this block (evo/creditpool.cpp folds the DIP-0027 platform
+    /// share locked at block N on top of the asset-lock/unlock deltas):
+    ///   creditPoolBalance(N) = creditPoolBalance(N-1)
+    ///                          + reward_accrual (platform share locked at N)
+    ///                          + Σ assetLocks(N) − Σ assetUnlocks(N)
+    /// The asset terms are walked from block.m_txs here; the caller supplies
+    /// reward_accrual (compute_dash_platform_reward_post_v20_mn_rr(N)) since
+    /// this state machine deliberately holds no subsidy schedule. Defaults to
+    /// 0 (pure DiffFromBlock accrual) so existing callers are unchanged.
+    std::optional<int64_t> apply_block(
+        const BlockType& block, uint32_t height, int64_t reward_accrual = 0)
+    {
+        if (!m_initialized) return std::nullopt;
+
+        int64_t delta = reward_accrual;
+        size_t locks = 0, unlocks = 0;
+
+        // Skip cb (index 0) — it's the special-tx-5 CCbTx itself,
+        // which doesn't carry asset-lock/unlock payloads.
+        for (size_t i = 1; i < block.m_txs.size(); ++i) {
+            const auto& tx = block.m_txs[i];
+            if (tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE
+                && !tx.extra_payload.empty()) {
+                vendor::CAssetLockPayload p;
+                if (vendor::parse_assetlock_payload(tx.extra_payload, p)) {
+                    delta += p.total_credit();
+                    ++locks;
+                }
+                // parse failures already log; skip the tx for accounting
+            } else if (tx.type == vendor::CAssetUnlockPayload::SPECIALTX_TYPE) {
+                // For unlocks, the deduction is payload.fee + sum of vout
+                // values: dashd's DiffFromBlock removes the GROSS unlock
+                // amount from the pool — the withdrawal vouts plus the
+                // miner fee carried in the payload (the fee reaches the
+                // miner through the coinbase, not back into the pool).
+                // The payload parse is therefore REQUIRED for the balance
+                // math, not just diagnostics: without the fee term the
+                // running balance drifts by Σfee at every unlock block
+                // (mainnet 2,166,498 KAT: 4 unlocks × fee 190 = 760).
+                int64_t out_sum = 0;
+                for (const auto& v : tx.vout) out_sum += v.value;
+                delta -= out_sum;
+                ++unlocks;
+                vendor::CAssetUnlockPayload up;
+                if (!tx.extra_payload.empty()
+                    && vendor::parse_assetunlock_payload(tx.extra_payload, up)) {
+                    delta -= static_cast<int64_t>(up.fee);
+                } else {
+                    // Fee unknown → our balance will run HIGH by that fee.
+                    // Log loudly; the maintainer's per-block cross-check
+                    // against the cbTx-committed balance (ACCRUAL DRIFT,
+                    // fail-closed re-seed) is the backstop.
+                    LOG_WARNING << "[CREDITPOOL] h=" << height
+                                << " type-9 unlock payload unparseable — "
+                                   "fee term missing from delta (balance "
+                                   "may drift high until re-seed)";
+                }
+            }
+        }
+
+        m_balance += delta;
+        m_height = height;
+
+        if (delta != 0 || locks != 0 || unlocks != 0) {
+            LOG_INFO << "[CREDITPOOL] h=" << height
+                     << " delta=" << delta
+                     << " reward=" << reward_accrual
+                     << " locks=" << locks
+                     << " unlocks=" << unlocks
+                     << " balance=" << m_balance;
+        }
+        return delta;
+    }
+
+    /// Seed the pool from an observed CCbTx.creditPoolBalance. The
+    /// CCbTx field reports the balance AFTER applying that block's
+    /// activity, so on the next block we apply deltas on top of this.
+    void seed(int64_t balance, uint32_t height)
+    {
+        m_balance     = balance;
+        m_height      = height;
+        m_initialized = true;
+        LOG_INFO << "[CREDITPOOL] seeded h=" << height
+                 << " balance=" << balance;
+    }
+
+    int64_t balance() const { return m_balance; }
+    uint32_t height() const { return m_height; }
+    bool initialized() const { return m_initialized; }
+
+    void clear()
+    {
+        m_balance = 0;
+        m_height = 0;
+        m_initialized = false;
+    }
+
+private:
+    int64_t  m_balance{0};
+    uint32_t m_height{0};
+    bool     m_initialized{false};
+};
+
+} // namespace coin
+} // namespace dash

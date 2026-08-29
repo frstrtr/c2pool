@@ -1,0 +1,14 @@
+# T16 proof-cache memory  W=300000 requests=300000 zipf=1.1 churn=1/50 seed=20260627
+# build=1.42s  logW=19  proof_entry≈672B  roots=8
+C=     0  mem=   0.00MB  hit(bucket-inval)=  0.0%  hit(any-mut-inval)=  0.0%  gen_calls= 300000  mut=6000  inval_b=0  inval_any=0  (0.7s)
+C=  1000  mem=   0.67MB  hit(bucket-inval)= 64.6%  hit(any-mut-inval)= 23.0%  gen_calls= 106177  mut=6000  inval_b=25557  inval_any=230934  (1.2s)
+C=  5000  mem=   3.36MB  hit(bucket-inval)= 76.7%  hit(any-mut-inval)= 23.0%  gen_calls=  69897  mut=6000  inval_b=25557  inval_any=230934  (4.0s)
+C= 20000  mem=  13.44MB  hit(bucket-inval)= 83.9%  hit(any-mut-inval)= 23.0%  gen_calls=  48441  mut=6000  inval_b=25557  inval_any=230934  (9.3s)
+C= 80000  mem=  53.76MB  hit(bucket-inval)= 84.0%  hit(any-mut-inval)= 23.0%  gen_calls=  48134  mut=6000  inval_b=25557  inval_any=230934  (9.8s)
+# NOTE proof a path of 32B sibling hashes; leaf payload size is irrelevant to proof size (T11). Cache value is bounded by churn-driven staleness, not by RAM.
+# T16 proof-cache memory  W=300000 requests=300000 zipf=1.1 churn=1/10 seed=20260627
+# build=1.16s  logW=19  proof_entry≈672B  roots=8
+C=     0  mem=   0.00MB  hit(bucket-inval)=  0.0%  hit(any-mut-inval)=  0.0%  gen_calls= 300000  mut=30000  inval_b=0  inval_any=0  (0.9s)
+C=  5000  mem=   3.36MB  hit(bucket-inval)= 76.7%  hit(any-mut-inval)=  8.7%  gen_calls=  70034  mut=30000  inval_b=25356  inval_any=273852  (13.6s)
+C= 20000  mem=  13.44MB  hit(bucket-inval)= 83.9%  hit(any-mut-inval)=  8.7%  gen_calls=  48381  mut=30000  inval_b=25356  inval_any=273852  (39.0s)
+# NOTE proof a path of 32B sibling hashes; leaf payload size is irrelevant to proof size (T11). Cache value is bounded by churn-driven staleness, not by RAM.

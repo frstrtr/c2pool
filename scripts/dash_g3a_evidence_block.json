@@ -1,0 +1,20 @@
+{
+  "gate": "G3a",
+  "coin": "DASH",
+  "claim": "POPULATED regtest block built+serialized+submitted by c2pool-dash (submitblock-RPC arm), not dashd generatetoaddress",
+  "regtest": {"host": "192.168.86.52:29998", "isolated": true},
+  "block_hash": "16bff8207902ed6bc3e842352627573ee434fda852ae882050acf1f47e607694",
+  "height": 268,
+  "block_bytes": 957,
+  "x11_nonce": 1,
+  "tx_count": 4,
+  "payload_txs": {
+    "T2_p2sh_multisig_plus_nulldata": "52c0f7c553744237c34e8088089ae1a5b465456cee8bec121aba1fb7e4d0bd72",
+    "T3_p2sh_multisig": "7dccea43066deb546738a391ab6cb37641b6d0d1823f4290c1e5011af232b2ef",
+    "T4_p2pkh": "9a7ff1ffec0e20e76d6f0c27d245cf0e0f7323d101a70669169c103361ee5807"
+  },
+  "script_types_present": ["pubkeyhash", "scripthash", "nulldata"],
+  "coinbase_outputs": 3,
+  "note": "DASH has no SegWit (X11) — diverse mix is non-witness; coinbase carries masternode payment split (DIP). dashd submitblock ACCEPTED; tip 267->268.",
+  "assertions": ["A1 populated", "A2 payload survived c2pool serialize->submitblock", "A3 diverse script types", "A4 coinbase masternode split"]
+}

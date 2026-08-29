@@ -1,0 +1,1997 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <functional>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <deque>
+#include <future>
+#include <set>
+#include <map>
+#include <unordered_map>
+#include <array>
+#include <iomanip>
+#include <sstream>
+#include <ctime>
+
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include <nlohmann/json.hpp>
+#include <jsonrpccxx/server.hpp>
+
+#include <core/log.hpp>
+#include <core/uint256.hpp>
+#include <core/mining_node_interface.hpp>
+#include <core/address_validator.hpp>
+#include <core/hashrate_ring.hpp>
+#include <core/featured_node.hpp>
+#include <core/stratum_types.hpp>
+#include <core/stratum_work_source.hpp>
+#include <c2pool/payout/payout_manager.hpp>
+#include <c2pool/hashrate/tracker.hpp>
+#include <core/address_utils.hpp>
+#include <core/graph_history.hpp>
+
+// Forward declaration for merged mining integration
+namespace c2pool { namespace merged { class MergedMiningManager; } }
+
+// Bring the address validation types into the core namespace for convenience
+using Blockchain = c2pool::address::Blockchain;
+using Network = c2pool::address::Network;
+using AddressValidationResult = c2pool::address::AddressValidationResult;
+using BlockchainAddressValidator = c2pool::address::BlockchainAddressValidator;
+
+// Forward declarations for optional coin daemon integration (avoid layering violation)
+namespace core { namespace coin { struct ICoinNode; } }
+
+namespace core {
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace net = boost::asio;
+using tcp = net::ip::tcp;
+
+// Forward declarations
+class MiningInterface;
+class StratumServer;
+
+/// HTTP Session handler for incoming connections
+class HttpSession : public std::enable_shared_from_this<HttpSession>
+{
+    tcp::socket socket_;
+    beast::flat_buffer buffer_;
+    http::request<http::string_body> request_;
+    std::shared_ptr<MiningInterface> mining_interface_;
+
+public:
+    explicit HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
+    void run();
+
+private:
+    void read_request();
+    void process_request();
+    void send_response(http::response<http::string_body> response);
+    void handle_error(beast::error_code ec, char const* what);
+};
+
+/// Best-tip snapshot of the sharechain.
+///
+/// Producer is internal (share tracker). Consumers are both internal
+/// (work refresh, delta precompute) and external (REST `/sharechain/tip`,
+/// SSE push). The struct is the authoritative representation; JSON is
+/// produced only at the external edge via `to_json()`.
+///
+/// `std::optional<SharechainTip>` — preferred over a sentinel value — is
+/// the canonical "no tip yet" signal. Callers that dereference without
+/// checking are a compile error, eliminating the whole class of null-JSON
+/// `.value()` crashes that arise when consuming an uninitialized cache.
+struct SharechainTip {
+    std::string hash;       // short-hex (16 chars) of the best head
+    int64_t     height = 0;
+    int32_t     total  = 0; // total shares known to the tracker
+};
+
+/// Serialize an optional tip to the wire JSON.  Absent tip preserves the
+/// legacy REST shape `{"hash":"","height":-1,"total":0}` so existing
+/// clients (dashboards, SSE subscribers) keep working unchanged.
+inline nlohmann::json to_json(const std::optional<SharechainTip>& tip)
+{
+    if (!tip)
+        return nlohmann::json::object({{"hash", ""}, {"height", -1}, {"total", 0}});
+    return nlohmann::json::object({
+        {"hash",   tip->hash},
+        {"height", tip->height},
+        {"total",  tip->total},
+    });
+}
+
+/// Stratum mining configuration — tuneable from CLI, YAML, or API.
+// Hoisted to core::stratum (see core/stratum_types.hpp). Alias kept here
+// so existing references to `core::StratumConfig` resolve transparently.
+using StratumConfig = core::stratum::StratumConfig;
+
+/// Mining interface that provides RPC methods for miners.
+///
+/// Implements `core::stratum::IWorkSource` so the same `core::StratumServer`
+/// can drive both LTC's `MiningInterface` and BTC's `btc::stratum::
+/// BTCWorkSource`. The IWorkSource methods on this class are annotated
+/// `override`. See `core/stratum_work_source.hpp` for the contract.
+class MiningInterface : public jsonrpccxx::JsonRpc2Server,
+                        public core::stratum::IWorkSource
+{
+public:
+    MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr, Blockchain blockchain = Blockchain::LITECOIN);
+    ~MiningInterface();
+
+    // Core mining methods that miners expect
+    nlohmann::json getwork(const std::string& request_id = "");
+    nlohmann::json submitwork(const std::string& nonce, const std::string& header, const std::string& mix, const std::string& request_id = "");
+    nlohmann::json getblocktemplate(const nlohmann::json& params = nlohmann::json::array(), const std::string& request_id = "");
+    nlohmann::json submitblock(const std::string& hex_data, const std::string& request_id = "");
+
+    // Recent-won-block dedup (#886). Keyed on the BLOCK HASH (SHA256d of the
+    // 80-byte header), NOT the prev-hash: many distinct valid blocks share one
+    // prev, so a prev-hash key drops real winnable blocks. Membership is
+    // recorded ONLY on a SUCCESSFUL submit, so a failed submit leaves the block
+    // eligible for resubmission by the next share. Bounded FIFO, own mutex
+    // (mining_submit runs on many stratum session threads). Public for KATs.
+    bool already_submitted_block(const uint256& block_hash) const;
+    void mark_block_submitted(const uint256& block_hash);
+    
+    // Pool stats and info methods
+    nlohmann::json getinfo(const std::string& request_id = "");
+    nlohmann::json getstats(const std::string& request_id = "");
+    nlohmann::json getpeerinfo(const std::string& request_id = "");
+
+    // p2pool-compatible REST endpoints (return plain JSON, not JSON-RPC)
+    nlohmann::json rest_local_rate();
+    nlohmann::json rest_global_rate();
+    nlohmann::json rest_current_payouts();
+    nlohmann::json rest_users();
+    nlohmann::json rest_fee();
+    nlohmann::json rest_recent_blocks();
+    // Coin-generic block-explorer URL prefix (block deep link, DASH first-class).
+    // Honors an operator custom explorer, else the per-coin default; empty when
+    // the coin is unknown so callers emit null rather than a wrong-coin link.
+    std::string block_explorer_prefix() const;
+
+    // THE checkpoint endpoints
+    nlohmann::json rest_checkpoint();    // latest verified checkpoint
+    nlohmann::json rest_checkpoints();   // all checkpoints
+
+    // Current work state for THE checkpoint creation
+    struct CurrentTheState {
+        uint256 the_state_root;
+        uint32_t sharechain_height{0};
+        uint16_t miner_count{0};
+        double pool_hashrate{0};
+    };
+    CurrentTheState get_current_work() const {
+        CurrentTheState s;
+        s.the_state_root = m_cached_the_state_root;
+        s.sharechain_height = m_cached_sharechain_height;
+        s.miner_count = m_cached_miner_count;
+        s.pool_hashrate = m_cached_pool_hashrate;
+        return s;
+    }
+
+    // THE checkpoint management
+    using checkpoint_store_fn_t = std::function<nlohmann::json()>;                  // get latest
+    using checkpoints_all_fn_t = std::function<nlohmann::json()>;                   // get all
+    using checkpoint_verify_fn_t = std::function<bool(const uint256&, uint32_t)>;   // verify state_root
+    using checkpoint_create_fn_t = std::function<void(const std::string& chain, uint64_t height,
+                                                       const std::string& hash, uint64_t ts)>;
+    void set_checkpoint_fns(checkpoint_store_fn_t latest, checkpoints_all_fn_t all_fn,
+                            checkpoint_verify_fn_t verify_fn,
+                            checkpoint_create_fn_t create_fn = {}) {
+        m_checkpoint_latest_fn = std::move(latest);
+        m_checkpoints_all_fn = std::move(all_fn);
+        m_checkpoint_verify_fn = std::move(verify_fn);
+        m_checkpoint_create_fn = std::move(create_fn);
+    }
+
+    // Monitoring endpoints for Qt control panel
+    nlohmann::json rest_uptime();
+    nlohmann::json rest_connected_miners();
+    nlohmann::json rest_stratum_stats();
+    nlohmann::json rest_miner_thresholds();
+    nlohmann::json rest_global_stats();
+    nlohmann::json rest_sharechain_stats();
+    nlohmann::json rest_sharechain_window();
+    // Returns cached+serialized window JSON string (for ETag/cache layer)
+    std::pair<std::string, std::string> get_cached_window_response(); // {json_body, etag}
+    nlohmann::json rest_sharechain_tip();
+    // Typed accessor for internal consumers.  Preferred over
+    // rest_sharechain_tip() inside the server — no stringly-typed field
+    // lookups, and the optional forces the caller to handle "no tip".
+    std::optional<SharechainTip> get_sharechain_tip();
+    nlohmann::json rest_sharechain_delta(const std::string& since_hash);
+    nlohmann::json rest_control_mining_start();
+    nlohmann::json rest_control_mining_stop();
+    nlohmann::json rest_control_mining_restart();
+    nlohmann::json rest_control_mining_ban(const std::string& target);
+    nlohmann::json rest_control_mining_unban(const std::string& target);
+
+    // p2pool-compatible legacy REST endpoints (enable original p2pool dashboards)
+    nlohmann::json rest_local_stats();
+    nlohmann::json rest_p2pool_global_stats();
+    nlohmann::json rest_web_version();
+    nlohmann::json rest_web_currency_info();
+    nlohmann::json rest_payout_addr();
+    nlohmann::json rest_payout_addrs();
+    nlohmann::json rest_web_best_share_hash();
+    nlohmann::json rest_sync_status();
+    bool is_node_ready();  // true when dashboard data is fully available
+
+    // Additional p2pool-compatible REST endpoints (peer network, stale rates, mining details)
+    nlohmann::json rest_rate();                     // /rate — pool hashrate (single number)
+    nlohmann::json rest_difficulty();               // /difficulty — share difficulty (single number)
+    nlohmann::json rest_user_stales();              // /user_stales — per-user stale proportions
+    std::string    rest_peer_addresses();           // /peer_addresses — space-separated peer list (text)
+    nlohmann::json rest_peer_versions();            // /peer_versions — p2pool version per peer
+    nlohmann::json rest_peer_txpool_sizes();        // /peer_txpool_sizes — txpool size per peer
+    nlohmann::json rest_peer_list();                // /peer_list — detailed peer list [{address,version,incoming,uptime,...}]
+    nlohmann::json rest_pings();                    // /pings — ping latency per peer (stub)
+    nlohmann::json rest_stale_rates();              // /stale_rates — {good,orphan,dead} rate breakdown
+    nlohmann::json rest_node_info();                // /node_info — {external_ip,worker_port,p2p_port,network,symbol}
+    nlohmann::json rest_luck_stats();               // /luck_stats — pool luck statistics
+    nlohmann::json rest_ban_stats();                // /ban_stats — current ban statistics
+    nlohmann::json rest_stratum_security();         // /stratum_security — DDoS detection metrics (stub)
+    nlohmann::json rest_miner_stats(const std::string& address);  // /miner_stats/<addr> — detailed per-miner stats
+    nlohmann::json rest_best_share();               // /best_share — node-wide best share (BitAxe style)
+    nlohmann::json rest_miner_payouts(const std::string& address); // /miner_payouts/<addr> — payout history per miner
+    nlohmann::json rest_version_signaling(const nlohmann::json* cached_sc = nullptr); // /version_signaling — V36 version tracking
+    nlohmann::json rest_v36_status();                // /v36_status — V36 diagnostic
+    nlohmann::json rest_patron_sendmany(const std::string& total); // /patron_sendmany/<total> — sendmany text
+    nlohmann::json rest_tracker_debug();             // /tracker_debug — debug sharechain info
+
+    // Merged mining endpoints
+    nlohmann::json rest_merged_stats();              // /merged_stats — merged mining statistics
+    nlohmann::json rest_current_merged_payouts();    // /current_merged_payouts — cached wrapper (legacy shape)
+    nlohmann::json rest_pplns_current();             // /pplns/current — spec §5.1 shape
+    nlohmann::json rest_pplns_miner(const std::string& address);  // /pplns/miner/<addr> — spec §5.2
+    nlohmann::json compute_current_merged_payouts(); // full computation (main thread only)
+    nlohmann::json rest_recent_merged_blocks();      // /recent_merged_blocks — recent merged blocks
+    nlohmann::json rest_all_merged_blocks();         // /all_merged_blocks — all merged blocks
+    nlohmann::json rest_discovered_merged_blocks();  // /discovered_merged_blocks — merged block proofs
+    nlohmann::json rest_broadcaster_status();        // /broadcaster_status — parent chain broadcaster
+    nlohmann::json rest_merged_broadcaster_status(); // /merged_broadcaster_status — merged broadcaster
+    nlohmann::json rest_network_difficulty();         // /network_difficulty — historical network diff
+
+    // /web/ sub-endpoints (share chain inspection)
+    nlohmann::json rest_web_heads();                 // /web/heads
+    nlohmann::json rest_web_verified_heads();        // /web/verified_heads
+    nlohmann::json rest_web_tails();                 // /web/tails
+    nlohmann::json rest_web_verified_tails();        // /web/verified_tails
+    nlohmann::json rest_web_my_share_hashes();       // /web/my_share_hashes
+    nlohmann::json rest_web_my_share_hashes50();     // /web/my_share_hashes50
+    nlohmann::json rest_web_share(const std::string& hash); // /web/share/<hash>
+    nlohmann::json rest_web_payout_address(const std::string& hash); // /web/payout_address/<hash>
+    nlohmann::json rest_web_log_json();              // /web/log — JSON array (p2pool stat_log format)
+    nlohmann::json rest_web_graph_data(const std::string& source, const std::string& view); // /web/graph_data/<source>/<view>
+
+    // Log endpoints for Qt PageLogs — read directly from debug.log
+    std::string rest_web_log();
+    std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
+
+    // WHO FOUND THE BLOCK. Three states, not two: a coin lane that has not
+    // been taught to label its call sites must say so, not inherit a default
+    // that reads as a claim. A two-valued bool defaulting to "not us" would
+    // make every LTC/DGB/BTC/BCH block announce a sharechain peer as its
+    // finder — the same false certainty this whole field exists to retire.
+    // Ordering is deliberate: the values increase with how much is known, so
+    // an enrichment pass can only ever raise the record (see the merge in
+    // record_found_block), never quietly downgrade a known finder.
+    enum class BlockAuthorship : uint8_t {
+        unknown         = 0,  // this coin lane does not label its call sites
+        sharechain_peer = 1,  // another node's template won
+        this_node       = 2,  // we built the template and dispatched it
+    };
+
+    // Track a found block for the /recent_blocks endpoint.
+    // Extended overload captures dashboard-enriched fields at record time.
+    void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0,
+                            const std::string& chain = "LTC",
+                            const std::string& miner = "",
+                            const std::string& share_hash = "",
+                            double network_difficulty = 0,
+                            double share_difficulty = 0,
+                            double pool_hashrate = 0,
+                            uint64_t subsidy = 0,
+                            // WHO FOUND IT — set at the call site that knows.
+                            // `this_node` from the local won-block dispatch;
+                            // `sharechain_peer` from the gossiped-share path
+                            // (another node's template won, so nothing this
+                            // node pins or serves is in it). A coin lane that
+                            // has not labelled its sites leaves `unknown`,
+                            // which reports as unknown and never as a claim.
+                            BlockAuthorship authorship =
+                                BlockAuthorship::unknown);
+    
+    // Boundary types hoisted to core::stratum (see core/stratum_types.hpp).
+    // Aliases kept here so existing references like `MiningInterface::JobSnapshot`
+    // continue to resolve. Not needed for IWorkSource extraction itself —
+    // these are convenience aliases for the existing call sites.
+    using RefHashResult = core::stratum::RefHashResult;
+    using JobSnapshot   = core::stratum::JobSnapshot;
+    nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
+    nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
+    nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "",
+        const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses = {},
+        const JobSnapshot* job = nullptr) override;
+
+    // Enhanced coinbase and validation methods
+    nlohmann::json validate_address(const std::string& address);
+    nlohmann::json build_coinbase(const nlohmann::json& params);
+    nlohmann::json validate_coinbase(const std::string& coinbase_hex);
+    nlohmann::json getblockcandidate(const nlohmann::json& params = nlohmann::json::object());
+
+    // Address validation
+    bool is_valid_address(const std::string& address) const;
+    
+    // Get current blockchain and network configuration
+    Blockchain get_blockchain() const { return m_blockchain; }
+    Network get_network() const { return m_testnet ? Network::TESTNET : Network::MAINNET; }
+    
+    // Access to address validator (for Stratum sessions)
+    const BlockchainAddressValidator& get_address_validator() const { return m_address_validator; }
+    
+    // Access to payout manager (for Stratum sessions)
+    c2pool::payout::PayoutManager* get_payout_manager() const { return m_payout_manager.get(); }
+    
+    // Difficulty calculation utilities
+    double calculate_share_difficulty(const std::string& job_id, const std::string& extranonce1,
+                                     const std::string& extranonce2, 
+                                     const std::string& ntime, const std::string& nonce) const;
+    double calculate_share_difficulty(const std::string& coinb1, const std::string& coinb2,
+                                     const std::string& extranonce1, const std::string& extranonce2,
+                                     const std::string& ntime, const std::string& nonce) const;
+
+    // Fully self-contained difficulty calculation: all template data passed in.
+    // Does NOT acquire m_work_mutex — safe to call from any thread.
+    static double calculate_share_difficulty(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches);
+
+    /// IWorkSource virtual override: LTC uses scrypt, so delegate to the
+    /// existing scrypt-based static `calculate_share_difficulty` directly.
+    /// (BTC's BTCWorkSource overrides with a SHA256d implementation.)
+    double compute_share_difficulty(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) const override
+    {
+        return calculate_share_difficulty(coinb1, coinb2, extranonce1, extranonce2,
+                                          ntime, nonce, version, prevhash_hex,
+                                          nbits_hex, merkle_branches);
+    }
+
+    // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
+    void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = thread_safe_wrap(std::move(fn)); }
+    std::function<uint256()> get_best_share_hash_fn() const override { return m_best_share_hash_fn; }
+
+    // Hook: walk back from best_share to find nearest peer share for work template.
+    // Ensures c2pool shares extend the main chain, not local forks.
+    using find_peer_prev_fn_t = std::function<uint256(const uint256&)>;
+    void set_find_peer_prev_fn(find_peer_prev_fn_t fn) { m_find_peer_prev_fn = std::move(fn); }
+    find_peer_prev_fn_t get_find_peer_prev_fn() const { return m_find_peer_prev_fn; }
+
+    // Hook: computes PPLNS expected payouts from the share tracker
+    using pplns_fn_t = std::function<std::map<std::vector<unsigned char>, double>(
+        const uint256& best_hash, const uint256& block_target,
+        uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
+    void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = thread_safe_wrap(std::move(fn)); }
+    // Direct current-payouts source (#939). Coins whose payout set is NOT
+    // derivable from the web coinbase-builder PPLNS cache (e.g. DASH, which
+    // wires no set_payout_manager feed) inject it here; when set and non-empty
+    // it is the authoritative source for /current_payouts. Unset -> unchanged
+    // (cache, then PayoutManager fallback). Contract owned by the web layer;
+    // the per-coin feed is wired by that coin's node (cross-steward).
+    void set_current_payouts_fn(std::function<nlohmann::json()> fn) { m_current_payouts_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Hook: computes the p2pool ref_hash for a given coinbase scriptSig.
+    // Returns (ref_hash, last_txout_nonce) pair.  The ref_hash depends on
+    // the share tracker state (prev_share, absheight, abswork, etc.) and
+    // the miner's payout address (implicit via existing connection state).
+    // Called per-connection during work generation.
+    using ref_hash_fn_t = std::function<RefHashResult(
+        const uint256& prev_share_hash,
+        const std::vector<unsigned char>& coinbase_scriptSig,
+        const std::vector<unsigned char>& payout_script,
+        uint64_t subsidy, uint32_t bits, uint32_t timestamp,
+        bool segwit_active, const std::string& witness_commitment_hex,
+        const uint256& witness_root,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        const std::vector<uint256>& merkle_branches)>;
+    void set_ref_hash_fn(ref_hash_fn_t fn) { m_ref_hash_fn = std::move(fn); }
+
+    // Atomically snapshot work-related fields under m_work_mutex.
+    // Used by StratumSession to freeze consistent state matching the coinbase.
+    // (Hoisted to core::stratum::WorkSnapshot — see core/stratum_types.hpp.)
+    using WorkSnapshot = core::stratum::WorkSnapshot;
+
+    // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
+    // then generates coinb1/coinb2 with full output set including OP_RETURN.
+    // prev_share_hash is frozen at the caller and passed in to avoid race conditions.
+    // Also returns work snapshot atomically (under same lock) to prevent race with refresh_work.
+    // Returns (coinb1, coinb2) or empty strings if not possible.
+    using CoinbaseResult = core::stratum::CoinbaseResult;
+    CoinbaseResult build_connection_coinbase(
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
+
+    // Hook: called by mining_submit() pool path to create a share in the tracker.
+    // All block template data needed by create_local_share() is passed through.
+    struct ShareCreationParams {
+        std::string miner_address;  // Stratum username (human-readable address)
+        std::vector<unsigned char> payout_script;
+        std::map<uint32_t, std::vector<unsigned char>> merged_addresses;
+        uint32_t block_version{0};
+        uint256  prev_block_hash;
+        uint32_t timestamp{0};
+        uint32_t bits{0};          // share chain target bits (share.m_bits)
+        uint32_t block_bits{0};   // GBT block difficulty (min_header.m_bits in the 80-byte header)
+        uint32_t nonce{0};
+        std::vector<unsigned char> coinbase_scriptSig;  // BIP34 height + pool tag
+        uint64_t subsidy{0};
+        std::vector<uint256> merkle_branches;
+        int stale_info{0};  // 0=none, 253=orphan, 254=doa
+        bool segwit_active{false};
+        std::string witness_commitment_hex;  // P2Pool witness commitment script hex
+        uint256 witness_root;                // raw wtxid merkle root (for SegwitData)
+        std::vector<unsigned char> full_coinbase_bytes;  // actual mined coinbase TX for hash_link
+        std::vector<unsigned char> message_data;         // optional V36 authority message blob
+        uint256 prev_share_hash;  // share chain tip at work-generation time
+
+        // Frozen share fields from ref_hash_fn (template creation time).
+        // These MUST match what was used to compute the ref_hash in the coinbase.
+        // If create_local_share recomputes them from current tracker state,
+        // they may differ → ref_hash mismatch → peer rejection.
+        uint32_t frozen_absheight{0};
+        uint128  frozen_abswork;
+        uint256  frozen_far_share_hash;
+        uint32_t frozen_max_bits{0};
+        uint32_t frozen_bits{0};     // share target at template time
+        uint32_t frozen_timestamp{0};
+        uint256  frozen_merged_payout_hash;
+        std::vector<uint256> frozen_merkle_branches;  // segwit txid_merkle_link branches at template time
+        uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
+        std::vector<unsigned char> frozen_merged_coinbase_info;  // pre-serialized MergedCoinbaseEntry vector
+        bool     has_frozen_fields{false};  // true if the above are valid
+
+        // AutoRatchet share version (V35 or V36) — determined at template time
+        int64_t  share_version{36};
+        uint64_t desired_version{36};
+    };
+    using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
+    void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }
+
+    // Operator-controlled V36 message blob to embed into locally created shares.
+    // Empty means no message_data in locally produced shares.
+    void set_operator_message_blob(const std::vector<unsigned char>& blob);
+    std::vector<unsigned char> get_operator_message_blob() const;
+
+    // Coinbase scriptSig customization (--coinbase-text)
+    void set_coinbase_text(const std::string& text) { m_coinbase_text = text; }
+    const std::string& get_coinbase_text() const { return m_coinbase_text; }
+
+    // Load transition message blobs from a directory (*.hex files).
+    // Decrypts and caches messages for display in the transition banner.
+    void load_transition_blobs(const std::string& dir_path);
+
+    // ── Featured developer-node banner (signed authority subtype 0x06) ──
+    // Consensus-neutral service/presentation feature: freshest-wins over a
+    // monotonic signed seq, replay-protected, persisted across restarts.
+    // All ingestion is downstream of authority verification; deleting this
+    // block cannot affect a single share, target, or payout.
+    void set_featured_node_state_path(const std::string& path) { m_featured_node.set_path(path); }
+    void load_featured_node_state() { m_featured_node.load(); }
+    bool apply_featured_node_message(uint64_t seq, uint32_t timestamp,
+                                     const std::string& payload_json,
+                                     const std::string& signer_pubkey_hex) {
+        return m_featured_node.apply(seq, timestamp, payload_json, signer_pubkey_hex);
+    }
+    // Verify (MAC+ECDSA+pinned-pubkey) an authority blob, then apply any
+    // MSG_FEATURED_NODE messages it carries. Forged/unsigned/wrong-key/
+    // tampered blobs are rejected here and never reach the seq comparator.
+    void scan_blob_for_featured_node(const std::vector<unsigned char>& blob);
+    nlohmann::json featured_node_json() const { return m_featured_node.emit(); }
+
+    // Hook: expose decoded protocol messages (e.g. from current best share)
+    // through API methods for dashboard/monitoring clients.
+    using protocol_messages_fn_t = std::function<nlohmann::json()>;
+    void set_protocol_messages_fn(protocol_messages_fn_t fn) { m_protocol_messages_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Integrated merged mining manager
+    void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
+    c2pool::merged::MergedMiningManager* get_mm_manager() const { return m_mm_manager; }
+
+    // Cached merged header info — built atomically with mm_commitment
+    struct CachedMergedHeaderInfo {
+        uint32_t chain_id{0};
+        uint64_t coinbase_value{0};
+        uint32_t block_height{0};
+        std::vector<unsigned char> block_header;
+        std::vector<uint256> coinbase_merkle_branches;
+        std::vector<unsigned char> coinbase_script;
+        std::string coinbase_hex;
+    };
+    const std::vector<CachedMergedHeaderInfo>& get_last_merged_header_infos() const { return m_last_merged_header_infos; }
+    double get_local_hashrate() const { return m_cached_pool_hashrate; }
+    void set_local_hashrate(double hr) { m_cached_pool_hashrate = hr; }
+    double get_network_difficulty() const { return m_network_difficulty.load(); }
+
+    // SPV sync progress callback — returns {ltc_blocks, ltc_need, doge_blocks, doge_need}
+    using spv_progress_fn_t = std::function<nlohmann::json()>;
+    void set_spv_progress_fn(spv_progress_fn_t fn) { m_spv_progress_fn = std::move(fn); }
+
+    // Coin peer sharing — returns verified LTC/DOGE peers for new node bootstrap.
+    // Rate-limited per IP (6 req/min), returns random subset of tried peers.
+    using coin_peers_fn_t = std::function<nlohmann::json()>;
+    void set_coin_peers_fn(coin_peers_fn_t fn) { m_coin_peers_fn = std::move(fn); }
+    nlohmann::json rest_coin_peers(const std::string& remote_ip);
+
+    // D0.3 per-coin stats seam + D0.2 auto-detect. node_topology_fn, when set
+    // by the wiring layer, feeds the real per-coin embedded-daemon topology
+    // (coin label, embedded/has_rpc/synced, peers, hashrate). When unset,
+    // rest_node_topology() auto-detects the node's real coin set from the live
+    // coin-peer map + m_blockchain -- never a hardcoded {ltc,doge} shape.
+    using node_topology_fn_t = std::function<nlohmann::json()>;
+    void set_node_topology_fn(node_topology_fn_t fn) { m_node_topology_fn = std::move(fn); }
+    nlohmann::json rest_node_topology();              // /api/node_topology
+
+    // Embedded ORACLE-SHADOW validator stats seam (/embedded_oracle). When set
+    // by a wiring layer (main_dash.cpp), returns the per-block dashd cross-check
+    // coverage ledger + objective GRADUATION verdict. OBSERVE-only reporting;
+    // touches no serving/consensus state. Unset -> a {mode:disabled} shape.
+    using embedded_oracle_fn_t = std::function<nlohmann::json()>;
+    void set_embedded_oracle_fn(embedded_oracle_fn_t fn) { m_embedded_oracle_fn = thread_safe_wrap(std::move(fn)); }
+    nlohmann::json rest_embedded_oracle();            // /embedded_oracle
+
+    // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
+    using sharechain_stats_fn_t = std::function<nlohmann::json()>;
+    void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Sharechain window callback — returns per-share data for the defragmenter grid
+    using sharechain_window_fn_t = std::function<nlohmann::json()>;
+    void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Sharechain tip callback — strongly-typed "maybe no tip yet".
+    // Returning std::nullopt is the explicit, compile-enforced signal for
+    // "sharechain empty, bootstrap in progress"; CacheEntry's default
+    // value for this type is also std::nullopt, so the pre-first-refresh
+    // race window produces a safe absent state instead of a null JSON
+    // that would explode in a downstream `.value()` call.
+    using sharechain_tip_fn_t = std::function<std::optional<SharechainTip>()>;
+    void set_sharechain_tip_fn(sharechain_tip_fn_t fn) { m_sharechain_tip_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Sharechain delta callback — returns shares newer than given hash
+    using sharechain_delta_fn_t = std::function<nlohmann::json(const std::string&)>;
+    void set_sharechain_delta_fn(sharechain_delta_fn_t fn) {
+        m_sharechain_delta_fn_raw = fn;   // raw copy for main-thread precompute
+        m_sharechain_delta_fn = thread_safe_wrap(std::move(fn));
+    }
+
+    // Individual share lookup — returns full p2pool-compatible share JSON by hash
+    using share_lookup_fn_t = std::function<nlohmann::json(const std::string&)>;
+    void set_share_lookup_fn(share_lookup_fn_t fn) { m_share_lookup_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Network difficulty callback — invoked from refresh_work() with real value
+    using network_difficulty_fn_t = std::function<void(double)>;
+    void set_on_network_difficulty(network_difficulty_fn_t fn) { m_on_network_difficulty_fn = std::move(fn); }
+    
+    // Payout management methods
+    nlohmann::json getpayoutinfo(const std::string& request_id = "");
+    nlohmann::json getminerstats(const std::string& request_id = "");
+    nlohmann::json setmessageblob(const std::string& message_blob_hex, const std::string& request_id = "");
+    nlohmann::json getmessageblob(const std::string& request_id = "");
+    void set_pool_payout_address(const std::string& address);
+    void set_pool_fee_percent(double fee_percent);
+
+    // V36-compatible probabilistic node fee: at share creation time,
+    // with probability fee%, the share's payout address is replaced with
+    // the node operator's address.  This flows through PPLNS naturally.
+    void set_node_fee(double percent, const std::vector<unsigned char>& script) {
+        m_node_fee_percent = percent;
+        m_node_fee_script  = script;
+        m_pool_fee_percent = percent;  // keep /fee endpoint in sync
+    }
+    // String-based overload: converts Base58Check address to P2PKH scriptPubKey
+    void set_node_fee_from_address(double percent, const std::string& address);
+    // Donation script used by get_expected_payouts (p2pool protocol)
+    void set_donation_script(const std::vector<unsigned char>& script) {
+        m_donation_script = script;
+    }
+    const std::vector<unsigned char>& get_donation_script() const { return m_donation_script; }
+    // Cached share version (v35/v36) — updated by PPLNS hook from AutoRatchet
+    void set_cached_share_version(int64_t v) { m_cached_share_version = v; }
+    int64_t get_cached_share_version() const { return m_cached_share_version; }
+    // Local stratum hashrate (H/s) — set via callback from WebServer
+    void set_stratum_hashrate_fn(std::function<double()> fn) { m_stratum_hashrate_fn = thread_safe_wrap(std::move(fn)); }
+    double get_stratum_total_hashrate() const { return m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0; }
+
+    // Pool hashrate (H/s) — from P2P node's get_pool_attempts_per_second
+    void set_pool_hashrate_fn(std::function<double()> fn) { m_pool_hashrate_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Bypass the is_node_ready() + has_work gating. Used by coin targets
+    // (e.g. c2pool-dash) that drive their own work pipeline and don't rely
+    // on WebServer's internal refresh_work()/m_cached_template. When true,
+    // is_node_ready() returns true immediately and sync_status reports
+    // has_work=true regardless of the cached template.
+    void set_dashboard_always_ready(bool v) { m_dashboard_always_ready.store(v, std::memory_order_relaxed); }
+    bool is_dashboard_always_ready() const { return m_dashboard_always_ready.load(std::memory_order_relaxed); }
+
+    // Override the p2pool-compat protocol_version reported by /local_stats.
+    // Default 3600 matches LTC/V36; Dash uses 1700.
+    void set_protocol_version(int v) { m_protocol_version.store(v, std::memory_order_relaxed); }
+    int  get_protocol_version() const { return m_protocol_version.load(std::memory_order_relaxed); }
+    double get_pool_hashrate() const { return m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0; }
+
+    // Rate monitor stats for p2pool-style status (DOA%, time window)
+    struct RateStats {
+        double hashrate = 0;
+        double effective_dt = 0;
+        int total_datums = 0;
+        int dead_datums = 0;
+    };
+    void set_stratum_rate_stats_fn(std::function<RateStats()> fn) { m_stratum_rate_stats_fn = thread_safe_wrap(std::move(fn)); }
+    RateStats get_stratum_rate_stats() const { return m_stratum_rate_stats_fn ? m_stratum_rate_stats_fn() : RateStats{}; }
+
+    // Per-user hashrate + dead-hashrate from the stratum RateMonitor (p2pool
+    // get_local_rates, work.py:1965-1973). The stat-log graph series reads from
+    // THIS, not per-session WorkerInfo.hashrate: the latter is refreshed only on
+    // pseudoshare-accept and always carries dead=0, which flattened the local
+    // hashrate history graph to zero on live prod (founding-bug class).
+    using local_rates_fn_t = std::function<std::pair<
+        std::unordered_map<std::string, double>,
+        std::unordered_map<std::string, double>>()>;
+    void set_local_rates_fn(local_rates_fn_t fn) { m_local_rates_fn = std::move(fn); }
+
+    // Per-worker stratum registry provider (display only). On the LTC path the
+    // dashboard's OWN core::StratumServer registers workers straight into
+    // m_stratum_workers (register_stratum_worker). Coin targets that run their
+    // own stratum acceptor bound to a separate IWorkSource (c2pool-dash ->
+    // DASHWorkSource) leave m_stratum_workers empty; they wire THIS provider so
+    // /local_stats + /stratum_stats read the live per-connection registry from
+    // that acceptor. effective_stratum_workers() prefers the local registry and
+    // falls back to this provider, so LTC behavior is byte-unchanged.
+    void set_stratum_workers_fn(std::function<std::map<std::string, core::stratum::WorkerInfo>()> fn) {
+        m_stratum_workers_fn = thread_safe_wrap(std::move(fn));
+    }
+
+    // Live coin-template summary provider (display only; NEVER drives coinbase
+    // or consensus). Coin targets that drive their own work pipeline
+    // (c2pool-dash -> DASHWorkSource) leave WebServer's internal
+    // refresh_work()/m_cached_template unpopulated, so block_value / masternode
+    // payment split / network difficulty read 0 on /local_stats. They wire this
+    // to expose the last-sourced template's coinbase value, payment split,
+    // height and network difficulty. Unset on the LTC path (m_cached_template
+    // is populated there), so LTC behavior is byte-unchanged.
+    struct CoinWorkInfo {
+        bool     valid = false;
+        double   network_difficulty = 0.0;   // from template nbits
+        uint64_t coinbase_value_sat = 0;      // "coinbasevalue"
+        uint64_t payment_amount_sat = 0;      // masternode+treasury share
+        uint64_t height = 0;                  // template height
+        // TOTAL of every coinbase output that does NOT go to miners, in
+        // template order: masternode payee + operator split + superblock +
+        // the DIP-0027 platform OP_RETURN burn. Measured on the hotel
+        // (2026-08-05, DASH mainnet h=2516911): payment_amount_sat carried
+        // only the MN payee (0.8298), so the dashboard's "miner" share read
+        // 53% of the block when the ACCEPTED coinbase paid miners 25% -- the
+        // 0.4979 platform burn was silently counted as miner money. 0 =
+        // producer did not fill it; consumers then fall back to
+        // payment_amount_sat (pre-existing behaviour, LTC unchanged).
+        uint64_t payments_total_sat = 0;
+        // Of payments_total_sat, the OP_RETURN burn portion (display split).
+        uint64_t burn_sat = 0;
+        // Wall-clock seconds since this template was sourced (0 = unknown).
+        // A stale template renders as a legitimate-looking block_value; the
+        // age is what lets the dashboard say "this number is N minutes old".
+        int64_t  template_age_sec = -1;
+    };
+    void set_coin_work_fn(std::function<CoinWorkInfo()> fn) { m_coin_work_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Truthful RPC availability for coin targets whose daemon RPC is not
+    // exposed through m_coin_node (c2pool-dash uses an external dashd NodeRPC
+    // arm, not an ICoinNode). OR'd into the /api/node_topology has_rpc flag.
+    void set_coin_rpc_available(bool v) { m_coin_rpc_available.store(v, std::memory_order_relaxed); }
+
+    // Current PPLNS outputs for payout display
+    // Coin targets (c2pool-dash) that compute PPLNS outside the
+    // refresh_work() path can push the current distribution here so
+    // /current_payouts reflects the live sharechain.
+    void set_cached_pplns_outputs(std::vector<std::pair<std::string, uint64_t>> v) {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        m_cached_pplns_outputs = std::move(v);
+    }
+
+    std::vector<std::pair<std::string, uint64_t>> get_cached_pplns_outputs() const {
+        std::lock_guard<std::mutex> l(m_work_mutex);
+        return m_cached_pplns_outputs;
+    }
+
+    // Exact-match lookup (no fallback). Returns empty object if missing.
+    // Used by coins that want to know "did we actually cache PPLNS for this
+    // share?" rather than always falling back to an arbitrary entry.
+    nlohmann::json get_pplns_for_tip_exact(const std::string& tip_key) {
+        std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+        auto it = m_pplns_per_tip.find(tip_key);
+        return (it != m_pplns_per_tip.end()) ? it->second : nlohmann::json::object();
+    }
+
+    // Store a per-share PPLNS snapshot under the given key (full or short
+    // share hash — the sharechain_window_fn must look up by the same form).
+    // Used by coins that drive their own PPLNS precomputation loop instead of
+    // going through start_pplns_precompute / refresh_work.
+    void store_pplns_for_tip(const std::string& tip_key, nlohmann::json pplns) {
+        std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+        m_pplns_per_tip[tip_key] = std::move(pplns);
+        constexpr size_t MAX_PPLNS_CACHE = 5000;
+        if (m_pplns_per_tip.size() > MAX_PPLNS_CACHE * 2) {
+            auto keep = std::move(m_pplns_per_tip[tip_key]);
+            m_pplns_per_tip.clear();
+            m_pplns_per_tip[tip_key] = std::move(keep);
+        }
+    }
+    // THE state root for sharechain anchoring (used by merged coinbase too)
+    uint256 get_the_state_root() const { std::lock_guard<std::mutex> l(m_work_mutex); return m_cached_the_state_root; }
+    // String-based overload for donation script
+    void set_donation_script_from_address(const std::string& address);
+
+    // Solo mining configuration
+    void set_solo_mode(bool enabled) { m_solo_mode = enabled; }
+    void set_solo_address(const std::string& address) { m_solo_address = address; }
+    bool is_solo_mode() const { return m_solo_mode; }
+    const std::string& get_solo_address() const { return m_solo_address; }
+
+    // Payout system integration
+    void set_payout_manager(c2pool::payout::PayoutManager* manager) { m_payout_manager_ptr = manager; }
+    c2pool::payout::PayoutManager* get_payout_manager_ptr() const { return m_payout_manager_ptr; }
+
+    // Wire the per-coin node (embedded and/or RPC) behind the agnostic seam.
+    // refresh_work() calls get_work_view(); submissions go via submit_block_hex().
+    void set_coin_node(core::coin::ICoinNode* node);
+    // Fetch a fresh block template from the coin daemon and cache it
+    void refresh_work();
+    // Return the most recently cached block template (empty json if unavailable)
+    nlohmann::json get_current_work_template() const override;
+    // Return Stratum-ready merkle branch hashes
+    std::vector<std::string> get_stratum_merkle_branches() const override;
+    // Return coinb1 and coinb2 (coinbase parts split around extranonce)
+    std::pair<std::string, std::string> get_coinbase_parts() const override;
+
+    // Return whether segwit is active in the current template
+    bool get_segwit_active() const;
+    // Return the cached MWEB extension data (empty if none)
+    std::string get_cached_mweb() const;
+    // Return the P2Pool witness commitment hex (computed in refresh_work)
+    std::string get_cached_witness_commitment() const;
+    // Return the raw wtxid merkle root (computed in refresh_work)
+    uint256 get_cached_witness_root() const;
+
+    WorkSnapshot get_work_snapshot() const;
+
+    // Returns current GBT previousblockhash (for stale block template detection)
+    std::string get_current_gbt_prevhash() const override;
+
+    // Found block status and record (Layer +2 — blockchain-accepted blocks)
+    enum class BlockStatus : uint8_t {
+        pending   = 0,  // submitted, awaiting confirmation
+        confirmed = 1,  // in best chain (confirmations > 0)
+        orphaned  = 2,  // replaced by another block at same height
+        stale     = 3,  // submitted with stale prev_block
+    };
+    struct FoundBlock {
+        uint64_t    height;
+        std::string hash;
+        uint64_t    ts;
+        BlockStatus status{BlockStatus::pending};
+        uint8_t     check_count{0};   // how many verification attempts
+        std::string chain;            // "LTC"/"tLTC"/"DOGE" etc — for log display
+        uint32_t    confirmations{0}; // last known confirmation count
+        // Dashboard-enriched fields (populated at record time)
+        std::string miner;                 // payout address of the share that found the block
+        std::string share_hash;            // share hash that produced the block
+        double      network_difficulty{0}; // network difficulty at time of find
+        double      share_difficulty{0};   // share difficulty at time of find
+        double      pool_hashrate{0};      // pool hashrate at time of find
+        uint64_t    subsidy{0};            // block reward in satoshis
+        double      expected_time{0};      // expected seconds to find at current rate
+        double      time_to_find{0};       // actual seconds since previous block
+        double      luck{0};              // expected_time / time_to_find * 100
+        // WHO FOUND IT. On a p2pool sharechain the coinbase pays EVERY
+        // participant proportionally, so our payout address appearing in a
+        // block's coinbase means we earned a SHARE of it — never that we found
+        // it. Reading the coinbase for authorship is the mistake this field
+        // exists to make impossible: it is set at the call site that knows,
+        // and the log states it in words. Unlabelled stays `unknown`, which
+        // the log reports as unknown rather than guessing.
+        BlockAuthorship authorship{BlockAuthorship::unknown};
+        // Provenance for the dashboard (#57 oracle parity). true when this row
+        // was restored from persistent storage at startup rather than recorded
+        // live this session. DISPLAY-ONLY, never persisted (a restored row is
+        // by definition from history), so it stays last in the struct and out
+        // of every positional aggregate-init above.
+        bool from_history{false};
+    };
+
+    // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
+    // The verify callback returns: >0=confirmed, <0=orphaned, 0=pending.
+    using block_verify_fn_t = std::function<int(const std::string& hash)>;
+    using block_store_fn_t = std::function<bool(const FoundBlock& blk)>;
+    using block_load_fn_t  = std::function<std::vector<FoundBlock>()>;
+    void set_block_verify_fn(block_verify_fn_t fn);
+    void set_io_context(boost::asio::io_context* ctx) { m_context = ctx;
+        m_main_thread_id = std::this_thread::get_id();
+        LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx;
+        start_cache_refresh_pump(); }
+
+    /// Thread-safe cached callback entry.  Main thread computes + publishes;
+    /// HTTP thread reads a shared_ptr snapshot (mutex-guarded for portability).
+    template<typename R>
+    struct CacheEntry {
+        std::function<R()> fn;
+
+        explicit CacheEntry(std::function<R()> f) : fn(std::move(f)),
+            cached_(std::make_shared<const R>()) {}
+
+        R refresh() {
+            auto result = std::make_shared<const R>(fn());
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                cached_ = result;
+            }
+            return *result;
+        }
+
+        R get() const {
+            std::shared_ptr<const R> snap;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                snap = cached_;
+            }
+            return *snap;
+        }
+
+    private:
+        mutable std::mutex mtx_;
+        std::shared_ptr<const R> cached_;
+    };
+
+    /// Zero-arg overload: RCU cache pattern.
+    /// Main thread calls → computes result, updates cache, returns result.
+    /// HTTP thread calls → returns cached result instantly (zero blocking).
+    /// Cache is also refreshed periodically via refresh_http_caches().
+    template<typename R>
+    std::function<R()> thread_safe_wrap(std::function<R()> fn) {
+        if (!fn) return fn;
+        auto entry = std::make_shared<CacheEntry<R>>(fn);
+        m_cache_refresh_fns.push_back([entry]() { entry->refresh(); });
+        return [this, entry, fn = std::move(fn)]() -> R {
+            if (!m_context || std::this_thread::get_id() == m_main_thread_id) {
+                return entry->refresh();   // main thread: compute + cache
+            }
+            return entry->get();           // HTTP thread: instant cached read
+        };
+    }
+
+    /// Parameterized overload: dispatch-and-wait (used for delta, lookup, etc.)
+    /// These are called less frequently so blocking is acceptable.
+    template<typename R, typename Arg0, typename... Args>
+    std::function<R(Arg0, Args...)> thread_safe_wrap(std::function<R(Arg0, Args...)> fn) {
+        if (!fn) return fn;
+        return [this, fn = std::move(fn)](Arg0 arg0, Args... args) -> R {
+            if (!m_context || std::this_thread::get_id() == m_main_thread_id) {
+                return fn(arg0, args...);
+            }
+            std::promise<R> prom;
+            auto fut = prom.get_future();
+            boost::asio::post(*m_context, [&]() {
+                try {
+                    prom.set_value(fn(arg0, args...));
+                } catch (...) {
+                    prom.set_exception(std::current_exception());
+                }
+            });
+            return fut.get();
+        };
+    }
+
+    /// Void-returning overload (parameterized)
+    template<typename... Args>
+    std::function<void(Args...)> thread_safe_wrap(std::function<void(Args...)> fn) {
+        if (!fn) return fn;
+        return [this, fn = std::move(fn)](Args... args) {
+            if (!m_context || std::this_thread::get_id() == m_main_thread_id) {
+                fn(args...);
+                return;
+            }
+            std::promise<void> prom;
+            auto fut = prom.get_future();
+            boost::asio::post(*m_context, [&]() {
+                try {
+                    fn(args...);
+                    prom.set_value();
+                } catch (...) {
+                    prom.set_exception(std::current_exception());
+                }
+            });
+            fut.get();
+        };
+    }
+
+    /// Refresh all zero-arg callback caches.  Call from main thread periodically.
+    ///
+    /// Tip-driven entries (opted in via mark_last_cache_tip_driven()) are NOT
+    /// fired here unless their group hasn't been refreshed for
+    /// TIP_CACHE_FALLBACK_SEC — that's a safety net for pathological cases
+    /// (dead chain, no peers) where on_best_share_changed would otherwise
+    /// never fire.  Normally they're refreshed only when a new share lands,
+    /// which is ~6×/min at SHARE_PERIOD=10s vs the 1 Hz periodic — the
+    /// difference is what keeps the HTTP-cache allocator churn down.
+    static constexpr int64_t TIP_CACHE_FALLBACK_SEC = 30;
+    void refresh_http_caches() {
+        for (auto& fn : m_cache_refresh_fns) {
+            try { fn(); } catch (...) {}
+        }
+        auto now_ts = static_cast<int64_t>(std::time(nullptr));
+        if (now_ts - m_last_tip_refresh_ts.load() >= TIP_CACHE_FALLBACK_SEC) {
+            for (auto& fn : m_tip_cache_refresh_fns) {
+                try { fn(); } catch (...) {}
+            }
+            m_last_tip_refresh_ts.store(now_ts);
+        }
+    }
+
+    /// Fired from on_best_share_changed — refresh only tip-driven caches.
+    /// Cheap: matches sharechain tip event cadence (~6×/min), not 1 Hz.
+    void refresh_tip_sensitive_caches() {
+        for (auto& fn : m_tip_cache_refresh_fns) {
+            try { fn(); } catch (...) {}
+        }
+        m_last_tip_refresh_ts.store(static_cast<int64_t>(std::time(nullptr)));
+    }
+
+    /// Opt-in: move the most-recently-registered cache entry from the
+    /// periodic (1 Hz) list to the tip-driven list.  Call immediately after
+    /// set_<whatever>_fn() for callbacks whose payload depends on the
+    /// sharechain tip (stats histograms, PPLNS, version signaling, etc.).
+    void mark_last_cache_tip_driven() {
+        if (m_cache_refresh_fns.empty()) return;
+        m_tip_cache_refresh_fns.push_back(std::move(m_cache_refresh_fns.back()));
+        m_cache_refresh_fns.pop_back();
+    }
+    void schedule_block_verification(const std::string& block_hash);
+
+    // Per-chain verify function: register additional verifiers for merged chains
+    void add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn);
+
+    // Test/introspection seam: run ONE verification pass for a recorded found
+    // block synchronously (no io_context timer) and return the resulting
+    // verdict — >0 confirmations (confirmed), <0 orphaned, 0 pending,
+    // INT_MIN if the hash is not a recorded found block. This drives the exact
+    // production status-transition code (verify_found_block); the async
+    // schedule_block_verification() above is the live driver. Added for the
+    // DASH orphan-lane tests so the pending→confirmed / pending→orphaned flips
+    // can be asserted deterministically without waiting on real timers.
+    int run_block_verification_now(const std::string& block_hash);
+
+    /// Read-only access to found blocks (for sharechain window grid).
+    std::vector<FoundBlock> get_found_blocks() const {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        return m_found_blocks;
+    }
+
+    /// Set persistence callbacks for found blocks (Layer +2).
+    void set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn);
+
+    /// Load persisted found blocks from storage (call once after persistence is set)
+    void load_persisted_found_blocks();
+
+    /// #159 (G6): rebuild the network-difficulty series from persisted
+    /// found-block rows so the long-horizon diff curve is reconstructable even
+    /// after a wiped stat/.views file. Rebuilds the volatile block-sampled
+    /// m_netdiff_history unconditionally, and folds pre-flat-window rows into
+    /// the binned 'network_difficulty' stream ONLY when the views were freshly
+    /// seeded this boot (idempotent across restarts with a healthy .views
+    /// sidecar). Display-only; crash-safe (empty/missing source degrades to a
+    /// no-op). Call AFTER load_persisted_found_blocks so the rows are in memory.
+    void seed_netdiff_history_from_found_blocks();
+
+    /// #159 (G2): schedule confirm/orphan verification for every restored row
+    /// still marked pending. load_persisted_found_blocks() only rebuilds the
+    /// rows; without this a row that was pending at shutdown stays "pending"
+    /// forever because the live verification schedulers only fire on freshly
+    /// recorded blocks. Call once AFTER the block-verify callback and io_context
+    /// are wired. Safe to call with no verifier/io_context (it no-ops per row).
+    void reverify_pending_found_blocks();
+
+    /// Backfill network_difficulty on loaded blocks using a block hash → difficulty lookup.
+    /// Called after embedded header chain is available.
+    using block_diff_lookup_fn = std::function<double(const std::string& block_hash)>;
+    using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
+    void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
+
+private:
+    /// #159 (G3): recompute the DERIVED found-block fields (time_to_find,
+    /// expected_time, luck) that are never persisted, from the height-ordered
+    /// timestamps + network_difficulty + pool_hashrate that ARE restored. Only
+    /// fills fields still at 0 so it never clobbers a live-computed value.
+    /// CALLER MUST HOLD m_blocks_mutex. Coin-generic; run at load and again
+    /// after backfill_block_fields fills a previously-missing network_difficulty.
+    void recompute_found_block_luck_locked();
+public:
+
+    /// Merged block persistence — opaque store pointer, cast in .cpp.
+    void set_merged_block_store(std::shared_ptr<void> store);
+    std::shared_ptr<void> get_merged_block_store() const { return m_merged_block_store; }
+
+    /// Coin P2P peer info callbacks (daemon-style getpeerinfo).
+    using coin_peer_info_fn = std::function<nlohmann::json()>;
+    void set_ltc_peer_info_fn(coin_peer_info_fn fn) { m_ltc_peer_info_fn = thread_safe_wrap(std::move(fn)); }
+    void set_doge_peer_info_fn(coin_peer_info_fn fn) { m_doge_peer_info_fn = thread_safe_wrap(std::move(fn)); }
+    // Generic coin peer-info for non-LTC paths (e.g. Dash SPV). Consumed by
+    // rest_broadcaster_status when m_mm_manager is null (no merged mining).
+    // The dashboard's "Parent Chain Peers" panel expects an array of
+    // {addr, subver, startingheight, conntime, connected} objects plus a
+    // running=true top-level flag.
+    void set_coin_peer_info_fn(coin_peer_info_fn fn) { m_coin_peer_info_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Embedded coin header-sync status provider (dashboard telemetry ONLY).
+    // Wired at standup by EACH coin lane (main_btc / main_dash / main_ltc /
+    // main_dgb + bch pool_entrypoint) so /broadcaster_status can report the
+    // REAL embedded coin header-chain sync state coin-generically -- the coin
+    // header tip, NOT the sharechain height. Provider contract (JSON object,
+    // every field optional; omit rather than fabricate):
+    //   { "header_height": <embedded coin header-chain tip height>,
+    //     "target_height": <best network-tip estimate, e.g. best peer
+    //                       startingheight / advertised tip>,
+    //     "synced":        <bool, the lane's own verdict (optional)>,
+    //     "peers": [ {addr?, subver?, startingheight, conntime?, connected}.. ] }
+    // rest_broadcaster_status() merges the snapshot ADDITIVELY as
+    // header_height / current_height / target_height / sync_percent / synced /
+    // syncing / connected_peers (last_broadcast + running are untouched), and
+    // rest_node_topology() enriches the primary coin row from the same
+    // provider. Display-only: no share-validity / reward / consensus reads.
+    void set_coin_sync_status_fn(coin_peer_info_fn fn) { m_coin_sync_status_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Callback fired whenever a block submission is attempted.
+    // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
+    void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);
+
+    // Callback for P2P block relay — receives full block hex for direct daemon P2P broadcast.
+    void set_on_block_relay(std::function<void(const std::string& full_block_hex)> fn);
+    // Optional RPC submitblock fallback for embedded mode (returns error string, empty = ok).
+    void set_rpc_submit_fallback(std::function<std::string(const std::string&)> fn);
+    // Redistribute / address-fallback callback.
+    // Called when a share's primary address cannot be resolved to a valid hash160.
+    // Receives the bad address string; must return a 40-char hex hash160, or "" to keep share.
+    using address_fallback_fn_t = std::function<std::string(const std::string&)>;
+    void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
+
+    // Return true if the merged-mining manager has a configured chain with chain_id.
+    bool has_merged_chain(uint32_t chain_id) const override;
+
+    // Extract the 40-char hex hash160 from the node fee scriptPubKey (P2PKH bytes 3-22).
+    // Returns "" if the fee script is not a 25-byte P2PKH.
+    std::string get_node_fee_hash160() const;
+private:
+    void setup_methods();
+    // Build Stratum-compatible coinb1/coinb2 from a live block template
+    // Output ordering matches generate_share_transaction():
+    //   segwit_commitment(first) → PPLNS payouts → donation → OP_RETURN(last)
+    /// Compute THE state root: Merkle(L-1, L0_pplns, L+1, epoch_meta).
+    /// L-1 and L+1 are zero (placeholders until THE activates).
+    /// L0 = SHA256d of sorted PPLNS output table. Epoch = SHA256d of metadata.
+    static uint256 compute_the_state_root(
+        const std::vector<std::pair<std::string,uint64_t>>& pplns_outputs,
+        uint32_t chain_length, uint32_t block_height, uint32_t bits);
+
+    static std::pair<std::string, std::string> build_coinbase_parts(
+        const nlohmann::json& tmpl, uint64_t coinbase_value,
+        const std::vector<std::pair<std::string,uint64_t>>& outputs,
+        bool raw_scripts = false,
+        const std::vector<uint8_t>& mm_commitment = {},
+        const std::string& witness_commitment_hex = {},
+        const std::string& ref_hash_hex = {},
+        const uint256& the_state_root = uint256(),
+        const std::string& coinbase_text = {});
+    public:  // pure, stateless stratum-merkle utilities (contract-pinned in core_merkle_branches_test)
+    // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
+    static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
+    // Reconstruct merkle root from coinbase hex + Stratum merkle branches
+    static uint256 reconstruct_merkle_root(const std::string& coinbase_hex,
+                                           const std::vector<std::string>& merkle_branches);
+    private:
+    // Build full block hex from Stratum submit parameters.
+    // When job is provided, uses its frozen template data instead of the live m_cached_template.
+    std::string build_block_from_stratum(const std::string& extranonce1,
+                                         const std::string& extranonce2,
+                                         const std::string& ntime,
+                                         const std::string& nonce,
+                                         const JobSnapshot* job = nullptr) const;
+
+    // Try submitting to merged-mined aux chains if their target is met
+    // Returns true if a merged block was found (for twin block detection)
+    bool check_merged_mining(const std::string& block_hex,
+                             const std::string& extranonce1,
+                             const std::string& extranonce2,
+                             const JobSnapshot* job = nullptr);
+    
+    // Internal state
+    uint64_t m_work_id_counter;
+    std::map<std::string, nlohmann::json> m_active_work;
+    bool m_testnet;  // Store testnet flag
+    Blockchain m_blockchain;  // Store blockchain type
+    std::string m_coin_label; // Raw configured coin string; fallback label for chains absent from the Blockchain enum
+    std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
+    BlockchainAddressValidator m_address_validator;  // New address validator
+    std::unique_ptr<c2pool::payout::PayoutManager> m_payout_manager;  // Payout management
+    
+    // Solo mining configuration
+    bool m_solo_mode = false;
+    std::string m_solo_address;
+    
+    // Payout system integration
+    c2pool::payout::PayoutManager* m_payout_manager_ptr = nullptr;
+
+    // Per-coin node behind the agnostic seam (embedded and/or RPC, decided coin-side)
+    core::coin::ICoinNode*       m_coin_node      = nullptr;
+    // io_context for scheduling async verification timers
+    boost::asio::io_context*     m_context        = nullptr;
+    std::thread::id              m_main_thread_id;          // set by set_io_context()
+    std::vector<std::function<void()>> m_cache_refresh_fns; // populated by thread_safe_wrap
+    std::vector<std::function<void()>> m_tip_cache_refresh_fns; // opted in via mark_last_cache_tip_driven()
+    std::atomic<int64_t>               m_last_tip_refresh_ts{0};
+    // Self-scheduling RCU-cache pump. Every zero-arg thread_safe_wrap() provider
+    // (peers, topology, and the coin header-sync feed) publishes its snapshot on
+    // the io/main thread here so the HTTP thread reads a warm cache instead of the
+    // CacheEntry default (a null json). main_dash/main_ltc already drive
+    // refresh_http_caches() from their own timers; BTC/DGB/BCH did NOT, which left
+    // any wrapped provider cold on those lanes (the header-sync fields never
+    // surfaced on /broadcaster_status). Starting the pump from set_io_context()
+    // makes the behaviour coin-generic: armed exactly when a lane stands up its
+    // dashboard (the only caller of set_io_context), redundant-but-harmless where
+    // a lane also pumps manually. Display/telemetry only.
+    std::unique_ptr<boost::asio::steady_timer> m_cache_refresh_timer;
+    void start_cache_refresh_pump() {
+        if (!m_context || m_cache_refresh_timer) return;   // once, dashboard lanes only
+        m_cache_refresh_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+        arm_cache_refresh_pump();
+    }
+    void arm_cache_refresh_pump() {
+        if (!m_cache_refresh_timer) return;
+        m_cache_refresh_timer->expires_after(std::chrono::seconds(2));
+        m_cache_refresh_timer->async_wait([this](const boost::system::error_code& ec) {
+            if (ec) return;   // cancelled at shutdown (timer destroyed with `this`)
+            refresh_http_caches();
+            arm_cache_refresh_pump();
+        });
+    }
+    std::atomic<bool>       m_work_valid{false};
+    std::atomic<uint64_t>   m_work_generation{0};       // incremented on each refresh_work()
+    std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
+    std::atomic<double>     m_last_work_latency{0};    // template build latency (ms)
+    nlohmann::json          m_cached_template;
+
+public:
+    // Monotonically increasing counter — incremented on each refresh_work().
+    // Used by per-miner safety timer to avoid pushing unchanged work.
+    uint64_t get_work_generation() const override { return m_work_generation.load(); }
+
+    // IWorkSource atomic-state getters — replace direct m_share_bits.load()
+    // member access from stratum_server (post-extraction).
+    uint32_t get_share_bits() const override { return m_share_bits.load(); }
+    uint32_t get_share_max_bits() const override { return m_share_max_bits.load(); }
+
+    // Share target from compute_share_target() — set by ref_hash_fn, used by
+    // mining.notify (nbits) and share creation (params.bits).
+    // These are consensus-level share difficulty, NOT the block difficulty.
+    std::atomic<uint32_t>   m_share_bits{0};
+    std::atomic<uint32_t>   m_share_max_bits{0};
+private:
+    std::vector<std::string> m_cached_merkle_branches;   // Stratum merkle branches
+    std::string             m_cached_coinb1;
+    std::string             m_cached_coinb2;
+    mutable std::mutex      m_work_mutex;
+
+    // Recent-won-block dedup state (#886) — see already_submitted_block().
+    mutable std::mutex      m_recent_submit_mutex;
+    std::deque<uint256>     m_recent_submitted_blocks;
+    static constexpr size_t kRecentSubmitCap = 256;
+
+    // Block-found callback (header_hex, stale_info: 0=none, 253=orphan, 254=doa)
+    std::function<void(const std::string&, int)> m_on_block_submitted;
+
+    find_peer_prev_fn_t m_find_peer_prev_fn;
+
+    // P2P block relay callback — receives the full block hex for direct P2P broadcast.
+    // Only called for accepted blocks (not stale/orphan/doa).
+    std::function<void(const std::string&)> m_on_block_relay;
+
+    // Optional RPC submitblock fallback — called BEFORE P2P relay in embedded mode.
+    // Returns the error string from litecoind (empty = accepted).
+    std::function<std::string(const std::string&)> m_rpc_submit_fallback;
+
+    // Share tracker hook
+    std::function<uint256()> m_best_share_hash_fn;
+
+    // Sharechain stats callback
+    sharechain_stats_fn_t m_sharechain_stats_fn;
+    std::function<nlohmann::json()> m_current_payouts_fn;  // #939 direct source seam
+    spv_progress_fn_t m_spv_progress_fn;
+    coin_peers_fn_t m_coin_peers_fn;
+    node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
+    embedded_oracle_fn_t m_embedded_oracle_fn;  // /embedded_oracle shadow-validator stats (optional)
+    // Rate limiter for /api/coin_peers: IP → last request time
+    std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
+    sharechain_window_fn_t m_sharechain_window_fn;
+    sharechain_tip_fn_t m_sharechain_tip_fn;
+    sharechain_delta_fn_t m_sharechain_delta_fn;
+    sharechain_delta_fn_t m_sharechain_delta_fn_raw;  // unwrapped, for main-thread precompute
+    share_lookup_fn_t m_share_lookup_fn;
+
+public:
+    // ── Sharechain window response cache (Layer 1 + 2) ──
+    void invalidate_window_cache() {
+        std::lock_guard<std::mutex> lock(m_window_cache_mutex);
+        m_window_cache_etag.clear();
+    }
+    // ── Pre-computed delta cache (called from main thread on new share) ──
+    void precompute_delta(const std::string& prev_tip_hash);
+
+    // ── Per-share PPLNS cache ──
+    void cache_pplns_at_tip();
+    nlohmann::json get_pplns_for_tip(const std::string& tip_hash);
+    // Background pre-computation: walks all verified shares after sync
+    void start_pplns_precompute();
+    bool pplns_precompute_done() const { return m_pplns_precompute_done.load(); }
+    // ── Per-IP rate limiting (Layer 3) ──
+    bool rate_check(const std::string& ip, int max_per_min);
+    // ── SSE subscribers (Layer 4) ──
+    void sse_push(const std::string& event_data);
+    void sse_register(std::shared_ptr<tcp::socket> socket);
+    size_t sse_subscriber_count() const;
+private:
+    std::mutex m_window_cache_mutex;
+    std::string m_window_cache_json;
+    std::string m_window_cache_etag;
+    // Single-entry delta cache: pre-computed on main thread when tip changes.
+    // SSE clients all request the same since_hash (previous tip) → ~100% hit rate.
+    mutable std::mutex m_delta_cache_mutex;
+    std::string m_delta_cache_since;         // since_hash this delta was computed for
+    nlohmann::json m_delta_cache_result;     // the cached delta JSON
+    struct RateBucket {
+        int tokens{0};
+        std::chrono::steady_clock::time_point last_refill;
+    };
+    std::mutex m_rate_mutex;
+    std::unordered_map<std::string, RateBucket> m_rate_buckets;
+    // Per-share PPLNS snapshots: share_short_hash → {addr: amount}
+    std::mutex m_pplns_cache_mutex;
+    std::unordered_map<std::string, nlohmann::json> m_pplns_per_tip;
+    std::atomic<bool> m_pplns_precompute_done{false};
+    std::atomic<bool> m_pplns_precompute_started{false};  // prevents re-spawn after detach
+    // Cached full merged payouts (LTC + DOGE) — updated by cache_pplns_at_tip()
+    mutable std::mutex m_merged_payouts_mutex;
+    nlohmann::json m_cached_merged_payouts;
+    std::thread m_pplns_precompute_thread;
+    struct SSESubscriber {
+        std::shared_ptr<tcp::socket> socket;
+        std::string last_tip;
+    };
+    std::mutex m_sse_mutex;
+    std::vector<SSESubscriber> m_sse_subscribers;
+
+    // PPLNS computation hook
+    pplns_fn_t m_pplns_fn;
+
+    // Ref hash computation hook (per-connection work generation)
+    ref_hash_fn_t m_ref_hash_fn;
+
+    // Cached PPLNS outputs for per-connection coinbase generation
+    // (populated in refresh_work, consumed in build_connection_coinbase)
+    // m_cached_pplns_best_share records which share the PPLNS was computed from.
+    // If build_connection_coinbase's frozen_prev_share differs, PPLNS is recomputed.
+    std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
+    uint256 m_cached_pplns_best_share;
+    bool m_cached_raw_scripts{false};
+    int64_t m_cached_share_version{36};  // V35/V36 PPLNS selection
+    std::string m_cached_witness_commitment;
+    uint256 m_cached_witness_root;  // raw wtxid merkle root
+    std::vector<uint8_t> m_cached_mm_commitment;
+    mutable std::vector<CachedMergedHeaderInfo> m_last_merged_header_infos;
+    uint256 m_cached_the_state_root;  // THE state root for sharechain anchoring
+    std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
+
+    // Share creation hook
+    create_share_fn_t m_create_share_fn;
+
+    // Protocol message extraction hook for API display.
+    protocol_messages_fn_t m_protocol_messages_fn;
+
+    // Operator blob injected into locally created shares (thread-safe).
+    mutable std::mutex m_message_blob_mutex;
+    std::vector<unsigned char> m_operator_message_blob;
+
+    // Cached transition messages loaded from blob files at startup.
+    nlohmann::json m_cached_transition_message;        // null or {msg,url,urgency,...}
+    nlohmann::json m_cached_authority_announcements;   // array of announcements
+
+    // Featured developer-node banner store (signed subtype 0x06, freshest-wins).
+    // Pure presentation state — see featured_node.hpp for the consensus-neutral
+    // contract. Read/written only by web_server featured-node code.
+    core::FeaturedNodeStore m_featured_node;
+
+    // Coinbase scriptSig customization
+    std::string m_coinbase_text;  // empty = "/c2pool/" default tag
+
+    // Cached THE state for checkpoint creation (state_root already at line 639)
+    uint32_t m_cached_sharechain_height{0};
+    uint16_t m_cached_miner_count{0};
+    double m_cached_pool_hashrate{0};
+    std::function<double()> m_pool_hashrate_fn;
+    std::atomic<bool> m_dashboard_always_ready{false};
+    std::atomic<int> m_protocol_version{3600};
+
+    // THE checkpoint callbacks (set by node layer)
+    checkpoint_store_fn_t m_checkpoint_latest_fn;
+    checkpoints_all_fn_t m_checkpoints_all_fn;
+    checkpoint_verify_fn_t m_checkpoint_verify_fn;
+
+    // Called when a block is found — creates a THE checkpoint
+    checkpoint_create_fn_t m_checkpoint_create_fn;
+
+    // Segwit activation (from template rules)
+    bool m_segwit_active{false};
+
+    // Integrated merged mining manager (non-owning)
+    c2pool::merged::MergedMiningManager* m_mm_manager{nullptr};
+
+    // Network difficulty callback
+    network_difficulty_fn_t m_on_network_difficulty_fn;
+
+    // Pool fee percent (set via set_pool_fee_percent)
+    double m_pool_fee_percent{0.0};
+
+    // V36 probabilistic node fee
+    double m_node_fee_percent{0.0};
+    std::vector<unsigned char> m_node_fee_script;   // node operator scriptPubKey
+    std::string m_node_fee_address;                 // node operator address (display/logging)
+    std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
+    std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
+    std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
+    local_rates_fn_t m_local_rates_fn;  // RateMonitor per-user rates for stat-log graph series
+
+    // Cached network difficulty (computed from bits in refresh_work)
+    std::atomic<double> m_network_difficulty{0.0};
+
+    // Found block list (persistent via Layer +2 callbacks)
+    std::vector<FoundBlock> m_found_blocks;   // newest first, no cap (persistent)
+    mutable std::mutex      m_blocks_mutex;
+
+    // Persistent found block storage (Layer +2) — functional callbacks
+    block_store_fn_t m_persist_block_fn;   // called on record + status change
+    block_load_fn_t  m_load_blocks_fn;     // called on startup
+
+    std::shared_ptr<void> m_merged_block_store;  // MergedBlockStore (opaque)
+    coin_peer_info_fn m_ltc_peer_info_fn;
+    coin_peer_info_fn m_doge_peer_info_fn;
+    coin_peer_info_fn m_coin_peer_info_fn;
+    coin_peer_info_fn m_coin_sync_status_fn;  // embedded coin header-sync provider
+    // Merge the header-sync provider snapshot into a /broadcaster_status
+    // response (additive fields only; running/last_broadcast untouched).
+    // No-op when the provider is unwired or throws.
+    void augment_with_coin_sync_status(nlohmann::json& result);
+    block_verify_fn_t m_block_verify_fn;  // default (parent chain)
+    std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
+    void verify_found_block(size_t index);
+
+    // Pool start time for /uptime
+    std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};
+
+    // Stratum tuning (shared with all StratumSessions via pointer)
+    StratumConfig m_stratum_config;
+    std::string m_cors_origin;  // empty = no CORS header; set explicitly if needed
+    std::string m_auth_token;   // auth token for sensitive endpoints; empty = no auth
+public:
+    void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
+    const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
+    void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
+    const std::string& get_cors_origin() const { return m_cors_origin; }
+
+    // Authentication token for sensitive endpoints (/control/*, /web/log, /logs/export)
+    // Empty = no auth required (NOT recommended for production)
+    void set_auth_token(const std::string& token) { m_auth_token = token; }
+    bool verify_auth_token(const std::string& token) const {
+        return !m_auth_token.empty() && token == m_auth_token;
+    }
+    bool auth_required() const { return !m_auth_token.empty(); }
+
+    // Dashboard static file serving directory
+    void set_dashboard_dir(const std::string& dir) { m_dashboard_dir = dir; }
+    const std::string& get_dashboard_dir() const { return m_dashboard_dir; }
+
+    // Google Analytics (or compatible) measurement ID injected into HTML pages
+    void set_analytics_id(const std::string& id) { m_analytics_id = id; }
+    const std::string& get_analytics_id() const { return m_analytics_id; }
+
+    // Custom external block explorer link prefixes (overrides defaults)
+    void set_custom_explorer_links(const std::string& addr, const std::string& block, const std::string& tx) {
+        m_custom_address_explorer = addr;
+        m_custom_block_explorer = block;
+        m_custom_tx_explorer = tx;
+    }
+
+    // Explorer API
+    using explorer_chaininfo_fn_t = std::function<nlohmann::json(const std::string& chain)>;
+    using explorer_blockhash_fn_t = std::function<std::string(uint32_t height, const std::string& chain)>;
+    using explorer_getblock_fn_t  = std::function<nlohmann::json(const std::string& hash, const std::string& chain)>;
+    void set_explorer_enabled(bool enabled) { m_explorer_enabled = enabled; }
+    bool is_explorer_enabled() const { return m_explorer_enabled; }
+    void set_explorer_url(const std::string& url) { m_explorer_url = url; }
+    const std::string& get_explorer_url() const { return m_explorer_url; }
+
+    // Uppercase coin symbol for THIS node. Enum-derived for the consensus-
+    // supported coins; falls back to the config-driven m_coin_label when the
+    // chain has no Blockchain enum entry (BCH / NMC-aux), so topology and
+    // node_info never emit a blank symbol. "" only when truly unconfigured.
+    std::string node_symbol() const {
+        switch (m_blockchain) {
+            case Blockchain::LITECOIN: return "LTC";
+            case Blockchain::BITCOIN:  return "BTC";
+            case Blockchain::DOGECOIN: return "DOGE";
+            case Blockchain::DASH:     return "DASH";
+            case Blockchain::DIGIBYTE: return "DGB";
+            default:                   break;
+        }
+        std::string s = m_coin_label;
+        for (auto& ch : s) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+        return s;
+    }
+    // Primary chain key for THIS node, derived from its configured blockchain
+    // (lowercase symbol). Used as the default chain for explorer / coin-admin
+    // endpoints instead of a hardcoded "ltc": a DGB/DASH/BTC node must not
+    // silently serve Litecoin data. Empty for UNKNOWN so callers surface a
+    // truthful "chain not enabled" rather than a fabricated coin identity.
+    std::string primary_chain_key() const {
+        switch (m_blockchain) {
+            case Blockchain::LITECOIN: return "ltc";
+            case Blockchain::BITCOIN:  return "btc";
+            case Blockchain::DOGECOIN: return "doge";
+            case Blockchain::DASH:     return "dash";
+            case Blockchain::DIGIBYTE: return "dgb";
+            default:                   break;
+        }
+        std::string s = m_coin_label;
+        for (auto& ch : s) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+        return s;  // "" only when truly unconfigured -> callers surface "not enabled"
+    }
+    void set_explorer_chaininfo_fn(explorer_chaininfo_fn_t fn) { m_explorer_chaininfo_fn = thread_safe_wrap(std::move(fn)); }
+    void set_explorer_blockhash_fn(explorer_blockhash_fn_t fn) { m_explorer_blockhash_fn = thread_safe_wrap(std::move(fn)); }
+    void set_explorer_getblock_fn(explorer_getblock_fn_t fn) { m_explorer_getblock_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_explorer_chaininfo_fn() const { return !!m_explorer_chaininfo_fn; }
+    bool has_explorer_blockhash_fn() const { return !!m_explorer_blockhash_fn; }
+    bool has_explorer_getblock_fn() const { return !!m_explorer_getblock_fn; }
+    nlohmann::json call_explorer_chaininfo(const std::string& c) { return m_explorer_chaininfo_fn(c); }
+    std::string call_explorer_blockhash(uint32_t h, const std::string& c) { return m_explorer_blockhash_fn(h, c); }
+    nlohmann::json call_explorer_getblock(const std::string& h, const std::string& c) { return m_explorer_getblock_fn(h, c); }
+
+    // ── Daemonless coin-chain query hook ───────────────────────────────────
+    // A coin backend that can answer chain queries (getbestblockhash /
+    // getblockhash / getblockchaininfo) from its OWN validated state — e.g.
+    // DASH's SPV HeaderChain — installs one function here instead of three.
+    // One hook for all three keeps the answers structurally consistent: a
+    // bestblockhash can never disagree with the bestblockhash inside the same
+    // backend's getblockchaininfo.
+    //
+    // The return value is the bare daemon-compatible result on success, or an
+    // object carrying "error"/"unavailable_reason" naming the condition that
+    // blocked the answer, with the measured value and the threshold. A backend
+    // must never substitute a plausible zero for state it does not own — the
+    // callers here forward the refusal verbatim rather than flattening it.
+    using coin_chain_query_fn_t = std::function<nlohmann::json(
+        const std::string& method, const nlohmann::json& params, const std::string& chain)>;
+    void set_coin_chain_query_fn(coin_chain_query_fn_t fn) { m_coin_chain_query_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_coin_chain_query_fn() const { return !!m_coin_chain_query_fn; }
+    nlohmann::json call_coin_chain_query(const std::string& method,
+                                         const nlohmann::json& params,
+                                         const std::string& chain) {
+        return m_coin_chain_query_fn(method, params, chain);
+    }
+
+    // Mempool explorer callbacks
+    using explorer_mempoolinfo_fn_t  = std::function<nlohmann::json(const std::string& chain)>;
+    using explorer_rawmempool_fn_t   = std::function<nlohmann::json(const std::string& chain, bool verbose, uint32_t limit)>;
+    using explorer_mempoolentry_fn_t = std::function<nlohmann::json(const std::string& txid, const std::string& chain)>;
+    void set_explorer_mempoolinfo_fn(explorer_mempoolinfo_fn_t fn) { m_explorer_mempoolinfo_fn = thread_safe_wrap(std::move(fn)); }
+    void set_explorer_rawmempool_fn(explorer_rawmempool_fn_t fn) { m_explorer_rawmempool_fn = thread_safe_wrap(std::move(fn)); }
+    void set_explorer_mempoolentry_fn(explorer_mempoolentry_fn_t fn) { m_explorer_mempoolentry_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_explorer_mempoolinfo_fn() const { return !!m_explorer_mempoolinfo_fn; }
+    bool has_explorer_rawmempool_fn() const { return !!m_explorer_rawmempool_fn; }
+    bool has_explorer_mempoolentry_fn() const { return !!m_explorer_mempoolentry_fn; }
+    nlohmann::json call_explorer_mempoolinfo(const std::string& c) { return m_explorer_mempoolinfo_fn(c); }
+    nlohmann::json call_explorer_rawmempool(const std::string& c, bool v, uint32_t l) { return m_explorer_rawmempool_fn(c, v, l); }
+    nlohmann::json call_explorer_mempoolentry(const std::string& t, const std::string& c) { return m_explorer_mempoolentry_fn(t, c); }
+
+    // Primary payout address (for legacy /payout_addr endpoint)
+    void set_payout_address(const std::string& addr) { m_payout_address = addr; }
+    const std::string& get_payout_address() const { return m_payout_address; }
+
+    // P2P peer info callback — returns JSON array of peer objects [{address,version,incoming,uptime,txpool_size}]
+    using peer_info_fn_t = std::function<nlohmann::json()>;
+    void set_peer_info_fn(peer_info_fn_t fn) { m_peer_info_fn = thread_safe_wrap(std::move(fn)); }
+
+    // ── Runtime admin callbacks (pool peer bans + whitelist) ─────────────
+    // Dispatched to NodeImpl on the io_context thread via thread_safe_wrap.
+    // All endpoints gated by loopback-only check in process_request.
+    using admin_list_bans_fn_t        = std::function<nlohmann::json()>;
+    using admin_ban_ip_fn_t           = std::function<nlohmann::json(const std::string& ip, int duration_sec)>;
+    using admin_unban_ip_fn_t         = std::function<nlohmann::json(const std::string& ip)>;
+    using admin_list_whitelist_fn_t   = std::function<nlohmann::json()>;
+    using admin_whitelist_add_fn_t    = std::function<nlohmann::json(const std::string& host, uint16_t port)>;
+    using admin_whitelist_remove_fn_t = std::function<nlohmann::json(const std::string& host, uint16_t port)>;
+    using admin_list_peers_fn_t       = std::function<nlohmann::json()>;
+    using admin_drop_peer_fn_t        = std::function<nlohmann::json(const std::string& ip)>;
+    using admin_dial_peer_fn_t        = std::function<nlohmann::json(const std::string& host, uint16_t port)>;
+
+    void set_admin_list_bans_fn(admin_list_bans_fn_t fn)             { m_admin_list_bans_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_ban_ip_fn(admin_ban_ip_fn_t fn)                   { m_admin_ban_ip_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_unban_ip_fn(admin_unban_ip_fn_t fn)               { m_admin_unban_ip_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_list_whitelist_fn(admin_list_whitelist_fn_t fn)   { m_admin_list_whitelist_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_whitelist_add_fn(admin_whitelist_add_fn_t fn)     { m_admin_whitelist_add_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_whitelist_remove_fn(admin_whitelist_remove_fn_t fn) { m_admin_whitelist_remove_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_list_peers_fn(admin_list_peers_fn_t fn)           { m_admin_list_peers_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_drop_peer_fn(admin_drop_peer_fn_t fn)             { m_admin_drop_peer_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_dial_peer_fn(admin_dial_peer_fn_t fn)             { m_admin_dial_peer_fn = thread_safe_wrap(std::move(fn)); }
+
+    bool has_admin_fns() const { return !!m_admin_list_bans_fn; }
+    nlohmann::json call_admin_list_bans()      { return m_admin_list_bans_fn(); }
+    nlohmann::json call_admin_ban_ip(const std::string& ip, int d)       { return m_admin_ban_ip_fn(ip, d); }
+    nlohmann::json call_admin_unban_ip(const std::string& ip)             { return m_admin_unban_ip_fn(ip); }
+    nlohmann::json call_admin_list_whitelist()                           { return m_admin_list_whitelist_fn(); }
+    nlohmann::json call_admin_whitelist_add(const std::string& h, uint16_t p) { return m_admin_whitelist_add_fn(h, p); }
+    nlohmann::json call_admin_whitelist_remove(const std::string& h, uint16_t p) { return m_admin_whitelist_remove_fn(h, p); }
+    nlohmann::json call_admin_list_peers()                               { return m_admin_list_peers_fn(); }
+    nlohmann::json call_admin_drop_peer(const std::string& ip)            { return m_admin_drop_peer_fn(ip); }
+    nlohmann::json call_admin_dial_peer(const std::string& h, uint16_t p) { return m_admin_dial_peer_fn(h, p); }
+
+    // ── Embedded-coin admin (LTC/DOGE seed peer management) ──────────────
+    // Operates on the CoinPeerManager for the requested chain; adds
+    // peers discovered out-of-band (config, DNS recovery, operator input).
+    using admin_coin_list_peers_fn_t = std::function<nlohmann::json(const std::string& chain)>;
+    using admin_coin_add_peer_fn_t   = std::function<nlohmann::json(const std::string& chain, const std::string& host, uint16_t port)>;
+    void set_admin_coin_list_peers_fn(admin_coin_list_peers_fn_t fn) { m_admin_coin_list_peers_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_coin_add_peer_fn(admin_coin_add_peer_fn_t fn)     { m_admin_coin_add_peer_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_admin_coin_fns() const { return !!m_admin_coin_add_peer_fn; }
+    nlohmann::json call_admin_coin_list_peers(const std::string& c)  { return m_admin_coin_list_peers_fn(c); }
+    nlohmann::json call_admin_coin_add_peer(const std::string& c, const std::string& h, uint16_t p) { return m_admin_coin_add_peer_fn(c, h, p); }
+
+    // Port configuration for /node_info
+    void set_p2p_port(uint16_t port) { m_p2p_port = port; }
+    void set_worker_port(uint16_t port) { m_worker_port = port; }
+    void set_external_ip(const std::string& ip) { m_external_ip = ip; }
+    void set_pool_version(const std::string& ver) { m_pool_version = ver; }
+    // Config-driven coin label (raw --blockchain/cfg string). Only consulted
+    // by node_symbol()/primary_chain_key() when the consensus Blockchain enum
+    // has no entry for this chain (e.g. embedded BCH / NMC-aux), so the
+    // dashboard labels every node truthfully instead of going blank. Web-layer
+    // only -- never feeds consensus/address-validation.
+    void set_coin_label(const std::string& sym) { m_coin_label = sym; }
+    const std::string& get_pool_version() const { return m_pool_version; }
+
+    /// Auto-detect public IP and version from external services.
+    /// Runs on detached threads — non-blocking. Only fetches if not
+    /// already configured. Safe to call from any thread.
+    void auto_detect_external_info();
+
+    // Best share difficulty tracking (for /best_share, /miner_stats)
+    // share_hash: optional pow-hash of the record-setting share (display only;
+    // DASH stratum submit path supplies it so the Best Share card can show the
+    // exact hash that got closest to net difficulty).
+    void record_share_difficulty(double difficulty, const std::string& miner,
+                                 const std::string& share_hash = "");
+    void record_merged_share_difficulty(double difficulty, const std::string& miner);
+    // A pool block was won -> the sharechain round boundary moved. Reset the
+    // round-level best-share tracker (all_time / session are left untouched).
+    // See #922: round previously only ever raised, degenerating into a
+    // permanent duplicate of all_time after the first block.
+    void reset_best_difficulty_round(uint64_t ts = 0);
+
+    // Stat log entry (appended every 5 minutes, rolling 24h window for /web/log JSON)
+    void update_stat_log();
+private:
+
+    // Lightweight runtime state for MVP mining controls.
+    bool m_mining_enabled{true};
+    std::set<std::string> m_banned_targets;
+    mutable std::mutex m_control_mutex;
+
+    // Fallback address resolver for invalid/empty miner addresses (redistribute / DOGE→LTC)
+    address_fallback_fn_t m_address_fallback_fn;
+
+    // Dashboard static file serving directory (empty = disabled)
+    std::string m_dashboard_dir;
+    // Google Analytics measurement ID (e.g. "G-XXXXXXXXXX")
+    std::string m_analytics_id;
+    // Custom external block explorer link prefixes (empty = use Blockchair defaults)
+    std::string m_custom_address_explorer;
+    std::string m_custom_block_explorer;
+    std::string m_custom_tx_explorer;
+    // Explorer configuration
+    bool m_explorer_enabled{false};
+    std::string m_explorer_url;  // URL for dashboard nav link injection
+    // Explorer data callbacks (set by c2pool_refactored.cpp)
+    explorer_chaininfo_fn_t m_explorer_chaininfo_fn;
+    explorer_blockhash_fn_t m_explorer_blockhash_fn;
+    explorer_getblock_fn_t  m_explorer_getblock_fn;
+    // Daemonless coin-chain query hook (DASH header chain; see setter above)
+    coin_chain_query_fn_t   m_coin_chain_query_fn;
+    // Mempool explorer callbacks
+    explorer_mempoolinfo_fn_t  m_explorer_mempoolinfo_fn;
+    explorer_rawmempool_fn_t   m_explorer_rawmempool_fn;
+    explorer_mempoolentry_fn_t m_explorer_mempoolentry_fn;
+    // Admin callbacks (runtime pool peer ban/whitelist management)
+    admin_list_bans_fn_t        m_admin_list_bans_fn;
+    admin_ban_ip_fn_t           m_admin_ban_ip_fn;
+    admin_unban_ip_fn_t         m_admin_unban_ip_fn;
+    admin_list_whitelist_fn_t   m_admin_list_whitelist_fn;
+    admin_whitelist_add_fn_t    m_admin_whitelist_add_fn;
+    admin_whitelist_remove_fn_t m_admin_whitelist_remove_fn;
+    admin_list_peers_fn_t       m_admin_list_peers_fn;
+    admin_drop_peer_fn_t        m_admin_drop_peer_fn;
+    admin_dial_peer_fn_t        m_admin_dial_peer_fn;
+    admin_coin_list_peers_fn_t  m_admin_coin_list_peers_fn;
+    admin_coin_add_peer_fn_t    m_admin_coin_add_peer_fn;
+    // Primary payout address for legacy API
+    std::string m_payout_address;
+
+    // P2P peer info callback
+    peer_info_fn_t m_peer_info_fn;
+
+    // Port configuration
+    uint16_t m_p2p_port{9326};
+    uint16_t m_worker_port{9327};
+    std::string m_external_ip;
+    std::string m_pool_version{"c2pool/0.1.0-alpha"};
+
+    // Best share difficulty tracking
+    struct BestDifficulty {
+        double all_time{0.0};
+        std::string all_time_miner;
+        std::string all_time_hash;   // pow-hash of the record share (display only)
+        uint64_t all_time_ts{0};
+        double session{0.0};
+        std::string session_miner;
+        std::string session_hash;
+        uint64_t session_ts{0};
+        double round{0.0};
+        std::string miner;       // round-level miner (backward compat)
+        std::string hash;        // round-level pow-hash (display only)
+        uint64_t timestamp{0};   // round-level timestamp (backward compat)
+        uint64_t round_start{0};
+        // Merged chain (DOGE) best share tracking
+        double merged_all_time{0.0};
+        std::string merged_all_time_miner;
+        uint64_t merged_all_time_ts{0};
+        double merged_round{0.0};
+        std::string merged_round_miner;
+        uint64_t merged_round_ts{0};
+        uint64_t merged_round_start{0};
+    };
+    BestDifficulty m_best_difficulty;
+    mutable std::mutex m_best_diff_mutex;
+    // ── ALL-TIME best-share persistence ─────────────────────────────────
+    // Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+    // best_share showed all_time == session == round — the "all-time" leg
+    // reset on every restart because it lived only in memory, so the card
+    // was quietly lying about what "all time" means. Persisted as a small
+    // sidecar JSON next to the stat log (all_time leg ONLY: session and
+    // round are honestly per-process/per-round). Display only.
+    std::string best_share_db_path() const {
+        return m_stat_log_path.empty() ? std::string()
+                                       : m_stat_log_path + ".best.json";
+    }
+    void save_best_share_all_time();
+    void load_best_share_all_time();
+
+    // Per-miner rolling hashrate ring populated by
+    // record_share_difficulty; consumed by rest_pplns_current
+    // (hashrate_hps) + rest_pplns_miner (hashrate_series).
+    HashrateRing m_hashrate_ring;
+
+    // Most-recent real recorded share difficulty (vardiff target), fed by
+    // record_share_difficulty and snapshotted into the stat log to drive the
+    // share-difficulty trend line. 0 == no shares seen yet (honest-absent).
+    std::atomic<double> m_recent_share_difficulty{0.0};
+
+    // #159 (G8): cumulative count of accepted local shares, incremented once
+    // per accepted share in record_share_difficulty. update_stat_log diffs it
+    // against m_stat_shares_prev to fill the per-interval 'shares' series that
+    // was previously hardcoded to 0 (dead p2pool-compatible /web/log graph).
+    // Display/telemetry only — never read by any share/consensus/reward path.
+    std::atomic<uint64_t> m_stat_shares_cum{0};
+    // Prev-cumulative snapshots for the per-interval diff (only touched from
+    // update_stat_log, which runs single-threaded on the stat-log timer).
+    uint64_t m_stat_shares_prev{0};
+    uint64_t m_stat_stale_prev{0};
+
+    // Stat log for /web/log JSON endpoint (rolling 24h window)
+    struct StatLogEntry {
+        double time;
+        double pool_hash_rate;
+        double pool_stale_prop;
+        double network_difficulty{0};   // chain difficulty snapshot at sample time
+        double share_difficulty{0};     // real share (vardiff) difficulty; honest-absent 0
+        nlohmann::json local_hash_rates;       // {addr: hashrate}
+        nlohmann::json local_dead_hash_rates;  // {addr: dead_hashrate}
+        int worker_count{0};              // unique address.worker combos
+        int miner_count{0};               // unique base addresses
+        int connected_count{0};           // raw stratum TCP connections
+        uint64_t shares;
+        uint64_t stale_shares;
+        double current_payout;
+        nlohmann::json current_payouts;   // {addr: payout_float}
+        nlohmann::json merged_current_payouts; // {ltc_addr: merged_amount}
+        nlohmann::json peers;             // {incoming: N, outgoing: N}
+        nlohmann::json desired_versions;  // {version_str: hashrate}
+        double attempts_to_share;
+        double attempts_to_block;
+        double block_value;
+        double memory_usage{0};           // RSS in bytes
+        double work_latency{0};           // template build latency (ms)
+        nlohmann::json traffic;           // {incoming: B/s, outgoing: B/s}
+    };
+    std::vector<StatLogEntry> m_stat_log;
+    mutable std::mutex m_stat_log_mutex;
+    std::string m_stat_log_path;  // persistence file path (empty = no persistence)
+
+    // ── Frozen-estimator graph-store guard ───────────────────────────────────
+    // A live pool-rate estimator recomputed every 60 s tick over a sliding
+    // share window essentially never yields the same bit-identical nonzero
+    // double for many consecutive ticks (empirical ceiling on live data: 4).
+    // A long identical run means the estimator upstream is FROZEN (e.g. a
+    // stale latched anchor carried forward by a last-good latch); recording it
+    // bakes a fake flat plateau into the persisted graph_db that survives
+    // restarts — the estimator-side staleness bound stops NEW pollution but
+    // cannot clean what a frozen value already wrote. After
+    // kMaxIdenticalPoolRateRun consecutive bit-identical nonzero samples
+    // (~10 min at the 60 s cadence, matching the estimator-side 600 s
+    // staleness bound) the sample is recorded honest-absent 0.0 so the graph
+    // BREAKS instead of extending a fabricated rectangle. Display-only:
+    // nothing here feeds vardiff/consensus. Accessed only from the
+    // single-threaded stat-log timer (update_stat_log) and startup load.
+    static constexpr int kMaxIdenticalPoolRateRun = 10;
+    double m_phr_freeze_last{0.0};   // last RAW estimator value seen
+    int m_phr_freeze_run{0};         // consecutive bit-identical raw samples
+    bool m_phr_freeze_logged{false}; // one warning per freeze episode
+    // Load-time self-heal for stores polluted BEFORE the ingest guard existed:
+    // zero pool_hash_rate (and the desired_versions derived from it) across any
+    // persisted run longer than the ingest guard could ever write. Caller holds
+    // m_stat_log_mutex. Returns the number of entries sanitized.
+    std::size_t sanitize_frozen_pool_rate_runs();
+    // Set when the sanitizer changed entries; load_graph_views then discards
+    // the .views sidecar (its bins still carry the plateau) and re-seeds from
+    // the sanitized flat log.
+    bool m_flat_sanitized_on_load{false};
+public:
+    /// Set persistence path for stat log (call before start)
+    void set_stat_log_path(const std::string& path) { m_stat_log_path = path; }
+    /// Save stat log to disk (atomic write). Called periodically + on shutdown.
+    void save_stat_log();
+    /// Load stat log from disk. Called once at startup.
+    void load_stat_log();
+    /// True once the binned graph views are loaded/seeded and answering the
+    /// long horizons. Until then week/month/year serve from the flat fallback.
+    bool graph_views_ready() const { return m_views_ready.load(std::memory_order_acquire); }
+private:
+    // ── G4: year-scale binned graph history (p2pool graph.py port) ───────────
+    // A coin-generic binned history DB (core::graph) that backs the long-horizon
+    // graph views (last_week / last_month / last_year). last_hour / last_day are
+    // still served from the flat m_stat_log above — the 60s samples are denser
+    // than useful there and binning would only introduce null gaps. Fed one
+    // datum per 60s update_stat_log tick; persisted to <stat_log_path>.views on
+    // the existing save cadence; seeded from the flat log on first upgrade.
+    core::graph::HistoryDatabase m_history;
+    mutable std::mutex m_history_mutex;
+    // Guards the crossover: while false, week/month/year fall back to the flat
+    // path (never worse than today). Set true once bins are loaded/seeded.
+    std::atomic<bool> m_views_ready{false};
+    // #159 (G6): true when load_graph_views seeded the binned DB fresh this boot
+    // (no usable .views sidecar). Gates the found-block network_difficulty fold
+    // so a healthy sidecar is never double-counted across restarts.
+    std::atomic<bool> m_views_freshly_seeded{false};
+    // Background seed thread (used when the .views file is absent/corrupt/geometry-
+    // mismatched and all views must be replayed from the flat log). Joined in the
+    // destructor. Long views answer from the flat fallback until it completes.
+    std::thread m_views_seed_thread;
+    std::atomic<bool> m_views_seed_stop{false};
+    double m_views_watermark{0.0};  // last binned datum time (persisted)
+
+    std::string graph_views_path() const {
+        return m_stat_log_path.empty() ? std::string()
+                                       : m_stat_log_path + ".views";
+    }
+    // The stream schema (~21 streams). Coin-generic; identical for every coin.
+    static std::vector<std::pair<std::string, core::graph::DataStreamDescription>>
+        graph_stream_descriptions();
+    // Fold one flat StatLogEntry into every binned stream. Caller holds
+    // m_history_mutex.
+    void feed_history_entry(const StatLogEntry& e);
+    // Serve one long view from the bins ([] if unknown source / empty).
+    nlohmann::json graph_view_data(const std::string& source, const std::string& view);
+    // Persistence + one-time seed/replay migration for the .views sidecar.
+    void save_graph_views();
+    void load_graph_views();   // called at the tail of load_stat_log
+    void seed_graph_views_from_flat();  // background replay of the whole flat log
+public:
+
+    // Network difficulty history for /network_difficulty
+    struct NetDiffSample { double ts; double difficulty; std::string source; };
+    std::vector<NetDiffSample> m_netdiff_history;  // oldest-first, capped at 2000
+    mutable std::mutex m_netdiff_mutex;
+    double m_last_netdiff_sampled{0.0};  // dedup: skip if unchanged
+    void add_netdiff_sample(double difficulty, const std::string& source);
+
+    // Push a live network difficulty into the cache atomic + the sample history
+    // from a coin-tip source that does NOT run refresh_work(). refresh_work()
+    // (the RPC/getblocktemplate work path, web_server.cpp ~1590) is the only
+    // place that populates m_network_difficulty on the LTC family; a daemonless
+    // DASH node never runs it, so netdiff stays 0 -> found-block rows carry a
+    // null network_difficulty -> the dashboard's drawDiffRatioBars gate skips
+    // the block trails, luck reads null, the netdiff graph is flat 0. This lets
+    // the embedded coin-tip follower feed the same atomic those consumers read.
+    // Display/telemetry only -- never drives coinbase or consensus. (#57)
+    void update_network_difficulty(double difficulty, const std::string& source);
+
+    // ── Stratum worker session tracking ──────────────────────────────────
+public:
+    using WorkerInfo = core::stratum::WorkerInfo;
+
+    void register_stratum_worker(const std::string& session_id, const WorkerInfo& info) override;
+    void unregister_stratum_worker(const std::string& session_id) override;
+    void update_stratum_worker(const std::string& session_id,
+                               double hashrate, double dead_hashrate, double difficulty,
+                               uint64_t accepted, uint64_t rejected, uint64_t stale) override;
+    void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
+    std::map<std::string, WorkerInfo> get_stratum_workers() const;
+
+private:
+    // Effective per-worker registry for the stats/display path: the locally
+    // registered workers (LTC dashboard-owned acceptor) when present, else the
+    // external provider (coin-target acceptor bound to its own IWorkSource).
+    std::map<std::string, WorkerInfo> effective_stratum_workers() const;
+
+    std::map<std::string, WorkerInfo> m_stratum_workers;
+    mutable std::mutex m_stratum_workers_mutex;
+    std::function<std::map<std::string, WorkerInfo>()> m_stratum_workers_fn;  // external provider (coin targets)
+    std::function<CoinWorkInfo()> m_coin_work_fn;                             // live template summary (coin targets)
+    std::atomic<bool> m_coin_rpc_available{false};                           // external daemon RPC present
+    std::chrono::steady_clock::time_point m_stratum_start_time{std::chrono::steady_clock::now()};
+};
+
+/// Main Web Server class
+class WebServer
+{
+    net::io_context& ioc_;               // Main event loop (Stratum, timers, mining)
+    net::io_context http_ioc_;           // Dedicated HTTP event loop (dashboard/REST)
+    std::thread http_thread_;            // Thread driving http_ioc_
+    tcp::acceptor acceptor_;
+    std::shared_ptr<MiningInterface> mining_interface_;
+    std::string bind_address_;
+    uint16_t port_;
+    uint16_t stratum_port_;  // Explicit Stratum port configuration
+    bool running_;
+    bool testnet_;
+    Blockchain blockchain_;
+    std::thread server_thread_;
+    std::unique_ptr<StratumServer> stratum_server_;
+
+    // Solo mining configuration
+    bool solo_mode_;
+    std::string solo_address_;
+
+    // Debounce state for trigger_work_refresh_debounced() (hotel interim fix
+    // #3). Leading-edge-immediate + ~300 ms trailing-coalesce; the trailing
+    // refresh is event-gated on a REAL work change (sharechain tip moved since
+    // the last executed refresh). All state is touched only from the main
+    // ioc_ thread (callers + timer handler run there) — no extra locking.
+    std::shared_ptr<net::steady_timer> m_work_refresh_timer;
+    bool m_work_refresh_pending = false;
+    std::chrono::steady_clock::time_point m_last_work_refresh{};  // last executed refresh
+    std::string m_last_refresh_tip_hash;  // sharechain tip at last executed refresh
+
+    // Payout system integration
+    c2pool::payout::PayoutManager* payout_manager_ptr_ = nullptr;
+
+    // Per-coin node behind the agnostic seam (enables getblocktemplate + submitblock)
+    core::coin::ICoinNode* m_coin_node_ = nullptr;
+    
+public:
+    WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet = false);
+    WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node);
+    WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain);
+    ~WebServer();
+
+    // Start/stop the server
+    bool start();
+    bool start_solo();  // Start in solo mining mode (Stratum only)
+    void stop();
+    
+    // Solo mining configuration
+    void set_solo_mode(bool enabled) { solo_mode_ = enabled; }
+    void set_solo_address(const std::string& address) { solo_address_ = address; }
+    bool is_solo_mode() const { return solo_mode_; }
+    const std::string& get_solo_address() const { return solo_address_; }
+
+    // Payout system integration
+    void set_payout_manager(c2pool::payout::PayoutManager* manager) { payout_manager_ptr_ = manager; }
+    c2pool::payout::PayoutManager* get_payout_manager_ptr() const { return payout_manager_ptr_; }
+
+    /// Per-address hashrate aggregation from stratum.
+    /// Matches p2pool: get_local_addr_rates() (work.py:1975-1990).
+    /// Returns {pubkey_hash → hashrate (H/s)} for all connected miners.
+    std::map<std::array<uint8_t, 20>, double> get_local_addr_rates() const;
+
+    // Stratum server control methods
+    bool start_stratum_server();
+    void stop_stratum_server();
+    bool is_stratum_running() const;
+    void set_stratum_port(uint16_t port);
+    uint16_t get_stratum_port() const;
+
+    // Dashboard directory for static file serving
+    void set_dashboard_dir(const std::string& dir);
+    void set_analytics_id(const std::string& id);
+
+    // Explorer API — forward to MiningInterface
+    void set_explorer_enabled(bool enabled);
+    void set_explorer_url(const std::string& url);
+
+    // Wire the per-coin node (embedded and/or RPC) behind the agnostic seam
+    void set_coin_node(core::coin::ICoinNode* node);
+    // Forward block-found callback to the underlying MiningInterface
+    void set_on_block_submitted(std::function<void(const std::string&, int)> fn);
+    // Forward P2P block relay callback to the underlying MiningInterface
+    void set_on_block_relay(std::function<void(const std::string&)> fn);
+    // Immediately refresh the cached block template and push to all miners.
+    // Use for time-critical events (new LTC block).
+    void trigger_work_refresh();
+    // Debounced variant: coalesces rapid-fire calls (share arrivals) into one
+    // refresh after 100ms. Matches p2pool's Twisted reactor tick coalescing.
+    void trigger_work_refresh_debounced();
+    // Wire the share tracker's best hash into MiningInterface
+    void set_best_share_hash_fn(std::function<uint256()> fn);
+    // Wire the PPLNS computation from the share tracker
+    void set_pplns_fn(MiningInterface::pplns_fn_t fn);
+    // Set the integrated merged mining manager
+    void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr);
+
+    // Access the underlying MiningInterface (e.g. for record_found_block)
+    MiningInterface* get_mining_interface() const { return mining_interface_.get(); }
+
+private:
+    void accept_connections();
+    void handle_accept(beast::error_code ec, tcp::socket socket);
+    // Body of a debounced work refresh (capture prev tip → refresh → caches →
+    // SSE). Runs on the leading edge and on the trailing coalesced timer.
+    void execute_debounced_work_refresh();
+};
+
+// StratumSession and StratumServer — see stratum_server.hpp
+
+} // namespace core

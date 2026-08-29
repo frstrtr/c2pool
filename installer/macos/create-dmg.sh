@@ -1,0 +1,189 @@
+#!/bin/bash
+# c2pool macOS DMG builder
+#
+# Two modes:
+#
+# 1. Staged mode (used by release.yml — wraps an already-assembled universal
+#    package directory into a .dmg):
+#      ./create-dmg.sh --staged <pkgdir> --name c2pool-ltc --version 0.2.0 --arch universal
+#    <pkgdir> must already contain the binary, lib/, web-static/, config/,
+#    start.sh — i.e. the exact tree the release matrix stages/lipo-merges.
+#    No asset copying or dylib rewriting is done here; the staged tree
+#    (which already has @executable_path-fixed dylibs) is shipped verbatim.
+#    Output: <name>-<version>-macos-<arch>.dmg
+#
+# 2. Legacy single-binary mode (per-arch, alpha compatible):
+#      ./create-dmg.sh <binary> <arch>
+
+set -e
+
+STAGED=""
+NAME=""
+VERSION=""
+ARCH=""
+BINARY=""
+
+# Flag parsing (staged mode) with positional fallback (legacy mode)
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --staged)  STAGED="$2"; shift 2 ;;
+        --name)    NAME="$2"; shift 2 ;;
+        --version) VERSION="$2"; shift 2 ;;
+        --arch)    ARCH="$2"; shift 2 ;;
+        *)
+            if [ -z "$BINARY" ]; then BINARY="$1"; else ARCH="$1"; fi
+            shift ;;
+    esac
+done
+
+# ── Staged mode ─────────────────────────────────────────────────────────────
+if [ -n "$STAGED" ]; then
+    [ -n "$NAME" ]    || { echo "ERROR: --name required with --staged"; exit 1; }
+    [ -n "$VERSION" ] || { echo "ERROR: --version required with --staged"; exit 1; }
+    ARCH="${ARCH:-universal}"
+    [ -d "$STAGED" ]  || { echo "ERROR: staged dir not found: $STAGED"; exit 1; }
+    VOLNAME="${NAME}-${VERSION}"
+    DMG_NAME="${NAME}-${VERSION}-macos-${ARCH}.dmg"
+    echo "Building $DMG_NAME from staged tree $STAGED"
+    rm -f "$DMG_NAME"
+    hdiutil create -volname "$VOLNAME" \
+        -srcfolder "$STAGED" \
+        -ov -format UDZO \
+        "$DMG_NAME"
+    echo ""
+    echo "Created: $DMG_NAME"
+    echo "Size: $(du -h "$DMG_NAME" | cut -f1)"
+    echo "SHA256: $(shasum -a 256 "$DMG_NAME" | cut -d' ' -f1)"
+    exit 0
+fi
+
+# ── Legacy single-binary mode (unchanged alpha behaviour) ───────────────────
+ARCH="${ARCH:-$(uname -m)}"
+VERSION="${VERSION:-0.1.1-alpha}"
+VOLNAME="c2pool-${VERSION}"
+DMG_NAME="c2pool-${VERSION}-macos-${ARCH}.dmg"
+
+if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
+    echo "Usage: $0 <path-to-c2pool-binary> [arch]"
+    echo "   or: $0 --staged <pkgdir> --name <name> --version <ver> [--arch <arch>]"
+    exit 1
+fi
+
+# Verify binary architecture
+ACTUAL_ARCH=$(file "$BINARY" | grep -o 'x86_64\|arm64' | head -1)
+if [ "$ACTUAL_ARCH" != "$ARCH" ]; then
+    echo "ERROR: binary is $ACTUAL_ARCH but arch=$ARCH specified"
+    exit 1
+fi
+
+# Find repo root (script is in installer/macos/)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Staging directory
+STAGE=$(mktemp -d)
+APP_DIR="$STAGE/$VOLNAME"
+mkdir -p "$APP_DIR/lib"
+
+echo "Building $DMG_NAME from $BINARY"
+echo "  Repo: $REPO_ROOT"
+echo "  Stage: $STAGE"
+
+# Copy binary
+cp "$BINARY" "$APP_DIR/c2pool"
+chmod +x "$APP_DIR/c2pool"
+
+# Copy bundled assets
+cp -R "$REPO_ROOT/web-static" "$APP_DIR/web-static"
+cp -R "$REPO_ROOT/config" "$APP_DIR/config"
+if [ -d "$REPO_ROOT/explorer" ]; then
+    cp -R "$REPO_ROOT/explorer" "$APP_DIR/explorer"
+fi
+
+# Copy transition message blobs (authority-signed V36 upgrade signal)
+if [ -d "$REPO_ROOT/transition_messages" ]; then
+    cp -R "$REPO_ROOT/transition_messages" "$APP_DIR/transition_messages"
+fi
+
+# Copy start script
+if [ -f "$REPO_ROOT/start.sh" ]; then
+    cp "$REPO_ROOT/start.sh" "$APP_DIR/start.sh"
+    chmod +x "$APP_DIR/start.sh"
+else
+    # Generate a start script
+    cat > "$APP_DIR/start.sh" << 'STARTEOF'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="${1:-$DIR/config/c2pool_mainnet.yaml}"
+export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+echo "=== c2pool ==="
+echo "Config: $CONFIG"
+exec "$DIR/c2pool" --integrated --net litecoin \
+    --embedded-ltc --embedded-doge \
+    --dashboard-dir "$DIR/web-static" \
+    --config "$CONFIG"
+STARTEOF
+    chmod +x "$APP_DIR/start.sh"
+fi
+
+# Copy secp256k1 dylib and fix load path
+LINKED_SECP=$(otool -L "$APP_DIR/c2pool" | grep secp256k1 | awk '{print $1}')
+if [ -n "$LINKED_SECP" ] && [ -f "$LINKED_SECP" ]; then
+    SECP_REAL=$(realpath "$LINKED_SECP")
+    cp "$SECP_REAL" "$APP_DIR/lib/libsecp256k1.6.dylib"
+    ln -sf libsecp256k1.6.dylib "$APP_DIR/lib/libsecp256k1.dylib"
+    install_name_tool -change "$LINKED_SECP" "@executable_path/lib/libsecp256k1.6.dylib" "$APP_DIR/c2pool"
+    echo "  secp256k1: $LINKED_SECP -> @executable_path/lib/libsecp256k1.6.dylib"
+else
+    if [ "$ARCH" = "arm64" ]; then
+        SECP_SEARCH="/Users/user0/arm64-deps/lib /opt/homebrew/lib"
+    else
+        SECP_SEARCH="/usr/local/lib /usr/local/opt/secp256k1/lib"
+    fi
+    for DIR in $SECP_SEARCH; do
+        if [ -f "$DIR/libsecp256k1.6.dylib" ]; then
+            cp "$DIR/libsecp256k1.6.dylib" "$APP_DIR/lib/libsecp256k1.6.dylib"
+            ln -sf libsecp256k1.6.dylib "$APP_DIR/lib/libsecp256k1.dylib"
+            for CANDIDATE in "$DIR/libsecp256k1.dylib" "$DIR/libsecp256k1.6.dylib"; do
+                install_name_tool -change "$CANDIDATE" "@executable_path/lib/libsecp256k1.6.dylib" "$APP_DIR/c2pool" 2>/dev/null || true
+            done
+            echo "  secp256k1: $DIR -> @executable_path/lib/libsecp256k1.6.dylib"
+            break
+        fi
+    done
+fi
+
+# Add a README
+cat > "$APP_DIR/README.txt" << 'README'
+c2pool — P2Pool rebirth in C++
+https://github.com/frstrtr/c2pool
+
+Quick start:
+  1. Open Terminal
+  2. cd to this directory
+  3. ./start.sh
+
+Or run directly:
+  ./c2pool --integrated --net litecoin --embedded-ltc --embedded-doge
+
+Dashboard: http://localhost:8080
+Stratum:   stratum+tcp://localhost:9327
+
+Miners connect with their payout address as the stratum username.
+README
+
+# Create DMG
+OUTPUT="$REPO_ROOT/$DMG_NAME"
+rm -f "$OUTPUT"
+hdiutil create -volname "$VOLNAME" \
+    -srcfolder "$APP_DIR" \
+    -ov -format UDZO \
+    "$OUTPUT"
+
+# Cleanup
+rm -rf "$STAGE"
+
+echo ""
+echo "Created: $OUTPUT"
+echo "Size: $(du -h "$OUTPUT" | cut -f1)"
+echo "SHA256: $(shasum -a 256 "$OUTPUT" | cut -d' ' -f1)"

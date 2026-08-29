@@ -1,0 +1,163 @@
+#pragma once
+
+#include <cstdint>
+#include <atomic>
+#include <optional>
+#include <vector>
+#include <map>
+#include <string>
+
+#include <boost/log/trivial.hpp>
+#include <boost/log/attributes/named_scope.hpp>
+
+namespace core
+{
+
+namespace log
+{
+
+enum flags : uint32_t
+{
+    NONE = 0,
+    POOL = (1 << 0),
+    COIND = (1 << 2),
+    COIND_RPC = (1 << 3),
+    SHARETRACKER = (1 << 4),
+    DB = (1 << 5),
+    OTHER = (1 << 6),
+    P2P = (1 << 7),
+    STRATUM = (1 << 8),
+    ALL = ~(uint32_t)0,
+};
+
+class Logger
+{
+private:
+    static uint32_t m_categories;
+public:
+
+    static void init();
+    static void init(const std::string& log_file, int rotation_size_mb, int max_total_mb, const std::string& level);
+
+    /// Apply a severity filter after init (e.g. from CLI --loglevel-* flags).
+    static void set_severity_level(boost::log::trivial::severity_level lvl);
+
+    /// Map a string ("trace","debug","info","warning","error","fatal","critical")
+    /// to a Boost.Log severity level. Returns nullopt on unknown input.
+    static std::optional<boost::log::trivial::severity_level>
+        severity_level_from_string(const std::string& name);
+
+    static void add_category(const std::string& category);
+    static void remove_category(const std::string& category);
+
+    static void enable_trace();
+    static void disable_trace();
+
+    static inline bool check_category(core::log::flags&& flag)
+    {
+        return (m_categories & flag) != 0;
+    }
+};
+
+#define LOG_TRACE BOOST_LOG_TRIVIAL(trace)
+#define LOG_ERROR BOOST_LOG_TRIVIAL(error)
+#define LOG_INFO BOOST_LOG_TRIVIAL(info)
+#define LOG_WARNING BOOST_LOG_TRIVIAL(warning)
+#define LOG_FATAL BOOST_LOG_TRIVIAL(fatal)
+
+// For Debug
+#define LOG_DEBUG(ctg) \
+    if (core::log::Logger::check_category(core::log::flags::ctg))                   \
+        BOOST_LOG_TRIVIAL(debug).stream() << "(" << #ctg << ") "
+
+// Plain debug log without category gate — visible at --loglevel-debug and below.
+// Use for high-frequency diagnostics (PPLNS distributions, per-share stats, etc.)
+#define LOG_DEBUG_DIAG BOOST_LOG_TRIVIAL(debug)
+
+#define LOG_DEBUG_POOL LOG_DEBUG(POOL)
+#define LOG_DEBUG_COIND LOG_DEBUG(COIND)
+#define LOG_DEBUG_COIND_RPC LOG_DEBUG(COIND_RPC)
+#define LOG_DEBUG_SHARETRACKER LOG_DEBUG(SHARETRACKER)
+#define LOG_DEBUG_DB LOG_DEBUG(DB)
+#define LOG_DEBUG_OTHER LOG_DEBUG(OTHER)
+#define LOG_DEBUG_P2P LOG_DEBUG(P2P)
+#define LOG_DEBUG_STRATUM LOG_DEBUG(STRATUM)
+
+} //namespace logger
+
+} //namespace core
+
+template<typename T>
+std::ostream &operator<<(std::ostream &stream, const std::optional<T> &data)
+{
+    stream << "({Opt}: ";
+    if (data.has_value())
+    {
+        stream << data.value();
+    } else
+    {
+        stream << "nullopt";
+    }
+    stream << ")";
+    return stream;
+}
+
+template<typename T>
+std::ostream &operator<<(std::ostream &stream, std::vector<T> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << v << ", ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template<typename T>
+std::ostream &operator<<(std::ostream &stream, const std::vector<T> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << v << ", ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template <>
+inline std::ostream &operator<<<unsigned char>(std::ostream &stream, std::vector<unsigned char> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << (unsigned int) v << ", ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template <>
+inline std::ostream &operator<<<unsigned char>(std::ostream &stream, const std::vector<unsigned char> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << (unsigned int) v << " ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template <typename T, typename K>
+inline std::ostream &operator<<(std::ostream &stream, std::map<T, K> &data)
+{
+    stream << "[ ";
+    for (auto [k, v] : data)
+    {
+        stream << "(" << k << ": " << v << ");";
+    }
+    stream << "\b ]";
+    return stream;
+}

@@ -1,0 +1,38 @@
+# T9 multi-bridge availability  W=300000  servers=20  shards=16  trials=60  seed=1337
+# checkpoint: 8 forest roots (256B) + 1 shard-root (32B) over 16 sub-roots; setup 2.20s
+# shard-root = d23cc327523a2adc...   (binds the 16 per-shard sub-roots)
+
+# SANITY: honest set verifies; all 4 sybil whole-sets fail root check -> OK
+
+    h | whole live%  avg_q  wasteKB | shard live%  avg_q  wasteKB | pred 1-(1-h)^q
+--------------------------------------------------------------------------------------------
+ 0.00 |        0.0%  20.00 136608.8 |        0.0%  20.00   8691.2 |         0.0000
+  0.05 |       80.8%  11.84  75380.5 |        6.7%  68.42  27333.5 |         0.6415
+ 0.10 |       97.5%   9.02  56167.9 |       67.5% 111.21  42670.1 |         0.8784
+ 0.20 |      100.0%   3.98  22024.9 |      100.0%  65.24  22035.7 |         0.9885
+ 0.30 |      100.0%   3.29  16084.1 |      100.0%  50.49  15287.8 |         0.9992
+ 0.50 |      100.0%   1.95   5993.6 |      100.0%  31.51   6694.2 |         1.0000
+
+# SAFETY: wrong-head acceptances across all 720 trials (incl. h=0): 0  -> PASS
+
+# Reading:
+# - SAFETY is unconditional: 0 wrong-head acceptances even at h=0. A sybil
+#   pool that fully owns the serving layer can DENY progress, never CORRUPT it.
+# - WHOLE-SET liveness: ONE honest server in the reachable pool suffices.
+#   We query each of the S peers AT MOST ONCE (without replacement, the
+#   realistic finite-peer case) -> success is 100% whenever >=1 honest peer
+#   exists and S<=maxq, so empirical >> the with-replacement 1-(1-h)^q column
+#   (shown only as the i.i.d.-sampling lower bound). The real failure mode is
+#   a pool with ZERO honest peers (h->0 / full eclipse) = retry/widen-peers,
+#   not a fork. avg_q is the wasted-query count = #sybils hit before the honest.
+# - SHARDED+per-shard-commitment caps WASTED EGRESS per lie at W/K leaves
+#   instead of W, and lets the validator accept good shards from DIFFERENT
+#   honest servers (union coverage) -- but it needs an honest server PER
+#   shard, so its all-shards success is lower at tiny h unless shards are
+#   re-requestable (they are: bad shard -> next server). The lever: per-shard
+#   commitment converts a whole-W DoS amplification into a bounded W/K one.
+# DESIGN FEED (superlight synthesis): the checkpoint should commit a 32B
+#   shard-root over K per-range sub-roots (still O(1) on-chain) so the
+#   serving layer is INCREMENTALLY VERIFIABLE -> liveness degrades gracefully
+#   under sybil churn instead of all-or-nothing. Honest-server requirement
+#   is the design knob; safety needs none.

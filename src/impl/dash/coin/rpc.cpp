@@ -1,0 +1,725 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include "rpc.hpp"
+
+#include <impl/dash/coin/rpc_request.hpp>
+
+#include <core/log.hpp>
+#include <core/hash.hpp>
+#include <core/core_util.hpp>    // core::timestamp() (getwork latency)
+
+#include <util/strencodings.h>   // ParseHex / HexStr
+
+#include <algorithm>             // std::min (sync-reconnect backoff)
+
+#ifndef _WIN32
+#include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline)
+#include <sys/time.h>            // struct timeval
+#endif
+
+namespace dash
+{
+
+namespace coin
+{
+
+// DASH chain-identity genesis hashes, DASH_MIN_DAEMON_VERSION and
+// make_gbt_request: see impl/dash/coin/rpc_request.hpp (oracle/identity SSOT).
+// check() probes getblockheader(dash_genesis_hash(IS_TESTNET)) to confirm the
+// daemon is a real dashd on the selected network.
+
+NodeRPC::NodeRPC(io::io_context* context, dash::interfaces::Node* coin, bool testnet)
+    : IS_TESTNET(testnet), m_coin(coin), m_context(context), m_stream(*context),
+      m_resolver(*context), m_client(*this, RPC_VER)
+{
+}
+
+void NodeRPC::connect(NetService address, std::string userpass)
+{
+    m_address = address;
+    m_userpass = userpass;
+
+    m_auth = std::make_unique<RPCAuthData>();
+    m_http_request = {http::verb::post, "/", 11};
+
+    m_auth->host = address.to_string();
+    m_http_request.set(http::field::host, m_auth->host);
+
+    m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    m_http_request.set(http::field::content_type, "application/json");
+    m_http_request.set(http::field::connection, "keep-alive");
+
+    std::string encoded_login2;
+    encoded_login2.resize(boost::beast::detail::base64::encoded_size(userpass.size()));
+    const auto result = boost::beast::detail::base64::encode(&encoded_login2[0], userpass.data(), userpass.size());
+    encoded_login2.resize(result);
+    m_auth->authorization = "Basic " + encoded_login2;
+
+    m_http_request.set(http::field::authorization, m_auth->authorization);
+
+    // Async DNS resolve — must NOT use the blocking m_resolver.resolve() overload
+    // as that stalls the entire io_context thread for the DNS round-trip.
+    m_resolver.async_resolve(address.address(), address.port_str(),
+        [this](boost::system::error_code ec, boost::asio::ip::tcp::resolver::results_type results)
+        {
+            if (ec)
+            {
+                LOG_ERROR << "CoindRPC DNS resolve failed: " << ec.message() << ", retrying in 15s";
+                m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
+                m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
+                return;
+            }
+            boost::asio::ip::tcp::endpoint endpoint = *results.begin();
+            m_stream.async_connect(endpoint,
+                [this](boost::system::error_code ec)
+                {
+                    if (ec)
+                    {
+                        if (ec == boost::system::errc::operation_canceled)
+                            return;
+
+                        LOG_ERROR << "CoindRPC error when try connect: [" << ec.message() << "].";
+                    } else
+                    {
+                        try
+                        {
+                            // Bound the synchronous Send() I/O BEFORE check()
+                            // runs its first RPC, so a wedged dashd cannot hang
+                            // the caller (io thread or background rpc_pool).
+                            apply_socket_timeouts();
+                            if (check())
+                            {
+                                m_connected = true;
+                                LOG_INFO << "...CoindRPC connected!";
+                                return;
+                            }
+                        }
+                        catch(const std::runtime_error& ec)
+                        {
+                            LOG_ERROR << "Error when try check CoindRPC: " << ec.what();
+                        }
+                    }
+
+                    LOG_INFO << "Retry after 15 seconds...";
+                    m_connected = false;
+                    m_stream.close();
+                    m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
+                    m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
+                }
+            );
+        });
+}
+
+NodeRPC::~NodeRPC()
+{
+    beast::error_code ec;
+    m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+    if (ec)
+    {
+        // shutdown errors on close are typically benign; ignore
+    }
+}
+
+void NodeRPC::reconnect()
+{
+    if (!m_connected)
+        return;  // already reconnecting or never connected
+    m_connected = false;
+    LOG_WARNING << "RPC connection lost — reconnecting in 15 seconds...";
+    m_stream.close();
+    // Stale-payee fix: the connection churned — anything cached from before
+    // this point (template / masternode payee) must not be served or
+    // submitted. Notify the observer (DASHWorkSource cache invalidation).
+    if (m_on_reconnect)
+        m_on_reconnect();
+    m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
+    m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
+}
+
+void NodeRPC::bump_sync_backoff()
+{
+    // Exponential 1 -> 2 -> 4 -> ... capped at kSyncBackoffMaxSecs. Called only
+    // on a FAILED sync reconnect, under m_rpc_mutex.
+    m_sync_backoff_secs = (m_sync_backoff_secs <= 0)
+                              ? 1
+                              : std::min(m_sync_backoff_secs * 2, kSyncBackoffMaxSecs);
+    m_sync_backoff_until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(m_sync_backoff_secs);
+}
+
+void NodeRPC::sync_reconnect()
+{
+    // DASHD-CUT thrash fix (hotel-reserve 2026-08-15). Two changes vs the old
+    // "fire observer FIRST, then blindly re-attempt" body:
+    //
+    //  (1) BACKOFF (no hot spin): a dead dashd returns "Connection refused"
+    //      instantly, so Send() used to re-drive this ~30/s. After a failed
+    //      attempt we refuse to touch the socket again until the backoff window
+    //      elapses -- Send() returns empty, and the embedded/null arm keeps
+    //      serving. The window is bypassed the instant dashd is reachable again
+    //      (the first post-window attempt succeeds and resets it).
+    //
+    //  (2) INVALIDATION DECOUPLED FROM FAILURE: the churn observer
+    //      (m_on_reconnect -> DASHWorkSource::invalidate_template_cache) now
+    //      fires ONLY after a SUCCESSFUL reconnect -- the sole moment dashd's
+    //      tip (and thus the masternode payee) may actually have moved. The old
+    //      body fired it unconditionally at the TOP, so every one of those ~30/s
+    //      failed attempts dropped a VALID cached embedded template and bumped
+    //      the work generation, starving the working embedded arm. A failed
+    //      reconnect changes nothing on-chain, so it must invalidate nothing.
+    //
+    // REWARD-SAFETY: a successful reconnect still invalidates (stale-payee class
+    // preserved); the tip-aware observer on the fallback arm still probes and
+    // fail-safe-invalidates. When dashd is ALIVE, the first attempt succeeds, no
+    // backoff engages, and behaviour is byte-identical to before.
+    const auto now = std::chrono::steady_clock::now();
+    if (m_sync_backoff_secs > 0 && now < m_sync_backoff_until) {
+        // Cooling down after a recent failure: do NOT attempt, do NOT invalidate.
+        return;
+    }
+
+    beast::error_code ec;
+    m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+    m_stream.close();
+
+    m_sync_reconnect_attempts.fetch_add(1, std::memory_order_relaxed);
+
+    // Blocking resolve + connect for immediate retry
+    auto results = m_resolver.resolve(m_address.address(), m_address.port_str(), ec);
+    if (ec) {
+        bump_sync_backoff();
+        LOG_WARNING << "CoindRPC sync_reconnect resolve failed: " << ec.message()
+                    << " -- backing off " << m_sync_backoff_secs << "s "
+                       "(no cache invalidation on a failed reconnect)";
+        return;
+    }
+    m_stream.connect(*results.begin(), ec);
+    if (ec) {
+        bump_sync_backoff();
+        LOG_WARNING << "CoindRPC sync_reconnect connect failed: " << ec.message()
+                    << " -- backing off " << m_sync_backoff_secs << "s "
+                       "(no cache invalidation on a failed reconnect)";
+        return;
+    }
+    apply_socket_timeouts();   // re-arm the Send() deadline on the fresh socket
+    // SUCCESS: reset the backoff and NOW fire the churn observer -- a live
+    // reconnect is the only point at which the cached template/payee may be
+    // stale (dashd's tip could have advanced while we were disconnected).
+    m_sync_backoff_secs = 0;
+    LOG_INFO << "CoindRPC reconnected (sync)";
+    if (m_on_reconnect)
+        m_on_reconnect();
+}
+
+void NodeRPC::close_stream()
+{
+    // Same teardown idiom as sync_reconnect()/the destructor. m_connected is
+    // cleared so the next Send() write-fails into a clean sync_reconnect().
+    beast::error_code ec;
+    m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+    m_stream.close();
+    m_connected = false;
+}
+
+void NodeRPC::apply_socket_timeouts()
+{
+    // Force the socket back to BLOCKING mode, then set kernel send/receive
+    // timeouts. async_connect (connect()) leaves asio's non_blocking flag set;
+    // under it a synchronous recv returns EAGAIN immediately and SO_RCVTIMEO is
+    // a no-op. In blocking mode the sync http::write/http::read inside Send()
+    // do true blocking send()/recv() which the kernel bounds by SO_SND/RCVTIMEO,
+    // returning an error after RPC_IO_TIMEOUT_SECONDS instead of hanging on a
+    // wedged dashd. (beast tcp_stream::expires_after cannot be used: it only
+    // governs ASYNC ops -- the sync path calls socket.read_some() directly.)
+    // Per-operation inactivity timeout: a large-but-steadily-arriving GBT does
+    // NOT trip it; only a genuine stall does. POSIX (SO_*TIMEO takes a timeval);
+    // guarded off Windows (no <sys/time.h>/timeval, and Winsock SO_RCVTIMEO takes
+    // a DWORD) -- the DASH deploy target is Linux, and macOS keeps the real
+    // deadline. On Windows this is a no-op (pre-PR behaviour: no deadline).
+#ifndef _WIN32
+    if (!m_stream.socket().is_open())
+        return;
+    boost::system::error_code ec;
+    m_stream.socket().non_blocking(false, ec);   // guarantee SO_*TIMEO applies
+    if (ec)
+        LOG_WARNING << "CoindRPC: could not set blocking mode: " << ec.message();
+    struct timeval tv;
+    tv.tv_sec  = RPC_IO_TIMEOUT_SECONDS;
+    tv.tv_usec = 0;
+    const int fd = m_stream.socket().native_handle();
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+std::string NodeRPC::Send(const std::string &request)
+{
+    // io-thread-decouple / LTC parity (impl/ltc/coin/rpc.cpp:136): serialize the
+    // whole write+read+reconnect. getwork()/submit_block_hex (io thread) and the
+    // tip-poll's getbestblockhash (background rpc_pool thread) both drive this
+    // single shared beast client; m_http_request/m_stream are not thread-safe.
+    // The socket deadline (apply_socket_timeouts) bounds how long the lock is held.
+    std::lock_guard<std::mutex> _rpc_lock(m_rpc_mutex);
+    // Retry once after synchronous reconnect on write/read failure
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        m_http_request.body() = request;
+        m_http_request.prepare_payload();
+        try
+        {
+            http::write(m_stream, m_http_request);
+        }
+        catch(const std::exception& e)
+        {
+            LOG_WARNING << "CoindRPC write failed: " << e.what()
+                        << (attempt == 0 ? " — reconnecting..." : "");
+            if (attempt == 0) {
+                sync_reconnect();
+                continue;
+            }
+            // Deadline-desync guard (see the read-fail path below): tear the
+            // socket down before giving up so a partially-written request can
+            // never be answered into a LATER Send() on a reused connection.
+            close_stream();
+            return {};
+        }
+
+        beast::flat_buffer buffer;
+        boost::beast::http::response<boost::beast::http::dynamic_body> response;
+
+        try
+        {
+            boost::beast::http::read(m_stream, buffer, response);
+        }
+        catch (const std::exception& ex)
+        {
+            LOG_WARNING << "CoindRPC read failed: " << ex.what()
+                        << (attempt == 0 ? " — reconnecting..." : "");
+            if (attempt == 0) {
+                sync_reconnect();
+                continue;
+            }
+            // Deadline-desync guard (SO_RCVTIMEO deadline hazard): this final
+            // attempt has already WRITTEN the request into dashd but its response
+            // is unread (read timed out). jsonrpccxx reuses the constant id
+            // "curltest" and never validates response ids, so reusing this open
+            // connection would make the NEXT Send() read THIS request's late
+            // response -> permanent off-by-one desync (a GBT would parse a
+            // getbestblockhash string -> zeroed work -> a stuck "honest set-gap"
+            // outage until the connection churns). Tear the socket down so the
+            // next Send() write-fails into a clean sync_reconnect(). Already
+            // under m_rpc_mutex.
+            close_stream();
+            return {};
+        }
+
+        auto body = boost::beast::buffers_to_string(response.body().data());
+        if (body.empty()) {
+            static int _empty_count = 0;
+            if (_empty_count++ < 5)
+                LOG_WARNING << "CoindRPC empty response: HTTP " << response.result_int()
+                            << " content-length=" << response[http::field::content_length]
+                            << " connection=" << response[http::field::connection];
+            if (attempt == 0 && response.result_int() != 200) {
+                sync_reconnect();
+                continue;
+            }
+        }
+        return body;
+    }
+    return {};
+}
+
+nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
+{
+    return m_client.CallMethod<nlohmann::json>(ID, method, params);
+}
+
+bool NodeRPC::check()
+{
+    uint256 genesis = uint256S(dash_genesis_hash(IS_TESTNET));
+    bool has_block = check_blockheader(genesis);
+    bool is_main_chain = getblockchaininfo()["chain"].get<std::string>() == "main";
+
+    if (is_main_chain && !has_block)
+    {
+        LOG_ERROR << "Check failed! Make sure that you're connected to the right dashd with --dash-rpc-port, and that it has finished syncing!" << std::endl;
+        return false;
+    }
+
+    try
+    {
+        auto networkinfo = getnetworkinfo();
+        bool version_check_result = daemon_version_acceptable(networkinfo["version"].get<int>());
+        if (!version_check_result)
+        {
+            LOG_ERROR << "Dash daemon too old! Upgrade!";
+            return false;
+        }
+    } catch (const jsonrpccxx::JsonRpcException& ex)
+    {
+        LOG_WARNING << "NodeRPC::check() exception: " << ex.what();
+        return false;
+    }
+
+    // DASH older-than-v35 baseline has NO segwit and no required-softfork gate
+    // (params.hpp: softforks_required == {}). Unlike DGB (reservealgo/odo/
+    // nversionbips), DASH carries no startup-readiness softfork requirement set,
+    // so the genesis-identity + version-floor probe above is the full check.
+    return true;
+}
+
+bool NodeRPC::check_blockheader(uint256 header)
+{
+    try
+    {
+        getblockheader(header);
+        return true;
+    } catch (const jsonrpccxx::JsonRpcException& ex)
+    {
+        return false;
+    }
+}
+
+DashWorkData NodeRPC::getwork()
+{
+    auto start = core::timestamp();
+    // DASH: X11, no segwit -> plain rules (no "algo", no injected "segwit").
+    auto work = getblocktemplate({});
+    auto end = core::timestamp();
+
+    DashWorkData w;
+    w.m_raw = work;
+
+    // ----- Standard Bitcoin-family fields -----
+    if (work.contains("version"))        w.m_version        = work["version"].get<int32_t>();
+    if (work.contains("previousblockhash"))
+        w.m_previous_block = uint256S(work["previousblockhash"].get<std::string>());
+    if (work.contains("coinbasevalue"))  w.m_coinbase_value = work["coinbasevalue"].get<uint64_t>();
+    if (work.contains("curtime"))        w.m_curtime        = work["curtime"].get<uint32_t>();
+    if (work.contains("mintime"))        w.m_mintime        = work["mintime"].get<uint32_t>();
+    if (work.contains("coinbaseaux") && work["coinbaseaux"].contains("flags"))
+        w.m_coinbase_flags_hex = work["coinbaseaux"]["flags"].get<std::string>();
+    if (work.contains("bits"))
+    {
+        // GBT "bits" is a hex string (compact nBits).
+        w.m_bits = static_cast<uint32_t>(std::stoul(work["bits"].get<std::string>(), nullptr, 16));
+    }
+
+    // Height: prefer GBT's, else previous block + 1.
+    if (work.contains("height"))
+        w.m_height = work["height"].get<uint32_t>();
+    else if (work.contains("previousblockhash"))
+        w.m_height = getblock(w.m_previous_block)["height"].get<uint32_t>() + 1;
+
+    // ----- Transactions (full parse + raw hex + txid + fees) -----
+    if (work.contains("transactions"))
+    {
+        for (auto& packed_tx : work["transactions"])
+        {
+            std::string data_hex;
+            if (packed_tx.is_object() && packed_tx.contains("data"))
+                data_hex = packed_tx["data"].get<std::string>();
+            else if (packed_tx.is_string())
+                data_hex = packed_tx.get<std::string>();
+            if (data_hex.empty())
+                continue;
+
+            w.m_tx_data_hex.push_back(data_hex);
+
+            // Deserialize into a full MutableTransaction (DASH tx codec handles
+            // the version|(type<<16) field + DIP3/DIP4 special-tx payload).
+            MutableTransaction mtx;
+            try
+            {
+                PackStream ps_tx(ParseHex(data_hex));
+                ps_tx >> mtx;
+            }
+            catch (const std::exception& ex)
+            {
+                LOG_WARNING << "getwork: tx deserialize failed: " << ex.what();
+            }
+            w.m_txs.emplace_back(mtx);   // Transaction(MutableTransaction) is explicit
+
+            // txid: prefer GBT's "txid" field, else recompute (DASH non-witness
+            // canonical serialization == dash_txid).
+            uint256 txid;
+            if (packed_tx.is_object() && packed_tx.contains("txid"))
+                txid = uint256S(packed_tx["txid"].get<std::string>());
+            else
+            {
+                PackStream ps_id(ParseHex(data_hex));
+                txid = Hash(ps_id.get_span());
+            }
+            w.m_tx_hashes.push_back(txid);
+
+            uint64_t fee = 0;
+            if (packed_tx.is_object() && packed_tx.contains("fee"))
+                fee = packed_tx["fee"].get<uint64_t>();
+            w.m_tx_fees.push_back(fee);
+        }
+    }
+
+    // ----- DASH masternode + superblock + platform payments -----
+    // Normalize into m_packed_payments in the EXACT coinbase-output order, using
+    // the same "!hex" raw-script / base58-address payee convention that
+    // coin/embedded_gbt.hpp::gbt_xcheck compares the embedded build against.
+    //
+    // dashd GBT carries these as either:
+    //   - the v0.13+ "masternode" array (objects {payee, script, amount}) and
+    //     "superblock" array (same shape), and/or
+    //   - the legacy single-object "masternode"/"payee"+"payee_amount" fields.
+    // We accept both shapes. Platform credit-pool OP_RETURN burns surface as a
+    // payee with an empty/"6a" script -> normalized to "!6a".
+    auto push_payment = [&w](const nlohmann::json& entry) {
+        // bad-cb-payee fix: empty payee strings normalize to the raw "!"+script
+        // form (see rpc_data.hpp::normalize_payment) instead of being dropped.
+        PackedPayment pp = normalize_payment(entry);
+        if (pp.amount == 0)
+            return;
+        w.m_packed_payments.push_back(std::move(pp));
+        w.m_payment_amount += w.m_packed_payments.back().amount;
+    };
+
+    // Platform credit-pool OP_RETURN burn FIRST (dashcore GetBlockTxOuts order).
+    if (work.contains("coinbase_payload_burn"))
+    {
+        PackedPayment burn;
+        burn.payee  = "!6a";
+        burn.amount = work["coinbase_payload_burn"].get<uint64_t>();
+        if (burn.amount > 0)
+        {
+            w.m_packed_payments.push_back(std::move(burn));
+            w.m_payment_amount += w.m_packed_payments.back().amount;
+        }
+    }
+
+    if (work.contains("masternode"))
+    {
+        if (work["masternode"].is_array())
+            for (auto& e : work["masternode"]) push_payment(e);
+        else if (work["masternode"].is_object())
+            push_payment(work["masternode"]);
+    }
+    if (work.contains("superblock") && work["superblock"].is_array())
+        for (auto& e : work["superblock"]) push_payment(e);
+
+    // ----- DIP3/DIP4 coinbase extra payload -----
+    if (work.contains("coinbase_payload") && work["coinbase_payload"].is_string())
+    {
+        auto payload = ParseHex(work["coinbase_payload"].get<std::string>());
+        w.m_coinbase_payload.assign(payload.begin(), payload.end());
+    }
+
+    w.m_latency = end - start;
+    return w;
+}
+
+void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
+{
+    // DASH is non-segwit, non-MWEB: full-block packing is the plain block codec.
+    // NOTE: BlockType transaction-aware (de)serialization of m_txs is the S5
+    // deferral (coin/block.hpp); until that lands, the hex submit arm
+    // (submit_block_hex) carrying a fully-assembled block is the live won-block
+    // RPC path. This typed overload packs the header form.
+    PackStream packed_block = pack<dash::coin::BlockType>(block);
+    auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {HexStr(packed_block.get_span())});
+    bool success = result.is_null();
+
+    auto success_expected = true;
+
+    if ((!success && success_expected && !ignore_failure) || (success && !success_expected))
+        LOG_ERROR << "Block submittal result: " << success << "(" << result.dump() << ") Expected: " << success_expected;
+}
+
+bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure)
+{
+    auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
+    // Dual-path contract (M1): a "duplicate"/"inconclusive"/already-have result
+    // means the OTHER broadcast arm already landed this block on the network —
+    // that is SUCCESS, not failure. See submitblock_result_accepted().
+    const bool success = dash::coin::submitblock_result_accepted(result);
+    if (!success && !ignore_failure)
+        LOG_ERROR << "submit_block_hex result: " << result.dump();
+    else if (success)
+        LOG_INFO << "submit_block_hex accepted"
+                 << (result.is_null() ? std::string{}
+                                      : " (already on network: " + result.dump() + ")");
+    return success;
+}
+
+// RPC Methods
+
+nlohmann::json NodeRPC::getblocktemplate(std::vector<std::string> rules)
+{
+    // Body shape (plain rules, NO algo, NO injected segwit) is the
+    // rpc_request.hpp SSOT -- the key DASH<->DGB divergence.
+    return CallAPIMethod("getblocktemplate", {make_gbt_request(rules)});
+}
+
+std::string NodeRPC::propose_block_hex(const std::string& block_hex)
+{
+    // getblocktemplate {mode:proposal, data:<blockhex>} runs dashd's
+    // TestBlockValidity on the exact block and returns null on ACCEPT or a
+    // reject-reason string. This is the ORACLE-SHADOW authoritative VERDICT
+    // (mempool-independent). Never throws to the caller: an RPC-layer error is
+    // surfaced as a reason string so a transient RPC blip is not read as a
+    // consensus rejection.
+    try {
+        nlohmann::json req;
+        req["mode"] = "proposal";
+        req["data"] = block_hex;
+        auto res = CallAPIMethod("getblocktemplate", {req});
+        if (res.is_null()) return {};                 // ACCEPTED
+        if (res.is_string()) return res.get<std::string>();
+        return res.dump();
+    } catch (const std::exception& e) {
+        return std::string("rpc-error:") + e.what();
+    }
+}
+
+nlohmann::json NodeRPC::test_mempool_accept(const std::string& raw_tx_hex)
+{
+    // THE MEMPOOL VALIDITY GATE's only question to dashd: would you accept
+    // THIS transaction? The answer array carries exactly one result object for
+    // a one-element request.
+    //
+    // A transport error, a daemon that is down, or a malformed answer all
+    // return a NULL json — the caller classifies that as UNPROBED. Returning
+    // anything that could be read as `allowed` would turn "we could not ask"
+    // into "dashd said yes", which is the failure mode this whole gate exists
+    // to remove.
+    try {
+        nlohmann::json arr = nlohmann::json::array();
+        arr.push_back(raw_tx_hex);
+        auto res = CallAPIMethod("testmempoolaccept", {arr});
+        if (res.is_array() && !res.empty() && res[0].is_object()) return res[0];
+        return nlohmann::json();
+    } catch (const std::exception&) {
+        return nlohmann::json();
+    }
+}
+
+nlohmann::json NodeRPC::getnetworkinfo()
+{
+    return CallAPIMethod("getnetworkinfo");
+}
+
+nlohmann::json NodeRPC::getblockchaininfo()
+{
+    return CallAPIMethod("getblockchaininfo");
+}
+
+nlohmann::json NodeRPC::getmininginfo()
+{
+    return CallAPIMethod("getmininginfo");
+}
+
+// Trivial tip probe -- `getbestblockhash` returns the best-block hash as a bare
+// JSON string. Returns "" if the daemon result is null/absent (never throws on
+// a well-formed-but-empty result; transport errors still propagate to the
+// caller, which swallows them). No dashd config change is required.
+std::string NodeRPC::getbestblockhash()
+{
+    auto result = CallAPIMethod("getbestblockhash");
+    if (result.is_string())
+        return result.get<std::string>();
+    return {};
+}
+
+// getpeerinfo -> the dashd's own connected-peer addresses. Each entry's "addr"
+// is "host:port" (IPv6 as "[::1]:9999"); parsed to NetService. Empty on a
+// non-array/absent result. Validation (routable/port) is the peer manager's.
+std::vector<NetService> NodeRPC::getpeerinfo()
+{
+    std::vector<NetService> peers;
+    auto result = CallAPIMethod("getpeerinfo");
+    if (!result.is_array())
+        return peers;
+    for (auto& entry : result)
+    {
+        if (!entry.contains("addr") || !entry["addr"].is_string())
+            continue;
+        std::string addr = entry["addr"].get<std::string>();
+        auto colon = addr.rfind(':');
+        if (colon == std::string::npos)
+            continue;
+        std::string host = addr.substr(0, colon);
+        uint16_t port = 0;
+        try {
+            port = static_cast<uint16_t>(std::stoul(addr.substr(colon + 1)));
+        } catch (...) {
+            continue;
+        }
+        // Strip IPv6 brackets: "[2001:db8::1]" -> "2001:db8::1".
+        if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+            host = host.substr(1, host.size() - 2);
+        if (host.empty() || port == 0)
+            continue;
+        peers.emplace_back(host, port);
+    }
+    return peers;
+}
+
+// verbose: true -- json result, false -- hex-encode result;
+nlohmann::json NodeRPC::getblockheader(uint256 header, bool verbose)
+{
+    return CallAPIMethod("getblockheader", {header, verbose});
+}
+
+int NodeRPC::blockcount_cached()
+{
+    constexpr int kBlockCountCacheSecs = 20;
+    const auto now = std::time(nullptr);
+    if (m_blockcount_cache > 0
+        && now - m_blockcount_cache_at < kBlockCountCacheSecs)
+        return m_blockcount_cache;
+    try {
+        auto j = CallAPIMethod("getblockcount", {});
+        if (!j.is_number_integer()) return 0;
+        m_blockcount_cache    = j.get<int>();
+        m_blockcount_cache_at = now;
+        return m_blockcount_cache;
+    } catch (const std::exception&) {
+        return 0;   // unreachable => the caller refuses; never a stale guess
+    }
+}
+
+nlohmann::json NodeRPC::gettxout(const uint256& txid, uint32_t n)
+{
+    return CallAPIMethod("gettxout",
+                         {txid.GetHex(), static_cast<int>(n)});
+}
+
+// verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
+nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
+{
+    return CallAPIMethod("getblock", {blockhash, verbosity});
+}
+
+// E2c (#738): the MN-set seed fetch. `protx list registered true` returns
+// every REGISTERED masternode at the current tip — PoSe-banned ones included,
+// each carrying its PoSeBanHeight — with the detailed per-MN state
+// (payoutAddress, lastPaidHeight, registeredHeight, PoSe heights,
+// pubKeyOperator, ...). Chosen over `protx diff`: the diff (even extended)
+// carries payoutAddress but NOT lastPaidHeight/registeredHeight, so a
+// diff-seeded set would rank every MN equal in GetMNPayee ordering and
+// project the WRONG payee (the bad-cb-payee class #746 fixed).
+//
+// `registered`, NOT `valid`. `valid` filters the PoSe-banned masternodes out
+// entirely, so a banned masternode is INDISTINGUISHABLE from one that does
+// not exist. The replay only ever ADDS (ProRegTx) — so a ProUpServTx that
+// revives a banned-at-seed masternode finds no entry, is dropped as "unknown
+// MN", and that masternode can never return to the DIP-3 payment queue. Our
+// queue head is then permanently the NEXT entry, i.e. every projection after
+// the missed revive is one slot ahead of dashd's. Seeding the REGISTERED set
+// keeps the banned masternodes PRESENT but INELIGIBLE (isValid is derived as
+// PoSeBanHeight == 0), so eligibility is computed rather than implied by
+// absence, and the revive path in apply_block works as written.
+nlohmann::json NodeRPC::protx_list_registered_detailed()
+{
+    return CallAPIMethod("protx", {"list", "registered", true});
+}
+
+} // namespace coin
+
+} // namespace dash

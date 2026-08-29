@@ -1,0 +1,122 @@
+# C2Pool Litecoin Mainnet Configuration
+# Default mode: integrated P2P pool with embedded SPV nodes
+#
+# Zero-config startup: just run `c2pool`
+# Miners set their payout address as stratum username (like p2pool).
+# --address is optional (fallback only).
+#
+# All keys below are optional. CLI arguments always take priority over YAML values.
+
+# ─── Network ────────────────────────────────────────────────────────────────
+port: 9326                     # P2P p2pool sharechain port (LTC mainnet default)
+stratum_port: 9327             # Stratum mining port
+web_port: 8080                 # Web dashboard / JSON-RPC API port
+http_host: "0.0.0.0"          # HTTP bind address
+# external_ip: ""              # Public IP/domain for stratum URL display
+#
+# Port forwarding recommendations (if behind NAT/firewall):
+#   9326  TCP — P2P sharechain (REQUIRED for full p2pool participation)
+#   9327  TCP — Stratum mining (REQUIRED for miners to connect)
+#   8080  TCP — Web dashboard (optional, for remote monitoring)
+#   9333  TCP — LTC P2P (recommended for faster embedded SPV sync)
+#   22556 TCP — DOGE P2P (recommended for faster embedded DOGE sync)
+
+# ─── Operating Mode ────────────────────────────────────────────────────────
+# integrated: true             # Full P2P pool (DEFAULT)
+# solo: false                  # Solo pool (no P2P sharechain, proportional payouts)
+# custodial: false             # Custodial pool (all coinbase to --address, REQUIRED)
+# startup_mode: wait           # wait (DEFAULT, p2pool persist=true), genesis, auto
+
+# ─── Embedded SPV Nodes ────────────────────────────────────────────────────
+# Enabled by default. No litecoind or dogecoind daemon needed.
+# Nodes sync via DNS seeds + P2P peer discovery.
+# embedded_ltc: true           # Embedded LTC SPV (DEFAULT)
+# embedded_doge: true          # Embedded DOGE SPV for merged mining (DEFAULT)
+
+# Bootstrap checkpoints — skip millions of old headers on first sync.
+# Format: HEIGHT:BLOCK_HASH
+# Update these periodically for faster initial sync.
+header_checkpoint: "3088000:4a7fc8d4668c69db4f40fcdeb99ad3dbd85545b742b48e1529ebbec641e547d1"
+doge_header_checkpoint: "6160000:51efd04daebddba43ae403662098524d99abf3edad3bddc3ea7b2938c6799939"
+
+# ─── Sharechain Seed Nodes ─────────────────────────────────────────────────
+# P2P peers to bootstrap the sharechain from. Added alongside hardcoded
+# bootstrap hosts (ml.toom.im, usa.p2p-spb.xyz, etc.). CLI: -n HOST:PORT
+# These are p2pool sharechain protocol peers (port 9326), NOT coin daemons.
+seed_nodes:
+  - "voidbind.com:9326"
+  - "ml.toom.im:9326"
+  - "usa.p2p-spb.xyz:9326"
+# Add your own trusted nodes:
+# - "your-node.example.com:9326"
+
+# ─── Coin Daemon RPC (optional, for non-embedded mode) ──────────────────────
+# Only needed with --no-embedded-ltc
+# ltc_rpc_host: 127.0.0.1
+# ltc_rpc_port: 9332
+# ltc_rpc_user: user
+# ltc_rpc_password: pass
+
+# ─── Coin Daemon P2P (optional, adds local daemon as peer) ─────────────────
+# If you run a local litecoind, uncomment to add it as a priority peer.
+# Without this, embedded SPV syncs from DNS seeds only.
+# coind_p2p_port: 9333
+# coind_p2p_address: 127.0.0.1
+
+# ─── Payout & Fees ──────────────────────────────────────────────────────────
+# --address is OPTIONAL in integrated/solo mode.
+# Miners set payout address as their stratum username (p2pool-style).
+# --address is only required for --custodial mode.
+donation_percentage: 0.1       # Developer donation % (default: 0.1%)
+# node_owner_fee: 0.0          # Node owner fee % (default: 0%)
+# node_owner_address: ""       # Node owner payout address (LTC)
+# node_owner_merged_address: "" # Explicit merged chain (DOGE) payout address for node fee
+#                               # If not set, auto-converts from LTC address (same hash160)
+# redistribute: pplns           # Redistribution mode: pplns, fee, boost, donate
+
+# ─── Stratum per-connection vardiff tuning ───────────────────────────────────
+min_difficulty: 0.001          # Floor for per-connection difficulty (smallest ASICs)
+max_difficulty: 65536.0        # Ceiling for per-connection difficulty (large farms)
+target_time: 10.0              # Target seconds between pseudoshares
+vardiff_enabled: true          # Auto-adjust per-connection difficulty
+max_coinbase_outputs: 4000     # Max coinbase outputs (p2pool: 4000)
+
+# ─── P2P Sharechain ─────────────────────────────────────────────────────────
+p2p_max_peers: 30              # Max total P2P peers (inbound + outbound)
+ban_duration: 300              # P2P ban duration in seconds (5 min)
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+log_level: INFO                # trace, debug, info, warning, error
+# log_file: c2pool.log         # Log filename (in data dir; default: debug.log)
+log_rotation_size_mb: 100      # Rotate log file at N MB
+log_max_total_mb: 50           # Max total rotated log space in MB
+
+# ─── Memory & Caches ────────────────────────────────────────────────────────
+rss_limit_mb: 4000             # Abort if RSS exceeds N MB (default: 4GB)
+# cache_max_shared_hashes: 50000
+# cache_max_known_txs: 10000
+# cache_max_raw_shares: 50000
+
+# ─── Storage ────────────────────────────────────────────────────────────────
+storage_save_interval: 300     # Periodic sharechain save interval (seconds)
+
+# ─── HTTP API / Security ────────────────────────────────────────────────────
+# cors_origin: "*"             # Access-Control-Allow-Origin header
+
+# ─── Web Dashboard ──────────────────────────────────────────────────────────
+# Dashboard and explorer are user-customizable: edit web-static/ HTML/JS/CSS
+# and explorer/explorer.py freely — they are bundled as modifiable components.
+dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)
+# analytics_id: "G-XXXXXXXXXX"  # Google Analytics measurement ID (optional)
+
+# Custom block explorer link prefixes (override Blockchair defaults).
+# Dashboard and explorer use these for address/block/tx hyperlinks.
+# address_explorer_prefix: "https://blockchair.com/litecoin/address/"
+# block_explorer_prefix: "https://blockchair.com/litecoin/block/"
+# tx_explorer_prefix: "https://blockchair.com/litecoin/transaction/"
+
+# ─── Lite Block Explorer ─────────────────────────────────────────────────────
+explorer: true                             # Enable block storage + explorer REST API
+# explorer_url: "http://localhost:9090"      # Explorer URL for dashboard nav link
+explorer_depth_ltc: 288                    # LTC blocks to keep
+explorer_depth_doge: 1440                  # DOGE blocks to keep

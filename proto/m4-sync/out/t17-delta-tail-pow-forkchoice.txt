@@ -1,0 +1,31 @@
+=== M4 T17: delta-tail per-share PoW + cumulative-work fork choice ===
+D_f=12 shares, honest bits=16, sybilC bits=12 len=8
+
+candidate                 chained  per-share-PoW  cum-work        full-rule  header-only
+honest                    True     True           786432          ACCEPT     ACCEPT
+forgedA_nopow             True     False          0               reject     ACCEPT
+forgedB_spliced           False    True           0               reject     reject
+forgedC_minoritywork      True     True           32768           ACCEPT     ACCEPT
+
+fork_choice winner (max valid cumulative work): honest
+
+--- golden invariants ---
+  [PASS] honest_accepted
+  [PASS] forgedA_rejected_nopow
+  [PASS] forgedB_rejected_splice
+  [PASS] forgedC_valid_but_loses
+  [PASS] forkchoice_picks_honest
+  [PASS] headeronly_accepts_forgedA
+  [PASS] fullrule_rejects_forgedA
+
+--- golden vector ---
+{
+  "boundary": "d9a3e15786b275e7f306498cb59bb1075bf6fcb5c23db7de82650f283ac4f540",
+  "honest_tip": "000080497c94ef27d184a6aac3eb33af2a82f4b8c2f450ba2d72a22f26de6f15",
+  "honest_cum_work": 786432,
+  "sybilC_cum_work": 32768,
+  "work_ratio_honest_over_sybilC": 24.0,
+  "winner": "honest"
+}
+
+RESULT: ALL PASS — F1 defense (per-share PoW + cumulative-work fork choice) TESTED & HOLDS.

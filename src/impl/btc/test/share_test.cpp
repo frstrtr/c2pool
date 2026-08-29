@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+    // PackStream stream_share;
+    // stream_share.from_hex("21fd0702fe02000020617dfa46bf73eb96548e0b039a647d35b387ed0cb1a6e51c80092175857d3f5b3ac4ff62f1a9001bc0254dda4d00fe065ba137d8e108ef134db29b7e33f46327f13626975c0c2a190082018f3d04d03aee002cfabe6d6d21102609e852babee96639fbb3b65588bbcc419720fec56da52e47120c4804a501000000000000000a5f5f6332706f6f6c5f5ffc88aa669a2cd3c1310067ae7e47a7869b330d30b691c61b46fb483b0a0000000000002102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203517d2164368b766e6b9d0598510a7bbfc9882940ebfe3f65bb72173c3dbf105802f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5ef1025a29236b072d75cde8637584a3ed2fe0bcd4aadb5824b61cc42b4414e143d020000000195cbb26f405ead27fcd8cf84155cfcfab722a0cfdb3a2c735fce15fb19bc8ae4ffff0f1e8888001e3bc4ff62cc210000df798a25160000000000000000000000000000000001000000986dae33074d8c439a5dc61c2019a86726ebd1cf0eb0240582ccc0b249d12ba7fd9c0102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203");
+
+#include <gtest/gtest.h>
+
+#include <core/uint256.hpp>
+#include <sharechain/sharechain.hpp>
+#include <impl/btc/share.hpp>
+#include <impl/btc/coin/template_builder.hpp>
+#include <impl/btc/coin/header_chain.hpp>
+
+// struct FakeBlock
+// {
+
+// };
+
+TEST(LTC_share_test, Init)
+{
+    PackStream stream_share;
+    // stream_share.from_hex("21fd0702fe02000020617dfa46bf73eb96548e0b039a647d35b387ed0cb1a6e51c80092175857d3f5b3ac4ff62f1a9001bc0254dda4d00fe065ba137d8e108ef134db29b7e33f46327f13626975c0c2a190082018f3d04d03aee002cfabe6d6d21102609e852babee96639fbb3b65588bbcc419720fec56da52e47120c4804a501000000000000000a5f5f6332706f6f6c5f5ffc88aa669a2cd3c1310067ae7e47a7869b330d30b691c61b46fb483b0a0000000000002102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203517d2164368b766e6b9d0598510a7bbfc9882940ebfe3f65bb72173c3dbf105802f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5ef1025a29236b072d75cde8637584a3ed2fe0bcd4aadb5824b61cc42b4414e143d020000000195cbb26f405ead27fcd8cf84155cfcfab722a0cfdb3a2c735fce15fb19bc8ae4ffff0f1e8888001e3bc4ff62cc210000df798a25160000000000000000000000000000000001000000986dae33074d8c439a5dc61c2019a86726ebd1cf0eb0240582ccc0b249d12ba7fd9c0102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203");
+    stream_share.from_hex("23fd9601fe00000020654f11363698fc9a54e43f126f294bd1a33b650148e8b6bb532fc08500cb6966e8103066140b041db0022a77e3af9c1de80a16583bed2a6179b63ed410b890b113cfd0fcd68bafa4096779b90503fd823100731a92d3226d6839617a4b44785235374766374a575a756e6e43324a7a37325351747746544b68dec14025000000000000fe2302a41fb37f52f6747afbbeae61462feaa40b8b3655f8fb7af60843111101ec5f958e93b9a76bb46536bf807b1caef9635f432d982bd907eb5050130b6ec00aeabc2bb9ca34c5f1ba0bd332fc3d217d9853754fe42797e32cf9ddddcab6f66ab8056f1b64efa2157281c406fc6a5d9de6db5e2adf63c86646a4edc91c51f86d74c707c0221e8828011ef310306675b3210073990593df0d00000000000000000000000100000000000000c357550d5a390b342f665a3d853c039a626b803bb37976c20ba0b5ee5a56fceedc0220e67c088987582af73218c99820276bbf0004c5c18f7dd691f9c4326bfd9930d5567a6d109fec00f4eca887c42e80ddaa57df9bda8db8b277110a50a9a268b6");
+
+    chain::RawShare rshare;
+    stream_share >> rshare;
+
+    std::cout << rshare.type << std::endl;
+
+    auto share = btc::load_share(rshare, NetService{"0.0.0.0", 0});
+}
+#include <core/version_gate.hpp>
+
+// G1 — version_gate SSOT boundary KAT (BTC reference adoption).
+// Proves the V36 share-format / consensus-revision boundary: is_v36_active()
+// flips at EXACTLY version 36, uniformly across coins, independent of any
+// per-coin segwit activation. This pins the v36-delta BOUNDARY only; full v35
+// byte-parity is closed separately by the canonical golden-hex vector (G0).
+TEST(BTC_version_gate, V36ActivationBoundary)
+{
+    using core::version_gate::is_v36_active;
+    using core::version_gate::V36_ACTIVATION_VERSION;
+
+    // Activation number is the uniform cross-coin 36 (no per-coin network state).
+    EXPECT_EQ(V36_ACTIVATION_VERSION, 36u);
+
+    // Pre-v36 versions use the legacy sharechain encoding.
+    EXPECT_FALSE(is_v36_active(0));
+    EXPECT_FALSE(is_v36_active(17));   // ltc/bch segwit version — NOT a v36 gate
+    EXPECT_FALSE(is_v36_active(33));   // BTC segwit version — NOT a v36 gate
+    EXPECT_FALSE(is_v36_active(35));   // exactly one below the boundary
+
+    // v36 and above use the V36 encoding + V36 consensus semantics.
+    EXPECT_TRUE(is_v36_active(36));    // exactly at the boundary
+    EXPECT_TRUE(is_v36_active(37));
+    EXPECT_TRUE(is_v36_active(1000));
+
+    // The flip is a single version step — no off-by-one at the boundary.
+    EXPECT_NE(is_v36_active(35), is_v36_active(36));
+
+    // constexpr: serves `if constexpr` template gates as well as runtime checks.
+    static_assert(!is_v36_active(35), "v35 must be pre-v36 at compile time");
+    static_assert(is_v36_active(36), "v36 must activate at compile time");
+}
+
+// SCOPE guard: segwit activation is coin-SPECIFIC and MUST NOT be folded into
+// the uniform v36 gate. BTC segwit=33 sits below 36, so a share can be
+// segwit-active yet pre-v36 — the two boundaries are independent by design.
+TEST(BTC_version_gate, SegwitNotFoldedIntoV36Gate)
+{
+    static_assert(33u < core::version_gate::V36_ACTIVATION_VERSION,
+                  "BTC segwit version must remain below the v36 gate");
+    EXPECT_FALSE(core::version_gate::is_v36_active(33));
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Coinbase subsidy MUST honor the per-network halving interval.
+//
+// Regression for the G3b won-block "bad-cb-amount" reject: the embedded
+// TemplateBuilder computes coinbasevalue from get_block_subsidy(height) and
+// previously hardcoded the 210,000-block mainnet halving interval. On regtest
+// (CRegTestParams nSubsidyHalvingInterval = 150) a won block at height 275 is
+// one halving past 150, so consensus allows only 25 BTC — but c2pool emitted
+// the genesis 50 BTC and bitcoind rejected the block on ConnectBlock, silently
+// losing the won subsidy. get_block_subsidy must scale by the passed interval.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST(BTC_subsidy, RegtestHalvingIntervalHonored)
+{
+    using btc::coin::get_block_subsidy;
+    constexpr uint64_t COIN = 100'000'000ULL;
+
+    // Regtest interval = 150. This is the exact won-block scenario.
+    EXPECT_EQ(get_block_subsidy(0,   150u), 50 * COIN);   // genesis epoch
+    EXPECT_EQ(get_block_subsidy(149, 150u), 50 * COIN);   // last of epoch 0
+    EXPECT_EQ(get_block_subsidy(150, 150u), 25 * COIN);   // first halving
+    EXPECT_EQ(get_block_subsidy(274, 150u), 25 * COIN);   // still epoch 1
+    EXPECT_EQ(get_block_subsidy(275, 150u), 25 * COIN);   // the rejected height: 25, NOT 50
+    EXPECT_EQ(get_block_subsidy(299, 150u), 25 * COIN);   // last of epoch 1
+    EXPECT_EQ(get_block_subsidy(300, 150u), 1'250'000'000ULL); // 12.5 BTC, epoch 2
+
+    // The pre-fix bug would have returned 50 BTC at h=275 (275 < 210000).
+    EXPECT_NE(get_block_subsidy(275, 150u), 50 * COIN);
+
+    // INTEGRATION SEAM (the actual G3b leg-b defect): proving the resolver
+    // honors a 150 interval is not enough — the regtest chainparams must
+    // actually CARRY 150 so the embedded TemplateBuilder passes it through.
+    // Pre-fix regtest() inherited the 210,000 default, so the won-block
+    // coinbase at h275 paid the un-halved 50 BTC. These flip RED on the bug.
+    using btc::coin::BTCChainParams;
+    EXPECT_EQ(BTCChainParams::regtest().subsidy_halving_interval, 150u);
+    EXPECT_EQ(get_block_subsidy(275, BTCChainParams::regtest().subsidy_halving_interval),
+              25 * COIN);
+}
+
+// Mainnet/testnet remain consensus-neutral after parameterization: the
+// chainparams field defaults to 210,000 and the single-arg default path is
+// unchanged.
+TEST(BTC_subsidy, MainnetIntervalUnchanged)
+{
+    using btc::coin::get_block_subsidy;
+    using btc::coin::BTCChainParams;
+    constexpr uint64_t COIN = 100'000'000ULL;
+
+    EXPECT_EQ(BTCChainParams::mainnet().subsidy_halving_interval, 210'000u);
+    EXPECT_EQ(BTCChainParams::testnet().subsidy_halving_interval, 210'000u);
+    EXPECT_EQ(BTCChainParams::testnet4().subsidy_halving_interval, 210'000u);
+
+    // Default-arg (single-arg) call still yields mainnet halving values.
+    EXPECT_EQ(get_block_subsidy(209'999),       50 * COIN);
+    EXPECT_EQ(get_block_subsidy(210'000),       25 * COIN);
+    EXPECT_EQ(get_block_subsidy(210'000, 210'000u), 25 * COIN);
+}

@@ -1,0 +1,1052 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+/// Dash Header Chain — SPV header-only chain with X11 PoW validation.
+/// DarkGravityWave v3 per-block difficulty retarget (24-block lookback).
+/// Persistence via LevelDB for fast restarts.
+
+#include "block.hpp"
+#include "lane_diag.hpp"        // ProgressReporter / LogSuppressor (backfill telemetry)
+#include <impl/bitcoin_family/coin/chain_params.hpp>
+#include <impl/dash/crypto/hash_x11.hpp>
+
+#include <core/uint256.hpp>
+#include <core/leveldb_store.hpp>
+#include <core/log.hpp>
+#include <core/pack.hpp>
+#include <core/hash.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <iomanip>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace dash {
+namespace coin {
+
+// ─── Index Entry ────────────────────────────────────────────────────────────
+
+enum HeaderStatus : uint32_t {
+    HEADER_VALID_UNKNOWN  = 0,
+    HEADER_VALID_HEADER   = 1,
+    HEADER_VALID_TREE     = 2,
+    HEADER_VALID_CHAIN    = 3,
+};
+
+struct IndexEntry {
+    BlockHeaderType header;
+    uint256         hash;           // X11(header) — both PoW and block identity for Dash
+    uint32_t        height{0};
+    uint256         chain_work;
+    uint256         prev_hash;
+    HeaderStatus    status{HEADER_VALID_UNKNOWN};
+
+    template<typename Stream>
+    void Serialize(Stream& s) const {
+        ::Serialize(s, header);
+        ::Serialize(s, hash);
+        ::Serialize(s, height);
+        ::Serialize(s, chain_work);
+        ::Serialize(s, prev_hash);
+        ::Serialize(s, static_cast<uint32_t>(status));
+    }
+    template<typename Stream>
+    void Unserialize(Stream& s) {
+        ::Unserialize(s, header);
+        ::Unserialize(s, hash);
+        ::Unserialize(s, height);
+        ::Unserialize(s, chain_work);
+        ::Unserialize(s, prev_hash);
+        uint32_t st;
+        ::Unserialize(s, st);
+        status = static_cast<HeaderStatus>(st);
+    }
+};
+
+// ─── Dash Chain Parameters ──────────────────────────────────────────────────
+
+using DashChainParams = bitcoin_family::coin::ChainParams;
+
+inline DashChainParams make_dash_chain_params_mainnet() {
+    DashChainParams p;
+    p.target_timespan = 3600;       // 1 hour (not used by DGW, but kept for interface compat)
+    p.target_spacing  = 150;        // 2.5 minutes
+    p.allow_min_difficulty = false;
+    p.no_retargeting = false;
+    p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    p.genesis_hash.SetHex("00000ffd590b1485b3caadc19b22e6379c733355108f107a430458cdf3407ab6");
+    p.halving_interval = 210240;
+    p.initial_subsidy = 500000000ULL; // 5 DASH (after early high-emission phase)
+    // Dash: X11 for both PoW validation AND block identity hash
+    p.pow_func = [](std::span<const unsigned char> data) -> uint256 {
+        return dash::crypto::hash_x11(data);
+    };
+    p.block_hash_func = p.pow_func;
+
+    // Fast-start checkpoint: PINNED TO COINCIDE WITH THE MN-SET BRIDGE
+    // ANCHOR (dash_mn_checkpoint_mainnet.inc, height 2513000). Cold start
+    // seeds the header tip AT the anchor, skipping ~2.5M headers of
+    // validation from genesis.
+    //
+    // WHY IT MUST EQUAL THE MN ANCHOR (2026-08-16 cold-cut incident). The
+    // MN-set fold (mn_checkpoint_lane) cannot begin until the header tip
+    // REACHES its anchor height -- until then it reports
+    // waiting_for()=="header-tip-to-reach-anchor@h=2513000". When this
+    // checkpoint sat 113k blocks BELOW the anchor (the old 2400000 pin), a
+    // fresh --coin-rpc-removed data-dir spent ~113000/~60 hdr/s ~= 31 min
+    // crawling headers forward BEFORE the first fold could start, so every
+    // stratum rig timed out before the first embedded template was served
+    // (have_tip=0 / populated=0 for >14 min). Coinciding the two collapses
+    // that gap: hdr_tip >= anchor at t~=0, and only the residual
+    // anchor->tip folds. See test_dash_header_checkpoint_coincide.cpp.
+    //
+    // This mints NO new consensus data: the height/hash below are the SAME
+    // release-pinned trust anchor the MN checkpoint already commits to and
+    // cross-checks the header chain against (mn_checkpoint_lane position
+    // verify). The coincidence is machine-enforced by that KAT, so the two
+    // pins can never silently drift apart again.
+    p.fast_start_checkpoint = DashChainParams::Checkpoint{};
+    p.fast_start_checkpoint->height = 2522504;
+    p.fast_start_checkpoint->hash.SetHex(
+        "0000000000000016359051c239e552f2423a9f47585dda1273a9a0e1743d64f5");
+    // The FULL header of the anchor block (mainnet 2513000), so the cold seed
+    // populates entry.header — not just entry.hash. Without it the seeded
+    // IndexEntry carries a default (all-zero) hashMerkleRoot, and the DIP-4
+    // historical-snapshot authentication in the MN-set bridge fails closed at
+    // step (b) ("block header not held"): the base=ZERO anchor snapshot is
+    // consumed but never APPLIED, the payee cursor never leaves the anchor,
+    // have_mn stays 0, and the embedded arm never serves a template on a
+    // --coin-rpc-removed binary (2026-08-16 cold-cut park). Pre-#1250 this
+    // root arrived by crawling headers in from the older 2400000 pin; #1250's
+    // fast-start seed dropped it. These six fields are the consensus header of
+    // the SAME release-pinned block `hash` above; init() REFUSES them unless
+    // X11(header) == hash (self-verifying, fail closed) — so no new trust is
+    // minted. Machine-checked by test_dash_anchor_header_merkle_root.cpp.
+    p.fast_start_checkpoint->has_header = true;
+    p.fast_start_checkpoint->hdr_version = 536870912u;   // 0x20000000
+    p.fast_start_checkpoint->hdr_prev_block.SetHex(
+        "000000000000001ba36f24ad2f5c2a8fbe7a5bddcd87c05ceb175fbfaf66cef3");
+    p.fast_start_checkpoint->hdr_merkle_root.SetHex(
+        "68a1e828b55bddf70048e5ea8403aa2c7c0ae2e7e9d73cd8fe066feb352c88b3");
+    p.fast_start_checkpoint->hdr_time  = 1786835924u;
+    p.fast_start_checkpoint->hdr_bits  = 0x19251a49u;
+    p.fast_start_checkpoint->hdr_nonce = 3493802570u;
+    return p;
+}
+
+inline DashChainParams make_dash_chain_params_testnet() {
+    DashChainParams p;
+    p.target_timespan = 3600;
+    p.target_spacing  = 150;
+    p.allow_min_difficulty = true;
+    p.no_retargeting = false;
+    p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    p.genesis_hash.SetHex("00000bafbc94add76cb75e2ec92894837288a481e5c005f6563d91623bf8bc2c");
+    p.halving_interval = 210240;
+    p.initial_subsidy = 500000000ULL;
+    p.pow_func = [](std::span<const unsigned char> data) -> uint256 {
+        return dash::crypto::hash_x11(data);
+    };
+    p.block_hash_func = p.pow_func;
+    return p;
+}
+
+// ─── PoW / Hash Functions ──────────────────────────────────────────────────
+
+inline uint256 x11_hash(const BlockHeaderType& header) {
+    auto packed = pack(header);
+    return dash::crypto::hash_x11(packed.get_span());
+}
+
+inline uint256 target_from_bits(uint32_t bits) {
+    uint256 target;
+    target.SetCompact(bits);
+    return target;
+}
+
+inline bool check_pow(const uint256& pow_hash, uint32_t bits, const uint256& pow_limit) {
+    bool negative, overflow;
+    uint256 target;
+    target.SetCompact(bits, &negative, &overflow);
+    if (negative || target.IsNull() || overflow || target > pow_limit)
+        return false;
+    return pow_hash <= target;
+}
+
+inline uint256 get_block_proof(uint32_t bits) {
+    bool negative, overflow;
+    uint256 target;
+    target.SetCompact(bits, &negative, &overflow);
+    if (negative || target.IsNull() || overflow)
+        return uint256::ZERO;
+    return (~target / (target + uint256::ONE)) + uint256::ONE;
+}
+
+// ─── DarkGravityWave v3 ────────────────────────────────────────────────────
+// Reference: dashcore/src/pow.cpp DarkGravityWave()
+// Per-block difficulty retarget using 24-block lookback window.
+
+static constexpr int64_t DGW_PAST_BLOCKS = 24;
+
+inline uint32_t dark_gravity_wave(
+    std::function<std::optional<IndexEntry>(uint32_t)> get_ancestor,
+    uint32_t tip_height,
+    const DashChainParams& params)
+{
+    const uint256 pow_limit = params.pow_limit;
+    uint32_t pow_limit_bits = pow_limit.GetCompact();
+
+    if (tip_height < DGW_PAST_BLOCKS)
+        return pow_limit_bits;
+
+    uint256 past_target_avg;
+    int64_t last_time = 0;
+    int64_t first_time = 0;
+
+    // Reference: dashcore pow.cpp DarkGravityWave()
+    // nCountBlocks is 1-based: 1 for first block, 2 for second, etc.
+    for (uint32_t n = 1; n <= static_cast<uint32_t>(DGW_PAST_BLOCKS); ++n)
+    {
+        auto entry = get_ancestor(tip_height - (n - 1));
+        if (!entry) return pow_limit_bits;
+
+        uint256 target = target_from_bits(entry->header.m_bits);
+
+        if (n == 1) {
+            past_target_avg = target;
+        } else {
+            past_target_avg = (past_target_avg * n + target) / (n + 1);
+        }
+
+        if (n == 1)
+            last_time = entry->header.m_timestamp;
+        if (n == static_cast<uint32_t>(DGW_PAST_BLOCKS))
+            first_time = entry->header.m_timestamp;
+    }
+
+    uint256 bn_new = past_target_avg;
+
+    int64_t actual_timespan = last_time - first_time;
+    int64_t target_timespan = DGW_PAST_BLOCKS * params.target_spacing;
+
+    if (actual_timespan < target_timespan / 3)
+        actual_timespan = target_timespan / 3;
+    if (actual_timespan > target_timespan * 3)
+        actual_timespan = target_timespan * 3;
+
+    bn_new *= static_cast<uint32_t>(actual_timespan);
+    bn_new /= uint256(static_cast<uint64_t>(target_timespan));
+
+    if (bn_new > pow_limit)
+        bn_new = pow_limit;
+
+    return bn_new.GetCompact();
+}
+
+// ─── HeaderChain ────────────────────────────────────────────────────────────
+
+class HeaderChain {
+public:
+    HeaderChain(const DashChainParams& params, const std::string& db_path = "")
+        : m_params(params), m_db_path(db_path) {}
+
+    ~HeaderChain() = default;
+    HeaderChain(const HeaderChain&) = delete;
+    HeaderChain& operator=(const HeaderChain&) = delete;
+
+    bool init() {
+        LOG_INFO << "[EMB-DASH] HeaderChain::init() db_path=" << (m_db_path.empty() ? "(in-memory)" : m_db_path)
+                 << " genesis=" << m_params.genesis_hash.GetHex().substr(0, 16);
+        if (!m_db_path.empty()) {
+            core::LevelDBOptions opts;
+            opts.write_buffer_size = 2 * 1024 * 1024;
+            opts.block_cache_size = 4 * 1024 * 1024;
+            m_db = std::make_unique<core::LevelDBStore>(m_db_path, opts);
+            if (!m_db->open()) {
+                LOG_WARNING << "[EMB-DASH] LevelDB open FAILED at " << m_db_path;
+                return false;
+            }
+            load_from_db();
+        }
+        // Prefer fast-start checkpoint over genesis when chain is empty.
+        // Matches c2pool-ltc init order: an anchor block jumps us past
+        // millions of irrelevant headers, saving ~30s of cold-sync time.
+        // (A CLI --dash-header-checkpoint may further bump this via
+        // set_dynamic_checkpoint() after init returns.)
+        if (m_tip.IsNull() && m_params.fast_start_checkpoint.has_value()) {
+            auto& cp = m_params.fast_start_checkpoint.value();
+            IndexEntry entry;
+            entry.hash = cp.hash;
+            entry.height = cp.height;
+            entry.chain_work = uint256::ONE;
+            entry.prev_hash = uint256::ZERO;
+            entry.status = HEADER_VALID_CHAIN;
+
+            // When the checkpoint carries its full header, adopt ONLY its
+            // self-verified hashMerkleRoot into entry.header — the single field
+            // the DIP-4 historical-snapshot auth in the MN-set bridge reads
+            // (main_dash set_merkle_root_at_fn). SELF-VERIFY first: X11 over the
+            // FULL pinned header must equal the release-pinned block hash; a
+            // mismatch means the pin is corrupt, so fail closed (adopt nothing)
+            // rather than feed a merkleRoot that could authenticate a forged SML.
+            //
+            // HONESTY RECONCILIATION (Plan A). We deliberately DO NOT copy the
+            // whole header. m_bits / m_timestamp / m_version / ... stay at their
+            // synthetic-anchor defaults (0), so chain_rpc::is_synthetic_anchor()
+            // (keyed on m_bits==0) stays TRUE and the node keeps WITHHOLDING the
+            // daemon-tip fields difficulty / mediantime / bestblockhash until it
+            // is genuinely synced to the LIVE tip. The pinned header exists for
+            // INTERNAL DIP-4 auth only; a single lone checkpoint anchor must
+            // never masquerade as a daemon tip. Mints no new trust: the merkle
+            // root is adopted only once proven to X11-hash to the pinned block
+            // hash. Machine-checked by test_dash_anchor_header_merkle_root (root
+            // present) and test_dash_header_chain's *SyntheticAnchor* guards
+            // (daemon-tip fields still withheld at the anchor).
+            if (cp.has_header) {
+                BlockHeaderType hdr;
+                hdr.m_version        = cp.hdr_version;
+                hdr.m_previous_block = cp.hdr_prev_block;
+                hdr.m_merkle_root    = cp.hdr_merkle_root;
+                hdr.m_timestamp      = cp.hdr_time;
+                hdr.m_bits           = cp.hdr_bits;
+                hdr.m_nonce          = cp.hdr_nonce;
+                const uint256 computed = x11_hash(hdr);
+                if (computed == cp.hash) {
+                    // Adopt the merkle root ALONE; leave every other header
+                    // field synthetic (0) so is_synthetic_anchor() stays true
+                    // and the daemon-tip honesty guards keep withholding.
+                    entry.header.m_merkle_root = hdr.m_merkle_root;
+                    LOG_INFO << "[EMB-DASH] Fast-start checkpoint merkleRoot"
+                                " VERIFIED (X11==hash) merkleRoot="
+                             << hdr.m_merkle_root.GetHex().substr(0, 16)
+                             << " (anchor kept synthetic: bits/time withheld)";
+                } else {
+                    LOG_ERROR << "[EMB-DASH] Fast-start checkpoint header X11 "
+                                 "MISMATCH — refusing to seed merkleRoot (fail "
+                                 "closed); computed="
+                              << computed.GetHex().substr(0, 16) << " pinned="
+                              << cp.hash.GetHex().substr(0, 16);
+                    // entry.header stays default (null merkleRoot) — unproven.
+                }
+            }
+
+            m_headers[cp.hash] = entry;
+            m_height_index[cp.height] = cp.hash;
+            m_tip = cp.hash;
+            m_tip_height = cp.height;
+            m_best_work = entry.chain_work;
+            persist_header(entry);
+            persist_tip();
+            LOG_INFO << "[EMB-DASH] Fast-start checkpoint: height=" << cp.height
+                     << " hash=" << cp.hash.GetHex().substr(0, 16)
+                     << " merkleRoot="
+                     << (entry.header.m_merkle_root.IsNull() ? "null" : "seeded");
+        }
+        // Fall back to genesis as stub when no checkpoint is configured
+        // (so block 1's prev_hash resolves).
+        if (m_tip.IsNull() && !m_params.genesis_hash.IsNull()) {
+            IndexEntry genesis;
+            genesis.hash = m_params.genesis_hash;
+            genesis.height = 0;
+            genesis.chain_work = uint256::ONE;
+            genesis.prev_hash = uint256::ZERO;
+            genesis.status = HEADER_VALID_CHAIN;
+            m_headers[m_params.genesis_hash] = genesis;
+            m_height_index[0] = m_params.genesis_hash;
+            m_tip = m_params.genesis_hash;
+            m_tip_height = 0;
+            m_best_work = genesis.chain_work;
+            persist_header(genesis);
+            persist_tip();
+            LOG_INFO << "[EMB-DASH] Genesis seeded: " << m_params.genesis_hash.GetHex().substr(0, 16);
+        }
+        return true;
+    }
+
+    std::optional<IndexEntry> tip() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull()) return std::nullopt;
+        auto it = m_headers.find(m_tip);
+        return it != m_headers.end() ? std::optional{it->second} : std::nullopt;
+    }
+
+    uint32_t height() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_tip_height;
+    }
+
+    uint256 cumulative_work() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_best_work;
+    }
+
+    // Phase C-TEMPLATE step 9: bits the next block must satisfy.
+    // Wraps DarkGravityWave3 over the current tip + 24-block window.
+    // Returns 0 when we don't yet have enough headers to retarget
+    // (caller should fall back to RPC / not produce a template).
+    uint32_t next_work_required() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull() || m_tip_height < DGW_PAST_BLOCKS) return 0;
+        auto get_ancestor = [this](uint32_t h) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(h);
+        };
+        return dark_gravity_wave(get_ancestor, m_tip_height, m_params);
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_headers.size();
+    }
+
+    // Median-time-past of the tip: median of the last 11 block timestamps
+    // (dashcore GetMedianTimePast / BIP113). build_embedded_workdata() uses
+    // mtp_at_tip+1 as the template mintime, so the embedded arm needs a real
+    // MTP off the header chain to match dashd's GBT. Falls back to the tip
+    // timestamp when fewer than 11 headers are indexed (cold start).
+    uint32_t median_time_past() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull()) return 0;
+        static constexpr int MEDIAN_SPAN = 11;
+        std::vector<uint32_t> times;
+        times.reserve(MEDIAN_SPAN);
+        int64_t h = static_cast<int64_t>(m_tip_height);
+        for (int i = 0; i < MEDIAN_SPAN && h >= 0; ++i, --h) {
+            auto e = get_header_by_height_internal(static_cast<uint32_t>(h));
+            if (!e) break;
+            times.push_back(e->header.m_timestamp);
+        }
+        if (times.empty()) {
+            auto it = m_headers.find(m_tip);
+            return it != m_headers.end() ? it->second.header.m_timestamp : 0;
+        }
+        std::sort(times.begin(), times.end());
+        return times[times.size() / 2];
+    }
+
+    bool has_header(const uint256& hash) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_headers.count(hash) > 0;
+    }
+
+    std::optional<IndexEntry> get_header(const uint256& hash) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_headers.find(hash);
+        return it != m_headers.end() ? std::optional{it->second} : std::nullopt;
+    }
+
+    std::optional<IndexEntry> get_header_by_height(uint32_t h) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return get_header_by_height_internal(h);
+    }
+
+    bool add_header(const BlockHeaderType& header) {
+        PendingTipChange ptc;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!add_header_internal(header)) return false;
+            persist_tip();
+            ptc = m_pending_tip_change;
+            m_pending_tip_change.fired = false;
+        }
+        if (ptc.fired && m_on_tip_changed)
+            m_on_tip_changed(ptc.old_tip, ptc.old_height, ptc.new_tip, ptc.new_height, ptc.was_reorg);
+        return true;
+    }
+
+    int add_headers(const std::vector<BlockHeaderType>& headers) {
+        int accepted = 0;
+        PendingTipChange last_ptc;
+        // X11 is fast (~0.1ms per header) so large batches are fine
+        static constexpr size_t BATCH_SIZE = 500;
+        for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                size_t end = std::min(offset + BATCH_SIZE, headers.size());
+                for (size_t i = offset; i < end; ++i) {
+                    if (add_header_internal(headers[i]))
+                        ++accepted;
+                }
+                if (m_pending_tip_change.fired)
+                    last_ptc = m_pending_tip_change;
+                m_pending_tip_change.fired = false;
+            }
+            if (offset + BATCH_SIZE < headers.size())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // WIRE BYTES. Each entry in a DASH `headers` message is an 80-byte
+        // header plus a CompactSize(0) tx-count byte, so this is the exact
+        // payload size for the batch (the message's own count varint aside) —
+        // not an estimate. Counted for RECEIVED, not accepted: bytes are what
+        // came off the wire whether or not the header was new.
+        static constexpr uint64_t kWireBytesPerHeader = 81;
+        m_hdr_wire_bytes += static_cast<uint64_t>(headers.size())
+                            * kWireBytesPerHeader;
+        m_hdr_received   += static_cast<uint64_t>(headers.size());
+        m_hdr_accepted   += static_cast<uint64_t>(accepted);
+        if (accepted > 0) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            persist_tip();
+            uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
+            if (peer_tip > 0 && m_tip_height > 0) {
+                // ── THE HEADER-BACKFILL PROGRESS LINE ────────────────────
+                // Replaces the old `[DASH] Header sync: N/M (P%)`, which had
+                // three defects that each cost time on 2026-08-04: no RATE and
+                // no ETA (both had to be reconstructed by diffing log
+                // timestamps by hand), no BYTES, and a throttle on height
+                // ALONE — so a backfill that slowed to a crawl went quiet for
+                // as long as it took to cover 2000 blocks, which is exactly
+                // when an operator most needs a line. The new throttle is
+                // 2000 headers OR 15 s, whichever comes FIRST.
+                //
+                // The old throttle also used a function-local `static`, i.e.
+                // ONE counter shared by every HeaderChain in the process; the
+                // member below is per-instance.
+                const int64_t now = diag::steady_now_ms();
+                if (!m_hdr_progress.started())
+                    m_hdr_progress.start(m_tip_height, now);
+                auto s = m_hdr_progress.sample(m_tip_height, now);
+                const bool finishing = (100.0 * m_tip_height / peer_tip) >= 99.9;
+                if (!s && finishing) s = m_hdr_progress.flush(m_tip_height, now);
+                if (s) {
+                    const uint64_t remaining =
+                        peer_tip > m_tip_height ? (peer_tip - m_tip_height) : 0;
+                    LOG_INFO
+                        << "[REPLAY-PROGRESS] lane=hdr-backfill"
+                        << " cursor=" << m_tip_height
+                        << " target=" << peer_tip
+                        << " done="
+                        << diag::fmt1(diag::ProgressReporter::done_pct(
+                               m_tip_height, peer_tip))
+                        << "%"
+                        << " rate=" << diag::fmt1(s->rate_per_s) << "hdr/s"
+                        << " eta="
+                        << diag::fmt_eta(diag::ProgressReporter::eta_s(
+                               *s, remaining))
+                        << " fetched=" << diag::fmt_bytes(m_hdr_wire_bytes)
+                        << " received=" << m_hdr_received
+                        << " accepted=" << m_hdr_accepted
+                        << " elapsed=" << (s->total_ms / 1000) << "s";
+                }
+            }
+        }
+        if (last_ptc.fired && m_on_tip_changed)
+            m_on_tip_changed(last_ptc.old_tip, last_ptc.old_height, last_ptc.new_tip, last_ptc.new_height, last_ptc.was_reorg);
+        // CP2 validate: received vs accepted. accepted==0 on a non-empty batch
+        // is the Q3 silent-reject corner — with a checkpoint configured the
+        // genesis stub is not seeded, so headers served from block 1 orphan-
+        // reject invisibly. Log the first header's prev hash so orphan-vs-PoW
+        // is distinguishable.
+        // THROTTLED (was one line per message, unbounded). During tip-follow
+        // this fires per header message forever and buries everything else;
+        // the suppressor collapses it to one line per 30 s and CARRIES the
+        // dropped count, so a storm is summarised rather than silently lost.
+        // The accepted==0 corner below is deliberately NOT suppressed: it is
+        // the diagnostic, not the noise.
+        {
+            const int64_t now = diag::steady_now_ms();
+            static const std::string kKey = "hdr-cp2";
+            if (m_hdr_cp2_log.allow(kKey, now))
+                LOG_INFO << "[DASH] CP2 validate add_headers: received="
+                         << headers.size() << " accepted=" << accepted
+                         << " suppressed=" << m_hdr_cp2_log.take_suppressed(kKey);
+        }
+        if (accepted == 0 && !headers.empty())
+            LOG_INFO << "[DASH] CP2 validate: accepted==0 first_prev_block="
+                     << headers.front().m_previous_block.GetHex();
+        return accepted;
+    }
+
+    // Feature macro: the cold-start pre-anchor header backfill primitive
+    // below exists. Guards the KAT so it still compiles on a pre-fix tree.
+#ifndef C2POOL_PREANCHOR_SPAN_BACKFILL
+#define C2POOL_PREANCHOR_SPAN_BACKFILL 1
+#endif
+    /// Install a PRE-ANCHOR header span that links DOWNWARD from a trusted,
+    /// already-held block (the fast-start anchor). The forward add_header path
+    /// cannot do this: a pre-anchor header's parent is not held, so it
+    /// orphan-rejects (add_header_internal :660-661). At cold fast-start the
+    /// chain holds a LONE anchor and none of the work-block headers BELOW it
+    /// that the DIP-4 historical-snapshot auth (leg (b), historical_sml.hpp)
+    /// must consult — so getqrinfo rotated-quarter snapshots fail closed with
+    /// "block header not held". This walks DOWN from `anchor_hash` (which MUST
+    /// be held) through the supplied getheaders batch, authenticating each
+    /// parent by (1) X11(header) == the prev-hash its already-trusted child
+    /// commits to, and (2) check_pow against pow_limit — exactly the two legs
+    /// dashd requires of any header it stores. Headers that do not chain
+    /// downward from the trusted anchor are IGNORED (fail closed). Does NOT
+    /// move the tip / best-work: pre-anchor headers never compete for the tip,
+    /// and the synthetic-anchor daemon-tip honesty guards stay intact.
+    ///
+    /// REWARD-SAFETY: every installed header is bound to the release-pinned
+    /// anchor by an unbroken X11 prev-hash chain AND is independently
+    /// PoW-verified, so a wrong/forged header can never enter the view leg (b)
+    /// consults. A lying peer that returns garbage produces no linkage → zero
+    /// installs → leg (b) still fails closed.
+    ///
+    /// Returns the number of headers newly installed.
+    size_t install_preanchor_span(const uint256& anchor_hash,
+                                  const std::vector<BlockHeaderType>& batch)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // The anchor is the trust root of the downward walk; it must be held.
+        auto anchor_it = m_headers.find(anchor_hash);
+        if (anchor_it == m_headers.end()) return 0;
+        const uint32_t anchor_height = anchor_it->second.height;
+
+        // Index the batch by X11 identity so prev-hash pointers can be
+        // followed. A header's presence here means it hashes to a specific
+        // block id; whether that id is TRUSTED is decided only by the walk.
+        std::map<uint256, const BlockHeaderType*> by_hash;
+        for (const auto& h : batch)
+            by_hash[x11_hash(h)] = &h;
+
+        // Bootstrap: the stored anchor entry keeps a SYNTHETIC prev (ZERO) so
+        // it never masquerades as a daemon tip, so read the anchor's REAL
+        // previous-block hash from the batch's own copy of the anchor header
+        // (getheaders with hash_stop=anchor returns it as the terminal entry).
+        // That copy is trusted the instant X11(copy) == the release-pinned
+        // anchor hash — which is exactly its key in by_hash.
+        auto anchor_hdr = by_hash.find(anchor_hash);
+        if (anchor_hdr == by_hash.end()) return 0;   // span never reached the anchor
+
+        uint32_t child_height = anchor_height;
+        uint256  parent_hash  = anchor_hdr->second->m_previous_block;
+
+        size_t installed = 0;
+        while (!parent_hash.IsNull() && child_height > 0) {
+            auto pit = by_hash.find(parent_hash);
+            if (pit == by_hash.end()) break;   // bottom of the supplied span
+            const BlockHeaderType& ph = *pit->second;
+            const uint32_t parent_height = child_height - 1;
+            // (1) X11 identity: pit was keyed by X11==parent_hash, and
+            //     parent_hash is the value the trusted child commits to — the
+            //     link is cryptographic. (2) PoW must be real.
+            if (!check_pow(parent_hash, ph.m_bits, m_params.pow_limit)) {
+                LOG_WARNING << "[EMB-DASH] pre-anchor backfill PoW FAIL at h="
+                            << parent_height << " hash="
+                            << parent_hash.GetHex().substr(0, 24)
+                            << " — stop (fail closed)";
+                break;
+            }
+            if (!m_headers.count(parent_hash)) {
+                IndexEntry e;
+                e.header     = ph;
+                e.hash       = parent_hash;
+                e.height     = parent_height;
+                // Pre-anchor cumulative work is unknown (genesis..anchor not
+                // held) and never consulted: these entries never enter tip
+                // selection. Zero keeps them strictly below m_best_work.
+                e.chain_work = uint256::ZERO;
+                e.prev_hash  = ph.m_previous_block;
+                e.status     = HEADER_VALID_CHAIN;
+                m_headers[parent_hash] = e;
+                // Bonus: back-fill the height index so get_header_by_height
+                // resolves pre-anchor heights too (harmless — forward entries
+                // at >= anchor are untouched; a later reorg rebuild walks from
+                // the synthetic anchor and simply drops these again, which
+                // leg (b)'s by-HASH lookup does not depend on).
+                m_height_index[parent_height] = parent_hash;
+                persist_header(e);
+                ++installed;
+            }
+            child_height = parent_height;
+            parent_hash  = ph.m_previous_block;
+        }
+        if (installed)
+            LOG_INFO << "[EMB-DASH] pre-anchor backfill INSTALLED " << installed
+                     << " header(s) down to h=" << child_height
+                     << " (X11-linked + PoW-verified from trusted anchor h="
+                     << anchor_height << "); DIP-4 leg (b) can now consult them.";
+        return installed;
+    }
+
+    std::vector<uint256> get_locator() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return get_locator_internal();
+    }
+
+    bool is_synced() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull()) return false;
+        auto it = m_headers.find(m_tip);
+        if (it == m_headers.end()) return false;
+        auto now = static_cast<uint32_t>(std::time(nullptr));
+        return (now - it->second.header.m_timestamp) < 86400; // 24 hours
+    }
+
+    void set_peer_tip_height(uint32_t height) { m_peer_tip_height.store(height); }
+
+    /// The PEER-ADVERTISED best height, lock-free. Distinct from height(),
+    /// which is OUR OWN tip behind m_mutex: this is the only height in the
+    /// class that comes from outside this process, which is what makes it
+    /// usable as an independent reference by the serve-staleness sentinel
+    /// (coin/serve_staleness.hpp). Read-only accessor over an atomic that
+    /// already existed and is already written on the io thread
+    /// (main_dash.cpp: the coin-p2p peer-height callback) — it adds no new
+    /// synchronisation and takes no lock the serve path holds. 0 = never
+    /// advertised, which is "unknown", NOT "we are current".
+    uint32_t peer_tip_height() const
+    { return m_peer_tip_height.load(std::memory_order_relaxed); }
+
+    /// Backfill progress line throttle: at most one line per `headers` of
+    /// forward progress OR per `ms` of wall clock, whichever comes first.
+    /// Telemetry only; exposed so a KAT can prove the line fires without
+    /// mining 2000 headers, and so an operator can tighten it during a debug
+    /// session without a rebuild-and-redeploy.
+    void set_progress_throttle(uint64_t headers, int64_t ms)
+    {
+        m_hdr_progress = diag::ProgressReporter(headers, ms);
+    }
+
+    void set_dynamic_checkpoint(uint32_t height, const uint256& hash) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (height > m_tip_height) {
+            IndexEntry entry;
+            entry.hash = hash;
+            entry.height = height;
+            entry.chain_work = uint256::ONE;
+            entry.prev_hash = uint256::ZERO;
+            entry.status = HEADER_VALID_CHAIN;
+            m_headers[hash] = entry;
+            m_height_index[height] = hash;
+            m_tip = hash;
+            m_tip_height = height;
+            m_best_work = entry.chain_work;
+            persist_header(entry);
+            persist_tip();
+            LOG_INFO << "[EMB-DASH] Dynamic checkpoint: height=" << height
+                     << " hash=" << hash.GetHex().substr(0, 16);
+        }
+    }
+
+    const DashChainParams& params() const { return m_params; }
+
+    // (old_tip, old_height, new_tip, new_height, was_reorg). was_reorg lets the
+    // SML axis wipe + cold-resync when the tip jumped branches (see PendingTipChange).
+    using TipChangedCallback = std::function<void(const uint256&, uint32_t, const uint256&, uint32_t, bool)>;
+    void set_on_tip_changed(TipChangedCallback cb) { m_on_tip_changed = std::move(cb); }
+
+private:
+    bool add_header_internal(const BlockHeaderType& header) {
+        // Dash: block identity = X11(header)
+        uint256 bhash = x11_hash(header);
+
+        if (m_headers.count(bhash))
+            return false;
+
+        // Genesis
+        if (header.m_previous_block.IsNull()) {
+            if (bhash != m_params.genesis_hash) return false;
+            IndexEntry entry;
+            entry.header = header;
+            entry.hash = bhash;
+            entry.height = 0;
+            entry.chain_work = get_block_proof(header.m_bits);
+            entry.prev_hash = uint256::ZERO;
+            entry.status = HEADER_VALID_CHAIN;
+            m_headers[bhash] = entry;
+            m_height_index[0] = bhash;
+            m_tip = bhash;
+            m_tip_height = 0;
+            m_best_work = entry.chain_work;
+            persist_header(entry);
+            LOG_INFO << "[EMB-DASH] Genesis: hash=" << bhash.GetHex().substr(0, 16);
+            return true;
+        }
+
+        auto prev_it = m_headers.find(header.m_previous_block);
+        if (prev_it == m_headers.end())
+            return false; // orphan
+
+        const auto& prev = prev_it->second;
+        uint32_t new_height = prev.height + 1;
+
+        // X11 PoW check (X11 is fast — no need for skip optimization like scrypt)
+        if (!check_pow(bhash, header.m_bits, m_params.pow_limit)) {
+            static int pow_fail_count = 0;
+            if (pow_fail_count++ < 5)
+                LOG_WARNING << "[EMB-DASH] PoW FAIL at height=" << new_height
+                            << " hash=" << bhash.GetHex().substr(0, 24)
+                            << " bits=0x" << std::hex << header.m_bits << std::dec;
+            return false;
+        }
+
+        // DarkGravityWave v3 difficulty validation
+        if (!validate_difficulty(header, new_height)) {
+            static int diff_fail_count = 0;
+            if (diff_fail_count++ < 5)
+                LOG_WARNING << "[EMB-DASH] Difficulty FAIL at height=" << new_height
+                            << " bits=0x" << std::hex << header.m_bits << std::dec;
+            return false;
+        }
+
+        IndexEntry entry;
+        entry.header = header;
+        entry.hash = bhash;
+        entry.height = new_height;
+        entry.chain_work = prev.chain_work + get_block_proof(header.m_bits);
+        entry.prev_hash = header.m_previous_block;
+        entry.status = HEADER_VALID_CHAIN;
+
+        m_headers[bhash] = entry;
+        persist_header(entry);
+
+        bool dominated = entry.chain_work > m_best_work;
+        bool equal_at_tip = entry.chain_work == m_best_work
+                         && new_height == m_tip_height
+                         && bhash != m_tip;
+        if (dominated || equal_at_tip) {
+            uint32_t old_height = m_tip_height;
+            uint256  old_tip = m_tip;
+            m_best_work = entry.chain_work;
+            m_tip = bhash;
+            m_tip_height = new_height;
+            bool linear_extension =
+                new_height == old_height + 1
+                && entry.prev_hash == m_height_index[old_height];
+            if (linear_extension) {
+                m_height_index[new_height] = bhash;
+            } else {
+                rebuild_height_index(bhash);
+                // SPV B4 (parity audit): alert on deep reorgs — operator
+                // visibility for serious network events. Threshold 3 blocks
+                // since Dash ChainLocks make anything deeper very rare.
+                int32_t depth = static_cast<int32_t>(old_height)
+                              - static_cast<int32_t>(new_height) + 1;
+                if (old_height > new_height && depth >= 3) {
+                    LOG_WARNING << "[EMB-DASH] DEEP REORG: old_tip="
+                                << old_tip.GetHex().substr(0, 16)
+                                << "@" << old_height << " → new_tip="
+                                << bhash.GetHex().substr(0, 16)
+                                << "@" << new_height
+                                << " (depth=" << depth << ")";
+                } else if (old_height > 0) {
+                    LOG_INFO << "[EMB-DASH] reorg: old_tip="
+                             << old_tip.GetHex().substr(0, 16)
+                             << "@" << old_height << " → new_tip="
+                             << bhash.GetHex().substr(0, 16)
+                             << "@" << new_height;
+                }
+            }
+            m_pending_tip_change.fired = true;
+            // A rebuilt height index with a pre-existing chain (old_height>0)
+            // means the new tip did not linearly extend the old one — a reorg
+            // the SML axis must react to.
+            m_pending_tip_change.was_reorg = !linear_extension && old_height > 0;
+            m_pending_tip_change.old_tip = old_tip;
+            m_pending_tip_change.old_height = old_height;
+            m_pending_tip_change.new_tip = bhash;
+            m_pending_tip_change.new_height = new_height;
+        }
+
+        return true;
+    }
+
+    // Dash difficulty algorithm activation heights (from chainparams.cpp)
+    static constexpr uint32_t MAINNET_DGW_HEIGHT = 34140;
+    static constexpr uint32_t TESTNET_DGW_HEIGHT = 4002;
+
+    bool validate_difficulty(const BlockHeaderType& header, uint32_t new_height) {
+        uint32_t dgw_height = m_params.allow_min_difficulty ? TESTNET_DGW_HEIGHT : MAINNET_DGW_HEIGHT;
+        if (new_height <= dgw_height + DGW_PAST_BLOCKS + 2) return true;
+        if (m_params.fast_start_checkpoint.has_value()) {
+            uint32_t cp_h = m_params.fast_start_checkpoint->height;
+            if (new_height > cp_h && new_height < cp_h + DGW_PAST_BLOCKS + 10)
+                return true;
+        }
+        if (m_headers.size() < static_cast<size_t>(DGW_PAST_BLOCKS + 10))
+            return true;
+
+        auto prev_it = m_headers.find(header.m_previous_block);
+        if (prev_it == m_headers.end()) return false;
+
+        auto get_ancestor = [this](uint32_t h) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(h);
+        };
+
+        uint32_t expected_bits = dark_gravity_wave(
+            get_ancestor, prev_it->second.height, m_params);
+
+        if (m_params.allow_min_difficulty) {
+            uint32_t pow_limit_bits = m_params.pow_limit.GetCompact();
+            if (header.m_bits == pow_limit_bits)
+                return true;
+        }
+
+        if (header.m_bits != expected_bits) {
+            static int mismatch_count = 0;
+            mismatch_count++;
+            if (mismatch_count <= 10 || mismatch_count % 10000 == 0)
+                LOG_WARNING << "[EMB-DASH] DGW mismatch #" << mismatch_count
+                            << " at height=" << new_height
+                            << " actual=0x" << std::hex << header.m_bits
+                            << " expected=0x" << expected_bits << std::dec;
+            // Accept despite mismatch — PoW (X11) is still validated
+            return true;
+        }
+
+        return true;
+    }
+
+    std::optional<IndexEntry> get_header_by_height_internal(uint32_t h) const {
+        auto it = m_height_index.find(h);
+        if (it == m_height_index.end()) return std::nullopt;
+        auto hit = m_headers.find(it->second);
+        return hit != m_headers.end() ? std::optional{hit->second} : std::nullopt;
+    }
+
+    void rebuild_height_index(const uint256& new_tip) {
+        m_height_index.clear();
+        uint256 current = new_tip;
+        while (!current.IsNull()) {
+            auto it = m_headers.find(current);
+            if (it == m_headers.end()) break;
+            m_height_index[it->second.height] = current;
+            current = it->second.prev_hash;
+        }
+    }
+
+    std::vector<uint256> get_locator_internal() const {
+        std::vector<uint256> locator;
+        if (m_tip.IsNull()) return locator;
+        int64_t step = 1;
+        int64_t h = static_cast<int64_t>(m_tip_height);
+        while (h >= 0) {
+            auto it = m_height_index.find(static_cast<uint32_t>(h));
+            if (it != m_height_index.end())
+                locator.push_back(it->second);
+            if (h == 0) break;
+            h -= step;
+            if (h < 0) h = 0;
+            if (locator.size() > 10) step *= 2;
+        }
+        return locator;
+    }
+
+    // ─── LevelDB persistence ──────────────────────────────────────────────
+
+    void persist_header(const IndexEntry& entry) {
+        m_dirty_headers.insert(entry.hash);
+    }
+
+    void flush_dirty() {
+        if (!m_db || !m_db->is_open() || m_dirty_headers.empty()) return;
+        auto batch = m_db->create_batch();
+        for (const auto& hash : m_dirty_headers) {
+            auto it = m_headers.find(hash);
+            if (it == m_headers.end()) continue;
+            auto packed = pack(it->second);
+            std::vector<uint8_t> data(
+                reinterpret_cast<const uint8_t*>(packed.data()),
+                reinterpret_cast<const uint8_t*>(packed.data()) + packed.size());
+            std::string key = "h";
+            key.append(reinterpret_cast<const char*>(hash.data()), 32);
+            batch.put(key, data);
+        }
+        std::vector<uint8_t> tip_data(m_tip.data(), m_tip.data() + 32);
+        batch.put("tip", tip_data);
+        uint32_t h = m_tip_height;
+        std::vector<uint8_t> height_data = {
+            uint8_t((h >> 24) & 0xFF), uint8_t((h >> 16) & 0xFF),
+            uint8_t((h >> 8) & 0xFF), uint8_t(h & 0xFF)};
+        batch.put("height", height_data);
+        size_t written = m_dirty_headers.size();
+        bool ok = batch.commit_sync();
+        // CP3 persist: entries written + LevelDB write status, so a flush that
+        // silently fails (headers accepted but never durable across restart)
+        // becomes visible.
+        LOG_INFO << "[EMB-DASH] CP3 persist flush_dirty: entries=" << written
+                 << " leveldb_status=" << (ok ? "OK" : "FAILED");
+        if (ok)
+            m_dirty_headers.clear();
+    }
+
+    void persist_tip() { flush_dirty(); }
+
+    void load_from_db() {
+        if (!m_db || !m_db->is_open()) return;
+        LOG_INFO << "[EMB-DASH] Loading headers from LevelDB...";
+        auto t0 = std::chrono::steady_clock::now();
+        auto keys = m_db->list_keys("h", 10000000);
+        int loaded = 0;
+        for (auto& key : keys) {
+            if (key.size() != 33) continue;
+            std::vector<uint8_t> data;
+            if (!m_db->get(key, data)) continue;
+            try {
+                PackStream ps(data);
+                IndexEntry entry;
+                ps >> entry;
+                m_headers[entry.hash] = entry;
+                ++loaded;
+            } catch (...) {}
+        }
+        std::vector<uint8_t> tip_data;
+        if (m_db->get("tip", tip_data) && tip_data.size() == 32) {
+            memcpy(m_tip.data(), tip_data.data(), 32);
+            auto it = m_headers.find(m_tip);
+            if (it != m_headers.end()) {
+                m_tip_height = it->second.height;
+                m_best_work = it->second.chain_work;
+                rebuild_height_index(m_tip);
+            } else {
+                m_tip.SetNull();
+            }
+        }
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        LOG_INFO << "[EMB-DASH] Loaded " << loaded << " headers in " << ms << "ms"
+                 << " tip_height=" << m_tip_height;
+    }
+
+    // ─── State ────────────────────────────────────────────────────────────
+
+    DashChainParams m_params;
+    std::string     m_db_path;
+    mutable std::mutex m_mutex;
+
+    std::map<uint256, IndexEntry> m_headers;
+    std::map<uint32_t, uint256>   m_height_index;
+
+    uint256  m_tip;
+    uint32_t m_tip_height{0};
+    uint256  m_best_work;
+
+    std::atomic<uint32_t> m_peer_tip_height{0};
+    std::unique_ptr<core::LevelDBStore> m_db;
+    std::set<uint256> m_dirty_headers;
+
+    TipChangedCallback m_on_tip_changed;
+
+    // ─── Backfill telemetry (no lock: touched only on the ingest thread) ──
+    /// 2000 headers OR 15 s, whichever comes first. Per-INSTANCE, unlike the
+    /// function-local `static` this replaced.
+    diag::ProgressReporter m_hdr_progress{2000, 15000};
+    /// One CP2 line per 30 s, with the dropped count carried on the next.
+    diag::LogSuppressor    m_hdr_cp2_log{30000};
+    uint64_t m_hdr_wire_bytes{0};
+    uint64_t m_hdr_received{0};
+    uint64_t m_hdr_accepted{0};
+
+    struct PendingTipChange {
+        bool fired{false};
+        // was_reorg: the tip advanced onto a branch that does NOT directly
+        // extend the previous tip (the height index had to be rebuilt). The
+        // SML axis consumes this to wipe + cold-resync the incremental SML,
+        // whose applied diffs were relative to the now-orphaned branch.
+        bool was_reorg{false};
+        uint256 old_tip, new_tip;
+        uint32_t old_height{0}, new_height{0};
+    };
+    PendingTipChange m_pending_tip_change;
+};
+
+} // namespace coin
+} // namespace dash

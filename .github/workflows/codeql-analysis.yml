@@ -1,0 +1,451 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+  schedule:
+    - cron: '30 1 * * 1'   # Weekly on Monday 01:30 UTC
+
+# Concurrency: a newer run on the same ref cancels the stale in-progress
+# one, cutting concurrent load on the shared self-hosted pool (the OOM/
+# oversubscription root cause, not just queue depth). Per-ref group so
+# distinct PRs/branches never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+env:
+  # Fail-fast on a stalled git HTTP transfer instead of hanging to the job
+  # timeout. Our WAN uplink stalls ~12% of codeload fetches (they neither
+  # finish nor error out); aborting a sub-1000 B/s transfer after 20s lets
+  # actions/checkout built-in 3-attempt fetch retry recover in ~1 min.
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '20'
+
+jobs:
+  analyze:
+    # Reap-guard: the c-cpp leg takes a HOST-SIDE exclusive flock (see
+    # "Acquire per-host heavy-leg lock" below) shared with build.yml
+    # linux-asan, so CodeQL c-cpp and the ASan build are never co-resident
+    # on one physical host: runner processes on one host share /tmp, so
+    # the flock is exactly per-host mutual exclusion -- a second heavy leg
+    # on the same host WAITS (nothing is ever cancelled) while different
+    # hosts run in parallel. The python leg (build-mode: none) is light
+    # and does not take the lock. A workflow-level concurrency group is
+    # deliberately NOT used: GitHub keeps at most 1 running + 1 pending
+    # per group and CANCELS older pending entries, so a shared repo-global
+    # group deterministically self-cancelled one of each run's own jobs
+    # and serialized all heavy legs repo-wide.
+    name: Analyze (${{ matrix.language }})
+    # Hard cap: the analyze job had no timeout-minutes, so a wedged
+    # CodeQL tracer build (uncapped, not the orphan-reap class of #1027/
+    # #1031) ran ~2h to a silent death (#1001) instead of a fast red.
+    # Honest p95 of the 25 most-recent SUCCESSFUL runs is 59.2 min (max
+    # legit 59.2); the only longer sample was the 600 min runaway this
+    # cap targets. 90 min sits above p95 with cold-cache headroom and
+    # well under the ~2h death point, converting the hang to a
+    # deterministic red without touching any legitimate run. +60 min on
+    # top of that budget for the per-host heavy-leg lock wait (worst case:
+    # queued behind one full ASan leg on the same host) => 150; the 60-min
+    # STEP cap on the analyze phase below keeps the wedged-tracer fast-red
+    # property unchanged.
+    timeout-minutes: 150
+    # STAYS on c2pool-build — MEASURED, and revisitable (see below).
+    # Two reasons, one temporary and one structural:
+    #  1. TEMPORARY — staging the ~823 MB CodeQL CLI bundle failed on the heavy
+    #     host ("Unable to download and extract CodeQL CLI: the process
+    #     '/usr/bin/tar' failed with exit code 2", 4 attempts / 4 failures).
+    #     Root cause is THROUGHPUT, not corruption: that host's egress varies
+    #     ~258 KB/s..1 MB/s, so a fixed step timeout cuts a large transfer
+    #     mid-flight and leaves a short tarball. Measured directly — the same
+    #     226 MB artifact fetched INTACT once (gzip OK, 1 MB/s) and truncated at
+    #     108 MB on the next attempt purely by timing out at 258 KB/s. Not PMTU:
+    #     TCP completes fine when given time. The bundle has since been cached
+    #     on that host, so this blocker is expected to clear — re-test before
+    #     assuming it still applies.
+    #  2. STRUCTURAL — flock separation. This job and build.yml's linux-asan are
+    #     the ONLY two holders of the per-host reap-guard flock (#1105), and
+    #     linux-asan runs on c2pool-heavy, so these two must stay on different
+    #     hosts or they serialize (measured: the second holder sat blocked in
+    #     `flock -x -w 3600`). Reason 2 stands even after reason 1 clears.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: python
+            build-mode: none
+
+    steps:
+      # Reap-guard: host-scoped exclusivity vs build.yml linux-asan (the
+      # other RAM-heavy leg). c-cpp (build-mode: manual) only -- the python
+      # leg is light. Held by a disowned holder process so it spans every
+      # step of this job (the heavy "Perform CodeQL Analysis" phase is an
+      # action step that cannot be wrapped in a shell flock). Released by
+      # the always() step at the end of the job; the holder also has a 4 h
+      # TTL so a host-reaped job can never wedge the lock, and the
+      # runner's end-of-job orphan cleanup is a second net.
+      - name: Acquire per-host heavy-leg lock (reap-guard)
+        if: matrix.build-mode == 'manual' && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Per-host heavy-leg semaphore (VM905: up to 8 runners on a 32-core/62 GB box).
+          # History: a single slot (1 heavy leg per host) became the #1 CI failure mode --
+          # 8 runners serialized behind one flock while ~2/3 of the box sat idle, and
+          # waiters hard-failed at the -w budget (integrator measurement 2026-08-05). This
+          # guard now offers HEAVY_LEG_SLOTS concurrent slots with first-free acquisition:
+          # a leg takes the first free slot, so up to SLOTS heavy legs (ASan/UBSan build +
+          # CodeQL c-cpp analyze) run concurrently on one host and the (SLOTS+1)th WAITS --
+          # nothing is ever cancelled. 2 ASan/CodeQL legs fit 32c/62G comfortably; do NOT
+          # raise SLOTS past 3 without first measuring an ASan leg's peak RSS.
+          # Two holder invariants preserved from #1112:
+          #  (1) the holder dies WITH the job -- it waits on the runner-worker PID and
+          #      frees its slot the instant that worker dies; TTL is only a ceiling.
+          #  (2) a stale holder from an already-dead job is REAPED at acquire, not blocked
+          #      on: a recorded holder whose worker is gone, or a markerless PPID-1 legacy
+          #      orphan, is by definition dead.
+          # HEAVY_LEG_* env overrides exist ONLY for the honesty-gate test
+          # (.github/actions/heavy-leg-lock/test.sh); production uses the defaults.
+          LOCK="${HEAVY_LEG_LOCK:-/tmp/c2pool-heavy-leg.lock}"
+          HOLDERFILE="${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}"
+          WAIT="${HEAVY_LEG_WAIT:-5400}"
+          TTL="${HEAVY_LEG_TTL:-14400}"
+          SWEEP="${HEAVY_LEG_SWEEP:-1}"
+          SLOTS="${HEAVY_LEG_SLOTS:-2}"
+          ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
+
+          # Slot files are ${LOCK}.1 .. ${LOCK}.SLOTS; each slot's live holder records a
+          # ${HOLDERFILE}.<slot> marker ("holderpid workerpid"). Both are per-slot so two
+          # concurrent holders never clobber each other's marker.
+
+          # --- stale-holder sweep: reap the dead on each slot instead of blocking ---
+          if [ "$SWEEP" = 1 ]; then
+            _s=1
+            while [ "$_s" -le "$SLOTS" ]; do
+              _mf="${HOLDERFILE}.${_s}"
+              if [ -f "$_mf" ]; then
+                read -r MH MW _ < "$_mf" 2>/dev/null || true
+                if [ -n "${MW:-}" ] && [ "${MW:-0}" != 0 ] && ! kill -0 "$MW" 2>/dev/null; then
+                  echo "heavy-leg sweep: reaping holder pid ${MH:-?} on slot $_s (worker $MW dead)"
+                  [ -n "${MH:-}" ] && kill "$MH" 2>/dev/null || true
+                  rm -f "$_mf"
+                fi
+              fi
+              # Markerless PPID-1 orphan on this slot = a pre-guard `sleep` holder: our live
+              # holders always keep a marker, and a still-waiting new holder has a live
+              # parent, so PPID==1 + no marker is unambiguously dead.
+              if [ ! -f "$_mf" ] && command -v fuser >/dev/null 2>&1; then
+                for _q in $(fuser "${LOCK}.${_s}" 2>/dev/null | tr -d ' '); do
+                  _qp="$(ps -o ppid= -p "$_q" 2>/dev/null | tr -d ' ' || true)"
+                  if [ "${_qp:-0}" = 1 ]; then
+                    echo "heavy-leg sweep: reaping markerless PPID-1 orphan pid $_q on slot $_s"
+                    kill "$_q" 2>/dev/null || true
+                  fi
+                done
+              fi
+              _s=$((_s+1))
+            done
+          fi
+
+          # --- find the runner-worker so the holder can die with the job ---
+          WORKER=""
+          _p=$$
+          while [ "${_p:-1}" -gt 1 ]; do
+            case "$(ps -o comm= -p "$_p" 2>/dev/null || true)" in
+              Runner.Worker*) WORKER="$_p"; break ;;
+            esac
+            _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)"
+            [ -z "${_p:-}" ] && break
+          done
+
+          # --- spawn the holder: first-free across SLOTS, holds its fd for the job's life ---
+          # Each slot opens on fd (8+slot); slot 1 -> fd 9 (as before). The held fd is
+          # closed (N>&-) in the sleep child so a kill of this bash frees the slot at once.
+          # The holder exits when the runner-worker dies, or at TTL, whichever is first; if
+          # the worker could not be found it falls back to a pure TTL ceiling.
+          env LOCK="$LOCK" HOLDERFILE="$HOLDERFILE" ACQ="$ACQ" WAIT="$WAIT" TTL="$TTL" SLOTS="$SLOTS" WORKER="$WORKER" \
+          bash -c '
+            _s=1
+            while [ "$_s" -le "$SLOTS" ]; do
+              _fd=$((8+_s))
+              eval "exec ${_fd}>\"\${LOCK}.\${_s}\"" || exit 1
+              _s=$((_s+1))
+            done
+            _held_fd=""
+            _deadline=$(( SECONDS + WAIT ))
+            while [ "$SECONDS" -lt "$_deadline" ]; do
+              _s=1
+              while [ "$_s" -le "$SLOTS" ]; do
+                _fd=$((8+_s))
+                if flock -n "$_fd"; then _held_fd="$_fd"; break; fi
+                _s=$((_s+1))
+              done
+              [ -n "$_held_fd" ] && break
+              sleep 3
+            done
+            [ -z "$_held_fd" ] && exit 1
+            _held_slot=$(( _held_fd - 8 ))
+            printf "%s %s\n" "$$" "${WORKER:-0}" > "${HOLDERFILE}.${_held_slot}"
+            echo "$_held_slot" > "$ACQ"
+            _end=$(( SECONDS + TTL ))
+            while [ "$SECONDS" -lt "$_end" ]; do
+              if [ -n "$WORKER" ] && ! kill -0 "$WORKER" 2>/dev/null; then break; fi
+              eval "sleep 15 ${_held_fd}>&-"
+            done
+            rm -f "${HOLDERFILE}.${_held_slot}"
+          ' </dev/null >/dev/null 2>&1 &
+          HOLDER=$!
+          disown "$HOLDER" 2>/dev/null || true
+          echo "HEAVY_LEG_LOCK_HOLDER=$HOLDER" >> "${GITHUB_ENV:-/dev/null}"
+
+          # --- wait for the acquire handshake ---
+          while kill -0 "$HOLDER" 2>/dev/null && [ ! -s "$ACQ" ]; do
+            sleep 2
+          done
+          if [ ! -s "$ACQ" ]; then
+            echo "::error::per-host heavy-leg lock: all $SLOTS slots busy for $((WAIT/60)) min on ${RUNNER_NAME:-?} -- blocked by live long holders, not this diff"
+            _s=1
+            while [ "$_s" -le "$SLOTS" ]; do
+              echo "  slot $_s (${LOCK}.${_s}):"
+              if command -v fuser >/dev/null 2>&1; then
+                for _q in $(fuser "${LOCK}.${_s}" 2>/dev/null | tr -d ' '); do
+                  # pid ppid age(etimes,s) comm -- names the live holder blocking this slot
+                  echo "    holder [pid ppid age_s comm]: $(ps -o pid=,ppid=,etimes=,comm= -p "$_q" 2>/dev/null | tr -s ' ')"
+                done
+              fi
+              if [ -f "${HOLDERFILE}.${_s}" ]; then
+                echo "    marker (holderpid workerpid): $(cat "${HOLDERFILE}.${_s}" 2>/dev/null)"
+              else
+                echo "    marker: (none)"
+              fi
+              _s=$((_s+1))
+            done
+            exit 1
+          fi
+          _got="$(cat "$ACQ" 2>/dev/null)"
+          rm -f "$ACQ"
+          echo "heavy-leg lock acquired on ${RUNNER_NAME:-?} slot ${_got:-?}/$SLOTS (holder pid $HOLDER, worker ${WORKER:-none})"
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Stage CodeQL bundle (self-hosted, retry-hardened)
+        # The shared self-hosted pool sits behind a lossy WAN uplink, so
+        # codeql-action/init's built-in bundle download intermittently dies at
+        # "Initialize CodeQL" (BCH/BTC merkle-backstop + gate-dedup PRs).
+        # Fetch the pinned bundle ONCE per runner per version with bounded retry
+        # (same hardening shape as checkout stopgap #982), cache it on the
+        # persistent self-hosted $HOME, and feed it to init via `tools:` so init
+        # resolves locally with zero egress on every job. Pinned to
+        # codeql-action@v4's default bundle to avoid a CLI mismatch.
+        if: runner.environment != 'github-hosted'
+        env:
+          CODEQL_BUNDLE_VERSION: codeql-bundle-v2.26.2
+        run: |
+          # FAIL-SOFT: a cold-cache fetch still rides the lossy uplink, so a
+          # curl-28 timeout here must NOT hard-red the job. On fetch failure we
+          # leave CODEQL_TOOLS empty and let Initialize CodeQL fall back to its
+          # own bundle download (the pre-existing behaviour) rather than skipping
+          # init entirely. Warm cache => zero egress as designed; cold-cache
+          # egress failure => degrades to baseline, never worse.
+          set -uo pipefail
+          dest="$HOME/codeql-bundles/$CODEQL_BUNDLE_VERSION"
+          tarball="$dest/codeql-bundle-linux64.tar.gz"
+          # INTEGRITY GATE: a bare .complete marker does not prove the cached
+          # tarball is intact. A resumed (-C -) or truncated fetch can leave a
+          # corrupt .tar.gz that is then reused forever, so every job dies at
+          # "Initialize CodeQL" with tar exit 2 (observed on .196 and
+          # oplex7020-heavy-3). Trust the bytes, not the marker: gzip -t before
+          # reuse, and re-verify before marking a fresh fetch complete.
+          if [ -f "$dest/.complete" ] && gzip -t "$tarball" 2>/dev/null; then
+            echo "Reusing verified cached bundle $tarball"
+            echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
+          else
+            if [ -f "$dest/.complete" ]; then
+              echo "::warning::cached CodeQL bundle failed gzip integrity check; purging corrupt cache and re-fetching"
+            fi
+            rm -f "$tarball" "$dest/.complete"
+            mkdir -p "$dest"
+            url="https://github.com/github/codeql-action/releases/download/$CODEQL_BUNDLE_VERSION/codeql-bundle-linux64.tar.gz"
+            echo "Fetching $url"
+            if curl -fL -C - --retry 8 --retry-all-errors --retry-delay 5 \
+                    --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+                    -o "$tarball.tmp" "$url"; then
+              if gzip -t "$tarball.tmp" 2>/dev/null; then
+                mv "$tarball.tmp" "$tarball"
+                touch "$dest/.complete"
+                echo "Staged and verified $tarball"
+                echo "CODEQL_TOOLS=$tarball" >> "$GITHUB_ENV"
+              else
+                rm -f "$tarball.tmp"
+                echo "::warning::codeql bundle arrived corrupt (gzip -t failed); discarded so Initialize CodeQL uses its own download"
+              fi
+            else
+              echo "::warning::codeql bundle prestage fetch failed over lossy uplink; leaving CODEQL_TOOLS empty so Initialize CodeQL uses its own bundle download (partial .tmp kept for -C - resume)"
+            fi
+          fi
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-and-quality
+          # Empty on github-hosted forks -> init falls back to default download.
+          tools: ${{ env.CODEQL_TOOLS }}
+
+      - if: matrix.build-mode == 'manual'
+        name: Set Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home dedicated to this workflow. Restoring a
+          # multi-hundred-MB conan2 tree from the GH cache service onto VM905 is
+          # the flake ("Failed to restore: The operation cannot be completed in
+          # timeout"), and on a miss it forced a from-source boost rebuild too.
+          # A local persistent home takes the network off the hot path.
+          # Keyed on the runner instance (NOT the shared ~/.conan2): a runner runs
+          # one job at a time, so this home is never contended even across refs,
+          # preserving the torn-cache isolation of #704/#710.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+
+      # ── C++ build (manual mode only) ─────────────────────────────────────
+      - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
+        name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make \
+            libleveldb-dev \
+            libsecp256k1-dev
+
+      - if: matrix.build-mode == 'manual'
+        name: Set up Python for Conan
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - if: matrix.build-mode == 'manual'
+        name: Install Conan 2
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      # Prefer the LAN Conan mirror when it answers the probe; conancenter stays
+      # as the fallback and is never removed, so an unreachable mirror is a
+      # no-op. Cuts a fresh runner's cold bootstrap from a measured 1554 s
+      # (170.7 MB Boost tarball over the WAN + from-source build) to ~2 s.
+      - if: matrix.build-mode == 'manual'
+        name: Prefer LAN Conan remote
+        run: bash ci/conan/lan-remote.sh
+
+      - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
+        name: Restore Conan package cache (github-hosted only)
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/conan2
+          # Isolated per-job Conan home; keyed by profile + lockfile.
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: conan2-ubuntu24-gcc13-
+
+      - if: matrix.build-mode == 'manual' && runner.environment != 'github-hosted'
+        name: Clean stale build dir (self-hosted workspace is reused)
+        run: rm -rf build_codeql
+
+      # Conan prime: the ONLY step here that reaches out to conancenter; bounded
+      # retry+backoff warms the cache, the install below runs --no-remote.
+      - if: matrix.build-mode == 'manual'
+        name: Conan prime (only conancenter egress)
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . \
+                 -pr:a=ci/conan/linux-gcc13.profile \
+                 --lockfile=conan.lock \
+                 --build=missing \
+                 --output-folder=build_codeql \
+                 --settings=build_type=Release; then
+              exit 0
+            fi
+            echo "conan prime failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan prime failed after 3 attempts" >&2
+          exit 1
+
+      - if: matrix.build-mode == 'manual'
+        name: Conan install (offline; --no-remote)
+        run: conan install . -pr:a=ci/conan/linux-gcc13.profile --lockfile=conan.lock --build=missing --output-folder=build_codeql --settings=build_type=Release -nr
+
+      - if: matrix.build-mode == 'manual'
+        name: Build for CodeQL analysis
+        run: |
+          cmake -S . -B build_codeql \
+            -DCMAKE_TOOLCHAIN_FILE=build_codeql/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+          # Cap build parallelism on the shared self-hosted 905 box so the
+          # CodeQL build does not co-OOM with a concurrent ASan job.
+          # github-hosted (fork) runs keep full parallelism.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            JOBS=$(nproc)
+          else
+            JOBS=8
+          fi
+          cmake --build build_codeql --target c2pool -j"$JOBS"
+
+      # ── Analysis ──────────────────────────────────────────────────────────
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        # Step-level cap on the analyze phase only. The 90-min job cap
+        # (see analyze.timeout-minutes) covers init+build+analyze together;
+        # this tighter step cap fast-reds a wedged run-queries/extractor
+        # (the CodeQL-java-tracer runaway class, e.g. runner 145-1) without
+        # waiting on the whole-job budget. Whole-job p95 of successful runs
+        # is 59.2 min, so analyze alone sits comfortably under 60.
+        timeout-minutes: 60
+        with:
+          category: "/language:${{ matrix.language }}"
+          # Cap the run-queries footprint on the shared self-hosted 905 box so
+          # CodeQL does not co-OOM with a concurrent ASan job (was auto-sizing
+          # to --ram=60466 --threads=32, nearly the whole box). 0 = action
+          # auto-default, kept for github-hosted (fork) runs.
+          threads: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '12' || '0' }}
+          ram: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '20000' || '0' }}
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
+
+      - name: Release per-host heavy-leg lock
+        if: always() && matrix.build-mode == 'manual' && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          H="${HEAVY_LEG_LOCK_HOLDER:-}"
+          if [ -n "$H" ]; then
+            kill "$H" 2>/dev/null || true
+            # drop whichever per-slot marker this holder owns
+            for MF in "${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}".*; do
+              [ -f "$MF" ] || continue
+              read -r _mh _ < "$MF" 2>/dev/null || true
+              [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
+            done
+          fi

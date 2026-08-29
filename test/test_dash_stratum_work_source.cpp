@@ -1,0 +1,4102 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// dash::stratum::DASHWorkSource -- Stage 4c/4d KATs (issue #732).
+//
+// The gate the v0.2.2 field failure proved missing: a stubbed work source
+// returning a FIXED DashWorkData must yield a non-empty stratum template trio
+// (template JSON / merkle branches / coinb1+coinb2 split), the reassembled
+// coinbase must be byte-identical to the verifier-shared SSOT build
+// (compute_dash_payouts -> coinbase::build) with value splits matching the
+// fixture, compute_share_difficulty must return the pinned X11-derived value
+// for a known header fixture, and mining_submit must classify a fixture solve
+// into the right accept/won-block/reject class. Also keeps the 4a/4b
+// contract KATs (construction, registry, fused get_work routing) and the
+// set-gap honesty test (empty fallback -> empty trio, never fabricated).
+//
+// MUST appear in BOTH this ctest registration AND the build.yml --target
+// allowlist, or it becomes a #143-style NOT_BUILT sentinel that reds master.
+
+#include <impl/dash/stratum/work_source.hpp>
+
+#include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (stale-payee fix)
+#include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, be_hex_u32
+#include <impl/dash/coin/block_producer.hpp>  // coinbase_txid, compute_merkle_root, serialize_header80, target_from_nbits
+#include <impl/dash/coin/zmq_tip_notify.hpp>  // dash::coin::TipHashDedup, zmq_hashblock_frame_to_hex (ZMQ hashblock instant tip-notify)
+#include <impl/dash/crypto/hash_x11.hpp>
+#include <impl/dash/params.hpp>
+#include <impl/dash/tracker_acquire.hpp>            // #889 bounded block-winning acquisition
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>  // CSimplifiedMNListEntry (embedded SML seed)
+#include <impl/dash/coin/vendor/cbtx.hpp>           // parse_cbtx (read served creditPool)
+#include <impl/dash/coin/embedded_gbt.hpp>          // encode_cbtx (GBT-xcheck fallback fixture)
+#include <impl/dash/coin/arm_resolution.hpp>       // #738 resolve_embedded_arm (run-path arm decision)
+#include <impl/dash/coin/mn_state_db.hpp>         // MNState (seed a resolvable MN payee for the #996 fail-closed gate)
+
+#include <core/stratum_work_source.hpp>
+#include <core/target_utils.hpp>
+#include <core/uint256.hpp>
+#include <core/web_server.hpp>                // core::MiningInterface (dashboard stats seam)
+
+#include <btclibs/util/strencodings.h>        // ParseHex, HexStr
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <functional>
+#include <stdexcept>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+// P2PKH script for a fixed 20-byte pubkey hash (0x11 repeated).
+std::vector<unsigned char> fixture_miner_script()
+{
+    std::vector<unsigned char> s = {0x76, 0xa9, 0x14};
+    s.insert(s.end(), 20, 0x11);
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return s;
+}
+
+uint160 fixture_miner_pkh()
+{
+    uint160 h;
+    std::memset(h.begin(), 0x11, 20);
+    return h;
+}
+
+// A masternode payment carried as a raw "!"+hex script (the GBT platform /
+// script-payee form normalize_payment preserves) so the fixture needs no
+// base58 round-trip. P2PKH to a distinct pkh (0x22 repeated).
+std::string fixture_mn_payee()
+{
+    std::vector<unsigned char> s = {0x76, 0xa9, 0x14};
+    s.insert(s.end(), 20, 0x22);
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return "!" + HexStr(std::span<const unsigned char>(s.data(), s.size()));
+}
+
+constexpr uint64_t kCoinbaseValue = 271570414ULL;   // sat
+constexpr uint64_t kMnAmount      = 100000000ULL;   // masternode share (sat)
+constexpr uint32_t kBits          = 0x1e0ffff0u;
+constexpr uint32_t kCurtime       = 1751000000u;
+constexpr int32_t  kVersion       = 0x20000000;
+const char* const  kPrevHashHex   =
+    "000000000000001b2f8c9e5a1d4b3c6e7f8091a2b3c4d5e6f708192a3b4c5d6e";
+
+// The rich fixture template the stubbed fallback serves: standard fields +
+// DASH masternode payment + a two-entry tx set.
+dash::coin::DashWorkData rich_work()
+{
+    dash::coin::DashWorkData w;
+    w.m_version        = kVersion;
+    w.m_previous_block.SetHex(kPrevHashHex);
+    w.m_height         = 424242u;
+    w.m_coinbase_value = kCoinbaseValue;
+    w.m_bits           = kBits;
+    w.m_curtime        = kCurtime;
+
+    dash::coin::PackedPayment mn;
+    mn.payee  = fixture_mn_payee();
+    mn.amount = kMnAmount;
+    w.m_packed_payments.push_back(mn);
+    w.m_payment_amount = kMnAmount;
+
+    uint256 t1, t2;
+    t1.SetHex("1111111111111111111111111111111111111111111111111111111111111111");
+    t2.SetHex("2222222222222222222222222222222222222222222222222222222222222222");
+    w.m_tx_hashes = {t1, t2};
+    w.m_tx_data_hex = {"aa01", "bb02"};   // opaque tx bytes for block assembly
+    return w;
+}
+
+// Construct a DASHWorkSource over a default (unpopulated) NodeCoinState with
+// a stubbed dashd fallback. `work` is what the fallback serves; the submit
+// callback captures any won-block dispatch for inspection.
+struct Fixture {
+    dash::coin::NodeCoinState coin_state;             // default: populated()==false
+    bool                      submit_called = false;
+    uint32_t                  submit_height = 0;
+    bool                      submit_height_race = false;   // guard flagged HeightRace
+    std::vector<unsigned char> submitted_block;
+    dash::coin::DashWorkData  fallback_work;          // seeded by caller
+
+    Fixture() = default;                              // set-gap fixture (empty work)
+    explicit Fixture(bool rich) { if (rich) fallback_work = rich_work(); }
+
+    std::unique_ptr<dash::stratum::DASHWorkSource> make()
+    {
+        auto submit = [this](const std::vector<unsigned char>& block,
+                             uint32_t height,
+                             bool height_race) -> bool {
+            submit_called      = true;
+            submit_height      = height;
+            submit_height_race = height_race;
+            submitted_block    = block;
+            return true;
+        };
+        auto fallback = [this]() -> dash::coin::DashWorkData { return fallback_work; };
+        return std::make_unique<dash::stratum::DASHWorkSource>(
+            coin_state, fallback, submit);
+    }
+};
+
+// Reassemble coinb1 || en1 || en2 || coinb2 into raw coinbase bytes.
+std::vector<unsigned char> reassemble(const std::string& coinb1,
+                                      const std::string& en1,
+                                      const std::string& en2,
+                                      const std::string& coinb2)
+{
+    auto b1 = ParseHex(coinb1);
+    auto e1 = ParseHex(en1);
+    auto e2 = ParseHex(en2);
+    auto b2 = ParseHex(coinb2);
+    std::vector<unsigned char> out;
+    out.insert(out.end(), b1.begin(), b1.end());
+    out.insert(out.end(), e1.begin(), e1.end());
+    out.insert(out.end(), e2.begin(), e2.end());
+    out.insert(out.end(), b2.begin(), b2.end());
+    return out;
+}
+
+// Fold LE-internal hex branches up from a leaf (the miner-side ascent).
+uint256 fold_branches(uint256 leaf, const std::vector<std::string>& branches)
+{
+    for (const auto& hex : branches) {
+        uint256 b;
+        auto bb = ParseHex(hex);
+        if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
+        unsigned char buf[64];
+        std::memcpy(buf,      leaf.data(), 32);
+        std::memcpy(buf + 32, b.data(),    32);
+        leaf = dash::coinbase::sha256d(std::span<const unsigned char>(buf, 64));
+    }
+    return leaf;
+}
+
+// Assemble the 80-byte header exactly as the work source does at submit time.
+std::vector<unsigned char> assemble_header(uint32_t version,
+                                           const uint256& prev,
+                                           const uint256& merkle_root,
+                                           uint32_t ntime, uint32_t nbits,
+                                           uint32_t nonce)
+{
+    unsigned char hdr[80];
+    dash::coin::serialize_header80(hdr, static_cast<int32_t>(version), prev,
+                                   merkle_root, ntime, nbits, nonce);
+    return std::vector<unsigned char>(hdr, hdr + 80);
+}
+
+// ── 4a/4b contract (kept) ───────────────────────────────────────────────────
+
+TEST(DashStratumWorkSource, ConstructsAndSatisfiesIWorkSourceContract)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    core::stratum::IWorkSource* iface = ws.get();  // usable through the abstract iface
+    ASSERT_NE(iface, nullptr);
+}
+
+TEST(DashStratumWorkSource, ConfigDefaultsMatchStratumConfigWithX11Overrides)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    const auto& cfg = ws->get_stratum_config();
+    EXPECT_DOUBLE_EQ(cfg.min_difficulty, 0.0005);
+    EXPECT_DOUBLE_EQ(cfg.max_difficulty, 65536.0);
+    // DASH adopts p2pool-dash's field-tuned 10s vardiff share-rate default (set in
+    // the work-source ctor, ec26caef) to stop the X11 vardiff oscillation/reject
+    // storm -- NOT the 3s BTC StratumConfig default. Keep this KAT in lockstep.
+    EXPECT_DOUBLE_EQ(cfg.target_time, 10.0);
+    EXPECT_TRUE(cfg.vardiff_enabled);
+    // X11 = standard diff-1 scale (p2pool-dash DUMB_SCRYPT_DIFF == 1), NOT the
+    // scrypt 2^16 default -- otherwise advertised difficulty inflates 65536x.
+    EXPECT_DOUBLE_EQ(cfg.set_difficulty_multiplier, 1.0);
+    // Runtime coin tag for the coin-agnostic core log lines (#732).
+    EXPECT_EQ(cfg.coin_symbol, "DASH");
+}
+
+TEST(DashStratumWorkSource, WorkGenerationStartsZeroAndBumps)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    EXPECT_EQ(ws->get_work_generation(), 0u);
+    ws->bump_work_generation();
+    ws->bump_work_generation();
+    EXPECT_EQ(ws->get_work_generation(), 2u);
+}
+
+TEST(DashStratumWorkSource, ShareTargetAtomicsRoundTrip)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    EXPECT_EQ(ws->get_share_bits(), 0u);
+    EXPECT_EQ(ws->get_share_max_bits(), 0u);
+    ws->set_share_target(0x1d00ffffu, 0x1e0fffffu);
+    EXPECT_EQ(ws->get_share_bits(), 0x1d00ffffu);
+    EXPECT_EQ(ws->get_share_max_bits(), 0x1e0fffffu);
+}
+
+TEST(DashStratumWorkSource, NoMergedChainInV36)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    EXPECT_FALSE(ws->has_merged_chain(0x0001));
+}
+
+TEST(DashStratumWorkSource, BestShareHashFnEmptyUntilWired)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    EXPECT_FALSE(static_cast<bool>(ws->get_best_share_hash_fn()));
+    ws->set_best_share_hash_fn([]() { return uint256::ZERO; });
+    auto fn = ws->get_best_share_hash_fn();
+    ASSERT_TRUE(static_cast<bool>(fn));
+    EXPECT_EQ(fn(), uint256::ZERO);
+}
+
+TEST(DashStratumWorkSource, WorkerRegistryRoundTrip)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    core::stratum::WorkerInfo info;
+    info.username    = "Xaddr.worker1";
+    info.worker_name = "worker1";
+    ws->register_stratum_worker("sess-1", info);
+    ws->update_stratum_worker("sess-1", /*hashrate=*/1.0e9, /*dead=*/0.0,
+                              /*difficulty=*/16.0, /*accepted=*/3, /*rejected=*/0, /*stale=*/0);
+    ws->update_stratum_worker("sess-unknown", 1.0, 0.0, 1.0, 0, 0, 0);
+    ws->unregister_stratum_worker("sess-1");
+    ws->unregister_stratum_worker("sess-unknown");
+    SUCCEED();
+}
+
+// The fused adapter: with an UNPOPULATED coin-state, get_work() routes to the
+// RETAINED dashd fallback (always-reachable safety + [GBT-XCHECK] arm).
+TEST(DashStratumWorkSource, GetWorkRoutesToDashdFallbackWhenCoinStateUnpopulated)
+{
+    Fixture fx(true);
+    ASSERT_FALSE(fx.coin_state.populated());  // default bundle is a set-gap
+    auto ws = fx.make();
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.have_desired_pseudoshare = false;
+    job_in.local_hash_rate = 0.0;
+
+    dash::stratum::GetWork gw = ws->get_work(job_in);
+
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_EQ(gw.work.m_height, 424242u);
+    EXPECT_EQ(gw.work.m_coinbase_value, kCoinbaseValue);
+    EXPECT_EQ(gw.targets.share_target, job_in.sane_target_max);
+    EXPECT_EQ(gw.targets.min_share_target, job_in.share_info_bits_target);
+}
+
+// ── 4c: set-gap honesty ─────────────────────────────────────────────────────
+// An EMPTY fallback template (unarmed dashd arm: bits == 0) must yield an
+// empty trio -- an honest "no template yet", never a fabricated one.
+TEST(DashStratumWorkSource, SetGapServesEmptyTrio)
+{
+    Fixture fx;   // fallback_work left default: m_bits == 0
+    auto ws = fx.make();
+    EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_TRUE(ws->get_stratum_merkle_branches().empty());
+    auto parts = ws->get_coinbase_parts();
+    EXPECT_TRUE(parts.first.empty());
+    EXPECT_TRUE(parts.second.empty());
+    auto cb = ws->build_connection_coinbase(uint256::ZERO, "deadbeef",
+                                            fixture_miner_script(), {});
+    EXPECT_TRUE(cb.coinb1.empty());
+    EXPECT_TRUE(cb.coinb2.empty());
+}
+
+// ── 4c: the template trio off a fixed DashWorkData ──────────────────────────
+
+TEST(DashStratumWorkSource, TemplateServesFixtureFieldsWithCorrectEncodings)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+
+    auto tmpl = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl.empty());
+    // The exact fields + conventions StratumSession::send_notify_work reads:
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), std::string(kPrevHashHex));
+    EXPECT_EQ(tmpl.value("version", 0), kVersion);
+    EXPECT_EQ(tmpl.value("bits", ""), "1e0ffff0");        // 8-char BE hex
+    EXPECT_EQ(tmpl.value("height", 0u), 424242u);
+    EXPECT_EQ(tmpl.value("curtime", uint64_t{0}), uint64_t{kCurtime});
+    EXPECT_EQ(tmpl.value("coinbasevalue", uint64_t{0}), kCoinbaseValue);
+
+    // The dedicated prevhash getter serves the SAME tip as the template.
+    EXPECT_EQ(ws->get_current_gbt_prevhash(), std::string(kPrevHashHex));
+}
+
+TEST(DashStratumWorkSource, MerkleBranchesFoldToTheBlockMerkleRoot)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+
+    auto branches = ws->get_stratum_merkle_branches();
+    ASSERT_EQ(branches.size(), 2u);   // 3 leaves (cb + 2 txs) -> 2 siblings
+
+    // Miner-side ascent from an arbitrary coinbase txid must reproduce the
+    // canonical block merkle root over [cb, t1, t2] (block_producer SSOT).
+    uint256 cb_txid;
+    cb_txid.SetHex("3333333333333333333333333333333333333333333333333333333333333333");
+    const dash::coin::DashWorkData w = rich_work();
+    std::vector<uint256> leaves;
+    leaves.push_back(cb_txid);
+    leaves.insert(leaves.end(), w.m_tx_hashes.begin(), w.m_tx_hashes.end());
+    EXPECT_EQ(fold_branches(cb_txid, branches),
+              dash::coin::compute_merkle_root(leaves));
+}
+
+TEST(DashStratumWorkSource, ConnectionCoinbaseIsByteIdenticalToVerifierSSOT)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+
+    const auto miner_script = fixture_miner_script();
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             miner_script, {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    ASSERT_FALSE(cbr.coinb2.empty());
+    EXPECT_EQ(cbr.snapshot.subsidy, kCoinbaseValue);
+    ASSERT_TRUE(cbr.snapshot.tx_data);
+    EXPECT_EQ(*cbr.snapshot.tx_data, rich_work().m_tx_data_hex);
+    EXPECT_EQ(cbr.snapshot.merkle_branches.size(), 2u);
+
+    // Reassemble with the zeroed extranonce (en1+en2 == the 8-byte nonce64
+    // placeholder) -> must be BYTE-IDENTICAL to the verifier-shared SSOT
+    // build: compute_dash_payouts + coinbase::build over the same fixture.
+    auto reassembled = reassemble(cbr.coinb1, "00000000", "00000000", cbr.coinb2);
+
+    const dash::coin::DashWorkData w = rich_work();
+    const core::CoinParams params = dash::make_coin_params(/*testnet=*/false);
+    std::map<std::vector<unsigned char>, uint64_t> weights{{miner_script, 1}};
+    auto tx_outs = dash::coinbase::compute_dash_payouts(
+        kCoinbaseValue, w.m_packed_payments, fixture_miner_pkh(),
+        weights, /*total_weight=*/1, params);
+    // Coinbase text comes from the coin SSOT (config_pool.hpp), the same source
+    // build_connection_coinbase resolves — pinning the literal here would make
+    // this byte-identity test fail the moment the pool's coinbase text changes,
+    // which is exactly the knob --coinbase-text exposes.
+    auto layout = dash::coinbase::build(
+        w, tx_outs, dash::SharechainConfig::coinbase_text(params.is_testnet),
+        params, /*ref_hash=*/uint256::ZERO);
+    EXPECT_EQ(reassembled, layout.bytes);
+
+    // Value splits: worker payout = subsidy - masternode share; the single
+    // genesis miner carries it all (modulo the donation rounding remainder),
+    // the masternode output carries EXACTLY its GBT amount, and the total
+    // never exceeds the coinbasevalue.
+    const uint64_t worker_payout = kCoinbaseValue - kMnAmount;
+    uint64_t total = 0, miner_amt = 0, mn_amt = 0, donation_amt = 0;
+    const auto mn_script = ParseHex(fixture_mn_payee().substr(1));
+    const std::vector<unsigned char> donation_script(
+        dash::DONATION_SCRIPT.begin(), dash::DONATION_SCRIPT.end());
+    for (const auto& o : tx_outs) {
+        total += o.amount;
+        if (o.script == miner_script)   miner_amt   += o.amount;
+        if (o.script == mn_script)      mn_amt      += o.amount;
+        if (o.script == donation_script) donation_amt += o.amount;
+    }
+    EXPECT_EQ(total, kCoinbaseValue);
+    EXPECT_EQ(mn_amt, kMnAmount);
+    EXPECT_EQ(miner_amt + donation_amt, worker_payout);
+    EXPECT_GE(miner_amt, worker_payout - 2);   // donation keeps only rounding dust
+}
+
+// ── 4d: X11 difficulty + submit classification ──────────────────────────────
+
+struct SubmitRig {
+    Fixture fx{true};
+    std::unique_ptr<dash::stratum::DASHWorkSource> ws;
+    core::stratum::JobSnapshot job;
+    std::string en1 = "00000001";
+    std::string en2 = "00000002";
+    uint256 prev;
+
+    SubmitRig()
+    {
+        ws = fx.make();
+        auto cbr = ws->build_connection_coinbase(uint256::ZERO, en1,
+                                                 fixture_miner_script(), {});
+        job.coinb1          = cbr.coinb1;
+        job.coinb2          = cbr.coinb2;
+        job.gbt_prevhash    = kPrevHashHex;
+        job.nbits           = "1e0ffff0";
+        job.version         = static_cast<uint32_t>(kVersion);
+        job.merkle_branches = cbr.snapshot.merkle_branches;
+        job.tx_data         = cbr.snapshot.tx_data;
+        job.subsidy         = cbr.snapshot.subsidy;
+        prev.SetHex(kPrevHashHex);
+    }
+
+    // Reproduce the submit-side header assembly for a given nonce.
+    std::vector<unsigned char> header_for(uint32_t nonce) const
+    {
+        auto coinbase = reassemble(job.coinb1, en1, en2, job.coinb2);
+        uint256 root = fold_branches(dash::coin::coinbase_txid(coinbase),
+                                     job.merkle_branches);
+        return assemble_header(job.version, prev, root, kCurtime,
+                               0x1e0ffff0u, nonce);
+    }
+
+    uint256 pow_for(uint32_t nonce) const
+    {
+        auto hdr = header_for(nonce);
+        return dash::crypto::hash_x11(hdr.data(), hdr.size());
+    }
+
+    // First nonce in [0, limit) whose X11 PoW satisfies `pred`.
+    template <typename Pred>
+    uint32_t find_nonce(Pred pred, uint32_t limit = 5000) const
+    {
+        for (uint32_t n = 0; n < limit; ++n)
+            if (pred(pow_for(n))) return n;
+        ADD_FAILURE() << "no nonce satisfying predicate in [0," << limit << ")";
+        return 0;
+    }
+
+    nlohmann::json submit(uint32_t nonce)
+    {
+        return ws->mining_submit(
+            "XfixtureMinerAddress", "job_0", en1, en2,
+            dash::coinbase::be_hex_u32(kCurtime),
+            dash::coinbase::be_hex_u32(nonce),
+            "rid-0", {}, &job);
+    }
+};
+
+TEST(DashStratumWorkSource, ComputeShareDifficultyMatchesX11Reconstruction)
+{
+    SubmitRig rig;
+    const uint32_t nonce = 7;
+
+    double got = rig.ws->compute_share_difficulty(
+        rig.job.coinb1, rig.job.coinb2, rig.en1, rig.en2,
+        dash::coinbase::be_hex_u32(kCurtime),
+        dash::coinbase::be_hex_u32(nonce),
+        rig.job.version, rig.job.gbt_prevhash, rig.job.nbits,
+        rig.job.merkle_branches);
+
+    // Pin: diff1 / x11(header) over the independently assembled fixture header.
+    double expected = chain::target_to_difficulty(rig.pow_for(nonce));
+    ASSERT_GT(expected, 0.0);
+    EXPECT_DOUBLE_EQ(got, expected);
+}
+
+TEST(DashStratumWorkSource, ComputeShareDifficultyMalformedInputIsZero)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    // Non-hex prevhash -> malformed header -> the documented 0.0 sentinel the
+    // vardiff gate treats as a hard reject.
+    double diff = ws->compute_share_difficulty(
+        "coinb1", "coinb2", "en1", "en2", "ntime", "nonce",
+        /*version=*/0x20000000u, "prevhash", "1e0ffff0",
+        /*merkle_branches=*/{});
+    EXPECT_DOUBLE_EQ(diff, 0.0);
+}
+
+TEST(DashStratumWorkSource, MiningSubmitRejectsWithoutJobSnapshot)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    auto result = ws->mining_submit(
+        "Xaddr.worker1", "job-0", "en1", "en2", "ntime", "nonce", "rid-0",
+        /*merged_addresses=*/{}, /*job=*/nullptr);
+    ASSERT_TRUE(result.is_array());
+    EXPECT_FALSE(result[0].get<bool>());
+    EXPECT_EQ(result[1][0].get<int>(), 21);   // Job not found
+    EXPECT_FALSE(fx.submit_called);
+}
+
+TEST(DashStratumWorkSource, MiningSubmitAcceptsShareBelowShareTarget)
+{
+    SubmitRig rig;
+    // Easy share target, impossible block target: a deterministic ShareAccept.
+    rig.job.share_bits  = 0x207fffffu;    // ~2^255 target: trivially satisfied
+    rig.job.block_nbits = "1c00ffff";     // hard: fixture PoW can never meet it
+    const uint256 block_target = dash::coin::target_from_nbits(0x1c00ffffu);
+    const uint256 share_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= share_target && pow > block_target;
+    });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    // Not a block: the won-block broadcaster must NOT have fired.
+    EXPECT_FALSE(rig.fx.submit_called);
+}
+
+TEST(DashStratumWorkSource, MiningSubmitRejectsLowDifficulty)
+{
+    SubmitRig rig;
+    // Both targets impossible for the fixture PoW -> low-difficulty reject.
+    rig.job.share_bits  = 0x1c00ffffu;
+    rig.job.block_nbits = "1c00ffff";
+    const uint256 hard_target = dash::coin::target_from_nbits(0x1c00ffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow > hard_target;
+    });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_array());
+    EXPECT_FALSE(result[0].get<bool>());
+    EXPECT_EQ(result[1][0].get<int>(), 23);   // Low difficulty share
+    EXPECT_FALSE(rig.fx.submit_called);
+}
+
+TEST(DashStratumWorkSource, MiningSubmitWonBlockAssemblesAndBroadcasts)
+{
+    SubmitRig rig;
+    // Trivial block target -> deterministic WonBlock for a mined-in-test nonce.
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u);
+
+    // The dispatched block must be the --mine-block serialization:
+    // header(80) || CompactSize(1 + ntx) || coinbase || txs.
+    const auto& block = rig.fx.submitted_block;
+    const auto  header = rig.header_for(nonce);
+    const auto  coinbase = reassemble(rig.job.coinb1, rig.en1, rig.en2, rig.job.coinb2);
+    ASSERT_GT(block.size(), 81u + coinbase.size());
+    EXPECT_TRUE(std::equal(header.begin(), header.end(), block.begin()));
+    EXPECT_EQ(block[80], 3u);   // CompactSize: coinbase + 2 fixture txs
+    EXPECT_TRUE(std::equal(coinbase.begin(), coinbase.end(), block.begin() + 81));
+    // Fixture tx bytes trail the coinbase verbatim.
+    auto t1 = ParseHex("aa01"), t2 = ParseHex("bb02");
+    std::vector<unsigned char> tail;
+    tail.insert(tail.end(), t1.begin(), t1.end());
+    tail.insert(tail.end(), t2.begin(), t2.end());
+    ASSERT_EQ(block.size(), 81u + coinbase.size() + tail.size());
+    EXPECT_TRUE(std::equal(tail.begin(), tail.end(),
+                           block.begin() + 81 + coinbase.size()));
+}
+
+// The mint seam: a share-target submission routes the found-share fields into
+// set_mint_share_fn when bound (the 4d follow-up wiring point).
+TEST(DashStratumWorkSource, MiningSubmitRoutesShareIntoMintSeam)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "1c00ffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x1c00ffffu);
+    const uint256 share_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= share_target && pow > block_target;
+    });
+
+    bool mint_called = false;
+    dash::stratum::DASHWorkSource::MintShareInputs seen;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            mint_called = true;
+            seen = in;
+            uint256 h;
+            h.SetHex("4444444444444444444444444444444444444444444444444444444444444444");
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(mint_called);
+    EXPECT_EQ(seen.header_bytes, rig.header_for(nonce));
+    EXPECT_EQ(seen.coinbase_bytes,
+              reassemble(rig.job.coinb1, rig.en1, rig.en2, rig.job.coinb2));
+    EXPECT_EQ(seen.subsidy, kCoinbaseValue);
+    EXPECT_EQ(seen.pow_hash, rig.pow_for(nonce));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #887 -- the block-winning share must ALSO be minted onto the sharechain.
+//
+// block_target <= share_target, so a solve that clears the block target clears
+// the share target by definition: it is the highest-work share this node will
+// ever produce. Before #887 the won-block arm dispatched the block and
+// RETURNED, so the mint seam was never reached -- forfeiting our own PPLNS
+// weight in the very window the block pays out from, on every block won.
+//
+// The two systems are independent (sharechain vs coin blockchain); the solve
+// belongs in BOTH.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Positive: a WonBlock submit reaches the broadcaster AND the mint seam, and
+// the fields handed to the mint describe the SAME solve that was dispatched.
+TEST(DashStratumWorkSource, MiningSubmitWonBlockAlsoMintsTheShare)
+{
+    SubmitRig rig;
+    // Trivial block target -> deterministic WonBlock (same setup as
+    // MiningSubmitWonBlockAssemblesAndBroadcasts).
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint256 share_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+    // The premise of the fix: a block solve is also a share solve.
+    ASSERT_LE(rig.pow_for(nonce), share_target);
+
+    bool mint_called = false;
+    dash::stratum::DASHWorkSource::MintShareInputs seen;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            mint_called = true;
+            seen = in;
+            uint256 h;
+            h.SetHex("5555555555555555555555555555555555555555555555555555555555555555");
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+
+    // The block still goes out -- unchanged, and first.
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u);
+
+    // ...AND the winning share is minted (the #887 fix).
+    ASSERT_TRUE(mint_called);
+    EXPECT_EQ(seen.header_bytes, rig.header_for(nonce));
+    EXPECT_EQ(seen.pow_hash, rig.pow_for(nonce));
+    EXPECT_EQ(seen.subsidy, kCoinbaseValue);
+    EXPECT_EQ(seen.coinbase_bytes,
+              reassemble(rig.job.coinb1, rig.en1, rig.en2, rig.job.coinb2));
+    // The minted share describes the block that was dispatched: the block's
+    // first 80 bytes ARE this share's header.
+    ASSERT_GE(rig.fx.submitted_block.size(), 80u);
+    EXPECT_TRUE(std::equal(seen.header_bytes.begin(), seen.header_bytes.end(),
+                           rig.fx.submitted_block.begin()));
+}
+
+// REWARD INVARIANT: the block submit runs FIRST and is never gated by the
+// mint. A mint that throws (tracker error, rebuild fault) must not cost the
+// block -- and must not turn a won block into a stratum reject either.
+TEST(DashStratumWorkSource, MiningSubmitWonBlockDispatchesBeforeAndDespiteAThrowingMint)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    // Ordering witness: the mint records whether the block had already been
+    // dispatched by the time it ran. Anything other than "already dispatched"
+    // means the mint was wired AHEAD of the submit -- the one arrangement this
+    // codebase forbids on a reward path.
+    bool mint_saw_block_already_submitted = false;
+    bool mint_called = false;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs&) -> uint256 {
+            mint_called = true;
+            mint_saw_block_already_submitted = rig.fx.submit_called;
+            throw std::runtime_error("mint blew up");
+        });
+
+    auto result = rig.submit(nonce);
+
+    // Block dispatched, and the throw did not escape mining_submit.
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u);
+    ASSERT_TRUE(mint_called);
+    EXPECT_TRUE(mint_saw_block_already_submitted);
+    // Won block still answers the miner with the accepted reply.
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #889 -- a BUSY TRACKER must not forfeit the block-winning share.
+//
+// #888 made the block arm REACH the mint seam. This is about that mint then
+// being DECLINED: every tracker acquisition on the mint path is try_to_lock and
+// gives up if the compute thread is mid-think(). For an ordinary share that is
+// right -- the next solve mints. A block-winning share has no next solve, so
+// the same decline is permanent, and because p2pool peers detect a pool block
+// by watching the sharechain for a share meeting the block target
+// (p2pool/node.py:145-147), the won block also becomes invisible to every node
+// on the network. A momentary lock contention reproduces the whole #887
+// symptom.
+//
+// The seam carries `won_block` so the mint binding can take a BOUNDED WAIT on
+// that path ONLY. These pin (a) the flag actually reaches the mint, set on the
+// block arm and clear on the share arm, and (b) end to end through
+// mining_submit: with the tracker HELD EXCLUSIVELY by another thread, a
+// block-target submit still lands its share while an ordinary one still
+// declines.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// The block arm marks the solve as block-winning; nothing else about the mint
+// inputs changes.
+TEST(DashStratumWorkSource, MiningSubmitWonBlockFlagsTheMintAsBlockWinning)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    bool mint_called = false;
+    bool seen_won_block = false;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            mint_called = true;
+            seen_won_block = in.won_block;
+            uint256 h;
+            h.SetHex("6666666666666666666666666666666666666666666666666666666666666666");
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);      // block out first, unchanged
+    ASSERT_TRUE(mint_called);
+    EXPECT_TRUE(seen_won_block)
+        << "the mint seam must be told this solve already won a block -- "
+           "without it the binding cannot know a decline is permanent (#889)";
+}
+
+// ...and the ordinary share arm does NOT. This is the guard that the bounded
+// wait can never leak onto ordinary share traffic, where try-and-decline is
+// the correct trade and must stay exactly as it is.
+TEST(DashStratumWorkSource, MiningSubmitOrdinaryShareIsNotFlaggedBlockWinning)
+{
+    SubmitRig rig;
+    // Easy share target, impossible block target -> deterministic share arm.
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "1d00ffff";
+    const uint256 share_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint256 block_target = dash::coin::target_from_nbits(0x1d00ffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= share_target && pow > block_target;
+    });
+
+    bool mint_called = false;
+    bool seen_won_block = true;             // must be overwritten with false
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            mint_called = true;
+            seen_won_block = in.won_block;
+            uint256 h;
+            h.SetHex("7777777777777777777777777777777777777777777777777777777777777777");
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    EXPECT_FALSE(rig.fx.submit_called);     // not a block
+    ASSERT_TRUE(mint_called);
+    EXPECT_FALSE(seen_won_block);
+}
+
+// ★ THE REGRESSION, end to end through mining_submit: the tracker is HELD
+//   EXCLUSIVELY by another thread for the whole call -- exactly the state
+//   think() puts it in -- and a block-target submit STILL lands its share.
+//
+//   The bound mint here mirrors the production binding's lock discipline
+//   (main_dash.cpp): it derives urgency from in.won_block and acquires through
+//   the SAME dash::tracker_acquire helper the live path uses, so what is under
+//   test is the shipped mechanism, not a stand-in for it.
+//
+//   The paired ordinary-share case is the negative control: identical held
+//   lock, identical helper, and it declines -- which is what proves the block
+//   case is not passing merely because the mutex happened to be free.
+TEST(DashStratumWorkSource, WonBlockShareMintsThroughAnExclusivelyHeldTracker)
+{
+    std::shared_mutex tracker_mutex;        // stands in for NodeImpl::m_tracker_mutex
+
+    // Holder thread: takes the exclusive lock and keeps it, like a think()
+    // cycle in flight. Spin-wait until it is genuinely held so the submit can
+    // never race ahead of it.
+    std::atomic<bool> held{false};
+    std::atomic<bool> stop{false};
+    std::thread holder([&] {
+        std::unique_lock<std::shared_mutex> lk(tracker_mutex);
+        held.store(true);
+        while (!stop.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    while (!held.load())
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+    // Release the tracker shortly after the submit begins -- a think() cycle
+    // ends, it does not last forever. A try_to_lock mint gives up instantly and
+    // loses the share; a bounded one rides it out.
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        stop.store(true);
+    });
+
+    auto mint_under_lock =
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            const auto urgency = in.won_block
+                ? dash::tracker_acquire::Urgency::BlockWinning
+                : dash::tracker_acquire::Urgency::Opportunistic;
+            auto lk = dash::tracker_acquire::exclusive(tracker_mutex, urgency);
+            if (!lk.owns_lock())
+                return uint256();           // declined -- share lost
+            uint256 h;
+            h.SetHex("8888888888888888888888888888888888888888888888888888888888888888");
+            return h;                        // minted
+        };
+
+    // --- the block arm ---
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    bool minted = false;
+    bool block_was_out_before_the_wait = false;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            // ORDERING WITNESS: whatever the wait below costs, the block has
+            // ALREADY been dispatched. This is the invariant #888 established
+            // and #889 must not regress -- if a bounded wait ever moved ahead
+            // of the submit, this flips false.
+            block_was_out_before_the_wait = rig.fx.submit_called;
+            const uint256 h = mint_under_lock(in);
+            minted = !h.IsNull();
+            return h;
+        });
+
+    auto result = rig.submit(nonce);
+
+    holder.join();
+    releaser.join();
+
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_TRUE(block_was_out_before_the_wait)
+        << "the block submit must remain strictly first and unconditional";
+    EXPECT_TRUE(minted)
+        << "a busy tracker forfeited the block-winning share -- the block is "
+           "then invisible to every p2pool peer (#889)";
+}
+
+// Negative control for the test above: same helper, same permanently-held
+// tracker, ORDINARY share -> declines, unchanged from today.
+TEST(DashStratumWorkSource, OrdinaryShareStillDeclinesThroughAHeldTracker)
+{
+    std::shared_mutex tracker_mutex;
+    std::atomic<bool> held{false};
+    std::atomic<bool> stop{false};
+    std::thread holder([&] {
+        std::unique_lock<std::shared_mutex> lk(tracker_mutex);
+        held.store(true);
+        while (!stop.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    while (!held.load())
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "1d00ffff";
+    const uint256 share_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint256 block_target = dash::coin::target_from_nbits(0x1d00ffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= share_target && pow > block_target;
+    });
+
+    bool minted = true;
+    rig.ws->set_mint_share_fn(
+        [&](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            const auto urgency = in.won_block
+                ? dash::tracker_acquire::Urgency::BlockWinning
+                : dash::tracker_acquire::Urgency::Opportunistic;
+            auto lk = dash::tracker_acquire::exclusive(tracker_mutex, urgency);
+            minted = lk.owns_lock();
+            return uint256();
+        });
+
+    auto result = rig.submit(nonce);
+    stop.store(true);
+    holder.join();
+
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    EXPECT_FALSE(rig.fx.submit_called);
+    EXPECT_FALSE(minted)
+        << "ordinary shares must keep the try-and-decline trade (#889 scope)";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Stale-payee fix KATs (bad-cb-payee root cause; hex-confirmed @h1517420).
+// DASH rotates the masternode payee EVERY block: a job must be ONE frozen
+// template unit (header + coinbase + branches + txs), the template cache must
+// die on RPC-reconnect churn, and a won block whose coinbase no longer matches
+// the current height's payee set must be rejected LOUDLY, never submitted.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// A rotated sibling of rich_work(): the NEXT height, new prev, and — the DASH
+// property under test — a DIFFERENT masternode payee (pkh 0x33, new amount).
+const char* const kRotatedPrevHashHex =
+    "00000000000000c4d5e6f708192a3b4c5d6e2f8c9e5a1d4b3c6e7f8091a2b3c4";
+
+std::string rotated_mn_payee()
+{
+    std::vector<unsigned char> s = {0x76, 0xa9, 0x14};
+    s.insert(s.end(), 20, 0x33);
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return "!" + HexStr(std::span<const unsigned char>(s.data(), s.size()));
+}
+
+dash::coin::DashWorkData rotated_work()
+{
+    dash::coin::DashWorkData w = rich_work();
+    w.m_previous_block.SetHex(kRotatedPrevHashHex);
+    w.m_height += 1;
+    w.m_packed_payments.clear();
+    dash::coin::PackedPayment mn;
+    mn.payee  = rotated_mn_payee();
+    mn.amount = kMnAmount + 12345;   // rotation also changes the mandated amount
+    w.m_packed_payments.push_back(mn);
+    w.m_payment_amount = mn.amount;
+    return w;
+}
+
+// Fix 1 pin: build_connection_coinbase freezes the header fields ATOMICALLY
+// with the coinbase (WorkSnapshot::has_header) — the fields the stratum
+// session must use INSTEAD of its separately-fetched template.
+TEST(DashStratumWorkSource, SnapshotFreezesHeaderAtomicallyWithCoinbase)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             fixture_miner_script(), {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    EXPECT_TRUE(cbr.snapshot.has_header);
+    EXPECT_EQ(cbr.snapshot.gbt_prevhash, std::string(kPrevHashHex));
+    EXPECT_EQ(cbr.snapshot.header_version, static_cast<uint32_t>(kVersion));
+    EXPECT_EQ(cbr.snapshot.block_nbits_hex, "1e0ffff0");
+    EXPECT_EQ(cbr.snapshot.curtime, kCurtime);
+    EXPECT_EQ(cbr.snapshot.height, 424242u);
+    // require_job_snapshot is set: the core session refuses mixed jobs.
+    EXPECT_TRUE(ws->get_stratum_config().require_job_snapshot);
+}
+
+// Fix 1 pin — THE double-fetch race. The core session fetches the template
+// and the coinbase in two separate work-source calls; a rotation in between
+// previously produced a MIXED job: tmpl A's header + a coinbase carrying
+// height B's masternode payee -> deterministic dashd bad-cb-payee at submit.
+// Pin (a) the hazard witness: the pre-rotation tmpl header differs from the
+// post-rotation snapshot header, so a session composing tmpl(A)+coinbase(B)
+// WOULD have mixed template generations; and (b) the fix invariant: the
+// snapshot the coinbase ships with is self-consistent — its header AND its
+// payee both come from the SAME (post-rotation) template.
+TEST(DashStratumWorkSource, TemplateRotationBetweenFetchesYieldsSelfConsistentSnapshot)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+
+    // Fetch #1: the template, as StratumSession::send_notify_work does first.
+    auto tmpl_a = ws->get_current_work_template();
+    ASSERT_EQ(tmpl_a.value("previousblockhash", ""), std::string(kPrevHashHex));
+
+    // The tip moves between the two fetches (new block -> payee ROTATES).
+    fx.fallback_work = rotated_work();
+    ws->bump_work_generation();   // the tip signal that refreshes the cache
+
+    // Fetch #2: the per-connection coinbase.
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             fixture_miner_script(), {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    ASSERT_TRUE(cbr.snapshot.has_header);
+
+    // (a) hazard witness: tmpl(A) + this coinbase(B) would be a MIXED job.
+    EXPECT_NE(cbr.snapshot.gbt_prevhash, tmpl_a.value("previousblockhash", ""));
+
+    // (b) fix invariant: snapshot header and coinbase payee are BOTH from the
+    // rotated template — the new payee script is in the coinbase, the old one
+    // is gone, and the frozen header names the rotated tip/height.
+    EXPECT_EQ(cbr.snapshot.gbt_prevhash, std::string(kRotatedPrevHashHex));
+    EXPECT_EQ(cbr.snapshot.height, 424243u);
+    const std::string new_payee_hex = rotated_mn_payee().substr(1);
+    const std::string old_payee_hex = fixture_mn_payee().substr(1);
+    const std::string cb_hex = cbr.coinb1 + cbr.coinb2;
+    EXPECT_NE(cb_hex.find(new_payee_hex), std::string::npos);
+    EXPECT_EQ(cb_hex.find(old_payee_hex), std::string::npos);
+}
+
+// Fix 2 pin: a CoindRPC reconnect (the churn window) invalidates the cached
+// template + bumps the work generation, so no job is served from a payee
+// snapshot predating the reconnect.
+TEST(DashStratumWorkSource, InvalidateTemplateCacheForcesRefetchAndBumpsGeneration)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated -> fallback arm
+    int fallback_calls = 0;
+    auto ws = std::make_unique<dash::stratum::DASHWorkSource>(
+        cs,
+        [&fallback_calls]() {
+            ++fallback_calls;
+            return rich_work();
+        });
+
+    ASSERT_FALSE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1);
+    // Same generation, inside the TTL: served from cache, no re-fetch.
+    ASSERT_FALSE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1);
+
+    const uint64_t gen_before = ws->get_work_generation();
+    ws->invalidate_template_cache("kat: simulated CoindRPC reconnect");
+    EXPECT_EQ(ws->get_work_generation(), gen_before + 1);
+
+    // Next serve re-sources through the fallback — the stale snapshot is gone.
+    ASSERT_FALSE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 2);
+}
+
+// soak0804e resume-quantization pin: a FAILED sourcing attempt (set-gap /
+// declined gate) is negative-cached for kRetryAfter (5 s) so a down dashd is
+// not hammered by every session's 1 s notify-retry — but a work-generation
+// bump is an EVENT (tip change / coin-state advance, e.g. the credit-pool
+// seed catching up to the tip body) that changes the answer, so it must break
+// THROUGH the negative cache. Before this fix the event-driven resume was
+// quantized to the retry window: the maintainer had already advanced the
+// credit pool and fired state-dirty (bump + notify), the gate was viable, yet
+// cached_work() refused to re-source for up to 5 more seconds — exactly the
+// [5,5,5,5,5] s creditpool-stale episode floor the soak measured.
+TEST(DashStratumWorkSource, GenerationBumpBreaksThroughNegativeTemplateCache)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated -> fallback arm
+    int fallback_calls = 0;
+    auto ws = std::make_unique<dash::stratum::DASHWorkSource>(
+        cs,
+        [&fallback_calls]() {
+            ++fallback_calls;
+            return dash::coin::DashWorkData{};   // set-gap: every attempt FAILS
+        });
+
+    // First pull: sources once, fails, arms the negative cache.
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1);
+
+    // Second pull inside kRetryAfter with NO event: the throttle must hold
+    // (the down-dashd protection is unchanged).
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1) << "no event => the retry throttle must hold";
+
+    // An event fires (the state-dirty sink's bump_work_generation): the next
+    // pull must re-source IMMEDIATELY instead of waiting out kRetryAfter.
+    ws->bump_work_generation();
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 2)
+        << "a work-generation bump must break through the negative template "
+           "cache (event-driven resume, not the 5 s retry quantum)";
+}
+
+// Fallback-arm event-driven tip refresh pin: on the dashd-fallback arm the
+// template cache only re-sources on the 30 s staleness TTL, so a new DASH block
+// can leave miners hashing a stale tip for up to ~30 s (accepted pseudoshares
+// that can no longer win the current block). The run-path tip poller
+// (main_dash.cpp) closes that window by firing the SAME refresh pair on a
+// dashd best-block change that the embedded arm fires from its header-chain
+// tip-changed callback: invalidate_template_cache() + bump_work_generation(),
+// then notify_all() pushes a clean_jobs mining.notify. This KAT pins the
+// work-source contract that pair relies on: on a tip change the served template
+// must SWAP to the new tip (no stale-tip mining) AND the work generation must
+// bump (the clean_jobs/notify signal every session re-pulls on). Fallback arm
+// only: an UNPOPULATED coin-state, so get_work routes to the dashd fallback.
+TEST(DashStratumWorkSource, FallbackArmTipChangeRefreshesTemplateAndBumpsGeneration)
+{
+    Fixture fx(true);                       // unpopulated coin-state -> fallback arm
+    ASSERT_FALSE(fx.coin_state.populated());
+    auto ws = fx.make();
+
+    // Baseline: the fallback serves the pre-tip-change template, cached at the
+    // old tip. This is what an idle miner would keep hashing until the TTL.
+    auto tmpl_before = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_before.empty());
+    EXPECT_EQ(tmpl_before.value("previousblockhash", ""), std::string(kPrevHashHex));
+    const uint64_t gen_before = ws->get_work_generation();
+
+    // A new DASH block arrives: dashd's best-block hash changes. The fallback
+    // now sources a new-tip template (rotated prev + rotated payee), exactly as
+    // getbestblockhash flips for the run-path poller.
+    fx.fallback_work = rotated_work();
+
+    // The poller's refresh action on an observed tip change (the SAME pair the
+    // embedded header-chain tip-changed callback fires).
+    ws->invalidate_template_cache("kat: fallback-arm dashd best-block changed");
+    ws->bump_work_generation();
+
+    // (a) clean_jobs/notify signal: work generation advanced, so notify_all()
+    //     will push a fresh mining.notify to every session.
+    EXPECT_GT(ws->get_work_generation(), gen_before);
+
+    // (b) no more stale-tip mining: the next served template is the NEW tip,
+    //     not the cached pre-change one.
+    auto tmpl_after = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_after.empty());
+    EXPECT_EQ(tmpl_after.value("previousblockhash", ""),
+              std::string(kRotatedPrevHashHex));
+    EXPECT_NE(tmpl_after.value("previousblockhash", ""),
+              tmpl_before.value("previousblockhash", ""));
+    EXPECT_EQ(tmpl_after.value("height", 0u), 424243u);
+}
+
+// ── #751 idle-reconnect churn fix KAT ───────────────────────────────────────
+// dashd closes an idle keep-alive connection on its rpcservertimeout (default
+// 30 s), so on an otherwise-idle pool c2pool reconnects every ~30-90 s. The old
+// behaviour invalidated the template cache (and fired clean_jobs) on EVERY such
+// reconnect, flapping the endpoint and wasting rig work even though nothing
+// changed on-chain. The fix makes the fallback-arm reconnect observer tip-aware:
+// on a reconnect it probes dashd's best-block hash and invalidates ONLY if the
+// tip actually moved during the disconnect.
+//
+// This KAT models that observer (mirroring main_dash.cpp's reconnect handler the
+// same way the ZMQ KAT models fire_refresh) and pins all three cases:
+//   (1) reconnect with the tip UNCHANGED -> NO invalidate (cache retained, no
+//       clean_jobs) -- the churn fix;
+//   (2) reconnect with the tip CHANGED during the disconnect -> DOES invalidate
+//       + bump (the stale-masternode-payee INVARIANT is preserved -- a moved tip
+//       must still re-source fresh-payee work);
+//   (3) reconnect where the best-block probe FAILS -> FAIL-SAFE invalidate
+//       (never serve stale-payee work on an unproven tip).
+TEST(DashStratumWorkSource, ReconnectInvalidatesOnlyWhenTipChanged)
+{
+    Fixture fx(true);                       // unpopulated coin-state -> fallback arm
+    ASSERT_FALSE(fx.coin_state.populated());
+    auto ws = fx.make();
+
+    // Shared last-seen-tip dedup + the tip-aware reconnect observer, mirroring
+    // main_dash.cpp: fire_refresh invalidates+bumps IFF the tip is new; the
+    // reconnect handler adds the fail-safe invalidate on a probe failure.
+    dash::coin::TipHashDedup dedup;
+    int notify_count = 0;
+    auto fire_refresh = [&](const std::string& tip) -> bool {
+        if (!dedup.is_new_tip(tip)) return false;   // unchanged tip -> no-op
+        ws->invalidate_template_cache("kat: tip changed during disconnect");
+        ws->bump_work_generation();
+        ++notify_count;                              // stands in for notify_all()
+        return true;
+    };
+    auto on_reconnect = [&](bool probe_ok, const std::string& probed_tip) {
+        if (!probe_ok || probed_tip.empty()) {
+            // FAIL-SAFE: unproven tip -> conservatively invalidate.
+            ws->invalidate_template_cache("kat: reconnect probe failed");
+            ++notify_count;
+            return;
+        }
+        // Benign idle-timeout reconnect (tip unchanged) coalesces to a no-op;
+        // a real tip change fires the refresh trio.
+        fire_refresh(probed_tip);
+    };
+
+    // Startup baseline: seed the dedup with the tip we are already mining (as the
+    // poll does at startup, WITHOUT notifying).
+    const std::string tip_old(64, 'a');
+    dedup.set_last(tip_old);
+    auto tmpl_before = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_before.empty());
+    EXPECT_EQ(tmpl_before.value("previousblockhash", ""), std::string(kPrevHashHex));
+    const uint64_t gen_baseline = ws->get_work_generation();
+
+    // (1) Idle-timeout reconnect, tip UNCHANGED -> NO invalidate, NO clean_jobs.
+    //     The endpoint does not flap; the cached template stays put.
+    on_reconnect(true, tip_old);
+    EXPECT_EQ(notify_count, 0);
+    EXPECT_EQ(ws->get_work_generation(), gen_baseline);   // no work-gen bump
+    auto tmpl_still = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_still.empty());
+    EXPECT_EQ(tmpl_still.value("previousblockhash", ""), std::string(kPrevHashHex));
+
+    // (2) A real tip change during the disconnect window -> MUST invalidate + bump
+    //     (stale-masternode-payee invariant preserved). The fallback now sources
+    //     the rotated-tip/rotated-payee template.
+    fx.fallback_work = rotated_work();
+    const std::string tip_new(64, 'b');
+    ASSERT_NE(tip_new, tip_old);
+    on_reconnect(true, tip_new);
+    EXPECT_EQ(notify_count, 1);                            // trio fired
+    EXPECT_GT(ws->get_work_generation(), gen_baseline);   // clean_jobs/notify signal
+    auto tmpl_after = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_after.empty());
+    EXPECT_EQ(tmpl_after.value("previousblockhash", ""),   // no stale-tip mining
+              std::string(kRotatedPrevHashHex));
+    EXPECT_EQ(tmpl_after.value("height", 0u), 424243u);
+
+    // (2b) An immediate follow-up reconnect on the SAME (now current) tip is again
+    //      benign -> deduped no-op (proves case (1) still holds after a change).
+    const uint64_t gen_after_change = ws->get_work_generation();
+    on_reconnect(true, tip_new);
+    EXPECT_EQ(notify_count, 1);
+    EXPECT_EQ(ws->get_work_generation(), gen_after_change);
+
+    // (3) FAIL-SAFE: the best-block probe fails on reconnect (RPC not ready) ->
+    //     invalidate conservatively rather than risk serving stale-payee work.
+    on_reconnect(false, "");
+    EXPECT_EQ(notify_count, 2);                            // fail-safe invalidate fired
+}
+
+// ── io-thread-decouple KAT (mining-hotel stratum-stall fix, v0.2.3.8) ────────
+// The stall fix: the stratum io_context thread must NEVER block on the dashd
+// fallback getblocktemplate. cached_work() re-sources through a background
+// executor (the dedicated rpc_pool in main_dash.cpp) as a SINGLE-FLIGHT job and
+// serves the cached template immediately, so a generation bump (a minted share,
+// ~every 15-30 s) no longer freezes 60+ sessions on a blocking GBT. Pins:
+//   (a) with an executor wired, a cache-miss / gen-bump does NOT call the (slow)
+//       fallback on the calling (io) thread -- it schedules ONE background job
+//       and serves the current cache immediately;
+//   (b) the re-source runs on the EXECUTOR's thread, not the caller's;
+//   (c) single-flight: concurrent misses schedule at most one refresh;
+//   (d) the gen-key freshness contract (double-fetch-race fix) is preserved --
+//       a bump still triggers a refresh, only OFF the io thread.
+TEST(DashStratumWorkSource, IoThreadDecoupleServesCachedAndRefreshesOffThread)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated -> dashd-fallback arm
+    std::atomic<int> fallback_calls{0};
+    std::atomic<bool> fallback_on_caller{false};
+    const auto caller_tid = std::this_thread::get_id();
+
+    auto ws = std::make_unique<dash::stratum::DASHWorkSource>(
+        cs,
+        [&]() -> dash::coin::DashWorkData {
+            fallback_calls.fetch_add(1);
+            if (std::this_thread::get_id() == caller_tid)
+                fallback_on_caller.store(true);
+            return rich_work();
+        });
+
+    // Controllable executor: capture jobs so the test drives WHEN the background
+    // re-source runs. Single-flight is enforced inside the work source.
+    std::mutex jm;
+    std::vector<std::function<void()>> jobs;
+    ws->set_refresh_executor([&](std::function<void()> job) {
+        std::lock_guard<std::mutex> l(jm);
+        jobs.push_back(std::move(job));
+    });
+
+    // (1) First request: cache empty. The io thread does NOT call the fallback --
+    //     it schedules ONE background job and serves an empty set-gap template.
+    auto t0 = ws->get_current_work_template();
+    EXPECT_TRUE(t0.empty());
+    EXPECT_EQ(fallback_calls.load(), 0);              // io thread never blocked on dashd
+    { std::lock_guard<std::mutex> l(jm); ASSERT_EQ(jobs.size(), 1u); }
+
+    // (1b) Single-flight: another request while a refresh is in flight schedules
+    //      no additional job.
+    (void)ws->get_current_work_template();
+    { std::lock_guard<std::mutex> l(jm); EXPECT_EQ(jobs.size(), 1u); }
+
+    // (2) Run the background job on a DIFFERENT thread (the rpc_pool stand-in).
+    //     The blocking fallback runs THERE; the cache is populated.
+    std::function<void()> job0;
+    { std::lock_guard<std::mutex> l(jm); job0 = jobs[0]; jobs.clear(); }
+    std::thread(job0).join();
+    EXPECT_EQ(fallback_calls.load(), 1);
+    EXPECT_FALSE(fallback_on_caller.load());          // re-source ran OFF the caller thread
+
+    // (3) Now cached + fresh: served immediately, no new fallback call, no job.
+    auto t1 = ws->get_current_work_template();
+    EXPECT_FALSE(t1.empty());
+    EXPECT_EQ(t1.value("previousblockhash", ""), std::string(kPrevHashHex));
+    EXPECT_EQ(fallback_calls.load(), 1);
+    { std::lock_guard<std::mutex> l(jm); EXPECT_TRUE(jobs.empty()); }
+
+    // (4) A generation bump (a minted best-share) breaks freshness, but the io
+    //     thread STILL does not block: it serves the cached template and
+    //     schedules a single background refresh.
+    ws->bump_work_generation();
+    auto t2 = ws->get_current_work_template();
+    EXPECT_FALSE(t2.empty());                          // served cached template -- no stall
+    EXPECT_EQ(fallback_calls.load(), 1);               // fallback NOT called on the io thread
+    { std::lock_guard<std::mutex> l(jm); ASSERT_EQ(jobs.size(), 1u); }
+
+    // Draining the scheduled refresh runs the fallback off-thread again.
+    std::function<void()> job1;
+    { std::lock_guard<std::mutex> l(jm); job1 = jobs[0]; jobs.clear(); }
+    std::thread(job1).join();
+    EXPECT_EQ(fallback_calls.load(), 2);
+}
+
+// ── dashd ZMQ `hashblock` INSTANT tip-notify (hardening on the #770 poll) ────
+//
+// dashd publishes a `hashblock` ZMQ message the instant it connects a new
+// block, so a SUB subscriber closes the lost-block window from <=3 s (poll) to
+// ~0 s. On a hashblock frame the subscriber fires the SAME refresh trio the
+// poll fires (invalidate_template_cache + bump_work_generation + notify_all),
+// and BOTH paths share ONE last-seen-tip dedup so a double-fire on the same
+// block coalesces to a single refresh. These KATs pin that contract without a
+// live daemon or libzmq: the pure frame-decode + dedup + the work-source trio.
+
+// dashd publishes the hashblock frame ALREADY in RPC/display byte order
+// (CZMQPublishHashBlockNotifier::NotifyBlock reverses the internal little-endian
+// array before sending; Bitcoin Core doc/zmq.md: "reversed byte order, the same
+// format as the RPC interface"). So the decoder hex-encodes the frame DIRECTLY
+// — NO further reversal — which is exactly what makes a ZMQ notify and a poll
+// tick on the SAME block produce the SAME getbestblockhash string and thus dedup
+// against each other. (A second reversal here would break cross-path dedup and
+// double-fire the refresh trio every block.)
+TEST(DashZmqHashblock, FrameDecodeMatchesGetbestblockhashByteOrder)
+{
+    // 32-byte frame 0x00,0x01,...,0x1f -> hex encodes DIRECTLY, no reversal.
+    unsigned char frame[32];
+    for (unsigned i = 0; i < 32; ++i) frame[i] = static_cast<unsigned char>(i);
+    const std::string hex = dash::coin::zmq_hashblock_frame_to_hex(frame, 32);
+    // Straight order: first byte (0x00) first ... last byte (0x1f) last — the
+    // string getbestblockhash would return for this block hash.
+    EXPECT_EQ(hex,
+              "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    // Cross-path contract: the frame decodes to the SAME string a poll would
+    // report (both are already display order), so the shared dedup coalesces.
+    const std::string poll_would_report =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    EXPECT_EQ(hex, poll_would_report);
+    // Malformed length -> empty (never a bogus tip that would false-fire).
+    EXPECT_TRUE(dash::coin::zmq_hashblock_frame_to_hex(frame, 31).empty());
+    EXPECT_TRUE(dash::coin::zmq_hashblock_frame_to_hex(nullptr, 32).empty());
+}
+
+// Core KAT: a ZMQ hashblock message drives the refresh+notify trio exactly
+// once, a double-fire (ZMQ then poll, or poll then ZMQ, on the SAME tip) is
+// deduped to a no-op, and a subsequent DIFFERENT tip fires again — proving the
+// poll path still works (no regression) and coexists with the ZMQ path via the
+// shared dedup. Fallback arm only (unpopulated coin-state -> dashd fallback).
+TEST(DashZmqHashblock, InstantNotifyFiresTrioOnceAndDedupesDoubleFire)
+{
+    Fixture fx(true);
+    ASSERT_FALSE(fx.coin_state.populated());
+    auto ws = fx.make();
+
+    // Mirror main_dash's shared refresh: ONE dedup consulted by both paths, and
+    // the trio (invalidate + bump + [notify counter]) fired only on a NEW tip.
+    dash::coin::TipHashDedup dedup;
+    int notify_count = 0;
+    auto fire_refresh = [&](const std::string& tip) {
+        if (!dedup.is_new_tip(tip)) return;     // coalesce poll+ZMQ double-fire
+        ws->invalidate_template_cache("kat: tip-notify best-block changed");
+        ws->bump_work_generation();
+        ++notify_count;                          // stands in for notify_all()
+    };
+
+    // Startup baseline: the poll seeds the dedup with the tip we are already
+    // mining WITHOUT notifying (matches main_dash's tip_dedup->set_last()).
+    const std::string tip_old(64, 'a');
+    dedup.set_last(tip_old);
+    const uint64_t gen_before = ws->get_work_generation();
+    auto tmpl_before = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_before.empty());
+    EXPECT_EQ(tmpl_before.value("previousblockhash", ""), std::string(kPrevHashHex));
+
+    // (1) A new block arrives on dashd: the fallback now sources the new-tip
+    //     template, and a ZMQ hashblock frame decodes to the new tip hash.
+    fx.fallback_work = rotated_work();
+    unsigned char frame[32];
+    for (unsigned i = 0; i < 32; ++i) frame[i] = static_cast<unsigned char>(0xB0 + (i & 0x0f));
+    const std::string tip_new = dash::coin::zmq_hashblock_frame_to_hex(frame, 32);
+    ASSERT_FALSE(tip_new.empty());
+    ASSERT_NE(tip_new, tip_old);
+
+    // ZMQ fires first (instant).
+    fire_refresh(tip_new);
+    EXPECT_EQ(notify_count, 1);                       // trio fired exactly once
+    EXPECT_GT(ws->get_work_generation(), gen_before); // clean_jobs/notify signal
+    auto tmpl_after = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_after.empty());
+    EXPECT_EQ(tmpl_after.value("previousblockhash", ""),
+              std::string(kRotatedPrevHashHex));       // no stale-tip mining
+    EXPECT_EQ(tmpl_after.value("height", 0u), 424243u);
+
+    // (2) The 3 s poll wakes ~instant later and observes the SAME new tip:
+    //     shared dedup -> no-op (harmless double-fire coalesced).
+    const uint64_t gen_after_zmq = ws->get_work_generation();
+    fire_refresh(tip_new);
+    EXPECT_EQ(notify_count, 1);                        // still ONE — deduped
+    EXPECT_EQ(ws->get_work_generation(), gen_after_zmq);
+
+    // (3) A THIRD, different tip (e.g. ZMQ absent and the poll alone catches the
+    //     next block) fires again -> the poll path works, coexisting with ZMQ.
+    const std::string tip_third(64, 'c');
+    fire_refresh(tip_third);
+    EXPECT_EQ(notify_count, 2);
+    EXPECT_GT(ws->get_work_generation(), gen_after_zmq);
+}
+
+// Fix 3 pin (work-source side of the zero-hash pre-auth job_0 defect): a
+// template with a zeroed prev is NOT mineable work — honest set-gap, never a
+// zero-prev job.
+TEST(DashStratumWorkSource, ZeroPrevhashTemplateIsAnHonestSetGap)
+{
+    Fixture fx(true);
+    fx.fallback_work.m_previous_block = uint256::ZERO;   // bits stay non-zero
+    auto ws = fx.make();
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             fixture_miner_script(), {});
+    EXPECT_TRUE(cbr.coinb1.empty());
+    EXPECT_FALSE(cbr.snapshot.has_header);
+}
+
+// ── Fix 4: the submit-time payee guard (pure-function KATs) ─────────────────
+
+std::vector<unsigned char> fixture_coinbase_bytes()
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000001",
+                                             fixture_miner_script(), {});
+    return reassemble(cbr.coinb1, "00000001", "00000002", cbr.coinb2);
+}
+
+TEST(DashSubmitPayeeGuard, OkWhenAllMandatedPaymentsPresent)
+{
+    const auto cb = fixture_coinbase_bytes();
+    const auto r = dash::stratum::check_submit_payee(
+        cb, kPrevHashHex, rich_work(), dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::Ok);
+}
+
+TEST(DashSubmitPayeeGuard, PayeeMissingWhenPayeeScriptRotatedAtSameHeight)
+{
+    // Same prev (same height context) but the current template now mandates a
+    // ROTATED masternode payee SCRIPT the frozen coinbase does not pay at all:
+    // the genuine bad-cb-payee class (wrong PAYEE, not a mere amount drift).
+    // The guard must forbid the submit.
+    const auto cb = fixture_coinbase_bytes();
+    dash::coin::DashWorkData current = rotated_work();
+    current.m_previous_block.SetHex(kPrevHashHex);   // same height, new payee script
+    const auto r = dash::stratum::check_submit_payee(
+        cb, kPrevHashHex, current, dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::PayeeMissing);
+    EXPECT_NE(r.detail.find("bad-cb-payee"), std::string::npos);
+}
+
+TEST(DashSubmitPayeeGuard, OkWhenMandatedAmountDriftsButScriptPresent)
+{
+    // THE reward-critical false-refusal fix. Same prev, same payee SCRIPT, but
+    // the current template's mandated amount differs from the job's frozen one
+    // (fees moved on a template re-pull at the same height). dashd validates
+    // the masternode amount against the block's OWN fees, so this is a valid
+    // winning block — the guard must PASS it (set-membership on scripts, no
+    // amount comparison). This exact drift lost mainnet blocks 2508655/2508696.
+    const auto cb = fixture_coinbase_bytes();
+    dash::coin::DashWorkData current = rich_work();
+    current.m_packed_payments[0].amount += 54321;   // same script, drifted amount
+    const auto r = dash::stratum::check_submit_payee(
+        cb, kPrevHashHex, current, dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::Ok);
+}
+
+TEST(DashSubmitPayeeGuard, HeightRaceWhenPrevDiffersIsSubmittedNotDropped)
+{
+    // REWARD-CRITICAL false-refusal fix. The job's parent is no longer the
+    // chain tip -- but "parent moved" is NOT "unwinnable": a chain-extend
+    // leaves us a valid same-height competitor dashd accepts, a 1-block reorg
+    // leaves us one above the tip so the network reorgs to us, and even a deep
+    // bury is free to submit (dashd stores a dead orphan). Per the guard's own
+    // invariant the block must be SUBMITTED (HeightRace), never dropped --
+    // dashd is the authority at the block's real height. The guard also does
+    // NOT run the payee check here (the current template's payees are for the
+    // WRONG height), so it reports HeightRace regardless of payee shape.
+    const auto cb = fixture_coinbase_bytes();
+    const auto r = dash::stratum::check_submit_payee(
+        cb, kPrevHashHex, rotated_work(), dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::HeightRace);
+    EXPECT_NE(r.detail.find("height race"), std::string::npos);
+}
+
+TEST(DashSubmitPayeeGuard, UnverifiableOnGarbageCoinbaseNeverBlocks)
+{
+    const std::vector<unsigned char> garbage = {0x01, 0x02, 0x03};
+    const auto r = dash::stratum::check_submit_payee(
+        garbage, kPrevHashHex, rich_work(), dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::Unverifiable);
+}
+
+// ── Fix 4 wired into the hot path: mining_submit ────────────────────────────
+
+// A won block whose payee SCRIPT rotated at the SAME height between job issue
+// and submit is locally rejected LOUDLY — the broadcaster must NOT fire (never
+// submit a doomed bad-cb-payee block; a genuinely omitted mandated payee).
+TEST(DashStratumWorkSource, WonBlockWithStalePayeeIsLocallyRejectedNotSubmitted)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    // Between job issue and submit: the payee SCRIPT ROTATES at the same height
+    // (the churn/staleness window). The re-sourced current template now
+    // mandates a payee SCRIPT the frozen job coinbase does not pay at all.
+    rig.fx.fallback_work = rotated_work();
+    rig.fx.fallback_work.m_previous_block.SetHex(kPrevHashHex);  // same prev
+    rig.ws->bump_work_generation();   // submit-side cached_work re-sources
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());          // the miner's work was honest
+    EXPECT_FALSE(rig.fx.submit_called);       // ...but NOTHING was dispatched
+}
+
+// THE reward-critical false-refusal fix, end-to-end on the hot path. A won
+// block whose mandated masternode AMOUNT drifted (fees moved on a same-height
+// template re-pull) but whose payee SCRIPT is unchanged is a VALID winning
+// block — dashd validates the amount against the block's own fees. The guard
+// must PASS it and the broadcaster MUST fire. This drift lost mainnet blocks
+// 2508655/2508696 before the set-membership fix.
+TEST(DashStratumWorkSource, WonBlockWithMandatedAmountDriftStillSubmits)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    // Same prev, same payee SCRIPT, only the mandated amount drifts (fee churn).
+    rig.fx.fallback_work = rich_work();
+    rig.fx.fallback_work.m_packed_payments[0].amount += 98765;
+    rig.ws->bump_work_generation();
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    EXPECT_TRUE(rig.fx.submit_called);        // amount drift is NOT a refusal
+    EXPECT_FALSE(rig.fx.submit_height_race);  // same-height Ok -> relay-first, not a race
+}
+
+// A won block across a MOVED tip is a HEIGHT RACE, not a guaranteed loss: a
+// chain-extend leaves us a valid same-height competitor dashd accepts, a
+// 1-block reorg leaves us one above the tip so the network reorgs to us, and
+// even a deep bury is free to submit (dashd stores a dead orphan). Per the
+// guard's reward invariant the block MUST be submitted (dashd is the authority
+// at its real height) — dropping it would forfeit a winnable reward. The
+// broadcaster MUST fire.
+TEST(DashStratumWorkSource, WonBlockAcrossTipMoveIsSubmittedAsHeightRace)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    rig.fx.fallback_work = rotated_work();    // new prev AND new payee
+    rig.ws->bump_work_generation();
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());          // the miner's work was honest
+    EXPECT_TRUE(rig.fx.submit_called);        // ...and the race block IS dispatched
+    EXPECT_TRUE(rig.fx.submit_height_race);   // ...flagged HeightRace -> RPC-first dispatch
+}
+
+// ── Dashboard stats seam (issue: /local_stats hashrate under-reported) ───────
+//
+// The DASH stratum acceptor is a standalone core::StratumServer bound to a
+// DASHWorkSource; its StratumSessions register/update per-connection hashrate +
+// share/difficulty state into the work source's OWN registry, NOT into the
+// dashboard WebServer's MiningInterface (whose acceptor is disabled). Before the
+// fix, MiningInterface::rest_local_stats read only its own empty registry, so a
+// busy pool reported miner_hash_rates {} / my_hash_rates_in_last_hour.actual 0
+// and a false "No miners connected — pool is idle" warning. main_dash wires
+// set_stratum_workers_fn -> DASHWorkSource::get_stratum_workers to close the
+// gap. This KAT pins that end-to-end: N workers of known hashrate -> summed
+// aggregate, non-empty per-worker maps, no idle warning.
+
+TEST(DashDashboardWiring, LocalStatsSumsStratumWorkerHashrate)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+
+    struct W { std::string sid, user, worker; double hr, dead, diff; uint64_t acc; };
+    // 3 X11 rigs across 2 payout addresses; hashrates in the field's TH/s range.
+    const std::vector<W> rigs = {
+        {"sess-1", "Xpayout1", "rig0", 1.20e13, 0.0,    4096.0, 100},
+        {"sess-2", "Xpayout1", "rig1", 8.00e12, 0.0,    2048.0,  80},
+        {"sess-3", "Xpayout2", "rig0", 2.50e13, 1.0e12, 8192.0, 200},
+    };
+    double expected_total = 0.0, expected_dead = 0.0;
+    for (const auto& r : rigs) {
+        core::stratum::WorkerInfo wi;
+        wi.username    = r.user;
+        wi.worker_name = r.worker;
+        wi.difficulty  = r.diff;
+        ws->register_stratum_worker(r.sid, wi);
+        ws->update_stratum_worker(r.sid, r.hr, r.dead, r.diff, r.acc, 0, 0);
+        expected_total += r.hr;
+        expected_dead  += r.dead;
+    }
+    ASSERT_EQ(ws->get_stratum_workers().size(), rigs.size());
+
+    // Wire the live registry into a DASH dashboard exactly as main_dash.cpp does.
+    core::MiningInterface mi(false, nullptr, c2pool::address::Blockchain::DASH);
+    mi.set_stratum_workers_fn([wsrc = ws.get()]() {
+        return wsrc->get_stratum_workers();
+    });
+
+    auto stats = mi.rest_local_stats();
+
+    // Aggregate hashrate == SUM of connected workers (was 0 before the fix).
+    ASSERT_TRUE(stats.contains("my_hash_rates_in_last_hour"));
+    const auto& hr = stats["my_hash_rates_in_last_hour"];
+    EXPECT_NEAR(hr["actual"].get<double>(),   expected_total,                 1.0);
+    EXPECT_NEAR(hr["nonstale"].get<double>(), expected_total - expected_dead, 1.0);
+    EXPECT_NEAR(hr["rewarded"].get<double>(), expected_total - expected_dead, 1.0);
+
+    // Per-worker maps are non-empty and keyed per "address.worker".
+    ASSERT_TRUE(stats.contains("miner_hash_rates"));
+    EXPECT_EQ(stats["miner_hash_rates"].size(), rigs.size());
+    EXPECT_FALSE(stats["miner_dead_hash_rates"].empty());
+    EXPECT_FALSE(stats["miner_last_difficulties"].empty());
+    EXPECT_NEAR(stats["miner_hash_rates"]["Xpayout1.rig0"].get<double>(), 1.20e13, 1.0);
+
+    // No false "pool is idle" warning while miners ARE connected.
+    ASSERT_TRUE(stats.contains("warnings"));
+    for (const auto& w : stats["warnings"])
+        EXPECT_EQ(w.get<std::string>().find("pool is idle"), std::string::npos);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// C1 mainnet gate (v0.2.4 tag-blocker). The embedded template arm's only prod
+// caller does not pass the E2d SML/QuorumManager seams, so build_embedded_
+// workdata() emits an EMPTY CCbTx extra_payload — a coinbase that is consensus-
+// INVALID (bad-cbtx) on a DIP4-active DASH MAINNET. Until the payload is
+// buildable (post-v0.2.4) the embedded arm MUST be fail-closed off mainnet: a
+// populated NodeCoinState must NOT serve its embedded template on mainnet (it
+// routes to the reward-safe dashd-RPC fallback), while testnet/regtest keep the
+// embedded arm (E5 proving ground). is_testnet_ defaults false, so an
+// unconfigured node is treated as mainnet — fail-closed by default.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+// A populated coin-state whose embedded template is DISTINGUISHABLE from the
+// dashd-fallback fixture (different prev/height), so the served template's
+// prevhash proves which arm ran. Empty MN/mempool is fine: the embedded build
+// still yields a valid, mineable template (non-null prev, non-zero bits).
+const char* const kEmbeddedPrevHashHex =
+    "0000000000000000abcdef0123456789abcdef0123456789abcdef0123456789";
+constexpr uint32_t kEmbeddedPrevHeight = 500000u;   // embedded template -> +1
+// #996 fail-closed guard (node_coin_state.hpp::mn_payee_resolvable_at_tip):
+// the embedded arm now REFUSES to serve when a MN payment is due at the tip
+// but find_expected_payee() is nullopt (empty MN set). These C1-gate fixtures
+// predate that guard and seed only the header tip, so post-#996 the embedded
+// arm is (correctly) refused for want of a MN set -- which would MASK the
+// mainnet/testnet DISCRIMINATOR this suite actually pins. Seed ONE live MN
+// into the payee queue so the embedded arm is genuinely viable and the gate
+// under test is the net discriminator, not the (separately-covered) #996
+// payee guard (see test_dash_cb_payee / test_dash_mn_state).
+void seed_resolvable_mn(dash::coin::NodeCoinState& cs)
+{
+    dash::coin::MNState mn;
+    mn.isValid           = true;              // eligible (nPoSeBanHeight == 0)
+    mn.nRegisteredHeight = 1;                 // a positive payment-queue slot
+    mn.collateralOutpoint.hash.SetHex(std::string(64, '9'));
+    mn.collateralOutpoint.index = 0;
+    mn.scriptPayout.m_data = fixture_miner_script();   // standard P2PKH payout
+    mn.payoutSplitProvenance = dash::coin::MNState::SPLIT_KNOWN;   // fixture: proven zero split (h=2516595 gate)
+    uint256 protx;
+    protx.SetHex(std::string(64, 'a'));
+    cs.mnstates().load({{protx, mn}}, /*as_of_height=*/kEmbeddedPrevHeight);
+}
+
+void seed_populated(dash::coin::NodeCoinState& cs)
+{
+    uint256 emb_prev;
+    emb_prev.SetHex(kEmbeddedPrevHashHex);
+    cs.set_tip(kEmbeddedPrevHeight, emb_prev, /*bits_for_next=*/0x1e0ffff0u,
+               /*mtp_at_tip=*/1'700'000'000u, /*addr_ver=*/76, /*p2sh_ver=*/16,
+               /*curtime=*/kCurtime, /*version=*/static_cast<uint32_t>(kVersion));
+    seed_resolvable_mn(cs);   // #996: make the embedded arm genuinely viable
+}
+}  // namespace
+
+// MAINNET: a populated coin-state must NOT flip to the embedded arm — the served
+// template is the reward-safe dashd fallback (prev/height of rich_work), never
+// the embedded template (which would carry the empty-CCbTx coinbase).
+TEST(DashStratumC1MainnetGate, MainnetPopulatedCoinStateRoutesToDashdFallback)
+{
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    ASSERT_TRUE(cs.populated());
+    ASSERT_TRUE(cs.make_embedded_work_inputs().viable());
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+
+    // is_testnet=false => mainnet => embedded arm GATED off.
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+
+    auto tmpl = ws.get_current_work_template();
+    ASSERT_FALSE(tmpl.empty());
+    // The fallback's tip/height — NOT the embedded prev/height. Embedded was
+    // suppressed on mainnet.
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), std::string(kPrevHashHex));
+    EXPECT_EQ(tmpl.value("height", 0u), 424242u);
+
+    // The fused adapter path is gated too: source is the retained dashd arm.
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_EQ(gw.work.m_height, 424242u);
+}
+
+// TESTNET/REGTEST: the SAME populated coin-state DOES serve its embedded
+// template (E5 lives here) — proving the gate is mainnet-only, not a blanket
+// disable.
+TEST(DashStratumC1MainnetGate, TestnetPopulatedCoinStateServesEmbedded)
+{
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    ASSERT_TRUE(cs.populated());
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+
+    // is_testnet=true => testnet/regtest => embedded arm ENABLED.
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+
+    uint256 emb_prev;
+    emb_prev.SetHex(kEmbeddedPrevHashHex);
+
+    auto tmpl = ws.get_current_work_template();
+    ASSERT_FALSE(tmpl.empty());
+    // The embedded tip/height (prev_height + 1) — the embedded arm ran.
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), emb_prev.GetHex());
+    EXPECT_EQ(tmpl.value("height", 0u), kEmbeddedPrevHeight + 1u);
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::Embedded);
+    EXPECT_EQ(gw.work.m_height, kEmbeddedPrevHeight + 1u);
+}
+
+// RE-SOAK integration: a stale-cached EMBEDDED template (built with an older
+// credit-pool seed) must be dropped and re-sourced at SERVE time — the cache-hit
+// path re-validates the built creditPool against the current seed. Proves the
+// build-vs-serve skew the empirical soak hit is closed on the actual serve path,
+// not just the predicate.
+TEST(DashStratumC1MainnetGate, EmbeddedCacheHitReValidatesCreditPoolAndReSources)
+{
+    dash::coin::NodeCoinState cs;
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+
+    // Full embedded seed: SML + tip + credit-pool, freshness gates armed.
+    dash::coin::vendor::CSimplifiedMNListEntry e1, e2;
+    e1.proRegTxHash.SetHex(std::string(64, '4')); e1.confirmedHash.SetHex(std::string(64, '5')); e1.isValid = true;
+    e2.proRegTxHash.SetHex(std::string(64, '6')); e2.confirmedHash.SetHex(std::string(64, '7')); e2.isValid = true;
+    cs.sml().mnList = {e1, e2};
+    cs.sml().sort();
+    cs.set_have_sml(true);
+    cs.set_sml_current_hash(emb_prev);
+    cs.set_require_sml(true);
+    cs.set_require_fresh_credit_pool(true);
+    seed_resolvable_mn(cs);   // #996: resolvable payee so the embedded arm serves
+
+    const int64_t S1 = 33971546001156LL;
+    const int64_t S2 = 33971612967986LL;   // advanced seed (one reward later)
+    // Seed current AT the tip (height == kEmbeddedPrevHeight) so the height gate
+    // passes; the build-vs-serve skew is driven by the VALUE changing.
+    cs.set_credit_pool(S1, emb_prev, static_cast<int32_t>(kEmbeddedPrevHeight));
+    cs.set_tip(kEmbeddedPrevHeight, emb_prev, 0x1e0ffff0u, 1'700'000'000u,
+               76, 16, kCurtime, static_cast<uint32_t>(kVersion));
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+
+    auto credit_of = [&]() -> int64_t {
+        auto t = ws.peek_template();
+        EXPECT_TRUE(t && !t->m_coinbase_payload.empty());
+        dash::coin::vendor::CCbTx cb;
+        EXPECT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, cb));
+        return cb.creditPoolBalance;
+    };
+
+    // First serve: caches the embedded template built over seed S1.
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    const int64_t cp1 = credit_of();
+
+    // Advance the credit-pool seed VALUE (same height, no work_generation bump):
+    // models the build-vs-serve race where the seed moved after build+cache.
+    cs.set_credit_pool(S2, emb_prev, static_cast<int32_t>(kEmbeddedPrevHeight));
+
+    // Second serve: cache HIT on the same work-generation. The serve-time
+    // re-check must find the cached creditPool stale vs the new seed, drop it,
+    // and re-source a fresh embedded template over S2.
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    const int64_t cp2 = credit_of();
+
+    EXPECT_NE(cp1, cp2)
+        << "stale-cached embedded creditPool must not be served after the seed advanced";
+    EXPECT_EQ(cp2 - cp1, S2 - S1)
+        << "the re-sourced template must reflect the advanced seed exactly";
+}
+
+// GBT-xcheck reward-safety BACKSTOP: when the embedded CbTx's creditPool differs
+// from dashd's GBT for the same height, the arm serves dashd's template — the
+// ultimate net for any seed bug the daemonless self-checks miss.
+TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnCreditPoolMismatch)
+{
+    dash::coin::NodeCoinState cs;
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    dash::coin::vendor::CSimplifiedMNListEntry e1;
+    e1.proRegTxHash.SetHex(std::string(64, '4')); e1.confirmedHash.SetHex(std::string(64, '5')); e1.isValid = true;
+    cs.sml().mnList = {e1}; cs.sml().sort();
+    cs.set_have_sml(true);
+    cs.set_sml_current_hash(emb_prev);
+    cs.set_require_sml(true);
+    cs.set_require_fresh_credit_pool(true);
+    const int64_t seed = 500000000LL;
+    cs.set_credit_pool(seed, emb_prev, static_cast<int32_t>(kEmbeddedPrevHeight));
+    cs.set_tip(kEmbeddedPrevHeight, emb_prev, 0x1e0ffff0u, 1'700'000'000u,
+               76, 16, kCurtime, static_cast<uint32_t>(kVersion));
+
+    // The dashd fallback disagrees on creditPool for the same height (the block
+    // dashd would build carries a DIFFERENT balance) — the backstop must catch it.
+    const int64_t dashd_credit = seed + 424242LL;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits = 0x1e0ffff0u;
+        w.m_version = static_cast<uint32_t>(kVersion);
+        w.m_curtime = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.creditPoolBalance = dashd_credit;
+        w.m_coinbase_payload = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    EXPECT_EQ(served.creditPoolBalance, dashd_credit)
+        << "on a creditPool mismatch the backstop must serve dashd's template";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GBT-xcheck reward-safety BACKSTOP — merkleRootQuorums axis (#127 null arm).
+// UNLIKE the creditPool delta (which by-design special-tx exclusion can EXPLAIN),
+// a divergent merkleRootQuorums is never explained by anything: it is the exact
+// bad-cbtx-quorummerkleroot reject vector. A served embedded template whose
+// merkleRootQuorums disagrees with dashd's GBT for the same height MUST swap to
+// dashd's template with cause=gbt-xcheck-quorumroot-mismatch — a wrong (e.g. an
+// optimistic null) quorum root must NEVER reach a rig. This is the KAT the null
+// arm rides on; neuter the new compare in work_source.cpp and it goes RED.
+namespace {
+std::unique_ptr<dash::coin::NodeCoinState> make_quorumroot_xcheck_cs()
+{
+    auto cs = std::make_unique<dash::coin::NodeCoinState>();
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    dash::coin::vendor::CSimplifiedMNListEntry e1;
+    e1.proRegTxHash.SetHex(std::string(64, '4'));
+    e1.confirmedHash.SetHex(std::string(64, '5'));
+    e1.isValid = true;
+    cs->sml().mnList = {e1};
+    cs->sml().sort();
+    cs->set_have_sml(true);
+    cs->set_sml_current_hash(emb_prev);
+    cs->set_require_sml(true);
+    cs->set_require_fresh_credit_pool(true);
+    const int64_t seed = 500000000LL;
+    cs->set_credit_pool(seed, emb_prev, static_cast<int32_t>(kEmbeddedPrevHeight));
+    cs->set_tip(kEmbeddedPrevHeight, emb_prev, 0x1e0ffff0u, 1'700'000'000u,
+                76, 16, kCurtime, static_cast<uint32_t>(kVersion));
+    return cs;
+}
+bool xcheck_submit(const std::vector<unsigned char>&, uint32_t, bool) { return true; }
+// Serve the EMBEDDED template with the xcheck OFF and read back the CbTx the
+// builder produced — its merkleRootMNList / creditPool become the values dashd
+// must MATCH so the ONLY axis under test is merkleRootQuorums.
+dash::coin::vendor::CCbTx capture_embedded_cbtx(std::vector<unsigned char>* raw_out)
+{
+    auto cs = make_quorumroot_xcheck_cs();
+    auto never = []() -> dash::coin::DashWorkData { return {}; };
+    dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    // xcheck stays OFF (default) -> the embedded selection is served untouched.
+    EXPECT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    EXPECT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx emb;
+    EXPECT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb));
+    if (raw_out) *raw_out = t->m_coinbase_payload;
+    return emb;
+}
+} // namespace
+
+TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnQuorumRootMismatch)
+{
+    const dash::coin::vendor::CCbTx emb = capture_embedded_cbtx(nullptr);
+
+    // dashd fallback: SAME height, SAME creditPool, SAME merkleRootMNList, but a
+    // DIFFERENT merkleRootQuorums -> ONLY the quorum-root axis diverges.
+    uint256 dashd_quorums; dashd_quorums.SetHex(std::string(64, 'a'));
+    ASSERT_NE(emb.merkleRootQuorums, dashd_quorums)
+        << "fixture: dashd quorum root must actually differ from the embedded one";
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb.merkleRootMNList;   // MATCH -> not the mn-list axis
+        cb.merkleRootQuorums  = dashd_quorums;          // DIFFER -> the axis under test
+        cb.creditPoolBalance  = emb.creditPoolBalance;  // MATCH -> not the creditPool axis
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+
+    auto cs = make_quorumroot_xcheck_cs();
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    const auto j = ws.get_current_work_template();
+    ASSERT_FALSE(j.empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    EXPECT_EQ(served.merkleRootQuorums, dashd_quorums)
+        << "on a merkleRootQuorums mismatch the backstop must serve dashd's template";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "dashd-fallback")
+        << "the swap must leave the served arm as the dashd fallback";
+    EXPECT_EQ(st.value("no_work_reason", std::string{}), "gbt-xcheck-quorumroot-mismatch")
+        << "the swap must be recorded with the distinct quorum-root cause";
+}
+
+// Byte-neutral proof: when the embedded merkleRootQuorums (and merkleRootMNList
+// and creditPool) already MATCH dashd's, the unconditional xcheck adds NO swap and
+// the served bytes ARE the embedded template's, unchanged. This is why extending
+// the xcheck changes nothing on today's non-null hotel templates (whose roots
+// match dashd byte-for-byte).
+TEST(DashStratumC1MainnetGate, GbtXcheckQuorumRootMatchServesEmbeddedUnchanged)
+{
+    std::vector<unsigned char> emb_raw;
+    const dash::coin::vendor::CCbTx emb = capture_embedded_cbtx(&emb_raw);
+    ASSERT_FALSE(emb_raw.empty());
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb.merkleRootMNList;   // MATCH
+        cb.merkleRootQuorums  = emb.merkleRootQuorums;  // MATCH
+        cb.creditPoolBalance  = emb.creditPoolBalance;  // MATCH
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+
+    auto cs = make_quorumroot_xcheck_cs();
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    const auto j = ws.get_current_work_template();
+    ASSERT_FALSE(j.empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    EXPECT_EQ(t->m_coinbase_payload, emb_raw)
+        << "roots match -> byte-neutral: the embedded template must be served unchanged";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "EMBEDDED")
+        << "a matching quorum root must leave the embedded arm serving, not swap";
+    EXPECT_NE(st.value("no_work_reason", std::string{}), "gbt-xcheck-quorumroot-mismatch")
+        << "a matching quorum root must NOT record a swap";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GBT-xcheck reward-safety BACKSTOP — NON-COINBASE tx-merkleroot axis (#130,
+// tx-serving analog of #1216). The #1216 branches guard the CbTx (coinbase)
+// roots; this one guards the TRANSACTION-SELECTION axis, which lives entirely in
+// the non-coinbase txid vector m_tx_hashes. Once --embedded-serve-mempool-txs is
+// armed the embedded selector — KNOWN to diverge from dashd's BlockAssembler
+// (ancestor-score key, mapModifiedTx CPFP, within-package emit order) — can pick
+// a different tx SET/ORDER at the same tip, folding to a different block body
+// hashMerkleRoot: the exact bad-txns-merkleroot orphan vector. A served embedded
+// template whose non-coinbase fold disagrees with dashd's GBT for the same
+// height MUST swap to dashd's template with cause=gbt-xcheck-txmerkle-mismatch.
+// Neuter the new compare in work_source.cpp (`if (false && ...)`) and the swap
+// KAT goes RED while the byte-neutral KAT stays GREEN — the load-bearing proof.
+namespace {
+// The mempool spend the embedded arm SELECTS: a positive-fee spend of a mature
+// non-coinbase coin the fixture funds. Deterministic id.
+dash::coin::MutableTransaction txmerkle_mempool_spend(const uint256& funding)
+{
+    dash::coin::MutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout.hash  = funding;
+    tx.vin[0].prevout.index = 0;
+    tx.vout.resize(1);
+    tx.vout[0].value = 90'000;   // 100k funded − 90k = 10k fee (>0 → selected)
+    tx.vout[0].scriptPubKey.m_data = fixture_miner_script();
+    return tx;
+}
+// make_quorumroot_xcheck_cs() + a served mempool tx: with --embedded-serve-
+// mempool-txs ON and a funded UTXO the embedded template comes back with
+// m_mempool_tx_count==1 and m_tx_hashes carrying the spend's txid, so the tx-
+// merkle axis is LIVE (the m_mempool_tx_count>0 gate is satisfied). The caller
+// OWNS `utxo`; it must outlive the returned coin state / any DASHWorkSource
+// built over it.
+std::unique_ptr<dash::coin::NodeCoinState>
+make_txmerkle_xcheck_cs(::core::coin::UTXOViewCache& utxo, const uint256& funding)
+{
+    utxo.add_coin(::core::coin::Outpoint(funding, 0),
+                  ::core::coin::Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    auto cs = make_quorumroot_xcheck_cs();
+    cs->mempool().set_utxo(&utxo);
+    EXPECT_TRUE(cs->mempool().add_tx(txmerkle_mempool_spend(funding)))
+        << "fixture: the mempool spend must price against the funded UTXO";
+    cs->set_serve_mempool_txs(true);
+    return cs;
+}
+}  // namespace
+
+TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnTxMerkleMismatch)
+{
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x51;
+
+    // (0) Capture the EMBEDDED template with the xcheck OFF: its CbTx roots
+    // become the values dashd must MATCH (so ONLY the tx axis is under test),
+    // and its non-empty served tx set proves the fixture actually carries
+    // mempool txs (so the m_mempool_tx_count>0 gate does not make the assertion
+    // below vacuous).
+    dash::coin::vendor::CCbTx emb_cb;
+    std::vector<uint256> emb_txids;
+    uint32_t emb_mempool_n = 0;
+    {
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+        auto never = []() -> dash::coin::DashWorkData { return {}; };
+        dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb_cb));
+        emb_txids     = t->m_tx_hashes;
+        emb_mempool_n = t->m_mempool_tx_count;
+    }
+    ASSERT_GT(emb_mempool_n, 0u)
+        << "fixture broken: the embedded arm served no mempool txs, so the "
+           "m_mempool_tx_count>0 gate would skip the branch and this KAT would "
+           "be vacuous";
+    ASSERT_FALSE(emb_txids.empty());
+    const uint256 emb_txroot = dash::coin::compute_merkle_root(emb_txids);
+
+    // dashd fallback: SAME height, SAME creditPool / merkleRootMNList /
+    // merkleRootQuorums (so the #1216 CbTx branches do NOT fire), but a
+    // DIFFERENT non-coinbase tx set → ONLY the tx-merkle axis diverges.
+    std::vector<uint256> dref_txids(1);
+    dref_txids[0].SetHex(std::string(64, 'e'));
+    const uint256 dref_txroot = dash::coin::compute_merkle_root(dref_txids);
+    ASSERT_NE(emb_txroot, dref_txroot)
+        << "fixture: the dashd tx set must actually fold to a different root";
+
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb_cb.merkleRootMNList;   // MATCH → not the mn axis
+        cb.merkleRootQuorums  = emb_cb.merkleRootQuorums;  // MATCH → not the quorum axis
+        cb.creditPoolBalance  = emb_cb.creditPoolBalance;  // MATCH → not the creditPool axis
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        w.m_tx_hashes         = dref_txids;                // DIFFER → the axis under test
+        w.m_mempool_tx_count  = 1;
+        return w;
+    };
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    // The served body is now dashd's: its non-coinbase set folds to dashd's
+    // root, NOT the embedded one.
+    EXPECT_EQ(dash::coin::compute_merkle_root(t->m_tx_hashes), dref_txroot)
+        << "on a tx-merkleroot mismatch the backstop must serve dashd's body";
+    EXPECT_NE(dash::coin::compute_merkle_root(t->m_tx_hashes), emb_txroot);
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    EXPECT_EQ(served.creditPoolBalance, emb_cb.creditPoolBalance)
+        << "the swap is on the tx axis: the CbTx roots MATCHED, proving the "
+           "#1216 branches did not fire and this is the tx-merkle branch";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "dashd-fallback")
+        << "the swap must leave the served arm as the dashd fallback";
+    EXPECT_EQ(st.value("no_work_reason", std::string{}), "gbt-xcheck-txmerkle-mismatch")
+        << "the swap must be recorded with the distinct tx-merkleroot cause";
+}
+
+// Byte-neutral proof: when the embedded non-coinbase fold already MATCHES dashd's
+// (and the CbTx roots match too) the unconditional xcheck adds NO swap and the
+// served bytes ARE the embedded template's, unchanged — coinbase and body. This
+// is why arming the guard changes nothing on a template whose selection already
+// agrees with dashd.
+TEST(DashStratumC1MainnetGate, GbtXcheckTxMerkleMatchServesEmbeddedUnchanged)
+{
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x51;
+
+    // Capture the embedded template (xcheck OFF): CbTx roots, the served tx set,
+    // and the raw served CbTx bytes.
+    dash::coin::vendor::CCbTx emb_cb;
+    std::vector<uint256> emb_txids;
+    std::vector<unsigned char> emb_raw;
+    {
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+        auto never = []() -> dash::coin::DashWorkData { return {}; };
+        dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb_cb));
+        ASSERT_GT(t->m_mempool_tx_count, 0u)
+            << "fixture broken: no mempool txs served, byte-neutral claim vacuous";
+        emb_txids = t->m_tx_hashes;
+        emb_raw   = t->m_coinbase_payload;
+    }
+    ASSERT_FALSE(emb_raw.empty());
+
+    // dashd fallback: SAME height, SAME CbTx roots, AND the SAME non-coinbase tx
+    // set → every axis matches, so the unconditional xcheck adds no swap.
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb_cb.merkleRootMNList;
+        cb.merkleRootQuorums  = emb_cb.merkleRootQuorums;
+        cb.creditPoolBalance  = emb_cb.creditPoolBalance;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        w.m_tx_hashes         = emb_txids;                              // MATCH → byte-neutral
+        w.m_mempool_tx_count  = static_cast<uint32_t>(emb_txids.size());
+        return w;
+    };
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    EXPECT_EQ(t->m_coinbase_payload, emb_raw)
+        << "tx roots match → byte-neutral: the embedded template is served "
+           "unchanged, coinbase and all";
+    EXPECT_EQ(t->m_tx_hashes, emb_txids)
+        << "the served non-coinbase body is the embedded one, untouched";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "EMBEDDED")
+        << "a matching tx-merkleroot must leave the embedded arm serving, not swap";
+    EXPECT_NE(st.value("no_work_reason", std::string{}), "gbt-xcheck-txmerkle-mismatch")
+        << "a matching tx-merkleroot must NOT record a swap";
+}
+
+// =============================================================================
+// --embedded-tx-serve-own-set : SERVE OUR OWN VALID SET on a divergent-from-
+// dashd mempool selection, instead of the dashd-tx-merkle PARITY swap. The two
+// tests below are the load-bearing red->green through the work source:
+//
+//   * with the flag OFF the divergent set SWAPS to dashd (unchanged behaviour,
+//     proven by GbtXcheckServesDashdOnTxMerkleMismatch above);
+//   * with the flag ON and the validity-gate coupling satisfied, the SAME
+//     divergent set is served as EMBEDDED (this file);
+//   * with the flag ON but a validity probe bound and NOT yet open, it fail-
+//     closes to dashd -- the runtime guard against the already-mined / stale-
+//     UTXO-view class the internal-consistency referee cannot catch alone.
+// =============================================================================
+TEST(DashStratumC1MainnetGate, GbtXcheckOwnSetServesEmbeddedOnConsistentTxDivergence)
+{
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x51;
+
+    // (0) Capture the EMBEDDED template (xcheck OFF): CbTx roots for dref to
+    // match, and the served tx set the flag-ON serve must reproduce byte-for-
+    // byte (serving OUR OWN set means the embedded body is untouched).
+    dash::coin::vendor::CCbTx emb_cb;
+    std::vector<uint256> emb_txids;
+    uint32_t emb_mempool_n = 0;
+    {
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+        auto never = []() -> dash::coin::DashWorkData { return {}; };
+        dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb_cb));
+        emb_txids     = t->m_tx_hashes;
+        emb_mempool_n = t->m_mempool_tx_count;
+    }
+    ASSERT_GT(emb_mempool_n, 0u)
+        << "fixture broken: no mempool txs served -> the m_mempool_tx_count>0"
+           " gate would skip the branch and this KAT would be vacuous";
+    const uint256 emb_txroot = dash::coin::compute_merkle_root(emb_txids);
+
+    // dashd fallback: SAME height + SAME CbTx roots (so only the tx axis
+    // diverges), DIFFERENT non-coinbase tx set.
+    std::vector<uint256> dref_txids(1);
+    dref_txids[0].SetHex(std::string(64, 'e'));
+    ASSERT_NE(emb_txroot, dash::coin::compute_merkle_root(dref_txids));
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb_cb.merkleRootMNList;
+        cb.merkleRootQuorums  = emb_cb.merkleRootQuorums;
+        cb.creditPoolBalance  = emb_cb.creditPoolBalance;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        w.m_tx_hashes         = dref_txids;
+        w.m_mempool_tx_count  = 1;
+        return w;
+    };
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+    // NO shadow-compare bound -> the validity-gate coupling is bypassed
+    // (pure-daemonless, operator-armed posture); the referee decides alone.
+    ws.set_tx_serve_own_set(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    // The served body is OUR OWN embedded set, NOT dashd's, despite the tx-
+    // merkle divergence.
+    EXPECT_EQ(t->m_tx_hashes, emb_txids)
+        << "own-set: a divergent-but-consistent embedded template is served"
+           " unchanged, not swapped for dashd's";
+    EXPECT_EQ(dash::coin::compute_merkle_root(t->m_tx_hashes), emb_txroot);
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "EMBEDDED")
+        << "the divergence must leave the embedded arm serving";
+    EXPECT_NE(st.value("no_work_reason", std::string{}), "gbt-xcheck-txmerkle-mismatch")
+        << "own-set must NOT record a parity swap";
+    EXPECT_GE(st.value("tx_serve_own_set_serves", (uint64_t)0), (uint64_t)1)
+        << "the referee must have actively served the divergent set as own";
+}
+
+TEST(DashStratumC1MainnetGate, GbtXcheckOwnSetServesEmbeddedWhenValidityGateDemoted)
+{
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x51;
+
+    // Capture the EMBEDDED template (xcheck OFF): CbTx roots for the dashd
+    // fallback to match on the non-tx axes, and the served tx set (own-set
+    // serving must reproduce it byte-for-byte).
+    dash::coin::vendor::CCbTx emb_cb;
+    std::vector<uint256> emb_txids;
+    {
+        ::core::coin::UTXOViewCache utxo(nullptr);
+        auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+        auto never = []() -> dash::coin::DashWorkData { return {}; };
+        dash::stratum::DASHWorkSource ws(*cs, never, xcheck_submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, emb_cb));
+        ASSERT_GT(t->m_mempool_tx_count, 0u);
+        emb_txids = t->m_tx_hashes;
+    }
+    const uint256 emb_txroot = dash::coin::compute_merkle_root(emb_txids);
+
+    std::vector<uint256> dref_txids(1);
+    dref_txids[0].SetHex(std::string(64, 'e'));
+    const uint256 dref_txroot = dash::coin::compute_merkle_root(dref_txids);
+    ASSERT_NE(emb_txroot, dref_txroot)
+        << "fixture broken: embedded and dashd tx sets must diverge for this"
+           " test to discriminate own-set serving from a dashd swap";
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.merkleRootMNList   = emb_cb.merkleRootMNList;
+        cb.merkleRootQuorums  = emb_cb.merkleRootQuorums;
+        cb.creditPoolBalance  = emb_cb.creditPoolBalance;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        w.m_tx_hashes         = dref_txids;
+        w.m_mempool_tx_count  = 1;
+        return w;
+    };
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    auto cs = make_txmerkle_xcheck_cs(utxo, funding);
+    dash::stratum::DASHWorkSource ws(*cs, fallback, xcheck_submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+    ws.set_tx_serve_own_set(true);
+
+    // PR #1325 DEMOTED the dashd testmempoolaccept validity gate OUT of the
+    // own-set serve decision: it is now a pre-cut CONFIDENCE measurement
+    // (logged, never gated), and the fail-close cause
+    // "tx-serve-validity-gate-not-open" was DELETED. Own-set serving is decided
+    // SOLELY by the internal-consistency referee over OUR OWN state (every
+    // served tx fee_fold_proven vs our spent-aware UTXO view, coinbase ==
+    // subsidy + sum(fee) + superblock, no intra-set double-spend) -- the
+    // predicate that survives the --coin-rpc cut, making ZERO dashd calls.
+    //
+    // We bind a shadow-compare whose validity gate is ARMED but has accrued
+    // ZERO clean heights (open()==false) -- the exact scenario that USED to
+    // fail-close to dashd. Under #1325 the internally-consistent embedded
+    // template is SERVED as EMBEDDED regardless: the un-open (demoted) gate can
+    // no longer force a dashd swap. This is the dashd-free serve intent -- the
+    // referee alone decides, and it passes here.
+    auto oracle = []() -> std::optional<dash::coin::DashWorkData> { return std::nullopt; };
+    auto accept = [](const std::string&) -> nlohmann::json { return nlohmann::json(); };
+    auto sc = std::make_shared<dash::coin::EmbeddedShadowCompare>(oracle, accept);
+    ws.set_shadow_compare(sc);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    // The served body is OUR OWN embedded set, NOT dashd's, despite the un-open
+    // (demoted) validity gate.
+    EXPECT_EQ(dash::coin::compute_merkle_root(t->m_tx_hashes), emb_txroot)
+        << "demoted validity gate must NOT force a dashd swap: serve own set";
+    EXPECT_NE(dash::coin::compute_merkle_root(t->m_tx_hashes), dref_txroot)
+        << "the served set must be embedded, not dashd's fallback body";
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", std::string{}), "EMBEDDED")
+        << "referee-pass with a demoted gate leaves the embedded arm serving";
+    EXPECT_EQ(st.value("no_work_reason", std::string{}), "")
+        << "no fail-close: the demoted validity gate records no cause";
+    EXPECT_GE(st.value("tx_serve_own_set_serves", (uint64_t)0), (uint64_t)1)
+        << "the referee must have actively served the divergent set as own";
+    ws.set_shadow_compare(nullptr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tip-transition fallback leak: on every new block the serve path re-sources
+// during the body-pending window and (correctly) gets the dashd fallback; the
+// serve-tip promotion then lands ~0.1-0.4 s later — routinely WHILE that
+// blocking fallback GBT source is still in flight. The promotion fires the
+// state-dirty sink (bump_work_generation + notify_all), but master stamped the
+// stored snapshot with a work_generation_.load() taken AT STORE TIME, which
+// swallows the racing bump: the fallback template reads as current for the
+// full kStaleAfter (30 s) window and several fallback serves leak per block
+// after the embedded arm is already viable.
+//
+// THE MEASUREMENT (fails on master): after the promotion's bump, the very
+// next template request must re-evaluate the arm gates and serve EMBEDDED —
+// not the stale cached fallback decision. Gate semantics are untouched; only
+// the re-evaluation latency is.
+TEST(DashStratumC1MainnetGate, PromotionBumpDuringInFlightSourceMakesNextTemplateEmbedded)
+{
+    dash::coin::NodeCoinState cs;   // NOT populated yet: the pending window
+    dash::stratum::DASHWorkSource* wsp = nullptr;
+    int fallback_calls = 0;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        if (++fallback_calls == 1) {
+            // The serve-tip promotion lands while this (in prod: blocking
+            // dashd GBT RPC) source is in flight: the maintainer publishes
+            // the now-viable embedded bundle and fires the state-dirty sink.
+            seed_populated(cs);
+            if (wsp) wsp->bump_work_generation();
+        }
+        return rich_work();
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    wsp = &ws;
+
+    // Serve 1: sourced during the pending window -> dashd fallback (the
+    // normal propagation-window serve; the promotion lands mid-flight).
+    auto t1 = ws.get_current_work_template();
+    ASSERT_FALSE(t1.empty());
+    EXPECT_EQ(t1.value("previousblockhash", ""), std::string(kPrevHashHex))
+        << "the in-flight serve itself is the fallback — that part is normal";
+
+    // Serve 2 — the very next template request after the promotion: must be
+    // EMBEDDED. On master the fallback snapshot was stamped with the
+    // post-bump generation, so it reads as fresh and this serves fallback.
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    auto t2 = ws.get_current_work_template();
+    ASSERT_FALSE(t2.empty());
+    EXPECT_EQ(t2.value("previousblockhash", ""), emb_prev.GetHex())
+        << "stale cached arm decision leaked a dashd-fallback serve after "
+           "the serve-tip promotion";
+    EXPECT_EQ(t2.value("height", 0u), kEmbeddedPrevHeight + 1u);
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::Embedded);
+}
+
+// Negative twin: an ORDINARY re-source with no racing event must keep today's
+// exact caching behaviour — stored fresh, served from cache, ONE sourcing —
+// so the promotion fix cannot regress into a re-source storm.
+TEST(DashStratumC1MainnetGate, UnracedSourceStaysCachedWithoutReSourceStorm)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated: fallback arm throughout
+    int fallback_calls = 0;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        ++fallback_calls;
+        return rich_work();
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    const int calls_after_first = fallback_calls;
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, calls_after_first)
+        << "no event fired between serves: the second must be a cache hit";
+}
+
+TEST(DashDashboardWiring, LocalStatsIdleWarningWhenNoWorkers)
+{
+    // No provider wired and an empty local registry -> the honest idle warning
+    // fires and the per-worker map stays empty (the pre-fix state was correct
+    // ONLY when the pool truly had no miners).
+    core::MiningInterface mi(false, nullptr, c2pool::address::Blockchain::DASH);
+    auto stats = mi.rest_local_stats();
+
+    EXPECT_TRUE(stats["miner_hash_rates"].empty());
+    EXPECT_DOUBLE_EQ(stats["my_hash_rates_in_last_hour"]["actual"].get<double>(), 0.0);
+    bool idle = false;
+    for (const auto& w : stats["warnings"])
+        if (w.get<std::string>().find("pool is idle") != std::string::npos) idle = true;
+    EXPECT_TRUE(idle);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// coin-P2P tip event closes the stale-payee window EXPLICITLY (robust under a
+// future io-decouple-extended config where refresh_executor_ is SET).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+// A DEFERRED refresh executor (models the rpc_pool background thread): jobs are
+// queued, not run inline, so cached_work() takes the serve-stale-while-refreshing
+// path — exactly the config where a bump-only tip event would REOPEN the window.
+struct DeferredExecutor {
+    std::vector<std::function<void()>> jobs;
+    void operator()(std::function<void()> j) { jobs.push_back(std::move(j)); }
+    void run() { auto q = std::move(jobs); jobs.clear(); for (auto& j : q) j(); }
+};
+}  // namespace
+
+// THE FIX: invalidate_template_cache() on the coin-P2P tip event guarantees the
+// next served job is re-sourced (fresh payee), never the stale cached one — even
+// with a background refresh_executor_ set.
+TEST(DashStratumCoinP2pTipInvalidate, InvalidateClosesStalePayeeWindowUnderRefreshExecutor)
+{
+    auto current  = std::make_shared<dash::coin::DashWorkData>(rich_work());   // tip A
+    auto fallback = [current]() -> dash::coin::DashWorkData { return *current; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::coin::NodeCoinState cs;   // unpopulated -> fallback arm
+
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{}, /*is_testnet=*/false);
+    auto exec = std::make_shared<DeferredExecutor>();
+    ws.set_refresh_executor([exec](std::function<void()> j) { (*exec)(std::move(j)); });
+
+    // Prime the cache with tip A (dispatch the bg refresh, then run it).
+    ws.get_current_work_template();   // dispatches; returns set-gap
+    exec->run();                      // bg refresh sources tip A -> cache = A
+    ASSERT_EQ(ws.get_current_work_template().value("previousblockhash", ""),
+              std::string(kPrevHashHex));
+
+    // The coin-P2P feed advances to tip B (a DIFFERENT masternode payee).
+    *current = rotated_work();
+
+    // The coin-P2P on_tip_changed handler fires: invalidate + bump (+ notify).
+    ws.invalidate_template_cache("coin-P2P tip changed: fresh-payee re-source");
+    ws.bump_work_generation();
+
+    // Under refresh_executor_ the served job must NEVER be the stale tip-A
+    // template: the invalidate dropped the cache -> honest set-gap until the bg
+    // refresh lands tip B.
+    auto served = ws.get_current_work_template();
+    if (!served.empty())
+        EXPECT_NE(served.value("previousblockhash", ""), std::string(kPrevHashHex))
+            << "stale tip-A template must not be served after a coin-P2P tip event";
+    exec->run();   // the deferred bg refresh completes
+    auto fresh = ws.get_current_work_template();
+    ASSERT_FALSE(fresh.empty());
+    EXPECT_EQ(fresh.value("previousblockhash", ""), std::string(kRotatedPrevHashHex))
+        << "the served job must carry the FRESH-tip (B) template/payee";
+}
+
+// CONTRAST (the window this fix closes): bump_work_generation() ALONE, under a
+// refresh_executor_, serves the STALE cached tip-A template while refreshing
+// async — the implicit-only path that reopens the stale-payee window.
+TEST(DashStratumCoinP2pTipInvalidate, BumpAloneServesStaleUnderRefreshExecutor)
+{
+    auto current  = std::make_shared<dash::coin::DashWorkData>(rich_work());
+    auto fallback = [current]() -> dash::coin::DashWorkData { return *current; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::coin::NodeCoinState cs;
+
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{}, /*is_testnet=*/false);
+    auto exec = std::make_shared<DeferredExecutor>();
+    ws.set_refresh_executor([exec](std::function<void()> j) { (*exec)(std::move(j)); });
+
+    ws.get_current_work_template();
+    exec->run();
+    ASSERT_EQ(ws.get_current_work_template().value("previousblockhash", ""),
+              std::string(kPrevHashHex));
+
+    *current = rotated_work();
+    ws.bump_work_generation();   // NO invalidate — the pre-fix implicit path
+
+    // Serves the STALE tip-A template (cache still held; async refresh not landed).
+    auto served = ws.get_current_work_template();
+    ASSERT_FALSE(served.empty());
+    EXPECT_EQ(served.value("previousblockhash", ""), std::string(kPrevHashHex))
+        << "bump-only under refresh_executor_ serves the STALE tip-A payee — the "
+           "window invalidate_template_cache() closes";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #738 — RUN-PATH ARM RESOLUTION.
+//
+// Taking the embedded arm needs TWO independent conditions and, before #738, no
+// single flag satisfied both:
+//   (1) the work-source gate  — is_testnet_ || embedded_mainnet_ (pinned by the
+//       DashStratumC1MainnetGate suite above);
+//   (2) a live coin-state FEED — the CoinStateMaintainer that flips
+//       NodeCoinState::populated() is constructed ONLY inside main_dash's
+//       `if (coin_p2p)` block.
+// `--embedded-mainnet` armed (1) only, so the bundle was never fed and the arm
+// was unreachable from any documented invocation. resolve_embedded_arm() makes
+// the embedded opt-in imply its own feed.
+//
+// ★ The converse must NEVER hold. A transport flag moving the arm is the exact
+// shape of the live-hotel incident (--coin-p2p-connect activating an unguarded
+// embedded arm on a production node, real money). The two REWARD-SAFETY pins
+// below are load-bearing: a default `--run` and `--coin-p2p-connect` alone must
+// BOTH still resolve dashd-fallback.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+using dash::coin::ArmInputs;
+using dash::coin::ArmReason;
+using dash::coin::WorkArm;
+using dash::coin::resolve_embedded_arm;
+
+// argv shorthand: {testnet, embedded_mainnet, coin_p2p_connect, coin_p2p_discover}
+ArmInputs argv_bare()             { return ArmInputs{false, false, false, false}; }
+ArmInputs argv_p2p_connect()      { return ArmInputs{false, false, true,  false}; }
+ArmInputs argv_p2p_discover()     { return ArmInputs{false, false, false, true }; }
+ArmInputs argv_embedded()         { return ArmInputs{false, true,  false, false}; }
+ArmInputs argv_embedded_pinned()  { return ArmInputs{false, true,  true,  false}; }
+ArmInputs argv_testnet()          { return ArmInputs{true,  false, false, false}; }
+ArmInputs argv_testnet_connect()  { return ArmInputs{true,  false, true,  false}; }
+
+// End-to-end composition mirror: reproduce EXACTLY what run_node does with the
+// resolution — construct the coin-state feed iff coin_feed_armed (a fed
+// maintainer is what publishes a tip, i.e. flips populated()), build the work
+// source on the resolved network flag, apply the embedded opt-in — then ask the
+// real DASHWorkSource which arm it serves. This is the reachability proof: it
+// exercises the SAME predicate the production get_work() applies, not a
+// restatement of the resolver.
+dash::coin::WorkSource served_arm_for(const ArmInputs& in)
+{
+    const auto r = resolve_embedded_arm(in);
+
+    dash::coin::NodeCoinState cs;              // declared first -> destroyed last
+    if (r.coin_feed_armed)
+        seed_populated(cs);                    // the feed's published tip
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/in.testnet);
+    ws.set_embedded_mainnet(in.embedded_mainnet);
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    return ws.get_work(job_in).source;
+}
+}  // namespace
+
+// ── REWARD-SAFETY PIN 1: a default `--run` is untouched ──────────────────────
+TEST(DashRunArmResolution, DefaultRunResolvesDashdFallback)
+{
+    const auto r = resolve_embedded_arm(argv_bare());
+    EXPECT_EQ(r.arm, WorkArm::DashdFallback);
+    EXPECT_EQ(r.reason, ArmReason::NoOptIn);
+    EXPECT_FALSE(r.embedded_arm_enabled);
+    EXPECT_FALSE(r.coin_feed_armed)   << "a bare --run must construct NO coin-P2P client";
+    EXPECT_FALSE(r.discover_implied);
+    EXPECT_EQ(served_arm_for(argv_bare()), dash::coin::WorkSource::DashdFallback);
+}
+
+// ── REWARD-SAFETY PIN 2: the hotel incident. A transport flag alone must NOT
+// flip the arm — on its own it brings up the coin-network connection and
+// NOTHING else. This is the pin that would have caught that incident. ─────────
+TEST(DashRunArmResolution, CoinP2pConnectAloneStillResolvesDashdFallback)
+{
+    const auto r = resolve_embedded_arm(argv_p2p_connect());
+    EXPECT_EQ(r.arm, WorkArm::DashdFallback);
+    EXPECT_EQ(r.reason, ArmReason::MainnetGateOff);
+    EXPECT_FALSE(r.embedded_arm_enabled)
+        << "--coin-p2p-connect must never lift the mainnet embedded gate";
+    EXPECT_TRUE(r.coin_feed_armed)    << "the transport itself still comes up";
+    EXPECT_FALSE(r.discover_implied)  << "a pinned peer must not silently add discovery";
+    EXPECT_EQ(served_arm_for(argv_p2p_connect()), dash::coin::WorkSource::DashdFallback)
+        << "a populated coin-state must STILL serve dashd without --embedded-mainnet";
+}
+
+// Same for the other transport flag.
+TEST(DashRunArmResolution, CoinP2pDiscoverAloneStillResolvesDashdFallback)
+{
+    const auto r = resolve_embedded_arm(argv_p2p_discover());
+    EXPECT_EQ(r.arm, WorkArm::DashdFallback);
+    EXPECT_EQ(r.reason, ArmReason::MainnetGateOff);
+    EXPECT_FALSE(r.embedded_arm_enabled);
+    EXPECT_TRUE(r.coin_feed_armed);
+    EXPECT_EQ(served_arm_for(argv_p2p_discover()), dash::coin::WorkSource::DashdFallback);
+}
+
+// ── THE WIRING: the embedded opt-in now arms BOTH halves ─────────────────────
+TEST(DashRunArmResolution, EmbeddedMainnetOptInArmsBothHalvesEndToEnd)
+{
+    const auto r = resolve_embedded_arm(argv_embedded());
+    EXPECT_EQ(r.arm, WorkArm::EmbeddedEligible);
+    EXPECT_EQ(r.reason, ArmReason::Armed);
+    EXPECT_TRUE(r.embedded_arm_enabled) << "half 1: the work-source gate";
+    EXPECT_TRUE(r.coin_feed_armed)
+        << "half 2 (#738): the opt-in must imply the coin-state feed that "
+           "populates NodeCoinState — without it the arm is unreachable";
+    EXPECT_TRUE(r.discover_implied)
+        << "no pinned peer given: daemonless needs seed-based discovery";
+    EXPECT_EQ(served_arm_for(argv_embedded()), dash::coin::WorkSource::Embedded);
+}
+
+// With peers named, discovery is NOT force-enabled behind the operator's back.
+TEST(DashRunArmResolution, EmbeddedMainnetWithPinnedPeerDoesNotImplyDiscovery)
+{
+    const auto r = resolve_embedded_arm(argv_embedded_pinned());
+    EXPECT_EQ(r.arm, WorkArm::EmbeddedEligible);
+    EXPECT_TRUE(r.coin_feed_armed);
+    EXPECT_FALSE(r.discover_implied);
+    EXPECT_EQ(served_arm_for(argv_embedded_pinned()), dash::coin::WorkSource::Embedded);
+}
+
+// ── NO REGRESSION on the testnet paths (unchanged by #738) ───────────────────
+TEST(DashRunArmResolution, TestnetWithoutFeedIsUnchangedFallback)
+{
+    const auto r = resolve_embedded_arm(argv_testnet());
+    EXPECT_EQ(r.arm, WorkArm::DashdFallback);
+    EXPECT_EQ(r.reason, ArmReason::NoCoinStateFeed)
+        << "the network lifts the arm gate, but nothing feeds the bundle";
+    EXPECT_TRUE(r.embedded_arm_enabled);
+    EXPECT_FALSE(r.coin_feed_armed);
+    EXPECT_EQ(served_arm_for(argv_testnet()), dash::coin::WorkSource::DashdFallback);
+}
+
+TEST(DashRunArmResolution, TestnetWithCoinP2pIsUnchangedEmbedded)
+{
+    const auto r = resolve_embedded_arm(argv_testnet_connect());
+    EXPECT_EQ(r.arm, WorkArm::EmbeddedEligible);
+    EXPECT_TRUE(r.coin_feed_armed);
+    EXPECT_FALSE(r.discover_implied);
+    EXPECT_EQ(served_arm_for(argv_testnet_connect()), dash::coin::WorkSource::Embedded);
+}
+
+// ── The one-way implication, stated as an exhaustive invariant over the whole
+// 16-point argv space: no combination WITHOUT the embedded opt-in may ever
+// enable the arm on mainnet. Any future edit to the resolver that lets a
+// transport flag leak into the arm gate reds here. ───────────────────────────
+TEST(DashRunArmResolution, NoMainnetCombinationWithoutOptInEverEnablesTheArm)
+{
+    int mainnet_cases = 0;
+    for (int bits = 0; bits < 16; ++bits) {
+        ArmInputs in{ (bits & 1) != 0, (bits & 2) != 0,
+                      (bits & 4) != 0, (bits & 8) != 0 };
+        const auto r = resolve_embedded_arm(in);
+        if (in.testnet || in.embedded_mainnet)
+            continue;                       // opt-in / testnet cases covered above
+        ++mainnet_cases;
+        EXPECT_FALSE(r.embedded_arm_enabled) << "bits=" << bits;
+        EXPECT_EQ(r.arm, WorkArm::DashdFallback) << "bits=" << bits;
+        EXPECT_FALSE(r.discover_implied) << "bits=" << bits;
+        EXPECT_EQ(served_arm_for(in), dash::coin::WorkSource::DashdFallback)
+            << "bits=" << bits;
+    }
+    EXPECT_EQ(mainnet_cases, 4) << "the un-opted-in mainnet quadrant must be exercised";
+}
+
+}  // namespace
+
+// ════════════════════════════════════════════════════════════════════════
+// DEFECT-3: the RATE POLICY for the named refusal (ServeGateJournal).
+//
+// The serve gate sits on a per-template path, so the reason cannot simply be
+// logged on every observation. The policy that makes a silent gate impossible
+// without flooding it:
+//
+//   * the EMBEDDED -> fallback TRANSITION always logs, EVEN IF the cause is
+//     unchanged from an earlier decline -- that edge is the event the operator
+//     cares about, and suppressing it is exactly how the 08-03 flip went
+//     unexplained;
+//   * a CHANGE of cause always logs;
+//   * an unchanged cause logs on a slow heartbeat;
+//   * everything else is suppressed and COUNTED.
+//
+// Negative twins throughout: each "must emit" is paired with the neighbouring
+// state that must NOT emit, so a journal that simply logs everything (or
+// nothing) fails.
+// ════════════════════════════════════════════════════════════════════════
+
+#include <impl/dash/coin/serve_gate_journal.hpp>
+
+using dash::coin::ServeGateJournal;
+using Trig = dash::coin::ServeGateJournal::Trigger;
+
+// ── Episode DURATION: the metric that actually ranks the causes ─────────────
+// Measured on the hotel node over 5h33m (2026-08-06): 109 `dmn-stale` episodes
+// vs 3 `qc-plan-underivable`. BY COUNT dmn-stale is 97% of the problem. BY TIME
+// OFF THE EMBEDDED ARM, 104 of those 109 lasted under a second (~54 ms each,
+// 5.6 s in total — the ordinary tip-change -> getmnlistd round trip) while the
+// 3 qc-plan episodes cost 351 s. The two readings rank the work in OPPOSITE
+// orders, and the journal could only ever emit the misleading one.
+TEST(DashServeGateJournal, ResumeReportsHowLongTheArmWasDown) {
+    ServeGateJournal j(300);
+    j.observe(true,  "", 1000);                    // serving
+    j.observe(false, "dmn-stale", 1010);           // episode starts
+    auto d = j.observe(true, "", 1130);            // resumes 120 s later
+    ASSERT_EQ(d.trigger, Trig::Resumed);
+    EXPECT_EQ(d.episode_sec, 120)
+        << "the RESUMED line must carry the cost of the episode in seconds; a "
+           "decline COUNT cannot distinguish a 54 ms tip-change round trip from "
+           "a four-minute outage, and those need opposite responses";
+}
+
+// A cause change mid-episode must NOT restart the clock: the arm never came
+// back, so "how long have we been off?" is answered from the FIRST decline,
+// not from the last relabelling.
+TEST(DashServeGateJournal, CauseChangeDoesNotRestartTheEpisodeClock) {
+    ServeGateJournal j(300);
+    j.observe(true,  "", 1000);
+    j.observe(false, "qc-plan-underivable", 1010); // episode starts here
+    j.observe(false, "dmn-stale", 1100);           // cause changes, still down
+    auto d = j.observe(true, "", 1160);
+    ASSERT_EQ(d.trigger, Trig::Resumed);
+    EXPECT_EQ(d.episode_sec, 150)
+        << "measured from the FIRST decline (1010), not the cause change "
+           "(1100) — otherwise every long episode that changes cause reports "
+           "only its final segment and the true loss is understated";
+}
+
+// The decline lines carry it too, so an episode still in flight is readable
+// without waiting for it to end.
+TEST(DashServeGateJournal, DeclineLinesCarryTheRunningEpisodeAge) {
+    ServeGateJournal j(10);
+    j.observe(true,  "", 1000);
+    auto first = j.observe(false, "dmn-stale", 1005);
+    ASSERT_EQ(first.trigger, Trig::Transition);
+    EXPECT_EQ(first.episode_sec, 0);
+    auto beat = j.observe(false, "dmn-stale", 1065);   // heartbeat
+    ASSERT_EQ(beat.trigger, Trig::Heartbeat);
+    EXPECT_EQ(beat.episode_sec, 60)
+        << "a heartbeat that cannot say how long the arm has already been down "
+           "reads identically at 1 s and at 4 min";
+}
+
+// While the arm is serving there is no episode; the field must stay absent
+// rather than report a stale or zero duration.
+TEST(DashServeGateJournal, ServingArmHasNoEpisodeDuration) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    j.observe(true,  "", 1030);
+    auto d = j.observe(true, "", 1090);   // still serving, nothing emitted
+    EXPECT_FALSE(d.emit());
+    EXPECT_EQ(d.episode_sec, -1);
+}
+
+TEST(DashServeGateJournal, FirstObservationEverIsAlwaysEmitted) {
+    ServeGateJournal j(300);
+    auto d = j.observe(false, "dmn-stale", 1000);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::First)
+        << "a node that has NEVER served must name its reason immediately -- "
+           "otherwise a cold node that never arms is silent forever";
+}
+
+TEST(DashServeGateJournal, EmbeddedToFallbackTransitionAlwaysEmits) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);          // first decline, emitted
+    j.observe(true,  "",          1010);          // arm resumes
+    // SAME cause as before, and well inside the heartbeat window: the ONLY
+    // thing that makes this emit is that the arm just flipped.
+    auto d = j.observe(false, "dmn-stale", 1011);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::Transition)
+        << "the EMBEDDED->fallback edge must log even when the cause is "
+           "identical to a previous decline -- this is the measured 08-03 "
+           "event and the rate limiter must never eat it";
+}
+
+TEST(DashServeGateJournal, RepeatOfSameCauseInsideHeartbeatIsSuppressed) {  // twin
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    auto d = j.observe(false, "dmn-stale", 1001);
+    EXPECT_FALSE(d.emit())
+        << "an unchanged cause on a per-template path must NOT flood";
+    EXPECT_EQ(j.suppressed_since_emit(), 1u);
+}
+
+TEST(DashServeGateJournal, ChangeOfCauseEmitsImmediately) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    auto d = j.observe(false, "creditpool-stale", 1001);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::CauseChange)
+        << "a different first-unmet condition is a different fault";
+    EXPECT_EQ(d.previous_cause, "dmn-stale");
+}
+
+TEST(DashServeGateJournal, HeartbeatEmitsOnlyAfterTheIntervalElapses) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    EXPECT_FALSE(j.observe(false, "dmn-stale", 1299).emit())
+        << "one second short of the interval must stay suppressed";
+    auto d = j.observe(false, "dmn-stale", 1300);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::Heartbeat)
+        << "a stuck arm must still name itself in any 5-minute window";
+}
+
+TEST(DashServeGateJournal, SuppressedCountRidesTheNextEmittedLine) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    for (int i = 1; i <= 7; ++i) j.observe(false, "dmn-stale", 1000 + i);
+    auto d = j.observe(false, "creditpool-stale", 1010);
+    ASSERT_TRUE(d.emit());
+    EXPECT_EQ(d.suppressed, 7u)
+        << "the emitted line must say how many observations it stands for; a "
+           "bare reason hides whether this is a blip or a wedge";
+    EXPECT_EQ(j.suppressed_since_emit(), 0u) << "counter resets on emit";
+}
+
+TEST(DashServeGateJournal, ResumeEmitsAndNamesWhatItReplaced) {
+    ServeGateJournal j(300);
+    j.observe(false, "dmn-stale", 1000);
+    auto d = j.observe(true, "", 1005);
+    EXPECT_TRUE(d.emit());
+    EXPECT_EQ(d.trigger, Trig::Resumed);
+    EXPECT_EQ(d.previous_cause, "dmn-stale");
+    EXPECT_TRUE(j.serving());
+    EXPECT_TRUE(j.last_cause().empty());
+}
+
+TEST(DashServeGateJournal, SteadyServingNeverEmits) {          // negative twin
+    ServeGateJournal j(300);
+    j.observe(true, "", 1000);
+    for (int i = 1; i < 50; ++i)
+        EXPECT_FALSE(j.observe(true, "", 1000 + i * 10).emit())
+            << "a healthy arm must be silent -- the journal is for refusals";
+}
+
+TEST(DashServeGateJournal, TwoTransitionsBothEmitEvenWithOneCause) {
+    // The measured 08-03 shape: serve, serve, decline, (recover), decline.
+    // Every arm flip must be visible.
+    ServeGateJournal j(300);
+    int emitted = 0;
+    const std::pair<bool, int64_t> seq[] = {
+        {true, 1000}, {true, 1005}, {false, 1010}, {false, 1011},
+        {true, 1020}, {false, 1030}, {false, 1031},
+    };
+    for (const auto& [served, t] : seq)
+        if (j.observe(served, served ? "" : "dmn-stale", t).emit()) ++emitted;
+    EXPECT_EQ(emitted, 3)
+        << "expected: first decline (transition), resume, second decline "
+           "(transition) -- three edges, none swallowed by the same-cause rule";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PINNED DONATION TX vs THE SERVED FALLBACK TEMPLATE
+//
+// Measured on the production primary, 2026-08-07 (log c2pool-dash-v024.log.1,
+// window 22:33:35 -> 23:32:45, 197 distinct served dashd-fallback templates):
+//
+//     131  produced by the DECLINED-EMBEDDED branch  -> the splice ran
+//                                                        (28 INCLUDED, 103
+//                                                         EXCLUDED cause=tip-unknown)
+//      66  produced by the GBT-XCHECK SWAP           -> the splice NEVER ran,
+//                                                        and NOTHING was logged
+//
+// The 66 are the defect. The swap replaces the embedded selection -- which
+// already carries the pins -- with a fresh dashd template that no pin splice
+// ever touches, so the donation silently falls off a third of everything we
+// serve. Block h=2518044 was won from one of them:
+//
+//     23:12:31.660-.711  [GBT-EMB] pinned tx INCLUDED x4  h=2518044
+//     23:12:31.768       GBT-xcheck MATCH-MODULO-SPECIAL  h=2518044
+//     23:12:31.768       template sourced: arm=dashd-fallback
+//     23:12:39           won block 2518044                (0 of 4 pins on chain)
+//
+// 57 ms between "the pins are on this template" and serving a different one.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// A pinned tx that the gate ADMITS: one mature non-coinbase input, one output
+// of exactly the input value (fee == 0), well under kMaxPinnedTxBytes.
+dash::coin::MutableTransaction admissible_pin(const uint256& funding)
+{
+    dash::coin::MutableTransaction pin;
+    pin.vin.resize(1);
+    pin.vin[0].prevout.hash  = funding;
+    pin.vin[0].prevout.index = 0;
+    pin.vout.resize(1);
+    pin.vout[0].value  = 50'000;
+    pin.vout[0].scriptPubKey.m_data = fixture_miner_script();
+    return pin;
+}
+
+bool template_carries(const dash::coin::DashWorkData& w, const uint256& txid)
+{
+    return std::find(w.m_tx_hashes.begin(), w.m_tx_hashes.end(), txid)
+        != w.m_tx_hashes.end();
+}
+
+const dash::coin::PinOutcome* find_pin_outcome(const dash::coin::DashWorkData& w,
+                                               const uint256& txid)
+{
+    for (const auto& o : w.m_pin_outcomes)
+        if (o.txid == txid) return &o;
+    return nullptr;
+}
+
+// The xcheck fixture: populated + SML-fresh + credit-pool-fresh coin state whose
+// embedded template is viable, plus a dashd fallback that disagrees on
+// creditPool at the SAME height so the backstop swaps the served arm.
+void seed_xcheck_ready(dash::coin::NodeCoinState& cs, const uint256& emb_prev,
+                       int64_t seed)
+{
+    dash::coin::vendor::CSimplifiedMNListEntry e1;
+    e1.proRegTxHash.SetHex(std::string(64, '4'));
+    e1.confirmedHash.SetHex(std::string(64, '5'));
+    e1.isValid = true;
+    cs.sml().mnList = {e1};
+    cs.sml().sort();
+    cs.set_have_sml(true);
+    cs.set_sml_current_hash(emb_prev);
+    cs.set_require_sml(true);
+    cs.set_require_fresh_credit_pool(true);
+    cs.set_credit_pool(seed, emb_prev, static_cast<int32_t>(kEmbeddedPrevHeight));
+    cs.set_tip(kEmbeddedPrevHeight, emb_prev, 0x1e0ffff0u, 1'700'000'000u,
+               76, 16, kCurtime, static_cast<uint32_t>(kVersion));
+    seed_resolvable_mn(cs);
+}
+
+}  // namespace
+
+// THE DEFECT. An admissible pin rides the EMBEDDED template (proved first, so
+// this test cannot pass vacuously on an inadmissible pin), and then the
+// GBT-xcheck swap serves a dashd template that carries neither the pin nor any
+// record of why it is missing.
+TEST(DashStratumPinSplice, XcheckSwapDropsThePinnedDonationSilently)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x42;
+    const int64_t seed = 500'000'000LL;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+
+    // ── (a) NON-VACUITY: the same pin, the same gate, xcheck OFF -> the served
+    // EMBEDDED template carries it. If this fails the fixture is wrong, not the
+    // code under test.
+    {
+        dash::coin::NodeCoinState cs;
+        seed_xcheck_ready(cs, emb_prev, seed);
+        cs.mempool().set_utxo(&utxo);
+        cs.set_pinned_local_txs({pin});
+
+        auto fallback = []() -> dash::coin::DashWorkData { return dash::coin::DashWorkData{}; };
+        dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                         core::stratum::StratumConfig{},
+                                         /*is_testnet=*/true);
+        ASSERT_FALSE(ws.get_current_work_template().empty());
+        auto t = ws.peek_template();
+        ASSERT_TRUE(t);
+        ASSERT_TRUE(template_carries(*t, txid))
+            << "fixture broken: the pin is not admissible on the embedded arm, "
+               "so the xcheck assertion below would be vacuous";
+    }
+
+    // ── (b) THE DEFECT: same coin state, xcheck ARMED, dashd disagrees on
+    // creditPool at the same height -> the backstop serves dashd's template.
+    dash::coin::NodeCoinState cs;
+    seed_xcheck_ready(cs, emb_prev, seed);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    const int64_t dashd_credit = seed + 424242LL;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion           = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight            = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.creditPoolBalance  = dashd_credit;
+        w.m_coinbase_payload  = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    ASSERT_EQ(served.creditPoolBalance, dashd_credit)
+        << "precondition: the xcheck backstop must have swapped in dashd's template";
+
+    // THE CONTRACT: ride, or say why. Never both absent.
+    const bool rides = template_carries(*t, txid);
+    const auto* outcome = find_pin_outcome(*t, dash::coin::dash_txid(pin));
+    EXPECT_TRUE(rides || (outcome != nullptr && !outcome->cause.empty()))
+        << "h=2518044 shape: the served dashd template dropped the pinned "
+           "donation and recorded no reason at all";
+
+    // With the arm flag at its DEFAULT (off) the served bytes are unchanged --
+    // so the resolution must be the NAMED cause, not an inclusion.
+    EXPECT_FALSE(rides)
+        << "--pin-splice-xcheck-arm defaults OFF: no new bytes may be served";
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_EQ(outcome->cause, "xcheck-swap-pin-gate-off");
+    EXPECT_EQ(outcome->gate_height, kEmbeddedPrevHeight + 1);
+    EXPECT_EQ(outcome->template_height, kEmbeddedPrevHeight + 1);
+}
+
+// FLAG ON: the same swap, the same pin, and now it RIDES -- the served dashd
+// template carries the donation and the outcome says so. This is the arm the
+// operator turns on once the flag-off shape has been read in production.
+TEST(DashStratumPinSplice, XcheckSwapCarriesThePinWhenTheArmIsEnabled)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x44;
+    const int64_t seed = 500'000'000LL;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    dash::coin::NodeCoinState cs;
+    seed_xcheck_ready(cs, emb_prev, seed);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    const int64_t dashd_credit = seed + 424242LL;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::vendor::CCbTx cb;
+        cb.nVersion          = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+        cb.nHeight           = static_cast<int32_t>(kEmbeddedPrevHeight + 1);
+        cb.creditPoolBalance = dashd_credit;
+        w.m_coinbase_payload = dash::coin::encode_cbtx(cb);
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_gbt_xcheck(true);
+    ws.set_pin_splice_xcheck_arm(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t && !t->m_coinbase_payload.empty());
+    dash::coin::vendor::CCbTx served;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(t->m_coinbase_payload, served));
+    ASSERT_EQ(served.creditPoolBalance, dashd_credit)
+        << "precondition: the xcheck backstop must have swapped in dashd's template";
+
+    EXPECT_TRUE(template_carries(*t, txid))
+        << "--pin-splice-xcheck-arm is ON: the pin must ride the swapped template";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_TRUE(outcome->included);
+    EXPECT_TRUE(outcome->cause.empty());
+    // The append must be COMPLETE -- all four parallel vectors, fee recorded as
+    // zero, coinbase claim untouched. A half-spliced tx is an unmineable block.
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_hashes.size());
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_fees.size());
+    ASSERT_EQ(t->m_txs.size(), t->m_tx_data_hex.size());
+    EXPECT_EQ(t->m_tx_fees.back(), 0u);
+    EXPECT_FALSE(t->m_tx_data_hex.back().empty());
+}
+
+// THE BUDGET. The fallback splice caps pins against 400 KB of PINS and nothing
+// else -- never against what the template it is appending to already holds. A
+// dashd template that is already near the 2 MB block limit therefore accepts
+// the pin and produces a block that cannot be mined (bad-blk-length).
+TEST(DashStratumPinSplice, FallbackSpliceRespectsTheBlockSizeBudget)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x43;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    // Mainnet with --embedded-mainnet OFF: the arm declines by the gate, the
+    // tip is still known (so the pin gate judges at a real height), and the
+    // served template is the dashd fallback that the splice runs on today.
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    // A dashd template already holding ~1.95 MB of transaction payload.
+    constexpr size_t kFatBytes = 1'950'000;
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        dash::coin::MutableTransaction fat;   // identity only; the BYTES are the hex
+        fat.vin.resize(1);
+        fat.vin[0].prevout.hash.begin()[0] = 0x77;
+        w.m_txs.emplace_back(fat);
+        w.m_tx_hashes.push_back(dash::coin::dash_txid(fat));
+        w.m_tx_fees.push_back(0);
+        w.m_tx_data_hex.push_back(std::string(kFatBytes * 2, 'a'));
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+    // The budget is FLAG-GATED and OFF by default, because enforcing it removes
+    // a pin from a template this arm is already serving in production -- a
+    // served-bytes change, which may not default on. Arm it here; the companion
+    // test below pins the DEFAULT (off) shape.
+    ws.set_pin_splice_block_budget(true);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t);
+    ASSERT_EQ(t->m_height, kEmbeddedPrevHeight + 1)
+        << "precondition: the dashd fallback template is the one being served";
+
+    EXPECT_FALSE(template_carries(*t, txid))
+        << "the pin was appended to a template already at " << kFatBytes
+        << " bytes -- the only cap that ran was pins-vs-400KB";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr) << "an exclusion without a record is the defect";
+    EXPECT_EQ(outcome->cause, "block-budget");
+}
+
+// THE HOIST MUST NOT REGRESS THE PATH THAT ALREADY WORKED. Same declined-
+// embedded producer as the budget KAT above, but a normal-sized dashd template:
+// the pin still rides, still with fee 0, still recorded as INCLUDED. Moving the
+// splice from inside the fallback branch to the final selection is a pure move
+// only if this stays green.
+TEST(DashStratumPinSplice, DeclinedEmbeddedFallbackStillCarriesThePin)
+{
+    using ::core::coin::UTXOViewCache;
+    using ::core::coin::Outpoint;
+    using ::core::coin::Coin;
+
+    uint256 emb_prev; emb_prev.SetHex(kEmbeddedPrevHashHex);
+    uint256 funding;  funding.begin()[0] = 0x45;
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(funding, 0), Coin(50'000, {}, /*height=*/1, /*cb=*/false));
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    cs.mempool().set_utxo(&utxo);
+    cs.set_pinned_local_txs({pin});
+
+    auto fallback = [&]() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_height         = kEmbeddedPrevHeight + 1;
+        w.m_previous_block = emb_prev;
+        w.m_bits           = 0x1e0ffff0u;
+        w.m_version        = static_cast<uint32_t>(kVersion);
+        w.m_curtime        = kCurtime;
+        return w;
+    };
+    auto submit = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    // mainnet, --embedded-mainnet OFF => the arm declines by the gate and the
+    // dashd fallback is what gets served.
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+
+    ASSERT_FALSE(ws.get_current_work_template().empty());
+    auto t = ws.peek_template();
+    ASSERT_TRUE(t);
+    EXPECT_TRUE(template_carries(*t, txid))
+        << "the declined-embedded fallback has spliced the pin since #1170; "
+           "the hoist must not have taken that away";
+    const auto* outcome = find_pin_outcome(*t, txid);
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_TRUE(outcome->included);
+    ASSERT_FALSE(t->m_tx_fees.empty());
+    EXPECT_EQ(t->m_tx_fees.back(), 0u);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// THE SPLICE GUARDS, DRIVEN DIRECTLY.
+//
+// An adversarial rebuild of this branch replaced two money-path guards with
+// `if (false)`, rebuilt, and every test above still passed. They were
+// unreachable from the pipeline by construction:
+//
+//   * pin-verdict-count-mismatch  -- pins and verdicts both come out of ONE
+//     evaluate_pinned_txs() call, so the pipeline cannot make them disagree;
+//   * xcheck-swap-height-mismatch -- the xcheck backstop only swaps when dashd's
+//     height EQUALS ours, so the pipeline cannot make them disagree either;
+//   * already-in-template / input-spent-by-template -- no fixture hands the
+//     splice a host template that already carries the pin.
+//
+// A guard on the money path that no test can reach is not a guard. The splice
+// is pure (it takes a DashWorkData and mutates only that), so these KATs call
+// dash::stratum::detail::splice_pins_onto_served_fallback directly. Each one is
+// proven red by making exactly the `if (false)` mutation on its own guard.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+constexpr uint32_t kSpliceHeight = 500001;
+
+// An ok verdict at a chosen height -- what the gate hands the splice when the
+// pin is admissible beside the coin state.
+dash::coin::PinVerdict ok_verdict(uint32_t at_height)
+{
+    dash::coin::PinVerdict v;
+    v.ok        = true;
+    v.at_height = at_height;
+    return v;
+}
+
+// A served dashd-fallback template at kSpliceHeight carrying `hosts`, with the
+// four parallel vectors kept in step exactly as pin_append keeps them.
+dash::coin::DashWorkData host_template(
+    const std::vector<dash::coin::MutableTransaction>& hosts = {})
+{
+    dash::coin::DashWorkData w;
+    w.m_height = kSpliceHeight;
+    w.m_previous_block.SetHex(kEmbeddedPrevHashHex);
+    for (const auto& h : hosts) {
+        auto packed = ::pack(h);       // keep the packed buffer alive across the HexStr read below
+        auto sp = packed.get_span();
+        w.m_txs.emplace_back(h);
+        w.m_tx_hashes.push_back(dash::coin::dash_txid(h));
+        w.m_tx_fees.push_back(0);
+        w.m_tx_data_hex.push_back(HexStr(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size())));
+    }
+    return w;
+}
+
+}  // namespace
+
+// GUARD (verdict/pin count). The verdict vector is indexed BY POSITION against
+// the pin vector. A length disagreement means the two crossed the thread
+// boundary out of step, and indexing into a guess on the money path is how a
+// pin gets spliced under someone else's admission decision.
+//
+// RED WITHOUT THE GUARD: with `if (verdicts.size() != pins->size())` replaced by
+// `if (false)`, the extra-verdict case below indexes verdicts[0] -- which is ok
+// -- and the pin RIDES, so the ASSERT_TRUE(w.m_txs.empty()) fails.
+TEST(DashStratumSpliceGuards, VerdictCountMismatchRefusesEveryPinByName)
+{
+    uint256 f1; f1.begin()[0] = 0x61;
+    const auto pin  = admissible_pin(f1);
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+
+    // MORE verdicts than pins. Chosen as the load-bearing case on purpose: with
+    // the guard mutated out every index is still in range, so the mutation's
+    // effect is a DETERMINISTIC inclusion rather than an out-of-range read.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> verdicts{
+            ok_verdict(kSpliceHeight), ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/false,
+            /*xcheck_arm_enabled=*/false, /*block_budget_enabled=*/false);
+
+        ASSERT_TRUE(w.m_txs.empty())
+            << "2 verdicts for 1 pin: the splice indexed into a mismatched "
+               "vector and appended anyway";
+        ASSERT_FALSE(template_carries(w, txid));
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        ASSERT_FALSE(w.m_pin_outcomes[0].included);
+        ASSERT_EQ(w.m_pin_outcomes[0].cause, "pin-verdict-count-mismatch");
+        // The refusal must also reach the operator as a DROP, not just a code.
+        ASSERT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/1"),
+                  std::string::npos);
+        ASSERT_NE(w.m_pin_drop_alarm.find("pin-verdict-count-mismatch"),
+                  std::string::npos);
+    }
+
+    // FEWER verdicts than pins -- the direction that would be an out-of-range
+    // read. Reached only when the case above already held.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> none;
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, none, false, false, false);
+        EXPECT_TRUE(w.m_txs.empty());
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "pin-verdict-count-mismatch");
+    }
+
+    // NON-VACUITY: the same pin, the same height, verdicts in step -> it rides.
+    // Without this the two assertions above would pass on a splice that never
+    // includes anything.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> matched{ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, matched, false, false, false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "fixture broken: this pin never rides, so the refusals above "
+               "prove nothing";
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << "no pin was dropped -- the alarm must stay silent";
+    }
+}
+
+// GUARD (xcheck-swap height). The verdict is judged at OUR tip+1; the swapped
+// template's height is dashd's. Coinbase maturity is a function of height, so a
+// disagreement means the admission decision does not apply to this template.
+//
+// RED WITHOUT THE GUARD: with the `if (from_xcheck_swap && w.m_height != 0 &&
+// v.at_height != w.m_height)` line replaced by `if (false)`, the mismatched pin
+// rides and EXPECT_FALSE(template_carries(...)) fails.
+TEST(DashStratumSpliceGuards, XcheckSwapHeightMismatchExcludesByName)
+{
+    uint256 f1; f1.begin()[0] = 0x62;
+    const auto pin  = admissible_pin(f1);
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+
+    // (a) THE GUARD. Arm flag ON (so gate (b) cannot shadow this), swapped arm,
+    // verdict judged one height BELOW the template.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> verdicts{
+            ok_verdict(kSpliceHeight - 1)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/true,
+            /*xcheck_arm_enabled=*/true, /*block_budget_enabled=*/false);
+
+        EXPECT_FALSE(template_carries(w, txid))
+            << "the verdict was judged at h=" << (kSpliceHeight - 1)
+            << " and the template is at h=" << kSpliceHeight
+            << " -- maturity is a function of height";
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_FALSE(w.m_pin_outcomes[0].included);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "xcheck-swap-height-mismatch");
+        EXPECT_EQ(w.m_pin_outcomes[0].gate_height, kSpliceHeight - 1);
+        EXPECT_EQ(w.m_pin_outcomes[0].template_height, kSpliceHeight);
+        EXPECT_NE(w.m_pin_drop_alarm.find("xcheck-swap-height-mismatch"),
+                  std::string::npos);
+    }
+
+    // (b) NON-VACUITY: heights AGREE on the same armed swap -> it rides.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, true, true, false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "fixture broken: the armed swap never carries this pin, so (a) "
+               "proves nothing";
+    }
+
+    // (c) CONFINEMENT. The rule is deliberately xcheck-swap-only: the
+    // declined-embedded branch has always spliced regardless of the height it
+    // was judged at, and widening it there would change bytes this branch is
+    // required not to touch. Same mismatch, same pin, non-swapped arm -> RIDES.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::PinVerdict> verdicts{
+            ok_verdict(kSpliceHeight - 1)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/false, false, false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "the height rule leaked onto the declined-embedded arm and "
+               "changed what that arm serves";
+    }
+}
+
+// GUARD (duplicate / conflict vs the host template). The splice appended blind.
+// Splicing a txid the served template already carries is bad-txns-duplicate;
+// splicing a tx whose input the template already spends is
+// bad-txns-inputs-missingorspent. Either one costs the WHOLE block, not the
+// donation -- and unlike the size budget these are consensus-exact, so
+// excluding can only ever change a template that could never have been mined.
+//
+// RED WITHOUT THE GUARD: `if (std::find(...) != w.m_tx_hashes.end())` -> `if
+// (false)` makes case (a) append a second copy (m_txs.size() == 2); nulling the
+// conflict scan makes case (b) append the double-spend.
+TEST(DashStratumSpliceGuards, SpliceRefusesDuplicateAndConflictingPins)
+{
+    uint256 funding; funding.begin()[0] = 0x63;
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+
+    // (a) THE TEMPLATE ALREADY CARRIES THIS EXACT TXID.
+    {
+        auto w = host_template({pin});
+        ASSERT_EQ(w.m_txs.size(), 1u);
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, false);
+        EXPECT_EQ(w.m_txs.size(), 1u)
+            << "the same transaction is in the block twice -- bad-txns-duplicate";
+        EXPECT_EQ(w.m_tx_hashes.size(), 1u);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_FALSE(w.m_pin_outcomes[0].included);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "already-in-template");
+    }
+
+    // (b) A DIFFERENT TRANSACTION ALREADY SPENDS THE PIN'S INPUT. Same outpoint,
+    // different txid (different output value), so the txid scan cannot catch it.
+    {
+        auto conflicting = admissible_pin(funding);
+        conflicting.vout[0].value = 49'000;    // -> different txid, same input
+        ASSERT_NE(dash::coin::dash_txid(conflicting), txid);
+        auto w = host_template({conflicting});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, false);
+        EXPECT_EQ(w.m_txs.size(), 1u)
+            << "two transactions in one block spend outpoint " << funding.GetHex()
+            << ":0 -- bad-txns-inputs-missingorspent";
+        EXPECT_FALSE(template_carries(w, txid));
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "input-spent-by-template");
+    }
+
+    // (c) THE SAME PIN CONFIGURED TWICE. The scan reads the containers
+    // pin_append writes, so the second copy is caught inside one call: the
+    // first rides, the second is named.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::MutableTransaction> twice{pin, pin};
+        const std::vector<dash::coin::PinVerdict> two{ok_verdict(kSpliceHeight),
+                                                     ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &twice, two, false, false, false);
+        EXPECT_EQ(w.m_txs.size(), 1u);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 2u);
+        EXPECT_TRUE(w.m_pin_outcomes[0].included);
+        EXPECT_FALSE(w.m_pin_outcomes[1].included);
+        EXPECT_EQ(w.m_pin_outcomes[1].cause, "already-in-template");
+    }
+
+    // (d) NON-VACUITY: a clean host template with an unrelated tx -> it rides.
+    {
+        uint256 other; other.begin()[0] = 0x64;
+        auto w = host_template({admissible_pin(other)});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "fixture broken: this pin never rides a populated template";
+        EXPECT_EQ(w.m_txs.size(), 2u);
+    }
+}
+
+// THE BLOCK-SIZE BUDGET IS FLAG-GATED, AND ITS DEFAULT IS BYTE-FOR-BYTE THE
+// BEHAVIOUR THAT WAS ALREADY LIVE. The declined-embedded arm has been splicing
+// pins onto served templates since #1170; turning an inclusion there into an
+// exclusion changes the served transaction set, which a money-path change may
+// not do by default. So the default still SERVES the over-budget pin and SAYS
+// the budget was blown; only --pin-splice-block-budget acts on it.
+//
+// RED WITHOUT THE GATE: `if (block_budget_enabled)` -> `if (true)` makes the
+// default arm exclude the pin, and EXPECT_TRUE(template_carries(...)) fails.
+TEST(DashStratumSpliceGuards, BlockBudgetIsGatedOffAndTheDefaultStillServes)
+{
+    uint256 funding; funding.begin()[0] = 0x65;
+    const auto pin  = admissible_pin(funding);
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+
+    // A host template already holding ~1.95 MB of transaction payload: over the
+    // 1.9 MB pin budget, still 49915 bytes INSIDE the 2 MB consensus limit.
+    constexpr size_t kFatBytes = 1'950'000;
+    static_assert(kFatBytes > dash::coin::Mempool::kMaxPinnedBlockBytes,
+                  "fixture must exceed the budget");
+    static_assert(kFatBytes + 1000 < dash::coin::Mempool::kMaxBlockBytes,
+                  "and must stay inside the consensus limit -- that gap is "
+                  "exactly why the budget may not default on");
+    auto fat_template = [&]() {
+        auto w = host_template();
+        dash::coin::MutableTransaction fat;   // identity only; the BYTES are the hex
+        fat.vin.resize(1);
+        fat.vin[0].prevout.hash.begin()[0] = 0x77;
+        w.m_txs.emplace_back(fat);
+        w.m_tx_hashes.push_back(dash::coin::dash_txid(fat));
+        w.m_tx_fees.push_back(0);
+        w.m_tx_data_hex.push_back(std::string(kFatBytes * 2, 'a'));
+        return w;
+    };
+
+    // (a) DEFAULT (flag OFF): the pin RIDES -- served bytes unchanged from what
+    // this arm already produces -- and the template SAYS the budget was blown.
+    {
+        auto w = fat_template();
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, /*block_budget_enabled=*/false);
+        EXPECT_TRUE(template_carries(w, txid))
+            << "the budget acted at its default and removed a pin the "
+               "declined-embedded arm is already serving";
+        EXPECT_TRUE(w.m_pin_block_budget_unenforced)
+            << "over budget and silent about it -- the operator cannot see the "
+               "bad-blk-length exposure that cost block 2517855";
+        EXPECT_NE(dash::stratum::detail::served_pins_field(w, &pins)
+                      .find("BLOCK-BUDGET-UNENFORCED"),
+                  std::string::npos);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_TRUE(w.m_pin_outcomes[0].included);
+    }
+
+    // (b) ARMED: the same template, the same pin, now EXCLUDED by name.
+    {
+        auto w = fat_template();
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, /*block_budget_enabled=*/true);
+        EXPECT_FALSE(template_carries(w, txid));
+        EXPECT_FALSE(w.m_pin_block_budget_unenforced)
+            << "the budget was ENFORCED, so nothing rode unenforced";
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        EXPECT_EQ(w.m_pin_outcomes[0].cause, "block-budget");
+    }
+
+    // (c) The gate is about the BUDGET, not about pins in general: an
+    // under-budget pin rides on both settings.
+    {
+        auto w = host_template();
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, false, false, true);
+        EXPECT_TRUE(template_carries(w, txid));
+        EXPECT_FALSE(w.m_pin_block_budget_unenforced);
+    }
+}
+
+// THE DROP ALARM -- what the flag-OFF xcheck-swap arm buys instead of bytes.
+//
+// With --pin-splice-xcheck-arm at its default the h=2518044 loss shape is
+// unchanged in BYTES: the pins are still absent from every swapped template.
+// What changes is that the loss is STATED, per template, with the money counted
+// and the flag that buys it back named. A ratio ("pins=0/4") does not tell an
+// operator that a donation is being given up.
+//
+// RED WITHOUT THE ALARM: `if (dropped == 0) return;` -> `if (true) return;`
+// leaves m_pin_drop_alarm empty and every ASSERT_NE below fails.
+TEST(DashStratumSpliceGuards, DropAlarmNamesTheCountValueAndCause)
+{
+    uint256 f1; f1.begin()[0] = 0x66;
+    uint256 f2; f2.begin()[0] = 0x67;
+    auto p1 = admissible_pin(f1);
+    auto p2 = admissible_pin(f2);
+    p2.vout[0].value = 30'000;
+    const std::vector<dash::coin::MutableTransaction> pins{p1, p2};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight),
+                                                      ok_verdict(kSpliceHeight)};
+
+    // The shipped default on the swapped arm: both pins dropped by policy.
+    auto w = host_template();
+    dash::stratum::detail::splice_pins_onto_served_fallback(
+        w, &pins, verdicts, /*from_xcheck_swap=*/true,
+        /*xcheck_arm_enabled=*/false, false);
+
+    EXPECT_TRUE(w.m_txs.empty());
+    ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+        << "the donation is being dropped from a SERVED template and the "
+           "template does not say so";
+    // COUNT, HEIGHT, MONEY, CAUSE, SITE -- each one load-bearing for the
+    // operator: without the value it is a ratio, without the cause it is a
+    // mystery, without the site it is the wrong arm.
+    EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 2/2"), std::string::npos)
+        << w.m_pin_drop_alarm;
+    EXPECT_NE(w.m_pin_drop_alarm.find("h=" + std::to_string(kSpliceHeight)),
+              std::string::npos) << w.m_pin_drop_alarm;
+    EXPECT_NE(w.m_pin_drop_alarm.find("value=80000sat"), std::string::npos)
+        << "50000 + 30000 -- the whole amount at stake, not a count: "
+        << w.m_pin_drop_alarm;
+    EXPECT_NE(w.m_pin_drop_alarm.find("cause=xcheck-swap-pin-gate-off"),
+              std::string::npos) << w.m_pin_drop_alarm;
+    EXPECT_NE(w.m_pin_drop_alarm.find("site=xcheck-swap"), std::string::npos)
+        << w.m_pin_drop_alarm;
+    // And it must reach the ONE line an operator greps for arm provenance.
+    EXPECT_NE(dash::stratum::detail::served_pins_field(w, &pins)
+                  .find("DONATION-DROPPED 2/2"),
+              std::string::npos);
+
+    // NO FALSE ALARM: the same two pins on the armed swap ride, and the field
+    // stays a clean pins=2/2 with nothing shouted.
+    auto clean = host_template();
+    dash::stratum::detail::splice_pins_onto_served_fallback(
+        clean, &pins, verdicts, true, /*xcheck_arm_enabled=*/true, false);
+    EXPECT_EQ(clean.m_txs.size(), 2u);
+    EXPECT_TRUE(clean.m_pin_drop_alarm.empty());
+    EXPECT_EQ(dash::stratum::detail::served_pins_field(clean, &pins), " pins=2/2");
+}
+
+// THE ALARM MUST BE TRUTHFUL -- `already-in-template` is NOT a dropped donation.
+//
+// The alarm's WARNING asserts "this template IS SERVED to miners without the
+// donation; if it wins, that value does not land". `included` records what THE
+// SPLICE did, not what the SERVED TEMPLATE holds, and exactly one of the seven
+// causes makes those disagree: `already-in-template` refuses BECAUSE
+// w.m_tx_hashes already carries the txid. The money is on the template. It
+// lands. The shipped line contradicted itself inside one string --
+//
+//   pins=1/1 pin_cause=already-in-template DONATION-DROPPED 1/1 pins h=500001 value=50000sat
+//
+// -- pins=1/1 counted by PRESENCE against DONATION-DROPPED 1/1 counted by
+// outcome. An alarm that fires where the money DID land is the alarm the next
+// operator learns to ignore, and then block 2518044 happens again unseen.
+//
+// RED WITHOUT THE FIX: delete the presence test from raise_drop_alarm
+// (work_source.cpp -- the std::find over w.m_tx_hashes) and arms (a), (b) and
+// (c) all fail -- (a) and (b) on a non-empty m_pin_drop_alarm, (c) on the
+// count/value/cause of a real loss being inflated by a pin that is being served.
+//
+// This test originally rode a skip on the cause STRING. It does not any more:
+// the string skip was one refusal shape short (see
+// DropAlarmKeysOnPresenceNotOnTheCauseString below) and is gone, so this test
+// and that one now both hang on the same single statement, which is the point --
+// one mutation must be able to take them both down.
+TEST(DashStratumSpliceGuards, DropAlarmIsSilentWhenTheDuplicatePinIsActuallyServed)
+{
+    uint256 funding; funding.begin()[0] = 0x68;
+    const auto pin  = admissible_pin(funding);          // 50'000 sat
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+    const std::vector<dash::coin::PinVerdict> verdicts{ok_verdict(kSpliceHeight)};
+
+    // (a) THE REPORTED LINE. The served template already carries the pin, so the
+    // splice refuses -- and the donation is ON THE TEMPLATE.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, verdicts, /*from_xcheck_swap=*/false,
+            /*xcheck_arm_enabled=*/false, /*block_budget_enabled=*/false);
+
+        // The refusal itself is unchanged -- this KAT is about the ALARM, not
+        // about relaxing the duplicate guard.
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u);
+        ASSERT_FALSE(w.m_pin_outcomes[0].included);
+        ASSERT_EQ(w.m_pin_outcomes[0].cause, "already-in-template");
+        ASSERT_EQ(w.m_txs.size(), 1u) << "the duplicate guard stopped guarding";
+
+        // THE POINT: the value is in the block that gets served.
+        ASSERT_TRUE(template_carries(w, txid))
+            << "fixture broken: the alarm would be telling the truth";
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << "DONATION-DROPPED on a template that IS carrying the donation: "
+            << w.m_pin_drop_alarm;
+        const auto field = dash::stratum::detail::served_pins_field(w, &pins);
+        EXPECT_EQ(field.find("DONATION-DROPPED"), std::string::npos)
+            << "the arm line claims a loss and a full pin count at once: " << field;
+        EXPECT_NE(field.find("pins=1/1"), std::string::npos) << field;
+    }
+
+    // (b) THE SAME PIN CONFIGURED TWICE. The first copy rides, the second is
+    // refused as already-in-template by the scan reading what pin_append just
+    // wrote. One donation, served once, correctly: nothing was lost.
+    {
+        auto w = host_template();
+        const std::vector<dash::coin::MutableTransaction> twice{pin, pin};
+        const std::vector<dash::coin::PinVerdict> two{ok_verdict(kSpliceHeight),
+                                                      ok_verdict(kSpliceHeight)};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &twice, two, false, false, false);
+        ASSERT_EQ(w.m_pin_outcomes.size(), 2u);
+        ASSERT_TRUE(w.m_pin_outcomes[0].included);
+        ASSERT_EQ(w.m_pin_outcomes[1].cause, "already-in-template");
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << "configuring one donation twice is not losing it: "
+            << w.m_pin_drop_alarm;
+    }
+
+    // (c) MIXED, AND THE REAL LOSS STILL SHOUTS -- with the served duplicate out
+    // of the count, out of the money, and out of the cause list. This arm is
+    // what stops the fix from being "silence the alarm": a genuine drop beside a
+    // served duplicate must still name itself, at 1/2 and 30000sat, not 2/2 and
+    // 80000sat.
+    {
+        uint256 other; other.begin()[0] = 0x69;
+        auto lost_pin = admissible_pin(other);
+        lost_pin.vout[0].value = 30'000;
+        const auto lost_txid = dash::coin::dash_txid(lost_pin);
+
+        auto w = host_template({pin});                  // already carries `pin`
+        const std::vector<dash::coin::MutableTransaction> both{pin, lost_pin};
+        dash::coin::PinVerdict refused;                 // a REAL refusal
+        refused.ok        = false;
+        refused.cause     = "pin-input-unspendable";
+        refused.at_height = kSpliceHeight;
+        const std::vector<dash::coin::PinVerdict> two{ok_verdict(kSpliceHeight),
+                                                      refused};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &both, two, false, false, false);
+
+        ASSERT_FALSE(template_carries(w, lost_txid));
+        ASSERT_TRUE(template_carries(w, txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "a pin that is genuinely absent stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/2"),
+                  std::string::npos)
+            << "the served duplicate was counted as lost: " << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=30000sat"), std::string::npos)
+            << "the served duplicate's 50000 sat was added to the loss: "
+            << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("cause=pin-input-unspendable"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+        EXPECT_EQ(w.m_pin_drop_alarm.find("already-in-template"),
+                  std::string::npos)
+            << "a cause that describes a SERVED pin is in a loss report: "
+            << w.m_pin_drop_alarm;
+    }
+}
+
+// THE ALARM KEYS ON PRESENCE, NOT ON A CAUSE STRING.
+//
+// The first cut of this fix skipped outcomes whose cause == "already-in-template",
+// and that was one refusal shape short of the truth condition. `already-in-template`
+// is only ever REACHED by the duplicate scan (work_source.cpp guard (f)), and FIVE
+// guards run BEFORE it and `continue` with a different cause:
+//
+//   the verdict-count-mismatch early return  (cause=pin-verdict-count-mismatch)
+//   (a) the pin's own verdict !v.ok          (cause=<whatever the gate said>)
+//   (b) xcheck-swap-pin-gate-off
+//   (c) xcheck-swap-height-mismatch
+//   (d)/(e) pin-total-too-large / block-budget
+//
+// A pin that IS on the served template but trips any of those records that
+// cause instead, and the cause-string skip never sees it -- so the alarm still
+// says the donation was lost while the donation is sitting in the block.
+//
+// This is not hypothetical shape-hunting. (a) is the PRODUCTION shape: the
+// embedded UTXO view is built forward from the height we started at, so a coin
+// older than that reads back input-missing-or-spent (mempool.hpp:205, and the
+// SECOND SOURCE comment at :212 exists because the production primary refused a
+// perfectly valid pin exactly this way). The dashd fallback template we splice
+// onto was built from dashd's OWN mempool, which can already carry that same
+// donation. Our gate refuses; dashd already included it; the money lands; the
+// alarm shouts that it did not.
+//
+// The truth condition the WARNING asserts is "the txid is NOT in the served
+// template". So that is what the alarm must test. The cause string is a
+// description of a decision; presence is the fact.
+//
+// RED WITHOUT THE FIX: with the presence test removed from raise_drop_alarm
+// (work_source.cpp) -- or replaced by the old cause-string skip, which is what
+// shipped -- arms (a) through (d) all fail on a non-empty m_pin_drop_alarm, and
+// arm (f) fails on a real loss whose count/value is inflated by a served pin.
+TEST(DashStratumSpliceGuards, DropAlarmKeysOnPresenceNotOnTheCauseString)
+{
+    uint256 funding; funding.begin()[0] = 0x6a;
+    const auto pin  = admissible_pin(funding);          // 50'000 sat
+    const auto txid = dash::coin::dash_txid(pin);
+    const std::vector<dash::coin::MutableTransaction> pins{pin};
+
+    // A refusal from the pin's own gate, at the template's height, with a cause
+    // that is NOT "already-in-template" -- the reviewer's scratch KAT.
+    auto bad_verdict = [](const char* cause) {
+        dash::coin::PinVerdict v;
+        v.ok        = false;
+        v.cause     = cause;
+        v.at_height = kSpliceHeight;
+        return v;
+    };
+
+    // Every arm below serves a template that ALREADY CARRIES the pin. Whatever
+    // the splice decided, the donation is in the block. Nothing may claim a loss.
+    auto expect_no_alarm = [&](const dash::coin::DashWorkData& w,
+                               const char* which, const char* expected_cause) {
+        ASSERT_EQ(w.m_pin_outcomes.size(), 1u) << which;
+        ASSERT_FALSE(w.m_pin_outcomes[0].included) << which;
+        // If this ever reads already-in-template the arm has stopped testing
+        // what it was written to test and the cause-string skip covers it.
+        ASSERT_EQ(w.m_pin_outcomes[0].cause, expected_cause)
+            << which << ": fixture no longer reaches the guard it targets";
+        ASSERT_TRUE(template_carries(w, txid))
+            << which << ": fixture broken, the alarm would be telling the truth";
+        EXPECT_TRUE(w.m_pin_drop_alarm.empty())
+            << which << ": DONATION-DROPPED on a template that IS carrying the "
+                        "donation: " << w.m_pin_drop_alarm;
+        const auto field = dash::stratum::detail::served_pins_field(w, &pins);
+        EXPECT_EQ(field.find("DONATION-DROPPED"), std::string::npos)
+            << which << ": the arm line claims a loss and a full pin count at "
+                        "once: " << field;
+        EXPECT_NE(field.find("pins=1/1"), std::string::npos) << which << field;
+    };
+
+    // (a) THE REVIEWER'S KAT. Guard (a) fires on the pin's own verdict and
+    // `continue`s long before the duplicate scan can name it.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {bad_verdict("input-missing-or-spent")},
+            /*from_xcheck_swap=*/false, /*xcheck_arm_enabled=*/false,
+            /*block_budget_enabled=*/false);
+        expect_no_alarm(w, "(a) !v.ok", "input-missing-or-spent");
+    }
+
+    // (b) The xcheck-swap money-path flag, default OFF. The swapped template
+    // came from dashd and can already carry the donation.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {ok_verdict(kSpliceHeight)},
+            /*from_xcheck_swap=*/true, /*xcheck_arm_enabled=*/false, false);
+        expect_no_alarm(w, "(b) xcheck-swap-pin-gate-off",
+                        "xcheck-swap-pin-gate-off");
+    }
+
+    // (c) Height disagreement on the xcheck arm.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {ok_verdict(kSpliceHeight - 1)},
+            /*from_xcheck_swap=*/true, /*xcheck_arm_enabled=*/true, false);
+        expect_no_alarm(w, "(c) xcheck-swap-height-mismatch",
+                        "xcheck-swap-height-mismatch");
+    }
+
+    // (d) The count-mismatch EARLY RETURN, which raises the alarm from its own
+    // exit path. Refusing everything by name is right; calling it a loss is not.
+    {
+        auto w = host_template({pin});
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, /*verdicts=*/{}, false, false, false);
+        expect_no_alarm(w, "(d) pin-verdict-count-mismatch",
+                        "pin-verdict-count-mismatch");
+    }
+
+    // (e) THE CONTROL, and the reason this is not "silence the alarm": the SAME
+    // refusal cause on a pin that is genuinely ABSENT must still shout, with the
+    // money and the cause named.
+    {
+        auto w = host_template();                       // carries nothing
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &pins, {bad_verdict("input-missing-or-spent")}, false, false,
+            false);
+        ASSERT_FALSE(template_carries(w, txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "a pin that is genuinely absent stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/1"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=50000sat"), std::string::npos)
+            << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("cause=input-missing-or-spent"),
+                  std::string::npos) << w.m_pin_drop_alarm;
+    }
+
+    // (f) MIXED, the arm that stops presence-keying from swallowing a real loss:
+    // one pin served-but-refused beside one genuinely absent, same cause on
+    // both. The alarm must read 1/2 and 30000sat, not 2/2 and 80000sat.
+    {
+        uint256 other; other.begin()[0] = 0x6b;
+        auto lost_pin = admissible_pin(other);
+        lost_pin.vout[0].value = 30'000;
+        const auto lost_txid = dash::coin::dash_txid(lost_pin);
+
+        auto w = host_template({pin});                  // carries `pin` only
+        const std::vector<dash::coin::MutableTransaction> both{pin, lost_pin};
+        dash::stratum::detail::splice_pins_onto_served_fallback(
+            w, &both,
+            {bad_verdict("input-missing-or-spent"),
+             bad_verdict("input-missing-or-spent")},
+            false, false, false);
+
+        ASSERT_TRUE(template_carries(w, txid));
+        ASSERT_FALSE(template_carries(w, lost_txid));
+        ASSERT_FALSE(w.m_pin_drop_alarm.empty())
+            << "the genuinely absent pin stopped raising the alarm";
+        EXPECT_NE(w.m_pin_drop_alarm.find("DONATION-DROPPED 1/2"),
+                  std::string::npos)
+            << "the served pin was counted as lost: " << w.m_pin_drop_alarm;
+        EXPECT_NE(w.m_pin_drop_alarm.find("value=30000sat"), std::string::npos)
+            << "the served pin's 50000 sat was added to the loss: "
+            << w.m_pin_drop_alarm;
+    }
+}

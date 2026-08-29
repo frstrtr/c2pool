@@ -1,0 +1,8 @@
+[Unit]
+Description=c2pool D-MINER.1 nightly rollup (per-worker/day hours_online,avg_hashrate,shares,stale%%)
+Documentation=https://github.com/frstrtr/c2pool/blob/master/docs/design/d-miner-5-notify-engine.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/c2pool/miner.env
+ExecStart=/usr/bin/env python3 ${C2POOL_MINER_SCRIPTS}/miner_presence_sampler.py rollup --db ${C2POOL_MINER_DB}

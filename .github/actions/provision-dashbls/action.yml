@@ -1,0 +1,138 @@
+name: Provision dashbls
+description: >
+  Make the dashbls (BLS12-381) backend available to a DASH build, so
+  -DC2POOL_DASH_BLS=ON links the REAL verifier instead of failing to configure.
+
+  Builds dash's own src/dashbls subtree at the pinned release tag via
+  scripts/build_dashbls.sh (the single source of truth for the tag - this action
+  parses DASH_REF out of that script rather than duplicating it) and installs it
+  into a per-host prefix that is reused across runs. The build is heavy
+  (autotools + relic + mimalloc), so it happens ONCE per runner per pinned tag:
+  a prefix whose .dash-ref marker already matches is used as-is. On
+  github-hosted runners (fork PRs, ephemeral) the prefix is additionally
+  restored from the Actions cache.
+
+  Exports DASHBLS_ROOT to $GITHUB_ENV for the subsequent cmake configure, and
+  FAILS the job if the library or headers are not present when it finishes -
+  never leaves a job believing it has BLS when it does not.
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve dashbls prefix + pinned tag
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Fixed prefix (no input): the github-hosted cache path below must be a
+        # literal, and a configurable prefix that silently misses the cache is
+        # worse than none.
+        prefix="$HOME/.c2pool-deps/dashbls"
+        # Single source of truth for the pin: scripts/build_dashbls.sh. Parsing
+        # it here means a re-pin of the tag cannot silently leave CI on the old
+        # library (the prefix marker below is keyed on this value).
+        ref="$(sed -n 's/^DASH_REF="\${DASH_REF:-\(.*\)}"$/\1/p' scripts/build_dashbls.sh)"
+        if [ -z "$ref" ]; then
+          echo "::error::could not parse DASH_REF from scripts/build_dashbls.sh"
+          exit 1
+        fi
+        echo "dashbls prefix=$prefix pinned dash ref=$ref"
+        echo "DASHBLS_PREFIX=$prefix" >> "$GITHUB_ENV"
+        echo "DASHBLS_PIN=$ref" >> "$GITHUB_ENV"
+
+    # Ephemeral github-hosted runners only (fork PRs). Self-hosted runners keep
+    # the prefix on disk, which is both faster and immune to the cache-service
+    # restore timeouts seen on the VM905 pool.
+    - name: Restore dashbls cache (github-hosted only)
+      if: runner.environment == 'github-hosted'
+      uses: actions/cache@v5
+      with:
+        path: ~/.c2pool-deps/dashbls
+        key: dashbls-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_dashbls.sh') }}
+
+    - name: Install dashbls build dependencies
+      shell: bash
+      run: |
+        set -uo pipefail
+        # relic needs gmp, and the vendored subtree only supports the autotools
+        # path (see the note in scripts/build_dashbls.sh). libgmp-dev is also a
+        # LINK-time requirement of the c2pool find (find_library(gmp)), so it is
+        # ensured even when the prefix is already warm.
+        #
+        # flock: several coin cells run concurrently on the one self-hosted host
+        # and race on the apt lock (the same guard release.yml uses for its own
+        # apt step).
+        #
+        # Non-fatal on purpose: a transient apt hiccup on a host that ALREADY
+        # has these packages must not red the job. What is actually required is
+        # verified right after, and a genuinely missing gmp fails there.
+        exec {lockfd}>/tmp/c2pool-apt.lock
+        flock "$lockfd"
+        sudo apt-get update -qq || true
+        sudo apt-get install -y --no-install-recommends \
+          autoconf automake libtool libgmp-dev || true
+
+    - name: Assert libgmp development files are present
+      shell: bash
+      run: |
+        set -euo pipefail
+        # find_library(DASHBLS_GMP_LIB NAMES gmp) in the root CMakeLists needs
+        # the libgmp.so DEVELOPMENT symlink, not just the versioned runtime
+        # object -- i.e. libgmp-dev. Checked explicitly so a host missing it
+        # says so here instead of surfacing as a confusing "dashbls not found".
+        entries="$(ldconfig -p || true)"
+        case "$entries" in
+          *"libgmp.so ("*) echo "  ok   libgmp runtime present" ;;
+          *) echo "::error::libgmp is not installed on this runner (need libgmp-dev)"; exit 1 ;;
+        esac
+        found=""
+        for d in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib /usr/local/lib; do
+          if [ -e "$d/libgmp.so" ]; then found="$d/libgmp.so"; break; fi
+        done
+        if [ -z "$found" ]; then
+          echo "::error::libgmp.so development symlink not found (install libgmp-dev on this runner)"
+          exit 1
+        fi
+        echo "  ok   $found"
+
+    - name: Build dashbls if the prefix is cold or pinned to another tag
+      shell: bash
+      run: |
+        set -euo pipefail
+        marker="$DASHBLS_PREFIX/.dash-ref"
+        if [ -f "$DASHBLS_PREFIX/lib/libdashbls.a" ] \
+           && [ -f "$DASHBLS_PREFIX/include/dashbls/bls.hpp" ] \
+           && [ "$(cat "$marker" 2>/dev/null || true)" = "$DASHBLS_PIN" ]; then
+          echo "dashbls $DASHBLS_PIN already installed at $DASHBLS_PREFIX - reusing"
+          exit 0
+        fi
+        echo "building dashbls $DASHBLS_PIN into $DASHBLS_PREFIX (one-time per runner)"
+        # Belt-and-braces before an rm -rf: the prefix must be the resolved
+        # per-user dependency dir, never $HOME or /.
+        case "$DASHBLS_PREFIX" in
+          "$HOME"/.c2pool-deps/*) ;;
+          *) echo "::error::refusing to remove unexpected prefix $DASHBLS_PREFIX"; exit 1 ;;
+        esac
+        rm -rf "$DASHBLS_PREFIX"
+        bash scripts/build_dashbls.sh "$DASHBLS_PREFIX"
+        printf '%s\n' "$DASHBLS_PIN" > "$marker"
+
+    # The whole point of the action: a job must never continue believing it has
+    # a BLS backend when the provisioning silently did nothing.
+    - name: Assert dashbls is present
+      shell: bash
+      run: |
+        set -euo pipefail
+        fail=0
+        for f in "$DASHBLS_PREFIX/lib/libdashbls.a" "$DASHBLS_PREFIX/include/dashbls/bls.hpp"; do
+          if [ -f "$f" ]; then
+            echo "  ok   $f"
+          else
+            echo "  MISS $f"
+            fail=1
+          fi
+        done
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::dashbls provisioning did not produce a usable prefix at $DASHBLS_PREFIX"
+          exit 1
+        fi
+        echo "DASHBLS_ROOT=$DASHBLS_PREFIX" >> "$GITHUB_ENV"

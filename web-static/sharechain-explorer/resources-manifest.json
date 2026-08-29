@@ -1,0 +1,30 @@
+{
+  "version": "0.1.0-alpha",
+  "generated": "2026-08-28T19:52:28.612Z",
+  "files": [
+    "pplns-view.js",
+    "sharechain-explorer.js",
+    "shared-core.js"
+  ],
+  "filesDev": [
+    "pplns-view.js.map",
+    "sharechain-explorer.js.map",
+    "shared-core.js.map"
+  ],
+  "integrity": {
+    "pplns-view.js": "sha384-/cHI3U+QO74fSFbk0Es5ETWJMR1ZoT9gzRCGJNB1bPlprrz+o6AzuKRYTkRxdgtp",
+    "pplns-view.js.map": "sha384-J4jHvn3U6ZFjUtKDE5Y8h+AMx52ASTFtlaaS4qYsg3t8N00LlONyNWaagbofgda9",
+    "sharechain-explorer.js": "sha384-4/4UlrLNDDQngdBi1dAVTYFrj4+pCBXbJQ8Jo4ez21PYDchNht63QGM+ujGCfXxb",
+    "sharechain-explorer.js.map": "sha384-0CK5AYxbgPg3BZjBsbO7bffEODchyQJie4+CM0N+op6GnVAQ7NiVcrkOMcKHhbq2",
+    "shared-core.js": "sha384-shFs3b7dkb/ooHhtaqwIZwSuYwFwk9VonRrrBg8nUSyS7Sqfbc1PDX5+ufap/Wvz",
+    "shared-core.js.map": "sha384-A1CSDMTBmnHbS8vHRdtNIHb8kZN2GTgdWz/aTce3xNY6eAmWiTW0yN8hCpign5gM"
+  },
+  "sizes": {
+    "pplns-view.js": 32954,
+    "pplns-view.js.map": 128604,
+    "sharechain-explorer.js": 59644,
+    "sharechain-explorer.js.map": 284763,
+    "shared-core.js": 25691,
+    "shared-core.js.map": 113695
+  }
+}

@@ -1,0 +1,79 @@
+# C2Pool Litecoin Testnet Configuration
+# P2P: 19326, Stratum: 19327, HTTP: 8080
+#
+# All keys below are optional. CLI arguments always take priority over YAML values.
+# Unrecognized keys are silently ignored.
+
+# ─── Network ────────────────────────────────────────────────────────────────
+port: 19326                    # P2P p2pool sharechain port (testnet)
+stratum_port: 19327            # Stratum mining port (testnet)
+http_port: 18080               # HTTP/JSON-RPC API port (testnet)
+http_host: "0.0.0.0"          # HTTP bind address
+
+# ─── Coin Daemon RPC ────────────────────────────────────────────────────────
+ltc_rpc_host: 127.0.0.1
+ltc_rpc_port: 19332            # Litecoin testnet RPC port
+ltc_rpc_user: ltctest
+ltc_rpc_password: ltctest123
+
+# ─── Coin Daemon P2P (fast block relay) ──────────────────────────────────────
+# coind_p2p_port: 19335        # auto-detected from chain if omitted
+# coind_p2p_address: 127.0.0.1 # defaults to ltc_rpc_host
+
+# ─── Payout & Fees ──────────────────────────────────────────────────────────
+# donation_percentage: 0.0     # Developer donation %
+# node_owner_fee: 0.0          # Node owner fee %
+# node_owner_address: ""       # Node owner payout address
+# redistribute: pplns           # Redistribution mode: pplns, fee, boost, donate
+# payout_window_seconds: 86400  # PPLNS payout window (default: 24h)
+
+# ─── Stratum per-connection vardiff tuning ───────────────────────────────────
+min_difficulty: 0.001          # Floor for per-connection difficulty (smallest ASICs)
+max_difficulty: 65536.0        # Ceiling for per-connection difficulty (large farms)
+target_time: 10.0              # Target seconds between pseudoshares
+vardiff_enabled: true          # Auto-adjust per-connection difficulty
+max_coinbase_outputs: 4000     # Max coinbase outputs (p2pool: 4000; no consensus limit)
+
+# ─── P2P Sharechain ─────────────────────────────────────────────────────────
+p2p_max_peers: 30              # Max total P2P peers (inbound + outbound)
+ban_duration: 300              # P2P ban duration in seconds (5 min default)
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+log_level: INFO                # trace, debug, info, warning, error
+log_file: c2pool_testnet.log   # Log filename (in data dir)
+log_rotation_size_mb: 10       # Rotate log file at N MB
+log_max_total_mb: 50           # Max total rotated log space in MB
+
+# ─── Memory & Caches ────────────────────────────────────────────────────────
+rss_limit_mb: 4000             # Abort if RSS exceeds N MB (default: 4GB)
+# cache_max_shared_hashes: 50000
+# cache_max_known_txs: 10000
+# cache_max_raw_shares: 50000
+
+# ─── Storage ────────────────────────────────────────────────────────────────
+storage_save_interval: 300     # Periodic sharechain save interval (seconds)
+
+# ─── HTTP API / Security ────────────────────────────────────────────────────
+cors_origin: "*"               # Access-Control-Allow-Origin header
+
+# ─── Web Dashboard ──────────────────────────────────────────────────────────
+# Dashboard and explorer are user-customizable: edit web-static/ HTML/JS/CSS
+# and explorer/explorer.py freely — they are bundled as modifiable components.
+dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)
+# analytics_id: "G-XXXXXXXXXX"  # Google Analytics measurement ID (optional)
+
+# Custom block explorer link prefixes (override Blockchair defaults).
+# address_explorer_prefix: "https://blockchair.com/litecoin/testnet/address/"
+# block_explorer_prefix: "https://blockchair.com/litecoin/testnet/block/"
+# tx_explorer_prefix: "https://blockchair.com/litecoin/testnet/transaction/"
+
+# ─── Lite Block Explorer ─────────────────────────────────────────────────────
+# explorer: false                          # Enable block storage + explorer REST API
+# explorer_url: "http://localhost:9090"    # Explorer URL for dashboard nav link
+# explorer_depth_ltc: 288                  # LTC blocks to keep
+# explorer_depth_doge: 1440               # DOGE blocks to keep
+
+# ─── DOGE Merged Mining ─────────────────────────────────────────────────────
+doge_testnet4alpha: true       # Use testnet4alpha chain params (not testnet3)
+doge_p2p_address: "192.168.86.27"  # DOGE daemon P2P address
+doge_p2p_port: 44556           # DOGE daemon P2P port (testnet4alpha)

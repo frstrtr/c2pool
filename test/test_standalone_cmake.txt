@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.10)
+project(test_coinbase_standalone)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find required packages
+find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem system)
+find_package(nlohmann_json REQUIRED)
+
+# Include directories
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Add executable
+add_executable(test_coinbase_standalone test_coinbase_standalone.cpp)
+
+# Link with required libraries
+target_link_libraries(test_coinbase_standalone
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/src/c2pool/payout/libc2pool_payout.a
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/src/core/libcore.a
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/src/btclibs/libbtclibs.a
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    pthread
+)

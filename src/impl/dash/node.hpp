@@ -1,0 +1,1419 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+// Dash p2pool sharechain pool-node — S8 pool-node leaf 5 (FINAL), slice A.
+//
+// SLICE A SCOPE: class skeleton + accessors + KAT ONLY. This is one slice of a
+// 4-slice plan (A=skeleton+accessors+KAT, B=reception, C=broadcast/persist,
+// D=think-loop). Reception (message handlers / Legacy / Actual / NodeBridge),
+// broadcast/persist, and the think() compute-loop bodies are DEFERRED to the
+// later slices and are intentionally NOT declared here.
+//
+// Namespace-ported from the btc::NodeImpl prod reference (src/impl/btc/node.hpp),
+// reconciled against DASH's actual headers (dash::Config, dash::ShareChain,
+// dash::ShareTracker, dash::Peer, dash::coin::Transaction). DASH is X11 but the
+// pool-node layer is consensus-agnostic; the slice-A surface (lifecycle fields,
+// async-compute pipeline scaffold, lock-free snapshot, tracker accessors) is
+// byte-for-byte the same shape as btc/dgb.
+
+#include "config.hpp"
+#include "share.hpp"
+#include "share_chain.hpp"
+#include "share_tracker.hpp"
+#include "peer.hpp"
+#include "min_protocol_gate.hpp"
+#include "tracker_acquire.hpp"       // #889: bounded acquisition — BLOCK-WINNING mint path only
+#include "auto_ratchet.hpp"          // dash::apply_min_protocol_ratchet_decision (v36 accept-floor ratchet)
+#include "version_negotiation.hpp"   // dash::version_negotiation::get_desired_version_weights (ratchet window)
+#include "messages.hpp"
+#include "coin/transaction.hpp"
+#include "coin/node_coin_state.hpp"       // dash::coin::NodeCoinState (node-held embedded bundle)
+#include "coin/coin_state_maintainer.hpp" // dash::coin::CoinStateMaintainer (reception/think driver)
+
+#include <pool/node.hpp>
+#include <pool/protocol.hpp>
+#include <pool/share_download.hpp>  // shared downloader helpers (#754)
+#include <core/p2p_message_stats.hpp>
+#include <core/reply_matcher.hpp>
+#include <core/tx_advertiser.hpp>
+#include <c2pool/storage/sharechain_storage.hpp>
+
+#include <boost/asio/thread_pool.hpp>
+#include <boost/asio/steady_timer.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <set>
+#include <shared_mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace dash
+{
+
+// Batch of received shares (+ their raw bytes and needed txs) awaiting tracker
+// insertion. Slice A defines the complete shell so m_pending_adds's
+// unique_ptr<HandleSharesData> has a complete type at destruction; the reception
+// slice (B) drives add()/drain. Mirrors btc::HandleSharesData.
+struct HandleSharesData
+{
+    std::vector<ShareType> m_items;
+    std::vector<chain::RawShare> m_raw_items; // original raw bytes, parallel with m_items
+    std::map<uint256, std::vector<coin::MutableTransaction>> m_txs;
+
+    void add(const ShareType& share, std::vector<coin::MutableTransaction> txs)
+    {
+        m_items.push_back(share);
+        m_raw_items.emplace_back(); // no cached raw bytes
+        m_txs[share.hash()] = std::move(txs);
+    }
+
+    void add(const ShareType& share, std::vector<coin::MutableTransaction> txs,
+             const chain::RawShare& raw)
+    {
+        m_items.push_back(share);
+        m_raw_items.push_back(raw);
+        m_txs[share.hash()] = std::move(txs);
+    }
+};
+
+// Response payload delivered to a pending async share request when a sharereply
+// arrives. Parsed shares plus their original raw payloads (so relay re-sends the
+// exact bytes received). Wired into the reply_matcher typedef below.
+struct ShareReplyData
+{
+    std::vector<ShareType> m_items;
+    std::vector<chain::RawShare> m_raw_items;
+};
+
+class NodeImpl : public pool::BaseNode<dash::Config, dash::ShareChain, dash::Peer>
+{
+    // Async share downloader:
+    //   ID       = uint256 (matches sharereq id to sharereply id)
+    //   RESPONSE = parsed shares plus their original raw payloads
+    //   REQUEST  = req_id, peer, hashes, parents, stops
+    using share_getter_t = ReplyMatcher::ID<uint256>
+        ::RESPONSE<dash::ShareReplyData>
+        ::REQUEST<uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>>;
+
+protected:
+    share_getter_t m_share_getter;
+    ShareTracker m_tracker;
+    std::unique_ptr<c2pool::storage::SharechainStorage> m_storage;
+
+    // Global pool of known transactions, populated by remember_tx and the coin
+    // daemon. Reception-slice protocol handlers look up tx hashes here.
+    std::map<uint256, coin::Transaction> m_known_txs;
+
+    // Embedded coin-state (S8 embedded_gbt live-wire capstone). The node-held
+    // bundle build_embedded_workdata() consumes (MN list + mempool + tip
+    // params) plus the maintainer that keeps it current off the async
+    // reception/think update path. Until the maintainer publishes (both a
+    // non-empty MN list AND a tip have arrived), populated() stays false and
+    // select_work() routes to the RETAINED dashd getblocktemplate fallback --
+    // the always-reachable safety path + [GBT-XCHECK] cross-check, never
+    // removed. Declaration order matters: the maintainer holds a reference to
+    // m_coin_state, so the bundle must be declared first.
+    coin::NodeCoinState       m_coin_state;
+    coin::CoinStateMaintainer m_coin_state_maintainer{m_coin_state};
+
+    // Wire-message parser used by the Legacy/Actual dispatch protocols to turn
+    // a RawMessage into a typed message variant. Mirrors dgb::NodeImpl::m_handler.
+    dash::Handler m_handler;
+
+    // Callback fired when a bestblock message is received from a pool peer.
+    //
+    // NOT WIRED ON THE DASH LANE (audited 2026-08-04) — and that is the norm,
+    // not a DASH regression: btc/dgb/bch declare the identical seam and leave
+    // it unset too; src/c2pool/main_ltc.cpp is the ONLY set_on_bestblock call
+    // site in the tree. Inbound bestblock on DASH is therefore observability
+    // only (the "[Pool] New best block from peer" line in
+    // dash/protocol_actual.cpp + protocol_legacy.cpp). The SEND side IS wired:
+    // main_dash's fallback-arm tip-notify announces via broadcast_bestblock().
+    //
+    // DASH does not need it as a tip source. Both arms already have a
+    // first-party coin-tip signal that the refresh trio (invalidate template
+    // cache + bump work generation + notify_all) hangs off:
+    //   * embedded arm  -> header_chain->set_on_tip_changed (coin-P2P headers),
+    //   * fallback arm  -> --coin-zmq-hashblock (instant) with a 3 s
+    //                      getbestblockhash poll backstop, behind one shared
+    //                      last-seen-tip dedup.
+    // LTC wires it because pool-P2P is its PRIMARY block source; DASH's is not.
+    //
+    // IF IT IS EVER WIRED, the hazard to solve first: the argument is a
+    // PEER-ASSERTED header hash, not our own tip. Feeding it straight into the
+    // fallback arm's fire_refresh would (a) let an unbounded stream of distinct
+    // bogus hashes drive a template-rebuild storm (LTC's leading-edge dedup is
+    // per-hash, so it does not bound that), and (b) POISON the shared tip_dedup
+    // with a hash dashd has not connected yet — the re-source returns the OLD
+    // template and the real tip-change refresh is then suppressed as
+    // "not a new tip", i.e. exactly the stale-work outcome the hook exists to
+    // prevent. Any wiring must confirm the hash against our own tip source
+    // before it is allowed to touch the dedup.
+    std::function<void(const uint256&)> m_on_bestblock;
+
+    // Thread pool for parallel share_init_verify (X11 CPU work). Keeps the
+    // expensive crypto off the io_context thread.
+    boost::asio::thread_pool m_verify_pool{4};
+
+    // ── Async compute pipeline ──────────────────────────────────────────
+    // think() (slice D) runs on m_think_pool (1 thread) holding m_tracker_mutex
+    // exclusively. The IO thread NEVER calls lock() — only try_to_lock(). If the
+    // mutex is held by the compute thread, the IO thread defers the operation and
+    // continues processing network I/O. Synchronization contract:
+    //   Compute thread:   unique_lock(m_tracker_mutex)  — exclusive, blocking
+    //   IO thread reads:  shared_lock(try_to_lock)      — non-blocking, skip if busy
+    //   IO thread writes: unique_lock(try_to_lock)      — non-blocking, queue if busy
+    boost::asio::thread_pool m_think_pool{1};
+    std::atomic<bool> m_think_running{false};
+    std::atomic<bool> m_clean_running{false};
+    // #854: a run_think() request that arrives while a cycle is already in
+    // flight used to be DROPPED. It is reachable on the hot path — a local
+    // mint (add_local_share) or a peer best-advert drain landing during a
+    // think/clean IO-phase, when the tracker lock is already released but
+    // m_think_running is still true — and the dropped election is the tip
+    // change that never reaches the rigs. Set by dash::think::
+    // acquire_think_slot() when the slot is busy, consumed by
+    // dash::think::release_think_slot() at the end of the running cycle,
+    // which then re-posts run_think(). Both flags are IO-thread-only (single
+    // ioc.run() thread in main_dash); the compute thread never touches them.
+    // Protocol + rationale: src/impl/dash/think_gate.hpp.
+    std::atomic<bool> m_rethink_pending{false};
+    mutable std::shared_mutex m_tracker_mutex;
+
+    // ── Lock-free stats snapshot ─────────────────────────────────────────
+    // Published by think() on the compute thread under m_tracker_mutex. Read by
+    // ALL consumers (sync_status, loading page, global_stats, graph data, …)
+    // WITHOUT needing the tracker lock — the c2pool equivalent of p2pool's
+    // reactor-thread stats variables.
+    struct TrackerSnapshot {
+        int chain_count{0};
+        int verified_count{0};
+        int head_count{0};
+        int orphan_shares{0};
+        int dead_shares{0};
+        int fork_count{0};
+        double pool_hashrate{0};
+        // Last published best-share election (m_best_share_hash at publish
+        // time). The lock-free fallback for best_share_hash() /
+        // advertised_best_share() when the compute thread holds the
+        // exclusive lock — see snapshot_best_share().
+        uint256 best_share;
+    };
+    void publish_snapshot() {
+        TrackerSnapshot s;
+        s.chain_count = static_cast<int>(m_tracker.chain.size());
+        s.verified_count = static_cast<int>(m_tracker.verified.size());
+        s.head_count = static_cast<int>(m_tracker.chain.get_heads().size());
+        s.fork_count = s.head_count;
+        s.best_share = m_best_share_hash;
+        publish_timestamp_diagnostics();
+        {
+            std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+            m_snapshot = s;
+        }
+    }
+
+    // ── /p2p_stats: embedded-timestamp health of the sharechain tip ─────────
+    //
+    // OBSERVE-ONLY. Publishes the two fields the aggregate gauges cannot give
+    // us honestly:
+    //   (a) tip_lag_seconds — wall-clock now MINUS the tip's EMBEDDED
+    //       share timestamp;
+    //   (b) ts_saturation_fraction — over the last 100 shares, the share of
+    //       embedded deltas pinned to the clip upper bound (2*SHARE_PERIOD-1,
+    //       = 39 s on DASH).
+    //
+    // Upstream p2pool clips every embedded share timestamp to
+    // [prev+1, prev+2*SHARE_PERIOD-1] (data.py:239-242). Once real cadence
+    // outruns that bound the embedded clock saturates, the retarget (which
+    // reads embedded timestamps) goes blind to hashrate, and the floor decays.
+    // pool_hash_rate / min_difficulty are computed FROM that saturated history,
+    // so they measure floor decay, not the pool — which is exactly why these
+    // two raw fields exist as the deploy criterion instead.
+    //
+    // THREADING: reads m_tracker.chain, so it MUST run under the tracker lock.
+    // Called only from publish_snapshot(), whose three call sites are the two
+    // run_think()/clean-cycle compute phases (exclusive m_tracker_mutex held)
+    // and the single-threaded LevelDB load before the compute thread starts.
+    //
+    // COST: bounded at 101 chain lookups per think cycle, no allocation beyond
+    // one 101-entry vector. Nothing here feeds validation, minting or payout.
+    void publish_timestamp_diagnostics()
+    {
+        static constexpr std::size_t SAMPLE_SHARES = 100;
+
+        std::vector<std::uint32_t> ts;
+        ts.reserve(SAMPLE_SHARES + 1);
+
+        uint256 cursor = m_best_share_hash;
+        while (ts.size() <= SAMPLE_SHARES && !cursor.IsNull()
+               && m_tracker.chain.contains(cursor))
+        {
+            std::uint32_t stamp = 0;
+            uint256 prev;
+            m_tracker.chain.get_share(cursor).invoke([&](auto* obj) {
+                stamp = obj->m_timestamp;
+                prev  = obj->m_prev_hash;
+            });
+            ts.push_back(stamp);
+            cursor = prev;
+        }
+
+        const std::uint32_t clip =
+            SharechainConfig::share_period() * 2 - 1;   // 39 s on DASH
+        const auto sat = core::obs::compute_timestamp_saturation(ts, clip);
+        const std::uint32_t tip_ts = ts.empty() ? 0u : ts.front();
+
+        auto& stats = core::obs::p2p_stats();
+        stats.tip_embedded_timestamp.store(tip_ts, std::memory_order_relaxed);
+        stats.tip_lag_seconds.store(
+            core::obs::compute_tip_lag_seconds(
+                static_cast<std::int64_t>(core::timestamp()), tip_ts),
+            std::memory_order_relaxed);
+        stats.ts_delta_samples.store(sat.samples, std::memory_order_relaxed);
+        stats.ts_delta_saturated.store(sat.saturated, std::memory_order_relaxed);
+        stats.ts_clip_upper_bound.store(clip, std::memory_order_relaxed);
+        stats.sharechain_updated_at.store(
+            static_cast<std::int64_t>(core::timestamp()), std::memory_order_relaxed);
+
+        // DELIBERATELY NOT published here: m_known_txs.size(). This body runs
+        // on the COMPUTE thread, and in the DASH lane every m_known_txs mutator
+        // is IO-thread-confined WITHOUT taking the tracker lock (see the
+        // invariant note on advertise_known_txs) — so reading the map from here
+        // would be an unsynchronised cross-thread read of a container being
+        // mutated, the exact #828 discipline this file exists to keep. The
+        // 10 s advert sweep publishes that gauge from the IO thread instead.
+    }
+    mutable std::mutex m_snapshot_mutex;
+    TrackerSnapshot m_snapshot;
+
+    // ── Lock-free peer-info snapshot (display-only) ──────────────────────
+    // m_peers / m_outbound_addrs are IO-thread-owned and have NO lock; the
+    // dashboard node-status card polls the peer panel from the WebServer HTTP
+    // thread. Iterating those std::maps on the HTTP thread while handle_version
+    // inserts / error()/close_connection erase on the IO thread rebalances the
+    // tree under the reader's iterator → the SAME freed-memory GP-fault this
+    // file's tracker fix closes (TSAN-captured). So the JSON is BUILT on the IO
+    // thread (publish_peer_info_snapshot, at every peer add/remove + the 2s
+    // advert-timer tick for uptime freshness) and the HTTP fn reads this copy
+    // lock-free — mirrors TrackerSnapshot. Guarded by m_snapshot_mutex (a
+    // std::mutex briefly held for the swap, never contended with the tracker).
+    nlohmann::json m_peer_info_snapshot = nlohmann::json::array();
+
+    // Identity of the compute thread (m_think_pool's single thread). Used by
+    // TrackerReadGuard to skip shared_lock when the caller is already on the
+    // compute thread (which holds the exclusive lock).
+    std::atomic<std::thread::id> m_compute_thread_id{};
+
+    // Pending share batches queued while think() holds the mutex; drained on the
+    // IO thread after think() releases the lock. unique_ptr because
+    // HandleSharesData is forward-declared here (defined in the reception slice).
+    struct PendingShareBatch {
+        std::unique_ptr<HandleSharesData> data;
+        NetService addr;
+    };
+    std::vector<PendingShareBatch> m_pending_adds;
+
+    // ── think() watchdog + backpressure (livelock defense-in-depth) ──
+    // If a think() cycle exceeds THINK_WATCHDOG_SECONDS the watchdog (slice D)
+    // logs compute-thread state, flags the cycle, and resets m_think_running so
+    // the pipeline recovers instead of wedging. The watchdog NEVER touches
+    // m_tracker_mutex. MAX_PENDING_ADDS caps the deferred queue.
+    static constexpr int THINK_WATCHDOG_SECONDS = 30;
+    static constexpr size_t MAX_PENDING_ADDS = 256;
+    std::atomic<int64_t> m_think_deadline_ns{0};
+    std::atomic<uint64_t> m_think_generation{0};
+    std::unique_ptr<boost::asio::steady_timer> m_watchdog_timer;
+
+    // Top-5 scored heads from last think() — used by clean_tracker() (slice D)
+    // to protect the best chains from head pruning.
+    std::vector<uint256> m_last_top5_heads;
+
+    // Buffer of newly verified share hashes, flushed to LevelDB periodically.
+    std::vector<uint256> m_verified_flush_buf;
+    // Buffer of pruned share hashes, batch-deleted from LevelDB after clean.
+    std::vector<uint256> m_removal_flush_buf;
+
+    // ── Run-loop mint slice (3/3) state ─────────────────────────────────
+    // Best-share election result — published by run_think() on the compute
+    // thread under m_tracker_mutex (mirrors btc::NodeImpl::m_best_share_hash).
+    uint256 m_best_share_hash;
+
+    // #889: block-winning mints forfeited because the BOUNDED wait on the
+    // exclusive tracker lock expired. Written from the stratum IO thread only,
+    // read from anywhere (dashboard/KAT) — atomic, relaxed; it is a diagnostic
+    // gauge, not a synchronisation point.
+    std::atomic<uint64_t> m_block_share_lock_forfeits{0};
+
+    // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
+    // Runtime P2P accept-floor, seeded from the COLD config floor (1700, accept-all)
+    // and lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by apply_min_protocol_ratchet()
+    // once the work-weighted desired-version tally over the [9/10..10/10] window behind
+    // the best share holds >= 95% for v36. Mutated ONLY on the compute thread under the
+    // exclusive m_tracker_mutex (same sites as m_best_share_hash); it drives the LIVE
+    // m_min_protocol_gate.min_version so the handshake reception reflects the ratchet.
+    std::atomic<uint32_t> m_runtime_min_protocol_version{
+        SharechainConfig::MINIMUM_PROTOCOL_VERSION};
+
+    // De-dup set for broadcast_share (hashes already relayed to peers).
+    std::set<uint256> m_shared_share_hashes;
+    // Rolling history of recent templates' tx-hash sets (register_template_txs).
+    // A locally minted share references its job's template txs; the miner may
+    // solve a job whose template has since rotated (especially at high hashrate),
+    // and ROOT-2 re-announce re-broadcasts a share after several rotations. If we
+    // evict a tx the moment its template rotates (the old single-template bound),
+    // send_shares can no longer forward its bytes via remember_tx, and the
+    // canonical peer drops us with "referenced unknown transaction" (p2p.py:404).
+    // Keep the last RETAINED_TEMPLATE_TX_SETS template tx-sets so a share minted
+    // on any recent job stays fully backable; a tx leaves m_known_txs only once it
+    // has fallen out of EVERY retained set (peer-remembered txs are separate).
+    static constexpr size_t RETAINED_TEMPLATE_TX_SETS = 8;
+    // #950: canonical p2pool's max_remembered_txs_size (p2p.py:30). A peer
+    // disconnects if an inbound remember_tx pushes its remembered_txs_size
+    // over this (p2p.py:488), so the standing-remember seed stays under it.
+    static constexpr std::size_t MAX_REMEMBERED_TXS_SIZE = 2500000;
+    std::deque<std::set<uint256>> m_recent_template_tx_sets;
+    // Fired on the IO thread when run_think() elects a new best share
+    // (p2pool: new_work_event) — main_dash binds the stratum work refresh.
+    std::function<void()> m_on_best_share_changed;
+    // Chain-relative block height for think() scoring; unbound -> zero fn.
+    std::function<int32_t(uint256)> m_block_rel_height_fn;
+
+    // ── Share-download leg (#754) state — IO-thread only ────────────────
+    // De-dup + per-cycle retry gate for in-flight sharereq targets (shared
+    // pool/share_download.hpp; ltc m_downloading_shares/m_download_fail_count).
+    pool::download::DownloadGate m_download_gate;
+    // req_id → peer addr for selective cancellation on disconnect. p2pool has
+    // per-peer get_shares deferrers (connectionLost → respond_all on just that
+    // peer); c2pool's m_share_getter is shared, so the ownership is tracked
+    // here (ltc node.hpp:511 parity).
+    std::map<uint256, NetService> m_pending_share_reqs;
+    // Best-share adverts learned in handle_version, awaiting download. The
+    // inline (vtable) handle_version body must stay link-free for the
+    // rig-free KAT targets (they build NodeImpl WITHOUT the node.cpp TU), so
+    // it QUEUES here; run_think()'s IO phase + the advert timer started by
+    // start_outbound_connections() (both node.cpp) drain the queue into
+    // download_shares — the oracle p2p.py handle_version →
+    // node.handle_share_hashes join trigger, one hop later.
+    // TODO(dash-async, follow-up): bound this queue with a drop-oldest cap
+    // (mirror MAX_PENDING_ADDS). Today the busy-download path in
+    // download_shares re-enqueues continuations here when the tracker lock is
+    // held, so a sustained think()-busy window could grow it; a cap keeps it
+    // bounded like m_pending_adds. Not a crash risk (drained every 2s).
+    std::vector<std::pair<std::weak_ptr<peer_t>, uint256>> m_peer_best_adverts;
+
+    // ── Peer-count mirror ───────────────────────────────────────────────
+    // m_peers (pool/node.hpp base) is IO-thread-owned and has no lock; the
+    // best-share election needs only "any peers?" and is reachable from the
+    // WebServer HTTP thread + the compute thread (via best_share_hash), so
+    // it reads this atomic mirror instead of touching the map. Updated at
+    // the two mutation sites (handle_version insert, error() erase).
+    std::atomic<size_t> m_peer_count{0};
+
+    // ── Outbound dialing (btc/ltc start_outbound_connections port) ──────
+    static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
+    size_t m_max_peers = 30;
+    size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
+    std::unique_ptr<core::Timer> m_connect_timer;   // 30s dial maintenance
+    // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
+    // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
+    std::unique_ptr<core::Timer> m_tx_advert_timer;
+    // Canonical addr-discovery sweep timer (p2p.py:794-799). Flat 20 s, the
+    // mean of canonical's random.expovariate(1/20) re-arm.
+    std::unique_ptr<core::Timer> m_getaddrs_timer;
+    // Canonical p2p.py:759 preferred_storage default: stop asking for more
+    // addresses once the store holds this many. Keeps the AddrStore bounded
+    // well under the pool/node.hpp got_addr() hard cap of 10000.
+    static constexpr size_t PREFERRED_ADDR_STORAGE = 1000;
+    std::unique_ptr<core::Timer> m_advert_timer;    // 2s best-advert drain
+    std::set<NetService> m_pending_outbound;  // addresses currently being dialed
+    std::set<NetService> m_outbound_addrs;    // established outbound peers
+
+    // ── P2P ban list (btc node.hpp:533-545 port) ────────────────────────
+    // Peers that fed unverifiable shares (think()'s bad_peer_addresses) are
+    // banned for m_ban_duration; expired entries are swept each think cycle.
+    std::map<NetService, std::chrono::steady_clock::time_point> m_ban_list;
+    std::chrono::seconds m_ban_duration{300};   // 5 minutes (configurable)
+    std::map<std::string, std::chrono::steady_clock::time_point> m_ip_ban_list;
+    // Whitelist: permanent dial targets (--addnode/--connect bootstrap seeds)
+    // are immune to bans — banning the only seed of a small mesh would lock
+    // the node out of its own pool (btc is_banned whitelist-bypass parity;
+    // populated from the config bootstrap list in the ctor).
+    std::set<std::string> m_whitelist_ips;
+    std::set<NetService> m_whitelist_hosts;
+
+public:
+    // DISPLAY-ONLY read of the live P2P accept-floor (v36 ratchet output). Read
+    // atomically off any thread; the dashboard's /version_signaling surfaces this
+    // as the "min-protocol floor" gauge (1700 pre-crossing -> 3600 post-ratchet).
+    // Consensus-neutral: a plain atomic load, no side effects.
+    uint32_t runtime_min_protocol_version() const {
+        return m_runtime_min_protocol_version.load(std::memory_order_relaxed);
+    }
+
+    // Default (rig-free) construction for tests/standalone: no io_context, the
+    // share-getter requester is a no-op (there are no peers to write a
+    // sharereq to; the ctx ctor below wires the real writer). Routes m_chain
+    // at the tracker's main chain so any BaseNode path that reads m_chain is
+    // valid.
+    NodeImpl()
+        : m_share_getter(nullptr,
+            [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){})
+    {
+        m_chain = &m_tracker.chain;
+        std::mt19937_64 rng(std::random_device{}());
+        m_nonce = rng();
+    }
+
+    NodeImpl(boost::asio::io_context* ctx, config_t* config)
+        : base_t(ctx, config),
+          // #754 share-download leg: the REAL sharereq writer (ltc
+          // node.hpp:162-170 parity) — packs the request through the
+          // message_sharereq wire codec and writes it to the chosen peer.
+          m_share_getter(ctx,
+            [](uint256 req_id, peer_ptr to_peer,
+               std::vector<uint256> hashes, uint64_t parents,
+               std::vector<uint256> stops)
+            {
+                auto rmsg = dash::message_sharereq::make_raw(
+                    req_id, hashes, parents, stops);
+                to_peer->write(std::move(rmsg));
+            },
+            15)  // p2pool p2p.py:80 — 15s timeout for share requests
+    {
+        // Seed addr store with hardcoded bootstrap peers.
+        m_addrs.load(config->pool()->m_bootstrap_addrs);
+        // Bootstrap seeds are whitelisted: permanent dial targets are immune
+        // to bans (btc is_banned whitelist-bypass parity).
+        for (const auto& seed : config->pool()->m_bootstrap_addrs) {
+            m_whitelist_ips.insert(seed.address());
+            m_whitelist_hosts.insert(seed);
+        }
+        // Randomise our nonce so we detect self-connections.
+        std::mt19937_64 rng(std::random_device{}());
+        m_nonce = rng();
+        // Route m_chain (used by BaseNode) at the tracker's main chain.
+        m_chain = &m_tracker.chain;
+    }
+
+    // ── Shutdown: drain the compute pools FIRST, before anything they touch ──
+    // (#1133 teardown-order fix.) m_verify_pool (X11 share_init_verify) and
+    // m_think_pool (the run_think/clean election, holding m_tracker_mutex
+    // EXCLUSIVELY) run tasks that lock m_tracker_mutex and read/write the
+    // m_think_running / m_clean_running / m_rethink_pending atomics + the
+    // tracker, snapshot and download/peer state. Every one of those members is
+    // declared AFTER the two pools, so under reverse-order member destruction it
+    // would be torn down while a pool thread still holds/reads it — destroying a
+    // std::shared_mutex another thread may lock is UB. Joining the pools here,
+    // and again from the destructor BODY (which runs before ANY member is
+    // destroyed), makes the hazard unreachable regardless of declaration order.
+    //
+    // Idempotent: stop()+join() on an already-joined pool is a no-op, so the
+    // main_dash explicit call (fault 2: join right after ioc.run() returns, so
+    // ~Node does not run after web_server/oracle_shadow/stratum_server unwind)
+    // and the ~NodeImpl belt-and-suspenders below can both run safely. Mirrors
+    // the main_dash rpc_pool stop()+join() shutdown idiom.
+    void join_compute_pools()
+    {
+        m_verify_pool.stop();
+        m_think_pool.stop();
+        m_verify_pool.join();
+        m_think_pool.join();
+    }
+
+    // Deterministic teardown order (#1133 fault 1): the destructor body runs
+    // before the members are destroyed, so joining the pools here guarantees no
+    // pool task is in flight when m_tracker_mutex / the think atomics / the
+    // tracker are destroyed — independent of where the pools are declared.
+    ~NodeImpl() override
+    {
+        join_compute_pools();
+    }
+
+    // INetwork: a pool node does not initiate disconnect; the reception slice
+    // overrides connected(). Slice A only needs disconnect() to satisfy the
+    // pure-virtual INetwork contract.
+    void disconnect() override { }
+
+    // ICommunicator: the message-dispatch entry point. Slice B wires the real
+    // version-handshake routing so handle_version() (and its live #646 gate) is
+    // actually reachable -- mirrors the pool::NodeBridge unknown-peer branch
+    // (src/pool/node.hpp). Full Legacy/Actual established-peer message dispatch
+    // (shares, txs, getaddrs) rides a later slice; until then, post-handshake
+    // messages are dropped. The handshake + min-protocol discrimination is live.
+    void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
+    {
+        // Guard: the peer may have been removed by a prior error/timeout while an
+        // async_read callback was still in-flight for the same socket.
+        if (!m_connections.contains(service))
+            return;
+        auto peer = m_connections[service];
+        peer->m_timeout->restart();
+
+        if (peer->type() == pool::PeerConnectionType::unknown)
+        {
+            // The first message from an unknown peer MUST be `version`.
+            if (rmsg->m_command.compare(0, 7, "version") != 0)
+                return error("expected version message", service);
+
+            std::optional<pool::PeerConnectionType> peer_type;
+            try {
+                peer_type = handle_version(std::move(rmsg), peer);
+            } catch (const std::exception& ex) {
+                error(ex.what(), service);
+                return;
+            }
+            if (!peer_type.has_value()) {
+                // self- or duplicate-connection: graceful close.
+                close_connection(service);
+                return;
+            }
+            peer->stable(*peer_type, PEER_TIMEOUT_TIME);
+            return;
+        }
+
+        // Established peer: full Legacy/Actual message dispatch rides a later
+        // slice; post-handshake messages are dropped for now.
+    }
+
+    // Keep-alive ping (reception's ping handler is live; the sender keeps the
+    // peer's timeout timer from firing on the remote side).
+    void send_ping(peer_ptr peer) override
+    {
+        auto rmsg = dash::message_ping::make_raw();
+        peer->write(std::move(rmsg));
+    }
+
+    // Run-loop mint slice (3/3): SEND our version on every new connection —
+    // without it a p2pool-dash peer times out waiting for our handshake and
+    // drops the link (reception alone cannot hold a session). Advertises
+    // advertised_best_share() so peers pull our chain (btc ROOT-2 parity).
+    // INLINE (not node.cpp): connected() is virtual, so its body must be
+    // visible to every TU that emits the NodeImpl vtable — the link-deferred
+    // KAT targets instantiate NodeImpl without the node.cpp TU.
+    // ── P2P ban check (btc node.cpp:2183-2196 port, inline for the vtable-
+    // complete KAT targets). Whitelisted permanent dial targets bypass bans.
+    bool is_whitelisted(const NetService& addr) const
+    {
+        return m_whitelist_ips.contains(addr.address())
+            || m_whitelist_hosts.contains(addr);
+    }
+    bool is_banned(const NetService& addr) const
+    {
+        if (is_whitelisted(addr)) return false;
+        const auto now = std::chrono::steady_clock::now();
+        auto it = m_ban_list.find(addr);
+        if (it != m_ban_list.end() && it->second > now) return true;
+        auto ip_it = m_ip_ban_list.find(addr.address());
+        if (ip_it != m_ip_ban_list.end() && ip_it->second > now) return true;
+        return false;
+    }
+    void set_ban_duration(int seconds) { m_ban_duration = std::chrono::seconds(seconds); }
+
+    void connected(std::shared_ptr<core::Socket> socket) override
+    {
+        // Reject banned peers (btc node.cpp:133-139).
+        if (is_banned(socket->get_addr()))
+        {
+            LOG_INFO << "[Pool] Rejecting connection from banned peer "
+                     << socket->get_addr().to_string();
+            socket->close();
+            return;
+        }
+
+        // Outbound lifecycle tracking (#754, ltc node.cpp:128-149): a dial we
+        // initiated graduates from pending to established.
+        const bool is_outbound = m_pending_outbound.erase(socket->get_addr()) > 0;
+
+        // BaseNode creates the peer + timeout timer; then OPEN the handshake.
+        // p2pool sends version from both sides on connectionMade — a silent
+        // side gets dropped by the remote's handshake timeout.
+        base_t::connected(socket);
+        auto it = m_connections.find(socket->get_addr());
+        if (it != m_connections.end())
+        {
+            if (is_outbound)
+                m_outbound_addrs.insert(socket->get_addr());
+            send_version(it->second);
+        }
+    }
+
+    // ── Disconnect cleanup (#754, ltc node.cpp:151-241 reduced) ─────────
+    // Cancel this peer's pending share requests (invokes their callbacks with
+    // an empty reply so the download gate releases the hashes immediately
+    // instead of waiting out the 15s ReplyMatcher timeout — p2pool p2p.py:595
+    // get_shares.respond_all on connectionLost), drop its stale nonce entry
+    // from m_peers (without this, reconnects are rejected as false
+    // duplicates), and clear the outbound tracking. INLINE (vtable bodies must
+    // stay link-free for the rig-free KAT targets).
+    using base_t::error;   // keep the error_code overload visible
+    void error(const message_error_type& err, const NetService& service,
+               const std::source_location where =
+                   std::source_location::current()) override
+    {
+        cancel_peer_share_requests(service);
+        for (auto it = m_peers.begin(); it != m_peers.end(); )
+        {
+            if (it->second && it->second->addr() == service)
+                it = m_peers.erase(it);
+            else
+                ++it;
+        }
+        m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
+        m_pending_outbound.erase(service);
+        m_outbound_addrs.erase(service);
+        publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
+        base_t::error(err, service, where);
+    }
+
+    void close_connection(const NetService& service) override
+    {
+        cancel_peer_share_requests(service);
+        m_pending_outbound.erase(service);
+        m_outbound_addrs.erase(service);
+        // base close may drop the peer from m_peers; refresh AFTER so the
+        // snapshot reflects the post-close map (IO thread).
+        base_t::close_connection(service);
+        publish_peer_info_snapshot();
+    }
+
+    void cancel_peer_share_requests(const NetService& service)
+    {
+        std::vector<uint256> to_cancel;
+        for (const auto& [req_id, peer_addr] : m_pending_share_reqs)
+        {
+            if (peer_addr == service)
+                to_cancel.push_back(req_id);
+        }
+        for (const auto& req_id : to_cancel)
+        {
+            m_pending_share_reqs.erase(req_id);
+            m_share_getter.cancel(req_id);  // fires callback with empty reply
+        }
+    }
+
+    void send_version(peer_ptr peer)
+    {
+        auto rmsg = dash::message_version::make_raw(
+            SharechainConfig::ADVERTISED_PROTOCOL_VERSION,  // advertise v36 capability (3600); >= ratchet target so ratcheted peers accept us. Legacy peers (floor 1700) accept any >=1700, so backward-compatible.
+            1,                                           // services
+            addr_t{1, peer->addr()},                     // addr_to (the remote)
+            addr_t{1, NetService{"0.0.0.0", SharechainConfig::p2p_port()}},  // addr_from
+            m_nonce,
+            std::string("c2pool"),
+            1,                                           // mode (always 1, legacy compat)
+            advertised_best_share());                    // head advert (raw pre-sync)
+        peer->write(std::move(rmsg));
+    }
+
+    /// Head advertised to peers: think()'s best when known, else the tallest
+    /// RAW chain head (btc ROOT-2: a pre-sync/genesis node must still let a
+    /// connecting peer learn it HAS a chain and pull it). Inline — reachable
+    /// from send_version() above.
+    uint256 advertised_best_share()
+    {
+        // Reader discipline (m_tracker_mutex contract above; ltc node.cpp
+        // readvertise_best_share parity): the heads/height walk below reads
+        // the chain containers, which the compute thread's think() mutates
+        // (verified.add / chain.remove → rehash) under the exclusive lock.
+        // Walking them unlocked is the join-burst GP-fault class. try_to_lock:
+        // the IO thread never blocks — busy ⇒ advertise the last published
+        // election (lock-free snapshot; null pre-sync, which a peer treats as
+        // "no advert" and later learns our head via broadcast/re-advert).
+        std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return snapshot_best_share();
+        if (!m_best_share_hash.IsNull())
+            return m_best_share_hash;
+        uint256 best;
+        int32_t best_height = -1;
+        for (const auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
+            const auto h = static_cast<int32_t>(m_tracker.chain.get_height(head_hash));
+            if (h > best_height) {
+                best = head_hash;
+                best_height = h;
+            }
+        }
+        return best;
+    }
+
+    // #646 min-protocol ratchet gate -- LIVE per-instance floor. Default-
+    // constructed it holds the oracle accept-all floor (1700), so at the default
+    // this gate is a no-op; the operator lifts min_version at G2-migration time
+    // and this reception then rejects any peer advertising a sub-floor protocol.
+    dash::MinProtocolGate m_min_protocol_gate;
+
+    // Slice B: real version-handshake reception. Mirrors the ltc::NodeImpl
+    // reference (src/impl/ltc/node.cpp:265) reconciled to DASH's header-only
+    // node and message set. Parses message_version, guards self- and duplicate
+    // connections, fires the #646 min-protocol discrimination, registers the
+    // peer, and returns the negotiated connection type. The share-download /
+    // getaddrs machinery LTC drives here is not yet present on the DASH node and
+    // rides a later slice; this reception is what flips G2 dual-pool from a
+    // dormant seam to a live cross-peer.
+    std::optional<pool::PeerConnectionType>
+    handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override
+    {
+        auto msg = dash::message_version::make(rmsg->m_data);
+
+        if (peer->m_other_version.has_value())
+            throw std::runtime_error("more than one version message");
+
+        peer->m_other_version = msg->m_version;
+        peer->m_other_subversion = msg->m_subversion;
+
+        // Self-connection guard: we dialled our own advertised nonce.
+        if (m_nonce == msg->m_nonce)
+            return std::nullopt;
+
+        // Duplicate-connection guard: already peered with this nonce.
+        if (m_peers.contains(msg->m_nonce))
+            return std::nullopt;
+
+        // #646 min-protocol ratchet -- LIVE discrimination. Throwing here makes
+        // the NodeBridge close the connection (pool/node.hpp handle()). The
+        // effective floor is the MAX of the operator knob (m_min_protocol_gate,
+        // IO-thread-owned) and the auto-ratchet floor (m_runtime_min_protocol_version,
+        // lifted 1700 -> 3600 on the compute thread by apply_min_protocol_ratchet).
+        // Reading the atomic here is race-free; at the cold default (both 1700) every
+        // real DASH peer is admitted (accept-all).
+        const uint32_t effective_floor = std::max(
+            m_min_protocol_gate.min_version,
+            m_runtime_min_protocol_version.load(std::memory_order_relaxed));
+        if (msg->m_version < effective_floor)
+            throw std::runtime_error("peer protocol below min-protocol floor");
+
+        peer->m_nonce = msg->m_nonce;
+        m_peers[peer->m_nonce] = peer;
+        m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
+        publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
+
+        // Ask the freshly-handshaked peer for addresses. Straight port of the
+        // LTC reference (src/impl/ltc/node.cpp:309, also dgb node.cpp:318 /
+        // bch node.cpp:316 / btc node.cpp:316); count=8 is exactly canonical
+        // (p2p.py:797 send_getaddrs(count=8)). DASH never sent this, so its
+        // AddrStore only ever held the configured --addnode/--connect seeds and
+        // the node had ZERO organic peer discovery. The reply lands in the
+        // existing HANDLER(addrs) -> got_addr() path, which is already bounded
+        // (pool/node.hpp got_addr caps the store at 10000). Discovery only; no
+        // consensus/mint state touched.
+        peer->write(dash::message_getaddrs::make_raw(8));
+
+        // #882 — ORIGINATE addrme. Canonical p2p.py:109-134 sendAdvertisement():
+        // a listening node with no configured external IP asks the peer to
+        // advertise back what IT believes our address to be, carrying our listen
+        // port as the only thing the peer cannot observe for itself. Port of the
+        // ltc reference (src/impl/ltc/node.cpp:343-348; btc node.cpp:344-348,
+        // bch node.cpp:342-346, dgb node.cpp:349-353). DASH registered the
+        // handler on both generations (node.hpp:1272 Legacy / 1291 Actual) but
+        // nothing in the lane ever WROTE one, so a DASH peer could only ever
+        // learn our listen port second-hand from someone else's addrs gossip.
+        // Discovery only; no consensus/mint state touched.
+        //
+        // GUARDED, unlike the ltc/btc port. Canonical gates the whole
+        // advertisement on `if self.node.serverfactory.listen_port is not None`
+        // (p2p.py:110), and DASH has a real non-listening mode: `--connect`
+        // without `--listen` suppresses the inbound listener
+        // (src/c2pool/main_dash.cpp:566). core::Server::listen_port() reads
+        // m_acceptor->local_endpoint() unconditionally, which throws on an
+        // acceptor that was never opened — and a throw out of handle_version
+        // makes the bridge drop the connection, so an unguarded read would break
+        // --connect mode outright. listen_port_or_none() is canonical's
+        // `is not None` test; when we are not listening we advertise nothing,
+        // exactly as canonical does.
+        if (auto our_listen_port = core::Server::listen_port_or_none())
+            peer->write(dash::message_addrme::make_raw(*our_listen_port));
+
+        // Canonical p2p.py:276 — one FULL have_tx as soon as the handshake
+        // completes, so the peer's view of our tx pool starts correct (and its
+        // dashboard stops showing us as txpool = 0). Subsequent sweeps send
+        // deltas only. Advert-only; no consensus/mint state touched.
+        //
+        // ORDERING IS LOAD-BEARING: this is the LARGEST write the handshake
+        // issues (up to TX_ADVERT_MAX_HASHES_PER_MESSAGE hashes, ~32 KB) and it
+        // goes LAST. core::Socket::write starts a composed async_write with no
+        // outbound queue (core/socket.cpp:110-137), so initiating another write
+        // while one is still draining interleaves bytes mid-message and gets us
+        // dropped on a bad checksum. Going last means NOTHING follows it in this
+        // handler; the ~32 KB advert may well take several write_some rounds,
+        // which is harmless precisely because nothing else is queued behind it,
+        // and the per-peer min-emit interval keeps the next timer sweep from
+        // landing on top of it. See core/tx_advertiser.hpp.
+        advertise_known_txs(peer);
+
+        // #950: seed this freshly-connected peer's STANDING remembered set
+        // (canonical p2p.py:269). A peer's "txpool" for us (web.py:673
+        // remembered_txs_size) is fed ONLY by remember_tx bodies; c2pool
+        // emitted none outside the transient sendShares bracket, so every
+        // peer showed txpool == 0 (#950). Post-#863 the socket write queue
+        // drains composed writes in strict submission order
+        // (core/socket.cpp:110-145), so this no longer risks the mid-message
+        // interleave the comment above warns of — it is safely queued after
+        // the have_tx advert. Bounded by MAX_REMEMBERED_TXS_SIZE so a
+        // canonical peer never disconnects us on overflow (p2p.py:488).
+        send_standing_remember(peer);
+
+        // #754 join trigger (oracle p2p.py handle_version → node.py
+        // handle_share_hashes): a peer advertising a best share we don't have
+        // is THE download entry point for an empty node joining an
+        // established chain. QUEUED, not called directly — download_shares
+        // lives in node.cpp and this inline vtable body must stay link-free
+        // for the rig-free KAT targets; run_think()'s IO phase and the
+        // 2s advert timer (start_outbound_connections) drain the queue.
+        if (!msg->m_best_share.IsNull())
+        {
+            // contains() reads the chain map — take the shared lock
+            // (try_to_lock, IO thread never blocks; the check is log-only,
+            // the advert is queued either way and the drain re-checks under
+            // its own lock).
+            bool known = false;
+            {
+                std::shared_lock<std::shared_mutex> lk(m_tracker_mutex,
+                                                       std::try_to_lock);
+                known = lk.owns_lock() && m_chain->contains(msg->m_best_share);
+            }
+            LOG_INFO << "[Pool] Peer " << peer->addr().to_string()
+                     << " advertises best share "
+                     << msg->m_best_share.ToString().substr(0, 16)
+                     << (known ? " (known)" : " (unknown — queued for download)");
+            m_peer_best_adverts.emplace_back(peer, msg->m_best_share);
+        }
+
+        // Legacy/actual split for the G2 dual-pool: only once the operator has
+        // ratcheted the floor above the oracle baseline do at-or-above-floor
+        // peers negotiate the actual (v36) protocol; otherwise legacy (parity
+        // with the ltc reference, which returns legacy unconditionally).
+        const bool ratcheted =
+            effective_floor > SharechainConfig::MINIMUM_PROTOCOL_VERSION;
+        return (ratcheted && msg->m_version >= effective_floor)
+                   ? pool::PeerConnectionType::actual
+                   : pool::PeerConnectionType::legacy;
+    }
+
+    // ── Reception-slice (B) dispatch surface ───────────────────
+    // Declarations consumed by the Legacy/Actual protocol handlers
+    // (protocol_legacy.cpp / protocol_actual.cpp). The bodies of
+    // processing_shares() and handle_get_share() live in the node.cpp
+    // translation unit (slice .4) and are intentionally link-deferred here;
+    // the dispatch layer object-compiles against these declarations.
+    void processing_shares(HandleSharesData& data, NetService addr);
+    std::vector<dash::ShareType> handle_get_share(std::vector<uint256> hashes,
+        uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
+
+    // Slice .4 helper: io_context-thread tracker insertion for a phase-1-
+    // verified batch (non-blocking lock; defers to m_pending_adds if the
+    // compute thread holds the exclusive lock). Body in node.cpp.
+    void add_verified_shares(HandleSharesData& data, NetService addr);
+
+    // ── Run-loop mint slice (3/3) surface — bodies in node.cpp ──────────
+    // Ports of the btc::NodeImpl prod reference (src/impl/btc/node.cpp),
+    // reconciled to the DASH pool-node. These make --run actually MINT:
+    // stratum ShareAccept -> add_local_share -> broadcast_share, with think()
+    // electing the best share the next job builds on.
+
+    /// Open the LevelDB sharechain store for `net_name`, wire the verified-
+    /// hash persistence + removal hooks, and load persisted shares into the
+    /// tracker. Call ONCE from the run-loop before serving work.
+    void init_storage(const std::string& net_name);
+    void load_persisted_shares();
+    /// Serialize one share into a LevelDB batch entry ([8B ver][contents]).
+    void collect_share_batch_entry(ShareType& share,
+        std::vector<c2pool::storage::SharechainStorage::ShareBatchEntry>& out);
+    void flush_verified_to_leveldb();
+    /// Flush pending persistence buffers (call at shutdown).
+    void shutdown_persistence();
+
+    /// Async best-chain selection: post tracker.think() to the compute
+    /// thread (exclusive lock), publish m_best_share_hash + snapshot, then
+    /// IO-phase: drain deferred share batches, fire on_best_share_changed,
+    /// re-broadcast the new head. Serialized via m_think_running.
+    void run_think();
+    void drain_pending_adds();
+
+    /// v36 accept-floor AutoRatchet — runtime wiring of the pure decision in
+    /// auto_ratchet.hpp (mirrors dgb::NodeImpl::apply_min_protocol_ratchet, the
+    /// three best-share-advance call sites in src/impl/dgb/node.cpp). Over the
+    /// [CHAIN_LENGTH*9/10 .. CHAIN_LENGTH] window behind the best share's parent
+    /// — the SAME window the 60% successor gate reads — lift the P2P accept floor
+    /// 1700 -> 3600 once >= 95% of the work-weighted desired-version tally desires
+    /// v36. Latched (never lowers), full-window-guarded (never lifts on a partial
+    /// window), and DASH-specific keyed on the best share's m_desired_version (DASH
+    /// has no v36 share TYPE — the vote carries v36-ness). MUST be called under the
+    /// exclusive m_tracker_mutex. Body in node.cpp.
+    void apply_min_protocol_ratchet();
+
+    /// Periodic maintenance (btc node.cpp:1878-2173 / p2pool node.py:355-402
+    /// clean_tracker port): think + eat stale heads + drop tails beyond
+    /// 2*CHAIN_LENGTH+10 + LevelDB prune flush, all on the compute thread
+    /// under the exclusive lock. Body in node.cpp; scheduled by the run
+    /// loop's periodic tick. Without it the raw chain grows unbounded.
+    void clean_tracker();
+
+    /// Verified-work-first best share (mint_runloop.hpp elect_best_share
+    /// policy — btc parity). ZERO with peers but no verified chain (never
+    /// mint on an unverified foreign chain); raw-head bootstrap on genesis.
+    /// (advertised_best_share — the peer-facing raw-head variant — is inline
+    /// above, next to send_version.)
+    uint256 best_share_hash();
+
+    /// Rebuild the lock-free peer-info snapshot. IO-THREAD ONLY (reads the
+    /// IO-owned m_peers / m_outbound_addrs). Called at every peer add/remove
+    /// and on the 2s advert-timer tick. Publishes under m_snapshot_mutex so
+    /// the HTTP reader (get_peer_info_json) never touches the live maps.
+    void publish_peer_info_snapshot() {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& [nonce, peer] : m_peers) {
+            if (!peer) continue;
+            auto addr = peer->addr();
+            bool incoming = (m_outbound_addrs.find(addr) == m_outbound_addrs.end());
+            auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - peer->m_connected_at).count();
+            arr.push_back({
+                {"address", addr.to_string()},
+                {"version", peer->m_other_subversion},
+                {"incoming", incoming},
+                {"uptime", uptime_sec},
+                {"downtime", 0},
+                {"web_port", 0}
+            });
+        }
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        m_peer_info_snapshot = std::move(arr);
+    }
+
+    /// Pool-peer info for the dashboard node-status card (ltc node.hpp:302
+    /// parity). Display only — MiningInterface::set_peer_info_fn feeds
+    /// /local_stats {peers:{incoming,outgoing}} and the peer table. Reachable
+    /// from the WebServer HTTP thread, so it returns the IO-thread-published
+    /// snapshot lock-free — it must NEVER iterate the live m_peers map (that
+    /// races the IO thread's insert/erase → freed-memory GP-fault).
+    nlohmann::json get_peer_info_json() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_peer_info_snapshot;
+    }
+
+    /// Relay a share (and up to 4 un-broadcast ancestors) to all peers via
+    /// the message_shares wire codec (+ remember_tx/forget_tx for txs the
+    /// peer lacks). try_to_lock; deferred if the compute thread is busy.
+    void broadcast_share(const uint256& share_hash);
+    /// Returns the hashes actually SENT to `peer` (those passing the tx-
+    /// completeness gate); broadcast_share marks only these as shared (F2).
+    std::vector<uint256> send_shares(peer_ptr peer,
+                                     const std::vector<uint256>& share_hashes);
+
+    /// Insert a locally-minted, ALREADY self-verified share into the tracker
+    /// (+ LevelDB persist + attempt_verify), then broadcast + run_think.
+    /// Returns the share hash, or ZERO when the tracker lock is busy or the
+    /// share is a duplicate (fail-closed: caller declines the mint).
+    ///
+    /// #889 `block_winning`: true ONLY when this solve already cleared the COIN
+    /// BLOCK target. That share is unrepeatable — there is no next solve — and a
+    /// share that is never minted is also a block no p2pool peer can ever see
+    /// (they detect pool blocks through the sharechain, not through a block
+    /// announcement). It therefore takes a BOUNDED WAIT on the exclusive lock
+    /// instead of the single try. false (the default) is the ordinary share
+    /// path: byte-for-byte today's `try_to_lock` decline, deliberately unchanged.
+    ///
+    /// CALLER CONTRACT (#878/#881): a `block_winning` caller MUST hold no
+    /// tracker lock. The block-arm caller (main_dash.cpp's mint lambda, reached
+    /// from the stratum handler) holds zero locks; the compute thread is guarded
+    /// against explicitly inside.
+    uint256 add_local_share(ShareType share, bool block_winning = false);
+
+    /// #889 observability: block-winning mints lost because the bounded wait on
+    /// the tracker expired. MUST stay 0 in production — every increment is one
+    /// won block that is invisible to the whole p2pool network. Each one also
+    /// emits a LOG_ERROR; this counter is what makes it aggregatable instead of
+    /// a line someone has to notice.
+    uint64_t block_share_lock_forfeits() const {
+        return m_block_share_lock_forfeits.load(std::memory_order_relaxed);
+    }
+
+    /// Register the current template's txs in m_known_txs so send_shares can
+    /// serve remember_tx for a minted share's new_transaction_hashes. The
+    /// previous template's leftovers are dropped (bounded by one template).
+    void register_template_txs(const std::vector<coin::Transaction>& txs,
+                               const std::vector<uint256>& hashes);
+
+    void set_on_best_share_changed(std::function<void()> fn) { m_on_best_share_changed = std::move(fn); }
+    void set_block_rel_height_fn(std::function<int32_t(uint256)> fn) { m_block_rel_height_fn = std::move(fn); }
+
+    // ── #754 share-download leg surface ─────────────────────────────────
+
+    /// Async share download: register the reply callback + dispatch the
+    /// sharereq through the ctor's writer (ltc node.hpp:275-281 parity).
+    void request_shares(uint256 id, peer_ptr peer,
+                        std::vector<uint256> hashes, uint64_t parents,
+                        std::vector<uint256> stops,
+                        std::function<void(dash::ShareReplyData)> callback)
+    {
+        m_share_getter.request(id, callback, id, peer, hashes, parents, stops);
+    }
+
+    /// Request `target_hash` (+ a random 0..499-parent chunk, stops-bounded)
+    /// from a peer; on reply, feed the shares into processing_shares and
+    /// continue backfilling from the oldest parent. Body in node.cpp (ltc
+    /// node.cpp:968-1105 port).
+    void download_shares(peer_ptr peer, const uint256& target_hash);
+
+    /// Drain the handle_version best-share advert queue into
+    /// download_shares (unknown) / run_think (known). Body in node.cpp.
+    void drain_peer_best_adverts();
+
+    /// Dial outbound peers from the AddrStore (--addnode/--connect seeds) and
+    /// start the 30s dial-maintenance + 2s advert-drain timers. Call once
+    /// from the run loop after listen(). Body in node.cpp (ltc
+    /// node.cpp:1289-1327 port).
+    void start_outbound_connections();
+
+    // ── have_tx / losing_tx advertisement (SEND side) ─────────────────────
+    // c2pool was RECEIVE-ONLY for the p2pool tx-pool advertisement: the
+    // protocol handlers ingest a peer's have_tx/losing_tx into
+    // Peer::m_remote_txs, but we never advertised our OWN known-tx set. Every
+    // canonical p2pool dashboard therefore rendered this node with txpool = 0
+    // (real p2pool peers report 12k-16k), and peers could not tell which txs we
+    // already hold, so remember_tx forwarded whole tx bodies needlessly.
+    //
+    // Canonical (p2pool python, p2pool/p2p.py): ONE full have_tx immediately
+    // after the version handshake (p2p.py:276), then pure deltas off the
+    // known_txs_var change events — added -> send_have_tx (p2p.py:243-248),
+    // removed -> send_losing_tx (p2p.py:250-259), transitioned -> both in that
+    // order (p2p.py:261-274). c2pool has no reactive variable, so
+    // Peer::m_tx_advert reconstructs the per-peer view and each sweep emits the
+    // diff; the sweep cadence mirrors node.py:298's 10s forget_old_txs loop.
+    // See core/tx_advertiser.hpp for the full derivation and the wire bound.
+    //
+    // Header-inline on purpose: the DASH handle_version vtable body must stay
+    // link-free for the rig-free KAT targets, and this touches only
+    // header-only message types plus peer->write.
+    //
+    // REWARD-SAFETY: tx hashes only. No consensus, share validation, subsidy,
+    // coinbase, payee or won-block state is read or written here.
+    void advertise_known_txs(peer_ptr only_peer = nullptr)
+    {
+        // THREAD-CONFINEMENT INVARIANT: every m_known_txs mutator in the DASH
+        // lane runs on the IO thread — the two remember_tx ingests
+        // (protocol_actual.cpp:263, protocol_legacy.cpp:299) and
+        // register_template_txs() -> dash::retain_template_txs(). Unlike the
+        // LTC/DGB/BCH/BTC lanes there is NO compute-thread evictor here:
+        // prune_shares() / core::evict_known_txs_to_cap do not exist in this
+        // lane. This sweep is also IO-thread, so the map is same-thread-safe.
+        //
+        // The shared try-lock below is therefore DEFENSIVE, not load-bearing for
+        // m_known_txs: it keeps this reader inside the established #828
+        // discipline for anything tracker-adjacent, and it is what a future
+        // compute-thread evictor would need. Do NOT read it as evidence that one
+        // exists — if you add one, this lock becomes required, not optional.
+        // try_to_lock, never block: if the compute thread is mid-cycle we skip
+        // and the next sweep carries the identical delta 10 s later.
+        std::set<uint256> current;
+        {
+            std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
+            if (!lk.owns_lock())
+                return;
+            for (const auto& entry : m_known_txs)
+                current.insert(entry.first);
+        }
+
+        // /p2p_stats gauge: the SEND-side truth behind a peer dashboard showing
+        // TXPOOL=0 for us. If this reads 0 our pool really is empty; if it
+        // reads non-zero while peers still show 0, the advert is the problem,
+        // not the pool. (DASH has no m_known_txs_order recency deque — the
+        // sidecar stays at its -1 "not present in this lane" sentinel.)
+        core::obs::p2p_stats().known_txs_size.store(
+            current.size(), std::memory_order_relaxed);
+        core::obs::p2p_stats().known_txs_updated_at.store(
+            static_cast<std::int64_t>(core::timestamp()), std::memory_order_relaxed);
+
+        // One clock reading for the whole sweep: run_tx_advert uses it both to
+        // apply the per-peer min-emit interval (never two writes in flight on
+        // one socket) and to stamp the peer after a send. IO-thread-local, so
+        // Peer::m_tx_advert needs no locking.
+        const auto now = std::chrono::steady_clock::now();
+
+        auto advertise_one = [&current, now](const peer_ptr& p)
+        {
+            if (!p)
+                return;
+            core::run_tx_advert(
+                p->m_tx_advert, current,
+                [&p](const std::vector<uint256>& hashes)
+                {
+                    // /p2p_stats: size of the LAST have_tx advert actually put
+                    // on the wire, plus how many we have emitted. A pool with
+                    // known_txs_size > 0 but have_tx_adverts_sent == 0 is a
+                    // suppressed advert; both zero is a genuinely empty pool.
+                    auto& stats = core::obs::p2p_stats();
+                    stats.last_have_tx_advert_size.store(hashes.size(), std::memory_order_relaxed);
+                    stats.have_tx_adverts_sent.fetch_add(1, std::memory_order_relaxed);
+                    p->write(dash::message_have_tx::make_raw(hashes));
+                },
+                [&p](const std::vector<uint256>& hashes)
+                {
+                    core::obs::p2p_stats().last_losing_tx_advert_size.store(
+                        hashes.size(), std::memory_order_relaxed);
+                    p->write(dash::message_losing_tx::make_raw(hashes));
+                },
+                core::TX_ADVERT_MAX_HASHES_PER_MESSAGE, now);
+        };
+
+        if (only_peer)
+        {
+            advertise_one(only_peer);
+            return;
+        }
+        // m_peers is IO-thread-owned and mutated only on this thread
+        // (handle_version insert / error() erase), so plain iteration is safe.
+        for (auto& entry : m_peers)
+            advertise_one(entry.second);
+    }
+
+    /// #950: seed a freshly-connected peer's STANDING remembered set with the
+    /// txs we already hold, bounded by MAX_REMEMBERED_TXS_SIZE (canonical
+    /// p2p.py:269, :30/:488). IO-THREAD ONLY (handle_version handler): reads
+    /// IO-confined m_known_txs, same discipline as advertise_known_txs.
+    /// Defined in node.cpp because it serializes tx bytes (pack /
+    /// TX_WITH_WITNESS) to size the per-peer cap.
+    void send_standing_remember(const peer_ptr& peer);
+
+    /// Broadcast a new best-block notification to every connected pool peer.
+    /// Straight port of the LTC reference (src/impl/ltc/node.hpp:316-320; same
+    /// body in dgb node.hpp:339 / btc node.hpp:320 / bch node.hpp:562), which
+    /// DASH lacked entirely. Canonical trigger is node.py:137-140
+    /// (`best_block_header.changed` -> `peer.send_bestblock(header=header)` for
+    /// every peer), i.e. one message per NEW COIN TIP — on DASH that is ~1 per
+    /// 2.5 min, and the caller (main_dash.cpp) fires it only through the
+    /// already-deduped tip-notify path, so a poll+ZMQ double-observation of the
+    /// same block cannot double-send.
+    ///
+    /// The peer-side HANDLER(bestblock) deliberately does NOT relay
+    /// (protocol_actual.cpp:197), so this cannot amplify across the network.
+    ///
+    /// IO-THREAD ONLY (reads the IO-owned m_peers). Advert-only: no consensus,
+    /// share validation, subsidy, coinbase, payee or won-block state.
+    void broadcast_bestblock(const coin::BlockHeaderType& header)
+    {
+        for (auto& entry : m_peers)
+            if (entry.second)
+                entry.second->write(dash::message_bestblock::make_raw(header));
+    }
+
+    /// Periodic address-discovery sweep. Canonical p2p.py:794-799 (Node._think,
+    /// driven by deferral.run_repeatedly): when the addr store is below
+    /// `preferred_storage` (p2p.py:759 default 1000) and we have any peers, ask
+    /// ONE randomly chosen peer for 8 addresses. Canonical re-arms with
+    /// random.expovariate(1/20) (mean 20 s); core::Timer has no exponential
+    /// jitter, so we use a flat 20 s — same mean, strictly bounded tail.
+    ///
+    /// This is the only piece here with no existing c2pool precedent (LTC/DGB/
+    /// BCH/BTC send getaddrs on handshake only), so it is deliberately the most
+    /// conservative shape possible: one 4-byte request per 20 s to one peer,
+    /// and it stops entirely once the store reaches 1000 entries. Discovery
+    /// only; no consensus/mint state.
+    void getaddrs_sweep()
+    {
+        if (m_peers.empty())
+            return;
+        if (m_addrs.len() >= PREFERRED_ADDR_STORAGE)
+            return; // canonical `len(self.addr_store) < self.preferred_storage`
+        auto it = m_peers.begin();
+        std::advance(it, core::random::random_int(0, static_cast<int>(m_peers.size())));
+        if (it != m_peers.end() && it->second)
+            it->second->write(dash::message_getaddrs::make_raw(8));
+    }
+
+    void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
+    void set_max_peers(size_t count) { m_max_peers = count; }
+
+    // Completes a pending async share request when a sharereply arrives.
+    // Inline (mirrors dgb) so the reply-matcher plumbing needs no node.cpp.
+    void got_share_reply(uint256 id, dash::ShareReplyData shares)
+    {
+        try { m_share_getter.got_response(id, shares); }
+        catch (const std::invalid_argument&) { /* request already timed out */ }
+    }
+
+    // Register a callback fired when a bestblock message is received from a
+    // pool peer. Currently UNCALLED on the DASH lane by design — see the
+    // m_on_bestblock declaration for why, and for the dedup-poisoning hazard
+    // that must be handled before anything is wired here.
+    void set_on_bestblock(std::function<void(const uint256&)> fn) { m_on_bestblock = std::move(fn); }
+
+    // ── Tracker accessors ───────────────────────────────────────────────
+
+    /// Direct tracker access — compute-thread-only (already holds the exclusive
+    /// lock) or startup code (before the compute thread exists). IO-thread code
+    /// MUST use read_tracker() instead.
+    ShareTracker& tracker() { return m_tracker; }
+
+    /// RAII guard for IO-thread tracker reads.
+    /// - IO thread:      acquires shared_lock(try_to_lock); falsy if busy.
+    /// - Compute thread: skips locking (exclusive already held); always truthy.
+    ///
+    /// #889: an optional `urgency` selects a BOUNDED WAIT instead of the single
+    /// try. It defaults to Opportunistic, so every existing call site keeps
+    /// today's exact non-blocking behaviour; only the block-winning mint (which
+    /// has no "next solve" to fall back on) passes BlockWinning.
+    class TrackerReadGuard {
+        std::shared_lock<std::shared_mutex> lock_;
+        ShareTracker& tracker_;
+        bool ok_;
+    public:
+        TrackerReadGuard(std::shared_mutex& mtx, ShareTracker& t, bool on_compute,
+                         tracker_acquire::Urgency urgency =
+                             tracker_acquire::Urgency::Opportunistic)
+            : lock_(mtx, std::defer_lock), tracker_(t)
+        {
+            if (on_compute) {
+                ok_ = true;                      // exclusive lock already held
+            } else if (urgency == tracker_acquire::Urgency::Opportunistic) {
+                ok_ = lock_.try_lock();          // unchanged: single try, skip if busy
+            } else {
+                lock_ = tracker_acquire::shared(mtx, urgency, /*on_compute=*/false);
+                ok_ = lock_.owns_lock();
+            }
+        }
+        TrackerReadGuard(TrackerReadGuard&&) = default;
+        TrackerReadGuard(const TrackerReadGuard&) = delete;
+        TrackerReadGuard& operator=(const TrackerReadGuard&) = delete;
+        TrackerReadGuard& operator=(TrackerReadGuard&&) = default;
+
+        explicit operator bool() const { return ok_; }
+        ShareTracker& operator*()  { return tracker_; }
+        ShareTracker* operator->() { return &tracker_; }
+    };
+
+    /// True if the calling thread is the compute thread (m_think_pool).
+    bool is_compute_thread() const {
+        return std::this_thread::get_id() == m_compute_thread_id.load(std::memory_order_relaxed);
+    }
+
+    /// Preferred tracker accessor for IO-thread callbacks. On the IO thread it
+    /// acquires shared_lock(try_to_lock) (check `if (!guard)`); on the compute
+    /// thread it skips locking (exclusive already held).
+    ///
+    /// #889: pass tracker_acquire::Urgency::BlockWinning ONLY from a solve that
+    /// already cleared the BLOCK target, and ONLY from a caller holding zero
+    /// locks (#878/#881). Everything else keeps the default, i.e. no change.
+    TrackerReadGuard read_tracker(tracker_acquire::Urgency urgency =
+                                      tracker_acquire::Urgency::Opportunistic) {
+        return TrackerReadGuard(m_tracker_mutex, m_tracker, is_compute_thread(),
+                                urgency);
+    }
+
+    /// Acquire shared (reader) lock on the tracker mutex — BLOCKING. Only for
+    /// consensus-critical paths (share creation) where skipping is unacceptable.
+    std::shared_lock<std::shared_mutex> tracker_shared_lock() {
+        return std::shared_lock<std::shared_mutex>(m_tracker_mutex);
+    }
+
+    /// Expose the tracker mutex for IO-thread callbacks. Callers MUST use
+    /// shared_lock(try_to_lock) — NEVER a blocking lock().
+    std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
+
+    // Embedded coin-state accessors (S8 embedded_gbt live-wire).
+    /// The node-held embedded coin-state bundle (MN list + mempool + tip).
+    coin::NodeCoinState&       coin_state()       { return m_coin_state; }
+    const coin::NodeCoinState& coin_state() const { return m_coin_state; }
+
+    /// The maintainer the reception/think slices drive as their updates land
+    /// (on_mn_list_update / on_mempool_tx / on_new_tip / on_block_connected /
+    /// on_invalidate). It republishes m_coin_state only once both a tip and a
+    /// non-empty MN list are present.
+    coin::CoinStateMaintainer& coin_state_maintainer() { return m_coin_state_maintainer; }
+
+    /// Live get_work entry point: prefer the locally-assembled embedded
+    /// template when the node-held bundle is populated, else the supplied
+    /// dashd getblocktemplate fallback (REQUIRED -- always-reachable safety
+    /// path + [GBT-XCHECK] cross-check). One-liner over NodeCoinState so the
+    /// node call site (main_dash run path) is select_work(fallback).
+    coin::WorkSelection select_work(
+        const std::function<coin::DashWorkData()>& dashd_fallback)
+    {
+        return m_coin_state.select_work(dashd_fallback);
+    }
+
+    // ── Lock-free snapshot getters ──────────────────────────────────────
+    // Inline (defined in this header) since slice A has no node.cpp. Never
+    // fail, never need the tracker lock.
+    TrackerSnapshot get_tracker_snapshot() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot;
+    }
+    int get_chain_count() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot.chain_count;
+    }
+    int get_verified_count() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot.verified_count;
+    }
+    /// Last published best-share election (compute thread publishes under the
+    /// exclusive tracker lock). The busy-fallback for best_share_hash() /
+    /// advertised_best_share() — a torn/unlocked m_best_share_hash read is
+    /// never taken.
+    uint256 snapshot_best_share() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot.best_share;
+    }
+};
+
+// ── Sharechain-p2p dispatch layer (slice S8-p2p.2) ──────────────────
+// Namespace-only port of the dgb reference (src/impl/dgb/node.hpp:647). The
+// version-handshake reception rides NodeImpl::handle_version above; the two
+// established-peer protocols below dispatch the 12 post-handshake messages.
+// Both Legacy and Actual register the identical handler set; the divergence
+// between them lives in the handler BODIES (protocol_legacy.cpp vs
+// protocol_actual.cpp), byte-parity with dgb. handle_message() bodies + the
+// 12 HANDLER() bodies are defined in those two .cpp translation units.
+
+class Legacy : public pool::Protocol<NodeImpl>
+{
+public:
+    void handle_message(std::unique_ptr<RawMessage> rmsg, NodeImpl::peer_ptr peer) override;
+
+    ADD_HANDLER(addrs, dash::message_addrs);
+    ADD_HANDLER(addrme, dash::message_addrme);
+    ADD_HANDLER(ping, dash::message_ping);
+    ADD_HANDLER(getaddrs, dash::message_getaddrs);
+    ADD_HANDLER(shares, dash::message_shares);
+    ADD_HANDLER(sharereq, dash::message_sharereq);
+    ADD_HANDLER(sharereply, dash::message_sharereply);
+    ADD_HANDLER(bestblock, dash::message_bestblock);
+    ADD_HANDLER(have_tx, dash::message_have_tx);
+    ADD_HANDLER(losing_tx, dash::message_losing_tx);
+    ADD_HANDLER(remember_tx, dash::message_remember_tx);
+    ADD_HANDLER(forget_tx, dash::message_forget_tx);
+};
+
+class Actual : public pool::Protocol<NodeImpl>
+{
+public:
+    void handle_message(std::unique_ptr<RawMessage> rmsg, NodeImpl::peer_ptr peer) override;
+
+    ADD_HANDLER(addrs, dash::message_addrs);
+    ADD_HANDLER(addrme, dash::message_addrme);
+    ADD_HANDLER(ping, dash::message_ping);
+    ADD_HANDLER(getaddrs, dash::message_getaddrs);
+    ADD_HANDLER(shares, dash::message_shares);
+    ADD_HANDLER(sharereq, dash::message_sharereq);
+    ADD_HANDLER(sharereply, dash::message_sharereply);
+    ADD_HANDLER(bestblock, dash::message_bestblock);
+    ADD_HANDLER(have_tx, dash::message_have_tx);
+    ADD_HANDLER(losing_tx, dash::message_losing_tx);
+    ADD_HANDLER(remember_tx, dash::message_remember_tx);
+    ADD_HANDLER(forget_tx, dash::message_forget_tx);
+};
+
+using Node = pool::NodeBridge<NodeImpl, Legacy, Actual>;
+
+} // namespace dash

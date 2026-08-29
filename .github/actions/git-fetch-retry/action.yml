@@ -1,0 +1,37 @@
+name: "git-fetch-retry"
+description: "Resilient git fetch/unshallow: pins HTTP/1.1 and retries with bounded exponential backoff. Guards against intermittent self-hosted egress faults (curl 56 Recv failure / curl 92 HTTP/2 stream CANCEL) seen during actions/checkout --unshallow on c2pool-linux-198-*."
+inputs:
+  args:
+    description: "Arguments passed verbatim to 'git fetch' (e.g. '--unshallow', 'origin master')."
+    required: false
+    default: "--unshallow"
+  retries:
+    description: "Maximum attempts before the step fails."
+    required: false
+    default: "3"
+  initial-delay:
+    description: "Seconds to wait before the first retry; doubles each attempt."
+    required: false
+    default: "5"
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      run: |
+        set -uo pipefail
+        # Belt-and-suspenders: also pin at job scope in case a runner lost the global config.
+        git config --global http.version HTTP/1.1
+        git config --global http.postBuffer 524288000
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 20
+        n=0; max="${{ inputs.retries }}"; delay="${{ inputs.initial-delay }}"
+        until git fetch ${{ inputs.args }}; do
+          n=$((n+1))
+          if [ "$n" -ge "$max" ]; then
+            echo "::error::git fetch ${{ inputs.args }} failed after ${max} attempts"
+            exit 1
+          fi
+          echo "::warning::git fetch attempt ${n}/${max} failed (transient egress); retrying in ${delay}s"
+          sleep "${delay}"
+          delay=$((delay*2))
+        done

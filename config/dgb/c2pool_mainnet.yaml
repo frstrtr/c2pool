@@ -1,0 +1,32 @@
+# C2Pool DigiByte [DGB] Mainnet Configuration
+#
+# Zero-config startup: run ./start.sh (Linux/macOS) or start.bat (Windows).
+# Miners set their payout address as the stratum username (p2pool-style).
+# CLI arguments always override values set here.
+
+# --- Network -----------------------------------------------------------------
+port: 5024                    # p2pool sharechain P2P port (DGB mainnet default)
+stratum_port: 5025            # Stratum mining port
+web_port: 8080                 # Web dashboard / JSON-RPC API port
+http_host: "0.0.0.0"           # HTTP bind address
+# external_ip: ""              # Public IP/domain for stratum URL display
+#
+# Port forwarding (if behind NAT/firewall):
+#   5024 TCP  — P2P sharechain (REQUIRED for full p2pool participation)
+#   5025 TCP  — Stratum mining (REQUIRED for miners to connect)
+#   12024 TCP  — DGB coin P2P (recommended for faster daemon sync)
+
+# --- Operating mode ----------------------------------------------------------
+# Deployment: DigiByte daemon RPC. Run digibyted and set the dgb_rpc_*
+# fields below. See `./c2pool-dgb --help` for algo/mode options.
+
+# --- Bootstrap header checkpoint (optional) ----------------------------------
+# Skip old headers on first sync.  Format: HEIGHT:BLOCK_HASH
+# header_checkpoint: "HEIGHT:BLOCK_HASH"   # set for faster first sync
+
+# --- Coin daemon RPC (for non-embedded / daemon mode) ------------------------
+# dgb_rpc_host: 127.0.0.1
+# dgb_rpc_port:                # your DGB daemon's RPC port
+# dgb_rpc_user: user
+# dgb_rpc_password: pass
+

@@ -1,0 +1,47 @@
+name: libmrr Go tests
+
+# Truth-in-CI guard for prototypes/libmrr (issue #1076).
+#
+# prototypes/libmrr is a Go module whose test suite no workflow builds or
+# runs, so a PR touching only that module renders evaluate + attribution-gate
+# and reports CLEAN without compiling a line of Go or executing a single
+# golden. tools/ci/check_test_target_allowlist.py is structurally blind to it
+# (a Go module has no CMake --target). This job runs go test ./... scoped to
+# the module so a green check means the tests actually ran, not that they were
+# skipped. Prototypes-only, path-scoped: it adds zero load to any coin lane.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "prototypes/libmrr/**"
+      - ".github/workflows/libmrr-go.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "prototypes/libmrr/**"
+      - ".github/workflows/libmrr-go.yml"
+
+env:
+  # Match the fleet fail-fast-on-stalled-fetch convention (see pplns-parse-seedpin.yml).
+  GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+  GIT_HTTP_LOW_SPEED_TIME: "20"
+
+jobs:
+  go-test:
+    name: libmrr go test
+    # Self-hosted for trusted events; fork PRs fall back to GitHub-hosted
+    # (never run untrusted fork code self-hosted).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    defaults:
+      run:
+        working-directory: prototypes/libmrr
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: go test ./...
+        run: go test ./...

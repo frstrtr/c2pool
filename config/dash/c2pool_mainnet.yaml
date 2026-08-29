@@ -1,0 +1,34 @@
+# C2Pool Dash [DASH] Mainnet Configuration
+#
+# Zero-config startup: run ./start.sh (Linux/macOS) or start.bat (Windows).
+# Miners set their payout address as the stratum username (p2pool-style).
+# CLI arguments always override values set here.
+
+# --- Network -----------------------------------------------------------------
+port: 8999                    # p2pool sharechain P2P port (DASH mainnet default)
+stratum_port: 7903            # Stratum mining port
+web_port: 8080                 # Web dashboard / JSON-RPC API port
+http_host: "0.0.0.0"           # HTTP bind address
+# external_ip: ""              # Public IP/domain for stratum URL display
+#
+# Port forwarding (if behind NAT/firewall):
+#   8999 TCP  — P2P sharechain (REQUIRED for full p2pool participation)
+#   7903 TCP  — Stratum mining (REQUIRED for miners to connect)
+#   9999 TCP  — DASH coin P2P (recommended for faster daemon sync)
+
+# --- Operating mode ----------------------------------------------------------
+# Deployment: EXTERNAL dashd RPC fallback. Embedded Dash SPV is NOT wired
+# on this release (tracked in #738) — do not rely on embedded mode. Point
+# the dash_rpc_* fields below at a running dashd for block templates.
+# embedded_dash: false         # (unavailable this release)
+
+# --- Bootstrap header checkpoint (optional) ----------------------------------
+# Skip old headers on first sync.  Format: HEIGHT:BLOCK_HASH
+# header_checkpoint: "HEIGHT:BLOCK_HASH"   # set for faster first sync
+
+# --- Coin daemon RPC (for non-embedded / daemon mode) ------------------------
+# dash_rpc_host: 127.0.0.1
+# dash_rpc_port:                # your DASH daemon's RPC port
+# dash_rpc_user: user
+# dash_rpc_password: pass
+

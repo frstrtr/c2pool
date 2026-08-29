@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+#include <core/leveldb_store.hpp>
+#include <core/uint256.hpp>
+#include <core/filesystem.hpp>
+#include <core/log.hpp>
+#include <boost/asio.hpp>
+
+namespace c2pool {
+namespace storage {
+
+/** * @brief Modern LevelDB-based sharechain storage manager
+ *
+ * Provides persistent storage for sharechain data with automatic
+ * distinction between mining_shares (from physical miners) and
+ * p2p_shares (from cross-node communication). Both types are stored
+ * in the same chain but can be tracked separately for statistics.
+ * maintenance, compaction, and recovery capabilities.
+ */
+class SharechainStorage {
+private:
+    std::unique_ptr<core::SharechainLevelDBStore> m_leveldb_store;
+    std::string m_network_name;
+    
+public:
+    /**
+     * @brief Construct sharechain storage for a specific network
+     * @param network_name Name of the network (mainnet/testnet)
+     */
+    explicit SharechainStorage(const std::string& network_name);
+    
+    /**
+     * @brief Destructor with cleanup
+     */
+    ~SharechainStorage();
+    
+    /**
+     * @brief Check if storage is available and ready
+     * @return True if storage is operational
+     */
+    bool is_available() const;
+    
+    /**
+     * @brief Save sharechain to persistent storage
+     * @tparam ShareChainType Type of sharechain to save
+     * @param chain The sharechain to save
+     */
+    template<typename ShareChainType>
+    void save_sharechain(const ShareChainType& /*chain*/)
+    {
+        if (!m_leveldb_store) {
+            LOG_ERROR << "LevelDB store not available";
+            return;
+        }
+        try {
+            LOG_INFO << "LevelDB sharechain storage is ready for persistent share storage";
+            LOG_INFO << "  Network: " << m_network_name;
+        } catch (const std::exception& e) {
+            LOG_ERROR << "Error with LevelDB sharechain storage: " << e.what();
+        }
+    }
+
+    /**
+     * @brief Load sharechain from persistent storage
+     * @tparam ShareChainType Type of sharechain to load into
+     * @param chain The sharechain to load into
+     * @return True if shares were loaded
+     */
+    template<typename ShareChainType>
+    bool load_sharechain(ShareChainType& /*chain*/)
+    {
+        if (!m_leveldb_store) {
+            LOG_WARNING << "LevelDB store not available, starting with empty sharechain";
+            return false;
+        }
+        try {
+            uint64_t stored_shares = m_leveldb_store->get_share_count();
+            if (stored_shares == 0) {
+                LOG_INFO << "No shares found in LevelDB storage, starting fresh";
+                return false;
+            }
+            return stored_shares > 0;
+        } catch (const std::exception& e) {
+            LOG_ERROR << "Error loading from LevelDB sharechain storage: " << e.what();
+            return false;
+        }
+    }
+    
+    /**
+     * @brief Store a specific share in the database
+     * @param hash Share hash
+     * @param serialized_data Serialized share data
+     * @param prev_hash Previous share hash
+     * @param height Chain height
+     * @param timestamp Share timestamp
+     * @param work Cumulative work
+     * @param target Share target
+     * @param is_orphan Whether share is orphaned
+     * @return True if successful
+     */
+    bool store_share(const uint256& hash, const std::vector<uint8_t>& serialized_data,
+                     const uint256& prev_hash, uint64_t height, uint64_t timestamp,
+                     const uint256& work, const uint256& target, bool is_orphan = false);
+
+    /// Batch entry for store_shares_batch()
+    struct ShareBatchEntry {
+        uint256 hash;
+        std::vector<uint8_t> serialized_data;
+        uint256 prev_hash;
+        uint64_t height;
+        uint64_t timestamp;
+        uint256 work;
+        uint256 target;
+    };
+
+    /// Store multiple shares atomically in one LevelDB WriteBatch.
+    /// Either ALL shares are committed or NONE (crash-safe).
+    bool store_shares_batch(const std::vector<ShareBatchEntry>& entries);
+
+    /**
+     * @brief Load a specific share from the database
+     * @param hash Share hash to load
+     * @param serialized_data Output: serialized share data
+     * @param prev_hash Output: previous share hash
+     * @param height Output: chain height
+     * @param timestamp Output: share timestamp
+     * @param work Output: cumulative work
+     * @param target Output: share target
+     * @param is_orphan Output: whether share is orphaned
+     * @return True if successful
+     */
+    bool load_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
+                    uint256& prev_hash, uint64_t& height, uint64_t& timestamp,
+                    uint256& work, uint256& target, bool& is_orphan);
+
+    /// Load a share with full metadata (includes is_verified)
+    bool load_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
+                    core::ShareMetadata& metadata);
+    
+    /**
+     * @brief Check if a share exists in storage
+     * @param hash Share hash to check
+     * @return True if share exists
+     */
+    bool has_share(const uint256& hash);
+
+    /**
+     * @brief Remove a share from storage
+     * @param hash Share hash to remove
+     * @return True if successfully removed
+     */
+    bool remove_share(const uint256& hash);
+
+    /// Batch-remove multiple shares from LevelDB in one WriteBatch.
+    bool remove_shares_batch(const std::vector<uint256>& hashes);
+
+    /// Batch-mark shares as verified in LevelDB metadata.
+    bool mark_shares_verified(const std::vector<uint256>& hashes);
+
+    /// Batch-mark verified + persist pow_hash in one write.
+    bool mark_shares_verified_with_pow(const std::vector<std::pair<uint256, uint256>>& hash_pow_pairs);
+
+    /**
+     * @brief Log storage statistics
+     */
+    void log_storage_stats();
+    
+    /**
+     * @brief Compact the database for optimization
+     */
+    void compact();
+    
+    /**
+     * @brief Get chain hashes for synchronization
+     * @param start_hash Starting hash
+     * @param max_count Maximum number of hashes to return
+     * @param forward Direction to traverse
+     * @return Vector of hashes
+     */
+    std::vector<uint256> get_chain_hashes(const uint256& start_hash, uint64_t max_count, bool forward = true);
+    
+    /**
+     * @brief Get shares in a height range
+     * @param start_height Starting height
+     * @param end_height Ending height
+     * @return Vector of share hashes
+     */
+    std::vector<uint256> get_shares_by_height_range(uint64_t start_height, uint64_t end_height);
+    
+    /**
+     * @brief Schedule periodic maintenance tasks
+     * @tparam ShareChainType Type of sharechain
+     * @param chain Sharechain reference
+     * @param ioc IO context for timers
+     * @param interval_seconds Maintenance interval
+     */
+    template<typename ShareChainType>
+    void schedule_periodic_save(ShareChainType& /*chain*/, boost::asio::io_context& ioc, int interval_seconds = 300)
+    {
+        auto timer = std::make_shared<boost::asio::steady_timer>(ioc);
+        auto leveldb_store_ptr = m_leveldb_store.get();
+        auto save_task = std::make_shared<std::function<void()>>();
+        *save_task = [leveldb_store_ptr, timer, interval_seconds, save_task]() {
+            if (leveldb_store_ptr) {
+                LOG_INFO << "Periodic LevelDB storage maintenance";
+                try {
+                    uint64_t share_count = leveldb_store_ptr->get_share_count();
+                    uint64_t best_height = leveldb_store_ptr->get_best_height();
+                    LOG_INFO << "  Share count: " << share_count;
+                    LOG_INFO << "  Best height: " << best_height;
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "Error in periodic maintenance: " << e.what();
+                }
+            }
+            timer->expires_after(std::chrono::seconds(interval_seconds));
+            timer->async_wait([save_task](const boost::system::error_code&) {
+                if (save_task) (*save_task)();
+            });
+        };
+        timer->expires_after(std::chrono::seconds(30));
+        timer->async_wait([save_task](const boost::system::error_code&) {
+            if (save_task) (*save_task)();
+        });
+    }
+};
+
+} // namespace storage
+} // namespace c2pool

@@ -1,0 +1,10072 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include "web_server.hpp"
+#include "stratum_server.hpp"
+#include <algorithm>   // std::max — authorship only ever climbs, never downgrades
+#include <memory>
+#include "address_utils.hpp"
+#include "socket.hpp"
+
+// Real coin daemon access (optional - only active when set_coin_node() is called)
+#include <impl/ltc/coin/rpc.hpp>
+#include <impl/ltc/coin/node_interface.hpp>
+#include <core/coin/node_iface.hpp>
+// Phase 4: embedded coin node interface
+#include <impl/ltc/coin/template_builder.hpp>
+#include <impl/ltc/share_messages.hpp>
+
+#include <core/hash.hpp>   // Hash(a,b) double-SHA256 for merkle computation
+#include <core/random.hpp> // core::random::random_float for probabilistic fee
+#include <core/target_utils.hpp> // chain::bits_to_target
+#include <btclibs/util/strencodings.h>  // ParseHex, HexStr
+#include <crypto/scrypt.h>  // scrypt_1024_1_1_256 for Litecoin PoW
+#include <crypto/sha256.h>      // CSHA256 for P2PK→P2PKH conversion
+#include <crypto/ripemd160.h>   // CRIPEMD160 for Hash160
+#include <c2pool/merged/merged_mining.hpp>  // Integrated merged mining
+#include <impl/ltc/config_pool.hpp>          // PoolConfig::is_testnet for donation addr
+
+#include <iomanip>
+#include <sstream>
+#include <set>
+#include <cstdio>   // std::rename (best-share sidecar atomic replace)
+#include <ctime>
+#include <chrono>
+#include <limits>
+#include <cmath>
+#include <fstream>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+#include <boost/algorithm/string.hpp>
+#include "btclibs/base58.h"
+#include "btclibs/bech32.h"
+#include "filesystem.hpp"
+
+namespace core {
+
+static std::string to_hex(const std::vector<unsigned char>& data)
+{
+    return HexStr(std::span<const unsigned char>(data.data(), data.size()));
+}
+
+/// MiningInterface Implementation
+MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
+    : m_work_id_counter(1)
+    , m_testnet(testnet)
+    , m_blockchain(blockchain)
+    , m_node(node)
+    , m_address_validator(blockchain, testnet ? Network::TESTNET : Network::MAINNET)
+    , m_payout_manager(std::make_unique<c2pool::payout::PayoutManager>(1.0, 86400)) // 1% fee, 24h window
+    , m_solo_mode(false)
+    , m_solo_address("")
+{
+    setup_methods();
+}
+
+MiningInterface::~MiningInterface()
+{
+    // Stop and join the background graph-view seed thread (if it is still
+    // replaying the flat log). Never blocks shutdown for long: the flag is
+    // checked between entries.
+    m_views_seed_stop.store(true, std::memory_order_relaxed);
+    if (m_views_seed_thread.joinable())
+        m_views_seed_thread.join();
+}
+
+void MiningInterface::setup_methods()
+{
+    // Core mining methods - explicitly cast to MethodHandle
+    Add("getwork", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getwork();
+    }));
+    
+    Add("submitwork", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.size() < 3) {
+            throw jsonrpccxx::JsonRpcException(-1, "submitwork requires 3 parameters");
+        }
+        return submitwork(params[0], params[1], params[2]);
+    }));
+    
+    Add("getblocktemplate", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        nlohmann::json template_params = params.empty() ? nlohmann::json::array() : params;
+        return getblocktemplate(template_params);
+    }));
+    
+    Add("submitblock", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.empty()) {
+            throw jsonrpccxx::JsonRpcException(-1, "submitblock requires hex data parameter");
+        }
+        return submitblock(params[0]);
+    }));
+    
+    // Pool info methods
+    Add("getinfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getinfo();
+    }));
+    
+    Add("getstats", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getstats();
+    }));
+    
+    Add("getpeerinfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getpeerinfo();
+    }));
+    
+    // Stratum methods
+    Add("mining.subscribe", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        std::string user_agent = params.empty() ? "" : params[0];
+        return mining_subscribe(user_agent);
+    }));
+    
+    Add("mining.authorize", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.size() < 2) {
+            throw jsonrpccxx::JsonRpcException(-1, "mining.authorize requires username and password");
+        }
+        return mining_authorize(params[0], params[1]);
+    }));
+    
+    Add("mining.submit", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.size() < 5) {
+            throw jsonrpccxx::JsonRpcException(-1, "mining.submit requires 5 parameters");
+        }
+        return mining_submit(params[0], params[1], "", params[2], params[3], params[4]);
+    }));
+    
+    // Enhanced payout and coinbase methods
+    Add("validate_address", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.empty()) {
+            throw jsonrpccxx::JsonRpcException(-1, "validate_address requires address parameter");
+        }
+        return validate_address(params[0]);
+    }));
+    
+    Add("build_coinbase", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.empty()) {
+            throw jsonrpccxx::JsonRpcException(-1, "build_coinbase requires parameters object");
+        }
+        return build_coinbase(params);
+    }));
+    
+    Add("validate_coinbase", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.empty()) {
+            throw jsonrpccxx::JsonRpcException(-1, "validate_coinbase requires coinbase hex parameter");
+        }
+        return validate_coinbase(params[0]);
+    }));
+    
+    Add("getblockcandidate", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getblockcandidate(params);
+    }));
+    
+    Add("getpayoutinfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getpayoutinfo();
+    }));
+    
+    Add("getminerstats", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getminerstats();
+    }));
+
+    Add("setmessageblob", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.empty()) {
+            throw jsonrpccxx::JsonRpcException(-1, "setmessageblob requires hex blob parameter");
+        }
+        return setmessageblob(params[0]);
+    }));
+
+    Add("getmessageblob", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getmessageblob();
+    }));
+
+    // Explorer JSON-RPC adapter — allows Python explorer to talk to c2pool
+    // as if it were a standard Bitcoin/Litecoin daemon.
+    // Daemonless coin-chain queries take precedence over the explorer
+    // callbacks when a coin backend installed one (DASH answers these three
+    // from its own PoW-validated header chain). The hook returns a refusal
+    // object naming the blocking condition when it cannot answer; forward it
+    // verbatim rather than flattening it to a zero or an empty string.
+    Add("getblockchaininfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_coin_chain_query_fn())
+            return call_coin_chain_query("getblockchaininfo", params, primary_chain_key());
+        if (has_explorer_chaininfo_fn())
+            return call_explorer_chaininfo(primary_chain_key());
+        return nlohmann::json{{"error", "explorer not enabled"}};
+    }));
+
+    Add("getbestblockhash", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_coin_chain_query_fn())
+            return call_coin_chain_query("getbestblockhash", params, primary_chain_key());
+        return nlohmann::json{
+            {"error", "getbestblockhash unavailable: no coin chain-query backend "
+                      "is installed for this node (threshold: a coin backend must "
+                      "call set_coin_chain_query_fn)"}};
+    }));
+
+    Add("getblockhash", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_coin_chain_query_fn())
+            return call_coin_chain_query("getblockhash", params, primary_chain_key());
+        if (!has_explorer_blockhash_fn() || params.empty())
+            return nullptr;
+        uint32_t h = params[0].get<uint32_t>();
+        return call_explorer_blockhash(h, primary_chain_key());
+    }));
+
+    Add("getblock", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (!has_explorer_getblock_fn() || params.empty())
+            return nullptr;
+        std::string hash = params[0].get<std::string>();
+        return call_explorer_getblock(hash, primary_chain_key());
+    }));
+
+    Add("getmempoolinfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_explorer_mempoolinfo_fn())
+            return call_explorer_mempoolinfo(primary_chain_key());
+        return nlohmann::json::object();
+    }));
+
+    Add("getrawmempool", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_explorer_rawmempool_fn()) {
+            bool verbose = (!params.empty() && params[0].get<bool>());
+            return call_explorer_rawmempool(primary_chain_key(), verbose, 500);
+        }
+        return nlohmann::json::array();
+    }));
+}
+
+void MiningInterface::load_transition_blobs(const std::string& dir_path)
+{
+    namespace fs = std::filesystem;
+    if (!fs::is_directory(dir_path)) return;
+
+    int loaded = 0;
+    for (const auto& entry : fs::directory_iterator(dir_path)) {
+        if (!entry.is_regular_file()) continue;
+        auto ext = entry.path().extension().string();
+        if (ext != ".hex") continue;
+
+        // Read hex file
+        std::ifstream f(entry.path());
+        if (!f) continue;
+        std::string hex_str;
+        std::getline(f, hex_str);
+        // Trim whitespace
+        while (!hex_str.empty() && (hex_str.back() == '\n' || hex_str.back() == '\r' || hex_str.back() == ' '))
+            hex_str.pop_back();
+        if (hex_str.empty()) continue;
+
+        auto blob = ParseHex(hex_str);
+        if (blob.empty()) continue;
+
+        // Featured-node banner: ECDSA-verified ingestion (freshest-wins).
+        scan_blob_for_featured_node(blob);
+
+        auto unpacked = ltc::unpack_share_messages(blob.data(), blob.size());
+        if (!unpacked.decrypted) continue;
+
+        auto now = static_cast<uint32_t>(std::time(nullptr));
+        for (const auto& msg : unpacked.messages) {
+            // Decode payload as UTF-8 text, try JSON
+            std::string payload_text(msg.payload.begin(), msg.payload.end());
+            nlohmann::json payload_json;
+            try { payload_json = nlohmann::json::parse(payload_text); } catch (...) {}
+
+            if (msg.msg_type == ltc::MSG_TRANSITION_SIGNAL && m_cached_transition_message.is_null()) {
+                nlohmann::json tmsg = nlohmann::json::object();
+                if (payload_json.is_object()) {
+                    tmsg["msg"] = payload_json.value("msg", "");
+                    tmsg["url"] = payload_json.value("url", "");
+                    tmsg["urgency"] = payload_json.value("urg", "info");
+                    tmsg["from_ver"] = payload_json.value("from", "");
+                    tmsg["to_ver"] = payload_json.value("to", "");
+                } else {
+                    tmsg["msg"] = payload_text;
+                    tmsg["urgency"] = "info";
+                }
+                tmsg["timestamp"] = msg.timestamp;
+                tmsg["verified"] = true;
+                tmsg["authority"] = (msg.wire_flags & ltc::FLAG_PROTOCOL_AUTHORITY) != 0;
+                m_cached_transition_message = tmsg;
+                ++loaded;
+            } else if (msg.msg_type == ltc::MSG_POOL_ANNOUNCE || msg.msg_type == ltc::MSG_EMERGENCY) {
+                nlohmann::json ann = nlohmann::json::object();
+                ann["type"] = (msg.msg_type == ltc::MSG_EMERGENCY) ? "EMERGENCY" : "POOL_ANNOUNCE";
+                ann["type_id"] = msg.msg_type;
+                ann["timestamp"] = msg.timestamp;
+                ann["age"] = (now > msg.timestamp) ? static_cast<int>(now - msg.timestamp) : 0;
+                ann["verified"] = true;
+                ann["authority"] = (msg.wire_flags & ltc::FLAG_PROTOCOL_AUTHORITY) != 0;
+                if (payload_json.is_object()) {
+                    ann["text"] = payload_json.value("msg", payload_json.value("text", ""));
+                    ann["urgency"] = payload_json.value("urg", payload_json.value("urgency", "info"));
+                    ann["url"] = payload_json.value("url", "");
+                } else {
+                    ann["text"] = payload_text;
+                    ann["urgency"] = (msg.msg_type == ltc::MSG_EMERGENCY) ? "alert" : "info";
+                }
+                m_cached_authority_announcements.push_back(ann);
+                ++loaded;
+            }
+        }
+    }
+    if (loaded > 0)
+        LOG_INFO << "Messaging: loaded " << loaded << " transition message(s) from " << dir_path;
+}
+
+void MiningInterface::set_operator_message_blob(const std::vector<unsigned char>& blob)
+{
+    std::lock_guard<std::mutex> lock(m_message_blob_mutex);
+    m_operator_message_blob = blob;
+}
+
+std::vector<unsigned char> MiningInterface::get_operator_message_blob() const
+{
+    std::lock_guard<std::mutex> lock(m_message_blob_mutex);
+    return m_operator_message_blob;
+}
+
+// ── Featured developer-node banner: authority-verified ingestion ────────────
+// The freshest-wins comparator, persistence and render logic live in the
+// consensus-neutral core::FeaturedNodeStore (featured_node.hpp). This is the
+// RENDER GATE: only blobs that pass FULL authority verification — MAC decrypt
+// + per-message ECDSA + pinned COMBINED_DONATION_SCRIPT pubkey — are ingested.
+// validate_message_data() returns empty ONLY on that success; a forged,
+// unsigned, wrong-key or tampered blob is rejected before any seq comparison,
+// so an attacker can neither render a banner nor burn the monotonic counter.
+void MiningInterface::scan_blob_for_featured_node(const std::vector<unsigned char>& blob)
+{
+    if (blob.empty()) return;
+    if (!ltc::validate_message_data(blob).empty()) return;  // not authority-signed → ignore
+    auto unpacked = ltc::unpack_share_messages(blob.data(), blob.size());
+    if (!unpacked.decrypted || unpacked.authority_pubkey == nullptr) return;
+    std::string signer_hex = to_hex(std::vector<unsigned char>(
+        unpacked.authority_pubkey->begin(), unpacked.authority_pubkey->end()));
+    for (const auto& msg : unpacked.messages) {
+        if (msg.msg_type != ltc::MSG_FEATURED_NODE) continue;  // unknown subtypes ignored gracefully
+        std::string payload_text(msg.payload.begin(), msg.payload.end());
+        nlohmann::json pj;
+        try { pj = nlohmann::json::parse(payload_text); } catch (...) { continue; }
+        if (!pj.is_object()) continue;
+        uint64_t seq = pj.value("seq", uint64_t(0));
+        apply_featured_node_message(seq, msg.timestamp, payload_text, signer_hex);
+    }
+}
+
+// ─── Live coin-daemon integration ────────────────────────────────────────────
+
+void MiningInterface::set_coin_node(core::coin::ICoinNode* node)
+{
+    m_coin_node = node;
+    LOG_INFO << "MiningInterface: coin node " << (node ? "attached" : "detached");
+}
+
+void MiningInterface::set_on_block_submitted(std::function<void(const std::string&, int)> fn)
+{
+    m_on_block_submitted = std::move(fn);
+}
+
+void MiningInterface::set_on_block_relay(std::function<void(const std::string&)> fn)
+{
+    m_on_block_relay = std::move(fn);
+}
+
+void MiningInterface::set_rpc_submit_fallback(std::function<std::string(const std::string&)> fn)
+{
+    m_rpc_submit_fallback = std::move(fn);
+}
+
+bool MiningInterface::has_merged_chain(uint32_t chain_id) const
+{
+    if (!m_mm_manager) return false;
+    return m_mm_manager->get_chain_rpc(chain_id) != nullptr;
+}
+
+std::string MiningInterface::get_node_fee_hash160() const
+{
+    // Extract hash160 from scriptPubKey (P2PKH, P2SH, or P2WPKH)
+    int h160_off = -1;
+    auto sz = m_node_fee_script.size();
+    if (sz == 25 && m_node_fee_script[0] == 0x76 &&
+        m_node_fee_script[1] == 0xa9 && m_node_fee_script[2] == 0x14)
+        h160_off = 3;   // P2PKH
+    else if (sz == 23 && m_node_fee_script[0] == 0xa9 &&
+             m_node_fee_script[1] == 0x14)
+        h160_off = 2;   // P2SH
+    else if (sz == 22 && m_node_fee_script[0] == 0x00 &&
+             m_node_fee_script[1] == 0x14)
+        h160_off = 2;   // P2WPKH
+    if (h160_off < 0) return {};
+    static const char* HEX = "0123456789abcdef";
+    std::string h160;
+    h160.reserve(40);
+    for (int i = h160_off; i < h160_off + 20; ++i) {
+        h160 += HEX[m_node_fee_script[i] >> 4];
+        h160 += HEX[m_node_fee_script[i] & 0x0f];
+    }
+    return h160;
+}
+
+bool MiningInterface::check_merged_mining(const std::string& block_hex,
+                                          const std::string& extranonce1,
+                                          const std::string& extranonce2,
+                                          const JobSnapshot* job)
+{
+    if (!m_mm_manager) return false;
+
+    // Extract 80-byte parent header (first 160 hex chars)
+    if (block_hex.size() < 160) return false;
+    std::string parent_header_hex = block_hex.substr(0, 160);
+
+    // Compute parent block hash (scrypt for LTC)
+    auto hdr_bytes = ParseHex(parent_header_hex);
+    uint256 parent_hash;
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_bytes.data()),
+                        reinterpret_cast<char*>(parent_hash.data()));
+
+    // Build stripped coinbase tx (no witness) — use per-job parts when available
+    std::string coinbase_hex;
+    std::vector<std::string> merkle_branches_copy;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+        const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+        coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+        merkle_branches_copy = job ? job->merkle_branches : m_cached_merkle_branches;
+    }
+
+    auto before = m_mm_manager->get_discovered_blocks().size();
+    m_mm_manager->try_submit_merged_blocks(
+        parent_header_hex,
+        coinbase_hex,
+        merkle_branches_copy,
+        0,  // coinbase is always at index 0
+        parent_hash);
+    auto after = m_mm_manager->get_discovered_blocks().size();
+    return after > before; // true if a merged block was found
+}
+
+// ─── Witness merkle root computation ──────────────────────────────────────────
+// Compute the merkle root of a list of hashes (standard Bitcoin merkle tree).
+static uint256 compute_witness_merkle_root(std::vector<uint256> hashes) {
+    if (hashes.empty()) return uint256();
+    while (hashes.size() > 1) {
+        if (hashes.size() % 2 == 1)
+            hashes.push_back(hashes.back());
+        std::vector<uint256> next;
+        next.reserve(hashes.size() / 2);
+        for (size_t i = 0; i + 1 < hashes.size(); i += 2)
+            next.push_back(Hash(hashes[i], hashes[i + 1]));
+        hashes = std::move(next);
+    }
+    return hashes[0];
+}
+
+// P2Pool witness nonce: '[Pool]' repeated 4 times = 32 bytes
+static const unsigned char P2POOL_WITNESS_NONCE_BYTES[32] = {
+    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
+    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
+    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
+    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
+};
+
+// Compute the P2Pool witness commitment hex from a raw witness merkle root.
+// Returns the full script hex: "6a24aa21a9ed" + SHA256d(root || '[Pool]'*4)
+static std::string compute_p2pool_witness_commitment_hex(const uint256& witness_root) {
+    uint256 nonce;
+    std::memcpy(nonce.data(), P2POOL_WITNESS_NONCE_BYTES, 32);
+    uint256 commitment = Hash(witness_root, nonce);
+    return "6a24aa21a9ed" + HexStr(std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(commitment.data()), 32));
+}
+
+// ─── Merkle branch computation ────────────────────────────────────────────────
+// Given the list of transaction hashes EXCLUDING the coinbase
+// (i.e. from getblocktemplate tx list), compute the Stratum merkle_branches
+// array that enables the miner to reconstruct the merkle root as:
+//   hash = coinbase_hash
+//   for b in branches: hash = Hash(hash, b)
+/*static*/ std::vector<std::string>
+MiningInterface::compute_merkle_branches(std::vector<std::string> tx_hashes_hex)
+{
+    if (tx_hashes_hex.empty()) return {};
+
+    // Convert hex strings to uint256
+    std::vector<uint256> current;
+    current.reserve(tx_hashes_hex.size());
+    for (const auto& h : tx_hashes_hex) {
+        uint256 u;
+        u.SetHex(h);
+        current.push_back(u);
+    }
+
+    std::vector<std::string> branches;
+
+    // At each tree level: the first element of `current` is the sibling of our
+    // path node. Consume it as a branch, then build the next level from the rest.
+    while (!current.empty()) {
+        // Store in internal byte order (Stratum format: raw SHA256d output hex)
+        branches.push_back(HexStr(std::span<const unsigned char>(current[0].data(), 32)));
+        current.erase(current.begin());      // remove the sibling we just used
+        if (current.empty()) break;
+
+        // If the remaining list is odd, duplicate the last entry
+        if (current.size() % 2 == 1)
+            current.push_back(current.back());
+
+        // Pair and hash for the next level
+        std::vector<uint256> next;
+        next.reserve(current.size() / 2);
+        for (size_t i = 0; i + 1 < current.size(); i += 2)
+            next.push_back(Hash(current[i], current[i + 1]));
+        current = std::move(next);
+    }
+
+    return branches;
+}
+
+// ─── Merkle root reconstruction ──────────────────────────────────────────────
+// Given a fully-assembled coinbase transaction in hex and the Stratum merkle
+// branches, reconstruct the block's merkle root.
+//   coinbase_hash = dSHA256(coinbase_bytes)
+//   for each branch: coinbase_hash = dSHA256(coinbase_hash || branch)
+/*static*/ uint256
+MiningInterface::reconstruct_merkle_root(const std::string& coinbase_hex,
+                                         const std::vector<std::string>& merkle_branches)
+{
+    auto coinbase_bytes = ParseHex(coinbase_hex);
+    uint256 hash = Hash(coinbase_bytes);
+
+    for (const auto& branch_hex : merkle_branches) {
+        // Branches are in internal byte order (Stratum format)
+        uint256 branch;
+        auto branch_bytes = ParseHex(branch_hex);
+        if (branch_bytes.size() == 32)
+            memcpy(branch.begin(), branch_bytes.data(), 32);
+        hash = Hash(hash, branch);
+    }
+    return hash;
+}
+
+// ─── Build full block from Stratum parameters ────────────────────────────────
+// Assembles the block header + full transaction list from the cached template
+// and the miner's Stratum submit data.
+std::string
+MiningInterface::build_block_from_stratum(const std::string& extranonce1,
+                                          const std::string& extranonce2,
+                                          const std::string& ntime,
+                                          const std::string& nonce,
+                                          const JobSnapshot* job) const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+
+    // When a JobSnapshot is provided, use its frozen template data.
+    // Otherwise fall back to the live m_cached_template (legacy/solo path).
+    const std::string& coinb1 = job ? job->coinb1 : m_cached_coinb1;
+    const std::string& coinb2 = job ? job->coinb2 : m_cached_coinb2;
+
+    if (coinb1.empty())
+        return {};
+
+    // Reconstruct coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
+    std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
+
+    // Reconstruct merkle root using the job's branches (or the live cache)
+    const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+    uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, branches);
+
+    // Block header fields — from the job snapshot or the live template
+    uint32_t version;
+    uint256 prev_hash;
+    std::string bits_hex;
+    bool segwit;
+    if (job) {
+        version = job->version ? job->version : 536870912U;
+        prev_hash.SetHex(job->gbt_prevhash.empty() ? std::string(64, '0') : job->gbt_prevhash);
+        bits_hex = job->nbits.empty() ? "1d00ffff" : job->nbits;
+        segwit = job->segwit_active;
+    } else {
+        if (!m_work_valid || m_cached_template.is_null())
+            return {};
+        version = m_cached_template.value("version", 536870912U);
+        prev_hash.SetHex(m_cached_template.value("previousblockhash", std::string(64, '0')));
+        bits_hex = m_cached_template.value("bits", std::string("1d00ffff"));
+        segwit = m_segwit_active;
+    }
+
+    // ntime and nonce from miner (hex strings, 4 bytes each, BE from Stratum)
+    auto ntime_bytes = ParseHex(ntime);
+    auto nonce_bytes = ParseHex(nonce);
+    auto bits_bytes  = ParseHex(bits_hex);
+
+    // Stratum/GBT sends these as big-endian hex; block header needs little-endian
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
+    std::reverse(bits_bytes.begin(),  bits_bytes.end());
+
+    std::ostringstream block;
+    // version LE
+    block << std::hex << std::setfill('0')
+          << std::setw(2) << ((version      ) & 0xff)
+          << std::setw(2) << ((version >>  8) & 0xff)
+          << std::setw(2) << ((version >> 16) & 0xff)
+          << std::setw(2) << ((version >> 24) & 0xff);
+    // prev_hash (already internal byte order in uint256)
+    block << HexStr(std::span<const unsigned char>(prev_hash.data(), 32));
+    // merkle_root
+    block << HexStr(std::span<const unsigned char>(merkle_root.data(), 32));
+    // ntime LE
+    block << HexStr(std::span<const unsigned char>(ntime_bytes.data(), ntime_bytes.size()));
+    // nbits LE
+    block << HexStr(std::span<const unsigned char>(bits_bytes.data(), bits_bytes.size()));
+    // nonce LE
+    block << HexStr(std::span<const unsigned char>(nonce_bytes.data(), nonce_bytes.size()));
+
+    // Transaction count (varint) + coinbase + rest of transactions
+    const std::vector<std::string> tx_list = (job && job->tx_data) ? *job->tx_data : std::vector<std::string>{};
+    // If no job snapshot, collect tx data from the live template
+    std::vector<std::string> live_tx_data;
+    if (!job && m_cached_template.contains("transactions")) {
+        for (const auto& tx : m_cached_template["transactions"])
+            if (tx.contains("data"))
+                live_tx_data.push_back(tx["data"].get<std::string>());
+    }
+    const auto& txs_hex = job ? tx_list : live_tx_data;
+    uint64_t tx_count = 1 + txs_hex.size(); // coinbase + template txs
+    // Simple varint encoding
+    if (tx_count < 0xfd)
+        block << std::hex << std::setfill('0') << std::setw(2) << tx_count;
+    else
+        block << "fd" << std::hex << std::setfill('0')
+              << std::setw(2) << (tx_count & 0xff)
+              << std::setw(2) << ((tx_count >> 8) & 0xff);
+
+    // Coinbase transaction: coinb1 + extranonce1 + extranonce2 + coinb2 is the
+    // non-witness (stripped) serialization used for txid computation and the
+    // Stratum merkle tree.  For segwit blocks the block body must contain the
+    // witness serialization which wraps the same data with marker/flag bytes
+    // and a coinbase witness stack (BIP141: 1 item of 32 bytes = P2Pool nonce).
+    if (segwit) {
+        // Non-witness: [version 4B][input_count 1B][inputs…][outputs…][locktime 4B]
+        // Witness:     [version 4B][00 01][input_count 1B][inputs…][outputs…]
+        //              [witness_stack][locktime 4B]
+        block << coinbase_hex.substr(0, 8)    // version (4 bytes = 8 hex)
+              << "0001"                        // segwit marker + flag
+              << coinbase_hex.substr(8, coinbase_hex.size() - 16) // inputs + outputs
+              << "01"                          // 1 stack item for the single coinbase input
+              << "20"                          // 32 bytes
+              // P2Pool witness nonce: '[Pool]' * 4
+              << "5b5032506f6f6c5d5b5032506f6f6c5d5b5032506f6f6c5d5b5032506f6f6c5d"
+              << coinbase_hex.substr(coinbase_hex.size() - 8); // locktime
+    } else {
+        block << coinbase_hex;
+    }
+
+    // Remaining transactions from the template
+    for (const auto& tx_hex : txs_hex) {
+        block << tx_hex;
+    }
+
+    // MWEB extension block (Litecoin): append HogEx flag + MWEB data
+    const std::string& mweb_data = job ? job->mweb : m_cached_mweb;
+    if (!mweb_data.empty()) {
+        block << "01" << mweb_data;
+    } else if (segwit) {
+        // MWEB not yet bootstrapped — litecoind will reject with "mweb-missing".
+        // Return empty string to signal invalid block — caller should skip submission.
+        LOG_WARNING << "[EMB-LTC] Block built WITHOUT MWEB — skipping submission"
+                    << " (MWEB state not yet bootstrapped from P2P full block)";
+        return {};
+    }
+
+    return block.str();
+}
+
+// ─── Coinbase parts construction ─────────────────────────────────────────────
+// Encode an integer as a minimal CScriptNum (sign-magnitude, little-endian)
+// prefixed by a 1-byte push-data length. Used for BIP34 block height.
+static std::string encode_height_pushdata(int height)
+{
+    std::ostringstream os;
+    if (height == 0) {
+        os << "0100";  // PUSH1 [0x00]
+        return os.str();
+    }
+    std::vector<uint8_t> bytes;
+    uint32_t v = static_cast<uint32_t>(height);
+    while (v > 0) {
+        bytes.push_back(static_cast<uint8_t>(v & 0xFF));
+        v >>= 8;
+    }
+    // If MSB is set, add a 0x00 sign byte (positive)
+    if (bytes.back() & 0x80)
+        bytes.push_back(0x00);
+
+    // PUSHDATA opcode = len, then the data bytes (already little-endian)
+    os << std::hex << std::setfill('0') << std::setw(2) << bytes.size();
+    for (uint8_t b : bytes)
+        os << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(b);
+    return os.str();
+}
+
+// Encode a uint64 amount as 8 little-endian hex bytes
+static std::string encode_le64(uint64_t v)
+{
+    std::ostringstream os;
+    for (int i = 0; i < 8; ++i)
+        os << std::hex << std::setfill('0') << std::setw(2)
+           << static_cast<int>((v >> (i * 8)) & 0xFF);
+    return os.str();
+}
+
+// Build a P2PKH output script OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+// `hash160_hex` must be 40 hex chars (20 bytes).
+// Returns the (length-prefixed) complete output script hex.
+static std::string p2pkh_script(const std::string& hash160_hex)
+{
+    // 1976a914{hash160}88ac
+    std::ostringstream s;
+    s << "19" << "76a914" << hash160_hex << "88ac";
+    return s.str();
+}
+
+/*static*/ uint256 MiningInterface::compute_the_state_root(
+    const std::vector<std::pair<std::string,uint64_t>>& pplns_outputs,
+    uint32_t chain_length, uint32_t block_height, uint32_t bits)
+{
+    // THE State Root = MerkleRoot(L-1, L0, L+1, epoch_meta)
+    // L-1 and L+1 are zero placeholders until THE activates.
+
+    // Layer 0: SHA256d of sorted PPLNS output table
+    uint256 layer_0;
+    {
+        PackStream ps;
+        for (const auto& [script, amount] : pplns_outputs)
+        {
+            ps << static_cast<uint64_t>(amount);
+            uint8_t len = static_cast<uint8_t>(std::min(script.size() / 2, size_t(255)));
+            ps << len;
+        }
+        auto span = ps.get_span();
+        if (span.size() > 0)
+            layer_0 = Hash(std::span<const unsigned char>(
+                reinterpret_cast<const unsigned char*>(span.data()), span.size()));
+    }
+
+    // Epoch metadata: SHA256d(chain_length || block_height || bits)
+    uint256 epoch_meta;
+    {
+        PackStream ps;
+        ps << chain_length;
+        ps << block_height;
+        ps << bits;
+        auto span = ps.get_span();
+        epoch_meta = Hash(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(span.data()), span.size()));
+    }
+
+    // Layer -1 and +1: zero (placeholders)
+    uint256 layer_m1; // zero
+    uint256 layer_p1; // zero
+
+    // 4-leaf Merkle tree: hash pairs, then hash the pair of pairs
+    // Concatenate each pair into a 64-byte buffer and SHA256d
+    auto hash_pair = [](const uint256& a, const uint256& b) -> uint256 {
+        unsigned char buf[64];
+        std::memcpy(buf, a.data(), 32);
+        std::memcpy(buf + 32, b.data(), 32);
+        return Hash(std::span<const unsigned char>(buf, 64));
+    };
+    uint256 left = hash_pair(layer_m1, layer_0);
+    uint256 right = hash_pair(layer_p1, epoch_meta);
+    return hash_pair(left, right);
+}
+
+/*static*/ std::pair<std::string, std::string>
+MiningInterface::build_coinbase_parts(
+    const nlohmann::json& tmpl,
+    uint64_t coinbase_value,
+    const std::vector<std::pair<std::string,uint64_t>>& outputs,
+    bool raw_scripts,
+    const std::vector<uint8_t>& mm_commitment,
+    const std::string& witness_commitment_hex,
+    const std::string& ref_hash_hex,
+    const uint256& the_state_root,
+    const std::string& coinbase_text)
+{
+    // P2Pool-compatible coinbase split: extranonce goes into last_txout_nonce,
+    // NOT into the scriptSig.  This way:
+    //   - scriptSig is fixed (no miner-variable data) → share.m_coinbase is deterministic
+    //   - hash_link prefix (everything before last 44 bytes) matches generate_transaction
+    //   - en1+en2 fill the 8-byte last_txout_nonce in OP_RETURN (part of hash_link suffix)
+    //
+    // coinb1 = everything up to and including ref_hash in the OP_RETURN output
+    // coinb2 = locktime only ("00000000")
+    // coinbase = coinb1 + extranonce1(4B) + extranonce2(4B) + coinb2
+    //
+    // The en1+en2 become the P2Pool last_txout_nonce (8 bytes).
+    //
+    // Output ordering (must match generate_share_transaction()):
+    //   1. Segwit witness commitment (if present) — value=0
+    //   2. PPLNS payout outputs (sorted by amount asc, script asc) + donation last
+    //   3. OP_RETURN commitment (0x6a28 + ref_hash + last_txout_nonce) — value=0
+
+    const int height = tmpl.value("height", 1);
+    const std::string height_hex = encode_height_pushdata(height);
+    const int height_bytes = static_cast<int>(height_hex.size()) / 2;
+
+    // Dynamic tag: "/c2pool/" (default) or operator --coinbase-text
+    // When operator provides text, /c2pool/ tag is replaced — c2pool is
+    // always identified by the combined donation address in coinbase outputs.
+    const std::string default_tag = "/c2pool/";
+    const std::string& tag_text = coinbase_text.empty() ? default_tag : coinbase_text;
+    static const char* HEXC = "0123456789abcdef";
+    std::string tag_hex;
+    tag_hex.reserve(tag_text.size() * 2);
+    for (char c : tag_text) {
+        uint8_t b = static_cast<uint8_t>(c);
+        tag_hex += HEXC[b >> 4];
+        tag_hex += HEXC[b & 0x0f];
+    }
+    const int tag_bytes = static_cast<int>(tag_text.size());
+
+    // AuxPoW merged mining commitment
+    std::string mm_hex;
+    if (!mm_commitment.empty()) {
+        static const char* HEX = "0123456789abcdef";
+        mm_hex.reserve(mm_commitment.size() * 2);
+        for (uint8_t b : mm_commitment) {
+            mm_hex += HEX[b >> 4];
+            mm_hex += HEX[b & 0x0f];
+        }
+    }
+    const int mm_bytes = static_cast<int>(mm_commitment.size());
+
+    // THE state root: 32 bytes embedded in scriptSig (V37 prep — zero cost)
+    // Layout: [height][mm_commit]["/c2pool/"][the_state_root(32)][optional operator text]
+    std::string state_root_hex;
+    const int state_root_bytes = the_state_root.IsNull() ? 0 : 32;
+    if (state_root_bytes > 0) {
+        static const char* HEX = "0123456789abcdef";
+        state_root_hex.reserve(64);
+        for (int i = 0; i < 32; ++i) {
+            unsigned char c = the_state_root.data()[i];
+            state_root_hex += HEX[c >> 4];
+            state_root_hex += HEX[c & 0x0f];
+        }
+    }
+
+    // ScriptSig: height + mm_commitment + tag + state_root (NO extranonce!)
+    // Each element (mm, tag) gets a 1-byte push opcode prefix (matching create_push_script)
+    // state_root is raw (no push opcode, like coinbaseflags in p2pool)
+    const int mm_push_overhead = (mm_bytes > 0) ? 1 : 0;
+    const int tag_push_overhead = (tag_bytes > 0) ? 1 : 0;
+    const int script_total = height_bytes + mm_push_overhead + mm_bytes
+                           + tag_push_overhead + tag_bytes + state_root_bytes;
+
+    // Build coinb1: entire coinbase TX up to and including ref_hash in OP_RETURN
+    std::ostringstream coinb1;
+    coinb1 << "01000000"   // version
+           << "01"         // 1 input
+           << "0000000000000000000000000000000000000000000000000000000000000000"
+           << "ffffffff"   // previous index
+           << std::hex << std::setfill('0') << std::setw(2) << script_total
+           << height_hex;
+
+    // scriptSig elements with push opcodes (matching p2pool's create_push_script):
+    // Each datum gets its own length-prefix push opcode.
+    auto emit_push = [&](std::ostringstream& os, const std::string& data_hex) {
+        size_t len = data_hex.size() / 2;
+        if (len > 0 && len < 76)
+            os << std::hex << std::setfill('0') << std::setw(2) << len;
+        os << data_hex;
+    };
+    if (!mm_hex.empty()) emit_push(coinb1, mm_hex);
+    if (!tag_hex.empty()) emit_push(coinb1, tag_hex);
+    // state_root appended raw (like p2pool's coinbaseflags)
+    if (!state_root_hex.empty())
+        coinb1 << state_root_hex;
+    coinb1 << "ffffffff";  // sequence = 0xFFFFFFFF
+
+    // Count outputs: [segwit?] + PPLNS + OP_RETURN
+    size_t num_outputs = outputs.size();
+    if (!witness_commitment_hex.empty()) ++num_outputs;
+    if (!ref_hash_hex.empty()) ++num_outputs;
+
+    // Varint-encode output count
+    if (num_outputs < 0xfd)
+        coinb1 << std::hex << std::setfill('0') << std::setw(2) << num_outputs;
+    else
+        coinb1 << "fd" << std::hex << std::setfill('0')
+               << std::setw(2) << (num_outputs & 0xff)
+               << std::setw(2) << ((num_outputs >> 8) & 0xff);
+
+    // Output 1: Segwit witness commitment (FIRST, matching generate_share_transaction)
+    if (!witness_commitment_hex.empty()) {
+        coinb1 << encode_le64(0);   // 0 satoshis
+        size_t wc_len = witness_commitment_hex.size() / 2;
+        coinb1 << std::hex << std::setfill('0') << std::setw(2) << wc_len;
+        coinb1 << witness_commitment_hex;
+        {
+            static int wc_log = 0;
+            if (wc_log++ < 5)
+                LOG_INFO << "[WC-COINBASE] witness_commitment(" << wc_len << ")=" << witness_commitment_hex.substr(0, 80);
+        }
+    }
+
+    // Outputs 2..N: PPLNS payouts + donation (already sorted by caller)
+    for (const auto& [addr, amount] : outputs) {
+        coinb1 << encode_le64(amount);
+        if (raw_scripts) {
+            size_t script_len = addr.size() / 2;
+            coinb1 << std::hex << std::setfill('0') << std::setw(2) << script_len;
+            coinb1 << addr;
+        } else {
+            coinb1 << p2pkh_script(addr);
+        }
+    }
+
+    // Output N+1: OP_RETURN commitment (LAST, matching generate_share_transaction)
+    // Script = 6a(OP_RETURN) + 28(PUSH_40) + ref_hash(32) + nonce(8)
+    // Total script = 42 bytes = 0x2a
+    // The nonce(8) bytes are filled by en1+en2 (between coinb1 and coinb2)
+    if (!ref_hash_hex.empty()) {
+        coinb1 << encode_le64(0);   // 0 satoshis
+        coinb1 << "2a";             // script length = 42
+        coinb1 << "6a28";           // OP_RETURN + PUSH_40
+        coinb1 << ref_hash_hex;     // 32 bytes = 64 hex chars
+        // nonce (8 bytes) = en1+en2 goes HERE (between coinb1 and coinb2)
+    }
+
+    // coinb2 is just locktime
+    std::string coinb2 = "00000000";
+
+    return { coinb1.str(), coinb2 };
+}
+
+MiningInterface::CoinbaseResult
+MiningInterface::build_connection_coinbase(
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+{
+    // ── Lock hierarchy: m_work_mutex (1) > sessions_mutex_ (2) > MM::m_mutex (3) ──
+    //
+    // This function is called from StratumSession::send_notify_work which may be
+    // invoked by notify_all() after it releases sessions_mutex_.
+    // Internally, ref_hash_fn needs get_local_addr_rates() (sessions_mutex_) and
+    // MM needs its own m_mutex.
+    //
+    // Architecture: snapshot-then-compute (matches p2pool's single-threaded model).
+    //   Phase 1: Snapshot all work state under m_work_mutex (brief hold)
+    //   Phase 2: Gather external data WITHOUT any lock (addr_rates, MM commitment)
+    //   Phase 3: Compute everything from snapshot (ref_hash, coinbase parts) — lock-free
+    //   Phase 4: Brief re-lock to write back PPLNS cache + build final result
+
+    // ── Phase 1: Snapshot work state under m_work_mutex ──
+    // All reads from m_cached_* fields happen here.  The lock is released before
+    // any callback that might acquire other mutexes.
+
+    struct WorkStateSnapshot {
+        nlohmann::json tmpl;
+        std::vector<std::pair<std::string, uint64_t>> pplns_outputs;
+        uint256 pplns_best_share;
+        bool raw_scripts{false};
+        std::string witness_commitment;
+        uint256 witness_root;
+        std::vector<uint8_t> mm_commitment;
+        std::vector<CachedMergedHeaderInfo> merged_header_infos;
+        bool segwit_active{false};
+        std::string mweb;
+        std::string coinbase_text;
+        std::vector<unsigned char> donation_script;
+        std::vector<std::string> merkle_branches;
+        pplns_fn_t pplns_fn;
+        ref_hash_fn_t ref_hash_fn;
+        bool needs_pplns_recompute{false};
+        int64_t share_version{36};
+    };
+
+    WorkStateSnapshot ws;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_work_valid || m_cached_template.is_null())
+            return {};
+
+        ws.tmpl = m_cached_template;
+        ws.pplns_outputs = m_cached_pplns_outputs;
+        ws.pplns_best_share = m_cached_pplns_best_share;
+        ws.raw_scripts = m_cached_raw_scripts;
+        ws.witness_commitment = m_cached_witness_commitment;
+        ws.witness_root = m_cached_witness_root;
+        ws.mm_commitment = m_cached_mm_commitment;
+        ws.merged_header_infos = m_last_merged_header_infos;
+        ws.segwit_active = m_segwit_active;
+        ws.mweb = m_cached_mweb;
+        ws.coinbase_text = m_coinbase_text;
+        ws.donation_script = m_donation_script;
+        ws.share_version = m_cached_share_version;
+        ws.merkle_branches = m_cached_merkle_branches;
+        ws.pplns_fn = m_pplns_fn;
+        ws.ref_hash_fn = m_ref_hash_fn;
+        ws.needs_pplns_recompute = !prev_share_hash.IsNull()
+            && ws.pplns_fn
+            && prev_share_hash != ws.pplns_best_share;
+    }
+    // ── m_work_mutex RELEASED ──
+    // From here on, NO mutex is held. All callbacks (PPLNS, ref_hash, MM, addr_rates)
+    // can freely acquire their own locks without deadlock risk.
+
+    if (!ws.ref_hash_fn)
+        return {};
+
+    // ── Phase 2: PPLNS recomputation (lock-free — callbacks may acquire their own locks) ──
+    // CRITICAL: If frozen prev_share_hash differs from the share used for cached PPLNS,
+    // recompute PPLNS from the frozen share. This ensures the coinbase amounts match
+    // what generate_share_transaction will compute during verification.
+    // (Matches p2pool's closure pattern: coinbase is frozen at template time.)
+    static const char* HX = "0123456789abcdef";
+
+    if (prev_share_hash.IsNull())
+    {
+        // Genesis: no PPLNS walk possible. p2pool puts 100% of subsidy to donation.
+        ws.pplns_outputs.clear();
+        uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
+        std::string donation_hex;
+        for (unsigned char b : ws.donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
+        ws.pplns_outputs.push_back({donation_hex, subsidy});
+        ws.raw_scripts = true;
+        ws.pplns_best_share = prev_share_hash;
+    }
+    else if (ws.needs_pplns_recompute)
+    {
+        uint32_t nbits = 0;
+        if (ws.tmpl.contains("bits"))
+            nbits = static_cast<uint32_t>(std::stoul(
+                ws.tmpl["bits"].get<std::string>(), nullptr, 16));
+        uint256 block_target = chain::bits_to_target(nbits);
+        uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
+
+        auto expected = ws.pplns_fn(prev_share_hash, block_target, subsidy, ws.donation_script);
+
+        if (!expected.empty()) {
+            ws.pplns_outputs.clear();
+            std::string donation_hex;
+            for (unsigned char b : ws.donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
+
+            std::pair<std::string, uint64_t> donation_entry;
+            bool found_donation = false;
+
+            for (const auto& [script_bytes, amount] : expected) {
+                uint64_t sat = static_cast<uint64_t>(amount);
+                std::string hex;
+                for (unsigned char b : script_bytes) { hex += HX[b >> 4]; hex += HX[b & 0x0f]; }
+                if (hex == donation_hex) { donation_entry = {hex, sat}; found_donation = true; }
+                else if (sat > 0) { ws.pplns_outputs.push_back({std::move(hex), sat}); }
+            }
+            std::sort(ws.pplns_outputs.begin(), ws.pplns_outputs.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
+            if (found_donation) ws.pplns_outputs.push_back(donation_entry);
+            ws.pplns_best_share = prev_share_hash;
+            LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
+                     << prev_share_hash.ToString().substr(0, 16)
+                     << " outputs=" << ws.pplns_outputs.size();
+        }
+    }
+
+    // ── Phase 2a: V35 finder fee (per-connection adjustment) ──
+    // V35 PPLNS returns 99.5% to miners + remainder to donation.
+    // The finder (this connection's miner) gets subsidy/200 (0.5%) moved
+    // from the donation output to their payout script.
+    // Reference: p2pool data.py lines 945-948
+    if (ws.share_version < 36 && !ws.pplns_outputs.empty() && !payout_script.empty())
+    {
+        uint64_t subsidy_for_fee = ws.tmpl.value("coinbasevalue", uint64_t(0));
+        uint64_t finder_fee = subsidy_for_fee / 200;
+
+        if (finder_fee > 0) {
+            // Build finder's script hex
+            std::string finder_hex;
+            finder_hex.reserve(payout_script.size() * 2);
+            for (unsigned char b : payout_script) {
+                finder_hex += HX[b >> 4]; finder_hex += HX[b & 0x0f];
+            }
+
+            // Subtract finder fee from donation (last entry)
+            auto& donation_out = ws.pplns_outputs.back();
+            uint64_t taken = std::min(donation_out.second, finder_fee);
+            donation_out.second -= taken;
+
+            // Add to finder's script (may already exist in PPLNS outputs)
+            bool found_finder = false;
+            for (auto& [hex, amt] : ws.pplns_outputs) {
+                if (hex == finder_hex) { amt += taken; found_finder = true; break; }
+            }
+            if (!found_finder) {
+                // Insert before donation (last entry) to maintain sort invariant
+                ws.pplns_outputs.insert(ws.pplns_outputs.end() - 1, {finder_hex, taken});
+            }
+
+            // Re-sort PPLNS entries (excluding donation at the end)
+            if (ws.pplns_outputs.size() > 1) {
+                auto donation_save = ws.pplns_outputs.back();
+                ws.pplns_outputs.pop_back();
+                std::sort(ws.pplns_outputs.begin(), ws.pplns_outputs.end(),
+                    [](const auto& a, const auto& b) {
+                        if (a.second != b.second) return a.second < b.second;
+                        return a.first < b.first;
+                    });
+                ws.pplns_outputs.push_back(donation_save);
+            }
+        }
+    }
+
+    // ── Phase 2b: MM commitment (cache read — no rebuild, no mutex contention) ──
+    // DOGE blocks are pre-built by MergedMiningManager::rebuild_cached_blocks()
+    // during the refresh cycle.  We just read the cached result here.
+    std::vector<uint8_t> atomic_mm_commitment;
+    if (m_mm_manager) {
+        auto [header_infos, fresh_commit] =
+            m_mm_manager->get_cached_header_infos_and_commitment();
+        LOG_TRACE << "[build_cb] MM cache read, commit_size=" << fresh_commit.size()
+                  << " infos=" << header_infos.size();
+        atomic_mm_commitment = std::move(fresh_commit);
+        ws.merged_header_infos.clear();
+        ws.merged_header_infos.reserve(header_infos.size());
+        for (auto& hi : header_infos) {
+            CachedMergedHeaderInfo c;
+            c.chain_id = hi.chain_id;
+            c.coinbase_value = hi.coinbase_value;
+            c.block_height = hi.block_height;
+            c.block_header = std::move(hi.block_header);
+            c.coinbase_merkle_branches = std::move(hi.coinbase_merkle_branches);
+            c.coinbase_script = std::move(hi.coinbase_script);
+            c.coinbase_hex = std::move(hi.coinbase_hex);
+            ws.merged_header_infos.push_back(std::move(c));
+        }
+    }
+
+    // Write merged header infos so ref_hash_fn (which captures MiningInterface*)
+    // reads the FRESH infos from this MM build, not stale ones from last refresh_work.
+    // m_last_merged_header_infos is mutable and only consumed by ref_hash_fn (single caller).
+    if (!ws.merged_header_infos.empty()) {
+        auto& self = const_cast<MiningInterface&>(*this);
+        self.m_last_merged_header_infos = ws.merged_header_infos;
+    }
+
+    // ── Phase 3: Pure computation from snapshot (NO locks held) ──
+    LOG_TRACE << "[build_cb] Phase 3: building coinbase from snapshot...";
+
+    const int height = ws.tmpl.value("height", 1);
+    std::string height_hex = encode_height_pushdata(height);
+
+    static const char* HEX = "0123456789abcdef";
+    const std::string default_tag2 = "/c2pool/";
+    const std::string& tag_src = ws.coinbase_text.empty() ? default_tag2 : ws.coinbase_text;
+    std::string tag_hex;
+    for (char c : tag_src) {
+        uint8_t b = static_cast<uint8_t>(c);
+        tag_hex += HEX[b >> 4];
+        tag_hex += HEX[b & 0x0f];
+    }
+
+    const auto& mm_for_scriptsig = atomic_mm_commitment.empty()
+        ? ws.mm_commitment : atomic_mm_commitment;
+
+    std::string mm_hex;
+    for (uint8_t b : mm_for_scriptsig) {
+        mm_hex += HEX[b >> 4];
+        mm_hex += HEX[b & 0x0f];
+    }
+
+    // THE state root
+    std::string state_root_hex;
+    {
+        uint32_t tmpl_height = ws.tmpl.value("height", uint32_t(0));
+        uint32_t tmpl_bits = 0;
+        if (ws.tmpl.contains("bits"))
+            tmpl_bits = static_cast<uint32_t>(std::stoul(
+                ws.tmpl["bits"].get<std::string>(), nullptr, 16));
+        uint256 the_root = compute_the_state_root(
+            ws.pplns_outputs,
+            static_cast<uint32_t>(ws.pplns_outputs.size()),
+            tmpl_height, tmpl_bits);
+        if (!the_root.IsNull()) {
+            state_root_hex.reserve(64);
+            for (int i = 0; i < 32; ++i) {
+                unsigned char c = the_root.data()[i];
+                state_root_hex += HEX[c >> 4];
+                state_root_hex += HEX[c & 0x0f];
+            }
+        }
+    }
+
+    // ScriptSig
+    auto push_prefix = [&](const std::string& data_hex) -> std::string {
+        size_t len = data_hex.size() / 2;
+        if (len == 0) return "";
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned>(len));
+        return std::string(buf) + data_hex;
+    };
+    std::string scriptsig_hex = height_hex;
+    if (!mm_hex.empty()) scriptsig_hex += push_prefix(mm_hex);
+    if (!tag_hex.empty()) scriptsig_hex += push_prefix(tag_hex);
+    scriptsig_hex += state_root_hex;
+
+    std::vector<unsigned char> scriptsig_bytes;
+    scriptsig_bytes.reserve(scriptsig_hex.size() / 2);
+    for (size_t i = 0; i + 1 < scriptsig_hex.size(); i += 2)
+        scriptsig_bytes.push_back(static_cast<unsigned char>(
+            std::stoul(scriptsig_hex.substr(i, 2), nullptr, 16)));
+
+    LOG_TRACE << "[build_cb] scriptsig built, len=" << scriptsig_hex.size()/2;
+
+    uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
+    uint32_t bits = 0;
+    if (ws.tmpl.contains("bits"))
+        bits = static_cast<uint32_t>(std::stoul(
+            ws.tmpl["bits"].get<std::string>(), nullptr, 16));
+    uint32_t timestamp = ws.tmpl.value("curtime", uint32_t(0));
+
+    std::vector<uint256> branches_u256;
+    branches_u256.reserve(ws.merkle_branches.size());
+    for (const auto& hex : ws.merkle_branches) {
+        uint256 h;
+        auto bytes = ParseHex(hex);
+        if (bytes.size() == 32)
+            memcpy(h.begin(), bytes.data(), 32);
+        branches_u256.push_back(h);
+    }
+
+    LOG_TRACE << "[build_cb] calling ref_hash_fn (lock-free)...";
+    // The witness_root for a block with only a coinbase tx is 0x00..00 (the
+    // coinbase wtxid).  This is a VALID root — p2pool uses it to compute the
+    // witness commitment.  Never recompute just because IsNull() — the zero
+    // hash is correct when template has no non-coinbase transactions.
+    // Only recompute when witness_commitment indicates segwit is needed but
+    // witness_root was genuinely never set (witness_commitment also empty).
+    uint256 effective_witness_root = ws.witness_root;
+    bool witness_root_set = !ws.witness_commitment.empty();  // commitment computed → root is valid
+    if (!witness_root_set && ws.segwit_active && ws.tmpl.contains("transactions")) {
+        std::vector<uint256> wtxids;
+        wtxids.push_back(uint256());  // coinbase wtxid = 0
+        for (auto& tx : ws.tmpl["transactions"]) {
+            uint256 wtxid;
+            if (tx.is_object() && tx.contains("hash"))
+                wtxid.SetHex(tx["hash"].get<std::string>());
+            else if (tx.is_object() && tx.contains("txid"))
+                wtxid.SetHex(tx["txid"].get<std::string>());
+            wtxids.push_back(wtxid);
+        }
+        effective_witness_root = compute_witness_merkle_root(std::move(wtxids));
+        witness_root_set = true;
+        LOG_INFO << "[build_cb] witness_root computed from "
+                 << ws.tmpl["transactions"].size() << " txs: "
+                 << effective_witness_root.GetHex();
+    }
+    auto rhr = ws.ref_hash_fn(
+        prev_share_hash,
+        scriptsig_bytes, payout_script, subsidy, bits, timestamp,
+        ws.segwit_active, ws.witness_commitment, effective_witness_root,
+        merged_addrs, branches_u256);
+    LOG_TRACE << "[build_cb] ref_hash_fn returned, bits=" << std::hex << rhr.bits << std::dec;
+
+    // Build ref_hash hex
+    std::string ref_hash_hex;
+    {
+        auto ref_chars = rhr.ref_hash.GetChars();
+        for (unsigned char b : ref_chars) {
+            ref_hash_hex += HEX[b >> 4];
+            ref_hash_hex += HEX[b & 0x0f];
+        }
+    }
+
+    // THE state root for coinbase parts
+    uint32_t tmpl_height = ws.tmpl.value("height", uint32_t(0));
+    uint32_t tmpl_bits = 0;
+    {
+        auto bits_str = ws.tmpl.value("bits", std::string(""));
+        if (bits_str.size() == 8)
+            tmpl_bits = static_cast<uint32_t>(std::stoul(bits_str, nullptr, 16));
+    }
+    uint256 the_root = compute_the_state_root(
+        ws.pplns_outputs,
+        static_cast<uint32_t>(ws.pplns_outputs.size()),
+        tmpl_height, tmpl_bits);
+
+    const auto& mm_commitment_fresh = mm_for_scriptsig;
+
+    LOG_INFO << "[build_connection_cb] PPLNS for frozen prev_share="
+             << prev_share_hash.GetHex().substr(0, 16) << " outputs=" << ws.pplns_outputs.size();
+    {
+        uint64_t pplns_total = 0;
+        for (auto& [script_hex, amt] : ws.pplns_outputs) {
+            pplns_total += amt;
+            LOG_DEBUG_DIAG << "[PPLNS-OUT] script=" << script_hex.substr(0, 40) << " amount=" << amt;
+        }
+        LOG_INFO << "[build_connection_cb] subsidy=" << subsidy
+                 << " pplns_total=" << pplns_total
+                 << " diff=" << (int64_t(subsidy) - int64_t(pplns_total));
+    }
+
+    LOG_TRACE << "[build_cb] calling build_coinbase_parts...";
+    auto [cb1, cb2] = build_coinbase_parts(
+        ws.tmpl,
+        subsidy,
+        ws.pplns_outputs,
+        ws.raw_scripts,
+        mm_commitment_fresh,
+        ws.witness_commitment,
+        ref_hash_hex,
+        the_root,
+        ws.coinbase_text);
+    LOG_TRACE << "[build_cb] coinbase_parts built, cb1_len=" << cb1.size();
+
+    // ── Phase 4: Write back updated PPLNS cache ──
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        auto& self = const_cast<MiningInterface&>(*this);
+        if (ws.pplns_best_share != self.m_cached_pplns_best_share) {
+            self.m_cached_pplns_outputs = ws.pplns_outputs;
+            self.m_cached_pplns_best_share = ws.pplns_best_share;
+            self.m_cached_raw_scripts = ws.raw_scripts;
+        }
+    }
+
+    WorkSnapshot snap;
+    snap.segwit_active = ws.segwit_active;
+    snap.mweb = ws.mweb;
+    snap.subsidy = subsidy;
+    snap.witness_commitment_hex = ws.witness_commitment;
+    snap.witness_root = effective_witness_root;
+    snap.frozen_ref = rhr;
+    // Freeze block body data atomically — prevents merkle root mismatch
+    // when refresh_work() updates the template between separate reads.
+    snap.merkle_branches = ws.merkle_branches;
+    if (ws.tmpl.contains("transactions")) {
+        auto txd = std::make_shared<std::vector<std::string>>();
+        for (const auto& tx : ws.tmpl["transactions"])
+            if (tx.contains("data"))
+                txd->push_back(tx["data"].get<std::string>());
+        snap.tx_data = std::move(txd);
+    }
+    return {std::move(cb1), std::move(cb2), std::move(snap)};
+}
+
+// base58check_to_hash160 moved to address_utils.cpp
+
+void MiningInterface::refresh_work()
+{
+    if (!m_coin_node) return;
+
+    // Serialize refresh_work calls — two concurrent threads (e.g. embedded LTC
+    // header callback + stratum submit) hitting build_coinbase_parts() in parallel
+    // causes heap corruption ("corrupted size vs. prev_size in fastbins").
+    static std::mutex s_refresh_mutex;
+    std::unique_lock<std::mutex> refresh_lock(s_refresh_mutex, std::try_to_lock);
+    if (!refresh_lock.owns_lock()) return;  // another refresh in progress, skip
+
+    try {
+        // P2 WorkView seam: the concrete coin node makes the embedded-vs-RPC
+        // decision internally, retains the full per-coin WorkData coin-side
+        // (work.set), and returns only the agnostic slice (m_data/m_hashes/m_latency).
+        auto wd = m_coin_node->get_work_view();
+
+        // Collect tx hashes from WorkData
+        std::vector<std::string> tx_hashes_hex;
+        for (const auto& h : wd.m_hashes)
+            tx_hashes_hex.push_back(h.GetHex());
+
+        // Compute Stratum merkle branches from those hashes
+        auto merkle_branches = compute_merkle_branches(tx_hashes_hex);
+
+        // Build coinbase parts with properly split payout outputs
+        uint64_t coinbase_value = wd.m_data.value("coinbasevalue", uint64_t(5000000000));
+        std::pair<std::string,std::string> cb_parts;
+        bool segwit_active = false;
+
+        // Cached PPLNS data for per-connection coinbase generation
+        std::vector<std::pair<std::string,uint64_t>> pplns_outputs;
+        bool pplns_raw_scripts = false;
+        std::string witness_commitment;
+        uint256 witness_root;
+        std::vector<uint8_t> mm_commitment;
+
+        try {
+            // V36 PPLNS path: use share-tracker proportional payouts directly
+            // IMPORTANT: Use m_best_share_hash_fn() here for the PPLNS computation AND
+            // cache it so build_connection_coinbase can verify consistency with frozen_prev_share.
+            // If they diverge, build_connection_coinbase will recompute PPLNS from frozen_prev_share.
+            if (m_pplns_fn && m_best_share_hash_fn) {
+                auto best = m_best_share_hash_fn();
+                m_cached_pplns_best_share = best;  // remember which share PPLNS was computed from
+                if (!best.IsNull()) {
+                    LOG_INFO << "[Pool] refresh_work: PPLNS active, best_share=" << best.GetHex()
+                             << " donation_script_len=" << m_donation_script.size();
+                    uint32_t nbits = std::stoul(
+                        wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
+                    uint256 block_target = chain::bits_to_target(nbits);
+
+                    auto expected = m_pplns_fn(best, block_target, coinbase_value, m_donation_script);
+
+                    // Debug: log PPLNS distribution
+                    {
+                        static int pplns_log = 0;
+                        if (pplns_log++ % 60 == 0) { // every ~5 min (60 * 5s interval)
+                            LOG_INFO << "[PPLNS] " << expected.size() << " addrs, subsidy=" << coinbase_value;
+                            for (const auto& [script, amount] : expected) {
+                                uint64_t sat = static_cast<uint64_t>(amount);
+                                LOG_INFO << "[PPLNS]   script(" << script.size() << ")="
+                                         << (script.size() > 4 ? HexStr(std::span<const unsigned char>(
+                                             reinterpret_cast<const unsigned char*>(script.data()),
+                                             std::min(script.size(), size_t(10)))) : "?")
+                                         << "... amount=" << sat;
+                            }
+                        }
+                    }
+
+                    if (!expected.empty()) {
+                        static const char* HEX = "0123456789abcdef";
+
+                        // Convert donation script to hex for identification
+                        std::string donation_script_hex;
+                        for (unsigned char b : m_donation_script) {
+                            donation_script_hex += HEX[b >> 4];
+                            donation_script_hex += HEX[b & 0x0f];
+                        }
+
+                        // Separate PPLNS outputs from donation output
+                        std::pair<std::string, uint64_t> donation_entry;
+                        bool found_donation = false;
+
+                        for (const auto& [script_bytes, amount] : expected) {
+                            uint64_t sat = static_cast<uint64_t>(amount);
+                            std::string hex;
+                            hex.reserve(script_bytes.size() * 2);
+                            for (unsigned char b : script_bytes) {
+                                hex += HEX[b >> 4];
+                                hex += HEX[b & 0x0f];
+                            }
+                            if (hex == donation_script_hex) {
+                                donation_entry = {hex, sat};
+                                found_donation = true;
+                            } else {
+                                if (sat == 0) continue; // Only skip zero-value PPLNS outputs
+                                pplns_outputs.push_back({std::move(hex), sat});
+                            }
+                        }
+
+                        // Sort PPLNS by (amount ascending, script ascending)
+                        // matching Python's sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
+                        std::sort(pplns_outputs.begin(), pplns_outputs.end(),
+                            [](const auto& a, const auto& b) {
+                                if (a.second != b.second) return a.second < b.second;
+                                return a.first < b.first;
+                            });
+                        const size_t MAX_PPLNS = m_stratum_config.max_coinbase_outputs;
+                        if (pplns_outputs.size() > MAX_PPLNS)
+                            pplns_outputs.erase(pplns_outputs.begin(),
+                                                pplns_outputs.end() - MAX_PPLNS);
+
+                        // Donation output LAST among value outputs
+                        // (matches Python's generate_transaction: payouts + [donation] + OP_RETURN)
+                        if (found_donation)
+                            pplns_outputs.push_back(donation_entry);
+
+                        pplns_raw_scripts = true;
+                        LOG_INFO << "[Pool] refresh_work: V" << m_cached_share_version
+                                 << " PPLNS coinbase with "
+                                 << pplns_outputs.size() << " outputs (donation_last="
+                                 << found_donation << ")";
+                    }
+                }
+            }
+
+            // Fallback: single output to zero-key (burn) so coinbase is always valid
+            if (pplns_outputs.empty()) {
+                pplns_outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
+                // Diagnostic: trace WHY PPLNS is empty — this causes invalid coinbase
+                static int zero_warn = 0;
+                if (zero_warn++ < 10 || zero_warn % 100 == 0) {
+                    bool has_pplns = static_cast<bool>(m_pplns_fn);
+                    bool has_best = static_cast<bool>(m_best_share_hash_fn);
+                    uint256 best_hash;
+                    if (has_best) best_hash = m_best_share_hash_fn();
+                    LOG_WARNING << "[PPLNS-EMPTY] Falling back to zero-address burn!"
+                                << " has_pplns_fn=" << has_pplns
+                                << " has_best_fn=" << has_best
+                                << " best_hash=" << (best_hash.IsNull() ? "null" : best_hash.GetHex().substr(0, 16))
+                                << " subsidy=" << coinbase_value
+                                << " donation_script_len=" << m_donation_script.size()
+                                << " (#" << zero_warn << ")";
+                }
+            }
+
+            // Get merged mining commitment if an MM manager is wired.
+            // Only rebuild when PPLNS weights changed (new best_share).
+            // DOGE template changes are handled by refresh_aux_work() poll.
+            // LTC-only tip changes don't affect the DOGE block at all.
+            if (m_mm_manager) {
+                if (m_mm_manager->is_pplns_dirty())
+                    m_mm_manager->rebuild_cached_blocks();
+                mm_commitment = m_mm_manager->get_auxpow_commitment();
+            }
+
+            // BIP141: compute P2Pool witness commitment from template transactions
+            if (wd.m_data.contains("rules")) {
+                auto rules = wd.m_data["rules"].get<std::vector<std::string>>();
+                segwit_active = std::any_of(rules.begin(), rules.end(),
+                    [](const auto& r) { return r == "segwit" || r == "!segwit"; });
+            }
+            LOG_INFO << "[Pool] segwit_active=" << segwit_active
+                     << " rules=" << (wd.m_data.contains("rules") ? wd.m_data["rules"].dump() : "none");
+            if (segwit_active && wd.m_data.contains("transactions")) {
+                // Compute raw wtxid merkle root from block template transactions
+                std::vector<uint256> wtxids;
+                uint256 zero;  // coinbase wtxid = 0x00
+                wtxids.push_back(zero);
+                for (auto& tx : wd.m_data["transactions"]) {
+                    uint256 wtxid;
+                    if (tx.is_object() && tx.contains("hash"))
+                        wtxid.SetHex(tx["hash"].get<std::string>());
+                    else if (tx.is_object() && tx.contains("txid"))
+                        wtxid.SetHex(tx["txid"].get<std::string>());
+                    wtxids.push_back(wtxid);
+                }
+                witness_root = compute_witness_merkle_root(std::move(wtxids));
+                // P2Pool commitment: SHA256d(witness_root || '[Pool]'*4)
+                witness_commitment = compute_p2pool_witness_commitment_hex(witness_root);
+            }
+
+            // Build fallback coinbase (without OP_RETURN, for non-p2pool or initial work)
+            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, pplns_outputs,
+                                            pplns_raw_scripts, mm_commitment, witness_commitment,
+                                            {}, uint256(), m_coinbase_text);
+        } catch (const std::exception& e) {
+            LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
+            cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
+        }
+
+        // Compute THE state root for sharechain anchoring (both LTC and merged coinbases)
+        uint32_t tmpl_h = wd.m_data.value("height", 0);
+        uint32_t tmpl_b = 0;
+        {
+            auto bs = wd.m_data.value("bits", std::string(""));
+            if (bs.size() == 8) tmpl_b = static_cast<uint32_t>(std::stoul(bs, nullptr, 16));
+        }
+        auto the_root = compute_the_state_root(pplns_outputs,
+            static_cast<uint32_t>(pplns_outputs.size()), tmpl_h, tmpl_b);
+
+        // Commit to cache under mutex
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        m_cached_template         = wd.m_data;
+        m_cached_merkle_branches  = std::move(merkle_branches);
+        m_cached_coinb1           = std::move(cb_parts.first);
+        m_cached_coinb2           = std::move(cb_parts.second);
+        m_segwit_active           = segwit_active;
+        m_cached_pplns_outputs    = std::move(pplns_outputs);
+        m_cached_raw_scripts      = pplns_raw_scripts;
+        m_cached_witness_commitment = std::move(witness_commitment);
+        m_cached_witness_root       = witness_root;
+        m_cached_mm_commitment    = std::move(mm_commitment);
+        m_cached_the_state_root   = the_root;
+        m_cached_sharechain_height = tmpl_h;
+        m_cached_miner_count       = static_cast<uint16_t>(m_cached_pplns_outputs.size());
+        m_cached_mweb             = wd.m_data.contains("mweb")
+                                  ? wd.m_data["mweb"].get<std::string>() : "";
+        m_work_valid              = true;
+        ++m_work_generation;
+        m_last_work_update_time   = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        m_last_work_latency.store(static_cast<double>(wd.m_latency), std::memory_order_relaxed);
+        LOG_INFO << "[LTC] refresh_work: height=" << wd.m_data.value("height", 0)
+                 << " txs=" << wd.m_hashes.size()
+                 << " latency=" << wd.m_latency << "ms"
+                 << " merkle_branches=" << m_cached_merkle_branches.size();
+
+        // Push real network difficulty to external consumers (AdjustmentEngine)
+        if (m_on_network_difficulty_fn) {
+            try {
+                uint32_t nbits_val = std::stoul(
+                    wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
+                double net_diff = chain::target_to_difficulty(
+                    chain::bits_to_target(nbits_val));
+                if (net_diff > 0) {
+                    m_on_network_difficulty_fn(net_diff);
+                    m_network_difficulty.store(net_diff, std::memory_order_relaxed);
+                    add_netdiff_sample(net_diff, "block");
+                }
+            } catch (...) {}
+        } else {
+            // Even without callback, store network difficulty for API endpoints
+            try {
+                uint32_t nbits_val = std::stoul(
+                    wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
+                double net_diff = chain::target_to_difficulty(
+                    chain::bits_to_target(nbits_val));
+                if (net_diff > 0) {
+                    m_network_difficulty.store(net_diff, std::memory_order_relaxed);
+                    add_netdiff_sample(net_diff, "block");
+                }
+            } catch (...) {}
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING << "refresh_work failed: " << e.what();
+        m_work_valid = false;
+    }
+}
+
+nlohmann::json MiningInterface::get_current_work_template() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_work_valid ? m_cached_template : nlohmann::json{};
+}
+
+std::vector<std::string> MiningInterface::get_stratum_merkle_branches() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_merkle_branches;
+}
+
+std::pair<std::string, std::string> MiningInterface::get_coinbase_parts() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return { m_cached_coinb1, m_cached_coinb2 };
+}
+
+bool MiningInterface::get_segwit_active() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_segwit_active;
+}
+
+std::string MiningInterface::get_cached_mweb() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_mweb;
+}
+
+std::string MiningInterface::get_cached_witness_commitment() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_witness_commitment;
+}
+
+uint256 MiningInterface::get_cached_witness_root() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_witness_root;
+}
+
+std::string MiningInterface::get_current_gbt_prevhash() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    if (!m_cached_template.is_null() && m_cached_template.contains("previousblockhash"))
+        return m_cached_template["previousblockhash"].get<std::string>();
+    return {};
+}
+
+MiningInterface::WorkSnapshot MiningInterface::get_work_snapshot() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    WorkSnapshot s;
+    s.segwit_active = m_segwit_active;
+    s.mweb = m_cached_mweb;
+    s.subsidy = m_cached_template.is_null() ? 0
+                : m_cached_template.value("coinbasevalue", uint64_t(0));
+    s.witness_commitment_hex = m_cached_witness_commitment;
+    s.witness_root = m_cached_witness_root;
+    return s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+nlohmann::json MiningInterface::getwork(const std::string& request_id)
+{
+    LOG_INFO << "getwork request received";
+    
+    // Get current difficulty from the c2pool node
+    double current_difficulty = 1.0; // Default fallback
+    std::string target_hex = "00000000ffff0000000000000000000000000000000000000000000000000000";
+    
+    if (m_node) {
+        // Get current session difficulty and global pool difficulty
+        auto difficulty_stats = m_node->get_difficulty_stats();
+        if (difficulty_stats.contains("global_pool_difficulty")) {
+            current_difficulty = difficulty_stats["global_pool_difficulty"];
+        }
+        
+        // Calculate target from difficulty
+        // Target = max_target / difficulty
+        // max_target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+        uint256 max_target;
+        max_target.SetHex("00000000FFFF0000000000000000000000000000000000000000000000000000");
+        
+        uint256 work_target = max_target / static_cast<uint64_t>(current_difficulty * 1000000); // Scale for precision
+        target_hex = work_target.GetHex();
+        
+        LOG_INFO << "Using pool difficulty: " << current_difficulty << ", target: " << target_hex;
+    } else {
+        LOG_WARNING << "No c2pool node connected, using default difficulty: " << current_difficulty;
+    }
+    
+    // Build work data from the cached block template if available
+    std::string work_data;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (m_work_valid && !m_cached_template.is_null()) {
+            // Build an 80-byte header stub (version + prevhash + merkle_placeholder + time + bits + nonce_placeholder)
+            uint32_t version = m_cached_template.value("version", 536870912U);
+            std::string prevhash = m_cached_template.value("previousblockhash", std::string(64, '0'));
+            std::string bits = m_cached_template.value("bits", std::string("1d00ffff"));
+            uint32_t curtime = static_cast<uint32_t>(m_cached_template.value("curtime", uint64_t(std::time(nullptr))));
+
+            std::ostringstream hdr;
+            hdr << std::hex << std::setfill('0')
+                << std::setw(2) << ((version      ) & 0xff)
+                << std::setw(2) << ((version >>  8) & 0xff)
+                << std::setw(2) << ((version >> 16) & 0xff)
+                << std::setw(2) << ((version >> 24) & 0xff)
+                << prevhash
+                << std::string(64, '0') // merkle root placeholder — miners fill this in
+                << std::setw(2) << ((curtime      ) & 0xff)
+                << std::setw(2) << ((curtime >>  8) & 0xff)
+                << std::setw(2) << ((curtime >> 16) & 0xff)
+                << std::setw(2) << ((curtime >> 24) & 0xff)
+                << bits
+                << "00000000"; // nonce placeholder
+            work_data = hdr.str();
+
+            // Derive target from bits
+            uint32_t nbits = static_cast<uint32_t>(std::stoul(bits, nullptr, 16));
+            uint256 tmpl_target = chain::bits_to_target(nbits);
+            target_hex = tmpl_target.GetHex();
+        }
+    }
+
+    if (work_data.empty()) {
+        // Fallback: static placeholder
+        work_data = "00000001" + std::string(64, '0') + std::string(64, '0')
+                    + "00000000" + "1d00ffff" + "00000000";
+        LOG_WARNING << "getwork: no live template, returning placeholder work";
+    }
+    
+    nlohmann::json work = {
+        {"data", work_data},
+        {"target", target_hex},
+        {"difficulty", current_difficulty}
+    };
+    
+    // Store work for later validation
+    std::string work_id = std::to_string(m_work_id_counter++);
+    m_active_work[work_id] = work;
+    
+    LOG_INFO << "Provided work to miner, work_id=" << work_id << ", difficulty=" << current_difficulty;
+    return work;
+}
+
+nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::string& header, const std::string& mix, const std::string& request_id)
+{
+    LOG_INFO << "Work submission received - nonce: " << nonce << ", header: " << header;
+    
+    // Validate the submitted work by computing scrypt PoW hash
+    bool work_valid = false;
+    if (header.size() >= 160) { // 80 bytes = 160 hex chars
+        auto header_bytes = ParseHex(header.substr(0, 160));
+        if (header_bytes.size() == 80) {
+            char pow_hash_bytes[32];
+            scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_bytes.data()), pow_hash_bytes);
+            uint256 pow_hash;
+            memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+            // Check against the template target
+            uint256 target;
+            {
+                std::lock_guard<std::mutex> lock(m_work_mutex);
+                if (m_work_valid && m_cached_template.contains("bits")) {
+                    std::string bits_hex = m_cached_template["bits"].get<std::string>();
+                    uint32_t bits = static_cast<uint32_t>(std::stoul(bits_hex, nullptr, 16));
+                    target = chain::bits_to_target(bits);
+                } else {
+                    target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+                }
+            }
+            work_valid = (pow_hash <= target);
+            LOG_INFO << "PoW check: hash=" << pow_hash.GetHex().substr(0, 16)
+                     << "... target=" << target.GetHex().substr(0, 16)
+                     << "... valid=" << work_valid;
+        }
+    }
+    
+    if (work_valid && m_node) {
+        // Track the mining_share submission for difficulty adjustment
+        std::string session_id = "miner_" + std::to_string(m_work_id_counter);
+        m_node->track_mining_share_submission(session_id, 1.0);
+        
+        // Create a new mining_share and add to the sharechain
+        uint256 share_hash;
+        share_hash.SetHex(header); // Simplified - would need proper hash calculation
+        
+        uint256 prev_hash = m_best_share_hash_fn ? m_best_share_hash_fn() : uint256::ZERO;
+        uint256 target;
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (m_work_valid && m_cached_template.contains("bits")) {
+                std::string bits_hex = m_cached_template["bits"].get<std::string>();
+                uint32_t bits = static_cast<uint32_t>(std::stoul(bits_hex, nullptr, 16));
+                target = chain::bits_to_target(bits);
+            } else {
+                target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+            }
+        }
+        
+        m_node->add_local_mining_share(share_hash, prev_hash, target);
+        
+        LOG_INFO << "Mining share submitted and added to sharechain: " << share_hash.ToString();
+        LOG_INFO << "Work submission accepted";
+        return true;
+    } else if (work_valid) {
+        LOG_INFO << "Work submission accepted (no node connected for tracking)";
+        return true;
+    } else {
+        LOG_WARNING << "Work submission rejected - invalid work";
+        return false;
+    }
+}
+
+nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, const std::string& request_id)
+{
+    LOG_INFO << "getblocktemplate request received";
+
+    // Return live template if available
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (m_work_valid && !m_cached_template.empty())
+            return m_cached_template;
+    }
+
+    // Fallback: static placeholder so callers always get a valid JSON object
+    LOG_WARNING << "getblocktemplate: no live template yet, returning placeholder";
+    return {
+        {"version", 536870912},
+        {"previousblockhash", "0000000000000000000000000000000000000000000000000000000000000000"},
+        {"transactions", nlohmann::json::array()},
+        {"coinbaseaux", nlohmann::json::object()},
+        {"coinbasevalue", 5000000000LL},
+        {"target", "00000000ffff0000000000000000000000000000000000000000000000000000"},
+        {"mintime", 1234567890},
+        {"mutable", nlohmann::json::array({"time", "transactions", "prevblock"})},
+        {"noncerange", "00000000ffffffff"},
+        {"sigoplimit", 20000},
+        {"sizelimit", 1000000},
+        {"curtime", static_cast<uint64_t>(std::time(nullptr))},
+        {"bits", "1d00ffff"},
+        {"height", 1},
+        {"rules", nlohmann::json::array({"segwit"})}
+    };
+}
+
+// #886 recent-won-block dedup helpers. Keyed on the BLOCK HASH, recorded only
+// on a SUCCESSFUL submit. Linear scan over a bounded FIFO (<=256) — the won-block
+// path is rare, so this is trivially cheap and avoids a std::hash<uint256>.
+bool MiningInterface::already_submitted_block(const uint256& block_hash) const
+{
+    std::lock_guard<std::mutex> lk(m_recent_submit_mutex);
+    for (const auto& h : m_recent_submitted_blocks)
+        if (h == block_hash) return true;
+    return false;
+}
+
+void MiningInterface::mark_block_submitted(const uint256& block_hash)
+{
+    std::lock_guard<std::mutex> lk(m_recent_submit_mutex);
+    for (const auto& h : m_recent_submitted_blocks)
+        if (h == block_hash) return;              // already recorded
+    m_recent_submitted_blocks.push_back(block_hash);
+    while (m_recent_submitted_blocks.size() > kRecentSubmitCap)
+        m_recent_submitted_blocks.pop_front();
+}
+
+nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const std::string& request_id)
+{
+    LOG_TRACE << "[LTC] submitblock: received " << hex_data.length() / 2 << " bytes";
+
+    // Block header is 80 bytes = 160 hex chars minimum
+    if (hex_data.size() < 160) {
+        LOG_ERROR << "[LTC] submitblock: hex data too short for a valid block header";
+        return {{"error", "block data too short"}};
+    }
+
+    // Parse the 80-byte block header:
+    //   bytes  0- 3: version  (uint32 LE)
+    //   bytes  4-35: prev_block_hash (32 bytes, internal byte order)
+    //   bytes 36-67: merkle_root     (32 bytes, internal byte order)
+    //   bytes 68-71: timestamp (uint32 LE)
+    //   bytes 72-75: nbits     (uint32 LE)
+    //   bytes 76-79: nonce     (uint32 LE)
+    auto header_bytes = ParseHex(hex_data.substr(0, 160));
+
+    // Extract prev_block_hash (bytes 4..35), reversed for display/comparison
+    uint256 submitted_prev_hash;
+    std::memcpy(submitted_prev_hash.data(), header_bytes.data() + 4, 32);
+
+    // Extract merkle_root (bytes 36..67)
+    uint256 submitted_merkle_root;
+    std::memcpy(submitted_merkle_root.data(), header_bytes.data() + 36, 32);
+
+    // Compare prev_block_hash against our cached template. A MISMATCH is a RACE,
+    // NOT a guaranteed loss: a chain-extended block is a valid same-height
+    // competitor, a 1-block reorg block leads by one, and only a block buried 2+
+    // deep is unwinnable — and forwarding even that is free (the daemon stores a
+    // dead orphan). GUIDING INVARIANT: never REFUSE a block the daemon might
+    // accept — a false refusal is a guaranteed irreversible loss, whereas a
+    // truly-dead block is rejected by the daemon for free. So "stale" is ADVISORY
+    // telemetry only: we log it, mark it in metrics, then FALL THROUGH to the
+    // normal submit path and let the daemon be the authority on validity at the
+    // block's real height. (Previously this path early-returned a synthetic
+    // "stale" error and DROPPED the block, forfeiting winnable race blocks —
+    // this is LTC's + NMC's primary won-block submit path.)
+    bool is_stale = false;
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (m_work_valid && !m_cached_template.is_null()
+                && m_cached_template.contains("previousblockhash"))
+            {
+                uint256 expected_prev;
+                expected_prev.SetHex(m_cached_template["previousblockhash"].get<std::string>());
+                if (submitted_prev_hash != expected_prev) {
+                    LOG_WARNING << "[LTC] submitblock: stale/race block — prev_hash mismatch"
+                                << " submitted=" << submitted_prev_hash.GetHex()
+                                << " expected=" << expected_prev.GetHex()
+                                << " — forwarding to daemon anyway (daemon is authority)";
+                    is_stale = true;
+                }
+            }
+
+            // Reconstruct expected merkle_root from coinbase + merkle branches
+            if (!is_stale && !m_cached_coinb1.empty() && !m_cached_coinb2.empty()) {
+                LOG_TRACE << "[LTC] submitblock: merkle_root=" << submitted_merkle_root.GetHex();
+            }
+        }
+        // The race/stale telemetry is NOT fired eagerly here. When the daemon is
+        // RPC-armed, a stale/race block can still be ACCEPTED (we win the race),
+        // and must then be credited as a WON block (stale_info 0) so the consumer
+        // runs broadcast_bestblock + schedule_block_verification and the found
+        // block is NOT left pending/ORPHAN. So we fire EXACTLY ONE callback per
+        // block: AFTER the daemon verdict (RPC arm below), or synchronously in the
+        // embedded / no-verdict arms.
+    }
+
+    if (m_coin_node && m_coin_node->has_rpc()) {
+        try {
+            bool accepted = m_coin_node->submit_block_hex(hex_data, false);
+            LOG_INFO << "Block forwarded to coin daemon"
+                     << (is_stale ? " (stale/race — daemon is authority on validity)" : "");
+            if (accepted) {
+                // WON. Fire the single found-block callback with stale_info 0 EVEN
+                // for a stale/race block: an accepted race is a real, paid win and
+                // must be credited (broadcast_bestblock + schedule_block_verification).
+                // record_found_block dedups by block hash, so firing at verdict time
+                // is double-record-safe.
+                if (m_on_block_submitted && hex_data.size() >= 160) {
+                    m_on_block_submitted(hex_data.substr(0, 160), 0);
+                }
+                // Relay full block via P2P for fast propagation
+                if (m_on_block_relay) {
+                    m_on_block_relay(hex_data);
+                }
+            } else {
+                // Daemon REJECTED (or already had) the block: return its verdict to
+                // the caller instead of a synthetic "stale" error. Fire the single
+                // callback ONLY for a stale/race block, recording it as ORPHAN (253)
+                // so the race stays visible. For a NON-stale block fire nothing —
+                // matching the prior telemetry (which only recorded on the exception
+                // path) — and because a "false" return can also mean daemon-duplicate
+                // (block already accepted via P2P), which must not be mis-counted.
+                LOG_WARNING << "submitblock: coin daemon rejected the block (or already had it)";
+                if (is_stale && m_on_block_submitted && hex_data.size() >= 160) {
+                    m_on_block_submitted(hex_data.substr(0, 160), 253);
+                }
+                return {{"error", "block rejected by coin daemon"}};
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR << "submitblock failed: " << e.what();
+            // DOA (RPC transport failure — no verdict). Fire the single callback:
+            // 253 for a stale/race block, else 254.
+            if (m_on_block_submitted && hex_data.size() >= 160) {
+                m_on_block_submitted(hex_data.substr(0, 160), is_stale ? 253 : 254);
+            }
+            return {{"error", std::string(e.what())}};
+        }
+    } else if (m_coin_node && m_coin_node->is_embedded()) {
+        // Phase 4 embedded mode: no daemon — relay the block directly via P2P.
+        // on_block_relay is wired to CoinBroadcaster::submit_block_raw().
+        size_t block_size = hex_data.size() / 2;
+        LOG_INFO << "[EMB-LTC] submitblock: embedded relay " << block_size << " bytes";
+
+        // Parse and log header fields for debugging
+        if (hex_data.size() >= 160) {
+            auto hdr = ParseHex(hex_data.substr(0, 160));
+            uint32_t ver = hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | (hdr[3]<<24);
+            LOG_INFO << "[EMB-LTC] submitblock header:"
+                     << " version=0x" << std::hex << ver << std::dec
+                     << " prev=" << HexStr(std::span<const unsigned char>(hdr.data()+4, 32))
+                     << " merkle=" << HexStr(std::span<const unsigned char>(hdr.data()+36, 32))
+                     << " bits=" << HexStr(std::span<const unsigned char>(hdr.data()+72, 4))
+                     << " nonce=" << HexStr(std::span<const unsigned char>(hdr.data()+76, 4));
+            // Log tx count varint
+            if (hex_data.size() > 162) {
+                auto txcnt_byte = ParseHex(hex_data.substr(160, 2));
+                LOG_INFO << "[EMB-LTC] submitblock tx_count_byte=0x"
+                         << std::hex << (int)txcnt_byte[0] << std::dec
+                         << " total_hex_len=" << hex_data.size();
+            }
+        }
+
+        // Save block hex to file for manual submitblock testing. Kept at a
+        // fixed /tmp path (NOT re-rooted under --data-dir): it is a transient
+        // manual-test artifact, and routing an env/CLI-derived path into a
+        // file sink trips CodeQL cpp/path-injection with no isolation benefit
+        // (per-instance state that matters — LevelDB, addrs, logs — is already
+        // isolated via config_path()). See #722.
+        {
+            std::string path = "/tmp/c2pool_block_" + std::to_string(std::time(nullptr)) + ".hex";
+            std::ofstream f(path);
+            if (f) {
+                f << hex_data;
+                LOG_INFO << "[EMB-LTC] Block hex saved to " << path
+                         << " (" << block_size << " bytes)"
+                         << " — test with: litecoin-cli -testnet submitblock $(cat " << path << ")";
+            }
+        }
+
+        // Fire the single found-block callback synchronously (embedded has no
+        // synchronous daemon verdict — it relays via P2P and does async RPC
+        // feedback below). A stale/race block is recorded as ORPHAN (253); a fresh
+        // block as WON (0). The block is still relayed via P2P regardless.
+        if (m_on_block_submitted && hex_data.size() >= 160)
+            m_on_block_submitted(hex_data.substr(0, 160), is_stale ? 253 : 0);
+
+        // Thread the slow parts (P2P relay + RPC) so stratum isn't blocked.
+        // P2P relay runs FIRST — fast propagation is critical for block acceptance.
+        // RPC runs SECOND — provides accept/reject feedback but is not time-critical.
+        auto rpc_fn   = m_rpc_submit_fallback;
+        auto relay_fn = m_on_block_relay;
+        std::string hex_copy = hex_data;
+        std::thread([rpc_fn, relay_fn, hex_copy]() {
+            // 1) P2P relay to all connected peers — time-critical for acceptance
+            if (relay_fn) {
+                try {
+                    relay_fn(hex_copy);
+                    LOG_INFO << "[EMB-LTC] P2P block relay dispatched";
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "[EMB-LTC] P2P relay exception: " << e.what();
+                }
+            } else {
+                LOG_WARNING << "[EMB-LTC] No P2P relay callback — block not broadcast!";
+            }
+            // 2) RPC submitblock (if configured) — accept/reject feedback
+            if (rpc_fn) {
+                std::string rpc_err = rpc_fn(hex_copy);
+                if (rpc_err.empty()) {
+                    LOG_INFO << "[EMB-LTC] submitblock via RPC: ACCEPTED";
+                } else {
+                    LOG_WARNING << "[EMB-LTC] submitblock via RPC: REJECTED — " << rpc_err;
+                }
+            }
+        }).detach();
+    } else {
+        LOG_WARNING << "[LTC] submitblock: no coin RPC or embedded node connected, block discarded";
+        // No verdict and no forward path: a stale/race block is genuinely lost
+        // here, so record it as ORPHAN (253) to keep the race visible in metrics.
+        if (is_stale && m_on_block_submitted && hex_data.size() >= 160)
+            m_on_block_submitted(hex_data.substr(0, 160), 253);
+    }
+
+    return nullptr; // null = accepted in getblocktemplate spec
+}
+
+nlohmann::json MiningInterface::getinfo(const std::string& request_id)
+{
+    double current_difficulty = 1.0;
+    double pool_hashrate = 0.0;
+    uint64_t total_shares = 0;
+    uint64_t connections = 0;
+    
+    // Get stats from c2pool node if available
+    if (m_node) {
+        auto difficulty_stats = m_node->get_difficulty_stats();
+        if (difficulty_stats.contains("global_pool_difficulty")) {
+            current_difficulty = difficulty_stats["global_pool_difficulty"];
+        }
+        
+        auto hashrate_stats = m_node->get_hashrate_stats();
+        if (hashrate_stats.contains("global_hashrate")) {
+            pool_hashrate = hashrate_stats["global_hashrate"];
+        }
+        
+        total_shares = m_node->get_total_mining_shares();
+        connections = m_node->get_connected_peers_count();
+    }
+    
+    // Prefer the live MiningInterface hooks over the m_node accessors.
+    // In the embedded prod build m_node is the unpopulated enhanced_node stub
+    // whose peer/hashrate accessors return 0 -- the source of the false
+    // "no peers / 0 hashrate" dashboard alarms. m_peer_info_fn (real c2pool
+    // share peers) and m_pool_hashrate_fn (real attempts/s) are wired live.
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array()) connections = pi.size();
+    }
+    if (double real_hs = get_pool_hashrate(); real_hs > 0.0)
+        pool_hashrate = real_hs;
+
+    // poolshares + difficulty previously came ONLY from the empty m_node stub
+    // (get_total_mining_shares()/get_difficulty_stats() return 0 on the
+    // embedded prod build) -- the same false-zero source as the founding
+    // connections/poolhashps bug. Source them from the live sharechain stats
+    // hook (the truthful source #462 used for stale/DOA): total_shares =
+    // current sharechain length, average_difficulty = PPLNS-window share diff.
+    if (m_sharechain_stats_fn) {
+        auto ss = m_sharechain_stats_fn();
+        if (ss.contains("total_shares") && ss["total_shares"].is_number())
+            total_shares = ss["total_shares"].get<uint64_t>();
+        if (ss.contains("average_difficulty") && ss["average_difficulty"].is_number()
+            && ss["average_difficulty"].get<double>() > 0.0)
+            current_difficulty = ss["average_difficulty"].get<double>();
+    }
+
+    // Read block height from cached template
+    uint64_t block_height = 0;
+    double network_hashps = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("height"))
+            block_height = m_cached_template["height"].get<uint64_t>();
+    }
+    // Real network hashrate -- same source as /global_rate (net_difficulty
+    // * 2^32 / block_period, template fallback). Previously left at 0.0,
+    // which made the dashboard graphs/stats tabs report networkhashps:0
+    // while the chain was live. rest_global_rate() locks m_work_mutex
+    // itself, so it MUST be called after the block above releases it.
+    if (auto gr = rest_global_rate(); gr.is_number())
+        network_hashps = gr.get<double>();
+    
+    nlohmann::json protocol_messages = nlohmann::json::array();
+    if (m_protocol_messages_fn) {
+        try {
+            protocol_messages = m_protocol_messages_fn();
+        } catch (const std::exception& e) {
+            LOG_WARNING << "protocol_messages hook failed: " << e.what();
+        }
+    }
+
+    auto operator_blob = get_operator_message_blob();
+
+    return {
+        {"version", m_pool_version},
+        {"protocolversion", 70015},
+        {"blocks", block_height},
+        {"connections", connections},
+        {"difficulty", current_difficulty},
+        {"networkhashps", network_hashps},
+        {"poolhashps", pool_hashrate},
+        {"poolshares", total_shares},
+        {"generate", true},
+        {"genproclimit", -1},
+        {"testnet", m_testnet},
+        {"paytxfee", 0.0},
+        {"errors", ""},
+        {"operator_message_blob_hex", to_hex(operator_blob)},
+        {"protocol_messages", protocol_messages}
+    };
+}
+
+nlohmann::json MiningInterface::getstats(const std::string& request_id)
+{
+    uint64_t total_mining_shares = 0;
+    uint64_t connected_peers = 0;
+    double pool_hashrate = 0.0;
+    double difficulty = 1.0;
+    uint64_t active_miners = 0;
+
+    if (m_node) {
+        total_mining_shares = m_node->get_total_mining_shares();
+        connected_peers = m_node->get_connected_peers_count();
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("global_hashrate"))
+            pool_hashrate = hs["global_hashrate"];
+        auto ds = m_node->get_difficulty_stats();
+        if (ds.contains("global_pool_difficulty"))
+            difficulty = ds["global_pool_difficulty"];
+    }
+
+    // Prefer live hooks over the empty m_node stub (see getinfo above).
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array()) connected_peers = pi.size();
+    }
+    if (double real_hs = get_pool_hashrate(); real_hs > 0.0)
+        pool_hashrate = real_hs;
+
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm)
+        active_miners = pm->get_active_miners_count();
+
+    uint64_t block_height = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("height"))
+            block_height = m_cached_template["height"].get<uint64_t>();
+    }
+
+    // Prefer the live sharechain-stats hook over the empty m_node stub: m_node
+    // returns zeros on prod, so getstats lied about orphan/DOA/stale shares while
+    // /stale_rates (same hook) reported the truth. Charter: dashboards must not lie.
+    nlohmann::json stale = {{"orphan_count", 0}, {"doa_count", 0}, {"stale_count", 0}, {"stale_prop", 0.0}};
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        uint64_t total  = sc.value("total_shares", uint64_t(0));
+        uint64_t orphan = sc.value("orphan_shares", uint64_t(0));
+        uint64_t dead   = sc.value("dead_shares", uint64_t(0));
+        stale["orphan_count"] = orphan;
+        stale["doa_count"]    = dead;
+        stale["stale_count"]  = orphan + dead;
+        stale["stale_prop"]   = total > 0
+            ? static_cast<double>(orphan + dead) / static_cast<double>(total)
+            : 0.0;
+    } else if (m_node) {
+        stale = m_node->get_stale_stats();
+    }
+
+    nlohmann::json protocol_messages = nlohmann::json::array();
+    if (m_protocol_messages_fn) {
+        try {
+            protocol_messages = m_protocol_messages_fn();
+        } catch (const std::exception& e) {
+            LOG_WARNING << "protocol_messages hook failed: " << e.what();
+        }
+    }
+
+    auto operator_blob = get_operator_message_blob();
+
+    return {
+        {"pool_statistics", {
+            {"mining_shares", total_mining_shares},
+            {"pool_hashrate", pool_hashrate},
+            {"difficulty", difficulty},
+            {"block_height", block_height},
+            {"connected_peers", connected_peers},
+            {"active_miners", active_miners},
+            {"orphan_shares", stale["orphan_count"]},
+            {"doa_shares", stale["doa_count"]},
+            {"stale_shares", stale["stale_count"]},
+            {"stale_prop", stale["stale_prop"]}
+        }},
+        {"operator_message_blob_hex", to_hex(operator_blob)},
+        {"protocol_messages", protocol_messages}
+    };
+}
+
+nlohmann::json MiningInterface::setmessageblob(const std::string& message_blob_hex,
+                                               const std::string& request_id)
+{
+    if (message_blob_hex.empty()) {
+        set_operator_message_blob({});
+        return {
+            {"ok", true},
+            {"enabled", false},
+            {"size", 0},
+            {"message", "operator message blob cleared"}
+        };
+    }
+
+    if (message_blob_hex.size() % 2 != 0) {
+        throw jsonrpccxx::JsonRpcException(-1, "message blob hex length must be even");
+    }
+
+    std::vector<unsigned char> blob;
+    try {
+        blob = ParseHex(message_blob_hex);
+    } catch (const std::exception& e) {
+        throw jsonrpccxx::JsonRpcException(-1, std::string("invalid hex blob: ") + e.what());
+    }
+
+    if (blob.size() > 4096) {
+        throw jsonrpccxx::JsonRpcException(-1, "message blob too large (max 4096 bytes)");
+    }
+
+    // Validate encrypted authority blob using V36 consensus validation path.
+    auto err = ltc::validate_message_data(blob);
+    if (!err.empty()) {
+        throw jsonrpccxx::JsonRpcException(-1, "message blob rejected: " + err);
+    }
+
+    set_operator_message_blob(blob);
+    scan_blob_for_featured_node(blob);  // freshest-wins featured-node banner at runtime
+    return {
+        {"ok", true},
+        {"enabled", true},
+        {"size", blob.size()},
+        {"hex", message_blob_hex}
+    };
+}
+
+nlohmann::json MiningInterface::getmessageblob(const std::string& request_id)
+{
+    auto blob = get_operator_message_blob();
+    return {
+        {"enabled", !blob.empty()},
+        {"size", blob.size()},
+        {"hex", to_hex(blob)}
+    };
+}
+
+nlohmann::json MiningInterface::getpeerinfo(const std::string& request_id)
+{
+    // Prefer the live share-peer hook (real per-peer list from
+    // p2p_node->get_peer_info_json) over the empty m_node stub. On the
+    // embedded prod build m_node->get_connected_peers_count() returns 0 while
+    // the node is fully peered -- the same founding-charter lie that getinfo/
+    // getstats already route around. getpeerinfo must report the real peers.
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array())
+            return pi;
+    }
+
+    nlohmann::json peers = nlohmann::json::array();
+    if (m_node) {
+        size_t count = m_node->get_connected_peers_count();
+        // Fallback only (API-only mode, no live hook): minimal aggregate count.
+        peers.push_back({
+            {"connected_peers", count}
+        });
+    }
+    return peers;
+}
+
+nlohmann::json MiningInterface::getpayoutinfo(const std::string& request_id)
+{
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (!pm)
+        return {{"error", "payout manager not available"}};
+
+    return pm->get_payout_statistics();
+}
+
+nlohmann::json MiningInterface::getminerstats(const std::string& request_id)
+{
+    nlohmann::json result;
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm) {
+        result["active_miners"] = pm->get_active_miners_count();
+        result["pplns_active"] = pm->has_pplns_data();
+        result["payout_statistics"] = pm->get_payout_statistics();
+    }
+    if (m_node) {
+        result["hashrate"] = m_node->get_hashrate_stats();
+        result["difficulty"] = m_node->get_difficulty_stats();
+        result["stale_stats"] = m_node->get_stale_stats();
+    }
+    return result;
+}
+
+// ──────────────────────── p2pool-compatible REST endpoints ────────────────────
+
+nlohmann::json MiningInterface::rest_local_rate()
+{
+    double rate = 0.0;
+    if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("global_hashrate"))
+            rate = hs["global_hashrate"];
+    }
+    return rate;
+}
+
+nlohmann::json MiningInterface::rest_global_rate()
+{
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    if (net_diff > 0) {
+        // network_hashrate = net_difficulty * 2^32 / block_period (150s for LTC)
+        return net_diff * 4294967296.0 / 150.0;
+    }
+    double rate = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("networkhashps"))
+            rate = m_cached_template["networkhashps"].get<double>();
+    }
+    return rate;
+}
+
+nlohmann::json MiningInterface::rest_current_payouts()
+{
+    nlohmann::json result = nlohmann::json::object();
+    bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+
+    // #939: authoritative direct source, when a coin wires one (DASH has no
+    // coinbase-builder PPLNS cache feeding this endpoint, so it returned {} on
+    // a node with a full window and live balances). Only trust a non-empty
+    // object -- an empty/absent feed falls through to the cache + fallback
+    // below rather than masking them.
+    if (m_current_payouts_fn) {
+        auto direct = m_current_payouts_fn();
+        if (direct.is_object() && !direct.empty())
+            return direct;
+    }
+
+    // Script-to-address resolver — picks chain-specific version bytes so
+    // Dash payouts render as 'X...' not Bitcoin '1...'.
+    auto resolve_addr = [this, is_ltc](const std::vector<unsigned char>& s) -> std::string {
+        if (m_blockchain == Blockchain::DASH) {
+            uint8_t p2pkh = m_testnet ? 140 : 76;   // Dash: 'y' / 'X'
+            uint8_t p2sh  = m_testnet ?  19 : 16;   // Dash: '7'
+            return core::script_to_address(s, "", p2pkh, p2sh);
+        }
+        return core::script_to_address(s, is_ltc, m_testnet);
+    };
+
+    // Primary source: cached PPLNS outputs from the coinbase builder.
+    // These are always up-to-date with the latest share template and subsidy.
+    auto cached = get_cached_pplns_outputs();
+    if (!cached.empty()) {
+        // Skip zero-address burn entries (20-byte zero hash from PPLNS-empty fallback).
+        // These are not real payouts — they indicate PPLNS is not yet computed.
+        static const std::string zero_burn = "0000000000000000000000000000000000000000";
+
+        for (const auto& [script_hex, amount] : cached) {
+            if (script_hex == zero_burn)
+                continue;  // Don't expose the burn placeholder to the API
+
+            // script_hex is a hex-encoded scriptPubKey — decode to bytes, then to address
+            auto script_bytes = ParseHex(script_hex);
+            std::string addr = resolve_addr(script_bytes);
+            if (addr.empty() && script_bytes.size() > 33 && script_bytes.back() == 0xac) {
+                // P2PK: PUSH<len> <pubkey> OP_CHECKSIG → hash pubkey → P2PKH address
+                size_t pk_len = script_bytes[0];
+                if (pk_len + 1 == script_bytes.size() - 1) {
+                    // SHA256 → RIPEMD160 (Hash160)
+                    unsigned char sha[32], rip[20];
+                    CSHA256().Write(&script_bytes[1], pk_len).Finalize(sha);
+                    CRIPEMD160().Write(sha, 32).Finalize(rip);
+                    std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+                    p2pkh.insert(p2pkh.end(), rip, rip + 20);
+                    p2pkh.push_back(0x88);
+                    p2pkh.push_back(0xac);
+                    addr = resolve_addr(p2pkh);
+                }
+            }
+            if (addr.empty())
+                addr = script_hex;
+            // p2pool returns coins (not satoshis)
+            result[addr] = static_cast<double>(amount) / 1e8;
+        }
+        // Only short-circuit when we actually surfaced real payouts. If the
+        // cache held ONLY the zero-address burn placeholder (PPLNS-empty
+        // fallback state), result is empty here -- do NOT report {} as final;
+        // fall through to the PayoutManager source below (#939).
+        if (!result.empty())
+            return result;
+    }
+
+    // Fallback: PayoutManager (for modes without coinbase builder)
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm && pm->has_pplns_data()) {
+        uint64_t subsidy = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (!m_cached_template.is_null())
+                subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+        }
+        if (subsidy > 0) {
+            auto outputs = pm->calculate_pplns_outputs(subsidy);
+            for (const auto& [script, amount] : outputs) {
+                std::string addr = resolve_addr(script);
+                if (addr.empty() && script.size() > 33 && script.back() == 0xac) {
+                    size_t pk_len = script[0];
+                    if (pk_len + 1 == script.size() - 1) {
+                        unsigned char sha[32], rip[20];
+                        CSHA256().Write(&script[1], pk_len).Finalize(sha);
+                        CRIPEMD160().Write(sha, 32).Finalize(rip);
+                        std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+                        p2pkh.insert(p2pkh.end(), rip, rip + 20);
+                        p2pkh.push_back(0x88);
+                        p2pkh.push_back(0xac);
+                        addr = resolve_addr(p2pkh);
+                    }
+                }
+                if (addr.empty()) {
+                    static const char* HEX = "0123456789abcdef";
+                    addr.reserve(script.size() * 2);
+                    for (unsigned char b : script) {
+                        addr += HEX[b >> 4];
+                        addr += HEX[b & 0x0f];
+                    }
+                }
+                result[addr] = static_cast<double>(amount) / 1e8;
+            }
+        }
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_users()
+{
+    // Prefer sharechain unique miners count (matches /global_stats)
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object()) {
+            int count = static_cast<int>(sc["shares_by_miner"].size());
+            if (count > 0) return nlohmann::json(count);
+        }
+    }
+    // Fallback to payout manager
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    return pm ? nlohmann::json(pm->get_active_miners_count()) : nlohmann::json(0);
+}
+
+nlohmann::json MiningInterface::rest_fee()
+{
+    return m_pool_fee_percent;
+}
+
+std::string MiningInterface::block_explorer_prefix() const
+{
+    // Operator override wins on every coin (same source rest_web_currency_info
+    // advertises as block_explorer_url_prefix), so a node configured for chainz
+    // or any other explorer links found blocks through it.
+    if (!m_custom_block_explorer.empty())
+        return m_custom_block_explorer;
+    // Label-keyed coins that share a Blockchain enum value (BCH on BITCOIN;
+    // NMC AuxPoW) resolve from the coin label so a BCH node does not emit
+    // Bitcoin's block explorer. Enum-native coins never match these labels.
+    {
+        std::string label = m_coin_label;
+        for (auto& ch : label) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+        if (label == "BCH") return "https://blockchair.com/bitcoin-cash/block/";
+        if (label == "NMC") return "https://nmc.tokenview.io/en/blockdetail/";
+    }
+    switch (m_blockchain) {
+    case Blockchain::LITECOIN:
+        return m_testnet ? "https://blockchair.com/litecoin/testnet/block/"
+                         : "https://blockchair.com/litecoin/block/";
+    case Blockchain::BITCOIN:  return "https://blockchair.com/bitcoin/block/";
+    case Blockchain::DOGECOIN: return "https://blockchair.com/dogecoin/block/";
+    case Blockchain::DASH:     return "https://blockchair.com/dash/block/";
+    // Blockchair does not list DigiByte; digiexplorer.info is the live DGB
+    // explorer (matches rest_web_currency_info + classify.ts + c2pool-qt).
+    case Blockchain::DIGIBYTE: return "https://digiexplorer.info/block/";
+    default:                   return "";   // unknown coin -> caller emits null
+    }
+}
+
+nlohmann::json MiningInterface::rest_recent_blocks()
+{
+    static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
+    nlohmann::json arr = nlohmann::json::array();
+
+    // actual_hash_difficulty: how far below target the WINNING hash landed,
+    // = diff1 / block_hash (the p2pool-dash formula, web.py:1754). It is the
+    // "quality of the found hash" the dashboard's drawDiffRatioBars / diamond
+    // elevation / Hash Difficulty column all read, and which no backend has
+    // ever emitted (#1137) -- so those visuals have been dead on every lane.
+    //
+    // It is ONLY meaningful where the BLOCK HASH IS the PoW hash: DASH (X11)
+    // and BTC (SHA256d). On scrypt lanes (LTC/DOGE) and multi-algo DGB the
+    // block identity hash is SHA256d while the PoW is a different function, so
+    // diff1/block_hash would describe the WRONG hash. Those lanes emit null
+    // here until a pow_hash is captured at find time -- a larger change,
+    // deliberately scoped out (it needs a FoundBlock field + mint-path plumbing
+    // on every scrypt lane). Emitting a plausible-but-wrong number would be the
+    // exact fabricated-value defect the honest-null rule above exists to stop.
+    const bool block_hash_is_pow_hash =
+        (m_blockchain == Blockchain::DASH || m_blockchain == Blockchain::BITCOIN);
+    auto actual_hash_difficulty = [&](const std::string& hash_hex) -> nlohmann::json {
+        if (!block_hash_is_pow_hash || hash_hex.size() != 64)
+            return nlohmann::json(nullptr);
+        uint256 h;
+        h.SetHex(hash_hex);
+        if (h.IsNull()) return nlohmann::json(nullptr);
+        double d = chain::target_to_difficulty(h);   // diff1 / hash
+        return d > 0.0 ? nlohmann::json(d) : nlohmann::json(nullptr);
+    };
+
+    // #57 oracle parity: coin-generic block-explorer deep link (chainz-style),
+    // block reward in whole coins, luck-provenance sample counts, and a
+    // first-row pool luck aggregate. All DISPLAY-ONLY and honest-null (#942):
+    // an unmeasured value is null, never a fabricated 0.
+    const std::string explorer_prefix = block_explorer_prefix();
+    auto explorer_url = [&](const std::string& hash_hex) -> nlohmann::json {
+        if (explorer_prefix.empty() || hash_hex.empty())
+            return nlohmann::json(nullptr);
+        return nlohmann::json(explorer_prefix + hash_hex);
+    };
+    // Pool luck aggregate, accumulated over the rows as we build them. c2pool
+    // derives each block's luck from ONE network-difficulty and ONE pool-
+    // hashrate reading sampled at find time -- it does not interval-average
+    // between blocks the way the p2pool-dash oracle does -- so every computed
+    // luck is honestly the "single_hashrate" method and is approximate.
+    double luck_sum = 0.0;
+    uint64_t luck_count = 0;
+
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    for (const auto& b : m_found_blocks) {
+        // Node-role honesty (#942): a block with no local share_hash AND no
+        // miner address is one this node did NOT find -- it was learned from a
+        // peer over P2P relay. A relay node therefore has no local timing for
+        // it, so luck_method must not fabricate a computed-luck label
+        // ("first_block" wrongly implied a luck computation was attempted), and
+        // the timing-derived fields are honest-absent (null) rather than a
+        // real-looking 0.
+        //
+        // NAMING (2026-08-07): this predicate asks "do we hold a local record
+        // of the block", NOT "did we find it" — a sharechain peer's block
+        // satisfies it, because the gossiped share carries both fields. The
+        // two questions were conflated under one name; authorship now has its
+        // own field (b.authorship, emitted as found_by) set at the call site
+        // that knows. The wire key `found_locally` keeps its existing meaning
+        // and its existing consumers; read `found_by` for authorship.
+        const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
+        std::string method;
+        if (!have_local_record)                    method = "relayed";
+        else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
+        else                                       method = "first_block";
+        // #942 second slice, extended to EVERY unmeasured field (hotel,
+        // 2026-08-05): the primary's rows for our own blocks rendered
+        // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
+        // were data. A zero that was never measured is emitted as null — the
+        // same honesty rule the timing fields already follow — so the UI
+        // renders '-' instead of a fabricated measurement. A luck of 0 on a
+        // found_locally row means "not computed" (first block, or recorded
+        // with no difficulty), never "0% lucky": also null.
+        auto num_or_null = [](double v) {
+            return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
+        };
+        // A luck value exists only on a row we hold locally that actually
+        // computed one (time_to_find>0 && luck>0). Those rows feed both the
+        // per-row luck_approximate flag and the first-row pool aggregate below.
+        const bool luck_present = have_local_record && b.luck > 0.0
+                                  && b.time_to_find > 0.0;
+        if (luck_present) { luck_sum += b.luck; ++luck_count; }
+        // block_reward: the raw-duff subsidy expressed in whole coins, kept
+        // ALONGSIDE the existing integer `subsidy` field. 1e8 base units per
+        // coin holds for every lane this build serves (DASH/LTC/DOGE/BTC/DGB).
+        nlohmann::json block_reward = b.subsidy != 0
+            ? nlohmann::json(static_cast<double>(b.subsidy) / 1e8)
+            : nlohmann::json(nullptr);
+        // Sample-count provenance. c2pool derives luck from ONE difficulty and
+        // ONE hashrate reading captured at find time, so the "average used" is
+        // that single value and the sample count is 1 when present, 0 when the
+        // input was never measured (honest-null, #942).
+        arr.push_back({
+            {"ts", b.ts},
+            {"hash", b.hash},
+            {"number", b.height},
+            {"height", b.height},
+            {"status", status_str[static_cast<int>(b.status)]},
+            {"verified", b.status == BlockStatus::confirmed},
+            {"checks", b.check_count},
+            {"chain", b.chain},
+            {"confirmations", b.confirmations},
+            {"miner", b.miner},
+            {"share", b.share_hash},
+            {"found_locally", have_local_record},
+            // Authorship, set at the call site that knows. "unknown" is a real
+            // answer -- a coin lane that has not labelled its sites -- and the
+            // UI must render it as unknown rather than folding it into either
+            // claim.
+            {"found_by", b.authorship == BlockAuthorship::this_node
+                             ? "this_node"
+                             : b.authorship == BlockAuthorship::sharechain_peer
+                                   ? "sharechain_peer" : "unknown"},
+            {"network_difficulty", num_or_null(b.network_difficulty)},
+            {"actual_hash_difficulty", actual_hash_difficulty(b.hash)},
+            {"share_difficulty", num_or_null(b.share_difficulty)},
+            {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
+            {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
+                                       : nlohmann::json(nullptr)},
+            {"expected_time", have_local_record ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
+            {"time_to_find", have_local_record ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
+            {"luck", have_local_record ? num_or_null(b.luck) : nlohmann::json(nullptr)},
+            {"luck_method", method},
+            // #57 oracle-parity residual fields (all DISPLAY-ONLY, honest-null):
+            {"block_reward", block_reward},
+            {"explorer_url", explorer_url(b.hash)},
+            {"from_history", b.from_history},
+            // The luck value is a single-sample approximation whenever it
+            // exists; null (not false) when no luck was computed, so the UI
+            // renders '-' rather than claiming a precise measurement.
+            {"luck_approximate", luck_present ? nlohmann::json(true)
+                                              : nlohmann::json(nullptr)},
+            {"avg_hashrate_used", num_or_null(b.pool_hashrate)},
+            {"hashrate_samples_used", b.pool_hashrate > 0.0 ? 1 : 0},
+            {"avg_difficulty_used", num_or_null(b.network_difficulty)},
+            {"diff_samples_used", b.network_difficulty > 0.0 ? 1 : 0}
+        });
+    }
+
+    // First-row pool luck aggregate (#57), mirroring the oracle shape: the
+    // summary keys ride on arr[0] so a consumer reads them without a second
+    // request. Every c2pool luck is the single-hashrate method (approximate),
+    // never the interval-averaged method the oracle labels accurate/simple_avg
+    // -- reporting it as anything else would fabricate a measurement we did not
+    // make. Empty counts and a null average when nothing was computed.
+    if (!arr.empty()) {
+        arr[0]["blocks_for_luck"]            = luck_count;
+        arr[0]["pool_avg_luck"]              = luck_count > 0
+            ? nlohmann::json(luck_sum / static_cast<double>(luck_count))
+            : nlohmann::json(nullptr);
+        arr[0]["accurate_luck_count"]        = 0;
+        arr[0]["approximate_luck_count"]     = luck_count;
+        arr[0]["time_weighted_luck_count"]   = 0;
+        arr[0]["simple_avg_luck_count"]      = 0;
+        arr[0]["single_hashrate_luck_count"] = luck_count;
+        arr[0]["luck_note"] =
+            "Luck derived from network difficulty and pool hashrate sampled at "
+            "block-find time (single sample per block, approximate; not "
+            "interval-averaged between blocks).";
+    }
+    return arr;
+}
+
+nlohmann::json MiningInterface::rest_checkpoint()
+{
+    if (m_checkpoint_latest_fn)
+        return m_checkpoint_latest_fn();
+    return nlohmann::json::object({{"error", "checkpoint store not configured"}});
+}
+
+nlohmann::json MiningInterface::rest_checkpoints()
+{
+    if (m_checkpoints_all_fn)
+        return m_checkpoints_all_fn();
+    return nlohmann::json::array();
+}
+
+nlohmann::json MiningInterface::rest_uptime()
+{
+    // Return daemon uptime in seconds (m_start_time set at MiningInterface construction)
+    auto now = std::chrono::steady_clock::now();
+    auto uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - m_start_time).count();
+    return nlohmann::json(uptime_seconds);
+}
+
+nlohmann::json MiningInterface::rest_connected_miners()
+{
+    // p2pool returns a simple array of unique miner addresses
+    auto workers = effective_stratum_workers();
+    std::set<std::string> unique_addrs;
+    for (const auto& [sid, w] : workers) {
+        // Strip worker suffix: "addr.worker" → "addr"
+        std::string base = w.username;
+        auto dot = base.find('.');
+        if (dot != std::string::npos) base = base.substr(0, dot);
+        unique_addrs.insert(base);
+    }
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& addr : unique_addrs)
+        arr.push_back(addr);
+    return arr;
+}
+
+nlohmann::json MiningInterface::rest_stratum_stats()
+{
+    // p2pool format: { pool: {...}, workers: {...} }
+    // stratum.html reads data.pool.* and data.workers.*
+    nlohmann::json result = nlohmann::json::object();
+    auto workers = effective_stratum_workers();
+    auto now = std::time(nullptr);
+    auto now_steady = std::chrono::steady_clock::now();
+
+    double total_hashrate = 0.0;
+    uint64_t total_accepted = 0, total_rejected = 0, total_stale = 0;
+    std::set<std::string> unique_addrs;
+    std::map<std::string, int> ip_connections;   // IP → connection count
+    std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique workers
+
+    nlohmann::json workers_json = nlohmann::json::object();
+    for (const auto& [sid, w] : workers) {
+        total_hashrate += w.hashrate;
+        total_accepted += w.accepted;
+        total_rejected += w.rejected;
+        total_stale += w.stale;
+        unique_addrs.insert(w.username);
+
+        // Track connections per IP
+        auto colon = w.remote_endpoint.rfind(':');
+        std::string ip = (colon != std::string::npos) ? w.remote_endpoint.substr(0, colon) : w.remote_endpoint;
+        if (!ip.empty()) {
+            ip_connections[ip]++;
+            ip_workers_set[ip].insert(w.username);
+        }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now_steady - w.connected_at).count();
+        auto first_seen_ts = static_cast<uint64_t>(now) - static_cast<uint64_t>(elapsed);
+
+        // Key by worker name: "ADDRESS.worker" (like p2pool)
+        std::string worker_key = w.worker_name.empty()
+            ? w.username
+            : w.username + "." + w.worker_name;
+
+        // Aggregate multiple connections for the same worker (p2pool behavior)
+        if (workers_json.contains(worker_key)) {
+            workers_json[worker_key]["connections"] = workers_json[worker_key]["connections"].get<int>() + 1;
+            workers_json[worker_key]["connection_difficulties"].push_back(w.difficulty);
+            workers_json[worker_key]["hash_rate"] = workers_json[worker_key]["hash_rate"].get<double>() + w.hashrate;
+            workers_json[worker_key]["dead_hash_rate"] = workers_json[worker_key]["dead_hash_rate"].get<double>() + w.dead_hashrate;
+            workers_json[worker_key]["accepted"] = workers_json[worker_key]["accepted"].get<uint64_t>() + w.accepted;
+            workers_json[worker_key]["rejected"] = workers_json[worker_key]["rejected"].get<uint64_t>() + w.rejected;
+            workers_json[worker_key]["stale"] = workers_json[worker_key]["stale"].get<uint64_t>() + w.stale;
+            if (w.rtt_ms > workers_json[worker_key].value("rtt_ms", 0.0))
+                workers_json[worker_key]["rtt_ms"] = w.rtt_ms;
+            workers_json[worker_key]["shares"] = workers_json[worker_key]["shares"].get<uint64_t>() + w.accepted + w.stale;
+            // Keep earliest first_seen
+            if (first_seen_ts < workers_json[worker_key]["first_seen"].get<uint64_t>())
+                workers_json[worker_key]["first_seen"] = first_seen_ts;
+        } else {
+            workers_json[worker_key] = {
+                {"hash_rate", w.hashrate},
+                {"dead_hash_rate", w.dead_hashrate},
+                {"connections", 1},
+                {"connection_difficulties", nlohmann::json::array({w.difficulty})},
+                {"last_seen", static_cast<uint64_t>(now)},
+                {"first_seen", first_seen_ts},
+                {"difficulty", w.difficulty},
+                {"accepted", w.accepted},
+                {"rejected", w.rejected},
+                {"stale", w.stale},
+                {"shares", w.accepted + w.stale},
+                {"connected_seconds", elapsed},
+                {"remote_endpoint", w.remote_endpoint},
+                {"rtt_ms", w.rtt_ms}
+            };
+        }
+    }
+
+    // Pool-level stats (stratum.html reads data.pool.*)
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+        now_steady - m_stratum_start_time).count();
+    double total_shares = static_cast<double>(total_accepted + total_rejected + total_stale);
+    double submission_rate = (uptime > 0) ? (total_shares / static_cast<double>(uptime)) : 0.0;
+
+    nlohmann::json ip_workers_json = nlohmann::json::object();
+    for (const auto& [ip, wset] : ip_workers_set)
+        ip_workers_json[ip] = static_cast<int>(wset.size());
+
+    result["pool"] = {
+        {"connections", static_cast<int>(workers.size())},
+        {"workers", static_cast<int>(unique_addrs.size())},
+        {"unique_addresses", static_cast<int>(unique_addrs.size())},
+        {"total_accepted", total_accepted},
+        {"total_rejected", total_rejected},
+        {"total_stale", total_stale},
+        {"submission_rate", submission_rate},
+        {"uptime", static_cast<double>(uptime)},
+        {"hashrate", total_hashrate},
+        {"ip_connections", ip_connections},
+        {"ip_workers", ip_workers_json}
+    };
+    result["workers"] = workers_json;
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_miner_thresholds()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    // Get pool hashrate from global_stats computation
+    auto gs = rest_global_stats();
+    double pool_hr = gs.value("pool_hash_rate", 0.0);
+
+    // Get block subsidy from cached GBT template
+    uint64_t subsidy = 156250000; // default 1.5625 LTC
+    if (m_cached_template.contains("coinbasevalue"))
+        subsidy = m_cached_template.value("coinbasevalue", subsidy);
+
+    // Network params (testnet defaults, overridden by config)
+    uint32_t chain_length = 400;  // REAL_CHAIN_LENGTH
+    uint32_t share_period = 4;    // SHARE_PERIOD
+    if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("chain_length"))
+            chain_length = hs.value("chain_length", chain_length);
+        if (hs.contains("share_period"))
+            share_period = hs.value("share_period", share_period);
+    }
+
+    double window_sec = static_cast<double>(chain_length) * share_period;
+
+    // min_hashrate = pool_hashrate / chain_length (1 share per window)
+    double min_hr_normal = pool_hr / chain_length;
+    double min_hr_dust = min_hr_normal / 30.0; // 30x DUST range
+
+    // min_payout = subsidy / chain_length
+    double min_payout = static_cast<double>(subsidy) / 1e8 / chain_length;
+
+    result["pool_hashrate"] = pool_hr;
+    result["min_hashrate_normal"] = min_hr_normal;
+    result["min_hashrate_dust"] = min_hr_dust;
+    result["min_payout_ltc"] = min_payout;
+    result["block_subsidy_ltc"] = static_cast<double>(subsidy) / 1e8;
+    result["chain_length"] = chain_length;
+    result["share_period"] = share_period;
+    result["window_seconds"] = window_sec;
+    result["dust_range"] = 30;
+
+    // Human-readable formatting
+    auto fmt_hr = [](double hr) -> std::string {
+        char buf[32];
+        if (hr >= 1e12) { snprintf(buf, sizeof(buf), "%.2f TH/s", hr / 1e12); return buf; }
+        if (hr >= 1e9)  { snprintf(buf, sizeof(buf), "%.2f GH/s", hr / 1e9);  return buf; }
+        if (hr >= 1e6)  { snprintf(buf, sizeof(buf), "%.2f MH/s", hr / 1e6);  return buf; }
+        if (hr >= 1e3)  { snprintf(buf, sizeof(buf), "%.2f KH/s", hr / 1e3);  return buf; }
+        snprintf(buf, sizeof(buf), "%.0f H/s", hr); return buf;
+    };
+    result["min_hashrate_display"] = fmt_hr(min_hr_dust);
+    result["pool_hashrate_display"] = fmt_hr(pool_hr);
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_global_stats()
+{
+    // Return p2pool-compatible pool statistics
+    nlohmann::json result = nlohmann::json::object();
+    
+    double pool_rate = 0.0;
+    int unique_miners = 0;
+    int total_shares = 0;
+    int orphan_shares = 0, dead_shares = 0;
+    int chain_height = 0;
+
+    // p2pool web.py get_global_stats() reports the pool's FLOOR share
+    // difficulty, not the sharechain average:
+    //     min_difficulty = target_to_difficulty(tracker.items[best_share].max_target)
+    // These are different quantities -- max_target is the per-share difficulty
+    // FLOOR carried in the share header, while the average is a window mean that
+    // drifts with vardiff. The per-coin sharechain-stats hook publishes the
+    // p2pool quantity as "min_difficulty"; a coin that does not publish it has
+    // no honest answer, and p2pool itself returns None for the whole payload
+    // while the chain is too young, so the field is emitted as null rather than
+    // a literal 1.0 that reads as a real floor.
+    std::optional<double> min_difficulty;
+
+    // Populate from sharechain
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("total_shares"))
+            total_shares = sc["total_shares"].get<int>();
+        if (sc.contains("orphan_shares"))
+            orphan_shares = sc["orphan_shares"].get<int>();
+        if (sc.contains("dead_shares"))
+            dead_shares = sc["dead_shares"].get<int>();
+        if (sc.contains("chain_height"))
+            chain_height = sc["chain_height"].get<int>();
+        if (sc.contains("min_difficulty") && sc["min_difficulty"].is_number()
+            && sc["min_difficulty"].get<double>() > 0.0)
+            min_difficulty = sc["min_difficulty"].get<double>();
+        if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object())
+            unique_miners = static_cast<int>(sc["shares_by_miner"].size());
+    }
+
+    // Pool hashrate from P2P node's get_pool_attempts_per_second (p2pool-correct)
+    if (m_pool_hashrate_fn) {
+        double hr = m_pool_hashrate_fn();
+        if (hr > 0) pool_rate = hr;
+    }
+    
+    // Network difficulty and hashrate
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    double net_hashrate = 0.0;
+    if (net_diff > 0) {
+        // network_hashrate = net_difficulty * 2^32 / block_period
+        double block_period = 150.0;  // LTC default 2.5 min
+        net_hashrate = net_diff * 4294967296.0 / block_period;
+    }
+
+    // p2pool field names the dashboard expects
+    // pool_stale_prop = stales / (lookbehind + stales), matching p2pool's get_average_stale_prop()
+    int stales = orphan_shares + dead_shares;
+    int good = total_shares - stales;
+    double pool_stale_prop = (good + stales > 0) ? static_cast<double>(stales) / (good + stales) : 0.0;
+    // p2pool web.py get_global_stats():
+    //     nonstale_hash_rate      = get_pool_attempts_per_second(...)
+    //     pool_nonstale_hash_rate = nonstale_hash_rate
+    //     pool_hash_rate          = nonstale_hash_rate / (1 - stale_prop)
+    // get_pool_attempts_per_second sums the work of shares that actually made
+    // the chain, so the estimator output IS the NON-STALE rate; the gross rate
+    // is that grossed UP by the stale fraction. c2pool had the two fields
+    // assigned the other way round (gross = estimator, nonstale = estimator
+    // scaled DOWN), i.e. both wrong and in opposite directions. Masked so far
+    // only because pool_stale_prop has been 0 in practice.
+    result["pool_nonstale_hash_rate"] = pool_rate;
+    result["pool_hash_rate"] = (pool_stale_prop < 1.0)
+        ? pool_rate / (1.0 - pool_stale_prop)
+        : pool_rate;  // degenerate all-stale window: do not divide by zero
+    result["pool_stale_prop"] = pool_stale_prop;
+    if (min_difficulty)
+        result["min_difficulty"] = *min_difficulty;
+    else
+        result["min_difficulty"] = nullptr;
+    result["network_block_difficulty"] = net_diff;
+
+    // Additional fields
+    result["network_hashrate"] = net_hashrate;
+    result["shares_in_chain"] = total_shares;
+    result["unique_miners"] = unique_miners;
+    // WHAT unique_miners COUNTS, stated so the card can label it (hotel,
+    // 2026-08-05: the operator read 5 against ~33 connected rigs and called
+    // it wrong — it was counting something else). It is the number of
+    // DISTINCT PAYOUT ADDRESSES holding shares in the sharechain window,
+    // POOL-WIDE (every node's miners, workers collapsed per address); the
+    // rigs number the operator expected is local stratum sessions, published
+    // separately here so the two can never be conflated again.
+    result["unique_miners_scope"] = "sharechain-payout-addresses-pool-wide";
+    {
+        int local_workers = 0;
+        auto workers = effective_stratum_workers();
+        local_workers = static_cast<int>(workers.size());
+        result["local_workers"] = local_workers;
+    }
+    result["current_height"] = chain_height;
+    result["uptime_seconds"] = rest_uptime();
+    result["status"] = "operational";
+    // last_block: was a hardcoded 0 since the field's introduction — never
+    // set on any chain (both hotel nodes showed 0 with 100+ ledger rows).
+    // Sourced from the found-block ledger (persistent, so a restart does not
+    // zero it): the newest row for THIS node's primary chain.
+    {
+        uint64_t last_h = 0, last_ts = 0;
+        const std::string primary = node_symbol();
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks) {
+            if (!primary.empty() && b.chain != primary) continue;
+            if (b.height > last_h) { last_h = b.height; last_ts = b.ts; }
+        }
+        result["last_block"] = last_h;
+        result["last_block_ts"] =
+            last_ts ? nlohmann::json(last_ts) : nlohmann::json(nullptr);
+    }
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_sharechain_stats()
+{
+    // Delegate to the live tracker callback if wired
+    if (m_sharechain_stats_fn)
+        return m_sharechain_stats_fn();
+
+    // Fallback: return empty stub when no tracker is connected
+    nlohmann::json result = nlohmann::json::object();
+    result["total_shares"] = 0;
+    result["shares_by_version"] = nlohmann::json::object();
+    result["shares_by_miner"] = nlohmann::json::object();
+    result["chain_height"] = 0;
+    result["chain_tip_hash"] = "";
+    result["fork_count"] = 0;
+    result["heaviest_fork_weight"] = 0.0;
+    result["average_difficulty"] = 1.0;
+    result["difficulty_trend"] = nlohmann::json::array();
+    auto now = std::time(nullptr);
+    nlohmann::json timeline = nlohmann::json::array();
+    for (int i = 5; i >= 0; --i) {
+        nlohmann::json slot;
+        slot["timestamp"] = now - (i * 600);
+        slot["share_count"] = 0;
+        slot["miner_distribution"] = nlohmann::json::object();
+        timeline.push_back(slot);
+    }
+    result["timeline"] = timeline;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_sharechain_window()
+{
+    if (m_sharechain_window_fn)
+        return m_sharechain_window_fn();
+
+    // Fallback stub
+    nlohmann::json result;
+    result["shares"] = nlohmann::json::array();
+    result["total"] = 0;
+    result["best_hash"] = "";
+    result["chain_length"] = 0;
+    return result;
+}
+
+void MiningInterface::start_pplns_precompute()
+{
+    // Guard: only spawn once. After detach(), joinable() is false, so
+    // the old guard allowed re-spawning. Use atomic flag instead.
+    if (m_pplns_precompute_started.exchange(true)) return;
+
+    m_pplns_precompute_thread = std::thread([this]() {
+        LOG_INFO << "[PPLNS-Cache] Background pre-computation thread started";
+
+        // Wait for: PPLNS function + sharechain sync + valid work template
+        uint256 block_target;
+        uint64_t subsidy = 0;
+        for (int wait = 0; wait < 600; ++wait) {  // up to 10 minutes
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!m_pplns_fn || !m_sharechain_window_fn) continue;
+
+            // Need meaningful chain
+            bool chain_ok = false;
+            if (auto tip = get_sharechain_tip(); tip && tip->height > 100)
+                chain_ok = true;
+            if (!chain_ok) continue;
+
+            // Need valid work template with real block target
+            {
+                std::lock_guard<std::mutex> lock(m_work_mutex);
+                if (!m_cached_template.is_null() && m_cached_template.contains("bits")) {
+                    // bits is stored as hex string in the template
+                    uint32_t bits = 0;
+                    try {
+                        if (m_cached_template["bits"].is_string())
+                            bits = static_cast<uint32_t>(std::stoul(
+                                m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                        else
+                            bits = m_cached_template["bits"].get<uint32_t>();
+                    } catch (...) {}
+                    if (bits > 0 && (bits >> 24) < 0x21) {
+                        block_target = chain::bits_to_target(bits);
+                        if (m_cached_template.contains("coinbasevalue"))
+                            subsidy = m_cached_template["coinbasevalue"].get<uint64_t>();
+                    }
+                }
+            }
+            if (!block_target.IsNull() && subsidy > 0) break;
+        }
+
+        if (!m_pplns_fn || !m_sharechain_window_fn) {
+            LOG_WARNING << "[PPLNS-Cache] No PPLNS function available, aborting pre-compute";
+            return;
+        }
+        if (block_target.IsNull() || subsidy == 0) {
+            LOG_WARNING << "[PPLNS-Cache] No valid work template after 10min, aborting pre-compute";
+            return;
+        }
+
+        LOG_INFO << "[PPLNS-Cache] Sharechain + work template ready (subsidy=" << subsidy
+                 << "), starting full PPLNS walk...";
+
+        // Get the share list from window
+        auto window = m_sharechain_window_fn();
+        if (!window.contains("shares") || !window["shares"].is_array()) {
+            LOG_WARNING << "[PPLNS-Cache] No shares in window, aborting";
+            return;
+        }
+
+        auto& shares = window["shares"];
+        int total = static_cast<int>(shares.size());
+        int computed = 0;
+        bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+
+        LOG_INFO << "[PPLNS-Cache] Computing PPLNS for " << total << " shares...";
+        auto start_time = std::chrono::steady_clock::now();
+
+        for (int i = 0; i < total; ++i) {
+            auto& s = shares[i];
+            if (!s.contains("H") || !s.contains("h")) continue;
+
+            std::string full_hash = s["H"].get<std::string>();
+            std::string short_hash = s["h"].get<std::string>();
+
+            // Check if already cached (from live share arrivals)
+            {
+                std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+                if (m_pplns_per_tip.count(short_hash)) continue;
+            }
+
+            // Compute PPLNS from this share's perspective
+            try {
+                uint256 share_hash;
+                share_hash.SetHex(full_hash);
+
+                auto raw_pplns = m_pplns_fn(share_hash, block_target, subsidy, m_donation_script);
+                if (raw_pplns.empty()) continue;
+
+                // Convert script→address map to JSON {addr: amount}
+                nlohmann::json pplns_json = nlohmann::json::object();
+                for (const auto& [script, amount] : raw_pplns) {
+                    std::string addr = core::script_to_address(script, is_ltc, m_testnet);
+                    // P2PK: PUSH<len> <pubkey> OP_CHECKSIG → hash to P2PKH address
+                    if (addr.empty() && script.size() > 33 && script.back() == 0xac) {
+                        size_t pk_len = script[0];
+                        if (pk_len + 1 == script.size() - 1) {
+                            unsigned char sha[32], rip[20];
+                            CSHA256().Write(&script[1], pk_len).Finalize(sha);
+                            CRIPEMD160().Write(sha, 32).Finalize(rip);
+                            std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+                            p2pkh.insert(p2pkh.end(), rip, rip + 20);
+                            p2pkh.push_back(0x88);
+                            p2pkh.push_back(0xac);
+                            addr = core::script_to_address(p2pkh, is_ltc, m_testnet);
+                        }
+                    }
+                    if (addr.empty()) {
+                        // Last resort: hex
+                        static const char* HEX = "0123456789abcdef";
+                        addr.reserve(script.size() * 2);
+                        for (unsigned char b : script) {
+                            addr += HEX[b >> 4];
+                            addr += HEX[b & 0x0f];
+                        }
+                    }
+                    pplns_json[addr] = amount / 1e8;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+                    m_pplns_per_tip[short_hash] = std::move(pplns_json);
+                }
+                ++computed;
+
+                // Log progress every 500 shares
+                if (computed % 500 == 0) {
+                    LOG_INFO << "[PPLNS-Cache] Computed " << computed << "/" << total
+                             << " (" << (computed * 100 / total) << "%)";
+                }
+
+                // Yield to mining thread — don't hog the tracker lock
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            } catch (const std::exception& e) {
+                // Skip shares that fail (e.g., at chain boundary)
+                continue;
+            }
+        }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+
+        // Convert flat pre-computed entries to merged format with DOGE data
+        // Fetch current merged payouts once as a template for DOGE amounts
+        auto merged_template = rest_current_merged_payouts();
+        if (merged_template.is_object() && !merged_template.empty()) {
+            // Build DOGE lookup: addr → {symbol, address, amount_per_ltc_unit}
+            // For each address, compute DOGE/LTC ratio from the template
+            std::map<std::string, nlohmann::json> doge_info;  // addr → merged array
+            for (auto& [addr, entry] : merged_template.items()) {
+                if (entry.contains("merged") && entry["merged"].is_array()) {
+                    doge_info[addr] = entry["merged"];
+                }
+            }
+            // Compute total LTC in template for proportion scaling
+            double template_ltc_total = 0;
+            for (auto& [addr, entry] : merged_template.items()) {
+                if (entry.contains("amount"))
+                    template_ltc_total += entry["amount"].get<double>();
+            }
+
+            std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+            int upgraded = 0;
+            for (auto& [hash, pplns] : m_pplns_per_tip) {
+                // Skip entries already in merged format
+                if (pplns.empty()) continue;
+                auto first_val = pplns.begin().value();
+                if (first_val.is_object()) continue;  // already merged format
+
+                // Convert flat {addr: ltc_amount} → merged {addr: {amount, merged:[]}}
+                double share_ltc_total = 0;
+                for (auto& [a, v] : pplns.items()) {
+                    if (v.is_number()) share_ltc_total += v.get<double>();
+                }
+
+                nlohmann::json merged_pplns = nlohmann::json::object();
+                for (auto& [addr, ltc_val] : pplns.items()) {
+                    double ltc_amt = ltc_val.is_number() ? ltc_val.get<double>() : 0;
+                    double ltc_pct = share_ltc_total > 0 ? ltc_amt / share_ltc_total : 0;
+
+                    nlohmann::json entry = {{"amount", ltc_amt}, {"merged", nlohmann::json::array()}};
+
+                    // Match DOGE data from template by address
+                    auto dit = doge_info.find(addr);
+                    if (dit != doge_info.end()) {
+                        // Use exact DOGE data for this address, scaled by LTC proportion
+                        for (auto& m : dit->second) {
+                            double template_doge = m.value("amount", 0.0);
+                            // Scale: this share's LTC pct vs template LTC pct for this addr
+                            double template_addr_ltc = 0;
+                            if (merged_template.contains(addr) && merged_template[addr].contains("amount"))
+                                template_addr_ltc = merged_template[addr]["amount"].get<double>();
+                            double scale = (template_addr_ltc > 0) ? (ltc_amt / template_addr_ltc) : 1.0;
+                            entry["merged"].push_back({
+                                {"symbol", m.value("symbol", "")},  // honesty: never fabricate a coin label
+                                {"address", m.value("address", "")},
+                                {"amount", template_doge * scale}
+                            });
+                        }
+                    }
+                    merged_pplns[addr] = std::move(entry);
+                }
+                pplns = std::move(merged_pplns);
+                ++upgraded;
+            }
+            LOG_INFO << "[PPLNS-Cache] Upgraded " << upgraded << " entries to merged format with DOGE data";
+        }
+
+        m_pplns_precompute_done.store(true);
+        invalidate_window_cache();
+        LOG_INFO << "[PPLNS-Cache] Pre-computation complete: " << computed
+                 << " snapshots in " << elapsed << "s (cache size: "
+                 << m_pplns_per_tip.size() << ")";
+    });
+
+    m_pplns_precompute_thread.detach();
+}
+
+void MiningInterface::cache_pplns_at_tip()
+{
+    // Get current tip hash — absent tip = no-op (sharechain not ready yet).
+    auto maybe_tip = get_sharechain_tip();
+    if (!maybe_tip || maybe_tip->hash.empty()) return;
+    std::string tip = maybe_tip->hash;
+
+    // Compute full merged PPLNS (LTC + DOGE with donation) and cache
+    auto pplns = compute_current_merged_payouts();
+    if (pplns.is_null() || pplns.empty()) return;
+
+    // Update dedicated merged payouts cache (for /current_merged_payouts endpoint)
+    {
+        std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
+        m_cached_merged_payouts = pplns;
+    }
+
+    // Also store in per-tip cache (for window PPLNS overlay)
+    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+    m_pplns_per_tip[tip] = std::move(pplns);
+
+    // Evict old entries to prevent unbounded growth. Cap at 5000 so Dash's
+    // chain_length=4320 precompute + live tip churn both fit. LTC's older
+    // 100-entry comment was sized for live tips only; precompute now stores
+    // one entry per share in the window, so the cap has to be larger than
+    // the biggest window we serve.
+    constexpr size_t MAX_PPLNS_CACHE = 5000;
+    if (m_pplns_per_tip.size() > MAX_PPLNS_CACHE * 2) {
+        auto current = std::move(m_pplns_per_tip[tip]);
+        m_pplns_per_tip.clear();
+        m_pplns_per_tip[tip] = std::move(current);
+    }
+}
+
+nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
+{
+    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+    auto it = m_pplns_per_tip.find(tip_hash);
+    if (it != m_pplns_per_tip.end())
+        return it->second;
+    // Cache miss — return empty. The previous fallback (returning an arbitrary
+    // entry when the requested tip wasn't cached) was both incorrect (callers
+    // check !empty to gate inclusion, so they ended up storing some other
+    // share's PPLNS data labelled as the requested share's) and the dominant
+    // memory consumer in the process (heaptrack identified ~17000 deep JSON
+    // copies per refresh, every 2s). Honest miss is the right answer.
+    return nlohmann::json::object();
+}
+
+std::pair<std::string, std::string> MiningInterface::get_cached_window_response()
+{
+    std::lock_guard<std::mutex> lock(m_window_cache_mutex);
+    // Check if cache is valid (has real tip hash, not empty/stub)
+    if (!m_window_cache_etag.empty())
+        return {m_window_cache_json, m_window_cache_etag};
+
+    // Regenerate
+    auto data = rest_sharechain_window();
+    std::string tip;
+    if (data.contains("best_hash")) {
+        tip = data["best_hash"].get<std::string>();
+        if (tip.size() > 16) tip = tip.substr(0, 16);
+    }
+    // Don't cache stub responses (empty best_hash) — during early startup
+    // the sharechain_window_fn may not be wired yet or return empty data.
+    // Return the stub without caching so next request retries.
+    if (tip.empty()) {
+        return {data.dump(), ""};
+    }
+    m_window_cache_json = data.dump();
+    m_window_cache_etag = tip;
+    return {m_window_cache_json, m_window_cache_etag};
+}
+
+bool MiningInterface::rate_check(const std::string& ip, int max_per_min)
+{
+    std::lock_guard<std::mutex> lock(m_rate_mutex);
+    auto now = std::chrono::steady_clock::now();
+
+    // Periodic cleanup: evict stale IPs (>1 hour idle) to prevent unbounded growth
+    static int check_counter = 0;
+    if (++check_counter >= 1000) {
+        check_counter = 0;
+        for (auto it = m_rate_buckets.begin(); it != m_rate_buckets.end(); ) {
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - it->second.last_refill).count();
+            if (age > 3600) it = m_rate_buckets.erase(it);
+            else ++it;
+        }
+    }
+    auto& bucket = m_rate_buckets[ip];
+
+    // Refill tokens (1 per second, up to max_per_min)
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - bucket.last_refill).count();
+    if (elapsed > 0) {
+        bucket.tokens = std::min(max_per_min, bucket.tokens + static_cast<int>(elapsed));
+        bucket.last_refill = now;
+    }
+    // First access
+    if (bucket.tokens == 0 && elapsed == 0 && bucket.last_refill.time_since_epoch().count() == 0) {
+        bucket.tokens = max_per_min;
+        bucket.last_refill = now;
+    }
+
+    if (bucket.tokens > 0) {
+        bucket.tokens--;
+        return true;  // allowed
+    }
+    return false;  // rate limited
+}
+
+void MiningInterface::sse_register(std::shared_ptr<tcp::socket> socket)
+{
+    std::lock_guard<std::mutex> lock(m_sse_mutex);
+    // Cap at 200 subscribers
+    if (m_sse_subscribers.size() >= 200) return;
+    m_sse_subscribers.push_back({socket, ""});
+}
+
+void MiningInterface::sse_push(const std::string& event_data)
+{
+    std::lock_guard<std::mutex> lock(m_sse_mutex);
+    std::string msg = "data: " + event_data + "\n\n";
+    auto buf = std::make_shared<std::string>(msg);
+
+    std::vector<SSESubscriber> alive;
+    for (auto& sub : m_sse_subscribers) {
+        if (!sub.socket || !sub.socket->is_open()) continue;
+        try {
+            boost::asio::async_write(*sub.socket, boost::asio::buffer(*buf),
+                [buf, sock = sub.socket](beast::error_code ec, std::size_t) {
+                    if (ec) {
+                        beast::error_code close_ec;
+                        sock->shutdown(tcp::socket::shutdown_send, close_ec);
+                    }
+                });
+            alive.push_back(sub);
+        } catch (...) {
+            // dead socket, skip
+        }
+    }
+    m_sse_subscribers = std::move(alive);
+}
+
+size_t MiningInterface::sse_subscriber_count() const
+{
+    // No lock needed for approximate count
+    return m_sse_subscribers.size();
+}
+
+std::optional<SharechainTip> MiningInterface::get_sharechain_tip()
+{
+    if (m_sharechain_tip_fn)
+        return m_sharechain_tip_fn();
+    return std::nullopt;
+}
+
+nlohmann::json MiningInterface::rest_sharechain_tip()
+{
+    return to_json(get_sharechain_tip());
+}
+
+nlohmann::json MiningInterface::rest_sharechain_delta(const std::string& since_hash)
+{
+    // Check single-entry delta cache (pre-computed on main thread when tip changes).
+    // All SSE clients request the same since_hash → near-100% hit rate.
+    {
+        std::lock_guard<std::mutex> lk(m_delta_cache_mutex);
+        if (!m_delta_cache_since.empty() && m_delta_cache_since == since_hash)
+            return m_delta_cache_result;
+    }
+    if (m_sharechain_delta_fn)
+        return m_sharechain_delta_fn(since_hash);
+    return nlohmann::json::object({{"shares", nlohmann::json::array()}, {"count", 0}});
+}
+
+void MiningInterface::precompute_delta(const std::string& prev_tip_hash)
+{
+    if (!m_sharechain_delta_fn_raw || prev_tip_hash.empty()) return;
+    auto result = m_sharechain_delta_fn_raw(prev_tip_hash);
+    std::lock_guard<std::mutex> lk(m_delta_cache_mutex);
+    m_delta_cache_since = prev_tip_hash;
+    m_delta_cache_result = std::move(result);
+}
+
+nlohmann::json MiningInterface::rest_control_mining_start()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = true;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "start"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_stop()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = false;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "stop"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_restart()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = true;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "restart"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_ban(const std::string& target)
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    if (!target.empty()) {
+        m_banned_targets.insert(target);
+    }
+    return nlohmann::json::object({
+        {"ok", !target.empty()},
+        {"action", "ban"},
+        {"target", target},
+        {"banned_count", static_cast<uint64_t>(m_banned_targets.size())}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_unban(const std::string& target)
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    if (!target.empty()) {
+        m_banned_targets.erase(target);
+    }
+    return nlohmann::json::object({
+        {"ok", !target.empty()},
+        {"action", "unban"},
+        {"target", target},
+        {"banned_count", static_cast<uint64_t>(m_banned_targets.size())}
+    });
+}
+
+void MiningInterface::record_found_block(uint64_t height, const uint256& hash, uint64_t ts,
+                                          const std::string& chain,
+                                          const std::string& miner,
+                                          const std::string& share_hash,
+                                          double network_difficulty,
+                                          double share_difficulty,
+                                          double pool_hashrate,
+                                          uint64_t subsidy,
+                                          BlockAuthorship authorship)
+{
+    if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
+    std::string hash_hex = hash.GetHex();
+
+    // ── MEASUREMENT FALLBACKS (hotel, 2026-08-05) ────────────────────────
+    // Both record paths passed mi->get_network_difficulty(), which reads a
+    // cache that is only refreshed when somebody polls /local_stats — so a
+    // block found before the first dashboard hit was recorded with
+    // network_difficulty=0, which zeroed expected_time, which zeroed luck,
+    // which the chart then DREW as 0% luck (the operator's wrong-luck-trend
+    // complaint, rows h=2516911/2516914). The live template knows the real
+    // difficulty at find time; ask it before accepting a zero. Same for a
+    // zero subsidy on the primary chain (row 2516914 recorded subsidy=0
+    // because the embedded arm leaves get_current_work_template() empty).
+    if (network_difficulty <= 0.0 || subsidy == 0) {
+        CoinWorkInfo cw;
+        if (m_coin_work_fn) cw = m_coin_work_fn();
+        if (cw.valid) {
+            if (network_difficulty <= 0.0 && cw.network_difficulty > 0.0)
+                network_difficulty = cw.network_difficulty;
+            if (subsidy == 0 && chain == node_symbol())
+                subsidy = cw.coinbase_value_sat;
+        }
+        if (network_difficulty <= 0.0)
+            network_difficulty =
+                m_network_difficulty.load(std::memory_order_relaxed);
+    }
+
+    // Runtime dedup — with ENRICHMENT. Measured (hotel primary): rows for
+    // OUR OWN blocks h=2516911/2516914 sat as miner="" share="" subsidy=0
+    // junk forever, because they were persisted by an older binary before
+    // attribution existed, restored at startup, and the plain early-return
+    // here then blocked the attributed re-record (sharechain hook) for the
+    // rest of time. An ATTRIBUTED record now upgrades an unattributed row in
+    // place; nothing ever downgrades, and a second attributed record for the
+    // same (hash, chain) still dedups exactly as before.
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (auto& existing : m_found_blocks) {
+            if (existing.hash != hash_hex || existing.chain != chain)
+                continue;
+            // AUTHORSHIP CLIMBS FIRST, and OUTSIDE the enrichment branch.
+            // It was inside it, gated on the existing row being unattributed
+            // -- which made the raise unreachable on the path it exists for.
+            // Both DASH sites record miner+share_hash, so the second call for
+            // a block always meets an ALREADY-ATTRIBUTED row, hit the plain
+            // early return, and left authorship at whatever the first caller
+            // happened to know. Attribution and authorship are independent
+            // facts: a fully attributed row can still be wrong about WHO
+            // found the block, and that is exactly the row this field exists
+            // to correct. EnrichmentRaisesAuthorshipAndNeverLowersIt proved
+            // this red before the fix.
+            const bool authorship_raised = authorship > existing.authorship;
+            if (authorship_raised) {
+                existing.authorship = authorship;
+                LOG_INFO << "[Pool] found-block AUTHORSHIP raised: h="
+                         << existing.height << " hash="
+                         << hash_hex.substr(0, 16) << " -> "
+                         << (authorship == BlockAuthorship::this_node
+                                 ? "THIS NODE" : "sharechain peer");
+            }
+
+            const bool existing_unattributed =
+                existing.share_hash.empty() && existing.miner.empty();
+            const bool incoming_attributed =
+                !share_hash.empty() || !miner.empty();
+            if (existing_unattributed && incoming_attributed) {
+                existing.miner      = miner;
+                existing.share_hash = share_hash;
+                if (existing.share_difficulty <= 0.0)
+                    existing.share_difficulty = share_difficulty;
+                if (existing.network_difficulty <= 0.0)
+                    existing.network_difficulty = network_difficulty;
+                if (existing.pool_hashrate <= 0.0)
+                    existing.pool_hashrate = pool_hashrate;
+                if (existing.subsidy == 0) existing.subsidy = subsidy;
+                LOG_INFO << "[Pool] found-block row ENRICHED (was recorded"
+                            " unattributed): h=" << existing.height
+                         << " hash=" << hash_hex.substr(0, 16)
+                         << " miner=" << miner;
+                if (m_persist_block_fn) {
+                    try { m_persist_block_fn(existing); }
+                    catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] Failed to persist enriched"
+                                       " found block: " << e.what();
+                    }
+                }
+            } else if (authorship_raised && m_persist_block_fn) {
+                // Authorship changed on a row that needed no other enrichment.
+                // Without this the raise lives only in memory and the restored
+                // row reasserts the wrong finder after every restart.
+                try { m_persist_block_fn(existing); }
+                catch (const std::exception& e) {
+                    LOG_WARNING << "[Pool] Failed to persist raised"
+                                   " authorship: " << e.what();
+                }
+            }
+            return;  // already recorded (possibly just enriched)
+        }
+    }
+
+    FoundBlock blk{height, hash_hex, ts, BlockStatus::pending, 0, chain, 0,
+                   miner, share_hash, network_difficulty, share_difficulty,
+                   pool_hashrate, subsidy, 0, 0, 0, authorship};
+
+    // Compute time_to_find from previous block, then derive expected_time and luck
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        // Find previous block in the same chain for time_to_find
+        for (const auto& prev : m_found_blocks) {
+            if (prev.chain == chain) {
+                blk.time_to_find = static_cast<double>(ts) - static_cast<double>(prev.ts);
+                break;
+            }
+        }
+        // Fallback: if caller passed 0 pool hashrate, use live pool hashrate
+        double hr = pool_hashrate;
+        if (hr <= 0 && m_pool_hashrate_fn)
+            hr = m_pool_hashrate_fn();
+        blk.pool_hashrate = hr;
+        // expected_time = network_difficulty * 2^32 / pool_hashrate
+        if (hr > 0 && network_difficulty > 0) {
+            blk.expected_time = network_difficulty * 4294967296.0 / hr;
+        }
+        // luck = expected / actual * 100 (>100 = lucky)
+        if (blk.time_to_find > 0 && blk.expected_time > 0) {
+            blk.luck = blk.expected_time / blk.time_to_find * 100.0;
+        }
+        // Keep found-blocks ordered newest-first by chain height (canonical
+        // chain order). Height is monotonic on-chain, so it is immune to the
+        // block-header timestamp skew that can reverse a same-day cluster
+        // relative to height; ts only breaks ties at equal height.
+        m_found_blocks.push_back(blk);
+        std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+            [](const FoundBlock& a, const FoundBlock& b) {
+                if (a.height != b.height) return a.height > b.height;
+                return a.ts > b.ts;
+            });
+    }
+
+    // Persist to LevelDB (Layer +2 — never pruned)
+    if (m_persist_block_fn)
+    {
+        try { m_persist_block_fn(blk); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[Pool] Failed to persist found block: " << e.what();
+        }
+    }
+
+    // Create THE checkpoint from current sharechain state
+    // The state_root is already embedded in the block's coinbase — record it
+    // so future nodes can verify sharechain integrity against the blockchain.
+    if (m_checkpoint_create_fn)
+    {
+        try { m_checkpoint_create_fn(chain, height, hash.GetHex(), ts); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[THE] Failed to create checkpoint: " << e.what();
+        }
+    }
+
+    // #922: a pool block was found -> a new sharechain round begins. Reset the
+    // round best-share tracker so /best_share.round reflects THIS round rather
+    // than staying pinned to the last winning share forever. Reached only for
+    // genuinely new blocks -- the (hash, chain) dedup above returns early on
+    // duplicates, so twin / replayed notifications never double-reset. Tied to
+    // the block-found event, not a timer.
+    reset_best_difficulty_round(ts);
+}
+
+void MiningInterface::set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn)
+{
+    m_persist_block_fn = std::move(persist_fn);
+    m_load_blocks_fn = std::move(load_fn);
+}
+
+void MiningInterface::recompute_found_block_luck_locked()
+{
+    // CALLER HOLDS m_blocks_mutex. Reconstruct the DERIVED fields
+    // (time_to_find, expected_time, luck) that record_found_block computes at
+    // record time but that are NOT persisted, so a restored history keeps its
+    // luck trend instead of emitting null for every row. Only fills fields
+    // still at 0 — never clobbers a value that is already present. Inputs that
+    // are genuinely unknown (e.g. a v1 record with pool_hashrate==0) leave luck
+    // at 0, which rest_luck_stats renders as null rather than a fabricated 0%.
+    // The list is kept sorted newest-first by height, so the previous (older)
+    // block on the same chain is the NEXT same-chain element.
+    for (size_t i = 0; i < m_found_blocks.size(); ++i) {
+        auto& blk = m_found_blocks[i];
+        if (blk.time_to_find <= 0.0) {
+            for (size_t j = i + 1; j < m_found_blocks.size(); ++j) {
+                if (m_found_blocks[j].chain == blk.chain) {
+                    blk.time_to_find = static_cast<double>(blk.ts)
+                                     - static_cast<double>(m_found_blocks[j].ts);
+                    break;
+                }
+            }
+        }
+        if (blk.expected_time <= 0.0 && blk.network_difficulty > 0.0
+            && blk.pool_hashrate > 0.0) {
+            blk.expected_time =
+                blk.network_difficulty * 4294967296.0 / blk.pool_hashrate;
+        }
+        if (blk.luck <= 0.0 && blk.time_to_find > 0.0 && blk.expected_time > 0.0) {
+            blk.luck = blk.expected_time / blk.time_to_find * 100.0;
+        }
+    }
+}
+
+void MiningInterface::load_persisted_found_blocks()
+{
+    if (!m_load_blocks_fn) return;
+
+    try {
+        auto blocks = m_load_blocks_fn();
+        if (blocks.empty()) return;
+
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        // Merge loaded blocks with any already in memory (avoid duplicates)
+        for (auto& blk : blocks)
+        {
+            bool exists = false;
+            for (const auto& existing : m_found_blocks)
+            {
+                if (existing.hash == blk.hash && existing.chain == blk.chain)
+                {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                // Provenance for the dashboard (#57): a block that arrives via
+                // the load path is, by definition, from persisted history.
+                blk.from_history = true;
+                m_found_blocks.push_back(std::move(blk));
+            }
+        }
+
+        // Sort newest-first by chain height (canonical, monotonic on-chain);
+        // ts only breaks ties. Sorting by ts alone reversed same-day clusters
+        // whose header timestamps disagree with height.
+        std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+            [](const FoundBlock& a, const FoundBlock& b) {
+                if (a.height != b.height) return a.height > b.height;
+                return a.ts > b.ts;
+            });
+
+        // #159 (G3): reconstruct the derived luck series for the restored rows.
+        recompute_found_block_luck_locked();
+
+        LOG_INFO << "[Pool] Loaded " << blocks.size() << " found blocks from persistent storage";
+    }
+    catch (const std::exception& e) {
+        LOG_WARNING << "[Pool] Failed to load found blocks: " << e.what();
+    }
+}
+
+void MiningInterface::seed_netdiff_history_from_found_blocks()
+{
+    // #159 (G6): p2pool keeps a block-sampled network-difficulty series seeded
+    // from block history at load. c2pool's found-block rows persist (ts,
+    // network_difficulty) after #1351, so the diff curve is reconstructable even
+    // from a wiped stat/.views file. Display-only; every step degrades to a
+    // no-op on missing/empty data and never throws out of the function.
+    try {
+        // Snapshot (ts, nd) under the blocks lock, then release it before taking
+        // any other lock (no nested lock-order coupling).
+        std::vector<std::pair<double, double>> samples;  // (ts, nd), ascending
+        {
+            std::lock_guard<std::mutex> lock(m_blocks_mutex);
+            samples.reserve(m_found_blocks.size());
+            for (const auto& b : m_found_blocks) {
+                const double ts = static_cast<double>(b.ts);
+                if (ts > 0.0 && b.network_difficulty > 0.0)
+                    samples.emplace_back(ts, b.network_difficulty);
+            }
+        }
+        if (samples.empty()) return;
+        std::sort(samples.begin(), samples.end(),
+                  [](const std::pair<double, double>& a,
+                     const std::pair<double, double>& b) {
+                      return a.first < b.first;
+                  });
+
+        // (1) Rebuild the volatile block-sampled series unconditionally — it is
+        // fully volatile (never persisted), so a wiped process starts empty and
+        // this is the only source until live add_netdiff_sample() calls append.
+        {
+            std::lock_guard<std::mutex> lock(m_netdiff_mutex);
+            std::vector<NetDiffSample> seeded;
+            seeded.reserve(samples.size() + m_netdiff_history.size());
+            for (const auto& s : samples)
+                seeded.push_back({s.first, s.second, "block-restore"});
+            // Defensive: preserve anything the live path already recorded
+            // (normally none this early in startup), restored samples first.
+            if (!m_netdiff_history.empty())
+                seeded.insert(seeded.end(), m_netdiff_history.begin(),
+                              m_netdiff_history.end());
+            if (seeded.size() > 2000)
+                seeded.erase(seeded.begin(), seeded.end() - 2000);
+            m_netdiff_history = std::move(seeded);
+        }
+
+        // (2) Fold pre-flat-window rows into the binned 'network_difficulty'
+        // stream — but ONLY when the views were freshly seeded this boot (so a
+        // healthy .views sidecar is never double-counted across restarts), and
+        // ONLY for rows older than the earliest flat stat_log entry (the dense
+        // 60s samples already cover the recent window). DataView::add_datum
+        // handles out-of-order/too-old timestamps safely, and the concurrent
+        // background flat-seed thread locks m_history_mutex per datum too.
+        if (!m_views_freshly_seeded.load(std::memory_order_acquire)) return;
+        double earliest_flat = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+            if (!m_stat_log.empty()) earliest_flat = m_stat_log.front().time;
+        }
+        {
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            for (const auto& s : samples) {
+                if (earliest_flat > 0.0 && s.first >= earliest_flat) continue;
+                m_history.add_scalar("network_difficulty", s.first, s.second);
+            }
+        }
+        LOG_INFO << "[NetDiffSeed] Seeded network-difficulty series from "
+                 << samples.size() << " found-block row(s)";
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[NetDiffSeed] Failed: " << ex.what();
+    }
+}
+
+void MiningInterface::reverify_pending_found_blocks()
+{
+    // Snapshot the pending hashes under the lock, then schedule outside it —
+    // schedule_block_verification takes m_blocks_mutex itself.
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& blk : m_found_blocks) {
+            if (blk.status == BlockStatus::pending && !blk.hash.empty())
+                pending.push_back(blk.hash);
+        }
+    }
+    if (pending.empty()) return;
+    for (const auto& hash : pending)
+        schedule_block_verification(hash);
+    LOG_INFO << "[Pool] Scheduled re-verification for " << pending.size()
+             << " restored pending found block(s)";
+}
+
+void MiningInterface::backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn)
+{
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    int diff_filled = 0, ts_filled = 0;
+    for (auto& blk : m_found_blocks) {
+        if (!blk.hash.empty()) {
+            if (diff_fn && blk.network_difficulty == 0.0) {
+                double diff = diff_fn(blk.hash);
+                if (diff > 0) { blk.network_difficulty = diff; ++diff_filled; }
+            }
+            if (ts_fn) {
+                uint32_t ts = ts_fn(blk.hash);
+                if (ts > 0 && blk.ts != ts) { blk.ts = ts; ++ts_filled; }
+            }
+        }
+    }
+    if (diff_filled > 0)
+        LOG_INFO << "[Pool] Backfilled network_difficulty on " << diff_filled << " found block(s)";
+    if (ts_filled > 0)
+        LOG_INFO << "[Pool] Backfilled timestamp on " << ts_filled << " found block(s)";
+    // #159 (G3/G5): a backfilled network_difficulty or timestamp is an input to
+    // the luck series, so recompute the derived fields now that they are known.
+    if (diff_filled > 0 || ts_filled > 0)
+        recompute_found_block_luck_locked();
+}
+
+void MiningInterface::set_merged_block_store(std::shared_ptr<void> store) { m_merged_block_store = std::move(store); }
+
+void MiningInterface::set_block_verify_fn(block_verify_fn_t fn) { m_block_verify_fn = std::move(fn); }
+
+void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn) {
+    m_chain_verify_fns[chain] = std::move(fn);
+}
+
+void MiningInterface::verify_found_block(size_t index)
+{
+    std::string hash;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (index >= m_found_blocks.size()) return;
+        auto& blk = m_found_blocks[index];
+        if (blk.status != BlockStatus::pending) return;
+        blk.check_count++;
+        hash = blk.hash;
+    }
+
+    // Select chain-specific verifier, fall back to default
+    std::string chain;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (index < m_found_blocks.size())
+            chain = m_found_blocks[index].chain;
+    }
+    block_verify_fn_t verify_fn;
+    auto it = m_chain_verify_fns.find(chain);
+    if (it != m_chain_verify_fns.end())
+        verify_fn = it->second;
+    else
+        verify_fn = m_block_verify_fn;
+
+    if (!verify_fn) return;
+
+    // Callback returns: >0 confirmed, <0 orphaned, 0 unknown/pending
+    int result = 0;
+    try { result = verify_fn(hash); } catch (...) {}
+
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    if (index >= m_found_blocks.size()) return;
+    auto& blk = m_found_blocks[index];
+    if (blk.status != BlockStatus::pending) return;
+
+    const auto& cn = blk.chain.empty() ? std::string("unknown") : blk.chain;
+    auto prev_status = blk.status;
+
+    if (result > 0) {
+        blk.confirmations = static_cast<uint32_t>(result);
+
+        if (blk.status == BlockStatus::pending) {
+            blk.status = BlockStatus::confirmed;
+            auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
+            // WHO FOUND IT, in words. On a p2pool sharechain the coinbase
+            // pays every participant proportionally, so our payout address in
+            // a block's coinbase means we earned a SHARE — never that we found
+            // it. That ambiguity cost real debugging time on 2026-08-07, when
+            // block 2517979 read as "ours" by its coinbase and was in fact
+            // found by another sharechain node, which is also why none of this
+            // node's pinned transactions were in it.
+            const bool ours  = blk.authorship == BlockAuthorship::this_node;
+            const bool peers = blk.authorship == BlockAuthorship::sharechain_peer;
+            LOG_INFO << "\n"
+                     << (ours  ? "  +++  BLOCK CONFIRMED — FOUND BY THIS NODE  +++\n"
+                       : peers ? "  +++  POOL BLOCK CONFIRMED — found by ANOTHER "
+                                 "sharechain node  +++\n"
+                               : "  +++  POOL BLOCK CONFIRMED  +++\n")
+                     << "  Chain:      " << cn << "\n"
+                     << "  Height:     " << blk.height << "\n"
+                     << "  Block hash: " << blk.hash << "\n"
+                     << "  Found by:   "
+                     << (ours  ? "THIS NODE (we built the template and"
+                                 " dispatched it)"
+                       : peers ? "ANOTHER NODE on the sharechain — its"
+                                 " template, not ours"
+                               : "UNKNOWN — this coin lane does not record"
+                                 " which node found the block")
+                     << "\n"
+                     // The miner address is the payout of the WINNING SHARE,
+                     // i.e. the finder's own address, not the pool's and not
+                     // ours. It is meaningful on all three branches: on a
+                     // peer-found block it names the peer who found it.
+                     << "  Payout to:  " << (blk.miner.empty() ? "(unattributed)"
+                                                               : blk.miner)
+                     << (ours ? ""
+                              : "   [payout of the winning share — the finder."
+                                " Our address may ALSO appear in the coinbase"
+                                " as our SHARE of the pool payout]")
+                     << "\n"
+                     << "  Share hash: " << (blk.share_hash.empty()
+                                                 ? "(none)" : blk.share_hash)
+                     << "\n"
+                     << "  Verified:   check #" << (int)blk.check_count
+                     << " (" << age_sec << "s after submission)"
+                     << " confirmations=" << blk.confirmations
+                     << (peers
+                            ? "\n  Note:       transactions this node pins or"
+                              " serves are NOT in this block — the finder built"
+                              " its own template."
+                            : "");
+        }
+        // Already confirmed — just update confirmation count silently
+    } else if (result < 0) {
+        // Explicit orphan signal from verifier
+        if (blk.status == BlockStatus::confirmed) {
+            // Deep reorg: was confirmed, now orphaned
+            LOG_WARNING << "[Pool] DEEP REORG — " << cn << " height " << blk.height
+                        << " was CONFIRMED but now ORPHANED (had " << blk.confirmations << " confs)";
+        }
+        blk.status = BlockStatus::orphaned;
+        blk.confirmations = 0;
+        auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
+        LOG_WARNING << "\n"
+                    << "  ---  BLOCK ORPHANED — " << cn << " height " << blk.height << "  ---\n"
+                    << "  Chain:      " << cn << "\n"
+                    << "  Height:     " << blk.height << "\n"
+                    << "  Block hash: " << blk.hash << "\n"
+                    << "  Checked:    " << (int)blk.check_count
+                    << " times over " << age_sec << "s — not in best chain";
+    }
+    // result == 0: still pending, keep checking
+
+    // Persist any status/confirmation change to LevelDB
+    if ((blk.status != prev_status || blk.confirmations > 0) && m_persist_block_fn)
+    {
+        try { m_persist_block_fn(blk); }
+        catch (...) {}
+    }
+}
+
+int MiningInterface::run_block_verification_now(const std::string& block_hash)
+{
+    size_t idx = SIZE_MAX;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
+            if (m_found_blocks[i].hash == block_hash) { idx = i; break; }
+        }
+    }
+    if (idx == SIZE_MAX) return std::numeric_limits<int>::min();
+
+    // verify_found_block() takes m_blocks_mutex itself — must not hold it here.
+    verify_found_block(idx);
+
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    if (idx >= m_found_blocks.size()) return std::numeric_limits<int>::min();
+    switch (m_found_blocks[idx].status) {
+        case BlockStatus::confirmed:
+            return static_cast<int>(m_found_blocks[idx].confirmations);
+        case BlockStatus::orphaned:
+            return -1;
+        default:
+            return 0;
+    }
+}
+
+void MiningInterface::schedule_block_verification(const std::string& block_hash)
+{
+    if (!m_context) {
+        LOG_WARNING << "schedule_block_verification: io_context not set (this=" << this
+                    << "), skipping hash=" << block_hash.substr(0,16);
+        return;
+    }
+
+    // Find the block index by hash
+    size_t idx = SIZE_MAX;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
+            if (m_found_blocks[i].hash == block_hash) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (idx == SIZE_MAX) return;
+
+    // Schedule verification checks for block acceptance.
+    // Block acceptance (in best chain) typically confirmed within 6 blocks.
+    // This is NOT coinbase maturity (100/240 confs for spending) — just
+    // whether the block was accepted into the blockchain.
+    //
+    // Chain-specific block times:
+    //   LTC: 2.5 min/block → check at +30s, +150s, +300s, +450s, +750s, +1500s
+    //   DOGE: 1 min/block  → check at +10s, +60s, +120s, +180s, +360s, +600s
+    //
+    // After 6 confirmations the block is considered permanently accepted.
+    // If still pending after all checks, mark as orphaned.
+    std::string chain_name;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (idx < m_found_blocks.size())
+            chain_name = m_found_blocks[idx].chain;
+    }
+
+    // Per-coin block target (seconds). Confirmation checks below are spaced by
+    // this value, so it MUST track each chain's real block time. Previously only
+    // LTC/DOGE were known and every other coin fell through to 60s -- meaning a
+    // genuine found block on a slow chain (BTC/BCH ~10 min) exhausted all 6
+    // confirmation checks inside ~1 real block and was falsely marked orphaned.
+    // A dashboard must never lie that a real found block was lost.
+    std::string cn = chain_name;
+    if (cn.size() > 1 && cn[0] == 't')   // strip testnet prefix (tLTC, tBTC, ...)
+        cn = cn.substr(1);
+    int block_time_sec;
+    if      (cn == "LTC")  block_time_sec = 150;   // 2.5 min
+    else if (cn == "DOGE") block_time_sec = 60;    // 1 min
+    else if (cn == "BTC")  block_time_sec = 600;   // 10 min
+    else if (cn == "BCH")  block_time_sec = 600;   // 10 min
+    else if (cn == "DASH") block_time_sec = 150;   // 2.5 min
+    else if (cn == "DGB")  block_time_sec = 15;    // ~15 s
+    else                   block_time_sec = 60;    // safe fallback
+
+    // Check at: first_check, then every block_time for 6 blocks,
+    // then one final check at 10 blocks
+    auto& ioc = *m_context;
+    std::vector<int> delays = {
+        block_time_sec / 5,         // quick first check
+        block_time_sec,             // ~1 conf
+        block_time_sec * 2,         // ~2 confs
+        block_time_sec * 3,         // ~3 confs
+        block_time_sec * 5,         // ~5 confs
+        block_time_sec * 10,        // ~10 confs (final)
+    };
+
+    for (int delay : delays) {
+        auto timer = std::make_shared<boost::asio::steady_timer>(
+            ioc, std::chrono::seconds(delay));
+        timer->async_wait([this, idx, timer](boost::system::error_code ec) {
+            if (!ec) verify_found_block(idx);
+        });
+    }
+}
+
+// ──────────── p2pool legacy compatibility REST endpoints ─────────────────
+// These endpoints reproduce the exact JSON shape that the original p2pool
+// dashboard (Forrest Voight) and jtoomim fork expect, enabling third-party
+// dashboards built for the classic p2pool lineage to work unchanged.
+
+nlohmann::json MiningInterface::rest_local_stats()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    // peers — legacy format: {incoming, outgoing}
+    result["peers"] = {{"incoming", 0}, {"outgoing", 0}};
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array()) {
+            int incoming = 0, outgoing = 0;
+            for (const auto& p : pi) {
+                if (p.value("incoming", false)) ++incoming;
+                else ++outgoing;
+            }
+            result["peers"] = {{"incoming", incoming}, {"outgoing", outgoing}};
+        }
+    } else if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("peer_count"))
+            result["peers"]["outgoing"] = hs["peer_count"];
+    }
+
+    // miner_hash_rates / miner_dead_hash_rates — from stratum worker registry
+    nlohmann::json miner_rates = nlohmann::json::object();
+    nlohmann::json miner_dead  = nlohmann::json::object();
+    {
+        auto workers = effective_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            // Key by the FULL stratum username (ADDRESS.worker) so each D9/worker
+            // gets its own bucket; fall back to the bare address when no worker
+            // suffix was supplied. Read/web-stats path only — pool-wide aggregates
+            // (poolhashps, shares, payouts) are unchanged.
+            std::string key = w.worker_name.empty()
+                                  ? w.username
+                                  : w.username + "." + w.worker_name;
+            double existing = miner_rates.value(key, 0.0);
+            miner_rates[key] = existing + w.hashrate;
+            double existing_dead = miner_dead.value(key, 0.0);
+            miner_dead[key] = existing_dead + w.dead_hashrate;
+        }
+    }
+    result["miner_hash_rates"] = miner_rates;
+    result["miner_dead_hash_rates"] = miner_dead;
+
+    // #919 per-node LOCAL hashrate (local_hashps) -- the series a local-hashrate
+    // graph polls over time. This is THIS node's own work rate, read from the
+    // real stratum work-rate counter (m_stratum_hashrate_fn, the same live
+    // per-node source the node-fee "local_hr" leg below trusts), NOT the empty
+    // m_node stub that produced the founding poolhashps=0 lie. Distinct from
+    // poolhashps, which is the pool-wide attempts/s the "Pool: X GH/s" print
+    // reports. Honest-absent: with no work-rate source wired the counter is
+    // COLD and we emit null, never a flat 0 that would falsely claim this node
+    // mines nothing. A wired source reporting 0.0 is a TRUE reading (no active
+    // local miners) and is surfaced as 0, not null.
+    if (m_stratum_hashrate_fn)
+        result["local_hashps"] = m_stratum_hashrate_fn();
+    else
+        result["local_hashps"] = nullptr;
+
+    // shares — {total, orphan, dead}
+    // Sharechain stats now use O(log n) StatsSkipList — no caching needed.
+    nlohmann::json cached_sc;
+    int total_shares = 0, orphan_shares = 0, dead_shares = 0;
+    double share_diff = 1.0;
+    if (m_sharechain_stats_fn) {
+        cached_sc = m_sharechain_stats_fn();
+        if (cached_sc.contains("total_shares"))
+            total_shares = cached_sc["total_shares"].get<int>();
+        if (cached_sc.contains("orphan_shares"))
+            orphan_shares = cached_sc["orphan_shares"].get<int>();
+        if (cached_sc.contains("dead_shares"))
+            dead_shares = cached_sc["dead_shares"].get<int>();
+        if (cached_sc.contains("average_difficulty"))
+            share_diff = cached_sc["average_difficulty"].get<double>();
+    }
+    result["shares"] = {{"total", total_shares}, {"orphan", orphan_shares}, {"dead", dead_shares}};
+
+    // local_shares — fate of the shares THIS node minted (display only).
+    // shares{orphan,dead} above is the sharechain-wide StaleInfo tally, which
+    // by construction cannot see a locally minted share that was accepted and
+    // then lost the head race (we stamp StaleInfo::none on our own mints). A
+    // coin whose stats fn publishes the local-mint gauge (DASH) gets this extra
+    // object; every other coin's payload is byte-identical to before.
+    if (cached_sc.contains("local_minted_shares")) {
+        result["local_shares"] = {
+            {"minted",      cached_sc.value("local_minted_shares",   uint64_t(0))},
+            {"on_chain",    cached_sc.value("local_on_chain_shares", uint64_t(0))},
+            {"orphan",      cached_sc.value("local_orphan_shares",   uint64_t(0))},
+            {"pending",     cached_sc.value("local_pending_shares",  uint64_t(0))},
+            {"gone",        cached_sc.value("local_gone_shares",     uint64_t(0))},
+            {"orphan_rate", cached_sc.value("local_orphan_rate",     0.0)},
+        };
+    }
+
+    // efficiency = valid / total (null if no shares)
+    if (total_shares > 0) {
+        int valid = total_shares - orphan_shares - dead_shares;
+        result["efficiency"] = static_cast<double>(valid) / total_shares;
+    } else {
+        result["efficiency"] = nullptr;
+    }
+
+    result["uptime"] = rest_uptime();
+
+    // Live coin-template summary for coin targets (c2pool-dash) that drive
+    // their own work pipeline and leave WebServer's m_cached_template empty.
+    // Display only; NEVER drives coinbase or consensus. Also refreshes the
+    // network-difficulty cache so /global_stats + attempts_to_block read the
+    // real value on the DASH path (where refresh_work() never runs).
+    CoinWorkInfo coin_work;
+    if (m_coin_work_fn) coin_work = m_coin_work_fn();
+    if (coin_work.valid && coin_work.network_difficulty > 0.0)
+        m_network_difficulty.store(coin_work.network_difficulty, std::memory_order_relaxed);
+
+    // block_value in coins (not satoshis)
+    double block_value = 0.0;
+    double payment_amount = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null()) {
+            block_value = m_cached_template.value("coinbasevalue", uint64_t(0)) / 1e8;
+            // Dash: payment_amount = masternode + superblock + platform payments
+            // These are deducted from miner payout before PPLNS distribution
+            payment_amount = m_cached_template.value("payment_amount", uint64_t(0)) / 1e8;
+        }
+    }
+    // Fall back to the coin target's live template when WebServer has none.
+    double burn_amount = 0.0;
+    if (block_value == 0.0 && coin_work.valid) {
+        block_value    = static_cast<double>(coin_work.coinbase_value_sat) / 1e8;
+        // MEASURED WRONG SPLIT (hotel, 2026-08-05, DASH mainnet). The
+        // dashboard said miner_gross=0.9404 (53% of the block) while the
+        // ACCEPTED coinbase of our own h=2516911 paid miners 0.4428 (25%):
+        // payment_amount_sat carries only the projected MN payee — it rides
+        // in share serialization and MUST keep that meaning — so the 0.4979
+        // DIP-0027 platform OP_RETURN burn was silently counted as miner
+        // money. payments_total_sat is the display-side truth: the sum of
+        // EVERY non-miner coinbase output (MN payee + operator split +
+        // superblock + burn). Fall back to the legacy field only when the
+        // producer did not fill it (LTC path: both 0, byte-identical).
+        payment_amount = static_cast<double>(
+            coin_work.payments_total_sat != 0 ? coin_work.payments_total_sat
+                                              : coin_work.payment_amount_sat) / 1e8;
+        burn_amount    = static_cast<double>(coin_work.burn_sat) / 1e8;
+    }
+    result["block_value"] = block_value;
+    // WHICH template the number describes, and how old it is. block_value
+    // renders identically whether the template is live or was last sourced
+    // an hour ago (hotel primary: 0 local miners => nothing refreshes it) —
+    // the height + age let the dashboard say so instead of presenting a
+    // stale number as current.
+    if (coin_work.valid) {
+        result["block_value_height"] = coin_work.height;
+        result["block_value_age_sec"] =
+            coin_work.template_age_sec >= 0
+                ? nlohmann::json(coin_work.template_age_sec)
+                : nlohmann::json(nullptr);
+    }
+    // #948 gross-vs-net honesty. block_value_miner has always been NET of the
+    // pool fee while block_value_payments is GROSS: two sibling fields sharing
+    // the block_value_ prefix carry different conventions, and nothing in the
+    // name says so. Worse, block_value_miner + block_value_payments does NOT
+    // equal block_value, so a consumer that assumes the parts sum silently
+    // loses the fee. Fix additively -- the legacy keys keep their exact values
+    // (block_value_miner stays NET), and we expose the gross miner share, the
+    // fee deduction, and explicit *_gross / *_net aliases whose names state
+    // pre- vs post-fee. The reconciliation identity then holds on a fee'd node:
+    //     block_value_miner_gross + block_value_payments == block_value   (DASH)
+    //     block_value_miner_gross == block_value_miner + block_value_fee
+    double fee_ratio = m_pool_fee_percent / 100.0;
+    double miner_subsidy = std::max(0.0, block_value - payment_amount);  // GROSS miner share (pre-fee)
+    double miner_fee     = miner_subsidy * fee_ratio;                    // pool fee taken from the miner share
+    double miner_net     = miner_subsidy - miner_fee;                    // POST-fee miner share
+    result["block_value_miner"]       = miner_net;     // legacy key: unchanged value, now documented as NET
+    result["block_value_miner_net"]   = miner_net;     // explicit post-fee alias
+    result["block_value_miner_gross"] = miner_subsidy; // explicit pre-fee miner share (dashboard displays this)
+    result["block_value_fee"]         = miner_fee;     // visible pool-fee deduction, so the parts reconcile
+    result["block_value_payments"] = (m_blockchain == Blockchain::DASH) ? payment_amount : block_value;
+    // The burn split out of payments, so the card's arithmetic is auditable
+    // against the real coinbase: payments == masternode-lane outputs + burn.
+    if (m_blockchain == Blockchain::DASH)
+        result["block_value_burn"] = burn_amount;
+
+    // Node fee amounts per block: fee% × (local_hashrate / pool_hashrate) × block_value
+    // Matches p2pool: operator gets fee% of THIS node's contribution, not the whole block.
+    {
+        double local_hr = m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0;
+        double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
+        double node_share = (pool_hr > 0 && local_hr > 0) ? local_hr / pool_hr : 0.0;
+        double primary_fee = miner_subsidy * fee_ratio * node_share;
+
+        // COIN-NEUTRAL key. There is exactly ONE shared web-static/dashboard
+        // .html for every coin, so a per-coin key name is something the page
+        // cannot read without knowing which coin it is serving. The Node Fee
+        // card read `node_fee_ltc` unconditionally, which is absent on DASH —
+        // d3.format('.4f')(undefined) renders nothing, so the card sat at "-"
+        // on a node that had computed the number correctly (measured live:
+        // node_fee_dash = 0.00424, node_fee_ltc absent). This is the key the
+        // dashboard reads first, on every coin.
+        result["node_fee"] = primary_fee;
+        // Merged-child equivalent, likewise coin-neutral. Absent (not zero)
+        // when nothing is merged, so the page can tell "no merged chain" from
+        // "merged chain owes zero".
+        //
+        // The coin-SUFFIXED keys below stay byte-unchanged: they are the
+        // p2pool-compat surface external tooling reads, and the same
+        // keep-the-legacy-key rule #1127 followed for the fee fields. The
+        // dashboard falls back to them so a NEW page dropped on an OLD binary
+        // (e.g. --dashboard-dir pointed at a newer web-static) still renders.
+        switch (m_blockchain) {
+        case Blockchain::DASH:
+            result["node_fee_dash"] = primary_fee; break;
+        case Blockchain::DOGECOIN:
+            result["node_fee_doge"] = primary_fee;
+            result["node_fee_ltc"] = primary_fee; break;  // compat
+        default:
+            result["node_fee_ltc"] = primary_fee; break;
+        }
+        if (m_mm_manager) {
+            auto chain_infos = m_mm_manager->get_chain_infos();
+            bool first_merged = true;
+            for (const auto& ci : chain_infos) {
+                double merged_bv = ci.coinbase_value / 1e8;
+                std::string sym = ci.symbol;
+                for (auto& c : sym) c = std::tolower(c);
+                double merged_fee = merged_bv * fee_ratio * node_share;
+                result["node_fee_" + sym] = merged_fee;
+                if (first_merged) {
+                    result["node_fee_merged"]        = merged_fee;
+                    result["node_fee_merged_symbol"] = ci.symbol;
+                    first_merged = false;
+                }
+            }
+        }
+    }
+
+    // Warnings: daemon health, version alerts, merged chain status
+    {
+        auto warnings = nlohmann::json::array();
+
+        // 1. LTC block source contact check (>60s since last work update)
+        auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (m_last_work_update_time > 0 && now_s - m_last_work_update_time > 60) {
+            std::string src = (m_coin_node && m_coin_node->is_embedded()) ? "EMBEDDED LTC NODE" : "LTC DAEMON";
+            warnings.push_back("LOST CONTACT WITH " + src + " for "
+                + std::to_string(now_s - m_last_work_update_time) + "s! "
+                + ((m_coin_node && m_coin_node->is_embedded()) ? "No new blocks received from P2P peers."
+                                   : "Check that it isn't frozen or dead!"));
+        }
+
+        // 2. No work template yet
+        // Coin targets that drive their own work pipeline (c2pool-dash)
+        // don't populate m_cached_template; suppress this warning when
+        // the dashboard-always-ready flag is set.
+        if (!m_dashboard_always_ready.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (!m_work_valid)
+                warnings.push_back("No block template received yet — waiting for daemon connection");
+        }
+
+        // 3. Merged chain daemon contact check
+        // Threshold: 3x expected block time (LTC ~150s → 450s, DOGE ~60s → 180s).
+        // Aux work updates on each new block — brief gaps between blocks are normal.
+        if (m_mm_manager) {
+            auto chain_infos = m_mm_manager->get_chain_infos();
+            for (const auto& ci : chain_infos) {
+                int64_t threshold = 180; // 3 minutes default (covers DOGE 1min blocks)
+                if (ci.last_update_age_s > threshold) {
+                    std::string src = (m_coin_node && m_coin_node->is_embedded()) ? " EMBEDDED NODE" : " DAEMON";
+                    warnings.push_back("LOST CONTACT WITH " + ci.symbol + src + " for "
+                        + std::to_string(ci.last_update_age_s) + "s!"
+                        + ((m_coin_node && m_coin_node->is_embedded()) ? " No new blocks from P2P peers." : ""));
+                }
+            }
+        }
+
+        // 4. No peers connected — use P2P peer info callback if available
+        {
+            int peers = 0;
+            if (m_peer_info_fn) {
+                auto pi = m_peer_info_fn();
+                peers = pi.is_array() ? static_cast<int>(pi.size()) : 0;
+            } else if (m_node) {
+                peers = static_cast<int>(m_node->get_connected_peers_count());
+            }
+            if (peers == 0)
+                warnings.push_back("No pool peers connected — share propagation disabled");
+        }
+
+        // 5. No miners connected
+        if (effective_stratum_workers().empty() && !m_solo_mode)
+            warnings.push_back("No miners connected — pool is idle");
+
+        // 6. Version signaling: majority voting for unsupported version
+        if (m_node) {
+            // Reuse cached sharechain stats to avoid a second expensive chain walk
+            auto vs = rest_version_signaling(&cached_sc);
+            if (vs.contains("versions") && vs["versions"].is_object()) {
+                int64_t total_votes = 0;
+                int64_t max_version = 0;
+                int64_t max_count = 0;
+                for (auto& [ver_str, entry] : vs["versions"].items()) {
+                    int64_t v = std::stoll(ver_str);
+                    int64_t c = entry.is_object() ? entry.value("weight", int64_t(0)) : entry.get<int64_t>();
+                    total_votes += c;
+                    if (c > max_count) { max_count = c; max_version = v; }
+                }
+                if (max_version > 36 && total_votes > 0 && max_count * 2 > total_votes)
+                    warnings.push_back("MAJORITY VOTING FOR V" + std::to_string(max_version)
+                        + " (" + std::to_string(max_count * 100 / total_votes)
+                        + "% support) — an upgrade may be necessary!");
+            }
+        }
+
+        result["warnings"] = warnings;
+    }
+    result["donation_proportion"] = m_pool_fee_percent / 100.0;
+    result["fee"] = m_pool_fee_percent;  // percentage (e.g. 1.0)
+    // UNITS, stated (hotel, 2026-08-05: the operator could not tell from the
+    // payload whether fee=1.0 meant 1% or a proportion of 1.0 = 100%, because
+    // the sibling donation_proportion IS a proportion where 1.0 would mean
+    // 100%). `fee` and /fee stay p2pool-compat percent; these two name their
+    // unit in the key so no consumer has to guess again. Same value, no
+    // semantic change.
+    result["fee_percent"]      = m_pool_fee_percent;          // 1.0 == 1%
+    result["donation_percent"] = m_pool_fee_percent;          // same 1% restated
+    result["fee_units"]        = "percent";
+
+    // attempts_to_{share,block} — estimate from difficulty
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    result["attempts_to_share"] = static_cast<int64_t>(share_diff * 4294967296.0);
+    result["attempts_to_block"] = static_cast<int64_t>(net_diff * 4294967296.0);
+
+    // attempts_to_merged_block — from aux chain difficulty
+    int64_t merged_attempts = 0;
+    if (m_mm_manager && m_mm_manager->has_chains()) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        if (!chain_infos.empty() && chain_infos.front().difficulty > 0) {
+            merged_attempts = static_cast<int64_t>(chain_infos.front().difficulty * 4294967296.0);
+        }
+    }
+    result["attempts_to_merged_block"] = merged_attempts;
+
+    // p2pool-compat: my_hash_rates_in_last_hour — aggregate from all local workers
+    double total_hr = 0, total_dead = 0;
+    {
+        auto workers = effective_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            total_hr += w.hashrate;
+            total_dead += w.dead_hashrate;
+        }
+    }
+    result["my_hash_rates_in_last_hour"] = {
+        {"nonstale", total_hr - total_dead},
+        {"rewarded", total_hr - total_dead},
+        {"actual", total_hr},
+        {"note", "from stratum worker hashrates"}
+    };
+
+    // p2pool-compat: my_share_counts_in_last_hour
+    result["my_share_counts_in_last_hour"] = {
+        {"shares", total_shares},
+        {"unstale_shares", total_shares - orphan_shares - dead_shares},
+        {"stale_shares", orphan_shares + dead_shares},
+        {"orphan_stale_shares", orphan_shares},
+        {"doa_stale_shares", dead_shares}
+    };
+
+    // p2pool-compat: my_stale_proportions_in_last_hour
+    double stale_prop = total_shares > 0 ? static_cast<double>(orphan_shares + dead_shares) / total_shares : 0.0;
+    double orphan_prop = total_shares > 0 ? static_cast<double>(orphan_shares) / total_shares : 0.0;
+    double dead_prop = total_shares > 0 ? static_cast<double>(dead_shares) / total_shares : 0.0;
+    result["my_stale_proportions_in_last_hour"] = {
+        {"stale", stale_prop}, {"orphan_stale", orphan_prop}, {"dead_stale", dead_prop}
+    };
+
+    // p2pool-compat: efficiency_if_miner_perfect
+    if (total_shares > 0)
+        result["efficiency_if_miner_perfect"] = 1.0 - stale_prop;
+    else
+        result["efficiency_if_miner_perfect"] = nullptr;
+
+    // p2pool-compat: miner_last_difficulties — from stratum workers
+    nlohmann::json miner_diffs = nlohmann::json::object();
+    {
+        auto workers = effective_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            std::string key = w.username;
+            miner_diffs[key] = w.difficulty;
+        }
+    }
+    result["miner_last_difficulties"] = miner_diffs;
+
+    // Best-share summary (highest-difficulty pseudoshare seen). Mirrors the
+    // dedicated /best_share endpoint so /local_stats consumers get the "how
+    // close did the best share get to a block" metric inline. Display only.
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        auto pct = [&](double d) { return net_diff > 0 ? d / net_diff * 100.0 : 0.0; };
+        auto bs_entry = [&](double diff, const std::string& miner,
+                            const std::string& hash, uint64_t ts) {
+            return nlohmann::json{
+                {"difficulty", diff}, {"pct_of_block", pct(diff)},
+                {"miner", miner}, {"hash", hash}, {"timestamp", ts}};
+        };
+        result["best_share"] = {
+            {"network_difficulty", net_diff},
+            {"round", bs_entry(m_best_difficulty.round, m_best_difficulty.miner,
+                               m_best_difficulty.hash, m_best_difficulty.timestamp)},
+            {"session", bs_entry(m_best_difficulty.session, m_best_difficulty.session_miner,
+                                 m_best_difficulty.session_hash, m_best_difficulty.session_ts)},
+            {"all_time", bs_entry(m_best_difficulty.all_time, m_best_difficulty.all_time_miner,
+                                  m_best_difficulty.all_time_hash, m_best_difficulty.all_time_ts)}
+        };
+    }
+
+    // p2pool-compat: version and protocol_version
+    result["version"] = m_pool_version;
+    result["protocol_version"] = m_protocol_version.load(std::memory_order_relaxed);
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_p2pool_global_stats()
+{
+    // Original p2pool /global_stats shape — delegate to full implementation
+    auto full = rest_global_stats();
+    nlohmann::json result = nlohmann::json::object();
+    result["pool_hash_rate"] = full.value("pool_hash_rate", 0.0);
+    result["pool_stale_prop"] = full.value("pool_stale_prop", 0.0);
+    // Propagate the null through rather than substituting a literal 1.0: an
+    // unknown floor must read as unknown on the p2pool-shaped endpoint too.
+    result["min_difficulty"] = (full.contains("min_difficulty") && full["min_difficulty"].is_number())
+        ? full["min_difficulty"]
+        : nlohmann::json(nullptr);
+    result["pool_nonstale_hash_rate"] = full.value("pool_nonstale_hash_rate", 0.0);
+    result["network_block_difficulty"] = full.value("network_block_difficulty", 0.0);
+    result["network_hashrate"] = full.value("network_hashrate", 0.0);
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_web_version()
+{
+    return m_pool_version;
+}
+
+nlohmann::json MiningInterface::rest_coin_peers(const std::string& remote_ip)
+{
+    // Rate limit: max 6 requests per minute per IP
+    auto now = std::chrono::steady_clock::now();
+    auto it = m_coin_peers_rate_limit.find(remote_ip);
+    if (it != m_coin_peers_rate_limit.end()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now - it->second).count();
+        if (elapsed < 10) {
+            return {{"error", "rate_limited"}, {"retry_after", 10 - elapsed}};
+        }
+    }
+    m_coin_peers_rate_limit[remote_ip] = now;
+
+    // Prune old entries (prevent unbounded growth)
+    if (m_coin_peers_rate_limit.size() > 1000) {
+        for (auto rl = m_coin_peers_rate_limit.begin();
+             rl != m_coin_peers_rate_limit.end(); ) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(
+                    now - rl->second).count() > 60)
+                rl = m_coin_peers_rate_limit.erase(rl);
+            else
+                ++rl;
+        }
+    }
+
+    // No embedded-coin-peer source wired for this node: return an EMPTY
+    // object rather than a fabricated {ltc,doge} skeleton. Inventing a fixed
+    // LTC+DOGE shape lies about a node that may run a different coin set (or
+    // none) -- the dashboard must reflect THIS node's real topology, never a
+    // hardcoded one. Empty object => dashboard shows no embedded chains.
+    if (!m_coin_peers_fn)
+        return nlohmann::json::object();
+
+    return m_coin_peers_fn();
+}
+
+nlohmann::json MiningInterface::rest_web_currency_info()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    // Label-keyed coins that share a Blockchain enum value with another chain
+    // resolve their identity from the configured coin label, NOT the enum:
+    //   - BCH runs on Blockchain::BITCOIN + set_coin_label("BCH") (it has no
+    //     dedicated enum entry — see src/impl/bch/pool_entrypoint.hpp), so the
+    //     BITCOIN switch case below would otherwise advertise Bitcoin's
+    //     symbol/name/explorer on a Bitcoin-Cash node.
+    //   - NMC is an AuxPoW child (no primary binary); handled here for
+    //     completeness / operator custom deployments.
+    // Enum-native coins (LTC/BTC/DOGE/DASH/DGB) never match these labels, so
+    // they fall through to the switch UNCHANGED (byte-identical behaviour).
+    std::string coin_label_uc = m_coin_label;
+    for (auto& ch : coin_label_uc)
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+    if (coin_label_uc == "BCH") {
+        result["symbol"] = "BCH";
+        result["name"] = "Bitcoin Cash";
+        result["block_period"] = 600;  // 10 min average (SHA256d)
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/bitcoin-cash/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/bitcoin-cash/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/bitcoin-cash/transaction/";
+        }
+    } else if (coin_label_uc == "NMC") {
+        result["symbol"] = "NMC";
+        result["name"] = "Namecoin";
+        result["block_period"] = 600;  // 10 min average (SHA256d AuxPoW under BTC)
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            // Blockchair does not list Namecoin; Tokenview is a live NMC explorer
+            // (namecoin.org "Blockchain Explorers"). Operator-verifiable value.
+            result["address_explorer_url_prefix"] = "https://nmc.tokenview.io/en/address/";
+            result["block_explorer_url_prefix"]   = "https://nmc.tokenview.io/en/blockdetail/";
+            result["tx_explorer_url_prefix"]      = "https://nmc.tokenview.io/en/tx/";
+        }
+    } else
+    switch (m_blockchain) {
+    case Blockchain::LITECOIN:
+        result["symbol"] = "LTC";
+        result["name"] = "Litecoin";
+        // LTC parent merge-mines DOGE across the fleet; expose the child so
+        // the dashboard renders the merged worker-username format. Standalone
+        // coins (DASH/BTC/DGB) set NO merged child -> field absent -> parent-
+        // only instructions. Never advertise a merged child a coin lacks.
+        result["merged_child_symbol"] = "DOGE";
+        // Companion to merged_child_symbol: the child chain's address-explorer
+        // prefix, so the dashboard links merged (DOGE) payout addresses through
+        // currency_info instead of a hardcoded blockchair URL. Absent on
+        // standalone coins -> no merged link rendered.
+        result["merged_child_address_explorer_url_prefix"] = "https://blockchair.com/dogecoin/address/";
+        result["block_period"] = 150;  // 2.5 min average
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else if (m_testnet) {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/litecoin/testnet/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/litecoin/testnet/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/litecoin/testnet/transaction/";
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/litecoin/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/litecoin/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/litecoin/transaction/";
+        }
+        break;
+    case Blockchain::BITCOIN:
+        result["symbol"] = "BTC";
+        result["name"] = "Bitcoin";
+        result["block_period"] = 600;  // 10 min average
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/bitcoin/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/bitcoin/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/bitcoin/transaction/";
+        }
+        break;
+    case Blockchain::DOGECOIN:
+        result["symbol"] = "DOGE";
+        result["name"] = "Dogecoin";
+        result["block_period"] = 60;   // 1 min average
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/dogecoin/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/dogecoin/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/dogecoin/transaction/";
+        }
+        break;
+    case Blockchain::DASH:
+        result["symbol"] = "DASH";
+        result["name"] = "Dash";
+        result["block_period"] = 150;  // 2.5 min average
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/dash/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/dash/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/dash/transaction/";
+        }
+        break;
+    case Blockchain::DIGIBYTE:
+        result["symbol"] = "DGB";
+        result["name"] = "DigiByte";
+        result["block_period"] = 15;   // ~15 s average (multi-algo)
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            // Blockchair does NOT list DigiByte (blockchair.com/digibyte/* are
+            // dead links); digiexplorer.info is the live DGB explorer and is
+            // already what the bundled explorer (classify.ts) and c2pool-qt
+            // (CoinBridge) use — align the server so all three agree. Note the
+            // path segment is /tx/ (digiexplorer), not /transaction/ (blockchair).
+            result["address_explorer_url_prefix"] = "https://digiexplorer.info/address/";
+            result["block_explorer_url_prefix"]   = "https://digiexplorer.info/block/";
+            result["tx_explorer_url_prefix"]      = "https://digiexplorer.info/tx/";
+        }
+        break;
+    default:
+        // Per-node truthfulness: never fabricate a coin identity we do not know.
+        // Honor an operator-configured custom explorer if present; otherwise leave
+        // symbol/name unset so the dashboard shows unknown rather than a wrong coin.
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        }
+        break;
+    }
+
+    // Expose explorer state so dashboard JS can link to internal explorer
+    result["explorer_enabled"] = m_explorer_enabled;
+    if (m_explorer_enabled && !m_explorer_url.empty())
+        result["explorer_url"] = m_explorer_url;
+
+    // Mode indicators for conditional UI. Coin targets whose daemon RPC is an
+    // external NodeRPC arm (c2pool-dash dashd) rather than an ICoinNode set the
+    // m_coin_rpc_available flag so has_rpc is truthful.
+    result["embedded"] = (m_coin_node && m_coin_node->is_embedded());
+    result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
+                         || m_coin_rpc_available.load(std::memory_order_relaxed);
+
+    // p2pool share version for the current coin — consumed by the
+    // bundled @c2pool/sharechain-explorer to classify share cells.
+    // For the V35/V36-ratcheting coins this MUST be the node's LIVE
+    // ratchet-selected version (m_cached_share_version, fed from the
+    // AutoRatchet), never a static 36: during the V35->V36 cross a node that
+    // is still VOTING is actually producing V35 shares, and reporting 36 would
+    // make the explorer misclassify live V35 share cells as V36 — a lie about
+    // the crossing state. DASH (v16, non-ratcheting on this path) keeps its
+    // protocol version since the LTC AutoRatchet does not drive its cache.
+    switch (m_blockchain) {
+    case Blockchain::DASH:     result["share_version"] = 16; break;
+    case Blockchain::LITECOIN:
+    case Blockchain::BITCOIN:
+    case Blockchain::DOGECOIN:
+    default:                   result["share_version"] = m_cached_share_version; break;
+    }
+
+    // ─── Per-coin explorer map (operator 2026-06-23: each coin = a distinct
+    // blockchain). On merged-mining nodes (e.g. LTC primary + DOGE aux) the
+    // dashboard switcher must link each coin's blocks/txs/addresses to the
+    // RIGHT explorer, never the primary coin's. Sourced from live MM state —
+    // never hardcoded per node.
+    {
+        // Per-coin {address,block,tx} explorer prefixes. Blockchair covers the
+        // SHA256d/scrypt/X11 majors, but does NOT list DigiByte or Namecoin —
+        // those use their own explorers with chain-correct path segments
+        // (digiexplorer uses /tx/, not blockchair's /transaction/). Returns an
+        // empty object when no public explorer is known -> no link rendered.
+        auto explorer_prefixes = [](const std::string& sym) -> nlohmann::json {
+            auto bc = [](const char* slug) {
+                std::string base = std::string("https://blockchair.com/") + slug + "/";
+                return nlohmann::json{
+                    {"address_explorer_url_prefix", base + "address/"},
+                    {"block_explorer_url_prefix",   base + "block/"},
+                    {"tx_explorer_url_prefix",      base + "transaction/"}};
+            };
+            if (sym == "LTC")  return bc("litecoin");
+            if (sym == "DOGE") return bc("dogecoin");
+            if (sym == "BTC")  return bc("bitcoin");
+            if (sym == "DASH") return bc("dash");
+            if (sym == "BCH")  return bc("bitcoin-cash");
+            if (sym == "DGB")  return nlohmann::json{
+                {"address_explorer_url_prefix", "https://digiexplorer.info/address/"},
+                {"block_explorer_url_prefix",   "https://digiexplorer.info/block/"},
+                {"tx_explorer_url_prefix",      "https://digiexplorer.info/tx/"}};
+            if (sym == "NMC")  return nlohmann::json{
+                {"address_explorer_url_prefix", "https://nmc.tokenview.io/en/address/"},
+                {"block_explorer_url_prefix",   "https://nmc.tokenview.io/en/blockdetail/"},
+                {"tx_explorer_url_prefix",      "https://nmc.tokenview.io/en/tx/"}};
+            return nlohmann::json::object();
+        };
+        nlohmann::json coins = nlohmann::json::array();
+        // Primary coin: reuse the prefixes already resolved above so we never
+        // diverge from the top-level fields (honors operator custom-explorer).
+        if (result.contains("symbol")) {
+            nlohmann::json primary = {
+                {"symbol", result.value("symbol", std::string())},
+                {"name",   result.value("name",   std::string())},
+                {"primary", true},
+            };
+            if (result.contains("address_explorer_url_prefix")) {
+                primary["address_explorer_url_prefix"] = result["address_explorer_url_prefix"];
+                primary["block_explorer_url_prefix"]   = result["block_explorer_url_prefix"];
+                primary["tx_explorer_url_prefix"]      = result["tx_explorer_url_prefix"];
+            }
+            coins.push_back(primary);
+        }
+        // Merged aux chains (DOGE-into-LTC, NMC-into-BTC, ...) from live MM state.
+        if (m_mm_manager) {
+            for (const auto& ci : m_mm_manager->get_chain_infos()) {
+                nlohmann::json c = {{"symbol", ci.symbol}, {"merged", true}};
+                c["current_height"] = ci.current_height;
+                if (!ci.current_tip.empty()) c["current_tip"] = ci.current_tip;
+                nlohmann::json ex = explorer_prefixes(ci.symbol);
+                if (!ex.empty()) {
+                    c["address_explorer_url_prefix"] = ex["address_explorer_url_prefix"];
+                    c["block_explorer_url_prefix"]   = ex["block_explorer_url_prefix"];
+                    c["tx_explorer_url_prefix"]      = ex["tx_explorer_url_prefix"];
+                }
+                coins.push_back(c);
+            }
+        }
+        result["coins"] = coins;
+    }
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_payout_addr()
+{
+    return m_payout_address;
+}
+
+nlohmann::json MiningInterface::rest_payout_addrs()
+{
+    // p2pool: returns the node operator's address(es) so the dashboard
+    // can look them up in /current_payouts and display operator earnings.
+    // The probabilistic fee replacement puts shares under this address.
+    nlohmann::json arr = nlohmann::json::array();
+    if (!m_payout_address.empty())
+        arr.push_back(m_payout_address);
+    if (!m_node_fee_address.empty() && m_node_fee_address != m_payout_address)
+        arr.push_back(m_node_fee_address);
+    return arr;
+}
+
+nlohmann::json MiningInterface::rest_web_best_share_hash()
+{
+    if (m_best_share_hash_fn) {
+        uint256 h = m_best_share_hash_fn();
+        return h.GetHex();
+    }
+    return "0000000000000000000000000000000000000000000000000000000000000000";
+}
+
+nlohmann::json MiningInterface::rest_sync_status()
+{
+    nlohmann::json result;
+
+    // Check if sharechain has data
+    bool has_shares = false;
+    int chain_size = 0, verified_size = 0;
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        chain_size = sc.value("chain_height", 0);
+        verified_size = sc.value("verified_count", 0);
+        has_shares = chain_size > 0;
+    }
+
+    // Check if best share exists
+    bool has_best = false;
+    if (m_best_share_hash_fn) {
+        auto h = m_best_share_hash_fn();
+        has_best = !h.IsNull();
+    }
+
+    // Check if a valid work template exists (SPV synced + UTXO mature).
+    // The placeholder template has height=1 and coinbasevalue=5000000000 —
+    // reject it by requiring height > 100.
+    bool has_work = false;
+    if (m_dashboard_always_ready.load(std::memory_order_relaxed)) {
+        // Coin-driven work pipelines (c2pool-dash) manage their own work;
+        // report has_work=true so the loading gate doesn't stall.
+        has_work = true;
+    } else {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        has_work = !m_cached_template.is_null()
+            && m_cached_template.value("coinbasevalue", uint64_t(0)) > 0
+            && m_cached_template.value("height", 0) > 100;
+    }
+
+    // Node is truly ready when:
+    // 1. Has verified shares (for PPLNS)
+    // 2. Has a valid work template (SPV synced, UTXO matured)
+    // Without both, the dashboard shows empty sections.
+    result["ready"] = has_best && has_shares && verified_size > 0 && has_work;
+    result["has_best_share"] = has_best;
+    result["has_shares"] = has_shares;
+    result["has_work"] = has_work;
+    result["chain_size"] = chain_size;
+    result["verified_size"] = verified_size;
+    result["uptime_seconds"] = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - m_start_time).count());
+
+    // SPV sync progress
+    if (m_spv_progress_fn) {
+        auto spv = m_spv_progress_fn();
+        result["spv"] = spv;
+    }
+
+    return result;
+}
+
+bool MiningInterface::is_node_ready()
+{
+    // Coin targets that drive their own work pipeline (c2pool-dash) can
+    // bypass the internal readiness gate — their dashboard is ready as
+    // soon as the HTTP server is up.
+    if (m_dashboard_always_ready.load(std::memory_order_relaxed))
+        return true;
+
+    // Check sharechain has verified shares
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.value("verified_count", 0) <= 0)
+            return false;
+    } else {
+        return false;
+    }
+
+    // Check work template exists (not a placeholder — height > 100)
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (m_cached_template.is_null() ||
+            m_cached_template.value("coinbasevalue", uint64_t(0)) == 0 ||
+            m_cached_template.value("height", 0) <= 100)
+            return false;
+    }
+
+    // Check sharechain window has data (not a stub)
+    if (m_sharechain_window_fn) {
+        // Don't call the fn here (expensive) — just check if it's wired
+        // The window cache will be populated on first real request
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+// ── Log endpoints (read directly from debug.log) ───────────────────────
+
+static std::string tail_file(const std::filesystem::path& path, size_t max_lines)
+{
+    std::ifstream f(path, std::ios::ate);
+    if (!f.is_open()) return {};
+
+    const auto size = f.tellg();
+    if (size <= 0) return {};
+
+    // Scan backwards for newlines
+    std::string result;
+    size_t lines = 0;
+    std::streamoff pos = size;
+    while (pos > 0 && lines <= max_lines) {
+        --pos;
+        f.seekg(pos);
+        char c;
+        f.get(c);
+        if (c == '\n' && pos + 1 < size)
+            ++lines;
+    }
+    if (pos > 0) {
+        // skip the newline we're on
+        f.seekg(pos + 1);
+    } else {
+        f.seekg(0);
+    }
+    result.resize(static_cast<size_t>(size - f.tellg()));
+    f.read(result.data(), static_cast<std::streamsize>(result.size()));
+    return result;
+}
+
+std::string MiningInterface::rest_web_log()
+{
+    auto path = core::filesystem::config_path() / "debug.log";
+    return tail_file(path, 500);
+}
+
+std::string MiningInterface::rest_logs_export(const std::string& scope,
+                                               int64_t /*from_ts*/, int64_t /*to_ts*/,
+                                               const std::string& format)
+{
+    // Read all lines, optionally filter by scope keyword
+    auto path = core::filesystem::config_path() / "debug.log";
+    std::ifstream f(path);
+    if (!f.is_open()) return "# log file not found\n";
+
+    std::string out;
+    std::string line;
+    while (std::getline(f, line)) {
+        // Scope filter: if scope is "node","stratum","security" etc, check if keyword appears
+        if (!scope.empty() && scope != "all") {
+            std::string upper_scope = scope;
+            for (auto& c : upper_scope) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (line.find(upper_scope) == std::string::npos &&
+                line.find(scope) == std::string::npos)
+                continue;
+        }
+        if (format == "csv") {
+            out += "0," + scope + "," + line + '\n';
+        } else if (format == "jsonl") {
+            nlohmann::json j;
+            j["ts"] = 0;
+            j["scope"] = scope;
+            j["line"] = line;
+            out += j.dump() + '\n';
+        } else {
+            out += line + '\n';
+        }
+    }
+    return out;
+}
+
+// address_to_script is in address_utils.hpp (included via web_server.hpp)
+
+// ──────────── Additional p2pool-compatible REST endpoints ────────────────
+
+nlohmann::json MiningInterface::rest_rate()
+{
+    // Use sharechain-based pool hashrate (same source as /global_stats)
+    if (m_pool_hashrate_fn) {
+        double hr = m_pool_hashrate_fn();
+        if (hr > 0) return hr;
+    }
+    // Fallback to node hashrate tracker
+    double rate = 0.0;
+    if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("global_hashrate"))
+            rate = hs["global_hashrate"];
+    }
+    return rate;
+}
+
+nlohmann::json MiningInterface::rest_difficulty()
+{
+    double diff = m_network_difficulty.load(std::memory_order_relaxed);
+    if (diff <= 0.0) {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("difficulty"))
+            diff = m_cached_template["difficulty"].get<double>();
+    }
+    return diff;
+}
+
+nlohmann::json MiningInterface::rest_user_stales()
+{
+    // Map of address → stale proportion
+    return nlohmann::json::object();
+}
+
+std::string MiningInterface::rest_peer_addresses()
+{
+    std::string result;
+    if (m_peer_info_fn) {
+        auto peers = m_peer_info_fn();
+        for (const auto& p : peers) {
+            if (!result.empty()) result += ' ';
+            result += p.value("address", "");
+        }
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_peer_versions()
+{
+    nlohmann::json result = nlohmann::json::object();
+    if (m_peer_info_fn) {
+        auto peers = m_peer_info_fn();
+        for (const auto& p : peers)
+            result[p.value("address", "")] = p.value("version", "unknown");
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_peer_txpool_sizes()
+{
+    nlohmann::json result = nlohmann::json::object();
+    if (m_peer_info_fn) {
+        auto peers = m_peer_info_fn();
+        for (const auto& p : peers)
+            result[p.value("address", "")] = p.value("txpool_size", 0);
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_peer_list()
+{
+    if (m_peer_info_fn)
+        return m_peer_info_fn();
+    return nlohmann::json::array();
+}
+
+nlohmann::json MiningInterface::rest_pings()
+{
+    nlohmann::json result = nlohmann::json::object();
+    if (m_peer_info_fn) {
+        auto peers = m_peer_info_fn();
+        for (const auto& p : peers)
+            result[p.value("address", "")] = p.value("ping_ms", 0.0);
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_stale_rates()
+{
+    nlohmann::json result = nlohmann::json::object();
+    result["good"] = 0.0;
+    result["orphan"] = 0.0;
+    result["dead"] = 0.0;
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        uint64_t total = sc.value("total_shares", uint64_t(0));
+        if (total > 0) {
+            // If stale counts available, compute proportions
+            uint64_t orphan = sc.value("orphan_shares", uint64_t(0));
+            uint64_t dead = sc.value("dead_shares", uint64_t(0));
+            uint64_t good = total - orphan - dead;
+            result["good"] = static_cast<double>(good) / static_cast<double>(total);
+            result["orphan"] = static_cast<double>(orphan) / static_cast<double>(total);
+            result["dead"] = static_cast<double>(dead) / static_cast<double>(total);
+        }
+    }
+    return result;
+}
+
+void MiningInterface::auto_detect_external_info()
+{
+    // Auto-detect public IP if not configured
+    if (m_external_ip.empty() || m_external_ip == "0.0.0.0") {
+        std::thread([this]() {
+            try {
+                boost::asio::io_context tmp_ioc;
+                boost::asio::ip::tcp::resolver resolver(tmp_ioc);
+
+                // Try ifconfig.me (returns plain text IP)
+                auto endpoints = resolver.resolve("ifconfig.me", "80");
+                boost::asio::ip::tcp::socket sock(tmp_ioc);
+                boost::asio::connect(sock, endpoints);
+
+                std::string req =
+                    "GET /ip HTTP/1.0\r\n"
+                    "Host: ifconfig.me\r\n"
+                    "User-Agent: curl/8.0\r\n"
+                    "Accept: text/plain\r\n"
+                    "Connection: close\r\n\r\n";
+                boost::asio::write(sock, boost::asio::buffer(req));
+
+                std::string response;
+                boost::system::error_code ec;
+                char buf[1024];
+                while (true) {
+                    size_t n = sock.read_some(boost::asio::buffer(buf), ec);
+                    if (n > 0) response.append(buf, n);
+                    if (ec) break;
+                }
+
+                auto body_pos = response.find("\r\n\r\n");
+                if (body_pos != std::string::npos) {
+                    std::string ip = response.substr(body_pos + 4);
+                    // Trim whitespace
+                    while (!ip.empty() && (ip.back() == '\n' || ip.back() == '\r'
+                           || ip.back() == ' '))
+                        ip.pop_back();
+                    if (!ip.empty() && ip.find('.') != std::string::npos) {
+                        m_external_ip = ip;
+                        LOG_INFO << "[AUTO] Public IP detected: " << ip;
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[AUTO] Public IP detection failed: " << e.what();
+            }
+        }).detach();
+    }
+
+    // Version is set at build time via C2POOL_VERSION from git describe.
+    // No runtime GitHub fetch needed (requires HTTPS which we can't do
+    // with raw TCP sockets).
+}
+
+// D0.2/D0.3 -- truthful per-node topology. Each node in the 6-coin fleet
+// (LTC/DOGE/BTC/DGB/DASH/BCH) runs a different coin set + embedded daemons;
+// the dashboard must reflect THAT node's REAL shape, auto-detected from live
+// state -- never a hardcoded LTC+DOGE shape. Web/diagnostic layer only.
+// Embedded ORACLE-SHADOW validator stats (/embedded_oracle). Returns the
+// per-block dashd cross-check coverage ledger + objective GRADUATION verdict
+// (the safe-to-disable-dashd gate) when the wiring layer feeds the hook;
+// otherwise a {mode:disabled} shape. OBSERVE-only reporting.
+nlohmann::json MiningInterface::rest_embedded_oracle()
+{
+    if (m_embedded_oracle_fn) {
+        auto j = m_embedded_oracle_fn();
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"mode", "disabled"},
+        {"note", "embedded-oracle-shadow not wired on this node"}};
+}
+
+nlohmann::json MiningInterface::rest_node_topology()
+{
+    // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer
+    // feeds one (richer -- per-coin synced flag + hashrate). Falls back to the
+    // D0.2 auto-detect below when unset, so the endpoint is always truthful.
+    if (m_node_topology_fn) {
+        auto t = m_node_topology_fn();
+        if (!t.is_null()) {
+            // Normalize a flat single-coin emit ({"coin": ...} with no coins
+            // array -- the BTC/BCH lane shape) into the {coins:[...]} wrapper
+            // the dashboard's renderNodeTopology() requires; a flat emit was
+            // previously invisible to the card. Display-shape only.
+            if (!t.contains("coins") && t.contains("coin")) {
+                nlohmann::json wrapped = nlohmann::json::object();
+                wrapped["node_symbol"]   = t.value("coin", std::string{});
+                wrapped["auto_detected"] = false;
+                if (!t.contains("primary")) t["primary"] = true;
+                wrapped["coins"] = nlohmann::json::array({std::move(t)});
+                t = std::move(wrapped);
+            }
+            // Enrich the primary coin row with the embedded header-sync
+            // provider fields (header_height/target_height/sync_percent/
+            // synced) when the lane's topology emit does not already carry
+            // them -- the same coin-generic source /broadcaster_status uses.
+            // Additive: rows that already publish header_height (DASH) are
+            // untouched, and with no provider nothing is fabricated.
+            if (m_coin_sync_status_fn && t.contains("coins") && t["coins"].is_array()) {
+                nlohmann::json sync = nlohmann::json::object();
+                augment_with_coin_sync_status(sync);
+                if (sync.value("target_height", 0ull) > 0) {
+                    for (auto& c : t["coins"]) {
+                        if (!c.is_object() || c.contains("header_height")) continue;
+                        // The provider describes the node's PRIMARY coin chain.
+                        if (!c.value("primary", false) && t["coins"].size() > 1) continue;
+                        c["header_height"] = sync["header_height"];
+                        c["target_height"] = sync["target_height"];
+                        c["sync_percent"]  = sync["sync_percent"];
+                        if (!c.contains("synced")) c["synced"] = sync["synced"];
+                    }
+                }
+            }
+            return t;
+        }
+    }
+
+    auto upper = [](std::string str) {
+        for (auto& ch : str)
+            if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+        return str;
+    };
+
+    // This node's own chain. node_symbol() falls back to the config-driven
+    // coin label for chains with no Blockchain enum entry (BCH / NMC-aux),
+    // so a node never advertises a blank primary symbol.
+    std::string primary = node_symbol();
+
+    // Primary coin's REAL current block height from the embedded daemon's cached
+    // template -- the same source rest_local_stats uses. Lets the auto-detect
+    // fallback emit "height" (tip) so the topology card shows the primary tip even
+    // when no per-coin StatsProvider hook is wired. A truthful embedded-daemon
+    // "synced" flag is intentionally NOT emitted in this fallback: the only
+    // authoritative source is the per-coin StatsProvider hook (m_node_topology_fn),
+    // which reads the embedded daemon's own getblockchaininfo. The
+    // explorer_chaininfo_fn reports c2pool SHARECHAIN height -- a different thing --
+    // so deriving synced from it would lie. Omit rather than guess.
+    uint64_t primary_height = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("height"))
+            primary_height = m_cached_template["height"].get<uint64_t>();
+    }
+    // Coin targets (c2pool-dash) leave m_cached_template empty; use the live
+    // template summary's height instead.
+    if (primary_height == 0 && m_coin_work_fn) {
+        auto cw = m_coin_work_fn();
+        if (cw.valid) primary_height = cw.height;
+    }
+
+    nlohmann::json coins = nlohmann::json::array();
+    auto has_coin = [&](const std::string& sym) {
+        for (const auto& c : coins)
+            if (c.value("coin", std::string{}) == sym) return true;
+        return false;
+    };
+    auto add_coin = [&](const std::string& sym, bool is_primary, int peers) {
+        if (sym.empty() || has_coin(sym)) return;
+        nlohmann::json entry = nlohmann::json::object();
+        entry["coin"]    = sym;
+        entry["primary"] = is_primary;
+        entry["peers"]   = peers;
+        if (is_primary) {
+            // Real embedded/RPC flags for this node's own daemon. Coin targets
+            // with an external NodeRPC arm (c2pool-dash) set m_coin_rpc_available.
+            entry["embedded"] = (m_coin_node && m_coin_node->is_embedded());
+            entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
+                                || m_coin_rpc_available.load(std::memory_order_relaxed);
+            // Truthful tip from the embedded daemon's cached template (front-end
+            // renders it only when > 0, so omit a meaningless 0).
+            if (primary_height > 0)
+                entry["height"] = primary_height;
+        }
+        coins.push_back(std::move(entry));
+    };
+
+    // Auto-detect the embedded/aux coin set from the live coin-peer map keys
+    // (e.g. an LTC node also runs embedded DOGE) -- the node's REAL shape, not
+    // a baked-in assumption.
+    nlohmann::json peer_map = m_coin_peers_fn ? m_coin_peers_fn()
+                                              : nlohmann::json::object();
+    if (peer_map.is_object()) {
+        for (auto it = peer_map.begin(); it != peer_map.end(); ++it) {
+            std::string sym = upper(it.key());
+            int peers = it.value().is_array()
+                          ? static_cast<int>(it.value().size()) : 0;
+            add_coin(sym, sym == primary, peers);
+        }
+    }
+    // Guarantee the primary chain is always present even if absent from the map.
+    add_coin(primary, true, 0);
+
+    nlohmann::json result = nlohmann::json::object();
+    result["node_symbol"]   = primary;
+    result["auto_detected"] = true;
+    result["coins"]         = coins;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_node_info()
+{
+    nlohmann::json result = nlohmann::json::object();
+    result["version"] = m_pool_version;
+    result["external_ip"] = m_external_ip.empty() ? "0.0.0.0" : m_external_ip;
+    result["worker_port"] = m_worker_port;
+    result["p2p_port"] = m_p2p_port;
+
+    switch (m_blockchain) {
+    case Blockchain::LITECOIN:
+        result["network"] = m_testnet ? "litecoin_testnet" : "litecoin";
+        result["symbol"] = "LTC";
+        break;
+    case Blockchain::BITCOIN:
+        result["network"] = m_testnet ? "bitcoin_testnet" : "bitcoin";
+        result["symbol"] = "BTC";
+        break;
+    case Blockchain::DOGECOIN:
+        result["network"] = m_testnet ? "dogecoin_testnet" : "dogecoin";
+        result["symbol"] = "DOGE";
+        break;
+    case Blockchain::DASH:
+        result["network"] = m_testnet ? "dash_testnet" : "dash";
+        result["symbol"] = "DASH";
+        break;
+    case Blockchain::DIGIBYTE:
+        result["network"] = m_testnet ? "digibyte_testnet" : "digibyte";
+        result["symbol"] = "DGB";
+        break;
+    default: break;
+    }
+    // Config-driven fallback for chains absent from the Blockchain enum
+    // (BCH / NMC-aux): label from the configured coin string rather than
+    // leaving symbol/network blank.
+    if (!result.contains("symbol")) {
+        std::string sym = node_symbol();
+        if (!sym.empty()) result["symbol"] = sym;
+    }
+    if (!result.contains("network")) {
+        std::string ck = primary_chain_key();
+        if (!ck.empty()) result["network"] = m_testnet ? (ck + "_testnet") : ck;
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_luck_stats()
+{
+    nlohmann::json result = nlohmann::json::object();
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    result["luck_available"] = !m_found_blocks.empty();
+
+    nlohmann::json blocks = nlohmann::json::array();
+    for (const auto& b : m_found_blocks) {
+        // luck==0 is "never computed" (relay-learned row, or recorded with
+        // no network difficulty), not "0% lucky". The chart previously drew
+        // those as 0-value points, which is exactly the wrong-luck-trend the
+        // hotel dashboards showed on 2026-08-05: emit null so the trend
+        // SKIPS them instead of plotting a fabricated catastrophe.
+        blocks.push_back({{"ts", b.ts}, {"hash", b.hash},
+                          {"luck", b.luck > 0.0 ? nlohmann::json(b.luck)
+                                                : nlohmann::json(nullptr)}});
+    }
+    result["blocks"] = blocks;
+
+    // Current round luck: expected_time / time_since_last_block * 100
+    // Matches p2pool: shows how the ongoing round compares to expectation
+    nlohmann::json current_luck_val = nullptr;
+    if (!m_found_blocks.empty()) {
+        auto now_ts = static_cast<double>(std::time(nullptr));
+        double time_since_last = now_ts - static_cast<double>(m_found_blocks.front().ts);
+
+        // Get LIVE pool hashrate and network difficulty
+        double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0;
+        double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+
+        double expected = 0;
+        if (net_diff > 0 && pool_hr > 0)
+            expected = net_diff * 4294967296.0 / pool_hr;
+
+        if (expected > 0 && time_since_last > 1)
+            current_luck_val = (expected / time_since_last) * 100.0;
+    }
+    result["current_luck_trend"] = current_luck_val;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_ban_stats()
+{
+    nlohmann::json result = nlohmann::json::object();
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    result["total_banned"] = static_cast<uint64_t>(m_banned_targets.size());
+    nlohmann::json banned = nlohmann::json::array();
+    for (const auto& t : m_banned_targets)
+        banned.push_back(t);
+    result["banned_targets"] = banned;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_stratum_security()
+{
+    // Honesty over a fake all-clear. There is no stratum DDoS/rate-limit/ban
+    // instrumentation reachable from the web layer on this build, and the
+    // operator-facing stratum.html security panel expects a rich schema
+    // (rate_10s / rate_60s / burst_ratio / banned_*_count / threat_level /
+    // limits) that this endpoint never produced. The old body returned fixed
+    // zeros under DIFFERENT keys (connections_per_second / potential_ddos /
+    // blacklisted_ips), so the panel silently painted "0.0 / normal / 0 banned
+    // / Normal" forever -- a security widget that can never go red. That is the
+    // founding-charter lie class. Until real stratum security metrics are wired,
+    // signal not-instrumented so the page guard (`secData.error`) trips and the
+    // panel shows "-" (no data) rather than a fabricated green all-clear.
+    nlohmann::json result = nlohmann::json::object();
+    result["available"] = false;
+    result["error"] = "not_instrumented";
+    result["note"] = "stratum security metrics are not instrumented in this build";
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
+{
+    nlohmann::json result = nlohmann::json::object();
+    result["address"] = address;
+
+    // Aggregate from stratum workers matching this address
+    double total_hr = 0, dead_hr = 0, diff = 0;
+    uint64_t accepted = 0, rejected = 0, stale = 0;
+    bool found = false;
+    {
+        auto workers = effective_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            // Match base address (strip worker suffix)
+            std::string base = w.username;
+            auto dot = base.find('.');
+            if (dot != std::string::npos) base = base.substr(0, dot);
+            if (base == address) {
+                total_hr += w.hashrate;
+                dead_hr += w.dead_hashrate;
+                diff = w.difficulty;  // last seen difficulty
+                accepted += w.accepted;
+                rejected += w.rejected;
+                stale += w.stale;
+                found = true;
+            }
+        }
+    }
+
+    result["active"] = found;
+    result["hashrate"] = total_hr;
+    result["estimated_hashrate"] = false;
+    result["dead_hashrate"] = dead_hr;
+    result["doa_rate"] = (accepted + stale > 0) ? static_cast<double>(stale) / (accepted + stale) : 0.0;
+    result["share_difficulty"] = diff;
+    result["time_to_share"] = (total_hr > 0 && diff > 0) ? (diff * 4294967296.0 / total_hr) : 0.0;
+    result["current_payout"] = 0.0;
+    result["merged_payouts"] = nlohmann::json::array();
+
+    // Global stale proportion
+    double global_stale_prop = 0.0;
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        uint64_t total_shares = sc.value("total_shares", uint64_t(0));
+        uint64_t orphan_shares = sc.value("orphan_shares", uint64_t(0));
+        uint64_t dead_shares = sc.value("dead_shares", uint64_t(0));
+        if (total_shares > 0)
+            global_stale_prop = static_cast<double>(orphan_shares + dead_shares) / total_shares;
+    }
+    result["global_stale_prop"] = global_stale_prop;
+
+    // Best difficulty data
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        result["best_difficulty_all_time"] = m_best_difficulty.all_time;
+        result["best_difficulty_session"] = m_best_difficulty.session;
+        result["best_difficulty_round"] = m_best_difficulty.round;
+    }
+
+    result["hashrate_periods"] = {
+        {"1m", {{"hashrate", total_hr}, {"dead_hashrate", dead_hr}}},
+        {"10m", {{"hashrate", total_hr}, {"dead_hashrate", dead_hr}}},
+        {"1h", {{"hashrate", total_hr}, {"dead_hashrate", dead_hr}}}
+    };
+
+    // Try to get current payout from PPLNS
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm && pm->has_pplns_data()) {
+        uint64_t subsidy = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (!m_cached_template.is_null())
+                subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+        }
+        if (subsidy > 0) {
+            auto outputs = pm->calculate_pplns_outputs(subsidy);
+            auto script = address_to_script(address);
+            if (!script.empty()) {
+                for (const auto& [scr, amt] : outputs) {
+                    if (scr == script) {
+                        result["current_payout"] = static_cast<double>(amt) / 1e8;
+                        result["active"] = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Network difficulty
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    result["network_difficulty"] = net_diff;
+    result["chance_to_find_block"] = (net_diff > 0 && total_hr > 0)
+        ? (total_hr / (net_diff * 4294967296.0) * 100.0) : 0.0;
+    // Per-worker share-outcome breakdown. The stratum layer tracks three
+    // counters (accepted / rejected / stale); map them onto the wire fields
+    // using this codebase's own stale_info enum (253=orphan, 254=doa):
+    //   - stale    = job template expired at submit -> ORPHAN (stale_info 253)
+    //   - rejected = low-diff / invalid submission  -> never counted as a share
+    // There is no per-worker daemon-DOA *share* counter; DOA is surfaced as
+    // dead_hashrate instead, so doa_shares is honestly 0 here rather than a
+    // copy of the stale counter (the prior code reported doa=stale, orphan=0).
+    result["total_shares"] = accepted + stale;
+    result["unstale_shares"] = accepted;
+    result["dead_shares"] = stale;            // dead = orphan + doa; only orphans counted per-worker
+    result["orphan_shares"] = stale;          // stale-template shares are orphans
+    result["doa_shares"] = 0;                 // no per-worker DOA share counter (see dead_hashrate)
+    result["rejected_shares"] = rejected;     // invalid/low-diff submissions, never counted as shares
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_best_share()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    result["network_difficulty"] = net_diff;
+
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        auto now_ts = static_cast<uint64_t>(std::time(nullptr));
+
+        // Honest-absent: until a real record share is seen, best-share
+        // difficulty reads 0. We deliberately do NOT substitute the sharechain
+        // AVERAGE here (#945) -- an average is not a record, yet the card labels
+        // this a "Best Share" / "record", so the average masqueraded as the
+        // all-time/round best. The window average legitimately surfaces on its
+        // own below as median_pct; has_best_share lets the card render
+        // honest-absent instead of a fake average-as-record value.
+        double best_all = m_best_difficulty.all_time;
+        double best_sess = m_best_difficulty.session;
+        double best_round = m_best_difficulty.round;
+
+        auto make_entry = [&](double diff, const std::string& miner, uint64_t ts,
+                              const std::string& hash) {
+            nlohmann::json e;
+            e["difficulty"] = diff;
+            e["pct_of_block"] = (net_diff > 0) ? (diff / net_diff * 100.0) : 0.0;
+            e["miner"] = miner;
+            e["timestamp"] = ts;
+            e["hash"] = hash;   // pow-hash of the record share (empty until wired)
+            return e;
+        };
+
+        result["all_time"] = make_entry(best_all,
+            m_best_difficulty.all_time_miner, m_best_difficulty.all_time_ts,
+            m_best_difficulty.all_time_hash);
+        auto session = make_entry(best_sess,
+            m_best_difficulty.session_miner, m_best_difficulty.session_ts,
+            m_best_difficulty.session_hash);
+        session["started"] = m_start_time.time_since_epoch().count() / 1000000000ULL;
+        result["session"] = session;
+        auto round = make_entry(best_round,
+            m_best_difficulty.miner, m_best_difficulty.timestamp,
+            m_best_difficulty.hash);
+        round["started"] = m_best_difficulty.round_start;
+        result["round"] = round;
+
+        // A real record was recorded iff the all-time best difficulty is > 0.
+        // The card gates on this so it never presents a 0 (or, pre-#945, a
+        // sharechain average) as a "best share" record.
+        result["has_best_share"] = (best_all > 0.0);
+    }
+
+    // ── Merged (aux) chain best share stats - symbol from the real aux chain, never hardcoded ──
+    double merged_net_diff = 0.0;
+    std::string merged_symbol;  // empty until sourced from the live aux chain
+    if (m_mm_manager && m_mm_manager->has_chains()) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        if (!chain_infos.empty()) {
+            merged_net_diff = chain_infos.front().difficulty;
+            if (!chain_infos.front().symbol.empty())
+                merged_symbol = chain_infos.front().symbol;
+        }
+    }
+
+    if (merged_net_diff > 0 || m_best_difficulty.merged_all_time > 0) {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        auto pct = [](double d, double nd) { return nd > 0 ? d / nd * 100.0 : 0.0; };
+        result["merged"] = {
+            {"network_difficulty", merged_net_diff},
+            {"symbol", merged_symbol},
+            {"all_time", {
+                {"difficulty", m_best_difficulty.merged_all_time},
+                {"pct_of_block", pct(m_best_difficulty.merged_all_time, merged_net_diff)},
+                {"miner", m_best_difficulty.merged_all_time_miner},
+                {"timestamp", m_best_difficulty.merged_all_time_ts}
+            }},
+            {"round", {
+                {"difficulty", m_best_difficulty.merged_round},
+                {"pct_of_block", pct(m_best_difficulty.merged_round, merged_net_diff)},
+                {"miner", m_best_difficulty.merged_round_miner},
+                {"timestamp", m_best_difficulty.merged_round_ts},
+                {"started", m_best_difficulty.merged_round_start}
+            }}
+        };
+        // Merged median (same share difficulties, different network target)
+        if (m_sharechain_stats_fn) {
+            auto sc = m_sharechain_stats_fn();
+            double avg = sc.value("average_difficulty", 0.0);
+            if (avg > 0 && merged_net_diff > 0)
+                result["median_merged_pct"] = avg / merged_net_diff * 100.0;
+        }
+    }
+
+    // ── Median share % (approximate from average difficulty in skiplist) ──
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        double avg = sc.value("average_difficulty", 0.0);
+        if (avg > 0 && net_diff > 0)
+            result["median_pct"] = avg / net_diff * 100.0;
+        else
+            result["median_pct"] = 0.0;
+    } else {
+        result["median_pct"] = 0.0;
+    }
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
+{
+    nlohmann::json result = nlohmann::json::object();
+    result["address"] = address;
+    result["current_payout"] = 0.0;
+    result["blocks_found"] = 0;
+    result["total_estimated_rewards"] = 0.0;
+    result["confirmed_rewards"] = 0.0;
+    result["maturing_rewards"] = 0.0;
+    result["blocks"] = nlohmann::json::array();
+
+    // Get current payout from PPLNS
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm && pm->has_pplns_data()) {
+        uint64_t subsidy = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (!m_cached_template.is_null())
+                subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+        }
+        if (subsidy > 0) {
+            auto outputs = pm->calculate_pplns_outputs(subsidy);
+            auto script = address_to_script(address);
+            if (!script.empty()) {
+                for (const auto& [scr, amt] : outputs) {
+                    if (scr == script) {
+                        result["current_payout"] = static_cast<double>(amt) / 1e8;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Populate from found blocks history
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
+        nlohmann::json blocks_arr = nlohmann::json::array();
+        int blocks_found = 0;
+        double confirmed_rewards = 0, maturing_rewards = 0;
+        // Block explorer URL prefix — use custom if set, else Blockchair
+        std::string explorer_prefix;
+        if (!m_custom_block_explorer.empty()) {
+            explorer_prefix = m_custom_block_explorer;
+        } else {
+            bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+            explorer_prefix = is_ltc
+                ? (m_testnet ? "https://blockchair.com/litecoin/testnet/block/" : "https://blockchair.com/litecoin/block/")
+                : "https://blockchair.com/bitcoin/block/";
+        }
+
+        for (const auto& b : m_found_blocks) {
+            if (b.miner == address || address.empty()) {
+                ++blocks_found;
+                double payout_estimate = b.subsidy > 0 ? static_cast<double>(b.subsidy) / 1e8 : 0;
+                if (b.status == BlockStatus::confirmed)
+                    confirmed_rewards += payout_estimate;
+                else if (b.status == BlockStatus::pending)
+                    maturing_rewards += payout_estimate;
+
+                if (blocks_arr.size() < 20) {
+                    blocks_arr.push_back({
+                        {"timestamp", b.ts},
+                        {"block_height", b.height},
+                        {"block_hash", b.hash},
+                        {"block_reward", payout_estimate},
+                        {"explorer_url", explorer_prefix + b.hash},
+                        {"status", status_str[static_cast<int>(b.status)]},
+                        {"estimated_payout", payout_estimate},
+                        {"confirmations", b.confirmations},
+                        {"confirmations_required", 100}
+                    });
+                }
+            }
+        }
+        result["blocks_found"] = blocks_found;
+        result["total_estimated_rewards"] = confirmed_rewards + maturing_rewards;
+        result["confirmed_rewards"] = confirmed_rewards;
+        result["maturing_rewards"] = maturing_rewards;
+        result["blocks"] = blocks_arr;
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cached_sc)
+{
+    // V35→V36 transition tracking applies to every v36-ratcheting coin
+    // (LTC/DOGE/BTC/DGB, plus BCH which reaches this path as its embedded base
+    // coin). DASH runs its OWN v16→v36 crossing (auto_ratchet.hpp lifts the accept
+    // floor 1700→3600 on ≥95% work-weighted v36 desire): its sharechain-stats fn
+    // (main_dash.cpp) emits the same shares_by_desired_version / sampling weight /
+    // propagation fields, so DASH flows through the identical gauge computation
+    // below — the crossing banner stays hidden until there is real vote data
+    // (overall_total<10 or no shares_by_* → empty result). A prior hardcoded early
+    // return suppressed the DASH crossing banner outright — a charter #3 blind
+    // spot now that DASH ratchets. Coins whose stats carry no vote data simply
+    // fall through to an empty result, so the banner stays hidden.
+
+    // Matches p2pool's get_version_signaling() — all fields the dashboard JS expects.
+    constexpr int TARGET_VERSION = 36;
+    // Dust floor for "is a HIGHER version genuinely being signalled?" (display
+    // only — see the transition-detection block below). A desired version only
+    // counts as a real upgrade signal once it holds at least this share of the
+    // vote. The tally denominators are the full-chain window (8640 shares for
+    // the LTC family, 4320 for DASH), so 1% is ~86 / ~43 shares — far above a
+    // stray or replayed single share, and orders of magnitude below any real
+    // rollout (LTC's live v35→v36 cross sits at 59.8% flat / 19.2% work-weighted).
+    constexpr double DESIRED_SIGNAL_FLOOR_PCT = 1.0;
+    // ETA cadence for the propagation countdown (display only): DASH mints one
+    // share every 20s, the LTC-family every 10s.
+    const int share_period_sec = (m_blockchain == Blockchain::DASH) ? 20 : 10;
+    const std::map<int, std::string> share_type_names = {
+        {16, "DashShare"},
+        {17, "Share"}, {32, "PreSegwitShare"}, {33, "NewShare"},
+        {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"}, {36, "MergedMiningShare"}
+    };
+
+    nlohmann::json result = nlohmann::json::object();
+
+    // ── Featured developer-node banner (signed subtype 0x06, freshest-wins) ──
+    // Emitted BEFORE the version-signaling early returns so the banner is shown
+    // independent of any transition state (a fresh/empty chain returns {} for
+    // the signaling fields, but a verified banner must still render). Fold in
+    // the operator message blob so a runtime /msg/load_blob (the DASH delivery
+    // seam until share-embedding Phase B lands) updates the banner without a
+    // restart. featured_node_json() applies expiry/retract and returns null
+    // when there is nothing to show → the field is OMITTED, so an old dashboard
+    // sees no key and a new dashboard hides the div (version-coupling safe).
+    {
+        auto op_blob = get_operator_message_blob();
+        if (!op_blob.empty()) scan_blob_for_featured_node(op_blob);
+        auto fn = featured_node_json();
+        if (!fn.is_null()) result["featured_node"] = fn;
+    }
+
+    // Use pre-computed sharechain stats if provided
+    nlohmann::json sc;
+    if (cached_sc && !cached_sc->is_null())
+        sc = *cached_sc;
+    else if (m_sharechain_stats_fn)
+        sc = m_sharechain_stats_fn();
+
+    if (sc.is_null()) return result;
+
+    int chain_height = sc.value("chain_height", 0);
+    int chain_length = sc.value("chain_length", 8640);
+    int overall_total = sc.value("total_shares", 0);
+
+    if (overall_total < 10) return result;
+
+    // ── Share type counts (format VERSION) ──
+    int overall_v36_shares = 0;
+    int current_share_type = 0;
+    // Lowest share FORMAT still present in the window — the shares that would
+    // have to move for an upgrade to complete. current_share_type is the MAX
+    // format seen, so during a mixed window it already reads the new version;
+    // the gate below needs the laggard side of the same window.
+    int lowest_share_type = 0;
+    nlohmann::json share_types_json = nlohmann::json::object();
+    if (sc.contains("shares_by_version") && sc["shares_by_version"].is_object()) {
+        auto& sv = sc["shares_by_version"];
+        for (auto& [ver, count] : sv.items()) {
+            int v = std::stoi(ver);
+            int c = count.get<int>();
+            auto it = share_type_names.find(v);
+            std::string name = (it != share_type_names.end()) ? it->second : "V" + ver;
+            double pct = overall_total > 0 ? (c * 100.0 / overall_total) : 0;
+            share_types_json[ver] = {{"name", name}, {"count", c}, {"percentage", pct}};
+            if (v >= TARGET_VERSION) overall_v36_shares += c;
+            if (v > current_share_type) current_share_type = v;
+            if (c > 0 && (lowest_share_type == 0 || v < lowest_share_type)) lowest_share_type = v;
+        }
+    }
+
+    // Highest desired version that clears DESIRED_SIGNAL_FLOOR_PCT on either the
+    // flat full-chain vote tally or the work-weighted sampling window. Both are
+    // consulted (whichever is higher wins) because a fresh signal shows up in the
+    // full-chain tally long before it ages into the sampling window — that is
+    // exactly the "propagating" phase the banner exists to announce.
+    int dominant_desired = 0;
+
+    // ── Desired version counts (voting — full chain) ──
+    int overall_v36_votes = 0;
+    nlohmann::json full_chain_versions = nlohmann::json::object();
+    nlohmann::json versions_json = nlohmann::json::object();  // populated below from sampling window
+    if (sc.contains("shares_by_desired_version") && sc["shares_by_desired_version"].is_object()) {
+        auto& dv = sc["shares_by_desired_version"];
+        for (auto& [ver, count] : dv.items()) {
+            int v = std::stoi(ver);
+            int c = count.get<int>();
+            double pct = overall_total > 0 ? (c * 100.0 / overall_total) : 0;
+            full_chain_versions[ver] = {{"count", c}, {"percentage", pct}};
+            if (v >= TARGET_VERSION) overall_v36_votes += c;
+            if (pct >= DESIRED_SIGNAL_FLOOR_PCT && v > dominant_desired) dominant_desired = v;
+        }
+    }
+
+    double overall_v36_vote_pct = overall_total > 0 ? (overall_v36_votes * 100.0 / overall_total) : 0;
+    double overall_v36_share_pct = overall_total > 0 ? (overall_v36_shares * 100.0 / overall_total) : 0;
+
+    // ── Chain maturity ──
+    double chain_maturity = chain_length > 0 ? std::min(chain_height / static_cast<double>(chain_length), 1.0) * 100.0 : 0;
+    bool chain_ready = chain_height >= chain_length;
+
+    // ── Current share name ──
+    auto cit = share_type_names.find(current_share_type);
+    std::string current_share_name = (cit != share_type_names.end()) ? cit->second : "V" + std::to_string(current_share_type);
+
+    // ── Target version: successor if V35 has one (V36), else dominant vote ──
+    int target_version = TARGET_VERSION;  // V35's successor is V36
+    auto tit = share_type_names.find(target_version);
+    std::string target_version_name = (tit != share_type_names.end()) ? tit->second : "V" + std::to_string(target_version);
+
+    // ── Sampling window signaling (CHAIN_LENGTH/10 shares from tip, work-weighted like p2pool) ──
+    int sampling_window_size = chain_length / 10;
+    double sampling_v36_weight = 0;
+    double sampling_total_weight = 0;
+    if (sc.contains("sampling_desired_version") && sc["sampling_desired_version"].is_object()) {
+        versions_json = nlohmann::json::object();
+        for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
+            int v = std::stoi(ver);
+            double w = weight.get<double>();
+            sampling_total_weight += w;
+            if (v >= TARGET_VERSION) sampling_v36_weight += w;
+        }
+        // Build versions_json with percentages from work weights
+        for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
+            int v = std::stoi(ver);
+            double w = weight.get<double>();
+            double pct = sampling_total_weight > 0 ? (w * 100.0 / sampling_total_weight) : 0;
+            versions_json[ver] = {{"weight", w}, {"percentage", pct}};
+            if (pct >= DESIRED_SIGNAL_FLOOR_PCT && v > dominant_desired) dominant_desired = v;
+        }
+    }
+    double sampling_signaling = sampling_total_weight > 0
+        ? (sampling_v36_weight * 100.0 / sampling_total_weight) : 0;
+    // [V36-GATE] Authoritative work-weighted signaling time series: emit the
+    // ratchet gate figure on every evaluation. This is the only site where
+    // sampling_signaling is computed; it previously reached only the HTTP JSON
+    // (result["sampling_signaling"]) and was otherwise dropped, so no time
+    // series existed anywhere. Log-only: does NOT touch the >=95/>=60 predicate
+    // below or the sampling-window definition above.
+    LOG_INFO << "[V36-GATE] sampling_signaling=" << sampling_signaling
+             << "% sampling_v36_weight=" << sampling_v36_weight
+             << " sampling_total_weight=" << sampling_total_weight
+             << " window=" << sampling_window_size;
+
+    // ── Transition detection ─────────────────────────────────────────────────
+    // The crossing banner, the signed authority notice and the progress bar are
+    // PENDING-UPGRADE UI. They may only light while an upgrade is genuinely
+    // pending, i.e. when there IS a current share version AND a *different,
+    // HIGHER* desired version is actually being signalled for it. That is the
+    // pool-level aggregate of the per-share rule the dashboard already applies
+    // to its "Signals V36" tag (share.dv >= 36 && share.V < 36): desired
+    // STRICTLY HIGHER than what is being produced.
+    //
+    // Previously this was:
+    //     successor_transition = (current_share_type < TARGET_VERSION);
+    //     classic_transition   = false;                 // never computed
+    //     is_transitioning     = classic || successor;
+    //     show_transition      = (is_transitioning || !confirmed) && !confirmed && !all_target;
+    // The "dominant vote differs from current" term was hardcoded false, so the
+    // whole gate reduced to "show whenever the chain is not 100% target-FORMAT".
+    // On a coin whose share format never becomes 36 — DASH stays wire-format v16
+    // across its entire v16→v36 accept-floor crossing — that is permanently true,
+    // so the banner, authority message and progress bar would have hung on
+    // forever while the pool signalled 100% desired-v16 and nobody signalled 36.
+    bool has_current_share_version = (current_share_type > 0);
+    bool higher_desired_signalled =
+        (lowest_share_type > 0 && dominant_desired > lowest_share_type);
+    bool classic_transition = has_current_share_version && higher_desired_signalled;
+    bool is_transitioning = classic_transition;
+
+    // ── show_transition: golden border ──
+    bool all_target = (overall_total > 0 && overall_v36_shares == overall_total);
+    bool confirmed = all_target && chain_height >= chain_length * 3;
+    // Completion signal for coins whose share FORMAT never reaches the target, so
+    // the format-count all_target above can never fire for them: those coins hand
+    // the ratchet-derived version through the stats fn as "live_share_version"
+    // (DASH — see main_dash.cpp). Only an explicitly reported value counts; the
+    // m_cached_share_version fallback used by the auto_ratchet block below
+    // defaults to 36 and would wrongly read as "already latched" on a coin that
+    // never sets it.
+    bool latched = sc.contains("live_share_version") && sc["live_share_version"].is_number()
+                   && sc["live_share_version"].get<int64_t>() >= TARGET_VERSION;
+    bool show_transition = is_transitioning && !confirmed && !all_target && !latched;
+
+    // ── Propagation depth (needed for status logic) ──
+    int deepest_v36_pos = sc.value("deepest_v36_position", 0);
+
+    // ── Status and message (matching p2pool phases) ──
+    std::string status, message;
+    double transition_progress = 0;
+
+    if (!is_transitioning && all_target) {
+        status = "no_transition";
+        message = "No version transition in progress";
+        transition_progress = 100;
+    } else if (!chain_ready) {
+        status = "building_chain";
+        int remaining = chain_length - chain_height;
+        message = "Building chain: " + std::to_string(chain_height) + "/" +
+                  std::to_string(chain_length) + " shares (need " +
+                  std::to_string(remaining) + " more before upgrade checks activate)";
+        transition_progress = chain_maturity;
+    } else if (sampling_signaling >= 95) {
+        status = "activating";
+        char buf[128];
+        snprintf(buf, sizeof(buf), "V%d activation threshold reached! %.1f%% in sampling window — switchover imminent",
+                 target_version, sampling_signaling);
+        message = buf;
+        transition_progress = 100;
+    } else if (sampling_signaling >= 60) {
+        status = "signaling_strong";
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Strong V%d signaling — activation approaching (need 95%%)", target_version);
+        message = buf;
+        transition_progress = sampling_signaling;
+    } else if (sampling_signaling > 0) {
+        // Votes present in sampling window but below 60%
+        status = "signaling";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Network is signaling for V%d upgrade", target_version);
+        message = buf;
+        transition_progress = sampling_signaling;
+    } else if (overall_v36_votes > 0 && deepest_v36_pos < chain_length) {
+        // V36 votes exist but haven't reached the sampling window yet
+        status = "propagating";
+        int shares_to = std::max(0, chain_length - deepest_v36_pos);
+        int eta_sec = shares_to * share_period_sec;  // per-coin share cadence
+        int eta_min = eta_sec / 60;
+        int eta_h = eta_min / 60;
+        int eta_m = eta_min % 60;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "V%d votes propagating: %d votes (%.1f%% of chain), deepest at position %d/%d. Reach sampling window in ~%s",
+                 target_version, overall_v36_votes, overall_v36_vote_pct,
+                 deepest_v36_pos, chain_length,
+                 eta_h > 0 ? (std::to_string(eta_h) + "h " + std::to_string(eta_m) + "m").c_str()
+                           : (std::to_string(eta_m) + "m").c_str());
+        message = buf;
+        double prop_pct = chain_length > 0
+            ? std::min(deepest_v36_pos * 100.0 / chain_length, 100.0) : 0;
+        transition_progress = prop_pct;
+    } else if (overall_v36_votes > 0) {
+        // V36 votes reached window position but 0% weighted (edge case)
+        status = "signaling";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "V%d votes appearing in sampling window. %d votes (%.1f%%) in chain overall",
+                 target_version, overall_v36_votes, overall_v36_vote_pct);
+        message = buf;
+        transition_progress = overall_v36_vote_pct;
+    } else {
+        status = "waiting";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Waiting for miners to upgrade. No V%d votes in chain yet (0/%d shares)",
+                 target_version, overall_total);
+        message = buf;
+        transition_progress = 0;
+    }
+
+    // ── Populate result ──
+    result["chain_height"] = chain_height;
+    result["chain_length_required"] = chain_length;
+    result["chain_ready"] = chain_ready;
+    result["chain_maturity"] = std::round(chain_maturity * 100) / 100.0;
+    result["lookbehind"] = std::min(chain_height, chain_length / 10);
+    result["total_weight"] = overall_total;
+    result["sampling_window_size"] = sampling_window_size;
+    result["sampling_signaling"] = std::round(sampling_signaling * 100) / 100.0;
+    result["share_types"] = share_types_json;
+    result["current_share_type"] = current_share_type;
+    result["current_share_name"] = current_share_name;
+    result["target_version"] = target_version;
+    result["target_version_name"] = target_version_name;
+    result["versions"] = versions_json;
+    result["full_chain_versions"] = full_chain_versions;
+    result["overall_v36_votes"] = overall_v36_votes;
+    result["overall_v36_vote_pct"] = std::round(overall_v36_vote_pct * 100) / 100.0;
+    result["overall_v36_shares"] = overall_v36_shares;
+    result["overall_v36_share_pct"] = std::round(overall_v36_share_pct * 100) / 100.0;
+    result["overall_total"] = overall_total;
+    result["show_transition"] = show_transition;
+    result["is_transitioning"] = is_transitioning;
+    // Gate inputs, surfaced so an operator can see WHY the banner is (not) lit
+    // instead of guessing. Display-only, additive.
+    result["dominant_desired_version"] = dominant_desired;
+    result["lowest_share_type"] = lowest_share_type;
+    result["desired_signal_floor_pct"] = DESIRED_SIGNAL_FLOOR_PCT;
+    result["transition_progress"] = std::round(transition_progress * 100) / 100.0;
+    result["thresholds"] = {{"accept", 60}, {"activate", 95}};
+    result["status"] = status;
+    result["message"] = message;
+
+    // ── Propagation tracking (V36 votes aging toward sampling window) ──
+    int v36_contiguous = sc.value("v36_contiguous_from_tip", 0);
+    int propagation_target = chain_length;  // 8640 for LTC
+    double propagation_pct = propagation_target > 0
+        ? std::min(deepest_v36_pos * 100.0 / propagation_target, 100.0) : 0;
+    int shares_to_window = std::max(0, propagation_target - deepest_v36_pos);
+    double time_to_window_seconds = shares_to_window * share_period_sec;  // per-coin cadence
+    result["propagation_pct"] = std::round(propagation_pct * 100) / 100.0;
+    result["propagation_target"] = propagation_target;
+    result["deepest_v36_position"] = deepest_v36_pos;
+    result["v36_contiguous_from_tip"] = v36_contiguous;
+    result["shares_to_window"] = shares_to_window;
+    result["time_to_window_seconds"] = std::round(time_to_window_seconds);
+    result["chain_length"] = chain_length;
+
+    // ── Transition message + authority announcements ──
+    // First try live messages from best share, then fall back to cached blob files.
+    result["transition_message"] = nullptr;
+    result["authority_announcements"] = nlohmann::json::array();
+
+    // Try live messages from best share's message_data
+    if (m_protocol_messages_fn) {
+        try {
+            auto pm = m_protocol_messages_fn();
+            if (pm.value("decrypted", false) && pm.contains("messages") && pm["messages"].is_array()) {
+                auto now = static_cast<uint32_t>(std::time(nullptr));
+                // Signer identity: the authority pubkey whose signature verified the
+                // blob (unpack returns it only on a good ECDSA check). Surfaced so the
+                // dashboard can show "✓ Verified — signed by <pubkey>" on the notice.
+                std::string signer = pm.value("authority_pubkey_hex", "");
+                nlohmann::json announcements = nlohmann::json::array();
+                for (auto& msg : pm["messages"]) {
+                    int msg_type = msg.value("type", 0);
+                    uint32_t ts = msg.value("timestamp", uint32_t(0));
+                    std::string payload_hex = msg.value("payload_hex", "");
+                    bool is_authority = msg.value("protocol_authority", false);
+                    auto payload_bytes = ParseHex(payload_hex);
+                    std::string payload_text(payload_bytes.begin(), payload_bytes.end());
+                    nlohmann::json payload_json;
+                    try { payload_json = nlohmann::json::parse(payload_text); } catch (...) {}
+
+                    if (msg_type == 0x20 && is_authority && result["transition_message"].is_null()) {
+                        nlohmann::json tmsg = {{"timestamp", ts}, {"verified", true}, {"authority", true}, {"signer", signer}};
+                        if (payload_json.is_object()) {
+                            tmsg["msg"] = payload_json.value("msg", "");
+                            tmsg["url"] = payload_json.value("url", "");
+                            tmsg["urgency"] = payload_json.value("urg", "info");
+                            tmsg["from_ver"] = payload_json.value("from", "");
+                            tmsg["to_ver"] = payload_json.value("to", "");
+                        } else { tmsg["msg"] = payload_text; tmsg["urgency"] = "info"; }
+                        result["transition_message"] = tmsg;
+                    } else if (msg_type == 0x06 && is_authority) {
+                        // Featured dev-node banner via share-embedded gossip
+                        // (delivery inherits automatically when DASH Phase B
+                        // share-embedding lands). The best share was already
+                        // ECDSA-validated upstream, so this is authority-proven.
+                        if (payload_json.is_object()) {
+                            uint64_t fseq = payload_json.value("seq", uint64_t(0));
+                            apply_featured_node_message(fseq, ts, payload_text, signer);
+                        }
+                    } else if (msg_type == 0x03 || msg_type == 0x10) {
+                        nlohmann::json ann = {
+                            {"type", (msg_type == 0x10) ? "EMERGENCY" : "POOL_ANNOUNCE"},
+                            {"type_id", msg_type}, {"timestamp", ts},
+                            {"age", (now > ts) ? int(now - ts) : 0},
+                            {"verified", true}, {"authority", is_authority}, {"signer", signer}
+                        };
+                        if (payload_json.is_object()) {
+                            ann["text"] = payload_json.value("msg", payload_json.value("text", ""));
+                            ann["urgency"] = payload_json.value("urg", "info");
+                            ann["url"] = payload_json.value("url", "");
+                        } else { ann["text"] = payload_text; ann["urgency"] = (msg_type == 0x10) ? "alert" : "info"; }
+                        announcements.push_back(ann);
+                    }
+                }
+                if (!announcements.empty())
+                    result["authority_announcements"] = announcements;
+            }
+        } catch (...) {}
+    }
+
+    // Fall back to cached blob files (loaded at startup via load_transition_blobs)
+    if (result["transition_message"].is_null() && !m_cached_transition_message.is_null())
+        result["transition_message"] = m_cached_transition_message;
+    if (result["authority_announcements"].empty() && !m_cached_authority_announcements.empty())
+        result["authority_announcements"] = m_cached_authority_announcements;
+
+    // ── Address format warnings (node-generated, matches p2pool) ──
+    {
+        bool ratchet_confirmed = all_target && confirmed;
+        nlohmann::json warnings = nlohmann::json::array();
+
+        if (!ratchet_confirmed && TARGET_VERSION >= 36) {
+            warnings.push_back({
+                {"id", "v35_addr_limitation"},
+                {"urgency", "recommended"},
+                {"title", "V35 Address Limitation (Current Phase)"},
+                {"text", "During V35 (current share format), shares cannot carry "
+                         "explicit merged mining addresses. Even if you configure "
+                         "LTC,DOGE in stratum, PPLNS will use ONLY auto-converted "
+                         "DOGE addresses derived from your LTC public key hash. "
+                         "Explicit address support activates after V36 transition."}
+            });
+        }
+
+        warnings.push_back({
+            {"id", "multiaddr_format"},
+            {"urgency", "recommended"},
+            {"title", "Multi-Address Mining Format"},
+            {"text", "V36 introduces merged mining. To receive rewards on both "
+                     "chains, configure your miner's stratum username as: "
+                     "LTC_ADDRESS,DOGE_ADDRESS.worker_name  "
+                     "Example: ltc1q...abc,D9ab...def.rig1"}
+        });
+
+        warnings.push_back({
+            {"id", "auto_convert"},
+            {"urgency", "info"},
+            {"title", "Address Auto-Conversion"},
+            {"text", "If you only provide a LTC address, a DOGE address will be "
+                     "auto-derived from its public key hash. This derived address "
+                     "may NOT match your actual DOGE wallet \u2014 you could lose "
+                     "merged mining rewards. Always specify your own DOGE address "
+                     "explicitly."}
+        });
+
+        warnings.push_back({
+            {"id", "invalid_addr_redist"},
+            {"urgency", "info"},
+            {"title", "Invalid Address Redistribution"},
+            {"text", "Miners with invalid or unparseable addresses are handled "
+                     "per case: (1) Invalid LTC + no DOGE = both redistributed. "
+                     "(2) Invalid LTC + valid DOGE = DOGE preserved, LTC "
+                     "reverse-derived from DOGE key (Case 4). "
+                     "Redistributed shares go probabilistically to PPLNS miners."}
+        });
+
+        result["address_warnings"] = warnings;
+    }
+
+    // ── AutoRatchet effective state (matches p2pool web.py:382-391) ──
+    // c2pool has no live AutoRatchet object, so derive state from chain data.
+    // p2pool: confirmed = chain_height >= chain_length*3 AND 100% v36 shares
+    //         activated = sampling >= 95%
+    //         voting = otherwise (transition in progress)
+    {
+        std::string effective_state;
+        if (confirmed) {
+            effective_state = "confirmed";
+        } else if (sampling_signaling >= 95) {
+            effective_state = "activated";
+        } else {
+            effective_state = "voting";
+        }
+        // The chain-derived state above can momentarily disagree with what the
+        // node is ACTUALLY mining: the live ratchet output (the version stamped on
+        // this node's new shares) is ground truth so a transient sampling dip
+        // cannot make the dashboard claim "voting" while the node has already
+        // latched to V36 (charter #3). LTC-family sources it from m_cached_share_version;
+        // DASH (whose shares stay wire-format v16 across the whole crossing) hands
+        // the ratchet-derived version through the stats fn as "live_share_version".
+        int64_t live_share_version = sc.value("live_share_version", static_cast<int64_t>(m_cached_share_version));
+        result["auto_ratchet"] = {
+            {"state", effective_state},
+            {"persisted_state", effective_state},
+            {"live_share_version", live_share_version},
+            {"v36_active", live_share_version >= TARGET_VERSION},
+            {"activated_at", nullptr},
+            {"activated_height", nullptr},
+            {"confirmed_at", nullptr}
+        };
+
+        // Protocol-floor gauge pass-through (display only). DASH's stats fn emits
+        // the live accept-floor + advert; surface them so the dashboard can show
+        // "min-protocol floor 1700 → 3600" and "advertised vs current share version"
+        // alongside the vote gauge. Harmless for coins that don't emit these keys.
+        for (const char* k : {"min_protocol_version", "cold_min_protocol_version",
+                              "new_min_protocol_version", "advertised_protocol_version"}) {
+            if (sc.contains(k)) result[k] = sc[k];
+        }
+    }
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_v36_status()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    // Source the real ratchet state + share counts from rest_version_signaling()
+    // â the canonical, chain-derived V35âV36 computation â so /v36_status never
+    // lies about the cross. The old body returned a frozen "voting" / 0 v36
+    // shares regardless of reality (the founding-charter stub class). On
+    // non-transition coins version_signaling returns {}, leaving the truthful
+    // zeros below; on a too-short chain it early-returns before populating the
+    // overall_* fields, which .value() defaults handle.
+    nlohmann::json vs = rest_version_signaling();
+
+    std::string state = "voting";
+    int64_t live_share_version = m_cached_share_version;
+    bool v36_active = live_share_version >= 36;
+    if (vs.contains("auto_ratchet")) {
+        const auto& ar = vs["auto_ratchet"];
+        state = ar.value("state", std::string("voting"));
+        live_share_version = ar.value("live_share_version", live_share_version);
+        v36_active = ar.value("v36_active", v36_active);
+    }
+
+    result["auto_ratchet"] = {
+        {"state", state},
+        {"persisted_state", state},
+        {"live_share_version", live_share_version},
+        {"v36_active", v36_active},
+        {"activated_at", nullptr},
+        {"activated_height", nullptr},
+        {"confirmed_at", nullptr}
+    };
+
+    int sample_size = vs.value("overall_total", 0);
+    // Crossing counter must reflect the DESIRED-version tally the AutoRatchet
+    // keys on (get_desired_version_weights), NOT the per-share FORMAT flag.
+    // p2p-received shares relayed from the V35 seed carry format V35 even while
+    // their miners are voting V36, so overall_v36_shares (a format-flag count)
+    // stays 0 straight through a real crossing -- the founding-charter class of
+    // lie, here in the very fields the operator curls to watch the ratchet.
+    // Re-source from the desired-version data (the same swap #288 made for the
+    // ratchet mint gate): the headline percentage is the work-weighted sampling
+    // signal -- the exact "N% old version" figure the journal logs and the
+    // integrator reads to fire the crossing-event ping -- and the counts are the
+    // flat desired-version vote counts over the chain. Both climb with the cross;
+    // neither is the format-flag stub. (overall_v36_shares stays available on the
+    // parent version_signaling object for anyone who wants the format breakdown.)
+    int v36_shares  = vs.value("overall_v36_votes", 0);
+    int v35_shares  = std::max(0, sample_size - v36_shares);
+    double v36_pct  = vs.value("sampling_signaling", 0.0);
+
+    int height = 0;
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        height = sc.value("chain_height", 0);
+        if (sample_size == 0)
+            sample_size = sc.value("total_shares", 0);
+    }
+
+    result["share_chain"] = {
+        {"height", height},
+        {"sample_size", sample_size},
+        {"v35_shares", v35_shares},
+        {"v36_shares", v36_shares},
+        {"v36_percentage", v36_pct}
+    };
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_patron_sendmany(const std::string& total)
+{
+    // Builds a sendmany JSON string that splits <total> among current miners
+    nlohmann::json result = nlohmann::json::object();
+    result["note"] = "patron_sendmany stub";
+    result["total"] = total;
+    result["destinations"] = nlohmann::json::object();
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_tracker_debug()
+{
+    nlohmann::json result = nlohmann::json::object();
+    if (m_sharechain_stats_fn) {
+        result = m_sharechain_stats_fn();
+    }
+    result["best_share_hash"] = rest_web_best_share_hash();
+    return result;
+}
+
+// ──────────── Merged mining endpoints ────────────────────────────────────
+
+nlohmann::json MiningInterface::rest_merged_stats()
+{
+    nlohmann::json result = nlohmann::json::object();
+    if (!m_mm_manager || !m_mm_manager->has_chains()) {
+        result["total_blocks"] = 0;
+        result["networks"] = nlohmann::json::object();
+        result["recent"] = nlohmann::json::array();
+        return result;
+    }
+
+    result["total_blocks"] = m_mm_manager->get_total_blocks();
+
+    // Primary chain block_value + symbol for dashboard card
+    auto chain_infos = m_mm_manager->get_chain_infos();
+    if (!chain_infos.empty()) {
+        const auto& primary = chain_infos.front();
+        // block_value in coins (coinbase_value is in satoshis; 1e8 sat/coin)
+        result["block_value"] = primary.coinbase_value / 1e8;
+        result["symbol"] = primary.symbol;
+        result["difficulty"] = primary.difficulty;
+    }
+
+    // Per-network stats
+    nlohmann::json networks = nlohmann::json::object();
+    for (const auto& ci : chain_infos) {
+        nlohmann::json net;
+        net["chain_id"]       = ci.chain_id;
+        net["blocks_found"]   = m_mm_manager->get_chain_block_count(ci.chain_id);
+        net["current_height"] = ci.current_height;
+        net["current_tip"]    = ci.current_tip;
+        net["rpc_host"]       = ci.rpc_host;
+        net["rpc_port"]       = ci.rpc_port;
+        net["p2p_port"]       = ci.p2p_port;
+        net["multiaddress"]   = ci.multiaddress;
+        net["block_value"]    = ci.coinbase_value / 1e8;
+        net["difficulty"]     = ci.difficulty;
+        networks[ci.symbol]   = std::move(net);
+    }
+    result["networks"] = std::move(networks);
+
+    // Recent blocks (last 20) – field names match dashboard renderMergedBlocks()
+    nlohmann::json recent = nlohmann::json::array();
+    for (const auto& blk : m_mm_manager->get_recent_blocks(20)) {
+        nlohmann::json j;
+        j["ts"]          = blk.timestamp;
+        j["symbol"]      = blk.symbol;
+        j["network"]     = blk.symbol;
+        j["chainid"]     = blk.chain_id;
+        j["pow_hash"]    = blk.block_hash;
+        j["parent_hash"] = blk.parent_hash;
+        j["height"]      = blk.height;
+        j["miner"]       = nullptr;
+        j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
+        recent.push_back(std::move(j));
+    }
+    result["recent"] = std::move(recent);
+
+    return result;
+}
+
+nlohmann::json MiningInterface::compute_current_merged_payouts()
+{
+    // Full computation — called by cache_pplns_at_tip() on main thread.
+    // Format: { "LTC_ADDRESS": { "amount": 0.123, "merged": [{"symbol":"DOGE","address":"D...","amount":0.456}] } }
+    nlohmann::json result = nlohmann::json::object();
+
+    // Get parent chain (LTC) payouts
+    auto payouts_json = rest_current_payouts();
+    if (!payouts_json.is_object()) return result;
+
+    // Convert current_payouts {addr: amount_float} to merged format
+    for (auto& [addr, amount] : payouts_json.items()) {
+        result[addr] = {{"amount", amount}, {"merged", nlohmann::json::array()}};
+    }
+
+    // Add merged chain payouts via the payout_provider callback
+    if (m_mm_manager) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        for (const auto& ci : chain_infos) {
+            if (ci.coinbase_value == 0) continue;
+
+            // Use the same payout_provider that build_multiaddress_block uses
+            auto merged_payouts = m_mm_manager->get_payouts(ci.chain_id, ci.coinbase_value);
+            if (merged_payouts.empty()) continue;
+
+            // Per-coin aux-payout address version bytes from the merged
+            // chain's own config -- never a hardcoded DOGE assumption, so a
+            // node merging NMC/other into its primary renders truthful aux
+            // payout addresses. Falls back to DOGE mainnet bytes (0x1e/0x16)
+            // only when the chain config leaves them unset (legacy DOGE).
+            uint8_t merged_p2pkh_ver = ci.address_version ? ci.address_version : 0x1e;
+            uint8_t merged_p2sh_ver  = ci.p2sh_version    ? ci.p2sh_version    : 0x16;
+
+            for (auto& [script, amount] : merged_payouts) {
+                // Determine source label (p2pool: auto-convert, donation, explicit)
+                std::string source = "auto-convert"; // default for V35 (no explicit merged addrs)
+                // Donation: P2PK (ends with OP_CHECKSIG), P2SH matching donation script,
+                // or script matching the known donation_script from MiningInterface
+                bool is_donation = (script.size() > 33 && script.back() == 0xac); // P2PK
+                if (!is_donation && !m_donation_script.empty() && script == m_donation_script)
+                    is_donation = true; // matches configured donation script
+                if (!is_donation && script.size() == 23 && script[0] == 0xa9) {
+                    // Check if P2SH matches combined donation hash (8c6272621d89e8fa...)
+                    if (script[2] == 0x8c && script[3] == 0x62 && script[4] == 0x72)
+                        is_donation = true;
+                }
+                if (is_donation) source = "donation";
+                // TODO: detect "explicit" when V36 shares carry merged_addresses
+
+                // Convert merged script to proper DOGE address
+                std::string merged_addr = script_to_address(script, "", merged_p2pkh_ver, merged_p2sh_ver);
+                if (merged_addr.empty()) {
+                    if (source == "donation") {
+                        merged_addr = "donation";
+                    }
+                }
+
+                // Extract hash160 from merged script for matching to parent LTC address
+                std::string hash160_hex;
+                int h160_offset = -1;
+                if (script.size() == 25 && script[0] == 0x76) h160_offset = 3; // P2PKH
+                else if (script.size() == 23 && script[0] == 0xa9) h160_offset = 2; // P2SH
+                else if (script.size() == 22 && script[0] == 0x00) h160_offset = 2; // P2WPKH
+                if (h160_offset >= 0) {
+                    static const char* HEX = "0123456789abcdef";
+                    hash160_hex.reserve(40);
+                    for (int i = h160_offset; i < h160_offset + 20; ++i) {
+                        hash160_hex += HEX[script[i] >> 4];
+                        hash160_hex += HEX[script[i] & 0x0f];
+                    }
+                }
+
+                // Find parent LTC address with same hash160
+                bool attached = false;
+                if (!hash160_hex.empty()) {
+                    for (auto& [parent_addr, entry] : result.items()) {
+                        auto ps = address_to_script(parent_addr);
+                        int po = (ps.size() == 25) ? 3 : (ps.size() == 22) ? 2 : (ps.size() == 23) ? 2 : -1;
+                        if (po >= 0 && po + 20 <= static_cast<int>(ps.size())) {
+                            static const char* HEX = "0123456789abcdef";
+                            std::string ph;
+                            ph.reserve(40);
+                            for (int i = po; i < po + 20; ++i) { ph += HEX[ps[i] >> 4]; ph += HEX[ps[i] & 0x0f]; }
+                            if (ph == hash160_hex) {
+                                entry["merged"].push_back({
+                                    {"symbol", ci.symbol},
+                                    {"address", merged_addr.empty() ? hash160_hex : merged_addr},
+                                    {"amount", amount / 1e8},
+                                    {"source", source}
+                                });
+                                attached = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Donation not matched by hash160 — attach to LTC donation address
+                // by name (p2pool web.py:1164). DONATION_SCRIPT (P2PK → LeD2f on mainnet)
+                // and COMBINED_DONATION_SCRIPT (P2SH → MLhSm on mainnet) have different
+                // hash160 values, so hash160 matching won't find the parent.
+                if (!attached && is_donation) {
+                    // Use known DOGE donation address (precomputed, same as p2pool)
+                    std::string doge_donation_addr = merged_addr;
+                    if (doge_donation_addr.empty() || doge_donation_addr == "donation")
+                        doge_donation_addr = ltc::PoolConfig::is_testnet
+                            ? "2N63WXLw22FXFdLBNqWZLsDX7WQJTPXus7f"   // COMBINED_DONATION_DOGE_TESTNET
+                            : "A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr";  // COMBINED_DONATION_DOGE_MAINNET
+
+                    // Find LTC donation address: try known prefixes
+                    std::string ltc_donation_key;
+                    for (auto& [parent_addr, entry] : result.items()) {
+                        // Pre-V36: LeD2fnn... (hash160 of DONATION_SCRIPT pubkey)
+                        // V36+:    MLhSmVQ... (COMBINED_DONATION_SCRIPT P2SH)
+                        if (parent_addr.rfind("LeD2f", 0) == 0 ||
+                            parent_addr.rfind("MLhSm", 0) == 0)
+                        {
+                            ltc_donation_key = parent_addr;
+                            break;
+                        }
+                    }
+                    if (!ltc_donation_key.empty()) {
+                        result[ltc_donation_key]["merged"].push_back({
+                            {"symbol", ci.symbol},
+                            {"address", doge_donation_addr},
+                            {"amount", amount / 1e8},
+                            {"source", "donation"}
+                        });
+                        attached = true;
+                    }
+                }
+                if (!attached && amount > 0) {
+                    std::string key = merged_addr.empty() ? (hash160_hex.empty() ? "unknown" : hash160_hex) : merged_addr;
+                    if (!result.contains(key))
+                        result[key] = {{"amount", 0.0}, {"merged", nlohmann::json::array()}};
+                    result[key]["merged"].push_back({
+                        {"symbol", ci.symbol},
+                        {"address", key},
+                        {"amount", amount / 1e8},
+                        {"source", source}
+                    });
+                }
+            }
+        }
+    }
+
+    // Filter out entries with 0 LTC and no merged payouts
+    nlohmann::json filtered = nlohmann::json::object();
+    for (auto& [key, entry] : result.items()) {
+        double ltc_amount = entry.value("amount", 0.0);
+        auto& merged = entry["merged"];
+        bool has_merged = merged.is_array() && !merged.empty();
+        if (ltc_amount < 0.000001 && !has_merged) continue;
+        // Filter out overflow merged entries (< 0.01 DOGE or > 1B — clearly wrong).
+        // Exempt source="donation": p2pool web.py forces donation_reward to >=1
+        // satoshi when the V36-signaling shares all set m_donation=0, so the
+        // legitimate donation entry can be 1e-8 DOGE — must not be dropped as
+        // "garbage". Matches p2pool web.py:1150 which attaches donation
+        // unconditionally regardless of amount.
+        if (has_merged) {
+            nlohmann::json good = nlohmann::json::array();
+            for (auto& m : merged) {
+                double amt = m.value("amount", 0.0);
+                bool is_donation = (m.value("source", "") == "donation");
+                if (is_donation || (amt >= 0.01 && amt < 1e9))
+                    good.push_back(m);
+            }
+            entry["merged"] = good;
+            if (ltc_amount < 0.000001 && good.empty()) continue;
+        }
+        filtered[key] = entry;
+    }
+    return filtered;
+}
+
+nlohmann::json MiningInterface::rest_current_merged_payouts()
+{
+    // Return pre-computed cache from cache_pplns_at_tip() (main thread, every 2s)
+    std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
+    if (!m_cached_merged_payouts.is_null() && !m_cached_merged_payouts.empty())
+        return m_cached_merged_payouts;
+    return nlohmann::json::object();
+}
+
+namespace {
+
+// Name mapping for the top-level "coin" field.
+// frstrtr/the/docs/c2pool-pplns-view-module-task.md §5.1 expects the
+// short symbol (e.g. "LTC"), not a class-name or lowercase variant.
+const char* blockchain_short_symbol(Blockchain b)
+{
+    switch (b) {
+        case Blockchain::LITECOIN: return "LTC";
+        case Blockchain::BITCOIN:  return "BTC";
+        case Blockchain::DOGECOIN: return "DOGE";
+        case Blockchain::DASH:     return "DASH";
+        case Blockchain::DIGIBYTE: return "DGB";
+        case Blockchain::ETHEREUM: return "ETH";
+        case Blockchain::MONERO:   return "XMR";
+        case Blockchain::ZCASH:    return "ZEC";
+        case Blockchain::UNKNOWN:
+        default:                   return "UNKNOWN";
+    }
+}
+
+} // namespace
+
+nlohmann::json MiningInterface::rest_pplns_current()
+{
+    // Shape per frstrtr/the/docs/c2pool-pplns-view-module-task.md §5.1.
+    //
+    // Strategy: the existing merged-payouts cache already carries
+    // primary amount + per-miner DOGE split (cached every 2s on the
+    // main thread via cache_pplns_at_tip → compute_current_merged_payouts).
+    // We enrich it here with per-miner aggregates (shares_in_window,
+    // version, desired_version, last_share_at) derived by a single
+    // walk over the sharechain window. hashrate_hps is deferred to a
+    // follow-up; spec tolerates its absence.
+
+    // Snapshot the payouts cache under the mutex, then release.
+    nlohmann::json cache;
+    {
+        std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
+        cache = m_cached_merged_payouts;
+    }
+
+    // Build enrichment table from the current window. Non-fatal if the
+    // window isn't available — the module degrades gracefully.
+    struct Enrich {
+        int    shares_in_window = 0;
+        int    version          = 0;
+        int    desired_version  = 0;
+        double last_share_at    = 0;
+    };
+    std::unordered_map<std::string, Enrich> enrich;
+    if (m_sharechain_window_fn) {
+        auto window = m_sharechain_window_fn();
+        if (window.contains("shares") && window["shares"].is_array()) {
+            for (const auto& s : window["shares"]) {
+                std::string addr;
+                if (s.contains("m") && s["m"].is_string())
+                    addr = s["m"].get<std::string>();
+                if (addr.empty()) continue;
+                auto& e = enrich[addr];
+                e.shares_in_window++;
+                double t = s.value("t", 0.0);
+                if (t > e.last_share_at) {
+                    e.last_share_at   = t;
+                    e.version         = s.value("V",  0);
+                    e.desired_version = s.value("dv", 0);
+                }
+            }
+        }
+    }
+
+    // Compose output.
+    nlohmann::json out;
+    {
+        std::string tip;
+        int32_t     chain_length = 0;
+        if (auto t = get_sharechain_tip()) {
+            tip = t->hash;
+            chain_length = static_cast<int32_t>(t->height);
+        }
+        // Short-hash (16 hex) per spec §5.1 "short-hash of current tip".
+        if (tip.size() > 16) tip = tip.substr(0, 16);
+        out["tip"]          = tip;
+        out["window_size"]  = chain_length > 0 ? chain_length : 4320;
+        out["coin"]         = blockchain_short_symbol(m_blockchain);
+    }
+    out["computed_at"]    = static_cast<int64_t>(std::time(nullptr));
+    out["schema_version"] = "1.0";
+
+    // Walk the cache to aggregate primary + per-chain merged totals,
+    // and build the miners[] array.
+    double total_primary = 0;
+    std::map<std::string, double> merged_totals;
+    std::vector<std::pair<std::string, nlohmann::json>> miners;
+    miners.reserve(cache.is_object() ? cache.size() : 0);
+
+    if (cache.is_object()) {
+        for (const auto& [addr, entry] : cache.items()) {
+            double amount = 0;
+            if (entry.is_number()) {
+                amount = entry.get<double>();
+            } else if (entry.is_object() && entry.contains("amount")) {
+                amount = entry["amount"].get<double>();
+            }
+            if (!(amount > 0)) continue;
+            total_primary += amount;
+
+            nlohmann::json m;
+            m["address"] = addr;
+            m["amount"]  = amount;
+            m["pct"]     = 0;     // filled below once total is known
+            // Enrichment from sharechain window.
+            auto eit = enrich.find(addr);
+            if (eit != enrich.end()) {
+                m["shares_in_window"] = eit->second.shares_in_window;
+                if (eit->second.version > 0)
+                    m["version"] = eit->second.version;
+                if (eit->second.desired_version > 0)
+                    m["desired_version"] = eit->second.desired_version;
+                if (eit->second.last_share_at > 0)
+                    m["last_share_at"] = static_cast<int64_t>(eit->second.last_share_at);
+            }
+            // Rolling hashrate (H/s) from the in-memory ring populated
+            // by record_share_difficulty. Tolerates 0 silently — the
+            // spec treats hashrate_hps as optional.
+            const double hps = m_hashrate_ring.hashrate(addr);
+            if (hps > 0) m["hashrate_hps"] = hps;
+            // Merged-chain breakdown.
+            nlohmann::json merged_arr = nlohmann::json::array();
+            if (entry.is_object() && entry.contains("merged")
+                && entry["merged"].is_array()) {
+                for (const auto& mm : entry["merged"]) {
+                    double mm_amount = mm.value("amount", 0.0);
+                    if (!(mm_amount > 0)) continue;
+                    // Charter honesty: a merged entry must carry its real
+                    // aux-chain symbol (producers set it from ci.symbol). If it
+                    // is somehow absent we must NOT fabricate a specific coin --
+                    // the old "DOGE" default lied on non-DOGE aux nodes and
+                    // folded the amount into a bogus DOGE merged_total. Leave it
+                    // unlabelled (== unknown) so it never masquerades as DOGE.
+                    std::string sym = mm.value("symbol", std::string(""));
+                    std::string mm_addr = mm.value("address", std::string(""));
+                    if (mm_addr.empty() && mm.contains("addr"))
+                        mm_addr = mm.value("addr", std::string(""));
+                    if (!sym.empty())
+                        merged_totals[sym] += mm_amount;
+                    nlohmann::json me;
+                    me["symbol"]  = sym;
+                    me["address"] = mm_addr;
+                    me["amount"]  = mm_amount;
+                    me["pct"]     = 0;   // filled below
+                    if (mm.contains("source") && mm["source"].is_string())
+                        me["source"] = mm["source"];
+                    merged_arr.push_back(std::move(me));
+                }
+            }
+            m["merged"] = std::move(merged_arr);
+            miners.emplace_back(addr, std::move(m));
+        }
+    }
+
+    // Sort by primary amount desc, ties broken by address lex-asc
+    // (spec §5.1 contract rule).
+    std::sort(miners.begin(), miners.end(),
+        [](const auto& a, const auto& b) {
+            const double aa = a.second.value("amount", 0.0);
+            const double bb = b.second.value("amount", 0.0);
+            if (aa != bb) return aa > bb;
+            return a.first < b.first;
+        });
+
+    // Fill pct fields now that totals are known.
+    for (auto& [addr, entry] : miners) {
+        (void)addr;
+        double amt = entry.value("amount", 0.0);
+        entry["pct"] = total_primary > 0 ? amt / total_primary : 0.0;
+        if (entry.contains("merged") && entry["merged"].is_array()) {
+            for (auto& mm : entry["merged"]) {
+                std::string sym = mm.value("symbol", std::string(""));
+                double mt = merged_totals[sym];
+                mm["pct"] = mt > 0 ? mm.value("amount", 0.0) / mt : 0.0;
+            }
+        }
+    }
+
+    // Emit aggregate totals.
+    out["total_primary"] = total_primary;
+    nlohmann::json chains_arr = nlohmann::json::array();
+    nlohmann::json totals_obj = nlohmann::json::object();
+    for (const auto& [sym, tot] : merged_totals) {
+        chains_arr.push_back(sym);
+        totals_obj[sym] = tot;
+    }
+    out["merged_chains"] = std::move(chains_arr);
+    out["merged_totals"] = std::move(totals_obj);
+
+    // Emit miners array in sorted order.
+    nlohmann::json miners_arr = nlohmann::json::array();
+    miners_arr.get_ptr<nlohmann::json::array_t*>()->reserve(miners.size());
+    for (auto& [addr, entry] : miners) {
+        (void)addr;
+        miners_arr.push_back(std::move(entry));
+    }
+    out["miners"] = std::move(miners_arr);
+    return out;
+}
+
+nlohmann::json MiningInterface::rest_pplns_miner(const std::string& address)
+{
+    // Shape per frstrtr/the/docs/c2pool-pplns-view-module-task.md §5.2.
+    // First-cut implementation: project from the /pplns/current miner
+    // list and augment with recent_shares + sharechain lifetime counts.
+    // Defers hashrate_series / version_history to a follow-up — the
+    // current sharechain window gives us cadence, not a long-horizon
+    // time-series.
+    if (address.empty()) {
+        nlohmann::json err;
+        err["error"] = "miner_not_found";
+        return err;
+    }
+
+    const auto current = rest_pplns_current();
+    nlohmann::json out;
+    out["address"] = address;
+
+    // Scan miners[] for an exact match.
+    bool in_window = false;
+    if (current.contains("miners") && current["miners"].is_array()) {
+        for (const auto& m : current["miners"]) {
+            if (m.value("address", std::string("")) == address) {
+                out["amount"]           = m.value("amount", 0.0);
+                out["pct"]              = m.value("pct", 0.0);
+                if (m.contains("shares_in_window"))
+                    out["shares_in_window"] = m["shares_in_window"];
+                if (m.contains("version"))
+                    out["version"] = m["version"];
+                if (m.contains("desired_version"))
+                    out["desired_version"] = m["desired_version"];
+                if (m.contains("last_share_at"))
+                    out["last_share_at"] = m["last_share_at"];
+                if (m.contains("merged"))
+                    out["merged"] = m["merged"];
+                in_window = true;
+                break;
+            }
+        }
+    }
+    out["in_window"] = in_window;
+
+    // recent_shares: scan the current window for this miner's shares.
+    // Spec says "last N shares (configurable, default 50)"; we emit up
+    // to 50 newest-first.
+    //
+    // While walking we also collect (t, V, dv) tuples so we can
+    // compress them into version_history afterwards. Storing in a
+    // local vector avoids assuming window order — we sort ascending
+    // before compressing.
+    nlohmann::json recent = nlohmann::json::array();
+    int    shares_total = 0;
+    double first_seen_at = 0;
+    struct VerPoint { int64_t t; int v; int dv; };
+    std::vector<VerPoint> ver_pts;
+    if (m_sharechain_window_fn) {
+        auto window = m_sharechain_window_fn();
+        if (window.contains("shares") && window["shares"].is_array()) {
+            for (const auto& s : window["shares"]) {
+                if (s.value("m", std::string("")) != address) continue;
+                ++shares_total;
+                const double t = s.value("t", 0.0);
+                if (first_seen_at == 0 || t < first_seen_at) first_seen_at = t;
+                if (recent.size() < 50) {
+                    nlohmann::json r;
+                    if (s.contains("h")) r["h"] = s["h"];
+                    if (s.contains("t")) r["t"] = s["t"];
+                    if (s.contains("s")) r["s"] = s["s"];
+                    if (s.contains("V")) r["V"] = s["V"];
+                    recent.push_back(std::move(r));
+                }
+                const int v  = s.value("V",  0);
+                const int dv = s.value("dv", 0);
+                if (v > 0 && t > 0) {
+                    ver_pts.push_back({static_cast<int64_t>(t), v, dv});
+                }
+            }
+        }
+    }
+    if (!in_window && shares_total == 0) {
+        nlohmann::json err;
+        err["error"]   = "miner_not_found";
+        err["address"] = address;
+        return err;
+    }
+    out["shares_total"]  = shares_total;
+    if (first_seen_at > 0) out["first_seen_at"] = static_cast<int64_t>(first_seen_at);
+    out["recent_shares"] = std::move(recent);
+
+    // version_history: compress the per-share (V, dv) stream into
+    // transitions. First observed pair is always emitted, then each
+    // pair that differs from the previous. Capped at 16 entries —
+    // a runaway toggler shouldn't balloon the response.
+    if (!ver_pts.empty()) {
+        std::sort(ver_pts.begin(), ver_pts.end(),
+            [](const VerPoint& a, const VerPoint& b) { return a.t < b.t; });
+        nlohmann::json vh = nlohmann::json::array();
+        int prev_v = -1, prev_dv = -1;
+        for (const auto& p : ver_pts) {
+            if (p.v == prev_v && p.dv == prev_dv) continue;
+            nlohmann::json entry;
+            entry["t"]       = p.t;
+            entry["version"] = p.v;
+            if (p.dv > 0) entry["desired_version"] = p.dv;
+            vh.push_back(std::move(entry));
+            prev_v  = p.v;
+            prev_dv = p.dv;
+            if (vh.size() >= 16) break;
+        }
+        if (!vh.empty()) out["version_history"] = std::move(vh);
+    }
+
+    // Hashrate (rolling + bucketed series) from the ring.
+    const double hps = m_hashrate_ring.hashrate(address);
+    if (hps > 0) out["hashrate_hps"] = hps;
+    auto series = m_hashrate_ring.series(address);
+    if (!series.empty()) {
+        nlohmann::json series_json = nlohmann::json::array();
+        for (const auto& p : series) {
+            nlohmann::json point;
+            point["t"]   = p.t;
+            point["hps"] = p.hps;
+            series_json.push_back(std::move(point));
+        }
+        out["hashrate_series"] = std::move(series_json);
+    }
+    return out;
+}
+
+
+nlohmann::json MiningInterface::rest_recent_merged_blocks()
+{
+    nlohmann::json arr = nlohmann::json::array();
+    if (!m_mm_manager) return arr;
+
+    for (const auto& blk : m_mm_manager->get_recent_blocks(50)) {
+        nlohmann::json j;
+        // Field names match dashboard.html renderMergedBlocks() expectations
+        j["ts"]          = blk.timestamp;
+        j["symbol"]      = blk.symbol;
+        j["network"]     = blk.symbol;
+        j["chainid"]     = blk.chain_id;
+        j["pow_hash"]    = blk.block_hash;
+        j["parent_hash"] = blk.parent_hash;
+        j["height"]      = blk.height;
+        j["miner"]       = blk.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(blk.miner);
+        j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
+        arr.push_back(std::move(j));
+    }
+    return arr;
+}
+
+nlohmann::json MiningInterface::rest_all_merged_blocks()
+{
+    nlohmann::json arr = nlohmann::json::array();
+    if (!m_mm_manager) return arr;
+
+    for (const auto& blk : m_mm_manager->get_discovered_blocks()) {
+        nlohmann::json j;
+        j["ts"]          = blk.timestamp;
+        j["symbol"]      = blk.symbol;
+        j["chainid"]     = blk.chain_id;
+        j["pow_hash"]    = blk.block_hash;
+        j["parent_hash"] = blk.parent_hash;
+        j["height"]      = blk.height;
+        j["miner"]       = nullptr;
+        j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
+        arr.push_back(std::move(j));
+    }
+    return arr;
+}
+
+nlohmann::json MiningInterface::rest_discovered_merged_blocks()
+{
+    // Field names match dashboard.html renderDiscoveredMerged() expectations
+    nlohmann::json arr = nlohmann::json::array();
+    if (!m_mm_manager) return arr;
+
+    for (const auto& blk : m_mm_manager->get_discovered_blocks()) {
+        nlohmann::json j;
+        j["ts"]               = blk.timestamp;
+        j["number"]           = blk.parent_height > 0 ? nlohmann::json(blk.parent_height) : nlohmann::json(nullptr);
+        j["hash"]             = blk.parent_hash;
+        j["aux_block_height"] = blk.height;
+        j["aux_hash"]         = blk.block_hash;
+        j["aux_symbol"]       = blk.symbol;
+        j["aux_reward"]       = blk.coinbase_value > 0 ? nlohmann::json(blk.coinbase_value / 1e8) : nlohmann::json(nullptr);
+        j["miner"]            = blk.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(blk.miner);
+        j["peer_addr"]        = blk.is_local ? "local" : "peer";
+        j["status"]           = blk.accepted ? "confirmed" : "orphaned";
+        arr.push_back(std::move(j));
+    }
+    return arr;
+}
+
+// ── Embedded coin header-sync merge (dashboard telemetry only) ──────────────
+// Folds the per-lane coin header-sync provider snapshot into a
+// /broadcaster_status response so the dashboard's "embedded daemon REAL sync"
+// card (header_height/target_height/sync_percent + synced flag) and the
+// "Header Sync %" stat card (current_height vs max connected-peer
+// startingheight) render real values instead of blanks. STRICTLY ADDITIVE:
+// pre-existing keys (running, last_broadcast, peers, chains, ...) are never
+// overwritten, so every current consumer keeps its exact contract.
+//   header_height / current_height = the embedded coin header-chain TIP (the
+//     real coin header chain the node syncs -- NOT the sharechain height).
+//   target_height = the lane's best network-tip estimate, raised to the max
+//     startingheight among the provider's connected peers; 0 when unknown.
+//   sync_percent  = clamp(100 * header_height / target_height, 0..100);
+//     100 when the target is unknown but the lane says synced, else 0.
+//   synced        = the lane's verdict when it states one, else header within
+//     2 blocks of a known target. syncing = !synced.
+//   connected_peers = the provider's peer list (carries startingheight so the
+//     dashboard can compute max itself); mirrored into "peers" only when no
+//     other source populated that key.
+void MiningInterface::augment_with_coin_sync_status(nlohmann::json& result)
+{
+    if (!m_coin_sync_status_fn) return;
+    nlohmann::json s;
+    try { s = m_coin_sync_status_fn(); } catch (...) { return; }
+    if (!s.is_object()) return;
+
+    const uint64_t header_height = s.value("header_height", 0ull);
+    uint64_t target_height = s.value("target_height", 0ull);
+
+    nlohmann::json peers = nlohmann::json::array();
+    if (s.contains("peers") && s["peers"].is_array()) {
+        peers = s["peers"];
+        for (const auto& p : peers) {
+            if (!p.is_object() || !p.value("connected", true)) continue;
+            const uint64_t sh = p.value("startingheight", 0ull);
+            if (sh > target_height) target_height = sh;
+        }
+    }
+
+    bool synced;
+    double sync_percent;
+    if (target_height > 0) {
+        sync_percent = 100.0 * static_cast<double>(header_height)
+                             / static_cast<double>(target_height);
+        if (sync_percent > 100.0) sync_percent = 100.0;
+        if (sync_percent < 0.0)   sync_percent = 0.0;
+        synced = (header_height + 2 >= target_height);
+    } else {
+        synced = s.value("synced", false);
+        sync_percent = synced ? 100.0 : 0.0;
+    }
+    // The lane's own verdict, when it states one, wins over the heuristic.
+    if (s.contains("synced") && s["synced"].is_boolean())
+        synced = s["synced"].get<bool>();
+
+    if (!result.contains("header_height"))   result["header_height"]   = header_height;
+    if (!result.contains("current_height"))  result["current_height"]  = header_height;
+    if (!result.contains("target_height"))   result["target_height"]   = target_height;
+    if (!result.contains("sync_percent"))    result["sync_percent"]    = sync_percent;
+    if (!result.contains("synced"))          result["synced"]          = synced;
+    if (!result.contains("syncing"))         result["syncing"]         = !synced;
+    if (!result.contains("connected_peers")) result["connected_peers"] = peers;
+    if (!result.contains("peers") && !peers.empty()) result["peers"] = peers;
+}
+
+nlohmann::json MiningInterface::rest_broadcaster_status()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    // LTC / merged-mining path: broadcaster is driven by MM manager.
+    if (m_mm_manager && m_mm_manager->has_chains()) {
+        result["running"] = true;
+        result["enabled"] = true;
+        result["chains"] = m_mm_manager->chain_count();
+        result["total_blocks_found"] = m_mm_manager->get_total_blocks();
+        if (m_ltc_peer_info_fn)
+            result["peers"] = m_ltc_peer_info_fn();
+        augment_with_coin_sync_status(result);
+        return result;
+    }
+
+    // Non-merged path (e.g. Dash SPV): coin_peer_info_fn provides the
+    // daemon P2P peer list so the dashboard's "Parent Chain Peers" panel
+    // can render dashd connections. Runs true iff the callback is wired
+    // AND at least one peer is connected.
+    if (m_coin_peer_info_fn) {
+        auto peers = m_coin_peer_info_fn();
+        bool any_connected = false;
+        if (peers.is_array()) {
+            for (const auto& p : peers)
+                if (p.value("connected", false)) { any_connected = true; break; }
+        }
+        result["running"] = any_connected;
+        result["enabled"] = true;
+        result["peers"] = std::move(peers);
+        result["total_blocks_found"] = 0;  // no coin-side found-block counter yet
+        augment_with_coin_sync_status(result);
+        return result;
+    }
+
+    // Fallback path. The historical {last_broadcast, running} pair stays --
+    // the header-sync fields ride ADDITIVELY beside it. When the sync
+    // provider reports at least one CONNECTED coin peer the embedded node IS
+    // relaying, so running mirrors the coin_peer_info_fn semantics above
+    // (running == any_connected); with no provider or no peers it remains
+    // false, byte-identical to the old emit.
+    result["running"] = false;
+    result["last_broadcast"] = nullptr;
+    augment_with_coin_sync_status(result);
+    if (result.contains("connected_peers") && result["connected_peers"].is_array()) {
+        for (const auto& p : result["connected_peers"]) {
+            if (p.is_object() && p.value("connected", false)) {
+                result["running"] = true;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_merged_broadcaster_status()
+{
+    nlohmann::json result = nlohmann::json::object();
+    if (!m_mm_manager || !m_mm_manager->has_chains()) {
+        result["running"] = false;
+        result["last_broadcast"] = nullptr;
+        result["chains"] = nlohmann::json::object();
+        return result;
+    }
+
+    result["running"] = true;
+
+    nlohmann::json chains = nlohmann::json::object();
+    for (const auto& ci : m_mm_manager->get_chain_infos()) {
+        nlohmann::json ch;
+        ch["chain_id"]       = ci.chain_id;
+        ch["current_height"] = ci.current_height;
+        ch["current_tip"]    = ci.current_tip;
+        ch["p2p_port"]       = ci.p2p_port;
+        ch["blocks_found"]   = m_mm_manager->get_chain_block_count(ci.chain_id);
+        chains[ci.symbol]    = std::move(ch);
+    }
+    result["chains"] = std::move(chains);
+
+    // DOGE P2P peer info
+    if (m_doge_peer_info_fn)
+        result["peers"] = m_doge_peer_info_fn();
+
+    return result;
+}
+
+void MiningInterface::add_netdiff_sample(double difficulty, const std::string& source)
+{
+    if (difficulty <= 0) return;
+    // Skip if unchanged from last sample (dedup same-block updates)
+    if (difficulty == m_last_netdiff_sampled && source == "periodic") return;
+    m_last_netdiff_sampled = difficulty;
+
+    std::lock_guard<std::mutex> lock(m_netdiff_mutex);
+    double now = static_cast<double>(std::time(nullptr));
+    m_netdiff_history.push_back({now, difficulty, source});
+    // Cap at 2000 samples (oldest first)
+    while (m_netdiff_history.size() > 2000)
+        m_netdiff_history.erase(m_netdiff_history.begin());
+}
+
+void MiningInterface::update_network_difficulty(double difficulty, const std::string& source)
+{
+    // Mirror of the refresh_work() network-difficulty commit (web_server.cpp
+    // ~1590) for coin-tip sources that never run refresh_work() (daemonless
+    // DASH). Store the atomic every consumer reads (/global_stats,
+    // record_found_block's netdiff fallback, attempts_to_block) and append a
+    // graph sample. add_netdiff_sample() already dedups & bounds the history.
+    if (difficulty <= 0.0) return;
+    m_network_difficulty.store(difficulty, std::memory_order_relaxed);
+    if (m_on_network_difficulty_fn) {
+        try { m_on_network_difficulty_fn(difficulty); } catch (...) {}
+    }
+    add_netdiff_sample(difficulty, source);
+}
+
+nlohmann::json MiningInterface::rest_network_difficulty()
+{
+    nlohmann::json arr = nlohmann::json::array();
+    {
+        std::lock_guard<std::mutex> lock(m_netdiff_mutex);
+        for (const auto& s : m_netdiff_history)
+            arr.push_back({{"ts", s.ts}, {"network_diff", s.difficulty}, {"source", s.source}});
+    }
+    // If empty, at least return current
+    if (arr.empty()) {
+        double diff = m_network_difficulty.load(std::memory_order_relaxed);
+        arr.push_back({
+            {"ts", static_cast<double>(std::time(nullptr))},
+            {"network_diff", diff},
+            {"source", "current"}
+        });
+    }
+    return arr;
+}
+
+// ──────────── Stratum worker session tracking ───────────────────────────
+
+void MiningInterface::register_stratum_worker(const std::string& session_id, const WorkerInfo& info)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    m_stratum_workers[session_id] = info;
+}
+
+void MiningInterface::unregister_stratum_worker(const std::string& session_id)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    m_stratum_workers.erase(session_id);
+}
+
+void MiningInterface::update_stratum_worker(const std::string& session_id,
+                                             double hashrate, double dead_hashrate, double difficulty,
+                                             uint64_t accepted, uint64_t rejected, uint64_t stale)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    auto it = m_stratum_workers.find(session_id);
+    if (it != m_stratum_workers.end()) {
+        it->second.hashrate = hashrate;
+        it->second.dead_hashrate = dead_hashrate;
+        it->second.difficulty = difficulty;
+        it->second.accepted = accepted;
+        it->second.rejected = rejected;
+        it->second.stale = stale;
+    }
+}
+
+void MiningInterface::update_stratum_worker_rtt(const std::string& session_id, double rtt_ms)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    auto it = m_stratum_workers.find(session_id);
+    if (it != m_stratum_workers.end())
+        it->second.rtt_ms = rtt_ms;
+}
+
+std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::get_stratum_workers() const
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    return m_stratum_workers;
+}
+
+std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::effective_stratum_workers() const
+{
+    {
+        std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+        if (!m_stratum_workers.empty())
+            return m_stratum_workers;   // LTC path: dashboard-owned acceptor
+    }
+    // Coin targets (c2pool-dash) run their stratum acceptor against a separate
+    // IWorkSource; its per-connection registry is the ground truth.
+    if (m_stratum_workers_fn)
+        return m_stratum_workers_fn();
+    return {};
+}
+
+// ──────────── /web/ sub-endpoints (share chain inspection) ───────────────
+
+nlohmann::json MiningInterface::rest_web_heads()
+{
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("heads"))
+            return sc["heads"];
+    }
+    return nlohmann::json::array();
+}
+
+nlohmann::json MiningInterface::rest_web_verified_heads()
+{
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("verified_heads"))
+            return sc["verified_heads"];
+    }
+    return nlohmann::json::array();
+}
+
+nlohmann::json MiningInterface::rest_web_tails()
+{
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("tails"))
+            return sc["tails"];
+    }
+    return nlohmann::json::array();
+}
+
+nlohmann::json MiningInterface::rest_web_verified_tails()
+{
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("verified_tails"))
+            return sc["verified_tails"];
+    }
+    return nlohmann::json::array();
+}
+
+nlohmann::json MiningInterface::rest_web_my_share_hashes()
+{
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("my_share_hashes"))
+            return sc["my_share_hashes"];
+    }
+    return nlohmann::json::array();
+}
+
+nlohmann::json MiningInterface::rest_web_my_share_hashes50()
+{
+    auto all = rest_web_my_share_hashes();
+    if (all.is_array() && all.size() > 50) {
+        nlohmann::json trimmed = nlohmann::json::array();
+        for (size_t i = 0; i < 50; ++i)
+            trimmed.push_back(all[i]);
+        return trimmed;
+    }
+    return all;
+}
+
+nlohmann::json MiningInterface::rest_web_share(const std::string& hash)
+{
+    // Use dedicated share lookup if wired
+    if (m_share_lookup_fn) {
+        auto result = m_share_lookup_fn(hash);
+        if (!result.is_null() && !result.contains("error"))
+            return result;
+    }
+    nlohmann::json result = nlohmann::json::object();
+    result["error"] = "share not found";
+    result["hash"] = hash;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_web_payout_address(const std::string& hash)
+{
+    auto share = rest_web_share(hash);
+    if (share.contains("share_data") && share["share_data"].contains("payout_address"))
+        return share["share_data"]["payout_address"];
+    return "";
+}
+
+nlohmann::json MiningInterface::rest_web_log_json()
+{
+    std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& entry : m_stat_log) {
+        arr.push_back({
+            {"time", entry.time},
+            {"pool_hash_rate", entry.pool_hash_rate},
+            {"pool_stale_prop", entry.pool_stale_prop},
+            {"local_hash_rates", entry.local_hash_rates},
+            {"shares", entry.shares},
+            {"stale_shares", entry.stale_shares},
+            {"current_payout", entry.current_payout},
+            {"peers", entry.peers},
+            {"attempts_to_share", entry.attempts_to_share},
+            {"attempts_to_block", entry.attempts_to_block},
+            {"block_value", entry.block_value}
+        });
+    }
+    return arr;
+}
+
+nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, const std::string& view)
+{
+    // p2pool-compatible graph data: array of [timestamp, value, width, default] 4-tuples.
+    // dict sources: [ts, {key: val} or null, width, 0]
+    // scalar sources: [ts, value, width, 0]
+    // data_to_lines() in graphs.html parses this format.
+    nlohmann::json result = nlohmann::json::array();
+
+    // G4 dispatch: the long horizons (week/month/year) answer from the binned
+    // history DB when it is ready, dropping the payload from thousands of flat
+    // samples to ~300 bin points. last_hour/last_day stay on the flat path
+    // below unchanged. If the binned view is not ready yet (still seeding) or is
+    // empty, fall through to the flat path — never worse than today.
+    if ((view == "last_week" || view == "last_month" || view == "last_year")
+        && m_views_ready.load(std::memory_order_acquire)) {
+        nlohmann::json binned = graph_view_data(source, view);
+        if (binned.is_array() && !binned.empty())
+            return binned;
+        // else: fall through to the flat path (honest-absent / not-yet-filled)
+    }
+
+    std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+    auto now = std::time(nullptr);
+    double window = 3600.0;
+    if (view == "last_day") window = 86400.0;
+    else if (view == "last_week") window = 604800.0;
+    else if (view == "last_month") window = 2592000.0;
+    else if (view == "last_year") window = 31536000.0;
+
+    // Compute bin width from stat_log interval (~300s) or use view-dependent default
+    double bin_width = 300.0;
+
+    for (const auto& entry : m_stat_log) {
+        if (entry.time < (now - static_cast<time_t>(window)))
+            continue;
+
+        if (source == "pool_rates") {
+            nlohmann::json val = nlohmann::json::object();
+            val["good"] = entry.pool_hash_rate * (1.0 - entry.pool_stale_prop);
+            val["orphan"] = entry.pool_hash_rate * entry.pool_stale_prop;
+            val["dead"] = 0.0;
+            result.push_back({entry.time, val, bin_width, 0});
+        }
+        else if (source == "pool_hash_rate" || source == "pool_rate") {
+            // "pool_rate" (singular) is an alias of the "pool_hash_rate" scalar.
+            // Both emit entry.pool_hash_rate, which the periodic sampler
+            // (update_stat_log :7212) fills from m_pool_hashrate_fn -- on DASH
+            // the #1349 estimator that anchors on dash::select_pool_rate_head,
+            // so this series is NON-ZERO on a live node with 0 local miners
+            // (peers-filled raw sharechain). Without this branch the singular
+            // name fell through to the catch-all and fabricated a flat-zero
+            // line on ANY node in ANY state (instrument-lied), masquerading as
+            // a dead graph regardless of real pool hashrate.
+            result.push_back({entry.time, entry.pool_hash_rate, bin_width, 0});
+        }
+        else if (source == "pool_stale_prop") {
+            result.push_back({entry.time, entry.pool_stale_prop, bin_width, 0});
+        }
+        else if (source == "local_hash_rate") {
+            double total = 0.0;
+            if (entry.local_hash_rates.is_object())
+                for (auto& [k, v] : entry.local_hash_rates.items())
+                    if (v.is_number()) total += v.get<double>();
+            result.push_back({entry.time, total, bin_width, 0});
+        }
+        else if (source == "local_dead_hash_rate") {
+            double total = 0.0;
+            if (entry.local_dead_hash_rates.is_object())
+                for (auto& [k, v] : entry.local_dead_hash_rates.items())
+                    if (v.is_number()) total += v.get<double>();
+            result.push_back({entry.time, total, bin_width, 0});
+        }
+        else if (source == "local_share_hash_rates") {
+            result.push_back({entry.time, entry.local_hash_rates, bin_width, 0});
+        }
+        else if (source == "miner_hash_rates") {
+            result.push_back({entry.time, entry.local_hash_rates, bin_width, 0});
+        }
+        else if (source == "miner_dead_hash_rates") {
+            result.push_back({entry.time, entry.local_dead_hash_rates, bin_width, 0});
+        }
+        else if (source == "current_payout") {
+            result.push_back({entry.time, entry.current_payout, bin_width, 0});
+        }
+        else if (source == "current_payouts") {
+            result.push_back({entry.time, entry.current_payouts, bin_width, 0});
+        }
+        else if (source == "merged_current_payouts") {
+            result.push_back({entry.time, entry.merged_current_payouts, bin_width, 0});
+        }
+        else if (source == "peers") {
+            result.push_back({entry.time, entry.peers, bin_width, 0});
+        }
+        else if (source == "desired_version_rates") {
+            result.push_back({entry.time, entry.desired_versions, bin_width, 0});
+        }
+        else if (source == "worker_count") {
+            result.push_back({entry.time, entry.worker_count, bin_width, 0});
+        }
+        else if (source == "unique_miner_count") {
+            result.push_back({entry.time, entry.miner_count, bin_width, 0});
+        }
+        else if (source == "connected_miners") {
+            result.push_back({entry.time, entry.connected_count, bin_width, 0});
+        }
+        else if (source == "traffic_rate") {
+            result.push_back({entry.time, entry.traffic, bin_width, 0});
+        }
+        else if (source == "getwork_latency") {
+            result.push_back({entry.time, entry.work_latency, bin_width, 0});
+        }
+        else if (source == "memory_usage") {
+            result.push_back({entry.time, entry.memory_usage, bin_width, 0});
+        }
+        else if (source == "network_difficulty") {
+            // Per-entry historical snapshot (fixes the flat-line bug where every
+            // point back-filled the current atomic). 0 = honest-absent.
+            result.push_back({entry.time, entry.network_difficulty, bin_width, 0});
+        }
+        else if (source == "share_difficulty") {
+            // Real share (vardiff) difficulty trend; honest-absent 0.
+            result.push_back({entry.time, entry.share_difficulty, bin_width, 0});
+        }
+        else {
+            // Honest-absent: an UNKNOWN source name emits NOTHING rather than a
+            // fabricated zero bucket. The old `push_back({time, 0.0, ...})` made
+            // every unrecognised series (e.g. a mistyped "pool_rate" before the
+            // alias above) return one all-zero point per stat_log entry, which
+            // reads identically to a genuinely dead graph on a healthy node --
+            // an instrument that cannot be distinguished from the failure it is
+            // meant to detect. Skipping yields an empty array the frontend
+            // renders as "no data" instead of a false flat-zero trend.
+            continue;
+        }
+    }
+    return result;
+}
+
+// ──────────── Difficulty tracking and stat log helpers ────────────────────
+
+// #922: restart the round-level best-share tracker at a block-found boundary.
+// all_time.* and session.* are deliberately preserved -- only the round leg is
+// cleared and its start timestamp advanced. Shared-core by necessity: the round
+// counters live on the core MiningInterface (m_best_difficulty) and are fed by
+// the core record_share_difficulty path, so the reset must fire from the same
+// core record_found_block that every coin already calls -- there is no per-coin
+// surface that could do it without duplicating the logic in each main_<coin>.
+void MiningInterface::reset_best_difficulty_round(uint64_t ts)
+{
+    if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
+    std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+    // Primary-chain round leg.
+    m_best_difficulty.round = 0.0;
+    m_best_difficulty.miner.clear();
+    m_best_difficulty.hash.clear();
+    m_best_difficulty.timestamp = 0;
+    m_best_difficulty.round_start = ts;
+    // Merged (aux) round leg shares the same sharechain -> same boundary. A
+    // node without merged mining leaves these at 0, so this is a no-op there.
+    m_best_difficulty.merged_round = 0.0;
+    m_best_difficulty.merged_round_miner.clear();
+    m_best_difficulty.merged_round_ts = 0;
+    m_best_difficulty.merged_round_start = ts;
+}
+
+void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner,
+                                              const std::string& share_hash)
+{
+    // Feed the rolling-hashrate ring. Independent of the best-diff
+    // tracking below; the ring has its own internal lock.
+    m_hashrate_ring.record(miner, difficulty,
+        static_cast<int64_t>(std::time(nullptr)));
+
+    // #159 (G8): count accepted local shares for the per-interval 'shares'
+    // series that update_stat_log diffs into the /web/log graph. This is the
+    // per-accepted-share choke point (it already feeds the ring + best-diff);
+    // display/telemetry only, touches no share/consensus/reward path.
+    m_stat_shares_cum.fetch_add(1, std::memory_order_relaxed);
+
+    // Snapshot the latest real share difficulty for the share-difficulty trend
+    // line (fallback for coins whose sharechain stats omit min_difficulty).
+    // This is the true vardiff target, not an approximation.
+    if (difficulty > 0)
+        m_recent_share_difficulty.store(difficulty, std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+    auto now_ts = static_cast<uint64_t>(std::time(nullptr));
+    if (difficulty > m_best_difficulty.all_time) {
+        m_best_difficulty.all_time = difficulty;
+        m_best_difficulty.all_time_miner = miner;
+        m_best_difficulty.all_time_hash = share_hash;
+        m_best_difficulty.all_time_ts = now_ts;
+    }
+    if (difficulty > m_best_difficulty.session) {
+        m_best_difficulty.session = difficulty;
+        m_best_difficulty.session_miner = miner;
+        m_best_difficulty.session_hash = share_hash;
+        m_best_difficulty.session_ts = now_ts;
+    }
+    if (difficulty > m_best_difficulty.round) {
+        m_best_difficulty.round = difficulty;
+        m_best_difficulty.miner = miner;
+        m_best_difficulty.hash = share_hash;
+        m_best_difficulty.timestamp = now_ts;
+    }
+}
+
+void MiningInterface::record_merged_share_difficulty(double difficulty, const std::string& miner)
+{
+    std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+    auto now_ts = static_cast<uint64_t>(std::time(nullptr));
+    if (difficulty > m_best_difficulty.merged_all_time) {
+        m_best_difficulty.merged_all_time = difficulty;
+        m_best_difficulty.merged_all_time_miner = miner;
+        m_best_difficulty.merged_all_time_ts = now_ts;
+    }
+    if (difficulty > m_best_difficulty.merged_round) {
+        m_best_difficulty.merged_round = difficulty;
+        m_best_difficulty.merged_round_miner = miner;
+        m_best_difficulty.merged_round_ts = now_ts;
+    }
+}
+
+void MiningInterface::update_stat_log()
+{
+    StatLogEntry entry;
+    entry.time = static_cast<double>(std::time(nullptr));
+
+    // Pool hash rate — use p2pool-correct callback (safe, runs on ioc thread)
+    entry.pool_hash_rate = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
+
+    // ── Frozen-estimator ingest guard (see header) ───────────────────────────
+    // Runs BEFORE desired_versions is derived below (dv[ver] = phr * pct), so
+    // zeroing a frozen sample here keeps the derived series clean too. The
+    // frozen 48.96 TH/s rectangle on dash.voidbind.com was exactly this: a
+    // stuck estimator value recorded verbatim for 15 h and persisted, still
+    // rendering after the estimator itself was fixed.
+    {
+        const double raw_phr = entry.pool_hash_rate;
+        if (raw_phr != 0.0 && raw_phr == m_phr_freeze_last) {
+            ++m_phr_freeze_run;
+        } else {
+            m_phr_freeze_last = raw_phr;
+            m_phr_freeze_run = 1;
+            m_phr_freeze_logged = false;
+        }
+        if (raw_phr != 0.0 && m_phr_freeze_run > kMaxIdenticalPoolRateRun) {
+            if (!m_phr_freeze_logged) {
+                LOG_WARNING << "[StatLog] pool_hash_rate frozen at " << raw_phr
+                            << " for " << m_phr_freeze_run
+                            << " consecutive samples — recording honest-absent 0"
+                               " until it moves (frozen-estimator guard)";
+                m_phr_freeze_logged = true;
+            }
+            entry.pool_hash_rate = 0.0;
+        }
+    }
+
+    // Periodic network difficulty sample for graph
+    double cur_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    if (cur_diff > 0)
+        add_netdiff_sample(cur_diff, "periodic");
+
+    // Pool stale proportion from sharechain orphan+dead counts
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        int ts = sc.value("total_shares", 0);
+        int os = sc.value("orphan_shares", 0);
+        int ds = sc.value("dead_shares", 0);
+        int st = os + ds;
+        entry.pool_stale_prop = (ts > 0) ? static_cast<double>(st) / ts : 0.0;
+    } else {
+        entry.pool_stale_prop = 0.0;
+    }
+
+    // Local hash rates by address — from stratum worker registry
+    // Matches p2pool: worker_count = unique address.worker combos,
+    // unique_miner_count = unique base addresses,
+    // connected_miners = raw stratum TCP connections.
+    entry.local_hash_rates = nlohmann::json::object();
+    entry.local_dead_hash_rates = nlohmann::json::object();
+    uint64_t cur_stale_cum = 0;  // #159 (G8): cumulative per-worker stale count
+    {
+        auto workers = effective_stratum_workers();
+        entry.connected_count = static_cast<int>(workers.size());  // raw TCP connections
+        std::set<std::string> worker_combos;
+        for (const auto& [sid, w] : workers) {
+            std::string combo = w.username;
+            if (!w.worker_name.empty()) combo += "." + w.worker_name;
+            worker_combos.insert(combo);
+            cur_stale_cum += w.stale;  // sum the same per-worker counters getstats sums
+        }
+        // Hash-rate series: source from the RateMonitor (windowed, p2pool-correct
+        // get_local_rates), NOT the per-session WorkerInfo.hashrate estimate. The
+        // per-session field is updated only on pseudoshare-accept and always
+        // carries dead=0, which rendered the local-hashrate history graph flat/zero
+        // on live prod. Fall back to the per-session sum only if the seam is unset.
+        if (m_local_rates_fn) {
+            auto [rates, dead_rates] = m_local_rates_fn();
+            for (const auto& [user, hr] : rates)
+                entry.local_hash_rates[user] = hr;
+            for (const auto& [user, dhr] : dead_rates)
+                entry.local_dead_hash_rates[user] = dhr;
+        } else {
+            for (const auto& [sid, w] : workers) {
+                double existing = entry.local_hash_rates.value(w.username, 0.0);
+                entry.local_hash_rates[w.username] = existing + w.hashrate;
+                double existing_dead = entry.local_dead_hash_rates.value(w.username, 0.0);
+                entry.local_dead_hash_rates[w.username] = existing_dead + w.dead_hashrate;
+            }
+        }
+        entry.miner_count = static_cast<int>(entry.local_hash_rates.size());
+        entry.worker_count = static_cast<int>(worker_combos.size());
+    }
+
+    // unique_miner_count fallback for the daemonless relay: with 0 local stratum
+    // workers the local registry is empty, but the pool still has miners — the
+    // distinct sharechain payout addresses. Use the SAME count /global_stats
+    // reports as unique_miners (shares_by_miner.size()) so the graph matches the
+    // live card. Only when the local registry is genuinely empty; a hotel node
+    // with local rigs keeps its byte-identical local count. connected_miners /
+    // worker_count / local_hash_rate stay local-scoped (0 is the truth there).
+    if (entry.miner_count == 0 && m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object())
+            entry.miner_count = static_cast<int>(sc["shares_by_miner"].size());
+    }
+
+    // #159 (G8): real per-interval share / stale-share counters (were hardcoded
+    // to 0, persisting 31 days of a dead series). 'shares' diffs the cumulative
+    // accepted-share counter; 'stale_shares' diffs the summed per-worker stale
+    // counter. Both clamp to 0 because the cumulative sources can DROP between
+    // ticks (worker stale counts vanish when a stratum session unregisters).
+    // Deviation from p2pool (documented): p2pool's /web/log stores cumulative
+    // get_stale_counts values; c2pool's own frontend is the only consumer, so a
+    // per-interval delta is the more useful series here.
+    {
+        uint64_t cur_shares_cum = m_stat_shares_cum.load(std::memory_order_relaxed);
+        entry.shares = (cur_shares_cum >= m_stat_shares_prev)
+                           ? (cur_shares_cum - m_stat_shares_prev) : 0;
+        entry.stale_shares = (cur_stale_cum >= m_stat_stale_prev)
+                                 ? (cur_stale_cum - m_stat_stale_prev) : 0;
+        m_stat_shares_prev = cur_shares_cum;
+        m_stat_stale_prev = cur_stale_cum;
+    }
+
+    // Current payout
+    entry.current_payout = 0.0;
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm && pm->has_pplns_data() && !m_payout_address.empty()) {
+        uint64_t subsidy = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (!m_cached_template.is_null())
+                subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+        }
+        if (subsidy > 0) {
+            auto outputs = pm->calculate_pplns_outputs(subsidy);
+            auto script = address_to_script(m_payout_address);
+            if (!script.empty()) {
+                for (const auto& [scr, amt] : outputs) {
+                    if (scr == script) {
+                        entry.current_payout = static_cast<double>(amt) / 1e8;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Peers — use P2P peer info callback for accurate counts
+    int incoming = 0, outgoing = 0;
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array()) {
+            for (const auto& p : pi) {
+                if (p.value("incoming", false)) ++incoming;
+                else ++outgoing;
+            }
+        }
+    } else if (m_node) {
+        outgoing = static_cast<int>(m_node->get_connected_peers_count());
+    }
+    entry.peers = {{"incoming", incoming}, {"outgoing", outgoing}};
+
+    // Current payouts per address
+    entry.current_payouts = nlohmann::json::object();
+    {
+        auto cached = get_cached_pplns_outputs();
+        // Chain-aware address encoding. The legacy is_ltc bool overload
+        // only covers LTC/BTC version bytes; Dash needs 76/16 mainnet,
+        // 140/19 testnet. Pick the right pair per blockchain so graph_db
+        // samples carry human-readable addresses (not Bitcoin fallback
+        // encodings). Parity-audit D-tier followup shipped alongside C2.
+        auto [p2pkh_ver, p2sh_ver, hrp] = [&]()
+            -> std::tuple<uint8_t, uint8_t, std::string>
+        {
+            switch (m_blockchain) {
+            case Blockchain::LITECOIN:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0xc4, "tltc")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(0x30, 0x32, "ltc");
+            case Blockchain::DASH:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(140, 19, "")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(76, 16, "");
+            case Blockchain::DOGECOIN:
+                // Dogecoin mainnet version bytes (address_validator.cpp:163):
+                // D addresses p2pkh=30, 9/A p2sh=22, no bech32 HRP. Without
+                // this a primary-DOGE node fell to the Bitcoin default and
+                // surfaced payout addresses with the wrong (BTC) version bytes.
+                return std::make_tuple<uint8_t, uint8_t, std::string>(30, 22, "");
+            case Blockchain::BITCOIN:
+            default:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0xc4, "tb")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(0x00, 0x05, "bc");
+            }
+        }();
+        for (const auto& [script_hex, amount] : cached) {
+            auto script_bytes = ParseHex(script_hex);
+            std::string addr = core::script_to_address(script_bytes, hrp, p2pkh_ver, p2sh_ver);
+            if (addr.empty()) addr = script_hex;
+            double coin_amt = static_cast<double>(amount) / 1e8;
+            if (entry.current_payouts.contains(addr))
+                coin_amt += entry.current_payouts[addr].get<double>();
+            entry.current_payouts[addr] = coin_amt;
+        }
+    }
+
+    // Merged current payouts per miner (DOGE amounts keyed by LTC address)
+    // Consistent with current_payouts: every miner in the LTC PPLNS gets a
+    // proportional share of the DOGE subsidy.  This mirrors the LTC payout
+    // distribution so both graphs always show data for the same addresses.
+    entry.merged_current_payouts = nlohmann::json::object();
+    if (m_mm_manager && !entry.current_payouts.empty()) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        for (const auto& ci : chain_infos) {
+            if (ci.coinbase_value == 0) continue;
+            double doge_subsidy = static_cast<double>(ci.coinbase_value) / 1e8;
+            // Sum total LTC payouts to compute each miner's fraction
+            double total_ltc = 0;
+            for (auto& [addr, val] : entry.current_payouts.items())
+                if (val.is_number()) total_ltc += val.get<double>();
+            if (total_ltc <= 0) continue;
+            for (auto& [addr, val] : entry.current_payouts.items()) {
+                if (!val.is_number()) continue;
+                double ltc_amt = val.get<double>();
+                if (ltc_amt <= 0) continue;
+                double doge_amt = doge_subsidy * (ltc_amt / total_ltc);
+                double existing = entry.merged_current_payouts.value(addr, 0.0);
+                entry.merged_current_payouts[addr] = existing + doge_amt;
+            }
+        }
+    }
+
+    // Desired version rates — p2pool: {version_str: hashrate}
+    // Uses desired_version (what miners signal they want) not share version (what's in the chain)
+    entry.desired_versions = nlohmann::json::object();
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("shares_by_desired_version") && sc["shares_by_desired_version"].is_object()) {
+            int total = sc.value("total_shares", 1);
+            for (auto& [ver, count] : sc["shares_by_desired_version"].items()) {
+                double pct = (total > 0) ? count.get<double>() / total : 0.0;
+                entry.desired_versions[ver] = entry.pool_hash_rate * pct;
+            }
+        }
+    }
+
+    double share_diff = m_network_difficulty.load(std::memory_order_relaxed) / 65536.0; // approx
+    entry.attempts_to_share = share_diff * 4294967296.0;
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    entry.attempts_to_block = net_diff * 4294967296.0;
+
+    // Historize the chain difficulty at THIS sample time so the graph plots a
+    // real trend instead of back-filling the current atomic across every point
+    // (the flat-line bug). 0 until the first work update populates it.
+    entry.network_difficulty = net_diff;
+
+    // Real share (vardiff) difficulty for the share-vs-network trend line.
+    // Priority: the sharechain published min_difficulty (the p2pool share
+    // target that vardiff retargets), then the last recorded real share diff,
+    // else honest-absent 0. Never the net/65536 approximation.
+    double real_share_diff = 0.0;
+    if (m_sharechain_stats_fn) {
+        auto scd = m_sharechain_stats_fn();
+        if (scd.contains("min_difficulty") && scd["min_difficulty"].is_number()
+            && scd["min_difficulty"].get<double>() > 0.0)
+            real_share_diff = scd["min_difficulty"].get<double>();
+    }
+    if (real_share_diff <= 0.0)
+        real_share_diff = m_recent_share_difficulty.load(std::memory_order_relaxed);
+    entry.share_difficulty = real_share_diff;
+
+    // Block value
+    entry.block_value = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null())
+            entry.block_value = m_cached_template.value("coinbasevalue", uint64_t(0)) / 1e8;
+    }
+
+    // Memory usage (RSS)
+    entry.memory_usage = 0;
+#ifdef _WIN32
+    // Windows: use GetProcessMemoryInfo if needed (optional, skip for now)
+#else
+    {
+        std::ifstream statm("/proc/self/statm");
+        if (statm) {
+            long pages = 0;
+            statm >> pages; // first field is total, second is RSS
+            statm >> pages;
+            entry.memory_usage = static_cast<double>(pages) * sysconf(_SC_PAGESIZE);
+        }
+    }
+#endif
+
+    // Work latency (template build time in seconds, matching p2pool getwork_latency)
+    entry.work_latency = m_last_work_latency.load(std::memory_order_relaxed) / 1000.0;
+
+    // Traffic rate (B/s) — diff global byte counters since last sample
+    {
+        static uint64_t prev_recv = 0, prev_sent = 0;
+        static double prev_time = 0;
+        uint64_t cur_recv = core::Socket::g_bytes_recv.load(std::memory_order_relaxed);
+        uint64_t cur_sent = core::Socket::g_bytes_sent.load(std::memory_order_relaxed);
+        double dt = (prev_time > 0) ? (entry.time - prev_time) : 1.0;
+        if (dt < 1.0) dt = 1.0;
+        entry.traffic = {
+            {"incoming", static_cast<double>(cur_recv - prev_recv) / dt},
+            {"outgoing", static_cast<double>(cur_sent - prev_sent) / dt}
+        };
+        prev_recv = cur_recv;
+        prev_sent = cur_sent;
+        prev_time = entry.time;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+        m_stat_log.push_back(entry);
+        // Keep rolling 31-day window to support last_month graph view
+        // (p2pool DataStream keeps up to last_year; we match last_month)
+        double cutoff = entry.time - 2678400.0;  // 31 days
+        while (!m_stat_log.empty() && m_stat_log.front().time < cutoff)
+            m_stat_log.erase(m_stat_log.begin());
+    }
+
+    // G4: fan the fresh entry into the binned history DB (last_week/month/year).
+    // Done AFTER releasing m_stat_log_mutex so the two locks never couple. The
+    // history DB has its own mutex. One datum per 60s tick — no new timer.
+    {
+        std::lock_guard<std::mutex> hlock(m_history_mutex);
+        feed_history_entry(entry);
+        m_views_watermark = entry.time;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// G4: year-scale binned graph history (p2pool util/graph.py port)
+// ════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// nlohmann {key: number} object -> std::map<string,double>, skipping non-numbers.
+std::map<std::string, double> json_obj_to_map(const nlohmann::json& j)
+{
+    std::map<std::string, double> out;
+    if (j.is_object())
+        for (auto it = j.begin(); it != j.end(); ++it)
+            if (it.value().is_number())
+                out[it.key()] = it.value().get<double>();
+    return out;
+}
+
+double json_obj_sum(const nlohmann::json& j)
+{
+    double s = 0.0;
+    if (j.is_object())
+        for (auto& [k, v] : j.items())
+            if (v.is_number()) s += v.get<double>();
+    return s;
+}
+
+}  // namespace
+
+std::vector<std::pair<std::string, core::graph::DataStreamDescription>>
+MiningInterface::graph_stream_descriptions()
+{
+    using core::graph::DataViewDescription;
+    using core::graph::DataStreamDescription;
+
+    // The five p2pool horizons. last_hour/last_day are maintained in the DB for
+    // completeness but SERVED from the flat log; last_week/month/year are served
+    // from these bins. last_year = 365.25d / 300 bins (p2pool-exact).
+    const std::vector<std::pair<std::string, DataViewDescription>> views = {
+        {"last_hour",  DataViewDescription(150, 60.0 * 60.0)},
+        {"last_day",   DataViewDescription(300, 60.0 * 60.0 * 24.0)},
+        {"last_week",  DataViewDescription(300, 60.0 * 60.0 * 24.0 * 7.0)},
+        {"last_month", DataViewDescription(300, 60.0 * 60.0 * 24.0 * 30.0)},
+        {"last_year",  DataViewDescription(300, 60.0 * 60.0 * 24.0 * 365.25)},
+    };
+
+    // Every c2pool stream is a GAUGE (deliberate deviation from p2pool — the
+    // datums are pre-computed H/s rates sampled at 60s, so a bin holds their
+    // MEAN, not total/bin_width). See graph_history.hpp.
+    auto scalar = [&]() {
+        DataStreamDescription d;
+        d.dataview_descriptions = views;
+        d.is_gauge = true;
+        d.multivalues = false;
+        return d;
+    };
+    // Per-address multivalue streams are capped (review #1): p2pool's
+    // multivalues_keep=10000 makes month/year unbounded on a large pool. Cap at
+    // 200 keys with an "other" squash key. The per-address YEAR payout story
+    // (open question #14) is DEFERRED — it would reinflate exactly this bound.
+    auto multi = [&](bool undefined0, bool capped) {
+        DataStreamDescription d;
+        d.dataview_descriptions = views;
+        d.is_gauge = true;
+        d.multivalues = true;
+        d.multivalue_undefined_means_0 = undefined0;
+        if (capped) {
+            d.multivalues_keep = 200;
+            d.has_squash_key = true;
+            d.multivalues_squash_key = "other";
+        } else {
+            d.multivalues_keep = 20;  // fixed-key streams (peers, traffic): 2 keys
+        }
+        return d;
+    };
+
+    return {
+        {"pool_rates",              multi(/*undefined0=*/true,  /*capped=*/false)},
+        {"pool_hash_rate",          scalar()},
+        {"pool_stale_prop",         scalar()},
+        {"local_hash_rate",         scalar()},
+        {"local_dead_hash_rate",    scalar()},
+        {"local_share_hash_rates",  multi(true,  true)},
+        {"miner_hash_rates",        multi(false, true)},
+        {"miner_dead_hash_rates",   multi(false, true)},
+        {"current_payout",          scalar()},
+        {"current_payouts",         multi(false, true)},
+        {"merged_current_payouts",  multi(false, true)},
+        {"peers",                   multi(false, false)},
+        {"desired_version_rates",   multi(true,  true)},
+        {"worker_count",            scalar()},
+        {"unique_miner_count",      scalar()},
+        {"connected_miners",        scalar()},
+        {"traffic_rate",            multi(false, false)},
+        {"getwork_latency",         scalar()},
+        {"memory_usage",            scalar()},
+        {"network_difficulty",      scalar()},
+        {"share_difficulty",        scalar()},
+    };
+}
+
+void MiningInterface::feed_history_entry(const StatLogEntry& e)
+{
+    // Caller holds m_history_mutex.
+    const double t = e.time;
+
+    // pool_rates — SAME derivation the flat path uses at rest_web_graph_data:
+    // good = phr*(1-stale), orphan = phr*stale, dead = 0.
+    m_history.add_multi("pool_rates", t, {
+        {"good",   e.pool_hash_rate * (1.0 - e.pool_stale_prop)},
+        {"orphan", e.pool_hash_rate * e.pool_stale_prop},
+        {"dead",   0.0},
+    });
+
+    m_history.add_scalar("pool_hash_rate",       t, e.pool_hash_rate);
+    m_history.add_scalar("pool_stale_prop",      t, e.pool_stale_prop);
+    m_history.add_scalar("local_hash_rate",      t, json_obj_sum(e.local_hash_rates));
+    m_history.add_scalar("local_dead_hash_rate", t, json_obj_sum(e.local_dead_hash_rates));
+
+    m_history.add_multi("local_share_hash_rates", t, json_obj_to_map(e.local_hash_rates));
+    m_history.add_multi("miner_hash_rates",       t, json_obj_to_map(e.local_hash_rates));
+    m_history.add_multi("miner_dead_hash_rates",  t, json_obj_to_map(e.local_dead_hash_rates));
+
+    m_history.add_scalar("current_payout",        t, e.current_payout);
+    m_history.add_multi("current_payouts",        t, json_obj_to_map(e.current_payouts));
+    m_history.add_multi("merged_current_payouts", t, json_obj_to_map(e.merged_current_payouts));
+    m_history.add_multi("peers",                  t, json_obj_to_map(e.peers));
+    m_history.add_multi("desired_version_rates",  t, json_obj_to_map(e.desired_versions));
+
+    m_history.add_scalar("worker_count",       t, static_cast<double>(e.worker_count));
+    m_history.add_scalar("unique_miner_count", t, static_cast<double>(e.miner_count));
+    m_history.add_scalar("connected_miners",   t, static_cast<double>(e.connected_count));
+    m_history.add_multi ("traffic_rate",       t, json_obj_to_map(e.traffic));
+    m_history.add_scalar("getwork_latency",    t, e.work_latency);
+    m_history.add_scalar("memory_usage",       t, e.memory_usage);
+    // FAIL-SAFE: network_difficulty is honest-absent (not 0) when no work source
+    // has populated m_network_difficulty yet — e.g. a daemonless relay before the
+    // header follower publishes its first tip. Persisting a literal 0 here painted
+    // ~6 days of false zeros on the daemonless canary's netdiff graph. Skip the
+    // sample entirely on absence: no datum in the bin, never a fabricated 0. A
+    // real feed (LTC, or DASH once the follower is live) always has nd>0 here.
+    if (e.network_difficulty > 0.0)
+        m_history.add_scalar("network_difficulty", t, e.network_difficulty);
+    m_history.add_scalar("share_difficulty",   t, e.share_difficulty);
+}
+
+nlohmann::json MiningInterface::graph_view_data(const std::string& source,
+                                                const std::string& view)
+{
+    // "pool_rate" (singular) is an alias of the "pool_hash_rate" scalar, kept
+    // for wire compatibility exactly as the flat path does.
+    const std::string src = (source == "pool_rate") ? "pool_hash_rate" : source;
+    std::lock_guard<std::mutex> hlock(m_history_mutex);
+    const auto* stream = m_history.stream(src);
+    if (!stream) return nlohmann::json::array();  // honest-absent unknown source
+    const auto* dv = stream->view(view);
+    if (!dv) return nlohmann::json::array();
+    return dv->get_data(stream->desc, static_cast<double>(std::time(nullptr)));
+}
+
+void MiningInterface::save_graph_views()
+{
+    const std::string path = graph_views_path();
+    if (path.empty()) return;
+    try {
+        nlohmann::json out;
+        {
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            // Only persist once the views carry data — a half-seeded DB would
+            // store a watermark ahead of its bins and mislead the next replay.
+            if (!m_views_ready.load(std::memory_order_acquire)) return;
+            out["version"] = 1;
+            out["watermark"] = m_views_watermark;
+            out["data"] = m_history.to_obj();
+        }
+        const std::string tmp = path + ".new";
+        { std::ofstream f(tmp, std::ios::trunc); f << out.dump(); }
+        std::filesystem::rename(tmp, path);
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[GraphViews] Save failed: " << ex.what();
+    }
+}
+
+void MiningInterface::seed_graph_views_from_flat()
+{
+    // Replay the WHOLE flat log into empty views (the upgrade / corrupt-recovery
+    // path). Runs on a background thread so a live money node never blocks
+    // startup on the ~44k-entry x ~21-stream replay; week/month/year answer from
+    // the flat fallback until this completes. Any throw leaves the views empty
+    // (m_views_ready stays false) → permanent flat fallback, which is safe.
+    try {
+        std::vector<StatLogEntry> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+            snapshot = m_stat_log;   // chronological (append order)
+        }
+        double last_t = 0.0;
+        for (const auto& e : snapshot) {
+            if (m_views_seed_stop.load(std::memory_order_relaxed)) return;
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            feed_history_entry(e);
+            last_t = e.time;
+        }
+        {
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            if (last_t > m_views_watermark) m_views_watermark = last_t;
+        }
+        m_views_ready.store(true, std::memory_order_release);
+        LOG_INFO << "[GraphViews] Seeded binned views from " << snapshot.size()
+                 << " flat entries";
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[GraphViews] Seed failed (serving long views from flat "
+                       "fallback): " << ex.what();
+    }
+}
+
+void MiningInterface::load_graph_views()
+{
+    // Fully guarded (review #4): ANY failure — missing / parse error / version
+    // mismatch / geometry mismatch — degrades to seed-from-flat, and if seeding
+    // itself throws the views stay empty and week/month/year serve from the flat
+    // fallback. Never aborts load_stat_log, never crashes startup.
+    const std::string path = graph_views_path();
+    if (path.empty()) return;
+
+    // Always (re)build the schema so the compiled geometry is authoritative.
+    const auto descs = graph_stream_descriptions();
+
+    bool do_full_seed = true;   // default: no usable sidecar → seed from flat
+    if (m_flat_sanitized_on_load) {
+        // The flat log was purged of frozen-plateau runs on load; the sidecar
+        // bins were folded from the POLLUTED flat log and still carry the
+        // plateau, so adopting them would resurrect it on the long horizons.
+        // Discard the sidecar and re-seed everything from the clean flat log.
+        LOG_INFO << "[GraphViews] Flat log sanitized on load — discarding "
+                    "sidecar bins and re-seeding from the clean flat log";
+    } else try {
+        std::ifstream f(path);
+        if (f) {
+            std::string content((std::istreambuf_iterator<char>(f)),
+                                std::istreambuf_iterator<char>());
+            if (!content.empty()) {
+                auto obj = nlohmann::json::parse(content);  // throws on corrupt
+                int version = obj.is_object() ? obj.value("version", 0) : 0;
+                if (version == 1 && obj.contains("data")) {
+                    bool needs_reseed = false;
+                    auto db = core::graph::HistoryDatabase::from_obj(
+                        descs, obj["data"], needs_reseed);
+                    if (!needs_reseed) {
+                        // Clean load: adopt the bins, then incrementally replay
+                        // the flat tail strictly newer than the stored watermark
+                        // (covers a crash between the flat and .views saves).
+                        double watermark = obj.value("watermark", 0.0);
+                        std::vector<StatLogEntry> tail;
+                        {
+                            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+                            for (const auto& e : m_stat_log)
+                                if (e.time > watermark) tail.push_back(e);
+                        }
+                        {
+                            std::lock_guard<std::mutex> hlock(m_history_mutex);
+                            m_history = std::move(db);
+                            m_views_watermark = watermark;
+                            for (const auto& e : tail) {
+                                feed_history_entry(e);
+                                if (e.time > m_views_watermark)
+                                    m_views_watermark = e.time;
+                            }
+                        }
+                        m_views_ready.store(true, std::memory_order_release);
+                        do_full_seed = false;
+                        LOG_INFO << "[GraphViews] Loaded bins (watermark "
+                                 << static_cast<long long>(watermark) << ", replayed "
+                                 << tail.size() << " tail entries)";
+                    }
+                    // needs_reseed (missing view / wrong geometry) falls through
+                    // to the full seed below with fresh, correctly-shaped views.
+                }
+            }
+        }
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[GraphViews] Sidecar load failed, seeding from flat: "
+                    << ex.what();
+        do_full_seed = true;
+    }
+
+    // #159 (G6): record whether the binned DB was seeded fresh this boot. When
+    // a healthy .views sidecar was adopted (do_full_seed == false), the
+    // found-block network_difficulty fold must be skipped so persisted gauge
+    // bins are never double-counted across restarts.
+    m_views_freshly_seeded.store(do_full_seed, std::memory_order_release);
+
+    if (do_full_seed) {
+        // Fresh, correctly-shaped empty views; seed on a background thread.
+        {
+            std::lock_guard<std::mutex> hlock(m_history_mutex);
+            m_history = core::graph::HistoryDatabase::create(descs);
+            m_views_watermark = 0.0;
+        }
+        m_views_ready.store(false, std::memory_order_release);
+        if (m_views_seed_thread.joinable()) m_views_seed_thread.join();
+        m_views_seed_stop.store(false, std::memory_order_relaxed);
+        m_views_seed_thread = std::thread([this]() { seed_graph_views_from_flat(); });
+    }
+}
+
+void MiningInterface::save_stat_log()
+{
+    if (m_stat_log_path.empty()) return;
+    // Piggyback on the existing 100 s stat-log cadence (plus the clean-
+    // shutdown save): the all-time best share rides to disk with it.
+    save_best_share_all_time();
+    try {
+        // Snapshot under brief lock — copies a compact std::vector of structs.
+        // The expensive part is the JSON expansion + serialization, which we
+        // do entry-by-entry below WITHOUT the lock so HTTP endpoints reading
+        // m_stat_log don't block on disk I/O. Previously this function held
+        // the lock while building a giant in-memory nlohmann::json array of
+        // every entry, then dumped it — heaptrack on contabo identified that
+        // path as a top peak consumer (60+ MB transient per 100s save call,
+        // contributing to heap fragmentation and observed RSS growth).
+        std::vector<StatLogEntry> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+            snapshot = m_stat_log;
+        }
+        // Stream-dump: peak transient memory is one entry's JSON, not all of them.
+        std::string tmp = m_stat_log_path + ".new";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            f << '[';
+            bool first = true;
+            for (const auto& e : snapshot) {
+                if (!first) f << ',';
+                first = false;
+                nlohmann::json one = {
+                    {"t", e.time}, {"phr", e.pool_hash_rate}, {"psp", e.pool_stale_prop},
+                    {"lhr", e.local_hash_rates}, {"ldhr", e.local_dead_hash_rates},
+                    {"wc", e.worker_count}, {"mc", e.miner_count}, {"cc", e.connected_count},
+                    {"sh", e.shares}, {"st", e.stale_shares},
+                    {"cp", e.current_payout}, {"cps", e.current_payouts},
+                    {"mcp", e.merged_current_payouts},
+                    {"pe", e.peers}, {"dv", e.desired_versions},
+                    {"as", e.attempts_to_share}, {"ab", e.attempts_to_block},
+                    {"bv", e.block_value}, {"mu", e.memory_usage},
+                    {"wl", e.work_latency}, {"tr", e.traffic},
+                    {"nd", e.network_difficulty}, {"sd", e.share_difficulty}
+                };
+                f << one.dump();
+            }
+            f << ']';
+            f.flush();
+        }
+        std::filesystem::rename(tmp, m_stat_log_path);
+        LOG_INFO << "[StatLog] Saved " << snapshot.size() << " entries to " << m_stat_log_path;
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[StatLog] Save failed: " << ex.what();
+    }
+
+    // G4: persist the binned views AFTER the flat file (review-mandated order).
+    // The stored watermark can then never exceed the flat file's newest entry,
+    // so the strict t>watermark replay on load is provably double-count-free and
+    // the crash window is bounded to flat-newer-than-views (absorbed by replay).
+    save_graph_views();
+}
+
+std::size_t MiningInterface::sanitize_frozen_pool_rate_runs()
+{
+    // Caller holds m_stat_log_mutex. Zero pool_hash_rate across any run of
+    // MORE THAN kMaxIdenticalPoolRateRun consecutive bit-identical nonzero
+    // samples — the ingest guard caps new runs at exactly the threshold, so a
+    // longer persisted run can only be pre-guard frozen-estimator pollution
+    // (live data's legitimate identical-run ceiling is 4 at the 60 s cadence).
+    // desired_versions is derived from the frozen value (dv[ver] = phr * pct),
+    // so every numeric dv in a sanitized entry is fabricated too — zero it.
+    std::size_t changed = 0;
+    const std::size_t n = m_stat_log.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const double v = m_stat_log[i].pool_hash_rate;
+        std::size_t j = i + 1;
+        if (v != 0.0) {
+            while (j < n && m_stat_log[j].pool_hash_rate == v) ++j;
+            if (j - i > static_cast<std::size_t>(kMaxIdenticalPoolRateRun)) {
+                for (std::size_t k = i; k < j; ++k) {
+                    auto& e = m_stat_log[k];
+                    e.pool_hash_rate = 0.0;
+                    if (e.desired_versions.is_object())
+                        for (auto& kv : e.desired_versions.items())
+                            if (kv.value().is_number())
+                                kv.value() = 0.0;
+                    ++changed;
+                }
+            }
+        }
+        i = j;
+    }
+    return changed;
+}
+
+void MiningInterface::load_stat_log()
+{
+    if (m_stat_log_path.empty()) return;
+    // Flat-log load is wrapped in an IIFE so its early returns (missing/empty/
+    // malformed file) skip ONLY the flat parse — load_best_share_all_time and
+    // load_graph_views below must always run, including on a first boot where no
+    // flat file exists yet (that is exactly when the views seed themselves).
+    [&]() {
+      try {
+        std::ifstream f(m_stat_log_path);
+        if (!f) return;
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (content.empty()) return;
+        auto arr = nlohmann::json::parse(content);
+        if (!arr.is_array()) return;
+
+        auto now = std::time(nullptr);
+        double cutoff = static_cast<double>(now) - 2678400.0;  // keep 31 days
+
+        std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+        for (const auto& j : arr) {
+            StatLogEntry e;
+            e.time = j.value("t", 0.0);
+            if (e.time < cutoff) continue;  // discard stale entries
+            e.pool_hash_rate = j.value("phr", 0.0);
+            e.pool_stale_prop = j.value("psp", 0.0);
+            e.local_hash_rates = j.value("lhr", nlohmann::json::object());
+            e.local_dead_hash_rates = j.value("ldhr", nlohmann::json::object());
+            e.worker_count = j.value("wc", 0);
+            e.miner_count = j.value("mc", 0);
+            e.connected_count = j.value("cc", 0);
+            e.shares = j.value("sh", uint64_t(0));
+            e.stale_shares = j.value("st", uint64_t(0));
+            e.current_payout = j.value("cp", 0.0);
+            e.current_payouts = j.value("cps", nlohmann::json::object());
+            e.merged_current_payouts = j.value("mcp", nlohmann::json::object());
+            e.peers = j.value("pe", nlohmann::json::object());
+            e.desired_versions = j.value("dv", nlohmann::json::object());
+            e.attempts_to_share = j.value("as", 0.0);
+            e.attempts_to_block = j.value("ab", 0.0);
+            e.block_value = j.value("bv", 0.0);
+            e.memory_usage = j.value("mu", 0.0);
+            e.work_latency = j.value("wl", 0.0);
+            e.traffic = j.value("tr", nlohmann::json::object());
+            e.network_difficulty = j.value("nd", 0.0);
+            e.share_difficulty = j.value("sd", 0.0);
+            m_stat_log.push_back(std::move(e));
+        }
+        // ── Load-time frozen-run sanitizer (see header) ──────────────────────
+        // Self-heals stores polluted before the ingest guard existed: the guard
+        // caps NEW identical runs at exactly kMaxIdenticalPoolRateRun, so any
+        // longer persisted run can only be pre-guard pollution.
+        const std::size_t sanitized = sanitize_frozen_pool_rate_runs();
+        if (sanitized > 0) {
+            m_flat_sanitized_on_load = true;
+            LOG_WARNING << "[StatLog] Sanitized " << sanitized
+                        << " frozen pool_hash_rate samples on load "
+                           "(frozen-estimator plateau purge)";
+        }
+        LOG_INFO << "[StatLog] Loaded " << m_stat_log.size() << " entries from " << m_stat_log_path;
+      } catch (const std::exception& ex) {
+        LOG_WARNING << "[StatLog] Load failed: " << ex.what();
+      }
+    }();
+
+    // #159 (G7): rehydrate the per-miner HashrateRing from the restored stat_log
+    // lhr (per-address H/s, 60s cadence) so the per-miner sparkline is not blank
+    // for ~1h after a restart. The ring stores raw shares; the aggregate rate it
+    // reports is sum(difficulty)*2^32/elapsed, so a 60s sample at rate `hps`
+    // reconstructs to a synthetic difficulty of hps*dt/2^32 — restoring both the
+    // aggregate number and the bucketed shape. Display-only; fully crash-safe
+    // (any parse issue on a single field is skipped, never throws out).
+    try {
+        std::vector<StatLogEntry> recent;
+        {
+            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+            const double cutoff =
+                static_cast<double>(std::time(nullptr)) - HashrateRing::kWindowSec;
+            for (const auto& e : m_stat_log)          // chronological (append order)
+                if (e.time > cutoff) recent.push_back(e);
+        }
+        double prev_t = 0.0;
+        for (const auto& e : recent) {
+            // dt to the previous sample, clamped to [1,300]s; default 60 for the
+            // first sample in the window (matches the update_stat_log cadence).
+            double dt = (prev_t > 0.0) ? (e.time - prev_t) : 60.0;
+            if (dt < 1.0) dt = 1.0;
+            if (dt > 300.0) dt = 300.0;
+            prev_t = e.time;
+            if (!e.local_hash_rates.is_object()) continue;
+            for (auto it = e.local_hash_rates.begin();
+                 it != e.local_hash_rates.end(); ++it) {
+                if (!it.value().is_number()) continue;
+                const double hps = it.value().get<double>();
+                if (!(hps > 0.0)) continue;
+                const double diff =
+                    hps * dt / HashrateRing::kHashesPerDifficultyShare;
+                if (diff > 0.0)
+                    m_hashrate_ring.record(it.key(), diff,
+                                           static_cast<int64_t>(e.time));
+            }
+        }
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[StatLog] Ring rehydrate failed: " << ex.what();
+    }
+
+    load_best_share_all_time();
+
+    // G4: load (or seed) the binned graph views. Runs AFTER the flat log is in
+    // memory so the seed/replay migration can read m_stat_log. Fully guarded:
+    // any failure degrades to serving week/month/year from the flat fallback and
+    // never aborts load_stat_log or crashes startup.
+    load_graph_views();
+}
+
+// ── ALL-TIME best share: survives restarts ──────────────────────────────
+// Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+// best_share reported all_time == session == round because the all-time leg
+// lived only in memory — every restart re-founded "all time", and the card
+// silently redefined the word. Only the all-time leg is persisted: session
+// and round are honestly per-process / per-round and must reset.
+void MiningInterface::save_best_share_all_time()
+{
+    const std::string path = best_share_db_path();
+    if (path.empty()) return;
+    nlohmann::json j;
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        if (m_best_difficulty.all_time <= 0.0) return;   // nothing measured
+        j = {{"difficulty", m_best_difficulty.all_time},
+             {"miner", m_best_difficulty.all_time_miner},
+             {"hash", m_best_difficulty.all_time_hash},
+             {"ts", m_best_difficulty.all_time_ts}};
+    }
+    try {
+        const std::string tmp = path + ".new";
+        { std::ofstream f(tmp, std::ios::trunc); f << j.dump(); }
+        std::rename(tmp.c_str(), path.c_str());
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[BestShare] Save failed: " << ex.what();
+    }
+}
+
+void MiningInterface::load_best_share_all_time()
+{
+    const std::string path = best_share_db_path();
+    if (path.empty()) return;
+    try {
+        std::ifstream f(path);
+        if (!f) return;
+        auto j = nlohmann::json::parse(std::string(
+            (std::istreambuf_iterator<char>(f)),
+            std::istreambuf_iterator<char>()));
+        const double d = j.value("difficulty", 0.0);
+        if (d <= 0.0) return;
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        // Only ever RAISE: a persisted record must never overwrite a better
+        // share found before the load ran.
+        if (d > m_best_difficulty.all_time) {
+            m_best_difficulty.all_time       = d;
+            m_best_difficulty.all_time_miner = j.value("miner", std::string());
+            m_best_difficulty.all_time_hash  = j.value("hash", std::string());
+            m_best_difficulty.all_time_ts    = j.value("ts", uint64_t(0));
+            LOG_INFO << "[BestShare] all-time best RESTORED: difficulty=" << d
+                     << " miner=" << m_best_difficulty.all_time_miner
+                     << " — the card's 'all time' now actually spans restarts";
+        }
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[BestShare] Load failed: " << ex.what();
+    }
+}
+
+void MiningInterface::set_pool_fee_percent(double fee_percent)
+{
+    m_pool_fee_percent = fee_percent;
+}
+
+// Extract hash160 from any address type and return the address category.
+
+// address_to_hash160, hash160_to_merged_script, is_address_for_chain,
+// address_to_script moved to address_utils.cpp
+
+void MiningInterface::set_node_fee_from_address(double percent, const std::string& address)
+{
+    auto script = address_to_script(address);
+    if (script.empty()) {
+        LOG_WARNING << "set_node_fee_from_address: invalid address " << address;
+        return;
+    }
+    set_node_fee(percent, script);
+    m_node_fee_address = address;
+}
+
+void MiningInterface::set_donation_script_from_address(const std::string& address)
+{
+    auto script = address_to_script(address);
+    if (script.empty()) return;
+    set_donation_script(script);
+}
+
+nlohmann::json MiningInterface::mining_subscribe(const std::string& user_agent, const std::string& request_id)
+{
+    LOG_INFO << "Stratum mining.subscribe from: " << user_agent;
+    
+    // Return stratum subscription response
+    return nlohmann::json::array({
+        nlohmann::json::array({"mining.notify", "subscription_id_1"}),
+        "extranonce1",
+        0 // extranonce2_size = 0 (p2pool per-connection coinbase)
+    });
+}
+
+nlohmann::json MiningInterface::mining_authorize(const std::string& username, const std::string& password, const std::string& request_id)
+{
+    LOG_INFO << "Stratum mining.authorize for user: " << username;
+    
+    // Validate the username as a payout address for the configured blockchain/network
+    if (!is_valid_address(username)) {
+        std::string blockchain_name = m_address_validator.get_blockchain_name(m_blockchain);
+        LOG_WARNING << "Authorization failed: Invalid address for " 
+                   << blockchain_name << " " 
+                   << (m_testnet ? "testnet" : "mainnet") << ": " << username;
+        
+        nlohmann::json error_response;
+        error_response["result"] = false;
+        error_response["error"] = {
+            {"code", -1},
+            {"message", "Invalid payout address for " + blockchain_name + 
+                       " " + (m_testnet ? "testnet" : "mainnet")}
+        };
+        return error_response;
+    }
+    
+    LOG_INFO << "Authorization successful for address: " << username;
+    return true;
+}
+
+nlohmann::json MiningInterface::mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id,
+    const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses,
+    const JobSnapshot* job)
+{
+    LOG_TRACE << "[Stratum] mining.submit " << username << " job=" << job_id
+              << " nonce=" << nonce << " en2=" << extranonce2;
+    
+    // Basic share validation
+    bool share_valid = true;
+    
+    // Validate hex parameters
+    if (extranonce2.empty() || ntime.empty() || nonce.empty()) {
+        LOG_WARNING << "Invalid share parameters from " << username;
+        return false;
+    }
+    
+    // Validate nonce format (should be 8 hex chars)
+    if (nonce.length() != 8) {
+        LOG_WARNING << "Invalid nonce length from " << username << ": " << nonce;
+        return false;
+    }
+    
+    // Validate extranonce2 format
+    if (extranonce2.length() != 8) {
+        LOG_WARNING << "Invalid extranonce2 length from " << username << ": " << extranonce2;
+        return false;
+    }
+    
+    // Validate timestamp format (should be 8 hex chars)
+    if (ntime.length() != 8) {
+        LOG_WARNING << "Invalid ntime length from " << username << ": " << ntime;
+        return false;
+    }
+    
+    // Calculate share difficulty
+    double share_difficulty = calculate_share_difficulty(job_id, extranonce1, extranonce2, ntime, nonce);
+    
+    if (m_solo_mode) {
+        // Solo mining mode - work directly with blockchain
+        LOG_INFO << "Solo mining share from " << username << " (difficulty: " << share_difficulty << ")";
+        
+        // In solo mode, check if share meets network difficulty for block submission
+        std::string payout_address = m_solo_address.empty() ? username : m_solo_address;
+        
+        // Calculate payout allocation if we have a payout manager
+        if (m_payout_manager_ptr) {
+            // Simulate block reward for calculation (25 LTC = 2500000000 satoshis)
+            uint64_t block_reward = 2500000000; // 25 LTC in satoshis
+            auto allocation = m_payout_manager_ptr->calculate_payout(block_reward);
+            
+            if (allocation.is_valid()) {
+                LOG_INFO << "Solo mining payout allocation:";
+                LOG_INFO << "  Miner (" << payout_address << "): " << allocation.miner_percent << "% = " << allocation.miner_amount << " satoshis";
+                LOG_INFO << "  Developer: " << allocation.developer_percent << "% = " << allocation.developer_amount << " satoshis (" << allocation.developer_address << ")";
+                if (allocation.node_owner_amount > 0) {
+                    LOG_INFO << "  Node owner: " << allocation.node_owner_percent << "% = " << allocation.node_owner_amount << " satoshis (" << allocation.node_owner_address << ")";
+                }
+                
+                // Allocation is already baked into coinbase parts by refresh_work() →
+                // build_coinbase_parts(). When a valid block is found below, it carries
+                // the correct developer and node-owner fee outputs.
+            }
+        }
+        
+        LOG_INFO << "Solo mining share accepted - primary payout address: " << payout_address;
+        
+        // Check if share meets network difficulty and attempt block submission
+        if (m_coin_node && !extranonce1.empty()) {
+            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
+            if (!block_hex.empty()) {
+                // Check merged mining targets for every share (aux targets are lower)
+                bool solo_merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job);
+
+                // Check PoW hash against the blockchain target before submitting
+                auto block_bytes = ParseHex(block_hex.substr(0, 160));
+                if (block_bytes.size() == 80) {
+                    char pow_hash_bytes[32];
+                    scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
+                    uint256 pow_hash;
+                    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+                    // Read nBits directly from the block header (offset 72, LE uint32).
+                    // Using the header's own bits guarantees the same target litecoind
+                    // will verify, avoiding races when GBT difficulty changes between
+                    // job creation and share submission.
+                    uint32_t header_bits = block_bytes[72] | (block_bytes[73] << 8) |
+                                           (block_bytes[74] << 16) | (block_bytes[75] << 24);
+                    uint256 block_target = chain::bits_to_target(header_bits);
+
+                    if (!block_target.IsNull() && pow_hash <= block_target) {
+                        // Validate merkle root before submitting
+                        uint256 header_merkle;
+                        std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
+
+                        std::string coinbase_hex;
+                        uint256 expected_merkle;
+                        {
+                            const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+                            const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+                            const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+                            coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                            expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
+                        }
+
+                        // #886 BUG 2: the merkle self-check is ADVISORY ONLY,
+                        // never a refusal. expected_merkle is rebuilt from
+                        // job/cache; a template roll between job freeze and submit
+                        // yields a benign FALSE mismatch. Log loudly, then SUBMIT
+                        // ANYWAY and let the daemon be the authority (mirrors BTC
+                        // work_source.cpp:802). INVARIANT: never REFUSE a block the
+                        // daemon might accept — a false refusal is a guaranteed loss.
+                        if (header_merkle != expected_merkle) {
+                            LOG_WARNING << "Block merkle self-check DIVERGENCE"
+                                        << " header=" << header_merkle.GetHex()
+                                        << " expected=" << expected_merkle.GetHex()
+                                        << " — submitting anyway (daemon is authority; template roll or leaf-set bug)";
+                        }
+                        // #886 BUG 1: dedup on the BLOCK HASH (not prev-hash — many
+                        // distinct valid blocks share one prev), recorded ONLY on a
+                        // SUCCESSFUL submit so a failed submit (stale template,
+                        // transient RPC, -1 verdict) stays resubmittable. Bounded +
+                        // thread-safe (see already_submitted_block).
+                        {
+                            uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+                            if (!already_submitted_block(block_hash)) {
+                                LOG_INFO << "[BLOCK] Parent block found by " << username
+                                         << " hash=" << block_hash.GetHex().substr(0,16);
+                                auto submit_res = submitblock(block_hex);
+                                if (!submit_res.contains("error")) {
+                                    mark_block_submitted(block_hash);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return nlohmann::json{{"result", true}};
+    } else {
+        // Standard pool mode - track shares for sharechain and payouts
+
+        // Extract primary address from multiaddress username format.
+        // Format: PRIMARY_ADDR[,MERGED_ADDR...][.WORKER_NAME]
+        std::string primary_addr = username;
+        {
+            auto dot_pos = primary_addr.rfind('.');
+            if (dot_pos != std::string::npos && dot_pos > 20)
+                primary_addr = primary_addr.substr(0, dot_pos);
+            auto comma_pos = primary_addr.find(',');
+            if (comma_pos != std::string::npos)
+                primary_addr = primary_addr.substr(0, comma_pos);
+        }
+        // Decode any address format: base58 (P2PKH/P2SH) or bech32 (P2WPKH)
+        std::string addr_type_str;
+        std::string share_address = address_to_hash160(primary_addr, addr_type_str);
+        uint8_t share_addr_type = 0; // 0=P2PKH, 1=P2WPKH, 2=P2SH
+        if (share_address.size() == 40) {
+            if (addr_type_str == "p2wpkh") share_addr_type = 1;
+            else if (addr_type_str == "p2sh") share_addr_type = 2;
+        }
+        if (share_address.size() != 40) {
+            // Case 4 (Python work.py): invalid/empty LTC address but miner provided an
+            // explicit DOGE merged address → derive LTC hash160 from DOGE P2PKH script.
+            // LTC and DOGE use identical secp256k1 keys: same pubkey_hash, different version byte.
+            static constexpr uint32_t DOGE_CHAIN_ID = 98;
+            auto doge_it = merged_addresses.find(DOGE_CHAIN_ID);
+            if (doge_it != merged_addresses.end()) {
+                const auto& doge_script = doge_it->second;
+                // P2PKH script: 76 a9 14 <20-byte hash160> 88 ac
+                if (doge_script.size() == 25 &&
+                    doge_script[0] == 0x76 && doge_script[1] == 0xa9 && doge_script[2] == 0x14) {
+                    static const char* HEX = "0123456789abcdef";
+                    std::string h160;
+                    h160.reserve(40);
+                    for (int i = 3; i < 23; ++i) {
+                        h160 += HEX[doge_script[i] >> 4];
+                        h160 += HEX[doge_script[i] & 0x0f];
+                    }
+                    share_address = h160;
+                    LOG_INFO << "mining_submit: Case 4 — LTC share hash160 derived from DOGE merged address";
+                }
+            }
+        }
+        if (share_address.size() != 40) {
+            // Case 3 (Python work.py): no valid LTC or DOGE address → redistribute
+            // according to the node's configured --redistribute mode.
+            if (m_address_fallback_fn) {
+                share_address = m_address_fallback_fn(primary_addr);
+                if (share_address.size() == 40)
+                    LOG_INFO << "mining_submit: Case 3 — redistributed share for invalid address '"
+                             << primary_addr << "'";
+            }
+            if (share_address.size() != 40)
+                LOG_WARNING << "mining_submit: cannot resolve share address for '"
+                            << primary_addr << "' — share will carry zero-hash payout";
+        }
+
+        // p2pool -f: probabilistic node fee (matches work.py:1592-1594).
+        // With probability fee%, replace the miner's pubkey_hash with the
+        // node operator's. ~fee% of shares carry the operator's address
+        // in PPLNS, so the operator earns ~fee% of block rewards.
+        // Supports P2PKH, P2SH, and P2WPKH node fee addresses.
+        if (m_node_fee_percent > 0.0 && !m_node_fee_script.empty()) {
+            float roll = core::random::random_float(0.0f, 100.0f);
+            if (roll < static_cast<float>(m_node_fee_percent)) {
+                // Extract hash160 from node fee scriptPubKey (any supported type)
+                static const char* HEX = "0123456789abcdef";
+                int h160_off = -1;
+                auto sz = m_node_fee_script.size();
+                if (sz == 25 && m_node_fee_script[0] == 0x76 &&
+                    m_node_fee_script[1] == 0xa9 && m_node_fee_script[2] == 0x14) {
+                    h160_off = 3;  // P2PKH: 76 a9 14 <20> 88 ac
+                } else if (sz == 23 && m_node_fee_script[0] == 0xa9 &&
+                           m_node_fee_script[1] == 0x14) {
+                    h160_off = 2;  // P2SH: a9 14 <20> 87
+                } else if (sz == 22 && m_node_fee_script[0] == 0x00 &&
+                           m_node_fee_script[1] == 0x14) {
+                    h160_off = 2;  // P2WPKH: 00 14 <20>
+                }
+                if (h160_off >= 0) {
+                    std::string h160;
+                    h160.reserve(40);
+                    for (int i = h160_off; i < h160_off + 20; ++i) {
+                        h160 += HEX[m_node_fee_script[i] >> 4];
+                        h160 += HEX[m_node_fee_script[i] & 0x0f];
+                    }
+                    share_address = h160;
+                    LOG_DEBUG_POOL << "Node fee: share " << job_id
+                                   << " address replaced → operator (roll="
+                                   << roll << " < " << m_node_fee_percent << ")";
+                }
+            }
+        }
+        
+        // Track mining_share submission for statistics
+        if (m_node) {
+            m_node->track_mining_share_submission(username, share_difficulty);
+        }
+
+        // Record share contribution for payout calculation (pool mode only)
+        if (m_payout_manager) {
+            m_payout_manager->record_share_contribution(share_address, share_difficulty);
+            LOG_DEBUG_POOL << "Share contribution recorded: " << share_address << " (difficulty: " << share_difficulty << ")";
+        }
+
+        // Create a proper V36 share in the tracker with all block template data.
+        // The payout_script is built from share_address (which may have been
+        // probabilistically replaced with the node operator's address for the
+        // primary chain node fee).  Merged addresses are passed through
+        // unmodified — Python p2pool does NOT apply node fee to merged chains.
+        if (m_create_share_fn) {
+            ShareCreationParams params;
+            // Miner display name: PRIMARY_ADDR.WORKER (strip merged addrs, keep worker)
+            {
+                std::string display = username;
+                // Remove merged addresses (after first comma) but keep worker name (after last dot)
+                auto comma_pos = display.find(',');
+                std::string worker;
+                if (comma_pos != std::string::npos) {
+                    // Check for worker name after the merged addresses
+                    auto dot_pos = display.rfind('.');
+                    if (dot_pos != std::string::npos && dot_pos > comma_pos)
+                        worker = display.substr(dot_pos);
+                    display = display.substr(0, comma_pos) + worker;
+                }
+                params.miner_address = display;
+            }
+
+            // Build scriptPubKey from share_address (40-char hex hash160) + type
+            if (share_address.size() == 40) {
+                std::vector<unsigned char> hash160_bytes;
+                hash160_bytes.reserve(20);
+                for (size_t i = 0; i < share_address.size(); i += 2)
+                    hash160_bytes.push_back(static_cast<unsigned char>(
+                        std::stoul(share_address.substr(i, 2), nullptr, 16)));
+
+                if (share_addr_type == 1) {
+                    // P2WPKH: 00 14 <20-byte witness program>
+                    params.payout_script = {0x00, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                } else if (share_addr_type == 2) {
+                    // P2SH: a9 14 <20-byte hash> 87
+                    params.payout_script = {0xa9, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                    params.payout_script.push_back(0x87);
+                } else {
+                    // P2PKH: 76 a9 14 <20-byte hash> 88 ac
+                    params.payout_script = {0x76, 0xa9, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                    params.payout_script.push_back(0x88);
+                    params.payout_script.push_back(0xac);
+                }
+            }
+
+            params.merged_addresses = merged_addresses;
+            params.nonce = static_cast<uint32_t>(std::stoul(nonce, nullptr, 16));
+            params.timestamp = static_cast<uint32_t>(std::stoul(ntime, nullptr, 16));
+
+            // Extract block template fields — prefer job snapshot over live template.
+            // CRITICAL: share.m_bits (share chain target) and min_header.m_bits
+            // (block difficulty in the 80-byte header) are DIFFERENT values.
+            // - params.bits = share chain target from compute_share_target()
+            // - params.block_bits = GBT block difficulty (what the miner puts in the header)
+            // Confusing these causes p2pool to reject shares as "PoW invalid".
+            {
+                std::lock_guard<std::mutex> lock(m_work_mutex);
+                if (job) {
+                    params.block_version = job->version;
+                    params.prev_block_hash.SetHex(job->gbt_prevhash);
+                    // Share chain difficulty
+                    params.bits = job->share_bits ? job->share_bits
+                        : static_cast<uint32_t>(std::stoul(job->nbits, nullptr, 16));
+                    // Block difficulty (GBT bits) — goes into the 80-byte header
+                    params.block_bits = static_cast<uint32_t>(
+                        std::stoul(job->block_nbits.empty() ? job->nbits : job->block_nbits, nullptr, 16));
+                    params.subsidy = job->subsidy;
+                } else if (m_work_valid) {
+                    params.block_version = m_cached_template.value("version", 536870912U);
+                    if (m_cached_template.contains("previousblockhash")) {
+                        params.prev_block_hash.SetHex(
+                            m_cached_template["previousblockhash"].get<std::string>());
+                    }
+                    // Share chain difficulty
+                    uint32_t sb = m_share_bits.load();
+                    if (sb != 0) {
+                        params.bits = sb;
+                    } else if (m_cached_template.contains("bits")) {
+                        params.bits = static_cast<uint32_t>(std::stoul(
+                            m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                    }
+                    // Block difficulty from GBT
+                    if (m_cached_template.contains("bits")) {
+                        params.block_bits = static_cast<uint32_t>(std::stoul(
+                            m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                    }
+                    params.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+                }
+
+                // Build the actual mined coinbase: coinb1 + en1 + en2 + coinb2
+                // In the new split, en1+en2 fill the last_txout_nonce (in OP_RETURN),
+                // not the scriptSig.  So the scriptSig is the same in all coinbases.
+                std::string full_coinbase_hex;
+                {
+                    const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+                    const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+                    full_coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                }
+
+                // Extract scriptSig from the coinbase (scriptSig is fixed, no en1/en2).
+                // Layout: version(4) + vin_count(1) + prev_hash(32) + prev_idx(4) + script_len(1+)
+                auto cb_bytes = ParseHex(full_coinbase_hex);
+                if (cb_bytes.size() > 41) {
+                    size_t pos = 41;
+                    uint64_t scriptsig_len = cb_bytes[pos++];
+                    if (scriptsig_len < 0xfd && pos + scriptsig_len <= cb_bytes.size()) {
+                        params.coinbase_scriptSig.assign(
+                            cb_bytes.begin() + pos,
+                            cb_bytes.begin() + pos + scriptsig_len);
+                    }
+                    LOG_INFO << "[scriptSig-extract] cb_total=" << cb_bytes.size()
+                             << " scriptsig_varint=0x" << std::hex << scriptsig_len << std::dec
+                             << " scriptsig_len=" << scriptsig_len
+                             << " extracted=" << params.coinbase_scriptSig.size()
+                             << " cb1_src=" << (job ? "job" : "cached");
+                }
+
+                // Convert string merkle branches to uint256 (internal byte order)
+                const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+                params.merkle_branches.reserve(branches.size());
+                for (const auto& branch_hex : branches) {
+                    uint256 h;
+                    auto branch_bytes = ParseHex(branch_hex);
+                    if (branch_bytes.size() == 32)
+                        memcpy(h.begin(), branch_bytes.data(), 32);
+                    params.merkle_branches.push_back(h);
+                }
+
+                // Segwit fields for SegwitData on the share
+                params.segwit_active = job ? job->segwit_active : m_segwit_active;
+                if (params.segwit_active) {
+                    if (job && !job->witness_commitment_hex.empty()) {
+                        params.witness_commitment_hex = job->witness_commitment_hex;
+                        params.witness_root = job->witness_root;
+                    } else {
+                        // Fallback: use cached values from refresh_work
+                        params.witness_commitment_hex = m_cached_witness_commitment;
+                        params.witness_root = m_cached_witness_root;
+                    }
+                    // The zero witness_root (0x00..00) is VALID — it's the correct
+                    // root when a block has only a coinbase transaction.  Don't treat
+                    // IsNull() as "not set".  The witness_commitment_hex being non-empty
+                    // means the root was computed and should be used as-is.
+                    // Only recompute when witness_commitment is empty but segwit active.
+                    if (params.witness_commitment_hex.empty() && params.segwit_active) {
+                        const std::vector<std::string> txd = (job && job->tx_data) ? *job->tx_data : std::vector<std::string>{};
+                        if (!txd.empty()) {
+                            std::vector<uint256> wtxids;
+                            wtxids.push_back(uint256());  // coinbase wtxid = 0
+                            for (const auto& tx_hex : txd) {
+                                auto tx_bytes = ParseHex(tx_hex);
+                                if (!tx_bytes.empty())
+                                    wtxids.push_back(Hash(tx_bytes));
+                            }
+                            params.witness_root = compute_witness_merkle_root(std::move(wtxids));
+                            params.witness_commitment_hex =
+                                compute_p2pool_witness_commitment_hex(params.witness_root);
+                            LOG_INFO << "[WC-FIX] witness data computed from "
+                                     << txd.size() << " txs";
+                        }
+                    }
+                }
+
+                // Pass the actual mined coinbase TX bytes for hash_link computation.
+                if (!full_coinbase_hex.empty())
+                    params.full_coinbase_bytes = ParseHex(full_coinbase_hex);
+
+                // Optional operator-provided authority message blob (V36 message_data).
+                params.message_data = get_operator_message_blob();
+
+                // Use the share chain tip and frozen fields from work-generation time.
+                // These match what was used to compute the ref_hash in the coinbase.
+                if (job) {
+                    params.prev_share_hash = job->prev_share_hash;
+                    params.frozen_absheight = job->frozen_ref.absheight;
+                    params.frozen_abswork = job->frozen_ref.abswork;
+                    params.frozen_far_share_hash = job->frozen_ref.far_share_hash;
+                    params.frozen_max_bits = job->frozen_ref.max_bits;
+                    params.frozen_bits = job->frozen_ref.bits;
+                    params.frozen_timestamp = job->frozen_ref.timestamp;
+                    params.frozen_merged_payout_hash = job->frozen_ref.merged_payout_hash;
+                    params.frozen_merkle_branches = job->frozen_ref.frozen_merkle_branches;
+                    params.frozen_witness_root = job->frozen_ref.frozen_witness_root;
+                    // If frozen_witness_root was never set (commitment empty at ref_hash
+                    // time), propagate the current witness_root for consistency.
+                    // Note: zero root IS valid (coinbase-only block) — don't use IsNull().
+                    if (params.frozen_witness_root.IsNull() &&
+                        !params.witness_commitment_hex.empty())
+                        params.frozen_witness_root = params.witness_root;
+                    params.frozen_merged_coinbase_info = job->frozen_ref.frozen_merged_coinbase_info;
+                    // has_frozen = true when ref_hash_fn produced valid frozen data.
+                    // Cannot use absheight > 0: absheight IS 0 for the genesis share,
+                    // but frozen data is still valid. Use bits != 0 as the indicator:
+                    // bits is always non-zero when ref_hash_fn ran (share target > 0).
+                    params.has_frozen_fields = (job->frozen_ref.bits != 0);
+                    params.share_version = job->frozen_ref.share_version;
+                    params.desired_version = job->frozen_ref.desired_version;
+                    params.stale_info = job->stale_info;
+                }
+            }
+
+            // Bootstrap: when chain depth < TARGET_LOOKBEHIND, share_bits is 0
+            // to signal "not ready for share creation yet". Skip share creation
+            // and only mine pseudoshares until difficulty stabilizes.
+            // Exception: genesis mode (no peers) uses max_target fallback.
+            if (params.bits == 0) {
+                params.bits = m_share_max_bits.load();
+                // Only use genesis fallback if no peers have connected yet
+                // (m_share_max_bits is 0 when compute_share_target returns {0,0})
+            }
+            if (!params.payout_script.empty() && params.bits != 0) {
+                m_create_share_fn(params);
+            }
+        }
+        
+        // Attempt block construction + submission only when PoW meets blockchain target.
+        if (m_coin_node && !extranonce1.empty()) {
+            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
+            if (!block_hex.empty()) {
+                // Check merged mining targets for every share (aux targets are lower)
+                bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job);
+
+                auto block_bytes = ParseHex(block_hex.substr(0, 160));
+                if (block_bytes.size() == 80) {
+                    char pow_hash_bytes[32];
+                    scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
+                    uint256 pow_hash;
+                    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+                    // Read nBits from the block header itself (offset 72, LE uint32)
+                    // to match exactly what litecoind will verify.
+                    uint32_t header_bits = block_bytes[72] | (block_bytes[73] << 8) |
+                                           (block_bytes[74] << 16) | (block_bytes[75] << 24);
+                    uint256 block_target = chain::bits_to_target(header_bits);
+
+                    if (!block_target.IsNull() && pow_hash <= block_target) {
+                        uint256 header_merkle;
+                        std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
+
+                        std::string coinbase_hex;
+                        uint256 expected_merkle;
+                        {
+                            const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+                            const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+                            const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+                            coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                            expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
+                        }
+
+                        // #886 BUG 2: merkle self-check is ADVISORY ONLY (see
+                        // solo path). A template roll yields a benign FALSE
+                        // mismatch; log loudly then SUBMIT ANYWAY, daemon decides.
+                        if (header_merkle != expected_merkle) {
+                            LOG_WARNING << "Pool block merkle self-check DIVERGENCE"
+                                        << " header=" << header_merkle.GetHex()
+                                        << " expected=" << expected_merkle.GetHex()
+                                        << " — submitting anyway (daemon is authority; template roll or leaf-set bug)";
+                        }
+                        // #886 BUG 1: dedup on BLOCK HASH, recorded only on success.
+                        {
+                            uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+                            if (!already_submitted_block(block_hash)) {
+                                LOG_INFO << "[BLOCK] " << (merged_found ? "Twin" : "Parent")
+                                         << " block found by " << username
+                                         << " hash=" << block_hash.GetHex().substr(0,16);
+                                auto submit_res = submitblock(block_hex);
+                                if (!submit_res.contains("error")) {
+                                    mark_block_submitted(block_hash);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return nlohmann::json{{"result", true}};
+    }
+}
+
+nlohmann::json MiningInterface::validate_address(const std::string& address)
+{
+    LOG_INFO << "Address validation request for: " << address;
+    
+    nlohmann::json result = nlohmann::json::object();
+    
+    try {
+        if (m_payout_manager) {
+            // Use the existing address validator from payout manager
+            auto validation_result = m_payout_manager->get_address_validator()->validate_address(address);
+            
+            result["valid"] = validation_result.is_valid;
+            result["address"] = address;
+            result["type"] = static_cast<int>(validation_result.type);
+            result["blockchain"] = static_cast<int>(validation_result.blockchain);
+            result["network"] = static_cast<int>(validation_result.network);
+            
+            if (!validation_result.is_valid) {
+                result["error"] = validation_result.error_message;
+            }
+            
+            LOG_INFO << "Address validation result: " << (validation_result.is_valid ? "VALID" : "INVALID");
+            
+        } else {
+            result["valid"] = false;
+            result["error"] = "Payout manager not available";
+        }
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Address validation error: " << e.what();
+        result["valid"] = false;
+        result["error"] = std::string("Validation failed: ") + e.what();
+    }
+    
+    return result;
+}
+
+nlohmann::json MiningInterface::build_coinbase(const nlohmann::json& params)
+{
+    LOG_INFO << "Coinbase construction request received";
+    
+    try {
+        if (!m_payout_manager) {
+            throw std::runtime_error("Payout manager not available");
+        }
+        
+        // Extract parameters
+        uint64_t block_reward = params.value("block_reward", 2500000000ULL); // Default 25 LTC
+        std::string miner_address = params.value("miner_address", "");
+        double dev_fee_percent = params.value("dev_fee_percent", 0.0);
+        double node_fee_percent = params.value("node_fee_percent", 0.0);
+        
+        if (miner_address.empty()) {
+            throw std::runtime_error("Miner address is required");
+        }
+        
+        // Validate the miner address first
+        auto addr_validation = m_payout_manager->get_address_validator()->validate_address(miner_address);
+        if (!addr_validation.is_valid) {
+            throw std::runtime_error("Invalid miner address: " + addr_validation.error_message);
+        }
+        
+        // Build detailed coinbase
+        auto result = m_payout_manager->build_coinbase_detailed(block_reward, miner_address, 
+                                                               dev_fee_percent, node_fee_percent);
+        
+        LOG_INFO << "Coinbase construction successful for " << miner_address;
+        return result;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Coinbase construction error: " << e.what();
+        return nlohmann::json{
+            {"error", std::string("Coinbase construction failed: ") + e.what()}
+        };
+    }
+}
+
+nlohmann::json MiningInterface::validate_coinbase(const std::string& coinbase_hex)
+{
+    LOG_INFO << "Coinbase validation request - hex length: " << coinbase_hex.length();
+    
+    nlohmann::json result = nlohmann::json::object();
+    
+    try {
+        if (!m_payout_manager) {
+            throw std::runtime_error("Payout manager not available");
+        }
+        
+        bool is_valid = m_payout_manager->validate_coinbase_transaction(coinbase_hex);
+        
+        result["valid"] = is_valid;
+        result["coinbase_hex"] = coinbase_hex;
+        result["hex_length"] = coinbase_hex.length();
+        result["byte_length"] = coinbase_hex.length() / 2;
+        
+        if (!is_valid) {
+            result["error"] = "Coinbase transaction validation failed";
+        }
+        
+        LOG_INFO << "Coinbase validation result: " << (is_valid ? "VALID" : "INVALID");
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Coinbase validation error: " << e.what();
+        result["valid"] = false;
+        result["error"] = std::string("Validation failed: ") + e.what();
+    }
+    
+    return result;
+}
+
+nlohmann::json MiningInterface::getblockcandidate(const nlohmann::json& params)
+{
+    LOG_INFO << "Block candidate request received";
+    
+    try {
+        // Get base block template (this would normally come from the coin node)
+        auto base_template = getblocktemplate(nlohmann::json::array());
+        
+        // Enhance with coinbase construction if payout manager available
+        if (m_payout_manager && params.contains("miner_address")) {
+            std::string miner_address = params["miner_address"];
+            uint64_t coinbase_value = base_template.value("coinbasevalue", 2500000000ULL);
+            
+            // Build coinbase with payout distribution
+            auto coinbase_result = m_payout_manager->build_coinbase_detailed(coinbase_value, miner_address);
+            
+            // Add coinbase info to block template
+            base_template["coinbase_outputs"] = coinbase_result["outputs"];
+            base_template["coinbase_hex"] = coinbase_result["coinbase_hex"];
+            base_template["payout_distribution"] = true;
+            
+            LOG_INFO << "Block candidate with payout distribution generated";
+        } else {
+            base_template["payout_distribution"] = false;
+            LOG_INFO << "Basic block candidate generated (no payout distribution)";
+        }
+        
+        // Add validation info
+        base_template["candidate_valid"] = true;
+        base_template["generation_time"] = static_cast<uint64_t>(std::time(nullptr));
+        
+        return base_template;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Block candidate generation error: " << e.what();
+        return nlohmann::json{
+            {"error", std::string("Block candidate generation failed: ") + e.what()},
+            {"candidate_valid", false}
+        };
+    }
+}
+
+/// WebServer Implementation
+WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet)
+    : ioc_(ioc)
+    , acceptor_(http_ioc_)
+    , bind_address_(address)
+    , port_(port)
+    , stratum_port_(port + 10)  // Default stratum port is +10 from main port
+    , running_(false)
+    , testnet_(testnet)
+    , blockchain_(Blockchain::LITECOIN)
+    , solo_mode_(false)
+{
+    mining_interface_ = std::make_shared<MiningInterface>(testnet);
+    LOG_INFO << "core::WebServer constructed on " << bind_address_ << ":" << port_ << " (MiningInterface " << (mining_interface_ ? "alive" : "NULL") << ", blockchain=" << static_cast<int>(blockchain_) << ")";
+}
+
+WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node)
+    : ioc_(ioc)
+    , acceptor_(http_ioc_)
+    , bind_address_(address)
+    , port_(port)
+    , stratum_port_(port + 10)
+    , running_(false)
+    , testnet_(testnet)
+    , blockchain_(Blockchain::LITECOIN)
+    , solo_mode_(false)
+{
+    mining_interface_ = std::make_shared<MiningInterface>(testnet, node);
+    LOG_INFO << "core::WebServer constructed on " << bind_address_ << ":" << port_ << " (MiningInterface " << (mining_interface_ ? "alive" : "NULL") << ", blockchain=" << static_cast<int>(blockchain_) << ")";
+}
+
+WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
+    : ioc_(ioc)
+    , acceptor_(http_ioc_)
+    , bind_address_(address)
+    , port_(port)
+    , stratum_port_(port + 10)
+    , running_(false)
+    , testnet_(testnet)
+    , blockchain_(blockchain)
+    , solo_mode_(false)
+{
+    mining_interface_ = std::make_shared<MiningInterface>(testnet, node, blockchain);
+    LOG_INFO << "core::WebServer constructed on " << bind_address_ << ":" << port_ << " (MiningInterface " << (mining_interface_ ? "alive" : "NULL") << ", blockchain=" << static_cast<int>(blockchain_) << ")";
+}
+
+WebServer::~WebServer()
+{
+    stop();
+}
+
+bool WebServer::start()
+{
+    if (running_) return true;  // Already started (early start for loading page)
+    running_ = true;
+
+    try {
+        // Bind and listen on the HTTP port (runs on dedicated http_ioc_)
+        auto const address = net::ip::make_address(bind_address_);
+        tcp::endpoint endpoint{address, port_};
+
+        acceptor_.open(endpoint.protocol());
+        acceptor_.set_option(net::socket_base::reuse_address(true));
+        acceptor_.bind(endpoint);
+        acceptor_.listen(net::socket_base::max_listen_connections);
+
+        LOG_INFO << "WebServer started on " << bind_address_ << ":" << port_ << " (dedicated HTTP thread)";
+
+        // Start accepting HTTP connections (on http_ioc_)
+        accept_connections();
+
+        // Launch dedicated thread for HTTP event loop — decouples dashboard
+        // latency from think()/verification work on the main ioc_.
+        http_thread_ = std::thread([this]() {
+            LOG_INFO << "[HTTP-thread] started";
+            auto work_guard = net::make_work_guard(http_ioc_);
+            while (running_ || !http_ioc_.stopped()) {
+                try {
+                    http_ioc_.run();
+                    break;  // run() returned normally (ioc stopped)
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "[HTTP-thread] exception: " << e.what();
+                }
+            }
+            LOG_INFO << "[HTTP-thread] exiting";
+        });
+
+        // Start stratum server if configured (stays on main ioc_)
+        if (stratum_port_ > 0) {
+            start_stratum_server();
+        }
+
+        // One-shot initial template fetch: populate the cache before any events fire.
+        // After this, all template updates are event-driven (bestblock, best_share_changed).
+        // p2pool has no recurring refresh timer — Twisted reactor events handle everything.
+        if (m_coin_node_ && m_coin_node_->has_rpc()) {
+            auto timer = std::make_shared<net::steady_timer>(ioc_);
+            timer->expires_after(std::chrono::milliseconds(500));
+            timer->async_wait([this, timer](beast::error_code ec) {
+                if (ec || !running_) return;
+                try { mining_interface_->refresh_work(); }
+                catch (const std::exception& e) { LOG_WARNING << "initial refresh_work failed: " << e.what(); }
+                catch (...) { LOG_WARNING << "initial refresh_work failed: unknown error"; }
+                LOG_INFO << "Initial block template fetched";
+            });
+        }
+
+        // ── No-embedded RPC mode: recurring getblocktemplate poll ─────────────
+        // The one-shot fetch above is the ONLY template refresh in --no-embedded
+        // mode: there is no embedded header-sync on_new_headers callback and no
+        // ZMQ/longpoll subscription to fire "bestblock" events (embedded mode drives
+        // refresh via on_new_headers → trigger_work_refresh). If the daemon was still
+        // in IBD at the 500ms one-shot, m_work_valid stayed false and never recovered
+        // because nothing polls again. Add a recurring poll that (a) bootstraps the
+        // cache once the daemon leaves IBD and (b) re-notifies miners when the network
+        // tip advances — replacing the event source embedded mode gets for free.
+        if (m_coin_node_ && m_coin_node_->has_rpc() && !m_coin_node_->is_embedded()) {
+            auto poll = std::make_shared<net::steady_timer>(ioc_);
+            auto prev_hash = std::make_shared<std::string>();
+            auto poll_fn = std::make_shared<std::function<void(beast::error_code)>>();
+            *poll_fn = [this, poll, prev_hash, poll_fn](beast::error_code ec) {
+                if (ec || !running_) return;
+                poll->expires_after(std::chrono::seconds(2));
+                poll->async_wait(*poll_fn);
+                try {
+                    mining_interface_->refresh_work();
+                    std::string tip = mining_interface_->get_current_gbt_prevhash();
+                    if (!tip.empty() && tip != *prev_hash) {
+                        bool first = prev_hash->empty();
+                        *prev_hash = tip;
+                        if (stratum_server_) stratum_server_->notify_all();
+                        LOG_INFO << "[LTC] no-embed GBT poll: "
+                                 << (first ? "first template " : "new tip ")
+                                 << tip.substr(0, 16) << "... — miners notified";
+                    }
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[LTC] no-embed GBT poll failed: " << e.what();
+                }
+            };
+            poll->expires_after(std::chrono::seconds(2));
+            poll->async_wait(*poll_fn);
+            LOG_INFO << "[LTC] no-embedded RPC mode: recurring GBT poll scheduled (2s)";
+        }
+
+        // Schedule stat_log timer (every 60 seconds for graph data)
+        {
+            auto stat_timer = std::make_shared<net::steady_timer>(ioc_);
+            auto stat_fn = std::make_shared<std::function<void(beast::error_code)>>();
+            *stat_fn = [this, stat_timer, stat_fn](beast::error_code ec) {
+                if (ec || !running_) return;
+                stat_timer->expires_after(std::chrono::seconds(60));
+                stat_timer->async_wait(*stat_fn);
+                try { mining_interface_->update_stat_log(); }
+                catch (const std::exception& e) {
+                    LOG_WARNING << "Stat log update failed: " << e.what();
+                }
+            };
+            stat_timer->expires_after(std::chrono::seconds(10)); // first sample after 10s
+            stat_timer->async_wait(*stat_fn);
+            LOG_INFO << "Stat-log timer scheduled (every 60 s)";
+        }
+
+        running_ = true;
+        return true;
+
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to start WebServer: " << e.what();
+        return false;
+    }
+}
+
+void WebServer::set_on_block_submitted(std::function<void(const std::string&, int)> fn)
+{
+    mining_interface_->set_on_block_submitted(std::move(fn));
+}
+
+void WebServer::set_on_block_relay(std::function<void(const std::string&)> fn)
+{
+    mining_interface_->set_on_block_relay(std::move(fn));
+}
+
+std::map<std::array<uint8_t, 20>, double> WebServer::get_local_addr_rates() const
+{
+    // Forward to StratumServer. Converts unordered_map → sorted map.
+    // p2pool ref: work.py:1975-1990
+    std::map<std::array<uint8_t, 20>, double> result;
+    if (stratum_server_) {
+        auto rates = stratum_server_->get_local_addr_rates();
+        for (auto& [k, v] : rates)
+            result[k] = v;
+    }
+    return result;
+}
+
+void WebServer::trigger_work_refresh()
+{
+    // Update local hashrate from stratum sessions (p2pool: get_local_addr_rates)
+    if (stratum_server_)
+        mining_interface_->set_local_hashrate(stratum_server_->get_total_hashrate());
+    mining_interface_->refresh_work();
+    // Push new work to all miners immediately (p2pool: new_work_event).
+    // Old jobs stay valid — miner submits by job_id, which maps to frozen data.
+    // Stale shares only occur when MAX_ACTIVE_JOBS (256) is exceeded.
+    if (stratum_server_)
+        stratum_server_->notify_all();
+}
+
+void WebServer::execute_debounced_work_refresh()
+{
+    // Capture previous tip hash BEFORE refresh updates it — needed for delta precompute.
+    // Absent tip (fresh bootstrap, no shares yet) → empty prev_tip_hash, precompute_delta
+    // treats that as "no prior baseline" and the SSE consumers reconcile at first emission.
+    auto prev_tip = mining_interface_->get_sharechain_tip();
+    std::string prev_tip_hash = prev_tip ? prev_tip->hash : std::string{};
+
+    // Mark MM PPLNS dirty so the DOGE block gets rebuilt with fresh payouts.
+    // refresh_work() → rebuild_cached_blocks() will clear the flag and rebuild.
+    if (auto* mm = mining_interface_->get_mm_manager())
+        mm->mark_pplns_dirty();
+
+    trigger_work_refresh();
+
+    // Invalidate sharechain window cache (new share changed the tip)
+    mining_interface_->invalidate_window_cache();
+
+    // Cache PPLNS snapshot for this tip (each share gets unique PPLNS)
+    mining_interface_->cache_pplns_at_tip();
+
+    // Pre-compute delta from previous tip so SSE clients get instant response.
+    // All clients request delta(prev_tip) simultaneously after receiving the SSE
+    // tip notification — this single-entry cache gives ~100% hit rate.
+    mining_interface_->precompute_delta(prev_tip_hash);
+
+    // Push SSE event to RealTime subscribers — serialize at the edge, not before.
+    if (mining_interface_->sse_subscriber_count() > 0) {
+        mining_interface_->sse_push(to_json(mining_interface_->get_sharechain_tip()).dump());
+    }
+
+    // Record execution for the debounce window + trailing-edge event gate.
+    m_last_work_refresh = std::chrono::steady_clock::now();
+    auto refreshed_tip = mining_interface_->get_sharechain_tip();
+    m_last_refresh_tip_hash = refreshed_tip ? refreshed_tip->hash : std::string{};
+}
+
+void WebServer::trigger_work_refresh_debounced()
+{
+    // ── Notify debounce (hotel interim fix #3) ──
+    // Share-arrival storms used to fan out into one full refresh_work() +
+    // notify_all() per share (the old body here was a no-op stub that called
+    // refresh immediately). Semantics now:
+    //   * Leading edge: a call outside the debounce window refreshes
+    //     IMMEDIATELY (first share after quiet keeps p2pool-grade latency).
+    //   * Trailing coalesce: calls inside the window collapse into ONE
+    //     deferred refresh ~300 ms after the leading edge, event-gated on a
+    //     REAL work change (sharechain tip differs from the last executed
+    //     refresh) so a redundant burst costs nothing.
+    // The new-block path is untouched: trigger_work_refresh() stays immediate.
+    // Timing/coalescing only — the bytes of any notify that IS sent are
+    // unchanged. Single-threaded: callers + timer run on the main ioc_.
+    using namespace std::chrono;
+    static constexpr auto DEBOUNCE_WINDOW = milliseconds(300);
+
+    const auto now = steady_clock::now();
+    const bool in_window = (m_last_work_refresh.time_since_epoch().count() != 0)
+                           && (now - m_last_work_refresh < DEBOUNCE_WINDOW);
+
+    if (!in_window && !m_work_refresh_pending) {
+        execute_debounced_work_refresh();  // leading edge — immediate
+        return;
+    }
+
+    if (m_work_refresh_pending)
+        return;  // trailing refresh already scheduled — this call coalesces
+
+    m_work_refresh_pending = true;
+    if (!m_work_refresh_timer)
+        m_work_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
+    // Fire at the end of the window that opened with the leading-edge refresh.
+    const auto remaining = DEBOUNCE_WINDOW - duration_cast<milliseconds>(now - m_last_work_refresh);
+    m_work_refresh_timer->expires_after(remaining > milliseconds(1) ? remaining : milliseconds(1));
+    m_work_refresh_timer->async_wait([this](beast::error_code ec) {
+        m_work_refresh_pending = false;
+        if (ec || !running_) return;
+        // Event gate: only refresh on a real work change. If the sharechain
+        // tip is still what the last executed refresh saw, the coalesced
+        // calls were redundant (already covered by the leading edge).
+        auto tip = mining_interface_->get_sharechain_tip();
+        std::string tip_hash = tip ? tip->hash : std::string{};
+        if (tip_hash == m_last_refresh_tip_hash)
+            return;
+        execute_debounced_work_refresh();
+    });
+}
+
+void WebServer::set_coin_node(core::coin::ICoinNode* node)
+{
+    m_coin_node_ = node;
+    mining_interface_->set_coin_node(node);
+    LOG_INFO << "WebServer: coin node " << (node ? "attached" : "detached");
+}
+
+void WebServer::set_best_share_hash_fn(std::function<uint256()> fn)
+{
+    mining_interface_->set_best_share_hash_fn(std::move(fn));
+}
+
+void WebServer::set_pplns_fn(MiningInterface::pplns_fn_t fn)
+{
+    mining_interface_->set_pplns_fn(std::move(fn));
+}
+
+void WebServer::set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr)
+{
+    mining_interface_->set_merged_mining_manager(mgr);
+}
+
+void WebServer::set_dashboard_dir(const std::string& dir)
+{
+    if (!dir.empty()) {
+        std::error_code ec;
+        bool exists = std::filesystem::is_directory(dir, ec);
+        if (!exists) {
+            LOG_ERROR << "Dashboard directory does NOT exist: " << dir
+                      << " — dashboard will serve JSON only. "
+                      << "Check --dashboard-dir path (spaces in path need quoting).";
+            // Don't set the dir — keep it empty so the server knows it's broken
+            return;
+        }
+        auto index = std::filesystem::path(dir) / "dashboard.html";
+        if (!std::filesystem::exists(index, ec))
+            LOG_WARNING << "Dashboard directory exists but dashboard.html not found in: " << dir;
+    }
+    mining_interface_->set_dashboard_dir(dir);
+    if (!dir.empty())
+        LOG_INFO << "Dashboard serving from: " << dir;
+}
+
+void WebServer::set_analytics_id(const std::string& id)
+{
+    mining_interface_->set_analytics_id(id);
+    if (!id.empty())
+        LOG_INFO << "Analytics tag enabled: " << id;
+}
+
+void WebServer::set_explorer_enabled(bool enabled)
+{
+    mining_interface_->set_explorer_enabled(enabled);
+    if (enabled)
+        LOG_INFO << "[Explorer] API enabled (loopback-only)";
+}
+
+void WebServer::set_explorer_url(const std::string& url)
+{
+    mining_interface_->set_explorer_url(url);
+    if (!url.empty())
+        LOG_INFO << "[Explorer] Nav link URL: " << url;
+}
+
+bool WebServer::start_solo()
+{
+    solo_mode_ = true;
+    
+    try {
+        // In solo mode, only start stratum server
+        if (stratum_port_ > 0) {
+            start_stratum_server();
+            LOG_INFO << "WebServer started in solo mode on Stratum port " << stratum_port_;
+            running_ = true;
+            return true;
+        } else {
+            LOG_ERROR << "Solo mode requires Stratum port configuration";
+            return false;
+        }
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to start WebServer in solo mode: " << e.what();
+        return false;
+    }
+}
+
+void WebServer::stop()
+{
+    if (running_) {
+        try {
+            running_ = false;
+            acceptor_.close();
+            // Stop the dedicated HTTP event loop and join its thread
+            http_ioc_.stop();
+            if (http_thread_.joinable())
+                http_thread_.join();
+            stop_stratum_server();
+            LOG_INFO << "WebServer stopped";
+        } catch (const std::exception& e) {
+            LOG_ERROR << "Error stopping WebServer: " << e.what();
+        }
+    }
+}
+
+bool WebServer::start_stratum_server()
+{
+    try {
+        if (!stratum_server_) {
+            stratum_server_ = std::make_unique<StratumServer>(ioc_, bind_address_, stratum_port_, mining_interface_);
+        }
+        
+        bool started = stratum_server_->start();
+        if (started) {
+            LOG_INFO << "Stratum server started on port " << stratum_port_;
+            // Wire stratum hashrate callback to MiningInterface
+            auto* ss = stratum_server_.get();
+            mining_interface_->set_stratum_hashrate_fn([ss]() -> double {
+                return ss->get_total_hashrate();
+            });
+            mining_interface_->set_stratum_rate_stats_fn([ss]() -> MiningInterface::RateStats {
+                auto s = ss->get_rate_stats();
+                return {s.hashrate, s.effective_dt, s.total_datums, s.dead_datums};
+            });
+            // Feed the stat-log graph series from the RateMonitor per-user rates
+            // (get_local_rates), so the local-hashrate history graph reflects live
+            // windowed hashrate instead of the flat per-session estimate.
+            mining_interface_->set_local_rates_fn([ss]() {
+                return ss->get_local_rates();
+            });
+        }
+        return started;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to start Stratum server: " << e.what();
+        return false;
+    }
+}
+
+void WebServer::stop_stratum_server()
+{
+    if (stratum_server_) {
+        stratum_server_->stop();
+        stratum_server_.reset();
+        LOG_INFO << "Stratum server stopped";
+    }
+}
+
+void WebServer::set_stratum_port(uint16_t port)
+{
+    stratum_port_ = port;
+}
+
+void WebServer::accept_connections()
+{
+    acceptor_.async_accept(
+        [this](beast::error_code ec, tcp::socket socket)
+        {
+            handle_accept(ec, std::move(socket));
+        });
+}
+
+void WebServer::handle_accept(beast::error_code ec, tcp::socket socket)
+{
+
+    if (!ec) {
+        // Create and run HTTP session
+        std::make_shared<HttpSession>(std::move(socket), mining_interface_)->run();
+    } else {
+        LOG_ERROR << "HTTP accept error: " << ec.message();
+    }
+    
+    // Continue accepting new connections
+    if (running_) {
+        accept_connections();
+    }
+}
+
+bool WebServer::is_stratum_running() const
+{
+    return stratum_server_ && stratum_server_->is_running();
+}
+
+uint16_t WebServer::get_stratum_port() const
+{
+    return stratum_port_;
+}
+
+
+// StratumServer and StratumSession implementations moved to stratum_server.cpp
+
+bool MiningInterface::is_valid_address(const std::string& address) const
+{
+    if (m_payout_manager) {
+        auto validator = m_payout_manager->get_address_validator();
+        if (validator) {
+            auto result = validator->validate_address(address);
+            return result.is_valid;
+        }
+    }
+    
+    // Basic validation - check length and format
+    if (address.length() < 26 || address.length() > 62) {
+        return false;
+    }
+    
+    // Check for valid characters (alphanumeric + some special chars)
+    for (char c : address) {
+        if (!std::isalnum(c) && c != '1' && c != '2' && c != '3') {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+double MiningInterface::calculate_share_difficulty(const std::string& job_id, const std::string& extranonce1,
+                                                   const std::string& extranonce2,
+                                                   const std::string& ntime, const std::string& nonce) const
+{
+    // Build the 80-byte block header, compute scrypt hash, and derive difficulty.
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+
+    if (!m_work_valid || m_cached_template.is_null() || m_cached_coinb1.empty())
+        return 0.0;
+
+    // Reconstruct coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
+    std::string coinbase_hex = m_cached_coinb1 + extranonce1 + extranonce2 + m_cached_coinb2;
+    uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, m_cached_merkle_branches);
+
+    // Build 80-byte header (little-endian fields)
+    uint32_t version = m_cached_template.value("version", 536870912U);
+    uint256 prev_hash;
+    prev_hash.SetHex(m_cached_template.value("previousblockhash", std::string(64, '0')));
+
+    std::vector<unsigned char> header;
+    header.reserve(80);
+
+    // version (4 bytes LE)
+    header.push_back(static_cast<unsigned char>((version      ) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
+
+    // prev_hash (32 bytes, internal byte order)
+    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
+
+    // merkle_root (32 bytes)
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+
+    // ntime (4 bytes LE — miner sends BE hex, reverse for header)
+    auto ntime_bytes = ParseHex(ntime);
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
+    header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
+
+    // nbits (4 bytes LE — GBT gives BE hex, reverse for header)
+    std::string bits_hex = m_cached_template.value("bits", std::string("1d00ffff"));
+    auto bits_bytes = ParseHex(bits_hex);
+    std::reverse(bits_bytes.begin(), bits_bytes.end());
+    header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
+
+    // nonce (4 bytes LE — miner sends BE hex, reverse for header)
+    auto nonce_bytes = ParseHex(nonce);
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
+    header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
+
+    if (header.size() != 80)
+        return 0.0;
+
+    // Compute scrypt hash
+    char pow_hash_bytes[32];
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
+
+    uint256 pow_hash;
+    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+    // difficulty = truediffone / pow_hash_as_double
+    // truediffone = 0x00000000FFFF0000... (Litecoin difficulty-1 target)
+    // For a 256-bit hash, difficulty = 2^224 / pow_hash (approximate)
+    static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0; // 0xFFFF * 2^208
+    if (pow_hash.IsNull())
+        return 0.0;
+
+    // Convert pow_hash to a double (most significant bytes)
+    double hash_val = 0.0;
+    for (int i = 31; i >= 0; --i)
+        hash_val = hash_val * 256.0 + static_cast<double>(pow_hash.data()[i]);
+
+    if (hash_val == 0.0)
+        return 0.0;
+
+    return truediffone / hash_val;
+}
+
+double MiningInterface::calculate_share_difficulty(const std::string& coinb1, const std::string& coinb2,
+                                                   const std::string& extranonce1, const std::string& extranonce2,
+                                                   const std::string& ntime, const std::string& nonce) const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+
+    if (!m_work_valid || m_cached_template.is_null())
+        return 0.0;
+
+    // Reconstruct coinbase from per-connection parts
+    std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
+    uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, m_cached_merkle_branches);
+
+    uint32_t version = m_cached_template.value("version", 536870912U);
+    uint256 prev_hash;
+    prev_hash.SetHex(m_cached_template.value("previousblockhash", std::string(64, '0')));
+
+    std::vector<unsigned char> header;
+    header.reserve(80);
+
+    header.push_back(static_cast<unsigned char>((version      ) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
+
+    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+
+    // ntime, nbits, nonce: miner/GBT sends as BE hex, header needs LE bytes
+    auto ntime_bytes = ParseHex(ntime);
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
+    header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
+
+    std::string bits_hex = m_cached_template.value("bits", std::string("1d00ffff"));
+    auto bits_bytes = ParseHex(bits_hex);
+    std::reverse(bits_bytes.begin(), bits_bytes.end());
+    header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
+
+    auto nonce_bytes = ParseHex(nonce);
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
+    header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
+
+    if (header.size() != 80)
+        return 0.0;
+
+    char pow_hash_bytes[32];
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
+
+    uint256 pow_hash;
+    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+    static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+    if (pow_hash.IsNull())
+        return 0.0;
+
+    double hash_val = 0.0;
+    for (int i = 31; i >= 0; --i)
+        hash_val = hash_val * 256.0 + static_cast<double>(pow_hash.data()[i]);
+
+    if (hash_val == 0.0)
+        return 0.0;
+
+    return truediffone / hash_val;
+}
+
+/*static*/
+double MiningInterface::calculate_share_difficulty(
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches)
+{
+    // Reconstruct coinbase from per-connection parts
+    std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
+    uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, merkle_branches);
+
+    // Prevhash: must match build_block_from_stratum exactly.
+    // GBT prevhash is BE display hex. SetHex converts to internal LE.
+    // .data() returns LE bytes — same as block header format.
+    uint256 prev_hash;
+    prev_hash.SetHex(prevhash_hex);
+
+    std::vector<unsigned char> header;
+    header.reserve(80);
+
+    header.push_back(static_cast<unsigned char>((version      ) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
+
+    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
+
+    // Merkle root: internal byte order from reconstruct_merkle_root
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+
+    // ntime: Stratum sends as BE hex (swap4'd from LE). Miner parses as
+    // BE uint32 and writes as LE in header. We must reverse to get LE.
+    auto ntime_bytes = ParseHex(ntime);
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
+    header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
+
+    // nbits: same — Stratum sends BE hex, header needs LE
+    auto bits_bytes = ParseHex(nbits_hex);
+    std::reverse(bits_bytes.begin(), bits_bytes.end());
+    header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
+
+    // nonce: same — miner sends BE hex, header needs LE
+    auto nonce_bytes = ParseHex(nonce);
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
+    header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
+
+    if (header.size() != 80)
+        return 0.0;
+
+    // Diagnostic: dump header hex for byte-order debugging
+    {
+        static int dump_count = 0;
+        if (dump_count < 5) {
+            std::string hdr_hex;
+            static const char* HX = "0123456789abcdef";
+            for (auto b : header) { hdr_hex += HX[b>>4]; hdr_hex += HX[b&0xf]; }
+            LOG_INFO << "[PoW-diag] header(80)=" << hdr_hex;
+            LOG_INFO << "[PoW-diag] prevhash=" << prevhash_hex.substr(0,16) << "..."
+                     << " ntime=" << ntime << " nbits=" << nbits_hex << " nonce=" << nonce;
+            ++dump_count;
+        }
+    }
+
+    char pow_hash_bytes[32];
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
+
+    uint256 pow_hash;
+    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+    static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+    if (pow_hash.IsNull())
+        return 0.0;
+
+    double hash_val = 0.0;
+    for (int i = 31; i >= 0; --i)
+        hash_val = hash_val * 256.0 + static_cast<double>(pow_hash.data()[i]);
+
+    if (hash_val == 0.0)
+        return 0.0;
+
+    return truediffone / hash_val;
+}
+} // namespace core

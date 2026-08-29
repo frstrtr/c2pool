@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# runner-watchdog-mac-arm.sh
+#
+# Auto-reregister watchdog for the self-hosted macOS Apple Silicon CI runner
+# (Mac-mini-Alonso-227, labels: self-hosted,macOS,ARM64,c2pool-mac-arm).
+#
+# WHERE THIS RUNS: the CI bridge / workstation -- NOT on the Mac node.
+#   The node's launchd service already has KeepAlive(SuccessfulExit=false),
+#   which restarts a *crashed runner process*. That alone cannot recover a
+#   runner that GitHub has *deregistered* server-side (registration removed
+#   or its auth token revoked): re-registration needs a fresh registration
+#   token minted with repo-admin creds, which live here on the bridge, not
+#   on the Mac node. This watchdog closes that gap.
+#
+#   Sibling of runner-watchdog-mac-intel.sh. arm64 is a REQUIRED release leg
+#   (the macOS universal package lipo-merges the arm64 + x86_64 binaries), so
+#   the Apple Silicon node needs the same self-heal the Intel node already
+#   has -- an unattended arm64 drop must not block a release.
+#
+# WHAT IT DOES (idempotent, non-destructive):
+#   1. Polls the repo's runners API for Mac-mini-Alonso-227.
+#   2. If the runner is absent or "offline" for >= THRESHOLD consecutive
+#      checks, mints a fresh registration token and re-registers the runner
+#      over SSH using `config.sh --replace` (no delete; --replace reuses the
+#      same name), then reloads the launchd service.
+#   3. Resets the failure counter as soon as the runner is seen online.
+#
+# REVERT: delete this file + remove its launchd/cron entry on the bridge.
+#   It never deletes the runner; --replace is the only mutation it makes.
+#
+set -euo pipefail
+
+REPO="${C2POOL_REPO:-frstrtr/c2pool}"
+RUNNER_NAME="${RUNNER_NAME:-Mac-mini-Alonso-227}"
+NODE_SSH="${NODE_SSH:-user0@192.168.86.227}"
+NODE_KEY="${NODE_KEY:-$HOME/.ssh/id_ed25519}"
+RUNNER_DIR="${RUNNER_DIR:-/Users/user0/actions-runner}"
+RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,macOS,ARM64,c2pool-mac-arm}"
+SVC_LABEL="actions.runner.frstrtr-c2pool.${RUNNER_NAME}"
+
+# Re-register only after this many consecutive offline observations, so a
+# single transient blip (job restart, brief network drop) does not trigger
+# a churn. With a 5-min poll, 3 == ~15 min sustained offline.
+THRESHOLD="${THRESHOLD:-3}"
+STATE_FILE="${STATE_FILE:-$HOME/.cache/c2pool-runner-watchdog/${RUNNER_NAME}.fails}"
+
+log() { printf '%s [runner-watchdog:%s] %s\n' "$(date -u +%FT%TZ)" "$RUNNER_NAME" "$*"; }
+
+mkdir -p "$(dirname "$STATE_FILE")"
+fails=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+
+# Status as GitHub sees it: "online" | "offline" | "absent".
+status=$(gh api "repos/${REPO}/actions/runners" \
+  --jq ".runners[] | select(.name==\"${RUNNER_NAME}\") | .status" 2>/dev/null || true)
+[ -z "$status" ] && status="absent"
+
+if [ "$status" = "online" ]; then
+  [ "$fails" -ne 0 ] && log "back online; clearing fail counter ($fails -> 0)"
+  echo 0 > "$STATE_FILE"
+  exit 0
+fi
+
+fails=$((fails + 1))
+echo "$fails" > "$STATE_FILE"
+log "status=${status} consecutive_fails=${fails}/${THRESHOLD}"
+[ "$fails" -lt "$THRESHOLD" ] && exit 0
+
+log "threshold reached -> re-registering"
+REG_TOKEN=$(gh api --method POST "repos/${REPO}/actions/runners/registration-token" --jq .token)
+[ -z "$REG_TOKEN" ] && { log "ERROR: empty registration token"; exit 1; }
+# Removal token deregisters the stale server-side registration + wipes local
+# config so a clean re-register succeeds. Best-effort: if GitHub already
+# dropped the runner ("absent"), remove is a no-op and we fall back to
+# wiping the local config files directly.
+RM_TOKEN=$(gh api --method POST "repos/${REPO}/actions/runners/remove-token" --jq .token 2>/dev/null || true)
+
+# macOS runner service management is more involved than the Intel sibling's
+# original 5-liner assumed (that flow was never drop-tested). Two facts,
+# both confirmed by an actual .227 drop test 2026-07-27:
+#   (a) The runner's launchd LaunchAgent lives in the user's *GUI* (Aqua)
+#       domain. Over a non-GUI SSH session `svc.sh install/uninstall`
+#       (plain `launchctl load/unload`) fail with "Unload failed: 5:
+#       Input/output error". The agent must be managed with an explicit
+#       `launchctl bootout|bootstrap gui/$UID ...` target.
+#   (b) `config.sh --replace` does NOT bypass the local "already configured"
+#       guard; a real `config.sh remove` (or wiping .runner/.credentials)
+#       must precede a fresh `config.sh` configure.
+# Sequence: bootout+uninstall service -> unconfigure -> fresh configure ->
+# install + bootstrap+kickstart into the GUI domain. Non-destructive: no
+# runner is deleted beyond its own re-registration under the same name.
+ssh -i "$NODE_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "$NODE_SSH" \
+  REG_TOKEN="$REG_TOKEN" RM_TOKEN="$RM_TOKEN" REPO="$REPO" \
+  RUNNER_NAME="$RUNNER_NAME" RUNNER_LABELS="$RUNNER_LABELS" RUNNER_DIR="$RUNNER_DIR" \
+  bash -s <<'EOF'
+set -e
+cd "$RUNNER_DIR"
+U=$(id -u)
+LABEL="actions.runner.$(echo "$REPO" | tr '/' '-').${RUNNER_NAME}"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+
+# 1) stop + uninstall the LaunchAgent from the GUI domain
+launchctl bootout "gui/${U}/${LABEL}" 2>/dev/null || true
+./svc.sh uninstall 2>/dev/null || true
+
+# 2) unconfigure (deregister + wipe local config); fall back to wiping files
+if [ -n "$RM_TOKEN" ]; then
+  ./config.sh remove --token "$RM_TOKEN" || rm -f .runner .credentials .credentials_rsaparams
+else
+  rm -f .runner .credentials .credentials_rsaparams
+fi
+
+# 3) fresh register under the same name + labels
+./config.sh --unattended \
+  --url "https://github.com/${REPO}" \
+  --token "$REG_TOKEN" \
+  --name "$RUNNER_NAME" \
+  --labels "$RUNNER_LABELS"
+
+# 4) (re)install + load the service into the GUI domain
+./svc.sh install
+launchctl bootstrap "gui/${U}" "$PLIST" 2>/dev/null || true
+launchctl kickstart -k "gui/${U}/${LABEL}"
+EOF
+
+log "re-registration issued; clearing fail counter"
+echo 0 > "$STATE_FILE"

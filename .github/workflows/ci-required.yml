@@ -1,0 +1,57 @@
+name: CI Required
+# Single required status that aggregates the 10 previously-required contexts
+# (5 coin smokes from coin-matrix + DASH G1/G3a + DGB Phase-B + BCH G3a/G3b).
+# Path-filtering inside the called workflows may legitimately SKIP a lane on a
+# PR that does not touch it; this aggregate tolerates "skipped" but fails on any
+# failure or cancellation. Branch protection requires ONE context (CI Required /
+# aggregate) instead of 10, so path-filter skips no longer block merges.
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-required-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  coin-matrix:
+    uses: ./.github/workflows/coin-matrix.yml
+    secrets: inherit
+  dash-g1:
+    uses: ./.github/workflows/dash-gate-g1-byte-parity.yml
+    secrets: inherit
+  dash-g3a:
+    uses: ./.github/workflows/dash-gate-g3a-regtest-block-production.yml
+    secrets: inherit
+  dgb-phase-b:
+    uses: ./.github/workflows/dgb-phase-b-smoke.yml
+    secrets: inherit
+  bch-g3a:
+    uses: ./.github/workflows/bch-gate-g3a-regtest-block-production.yml
+    secrets: inherit
+  bch-g3b:
+    uses: ./.github/workflows/bch-gate-g3b-genuine-activation.yml
+    secrets: inherit
+
+  aggregate:
+    name: aggregate
+    needs: [coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail on any failed or cancelled lane; tolerate skipped
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "lane results: $results"
+          rc=0
+          for r in $results; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a required lane reported '$r'"; rc=1 ;;
+            esac
+          done
+          if [ "$rc" -ne 0 ]; then exit 1; fi
+          echo "all required lanes passed or were legitimately skipped"

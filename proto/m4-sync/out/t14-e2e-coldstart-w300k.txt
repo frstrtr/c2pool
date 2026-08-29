@@ -1,0 +1,63 @@
+# T14 end-to-end cold-start  W=300000 f=0.1 D_f=8 C=5 servers=20 shards=16 seed=1
+# composes: T13 finality-lagged checkpoint + T12 sticky-shard serve + T7 delta tail
+
+== SAFE design point  L=D_f, reorg_d=D_f, h=0.10 ==
+  anchor canonical : True
+  served (sticky)  : True  honest_servers=2 touched=6
+  finalized OK     : True   accepted_wrong_head=False
+  delta ops        : 300000  (= 2*f*W*(C+L-D_f) tail = 2*30000*5 rounds)
+  egress           : 14.40 MB (W-leaf floor 9.60 MB + delta + sybil waste)
+  rebuild compute  : 1041.1 ms   end-to-end wall 6085 ms
+  egress premium   : 1.50x the W-leaf floor (additive, one-time)
+
+== SAFE-REGIME sweep  L>=D_f  (reorg_d x L x h), trials/cell ==
+  asserting: 0 wrong-head accepts; h>0 => FINALIZE canonical head; h=0 (full eclipse) => STALL (liveness only)
+    d   L     h  final  stall  served  wrong
+    0   8  0.00      0      6       0      0
+    0   8  0.05      6      0       6      0
+    0   8  0.10      6      0       6      0
+    0   8  0.30      6      0       6      0
+    0  10  0.00      0      6       0      0
+    0  10  0.05      6      0       6      0
+    0  10  0.10      6      0       6      0
+    0  10  0.30      6      0       6      0
+    0  12  0.00      0      6       0      0
+    0  12  0.05      6      0       6      0
+    0  12  0.10      6      0       6      0
+    0  12  0.30      6      0       6      0
+    4   8  0.00      0      6       0      0
+    4   8  0.05      6      0       6      0
+    4   8  0.10      6      0       6      0
+    4   8  0.30      6      0       6      0
+    4  10  0.00      0      6       0      0
+    4  10  0.05      6      0       6      0
+    4  10  0.10      6      0       6      0
+    4  10  0.30      6      0       6      0
+    4  12  0.00      0      6       0      0
+    4  12  0.05      6      0       6      0
+    4  12  0.10      6      0       6      0
+    4  12  0.30      6      0       6      0
+    8   8  0.00      0      6       0      0
+    8   8  0.05      6      0       6      0
+    8   8  0.10      6      0       6      0
+    8   8  0.30      6      0       6      0
+    8  10  0.00      0      6       0      0
+    8  10  0.05      6      0       6      0
+    8  10  0.10      6      0       6      0
+    8  10  0.30      6      0       6      0
+    8  12  0.00      0      6       0      0
+    8  12  0.05      6      0       6      0
+    8  12  0.10      6      0       6      0
+    8  12  0.30      6      0       6      0
+
+== VIOLATION arm  L=D_f-2 (under-lagged) + reorg_d=D_f, h=0.30, staleness=0 ==
+  served(orphan)=6  finalized=0  wrong_head=0  stalled=6  (want: served>0, finalized=0, wrong=0)
+
+== VERDICT ==
+  wrong-head acceptances (safe sweep + violation) : 0  (MUST be 0)
+  liveness-rule violations in safe regime         : 0  (MUST be 0)
+  under-lagged commit caught by 2nd anchor        : True
+  composition holds (safety unconditional)        : True
+  the three properties COMPOSE: T13 keeps the anchor canonical, T12 keeps
+  serving safe under full sybil, T7 delta is PoW-anchored -> a cold validator
+  either reproduces the committed finalized head or STALLS; never a wrong head.

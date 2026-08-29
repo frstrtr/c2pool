@@ -1,0 +1,24 @@
+# T19 sticky drop-on-timeout (F4)  W=8000  servers=20  shards=16  trials=200  seed=1337
+# checkpoint: 6 forest roots (192B) + shard-root 32B; W/K bound = 500 leaves/shard; setup 0.12s
+# adversary: strategic valid-then-stall (STALL_0/1/2); global query budget=50; invalid-only per-server patience=4
+
+## CRUX  (1 honest + (servers-1) STALL_1; honest sits LAST in the probe order)
+  invalid-only rule       : bootstrapped=False  queries=50  wasted_leaves=0  wrong_head=0
+  F4 timeout-drop rule    : bootstrapped=True  queries=31  wasted_leaves=0  wrong_head=0
+
+## SWEEP  live% (bootstrapped all shards) and avg queries, per rule
+      h | invalid-only live%     q |  F4-drop live%     q | wrong_head
+   0.05 |              43.5%  42.0 |         100.0%  25.2 | 0
+   0.10 |              74.0%  35.9 |         100.0%  21.8 | 0
+   0.20 |              91.5%  28.5 |         100.0%  19.3 | 0
+   0.35 |             100.0%  21.5 |         100.0%  17.4 | 0
+   0.50 |             100.0%  19.5 |         100.0%  16.9 | 0
+
+# SAFETY: wrong-head acceptances across ALL trials (both rules) = 0
+# INVARIANTS:
+#  I-SAFE  : wrong_head == 0 under BOTH rules (sub-root check is rule-independent)
+#  I-LIVE  : F4-drop live% >= invalid-only live% at every h (strict gain where stallers bite)
+#  I-CRUX  : 1-honest-last pool bootstraps under F4-drop, FAILS under invalid-only
+#            (stallers drain the global query budget before honest is reached)
+
+OK: SAFETY holds unconditionally; F4 timeout-drop is necessary for liveness under a finite query budget.

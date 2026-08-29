@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include <gtest/gtest.h>
+
+#include <string>
+
+#include <nlohmann/json.hpp>
+
+#include <core/web_server.hpp>
+#include <core/uint256.hpp>
+
+// ---------------------------------------------------------------------------
+// KATs for core::MiningInterface::rest_recent_blocks -> node-role honesty (#942).
+//
+// A relay-only node learns some blocks over P2P from peers rather than finding
+// them itself. Those relay-learned records carry NO local share_hash and NO
+// miner address, and no local timing was ever computed for them. Before this
+// fix the endpoint labelled every timing-less block luck_method="first_block"
+// -- fabricating a computed-luck claim for blocks this node never found -- and
+// surfaced the timing fields as a real-looking 0.0, so the dashboard rendered
+// ten empty-but-numeric fields as if they were measured.
+//
+// The honesty rule these lock, in both directions:
+//   * RELAY-LEARNED (no share_hash, no miner): found_locally is false,
+//     luck_method is "relayed", and the timing-derived fields (luck,
+//     time_to_find, expected_time) are honest-absent null, never 0.
+//   * LOCALLY-FOUND (share_hash + miner present): found_locally is true,
+//     luck_method is a real timing label, and luck is a genuine number.
+//
+// Both FAIL WITHOUT THE FIX: before it there is no found_locally key at all,
+// the relay block reports luck_method=="first_block" not "relayed", and its
+// luck is 0.0 rather than null.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Locate a recorded block by hash in the /recent_blocks array.
+nlohmann::json find_block(const nlohmann::json& arr, const std::string& hash) {
+    for (const auto& b : arr)
+        if (b.contains("hash") && b["hash"].get<std::string>() == hash)
+            return b;
+    return nlohmann::json(nullptr);
+}
+
+} // namespace
+
+// RELAY-LEARNED: no local share/miner -> found_locally false, luck_method
+// "relayed", timing fields honest-absent null (never a fabricated 0).
+TEST(RelayBlockHonesty, RelayLearnedBlockIsHonestlyLabelled) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+
+    const std::string h =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    // Relay path: empty miner + empty share_hash (this node did not find it).
+    mi.record_found_block(/*height=*/900000, uint256S(h), /*ts=*/1750000000,
+                          /*chain=*/"LTC", /*miner=*/"", /*share_hash=*/"");
+
+    auto blk = find_block(mi.rest_recent_blocks(), h);
+    ASSERT_TRUE(blk.is_object()) << "relay-learned block must be recorded";
+
+    ASSERT_TRUE(blk.contains("found_locally"))
+        << "found_locally is the node-role signal the dashboard reads";
+    EXPECT_FALSE(blk["found_locally"].get<bool>())
+        << "a block with no local share/miner was not found by this node";
+
+    EXPECT_EQ(blk["luck_method"].get<std::string>(), "relayed")
+        << "must not fabricate a computed-luck label for a relay-learned block";
+
+    EXPECT_TRUE(blk["luck"].is_null())
+        << "relay-learned luck is unknown -- honest-absent null, not 0";
+    EXPECT_TRUE(blk["time_to_find"].is_null())
+        << "relay-learned time_to_find is unknown -- honest-absent null, not 0";
+    EXPECT_TRUE(blk["expected_time"].is_null())
+        << "relay-learned expected_time is unknown -- honest-absent null, not 0";
+}
+
+// LOCALLY-FOUND: real share + miner -> found_locally true, real timing label,
+// luck surfaced as a genuine number.
+TEST(RelayBlockHonesty, LocallyFoundBlockKeepsRealTiming) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+
+    const std::string h =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    // Found locally: real payout address + real share hash.
+    mi.record_found_block(/*height=*/900001, uint256S(h), /*ts=*/1750000100,
+                          /*chain=*/"LTC",
+                          /*miner=*/"LhK2b7hQ8example",
+                          /*share_hash=*/"deadbeef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), h);
+    ASSERT_TRUE(blk.is_object()) << "locally-found block must be recorded";
+
+    ASSERT_TRUE(blk.contains("found_locally"));
+    EXPECT_TRUE(blk["found_locally"].get<bool>())
+        << "a block with a real local share/miner was found by this node";
+
+    EXPECT_NE(blk["luck_method"].get<std::string>(), "relayed")
+        << "a locally-found block must carry a real timing label, not 'relayed'";
+
+    // 2026-08-05 revision: this block is the FIRST in its ledger, so no
+    // time_to_find exists and no luck was ever computed. The original
+    // assertion pinned that fabricated 0.0 as "a genuine measured number" —
+    // and the hotel's luck-trend chart faithfully drew those zeros as a
+    // catastrophe. An uncomputed luck is honest-absent null on found blocks
+    // too; luck_method=first_block is the label that says why.
+    EXPECT_TRUE(blk["luck"].is_null())
+        << "a first block has no luck measurement; 0 would be a fabricated one";
+    EXPECT_EQ(blk["luck_method"].get<std::string>(), "first_block");
+}
+
+// ─── actual_hash_difficulty: quality of the found hash (#1137) ───────────────
+//
+// = diff1 / block_hash (p2pool-dash web.py:1754). The dashboard reads it 12x
+// (drawDiffRatioBars, diamond elevation, the Hash Difficulty column, two
+// tooltip branches) and NO backend emitted it, so those visuals were dead on
+// every lane. It is only correct where the BLOCK HASH IS the PoW hash: DASH
+// (X11) and BTC (SHA256d). Scrypt lanes (LTC/DOGE) and multi-algo DGB must
+// emit null -- diff1/block_hash there describes the wrong hash.
+
+// diff1 target itself -> difficulty exactly 1.0.
+static const char* kDiff1Hash =
+    "00000000ffff0000000000000000000000000000000000000000000000000000";
+// A much smaller hash (more leading zeroes) -> a large difficulty.
+static const char* kDeepHash =
+    "000000000000000f000000000000000000000000000000000000000000000000";
+
+TEST(ActualHashDifficulty, DashLaneEmitsDiff1OverHash) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+    mi.record_found_block(/*height=*/2500000, uint256S(kDiff1Hash),
+                          /*ts=*/1750000000, /*chain=*/"DASH",
+                          /*miner=*/"XhK2example", /*share_hash=*/"beef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), kDiff1Hash);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk.contains("actual_hash_difficulty"));
+    ASSERT_TRUE(blk["actual_hash_difficulty"].is_number())
+        << "DASH block hash IS the X11 PoW hash -- the field must be emitted";
+    // hash == diff1 target -> difficulty 1.0.
+    EXPECT_NEAR(blk["actual_hash_difficulty"].get<double>(), 1.0, 1e-6);
+}
+
+TEST(ActualHashDifficulty, DeeperHashGivesHigherDifficulty) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+    mi.record_found_block(/*height=*/2500001, uint256S(kDeepHash),
+                          /*ts=*/1750000100, /*chain=*/"DASH",
+                          /*miner=*/"XhK2example", /*share_hash=*/"beef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), kDeepHash);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk["actual_hash_difficulty"].is_number());
+    // A hash far below the diff1 target is a much "better" (rarer) hash.
+    EXPECT_GT(blk["actual_hash_difficulty"].get<double>(), 1e6)
+        << "a hash with many more leading zeroes than target implies high diff";
+}
+
+TEST(ActualHashDifficulty, BtcLaneAlsoEmits) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::BITCOIN);
+    mi.record_found_block(/*height=*/800000, uint256S(kDiff1Hash),
+                          /*ts=*/1750000000, /*chain=*/"BTC",
+                          /*miner=*/"1BtcExample", /*share_hash=*/"beef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), kDiff1Hash);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk["actual_hash_difficulty"].is_number())
+        << "BTC block hash IS the SHA256d PoW hash -- the field must be emitted";
+    EXPECT_NEAR(blk["actual_hash_difficulty"].get<double>(), 1.0, 1e-6);
+}
+
+TEST(ActualHashDifficulty, ScryptLaneEmitsNullNotAWrongNumber) {
+    // LTC: block identity hash is SHA256d, PoW is scrypt. diff1/block_hash
+    // would describe the SHA256d hash, which is NOT what won the block. That
+    // is a fabricated measurement, so the lane emits null until a pow_hash is
+    // captured at find time (scoped out -- FoundBlock field + mint plumbing).
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    mi.record_found_block(/*height=*/2600000, uint256S(kDiff1Hash),
+                          /*ts=*/1750000000, /*chain=*/"LTC",
+                          /*miner=*/"LhK2example", /*share_hash=*/"beef");
+
+    auto blk = find_block(mi.rest_recent_blocks(), kDiff1Hash);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk.contains("actual_hash_difficulty"));
+    EXPECT_TRUE(blk["actual_hash_difficulty"].is_null())
+        << "scrypt lane must NOT emit diff1/block_hash -- that is the wrong hash";
+}

@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+#include <map>
+#include <optional>
+#include <source_location>
+
+#include <pool/peer.hpp>
+#include <pool/protocol.hpp>
+#include <core/common.hpp>
+#include <core/factory.hpp>
+#include <core/socket.hpp>
+#include <core/message.hpp>
+#include <core/config.hpp>
+#include <core/random.hpp>
+#include <core/addr_store.hpp>
+#include <core/p2p_message_stats.hpp>
+
+namespace pool
+{
+
+std::string parse_net_error(const boost::system::error_code& ec);
+
+class NodeInterfaces : public core::ICommunicator, public core::INetwork
+{
+    //-core::ICommmunicator:
+    // void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
+    // void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
+    // void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) = 0;
+    // const std::vector<std::byte>& get_prefix() const = 0;
+    //
+    //-core::INetwork:
+    // void connected(std::shared_ptr<core::Socket> socket) = 0;
+    // void disconnect() = 0;
+};
+
+template <typename ConfigType, typename ShareChainType, typename PeerData>
+class BaseNode : public NodeInterfaces, public core::Factory<core::Server, core::Client>
+{
+    // For implementation override:
+    //  INetwork:
+    //      void disconnect()
+    // BaseNode:
+    //      void handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
+    //      void send_ping(peer_ptr peer);
+protected:
+    const time_t NEW_PEER_TIMEOUT_TIME = 10;
+    const time_t PEER_TIMEOUT_TIME = 100;
+    const time_t PING_DELAY = 60;
+
+public:
+    using base_t = BaseNode<ConfigType, ShareChainType, PeerData>;
+    using peer_t = pool::Peer<PeerData>;
+    using peer_ptr = std::shared_ptr<peer_t>;
+    using config_t = ConfigType;
+
+protected:
+    boost::asio::io_context* m_context;
+    config_t* m_config; // todo: init
+    ShareChainType* m_chain; // todo: init
+    core::AddrStore m_addrs;
+
+    uint64_t m_nonce; // node_id todo: init
+    std::map<NetService, peer_ptr> m_connections;
+    std::map<uint64_t, peer_ptr> m_peers; // key = peers nonce
+
+    std::unique_ptr<core::Timer> m_ping_timer;
+
+public:
+    BaseNode() : Factory<Server, Client>(nullptr, this, "Pool"), m_addrs("") {}
+    BaseNode(boost::asio::io_context* context, config_t* config)
+        : Factory<Server, Client>(context, this, "Pool"), m_context(context), m_addrs(config->m_name), m_config(config)
+    {
+        // ping timer for all peers
+        m_ping_timer = std::make_unique<core::Timer>(m_context, true);
+        m_ping_timer->start(PING_DELAY, 
+            [&]()
+            {
+                for (auto& [nonce, peer] : m_peers)
+                {
+                    if (m_peers.contains(peer->m_nonce))
+                        send_ping(peer);
+                }
+            }
+        );
+    }
+
+    const std::vector<std::byte>& get_prefix() const override { return m_config->pool()->m_prefix; }
+    void connected(std::shared_ptr<core::Socket> socket) override 
+    {
+        // make peer
+        auto peer = std::make_shared<peer_t>(socket);
+        // move peer to m_connections
+        m_connections[socket->get_addr()] = peer;
+        // configure peer timeout timer
+        peer->m_timeout = std::make_unique<core::Timer>(m_context, true);
+        peer->m_timeout->start(NEW_PEER_TIMEOUT_TIME, [&, addr = peer->addr()](){ timeout(addr); });
+
+        LOG_INFO << "[Pool] " << socket->get_addr().to_string() << " connected";
+    }
+
+    void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
+    {
+        // Copy NetService — the reference may become dangling if the socket
+        // that owns it is destroyed before this handler completes.
+        NetService svc_copy = service;
+        LOG_WARNING << "[Pool] Peer " << svc_copy.to_string()
+                    << " disconnected: " << err;
+        if (m_connections.contains(svc_copy))
+        {
+            auto node = m_connections.extract(svc_copy);
+            auto peer = std::move(node.mapped());
+            peer->m_timeout->stop();
+            peer->cancel();
+            peer->close();
+            // Defer peer destruction to the next ioc iteration.
+            // The timeout callback may still be on the call stack —
+            // destroying the peer (and its Timer) now would be a
+            // use-after-free.  The posted lambda captures the shared_ptr
+            // keeping the peer alive until the current handler returns.
+            boost::asio::post(*m_context, [p = std::move(peer)]() mutable {
+                p.reset();
+            });
+        }
+        // else: already removed (double-disconnect race) — safe to ignore
+    }
+
+    void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override
+    {
+        error(parse_net_error(ec), service, where);
+    }
+
+    void timeout(const NetService& service)
+    {
+        error("peer timeout!", service);
+    }
+
+    /// Gracefully close a connection without error logging.
+    /// Used for expected disconnects (duplicate connections, self-connections).
+    virtual void close_connection(const NetService& service)
+    {
+        if (m_connections.contains(service))
+        {
+            auto node = m_connections.extract(service);
+            auto peer = std::move(node.mapped());
+            peer->m_timeout->stop();
+            peer->cancel();
+            peer->close();
+            // Defer destruction — same reason as error()
+            boost::asio::post(*m_context, [p = std::move(peer)]() mutable {
+                p.reset();
+            });
+        }
+    }
+
+    void got_addr(NetService addr, uint64_t services, uint64_t timestamp)
+    {
+    	if (m_addrs.check(addr))
+    	{
+    		auto old = m_addrs.get(addr);
+    		m_addrs.update(addr, {services, old.m_first_seen, std::max(old.m_last_seen, timestamp)});
+    	}
+    	else
+    	{
+    		if (m_addrs.len() < 10000)
+    			m_addrs.add(addr, {services, timestamp, timestamp});
+    	}
+    }
+
+	std::vector<core::AddrStorePair> get_good_peers(size_t max_count)
+    {
+	    auto t = core::timestamp();
+
+        std::vector<std::pair<float, core::AddrStorePair>> values;
+	    for (auto pair : m_addrs.get_all())
+	    {
+	    	values.push_back(
+	    			std::make_pair(
+	    					-log(std::max(uint64_t(3600), pair.value.m_last_seen - pair.value.m_first_seen)) / log(std::max(uint64_t(3600), t - pair.value.m_last_seen)) * core::random::expovariate(1),
+	    					pair)
+            );
+	    }
+
+	    std::sort(values.begin(), values.end(), [](const auto& a, auto b)
+	    { return a.first < b.first; });
+
+	    values.resize(std::min(values.size(), max_count));
+	    std::vector<core::AddrStorePair> result;
+	    for (const auto& v : values)
+	    {
+	    	result.push_back(v.second);
+	    }
+	    return result;
+    }
+
+    virtual void send_ping(peer_ptr peer) = 0;
+    virtual std::optional<PeerConnectionType> handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) = 0;
+};
+
+// Legacy -- p2pool; Actual -- c2pool
+template <typename Base, typename Legacy, typename Actual>
+class NodeBridge : public virtual Base, public Legacy, public Actual
+{
+    static_assert(std::is_base_of_v<Protocol<Base>, Legacy> && std::is_base_of_v<Protocol<Base>, Actual>);
+
+public:
+    template <typename... Args>
+    NodeBridge(boost::asio::io_context* ctx, Base::config_t* config, Args... args) : Base(ctx, config, args...){ }
+
+    void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
+    {
+        // RECEIVE choke point for the pool protocol: every inbound pool
+        // message in every coin lane is dispatched from here, whether it ends
+        // up in the Legacy (p2pool) or Actual (c2pool) protocol handler. The
+        // inbound counter therefore lives here and NOT in the per-coin
+        // protocol_legacy.cpp / protocol_actual.cpp files.
+        //
+        // Counted BEFORE the connection guard on purpose: a message that
+        // arrives for an already-dropped peer still crossed the wire, and
+        // hiding it would reproduce exactly the blind spot this counter set
+        // exists to close. Observe-only — relaxed fetch_add, message untouched.
+        if (rmsg)
+        {
+            auto& stats = core::obs::p2p_stats();
+            stats.count_in(rmsg->m_command);
+            if (stats.trace_enabled.load(std::memory_order_relaxed))
+                LOG_DEBUG_POOL << "[p2p-msg] in "
+                               << std::string(core::obs::trim_command(rmsg->m_command))
+                               << " <- " << service.to_string();
+        }
+
+        // Guard: peer may have been removed by a prior error/timeout while
+        // an async_read callback was still in-flight for the same socket.
+        if (!Base::m_connections.contains(service))
+            return;
+        auto peer = Base::m_connections[service];
+        peer->m_timeout->restart();
+
+        if (peer->type() == PeerConnectionType::unknown)
+        {
+            if (rmsg->m_command.compare(0, 7, "version") != 0)
+                return Base::error("message wanna for be version", service);
+
+            std::optional<PeerConnectionType> peer_type;
+            try
+            {
+                peer_type = Base::handle_version(std::move(rmsg), peer);
+            } catch (const std::exception& ex)
+            {
+                Base::error(ex.what(), service);
+                return;
+            }
+            if (!peer_type.has_value())
+            {
+                // Graceful disconnect (duplicate or self-connection)
+                Base::close_connection(service);
+                return;
+            }
+            peer->stable(*peer_type, Base::PEER_TIMEOUT_TIME); // after message_version a stable connection is established.
+            return;
+        }
+
+        switch (peer->type())
+        {
+        case PeerConnectionType::legacy:
+            static_cast<Legacy*>(this)->handle_message(std::move(rmsg), peer);
+            break;
+        case PeerConnectionType::actual:
+            static_cast<Actual*>(this)->handle_message(std::move(rmsg), peer);
+            break;
+        default:
+            return;
+        }
+    }
+};
+
+#define ADD_HANDLER(name, msg_type)\
+    void handle (std::unique_ptr<msg_type> msg, peer_ptr peer)
+
+#define HANDLER(name)\
+    handle (std::unique_ptr<message_ ##name> msg, peer_ptr peer)
+
+} // namespace pool

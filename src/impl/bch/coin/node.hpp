@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+// ---------------------------------------------------------------------------
+// bch::coin::Node -- embedded coin-node front-end, ported from
+// src/impl/btc/coin/node.hpp (M3 slice 13, last P2P-layer file).
+//
+// This is the site where bch's config.hpp FIRST resolves concretely: the
+// class is template<ConfigType> and config binds only at the Node<Config>
+// instantiation (binary entrypoint), exactly as the btc reference defers it.
+// Until then nothing in the P2P layer is config-gated.
+//
+// Aggregates the embedded daemon front-ends landed in slices 1-12:
+//   m_rpc : NodeRPC                 -- external coin-RPC client (work source)
+//   m_p2p : p2p::NodeP2P<config_t>  -- embedded BCHN peer driver (fast relay)
+// and derives from bch::interfaces::Node for the work/event surface.
+//
+// >>> BCH DIVERGENCE (standalone SHA256d parent, M1 4.x) <<<
+//   - No MWEB / extension-block payload (LTC-specific); full_block carries
+//     plain BlockType -- inherited from node_interface.hpp.
+//   - No AuxPoW hooks (BCH is not merged-mined).
+//   - Handshake protocol version is 70016, matching the btc reference and the
+//     bch p2p_node.hpp version handshake; no NODE_WITNESS / wtxidrelay.
+// ---------------------------------------------------------------------------
+
+#include <memory>
+
+#include <boost/asio.hpp>
+
+#include "rpc.hpp"
+#include "p2p_node.hpp"
+#include "node_interface.hpp"
+
+namespace bch
+{
+
+namespace coin
+{
+
+using p2p::NodeP2P;
+
+template <typename ConfigType>
+class Node : public bch::interfaces::Node
+{
+    using config_t = ConfigType;
+
+    boost::asio::io_context* m_context;
+    config_t* m_config;
+
+    std::unique_ptr<NodeRPC> m_rpc;
+    std::unique_ptr<NodeP2P<config_t>> m_p2p;
+
+    void init_p2p()
+    {
+        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p->connect(m_config->coin()->m_p2p.address);
+    }
+
+    // embedded_primary: when the in-process embedded daemon is the PRIMARY work
+    // source (v36 external_fallback invariant), a dead / 0-peer external BCHN that
+    // cannot yet answer getblocktemplate must NOT abort bring-up -- the embedded
+    // source provides work and the external RPC is only the fallback sink. When the
+    // external RPC IS the work source (embedded_primary == false), a failure here
+    // stays fatal exactly as before.
+    void init_rpc(bool embedded_primary)
+    {
+        m_rpc = std::make_unique<NodeRPC>(m_context, this, m_config->m_testnet);
+        m_rpc->connect(m_config->m_rpc.address, m_config->m_rpc.userpass);
+
+        // work (eager prime from external RPC)
+        if (embedded_primary) {
+            try {
+                work.set(m_rpc->getwork());
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[EMB-BCH] init_rpc: external BCHN getwork() unavailable"
+                               " at bring-up (" << e.what() << "); embedded-primary ->"
+                               " deferring to embedded work source, RPC retained as"
+                               " fallback sink.";
+            }
+        } else {
+            work.set(m_rpc->getwork());
+        }
+    }
+
+public:
+
+    Node(auto* context, auto* config) : m_context(context), m_config(config)
+    {
+    }
+
+    // embedded_primary defaults false: an external-RPC-as-work-source config still
+    // hard-fails on a dead RPC at bring-up. The embedded daemon passes true.
+    void run(bool embedded_primary = false)
+    {
+        // RPC
+        init_rpc(embedded_primary);
+    }
+
+    /// Start P2P connection to coin daemon for fast block relay.
+    /// Call after run() when P2P address is configured.
+    void start_p2p(const NetService& addr)
+    {
+        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p->connect(addr);
+        LOG_INFO << "Coin P2P broadcaster connecting to " << addr.to_string();
+    }
+
+    /// Submit a block via P2P directly (faster propagation than RPC).
+    void submit_block_p2p(BlockType& block)
+    {
+        if (m_p2p)
+            m_p2p->submit_block(block);
+    }
+
+    /// Submit a pre-serialized block via P2P. Used by the stratum work
+    /// source which already has the full block bytes assembled from
+    /// (header || tx_count || coinbase || tx_data) and does not need to
+    /// round-trip through BlockType deserialization.
+    void submit_block_p2p_raw(const std::vector<unsigned char>& block_bytes)
+    {
+        if (m_p2p)
+            m_p2p->submit_block_raw(block_bytes);
+    }
+
+    bool has_p2p() const { return m_p2p != nullptr; }
+
+    /// External BCHN-RPC client, or nullptr until run()/init_rpc() has run.
+    /// Handed to CoinNode as the live external FALLBACK sink behind the
+    /// embedded work source (v36 external_fallback invariant). Not owned by
+    /// the caller -- the Node retains ownership for its whole lifetime.
+    NodeRPC* rpc() { return m_rpc.get(); }
+
+    /// Embedded BCHN P2P driver, or nullptr until start_p2p()/init_p2p() ran.
+    /// Exposes the read-only IBD counters (ibd_reissue_count / false_evict) to
+    /// the --ibd run-loop. Node retains ownership.
+    NodeP2P<config_t>* p2p() { return m_p2p.get(); }
+
+    /// Send getheaders to drive header sync.
+    /// Locator should be hashes from chain tip back to genesis (sparsely);
+    /// for an empty chain pass {genesis_hash}. Stop = uint256::ZERO means
+    /// "send up to 2000 headers from locator first match forward".
+    /// version is the requester protocol_version (70016, matching the
+    /// bch p2p_node.hpp version handshake).
+    void send_getheaders(uint32_t version,
+                         const std::vector<uint256>& locator,
+                         const uint256& stop)
+    {
+        if (m_p2p)
+            m_p2p->send_getheaders(version, locator, stop);
+    }
+
+    /// True once the version+verack handshake completed with the peer.
+    bool is_handshake_complete() const
+    {
+        return m_p2p && m_p2p->is_handshake_complete();
+    }
+};
+
+} // namespace coin
+
+} // namespace bch

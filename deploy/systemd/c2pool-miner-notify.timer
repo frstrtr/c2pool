@@ -1,0 +1,10 @@
+[Unit]
+Description=c2pool D-MINER.5 notify engine evaluation cadence
+
+[Timer]
+# Evaluate every 5 min; offline-min default 15 + hourly throttle make this safe.
+OnCalendar=*:0/5
+Persistent=false
+
+[Install]
+WantedBy=timers.target

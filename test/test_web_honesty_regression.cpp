@@ -1,0 +1,1872 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Web honesty-regression KAT (SAFE-ADDITIVE characterization test).
+//
+// Charter: "A dashboard must never lie about prod health." (founding bug
+// 2026-06-22 -- the getinfo / local_stats surface reported connections=0 and
+// poolhashps=0 while the node was fully peered + mining, because the embedded
+// prod build runs MiningInterface with an UNPOPULATED m_node (the enhanced_node
+// stub whose peer/hashrate/share accessors all return 0). It lied to the
+// operator TWICE in one night about contabo LTC+DOGE prod health.)
+//
+// This test pins the un-stub fix in place: it constructs MiningInterface with
+// node == nullptr -- the exact embedded-prod topology that produced the false
+// zeros -- and verifies getinfo() sources connections / poolhashps / poolshares
+// / difficulty from the live MiningInterface hooks instead of collapsing to the
+// historical 0-stubs. If anyone re-introduces the m_node-only path, these
+// expectations fail loudly.
+#include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+
+#include <core/web_server.hpp>
+#include <impl/dash/config_pool.hpp>   // dash::SharechainConfig SHARE_PERIOD / TARGET_LOOKBEHIND
+#include <impl/ltc/config_pool.hpp>    // ltc::PoolConfig  SHARE_PERIOD / TARGET_LOOKBEHIND
+
+#include <cmath>
+#include <fstream>   // folded merged-gating KAT (#912)
+#include <sstream>
+#include <vector>
+
+using namespace core;
+using nlohmann::json;
+
+// With an empty m_node but live hooks wired, getinfo must report TRUTH, not the
+// historical zeros.
+TEST(WebHonestyRegression, GetInfoSourcesLiveHooksNotZeroStubs) {
+    // node == nullptr: the embedded-prod topology where every m_node accessor
+    // returns 0 -- the founding-bug scenario.
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    // 7 real c2pool share-peers (the prod node ran 6-7 V36 share peers on the
+    // night of the founding bug while the dashboard said "0").
+    mi.set_peer_info_fn([] {
+        json peers = json::array();
+        for (int i = 0; i < 7; ++i)
+            peers.push_back(json{{"addr", "10.0.0." + std::to_string(i)}});
+        return peers;
+    });
+    // Real pool hashrate -- 62.2 GH/s was the verified contabo prod truth once
+    // the stub was fixed (see founding-charter-verified-prod).
+    mi.set_pool_hashrate_fn([] { return 62.2e9; });
+    // Live sharechain stats (same truthful source #462 used for stale/DOA).
+    mi.set_sharechain_stats_fn([] {
+        return json{{"total_shares", 12345}, {"average_difficulty", 1024.0}};
+    });
+
+    json r = mi.getinfo("kat");
+
+    // The four metrics that the founding bug zeroed out:
+    EXPECT_EQ(r["connections"].get<int>(), 7)
+        << "share-peer count must come from m_peer_info_fn, not the 0-stub";
+    EXPECT_GT(r["poolhashps"].get<double>(), 0.0)
+        << "pool hashrate must come from m_pool_hashrate_fn, not the 0-stub";
+    EXPECT_DOUBLE_EQ(r["poolhashps"].get<double>(), 62.2e9);
+    EXPECT_EQ(r["poolshares"].get<uint64_t>(), 12345u)
+        << "poolshares must come from the live sharechain stats hook";
+    EXPECT_GT(r["difficulty"].get<double>(), 0.0)
+        << "difficulty must come from the live sharechain stats hook";
+}
+
+// Belt-and-braces: a nodeless interface with NO hooks still returns a
+// well-formed object whose un-stub keys are STRUCTURALLY present (value 0).
+// Absent telemetry reporting a structural 0 ("not instrumented") is honest --
+// distinct from the founding lie of reporting 0 while live data exists.
+TEST(WebHonestyRegression, GetInfoWellFormedWithoutHooks) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json r = mi.getinfo("kat");
+    ASSERT_TRUE(r.is_object());
+    EXPECT_TRUE(r.contains("connections"));
+    EXPECT_TRUE(r.contains("poolhashps"));
+    EXPECT_TRUE(r.contains("poolshares"));
+    EXPECT_TRUE(r.contains("difficulty"));
+}
+
+// --- getstats: same founding-bug surface as getinfo --------------------------
+// getstats() reported connected_peers=0 / pool_hashrate=0 and zeroed orphan/DOA/
+// stale share counts whenever m_node was the empty embedded-prod stub, while
+// /stale_rates (the same m_sharechain_stats_fn hook) showed the truth. Pin the
+// un-stub: with node==nullptr and live hooks wired, pool_statistics must report
+// real peers / hashrate / orphan / DOA / stale.
+TEST(WebHonestyRegression, GetStatsSourcesLiveHooksNotZeroStubs) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    mi.set_peer_info_fn([] {
+        json peers = json::array();
+        for (int i = 0; i < 7; ++i)
+            peers.push_back(json{{"addr", "10.0.0." + std::to_string(i)}});
+        return peers;
+    });
+    mi.set_pool_hashrate_fn([] { return 62.2e9; });
+    // 1000 total shares, 30 orphan + 10 dead -> 40 stale, 4% stale_prop.
+    mi.set_sharechain_stats_fn([] {
+        return json{{"total_shares", 1000}, {"orphan_shares", 30}, {"dead_shares", 10}};
+    });
+
+    json r = mi.getstats("kat");
+    ASSERT_TRUE(r.contains("pool_statistics"));
+    const json& ps = r["pool_statistics"];
+
+    EXPECT_EQ(ps["connected_peers"].get<int>(), 7)
+        << "connected_peers must come from m_peer_info_fn, not the 0-stub";
+    EXPECT_DOUBLE_EQ(ps["pool_hashrate"].get<double>(), 62.2e9)
+        << "pool_hashrate must come from m_pool_hashrate_fn, not the 0-stub";
+    EXPECT_EQ(ps["orphan_shares"].get<uint64_t>(), 30u)
+        << "orphan_shares must come from the live sharechain stats hook";
+    EXPECT_EQ(ps["doa_shares"].get<uint64_t>(), 10u)
+        << "doa_shares must come from the live sharechain stats hook";
+    EXPECT_EQ(ps["stale_shares"].get<uint64_t>(), 40u)
+        << "stale_shares = orphan + dead from the live hook";
+    EXPECT_DOUBLE_EQ(ps["stale_prop"].get<double>(), 0.04)
+        << "stale_prop = (orphan+dead)/total from the live hook";
+}
+
+// Belt-and-braces: nodeless interface with NO hooks still returns a well-formed
+// getstats whose un-stub keys are structurally present (honest 0 = "not
+// instrumented", distinct from the founding lie of 0-while-live-data-exists).
+TEST(WebHonestyRegression, GetStatsWellFormedWithoutHooks) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json r = mi.getstats("kat");
+    ASSERT_TRUE(r.contains("pool_statistics"));
+    const json& ps = r["pool_statistics"];
+    EXPECT_TRUE(ps.contains("connected_peers"));
+    EXPECT_TRUE(ps.contains("pool_hashrate"));
+    EXPECT_TRUE(ps.contains("orphan_shares"));
+    EXPECT_TRUE(ps.contains("doa_shares"));
+    EXPECT_TRUE(ps.contains("stale_shares"));
+}
+
+// --- getpeerinfo: the real per-peer list, not the 0-count fallback -----------
+// On the embedded-prod build m_node->get_connected_peers_count() returns 0 while
+// the node is fully peered. getpeerinfo() must return the real per-peer list
+// from m_peer_info_fn -- not the single {connected_peers:0} aggregate fallback.
+TEST(WebHonestyRegression, GetPeerInfoReturnsLivePeerListNotZeroStub) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    mi.set_peer_info_fn([] {
+        json peers = json::array();
+        for (int i = 0; i < 7; ++i)
+            peers.push_back(json{{"addr", "10.0.0." + std::to_string(i)}});
+        return peers;
+    });
+
+    json r = mi.getpeerinfo("kat");
+    ASSERT_TRUE(r.is_array());
+    EXPECT_EQ(r.size(), 7u)
+        << "getpeerinfo must return the real per-peer list from m_peer_info_fn";
+    EXPECT_EQ(r[0]["addr"].get<std::string>(), "10.0.0.0");
+}
+
+// Without a live hook and without a node, getpeerinfo returns an empty array --
+// honest absence (no peers reported because none are observable), never a
+// fabricated count.
+TEST(WebHonestyRegression, GetPeerInfoEmptyWithoutHooksIsHonest) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json r = mi.getpeerinfo("kat");
+    ASSERT_TRUE(r.is_array());
+    EXPECT_TRUE(r.empty())
+        << "no node + no hook -> empty list (honest absence), not a fake count";
+}
+
+// --- rest_miner_stats: per-worker share-outcome labels, not the inversion lie -
+// Before #467 the per-miner panel reported doa_shares = the stale counter and
+// orphan_shares = 0 -- an inversion: stale-template shares are ORPHANs (stale_info
+// 253), and there is no per-worker daemon-DOA *share* counter at all (DOA is
+// surfaced as dead_hashrate, not a share count). The old labelling told the
+// operator a worker had DOA shares it never had, and hid its real orphan rate.
+// Also: low-diff/invalid submissions (rejected) were never exposed. Pin the
+// corrected mapping so the inversion cannot silently return.
+TEST(WebHonestyRegression, MinerStatsLabelsOrphanNotDoaAndExposesRejected) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    // One stratum worker for address "addr1" (worker suffix ".alpha" stripped):
+    // 100 accepted, 5 rejected (invalid/low-diff), 10 stale (expired template).
+    core::stratum::WorkerInfo w;
+    w.username = "addr1.alpha";
+    w.hashrate = 50e9;
+    w.dead_hashrate = 2e9;   // DOA surfaced as hashrate, not a share count
+    w.difficulty = 1024.0;
+    w.accepted = 100;
+    w.rejected = 5;
+    w.stale = 10;
+    mi.register_stratum_worker("sess-1", w);
+
+    json r = mi.rest_miner_stats("addr1");
+
+    EXPECT_TRUE(r["active"].get<bool>())
+        << "a registered worker for this address must read active";
+    // The corrected #467 mapping: stale -> ORPHAN, DOA share count -> 0.
+    EXPECT_EQ(r["orphan_shares"].get<uint64_t>(), 10u)
+        << "stale-template shares are orphans (stale_info 253), not doa";
+    EXPECT_EQ(r["doa_shares"].get<uint64_t>(), 0u)
+        << "no per-worker DOA share counter -- DOA lives in dead_hashrate, "
+           "never a copy of the stale counter (the pre-#467 inversion lie)";
+    EXPECT_EQ(r["dead_shares"].get<uint64_t>(), 10u)
+        << "dead = orphan + doa; only orphans are counted per-worker here";
+    EXPECT_EQ(r["rejected_shares"].get<uint64_t>(), 5u)
+        << "invalid/low-diff submissions must be exposed, never counted as shares";
+    EXPECT_EQ(r["total_shares"].get<uint64_t>(), 110u)
+        << "total = accepted + stale (rejected are NOT shares)";
+    EXPECT_EQ(r["unstale_shares"].get<uint64_t>(), 100u);
+    EXPECT_DOUBLE_EQ(r["dead_hashrate"].get<double>(), 2e9)
+        << "DOA is surfaced honestly as dead_hashrate";
+    // doa_rate is the stale fraction of submitted work: stale/(accepted+stale).
+    EXPECT_DOUBLE_EQ(r["doa_rate"].get<double>(), 10.0 / 110.0);
+}
+
+// An address with no matching worker reports inactive zeros -- honest absence,
+// never fabricated activity.
+TEST(WebHonestyRegression, MinerStatsUnknownAddressIsHonestlyInactive) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json r = mi.rest_miner_stats("nobody");
+    EXPECT_FALSE(r["active"].get<bool>());
+    EXPECT_EQ(r["total_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["orphan_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["doa_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["rejected_shares"].get<uint64_t>(), 0u);
+}
+
+// --- rest_stratum_security: signal not-instrumented, never a fake all-clear ---
+// The old body returned fixed zeros (connections_per_second / potential_ddos /
+// blacklisted_ips) so stratum.html painted "0.0 / normal / 0 banned / Normal"
+// FOREVER -- a security widget that can never go red, the founding-charter lie
+// class. #470 replaced it with an explicit not-instrumented signal so the page
+// guard (`secData.error`) trips and the panel shows "-" instead of fake green.
+// Pin: the endpoint must self-declare unavailable and must NOT emit the old
+// fabricated all-clear fields.
+TEST(WebHonestyRegression, StratumSecuritySignalsNotInstrumentedNotFakeGreen) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json r = mi.rest_stratum_security();
+    ASSERT_TRUE(r.is_object());
+    EXPECT_FALSE(r.value("available", true))
+        << "the panel must learn the metrics are unavailable";
+    EXPECT_EQ(r.value("error", std::string{}), "not_instrumented")
+        << "the page guard keys off error == not_instrumented to show -";
+    // The fabricated all-clear fields that could paint permanent green must be
+    // gone -- their mere presence (even as 0) re-arms the can-never-go-red lie.
+    EXPECT_FALSE(r.contains("connections_per_second"));
+    EXPECT_FALSE(r.contains("potential_ddos"));
+    EXPECT_FALSE(r.contains("blacklisted_ips"));
+    EXPECT_FALSE(r.contains("threat_level"));
+}
+
+// --- charter #3: ratchet / crossing-state honesty ----------------------------
+// The dashboard must tell the truth about the V35->V36 cross. Two founding-class
+// lies are pinned here:
+//   (a) currency_info.share_version was hardcoded 36 -- a node still VOTING
+//       (producing V35 shares) would report 36, making the bundled sharechain-
+//       explorer misclassify live V35 share cells as V36 (#491).
+//   (b) v36_status.auto_ratchet.v36_active was a frozen stub -- it must derive
+//       from the LIVE ratchet latch (m_cached_share_version) so a node that has
+//       latched to V36 cannot be shown as still "voting", nor vice-versa (#499).
+// Both are the same class of lie as the founding 0-stubs: the dashboard claiming
+// one thing while the node is actually doing another, during the very crossing
+// the operator is coordinating live on LTC prod.
+
+// (a) currency_info.share_version reflects the LIVE ratchet output, never a
+// static 36: a VOTING LTC node still mining V35 must report 35.
+TEST(WebHonestyRegression, CurrencyInfoShareVersionIsLiveRatchetNotStatic36) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+
+    mi.set_cached_share_version(35);  // node still VOTING -- producing V35 shares
+    json r = mi.rest_web_currency_info();
+    EXPECT_EQ(r["share_version"].get<int64_t>(), 35)
+        << "share_version must track m_cached_share_version (live ratchet), never "
+           "a hardcoded 36 -- reporting 36 while VOTING lies about the cross";
+}
+
+// currency_info.share_version follows the latch forward once the node crosses.
+TEST(WebHonestyRegression, CurrencyInfoShareVersionFollowsLatchToV36) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+
+    mi.set_cached_share_version(36);  // node has latched to V36
+    json r = mi.rest_web_currency_info();
+    EXPECT_EQ(r["share_version"].get<int64_t>(), 36)
+        << "share_version must follow the live latch to 36 once crossed";
+}
+
+// DASH is non-ratcheting on the LTC AutoRatchet path: its share_version stays
+// the static protocol v16 even if the cached ratchet value is something else --
+// the LTC ratchet cache must never bleed into a Dash dashboard.
+TEST(WebHonestyRegression, CurrencyInfoDashShareVersionStaysStatic16) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+
+    mi.set_cached_share_version(35);  // would be a lie to surface on Dash
+    json r = mi.rest_web_currency_info();
+    EXPECT_EQ(r["share_version"].get<int64_t>(), 16)
+        << "Dash share_version is the static protocol v16, not the LTC ratchet cache";
+}
+
+// (b) v36_status.auto_ratchet.v36_active is derived from the LIVE latch
+// (m_cached_share_version >= 36), not a frozen stub. With no sharechain stats
+// wired, version_signaling returns {} and the chain-derived branch is skipped --
+// isolating the latch derivation, which is exactly what #499 surfaces as ground
+// truth so a transient sampling dip cannot misreport the crossing state.
+TEST(WebHonestyRegression, V36StatusActiveLatchTracksLiveShareVersion) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+
+    // Pre-cross: still on V35.
+    mi.set_cached_share_version(35);
+    json voting = mi.rest_v36_status();
+    ASSERT_TRUE(voting.contains("auto_ratchet"));
+    EXPECT_EQ(voting["auto_ratchet"]["live_share_version"].get<int64_t>(), 35);
+    EXPECT_FALSE(voting["auto_ratchet"]["v36_active"].get<bool>())
+        << "v36_active must be false while the live latch is still V35";
+
+    // Post-cross: latched to V36.
+    mi.set_cached_share_version(36);
+    json active = mi.rest_v36_status();
+    ASSERT_TRUE(active.contains("auto_ratchet"));
+    EXPECT_EQ(active["auto_ratchet"]["live_share_version"].get<int64_t>(), 36);
+    EXPECT_TRUE(active["auto_ratchet"]["v36_active"].get<bool>())
+        << "v36_active must latch true once the live ratchet reaches V36";
+}
+
+// (c) v36_status.share_chain.{v35_shares,v36_shares,v36_percentage} must reflect
+// the DESIRED-version tally the AutoRatchet keys on (get_desired_version_weights),
+// NOT the per-share FORMAT flag. During the graded g2 ratchet the .157 seed relays
+// V35-FORMAT shares over p2p even while their miners vote V36, so a format-flag
+// count reads 0 v36 straight through a real crossing -- the founding 0-stub class
+// of lie, in the exact fields the operator curls to watch the vote climb. This pins
+// the #288-style swap: build a sharechain-stats snapshot whose FORMAT is 100% V35
+// yet whose DESIRED-version tally is ~33% V36 (one rig flipped), and assert the
+// crossing counter tracks the vote, never the frozen format zero.
+TEST(WebHonestyRegression, V36StatusShareChainTracksDesiredVersionNotFormatFlag) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+
+    // Snapshot mirroring rig #1 (.37) flipped to V36 while .38/.39 stay V35 and the
+    // seed relays V35-format shares: FORMAT all V35, DESIRED-version ~1/3 V36, and a
+    // work-weighted sampling signal of ~33.33%.
+    mi.set_sharechain_stats_fn([]() {
+        nlohmann::json sc = nlohmann::json::object();
+        sc["total_shares"] = 400;
+        sc["chain_height"] = 400;
+        sc["chain_length"] = 400;
+        sc["shares_by_version"]         = {{"35", 400}};            // FORMAT: 100% V35
+        sc["shares_by_desired_version"] = {{"35", 268}, {"36", 132}}; // VOTE: 132/400 = 33%
+        sc["sampling_desired_version"]  = {{"35", 2.0}, {"36", 1.0}};  // work-weighted: 33.33%
+        return sc;
+    });
+
+    nlohmann::json v = mi.rest_v36_status();
+    ASSERT_TRUE(v.contains("share_chain"));
+    const auto& scj = v["share_chain"];
+
+    // The format-flag count IS zero here -- that is the pre-fix stub value the
+    // crossing counter used to echo. Pin it on the parent version_signaling object
+    // (its true source) so a refactor that reverts share_chain to the format tally
+    // is caught: the bug is real precisely because format says 0 while vote says 33.
+    nlohmann::json sig = mi.rest_version_signaling();
+    EXPECT_EQ(sig.value("overall_v36_shares", -1), 0)
+        << "guard: this snapshot is the crossing where FORMAT is still 100% V35";
+
+    EXPECT_EQ(scj["v36_shares"].get<int>(), 132)
+        << "v36_shares must be the desired-version vote count (132), not the "
+           "format-flag count (0) that lies through the crossing";
+    EXPECT_EQ(scj["v35_shares"].get<int>(), 268)
+        << "v35_shares is the desired-version remainder (400-132), not 400";
+    EXPECT_NEAR(scj["v36_percentage"].get<double>(), 33.33, 0.01)
+        << "v36_percentage must be the work-weighted sampling signal (the journal "
+           "N% old version complement the integrator reads), never 0";
+}
+
+// --- charter #3: crossing-banner coin coverage (de-allowlist, #496) ----------
+// The V35->V36 crossing banner must surface on EVERY v36-ratcheting coin, not
+// just LTC/DOGE. Before #496 a hardcoded {LITECOIN,DOGECOIN} allowlist gated
+// rest_version_signaling(), so a BTC/DGB/BCH node mid-cross showed NO crossing
+// banner -- the dashboard hid the very state the operator most needs to see
+// during the upgrade. #496 replaced the allowlist with a single DASH (static
+// v16, non-ratcheting) exclusion: every other coin derives the banner from real
+// vote data and falls through to an empty result only when there is no real
+// crossing state yet. These pins lock that in.
+
+// A coin the OLD allowlist would have SUPPRESSED (BTC) must still surface the
+// live crossing state from real vote data.
+TEST(WebHonestyRegression, VersionSignalingSurfacesOnRatchetingBtcNotAllowlistSuppressed) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::BITCOIN);
+
+    // 100 shares: still producing V35, but 70% are VOTING V36.
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 100},
+            {"chain_height", 8640},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 100}}},
+            {"shares_by_desired_version", {{"35", 30}, {"36", 70}}},
+        };
+    });
+
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty())
+        << "BTC is v36-ratcheting -- the pre-#496 {LTC,DOGE} allowlist must no "
+           "longer suppress its crossing banner";
+    EXPECT_EQ(r["target_version"].get<int>(), 36);
+    EXPECT_EQ(r["overall_v36_votes"].get<int>(), 70)
+        << "vote tally must come from the live sharechain stats hook";
+    EXPECT_DOUBLE_EQ(r["overall_v36_vote_pct"].get<double>(), 70.0);
+}
+
+// DGB (scrypt, also v36-ratcheting) is likewise no longer suppressed.
+TEST(WebHonestyRegression, VersionSignalingSurfacesOnRatchetingDgb) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DIGIBYTE);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 50},
+            {"shares_by_version", {{"35", 50}}},
+            {"shares_by_desired_version", {{"36", 50}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty()) << "DGB is v36-ratcheting -- banner must not be suppressed";
+    EXPECT_EQ(r["target_version"].get<int>(), 36);
+    EXPECT_DOUBLE_EQ(r["overall_v36_vote_pct"].get<double>(), 100.0);
+}
+
+// DASH now runs its OWN v16->v36 crossing: the accept-floor ratchet is armed
+// (apply_min_protocol_ratchet lifts 1700->3600 on >=95% work-weighted v36 desire).
+// The pre-#496 blanket suppression predated that armed ratchet; keeping it would
+// now be the LIE -- hiding a genuinely-armed transition. So DASH version_signaling
+// must surface the TRUTHFUL pre-crossing PAYLOAD: non-empty, status "waiting",
+// 0% v36 votes, floor 1700 (target 3600), v36 not yet active.
+//
+// The BANNER, however, is pending-upgrade UI and stays DARK here: the pool has a
+// current share version (16) and NOBODY is signalling anything higher, so there
+// is no pending upgrade to announce. (This expectation was show_transition=true
+// while classic_transition was hardcoded false and the gate reduced to
+// "current_share_type < 36" -- permanently true on a coin whose share FORMAT is
+// v16 for the whole crossing, so the banner/authority notice/progress bar would
+// have hung on forever at a truthful-but-pointless 0%.) Serving the honest
+// payload and lighting the banner are separate concerns; only the latter moved.
+TEST(WebHonestyRegression, VersionSignalingTruthfulPreCrossingDash) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    // Real DASH pre-crossing shape: wire-format v16 shares, all still DESIRING v16
+    // (0% v36), a mature chain, and the armed accept-floor at its cold 1700 with the
+    // 3600 target advertised -- exactly the fields main_dash.cpp's stats fn emits.
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 100},
+            {"chain_height", 4320},
+            {"chain_length", 4320},
+            {"shares_by_version", {{"16", 100}}},
+            {"shares_by_desired_version", {{"16", 100}}},
+            {"sampling_desired_version", {{"16", 1.0e15}}},
+            {"deepest_v36_position", 0},
+            {"v36_contiguous_from_tip", 0},
+            {"min_protocol_version", 1700},
+            {"cold_min_protocol_version", 1700},
+            {"new_min_protocol_version", 3600},
+            {"advertised_protocol_version", 3600},
+            {"live_share_version", 16},
+        };
+    });
+
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty())
+        << "DASH now ratchets v16->v36 -- the crossing gauge must surface the real "
+           "pre-crossing state, not the pre-armed-ratchet empty suppression";
+
+    // Truthful pre-crossing: the payload is served, but with a current share
+    // version of 16 and ZERO higher-version signal there is no pending upgrade,
+    // so the banner / authority notice / progress bar stay hidden.
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "nobody is signalling a version higher than the v16 the pool produces "
+           "-- the pending-upgrade banner must stay dark";
+    EXPECT_FALSE(r.value("is_transitioning", true))
+        << "a pool sitting at v16 with zero v36 signal is NOT transitioning";
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 16)
+        << "the only signalled desired version is 16 -- not higher than current";
+    EXPECT_EQ(r.value("status", std::string{}), "waiting")
+        << "0 v36 votes on a ready chain -> waiting-for-upgrade, not a fabricated cross";
+    EXPECT_EQ(r["target_version"].get<int>(), 36);
+    EXPECT_EQ(r["current_share_type"].get<int>(), 16)
+        << "DASH mines wire-format v16 across the whole crossing";
+    EXPECT_DOUBLE_EQ(r["overall_v36_vote_pct"].get<double>(), 0.0)
+        << "no share desires v36 yet -- the gauge must read a truthful 0%";
+    EXPECT_DOUBLE_EQ(r["sampling_signaling"].get<double>(), 0.0);
+
+    // Protocol-floor gauge pass-through (the min-proto floor 1700 -> 3600 target).
+    EXPECT_EQ(r.value("min_protocol_version", 0), 1700);
+    EXPECT_EQ(r.value("new_min_protocol_version", 0), 3600);
+    EXPECT_EQ(r.value("advertised_protocol_version", 0), 3600);
+
+    // The ratchet has NOT latched: this node still mines v16, v36 not active.
+    ASSERT_TRUE(r.contains("auto_ratchet"));
+    EXPECT_EQ(r["auto_ratchet"].value("live_share_version", 0), 16);
+    EXPECT_FALSE(r["auto_ratchet"].value("v36_active", true))
+        << "floor is still 1700 -- v36 must NOT read active pre-crossing";
+    EXPECT_EQ(r["auto_ratchet"].value("state", std::string{}), "voting");
+}
+
+// Honest-empty: a ratcheting coin with too little chain (<10 shares) has no real
+// crossing state yet -- the banner stays hidden until there IS truth to show,
+// rather than rendering a misleading transition.
+TEST(WebHonestyRegression, VersionSignalingEmptyUntilRealCrossingState) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::BITCOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{{"total_shares", 5}, {"shares_by_desired_version", {{"36", 5}}}};
+    });
+    EXPECT_TRUE(mi.rest_version_signaling().empty())
+        << "fewer than 10 shares -- no real crossing state, so no banner (honest)";
+}
+
+// --- v36 transition-banner gate truth table ---------------------------------
+// Operator rule: the transition banner, the signed authority message and the
+// progress bar are shown ONLY when there IS a current share version AND a
+// DIFFERENT, HIGHER desired version is genuinely being signalled for it. That is
+// the pool-level aggregate of the per-share "Signals V36" tag the dashboard
+// already renders (dashboard.html: share.dv >= 36 && share.V < 36).
+//
+// The gate used to be `current_share_type < 36` (its "dominant vote differs from
+// current" term was hardcoded false), which reduced to "show whenever the chain
+// is not 100% v36-FORMAT" -- permanently true on DASH, whose shares are
+// wire-format v16 across the whole crossing.
+//
+// Dust floor: a desired version only counts once it holds >= 1% of the flat
+// full-chain vote tally OR >= 1% of the work-weighted sampling window (either
+// qualifies -- a fresh signal lands in the flat tally long before it ages into
+// the sampling window, which is the "propagating" phase). On an 8640-share LTC
+// window that is ~86 shares; on DASH's 4320 it is ~43.
+
+// (a) DASH ACCEPTANCE CASE -- verbatim from the live hotel prod node
+//     (109.161.57.3:8080/version_signaling): share format 16 across the whole
+//     4320-share window, 100% of shares desiring 16, ZERO v36 votes, accept-floor
+//     still cold at 1700. Nothing higher is signalled, so the banner, the
+//     authority message and the progress bar are ALL hidden. Before the gate fix
+//     this prod node served show_transition=true forever (16 < 36 was permanently
+//     true) and showed a "V16 -> V36 Transition" banner at a fixed 0%.
+TEST(WebHonestyRegression, TransitionBannerHiddenWhenNoHigherVersionSignalled) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 4320},
+            {"chain_height", 8664},
+            {"chain_length", 4320},
+            {"shares_by_version", {{"16", 4320}}},
+            {"shares_by_desired_version", {{"16", 4320}}},
+            {"sampling_desired_version", {{"16", 6.740268185691459e16}}},
+            {"deepest_v36_position", 0},
+            {"v36_contiguous_from_tip", 0},
+            {"min_protocol_version", 1700},
+            {"new_min_protocol_version", 3600},
+            {"advertised_protocol_version", 3600},
+            {"live_share_version", 16},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty()) << "the payload itself is still served -- only the gate moved";
+    EXPECT_EQ(r.value("current_share_type", 0), 16);
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 16);
+    EXPECT_EQ(r.value("overall_v36_votes", -1), 0);
+    EXPECT_DOUBLE_EQ(r.value("sampling_signaling", -1.0), 0.0);
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "current=16, desired=16 -- no HIGHER version, so no pending upgrade: "
+           "banner, authority message and progress bar must all stay hidden";
+    EXPECT_FALSE(r.value("is_transitioning", true));
+    // Still honest about the armed-but-unstarted ratchet underneath.
+    EXPECT_EQ(r.value("min_protocol_version", 0), 1700);
+    EXPECT_FALSE(r["auto_ratchet"].value("v36_active", true));
+}
+
+// (b) LTC PROD (voidbind.com, captured live mid-cross): format v35 everywhere,
+//     59.79% of the full-chain vote already desiring V36, 19.15% work-weighted in
+//     the sampling window. A genuinely higher version IS signalled -> banner SHOWN.
+//     Also pins the gauges the banner renders (chain maturity, propagation bar,
+//     sampling-signaling text) so the shared-core gate change cannot regress them.
+TEST(WebHonestyRegression, TransitionBannerShownOnLiveLtcCrossing) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 17801},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 8640}}},
+            {"shares_by_desired_version", {{"35", 3474}, {"36", 5166}}},
+            {"sampling_desired_version",
+                 {{"35", 222623983195438.0}, {"36", 52734697861119.0}}},
+            {"deepest_v36_position", 8638},
+            {"v36_contiguous_from_tip", 2},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", 0), 35);
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 36)
+        << "V36 holds 59.79% of the flat vote -- far above the 1% dust floor";
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "LTC prod is genuinely mid-transition -- the banner must stay lit";
+    EXPECT_TRUE(r.value("is_transitioning", false));
+
+    // Anti-regression: the gauges rendered inside the banner are untouched.
+    EXPECT_DOUBLE_EQ(r.value("chain_maturity", 0.0), 100.0);
+    EXPECT_TRUE(r.value("chain_ready", false));
+    EXPECT_DOUBLE_EQ(r.value("overall_v36_vote_pct", 0.0), 59.79);
+    EXPECT_NEAR(r.value("sampling_signaling", 0.0), 19.15, 0.02);
+    EXPECT_NEAR(r.value("propagation_pct", 0.0), 99.98, 0.01);
+    EXPECT_EQ(r.value("status", std::string{}), "signaling");
+    EXPECT_EQ(r.value("deepest_v36_position", 0), 8638);
+    EXPECT_EQ(r.value("shares_to_window", -1), 2);
+}
+
+// (b2) Anti-regression for the MIXED-format window LTC enters once V36 shares
+//      start landing: current_share_type is the MAX format seen, so it reads 36
+//      the moment ONE v36 share exists. The gate must key off the LAGGARD side of
+//      the window (shares still on v35) or the banner would vanish at 1 share in.
+TEST(WebHonestyRegression, TransitionBannerStaysLitAcrossMixedFormatWindow) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 17801},
+            {"chain_length", 8640},
+            // 8639 shares still on v35, one already minted at v36.
+            {"shares_by_version", {{"35", 8639}, {"36", 1}}},
+            {"shares_by_desired_version", {{"36", 8640}}},
+            {"sampling_desired_version", {{"36", 1.0e15}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", 0), 36) << "max format seen is 36";
+    EXPECT_EQ(r.value("lowest_share_type", 0), 35) << "but 8639 shares still lag at v35";
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "the rollout is still in flight -- banner must not vanish on the first "
+           "v36 share just because current_share_type is the MAX format";
+}
+
+// (c) COMPLETED: every share on the target format, chain > 3x length -> confirmed.
+//     Nothing pending -> banner HIDDEN, status "no_transition".
+TEST(WebHonestyRegression, TransitionBannerHiddenOnceCrossingConfirmed) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 8640 * 3},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"36", 8640}}},
+            {"shares_by_desired_version", {{"36", 8640}}},
+            {"sampling_desired_version", {{"36", 1.0e15}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", 0), 36);
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "the crossing is complete and confirmed -- nothing left to announce";
+    EXPECT_EQ(r.value("status", std::string{}), "no_transition");
+    EXPECT_DOUBLE_EQ(r.value("transition_progress", 0.0), 100.0);
+}
+
+// (d) DUST: a single stray V36 signal in an 8640-share window (0.0116% flat, ~0%
+//     work-weighted) is below the 1% floor -> banner stays HIDDEN. One replayed or
+//     mistuned share must not flip prod into "transition" mode.
+TEST(WebHonestyRegression, TransitionBannerHiddenOnDustSignalBelowFloor) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 8640},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 8640}}},
+            {"shares_by_desired_version", {{"35", 8639}, {"36", 1}}},
+            // One dust vote against ~1e15 of v35 work: far below 1% weighted too.
+            {"sampling_desired_version", {{"35", 1.0e15}, {"36", 1.0e9}}},
+            {"deepest_v36_position", 12},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 35)
+        << "a 0.0116% V36 signal does not clear the 1% dust floor";
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "a single stray V36 share must not light the prod transition banner";
+    // The truthful vote tally is still served -- only the banner gate is dark.
+    EXPECT_EQ(r.value("overall_v36_votes", -1), 1);
+}
+
+// (d2) Just OVER the floor: 1% of the window genuinely signalling V36 is a real
+//      emerging rollout and DOES light the banner. Pins the floor from both sides.
+TEST(WebHonestyRegression, TransitionBannerShownOnceSignalClearsFloor) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 8640},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 8640}}},
+            {"shares_by_desired_version", {{"35", 8553}, {"36", 87}}},  // 1.007%
+            {"sampling_desired_version", {{"35", 1.0e15}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 36);
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "1.007% of the window signalling V36 is a real rollout, not dust";
+}
+
+// (d3) The floor is checked on the work-weighted sampling window TOO: a signal
+//      that is dust by flat count but material by hashrate still counts.
+TEST(WebHonestyRegression, TransitionBannerShownOnWorkWeightedSignalAlone) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 8640},
+            {"chain_height", 8640},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 8640}}},
+            {"shares_by_desired_version", {{"35", 8630}, {"36", 10}}},  // 0.12% flat
+            // ...but those 10 shares carry 20% of the sampling-window work.
+            {"sampling_desired_version", {{"35", 8.0e14}, {"36", 2.0e14}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 36);
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "20% of sampling-window WORK on V36 is a real signal even though the "
+           "flat share count is under the floor";
+}
+
+// (e) DASH POST-LATCH: DASH share FORMAT never becomes 36, so the format-count
+//     all_target test can never fire for it. Once the accept-floor ratchet has
+//     latched (stats fn reports live_share_version 36) the crossing is done and
+//     the banner must go dark rather than hang on forever at 100% signalling.
+TEST(WebHonestyRegression, TransitionBannerHiddenOnceDashRatchetLatched) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 4320},
+            {"chain_height", 4320},
+            {"chain_length", 4320},
+            {"shares_by_version", {{"16", 4320}}},
+            {"shares_by_desired_version", {{"36", 4320}}},
+            {"sampling_desired_version", {{"36", 1.0e15}}},
+            {"min_protocol_version", 3600},
+            {"new_min_protocol_version", 3600},
+            {"live_share_version", 36},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_TRUE(r["auto_ratchet"].value("v36_active", false));
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "the ratchet has latched -- no upgrade is pending any more";
+}
+
+// (e2) DASH MID-CROSSING: format still v16, but the pool is now signalling V36
+//      well above the floor and the floor has NOT latched -> banner SHOWN.
+TEST(WebHonestyRegression, TransitionBannerShownDuringRealDashCrossing) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 4320},
+            {"chain_height", 4320},
+            {"chain_length", 4320},
+            {"shares_by_version", {{"16", 4320}}},
+            {"shares_by_desired_version", {{"16", 2000}, {"36", 2320}}},
+            {"sampling_desired_version", {{"16", 4.0e14}, {"36", 6.0e14}}},
+            {"min_protocol_version", 1700},
+            {"new_min_protocol_version", 3600},
+            {"live_share_version", 16},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", 0), 16);
+    EXPECT_EQ(r.value("dominant_desired_version", -1), 36);
+    EXPECT_TRUE(r.value("show_transition", false))
+        << "DASH v16 shares with a majority signalling V36 IS a pending upgrade";
+    EXPECT_NEAR(r.value("sampling_signaling", 0.0), 60.0, 0.01);
+}
+
+// (f) No share-format data at all: there is no current share version, so there is
+//     nothing for a desired version to be HIGHER than -> banner hidden.
+TEST(WebHonestyRegression, TransitionBannerHiddenWithoutACurrentShareVersion) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 100},
+            {"chain_height", 100},
+            {"chain_length", 8640},
+            {"shares_by_desired_version", {{"36", 100}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.value("current_share_type", -1), 0);
+    EXPECT_FALSE(r.value("show_transition", true))
+        << "no current share version reported -- nothing to transition FROM";
+}
+
+// ---------------------------------------------------------------------------
+// Charter #2 (per-node truthful topology) regression-lock.
+//
+// rest_node_topology() must reflect THIS node's REAL shape -- config-driven /
+// auto-detected -- never a baked-in coin list, and must NEVER fabricate an
+// embedded-daemon "synced" flag in the auto-detect fallback. The only
+// authoritative sync source is the per-coin StatsProvider hook
+// (m_node_topology_fn): the explorer_chaininfo_fn reports SHARECHAIN height, a
+// different thing, so deriving "synced" from the fallback would re-introduce
+// the founding class of lie (dashboard asserting health it cannot see).
+// ---------------------------------------------------------------------------
+
+// Fallback path (no StatsProvider hook): the primary coin is always present and
+// the object self-labels auto_detected, but it must OMIT "synced" rather than
+// guess it. Omission is honest; a fabricated true/false is the founding lie.
+TEST(WebHonestyRegression, NodeTopologyAutoDetectOmitsSyncedRatherThanGuess) {
+    // Default blockchain is LITECOIN -> node_symbol() == "LTC".
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    // No node_topology_fn, no coin_peers_fn: the bare auto-detect fallback.
+
+    json t = mi.rest_node_topology();
+
+    EXPECT_EQ(t.value("node_symbol", std::string{}), "LTC")
+        << "primary symbol must come from the node's configured chain, not blank";
+    EXPECT_TRUE(t.value("auto_detected", false))
+        << "fallback must self-label as auto-detected, not silently authoritative";
+    ASSERT_TRUE(t.contains("coins") && t["coins"].is_array());
+
+    bool saw_primary = false;
+    for (const auto& c : t["coins"]) {
+        if (c.value("coin", std::string{}) == "LTC") {
+            saw_primary = true;
+            EXPECT_TRUE(c.value("primary", false));
+            EXPECT_FALSE(c.contains("synced"))
+                << "auto-detect fallback must NOT fabricate an embedded-daemon "
+                   "synced flag -- omit-rather-than-guess (charter #2)";
+        }
+    }
+    EXPECT_TRUE(saw_primary) << "primary chain must always be present";
+}
+
+// The embedded/aux coin set is discovered from the live coin-peer map keys
+// (e.g. an LTC node also running embedded DOGE), uppercased -- the node's REAL
+// shape, never a hardcoded {ltc,doge} assumption.
+TEST(WebHonestyRegression, NodeTopologyAutoDetectsEmbeddedCoinSetFromPeerMap) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_coin_peers_fn([] {
+        return json{
+            {"ltc",  json::array({json{{"addr", "10.0.0.1"}},
+                                    json{{"addr", "10.0.0.2"}}})},
+            {"doge", json::array({json{{"addr", "10.0.0.3"}}})},
+        };
+    });
+
+    json t = mi.rest_node_topology();
+    ASSERT_TRUE(t.contains("coins") && t["coins"].is_array());
+
+    int ltc_peers = -1, doge_peers = -1;
+    bool doge_primary = true;
+    for (const auto& c : t["coins"]) {
+        if (c.value("coin", std::string{}) == "LTC")  ltc_peers = c.value("peers", -1);
+        if (c.value("coin", std::string{}) == "DOGE") {
+            doge_peers = c.value("peers", -1);
+            doge_primary = c.value("primary", false);
+        }
+    }
+    EXPECT_EQ(ltc_peers, 2)  << "primary LTC peer count from the live map, uppercased";
+    EXPECT_EQ(doge_peers, 1) << "embedded DOGE auto-detected from the map, not baked in";
+    EXPECT_FALSE(doge_primary) << "only the configured chain is primary";
+}
+
+// When the wiring layer feeds the per-coin StatsProvider hook, its richer
+// authoritative payload (real per-coin synced/tip) is returned verbatim -- the
+// fallback must not override or strip it.
+TEST(WebHonestyRegression, NodeTopologyPrefersStatsProviderHookWhenWired) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_node_topology_fn([] {
+        return json{
+            {"node_symbol", "LTC"},
+            {"auto_detected", false},
+            {"coins", json::array({
+                json{{"coin", "LTC"}, {"primary", true},
+                     {"peers", 30}, {"synced", true}, {"height", 2710001}},
+            })},
+        };
+    });
+
+    json t = mi.rest_node_topology();
+    EXPECT_FALSE(t.value("auto_detected", true))
+        << "the StatsProvider hook is authoritative, not auto-detected";
+    ASSERT_TRUE(t.contains("coins") && !t["coins"].empty());
+    const auto& ltc = t["coins"][0];
+    EXPECT_TRUE(ltc.contains("synced") && ltc["synced"].get<bool>())
+        << "a real per-coin synced flag from the hook must survive verbatim";
+    EXPECT_EQ(ltc.value("height", 0), 2710001)
+        << "the hook's real embedded-daemon tip must survive verbatim";
+}
+
+// /patron_sendmany/<total> is an UNIMPLEMENTED payout-split helper. The charter
+// rule is not "every endpoint must be real" -- it is "never let an unreal one
+// read as real." This endpoint stays honest by SELF-LABELLING: it carries an
+// explicit "patron_sendmany stub" note and an EMPTY destinations object, so the
+// operator can never mistake it for a computed payout lane. This pins that
+// disclosure: if someone fills destinations with fabricated splits, they must
+// also drop the stub label (and wire real data) or this fails loudly. A
+// non-empty destinations while still flagged a stub is exactly the silent-lie
+// regression we forbid.
+TEST(WebHonestyRegression, PatronSendmanySelfLabelsAsStubNeverFabricatesPayouts) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json p = mi.rest_patron_sendmany("12.5");
+
+    ASSERT_TRUE(p.contains("destinations"));
+    const bool labelled_stub =
+        p.value("note", std::string{}).find("stub") != std::string::npos;
+    const bool has_payouts =
+        p["destinations"].is_object() && !p["destinations"].empty();
+
+    EXPECT_TRUE(labelled_stub)
+        << "an unimplemented payout helper must self-label as a stub";
+    EXPECT_FALSE(has_payouts)
+        << "a stub must not present fabricated payout destinations as real";
+    // The forbidden state: data shown WHILE still flagged a stub.
+    EXPECT_FALSE(labelled_stub && has_payouts)
+        << "never label-as-stub while surfacing payout splits -- silent lie";
+    EXPECT_EQ(p.value("total", std::string{}), "12.5")
+        << "the echoed total must be the operator-supplied value, not invented";
+}
+// ── Stratum-URL external_ip override (DASH NAT/port-mapped nodes) ──────────
+// The dashboard Stratum-URL card renders nodeInfo.external_ip
+// (dashboard.html:2889-2892). When a node NATs out through a shared gateway
+// (both hotel DASH nodes: LAN 192.168.1.x, one public 31.172.65.125), the
+// auto-detected OUTBOUND IP is NOT the address miners dial -- they reach the
+// external-mapped hosts (109.161.57.3 / 109.161.52.148). c2pool-dash exposes
+// --external-ip (alias --stratum-advertise / --public-host) which feeds
+// set_external_ip(); rest_node_info() must then SERVE that operator-supplied
+// host verbatim so the Stratum URL is truthful. Unset must stay honest-absent
+// ("0.0.0.0"), leaving the auto-detect / window.location.hostname fallback --
+// no regression. Pins the flag -> served-external_ip plumbing.
+TEST(WebHonestyRegression, NodeInfoExternalIpUnsetIsHonestlyUnspecified) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    json ni = mi.rest_node_info();
+    EXPECT_EQ(ni.value("external_ip", std::string{}), "0.0.0.0")
+        << "unset external_ip must serve the honest-absent sentinel so the "
+           "dashboard falls back to auto-detect / window.location.hostname";
+}
+
+TEST(WebHonestyRegression, NodeInfoExternalIpServesOperatorAdvertisedHost) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    // Operator advertises the real miner-facing external-mapped host (primary
+    // hotel node), NOT the auto-detected 31.172.65.125 NAT gateway.
+    mi.set_external_ip("109.161.57.3");
+    json ni = mi.rest_node_info();
+    EXPECT_EQ(ni.value("external_ip", std::string{}), "109.161.57.3")
+        << "served external_ip must be the operator-advertised miner-facing "
+           "host so the dashboard Stratum URL is not the wrong NAT IP";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #864 — /global_stats gauges must agree with canonical p2pool
+//
+// Three independent defects, all DISPLAY-only (no consensus path touched):
+//
+//  (a) min_difficulty fell back to a literal 1.0 for any coin whose
+//      sharechain-stats hook does not publish it (DASH published no
+//      difficulty key at all), so the dashboard showed a fabricated floor.
+//  (b) Even when populated it carried the sharechain AVERAGE difficulty.
+//      p2pool web.py get_global_stats() reports
+//      target_to_difficulty(tracker.items[best_share].max_target) -- the
+//      pool's share-difficulty FLOOR. Different quantity.
+//  (c) The stale relationship was inverted. p2pool:
+//          pool_nonstale_hash_rate = get_pool_attempts_per_second(...)
+//          pool_hash_rate          = nonstale / (1 - stale_prop)
+//      c2pool had pool_hash_rate = aps and nonstale = aps*(1-stale_prop) --
+//      both fields wrong, in opposite directions. Masked while stale_prop==0.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Stats hook shaped like the real per-coin lambdas, with a controllable
+// stale tally and an optionally-absent min_difficulty.
+json make_stats(int total, int orphan, int dead, const json& min_diff)
+{
+    json j{{"total_shares", total},
+           {"orphan_shares", orphan},
+           {"dead_shares", dead},
+           // The average is deliberately far from any plausible floor so a
+           // regression that re-sources min_difficulty from it is unmissable.
+           {"average_difficulty", 1024.0}};
+    if (!min_diff.is_null())
+        j["min_difficulty"] = min_diff;
+    return j;
+}
+
+} // namespace
+
+// (b) The floor is the floor, not the window average.
+TEST(WebGaugeParity, MinDifficultyIsPoolFloorNotSharechainAverage) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_sharechain_stats_fn([] { return make_stats(1000, 0, 0, 3.5); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json g = mi.rest_global_stats();
+    ASSERT_TRUE(g["min_difficulty"].is_number());
+    EXPECT_DOUBLE_EQ(g["min_difficulty"].get<double>(), 3.5)
+        << "min_difficulty must be the best share's max_target floor "
+           "(p2pool web.py), never the sharechain average";
+    EXPECT_NE(g["min_difficulty"].get<double>(), 1024.0)
+        << "min_difficulty must not be re-sourced from average_difficulty";
+}
+
+// (a) No floor published => null, never a fabricated 1.0.
+TEST(WebGaugeParity, MinDifficultyIsNullWhenTheCoinPublishesNoFloor) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    // Exactly the pre-fix DASH shape: chain/stale keys, no difficulty floor.
+    mi.set_sharechain_stats_fn([] { return make_stats(500, 0, 0, json(nullptr)); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json g = mi.rest_global_stats();
+    EXPECT_TRUE(g["min_difficulty"].is_null())
+        << "an unknown difficulty floor must read as unknown, not as a "
+           "literal 1.0 that the dashboard renders as a real value";
+    EXPECT_FALSE(g["min_difficulty"] == 1.0);
+
+    // The p2pool-shaped endpoint must propagate the null, not re-substitute.
+    json p = mi.rest_p2pool_global_stats();
+    EXPECT_TRUE(p["min_difficulty"].is_null())
+        << "/global_stats (p2pool shape) must not restore the 1.0 literal";
+}
+
+TEST(WebGaugeParity, MinDifficultyPropagatesThroughP2poolShapeWhenKnown) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_sharechain_stats_fn([] { return make_stats(1000, 0, 0, 8.75); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json p = mi.rest_p2pool_global_stats();
+    ASSERT_TRUE(p["min_difficulty"].is_number());
+    EXPECT_DOUBLE_EQ(p["min_difficulty"].get<double>(), 8.75);
+}
+
+// (#945) The "Best Share" card claims a RECORD share; it must never present the
+// sharechain window AVERAGE as that record. Pre-fix, rest_best_share()
+// substituted average_difficulty into the all-time/session/round difficulty
+// whenever no local record had been seen -- so a freshly-started node showed the
+// window average under a "Best Share / record" label. Fails-without-fix: the
+// substitution set all three difficulties to 1024.0 (make_stats' average).
+TEST(WebGaugeParity, BestShareRecordIsRealNotSharechainAverage) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    // Live sharechain with a fat average, but NO recorded best share yet.
+    mi.set_sharechain_stats_fn([] { return make_stats(1000, 0, 0, 3.5); });
+
+    json b = mi.rest_best_share();
+
+    // has_best_share is the honest flag the card gates on.
+    ASSERT_TRUE(b.contains("has_best_share"));
+    EXPECT_FALSE(b["has_best_share"].get<bool>())
+        << "no record share was ever recorded; has_best_share must be false";
+
+    for (const char* scope : {"all_time", "session", "round"}) {
+        ASSERT_TRUE(b.contains(scope)) << scope << " entry missing";
+        const double d = b[scope].value("difficulty", -1.0);
+        EXPECT_DOUBLE_EQ(d, 0.0)
+            << scope << " best-share difficulty must read 0 (honest-absent), "
+               "not the sharechain average";
+        EXPECT_NE(d, 1024.0)
+            << scope << " must not be re-sourced from average_difficulty";
+    }
+}
+
+// (c) aps IS the non-stale rate; the gross rate is that grossed UP.
+TEST(WebGaugeParity, StaleRelationshipMatchesP2poolNotItsInverse) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    // 100 shares, 10 stale => pool_stale_prop = 0.10
+    mi.set_sharechain_stats_fn([] { return make_stats(100, 5, 5, 4.0); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });  // get_pool_attempts_per_second
+
+    json g = mi.rest_global_stats();
+    const double aps = 1e9;
+    const double stale = g["pool_stale_prop"].get<double>();
+    ASSERT_DOUBLE_EQ(stale, 0.10);
+
+    EXPECT_DOUBLE_EQ(g["pool_nonstale_hash_rate"].get<double>(), aps)
+        << "p2pool: pool_nonstale_hash_rate = get_pool_attempts_per_second()";
+    EXPECT_DOUBLE_EQ(g["pool_hash_rate"].get<double>(), aps / (1.0 - stale))
+        << "p2pool: pool_hash_rate = nonstale / (1 - stale_prop)";
+
+    // The pre-fix values, pinned as explicitly WRONG so the inversion cannot
+    // come back: gross must exceed non-stale, never fall below it.
+    EXPECT_GT(g["pool_hash_rate"].get<double>(), g["pool_nonstale_hash_rate"].get<double>())
+        << "gross hashrate must be >= non-stale; the inverted form had it lower";
+    EXPECT_NE(g["pool_nonstale_hash_rate"].get<double>(), aps * (1.0 - stale))
+        << "non-stale must not be the estimator scaled DOWN (the pre-fix form)";
+}
+
+// The two fields must stay equal exactly when there are no stales -- the
+// condition that masked the inversion in production.
+TEST(WebGaugeParity, ZeroStalesLeavesBothHashRatesEqual) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_sharechain_stats_fn([] { return make_stats(100, 0, 0, 4.0); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json g = mi.rest_global_stats();
+    ASSERT_DOUBLE_EQ(g["pool_stale_prop"].get<double>(), 0.0);
+    EXPECT_DOUBLE_EQ(g["pool_hash_rate"].get<double>(), 1e9);
+    EXPECT_DOUBLE_EQ(g["pool_nonstale_hash_rate"].get<double>(), 1e9);
+}
+
+// Degenerate all-stale window must not divide by zero into inf/NaN.
+TEST(WebGaugeParity, AllStaleWindowDoesNotDivideByZero) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_sharechain_stats_fn([] { return make_stats(10, 5, 5, 4.0); });
+    mi.set_pool_hashrate_fn([] { return 1e9; });
+
+    json g = mi.rest_global_stats();
+    ASSERT_DOUBLE_EQ(g["pool_stale_prop"].get<double>(), 1.0);
+    EXPECT_TRUE(std::isfinite(g["pool_hash_rate"].get<double>()));
+    EXPECT_TRUE(std::isfinite(g["pool_nonstale_hash_rate"].get<double>()));
+}
+
+// ── (d) DISPLAY lookbehind vs CONSENSUS retarget lookbehind ────────────────
+// p2pool web.py get_global_stats() averages the gauge over ONE HOUR of shares:
+//     lookbehind = min(height, 3600 // net.SHARE_PERIOD)
+// The CONSENSUS retarget is a different window entirely (p2pool data.py:137,140
+// uses net.TARGET_LOOKBEHIND) and c2pool already matches canonical there. The
+// two must NOT be conflated: this pins the display formula AND pins
+// TARGET_LOOKBEHIND at its canonical per-coin value so a future "unification"
+// cannot drag the retarget along with the gauge.
+TEST(WebGaugeParity, DisplayLookbehindIsOneHourOfSharesNotTargetLookbehind) {
+    // DASH: SHARE_PERIOD 20s -> 3600/20 = 180 display shares; retarget stays 100.
+    EXPECT_EQ(dash::SharechainConfig::SHARE_PERIOD, 20u);
+    EXPECT_EQ(3600u / dash::SharechainConfig::SHARE_PERIOD, 180u)
+        << "DASH display gauge must look back one hour = 180 shares";
+    EXPECT_EQ(dash::SharechainConfig::TARGET_LOOKBEHIND, 100u)
+        << "CONSENSUS retarget lookbehind is canonical and MUST NOT move";
+    EXPECT_NE(3600u / dash::SharechainConfig::SHARE_PERIOD,
+              dash::SharechainConfig::TARGET_LOOKBEHIND)
+        << "display and consensus windows are distinct on DASH -- conflating "
+           "them is exactly the #864 defect";
+
+    // LTC: SHARE_PERIOD 15s -> 3600/15 = 240 display shares; retarget stays 200.
+    EXPECT_EQ(ltc::PoolConfig::SHARE_PERIOD, 15u);
+    EXPECT_EQ(3600u / ltc::PoolConfig::SHARE_PERIOD, 240u)
+        << "LTC display gauge must look back one hour = 240 shares";
+    EXPECT_EQ(ltc::PoolConfig::TARGET_LOOKBEHIND, 200u)
+        << "CONSENSUS retarget lookbehind is canonical and MUST NOT move";
+    EXPECT_NE(3600u / ltc::PoolConfig::SHARE_PERIOD,
+              ltc::PoolConfig::TARGET_LOOKBEHIND);
+}
+
+// Coin-topology honesty (2026-07-26 integrator HIGH): a standalone parent (DASH)
+// must NOT advertise a merged child -- serving LTC+DOGE merged-mining worker-
+// username instructions on a DASH pool misconfigures a live tenant. The
+// dashboard's Username line is driven by currency_info.merged_child_symbol, so
+// that field must be present ONLY for a genuine merged parent (LTC->DOGE) and
+// ABSENT for standalone coins. Not #ifdef-guarded (issue #895): always runs.
+TEST(WebHonestyRegression, CurrencyInfoNoFalseMergedChildOnDash) {
+    MiningInterface dash(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    json d = dash.rest_web_currency_info();
+    EXPECT_EQ(d.value("symbol", std::string()), "DASH");
+    EXPECT_FALSE(d.contains("merged_child_symbol"))
+        << "DASH is a standalone parent with no merged child; advertising one "
+           "serves wrong LTC+DOGE worker-username instructions to tenants";
+    // Branding/explorer must be DASH, never a hardcoded litecoin fallback.
+    std::string dpfx = d.value("address_explorer_url_prefix", std::string());
+    EXPECT_NE(dpfx.find("dash"), std::string::npos);
+    EXPECT_EQ(dpfx.find("litecoin"), std::string::npos);
+
+    MiningInterface ltc(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    json l = ltc.rest_web_currency_info();
+    EXPECT_EQ(l.value("merged_child_symbol", std::string()), "DOGE")
+        << "LTC parent merge-mines DOGE; the merged worker-username format is "
+           "correct here";
+}
+
+
+// ===========================================================================
+// FOLDED FROM test_dashboard_merged_gating.cpp (#912): the DashboardMergedGating
+// static-HTML characterization KAT lives here, in an ALLOWLISTED target, so CI
+// actually BUILDS + RUNS it. A standalone add_executable was the #769 Not-Run
+// trap (never compiled -> ctest "Not Run" -> exit 8). Same charter as this
+// file: the dashboard must never imply revenue that does not exist.
+// ===========================================================================
+#ifndef DASHBOARD_HTML_PATH
+#error "DASHBOARD_HTML_PATH must be defined by CMake"
+#endif
+
+namespace {
+std::string read_dashboard() {
+    std::ifstream f(DASHBOARD_HTML_PATH);
+    EXPECT_TRUE(f.good()) << "cannot open " << DASHBOARD_HTML_PATH;
+    std::stringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+std::vector<std::string> lines_of(const std::string& s) {
+    std::vector<std::string> out; std::string line; std::stringstream ss(s);
+    while (std::getline(ss, line)) out.push_back(line);
+    return out;
+}
+} // namespace
+
+// (a) One mechanism, applied everywhere: every HTML element that renders
+// merged-child data must carry the topology gate class so the standalone-hide
+// path covers it. Covers the "Miners Block Value" card ids at ~1852/1854 and
+// the node-payout id at ~1860. A merged element is an HTML declaration
+// `id="<merged-id>"` (JS refs use '#id' and are excluded).
+TEST(DashboardMergedGating, EveryMergedElementIsTopologyGated) {
+    const auto html = read_dashboard();
+    const std::vector<std::string> merged_ids = {
+        "merged_block_value", "node_merged_payout", "time_to_merged_block"};
+    for (const auto& line : lines_of(html)) {
+        for (const auto& id : merged_ids) {
+            if (line.find("id=\"" + id + "\"") != std::string::npos) {
+                EXPECT_NE(line.find("merged-child-hint"), std::string::npos)
+                    << "merged element '" << id << "' is not inside a "
+                       ".merged-child-hint gate -- it will render on a "
+                       "standalone coin that has no merged child. Line:\n"
+                    << line;
+            }
+        }
+    }
+}
+
+// (b) The block-graph LEGEND (~2301) must not carry a bare hardcoded
+// "DOGE block" entry: on a standalone coin the legend would advertise a merged
+// chain that does not exist. The gated form wraps the whole legend-item in the
+// topology class and drives the symbol text from currency_info via
+// .merged-child-symbol-hint. FAILS on the pre-fix source (bare "DOGE block").
+TEST(DashboardMergedGating, MergedBlockLegendIsGated) {
+    const auto html = read_dashboard();
+    EXPECT_EQ(html.find(">DOGE block<"), std::string::npos)
+        << "the block-graph legend has a bare hardcoded 'DOGE block' entry; on "
+           "a standalone coin it advertises a merged chain that does not exist. "
+           "Wrap the legend-item in .merged-child-hint and render the symbol via "
+           ".merged-child-symbol-hint.";
+    EXPECT_NE(html.find("legend-item merged-child-hint"), std::string::npos)
+        << "the merged-block legend entry is not topology-gated.";
+}
+
+// (b) The JS write sites (~3042/3049) that stamp 'N/A' into the merged card
+// must target ONLY ids whose HTML declaration is topology-gated -- otherwise a
+// standalone coin flashes a phantom "+N/A" before/without the hide path. This
+// couples the JS writes to the gate: every id written with 'N/A' here must be
+// in the gated set above.
+TEST(DashboardMergedGating, MergedNaWritesTargetGatedElements) {
+    const auto html = read_dashboard();
+    const auto lines = lines_of(html);
+    const std::vector<std::string> na_write_ids = {
+        "merged_block_value", "time_to_merged_block"};
+    for (const auto& id : na_write_ids) {
+        // the 'N/A' write must exist (documents the site we are gating)...
+        EXPECT_NE(html.find("d3.select('#" + id + "').text('N/A')"),
+                  std::string::npos)
+            << "expected merged 'N/A' write for '" << id << "' not found; if it "
+               "moved, re-point this KAT at the new site.";
+        // ...and the element it writes to must be gated.
+        bool gated = false;
+        for (const auto& line : lines)
+            if (line.find("id=\"" + id + "\"") != std::string::npos &&
+                line.find("merged-child-hint") != std::string::npos)
+                gated = true;
+        EXPECT_TRUE(gated)
+            << "JS writes 'N/A' into '" << id << "' but its HTML declaration is "
+               "not inside a .merged-child-hint gate -- phantom on standalone.";
+    }
+}
+
+// (c) Failure direction 1 -- standalone / failed currency_info fetch renders as
+// standalone: the hide path keys off the absence of merged_child_symbol.
+TEST(DashboardMergedGating, StandaloneHidePathPresent) {
+    const auto html = read_dashboard();
+    EXPECT_NE(html.find("info.merged_child_symbol"), std::string::npos)
+        << "the gate must key off currency_info.merged_child_symbol; a missing "
+           "or failed fetch (no merged_child_symbol) must read as standalone.";
+    EXPECT_NE(html.find(".merged-child-hint').style('display', 'none')"),
+              std::string::npos)
+        << "the topology gate that HIDES merged elements on a standalone coin "
+           "is missing -- merged elements would render for every coin.";
+}
+
+// (c) Failure direction 2 -- a merged parent (LTC, merged_child_symbol present)
+// still SHOWS its merged elements: the show path must exist too, so the fix
+// does not over-correct into hiding merged data on the coin that has it.
+TEST(DashboardMergedGating, MergedParentShowPathPresent) {
+    const auto html = read_dashboard();
+    EXPECT_NE(html.find(".merged-child-hint').style('display', null)"),
+              std::string::npos)
+        << "the show path (reveal merged elements when merged_child_symbol is "
+           "present) is missing -- LTC would stop showing its DOGE merged data.";
+}
+
+// (b) A merged block-value symbol must come from topology
+// (.merged-child-symbol-hint), never a hardcoded 'DOGE' fused to the
+// merged_block_value element.
+TEST(DashboardMergedGating, NoHardcodedMergedSymbolOnBlockValue) {
+    const auto html = read_dashboard();
+    EXPECT_EQ(html.find("id=\"merged_block_value\">-</span> DOGE"),
+              std::string::npos)
+        << "merged_block_value has a hardcoded 'DOGE' symbol; a merged coin "
+           "with a different child (or a standalone coin) would render a "
+           "phantom currency.";
+}
+
+// (d) Merged (DOGE) address-explorer links must route through the currency_info
+// prefix (per-node truthful), not a hardcoded blockchair URL fused into the
+// href. FAILS on the pre-fix source (hardcoded href + no currency_info field).
+TEST(DashboardMergedGating, MergedExplorerRoutedThroughCurrencyInfo) {
+    const auto html = read_dashboard();
+    EXPECT_NE(html.find("merged_child_address_explorer_url_prefix"),
+              std::string::npos)
+        << "the dashboard does not read currency_info."
+           "merged_child_address_explorer_url_prefix; merged address links are "
+           "hardcoded and cannot follow this node's real topology.";
+    EXPECT_EQ(html.find("'https://blockchair.com/dogecoin/address/' + "
+                        "encodeURIComponent(miner.mergedAddress)"),
+              std::string::npos)
+        << "the merged payout-address link is a hardcoded blockchair URL; route "
+           "it through currency_info.merged_child_address_explorer_url_prefix.";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #922 — BEST-SHARE "round" must RESET at a block-found boundary.
+//
+// Operator-reported + reproduced on the live hotel: GET /best_share returned
+// round.hash == all_time.hash and round.difficulty == all_time.difficulty for
+// a share attached to a block found hours (and hundreds of shares) earlier —
+// both rows 932.28% of target. The all_time/round SPLIT already existed in the
+// payload; the RESET was missing, so `round` only ever raised and degenerated
+// into a permanent duplicate of `all_time` the instant a block was won.
+//
+// These cases pin the reset in place. They FAIL against the pre-fix source
+// (round never cleared, round_start never written).
+class BestShareRoundReset : public ::testing::Test {
+protected:
+    // Read /best_share and pull out the round + all_time legs.
+    static void snapshot(MiningInterface& mi,
+                         double& round_diff, uint64_t& round_started,
+                         double& all_time_diff) {
+        const nlohmann::json bs = mi.rest_best_share();
+        round_diff    = bs.at("round").at("difficulty").get<double>();
+        round_started = bs.at("round").at("started").get<uint64_t>();
+        all_time_diff = bs.at("all_time").at("difficulty").get<double>();
+    }
+};
+
+// The round leg resets on block-found while all_time is preserved untouched.
+TEST_F(BestShareRoundReset, RoundResetsOnBlockFoundAllTimePreserved) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    // A round's worth of shares, culminating in the record 900000-diff winner —
+    // the share that will go on to solve the block.
+    mi.record_share_difficulty(12.0,     "minerA", "aa");
+    mi.record_share_difficulty(4096.0,   "minerB", "bb");
+    mi.record_share_difficulty(900000.0, "minerC", "cc");   // block-solving share
+
+    double round_diff, all_time_diff; uint64_t round_started;
+    snapshot(mi, round_diff, round_started, all_time_diff);
+
+    // Pre-block: this is exactly the reproduced 932%-style state — round is a
+    // duplicate of all_time, and round.started was never written.
+    EXPECT_DOUBLE_EQ(round_diff, 900000.0);
+    EXPECT_DOUBLE_EQ(all_time_diff, 900000.0);
+    EXPECT_EQ(round_started, 0u)
+        << "pre-fix baseline: round_start is never written until the first reset";
+
+    // The pool wins the block that minerC's share solved.
+    mi.record_found_block(/*height=*/2511601, uint256{}, /*ts=*/0, "LTC",
+                          "minerC", "cc", /*network_difficulty=*/96540.0);
+
+    snapshot(mi, round_diff, round_started, all_time_diff);
+
+    // Acceptance #1: round.* reset on block-found.
+    EXPECT_DOUBLE_EQ(round_diff, 0.0)
+        << "#922: round best-share must reset to 0 when a block is won";
+    EXPECT_GT(round_started, 0u)
+        << "#922: round.started must be stamped to the block-found event";
+
+    // Acceptance #2: all_time.* untouched by the reset.
+    EXPECT_DOUBLE_EQ(all_time_diff, 900000.0)
+        << "#922: all_time must survive the round reset";
+}
+
+// After the reset, the round leg tracks THIS round independently — a new,
+// smaller share raises round without disturbing the preserved all_time record.
+// This is the property whose absence produced the permanent round==all_time bug.
+TEST_F(BestShareRoundReset, RoundTracksNewRoundIndependentlyAfterReset) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    mi.record_share_difficulty(900000.0, "minerC", "cc");   // last round's record
+    mi.record_found_block(2511601, uint256{}, 0, "LTC", "minerC", "cc", 96540.0);
+
+    // A modest share arrives in the new round.
+    mi.record_share_difficulty(250.0, "minerD", "dd");
+
+    double round_diff, all_time_diff; uint64_t round_started;
+    snapshot(mi, round_diff, round_started, all_time_diff);
+
+    EXPECT_DOUBLE_EQ(round_diff, 250.0)
+        << "#922: round must now reflect the new round's best share, not last round's";
+    EXPECT_DOUBLE_EQ(all_time_diff, 900000.0)
+        << "#922: the all_time record must remain the last round's 900000";
+    EXPECT_NE(round_diff, all_time_diff)
+        << "#922 regression guard: round must not degenerate back into a "
+           "duplicate of all_time";
+}
+// ===========================================================================
+// #921 -- Share-Version Crossing card schema contract.
+//
+// The operator reported the crossing card "not serving": /v36_status emits a
+// NESTED shape (auto_ratchet{...} + share_chain{...}) with NOTHING at top level,
+// but renderV36Status() read only TOP-LEVEL keys (v.status, v.overall_v36_vote_pct,
+// v.sampling_signaling, v.message, v.target_version, ...). The endpoint returned
+// 200, the card rendered, nothing threw -- every field just fell through to '-'.
+// A present-but-meaningless card, invisible to every existing test (same shape
+// as the local_share_hash_rates aliasing class). These two KATs pin the contract
+// from BOTH sides so it cannot drift back.
+// ===========================================================================
+
+// Side 1 (backend): rest_v36_status() must actually EMIT, under the nested paths,
+// every field the fixed card reads. If a refactor flattens or renames the shape,
+// this fails.
+TEST(WebHonestyRegression, V36StatusEmitsEveryNestedFieldTheCrossingCardReads) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_cached_share_version(36);              // latched -> exercises the active path
+    json v = mi.rest_v36_status();
+
+    // The card reads exactly these nested paths (dashboard.html renderV36Status):
+    ASSERT_TRUE(v.contains("auto_ratchet")) << "/v36_status must emit auto_ratchet";
+    ASSERT_TRUE(v.contains("share_chain"))  << "/v36_status must emit share_chain";
+    const auto& ar = v["auto_ratchet"];
+    const auto& sc = v["share_chain"];
+    EXPECT_TRUE(ar.contains("state"))
+        << "card reads auto_ratchet.state for its status label";
+    EXPECT_TRUE(ar.contains("live_share_version"))
+        << "card reads auto_ratchet.live_share_version for the current-version label";
+    EXPECT_TRUE(ar.contains("v36_active"))
+        << "card reads auto_ratchet.v36_active for the live-latch line";
+    EXPECT_TRUE(sc.contains("v36_percentage"))
+        << "card reads share_chain.v36_percentage for the signalling %";
+    // The endpoint must NOT be relied on for the top-level keys the buggy card
+    // read -- their absence is exactly why the card was empty. Guard that the
+    // card is not silently re-coupled to a shape the endpoint doesn't provide.
+    for (const char* absent : {"status", "overall_v36_vote_pct", "sampling_signaling",
+                               "message", "target_version", "current_share_name"}) {
+        EXPECT_FALSE(v.contains(absent))
+            << "top-level '" << absent << "' is NOT emitted by /v36_status; the "
+               "card must not read it (this was the #921 empty-card bug)";
+    }
+}
+
+// Side 2 (frontend, static-HTML): the crossing-card render function must read the
+// nested shape and must NOT read any of the top-level keys the endpoint does not
+// emit. This is the KAT the issue asked for -- it fails if the card reads a field
+// the endpoint does not serve, the defect class that returns 200 and throws
+// nothing. Folded into this allowlisted target (not a new add_executable -> the
+// #769 Not-Run trap).
+TEST(DashboardCrossingCard, ReadsOnlyEmittedNestedFields) {
+    const auto html = read_dashboard();
+    auto start = html.find("function renderV36Status(v)");
+    ASSERT_NE(start, std::string::npos) << "renderV36Status not found";
+    // Slice to the next top-level function declaration (same 8-space indent).
+    auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+
+    // Must read the canonical nested shape the endpoint emits.
+    EXPECT_NE(fn.find("v.auto_ratchet"), std::string::npos)
+        << "renderV36Status does not read v.auto_ratchet -- /v36_status emits the "
+           "ratchet state nested there, not at top level.";
+    EXPECT_NE(fn.find("v.share_chain"), std::string::npos)
+        << "renderV36Status does not read v.share_chain -- v36_percentage lives "
+           "there, not at top level.";
+
+    // Must NOT read the top-level keys /v36_status never emits (the #921 bug).
+    for (const char* dead : {"v.status", "v.overall_v36_vote_pct", "v.sampling_signaling",
+                             "v.current_share_name", "v.current_share_type",
+                             "v.target_version_name", "v.target_version",
+                             "v.message", "v.is_transitioning"}) {
+        EXPECT_EQ(fn.find(dead), std::string::npos)
+            << "renderV36Status reads '" << dead << "', a field /v36_status does "
+               "NOT emit -- it will render as '-' and produce the empty card the "
+               "operator reported. Read the nested auto_ratchet/share_chain path.";
+    }
+
+    // The backwards label must be gone: 'ACTIVATED' must never be the no-transition
+    // fallback (a quiet pre-cross node claiming it had activated).
+    EXPECT_EQ(fn.find("no_transition"), std::string::npos)
+        << "the no_transition:'ACTIVATED' label is semantically backwards -- a "
+           "node with nothing happening would read ACTIVATED.";
+
+    // Visibility must be gated, not unconditional: a hide path must exist.
+    EXPECT_NE(fn.find("card.style.display = 'none'"), std::string::npos)
+        << "the crossing card display is unconditional; it must hide when the node "
+           "is plainly pre-crossing (operator design point on #921).";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Share-difficulty trend line (operator-requested, 2026-08-01): the graph must
+// plot a REAL share-difficulty trend against network difficulty. The pre-fix
+// source had no "share_difficulty" graph series at all, and the stat-log's
+// share_diff was a hardcoded net_difficulty/65536 approximation — a flat scaled
+// copy of the chain difficulty, not the true vardiff target. These KATs pin the
+// real source in place; they FAIL on the pre-fix code (no source → 0.0).
+// ─────────────────────────────────────────────────────────────────────────
+
+// The share_difficulty graph series must carry the sharechain's published
+// min_difficulty (the p2pool share target that vardiff retargets), NOT the
+// net/65536 approximation (which would be 0 here since no chain difficulty is
+// set) and NOT an absent-source 0.
+TEST(ShareDifficultyTrend, GraphSourcesRealVardiffFromSharechainStats) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_pool_hashrate_fn([] { return 1.5e12; });   // ~1.5 TH/s per hotel
+    mi.set_sharechain_stats_fn([] {
+        return json{{"total_shares", 4096}, {"orphan_shares", 0},
+                    {"dead_shares", 0}, {"min_difficulty", 2048.0}};
+    });
+
+    mi.update_stat_log();
+    json series = mi.rest_web_graph_data("share_difficulty", "last_hour");
+
+    ASSERT_TRUE(series.is_array());
+    ASSERT_FALSE(series.empty())
+        << "share_difficulty graph series is empty; the trend line has no data";
+    const auto& last = series.back();
+    ASSERT_TRUE(last.is_array() && last.size() >= 2);
+    EXPECT_DOUBLE_EQ(last[1].get<double>(), 2048.0)
+        << "share_difficulty must come from the sharechain's min_difficulty "
+           "(the real vardiff target), not the net/65536 approximation or a "
+           "0-stub.";
+}
+
+// When the sharechain omits min_difficulty, the trend must fall back to the
+// last real RECORDED share difficulty — never the net/65536 approximation.
+TEST(ShareDifficultyTrend, GraphFallsBackToRecordedShareDifficulty) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_pool_hashrate_fn([] { return 1.5e12; });
+    // sharechain stats WITHOUT min_difficulty (the honest-absent case):
+    mi.set_sharechain_stats_fn([] {
+        return json{{"total_shares", 4096}, {"orphan_shares", 0},
+                    {"dead_shares", 0}};
+    });
+    // A real accepted share at difficulty 4096 (vardiff top of the 2048<->4096
+    // retarget band the hotel node was running).
+    mi.record_share_difficulty(4096.0, "miner1", "deadbeef");
+
+    mi.update_stat_log();
+    json series = mi.rest_web_graph_data("share_difficulty", "last_hour");
+
+    ASSERT_TRUE(series.is_array() && !series.empty());
+    const auto& last = series.back();
+    ASSERT_TRUE(last.is_array() && last.size() >= 2);
+    EXPECT_DOUBLE_EQ(last[1].get<double>(), 4096.0)
+        << "with no published min_difficulty the share_difficulty trend must "
+           "fall back to the last recorded real share difficulty, not a "
+           "difficulty/65536 approximation.";
+}
+
+
+// ===========================================================================
+// PRE-SYNC / NO-WORK-REASON surface (integrator 08-02, PERMANENT lane item).
+//
+// Measured gap: nothing in web_server.cpp / dashboard.html referenced sync
+// state or a no-work reason, so a node healthily SYNCING and a node FAULTED
+// rendered identically -- "nothing happening". The truth existed only in a
+// log line (stratum_server.cpp: "header sync in progress") and in the log-only
+// classify_decline() (dash node_coin_state.hpp). These KATs pin the web-owned
+// contract from both sides: the render must surface header-sync progress + the
+// no-work reason, categorised, and the hook payload must pass those fields
+// through verbatim so each lane can feed classify_decline()/header heights.
+// ===========================================================================
+
+// Side 1 (backend): the per-coin node_topology hook is a verbatim passthrough
+// (rest_node_topology returns the hook JSON as-is). A lane feeding a no-work
+// reason + header-sync heights must have them survive to the API untouched --
+// the contract the front-end reads.
+TEST(WebHonestyRegression, NodeTopologyHookPassesNoWorkReasonAndHeaderSyncVerbatim) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_node_topology_fn([] {
+        return json{{"node_symbol", "DASH"}, {"auto_detected", false},
+            {"coins", json::array({
+                json{{"coin", "DASH"}, {"primary", true}, {"peers", 8},
+                     {"synced", false},
+                     {"header_height", 2515029}, {"target_height", 2515025},
+                     {"sync_percent", 100.0},
+                     {"no_work_reason", "superblock-refused"}}})}};
+    });
+    json t = mi.rest_node_topology();
+    ASSERT_TRUE(t.contains("coins") && t["coins"].is_array() && !t["coins"].empty());
+    const auto& c = t["coins"][0];
+    EXPECT_EQ(c.value("no_work_reason", std::string{}), "superblock-refused")
+        << "the lane no-work reason (classify_decline output) must survive the "
+           "topology hook verbatim -- it is the money-relevant field.";
+    EXPECT_EQ(c.value("header_height", 0), 2515029)
+        << "header-sync current height must pass through for the progress line";
+    EXPECT_EQ(c.value("target_height", 0), 2515025)
+        << "header-sync target height must pass through for the progress line";
+}
+
+// Side 2 (frontend, static-HTML): renderNodeTopology must READ the header-sync
+// heights and the no-work reason, and must categorise the reason so a syncing
+// node is legibly different from a faulted or a declining one. Fails-without-fix:
+// if the render drops back to the peers/synced-only shape, a syncing node and a
+// dead node collapse to identical output -- the exact defect this item exists to
+// kill. Folded into this allowlisted target (no new add_executable -> #769 trap).
+TEST(DashboardNoWorkReason, RendersHeaderSyncAndCategorisedReason) {
+    const auto html = read_dashboard();
+    auto start = html.find("function renderNodeTopology(t)");
+    ASSERT_NE(start, std::string::npos) << "renderNodeTopology not found";
+    auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+
+    // Header-sync progress: must read current AND target height.
+    EXPECT_NE(fn.find("c.header_height"), std::string::npos)
+        << "render must read c.header_height for the sync-progress line";
+    EXPECT_NE(fn.find("c.target_height"), std::string::npos)
+        << "render must read c.target_height for the sync-progress line";
+
+    // The no-work reason must be read and surfaced.
+    EXPECT_NE(fn.find("c.no_work_reason"), std::string::npos)
+        << "render must read c.no_work_reason -- without it a node serving no "
+           "work renders blank, indistinguishable from a dead node (the gap "
+           "this permanent item exists to close).";
+
+    // The three states must each be legibly named -- collapsing them was the bug.
+    for (const char* cat : {"syncing", "faulted", "armed, declining"}) {
+        EXPECT_NE(fn.find(cat), std::string::npos)
+            << "render must name the  << cat <<  state; the whole point is "
+               "that syncing / faulted / declining are NOT identical on screen.";
+    }
+
+    // Honest-absent: the reason line is guarded on the field being present, so a
+    // lane that feeds no reason stays silent rather than claiming a false state.
+    EXPECT_NE(fn.find("c.no_work_reason != null"), std::string::npos)
+        << "the no-work line must be gated on the reason being present "
+           "(honest-absent), not rendered unconditionally.";
+}
+
+// (#945, frontend) renderBestShare must gate the record on has_best_share and
+// must not present a value when absent. Pre-fix it unconditionally wrote
+// bs.round.difficulty / bs.all_time.pct_of_block, so when the backend fell back
+// to the sharechain average the card rendered that average as a record.
+// Fails-without-fix: the pre-fix function never references has_best_share.
+TEST(DashboardBestShare, RecordGatesOnHasBestNotAverage) {
+    const auto html = read_dashboard();
+    auto start = html.find("function renderBestShare(bs)");
+    ASSERT_NE(start, std::string::npos) << "renderBestShare not found";
+    auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+
+    EXPECT_NE(fn.find("has_best_share"), std::string::npos)
+        << "renderBestShare must gate the record on bs.has_best_share; without "
+           "it a syncing node renders the sharechain average as a 'Best Share'.";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #948 — block_value_miner (NET of pool fee) vs block_value_payments (GROSS):
+// the two sibling fields used different conventions with nothing in the name
+// saying so, and block_value_miner + block_value_payments != block_value, so a
+// consumer that assumed the parts sum silently dropped the fee. The fix keeps
+// the legacy keys byte-for-byte and adds explicit gross / net / fee fields such
+// that the reconciliation identity holds on a fee'd node. These pin it.
+//
+// Live hotel primary (DASH, --fee 1) numbers, re-derived per the issue:
+//     block_value           1.77033183
+//     block_value_payments   1.32774887   (75%: masternode + treasury)
+//     miner GROSS 25%        0.44258296
+//     pool fee 1%            0.00442583
+//     miner NET              0.43815713   (== legacy block_value_miner)
+namespace {
+// MiningInterface is non-copyable/non-movable (atomic + mutex members), so we
+// configure a caller-owned instance in place rather than return one by value.
+void feed_coin_work(MiningInterface& mi, double block_value, double payments) {
+    // m_cached_template stays null -> rest_local_stats reads the coin-work feed,
+    // the c2pool-dash topology where WebServer drives no work pipeline of its own.
+    mi.set_coin_work_fn([block_value, payments] {
+        MiningInterface::CoinWorkInfo w;
+        w.valid = true;
+        w.network_difficulty = 28231.0;
+        w.coinbase_value_sat = static_cast<uint64_t>(llround(block_value * 1e8));
+        w.payment_amount_sat = static_cast<uint64_t>(llround(payments * 1e8));
+        w.height = 2200000;
+        return w;
+    });
+}
+} // namespace
+
+TEST(WebBlockValueReconcile, GrossNetFeeReconcileOnFeedNode) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_pool_fee_percent(1.0);
+    feed_coin_work(mi, 1.77033183, 1.32774887);
+    json r = mi.rest_local_stats();
+
+    ASSERT_TRUE(r.contains("block_value_miner_gross"))
+        << "gross miner share must be exposed explicitly (#948)";
+    ASSERT_TRUE(r.contains("block_value_fee"))
+        << "pool-fee deduction must be a visible field so the parts reconcile (#948)";
+    ASSERT_TRUE(r.contains("block_value_miner_net"));
+
+    const double bv    = r["block_value"].get<double>();
+    const double gross = r["block_value_miner_gross"].get<double>();
+    const double fee   = r["block_value_fee"].get<double>();
+    const double net   = r["block_value_miner_net"].get<double>();
+    const double pay   = r["block_value_payments"].get<double>();
+    const double legacy= r["block_value_miner"].get<double>();
+
+    // Values match the live re-derivation.
+    EXPECT_NEAR(bv,    1.77033183, 1e-8);
+    EXPECT_NEAR(gross, 0.44258296, 1e-8);
+    EXPECT_NEAR(fee,   0.00442583, 1e-7);
+    EXPECT_NEAR(net,   0.43815713, 1e-7);
+
+    // The reconciliation identity the issue demands: gross + payments == block_value.
+    EXPECT_NEAR(gross + pay, bv, 1e-8)
+        << "block_value_miner_gross + block_value_payments must equal block_value";
+    // Gross decomposes into the net share plus the fee.
+    EXPECT_NEAR(gross, net + fee, 1e-9)
+        << "gross must equal net + fee so the fee is a derivable deduction";
+    // The legacy field is unchanged and is the NET value (not gross).
+    EXPECT_DOUBLE_EQ(legacy, net)
+        << "legacy block_value_miner must keep its exact NET value (no consumer break)";
+    EXPECT_GT(gross, legacy)
+        << "with a non-zero fee the gross share must exceed the net legacy field, "
+           "which is the whole point of the #948 mislabel";
+}
+
+// A zero-fee node cannot distinguish gross from net, but the fields must still
+// be present and the identity must still hold (fee == 0, gross == net).
+TEST(WebBlockValueReconcile, ZeroFeeStillPresentAndConsistent) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_pool_fee_percent(0.0);
+    feed_coin_work(mi, 1.77033183, 1.32774887);
+    json r = mi.rest_local_stats();
+
+    ASSERT_TRUE(r.contains("block_value_fee"));
+    EXPECT_NEAR(r["block_value_fee"].get<double>(), 0.0, 1e-12);
+    EXPECT_DOUBLE_EQ(r["block_value_miner_gross"].get<double>(),
+                     r["block_value_miner_net"].get<double>());
+    EXPECT_NEAR(r["block_value_miner_gross"].get<double>() +
+                r["block_value_payments"].get<double>(),
+                r["block_value"].get<double>(), 1e-8);
+}
+
+// ===========================================================================
+// Standalone-coin merged-UI purge (follow-up to #896/#912): a coin with no
+// merged child (DASH/BTC/DGB) must not render ANY merged-mining card, column,
+// or SPV row anywhere in the web-static layer -- not just the Username line.
+// These KATs pin the topology gates added to dashboard.html (Merged Payout
+// column), miners.html / miner.html (Merged Mining Blocks sections), and
+// loading.html (SPV rows). Same charter: never imply revenue or a chain
+// topology that does not exist.
+// ===========================================================================
+#ifndef WEB_STATIC_DIR
+#error "WEB_STATIC_DIR must be defined by CMake"
+#endif
+
+namespace {
+std::string read_web_static(const std::string& name) {
+    std::ifstream f(std::string(WEB_STATIC_DIR) + "/" + name);
+    EXPECT_TRUE(f.good()) << "cannot open " << WEB_STATIC_DIR << "/" << name;
+    std::stringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+} // namespace
+
+// dashboard.html: the Active-Miners "Merged Payout" column (header AND the
+// dynamically appended cells) must carry the merged-child-hint gate. The cells
+// are appended on every table re-render, AFTER the one-shot d3 toggle ran, so
+// the gate must also exist as a CSS rule keyed off a body class the topology
+// handler stamps -- otherwise re-rendered rows resurrect the DOGE column.
+TEST(DashboardMergedGating, MinersTableMergedPayoutColumnIsGated) {
+    const auto html = read_dashboard();
+    for (const auto& line : lines_of(html)) {
+        if (line.find(">Merged Payout</th>") != std::string::npos) {
+            EXPECT_NE(line.find("merged-child-hint"), std::string::npos)
+                << "the Merged Payout column header is not topology-gated; a "
+                   "standalone coin renders a phantom DOGE payout column:\n"
+                << line;
+        }
+    }
+    // Body-class CSS gate covers dynamically appended cells.
+    EXPECT_NE(html.find("body.no-merged-child .merged-child-hint"),
+              std::string::npos)
+        << "missing the body-class CSS gate; merged cells appended after the "
+           "currency_info toggle ran (miner-table re-renders) stay visible on "
+           "a standalone coin.";
+    EXPECT_NE(html.find("classList.toggle('no-merged-child', !mergedChild)"),
+              std::string::npos)
+        << "the topology handler does not stamp the no-merged-child body "
+           "class; the CSS gate never engages.";
+    // The dynamically appended merged-payout cell must carry the gate class.
+    EXPECT_NE(html.find("minerRow.append('td').attr('class', 'merged-child-hint')"),
+              std::string::npos)
+        << "the per-miner merged-payout cell is appended without the gate "
+           "class; every miner row shows '0.0000 DOGE' on a standalone coin.";
+}
+
+// miners.html: the "Merged Mining Blocks" section must be hidden by default
+// and revealed only when currency_info advertises a merged child. Both failure
+// directions: standalone stays hidden, merged parent still shows it.
+TEST(WebStaticMergedGating, MinersPageMergedBlocksSectionIsTopologyGated) {
+    const auto html = read_web_static("miners.html");
+    for (const auto& line : lines_of(html)) {
+        if (line.find("id=\"merged_blocks_header\"") != std::string::npos) {
+            EXPECT_NE(line.find("display: none"), std::string::npos)
+                << "merged_blocks_header renders by default; a standalone coin "
+                   "shows a Merged Mining Blocks card:\n" << line;
+        }
+        if (line.find("id=\"merged_blocks_panel\"") != std::string::npos) {
+            EXPECT_NE(line.find("display: none"), std::string::npos)
+                << "merged_blocks_panel renders by default on a standalone "
+                   "coin:\n" << line;
+        }
+    }
+    EXPECT_NE(html.find("info.merged_child_symbol"), std::string::npos)
+        << "no topology reveal path: a merged parent (LTC) would lose its "
+           "Merged Mining Blocks section.";
+}
+
+// miner.html: same contract for the per-miner page (header + summary stat
+// cards + blocks table), which previously rendered zeroed merged cards
+// unconditionally.
+TEST(WebStaticMergedGating, MinerPageMergedBlocksSectionIsTopologyGated) {
+    const auto html = read_web_static("miner.html");
+    const std::vector<std::string> gated_ids = {
+        "merged_blocks_header", "merged_summary_grid", "merged_blocks_panel"};
+    for (const auto& id : gated_ids) {
+        bool declared = false, hidden = false;
+        for (const auto& line : lines_of(html)) {
+            if (line.find("id=\"" + id + "\"") != std::string::npos) {
+                declared = true;
+                if (line.find("display: none") != std::string::npos) hidden = true;
+            }
+        }
+        EXPECT_TRUE(declared) << "expected element '" << id << "' not found; "
+            "if it moved, re-point this KAT.";
+        EXPECT_TRUE(hidden) << "'" << id << "' renders by default; a "
+            "standalone coin shows zeroed merged-mining cards.";
+    }
+    EXPECT_NE(html.find("info.merged_child_symbol"), std::string::npos)
+        << "no topology reveal path: a merged parent (LTC) would lose its "
+           "merged blocks section on the miner page.";
+}
+
+// loading.html: the startup page must not hardcode LTC/DOGE SPV rows. The
+// parent row's label is currency_info-driven and both rows appear only when
+// the node reports SPV progress; the child row additionally requires a merged
+// child in the topology. A DASH node must show neither an LTC nor a DOGE row.
+TEST(WebStaticMergedGating, LoadingPageSpvRowsAreTopologyDriven) {
+    const auto html = read_web_static("loading.html");
+    EXPECT_EQ(html.find(">LTC SPV</span>"), std::string::npos)
+        << "loading.html hardcodes an LTC SPV row label; a standalone DASH "
+           "node presents itself as an LTC node while starting up.";
+    EXPECT_EQ(html.find(">DOGE SPV</span>"), std::string::npos)
+        << "loading.html hardcodes a DOGE SPV row label; a standalone coin "
+           "advertises a merged chain it does not have.";
+    for (const auto& line : lines_of(html)) {
+        if (line.find("id=\"row-parent-spv\"") != std::string::npos ||
+            line.find("id=\"row-child-spv\"") != std::string::npos) {
+            EXPECT_NE(line.find("display:none"), std::string::npos)
+                << "SPV row renders by default (before the node reports any "
+                   "SPV state):\n" << line;
+        }
+    }
+    EXPECT_NE(html.find("ci.merged_child_symbol"), std::string::npos)
+        << "the child SPV row is not keyed off the merged-child topology.";
+    EXPECT_NE(html.find("ci.symbol"), std::string::npos)
+        << "the parent SPV row label is not currency_info-driven.";
+}

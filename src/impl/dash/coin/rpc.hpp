@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+// ---------------------------------------------------------------------------
+// dash::coin::NodeRPC -- external dashd-RPC client (launcher slice 3).
+//
+// Real boost::beast + jsonrpccxx HTTP JSON-RPC client to an external dashd,
+// mirroring src/impl/dgb/coin/rpc.{hpp,cpp} (itself mirrored from
+// src/impl/btc/coin/rpc.{hpp,cpp}). This is the EXTERNAL-DAEMON FALLBACK path
+// that V36 mandates persist alongside the embedded daemon (v36 external_fallback:
+// "embedded primary, external fallback persists -- do NOT remove external-daemon
+// code paths"). Closes the launcher-campaign gap: before this slice DASH had
+// ONLY coin/rpc_data.hpp (the DashWorkData placeholder) and NO RPC client.
+//
+// DASH divergences from DGB/BTC (conformed at port time):
+//   - getblocktemplate(): DASH is X11 and has NO segwit, so -- unlike DGB --
+//     the GBT body carries NO {"algo":"scrypt"} param and injects NO "segwit"
+//     rule. It is the plain {"rules": <caller rules>} dashd expects (default
+//     {}). See coin/rpc_request.hpp (request-shape SSOT).
+//   - getwork() returns the RICH dash::coin::DashWorkData (NOT the trimmed
+//     rpc::WorkData family-1 seam DGB uses). It parses the dashd GBT JSON into:
+//       * standard fields (version/prev/height/coinbasevalue/bits/curtime/...)
+//       * the full transaction set (m_txs + m_tx_data_hex + m_tx_hashes + fees)
+//       * the DASH masternode + superblock + platform payments
+//         (m_packed_payments, normalized to the "!hex"/base58 payee convention
+//         coin/embedded_gbt.hpp::gbt_xcheck compares against), with
+//         m_payment_amount = sum of those amounts (the masternode+treasury
+//         share miners do NOT receive)
+//       * the DIP3/DIP4 coinbase extra payload (m_coinbase_payload, hex-decoded)
+//   - check(): chain-identity probe uses the DASH genesis hash (mainnet vs
+//     testnet3 by IS_TESTNET) from coin/rpc_request.hpp, not DGB's.
+//
+// submit_block_hex(block_hex, ignore_failure) is THE key deliverable: the dashd
+// `submitblock` fallback arm. The embedded-P2P relay leg of the won-block
+// dual-path broadcaster is still DEFERRED (lands with coin/p2p_node); this slice
+// ships the RPC submit fallback only. NEVER remove the external-daemon path.
+// ---------------------------------------------------------------------------
+
+#include "block.hpp"
+#include "rpc_data.hpp"
+#include "node_interface.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <ctime>
+#include <functional>
+#include <iostream>
+#include <mutex>
+
+#include <core/uint256.hpp>
+#include <core/timer.hpp>
+#include <core/netaddress.hpp>   // NetService m_address / connect() endpoint
+
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include <nlohmann/json.hpp>
+#include <jsonrpccxx/client.hpp>
+
+namespace io = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+
+namespace dash
+{
+
+namespace coin
+{
+
+struct RPCAuthData;
+class NodeRPC : public jsonrpccxx::IClientConnector
+{
+    const std::string ID = "curltest";
+    const jsonrpccxx::version RPC_VER = jsonrpccxx::version::v2;
+
+    const bool IS_TESTNET;
+private:
+    dash::interfaces::Node* m_coin;
+
+    io::io_context* m_context;
+    beast::tcp_stream m_stream;
+    boost::asio::ip::tcp::resolver m_resolver;
+    http::request<http::string_body> m_http_request;
+    // Serializes Send() (verbatim LTC parity, impl/ltc/coin/rpc.hpp:43-47).
+    // io-thread-decouple drives this ONE shared client from TWO threads: the
+    // stratum io_context thread (getwork() during a template re-source, and ARM
+    // B submit_block_hex on a won block) AND the background rpc_pool thread (the
+    // tip poll's getbestblockhash + the single-flight GBT refresh). m_http_request
+    // + m_stream are NOT thread-safe: without this lock one thread's
+    // prepare_payload() frees the Content-Length field element mid-write on the
+    // other -> UAF / interleaved HTTP frames / cross-wired responses (a garbled
+    // submitblock = lost block on the paying node). The lock also serializes the
+    // sync_reconnect() retry path, which is only ever entered from inside Send().
+    std::mutex m_rpc_mutex;
+
+    std::unique_ptr<RPCAuthData> m_auth;
+    jsonrpccxx::JsonRpcClient m_client;
+
+    // Reconnection state
+    NetService m_address;
+    std::string m_userpass;
+    bool m_connected = false;
+    std::unique_ptr<core::Timer> m_reconnect_timer;
+
+    // DASHD-CUT sync-reconnect backoff (hotel-reserve thrash fix). sync_reconnect()
+    // is called synchronously from Send() (under m_rpc_mutex) on every write/read
+    // failure and, unlike the async connect() path, had NO backoff: against a dead
+    // dashd "Connection refused" returns instantly, so Send() re-drove it ~30/s
+    // (17804 attempts in ~10 min at the hotel-reserve reserve). These bound that:
+    // after a FAILED sync reconnect we refuse to re-attempt the socket until the
+    // backoff window elapses (Send() returns empty; the embedded/null arm keeps
+    // serving), doubling the window 1->2->4->...->kSyncBackoffMaxSecs. A SUCCESS
+    // resets it to 0. All accessed only under m_rpc_mutex (sync_reconnect is only
+    // ever entered from inside Send(), which holds it).
+    static constexpr int kSyncBackoffMaxSecs = 30;
+    std::chrono::steady_clock::time_point m_sync_backoff_until{};
+    int      m_sync_backoff_secs = 0;   // 0 = no active backoff
+    // Observability (read-only; test + log). Counts genuine socket attempts (NOT
+    // window-skipped calls): under the fix this stays tiny against a dead dashd
+    // where it used to equal the Send()-retry count. Atomic so a diagnostic
+    // reader off the io thread is race-free; only sync_reconnect() (under the
+    // mutex) writes it.
+    std::atomic<uint64_t> m_sync_reconnect_attempts{0};
+    void bump_sync_backoff();
+    // Reconnect-churn observer (stale-payee fix): fired whenever the RPC
+    // connection is torn down / re-established (reconnect(), sync_reconnect()).
+    // main_dash.cpp wires this to DASHWorkSource::invalidate_template_cache()
+    // so no stratum job is ever served or submitted from a template/masternode
+    // payee cached from BEFORE the churn window. Assigned once at startup,
+    // before the io loop runs.
+    std::function<void()> m_on_reconnect;
+
+    // blockcount_cached() memo — see its declaration below.
+    int          m_blockcount_cache{0};
+    std::time_t  m_blockcount_cache_at{0};
+
+    std::string Send(const std::string &request) override;
+    nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
+
+    // io-thread-decouple: a REAL deadline on the synchronous Send() I/O so a
+    // wedged-but-connected dashd (socket open, no bytes) cannot hang the caller
+    // forever -- which on the background rpc_pool thread would wedge
+    // template_refresh_inflight_ true (permanent set-gap after the next tip
+    // change), stop the tip-poll re-arming, AND block rpc_pool->join() at
+    // shutdown (SIGKILL needed). beast's SYNCHRONOUS read_some/write_some call
+    // socket.read_some() directly and do NOT honour tcp_stream::expires_after
+    // (that timer only fires for ASYNC ops -- basic_stream.hpp), so the robust
+    // bound is a kernel SO_RCV/SNDTIMEO on the socket forced back to BLOCKING
+    // mode (async_connect leaves asio's non_blocking flag set, under which
+    // SO_*TIMEO is a no-op). apply_socket_timeouts() does both; it is called
+    // after every successful (re)connect. Linux release target.
+    static constexpr int RPC_IO_TIMEOUT_SECONDS = 12;
+    void apply_socket_timeouts();
+    // Tear down m_stream (sync_reconnect idiom). Called on a FINAL-attempt Send()
+    // failure so a half-written / unread request can never be answered into a
+    // later Send() on a reused connection -- the deadline-desync guard (the
+    // constant "curltest" id + jsonrpccxx not validating response ids makes any
+    // reused-connection off-by-one a permanent set-gap outage). Caller holds
+    // m_rpc_mutex.
+    void close_stream();
+
+public:
+    NodeRPC(io::io_context* context, dash::interfaces::Node* coin, bool testnet);
+    ~NodeRPC();
+
+    void connect(NetService address, std::string userpass);
+    void reconnect();
+    void sync_reconnect();
+    /// Register the reconnect-churn observer (see m_on_reconnect). Call once
+    /// at startup before the io loop runs.
+    void set_on_reconnect(std::function<void()> fn) { m_on_reconnect = std::move(fn); }
+    /// DASHD-CUT observability (read-only). Number of genuine sync-reconnect
+    /// SOCKET attempts made (window-skipped calls are NOT counted): a dead-dashd
+    /// hot spin shows up here as a large number; under the backoff fix it stays
+    /// tiny. The current backoff window (seconds; 0 when healthy) is the second
+    /// gauge. Both are the KAT's proof that the ~30/s churn is bounded.
+    uint64_t sync_reconnect_attempts() const { return m_sync_reconnect_attempts.load(); }
+    int      sync_backoff_secs() const { return m_sync_backoff_secs; }
+    bool check();
+    bool check_blockheader(uint256 header);
+
+    // Parse a dashd getblocktemplate response into the rich DashWorkData (txs +
+    // masternode/superblock payments + DIP3/DIP4 coinbase payload).
+    DashWorkData getwork();
+
+    void submit_block(BlockType& block, bool ignore_failure);
+    // Submit a pre-serialised block passed in as a hex string (avoids re-packing)
+    // -- THE dashd submitblock fallback arm. Returns true iff the daemon
+    // accepted the block (result is null), false otherwise.
+    bool submit_block_hex(const std::string& block_hex, bool ignore_failure);
+
+    // RPC Methods
+    // DASH: X11, no segwit -> rules are passed through plainly; no separate algo
+    // param (the DGB Scrypt divergence does NOT apply). See rpc_request.hpp.
+    nlohmann::json getblocktemplate(std::vector<std::string> rules = {});
+
+    // ORACLE-SHADOW verdict: getblocktemplate{mode:proposal} of a fully-
+    // assembled block. Returns "" on ACCEPT (dashd TestBlockValidity passed) or
+    // the reject reason. Mempool-independent; never throws (RPC blip -> reason).
+    std::string propose_block_hex(const std::string& block_hex);
+    // MEMPOOL VALIDITY GATE (mempool_validity_gate.hpp): dashd's own verdict on
+    // ONE transaction we hold and would serve. Returns the single result object
+    // -- {"txid":..,"allowed":..,"reject-reason":..} -- or a NULL json when the
+    // daemon could not be asked. Never throws, and a failure is deliberately
+    // indistinguishable from "no answer" rather than from "allowed": the gate
+    // counts a missing answer as UNPROBED, never as a pass.
+    //
+    // ONE transaction per call, because that is the only shape Dash Core's
+    // testmempoolaccept takes ("Array must contain exactly one raw
+    // transaction"). Always called off the miner-facing path.
+    nlohmann::json test_mempool_accept(const std::string& raw_tx_hex);
+    nlohmann::json getnetworkinfo();
+    nlohmann::json getblockchaininfo();
+    nlohmann::json getmininginfo();
+    // Trivial tip probe: the current best-block hash as a hex string. Used by
+    // the fallback-arm tip poller (main_dash.cpp) to drive event-driven
+    // template refresh without waiting on the 30 s staleness TTL. Empty string
+    // on a null/absent result.
+    std::string getbestblockhash();
+    // gettxout <txid> <n>: the daemon's own UTXO-set answer for one outpoint.
+    // SECOND SOURCE for the pinned-tx admission gate (money-path): our embedded
+    // UTXO view is built forward from the node's start height, so coins older
+    // than that are absent from it and the gate cannot tell "spent" from
+    // "never seen". Returns a null json when the coin is unspendable/absent —
+    // the caller must treat that as REFUSE, never as a guess.
+    nlohmann::json gettxout(const uint256& txid, uint32_t n);
+    // Chain height with a short cache. The pin gate calls gettxout once per
+    // input (1032 for the donation consolidation) and each answer needs the
+    // tip to turn `confirmations` into a coin height; asking the daemon 1032
+    // times for a number that changes every ~2.6 minutes would be waste. The
+    // cache is refreshed at most once every kBlockCountCacheSecs. Returns 0
+    // when the daemon cannot be reached, which callers must treat as REFUSE.
+    int blockcount_cached();
+    // getpeerinfo -> the dashd's OWN connected-peer addresses (the "addr" field
+    // of each entry), parsed to NetService. Feeds the embedded
+    // DashCoinPeerManager's daemon-peer overlap filter + coind-source -20 score
+    // penalty so the embedded arm actively avoids mirroring the local dashd's
+    // peers (network-view disjointness). Returns empty on a null/absent result;
+    // transport errors propagate (the caller swallows them). No dashd config
+    // change required (getpeerinfo is a default RPC).
+    std::vector<NetService> getpeerinfo();
+    // verbose: true -- json result, false -- hex-encode result;
+    nlohmann::json getblockheader(uint256 header, bool verbose = true);
+    // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
+    nlohmann::json getblock(uint256 blockhash, int verbosity = 1);
+    // E2c (#738): `protx list registered true` -- the full REGISTERED
+    // deterministic-MN set at the current tip in the DETAILED shape
+    // (state.payoutAddress + lastPaidHeight + registeredHeight + PoSe
+    // heights). This is the payout-bearing MN-set SEED source for the
+    // embedded arm; the P2P Simplified MN List omits
+    // scriptPayout/lastPaidHeight so it can never back this. See
+    // coin/mn_seed.hpp (parse_protx_list_seed).
+    //
+    // REGISTERED, not `valid`: `valid` FILTERS OUT every PoSe-banned
+    // masternode, which makes "banned at seed time" byte-identical to "does
+    // not exist" in the seeded set. A ProUpServTx that later REVIVES such a
+    // masternode then hits the unknown-MN branch of
+    // MnStateMachine::apply_block and is dropped — the masternode can never
+    // re-enter the payment queue, and its queue slot silently shifts every
+    // later projection by one. `registered` carries the banned masternodes
+    // WITH their PoSeBanHeight, so they are PRESENT but INELIGIBLE
+    // (MNState::isValid is derived as banHeight == 0) and the revive path
+    // works as written. Eligibility is then COMPUTED, never implied by
+    // absence. `eligible_size()` — not `size()` — is the number comparable
+    // to `protx list valid`.
+    nlohmann::json protx_list_registered_detailed();
+};
+
+struct RPCAuthData
+{
+    std::string authorization;
+    std::string host;
+};
+
+} // namespace coin
+
+} // namespace dash

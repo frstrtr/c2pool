@@ -1,0 +1,28 @@
+# T12 sticky shard assembly  W=300000  servers=20  shards=16  trials=60  seed=1337
+# checkpoint: 8 forest roots (256B) + 1 shard-root (32B); W/K bound = 18750 leaves/shard; setup 2.05s
+# shard-root = d23cc327523a2adc...
+# SANITY: honest verifies; 0/4 sybil whole-sets pass (want 0) -> OK
+
+        |     whole-set      |    shard-naive     |   shard-STICKY (T12)        
+    h   | live%   wasteKB    | live%   wasteKB    | live%  servers  wasteKB  maxSybilKB
+----------------------------------------------------------------------------------------------------
+ 0.00   |   0.0%  134539.2  |   0.0%    8564.3  |   0.0%    20.0    8564.3     585.9
+ 0.05   | 100.0%   71180.1  | 100.0%   67606.2  | 100.0%     9.7    4082.0     585.9
+ 0.10   | 100.0%   47385.4  | 100.0%   42753.1  | 100.0%     7.3    2812.4     585.9
+ 0.20   | 100.0%   19385.0  | 100.0%   22294.6  | 100.0%     4.2    1406.2     585.9
+ 0.30   | 100.0%   13906.6  | 100.0%   14335.7  | 100.0%     2.8     781.2     585.9
+ 0.50   | 100.0%    7086.8  | 100.0%    6484.3  | 100.0%     1.9     390.6     585.9
+
+# SAFETY: wrong-head acceptances across all trials (incl h=0): 0  -> PASS
+# W/K per-lie egress bound = 585.9KB/shard; sticky maxSybilKB must stay <= that bound.
+
+# Reading:
+# - STICKY live% should TRACK whole-set (one honest server in the sampled
+#   order suffices -- affinity pulls all K shards from it), unlike shard-naive
+#   which needs an honest server PER shard and collapses at low h.
+# - STICKY wasteKB stays bounded: each sybil is one-strike-dropped after a
+#   single bad shard, so per-sybil egress <= W/K (maxSybilKB column), NOT W.
+# - Net: sticky assembly is the Pareto move -- whole-set liveness AND the
+#   sharded bounded-W/K DoS cap together. This is the assembly rule the
+#   superlight checkpoint's shard-root should specify, not naive per-shard
+#   independent resampling.

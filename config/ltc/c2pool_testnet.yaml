@@ -1,0 +1,34 @@
+# C2Pool Litecoin [LTC] Testnet Configuration
+#
+# Zero-config startup: run ./start.sh (Linux/macOS) or start.bat (Windows).
+# Miners set their payout address as the stratum username (p2pool-style).
+# CLI arguments always override values set here.
+
+# --- Network -----------------------------------------------------------------
+port: 19326                   # p2pool sharechain P2P port (LTC testnet default)
+stratum_port: 19327           # Stratum mining port
+web_port: 8080                 # Web dashboard / JSON-RPC API port
+http_host: "0.0.0.0"           # HTTP bind address
+# external_ip: ""              # Public IP/domain for stratum URL display
+#
+# Port forwarding (if behind NAT/firewall):
+#   19326 TCP  — P2P sharechain (REQUIRED for full p2pool participation)
+#   19327 TCP  — Stratum mining (REQUIRED for miners to connect)
+#   9333 TCP  — LTC coin P2P (recommended for faster daemon sync)
+
+# --- Operating mode ----------------------------------------------------------
+# Default: integrated P2P pool with EMBEDDED LTC + DOGE SPV nodes.
+# Zero-config — no litecoind/dogecoind daemon required.
+embedded_ltc: true             # Embedded LTC SPV (default)
+embedded_doge: true            # Embedded DOGE SPV for merged mining (default)
+
+# --- Bootstrap header checkpoint (optional) ----------------------------------
+# Skip old headers on first sync.  Format: HEIGHT:BLOCK_HASH
+# header_checkpoint: "HEIGHT:BLOCK_HASH"   # set for faster first sync
+
+# --- Coin daemon RPC (for non-embedded / daemon mode) ------------------------
+# ltc_rpc_host: 127.0.0.1
+# ltc_rpc_port:                # your LTC daemon's RPC port
+# ltc_rpc_user: user
+# ltc_rpc_password: pass
+

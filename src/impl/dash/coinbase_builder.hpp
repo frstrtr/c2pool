@@ -1,0 +1,601 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+// Dash coinbase TX assembly for p2pool-dash v16 compatible Stratum mining.
+//
+// The layout is dictated by the hash_link mechanism documented in
+// share_check.hpp::compute_gentx_before_refhash:
+//
+//   [ver|type int32]
+//   [vin VarInt = 1]
+//   [TxIn:
+//      [prev_hash 32B zeros][prev_n 0xFFFFFFFF]
+//      [VarStr scriptSig:
+//         [BIP34 height push][coinbase text]
+//      ]                                          ← no extranonce here anymore
+//      [sequence 0xFFFFFFFF]
+//   ]
+//   [vout VarInt]
+//     [worker_payouts…]                          ← PPLNS splits
+//     [packed_payments…]                         ← masternode/superblock/platform
+//     [donation_output:
+//        [value i64][VarStr DONATION_SCRIPT]     ← constant tail; value usually 0
+//     ]
+//     [op_return_output:
+//        [value i64 = 0][VarStr (42B):
+//           [0x6a OP_RETURN][0x28 push40]
+//           [ref_hash 32B]      ← pool fills; PPLNS commitment
+//           [nonce64 8B]        ← miner fills via Stratum extranonce2
+//        ]
+//     ]
+//   [locktime 4B = 0]
+//   [optional VarStr extra_payload]              ← DIP3/DIP4 CBTX
+//
+// The 8-byte `nonce64` placeholder is the Stratum extranonce2 slot.
+// Coinb1 = bytes[0 : nonce64_offset]      ( includes ref_hash )
+// Coinb2 = bytes[nonce64_offset + 8 : ]   ( starts at locktime )
+
+#include "coin/transaction.hpp"
+#include "coin/rpc_data.hpp"
+#include "config_pool.hpp"                 // SSOT: SharechainConfig::COINBASEEXT_HEX / IMPL_TAG
+#include "share_check.hpp"                 // decode_payee_script, pubkey_hash_to_script2, DONATION_SCRIPT
+#include "payout_muldiv.hpp"               // dash::payout::payout_share (MSVC-portable 128-bit muldiv)
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <string>
+#include <vector>
+
+#include <core/pack.hpp>
+#include <core/uint256.hpp>
+#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active (DASH 16->36)
+#include <core/hash.hpp>
+#include <core/coin_params.hpp>
+#include <core/log.hpp>
+#include <btclibs/util/strencodings.h>
+
+namespace dash {
+namespace coinbase {
+
+static constexpr size_t EXTRANONCE2_SIZE = 8;          // = nonce64 width
+
+// One miner payout row: scriptPubKey + amount (sat).
+struct MinerPayout {
+    std::vector<unsigned char> script;
+    uint64_t                   amount{0};
+};
+
+// C++ implementation of the p2pool-dash generate_transaction design
+// tx_outs construction. Returns tx_outs in the exact on-wire order:
+//     worker_tx (sorted by script bytes, excluding DONATION) ||
+//     payments_tx (packed_payments in GBT order)             ||
+//     donation_tx (always one entry, even at value 0)
+// Does NOT include the OP_RETURN — coinbase::build() appends that.
+//
+// For genesis (no previous shares on the chain), pass an empty weights
+// map and total_weight == 0. For non-genesis shares the caller supplies
+// tracker-derived PPLNS weights from share_builder::walk_cumulative_weights
+// (a linear C++ implementation of p2pool-dash's WeightsSkipList — O(N) per call rather
+// than the Python upstream's O(log N), but consensus-equivalent since
+// chain_length=4320 makes the walk cheap).
+inline std::vector<MinerPayout> compute_dash_payouts(
+    uint64_t subsidy,
+    const std::vector<dash::coin::PackedPayment>& packed_payments,
+    const uint160& miner_pubkey_hash,
+    const std::map<std::vector<unsigned char>, uint64_t>& weights,
+    uint64_t total_weight,
+    const core::CoinParams& params)
+{
+    using Script = std::vector<unsigned char>;
+    const Script donation_script(dash::DONATION_SCRIPT.begin(),
+                                  dash::DONATION_SCRIPT.end());
+
+    // 1. payments_tx: preserves GBT order, drops zero-value entries + undecodable payees.
+    std::vector<MinerPayout> payments_tx;
+    payments_tx.reserve(packed_payments.size());
+    uint64_t total_payments = 0;
+    for (const auto& p : packed_payments) {
+        if (p.amount == 0) continue;
+        auto pm_script = dash::decode_payee_script(
+            p.payee, params.address_version, params.address_p2sh_version);
+        if (pm_script.empty()) continue;
+        MinerPayout out;
+        out.amount = p.amount;
+        out.script = std::move(pm_script);
+        payments_tx.push_back(std::move(out));
+        total_payments += p.amount;
+    }
+
+    // 2. worker_payout = subsidy - Σpayment_amounts
+    uint64_t worker_payout = (subsidy > total_payments) ? (subsidy - total_payments) : 0;
+
+    // 3-4. PPLNS split. Two consensus arms, gated on the minted share version
+    //      (core::version_gate SSOT; DASH transition 16 -> 36):
+    //
+    //   pre-v36 (bucket-3 per-coin compat, UNCHANGED p2pool-dash shape):
+    //       amounts[script]      = worker_payout * 49 * weight / (50 * total_weight)
+    //       amounts[this_script] += worker_payout / 50            (2% block-finder)
+    //
+    //   v36 (bucket-2 standardize-toward-merged-v36; mirrors DGB
+    //        share_tracker::get_expected_payouts):
+    //       amounts[script] = worker_payout * weight / total_weight  (FULL weight)
+    //       NO block-finder fee.
+    //   total_weight is the GRAND total (includes donation_weight), so the
+    //   donation absorbs its decayed-weight share via the step-5 remainder.
+    const bool v36 =
+        core::version_gate::is_v36_active(params.current_share_version);
+    std::map<Script, uint64_t> amounts;
+    if (total_weight > 0) {
+        // weights/total_weight fit uint64 at the DASH layer, but the muldiv
+        // intermediate (worker_payout*weight*49 ~ 2^120, pre-v36 den > 2^64)
+        // needs a true 128-bit type. dash::payout::payout_share uses native
+        // __uint128_t on GCC/Clang and boost uint128 on MSVC (no __int128);
+        // the two are pinned bit-identical by test_dash_coinbase_muldiv.
+        for (const auto& [script, w] : weights) {
+            amounts[script] =
+                dash::payout::payout_share(w, worker_payout, total_weight, v36);
+        }
+    }
+
+    // 4. (pre-v36 only) 2% block-finder fee to the share creator.
+    //
+    // ZERO-PKH GUARD (#960, money path). A zero miner_pubkey_hash is not a
+    // miner -- it is the sentinel every caller of this function already uses
+    // to mean "this coinbase has no finder":
+    //   * work_source.cpp build_connection_coinbase, ownerless stratum
+    //     session whose login carried no P2PKH script -- its own comment
+    //     reads "No usable miner script: all-to-donation";
+    //   * main_dash.cpp --mine-block with no --payout-pubkey-hash
+    //     ("uint160 payout_pkh;   // default all-zero");
+    //   * main_dash.cpp embedded-oracle proposal coinbase
+    //     ("uint160 zero_pkh;   // pool-only coinbase (no finder)");
+    //   * main_dash.cpp --regtest-force-won-block
+    //     ("uint160 payout_pkh;   // all-zero placeholder finder").
+    // Paying the slice anyway emitted P2PKH(0x0000...0000) -- an output no
+    // key can ever spend. The 2% was BURNED, not credited: strictly worse
+    // than p2pool-dash, which credits ownerless work to the node operator
+    // and destroys nothing. Suppressing the output lets step 5 sweep the
+    // slice into the donation tail, which is exactly what all four call
+    // sites above already claim to do.
+    //
+    // NOT consensus-visible. Every path that MINTS or VERIFIES a share
+    // derives the finder script from the share's own m_pubkey_hash through
+    // share_producer.hpp build_gentx / share_check.hpp, never through this
+    // function; and the mint fail-closes on a non-P2PKH payout script
+    // (share_producer_bind.hpp pubkey_hash_from_p2pkh returns nullopt), so a
+    // minted share cannot carry a zero pubkey hash in the first place.
+    // compute_dash_payouts only shapes coinbases that no share commits to.
+    auto this_script = dash::pubkey_hash_to_script2(miner_pubkey_hash);
+    if (!v36 && !miner_pubkey_hash.IsNull())
+        amounts[this_script] = amounts[this_script] + (worker_payout / 50);
+
+    // 5. amounts[DONATION] += worker_payout - Σamounts  (remainder incl. rounding).
+    uint64_t current_sum = 0;
+    for (const auto& [s, a] : amounts) current_sum += a;
+    uint64_t donation_remainder = (worker_payout > current_sum)
+        ? (worker_payout - current_sum) : 0;
+
+    // v36 consensus (a60f7f7f): the donation output MUST carry >= 1 satoshi.
+    // If the remainder rounds to 0, deduct 1 sat from the largest miner
+    // (deterministic tiebreak: (amount, script)); the sum invariant holds.
+    if (v36 && donation_remainder < 1 && worker_payout > 0 && !amounts.empty()) {
+        auto largest = std::max_element(amounts.begin(), amounts.end(),
+            [&](const auto& a, const auto& b) {
+                if (a.first == donation_script) return true;   // never pick donation
+                if (b.first == donation_script) return false;
+                if (a.second != b.second) return a.second < b.second;
+                return a.first < b.first;
+            });
+        if (largest != amounts.end() && largest->first != donation_script
+            && largest->second >= 1) {
+            largest->second -= 1;
+            donation_remainder += 1;
+        }
+    }
+    amounts[donation_script] = amounts[donation_script] + donation_remainder;
+
+    // Sanity: Σ(amounts) == worker_payout (matches p2pool-dash assertion).
+    {
+        uint64_t check = 0;
+        for (const auto& [s, a] : amounts) check += a;
+        if (check != worker_payout) {
+            LOG_WARNING << "[compute_dash_payouts] sum mismatch: worker_payout="
+                        << worker_payout << " check=" << check
+                        << " diff=" << (check > worker_payout
+                                        ? (check - worker_payout)
+                                        : (worker_payout - check))
+                        << " total_weight=" << total_weight
+                        << " weights_count=" << weights.size()
+                        << " this_script_in_weights="
+                        << (weights.count(this_script) ? "yes" : "no")
+                        << " subsidy=" << subsidy
+                        << " total_payments=" << total_payments
+                        << " current_sum_before_donation=" << current_sum
+                        << " donation_remainder=" << donation_remainder;
+            throw std::runtime_error("compute_dash_payouts: amounts sum mismatch");
+        }
+    }
+
+    // 6. worker_tx = amounts sorted by script bytes, excluding DONATION,
+    //               dropping zero-value entries. std::map is already sorted.
+    std::vector<MinerPayout> worker_tx;
+    worker_tx.reserve(amounts.size());
+    for (const auto& [script, amount] : amounts) {
+        if (script == donation_script) continue;
+        if (amount == 0) continue;
+        MinerPayout out;
+        out.amount = amount;
+        out.script = script;
+        worker_tx.push_back(std::move(out));
+    }
+
+    // 7. donation_tx — always emitted even at value 0.
+    MinerPayout donation_out;
+    donation_out.amount = amounts[donation_script];
+    donation_out.script = donation_script;
+
+    // 8. Final order: worker_tx || payments_tx || donation_tx.
+    std::vector<MinerPayout> result;
+    result.reserve(worker_tx.size() + payments_tx.size() + 1);
+    for (auto& o : worker_tx)   result.push_back(std::move(o));
+    for (auto& o : payments_tx) result.push_back(std::move(o));
+    result.push_back(std::move(donation_out));
+    return result;
+}
+
+// Result of build(): raw coinbase bytes + key offsets.
+struct CoinbaseLayout {
+    std::vector<unsigned char> bytes;
+    size_t ref_hash_offset{0};   // first byte of the 32B ref_hash region
+    size_t nonce64_offset{0};    // first byte of the 8B nonce64 placeholder
+                                 // (always == ref_hash_offset + 32)
+};
+
+// BIP34 minimal push of a positive integer. Writes length byte + height LE.
+inline std::vector<unsigned char> push_bip34_height(uint32_t height)
+{
+    // BIP34 height == CScript() << nHeight (push_int64): 0->OP_0; 1..16->
+    // OP_1..OP_16 (single opcode 0x51..0x60); else minimal CScriptNum data push.
+    // dashd ContextualCheckBlock compares the coinbase scriptSig prefix to this
+    // exact form -> mismatch == bad-cb-height. OP_N only bites at low heights
+    // (regtest blocks 1-16); mainnet heights >> 16 take the data-push branch
+    // (why realistic-height KATs passed).
+    if (height == 0) return { 0x00 };
+    if (height <= 16) return { static_cast<unsigned char>(0x50 + height) };
+
+    std::vector<unsigned char> le;
+    le.reserve(4);
+    uint32_t h = height;
+    while (h) {
+        le.push_back(static_cast<unsigned char>(h & 0xff));
+        h >>= 8;
+    }
+    if (le.back() & 0x80) le.push_back(0x00);           // avoid sign
+
+    std::vector<unsigned char> out;
+    out.reserve(1 + le.size());
+    out.push_back(static_cast<unsigned char>(le.size()));
+    out.insert(out.end(), le.begin(), le.end());
+    return out;
+}
+
+// Maximum coinbase scriptSig length. Oracle data.py Share.__init__ rejects a
+// share whose share_data['coinbase'] is outside 2..100 bytes, and work.py:339
+// slices the assembled stratum scriptSig to [:100]. Both bounds are the same
+// number; every scriptSig c2pool emits goes through build_coinbase_scriptsig()
+// so neither can be breached from one path only.
+static constexpr size_t MAX_SCRIPTSIG_LEN = 100;
+
+// ── build_coinbase_scriptsig — THE single coinbase-scriptSig SSOT ───────────
+//
+// Emits:  [BIP34 height push][coinbase text]              truncated to 100 B
+//
+// mainnet, height 2511303, default text:
+//   03 c75126 | 2f 50 32 50 6f 6f 6c 2d 44 41 53 48 2f 63 32 70 6f 6f 6c 2f
+//   = push3 "\xc7\x51\x26"  +  "/P2Pool-DASH/c2pool/"                (24 bytes)
+//
+// `coinbase_text` is the operator-facing text slot (--coinbase-text /
+// pool.yaml coinbase_text, README "Coinbase structure"). Pass an empty string
+// to take the network default from the SSOT — SharechainConfig::coinbase_text()
+// resolves the override-or-default, so the stratum job path and the share-mint
+// path cannot end up disagreeing.
+//
+// WHY THIS DEFAULT
+//   * "/P2Pool-DASH/" is the oracle's COINBASEEXT payload (networks/dash.py:11;
+//     testnet "/P2Pool-tDASH/"). Block explorers attribute blocks to a pool by
+//     coinbase text — chainz.cryptoid.info registers this pool as "P2Pool-DASH"
+//     and has no knowledge of the string "c2pool", so before this every block
+//     the pool won through c2pool was credited to nobody.
+//   * "c2pool/" follows so a human reading the coinbase can still tell WHICH
+//     p2pool implementation produced the block.
+//
+// FRAMING — the two things that must not move
+//   1. BIP34. The height push stays FIRST and can never be displaced or
+//      truncated: dashd's ContextualCheckBlock compares the scriptSig PREFIX to
+//      CScript() << nHeight, so anything appended after it is invisible to that
+//      check. Worst case the push is 5 bytes (data-push of a 4-byte
+//      CScriptNum), leaving 95 for the text; the default needs 20 (mainnet) /
+//      21 (testnet) and --coinbase-text is capped at 64 by the caller, so the
+//      100-byte truncation cannot reach back into the height push.
+//   2. Extranonce offsets. DASH's stratum extranonce2 is the 8-byte nonce64
+//      inside the OP_RETURN output, NOT inside the scriptSig. coinb1/coinb2
+//      split at nonce64_offset, which build() derives from the tx TAIL
+//      (total - payload - 4 - 8). A longer scriptSig lengthens coinb1 and
+//      leaves the advertised extranonce2_size (8) and coinb2 byte-identical.
+//
+// CONSENSUS: the coinbase text is a customizable parameter and is not part of
+// what peers re-derive. Oracle data.py Share.check() calls
+// generate_transaction(tracker, SELF.share_info['share_data'], ...) — it feeds
+// the RECEIVED share's own coinbase field back in; COINBASEEXT appears nowhere
+// in data.py. c2pool's mirror, share_check.hpp::generate_share_transaction,
+// likewise does `tx << share.m_coinbase`. The hash_link is length-agnostic
+// (prefix_to_hash_link/check_hash_link derive the 64-byte-block split from the
+// actual prefix length, and dash's hash_link_type carries extra_data as a
+// VarStr precisely so a variable-length prefix works). Empirically: c2pool has
+// been writing "c2pool" — matching no network constant — and canonical
+// p2pool-dash peers accept its shares with zero bans across thousands of shares
+// and two dashd-confirmed mainnet blocks (2511241, 2511303).
+//
+// The ONE hazard this function exists to close: dash builds the scriptSig in
+// TWO places — coinbase::build() (the stratum job / real block coinbase) and
+// mint::build_producer_job() (share_data['coinbase']). If those two ever
+// disagree by a single byte, the minted share's gentx no longer matches the
+// block coinbase and the node self-rejects. They now both call this.
+inline std::vector<unsigned char> build_coinbase_scriptsig(
+    uint32_t height, const std::string& coinbase_text, bool testnet)
+{
+    std::vector<unsigned char> script = push_bip34_height(height);
+
+    const std::string text = coinbase_text.empty()
+        ? dash::SharechainConfig::coinbase_text(testnet)
+        : coinbase_text;
+
+    for (unsigned char c : text) {
+        if (script.size() >= MAX_SCRIPTSIG_LEN) break;   // oracle work.py [:100]
+        script.push_back(c);
+    }
+    return script;
+}
+
+// Convert compact nbits → share difficulty (Bitcoin bdiff formula).
+inline double bits_to_difficulty(uint32_t nbits)
+{
+    uint256 target;
+    target.SetCompact(nbits);
+    if (target.IsNull()) return 0.0;
+    uint256 shifted = target >> 192;
+    uint64_t top = shifted.GetLow64();
+    if (top == 0) return 0.0;
+    const double bdiff_const = 4294901760.0;  // 0xffff0000
+    return bdiff_const / static_cast<double>(top);
+}
+
+// Build the coinbase TX in the p2pool-dash v16 layout.
+//
+//   work             — parsed GBT
+//   tx_outs_ordered  — full output list in p2pool-dash generate_transaction
+//                      order: worker_tx || payments_tx || donation_tx.
+//                      Must end with a donation output whose script ==
+//                      DONATION_SCRIPT so gentx_before_refhash lines up.
+//                      Zero-value entries are emitted as-is (callers that
+//                      want to strip them should do so before calling).
+//   coinbase_text    — operator coinbase scriptSig text (--coinbase-text);
+//                      empty -> the network default from the SSOT (no extranonce)
+//   params           — coin params; params.is_testnet selects the network default
+//   ref_hash         — 32B PPLNS commitment embedded in OP_RETURN
+inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
+                            const std::vector<MinerPayout>& tx_outs_ordered,
+                            const std::string& coinbase_text,
+                            const core::CoinParams& params,
+                            const uint256& ref_hash)
+{
+    using namespace dash::coin;
+
+    MutableTransaction tx;
+
+    // ── Input ───────────────────────────────────────────────────────────
+    TxIn in;
+    in.prevout.hash  = uint256::ZERO;
+    in.prevout.index = 0xFFFFFFFFu;
+    in.sequence      = 0xFFFFFFFFu;
+    {
+        // SSOT: same helper mint::build_producer_job uses for
+        // share_data['coinbase'] — the two must stay byte-identical or a
+        // minted share's gentx stops matching the block coinbase.
+        auto script = build_coinbase_scriptsig(
+            work.m_height, coinbase_text, params.is_testnet);
+        in.scriptSig = OPScript(script.data(), script.data() + script.size());
+    }
+    tx.vin.push_back(std::move(in));
+
+    // ── Outputs (caller-ordered tx_outs + OP_RETURN) ────────────────────
+    //
+    // Caller (share_builder / compute_dash_payouts) has already put the
+    // tx_outs into the exact p2pool-dash generate_transaction order,
+    // including a guaranteed donation output at the tail. We trust that
+    // and just append.
+    if (tx_outs_ordered.empty())
+        throw std::runtime_error("coinbase_builder: empty tx_outs_ordered");
+    if (tx_outs_ordered.back().script !=
+        std::vector<unsigned char>(dash::DONATION_SCRIPT.begin(),
+                                    dash::DONATION_SCRIPT.end()))
+        throw std::runtime_error(
+            "coinbase_builder: last output must be DONATION_SCRIPT");
+
+    for (const auto& p : tx_outs_ordered) {
+        TxOut o;
+        o.value = static_cast<int64_t>(p.amount);
+        o.scriptPubKey = OPScript(
+            p.script.data(), p.script.data() + p.script.size());
+        tx.vout.push_back(std::move(o));
+    }
+    // OP_RETURN output carrying [0x6a][0x28][ref_hash 32B][nonce64 8B].
+    {
+        std::vector<unsigned char> op_ret;
+        op_ret.reserve(2 + 32 + 8);
+        op_ret.push_back(0x6a);                             // OP_RETURN
+        op_ret.push_back(0x28);                             // push 40 bytes
+        op_ret.insert(op_ret.end(), ref_hash.data(), ref_hash.data() + 32);
+        op_ret.insert(op_ret.end(), EXTRANONCE2_SIZE, 0x00); // nonce64 placeholder
+        TxOut o;
+        o.value = 0;
+        o.scriptPubKey = OPScript(op_ret.data(), op_ret.data() + op_ret.size());
+        tx.vout.push_back(std::move(o));
+    }
+
+    // ── DIP3/DIP4 ───────────────────────────────────────────────────────
+    if (!work.m_coinbase_payload.empty()) {
+        tx.version = 3;
+        tx.type    = 5;
+        tx.extra_payload = work.m_coinbase_payload;
+    }
+    tx.locktime = 0;
+
+    // ── Serialize ───────────────────────────────────────────────────────
+    auto packed = pack(tx);
+    auto raw = packed.get_span();
+    CoinbaseLayout out;
+    out.bytes.reserve(raw.size());
+    for (auto b : raw) out.bytes.push_back(static_cast<unsigned char>(b));
+
+    // ── Locate ref_hash / nonce64 positions from the tail ───────────────
+    // Tail layout (bytes, from end of tx moving toward start):
+    //   [VarStr extra_payload]?   — length = payload_varstr_size
+    //   [locktime 4B]
+    //   [nonce64 8B]              ← EXTRANONCE2_SIZE bytes of zeros (miner fills)
+    //   [ref_hash 32B]            ← the ref_hash we just embedded
+    //   [0x28 push40]
+    //   [0x6a OP_RETURN]
+    //   [0x2a VarInt script_len 42]
+    //   [value i64 = 0]
+    //
+    // So offsets-from-end:
+    //   nonce64_offset  = total - payload_varstr_size - 4 - 8
+    //   ref_hash_offset = total - payload_varstr_size - 4 - 8 - 32
+    size_t payload_varstr_size = 0;
+    if (tx.type != 0 && !tx.extra_payload.empty()) {
+        PackStream ps;
+        BaseScript bs; bs.m_data = tx.extra_payload;
+        ps << bs;
+        payload_varstr_size = ps.size();
+    }
+    const size_t total = out.bytes.size();
+    if (total < payload_varstr_size + 4 + 8 + 32)
+        throw std::runtime_error("coinbase_builder: tx shorter than known tail");
+    out.nonce64_offset  = total - payload_varstr_size - 4 - 8;
+    out.ref_hash_offset = out.nonce64_offset - 32;
+
+    // Sanity: bytes at ref_hash_offset must equal the ref_hash we embedded.
+    if (std::memcmp(out.bytes.data() + out.ref_hash_offset, ref_hash.data(), 32) != 0)
+        throw std::runtime_error("coinbase_builder: ref_hash offset mismatch");
+    // Sanity: bytes at nonce64_offset must be 8 zero bytes.
+    for (size_t i = 0; i < EXTRANONCE2_SIZE; ++i) {
+        if (out.bytes[out.nonce64_offset + i] != 0x00)
+            throw std::runtime_error("coinbase_builder: nonce64 placeholder not zeroed");
+    }
+
+    return out;
+}
+
+// Split coinbase bytes into coinb1 / coinb2 hex around the 8-byte nonce64
+// slot. The miner inserts its extranonce2 in that slot.
+struct CoinbSplit {
+    std::string coinb1_hex;
+    std::string coinb2_hex;
+};
+
+inline CoinbSplit split_coinb(const CoinbaseLayout& lay)
+{
+    if (lay.nonce64_offset + EXTRANONCE2_SIZE > lay.bytes.size())
+        throw std::runtime_error("split_coinb: bad nonce64 offset");
+    std::span<const unsigned char> b1(lay.bytes.data(), lay.nonce64_offset);
+    std::span<const unsigned char> b2(
+        lay.bytes.data() + lay.nonce64_offset + EXTRANONCE2_SIZE,
+        lay.bytes.size() - lay.nonce64_offset - EXTRANONCE2_SIZE);
+    return CoinbSplit{HexStr(b1), HexStr(b2)};
+}
+
+// Compute sha256d of concatenated bytes.
+inline uint256 sha256d(std::span<const unsigned char> a)
+{
+    return Hash(a);
+}
+
+// Merkle branches for index 0 with placeholder at [0]. (Siblings along the
+// path do not depend on [0] even though it participates in the reduction.)
+inline std::vector<uint256> merkle_branches_raw(
+    const std::vector<uint256>& tx_hashes_including_coinbase_placeholder)
+{
+    std::vector<uint256> out;
+    if (tx_hashes_including_coinbase_placeholder.size() <= 1) return out;
+
+    std::vector<uint256> layer = tx_hashes_including_coinbase_placeholder;
+    while (layer.size() > 1) {
+        out.push_back(layer[1]);
+        if (layer.size() % 2 == 1)
+            layer.push_back(layer.back());
+        std::vector<uint256> next;
+        next.reserve(layer.size() / 2);
+        for (size_t i = 0; i + 1 < layer.size(); i += 2) {
+            std::vector<unsigned char> buf(64);
+            std::memcpy(buf.data(),      layer[i].data(),     32);
+            std::memcpy(buf.data() + 32, layer[i + 1].data(), 32);
+            next.push_back(sha256d(buf));
+        }
+        layer.swap(next);
+    }
+    return out;
+}
+
+inline std::vector<std::string> merkle_branches_hex(const std::vector<uint256>& raw)
+{
+    // Stratum convention for merkle branches: send the LE internal bytes
+    // directly as hex, NOT the reversed display form. cpuminer ParseHex's
+    // the hex into a byte array and uses those bytes verbatim in its
+    // merkle walk (SHA256d(root_LE || branch_LE)). Our server walks the
+    // same way using h.GetChars() (LE internal). Using h.GetHex() here —
+    // which reverses bytes for the block-explorer display form — made
+    // the miner's walk produce a different root than the server's, every
+    // submit failed with "hash > target" (hash was essentially random).
+    // Reference: p2pool-dash dash/stratum.py packs merkle branches as
+    //   [pack.IntType(256).pack(s).encode('hex') for s in link.branch]
+    // which is LE bytes as hex — NOT the reversed display form.
+    std::vector<std::string> out;
+    out.reserve(raw.size());
+    for (const auto& h : raw) {
+        auto c = h.GetChars();
+        out.push_back(HexStr(std::span<const unsigned char>(c.data(), c.size())));
+    }
+    return out;
+}
+
+// ── Stratum wire formatting helpers ─────────────────────────────────────────
+
+inline std::string swap4_hex(std::span<const unsigned char> data)
+{
+    if (data.size() % 4 != 0) throw std::runtime_error("swap4_hex: len %4 != 0");
+    std::vector<unsigned char> out(data.size());
+    for (size_t i = 0; i < data.size(); i += 4) {
+        out[i + 0] = data[i + 3];
+        out[i + 1] = data[i + 2];
+        out[i + 2] = data[i + 1];
+        out[i + 3] = data[i + 0];
+    }
+    return HexStr(out);
+}
+
+inline std::string be_hex_u32(uint32_t v)
+{
+    unsigned char b[4] = {
+        static_cast<unsigned char>((v >> 24) & 0xff),
+        static_cast<unsigned char>((v >> 16) & 0xff),
+        static_cast<unsigned char>((v >>  8) & 0xff),
+        static_cast<unsigned char>((v >>  0) & 0xff),
+    };
+    return HexStr(std::span<const unsigned char>(b, 4));
+}
+
+} // namespace coinbase
+} // namespace dash

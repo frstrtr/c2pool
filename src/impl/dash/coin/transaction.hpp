@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+// Dash transaction types: standard Bitcoin transactions + DIP3/DIP4 CBTX support.
+// No MWEB, no HogEx. Has extra_payload for coinbase special transactions (type=5).
+
+#include <impl/bitcoin_family/coin/base_transaction.hpp>
+
+#include <core/pack.hpp>
+#include <core/opscript.hpp>
+#include <core/uint256.hpp>
+
+#include <optional>
+#include <vector>
+
+namespace dash
+{
+namespace coin
+{
+
+// Import generic tx primitives from bitcoin_family
+using bitcoin_family::coin::TxParams;
+using bitcoin_family::coin::TX_WITH_WITNESS;
+using bitcoin_family::coin::TX_NO_WITNESS;
+using bitcoin_family::coin::TxPrevOut;
+using bitcoin_family::coin::TxIn;
+using bitcoin_family::coin::TxOut;
+
+// Dash transaction type field (nType in serialization)
+// type=0: standard, type=5: CBTX (coinbase with DIP3/DIP4 payload)
+class Transaction; // fwd — for the symmetric MutableTransaction(const Transaction&) below
+
+struct MutableTransaction
+{
+    std::vector<TxIn> vin;
+    std::vector<TxOut> vout;
+    int32_t version{1};
+    uint16_t type{0};           // Dash-specific: transaction type
+    uint32_t locktime{0};
+    std::vector<unsigned char> extra_payload; // DIP3/DIP4 payload (for type=5 CBTX)
+
+    MutableTransaction() = default;
+    // Rebuild the mutable form from an (immutable) Transaction. Symmetric to
+    // the explicit Transaction(const MutableTransaction&) below; used by the
+    // p2p dispatch path (protocol_{legacy,actual}.cpp) when staging peer-
+    // referenced txs for share admission. Defined out-of-line once Transaction
+    // is complete.
+    explicit MutableTransaction(const Transaction& tx);
+
+    bool HasWitness() const { return false; } // Dash has no segwit
+
+    // Dash has no MWEB / HogEx. The field exists only so the
+    // generic `core::coin::UTXOViewCache::connect_block<BlockType>`
+    // template (shared with LTC) can treat every Dash tx as a normal
+    // (non-pegout) block tx without specialisation. Always false.
+    static constexpr bool m_hogEx = false;
+
+    template <typename StreamType>
+    void Serialize(StreamType& s) const
+    {
+        // Dash uses version | (type << 16) in the version field
+        int32_t version_with_type = version | (static_cast<int32_t>(type) << 16);
+        s << version_with_type;
+        s << vin;
+        s << vout;
+        s << locktime;
+        // Extra payload for special transactions — dashd parity
+        // (primitives/transaction.h): vExtraPayload exists on the wire ONLY
+        // when nVersion==3 (SPECIAL_VERSION) AND nType!=0. Gating on type
+        // alone mis-serializes pre-DIP2 txs whose raw 32-bit nVersion carries
+        // BIP9-style high bits (e.g. mainnet 842284's coinbase nVersion
+        // 0x20000000 => version16=0, type16=0x2000): those are PLAIN txs and
+        // must round-trip without any payload field. Note dashd writes the
+        // payload compact-size even when the payload is empty.
+        if (version == 3 && type != 0) {
+            BaseScript ep;
+            ep.m_data = extra_payload;
+            s << ep;
+        }
+    }
+
+    template <typename StreamType>
+    void Unserialize(StreamType& s)
+    {
+        int32_t version_with_type;
+        s >> version_with_type;
+        version = version_with_type & 0xFFFF;
+        type = static_cast<uint16_t>((version_with_type >> 16) & 0xFFFF);
+        s >> vin;
+        s >> vout;
+        s >> locktime;
+        // Read extra payload for special transactions — same dashd gate as
+        // Serialize above: nVersion==3 && nType!=0. Reading on type alone
+        // consumed a phantom payload out of the NEXT tx's bytes whenever a
+        // pre-DIP2 tx carried BIP9-style high version bits, misaligning the
+        // whole block body (the 842284 merkle-bind livelock).
+        extra_payload.clear();
+        if (version == 3 && type != 0) {
+            BaseScript ep;
+            s >> ep;
+            extra_payload = std::move(ep.m_data);
+        }
+    }
+};
+
+// Immutable transaction (for txid computation — non-witness serialization)
+class Transaction
+{
+public:
+    static const int32_t CURRENT_VERSION = 1;
+
+    std::vector<TxIn> vin;
+    std::vector<TxOut> vout;
+    int32_t version{1};
+    uint16_t type{0};
+    uint32_t locktime{0};
+    std::vector<unsigned char> extra_payload;
+
+    explicit Transaction(const MutableTransaction& tx)
+        : vin(tx.vin), vout(tx.vout), version(tx.version),
+          type(tx.type), locktime(tx.locktime), extra_payload(tx.extra_payload) {}
+
+    bool HasWitness() const { return false; }
+};
+
+inline MutableTransaction::MutableTransaction(const Transaction& tx)
+    : vin(tx.vin), vout(tx.vout), version(tx.version),
+      type(tx.type), locktime(tx.locktime), extra_payload(tx.extra_payload) {}
+
+} // namespace coin
+} // namespace dash

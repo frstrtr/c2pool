@@ -1,0 +1,1916 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+/// Phase C-TEMPLATE step 5 (S7 embedded_gbt capstone) — Dash embedded
+/// getblocktemplate bit-parity unit tests.
+///
+/// Exercises the capstone that fuses every landed S7 leaf into a single
+/// getblocktemplate-equivalent projection:
+///
+///   - build_embedded_workdata() : subsidy.hpp block-reward + MN/platform
+///     split + mempool get_sorted_txs_with_fees() selection + MN payee
+///     resolution (mn_state_machine find_expected_payee → script_to_address)
+///     + DIP-0027 OP_RETURN platform-burn ordering.
+///   - build_embedded_cbtx() / encode_cbtx() / parse_cbtx() : the CCbTx
+///     (coinbase extra_payload) wire encoder — merkleRootMNList (SML) +
+///     merkleRootQuorums (QuorumManager) + bestCL* + creditPoolBalance.
+///   - gbt_xcheck() / cbtx_xcheck() : the dashd-RPC cross-check comparators.
+///
+/// KAT philosophy (mirrors test_dash_mn_state.cpp / test_dash_simplifiedmns.cpp):
+/// every assertion is either
+///   (a) a structural round-trip (build → encode → parse → field EQ),
+///   (b) a bit-exact preimage rebuilt INDEPENDENTLY (the subsidy / split
+///       integer arithmetic recomputed by hand in the test, the CCbTx wire
+///       re-serialized through a second path) and compared byte-for-byte, or
+///   (c) a self-consistency property of the comparator (identical inputs
+///       match; a single mutated field is detected).
+/// No "expected" hashes or amounts are fabricated — every numeric oracle is
+/// derived from the same closed-form formula dashcore uses, recomputed
+/// independently here.
+///
+/// ════════════════════════════════════════════════════════════════════════
+/// SCOPE NOTE (honest, mirrors test_dash_mn_state.cpp's deferral):
+/// The end-to-end oracle cross-check — "build_embedded_workdata over a REAL
+/// Dash mainnet tip produces the SAME coinbasevalue / payee / CCbTx roots as
+/// a live `dashd-cli getblocktemplate`" — requires a live Dash node oracle
+/// (a synced mainnet dashd exposing getblocktemplate + the matching
+/// mnlistdiff/quorum state) which this hermetic unit test deliberately does
+/// NOT reach. That node-backed parity vector is captured by the
+/// embedded_gbt RPC-shadow path at runtime ([GBT-XCHECK] / [CBTX-XCHECK]
+/// log lines) and is the subject of a follow-up live-harness leaf. The
+/// gbt_xcheck()/cbtx_xcheck() comparators ARE exercised here against
+/// locally-built reference WorkData/CCbTx so the comparison logic itself is
+/// proven; only the dashd-supplied side is deferred.  TODO(oracle-e2e):
+/// wire VMID 200/201 dashd getblocktemplate vectors once a node is reachable.
+/// ════════════════════════════════════════════════════════════════════════
+
+#include <gtest/gtest.h>
+
+#include <impl/dash/coin/embedded_gbt.hpp>
+#include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/mn_state_db.hpp>
+#include <impl/dash/coin/mempool.hpp>
+#include <impl/dash/coin/mempool_validity_gate.hpp>    // probe-set assembly (the serve-flag gate)
+#include <impl/dash/coin/subsidy.hpp>
+#include <impl/dash/coin/utxo_adapter.hpp>
+#include <impl/dash/coin/quorum_manager.hpp>
+#include <impl/dash/coin/quorum_root.hpp>
+#include <impl/dash/coin/rpc_data.hpp>
+#include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/vendor/cbtx.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/smldiff.hpp>           // E2: CSimplifiedMNListDiff (restart-seed KAT)
+#include <impl/dash/coin/node_coin_state.hpp>          // E2: NodeCoinState freshness gate
+#include <impl/dash/coin/coin_state_maintainer.hpp>    // E2: CoinStateMaintainer (independent advance)
+#include <impl/dash/coin/credit_pool.hpp>              // E2: CreditPool (running accrual)
+#include <impl/dash/coin/block.hpp>                    // E2: BlockType (ingested block)
+#include <impl/dash/coin/block_producer.hpp>           // E2 finding A: compute_merkle_root / block_body_binds_to_header
+
+#include <core/uint256.hpp>
+#include <core/pack.hpp>
+#include <core/hash.hpp>
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+using dash::coin::DashWorkData;
+using dash::coin::PackedPayment;
+using dash::coin::MNState;
+using dash::coin::MnStateMachine;
+using dash::coin::Mempool;
+using dash::coin::MutableTransaction;
+using dash::coin::QuorumManager;
+using dash::coin::build_embedded_workdata;
+using dash::coin::build_embedded_cbtx;
+using dash::coin::encode_cbtx;
+using dash::coin::gbt_xcheck;
+using dash::coin::cbtx_xcheck;
+using dash::coin::compute_dash_block_reward_post_v20;
+using dash::coin::compute_dash_mn_payment_post_v20;
+using dash::coin::compute_dash_platform_reward_post_v20_mn_rr;
+using dash::coin::compute_merkle_root_quorums;
+using dash::coin::vendor::CCbTx;
+using dash::coin::vendor::CSimplifiedMNList;
+using dash::coin::vendor::CSimplifiedMNListEntry;
+using dash::coin::vendor::CSimplifiedMNListDiff;
+using dash::coin::vendor::parse_cbtx;
+using dash::coin::NodeCoinState;
+using dash::coin::CoinStateMaintainer;
+using dash::coin::BlockType;
+using dash::coin::compute_dash_block_reward_post_v20;
+using ::core::coin::UTXOViewCache;
+using ::core::coin::Outpoint;
+using ::core::coin::Coin;
+using ::bitcoin_family::coin::TxIn;
+using ::bitcoin_family::coin::TxOut;
+
+// Dash mainnet base58 version bytes (chainparams.cpp PUBKEY_ADDRESS=76,
+// SCRIPT_ADDRESS=16). Used so script_to_address() emits a real Dash payee.
+static constexpr uint8_t DASH_PUBKEY_VER = 76;
+static constexpr uint8_t DASH_P2SH_VER   = 16;
+
+// A checkpoint height well past V20 (1,987,776) AND MN_RR (2,128,896) so the
+// platform-share burn is always active — matches the mainnet steady state the
+// shadow path validates.
+static constexpr uint32_t H = 2'400'000;
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+static uint256 raw256(uint8_t base) {
+    uint256 h;
+    std::array<uint8_t, 32> p{};
+    for (size_t i = 0; i < 32; ++i) p[i] = static_cast<uint8_t>(base + i);
+    std::memcpy(h.data(), p.data(), 32);
+    return h;
+}
+
+template <size_t N>
+static std::array<uint8_t, N> seq_array(uint8_t base) {
+    std::array<uint8_t, N> a{};
+    for (size_t i = 0; i < N; ++i) a[i] = static_cast<uint8_t>(base + i);
+    return a;
+}
+
+// A valid 25-byte P2PKH scriptPubKey: OP_DUP OP_HASH160 <20> .. OP_EQUALVERIFY
+// OP_CHECKSIG. script_to_address() must decode this to a base58 Dash address.
+static std::vector<unsigned char> p2pkh_script(uint8_t hashseed) {
+    std::vector<unsigned char> s;
+    s.push_back(0x76);              // OP_DUP
+    s.push_back(0xa9);              // OP_HASH160
+    s.push_back(0x14);              // push 20
+    for (int i = 0; i < 20; ++i) s.push_back(static_cast<unsigned char>(hashseed + i));
+    s.push_back(0x88);              // OP_EQUALVERIFY
+    s.push_back(0xac);              // OP_CHECKSIG
+    return s;
+}
+
+static uint256 mint_hash(uint32_t seed) {
+    MutableTransaction t;
+    t.version = 1; t.type = 0;
+    t.locktime = 0x51000000u ^ seed;
+    auto ps = ::pack(t);
+    return ::Hash(ps.get_span());
+}
+
+static MutableTransaction make_spend(const uint256& prev, uint32_t idx,
+                                     int64_t out_value, uint32_t salt) {
+    MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = salt;
+    TxIn in; in.prevout.hash = prev; in.prevout.index = idx;
+    in.sequence = 0xffffffffu;
+    tx.vin.push_back(in);
+    TxOut o; o.value = out_value;
+    tx.vout.push_back(o);
+    return tx;
+}
+
+// Seed an MnStateMachine with a single valid MN paying `payout`, so
+// find_expected_payee() resolves to it deterministically.
+static MnStateMachine single_mn(const std::vector<unsigned char>& payout) {
+    MNState s;
+    s.isValid = true;
+    s.nRegisteredHeight = 2'300'000;
+    s.nLastPaidHeight = 0;
+    s.scriptPayout.m_data = payout;
+    // Hand-seeded fixtures declare their (zero) operator split PROVEN, as
+    // every real ingest path does (h=2516595 serve gate).
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    MnStateMachine m;
+    m.load(std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}});
+    return m;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// build_embedded_workdata — structural fields + independently-recomputed
+// subsidy/split arithmetic (bit-exact integer oracle).
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashEmbeddedGbt, WorkdataHeaderFieldsAndSubsidyArithmetic) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(20);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto tx = make_spend(prev, 0, 90'000, /*salt=*/1);   // fee = 10'000
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    auto payout = p2pkh_script(0x30);
+    auto mnstates = single_mn(payout);
+
+    uint256 prev_hash = raw256(0xAB);
+    const uint32_t bits = 0x1b104be3u;
+    const uint32_t mtp  = 1'700'000'000u;
+
+    auto w = build_embedded_workdata(
+        /*prev_height=*/H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    // Header fields are pass-through / derived — assert exactly.
+    EXPECT_EQ(w.m_height, H);
+    EXPECT_EQ(w.m_previous_block, prev_hash);
+    EXPECT_EQ(w.m_bits, bits);
+    EXPECT_EQ(w.m_mintime, mtp + 1u);            // GBT returns MTP+1
+    EXPECT_EQ(w.m_version, 0x20000000);          // BIP9 default top bit
+
+    // Independent re-derivation of the value/split arithmetic (same
+    // closed-form formulas dashcore uses, recomputed here from scratch).
+    int64_t reward          = compute_dash_block_reward_post_v20(H);
+    int64_t total_fees      = 10'000;            // the one selected tx
+    int64_t block_value     = reward + total_fees;
+    int64_t platform_reward = compute_dash_platform_reward_post_v20_mn_rr(H);
+    int64_t mn_payment      = compute_dash_mn_payment_post_v20(block_value)
+                              - platform_reward;
+
+    EXPECT_EQ(w.m_coinbase_value, static_cast<uint64_t>(block_value));
+    EXPECT_EQ(w.m_payment_amount, static_cast<uint64_t>(mn_payment));
+    EXPECT_GT(platform_reward, 0)
+        << "h=" << H << " is past MN_RR so platform burn must be active";
+
+    // tx plumbing: the single fee-known mempool tx is selected.
+    ASSERT_EQ(w.m_txs.size(), 1u);
+    ASSERT_EQ(w.m_tx_fees.size(), 1u);
+    ASSERT_EQ(w.m_tx_hashes.size(), 1u);
+    EXPECT_EQ(w.m_tx_fees[0], 10'000u);
+    EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(tx));
+}
+
+// C-3 (consensus): the embedded block MUST exclude every DIP special-tx type
+// (1-4 ProTx, 6 quorum-commitment, 8/9 asset-lock/unlock). build_embedded_cbtx
+// commits merkle roots + creditPool computed from the SML/quorum/seed state
+// WITHOUT applying the block's own txs' state effects, so a selected special tx
+// (which changes the MN list / quorums / creditPool) would make the committed
+// CbTx inconsistent -> consensus-invalid (bad-cbtx / bad merkle). End-to-end via
+// build_embedded_workdata (the serving path). Each special tx is UTXO-priced
+// (fee-known) so it WOULD be selected but for the type filter.
+TEST(DashEmbeddedGbt, EmbeddedBlockExcludesAllDipSpecialTxs) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+
+    // A standard (type-0) fee-paying tx — MUST be selected.
+    uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    auto std_tx = make_spend(p0, 0, 90'000, /*salt=*/1);   // type 0, fee 10'000
+    ASSERT_TRUE(mp.add_tx(std_tx));
+
+    // DIP special txs (1,2,3,4,6,8,9), each UTXO-priced (fee-known) — MUST be
+    // excluded. (Type 5 is the coinbase itself, never a mempool tx.)
+    const uint16_t special_types[] = {1, 2, 3, 4, 6, 8, 9};
+    std::vector<uint256> special_ids;
+    uint32_t seed = 0x60;
+    for (uint16_t t : special_types) {
+        uint256 pv = mint_hash(seed++);
+        utxo.add_coin(Outpoint(pv, 0), Coin(100'000, {}, 1, false));
+        auto sp = make_spend(pv, 0, 90'000, /*salt=*/100u + t);
+        sp.type = t;                     // DIP special type
+        ASSERT_TRUE(mp.add_tx(sp));
+        special_ids.push_back(dash::coin::dash_txid(sp));
+    }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    // Only the standard tx is in the embedded block; no special tx leaked in.
+    ASSERT_EQ(w.m_txs.size(), 1u)
+        << "embedded block must contain only the standard tx (all special txs excluded)";
+    EXPECT_EQ(w.m_txs[0].type, 0);
+    EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(std_tx));
+    for (const auto& id : special_ids)
+        for (const auto& h : w.m_tx_hashes)
+            EXPECT_NE(h, id) << "a DIP special tx must never reach the embedded block";
+}
+
+TEST(DashEmbeddedGbt, PlatformBurnIsFirstPaymentAndMnPayeeBase58) {
+    UTXOViewCache utxo(nullptr);   // empty mempool path (no fees)
+    Mempool mp;
+    auto payout = p2pkh_script(0x40);
+    auto mnstates = single_mn(payout);
+
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0x10), mnstates, mp,
+        /*bits=*/0x1b104be3u, /*mtp=*/1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    // Two payments in dashcore order: [0] OP_RETURN platform burn ("!6a"),
+    // [1] the MN payee (a base58 Dash address from the P2PKH script).
+    ASSERT_EQ(w.m_packed_payments.size(), 2u);
+
+    int64_t platform_reward = compute_dash_platform_reward_post_v20_mn_rr(H);
+    EXPECT_EQ(w.m_packed_payments[0].payee, "!6a")
+        << "platform credit-pool burn must be the OP_RETURN raw-script payee";
+    EXPECT_EQ(w.m_packed_payments[0].amount,
+              static_cast<uint64_t>(platform_reward));
+
+    // MN payee: P2PKH → base58 (NOT the "!hex" fallback). Independent decode
+    // through script_to_address must agree byte-for-byte.
+    std::string expect_addr = ::core::script_to_address(
+        payout, "", DASH_PUBKEY_VER, DASH_P2SH_VER);
+    ASSERT_FALSE(expect_addr.empty())
+        << "P2PKH must decode to a base58 address, not fall to !hex";
+    EXPECT_EQ(w.m_packed_payments[1].payee, expect_addr);
+    EXPECT_NE(w.m_packed_payments[1].payee.rfind('!', 0), 0u)
+        << "standard P2PKH must NOT use the !hex raw-script fallback";
+
+    int64_t reward      = compute_dash_block_reward_post_v20(H);   // no fees
+    int64_t mn_payment  = compute_dash_mn_payment_post_v20(reward) - platform_reward;
+    EXPECT_EQ(w.m_packed_payments[1].amount, static_cast<uint64_t>(mn_payment));
+}
+
+TEST(DashEmbeddedGbt, NonStandardScriptFallsBackToHexPayee) {
+    Mempool mp;
+    // 7-byte opaque script: not P2PKH/P2SH/bech32 → "!hex" fallback.
+    std::vector<unsigned char> weird{0x6a, 0x05, 0xde, 0xad, 0xbe, 0xef, 0x01};
+    auto mnstates = single_mn(weird);
+
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0x20), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    ASSERT_EQ(w.m_packed_payments.size(), 2u);   // burn + MN
+    // Independent hex encode of the raw script, "!"-prefixed.
+    std::string expect = "!";
+    static const char* d = "0123456789abcdef";
+    for (uint8_t b : weird) { expect.push_back(d[(b >> 4) & 0xF]); expect.push_back(d[b & 0xF]); }
+    EXPECT_EQ(w.m_packed_payments[1].payee, expect);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// CCbTx (coinbase extra_payload) — bit-exact wire preimage parity.
+// ════════════════════════════════════════════════════════════════════════
+
+// Independent re-serialization of a CCbTx via a fresh PackStream, bypassing
+// encode_cbtx, so the encoder is checked against a second path.
+static std::vector<unsigned char> repack_cbtx(const CCbTx& c) {
+    ::PackStream s;
+    s << c;
+    auto sp = s.get_span();
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()),
+        reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+}
+
+TEST(DashEmbeddedGbt, CbtxEncodeDecodeRoundTripAndPreimage) {
+    // Seed an SML with two entries so CalcMerkleRoot is non-trivial.
+    CSimplifiedMNListEntry e1; e1.proRegTxHash = raw256(0x11); e1.isValid = true;
+    CSimplifiedMNListEntry e2; e2.proRegTxHash = raw256(0x22); e2.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{e1, e2});
+
+    QuorumManager qmgr;   // empty active set → deterministic root
+    std::array<uint8_t, 96> clsig = seq_array<96>(0x55);
+
+    CCbTx c = build_embedded_cbtx(
+        /*prev_height=*/H - 1, sml, qmgr,
+        /*best_cl_height=*/static_cast<int32_t>(H - 10), clsig,
+        /*last_observed_credit_pool=*/123'456'789LL);
+
+    // Field provenance: independently recompute the two roots.
+    CSimplifiedMNList sml_copy = sml;
+    EXPECT_EQ(c.merkleRootMNList, sml_copy.CalcMerkleRoot());
+    EXPECT_EQ(c.merkleRootQuorums, compute_merkle_root_quorums(qmgr));
+    EXPECT_EQ(c.nVersion, CCbTx::VERSION_CLSIG_AND_BALANCE);
+    EXPECT_EQ(c.nHeight, static_cast<int32_t>(H));
+    // best_cl_height=H-10 ≤ prev_height=H-1 → diff = prev_height - best.
+    EXPECT_EQ(c.bestCLHeightDiff, (H - 1) - (H - 10));
+    EXPECT_EQ(c.bestCLSignature, clsig);
+    EXPECT_EQ(c.creditPoolBalance, 123'456'789LL);
+
+    // (a) encoder == independent re-serialization (bit-exact preimage).
+    auto wire = encode_cbtx(c);
+    EXPECT_EQ(wire, repack_cbtx(c)) << "encode_cbtx must match a second pack path";
+    EXPECT_FALSE(wire.empty());
+
+    // (b) decode round-trip: parse_cbtx(wire) reconstructs every field.
+    CCbTx back;
+    ASSERT_TRUE(parse_cbtx(wire, back)) << "encoded payload must parse cleanly";
+    EXPECT_EQ(back.nVersion, c.nVersion);
+    EXPECT_EQ(back.nHeight, c.nHeight);
+    EXPECT_EQ(back.merkleRootMNList, c.merkleRootMNList);
+    EXPECT_EQ(back.merkleRootQuorums, c.merkleRootQuorums);
+    EXPECT_EQ(back.bestCLHeightDiff, c.bestCLHeightDiff);
+    EXPECT_EQ(back.bestCLSignature, c.bestCLSignature);
+    EXPECT_EQ(back.creditPoolBalance, c.creditPoolBalance);
+
+    // (c) re-encode the parsed struct → identical bytes (encode⁻¹ is exact).
+    EXPECT_EQ(encode_cbtx(back), wire) << "round-trip must be byte-stable";
+}
+
+TEST(DashEmbeddedGbt, CbtxNoChainlockZeroesBestCLFields) {
+    CSimplifiedMNListEntry e; e.proRegTxHash = raw256(0x33); e.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{e});
+    QuorumManager qmgr;
+
+    // best_cl_height=0 → no CLSIG observed → bestCL* must be zeroed,
+    // matching dashd's "no chainlock for the window" wire shape.
+    CCbTx c = build_embedded_cbtx(
+        H - 1, sml, qmgr, /*best_cl_height=*/0, std::array<uint8_t, 96>{},
+        /*last_observed_credit_pool=*/0LL);
+    EXPECT_EQ(c.bestCLHeightDiff, 0u);
+    EXPECT_EQ(c.bestCLSignature, (std::array<uint8_t, 96>{}));
+    EXPECT_FALSE(c.has_best_cl_signature());
+
+    auto wire = encode_cbtx(c);
+    CCbTx back;
+    ASSERT_TRUE(parse_cbtx(wire, back));
+    EXPECT_EQ(back.bestCLHeightDiff, 0u);
+    EXPECT_FALSE(back.has_best_cl_signature());
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// cbtx_xcheck / gbt_xcheck — comparator self-consistency (the dashd side
+// is mirrored by a locally-built reference; only the node oracle is deferred).
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashEmbeddedGbt, CbtxXcheckMatchesIdenticalDetectsRootDrift) {
+    CSimplifiedMNListEntry e; e.proRegTxHash = raw256(0x44); e.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{e});
+    QuorumManager qmgr;
+    CCbTx c = build_embedded_cbtx(H - 1, sml, qmgr, 0, std::array<uint8_t, 96>{}, 0LL);
+
+    // Identical payload → roots match.
+    auto wire = encode_cbtx(c);
+    EXPECT_TRUE(cbtx_xcheck(c, wire));
+
+    // Flip merkleRootMNList on the embedded side → root drift detected.
+    CCbTx c_drift = c;
+    c_drift.merkleRootMNList = raw256(0xFF);
+    EXPECT_FALSE(cbtx_xcheck(c_drift, wire))
+        << "a divergent merkleRootMNList must fail the root cross-check";
+
+    // Unparseable payload → returns false (defensive).
+    std::vector<unsigned char> garbage{0x01, 0x02};
+    EXPECT_FALSE(cbtx_xcheck(c, garbage));
+}
+
+TEST(DashEmbeddedGbt, GbtXcheckMatchesIdenticalDetectsFieldDrift) {
+    Mempool mp;
+    auto payout = p2pkh_script(0x50);
+    auto mnstates = single_mn(payout);
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0x60), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    // Identical WorkData (embedded vs. a copy standing in for the RPC side).
+    DashWorkData rpc = w;
+    EXPECT_TRUE(gbt_xcheck(w, rpc));
+
+    // Single-field drift on coinbase_value → detected.
+    DashWorkData rpc_bad = w;
+    rpc_bad.m_coinbase_value += 1;
+    EXPECT_FALSE(gbt_xcheck(w, rpc_bad));
+
+    // Payee drift → detected.
+    DashWorkData rpc_payee = w;
+    ASSERT_FALSE(rpc_payee.m_packed_payments.empty());
+    rpc_payee.m_packed_payments.back().payee = "XdifferentDashAddr";
+    EXPECT_FALSE(gbt_xcheck(w, rpc_payee));
+
+    // packed_payments count drift → detected.
+    DashWorkData rpc_count = w;
+    rpc_count.m_packed_payments.pop_back();
+    EXPECT_FALSE(gbt_xcheck(w, rpc_count));
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// G1 golden: deterministic template+coinbase vector via the curtime seam.
+//
+// The sole non-determinism in build_embedded_workdata was the live
+// std::time(nullptr) read for m_curtime. With the trailing defaulted curtime
+// param, a fixed-input call yields a byte-for-byte reproducible header
+// projection — the G1 deliverable (fixed-input template+coinbase golden) in
+// the per-coin block-production gate.
+//
+// Oracle discipline (non-circular, mirrors the params KAT): bits is pinned to
+// the oracle GBT nBits and passed through; every value/split number is
+// re-derived here from the SAME closed-form dashcore formulas, not copied from
+// a build_embedded_workdata run. Only curtime is a pinned input we assert the
+// seam faithfully echoes.
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashEmbeddedGbt, G1GoldenDeterministicTemplateViaCurtimeSeam) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(77);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto tx = make_spend(prev, 0, 90'000, /*salt=*/7);   // fee = 10'000
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    auto payout   = p2pkh_script(0x55);
+    auto mnstates = single_mn(payout);
+
+    uint256 prev_hash = raw256(0xC3);
+    const uint32_t bits           = 0x1b104be3u;   // pinned oracle GBT nBits
+    const uint32_t mtp            = 1'700'000'000u;
+    const uint32_t PINNED_CURTIME = 1'700'000'123u;  // fixed block time
+
+    // Same fixed inputs → identical WorkData every run (the golden property).
+    auto a = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME);
+    auto b = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME);
+
+    // The seam echoes the pinned time exactly — no wall-clock leak.
+    EXPECT_EQ(a.m_curtime, PINNED_CURTIME);
+    EXPECT_EQ(b.m_curtime, PINNED_CURTIME);
+
+    // Full header projection is deterministic field-for-field.
+    EXPECT_EQ(a.m_height,          b.m_height);
+    EXPECT_EQ(a.m_previous_block,  b.m_previous_block);
+    EXPECT_EQ(a.m_bits,            b.m_bits);
+    EXPECT_EQ(a.m_mintime,         b.m_mintime);
+    EXPECT_EQ(a.m_version,         b.m_version);
+    EXPECT_EQ(a.m_coinbase_value,  b.m_coinbase_value);
+    EXPECT_EQ(a.m_payment_amount,  b.m_payment_amount);
+
+    // Independent re-derivation of the golden values (non-circular oracle).
+    int64_t reward          = compute_dash_block_reward_post_v20(H);
+    int64_t total_fees      = 10'000;
+    int64_t block_value     = reward + total_fees;
+    int64_t platform_reward = compute_dash_platform_reward_post_v20_mn_rr(H);
+    int64_t mn_payment      = compute_dash_mn_payment_post_v20(block_value)
+                              - platform_reward;
+
+    EXPECT_EQ(a.m_height,         H);
+    EXPECT_EQ(a.m_previous_block, prev_hash);
+    EXPECT_EQ(a.m_bits,           bits);            // oracle nBits passthrough
+    EXPECT_EQ(a.m_mintime,        mtp + 1u);        // GBT returns MTP+1
+    EXPECT_EQ(a.m_version,        0x20000000u);
+    EXPECT_EQ(a.m_coinbase_value, static_cast<uint64_t>(block_value));
+    EXPECT_EQ(a.m_payment_amount, static_cast<uint64_t>(mn_payment));
+
+    // Coinbase payee side is deterministic: platform OP_RETURN burn FIRST,
+    // then the MN base58 payee — same ordering the shadow path asserts.
+    ASSERT_EQ(a.m_packed_payments.size(), 2u);
+    EXPECT_EQ(a.m_packed_payments[0].payee, "!6a");   // DIP-0027 burn
+    EXPECT_EQ(a.m_packed_payments[0].amount,
+              static_cast<uint64_t>(platform_reward));
+    EXPECT_EQ(a.m_packed_payments[1].amount,
+              static_cast<uint64_t>(mn_payment));
+    EXPECT_FALSE(a.m_packed_payments[1].payee.empty());
+    EXPECT_NE(a.m_packed_payments[1].payee.front(), '!');  // base58, not !hex
+
+    // The default arg preserves the prior live-read behavior: omitting curtime
+    // still reads the wall clock (post-2023 epoch), so no caller is changed.
+    auto live = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_GE(live.m_curtime, 1'700'000'000u)
+        << "default curtime must still read std::time(nullptr)";
+}
+
+// ========================================================================
+// G1 golden: injectable block-version seam (companion to the curtime seam).
+//
+// build_embedded_workdata hardcoded m_version = 0x20000000 (BIP9 "no
+// signaling" baseline). With the trailing defaulted `version` param a
+// fixed-input call yields a byte-for-byte reproducible version projection,
+// and a real BIP9-deployment-aware value can later be threaded through
+// without disturbing the default. curtime is pinned here because the
+// version seam sits AFTER curtime in the signature.
+// ========================================================================
+TEST(DashEmbeddedGbt, G1GoldenVersionSeamEchoesInjectedVersion) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(88);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto tx = make_spend(prev, 0, 90'000, /*salt=*/9);   // fee = 10'000
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    auto payout   = p2pkh_script(0x55);
+    auto mnstates = single_mn(payout);
+
+    uint256 prev_hash = raw256(0xD4);
+    const uint32_t bits           = 0x1b104be3u;   // pinned oracle GBT nBits
+    const uint32_t mtp            = 1'700'000'000u;
+    const uint32_t PINNED_CURTIME = 1'700'000'123u; // pinned: sits before version in sig
+    const uint32_t PINNED_VERSION = 0x20000004u;   // BIP9 baseline + bit 2 set
+
+    // Injected version is echoed byte-for-byte -- the seam adds no arithmetic.
+    auto injected = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME, PINNED_VERSION);
+    EXPECT_EQ(injected.m_version, PINNED_VERSION);
+
+    // Deterministic: same fixed inputs -> identical version projection.
+    auto injected2 = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME, PINNED_VERSION);
+    EXPECT_EQ(injected.m_version, injected2.m_version);
+
+    // Default arg preserves the prior hardcoded projection: omitting version
+    // still yields the BIP9 "no signaling" baseline, so no caller is changed.
+    auto baseline = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME);
+    EXPECT_EQ(baseline.m_version, 0x20000000u);
+
+    // The version seam is orthogonal to every other header field: injecting a
+    // non-default version changes ONLY m_version, nothing else drifts.
+    EXPECT_EQ(injected.m_height,         baseline.m_height);
+    EXPECT_EQ(injected.m_previous_block, baseline.m_previous_block);
+    EXPECT_EQ(injected.m_bits,           baseline.m_bits);
+    EXPECT_EQ(injected.m_mintime,        baseline.m_mintime);
+    EXPECT_EQ(injected.m_coinbase_value, baseline.m_coinbase_value);
+    EXPECT_EQ(injected.m_payment_amount, baseline.m_payment_amount);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// E2 — independent credit-pool advance on ingestion, POST-RESTART.
+//
+// The gap: m_credit_pool is seeded only by the periodic mnlistdiff cbTx, and is
+// NOT persisted. After a warm restart the SML resumes from its persisted tip
+// (#800), but the credit pool re-seeds to nothing until the NEXT mnlistdiff —
+// so for the tip that existed AT restart the credit-pool freshness gate fails
+// closed and the daemonless arm falls back to dashd.
+//
+// The fix (verified here):
+//   (1) persist the credit-pool tip alongside the SML (same blockHash/height)
+//       and RESTORE it on warm restart, so the gate is live at the restart tip;
+//   (2) ADVANCE the pool INDEPENDENTLY on every ingested block, verified against
+//       that block's OWN from-wire cbTx creditPoolBalance at nHeight == height —
+//       NOT against a template we built from the seed (the self-consistent-but-
+//       stale trap that refuted 3 prior soaks).
+//
+// Oracle discipline: the block's committed creditPoolBalance is built from the
+// raw dashcore platform-share formula (subsidy*3/4*375/1000, recomputed here),
+// and we assert the maintainer's independent accrual reproduces exactly that
+// from-wire value — two independent derivations meeting, never a self-check.
+// ════════════════════════════════════════════════════════════════════════
+
+// v3 CCbTx extra_payload at a given height carrying a given creditPoolBalance.
+static std::vector<unsigned char> e2_cbtx_payload(int32_t cb_height,
+                                                  int64_t credit_pool) {
+    CCbTx cb;
+    cb.nVersion          = CCbTx::VERSION_CLSIG_AND_BALANCE;
+    cb.nHeight           = cb_height;
+    cb.creditPoolBalance = credit_pool;
+    return dash::coin::encode_cbtx(cb);
+}
+
+// A block whose coinbase (tx 0) is a type-5 CbTx committing creditPoolBalance at
+// cb_height. No special asset-lock/unlock txs, so the per-block accrual reduces
+// to the platform-reward term (the mainnet steady state at H).
+static BlockType e2_block_with_cbtx(int32_t cb_height, int64_t credit_pool) {
+    BlockType blk;
+    blk.m_bits = 0x1b104be3u;                 // non-null header (identity hashable)
+    MutableTransaction coinbase;
+    coinbase.version       = 3;
+    coinbase.type          = 5;               // CbTx
+    coinbase.extra_payload = e2_cbtx_payload(cb_height, credit_pool);
+    // A coinbase input (prevout null) — not inspected by the credit-pool walk
+    // (it skips tx 0), present only so the block looks well-formed.
+    TxIn cin; cin.prevout.hash = uint256::ZERO; cin.prevout.index = 0xffffffffu;
+    coinbase.vin.push_back(cin);
+    blk.m_txs.push_back(std::move(coinbase));
+    // Bind the body to the header: commit the merkle root over the actual tx set,
+    // so the E2 finding-A guard (block_body_binds_to_header) accepts this block.
+    std::vector<uint256> txids;
+    for (const auto& tx : blk.m_txs) txids.push_back(dash::coin::dash_txid(tx));
+    blk.m_merkle_root = dash::coin::compute_merkle_root(txids);
+    return blk;
+}
+
+// A FORGED body: the header commits the real coinbase's merkle root, but the
+// delivered body swaps in a coinbase with a WRONG creditPoolBalance (same
+// nHeight). The merkle root is left committing the real coinbase, so the body no
+// longer binds to the header — a real-PoW-header + forged-body attack.
+static BlockType e2_forged_block(int32_t cb_height, int64_t real_cp,
+                                 int64_t forged_cp) {
+    BlockType blk = e2_block_with_cbtx(cb_height, real_cp);   // root commits real cbTx
+    blk.m_txs[0].extra_payload = e2_cbtx_payload(cb_height, forged_cp);  // swap in forgery
+    return blk;                                              // m_merkle_root NOT updated
+}
+
+static CSimplifiedMNListEntry e2_sml_entry(uint8_t seed) {
+    CSimplifiedMNListEntry e;
+    e.proRegTxHash  = raw256(seed);
+    e.confirmedHash = raw256(seed + 1);
+    e.isValid = true;
+    return e;
+}
+
+// mnlistdiff carrying a type-5 cbTx seed (credit pool @ cb_height).
+static CSimplifiedMNListDiff e2_diff_with_seed(const uint256& base,
+                                               const uint256& block,
+                                               int32_t cb_height,
+                                               int64_t credit_pool) {
+    CSimplifiedMNListDiff d;
+    d.baseBlockHash = base;
+    d.blockHash     = block;
+    d.mnList = {e2_sml_entry(0x40)};
+    d.cbTx.version       = 3;
+    d.cbTx.type          = 5;
+    d.cbTx.extra_payload = e2_cbtx_payload(cb_height, credit_pool);
+    return d;
+}
+
+static std::vector<std::pair<uint256, MNState>>
+e2_mn_pairs(const std::vector<unsigned char>& payout) {
+    MNState s;
+    s.isValid = true;
+    s.nRegisteredHeight = 2'300'000;
+    s.nLastPaidHeight = 0;
+    s.scriptPayout.m_data = payout;
+    s.payoutSplitProvenance = MNState::SPLIT_KNOWN;   // h=2516595 serve gate
+    return std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}};
+}
+
+// The independent platform-reward oracle at a height (raw dashcore formula,
+// truncation order preserved), NOT compute_dash_platform_reward_post_v20_mn_rr.
+static int64_t e2_platform_reward_oracle(uint32_t height) {
+    int64_t mn_share = compute_dash_block_reward_post_v20(height) * 3 / 4;
+    return mn_share * 375 / 1000;
+}
+
+TEST(DashEmbeddedGbt, E2CreditPoolIndependentAdvancePostRestart) {
+    // Snapshot tip at P = H-1; the first post-restart block is at H.
+    const uint32_t P       = H - 1;
+    const uint256  HASH_P  = raw256(0x54);
+    const int64_t  CP0     = 111'000'000'000LL;             // snapshot balance @ P
+    const int64_t  reward  = e2_platform_reward_oracle(H);  // locked at block H
+    ASSERT_GT(reward, 0) << "H must be past MN_RR so the platform burn is active";
+    const int64_t  CP1     = CP0 + reward;                  // committed balance @ H
+
+    // ── Pre-restart: a cold snapshot seeds + PERSISTS the credit pool @ P. ──
+    uint256 persist_hash; uint32_t persist_h = 0; int64_t persist_bal = 0; bool persisted = false;
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);
+        m.set_on_credit_pool_persist(
+            [&](const uint256& h, uint32_t ht, int64_t bal) {
+                persist_hash = h; persist_h = ht; persist_bal = bal; persisted = true;
+            });
+        m.on_mnlistdiff(e2_diff_with_seed(uint256::ZERO, HASH_P,
+                                          static_cast<int32_t>(P), CP0));
+        ASSERT_EQ(st.credit_pool(), CP0);
+        ASSERT_EQ(st.credit_pool_height(), static_cast<int32_t>(P));
+        ASSERT_TRUE(persisted) << "an accepted diff with a v3 cbTx must persist the pool tip";
+        EXPECT_EQ(persist_hash, HASH_P);
+        EXPECT_EQ(persist_h, P);
+        EXPECT_EQ(persist_bal, CP0);
+    }
+
+    // Helper: simulate a warm SML restore (loaded from SMLDb directly, NOT via a
+    // diff), so the credit pool is the ONLY axis under test.
+    auto warm_restore_sml = [&](NodeCoinState& st) {
+        st.sml() = CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>{e2_sml_entry(0x40)});
+        st.set_have_sml(true);
+        st.set_sml_current_hash(HASH_P);
+    };
+    auto arm_full_bundle = [&](NodeCoinState& st, CoinStateMaintainer& m) {
+        st.set_require_sml(true);
+        st.set_require_fresh_credit_pool(true);
+        m.on_mn_list_update(e2_mn_pairs(p2pkh_script(0x30)));
+        m.on_new_tip(P, HASH_P, 0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    };
+
+    // ── Restart WITHOUT the credit-pool restore (the bug): SML resumes @ P but
+    //    the pool is unseeded (height -1) → the freshness gate fails closed. ──
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);
+        warm_restore_sml(st);
+        arm_full_bundle(st, m);
+        EXPECT_EQ(st.credit_pool_height(), -1)
+            << "without persistence the pool is unseeded at the restart tip";
+        EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+            << "unseeded credit pool at the restart tip must fail closed to dashd fallback";
+    }
+
+    // ── Restart WITH the credit-pool restore (the fix): pool resumes @ P, the
+    //    gate is live at the restart tip, and the first ingested block advances
+    //    the pool INDEPENDENTLY, VERIFIED against its own from-wire cbTx. ──
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    warm_restore_sml(st);
+    // Restore both the freshness seed (NodeCoinState) and the running accrual.
+    st.set_credit_pool(persist_bal, persist_hash, static_cast<int32_t>(persist_h));
+    m.restore_credit_pool(persist_bal, persist_h);
+    arm_full_bundle(st, m);
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(P));
+    EXPECT_EQ(st.credit_pool(), CP0);
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable())
+        << "restored credit pool current at the restart tip must serve daemonlessly";
+
+    // First incremental block @ H carrying the from-wire committed balance CP1.
+    BlockType blk = e2_block_with_cbtx(static_cast<int32_t>(H), CP1);
+    // Sanity: the block's OWN coinbase commits CP1 at nHeight H (the independent
+    // source of truth the advance is verified against — re-parsed here).
+    {
+        CCbTx from_wire;
+        ASSERT_TRUE(parse_cbtx(blk.m_txs[0].extra_payload, from_wire));
+        ASSERT_EQ(from_wire.nHeight, static_cast<int32_t>(H));
+        ASSERT_EQ(from_wire.creditPoolBalance, CP1);
+    }
+    m.on_block_connected(blk, H);
+    // The pool advanced to the tip, matching the block's OWN committed value.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H))
+        << "the pool must advance to the ingested block's height independently";
+    EXPECT_EQ(st.credit_pool(), CP1)
+        << "advance must equal the block's from-wire committed creditPoolBalance";
+    // Non-self-referential: the advanced value equals CP0 + the INDEPENDENTLY
+    // derived platform reward, i.e. the seed plus this block's own accrual —
+    // reproduced from the raw formula, not read back off a template we built.
+    EXPECT_EQ(st.credit_pool(), CP0 + e2_platform_reward_oracle(H));
+
+    // The advanced pool is fresh at the new tip → still serves at H.
+    m.on_new_tip(H, raw256(0x55), 0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    // (sml_current_hash must also be at the new tip for full viability; the
+    // credit-pool axis specifically is proven fresh below regardless.)
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+}
+
+// E2 — the independent verify is REAL: a block whose coinbase commits a WRONG
+// creditPoolBalance (inconsistent with the accrual) is REJECTED — the freshness
+// seed is NOT advanced, so the arm fails closed rather than serving a bad-cbtx
+// balance. A self-referential built==seed+reward check could not catch this
+// (it would happily rebuild the wrong value); comparing our independent accrual
+// to the block's own committed value does.
+TEST(DashEmbeddedGbt, E2CreditPoolDriftFailsClosedNotSelfReferential) {
+    const uint32_t P      = H - 1;
+    const uint256  HASH_P = raw256(0x54);
+    const int64_t  CP0    = 111'000'000'000LL;
+    const int64_t  reward = e2_platform_reward_oracle(H);
+    const int64_t  CP1_correct = CP0 + reward;
+    const int64_t  CP1_wrong   = CP1_correct + 1;   // off-by-one bad-cbtx
+
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    // Warm-restore the pool @ P (contiguous predecessor of block H).
+    st.sml() = CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>{e2_sml_entry(0x40)});
+    st.set_have_sml(true);
+    st.set_sml_current_hash(HASH_P);
+    st.set_credit_pool(CP0, HASH_P, static_cast<int32_t>(P));
+    m.restore_credit_pool(CP0, P);
+
+    // A block @ H whose committed balance disagrees with the accrual by 1 duff.
+    BlockType bad = e2_block_with_cbtx(static_cast<int32_t>(H), CP1_wrong);
+    m.on_block_connected(bad, H);
+
+    // Fail closed: the freshness seed stayed at P (did NOT advance to H), so with
+    // the tip at H the credit-pool gate refuses the arm — the invariant "never
+    // serve a wrong creditPoolBalance" holds by failing to fallback, not by
+    // adopting the bad value.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(P))
+        << "a drifted (bad-cbtx) balance must NOT advance the freshness seed";
+    EXPECT_NE(st.credit_pool(), CP1_wrong)
+        << "the wrong committed balance must never be adopted as the seed";
+    EXPECT_EQ(st.credit_pool(), CP0)
+        << "the seed must remain the last independently-confirmed value";
+
+    // Contrast — the SAME block with the CORRECT committed balance DOES verify
+    // (contiguous advance from the restored P) and advances the seed to H. This
+    // is what proves the check is discriminating, not merely always-refusing.
+    NodeCoinState st_ok;
+    CoinStateMaintainer m_ok(st_ok);
+    st_ok.set_credit_pool(CP0, HASH_P, static_cast<int32_t>(P));
+    m_ok.restore_credit_pool(CP0, P);
+    BlockType good = e2_block_with_cbtx(static_cast<int32_t>(H), CP1_correct);
+    m_ok.on_block_connected(good, H);
+    EXPECT_EQ(st_ok.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st_ok.credit_pool(), CP1_correct);
+}
+
+// E2 finding A — a FORGED block body (real PoW header, fake type-5 coinbase with
+// the CORRECT nHeight but a WRONG creditPoolBalance and an unbound merkle root)
+// must be REFUSED at ingestion and must NOT advance the freshness seed. Without
+// the body↔header binding this forgery would ride the non-contiguous bootstrap,
+// advance the gate, and be SERVED as a bad-cbtx — E2 widened this trust surface,
+// so the binding closes it. The verify is discriminating: a well-BOUND block
+// (correct root committing its own coinbase) still advances.
+TEST(DashEmbeddedGbt, E2ForgedBlockBodyRefusedDoesNotAdvanceSeed) {
+    const uint32_t P      = H - 1;
+    const uint256  HASH_P = raw256(0x54);
+    const int64_t  CP0    = 111'000'000'000LL;
+    const int64_t  reward = e2_platform_reward_oracle(H);
+    const int64_t  CP1_real   = CP0 + reward;
+    const int64_t  CP1_forged = CP1_real + 777;   // attacker's fabricated balance
+
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    st.set_credit_pool(CP0, HASH_P, static_cast<int32_t>(P));
+    m.restore_credit_pool(CP0, P);
+
+    // Forged body: right nHeight (H), wrong creditPoolBalance, header still commits
+    // the REAL coinbase → the delivered body does not fold to the committed root.
+    BlockType forged = e2_forged_block(static_cast<int32_t>(H), CP1_real, CP1_forged);
+    ASSERT_FALSE(dash::coin::block_body_binds_to_header(forged))
+        << "the forged body must fail the merkle body↔header binding";
+    // Re-parse confirms the forgery carries the right height but the fake balance.
+    {
+        CCbTx fake;
+        ASSERT_TRUE(parse_cbtx(forged.m_txs[0].extra_payload, fake));
+        ASSERT_EQ(fake.nHeight, static_cast<int32_t>(H));
+        ASSERT_EQ(fake.creditPoolBalance, CP1_forged);
+    }
+    m.on_block_connected(forged, H);
+
+    // Refused: the seed stayed at P — the fabricated balance was never adopted.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(P))
+        << "a forged/unbound body must NOT advance the freshness seed";
+    EXPECT_EQ(st.credit_pool(), CP0);
+    EXPECT_NE(st.credit_pool(), CP1_forged);
+
+    // Discriminating: a well-bound block at H (root commits its own coinbase) IS
+    // accepted and advances — the guard rejects only unbound bodies, not valid ones.
+    BlockType good = e2_block_with_cbtx(static_cast<int32_t>(H), CP1_real);
+    ASSERT_TRUE(dash::coin::block_body_binds_to_header(good));
+    m.on_block_connected(good, H);
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st.credit_pool(), CP1_real);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UTXO-IMMATURE SERVING — the coinbase-only template (pure-daemonless OPT-IN)
+//
+// The DEFAULT during the UTXO-immature window is to REFUSE (p2pool semantics:
+// an unsynced node does not serve templates — pinned in
+// test_dash_node_coin_state.cpp DefaultRefusesTheImmatureWindowExactlyAsBefore).
+// The suppress_mempool_txs seam exercised here is the explicit opt-in for
+// pure-daemonless nodes with no fallback: serve a coinbase-only template
+// rather than nothing for ~106 blocks (~4.4 h at ~150 s/block).
+//
+// Consensus never requires a mempool transaction in a block, so a
+// coinbase-only template is a fully valid block; and because this builder has
+// no TestBlockValidity equivalent, the decisive property is that with ZERO
+// selected txs the fee term is exactly 0 — there is no fee to overstate, so
+// bad-cb-amount is structurally impossible in this mode rather than merely
+// improbable.
+//
+// These pin exactly that: the suppressed template is byte-valid (subsidy exact,
+// CCbTx fields exact, fees exactly zero and never above the normal template),
+// and it SAYS it is running in that mode.
+// ════════════════════════════════════════════════════════════════════════════
+
+// Build one template from a mempool holding a fee-paying tx, with and without
+// suppression, from otherwise IDENTICAL state — so every difference asserted
+// below is attributable to the suppression flag alone.
+namespace {
+struct ImmatureFixture {
+    UTXOViewCache      utxo{nullptr};
+    Mempool            mp;
+    MnStateMachine     mnstates;
+    uint256            prev_hash{raw256(0xAB)};
+    MutableTransaction tx;
+    static constexpr int64_t  FEE  = 10'000;
+    static constexpr uint32_t BITS = 0x1b104be3u;
+    static constexpr uint32_t MTP  = 1'700'000'000u;
+
+    ImmatureFixture() : mnstates(single_mn(p2pkh_script(0x30))) {
+        uint256 prev = mint_hash(77);
+        utxo.add_coin(Outpoint(prev, 0),
+                      Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+        mp.set_utxo(&utxo);
+        tx = make_spend(prev, 0, 100'000 - FEE, /*salt=*/7);
+        EXPECT_TRUE(mp.add_tx(tx));
+    }
+
+    dash::coin::DashWorkData build(bool suppress,
+                                   const CSimplifiedMNList* sml = nullptr,
+                                   const QuorumManager* qmgr = nullptr,
+                                   int64_t credit_pool = 0) const {
+        return build_embedded_workdata(
+            /*prev_height=*/H - 1, prev_hash, mnstates, mp,
+            BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER,
+            /*curtime=*/1'700'000'123u, /*version=*/0x20000000u,
+            /*underfill_tripped=*/nullptr,
+            sml, qmgr,
+            /*best_cl_height=*/0, dash::coin::k_zero_cl_sig, credit_pool,
+            /*qc_commitments=*/nullptr, /*quorum_root_override=*/nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+            /*superblock_payments=*/nullptr,
+            dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+            /*suppress_mempool_txs=*/suppress);
+    }
+};
+}  // namespace
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateIsCoinbaseOnlyWithExactSubsidy) {
+    ImmatureFixture f;
+
+    // Control: without suppression the fee-paying tx IS selected, so the
+    // fixture genuinely has something to lose (a vacuous mempool would make
+    // every assertion below pass for the wrong reason).
+    auto normal = f.build(/*suppress=*/false);
+    ASSERT_EQ(normal.m_txs.size(), 1u);
+    ASSERT_EQ(normal.m_tx_fees[0], static_cast<uint64_t>(ImmatureFixture::FEE));
+
+    auto empty = f.build(/*suppress=*/true);
+
+    // (1) Coinbase-only body.
+    EXPECT_TRUE(empty.m_txs.empty());
+    EXPECT_TRUE(empty.m_tx_fees.empty());
+    EXPECT_TRUE(empty.m_tx_hashes.empty());
+    EXPECT_TRUE(empty.m_tx_data_hex.empty());
+
+    // (2) Value fields exact, recomputed independently from the same
+    //     closed-form formulas dashcore uses. total_fees is exactly 0.
+    const int64_t reward = compute_dash_block_reward_post_v20(H);
+    const int64_t platform_reward =
+        compute_dash_platform_reward_post_v20_mn_rr(H);
+    const int64_t mn_payment =
+        compute_dash_mn_payment_post_v20(reward) - platform_reward;
+    EXPECT_EQ(empty.m_coinbase_value, static_cast<uint64_t>(reward))
+        << "with zero txs the coinbase value must be the bare subsidy";
+    EXPECT_EQ(empty.m_payment_amount, static_cast<uint64_t>(mn_payment));
+
+    // (3) NO fee overstatement — the one failure mode that costs a block
+    //     (bad-cb-amount). The suppressed template must claim strictly LESS
+    //     than the fee-bearing one, never more.
+    EXPECT_LT(empty.m_coinbase_value, normal.m_coinbase_value);
+    EXPECT_EQ(normal.m_coinbase_value - empty.m_coinbase_value,
+              static_cast<uint64_t>(ImmatureFixture::FEE));
+
+    // (4) Payout structure is otherwise untouched: platform burn first, then
+    //     the base58 MN payee.
+    ASSERT_EQ(empty.m_packed_payments.size(), 2u);
+    EXPECT_EQ(empty.m_packed_payments[0].payee, "!6a");
+    EXPECT_EQ(empty.m_packed_payments[0].amount,
+              static_cast<uint64_t>(platform_reward));
+    EXPECT_EQ(empty.m_packed_payments[1].amount,
+              static_cast<uint64_t>(mn_payment));
+    EXPECT_NE(empty.m_packed_payments[1].payee.front(), '!');
+
+    // (5) Header fields unchanged by the mode.
+    EXPECT_EQ(empty.m_height, H);
+    EXPECT_EQ(empty.m_previous_block, f.prev_hash);
+    EXPECT_EQ(empty.m_bits, ImmatureFixture::BITS);
+    EXPECT_EQ(empty.m_mintime, ImmatureFixture::MTP + 1u);
+    EXPECT_EQ(empty.m_version, normal.m_version);
+}
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateNamesItselfAndReportsThePrice) {
+    ImmatureFixture f;
+
+    auto normal = f.build(/*suppress=*/false);
+    EXPECT_TRUE(normal.m_txset_empty_cause.empty())
+        << "a normal template must NOT claim to be deliberately empty";
+    EXPECT_EQ(normal.m_txset_forgone_fees, 0u);
+
+    auto empty = f.build(/*suppress=*/true);
+    // Silence here would hide a real economic trade-off: a soak has to be able
+    // to measure how long the node ran coinbase-only and what it cost.
+    EXPECT_EQ(empty.m_txset_empty_cause, "utxo-immature-serving");
+    EXPECT_EQ(empty.m_txset_forgone_fees, f.mp.total_known_fees());
+    EXPECT_EQ(empty.m_txset_forgone_fees,
+              static_cast<uint64_t>(ImmatureFixture::FEE));
+}
+
+// ── THE MEMPOOL VALIDITY GATE's PROBE SET (mempool_validity_gate.hpp) ───────
+// The condition that decides when --embedded-serve-mempool-txs may be armed
+// needs the WIRE BYTES of every transaction we would serve, so each one can be
+// put to dashd's testmempoolaccept. These pin that the builder hands the gate
+// exactly those transactions and no others, in both postures.
+
+TEST(DashMempoolProbeSet, SuppressedTemplateCarriesCandidateWireHexForTheGate) {
+    ImmatureFixture f;
+    auto empty = f.build(/*suppress=*/true);
+
+    // Nothing served, but the candidate set — what selection WOULD have chosen
+    // — now carries its wire hex: ids alone cannot be put to
+    // testmempoolaccept, and while the flag is OFF the candidate set is the
+    // only place the transactions we would serve exist.
+    ASSERT_TRUE(empty.m_txs.empty());
+    ASSERT_EQ(empty.m_txset_candidates.size(), 1u);
+    ASSERT_EQ(empty.m_txset_candidate_data_hex.size(),
+              empty.m_txset_candidates.size());
+    EXPECT_FALSE(empty.m_txset_candidate_data_hex[0].empty());
+    ASSERT_EQ(empty.m_mempool_probe_depends_in_set.size(), 1u);
+    EXPECT_EQ(empty.m_mempool_probe_depends_in_set[0], 0u)
+        << "a single independent tx has no in-set parent";
+
+    const auto set = dash::coin::mempool_probe_set(empty);
+    ASSERT_EQ(set.size(), 1u);
+    EXPECT_EQ(set[0].txid, dash::coin::dash_txid(f.tx).GetHex());
+    EXPECT_EQ(set[0].raw_hex, empty.m_txset_candidate_data_hex[0]);
+}
+
+TEST(DashMempoolProbeSet, ServedTemplateRangeNamesTheMempoolTxsWithoutDuplicatingThem) {
+    ImmatureFixture f;
+    auto normal = f.build(/*suppress=*/false);
+
+    // The served body here is exactly the one selected mempool tx: no type-6
+    // commitments, no pins. The range must name it and nothing else.
+    ASSERT_EQ(normal.m_txs.size(), 1u);
+    EXPECT_EQ(normal.m_mempool_tx_first_index, 0u);
+    EXPECT_EQ(normal.m_mempool_tx_count, 1u);
+
+    const auto set = dash::coin::mempool_probe_set(normal);
+    ASSERT_EQ(set.size(), 1u);
+    EXPECT_EQ(set[0].txid, dash::coin::dash_txid(f.tx).GetHex());
+    EXPECT_EQ(set[0].raw_hex, normal.m_tx_data_hex[0]);
+
+    // The probe set is a VIEW of the served body, not a second copy of it —
+    // the money path must not grow a duplicate block body for a diagnostic.
+    EXPECT_TRUE(normal.m_txset_candidate_data_hex.empty());
+}
+
+TEST(DashMempoolProbeSet, ProbeRangeSkipsTheMandatoryQuorumCommitmentPrefix) {
+    // A type-6 quorum commitment is consensus-REQUIRED and is not a mempool
+    // transaction: relay refuses it by design. Probing it would manufacture an
+    // INVALID verdict out of correct behaviour, so the range must start AFTER
+    // the commitments.
+    ImmatureFixture f;
+    std::vector<dash::coin::vendor::CFinalCommitment> qcs(1);
+    qcs[0].llmqType   = 1;
+    qcs[0].quorumHash = raw256(0x77);
+
+    auto w = build_embedded_workdata(
+        /*prev_height=*/H - 1, f.prev_hash, f.mnstates, f.mp,
+        ImmatureFixture::BITS, ImmatureFixture::MTP,
+        DASH_PUBKEY_VER, DASH_P2SH_VER,
+        /*curtime=*/1'700'000'123u, /*version=*/0x20000000u,
+        /*underfill_tripped=*/nullptr,
+        /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig, /*credit_pool=*/0,
+        &qcs, /*quorum_root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+        /*superblock_payments=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress_mempool_txs=*/false);
+
+    ASSERT_EQ(w.m_txs.size(), 2u) << "one qc tx + one mempool tx";
+    EXPECT_EQ(w.m_txs[0].type, 6);
+    EXPECT_EQ(w.m_mempool_tx_first_index, 1u);
+    EXPECT_EQ(w.m_mempool_tx_count, 1u);
+
+    const auto set = dash::coin::mempool_probe_set(w);
+    ASSERT_EQ(set.size(), 1u);
+    EXPECT_EQ(set[0].txid, dash::coin::dash_txid(f.tx).GetHex())
+        << "the quorum commitment must never be put to testmempoolaccept";
+}
+
+TEST(DashUtxoImmatureServing, SuppressedTemplateCbTxIsByteIdenticalToNormal) {
+    // The CCbTx commits merkleRootMNList / merkleRootQuorums / bestCL* /
+    // creditPoolBalance — NONE of which is a function of transaction fees
+    // (the credit-pool accrual is prev + platformReward, and platformReward is
+    // height-derived). So suppressing the tx set must not move a single CbTx
+    // byte. If a future edit ever couples fees into that payload, this goes red
+    // before it can cost a block.
+    CSimplifiedMNListEntry e1; e1.proRegTxHash = raw256(0x11); e1.isValid = true;
+    CSimplifiedMNListEntry e2; e2.proRegTxHash = raw256(0x22); e2.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{e1, e2});
+    QuorumManager qmgr;
+    const int64_t CP = 123'456'789LL;
+
+    ImmatureFixture f;
+    auto normal = f.build(/*suppress=*/false, &sml, &qmgr, CP);
+    auto empty  = f.build(/*suppress=*/true,  &sml, &qmgr, CP);
+
+    ASSERT_FALSE(empty.m_coinbase_payload.empty())
+        << "the suppressed template must still carry a REAL type-5 payload";
+    EXPECT_EQ(empty.m_coinbase_payload, normal.m_coinbase_payload)
+        << "fees do not enter the CCbTx; suppression must not move its bytes";
+
+    // …and it parses to the right height + an unchanged credit-pool accrual.
+    CCbTx got;
+    ASSERT_TRUE(parse_cbtx(empty.m_coinbase_payload, got));
+    EXPECT_EQ(got.nHeight, static_cast<int32_t>(H));
+    EXPECT_EQ(got.creditPoolBalance,
+              CP + compute_dash_platform_reward_post_v20_mn_rr(H));
+    CSimplifiedMNList sml_copy = sml;
+    EXPECT_EQ(got.merkleRootMNList, sml_copy.CalcMerkleRoot());
+    EXPECT_EQ(got.merkleRootQuorums, compute_merkle_root_quorums(qmgr));
+}
+
+TEST(DashUtxoImmatureServing, SuppressionDoesNotTripTheUnderfillGuard) {
+    // The underfill guard exists to flag an UNEXPLAINED near-empty template.
+    // This one is explained, and letting the guard fire here would train
+    // operators to ignore the line that is supposed to mean "template-fill
+    // regression".
+    ImmatureFixture f;
+    bool tripped_normal = false;
+    bool tripped_empty  = false;
+
+    build_embedded_workdata(
+        H - 1, f.prev_hash, f.mnstates, f.mp,
+        ImmatureFixture::BITS, ImmatureFixture::MTP,
+        DASH_PUBKEY_VER, DASH_P2SH_VER,
+        1'700'000'123u, 0x20000000u, &tripped_normal);
+
+    build_embedded_workdata(
+        H - 1, f.prev_hash, f.mnstates, f.mp,
+        ImmatureFixture::BITS, ImmatureFixture::MTP,
+        DASH_PUBKEY_VER, DASH_P2SH_VER,
+        1'700'000'123u, 0x20000000u, &tripped_empty,
+        nullptr, nullptr, 0, dash::coin::k_zero_cl_sig, 0,
+        nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+        nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress_mempool_txs=*/true);
+
+    EXPECT_FALSE(tripped_empty)
+        << "a deliberately coinbase-only template is not an underfill defect";
+    EXPECT_FALSE(tripped_normal)
+        << "control: this fixture's mempool is too small to trip the guard "
+           "either way, so the assertion above is about the mode, not the size";
+}
+
+// End-to-end through the SELECTOR: NodeCoinState's suppression flag must reach
+// build_embedded_workdata. A flag that is set but never threaded would leave
+// the arm serving a normal template off an immature UTXO view — the one
+// dangerous variant.
+TEST(DashUtxoImmatureServing, SelectorThreadsSuppressionIntoTheBuilder) {
+    ImmatureFixture f;
+    dash::coin::EmbeddedWorkInputs e;
+    e.has_state           = true;
+    e.prev_height         = H - 1;
+    e.prev_hash           = f.prev_hash;
+    e.mnstates            = &f.mnstates;
+    e.mempool             = &f.mp;
+    e.bits_for_next       = ImmatureFixture::BITS;
+    e.mtp_at_tip          = ImmatureFixture::MTP;
+    e.address_version     = DASH_PUBKEY_VER;
+    e.address_p2sh_version = DASH_P2SH_VER;
+    e.curtime             = 1'700'000'123u;
+    e.version             = 0x20000000u;
+
+    auto never = []() -> dash::coin::DashWorkData {
+        ADD_FAILURE() << "viable bundle must not reach the dashd fallback";
+        return {};
+    };
+
+    e.suppress_mempool_txs = false;
+    auto sel_normal = dash::coin::select_dash_work(e, never);
+    ASSERT_EQ(sel_normal.source, dash::coin::WorkSource::Embedded);
+    EXPECT_EQ(sel_normal.work.m_txs.size(), 1u);
+
+    e.suppress_mempool_txs = true;
+    auto sel_empty = dash::coin::select_dash_work(e, never);
+    ASSERT_EQ(sel_empty.source, dash::coin::WorkSource::Embedded)
+        << "suppression changes WHAT is served, never WHETHER";
+    EXPECT_TRUE(sel_empty.work.m_txs.empty());
+    EXPECT_EQ(sel_empty.work.m_txset_empty_cause, "utxo-immature-serving");
+    EXPECT_EQ(sel_empty.work.m_coinbase_value,
+              static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)));
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PINNED LOCAL TX (donation-dust consolidation lane). The four gate faces:
+// admissible rides with fee 0 and exact coinbase; a missing/spent input, an
+// immature coinbase input, and a nonzero fee are each EXCLUDED — template
+// byte-identical to a build with no pin at all, never a refused template.
+// ════════════════════════════════════════════════════════════════════════
+
+// Convenience: full positional call up to the trailing pinned seam.
+static dash::coin::DashWorkData build_with_pin(
+    const MnStateMachine& mnstates, const Mempool& mp,
+    const uint256& prev_hash, const MutableTransaction* pin,
+    bool suppress = false) {
+    // The builder now takes a VECTOR of pins (the consolidation had to be
+    // split); these KATs each exercise one, so wrap it.
+    static thread_local std::vector<MutableTransaction> pins;
+    pins.clear();
+    if (pin != nullptr) pins.push_back(*pin);
+    const std::vector<MutableTransaction>* pins_arg = pin ? &pins : nullptr;
+    return build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER,
+        /*curtime=*/1'700'000'100u, /*version=*/0x20000000u,
+        /*underfill=*/nullptr, /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig,
+        /*credit_pool=*/0, /*qc=*/nullptr, /*root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        suppress, "mempool-txs-disabled", pins_arg);
+}
+
+TEST(DashEmbeddedGbt, PinnedLocalTxRidesWithZeroFeeAndExactCoinbase) {
+    UTXOViewCache utxo(nullptr);
+    // Two MATURE coinbase outputs (donation dust shape): height far below
+    // H - 100, spendable at H.
+    uint256 don1 = mint_hash(70), don2 = mint_hash(71);
+    utxo.add_coin(Outpoint(don1, 0), Coin(60'000, {}, H - 5'000, /*cb=*/true));
+    utxo.add_coin(Outpoint(don2, 0), Coin(40'000, {}, H - 4'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // The consolidation: 2 inputs -> 1 output of the EXACT sum (fee 0).
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don1; i.prevout.index = 0; i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxIn i; i.prevout.hash = don2; i.prevout.index = 0; i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    // suppress_mempool_txs=true — the production hotel posture; the pin must
+    // ride the coinbase-only body regardless.
+    auto w = build_with_pin(mnstates, mp, raw256(0xAB), &pin, /*suppress=*/true);
+
+    ASSERT_EQ(w.m_txs.size(), 1u) << "the pinned tx and nothing else";
+    EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(pin));
+    EXPECT_EQ(w.m_tx_fees[0], 0u);
+    // Zero fee => coinbase value is the pure subsidy, bit-exact.
+    EXPECT_EQ(w.m_coinbase_value,
+              static_cast<uint64_t>(compute_dash_block_reward_post_v20(H)));
+    // The wire body carries the pin (submit-time source).
+    ASSERT_EQ(w.m_tx_data_hex.size(), 1u);
+    EXPECT_FALSE(w.m_tx_data_hex[0].empty());
+}
+
+TEST(DashEmbeddedGbt, PinnedLocalTxExcludedFacesLeaveTemplateUntouched) {
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    uint256 prev_hash = raw256(0xAB);
+
+    // Baseline: no pin at all, coinbase-only.
+    UTXOViewCache utxo0(nullptr);
+    Mempool mp0; mp0.set_utxo(&utxo0);
+    auto base = build_with_pin(mnstates, mp0, prev_hash, nullptr, true);
+    ASSERT_EQ(base.m_txs.size(), 0u);
+
+    // Face 1 — input missing entirely (already mined / never existed).
+    {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = mint_hash(80); i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 1'000; pin.vout.push_back(o);
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u) << "missing input must EXCLUDE the pin";
+        EXPECT_EQ(w.m_coinbase_value, base.m_coinbase_value);
+    }
+    // Face 2 — immature coinbase input (donation output younger than 100).
+    {
+        UTXOViewCache utxo(nullptr);
+        uint256 fresh = mint_hash(81);
+        utxo.add_coin(Outpoint(fresh, 0), Coin(5'000, {}, H - 10, /*cb=*/true));
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = fresh; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 5'000; pin.vout.push_back(o);
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u)
+            << "coinbase input at H-10 is immature at H — must EXCLUDE";
+    }
+    // Face 3 — fee not exactly zero (snapshot drift: output != input sum).
+    {
+        UTXOViewCache utxo(nullptr);
+        uint256 old1 = mint_hash(82);
+        utxo.add_coin(Outpoint(old1, 0), Coin(9'000, {}, H - 5'000, /*cb=*/true));
+        Mempool mp; mp.set_utxo(&utxo);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = old1; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 8'000; pin.vout.push_back(o);   // 1000 duffs "fee"
+        auto w = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w.m_txs.size(), 0u)
+            << "nonzero fee breaks this lane's contract — must EXCLUDE";
+    }
+    // Face 4 — the gate self-heals: same pin becomes admissible when its
+    // input appears mature, WITHOUT any state reset between builds.
+    {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp; mp.set_utxo(&utxo);
+        uint256 don = mint_hash(83);
+        MutableTransaction pin;
+        pin.version = 2; pin.type = 0;
+        TxIn i; i.prevout.hash = don; i.prevout.index = 0; pin.vin.push_back(i);
+        TxOut o; o.value = 7'000; pin.vout.push_back(o);
+        auto w1 = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        EXPECT_EQ(w1.m_txs.size(), 0u);
+        utxo.add_coin(Outpoint(don, 0), Coin(7'000, {}, H - 5'000, /*cb=*/true));
+        auto w2 = build_with_pin(mnstates, mp, prev_hash, &pin, true);
+        ASSERT_EQ(w2.m_txs.size(), 1u) << "pin must self-heal into the template";
+        EXPECT_EQ(w2.m_tx_fees[0], 0u);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PIN GATE vs the SERVED-DASHD arm. Both KATs below are red on the code that
+// ran on the production primary on 2026-08-07, which logged
+//     [dashd-splice] pinned tx EXCLUDED h=0 cause=immature-coinbase-input
+// and told the operator nothing true: the height was not the template's, and
+// the template was not the one being served.
+// ════════════════════════════════════════════════════════════════════════
+
+// DEFECT 1 — a zero height marks a MATURE coinbase input immature. The gate is
+// correct; feeding it a height nobody established is what is wrong, so the
+// serve path must judge at a height it OWNS (coin-state tip + 1) and refuse by
+// name when it has none.
+TEST(DashPinGate, ZeroHeightWouldRefuseAMatureCoinbaseInput) {
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(90);
+    // Mined 5000 blocks ago: mature by any reading, 50x the 100-block rule.
+    utxo.add_coin(Outpoint(don, 0), Coin(100'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+
+    const auto at_tip = dash::coin::pin_gate_verdict(pin, mp, mnstates, H);
+    EXPECT_TRUE(at_tip.ok) << "mature at the real height, cause=" << at_tip.cause;
+    EXPECT_EQ(at_tip.at_height, H) << "the verdict must carry the height it judged at";
+
+    const auto at_zero = dash::coin::pin_gate_verdict(pin, mp, mnstates, 0);
+    EXPECT_FALSE(at_zero.ok)
+        << "height 0 must not silently admit — it cannot evaluate maturity";
+    EXPECT_STREQ(at_zero.cause, "immature-coinbase-input")
+        << "and this is exactly the production line: the SAME coin, refused "
+           "only because the height was never established";
+}
+
+// DEFECT 2 — the serve path binds the fallback arm to a no-op returning an
+// EMPTY template (#1134). Splicing into that judged a throwaway while the real
+// served template went unspliced, so the pin could never ride a block no matter
+// what the log said. A placeholder must be left alone.
+TEST(DashPinGate, PlaceholderFallbackIsNeverSpliced) {
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(91);
+    utxo.add_coin(Outpoint(don, 0), Coin(100'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+
+    // NON-VIABLE bundle => the selector takes the fallback arm. The pin is
+    // admissible on the merits, so anything appended here is appended to the
+    // placeholder.
+    dash::coin::EmbeddedWorkInputs e;
+    e.has_state        = false;        // forces the fallback arm
+    e.prev_height      = 0;            // exactly the production shape
+    e.mnstates         = &mnstates;
+    e.mempool          = &mp;
+    std::vector<dash::coin::MutableTransaction> pins{pin};
+    e.pinned_local_txs = &pins;
+
+    auto placeholder = []() -> dash::coin::DashWorkData { return {}; };
+    auto sel = dash::coin::select_dash_work(e, placeholder);
+    ASSERT_EQ(sel.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_TRUE(sel.work.m_txs.empty())
+        << "a placeholder is not a template — the pin must not be spliced into it";
+    EXPECT_TRUE(sel.work.m_tx_data_hex.empty());
+
+    // A REAL fallback (it has a previous block) still splices here, so the
+    // guard discriminates on placeholder-ness, not on the arm.
+    auto real_fb = []() -> dash::coin::DashWorkData {
+        dash::coin::DashWorkData w;
+        w.m_previous_block = raw256(0xAB);
+        w.m_height         = H;
+        return w;
+    };
+    auto sel_real = dash::coin::select_dash_work(e, real_fb);
+    ASSERT_EQ(sel_real.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_EQ(sel_real.work.m_txs.size(), 1u)
+        << "a genuine fallback template still carries the pin";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SIZE — the gate face that did not exist, and the block it cost.
+//
+//   2026-08-07 14:33:45  won block height=2517855 bytes=152889
+//   2026-08-07 14:33:45  submit_block_hex result: "bad-txns-oversize"
+//
+// Height 2517855 went to another miner. The pinned consolidation was 152258
+// bytes (1032 inputs) and EVERY face the gate had — inputs unspent, coinbase
+// maturity, fee exactly zero, no MN-collateral spend — passed it. The tx was
+// admissible by every rule anyone had thought to write, and unmineable by
+// consensus. dashd agreed independently:
+//   testmempoolaccept -> allowed=false reject-reason="bad-txns-oversize"
+//
+// A pin is not worth its own value when it is wrong. It is worth the block.
+// ════════════════════════════════════════════════════════════════════════
+
+// Build a pin with `n` inputs, all mature and unspent, fee exactly zero — so
+// the ONLY thing that can refuse it is size.
+static MutableTransaction make_admissible_pin(UTXOViewCache& utxo, unsigned n,
+                                              unsigned seed_base) {
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    int64_t total = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        uint256 h = mint_hash(seed_base + i);
+        const int64_t v = 1'000 + i;
+        utxo.add_coin(Outpoint(h, 0), Coin(v, {}, H - 5'000, /*cb=*/true));
+        TxIn in; in.prevout.hash = h; in.prevout.index = 0;
+        // A real signed input carries a ~107-byte scriptSig (DER sig +
+        // compressed pubkey). Without it the KAT would measure a shape that
+        // never reaches a block, and the size face would be tested against
+        // fiction.
+        std::vector<unsigned char> sig(107, 0x51);
+        in.scriptSig = OPScript(sig.data(), sig.data() + sig.size());
+        in.sequence = 0xffffffffu;
+        pin.vin.push_back(in);
+        total += v;
+    }
+    TxOut o; o.value = total; pin.vout.push_back(o);   // fee exactly zero
+    return pin;
+}
+
+TEST(DashPinGate, OversizePinIsRefusedByNameNotDiscoveredAtSubmit) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // 1032 inputs — the production shape, byte-for-byte in spirit.
+    auto pin = make_admissible_pin(utxo, 1032, 5'000);
+    const size_t bytes = ::pack(pin).get_span().size();
+    EXPECT_GT(bytes, dash::coin::Mempool::kMaxPinnedTxBytes)
+        << "the KAT must reproduce an OVERSIZE tx or it proves nothing; got "
+        << bytes << " bytes";
+
+    EXPECT_EQ(mp.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::TooLarge)
+        << "an oversize pin must be refused BY NAME at gate time — the "
+           "alternative is discovering it from dashd after the block is gone";
+    EXPECT_STREQ(dash::coin::Mempool::pinned_gate_name(
+                     dash::coin::Mempool::PinnedTxGate::TooLarge),
+                 "tx-too-large");
+}
+
+TEST(DashPinGate, SplitPinUnderTheCapIsAdmissible) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // 258 inputs = the 1032 consolidation split four ways. Same coins, same
+    // zero fee, same maturity — the ONLY change is size.
+    auto pin = make_admissible_pin(utxo, 258, 9'000);
+    const size_t bytes = ::pack(pin).get_span().size();
+    EXPECT_LT(bytes, dash::coin::Mempool::kMaxPinnedTxBytes)
+        << "a quarter-split must fit under the cap; got " << bytes;
+
+    EXPECT_EQ(mp.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::Ok)
+        << "splitting is the fix, so the split must actually pass";
+}
+
+// The size face runs BEFORE the coin lookups. With no UTXO view wired at all,
+// an oversize tx must still be named TooLarge rather than utxo-view-unset:
+// the verdict is certain without consulting any chain state, and reporting the
+// weaker cause would send the operator hunting a view that is not the problem.
+TEST(DashPinGate, OversizeIsNamedEvenWithNoUtxoViewWired) {
+    UTXOViewCache utxo(nullptr);
+    Mempool sizing; sizing.set_utxo(&utxo);
+    auto pin = make_admissible_pin(utxo, 1032, 13'000);
+
+    Mempool bare;   // no view, no external lookup
+    EXPECT_EQ(bare.pinned_tx_admissible(pin, H),
+              dash::coin::Mempool::PinnedTxGate::TooLarge)
+        << "size is decidable without chain state; say so";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// UNIFIED SIZE BUDGET — every component competes for ONE block.
+//
+// Before this, mempool selection was handed the WHOLE cap as if it were alone
+// in the block, and the consensus-required qc set plus any pinned transactions
+// were appended ON TOP. The arithmetic overshoots the 2 MB consensus limit,
+// and an oversize block is INVALID — dashd rejects it bad-blk-length and the
+// height goes to another miner. We lost block 2517855 to the same class of
+// error one level down (a single oversize TRANSACTION); this is the same
+// mistake at block scale.
+//
+// dashd accounts the other way round on purpose (node/miner.cpp): nBlockSize
+// starts at a 1000-byte coinbase reserve, each qcTx GetTotalSize() is added,
+// and packages are fitted into what remains. The component that can be dropped
+// safely — mempool txs, worth only fees — yields to the ones that cannot.
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashSizeBudget, SelectionBudgetShrinksByTheRequiredSet) {
+    // The arithmetic that was wrong. Selection cap 1'990'000 while the pin set
+    // may hold kMaxPinnedTotalBytes (400'000) and the qc plan adds more — the
+    // sum exceeded the 2'000'000 consensus limit with no accounting anywhere.
+    constexpr uint64_t kConsensusBlockLimit = 2'000'000;
+    constexpr uint64_t kOldSelectionCap     = 1'990'000;
+    constexpr uint64_t kPinBudget = dash::coin::Mempool::kMaxPinnedTotalBytes;
+
+    // Worst case under the OLD scheme: selection fills its cap, pins fill
+    // theirs, qc rides on top. Even ignoring qc entirely this is already over.
+    const uint64_t old_worst = kOldSelectionCap + kPinBudget;
+    EXPECT_GT(old_worst, kConsensusBlockLimit)
+        << "the pre-fix arithmetic must actually overshoot, or this KAT is "
+           "asserting nothing: " << old_worst << " vs " << kConsensusBlockLimit;
+
+    // Under the unified budget the deduction is subtraction, so the total is
+    // bounded by construction no matter how the parts are sized.
+    constexpr uint64_t kCoinbaseReserve = 1'000;
+    const uint64_t qc_bytes  = 12'000;   // a fat rotated-boundary qc plan
+    const uint64_t reserved  = kCoinbaseReserve + qc_bytes + kPinBudget;
+    const uint64_t selection = reserved >= kOldSelectionCap
+                                   ? 0 : kOldSelectionCap - reserved;
+    EXPECT_LE(selection + reserved, kConsensusBlockLimit)
+        << "the unified budget must bound the whole block";
+}
+
+TEST(DashSizeBudget, RequiredSetLargerThanCapYieldsZeroNotUnderflow) {
+    // The face that would silently restore the old behaviour: if the required
+    // set exceeds the cap and the remainder is computed as an unsigned
+    // subtraction, it wraps to ~4 GB and selection fills the block again.
+    constexpr uint32_t MAX_BLOCK_BYTES = 1'990'000;
+    const uint64_t reserved = 2'500'000;   // required set alone over the cap
+
+    const uint32_t budget = reserved >= MAX_BLOCK_BYTES
+                                ? 0u
+                                : static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved);
+    EXPECT_EQ(budget, 0u)
+        << "an over-budget required set must starve selection, never wrap";
+
+    // Demonstrate what the unguarded form would have produced, so the guard's
+    // value is visible rather than asserted.
+    const uint32_t unguarded =
+        static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved);
+    EXPECT_GT(unguarded, MAX_BLOCK_BYTES)
+        << "unguarded subtraction wraps — this is the defect being prevented";
+}
+
+TEST(DashSizeBudget, BuilderDeductsPinsFromSelectionBudget) {
+    // End-to-end through the builder: with a pin configured, the template must
+    // not exceed the limit. The pin is admissible on the merits so it really
+    // does ride, and its bytes really do have to come from somewhere.
+    UTXOViewCache utxo(nullptr);
+    uint256 don = mint_hash(120);
+    utxo.add_coin(Outpoint(don, 0), Coin(50'000, {}, H - 5'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don; i.prevout.index = 0;
+      i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 50'000; pin.vout.push_back(o); }
+    std::vector<MutableTransaction> pins{pin};
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER,
+        /*curtime=*/1'700'000'100u, /*version=*/0x20000000u,
+        /*underfill=*/nullptr, /*sml=*/nullptr, /*qmgr=*/nullptr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig,
+        /*credit_pool=*/0, /*qc=*/nullptr, /*root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress=*/true, "mempool-txs-disabled", &pins);
+
+    ASSERT_EQ(w.m_txs.size(), 1u) << "the pin rides";
+    uint64_t body = 0;
+    for (const auto& h : w.m_tx_data_hex) body += h.size() / 2;
+    EXPECT_LT(body, 2'000'000u)
+        << "template body must stay under the consensus block limit";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// F1 — BLOCK-LEVEL SIZE BUDGET ON THE SERVED-DASHD FALLBACK ARM
+//
+// #1177 unified the size budget on the EMBEDDED arm: the consensus-required
+// set is measured BEFORE mempool selection and deducted, with an explicit
+// zero floor. The FALLBACK arm never got that discipline. It spliced up to
+// kMaxPinnedTotalBytes (400000) of pins onto dashd's OWN template with NO
+// block-level accounting — the only cap was pins-vs-400000, never
+// pins-vs-what-the-template-already-holds.
+//
+// dashd fills its template to its own blockmaxsize (node/miner.cpp:212
+// clamps to MaxBlockSize()-1000; policy/policy.h:23 DEFAULT_BLOCK_MAX_SIZE
+// is 2000000). Near that ceiling, +400 KB of pins reproduces EXACTLY the
+// bad-blk-length overshoot that cost block 2517855 — on the arm we describe
+// as the always-reachable safety path. And this arm carries pins in
+// production: block 2518186 was won on arm=dashd-fallback carrying 154 KB of
+// pinned donation.
+//
+// The ORDER is dashd's, deliberately (node/miner.cpp): coinbase reserve
+// (miner.cpp:115, nBlockSize = 1000) and the consensus-required set
+// (miner.cpp:235) may not be dropped; mempool selection is fitted into what
+// is left (miner.cpp:361). On the served-dashd arm all three have already
+// happened INSIDE dashd and arrive as a finished template, so the only
+// component left that may yield is the pin set — and it yields by being
+// REFUSED WITH A NAME, never silently.
+// ════════════════════════════════════════════════════════════════════════
+
+// A dashd template whose BODY is `body_bytes` on the wire. Only the raw hex
+// matters here: template_body_bytes() and serialize_full_block() both read
+// m_tx_data_hex, and those ARE the bytes that go on the wire
+// (block_producer.hpp:220).
+static DashWorkData dashd_template_with_body(uint64_t body_bytes) {
+    DashWorkData fb;
+    fb.m_height = H;
+    fb.m_tx_data_hex.push_back(std::string(body_bytes * 2, '0'));
+    return fb;
+}
+
+static std::vector<dash::coin::PinVerdict> all_ok_verdicts(size_t n) {
+    std::vector<dash::coin::PinVerdict> v(n);
+    for (auto& e : v) { e.ok = true; e.at_height = H; }
+    return v;
+}
+
+// The bytes the ASSEMBLED block would occupy: the same three terms
+// pin_headroom_bytes() budgets against, so the two cannot disagree.
+static uint64_t assembled_block_bytes(const DashWorkData& w) {
+    return dash::coin::kBlockOverheadBytes
+         + dash::coin::kCoinbaseReserveBytes
+         + dash::coin::template_body_bytes(w);
+}
+
+// ── THE RED ONE ─────────────────────────────────────────────────────────
+// A dashd template near blockmaxsize, spliced with a pin that is admissible
+// on every OTHER axis (inside kMaxPinnedTxBytes, inside kMaxPinnedTotalBytes,
+// gate verdict ok). The block-level budget is the ONLY thing that can refuse
+// it. It must be refused, and the refusal must be NAMED.
+TEST(DashFallbackPinBudget, PinOverBlockHeadroomIsRefusedByName) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 21'000);
+    const uint64_t pin_bytes = ::pack(pin).get_span().size();
+
+    // The pin must be inside EVERY pre-existing cap, or one of them would
+    // have refused it and this KAT would be proving someone else's guard.
+    ASSERT_LT(pin_bytes, Mempool::kMaxPinnedTxBytes)
+        << "pin must pass the per-tx size face; got " << pin_bytes;
+    ASSERT_LT(pin_bytes, Mempool::kMaxPinnedTotalBytes)
+        << "pin must pass the cumulative pin cap; got " << pin_bytes;
+
+    auto fb = dashd_template_with_body(1'950'000);
+    std::vector<MutableTransaction> pins{pin};
+
+    const uint64_t headroom = dash::coin::pin_headroom_bytes(fb);
+    ASSERT_LT(headroom, pin_bytes)
+        << "the fixture must actually leave too little room (" << headroom
+        << " for a " << pin_bytes << "-byte pin) or nothing is being tested";
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 0u) << "the pin must NOT ride a full template";
+    ASSERT_EQ(rep.causes.size(), 1u);
+    EXPECT_STREQ(rep.causes[0], "pin-over-block-headroom")
+        << "a refusal the operator cannot name is a silent drop";
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes)
+        << "the served block must stay inside the consensus limit; got "
+        << assembled_block_bytes(fb);
+}
+
+// The DEFECT, demonstrated rather than asserted around: with the budget off
+// (today's shipped arithmetic) the identical splice produces an OVERSIZE
+// block. If this ever stops overshooting, the fix above is guarding nothing
+// and this KAT says so by failing.
+TEST(DashFallbackPinBudget, WithoutTheBudgetTheSpliceGoesOversize) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 31'000);
+    auto fb = dashd_template_with_body(1'950'000);
+    std::vector<MutableTransaction> pins{pin};
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/false);
+
+    EXPECT_EQ(rep.included, 1u)
+        << "flag OFF must be byte-for-byte the shipped behaviour: the pin "
+           "rides, cap-checked only against " << Mempool::kMaxPinnedTotalBytes;
+    EXPECT_GT(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes)
+        << "the pre-fix arithmetic must ACTUALLY overshoot the 2 MB consensus "
+           "limit, or there is no defect here to fix; got "
+        << assembled_block_bytes(fb);
+}
+
+// The normal case must be untouched: a small dashd template with the budget
+// ON still carries the pin. A guard that refuses everything is not a guard.
+TEST(DashFallbackPinBudget, RoomyTemplateStillCarriesThePinWithBudgetOn) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 600, 41'000);
+    auto fb = dashd_template_with_body(120'000);   // a typical live body
+    std::vector<MutableTransaction> pins{pin};
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 1u) << "a pin that fits must still ride";
+    EXPECT_STREQ(rep.causes[0], "");
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes);
+}
+
+// Earlier pins keep their places. The donation had to be SPLIT into four
+// transactions; a partial fit must land what fits rather than refuse the set.
+TEST(DashFallbackPinBudget, EarlierPinsKeepTheirPlacesWhenALaterOneOverflows) {
+    UTXOViewCache utxo(nullptr);
+    auto small = make_admissible_pin(utxo, 60,  51'000);   // ~9 KB
+    auto big   = make_admissible_pin(utxo, 600, 52'000);   // ~89 KB
+    const uint64_t small_bytes = ::pack(small).get_span().size();
+
+    // Room for the small pin and not the big one.
+    auto fb = dashd_template_with_body(1'950'000);
+    const uint64_t headroom = dash::coin::pin_headroom_bytes(fb);
+    ASSERT_GT(headroom, small_bytes);
+    ASSERT_LT(headroom, ::pack(big).get_span().size());
+
+    std::vector<MutableTransaction> pins{small, big};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(2), "dashd-splice",
+        /*enforce_block_budget=*/true);
+
+    EXPECT_EQ(rep.included, 1u);
+    EXPECT_STREQ(rep.causes[0], "") << "the pin that fits must ride";
+    EXPECT_STREQ(rep.causes[1], "pin-over-block-headroom");
+    EXPECT_LE(assembled_block_bytes(fb), dash::coin::kDashMaxBlockBytes);
+}
+
+// The underflow face — the one that would SILENTLY restore the old
+// behaviour. An over-cap template must starve the pin set, never wrap to a
+// budget of ~18 EB. Demonstrated against the unguarded form so the guard's
+// value is visible rather than asserted.
+TEST(DashFallbackPinBudget, OverCapTemplateYieldsZeroHeadroomNotAWrap) {
+    auto fb = dashd_template_with_body(2'500'000);   // already over the limit
+    EXPECT_EQ(dash::coin::pin_headroom_bytes(fb), 0u)
+        << "an over-cap template must leave NO room for pins";
+
+    const uint64_t occupied = assembled_block_bytes(fb);
+    const uint64_t unguarded = dash::coin::kDashMaxBlockBytes - occupied;
+    EXPECT_GT(unguarded, dash::coin::kDashMaxBlockBytes)
+        << "unguarded subtraction wraps — this is the defect being prevented";
+
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 61'000);
+    std::vector<MutableTransaction> pins{pin};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice",
+        /*enforce_block_budget=*/true);
+    EXPECT_EQ(rep.included, 0u);
+    EXPECT_STREQ(rep.causes[0], "pin-over-block-headroom");
+}
+
+// The budget may only ever SHRINK the pin allowance, never raise it. An empty
+// template has ~2 MB free, but the pin policy cap still governs.
+TEST(DashFallbackPinBudget, HeadroomNeverExceedsThePinPolicyCap) {
+    DashWorkData empty;
+    EXPECT_EQ(dash::coin::pin_headroom_bytes(empty),
+              Mempool::kMaxPinnedTotalBytes)
+        << "the block budget must never RAISE the pin allowance";
+}
+
+// The two refusals stay distinguishable. "pin-total-too-large" is a property
+// of the pin SET; "pin-over-block-headroom" is a property of the TEMPLATE the
+// pin happened to meet. Neither is "tx-too-large", which blames the
+// transaction for something that is not its fault — and a cause name is the
+// operator's only handle on a refusal.
+TEST(DashFallbackPinBudget, TheTwoRefusalsAreNamedApart) {
+    // Over the pin-set cap, with all the block room in the world.
+    EXPECT_STREQ(dash::coin::pin_budget_refusal(
+                     /*spliced=*/Mempool::kMaxPinnedTotalBytes - 10,
+                     /*pin=*/100, Mempool::kMaxPinnedTotalBytes,
+                     /*headroom=*/1'000'000),
+                 "pin-total-too-large");
+    // Inside the pin-set cap, but the template has no room.
+    EXPECT_STREQ(dash::coin::pin_budget_refusal(
+                     /*spliced=*/0, /*pin=*/50'000,
+                     Mempool::kMaxPinnedTotalBytes, /*headroom=*/1'000),
+                 "pin-over-block-headroom");
+    // Fits both.
+    EXPECT_EQ(dash::coin::pin_budget_refusal(
+                  0, 1'000, Mempool::kMaxPinnedTotalBytes, 400'000),
+              nullptr);
+}
+
+// The occupancy figure is the SERVED one, not a re-derivation: it is read
+// from the same m_tx_data_hex that serialize_full_block() emits verbatim
+// (block_producer.hpp:220). A pin that is appended must be counted.
+TEST(DashFallbackPinBudget, BodyBytesTrackWhatIsActuallyAppended) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 71'000);
+    const uint64_t pin_bytes = ::pack(pin).get_span().size();
+
+    auto fb = dashd_template_with_body(100'000);
+    const uint64_t before = dash::coin::template_body_bytes(fb);
+    EXPECT_EQ(before, 100'000u);
+
+    std::vector<MutableTransaction> pins{pin};
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, all_ok_verdicts(1), "dashd-splice", true);
+    ASSERT_EQ(rep.included, 1u);
+    EXPECT_EQ(dash::coin::template_body_bytes(fb), before + pin_bytes)
+        << "the budget must measure the bytes that actually go on the wire";
+    EXPECT_EQ(rep.spliced_bytes, pin_bytes);
+}
+
+// A gate refusal still reports the GATE's cause, not a size cause — the
+// verdicts arrive already decided (the served-dashd arm cannot run the gate
+// where it appends, #1134) and the splice must not overwrite them.
+TEST(DashFallbackPinBudget, GateRefusalKeepsItsOwnCause) {
+    UTXOViewCache utxo(nullptr);
+    auto pin = make_admissible_pin(utxo, 60, 81'000);
+    auto fb = dashd_template_with_body(1'999'000);   // no room at all
+
+    std::vector<MutableTransaction> pins{pin};
+    std::vector<dash::coin::PinVerdict> verdicts(1);
+    verdicts[0].ok = false;
+    verdicts[0].cause = "input-missing-or-spent";
+    verdicts[0].at_height = H;
+
+    auto rep = dash::coin::splice_verdicted_pins(
+        fb, pins, verdicts, "dashd-splice", /*enforce_block_budget=*/true);
+    EXPECT_EQ(rep.included, 0u);
+    EXPECT_STREQ(rep.causes[0], "input-missing-or-spent")
+        << "the size budget must not relabel a gate refusal";
+}

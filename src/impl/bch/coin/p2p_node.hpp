@@ -1,0 +1,1318 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+// ---------------------------------------------------------------------------
+// bch::coin::p2p::NodeP2P (M3 slice 12) -- ported from
+// src/impl/btc/coin/p2p_node.hpp. Drives the embedded BCHN peer connection:
+// handshake, header/block sync, inv relay, BIP 152 compact blocks, and the
+// BIP 35/130/133 niceties.
+//
+// >>> BCH DIVERGENCES from the BTC source <<<
+//  * NO SegWit: service flags advertise NODE_NETWORK | NODE_BITCOIN_CASH
+//    (NOT NODE_WITNESS). inv requests use plain MSG_TX (1) / MSG_BLOCK (2),
+//    never the witness-flagged variants, and there is NO MSG_WTX path.
+//  * NO BIP 339 wtxidrelay: BCH has no wtxid (wtxid == txid), so the
+//    wtxidrelay negotiation message and handler are dropped entirely
+//    (see p2p_messages.hpp -- it is absent from the Handler variant too).
+//  * Compact blocks negotiate version 1: short IDs are keyed on txid, not
+//    witness-txid (compact_blocks.hpp computes them via compute_txid()).
+//  * NO AuxPoW: BCH is a standalone parent (never merged-mined), so the
+//    DOGE raw_headers_parser / raw_block_parser hooks are removed -- BCH
+//    headers/blocks are the standard SHA256d serialization.
+//  * doublespendproof (DSPROOF, 0x94a0) inv is recognized but not requested.
+//
+// >>> BLOCK-ARRIVAL EMIT CONFORMANCE (vs frstrtr/p2poolBCH @6603b79) <<<
+// The Python baseline delivers block arrivals through exactly two events in
+// p2pool/bitcoin/p2p.py:
+//   - handle_inv  -> factory.new_block.happened(inv['hash'])  (announcement)
+//   - handle_block -> get_block.got_response(hash, block)  (full block,
+//     matched to an explicit get_block ReplyMatcher request; single path,
+//     no broadcast event, no compact-block handling at all).
+// We mirror both: new_block.happened(hash) on the block inv, and the direct
+// `block` handler calls m_peer->get_block(hash, block) (the same ReplyMatcher
+// surface) before firing full_block. The two compact-block delivery paths
+// (cmpctblock-complete and cmpctblock+blocktxn) have NO Python analog -- they
+// are strictly additive embedded-daemon coverage that funnels reconstructed
+// blocks into the same full_block sink. full_block itself is internal ABLA /
+// mempool plumbing with zero p2pool-merged-v36 surface (Python reads block
+// size from the daemon, not from a broadcast event). Emit-completeness across
+// all three delivery paths therefore conforms to the baseline and is additive.
+//
+// This class is templated on ConfigType and touches the per-coin config only
+// through `m_config->coin()->m_p2p.prefix`. It carries NO concrete dependency
+// on bch's config.hpp -- the config binding is deferred to the
+// NodeP2P<config_t> instantiation in node.hpp (slice 13).
+// ---------------------------------------------------------------------------
+
+#include "p2p_messages.hpp"
+#include "p2p_connection.hpp"
+#include "node_interface.hpp"
+#include "compact_blocks.hpp"
+#include "mempool.hpp"
+#include "merkle.hpp"
+#include "header_sync.hpp"
+#include "block_download.hpp"
+#include "idle_watchdog.hpp"
+
+#include <memory>
+#include <optional>
+#include <functional>
+
+#include <boost/asio.hpp>
+
+#include <core/config.hpp>
+#include <core/log.hpp>
+#include <core/random.hpp>
+#include <core/factory.hpp>
+#include <core/reply_matcher.hpp>
+#include <core/timer.hpp>
+
+namespace io = boost::asio;
+
+#define ADD_P2P_HANDLER(name)\
+    void handle(std::unique_ptr<bch::coin::p2p::message_##name> msg)
+namespace bch
+{
+namespace coin
+{
+
+namespace p2p
+{
+
+std::string parse_net_error(const boost::system::error_code& ec);
+
+//-core::ICommmunicator:
+// void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
+// void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
+// void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) = 0;
+// const std::vector<std::byte>& get_prefix() const = 0;
+//
+//-core::INetwork:
+// void connected(std::shared_ptr<core::Socket> socket) = 0;
+// void disconnect() = 0;
+
+template <typename ConfigType>
+class NodeP2P : public core::ICommunicator, public core::INetwork, public core::Factory<core::Client>
+{
+    using config_t = ConfigType;
+
+private:
+    static constexpr time_t CONNECT_TIMEOUT_SEC = 10;
+    static constexpr time_t IDLE_TIMEOUT_SEC = 100;
+    static constexpr time_t PING_INTERVAL_SEC = 30;
+    // Headers-first block-download stall recovery. Every BLOCK_DL_EXPIRE_TICK_SEC
+    // the in-flight getdata(MSG_BLOCK) window is scanned; any request outstanding
+    // >= BLOCK_DL_TIMEOUT_SEC is presumed dropped by a stalling peer, requeued, and
+    // re-issued from the freed slot. Tick << timeout so a stall is caught within one
+    // cadence of the deadline without churning the window. See block_download.hpp.
+    static constexpr time_t BLOCK_DL_EXPIRE_TICK_SEC = 5;
+    static constexpr time_t BLOCK_DL_TIMEOUT_SEC = 60;
+
+    bch::interfaces::Node* m_coin;
+    io::io_context* m_context;
+    config_t* m_config;
+    p2p::Handler m_handler;
+
+    std::unique_ptr<Connection> m_peer;
+    std::unique_ptr<core::Timer> m_reconnect_timer;
+    std::unique_ptr<core::Timer> m_ping_timer;
+    std::unique_ptr<core::Timer> m_timeout_timer;
+    std::unique_ptr<core::Timer> m_block_dl_timer;
+    NetService m_target_addr;
+    bool m_reconnect_enabled = false;
+    bool m_handshake_complete = false;
+    std::string m_chain_label = "CoinP2P";
+    // BIP 152 compact block state
+    bool m_peer_supports_cmpct{false};
+    uint64_t m_peer_cmpct_version{0};
+    bool m_peer_wants_cmpct_announce{false};
+    // Peer metadata from version message
+    uint64_t m_peer_services{0};
+    uint32_t m_peer_version{0};          // protocol version (e.g. 70016)
+    std::string m_peer_subver;           // user agent (e.g. "/Bitcoin Cash Node:27.1.0/")
+    uint32_t m_peer_start_height{0};     // chain height at connect time
+    std::chrono::steady_clock::time_point m_connected_at{std::chrono::steady_clock::now()};
+    // BIP 35: request full mempool inventory after handshake
+    bool m_request_mempool_on_connect{false};
+    // Embedded header-sync self-start: when set, the handshake completion
+    // (verack) self-issues the initial getheaders using the HeaderChain
+    // back-off locator, so the embedded P2P node drives IBD without an
+    // external getheaders kick. Off by default: tests that drive header sync
+    // manually (and the BCHN-RPC fallback path) keep the prior behaviour.
+    bool m_auto_getheaders_on_handshake{false};
+    // Compact block reconstruction state: pending compact block awaiting blocktxn
+    std::unique_ptr<CompactBlock> m_pending_cmpct;
+    std::vector<uint32_t> m_pending_missing_indexes;
+    // Last compact block we SENT — cached to serve getblocktxn requests
+    BlockType m_sent_cmpct_block;
+    uint256   m_sent_cmpct_hash;
+    // External mempool for compact block tx matching
+    Mempool* m_mempool{nullptr};
+    // Headers-first windowed block download (cold-start IBD). Bounds outstanding
+    // getdata(MSG_BLOCK) so the synced header stream is pulled as block bodies at
+    // the peer's pace instead of stalling after header sync. See block_download.hpp.
+    block_download::BlockDownloadWindow m_block_dl;
+    // Progress-gated block-download stall watchdog baseline: monotonic-since-
+    // connect tick of the last ACCEPTED block body. DISARMED (0) while at tip
+    // or before download begins. See idle_watchdog.hpp.
+    uint64_t m_last_progress_tick{idle_watchdog::DISARMED};
+
+    // Callbacks for broadcaster integration
+    using AddrCallback = std::function<void(const std::vector<NetService>&)>;
+    AddrCallback m_addr_callback;
+    using PeerHeightCallback = std::function<void(uint32_t)>;
+    PeerHeightCallback m_on_peer_height;
+    // Robust getheaders locator provider (exponential back-off over the
+    // authoritative HeaderChain). When set, IBD continuation re-issues
+    // getheaders with this multi-hash locator so the peer can always find a
+    // common ancestor even if our latest header sits on a minority fork. When
+    // unset we fall back to a single-hash locator anchored at the last header
+    // (degraded -- may stall if the peer cannot anchor that lone hash). Pure
+    // SPV wire-sync; no PoW/share/coinbase/PPLNS surface.
+    using LocatorProvider = std::function<std::vector<uint256>()>;
+    LocatorProvider m_locator_provider;
+
+    // Discovery tail-walk hook. When set (by the SeedTier-discovered path), the
+    // reconnect tick consults it to ROTATE m_target_addr to the next resolved
+    // candidate on peer loss instead of re-dialing the dead front forever. Unset
+    // on the explicit-configured-peer path, so that path re-dials its single
+    // address bit-for-bit as before. Returns nullopt to leave m_target_addr
+    // unchanged (e.g. empty walk). Pure transport wiring; no share/PoW surface.
+    using NextTargetProvider = std::function<std::optional<NetService>()>;
+    NextTargetProvider m_next_target_provider;
+
+    // Peer-connected (recovery) hook. When set (by the SeedTier-discovered path),
+    // connected() invokes it so the owner can reset its emergency re-arm backoff
+    // (spec section 2.3 recovery: a live peer zeroes the attempt counter). Unset
+    // on the explicit-peer / RPC-only default, which has no emergency ladder.
+    // Pure transport wiring; no share/PoW/handshake surface change.
+    using PeerConnectedCallback = std::function<void()>;
+    PeerConnectedCallback m_peer_connected_cb;
+
+public:
+    NodeP2P(io::io_context* context, bch::interfaces::Node* coin, config_t* config,
+            const std::string& chain_label = "CoinP2P")
+        : core::Factory<core::Client>(context, this, chain_label)
+        , m_context(context), m_coin(coin), m_config(config)
+        , m_chain_label(chain_label)
+    {
+    }
+
+    /// Connect with automatic reconnection on failure/disconnect (30s interval).
+    void connect(NetService addr)
+    {
+        m_target_addr = addr;
+        m_reconnect_enabled = true;
+        core::Factory<core::Client>::connect(addr);
+
+        // Periodic reconnect check: if m_peer is null, try again
+        m_reconnect_timer = std::make_unique<core::Timer>(m_context, true);
+        m_reconnect_timer->start(30, [this]() {
+            if (!m_peer && m_reconnect_enabled) {
+                // Discovery tail-walk: on peer loss rotate m_target_addr to the
+                // NEXT resolved candidate (SeedTier walk) instead of re-dialing
+                // the dead front forever. Unset on the explicit-peer path, so
+                // that path re-dials its single configured address as before.
+                if (m_next_target_provider) {
+                    if (auto nxt = m_next_target_provider())
+                        m_target_addr = *nxt;
+                }
+                LOG_INFO << "" << "[" << m_chain_label << "] Reconnecting to " << m_target_addr.to_string() << "...";
+                core::Factory<core::Client>::connect(m_target_addr);
+            }
+        });
+    }
+
+    /// Install the discovery tail-walk provider. Consulted on each reconnect
+    /// tick (peer loss) to rotate the dial target across the resolved candidate
+    /// ladder. No-op for the explicit-peer path (never set there).
+    void set_next_target_provider(NextTargetProvider p)
+    { m_next_target_provider = std::move(p); }
+
+    /// Install the peer-connected (recovery) callback. Invoked from connected()
+    /// once a peer socket is established, so the discovered path can reset its
+    /// emergency re-arm backoff. No-op for the explicit-peer path (never set).
+    void set_peer_connected_callback(PeerConnectedCallback cb)
+    { m_peer_connected_cb = std::move(cb); }
+
+    // INetwork
+    void connected(std::shared_ptr<core::Socket> socket) override
+    {
+        m_peer = std::make_unique<Connection>(m_context, socket);
+        m_handshake_complete = false;
+        LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
+
+        // Recovery signal (spec 2.3): a live peer resets the owner's emergency
+        // re-arm backoff so the NEXT starvation escalates from base, not the
+        // ceiling. No-op on the explicit-peer path (callback never installed).
+        if (m_peer_connected_cb)
+            m_peer_connected_cb();
+
+        // Require version/verack progress soon after connect.
+        ensure_timeout_timer();
+        m_timeout_timer->start(CONNECT_TIMEOUT_SEC, [this]() {
+            timeout("handshake timeout");
+        });
+
+        // BCH service flags + protocol version:
+        // BCH (BCHN) advertises NODE_NETWORK | NODE_BITCOIN_CASH. There is NO
+        // NODE_WITNESS — BCH never adopted SegWit, so no witness-bearing inv
+        // types and no BIP 339 wtxidrelay negotiation. NODE_BITCOIN_CASH
+        // (1<<5) is the network-membership bit BCH peers require to peer.
+        static constexpr uint64_t NODE_NETWORK = 1;
+        static constexpr uint64_t NODE_BITCOIN_CASH = (1 << 5);
+        uint64_t our_services = NODE_NETWORK | NODE_BITCOIN_CASH;
+        uint32_t protocol_version = 70016;
+
+        auto msg_version = message_version::make_raw(
+            protocol_version,
+            our_services,
+            core::timestamp(),
+            addr_t{our_services, m_peer->get_addr()},
+            addr_t{our_services, NetService{"192.168.0.1", 8333}},
+            core::random::random_nonce(),
+            "c2pool-bch",
+            0
+        );
+
+        m_peer->write(msg_version);
+    }
+
+    void disconnect() override
+    {
+        stop_ping_timer();
+        stop_timeout_timer();
+        stop_block_dl_timer();
+        m_handshake_complete = false;
+        m_peer.reset();
+    }
+
+    /// Send a getheaders request to the connected peer.
+    /// @param version  Protocol version (typically 70015 or 70017).
+    /// @param locator  Block locator hashes (tip-to-genesis order).
+    /// @param stop     Stop hash (uint256::ZERO to request up to tip).
+    void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
+    {
+        if (!m_peer) return;
+        // Suppress per-request logging — Header sync progress indicator
+        // in add_headers() provides the meaningful status update.
+        auto msg = message_getheaders::make_raw(version, locator, stop);
+        m_peer->write(msg);
+    }
+
+    /// Whether the handshake with the peer is complete.
+    bool is_handshake_complete() const { return m_handshake_complete; }
+
+    /// Send BIP 35 mempool request — ask peer to announce all mempool txs via inv.
+    void send_mempool() {
+        if (!m_peer) return;
+        auto msg = message_mempool::make_raw();
+        m_peer->write(msg);
+    }
+
+    /// Send BIP 133 feefilter — advise peer of minimum feerate we accept (sat/kB).
+    /// Pass 0 to request all transactions (no filtering).
+    void send_feefilter(uint64_t min_feerate_sat_per_kb = 0) {
+        if (!m_peer) return;
+        auto msg = message_feefilter::make_raw(min_feerate_sat_per_kb);
+        m_peer->write(msg);
+    }
+
+    // ICommmunicator
+    void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
+    {
+        // Copy — the NetService reference may dangle if the socket is already freed
+        NetService svc_copy = service;
+        LOG_WARNING << "[" << m_chain_label << "] Peer " << svc_copy.to_string()
+                    << " disconnected: " << err;
+        if (m_peer)
+        {
+            m_peer.reset();
+        }
+        // else: already disconnected (double-fire race) — safe to ignore
+
+        stop_ping_timer();
+        stop_timeout_timer();
+        stop_block_dl_timer();
+        m_handshake_complete = false;
+    }
+
+    void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override
+    {
+        error(parse_net_error(ec), service, where);
+    }
+
+    void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
+    {
+        on_activity();
+
+        p2p::Handler::result_t result;
+        try
+        {
+            result = m_handler.parse(rmsg);
+        } catch (const std::runtime_error& ec)
+        {
+            LOG_ERROR << "NodeP2P handle(" << rmsg->m_command << ", "
+                      << rmsg->m_data.size() << " bytes): " << ec.what();
+            // todo: error
+            return;
+        } catch (const std::out_of_range& ec)
+        {
+            LOG_ERROR << "NodeP2P: " << ec.what();
+            return;
+        }
+
+        std::visit([&](auto& msg){ handle(std::move(msg)); }, result);
+    }
+
+    const std::vector<std::byte>& get_prefix() const override
+    {
+        return m_config->coin()->m_p2p.prefix;
+    }
+
+    void submit_block(BlockType& block)
+    {
+        if (m_peer)
+        {
+            auto rmsg = bch::coin::p2p::message_block::make_raw(block, {});
+            m_peer->write(rmsg);
+        } else
+        {
+            LOG_ERROR << "No BCHN connection when block submittal attempted!";
+            throw std::runtime_error("No BCHN connection in submit_block");
+        }
+    }
+
+    /// Set callback for received addr messages (peer discovery).
+    void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
+    /// Set callback for peer's reported chain height (from version message).
+    void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
+    /// Set provider for the robust IBD getheaders locator (HeaderChain
+    /// exponential back-off). Without it, ContinueSync falls back to a
+    /// single-hash locator anchored at the last learned header.
+    void set_locator_provider(LocatorProvider cb) { m_locator_provider = std::move(cb); }
+
+    /// Send getaddr to request peer addresses.
+    void send_getaddr()
+    {
+        if (m_peer) {
+            auto msg = message_getaddr::make_raw();
+            m_peer->write(msg);
+        }
+    }
+
+    /// Send inv for a block hash (chain relay — announcement only).
+    void send_block_inv(const uint256& block_hash)
+    {
+        if (m_peer) {
+            auto msg = message_inv::make_raw({inventory_type(inventory_type::block, block_hash)});
+            m_peer->write(msg);
+        }
+    }
+
+    /// Request a full block via getdata.
+    /// BCH: plain MSG_BLOCK (0x02) — there is no witness-bearing block inv,
+    /// so this is identical to request_block(). The method is kept distinct to
+    /// preserve the call surface inherited from the BTC reference.
+    void request_full_block(const uint256& block_hash)
+    {
+        if (m_peer) {
+            auto msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, block_hash)});
+            m_peer->write(msg);
+        }
+    }
+
+    /// Re-request a batch of block bodies through the bounded, deduping,
+    /// reissue-accounted download window -- the wiring target for
+    /// BlockConnector::set_block_requester (deep-reorg re-request recovery).
+    /// Routed through m_block_dl (NOT request_full_block) so re-getdata'd bodies
+    /// stay under the same in-flight bound + timeout/eviction accounting as IBD;
+    /// the window dedupes against anything already requested. No-op offline
+    /// (drain_block_window is a no-op without a peer) -- safe to call before P2P.
+    void request_block_downloads(const std::vector<uint256>& hashes)
+    {
+        if (hashes.empty()) return;
+        m_block_dl.enqueue(hashes);
+        drain_block_window();
+    }
+
+    /// Request a block via plain MSG_BLOCK (0x02) getdata.
+    void request_block(const uint256& block_hash)
+    {
+        if (m_peer) {
+            auto msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, block_hash)});
+            m_peer->write(msg);
+        }
+    }
+
+    /// Drain the IBD block-download window: issue getdata(MSG_BLOCK) for every
+    /// hash the window releases (bounded by MAX_BLOCKS_IN_FLIGHT). Called after
+    /// enqueuing a synced headers batch and again on each block arrival to top
+    /// the window back up. No-op when the window is full or the queue is empty.
+    void drain_block_window()
+    {
+        if (!m_peer) return;
+        for (const auto& bhash : m_block_dl.next_requests(now_tick_sec())) {
+            auto getdata_msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, bhash)});
+            m_peer->write(getdata_msg);
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] IBD getdata block "
+                            << bhash.GetHex().substr(0, 16) << "... (in flight "
+                            << m_block_dl.in_flight() << ", queued "
+                            << m_block_dl.queued() << ")";
+        }
+    }
+
+    /// Whether this peer supports compact blocks (BIP 152).
+    bool supports_compact_blocks() const { return m_peer_supports_cmpct; }
+    /// Peer's service flags from version message (for NODE_BLOOM check etc.)
+    uint64_t peer_services() const { return m_peer_services; }
+    /// Check if peer supports NODE_BLOOM (required for BIP 35 mempool).
+    bool peer_has_bloom() const { return (m_peer_services & 4) != 0; }
+
+    /// Peer metadata accessors
+    uint32_t peer_version() const { return m_peer_version; }
+    const std::string& peer_subver() const { return m_peer_subver; }
+    uint32_t peer_start_height() const { return m_peer_start_height; }
+
+    /// Read-only IBD block-download evidence (M5 --ibd run-loop). reissue =
+    /// stalled in-flight requests re-issued; false_evict = evicted requests
+    /// whose block arrived anyway (premature timeout). Both 0 on a clean sync.
+    std::size_t ibd_reissue_count() const { return m_block_dl.reissue_count(); }
+    std::size_t ibd_false_evict_count() const { return m_block_dl.false_evict_count(); }
+    std::size_t ibd_in_flight() const { return m_block_dl.in_flight(); }
+    std::size_t ibd_queued() const { return m_block_dl.queued(); }
+    int64_t peer_uptime_sec() const {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - m_connected_at).count();
+    }
+    const std::string& chain_label() const { return m_chain_label; }
+
+    /// Set mempool reference for compact block reconstruction.
+    void set_mempool(Mempool* mp) { m_mempool = mp; }
+
+    /// Enable BIP 35 mempool request after handshake.
+    /// Call after UTXO is initialized so incoming txs can have fees computed.
+    void enable_mempool_request() { m_request_mempool_on_connect = true; }
+
+    /// Enable embedded header-sync self-start: the handshake-complete (verack)
+    /// path self-issues the initial getheaders from the HeaderChain back-off
+    /// locator. Requires a locator provider (set_locator_provider) for a
+    /// well-anchored kick; without one it falls back to an empty locator
+    /// (peer serves from its best header). Idempotent.
+    void enable_auto_getheaders() { m_auto_getheaders_on_handshake = true; }
+
+    /// Relay a pre-serialized block via P2P.
+    /// Uses compact block format (BIP 152 v1) for peers that support it,
+    /// falling back to full block otherwise.
+    void submit_block_raw(const std::vector<unsigned char>& block_bytes)
+    {
+        if (!m_peer) return;
+
+        // BCH negotiates compact block version 1 (txid short IDs); v2's
+        // witness-txid keying never applies. Accept any peer advertising >= 1.
+        if (m_peer_supports_cmpct && m_peer_cmpct_version >= 1) {
+            // Deserialize the block to build a compact representation
+            try {
+                PackStream ps(block_bytes);
+                BlockType block;
+                ps >> block;
+                auto cb = BuildCompactBlock(
+                    static_cast<BlockHeaderType&>(block), block.m_txs);
+                auto rmsg = message_cmpctblock::make_raw(cb);
+                m_peer->write(rmsg);
+
+                auto packed_hdr = pack(static_cast<BlockHeaderType&>(block));
+                auto blockhash = Hash(packed_hdr.get_span());
+
+                // Cache the full block so we can serve getblocktxn requests.
+                m_sent_cmpct_block = std::move(block);
+                m_sent_cmpct_hash  = blockhash;
+
+                LOG_INFO << "[" << m_chain_label << "] Sent compact block "
+                         << blockhash.GetHex()
+                         << " (" << cb.short_ids.size() << " short IDs, "
+                         << cb.prefilled_txns.size() << " prefilled)";
+                return;
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_chain_label
+                            << "] Compact block build failed (block_size=" << block_bytes.size()
+                            << "), sending full block: " << e.what();
+            }
+        } else {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer does not support compact blocks"
+                     << " (cmpct=" << m_peer_supports_cmpct
+                     << " ver=" << m_peer_cmpct_version
+                     << "), sending full block (" << block_bytes.size() << " bytes)";
+        }
+
+        // Fallback: send full block
+        submit_block_full(block_bytes);
+    }
+
+    /// Send a full block message (legacy relay).
+    void submit_block_full(const std::vector<unsigned char>& block_bytes)
+    {
+        if (!m_peer) return;
+        PackStream ps(block_bytes);
+        auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
+        m_peer->write(rmsg);
+        LOG_INFO << "[" << m_chain_label << "] Sent full block message ("
+                 << block_bytes.size() << " bytes) to " << m_target_addr.to_string();
+    }
+
+    //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_pong(std::shared_ptr<coind::messages::message_pong> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_alert(std::shared_ptr<coind::messages::message_alert> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_inv(std::shared_ptr<coind::messages::message_inv> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_block(std::shared_ptr<coind::messages::message_block> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol); //
+
+private:
+    void ensure_timeout_timer()
+    {
+        if (!m_timeout_timer)
+            m_timeout_timer = std::make_unique<core::Timer>(m_context, false);
+    }
+
+    void ensure_ping_timer()
+    {
+        if (!m_ping_timer)
+            m_ping_timer = std::make_unique<core::Timer>(m_context, true);
+    }
+
+    void stop_timeout_timer()
+    {
+        if (m_timeout_timer)
+            m_timeout_timer->stop();
+    }
+
+    void stop_ping_timer()
+    {
+        if (m_ping_timer)
+            m_ping_timer->stop();
+    }
+
+    void ensure_block_dl_timer()
+    {
+        if (!m_block_dl_timer)
+            m_block_dl_timer = std::make_unique<core::Timer>(m_context, true);
+    }
+
+    void stop_block_dl_timer()
+    {
+        if (m_block_dl_timer)
+            m_block_dl_timer->stop();
+    }
+
+    /// Monotonic seconds since connect -- the tick domain for the block-download
+    /// window's issue/expire bookkeeping. steady_clock so it never runs backwards.
+    uint64_t now_tick_sec() const
+    {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - m_connected_at).count());
+    }
+
+    /// Periodic stall-recovery tick: requeue in-flight block requests outstanding
+    /// >= BLOCK_DL_TIMEOUT_SEC and re-issue from the freed slots. No-op while
+    /// nothing is in flight or nothing has timed out.
+    void expire_block_window()
+    {
+        auto now = now_tick_sec();
+        auto requeued = m_block_dl.expire(now, BLOCK_DL_TIMEOUT_SEC);
+        if (!requeued.empty()) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] IBD block-dl expire requeued "
+                            << requeued.size() << " stalled request(s) (in flight "
+                            << m_block_dl.in_flight() << ", queued "
+                            << m_block_dl.queued() << ")";
+            drain_block_window();
+        }
+
+        // Progress-gated idle watchdog. on_activity() restarts the liveness
+        // timeout on ANY inbound message, so a peer that stalls block delivery
+        // while emitting keepalive/chatter never trips IDLE_TIMEOUT and the
+        // expiry above just requeues the same heights to the same single peer
+        // forever. Gate a stricter watchdog on FORWARD PROGRESS, armed ONLY
+        // while bodies are in flight so an at-tip node (in_flight == 0, ~10 min
+        // between BCH blocks) never churns. See idle_watchdog.hpp.
+        auto in_flight = m_block_dl.in_flight();
+        if (in_flight == 0) {
+            m_last_progress_tick = idle_watchdog::DISARMED; // disarm at tip / idle
+        } else if (idle_watchdog::should_drop_on_stall(
+                       in_flight, now, m_last_progress_tick, IDLE_TIMEOUT_SEC)) {
+            LOG_WARNING << "[" << m_chain_label << "] block-download stalled: no"
+                        << " accepted body in " << (now - m_last_progress_tick)
+                        << "s with " << in_flight << " in flight -- dropping peer"
+                        << " to reconnect";
+            m_last_progress_tick = idle_watchdog::DISARMED;
+            timeout("block-download stall (no progress)");
+        } else if (m_last_progress_tick == idle_watchdog::DISARMED) {
+            m_last_progress_tick = (now == idle_watchdog::DISARMED) ? 1 : now; // arm baseline
+        }
+    }
+
+    // Mark forward sync progress: an accepted block body advanced our chain.
+    // Arms/refreshes the progress-gated stall watchdog (expire_block_window).
+    void note_block_progress()
+    {
+        auto t = now_tick_sec();
+        // Never store DISARMED for a real progress event -- bump off the sentinel.
+        m_last_progress_tick = (t == idle_watchdog::DISARMED) ? 1 : t;
+    }
+
+    void on_activity()
+    {
+        if (!m_peer)
+            return;
+
+        ensure_timeout_timer();
+        auto timeout = m_handshake_complete ? IDLE_TIMEOUT_SEC : CONNECT_TIMEOUT_SEC;
+        m_timeout_timer->restart(timeout);
+    }
+
+    void timeout(const char* reason)
+    {
+        auto endpoint = m_peer ? m_peer->get_addr() : m_target_addr;
+        error(std::string("peer timeout: ") + reason, endpoint);
+    }
+
+    void send_ping()
+    {
+        if (!m_peer || !m_handshake_complete)
+            return;
+
+        auto msg_ping = message_ping::make_raw(core::random::random_nonce());
+        m_peer->write(msg_ping);
+    }
+
+    ADD_P2P_HANDLER(version)
+    {
+        m_peer_services = msg->m_services;
+        m_peer_version = msg->m_version;
+        m_peer_subver = msg->m_subversion;
+        m_peer_start_height = msg->m_start_height;
+        LOG_INFO << "[" << m_chain_label << "] version: " << msg->m_command
+                 << " start_height=" << msg->m_start_height
+                 << " services=0x" << std::hex << msg->m_services << std::dec
+                 << " subver=" << msg->m_subversion;
+        // Notify header chain of peer's tip height.
+        if (m_on_peer_height && msg->m_start_height > 0)
+            m_on_peer_height(msg->m_start_height);
+        auto verack_msg = message_verack::make_raw();
+        m_peer->write(verack_msg);
+    }
+
+    ADD_P2P_HANDLER(verack)
+    {
+        m_peer->init_requests(
+            [&](uint256 hash)
+            {
+                auto getdata_msg = message_getdata::make_raw({inventory_type(inventory_type::block, hash)});
+                m_peer->write(getdata_msg);
+            },
+            [&](uint256 hash)
+            {
+                auto getheaders_msg = message_getheaders::make_raw(1, {}, hash);
+                m_peer->write(getheaders_msg);
+            }
+        );
+
+        m_handshake_complete = true;
+        ensure_timeout_timer();
+        m_timeout_timer->restart(IDLE_TIMEOUT_SEC);
+
+        ensure_ping_timer();
+        m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
+            send_ping();
+        });
+
+        ensure_block_dl_timer();
+        m_block_dl_timer->start(BLOCK_DL_EXPIRE_TICK_SEC, [this]() {
+            expire_block_window();
+        });
+
+        // BIP 130: request header-first block announcements
+        auto msg_sendheaders = message_sendheaders::make_raw();
+        m_peer->write(msg_sendheaders);
+
+        // BIP 152: compact blocks. BCH negotiates version 1 — short IDs are
+        // keyed on txid (BCH has no wtxid; v2's witness-txid keying does not
+        // apply). announce=false: serve on getdata, don't push unrequested.
+        auto msg_cmpct = message_sendcmpct::make_raw(false, 1);
+        m_peer->write(msg_cmpct);
+
+        // BIP 133: advertise minimum feerate (0 = accept all transactions)
+        send_feefilter(0);
+
+        // BIP 35: Request mempool contents from peer.
+        // CRITICAL: Peers without NODE_BLOOM (0x04) will DISCONNECT us if we
+        // send the mempool message. Only send if peer advertises NODE_BLOOM.
+        // Normal inv relay delivers NEW txs without BIP 35.
+        static constexpr uint64_t SVC_NODE_BLOOM = 4;
+        if (m_request_mempool_on_connect) {
+            if (m_peer_services & SVC_NODE_BLOOM) {
+                send_mempool();
+                LOG_INFO << "[" << m_chain_label << "] Sent BIP 35 mempool request"
+                         << " (peer has NODE_BLOOM)";
+            } else {
+                LOG_INFO << "[" << m_chain_label << "] Skipped BIP 35 mempool request"
+                         << " — peer lacks NODE_BLOOM (0x" << std::hex << m_peer_services
+                         << std::dec << "), would cause disconnect";
+            }
+        }
+
+        // Embedded header-sync self-start. The HeaderChain-backed locator is
+        // anchored at our current tip and carries exponential back-off, so the
+        // peer can find a common ancestor even on a minority fork; with no
+        // provider we send an empty locator (peer serves from its best header).
+        // Mirrors the ContinueSync getheaders policy for the INITIAL batch.
+        if (m_auto_getheaders_on_handshake && m_peer) {
+            std::vector<uint256> locator;
+            if (m_locator_provider)
+                locator = m_locator_provider();
+            send_getheaders(m_peer_version ? m_peer_version : 1,
+                            locator, uint256::ZERO);
+            LOG_INFO << "[" << m_chain_label << "] IBD: auto getheaders kick ("
+                     << locator.size() << "-hash locator)";
+        }
+    }
+
+    ADD_P2P_HANDLER(ping)
+    {
+        auto msg_pong = message_pong::make_raw(msg->m_nonce);
+        m_peer->write(msg_pong);
+    }
+
+    ADD_P2P_HANDLER(pong)
+    {
+        // just handled pong
+    }
+
+    ADD_P2P_HANDLER(alert)
+    {
+        LOG_WARNING << "Handled message_alert signature: " << msg->m_signature;
+    }
+
+    ADD_P2P_HANDLER(inv)
+    {
+        std::vector<inventory_type> vinv;
+
+        for (auto& inv : msg->m_invs)
+        {
+            // BCH inv types carry no witness flag, so m_type is used directly
+            // (there is no base_type() mask as in the witness-bearing BTC fork).
+            switch (inv.m_type)
+            {
+            case inventory_type::tx:
+                // BCH: request the plain transaction (MSG_TX). There is no
+                // witness serialization, so no MSG_WITNESS_TX / MSG_WTX path.
+                vinv.push_back(inventory_type(inventory_type::tx, inv.m_hash));
+                break;
+            case inventory_type::block:
+                m_coin->new_block.happened(inv.m_hash);
+                // BCH: getdata uses plain MSG_BLOCK (0x02) — no BIP 144
+                // witness-bearing block on BCH.
+                vinv.push_back(inventory_type(
+                    inventory_type::block, inv.m_hash));
+                break;
+            case inventory_type::filtered_block:
+            case inventory_type::cmpct_block:
+            case inventory_type::doublespendproof:
+                // Recognized but not requested — ignore. doublespendproof
+                // (DSPROOF, CHIP-2021-01) is BCH-specific and not consumed here.
+                break;
+            default:
+                LOG_WARNING << "[" << m_chain_label << "] Unknown inv type 0x" << std::hex
+                            << static_cast<uint32_t>(inv.m_type) << std::dec;
+                break;
+            }
+        }
+
+        if (!vinv.empty())
+        {
+            auto msg_getdata = message_getdata::make_raw(vinv);
+            m_peer->write(msg_getdata);
+        }
+    }
+
+    ADD_P2P_HANDLER(tx)
+    {
+        m_coin->new_tx.happened(Transaction(msg->m_tx));
+    }
+
+    // Validate a fully-assembled/received block against its header's merkle
+    // commitment, then publish it on full_block. All three delivery paths --
+    // the direct `block` message, compact-block-complete, and the compact +
+    // getblocktxn round-trip -- funnel through here so a block can only reach
+    // the ABLA size feed (and any future block-connect consumer) once its tx
+    // set provably matches the header it was announced under.
+    //
+    // The check is the parent-chain consensus merkle (SHA256d over txids, BCH
+    // == BTC rule; CTOR fixes only tx *order*, which the block already carries).
+    // A mismatch means the peer handed us a header/txs pair that does not
+    // cohere -- we DROP it rather than fold a bogus serialized size into ABLA,
+    // where the resulting discontinuity would (safely) sink the template budget
+    // to the 32 MB floor. Mirrors BCHN CheckMerkleRoot (validation.cpp) at
+    // accept time. p2pool-merged-v36 surface: NONE -- local accept gate only.
+    bool emit_full_block(const BlockType& block, const uint256& blockhash)
+    {
+        std::vector<uint256> txids;
+        txids.reserve(block.m_txs.size());
+        for (const auto& tx : block.m_txs)
+            txids.push_back(compute_txid(tx));
+        const uint256 computed = compute_merkle_root(txids);
+
+        if (computed != block.m_merkle_root) {
+            LOG_WARNING << "[" << m_chain_label << "] Block "
+                        << blockhash.GetHex().substr(0, 16) << "... merkle mismatch (header "
+                        << block.m_merkle_root.GetHex().substr(0, 16) << "... vs computed "
+                        << computed.GetHex().substr(0, 16) << "...) over "
+                        << block.m_txs.size() << " txs -- dropping, full_block NOT emitted";
+            return false;
+        }
+        m_coin->full_block.happened(block);
+        return true;
+    }
+
+    ADD_P2P_HANDLER(block)
+    {
+        // BCH blocks are the standard SHA256d serialization — no AuxPoW
+        // extended payload, so the raw-block re-parser the BTC fork carried
+        // for DOGE is not needed here.
+        BlockType block = msg->m_block;
+
+        auto header = static_cast<BlockHeaderType>(block);
+        auto packed_header = pack(header);
+        auto blockhash = Hash(packed_header.get_span());
+        // ReplyMatcher may throw if nobody registered a pending request for
+        // this block (e.g., unsolicited block or getdata-triggered response).
+        // Catch to ensure full_block event always fires.
+        try { m_peer->get_block(blockhash, block); } catch (...) {}
+        try { m_peer->get_header(blockhash, header); } catch (...) {}
+        LOG_INFO << "[" << m_chain_label << "] Full block received: "
+                 << blockhash.GetHex().substr(0, 16) << "..."
+                 << " txs=" << block.m_txs.size();
+        const bool accepted = emit_full_block(block, blockhash);
+
+        // IBD window: this block freed a slot (if it was one we requested) --
+        // top the window back up so the next queued block bodies stream in. A
+        // body that FAILED local validation (merkle mismatch) must NOT be marked
+        // permanently received -- on_block_received keeps it in m_known forever,
+        // blackholing the height so it is never re-downloaded and the ABLA feed /
+        // block-connector starve there. Route the drop through on_block_rejected
+        // so the slot frees and the height is re-requested (bounded retries).
+        if (accepted) {
+            m_block_dl.on_block_received(blockhash);
+            note_block_progress(); // forward progress -> refresh stall watchdog
+        } else {
+            m_block_dl.on_block_rejected(blockhash);
+        }
+        drain_block_window();
+    }
+
+    ADD_P2P_HANDLER(headers)
+    {
+        std::vector<BlockHeaderType> vheaders;
+
+        // Standard path: BCH headers are 80-byte SHA256d block headers parsed
+        // as BlockType. No AuxPoW raw-parser fallback (BCH is not merged-mined).
+        for (auto block : msg->m_headers)
+        {
+            auto header = (BlockHeaderType)block;
+            auto packed_header = pack(header);
+            auto blockhash = Hash(packed_header.get_span());
+            try {
+                m_peer->get_header(blockhash, header);
+            } catch (const std::invalid_argument&) {}
+            vheaders.push_back(header);
+        }
+
+        if (!vheaders.empty()) {
+            m_coin->new_headers.happened(vheaders);
+
+            // Headers-first BLOCK download is INDEPENDENT of the getheaders
+            // follow-up policy: EVERY header batch we learn -- a maximal IBD
+            // batch, a BIP130 tip announce, OR a non-maximal partial batch (the
+            // --near-tip anchor->tip span is ~100 headers) -- must have its
+            // block BODIES pulled, or the ABLA size feed / block-connector
+            // starve: the header chain advances to the peer tip but
+            // AblaTracker's cursor never moves (pinned at the 32 MB floor). The
+            // old code queued bodies ONLY inside the ContinueSync branch, so the
+            // near-tip span classified Idle and downloaded NOTHING -- exactly
+            // the pinned-cursor symptom. Queue this batch's hashes through the
+            // bounded, deduping, reissue-accounted window for ALL batch shapes;
+            // block_download.hpp dedupes overlap and bounds in_flight while
+            // accounting reissue/false_evict.
+            std::vector<uint256> batch_hashes;
+            batch_hashes.reserve(vheaders.size());
+            for (auto& hdr : vheaders) {
+                auto p = pack(hdr);
+                batch_hashes.push_back(Hash(p.get_span()));
+            }
+            m_block_dl.enqueue(batch_hashes);
+            drain_block_window();
+
+            // getheaders follow-up policy (header_sync.hpp, PURE + tested).
+            // Block bodies for ALL batch shapes were already queued above; here
+            // we only decide whether to re-issue getheaders for the NEXT header
+            // batch:
+            //   ContinueSync  -- maximal IBD batch, peer has more -> getheaders
+            //   RequestBlocks -- BIP130 tip announce / partial batch -> bodies
+            //                    only (already queued); no further header sync
+            //   Idle          -- caught up; nothing further to fetch
+            using header_sync::Followup;
+            switch (header_sync::classify_headers_batch(vheaders.size())) {
+            case Followup::ContinueSync:
+                if (m_peer) {
+                    // The header chain already ingested this batch (new_headers
+                    // fired above), so a HeaderChain-backed locator is anchored
+                    // at the just-learned tip AND carries exponential back-off
+                    // references -- the peer can find a common ancestor even if
+                    // our tip is on a minority fork. Fall back to a single-hash
+                    // anchor only when no provider is wired (degraded).
+                    auto last_packed = pack(vheaders.back());
+                    auto last_hash = Hash(last_packed.get_span());
+                    std::vector<uint256> chain_locator;
+                    if (m_locator_provider)
+                        chain_locator = m_locator_provider();
+                    auto locator = header_sync::choose_continue_locator(
+                        std::move(chain_locator), last_hash);
+                    send_getheaders(m_peer_version ? m_peer_version : 1,
+                                    locator, uint256::ZERO);
+                    LOG_INFO << "[" << m_chain_label << "] IBD: got "
+                             << vheaders.size() << " headers, continuing from "
+                             << last_hash.GetHex().substr(0, 16) << "... ("
+                             << locator.size() << "-hash locator)";
+                }
+                break;
+            case Followup::RequestBlocks:
+            case Followup::Idle:
+                break;
+            }
+        }
+    }
+
+    ADD_P2P_HANDLER(getaddr)
+    {
+        // We don't serve addresses — ignore
+    }
+
+    ADD_P2P_HANDLER(addr)
+    {
+        if (m_addr_callback && !msg->m_addrs.empty()) {
+            std::vector<NetService> addrs;
+            addrs.reserve(msg->m_addrs.size());
+            for (auto& rec : msg->m_addrs) {
+                addrs.push_back(rec.m_endpoint);
+            }
+            m_addr_callback(addrs);
+        }
+    }
+
+    ADD_P2P_HANDLER(reject)
+    {
+        LOG_WARNING << "Peer rejected " << msg->m_message
+                    << " (code=" << static_cast<int>(msg->m_ccode)
+                    << "): " << msg->m_reason
+                    << " hash=" << msg->m_data.GetHex();
+    }
+
+    ADD_P2P_HANDLER(sendheaders)
+    {
+        // Peer prefers header announcements — acknowledged
+        LOG_DEBUG_COIND << "Peer supports sendheaders (BIP 130)";
+    }
+
+    ADD_P2P_HANDLER(notfound)
+    {
+        for (auto& inv : msg->m_invs)
+        {
+            switch (inv.m_type)
+            {
+            case inventory_type::block:
+                // Complete the ReplyMatcher with a default (empty) response
+                // so we don't wait for the 15s timeout.
+                try {
+                    m_peer->get_block(inv.m_hash, BlockType{});
+                } catch (...) {}
+                try {
+                    m_peer->get_header(inv.m_hash, BlockHeaderType{});
+                } catch (...) {}
+                break;
+            default:
+                break;
+            }
+            LOG_DEBUG_COIND << "Peer does not have inv 0x" << std::hex
+                            << static_cast<uint32_t>(inv.m_type) << std::dec
+                            << " " << inv.m_hash.GetHex();
+        }
+    }
+
+    ADD_P2P_HANDLER(feefilter)
+    {
+        LOG_DEBUG_COIND << "Peer feefilter: " << msg->m_feerate << " sat/kB";
+    }
+
+    ADD_P2P_HANDLER(mempool)
+    {
+        // We don't serve mempool — ignore incoming request
+    }
+
+    ADD_P2P_HANDLER(sendcmpct)
+    {
+        // BIP 152: Compact block negotiation — record peer capability
+        m_peer_supports_cmpct = true;
+        m_peer_cmpct_version = msg->m_version;
+        m_peer_wants_cmpct_announce = msg->m_announce;
+        LOG_INFO << "[" << m_chain_label << "] Peer supports compact blocks v"
+                 << msg->m_version << " (announce=" << msg->m_announce << ")";
+    }
+
+    ADD_P2P_HANDLER(cmpctblock)
+    {
+        auto& cb = msg->m_compact_block;
+        auto packed_hdr = pack(cb.header);
+        auto blockhash = Hash(packed_hdr.get_span());
+
+        LOG_INFO << "[" << m_chain_label << "] Received compact block "
+                 << blockhash.GetHex()
+                 << " (" << cb.short_ids.size() << " short IDs, "
+                 << cb.prefilled_txns.size() << " prefilled)";
+
+        // Always announce the new block to the node (header-based)
+        m_coin->new_block.happened(blockhash);
+
+        // Attempt reconstruction from mempool + known_txs.
+        // BCH: short IDs are keyed by txid (wtxid == txid).
+        std::map<uint256, MutableTransaction> known;
+
+        // Gather from node's known_txs (txid-keyed)
+        for (const auto& [txid, tx] : m_coin->known_txs) {
+            known[txid] = MutableTransaction(tx);
+        }
+
+        // Gather from mempool. all_txs_map_wtxid() aliases all_txs_map() on
+        // BCH (no wtxid distinction) — both are txid-keyed.
+        if (m_mempool) {
+            auto mp_txs = m_mempool->all_txs_map_wtxid();
+            known.merge(mp_txs);
+        }
+
+        auto result = ReconstructBlock(cb, known);
+
+        if (result.complete) {
+            LOG_INFO << "[" << m_chain_label << "] Compact block reconstructed: "
+                     << blockhash.GetHex()
+                     << " txs=" << result.block.m_txs.size();
+            // Deliver as a full block
+            m_peer->get_block(blockhash, result.block);
+            auto header = static_cast<BlockHeaderType>(result.block);
+            m_peer->get_header(blockhash, header);
+            emit_full_block(result.block, blockhash);
+        } else if (result.merkle_mismatch) {
+            // Every slot filled but the reconstructed txs FAIL the header merkle
+            // root -> a 48-bit short-ID collision substituted a wrong tx. Discard
+            // and pull the authoritative full block via getdata; never deliver the
+            // mismatched one. (emit_full_block would also drop it, but silently and
+            // without re-requesting -- leaving the tip stalled until re-announce.)
+            LOG_WARNING << "[" << m_chain_label << "] Compact block " << blockhash.GetHex()
+                        << " reconstructed but FAILED header merkle check — discarding, "
+                        << "requesting full block via getdata";
+            request_full_block(blockhash);
+        } else {
+            LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "
+                     << result.missing_indexes.size() << " txs missing — requesting via getblocktxn";
+            // Save pending state and request missing transactions
+            m_pending_cmpct = std::make_unique<CompactBlock>(cb);
+            m_pending_missing_indexes = result.missing_indexes;
+
+            BlockTransactionsRequest req;
+            req.blockhash = blockhash;
+            req.indexes = result.missing_indexes;
+            auto req_msg = message_getblocktxn::make_raw(req);
+            m_peer->write(req_msg);
+        }
+    }
+
+    ADD_P2P_HANDLER(getblocktxn)
+    {
+        auto& req = msg->m_request;
+
+        // Only serve our most recently sent compact block
+        if (req.blockhash != m_sent_cmpct_hash || m_sent_cmpct_block.m_txs.empty()) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] getblocktxn for unknown block "
+                            << req.blockhash.GetHex() << " — ignoring";
+            return;
+        }
+
+        BlockTransactionsResponse resp;
+        resp.blockhash = req.blockhash;
+        resp.txs.reserve(req.indexes.size());
+
+        for (uint32_t idx : req.indexes) {
+            if (idx >= m_sent_cmpct_block.m_txs.size()) {
+                LOG_WARNING << "[" << m_chain_label << "] getblocktxn: index " << idx
+                            << " out of range (block has " << m_sent_cmpct_block.m_txs.size() << " txs)";
+                return;  // malformed request — drop
+            }
+            resp.txs.push_back(m_sent_cmpct_block.m_txs[idx]);
+        }
+
+        auto rmsg = message_blocktxn::make_raw(resp);
+        m_peer->write(rmsg);
+        LOG_INFO << "[" << m_chain_label << "] Served " << resp.txs.size()
+                 << " txs via blocktxn for " << req.blockhash.GetHex();
+    }
+
+    ADD_P2P_HANDLER(blocktxn)
+    {
+        auto& resp = msg->m_response;
+
+        if (!m_pending_cmpct || m_pending_missing_indexes.empty()) {
+            LOG_WARNING << "[" << m_chain_label << "] Received blocktxn without pending compact block";
+            return;
+        }
+
+        if (resp.txs.size() != m_pending_missing_indexes.size()) {
+            LOG_WARNING << "[" << m_chain_label << "] blocktxn size mismatch: got "
+                        << resp.txs.size() << ", expected " << m_pending_missing_indexes.size();
+            m_pending_cmpct.reset();
+            m_pending_missing_indexes.clear();
+            return;
+        }
+
+        // Reconstruct the full block with the missing transactions
+        auto& cb = *m_pending_cmpct;
+        size_t total_txs = cb.short_ids.size() + cb.prefilled_txns.size();
+        std::vector<MutableTransaction> txs(total_txs);
+        std::vector<bool> filled(total_txs, false);
+
+        // Place prefilled transactions
+        for (const auto& pt : cb.prefilled_txns) {
+            if (pt.index < total_txs) {
+                txs[pt.index] = pt.tx;
+                filled[pt.index] = true;
+            }
+        }
+
+        // Re-match from mempool. BCH short IDs are keyed by txid in BOTH passes
+        // (BuildCompactBlock and the cmpctblock handler both use compute_txid);
+        // BCH has no wtxid (no SegWit), so there is no second key the two passes
+        // could diverge to. Call the SAME mempool accessor the cmpctblock handler
+        // uses (all_txs_map_wtxid() aliases all_txs_map() on BCH -- both txid-keyed)
+        // so the two passes cannot drift even textually.
+        std::map<uint256, MutableTransaction> known;
+        for (const auto& [txid, tx] : m_coin->known_txs)
+            known[txid] = MutableTransaction(tx);
+        if (m_mempool) {
+            auto mp_txs = m_mempool->all_txs_map_wtxid();
+            known.merge(mp_txs);
+        }
+
+        uint64_t k0, k1;
+        cb.GetSipHashKeys(k0, k1);
+        std::map<uint64_t, const MutableTransaction*> sid_map;
+        for (const auto& [txid, tx] : known) {
+            ShortTxID sid = CompactBlock::GetShortID(k0, k1, txid);
+            sid_map[sid.to_uint64()] = &tx;
+        }
+
+        size_t sid_idx = 0;
+        for (size_t i = 0; i < total_txs; ++i) {
+            if (filled[i]) continue;
+            if (sid_idx < cb.short_ids.size()) {
+                auto it = sid_map.find(cb.short_ids[sid_idx].to_uint64());
+                if (it != sid_map.end() && it->second)
+                    txs[i] = *(it->second);
+                // else: will be filled from blocktxn response below
+            }
+            ++sid_idx;
+        }
+
+        // Fill in the missing transactions from blocktxn response
+        for (size_t i = 0; i < m_pending_missing_indexes.size(); ++i) {
+            uint32_t idx = m_pending_missing_indexes[i];
+            if (idx < total_txs)
+                txs[idx] = resp.txs[i];
+        }
+
+        // Build and deliver the full block
+        auto packed_hdr = pack(cb.header);
+        auto blockhash = Hash(packed_hdr.get_span());
+
+        BlockType block;
+        static_cast<BlockHeaderType&>(block) = cb.header;
+        block.m_txs = std::move(txs);
+
+        // Merkle backstop (same invariant as ReconstructBlock): even with the
+        // missing txs now authoritative from blocktxn, a short-id-matched slot
+        // could carry a 48-bit collision, or a malicious peer could answer with a
+        // wrong tx. Verify the reconstructed vector against the header commitment
+        // BEFORE delivering; on mismatch discard and fall back to a full getdata.
+        if (ReconstructedMerkleRoot(block.m_txs) != cb.header.m_merkle_root) {
+            LOG_WARNING << "[" << m_chain_label << "] blocktxn-completed block "
+                        << blockhash.GetHex() << " FAILED header merkle check — discarding, "
+                        << "requesting full block via getdata";
+            request_full_block(blockhash);
+            m_pending_cmpct.reset();
+            m_pending_missing_indexes.clear();
+            return;
+        }
+
+        m_peer->get_block(blockhash, block);
+        auto header = static_cast<BlockHeaderType>(block);
+        m_peer->get_header(blockhash, header);
+
+        LOG_INFO << "[" << m_chain_label << "] Compact block completed via blocktxn: "
+                 << blockhash.GetHex();
+
+        // Emit the reconstructed block on full_block, exactly as the direct
+        // `block` handler and the complete-path `cmpctblock` handler do. Without
+        // this, a block delivered via the compact + getblocktxn round-trip (the
+        // common case when the mempool is missing some txns) never reaches the
+        // ABLA size feed: AblaBlockFeed would see a height discontinuity and the
+        // template budget would drop to the 32 MB safe floor. Producer-side
+        // completion of the embedded-daemon block-connect -> full_block path.
+        emit_full_block(block, blockhash);
+
+        m_pending_cmpct.reset();
+        m_pending_missing_indexes.clear();
+    }
+
+    ADD_P2P_HANDLER(sendaddrv2)
+    {
+        // BIP 155: Peer wants addrv2 messages — acknowledged
+        LOG_DEBUG_COIND << "Peer supports sendaddrv2 (BIP 155)";
+    }
+
+    ADD_P2P_HANDLER(getdata)
+    {
+        // Peer requesting data from us — we don't serve blocks/txs
+        LOG_DEBUG_COIND << "Peer getdata with " << msg->m_requests.size() << " items (ignored)";
+    }
+
+    ADD_P2P_HANDLER(getblocks)
+    {
+        // Peer requesting block locator — we don't serve blocks
+    }
+
+    ADD_P2P_HANDLER(getheaders)
+    {
+        // Peer requesting headers — we don't serve headers
+        LOG_DEBUG_COIND << "Peer getheaders (ignored, we don't serve headers)";
+    }
+
+    #undef ADD_P2P_HANDLER
+};
+
+} // namespace p2p
+
+} // namespace coin
+
+} // namespace bch
