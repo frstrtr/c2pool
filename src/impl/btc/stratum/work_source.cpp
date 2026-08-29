@@ -301,6 +301,13 @@ nlohmann::json BTCWorkSource::get_current_work_template() const
 
 std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
 {
+    // Public override: fold the branches from a freshly-read template.
+    return get_stratum_merkle_branches(cached_template());
+}
+
+std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches(
+    const std::shared_ptr<const btc::coin::rpc::WorkData>& wd) const
+{
     // Stratum merkle branches: at each level, the SIBLING of the left-most
     // node (the one that descends from the coinbase). The miner reconstructs
     // the merkle root by:
@@ -311,7 +318,10 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
     // Algorithm matches Bitcoin Core's merkle.cpp: at every level, if the
     // count is odd, duplicate the last element. The branches list is
     // typically log2(N) entries for N transactions.
-    auto wd = cached_template();
+    //
+    // Folds the CALLER-supplied template snapshot so build_connection_coinbase
+    // can freeze the branches from the exact same `wd` it built the coinbase
+    // and OP_RETURN ref_hash from (no second cached_template() read).
     if (!wd || wd->m_hashes.empty()) return {};
 
     // PRODUCER/CONSUMER CONTRACT: wd->m_hashes is the pure tx-hash list
@@ -522,6 +532,47 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         return a.first  < b.first;
     });
 
+    // ── Freeze the segwit inputs to the ref_hash BEFORE computing it ──
+    // The v33+ share serializes segwit_data (txid merkle branches + wtxid
+    // merkle root) into the ref that the OP_RETURN commits to. So these must
+    // be computed here, from THIS template snapshot (`wd`), and fed into
+    // ref_hash_fn — otherwise the committed ref_hash omits segwit while
+    // attempt_verify's recompute (off the stored share) includes it, and the
+    // share is rejected with no PPLNS credit. Computing them once off `wd`
+    // (not a second cached_template() read) also closes the sub-ms template
+    // -roll race between the coinbase body and its frozen branches.
+    std::vector<std::string> branch_hexes = get_stratum_merkle_branches(wd);
+    std::vector<uint256> frozen_branches_u256;
+    frozen_branches_u256.reserve(branch_hexes.size());
+    for (const auto& h : branch_hexes) {
+        uint256 b;
+        auto bb = ParseHex(h);
+        if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
+        frozen_branches_u256.push_back(b);
+    }
+
+    // wtxid merkle root — the coinbase-only witness root is the leaf-0
+    // placeholder folded by witness_merkle_root(). Computed here off `wd` so
+    // both the ref_hash (below) and the BIP141 commitment output (further
+    // down) share ONE value.
+    uint256 witness_root_uint;
+    if (segwit_active) {
+        std::vector<uint256> other_wtxids;
+        other_wtxids.reserve(wd->m_txs.size());
+        if (auto txs_field = wd->m_data.find("transactions");
+            txs_field != wd->m_data.end() && txs_field->is_array())
+        {
+            for (const auto& t : *txs_field) {
+                if (!t.is_object()) continue;
+                if (auto h = t.find("hash"); h != t.end() && h->is_string()) {
+                    uint256 wt; wt.SetHex(h->get<std::string>().c_str());
+                    other_wtxids.push_back(wt);
+                }
+            }
+        }
+        witness_root_uint = btc::coin::witness_merkle_root(other_wtxids);
+    }
+
     // ── ref_hash + chain-walked frozen_ref values (Phase 12) ──
     // The ref_hash_fn lambda walks the share tracker for the actual
     // network share target (bits/max_bits) plus the chain-position
@@ -535,7 +586,9 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     if (ref_hash_fn) {
         try {
             rh_result = ref_hash_fn(prev_share_hash, scriptsig, payout_script,
-                                    coinbasevalue, block_bits, curtime);
+                                    coinbasevalue, block_bits, curtime,
+                                    segwit_active, frozen_branches_u256,
+                                    witness_root_uint);
             if (rh_result.bits != 0) {
                 share_bits_.store(rh_result.bits, std::memory_order_relaxed);
                 share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
@@ -563,27 +616,10 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     // For coinbase-only templates (no other txs) the witness root is just
     // the coinbase wtxid (zero), so commitment = SHA256d(zero32 || zero32).
     std::vector<uint8_t> witness_commitment_script;  // empty if segwit not active
-    uint256 witness_root_uint;
+    // witness_root_uint was computed ONCE above (before ref_hash_fn) off the
+    // same `wd`; reuse it here so the BIP141 commitment output and the frozen
+    // ref's segwit wtxid root are guaranteed identical.
     if (segwit_active) {
-        // Collect the OTHER txs' wtxids (template "hash" field); the coinbase
-        // wtxid placeholder (BIP141 = 32 zero bytes) at leaf 0 is prepended by
-        // the shared witness_merkle_root() SSOT helper, so the leaf-0 contract
-        // lives in ONE place (mirrors the txid-merkle leaf-0 fix, PR #570).
-        std::vector<uint256> other_wtxids;
-        other_wtxids.reserve(wd->m_txs.size());
-        if (auto txs_field = wd->m_data.find("transactions");
-            txs_field != wd->m_data.end() && txs_field->is_array())
-        {
-            for (const auto& t : *txs_field) {
-                if (!t.is_object()) continue;
-                if (auto h = t.find("hash"); h != t.end() && h->is_string()) {
-                    uint256 wt; wt.SetHex(h->get<std::string>().c_str());
-                    other_wtxids.push_back(wt);
-                }
-            }
-        }
-        witness_root_uint = btc::coin::witness_merkle_root(other_wtxids);
-
         // commitment_hash = SHA256d(witness_root || witness_reserved_value)
         std::array<uint8_t, 64> commit_in;
         std::memcpy(commit_in.data(),      witness_root_uint.data(),    32);
@@ -680,14 +716,11 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     snap.frozen_ref.far_share_hash  = rh_result.far_share_hash;
     snap.frozen_ref.ref_hash        = ref_hash;
     snap.frozen_ref.last_txout_nonce = ref_nonce;
+    // Freeze the SAME branches + wtxid root that fed the ref_hash above so the
+    // mint (create_local_share_v35) reconstructs byte-identical segwit_data.
+    snap.frozen_ref.frozen_merkle_branches = frozen_branches_u256;
+    snap.frozen_ref.frozen_witness_root    = witness_root_uint;
 
-    auto branches = get_stratum_merkle_branches();
-    for (const auto& h : branches) {
-        uint256 b;
-        auto bb = ParseHex(h);
-        if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
-        snap.frozen_ref.frozen_merkle_branches.push_back(b);
-    }
     auto txs_field = wd->m_data.find("transactions");
     if (txs_field != wd->m_data.end() && txs_field->is_array()) {
         // a1 + H5 memo: build the per-tx hex vector ONCE and hand the snapshot a
@@ -705,7 +738,7 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         snap.tx_data = btc::stratum::detail::tx_data_memo_get_or_build(
             wd->m_hashes, *txs_field, tx_data_fp_, tx_data_memo_);
     }
-    snap.merkle_branches = std::move(branches);
+    snap.merkle_branches = std::move(branch_hexes);
 
     return result;
 }
