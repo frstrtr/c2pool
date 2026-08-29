@@ -89,6 +89,7 @@
 #include <malloc.h>         // [MEM] periodic malloc_trim(0) bounds glibc pool fragmentation (glibc-only)
 #endif
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -119,7 +120,17 @@ static void print_usage()
         "                       127.0.0.1:48333 (testnet4)\n"
         "                       127.0.0.1:18443 (regtest)\n"
         "  --p2pool H:P    BTC p2pool peer (jtoomim/SPB v35 + protocol 3502)\n"
-        "                  e.g. p2p-spb.xyz:9333\n"
+        "                  e.g. p2p-spb.xyz:9333. Single-peer alias for\n"
+        "                  --sharechain-addnode (exclusive target).\n"
+        "  --sharechain-addnode H:P  explicit sharechain (pool P2P) peer to\n"
+        "                  seed/pin. REPEATABLE. When given, the public p2pool\n"
+        "                  seed list is NOT dialed and the saved addr book is\n"
+        "                  reset — the node dials ONLY these peers. Use to join\n"
+        "                  a private/federation sharechain (with --network-id\n"
+        "                  --prefix). e.g. --sharechain-addnode 10.0.0.5:9333\n"
+        "                  NOTE: setting --network-id alone (no addnode) also\n"
+        "                  suppresses the public seed list — a custom-identity\n"
+        "                  node must never dial the open BTC p2pool network.\n"
         "  --stratum [H:]P stratum TCP listener for miners (B4-stratum)\n"
         "                  e.g. --stratum 9332           (binds 0.0.0.0:9332)\n"
         "                       --stratum 127.0.0.1:9332 (loopback only)\n"
@@ -183,6 +194,11 @@ int main(int argc, char* argv[])
     uint16_t    bitcoind_port = 0;
     std::string p2pool_host;
     uint16_t    p2pool_port   = 0;
+    // --sharechain-addnode HOST:PORT (repeatable): explicit federation
+    // sharechain peer(s). --p2pool folds in here as a single-entry alias so
+    // its old exclusive-target semantics are preserved. Non-empty => dial ONLY
+    // these peers (public seeds cleared, addrs.json reset).
+    std::vector<std::pair<std::string, uint16_t>> sharechain_addnodes;
     std::string stratum_addr  = "0.0.0.0";  // listen all interfaces by default
     uint16_t    stratum_port  = 0;          // 0 disables stratum; --stratum sets it
     std::string http_addr     = "0.0.0.0";  // dashboard bind; --http sets it (H-STATS.944)
@@ -261,6 +277,26 @@ int main(int argc, char* argv[])
             }
             p2pool_host = ep.substr(0, colon);
             p2pool_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+            // Fold --p2pool into the unified explicit-peer list. A single
+            // --p2pool preserves its historical exclusive-target semantics
+            // (bootstrap = this one peer, addrs.json reset, target_outbound=1).
+            sharechain_addnodes.emplace_back(p2pool_host, p2pool_port);
+        }
+        else if (arg == "--sharechain-addnode" && i + 1 < argc)
+        {
+            // --sharechain-addnode HOST:PORT — repeatable. Seed/pin explicit
+            // federation sharechain peer(s). Same HOST:PORT validation as
+            // --p2pool; multiple flags accumulate.
+            std::string ep = argv[++i];
+            auto colon = ep.rfind(':');
+            if (colon == std::string::npos)
+            {
+                std::cerr << "--sharechain-addnode requires HOST:PORT\n";
+                return 1;
+            }
+            sharechain_addnodes.emplace_back(
+                ep.substr(0, colon),
+                static_cast<uint16_t>(std::stoi(ep.substr(colon + 1))));
         }
         else if (arg == "--stratum" && i + 1 < argc)
         {
@@ -1408,35 +1444,80 @@ int main(int argc, char* argv[])
     config.pool()->m_prefix = ParseHexBytes(btc::PoolConfig::prefix_hex());
     config.m_testnet        = testnet;
 
-    if (!p2pool_host.empty() && p2pool_port != 0)
-    {
-        // Single explicit target — clear defaults so we dial only the named peer.
-        config.pool()->m_bootstrap_addrs.clear();
-        config.pool()->m_bootstrap_addrs.emplace_back(p2pool_host, p2pool_port);
+    // Explicit precedence: --sharechain-addnode/--p2pool > --regtest >
+    // custom --network-id > public default. select_sharechain_bootstrap_mode
+    // (config_pool.hpp) is the pure, unit-tested seam.
+    const bool has_custom_network_id = !network_id_hex.empty();
+    const btc::SharechainBootstrapMode bootstrap_mode =
+        btc::select_sharechain_bootstrap_mode(
+            /*has_explicit_peers=*/!sharechain_addnodes.empty(),
+            /*regtest=*/regtest,
+            /*has_custom_network_id=*/has_custom_network_id);
 
-        // AddrStore ctor reads addrs.json from disk if present, MERGING any
-        // saved-from-prior-runs peers with our bootstrap_addrs. Saved peers
-        // can outrank our just-added explicit target (get_good_peers scores
-        // by first_seen/last_seen). When --p2pool is given the user has
-        // explicitly chosen this peer — reset addr store so it actually wins.
+    switch (bootstrap_mode)
+    {
+    case btc::SharechainBootstrapMode::ExplicitPeers:
+    {
+        // --sharechain-addnode (repeatable) and/or --p2pool. Dial ONLY the
+        // named peers — clear defaults and reset the saved addr book so saved
+        // public peers can't outrank the explicit targets (get_good_peers
+        // scores by first_seen/last_seen).
+        config.pool()->m_bootstrap_addrs.clear();
+        for (const auto& [h, p] : sharechain_addnodes)
+            config.pool()->m_bootstrap_addrs.emplace_back(h, p);
+
         const auto addrs_path = net_dir / "addrs.json";
         std::error_code rm_ec;
         std::filesystem::remove(addrs_path, rm_ec);  // best-effort
 
-        LOG_INFO << "[BTC] Sharechain bootstrap: explicit --p2pool "
-                 << p2pool_host << ":" << p2pool_port
-                 << " (addrs.json reset to enforce exclusive target)";
+        LOG_INFO << "[BTC] Sharechain bootstrap: " << sharechain_addnodes.size()
+                 << " explicit peer(s) (--sharechain-addnode/--p2pool; "
+                 << "addrs.json reset to enforce exclusive targets)";
+        break;
     }
-    else if (regtest)
-    {
+    case btc::SharechainBootstrapMode::RegtestIsolated:
         // Isolated regtest standup: NEVER dial the public mainnet p2pool seeds
         // (DEFAULT_BOOTSTRAP_HOSTS). Leaving the addr store empty keeps the
         // sharechain solo/local so a won block is never relayed to real peers.
-        // Supply --p2pool HOST:PORT to dial an explicit isolated tuned-net peer.
+        // Supply --sharechain-addnode HOST:PORT to dial an isolated tuned peer.
         LOG_INFO << "[BTC] Sharechain bootstrap: regtest — 0 public seeds (isolated)";
-    }
-    else
+        break;
+    case btc::SharechainBootstrapMode::CustomNetSuppressed:
     {
+        // Custom sharechain identity (--network-id) but no explicit peer. A
+        // federation must NOT dial the public BTC p2pool seeds: their
+        // prefix/identifier differ, the handshake is rejected at read_prefix,
+        // and the public address book poisons redials forever. Suppress the
+        // public seed list entirely. Additionally do a ONE-TIME reset of any
+        // addrs.json inherited from a prior public-net run, keyed by an
+        // identity marker file so legitimately-learned federation peers
+        // persist/redial afterwards.
+        const std::string identity = btc::PoolConfig::identifier_hex() + " "
+                                   + btc::PoolConfig::prefix_hex();
+        const auto marker_path = net_dir / "sharechain_identity";
+        std::string saved_identity;
+        {
+            std::ifstream mf(marker_path);
+            if (mf) std::getline(mf, saved_identity);
+        }
+        if (saved_identity != identity)
+        {
+            const auto addrs_path = net_dir / "addrs.json";
+            std::error_code rm_ec;
+            std::filesystem::remove(addrs_path, rm_ec);  // best-effort one-time
+            std::ofstream mf(marker_path, std::ios::trunc);
+            if (mf) mf << identity << "\n";
+            LOG_INFO << "[BTC] custom network-id: sharechain identity "
+                     << (saved_identity.empty() ? "unmarked" : "changed")
+                     << " → addrs.json reset once";
+        }
+        LOG_INFO << "[BTC] custom network-id: public sharechain seeds suppressed"
+                 << " (id=" << btc::PoolConfig::identifier_hex()
+                 << " prefix=" << btc::PoolConfig::prefix_hex()
+                 << "); supply --sharechain-addnode to seed a federation peer";
+        break;
+    }
+    case btc::SharechainBootstrapMode::PublicDefault:
         // Default seed list (PoolConfig::DEFAULT_BOOTSTRAP_HOSTS, port 9333).
         for (const auto& host : btc::PoolConfig::DEFAULT_BOOTSTRAP_HOSTS)
         {
@@ -1449,10 +1530,21 @@ int main(int argc, char* argv[])
         LOG_INFO << "[BTC] Sharechain bootstrap: "
                  << config.pool()->m_bootstrap_addrs.size()
                  << " default seeds";
+        break;
     }
 
     auto p2p_node = std::make_unique<btc::Node>(&ioc, &config);
-    p2p_node->set_target_outbound_peers(p2pool_host.empty() ? 4 : 1);
+    p2p_node->set_target_outbound_peers(
+        sharechain_addnodes.empty()
+            ? 4
+            : std::max<size_t>(1, sharechain_addnodes.size()));
+    // Suppress the coin-seed escalation bootstrapper on federation/custom nets
+    // and whenever explicit sharechain peers are pinned: its escalation tier
+    // injects PUBLIC Bitcoin COIN seeds (port 8333) into the pool addr store
+    // whenever the outbound deficit persists — which on a custom net is
+    // permanent — so a federation would perpetually dial the open coin network.
+    if (has_custom_network_id || !sharechain_addnodes.empty())
+        p2p_node->set_seed_escalation_enabled(false);
     // Default sharechain P2P port is 9333 (oracle byte-parity); --sharechain-port
     // overrides it for an isolated second instance (G3b tuned-net) without
     // touching the default or any shared-base constant.
