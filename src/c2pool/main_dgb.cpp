@@ -76,6 +76,8 @@
 #include <atomic>
 #include <algorithm>
 #include <functional>
+#include <set>
+#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <optional>
@@ -703,6 +705,191 @@ int run_node(const core::CoinParams& params, bool testnet,
                 // 70019 == DigiByte Core PROTOCOL_VERSION (coin/p2p_node.hpp).
                 coin_p2p->send_getheaders(70019, locator, uint256::ZERO);
             });
+    }
+
+    // ── Network-standalone header source (--coin-p2p-discover, no --coin-daemon) ──
+    //
+    // Mirrors main_btc.cpp's standalone header driver. When coin-network peer
+    // discovery is armed (the block near the top of run_node populated
+    // coin_peer_mgr with DNS/fixed/HTTP-tier peers) AND no external digibyted
+    // endpoint is configured, the discovered coin-peer set is the ONLY header
+    // origin: it banks scored peer ADDRESSES but holds no header-streaming
+    // connection. So construct the SAME NodeP2P producer the --coin-daemon arm
+    // builds, dial the best-scored discovered peer, and drive header sync with a
+    // self-rescheduling failover timer. NodeP2P already walks getheaders forward
+    // autonomously on each 2000-header batch (coin/p2p_node.hpp add_headers), so
+    // this driver only needs to (a) kickstart getheaders from genesis on a fresh
+    // handshake, (b) re-request on a stall, and (c) fail over to the next
+    // candidate when the header tip makes no progress for kNoProgressFailoverSec.
+    //
+    // Skipped entirely when --coin-daemon is present (that arm already owns
+    // coin_p2p) — behaviour there is unchanged. Header-only against random public
+    // peers: deliberately NO enable_mempool_request() (a bip35 mempool pull to an
+    // unpermissioned peer is a fast-disconnect; main_btc.cpp does the same).
+    //
+    // The self-rescheduling driver closure needs one strong owner that outlives
+    // this block so its weak self-ref keeps rescheduling for the process life
+    // (mirrors main_btc.cpp's standalone_driver_keepalive).
+    std::shared_ptr<std::function<void()>> standalone_driver_keepalive;
+    if (coin_p2p_discover && coin_daemon.empty()) {
+        // DGB coin-network magic: default to the mainnet/testnet pchMessageStart
+        // (config_coin CoinParams MAINNET_MAGIC {fa c3 b6 da} / TESTNET_MAGIC),
+        // unless the operator overrode it with --coin-magic. Matches the coin_port
+        // the peer manager banked (12024 mainnet / 12026 testnet).
+        std::vector<std::byte> magic = coin_magic;
+        if (magic.empty()) {
+            const uint8_t* m = testnet ? dgb::CoinParams::TESTNET_MAGIC
+                                       : dgb::CoinParams::MAINNET_MAGIC;
+            magic = { std::byte{m[0]}, std::byte{m[1]},
+                      std::byte{m[2]}, std::byte{m[3]} };
+        }
+        config.coin()->m_p2p.prefix = magic;
+
+        // Genesis locator base: default to the DGB genesis (mainnet/testnet)
+        // unless --coin-genesis was supplied. NodeP2P walks forward from whatever
+        // headers the peer returns, so a genesis-anchored locator is a sufficient
+        // kickstart; re-sending it on a stall is idempotent (already-known headers
+        // are re-validated/deduped and the walk-forward continues from the real
+        // tip). Genesis hashes are the DigiByte Core chainparams block-0 ids.
+        uint256 genesis = coin_genesis;
+        if (genesis.IsNull()) {
+            genesis = uint256S(testnet
+                ? "308ea0711d5763be2995670dd9ca9872753561285a84da1d58be58acaa822252"
+                : "7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
+        }
+        std::vector<uint256> genesis_locator;
+        if (!genesis.IsNull())
+            genesis_locator.push_back(genesis);
+
+        coin_p2p = std::make_unique<dgb::coin::p2p::NodeP2P<dgb::Config>>(
+            &ioc, &coin_iface, &config, "DGB-CoinP2P");
+
+        // Peers already dialed this run (exclusion set for failover); cleared to
+        // re-sweep once the banked set is exhausted so a dead first pick — or a
+        // peer that later drops — never wedges header sync at genesis.
+        auto standalone_tried = std::make_shared<std::set<std::string>>();
+        auto dial_standalone_peer =
+            [&coin_p2p, &coin_peer_mgr, standalone_tried]() -> bool {
+                if (!coin_peer_mgr) return false;
+                auto cands = coin_peer_mgr->get_peers_to_connect(*standalone_tried);
+                if (cands.empty()) {
+                    standalone_tried->clear();
+                    cands = coin_peer_mgr->get_peers_to_connect(*standalone_tried);
+                }
+                if (cands.empty()) {
+                    std::cout << "[DGB] standalone header source: no coin peers to "
+                                 "dial yet" << std::endl;
+                    return false;
+                }
+                const auto& ep = cands.front();
+                standalone_tried->insert(ep.to_string());
+                std::cout << "[DGB] standalone header source: dialing coin peer "
+                          << ep.to_string() << " (no external digibyted)"
+                          << std::endl;
+                coin_p2p->connect(ep.to_net_service());
+                return true;
+            };
+        // Initial dial now so the driver's first tick finds a handshaking peer.
+        dial_standalone_peer();
+
+        // ── Standalone header-sync driver ────────────────────────────────────
+        //   (a) kickstart: getheaders(locator=[genesis]) on a fresh handshake so
+        //       the peer starts streaming from genesis (NodeP2P walk-forward then
+        //       chains the rest autonomously);
+        //   (b) stall recovery: re-request when handshaked, not advancing;
+        //   (c) failover: dial the NEXT best-scored candidate when the header tip
+        //       makes no progress for kNoProgressFailoverSec, regardless of
+        //       handshake state — a handshaked-but-silent peer no longer wedges
+        //       sync forever. Weak self-ref avoids a shared_ptr cycle.
+        constexpr int kDriverTickSec         = 12;
+        constexpr int kNoProgressFailoverSec = 40;
+        auto hdr_last_height   = std::make_shared<uint32_t>(
+            header_chain.tip_height().value_or(0));
+        auto hdr_last_progress = std::make_shared<std::chrono::steady_clock::time_point>(
+            std::chrono::steady_clock::now());
+        auto hdr_was_handshaked = std::make_shared<bool>(false);
+        auto standalone_dial_timer = std::make_shared<io::steady_timer>(ioc);
+        auto schedule_standalone_dial = std::make_shared<std::function<void()>>();
+        standalone_driver_keepalive = schedule_standalone_dial;
+        std::weak_ptr<std::function<void()>> weak_dial = schedule_standalone_dial;
+        *schedule_standalone_dial =
+            [standalone_dial_timer, weak_dial, &coin_p2p, &header_chain,
+             genesis_locator, dial_standalone_peer, hdr_last_height,
+             hdr_last_progress, hdr_was_handshaked,
+             kDriverTickSec, kNoProgressFailoverSec]() {
+                standalone_dial_timer->expires_after(std::chrono::seconds(kDriverTickSec));
+                standalone_dial_timer->async_wait(
+                    [standalone_dial_timer, weak_dial, &coin_p2p, &header_chain,
+                     genesis_locator, dial_standalone_peer, hdr_last_height,
+                     hdr_last_progress, hdr_was_handshaked, kNoProgressFailoverSec]
+                    (const boost::system::error_code& ec) {
+                        if (ec) return;
+                        const uint32_t h = header_chain.tip_height().value_or(0);
+                        const bool handshaked = coin_p2p && coin_p2p->is_handshake_complete();
+                        const auto now = std::chrono::steady_clock::now();
+                        const bool advanced = (h > *hdr_last_height);
+                        if (advanced) { *hdr_last_height = h; *hdr_last_progress = now; }
+
+                        auto send_locator_getheaders = [&]() {
+                            // Anchor the locator on the CURRENT header tip so a
+                            // fresh failover/reconnect peer continues from where
+                            // we are instead of restreaming from genesis; fall
+                            // back to genesis only for an empty chain. HeaderChain
+                            // stores the tip id as a little-endian u256 (limb[0]
+                            // least significant) — the inverse of the
+                            // from_le_bytes(uint256) the ingest builder used, so
+                            // reversing the limbs reconstructs the wire uint256.
+                            std::vector<uint256> locator;
+                            if (auto tip = header_chain.tip_hash(); tip) {
+                                std::vector<unsigned char> b(32);
+                                for (int i = 0; i < 4; ++i)
+                                    for (int j = 0; j < 8; ++j)
+                                        b[i * 8 + j] = static_cast<unsigned char>(
+                                            (tip->limb[i] >> (8 * j)) & 0xffu);
+                                locator.emplace_back(b);
+                            } else {
+                                locator = genesis_locator;
+                            }
+                            std::cout << "[DGB] standalone header-sync getheaders "
+                                         "locator="
+                                      << (locator.empty()
+                                            ? std::string("<empty>")
+                                            : locator.front().GetHex().substr(0, 16))
+                                      << " chain_height=" << h << std::endl;
+                            // 70019 == DigiByte Core PROTOCOL_VERSION.
+                            coin_p2p->send_getheaders(70019, locator, uint256::ZERO);
+                        };
+
+                        if (handshaked) {
+                            if (!*hdr_was_handshaked)      // fresh (re)connect
+                                send_locator_getheaders();
+                            else if (!advanced)            // stalled
+                                send_locator_getheaders();
+                        }
+                        *hdr_was_handshaked = handshaked;
+
+                        if (now - *hdr_last_progress >=
+                                std::chrono::seconds(kNoProgressFailoverSec)) {
+                            std::cout << "[DGB] standalone header source: no header "
+                                         "progress for " << kNoProgressFailoverSec
+                                      << "s (chain_height=" << h << ", handshaked="
+                                      << handshaked << ") — failing over to next "
+                                         "candidate" << std::endl;
+                            dial_standalone_peer();
+                            *hdr_last_progress  = now;    // grace window for new peer
+                            *hdr_was_handshaked = false;  // force getheaders on handshake
+                        }
+                        if (auto self = weak_dial.lock()) (*self)();
+                    });
+            };
+        (*schedule_standalone_dial)();
+        std::cout << "[DGB] network-standalone header source ARMED "
+                     "(--coin-p2p-discover, no --coin-daemon): magic="
+                  << HexStr(magic) << " genesis="
+                  << (genesis_locator.empty() ? std::string("<none>")
+                        : genesis_locator.front().GetHex().substr(0, 16))
+                  << " (12s driver, " << kNoProgressFailoverSec
+                  << "s no-progress failover)" << std::endl;
     }
 
     // submitblock-RPC arm of the #82 dual-path broadcaster, driven from the
