@@ -295,9 +295,13 @@ public:
         }
 
         // ── Block version ──────────────────────────────────────────────────
-        uint32_t block_version = static_cast<uint32_t>(tip.header.m_version);
-        if (block_version < BIP9_BASE_VERSION)
-            block_version = BIP9_BASE_VERSION;
+        // Canonical GBT version, matching bitcoind ComputeBlockVersion: TOP_BITS
+        // only (no deployments to signal). NEVER inherit tip.header.m_version — a
+        // mainnet tip carries another miner's BIP310-rolled bits inside the
+        // 0x1fffe000 rolling mask; advertising them makes a version-rolling
+        // miner's submitted version_bits lossy, so no pool-side formula can
+        // recover the hashed version and every share rejects as a random hash.
+        uint32_t block_version = BIP9_BASE_VERSION;
 
         // ── Subsidy ────────────────────────────────────────────────────────
         uint64_t subsidy = get_block_subsidy(next_h, chain.params().subsidy_halving_interval);
