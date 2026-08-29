@@ -1683,13 +1683,14 @@ int main(int argc, char* argv[])
         });
 
     work_source->set_ref_hash_fn(
-        [p2p_node_raw, auto_ratchet, donation_u16](const uint256& prev_share_hash,
+        [p2p_node_raw, auto_ratchet, donation_u16, &merged_configs](const uint256& prev_share_hash,
                        const std::vector<unsigned char>& scriptSig,
                        const std::vector<unsigned char>& payout_script,
                        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp,
                        bool segwit_active,
                        const std::vector<uint256>& txid_merkle_branches,
-                       const uint256& witness_root)
+                       const uint256& witness_root,
+                       const std::vector<unsigned char>& mci_blob)
         -> core::stratum::RefHashResult
         {
             // Phase 12 contract: produce both the ref_hash AND the full
@@ -1853,6 +1854,23 @@ int main(int argc, char* argv[])
                             chain::bits_to_target(p.bits)).GetLow64());
                         p.far_share_hash = uint256::ZERO;
                     }
+
+                    // V36 merged-mining PPLNS commitment. Computed on THIS
+                    // guard (no re-lock — recursive shared_lock is UB). MUST use
+                    // the GBT BLOCK bits (bits_to_target(block_bits)), because
+                    // verify recomputes with block_target from
+                    // share.m_min_header.m_bits — the BLOCK bits — NOT the share
+                    // bits (share_check.hpp:1971-1974). merged_coinbase_info +
+                    // merged_addresses are set (below) OUTSIDE the guard; only
+                    // the payout-hash walk needs the tracker.
+                    if (core::version_gate::is_v36_active(p.share_version)) {
+                        try {
+                            p.merged_payout_hash = tracker.compute_merged_payout_hash(
+                                prev_share_hash, chain::bits_to_target(block_bits));
+                        } catch (const std::exception&) {
+                            p.merged_payout_hash = uint256();
+                        }
+                    }
                 } else {
                     // Tracker busy — fallback values, ref_hash won't match peers
                     set_block_bits_fallback();
@@ -1875,6 +1893,38 @@ int main(int argc, char* argv[])
             result.far_share_hash = p.far_share_hash;
             result.timestamp      = p.timestamp;
 
+            // ── V36 merged-mining (NMC AuxPoW) ref fields — SSOT blob ──
+            // Gated on v36 (p.share_version set by AutoRatchet above). Pre-v36
+            // the merged fields are not serialized at all (byte-identical to
+            // today); v36 with an empty blob serializes an empty vector, the
+            // same as a merged-off node. The blob is the EXACT bytes
+            // build_connection_coinbase froze from its mm snapshot (the same
+            // bytes create_local_share thaws at share_check.hpp:2790), so the
+            // ref this OP_RETURN commits to serializes merged_coinbase_info
+            // identically to the minted share and to attempt_verify's recompute.
+            if (core::version_gate::is_v36_active(p.share_version)) {
+                if (!mci_blob.empty()) {
+                    try {
+                        PackStream ps;
+                        ps.write(std::span<const std::byte>(
+                            reinterpret_cast<const std::byte*>(mci_blob.data()),
+                            mci_blob.size()));
+                        ps >> p.merged_coinbase_info;
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[BTC-STRATUM] ref merged_coinbase_info "
+                                       "deserialize threw: " << e.what();
+                        p.merged_coinbase_info.clear();
+                    }
+                }
+                // Same deterministic effective payout script the mint commits
+                // (create_local_share :2000-2001), so ref.merged_addresses ==
+                // share.m_merged_addresses byte-for-byte.
+                p.merged_addresses =
+                    btc::merged_addr_entries(merged_configs, payout_script);
+                result.merged_payout_hash          = p.merged_payout_hash;
+                result.frozen_merged_coinbase_info = mci_blob;
+            }
+
             try {
                 auto [rh, nn] = btc::compute_ref_hash_for_work(p);
                 result.ref_hash         = rh;
@@ -1889,6 +1939,67 @@ int main(int argc, char* argv[])
     LOG_INFO << "[BTC-STRATUM] PPLNS + ref_hash callbacks wired"
              << " (donation_script=" << btc::PoolConfig::get_donation_script(35).size()
              << "B P2PK; ref_hash walks share tracker for share_target/absheight/abswork/far_share)";
+
+    // ── Merged-mining (NMC AuxPoW) payout provider + work-change hook ──────
+    // Port of the LTC P2P/PPLNS payout provider (main_ltc.cpp:6402-6446) onto
+    // the BTC tracker. WITHOUT a payout provider, rebuild_cached_blocks
+    // early-returns (merged_mining.cpp:1163) and BOTH the cached aux header
+    // infos AND the cached commitment stay empty forever — so the whole
+    // producer seam (build_connection_coinbase emit_mm gate) stays dark. Wired
+    // HERE, after p2p_node + work_source exist (post-start setter — the
+    // LTC-proven pattern; mm_manager->start() already ran during aux-backend
+    // standup). null absent --merged => this whole block is skipped => the BTC
+    // coinbase is byte-identical to today.
+    if (mm_manager) {
+        mm_manager->set_payout_provider(
+            [p2p_node_raw](uint32_t chain_id, uint64_t coinbase_value)
+            -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+        {
+            if (!p2p_node_raw) return {};
+            auto best = p2p_node_raw->best_share_hash();
+            if (best.IsNull()) return {};
+            auto guard = p2p_node_raw->read_tracker();
+            if (!guard) return {};
+            auto& tracker = *guard;
+            if (!tracker.chain.contains(best)) return {};
+            // Aux block_target = parent block target (p2pool: from the best
+            // share's min_header bits), NOT the share target.
+            uint256 block_target;
+            tracker.chain.get(best).share.invoke([&](auto* s) {
+                block_target = chain::bits_to_target(s->m_min_header.m_bits);
+            });
+            // Merged chains commit the V36 (P2SH) donation script regardless
+            // of parent share version (p2pool data.py:303).
+            auto donation_script = btc::PoolConfig::get_donation_script(36);
+            std::map<std::vector<unsigned char>, uint64_t> payouts_map;
+            try {
+                payouts_map = tracker.get_merged_expected_payouts(
+                    best, block_target, coinbase_value, chain_id,
+                    donation_script, {}, {});
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC-MM] get_merged_expected_payouts threw: "
+                            << e.what();
+                return {};
+            }
+            std::vector<std::pair<std::vector<unsigned char>, uint64_t>> result;
+            result.reserve(payouts_map.size());
+            for (auto& [script, amount] : payouts_map)
+                if (amount >= 1) result.emplace_back(script, amount);
+            std::sort(result.begin(), result.end());
+            return result;
+        });
+        // Fresh aux tip / commitment -> repush stratum jobs so miners never mine
+        // a stale aux commitment (a stale commitment => any NMC block found is
+        // orphaned). refresh_aux_work posts this on the io_context.
+        mm_manager->set_on_work_changed(
+            [ws = work_source.get()]() { ws->bump_work_generation(); });
+        // Provider is live now; force the first rebuild so the commitment is
+        // populated on the next job build (refresh_aux_work otherwise rebuilds
+        // only on aux-tip change; build_connection_coinbase also honours this).
+        mm_manager->mark_pplns_dirty();
+        LOG_INFO << "[BTC-MM] payout provider + work-change hook wired ("
+                 << mm_manager->chain_count() << " aux chain(s))";
+    }
 
     // ── Sharechain WRITE path (Phase 11) ──────────────────────────────────
     //
@@ -1986,17 +2097,17 @@ int main(int argc, char* argv[])
                 p2p_node_raw->tracker(), job.prev_share_hash);
 
             uint256 share_hash;
-            // P1 PE anchor (nmc/pe-main-btc-host-wire): merged_addrs is the
-            // seam the embedded NMC aux backend feeds — next slices add the
-            // --merged parse -> embedded-NMC register -> aux-merkle payout.
-            // Empty here == v35 behavior byte-for-byte until the backend is
-            // wired, so this commit is a no-op at runtime.
-            // NMC PE host-wire slice 4: commit one aux payout entry per parsed
-            // --merged chain. Empty absent --merged (v35 byte-for-byte). Until
-            // PC freezes per-share PPLNS aux scripts into the template, this
-            // feeds the parent payout_script under each aux chain_id — the
-            // --merged path is wire-only and not yet consensus-consistent with
-            // the frozen ref, so it stays behind that opt-in flag.
+            // Merged-mining (NMC AuxPoW): one aux payout entry per --merged
+            // chain, keyed by chain_id, paying the SAME deterministic effective
+            // payout_script the ref lambda commits (both derive
+            // merged_addr_entries over the identical script), so the minted
+            // share's m_merged_addresses reproduces the frozen ref byte-for-byte.
+            // The aux commitment itself + the per-share frozen aux-header blob
+            // (job.frozen_ref.frozen_merged_coinbase_info) are already carried
+            // through the generic freeze plumbing below — so a found BTC block
+            // now yields a valid NMC AuxPoW and every share is share-consistent
+            // (verify_merged_coinbase_commitment passes). Empty absent --merged
+            // => v35 byte-for-byte.
             std::vector<btc::MergedAddressEntry> merged_addrs =
                 btc::merged_addr_entries(merged_configs, payout_script);
             try {
