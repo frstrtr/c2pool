@@ -1302,11 +1302,12 @@ std::vector<unsigned char> BTCWorkSource::effective_payout_script(
 
     std::vector<uint8_t> buf;
     buf.reserve(32 + extranonce1_hex.size() + miner_script.size());
-    buf.insert(buf.end(), prev_share_hash.begin(), prev_share_hash.end());
+    uint256 psh = prev_share_hash;  // non-const copy: core::uint256 begin()/end() are non-const-only
+    buf.insert(buf.end(), psh.begin(), psh.end());
     buf.insert(buf.end(), extranonce1_hex.begin(), extranonce1_hex.end());
     buf.insert(buf.end(), miner_script.begin(), miner_script.end());
 
-    const uint256 h = Hash(std::span<const uint8_t>(buf.data(), buf.size()));
+    uint256 h = Hash(std::span<const uint8_t>(buf.data(), buf.size()));
     // First 8 bytes as a little-endian u64 (no dependency on a uint256 accessor
     // name); modulo 100000 gives 0.001%-granular rolls.
     uint64_t roll = 0;
