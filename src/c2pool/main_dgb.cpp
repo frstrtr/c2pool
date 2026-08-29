@@ -830,22 +830,41 @@ int run_node(const core::CoinParams& params, bool testnet,
                         const bool advanced = (h > *hdr_last_height);
                         if (advanced) { *hdr_last_height = h; *hdr_last_progress = now; }
 
-                        auto send_kickstart_getheaders = [&]() {
+                        auto send_locator_getheaders = [&]() {
+                            // Anchor the locator on the CURRENT header tip so a
+                            // fresh failover/reconnect peer continues from where
+                            // we are instead of restreaming from genesis; fall
+                            // back to genesis only for an empty chain. HeaderChain
+                            // stores the tip id as a little-endian u256 (limb[0]
+                            // least significant) — the inverse of the
+                            // from_le_bytes(uint256) the ingest builder used, so
+                            // reversing the limbs reconstructs the wire uint256.
+                            std::vector<uint256> locator;
+                            if (auto tip = header_chain.tip_hash(); tip) {
+                                std::vector<unsigned char> b(32);
+                                for (int i = 0; i < 4; ++i)
+                                    for (int j = 0; j < 8; ++j)
+                                        b[i * 8 + j] = static_cast<unsigned char>(
+                                            (tip->limb[i] >> (8 * j)) & 0xffu);
+                                locator.emplace_back(b);
+                            } else {
+                                locator = genesis_locator;
+                            }
                             std::cout << "[DGB] standalone header-sync getheaders "
                                          "locator="
-                                      << (genesis_locator.empty()
+                                      << (locator.empty()
                                             ? std::string("<empty>")
-                                            : genesis_locator.front().GetHex().substr(0, 16))
+                                            : locator.front().GetHex().substr(0, 16))
                                       << " chain_height=" << h << std::endl;
                             // 70019 == DigiByte Core PROTOCOL_VERSION.
-                            coin_p2p->send_getheaders(70019, genesis_locator, uint256::ZERO);
+                            coin_p2p->send_getheaders(70019, locator, uint256::ZERO);
                         };
 
                         if (handshaked) {
                             if (!*hdr_was_handshaked)      // fresh (re)connect
-                                send_kickstart_getheaders();
-                            else if (!advanced)            // stalled / at genesis
-                                send_kickstart_getheaders();
+                                send_locator_getheaders();
+                            else if (!advanced)            // stalled
+                                send_locator_getheaders();
                         }
                         *hdr_was_handshaked = handshaked;
 
