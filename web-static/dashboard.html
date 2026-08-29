@@ -7842,15 +7842,49 @@
                 }
             });
             
-            // Interpolate luck trend to align with hashrate time boundaries
-            // Use exponential decay toward 0 after the last known block luck,
-            // based on target block time from currency_info. This reflects rising expected work
-            // with no found block: luck drifts down as time passes without a hit.
-            var targetBlockTimeMs = parentBlockPeriodMs; // from currency_info
+            // Interpolate luck trend to align with hashrate time boundaries.
+            // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
+            // the render wall-clock "now". luck-if-found-now =
+            //   expected_round_time / elapsed_since_last_block * 100
+            // (same formula as rest_luck_stats current_luck_trend). It reads
+            // high right after a block, decays hyperbolically (~1/elapsed), and
+            // crosses 100% exactly at the expected round duration.
+            // expected_round_time = net_diff * 2^32 / pool_hashrate.
+            var liveLuckPoint = null;
+            if (sortedBlocks.length > 0) {
+                var lastBlk = sortedBlocks[sortedBlocks.length - 1];
+                var lastBlkMs = lastBlk.ts * 1000;
+                var nowMs = Date.now();
+                // Clock skew / just-found: clamp elapsed to >= 1s.
+                var elapsedMs = Math.max(nowMs - lastBlkMs, 1000);
+                // Freshest inputs first, at-find values as fallback.
+                var liveNetDiff = null;
+                for (var nd = netDiffData.length - 1; nd >= 0; nd--) {
+                    if (netDiffData[nd][1] && netDiffData[nd][1] > 0) { liveNetDiff = netDiffData[nd][1]; break; }
+                }
+                if (!(liveNetDiff > 0)) liveNetDiff = lastBlk.network_difficulty;
+                var livePoolHr = 0;
+                for (var hv = values.length - 1; hv >= 0; hv--) {
+                    if (values[hv] > 0) { livePoolHr = values[hv]; break; }
+                }
+                if (!(livePoolHr > 0)) livePoolHr = lastBlk.pool_hashrate_at_find;
+                var expectedMs = 0;
+                if (liveNetDiff > 0 && livePoolHr > 0) {
+                    expectedMs = liveNetDiff * 4294967296 / livePoolHr * 1000;
+                } else if (lastBlk.expected_time > 0) {
+                    expectedMs = lastBlk.expected_time * 1000;
+                }
+                if (expectedMs > 0) {
+                    // Cap at 1000%: transformLuck maps 1000 -> 200 (axis top),
+                    // so a just-found block cannot blow up the centered scale.
+                    var liveLuck = Math.min((expectedMs / elapsedMs) * 100, 1000);
+                    liveLuckPoint = { x: Math.max(nowMs, maxTime), y: liveLuck, expectedMs: expectedMs, lastBlkMs: lastBlkMs };
+                }
+            }
             if (luckTrendData.length > 0) {
                 // Sort by time
                 luckTrendData.sort(function(a, b) { return a[0] - b[0]; });
-                
+
                 // Add interpolated point at minTime if first point is after minTime
                 if (luckTrendData[0][0] > minTime && sortedBlocks.length > 0) {
                     // Find the last block before minTime for interpolation
@@ -7863,7 +7897,7 @@
                             break;
                         }
                     }
-                    
+
                     if (prevBlock) {
                         // Use the previous block's luck value at minTime
                         luckTrendData.unshift([minTime, prevBlock.luck]);
@@ -7872,34 +7906,17 @@
                         luckTrendData.unshift([minTime, luckTrendData[0][1]]);
                     }
                 }
-                
-                // Add interpolated point at maxTime with exponential decay toward 0
-                if (luckTrendData[luckTrendData.length - 1][0] < maxTime) {
-                    var lastTime = luckTrendData[luckTrendData.length - 1][0];
-                    var lastLuckVal = luckTrendData[luckTrendData.length - 1][1];
-                    var decay = Math.exp(-(maxTime - lastTime) / targetBlockTimeMs);
-                    var decayedLuck = lastLuckVal * decay;
-                    luckTrendData.push([maxTime, decayedLuck]);
+
+                // Append the live in-progress extrapolation at x = now.
+                if (liveLuckPoint && liveLuckPoint.x > luckTrendData[luckTrendData.length - 1][0]) {
+                    luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
                 }
-            } else if (luckTrendData.length === 0 && sortedBlocks.length > 0) {
-                // Edge case: No blocks in time window, but blocks exist before it
-                // Find the most recent block with luck before minTime
-                var lastBlockBeforeWindow = null;
-                for (var i = sortedBlocks.length - 1; i >= 0; i--) {
-                    var bt = sortedBlocks[i].ts * 1000;
-                    if (bt < minTime && sortedBlocks[i].luck !== undefined) {
-                        lastBlockBeforeWindow = sortedBlocks[i];
-                        break;
-                    }
-                }
-                
-                if (lastBlockBeforeWindow) {
-                    // Draw line from minTime to maxTime with exponential decay toward 0
-                    var lastLuck = lastBlockBeforeWindow.luck;
-                    luckTrendData.push([minTime, lastLuck]);
-                    var decay = Math.exp(-(maxTime - minTime) / targetBlockTimeMs);
-                    luckTrendData.push([maxTime, lastLuck * decay]);
-                }
+            } else if (sortedBlocks.length > 0 && liveLuckPoint) {
+                // No blocks inside the window: draw the same hyperbola across it.
+                var edgeElapsedMs = Math.max(minTime - liveLuckPoint.lastBlkMs, 1000);
+                var edgeLuck = Math.min((liveLuckPoint.expectedMs / edgeElapsedMs) * 100, 1000);
+                luckTrendData.push([minTime, edgeLuck]);
+                luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
             }
             
             // Convert simple array points to objects for luck trend
@@ -8572,15 +8589,49 @@
                 }
             });
             
-            // Interpolate luck trend to align with hashrate time boundaries
-            // Use exponential decay toward 0 after the last known block luck,
-            // based on target block time from currency_info. This reflects rising expected work
-            // with no found block: luck drifts down as time passes without a hit.
-            var targetBlockTimeMs = parentBlockPeriodMs; // from currency_info
+            // Interpolate luck trend to align with hashrate time boundaries.
+            // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
+            // the render wall-clock "now". luck-if-found-now =
+            //   expected_round_time / elapsed_since_last_block * 100
+            // (same formula as rest_luck_stats current_luck_trend). It reads
+            // high right after a block, decays hyperbolically (~1/elapsed), and
+            // crosses 100% exactly at the expected round duration.
+            // expected_round_time = net_diff * 2^32 / pool_hashrate.
+            var liveLuckPoint = null;
+            if (sortedBlocks.length > 0) {
+                var lastBlk = sortedBlocks[sortedBlocks.length - 1];
+                var lastBlkMs = lastBlk.ts * 1000;
+                var nowMs = Date.now();
+                // Clock skew / just-found: clamp elapsed to >= 1s.
+                var elapsedMs = Math.max(nowMs - lastBlkMs, 1000);
+                // Freshest inputs first, at-find values as fallback.
+                var liveNetDiff = null;
+                for (var nd = netDiffData.length - 1; nd >= 0; nd--) {
+                    if (netDiffData[nd][1] && netDiffData[nd][1] > 0) { liveNetDiff = netDiffData[nd][1]; break; }
+                }
+                if (!(liveNetDiff > 0)) liveNetDiff = lastBlk.network_difficulty;
+                var livePoolHr = 0;
+                for (var hv = values.length - 1; hv >= 0; hv--) {
+                    if (values[hv] > 0) { livePoolHr = values[hv]; break; }
+                }
+                if (!(livePoolHr > 0)) livePoolHr = lastBlk.pool_hashrate_at_find;
+                var expectedMs = 0;
+                if (liveNetDiff > 0 && livePoolHr > 0) {
+                    expectedMs = liveNetDiff * 4294967296 / livePoolHr * 1000;
+                } else if (lastBlk.expected_time > 0) {
+                    expectedMs = lastBlk.expected_time * 1000;
+                }
+                if (expectedMs > 0) {
+                    // Cap at 1000%: transformLuck maps 1000 -> 200 (axis top),
+                    // so a just-found block cannot blow up the centered scale.
+                    var liveLuck = Math.min((expectedMs / elapsedMs) * 100, 1000);
+                    liveLuckPoint = { x: Math.max(nowMs, maxTime), y: liveLuck, expectedMs: expectedMs, lastBlkMs: lastBlkMs };
+                }
+            }
             if (luckTrendData.length > 0) {
                 // Sort by time
                 luckTrendData.sort(function(a, b) { return a[0] - b[0]; });
-                
+
                 // Add interpolated point at minTime if first point is after minTime
                 if (luckTrendData[0][0] > minTime && sortedBlocks.length > 0) {
                     // Find the last block before minTime for interpolation
@@ -8593,7 +8644,7 @@
                             break;
                         }
                     }
-                    
+
                     if (prevBlock) {
                         // Use the previous block's luck value at minTime
                         luckTrendData.unshift([minTime, prevBlock.luck]);
@@ -8602,34 +8653,17 @@
                         luckTrendData.unshift([minTime, luckTrendData[0][1]]);
                     }
                 }
-                
-                // Add interpolated point at maxTime with exponential decay toward 0
-                if (luckTrendData[luckTrendData.length - 1][0] < maxTime) {
-                    var lastTime = luckTrendData[luckTrendData.length - 1][0];
-                    var lastLuckVal = luckTrendData[luckTrendData.length - 1][1];
-                    var decay = Math.exp(-(maxTime - lastTime) / targetBlockTimeMs);
-                    var decayedLuck = lastLuckVal * decay;
-                    luckTrendData.push([maxTime, decayedLuck]);
+
+                // Append the live in-progress extrapolation at x = now.
+                if (liveLuckPoint && liveLuckPoint.x > luckTrendData[luckTrendData.length - 1][0]) {
+                    luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
                 }
-            } else if (luckTrendData.length === 0 && sortedBlocks.length > 0) {
-                // Edge case: No blocks in time window, but blocks exist before it
-                // Find the most recent block with luck before minTime
-                var lastBlockBeforeWindow = null;
-                for (var i = sortedBlocks.length - 1; i >= 0; i--) {
-                    var bt = sortedBlocks[i].ts * 1000;
-                    if (bt < minTime && sortedBlocks[i].luck !== undefined) {
-                        lastBlockBeforeWindow = sortedBlocks[i];
-                        break;
-                    }
-                }
-                
-                if (lastBlockBeforeWindow) {
-                    // Draw line from minTime to maxTime with exponential decay toward 0
-                    var lastLuck = lastBlockBeforeWindow.luck;
-                    luckTrendData.push([minTime, lastLuck]);
-                    var decay = Math.exp(-(maxTime - minTime) / targetBlockTimeMs);
-                    luckTrendData.push([maxTime, lastLuck * decay]);
-                }
+            } else if (sortedBlocks.length > 0 && liveLuckPoint) {
+                // No blocks inside the window: draw the same hyperbola across it.
+                var edgeElapsedMs = Math.max(minTime - liveLuckPoint.lastBlkMs, 1000);
+                var edgeLuck = Math.min((liveLuckPoint.expectedMs / edgeElapsedMs) * 100, 1000);
+                luckTrendData.push([minTime, edgeLuck]);
+                luckTrendData.push([liveLuckPoint.x, liveLuckPoint.y]);
             }
             
             // Convert simple array points to objects for luck trend
