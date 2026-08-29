@@ -21,6 +21,8 @@
 #include <impl/btc/coin/template_builder.hpp>  // build_template + merkle_hash_pair
 #include <impl/btc/coin/transaction.hpp>
 #include <c2pool/merged/merged_mining.hpp>   // MergedMiningManager::has_chain (PR-2a)
+#include <impl/btc/share_types.hpp>          // btc::MergedCoinbaseEntry, BaseScript (frozen aux blob)
+#include <core/pack.hpp>                     // PackStream (frozen merged coinbase serialization)
 
 #include <core/address_utils.hpp>               // address_to_script (for share write path)
 #include <core/hash.hpp>
@@ -445,12 +447,49 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         donation_script = donation_script_;
     }
 
+    // ── Merged-mining (NMC AuxPoW) commitment snapshot ────────────────────
+    // Port of LTC web_server.cpp:1511-1513 (rebuild-if-dirty) + :1127-1133
+    // (ONE atomic read of the pre-built aux header infos + 44-byte commitment).
+    // The 44-byte commitment (fabe6d6d + 32-byte mm_root BE + tree_size LE +
+    // nonce LE, built by c2pool::merged::build_auxpow_commitment) is spliced
+    // into the coinbase scriptSig below; the SAME header infos are frozen
+    // per-share (mci_blob, further down) so the commitment the PRODUCER writes
+    // and the commitment the VERIFIER checks (share_check.hpp
+    // verify_merged_coinbase_commitment) agree byte-for-byte. Structural sync
+    // gate: get_cached_header_infos_and_commitment() only returns a non-empty
+    // commitment/infos once the aux chain is synced and rebuild_cached_blocks
+    // has run with a payout provider (merged_mining.cpp:1152/:1289) — so
+    // merged-off / pre-sync leaves the coinbase byte-identical to today.
+    std::vector<uint8_t> mm_commitment;
+    std::vector<c2pool::merged::MergedMiningManager::MergedHeaderInfo> mm_infos;
+    if (mm_manager_ && mm_manager_->has_chains()) {
+        if (mm_manager_->is_pplns_dirty())
+            mm_manager_->rebuild_cached_blocks();
+        auto mm_snap = mm_manager_->get_cached_header_infos_and_commitment();
+        mm_infos      = std::move(mm_snap.first);
+        mm_commitment = std::move(mm_snap.second);
+    }
+    // ONE flag gates BOTH the scriptSig splice and the frozen blob. A
+    // commitment-without-info or info-without-commitment is precisely the
+    // split-brain state verify_merged_coinbase_commitment hard-rejects, so
+    // derive both from this single snapshot + single flag. (<76: the push
+    // opcode equals the length for 1..75-byte pushes; the commitment is 44 B.)
+    const bool emit_mm = !mm_commitment.empty() && !mm_infos.empty()
+                       && mm_commitment.size() < 76;
+
     // ── ScriptSig assembly (always the same — coinbase deterministic) ──
     auto bip34 = bip34_height_push(height);
     static const std::string POOL_TAG = "/c2pool-btc/";
 
     std::vector<uint8_t> scriptsig;
     scriptsig.insert(scriptsig.end(), bip34.begin(), bip34.end());
+    // Layout [height][mm commitment][tag] — matches the LTC producer order
+    // (web_server.cpp:1212-1214: height_hex, then mm push, then tag push).
+    if (emit_mm) {
+        // Push opcode == length for 1-75 bytes (44 => 0x2c).
+        scriptsig.push_back(static_cast<uint8_t>(mm_commitment.size()));
+        scriptsig.insert(scriptsig.end(), mm_commitment.begin(), mm_commitment.end());
+    }
     if (!POOL_TAG.empty() && POOL_TAG.size() < 76) {
         // Push opcode: for 1-75 bytes, the opcode IS the length.
         scriptsig.push_back(static_cast<uint8_t>(POOL_TAG.size()));
@@ -624,13 +663,57 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     // difficulty (was forever 0 before Phase 12 → mining_submit was
     // never called for ordinary pseudoshares → chain-share creation
     // never triggered).
+    // ── Freeze the merged-mining coinbase info (SSOT) ─────────────────────
+    // Serialize the aux header infos ONCE, from the SAME mm snapshot that
+    // produced the scriptSig commitment above (mirror main_ltc.cpp:4846-4892
+    // field map). This blob is (a) passed to ref_hash_fn, which deserializes
+    // it into the ref's merged_coinbase_info, and (b) frozen into
+    // snap.frozen_ref.frozen_merged_coinbase_info, which create_local_share
+    // thaws back into share.m_merged_coinbase_info verbatim
+    // (share_check.hpp:2790-2799) — so the bytes hashed into the OP_RETURN ref
+    // are definitionally the bytes the minted share carries and the bytes
+    // attempt_verify re-serializes. Empty when !emit_mm (V35 omits the merged
+    // fields; V36 serializes an empty vector — identical to a merged-off node).
+    std::vector<unsigned char> mci_blob;
+    if (emit_mm) {
+        std::vector<btc::MergedCoinbaseEntry> entries;
+        entries.reserve(mm_infos.size());
+        for (const auto& hi : mm_infos) {
+            btc::MergedCoinbaseEntry e;
+            e.m_chain_id       = hi.chain_id;
+            e.m_coinbase_value = hi.coinbase_value;
+            e.m_block_height   = hi.block_height;
+            // 80-byte header guard: verify (share_check.hpp:1730) hard-errors on
+            // a header < 80 bytes; zero-fill a malformed one rather than emit it.
+            if (hi.block_header.size() == 80)
+                e.m_block_header.m_data = hi.block_header;
+            else
+                e.m_block_header.m_data.assign(80, 0);
+            e.m_coinbase_merkle_link.m_branch = hi.coinbase_merkle_branches;
+            e.m_coinbase_merkle_link.m_index  = 0;
+            e.m_coinbase_script.m_data        = hi.coinbase_script;
+            entries.push_back(std::move(e));
+        }
+        try {
+            PackStream ps;
+            ps << entries;
+            mci_blob.assign(
+                reinterpret_cast<const unsigned char*>(ps.data()),
+                reinterpret_cast<const unsigned char*>(ps.data()) + ps.size());
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[BTC-STRATUM] merged_coinbase_info serialize threw: "
+                        << e.what() << " — merged commitment dropped for this job";
+            mci_blob.clear();
+        }
+    }
+
     core::stratum::RefHashResult rh_result;
     if (ref_hash_fn) {
         try {
             rh_result = ref_hash_fn(prev_share_hash, scriptsig, eff_script,
                                     coinbasevalue, block_bits, curtime,
                                     segwit_active, frozen_branches_u256,
-                                    witness_root_uint);
+                                    witness_root_uint, mci_blob);
             if (rh_result.bits != 0) {
                 share_bits_.store(rh_result.bits, std::memory_order_relaxed);
                 share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
@@ -778,6 +861,14 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     // mint (create_local_share_v35) reconstructs byte-identical segwit_data.
     snap.frozen_ref.frozen_merkle_branches = frozen_branches_u256;
     snap.frozen_ref.frozen_witness_root    = witness_root_uint;
+    // Merged-mining (NMC AuxPoW): freeze the per-share PPLNS commitment hash
+    // and the serialized aux-header blob so the generic downstream plumbing
+    // (stratum_server.cpp payload store/restore -> create_local_share) mints a
+    // share whose m_merged_coinbase_info / m_merged_payout_hash reproduce THIS
+    // job's OP_RETURN ref byte-for-byte. Empty/null when merged-off (no delta
+    // vs today). Both come from the SAME rh_result the ref_hash above committed.
+    snap.frozen_ref.merged_payout_hash          = rh_result.merged_payout_hash;
+    snap.frozen_ref.frozen_merged_coinbase_info = rh_result.frozen_merged_coinbase_info;
 
     auto txs_field = wd->m_data.find("transactions");
     if (txs_field != wd->m_data.end() && txs_field->is_array()) {
@@ -1007,6 +1098,32 @@ nlohmann::json BTCWorkSource::mining_submit(
             LOG_INFO << tag << " accepted (no-tracker) user=" << username
                      << " pow_hash=" << pow_hex_short
                      << " job=" << job_id;
+        }
+
+        // ── Merged-mining: submit any aux (NMC) block THIS share solves ──
+        // Analog of MiningInterface::check_merged_mining (web_server.cpp:406,
+        // called on every accepted stratum share :9124). The aux target is far
+        // below the parent share target, so this must run per ACCEPTED SHARE,
+        // not only on a won parent block — most found NMC blocks ride ordinary
+        // shares. try_submit_merged_blocks self-gates on the aux target
+        // (merged_mining.cpp:880-900), rebuilds the AuxPoW proof from the frozen
+        // aux header committed in THIS job's coinbase (keyed by its block hash
+        // in frozen_history), and relays via the #1390 CoinBroadcaster. BTC
+        // coinb1/coinb2 are witness-free by construction — correct for the
+        // AuxPoW parent-coinbase merkle branch. On the won-block arm this runs
+        // AFTER the parent block was already dispatched (reward invariant).
+        if (mm_manager_ && mm_manager_->has_chains()) {
+            try {
+                std::string parent_header_hex =
+                    HexStr(std::span<const uint8_t>(header.data(), 80));
+                std::string parent_coinbase_hex =
+                    job->coinb1 + extranonce1 + extranonce2 + job->coinb2;
+                mm_manager_->try_submit_merged_blocks(
+                    parent_header_hex, parent_coinbase_hex,
+                    job->merkle_branches, 0, pow_hash);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC-MM] try_submit_merged_blocks threw: " << e.what();
+            }
         }
     };
 

@@ -146,6 +146,16 @@ public:
     /// serializes segwit_data identically to the share attempt_verify later
     /// reconstructs (share_check.hpp:574-587). All three are computed once,
     /// from the SAME template snapshot the coinbase is built from.
+    ///
+    /// `frozen_merged_coinbase_info` is the pre-serialized
+    /// vector<btc::MergedCoinbaseEntry> blob built by build_connection_coinbase
+    /// from the SAME merged-mining snapshot that produced the scriptSig aux
+    /// commitment (SSOT). The lambda deserializes these exact bytes into the
+    /// ref's merged_coinbase_info — the same bytes create_local_share later
+    /// thaws into the minted share — so producer ref == verifier ref by
+    /// construction. Empty when merged mining is off / the aux chain is not
+    /// synced (V35 does not serialize the merged fields at all; V36 serializes
+    /// an empty vector, identical to a merged-off node).
     using RefHashFn = std::function<core::stratum::RefHashResult(
         const uint256& prev_share_hash,
         const std::vector<unsigned char>& coinbase_scriptSig,
@@ -153,7 +163,8 @@ public:
         uint64_t subsidy, uint32_t block_bits, uint32_t timestamp,
         bool segwit_active,
         const std::vector<uint256>& txid_merkle_branches,
-        const uint256& witness_root)>;
+        const uint256& witness_root,
+        const std::vector<unsigned char>& frozen_merged_coinbase_info)>;
 
     /// Sharechain WRITE path. Called from mining_submit when a share's
     /// SHA256d PoW meets sharechain (not block) target. main_btc.cpp wires
