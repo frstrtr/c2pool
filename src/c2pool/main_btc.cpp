@@ -47,6 +47,14 @@
 #include <impl/btc/coin/block_confirm.hpp>       // #995/#1155 found-block confirm/orphan resolver
 #include <impl/btc/coin/merged_spec.hpp>          // parse --merged SPEC -> AuxChainConfig (NMC PE host-wire slice 3)
 #include <impl/btc/coin/merged_backend.hpp>       // build aux backends + merged_addr payout seam (NMC PE host-wire slice 4)
+// PA/PB: embedded NMC SPV aux backend (daemonless --merged NMC) — mirrors the
+// #1387 main_ltc wiring: AuxChainEmbedded primary + AuxChainRPC fallback +
+// NMC coin-P2P header-feed (seeds + AuxPoW-preserving raw-headers sink).
+#include <impl/nmc/coin/aux_chain_embedded.hpp>   // nmc::coin::AuxChainEmbedded + HeaderChain + Mempool
+#include <impl/nmc/coin/chain_seeds.hpp>          // nmc_dns_seeds / nmc_fixed_seeds (#980)
+#include <impl/nmc/coin/headers_wire.hpp>         // parse_nmc_headers_message (AuxPoW intact)
+#include <impl/ltc/config_coin.hpp>               // ltc::config::P2PData/RPCData — BroadcasterConfig adapter dep (coin_broadcaster.hpp; main_ltc pulls it via config.hpp)
+#include <c2pool/merged/coin_broadcaster.hpp>     // CoinBroadcaster (NMC coin-P2P header-feed)
 
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -342,6 +350,12 @@ int main(int argc, char* argv[])
             LOG_ERROR << "[NMC-MM] ignoring invalid --merged spec (" << merged_err << "): " << spec;
             continue;
         }
+        // PA/PB: the embedded NMC follower is P2P-driven, so default the NMC
+        // coin-P2P port when the optional 7th SPEC field is absent (SSOT:
+        // src/impl/nmc/coin/chain_seeds.hpp — namecoind mainnet 8334 /
+        // testnet3 18334; mirrors main_ltc's get_coin_p2p_port auto-detect).
+        if (cfg.symbol == "NMC" && cfg.p2p_port == 0)
+            cfg.p2p_port = testnet ? 18334 : 8334;
         LOG_INFO << "[NMC-MM] aux chain configured: " << cfg.symbol
                  << " chain_id=" << cfg.chain_id
                  << " rpc=" << cfg.rpc_host << ":" << cfg.rpc_port
@@ -406,16 +420,236 @@ int main(int argc, char* argv[])
 
     io::io_context ioc;
 
-    // ── NMC PE host-wire slice 4: construct aux backends from merged_configs ──
-    // One AuxChainRPC (external-daemon fallback) per parsed aux chain. The
-    // embedded-NMC SPV backend registers as primary alongside these in a later
-    // slice (PA/PB); construction is inert so an offline aux daemon never blocks
-    // BTC startup. Held for the whole run; the manager wiring lands with PC.
+    // ── NMC PE host-wire slice 4 + PA/PB: aux backends from merged_configs ──
+    // One AuxChainRPC (external-daemon fallback) per parsed aux chain — the
+    // fallback route that MUST always exist (never removed). PA/PB below
+    // registers the embedded-NMC SPV backend (nmc::coin::AuxChainEmbedded) as
+    // PRIMARY alongside it, mirroring the #1387 NMC block in main_ltc
+    // (~L5471-5524 + the L6132-6215 header-feed). Construction is inert — no
+    // connect() here, so an unreachable aux daemon never blocks BTC startup.
     auto aux_backends = btc::build_aux_backends(ioc, merged_configs);
     if (!aux_backends.empty())
         LOG_INFO << "[NMC-MM] " << aux_backends.size()
-                 << " aux chain backend(s) constructed (RPC fallback path);"
-                    " embedded-NMC primary + template wiring pending (PE later slices)";
+                 << " aux chain RPC backend(s) constructed (fallback path)";
+
+    // PA/PB state — all inert (null) absent --merged; declared AFTER ioc so
+    // destruction runs before ioc's (broadcaster timers/sockets + the manager
+    // poll thread stop first). Mirrors main_ltc declaration order (:5235-5246).
+    std::unique_ptr<c2pool::merged::MergedMiningManager> mm_manager;
+    std::map<uint32_t, std::unique_ptr<c2pool::merged::CoinBroadcaster>> merged_broadcasters;
+    std::unique_ptr<nmc::coin::HeaderChain>    nmc_chain;
+    std::unique_ptr<nmc::coin::Mempool>        nmc_pool;
+    std::unique_ptr<nmc::coin::NMCChainParams> nmc_params_ptr;
+
+    if (!merged_configs.empty()) {
+        mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
+        for (size_t ci = 0; ci < merged_configs.size(); ++ci) {
+            auto& cfg = merged_configs[ci];
+            if (cfg.symbol == "NMC") {
+                // Embedded NMC merged-mining under the BTC parent — faithful
+                // port of the main_ltc NMC block (#1387, :5471-5524). NMC is
+                // aux-only: no UTXO maturity gate; embedded HeaderChain +
+                // Mempool + P2P header-feed is the authoritative route.
+                if (!nmc_chain) {
+                    auto np = testnet
+                        ? nmc::coin::NMCChainParams::testnet()
+                        : nmc::coin::NMCChainParams::mainnet();
+                    nmc_params_ptr = std::make_unique<nmc::coin::NMCChainParams>(np);
+                    std::string nmc_net_dir = testnet ? "namecoin_testnet" : "namecoin";
+                    std::string nmc_db = (core::filesystem::config_path()
+                        / nmc_net_dir / "embedded_headers").string();
+                    nmc_chain = std::make_unique<nmc::coin::HeaderChain>(*nmc_params_ptr, nmc_db);
+                    if (!nmc_chain->init())
+                        LOG_WARNING << "[EMB-NMC] HeaderChain init failed - P2P sync will rebuild";
+                    if (!testnet && nmc_chain->size() == 0) {
+                        auto g = nmc::coin::NMCChainParams::mainnet_genesis_header();
+                        if (nmc_chain->add_header(g))
+                            LOG_INFO << "[EMB-NMC] seeded mainnet genesis header";
+                    }
+                }
+                if (!nmc_pool) nmc_pool = std::make_unique<nmc::coin::Mempool>();
+                {
+                    auto backend = std::make_unique<nmc::coin::AuxChainEmbedded>(
+                        *nmc_chain, *nmc_pool, *nmc_params_ptr, cfg, testnet);
+                    // Embedded P2P relay sink — looked up lazily in
+                    // merged_broadcasters (registered below), mirroring the
+                    // manager-level set_block_relay_fn. submit_block_raw
+                    // returns the relayed peer count.
+                    uint32_t nmc_chain_id = cfg.chain_id;
+                    auto* mbs = &merged_broadcasters;
+                    backend->set_block_relay(
+                        [mbs, nmc_chain_id](const std::string& block_hex) -> size_t {
+                            auto it = mbs->find(nmc_chain_id);
+                            if (it == mbs->end()) return 0;
+                            try {
+                                return it->second->submit_block_raw(ParseHex(block_hex));
+                            } catch (const std::exception& e) {
+                                LOG_WARNING << "[MM:NMC] embedded P2P relay failed: " << e.what();
+                                return 0;
+                            }
+                        });
+                    mm_manager->add_chain(cfg, std::move(backend));
+                    LOG_INFO << "Merged mining: NMC embedded (primary) chain_id=" << cfg.chain_id;
+                    // AuxChainRPC fallback (slice-4 backend, index-parallel to
+                    // merged_configs) — the never-removed external-daemon path.
+                    if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty() && aux_backends[ci]) {
+                        mm_manager->set_fallback_backend(cfg.chain_id, std::move(aux_backends[ci]));
+                        LOG_INFO << "Merged mining: NMC RPC fallback at "
+                                 << cfg.rpc_host << ":" << cfg.rpc_port;
+                    }
+                }
+            } else {
+                // Non-NMC aux chain — standard RPC-primary path (slice-4 backend).
+                mm_manager->add_chain(cfg, std::move(aux_backends[ci]));
+                LOG_INFO << "Merged mining: added " << cfg.symbol
+                         << " (chain_id=" << cfg.chain_id << ") via RPC at "
+                         << cfg.rpc_host << ":" << cfg.rpc_port;
+            }
+
+            // ── NMC coin-P2P broadcaster + AuxPoW header-feed (#980 L1/L2) ──
+            if (cfg.symbol == "NMC" && cfg.p2p_port > 0 && nmc_chain) {
+                // SSOT: NMCChainParams::p2p_magic (header_chain.hpp; KAT
+                // auxpow_wire_test.cpp) — mainnet f9beb4fe / testnet3 fabfb5fe.
+                auto prefix = testnet ? ParseHexBytes("fabfb5fe")
+                                      : ParseHexBytes("f9beb4fe");
+                c2pool::merged::PeerManagerConfig pm_cfg;
+                pm_cfg.is_merged = true;
+                pm_cfg.max_connection_attempts = 5;
+                pm_cfg.refresh_interval_sec = 300;
+                pm_cfg.max_peers = 20;
+                pm_cfg.min_peers = 4;
+                pm_cfg.valid_ports = {8334, 18334};
+                // Validate the P2P address via PeerEndpoint. In embedded mode
+                // with a placeholder RPC host, a dead endpoint is scored out by
+                // the peer manager; DNS/fixed seeds carry discovery.
+                auto local_daemon = PeerEndpoint::from(cfg.p2p_address, cfg.p2p_port);
+                if (!local_daemon) {
+                    LOG_INFO << "[NMC] No valid local daemon P2P address"
+                             << " ('" << cfg.p2p_address << ":" << cfg.p2p_port << "')"
+                             << " — broadcaster will use seed-only mode";
+                }
+                auto broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
+                    ioc, cfg.symbol, prefix,
+                    std::move(local_daemon),
+                    ".", pm_cfg);
+
+                // #980: NMC DNS seeds are dead — live dialing works via
+                // nmc_fixed_seeds (handshake-verified). No HTTP seeds.
+                broadcaster->peer_manager().set_dns_seeds(
+                    nmc::coin::nmc_dns_seeds(testnet));
+                broadcaster->peer_manager().set_fixed_seeds(
+                    nmc::coin::nmc_fixed_seeds(testnet));
+
+                // getpeerinfo bootstrap from the aux chain backend (RPC arm).
+                auto* rpc_ptr = mm_manager->get_chain_rpc(cfg.chain_id);
+                if (rpc_ptr) {
+                    broadcaster->set_getpeerinfo_fn([rpc_ptr]() {
+                        return rpc_ptr->getpeerinfo();
+                    });
+                }
+
+                // #980: NMC embedded header sync via P2P AuxPoW feed. The join
+                // point is set_raw_headers_sink — NOT set_raw_headers_parser
+                // (80-byte-only, drops the AuxPoW proof; structurally
+                // insufficient for a chain that has been AuxPoW since 2014).
+                auto nmc_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+                auto* bcaster_ptr = broadcaster.get();
+                auto* nc = nmc_chain.get();
+
+                // Peer-height (sync-progress logging only, no consensus)
+                broadcaster->set_on_peer_height(
+                    [nc](uint32_t h) {
+                        nc->set_peer_tip_height(h);
+                        LOG_INFO << "NMC peer reports height " << h;
+                    });
+
+                // The AuxPoW-carrying join point: parse the raw 'headers'
+                // payload to (header, optional<AuxPow>) and admit via
+                // add_auxpow_header (proof-verified) / add_header (own-PoW).
+                // Serialized on a 1-thread pool (mirror DOGE/LTC-side NMC).
+                broadcaster->set_raw_headers_sink(
+                    [nc, nmc_hdr_pool, bcaster_ptr, &ioc](
+                        const std::string& /*peer*/,
+                        const uint8_t* d, size_t n) {
+                        auto payload = std::make_shared<std::vector<uint8_t>>(d, d + n);
+                        boost::asio::post(*nmc_hdr_pool,
+                            [payload, nc, bcaster_ptr, &ioc]() {
+                                auto parsed = nmc::coin::parse_nmc_headers_message(
+                                    payload->data(), payload->size());
+                                int acc = 0;
+                                uint256 last_hash;
+                                for (auto& wh : parsed) {
+                                    bool ok = wh.auxpow
+                                        ? nc->add_auxpow_header(wh.header, *wh.auxpow)
+                                        : nc->add_header(wh.header);
+                                    if (ok) ++acc;
+                                    last_hash = nmc::coin::block_hash(wh.header);
+                                }
+                                if (acc > 0)
+                                    LOG_INFO << "[EMB-NMC] admitted " << acc << "/"
+                                             << parsed.size() << " headers, height="
+                                             << nc->height();
+                                bool full_batch = (parsed.size() >= 2000);
+                                if (acc > 0 || full_batch) {
+                                    boost::asio::post(ioc,
+                                        [acc, last_hash, nc, bcaster_ptr]() {
+                                          try {
+                                            if (acc > 0 && !last_hash.IsNull())
+                                                bcaster_ptr->request_headers({last_hash}, uint256::ZERO);
+                                            else
+                                                bcaster_ptr->request_headers(nc->get_locator(), uint256::ZERO);
+                                          } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-NMC] post-process: " << e.what();
+                                          }
+                                        });
+                                }
+                            });
+                    });
+
+                // Periodic getheaders sync timer (5s unsynced / 60s synced)
+                auto nmc_sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                auto nmc_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                *nmc_sync_fn = [nmc_sync_fn, nmc_sync_timer,
+                                nc, bcaster_ptr](boost::system::error_code ec) {
+                    if (ec) return;
+                    int interval = nc->is_synced() ? 60 : 5;
+                    nmc_sync_timer->expires_after(std::chrono::seconds(interval));
+                    nmc_sync_timer->async_wait(*nmc_sync_fn);
+                    try {
+                        bcaster_ptr->request_headers(nc->get_locator(), uint256::ZERO);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[EMB-NMC] Header sync error: " << e.what();
+                    }
+                };
+                nmc_sync_timer->expires_after(std::chrono::seconds(10));
+                nmc_sync_timer->async_wait(*nmc_sync_fn);
+                LOG_INFO << "NMC embedded header sync wired via P2P (AuxPoW admission)";
+
+                broadcaster->start();
+                merged_broadcasters[cfg.chain_id] = std::move(broadcaster);
+            }
+        }
+
+        // Manager-level merged P2P block relay (mirror main_ltc :6463-6476).
+        if (!merged_broadcasters.empty()) {
+            mm_manager->set_block_relay_fn(
+                [&merged_broadcasters](uint32_t chain_id, const std::string& block_hex) {
+                    auto it = merged_broadcasters.find(chain_id);
+                    if (it == merged_broadcasters.end()) return;
+                    try {
+                        auto block_bytes = ParseHex(block_hex);
+                        it->second->submit_block_raw(block_bytes);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[MM] P2P block relay failed: " << e.what();
+                    }
+                });
+        }
+
+        mm_manager->start();
+        LOG_INFO << "Merged mining manager started with "
+                 << mm_manager->chain_count() << " chain(s)"
+                 << " — embedded-NMC primary, RPC fallback retained";
+    }
 
     // ── Graceful shutdown via boost::asio::signal_set ─────────────────────
     //
@@ -1281,6 +1515,12 @@ int main(int argc, char* argv[])
         header_chain, mempool, testnet, std::move(stratum_submit_fn));
     work_source_for_shutdown = work_source;  // expose to signal handler
 
+    // PA/PB: hand the merged-mining manager to the work source (PR-2a seam,
+    // work_source.hpp set_merged_mining_manager). null absent --merged =>
+    // has_merged_chain() false, plain-BTC path byte-identical.
+    if (mm_manager)
+        work_source->set_merged_mining_manager(mm_manager.get());
+
     // ── PPLNS + ref_hash callbacks (Phase 8d) ────────────────────────────
     //
     // These wire the BTCWorkSource's coinbase builder to the live BTC
@@ -1920,6 +2160,11 @@ int main(int argc, char* argv[])
 #endif
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
+
+        // PA/PB: surface the merged-mining manager on the dashboard /merged
+        // endpoints (mirror main_ltc :6251). null absent --merged.
+        if (mm_manager)
+            web_server->set_merged_mining_manager(mm_manager.get());
 
         // Cross-coin dashboard parity: serve the shared refined web-static
         // dashboard over --http (btc.voidbind, same UI as LTC/DASH). This lane
