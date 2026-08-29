@@ -141,13 +141,13 @@ static void print_usage()
         "                  e.g. NMC:1:127.0.0.1:8336:nmcrpc:pass  (Namecoin)\n"
         "                  Omit for a single SHA256d BTC parent (no aux).\n"
         "  -f, --fee PCT   node-owner fee percent (default 0 = off). With prob.\n"
-        "                  PCT%%, a job's payout identity becomes --node-owner-address\n"
+        "                  PCT%, a job's payout identity becomes --node-owner-address\n"
         "                  (committed into the share; verify reproduces it — NOT a\n"
         "                  separate coinbase output). Requires --node-owner-address.\n"
         "  --node-owner-address ADDR  destination for the node-owner fee\n"
         "                  (P2PKH/P2SH/P2WPKH). Ignored (fee disabled) if undecodable.\n"
         "  --give-author PCT  dev-donation percent (alias --dev-donation). Default\n"
-        "                  keeps the built-in 0.5%%; 0 allowed (donation output still\n"
+        "                  keeps the built-in 0.5%; 0 allowed (donation output still\n"
         "                  emits per p2pool dust-marker semantics, amount 0). Changes\n"
         "                  the donation AMOUNT only — the donation script is unchanged.\n";
 }
