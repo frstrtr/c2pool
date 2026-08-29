@@ -524,6 +524,15 @@ public:
     /// A value of 0 disables outbound dialing.
     void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
 
+    /// Enable/disable the coin-seed escalation bootstrapper (default: enabled).
+    /// The escalation tier injects PUBLIC Bitcoin COIN seeds (port 8333) into
+    /// the POOL addr store whenever the outbound deficit persists. On a
+    /// custom/federation sharechain (custom --network-id/--prefix) that deficit
+    /// is permanent, so a federation would perpetually dial the open coin
+    /// network. main_btc disables this on custom nets / explicit-peer configs.
+    /// Must be called before start_outbound_connections().
+    void set_seed_escalation_enabled(bool enabled) { m_seed_escalation_enabled = enabled; }
+
     /// Set max total P2P peers (inbound + outbound).
     void set_max_peers(size_t count) { m_max_peers = count; }
 
@@ -683,6 +692,11 @@ protected:
     // signal into the pull-based Snapshot the bootstrapper reads each tick.
     std::unique_ptr<btc::coin::SeedBootstrapper> m_seed_bootstrapper;
     bool m_seed_candidates_exhausted = false;
+    // When false, start_outbound_connections() never constructs the
+    // SeedBootstrapper — set by main_btc on custom/federation nets so the
+    // escalation tier can't inject public COIN seeds (port 8333) into the pool
+    // addr store. Default true preserves public-net behavior byte-for-byte.
+    bool m_seed_escalation_enabled = true;
     // Periodic have_tx/losing_tx delta sweep (core/tx_advertiser.hpp). Cadence
     // mirrors the canonical known-tx removal loop, node.py:298 t.start(10).
     std::unique_ptr<core::Timer> m_tx_advert_timer;

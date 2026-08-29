@@ -1593,6 +1593,13 @@ void NodeImpl::start_outbound_connections()
     //                    tier resolves nothing and the FSM fast-advances past it
     //                    to the fixed tier (empty-tier advance path).
     //   tier 1 = fixed — static NetService fallback list (sync, works today).
+    //
+    // Skipped entirely on custom/federation nets (m_seed_escalation_enabled
+    // == false): the fixed tier is PUBLIC Bitcoin COIN seeds (port 8333) and a
+    // federation sharechain must never dial the open coin network. The tick
+    // sites below already null-check m_seed_bootstrapper, so leaving it unset
+    // simply disables escalation while the normal dial path keeps running.
+    if (m_seed_escalation_enabled)
     {
         const bool testnet = m_config->m_testnet;
         std::vector<btc::coin::SeedBootstrapper::TierFn> tiers;
@@ -1619,6 +1626,11 @@ void NodeImpl::start_outbound_connections()
             },
             std::move(tiers),
             std::random_device{}());  // per-node startup jitter decorrelation
+    }
+    else
+    {
+        LOG_INFO << "[Pool] Coin-seed escalation disabled "
+                    "(custom/federation net) — public COIN seeds suppressed";
     }
 
     // Try to connect to peers right away

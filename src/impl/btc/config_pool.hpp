@@ -229,4 +229,33 @@ public:
     std::vector<NetService> m_bootstrap_addrs;
 };
 
+// ---------------------------------------------------------------------------
+// Sharechain bootstrap-source selection (pure, testable seam)
+//
+// main_btc must decide which sharechain (pool P2P) peers to bootstrap from.
+// Historically the ELSE branch loaded the PUBLIC BTC p2pool seed list
+// (DEFAULT_BOOTSTRAP_HOSTS, port 9333) EVEN when a custom --network-id/--prefix
+// federation identity was set — so a federation node dialed the open network
+// it can never handshake (prefix mismatch → read_prefix disconnect), poisoning
+// its addr book with public peers. This resolver makes the precedence explicit
+// and unit-testable. Defaults (no custom id, no explicit peers) → PublicDefault,
+// byte-identical to prior behavior.
+// ---------------------------------------------------------------------------
+enum class SharechainBootstrapMode {
+    ExplicitPeers,        // --sharechain-addnode/--p2pool given: dial ONLY those
+    RegtestIsolated,      // --regtest: 0 seeds, solo/local
+    CustomNetSuppressed,  // custom --network-id, no explicit peers: 0 public seeds
+    PublicDefault,        // public net, no explicit peers: DEFAULT_BOOTSTRAP_HOSTS
+};
+
+// Precedence: explicit peers > regtest > custom-network-id > public default.
+inline SharechainBootstrapMode select_sharechain_bootstrap_mode(
+    bool has_explicit_peers, bool regtest, bool has_custom_network_id)
+{
+    if (has_explicit_peers)   return SharechainBootstrapMode::ExplicitPeers;
+    if (regtest)              return SharechainBootstrapMode::RegtestIsolated;
+    if (has_custom_network_id) return SharechainBootstrapMode::CustomNetSuppressed;
+    return SharechainBootstrapMode::PublicDefault;
+}
+
 } // namespace btc

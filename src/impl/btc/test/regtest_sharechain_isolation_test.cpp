@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include "../config_coin.hpp"
+#include "../config_pool.hpp"
 
 // The incident itself: regtest=true with testnet=false (main_btc resets it).
 // This MUST isolate to bitcoin_regtest; the pre-fix code returned "bitcoin".
@@ -53,4 +54,54 @@ TEST(RegtestSharechainIsolation, AllThreeNamespacesDistinct)
     EXPECT_NE(rt, tn);
     EXPECT_NE(rt, mn);
     EXPECT_NE(tn, mn);
+}
+// ---------------------------------------------------------------------------
+// Sharechain bootstrap-source precedence KATs (select_sharechain_bootstrap_mode).
+//
+// Regression guard for the btc.voidbind federation-dial incident: a node with
+// a custom --network-id (federation identity) still loaded the PUBLIC BTC
+// p2pool seed list, so it perpetually dialed the open network it can never
+// handshake (prefix mismatch), never sharing the federation sharechain. These
+// KATs pin the precedence: explicit peers > regtest > custom-net > public.
+// ---------------------------------------------------------------------------
+using btc::SharechainBootstrapMode;
+using btc::select_sharechain_bootstrap_mode;
+
+// Explicit peers (--sharechain-addnode/--p2pool) win over everything, even a
+// custom net or regtest also being set.
+TEST(SharechainBootstrap, ExplicitPeersWinAlways)
+{
+    EXPECT_EQ(select_sharechain_bootstrap_mode(true, false, false),
+              SharechainBootstrapMode::ExplicitPeers);
+    EXPECT_EQ(select_sharechain_bootstrap_mode(true, true,  true),
+              SharechainBootstrapMode::ExplicitPeers);
+    EXPECT_EQ(select_sharechain_bootstrap_mode(true, false, true),
+              SharechainBootstrapMode::ExplicitPeers);
+}
+
+// regtest (no explicit peers) → isolated, never the public seeds.
+TEST(SharechainBootstrap, RegtestIsolatedWhenNoExplicitPeers)
+{
+    EXPECT_EQ(select_sharechain_bootstrap_mode(false, true, false),
+              SharechainBootstrapMode::RegtestIsolated);
+    // regtest beats custom-net when both set but no explicit peers.
+    EXPECT_EQ(select_sharechain_bootstrap_mode(false, true, true),
+              SharechainBootstrapMode::RegtestIsolated);
+}
+
+// The incident itself: a custom network-id with NO explicit peer must NOT
+// dial the public seeds — it selects the suppressed mode, not PublicDefault.
+TEST(SharechainBootstrap, CustomNetSuppressesPublicSeeds)
+{
+    EXPECT_EQ(select_sharechain_bootstrap_mode(false, false, true),
+              SharechainBootstrapMode::CustomNetSuppressed);
+    EXPECT_NE(select_sharechain_bootstrap_mode(false, false, true),
+              SharechainBootstrapMode::PublicDefault);
+}
+
+// Public net, no explicit peers, not regtest → the historical default path.
+TEST(SharechainBootstrap, PublicDefaultUnchanged)
+{
+    EXPECT_EQ(select_sharechain_bootstrap_mode(false, false, false),
+              SharechainBootstrapMode::PublicDefault);
 }
