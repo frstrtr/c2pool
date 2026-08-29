@@ -7182,9 +7182,25 @@
                     grid.appendChild(cell);
                 });
         }
-        function loadMainPPLNS() {
+        // Bounded retries before the PPLNS treemap gives up. The treemap
+        // fetches its 355-byte /current_merged_payouts exactly once at page
+        // load (see page-init rationale), so a single transient failure — e.g.
+        // an intermittent 502 when a reverse proxy reuses an upstream socket
+        // the server has already half-closed — used to strand PPLNS at
+        // "Loading..." until the next manual/auto refresh. Retry with backoff
+        // (1.5s/3s/4.5s) so it self-heals, mirroring the sharechain-window
+        // retry above. Keeps the existing #pplns-loading placeholder visible
+        // (renderMainPPLNS only hides it on success).
+        var _pplnsLoadMaxRetries = 3;
+        function loadMainPPLNS(_attempt) {
+            var attempt = _attempt || 0;
             d3.json('../current_merged_payouts', function(payouts) {
-                if (!payouts || typeof payouts !== 'object') return;
+                if (!payouts || typeof payouts !== 'object') {
+                    if (attempt < _pplnsLoadMaxRetries) {
+                        setTimeout(function() { loadMainPPLNS(attempt + 1); }, 1500 * (attempt + 1));
+                    }
+                    return;
+                }
                 _cachedPPLNSPayouts = payouts;
                 renderMainPPLNS(payouts);
             });

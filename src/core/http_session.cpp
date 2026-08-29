@@ -1040,7 +1040,17 @@ void HttpSession::process_request()
 void HttpSession::send_response(http::response<http::string_body> response)
 {
     auto self = shared_from_this();
-    
+
+    // We shut down the send side of this socket immediately after the write
+    // completes (below), i.e. every response is the last one on its
+    // connection. Advertise that on the wire. Without an explicit
+    // "Connection: close", HTTP/1.1 defaults to keep-alive, so a reverse
+    // proxy (Caddy) pools and reuses the upstream connection — then races the
+    // server's FIN and intermittently returns 502 to the browser. Setting
+    // keep_alive(false) emits the header that matches our actual behaviour and
+    // eliminates that 502 class for every endpoint.
+    response.keep_alive(false);
+
     auto response_ptr = std::make_shared<http::response<http::string_body>>(std::move(response));
     
     http::async_write(socket_, *response_ptr,
