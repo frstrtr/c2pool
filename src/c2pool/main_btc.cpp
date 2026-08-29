@@ -65,6 +65,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 #include <core/stratum_server.hpp>
+#include <core/address_utils.hpp>       // core::address_to_script (node-owner fee destination)
 #include <core/web_server.hpp>          // H-STATS.944: operator dashboard + graph_db persist
 #include <btclibs/util/strencodings.h>
 
@@ -138,7 +139,17 @@ static void print_usage()
         "  --merged SPEC   embedded merged-mined aux chain (NMC under BTC),\n"
         "                  colon spec SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n"
         "                  e.g. NMC:1:127.0.0.1:8336:nmcrpc:pass  (Namecoin)\n"
-        "                  Omit for a single SHA256d BTC parent (no aux).\n";
+        "                  Omit for a single SHA256d BTC parent (no aux).\n"
+        "  -f, --fee PCT   node-owner fee percent (default 0 = off). With prob.\n"
+        "                  PCT%, a job's payout identity becomes --node-owner-address\n"
+        "                  (committed into the share; verify reproduces it — NOT a\n"
+        "                  separate coinbase output). Requires --node-owner-address.\n"
+        "  --node-owner-address ADDR  destination for the node-owner fee\n"
+        "                  (P2PKH/P2SH/P2WPKH). Ignored (fee disabled) if undecodable.\n"
+        "  --give-author PCT  dev-donation percent (alias --dev-donation). Default\n"
+        "                  keeps the built-in 0.5%; 0 allowed (donation output still\n"
+        "                  emits per p2pool dust-marker semantics, amount 0). Changes\n"
+        "                  the donation AMOUNT only — the donation script is unchanged.\n";
 }
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
@@ -175,6 +186,15 @@ int main(int argc, char* argv[])
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT: submitblock backup endpoint override (no secret)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH: bitcoin.conf creds (default ~/.bitcoin/bitcoin.conf)
     std::vector<std::string> merged_chain_specs; // --merged SPEC entries (embedded NMC aux; consumed in later PE slices)
+    // Node-owner fee + dev-donation (ported from main_dash.cpp -f/--fee /
+    // --node-owner-address / --give-author). Defaults leave an UNFLAGGED BTC
+    // deployment byte-identical: fee 0 (off) and donation u16 = 50 (0.5%, the
+    // pre-existing hardcoded value). --give-author only changes the donation
+    // AMOUNT; the donation SCRIPT (forrestv) is never touched.
+    double      node_owner_fee    = 0.0;   // -f/--fee PCT: node-owner fee %, default 0 (off)
+    std::string node_owner_address;        // --node-owner-address ADDR: fee destination
+    double      dev_donation      = 0.0;   // --give-author PCT: dev donation %
+    bool        give_author_set   = false; // true once --give-author/--dev-donation seen
 
     for (int i = 1; i < argc; ++i)
     {
@@ -304,6 +324,24 @@ int main(int argc, char* argv[])
             // following PE slices. Absent == BTC v35 byte-for-byte.
             merged_chain_specs.push_back(argv[++i]);
         }
+        else if ((arg == "-f" || arg == "--fee") && i + 1 < argc)
+        {
+            // p2pool node-owner fee percent. 0 (default) = off. Applied as a
+            // committed payout-identity substitution (NOT a coinbase output).
+            node_owner_fee = std::strtod(argv[++i], nullptr);
+        }
+        else if (arg == "--node-owner-address" && i + 1 < argc)
+        {
+            node_owner_address = argv[++i];
+        }
+        else if ((arg == "--give-author" || arg == "--dev-donation") && i + 1 < argc)
+        {
+            // Dev-donation percent -> the share's committed donation u16. 0 is
+            // allowed (donation output still emits as the dust marker). Only the
+            // AMOUNT changes; the donation script stays the compiled default.
+            dev_donation    = std::strtod(argv[++i], nullptr);
+            give_author_set = true;
+        }
         else
         {
             std::cerr << "unknown arg: " << arg << "\n";
@@ -322,6 +360,22 @@ int main(int argc, char* argv[])
     {
         print_usage();
         return 1;
+    }
+
+    // ── Dev-donation u16 (p2pool committed donation field) ──
+    // Default 50 (0.5%) keeps an UNFLAGGED deployment byte-identical to the two
+    // pre-existing hardcoded donation=50 sites below (ref_hash + create_local_share).
+    // --give-author overrides it: round(65535 * pct / 100), clamped to [0,65535].
+    // 0 is allowed (the donation output still emits as the p2pool dust marker; only
+    // its amount goes to ~0). The donation SCRIPT is never affected here.
+    uint16_t donation_u16 = 50;
+    if (give_author_set) {
+        double pct = dev_donation;
+        if (pct < 0.0)   pct = 0.0;
+        if (pct > 100.0) pct = 100.0;
+        uint64_t v = static_cast<uint64_t>(65535.0 * pct / 100.0 + 0.5);
+        if (v > 65535) v = 65535;
+        donation_u16 = static_cast<uint16_t>(v);
     }
 
     btc::PoolConfig::is_testnet = testnet;
@@ -1515,6 +1569,26 @@ int main(int argc, char* argv[])
         header_chain, mempool, testnet, std::move(stratum_submit_fn));
     work_source_for_shutdown = work_source;  // expose to signal handler
 
+    // ── Node-owner fee (p2pool -f/--fee + --node-owner-address) ──
+    // Ported from main_dash.cpp: with probability node_owner_fee%, a job's
+    // payout identity becomes the owner's script (committed into the share; the
+    // verify side reproduces it — NO extra coinbase output, NO share-format or
+    // verify change). Default (fee 0 / no address) leaves every job paying the
+    // miner, byte-identical to the pre-fee build. An undecodable address DISABLES
+    // the fee rather than silently paying an unspendable script.
+    if (node_owner_fee > 0.0 && !node_owner_address.empty()) {
+        auto owner_script = core::address_to_script(node_owner_address);
+        if (!owner_script.empty()) {
+            work_source->set_node_owner_fee(node_owner_fee, std::move(owner_script));
+            LOG_INFO << "[run] node-owner fee ARMED: " << node_owner_fee
+                     << "% -> " << node_owner_address;
+        } else {
+            LOG_WARNING << "[run] --fee " << node_owner_fee
+                        << " set but --node-owner-address '" << node_owner_address
+                        << "' is not decodable — node-owner fee DISABLED";
+        }
+    }
+
     // PA/PB: hand the merged-mining manager to the work source (PR-2a seam,
     // work_source.hpp set_merged_mining_manager). null absent --merged =>
     // has_merged_chain() false, plain-BTC path byte-identical.
@@ -1609,7 +1683,7 @@ int main(int argc, char* argv[])
         });
 
     work_source->set_ref_hash_fn(
-        [p2p_node_raw, auto_ratchet](const uint256& prev_share_hash,
+        [p2p_node_raw, auto_ratchet, donation_u16](const uint256& prev_share_hash,
                        const std::vector<unsigned char>& scriptSig,
                        const std::vector<unsigned char>& payout_script,
                        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp,
@@ -1641,7 +1715,7 @@ int main(int argc, char* argv[])
             p.coinbase_scriptSig  = scriptSig;
             p.share_nonce         = 0;             // matches LTC line 4281
             p.subsidy             = subsidy;
-            p.donation            = 50;            // 0.5% (matches finder fee)
+            p.donation            = donation_u16;  // --give-author (default 50 = 0.5%)
             p.stale_info          = 0;
             p.desired_version     = 35;
             p.timestamp           = timestamp;
@@ -1840,7 +1914,7 @@ int main(int argc, char* argv[])
     //     what the coinbase OP_RETURN claims
     //   - calls tracker.add(share) — attempt_verify runs later in think()
     work_source->set_create_share_fn(
-        [p2p_node_raw, auto_ratchet, &template_capture, &merged_configs](const std::vector<unsigned char>& full_coinbase,
+        [p2p_node_raw, auto_ratchet, &template_capture, &merged_configs, donation_u16](const std::vector<unsigned char>& full_coinbase,
                        const std::vector<uint8_t>&        header_80b,
                        const core::stratum::JobSnapshot&  job,
                        const std::vector<unsigned char>& payout_script)
@@ -1934,7 +2008,7 @@ int main(int argc, char* argv[])
                     /* prev_share */            job.prev_share_hash,
                     merkle_branches,
                     payout_script,
-                    /* donation */              50,         // 0.5%
+                    /* donation */              donation_u16,  // --give-author (default 50)
                     /* merged_addrs */          merged_addrs,
                     /* stale_info */            btc::StaleInfo::none,
                     /* segwit_active */         job.segwit_active,
