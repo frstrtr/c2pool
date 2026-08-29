@@ -4,6 +4,7 @@
 #include <algorithm>   // std::max — authorship only ever climbs, never downgrades
 #include <memory>
 #include "address_utils.hpp"
+#include "coin_registry.hpp"
 #include "socket.hpp"
 
 // Real coin daemon access (optional - only active when set_coin_node() is called)
@@ -5443,39 +5444,31 @@ nlohmann::json MiningInterface::rest_node_info()
     result["worker_port"] = m_worker_port;
     result["p2p_port"] = m_p2p_port;
 
-    switch (m_blockchain) {
-    case Blockchain::LITECOIN:
-        result["network"] = m_testnet ? "litecoin_testnet" : "litecoin";
-        result["symbol"] = "LTC";
-        break;
-    case Blockchain::BITCOIN:
-        result["network"] = m_testnet ? "bitcoin_testnet" : "bitcoin";
-        result["symbol"] = "BTC";
-        break;
-    case Blockchain::DOGECOIN:
-        result["network"] = m_testnet ? "dogecoin_testnet" : "dogecoin";
-        result["symbol"] = "DOGE";
-        break;
-    case Blockchain::DASH:
-        result["network"] = m_testnet ? "dash_testnet" : "dash";
-        result["symbol"] = "DASH";
-        break;
-    case Blockchain::DIGIBYTE:
-        result["network"] = m_testnet ? "digibyte_testnet" : "digibyte";
-        result["symbol"] = "DGB";
-        break;
-    default: break;
-    }
-    // Config-driven fallback for chains absent from the Blockchain enum
-    // (BCH / NMC-aux): label from the configured coin string rather than
-    // leaving symbol/network blank.
-    if (!result.contains("symbol")) {
-        std::string sym = node_symbol();
-        if (!sym.empty()) result["symbol"] = sym;
-    }
-    if (!result.contains("network")) {
-        std::string ck = primary_chain_key();
-        if (!ck.empty()) result["network"] = m_testnet ? (ck + "_testnet") : ck;
+    // Identity resolves label-FIRST, mirroring rest_web_currency_info's
+    // precedence. This matters for coins that deliberately share a Blockchain
+    // enum value with another chain: BCH runs on Blockchain::BITCOIN +
+    // set_coin_label("BCH"), so an enum switch alone would advertise
+    // bitcoin/BTC on a Bitcoin-Cash pool. The enum-native coins each set a coin
+    // label equal to their enum symbol (LTC/BTC/DOGE/DASH/DGB), so resolving
+    // through the label yields byte-identical output for them — zero regression
+    // — while BCH now correctly reports bitcoincash/BCH and any future
+    // label-keyed coin (e.g. an NMC-primary deployment) resolves through the
+    // same registry row. Network names come from the coin registry; an unknown
+    // label falls back to its own lowercased form (honesty: never fabricated).
+    std::string sym = m_coin_label;
+    for (auto& c : sym) if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
+    if (sym.empty()) sym = node_symbol();   // enum fallback when no label set
+    if (!sym.empty()) {
+        result["symbol"] = sym;
+        const auto* d = core::coin_descriptor(sym);
+        std::string net;
+        if (d) {
+            net = d->chain_name;
+        } else {
+            net = sym;
+            for (auto& c : net) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+        }
+        result["network"] = m_testnet ? (net + "_testnet") : net;
     }
     return result;
 }

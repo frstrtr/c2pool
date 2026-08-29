@@ -88,26 +88,40 @@ target_link_libraries(c2pool_node_enhanced INTERFACE
     nlohmann_json::nlohmann_json
 )
 
-# Inject version from git at build time. --dirty so a tag-exact but locally-
-# modified rebuild does not share a version string with the clean tag build
-# (the embedded oracle-shadow ledger keys its clean streak on this — a dirty
-# dev build must not inherit a tag-exact binary's graduation streak).
-execute_process(
-    COMMAND git describe --tags --always --dirty
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE C2POOL_GIT_VERSION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
+# Inject version from git at BUILD time (was configure time). --dirty so a
+# tag-exact but locally-modified rebuild does not share a version string with
+# the clean tag build (the embedded oracle-shadow ledger keys its clean streak
+# on this — a dirty dev build must not inherit a tag-exact binary's graduation
+# streak).
+#
+# The old execute_process() ran `git describe` only when CMake reconfigured, so
+# an incremental rebuild in a build dir configured at an older commit baked that
+# stale hash into the binary (deployed dgb/bch reported de025c6f while built
+# from ff3707c0 sources). Instead an always-out-of-date custom target regenerates
+# a header on every build; copy_if_different keeps its mtime stable when the
+# version is unchanged, so a no-op rebuild does not relink. Each c2pool-* target
+# depends on this target and gets the generated header on its include path; the
+# five mains + bch/pool_entrypoint.hpp include it under an __has_include guard,
+# so their existing `#ifdef C2POOL_VERSION` blocks work unchanged.
+set(C2POOL_VERSION_HEADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+add_custom_target(c2pool_version_header
+    COMMAND ${CMAKE_COMMAND}
+            -DSRC_DIR=${CMAKE_SOURCE_DIR}
+            -DOUT_FILE=${C2POOL_VERSION_HEADER_DIR}/c2pool_build_version.h
+            -P ${CMAKE_SOURCE_DIR}/cmake/GenerateVersionHeader.cmake
+    BYPRODUCTS ${C2POOL_VERSION_HEADER_DIR}/c2pool_build_version.h
+    COMMENT "Generating c2pool_build_version.h (git describe, build-time)"
+    VERBATIM
 )
-if(NOT C2POOL_GIT_VERSION)
-    set(C2POOL_GIT_VERSION "0.1.0-alpha")
-endif()
-# Strip leading 'v'
-string(REGEX REPLACE "^v" "" C2POOL_GIT_VERSION "${C2POOL_GIT_VERSION}")
+# Helper: wire a c2pool-* executable to the build-time version header.
+function(c2pool_wire_version _tgt)
+    add_dependencies(${_tgt} c2pool_version_header)
+    target_include_directories(${_tgt} PRIVATE ${C2POOL_VERSION_HEADER_DIR})
+endfunction()
 
 # Main C2Pool Enhanced Application (refactored with mining_shares/p2p_shares separation)
 add_executable(c2pool main_ltc.cpp)
-target_compile_definitions(c2pool PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+c2pool_wire_version(c2pool)
 target_link_libraries(c2pool
     c2pool_node_enhanced
     c2pool_payout
@@ -147,7 +161,7 @@ target_link_libraries(c2pool_enhanced c2pool_hashrate pool)  # OBJECT-lib SCC di
 # and c2pool_enhanced already build the same LTC-native main). DOGE aux rides
 # via c2pool_merged_mining -- always compiled in, NO -DAUX_DOGE flag.
 add_executable(c2pool-ltc main_ltc.cpp)
-target_compile_definitions(c2pool-ltc PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+c2pool_wire_version(c2pool-ltc)
 target_link_libraries(c2pool-ltc
     c2pool_node_enhanced
     c2pool_payout
@@ -168,7 +182,7 @@ target_link_libraries(c2pool-ltc c2pool_hashrate pool)  # OBJECT-lib SCC direct-
 # Links `ltc` transitively because core/web_server.cpp references LTC symbols
 # (see comment at the bottom of this file). Untangling that is out of B0 scope.
 add_executable(c2pool-btc main_btc.cpp)
-target_compile_definitions(c2pool-btc PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+c2pool_wire_version(c2pool-btc)
 target_link_libraries(c2pool-btc
     c2pool_node_enhanced
     c2pool_payout
@@ -223,7 +237,7 @@ target_link_libraries(c2pool-btc
 # dropped to avoid a duplicate-symbol link. Per-coin isolation holds: only the
 # c2pool-dgb target stanza changes.
 add_executable(c2pool-dgb main_dgb.cpp)
-target_compile_definitions(c2pool-dgb PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+c2pool_wire_version(c2pool-dgb)
 target_link_libraries(c2pool-dgb
     c2pool_payout
     c2pool_merged_mining  # symbol resolution for core web_server tangle (NOT -DAUX_DOGE)
@@ -274,7 +288,7 @@ add_executable(c2pool-bch
     ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_legacy.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bch/stratum/work_source.cpp
 )
-target_compile_definitions(c2pool-bch PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+c2pool_wire_version(c2pool-bch)
 # --ibd RUN-LOOP slice (integrator 2026-06-18): the read-only headers-first IBD
 # harness stands up EmbeddedDaemon over its P2P front-end (NodeP2P/HeaderChain/
 # Timer), which pulls the core OBJECT-lib + Boost.Asio. Adding ONLY these link
@@ -311,7 +325,7 @@ target_link_libraries(c2pool-bch
 # direct-naming, #22/#39); per-coin isolation held: src/impl/dash only, no
 # shared-base/core SOURCE edit, dashd RPC fallback untouched.
 add_executable(c2pool-dash main_dash.cpp)
-target_compile_definitions(c2pool-dash PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+c2pool_wire_version(c2pool-dash)
 target_link_libraries(c2pool-dash
     core pool sharechain
     c2pool_node_enhanced  # dash-dashboard: header-only EnhancedC2PoolNodeT (impl/dash/enhanced_node.hpp)

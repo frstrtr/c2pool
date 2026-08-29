@@ -1663,9 +1663,12 @@ private:
     // P2P peer info callback
     peer_info_fn_t m_peer_info_fn;
 
-    // Port configuration
-    uint16_t m_p2p_port{9326};
-    uint16_t m_worker_port{9327};
+    // Port configuration. 0 = not configured / no listener bound. Each coin's
+    // main wires the REAL runtime ports (stratum -> worker_port, sharechain ->
+    // p2p_port); these members are consumed only by rest_node_info (/node_info),
+    // so a template constant must never masquerade as this node's live port.
+    uint16_t m_p2p_port{0};
+    uint16_t m_worker_port{0};
     std::string m_external_ip;
     std::string m_pool_version{"c2pool/0.1.0-alpha"};
 
