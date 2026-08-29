@@ -96,10 +96,20 @@ inline uint32_t parse_be_hex_u32(const std::string& s) {
     return v;
 }
 
-// BIP 141 witness reserved value: 32 zero bytes embedded as the only
-// stack item in the coinbase witness. The witness commitment in the
-// coinbase OP_RETURN is computed against this exact value.
-constexpr std::array<uint8_t, 32> WITNESS_RESERVED_VALUE{};  // all zeros
+// BIP 141 witness reserved value: the p2pool witness nonce '[P2Pool]' repeated
+// 4 times (32 bytes), embedded as the only stack item in the coinbase witness.
+// The BIP141 commitment in the coinbase OP_RETURN is SHA256d(witness_root ||
+// reserved_value); the verify side (share_check.hpp compute_p2pool_witness_-
+// commitment, P2POOL_WITNESS_NONCE) rebuilds the commitment against exactly this
+// value, so the template MUST use the same bytes here AND in the won-block BIP144
+// witness stack item below — otherwise attempt_verify rejects the share
+// (GenerateShareTransaction mismatch) and a real won block is rejected by
+// bitcoind as bad-witness-merkle-match. BIP141 permits any reserved value as
+// long as commitment == SHA256d(witness_root || reserved) — this is what
+// upstream p2pool ships.
+constexpr std::array<uint8_t, 32> WITNESS_RESERVED_VALUE{
+    '[', 'P', '2', 'P', 'o', 'o', 'l', ']', '[', 'P', '2', 'P', 'o', 'o', 'l', ']',
+    '[', 'P', '2', 'P', 'o', 'o', 'l', ']', '[', 'P', '2', 'P', 'o', 'o', 'l', ']'};
 
 // BIP 141 witness commitment magic: OP_RETURN OP_PUSHBYTES_36 + "aa21a9ed".
 // Followed by 32 bytes of commitment hash for total OP_RETURN script of 38 bytes.
@@ -489,25 +499,18 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         }
     }
 
-    // v35 finder fee: 0.5% of the coinbase value goes to the share-finder
-    // (this miner), moved from the donation residual to the finder's output.
-    // Integer floor division (subsidy//200) via the v35_finder_fee_split SSOT —
-    // NO float on the money path (see finder_fee.hpp). Matches the p2pool
-    // reference (data.py generate_transaction: amounts[finder] += subsidy//200,
-    // unconditional) and the core/web_server.cpp preview path. The split is
-    // capped at the donation available, so it is applied unconditionally
-    // (never all-or-nothing skipped) while total stays == subsidy and no output
-    // goes negative. The map holds doubles, but the moved value is an exact
-    // integer satoshi count (<= 2^53, exact in double).
-    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()
-        && !donation_script.empty()) {
-        auto it = payouts.find(donation_script);
-        if (it != payouts.end()) {
-            const uint64_t donation_sats = static_cast<uint64_t>(it->second);
-            const uint64_t taken = v35_finder_fee_split(coinbasevalue, donation_sats);
-            it->second             -= static_cast<double>(taken);
-            payouts[payout_script] += static_cast<double>(taken);
-        }
+    // v35 finder fee (verify-exact): 0.5% of the coinbase value is added to the
+    // share-finder's output UNCONDITIONALLY. This mirrors the verify side
+    // (share_check.hpp generate_share_transaction: amounts[finder] += subsidy/200)
+    // and the p2pool reference (data.py generate_transaction). The donation output
+    // is recomputed as the residual (subsidy − sum(payouts)) AFTER this add — the
+    // same way verify derives it — rather than being min-capped against the
+    // donation entry. The old min-cap tied the finder fee to the donation entry
+    // being present and could diverge from verify by up to the cap. Integer floor
+    // division (subsidy//200), no float on the money path; the moved value is an
+    // exact integer satoshi count (<= 2^53, exact in double).
+    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()) {
+        payouts[payout_script] += static_cast<double>(coinbasevalue / 200);
     }
 
     // Degraded fallback: full subsidy → miner (only if miner address is OK).
@@ -515,7 +518,22 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         payouts[payout_script] = static_cast<double>(coinbasevalue);
     }
 
-    // ── Sort outputs: by amount asc, then by script asc (matches LTC) ──
+    // ── Donation output: extract it so it is NEVER amount-sorted into the payout
+    // list. The p2pool-canonical layout (which the verify side and the v35
+    // hash_link const-ending both require) places the single donation output
+    // SECOND-TO-LAST, immediately before the OP_RETURN — NOT interleaved among the
+    // PPLNS outputs. Verify (generate_share_transaction) builds payout_outputs that
+    // EXCLUDE the donation script, then writes one donation output last-but-one;
+    // compute_gentx_before_refhash likewise assumes VarStr(DONATION_SCRIPT)+
+    // int64(0)+6a28… directly precede ref_hash. Pull the donation entry out here;
+    // its value is recomputed below as the residual so total == subsidy and it is
+    // ALWAYS emitted (even at 0), mirroring verify. Serialized further down.
+    if (!donation_script.empty()) {
+        if (auto dit = payouts.find(donation_script); dit != payouts.end())
+            payouts.erase(dit);
+    }
+
+    // ── Sort outputs: by amount asc, then by script asc (matches LTC/verify) ──
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> outputs;
     outputs.reserve(payouts.size());
     for (const auto& [script, amount_d] : payouts) {
@@ -531,6 +549,16 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         if (a.second != b.second) return a.second < b.second;
         return a.first  < b.first;
     });
+
+    // Donation = residual: subsidy − sum(emitted non-donation outputs), computed
+    // over the SAME set of outputs that get serialized (post empty/dust filter) so
+    // it byte-matches verify's donation = subsidy − sum(amounts). Clamped >= 0.
+    uint64_t donation_amount = 0;
+    {
+        uint64_t paid = 0;
+        for (const auto& [script, amount] : outputs) paid += amount;
+        donation_amount = (coinbasevalue > paid) ? (coinbasevalue - paid) : 0;
+    }
 
     // ── Freeze the segwit inputs to the ref_hash BEFORE computing it ──
     // The v33+ share serializes segwit_data (txid merkle branches + wtxid
@@ -635,9 +663,13 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     }
 
     // ── Assemble coinb1: full tx up to (and including) ref_hash ──
-    // Output count = [witness commitment if segwit] + [PPLNS outputs] + [OP_RETURN ref_hash if any]
+    // Output count = [witness commitment if segwit] + [PPLNS outputs]
+    //              + [donation output (always, unless no donation script)]
+    //              + [OP_RETURN ref_hash if any]. Verify counts the donation output
+    // unconditionally (generate_share_transaction n_outs += 1 /* donation */).
     const size_t output_count = (segwit_active ? 1 : 0)
                               + outputs.size()
+                              + (donation_script.empty() ? 0 : 1)
                               + (emit_op_return ? 1 : 0);
 
     std::vector<uint8_t> coinb1;
@@ -660,11 +692,23 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
             witness_commitment_script.begin(), witness_commitment_script.end());
     }
 
-    // PPLNS / payout outputs (already sorted)
+    // PPLNS / payout outputs (already sorted, donation-free)
     for (const auto& [script, amount] : outputs) {
         push_u64_le(coinb1, amount);
         push_varint(coinb1, script.size());
         coinb1.insert(coinb1.end(), script.begin(), script.end());
+    }
+
+    // Donation output — p2pool-canonical SECOND-TO-LAST, immediately before the
+    // OP_RETURN. ALWAYS emitted (even at 0 sats) so the coinbase byte layout equals
+    // the verify-side rebuild (generate_share_transaction writes the donation
+    // output last-but-one) and the v35 hash_link const-ending
+    // (compute_gentx_before_refhash) resumes over the true tail bytes. Skipped only
+    // if no donation script is configured (degraded; never in production).
+    if (!donation_script.empty()) {
+        push_u64_le(coinb1, donation_amount);
+        push_varint(coinb1, donation_script.size());
+        coinb1.insert(coinb1.end(), donation_script.begin(), donation_script.end());
     }
 
     // Output last: OP_RETURN with c2pool ref_hash + 8B nonce slot.
@@ -964,7 +1008,7 @@ nlohmann::json BTCWorkSource::mining_submit(
         //
         // BIP 144 witness format inserts a marker(0x00) + flag(0x01) right
         // after the 4-byte version, and witness data right before the
-        // 4-byte locktime. Coinbase witness = 1 stack item, 32 zero bytes.
+        // 4-byte locktime. Coinbase witness = 1 stack item = WITNESS_RESERVED_VALUE.
         std::vector<uint8_t> coinbase_serialized = coinbase;
         if (job->segwit_active) {
             // Insert marker+flag after version (offset 4)
@@ -972,11 +1016,16 @@ nlohmann::json BTCWorkSource::mining_submit(
             coinbase_serialized.insert(coinbase_serialized.begin() + 4,
                 marker_flag.begin(), marker_flag.end());
             // Append witness BEFORE locktime (last 4 bytes):
-            //   [stack_count = 1][item_len = 0x20][32 zero bytes]
+            //   [stack_count = 1][item_len = 0x20][WITNESS_RESERVED_VALUE 32B]
+            // The stack item MUST be the SAME reserved value hashed into the BIP141
+            // commitment output above ('[P2Pool]'*4) — bitcoind validates the
+            // aa21a9ed commitment as SHA256d(witness_root || reserved_value), so a
+            // mismatch here (e.g. 32 zero bytes) would make a real won block
+            // rejected as bad-witness-merkle-match.
             std::array<uint8_t, 34> witness_bytes{};
             witness_bytes[0] = 0x01;  // stack_count
             witness_bytes[1] = 0x20;  // item_len = 32
-            // bytes [2..33] already zero from default-init = WITNESS_RESERVED_VALUE
+            std::memcpy(witness_bytes.data() + 2, WITNESS_RESERVED_VALUE.data(), 32);
             coinbase_serialized.insert(coinbase_serialized.end() - 4,
                 witness_bytes.begin(), witness_bytes.end());
         }
