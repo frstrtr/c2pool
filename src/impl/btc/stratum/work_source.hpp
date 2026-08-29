@@ -57,6 +57,44 @@ namespace c2pool { namespace merged { class MergedMiningManager; } }
 
 namespace btc::stratum {
 
+// Extract the coinbase scriptSig from a reconstructed coinbase TRANSACTION.
+// The mint seam (create_local_share) stores the scriptSig in share.m_coinbase,
+// which share_init_verify bounds to 2..100 bytes — so the mint MUST be handed
+// the scriptSig, NOT the full gentx. Coinbase tx layout:
+//   version(4) | vin_count(1=0x01) | prev_hash(32) | prev_idx(4) |
+//   scriptSig(varint len + bytes) | sequence(4) | ...
+// so the scriptSig length varint sits at fixed offset 41 (matches the coinb1
+// assembly in build_connection_coinbase). The 8-byte extranonce lands in the
+// OP_RETURN nonce slot near the tail, never in the scriptSig, so the bytes
+// recovered here are exactly the scriptSig the producer froze at template
+// time — which is what keeps the mint's recomputed ref_hash equal to the one
+// the miner's coinbase committed to. Port of dgb/stratum/work_source.cpp:118
+// (per-coin copy per the coin-isolation invariant); lifted to the header so
+// the mint call site in main_btc.cpp can reach it.
+inline std::vector<unsigned char>
+extract_coinbase_scriptsig(const std::vector<uint8_t>& coinbase_tx) {
+    constexpr size_t kScriptOffset = 4 + 1 + 32 + 4;  // = 41
+    if (coinbase_tx.size() < kScriptOffset + 1)
+        return {};  // truncated -> empty (fail-closed; mint declines on size<2)
+    size_t off = kScriptOffset;
+    uint64_t len = coinbase_tx[off++];
+    // A coinbase scriptSig is consensus-capped at 100 bytes, so its length is
+    // always a single-byte varint (< 0xfd). Handle the wider markers only to
+    // stay well-formed against a malformed buffer.
+    if (len == 0xfd) {
+        if (off + 2 > coinbase_tx.size()) return {};
+        len = static_cast<uint64_t>(coinbase_tx[off])
+            | (static_cast<uint64_t>(coinbase_tx[off + 1]) << 8);
+        off += 2;
+    } else if (len >= 0xfe) {
+        return {};  // implausible for a coinbase scriptSig -> fail-closed
+    }
+    if (off + len > coinbase_tx.size())
+        return {};  // length overruns the buffer -> fail-closed
+    return std::vector<unsigned char>(coinbase_tx.begin() + off,
+                                      coinbase_tx.begin() + off + len);
+}
+
 class BTCWorkSource : public core::stratum::IWorkSource
 {
 public:
@@ -103,11 +141,19 @@ public:
     /// candidate share timestamp; the lambda may clip it forward to
     /// `prev->m_timestamp + 1` and report the clipped value back via
     /// the result's `timestamp` field.
+    /// `segwit_active`, `txid_merkle_branches` and `witness_root` carry the
+    /// job's frozen segwit state so the ref_hash the OP_RETURN commits to
+    /// serializes segwit_data identically to the share attempt_verify later
+    /// reconstructs (share_check.hpp:574-587). All three are computed once,
+    /// from the SAME template snapshot the coinbase is built from.
     using RefHashFn = std::function<core::stratum::RefHashResult(
         const uint256& prev_share_hash,
         const std::vector<unsigned char>& coinbase_scriptSig,
         const std::vector<unsigned char>& payout_script,
-        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)>;
+        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp,
+        bool segwit_active,
+        const std::vector<uint256>& txid_merkle_branches,
+        const uint256& witness_root)>;
 
     /// Sharechain WRITE path. Called from mining_submit when a share's
     /// SHA256d PoW meets sharechain (not block) target. main_btc.cpp wires
@@ -300,6 +346,15 @@ private:
     mutable uint64_t template_cache_epoch_{~0ull};
     // Build-or-reuse the cached template under template_mutex_.
     std::shared_ptr<const btc::coin::rpc::WorkData> cached_template() const;
+
+    // Fold the stratum merkle branches from an ALREADY-snapshotted template.
+    // build_connection_coinbase uses this overload with the single `wd` it
+    // read once, so the OP_RETURN ref_hash, the coinbase body, and the frozen
+    // branches all come from the same template snapshot (no second
+    // cached_template() read that a tip roll could desync). The no-arg public
+    // override delegates here with cached_template().
+    std::vector<std::string> get_stratum_merkle_branches(
+        const std::shared_ptr<const btc::coin::rpc::WorkData>& wd) const;
 };
 
 }  // namespace btc::stratum

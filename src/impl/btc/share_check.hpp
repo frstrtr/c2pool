@@ -287,7 +287,7 @@ inline std::string pubkey_hash_to_address(const uint160& pubkey_hash, uint8_t pu
     bool testnet = PoolConfig::is_testnet;
     if (pubkey_type == 0) {
         // P2PKH: Base58Check with version byte
-        uint8_t ver = testnet ? 0x6f : 0x30;
+        uint8_t ver = testnet ? 0x6f : 0x00;  // BTC mainnet P2PKH (was 0x30 LTC)
         std::vector<unsigned char> payload(21);
         payload[0] = ver;
         std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
@@ -300,7 +300,7 @@ inline std::string pubkey_hash_to_address(const uint160& pubkey_hash, uint8_t pu
         return bech32::encode_segwit(hrp, 0, prog);
     } else if (pubkey_type == 2) {
         // P2SH: Base58Check with version byte
-        uint8_t ver = testnet ? 0xc4 : 0x32;
+        uint8_t ver = testnet ? 0xc4 : 0x05;  // BTC mainnet P2SH (was 0x32 LTC)
         std::vector<unsigned char> payload(21);
         payload[0] = ver;
         std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
@@ -397,8 +397,24 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     ref_stream << p.stale_info;
     ::Serialize(ref_stream, VarInt(p.desired_version));
 
-    if (p.has_segwit)
-        ref_stream << p.segwit_data;
+    // segwit_data (v33+): PossiblyNoneType — for segwit-active share versions
+    // this field is ALWAYS serialized, exactly as share_init_verify
+    // (share_check.hpp:574-587) and create_local_share_v35 (:2350-2356) do.
+    // When the job carries no segwit data, write the None sentinel (empty
+    // branch + zero root). Serializing this ONLY when has_segwit was true
+    // made the template-time OP_RETURN ref_hash diverge from the ref_hash
+    // attempt_verify recomputes off the stored share -> the share failed
+    // verification and earned no PPLNS credit.
+    if (p.share_version >= btc::PoolConfig::SEGWIT_ACTIVATION_VERSION) {
+        if (p.has_segwit) {
+            ref_stream << p.segwit_data;
+        } else {
+            std::vector<uint256> empty_branch;
+            ref_stream << empty_branch;
+            uint256 zero_root;
+            ref_stream << zero_root;
+        }
+    }
 
     // V36: merged_addresses (after segwit_data, before far_share_hash)
     if (core::version_gate::is_v36_active(p.share_version))

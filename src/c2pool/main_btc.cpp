@@ -1612,7 +1612,10 @@ int main(int argc, char* argv[])
         [p2p_node_raw, auto_ratchet](const uint256& prev_share_hash,
                        const std::vector<unsigned char>& scriptSig,
                        const std::vector<unsigned char>& payout_script,
-                       uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)
+                       uint64_t subsidy, uint32_t block_bits, uint32_t timestamp,
+                       bool segwit_active,
+                       const std::vector<uint256>& txid_merkle_branches,
+                       const uint256& witness_root)
         -> core::stratum::RefHashResult
         {
             // Phase 12 contract: produce both the ref_hash AND the full
@@ -1641,19 +1644,49 @@ int main(int argc, char* argv[])
             p.donation            = 50;            // 0.5% (matches finder fee)
             p.stale_info          = 0;
             p.desired_version     = 35;
-            p.has_segwit          = false;         // TODO Phase 8c+: detect from rules
             p.timestamp           = timestamp;
             // p.bits / p.max_bits set below from compute_share_target
 
-            // Heuristic v35 pubkey extract: P2PKH is 0x76 0xa9 0x14 + 20B + 0x88 0xac.
+            // Pubkey extract — MUST mirror create_local_share_v35
+            // (share_check.hpp:2230-2242) so the address string the mint
+            // freezes into the share equals the one this ref_hash commits to.
+            // P2PKH  (25B): 76 a9 14 <20> 88 ac -> type 0
+            // P2SH   (23B): a9 14 <20> 87        -> type 2
+            // P2WPKH (22B): 00 14 <20>           -> type 1
             if (payout_script.size() == 25 && payout_script[0] == 0x76 &&
                 payout_script[1] == 0xa9 && payout_script[2] == 0x14 &&
                 payout_script[23] == 0x88 && payout_script[24] == 0xac)
             {
                 std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 3, 20);
                 p.pubkey_type = 0;
+            } else if (payout_script.size() == 23 && payout_script[0] == 0xa9) {
+                std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 2, 20);
+                p.pubkey_type = 2;
+            } else if (payout_script.size() == 22 && payout_script[0] == 0x00) {
+                std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 2, 20);
+                p.pubkey_type = 1;
+            } else if (payout_script.size() >= 20) {
+                std::memcpy(p.pubkey_hash.begin(), payout_script.data(), 20);
             }
-            // Bech32 P2WSH/P2WPKH: leave pubkey_hash zeroed for now (TODO).
+            // V35 shares serialize the ADDRESS string (VarStr), not the
+            // pubkey_hash — populate it with the SAME derivation the mint
+            // uses (share_check.hpp:2242). Leaving it empty made the
+            // template ref_hash diverge from attempt_verify's recompute.
+            p.address = btc::pubkey_hash_to_address(p.pubkey_hash, p.pubkey_type);
+
+            // Segwit (v33+): the frozen ref serializes segwit_data (txid
+            // merkle branches + wtxid merkle root) for segwit-active share
+            // versions. Populate it from the job's frozen values so the
+            // OP_RETURN ref_hash matches what create_local_share_v35 stores
+            // and attempt_verify recomputes. has_segwit is gated on the GBT
+            // template's segwit activation (mirrors the mint's
+            // segwit_active && !witness_commitment.empty()).
+            p.has_segwit = segwit_active;
+            if (p.has_segwit) {
+                p.segwit_data.m_txid_merkle_link.m_branch = txid_merkle_branches;
+                p.segwit_data.m_txid_merkle_link.m_index  = 0;
+                p.segwit_data.m_wtxid_merkle_root         = witness_root;
+            }
 
             // Defaults if tracker access fails — fall back to block bits so
             // we still emit *some* ref_hash. These won't validate against
@@ -1835,9 +1868,16 @@ int main(int argc, char* argv[])
             min_header.m_bits      = read_le32(header_80b.data() + 72);
             min_header.m_nonce     = read_le32(header_80b.data() + 76);
 
-            // ── Wrap coinbase + convert merkle branches ──
-            BaseScript coinbase_bs(std::vector<unsigned char>(
-                full_coinbase.begin(), full_coinbase.end()));
+            // ── Wrap coinbase scriptSig + convert merkle branches ──
+            // The share's m_coinbase field is the coinbase *scriptSig*
+            // (share_init_verify bounds it to 2..100 bytes), NOT the full
+            // coinbase transaction. Storing the whole 600+ byte gentx here
+            // made attempt_verify throw "bad coinbase size" and the share got
+            // zero PPLNS credit. Extract the scriptSig at the fixed offset
+            // (mirrors dgb/stratum/work_source.cpp:118). actual_coinbase_bytes
+            // below stays the full gentx (hash_link + OP_RETURN ref override).
+            BaseScript coinbase_bs(
+                btc::stratum::extract_coinbase_scriptsig(full_coinbase));
 
             // Wire format for stratum branches is hex of LE-internal bytes
             // (see get_stratum_merkle_branches).  Parse via ParseHex+memcpy
