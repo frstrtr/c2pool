@@ -374,7 +374,7 @@ std::pair<std::string, std::string> BTCWorkSource::get_coinbase_parts() const
 
 core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     const uint256& prev_share_hash,
-    const std::string& /*extranonce1_hex*/,
+    const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged_addrs*/) const
 {
@@ -509,13 +509,27 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     // being present and could diverge from verify by up to the cap. Integer floor
     // division (subsidy//200), no float on the money path; the moved value is an
     // exact integer satoshi count (<= 2^53, exact in double).
-    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()) {
-        payouts[payout_script] += static_cast<double>(coinbasevalue / 200);
+    //
+    // Node-owner fee (p2pool -f/--fee): resolve the payout IDENTITY that
+    // receives this share's finder fee (and, via the committed share, its future
+    // PPLNS weight). effective_payout_script substitutes the node owner's script
+    // for ~fee% of jobs, deterministically on (prev_share_hash, extranonce1,
+    // miner_script) so the SAME decision is reproduced at submit time
+    // (mining_submit :960) and by attempt_verify — no new coinbase output, no
+    // share-format change. Default (fee 0 / no owner) => eff_script == payout_script,
+    // byte-identical to the pre-fee coinbase. eff_script also feeds the ref_hash_fn
+    // below so the OP_RETURN commits to the substituted identity.
+    const std::vector<unsigned char> eff_script =
+        effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
+
+    if (!payouts.empty() && coinbasevalue > 0 && !eff_script.empty()) {
+        payouts[eff_script] += static_cast<double>(coinbasevalue / 200);
     }
 
-    // Degraded fallback: full subsidy → miner (only if miner address is OK).
-    if (payouts.empty() && !payout_script.empty()) {
-        payouts[payout_script] = static_cast<double>(coinbasevalue);
+    // Degraded fallback: full subsidy → miner/owner (only if the resolved
+    // address is OK).
+    if (payouts.empty() && !eff_script.empty()) {
+        payouts[eff_script] = static_cast<double>(coinbasevalue);
     }
 
     // ── Donation output: extract it so it is NEVER amount-sorted into the payout
@@ -613,7 +627,7 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     core::stratum::RefHashResult rh_result;
     if (ref_hash_fn) {
         try {
-            rh_result = ref_hash_fn(prev_share_hash, scriptsig, payout_script,
+            rh_result = ref_hash_fn(prev_share_hash, scriptsig, eff_script,
                                     coinbasevalue, block_bits, curtime,
                                     segwit_active, frozen_branches_u256,
                                     witness_root_uint);
@@ -957,7 +971,16 @@ nlohmann::json BTCWorkSource::mining_submit(
             // means the share can still be ADDED locally but won't carry
             // a payout — peers will reject it on consensus check, which
             // we tolerate during dev.
-            auto payout_script = core::address_to_script(username);
+            // Node-owner fee (p2pool -f/--fee): apply the SAME deterministic
+            // substitution build_connection_coinbase used at job-build time, so
+            // the share this mint commits carries the identity the frozen job
+            // coinbase (and its OP_RETURN ref_hash) already paid — otherwise a
+            // substituted share hits the #1394 gentx-mismatch decline. Inputs
+            // (job->prev_share_hash, session extranonce1, miner script) are the
+            // exact ones the build side rolled on. Default (fee off) => identity.
+            auto payout_script = effective_payout_script(
+                core::address_to_script(username),
+                job->prev_share_hash, extranonce1);
 
             try {
                 share_hash = create_fn(coinbase, header, *job, payout_script);
@@ -1241,6 +1264,57 @@ void BTCWorkSource::set_donation_script(std::vector<unsigned char> script)
 {
     std::lock_guard<std::mutex> lk(callback_mutex_);
     donation_script_ = std::move(script);
+}
+
+void BTCWorkSource::set_node_owner_fee(double pct, std::vector<unsigned char> script)
+{
+    std::lock_guard<std::mutex> lk(callback_mutex_);
+    node_owner_fee_pct_ = pct;
+    node_owner_script_  = std::move(script);
+}
+
+// Deterministic per-(tip, connection) node-fee roll. BTC derives the payout
+// script from the miner's username at BOTH job build (stratum_server.cpp:1613)
+// and submit (mining_submit :960); a random template-side roll would make the
+// created share's committed identity mismatch the frozen job coinbase — exactly
+// the #1394 gentx-mismatch decline class. A pure function of data BOTH sites
+// hold (prev_share_hash + the session extranonce1 + the miner script) keeps
+// template + share + verify coherent with no job-state carry: prev_share_hash
+// re-rolls the decision every share interval (statistically p2pool's per-getwork
+// roll, work.py:1592), extranonce1 decorrelates concurrent connections. The fee
+// is NOT a coinbase output — it is a payout-identity substitution that flows
+// into the share's existing committed pubkey_hash/address, so attempt_verify
+// reproduces the resulting coinbase byte-for-byte with zero verify changes.
+std::vector<unsigned char> BTCWorkSource::effective_payout_script(
+    const std::vector<unsigned char>& miner_script,
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex) const
+{
+    double pct;
+    std::vector<unsigned char> owner;
+    {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        pct   = node_owner_fee_pct_;
+        owner = node_owner_script_;
+    }
+    if (pct <= 0.0 || owner.empty() || miner_script.empty())
+        return miner_script;
+
+    std::vector<uint8_t> buf;
+    buf.reserve(32 + extranonce1_hex.size() + miner_script.size());
+    buf.insert(buf.end(), prev_share_hash.begin(), prev_share_hash.end());
+    buf.insert(buf.end(), extranonce1_hex.begin(), extranonce1_hex.end());
+    buf.insert(buf.end(), miner_script.begin(), miner_script.end());
+
+    const uint256 h = Hash(std::span<const uint8_t>(buf.data(), buf.size()));
+    // First 8 bytes as a little-endian u64 (no dependency on a uint256 accessor
+    // name); modulo 100000 gives 0.001%-granular rolls.
+    uint64_t roll = 0;
+    for (int i = 0; i < 8; ++i)
+        roll |= static_cast<uint64_t>(h.begin()[i]) << (8 * i);
+    roll %= 100000;
+
+    return (static_cast<double>(roll) < pct * 1000.0) ? owner : miner_script;
 }
 
 }  // namespace btc::stratum

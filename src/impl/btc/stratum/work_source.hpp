@@ -288,7 +288,27 @@ public:
     /// PPLNS map so it always appears as an output.
     void set_donation_script(std::vector<unsigned char> script);
 
+    /// p2pool -f/--fee node-owner fee. With probability `pct`% a job's payout
+    /// IDENTITY becomes the owner's `script` (committed INTO the share via its
+    /// existing pubkey_hash/address field — NOT a new coinbase output). The
+    /// decision is a deterministic roll over (prev_share_hash, extranonce1,
+    /// miner_script), which are identical at job build (build_connection_coinbase)
+    /// and at submit (mining_submit), so template + share + verify stay coherent
+    /// (the #1394 gentx-mismatch class is avoided without any share-format or
+    /// verify change). pct<=0 or an empty owner script leaves every job paying the
+    /// miner — i.e. the default is off. Ported from main_dash.cpp / LTC
+    /// web_server.cpp set_node_fee_from_address.
+    void set_node_owner_fee(double pct, std::vector<unsigned char> script);
+
 private:
+    /// Resolve the effective payout script for a job/share: the node owner's
+    /// script with probability node_owner_fee_pct_%, else the miner's own
+    /// script. Deterministic in its inputs so job build and submit agree.
+    std::vector<unsigned char> effective_payout_script(
+        const std::vector<unsigned char>& miner_script,
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex) const;
+
     // External dependencies (non-owning references)
     btc::coin::HeaderChain&     chain_;
     btc::coin::Mempool&         mempool_;
@@ -321,6 +341,10 @@ private:
     RefHashFn                   ref_hash_fn_;
     CreateShareFn               create_share_fn_;
     std::vector<unsigned char>  donation_script_;
+    // Node-owner fee (p2pool -f/--fee). Guarded by callback_mutex_. Default off
+    // (pct 0, empty script) => effective_payout_script always returns the miner.
+    double                      node_owner_fee_pct_{0.0};
+    std::vector<unsigned char>  node_owner_script_;
 
     // Merged-mining manager (embedded NMC etc.); non-owning, set by
     // main_btc.cpp. null => no merged chains configured.
