@@ -230,6 +230,19 @@ void NodeImpl::close_connection(const NetService& service)
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
 
+    // Drop stale nonce->peer entries for this endpoint (parity with error()).
+    // close_connection is a peer-removal path too — without this a graceful
+    // close (e.g. the REPLACE-OLD duplicate swap) could leave a dangling
+    // m_peers[nonce] entry that makes later reconnects look like false
+    // duplicates.
+    for (auto it = m_peers.begin(); it != m_peers.end(); )
+    {
+        if (it->second && it->second->addr() == service)
+            it = m_peers.erase(it);
+        else
+            ++it;
+    }
+
     // Cancel pending share requests for this peer (same as in error())
     {
         std::vector<uint256> to_cancel;
@@ -299,10 +312,43 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
                 return std::nullopt;
         }
 
-        if (m_peers.contains(msg->m_nonce))
+        // Reject peers running too-old protocol BEFORE we touch m_peers, so a
+        // rejected handshake never inserts (and then has to unwind) a nonce entry.
+        // The floor is the RUNTIME ratcheted value (cold 1400, lifted to 3500 once
+        // >=95% of window work desires the best share's version --
+        // apply_min_protocol_ratchet), NOT the immutable config floor. Read
+        // lock-free; compute thread publishes via store. A refusal is pre-insert
+        // with a logged reason + a thrown disconnect — never a silent
+        // accept-then-drop.
+        const uint32_t min_proto =
+            m_runtime_min_protocol_version.load(std::memory_order_relaxed);
+        if (msg->m_version < min_proto)
         {
-                LOG_DEBUG_POOL << "Detected duplicate connection, disconnecting from " << peer->addr().to_string();
-                return std::nullopt;
+            LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
+                        << " protocol " << msg->m_version
+                        << " < minimum " << min_proto
+                        << ", disconnecting";
+            throw std::runtime_error("peer protocol too old");
+        }
+
+        // Duplicate-nonce policy: REPLACE-OLD (accept-then-drop busy-loop fix).
+        // A peer redialing with the same (per-process) nonce is signalling its
+        // previous connection is gone from its side. The existing m_peers entry is
+        // very likely a half-dead connection we have not yet timed out (up to
+        // PEER_TIMEOUT_TIME away). Silently dropping the NEW dial wastes the
+        // accepted socket and forces the peer into a ~3s redial busy-loop,
+        // starving it of the bulk chain download it is asking for. Instead close
+        // the stale connection and accept the newest one, logged at INFO.
+        if (auto dup = m_peers.find(msg->m_nonce); dup != m_peers.end())
+        {
+                NetService old_addr = dup->second ? dup->second->addr() : NetService{};
+                LOG_INFO << "[Pool] Replacing stale duplicate connection for peer "
+                         << msg->m_addr_from.m_endpoint.to_string()
+                         << " (nonce match): closing previous " << old_addr.to_string()
+                         << ", accepting new " << peer->addr().to_string();
+                m_peers.erase(dup);
+                if (old_addr != peer->addr())
+                        close_connection(old_addr);
         }
 
         peer->m_nonce = msg->m_nonce;
@@ -313,21 +359,6 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         {
             auto getaddrs_msg = dgb::message_getaddrs::make_raw(8);
             peer->write(std::move(getaddrs_msg));
-        }
-
-        // Reject peers running too-old protocol. The floor is the RUNTIME
-        // ratcheted value (cold 1400, lifted to 3500 once >=95% of window work
-        // desires the best share's version -- apply_min_protocol_ratchet), NOT the
-        // immutable config floor. Read lock-free; compute thread publishes via store.
-        const uint32_t min_proto =
-            m_runtime_min_protocol_version.load(std::memory_order_relaxed);
-        if (msg->m_version < min_proto)
-        {
-            LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
-                        << " protocol " << msg->m_version
-                        << " < minimum " << min_proto
-                        << ", disconnecting";
-            throw std::runtime_error("peer protocol too old");
         }
 
         if (!msg->m_best_share.IsNull())

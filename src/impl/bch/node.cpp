@@ -229,6 +229,19 @@ void NodeImpl::close_connection(const NetService& service)
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
 
+    // Drop stale nonce->peer entries for this endpoint (parity with error()).
+    // close_connection is a peer-removal path too — without this a graceful
+    // close (e.g. the REPLACE-OLD duplicate swap) could leave a dangling
+    // m_peers[nonce] entry that makes later reconnects look like false
+    // duplicates.
+    for (auto it = m_peers.begin(); it != m_peers.end(); )
+    {
+        if (it->second && it->second->addr() == service)
+            it = m_peers.erase(it);
+        else
+            ++it;
+    }
+
     // Cancel pending share requests for this peer (same as in error())
     {
         std::vector<uint256> to_cancel;
@@ -298,10 +311,38 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
                 return std::nullopt;
         }
 
-        if (m_peers.contains(msg->m_nonce))
+        // Reject peers running too-old protocol BEFORE we touch m_peers, so a
+        // rejected handshake never inserts (and then has to unwind) a nonce entry.
+        // A refusal is pre-insert, with a logged reason + a thrown disconnect that
+        // the bridge turns into a clean error()+cleanup — never a silent
+        // accept-then-drop.
+        if (msg->m_version < bch::PoolConfig::MINIMUM_PROTOCOL_VERSION)
         {
-                LOG_DEBUG_POOL << "Detected duplicate connection, disconnecting from " << peer->addr().to_string();
-                return std::nullopt;
+            LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
+                        << " protocol " << msg->m_version
+                        << " < minimum " << bch::PoolConfig::MINIMUM_PROTOCOL_VERSION
+                        << ", disconnecting";
+            throw std::runtime_error("peer protocol too old");
+        }
+
+        // Duplicate-nonce policy: REPLACE-OLD (accept-then-drop busy-loop fix).
+        // A peer redialing with the same (per-process) nonce is signalling its
+        // previous connection is gone from its side. The existing m_peers entry is
+        // very likely a half-dead connection we have not yet timed out (up to
+        // PEER_TIMEOUT_TIME away). Silently dropping the NEW dial wastes the
+        // accepted socket and forces the peer into a ~3s redial busy-loop,
+        // starving it of the bulk chain download it is asking for. Instead close
+        // the stale connection and accept the newest one, logged at INFO.
+        if (auto dup = m_peers.find(msg->m_nonce); dup != m_peers.end())
+        {
+                NetService old_addr = dup->second ? dup->second->addr() : NetService{};
+                LOG_INFO << "[Pool] Replacing stale duplicate connection for peer "
+                         << msg->m_addr_from.m_endpoint.to_string()
+                         << " (nonce match): closing previous " << old_addr.to_string()
+                         << ", accepting new " << peer->addr().to_string();
+                m_peers.erase(dup);
+                if (old_addr != peer->addr())
+                        close_connection(old_addr);
         }
 
         peer->m_nonce = msg->m_nonce;
@@ -312,16 +353,6 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         {
             auto getaddrs_msg = bch::message_getaddrs::make_raw(8);
             peer->write(std::move(getaddrs_msg));
-        }
-
-        // Reject peers running too-old protocol
-        if (msg->m_version < bch::PoolConfig::MINIMUM_PROTOCOL_VERSION)
-        {
-            LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
-                        << " protocol " << msg->m_version
-                        << " < minimum " << bch::PoolConfig::MINIMUM_PROTOCOL_VERSION
-                        << ", disconnecting";
-            throw std::runtime_error("peer protocol too old");
         }
 
         if (!msg->m_best_share.IsNull())

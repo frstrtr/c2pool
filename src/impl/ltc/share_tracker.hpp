@@ -844,6 +844,26 @@ public:
         // exclusive lock between chunks (the lock-segmentation seam).
         m_think_needs_continue = false;
 
+        // Wall-clock bound on a single think() cycle (tip-freeze livelock fix).
+        // The exclusive tracker lock is held for the whole of think(); while it
+        // is held the IO serve path (handle_get_share, send_shares) uses
+        // try_to_lock and returns EMPTY, so a multi-second — in the livelock,
+        // multi-MINUTE — hold degenerates a behind peer's bulk download to empty
+        // replies and back-pressures inbound shares. Cap the per-cycle hold;
+        // m_think_needs_continue makes run_think() repost the remainder next tick
+        // (releasing+reacquiring the lock between chunks). Bootstrap is exempt:
+        // there is no verified chain to serve yet and stratum is not serving real
+        // work, so the initial full verify runs uncapped (matches p2pool's
+        // synchronous initial sync).
+        const auto think_wall_t0 = std::chrono::steady_clock::now();
+        constexpr int64_t THINK_MAX_WALL_MS = 2000;
+        auto think_wall_exceeded = [&]() -> bool {
+            return !bootstrap_mode &&
+                   std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - think_wall_t0).count()
+                       >= THINK_MAX_WALL_MS;
+        };
+
         // Phase-1 verification budget — async-model adaptation mirroring the
         // Phase-2 THINK_VERIFY_BUDGET below. p2pool walks walk_count=head_height
         // for rooted heads (last is None, data.py:2131) but prunes aggressively
@@ -1103,6 +1123,15 @@ public:
         prioritize_challenger_heads(sorted_vheads, supersede);
         for (auto& [head_hash, tail_hash] : sorted_vheads)
         {
+            // Wall-clock bound (tip-freeze fix): stop the per-head sweep once this
+            // cycle has held the exclusive lock long enough; the remainder resumes
+            // next tick. No-op under bootstrap.
+            if (think_wall_exceeded()) {
+                m_think_needs_continue = true;
+                LOG_INFO << "[think-P2] wall-clock cap hit between heads, deferring remainder";
+                break;
+            }
+
             // Restart-reorg: is this verified head the frontier of the challenger
             // segment named by the hint? Matched by segment identity (the shared
             // missing-parent), so it survives the frontier advancing tick to tick.
@@ -1200,6 +1229,17 @@ public:
                         LOG_INFO << "[think-P2] budget exhausted after " << p2_verified_count
                                  << " verifications, deferring remainder"
                                  << (is_challenger ? " (challenger elevated pool spent)" : "");
+                        break;
+                    }
+                    // Wall-clock bound (tip-freeze fix): even with budget left, do
+                    // not hold the exclusive lock past THINK_MAX_WALL_MS — each
+                    // scrypt verify is ~20ms, so a large elevated pool could pin
+                    // the lock for many seconds. Resume next tick. Checked every
+                    // 8 verifies to keep the steady_clock reads cheap.
+                    if ((p2_verified_count & 7) == 0 && think_wall_exceeded()) {
+                        m_think_needs_continue = true;
+                        LOG_INFO << "[think-P2] wall-clock cap hit after " << p2_verified_count
+                                 << " verifications, deferring remainder";
                         break;
                     }
 

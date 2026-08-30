@@ -228,6 +228,19 @@ void NodeImpl::close_connection(const NetService& service)
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
 
+    // Drop stale nonce->peer entries for this endpoint (parity with error()).
+    // close_connection is a peer-removal path too — without this a graceful
+    // close (e.g. the REPLACE-OLD duplicate swap) could leave a dangling
+    // m_peers[nonce] entry that makes later reconnects look like false
+    // duplicates.
+    for (auto it = m_peers.begin(); it != m_peers.end(); )
+    {
+        if (it->second && it->second->addr() == service)
+            it = m_peers.erase(it);
+        else
+            ++it;
+    }
+
     // Cancel pending share requests for this peer (same as in error())
     {
         std::vector<uint256> to_cancel;
@@ -297,10 +310,39 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
                 return std::nullopt;
         }
 
-        if (m_peers.contains(msg->m_nonce))
+        // Reject peers running too-old protocol BEFORE we touch m_peers, so a
+        // rejected handshake never inserts (and then has to unwind) a nonce entry.
+        // A refusal is pre-insert, with a logged reason + a thrown disconnect that
+        // the bridge turns into a clean error()+cleanup — never a silent
+        // accept-then-drop.
+        if (msg->m_version < m_tracker.m_params->minimum_protocol_version)
         {
-                LOG_DEBUG_POOL << "Detected duplicate connection, disconnecting from " << peer->addr().to_string();
-                return std::nullopt;
+            LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
+                        << " protocol " << msg->m_version
+                        << " < minimum " << m_tracker.m_params->minimum_protocol_version
+                        << ", disconnecting";
+            throw std::runtime_error("peer protocol too old");
+        }
+
+        // Duplicate-nonce policy: REPLACE-OLD (accept-then-drop busy-loop fix).
+        // A peer redialing with the same (per-process) nonce is signalling its
+        // previous connection is gone from its side. The existing m_peers entry is
+        // very likely a half-dead connection we have not yet timed out (up to
+        // PEER_TIMEOUT_TIME away). Silently dropping the NEW dial — the pre-fix
+        // behaviour — wastes the accepted socket and forces the peer into a ~3s
+        // redial busy-loop, starving it of the bulk chain download it is asking
+        // for. Instead close the stale connection and accept the newest one, so a
+        // behind/fresh peer is actually served. Logged at INFO with the reason.
+        if (auto dup = m_peers.find(msg->m_nonce); dup != m_peers.end())
+        {
+                NetService old_addr = dup->second ? dup->second->addr() : NetService{};
+                LOG_INFO << "[Pool] Replacing stale duplicate connection for peer "
+                         << msg->m_addr_from.m_endpoint.to_string()
+                         << " (nonce match): closing previous " << old_addr.to_string()
+                         << ", accepting new " << peer->addr().to_string();
+                m_peers.erase(dup);
+                if (old_addr != peer->addr())
+                        close_connection(old_addr);
         }
 
         peer->m_nonce = msg->m_nonce;
@@ -311,16 +353,6 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         {
             auto getaddrs_msg = ltc::message_getaddrs::make_raw(8);
             peer->write(std::move(getaddrs_msg));
-        }
-
-        // Reject peers running too-old protocol
-        if (msg->m_version < m_tracker.m_params->minimum_protocol_version)
-        {
-            LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
-                        << " protocol " << msg->m_version
-                        << " < minimum " << m_tracker.m_params->minimum_protocol_version
-                        << ", disconnecting";
-            throw std::runtime_error("peer protocol too old");
         }
 
         if (!msg->m_best_share.IsNull())
@@ -441,12 +473,19 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         // new batch (peers re-advertise their best share, so dropped shares
         // are re-requested later) and warn instead of growing unbounded.
         if (m_pending_adds.size() >= MAX_PENDING_ADDS) {
+            // Drop the OLDEST queued batch, not the incoming one. The newest
+            // batches carry the shares that extend the current live tip (incl.
+            // the incumbent-extending and challenger-backfill shares that a
+            // wedged think() needs to converge); the oldest queued batch is the
+            // most stale. Dropping newest — the pre-fix behaviour — starved the
+            // node of exactly the inputs that would advance/unfreeze its tip.
             LOG_WARNING << "[ASYNC-DEFER] BACKPRESSURE: pending_adds at cap ("
                         << m_pending_adds.size() << "/" << MAX_PENDING_ADDS
-                        << "), dropping batch of " << data.m_items.size()
-                        << " shares from " << addr.to_string()
-                        << " — think() may be wedged";
-            return;
+                        << "), dropping OLDEST queued batch to admit "
+                        << data.m_items.size() << " newer shares from " << addr.to_string()
+                        << " — think() may be slow";
+            m_pending_adds.erase(m_pending_adds.begin());
+            // fall through and queue the incoming (newest) batch below
         }
         LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
                  << data.m_items.size() << " shares from " << addr.to_string()
@@ -1748,6 +1787,71 @@ void NodeImpl::disarm_think_watchdog()
         m_watchdog_timer->cancel();
 }
 
+ltc::SupersedeHint NodeImpl::gate_supersede_convergence(ltc::SupersedeHint hint)
+{
+    // Compute-thread only; caller holds the exclusive tracker lock.
+    const auto now = std::chrono::steady_clock::now();
+
+    // Expire old denylist entries so a segment whose parent later becomes
+    // obtainable can be retried.
+    for (auto it = m_supersede_denylist.begin(); it != m_supersede_denylist.end(); )
+    {
+        if (now - it->second >= SUPERSEDE_DENYLIST_TTL)
+            it = m_supersede_denylist.erase(it);
+        else
+            ++it;
+    }
+
+    if (!hint.active)
+        return hint;
+
+    const uint256 seg = hint.target_segment_last;
+
+    // Already proven unconvergeable and not yet expired — keep it suppressed so
+    // the elevated-verify treadmill stays off and GC can reclaim the segment.
+    if (m_supersede_denylist.count(seg))
+    {
+        static int dl_log = 0;
+        if (dl_log++ % 20 == 0)
+            LOG_INFO << "[SUPERSEDE] challenger segment " << seg.GetHex().substr(0, 16)
+                     << " denylisted as unconvergeable (parent unobtainable) — hint"
+                        " suppressed; normal argmax + GC continue";
+        return ltc::SupersedeHint{};
+    }
+
+    // Forward-progress metric: the challenger's verified accumulated height. On a
+    // genuinely converging fork this climbs every cycle as the elevated budget
+    // verifies deeper; on an unrooted/unobtainable-parent fork it stays pinned.
+    int32_t acc = 0;
+    try { acc = m_tracker.verified.get_acc_height(hint.target_head); }
+    catch (...) { acc = 0; }
+
+    auto& prog = m_supersede_progress[seg];
+    if (acc > prog.last_acc_height)
+    {
+        prog.last_acc_height = acc;
+        prog.stall_cycles = 0;
+    }
+    else
+    {
+        ++prog.stall_cycles;
+    }
+
+    if (prog.stall_cycles >= SUPERSEDE_STALL_LIMIT)
+    {
+        LOG_WARNING << "[SUPERSEDE] challenger segment " << seg.GetHex().substr(0, 16)
+                    << " made no verified-height progress in " << prog.stall_cycles
+                    << " cycles (verified_acc_height stuck at " << acc
+                    << "; missing parent unobtainable from all peers) — denylisting for "
+                    << SUPERSEDE_DENYLIST_TTL.count()
+                    << "m to break the elevated-verify treadmill and re-enable GC";
+        m_supersede_denylist[seg] = now;
+        m_supersede_progress.erase(seg);
+        return ltc::SupersedeHint{};
+    }
+    return hint;
+}
+
 void NodeImpl::run_think()
 {
     // Skip if a think() is already running on the compute thread.
@@ -1817,6 +1921,11 @@ void NodeImpl::run_think()
         ltc::SupersedeHint supersede = bootstrap
             ? ltc::SupersedeHint{}
             : m_tracker.compute_supersede_hint(m_best_share_hash, SUPERSEDE_VERIFY_BUDGET);
+        // Tip-freeze fix: refuse to keep spending the elevated verify budget on a
+        // challenger that never converges (missing parent unobtainable). Clears
+        // the hint after SUPERSEDE_STALL_LIMIT cycles of zero verified-height
+        // progress — breaking the treadmill and re-enabling GC of the zombie.
+        supersede = gate_supersede_convergence(supersede);
         m_supersede_hint = supersede;
         uint256 prev_best_for_flip = m_best_share_hash;
         if (supersede.active) {
@@ -2238,7 +2347,8 @@ void NodeImpl::clean_tracker()
             constexpr int SUPERSEDE_VERIFY_BUDGET = 400;
             m_supersede_hint = bootstrap
                 ? ltc::SupersedeHint{}
-                : m_tracker.compute_supersede_hint(m_best_share_hash, SUPERSEDE_VERIFY_BUDGET);
+                : gate_supersede_convergence(
+                      m_tracker.compute_supersede_hint(m_best_share_hash, SUPERSEDE_VERIFY_BUDGET));
             LOG_INFO << "[CLEAN] think+clean starting on compute thread: chain="
                      << m_tracker.chain.size() << " verified=" << m_tracker.verified.size()
                      << (bootstrap ? " BOOTSTRAP" : "")
