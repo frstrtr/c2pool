@@ -131,6 +131,57 @@ TEST(HeaderChainValidate, EmptyChainAndZeroWindowAreSafe)
     EXPECT_EQ(rw.scrypt_samples, 0u);
 }
 
+// ---------------------------------------------------------------------------
+// Rolling in-memory window bound (RSS plateau). Appending far more than
+// HEADER_WINDOW_CAP headers must NOT grow the in-memory chain without bound:
+// size() plateaus at the cap while every ABSOLUTE-height / work accessor stays
+// exactly what an unbounded chain would report. This is the unit-level proof
+// that dropping ancient headers is observationally invisible to the tip.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainWindowBound, SizePlateausWhileHeightAndWorkStayExact)
+{
+    HeaderChain hc;
+    const std::size_t CAP = HeaderChain::HEADER_WINDOW_CAP;
+    const std::size_t N   = CAP + 5000;   // well past the cap
+
+    // All-Scrypt, strictly increasing time (satisfies the MTP monotonicity
+    // gate), constant target 100 (pow_hash 0 <= 100 passes; default-ctor chain
+    // leaves the pow_limit ceiling unconfigured).
+    for (std::size_t i = 0; i < N; ++i) {
+        ASSERT_EQ(hc.validate_and_append({SCRYPT,
+                                          static_cast<int64_t>(1000 + i), 100}),
+                  IngestResult::VALIDATED_SCRYPT)
+            << "append " << i << " unexpectedly rejected";
+    }
+
+    // In-memory footprint is bounded, NOT proportional to N.
+    EXPECT_EQ(hc.size(), CAP);
+
+    // Absolute height is a pure function of base + index: the front was evicted
+    // and m_base_height advanced by the same count, so the tip is still at the
+    // Nth block regardless of how many headers were dropped.
+    ASSERT_TRUE(hc.tip_height().has_value());
+    EXPECT_EQ(hc.tip_height().value(), static_cast<uint32_t>(N - 1));
+    EXPECT_EQ(hc.next_block_height(), static_cast<uint32_t>(N));
+    EXPECT_EQ(hc.base_height(), static_cast<uint32_t>(N - CAP));
+
+    // cumulative_work is a monotone running scalar: total work ever credited,
+    // never decremented for an evicted header.
+    EXPECT_EQ(hc.cumulative_work(), static_cast<uint64_t>(N) * (UINT64_MAX / 100));
+
+    // The tail is intact: MedianTimePast reads the last 11 timestamps, which are
+    // the newest appended (1000 + N-11 .. 1000 + N-1); median == upper-middle.
+    EXPECT_EQ(hc.median_time_past(),
+              static_cast<int64_t>(1000 + (N - 1) - HeaderChain::MEDIAN_TIME_SPAN / 2));
+
+    // And validation continues correctly across the eviction boundary: the next
+    // header (strictly newer) is accepted and advances the tip by exactly one.
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, static_cast<int64_t>(1000 + N), 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), CAP);                                  // still bounded
+    EXPECT_EQ(hc.tip_height().value(), static_cast<uint32_t>(N));
+}
+
 
 // ---------------------------------------------------------------------------
 // DigiShield/MultiShield damped retarget multiply (digishield_next_target).
