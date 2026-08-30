@@ -1003,6 +1003,14 @@ jobs:
         run: npm run verify
 
       - name: Install Chrome for pixel-regression harness
+        # Fast-fail cap: the warm-cache path is seconds and a cold fetch of
+        # the ~135MB Chrome-for-Testing zip is minutes even on VM905's
+        # throttled egress. Bound the step so a stalled CDN download surfaces
+        # a retryable red in minutes instead of wedging the runner >40min with
+        # no output (run 33317959171). This caps ONLY the browser provision;
+        # the "Visual pixel-diff harness" step below stays uncapped and fully
+        # gating (no continue-on-error anywhere near the diff).
+        timeout-minutes: 15
         run: |
           # GitHub-hosted: apt google-chrome/chromium is a real .deb and launches.
           # Self-hosted VM905 only offers snap chromium, which refuses to launch
@@ -1040,34 +1048,64 @@ jobs:
             PIN="$(sed -nE "s/.*chrome: *.([0-9.]+).*/\\1/p" node_modules/puppeteer-core/lib/puppeteer/revisions.js | head -1)"
             test -n "$PIN" || { echo "could not read pinned Chrome revision from puppeteer-core"; exit 1; }
             echo "puppeteer-core pins Chrome-for-Testing $PIN"
+            # PRIMARY extraction fix is the yauzl devDependency of
+            # sharechain-explorer (installed by npm ci above): @puppeteer/browsers
+            # discovers it via require() and unpacks the Chrome zip IN-PROCESS,
+            # so extraction NEVER depends on a system unzip binary. Before yauzl,
+            # a runner without unzip (VM905 has none) hit "no zip archiver is
+            # available", and the retry loop then re-downloaded 135MB per attempt
+            # → a >40min wedge (run 33317959171). The two lines below are a
+            # belt-and-suspenders ONLY: keep /usr/bin on PATH so a present unzip
+            # is found, and best-effort provision one — both fully guarded so a
+            # missing/locked apt can never fail the job. yauzl remains the fix.
+            case ":$PATH:" in *:/usr/bin:*) ;; *) export PATH="/usr/bin:$PATH" ;; esac
+            command -v unzip >/dev/null 2>&1 || flock /tmp/c2pool-apt.lock \
+              sudo -n apt-get install -y --no-install-recommends unzip >/dev/null 2>&1 || true
             CHROME_BIN="$(ls -1 "$HOME"/.cache/puppeteer/chrome/*"$PIN"/chrome-linux64/chrome ./chrome/*"$PIN"/chrome-linux64/chrome 2>/dev/null | tail -1 || true)"
             if [ ! -x "$CHROME_BIN" ]; then
-              # Partial-cache guard: an interrupted prior download can leave
-              # the versioned dir present with NO chrome-linux64/chrome binary.
-              # @puppeteer/browsers treats "dir exists" as installed and refuses
-              # to re-fetch, so every retry short-circuits to the same broken
-              # path and the gate false-reds (linux-151.0.7922.77 on
-              # actions-runner-8, run 31607961557). The install runs with no
-              # --path from working-directory web-static/sharechain-explorer, so
-              # the versioned dir lands under CWD ./chrome/*"$PIN", NOT only
-              # ~/.cache/puppeteer (the corrupt dir on actions-runner-2, run
-              # 31685136400, was ./chrome/linux-151.0.7922.77). Purge BOTH roots
-              # for this PIN before AND between fetch attempts so the download
-              # re-runs regardless of which layout holds the stale dir.
-              purge_partial() {
-                for d in "$HOME"/.cache/puppeteer/chrome/*"$PIN" ./chrome/*"$PIN"; do
-                  [ -d "$d" ] && [ ! -x "$d/chrome-linux64/chrome" ] && rm -rf "$d"
-                done
-                return 0
-              }
-              purge_partial
-              for attempt in 1 2 3; do
-                CHROME_BIN="$(npx --yes @puppeteer/browsers install "chrome@$PIN" | tail -1 | awk '{print $NF}')" \
-                  && [ -x "$CHROME_BIN" ] && break
-                echo "chrome-for-testing fetch attempt $attempt failed; retrying in $((attempt*10))s"
+              # Cold cache: serialize the fetch across the runners that share
+              # this $HOME (VM905 hosts actions-runner-2..8 on one home dir), so
+              # concurrent web-static jobs don't race the same 135MB download
+              # into the same versioned dir. Hold the lock on its own fd for the
+              # whole cold path; mirror the existing /tmp/c2pool-apt.lock idiom.
+              CACHE_DIR="$HOME/.cache/puppeteer"
+              exec 9>/tmp/c2pool-puppeteer.lock
+              flock 9
+              # Re-check the warm cache now that we hold the lock — a concurrent
+              # job may have finished the download while we waited on flock.
+              CHROME_BIN="$(ls -1 "$CACHE_DIR"/chrome/*"$PIN"/chrome-linux64/chrome 2>/dev/null | tail -1 || true)"
+              if [ ! -x "$CHROME_BIN" ]; then
+                # Partial-cache guard: an interrupted prior download can leave
+                # the versioned dir present with NO chrome-linux64/chrome binary.
+                # @puppeteer/browsers treats "dir exists" as installed and refuses
+                # to re-fetch, so every retry short-circuits to the same broken
+                # path and the gate false-reds (linux-151.0.7922.77 on
+                # actions-runner-8, run 31607961557). Purge BOTH the persistent
+                # cache root and any legacy CWD ./chrome/*"$PIN" (older runs
+                # installed with no --path, e.g. run 31685136400) for this PIN
+                # before AND between fetch attempts so the download re-runs
+                # regardless of which layout holds the stale dir.
+                purge_partial() {
+                  for d in "$CACHE_DIR"/chrome/*"$PIN" ./chrome/*"$PIN"; do
+                    [ -d "$d" ] && [ ! -x "$d/chrome-linux64/chrome" ] && rm -rf "$d"
+                  done
+                  return 0
+                }
                 purge_partial
-                sleep $((attempt*10))
-              done
+                for attempt in 1 2 3; do
+                  # --path pins the download into the PERSISTENT per-host cache
+                  # (survives the "Prune runner workspace" step, which only drops
+                  # the CWD checkout) so a warm run touches NO network and every
+                  # runner sharing this $HOME reuses one fill. Extraction is
+                  # in-process via the yauzl devDependency — no system unzip.
+                  CHROME_BIN="$(npx --yes @puppeteer/browsers install "chrome@$PIN" --path "$CACHE_DIR" | tail -1 | awk '{print $NF}')" \
+                    && [ -x "$CHROME_BIN" ] && break
+                  echo "chrome-for-testing fetch attempt $attempt failed; retrying in $((attempt*10))s"
+                  purge_partial
+                  sleep $((attempt*10))
+                done
+              fi
+              flock -u 9
             fi
             test -x "$CHROME_BIN" || { echo "puppeteer chrome install failed after retries"; exit 1; }
             echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
