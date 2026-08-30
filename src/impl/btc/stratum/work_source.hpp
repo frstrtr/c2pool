@@ -264,6 +264,23 @@ public:
         share_max_bits_.store(max_bits, std::memory_order_relaxed);
     }
 
+    /// Record the most recent BTC BLOCK header nBits observed while building
+    /// work (the GBT block target). Display-only: the dashboard derives the
+    /// coin network difficulty from this (/local_stats net_difficulty). 0 =
+    /// unknown (no work built yet).
+    void note_block_bits(uint32_t bits) { last_block_bits_.store(bits, std::memory_order_relaxed); }
+    uint32_t last_block_bits() const { return last_block_bits_.load(std::memory_order_relaxed); }
+
+    /// Lock-safe copy of the per-connection worker registry, for the dashboard
+    /// (set_stratum_workers_fn / set_stratum_hashrate_fn). The stratum sessions
+    /// register/update here (workers_) but nothing bridged it to the WebServer,
+    /// so /local_stats reported "No miners connected" while bitAXEs were live.
+    std::map<std::string, core::stratum::WorkerInfo> snapshot_stratum_workers() const
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex_);
+        return workers_;
+    }
+
     /// Wire the share-tracker accessor that returns the current best-share
     /// hash. Called once at startup from main_btc.cpp after ShareTracker
     /// is constructed.
@@ -337,6 +354,8 @@ private:
     // ref_hash_fn's tracker.compute_share_target result (Phase 12).
     mutable std::atomic<uint32_t>       share_bits_{0};
     mutable std::atomic<uint32_t>       share_max_bits_{0};
+    // Most recent BTC BLOCK header nBits (GBT block target) — dashboard net diff.
+    std::atomic<uint32_t>               last_block_bits_{0};
 
     // Worker registry (per-connection metadata)
     mutable std::mutex          workers_mutex_;

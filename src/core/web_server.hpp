@@ -1310,7 +1310,14 @@ private:
     std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
     uint256 m_cached_pplns_best_share;
     bool m_cached_raw_scripts{false};
-    int64_t m_cached_share_version{36};  // V35/V36 PPLNS selection
+    // V35/V36 PPLNS selection. Defaults to the v35 network floor: this is the
+    // fallback rest_v36_status()/rest_version_signaling() read when a coin lane
+    // has not wired set_cached_share_version() or has no on-chain vote data yet.
+    // A {36} default made an unwired lane (BTC on the public v35 chain) report
+    // auto_ratchet.v36_active=true purely from this header value, even though the
+    // AutoRatchet state machine was VOTING and minting v35. The truthful floor is
+    // v35 — the ratchet lifts it to 36 only after the chain actually votes.
+    int64_t m_cached_share_version{35};
     std::string m_cached_witness_commitment;
     uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;
