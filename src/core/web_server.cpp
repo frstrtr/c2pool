@@ -4523,10 +4523,21 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["donation_percent"] = m_pool_fee_percent;          // same 1% restated
     result["fee_units"]        = "percent";
 
-    // attempts_to_{share,block} — estimate from difficulty
+    // attempts_to_{share,block} — estimate from difficulty.
+    // BTC-scale net difficulty (~1.26e14) times 2^32 is ~5.4e23, far beyond
+    // int64 range, so a bare static_cast<int64_t> is undefined behaviour and
+    // rendered INT64_MIN (-9223372036854775808) on the BTC lane. Saturate to
+    // int64 max instead — cross-coin safe, display-only, and LTC/DASH values
+    // (small enough to fit) are unchanged. Lambda keeps the guard local.
+    auto sat_i64 = [](double v) -> int64_t {
+        if (!(v > 0.0)) return 0;
+        constexpr double kMax = 9223372036854775807.0;  // ~= (double)INT64_MAX
+        return v >= kMax ? std::numeric_limits<int64_t>::max()
+                         : static_cast<int64_t>(v);
+    };
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
-    result["attempts_to_share"] = static_cast<int64_t>(share_diff * 4294967296.0);
-    result["attempts_to_block"] = static_cast<int64_t>(net_diff * 4294967296.0);
+    result["attempts_to_share"] = sat_i64(share_diff * 4294967296.0);
+    result["attempts_to_block"] = sat_i64(net_diff * 4294967296.0);
 
     // attempts_to_merged_block — from aux chain difficulty
     int64_t merged_attempts = 0;

@@ -2563,6 +2563,144 @@ int main(int argc, char* argv[])
             return p2p_node_raw->get_tracker_snapshot().pool_hashrate;
         });
 
+        // ── D-BTC dashboard PARITY wiring (integrator 2026-08-30) ──
+        // The WebServer's MiningInterface is stood up with a NULL IMiningNode
+        // (above), so refresh_work() never runs and several feeds that LTC/DGB
+        // install on their web MI were simply absent on BTC. That left the Node
+        // fee, Best-Share tip, PPLNS distribution and Sharechain explorer panels
+        // empty even though the underlying public sharechain is fully populated.
+        // Mirror the PROVEN per-lane shapes onto THIS web MI. Display-only — no
+        // share / reward / consensus path is touched. Honest note: every window
+        // view below is computed at the VERIFIED sharechain tip, which lags the
+        // raw head until the separate verify-backfill (to_get=0) fix lands; our
+        // own payout address stays absent from any payout view until then.
+
+        // §6 Node fee — /fee and local_stats.fee_percent/donation_percent read
+        // m_pool_fee_percent, which main_btc parsed into the coinbase path but
+        // never handed to the web MI (LTC does). Feed the parsed --fee value so
+        // the "Node fee" card shows the configured 0.1% instead of 0.0.
+        mi->set_pool_fee_percent(node_owner_fee);
+
+        // §7 Best-share tip — mirror the work_source hook (main_btc.cpp:1727)
+        // onto the web MI so /web/best_share_hash returns the REAL verified
+        // sharechain tip instead of the all-zero sentinel. (The best-share
+        // RECORD — /best_share has_best_share, round/session/all-time — tracks
+        // THIS node's own minted shares and stays honestly empty while the C1
+        // mint-freshness gate holds; that is wedge-blocked, not mis-wired.)
+        mi->set_best_share_hash_fn([p2p_node_raw]() -> uint256 {
+            if (!p2p_node_raw) return uint256::ZERO;
+            return p2p_node_raw->best_share_hash();
+        });
+
+        // §3 PPLNS distribution — /pplns/current requires m_pplns_fn on the web
+        // MI. Reuse the EXACT lambda already given to the stratum work_source
+        // (main_btc.cpp:1749): AutoRatchet picks the live share version and the
+        // donation script + payout formula both follow it. NOTE: the pplns
+        // pre-compute ALSO gates on a valid m_cached_template (web_server.cpp
+        // ~3131), which the NULL-IMiningNode web MI does not fill on BTC — so
+        // full rendering additionally needs the coin-work/template feed tracked
+        // as a follow-up; this setter removes the missing-function half.
+        mi->set_pplns_fn(
+            [p2p_node_raw, auto_ratchet, ws = work_source.get()](
+                           const uint256& best_share_hash,
+                           const uint256& block_target,
+                           uint64_t subsidy,
+                           const std::vector<unsigned char>& /*donation_script*/)
+            -> std::map<std::vector<unsigned char>, double>
+            {
+                if (!p2p_node_raw) return {};
+                auto guard = p2p_node_raw->read_tracker();
+                if (!guard) return {};
+                auto [share_version, desired_ver] =
+                    auto_ratchet->get_share_version(*guard, best_share_hash);
+                (void)desired_ver;
+                auto correct_donation = btc::PoolConfig::get_donation_script(share_version);
+                ws->set_donation_script(correct_donation);
+                try {
+                    if (share_version < 36)
+                        return guard->get_v35_expected_payouts(
+                            best_share_hash, block_target, subsidy, correct_donation);
+                    return guard->get_expected_payouts(
+                        best_share_hash, block_target, subsidy, correct_donation);
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[BTC-POOL] web pplns get_expected_payouts threw: "
+                                << e.what();
+                    return {};
+                }
+            });
+
+        // §4 Sharechain explorer — /sharechain/window requires m_sharechain_window_fn.
+        // Port the proven DGB feeder shape (main_dgb.cpp:1721, itself copied from
+        // the LTC wiring): walk the tallest chain head back through the PPLNS
+        // window and emit share rows. Unlike PPLNS this has NO template
+        // dependency, so the explorer fills with the real public sharechain
+        // immediately. Address markers use the raw scriptPubKey hex (self-
+        // consistent with my_address below for the frontend's "mine" highlight).
+        mi->set_sharechain_window_fn([p2p_node_raw, mi]() -> nlohmann::json {
+            auto guard = p2p_node_raw->read_tracker();
+            if (!guard) return nlohmann::json::object();
+            nlohmann::json result;
+            auto& chain = guard->chain;
+            auto& verified = guard->verified;
+
+            uint256 best;
+            int32_t best_height = -1;
+            for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                (void)tail_hash;
+                auto h = chain.get_height(head_hash);
+                if (h > best_height) { best = head_hash; best_height = h; }
+            }
+            result["best_hash"] = best.IsNull() ? "" : best.GetHex();
+            result["chain_length"] = static_cast<int>(chain.size());
+            result["window_size"] = static_cast<int>(btc::PoolConfig::chain_length());
+
+            std::string local_addr;
+            if (mi && !mi->get_payout_address().empty()) {
+                auto script = core::address_to_script(mi->get_payout_address());
+                if (!script.empty()) local_addr = HexStr(script);
+            }
+            result["my_address"] = local_addr;
+            result["fee_hash160"] = mi ? mi->get_node_fee_hash160() : std::string{};
+
+            nlohmann::json shares_arr = nlohmann::json::array();
+            if (!best.IsNull()) {
+                int height = chain.get_height(best);
+                int walk = std::min(height,
+                                    static_cast<int>(btc::PoolConfig::chain_length()));
+                if (walk > 0) {
+                    try {
+                        int pos = 0;
+                        auto view = chain.get_chain(best, walk);
+                        for (auto [hash, data] : view) {
+                            nlohmann::json s;
+                            s["h"] = hash.GetHex().substr(0, 16);
+                            s["H"] = hash.GetHex();
+                            s["p"] = pos++;
+                            s["v"] = verified.contains(hash) ? 1 : 0;
+                            auto* idx = chain.get_index(hash);
+                            if (idx && idx->is_block_solution) s["blk"] = 1;
+                            data.share.invoke([&](auto* obj) {
+                                s["t"]  = obj->m_timestamp;
+                                s["b"]  = obj->m_bits;
+                                s["a"]  = obj->m_absheight;
+                                s["dv"] = obj->m_desired_version;
+                                auto script = btc::get_share_script(obj);
+                                s["m"] = HexStr(script);
+                            });
+                            shares_arr.push_back(std::move(s));
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[BTC-POOL] sharechain_window walk threw: "
+                                    << e.what();
+                    }
+                }
+            }
+            int total_n = static_cast<int>(shares_arr.size());
+            result["shares"] = std::move(shares_arr);
+            result["total"] = total_n;
+            return result;
+        });
+
         // Seed the REST fallback share version from the AutoRatchet's live
         // answer (VOTING on the public v35 chain → 35). Without this the
         // dashboard read m_cached_share_version's header default and reported
