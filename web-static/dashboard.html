@@ -1516,7 +1516,22 @@
         .legend-item.disabled .legend-color {
             background: #666 !important;
         }
-        
+
+        /* Honest luck empty-state: the luck line has no points because no
+           block has been observed by this node yet (netdiff + pool hashrate
+           at find) and there are no live-extrapolation inputs. Distinct from
+           .disabled (a user-toggled-off series): greyed + italic, not
+           struck-through, and non-interactive. */
+        .legend-item.luck-empty {
+            opacity: 0.45;
+            cursor: default;
+            font-style: italic;
+        }
+
+        .legend-item.luck-empty .legend-color {
+            background: #666 !important;
+        }
+
         .legend-color {
             width: 12px;
             height: 12px;
@@ -7662,6 +7677,39 @@
             el.style.color = color;
         }
 
+        // Honest luck empty-state. The luck line is composited client-side; it
+        // legitimately has ZERO points when this node has observed no block with
+        // a computable luck (needs netdiff + pool hashrate at find) AND there is
+        // no live-extrapolation input for the in-progress round. In that case
+        // the daemonless canary simply has not found a block yet, so there is
+        // nothing real to plot -- we must NOT fabricate a point (see #1400). But
+        // a bare "-" over a clickable-but-empty legend chip reads as "broken".
+        // Say it plainly instead: label the stat "accumulating" and grey the
+        // Luck legend chip. Returns true when the empty-state was applied so the
+        // caller skips the numeric Avg-Luck path.
+        function applyLuckEmptyState(statElId, legendScopeSel, hasSeries) {
+            var statEl = document.getElementById(statElId);
+            var chip = document.querySelector(legendScopeSel + ' .legend-item[data-series="lucktrend"]');
+            if (!hasSeries) {
+                if (statEl) {
+                    statEl.textContent = 'accumulating';
+                    statEl.style.color = 'var(--text-muted)';
+                    statEl.title = 'Luck needs at least one block observed by this node (netdiff + pool hashrate at find); N/A until the first find';
+                }
+                if (chip) {
+                    chip.classList.add('luck-empty');
+                    chip.title = 'Luck line accumulating \u2014 no block observed by this node yet (needs netdiff + pool hashrate at the first find)';
+                }
+                return true;
+            }
+            if (chip) {
+                chip.classList.remove('luck-empty');
+                chip.title = 'Click to toggle luck trend line';
+            }
+            if (statEl) { statEl.title = ''; }
+            return false;
+        }
+
         function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('hashrate-graph');
             blocks = blocks || [];
@@ -8005,12 +8053,20 @@
             currentUniqueMinerCount = (currentUniqueMinerCount === null || currentUniqueMinerCount === undefined) ? 0 : Math.round(currentUniqueMinerCount);
             document.getElementById('graph-miners').textContent = currentWorkerCount + '/' + currentUniqueMinerCount;
             
-            if (avgLuck !== null) {
+            // luckTrendData empty => no observed block AND no live-extrapolation
+            // input: render the honest "accumulating" state, not a bare "-".
+            if (!applyLuckEmptyState('graph-luck', '.graph-legend.compact', luckTrendData.length > 0)) {
                 var luckEl = document.getElementById('graph-luck');
-                luckEl.textContent = d3.format('.0f')(avgLuck) + '%';
-                luckEl.style.color = avgLuck >= 100 ? 'var(--success)' : (avgLuck >= 75 ? 'var(--warning)' : 'var(--danger)');
-            } else {
-                document.getElementById('graph-luck').textContent = '-';
+                if (avgLuck !== null) {
+                    luckEl.textContent = d3.format('.0f')(avgLuck) + '%';
+                    luckEl.style.color = avgLuck >= 100 ? 'var(--success)' : (avgLuck >= 75 ? 'var(--warning)' : 'var(--danger)');
+                } else {
+                    // Series has only the live in-progress point (no completed
+                    // round in-window yet): the line draws, but there is no
+                    // block-average to report.
+                    luckEl.textContent = '-';
+                    luckEl.style.color = '';
+                }
             }
             // CI95 effective-vs-reported band. lastNetDiff read defensively so
             // this is agnostic to the netdiff sample shape; k counts blocks WE
@@ -8724,12 +8780,17 @@
             fsUniqueMinerCount = (fsUniqueMinerCount === null || fsUniqueMinerCount === undefined) ? 0 : Math.round(fsUniqueMinerCount);
             document.getElementById('fs-graph-miners').textContent = fsWorkerCount + '/' + fsUniqueMinerCount;
             
-            if (fsAvgLuck !== null) {
+            // Same honest empty-state as the compact chart, scoped to the
+            // fullscreen legend/stat.
+            if (!applyLuckEmptyState('fs-graph-luck', '.fullscreen-controls', luckTrendData.length > 0)) {
                 var luckEl = document.getElementById('fs-graph-luck');
-                luckEl.textContent = d3.format('.0f')(fsAvgLuck) + '%';
-                luckEl.style.color = fsAvgLuck >= 100 ? 'var(--success)' : (fsAvgLuck >= 75 ? 'var(--warning)' : 'var(--danger)');
-            } else {
-                document.getElementById('fs-graph-luck').textContent = '-';
+                if (fsAvgLuck !== null) {
+                    luckEl.textContent = d3.format('.0f')(fsAvgLuck) + '%';
+                    luckEl.style.color = fsAvgLuck >= 100 ? 'var(--success)' : (fsAvgLuck >= 75 ? 'var(--warning)' : 'var(--danger)');
+                } else {
+                    luckEl.textContent = '-';
+                    luckEl.style.color = '';
+                }
             }
             // CI95 effective-vs-reported band. lastNetDiff read defensively so
             // this is agnostic to the netdiff sample shape; k counts blocks WE
