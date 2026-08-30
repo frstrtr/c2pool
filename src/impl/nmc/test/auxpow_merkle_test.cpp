@@ -908,7 +908,45 @@ TEST(NmcP1eStore, VerifiedAuxPowConnectsAtActivationHeight)
     EXPECT_TRUE(chain_.has_header(aux));
     EXPECT_EQ(chain_.height(), 1u);
     ASSERT_TRUE(chain_.get_header(aux).has_value());
-    EXPECT_TRUE(chain_.get_header(aux)->auxpow.has_value());
+    // MEMORY: the verified proof is persisted to disk behind has_auxpow, then
+    // DROPPED from the resident IndexEntry so m_index stays headers-only across
+    // the full NMC history (the OOM-balloon fix). The merge-mined verdict is
+    // preserved by status, not by keeping the blob in RAM.
+    EXPECT_FALSE(chain_.get_header(aux)->auxpow.has_value());
+    EXPECT_EQ(chain_.get_header(aux)->status, nmc::coin::HEADER_VALID_CHAIN);
+}
+
+// MEMORY / OOM-balloon fix: admitting a merge-mined header must NOT grow the
+// resident index by the AuxPow proof size. The proof (parent coinbase tx + two
+// merkle branches + parent header, ~1-3 KB) is written to LevelDB behind
+// has_auxpow and immediately released from the resident IndexEntry; only the
+// slim header + status + chain_work remain in RAM. This is the invariant that
+// keeps RSS flat across a ~740k-header IBD instead of OOM-killing the arm.
+TEST(NmcP1eStore, AdmittedAuxPowIsDroppedFromResidentIndex)
+{
+    HeaderChain chain_(params_activation(1));       // activation at height 1
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(g));              // genesis (height 0, plain)
+
+    uint32_t aux_bits = 0x207fffffu;
+    BlockHeaderType h1 = plain_header(block_hash(g), aux_bits, 7);
+    uint256 aux = block_hash(h1);
+    AuxPow ap = complete_proof(aux, /*parent_own_bits=*/0x1d00ffffu);
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+    ASSERT_EQ(chain_.verify_auxpow_header(h1, ap), AuxPow::CheckResult::VALID);
+    ASSERT_TRUE(chain_.add_auxpow_header(h1, ap));
+
+    auto e = chain_.get_header(aux);
+    ASSERT_TRUE(e.has_value());
+    // The resident entry carries the header + verdict, but NOT the proof blob.
+    EXPECT_FALSE(e->auxpow.has_value());
+    EXPECT_EQ(e->status, nmc::coin::HEADER_VALID_CHAIN);
+    EXPECT_EQ(e->block_hash, aux);
+    // The genesis (plain, no proof) is likewise slim — nothing to drop.
+    auto ge = chain_.get_header(block_hash(g));
+    ASSERT_TRUE(ge.has_value());
+    EXPECT_FALSE(ge->auxpow.has_value());
 }
 
 TEST(NmcP1eStore, PrematureAuxPowIsRejectedByStoreEvenWhenProofValid)
@@ -1331,12 +1369,20 @@ TEST(NmcP1fPersist, DiskRoundTripPreservesMergeMinedStatusAndAuxFlag)
     ps >> back;
     EXPECT_EQ(back.has_auxpow, 1);
 
+    // The DISK form preserves the proof blob byte-for-byte (P1f(a) durability):
+    // the codec is where the AuxPow persists, so the assertion is on the on-disk
+    // struct after unpack, not on the resident projection.
+    ASSERT_TRUE(back.auxpow.has_value());                 // P1f(a): blob durable on disk
+    EXPECT_EQ(back.auxpow->chain_merkle_index, e.auxpow->chain_merkle_index);
+    EXPECT_EQ(parent_coinbase_txid(back.auxpow->parent_coinbase),
+              parent_coinbase_txid(e.auxpow->parent_coinbase));
+
+    // The RESIDENT projection deliberately defers the blob (OOM-balloon fix):
+    // to_entry() keeps the merge-mined verdict via status but leaves auxpow
+    // empty so a reload cannot re-balloon RAM.
     IndexEntry r = back.to_entry();
     EXPECT_EQ(r.status, nmc::coin::HEADER_VALID_CHAIN);    // status survives reload
-    ASSERT_TRUE(r.auxpow.has_value());                    // P1f(a): blob now restored
-    EXPECT_EQ(r.auxpow->chain_merkle_index, e.auxpow->chain_merkle_index);
-    EXPECT_EQ(parent_coinbase_txid(r.auxpow->parent_coinbase),
-              parent_coinbase_txid(e.auxpow->parent_coinbase));
+    EXPECT_FALSE(r.auxpow.has_value());                   // resident stays slim
 }
 
 TEST(NmcP1fPersist, ReopenRestoresEmptyChainAsEmpty)
@@ -1465,7 +1511,12 @@ TEST(NmcP1fAcceptPersist, ValidatedAuxPowHeaderSurvivesReopenViaAcceptPath)
         EXPECT_EQ(b.tip()->block_hash, aux);                   // tip advanced + survived
         ASSERT_TRUE(b.get_header(aux).has_value());
         EXPECT_EQ(b.get_header(aux)->status, nmc::coin::HEADER_VALID_CHAIN);
-        EXPECT_TRUE(b.get_header(aux)->auxpow.has_value());    // P1f(a) blob restored thru live path
+        // MEMORY: the P1f(a) proof blob remains DURABLE on disk (has_auxpow=1,
+        // codec covered by DiskRoundTripPreservesMergeMinedStatusAndAuxFlag), but
+        // it is NOT rehydrated into the resident index on reload — to_entry()
+        // defers it so a restart cannot re-balloon RAM. The merge-mined verdict
+        // is carried by status, which survives the round-trip above.
+        EXPECT_FALSE(b.get_header(aux)->auxpow.has_value());
     }
 }
 
@@ -1572,14 +1623,17 @@ TEST(NmcAuxPowPersist, IndexEntryDiskV1RoundTripsAuxPowBlob)
     ASSERT_EQ(back.has_auxpow, 1);
     ASSERT_TRUE(back.auxpow.has_value());
 
+    // Blob durability is asserted on the DISK struct (back), where the proof is
+    // persisted byte-for-byte; the resident projection defers it by design.
+    EXPECT_EQ(back.auxpow->chain_merkle_index,      e.auxpow->chain_merkle_index);
+    EXPECT_EQ(back.auxpow->parent_coinbase_branch,  e.auxpow->parent_coinbase_branch);
+    EXPECT_EQ(parent_coinbase_txid(back.auxpow->parent_coinbase),
+              parent_coinbase_txid(e.auxpow->parent_coinbase));
+
     IndexEntry r = back.to_entry();
     EXPECT_EQ(r.height, e.height);
     EXPECT_EQ(r.status, e.status);
-    ASSERT_TRUE(r.auxpow.has_value());
-    EXPECT_EQ(r.auxpow->chain_merkle_index,      e.auxpow->chain_merkle_index);
-    EXPECT_EQ(r.auxpow->parent_coinbase_branch,  e.auxpow->parent_coinbase_branch);
-    EXPECT_EQ(parent_coinbase_txid(r.auxpow->parent_coinbase),
-              parent_coinbase_txid(e.auxpow->parent_coinbase));
+    EXPECT_FALSE(r.auxpow.has_value());   // OOM-balloon fix: resident stays slim
 
     // A proofless entry trails no blob and restores to nullopt.
     IndexEntry plain = e; plain.auxpow = std::nullopt;
