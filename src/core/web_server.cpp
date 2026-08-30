@@ -4351,6 +4351,23 @@ nlohmann::json MiningInterface::rest_local_stats()
             coin_work.template_age_sec >= 0
                 ? nlohmann::json(coin_work.template_age_sec)
                 : nlohmann::json(nullptr);
+        // Honest provenance: "template" = read off a sourced work template
+        // (live block value, has an age); "projected" = derived from the
+        // header follower's published tip + pure subsidy formulas on a
+        // daemonless zero-rig relay (exact miner share, no wall-clock age,
+        // superblock/fee extras not reflected). Lets the card label it.
+        result["block_value_basis"] =
+            coin_work.projected ? "projected" : "template";
+        // Superblock honesty: when the tip height is a DASH governance
+        // superblock, the real coinbase ALSO pays the voted treasury budget as
+        // extra outputs. A daemonless node cannot know the voted total, so
+        // block_value / block_value_payments EXCLUDE that lane here — flag the
+        // height rather than fabricate a payout. The miner share is exact
+        // regardless (superblock payouts come from the 20% carve-out already
+        // deducted from every block's subsidy). Emitted only when true so the
+        // key stays absent on ordinary heights and all non-DASH coins.
+        if (coin_work.superblock)
+            result["block_value_superblock"] = true;
     }
     // #948 gross-vs-net honesty. block_value_miner has always been NET of the
     // pool fee while block_value_payments is GROSS: two sibling fields sharing

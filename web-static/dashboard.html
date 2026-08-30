@@ -1892,17 +1892,17 @@
                 
                 <!-- Second Row: Miners Block Value -->
                 <div class="stat-card">
-                    <h3><span class="icon">💰</span> Miners Block Value <small style="opacity:0.7;">(gross, pre-fee)</small></h3>
+                    <h3><span class="icon">💰</span> Miners Block Value <small style="opacity:0.7;">(after MN + treasury; before pool fee)</small></h3>
                     <div class="stat-value warning"><span id="block_value_miner">-</span> <small class="symbol-small" id="block_value_symbol">-</small></div>
                     <div class="stat-sub merged-child-hint" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> <span class="merged-child-symbol-hint">DOGE</span></div>
-                    <div class="stat-detail" style="white-space: nowrap;" title="#948: this card shows the GROSS miner share; the pool fee is deducted to give the NET amount the API reports as block_value_miner">Fee: <span id="block_value_fee">-</span> &rarr; net <span id="block_value_miner_net">-</span></div>
+                    <div class="stat-detail" style="white-space: nowrap;" title="This card headline is the MINERS' share of the block — the DASH subsidy AFTER the masternode payment and the platform/treasury lane (DIP-0027 burn) are deducted. It is chain-truth: a deterministic function of the block HEIGHT, identical on every node, the same split embedded_gbt.hpp uses to build accepted coinbases. 'Gross'/'pre-fee' here means before the POOL fee only; the pool fee is then subtracted to give the NET amount the API reports as block_value_miner.">Fee: <span id="block_value_fee">-</span> &rarr; net <span id="block_value_miner_net">-</span></div>
                     <!-- #block_value and #block_value_payments were both written
                          by renderLocalStats but had NO elements in this page. The
                          card showed the miner slice with nothing to compare it
                          against, so on DASH there was no way to see that 1.7702
                          total minus 1.3277 of protocol outputs is what leaves
                          miners 0.4426. -->
-                    <div class="stat-detail" style="white-space: nowrap;" title="Full coinbase value of the block being worked on, and the protocol-mandated outputs deducted from it before the miner split (masternode / superblock / platform burn). Shown only on coins that have such a lane.">Block: <span id="block_value">-</span><span id="block_value_payments_part" style="display: none;"> &minus; protocol <span id="block_value_payments">-</span><span id="block_value_burn_part" style="display: none;"> (burn <span id="block_value_burn">-</span>)</span></span></div>
+                    <div class="stat-detail" style="white-space: nowrap;" title="Full coinbase value of the block being worked on, and the protocol-mandated outputs deducted from it before the miner split (masternode / superblock / platform burn). Shown only on coins that have such a lane.">Block: <span id="block_value">-</span><span id="block_value_payments_part" style="display: none;"> &minus; protocol <span id="block_value_payments">-</span><span id="block_value_burn_part" style="display: none;"> (burn <span id="block_value_burn">-</span>)</span></span><span id="block_value_superblock_part" style="display: none; opacity: 0.7;" title="This height is a DASH governance superblock: the real coinbase also pays the voted treasury budget as extra outputs. A daemonless node cannot know the voted total, so it is NOT included here — but the MINERS' share above is unaffected, since superblock payouts come from the 20% carve-out already deducted from every block."> &nbsp;(+ superblock treasury payouts, not shown)</span></div>
                     <div class="stat-detail" style="white-space: nowrap;">Expected: <span id="time_to_block">-</span> <span class="merged-child-hint"><span style="color: #c3a634;">|</span> <span style="color: #c3a634;"><span id="time_to_merged_block">-</span></span></span></div>
                 </div>
                 
@@ -3453,6 +3453,15 @@
                     d3.select('#block_value_payments').text(d3.format('.4f')(_bvp));
                 if (_hasBurn)
                     d3.select('#block_value_burn').text(d3.format('.4f')(_burn));
+                // Superblock honesty: at a DASH governance superblock height the
+                // real coinbase carries the voted treasury budget as extra
+                // outputs. A daemonless node cannot know the voted total, so
+                // block_value / block_value_payments EXCLUDE that lane — the
+                // backend flags the height instead of fabricating a payout. The
+                // miners' share is unaffected either way. Set on EVERY pass so
+                // the note never sticks after the tip leaves a superblock.
+                d3.select('#block_value_superblock_part')
+                    .style('display', local_stats.block_value_superblock === true ? null : 'none');
                 // #948: the card headline is the GROSS (pre-fee) miner share so it
                 // matches the API block_value_miner_gross field and the label says so;
                 // the fee and the resulting NET (legacy block_value_miner) are shown below.

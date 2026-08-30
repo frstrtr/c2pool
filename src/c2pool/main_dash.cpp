@@ -1649,6 +1649,42 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 out["chain_height"]   = chain_ht;
                 out["stored_shares"]  = static_cast<int>(chain.size());  // all shares in the DB (incl. forks)
 
+                // ── Share-explorer nav: heads / tails / verified_* ────────────
+                // /web/heads, /web/tails, /web/verified_heads, /web/verified_tails
+                // (rest_web_heads/…) return sc["heads"] etc. ONLY if the key is
+                // present, else fall through to an empty array. This DASH lambda
+                // never emitted them, so all four served [] on the daemonless
+                // canary while /sharechain/window served the full 10k-share
+                // window from the SAME tracker (green-matrix #170 gap). Surface
+                // them from the tracker exactly as the LTC lane does
+                // (main_ltc.cpp: get_heads()/get_tails() on chain and verified).
+                // Honest-empty preserved: the arrays are empty only when the
+                // tracker truly has no heads/tails, and the busy-tick
+                // s_last_good cache carries these keys once populated (no flap).
+                {
+                    auto& verified = guard->verified;
+
+                    nlohmann::json heads_arr = nlohmann::json::array();
+                    for (const auto& [head_hash, tail_hash] : chain.get_heads())
+                        heads_arr.push_back(head_hash.GetHex());
+                    out["heads"] = std::move(heads_arr);
+
+                    nlohmann::json vheads_arr = nlohmann::json::array();
+                    for (const auto& [head_hash, tail_hash] : verified.get_heads())
+                        vheads_arr.push_back(head_hash.GetHex());
+                    out["verified_heads"] = std::move(vheads_arr);
+
+                    nlohmann::json tails_arr = nlohmann::json::array();
+                    for (const auto& [tail_hash, head_hashes] : chain.get_tails())
+                        tails_arr.push_back(tail_hash.GetHex());
+                    out["tails"] = std::move(tails_arr);
+
+                    nlohmann::json vtails_arr = nlohmann::json::array();
+                    for (const auto& [tail_hash, head_hashes] : verified.get_tails())
+                        vtails_arr.push_back(tail_hash.GetHex());
+                    out["verified_tails"] = std::move(vtails_arr);
+                }
+
                 // ── Single backward walk: desired-version votes, share-format
                 //    counts, per-miner tally, and V36 propagation depth ──────────
                 std::map<int, int> desired_counts;   // m_desired_version → count
@@ -3981,6 +4017,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         });
     }
 
+    // ── DAEMONLESS zero-rig block-value fallback source ───────────────────
+    // The set_coin_work_fn lambda below feeds the dashboard's block-value /
+    // node-fee cards from wsrc->peek_template(). On a fully-daemonless relay
+    // with ZERO connected miners no stratum work demand ever sources a
+    // template, so peek_template() is null and block_value read 0. This
+    // pointer lets the lambda fall back to the header follower's published
+    // tip + the ported-from-dashd subsidy formulas (exactly the #57/#1366
+    // maintainer-fallback pattern already used for network_difficulty). It is
+    // assigned right after the CoinStateMaintainer is constructed below (stays
+    // null and harmless until then) and captured by-reference so the lambda
+    // sees it once live. Display/telemetry only; never drives coinbase.
+    dash::coin::CoinStateMaintainer* coinwork_maintainer = nullptr;
+
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(
             ioc, stratum_host, stratum_port, work_source);
@@ -4028,11 +4077,103 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // attempts_to_block read the live values. Non-fetching peek;
                 // display only, never drives coinbase or consensus.
                 mi->set_coin_work_fn(
-                    [wsrc = work_source.get()]()
+                    [wsrc = work_source.get(), &coinwork_maintainer, testnet]()
                         -> core::MiningInterface::CoinWorkInfo {
                         core::MiningInterface::CoinWorkInfo info;
                         auto t = wsrc->peek_template();
-                        if (!t) return info;
+                        if (!t) {
+                            // ── DAEMONLESS ZERO-RIG FALLBACK ──────────────
+                            // No stratum work demand ever sourced a template
+                            // (peek_template() null on a zero-rig relay), so
+                            // the block-value / node-fee cards read 0 on the
+                            // fully-daemonless canary even though the header
+                            // follower knows the tip. Project the values from
+                            // the published tip + the ported-from-dashd pure
+                            // subsidy formulas (subsidy.hpp) — the SAME math
+                            // embedded_gbt.hpp uses to build the real accepted
+                            // coinbases (proven on-chain h=2516911/...). This
+                            // is a NON-fetching read of already-published
+                            // state; it never invokes the money-path template
+                            // builder from a display timer (#57 invariant).
+                            if (coinwork_maintainer) {
+                                uint32_t tip =
+                                    coinwork_maintainer->serve_tip_height();
+                                if (tip == 0)
+                                    tip = coinwork_maintainer
+                                              ->header_tip_height();
+                                if (tip != 0) {
+                                    uint32_t height = tip + 1;
+                                    int64_t reward =
+                                        dash::coin::
+                                            compute_dash_block_reward_post_v20(
+                                                height);
+                                    int64_t mn_lane =
+                                        dash::coin::
+                                            compute_dash_mn_payment_post_v20(
+                                                reward);
+                                    int64_t burn =
+                                        dash::coin::
+                                            compute_dash_platform_reward_post_v20_mn_rr(
+                                                height);
+                                    // block_value == subsidy on a coinbase-
+                                    // only body (no tx fees); the MN lane
+                                    // (3/4) holds the payee + the DIP-0027
+                                    // platform burn carved out of it, leaving
+                                    // miners the 1/4 the card displays. Keep
+                                    // payment_amount_sat = MN payee alone
+                                    // (its documented share-serialized
+                                    // meaning); payments_total_sat = the whole
+                                    // MN lane (payee + burn) the card nets out.
+                                    info.valid              = true;
+                                    info.projected          = true;
+                                    info.height             = height;
+                                    // SUPERBLOCK honesty: at a governance
+                                    // superblock height the real coinbase also
+                                    // pays the voted treasury budget as extra
+                                    // outputs. A daemonless node cannot know
+                                    // the voted total (needs governance
+                                    // objects), so reward/payments below EXCLUDE
+                                    // that lane — flag it instead of
+                                    // fabricating an amount. The miner share is
+                                    // exact regardless: superblock payouts come
+                                    // from the 20% carve-out already deducted
+                                    // from every block's subsidy. Cycle is
+                                    // network-specific (mainnet 16616, tn 24).
+                                    info.superblock =
+                                        dash::coin::is_superblock_height(
+                                            height,
+                                            testnet
+                                                ? dash::coin::
+                                                      DASH_SUPERBLOCK_CYCLE_TESTNET
+                                                : dash::coin::
+                                                      DASH_SUPERBLOCK_CYCLE_MAINNET);
+                                    info.coinbase_value_sat =
+                                        static_cast<uint64_t>(reward);
+                                    info.payment_amount_sat =
+                                        static_cast<uint64_t>(
+                                            std::max<int64_t>(0,
+                                                              mn_lane - burn));
+                                    info.payments_total_sat =
+                                        static_cast<uint64_t>(mn_lane);
+                                    info.burn_sat =
+                                        static_cast<uint64_t>(burn);
+                                    uint32_t bits =
+                                        coinwork_maintainer
+                                            ->published_bits_for_next();
+                                    if (bits != 0)
+                                        info.network_difficulty =
+                                            chain::target_to_difficulty(
+                                                dash::coin::target_from_nbits(
+                                                    bits));
+                                    // No sourced template: age is not a
+                                    // wall-clock; -1 renders block_value_age
+                                    // as null and block_value_basis as
+                                    // "projected" so the card can say so.
+                                    info.template_age_sec = -1;
+                                }
+                            }
+                            return info;
+                        }
                         info.valid              = true;
                         info.coinbase_value_sat = t->m_coinbase_value;
                         info.payment_amount_sat = t->m_payment_amount;
@@ -4411,6 +4552,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Display/telemetry only; the tick is cancelled before teardown, so the
         // maintainer always outlives every read.
         netdiff_maintainer = maintainer.get();
+        // Same header follower feeds the daemonless zero-rig block-value
+        // fallback in the set_coin_work_fn lambda above (captured by
+        // reference; null until now). The maintainer outlives every web read.
+        coinwork_maintainer = maintainer.get();
         mn_ckpt_lane = std::make_unique<dash::coin::MnCheckpointLane>();
         mn_ckpt_lane->set_max_bridge_blocks(g_mn_bridge_max_blocks);
 
