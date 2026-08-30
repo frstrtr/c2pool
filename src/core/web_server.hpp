@@ -710,6 +710,15 @@ public:
         // and superblock/fee extras are not reflected. Surfaced as
         // block_value_basis so the card can label a projection honestly.
         bool     projected = false;
+        // TRUE when `height` is a DASH governance superblock height. At such a
+        // height the real coinbase ALSO pays the voted treasury budget as
+        // extra outputs, but a daemonless node cannot know the voted total
+        // (needs governance objects) — so coinbase_value_sat / payments here
+        // EXCLUDE that lane. The miner share is unaffected (superblock payouts
+        // come from the 20% carve-out already deducted from every block's
+        // subsidy). Surfaced as block_value_superblock so the card can say the
+        // treasury-payout lane is not reflected, WITHOUT fabricating an amount.
+        bool     superblock = false;
     };
     void set_coin_work_fn(std::function<CoinWorkInfo()> fn) { m_coin_work_fn = thread_safe_wrap(std::move(fn)); }
 

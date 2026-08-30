@@ -1649,6 +1649,42 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 out["chain_height"]   = chain_ht;
                 out["stored_shares"]  = static_cast<int>(chain.size());  // all shares in the DB (incl. forks)
 
+                // ── Share-explorer nav: heads / tails / verified_* ────────────
+                // /web/heads, /web/tails, /web/verified_heads, /web/verified_tails
+                // (rest_web_heads/…) return sc["heads"] etc. ONLY if the key is
+                // present, else fall through to an empty array. This DASH lambda
+                // never emitted them, so all four served [] on the daemonless
+                // canary while /sharechain/window served the full 10k-share
+                // window from the SAME tracker (green-matrix #170 gap). Surface
+                // them from the tracker exactly as the LTC lane does
+                // (main_ltc.cpp: get_heads()/get_tails() on chain and verified).
+                // Honest-empty preserved: the arrays are empty only when the
+                // tracker truly has no heads/tails, and the busy-tick
+                // s_last_good cache carries these keys once populated (no flap).
+                {
+                    auto& verified = guard->verified;
+
+                    nlohmann::json heads_arr = nlohmann::json::array();
+                    for (const auto& [head_hash, tail_hash] : chain.get_heads())
+                        heads_arr.push_back(head_hash.GetHex());
+                    out["heads"] = std::move(heads_arr);
+
+                    nlohmann::json vheads_arr = nlohmann::json::array();
+                    for (const auto& [head_hash, tail_hash] : verified.get_heads())
+                        vheads_arr.push_back(head_hash.GetHex());
+                    out["verified_heads"] = std::move(vheads_arr);
+
+                    nlohmann::json tails_arr = nlohmann::json::array();
+                    for (const auto& [tail_hash, head_hashes] : chain.get_tails())
+                        tails_arr.push_back(tail_hash.GetHex());
+                    out["tails"] = std::move(tails_arr);
+
+                    nlohmann::json vtails_arr = nlohmann::json::array();
+                    for (const auto& [tail_hash, head_hashes] : verified.get_tails())
+                        vtails_arr.push_back(tail_hash.GetHex());
+                    out["verified_tails"] = std::move(vtails_arr);
+                }
+
                 // ── Single backward walk: desired-version votes, share-format
                 //    counts, per-miner tally, and V36 propagation depth ──────────
                 std::map<int, int> desired_counts;   // m_desired_version → count
@@ -4041,7 +4077,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // attempts_to_block read the live values. Non-fetching peek;
                 // display only, never drives coinbase or consensus.
                 mi->set_coin_work_fn(
-                    [wsrc = work_source.get(), &coinwork_maintainer]()
+                    [wsrc = work_source.get(), &coinwork_maintainer, testnet]()
                         -> core::MiningInterface::CoinWorkInfo {
                         core::MiningInterface::CoinWorkInfo info;
                         auto t = wsrc->peek_template();
@@ -4091,6 +4127,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     info.valid              = true;
                                     info.projected          = true;
                                     info.height             = height;
+                                    // SUPERBLOCK honesty: at a governance
+                                    // superblock height the real coinbase also
+                                    // pays the voted treasury budget as extra
+                                    // outputs. A daemonless node cannot know
+                                    // the voted total (needs governance
+                                    // objects), so reward/payments below EXCLUDE
+                                    // that lane — flag it instead of
+                                    // fabricating an amount. The miner share is
+                                    // exact regardless: superblock payouts come
+                                    // from the 20% carve-out already deducted
+                                    // from every block's subsidy. Cycle is
+                                    // network-specific (mainnet 16616, tn 24).
+                                    info.superblock =
+                                        dash::coin::is_superblock_height(
+                                            height,
+                                            testnet
+                                                ? dash::coin::
+                                                      DASH_SUPERBLOCK_CYCLE_TESTNET
+                                                : dash::coin::
+                                                      DASH_SUPERBLOCK_CYCLE_MAINNET);
                                     info.coinbase_value_sat =
                                         static_cast<uint64_t>(reward);
                                     info.payment_amount_sat =
