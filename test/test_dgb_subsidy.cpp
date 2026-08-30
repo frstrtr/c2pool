@@ -50,7 +50,8 @@ constexpr SubsidyVec kCoreVectors[] = {
     {4057999,       92168922949ULL},
     {4058000,       91140317768ULL},
     {20000000,      33193486585ULL},
-    {24125022,      25355810338ULL},  // LIVE Scrypt tip == on-chain coinbase
+    {24125001,      25355810338ULL},  // LIVE Scrypt tip (months=129 band)
+    {24125022,      25355810338ULL},  // == on-chain coinbase at 47515a15f270cbb4
 };
 
 // Independent DigiByte Core GetBlockSubsidy() reference implementation, kept
@@ -98,9 +99,14 @@ TEST(DgbSubsidy, MatchesDigiByteCoreVectors) {
 // The tip value is the money-critical one: it is exactly what a solved block's
 // coinbase would pay, and must equal the real on-chain coinbase to the satoshi.
 TEST(DgbSubsidy, LiveTipMatchesOnChainCoinbase) {
-    EXPECT_EQ(dgb::CoinParams::subsidy(24125022u), 25355810338ULL)
-        << "built DGB coinbase subsidy != on-chain coinbase at the live Scrypt tip "
+    // Both heights fall in the months=129 monthly-decay band and pay the same
+    // value; 24125001 is the money-critical build height, 24125022 is a block
+    // whose on-chain coinbase vout total is byte-identical to this value.
+    EXPECT_EQ(dgb::CoinParams::subsidy(24125001u), 25355810338ULL)
+        << "built DGB coinbase subsidy != DigiByte Core at the live Scrypt tip "
            "-- real hashrate would underpay or the block would be rejected";
+    EXPECT_EQ(dgb::CoinParams::subsidy(24125022u), 25355810338ULL)
+        << "built DGB coinbase subsidy != on-chain coinbase at the live Scrypt tip";
 }
 
 // Full-domain byte parity against an independent Core reference: boundaries,

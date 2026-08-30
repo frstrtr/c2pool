@@ -141,9 +141,13 @@ public:
     //   nSubsidy -= nSubsidy / N   (truncating division), and the Period VI
     // months count is blocks * BLOCK_TIME_SECONDS / SECONDS_PER_MONTH with
     // BLOCK_TIME_SECONDS=15 and SECONDS_PER_MONTH=60*60*24*365/12=2'628'000.
-    // Floor mirrors current Core master (nSubsidy < COIN -> 0); Core accepts
-    // underpay (ConnectBlock rejects only overpay, "bad-cb-amount") and the
-    // floor is ~40 years out, so it never bites at the live tip.
+    // Floor: DigiByte Core clamps a sub-1-DGB reward to 0. This was verified
+    // byte-for-byte against the released consensus (feature/8.22.0-final) and
+    // the latest release (v9.26.5): both run `if (nSubsidy < COIN) nSubsidy = 0;`
+    // -- the "Make sure the reward is at least 1 DGB" comment above it in Core is
+    // stale, the code writes 0, not COIN. Core accepts underpay (ConnectBlock
+    // rejects only overpay, "bad-cb-amount") and the floor is ~40 years out, so
+    // it never bites at the live tip -- but the port mirrors Core exactly anyway.
     // -----------------------------------------------------------------------
     static uint64_t subsidy(uint32_t height)
     {
@@ -190,8 +194,10 @@ public:
                 nSubsidy /= 100'000;
             }
         }
-        // Core master clamps a sub-1-DGB reward to 0 (released 8.22.x clamped
-        // to COIN; both moot at the tip -- the floor is ~40 years out).
+        // DigiByte Core clamps a sub-1-DGB reward to 0 -- verified identical in
+        // the released 8.22.0-final consensus and in v9.26.5 (the Core comment
+        // says "at least 1 DGB" but the code assigns 0). Moot at the tip: the
+        // floor is ~40 years out.
         if (nSubsidy < COIN)
             nSubsidy = 0;
         return nSubsidy;
