@@ -1,0 +1,124 @@
+name: BTC embedded-standalone daemonless smoke
+
+# ci-steward 2026-08-30. First CI coverage of the btc embedded-standalone
+# (daemonless) path proven live as btc.voidbind.com: c2pool-btc with NO
+# bitcoind, --coin-p2p-discover + --http :808x, headers climbing, HTTP 200.
+# A regression on that path is otherwise invisible until prod.
+#
+# Builds the c2pool-btc target, boots it daemonless, and asserts (bounded):
+# process stays up, HTTP ENGINE endpoint returns 200 (ENGINE, not /v36_status),
+# and the HeaderChain tip advances (headers climbing). Runs github-hosted for
+# guaranteed real DNS + P2P egress (the whole point of the smoke). The gate
+# emits a NAMED, logged skip if the coin network is unreachable, so a silent
+# skip can never read as green.
+#
+# Neutral-skip on branches/coins without the btc embedded-standalone sources
+# (PR #47 per-coin source-presence guard preserved — this job is an ADDITIVE
+# guard and does NOT relax the coin-matrix guard).
+
+on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'ci-steward/btc-embedded-standalone-smoke'
+  pull_request:
+    paths:
+      - 'src/c2pool/main_btc.cpp'
+      - 'src/impl/btc/coin/coin_peer_manager.hpp'
+      - 'src/impl/btc/coin/chain_seeds.hpp'
+      - 'src/impl/btc/coin/header_chain.hpp'
+      - 'tests/gates/btc_embedded_standalone_smoke.sh'
+      - '.github/workflows/btc-embedded-standalone-smoke.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+jobs:
+  btc-embedded-standalone-smoke:
+    name: BTC embedded-standalone daemonless smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check btc embedded-standalone source presence
+        id: presence
+        run: |
+          if [ -f "src/c2pool/main_btc.cpp" ] && [ -f "tests/gates/btc_embedded_standalone_smoke.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::btc embedded-standalone sources present — running daemonless smoke."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::btc embedded-standalone sources absent on this branch — neutral skip (PR #47 guard preserved)."
+          fi
+
+      - name: Set per-job Conan home
+        if: steps.presence.outputs.exists == '1'
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          pip install "conan>=2.0,<3.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-btc-smoke-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-btc-smoke-
+            conan2-ubuntu24-gcc13-
+
+      # Match the green coin-matrix provisioning exactly: lockfile-pinned deps
+      # and an EXPLICIT build_type=Release so conan generates the Release dep
+      # data cmake then consumes (no host/build build_type drift).
+      - name: Conan install
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . \
+              -pr:a=ci/conan/linux-gcc13.profile \
+              --lockfile=conan.lock \
+              --build=missing \
+              --output-folder=build_ci \
+              --settings=build_type=Release; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          exit 1
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake -S . -B build_ci \
+            -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build c2pool-btc target
+        if: steps.presence.outputs.exists == '1'
+        run: cmake --build build_ci --target c2pool-btc -j"$(nproc)"
+
+      - name: Run btc embedded-standalone daemonless smoke
+        if: steps.presence.outputs.exists == '1'
+        shell: bash
+        env:
+          BUILD_DIR: build_ci
+        run: bash tests/gates/btc_embedded_standalone_smoke.sh
