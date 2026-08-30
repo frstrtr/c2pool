@@ -124,6 +124,31 @@ protected:
         s.verified_count = static_cast<int>(m_tracker.verified.size());
         s.head_count = static_cast<int>(m_tracker.chain.get_heads().size());
         s.fork_count = s.head_count;
+
+        // Pool hashrate estimate (H/s) over TARGET_LOOKBEHIND at the tallest
+        // head — the same p2pool get_pool_attempts_per_second the LTC family
+        // publishes. Without this, set_pool_hashrate_fn / the graph / local_stats
+        // read the never-populated snapshot field and reported 0 forever while
+        // the node was mining. Runs on the compute thread under the exclusive
+        // tracker lock (via run_think), so the chain read is safe.
+        try {
+            uint256 best; int32_t best_h = -1;
+            for (const auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
+                auto h = m_tracker.chain.get_height(head_hash);
+                if (h > best_h) { best = head_hash; best_h = h; }
+            }
+            if (!best.IsNull() && best_h >= 2) {
+                auto lookback = std::min(best_h,
+                    static_cast<int32_t>(btc::PoolConfig::TARGET_LOOKBEHIND));
+                uint288 aps = m_tracker.get_pool_attempts_per_second(
+                    best, lookback, /*min_work=*/false);
+                double hr = 0;
+                for (int i = uint288::WIDTH - 1; i >= 0; --i)
+                    hr = hr * 4294967296.0 + aps.pn[i];
+                s.pool_hashrate = hr;
+            }
+        } catch (...) { /* display-only; leave 0 on any transient */ }
+
         std::lock_guard<std::mutex> lock(m_snapshot_mutex);
         m_snapshot = s;
     }

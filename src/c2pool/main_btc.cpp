@@ -1782,7 +1782,8 @@ int main(int argc, char* argv[])
         });
 
     work_source->set_ref_hash_fn(
-        [p2p_node_raw, auto_ratchet, donation_u16, &merged_configs](const uint256& prev_share_hash,
+        [p2p_node_raw, auto_ratchet, donation_u16, &merged_configs,
+         ws_bits = work_source.get()](const uint256& prev_share_hash,
                        const std::vector<unsigned char>& scriptSig,
                        const std::vector<unsigned char>& payout_script,
                        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp,
@@ -1804,6 +1805,9 @@ int main(int argc, char* argv[])
             // running. Pre-Phase-12 we used `bits` (block bits) directly
             // as p.bits — that produced ref_hashes peers couldn't verify
             // (ref_hash includes share_bits, not block_bits).
+            // Record the BTC block target for the dashboard net-difficulty feed.
+            if (ws_bits) ws_bits->note_block_bits(block_bits);
+
             core::stratum::RefHashResult result;
             result.share_version   = 35;
             result.desired_version = 35;
@@ -2195,6 +2199,42 @@ int main(int argc, char* argv[])
             auto [voted_ver, voted_desired] = auto_ratchet->get_share_version(
                 p2p_node_raw->tracker(), job.prev_share_hash);
 
+            // ── C1: fail-closed mint-freshness gate (money) ──────────────────
+            // job.prev_share_hash is our best-VERIFIED tip (best_share_hash_fn →
+            // NodeImpl::best_share_hash, the verified head). On a mature foreign
+            // v35 chain the verified tip can lag the tallest RAW head the network
+            // handed us by thousands of shares while verification catches up.
+            // Minting on that stale parent extends a PRIVATE low-difficulty fork:
+            // compute_share_target has retargeted the share target down to our own
+            // few-TH/s, so the minted share sits far below the network's real
+            // share difficulty, the public PPLNS never credits it, and python
+            // peers reject/disconnect after the broadcast. Fail-closed: refuse the
+            // mint (miners keep their accepted pseudoshare work) until the verified
+            // tip catches the raw head. This STRICTLY REDUCES what we broadcast and
+            // can never mint a wrong share — reward-path safe. Cold start / genesis
+            // (prev null or unknown) is exempt so the first shares can still form.
+            {
+                auto& tk = p2p_node_raw->tracker();
+                int32_t raw_h = -1;
+                for (const auto& [hh, th] : tk.chain.get_heads()) {
+                    auto h = tk.chain.get_height(hh);
+                    if (h > raw_h) raw_h = h;
+                }
+                int32_t v_h = (!job.prev_share_hash.IsNull()
+                               && tk.chain.contains(job.prev_share_hash))
+                    ? tk.chain.get_height(job.prev_share_hash) : -1;
+                constexpr int32_t STALE_SHARES = 30;  // ~15 min at the ~30s cadence
+                if (raw_h >= 0 && v_h >= 0 && (raw_h - v_h) > STALE_SHARES) {
+                    static int stale_log = 0;
+                    if (stale_log++ % 20 == 0)
+                        LOG_WARNING << "[BTC-CREATE-SHARE] refused: verified tip stale"
+                                    << " (v_h=" << v_h << " raw_h=" << raw_h
+                                    << " gap=" << (raw_h - v_h) << " > " << STALE_SHARES
+                                    << ") — not extending a private low-diff fork";
+                    return uint256::ZERO;
+                }
+            }
+
             uint256 share_hash;
             // Merged-mining (NMC AuxPoW): one aux payout entry per --merged
             // chain, keyed by chain_id, paying the SAME deterministic effective
@@ -2522,14 +2562,165 @@ int main(int argc, char* argv[])
         mi->set_pool_hashrate_fn([p2p_node_raw]() -> double {
             return p2p_node_raw->get_tracker_snapshot().pool_hashrate;
         });
-        mi->set_sharechain_stats_fn([p2p_node_raw]() {
-            auto s = p2p_node_raw->get_tracker_snapshot();
-            return nlohmann::json{
-                {"chain_count", s.chain_count},
-                {"verified_count", s.verified_count},
-                {"head_count", s.head_count},
-                {"pool_hashrate", s.pool_hashrate},
-            };
+
+        // Seed the REST fallback share version from the AutoRatchet's live
+        // answer (VOTING on the public v35 chain → 35). Without this the
+        // dashboard read m_cached_share_version's header default and reported
+        // auto_ratchet.v36_active=true on a 100%-v35 chain (mirrors LTC
+        // main_ltc.cpp:3284). The stats fn below keeps it fresh every refresh.
+        {
+            int64_t initial_ver = 35;
+            auto guard = p2p_node_raw->read_tracker();
+            if (guard) {
+                auto [iv, idv] = auto_ratchet->get_share_version(*guard, uint256::ZERO);
+                initial_ver = iv;
+            }
+            mi->set_cached_share_version(initial_ver);
+        }
+
+        // Full sharechain stats — emits the LTC-family key set every REST
+        // consumer (rest_v36_status / rest_version_signaling / local_stats /
+        // graph) expects. The prior 4-field stub emitted chain_count/… which
+        // none of those keys matched, so /v36_status.share_chain.height and
+        // sample_size read 0 and version_signaling early-returned (overall_total
+        // <10), letting live_share_version fall back to the bogus header 36.
+        // Direct tracker walk under the read guard (BTC has no StatsSkipList);
+        // tip-driven cadence keeps the O(chain_length) walk off the hot path.
+        mi->set_sharechain_stats_fn([p2p_node_raw, auto_ratchet,
+                                     ws = work_source.get(), mi]() -> nlohmann::json {
+            static std::mutex   s_cache_mutex;
+            static nlohmann::json s_last_good;
+
+            auto guard = p2p_node_raw->read_tracker();
+            if (!guard) {
+                // Busy (compute thread holds the exclusive lock): hand back the
+                // last full result refreshed with volatile snapshot fields so
+                // the vote/sampling data does not flap to empty.
+                auto snap = p2p_node_raw->get_tracker_snapshot();
+                std::lock_guard<std::mutex> lock(s_cache_mutex);
+                nlohmann::json out = s_last_good.is_null()
+                    ? nlohmann::json::object() : s_last_good;
+                out["chain_height"]   = snap.chain_count;
+                out["total_shares"]   = snap.chain_count;
+                out["verified_count"] = snap.verified_count;
+                out["fork_count"]     = snap.fork_count;
+                return out;
+            }
+
+            auto& chain    = guard->chain;
+            auto& verified = guard->verified;
+
+            // Tallest RAW head (not the verified best) so the stats reflect the
+            // whole adopted chain even while the verified tip catches up.
+            uint256 best; int32_t best_height = -1;
+            for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                auto h = chain.get_height(head_hash);
+                if (h > best_height) { best = head_hash; best_height = h; }
+            }
+
+            const int chain_len = static_cast<int>(btc::PoolConfig::chain_length());
+            const int chain_ht  = best.IsNull() ? 0 : static_cast<int>(chain.get_height(best));
+            const int walk      = std::min(chain_ht, chain_len);
+            const int skip_cnt  = std::min(chain_ht, chain_len * 9 / 10);
+            const int sample_cnt= std::min(chain_ht - skip_cnt, chain_len / 10);
+
+            std::map<std::string,int>    version_counts, desired_counts, miner_counts;
+            std::map<std::string,double> sampling_weights;  // work-weighted desired ver
+            double difficulty_sum = 0.0;
+            int total = 0, orphan = 0, dead = 0;
+
+            if (!best.IsNull() && walk > 0) {
+                int i = 0;
+                for (auto [hash, data] : chain.get_chain(best, walk)) {
+                    data.share.invoke([&](auto* s) {
+                        using T = std::remove_pointer_t<decltype(s)>;
+                        ++total;
+                        version_counts[std::to_string(static_cast<int>(T::version))]++;
+                        desired_counts[std::to_string(static_cast<int>(s->m_desired_version))]++;
+                        int si = static_cast<int>(s->m_stale_info);
+                        if (si == 253) ++orphan; else if (si == 254) ++dead;
+                        auto target = chain::bits_to_target(s->m_bits);
+                        difficulty_sum += chain::target_to_difficulty(target);
+                        std::string miner;
+                        if constexpr (requires { s->m_address; })
+                            miner = HexStr(s->m_address.m_data);
+                        else if constexpr (requires { s->m_pubkey_hash; })
+                            miner = s->m_pubkey_hash.GetHex();
+                        if (!miner.empty()) miner_counts[miner]++;
+                        if (i >= skip_cnt && i < skip_cnt + sample_cnt) {
+                            auto att = chain::target_to_average_attempts(target);
+                            sampling_weights[std::to_string(
+                                static_cast<int>(s->m_desired_version))] +=
+                                static_cast<double>(att.GetLow64());
+                        }
+                    });
+                    ++i;
+                }
+            }
+
+            // Live share version straight from the ratchet (ground truth for
+            // rest_version_signaling's auto_ratchet block + local_stats).
+            int64_t live_ver = 35;
+            { auto [lv, ldv] = auto_ratchet->get_share_version(*guard, best); live_ver = lv; }
+            if (mi) mi->set_cached_share_version(live_ver);
+
+            // Coin network difficulty from the last observed BTC block target
+            // (fills /local_stats net_difficulty + the netdiff graph series).
+            if (mi && ws) {
+                uint32_t bb = ws->last_block_bits();
+                if (bb) mi->update_network_difficulty(
+                    chain::target_to_difficulty(chain::bits_to_target(bb)), "btc-template");
+            }
+
+            nlohmann::json result;
+            result["chain_height"]  = chain_ht;
+            result["chain_length"]  = chain_len;
+            result["chain_tip_hash"]= best.IsNull() ? "" : best.GetHex();
+            result["total_shares"]  = total;
+            result["orphan_shares"] = orphan;
+            result["dead_shares"]   = dead;
+            result["fork_count"]    = static_cast<int>(chain.get_heads().size());
+            result["verified_count"]= static_cast<int>(verified.size());
+            result["shares_by_version"]         = version_counts;
+            result["shares_by_desired_version"] = desired_counts;
+            result["shares_by_miner"]           = miner_counts;
+            result["sampling_desired_version"]  = sampling_weights;
+            result["sampling_total"]            = sample_cnt;
+            result["average_difficulty"] = total > 0 ? difficulty_sum / total : 1.0;
+            result["live_share_version"] = live_ver;
+
+            nlohmann::json heads_arr = nlohmann::json::array();
+            for (auto& [h, t] : chain.get_heads()) heads_arr.push_back(h.GetHex());
+            result["heads"] = std::move(heads_arr);
+            nlohmann::json vheads_arr = nlohmann::json::array();
+            for (auto& [h, t] : verified.get_heads()) vheads_arr.push_back(h.GetHex());
+            result["verified_heads"] = std::move(vheads_arr);
+            nlohmann::json tails_arr = nlohmann::json::array();
+            for (auto& [t, hs] : chain.get_tails()) tails_arr.push_back(t.GetHex());
+            result["tails"] = std::move(tails_arr);
+
+            {
+                std::lock_guard<std::mutex> lock(s_cache_mutex);
+                s_last_good = result;
+            }
+            return result;
+        });
+        // Tip-driven: the payload only changes when a share lands (~1/30s on the
+        // public chain), not every second — keep it off the periodic refresh.
+        mi->mark_last_cache_tip_driven();
+
+        // Bridge the stratum worker registry (bitAXE sessions register on the
+        // BTCWorkSource, which was never wired to the WebServer → /local_stats
+        // showed "No miners connected" while rigs were live).
+        mi->set_stratum_workers_fn([ws = work_source.get()]() {
+            return ws ? ws->snapshot_stratum_workers()
+                      : std::map<std::string, core::stratum::WorkerInfo>{};
+        });
+        mi->set_stratum_hashrate_fn([ws = work_source.get()]() -> double {
+            if (!ws) return 0.0;
+            double total = 0.0;
+            for (auto& [id, w] : ws->snapshot_stratum_workers()) total += w.hashrate;
+            return total;
         });
         mi->set_node_topology_fn([&header_chain, &coin_node]() {
             const uint32_t synced   = header_chain.height();

@@ -908,6 +908,17 @@ public:
         int budget_remaining = bootstrap_mode ? INT_MAX : THINK_VERIFY_BUDGET;
         m_think_needs_continue = false;
 
+        // Frontier diagnostic (C2): when the verified tip lags the raw chain by
+        // a wide margin the mint path extends a stale private fork (money bug).
+        // Phase 2 swallows the first non-advancing share, so the CAUSE (missing
+        // parent body vs a deterministic v35 share_check incompatibility) was
+        // invisible. Log the FIRST failed frontier share + its parent state once
+        // per pass so the wedge root cause is measurable rather than inferred.
+        // Diagnostic only — changes no verification rule.
+        bool  p2_frontier_logged = false;
+        const int p2_raw_verified_gap =
+            static_cast<int>(chain.size()) - static_cast<int>(verified.size());
+
         // ── V36 livelock mirror: cooperative-yield budget for the scoring walk ──
         // The Phase 3/4 scoring step walks the decayed-cumulative-weight + PPLNS
         // window per scored head while holding m_tracker_mutex.  On a healthy
@@ -1074,8 +1085,29 @@ public:
                     // With our budget, don't count already-verified shares against it.
                     // Head B's walk through Head A's verified territory should be free.
                     bool was_already_verified = verified.contains(hash);
-                    if (!attempt_verify(hash))
+                    if (!attempt_verify(hash)) {
+                        // C2 frontier diagnostic: classify WHY the frontier share
+                        // will not verify. prev_in_chain=false → missing parent
+                        // body (need download); prev_in_chain && prev_verified →
+                        // a deterministic verify failure (candidate v35
+                        // share_check incompatibility → replay the bytes through
+                        // python p2pool before touching share_check.hpp).
+                        if (!p2_frontier_logged && p2_raw_verified_gap > 200) {
+                            p2_frontier_logged = true;
+                            bool prev_in_chain    = !prev_hash.IsNull() && chain.contains(prev_hash);
+                            bool prev_verified    = !prev_hash.IsNull() && verified.contains(prev_hash);
+                            LOG_WARNING << "[think-P2-frontier] stuck share=" << hash.GetHex().substr(0,16)
+                                        << " ver=" << share_ver
+                                        << " prev=" << prev_hash.GetHex().substr(0,16)
+                                        << " prev_in_chain=" << prev_in_chain
+                                        << " prev_verified=" << prev_verified
+                                        << " raw_verified_gap=" << p2_raw_verified_gap
+                                        << " reason=" << (!prev_in_chain ? "missing-parent-body"
+                                                          : (prev_verified ? "deterministic-verify-fail"
+                                                                           : "parent-unverified"));
+                        }
                         break;
+                    }
                     ++p2_verified_count;
                     if (!was_already_verified) {
                         --budget_remaining;
