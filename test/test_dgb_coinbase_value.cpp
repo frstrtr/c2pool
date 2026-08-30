@@ -8,7 +8,7 @@
 // (Stage 4c, work_source.cpp) and that takes a live digibyted GBT coinbasevalue
 // verbatim whenever present (the external-daemon fallback that MUST PERSIST).
 //
-// The subsidy values themselves are byte-exact vs the p2pool-dgb-scrypt oracle
+// The subsidy values themselves are byte-exact vs DigiByte Core GetBlockSubsidy
 // (see test_dgb_subsidy.cpp). This test proves the *wiring*: that the embedded
 // coinbasevalue is derived THROUGH the CoinParams::subsidy_func indirection
 // (which params.hpp populates and which previously had zero invocation sites)
@@ -32,15 +32,16 @@ const core::SubsidyFunc kSubsidyFunc =
 
 struct EraVec { uint32_t height; uint64_t subsidy; const char* era; };
 
-// One pin on each side of every reward-era boundary. Expected subsidy values
-// are the p2pool-dgb-scrypt oracle vectors (test_dgb_subsidy.cpp).
+// One pin on each side of every reward-period boundary. Expected subsidy values
+// are the DigiByte Core GetBlockSubsidy() vectors (satoshis/COIN=1e8,
+// test_dgb_subsidy.cpp).
 constexpr EraVec kEraBoundaries[] = {
-    {67199,   8000000000ULL, "phase1-fixed last"},
-    {67200,   7960000000ULL, "phase2 -0.5%/wk first"},
-    {399999,  6746441103ULL, "phase2 last"},
-    {400000,  2434410000ULL, "phase3 -1%/wk first"},
-    {1429999, 2157824200ULL, "phase3 last"},
-    {1430000, 1078500000ULL, "phase4 monthly-decay first"},
+    {67199,   800000000000ULL, "PeriodIII-fixed last"},
+    {67200,   796000000000ULL, "PeriodIV -0.5%/wk first"},
+    {399999,  674644108854ULL, "PeriodIV last"},
+    {400000,  243441000000ULL, "PeriodV -1%/wk first"},
+    {1429999, 215782419560ULL, "PeriodV last"},
+    {1430000, 107850000000ULL, "PeriodVI monthly-decay first"},
 };
 
 } // namespace

@@ -119,65 +119,81 @@ public:
     static constexpr uint32_t DUMB_SCRYPT_DIFF = 65536;  // 2^16
 
     // -----------------------------------------------------------------------
-    // DGB subsidy schedule -- EXACT replica of the p2pool-dgb-scrypt oracle
-    // get_subsidy() (bitcoin/networks/digibyte.py, IDENTIFIER 4B62545B1A631AFE).
-    // V36 conformance = parity with DGB's OWN canonical reference, so the
-    // oracle behaviour IS the spec -- including COIN=1e6 (NOT 1e8) and the
-    // weeks/months + 1 decay count. These are not quirks to "fix" (card #156).
-    // 3-bucket: COMPAT (pre-v36 per-coin baseline, temporary for the crossing;
-    // NOT a v36-native cross-coin standardization).
+    // DGB block subsidy -- EXACT port of DigiByte Core consensus
+    // GetBlockSubsidy(nHeight, consensusParams) (src/validation.cpp), the
+    // authoritative supply curve every DGB mainnet node validates against.
+    // Ground truth is DigiByte Core, NOT the p2pool-dgb-scrypt display oracle:
+    // that oracle's get_subsidy() carried COIN=1e6 and never built a coinbase
+    // in python p2pool (the real value came from digibyted's GBT
+    // coinbasevalue), so its 1e6 unit was a display artifact. This module,
+    // however, feeds the LIVE daemonless coinbase-build path
+    // (embedded_coinbase_value.hpp), where the returned value is written raw as
+    // the coinbase vout in satoshis. At COIN=1e6 that underpaid the real reward
+    // ~100x (built 2.53558070 DGB vs the on-chain 253.55810338 DGB at the live
+    // Scrypt tip ~24.12M), which reverses the earlier card #156 "oracle IS the
+    // spec" ruling: for a real coinbase the spec is DigiByte Core, and COIN is
+    // 1e8 (src/consensus/amount.h). A naive x100 rescale is NOT parity -- the
+    // 1e6 decay loop truncates coarser and lands thousands of sats off; the
+    // decay must run at full 1e8 precision, which this port does.
     //
-    // Integer math mirrors the oracle bit-for-bit: each decay step is
-    //   q -= q / N   (truncating division), NOT q * (N-1) / N -- the two round
-    // differently for non-divisible q, and the oracle rounding is consensus.
+    // Mainnet consensus constants (src/kernel/chainparams.cpp) match DGB Core
+    // exactly. Integer math mirrors Core bit-for-bit: each decay step is
+    //   nSubsidy -= nSubsidy / N   (truncating division), and the Period VI
+    // months count is blocks * BLOCK_TIME_SECONDS / SECONDS_PER_MONTH with
+    // BLOCK_TIME_SECONDS=15 and SECONDS_PER_MONTH=60*60*24*365/12=2'628'000.
+    // Floor mirrors current Core master (nSubsidy < COIN -> 0); Core accepts
+    // underpay (ConnectBlock rejects only overpay, "bad-cb-amount") and the
+    // floor is ~40 years out, so it never bites at the live tip.
     // -----------------------------------------------------------------------
     static uint64_t subsidy(uint32_t height)
     {
-        static constexpr uint64_t COIN                         = 1'000'000;   // oracle COIN = 1e6
+        static constexpr uint64_t COIN                         = 100'000'000; // DGB Core COIN = 1e8
         static constexpr uint32_t nDiffChangeTarget            = 67'200;
         static constexpr uint32_t alwaysUpdateDiffChangeTarget = 400'000;
         static constexpr uint32_t patchBlockRewardDuration     = 10'080;
         static constexpr uint32_t workComputationChangeTarget  = 1'430'000;
         static constexpr uint32_t patchBlockRewardDuration2    = 80'160;
+        static constexpr uint64_t BLOCK_TIME_SECONDS           = 15;
+        static constexpr uint64_t SECONDS_PER_MONTH            = 60ull * 60 * 24 * 365 / 12; // 2'628'000
 
         uint64_t nSubsidy = COIN;
         if (height < nDiffChangeTarget) {
-            // Phase 1: pre-DigiShield fixed rewards.
-            nSubsidy = 8'000 * COIN;
+            // Periods I-III: pre-DigiShield fixed rewards.
             if (height < 1'440)
                 nSubsidy = 72'000 * COIN;
             else if (height < 5'760)
                 nSubsidy = 16'000 * COIN;
+            else
+                nSubsidy = 8'000 * COIN;
         } else if (height < alwaysUpdateDiffChangeTarget) {
-            // Phase 2: -0.5% per (weeks+1), weeks = blocks / 10080.
-            uint64_t qSubsidy = 8'000 * COIN;
+            // Period IV: -0.5% per week, weeks = blocks / 10080 + 1.
+            nSubsidy = 8'000 * COIN;
             uint32_t blocks = height - nDiffChangeTarget;
             uint32_t weeks = (blocks / patchBlockRewardDuration) + 1;
             for (uint32_t i = 0; i < weeks; ++i)
-                qSubsidy -= qSubsidy / 200;
-            nSubsidy = qSubsidy;
+                nSubsidy -= nSubsidy / 200;
         } else if (height < workComputationChangeTarget) {
-            // Phase 3: -1% per (weeks+1), weeks = blocks / 80160.
-            uint64_t qSubsidy = 2'459 * COIN;
+            // Period V: -1% per period, weeks = blocks / 80160 + 1.
+            nSubsidy = 2'459 * COIN;
             uint32_t blocks = height - alwaysUpdateDiffChangeTarget;
             uint32_t weeks = (blocks / patchBlockRewardDuration2) + 1;
             for (uint32_t i = 0; i < weeks; ++i)
-                qSubsidy -= qSubsidy / 100;
-            nSubsidy = qSubsidy;
+                nSubsidy -= nSubsidy / 100;
         } else {
-            // Phase 4: monthly decay (x98884/100000) after work-computation change.
-            uint64_t qSubsidy = 2'157 * COIN / 2;
-            uint32_t blocks = height - workComputationChangeTarget;
-            uint32_t months = static_cast<uint32_t>(
-                static_cast<uint64_t>(blocks) * 15 / (3600 * 24 * 365 / 12));
-            for (uint32_t i = 0; i < months; ++i) {
-                qSubsidy *= 98'884;
-                qSubsidy /= 100'000;
+            // Period VI: monthly decay (x98884/100000) after the DigiSpeed
+            // work-computation-change hard fork at block 1'430'000.
+            nSubsidy = 2'157 * COIN / 2;
+            uint64_t blocks = static_cast<uint64_t>(height) - workComputationChangeTarget;
+            uint64_t months = blocks * BLOCK_TIME_SECONDS / SECONDS_PER_MONTH;
+            for (uint64_t i = 0; i < months; ++i) {
+                nSubsidy *= 98'884;
+                nSubsidy /= 100'000;
             }
-            nSubsidy = qSubsidy;
         }
+        // Core master clamps a sub-1-DGB reward to 0 (released 8.22.x clamped
+        // to COIN; both moot at the tip -- the floor is ~40 years out).
         if (nSubsidy < COIN)
-            nSubsidy = COIN;
+            nSubsidy = 0;
         return nSubsidy;
     }
 
