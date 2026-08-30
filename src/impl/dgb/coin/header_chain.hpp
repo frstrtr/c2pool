@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -274,6 +275,7 @@ public:
 
             m_chain.push_back(h);
             m_cumulative_work += work_from_target(h.target);  // credited
+            trim_to_window();
             return IngestResult::VALIDATED_SCRYPT;
         }
 
@@ -282,6 +284,7 @@ public:
             // Extends the header chain; work-neutral (NO m_cumulative_work
             // change) and excluded from the retarget window by construction.
             m_chain.push_back(h);
+            trim_to_window();
             return IngestResult::ACCEPTED_CONTINUITY;
         }
     }
@@ -389,6 +392,40 @@ public:
     // the tip + its 10 nearest ancestors == 11 timestamps).
     static constexpr std::size_t MEDIAN_TIME_SPAN = 11;
 
+    // ── Rolling in-memory window bound (RSS plateau) ────────────────────────
+    // DigiByte's ~15 s block time makes this the fastest-growing embedded
+    // HeaderChain in the fleet: sync-from-genesis accumulates the ENTIRE ~24 M
+    // header history in RAM (~112 B/HeaderSample × 24.1 M ≈ 2.7 GB resident,
+    // the single largest memory consumer on the voidbind host and an OOM on a
+    // no-swap box). Nothing in this class needs the full history: the only
+    // consumers that index into m_chain read the TAIL —
+    //   * median_time_past()      -> last MEDIAN_TIME_SPAN (11) headers,
+    //   * next_retarget_window(w)  -> last `w` SCRYPT ancestors (retarget
+    //                                 scaffolding; w == 0 / disabled on the live
+    //                                 default-constructed chain),
+    //   * tip_hash() / tip_height() / next_block_height() -> back()/size().
+    // Absolute height is a pure function of base + index, and cumulative_work is
+    // a running scalar, so the chain can drop headers OLDER than a bounded
+    // window without changing ANY observable value: on eviction we pop_front()
+    // and bump m_base_height by the same count, leaving tip_height(),
+    // next_block_height() and cumulative_work() bit-identical while RAM
+    // plateaus. This mirrors the BTC lane's bounded working set
+    // (src/impl/btc/coin/header_chain.hpp HEADER_CACHE_CAP LRU) adapted to DGB's
+    // positional, hash-keyless, reorg-free structure — a rolling tail window is
+    // the DGB-appropriate form of the same "bounded RAM + trusted checkpoint of
+    // older headers" bound.
+    //
+    // The cap must comfortably exceed every tail consumer AND any legal reorg
+    // depth. 16384 headers ≈ 2.8 days of DGB blocks — vastly beyond the 11-wide
+    // MTP window, beyond any DigiShield retarget window, and beyond the minutes-
+    // scale finality a legal reorg could reach; the daemon-independent PoW/MTP
+    // gates a header ingest runs are all context-free or tail-local, so a header
+    // dropped below the window is never needed to validate the tip or a
+    // fork the chain could switch to. At 16384 × 112 B ≈ 1.8 MB the header
+    // subsystem's RSS is bounded regardless of chain height. Retained headers
+    // never exceed CAP + 1 transiently (one push_back before one pop_front).
+    static constexpr std::size_t HEADER_WINDOW_CAP = 16384;
+
     // MedianTimePast: median nTime over the tip and its (up to) MEDIAN_TIME_SPAN
     // nearest ancestors. Walks ALL appended headers regardless of algo --
     // DigiByte Core's GetMedianTimePast walks the block index, which interleaves
@@ -411,6 +448,23 @@ public:
     }
 
 private:
+    // Drop headers older than HEADER_WINDOW_CAP so RAM plateaus regardless of
+    // chain height. Popping the front and advancing m_base_height by the same
+    // count is height-neutral: tip_height() == m_base_height + size() - 1 and
+    // next_block_height() == m_base_height + size() are both invariant across a
+    // pop_front()+(++m_base_height). cumulative_work is a monotone running
+    // scalar (total work ever credited, never consumed by a V36 consensus
+    // path), so it is deliberately NOT decremented for an evicted header. Called
+    // after every push_back, so at most one eviction fires per append; the while
+    // loop is defensive should the cap ever be lowered at runtime.
+    void trim_to_window()
+    {
+        while (m_chain.size() > HEADER_WINDOW_CAP) {
+            m_chain.pop_front();
+            ++m_base_height;
+        }
+    }
+
     // Work proxy: inversely proportional to the target. The full-width field
     // narrows to low64() for the proxy, keeping cumulative_work byte-identical
     // for every uint64-range vector; the embedded port swaps in arith_uint256
@@ -436,7 +490,11 @@ private:
     DigiShieldParams          m_ds_params{};        // retarget gate params
     uint32_t                  m_base_height = 0;   // abs height of m_chain[0]
     std::size_t               m_retarget_window = 0; // Scrypt window depth
-    std::vector<HeaderSample> m_chain;          // oldest .. newest
+    // Bounded rolling window, oldest .. newest (front == m_base_height). A
+    // std::deque gives O(1) pop_front() for eviction (trim_to_window); every
+    // access here is positional / back() / size(), all O(1) on a deque, so the
+    // container swap from std::vector is behaviour-preserving for consumers.
+    std::deque<HeaderSample>  m_chain;          // oldest .. newest (<= CAP)
     uint64_t                  m_cumulative_work = 0;
 };
 
