@@ -32,6 +32,7 @@
 // non-broadcaster shape suitable for B2-net smoke testing.
 
 #include <impl/btc/coin/header_chain.hpp>
+#include <impl/btc/coin/template_builder.hpp> // btc::coin::get_block_subsidy — zero-rig block-value projection (dashboard cards)
 #include <impl/btc/coin/tip_reconcile_gate.hpp> // B5b: TipReconcileGate SSOT (10s re-poll cadence + fire predicate) shared with tip_reconcile_test.cpp
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/node.hpp>
@@ -2592,6 +2593,56 @@ int main(int argc, char* argv[])
             return p2p_node_raw->best_share_hash();
         });
 
+        // §6b Block value (MINERS BLOCK VALUE / NODE FEE cards) — mirror of the
+        // DASH #1409 daemonless zero-rig fallback, BTC-adapted. The web MI is
+        // stood up with a NULL IMiningNode (above), so refresh_work() never fills
+        // m_cached_template and the core block-value read (web_server.cpp ~4316)
+        // stays 0; with no set_coin_work_fn producer the fallback at ~4325 has
+        // nothing to fall back to, so the cards read 0.0000 BTC / 0.0 % on the
+        // zero-rig relay even though the embedded header follower knows the tip.
+        // Project CoinWorkInfo from the header-follower tip + the ported-from-Core
+        // BTC subsidy formula (template_builder.hpp get_block_subsidy, the SAME
+        // math block_assembly.hpp uses to build real coinbases). Unlike DASH,
+        // BTC has NO treasury / NO masternode split / NO platform burn: the
+        // whole subsidy is the miners' block value (gross, pre-POOL-fee), so
+        // payments_total_sat = burn_sat = 0 and the card's "(gross, pre-fee)"
+        // label is exact — net = gross − pool_fee. This is a NON-fetching read
+        // of already-published header state; it never invokes the money-path
+        // template builder from a display timer. Projection excludes tx fees,
+        // flagged by block_value_basis="projected" (template_age_sec=-1). Once
+        // rigs connect the same header tip drives it; there is no live-template
+        // path to prefer on this NULL-IMiningNode web MI.
+        mi->set_coin_work_fn(
+            [&header_chain, ws = work_source.get(),
+             halving = chain_params.subsidy_halving_interval]()
+                -> core::MiningInterface::CoinWorkInfo {
+                core::MiningInterface::CoinWorkInfo info;
+                const uint32_t tip = header_chain.height();
+                if (tip == 0) return info;   // header follower not yet synced
+                const uint32_t height = tip + 1;
+                info.valid              = true;
+                info.projected          = true;
+                info.height             = height;
+                // block_value == full subsidy on a coinbase-only body (no tx
+                // fees on a projection). BTC has no protocol outputs to carve
+                // out, so miners get the whole amount.
+                info.coinbase_value_sat = btc::coin::get_block_subsidy(height, halving);
+                info.payment_amount_sat = 0;
+                info.payments_total_sat = 0;
+                info.burn_sat           = 0;
+                // Coin network difficulty from the last observed BTC block
+                // target (same source as the sharechain-stats netdiff feed).
+                if (ws) {
+                    uint32_t bb = ws->last_block_bits();
+                    if (bb) info.network_difficulty =
+                        chain::target_to_difficulty(chain::bits_to_target(bb));
+                }
+                // No sourced template: age is not a wall-clock; -1 renders
+                // block_value_age as null and block_value_basis "projected".
+                info.template_age_sec = -1;
+                return info;
+            });
+
         // §3 PPLNS distribution — /pplns/current requires m_pplns_fn on the web
         // MI. Reuse the EXACT lambda already given to the stratum work_source
         // (main_btc.cpp:1749): AutoRatchet picks the live share version and the
@@ -2836,6 +2887,13 @@ int main(int argc, char* argv[])
             nlohmann::json tails_arr = nlohmann::json::array();
             for (auto& [t, hs] : chain.get_tails()) tails_arr.push_back(t.GetHex());
             result["tails"] = std::move(tails_arr);
+            // Mirror #1409: emit verified_tails so /web/verified_tails serves
+            // the real verified sharechain tails instead of falling through to
+            // [] (web_server.cpp handles absent key as empty). Completes the
+            // heads/verified_heads/tails set already emitted above.
+            nlohmann::json vtails_arr = nlohmann::json::array();
+            for (auto& [t, hs] : verified.get_tails()) vtails_arr.push_back(t.GetHex());
+            result["verified_tails"] = std::move(vtails_arr);
 
             {
                 std::lock_guard<std::mutex> lock(s_cache_mutex);
