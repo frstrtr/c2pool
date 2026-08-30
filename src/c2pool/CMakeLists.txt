@@ -238,14 +238,29 @@ target_link_libraries(c2pool-btc
 # c2pool-dgb target stanza changes.
 add_executable(c2pool-dgb main_dgb.cpp)
 c2pool_wire_version(c2pool-dgb)
+# ── SLICE 2: arm --merged DOGE (DGB-as-DOGE-parent embedded merged mining) ──────
+# AUX_DOGE ON for THIS TARGET ONLY (target_compile_definitions, not the global
+# option() which would leak the macro across every coin lane and break per-coin
+# isolation). It compiles in main_dgb.cpp's #ifdef AUX_DOGE arm — the embedded
+# DOGE aux backend standup (mm_manager + doge::coin::AuxChainEmbedded PRIMARY +
+# CoinBroadcaster header sync) that feeds the #1413 DGBWorkSource coinbase-commit
+# seams. The dgb OBJECT libs stay compiled without the macro (main_dgb never
+# ODR-uses node.hpp::bind_aux_doge_parsers), so only this TU changes. ltc_coin is
+# added because the shared src/impl/doge aux module (header-only) is templated on
+# ltc::coin types (Mempool/Transaction/BlockHeaderType/parse_doge_*) whose
+# out-of-line defs live there; CoinBroadcaster/MergedMiningManager/AuxChainRPC
+# already resolve via c2pool_merged_mining (linked above). No shared-base edit;
+# only the c2pool-dgb stanza changes.
+target_compile_definitions(c2pool-dgb PRIVATE AUX_DOGE)
 target_link_libraries(c2pool-dgb
     c2pool_payout
-    c2pool_merged_mining  # symbol resolution for core web_server tangle (NOT -DAUX_DOGE)
+    c2pool_merged_mining  # MergedMiningManager / CoinBroadcaster / AuxChainRPC (+ core web_server tangle)
     c2pool_hashrate
     core
     dgb        # DGB pool-layer OBJECT lib: node.cpp NodeImpl + protocol handlers
     dgb_coin   # DGB coin-layer: embedded P2P + mempool + transaction ctors
     dgb_stratum  # DGB miner-facing IWorkSource (DGBWorkSource) — #82 stratum standup
+    ltc_coin   # SLICE 2: DOGE aux backend reuses ltc::coin Mempool/Transaction/parse (embedded DOGE-on-DGB)
     pool
     sharechain
     c2pool_storage

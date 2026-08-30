@@ -52,6 +52,21 @@ enum HeaderStatus : uint32_t {
 };
 
 /// A validated header with chain metadata.
+///
+/// MEMORY / OOM-residency invariant (embedded DGB-as-DOGE-parent aux chain,
+/// SLICE 2): this resident entry is HEADERS-ONLY. It carries the 80-byte base
+/// header + a handful of uint256 digests + status — and DELIBERATELY never the
+/// AuxPoW proof blob (parent coinbase tx + two merkle branches + parent header,
+/// ~1-3 KB). DOGE has been AuxPoW-mined since 2014, so a ~5M+ header IBD would
+/// balloon RSS by that per-header proof if it were kept resident. It is not: the
+/// P2P 'headers' feed is decoded by doge::coin::parse_doge_headers_message,
+/// which parses the AuxPoW proof and DROPS it, handing add_headers only the
+/// 80-byte base header. RSS therefore plateaus at the ~200 B/entry headers-only
+/// floor across the full DOGE history instead of the OOM balloon the NMC arm hit
+/// (#1414 — mirrored here at the PARSE boundary rather than a post-persist drop,
+/// because the blob never reaches this struct). Any future edit that adds an
+/// AuxPow / proof / std::vector<uint8_t> member REINTRODUCES that balloon; the
+/// DogeAuxResidency KAT in the dgb test suite pins the headers-only size floor.
 struct IndexEntry {
     BlockHeaderType header;
     uint256         hash;           // scrypt(header) for PoW check, SHA256d for identification

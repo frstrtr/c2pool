@@ -691,6 +691,25 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_coinbase_commit_test "" AUTO)
 
+    # --- DGB+DOGE (SLICE 2) -- embedded DOGE aux HeaderChain OOM-residency KAT ---
+    # Pins the invariant that keeps RSS flat across the ~5M+ header DOGE IBD the
+    # --merged DOGE arm syncs daemonless: (1) doge::coin::IndexEntry is headers-
+    # only (sizeof floor, NO resident AuxPoW proof blob); (2) the wire decoder
+    # parse_doge_headers_message drops the AuxPoW proof and yields BASE 80-byte
+    # headers (the parse-boundary that keeps the blob out of residency); (3) the
+    # projected full-history residency stays under a hard RAM cap. A regression
+    # that re-admits the ~1-3 KB proof per header (the #1414 OOM balloon) trips
+    # this. Links ltc_coin (DOGE headers reuse ltc::coin serialize) + core (pack).
+    # MUST appear in BOTH this registration AND the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_residency_test aux_doge_residency_test.cpp)
+    target_link_libraries(dgb_aux_doge_residency_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain ltc_coin)
+    gtest_add_tests(dgb_aux_doge_residency_test "" AUTO)
+
     # --- DGB+DOGE (phase DC) -- DGB-as-parent AuxPoW PROOF byte-parity + dual ---
     # Proves the neutral producer build_auxpow_proof (c2pool/merged) is byte-
     # identical to the typed doge::coin::CAuxPow<dgb::coin::MutableTransaction>
