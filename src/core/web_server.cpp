@@ -4351,6 +4351,13 @@ nlohmann::json MiningInterface::rest_local_stats()
             coin_work.template_age_sec >= 0
                 ? nlohmann::json(coin_work.template_age_sec)
                 : nlohmann::json(nullptr);
+        // Honest provenance: "template" = read off a sourced work template
+        // (live block value, has an age); "projected" = derived from the
+        // header follower's published tip + pure subsidy formulas on a
+        // daemonless zero-rig relay (exact miner share, no wall-clock age,
+        // superblock/fee extras not reflected). Lets the card label it.
+        result["block_value_basis"] =
+            coin_work.projected ? "projected" : "template";
     }
     // #948 gross-vs-net honesty. block_value_miner has always been NET of the
     // pool fee while block_value_payments is GROSS: two sibling fields sharing

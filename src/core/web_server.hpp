@@ -702,6 +702,14 @@ public:
         // A stale template renders as a legitimate-looking block_value; the
         // age is what lets the dashboard say "this number is N minutes old".
         int64_t  template_age_sec = -1;
+        // TRUE when these values were PROJECTED from the header follower's
+        // published tip + the pure subsidy formulas rather than read off a
+        // sourced work template. Happens on a fully-daemonless zero-rig relay
+        // where no stratum work demand ever built a template: the miner share
+        // (subsidy/4) and MN split are exact, but there is no wall-clock age
+        // and superblock/fee extras are not reflected. Surfaced as
+        // block_value_basis so the card can label a projection honestly.
+        bool     projected = false;
     };
     void set_coin_work_fn(std::function<CoinWorkInfo()> fn) { m_coin_work_fn = thread_safe_wrap(std::move(fn)); }
 
