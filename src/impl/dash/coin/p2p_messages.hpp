@@ -189,11 +189,24 @@ END_MESSAGE()
 ///
 /// Block invs are deliberately NOT here: they take the getheaders-then-block
 /// path in the inv handler, not a bare getdata.
+///
+/// govobject (17) / govobjectvote (18) ARE pull-eligible types (E-SUPERBLOCK:
+/// dashcore answers a govsync with governance INVENTORY, not the objects
+/// directly — CGovernanceManager::SyncObjects / SyncSingleObjVotes — so without
+/// a getdata for these types the govobj / govobjvote handlers never fire and
+/// the GovernanceStore stays empty, exactly the pre-fix inert leg). Unlike
+/// clsig / isdlock they are RUNTIME-GATED, not unconditional: the inv handler
+/// pulls them only when m_gov_pull_enabled is armed (--embedded-govsync
+/// observe-only OR --embedded-superblock), the same is_dstx precedent. Keeping
+/// them in this TYPE predicate documents "these are getdata-pull types"; the
+/// handler decides whether to actually pull.
 inline bool inv_type_is_pulled(inventory_type::inv_type t)
 {
     return t == inventory_type::quorum_final_commitment
         || t == inventory_type::clsig
-        || t == inventory_type::isdlock;
+        || t == inventory_type::isdlock
+        || t == inventory_type::govobject
+        || t == inventory_type::govobjectvote;
 }
 
 // ── Phase C-SML step 4: Simplified MN List sync messages ──────────────

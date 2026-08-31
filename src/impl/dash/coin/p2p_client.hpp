@@ -912,6 +912,19 @@ private:
     uint64_t m_dstx_inv_seen{0};     // inv(MSG_DSTX) admitted by the dedup
     uint64_t m_dstx_pull_sent{0};    // getdata(MSG_DSTX) issued
     uint64_t m_dstx_received{0};     // dstx bodies that arrived
+    // E-SUPERBLOCK governance sourcing lane (--embedded-govsync observe-only OR
+    // --embedded-superblock): OPT-IN, and — like DSTX — the GETDATA ITSELF is
+    // gated. A governance inv is otherwise inert: without the pull the
+    // govobj/govobjvote handlers never fire and the GovernanceStore stays
+    // empty, so a superblock height can never be served daemonlessly. OFF by
+    // default => the wire is byte-identical to the pre-fix node (govsync is
+    // still SENT at handshake, but the inv answer is not pulled). No budget:
+    // gov invs are batched to ONE getdata per inv message and dashd
+    // rate-limits full govsync per peer.
+    bool     m_gov_pull_enabled{false};
+    uint64_t m_gov_inv_offered{0};   // inv(gov) SEEN on the wire, pre-dedup
+    uint64_t m_gov_inv_seen{0};      // inv(gov) admitted by the dedup (armed)
+    uint64_t m_gov_pull_sent{0};     // getdata(gov) invs issued (batched)
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
     uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
@@ -1290,6 +1303,9 @@ public:
         for (const auto& p : m_pool) out.push_back(p->key);
         return out;
     }
+    // NOTE: handshaked_peer_keys() (the HANDSHAKE-COMPLETE peer set the govsync
+    // call site records via note_govsync_requested for the R5 coverage floor)
+    // is defined once below, near the bulk-scheduler peer accessors.
     /// Per-peer connection age in seconds, in pool order — durability, direct.
     std::vector<int64_t> peer_ages_sec() const
     {
@@ -1810,6 +1826,35 @@ public:
     void set_dstx_pull(bool on) { m_dstx_pull_enabled = on; }
     bool dstx_pull_enabled() const { return m_dstx_pull_enabled; }
 
+    /// Arm the E-SUPERBLOCK governance sourcing lane (--embedded-govsync
+    /// observe-only OR --embedded-superblock). OFF by default: an explicit
+    /// operator decision. Like DSTX this gates the GETDATA itself — a
+    /// governance inv (MSG_GOVERNANCE_OBJECT=17 / _VOTE=18) has no fee-only-safe
+    /// unconditional consumer, so off-flag no gov inv earns a request and the
+    /// wire is byte-identical to master (the govsync request still goes out at
+    /// handshake, but its inv answer is not pulled → the store stays empty →
+    /// every superblock height falls back to dashd, the pre-fix behaviour).
+    /// ON arms the batched getdata + per-object vote sync; SERVING is separately
+    /// gated by --embedded-superblock, so --embedded-govsync alone proves the
+    /// store populates on the live canary WITHOUT arming the serve path.
+    void set_gov_pull(bool on) { m_gov_pull_enabled = on; }
+    bool gov_pull_enabled() const { return m_gov_pull_enabled; }
+
+    /// One greppable line for the observe-only soak: governance invs the peer
+    /// announced, how many were admitted+pulled once armed. Zero offered =
+    /// "peer is not serving governance"; offered>0 with getdata>0 and the store
+    /// counters (maintainer EMBED-STATUS) still zero = a verify/weight gap.
+    std::string gov_ingest_status() const
+    {
+        return "[GOVSYNC-INGEST] armed=" + std::string(m_gov_pull_enabled ? "1" : "0")
+             + " gov_inv_offered=" + std::to_string(m_gov_inv_offered)
+             + " gov_inv=" + std::to_string(m_gov_inv_seen)
+             + " getdata=" + std::to_string(m_gov_pull_sent);
+    }
+    uint64_t gov_inv_offered_count() const { return m_gov_inv_offered; }
+    uint64_t gov_inv_seen_count()    const { return m_gov_inv_seen; }
+    uint64_t gov_pull_sent_count()   const { return m_gov_pull_sent; }
+
     /// One greppable line: what the ingest lane asked for and what it got.
     /// received < pull_sent is normal (notfound, races, peers that drop);
     /// received == 0 with pull_sent > 0 for a sustained period is the
@@ -2226,14 +2271,49 @@ public:
     /// seam. A zero nProp with an EMPTY bloom filter requests ALL governance
     /// objects + votes; the peer streams them back as govobj / govobjvote
     /// messages, which the handlers above forward into the GovernanceStore.
-    void send_govsync()
+    ///
+    /// COVERAGE: sends to EVERY handshaked peer, not just m_primary — dashcore
+    /// answers a govsync(nProp=0) with OBJECT invs only (SyncObjects), and the
+    /// R5 completeness predicate (set_superblock_sync_complete_fn) needs
+    /// >= min_peers (2) DISTINCT peers primed before it can flip TRUE. The
+    /// call site records each primed peer via note_govsync_requested (see the
+    /// keys returned by handshaked_peer_keys()). dashd rate-limits full govsync
+    /// per peer, so the re-prime at each handshake completion is safe. Returns
+    /// the number of peers written to (0 = no handshaked peer yet).
+    std::size_t send_govsync()
     {
-        if (!m_primary) return;
-        auto msg = message_govsync::make_raw(
-            uint256::ZERO,               // nProp = 0 => request all
-            std::vector<uint8_t>{},      // empty filter vData
-            /*nHashFuncs=*/0u, /*nTweak=*/0u, /*nFlags=*/uint8_t{0});
-        m_primary->write(msg);
+        std::size_t sent = 0;
+        for (auto& p : m_pool) {
+            if (!p->handshake.complete()) continue;
+            auto m = message_govsync::make_raw(
+                uint256::ZERO,           // nProp = 0 => request all objects
+                std::vector<uint8_t>{},  // empty filter vData
+                /*nHashFuncs=*/0u, /*nTweak=*/0u, /*nFlags=*/uint8_t{0});
+            p->write(m);
+            ++sent;
+        }
+        return sent;
+    }
+
+    /// Per-object vote sync (E-SUPERBLOCK): dashcore serves a governance
+    /// object's VOTES only in reply to a govsync whose nProp is that object's
+    /// hash (CGovernanceManager::SyncSingleObjVotes). A govsync(nProp=0) invs
+    /// OBJECTS only, never their votes, so a trigger's funding votes are
+    /// unreachable until we ask for them by hash. Fired from the govobj handler
+    /// the moment a TRIGGER object is accepted, to every handshaked peer so the
+    /// tally can reach the funding threshold. Bloom filter empty (match none =>
+    /// send all votes for the object).
+    std::size_t send_govsync(const uint256& prop)
+    {
+        std::size_t sent = 0;
+        for (auto& p : m_pool) {
+            if (!p->handshake.complete()) continue;
+            auto m = message_govsync::make_raw(
+                prop, std::vector<uint8_t>{}, 0u, 0u, uint8_t{0});
+            p->write(m);
+            ++sent;
+        }
+        return sent;
     }
 
     /// Relay a pre-serialized won block as a `block` P2P message (the embedded
@@ -3538,6 +3618,15 @@ private:
         // Block invs fire new_block (the E2 ingest seam, which pulls headers
         // then the block). Object invs in the pull policy get an immediate
         // getdata; everything else is ignored.
+        //
+        // E-SUPERBLOCK: governance invs (MSG_GOVERNANCE_OBJECT=17,
+        // MSG_GOVERNANCE_OBJECT_VOTE=18) are collected across THIS inv message
+        // and pulled with ONE batched getdata after the loop. A mainnet govsync
+        // answers with thousands of vote invs in a single inv message (the
+        // oracle currently holds ~5400 votes); emitting one getdata per inv
+        // would be a self-inflicted flood. InvDedup still collapses the N-peer
+        // fan-in to one pull per (type, hash) before an inv reaches the batch.
+        std::vector<inventory_type> gov_pull_batch;
         for (auto& inv : msg->m_invs)
         {
             // inv_type_is_pulled is the TYPE predicate. isdlock is pulled
@@ -3546,7 +3635,16 @@ private:
             // isdlock. The runtime opt-in (--embedded-ingest-isdlock) gates
             // only the BLS-verified new_isdlock lane at the handler, not
             // the getdata.
-            const bool pulled = inv_type_is_pulled(inv.m_type);
+            //
+            // Governance invs are pull-eligible BY TYPE (inv_type_is_pulled)
+            // but RUNTIME-GATED (m_gov_pull_enabled) and BATCHED, so they are
+            // pulled through the gov branch below, not the unconditional
+            // `pulled` path — is_gov_type factors them out of `pulled` exactly
+            // as the is_dstx precedent factors DSTX out of the tx path.
+            const bool is_gov_type = (inv.base_type() == inventory_type::govobject
+                                   || inv.base_type() == inventory_type::govobjectvote);
+            const bool is_gov = is_gov_type && m_gov_pull_enabled;
+            const bool pulled = inv_type_is_pulled(inv.m_type) && !is_gov_type;
             const bool is_block = (inv.base_type() == inventory_type::block);
             const bool is_tx = (inv.base_type() == inventory_type::tx)
                             && m_tx_pull_enabled;
@@ -3561,7 +3659,11 @@ private:
             // are filtering". Same announcement from N peers = N offered, 1
             // admitted — that gap is the fan-in the pool exists to produce.
             if (inv.base_type() == inventory_type::tx) ++m_tx_inv_offered;
-            if (!pulled && !is_block && !is_tx && !is_dstx)
+            // Offered-vs-admitted for governance: count gov invs the peer
+            // announces even when the arm is OFF, so the observe-only soak can
+            // tell "peer is not announcing governance" from "we are not pulling".
+            if (is_gov_type) ++m_gov_inv_offered;
+            if (!pulled && !is_block && !is_tx && !is_dstx && !is_gov)
                 continue;   // not actionable — do not spend a dedup slot on it
             if (!m_inv_dedup.admit(static_cast<uint32_t>(inv.m_type), inv.m_hash, now))
             {
@@ -3596,6 +3698,17 @@ private:
                 auto getdata_msg = message_getdata::make_raw(
                     {inventory_type(inv.m_type, inv.m_hash)});
                 p->write(getdata_msg);
+                continue;
+            }
+            if (is_gov)
+            {
+                // E-SUPERBLOCK gated pull: collect this admitted governance inv
+                // for the ONE batched getdata after the loop (echo the announced
+                // type + hash straight back — the govobj inv hash is the object
+                // identity hash, the govobjvote inv hash is the vote identity
+                // hash; both are only ever echoed to the peer, never derived).
+                ++m_gov_inv_seen;
+                gov_pull_batch.emplace_back(inv.m_type, inv.m_hash);
                 continue;
             }
             if (is_tx || is_dstx)
@@ -3644,6 +3757,17 @@ private:
             // holds the block, not to an arbitrary primary (block_source).
             record_block_announcer(inv.m_hash, p->key);
             m_coin->new_block.happened(inv.m_hash);
+        }
+        // E-SUPERBLOCK: ONE batched getdata for every admitted governance inv
+        // in this inv message (objects on the initial govsync, per-object vote
+        // invs on a govsync(nProp=hash) — see send_govsync). Asking the peer
+        // that ANNOUNCED them routes every govobj/govobjvote reply back to this
+        // same session, where the handlers below forward them into the store.
+        if (!gov_pull_batch.empty())
+        {
+            m_gov_pull_sent += gov_pull_batch.size();
+            auto getdata_msg = message_getdata::make_raw(gov_pull_batch);
+            p->write(getdata_msg);
         }
     }
 
@@ -4098,6 +4222,21 @@ private:
                  << rec.object_hash.GetHex().substr(0, 16) << " type="
                  << rec.object_type << " data=" << rec.vch_data.size() << "B";
         m_coin->new_govobject.happened(rec);
+        // E-SUPERBLOCK per-object vote sync: a govsync(nProp=0) invs OBJECTS
+        // only — a TRIGGER's funding votes are served only in reply to a
+        // govsync(nProp=objectHash) (dashcore SyncSingleObjVotes). Fire it now
+        // for every accepted TRIGGER (GOVERNANCE_OBJECT_TRIGGER == 2) so the
+        // funding tally can reach the threshold. Gated on the arm so an
+        // unarmed node stays wire-identical; the reply's vote invs ride the
+        // same gated batched-getdata path as the objects.
+        if (m_gov_pull_enabled &&
+            rec.object_type == ::dash::coin::GOVERNANCE_OBJECT_TRIGGER)
+        {
+            const std::size_t primed = send_govsync(rec.object_hash);
+            LOG_INFO << "[" << m_chain_label << "] govobj TRIGGER "
+                     << rec.object_hash.GetHex().substr(0, 16)
+                     << " -> per-object vote sync to " << primed << " peer[s]";
+        }
     }
 
     ADD_P2P_HANDLER(govobjvote)
