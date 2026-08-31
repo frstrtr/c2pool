@@ -689,3 +689,179 @@ TEST(MersenneTwisterTest, SingleValueRange) {
     int r = doge_mt_uniform_int(42, 5, 5);
     EXPECT_EQ(r, 5);
 }
+
+// ─── Pre-DigiShield retarget KAT (real Dogecoin mainnet) ────────────────────
+//
+// Provenance: Dogecoin mainnet, the first four 240-block retarget boundaries.
+// Every timestamp and every nBits below is the value on the canonical chain
+// (cross-checked against a public block explorer); the expected nBits at each
+// boundary is the difficulty the network actually mined at that height.
+//
+//   genesis  t=1386325540  bits=0x1e0ffff0
+//   h239     t=1386475638
+//   h240 →   bits=0x1e0fffff  (first retarget: timespan max-clamp + powlimit cap)
+//   h479     t=1386475840
+//   h480 →   bits=0x1e00ffff  (timespan min-clamp; first block = h239)
+//   h719     t=1386476362
+//   h720 →   bits=0x1d0ffff0  (timespan min-clamp; first block = h479)
+//   h959     t=1386479795
+//   h960 →   bits=0x1d03d07b  (FIRST UNCLAMPED retarget; first block = h719)
+//   h1199    t=1386489067
+//   h1200 →  bits=0x1d0274be  (first block = h959)
+//
+// h960 is the block that wedged from-genesis embedded sync: it is the first
+// boundary whose actual timespan lands inside the [900, 57600] clamp window,
+// so the off-by-one in the first-block selection (h720 instead of h719) is no
+// longer masked and produces a different, rejected nBits (0x1d03c884).
+
+namespace {
+// mainnet retarget boundary timestamps (parent block of each retarget)
+constexpr int64_t DOGE_T_GENESIS = 1386325540;
+constexpr int64_t DOGE_T_239     = 1386475638;
+constexpr int64_t DOGE_T_479     = 1386475840;
+constexpr int64_t DOGE_T_719     = 1386476362;
+constexpr int64_t DOGE_T_720     = 1386476390;  // real h720 nTime (the WRONG first block)
+constexpr int64_t DOGE_T_959     = 1386479795;
+constexpr int64_t DOGE_T_1199    = 1386489067;
+} // namespace
+
+TEST(PreDigiShieldRetargetKAT, FirstBlockSelectionMatchesCore) {
+    // dogecoin/src/pow.cpp GetNextWorkRequired: first block = genesis at the
+    // 240 boundary, else new_height - interval - 1.
+    EXPECT_EQ(doge_pre_digishield_first_height(240), 0u);
+    EXPECT_EQ(doge_pre_digishield_first_height(480), 239u);
+    EXPECT_EQ(doge_pre_digishield_first_height(720), 479u);
+    EXPECT_EQ(doge_pre_digishield_first_height(960), 719u);
+    EXPECT_EQ(doge_pre_digishield_first_height(1200), 959u);
+    EXPECT_EQ(doge_pre_digishield_first_height(1440), 1199u);
+}
+
+TEST(PreDigiShieldRetargetKAT, BoundaryBitsMatchMainnet) {
+    auto p = DOGEChainParams::mainnet();
+    // Sanity: the mainnet pow-limit compact used by the powlimit cap.
+    EXPECT_EQ(p.pow_limit.GetCompact(), 0x1e0fffffu);
+
+    // h240: first block = genesis; timespan 150098s > 57600 max → *4 → cap.
+    EXPECT_EQ(calculate_doge_next_work(0x1e0ffff0, DOGE_T_239, DOGE_T_GENESIS, 240, p),
+              0x1e0fffffu);
+    // h480: first = h239; timespan 202s < 900 min → /16.
+    EXPECT_EQ(calculate_doge_next_work(0x1e0fffff, DOGE_T_479, DOGE_T_239, 480, p),
+              0x1e00ffffu);
+    // h720: first = h479; timespan 522s < 900 min → /16.
+    EXPECT_EQ(calculate_doge_next_work(0x1e00ffff, DOGE_T_719, DOGE_T_479, 720, p),
+              0x1d0ffff0u);
+    // h960: first = h719; timespan 3433s IN-WINDOW → unclamped retarget.
+    EXPECT_EQ(calculate_doge_next_work(0x1d0ffff0, DOGE_T_959, DOGE_T_719, 960, p),
+              0x1d03d07bu);
+    // h1200: first = h959; still in-window.
+    EXPECT_EQ(calculate_doge_next_work(0x1d03d07b, DOGE_T_1199, DOGE_T_959, 1200, p),
+              0x1d0274beu);
+}
+
+TEST(PreDigiShieldRetargetKAT, WrongFirstBlockYieldsRejectedBitsAt960) {
+    // Documents the wedge: selecting h720 (the pre-fix new_height-interval)
+    // instead of h719 changes the in-window timespan and produces a different
+    // compact that does NOT match the on-chain header → the header is rejected.
+    auto p = DOGEChainParams::mainnet();
+    uint32_t wrong = calculate_doge_next_work(0x1d0ffff0, DOGE_T_959, DOGE_T_720, 960, p);
+    EXPECT_EQ(wrong, 0x1d03c884u);
+    EXPECT_NE(wrong, 0x1d03d07bu) << "the off-by-one first block mismatches the real chain";
+}
+
+// ─── DigiShield-era retarget KAT (real Dogecoin mainnet, must NOT regress) ──
+//
+// Provenance: Dogecoin mainnet blocks 200000–200002 (DigiShield era, 1-block
+// retarget). Values from a public block explorer:
+//   h200000  t=1398695540  bits=0x1b42fb92
+//   h200001  t=1398695701  bits=0x1b489088
+//   h200002               bits=0x1b5713d6  ← expected
+// DigiShield uses interval=1: the retarget's first block is the grandparent
+// of the new block (h200000), prev is h200001. This locks the DigiShield
+// amplitude-filter path the fix must leave untouched.
+TEST(DigiShieldRetargetKAT, Mainnet200002MatchesChain) {
+    auto p = DOGEChainParams::mainnet();
+    ASSERT_TRUE(p.is_digishield(200002));
+    EXPECT_EQ(calculate_doge_next_work(0x1b489088, 1398695701, 1398695540, 200002, p),
+              0x1b5713d6u);
+}
+
+// ─── HeaderChain from-genesis wedge regression (red-then-green) ──────────────
+//
+// Reproduces the exact from-genesis embedded-sync path that wedged at height
+// 960: a mainnet HeaderChain is fed a linked run of headers with the real
+// retarget-boundary timestamps and per-window nBits. On the pre-fix
+// first-block selection the header at 960 fails validate_difficulty and is
+// rejected (the chain sticks at 959, the observed re-request loop); with the
+// Core-matching selection the header at 960 is accepted and the chain walks
+// past it. scrypt PoW is skipped by advertising a far peer tip, exactly as the
+// real bulk-sync fast path does for old headers.
+TEST(DOGEFromGenesisRetargetTest, AcceptsHeader960AndWalksPast) {
+    auto params = DOGEChainParams::mainnet();
+    HeaderChain chain(params);
+    ASSERT_TRUE(chain.init());
+    chain.set_peer_tip_height(2000000);  // skip scrypt for all synthetic headers
+
+    // Seed a height-1 root so header 2 can connect (from-genesis linkage; the
+    // genesis timestamp is never consulted for the validated boundaries, which
+    // use first blocks 239/479/719).
+    uint256 root_hash;
+    root_hash.SetHex("0000000000000000000000000000000000000000000000000000000000000001");
+    chain.set_dynamic_checkpoint(1, root_hash);
+    ASSERT_EQ(chain.height(), 1u);
+
+    auto bits_for = [](uint32_t h) -> uint32_t {
+        if (h < 240) return 0x1e0ffff0u;   // genesis difficulty window
+        if (h < 480) return 0x1e0fffffu;   // set at the h240 retarget
+        if (h < 720) return 0x1e00ffffu;   // set at the h480 retarget
+        if (h < 960) return 0x1d0ffff0u;   // set at the h720 retarget
+        return 0x1d03d07bu;                // set at the h960 retarget
+    };
+    // Real boundary timestamps at the blocks used as first/prev for a validated
+    // retarget; everything else gets a monotone filler (never consulted).
+    auto ts_for = [](uint32_t h) -> uint32_t {
+        switch (h) {
+            case 239: return 1386475638u;
+            case 240: return 1386475640u;
+            case 479: return 1386475840u;
+            case 480: return 1386475842u;
+            case 719: return 1386476362u;
+            case 720: return 1386476390u;
+            case 959: return 1386479795u;
+        }
+        return static_cast<uint32_t>(1386325540 + static_cast<int64_t>(h) * 60);
+    };
+
+    uint256 prev = root_hash;
+    auto make_and_add = [&](uint32_t h) -> bool {
+        BlockHeaderType hd;
+        hd.m_version = 1;
+        hd.m_previous_block = prev;
+        hd.m_merkle_root.SetNull();
+        hd.m_timestamp = ts_for(h);
+        hd.m_bits = bits_for(h);
+        hd.m_nonce = h;  // unique → unique block hash
+        bool ok = chain.add_header(hd);
+        prev = doge::coin::block_hash(hd);
+        return ok;
+    };
+
+    // Build 2..959 — all must accept (240 boundary skipped by the 250-header
+    // gate; 480 and 720 boundaries validate and pass under both selections).
+    for (uint32_t h = 2; h <= 959; ++h)
+        ASSERT_TRUE(make_and_add(h)) << "header " << h << " should be accepted";
+    ASSERT_EQ(chain.height(), 959u);
+
+    // Header 960: the first pre-DigiShield unclamped retarget. RED on the
+    // pre-fix selection (rejected → height stays 959); GREEN after the fix.
+    ASSERT_TRUE(make_and_add(960))
+        << "header 960 must be accepted (first-block selection must match Core)";
+    EXPECT_EQ(chain.height(), 960u);
+    auto h960 = chain.get_header_by_height(960);
+    ASSERT_TRUE(h960.has_value());
+    EXPECT_EQ(h960->header.m_bits, 0x1d03d07bu);
+
+    // And it keeps walking — the re-request loop is gone.
+    EXPECT_TRUE(make_and_add(961)) << "header 961 must be accepted";
+    EXPECT_TRUE(make_and_add(962)) << "header 962 must be accepted";
+    EXPECT_EQ(chain.height(), 962u);
+}
