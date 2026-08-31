@@ -555,6 +555,33 @@ public:
     /// presented a stale block_value as current on 2026-08-05.
     int64_t peek_template_age_sec() const;
 
+    /// READ-ONLY observability (/embedded_template): a JSON snapshot of the
+    /// LAST embedded template this node SERVED to miners. Sourced from
+    /// peek_template() -- the same non-fetching cached snapshot the block-value
+    /// card already reads -- so it triggers NO GBT fetch, reads NO NodeCoinState
+    /// (safe from the dashboard HTTP thread), and has ZERO cost when unpolled
+    /// (serialized on request only). It NEVER rebuilds the template: the tx set,
+    /// header fields and CbTx payload are exactly the cached ones the miners got.
+    ///
+    /// The txs[] array is exactly the leaves folded into the served coinbase's
+    /// merkle root ([coinbase placeholder, tx1..txN]), and the returned
+    /// merkle_branch[] is recomputed from that same cached snapshot, so a
+    /// consumer that recomputes the stratum branch from txs[] txids reproduces
+    /// the branch miners received -- the byte-binding the live validation
+    /// harness asserts before it testmempoolaccept's each served tx.
+    ///
+    /// coinbase_hex is the CANONICAL template coinbase (zero extranonce, no
+    /// miner payout -> the whole worker portion routes to the donation tail),
+    /// assembled purely from the cached template through the SAME
+    /// compute_dash_payouts/build SSOTs the serve path uses; the per-session
+    /// miner payout + extranonce vary, but the masternode/superblock/CbTx
+    /// outputs and the tx set it commits to do not. merkleroot folds that
+    /// coinbase txid over txs[].
+    ///
+    /// Returns a clear {"state":"no_template_served_yet"} object (NOT an error)
+    /// when nothing has been sourced yet.
+    nlohmann::json embedded_template_json() const;
+
 private:
     /// Template cache resolve: return the cached DashWorkData snapshot when it
     /// is still fresh (same work_generation AND younger than the staleness

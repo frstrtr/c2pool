@@ -561,6 +561,16 @@ public:
     void set_embedded_oracle_fn(embedded_oracle_fn_t fn) { m_embedded_oracle_fn = thread_safe_wrap(std::move(fn)); }
     nlohmann::json rest_embedded_oracle();            // /embedded_oracle
 
+    // ── /embedded_template — READ-ONLY snapshot of the LAST embedded template
+    // this node SERVED to miners (height/coinbase/txs[txid,raw,fee]/cbtx/
+    // superblock-placeholder + the served stratum merkle_branch). Serialized on
+    // request only, touches no serving/consensus state, zero cost when unpolled.
+    // Bound by the coin target (main_dash.cpp) to DASHWorkSource::
+    // embedded_template_json(). Unset -> a {state:unavailable} shape.
+    using embedded_template_fn_t = std::function<nlohmann::json()>;
+    void set_embedded_template_fn(embedded_template_fn_t fn) { m_embedded_template_fn = thread_safe_wrap(std::move(fn)); }
+    nlohmann::json rest_embedded_template();          // /embedded_template
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -1254,6 +1264,7 @@ private:
     coin_peers_fn_t m_coin_peers_fn;
     node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
     embedded_oracle_fn_t m_embedded_oracle_fn;  // /embedded_oracle shadow-validator stats (optional)
+    embedded_template_fn_t m_embedded_template_fn;  // /embedded_template last-served snapshot (optional)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;
