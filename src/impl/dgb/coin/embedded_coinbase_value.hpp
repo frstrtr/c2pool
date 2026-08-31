@@ -42,7 +42,18 @@ namespace dgb::coin
 // Mirrors src/impl/ltc/coin/template_builder.hpp:
 //     uint64_t coinbasevalue = subsidy + total_fees;
 // but sources the subsidy through the coin's CoinParams::subsidy_func SSOT
-// (the DGB oracle decay schedule) rather than a hardcoded halving formula.
+// (the DigiByte Core GetBlockSubsidy port) rather than a hardcoded halving
+// formula.
+//
+// UNIT RECONCILIATION (money-path invariant): both terms are DGB satoshis
+// (1e8/DGB). subsidy_func == dgb::CoinParams::subsidy now returns DigiByte Core
+// GetBlockSubsidy() output in satoshis (COIN=1e8), and total_fees is the raw
+// satoshi sum of the included transactions' fees (the same unit digibyted folds
+// into GBT "coinbasevalue"). The sum is therefore unit-consistent and needs NO
+// rescale here. Before the subsidy fix the SSOT returned 1e6 units while fees
+// were 1e8 sats -- a mixed-unit coinbasevalue that underpaid ~100x. The fix is
+// entirely in the subsidy SSOT; this addition must stay a bare '+' with no
+// scaling factor (a stray x100 here would double-count the fix and overpay).
 //
 // Throws std::logic_error if subsidy_func is unset — an empty std::function
 // here means the CoinParams factory was not wired, which must fail loudly at
