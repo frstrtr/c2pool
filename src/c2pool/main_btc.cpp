@@ -3117,7 +3117,12 @@ int main(int argc, char* argv[])
         } else {
             LOG_ERROR << "[BTC-POOL] WebServer FAILED to bind " << http_addr << ":"
                       << http_port << " â dashboard disabled, run-loop continues.";
-            web_server.reset();
+            // Keep the WebServer alive on a failed bind (do NOT reset). A
+            // failed-start server holds no listener and serves nothing; all
+            // later use is `if (web_server)`-guarded. This mirrors the DASH
+            // fix: freeing here would dangle any pre-start raw-pointer capture
+            // into the WebServer / MiningInterface. BTC installs no such capture
+            // today, so this is defensive parity, not a live-bug fix.
         }
         } // if (mi != nullptr)
     } else {

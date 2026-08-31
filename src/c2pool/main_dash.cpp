@@ -2295,7 +2295,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         } else {
             std::cout << "[run] web dashboard FAILED to bind " << web_host << ":"
                       << web_port << " — dashboard disabled (mining unaffected)\n";
-            web_server.reset();
+            // Do NOT reset() the WebServer here. Pre-start hooks already captured
+            // it by raw pointer — the tracker's m_on_share_difficulty feed
+            // (core::WebServer* ws = web_server.get() above) and the detached
+            // auto_detect_external_info() thread both hold references into this
+            // object AND its MiningInterface. Freeing it on a failed bind left
+            // those pointers dangling; the first verify burst then called
+            // record_share_difficulty() on the freed MiningInterface
+            // (m_hashrate_ring / m_samples[miner]) and SIGSEGV'd during share
+            // ingestion. A failed-start WebServer holds no listener and serves
+            // nothing, so keeping it alive costs nothing: the acceptor never
+            // came up, later use is all `if (web_server)`-guarded, and the
+            // surviving hooks fire safely against an inert MiningInterface that
+            // merely accumulates stats. Every capture stays valid; the
+            // bind-success path (production) is byte-for-byte unchanged.
         }
     } else {
         std::cout << "[run] web dashboard disabled (--web-port 0)\n";
