@@ -108,6 +108,26 @@ struct DOGEChainParams
     }
 };
 
+// ─── Pre-DigiShield retarget first-block selection ────────────────────────
+// Port of dogecoin/src/pow.cpp GetNextWorkRequired()'s first-block lookback,
+// inherited from Litecoin's 51%-attack fix: the timespan is measured back a
+// FULL interval from the parent block (height new_height-1), i.e.
+//   blockstogoback = interval, EXCEPT for the very first retarget after
+//   genesis where blockstogoback = interval-1.
+// Since the parent sits at height new_height-1, the resulting first block is:
+//   * the genesis block (height 0) at the 240 boundary, and
+//   * height (new_height - interval - 1) at every later boundary.
+// The previously-used (new_height - interval) is off by one at every boundary
+// past the first; the delta is masked by the early-launch timespan clamps up
+// to the 720 boundary but becomes visible at 960 (the first unclamped
+// retarget), where it selected the wrong ancestor timestamp and rejected the
+// otherwise-valid mainnet header.
+inline uint32_t doge_pre_digishield_first_height(uint32_t new_height) {
+    const uint32_t interval =
+        static_cast<uint32_t>(DOGEChainParams::PRE_DIGISHIELD_INTERVAL);
+    return (new_height == interval) ? 0u : new_height - interval - 1u;
+}
+
 // ─── DigiShield v3 difficulty calculation ─────────────────────────────────
 // Direct port from dogecoin/src/dogecoin.cpp CalculateDogecoinNextWorkRequired()
 //
