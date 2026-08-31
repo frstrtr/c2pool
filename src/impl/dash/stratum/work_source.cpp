@@ -351,6 +351,160 @@ int64_t DASHWorkSource::peek_template_age_sec() const
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// READ-ONLY observability: /embedded_template.
+//
+// A JSON snapshot of the LAST embedded template this node SERVED to miners.
+// Everything here reads the cached peek_template() snapshot -- an immutable
+// shared_ptr<const DashWorkData> -- plus pure, coin-state-free helpers
+// (make_coin_params over the is_testnet_ member, compute_dash_payouts, build,
+// the coinbase merkle helpers). It touches NO NodeCoinState and takes NO lock
+// the serve path holds, so it is safe from the dashboard HTTP thread, costs
+// nothing when unpolled, and cannot perturb the coinbase the miners hash.
+//
+// The byte-binding contract (the harness acceptance test): txs[] is exactly the
+// leaf set [tx1..txN] folded (with a coinbase placeholder at leaf 0) into the
+// served coinbase merkle root, and merkle_branch[] is recomputed from that SAME
+// cached snapshot -- so recomputing the stratum branch from txs[] txids
+// reproduces the branch miners received.
+// ─────────────────────────────────────────────────────────────────────────────
+nlohmann::json DASHWorkSource::embedded_template_json() const
+{
+    auto wd = peek_template();   // last-served snapshot; no fetch, no coin-state
+    if (!wd) {
+        return nlohmann::json{
+            {"state", "no_template_served_yet"},
+            {"note",  "no embedded template has been sourced yet -- poll again"}};
+    }
+
+    nlohmann::json out = nlohmann::json::object();
+    out["state"]             = "ok";
+    out["height"]            = wd->m_height;
+    out["previousblockhash"] = wd->m_previous_block.GetHex();
+    out["version"]           = wd->m_version;
+    out["nbits"]             = dash::coinbase::be_hex_u32(wd->m_bits);
+    out["curtime"]           = static_cast<uint64_t>(
+        wd->m_curtime ? wd->m_curtime
+                      : static_cast<uint32_t>(std::time(nullptr)));
+    if (wd->m_mintime)
+        out["mintime"] = wd->m_mintime;
+    out["coinbasevalue_duffs"] = wd->m_coinbase_value;
+    out["template_age_sec"]    = peek_template_age_sec();
+
+    // ── The served tx set (byte-binding subject) ─────────────────────────
+    // txid is the block-explorer display form (GetHex, reverse-of-internal),
+    // matching dashd's getrawtransaction / testmempoolaccept output so the
+    // harness can correlate a served tx to dashd's verdict directly. The
+    // merkle helpers below fold the INTERNAL bytes (GetChars) -- a consumer
+    // reproducing the branch reverses each txid back to internal order.
+    nlohmann::json txs = nlohmann::json::array();
+    uint64_t total_fees = 0;
+    for (size_t i = 0; i < wd->m_tx_hashes.size(); ++i) {
+        nlohmann::json tx = nlohmann::json::object();
+        tx["txid"] = wd->m_tx_hashes[i].GetHex();
+        if (i < wd->m_tx_data_hex.size())
+            tx["raw"] = wd->m_tx_data_hex[i];
+        if (i < wd->m_tx_fees.size()) {
+            tx["fee_duffs"] = wd->m_tx_fees[i];
+            total_fees += wd->m_tx_fees[i];
+        }
+        txs.push_back(std::move(tx));
+    }
+    out["txs"]              = std::move(txs);
+    out["total_fees_duffs"] = total_fees;
+
+    // The contiguous mempool-sourced range of the body (the only range the
+    // validity gate should probe: type-6 quorum commitments and a zero-fee
+    // pinned donation are refused by relay policy BY DESIGN).
+    out["mempool_tx_first_index"] = wd->m_mempool_tx_first_index;
+    out["mempool_tx_count"]       = wd->m_mempool_tx_count;
+    if (!wd->m_txset_empty_cause.empty())
+        out["txset_empty_cause"] = wd->m_txset_empty_cause;
+
+    // ── The served stratum merkle branch (recomputed from THIS snapshot) ──
+    // Identical construction to get_stratum_merkle_branches(): [placeholder,
+    // tx1..txN] with a coinbase placeholder at leaf 0. Emitted so the harness
+    // has the reference branch to bind txs[] against.
+    {
+        std::vector<uint256> leaves;
+        leaves.reserve(1 + wd->m_tx_hashes.size());
+        leaves.push_back(uint256::ZERO);
+        leaves.insert(leaves.end(), wd->m_tx_hashes.begin(), wd->m_tx_hashes.end());
+        auto branch_hex = dash::coinbase::merkle_branches_hex(
+            dash::coinbase::merkle_branches_raw(leaves));
+        out["merkle_branch"] = branch_hex;
+    }
+
+    // ── Canonical template coinbase (pure assembly, no coin state) ────────
+    // Zero extranonce, no miner payout (whole worker portion -> donation
+    // tail), assembled through the SAME SSOTs the serve path uses. Lets the
+    // harness fold a concrete merkleroot; the per-session miner payout +
+    // extranonce vary but the masternode/superblock/CbTx outputs and the tx
+    // set the coinbase commits to do not.
+    try {
+        const core::CoinParams params = dash::make_coin_params(is_testnet_);
+        std::map<std::vector<unsigned char>, uint64_t> weights;  // empty
+        uint160 finder_pkh;                                      // zero
+        auto tx_outs = dash::coinbase::compute_dash_payouts(
+            wd->m_coinbase_value, wd->m_packed_payments, finder_pkh,
+            weights, /*total_weight=*/0, params);
+        dash::coinbase::CoinbaseLayout layout = dash::coinbase::build(
+            *wd, tx_outs,
+            dash::SharechainConfig::coinbase_text(params.is_testnet),
+            params, /*ref_hash=*/uint256::ZERO);
+
+        out["coinbase_hex"] = HexStr(layout.bytes);
+        out["coinbase_note"] =
+            "canonical template coinbase (zero extranonce, no miner payout); "
+            "per-session miner payout + extranonce vary";
+
+        // Full-block merkle root over [coinbase_txid, tx1..txN].
+        const uint256 cb_txid = dash::coin::coinbase_txid(layout.bytes);
+        std::vector<uint256> block_leaves;
+        block_leaves.reserve(1 + wd->m_tx_hashes.size());
+        block_leaves.push_back(cb_txid);
+        block_leaves.insert(block_leaves.end(),
+                            wd->m_tx_hashes.begin(), wd->m_tx_hashes.end());
+        out["coinbase_txid"] = cb_txid.GetHex();
+        out["merkleroot"]    = dash::coin::compute_merkle_root(block_leaves).GetHex();
+    } catch (const std::exception& e) {
+        // Never a 500: report the canonical-coinbase failure inline and still
+        // serve the tx set + branch (the byte-binding subject).
+        out["coinbase_hex"]  = nullptr;
+        out["merkleroot"]    = nullptr;
+        out["coinbase_note"] = std::string("canonical coinbase unavailable: ") + e.what();
+    }
+
+    // ── CbTx (DIP4 coinbase special-tx payload) ──────────────────────────
+    out["coinbase_payload_hex"] = HexStr(wd->m_coinbase_payload);
+    coin::vendor::CCbTx cbtx;
+    if (coin::vendor::parse_cbtx(wd->m_coinbase_payload, cbtx)) {
+        nlohmann::json cb = nlohmann::json::object();
+        cb["version"]           = cbtx.nVersion;
+        cb["height"]            = cbtx.nHeight;
+        cb["merkleRootMNList"]  = cbtx.merkleRootMNList.GetHex();
+        if (cbtx.nVersion >= coin::vendor::CCbTx::VERSION_MERKLE_ROOT_QUORUMS)
+            cb["merkleRootQuorums"] = cbtx.merkleRootQuorums.GetHex();
+        if (cbtx.nVersion >= coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE) {
+            cb["bestCLHeightDiff"]  = cbtx.bestCLHeightDiff;
+            cb["bestCLSig_present"] = cbtx.has_best_cl_signature();
+            cb["creditPoolBalance"] = cbtx.creditPoolBalance;
+        }
+        out["cbtx"] = std::move(cb);
+    } else {
+        out["cbtx"] = nullptr;
+    }
+
+    // ── Superblock placeholder (govsync port pending: wf wxrmpvbao) ───────
+    // The field is emitted now so the harness can read it unconditionally;
+    // it flips to active with real payouts once the govsync lane lands.
+    out["superblock"] = nlohmann::json{
+        {"active",  false},
+        {"payouts", nlohmann::json::array()}};
+
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // IWorkSource: work generation -- Stage 4c (the template trio).
 // ─────────────────────────────────────────────────────────────────────────────
 

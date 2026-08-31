@@ -5337,6 +5337,17 @@ nlohmann::json MiningInterface::rest_embedded_oracle()
         {"note", "embedded-oracle-shadow not wired on this node"}};
 }
 
+nlohmann::json MiningInterface::rest_embedded_template()
+{
+    if (m_embedded_template_fn) {
+        auto j = m_embedded_template_fn();
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"state", "unavailable"},
+        {"note", "embedded-template endpoint not wired on this node"}};
+}
+
 nlohmann::json MiningInterface::rest_node_topology()
 {
     // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer

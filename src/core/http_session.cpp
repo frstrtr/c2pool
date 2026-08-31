@@ -428,6 +428,8 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_node_topology();
             else if (target == "/embedded_oracle")
                 rest_result = mining_interface_->rest_embedded_oracle();
+            else if (target == "/embedded_template")
+                rest_result = mining_interface_->rest_embedded_template();
             else if (target == "/luck_stats")
                 rest_result = mining_interface_->rest_luck_stats();
             else if (target == "/ban_stats")

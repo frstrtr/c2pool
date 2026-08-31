@@ -4210,6 +4210,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 std::cout << "[run] dashboard local-hashrate + per-worker "
                              "registry + block-value/net-diff bound to the DASH "
                              "stratum acceptor\n";
+
+                // ── /embedded_template (READ-ONLY observability) ───────────
+                // Expose the LAST embedded template this node SERVED to miners
+                // so the live validation harness can testmempoolaccept every
+                // served tx and bind the served merkle_branch to txs[]. The
+                // closure calls DASHWorkSource::embedded_template_json(), which
+                // reads only the non-fetching peek_template() snapshot -- no
+                // GBT fetch, no NodeCoinState read, no serve-path effect, and
+                // zero cost when unpolled (serialized on request only).
+                mi->set_embedded_template_fn(
+                    [wsrc = work_source.get()]() -> nlohmann::json {
+                        return wsrc->embedded_template_json();
+                    });
             }
         } else {
             std::cout << "[run] stratum FAILED to bind " << stratum_host << ":"
