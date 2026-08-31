@@ -6704,6 +6704,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          " no state change).\n";
         }
 
+        // E-SUPERBLOCK R5 coverage reporting seam: the coin-P2P verack handler
+        // primes each handshaked peer with govsync(nProp=0) once per expiry
+        // window (armed only under --embedded-govsync/--embedded-superblock);
+        // whenever it actually primes a peer it reports that peer_key here, so
+        // GovSyncStatus records exactly-the-primed-peer coverage. Fires only on a
+        // real send (never a window-skip), so an already-primed peer never
+        // re-arms the quiescence window — the R5 min_peers (>=2) floor accrues
+        // one DISTINCT primed peer per handshake and can flip completeness TRUE.
+        coin_p2p->set_on_govsync_primed(
+            [maint = maintainer.get()](const std::string& pk) {
+                maint->note_govsync_requested(pk);
+            });
+
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
         coin_p2p->set_on_handshake_complete(
@@ -6750,36 +6763,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // the full cold snapshot; a reconnect after some sync re-requests
                 // from exactly what the SML has applied, never a stranded base.
                 cp->send_getmnlistd(maint ? maint->sml_current_hash() : uint256::ZERO, tip);
-                // E-SUPERBLOCK: prime the governance object sync (triggers +
-                // proposals) so a superblock height can be served daemonlessly.
-                // send_govsync_prime() primes each NOT-YET-PRIMED handshaked peer
-                // EXACTLY ONCE per expiry window (dashd punishes a repeated full
-                // govsync from the same address: CGovernanceManager::SyncObjects
-                // Misbehaving(20)). This callback also re-fires on primary
-                // promotion, where the prime is a deliberate no-op — every peer
-                // is already primed, so nobody is written and no ban score
-                // accrues. Zero nProp + empty filter => request all objects;
-                // dashcore answers with INVENTORY (MSG_GOVERNANCE_OBJECT=17
-                // invs); the inv handler getdata-pulls those (batched) when the
-                // gov arm is armed, the govobj handler fires a per-object vote
-                // sync (govsync nProp=objectHash) for each accepted TRIGGER, and
-                // its MSG_GOVERNANCE_OBJECT_VOTE=18 reply invs are pulled the
-                // same way — so the store populates instead of staying inert.
-                // OFF (no --embedded-govsync/--embedded-superblock) the getdata
-                // is not sent, so the prime is a harmless unanswered request; the
-                // OFF-arm wire is once-per-peer (not loop-all-per-event), which
-                // is itself the fix — the old loop-all leg carried the same
-                // per-repeat ban hazard.
-                //
-                // R5: record govsync peer coverage from the NEWLY primed keys
-                // (never handshaked_peer_keys() — recording an already-primed
-                // peer would spuriously re-arm the quiescence window and delay
-                // completeness). Under --coin-p2p-discover the bounded pool holds
-                // >= 2 peers, so >= 2 distinct keys accumulate across handshakes
-                // and the min_peers (>=2) completeness floor can flip TRUE (the
-                // serve-side R5 gate). With one peer it stays FALSE — reward-safe.
-                for (const auto& pk : cp->send_govsync_prime())
-                    maint->note_govsync_requested(pk);
+                // E-SUPERBLOCK govsync PRIME: NOT driven from here. The prime is
+                // emitted per session by the coin-P2P verack handler, beside its
+                // getsporks leg (routing class 3), so EVERY handshaked peer — the
+                // primary AND every witness — is primed once at its own handshake.
+                // R5 coverage is recorded from that verack site via
+                // set_on_govsync_primed (wired above), which fires only when a peer
+                // was actually primed. Driving it here fired only for the FIRST
+                // verack (the peer that wins primary election), which is exactly
+                // why gov_peers stuck at 1 despite a >=2-peer pool.
             });
 
         std::cout << "[run] E2a live-feed wired: header-chain(" << hdr_db

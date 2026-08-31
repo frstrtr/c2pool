@@ -60,9 +60,11 @@ inline constexpr int64_t DASH_GOVSYNC_SETTLE_SECS_DEFAULT = 60;
 /// hazard. dashcore syncs governance from multiple peers for the same reason.
 /// DEFAULT 2 (fail-closed leaning): a single-peer deployment can NEVER assert
 /// completeness, so it stays on the reward-safe dashd fallback. The multi-peer
-/// govsync leg that primes >= 2 distinct peers is CoinClient::send_govsync_prime()
-/// (each handshaked peer asked for the full object set exactly once per expiry
-/// window); the keys it returns are what feed note_govsync_requested here.
+/// govsync leg that primes >= 2 distinct peers is the coin-P2P verack handler:
+/// per session it asks THAT peer for the full object set exactly once per expiry
+/// window (CoinClient::send_govsync_prime_to), so both the primary and every
+/// witness peer are covered; each real prime reports its peer_key (via
+/// set_on_govsync_primed) into note_govsync_requested here.
 inline constexpr size_t DASH_GOVSYNC_MIN_PEERS_DEFAULT = 2;
 
 /// Tracks daemonless governance-sync progress and answers is_complete(now).
