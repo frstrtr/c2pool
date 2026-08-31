@@ -80,14 +80,24 @@ struct SharechainConfig
     static uint32_t real_chain_length() { return is_testnet ? TESTNET_REAL_CHAIN_LENGTH : REAL_CHAIN_LENGTH; }
 
     // ISOLATION PRIMITIVES — per-coin AND per-instance, never unified cross-coin.
-    // 2026-08-25: c2pool moved to its OWN sharechain identity, distinct from the inherited legacy
-    // p2pool-dash chain. Identifier + prefix are the sharechain's network isolation keys — nodes
-    // with different values form disjoint sharechains and reject each other, so this cleanly
-    // separates the c2pool sharechain from the old p2pool one. Old values kept commented below.
-    //   OLD (legacy p2pool-dash identity):
-    //     IDENTIFIER_HEX = "7242ef345e1bed6b";  PREFIX_HEX = "3b3e1286f446b891";
-    static inline const std::string IDENTIFIER_HEX         = "ac2785363c0180b8";  // c2pool sharechain
-    static inline const std::string PREFIX_HEX             = "8d8516bac9edd280";  // c2pool sharechain
+    // Identifier + prefix are the sharechain's network isolation keys — they are NOT just
+    // handshake framing: the identifier is committed inside every share's ref_hash (the ref
+    // stream prepends active_identifier_hex()), so it gates BOTH the p2p prefix match AND share
+    // PoW/ref-hash validation. Nodes with different values form disjoint, mutually-rejecting
+    // sharechains, so the default MUST equal the live network's identity.
+    //
+    // Mainnet = the live p2pool-dash fleet identity (oracle p2pool/dash.py:9-10). The single
+    // live DASH sharechain is keyed to 7242ef345e1bed6b / 3b3e1286f446b891.
+    //
+    // RESERVED (future v36 self-identity): ac2785363c0180b8 / 8d8516bac9edd280. A 2026-08-25
+    // switch (#1344) made this the default before any v36 network existed, isolating the node
+    // from the only live network and breaking both handshake AND share validation against the
+    // fleet — reverted here. When a real v36 network launches, reintroduce this identity through
+    // the v36 activation machinery (AutoRatchet / Phase C), not as the plain default.
+    //   RESERVED v36 self-identity:
+    //     IDENTIFIER_HEX = "ac2785363c0180b8";  PREFIX_HEX = "8d8516bac9edd280";
+    static inline const std::string IDENTIFIER_HEX         = "7242ef345e1bed6b";  // live p2pool-dash fleet
+    static inline const std::string PREFIX_HEX             = "3b3e1286f446b891";  // live p2pool-dash fleet
     static inline const std::string TESTNET_IDENTIFIER_HEX = "b6deb1e543fe2427";
     static inline const std::string TESTNET_PREFIX_HEX     = "198b644f6821e3b3";
 
