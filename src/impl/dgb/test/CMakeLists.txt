@@ -672,6 +672,25 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_aux_doge_mm_commitment_test "" AUTO)
 
+    # --- DGB+DOGE (phase DB) -- DGB-as-parent BUILT-COINBASE commitment KAT ----
+    # Proves the 44-byte AuxPoW blob is spliced, findable, and byte-correct
+    # THROUGH the real DGB coinbase assembler build_connection_coinbase_from_pplns
+    # (the production path DGBWorkSource drives once --merged DOGE arms the aux
+    # backend). RED = merged-off carries zero fabe6d6d markers (standalone parent
+    # byte-identity); GREEN = exactly one marker, 44 bytes byte-identical to the
+    # cross-coin SSOT build_auxpow_commitment, magic immediately before the aux
+    # root (the DOGE CAuxPow::check invariant), 0x2c push framing. DGB analog of
+    # src/impl/btc/test/merged_commitment_test.cpp. Links dgb_coin for the
+    # coinbase/PPLNS SSOT. MUST appear in BOTH this registration AND the build.yml
+    # --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_coinbase_commit_test aux_doge_coinbase_commit_test.cpp)
+    target_link_libraries(dgb_aux_doge_coinbase_commit_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_coinbase_commit_test "" AUTO)
+
     # --- DGB+DOGE (phase DC) -- DGB-as-parent AuxPoW PROOF byte-parity + dual ---
     # Proves the neutral producer build_auxpow_proof (c2pool/merged) is byte-
     # identical to the typed doge::coin::CAuxPow<dgb::coin::MutableTransaction>

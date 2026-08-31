@@ -27,6 +27,8 @@
 #include <impl/dgb/coin/scrypt_pow.hpp>        // scrypt_pow_hash (DGB-Scrypt PoW SSOT)
 #include <impl/dgb/coin/submit_classify.hpp>   // classify_submission (Stage-4d decision SSOT)
 #include <impl/dgb/coin/connection_coinbase.hpp>  // build_connection_coinbase_from_pplns SSOT
+#include <c2pool/merged/merged_mining.hpp>       // MergedMiningManager (--merged DOGE aux backend)
+#include <impl/dgb/coin/aux_doge_mm_commitment.hpp>  // AUX_MM_COMMITMENT_SIZE (44-byte MM blob)
 #include <impl/dgb/coin/won_block_serialize.hpp>   // serialize_won_block SSOT (won-block framing)
 #include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
 
@@ -436,6 +438,47 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     if (!inputs)
         return {};  // producer declined (e.g. tip not yet known) -> safe empty job.
 
+    // ── DGB-as-DOGE-parent merged-mining commitment snapshot ──────────────────
+    // Runtime-armed (no -DAUX_DOGE compile fence): when a --merged DOGE spec has
+    // stood up the embedded aux backend, splice the cached 44-byte AuxPoW
+    // commitment into the coinbase scriptSig so a won DGB block carries the DOGE
+    // merged-mining tag a Dogecoin node decodes. Mirrors the live-proven BTC->NMC
+    // parent lane (btc work_source.cpp:450-497): ONE lock-free read of the
+    // pre-built commitment (built per work cycle in rebuild_cached_blocks with a
+    // payout provider), gated so a merged-off / pre-sync node leaves the coinbase
+    // BYTE-IDENTICAL to standalone DGB.
+    //
+    // Layout matches the parent lane exactly: [push opcode 0x2c][44-byte blob],
+    // where the blob is the cross-coin SSOT c2pool::merged::build_auxpow_commitment
+    // output (fabe6d6d || aux_root32 BE || size4 LE || nonce4 LE). connection_
+    // coinbase.hpp appends aux_mm_commitment to the scriptSig AFTER the BIP34
+    // height + pool tag; DOGE's AuxPoW check searches the whole scriptSig for the
+    // fabe6d6d magic and only requires it be contiguous, single, and immediately
+    // followed by the aux root — all of which this framing satisfies.
+    //
+    // DGB divergence from BTC (deliberate, single-parent deployment): the DGB
+    // share does NOT freeze a per-chain merged_coinbase_info blob. The DGB
+    // verifier verify_merged_coinbase_commitment (share_check.hpp:1429) skips when
+    // m_merged_coinbase_info is empty, and the mint reads the scriptSig back off
+    // the actually-hashed coinbase (extract_coinbase_scriptsig), so the spliced
+    // bytes are self-consistent through gentx-txid / ref_hash with no split-brain
+    // reject. The DOGE block itself is assembled+relayed by the manager from its
+    // own cached aux work (try_submit_merged_blocks), not from the share blob.
+    if (mm_manager_ && mm_manager_->has_chains()) {
+        if (mm_manager_->is_pplns_dirty())
+            mm_manager_->rebuild_cached_blocks();
+        auto mm_snap = mm_manager_->get_cached_header_infos_and_commitment();
+        const std::vector<uint8_t>& mm_commitment = mm_snap.second;
+        // Push opcode == length for a 1..75-byte push; the commitment is 44 B => 0x2c.
+        if (mm_commitment.size() == dgb::coin::AUX_MM_COMMITMENT_SIZE) {
+            std::vector<unsigned char> tagged;
+            tagged.reserve(1 + mm_commitment.size());
+            tagged.push_back(static_cast<unsigned char>(mm_commitment.size()));
+            tagged.insert(tagged.end(), mm_commitment.begin(), mm_commitment.end());
+            inputs->aux_mm_commitment = std::move(tagged);
+        }
+    }
+
     dgb::coin::ConnCoinbaseParts parts =
         dgb::coin::build_connection_coinbase_from_pplns(*inputs);
 
@@ -639,6 +682,42 @@ nlohmann::json DGBWorkSource::mining_submit(
             // reason -- never a silent drop.
             LOG_INFO << tag << " accepted (no sharechain credit) user="
                      << username << " job=" << job_id;
+        }
+
+        // ── Merged-mining: submit any aux (DOGE) block THIS share solves ──────
+        // Analog of the live-proven BTC->NMC parent lane (btc work_source.cpp:
+        // 1103-1127) and p2pool check_merged_mining. The aux (DOGE) target sits
+        // far below the parent DGB share target, so this must run per ACCEPTED
+        // SHARE, not only on a won parent block -- most found DOGE blocks ride
+        // ordinary shares. try_submit_merged_blocks self-gates on the aux target
+        // (merged_mining.cpp ~:884), rebuilds the AuxPoW proof from the frozen
+        // aux header committed in THIS job's coinbase (keyed by parent hash), and
+        // relays via the CoinBroadcaster. DGB coinb1/coinb2 are witness-free by
+        // construction -- correct for the AuxPoW parent-coinbase merkle branch.
+        // On the won-block arm this runs AFTER the parent block was already
+        // dispatched (reward invariant preserved). Null manager => no-op.
+        if (mm_manager_ && mm_manager_->has_chains()) {
+            try {
+                std::string parent_header_hex =
+                    HexStr(Span<const uint8_t>(header.data(), 80));
+                std::string parent_coinbase_hex =
+                    HexStr(Span<const uint8_t>(coinbase.data(), coinbase.size()));
+                // dgb::coin::u256 -> core uint256: both hold a 32-byte
+                // little-endian image; serialize pow_hash's limbs LE and read
+                // them back through uint256's LE-vector ctor. The scrypt PoW hash
+                // IS the parent block hash the aux-target gate compares.
+                std::vector<unsigned char> ph_le(32, 0);
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 8; ++j)
+                        ph_le[i * 8 + j] =
+                            static_cast<unsigned char>((pow_hash.limb[i] >> (8 * j)) & 0xff);
+                uint256 parent_hash(ph_le);
+                mm_manager_->try_submit_merged_blocks(
+                    parent_header_hex, parent_coinbase_hex,
+                    job->merkle_branches, 0, parent_hash);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[DGB-MM] try_submit_merged_blocks threw: " << e.what();
+            }
         }
     };
 

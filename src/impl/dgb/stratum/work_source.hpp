@@ -65,6 +65,9 @@ class HeaderChain;
 namespace dgb::coin {
 class Mempool;
 }  // namespace dgb::coin
+namespace c2pool::merged {
+class MergedMiningManager;
+}  // namespace c2pool::merged
 
 namespace dgb::stratum {
 
@@ -272,6 +275,17 @@ public:
     uint64_t coinbase_value(uint32_t height, uint64_t total_fees,
                             std::optional<uint64_t> gbt_coinbasevalue) const;
 
+    /// Embedded DGB-as-DOGE-parent merged-mining manager hook (--merged DOGE).
+    /// Mirrors btc::stratum::BTCWorkSource::set_merged_mining_manager (the
+    /// live-proven BTC->NMC parent lane). Bound in main_dgb.cpp when a --merged
+    /// DOGE spec arms the embedded aux backend; otherwise stays null and every
+    /// merged codepath below is a structural no-op (byte-identical standalone
+    /// DGB coinbase). Non-owning: the manager outlives the work source.
+    /// When set, build_connection_coinbase() splices the cached 44-byte AuxPoW
+    /// commitment into the coinbase scriptSig and mining_submit() relays any aux
+    /// (DOGE) block a submitted share solves via try_submit_merged_blocks().
+    void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mm) { mm_manager_ = mm; }
+
 private:
     // External dependencies (non-owning references)
     c2pool::dgb::HeaderChain&   chain_;
@@ -318,6 +332,13 @@ private:
     // per-connection coinbase path returns an empty job (pre-wire behavior).
     mutable std::mutex          pplns_inputs_mutex_;
     PplnsInputsFn               pplns_inputs_fn_;
+
+    // Embedded DGB-as-DOGE-parent merged-mining manager (set_merged_mining_manager).
+    // Non-owning; null unless a --merged DOGE spec armed the aux backend in
+    // main_dgb.cpp. While null the coinbase-commit splice and per-share aux
+    // submit below are structural no-ops (standalone DGB coinbase, byte-identical
+    // to a merged-off node). Mirrors btc::stratum work_source mm_manager_.
+    c2pool::merged::MergedMiningManager* mm_manager_ = nullptr;
 
     // External-daemon GBT tip fallback (set_gbt_tip_fn). Empty until bound in
     // main_dgb; while empty the embedded-empty-chain path is byte-identical to
