@@ -917,11 +917,12 @@ private:
     // gated. A governance inv is otherwise inert: without the pull the
     // govobj/govobjvote handlers never fire and the GovernanceStore stays
     // empty, so a superblock height can never be served daemonlessly. OFF by
-    // default => the inv answer is not pulled and the store stays inert
-    // (a govsync(nProp=0) is still SENT once per peer at its handshake — the
-    // coverage-prime leg — but with the pull off its reply is ignored). No
-    // budget: gov invs are batched to ONE getdata per inv message, and the
-    // prime is sent to each peer EXACTLY ONCE per expiry window (send_govsync_prime,
+    // default => the inv answer is not pulled, the store stays inert, AND the
+    // govsync(nProp=0) coverage prime is not emitted at all — the verack handler
+    // gates it on m_gov_pull_enabled, so the default-OFF wire is byte-identical
+    // to the pre-feature node (no unanswered off-arm request). ARMED, the prime
+    // is emitted per session from the verack handler beside getsporks — each
+    // handshaked peer asked EXACTLY ONCE per expiry window (send_govsync_prime_to,
     // below) because dashd PUNISHES a repeated full govsync with Misbehaving(20).
     bool     m_gov_pull_enabled{false};
     uint64_t m_gov_inv_offered{0};   // inv(gov) SEEN on the wire, pre-dedup
@@ -1063,6 +1064,13 @@ private:
     PeerHeightCallback m_on_peer_height;
     using HandshakeCallback = std::function<void()>;
     HandshakeCallback m_on_handshake_complete;
+    // E-SUPERBLOCK R5 coverage REPORTING seam (NOT a drive hook): fired with a
+    // peer_key the moment the verack handler ACTUALLY primed that peer (the
+    // helper returned true — window-skips never fire it). The driver is the
+    // already-ported verack handshake-complete point; this only transports the
+    // primed key to GovSyncStatus (owned by CoinStateMaintainer, outside this
+    // class), so an already-primed peer never re-arms the quiescence window.
+    std::function<void(const std::string&)> m_on_govsync_primed;
     // Peer lifecycle seams for the DASH-isolated CoinPeerManager scoring feed
     // (coin/coin_peer_manager.hpp). Fired with the peer's "host:port" key so the
     // manager can score connects/disconnects and persist anchors. Both optional;
@@ -1316,10 +1324,11 @@ public:
     }
     // NOTE: handshaked_peer_keys() (the HANDSHAKE-COMPLETE peer set) is defined
     // once below, near the bulk-scheduler peer accessors. The R5 govsync
-    // coverage floor is NOT recorded from it — it is recorded from the keys
-    // RETURNED by send_govsync_prime() (the peers actually primed this round),
-    // so an already-primed peer that is re-visited does not spuriously re-arm
-    // the quiescence window / re-count as a fresh request.
+    // coverage floor is NOT recorded from it — it is recorded per session from
+    // the verack handler via m_on_govsync_primed, which fires ONLY for a peer the
+    // prime actually wrote (send_govsync_prime_to returned true), so an
+    // already-primed peer that is re-visited does not spuriously re-arm the
+    // quiescence window / re-count as a fresh request.
     /// Per-peer connection age in seconds, in pool order — durability, direct.
     std::vector<int64_t> peer_ages_sec() const
     {
@@ -1563,6 +1572,12 @@ public:
     /// Fired once per session when the version/verack handshake completes —
     /// the hook E2 uses to kick the initial getheaders/mnlistdiff sync.
     void set_on_handshake_complete(HandshakeCallback cb) { m_on_handshake_complete = std::move(cb); }
+    /// E-SUPERBLOCK R5 coverage reporting seam. Fired with the peer_key each
+    /// time the verack handler primes a peer with govsync(nProp=0), so the
+    /// maintainer that owns GovSyncStatus can record exactly that peer's
+    /// coverage. Reporting only — see m_on_govsync_primed.
+    void set_on_govsync_primed(std::function<void(const std::string&)> fn)
+    { m_on_govsync_primed = std::move(fn); }
     /// Register ONE historical-mnlistdiff consumer. Additive, not a slot: the
     /// Phase-L member source and the MN-checkpoint lane both source historical
     /// snapshots off this client and both must be offered every reply.
@@ -1767,15 +1782,17 @@ public:
     //      unlike getaddr, dashd PUNISHES a repeated full govsync from the same
     //      address inside the netfulfilledman window with Misbehaving(20)
     //      (CGovernanceManager::SyncObjects), so it cannot be a plain broadcast.
-    //      send_govsync_prime() (below) sends it to each handshaked peer AT MOST
-    //      ONCE per expiry window — the requester-side mirror of dashcore's own
-    //      CMasternodeSync + netfulfilledman once-per-peer gate.
+    //      the verack handler (below) primes each peer at its OWN handshake, once
+    //      per expiry window (send_govsync_prime_to) — the requester-side mirror
+    //      of dashcore's own CMasternodeSync + netfulfilledman once-per-peer gate.
     //
     // When the primary is lost, another handshaked peer is promoted and
     // m_on_handshake_complete re-fires — which is exactly the re-ask the
     // single-peer client already performed on every reconnect, so no class-1 leg
-    // silently loses its driver; the class-3 prime is idempotent across the
-    // re-fire (already-primed peers are skipped).
+    // silently loses its driver. The class-3 govsync prime is NOT driven from
+    // that callback (it is emitted per session in the verack handler): the
+    // survivor was already primed at its own verack, so primary re-election
+    // sends no govsync at all.
 
     /// Send a getheaders request (E2 sync driver seam; unused by E1 run_node).
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
@@ -2320,37 +2337,60 @@ public:
     /// for the whole list multiple times in a short period of time is no good") —
     /// five repeats = score 100 = ban. This is the requester-side mirror of
     /// dashcore's own CMasternodeSync + netfulfilledman
-    /// HasFulfilledRequest("governance-sync") gate. So this primes each handshaked
+    /// HasFulfilledRequest("governance-sync") gate.
+    ///
+    /// PER-SESSION DRIVE: the prime is emitted from the VERACK HANDLER, per
+    /// session, right beside the getsporks leg (routing-class-3, exactly-once):
+    /// each peer is primed once at its own handshake, so both the future primary
+    /// (first verack) and every witness peer (later veracks) get covered —
+    /// mirroring how getsporks reaches every handshaked peer. That drive routes
+    /// through send_govsync_prime_to() below (single source of the window
+    /// discipline). This pool-wide walker is retained as the reprime-after-expiry
+    /// / test seam and a future hourly re-ask primitive: it primes each handshaked
     /// peer whose key is not already in m_govsync_primed (within
-    /// m_govsync_reprime_secs), records it, and RETURNS the vector of NEWLY primed
-    /// keys. Invoked from on_handshake_complete: at each new handshake it writes to
-    /// exactly the one new unprimed peer; on primary promotion / a re-fire it
-    /// writes to NOBODY. The R5 coverage is recorded from the RETURNED keys, so it
-    /// accrues peer-by-peer across handshakes without any single call fanning out.
+    /// m_govsync_reprime_secs) and RETURNS the vector of NEWLY primed keys, so R5
+    /// coverage accrues peer-by-peer without any single call fanning out.
     std::vector<std::string> send_govsync_prime()
     {
         std::vector<std::string> primed;
-        const int64_t now = now_sec();
         for (auto& p : m_pool) {
-            if (!p->handshake.complete()) continue;
-            auto it = m_govsync_primed.find(p->key);
-            if (it != m_govsync_primed.end() &&
-                m_govsync_reprime_secs > 0 &&
-                now - it->second < m_govsync_reprime_secs) {
-                // already primed within the expiry window — a repeat here is
-                // exactly the CGovernanceManager::SyncObjects Misbehaving(20)
-                // hazard, so skip it (dashd's own netfulfilledman once-only gate).
-                continue;
-            }
-            auto m = message_govsync::make_raw(
-                uint256::ZERO,           // nProp = 0 => request all objects
-                std::vector<uint8_t>{},  // empty filter vData
-                /*nHashFuncs=*/0u, /*nTweak=*/0u, /*nFlags=*/uint8_t{0});
-            p->write(m);
-            m_govsync_primed[p->key] = now;
-            primed.push_back(p->key);
+            if (send_govsync_prime_to(p.get()))
+                primed.push_back(p->key);
         }
         return primed;
+    }
+
+    /// Prime EXACTLY this peer with a full govsync(nProp=0), honouring the
+    /// once-per-expiry-window discipline. Returns TRUE iff a govsync was actually
+    /// written (peer handshaked AND not primed within m_govsync_reprime_secs);
+    /// FALSE on a window-skip or an unhandshaked peer. SINGLE SOURCE OF TRUTH for
+    /// the wire discipline: both the per-session verack driver and the pool-wide
+    /// walker route their write through here, so the at-most-once-per-key-per-
+    /// window guarantee holds regardless of caller — the requester-side mirror of
+    /// dashd's netfulfilledman HasFulfilledRequest("governance-sync") gate (a
+    /// repeat inside the window draws Misbehaving(20) in
+    /// CGovernanceManager::SyncObjects). peer_key is addr:port, matching dashd's
+    /// per-address fulfilled-request identity, so the window survives reconnects.
+    bool send_govsync_prime_to(PeerSession* p)
+    {
+        if (!p || !p->handshake.complete()) return false;
+        const int64_t now = now_sec();
+        auto it = m_govsync_primed.find(p->key);
+        if (it != m_govsync_primed.end() &&
+            m_govsync_reprime_secs > 0 &&
+            now - it->second < m_govsync_reprime_secs) {
+            // already primed within the expiry window — a repeat here is exactly
+            // the CGovernanceManager::SyncObjects Misbehaving(20) hazard, so skip
+            // it (dashd's own netfulfilledman once-only gate).
+            return false;
+        }
+        auto m = message_govsync::make_raw(
+            uint256::ZERO,           // nProp = 0 => request all objects
+            std::vector<uint8_t>{},  // empty filter vData
+            /*nHashFuncs=*/0u, /*nTweak=*/0u, /*nFlags=*/uint8_t{0});
+        p->write(m);
+        m_govsync_primed[p->key] = now;
+        return true;
     }
 
     /// TEST/DEPLOYMENT SEAM: the govsync-prime re-ask TTL, seconds. Default 3600
@@ -3624,6 +3664,22 @@ private:
         // N-witness refinement of the assume-active seed.
         auto msg_getsporks = message_getsporks::make_raw();
         p->write(msg_getsporks);
+
+        // E-SUPERBLOCK GOVSYNC PRIME (routing class 3), mirroring getsporks:
+        // ask THIS peer for the full governance object set exactly once, so a
+        // superblock height can be sourced daemonlessly. Like getsporks it is
+        // per-peer — the coverage defence (R5) is that the winning trigger
+        // reaches us even if one peer withholds it, so both the future primary
+        // (this first verack) and every witness peer (later veracks) must be
+        // primed, not just whoever wins primary election below. Only armed under
+        // --embedded-govsync/--embedded-superblock (m_gov_pull_enabled); OFF, the
+        // reply would be unanswered, so the default wire stays byte-identical to
+        // the pre-feature node. send_govsync_prime_to() enforces the at-most-
+        // once-per-peer-per-window discipline (dashd punishes a repeat full
+        // govsync with Misbehaving(20)); the reporting seam fires only when it
+        // actually wrote, so a window-skip never re-arms R5 quiescence.
+        if (m_gov_pull_enabled && send_govsync_prime_to(p) && m_on_govsync_primed)
+            m_on_govsync_primed(p->key);
 
         if (!m_primary)
         {
