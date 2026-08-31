@@ -173,6 +173,13 @@ struct EmbeddedWorkInputs {
     // NodeCoinState::make_embedded_work_inputs from set_accrue_pending_asset_locks.
     bool                             accrue_pending_asset_locks{false};
 
+    // SUPERSET (--embedded-include-mn-special-txs): admit provider special txs
+    // (types 1-4) into selection and fold them over the projected SML so the
+    // committed merkleRootMNList matches the list they produce. Default false
+    // => byte-unchanged (types 1-4 excluded). Set by
+    // NodeCoinState::make_embedded_work_inputs from set_include_mn_special_txs.
+    bool                             include_mn_special_txs{false};
+
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
     }
@@ -306,7 +313,13 @@ inline WorkSelection select_dash_work(
                 emb.pinned_local_txs,
                 // #107 phase 2: accrue pending type-8 asset-lock term into the
                 // CbTx creditPoolBalance (default false => byte-unchanged).
-                emb.accrue_pending_asset_locks);
+                emb.accrue_pending_asset_locks,
+                // #143 verified type-9 unlocks: not wired through this arm yet
+                // (admission-path-only; default nullptr => byte-unchanged).
+                /*admitted_asset_unlocks=*/nullptr,
+                // SUPERSET: include provider special txs (types 1-4) + fold
+                // them into merkleRootMNList (default false => byte-unchanged).
+                emb.include_mn_special_txs);
         },
         dashd_fallback);
 }

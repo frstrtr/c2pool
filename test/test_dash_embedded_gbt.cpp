@@ -1914,3 +1914,244 @@ TEST(DashFallbackPinBudget, GateRefusalKeepsItsOwnCause) {
     EXPECT_STREQ(rep.causes[0], "input-missing-or-spent")
         << "the size budget must not relabel a gate refusal";
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// SUPERSET (frozen design): the daemonless template is a SUPERSET/parity of
+// dashd CreateNewBlock — it INCLUDES the mempool special txs dashd would
+// include and folds their effect into the CbTx so the block stays valid.
+//   * type-8 asset-lock: creditPoolBalance = prev + platformReward + Σlocks
+//     derived from the SELECTED BODY (not the mempool snapshot).
+//   * types 1-4 provider txs: merkleRootMNList recomputed from a projected-SML
+//     COPY folded with the block's own txs (dashd BuildNewListFromBlock).
+// ════════════════════════════════════════════════════════════════════════
+
+// A valid DIP-0027 type-8 asset-lock tx locking `lock_value` duff: one bare
+// OP_RETURN output of that value + a payload crediting the same sum.
+static MutableTransaction make_asset_lock_tx(const uint256& prev_utxo,
+                                             int64_t lock_value, uint32_t salt) {
+    MutableTransaction tx;
+    tx.version = 3; tx.type = 8; tx.locktime = salt;
+    TxIn in; in.prevout.hash = prev_utxo; in.prevout.index = 0;
+    in.sequence = 0xffffffffu; tx.vin.push_back(in);
+    TxOut op; op.value = lock_value;
+    op.scriptPubKey.m_data = {0x6a, 0x00};   // bare 2-byte OP_RETURN
+    tx.vout.push_back(op);
+    dash::coin::vendor::CAssetLockPayload pl; pl.nVersion = 1;
+    TxOut credit; credit.value = lock_value;
+    credit.scriptPubKey.m_data = p2pkh_script(0x30);
+    pl.creditOutputs.push_back(credit);
+    auto ps = ::pack(pl); auto sp = ps.get_span();
+    tx.extra_payload.assign(
+        reinterpret_cast<const unsigned char*>(sp.data()),
+        reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    return tx;
+}
+
+// PROOF (2): a template that INCLUDES a type-8 lock byte-validates — the CbTx
+// creditPoolBalance equals prev + platformReward + Σlocks over the block's OWN
+// included txs (the structural change: sessionLocked from the SELECTED body).
+TEST(DashSupersetSpecialTx, Type8LockCreditPoolFromSelectedBody) {
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+    const int64_t LOCK = 50'000, FEE = 10'000;
+    uint256 pv = mint_hash(0x88);
+    utxo.add_coin(::core::coin::Outpoint(pv, 0),
+                  ::core::coin::Coin(LOCK + FEE, {}, 1, false));
+    auto lock_tx = make_asset_lock_tx(pv, LOCK, /*salt=*/88);
+    ASSERT_TRUE(mp.add_tx(lock_tx));
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    CSimplifiedMNListEntry e;
+    e.proRegTxHash = raw256(0x01); e.confirmedHash = raw256(0x77); e.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{e});
+    QuorumManager qmgr;
+    const int64_t SEED = 3'000'000'000LL;   // creditPoolBalance(N-1)
+
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp, 0x1b104be3u, 1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER, /*curtime=*/1'700'000'123u,
+        /*version=*/0x20000000u, /*underfill=*/nullptr, &sml, &qmgr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig, SEED,
+        /*qc_commitments=*/nullptr, /*quorum_root_override=*/nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, /*superblock=*/nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress=*/false, /*cause=*/"utxo-immature-serving",
+        /*pinned=*/nullptr, /*accrue_pending_asset_locks=*/true);
+
+    // The lock rode the body (allow_locks admitted it).
+    bool found = false;
+    for (const auto& h : w.m_tx_hashes)
+        if (h == dash::coin::dash_txid(lock_tx)) found = true;
+    ASSERT_TRUE(found) << "type-8 lock must be selected once allow_locks is armed";
+
+    // creditPoolBalance == seed + platformReward + LOCK (from the body).
+    CCbTx cb; ASSERT_TRUE(parse_cbtx(w.m_coinbase_payload, cb));
+    const int64_t platform = compute_dash_platform_reward_post_v20_mn_rr(H);
+    EXPECT_GT(platform, 0);
+    EXPECT_EQ(cb.creditPoolBalance, SEED + platform + LOCK)
+        << "creditPoolBalance must be prev + platformReward + Σlocks (own body)";
+
+    // Control: a lock that fails selection must NOT accrue — prove the source
+    // is the BODY, not the pending snapshot. Add a second pending lock whose
+    // input the UTXO view does not know (unpriced => never selected).
+    Mempool mp2; ::core::coin::UTXOViewCache utxo2(nullptr); mp2.set_utxo(&utxo2);
+    uint256 pv2 = mint_hash(0x99);
+    utxo2.add_coin(::core::coin::Outpoint(pv2, 0),
+                   ::core::coin::Coin(LOCK + FEE, {}, 1, false));
+    ASSERT_TRUE(mp2.add_tx(make_asset_lock_tx(pv2, LOCK, /*salt=*/99)));
+    // A SECOND lock with no known UTXO for its input: pending but unpriced.
+    auto orphan_lock = make_asset_lock_tx(mint_hash(0xAA), 777'000, /*salt=*/100);
+    ASSERT_TRUE(mp2.add_tx(orphan_lock));
+    auto w2 = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp2, 0x1b104be3u, 1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u,
+        nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, SEED,
+        nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        false, "utxo-immature-serving", nullptr, true);
+    CCbTx cb2; ASSERT_TRUE(parse_cbtx(w2.m_coinbase_payload, cb2));
+    EXPECT_EQ(cb2.creditPoolBalance, SEED + platform + LOCK)
+        << "the unpriced pending lock (777000) must NOT accrue — body, not snapshot";
+}
+
+// PROOF (3, MN-root fold leg): a type-4 ProUpRevTx folded over a projected SML
+// COPY bans the MN and yields a DIFFERENT, independently-reproducible
+// merkleRootMNList — so a template including it commits the right root.
+TEST(DashSupersetSpecialTx, Type4FoldRevokesOperatorAndRecomputesRoot) {
+    namespace v = dash::coin::vendor;
+    CSimplifiedMNListEntry base_e;
+    base_e.nVersion       = CSimplifiedMNListEntry::VER_BASIC_BLS;
+    base_e.proRegTxHash   = raw256(0x01);
+    base_e.confirmedHash  = raw256(0x77);
+    base_e.netAddress     = seq_array<16>(0x11);
+    base_e.netPort        = 9999;
+    base_e.pubKeyOperator = seq_array<48>(0x30);
+    base_e.isValid        = true;
+    base_e.nType          = CSimplifiedMNListEntry::TYPE_REGULAR;
+    CSimplifiedMNList base(std::vector<CSimplifiedMNListEntry>{base_e});
+    const uint256 root_before = base.CalcMerkleRoot();
+
+    v::CProUpRevTx rev;
+    rev.nVersion  = v::ProTxVersion::BASIC_BLS;
+    rev.proTxHash = raw256(0x01);
+    rev.nReason   = v::CProUpRevTx::REASON_COMPROMISED_KEYS;
+    MutableTransaction revtx; revtx.version = 3; revtx.type = 4;
+    { auto ps = ::pack(rev); auto sp = ps.get_span();
+      revtx.extra_payload.assign(
+          reinterpret_cast<const unsigned char*>(sp.data()),
+          reinterpret_cast<const unsigned char*>(sp.data()) + sp.size()); }
+
+    auto fold = dash::coin::fold_mn_special_txs(
+        base, std::vector<MutableTransaction>{revtx},
+        [](const MutableTransaction& t) { return dash::coin::dash_txid(t); });
+    EXPECT_EQ(fold.applied, 1u);
+    EXPECT_EQ(fold.refused, 0u);
+    ASSERT_EQ(fold.sml.mnList.size(), 1u);
+    EXPECT_FALSE(fold.sml.mnList[0].isValid) << "type-4 must ban the MN";
+    std::array<uint8_t, 48> zero{};
+    EXPECT_EQ(fold.sml.mnList[0].pubKeyOperator, zero) << "operator key cleared";
+
+    // Independent expected root (hand-built, never from the fold).
+    CSimplifiedMNListEntry exp = base_e;
+    exp.isValid = false; exp.pubKeyOperator = {};
+    exp.netAddress = {}; exp.netPort = 0;
+    CSimplifiedMNList expsml(std::vector<CSimplifiedMNListEntry>{exp});
+    EXPECT_EQ(fold.sml.CalcMerkleRoot(), expsml.CalcMerkleRoot());
+    EXPECT_NE(fold.sml.CalcMerkleRoot(), root_before)
+        << "the fold must change merkleRootMNList (else bad-cbtx-mnmerkleroot)";
+}
+
+// An update naming a proRegTxHash the list does not hold is REFUSED (never a
+// guessed root); the list is unchanged — fail-closed exclusion.
+TEST(DashSupersetSpecialTx, UnknownProTxHashIsRefusedNotFolded) {
+    namespace v = dash::coin::vendor;
+    CSimplifiedMNListEntry base_e;
+    base_e.proRegTxHash = raw256(0x01); base_e.confirmedHash = raw256(0x77);
+    base_e.isValid = true;
+    CSimplifiedMNList base(std::vector<CSimplifiedMNListEntry>{base_e});
+    const uint256 root_before = base.CalcMerkleRoot();
+
+    v::CProUpRevTx rev; rev.nVersion = v::ProTxVersion::BASIC_BLS;
+    rev.proTxHash = raw256(0xEE);   // not in the list
+    MutableTransaction revtx; revtx.version = 3; revtx.type = 4;
+    { auto ps = ::pack(rev); auto sp = ps.get_span();
+      revtx.extra_payload.assign(
+          reinterpret_cast<const unsigned char*>(sp.data()),
+          reinterpret_cast<const unsigned char*>(sp.data()) + sp.size()); }
+
+    auto fold = dash::coin::fold_mn_special_txs(
+        base, std::vector<MutableTransaction>{revtx},
+        [](const MutableTransaction& t) { return dash::coin::dash_txid(t); });
+    EXPECT_EQ(fold.applied, 0u);
+    EXPECT_EQ(fold.refused, 1u);
+    ASSERT_EQ(fold.refused_ids.size(), 1u);
+    EXPECT_EQ(fold.refused_ids[0], dash::coin::dash_txid(revtx));
+    EXPECT_EQ(fold.sml.CalcMerkleRoot(), root_before)
+        << "a refused tx must not mutate the folded list";
+}
+
+// PROOF (3, end-to-end): a template that INCLUDES a type-1 ProRegTx commits a
+// merkleRootMNList equal to the projected-SML COPY folded with that tx.
+TEST(DashSupersetSpecialTx, Type1IncludedCommitsFoldedMnRoot) {
+    namespace v = dash::coin::vendor;
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+
+    // A type-1 ProRegTx (fee-known), operator key distinct from the base MN.
+    v::CProRegTx reg;
+    reg.nVersion = v::ProTxVersion::BASIC_BLS; reg.nType = v::MnType::REGULAR;
+    reg.netInfo.ip = seq_array<16>(0x12); reg.netInfo.port_be = 9998;
+    reg.pubKeyOperator = seq_array<48>(0x40);   // != base 0x30
+    reg.inputsHash = raw256(0x71);
+    MutableTransaction regtx; regtx.version = 3; regtx.type = 1;
+    { uint256 pv = mint_hash(0x55);
+      utxo.add_coin(::core::coin::Outpoint(pv, 0),
+                    ::core::coin::Coin(100'000, {}, 1, false));
+      TxIn in; in.prevout.hash = pv; in.prevout.index = 0; in.sequence = 0xffffffffu;
+      regtx.vin.push_back(in);
+      TxOut o; o.value = 90'000; o.scriptPubKey.m_data = p2pkh_script(0x33);
+      regtx.vout.push_back(o);
+      auto ps = ::pack(reg); auto sp = ps.get_span();
+      regtx.extra_payload.assign(
+          reinterpret_cast<const unsigned char*>(sp.data()),
+          reinterpret_cast<const unsigned char*>(sp.data()) + sp.size()); }
+    ASSERT_TRUE(mp.add_tx(regtx));
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    CSimplifiedMNListEntry base_e;
+    base_e.proRegTxHash = raw256(0x01); base_e.confirmedHash = raw256(0x77);
+    base_e.pubKeyOperator = seq_array<48>(0x30); base_e.isValid = true;
+    CSimplifiedMNList sml(std::vector<CSimplifiedMNListEntry>{base_e});
+    QuorumManager qmgr;
+    const uint256 prev_hash = raw256(0xAB);
+
+    auto w = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp, 0x1b104be3u, 1'700'000'000u,
+        DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u,
+        nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, /*credit_pool=*/0,
+        nullptr, nullptr, dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress=*/false, "utxo-immature-serving", /*pinned=*/nullptr,
+        /*accrue_pending_asset_locks=*/false, /*admitted_asset_unlocks=*/nullptr,
+        /*include_mn_special_txs=*/true);
+
+    // The ProRegTx rode the body.
+    bool found = false;
+    for (const auto& h : w.m_tx_hashes)
+        if (h == dash::coin::dash_txid(regtx)) found = true;
+    ASSERT_TRUE(found) << "type-1 must be selected once include_mn_special_txs is armed";
+
+    // Committed merkleRootMNList == projected SML folded with the ProRegTx.
+    auto proj = dash::coin::project_sml_confirmations(
+        sml, H - 1, prev_hash, mnstates,
+        dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET);
+    ASSERT_TRUE(proj.ok);
+    auto fold = dash::coin::fold_mn_special_txs(
+        proj.sml, std::vector<MutableTransaction>{regtx},
+        [](const MutableTransaction& t) { return dash::coin::dash_txid(t); });
+    EXPECT_EQ(fold.applied, 1u);
+    CCbTx cb; ASSERT_TRUE(parse_cbtx(w.m_coinbase_payload, cb));
+    EXPECT_EQ(cb.merkleRootMNList, fold.sml.CalcMerkleRoot())
+        << "committed merkleRootMNList must equal the folded projected-SML root";
+    EXPECT_EQ(fold.sml.mnList.size(), 2u) << "AddMN grew the list by one";
+}
