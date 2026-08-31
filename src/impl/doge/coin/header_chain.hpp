@@ -566,9 +566,12 @@ private:
         if ((new_height % interval) != 0)
             return header.m_bits == prev.header.m_bits; // no retarget
 
-        // Find block at (new_height - interval) for timespan calculation
+        // Select the retarget's first block per Dogecoin Core's
+        // GetNextWorkRequired lookback (genesis at the 240 boundary, else
+        // new_height-interval-1). Using new_height-interval is off by one and
+        // wedged from-genesis sync at the first unclamped boundary (960).
         auto first_entry = get_header_by_height_internal(
-            new_height - static_cast<uint32_t>(interval));
+            doge_pre_digishield_first_height(new_height));
         if (!first_entry.has_value())
             return true; // can't validate without ancestor
 
