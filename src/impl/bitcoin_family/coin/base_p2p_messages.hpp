@@ -122,6 +122,17 @@ struct inventory_type
                                         // NOTE: 16, NOT the retired legacy
                                         // MSG_ISLOCK=30 — protocol.h keeps
                                         // this enum backwards compatible)
+        govobject       = 17,           // MSG_GOVERNANCE_OBJECT (dashcore
+                                        // protocol.h:508). Governance object
+                                        // inv; the hash is the object identity
+                                        // hash (govobject_hash). getdata-pulled
+                                        // only when the daemonless governance
+                                        // arm is armed (E-SUPERBLOCK).
+        govobjectvote   = 18,           // MSG_GOVERNANCE_OBJECT_VOTE (dashcore
+                                        // protocol.h:509). Governance vote inv;
+                                        // the hash is the vote identity hash
+                                        // (govvote_identity_hash). Served
+                                        // per-object via a govsync(nProp=hash).
         quorum_final_commitment = 21,   // MSG_QUORUM_FINAL_COMMITMENT
         clsig           = 29,           // MSG_CLSIG (dashcore protocol.h:522)
         isdlock         = 31,           // MSG_ISDLOCK (dashcore protocol.h:524,

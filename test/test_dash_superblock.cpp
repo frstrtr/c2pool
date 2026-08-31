@@ -661,6 +661,164 @@ TEST(DashSuperblock, TemplateEmitsSuperblockOutputs) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// HISTORICAL BYTE-PARITY (the acceptance gate) — MAINNET superblock 2525632.
+//
+// Ground truth (Mauritius oracle dashd 192.168.86.165:9998, verbosity-2
+// getblock 0000000000000017221e577f37bb5d47a54b403e34ea1c5655e0cdf45b7328a1):
+// the on-chain coinbase txid 79030312ea976c901fa5e0d223ff1edecf71649b7f3e7f8e10f0c356f60ce3e1
+// pays vout[0]=miner, vout[1]=OP_RETURN(platform), vout[2]=MN, and
+// vout[3..16]= the 14 governance/treasury outputs of the funded superblock.
+// This KAT reconstructs the winning trigger's payment schedule from that
+// on-chain payee set (faithful because dashd validates a superblock coinbase
+// against exactly ParsePaymentSchedule(vchData), and address->script is
+// deterministic — the winning-trigger gobject itself is cycle-ephemeral and
+// long since erased network-wide), feeds it through the daemonless pipeline
+// parse_superblock_trigger -> GovernanceStore -> get_superblock_payments ->
+// build_embedded_workdata, and asserts the produced superblock coinbase
+// outputs are BYTE-IDENTICAL to the real vout[3..16] slice: same scripts,
+// same amounts, same ORDER (including the duplicate P2SH 7mUyau75… at
+// positions 4 and 12), same 20% treasury total (6817 DASH), under the
+// getsuperblockbudget cap (6828.26378160 DASH).
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// hex scriptPubKey -> raw bytes (the coinbase-serialized script form).
+std::vector<uint8_t> hb(const std::string& hex) {
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return 0;
+    };
+    std::vector<uint8_t> out;
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+        out.push_back(static_cast<uint8_t>((nib(hex[i]) << 4) | nib(hex[i + 1])));
+    return out;
+}
+
+// The 14 governance outputs of superblock 2525632 in ON-CHAIN ORDER:
+//   {mainnet payee address, DASH-amount string, on-chain scriptPubKey hex,
+//    duffs}. Note the SAME P2SH payee (7mUyau75…) appears at index 3 and 11.
+struct SbVec { const char* addr; const char* amt; const char* spk; int64_t duffs; };
+const std::vector<SbVec> kSb2525632 = {
+    {"XoLMVTXpDWvLe4yKcj989nZ2vddE2zJQ6q","60",   "76a9148ab9a867903e835e86d0e4f417d968c5c78fa7ba88ac",  6000000000LL},
+    {"XgNfgrEB9n6uCY9Pi1hb2foimxPdtiZ4Z2","350",  "76a9143e60cc82015c846a4ff43fc80e587850dd248e8d88ac", 35000000000LL},
+    {"Xebhp13RsUPU8sqzAPiurHUh1kGCJ7zabs","200",  "76a9142ae7ba2caf2a0578aa1b4ee9431dcaac2c56805388ac", 20000000000LL},
+    {"7mUyau75ATy1c6LoZeG3D57jKBkR4iHJkE","4832", "a914d13bc5c4b8ca8073d08e12baf57690d3eebc6f7987",    483200000000LL},
+    {"Xx1DY36sQjrmvRTPw7kyTZ9Xg9dyVp3h7C","45",   "76a914e9d43ee3ac25faf34f1776f1d1e23e6ea28543ac88ac", 4500000000LL},
+    {"XjRx5Xj9G4kE4gvLT6GQKmvWMrtGPtUjkS","530",  "76a9145fe81b4ddaafdffbd6f70cdb7464b9567e15301d88ac", 53000000000LL},
+    {"XogmURyyvkE8DXdhZGUd1qgYwgvwZ8WCxR","100",  "76a9148e95ff1957118b3209f4b40b8e63f5bc42edd5bb88ac", 10000000000LL},
+    {"XjdnZBUedF4q8EzgWWAGsZrHteEgEUybbo","250",  "76a914622526095b3f27d9b8f7a6f975956d9a63586a9c88ac", 25000000000LL},
+    {"Xhf1d5nmRreWC3YkvQXWswFbPdpGyU6rRB","1",    "76a9144c7038928ca5ad481a348a4dc74270026f82568c88ac", 100000000LL},
+    {"Xr3EjtyMzJRcb5dkshjbjg6zXd2EY1662Y","85",   "76a914a865540d8b036f34b8fd60f328177a4c22f39a4d88ac", 8500000000LL},
+    {"XvQMESjyfJEW2hsSXNRvbXwBVizZgdNXkw","32",   "76a914d843fc6fdfd071c2fab8b94dcd8143cec67dcb1788ac", 3200000000LL},
+    {"7mUyau75ATy1c6LoZeG3D57jKBkR4iHJkE","200",  "a914d13bc5c4b8ca8073d08e12baf57690d3eebc6f7987",     20000000000LL},
+    {"XoccKgfVCBRWqu2GYWctDAdLGRybr2zbhP","82",   "76a9148dccb1a4f3d32a7bdb997d18ff53bea78723ab2488ac", 8200000000LL},
+    {"XcAY5amfZ4qr8WrzppGxLQ3uGpCYFb19zC","50",   "76a9141034f40bf6fe1543f2290d9c3e515b6698dff80f88ac", 5000000000LL},
+};
+
+std::string join_pipe(const std::vector<std::string>& v) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) { if (i) out += "|"; out += v[i]; }
+    return out;
+}
+
+} // namespace
+
+TEST(DashSuperblockHistorical, Mainnet2525632CoinbaseBytesMatchOnChain) {
+    constexpr int32_t H = 2'525'632;
+    // 1) Reconstruct the winning trigger's plaintext JSON schedule from the
+    //    on-chain payee set (mainnet addresses, chain order). proposal_hashes
+    //    is a well-formed-but-arbitrary per-payee filler (the dashd parser
+    //    requires one valid uint256 hex per payee; it never affects the payee
+    //    math — get_superblock_payments consumes only script+amount).
+    std::vector<std::string> addrs, amts, props;
+    for (const auto& e : kSb2525632) {
+        addrs.emplace_back(e.addr);
+        amts.emplace_back(e.amt);
+        props.emplace_back(kPropHash);
+    }
+    const std::string json =
+        trigger_json(H, join_pipe(addrs), join_pipe(amts), join_pipe(props));
+
+    // 2) Parse via the daemonless dashd-exact parser (MAINNET chain-strict).
+    auto trig = parse_superblock_trigger(json, hash_of(2525632), /*testnet=*/false);
+    ASSERT_TRUE(trig.has_value()) << "mainnet trigger must parse";
+    ASSERT_EQ(trig->event_block_height, H);
+    ASSERT_EQ(trig->payments.size(), kSb2525632.size());
+
+    // 3) Feed the GovernanceStore and resolve the winning schedule under the
+    //    real getsuperblockbudget cap. superblock_budget(2525632, 16616) is
+    //    KAT-pinned below to the oracle's 6828.26378160 DASH.
+    const int64_t budget = superblock_budget(H, DASH_SUPERBLOCK_CYCLE_MAINNET);
+    EXPECT_EQ(budget, 682'826'378'160LL);  // dashd getsuperblockbudget 2525632
+
+    GovernanceStore store;
+    ASSERT_TRUE(store.add_trigger(*trig));
+    store.set_funding_threshold(1);
+    store.set_vote_weight_fn(weight_all_regular);
+    store.add_verified_funding_vote(hash_of(2525632), "mn-0", VOTE_OUTCOME_YES, 1);
+
+    auto sched = get_superblock_payments(store, H, budget);
+    ASSERT_TRUE(sched.has_value()) << "trigger-confident schedule must resolve";
+    ASSERT_EQ(sched->size(), kSb2525632.size());
+
+    // 4) BYTE-PARITY: the resolved (scriptPubKey, amount) vector is exactly the
+    //    on-chain coinbase vout[3..16] slice — order-exact, incl. the duplicate
+    //    P2SH at positions 3 and 11, to the duff.
+    int64_t total = 0;
+    for (size_t i = 0; i < kSb2525632.size(); ++i) {
+        const auto expected_script = hb(kSb2525632[i].spk);
+        EXPECT_EQ((*sched)[i].script, expected_script)
+            << "payee " << i << " (" << kSb2525632[i].addr
+            << ") scriptPubKey diverges from on-chain coinbase";
+        EXPECT_EQ((*sched)[i].amount, kSb2525632[i].duffs)
+            << "payee " << i << " amount diverges from on-chain coinbase";
+        total += kSb2525632[i].duffs;
+    }
+    // 20% treasury total: 6817 DASH, under the 6828.26378160 DASH budget.
+    EXPECT_EQ(total, 681'700'000'000LL);
+    EXPECT_LE(total, budget);
+
+    // 5) TEMPLATE WIRING: the embedded coinbase builder appends those payees as
+    //    ADDED outputs (mainnet address versions 76 / 16) and augments
+    //    coinbasevalue by exactly the treasury total — a valid CreateNewBlock-
+    //    equivalent superblock coinbase built daemonlessly.
+    MnStateMachine mn;   // empty MN set isolates the superblock outputs
+    Mempool mp;
+    DashWorkData base = build_embedded_workdata(
+        static_cast<uint32_t>(H) - 1, uint256::ZERO, mn, mp,
+        /*bits*/0x1a0ffff0, /*mtp*/1'700'000'000u,
+        /*addr_ver*/76, /*addr_p2sh*/16,
+        /*curtime*/1'700'000'100u, /*version*/0x20000000u,
+        /*underfill*/nullptr, /*sml*/nullptr, /*qmgr*/nullptr,
+        /*bestcl_h*/0, k_zero_cl_sig, /*credit_pool*/0,
+        /*qc_commitments*/nullptr, /*quorum_root_override*/nullptr,
+        DASH_MN_RR_HEIGHT_MAINNET, /*superblock_payments*/nullptr);
+    DashWorkData sb = build_embedded_workdata(
+        static_cast<uint32_t>(H) - 1, uint256::ZERO, mn, mp,
+        0x1a0ffff0, 1'700'000'000u, 76, 16,
+        1'700'000'100u, 0x20000000u,
+        nullptr, nullptr, nullptr, 0, k_zero_cl_sig, 0,
+        nullptr, nullptr, DASH_MN_RR_HEIGHT_MAINNET, &*sched);
+
+    EXPECT_EQ(sb.m_coinbase_value,
+              base.m_coinbase_value + static_cast<uint64_t>(total));
+    ASSERT_EQ(sb.m_packed_payments.size(),
+              base.m_packed_payments.size() + kSb2525632.size());
+    // The appended superblock outputs are in schedule order, each carrying the
+    // exact on-chain amount for its position (the duplicate 200-DASH / 4832-DASH
+    // P2SH pair distinguishes an order-preserving append from a set-merge).
+    const size_t off = base.m_packed_payments.size();
+    for (size_t i = 0; i < kSb2525632.size(); ++i) {
+        EXPECT_EQ(sb.m_packed_payments[off + i].amount,
+                  static_cast<uint64_t>(kSb2525632[i].duffs))
+            << "appended superblock output " << i << " amount/order diverges";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // R5 / R6 — NodeCoinState + CoinStateMaintainer harness
 // ═══════════════════════════════════════════════════════════════════════════
 namespace {
