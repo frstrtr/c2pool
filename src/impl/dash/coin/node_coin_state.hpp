@@ -351,6 +351,13 @@ public:
     void set_accrue_pending_asset_locks(bool v) { m_accrue_pending_asset_locks = v; }
     bool accrue_pending_asset_locks() const { return m_accrue_pending_asset_locks; }
 
+    /// SUPERSET (--embedded-include-mn-special-txs): admit provider special txs
+    /// (types 1-4) into the served body and fold them into the committed
+    /// merkleRootMNList. Default OFF (canary phase); the emit gate re-derives
+    /// the folded root over the served body and refuses on any mismatch.
+    void set_include_mn_special_txs(bool v) { m_include_mn_special_txs = v; }
+    bool include_mn_special_txs() const { return m_include_mn_special_txs; }
+
     /// Network MN_RR activation height (dashcore Params().GetConsensus()
     /// .MN_RRHeight — per-chainparams). Gates the DIP-0027 platform-share
     /// credit-pool accrual in the template build, the pre-emit value re-check,
@@ -1251,10 +1258,38 @@ public:
             m_sml_root_memo_epoch = m_root_memo_epoch;
             m_sml_root_memo_valid = true;
         }
-        if (cb.merkleRootMNList != m_sml_root_memo)
+        // merkleRootMNList expected value. By default this is the memoized
+        // projected root (no provider special txs in the body). When the
+        // SUPERSET arm (--embedded-include-mn-special-txs) is on, the served
+        // body may carry types 1-4, so the committed root must be the FOLDED
+        // root — re-derive it over w.m_txs on a projected COPY (dashd
+        // BuildNewListFromBlock parity, sml_special_fold.hpp) and refuse the
+        // template if the fold cannot apply the body exactly (fail-closed:
+        // an unfoldable body must never be served with a guessed root).
+        uint256 expected_mn_root = m_sml_root_memo;
+        if (m_include_mn_special_txs) {
+            auto proj = project_sml_confirmations(m_sml, m_prev_height,
+                                                  m_prev_hash, m_mnstates,
+                                                  m_mn_min_confirmations);
+            if (!proj.ok)
+                return reject("emit-mn-confirm-rollover-pending",
+                              "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
+                              "known-registration-height");
+            auto fold = fold_mn_special_txs(
+                proj.sml, w.m_txs,
+                [](const Transaction& t) {
+                    return dash::coin::dash_txid(MutableTransaction(t));
+                });
+            if (!fold.clean())
+                return reject("emit-mnlist-fold-refused",
+                              std::to_string(fold.refused),
+                              "0-refused");
+            expected_mn_root = fold.sml.CalcMerkleRoot();
+        }
+        if (cb.merkleRootMNList != expected_mn_root)
             return reject("emit-mnlist-root-drift",
                           cb.merkleRootMNList.GetHex().substr(0, 12),
-                          m_sml_root_memo.GetHex().substr(0, 12));
+                          expected_mn_root.GetHex().substr(0, 12));
         // E1: under a qc plan the committed root must be the WITH-BLOCK root
         // (fold of the plan's commitments over the active set — equal to the
         // plain root while the plan is all-null, diverging only once Phase L
@@ -1301,16 +1336,28 @@ public:
                 m_credit_pool
                 + compute_dash_platform_reward_post_v20_mn_rr(next_h,
                                                               m_mn_rr_height);
-            // #107 PHASE 2 (B2): when the asset-lock fold is armed the builder
-            // ADDED the pending type-8 term to the committed pool. Re-derive it
-            // here from the SAME source (m_mempool's pending type-8 locks) with
-            // the SAME arithmetic (asset_lock_fold.hpp) so the freshness gate
-            // EXPECTS the accrued value instead of rejecting it. Off (default)
-            // this term is 0 and the check is byte-identical to before.
-            if (m_accrue_pending_asset_locks) {
-                expected_credit_pool +=
-                    pending_asset_lock_fold(m_mempool.pending_asset_lock_txs())
-                        .accrued;
+            // BODY re-derivation (frozen design failclosed_gate): dashd derives
+            // the committed creditPoolBalance from the BLOCK'S OWN txs, so the
+            // emit gate re-derives the asset-lock/unlock terms over the SERVED
+            // BODY (w.m_txs) — NOT a mempool snapshot — killing the build-vs-emit
+            // snapshot race the old m_mempool.pending_asset_lock_txs() source
+            // tolerated. Each type-8 adds its first-OP_RETURN value (the SAME
+            // asset_lock_fold.hpp arithmetic the builder used); each type-9 (only
+            // the admitted set can be present) subtracts its gross = payload.fee
+            // + Σvout (dashd GetDataFromUnlockTx). When no special tx rode this
+            // body (the default posture) both terms are 0 and the check is
+            // byte-identical to before. NOTE: the type-9 deduction term is a HARD
+            // prerequisite of arming #143 — without it an admitted-unlock template
+            // would self-reject here.
+            expected_credit_pool += pending_asset_lock_fold(w.m_txs).accrued;
+            for (const auto& t : w.m_txs) {
+                if (t.type != vendor::CAssetUnlockPayload::SPECIALTX_TYPE) continue;
+                vendor::CAssetUnlockPayload upl;
+                if (!vendor::parse_assetunlock_payload(t.extra_payload, upl))
+                    continue;
+                int64_t gross = static_cast<int64_t>(upl.fee);
+                for (const auto& o : t.vout) gross += o.value;
+                expected_credit_pool -= gross;
             }
             if (cb.creditPoolBalance != expected_credit_pool)
                 return reject("emit-creditpool-value-drift",
@@ -1435,6 +1482,9 @@ public:
                                      ? &m_pinned_local_txs : nullptr;
         // #107 phase 2: accrue pending type-8 asset locks into the CbTx pool.
         e.accrue_pending_asset_locks = m_accrue_pending_asset_locks;
+        // SUPERSET: include provider special txs (types 1-4) + fold them into
+        // the committed merkleRootMNList. Default OFF (canary flag).
+        e.include_mn_special_txs = m_include_mn_special_txs;
         // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
         // Empty at non-superblock heights and confidently-unfunded superblocks
         // (normal block); the winning trigger's payees at a funded superblock.
@@ -1882,6 +1932,13 @@ private:
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs
     // (builder) and embedded_template_emit_ok (matching emit-gate re-derivation).
     bool m_accrue_pending_asset_locks{false};
+
+    // SUPERSET arm (--embedded-include-mn-special-txs): include provider special
+    // txs (types 1-4) in the served body and fold them into the committed
+    // merkleRootMNList (sml_special_fold.hpp). Default OFF (canary phase).
+    // Consumed by make_embedded_work_inputs (builder) and
+    // embedded_template_emit_ok (matching folded-root emit-gate re-derivation).
+    bool m_include_mn_special_txs{false};
     // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
     // this state; the bundle exposes a pointer only when the flag is set.
     // MULTIPLE pins: the donation consolidation had to be SPLIT after

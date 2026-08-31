@@ -1064,15 +1064,56 @@ public:
     /// miner too — its mempool never admits deeper chains).
     static constexpr size_t MAX_PACKAGE_TXS = 25;
 
-    // exclude_special (C-3): when true, drop every Dash special tx (tx.type != 0
-    // — ProRegTx/ProUpServTx/asset-lock/asset-unlock) from the selection. dashd
-    // recomputes the coinbase CbTx roots (merkleRootMNList/Quorums) and the
-    // DIP-0027 creditPoolBalance by APPLYING the block's own special txs, so
-    // including one in the embedded template WITHOUT folding its effect into the
-    // CbTx yields bad-cbtx and a rejected block. build_embedded_workdata passes
-    // true (safe-minimal: the creditPool accrual then reduces to the platform-
-    // reward term only). Default false preserves the mempool's general pricing +
-    // selection capability (including the asset-unlock fee path) unchanged.
+    // ── PER-TYPE SPECIAL-TX SELECTION MASK ────────────────────────────────
+    // dashd's BlockAssembler builds the coinbase CbTx roots (merkleRootMNList
+    // / merkleRootQuorums) and the DIP-0027 creditPoolBalance by APPLYING the
+    // block's OWN special txs (BuildNewListFromBlock, GetCreditPoolDiffForBlock).
+    // So a special tx may ride the embedded template ONLY when the template
+    // side folds that same effect into the CbTx. Which types the builder can
+    // account for varies at runtime (the SML fold may be unavailable, the
+    // credit-pool seed may be stale), so selection admits special txs PER TYPE
+    // rather than all-or-nothing. This mask is that per-type gate:
+    //
+    //   * types 1-4 (ProRegTx/ProUpServTx/ProUpRegTx/ProUpRevTx) — admitted
+    //     when allow_mn_types (the template folds them into merkleRootMNList,
+    //     sml_special_fold.hpp);
+    //   * type 8 (AssetLock) — admitted when allow_locks (the template accrues
+    //     the credit-pool lock term from the SELECTED body, asset_lock_fold.hpp);
+    //   * types 5/6/7/9 — NEVER admitted through selection: type-5 is the
+    //     coinbase itself, type-6 quorum commitments are builder-generated
+    //     (dkg_commitments), type-9 AssetUnlock is admission-path-only
+    //     (credit_pool_idx.hpp), and any mempool copy of these would duplicate
+    //     or invalidate the mandatory builder-side object.
+    //
+    // Legacy bool compatibility: the historical parameter was `exclude_special`
+    // (true = drop every special tx; false = admit ALL of them, the general
+    // pricing/selection capability). The implicit constructor preserves BOTH
+    // meanings byte-for-byte for every existing caller — `true` masks all
+    // special out, `false`/default admits all — so only the embedded builder,
+    // which now passes an explicit partial mask, changes behaviour.
+    struct SpecialTxSelectMask {
+        bool allow_all_special;   // legacy exclude_special == false
+        bool allow_mn_types;      // types 1-4
+        bool allow_locks;         // type 8
+        // A single user-provided constructor (default exclude_special=false =>
+        // legacy admit-all). No in-class member initializers: those would be
+        // odr-used by the `= {}` default argument on get_sorted_txs_with_fees
+        // while Mempool is still incomplete, which GCC rejects.
+        // NOLINTNEXTLINE(google-explicit-constructor) — the implicit bool path
+        // is exactly the source-compat contract with pre-mask callers.
+        constexpr SpecialTxSelectMask(bool exclude_special = false)
+            : allow_all_special(!exclude_special),
+              allow_mn_types(false),
+              allow_locks(false) {}
+        constexpr bool admits(uint16_t tx_type) const {
+            if (tx_type == 0) return true;              // ordinary tx
+            if (allow_all_special) return true;         // legacy general path
+            if (tx_type >= 1 && tx_type <= 4) return allow_mn_types;
+            if (tx_type == 8) return allow_locks;
+            return false;                               // 5/6/7/9 never here
+        }
+    };
+
     // lock_time_cutoff: dashd m_lock_time_cutoff = MTP(pindexPrev)
     // (miner.cpp:223) for the per-member IsFinalTx re-check
     // (TestPackageTransactions, miner.cpp:377). 0 (legacy/test callers) skips
@@ -1080,7 +1121,8 @@ public:
     // the embedded GBT passes the tip MTP, which closes that argument's reorg
     // edge (height/MTP can REGRESS across a reorg while the tx stays pooled).
     std::pair<std::vector<SelectedTx>, uint64_t>
-    get_sorted_txs_with_fees(uint32_t max_bytes, bool exclude_special = false,
+    get_sorted_txs_with_fees(uint32_t max_bytes,
+                             SpecialTxSelectMask special_mask = {},
                              uint32_t next_height = 0,
                              int64_t lock_time_cutoff = 0) const
     {
@@ -1337,7 +1379,11 @@ public:
                     }
                     if (!scripts_ok) { ok = false; break; }
                 }
-                if (exclude_special && e->tx.type != 0) { ok = false; break; }
+                // PER-TYPE special-tx admission (see SpecialTxSelectMask):
+                // the legacy exclude_special=true collapses to admits()==false
+                // for every type!=0; the partial embedded mask admits types
+                // 1-4 and/or 8 only, and 5/6/7/9 are never selected.
+                if (!special_mask.admits(e->tx.type)) { ok = false; break; }
 
                 // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
                 // member-level; either failure drops the WHOLE package and —
