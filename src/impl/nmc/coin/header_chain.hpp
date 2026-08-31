@@ -814,6 +814,13 @@ struct IndexEntryDiskV1 {
 
     /// Materialize the slim in-memory form. auxpow is reconstructed as nullopt
     /// in this leg (blob deferred); status carries the merge-mined verdict.
+    ///
+    /// MEMORY: the resident IndexEntry deliberately does NOT carry the AuxPow
+    /// blob. It stays on disk behind has_auxpow and is never needed after
+    /// admission (verification runs BEFORE connect); keeping it resident across
+    /// the ~740k-header NMC history is the OOM balloon this defers. status
+    /// (HEADER_VALID_CHAIN for a merge-mined header) preserves the validation
+    /// verdict, matching connect_locked which also drops the blob post-persist.
     IndexEntry to_entry() const {
         IndexEntry e;
         e.header     = header;
@@ -821,7 +828,7 @@ struct IndexEntryDiskV1 {
         e.height     = height;
         e.chain_work = chain_work;
         e.status     = status;
-        e.auxpow     = auxpow;         // P1f(a): blob restored behind has_auxpow
+        e.auxpow     = std::nullopt;  // blob stays on disk behind has_auxpow
         return e;
     }
 
@@ -1345,6 +1352,20 @@ private:
         // idempotent / orphan / activation-gate early returns above never reach
         // here, so nothing is written for a rejected header.
         persist_entry_locked(bh, tip_changed);
+
+        // MEMORY: the verified AuxPow proof is now durably on disk behind
+        // has_auxpow (persist_entry_locked / IndexEntryDiskV1, P1f(a)). Drop the
+        // resident copy so m_index stays headers-only (~200 B/entry) instead of
+        // pinning the full parent coinbase tx + two merkle branches + parent
+        // header (~1-3 KB) for every merge-mined header across the ~740k-header
+        // NMC history -- the residency balloon that OOM-killed the embedded arm
+        // mid-IBD under MemoryMax. status (HEADER_VALID_CHAIN) and chain_work are
+        // retained, so fork-choice and validation state are unaffected; the blob
+        // is verified BEFORE connect (add_auxpow_header -> check_proof) and no
+        // path reads the resident IndexEntry::auxpow after admission (disk
+        // restore likewise defers it, see to_entry()).
+        if (auto it = m_index.find(bh); it != m_index.end())
+            it->second.auxpow.reset();
         return true;
     }
 
@@ -1456,7 +1477,13 @@ private:
     // cumulative-work / fork-choice path (P1e), and LevelDB persistence +
     // reload incl. the AuxPow blob (P1f). Still deferred: nBits difficulty
     // RETARGET validation (calculate_next_work is provided but not enforced in
-    // connect_locked). NMC keeps a full-residency m_index with no height-index.
+    // connect_locked -- tracked as a hardening follow-up; low-nBits headers
+    // cannot outweigh the honest chain since chain_work is derived from nBits).
+    // MEMORY: m_index is HEADERS-ONLY -- the AuxPow proof blob is persisted to
+    // LevelDB behind has_auxpow and dropped from the resident IndexEntry after
+    // admission (connect_locked) and never restored into RAM (to_entry), so RSS
+    // plateaus at ~200 B/entry across the full ~740k-header NMC history instead
+    // of ballooning by the ~1-3 KB proof per merge-mined header. No height-index.
 };
 
 } // namespace coin

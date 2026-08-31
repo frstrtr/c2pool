@@ -539,6 +539,18 @@ int main(int argc, char* argv[])
     std::unique_ptr<nmc::coin::Mempool>        nmc_pool;
     std::unique_ptr<nmc::coin::NMCChainParams> nmc_params_ptr;
 
+    // SEGV FIX: own the NMC header-admission thread pools at main scope. Each
+    // pool runs connect_locked() on a raw HeaderChain* (nc) captured by the
+    // per-broadcaster header sink; the pool's shared_ptr previously lived ONLY
+    // inside that sink lambda (held by the broadcaster). Because
+    // merged_broadcasters is declared before nmc_chain, RAII destroys nmc_chain
+    // FIRST and joins the pool only later when the broadcaster dies — so a pool
+    // worker still admitting a header batch dereferences the freed chain. This
+    // was the SEGV on EVERY clean stop of the NMC arm. Holding the pools here
+    // lets the explicit teardown below stop()+join() them BEFORE nmc_chain is
+    // destroyed, closing the use-after-free deterministically.
+    std::vector<std::shared_ptr<boost::asio::thread_pool>> nmc_hdr_pools;
+
     if (!merged_configs.empty()) {
         mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
         for (size_t ci = 0; ci < merged_configs.size(); ++ci) {
@@ -651,6 +663,10 @@ int main(int argc, char* argv[])
                 // (80-byte-only, drops the AuxPoW proof; structurally
                 // insufficient for a chain that has been AuxPoW since 2014).
                 auto nmc_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+                // SEGV FIX: also own the pool at main scope so shutdown can
+                // stop()+join() it before nmc_chain is destroyed (see the
+                // nmc_hdr_pools declaration + the teardown block at end-of-main).
+                nmc_hdr_pools.push_back(nmc_hdr_pool);
                 auto* bcaster_ptr = broadcaster.get();
                 auto* nc = nmc_chain.get();
 
@@ -3174,6 +3190,29 @@ int main(int argc, char* argv[])
     stratum_server_for_shutdown.reset();
     work_source_for_shutdown.reset();
     p2p_node.reset();
+
+    // SEGV FIX: tear down the NMC merged arm in a controlled order BEFORE the
+    // embedded HeaderChain (nmc_chain) is destroyed by end-of-scope RAII.
+    //   1. drop the merged-mining manager first — its poll thread references the
+    //      broadcasters via set_block_relay_fn, so it must stop before they die.
+    //   2. clear the broadcasters — stops their network/peer threads and releases
+    //      the header-sink lambdas that post admission batches to the pools, so
+    //      no new connect_locked() work can be queued after this point.
+    //   3. stop() + join() every header-admission pool — discards queued batches
+    //      and drains any in-flight connect_locked() call so no worker thread can
+    //      still be touching the chain.
+    // Only after all three is it safe for nmc_chain / nmc_pool to be destroyed at
+    // end of main. Without this ordering a pool worker admitting a header batch
+    // raced the chain's destructor -> use-after-free (the SEGV on every clean
+    // stop of the NMC arm; core-dump crashing thread was the header pool inside
+    // HeaderChain::connect_locked while main() destroyed the chain).
+    mm_manager.reset();
+    merged_broadcasters.clear();
+    for (auto& p : nmc_hdr_pools) {
+        if (p) { p->stop(); p->join(); }
+    }
+    nmc_hdr_pools.clear();
+
     LOG_INFO << "[BTC] Shutdown complete.";
     return 0;
 }

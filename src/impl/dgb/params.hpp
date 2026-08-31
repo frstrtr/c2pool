@@ -67,7 +67,8 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.pow_func        = core::pow::scrypt;
     p.block_hash_func = core::pow::sha256d;
 
-    // Subsidy: DGB 3-phase decay schedule (config_coin.hpp SSOT)
+    // Subsidy: DigiByte Core GetBlockSubsidy port, 6-period schedule, COIN=1e8
+    // (config_coin.hpp SSOT). Feeds the daemonless coinbase-build path.
     p.subsidy_func = [](uint32_t height) -> uint64_t {
         return CoinParams::subsidy(height);
     };

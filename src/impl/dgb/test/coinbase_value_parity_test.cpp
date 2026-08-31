@@ -79,17 +79,17 @@ core::SubsidyFunc oracle_subsidy() {
     return [](uint32_t height) -> uint64_t { return dgb::CoinParams::subsidy(height); };
 }
 
-// Captured p2pool-dgb-scrypt oracle subsidy on each side of every reward-era
-// boundary -- the SAME vectors dgb_work_source_test pins. Reusing the captured
-// numbers (not just the live function) double-locks the parity figure.
+// DigiByte Core GetBlockSubsidy() on each side of every reward-period boundary
+// (satoshis, COIN=1e8) -- the SAME vectors dgb_work_source_test pins. Reusing the
+// captured numbers (not just the live function) double-locks the parity figure.
 struct EraVec { uint32_t height; uint64_t subsidy; const char* era; };
 constexpr EraVec kEraBoundaries[] = {
-    {67199,   8000000000ULL, "phase1-fixed last"},
-    {67200,   7960000000ULL, "phase2 -0.5%/wk first"},
-    {399999,  6746441103ULL, "phase2 last"},
-    {400000,  2434410000ULL, "phase3 -1%/wk first"},
-    {1429999, 2157824200ULL, "phase3 last"},
-    {1430000, 1078500000ULL, "phase4 monthly-decay first"},
+    {67199,   800000000000ULL, "PeriodIII-fixed last"},
+    {67200,   796000000000ULL, "PeriodIV -0.5%/wk first"},
+    {399999,  674644108854ULL, "PeriodIV last"},
+    {400000,  243441000000ULL, "PeriodV -1%/wk first"},
+    {1429999, 215782419560ULL, "PeriodV last"},
+    {1430000, 107850000000ULL, "PeriodVI monthly-decay first"},
 };
 
 // Minimal, distinct fee-known tx tagged by its output value (mirrors the
