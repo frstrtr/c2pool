@@ -6738,27 +6738,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // from exactly what the SML has applied, never a stranded base.
                 cp->send_getmnlistd(maint ? maint->sml_current_hash() : uint256::ZERO, tip);
                 // E-SUPERBLOCK: prime the governance object sync (triggers +
-                // proposals) to EVERY handshaked peer so a superblock height
-                // can be served daemonlessly. Zero nProp + empty filter =>
-                // request all objects. dashcore answers with INVENTORY
-                // (MSG_GOVERNANCE_OBJECT=17 invs); the inv handler now
-                // getdata-pulls those (batched) when the gov arm is armed, the
-                // govobj handler fires a per-object vote sync (govsync
-                // nProp=objectHash) for each accepted TRIGGER, and its
-                // MSG_GOVERNANCE_OBJECT_VOTE=18 reply invs are pulled the same
-                // way — so the store now populates instead of staying inert.
+                // proposals) so a superblock height can be served daemonlessly.
+                // send_govsync_prime() primes each NOT-YET-PRIMED handshaked peer
+                // EXACTLY ONCE per expiry window (dashd punishes a repeated full
+                // govsync from the same address: CGovernanceManager::SyncObjects
+                // Misbehaving(20)). This callback also re-fires on primary
+                // promotion, where the prime is a deliberate no-op — every peer
+                // is already primed, so nobody is written and no ban score
+                // accrues. Zero nProp + empty filter => request all objects;
+                // dashcore answers with INVENTORY (MSG_GOVERNANCE_OBJECT=17
+                // invs); the inv handler getdata-pulls those (batched) when the
+                // gov arm is armed, the govobj handler fires a per-object vote
+                // sync (govsync nProp=objectHash) for each accepted TRIGGER, and
+                // its MSG_GOVERNANCE_OBJECT_VOTE=18 reply invs are pulled the
+                // same way — so the store populates instead of staying inert.
                 // OFF (no --embedded-govsync/--embedded-superblock) the getdata
-                // is not sent, so this govsync is a harmless unanswered request
-                // (wire byte-identical to master's inert leg).
-                cp->send_govsync();
-                // R5: record govsync peer coverage per HANDSHAKED peer +
-                // (re)arm the quiescence window for the completeness
-                // determination. Under --coin-p2p-discover the bounded pool
-                // holds >= 2 peers, so recording each distinct key is what lets
-                // the min_peers (>=2) completeness floor ever flip TRUE (the
-                // serve-side R5 gate). With one peer it stays FALSE —
-                // reward-safe.
-                for (const auto& pk : cp->handshaked_peer_keys())
+                // is not sent, so the prime is a harmless unanswered request; the
+                // OFF-arm wire is once-per-peer (not loop-all-per-event), which
+                // is itself the fix — the old loop-all leg carried the same
+                // per-repeat ban hazard.
+                //
+                // R5: record govsync peer coverage from the NEWLY primed keys
+                // (never handshaked_peer_keys() — recording an already-primed
+                // peer would spuriously re-arm the quiescence window and delay
+                // completeness). Under --coin-p2p-discover the bounded pool holds
+                // >= 2 peers, so >= 2 distinct keys accumulate across handshakes
+                // and the min_peers (>=2) completeness floor can flip TRUE (the
+                // serve-side R5 gate). With one peer it stays FALSE — reward-safe.
+                for (const auto& pk : cp->send_govsync_prime())
                     maint->note_govsync_requested(pk);
             });
 

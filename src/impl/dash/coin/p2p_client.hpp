@@ -48,8 +48,8 @@
 //     PeerSession above. No shared mutable per-connection state.
 //   * Inbound fan-in dedup (InvDedup above): the same inv now arrives from
 //     several peers; ONE getdata is issued, from a bounded expiring set.
-//   * A designated PRIMARY peer carries every request/response leg
-//     (getheaders / getmnlistd / getqrinfo / govsync / getdata-for-block), so
+//   * A designated PRIMARY peer carries every stateful request/response leg
+//     (getheaders / getmnlistd / getqrinfo / getdata-for-block), so
 //     a reply is always matched to the peer that was asked and the
 //     ReplyMatcher state on that Connection stays coherent. Non-primary peers
 //     are witnesses: they deliver inv-pushed traffic and are pulled from, but
@@ -917,14 +917,25 @@ private:
     // gated. A governance inv is otherwise inert: without the pull the
     // govobj/govobjvote handlers never fire and the GovernanceStore stays
     // empty, so a superblock height can never be served daemonlessly. OFF by
-    // default => the wire is byte-identical to the pre-fix node (govsync is
-    // still SENT at handshake, but the inv answer is not pulled). No budget:
-    // gov invs are batched to ONE getdata per inv message and dashd
-    // rate-limits full govsync per peer.
+    // default => the inv answer is not pulled and the store stays inert
+    // (a govsync(nProp=0) is still SENT once per peer at its handshake — the
+    // coverage-prime leg — but with the pull off its reply is ignored). No
+    // budget: gov invs are batched to ONE getdata per inv message, and the
+    // prime is sent to each peer EXACTLY ONCE per expiry window (send_govsync_prime,
+    // below) because dashd PUNISHES a repeated full govsync with Misbehaving(20).
     bool     m_gov_pull_enabled{false};
     uint64_t m_gov_inv_offered{0};   // inv(gov) SEEN on the wire, pre-dedup
     uint64_t m_gov_inv_seen{0};      // inv(gov) admitted by the dedup (armed)
     uint64_t m_gov_pull_sent{0};     // getdata(gov) invs issued (batched)
+    // E-SUPERBLOCK govsync PRIME bookkeeping: peer_key -> wall-seconds of the
+    // last full govsync(nProp=0) we sent that peer. Enforces the EXACTLY-ONCE-
+    // per-peer-per-window discipline (routing class 3): a repeated full govsync
+    // inside dashd's per-request fulfilled window draws Misbehaving(20) in
+    // CGovernanceManager::SyncObjects, so send_govsync_prime() skips any peer
+    // whose recorded time is within m_govsync_reprime_secs. Mirrors dashcore's
+    // own netfulfilledman HasFulfilledRequest("governance-sync") gate.
+    std::map<std::string, int64_t> m_govsync_primed;   // peer_key -> primed-at
+    int64_t  m_govsync_reprime_secs{3600};             // dashd mainnet 1h expiry
     size_t   m_tx_pull_inflight_cap{64};
     std::map<uint256, int64_t> m_tx_pull_inflight;   // txid -> requested-at
     uint64_t m_tx_inv_offered{0};    // inv(MSG_TX) SEEN on the wire, pre-dedup
@@ -1303,9 +1314,12 @@ public:
         for (const auto& p : m_pool) out.push_back(p->key);
         return out;
     }
-    // NOTE: handshaked_peer_keys() (the HANDSHAKE-COMPLETE peer set the govsync
-    // call site records via note_govsync_requested for the R5 coverage floor)
-    // is defined once below, near the bulk-scheduler peer accessors.
+    // NOTE: handshaked_peer_keys() (the HANDSHAKE-COMPLETE peer set) is defined
+    // once below, near the bulk-scheduler peer accessors. The R5 govsync
+    // coverage floor is NOT recorded from it — it is recorded from the keys
+    // RETURNED by send_govsync_prime() (the peers actually primed this round),
+    // so an already-primed peer that is re-visited does not spuriously re-arm
+    // the quiescence window / re-count as a fresh request.
     /// Per-peer connection age in seconds, in pool order — durability, direct.
     std::vector<int64_t> peer_ages_sec() const
     {
@@ -1727,20 +1741,41 @@ public:
 
     // ── request/response legs — PRIMARY-TARGETED ─────────────────────────
     //
-    // ROUTING POLICY. Every leg below is a QUESTION whose answer must be
-    // matched to the peer that was asked: the ReplyMatcher deferral state lives
-    // on that peer's Connection (p2p_connection.hpp), the historical-mnlistdiff
-    // demux keys on the reply's own content, and fanning a getmnlistd /
-    // getqrinfo / govsync out to N peers would multiply an entire mainnet
-    // governance stream by N for no extra evidence. So they all go to the
-    // PRIMARY peer, and the reply arrives on the primary's socket, where
-    // handle() routes it back to that same session. Non-primary peers are
-    // witnesses: they are never asked a stateful question.
+    // ROUTING POLICY. Three classes of outbound ask, distinguished by how the
+    // ANSWER relates to the peer, NOT by importance:
+    //
+    //   1. STATEFUL, CURSOR-MATCHED -> PRIMARY ONLY. Every leg below is a
+    //      QUESTION whose answer must be matched to the peer that was asked: the
+    //      ReplyMatcher deferral state lives on that peer's Connection
+    //      (p2p_connection.hpp), and getmnlistd / getqrinfo carry a
+    //      requester-supplied baseBlock->block cursor that the reply
+    //      (mnlistdiff / qrinfo) is COMPUTED FROM and must be applied against on
+    //      the asking session. Fanning these out would both mis-route the
+    //      cursor-bound reply and multiply the stream by N. So getheaders /
+    //      getmnlistd / getqrinfo / mempool go to the PRIMARY, and the reply
+    //      arrives on the primary's socket, where handle() routes it back to
+    //      that same session. Non-primary peers are witnesses here.
+    //   2. REPEAT-SAFE COVERAGE BROADCAST -> ALL PEERS. getaddr (discovery
+    //      breadth refills the pool) and won-block relay: the reply carries no
+    //      per-peer matching state, repeats are a protocol non-event, and
+    //      breadth/redundancy is the whole value. Fanned out deliberately.
+    //   3. REPEAT-PUNISHED COVERAGE PRIME -> EACH PEER EXACTLY ONCE. govsync
+    //      (nProp=0): its reply is a full object-inv dump with NO requester
+    //      cursor — bodies merge into the ONE GovernanceStore regardless of
+    //      which session delivered them, so multi-peer coverage is the defence
+    //      against a single peer withholding the winning trigger (R5). But
+    //      unlike getaddr, dashd PUNISHES a repeated full govsync from the same
+    //      address inside the netfulfilledman window with Misbehaving(20)
+    //      (CGovernanceManager::SyncObjects), so it cannot be a plain broadcast.
+    //      send_govsync_prime() (below) sends it to each handshaked peer AT MOST
+    //      ONCE per expiry window — the requester-side mirror of dashcore's own
+    //      CMasternodeSync + netfulfilledman once-per-peer gate.
     //
     // When the primary is lost, another handshaked peer is promoted and
     // m_on_handshake_complete re-fires — which is exactly the re-ask the
-    // single-peer client already performed on every reconnect, so no leg
-    // silently loses its driver.
+    // single-peer client already performed on every reconnect, so no class-1 leg
+    // silently loses its driver; the class-3 prime is idempotent across the
+    // re-fire (already-primed peers are skipped).
 
     /// Send a getheaders request (E2 sync driver seam; unused by E1 run_node).
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
@@ -2267,41 +2302,78 @@ public:
         m_primary->note_request_sent(DatumClass::QrInfo, arrival_now_ms());
     }
 
-    /// Send a govsync (MNGOVERNANCESYNC) — E-SUPERBLOCK governance-object sync
-    /// seam. A zero nProp with an EMPTY bloom filter requests ALL governance
+    /// Send a govsync (MNGOVERNANCESYNC) PRIME — E-SUPERBLOCK governance-object
+    /// sync seam. A zero nProp with an EMPTY bloom filter requests ALL governance
     /// objects + votes; the peer streams them back as govobj / govobjvote
     /// messages, which the handlers above forward into the GovernanceStore.
     ///
-    /// COVERAGE: sends to EVERY handshaked peer, not just m_primary — dashcore
-    /// answers a govsync(nProp=0) with OBJECT invs only (SyncObjects), and the
-    /// R5 completeness predicate (set_superblock_sync_complete_fn) needs
-    /// >= min_peers (2) DISTINCT peers primed before it can flip TRUE. The
-    /// call site records each primed peer via note_govsync_requested (see the
-    /// keys returned by handshaked_peer_keys()). dashd rate-limits full govsync
-    /// per peer, so the re-prime at each handshake completion is safe. Returns
-    /// the number of peers written to (0 = no handshaked peer yet).
-    std::size_t send_govsync()
+    /// COVERAGE-PRIME, EXACTLY ONCE PER PEER (routing class 3). dashcore answers a
+    /// govsync(nProp=0) with OBJECT invs only (SyncObjects), and the R5
+    /// completeness predicate (set_superblock_sync_complete_fn) needs
+    /// >= min_peers (2) DISTINCT peers primed before it can flip TRUE — coverage
+    /// is the defence against a single peer withholding the winning trigger.
+    ///
+    /// But a full govsync must be sent to each peer AT MOST ONCE per expiry
+    /// window: dashd PUNISHES a repeat from the same address inside its
+    /// per-request fulfilled window (Params().FulfilledRequestExpireTime(), 1h on
+    /// mainnet) with Misbehaving(20) in CGovernanceManager::SyncObjects ("Asking
+    /// for the whole list multiple times in a short period of time is no good") —
+    /// five repeats = score 100 = ban. This is the requester-side mirror of
+    /// dashcore's own CMasternodeSync + netfulfilledman
+    /// HasFulfilledRequest("governance-sync") gate. So this primes each handshaked
+    /// peer whose key is not already in m_govsync_primed (within
+    /// m_govsync_reprime_secs), records it, and RETURNS the vector of NEWLY primed
+    /// keys. Invoked from on_handshake_complete: at each new handshake it writes to
+    /// exactly the one new unprimed peer; on primary promotion / a re-fire it
+    /// writes to NOBODY. The R5 coverage is recorded from the RETURNED keys, so it
+    /// accrues peer-by-peer across handshakes without any single call fanning out.
+    std::vector<std::string> send_govsync_prime()
     {
-        std::size_t sent = 0;
+        std::vector<std::string> primed;
+        const int64_t now = now_sec();
         for (auto& p : m_pool) {
             if (!p->handshake.complete()) continue;
+            auto it = m_govsync_primed.find(p->key);
+            if (it != m_govsync_primed.end() &&
+                m_govsync_reprime_secs > 0 &&
+                now - it->second < m_govsync_reprime_secs) {
+                // already primed within the expiry window — a repeat here is
+                // exactly the CGovernanceManager::SyncObjects Misbehaving(20)
+                // hazard, so skip it (dashd's own netfulfilledman once-only gate).
+                continue;
+            }
             auto m = message_govsync::make_raw(
                 uint256::ZERO,           // nProp = 0 => request all objects
                 std::vector<uint8_t>{},  // empty filter vData
                 /*nHashFuncs=*/0u, /*nTweak=*/0u, /*nFlags=*/uint8_t{0});
             p->write(m);
-            ++sent;
+            m_govsync_primed[p->key] = now;
+            primed.push_back(p->key);
         }
-        return sent;
+        return primed;
     }
 
-    /// Per-object vote sync (E-SUPERBLOCK): dashcore serves a governance
-    /// object's VOTES only in reply to a govsync whose nProp is that object's
-    /// hash (CGovernanceManager::SyncSingleObjVotes). A govsync(nProp=0) invs
-    /// OBJECTS only, never their votes, so a trigger's funding votes are
-    /// unreachable until we ask for them by hash. Fired from the govobj handler
-    /// the moment a TRIGGER object is accepted, to every handshaked peer so the
-    /// tally can reach the funding threshold. Bloom filter empty (match none =>
+    /// TEST/DEPLOYMENT SEAM: the govsync-prime re-ask TTL, seconds. Default 3600
+    /// (dashd's mainnet nFulfilledRequestExpireTime). 0 disables the once-only
+    /// guard so every call re-primes — used by the reprime-after-expiry KAT.
+    void set_govsync_reprime_secs(int64_t secs) { m_govsync_reprime_secs = secs; }
+
+    /// Per-object vote sync (E-SUPERBLOCK, routing class 2 for THIS leg): dashcore
+    /// serves a governance object's VOTES only in reply to a govsync whose nProp
+    /// is that object's hash (CGovernanceManager::SyncSingleObjVotes). A
+    /// govsync(nProp=0) invs OBJECTS only, never their votes, so a trigger's
+    /// funding votes are unreachable until we ask for them by hash. Fired from the
+    /// govobj handler the moment a TRIGGER object is accepted, to every handshaked
+    /// peer so the tally can reach the funding threshold.
+    ///
+    /// FANOUT IS SAFE HERE (unlike the nProp=0 prime): SyncSingleObjVotes has NO
+    /// netfulfilledman gate and draws NO Misbehaving penalty — per-object vote
+    /// sync repeats are not punished — and the reply is bounded by one object's
+    /// vote set (the inv handler further collapses N-peer vote invs to one batched
+    /// getdata per vote). Multi-peer vote gathering is the tally defence: a single
+    /// peer withholding a trigger's funding votes must not hold the tally under the
+    /// funding threshold. It fires once per accepted trigger, so it is naturally
+    /// once-per-object, not churn-multiplied. Bloom filter empty (match none =>
     /// send all votes for the object).
     std::size_t send_govsync(const uint256& prop)
     {
