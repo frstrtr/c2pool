@@ -73,11 +73,59 @@ add_library(btclibs STATIC ${sources}) #${SOURCE} ${HEADER})
 # SHA256AutoDetect falls back to the scalar transform -- the proven pre-SIMD path,
 # self-checked by CSHA256::SelfTest and the fold merkle byte-compare. No behavior
 # change on the fleet's Linux build hosts.
-if(NOT MSVC)
-    target_compile_definitions(btclibs PRIVATE USE_ASM ENABLE_SSE41 ENABLE_AVX2 ENABLE_SHANI)
-    set_source_files_properties(crypto/sha256_sse41.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1")
-    set_source_files_properties(crypto/sha256_avx2.cpp  PROPERTIES COMPILE_OPTIONS "-mavx2")
-    set_source_files_properties(crypto/sha256_shani.cpp PROPERTIES COMPILE_OPTIONS "-msse4;-msha")
+# Arch gate: -msse4.1/-mavx2/-msha and the Intel <immintrin.h> intrinsics are
+# x86-ONLY. clang rejects them for arm64-apple-darwin ("unsupported option
+# '-mavx2' for target 'arm64-...'"), which broke the macOS arm64 CI build. Emit
+# the SIMD definitions + flags only for an x86 (Intel/AMD) target. On any other
+# target (Apple Silicon arm64, aarch64, or a universal slice that includes
+# arm64) none of USE_ASM/ENABLE_SSE41/ENABLE_AVX2/ENABLE_SHANI is defined, so
+# every optimized TU compiles to empty (its body is fully #ifdef-wrapped) and
+# SHA256AutoDetect() -- itself gated on HAVE_GETCPUID, which compat/cpuid.h only
+# defines on x86 -- returns the scalar sha256::Transform. The scalar path is
+# self-checked by CSHA256::SelfTest and, on the DASH fold, by the merkle
+# byte-compare, so arm64 stays correct while x86_64 is byte-identical and keeps
+# the SIMD fold path unchanged.
+#
+# On Apple the effective target arch is CMAKE_OSX_ARCHITECTURES (which can be a
+# ";"-separated universal list), not CMAKE_SYSTEM_PROCESSOR -- consult it first.
+# A universal build that names arm64 must not receive x86-only flags (a single
+# COMPILE_OPTIONS cannot be made per-slice), so such builds fall back to scalar.
+set(_btclibs_target_arch "${CMAKE_SYSTEM_PROCESSOR}")
+if(CMAKE_OSX_ARCHITECTURES)
+    set(_btclibs_target_arch "${CMAKE_OSX_ARCHITECTURES}")
+endif()
+set(_btclibs_x86_target FALSE)
+if(_btclibs_target_arch MATCHES "(^|;)(x86_64|amd64|AMD64|x64|i[3-6]86)($|;)")
+    set(_btclibs_x86_target TRUE)
+endif()
+if(_btclibs_target_arch MATCHES "arm64|aarch64|arm")
+    # arm64 present (incl. a universal slice) -> never emit x86-only flags.
+    set(_btclibs_x86_target FALSE)
+endif()
+
+if(NOT MSVC AND _btclibs_x86_target)
+    # Belt-and-suspenders: enable each optimized TU only if the compiler truly
+    # accepts its flag, so an old x86 toolchain missing one extension drops just
+    # that TU (never a macro without its flag). A normal x86 clang/gcc accepts
+    # all three, so the x86_64 build is unchanged from before this gate.
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-msse4.1" BTCLIBS_HAVE_MSSE41)
+    check_cxx_compiler_flag("-mavx2"   BTCLIBS_HAVE_MAVX2)
+    check_cxx_compiler_flag("-msha"    BTCLIBS_HAVE_MSHA)
+
+    target_compile_definitions(btclibs PRIVATE USE_ASM)
+    if(BTCLIBS_HAVE_MSSE41)
+        target_compile_definitions(btclibs PRIVATE ENABLE_SSE41)
+        set_source_files_properties(crypto/sha256_sse41.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1")
+    endif()
+    if(BTCLIBS_HAVE_MAVX2)
+        target_compile_definitions(btclibs PRIVATE ENABLE_AVX2)
+        set_source_files_properties(crypto/sha256_avx2.cpp  PROPERTIES COMPILE_OPTIONS "-mavx2")
+    endif()
+    if(BTCLIBS_HAVE_MSHA)
+        target_compile_definitions(btclibs PRIVATE ENABLE_SHANI)
+        set_source_files_properties(crypto/sha256_shani.cpp PROPERTIES COMPILE_OPTIONS "-msse4;-msha")
+    endif()
 endif()
 # ---------------------------------------------------------------------------
 target_include_directories(btclibs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} util crypto compat)
