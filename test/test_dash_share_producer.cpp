@@ -518,7 +518,7 @@ ProspectiveShareInfo fixture_f1_info() {
 }
 
 const char* F1_REF_STREAM_HEX =
-    "ac2785363c0180b8"                                                  // IDENTIFIER
+    "7242ef345e1bed6b"                                                  // IDENTIFIER
     "0000000000000000000000000000000000000000000000000000000000000000"  // prev None
     "0403010203"                                                        // coinbase VarStr
     "00"                                                                // inner payload None
@@ -539,7 +539,7 @@ const char* F1_REF_STREAM_HEX =
     "01000100010000000000000000000000";                                 // abswork LE (128)
 
 const char* F1_REF_HASH_HEX =
-    "6b97d93ff3b1adad8f4c4d1c0f2fb3cd99ee3ab92a90dd1f83c4faa1a9eaca7e";
+    "ae9fd236e3de3647ce76bf2eb3172ad0ec51d3edba4b231b4b1e2d204771880b";
 
 const char* F1_GENTX_HEX =
     "01000000"                                                          // version 1, type 0
@@ -550,12 +550,12 @@ const char* F1_GENTX_HEX =
     "00e1f50500000000" "066a04deadbeef"                                 // payment 100000000
     "00725d1700000000" "1976a91420cb5c22b1e4d5947e5c112c7696b51ad9af3c6188ac"  // donation 392000000
     "0000000000000000" "2a6a28"
-    "6b97d93ff3b1adad8f4c4d1c0f2fb3cd99ee3ab92a90dd1f83c4faa1a9eaca7e"  // ref_hash
+    "ae9fd236e3de3647ce76bf2eb3172ad0ec51d3edba4b231b4b1e2d204771880b"  // ref_hash
     "0102030405060708"                                                  // last_txout_nonce LE
     "00000000";                                                         // locktime
 
 const char* F1_TXID_HEX =
-    "616583dd0f352b49ef69f04f2b947362bd4d4a9e29a3e7a02654fa095d1e2821";
+    "4cf27aa8726d1df1af549cf905e1b747288dcca9a418f15d052ad45cc0d0b9a0";
 
 constexpr uint64_t F1_NONCE64 = 0x0807060504030201ull;
 
@@ -618,14 +618,14 @@ TEST(DashShareProducerGentx, F2PayloadGolden) {
 
     const uint256 ref_hash = dash::producer::compute_ref_hash(params, info);
     EXPECT_EQ(hex_of(ref_hash),
-              "011b11d0b71be8ab58e2c0bc10c0d0af5ca07a129d2a5879ce695c3db99056b9");
+              "e5efc58b08be49d7bc03b6f1731114d84068346817017465ce07e46c516196e1");
 
     auto gentx = dash::producer::build_gentx(
         info, dash::producer::CumulativeWeights{}, ref_hash, F1_NONCE64, params);
     EXPECT_EQ(gentx.bytes.size(), 194u);
     EXPECT_EQ(gentx.prefix_len, 145u);          // len - 5 (VarStr payload) - 44
     EXPECT_EQ(hex_of(gentx.txid),
-              "cd230eda4487e566d1ea587ff90eee094ef68672ff6c7a1348d92cfe394a68ea");
+              "6835d59cfe4c564b06dc55b3d235fe201869a3aca3c1368eb295a831e8e36239");
     // version int16 / type int16 (dash/data.py:97-98) + payload tail.
     ASSERT_GE(gentx.bytes.size(), 5u);
     EXPECT_EQ(gentx.bytes[0], 0x03); EXPECT_EQ(gentx.bytes[1], 0x00);
