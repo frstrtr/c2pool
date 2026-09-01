@@ -1,0 +1,24 @@
+name: Param Catalog Tripwire
+# Anti-drift guard for the control-plane param catalog: every CLI flag spelling
+# accepted by any of the five node mains must have a matching alias row in
+# src/core/param_catalog.inc, and every catalog alias must exist in its main.
+# Pure grep+parse, no build -- runs in seconds on every PR, so it is immune to
+# the master-push-skips-heavy-Linux hole.
+on:
+  pull_request:
+    branches: [master]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tripwire:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: catalog-completeness tripwire
+        run: python3 ci/check_param_catalog.py

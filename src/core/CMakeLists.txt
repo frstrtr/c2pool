@@ -38,6 +38,10 @@ set(source
     address_utils.hpp address_utils.cpp
     leveldb_store.hpp leveldb_store.cpp
     address_validator.hpp address_validator.cpp
+    # Control-plane settings foundation (M0): declarative param catalog +
+    # monolithic settings-file loader with per-key source, tri-state, money gate.
+    param_catalog.hpp param_catalog.cpp param_catalog.inc
+    settings_file.hpp settings_file.cpp
     boost_throw_exception.cpp
 )
 

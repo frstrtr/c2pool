@@ -411,6 +411,27 @@ target_link_libraries(dash_tx_serve_self_validation_kat
 )
 add_test(NAME dash_tx_serve_self_validation_kat COMMAND dash_tx_serve_self_validation_kat)
 
+# ---- Control-plane M0: money-gate KAT (Qt-free sibling of test_reward_safe_launch)
+# The settings-file loader + param catalog are self-contained (stdlib only), so
+# this test compiles them directly rather than dragging the full core object lib
+# (and its boost/zmq/leveldb deps) into a config-only unit test.
+add_executable(test_reward_safe_file
+    test_reward_safe_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/settings_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/param_catalog.cpp)
+target_include_directories(test_reward_safe_file PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core)
+add_test(NAME test_reward_safe_file COMMAND test_reward_safe_file)
+
+# ---- Control-plane M0: catalog-completeness tripwire (anti-drift, runs offline)
+# Also wired as a GitHub Actions step so it runs on every PR without a build.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME param_catalog_completeness
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_SOURCE_DIR}/ci/check_param_catalog.py)
+endif()
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
