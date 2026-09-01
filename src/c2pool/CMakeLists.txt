@@ -370,6 +370,52 @@ target_link_libraries(c2pool-dash
     ${Boost_LIBRARIES}
 )
 
+# c2pool-bip110: Bitcoin Knots BLAKE2b hard fork (BIP-110) — NEW-LANE slice.
+# BIP-110 swaps Bitcoin's SHA256d PoW for the BLAKE2b commitment pipeline
+# (src/impl/bip110/pow.hpp) and caps block weight (RDTS). This target is the
+# leanest tier (like c2pool-bch --selftest): main_bip110.cpp drives the LIVE
+# CoinParams-bound BLAKE2b block-hash against a real BIP-110 chain block. It
+# compiles ONLY the lane-local BLAKE2b primitive + core/uint256.cpp and links
+# btclibs (SHA256) + json — it never drags in the core OBJECT-lib web_server/
+# stratum tangle, so PER-COIN ISOLATION holds: src/impl/bip110 + this stanza
+# only, no shared-base/core SOURCE edit, no other lane touched. The pool run-
+# loop (embedded sharechain peer + Stratum + won-block dispatch, cloned from the
+# BTC lane) and its Bitcoin Knots 29.4.1 GBT backend land in a later slice.
+# __C2POOL_COIN_BIP110__ is the per-binary isolation define (mirrors the
+# per-coin define pattern used by the other lane targets).
+add_executable(c2pool-bip110
+    main_bip110.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+    ${CMAKE_SOURCE_DIR}/src/core/uint256.cpp
+)
+target_compile_definitions(c2pool-bip110 PRIVATE
+    C2POOL_VERSION="${C2POOL_GIT_VERSION}"
+    __C2POOL_COIN_BIP110__=1
+)
+target_link_libraries(c2pool-bip110
+    btclibs
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+
+# bip110_blake2b_kat: the KILLER known-answer test for the BIP-110 lane.
+#   (A) BLAKE2b primitive vs the RFC 7693 vector; (B) the full BIP-110 block-
+#   hash pipeline reproduces the CANONICAL block hash of two REAL BIP-110 chain
+#   blocks (961640, 963396) byte-for-byte and 961640 satisfies its nBits.
+# Same lean, isolated link set as c2pool-bip110.
+add_executable(bip110_blake2b_kat
+    bip110_blake2b_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+    ${CMAKE_SOURCE_DIR}/src/core/uint256.cpp
+)
+target_compile_definitions(bip110_blake2b_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_blake2b_kat
+    btclibs
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME bip110_blake2b_kat COMMAND bip110_blake2b_kat)
+
 # KAT: pre-anchor header-backfill PARALLEL GETHEADERS WINDOW (extends #1263 /
 # task #151; base PR #1278). Drives the real BulkFetchLane header lane against a
 # scripted peer set: RED (window=1, no disconnect) serializes/wedges on a silent
