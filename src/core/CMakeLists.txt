@@ -42,6 +42,10 @@ set(source
     # monolithic settings-file loader with per-key source, tri-state, money gate.
     param_catalog.hpp param_catalog.cpp param_catalog.inc
     settings_file.hpp settings_file.cpp
+    settings_cli.hpp settings_cli.cpp
+    # Control-plane M1 (SAFE half): READ-ONLY /api/config[/schema] serializers +
+    # DORMANT (unwired) apply-batch validator. See config_endpoint.hpp.
+    config_endpoint.hpp config_endpoint.cpp
     boost_throw_exception.cpp
 )
 

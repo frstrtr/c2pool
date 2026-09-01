@@ -68,6 +68,9 @@
 #include <core/coin/utxo_view_cache.hpp>
 #include <core/coin/utxo_view_db.hpp>
 #include <core/filesystem.hpp>
+#include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
+#include <impl/btc/catalog_defaults.hpp>  // M0b L0 compiled defaults
 #include <core/log.hpp>
 #include <core/netaddress.hpp>
 #include <core/pack.hpp>
@@ -219,6 +222,9 @@ int main(int argc, char* argv[])
     std::string node_owner_address;        // --node-owner-address ADDR: fee destination
     double      dev_donation      = 0.0;   // --give-author PCT: dev donation %
     bool        give_author_set   = false; // true once --give-author/--dev-donation seen
+    std::string settings_path;             // --settings PATH (M0b; empty => default probe)
+    bool        want_dump_config  = false; // --dump-resolved-config (M0b)
+    bool        want_ack_money    = false; // --ack-money-settings (M0b)
 
     for (int i = 1; i < argc; ++i)
     {
@@ -227,6 +233,18 @@ int main(int argc, char* argv[])
         {
             print_usage();
             return 0;
+        }
+        else if (arg == "--settings" && i + 1 < argc)
+        {
+            settings_path = argv[++i];
+        }
+        else if (arg == "--dump-resolved-config")
+        {
+            want_dump_config = true;
+        }
+        else if (arg == "--ack-money-settings")
+        {
+            want_ack_money = true;
         }
         else if (arg == "--data-dir")
         {
@@ -392,6 +410,56 @@ int main(int argc, char* argv[])
             print_usage();
             return 1;
         }
+    }
+
+    // ---- M0b control-plane wiring ------------------------------------------
+    // compiled defaults (L0) -> settings file (L1) -> CLI (L2). No file => a
+    // structural no-op (AbsentOk) so the locals above are today's parse result.
+    // Placed BEFORE the mandatory-bitcoind usage-exit so --dump-resolved-config
+    // works without a coin endpoint (a diagnostic must not require a daemon).
+    {
+        namespace cs = c2pool::settings;
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(c2pool::catalog::C_BTC);
+        c2pool::impl::btc::register_catalog_defaults(rc);
+        cs::CliTracker tracker;
+        cs::scan_cli(argc, argv, c2pool::catalog::Bin::BIN_BTC, tracker, rc);
+        bool fatal = false; std::string err;
+        std::string path = cs::resolve_settings_path(settings_path, fatal, err);
+        if (fatal) { std::cerr << err << "\n"; return 78; }
+        if (want_ack_money) {
+            if (path.empty()) { std::cerr << "settings: --ack-money-settings needs a settings file (--settings PATH)\n"; return 78; }
+            std::cout << cs::SettingsFile::compute_money_ack_hash(path, c2pool::catalog::C_BTC) << "\n";
+            return 0;
+        }
+        int rc_code = cs::wire_settings(path, c2pool::catalog::C_BTC, tracker, rc);
+        if (rc_code != 0) return rc_code;
+        if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
+        // for the read-only control-plane endpoints. COPY (not move): any
+        // file->locals overlay below still reads rc. Startup resolution
+        // unchanged (golden gate byte-identical).
+        c2pool::config_endpoint::publish_resolved(
+            std::make_shared<const cs::ResolvedConfig>(rc),
+            c2pool::catalog::C_BTC, path);
+        // Apply file-sourced (L1) values into the locals the node consumes.
+        auto split_hostport = [](const std::string& v, std::string& h, uint16_t& p) {
+            auto c = v.rfind(':');
+            if (c == std::string::npos) { p = static_cast<uint16_t>(std::stoi(v)); }
+            else { h = v.substr(0, c); p = static_cast<uint16_t>(std::stoi(v.substr(c + 1))); }
+        };
+        if (rc.file_set("web.port"))          http_port = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("stratum.bind"))      split_hostport(rc.get_string("stratum.bind").value_or(""), stratum_addr, stratum_port);
+        if (rc.file_set("sharechain.listen")) { std::string hh; split_hostport(rc.get_string("sharechain.listen").value_or(""), hh, sharechain_port); }
+        if (rc.file_set("daemon_rpc.endpoint")) split_hostport(rc.get_string("daemon_rpc.endpoint").value_or(""), bitcoind_host, bitcoind_port);
+        if (rc.file_set("daemon_rpc.submit_endpoint")) rpc_endpoint = rc.get_string("daemon_rpc.submit_endpoint").value_or(rpc_endpoint);
+        if (rc.file_set("daemon_rpc.auth_file"))       rpc_conf_path = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf_path);
+        if (rc.file_set("coin_p2p.discover") && rc.get_string("coin_p2p.discover").value_or("") == "true") coin_p2p_discover = true;
+        if (rc.file_set("sharechain.network_id")) network_id_hex = rc.get_string("sharechain.network_id").value_or(network_id_hex);
+        if (rc.file_set("sharechain.prefix"))     prefix_hex     = rc.get_string("sharechain.prefix").value_or(prefix_hex);
+        if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
+        if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        if (rc.file_set("money.give_author_pct")) { dev_donation = rc.get_double("money.give_author_pct").value_or(dev_donation); give_author_set = true; }
     }
 
     // The external-bitcoind endpoint is only mandatory when NOT running the
@@ -2539,6 +2607,12 @@ int main(int argc, char* argv[])
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
 #endif
+        // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
+        // (lambdas read the immutable snapshot published in main()). POST
+        // /api/config/apply stays inert (503); runtime mutation not armed.
+        mi->set_config_fns(
+            []() { return c2pool::config_endpoint::resolved_config_json(); },
+            []() { return c2pool::config_endpoint::catalog_schema_json(); });
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
         // Advertise this node's REAL runtime ports on /node_info (was reporting

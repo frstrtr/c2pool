@@ -571,6 +571,24 @@ public:
     void set_embedded_template_fn(embedded_template_fn_t fn) { m_embedded_template_fn = thread_safe_wrap(std::move(fn)); }
     nlohmann::json rest_embedded_template();          // /embedded_template
 
+    // ── Control-plane M1 (SAFE half): READ-ONLY resolved-config + catalog
+    // schema, served over the existing web server via the same set-fn injection
+    // pattern as /embedded_template. Both are pure reads of compiled-in /
+    // startup-resolved data (no node-state coupling, no locks). The two GETs
+    // are loopback-gated in http_session.cpp (like /api/admin/*); a main that
+    // does not install the fns leaves the endpoints unwired -> 404 (harmless).
+    // POST /api/config/apply is answered with an unconditional 503 in
+    // http_session.cpp — runtime mutation is operator-gated and NOT armed here.
+    using config_json_fn_t = std::function<nlohmann::json()>;
+    void set_config_fns(config_json_fn_t config_fn, config_json_fn_t schema_fn) {
+        m_config_fn        = thread_safe_wrap(std::move(config_fn));
+        m_config_schema_fn = thread_safe_wrap(std::move(schema_fn));
+    }
+    bool has_config_fns() const { return static_cast<bool>(m_config_fn)
+                                      && static_cast<bool>(m_config_schema_fn); }
+    nlohmann::json rest_config();          // GET /api/config
+    nlohmann::json rest_config_schema();   // GET /api/config/schema
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -1276,6 +1294,8 @@ private:
     node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
     embedded_oracle_fn_t m_embedded_oracle_fn;  // /embedded_oracle shadow-validator stats (optional)
     embedded_template_fn_t m_embedded_template_fn;  // /embedded_template last-served snapshot (optional)
+    config_json_fn_t m_config_fn;         // GET /api/config — resolved launch config (optional)
+    config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;
@@ -2039,6 +2059,19 @@ public:
 
     // Access the underlying MiningInterface (e.g. for record_found_block)
     MiningInterface* get_mining_interface() const { return mining_interface_.get(); }
+
+    // Actual bound TCP port after start() (resolves an ephemeral port-0 bind to
+    // the OS-assigned port). Used by the in-process HTTP present-check test to
+    // issue a real loopback request; falls back to the requested port_ before
+    // the acceptor is open. Read-only; touches no node state.
+    uint16_t bound_port() const {
+        boost::system::error_code ec;
+        if (acceptor_.is_open()) {
+            auto ep = acceptor_.local_endpoint(ec);
+            if (!ec) return ep.port();
+        }
+        return port_;
+    }
 
 private:
     void accept_connections();

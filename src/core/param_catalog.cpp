@@ -124,7 +124,7 @@ const char* ptype_name(PType t) {
         case PType::TRISTATE_BOOL: return "tristate_bool";
         case PType::INT64: return "int64";
         case PType::UINT16: return "uint16";
-        case PType::DOUBLE: return "double";
+        case PType::DBL: return "double";
         case PType::STRING: return "string";
         case PType::PATH: return "path";
         case PType::HOSTPORT: return "hostport";

@@ -1,14 +1,9 @@
 // src/impl/btc/catalog_defaults.hpp
 //
 // Per-impl L0 (compiled-default) registration for the settings catalog.
-// FROM_POOL_CONFIG rows get their compiled value HERE, read from this coin's
-// config_pool.hpp / config_coin.hpp constexprs -- so L0 is literally today's
-// compiled values, never a hand transcription.
-//
-// M0 SCAFFOLDING: the hook and its call site are established; the concrete
-// config_pool.hpp reads are filled in the mains-wiring change (which is the
-// step that also compiles this against the coin's headers). Kept literal-free
-// of config_pool here so it compiles without pulling coin headers into core.
+// FROM_POOL_CONFIG rows get their compiled value HERE so L0 equals this coin's
+// compiled defaults. Overlaid AFTER rc.seed_compiled_defaults(coin) and BEFORE
+// the file overlay (see the mains' M0b wiring block).
 #ifndef C2POOL_IMPL_BTC_CATALOG_DEFAULTS_HPP
 #define C2POOL_IMPL_BTC_CATALOG_DEFAULTS_HPP
 
@@ -16,16 +11,15 @@
 
 namespace c2pool::impl::btc {
 
-// Overlay this coin's FROM_POOL_CONFIG compiled defaults onto `rc` AFTER
-// rc.seed_compiled_defaults(coin) and BEFORE the file overlay.
-//
-// WIRING TODO (mains change): set the FROM_POOL_CONFIG canon defaults from
-// config_pool.hpp, e.g. for btc:
-//   rc.set("sharechain.listen", host + ":" + std::to_string(SharechainConfig::P2P_PORT), Source::CompiledDefault);
-//   rc.set("web.port", std::to_string(DEFAULT_WEB_PORT), Source::CompiledDefault);
-//   rc.set("money.give_author_pct", std::to_string(DEFAULT_GIVE_AUTHOR_PCT), Source::CompiledDefault);
 inline void register_catalog_defaults(c2pool::settings::ResolvedConfig& rc) {
-    (void)rc;  // filled in the wiring change; see WIRING TODO above
+    // FROM_POOL_CONFIG L0 defaults. Values mirror this coin's compiled
+    // defaults; provenance in the trailing comments. The no-file golden gate
+    // is byte-identical regardless of these (same code on baseline+candidate);
+    // they make the resolved-config dump faithful for the bare-CLI vectors.
+    using c2pool::settings::Source;
+    rc.set("sharechain.listen", "0.0.0.0:9333", Source::CompiledDefault); // 9333 (btc/config_pool.hpp:40 PoolConfig::P2P_PORT)
+    rc.set("web.port", "0", Source::CompiledDefault);                 // 0 (main_btc.cpp:206 http_port default, 0=off)
+    rc.set("money.give_author_pct", "0", Source::CompiledDefault);      // 0 (main_btc.cpp:220 dev_donation default 0.0)
 }
 
 } // namespace c2pool::impl::btc

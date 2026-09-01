@@ -1,0 +1,9 @@
+coin_p2p.discover=true source=cli
+embedded.serve_mempool_txs=false source=cli
+meta.data_dir=<DATADIR> source=cli
+money.give_author_pct=0.1 source=compiled
+money.redistribute=pplns source=cli
+network.testnet=true source=cli
+sharechain.listen=0.0.0.0:8999 source=compiled
+stratum.bind=0.0.0.0:17903 source=cli
+web.port=8081 source=cli

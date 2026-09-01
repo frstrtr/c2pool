@@ -1,0 +1,3 @@
+meta.data_dir=<DATADIR> source=cli
+sharechain.listen=0.0.0.0:9349 source=compiled
+web.port=0 source=compiled

@@ -34,6 +34,9 @@
 #include <c2pool/storage/the_checkpoint.hpp>
 #include <core/pack.hpp>
 #include <core/filesystem.hpp>
+#include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
+#include <impl/ltc/catalog_defaults.hpp>  // M0b L0 compiled defaults
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
@@ -640,6 +643,9 @@ int main(int argc, char* argv[]) {
     std::string payout_address;
     
     std::string config_file;
+    std::string settings_path;          // --settings PATH (M0b TOML; empty => default probe)
+    bool want_dump_config = false;      // --dump-resolved-config (M0b)
+    bool want_ack_money   = false;      // --ack-money-settings (M0b)
     std::string solo_address;
     std::string node_owner_address;
     std::string node_owner_merged_address; // Explicit merged chain (DOGE) address for node fee
@@ -1202,6 +1208,17 @@ int main(int argc, char* argv[]) {
         else if (arg == "--no-console") {
             // c2pool has no interactive console — silently accept
         }
+        // Control-plane (M0b)
+        else if (arg == "--settings" && i + 1 < argc) {
+            settings_path = argv[++i];
+            cli_explicit.insert("settings_path");
+        }
+        else if (arg == "--dump-resolved-config") {
+            want_dump_config = true;
+        }
+        else if (arg == "--ack-money-settings") {
+            want_ack_money = true;
+        }
         else if (arg[0] == '-') {
             LOG_ERROR << "Unknown argument: " << arg;
             return 1;
@@ -1408,6 +1425,60 @@ int main(int argc, char* argv[]) {
             LOG_ERROR << "Failed to load config file '" << config_file << "': " << e.what();
             return 1;
         }
+    }
+
+    // ---- M0b control-plane wiring ------------------------------------------
+    // compiled defaults (L0) -> settings file (L1, TOML) -> CLI (L2). No file =>
+    // a structural no-op (AbsentOk) so the locals/settings above are today's
+    // parse result; the golden gate proves byte identity. MUTUAL EXCLUSION for
+    // this release: if the legacy --config YAML is in use AND a TOML settings
+    // file also resolves, the TOML is SKIPPED with a loud deprecation warning
+    // (YAML alone stays byte-identical; the one-release YAML->L1 translation is
+    // deferred per the plan doc).
+    {
+        namespace cs = c2pool::settings;
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(c2pool::catalog::C_LTC);
+        c2pool::impl::ltc::register_catalog_defaults(rc);
+        cs::CliTracker tracker;
+        cs::scan_cli(argc, argv, c2pool::catalog::Bin::BIN_LTC, tracker, rc);
+        bool fatal = false; std::string err;
+        std::string path = cs::resolve_settings_path(settings_path, fatal, err);
+        if (fatal) { LOG_ERROR << err; return 78; }
+        if (!config_file.empty() && !path.empty()) {
+            LOG_WARNING << "settings: legacy --config YAML (" << config_file
+                        << ") and TOML settings file (" << path
+                        << ") both present; the TOML is SKIPPED this release "
+                           "(YAML takes precedence). Migrate to the TOML settings file.";
+            path.clear();
+        }
+        if (want_ack_money) {
+            if (path.empty()) { LOG_ERROR << "settings: --ack-money-settings needs a TOML settings file (--settings PATH)"; return 78; }
+            std::cout << cs::SettingsFile::compute_money_ack_hash(path, c2pool::catalog::C_LTC) << "\n";
+            return 0;
+        }
+        int rc_code = cs::wire_settings(path, c2pool::catalog::C_LTC, tracker, rc);
+        if (rc_code != 0) return rc_code;
+        if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
+        // for the read-only control-plane endpoints. COPY (not move): any
+        // file->locals overlay below still reads rc. Startup resolution
+        // unchanged (golden gate byte-identical).
+        c2pool::config_endpoint::publish_resolved(
+            std::make_shared<const cs::ResolvedConfig>(rc),
+            c2pool::catalog::C_LTC, path);
+        // Apply file-sourced (L1) values into the locals the node consumes.
+        if (rc.file_set("web.port"))         http_port  = static_cast<int>(rc.get_u16("web.port").value_or(static_cast<uint16_t>(http_port)));
+        if (rc.file_set("web.host"))         http_host  = rc.get_string("web.host").value_or(http_host);
+        if (rc.file_set("stratum.bind")) {
+            std::string v = rc.get_string("stratum.bind").value_or("");
+            auto colon = v.rfind(':'); std::string p = (colon == std::string::npos) ? v : v.substr(colon + 1);
+            if (!p.empty()) stratum_port = std::stoi(p);
+        }
+        if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
+        if (rc.file_set("money.give_author_pct"))    dev_donation   = rc.get_double("money.give_author_pct").value_or(dev_donation);
+        if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        if (rc.file_set("money.payout_address"))     payout_address = rc.get_string("money.payout_address").value_or(payout_address);
     }
 
     // WAIT mode: block genesis share creation until peers deliver the
@@ -1694,6 +1765,12 @@ int main(int argc, char* argv[]) {
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port),
                                      settings->m_testnet, enhanced_node, blockchain);
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
+            // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
+            // (lambdas read the immutable snapshot published in main()). POST
+            // /api/config/apply stays inert (503); runtime mutation not armed.
+            web_server.get_mining_interface()->set_config_fns(
+                []() { return c2pool::config_endpoint::resolved_config_json(); },
+                []() { return c2pool::config_endpoint::catalog_schema_json(); });
             web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
             web_server.get_mining_interface()->set_worker_port(static_cast<uint16_t>(stratum_port));
             web_server.get_mining_interface()->set_p2p_port(static_cast<uint16_t>(p2p_port));

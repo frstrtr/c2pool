@@ -35,6 +35,9 @@
 // Mirrors src/c2pool/main_btc.cpp s target shape.
 
 #include <impl/dgb/node.hpp>
+#include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
+#include <impl/dgb/catalog_defaults.hpp>  // M0b L0 compiled defaults
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/coin/coin_node.hpp>
@@ -1875,6 +1878,12 @@ int run_node(const core::CoinParams& params, bool testnet,
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
 #endif
+        // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
+        // (lambdas read the immutable snapshot published in main()). POST
+        // /api/config/apply stays inert (503); runtime mutation not armed.
+        mi->set_config_fns(
+            []() { return c2pool::config_endpoint::resolved_config_json(); },
+            []() { return c2pool::config_endpoint::catalog_schema_json(); });
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
         // Advertise this node's REAL runtime ports on /node_info (was reporting
@@ -2439,13 +2448,20 @@ int main(int argc, char** argv)
     std::string doge_p2p_address;                 // --doge-p2p-address HOST
     int         doge_p2p_port = 0;                // --doge-p2p-port PORT
     bool        embedded_doge = false;            // --embedded-doge (force embedded DOGE)
+    std::string settings_path;              // --settings PATH (M0b; empty => default probe)
+    bool want_dump_config = false;          // --dump-resolved-config (M0b)
+    bool want_ack_money   = false;          // --ack-money-settings (M0b)
+    // Parse loop. M0b: converted from a chain of independent `if`s to an else-if
+    // chain with a trailing else, so an unknown flag is rejected with a nonzero
+    // exit (matching LTC/BTC) instead of being silently ignored. Every strcmp is
+    // a disjoint literal, so the known-flag behaviour is unchanged.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
             return 0;
         }
-        if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
-        if (std::strcmp(argv[i], "--data-dir") == 0) {
+        else if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
+        else if (std::strcmp(argv[i], "--data-dir") == 0) {
             // Root all per-instance state (LevelDB sharechain, addr store,
             // logs, ...) under PATH so co-located instances don't contend the
             // LevelDB LOCK. Default keeps ~/.c2pool. See #722.
@@ -2455,9 +2471,15 @@ int main(int argc, char** argv)
             }
             core::filesystem::set_data_dir(argv[++i]);
         }
-        if (std::strcmp(argv[i], "--selftest") == 0) want_selftest = true;
-        if (std::strcmp(argv[i], "--run") == 0)      want_run = true;
-        if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--settings") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --settings requires a PATH argument\n"; return 1; }
+            settings_path = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--dump-resolved-config") == 0) want_dump_config = true;
+        else if (std::strcmp(argv[i], "--ack-money-settings") == 0)   want_ack_money = true;
+        else if (std::strcmp(argv[i], "--selftest") == 0) want_selftest = true;
+        else if (std::strcmp(argv[i], "--run") == 0)      want_run = true;
+        else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
             // --stratum [HOST:]PORT — bind a stratum TCP listener for miners.
             const std::string ep = argv[++i];
             const auto colon = ep.find(':');
@@ -2468,7 +2490,7 @@ int main(int argc, char** argv)
                 stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
         }
-        if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc) {
             // --http [HOST:]PORT — bind the operator dashboard + graph_db stats
             // persistence (H-STATS.944). Omit to disable (mirrors --stratum).
             const std::string ep = argv[++i];
@@ -2480,34 +2502,34 @@ int main(int argc, char** argv)
                 http_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
         }
-        if (std::strcmp(argv[i], "--coin-daemon") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--coin-daemon") == 0 && i + 1 < argc) {
             coin_daemon = argv[++i];               // embedded coin-daemon P2P endpoint
         }
-        if (std::strcmp(argv[i], "--coin-magic") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--coin-magic") == 0 && i + 1 < argc) {
             coin_magic = ParseHexBytes(argv[++i]); // network magic (pchMessageStart)
         }
-        if (std::strcmp(argv[i], "--coin-genesis") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--coin-genesis") == 0 && i + 1 < argc) {
             coin_genesis = uint256S(argv[++i]);    // genesis hash for initial getheaders
         }
-        if (std::strcmp(argv[i], "--coin-rpc") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--coin-rpc") == 0 && i + 1 < argc) {
             rpc_endpoint = argv[++i];              // HOST:PORT endpoint override (no secret)
         }
-        if (std::strcmp(argv[i], "--coin-rpc-auth") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--coin-rpc-auth") == 0 && i + 1 < argc) {
             rpc_conf_path = argv[++i];             // path to digibyte.conf (rpcpassword stays in-file)
         }
-        if (std::strcmp(argv[i], "--regtest") == 0)  regtest = true;
-        if (std::strcmp(argv[i], "--regtest-force-won-share") == 0)
+        else if (std::strcmp(argv[i], "--regtest") == 0)  regtest = true;
+        else if (std::strcmp(argv[i], "--regtest-force-won-share") == 0)
             force_won_share = true;                 // gated below: regtest-ONLY
-        if (std::strcmp(argv[i], "--no-p2p-relay") == 0) no_p2p_relay = true;
-        if (std::strcmp(argv[i], "--dev-relax-algo-softforks") == 0) dev_relax_algo_softforks = true;
-        if (std::strcmp(argv[i], "--coin-p2p-discover") == 0) coin_p2p_discover = true;
-        if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--no-p2p-relay") == 0) no_p2p_relay = true;
+        else if (std::strcmp(argv[i], "--dev-relax-algo-softforks") == 0) dev_relax_algo_softforks = true;
+        else if (std::strcmp(argv[i], "--coin-p2p-discover") == 0) coin_p2p_discover = true;
+        else if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc) {
             redistribute_spec = argv[++i];     // pplns|fee|boost|donate or hybrid "boost:70,donate:20"
         }
-        if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc) {
             node_owner_address = argv[++i];    // operator payout addr -> "fee" identity (#307 fee arm)
         }
-        if (std::strcmp(argv[i], "--sharechain-port") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--sharechain-port") == 0 && i + 1 < argc) {
             // --sharechain-port PORT - bind the sharechain (pool P2P) listener on
             // a non-default port so a SECOND isolated c2pool-dgb instance can run
             // on a host where 5024 is already taken (e.g. G3b tuned-net). Default
@@ -2515,16 +2537,67 @@ int main(int argc, char** argv)
             // byte-parity + share_test pins. DGB-fenced opt-in; no shared-base touch.
             sharechain_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         }
-        if (std::strcmp(argv[i], "--merged") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--merged") == 0 && i + 1 < argc) {
             merged_chain_specs.emplace_back(argv[++i]);  // SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]]
         }
-        if (std::strcmp(argv[i], "--doge-p2p-address") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--doge-p2p-address") == 0 && i + 1 < argc) {
             doge_p2p_address = argv[++i];
         }
-        if (std::strcmp(argv[i], "--doge-p2p-port") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--doge-p2p-port") == 0 && i + 1 < argc) {
             doge_p2p_port = std::stoi(argv[++i]);
         }
-        if (std::strcmp(argv[i], "--embedded-doge") == 0) embedded_doge = true;
+        else if (std::strcmp(argv[i], "--embedded-doge") == 0) embedded_doge = true;
+        else {
+            std::cerr << "unknown argument: " << argv[i] << "\n";
+            return 1;
+        }
+    }
+
+    // ---- M0b control-plane wiring ------------------------------------------
+    // compiled defaults (L0) -> settings file (L1) -> CLI (L2). No file => a
+    // structural no-op (AbsentOk) so the locals above are today's parse result.
+    // network.testnet is intentionally unsupported here (DGB hardwires
+    // testnet=false, make_coin_params below): a file that sets it is refused
+    // fail-loud by the loader (not in the DGB catalog mask), never silently.
+    {
+        namespace cs = c2pool::settings;
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(c2pool::catalog::C_DGB);
+        c2pool::impl::dgb::register_catalog_defaults(rc);
+        cs::CliTracker tracker;
+        cs::scan_cli(argc, argv, c2pool::catalog::Bin::BIN_DGB, tracker, rc);
+        bool fatal = false; std::string err;
+        std::string path = cs::resolve_settings_path(settings_path, fatal, err);
+        if (fatal) { std::cerr << err << "\n"; return 78; }
+        if (want_ack_money) {
+            if (path.empty()) { std::cerr << "settings: --ack-money-settings needs a settings file (--settings PATH)\n"; return 78; }
+            std::cout << cs::SettingsFile::compute_money_ack_hash(path, c2pool::catalog::C_DGB) << "\n";
+            return 0;
+        }
+        int rc_code = cs::wire_settings(path, c2pool::catalog::C_DGB, tracker, rc);
+        if (rc_code != 0) return rc_code;
+        if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
+        // for the read-only control-plane endpoints. COPY (not move): any
+        // file->locals overlay below still reads rc. Startup resolution
+        // unchanged (golden gate byte-identical).
+        c2pool::config_endpoint::publish_resolved(
+            std::make_shared<const cs::ResolvedConfig>(rc),
+            c2pool::catalog::C_DGB, path);
+        // Apply file-sourced (L1) values into the locals the node consumes.
+        if (rc.file_set("web.port"))                 http_port = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("sharechain.listen")) {
+            std::string v = rc.get_string("sharechain.listen").value_or("");
+            auto colon = v.rfind(':'); std::string p = (colon == std::string::npos) ? v : v.substr(colon + 1);
+            if (!p.empty()) sharechain_port = static_cast<uint16_t>(std::stoi(p));
+        }
+        if (rc.file_set("coin_p2p.producer_target")) coin_daemon   = rc.get_string("coin_p2p.producer_target").value_or(coin_daemon);
+        if (rc.file_set("daemon_rpc.submit_endpoint")) rpc_endpoint = rc.get_string("daemon_rpc.submit_endpoint").value_or(rpc_endpoint);
+        if (rc.file_set("daemon_rpc.auth_file"))     rpc_conf_path = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf_path);
+        if (rc.file_set("coin_p2p.discover") && rc.get_string("coin_p2p.discover").value_or("") == "true") coin_p2p_discover = true;
+        if (rc.file_set("sharechain.no_p2p_relay") && rc.get_string("sharechain.no_p2p_relay").value_or("") == "true") no_p2p_relay = true;
+        if (rc.file_set("money.redistribute"))       redistribute_spec  = rc.get_string("money.redistribute").value_or(redistribute_spec);
+        if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);

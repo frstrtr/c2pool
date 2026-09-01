@@ -1,0 +1,4 @@
+meta.data_dir=<DATADIR> source=cli
+money.give_author_pct=0.1 source=compiled
+sharechain.listen=0.0.0.0:8999 source=compiled
+web.port=8080 source=compiled
