@@ -7,7 +7,7 @@
 #include <btclibs/util/strencodings.h>
 #include <btclibs/crypto/sha256.h>
 #include <core/uint256.hpp>
-#include <core/donation.hpp>
+#include <impl/bip110/params.hpp>
 
 #include <array>
 #include <cstdint>
@@ -17,7 +17,7 @@
 
 namespace bip110
 {
-    
+
 class PoolConfig : protected core::Fileconfig
 {
 protected:
@@ -31,42 +31,46 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // BTC p2pool network constants (jtoomim/SPB-compat — must match the live
-    // BTC p2pool sharechain at p2p-spb.xyz:9333 + jtoomim-derived peers).
-    // Source: ref/p2pool-btc + p2pool-jtoomim/p2pool/networks/bitcoin.py.
-    // Live network probe 2026-04-28: SPB cluster runs version 77.0.0 with
-    // protocol_version 3502 (one bump above jtoomim master's 3501).
+    // BIP-110 (Bitcoin Knots BLAKE2b hard fork) c2pool sharechain constants.
+    //
+    // SINGLE SOURCE OF TRUTH: every identity value below DERIVES from the
+    // namespace-level SHARECHAIN_* constants in params.hpp (the SSOT), so the
+    // factory (make_coin_params) and this PoolConfig can never drift. BIP-110 is
+    // a NEW sharechain, distinct from the BTC lane: its P2P/worker ports and
+    // identifier/prefix are BIP-110-native (BTC uses 9333 / fc70035c7a81bc6f /
+    // 2472ef181efcd37b), so the sharechain can never merge with, or cross-dial,
+    // the live BTC p2pool network. PREFIX and IDENTIFIER are TWO INDEPENDENT
+    // per-network transport constants (p2pool model) — PREFIX is never derived
+    // from IDENTIFIER. This mirrors the DASH lane's isolation discipline.
     // -----------------------------------------------------------------------
-    static constexpr uint16_t P2P_PORT                  = 9333;  // BTC p2pool sharechain port
-    static constexpr uint32_t SPREAD                    = 3;       // blocks (PPLNS window)
-    static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
-    // MINIMUM 3500 admits jtoomim master (3501) and SPB cluster (3502).
-    // Below that lies forrestv-era v17/v32 — not interoperable with v35.
-    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3500;
-    // Our capability — match SPB cluster's bump for forward-compat.
-    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3502;
-    static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 33;     // jtoomim BTC bitcoin.py:35
-    static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
-    static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;
+    static constexpr uint16_t P2P_PORT                  = SHARECHAIN_P2P_PORT;     // 9335 BIP-110 sharechain P2P port
+    static constexpr uint16_t WORKER_PORT               = SHARECHAIN_WORKER_PORT;  // 9336 BIP-110 Stratum port
+    static constexpr uint32_t SPREAD                    = SHARECHAIN_SPREAD;       // blocks (PPLNS window)
+    static constexpr uint32_t TARGET_LOOKBEHIND         = SHARECHAIN_TARGET_LOOKBEHIND;
+    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = SHARECHAIN_MINIMUM_PROTOCOL_VERSION;
+    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = SHARECHAIN_ADVERTISED_PROTOCOL_VERSION;
+    static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = SHARECHAIN_SEGWIT_ACTIVATION_VERSION;
+    static constexpr uint32_t BLOCK_MAX_SIZE            = SHARECHAIN_BLOCK_MAX_SIZE;
+    // RDTS reduced-data weight cap (800000 WU) while active, until the
+    // 2027-09-01 MTP gate — from params.hpp RDTS_MAX_BLOCK_WEIGHT.
+    static constexpr uint32_t BLOCK_MAX_WEIGHT          = RDTS_MAX_BLOCK_WEIGHT;
 
-    // Mainnet constants — jtoomim BTC bitcoin.py
-    static constexpr uint32_t SHARE_PERIOD              = 30;      // seconds (BTC slower than LTC's 15)
-    static constexpr uint32_t CHAIN_LENGTH              = 8640;    // 24*60*60 / 10
-    static constexpr uint32_t REAL_CHAIN_LENGTH         = 8640;
+    // Mainnet sharechain cadence.
+    static constexpr uint32_t SHARE_PERIOD              = SHARECHAIN_SHARE_PERIOD;   // seconds
+    static constexpr uint32_t CHAIN_LENGTH              = SHARECHAIN_CHAIN_LENGTH;
+    static constexpr uint32_t REAL_CHAIN_LENGTH         = SHARECHAIN_CHAIN_LENGTH;
 
-    // DUST_THRESHOLD: minimum payout per share output.
-    // BTC mainnet: 0.001 BTC = 100000 sat (jtoomim bitcoin/networks/bitcoin.py:32).
-    // Testnet: 1.0 BTC placeholder until jtoomim BTC testnet config is consulted.
-    static constexpr uint64_t DUST_THRESHOLD            = 100000;     // satoshis (BTC mainnet)
-    static constexpr uint64_t TESTNET_DUST_THRESHOLD    = 100000000;  // satoshis placeholder
+    // DUST_THRESHOLD: minimum payout per share output — Bitcoin relay dust floor
+    // (546 sat for a P2PKH output), unchanged by BIP-110. Testnet mirrors mainnet.
+    static constexpr uint64_t DUST_THRESHOLD            = SHARECHAIN_DUST_THRESHOLD;  // satoshis
+    static constexpr uint64_t TESTNET_DUST_THRESHOLD    = SHARECHAIN_DUST_THRESHOLD;
     static uint64_t dust_threshold() { return is_testnet ? TESTNET_DUST_THRESHOLD : DUST_THRESHOLD; }
 
-    // Testnet constants (jtoomim BTC testnet bitcoin/networks/bitcoin_testnet.py
-    // not yet probed; using BTC-mainnet defaults until live testnet network is
-    // selected). Conservative copy of mainnet for now — adjust in B-testnet phase.
-    static constexpr uint32_t TESTNET_SHARE_PERIOD      = 30;
-    static constexpr uint32_t TESTNET_CHAIN_LENGTH      = 8640;
-    static constexpr uint32_t TESTNET_REAL_CHAIN_LENGTH  = 8640;
+    // Testnet constants — BIP-110 testnet mirrors mainnet cadence for now
+    // (adjust in a testnet-bring-up phase). Values still flow from the SSOT.
+    static constexpr uint32_t TESTNET_SHARE_PERIOD      = SHARECHAIN_SHARE_PERIOD;
+    static constexpr uint32_t TESTNET_CHAIN_LENGTH      = SHARECHAIN_CHAIN_LENGTH;
+    static constexpr uint32_t TESTNET_REAL_CHAIN_LENGTH  = SHARECHAIN_CHAIN_LENGTH;
 
     // Runtime testnet flag — set once at startup
     static inline bool is_testnet = false;
@@ -76,52 +80,46 @@ public:
     static uint32_t chain_length()      { return is_testnet ? TESTNET_CHAIN_LENGTH : CHAIN_LENGTH; }
     static uint32_t real_chain_length()  { return is_testnet ? TESTNET_REAL_CHAIN_LENGTH : REAL_CHAIN_LENGTH; }
 
-    // MAX_TARGET: share difficulty floor (easiest allowed share PoW).
-    // BTC mainnet: 2^256 / 2^32 - 1 (≈ 2^224, bdiff 1) — jtoomim BTC bitcoin.py:18
-    //              MAX_TARGET = 2**256//2**32 - 1
-    // Testnet: same as mainnet for now (jtoomim BTC testnet placeholder).
+    // MAX_TARGET: share difficulty floor (easiest allowed share PoW). Bitcoin
+    // powLimit 00000000ffff0000... is unchanged by BIP-110 (CheckProofOfWorkImpl
+    // is untouched); the share floor sits at that limit. From the SSOT hex.
     static uint256 max_target()
     {
         static const uint256 MAINNET_MAX = [] {
             uint256 t;
-            // 2^256 / 2^32 - 1 = 0x00000000ffffffff...ffffffff (224 bits set).
-            t.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            t.SetHex(SHARECHAIN_MAX_TARGET_HEX);
             return t;
         }();
         static const uint256 TESTNET_MAX = [] {
             uint256 t;
-            t.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            t.SetHex(SHARECHAIN_MAX_TARGET_HEX);
             return t;
         }();
         return is_testnet ? TESTNET_MAX : MAINNET_MAX;
     }
 
     // -----------------------------------------------------------------------
-    // Consensus-critical donation scripts
-    // Must match frstrtr/p2pool-merged-v36 p2pool/data.py exactly.
+    // Donation script — DEPLOY-CONFIG-DRIVEN, never a hardcoded money address in
+    // source. Returns EMPTY here, matching params.hpp's donation_script_func: the
+    // KAT/bring-up lane does not mint, and the deploy config supplies the payout
+    // address at runtime (the BIP-110 lane's bech32 destination is provisioned by
+    // the operator, NEVER a cross-coin address baked into the binary). This is the
+    // per-coin-isolation rule: a source-hardcoded cross-coin donation would ship
+    // one lane's money bytes into another.
     // -----------------------------------------------------------------------
-
-    // Donation script — delegated to the chain-agnostic single source of
-    // truth in core::donation. The bytes are coin-invariant (no network
-    // version byte; uniform v36 redeem hash160), so they are no longer
-    // duplicated per-coin. See core/donation.hpp for provenance (forrestv
-    // P2PK pre-v36; combined P2SH 1-of-2 v36+, operator FLAG6 ruling
-    // 2026-06-17 option-b; bitcoin-agnostic re-scope 2026-06-17).
-    static std::vector<unsigned char> get_donation_script(int64_t share_version)
+    static std::vector<unsigned char> get_donation_script(int64_t /*share_version*/)
     {
-        return core::donation::get_donation_script(share_version);
+        return {};
     }
 
-    // Message framing prefix — BTC mainnet (jtoomim bitcoin.py:14):
-    //   PREFIX = '2472ef181efcd37b'
-    static inline const std::string DEFAULT_PREFIX_HEX          = "2472ef181efcd37b";
-    // Testnet placeholder until jtoomim BTC testnet prefix is probed
-    static inline const std::string TESTNET_PREFIX_HEX          = "2472ef181efcd37b";
-    // Network identifier — BTC mainnet (jtoomim bitcoin.py:13):
-    //   IDENTIFIER = 'fc70035c7a81bc6f'
-    static inline const std::string DEFAULT_IDENTIFIER_HEX      = "fc70035c7a81bc6f";
-    // Testnet placeholder
-    static inline const std::string TESTNET_IDENTIFIER_HEX      = "fc70035c7a81bc6f";
+    // Message framing prefix — BIP-110-native (SSOT: params.hpp SHARECHAIN_PREFIX_HEX).
+    static inline const std::string DEFAULT_PREFIX_HEX          = SHARECHAIN_PREFIX_HEX;
+    // Testnet mirrors mainnet (params testnet identity == mainnet).
+    static inline const std::string TESTNET_PREFIX_HEX          = SHARECHAIN_PREFIX_HEX;
+    // Network identifier — BIP-110-native (SSOT: params.hpp SHARECHAIN_IDENTIFIER_HEX).
+    static inline const std::string DEFAULT_IDENTIFIER_HEX      = SHARECHAIN_IDENTIFIER_HEX;
+    // Testnet mirrors mainnet.
+    static inline const std::string TESTNET_IDENTIFIER_HEX      = SHARECHAIN_IDENTIFIER_HEX;
 
     // Private chain overrides — set once at startup via --network-id
     static inline std::string override_identifier_hex;
@@ -197,29 +195,20 @@ public:
         return fp;
     }
 
-    // BTC mainnet softforks per jtoomim bitcoin.py:33 + post-2021 additions.
-    // jtoomim master pre-dates Taproot activation but the bitcoind we connect
-    // to enforces it; tracking it here keeps the softfork-check pass aligned
-    // with bitcoind's getblockchaininfo.
+    // Softforks the BIP-110 chain requires. segwit stays active; blake2b is the
+    // BIP-110 activation (the pool MUST request the "blake2b" GBT rule against a
+    // Knots 29.4.1 backend). Matches params.hpp p.softforks_required.
     static inline const std::set<std::string> SOFTFORKS_REQUIRED = {
-        "bip65", "csv", "segwit", "taproot"
+        "segwit", "blake2b"
     };
 
-    // Default bootstrap peers — live BTC p2pool network (probed 2026-04-28
-    // via http://p2p-spb.xyz:9334/peer_versions). Mix of the SPB-cluster
-    // 77.0.0 fork + jtoomim-master-derived peers + jtoomim BTC bitcoin.py
-    // BOOTSTRAP_ADDRS defaults.
-    static inline const std::vector<std::string> DEFAULT_BOOTSTRAP_HOSTS = {
-        // SPB cluster (4 nodes RU + USA, version 77.0.0)
-        "p2p-spb.xyz",
-        "ekb.p2p-spb.xyz",
-        "rov.p2p-spb.xyz",
-        "usa.p2p-spb.xyz",
-        // jtoomim-master defaults (BOOTSTRAP_ADDRS in bitcoin.py)
-        "ml.toom.im",
-        "btc-fork.coinpool.pw:9335",
-        "btc.p2pool.leblancnet.us",
-    };
+    // Default bootstrap peers — EMPTY. BIP-110 is a fresh sharechain; nodes come
+    // online via peer discovery (NODE-flagged coin-P2P + explicit --sharechain-
+    // addnode). We deliberately ship NO seed hosts here: the live BTC p2pool seed
+    // list (p2p-spb.xyz etc., port 9333) belongs to the BTC lane and must never
+    // be dialed from BIP-110 (prefix mismatch → handshake refusal + addr-book
+    // poisoning). Populate as BIP-110 c2pool nodes are provisioned.
+    static inline const std::vector<std::string> DEFAULT_BOOTSTRAP_HOSTS = {};
 
     // -----------------------------------------------------------------------
     // Runtime config loaded from pool.yaml
@@ -232,14 +221,13 @@ public:
 // ---------------------------------------------------------------------------
 // Sharechain bootstrap-source selection (pure, testable seam)
 //
-// main_btc must decide which sharechain (pool P2P) peers to bootstrap from.
-// Historically the ELSE branch loaded the PUBLIC BTC p2pool seed list
-// (DEFAULT_BOOTSTRAP_HOSTS, port 9333) EVEN when a custom --network-id/--prefix
-// federation identity was set — so a federation node dialed the open network
-// it can never handshake (prefix mismatch → read_prefix disconnect), poisoning
-// its addr book with public peers. This resolver makes the precedence explicit
-// and unit-testable. Defaults (no custom id, no explicit peers) → PublicDefault,
-// byte-identical to prior behavior.
+// main_bip110 must decide which sharechain (pool P2P) peers to bootstrap from.
+// The ELSE branch loads the PUBLIC seed list (DEFAULT_BOOTSTRAP_HOSTS — empty
+// for BIP-110) only when NO custom --network-id/--prefix federation identity is
+// set; a federation node must never dial the open network it cannot handshake
+// (prefix mismatch → read_prefix disconnect), which would poison its addr book.
+// This resolver makes the precedence explicit and unit-testable. Defaults (no
+// custom id, no explicit peers) → PublicDefault.
 // ---------------------------------------------------------------------------
 enum class SharechainBootstrapMode {
     ExplicitPeers,        // --sharechain-addnode/--p2pool given: dial ONLY those
