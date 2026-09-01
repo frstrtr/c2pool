@@ -370,30 +370,43 @@ target_link_libraries(c2pool-dash
     ${Boost_LIBRARIES}
 )
 
-# c2pool-bip110: Bitcoin Knots BLAKE2b hard fork (BIP-110) — NEW-LANE slice.
+# c2pool-bip110: Bitcoin Knots BLAKE2b hard fork (BIP-110) — M1 EMBEDDED lane.
 # BIP-110 swaps Bitcoin's SHA256d PoW for the BLAKE2b commitment pipeline
-# (src/impl/bip110/pow.hpp) and caps block weight (RDTS). This target is the
-# leanest tier (like c2pool-bch --selftest): main_bip110.cpp drives the LIVE
-# CoinParams-bound BLAKE2b block-hash against a real BIP-110 chain block. It
-# compiles ONLY the lane-local BLAKE2b primitive + core/uint256.cpp and links
-# btclibs (SHA256) + json — it never drags in the core OBJECT-lib web_server/
-# stratum tangle, so PER-COIN ISOLATION holds: src/impl/bip110 + this stanza
-# only, no shared-base/core SOURCE edit, no other lane touched. The pool run-
-# loop (embedded sharechain peer + Stratum + won-block dispatch, cloned from the
-# BTC lane) and its Bitcoin Knots 29.4.1 GBT backend land in a later slice.
-# __C2POOL_COIN_BIP110__ is the per-binary isolation define (mirrors the
-# per-coin define pattern used by the other lane targets).
+# (src/impl/bip110/pow.hpp) at Blake2bHeight=961640 and caps block weight (RDTS).
+# M1 is the daemonless SPV header-follower: main_bip110.cpp --run --coin-p2p-
+# discover dials NODE_BLAKE2B (bit 28) peers, downloads v2 headers, and follows
+# the BLAKE2b fork chain past 961640 (NO Knots/bitcoind daemon), exactly as
+# btc.voidbind runs embedded today. --selftest keeps the live BLAKE2b KAT arm.
+# It links the bip110_coin SPV lane (cloned from btc/coin) on top of the shared
+# core/pool/sharechain base — the same core OBJECT-lib web_server/stratum symbol
+# tangle that forces c2pool-btc to pull ltc/payout/merged is resolved by
+# mirroring that link set (documented risk; isolation is held by the per-binary
+# __C2POOL_COIN_BIP110__ define, NOT the link closure). blake2b.c is compiled
+# into the exe (pow.hpp inline callers resolve bip110_blake2b at final link);
+# core provides uint256.cpp so it is NOT compiled a second time here. No shared-
+# base/core SOURCE edit; no other lane touched; per-coin isolation holds. Mining
+# (164-byte template assembly / Knots-GBT backend) is M2+, untouched here.
 add_executable(c2pool-bip110
     main_bip110.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
-    ${CMAKE_SOURCE_DIR}/src/core/uint256.cpp
 )
+c2pool_wire_version(c2pool-bip110)
 target_compile_definitions(c2pool-bip110 PRIVATE
-    C2POOL_VERSION="${C2POOL_GIT_VERSION}"
     __C2POOL_COIN_BIP110__=1
 )
 target_link_libraries(c2pool-bip110
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
     btclibs
+    yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
