@@ -92,9 +92,34 @@
 #include <shared_mutex>
 #include <optional>
 #include <string>
+#include <sstream>
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#ifdef AUX_DOGE
+// ── DGB-as-DOGE-parent embedded merged-mining arm (--merged DOGE) ────────────
+// SLICE 2 of embedded DOGE-on-DGB: arm the DGB parent to produce DOGE aux work
+// DAEMONLESS. Ported verbatim from the live-proven LTC->DOGE parent lane in
+// main_ltc.cpp (mm_manager + doge::coin::AuxChainEmbedded PRIMARY + CoinBroadcaster
+// header sync) and the BTC->NMC #1414 shutdown-join + OOM-residency lessons. The
+// #1413 seams (work_source coinbase splice + per-share try_submit) are already on
+// this base; this arm wires the manager that feeds them. Only compiled into the
+// c2pool-dgb target (AUX_DOGE ON); every other target's main_dgb build is
+// byte-identical to a merged-off node.
+#include <impl/doge/coin/chain_params.hpp>       // doge::coin::DOGEChainParams
+#include <impl/doge/coin/header_chain.hpp>        // doge::coin::HeaderChain (headers-only IndexEntry)
+#include <impl/doge/coin/aux_chain_embedded.hpp>  // doge::coin::AuxChainEmbedded (IAuxChainBackend)
+#include <impl/doge/coin/auxpow_header.hpp>       // parse_doge_headers_message / parse_doge_block
+#include <impl/doge/coin/chain_seeds.hpp>         // doge_dns_seeds / doge_fixed_seeds
+#include <impl/ltc/coin/mempool.hpp>              // ltc::coin::Mempool (DOGE reuses the LTC pool type)
+#include <impl/ltc/config.hpp>                     // ltc::config::P2PData (coin_broadcaster BroadcasterConfig needs it)
+#include <c2pool/merged/merged_mining.hpp>        // MergedMiningManager / AuxChainConfig / AuxChainRPC
+#include <c2pool/merged/coin_broadcaster.hpp>     // CoinBroadcaster / PeerManagerConfig
+#include <core/netaddress.hpp>                    // PeerEndpoint
+#include <boost/asio/thread_pool.hpp>             // header-admission pool (owned at main scope for join)
+#include <boost/asio/post.hpp>
+#endif // AUX_DOGE
 
 #ifndef C2POOL_VERSION
 #define C2POOL_VERSION "dev"
@@ -203,7 +228,11 @@ int run_node(const core::CoinParams& params, bool testnet,
              bool dev_relax_algo_softforks = false,
              bool coin_p2p_discover = false,
              const std::string& http_addr = "0.0.0.0",
-             uint16_t http_port = 0)
+             uint16_t http_port = 0,
+             const std::vector<std::string>& merged_chain_specs = {},
+             const std::string& doge_p2p_address = "",
+             int doge_p2p_port = 0,
+             bool embedded_doge = false)
 {
     io::io_context ioc;
 
@@ -325,6 +354,258 @@ int run_node(const core::CoinParams& params, bool testnet,
     // add_tx and the pool stays empty until that node lands. The selection
     // below is therefore byte-identical to the subsidy-only #237 baseline today.
     dgb::coin::Mempool       mempool;
+
+#ifdef AUX_DOGE
+    // ══════════════════════════════════════════════════════════════════════
+    //  DGB-as-DOGE-parent embedded merged-mining arm (--merged DOGE)  [SLICE 2]
+    // ══════════════════════════════════════════════════════════════════════
+    // Stand up an embedded DOGE aux backend DAEMONLESS (no dogecoind): a
+    // doge::coin::HeaderChain synced over the DOGE P2P network by a
+    // CoinBroadcaster, registered PRIMARY in a MergedMiningManager whose cached
+    // 44-byte AuxPoW commitment the #1413 DGBWorkSource splices into the parent
+    // coinbase. Ported verbatim from the live-proven LTC->DOGE lane
+    // (main_ltc.cpp:5230-5760); the ONLY divergence is DGB-as-parent (DGB is the
+    // proof-of-work chain, DOGE is the aux chain).
+    //
+    // DECLARATION ORDER + LIFETIME (the #1414 SEGV lesson, baked in from the
+    // start): doge_aux_chain / doge_aux_pool / doge_aux_params are declared FIRST
+    // and the header-admission thread pools LAST, so RAII already joins the pools
+    // before the chain dies. Belt-and-suspenders, an EXPLICIT teardown after
+    // ioc.run() (mm_manager.reset -> broadcasters.clear -> pools stop()+join())
+    // drains every in-flight connect/add_headers BEFORE the DOGE HeaderChain is
+    // destroyed — closing the declaration-order use-after-free that SEGV'd the
+    // NMC arm on EVERY clean stop (main_btc.cpp #1414). main_ltc.cpp still carries
+    // that latent bug at its doge_hdr_pool; this main_dgb does not.
+    std::unique_ptr<doge::coin::DOGEChainParams> doge_aux_params;
+    std::unique_ptr<doge::coin::HeaderChain>     doge_aux_chain;
+    std::unique_ptr<ltc::coin::Mempool>          doge_aux_pool;
+    std::unique_ptr<c2pool::merged::MergedMiningManager> mm_manager;
+    std::map<uint32_t, std::unique_ptr<c2pool::merged::CoinBroadcaster>>
+        merged_broadcasters;
+    // SEGV FIX (#1414): own the DOGE header-admission pool(s) at run_node scope so
+    // the explicit teardown can stop()+join() them BEFORE doge_aux_chain is
+    // destroyed. Each pool runs add_headers() on a raw HeaderChain* captured by
+    // the broadcaster's header sink; an unjoined worker touching a freed chain is
+    // the exact UAF #1414 fixed on the BTC/NMC lane.
+    std::vector<std::shared_ptr<boost::asio::thread_pool>> doge_hdr_pools;
+
+    if (!merged_chain_specs.empty()) {
+        mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
+        for (const auto& spec : merged_chain_specs) {
+            // Format: SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]. For the
+            // daemonless DOGE arm only SYMBOL:CHAIN_ID are required (embedded P2P
+            // supplies HOST/PORT via seeds); the RPC fields stay optional so a
+            // digibyted/dogecoind fallback can be added when present.
+            std::vector<std::string> parts;
+            std::string token;
+            std::istringstream ss(spec);
+            while (std::getline(ss, token, ':'))
+                parts.push_back(token);
+            if (parts.size() < 2) {
+                std::cout << "[DGB-MM] invalid --merged spec (need SYMBOL:CHAIN_ID"
+                             "[:HOST:PORT:USER:PASS[:P2P_PORT]]): " << spec
+                          << std::endl;
+                continue;
+            }
+            c2pool::merged::AuxChainConfig cfg;
+            cfg.symbol   = parts[0];
+            try { cfg.chain_id = static_cast<uint32_t>(std::stoul(parts[1])); }
+            catch (...) { std::cout << "[DGB-MM] bad chain_id in spec: " << spec << std::endl; continue; }
+            if (parts.size() >= 4) cfg.rpc_host = parts[2];
+            if (parts.size() >= 4) { try { cfg.rpc_port = static_cast<uint16_t>(std::stoul(parts[3])); } catch (...) {} }
+            if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
+            cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
+
+            if (cfg.symbol == "DOGE" && testnet)
+                cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
+            else if (cfg.symbol == "DOGE")
+                cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
+
+            // P2P port: 7th field override, else the DOGE default (22556 main /
+            // 44556 testnet). The 7th field arms the embedded coin-P2P port.
+            if (parts.size() >= 7 && !parts[6].empty()) {
+                try { cfg.p2p_port = static_cast<uint16_t>(std::stoul(parts[6])); } catch (...) {}
+            } else if (cfg.symbol == "DOGE") {
+                cfg.p2p_port = testnet ? 44556 : 22556;
+            }
+            if (!doge_p2p_address.empty()) cfg.p2p_address = doge_p2p_address;
+            else                           cfg.p2p_address = cfg.rpc_host;  // may be empty => seed-only
+            if (cfg.symbol == "DOGE" && doge_p2p_port > 0)
+                cfg.p2p_port = static_cast<uint16_t>(doge_p2p_port);
+
+            const bool doge_has_p2p = (cfg.p2p_port > 0);
+            if (cfg.symbol == "DOGE" && (embedded_doge || doge_has_p2p) && !doge_aux_chain) {
+                std::cout << "[EMB-DOGE] embedded DOGE aux backend (DGB parent) — "
+                             "no dogecoind; AuxPoW header chain + P2P sync" << std::endl;
+                doge_aux_params = std::make_unique<doge::coin::DOGEChainParams>(
+                    testnet ? doge::coin::DOGEChainParams::testnet()
+                            : doge::coin::DOGEChainParams::mainnet());
+                const std::string doge_net_dir = testnet ? "dogecoin_testnet" : "dogecoin";
+                const std::string doge_db = (core::filesystem::config_path()
+                    / doge_net_dir / "embedded_headers").string();
+                doge_aux_chain = std::make_unique<doge::coin::HeaderChain>(*doge_aux_params, doge_db);
+                if (!doge_aux_chain->init())
+                    std::cout << "[EMB-DOGE] HeaderChain LevelDB init failed — in-memory only" << std::endl;
+
+                // Seed DOGE genesis if empty (dogecoin/src/chainparams.cpp
+                // CreateGenesisBlock: merkle 5b2a3f53..., version 1, bits 0x1e0ffff0;
+                // mainnet nTime 1386325540 nNonce 99943, testnet 1391503289/997879).
+                if (doge_aux_chain->size() == 0) {
+                    ltc::coin::BlockHeaderType g;
+                    g.m_previous_block.SetNull();
+                    g.m_version = 1;
+                    g.m_merkle_root.SetHex("5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69");
+                    g.m_bits = 0x1e0ffff0;
+                    if (testnet) { g.m_timestamp = 1391503289; g.m_nonce = 997879; }
+                    else         { g.m_timestamp = 1386325540; g.m_nonce = 99943;  }
+                    if (doge_aux_chain->add_header(g))
+                        std::cout << "[EMB-DOGE] genesis seeded (height 0)" << std::endl;
+                    else
+                        std::cout << "[EMB-DOGE] genesis seed REJECTED — wrong genesis hash?" << std::endl;
+                } else {
+                    std::cout << "[EMB-DOGE] loaded " << doge_aux_chain->size()
+                              << " headers (height=" << doge_aux_chain->height() << ")" << std::endl;
+                }
+
+                doge_aux_pool = std::make_unique<ltc::coin::Mempool>(core::coin::DOGE_LIMITS);
+
+                // Register the embedded DOGE backend PRIMARY. AuxChainRPC
+                // (dogecoind) is a never-removed FALLBACK only when RPC creds
+                // were supplied; absent them the arm is fully daemonless.
+                {
+                    auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
+                        *doge_aux_chain, *doge_aux_pool, *doge_aux_params, cfg);
+                    mm_manager->add_chain(cfg, std::move(backend));
+                    std::cout << "[DGB-MM] DOGE embedded (primary) chain_id=" << cfg.chain_id << std::endl;
+                    if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                        auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
+                        mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
+                        std::cout << "[DGB-MM] DOGE RPC fallback at " << cfg.rpc_host << ":" << cfg.rpc_port << std::endl;
+                    }
+                }
+
+                // ── CoinBroadcaster: daemonless DOGE header sync over P2P ──────
+                if (cfg.p2p_port > 0) {
+                    const std::vector<std::byte> prefix = testnet
+                        ? ParseHexBytes("fcc1b7dc")   // DOGE testnet3 magic
+                        : ParseHexBytes("c0c0c0c0");  // DOGE mainnet magic
+                    c2pool::merged::PeerManagerConfig pm_cfg;
+                    pm_cfg.is_merged = true;
+                    pm_cfg.max_connection_attempts = 5;
+                    pm_cfg.refresh_interval_sec = 300;
+                    pm_cfg.max_peers = 20;
+                    pm_cfg.min_peers = 4;
+                    pm_cfg.valid_ports = {22556, 44556, 44557};
+                    auto local_daemon = PeerEndpoint::from(cfg.p2p_address, cfg.p2p_port);
+                    auto broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
+                        ioc, cfg.symbol, prefix, std::move(local_daemon),
+                        (net_dir / "doge_bcaster").string(), pm_cfg);
+
+                    broadcaster->peer_manager().set_dns_seeds(
+                        doge::coin::doge_dns_seeds(testnet));
+                    broadcaster->peer_manager().set_fixed_seeds(
+                        doge::coin::doge_fixed_seeds(testnet));
+                    broadcaster->peer_manager().set_http_peer_seeds({{"voidbind.com", 8080}});
+
+                    // Phase 5.8: AuxPoW-aware DOGE header/block parsers. The
+                    // 'headers' message carries AuxPoW-extended headers; the parser
+                    // strips them to 80-byte BASE headers before the HeaderChain,
+                    // so the resident IndexEntry is HEADERS-ONLY (no AuxPow blob
+                    // residency — the OOM-residency requirement is satisfied at the
+                    // parse boundary, mirroring #1414's post-persist blob drop).
+                    broadcaster->set_raw_headers_parser(doge::coin::parse_doge_headers_message);
+                    broadcaster->set_raw_block_parser(doge::coin::parse_doge_block);
+
+                    auto* bcaster_ptr = broadcaster.get();
+                    auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+                    doge_hdr_pools.push_back(doge_hdr_pool);  // owned at run_node scope for join
+
+                    broadcaster->set_on_peer_height(
+                        [dc = doge_aux_chain.get()](uint32_t h) {
+                            dc->set_peer_tip_height(h);
+                        });
+
+                    broadcaster->set_on_new_headers(
+                        [dc = doge_aux_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc](
+                            const std::string& /*key*/,
+                            const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
+                            auto batch = std::make_shared<
+                                std::vector<ltc::coin::BlockHeaderType>>(hdrs);
+                            boost::asio::post(*doge_hdr_pool, [batch, dc, bcaster_ptr, &ioc]() {
+                                int accepted = dc->add_headers(*batch);
+                                if (accepted > 0)
+                                    std::cout << "[EMB-DOGE] add_headers " << accepted << "/"
+                                              << batch->size() << " accepted height="
+                                              << dc->height() << std::endl;
+                                const bool full_batch = (batch->size() >= 2000);
+                                if (accepted > 0 || full_batch) {
+                                    boost::asio::post(ioc, [dc, bcaster_ptr]() {
+                                        try {
+                                            bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
+                                        } catch (const std::exception& e) {
+                                            std::cout << "[EMB-DOGE] header follow-up error: " << e.what() << std::endl;
+                                        }
+                                    });
+                                }
+                            });
+                        });
+
+                    // Periodic getheaders: fast poll (5s) while syncing, slow (60s)
+                    // once caught up. Initial 10s delay lets the broadcaster connect.
+                    auto doge_sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                    auto doge_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                    *doge_sync_fn = [doge_sync_fn, doge_sync_timer,
+                                     dc = doge_aux_chain.get(), bcaster_ptr](boost::system::error_code ec) {
+                        if (ec) return;
+                        int interval = dc->is_synced() ? 60 : 5;
+                        doge_sync_timer->expires_after(std::chrono::seconds(interval));
+                        doge_sync_timer->async_wait(*doge_sync_fn);
+                        try {
+                            bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
+                        } catch (const std::exception& e) {
+                            std::cout << "[EMB-DOGE] header sync error: " << e.what() << std::endl;
+                        }
+                    };
+                    doge_sync_timer->expires_after(std::chrono::seconds(10));
+                    doge_sync_timer->async_wait(*doge_sync_fn);
+
+                    // Start the broadcaster's peer-maintenance loop (DNS/fixed-seed
+                    // dialing, handshake, addr crawl). Without this the getheaders
+                    // above go to 0 peers forever (main_ltc.cpp:6222 does the same).
+                    broadcaster->start();
+                    std::cout << "[EMB-DOGE] daemonless header sync wired via P2P (port "
+                              << cfg.p2p_port << ")" << std::endl;
+
+                    merged_broadcasters[cfg.chain_id] = std::move(broadcaster);
+                }
+            } else {
+                // Non-DOGE or no P2P -> RPC-only add_chain (kept for completeness;
+                // the DGB slice targets DOGE daemonless).
+                mm_manager->add_chain(cfg);
+                std::cout << "[DGB-MM] added " << cfg.symbol << " (chain_id="
+                          << cfg.chain_id << ") via RPC path" << std::endl;
+            }
+        }
+
+        // Start the manager + wire the P2P block relay so a won DOGE block
+        // reaches the DOGE network via the CoinBroadcaster (submit_block_raw).
+        mm_manager->start();
+        std::cout << "[DGB-MM] merged-mining manager started with "
+                  << mm_manager->chain_count() << " chain(s)" << std::endl;
+        if (!merged_broadcasters.empty()) {
+            mm_manager->set_block_relay_fn(
+                [&merged_broadcasters](uint32_t chain_id, const std::string& block_hex) {
+                    auto it = merged_broadcasters.find(chain_id);
+                    if (it == merged_broadcasters.end()) return;
+                    try {
+                        it->second->submit_block_raw(ParseHex(block_hex));
+                    } catch (const std::exception& e) {
+                        std::cout << "[DGB-MM] P2P relay failed: " << e.what() << std::endl;
+                    }
+                });
+        }
+    }
+#endif // AUX_DOGE
 
     // Embedded in-process work source: assembles GBT-compatible templates
     // ENTIRELY from embedded chain state + the coin subsidy schedule (no
@@ -940,6 +1221,16 @@ int run_node(const core::CoinParams& params, bool testnet,
     auto work_source = std::make_shared<dgb::stratum::DGBWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
+
+#ifdef AUX_DOGE
+    // Arm the #1413 DGBWorkSource merged-mining seams: once bound, every built
+    // coinbase splices the cached 44-byte DOGE AuxPoW commitment and every
+    // accepted share drives try_submit_merged_blocks. Null unless a --merged DOGE
+    // spec stood up mm_manager above (then the coinbase is byte-identical to a
+    // standalone DGB node — the structural no-op path proven in #1413's KAT).
+    if (mm_manager)
+        work_source->set_merged_mining_manager(mm_manager.get());
+#endif // AUX_DOGE
 
     // -- External-daemon GBT tip fallback bind (the fallback V36 mandates PERSIST)
     // While the embedded HeaderChain is unfed (tip_hash()==nullopt -- the live
@@ -2080,6 +2371,29 @@ int run_node(const core::CoinParams& params, bool testnet,
     stratum_server.reset();
     web_server.reset();
 
+#ifdef AUX_DOGE
+    // ── SEGV FIX (#1414): controlled DOGE-arm teardown BEFORE the embedded DOGE
+    // HeaderChain (doge_aux_chain) is destroyed by end-of-scope RAII ────────────
+    //   1. drop mm_manager first — its poll thread references the broadcasters
+    //      via set_block_relay_fn, so it must stop before they die.
+    //   2. clear the broadcasters — stops their network/peer threads and releases
+    //      the header-sink lambdas that post add_headers() batches to the pools,
+    //      so no new admission work can be queued after this point.
+    //   3. stop()+join() every header-admission pool — discards queued batches and
+    //      drains any in-flight add_headers()/connect so no worker thread is still
+    //      touching doge_aux_chain.
+    // Only after all three is it safe for doge_aux_chain / doge_aux_pool to be
+    // destroyed at scope exit. Without this ordering a pool worker admitting a
+    // header batch races the chain's destructor -> use-after-free (the SEGV on
+    // every clean stop of the NMC arm, main_btc.cpp #1414).
+    if (mm_manager) mm_manager.reset();
+    merged_broadcasters.clear();
+    for (auto& p : doge_hdr_pools) {
+        if (p) { p->stop(); p->join(); }
+    }
+    doge_hdr_pools.clear();
+#endif // AUX_DOGE
+
     std::cout << "[DGB] io_context stopped — clean exit" << std::endl;
     return 0;
 }
@@ -2123,6 +2437,17 @@ int main(int argc, char** argv)
     // taproot (a real consensus floor; operator-gated, not relaxed here).
     bool dev_relax_algo_softforks = false;  // --dev-relax-algo-softforks (dev boot aid)
     bool coin_p2p_discover = false;         // --coin-p2p-discover: DGB-isolated scored/diverse coin-network peer discovery (network-standalone arm; independent of local digibyted)
+    // ── DGB-as-DOGE-parent embedded merged-mining arm (--merged DOGE) [SLICE 2] ──
+    // --merged SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]] stands up an
+    // embedded DOGE aux backend DAEMONLESS (DOGE chain_id=98, P2P port 22556). The
+    // 7th field arms the embedded coin-P2P port. --doge-p2p-address / --doge-p2p-port
+    // override the peer target; --embedded-doge forces the embedded path even when
+    // no P2P port is derivable. Absent --merged the run is byte-identical to a
+    // standalone DGB node. Only active when built with -DAUX_DOGE (c2pool-dgb target).
+    std::vector<std::string> merged_chain_specs;  // --merged SPEC entries
+    std::string doge_p2p_address;                 // --doge-p2p-address HOST
+    int         doge_p2p_port = 0;                // --doge-p2p-port PORT
+    bool        embedded_doge = false;            // --embedded-doge (force embedded DOGE)
     std::string settings_path;              // --settings PATH (M0b; empty => default probe)
     bool want_dump_config = false;          // --dump-resolved-config (M0b)
     bool want_ack_money   = false;          // --ack-money-settings (M0b)
@@ -2212,6 +2537,16 @@ int main(int argc, char** argv)
             // byte-parity + share_test pins. DGB-fenced opt-in; no shared-base touch.
             sharechain_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         }
+        else if (std::strcmp(argv[i], "--merged") == 0 && i + 1 < argc) {
+            merged_chain_specs.emplace_back(argv[++i]);  // SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]]
+        }
+        else if (std::strcmp(argv[i], "--doge-p2p-address") == 0 && i + 1 < argc) {
+            doge_p2p_address = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--doge-p2p-port") == 0 && i + 1 < argc) {
+            doge_p2p_port = std::stoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "--embedded-doge") == 0) embedded_doge = true;
         else {
             std::cerr << "unknown argument: " << argv[i] << "\n";
             return 1;
@@ -2280,7 +2615,9 @@ int main(int argc, char** argv)
                         regtest, force_won_share, no_p2p_relay,
                         redistribute_spec, node_owner_address, dev_relax_algo_softforks,
                         coin_p2p_discover,
-                        http_addr, http_port);
+                        http_addr, http_port,
+                        merged_chain_specs, doge_p2p_address, doge_p2p_port,
+                        embedded_doge);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
