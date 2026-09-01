@@ -1053,6 +1053,17 @@ public:
     using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
     void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
 
+    /// Retain the block-header field lookups so paths OTHER than the one-shot
+    /// startup backfill can re-derive a missing network_difficulty from the
+    /// header chain. backfill_block_fields runs exactly once, before the
+    /// sharechain-replay / relay hooks record blocks won during the process's
+    /// own uptime, so a block learned AFTER backfill (e.g. a peer-relayed win
+    /// replayed 37s into boot) never gets its difficulty filled and its luck is
+    /// lost for the life of the process. record_found_block and the confirm
+    /// lane consult these to close that window. Coin-generic; wire once beside
+    /// backfill_block_fields (same header chain, same lambdas).
+    void set_block_field_lookups(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
+
 private:
     /// #159 (G3): recompute the DERIVED found-block fields (time_to_find,
     /// expected_time, luck) that are never persisted, from the height-ordered
@@ -1422,6 +1433,13 @@ private:
     // Persistent found block storage (Layer +2) — functional callbacks
     block_store_fn_t m_persist_block_fn;   // called on record + status change
     block_load_fn_t  m_load_blocks_fn;     // called on startup
+
+    // Retained block-header field lookups (set_block_field_lookups). Let the
+    // record + confirm paths re-derive a missing network_difficulty by block
+    // hash after the one-shot startup backfill has already run. Guarded by
+    // m_blocks_mutex at the call sites (same discipline as backfill_block_fields).
+    block_diff_lookup_fn m_block_diff_lookup_fn;
+    block_ts_lookup_fn   m_block_ts_lookup_fn;
 
     std::shared_ptr<void> m_merged_block_store;  // MergedBlockStore (opaque)
     coin_peer_info_fn m_ltc_peer_info_fn;
