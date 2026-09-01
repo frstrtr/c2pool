@@ -157,6 +157,211 @@ bool witness_nonce_ok(const std::vector<unsigned char>& blk, std::string& witnes
     return true;
 }
 
+// ── REWARD SPLIT (money completion): mirror of the work source's per-block split
+// build_connection_coinbase (src/impl/bip110/stratum/work_source.cpp). Kept
+// byte-identical to the live routing so the KAT proves the SAME arithmetic that
+// mints real coinbases: integer FLOOR division, miner absorbs the remainder,
+// single-key donation+owner consolidation. ──
+struct SplitOut {
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;  // [miner (, owner)]
+    uint64_t                    donation_amt{0};
+    std::vector<unsigned char>  donation;
+    uint64_t                    don{0};    // author donation component
+    uint64_t                    owner{0};  // node-owner fee component
+    uint64_t                    miner{0};  // miner remainder
+    bool                        consolidated{false};
+};
+
+SplitOut split_reward(uint64_t subsidy,
+                      const std::vector<unsigned char>& payout_script,
+                      const std::vector<unsigned char>& donation_script,
+                      const std::vector<unsigned char>& node_owner_script,
+                      uint64_t give_author_ppm, uint64_t node_owner_fee_ppm)
+{
+    SplitOut o; o.donation = donation_script;
+    const std::vector<unsigned char>& owner_script =
+        !node_owner_script.empty() ? node_owner_script : donation_script;
+    if (!payout_script.empty()) {
+        o.don   = (!donation_script.empty() && give_author_ppm > 0)
+                ? (subsidy * give_author_ppm / 1000000ULL) : 0;          // floor
+        o.owner = (!owner_script.empty() && node_owner_fee_ppm > 0)
+                ? (subsidy * node_owner_fee_ppm / 1000000ULL) : 0;       // floor
+        o.miner = subsidy - o.don - o.owner;                             // remainder
+        o.payouts.emplace_back(payout_script, o.miner);
+        const bool same_key = (!owner_script.empty()
+                            && !donation_script.empty()
+                            && owner_script == donation_script);
+        if (o.owner > 0 && same_key) {
+            o.donation_amt = o.don + o.owner; o.donation = donation_script; o.consolidated = true;
+        } else {
+            o.donation_amt = o.don; o.donation = donation_script;
+            if (o.owner > 0) o.payouts.emplace_back(owner_script, o.owner);
+        }
+    } else if (!donation_script.empty()) {
+        o.donation_amt = subsidy; o.donation = donation_script; o.don = subsidy;
+    }
+    if (o.donation.empty()) o.donation = {0x6a};
+    return o;
+}
+
+// Read a Bitcoin varint at offset `p`, advancing it.
+uint64_t read_varint(const std::vector<unsigned char>& b, size_t& p)
+{
+    uint8_t c = b[p++];
+    if (c < 0xfd) return c;
+    if (c == 0xfd) { uint64_t v = b[p] | (b[p+1] << 8); p += 2; return v; }
+    if (c == 0xfe) { uint64_t v = 0; for (int i=0;i<4;++i) v |= (uint64_t)b[p+i] << (8*i); p += 4; return v; }
+    uint64_t v = 0; for (int i=0;i<8;++i) v |= (uint64_t)b[p+i] << (8*i); p += 8; return v;
+}
+
+// Parse the NON-WITNESS coinbase serialization and return every vout value in
+// order (value(8 LE) | script(VarStr)). Independent of the assembler internals:
+// walks version|vin|vout to sum the on-wire output values — the reward-safety
+// proof that Σ(outputs) == subsidy exactly.
+std::vector<uint64_t> parse_vout_values(const std::vector<unsigned char>& tx)
+{
+    std::vector<uint64_t> out;
+    size_t p = 4;                                   // skip version(4)
+    uint64_t vin = read_varint(tx, p);
+    for (uint64_t i = 0; i < vin; ++i) {
+        p += 32 + 4;                                // prevhash + index
+        uint64_t sl = read_varint(tx, p); p += sl;  // scriptSig
+        p += 4;                                     // sequence
+    }
+    uint64_t vout = read_varint(tx, p);
+    for (uint64_t i = 0; i < vout; ++i) {
+        uint64_t v = 0; for (int k=0;k<8;++k) v |= (uint64_t)tx[p+k] << (8*k); p += 8;
+        out.push_back(v);
+        uint64_t sl = read_varint(tx, p); p += sl;  // scriptPubKey
+    }
+    return out;
+}
+
+// Assemble the coinbase for a given split (mirrors the work source's call to
+// assemble_gentx_coinbase) and return the non-witness bytes.
+std::vector<unsigned char> assemble_for_split(uint32_t height, const SplitOut& s)
+{
+    std::vector<unsigned char> cb_script;
+    {
+        uint32_t h = height;
+        std::vector<unsigned char> he;
+        while (h) { he.push_back(h & 0xff); h >>= 8; }
+        if (he.empty() || (he.back() & 0x80)) he.push_back(0x00);
+        cb_script.push_back(static_cast<unsigned char>(he.size()));
+        cb_script.insert(cb_script.end(), he.begin(), he.end());
+        const char* tag = "/c2pool-bip110/";
+        for (const char* c = tag; *c; ++c) cb_script.push_back((unsigned char)*c);
+    }
+    std::vector<unsigned char> wroot(32, 0);
+    {
+        std::vector<unsigned char> pre(64, 0);
+        unsigned char a[32], b[32];
+        CSHA256().Write(pre.data(), pre.size()).Finalize(a);
+        CSHA256().Write(a, 32).Finalize(b);
+        std::memcpy(wroot.data(), b, 32);
+    }
+    std::vector<unsigned char> scv = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+    scv.insert(scv.end(), wroot.begin(), wroot.end());
+    std::optional<std::vector<unsigned char>> segwit_commit = scv;
+    std::vector<unsigned char> op_return = {0x6a, 0x00};
+    return bip110::coin::assemble_gentx_coinbase(
+        cb_script, segwit_commit, s.payouts, s.donation_amt, s.donation, op_return).bytes;
+}
+
+void test_reward_split()
+{
+    std::printf("[C] reward split (author 0.1%% + node-owner fee + consolidation):\n");
+    const uint32_t height  = 961700;
+    const uint64_t subsidy = 312500000ULL;   // 3.125 BTC exact
+
+    // P2PKH scripts: miner, donation (our single key), a distinct node-owner key.
+    auto p2pkh = [](unsigned char fill){ std::vector<unsigned char> s = {0x76,0xa9,0x14};
+        for (int i=0;i<20;++i) s.push_back(fill); s.push_back(0x88); s.push_back(0xac); return s; };
+    const std::vector<unsigned char> miner = p2pkh(0x11);
+    const std::vector<unsigned char> donat = p2pkh(0x22);   // 13zQ/bc1qyr94… stand-in
+    const std::vector<unsigned char> owner = p2pkh(0x33);   // distinct node-owner
+    const std::vector<unsigned char> none;                  // empty
+
+    auto sum_vec = [](const std::vector<uint64_t>& v){ uint64_t t=0; for (auto x:v) t+=x; return t; };
+
+    // (1) give-author 0.1% (1000 ppm), fee 0, donation set, normal miner payout.
+    {
+        SplitOut s = split_reward(subsidy, miner, donat, none, 1000, 0);
+        auto tx = assemble_for_split(height, s);
+        auto vals = sum_vec(parse_vout_values(tx));
+        std::printf("         (1) 0.1%%: don=%llu miner=%llu Σ=%llu\n",
+                    (unsigned long long)s.don, (unsigned long long)s.miner, (unsigned long long)vals);
+        expect("(1) donation == coinbasevalue/1000", s.don == subsidy / 1000ULL);
+        expect("(1) donation_amt output == don", s.donation_amt == s.don);
+        expect("(1) miner == cb - don", s.miner == subsidy - s.don);
+        expect("(1) node-owner default 0 => single miner output", s.payouts.size() == 1);
+        expect("(1) Σ(all vout values) == subsidy EXACT", vals == subsidy);
+    }
+
+    // (2) give-author 0, fee 0, donation set, normal payout => miner gets it all,
+    //     donation output present but 0-value (author split absorbs NOTHING).
+    {
+        SplitOut s = split_reward(subsidy, miner, donat, none, 0, 0);
+        auto vals = sum_vec(parse_vout_values(assemble_for_split(height, s)));
+        expect("(2) give-author 0 => miner == subsidy", s.miner == subsidy);
+        expect("(2) give-author 0 => donation output == 0", s.donation_amt == 0);
+        expect("(2) Σ == subsidy EXACT", vals == subsidy);
+    }
+
+    // (3) give-author 0, EMPTY miner payout => donation absorbs the empty payout
+    //     (fallback), the ONLY case a 0.1%-less donation carries value.
+    {
+        SplitOut s = split_reward(subsidy, none, donat, none, 0, 0);
+        auto vals = sum_vec(parse_vout_values(assemble_for_split(height, s)));
+        expect("(3) empty payout => donation absorbs full subsidy", s.donation_amt == subsidy);
+        expect("(3) empty payout => no miner output", s.payouts.empty());
+        expect("(3) Σ == subsidy EXACT", vals == subsidy);
+    }
+
+    // (4) CONSOLIDATION: give-author 0.1% + fee 1%, node-owner == donation (single
+    //     key) => ONE combined output (don+owner), miner is the only payout vout.
+    {
+        SplitOut s = split_reward(subsidy, miner, donat, none, 1000, 10000);
+        auto vals = sum_vec(parse_vout_values(assemble_for_split(height, s)));
+        std::printf("         (4) consolidated: don=%llu owner=%llu combined=%llu miner=%llu Σ=%llu\n",
+                    (unsigned long long)s.don, (unsigned long long)s.owner,
+                    (unsigned long long)s.donation_amt, (unsigned long long)s.miner,
+                    (unsigned long long)vals);
+        expect("(4) consolidated flag set (same key)", s.consolidated);
+        expect("(4) combined donation output == don + owner", s.donation_amt == s.don + s.owner);
+        expect("(4) owner == subsidy/100 (1%)", s.owner == subsidy / 100ULL);
+        expect("(4) only the miner is a payout vout (owner folded in)", s.payouts.size() == 1);
+        expect("(4) miner == cb - don - owner", s.miner == subsidy - s.don - s.owner);
+        expect("(4) Σ == subsidy EXACT", vals == subsidy);
+    }
+
+    // (5) DISTINCT node-owner key => TWO outputs (donation + owner), not folded.
+    {
+        SplitOut s = split_reward(subsidy, miner, donat, owner, 1000, 10000);
+        auto vals = sum_vec(parse_vout_values(assemble_for_split(height, s)));
+        expect("(5) distinct owner key => NOT consolidated", !s.consolidated);
+        expect("(5) donation output == don only", s.donation_amt == s.don);
+        expect("(5) miner + owner are separate payouts", s.payouts.size() == 2);
+        expect("(5) owner payout value == owner", s.payouts.back().second == s.owner);
+        expect("(5) Σ == subsidy EXACT", vals == subsidy);
+    }
+
+    // (6) FLOOR + remainder: a ppm that does NOT divide evenly (333 ppm) — the
+    //     donation floors DOWN and the miner absorbs the dropped fraction; Σ stays
+    //     exact (no burn, no over-claim).
+    {
+        const uint64_t ppm = 333;                        // 0.0333%
+        SplitOut s = split_reward(subsidy, miner, donat, none, ppm, 0);
+        auto vals = sum_vec(parse_vout_values(assemble_for_split(height, s)));
+        // 312500000 * 333 / 1e6 = 104062.5 -> floor 104062
+        expect("(6) donation floored (integer division, no float)",
+               s.don == subsidy * ppm / 1000000ULL);
+        expect("(6) donation floored to 104062", s.don == 104062ULL);
+        expect("(6) miner absorbs the remainder", s.miner == subsidy - s.don);
+        expect("(6) Σ == subsidy EXACT (remainder not burned)", vals == subsidy);
+    }
+}
+
 // ── (A) WORK-SHAPE against real block 961640 ────────────────────────────────
 void test_workshape_961640()
 {
@@ -345,6 +550,7 @@ int main()
     std::printf("=== bip110_m2_workshape_kat ===\n");
     test_workshape_961640();
     test_submit_roundtrip();
+    test_reward_split();
     if (g_fail == 0) {
         std::printf("RESULT: PASS — M2 work-shape + submit-roundtrip reproduced end to end.\n");
         return 0;

@@ -179,22 +179,65 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         segwit_commit = std::move(sc);
     }
 
-    // ── DEFECT 2 BURN GUARD ──────────────────────────────────────────────────
-    // A coinbase whose only value-bearing outputs are the miner payout and the
-    // node-owner donation must pay the ENTIRE subsidy to one of them. If the
-    // miner's payout script failed to resolve (empty) AND no donation address is
-    // configured, every value-bearing output would be 0 and a found block would
-    // silently BURN the whole subsidy. Refuse to serve such work — return an
-    // empty CoinbaseResult (empty coinb1), which the core treats exactly like a
-    // not-yet-synced template and suppresses the job. Never serve all-zero work.
+    // ── PER-BLOCK REWARD SPLIT (author donation + node-owner fee) + BURN GUARD ─
+    // Integer FLOOR division ONLY (no float): the miner absorbs every remainder
+    // (never burned, never over-claimed). Σ(all value outputs) == subsidy EXACTLY.
+    //
+    //   don   = subsidy * give_author_ppm  / 1e6   (0 if no donation script)
+    //   owner = subsidy * node_owner_fee_ppm / 1e6 (0 if no owner script)
+    //   miner = subsidy - don - owner               (remainder to the miner)
+    //
+    // The node-owner fee is paid to node_owner_script_ when set, otherwise to the
+    // donation script (single-key consolidation: our 13zQ/bc1qyr94… key). When the
+    // owner destination EQUALS the donation destination, don+owner are summed into
+    // ONE output (saves a whole vout under the RDTS 800000 WU cap) rather than two.
+    //
+    // DEFECT 2 BURN GUARD: if the miner's payout script failed to resolve (empty)
+    // AND no donation address is configured, every value-bearing output would be 0
+    // and a found block would silently BURN the whole subsidy. Refuse to serve
+    // such work — return an empty CoinbaseResult (empty coinb1), which the core
+    // treats exactly like a not-yet-synced template and suppresses the job.
+    const uint64_t subsidy = w.subsidy;
+    const std::vector<unsigned char>& owner_script =
+        !node_owner_script_.empty() ? node_owner_script_ : donation_script_;
+
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;
     uint64_t donation_amt = 0;
     std::vector<unsigned char> donation = donation_script_;
-    if (!payout_script.empty())
-        payouts.emplace_back(payout_script, w.subsidy);
-    else if (!donation.empty())
-        donation_amt = w.subsidy;                 // no miner script -> all to donation
-    else {
+
+    if (!payout_script.empty()) {
+        // NORMAL MINING: split the subsidy between miner, author donation, owner.
+        uint64_t don   = (!donation_script_.empty() && give_author_ppm_ > 0)
+                       ? (subsidy * give_author_ppm_ / 1000000ULL) : 0;   // floor
+        uint64_t owner = (!owner_script.empty() && node_owner_fee_ppm_ > 0)
+                       ? (subsidy * node_owner_fee_ppm_ / 1000000ULL) : 0; // floor
+        if (don + owner >= subsidy) {
+            LOG_ERROR << "[BIP110-WS] REFUSING work: author+owner split (" << don << "+"
+                      << owner << ") >= subsidy " << subsidy << " — would leave the miner "
+                         "<= 0 (height=" << w.height << "). Lower --give-author / --fee.";
+            return CoinbaseResult{};
+        }
+        uint64_t miner = subsidy - don - owner;    // remainder absorbs all rounding
+        payouts.emplace_back(payout_script, miner);
+
+        // Consolidate the author donation and the node-owner fee when they share a
+        // key; otherwise emit a separate node-owner output.
+        const bool same_key = (!owner_script.empty()
+                            && !donation_script_.empty()
+                            && owner_script == donation_script_);
+        if (owner > 0 && same_key) {
+            donation_amt = don + owner;            // ONE consolidated output
+            donation     = donation_script_;
+        } else {
+            donation_amt = don;                    // author donation output (may be 0)
+            donation     = donation_script_;
+            if (owner > 0)                          // separate node-owner output
+                payouts.emplace_back(owner_script, owner);
+        }
+    } else if (!donation_script_.empty()) {
+        donation_amt = subsidy;                    // no miner script -> all to donation
+        donation     = donation_script_;
+    } else {
         LOG_ERROR << "[BIP110-WS] REFUSING work: miner payout script empty AND no "
                      "donation/node-owner address configured — serving would burn the "
                      "entire subsidy (height=" << w.height << "). Set --node-owner-address.";

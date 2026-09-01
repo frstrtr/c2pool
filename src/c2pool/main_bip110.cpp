@@ -28,10 +28,15 @@
 #include <core/netaddress.hpp>
 #include <core/stratum_server.hpp>
 #include <core/log.hpp>
+#include <core/param_catalog.hpp>           // M0b catalog: C_BIP110 / BIN_BIP110
+#include <core/settings_file.hpp>           // M0b resolved-config (give_author / fee L0)
+#include <impl/bip110/catalog_defaults.hpp> // M0b L0 compiled defaults (author 0.1%)
 
 #include <boost/asio.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -203,7 +208,9 @@ int run_embedded(bool coin_p2p_discover,
                  bool fork_checkpoint,
                  const std::string& http_host, uint16_t http_port,
                  uint16_t stratum_port,
-                 const std::string& donation_address)
+                 const std::string& donation_address,
+                 double give_author_pct,
+                 double node_owner_fee_pct)
 {
     core::log::Logger::init();
 
@@ -276,6 +283,24 @@ int run_embedded(bool coin_p2p_discover,
                        "with a resolvable payout address get work; unresolved payout + "
                        "no donation => work is REFUSED (burn guard), never zero-value.";
     }
+
+    // ── REWARD SPLIT: author/dev donation (give_author_pct, default 0.1%) +
+    // node-owner fee (node_owner_fee_pct, default 0). Percent -> parts-per-million
+    // (integer): 0.1% = 1000 ppm, 1% = 10000 ppm. llround keeps the ppm exact for
+    // typical human inputs; the split itself is integer FLOOR division and the
+    // miner absorbs every remainder. The node-owner address == the donation
+    // address here (single key), so a non-zero fee CONSOLIDATES with the donation
+    // into ONE coinbase output (see work_source.cpp build_connection_coinbase). ──
+    const uint64_t give_author_ppm = static_cast<uint64_t>(
+        std::llround(std::max(0.0, give_author_pct) * 10000.0));
+    const uint64_t node_owner_fee_ppm = static_cast<uint64_t>(
+        std::llround(std::max(0.0, node_owner_fee_pct) * 10000.0));
+    work_source->set_give_author_ppm(give_author_ppm);
+    work_source->set_node_owner_fee_ppm(node_owner_fee_ppm);
+    LOG_INFO << "[EMB-BIP110] reward split: give-author=" << give_author_pct << "% ("
+             << give_author_ppm << " ppm) node-owner-fee=" << node_owner_fee_pct << "% ("
+             << node_owner_fee_ppm << " ppm) — integer floor split, miner absorbs remainder"
+             << (node_owner_fee_ppm > 0 ? "; owner+donation consolidated (single key)" : "");
 
     std::unique_ptr<core::StratumServer> stratum_server;
     if (stratum_port != 0) {
@@ -475,6 +500,22 @@ int main(int argc, char** argv)
     std::string donation_address;  // operator-provided node-owner/donation address
     std::vector<NetService> explicit_peers;
 
+    // ── REWARD SPLIT L0 (resolved config): author/dev donation percent and the
+    // node-owner fee percent read from the settings catalog defaults (mirrors
+    // main_ltc/main_dash). money.give_author_pct is a FROM_POOL_CONFIG row filled
+    // by impl/bip110/catalog_defaults.hpp (0.1%); money.node_owner_fee_pct is the
+    // LIT "0" catalog row seeded by seed_compiled_defaults. CLI flags below win. ──
+    double give_author_pct   = 0.1;   // HARD RULE: author-fee default = 0.1%
+    double node_owner_fee_pct = 0.0;  // node-owner fee default = 0
+    {
+        namespace cs = c2pool::settings;
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(c2pool::catalog::C_BIP110);
+        c2pool::impl::bip110::register_catalog_defaults(rc);
+        give_author_pct    = rc.get_double("money.give_author_pct").value_or(give_author_pct);
+        node_owner_fee_pct = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee_pct);
+    }
+
     auto parse_hostport = [](const std::string& v, std::string& h, uint16_t& p) {
         auto c = v.rfind(':');
         if (c == std::string::npos) { p = static_cast<uint16_t>(std::stoi(v)); }
@@ -482,27 +523,34 @@ int main(int argc, char** argv)
     };
 
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--version") { std::printf("c2pool-bip110 %s\n", C2POOL_VERSION); return 0; }
-        if (a == "--help" || a == "-h") { print_banner(argv[0]); return 0; }
-        else if (a == "--selftest") { selftest = true; run = false; }
-        else if (a == "--run") { run = true; selftest = false; }
-        else if (a == "--coin-p2p-discover") { coin_p2p_discover = true; }
-        else if (a == "--fork-checkpoint") { fork_checkpoint = true; }
-        else if (a == "--peer" && i + 1 < argc) {
+        const std::string arg = argv[i];
+        if (arg == "--version") { std::printf("c2pool-bip110 %s\n", C2POOL_VERSION); return 0; }
+        if (arg == "--help" || arg == "-h") { print_banner(argv[0]); return 0; }
+        else if (arg == "--selftest") { selftest = true; run = false; }
+        else if (arg == "--run") { run = true; selftest = false; }
+        else if (arg == "--coin-p2p-discover") { coin_p2p_discover = true; }
+        else if (arg == "--fork-checkpoint") { fork_checkpoint = true; }
+        else if (arg == "--peer" && i + 1 < argc) {
             std::string host = "127.0.0.1"; uint16_t port = 8333;
             parse_hostport(argv[++i], host, port);
             explicit_peers.emplace_back(host, port);
         }
-        else if (a == "--http" && i + 1 < argc) {
+        else if (arg == "--http" && i + 1 < argc) {
             parse_hostport(argv[++i], http_host, http_port);
         }
-        else if (a == "--stratum" && i + 1 < argc) {
+        else if (arg == "--stratum" && i + 1 < argc) {
             stratum_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         }
-        else if (a == "--no-stratum") { stratum_port = 0; }
-        else if ((a == "--node-owner-address" || a == "--donation") && i + 1 < argc) {
+        else if (arg == "--no-stratum") { stratum_port = 0; }
+        else if ((arg == "--node-owner-address" || arg == "--donation") && i + 1 < argc) {
             donation_address = argv[++i];
+        }
+        // Money-class CLI flags (CLI wins over the catalog L0 defaults above).
+        else if ((arg == "--give-author" || arg == "--dev-donation") && i + 1 < argc) {
+            give_author_pct = std::stod(argv[++i]);
+        }
+        else if ((arg == "--fee" || arg == "-f") && i + 1 < argc) {
+            node_owner_fee_pct = std::stod(argv[++i]);
         }
     }
 
@@ -511,7 +559,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_port, donation_address);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_port, donation_address, give_author_pct, node_owner_fee_pct);
     }
 
     print_banner(argv[0]);

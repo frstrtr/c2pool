@@ -113,6 +113,16 @@ public:
     void set_share_target(uint32_t bits, uint32_t max_bits)
     { share_bits_.store(bits); share_max_bits_.store(max_bits); }
     void set_donation_script(std::vector<unsigned char> s) { donation_script_ = std::move(s); }
+    // Node-owner fee destination. When empty the node-owner fee (if any) is paid
+    // to the donation script (single-key consolidation, our 13zQ/bc1qyr94… key).
+    void set_node_owner_script(std::vector<unsigned char> s) { node_owner_script_ = std::move(s); }
+    // Author/dev donation as parts-per-million of the coinbase value (0.1% =
+    // 1000 ppm). Default 0.1% is applied by the caller (main_bip110 / catalog
+    // defaults); 0 => no author donation (miner keeps it). Integer floor split.
+    void set_give_author_ppm(uint64_t ppm) { give_author_ppm_ = ppm; }
+    // Node-owner fee as parts-per-million of the coinbase value (1% = 10000 ppm).
+    // Default 0 => no node-owner output. Integer floor split.
+    void set_node_owner_fee_ppm(uint64_t ppm) { node_owner_fee_ppm_ = ppm; }
     void set_create_share_fn(CreateShareFn fn) { create_share_fn_ = std::move(fn); }
 
 private:
@@ -145,7 +155,10 @@ private:
     std::atomic<uint32_t>        share_bits_{0};
     std::atomic<uint32_t>        share_max_bits_{0};
 
-    std::vector<unsigned char>   donation_script_;
+    std::vector<unsigned char>   donation_script_;     // author/dev donation destination
+    std::vector<unsigned char>   node_owner_script_;   // node-owner fee destination (empty => == donation)
+    uint64_t                     give_author_ppm_{0};  // author donation, ppm of coinbasevalue (0.1% = 1000)
+    uint64_t                     node_owner_fee_ppm_{0};// node-owner fee, ppm of coinbasevalue (1% = 10000)
     CreateShareFn                create_share_fn_;
 
     mutable std::mutex           workers_mutex_;

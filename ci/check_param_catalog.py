@@ -26,6 +26,7 @@ MAINS = {
     "main_btc.cpp": "BIN_BTC",
     "main_dgb.cpp": "BIN_DGB",
     "main_bch.cpp": "BIN_BCH",
+    "main_bip110.cpp": "BIN_BIP110",
 }
 
 # Flags that are intentionally NOT catalog rows. Keep this list SHORT and each
@@ -35,6 +36,19 @@ ALLOWLIST = {
     ("BIN_LTC", "--no-console"),   # accepted-and-ignored p2pool compat, no effect
     ("BIN_BCH", "--leg-c-capture"),      # dev-harness capture lane, not operator config
     ("BIN_BCH", "--leg-c-capture-p2p"),  # dev-harness capture lane
+    # c2pool-bip110 EMBEDDED-lane infra flags (M1/M2 SPV follower control surface,
+    # not operator money/config catalog params): the money-class flags
+    # (--give-author/--dev-donation/--fee/-f/--node-owner-address/--donation) and
+    # meta (--version/--help/-h) ARE catalog rows; these run-mode/network flags are
+    # lane-local and carry no [bip110] settings-file key.
+    ("BIN_BIP110", "--selftest"),          # selftest vs run mode toggle
+    ("BIN_BIP110", "--run"),               # embedded run mode toggle
+    ("BIN_BIP110", "--coin-p2p-discover"), # fork-peer discovery toggle
+    ("BIN_BIP110", "--fork-checkpoint"),   # BLAKE2b fork checkpoint seed toggle
+    ("BIN_BIP110", "--peer"),              # explicit fork peer host:port
+    ("BIN_BIP110", "--http"),              # dashboard/http bind host:port
+    ("BIN_BIP110", "--stratum"),           # stratum bind port
+    ("BIN_BIP110", "--no-stratum"),        # disable stratum
 }
 
 # A flag literal looks like -x or --long-flag (letters/digits/dashes, not a bare '-').
@@ -66,9 +80,10 @@ def extract_main_flags(path):
     return flags, saw_any
 
 
-# C2P_ALIAS(canon, BIN_x, "spelling", style)
+# C2P_ALIAS(canon, BIN_x, "spelling", style). Binary token may carry digits
+# (e.g. BIN_BIP110), so match [A-Z0-9]+ not just [A-Z]+.
 ALIAS_RE = re.compile(
-    r'C2P_ALIAS\(\s*[^,]+,\s*(BIN_[A-Z]+)\s*,\s*"([^"]+)"'
+    r'C2P_ALIAS\(\s*[^,]+,\s*(BIN_[A-Z0-9]+)\s*,\s*"([^"]+)"'
 )
 
 
