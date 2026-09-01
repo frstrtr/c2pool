@@ -273,13 +273,13 @@ C2P_PARAM("stratum.bind", Stratum, HOSTPORT, RESTART, C_ALL, LIT, "0.0.0.0:0", H
 C2P_PARAM("stratum.advertise_host", Stratum, STRING, LIVE, C_DASH, LIT, "", NONE, "stratum advertise host")
   C2P_ALIAS("stratum.advertise_host", BIN_DASH, "--stratum-advertise", VALUE)
 
-C2P_PARAM("stratum.min_diff", Stratum, DOUBLE, LIVE, C_LTC, LIT, "0.0005", NONE, "stratum min difficulty")
+C2P_PARAM("stratum.min_diff", Stratum, DBL, LIVE, C_LTC, LIT, "0.0005", NONE, "stratum min difficulty")
   C2P_ALIAS("stratum.min_diff", BIN_LTC, "--stratum-min-diff", VALUE)
 
-C2P_PARAM("stratum.max_diff", Stratum, DOUBLE, LIVE, C_LTC, LIT, "65536", NONE, "stratum max difficulty")
+C2P_PARAM("stratum.max_diff", Stratum, DBL, LIVE, C_LTC, LIT, "65536", NONE, "stratum max difficulty")
   C2P_ALIAS("stratum.max_diff", BIN_LTC, "--stratum-max-diff", VALUE)
 
-C2P_PARAM("stratum.target_time", Stratum, DOUBLE, LIVE, C_LTC, LIT, "3.0", NONE, "stratum vardiff target seconds")
+C2P_PARAM("stratum.target_time", Stratum, DBL, LIVE, C_LTC, LIT, "3.0", NONE, "stratum vardiff target seconds")
   C2P_ALIAS("stratum.target_time", BIN_LTC, "--stratum-target-time", VALUE)
 
 C2P_PARAM("stratum.vardiff", Stratum, TRISTATE_BOOL, LIVE, C_LTC, NONE, "", NONE, "vardiff (default on; --no-vardiff disables)")
@@ -352,7 +352,7 @@ C2P_PARAM("global.message_blob_hex", Global, HEX, LIVE, C_DASH|C_LTC, LIT, "", H
   C2P_ALIAS("global.message_blob_hex", BIN_DASH, "--transition-message", VALUE)
   C2P_ALIAS("global.message_blob_hex", BIN_LTC, "--message-blob-hex", VALUE)
 
-C2P_PARAM("money.give_author_pct", Money, DOUBLE, MONEY_RESTART, C_DASH|C_LTC|C_BTC, FROM_POOL_CONFIG, "", PCT_0_100, "author/dev donation percent")
+C2P_PARAM("money.give_author_pct", Money, DBL, MONEY_RESTART, C_DASH|C_LTC|C_BTC, FROM_POOL_CONFIG, "", PCT_0_100, "author/dev donation percent")
   C2P_ALIAS("money.give_author_pct", BIN_DASH, "--give-author", VALUE)
   C2P_ALIAS("money.give_author_pct", BIN_DASH, "--dev-donation", VALUE)
   C2P_ALIAS("money.give_author_pct", BIN_LTC, "--give-author", VALUE)
@@ -360,7 +360,7 @@ C2P_PARAM("money.give_author_pct", Money, DOUBLE, MONEY_RESTART, C_DASH|C_LTC|C_
   C2P_ALIAS("money.give_author_pct", BIN_BTC, "--give-author", VALUE)
   C2P_ALIAS("money.give_author_pct", BIN_BTC, "--dev-donation", VALUE)
 
-C2P_PARAM("money.node_owner_fee_pct", Money, DOUBLE, MONEY_RESTART, C_DASH|C_LTC|C_BTC, LIT, "0", PCT_0_100, "node-owner fee percent")
+C2P_PARAM("money.node_owner_fee_pct", Money, DBL, MONEY_RESTART, C_DASH|C_LTC|C_BTC, LIT, "0", PCT_0_100, "node-owner fee percent")
   C2P_ALIAS("money.node_owner_fee_pct", BIN_DASH, "--fee", VALUE)
   C2P_ALIAS("money.node_owner_fee_pct", BIN_DASH, "-f", SHORT)
   C2P_ALIAS("money.node_owner_fee_pct", BIN_LTC, "--fee", VALUE)
