@@ -42,6 +42,7 @@ set(source
     # monolithic settings-file loader with per-key source, tri-state, money gate.
     param_catalog.hpp param_catalog.cpp param_catalog.inc
     settings_file.hpp settings_file.cpp
+    settings_cli.hpp settings_cli.cpp
     boost_throw_exception.cpp
 )
 

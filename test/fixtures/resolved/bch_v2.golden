@@ -1,0 +1,5 @@
+meta.data_dir=<DATADIR> source=cli
+network.testnet=true source=cli
+sharechain.listen=9350 source=cli
+stratum.bind=3333 source=cli
+web.port=0 source=compiled

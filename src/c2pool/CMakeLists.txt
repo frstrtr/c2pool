@@ -423,6 +423,43 @@ target_include_directories(test_reward_safe_file PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../core)
 add_test(NAME test_reward_safe_file COMMAND test_reward_safe_file)
 
+# ---- Control-plane M0b: catalog-driven CLI scanner unit test. Same config-only
+# link shape as test_reward_safe_file (core settings TUs compiled directly, no
+# boost/zmq/leveldb). Kills the tracker-under-mark precedence risk mechanically:
+# iterates every catalog alias of every binary and asserts scan_cli marks it.
+add_executable(test_settings_cli_scan
+    test_settings_cli_scan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/settings_cli.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/settings_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/param_catalog.cpp)
+target_include_directories(test_settings_cli_scan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_test(NAME test_settings_cli_scan COMMAND test_settings_cli_scan)
+
+# ---- Control-plane M0b: GOLDEN no-file==today resolved-config gate + the
+# unknown-flag and money-gate end-to-end negatives, run against the built
+# coin binaries.
+#
+# The gate is meaningful ONLY where the 5 coin binaries are actually built. The
+# sanitizer lane builds the test suite but NOT the coin binaries, so it would
+# fail-close here ("no coin binaries -- instrument-validity floor"). Gate the
+# ctest REGISTRATION on a build-configuration option instead of on a runtime
+# "if file missing then skip": the sanitizer lane configures with
+# -DC2POOL_GOLDEN_RESOLVED_CONFIG_GATE=OFF, so the test is cleanly ABSENT there
+# (not a fail-close, not a fake pass). Everywhere else it defaults ON, is
+# PRESENT, and -- because ci/golden_resolved_config.sh requires ALL 5 coin
+# binaries in verify mode -- FAILS if any coin binary is missing or a vector
+# diverges. This encodes the leg distinction on target/build presence, never on
+# a per-file skip that could vacuously green the release leg.
+option(C2POOL_GOLDEN_RESOLVED_CONFIG_GATE
+       "Register the golden resolved-config ctest (requires the 5 coin binaries to be built)" ON)
+if(UNIX AND C2POOL_GOLDEN_RESOLVED_CONFIG_GATE)
+    add_test(NAME golden_resolved_config
+             COMMAND ${CMAKE_COMMAND} -E env bash
+                     ${CMAKE_SOURCE_DIR}/ci/golden_resolved_config.sh
+                     $<TARGET_FILE_DIR:c2pool-dash>)
+endif()
+
 # ---- Control-plane M0: catalog-completeness tripwire (anti-drift, runs offline)
 # Also wired as a GitHub Actions step so it runs on every PR without a build.
 find_package(Python3 COMPONENTS Interpreter QUIET)
