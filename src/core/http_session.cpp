@@ -430,6 +430,34 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_embedded_oracle();
             else if (target == "/embedded_template")
                 rest_result = mining_interface_->rest_embedded_template();
+
+            // ── Control-plane M1 (SAFE half): READ-ONLY resolved-config +
+            // catalog schema. Loopback-only (same posture as /api/admin/*):
+            // /api/config carries the node's fee/address posture and
+            // /api/config/schema is compiled constants, but both stay local
+            // until the control-token lands with the write path. Exact-match
+            // (schema BEFORE the bare path) so the substr dispatch cannot
+            // confuse the two. Unwired (no publish / no set_config_fns) => 404.
+            else if (target == "/api/config" || target == "/api/config/schema") {
+                auto remote_addr = socket_.remote_endpoint().address();
+                if (!remote_addr.is_loopback()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"Config API is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                if (!mining_interface_->has_config_fns()) {
+                    response.result(http::status::not_found);
+                    response.body() = R"({"error":"config endpoint not wired"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = (target == "/api/config/schema")
+                    ? mining_interface_->rest_config_schema()
+                    : mining_interface_->rest_config();
+            }
             else if (target == "/luck_stats")
                 rest_result = mining_interface_->rest_luck_stats();
             else if (target == "/ban_stats")
@@ -1007,6 +1035,19 @@ void HttpSession::process_request()
             }
         }
         else if (request_.method() == http::verb::post) {
+            // ── Control-plane M1: POST /api/config/apply is INERT this pass.
+            // Runtime mutation is operator-gated: the write path (control-token
+            // + two-phase money nonce + server-side AddressValidator) is NOT
+            // armed, so the only answer is an unconditional 503. Arming this
+            // requires flipping the KAT that pins the 503 — a reviewed change.
+            // (Plan: "the endpoint is never live without the gate.")
+            if (std::string(request_.target()) == "/api/config/apply") {
+                response.result(http::status::service_unavailable);
+                response.body() = R"({"armed":false,"error":"config-apply not armed; runtime mutation is operator-gated"})";
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
             // Handle JSON-RPC POST request.
             // Accept both 1.0 and 2.0 — upgrade 1.0 to 2.0 for the library.
             std::string request_body = request_.body();

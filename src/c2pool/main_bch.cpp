@@ -48,6 +48,7 @@
 #include <core/core_util.hpp>
 #include <core/filesystem.hpp>   // core::filesystem::set_data_dir (--data-dir, #722)
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/bch/catalog_defaults.hpp>  // M0b L0 compiled defaults
 
 #include <cstdlib>
@@ -832,6 +833,13 @@ int main(int argc, char** argv)
         int rc_code = cs::wire_settings(path, c2pool::catalog::C_BCH, tracker, rc);
         if (rc_code != 0) return rc_code;
         if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
+        // for the read-only control-plane endpoints. COPY (not move): any
+        // file->locals overlay below still reads rc. Startup resolution
+        // unchanged (golden gate byte-identical).
+        c2pool::config_endpoint::publish_resolved(
+            std::make_shared<const cs::ResolvedConfig>(rc),
+            c2pool::catalog::C_BCH, path);
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))        http_port  = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
         if (rc.file_set("daemon_rpc.auth_file")) rpc_conf = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf);

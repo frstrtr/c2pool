@@ -436,6 +436,22 @@ target_include_directories(test_settings_cli_scan PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..)
 add_test(NAME test_settings_cli_scan COMMAND test_settings_cli_scan)
 
+# ---- Control-plane M1 (SAFE half): config-endpoint KAT. Same config-only link
+# shape (settings + catalog + config_endpoint TUs compiled directly, only
+# nlohmann_json added for the JSON serializers). Exercises resolved_config_json,
+# catalog_schema_json, and the DORMANT validate_apply_batch oracle, plus the
+# cross-check that the core referee invariant agrees with the DASH
+# resolve_good_citizen_tx_serve resolver (pure/inline header -> no impl link).
+add_executable(test_config_endpoint
+    test_config_endpoint.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/config_endpoint.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/settings_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/param_catalog.cpp)
+target_include_directories(test_config_endpoint PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core)
+target_link_libraries(test_config_endpoint PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME test_config_endpoint COMMAND test_config_endpoint)
+
 # ---- Control-plane M0b: GOLDEN no-file==today resolved-config gate + the
 # unknown-flag and money-gate end-to-end negatives, run against the built
 # coin binaries.
