@@ -50,6 +50,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/p2p_client.hpp>
+#include <impl/dash/coin/govsync_status.hpp>   // R5 coverage wiring proof
 #include <impl/dash/config.hpp>
 
 #include <core/netaddress.hpp>
@@ -845,10 +846,13 @@ TEST(DashCoinP2PPool, won_block_with_no_handshaked_peer_reports_zero_not_success
 
 TEST(DashCoinP2PPool, stateful_request_legs_go_to_the_primary_only)
 {
-    // getmnlistd / getqrinfo / getheaders / govsync are QUESTIONS whose answers
-    // must be matched to the peer that was asked. Fanning them out would
-    // multiply an entire mainnet governance stream by the pool size for no
-    // extra evidence.
+    // getmnlistd / getqrinfo / getheaders / mempool are STATEFUL, CURSOR-MATCHED
+    // QUESTIONS whose answers must be matched to the peer that was asked (routing
+    // class 1): the reply is computed FROM a requester-supplied cursor and applied
+    // against the asking session. Fanning them out would mis-route the reply and
+    // multiply the stream by the pool size for no extra evidence. (govsync is NOT
+    // here — it is a coverage-prime, routing class 3; see
+    // govsync_prime_covers_every_handshaked_peer_exactly_once below.)
     PoolRig rig;
     rig.client.set_max_peers(3);
     rig.handshake(1);
@@ -860,14 +864,303 @@ TEST(DashCoinP2PPool, stateful_request_legs_go_to_the_primary_only)
 
     rig.client.send_getheaders(70230, {}, uint256::ZERO);
     rig.client.send_getmnlistd(uint256::ZERO, uint256::ONE);
-    rig.client.send_govsync();
     rig.client.send_mempool();
 
-    EXPECT_EQ(rig.session(1)->msgs_sent, before[0] + 4u)
+    EXPECT_EQ(rig.session(1)->msgs_sent, before[0] + 3u)
         << "the request legs did not land on the primary";
     EXPECT_EQ(rig.session(2)->msgs_sent, before[1])
         << "a stateful request was fanned out to a witness peer";
     EXPECT_EQ(rig.session(3)->msgs_sent, before[2]);
+}
+
+// ── govsync (nProp=0) is a COVERAGE-PRIME: each peer asked EXACTLY once ────────
+
+TEST(DashCoinP2PPool, govsync_prime_covers_every_handshaked_peer_exactly_once)
+{
+    // govsync(nProp=0) is neither a primary-only stateful question nor a
+    // repeat-safe getaddr broadcast: its reply (full object invs) merges into the
+    // ONE GovernanceStore regardless of which peer sent it, so multi-peer coverage
+    // is the defence against a single peer hiding the winning funding trigger —
+    // BUT dashd PUNISHES a repeated full govsync from the same address with
+    // Misbehaving(20) (CGovernanceManager::SyncObjects). So the prime must reach
+    // every handshaked peer, and reach each one AT MOST ONCE per expiry window.
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(3);
+    rig.handshake(1);
+    rig.handshake(2);
+    rig.handshake(3);
+
+    std::vector<uint64_t> before;
+    for (int i = 1; i <= 3; ++i) before.push_back(rig.session(i)->msgs_sent);
+
+    // First prime: every handshaked peer is asked exactly once; the returned
+    // vector is the coverage record (3 distinct keys).
+    auto primed1 = rig.client.send_govsync_prime();
+    EXPECT_EQ(primed1.size(), 3u) << "the prime did not cover all 3 handshaked peers";
+    for (int i = 1; i <= 3; ++i)
+        EXPECT_EQ(rig.session(i)->msgs_sent, before[i - 1] + 1u)
+            << "peer " << i << " was not primed";
+
+    // Second prime (same expiry window): NOBODY is re-asked — a repeat would earn
+    // dashd's Misbehaving(20). Returns empty (no new coverage), no bytes written.
+    auto primed2 = rig.client.send_govsync_prime();
+    EXPECT_TRUE(primed2.empty()) << "a repeat prime re-asked an already-primed peer "
+                                    "(dashd Misbehaving(20) / ban vector)";
+    for (int i = 1; i <= 3; ++i)
+        EXPECT_EQ(rig.session(i)->msgs_sent, before[i - 1] + 1u)
+            << "peer " << i << " was re-primed inside the expiry window";
+}
+
+TEST(DashCoinP2PPool, govsync_prime_is_incremental_for_late_handshakes)
+{
+    // The pool-wide walker (send_govsync_prime) primes each not-yet-primed
+    // handshaked peer exactly once: called after a new handshake it writes to
+    // exactly the ONE newly-handshaked (still-unprimed) peer, never re-touch the
+    // peers already primed. (In production the per-session prime is driven from
+    // the verack handler; this exercises the retained walker/test seam directly.)
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(3);
+    rig.handshake(1);
+    rig.handshake(2);
+
+    // Prime the first two.
+    auto r1 = rig.client.send_govsync_prime();
+    EXPECT_EQ(r1.size(), 2u);
+    const uint64_t s1 = rig.session(1)->msgs_sent;
+    const uint64_t s2 = rig.session(2)->msgs_sent;
+
+    // A third peer completes its handshake; prime again.
+    rig.handshake(3);
+    const uint64_t s3_before = rig.session(3)->msgs_sent;
+    auto r2 = rig.client.send_govsync_prime();
+
+    ASSERT_EQ(r2.size(), 1u) << "the incremental prime touched more than the new peer";
+    EXPECT_EQ(r2[0], PoolRig::peer_key(3));
+    EXPECT_EQ(rig.session(1)->msgs_sent, s1) << "peer 1 re-primed on a later handshake";
+    EXPECT_EQ(rig.session(2)->msgs_sent, s2) << "peer 2 re-primed on a later handshake";
+    EXPECT_EQ(rig.session(3)->msgs_sent, s3_before + 1u) << "the new peer was not primed";
+}
+
+TEST(DashCoinP2PPool, govsync_prime_reprime_after_expiry)
+{
+    // The once-only guard is an EXPIRY window (dashd's per-request fulfilled
+    // window, ~1h on mainnet), not a permanent latch: once it lapses the peer may
+    // be re-asked (dashcore re-syncs governance after its fulfilled request
+    // expires). set_govsync_reprime_secs(0) collapses the window so a second call
+    // re-primes, proving the TTL semantics rather than a one-shot flag.
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_govsync_reprime_secs(0);   // window lapses immediately
+    rig.handshake(1);
+    rig.handshake(2);
+
+    auto r1 = rig.client.send_govsync_prime();
+    EXPECT_EQ(r1.size(), 2u);
+    auto r2 = rig.client.send_govsync_prime();
+    EXPECT_EQ(r2.size(), 2u) << "a lapsed expiry window did not permit a re-prime";
+}
+
+TEST(DashCoinP2PPool, govsync_prime_returned_keys_drive_R5_to_two_peer_completeness)
+{
+    // THE MACHINE-CHECKED STATEMENT that a single peer can NEVER be the sole
+    // governance source: feed the keys RETURNED by the prime across handshakes
+    // into the production GovSyncStatus (the R5 completeness predicate the
+    // superblock serve path consults). One peer must stay INCOMPLETE; two DISTINCT
+    // primed peers must be able to cross the min_peers=2 floor and, after settle +
+    // quiescence, flip is_complete() TRUE — exactly the wiring main_dash performs
+    // (`for (pk : cp->send_govsync_prime()) maint->note_govsync_requested(pk)`).
+    using dash::coin::GovSyncStatus;
+    GovSyncStatus gov;                      // defaults: min_peers=2, settle=60, quiesce=30
+    const int64_t t0 = 1'000'000;
+
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.fake_now = t0;
+    rig.client.set_max_peers(2);
+
+    // First peer handshakes and is primed -> record its returned key.
+    rig.handshake(1);
+    for (const auto& pk : rig.client.send_govsync_prime())
+        gov.note_govsync_requested(pk, rig.fake_now);
+    EXPECT_EQ(gov.requested_peer_count(), 1u);
+    EXPECT_FALSE(gov.is_complete(t0 + 10'000))
+        << "a single primed peer must never be a complete governance view";
+
+    // Second DISTINCT peer handshakes later and is primed -> coverage reaches 2.
+    rig.fake_now = t0 + 5;
+    rig.handshake(2);
+    for (const auto& pk : rig.client.send_govsync_prime())
+        gov.note_govsync_requested(pk, rig.fake_now);
+    EXPECT_EQ(gov.requested_peer_count(), 2u)
+        << "two handshakes did not accrue two DISTINCT primed peers";
+
+    // Not settled yet (60s floor since first request).
+    EXPECT_FALSE(gov.is_complete(t0 + 30));
+    // After the settle floor AND the quiescence window with no new arrivals, the
+    // >=2-peer view is COMPLETE — the serve path may now trust the store.
+    EXPECT_TRUE(gov.is_complete(t0 + 61 + 30))
+        << "a >=2-peer, settled, quiesced governance view was not declared complete";
+}
+
+// ── VERACK-DRIVEN PRIME: every handshaked peer covered, once, per session ─────
+// The live-wire failure mode reproduced: with --embedded-govsync armed the
+// govsync prime must fire from the VERACK handler for EVERY peer — the future
+// primary AND every witness — so the R5 >=2-peer coverage floor can flip. On
+// master the prime was driven only from promote_primary -> on_handshake_complete,
+// which primed the first verack alone, so gov_peers stuck at 1 forever.
+
+TEST(DashCoinP2PPool, verack_primes_every_handshaked_peer_for_R5_coverage)
+{
+    using dash::coin::GovSyncStatus;
+
+    // Baseline: an UNARMED rig — set_gov_pull is NEVER called, so the verack path
+    // stays silent and a witness handshake writes NO govsync. This is the
+    // per-handshake message count the armed rig is measured against (+1 govsync).
+    uint64_t unarmed_witness_msgs;
+    {
+        PoolRig base;
+        base.use_fake_clock();
+        base.client.set_max_peers(3);
+        base.handshake(1);
+        base.handshake(2);
+        unarmed_witness_msgs = base.session(2)->msgs_sent;
+    }
+
+    GovSyncStatus gov;   // defaults: min_peers=2, settle=60, quiesce=30
+    const int64_t t0 = 1'000'000;
+
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.fake_now = t0;
+    rig.client.set_max_peers(3);
+    rig.client.set_gov_pull(true);                     // = --embedded-govsync armed
+    rig.client.set_on_govsync_primed(
+        [&](const std::string& pk){ gov.note_govsync_requested(pk, rig.fake_now); });
+
+    // The FUTURE PRIMARY (first verack) is primed at its own handshake — not
+    // gated behind primary election.
+    rig.handshake(1);
+    EXPECT_EQ(gov.requested_peer_count(), 1u)
+        << "the first (primary) peer was not primed at its verack";
+    EXPECT_FALSE(gov.is_complete(t0 + 10'000))
+        << "a single primed peer must never be a complete governance view";
+
+    // The WITNESS peer — the one master NEVER primed — handshakes later and is
+    // primed too. THIS is the coverage gap that kept gov_peers stuck at 1.
+    rig.fake_now = t0 + 5;
+    rig.handshake(2);
+    EXPECT_EQ(gov.requested_peer_count(), 2u)
+        << "the witness peer was not primed at its verack (the live-wire gap)";
+
+    // Per-peer WIRE proof: the witness wrote exactly ONE more message than the
+    // unarmed baseline — a single govsync, no fanout.
+    EXPECT_EQ(rig.session(2)->msgs_sent, unarmed_witness_msgs + 1u)
+        << "the witness prime was not exactly one govsync (fanout or missing)";
+
+    // No residual double-drive: everyone was already primed at their verack, so a
+    // pool-wide walk now returns EMPTY (proves the old promote_primary drive is
+    // gone — nobody is left for it to re-prime).
+    EXPECT_TRUE(rig.client.send_govsync_prime().empty())
+        << "a peer was left unprimed by the verack path (residual drive gap)";
+
+    // >=2 DISTINCT primed peers -> the min_peers=2 floor is crossable; after the
+    // settle floor AND quiescence the view flips COMPLETE -> gov_complete=1.
+    EXPECT_FALSE(gov.is_complete(t0 + 30)) << "settled before the 60s floor";
+    EXPECT_TRUE(gov.is_complete(t0 + 5 + 61 + 30))
+        << "a >=2-peer settled quiesced governance view was not declared complete";
+}
+
+TEST(DashCoinP2PPool, primary_election_does_not_double_prime_the_primary)
+{
+    // KAT-3: promote_primary fires on the first verack (m_on_handshake_complete),
+    // but the govsync drive no longer lives there — so the primary is primed
+    // exactly ONCE, by the same verack-site line as any peer. Armed handshake(1)
+    // writes exactly one govsync to peer 1 (delta vs an unarmed handshake == +1),
+    // and a following pool-wide walk finds nothing to re-prime.
+    uint64_t unarmed_primary_msgs;
+    {
+        PoolRig base;
+        base.use_fake_clock();
+        base.client.set_max_peers(2);
+        base.handshake(1);
+        unarmed_primary_msgs = base.session(1)->msgs_sent;
+    }
+
+    int primed_reports = 0;
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(2);
+    rig.client.set_gov_pull(true);
+    rig.client.set_on_govsync_primed([&](const std::string&){ ++primed_reports; });
+
+    rig.handshake(1);   // triggers promote_primary -> m_on_handshake_complete
+    EXPECT_EQ(rig.session(1)->msgs_sent, unarmed_primary_msgs + 1u)
+        << "the primary was double-primed (or not primed) at its verack";
+    EXPECT_EQ(primed_reports, 1)
+        << "the primary's prime reported other than exactly once";
+    EXPECT_TRUE(rig.client.send_govsync_prime().empty())
+        << "the primary was left unprimed / re-primeable after its verack";
+}
+
+TEST(DashCoinP2PPool, verack_reprime_within_window_does_not_resend_no_ban_vector)
+{
+    // KAT-2: the requester-side mirror of dashd's netfulfilledman once-per-window
+    // gate must survive a RECONNECT. A peer dropped and re-handshaked from the
+    // SAME address inside m_govsync_reprime_secs must NOT be re-sent a full
+    // govsync (that repeat is the CGovernanceManager::SyncObjects Misbehaving(20)
+    // ban vector). Once the window lapses, the re-handshake IS re-primed (TTL).
+    using dash::coin::GovSyncStatus;
+    GovSyncStatus gov;
+    int primed_reports = 0;
+
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.client.set_max_peers(3);
+    rig.client.set_gov_pull(true);
+    rig.client.set_on_govsync_primed([&](const std::string& pk){
+        ++primed_reports;
+        gov.note_govsync_requested(pk, rig.fake_now);
+    });
+
+    rig.handshake(1);
+    rig.handshake(2);
+    ASSERT_EQ(primed_reports, 2);
+    ASSERT_EQ(gov.requested_peer_count(), 2u);
+
+    // Keep the PRIMARY (peer 1) alive across the reap window by answering its
+    // pings; let the WITNESS (peer 2) go silent so ONLY it is reaped.
+    const auto answer_peer1 = [&](int64_t){
+        const PeerSession* s = rig.session(1);
+        if (s && s->liveness.ping_outstanding())
+            rig.deliver(1, p2p::message_pong::make_raw(s->liveness.ping_nonce()));
+    };
+    rig.run_seconds(rig.client.peer_timeout_sec(), answer_peer1);
+    ASSERT_EQ(rig.session(2), nullptr) << "the witness peer was not reaped";
+    ASSERT_NE(rig.session(1), nullptr) << "the primary was wrongly reaped";
+    // Still well inside the default 3600s reprime window (peer_timeout is 1200s),
+    // so the reconnect below must be treated as an in-window repeat.
+    ASSERT_LT(rig.fake_now - 1'000'000, static_cast<int64_t>(3600));
+
+    // RECONNECT the same address INSIDE the window: a NEW session, same peer_key.
+    rig.handshake(2);
+    EXPECT_EQ(primed_reports, 2)
+        << "a reconnect inside the window re-sent govsync (dashd Misbehaving(20))";
+    EXPECT_EQ(gov.requested_peer_count(), 2u)
+        << "a window-skipped reconnect spuriously re-armed R5 coverage";
+
+    // Collapse the window (TTL semantics), reap the witness again, reconnect: now
+    // the govsync IS re-sent — proving the guard is an EXPIRY window, not a latch,
+    // and that the discipline lives in the shared send-site helper.
+    rig.client.set_govsync_reprime_secs(0);
+    rig.run_seconds(rig.client.peer_timeout_sec(), answer_peer1);
+    ASSERT_EQ(rig.session(2), nullptr) << "the witness peer was not reaped (2nd)";
+    rig.handshake(2);
+    EXPECT_EQ(primed_reports, 3)
+        << "a lapsed reprime window did not permit a verack re-prime";
+    EXPECT_EQ(gov.requested_peer_count(), 2u);   // same key -> still 2 distinct
 }
 
 TEST(DashCoinP2PPool, getaddr_is_broadcast_because_discovery_breadth_refills_the_pool)

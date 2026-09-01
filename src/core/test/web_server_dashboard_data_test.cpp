@@ -934,3 +934,246 @@ TEST(DashboardData, RecentBlocksResidualFieldsHonorHonestNull)
     EXPECT_EQ(arr[0]["blocks_for_luck"].get<uint64_t>(), 0u);
     EXPECT_EQ(arr[0]["single_hashrate_luck_count"].get<uint64_t>(), 0u);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. Header-chain network_difficulty recovery — the luck-less accepted-win bug
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// THE INCIDENT (dash.voidbind, block 2531046, 2026-08-31). An accepted pool
+// win was recorded during startup sharechain replay — before any live template
+// existed and before the first /local_stats poll refreshed the netdiff cache —
+// so record_found_block's template and cache fallbacks were both empty and the
+// row persisted network_difficulty=0. luck needs expected_time needs netdiff,
+// so the row's luck was null forever and the found-block diamond had no matching
+// point on the luck trend. The one-shot startup backfill had already run BEFORE
+// replay created the row, and never re-runs. The block's OWN header carries the
+// exact difficulty in its nBits: the record path must consult it as a final
+// fallback, the confirm lane must repair a row whose header arrived late, the
+// enrichment path must fill it on an already-attributed row, and backfill must
+// PERSIST what it repairs so the fix survives a restart.
+
+namespace {
+// A header lookup that answers a fixed difficulty for every hash (the block's
+// nBits, resolved through the embedded header chain in production). 1.0 keeps
+// the luck arithmetic checkable by eye against a 2^32 H/s pool hashrate.
+MiningInterface::block_diff_lookup_fn fixed_diff_lookup(double d) {
+    return [d](const std::string&) -> double { return d; };
+}
+MiningInterface::block_ts_lookup_fn null_ts_lookup() {
+    return [](const std::string&) -> uint32_t { return 0; };
+}
+} // namespace
+
+// RECORD-PATH fallback: template empty, cache cold, but the block's header is
+// available — netdiff comes from the header and luck is computed. This is the
+// 2531046 replay case reproduced end to end.
+TEST(DashboardData, HeaderLookupFillsNetdiffWhenTemplateAndCacheAreCold)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    // NO template wired (embedded replay arm has none yet); cache is cold.
+    mi.set_pool_hashrate_fn([]() { return 4294967296.0; });   // 2^32 H/s
+    mi.set_block_field_lookups(fixed_diff_lookup(1.0), null_ts_lookup());
+
+    const std::string h1 =
+        "1111111111111111111111111111111111111111111111111111111111110001";
+    const std::string h2 =
+        "1111111111111111111111111111111111111111111111111111111111110002";
+
+    // First (predecessor) block, then the winning block 2 s later — the exact
+    // call shape of the replay hook: netdiff 0, pool_hashrate 0, subsidy 0.
+    mi.record_found_block(2531045, uint256S(h1), /*ts=*/1788182946, "DASH",
+                          "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h1,
+                          0.0, 240228.0, 0.0, 0);
+    mi.record_found_block(2531046, uint256S(h2), /*ts=*/1788182948, "DASH",
+                          "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h2,
+                          0.0, 240228.0, 0.0, 0);
+
+    auto blk = find_block(mi.rest_recent_blocks(), h2);
+    ASSERT_TRUE(blk.is_object());
+    ASSERT_TRUE(blk["network_difficulty"].is_number())
+        << "netdiff must be recovered from the block header when both the live "
+           "template and the cache are empty at record time";
+    EXPECT_DOUBLE_EQ(blk["network_difficulty"].get<double>(), 1.0);
+    ASSERT_TRUE(blk["luck"].is_number())
+        << "with the header-sourced netdiff the accepted win must carry luck";
+    EXPECT_DOUBLE_EQ(blk["expected_time"].get<double>(), 1.0);
+    EXPECT_DOUBLE_EQ(blk["time_to_find"].get<double>(), 2.0);
+    EXPECT_DOUBLE_EQ(blk["luck"].get<double>(), 50.0);
+    EXPECT_EQ(blk["luck_method"].get<std::string>(), "simple_avg");
+}
+
+// BASELINE for the label split: with NO header lookup available a row that has
+// a predecessor (time_to_find>0) but no measured netdiff is honestly labelled
+// "netdiff_unavailable", NOT "first_block" (which falsely implies it was the
+// pool's first block). Its luck stays null — the trend correctly skips it.
+TEST(DashboardData, NetdiffUnavailableLabelIsDistinctFromFirstBlock)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    mi.set_pool_hashrate_fn([]() { return 4294967296.0; });
+    // No template, no cache, and crucially NO header lookup wired.
+    const std::string h1 =
+        "2222222222222222222222222222222222222222222222222222222222220001";
+    const std::string h2 =
+        "2222222222222222222222222222222222222222222222222222222222220002";
+    mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
+                          "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h1,
+                          0.0, 240228.0, 0.0, 0);
+    mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
+                          "XghFtkZ8W3vhEHejUBbD3n387hemVJ6Pt4", h2,
+                          0.0, 240228.0, 0.0, 0);
+
+    auto arr = mi.rest_recent_blocks();
+    auto b1 = find_block(arr, h1);
+    auto b2 = find_block(arr, h2);
+    ASSERT_TRUE(b1.is_object() && b2.is_object());
+    // The genuine first block (no predecessor) keeps "first_block".
+    EXPECT_EQ(b1["luck_method"].get<std::string>(), "first_block");
+    // The second block HAS a predecessor (time_to_find>0) but no netdiff, so
+    // its luck is uncomputable — the old code mislabelled it "first_block".
+    EXPECT_TRUE(b2["time_to_find"].is_number());
+    EXPECT_TRUE(b2["luck"].is_null());
+    EXPECT_EQ(b2["luck_method"].get<std::string>(), "netdiff_unavailable");
+}
+
+// ENRICHMENT path, independent of attribution: an ALREADY-ATTRIBUTED row that
+// carries netdiff=0 (recorded off the fast path) is filled by a later record
+// that carries a real netdiff, and its luck is recomputed. On master the fill
+// lived only inside the unattributed-row branch, so a fully attributed
+// sharechain-peer win could never gain a netdiff after the fact.
+TEST(DashboardData, EnrichmentFillsNetdiffOnAlreadyAttributedRow)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    mi.set_pool_hashrate_fn([]() { return 4294967296.0; });
+    const std::string h1 =
+        "3333333333333333333333333333333333333333333333333333333333330001";
+    const std::string h2 =
+        "3333333333333333333333333333333333333333333333333333333333330002";
+    // Predecessor, then the attributed win with NO netdiff (no header, no
+    // template) — lands attributed but luck-less.
+    mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
+                          "Xminer", h1, 0.0, 240228.0, 0.0, 0);
+    mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
+                          "Xminer", h2, 0.0, 240228.0, 0.0, 0);
+    {
+        auto blk = find_block(mi.rest_recent_blocks(), h2);
+        ASSERT_TRUE(blk["found_locally"].get<bool>());
+        EXPECT_TRUE(blk["network_difficulty"].is_null());
+        EXPECT_TRUE(blk["luck"].is_null());
+    }
+    // A later attributed record for the same block carries the real netdiff.
+    mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
+                          "Xminer", h2, /*network_difficulty=*/1.0,
+                          240228.0, 4294967296.0, 0);
+
+    auto arr = mi.rest_recent_blocks();
+    int copies = 0;
+    for (const auto& b : arr)
+        if (b["hash"].get<std::string>() == h2) ++copies;
+    EXPECT_EQ(copies, 1) << "the fill must upgrade in place, never duplicate";
+    auto blk = find_block(arr, h2);
+    ASSERT_TRUE(blk["network_difficulty"].is_number());
+    EXPECT_DOUBLE_EQ(blk["network_difficulty"].get<double>(), 1.0);
+    ASSERT_TRUE(blk["luck"].is_number())
+        << "filling the netdiff on an attributed row must recompute its luck";
+    EXPECT_DOUBLE_EQ(blk["luck"].get<double>(), 50.0);
+    EXPECT_EQ(blk["luck_method"].get<std::string>(), "simple_avg");
+}
+
+// CONFIRM-LANE repair: a row recorded with no netdiff and no header available
+// AT RECORD TIME gains its netdiff when the confirmation lane flips it to
+// confirmed — by then the header is on-chain by definition. The status change
+// persists the repaired row.
+TEST(DashboardData, ConfirmationRepairsNetdiffAndComputesLuck)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    const std::string h1 =
+        "4444444444444444444444444444444444444444444444444444444444440001";
+    const std::string h2 =
+        "4444444444444444444444444444444444444444444444444444444444440002";
+    // Predecessor + winning block, both with netdiff 0 and NO lookup yet.
+    mi.record_found_block(2531045, uint256S(h1), 1788182946, "DASH",
+                          "Xminer", h1, 0.0, 240228.0, 4294967296.0, 0);
+    mi.record_found_block(2531046, uint256S(h2), 1788182948, "DASH",
+                          "Xminer", h2, 0.0, 240228.0, 4294967296.0, 0);
+    {
+        auto blk = find_block(mi.rest_recent_blocks(), h2);
+        EXPECT_TRUE(blk["network_difficulty"].is_null());
+        EXPECT_TRUE(blk["luck"].is_null());
+    }
+
+    // The header chain is available by the time the confirm lane runs.
+    mi.set_block_field_lookups(fixed_diff_lookup(1.0), null_ts_lookup());
+    mi.set_block_verify_fn([](const std::string&) -> int { return 6; });
+
+    int v = mi.run_block_verification_now(h2);
+    EXPECT_GT(v, 0);
+
+    auto blk = find_block(mi.rest_recent_blocks(), h2);
+    EXPECT_EQ(blk["status"].get<std::string>(), "confirmed");
+    ASSERT_TRUE(blk["network_difficulty"].is_number())
+        << "confirmation must fill the netdiff from the now-on-chain header";
+    EXPECT_DOUBLE_EQ(blk["network_difficulty"].get<double>(), 1.0);
+    ASSERT_TRUE(blk["luck"].is_number());
+    EXPECT_DOUBLE_EQ(blk["luck"].get<double>(), 50.0);
+}
+
+// PERSISTENCE: backfill_block_fields must WRITE BACK the rows it repairs, not
+// only fix them in memory. On master backfill filled the fields in RAM only,
+// so every restart re-derived them transiently and a row whose header was
+// unavailable at record time reverted to netdiff=0 on the next load. Here the
+// restored row starts at netdiff=0; after backfill the persist callback must
+// receive it carrying the header-sourced netdiff.
+TEST(DashboardData, BackfillPersistsRepairedRows)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    mi.set_pool_hashrate_fn([]() { return 4294967296.0; });
+
+    const std::string h1 =
+        "5555555555555555555555555555555555555555555555555555555555550001";
+    const std::string h2 =
+        "5555555555555555555555555555555555555555555555555555555555550002";
+
+    // Two rows restored from persistence with netdiff=0 (the shipped defect),
+    // pool_hashrate present, attributed. Aggregate init matches FoundBlock's
+    // field order; trailing derived + provenance fields default to 0/false.
+    auto make_row = [](uint64_t height, const std::string& hash, uint64_t ts) {
+        MiningInterface::FoundBlock b{};
+        b.height = height; b.hash = hash; b.ts = ts;
+        b.status = MiningInterface::BlockStatus::confirmed;
+        b.chain = "DASH"; b.confirmations = 300;
+        b.miner = "Xminer"; b.share_hash = hash;
+        b.network_difficulty = 0.0;      // the defect
+        b.share_difficulty = 240228.0;
+        b.pool_hashrate = 4294967296.0;
+        return b;
+    };
+    std::vector<MiningInterface::FoundBlock> restored = {
+        make_row(2531045, h1, 1788182946),
+        make_row(2531046, h2, 1788182948),
+    };
+
+    std::map<std::string, MiningInterface::FoundBlock> persisted;
+    mi.set_found_block_persistence(
+        [&persisted](const MiningInterface::FoundBlock& b) -> bool {
+            persisted[b.hash] = b; return true;
+        },
+        [&restored]() { return restored; });
+    mi.load_persisted_found_blocks();
+
+    // Header chain now available: backfill fills the missing netdiff.
+    mi.backfill_block_fields(fixed_diff_lookup(1.0), null_ts_lookup());
+
+    ASSERT_EQ(persisted.count(h2), 1u)
+        << "backfill must persist the repaired row, not only fix it in memory";
+    EXPECT_DOUBLE_EQ(persisted[h2].network_difficulty, 1.0);
+
+    // And the in-memory row now serves its luck to the trend.
+    auto blk = find_block(mi.rest_recent_blocks(), h2);
+    ASSERT_TRUE(blk["luck"].is_number());
+    EXPECT_DOUBLE_EQ(blk["luck"].get<double>(), 50.0);
+}

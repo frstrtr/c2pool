@@ -561,6 +561,16 @@ public:
     void set_embedded_oracle_fn(embedded_oracle_fn_t fn) { m_embedded_oracle_fn = thread_safe_wrap(std::move(fn)); }
     nlohmann::json rest_embedded_oracle();            // /embedded_oracle
 
+    // ── /embedded_template — READ-ONLY snapshot of the LAST embedded template
+    // this node SERVED to miners (height/coinbase/txs[txid,raw,fee]/cbtx/
+    // superblock-placeholder + the served stratum merkle_branch). Serialized on
+    // request only, touches no serving/consensus state, zero cost when unpolled.
+    // Bound by the coin target (main_dash.cpp) to DASHWorkSource::
+    // embedded_template_json(). Unset -> a {state:unavailable} shape.
+    using embedded_template_fn_t = std::function<nlohmann::json()>;
+    void set_embedded_template_fn(embedded_template_fn_t fn) { m_embedded_template_fn = thread_safe_wrap(std::move(fn)); }
+    nlohmann::json rest_embedded_template();          // /embedded_template
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -1043,6 +1053,17 @@ public:
     using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
     void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
 
+    /// Retain the block-header field lookups so paths OTHER than the one-shot
+    /// startup backfill can re-derive a missing network_difficulty from the
+    /// header chain. backfill_block_fields runs exactly once, before the
+    /// sharechain-replay / relay hooks record blocks won during the process's
+    /// own uptime, so a block learned AFTER backfill (e.g. a peer-relayed win
+    /// replayed 37s into boot) never gets its difficulty filled and its luck is
+    /// lost for the life of the process. record_found_block and the confirm
+    /// lane consult these to close that window. Coin-generic; wire once beside
+    /// backfill_block_fields (same header chain, same lambdas).
+    void set_block_field_lookups(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
+
 private:
     /// #159 (G3): recompute the DERIVED found-block fields (time_to_find,
     /// expected_time, luck) that are never persisted, from the height-ordered
@@ -1254,6 +1275,7 @@ private:
     coin_peers_fn_t m_coin_peers_fn;
     node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
     embedded_oracle_fn_t m_embedded_oracle_fn;  // /embedded_oracle shadow-validator stats (optional)
+    embedded_template_fn_t m_embedded_template_fn;  // /embedded_template last-served snapshot (optional)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;
@@ -1411,6 +1433,13 @@ private:
     // Persistent found block storage (Layer +2) — functional callbacks
     block_store_fn_t m_persist_block_fn;   // called on record + status change
     block_load_fn_t  m_load_blocks_fn;     // called on startup
+
+    // Retained block-header field lookups (set_block_field_lookups). Let the
+    // record + confirm paths re-derive a missing network_difficulty by block
+    // hash after the one-shot startup backfill has already run. Guarded by
+    // m_blocks_mutex at the call sites (same discipline as backfill_block_fields).
+    block_diff_lookup_fn m_block_diff_lookup_fn;
+    block_ts_lookup_fn   m_block_ts_lookup_fn;
 
     std::shared_ptr<void> m_merged_block_store;  // MergedBlockStore (opaque)
     coin_peer_info_fn m_ltc_peer_info_fn;

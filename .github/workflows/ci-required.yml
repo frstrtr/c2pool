@@ -17,6 +17,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  param-catalog-tripwire:
+    uses: ./.github/workflows/param-catalog-tripwire.yml
+    secrets: inherit
   coin-matrix:
     uses: ./.github/workflows/coin-matrix.yml
     secrets: inherit
@@ -38,7 +41,7 @@ jobs:
 
   aggregate:
     name: aggregate
-    needs: [coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b]
+    needs: [param-catalog-tripwire, coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b]
     if: always()
     runs-on: ubuntu-24.04
     steps:

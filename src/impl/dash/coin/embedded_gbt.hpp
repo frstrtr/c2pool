@@ -30,6 +30,7 @@
 
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
+#include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/asset_lock_fold.hpp>   // #107 phase 2: DIP-0027 type-8 credit-pool fold
 #include <impl/dash/coin/asset_unlock_admission.hpp>  // #143 Variant B: verified type-9 set (light bridge struct)
@@ -54,6 +55,7 @@
 #include <array>
 #include <cstdint>
 #include <ctime>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -525,7 +527,21 @@ inline DashWorkData build_embedded_workdata(
     //     term (creditpool.h:98-100) — so the validator's re-derivation from
     //     the block's OWN txs matches (specialtxman.cpp bad-cbtx-assetlocked-
     //     amount otherwise).
-    const AssetUnlockAdmission* admitted_asset_unlocks = nullptr)
+    const AssetUnlockAdmission* admitted_asset_unlocks = nullptr,
+    // ── SUPERSET seam: INCLUDE MEMPOOL PROVIDER SPECIAL TXS (types 1-4) ────
+    // --embedded-include-mn-special-txs (default OFF). When true AND the
+    // template-side SML fold is available (sml != nullptr), mempool selection
+    // admits ProRegTx/ProUpServTx/ProUpRegTx/ProUpRevTx (types 1-4) and the
+    // builder folds their effect over a COPY of the projected SML
+    // (sml_special_fold.hpp) so the committed merkleRootMNList matches the list
+    // those txs produce — exactly dashd BuildNewListFromBlock + the CbTx root
+    // it commits. A tx the fold cannot apply exactly is EXCLUDED (never a bad
+    // root). Default false => types 1-4 stay excluded and every existing
+    // positional caller is byte-unchanged (the folded copy is never built).
+    // The type-8 (asset-lock) selection leg rides accrue_pending_asset_locks;
+    // types 5/6/7/9 are never selected (type-6 is builder-generated, type-9 is
+    // admission-path-only via admitted_asset_unlocks).
+    bool include_mn_special_txs = false)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -599,11 +615,36 @@ inline DashWorkData build_embedded_workdata(
         reserved_bytes >= MAX_BLOCK_BYTES
             ? 0u
             : static_cast<uint32_t>(MAX_BLOCK_BYTES - reserved_bytes);
-    // C-3: exclude Dash special txs (tx.type != 0) from the embedded template.
-    // dashd recomputes the CbTx roots + creditPool by applying the block's own
-    // special txs; including one without accounting for it yields bad-cbtx. The
-    // safe-minimal cut keeps the embedded block special-tx-free so the creditPool
-    // accrual below is exactly the platform-reward term.
+    // ── PER-TYPE SPECIAL-TX ADMISSION MASK ────────────────────────────────
+    // dashd's BlockAssembler makes NO ordering distinction for special txs and
+    // recomputes the CbTx roots + creditPool by APPLYING the block's own
+    // special txs. So the embedded template is a SUPERSET/parity of dashd only
+    // when it INCLUDES the special txs dashd would include AND folds their
+    // effect into the CbTx. The mask below is that per-type gate:
+    //   * types 1-4 (ProReg/ProUpServ/ProUpReg/ProUpRev): admitted only when
+    //     the caller armed --embedded-include-mn-special-txs AND the SML fold
+    //     input is present (sml != nullptr) — the builder then folds them over
+    //     a projected-SML COPY and commits the resulting merkleRootMNList
+    //     (sml_special_fold.hpp, dashd BuildNewListFromBlock parity);
+    //   * type 8 (AssetLock): admitted only when accrue_pending_asset_locks is
+    //     armed — the credit-pool lock term is then derived from the SELECTED
+    //     BODY (not the mempool snapshot), matching dashd's
+    //     GetCreditPoolDiffForBlock over the block's own txs;
+    //   * types 5/6/7/9: never selected. Type-5 is the coinbase; type-6 quorum
+    //     commitments are builder-generated (dkg_commitments — a mempool copy
+    //     would duplicate the mandatory commitment, exactly as dashd's miner
+    //     injects its own); type-9 AssetUnlock is admission-path-only
+    //     (admitted_asset_unlocks / credit_pool_idx.hpp, because validity needs
+    //     the index follower).
+    // PER-TYPE DEGRADE: a missing leg masks ONLY its own type — a stale
+    // creditpool seed excludes type-8 while types 1-4 still ride, and a missing
+    // SML fold excludes types 1-4 while type-8 still rides. Default (all legs
+    // off) => admits() rejects every type!=0, byte-identical to the historical
+    // special-tx-free template.
+    Mempool::SpecialTxSelectMask special_mask;
+    special_mask.allow_all_special = false;                 // never the general path here
+    special_mask.allow_mn_types    = include_mn_special_txs && (sml != nullptr);
+    special_mask.allow_locks       = accrue_pending_asset_locks;
     // suppress_mempool_txs: coinbase-only body, total_fees == 0 exactly. The
     // mempool is not even consulted for selection (only, below, for the forgone-
     // fee report), so no partially-warm UTXO view can price anything into this
@@ -622,11 +663,11 @@ inline DashWorkData build_embedded_workdata(
         suppress_mempool_txs
             ? std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{{}, 0ull}
             : mempool.get_sorted_txs_with_fees(selection_budget,
-                                               /*exclude_special=*/true,
+                                               special_mask,
                                                /*next_height=*/w.m_height,
                                                /*lock_time_cutoff=*/mtp_at_tip);
-    // MN-collateral spend filter (sml_projection.hpp, FINDING-2). The C-3
-    // special-tx cut above is NOT sufficient: dashd's verifier removes a
+    // MN-collateral spend filter (sml_projection.hpp, FINDING-2). The per-type
+    // selection mask is NOT sufficient on its own: dashd's verifier removes a
     // masternode from the list when ANY block tx — special or not — spends
     // its collateral outpoint (specialtxman.cpp:457-464, no type guard), and
     // that removal changes the merkleRootMNList the CbTx must commit. A plain
@@ -635,7 +676,10 @@ inline DashWorkData build_embedded_workdata(
     // = a silently lost block). No tx is ever mandatory, so EXCLUDING it is
     // consensus-clean — dashd's own miner folds the removal instead, but the
     // exclusion needs no second root computation. Fee follows the tx out of
-    // the template so block_value / mn_payment below stay exact.
+    // the template so block_value / mn_payment below stay exact. (Kept even
+    // when the types-1-4 fold below is armed: a collateral spend has no ProTx
+    // effect the fold applies, so excluding it stays the simplest safe route —
+    // subsuming it into the fold is a later step, per the frozen design.)
     {
         size_t kept = 0;
         for (size_t i = 0; i < selected.size(); ++i) {
@@ -655,6 +699,77 @@ inline DashWorkData build_embedded_workdata(
             ++kept;
         }
         selected.resize(kept);
+    }
+    // ── TYPES 1-4 MN-LIST FOLD (merkleRootMNList parity) ──────────────────
+    // When the mask admitted provider special txs (types 1-4), fold their
+    // effect over a COPY of the projected SML now, BEFORE body assembly, so
+    // (a) a tx the fold cannot apply exactly is DROPPED from `selected` (its
+    // fee follows it out, exactly like the collateral filter), and (b) the
+    // resulting list's CalcMerkleRoot() is the merkleRootMNList the CbTx below
+    // commits — dashd BuildNewListFromBlock + CalcCbTxMerkleRootMNList parity.
+    // Never mutates any follower state: the fold runs on a projected COPY. When
+    // the mask did not admit types 1-4 (default), this whole block is skipped
+    // and the template is byte-identical to before.
+    std::optional<vendor::CSimplifiedMNList> mn_folded_sml;
+    if (special_mask.allow_mn_types && sml != nullptr) {
+        auto proj_for_fold = project_sml_confirmations(
+            *sml, prev_height, prev_hash, mnstates, mn_min_confirmations);
+        if (proj_for_fold.ok) {
+            std::vector<MutableTransaction> body_for_fold;
+            body_for_fold.reserve(selected.size());
+            for (const auto& s : selected) body_for_fold.push_back(s.tx);
+            auto fold = fold_mn_special_txs(
+                proj_for_fold.sml, body_for_fold,
+                [](const MutableTransaction& t) {
+                    return dash::coin::dash_txid(t);
+                });
+            if (!fold.refused_ids.empty()) {
+                std::set<uint256> drop(fold.refused_ids.begin(),
+                                       fold.refused_ids.end());
+                size_t kept = 0;
+                for (size_t i = 0; i < selected.size(); ++i) {
+                    if (drop.count(dash::coin::dash_txid(selected[i].tx))) {
+                        total_fees -= selected[i].fee;
+                        LOG_WARNING << "[GBT-EMB] excluding provider special tx "
+                                    << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
+                                    << " from template h=" << (prev_height + 1)
+                                    << ": MN-list fold refused it (unknown proTxHash"
+                                    << " / dup key / parse failure)";
+                        continue;
+                    }
+                    if (kept != i) selected[kept] = std::move(selected[i]);
+                    ++kept;
+                }
+                selected.resize(kept);
+            }
+            mn_folded_sml = std::move(fold.sml);
+            if (fold.applied > 0)
+                LOG_INFO << "[GBT-EMB] types 1-4 MN-list fold h="
+                         << (prev_height + 1) << " applied=" << fold.applied
+                         << " refused=" << fold.refused
+                         << " — committing folded merkleRootMNList";
+        } else {
+            // Projection unavailable ⇒ degrade leg (b): mask types 1-4 out by
+            // dropping them from the body (the credit-pool / type-8 leg is
+            // independent and unaffected). Fail-closed and loud.
+            size_t kept = 0;
+            unsigned dropped = 0;
+            for (size_t i = 0; i < selected.size(); ++i) {
+                const uint16_t t = selected[i].tx.type;
+                if (t >= 1 && t <= 4) {
+                    total_fees -= selected[i].fee;
+                    ++dropped;
+                    continue;
+                }
+                if (kept != i) selected[kept] = std::move(selected[i]);
+                ++kept;
+            }
+            selected.resize(kept);
+            if (dropped > 0)
+                LOG_WARNING << "[GBT-EMB] SML projection unavailable at h="
+                            << (prev_height + 1) << " — masked " << dropped
+                            << " provider special tx(s) out of the template";
+        }
     }
     // #143: the admitted unlocks' payload fees are ordinary miner fees (dashd
     // GetAssetUnlockFee, assetlocktx.cpp:200-212 — the fee reaches the miner
@@ -680,7 +795,10 @@ inline DashWorkData build_embedded_workdata(
             // against the FULL cap would overstate it — we could not have
             // served more than selection_budget even with serving enabled.
             mempool.get_sorted_txs_with_fees(selection_budget,
-                                             /*exclude_special=*/true,
+                                             // coverage measurement only: keep
+                                             // the conservative special-tx-free
+                                             // baseline (admits nothing != type 0)
+                                             Mempool::SpecialTxSelectMask{/*exclude_special=*/true},
                                              /*next_height=*/w.m_height,
                                              /*lock_time_cutoff=*/mtp_at_tip);
         (void)cand_fees;
@@ -1007,42 +1125,44 @@ inline DashWorkData build_embedded_workdata(
         //                          + platformReward(N)              (locked this block)
         //                          + Σ assetLocks(N) − Σ assetUnlocks(N)
         // last_observed_credit_pool is creditPoolBalance(N-1) (the freshness gate
-        // guarantees the SML/CCbTx seed is current at the tip we build on). The
-        // embedded template excludes special txs (C-3 mempool filter), so the
-        // asset-lock/unlock terms are exactly zero and the accrual reduces to the
-        // platform-reward burn locked this block. Verified byte-exact against a
-        // real testnet dashd getblocktemplate: creditPoolBalance stepped by
-        // exactly the platform reward (66966830 duff) each block — see
-        // test_dash_embedded_cbtx_byte_parity.cpp. When platform_reward is 0
-        // (pre-MN_RR) the balance carries forward unchanged, also correct.
+        // guarantees the SML/CCbTx seed is current at the tip we build on). When
+        // no special txs ride the body (the default posture) the asset-lock and
+        // asset-unlock terms are exactly zero and the accrual reduces to the
+        // platform-reward burn locked this block — verified byte-exact against a
+        // real testnet dashd getblocktemplate (creditPoolBalance stepped by
+        // exactly 66966830 duff each block, test_dash_embedded_cbtx_byte_parity).
         //
-        // #107 PHASE 2: when --embedded-accrue-asset-locks is armed, ADD the
-        // DIP-0027 type-8 (asset-lock) term dashd commits for this block. dashd
-        // builds its template from the pending locks in its mempool and adds,
-        // for each, the value of the lock tx's FIRST OP_RETURN output
-        // (creditpool.cpp:262-276) to GetTotalLocked() (creditpool.h:98-100),
-        // written to the CbTx at miner.cpp:314. We fold the SAME source — the
-        // pending type-8 locks in OUR mempool — with the SAME arithmetic
-        // (asset_lock_fold.hpp), each validated by check_asset_lock_tx
-        // (assetlocktx.cpp:44-95) so only would-be-valid block members count.
-        // Off (default) the term is 0 and the accrual is byte-identical to the
-        // pre-phase-2 template. The emit gate (node_coin_state.hpp
-        // embedded_template_emit_ok) re-derives this SAME term over the SAME
-        // mempool snapshot, so a fresh build cannot trip emit-creditpool-value-
-        // drift (PR body B2).
+        // THE STRUCTURAL CHOICE (frozen design creditpool_accounting): the lock
+        // term is derived from the SELECTED BODY, not the mempool snapshot —
+        // exactly dashd's GetCreditPoolDiffForBlock(*pblock,...), which folds
+        // ProcessLockUnlockTransaction over the block's OWN txs. A type-8 lock
+        // that was pending but did NOT win selection (budget / ancestor / IS
+        // hold) therefore accrues ZERO here, so a won block cannot commit a
+        // creditPoolBalance the validator's re-derivation from the served body
+        // would reject (bad-cbtx-assetlocked-amount). We fold ONLY the type-8
+        // locks actually in `selected`, with the SAME first-OP_RETURN
+        // arithmetic (asset_lock_fold.hpp), each re-validated by
+        // check_asset_lock_tx so only would-be-valid block members count. When
+        // selection admitted no type-8 (mask leg off, or none pending), the
+        // fold is empty and the accrual is byte-identical to the platform-reward
+        // term. The emit gate (node_coin_state.hpp embedded_template_emit_ok)
+        // re-derives this SAME term over the SAME served body, so a fresh build
+        // cannot trip emit-creditpool-value-drift.
         int64_t asset_lock_accrual = 0;
-        if (accrue_pending_asset_locks) {
-            const AssetLockFold f =
-                pending_asset_lock_fold(mempool.pending_asset_lock_txs());
+        {
+            std::vector<MutableTransaction> body_locks;
+            for (const auto& s : selected)
+                if (s.tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE)
+                    body_locks.push_back(s.tx);
+            const AssetLockFold f = pending_asset_lock_fold(body_locks);
             asset_lock_accrual = f.accrued;
             if (f.count > 0 || f.rejected > 0) {
-                LOG_INFO << "[GBT-EMB] #107 asset-lock accrual h="
+                LOG_INFO << "[GBT-EMB] asset-lock accrual (from SELECTED body) h="
                          << (prev_height + 1) << " folded=" << f.count
                          << " rejected=" << f.rejected
                          << " accrual=" << asset_lock_accrual
-                         << " duff (committed creditPoolBalance now INCLUDES the"
-                            " pending type-8 locks; block is valid ONLY if those"
-                            " same txs ride the served body -- #125/tx-serving)";
+                         << " duff (creditPoolBalance INCLUDES the type-8 locks that"
+                            " ride THIS body — dashd GetCreditPoolDiffForBlock parity)";
             }
         }
         // #143: the admitted unlocks' GROSS amount (Σ vout + fee) LEAVES the
@@ -1083,8 +1203,15 @@ inline DashWorkData build_embedded_workdata(
                      << (prev_height + 1)
                      << " — committing projected merkleRootMNList";
         }
+        // merkleRootMNList source: the types-1-4 fold above (when armed and the
+        // projection was available) has already applied the body's provider
+        // special txs to a projected COPY — commit THAT list's root so the
+        // CbTx matches the list the block's own txs produce (dashd
+        // BuildNewListFromBlock). Otherwise commit the plain projected root.
+        const vendor::CSimplifiedMNList& cbtx_sml =
+            mn_folded_sml.has_value() ? *mn_folded_sml : proj.sml;
         vendor::CCbTx cb = build_embedded_cbtx(
-            prev_height, proj.sml, *qmgr, best_cl_height, best_cl_sig,
+            prev_height, cbtx_sml, *qmgr, best_cl_height, best_cl_sig,
             accrued_credit_pool, quorum_root_override);
         w.m_coinbase_payload = encode_cbtx(cb);
     } else {
@@ -1231,9 +1358,10 @@ inline vendor::CCbTx build_embedded_cbtx(
 
     // creditPoolBalance: the caller (build_embedded_workdata) supplies the
     // ALREADY-ACCRUED balance for THIS block — i.e. creditPoolBalance(N-1) +
-    // platformReward(N) (+ asset lock/unlock, which are zero because the
-    // embedded template excludes special txs). We commit it verbatim. See the
-    // H-4 accrual note in build_embedded_workdata and the byte-parity KAT.
+    // platformReward(N) + Σ type-8 locks − Σ type-9 unlocks OVER THE SELECTED
+    // BODY (zero when no asset-lock/unlock tx rode this template — the default
+    // posture). We commit it verbatim. See the H-4 accrual note in
+    // build_embedded_workdata and the byte-parity KAT.
     c.creditPoolBalance  = last_observed_credit_pool;
     return c;
 }

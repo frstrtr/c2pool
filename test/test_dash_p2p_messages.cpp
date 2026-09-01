@@ -239,6 +239,28 @@ TEST(DashP2PMessages, InvTypeNumbersMatchDashcoreProtocol) {
     // dashcore src/protocol.h enum GetDataMsg
     EXPECT_EQ(static_cast<uint32_t>(inventory_type::quorum_final_commitment), 21u);
     EXPECT_EQ(static_cast<uint32_t>(inventory_type::clsig), 29u);   // protocol.h:522
+    // E-SUPERBLOCK governance inv types (dashcore protocol.h:508-509)
+    EXPECT_EQ(static_cast<uint32_t>(inventory_type::govobject), 17u);
+    EXPECT_EQ(static_cast<uint32_t>(inventory_type::govobjectvote), 18u);
+}
+
+// E-SUPERBLOCK feed hook (red-on-master -> green). Before this change the inv
+// handler getdata-pulled only types 21/29/31, so a govsync answer's
+// MSG_GOVERNANCE_OBJECT (17) / _VOTE (18) invs were never requested — the
+// govobj/govobjvote handlers could never fire and the GovernanceStore stayed
+// empty, which is exactly why every superblock height refused to serve
+// daemonlessly. Admitting 17/18 to the pull TYPE predicate is the wire change
+// that lets the store populate (the runtime pull is additionally flag-gated in
+// the inv handler by m_gov_pull_enabled, the is_dstx precedent).
+TEST(DashP2PMessages, InvPullPolicyCoversGovernanceObjectsAndVotes) {
+    EXPECT_TRUE(inv_type_is_pulled(inventory_type::govobject))
+        << "governance objects are inv-announced and served only on getdata; "
+           "without this the govobj handler can never fire and the superblock "
+           "store never populates";
+    EXPECT_TRUE(inv_type_is_pulled(inventory_type::govobjectvote))
+        << "a trigger's funding votes are inv-announced and served only on "
+           "getdata; without this the tally can never reach the funding "
+           "threshold";
 }
 
 TEST(DashP2PMessages, InvPullPolicyCoversChainLocksAndCommitments) {

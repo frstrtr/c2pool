@@ -2326,7 +2326,12 @@ int run_node(const core::CoinParams& params, bool testnet,
         } else {
             std::cout << "[DGB] WebServer FAILED to bind " << http_addr << ":"
                       << http_port << " — dashboard disabled, run-loop continues" << std::endl;
-            web_server.reset();
+            // Keep the WebServer alive on a failed bind (do NOT reset). A
+            // failed-start server holds no listener and serves nothing; all
+            // later use is `if (web_server)`-guarded. This mirrors the DASH
+            // fix: freeing here would dangle any pre-start raw-pointer capture
+            // into the WebServer / MiningInterface. DGB installs no such capture
+            // today, so this is defensive parity, not a live-bug fix.
         }
     } else {
         std::cout << "[DGB] dashboard disabled (no --http flag)" << std::endl;

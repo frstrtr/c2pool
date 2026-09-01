@@ -1019,6 +1019,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // requires --embedded-serve-mempool-txs; the #1218
              // gbt-xcheck-txmerkle guard is untouched and stays the referee.
              bool embedded_ingest_dstx = false,
+             // --embedded-govsync (E-SUPERBLOCK): OBSERVE-ONLY arm of the
+             // governance sourcing lane — inv(MSG_GOVERNANCE_OBJECT=17 /
+             // _VOTE=18) getdata pull + per-object vote sync so the
+             // GovernanceStore POPULATES from the live govsync feed
+             // (BLS-verified operator votes, EvoNode-4x weighted tally). It
+             // does NOT arm SERVING: --embedded-superblock is the separate
+             // serve gate. DEFAULT OFF => no gov inv earns a getdata and the
+             // store stays empty (wire byte-identical to master). This lets the
+             // canary prove store-populate live WITHOUT touching the serve
+             // path. --embedded-superblock implies this (serving needs the
+             // feed), so passing either arms the pull.
+             bool embedded_govsync = false,
              // --embedded-proactive-rotate (PR-3): arm the LOW-RATE proactive
              // coin-P2P peer rotation. DEFAULT OFF => the coin client runs the
              // stall-only rotation (#147/#148), byte-identical to master. ON, a
@@ -2283,7 +2295,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         } else {
             std::cout << "[run] web dashboard FAILED to bind " << web_host << ":"
                       << web_port << " — dashboard disabled (mining unaffected)\n";
-            web_server.reset();
+            // Do NOT reset() the WebServer here. Pre-start hooks already captured
+            // it by raw pointer — the tracker's m_on_share_difficulty feed
+            // (core::WebServer* ws = web_server.get() above) and the detached
+            // auto_detect_external_info() thread both hold references into this
+            // object AND its MiningInterface. Freeing it on a failed bind left
+            // those pointers dangling; the first verify burst then called
+            // record_share_difficulty() on the freed MiningInterface
+            // (m_hashrate_ring / m_samples[miner]) and SIGSEGV'd during share
+            // ingestion. A failed-start WebServer holds no listener and serves
+            // nothing, so keeping it alive costs nothing: the acceptor never
+            // came up, later use is all `if (web_server)`-guarded, and the
+            // surviving hooks fire safely against an inert MiningInterface that
+            // merely accumulates stats. Every capture stays valid; the
+            // bind-success path (production) is byte-for-byte unchanged.
         }
     } else {
         std::cout << "[run] web dashboard disabled (--web-port 0)\n";
@@ -4210,6 +4235,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 std::cout << "[run] dashboard local-hashrate + per-worker "
                              "registry + block-value/net-diff bound to the DASH "
                              "stratum acceptor\n";
+
+                // ── /embedded_template (READ-ONLY observability) ───────────
+                // Expose the LAST embedded template this node SERVED to miners
+                // so the live validation harness can testmempoolaccept every
+                // served tx and bind the served merkle_branch to txs[]. The
+                // closure calls DASHWorkSource::embedded_template_json(), which
+                // reads only the non-fetching peek_template() snapshot -- no
+                // GBT fetch, no NodeCoinState read, no serve-path effect, and
+                // zero cost when unpolled (serialized on request only).
+                mi->set_embedded_template_fn(
+                    [wsrc = work_source.get()]() -> nlohmann::json {
+                        return wsrc->embedded_template_json();
+                    });
             }
         } else {
             std::cout << "[run] stratum FAILED to bind " << stratum_host << ":"
@@ -6651,6 +6689,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          " is a drop (fail-closed, no state change).\n";
         }
 
+        // E-SUPERBLOCK: arm the governance sourcing lane when observe-only
+        // --embedded-govsync OR the serve gate --embedded-superblock is set
+        // (serving needs the feed). OFF => no gov inv earns a getdata, the
+        // GovernanceStore stays empty, every superblock height falls back to
+        // dashd — byte-identical to master.
+        if (embedded_govsync || embedded_superblock) {
+            coin_p2p->set_gov_pull(true);
+            std::cout << "[run] "
+                      << (embedded_superblock ? "--embedded-superblock"
+                                              : "--embedded-govsync")
+                      << ": coin-P2P governance sync ARMED (inv 17/18 batched"
+                         " getdata + per-object vote sync). The store populates"
+                         " from BLS-verified operator votes with EvoNode-4x"
+                         " weighting; SERVING stays gated on"
+                         " --embedded-superblock + the R5 completeness gate.\n";
+        }
+
         if (embedded_ingest_isdlock) {
             coin_p2p->set_isdlock_pull(true);
             std::cout << "[run] --embedded-ingest-isdlock: coin-P2P"
@@ -6661,6 +6716,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          " any verification failure is a drop (fail-closed,"
                          " no state change).\n";
         }
+
+        // E-SUPERBLOCK R5 coverage reporting seam: the coin-P2P verack handler
+        // primes each handshaked peer with govsync(nProp=0) once per expiry
+        // window (armed only under --embedded-govsync/--embedded-superblock);
+        // whenever it actually primes a peer it reports that peer_key here, so
+        // GovSyncStatus records exactly-the-primed-peer coverage. Fires only on a
+        // real send (never a window-skip), so an already-primed peer never
+        // re-arms the quiescence window — the R5 min_peers (>=2) floor accrues
+        // one DISTINCT primed peer per handshake and can flip completeness TRUE.
+        coin_p2p->set_on_govsync_primed(
+            [maint = maintainer.get()](const std::string& pk) {
+                maint->note_govsync_requested(pk);
+            });
 
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
@@ -6708,24 +6776,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // the full cold snapshot; a reconnect after some sync re-requests
                 // from exactly what the SML has applied, never a stranded base.
                 cp->send_getmnlistd(maint ? maint->sml_current_hash() : uint256::ZERO, tip);
-                // E-SUPERBLOCK: prime the governance object/vote sync (triggers
-                // + funding votes) so a superblock height can be served
-                // daemonlessly. Zero nProp + empty filter => request all.
-                // Handshake-only today — there is NO tip-change re-prime yet.
-                // KNOWN GAP (pre-enable requirement): dashcore answers govsync
-                // with INVENTORY (MSG_GOVERNANCE_OBJECT/_VOTE invs), not
-                // direct govobj/govobjvote messages, and our inv handler does
-                // not getdata governance types — so this leg is currently
-                // INERT (an extra fail-closed layer: the store stays empty).
-                // The inv-driven getdata + per-object vote sync + periodic
-                // re-prime co-land with vote-verify before any enable.
-                cp->send_govsync();
-                // R5: record govsync peer coverage + (re)arm the quiescence
-                // window for the completeness determination. With the current
-                // single-peer connection model this covers ONE peer, so the
-                // default min_peers floor (>=2) keeps the completeness predicate
-                // FALSE — reward-safe until multi-peer govsync lands.
-                maint->note_govsync_requested(cp->peer_key());
+                // E-SUPERBLOCK govsync PRIME: NOT driven from here. The prime is
+                // emitted per session by the coin-P2P verack handler, beside its
+                // getsporks leg (routing class 3), so EVERY handshaked peer — the
+                // primary AND every witness — is primed once at its own handshake.
+                // R5 coverage is recorded from that verack site via
+                // set_on_govsync_primed (wired above), which fires only when a peer
+                // was actually primed. Driving it here fired only for the FIRST
+                // verack (the peer that wins primary election), which is exactly
+                // why gov_peers stuck at 1 despite a >=2-peer pool.
             });
 
         std::cout << "[run] E2a live-feed wired: header-chain(" << hdr_db
@@ -9625,21 +9684,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // difficulty. backfill_block_fields internally re-derives the luck trend.
         if (header_chain) {
             auto* hc = header_chain.get();
-            cache_mi->backfill_block_fields(
-                [hc](const std::string& block_hash_hex) -> double {
-                    uint256 h;
-                    h.SetHex(block_hash_hex);
-                    auto e = hc->get_header(h);
-                    if (!e) return 0.0;
-                    return chain::target_to_difficulty(
-                        chain::bits_to_target(e->header.m_bits));
-                },
-                [hc](const std::string& block_hash_hex) -> uint32_t {
-                    uint256 h;
-                    h.SetHex(block_hash_hex);
-                    auto e = hc->get_header(h);
-                    return e ? e->header.m_timestamp : 0;
-                });
+            auto diff_lookup = [hc](const std::string& block_hash_hex) -> double {
+                uint256 h;
+                h.SetHex(block_hash_hex);
+                auto e = hc->get_header(h);
+                if (!e) return 0.0;
+                return chain::target_to_difficulty(
+                    chain::bits_to_target(e->header.m_bits));
+            };
+            auto ts_lookup = [hc](const std::string& block_hash_hex) -> uint32_t {
+                uint256 h;
+                h.SetHex(block_hash_hex);
+                auto e = hc->get_header(h);
+                return e ? e->header.m_timestamp : 0;
+            };
+            // One-shot backfill of rows restored from persistence.
+            cache_mi->backfill_block_fields(diff_lookup, ts_lookup);
+            // Retain the same lookups so the record + confirm paths can fill a
+            // missing network_difficulty for blocks won AFTER this backfill runs
+            // (sharechain-replay / relay wins recorded seconds into boot), whose
+            // luck point the one-shot backfill can never reach.
+            cache_mi->set_block_field_lookups(diff_lookup, ts_lookup);
         }
 
         // #159 (G2): the verifier + io_context are now live, so drive a
@@ -9796,6 +9861,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         << (mn_ckpt_lane ? mn_ckpt_lane->waiting_for()
                                          : std::string("n/a"))
                         << " hdr_tip=" << (header_chain ? header_chain->height() : 0)
+                        // E-SUPERBLOCK govsync store status (grep-provable on the
+                        // observe-only soak): triggers held / weighted funding
+                        // threshold / distinct peers primed (R5 coverage floor)
+                        // / whether the completeness gate is currently TRUE.
+                        // triggers>0 with coverage>=2 and complete=1 is the
+                        // shape that lets a superblock height serve daemonlessly.
+                        << " gov_triggers="
+                        << (maintainer ? maintainer->gov_store().trigger_count()
+                                       : 0)
+                        << " gov_threshold="
+                        << (maintainer ? maintainer->gov_store().funding_threshold()
+                                       : 0)
+                        << " gov_peers="
+                        << (maintainer
+                                ? maintainer->gov_sync_status().requested_peer_count()
+                                : 0)
+                        << " gov_complete="
+                        << (maintainer
+                                ? (maintainer->gov_sync_complete() ? 1 : 0)
+                                : 0)
                         << " trigger=" << (changed ? "shape-change" : "heartbeat")
                         << " suppressed=" << *embed_since;
                     *embed_shape = shape.str();
@@ -10390,6 +10475,7 @@ int main(int argc, char** argv)
         dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS;
     bool force_won_block = false;              // --regtest-force-won-block: fail-closed regtest E5 harness (drive one real won block through the run-path dual-path)
     bool embedded_superblock = false;          // --embedded-superblock: OPT-IN daemonless superblock payee sourcing via govsync (E-SUPERBLOCK); default OFF = superblock heights fall back to dashd (reward-safe)
+    bool embedded_govsync = false;             // --embedded-govsync: OBSERVE-ONLY arm of the governance sourcing lane (inv 17/18 pull + store populate); default OFF; does NOT arm serving (that is --embedded-superblock)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
@@ -10568,6 +10654,8 @@ int main(int argc, char** argv)
             force_won_block = true;
         else if (std::strcmp(argv[i], "--embedded-superblock") == 0)
             embedded_superblock = true;
+        else if (std::strcmp(argv[i], "--embedded-govsync") == 0)
+            embedded_govsync = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
         else if (std::strcmp(argv[i], "--embedded-utxo-immature-serve-empty") == 0)
@@ -11042,6 +11130,7 @@ int main(int argc, char** argv)
                         embedded_accrue_asset_unlocks, // #143 Variant B
                         embedded_ingest_isdlock,       // G4 isdlock feed
                         embedded_ingest_dstx,          // W5-B DSTX feed
+                        embedded_govsync,              // E-SUPERBLOCK gov-sourcing observe arm
                         embedded_proactive_rotate,    // PR-3 proactive rotation
                         embedded_asn_diversity,        // PR-4 ASN diversity
                         embedded_fold_live_db,         // PR-C1 embedded-fold-live
