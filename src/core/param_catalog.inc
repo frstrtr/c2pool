@@ -217,11 +217,13 @@ C2P_PARAM("coin_p2p.zmq_hashblock", CoinP2P, STRING, RESTART, C_DASH, LIT, "", N
 C2P_PARAM("coin_p2p.producer_target", CoinP2P, HOSTPORT, RESTART, C_DGB, LIT, "", HOSTPORT_V, "embedded P2P producer target")
   C2P_ALIAS("coin_p2p.producer_target", BIN_DGB, "--coin-daemon", VALUE)
 
-C2P_PARAM("coin_p2p.doge_address", CoinP2P, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "doge coin-P2P address")
+C2P_PARAM("coin_p2p.doge_address", CoinP2P, STRING, RESTART, C_LTC|C_DOGE|C_DGB, LIT, "", NONE, "doge coin-P2P address")
   C2P_ALIAS("coin_p2p.doge_address", BIN_LTC, "--doge-p2p-address", VALUE)
+  C2P_ALIAS("coin_p2p.doge_address", BIN_DGB, "--doge-p2p-address", VALUE)
 
-C2P_PARAM("coin_p2p.doge_port", CoinP2P, INT64, RESTART, C_LTC|C_DOGE, LIT, "0", NONE, "doge coin-P2P port")
+C2P_PARAM("coin_p2p.doge_port", CoinP2P, INT64, RESTART, C_LTC|C_DOGE|C_DGB, LIT, "0", NONE, "doge coin-P2P port")
   C2P_ALIAS("coin_p2p.doge_port", BIN_LTC, "--doge-p2p-port", VALUE)
+  C2P_ALIAS("coin_p2p.doge_port", BIN_DGB, "--doge-p2p-port", VALUE)
 
 C2P_PARAM("coin_p2p.address", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "coind P2P address")
   C2P_ALIAS("coin_p2p.address", BIN_LTC, "--coind-p2p-address", VALUE)
@@ -402,9 +404,10 @@ C2P_PARAM("money.coinbase_text", Money, STRING, MONEY_RESTART, C_DASH|C_LTC, LIT
   C2P_ALIAS("money.coinbase_text", BIN_DASH, "--coinbase-text", VALUE)
   C2P_ALIAS("money.coinbase_text", BIN_LTC, "--coinbase-text", VALUE)
 
-C2P_PARAM("merged.spec", Merged, MERGED_SPEC, RESTART, C_BTC|C_LTC|C_NMC, LIT, "", NONE, "merged-mining spec SYMBOL:CHAIN:HOST:PORT:USER:PASS")
+C2P_PARAM("merged.spec", Merged, MERGED_SPEC, RESTART, C_BTC|C_LTC|C_NMC|C_DGB|C_DOGE, LIT, "", NONE, "merged-mining spec SYMBOL:CHAIN:HOST:PORT:USER:PASS")
   C2P_ALIAS("merged.spec", BIN_LTC, "--merged", VALUE)
   C2P_ALIAS("merged.spec", BIN_BTC, "--merged", VALUE)
+  C2P_ALIAS("merged.spec", BIN_DGB, "--merged", VALUE)
 
 C2P_PARAM("merged.coind_address", Merged, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "merged coind address")
   C2P_ALIAS("merged.coind_address", BIN_LTC, "--merged-coind-address", VALUE)
@@ -428,9 +431,10 @@ C2P_PARAM("embedded.ltc_enabled", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE,
   C2P_ALIAS("embedded.ltc_enabled", BIN_LTC, "--embedded-ltc", FLAG)
   C2P_ALIAS("embedded.ltc_enabled", BIN_LTC, "--no-embedded-ltc", FLAG_NO_PREFIX)
 
-C2P_PARAM("embedded.doge_enabled", Embedded, TRISTATE_BOOL, RESTART, C_LTC|C_DOGE, NONE, "", NONE, "embedded DOGE SPV (default on)")
+C2P_PARAM("embedded.doge_enabled", Embedded, TRISTATE_BOOL, RESTART, C_LTC|C_DOGE|C_DGB, NONE, "", NONE, "embedded DOGE SPV (default on)")
   C2P_ALIAS("embedded.doge_enabled", BIN_LTC, "--embedded-doge", FLAG)
   C2P_ALIAS("embedded.doge_enabled", BIN_LTC, "--no-embedded-doge", FLAG_NO_PREFIX)
+  C2P_ALIAS("embedded.doge_enabled", BIN_DGB, "--embedded-doge", FLAG)
 
 C2P_PARAM("embedded.header_checkpoint", Embedded, STRING, RESTART, C_LTC, LIT, "", NONE, "LTC header checkpoint H:HASH")
   C2P_ALIAS("embedded.header_checkpoint", BIN_LTC, "--header-checkpoint", VALUE)
