@@ -65,13 +65,24 @@ capture_one() {  # coin vN args -> normalized dump on stdout
   rm -rf "$dd"
 }
 
-# Instrument-validity floor (the zero-test-run lesson): if NOT ONE coin binary
-# is present, the gate would pass vacuously. Fail loudly instead.
-present=0
-for coin in dash ltc btc dgb bch; do [ -x "$BINDIR/c2pool-$coin" ] && present=$((present+1)); done
-if [ "$present" -eq 0 ] && [ "$MODE" != "--capture" ]; then
-  echo "FAIL: no coin binaries under $BINDIR -- golden gate cannot run (instrument-validity floor)"
-  exit 1
+# Present-check integrity (the zero-test-run lesson, strengthened): this gate is
+# REGISTERED only where the coin binaries are built (see the CMake option
+# C2POOL_GOLDEN_RESOLVED_CONFIG_GATE); the sanitizer lane, which builds no coin
+# binaries, does not register it at all. So when the gate DOES run in verify
+# mode, EVERY coin binary must be present -- a missing one is a NO-SHIP FAILURE,
+# never a silent per-binary skip that could let the release leg green vacuously
+# over a coin whose build was dropped. --capture keeps the lenient behaviour so
+# fixtures can be regenerated from whatever subset is built.
+if [ "$MODE" != "--capture" ]; then
+  missing=""
+  for coin in dash ltc btc dgb bch; do
+    [ -x "$BINDIR/c2pool-$coin" ] || missing="$missing c2pool-$coin"
+  done
+  if [ -n "$missing" ]; then
+    echo "FAIL: coin binaries missing under $BINDIR -- golden gate is a hard present-check and cannot run:$missing"
+    echo "      (registered only where the coin binaries are built; a missing binary is NO-SHIP, not a skip)"
+    exit 1
+  fi
 fi
 
 echo "== golden resolved-config matrix =="
