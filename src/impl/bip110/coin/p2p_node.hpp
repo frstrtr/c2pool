@@ -340,6 +340,21 @@ public:
         }
     }
 
+    /// TIER-3 daemonless input pricing: request one or more parent txs via
+    /// getdata(MSG_WITNESS_TX 0x40000001, BIP 144). A peer answers only from its
+    /// mempool/relay set; an arriving tx flows through the normal message_tx ->
+    /// new_tx path where the run loop prices it (self-authenticating txid).
+    void request_tx(const std::vector<uint256>& txids)
+    {
+        if (!m_peer || txids.empty()) return;
+        std::vector<inventory_type> vinv;
+        vinv.reserve(txids.size());
+        for (const auto& h : txids)
+            vinv.emplace_back(inventory_type::witness_tx, h);
+        auto msg = message_getdata::make_raw(vinv);
+        m_peer->write(msg);
+    }
+
     /// Request a block via plain MSG_BLOCK (0x02) getdata.
     /// Works for any block regardless of MWEB support.
     void request_block(const uint256& block_hash)

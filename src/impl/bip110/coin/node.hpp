@@ -240,6 +240,14 @@ public:
     {
         return m_p2p && m_p2p->is_handshake_complete();
     }
+
+    /// TIER-3 pricing: request parent txs via getdata(MSG_WITNESS_TX). No-op
+    /// when no P2P peer is armed. Used by ParentTxResolver's getdata closure.
+    void request_tx(const std::vector<uint256>& txids)
+    {
+        if (m_p2p)
+            m_p2p->request_tx(txids);
+    }
 };
     
 } // namespace coin

@@ -35,7 +35,7 @@
 
 #include "pseudoheader.hpp"
 
-namespace bip110::coin { class HeaderChain; }
+namespace bip110::coin { class HeaderChain; class Mempool; }
 
 namespace bip110::stratum {
 
@@ -125,6 +125,15 @@ public:
     void set_node_owner_fee_ppm(uint64_t ppm) { node_owner_fee_ppm_ = ppm; }
     void set_create_share_fn(CreateShareFn fn) { create_share_fn_ = std::move(fn); }
 
+    // ── M3 daemonless mempool tx-serving ─────────────────────────────────
+    // Wire the embedded mempool (P2P-ingested, daemonlessly priced) so templates
+    // include REAL network txs instead of coinbase-only EMPTY blocks. serve=false
+    // keeps the coinbase-only M2 behaviour (canary escape hatch). ready_fn gates
+    // serving on the UTXO view being deep enough to price (fail closed to empty
+    // when not ready). The work source only ever READS the mempool.
+    void set_mempool(bip110::coin::Mempool* mp, bool serve, std::function<bool()> ready_fn)
+    { mempool_ = mp; serve_txs_ = serve; utxo_ready_fn_ = std::move(ready_fn); }
+
 private:
     // Recompute the PoW from a submit tuple by rebuilding the 164-byte header from
     // the h2-keyed freeze. Returns false if the job's freeze is unknown/expired.
@@ -161,6 +170,11 @@ private:
     uint64_t                     node_owner_fee_ppm_{0};// node-owner fee, ppm of coinbasevalue (1% = 10000)
     CreateShareFn                create_share_fn_;
 
+    // M3 mempool tx-serving. Read-only pointer; owned by main_bip110.
+    bip110::coin::Mempool*       mempool_{nullptr};
+    bool                         serve_txs_{false};
+    std::function<bool()>        utxo_ready_fn_;
+
     mutable std::mutex           workers_mutex_;
     std::map<std::string, core::stratum::WorkerInfo> workers_;
 
@@ -170,7 +184,22 @@ private:
     // coinbase_block = BIP144 witness serialization for the BLOCK BODY (carries
     //                  the 1x32-byte witness reserved value the commitment output
     //                  requires; == coinbase when no commitment). See DEFECT 1.
-    struct FreezeEntry { HeaderFreeze freeze; std::vector<unsigned char> coinbase; std::vector<unsigned char> coinbase_block; std::chrono::steady_clock::time_point at; };
+    // other_txs      = BIP144 witness-serialized bytes of each non-coinbase tx,
+    //                  in block order (the block BODY after the coinbase).
+    // other_txids    = SHA256d(non-witness) txid of each, same order (merkle).
+    // fee_total      = provable fee sum baked into the coinbase value; the
+    //                  pre-serve + submit xchecks re-derive and compare all three
+    //                  against the frozen bytes (reward-safety, never trust the
+    //                  builder). Empty for a coinbase-only (M2) freeze.
+    struct FreezeEntry {
+        HeaderFreeze freeze;
+        std::vector<unsigned char> coinbase;
+        std::vector<unsigned char> coinbase_block;
+        std::vector<std::vector<unsigned char>> other_txs;
+        std::vector<uint256> other_txids;
+        uint64_t fee_total{0};
+        std::chrono::steady_clock::time_point at;
+    };
     mutable std::mutex           freeze_mutex_;
     mutable std::map<std::string, FreezeEntry> freeze_map_;   // key = hex(h2)
     static constexpr std::chrono::seconds FREEZE_TTL{360};
