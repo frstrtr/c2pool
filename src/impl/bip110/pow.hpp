@@ -50,6 +50,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace bip110::pow
 {
@@ -180,27 +181,46 @@ inline uint256 blake2b_block_hash_v2(std::span<const unsigned char> header)
     std::memcpy(msg3 + 36, h.extranonce, 16);
     const Bytes32 b1 = blake2b256(msg3, sizeof(msg3));
 
-    // (5) b2, flags=0 layout only (proven against live chain data).
-    if (h.flags[0] != 0)
-        throw std::runtime_error("bip110: header flags!=0 layout not supported");
+    // (5) b2 — the Sia-ASIC-shaped pseudo-header. The low 2 bits of flags select
+    // the field layout, per Knots primitives/block.cpp GetHash switch(m_flags&3)
+    // (v29.4.1.knots20260508rc5). flags=0 is the 80-byte Sia-grind layout; 1/2/3
+    // are the alternate arrangements. `zeros` is a uint128 (16 bytes). This
+    // layout is self-validating on a live follower: a wrong arrangement yields a
+    // hash that the next block's prev-reference cannot match, so the chain simply
+    // stalls (fails closed) — it can never graft the node onto a wrong chain.
+    const unsigned char flags2 = static_cast<unsigned char>(h.flags[0] & 0x03);
+    static const unsigned char zeros16[16] = {0};
 
     Bytes32 prevblock_hidden =
         tagged_hash("Bitcoin prevblock header, hashed", rev_prev, 32);
     for (int i = 0; i < 6; ++i)
         prevblock_hidden[i] = 0;
 
-    unsigned char msg4[80];
-    {
-        unsigned char* w = msg4;
-        std::memcpy(w, prevblock_hidden.data(), 32); w += 32;
-        std::memcpy(w, h.nonce, 4);       w += 4;
-        std::memcpy(w, h.nonce2, 4);      w += 4;
-        std::memcpy(w, h.time_offset, 4); w += 4;
-        std::memcpy(w, h.nonce3, 4);      w += 4;
-        std::memcpy(w, b1.data(), 32);    w += 32;
-        // w - msg4 == 80
+    std::vector<unsigned char> pre;
+    pre.reserve(160);
+    auto put = [&](const unsigned char* p, size_t n) { pre.insert(pre.end(), p, p + n); };
+
+    switch (flags2) {
+    case 0:
+        put(prevblock_hidden.data(), 32);
+        put(h.nonce, 4); put(h.nonce2, 4); put(h.time_offset, 4); put(h.nonce3, 4);
+        put(b1.data(), 32);
+        break;
+    case 1:
+        put(h.nonce, 4); put(h.nonce2, 4); put(h.nonce3, 4); put(h.time_offset, 4);
+        put(b1.data(), 32); put(h2.data(), 32);
+        break;
+    case 3:
+        put(zeros16, 16); put(zeros16, 16);
+        [[fallthrough]];
+    case 2:
+        put(zeros16, 16); put(zeros16, 16); put(zeros16, 16);
+        put(h2.data(), 32);
+        put(h.nonce, 4); put(h.nonce2, 4); put(h.time_offset, 4); put(h.nonce3, 4);
+        put(b1.data(), 32);
+        break;
     }
-    const Bytes32 b2 = blake2b256(msg4, sizeof(msg4));
+    const Bytes32 b2 = blake2b256(pre.data(), pre.size());
 
     // (6) xor_key null -> mask all zero -> internal = reverse(b2).
     // (A non-null xor_key path is not exercised by any live block and is not
