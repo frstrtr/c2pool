@@ -1,0 +1,7 @@
+embedded.doge_enabled=false source=cli
+meta.data_dir=<DATADIR> source=cli
+money.give_author_pct=0.1 source=compiled
+network.testnet=true source=cli
+sharechain.listen=0.0.0.0:9326 source=compiled
+stratum.bind=9327 source=cli
+web.port=8081 source=cli

@@ -124,6 +124,8 @@
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
 #include <core/filesystem.hpp>         // core::filesystem::config_path()
+#include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <impl/dash/catalog_defaults.hpp> // M0b L0 compiled defaults
 #include <btclibs/util/strencodings.h> // ParseHexBytes (prefix isolation primitive)
 #include <filesystem>
 #include <system_error>
@@ -10582,6 +10584,9 @@ int main(int argc, char** argv)
     // Operator-supplied miner-facing host for the dashboard Stratum URL.
     // Empty => auto-detect the outbound public IP (current behaviour).
     std::string external_ip;                   // --external-ip / --stratum-advertise / --public-host
+    std::string settings_path;                 // --settings PATH (M0b; empty => default probe)
+    bool want_dump_config = false;             // --dump-resolved-config (M0b)
+    bool want_ack_money   = false;             // --ack-money-settings (M0b)
     // Optional encrypted authority message_data blob for local v36 shares +
     // dashboard transition-notice display (EMIT side, mirror of main_ltc.cpp).
     std::string operator_message_blob_hex;     // --message-blob-hex / --transition-message
@@ -10900,7 +10905,63 @@ int main(int argc, char** argv)
                 return 2;
             }
         }
-        // --selftest is the default; accepted explicitly for symmetry.
+        // Control-plane (M0b). --selftest is documented in usage but had no
+        // branch (it is the default path); it is accepted explicitly here so the
+        // new trailing else does not reject a documented flag.
+        else if (std::strcmp(argv[i], "--selftest") == 0) { /* accept: default path */ }
+        else if (std::strcmp(argv[i], "--settings") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --settings requires a PATH argument\n"; return 1; }
+            settings_path = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--dump-resolved-config") == 0) want_dump_config = true;
+        else if (std::strcmp(argv[i], "--ack-money-settings") == 0)   want_ack_money = true;
+        else {
+            // M0b: reject unknown flags with a nonzero exit (matching LTC/BTC)
+            // instead of silently ignoring them.
+            std::cerr << "unknown argument: " << argv[i] << "\n";
+            return 1;
+        }
+    }
+
+    // ---- M0b control-plane wiring ------------------------------------------
+    // compiled defaults (L0) -> settings file (L1) -> CLI (L2). No file => a
+    // structural no-op (AbsentOk) so the locals above are today's parse result;
+    // the golden gate proves byte identity. Placed BEFORE the replay-utility and
+    // run dispatch so --dump-resolved-config / --ack-money-settings preempt any
+    // run/exit lane. --data-dir was handled in the loop, so the default settings
+    // path sees the final data-dir. Money-class keys stay gated in the loader
+    // (RefusedMoney -> exit 78); CLI money flags keep today's ungated semantics.
+    {
+        namespace cs = c2pool::settings;
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(c2pool::catalog::C_DASH);
+        c2pool::impl::dash::register_catalog_defaults(rc);
+        cs::CliTracker tracker;
+        cs::scan_cli(argc, argv, c2pool::catalog::Bin::BIN_DASH, tracker, rc);
+        bool fatal = false; std::string err;
+        std::string path = cs::resolve_settings_path(settings_path, fatal, err);
+        if (fatal) { std::cerr << err << "\n"; return 78; }
+        if (want_ack_money) {
+            if (path.empty()) { std::cerr << "settings: --ack-money-settings needs a settings file (--settings PATH)\n"; return 78; }
+            std::cout << cs::SettingsFile::compute_money_ack_hash(path, c2pool::catalog::C_DASH) << "\n";
+            return 0;
+        }
+        int rc_code = cs::wire_settings(path, c2pool::catalog::C_DASH, tracker, rc);
+        if (rc_code != 0) return rc_code;
+        if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // Apply file-sourced (L1) values into the locals the node consumes. Only
+        // file-set keys (present && source==File) are applied; CLI-set keys never
+        // become File-sourced (the loader skips tracker keys), so the CLI wins.
+        if (rc.file_set("web.port"))        web_port    = static_cast<uint16_t>(rc.get_u16("web.port").value_or(web_port));
+        if (rc.file_set("stratum.bind"))    parse_listen(rc.get_string("stratum.bind").value_or(""), stratum_host, stratum_port);
+        if (rc.file_set("web.external_ip")) external_ip = rc.get_string("web.external_ip").value_or(external_ip);
+        if (rc.file_set("web.dashboard_dir")) dashboard_dir = rc.get_string("web.dashboard_dir").value_or(dashboard_dir);
+        if (rc.file_set("daemon_rpc.endpoint")) rpc_endpoint = rc.get_string("daemon_rpc.endpoint").value_or(rpc_endpoint);
+        if (rc.file_set("daemon_rpc.auth_file")) rpc_conf_path = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf_path);
+        if (rc.file_set("money.redistribute"))       redistribute_mode  = rc.get_string("money.redistribute").value_or(redistribute_mode);
+        if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
+        if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
+        if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
     }
 
     // ── FULL-HISTORY REPLAY W3: --replay-utxo-* standalone utility ──────────

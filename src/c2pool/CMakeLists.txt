@@ -423,6 +423,30 @@ target_include_directories(test_reward_safe_file PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../core)
 add_test(NAME test_reward_safe_file COMMAND test_reward_safe_file)
 
+# ---- Control-plane M0b: catalog-driven CLI scanner unit test. Same config-only
+# link shape as test_reward_safe_file (core settings TUs compiled directly, no
+# boost/zmq/leveldb). Kills the tracker-under-mark precedence risk mechanically:
+# iterates every catalog alias of every binary and asserts scan_cli marks it.
+add_executable(test_settings_cli_scan
+    test_settings_cli_scan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/settings_cli.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/settings_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/param_catalog.cpp)
+target_include_directories(test_settings_cli_scan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_test(NAME test_settings_cli_scan COMMAND test_settings_cli_scan)
+
+# ---- Control-plane M0b: GOLDEN no-file==today resolved-config gate + the
+# unknown-flag and money-gate end-to-end negatives, run against the built
+# coin binaries. Registered as a ctest AND (see build.yml/ci-required.yml) an
+# explicit workflow step so the Linux/ASan lanes actually exercise it.
+if(UNIX)
+    add_test(NAME golden_resolved_config
+             COMMAND ${CMAKE_COMMAND} -E env bash
+                     ${CMAKE_SOURCE_DIR}/ci/golden_resolved_config.sh
+                     $<TARGET_FILE_DIR:c2pool-dash>)
+endif()
+
 # ---- Control-plane M0: catalog-completeness tripwire (anti-drift, runs offline)
 # Also wired as a GitHub Actions step so it runs on every PR without a build.
 find_package(Python3 COMPONENTS Interpreter QUIET)

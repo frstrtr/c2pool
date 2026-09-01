@@ -47,6 +47,8 @@
 
 #include <core/core_util.hpp>
 #include <core/filesystem.hpp>   // core::filesystem::set_data_dir (--data-dir, #722)
+#include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <impl/bch/catalog_defaults.hpp>  // M0b L0 compiled defaults
 
 #include <cstdlib>
 #include <fstream>
@@ -722,14 +724,21 @@ int main(int argc, char** argv)
     std::string host = "192.168.86.110";   // VM300 bchn-bch
     uint16_t port = 8333;
     uint32_t max_seconds = 600;
+    std::string settings_path;       // --settings PATH (M0b; empty => default probe)
+    bool want_dump_config = false;   // --dump-resolved-config (M0b)
+    bool want_ack_money   = false;   // --ack-money-settings (M0b)
 
+    // Parse loop. M0b: converted from a chain of independent `if`s to an
+    // else-if chain with a trailing else, so an unknown flag is rejected with a
+    // nonzero exit (matching LTC/BTC) instead of being silently ignored. Every
+    // strcmp is a disjoint literal, so the known-flag behaviour is unchanged.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-bch " << C2POOL_VERSION << "\n";
             return 0;
         }
-        if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
-        if (std::strcmp(argv[i], "--data-dir") == 0) {
+        else if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
+        else if (std::strcmp(argv[i], "--data-dir") == 0) {
             // Root all per-instance state (LevelDB sharechain, addr store,
             // logs, ...) under PATH so co-located instances don't contend the
             // LevelDB LOCK. Default keeps ~/.c2pool. See #722.
@@ -739,13 +748,20 @@ int main(int argc, char** argv)
             }
             core::filesystem::set_data_dir(argv[++i]);
         }
-        if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
-        if (std::strcmp(argv[i], "--with-peer-verify") == 0) want_with_peer_verify = true;
-        if (std::strcmp(argv[i], "--pool") == 0)     want_pool = true;
-        if (std::strcmp(argv[i], "--regtest") == 0)  { regtest = true; testnet = true; port = 18444; }
-        if (std::strcmp(argv[i], "--anchor") == 0 && i + 1 < argc)
+        else if (std::strcmp(argv[i], "--settings") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --settings requires a PATH argument\n"; return 1; }
+            settings_path = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--dump-resolved-config") == 0) want_dump_config = true;
+        else if (std::strcmp(argv[i], "--ack-money-settings") == 0)   want_ack_money = true;
+        else if (std::strcmp(argv[i], "--selftest") == 0) { /* accept: default path below runs the selftest */ }
+        else if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
+        else if (std::strcmp(argv[i], "--with-peer-verify") == 0) want_with_peer_verify = true;
+        else if (std::strcmp(argv[i], "--pool") == 0)     want_pool = true;
+        else if (std::strcmp(argv[i], "--regtest") == 0)  { regtest = true; testnet = true; port = 18444; }
+        else if (std::strcmp(argv[i], "--anchor") == 0 && i + 1 < argc)
             anchor_height = static_cast<uint32_t>(std::stoul(argv[++i]));
-        if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
             std::string sp = argv[++i];
             const auto c = sp.rfind(char(58));  // ASCII colon
             if (c != std::string::npos) {
@@ -755,7 +771,7 @@ int main(int argc, char** argv)
                 stratum_port = static_cast<uint16_t>(std::stoul(sp));
             }
         }
-        if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc) {   // H-STATS.944 dashboard bind
+        else if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc) {   // H-STATS.944 dashboard bind
             std::string hp = argv[++i];
             const auto c = hp.rfind(char(58));  // ASCII colon
             if (c != std::string::npos) {
@@ -765,16 +781,16 @@ int main(int argc, char** argv)
                 http_port = static_cast<uint16_t>(std::stoul(hp));
             }
         }
-        if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
-        if (std::strcmp(argv[i], "--leg-c-capture-p2p") == 0) want_leg_c_p2p = true;
-        if (std::strcmp(argv[i], "--p2p-port") == 0 && i + 1 < argc)
+        else if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
+        else if (std::strcmp(argv[i], "--leg-c-capture-p2p") == 0) want_leg_c_p2p = true;
+        else if (std::strcmp(argv[i], "--p2p-port") == 0 && i + 1 < argc)
             leg_c_p2p_port = static_cast<uint16_t>(std::stoul(argv[++i]));
-        if (std::strcmp(argv[i], "--rpc-conf") == 0 && i + 1 < argc) rpc_conf = argv[++i];
-        if (std::strcmp(argv[i], "--testnet") == 0) { testnet = true; port = 18333; }
-        if (std::strcmp(argv[i], "--testnet4") == 0) { testnet4 = true; port = 28333; }
-        if (std::strcmp(argv[i], "--near-tip") == 0) near_tip = true;
-        if (std::strcmp(argv[i], "--auto-kick") == 0) auto_kick = true;
-        if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
+        else if (std::strcmp(argv[i], "--rpc-conf") == 0 && i + 1 < argc) rpc_conf = argv[++i];
+        else if (std::strcmp(argv[i], "--testnet") == 0) { testnet = true; port = 18333; }
+        else if (std::strcmp(argv[i], "--testnet4") == 0) { testnet4 = true; port = 28333; }
+        else if (std::strcmp(argv[i], "--near-tip") == 0) near_tip = true;
+        else if (std::strcmp(argv[i], "--auto-kick") == 0) auto_kick = true;
+        else if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
             std::string hp = argv[++i];
             const auto c = hp.rfind(char(58));  // ASCII colon
             if (c != std::string::npos) {
@@ -784,8 +800,42 @@ int main(int argc, char** argv)
                 host = hp;
             }
         }
-        if (std::strcmp(argv[i], "--max-seconds") == 0 && i + 1 < argc)
+        else if (std::strcmp(argv[i], "--max-seconds") == 0 && i + 1 < argc)
             max_seconds = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else {
+            std::cerr << "unknown argument: " << argv[i] << "\n";
+            return 1;
+        }
+    }
+
+    // ---- M0b control-plane wiring ------------------------------------------
+    // Load order: compiled defaults (L0) -> settings file (L1) -> CLI (L2).
+    // With no settings file this is a structural no-op (AbsentOk) and the locals
+    // above are exactly today's parse result; the golden gate proves byte
+    // identity. --dump-resolved-config / --ack-money-settings preempt the run
+    // and exit before print_banner / any node start.
+    {
+        namespace cs = c2pool::settings;
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(c2pool::catalog::C_BCH);
+        c2pool::impl::bch::register_catalog_defaults(rc);
+        cs::CliTracker tracker;
+        cs::scan_cli(argc, argv, c2pool::catalog::Bin::BIN_BCH, tracker, rc);
+        bool fatal = false; std::string err;
+        std::string path = cs::resolve_settings_path(settings_path, fatal, err);
+        if (fatal) { std::cerr << err << "\n"; return 78; }
+        if (want_ack_money) {
+            if (path.empty()) { std::cerr << "settings: --ack-money-settings needs a settings file (--settings PATH)\n"; return 78; }
+            std::cout << cs::SettingsFile::compute_money_ack_hash(path, c2pool::catalog::C_BCH) << "\n";
+            return 0;
+        }
+        int rc_code = cs::wire_settings(path, c2pool::catalog::C_BCH, tracker, rc);
+        if (rc_code != 0) return rc_code;
+        if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // Apply file-sourced (L1) values into the locals the node consumes.
+        if (rc.file_set("web.port"))        http_port  = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("daemon_rpc.auth_file")) rpc_conf = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf);
+        if (rc.file_set("embedded.anchor")) anchor_height = static_cast<uint32_t>(rc.get_i64("embedded.anchor").value_or(anchor_height));
     }
 
     print_banner(argv[0]);

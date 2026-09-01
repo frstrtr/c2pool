@@ -1,0 +1,6 @@
+meta.data_dir=<DATADIR> source=cli
+money.give_author_pct=0.2 source=cli
+money.node_owner_address=XyZmoneyDest source=cli
+money.node_owner_fee_pct=0.5 source=cli
+sharechain.listen=0.0.0.0:8999 source=compiled
+web.port=8080 source=compiled

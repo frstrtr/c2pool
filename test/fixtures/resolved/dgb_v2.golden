@@ -1,0 +1,6 @@
+coin_p2p.discover=true source=cli
+meta.data_dir=<DATADIR> source=cli
+meta.run=true source=cli
+sharechain.listen=5025 source=cli
+stratum.bind=7902 source=cli
+web.port=8081 source=cli
