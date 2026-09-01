@@ -7294,21 +7294,28 @@ int main(int argc, char* argv[]) {
             // using LTC header chain. Exact values from the block header.
             if (embedded_chain) {
                 auto* hc = embedded_chain.get();
+                auto diff_lookup = [hc](const std::string& block_hash_hex) -> double {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto entry = hc->get_header(h);
+                    if (!entry) return 0.0;
+                    auto target = chain::bits_to_target(entry->header.m_bits);
+                    return chain::target_to_difficulty(target);
+                };
+                auto ts_lookup = [hc](const std::string& block_hash_hex) -> uint32_t {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto entry = hc->get_header(h);
+                    return entry ? entry->header.m_timestamp : 0;
+                };
+                // One-shot backfill of rows restored from persistence.
                 web_server.get_mining_interface()->backfill_block_fields(
-                    [hc](const std::string& block_hash_hex) -> double {
-                        uint256 h;
-                        h.SetHex(block_hash_hex);
-                        auto entry = hc->get_header(h);
-                        if (!entry) return 0.0;
-                        auto target = chain::bits_to_target(entry->header.m_bits);
-                        return chain::target_to_difficulty(target);
-                    },
-                    [hc](const std::string& block_hash_hex) -> uint32_t {
-                        uint256 h;
-                        h.SetHex(block_hash_hex);
-                        auto entry = hc->get_header(h);
-                        return entry ? entry->header.m_timestamp : 0;
-                    });
+                    diff_lookup, ts_lookup);
+                // Retain the same lookups so the record + confirm paths can fill
+                // a missing network_difficulty for blocks won AFTER this backfill
+                // runs, whose luck point the one-shot backfill can never reach.
+                web_server.get_mining_interface()->set_block_field_lookups(
+                    diff_lookup, ts_lookup);
             }
 
             // #159 (G2): re-verify any found block that was still pending at the

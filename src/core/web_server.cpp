@@ -2636,7 +2636,18 @@ nlohmann::json MiningInterface::rest_recent_blocks()
         std::string method;
         if (!have_local_record)                    method = "relayed";
         else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
+        else if (b.time_to_find > 0)               method = "netdiff_unavailable";
         else                                       method = "first_block";
+        // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
+        // two distinct rows. A genuine first block has no earlier same-chain row,
+        // so time_to_find is 0 and no luck can exist. A row with time_to_find>0
+        // but no luck HAS a predecessor — its luck was uncomputable only because
+        // network_difficulty was never captured at find time. Labelling the
+        // second case "first_block" made the UI tooltip claim it was the pool's
+        // first block, which is false for any row after the first. The netdiff
+        // repair paths normally fill that difficulty and this row becomes
+        // "simple_avg"; the label survives only for a row whose header is still
+        // unavailable (never synced), where it correctly reads "unavailable".
         // #942 second slice, extended to EVERY unmeasured field (hotel,
         // 2026-08-05): the primary's rows for our own blocks rendered
         // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
@@ -3606,6 +3617,21 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         if (network_difficulty <= 0.0)
             network_difficulty =
                 m_network_difficulty.load(std::memory_order_relaxed);
+        // FINAL fallback: the block's OWN header carries the exact difficulty in
+        // its nBits. The live-template and cache fallbacks above are both empty
+        // when a block is recorded off the fast path — a sharechain-replay or
+        // relayed win recorded early in boot, before the first template exists
+        // and before any /local_stats poll refreshed the cache. That is exactly
+        // the case (block won during a fork/crash window, learned via replay 37s
+        // after restart) that persisted network_difficulty=0 and lost the luck
+        // point for the winning block. Ask the header chain by hash; it is the
+        // authoritative, purely-daemonless source and needs no live state.
+        if (network_difficulty <= 0.0 && m_block_diff_lookup_fn) {
+            try {
+                double d = m_block_diff_lookup_fn(hash_hex);
+                if (d > 0.0) network_difficulty = d;
+            } catch (...) {}
+        }
     }
 
     // Runtime dedup — with ENRICHMENT. Measured (hotel primary): rows for
@@ -3632,9 +3658,13 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             // found the block, and that is exactly the row this field exists
             // to correct. EnrichmentRaisesAuthorshipAndNeverLowersIt proved
             // this red before the fix.
+            bool row_dirty = false;      // any field changed -> persist once
+            bool luck_input_changed = false;  // netdiff/hashrate -> recompute luck
+
             const bool authorship_raised = authorship > existing.authorship;
             if (authorship_raised) {
                 existing.authorship = authorship;
+                row_dirty = true;
                 LOG_INFO << "[Pool] found-block AUTHORSHIP raised: h="
                          << existing.height << " hash="
                          << hash_hex.substr(0, 16) << " -> "
@@ -3651,30 +3681,63 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                 existing.share_hash = share_hash;
                 if (existing.share_difficulty <= 0.0)
                     existing.share_difficulty = share_difficulty;
-                if (existing.network_difficulty <= 0.0)
+                if (existing.network_difficulty <= 0.0 && network_difficulty > 0.0) {
                     existing.network_difficulty = network_difficulty;
-                if (existing.pool_hashrate <= 0.0)
+                    luck_input_changed = true;
+                }
+                if (existing.pool_hashrate <= 0.0 && pool_hashrate > 0.0) {
                     existing.pool_hashrate = pool_hashrate;
+                    luck_input_changed = true;
+                }
                 if (existing.subsidy == 0) existing.subsidy = subsidy;
+                row_dirty = true;
                 LOG_INFO << "[Pool] found-block row ENRICHED (was recorded"
                             " unattributed): h=" << existing.height
                          << " hash=" << hash_hex.substr(0, 16)
                          << " miner=" << miner;
-                if (m_persist_block_fn) {
-                    try { m_persist_block_fn(existing); }
-                    catch (const std::exception& e) {
-                        LOG_WARNING << "[Pool] Failed to persist enriched"
-                                       " found block: " << e.what();
-                    }
+            }
+
+            // NETWORK-DIFFICULTY REPAIR — independent of attribution state.
+            // A row can be fully attributed (a sharechain-peer win carries both
+            // miner + share_hash) yet still hold network_difficulty=0, because
+            // it was recorded off the fast path with no template/cache/header to
+            // read at that instant. That row loses its luck point permanently:
+            // the enrichment branch above never runs (the row is already
+            // attributed), backfill_block_fields already ran at startup, and
+            // recompute needs a non-zero difficulty. Fill it here from a later
+            // record that carries one, or from the block's own header, whenever
+            // the stored value is still absent. This is the general form of the
+            // enrichment fill, lifted out of the unattributed-only branch.
+            if (existing.network_difficulty <= 0.0) {
+                double nd = network_difficulty > 0.0 ? network_difficulty : 0.0;
+                if (nd <= 0.0 && m_block_diff_lookup_fn) {
+                    try {
+                        double d = m_block_diff_lookup_fn(existing.hash);
+                        if (d > 0.0) nd = d;
+                    } catch (...) {}
                 }
-            } else if (authorship_raised && m_persist_block_fn) {
-                // Authorship changed on a row that needed no other enrichment.
-                // Without this the raise lives only in memory and the restored
-                // row reasserts the wrong finder after every restart.
+                if (nd > 0.0) {
+                    existing.network_difficulty = nd;
+                    row_dirty = true;
+                    luck_input_changed = true;
+                    LOG_INFO << "[Pool] found-block network_difficulty filled: h="
+                             << existing.height << " hash="
+                             << hash_hex.substr(0, 16) << " diff=" << nd;
+                }
+            }
+
+            // A changed luck input means the derived expected_time/luck are now
+            // computable (or stale); recompute the whole series while we hold the
+            // lock. Only fills fields still at 0, so it never clobbers a live
+            // value on any other row.
+            if (luck_input_changed)
+                recompute_found_block_luck_locked();
+
+            if (row_dirty && m_persist_block_fn) {
                 try { m_persist_block_fn(existing); }
                 catch (const std::exception& e) {
-                    LOG_WARNING << "[Pool] Failed to persist raised"
-                                   " authorship: " << e.what();
+                    LOG_WARNING << "[Pool] Failed to persist updated found"
+                                   " block: " << e.what();
                 }
             }
             return;  // already recorded (possibly just enriched)
@@ -3928,30 +3991,62 @@ void MiningInterface::reverify_pending_found_blocks()
              << " restored pending found block(s)";
 }
 
+void MiningInterface::set_block_field_lookups(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn)
+{
+    m_block_diff_lookup_fn = std::move(diff_fn);
+    m_block_ts_lookup_fn = std::move(ts_fn);
+}
+
 void MiningInterface::backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn)
 {
-    std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    int diff_filled = 0, ts_filled = 0;
-    for (auto& blk : m_found_blocks) {
-        if (!blk.hash.empty()) {
-            if (diff_fn && blk.network_difficulty == 0.0) {
-                double diff = diff_fn(blk.hash);
-                if (diff > 0) { blk.network_difficulty = diff; ++diff_filled; }
+    std::vector<FoundBlock> repaired;   // snapshot rows to persist AFTER unlocking
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        int diff_filled = 0, ts_filled = 0;
+        for (auto& blk : m_found_blocks) {
+            if (!blk.hash.empty()) {
+                bool changed = false;
+                if (diff_fn && blk.network_difficulty == 0.0) {
+                    double diff = diff_fn(blk.hash);
+                    if (diff > 0) { blk.network_difficulty = diff; ++diff_filled; changed = true; }
+                }
+                if (ts_fn) {
+                    uint32_t ts = ts_fn(blk.hash);
+                    if (ts > 0 && blk.ts != ts) { blk.ts = ts; ++ts_filled; changed = true; }
+                }
+                if (changed) repaired.push_back(blk);
             }
-            if (ts_fn) {
-                uint32_t ts = ts_fn(blk.hash);
-                if (ts > 0 && blk.ts != ts) { blk.ts = ts; ++ts_filled; }
+        }
+        if (diff_filled > 0)
+            LOG_INFO << "[Pool] Backfilled network_difficulty on " << diff_filled << " found block(s)";
+        if (ts_filled > 0)
+            LOG_INFO << "[Pool] Backfilled timestamp on " << ts_filled << " found block(s)";
+        // #159 (G3/G5): a backfilled network_difficulty or timestamp is an input
+        // to the luck series, so recompute the derived fields now that they are
+        // known. Refresh the persist snapshot from the recomputed rows so the
+        // luck/expected_time/time_to_find just derived are written too.
+        if (diff_filled > 0 || ts_filled > 0) {
+            recompute_found_block_luck_locked();
+            for (auto& r : repaired)
+                for (const auto& blk : m_found_blocks)
+                    if (blk.hash == r.hash && blk.chain == r.chain) { r = blk; break; }
+        }
+    }
+    // PERSIST the repaired rows. Previously backfill filled the fields in memory
+    // ONLY, so every restart re-derived them transiently and a row whose header
+    // was unavailable at record time never healed durably — it healed for the
+    // lifetime of each process and reverted to network_difficulty=0 (luck null)
+    // on the next load. Writing them back makes the repair permanent. Done
+    // outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer, which
+    // must not run under the blocks lock.
+    if (m_persist_block_fn) {
+        for (const auto& blk : repaired) {
+            try { m_persist_block_fn(blk); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist backfilled found block: " << e.what();
             }
         }
     }
-    if (diff_filled > 0)
-        LOG_INFO << "[Pool] Backfilled network_difficulty on " << diff_filled << " found block(s)";
-    if (ts_filled > 0)
-        LOG_INFO << "[Pool] Backfilled timestamp on " << ts_filled << " found block(s)";
-    // #159 (G3/G5): a backfilled network_difficulty or timestamp is an input to
-    // the luck series, so recompute the derived fields now that they are known.
-    if (diff_filled > 0 || ts_filled > 0)
-        recompute_found_block_luck_locked();
 }
 
 void MiningInterface::set_merged_block_store(std::shared_ptr<void> store) { m_merged_block_store = std::move(store); }
@@ -4004,6 +4099,27 @@ void MiningInterface::verify_found_block(size_t index)
 
     if (result > 0) {
         blk.confirmations = static_cast<uint32_t>(result);
+
+        // VERDICT-TIME LUCK REPAIR. A block confirmed by the header chain has,
+        // by definition, an on-chain header now — so its exact difficulty is
+        // available even if it was not at record time. This closes the case the
+        // record-path fallback cannot: a win learned via replay/relay whose
+        // header had not yet synced when the row was created (network_difficulty
+        // persisted as 0, luck lost). Fill it on confirmation and recompute the
+        // derived luck series; the status change below triggers the persist that
+        // makes it durable.
+        if (blk.network_difficulty <= 0.0 && m_block_diff_lookup_fn) {
+            try {
+                double d = m_block_diff_lookup_fn(blk.hash);
+                if (d > 0.0) {
+                    blk.network_difficulty = d;
+                    recompute_found_block_luck_locked();
+                    LOG_INFO << "[Pool] found-block network_difficulty filled at"
+                                " confirmation: h=" << blk.height << " hash="
+                             << blk.hash.substr(0, 16) << " diff=" << d;
+                }
+            } catch (...) {}
+        }
 
         if (blk.status == BlockStatus::pending) {
             blk.status = BlockStatus::confirmed;

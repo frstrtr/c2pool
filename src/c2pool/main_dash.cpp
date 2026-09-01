@@ -9684,21 +9684,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // difficulty. backfill_block_fields internally re-derives the luck trend.
         if (header_chain) {
             auto* hc = header_chain.get();
-            cache_mi->backfill_block_fields(
-                [hc](const std::string& block_hash_hex) -> double {
-                    uint256 h;
-                    h.SetHex(block_hash_hex);
-                    auto e = hc->get_header(h);
-                    if (!e) return 0.0;
-                    return chain::target_to_difficulty(
-                        chain::bits_to_target(e->header.m_bits));
-                },
-                [hc](const std::string& block_hash_hex) -> uint32_t {
-                    uint256 h;
-                    h.SetHex(block_hash_hex);
-                    auto e = hc->get_header(h);
-                    return e ? e->header.m_timestamp : 0;
-                });
+            auto diff_lookup = [hc](const std::string& block_hash_hex) -> double {
+                uint256 h;
+                h.SetHex(block_hash_hex);
+                auto e = hc->get_header(h);
+                if (!e) return 0.0;
+                return chain::target_to_difficulty(
+                    chain::bits_to_target(e->header.m_bits));
+            };
+            auto ts_lookup = [hc](const std::string& block_hash_hex) -> uint32_t {
+                uint256 h;
+                h.SetHex(block_hash_hex);
+                auto e = hc->get_header(h);
+                return e ? e->header.m_timestamp : 0;
+            };
+            // One-shot backfill of rows restored from persistence.
+            cache_mi->backfill_block_fields(diff_lookup, ts_lookup);
+            // Retain the same lookups so the record + confirm paths can fill a
+            // missing network_difficulty for blocks won AFTER this backfill runs
+            // (sharechain-replay / relay wins recorded seconds into boot), whose
+            // luck point the one-shot backfill can never reach.
+            cache_mi->set_block_field_lookups(diff_lookup, ts_lookup);
         }
 
         // #159 (G2): the verifier + io_context are now live, so drive a
