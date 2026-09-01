@@ -222,19 +222,31 @@ inline uint256 blake2b_block_hash_v2(std::span<const unsigned char> header)
     }
     const Bytes32 b2 = blake2b256(pre.data(), pre.size());
 
-    // (6) xor_key null -> mask all zero -> internal = reverse(b2).
-    // (A non-null xor_key path is not exercised by any live block and is not
-    // ported here; live templates set xor_key = null.)
+    // (6) Final XOR mask (Knots primitives/block.cpp). A null xor_key leaves the
+    // mask all-zero, so internal = reverse(b2). A non-null xor_key derives
+    //   mask = TaggedHash("Bitcoin block hash PoW XOR mask", xor_key).GetSHA256()
+    // then zeroes the first clear_bits bits of the mask (whole bytes + a partial
+    // top-bit clear on the next byte) so the PoW leading zeros are preserved.
+    // The final hash is written reversed: internal[31-i] = b2[i] XOR mask[i].
+    Bytes32 mask{};  // zero-initialized -> no-op XOR when xor_key is null
     bool xor_key_null = true;
     for (int i = 0; i < 16; ++i)
         if (h.xor_key[i] != 0) { xor_key_null = false; break; }
-    if (!xor_key_null)
-        throw std::runtime_error("bip110: non-null xor_key mask not supported");
+    if (!xor_key_null) {
+        mask = tagged_hash("Bitcoin block hash PoW XOR mask", h.xor_key, 16);
+        const unsigned cb    = static_cast<unsigned>(h.clear_bits[0]);
+        const unsigned whole = cb / 8;
+        for (unsigned i = 0; i < whole && i < 32; ++i)
+            mask[i] = 0;
+        const unsigned rem = cb % 8;
+        if (rem && whole < 32)
+            mask[whole] &= static_cast<unsigned char>(0xFFu >> rem);
+    }
 
     uint256 result;
     unsigned char* d = result.data();
     for (int i = 0; i < 32; ++i)
-        d[i] = b2[31 - i];
+        d[i] = static_cast<unsigned char>(b2[31 - i] ^ mask[31 - i]);
     return result;
 }
 
