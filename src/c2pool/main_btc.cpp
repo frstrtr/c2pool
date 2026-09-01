@@ -69,6 +69,7 @@
 #include <core/coin/utxo_view_db.hpp>
 #include <core/filesystem.hpp>
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/btc/catalog_defaults.hpp>  // M0b L0 compiled defaults
 #include <core/log.hpp>
 #include <core/netaddress.hpp>
@@ -434,6 +435,13 @@ int main(int argc, char* argv[])
         int rc_code = cs::wire_settings(path, c2pool::catalog::C_BTC, tracker, rc);
         if (rc_code != 0) return rc_code;
         if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
+        // for the read-only control-plane endpoints. COPY (not move): any
+        // file->locals overlay below still reads rc. Startup resolution
+        // unchanged (golden gate byte-identical).
+        c2pool::config_endpoint::publish_resolved(
+            std::make_shared<const cs::ResolvedConfig>(rc),
+            c2pool::catalog::C_BTC, path);
         // Apply file-sourced (L1) values into the locals the node consumes.
         auto split_hostport = [](const std::string& v, std::string& h, uint16_t& p) {
             auto c = v.rfind(':');
@@ -2599,6 +2607,12 @@ int main(int argc, char* argv[])
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
 #endif
+        // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
+        // (lambdas read the immutable snapshot published in main()). POST
+        // /api/config/apply stays inert (503); runtime mutation not armed.
+        mi->set_config_fns(
+            []() { return c2pool::config_endpoint::resolved_config_json(); },
+            []() { return c2pool::config_endpoint::catalog_schema_json(); });
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
         // Advertise this node's REAL runtime ports on /node_info (was reporting

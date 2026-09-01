@@ -35,6 +35,7 @@
 #include <core/pack.hpp>
 #include <core/filesystem.hpp>
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/ltc/catalog_defaults.hpp>  // M0b L0 compiled defaults
 #include <core/log.hpp>
 #include <core/uint256.hpp>
@@ -1459,6 +1460,13 @@ int main(int argc, char* argv[]) {
         int rc_code = cs::wire_settings(path, c2pool::catalog::C_LTC, tracker, rc);
         if (rc_code != 0) return rc_code;
         if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
+        // for the read-only control-plane endpoints. COPY (not move): any
+        // file->locals overlay below still reads rc. Startup resolution
+        // unchanged (golden gate byte-identical).
+        c2pool::config_endpoint::publish_resolved(
+            std::make_shared<const cs::ResolvedConfig>(rc),
+            c2pool::catalog::C_LTC, path);
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))         http_port  = static_cast<int>(rc.get_u16("web.port").value_or(static_cast<uint16_t>(http_port)));
         if (rc.file_set("web.host"))         http_host  = rc.get_string("web.host").value_or(http_host);
@@ -1757,6 +1765,12 @@ int main(int argc, char* argv[]) {
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port),
                                      settings->m_testnet, enhanced_node, blockchain);
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
+            // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
+            // (lambdas read the immutable snapshot published in main()). POST
+            // /api/config/apply stays inert (503); runtime mutation not armed.
+            web_server.get_mining_interface()->set_config_fns(
+                []() { return c2pool::config_endpoint::resolved_config_json(); },
+                []() { return c2pool::config_endpoint::catalog_schema_json(); });
             web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
             web_server.get_mining_interface()->set_worker_port(static_cast<uint16_t>(stratum_port));
             web_server.get_mining_interface()->set_p2p_port(static_cast<uint16_t>(p2p_port));

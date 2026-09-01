@@ -125,6 +125,7 @@
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
 #include <core/filesystem.hpp>         // core::filesystem::config_path()
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
+#include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/dash/catalog_defaults.hpp> // M0b L0 compiled defaults
 #include <btclibs/util/strencodings.h> // ParseHexBytes (prefix isolation primitive)
 #include <filesystem>
@@ -1309,6 +1310,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             c2pool::address::Blockchain::DASH);
 
         auto* mi = web_server->get_mining_interface();
+
+        // ── Control-plane M1 (SAFE): install the READ-ONLY config endpoints.
+        // The lambdas read the immutable snapshot published in main() (before
+        // run_node) at request time, so install order is irrelevant. No node
+        // state is touched. POST /api/config/apply stays inert (503) in
+        // http_session.cpp — runtime mutation is operator-gated, not armed.
+        mi->set_config_fns(
+            []() { return c2pool::config_endpoint::resolved_config_json(); },
+            []() { return c2pool::config_endpoint::catalog_schema_json(); });
 
         // ── Peer-info liveness: serialize the HTTP-cache rebuild onto the
         // io_context thread (main_ltc.cpp parity). Once the io_context is wired,
@@ -10949,6 +10959,15 @@ int main(int argc, char** argv)
         int rc_code = cs::wire_settings(path, c2pool::catalog::C_DASH, tracker, rc);
         if (rc_code != 0) return rc_code;
         if (want_dump_config) { cs::dump_resolved(rc); return 0; }
+        // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
+        // for the read-only control-plane endpoints (GET /api/config[/schema],
+        // installed at web setup in run_node). COPY (not move): the file->locals
+        // overlay below still reads rc. Placed AFTER the --dump-resolved-config
+        // early-exit so the dump lane never reaches it; the startup resolution
+        // is unchanged (golden gate byte-identical).
+        c2pool::config_endpoint::publish_resolved(
+            std::make_shared<const cs::ResolvedConfig>(rc),
+            c2pool::catalog::C_DASH, path);
         // Apply file-sourced (L1) values into the locals the node consumes. Only
         // file-set keys (present && source==File) are applied; CLI-set keys never
         // become File-sourced (the loader skips tracker keys), so the CLI wins.

@@ -72,6 +72,7 @@
 #include <core/log.hpp>
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>       // H-STATS.944: operator dashboard + graph_db persist
+#include <core/config_endpoint.hpp>  // M1 control-plane READ-ONLY endpoints
 #include <core/filesystem.hpp>      // config_path() for the graph_db location
 #include <functional>
 #include <ctime>       // std::time (found-block record timestamp)
@@ -680,6 +681,12 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
 #endif
+        // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
+        // (lambdas read the immutable snapshot published in main_bch). POST
+        // /api/config/apply stays inert (503); runtime mutation not armed.
+        mi->set_config_fns(
+            []() { return c2pool::config_endpoint::resolved_config_json(); },
+            []() { return c2pool::config_endpoint::catalog_schema_json(); });
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
         // Advertise the REAL stratum bind as worker_port (was the LTC-template

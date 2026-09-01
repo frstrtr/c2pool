@@ -5464,6 +5464,30 @@ nlohmann::json MiningInterface::rest_embedded_template()
         {"note", "embedded-template endpoint not wired on this node"}};
 }
 
+nlohmann::json MiningInterface::rest_config()
+{
+    // Control-plane M1 (SAFE): read-only resolved LAUNCH config. The fn reads
+    // the immutable published snapshot (config_endpoint::resolved_config_json).
+    if (m_config_fn) {
+        auto j = m_config_fn();
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"error", "config endpoint not wired"}};
+}
+
+nlohmann::json MiningInterface::rest_config_schema()
+{
+    // Control-plane M1 (SAFE): read-only param-catalog schema (compiled
+    // constants; feeds qt form generation in M2).
+    if (m_config_schema_fn) {
+        auto j = m_config_schema_fn();
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"error", "config schema endpoint not wired"}};
+}
+
 nlohmann::json MiningInterface::rest_node_topology()
 {
     // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer
