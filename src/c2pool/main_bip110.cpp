@@ -20,10 +20,12 @@
 #include <impl/bip110/coin/node_interface.hpp>
 #include <impl/bip110/coin/coin_peer_manager.hpp>
 #include <impl/bip110/coin/chain_seeds.hpp>
+#include <impl/bip110/stratum/work_source.hpp>
 
 #include <core/uint256.hpp>
 #include <core/target_utils.hpp>
 #include <core/netaddress.hpp>
+#include <core/stratum_server.hpp>
 #include <core/log.hpp>
 
 #include <boost/asio.hpp>
@@ -196,7 +198,8 @@ private:
 int run_embedded(bool coin_p2p_discover,
                  const std::vector<NetService>& explicit_peers,
                  bool fork_checkpoint,
-                 const std::string& http_host, uint16_t http_port)
+                 const std::string& http_host, uint16_t http_port,
+                 uint16_t stratum_port)
 {
     core::log::Logger::init();
 
@@ -233,6 +236,31 @@ int run_embedded(bool coin_p2p_discover,
 
     bip110::coin::Node<MiniConfig> coin_node(&ioc, &config);
 
+    // ── M2 MINING: stratum server + BLAKE2b Sv1 work source (miner-facing) ──
+    // submit_block_fn relays a won 164-byte v2 block to the FORK peers over the
+    // coin P2P (submit_block_with_fallback: P2P relay + optional submitblock RPC
+    // backup). The work source serves coinbase-only jobs, validates shares with
+    // an independent BLAKE2b recompute, and dispatches block-target hits here.
+    auto stratum_submit_fn =
+        [&coin_node](const std::vector<unsigned char>& block_bytes, uint32_t height) -> bool {
+            LOG_INFO << "[EMB-BIP110] submitting won block height=" << height
+                     << " bytes=" << block_bytes.size();
+            return coin_node.submit_block_with_fallback(block_bytes);
+        };
+    auto work_source = std::make_shared<bip110::stratum::Bip110WorkSource>(
+        header_chain, /*is_testnet=*/false, std::move(stratum_submit_fn));
+
+    std::unique_ptr<core::StratumServer> stratum_server;
+    if (stratum_port != 0) {
+        stratum_server = std::make_unique<core::StratumServer>(
+            ioc, "0.0.0.0", stratum_port, work_source);
+        if (stratum_server->start())
+            LOG_INFO << "[EMB-BIP110] stratum server LIVE on :" << stratum_port
+                     << " (BLAKE2b Sv1 work source, coinbase-only M2)";
+        else
+            LOG_WARNING << "[EMB-BIP110] stratum server failed to bind :" << stratum_port;
+    }
+
     auto header_block_hash = [](const bip110::coin::BlockHeaderType& hdr) {
         return bip110::coin::block_hash(hdr);
     };
@@ -240,13 +268,15 @@ int run_embedded(bool coin_p2p_discover,
     auto hdr_caught_up = std::make_shared<bool>(false);
 
     // Ingest header batches, drive the peer's start_height into the fast-sync
-    // gate, and chain the next getheaders forward until caught up.
+    // gate, and chain the next getheaders forward until caught up. Bump the work
+    // generation on every fork-tip move so stratum sessions re-push fresh work.
     coin_node.new_headers.subscribe(
-        [&header_chain, &coin_node, header_block_hash, hdr_caught_up]
+        [&header_chain, &coin_node, header_block_hash, hdr_caught_up, work_source]
         (const std::vector<bip110::coin::BlockHeaderType>& headers)
         {
             if (headers.empty()) return;
             int accepted = header_chain.add_headers(headers);
+            if (accepted > 0) work_source->bump_work_generation();
             uint256 last_hash = header_block_hash(headers.back());
             const auto& lh = headers.back();
             LOG_INFO << "[EMB-BIP110] new_headers: received=" << headers.size()
@@ -414,6 +444,7 @@ int main(int argc, char** argv)
     bool fork_checkpoint = false;
     std::string http_host = "0.0.0.0";
     uint16_t http_port = 0;
+    uint16_t stratum_port = 9336;  // BIP-110 Stratum port (params.hpp worker_port)
     std::vector<NetService> explicit_peers;
 
     auto parse_hostport = [](const std::string& v, std::string& h, uint16_t& p) {
@@ -438,6 +469,10 @@ int main(int argc, char** argv)
         else if (a == "--http" && i + 1 < argc) {
             parse_hostport(argv[++i], http_host, http_port);
         }
+        else if (a == "--stratum" && i + 1 < argc) {
+            stratum_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        }
+        else if (a == "--no-stratum") { stratum_port = 0; }
     }
 
     if (run) {
@@ -445,7 +480,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_port);
     }
 
     print_banner(argv[0]);

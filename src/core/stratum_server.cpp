@@ -1538,7 +1538,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // Populate from live block template
     {
         gbt_prevhash = tmpl.value("previousblockhash", "");
-        prevhash = gbt_to_stratum_prevhash(gbt_prevhash);
+        // BIP-110: the wire prevhash is the raw Sia prevblock_hidden; other coins
+        // apply the BE-display -> stratum-internal transform (default).
+        prevhash = mining_interface_->get_stratum_config().raw_prevhash_wire
+                       ? gbt_prevhash
+                       : gbt_to_stratum_prevhash(gbt_prevhash);
 
         version_u32 = static_cast<uint32_t>(tmpl.value("version", 0x20000000));
         std::ostringstream ss;
@@ -1638,7 +1642,9 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // Work sources that leave has_header false are byte-unchanged.
     if (cbr.snapshot.has_header) {
         gbt_prevhash = cbr.snapshot.gbt_prevhash;
-        prevhash     = gbt_to_stratum_prevhash(gbt_prevhash);
+        prevhash     = mining_interface_->get_stratum_config().raw_prevhash_wire
+                           ? gbt_prevhash
+                           : gbt_to_stratum_prevhash(gbt_prevhash);
         version_u32  = cbr.snapshot.header_version;
         {
             std::ostringstream ss;
