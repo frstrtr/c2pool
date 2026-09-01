@@ -24,7 +24,7 @@ on:
 # oversubscription root cause, not just queue depth). Per-ref group so
 # distinct PRs/branches never cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: coin-matrix-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 
