@@ -273,14 +273,24 @@ struct BTCChainParams {
 /// DASH's X11). Function name `scrypt_hash` retained for cross-coin callsite
 /// symmetry. Throws from pow.hpp on unsupported flags/xor_key layouts — callers
 /// in add_header_internal catch-and-reject so one hostile header can't crash us.
-inline uint256 scrypt_hash(const BlockHeaderType& header) {
+// Shared dispatch: pack the header (80 bytes v1 / 164 bytes v2) and hash it
+// through the BIP-110 pipeline. get_span() yields std::span<std::byte>; the pow
+// entrypoint wants std::span<const unsigned char>, so re-view the same bytes.
+inline uint256 bip110_identity_hash(const BlockHeaderType& header) {
     auto packed = pack(header);
+    auto sp = packed.get_span();
+    std::span<const unsigned char> bytes(
+        reinterpret_cast<const unsigned char*>(sp.data()), sp.size());
     try {
-        return bip110::pow::blake2b_block_hash(packed.get_span());
+        return bip110::pow::blake2b_block_hash(bytes);
     } catch (const std::exception& e) {
         LOG_WARNING << "[EMB-BIP110] blake2b hash threw (unsupported header layout): " << e.what();
         return uint256::ZERO;  // sentinel: caller rejects a null hash
     }
+}
+
+inline uint256 scrypt_hash(const BlockHeaderType& header) {
+    return bip110_identity_hash(header);
 }
 
 /// Compute the BIP-110 block-identity hash (getdata/inv/index/locator key).
@@ -288,13 +298,7 @@ inline uint256 scrypt_hash(const BlockHeaderType& header) {
 /// Returns uint256::ZERO on an unsupported v2 layout (never a real hash), so a
 /// hostile/future header is rejected rather than crashing the node.
 inline uint256 block_hash(const BlockHeaderType& header) {
-    auto packed = pack(header);
-    try {
-        return bip110::pow::blake2b_block_hash(packed.get_span());
-    } catch (const std::exception& e) {
-        LOG_WARNING << "[EMB-BIP110] blake2b hash threw (unsupported header layout): " << e.what();
-        return uint256::ZERO;
-    }
+    return bip110_identity_hash(header);
 }
 
 /// Compute the target from compact nBits representation.
