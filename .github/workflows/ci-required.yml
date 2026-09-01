@@ -38,10 +38,13 @@ jobs:
   bch-g3b:
     uses: ./.github/workflows/bch-gate-g3b-genuine-activation.yml
     secrets: inherit
+  btc-daemonless-smoke:
+    uses: ./.github/workflows/btc-embedded-standalone-smoke.yml
+    secrets: inherit
 
   aggregate:
     name: aggregate
-    needs: [param-catalog-tripwire, coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b]
+    needs: [param-catalog-tripwire, coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b, btc-daemonless-smoke]
     if: always()
     runs-on: ubuntu-24.04
     steps:
