@@ -10,26 +10,33 @@
 // NO coin daemon there is no getblocktemplate to hand us an ordered tx list —
 // we build it ourselves from the embedded mempool.
 //
-// REWARD-SAFETY (money path): the cloned flat-feerate selector
-// (mempool.hpp get_sorted_txs_with_fees) admits a CPFP child whose in-mempool
-// parent is merely "present" without requiring the parent to be SELECTED AND
-// ORDERED FIRST — a high-feerate child of a low-feerate parent could enter a
-// template alone => missing-inputs => consensus-INVALID block => lost reward.
-// This assembler fixes that with a HARD topological invariant:
-//   (1) a tx is a candidate only if it is fee_known (priced snapshot) AND every
-//       in-mempool parent is ALSO priced (else the parent could never be
-//       included, so the child is excluded — fail closed);
-//   (2) a selected package emits its unselected in-mempool ancestors FIRST, in
-//       topological (parents-before-child) order;
-//   (3) a final O(n) verification pass proves every selected tx's in-mempool
-//       parents appear at a lower index — belt-and-suspenders against scorer
-//       bugs; on any violation the offending suffix is dropped (never emitted).
+// REWARD-SAFETY (money path). Four hard invariants make a selected set a VALID
+// block or nothing:
+//   (1) TOPOLOGY — a tx is a candidate only if it is fee_known AND every input
+//       is either an in-template priced parent (emitted first) or a CONFIRMED &
+//       MATURE coin in the post-anchor UTXO view (GAP2's inclusion rule). A
+//       child whose parent is merely in a peer's mempool / a stale cached fee /
+//       an evicted unconfirmed parent is EXCLUDED — including it alone is a
+//       missing-inputs INVALID block.
+//   (2) NO DOUBLE-SPEND — a claimed-outpoint set rejects any tx whose input was
+//       already claimed by an earlier-emitted tx (GAP1 Layer B); a final
+//       duplicate-outpoint sweep re-proves it independently. Combined with the
+//       mempool's reject-at-add (GAP1 Layer A) an assembled block can never
+//       double-spend => can never be consensus-invalid on that axis.
+//   (3) SIGOPS — each candidate's Bitcoin-exact sigop cost (legacy×4 + P2SH×4 +
+//       witness) is bounded by the conservative RDTS cap (GAP3); a tx over the
+//       per-tx budget or with an unresolvable prevout script is EXCLUDED.
+//   (4) VERIFY PASS — an O(n) pass proves every selected tx's in-template parent
+//       appears earlier and no outpoint repeats; on any violation the offending
+//       suffix is dropped (never emitted).
 //
-// Every skipped tx is named (good-citizen: no silent drops). ZERO DASH code.
+// Every skipped tx is NAMED (good-citizen: no silent drops). ZERO DASH code.
 // ---------------------------------------------------------------------------
 
 #include "mempool.hpp"
 #include "transaction.hpp"
+#include "sigops.hpp"
+#include "../params.hpp"
 
 #include <core/uint256.hpp>
 #include <core/hash.hpp>
@@ -39,6 +46,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -58,8 +66,21 @@ struct AssemblyResult {
     std::vector<AssembledTx> txs;        // block order (after coinbase)
     uint64_t total_fee{0};
     uint32_t total_weight{0};
+    uint32_t total_sigop_cost{0};
     // Named exclusions (good-citizen: never a silent drop).
     std::vector<std::pair<uint256, std::string>> excluded;
+};
+
+// GAP2/GAP3 — the confirmed-input view the assembler consults for inputs that
+// are NOT in-template parents. is_confirmed_mature gates inclusion (an input
+// must be a mature coin in the post-anchor UTXO view); script_of resolves that
+// coin's scriptPubKey for sigop accounting. Both are built by the work source
+// over the SAME UTXOViewCache the pricer used (mempool.hpp), so pricing and
+// inclusion agree. In-template parent scripts are resolved by the assembler
+// itself from the priced snapshot — the view only answers for confirmed coins.
+struct ConfirmedInputView {
+    std::function<bool(const uint256& txid, uint32_t index)> is_confirmed_mature;
+    std::function<std::optional<std::vector<unsigned char>>(const uint256& txid, uint32_t index)> script_of;
 };
 
 // wtxid = SHA256d of the BIP144 (with-witness) serialization.
@@ -72,23 +93,49 @@ inline uint256 compute_wtxid(const MutableTransaction& tx) {
 //   priced      : fee_known mempool entries (Mempool::snapshot_priced()).
 //   pool_txids  : ALL txids currently in the mempool (priced OR not). Needed to
 //                 tell "in-mempool but unpriced parent" (topo-unsafe: exclude
-//                 the child) from "confirmed / T2 / T3 parent" (safe: the input
-//                 value is in the UTXO view, no in-block ancestor required).
+//                 the child) from a confirmed parent.
 //   max_weight  : selection cap in weight units (RDTS 800000 minus the coinbase
 //                 reserve). BIP141 weight = base*4 + witness.
+//   view        : GAP2/GAP3 confirmed-input view (inclusion + sigop scripts).
+//   max_sigop_cost : RDTS block sigop-cost cap (GAP3).
 inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced,
                                          const std::set<uint256>& pool_txids,
-                                         uint32_t max_weight)
+                                         uint32_t max_weight,
+                                         const ConfirmedInputView& view,
+                                         uint32_t max_sigop_cost = bip110::RDTS_MAX_BLOCK_SIGOPS_COST)
 {
     AssemblyResult R;
     const size_t N = priced.size();
     if (N == 0) return R;
 
+    // Coinbase reserve on the sigop budget (the coinbase itself carries a few).
+    constexpr uint32_t COINBASE_SIGOP_RESERVE = 100;
+    const uint32_t sigop_budget = (max_sigop_cost > COINBASE_SIGOP_RESERVE)
+                                ? (max_sigop_cost - COINBASE_SIGOP_RESERVE) : 0;
+
     std::map<uint256, size_t> idx_of;
     for (size_t i = 0; i < N; ++i) idx_of[priced[i].txid] = i;
 
-    // ── topo-safety: an entry is UNSAFE iff it (transitively) depends on an
-    // in-mempool parent that is not priced (could never be included). ──
+    // Resolve an input's prevout scriptPubKey: an in-template priced parent's
+    // vout (from the snapshot) OR a confirmed coin (view). nullopt ⇒ unknown.
+    auto resolve_script = [&](const uint256& ph, uint32_t idx)
+        -> std::optional<std::vector<unsigned char>> {
+        auto it = idx_of.find(ph);
+        if (it != idx_of.end()) {
+            const auto& vo = priced[it->second].tx.vout;
+            if (idx < vo.size()) return vo[idx].scriptPubKey.m_data;
+            return std::nullopt;
+        }
+        return view.script_of ? view.script_of(ph, idx) : std::nullopt;
+    };
+
+    std::vector<uint32_t> sigcost(N, 0);
+    std::vector<std::string> unsafe_reason(N);
+
+    // ── topo-safety + inclusion rule (GAP2) + sigops (GAP3): an entry is UNSAFE
+    // iff any input is (a) an in-mempool UNPRICED parent, (b) not a confirmed &
+    // mature coin (input-not-in-view-or-template), (c) transitively unsafe, or
+    // the tx's own sigop cost is unresolvable / over budget. ──
     std::vector<int> safe(N, -1);   // -1 unknown, 0 unsafe, 1 safe
     std::vector<int> visiting(N, 0);
     std::function<bool(size_t)> is_safe = [&](size_t i) -> bool {
@@ -96,19 +143,36 @@ inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced
         if (visiting[i]) return true;   // cycle guard (mempool is a DAG; defensive)
         visiting[i] = 1;
         bool ok = true;
+        std::string reason;
         for (const auto& vin : priced[i].tx.vin) {
             const uint256& ph = vin.prevout.hash;
             auto it = idx_of.find(ph);
-            if (it != idx_of.end()) {           // in-mempool priced parent
-                if (!is_safe(it->second)) { ok = false; break; }
-            } else if (pool_txids.count(ph)) {  // in-mempool but UNPRICED parent
-                ok = false; break;              // child can never be safely included
+            if (it != idx_of.end()) {                 // in-mempool priced parent
+                if (!is_safe(it->second)) { ok = false; reason = "unpriced-in-mempool-parent"; break; }
+            } else if (pool_txids.count(ph)) {        // in-mempool but UNPRICED parent
+                ok = false; reason = "unpriced-in-mempool-parent"; break;
+            } else if (!view.is_confirmed_mature
+                       || !view.is_confirmed_mature(ph, vin.prevout.index)) {
+                // GAP2: parent not in the template AND not a confirmed/mature
+                // coin in the UTXO view — including this child ALONE would be a
+                // missing-inputs INVALID block. Fail closed.
+                ok = false; reason = "input-not-in-view-or-template"; break;
             }
-            // else: parent confirmed / priced via UTXO view (T2) or side table
-            // (T3) — its input value is already accounted, no in-block ancestor.
+        }
+        if (ok) {
+            // GAP3: own sigop cost. Prevout scripts are resolvable under the
+            // rule above (in-template parent vout or confirmed Coin), so nullopt
+            // is genuinely exceptional ⇒ exclude.
+            auto sc = sigops::tx_sigop_cost(priced[i].tx, resolve_script);
+            if (!sc) { ok = false; reason = "sigops-unresolvable"; }
+            else {
+                sigcost[i] = *sc;
+                if (*sc > sigop_budget) { ok = false; reason = "sigops-cap"; }
+            }
         }
         visiting[i] = 0;
         safe[i] = ok ? 1 : 0;
+        if (!ok) unsafe_reason[i] = reason;
         return ok;
     };
 
@@ -148,6 +212,9 @@ inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced
     std::vector<char> emitted(N, 0);
     uint32_t total_weight = 0;
     uint64_t total_fee = 0;
+    uint32_t total_sigop_cost = 0;
+    // GAP1 Layer B — outpoints already claimed by an emitted tx in THIS template.
+    std::set<std::pair<uint256, uint32_t>> claimed;
 
     std::function<void(size_t, std::vector<size_t>&)> topo = [&](size_t i, std::vector<size_t>& order) {
         if (emitted[i]) return;
@@ -162,16 +229,33 @@ inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced
         if (selected[c.i]) continue;
         // Weight the package would ADD (ancestors already selected are free).
         uint64_t add_w = selected[c.i] ? 0 : priced[c.i].weight;
-        for (size_t a : ancestors(c.i)) if (!selected[a]) add_w += priced[a].weight;
-        if (total_weight + add_w > max_weight) continue;  // deferred by weight; try smaller
+        uint64_t add_s = selected[c.i] ? 0 : sigcost[c.i];
+        for (size_t a : ancestors(c.i)) if (!selected[a]) { add_w += priced[a].weight; add_s += sigcost[a]; }
+        if (total_weight + add_w > max_weight) continue;        // deferred by weight
+        if (total_sigop_cost + add_s > sigop_budget) continue;  // deferred by sigops
 
         std::vector<size_t> order;
         topo(c.i, order);   // emits only not-yet-emitted, parents first
         for (size_t j : order) {
             if (selected[j]) continue;
+            // GAP1 Layer B — refuse any tx whose input was already claimed by an
+            // earlier-emitted tx in this template. With Layer A (reject-at-add)
+            // this is nearly unreachable in production, but it still catches
+            // pre-restart state, set_tx_fee test paths, and future add-path bugs.
+            bool conflict = false;
+            for (const auto& vin : priced[j].tx.vin)
+                if (claimed.count({vin.prevout.hash, vin.prevout.index})) { conflict = true; break; }
+            if (conflict) {
+                emitted[j] = 1;   // stays unselected; never counted / emitted
+                R.excluded.emplace_back(priced[j].txid, "conflict");
+                continue;
+            }
             selected[j] = 1;
-            total_weight += priced[j].weight;
-            total_fee    += priced[j].fee;
+            for (const auto& vin : priced[j].tx.vin)
+                claimed.insert({vin.prevout.hash, vin.prevout.index});
+            total_weight     += priced[j].weight;
+            total_fee        += priced[j].fee;
+            total_sigop_cost += sigcost[j];
             AssembledTx at;
             at.tx     = priced[j].tx;
             at.txid   = priced[j].txid;
@@ -182,11 +266,13 @@ inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced
         }
     }
 
-    // ── HARD verification pass (independent of the scorer): every in-mempool
-    // parent MUST appear at a lower index. On any violation drop the offending
-    // suffix rather than emit a consensus-invalid set. ──
+    // ── HARD verification pass (independent of the scorer): every in-template
+    // parent MUST appear at a lower index, and NO outpoint may repeat across the
+    // selected set. On any violation drop the offending suffix rather than emit
+    // a consensus-invalid (missing-inputs / double-spend) set. ──
     {
         std::map<uint256, size_t> pos;
+        std::set<std::pair<uint256, uint32_t>> seen_ops;
         size_t good = R.txs.size();
         for (size_t k = 0; k < R.txs.size(); ++k) {
             bool ok = true;
@@ -194,34 +280,42 @@ inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced
                 auto it = pos.find(vin.prevout.hash);
                 // parent in our selected set but NOT earlier => invariant broken
                 if (idx_of.count(vin.prevout.hash) && it == pos.end()) { ok = false; break; }
+                // outpoint already spent by an earlier selected tx => double-spend
+                if (seen_ops.count({vin.prevout.hash, vin.prevout.index})) { ok = false; break; }
             }
             if (!ok) { good = k; break; }
+            for (const auto& vin : R.txs[k].tx.vin)
+                seen_ops.insert({vin.prevout.hash, vin.prevout.index});
             pos[R.txs[k].txid] = k;
         }
         if (good < R.txs.size()) {
             for (size_t k = good; k < R.txs.size(); ++k) {
-                total_weight -= R.txs[k].weight;
-                total_fee    -= R.txs[k].fee;
-                R.excluded.emplace_back(R.txs[k].txid, "topo-verify-drop");
+                total_weight     -= R.txs[k].weight;
+                total_fee        -= R.txs[k].fee;
+                total_sigop_cost -= sigcost[idx_of[R.txs[k].txid]];
+                R.excluded.emplace_back(R.txs[k].txid, "verify-drop");
             }
             R.txs.resize(good);
         }
     }
 
-    // Name every safe-but-unselected (weight) and unsafe (unpriced-parent) drop.
+    // Name every safe-but-unselected (weight/sigops defer) and unsafe drop.
     for (size_t i = 0; i < N; ++i) {
         if (selected[i]) continue;
+        bool already = false;
+        for (const auto& e : R.excluded) if (e.first == priced[i].txid) { already = true; break; }
+        if (already) continue;
         if (safe[i] == 1) {
-            bool dropped = false;
-            for (const auto& e : R.excluded) if (e.first == priced[i].txid) { dropped = true; break; }
-            if (!dropped) R.excluded.emplace_back(priced[i].txid, "weight-cap");
+            R.excluded.emplace_back(priced[i].txid, "weight-cap");
         } else {
-            R.excluded.emplace_back(priced[i].txid, "unpriced-in-mempool-parent");
+            R.excluded.emplace_back(priced[i].txid,
+                unsafe_reason[i].empty() ? "unpriced-in-mempool-parent" : unsafe_reason[i]);
         }
     }
 
     R.total_fee = total_fee;
     R.total_weight = total_weight;
+    R.total_sigop_cost = total_sigop_cost;
     return R;
 }
 

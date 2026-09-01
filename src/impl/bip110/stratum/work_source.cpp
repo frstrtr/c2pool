@@ -7,8 +7,11 @@
 #include "../coin/gentx_coinbase.hpp"
 #include "../coin/mempool.hpp"            // M3 tx-serving
 #include "../coin/block_assembler.hpp"    // M3 ancestor-package tx selection
-#include "../params.hpp"                  // RDTS_MAX_BLOCK_WEIGHT
+#include "serve_xcheck.hpp"               // GAP5 independent fee re-derivation
+#include "../params.hpp"                  // RDTS_MAX_BLOCK_WEIGHT / SIGOPS_COST
 #include "../pow.hpp"
+
+#include <core/coin/utxo.hpp>             // Coin / Outpoint / money_range (GAP2/3/5)
 
 #include <core/target_utils.hpp>
 #include <core/log.hpp>
@@ -171,21 +174,62 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
             auto priced     = mempool_->snapshot_priced();
             auto pool_txids_v = mempool_->all_txids();
             std::set<uint256> pool_txids(pool_txids_v.begin(), pool_txids_v.end());
-            auto asm_res = bip110::coin::assemble_block_txs(priced, pool_txids, cap);
+
+            // GAP2/GAP3 — the confirmed-input view over the SAME UTXO view the
+            // pricer used (compute_fee_locked), so inclusion and pricing agree.
+            // A candidate input that is neither an in-template parent nor a
+            // confirmed & MATURE coin is EXCLUDED (a stale-cached-fee / evicted-
+            // unconfirmed-parent child alone is a missing-inputs INVALID block).
+            core::coin::UTXOViewCache* uv = mempool_->utxo();
+            const uint32_t tiph = mempool_->tip_height();
+            const core::coin::ChainLimits lim = mempool_->limits();
+            bip110::coin::ConfirmedInputView view;
+            view.is_confirmed_mature = [uv, tiph, lim](const uint256& h, uint32_t i) -> bool {
+                if (!uv) return false;
+                core::coin::Outpoint op(h, i);
+                core::coin::Coin c;
+                if (!uv->get_coin(op, c)) return false;
+                if (!core::coin::money_range(c.value, lim)) return false;
+                return tiph == 0 || c.is_mature(tiph, lim);
+            };
+            view.script_of = [uv](const uint256& h, uint32_t i)
+                -> std::optional<std::vector<unsigned char>> {
+                if (!uv) return std::nullopt;
+                core::coin::Outpoint op(h, i);
+                core::coin::Coin c;
+                if (!uv->get_coin(op, c)) return std::nullopt;
+                return c.scriptPubKey.m_data;
+            };
+
+            auto asm_res = bip110::coin::assemble_block_txs(priced, pool_txids, cap, view);
             sel_txs   = std::move(asm_res.txs);
             fee_total = asm_res.total_fee;
+
+            // GAP6 — good-citizen naming: fee-unknown (unpriceable) entries are
+            // filtered by snapshot_priced() before the assembler, so they never
+            // reach the exclusion ledger. Merge a bounded sample + the exact count
+            // so EVERY exclusion is named at template time (#1038/#1039).
+            const size_t unpriceable = mempool_->unpriced_count();
+            {
+                auto us = mempool_->unpriced_sample(8);
+                for (const auto& t : us)
+                    asm_res.excluded.emplace_back(t, "unpriceable");
+            }
+
             if (!sel_txs.empty() || !asm_res.excluded.empty())
                 LOG_INFO << "[BIP110-WS] tx-select height=" << w.height
                          << " priced=" << priced.size()
                          << " included=" << sel_txs.size()
                          << " weight=" << asm_res.total_weight
+                         << " sigops=" << asm_res.total_sigop_cost
                          << " fees=" << fee_total
-                         << " excluded=" << asm_res.excluded.size();
+                         << " excluded=" << asm_res.excluded.size()
+                         << " unpriceable=" << unpriceable;
             // Name a bounded sample of exclusions (good-citizen; avoid log flood).
             size_t named = 0;
             for (const auto& e : asm_res.excluded) {
-                if (named++ >= 8) { LOG_INFO << "[BIP110-WS]   ... +"
-                    << (asm_res.excluded.size() - 8) << " more excluded"; break; }
+                if (named++ >= 12) { LOG_INFO << "[BIP110-WS]   ... +"
+                    << (asm_res.excluded.size() - 12) << " more excluded"; break; }
                 LOG_INFO << "[BIP110-WS]   exclude " << e.first.GetHex().substr(0, 16)
                          << " reason=" << e.second;
             }
@@ -408,9 +452,51 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         }
         bool ok = decode_ok && (refold == f.merkle);
 
-        // (b) fee re-sum (the assembler already summed included fees; the guard is
-        //     that fee_total is exactly what the coinbase value carried).
-        // (c) coinbase value conservation.
+        // (b) INDEPENDENT fee re-sum (GAP5). Re-derive Σ(fees) from the FROZEN
+        //     BIP144 body bytes via a second code path (decoded-parent map + live
+        //     UTXO view), NOT from the assembler's structs, and assert it equals
+        //     fee_total. Total under GAP2's inclusion rule (every input is
+        //     in-view or in-template). Independent DERIVATION, not an independent
+        //     ledger — catches assembler/accounting/stale-fee bugs + any tampered
+        //     fee_total; a corrupted UTXO view itself is GAP4's job.
+        if (ok) {
+            core::coin::UTXOViewCache* uv = mempool_ ? mempool_->utxo() : nullptr;
+            const core::coin::ChainLimits lim =
+                mempool_ ? mempool_->limits() : core::coin::LTC_LIMITS;
+            auto utxo_get = [uv](const core::coin::Outpoint& op, core::coin::Coin& c) -> bool {
+                return uv && uv->get_coin(op, c);
+            };
+            auto resum = bip110::stratum::xcheck_resum_fees(other_txs_bytes, utxo_get, lim);
+            if (!resum || *resum != fee_total) {
+                LOG_ERROR << "[BIP110-WS] XCHECK fee re-sum MISMATCH resum="
+                          << (resum ? std::to_string(*resum) : std::string("unresolvable"))
+                          << " != fee_total=" << fee_total << " (height=" << w.height << ")";
+                ok = false;
+            }
+        }
+
+        // (c) coinbase value conservation, SECOND-SOURCE: re-parse the FROZEN
+        //     coinbase bytes (not the payouts vector that built it) and assert
+        //     Σ(vout) == subsidy + fee_total.
+        if (ok) {
+            PackStream cps(cb.bytes);
+            bip110::coin::MutableTransaction cbtx;
+            bool cb_ok = true;
+            try { bip110::coin::UnserializeTransaction(cbtx, cps, bip110::coin::TX_NO_WITNESS); }
+            catch (...) { cb_ok = false; }
+            if (!cb_ok || !cps.empty()) ok = false;
+            else {
+                uint64_t cb_out = 0;
+                for (const auto& o : cbtx.vout) cb_out += static_cast<uint64_t>(o.value);
+                if (cb_out != subsidy) {   // subsidy == w.subsidy + fee_total
+                    LOG_ERROR << "[BIP110-WS] XCHECK coinbase value re-parse MISMATCH out="
+                              << cb_out << " != subsidy+fees=" << subsidy
+                              << " (height=" << w.height << ")";
+                    ok = false;
+                }
+            }
+        }
+
         // (d) weight cap.
         if (ok && body_weight + 4000u > bip110::RDTS_MAX_BLOCK_WEIGHT) ok = false;
 

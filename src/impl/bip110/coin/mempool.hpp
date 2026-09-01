@@ -97,6 +97,14 @@ public:
     void set_tip_height(uint32_t h) { m_tip_height = h; }
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
+    // GAP2 — read access to the live UTXO view so the work source can build the
+    // template-time input_confirmed predicate over the SAME view the pricer used
+    // (compute_fee_locked), keeping inclusion and pricing agreed.
+    core::coin::UTXOViewCache* utxo() const { return m_utxo.load(); }
+    // Current tip height (for coinbase-maturity agreement in the predicate).
+    uint32_t tip_height() const { return m_tip_height; }
+    const core::coin::ChainLimits& limits() const { return m_limits; }
+
     /// Monotonic mutation counter, bumped on every add/remove/clear that
     /// could change the selected tx set. Readers (e.g. the stratum work
     /// template cache) compare it across calls to skip rebuilding when the
@@ -127,6 +135,28 @@ public:
         // Reject duplicates
         if (m_pool.count(txid))
             return false;
+
+        // GAP1 LAYER A — intra-mempool double-spend REJECT (first-seen wins, NO
+        // RBF). If any input is already claimed by a spender still in the pool,
+        // reject the newcomer. A pool template must never depend on a replacement
+        // race, and admitting a second spender would (a) corrupt the m_spent_outputs
+        // bookkeeping (the [key]=txid overwrite below silently drops the earlier
+        // spender's claim, breaking remove_tx_locked's single-spender erase and
+        // remove_for_block Phase-2 conflict detection) and (b) let both price via
+        // the same UTXO coin => a double-spending, consensus-INVALID assembled
+        // block => lost reward. Fail closed, deterministically.
+        for (const auto& vin : tx.vin) {
+            auto ckey = std::make_pair(vin.prevout.hash, vin.prevout.index);
+            auto so = m_spent_outputs.find(ckey);
+            if (so != m_spent_outputs.end() && m_pool.count(so->second)) {
+                LOG_INFO << "[EMB-BIP110] Mempool REJECT conflict txid="
+                         << txid.GetHex().substr(0, 16) << " spends "
+                         << vin.prevout.hash.GetHex().substr(0, 16) << ":"
+                         << vin.prevout.index << " already claimed by "
+                         << so->second.GetHex().substr(0, 16);
+                return false;
+            }
+        }
 
         MempoolEntry entry;
         entry.tx    = tx;
@@ -544,6 +574,45 @@ public:
         for (const auto& [txid, entry] : m_pool)
             if (entry.fee_known) out.push_back(entry);
         return out;
+    }
+
+    // GAP6 — good-citizen naming: fee-unknown (unpriceable) entries are filtered
+    // out by snapshot_priced() before the assembler ever sees them, so they never
+    // reach the per-template exclusion ledger. These accessors let the work source
+    // merge them in and NAME them at template time (#1038/#1039 no-silent-refusals).
+    size_t unpriced_count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (const auto& [txid, entry] : m_pool)
+            if (!entry.fee_known) ++n;
+        return n;
+    }
+    /// A bounded sample of unpriceable txids (keeps the log line free of flood).
+    std::vector<uint256> unpriced_sample(size_t n) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<uint256> out;
+        for (const auto& [txid, entry] : m_pool) {
+            if (entry.fee_known) continue;
+            if (out.size() >= n) break;
+            out.push_back(txid);
+        }
+        return out;
+    }
+
+    // GAP4 — reorg recovery: after a fork-chain disconnect, every priced fee was
+    // derived against a now-off-chain UTXO view. Quarantine ALL entries (set
+    // fee_known=false, drop the feerate index) so the next recompute_unknown_fees
+    // re-prices them against the reconciled post-disconnect view; KEEP the T3
+    // priced-parent side table (m_parent_values is txid-authenticated, chain-
+    // independent). Bumps epoch so template caches rebuild.
+    void requarantine_all() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& [txid, entry] : m_pool) {
+            entry.fee_known = false;
+            entry.fee = 0;
+        }
+        m_feerate_index.clear();
+        m_epoch.fetch_add(1, std::memory_order_relaxed);
     }
 
     /// Snapshot of all txids currently in the pool.

@@ -22,6 +22,7 @@
 #include <impl/bip110/coin/chain_seeds.hpp>
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
+#include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
 #include <impl/bip110/stratum/work_source.hpp>
 
 #include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
@@ -296,9 +297,16 @@ int run_embedded(bool coin_p2p_discover,
     // still independently fail-closed on pricing, so this only avoids churning
     // templates before we are following the fork tip. The work source READS the
     // mempool only.
+    // GAP4 — serve gate also requires the UTXO view to be CONSISTENT with the
+    // active chain. On a reorg the tip-changed handler flips this false while it
+    // rolls the view back to the fork (and permanently on an unrecoverable
+    // rollback), so templates are NEVER built from a diverged ledger — the
+    // work source falls back to coinbase-only (never a wrong fee).
+    std::atomic<bool> utxo_consistent{true};
     work_source->set_mempool(&mempool, serve_mempool_txs,
-        [&header_chain]() {
-            return header_chain.height() >= header_chain.params().blake2b_height;
+        [&header_chain, &utxo_consistent]() {
+            return utxo_consistent.load(std::memory_order_relaxed)
+                && header_chain.height() >= header_chain.params().blake2b_height;
         });
     LOG_INFO << "[EMB-BIP110] mempool tx-serving "
              << (serve_mempool_txs ? "ENABLED" : "DISABLED (coinbase-only)")
@@ -377,6 +385,20 @@ int run_embedded(bool coin_p2p_discover,
             if (!entry) return;                     // header sync lagging — drop
             uint32_t height = entry->height;
             if (height <= utxo_cache.get_best_height()) return;   // monotonic
+            // GAP4 continuity gate: only connect a block that extends the current
+            // view tip. A non-contiguous block means a reorg is pending — the
+            // tip-changed handler rolls the view back to the fork first, then the
+            // new branch re-connects contiguously from fork+1. Skip (named) here.
+            {
+                uint256 view_best = utxo_cache.get_best_block();
+                if (!view_best.IsNull() && block.m_previous_block != view_best) {
+                    LOG_WARNING << "[EMB-BIP110] utxo-connect skipped: non-contiguous "
+                                   "(reorg pending) h=" << height
+                                << " prev=" << block.m_previous_block.GetHex().substr(0, 16)
+                                << " view_best=" << view_best.GetHex().substr(0, 16);
+                    return;
+                }
+            }
             try {
                 auto undo = utxo_cache.connect_block(block, height, bip110_txid);
                 utxo_db.put_block_undo(height, undo);
@@ -390,6 +412,45 @@ int run_embedded(bool coin_p2p_discover,
                 LOG_WARNING << "[EMB-BIP110] UTXO connect_block failed h=" << height
                             << ": " << e.what();
             }
+        });
+
+    // ── GAP4 UTXO-view reorg handling ───────────────────────────────────────
+    // On a fork-chain reorg the header chain fires on_tip_changed. If the view's
+    // best is already on the new chain this is a plain extension (no-op — the
+    // connect handler applies the new blocks). Otherwise the view is on an
+    // abandoned branch: flag it inconsistent (serve coinbase-only), roll the view
+    // back to the common ancestor via undo data (removing rolled-back coins;
+    // fail-closed on missing/too-deep undo), requarantine + re-price the mempool
+    // against the reconciled view, then clear the flag. A rolled-back coin can
+    // NEVER be priced/included afterwards (GAP2's inclusion rule is the 2nd wall).
+    header_chain.set_on_tip_changed(
+        [&utxo_cache, &utxo_db, &header_chain, &mempool, &utxo_consistent, BIP110_KEEP_DEPTH]
+        (const uint256& /*old_tip*/, uint32_t old_h, const uint256& new_tip, uint32_t new_h)
+        {
+            uint256  view_best = utxo_cache.get_best_block();
+            uint32_t view_h    = utxo_cache.get_best_height();
+            if (view_best.IsNull()) return;    // nothing connected yet
+            auto active_at = header_chain.get_header_by_height(view_h);
+            if (active_at && active_at->block_hash == view_best)
+                return;                        // view already on the new chain — plain extension
+
+            utxo_consistent.store(false, std::memory_order_relaxed);
+            auto res = bip110::coin::reorg_disconnect_to_fork(
+                utxo_cache, utxo_db, header_chain, new_tip, BIP110_KEEP_DEPTH);
+            if (res != bip110::coin::ReorgResult::OK) {
+                LOG_ERROR << "[EMB-BIP110] UTXO reorg FAILED ("
+                          << bip110::coin::reorg_result_name(res) << ") old_h=" << old_h
+                          << " new_h=" << new_h << " — serving coinbase-only until view "
+                             "rebuild (fail closed, never a wrong ledger)";
+                return;   // leave utxo_consistent=false (until restart / rebuild)
+            }
+            mempool.requarantine_all();
+            mempool.set_tip_height(utxo_cache.get_best_height());
+            mempool.recompute_unknown_fees(&utxo_cache);
+            mempool.revalidate_inputs(&utxo_cache);
+            utxo_consistent.store(true, std::memory_order_relaxed);
+            LOG_INFO << "[EMB-BIP110] UTXO reorg reconciled to fork h="
+                     << utxo_cache.get_best_height() << " (new tip h=" << new_h << ")";
         });
 
     // ── M3 mempool tx ingest ──────────────────────────────────────────────
