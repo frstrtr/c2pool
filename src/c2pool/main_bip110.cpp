@@ -47,6 +47,11 @@ namespace io = boost::asio;
 
 namespace {
 
+// Standalone header-sync driver cadence (file-scope so the nested async lambdas
+// use them as constant expressions without an explicit capture).
+constexpr int kTickSec = 10;
+constexpr int kNoProgressFailoverSec = 40;
+
 std::vector<unsigned char> from_hex(const std::string& s)
 {
     auto nib = [](char c) -> int {
@@ -308,8 +313,6 @@ int run_embedded(bool coin_p2p_discover,
 
     // Self-rescheduling driver: (re)issue getheaders on a fresh handshake or a
     // stall, and fail over to the next candidate after no header progress.
-    constexpr int kTickSec = 10;
-    constexpr int kNoProgressFailoverSec = 40;
     auto last_height   = std::make_shared<uint32_t>(header_chain.height());
     auto last_progress = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
     auto was_handshaked = std::make_shared<bool>(false);
