@@ -33,7 +33,7 @@ on:
       - '.github/workflows/btc-embedded-standalone-smoke.yml'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: btc-standalone-smoke-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
