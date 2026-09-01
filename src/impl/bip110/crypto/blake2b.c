@@ -148,7 +148,11 @@ int bip110_blake2b(void* out, size_t out_len, const void* in, size_t in_len)
     // Final block, zero-padded to 128 bytes.
     uint8_t block[128];
     memset(block, 0, sizeof(block));
-    memcpy(block, p, left);
+    // block is already zero-padded; only copy when there is input, so an
+    // empty message (p may be NULL, left == 0) never passes NULL to memcpy
+    // (UB per C even with length 0; UBSan -fsanitize=nonnull-attribute flags it).
+    if (left > 0)
+        memcpy(block, p, left);
     blake2b_increment_counter(&S, (uint64_t)left);
     blake2b_compress(&S, block, 1);
 
