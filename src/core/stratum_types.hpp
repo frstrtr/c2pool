@@ -79,6 +79,16 @@ struct StratumConfig {
     // Default false: every other coin's prevhash is byte-identical.
     bool raw_prevhash_wire{false};
 
+    // ── Disable BIP310 version-rolling negotiation (BIP-110 BLAKE2b Sv1) ──────
+    // BIP-110's header commits the block version INSIDE h1 (the frozen
+    // pseudo-header), so a version-rolling miner that mutates the version bits
+    // produces a header the pool never committed to — every such share is
+    // 100%-rejected (fail-closed, no money loss, but wasted hashrate). When set,
+    // mining.configure refuses the "version-rolling" extension (responds
+    // version-rolling:false) so miners never roll a version this lane cannot use.
+    // Default false: every other coin negotiates version-rolling as before.
+    bool disable_version_rolling{false};
+
     // ── Live-session hygiene (mining-hotel ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
     // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and

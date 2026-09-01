@@ -33,6 +33,7 @@
 
 #include <impl/bip110/pow.hpp>
 #include <impl/bip110/stratum/pseudoheader.hpp>
+#include <impl/bip110/coin/gentx_coinbase.hpp>   // SSOT coinbase (same path as the live work source)
 #include <impl/bip110/crypto/blake2b.h>
 
 #include <core/uint256.hpp>
@@ -84,42 +85,76 @@ std::array<unsigned char, 8> u64be(uint64_t v)
     return o;
 }
 
-// Build a minimal but well-formed coinbase-only transaction (non-witness form
-// here for the KAT's txid + byte-exact block arm; the live work source appends
-// the BIP144 witness). Layout mirrors gentx_coinbase.hpp:
-//   version(4=1) | vin(1) | prevout(36=0..0:ffffffff) | scriptSig(VarStr) |
-//   seq(4=ffffffff) | vout(1) | value(8) | scriptPubKey(VarStr) | locktime(4=0)
-std::vector<unsigned char> build_coinbase(uint32_t height, uint64_t subsidy_sat)
+// Build the LIVE coinbase shape via the SSOT assembler — the SAME code path the
+// work source uses (bip110::coin::assemble_gentx_coinbase). This is deliberately
+// NOT a test-local reimplementation: emission (block-arm) and verification (this
+// KAT) MUST share ONE coinbase path so a witness/serialization defect cannot hide
+// behind a divergent test shape (DEFECT 3). The coinbase carries the BIP141
+// witness-commitment output, so cb.block_bytes is the BIP144 witness form (with
+// the 1x32-byte reserved value) while cb.txid/cb.bytes stay non-witness.
+bip110::coin::GentxCoinbase build_live_coinbase(uint32_t height, uint64_t subsidy_sat)
 {
-    std::vector<unsigned char> t;
-    auto put = [&](std::initializer_list<unsigned char> b){ for (auto x : b) t.push_back(x); };
-    auto put_u32le = [&](uint32_t v){ for (int i=0;i<4;++i) t.push_back((v>>(8*i))&0xff); };
-    auto put_u64le = [&](uint64_t v){ for (int i=0;i<8;++i) t.push_back((v>>(8*i))&0xff); };
+    // scriptSig = BIP34 minimal-push of height + "/c2pool-bip110/" tag (mirrors
+    // work_source.cpp build_connection_coinbase).
+    std::vector<unsigned char> cb_script;
+    {
+        uint32_t h = height;
+        std::vector<unsigned char> he;
+        while (h) { he.push_back(h & 0xff); h >>= 8; }
+        if (he.empty() || (he.back() & 0x80)) he.push_back(0x00);
+        cb_script.push_back(static_cast<unsigned char>(he.size()));
+        cb_script.insert(cb_script.end(), he.begin(), he.end());
+        const char* tag = "/c2pool-bip110/";
+        for (const char* c = tag; *c; ++c) cb_script.push_back((unsigned char)*c);
+    }
 
-    put_u32le(1);              // version
-    put({0x01});               // vin count
-    for (int i=0;i<32;++i) t.push_back(0x00);   // prev hash
-    put_u32le(0xffffffff);     // prev index
-    // scriptSig = BIP34 height push + "/c2pool-bip110/" tag
-    std::vector<unsigned char> ss;
-    // minimal serialized-CScript push of height (3-byte for 961640-range)
-    ss.push_back(0x03);
-    ss.push_back(height & 0xff); ss.push_back((height>>8)&0xff); ss.push_back((height>>16)&0xff);
-    const char* tag = "/c2pool-bip110/";
-    for (const char* c = tag; *c; ++c) ss.push_back((unsigned char)*c);
-    t.push_back((unsigned char)ss.size());
-    t.insert(t.end(), ss.begin(), ss.end());
-    put_u32le(0xffffffff);     // sequence
-    put({0x01});               // vout count
-    put_u64le(subsidy_sat);    // value
-    // scriptPubKey = OP_DUP OP_HASH160 <20*0x11> OP_EQUALVERIFY OP_CHECKSIG (P2PKH)
+    // Witness commitment over a zero witness-merkle-root (coinbase-only): header
+    // 6a24aa21a9ed || SHA256d(witness_merkle_root(0) || reserved(0*32)).
+    std::vector<unsigned char> wroot(32, 0);
+    {
+        std::vector<unsigned char> pre(64, 0);
+        unsigned char a[32], b[32];
+        CSHA256().Write(pre.data(), pre.size()).Finalize(a);
+        CSHA256().Write(a, 32).Finalize(b);
+        std::memcpy(wroot.data(), b, 32);
+    }
+    std::vector<unsigned char> sc = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+    sc.insert(sc.end(), wroot.begin(), wroot.end());
+    std::optional<std::vector<unsigned char>> segwit_commit = sc;
+
+    // P2PKH payout of the whole subsidy, empty-ish donation placeholder, OP_RETURN.
     std::vector<unsigned char> spk = {0x76,0xa9,0x14};
     for (int i=0;i<20;++i) spk.push_back(0x11);
     spk.push_back(0x88); spk.push_back(0xac);
-    t.push_back((unsigned char)spk.size());
-    t.insert(t.end(), spk.begin(), spk.end());
-    put_u32le(0);              // locktime
-    return t;
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;
+    payouts.emplace_back(spk, subsidy_sat);
+    std::vector<unsigned char> donation = {0x6a};       // OP_RETURN placeholder (0-value)
+    std::vector<unsigned char> op_return = {0x6a, 0x00};
+
+    return bip110::coin::assemble_gentx_coinbase(
+        cb_script, segwit_commit, payouts, /*donation_amount=*/0, donation, op_return);
+}
+
+// Verify a BIP144 coinbase (block_bytes) exposes exactly one 32-byte witness
+// element on its single input (the reserved value), i.e. it will PASS Knots/Core
+// CheckWitnessMalleation. Returns true iff the structure is
+//   version(4) | 0x00 0x01 | vin | vout | 0x01 0x20 32*00 | locktime(4)
+// and captures the witness stack hex (should be "012000..00").
+bool witness_nonce_ok(const std::vector<unsigned char>& blk, std::string& witness_hex)
+{
+    if (blk.size() < 4 + 2 + 1 + 2 + 32 + 4) return false;
+    if (blk[4] != 0x00 || blk[5] != 0x01) return false;    // segwit marker+flag
+    // The witness for the single coinbase input sits immediately before the
+    // 4-byte locktime: [count=0x01][len=0x20][32 bytes].
+    const size_t wend = blk.size() - 4;                    // start of locktime
+    const size_t wstart = wend - (1 + 1 + 32);
+    if (blk[wstart] != 0x01) return false;                 // exactly one stack item
+    if (blk[wstart + 1] != 0x20) return false;             // element length 32
+    for (size_t i = 0; i < 32; ++i)
+        if (blk[wstart + 2 + i] != 0x00) return false;     // reserved value = 0*32
+    witness_hex = bip110::stratum::to_hex(
+        std::vector<unsigned char>(blk.begin() + wstart, blk.begin() + wend));
+    return true;
 }
 
 // ── (A) WORK-SHAPE against real block 961640 ────────────────────────────────
@@ -188,9 +223,21 @@ void test_submit_roundtrip()
     const uint32_t height = 961700;
     const uint64_t subsidy = 312500000ULL;   // 3.125 BTC exact (post-fork era)
 
-    // Coinbase-only template: merkle field = coinbase txid (internal order).
-    std::vector<unsigned char> coinbase = build_coinbase(height, subsidy);
-    Bytes32 cb_txid = sha256d(coinbase.data(), coinbase.size());
+    // Coinbase-only template built via the LIVE SSOT path (with witness
+    // commitment). merkle field = coinbase txid over the NON-witness bytes.
+    bip110::coin::GentxCoinbase cb = build_live_coinbase(height, subsidy);
+    const std::vector<unsigned char>& coinbase       = cb.bytes;        // non-witness (txid/merkle)
+    const std::vector<unsigned char>& coinbase_block = cb.block_bytes;  // BIP144 witness (block body)
+    Bytes32 cb_txid;
+    std::memcpy(cb_txid.data(), cb.txid.data(), 32);
+    // Independent cross-check: txid is the double-SHA256 of the non-witness bytes.
+    expect("cb.txid == sha256d(non-witness bytes)", cb_txid == sha256d(coinbase.data(), coinbase.size()));
+    // The witness form MUST differ from the non-witness form (it carries the
+    // reserved-value witness) and MUST be longer by exactly marker+flag+witness.
+    expect("block_bytes carries a witness (differs from non-witness bytes)",
+           coinbase_block != coinbase);
+    expect("block_bytes length == non-witness + 2 (marker/flag) + 34 (witness)",
+           coinbase_block.size() == coinbase.size() + 2 + 34);
 
     HeaderFreeze f;
     // block_version 0xA0000000 = bit31 v2 flag | 0x20000000, little-endian on wire.
@@ -254,11 +301,14 @@ void test_submit_roundtrip()
     expect("recomputed PoW <= block target", pw2.GetHex() <= trivial_target);
     expect("won header is 164 bytes", won_header.size() == 164);
 
-    // ── BLOCK ARM: header(164) || varint(txcount=1) || coinbase ──
+    // ── BLOCK ARM: header(164) || varint(txcount=1) || BIP144 witness coinbase ──
+    // The block body MUST carry the witness coinbase (coinbase_block), exactly as
+    // work_source.cpp mining_submit does — shipping the non-witness form with the
+    // commitment output present is bad-witness-nonce-size (DEFECT 1).
     std::vector<unsigned char> block;
     block.insert(block.end(), won_header.begin(), won_header.end());
     block.push_back(0x01);                        // varint txcount = 1
-    block.insert(block.end(), coinbase.begin(), coinbase.end());
+    block.insert(block.end(), coinbase_block.begin(), coinbase_block.end());
 
     // Re-slice the header from the assembled block and re-hash -> same PoW.
     std::vector<unsigned char> reslice(block.begin(), block.begin() + 164);
@@ -266,12 +316,26 @@ void test_submit_roundtrip()
     uint256 pw3 = bip110::pow::blake2b_block_hash(std::span<const unsigned char>(reslice.data(), reslice.size()));
     expect_eq("block-arm re-hash == PoW", pw3.GetHex(), found_hash);
 
-    // The header's merkle field commits the coinbase txid (consensus binding).
-    expect("header merkle == coinbase txid", std::memcmp(reslice.data() + 36, cb_txid.data(), 32) == 0);
+    // The header's merkle field commits the coinbase txid (over the NON-witness
+    // bytes — the witness does NOT change the txid, the segwit invariant).
+    expect("header merkle == coinbase txid (non-witness)",
+           std::memcmp(reslice.data() + 36, cb_txid.data(), 32) == 0);
 
-    std::printf("         reassembled block: %zu bytes (164 hdr + 1 varint + %zu coinbase)\n",
-                block.size(), coinbase.size());
+    // ── DEFECT 1 GATE: the reassembled block's coinbase has a VALID witness nonce
+    // (one 32-byte reserved-value element) whenever a commitment output exists —
+    // the CheckWitnessMalleation-equivalent assertion. This is the check that the
+    // old test-local plain-P2PKH coinbase could never make (DEFECT 3).
+    std::string witness_hex;
+    expect("BIP144 witness nonce valid (0x01 0x20 32*00) — CheckWitnessMalleation",
+           witness_nonce_ok(coinbase_block, witness_hex));
+    expect_eq("coinbase witness stack", witness_hex,
+              std::string("0120") + std::string(64, '0'));
+
+    std::printf("         reassembled block: %zu bytes (164 hdr + 1 varint + %zu witness-coinbase)\n",
+                block.size(), coinbase_block.size());
     std::printf("         header hex: %s\n", to_hex(won_header).c_str());
+    std::printf("         witness-coinbase hex: %s\n", to_hex(coinbase_block).c_str());
+    std::printf("         witness stack: %s (count=01 len=20 reserved=32*00)\n", witness_hex.c_str());
 }
 
 } // namespace

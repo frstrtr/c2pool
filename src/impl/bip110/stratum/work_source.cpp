@@ -67,6 +67,7 @@ Bip110WorkSource::Bip110WorkSource(bip110::coin::HeaderChain& chain,
     config_.set_difficulty_multiplier = 1.0;   // BLAKE2b net, not scrypt
     config_.require_job_snapshot    = true;
     config_.raw_prevhash_wire       = true;
+    config_.disable_version_rolling = true;   // R4: header commits version in h1
     if (config_.max_coinbase_outputs == 0 || config_.max_coinbase_outputs > 1500)
         config_.max_coinbase_outputs = 1500;   // R8 weight guard (800000 WU cap)
 
@@ -178,6 +179,14 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         segwit_commit = std::move(sc);
     }
 
+    // ── DEFECT 2 BURN GUARD ──────────────────────────────────────────────────
+    // A coinbase whose only value-bearing outputs are the miner payout and the
+    // node-owner donation must pay the ENTIRE subsidy to one of them. If the
+    // miner's payout script failed to resolve (empty) AND no donation address is
+    // configured, every value-bearing output would be 0 and a found block would
+    // silently BURN the whole subsidy. Refuse to serve such work — return an
+    // empty CoinbaseResult (empty coinb1), which the core treats exactly like a
+    // not-yet-synced template and suppresses the job. Never serve all-zero work.
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;
     uint64_t donation_amt = 0;
     std::vector<unsigned char> donation = donation_script_;
@@ -185,7 +194,27 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         payouts.emplace_back(payout_script, w.subsidy);
     else if (!donation.empty())
         donation_amt = w.subsidy;                 // no miner script -> all to donation
+    else {
+        LOG_ERROR << "[BIP110-WS] REFUSING work: miner payout script empty AND no "
+                     "donation/node-owner address configured — serving would burn the "
+                     "entire subsidy (height=" << w.height << "). Set --node-owner-address.";
+        return CoinbaseResult{};
+    }
     if (donation.empty()) donation = {0x6a};      // OP_RETURN placeholder (0-value)
+
+    // Value-conservation guard: the sum of all non-commitment output values MUST
+    // equal subsidy + fees (M2: fees == 0). A mismatch means a construction bug
+    // would over-claim or burn value — refuse rather than emit an invalid/burning
+    // coinbase.
+    {
+        uint64_t total_out = donation_amt;
+        for (const auto& [scr, amt] : payouts) { (void)scr; total_out += amt; }
+        if (total_out != w.subsidy) {
+            LOG_ERROR << "[BIP110-WS] REFUSING work: coinbase output value " << total_out
+                      << " != subsidy+fees " << w.subsidy << " (height=" << w.height << ")";
+            return CoinbaseResult{};
+        }
+    }
 
     // OP_RETURN ref marker (M2: empty commitment; M3 carries the share ref).
     std::vector<unsigned char> op_return = {0x6a, 0x00};
@@ -220,7 +249,10 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
     {
         std::lock_guard<std::mutex> lk(freeze_mutex_);
         gc_freezes();
-        FreezeEntry e; e.freeze = f; e.coinbase = cb.bytes; e.at = std::chrono::steady_clock::now();
+        FreezeEntry e; e.freeze = f;
+        e.coinbase       = cb.bytes;        // non-witness (txid/merkle/share source)
+        e.coinbase_block = cb.block_bytes;  // BIP144 witness form for the block body
+        e.at = std::chrono::steady_clock::now();
         freeze_map_[to_hex(f.h2)] = std::move(e);
     }
 
@@ -307,11 +339,16 @@ nlohmann::json Bip110WorkSource::mining_submit(
 
     if (is_block) {
         // BLOCK ARM: reassemble 164-byte v2 header || varint(txcount=1) || coinbase.
+        // Use the BIP144 witness coinbase (coinbase_block): the block body carries
+        // the commitment output, so its coinbase MUST expose the 1x32-byte witness
+        // reserved value or fork peers/submitblock reject bad-witness-nonce-size
+        // (DEFECT 1). txid/merkle/h1 were computed over the non-witness bytes and
+        // are unchanged by the witness — the PoW re-slice below re-proves it.
         std::vector<unsigned char> coinbase;
         {
             std::lock_guard<std::mutex> lk(freeze_mutex_);
             auto it = freeze_map_.find(to_hex(f.h2));
-            if (it != freeze_map_.end()) coinbase = it->second.coinbase;
+            if (it != freeze_map_.end()) coinbase = it->second.coinbase_block;
         }
         std::vector<unsigned char> block = hdr;
         block.push_back(0x01);                                  // txcount varint = 1

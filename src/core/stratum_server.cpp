@@ -869,6 +869,18 @@ nlohmann::json StratumSession::handle_configure(const nlohmann::json& params, co
         std::string ext_name = ext.get<std::string>();
 
         if (ext_name == "version-rolling") {
+            // BIP-110 (and any lane that commits the block version inside the
+            // frozen pseudo-header) MUST NOT let miners roll the version — a
+            // rolled version yields a header the pool never committed to and the
+            // share is 100%-rejected. Refuse the extension so miners don't waste
+            // shares (fail-closed, no money loss).
+            if (mining_interface_->get_stratum_config().disable_version_rolling) {
+                version_rolling_enabled_ = false;
+                result["version-rolling"] = false;
+                LOG_INFO << "[Stratum] Version-rolling DISABLED for this lane "
+                            "(header commits version) — declining negotiation";
+                continue;
+            }
             // Miner provides its mask and optional min-bit-count
             std::string miner_mask_hex = "ffffffff";
             if (ext_params.contains("version-rolling.mask") && ext_params["version-rolling.mask"].is_string())

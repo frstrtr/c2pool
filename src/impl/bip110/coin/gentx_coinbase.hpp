@@ -41,8 +41,20 @@ namespace bip110::coin
 
 struct GentxCoinbase
 {
-    std::vector<unsigned char> bytes; // non-witness serialization
-    uint256 txid;                     // double-SHA256(bytes) == gentx_hash
+    std::vector<unsigned char> bytes;       // non-witness serialization (txid/merkle source)
+    uint256 txid;                           // double-SHA256(bytes) == gentx_hash
+    // BIP144 (segwit) serialization used for the BLOCK BODY when a witness
+    // commitment output is present:
+    //   version | 0x00 0x01 (marker+flag) | vin | vout |
+    //   witness_for_input0{ 0x01 (stack items) | 0x20 (len 32) | 32*0x00 reserved }
+    //   | locktime
+    // Knots/Core CheckWitnessMalleation REQUIRES exactly one 32-byte witness
+    // element on the coinbase input whenever a commitment output exists;
+    // shipping `bytes` (empty witness stack) => bad-witness-nonce-size => the
+    // won block is rejected by fork peers AND submitblock. When there is no
+    // commitment output, block_bytes == bytes (no witness, as before).
+    // txid/merkle stay over the NON-witness `bytes` (segwit-invariant).
+    std::vector<unsigned char> block_bytes;
 };
 
 // payout_outputs: (scriptPubKey, value) pairs in final consensus order.
@@ -125,7 +137,41 @@ inline GentxCoinbase assemble_gentx_coinbase(
     out.bytes.assign(reinterpret_cast<const unsigned char*>(tx.data()),
                      reinterpret_cast<const unsigned char*>(tx.data()) + tx.size());
     auto sp = std::span<const unsigned char>(out.bytes.data(), out.bytes.size());
-    out.txid = Hash(sp);
+    out.txid = Hash(sp);   // txid/merkle over the NON-witness bytes (segwit-invariant)
+
+    // ── BIP144 block-body serialization ──────────────────────────────────────
+    // When a witness-commitment output exists, the coinbase carried in the block
+    // MUST expose exactly one 32-byte witness element (the reserved value) on its
+    // single input, or Knots/Core CheckWitnessMalleation rejects it with
+    // bad-witness-nonce-size. Splice the marker+flag after the 4-byte version and
+    // the witness+locktime around the non-witness body:
+    //   version(4) | 0x00 0x01 | vin | vout | witness | locktime(4)
+    // The reserved value is 32 zero bytes — the SAME preimage the commitment math
+    // above consumed (SHA256d(witness_merkle_root(0) || reserved(0*32))). No
+    // commitment output => no witness => block_bytes == bytes (byte-unchanged).
+    if (segwit_commitment_script.has_value() && out.bytes.size() >= 8)
+    {
+        const size_t n = out.bytes.size();
+        std::vector<unsigned char>& b = out.block_bytes;
+        b.reserve(n + 2 + 34);
+        // version (4)
+        b.insert(b.end(), out.bytes.begin(), out.bytes.begin() + 4);
+        // segwit marker + flag
+        b.push_back(0x00);
+        b.push_back(0x01);
+        // vin || vout  (everything between version and locktime)
+        b.insert(b.end(), out.bytes.begin() + 4, out.bytes.begin() + (n - 4));
+        // witness for input[0]: 1 stack item, 32-byte reserved value (all zero)
+        b.push_back(0x01);                 // stack item count
+        b.push_back(0x20);                 // element length = 32
+        b.insert(b.end(), 32, 0x00);       // reserved value
+        // locktime (4)
+        b.insert(b.end(), out.bytes.begin() + (n - 4), out.bytes.end());
+    }
+    else
+    {
+        out.block_bytes = out.bytes;       // no commitment -> no witness needed
+    }
     return out;
 }
 

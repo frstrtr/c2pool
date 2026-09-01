@@ -153,7 +153,11 @@ private:
 
     // h2-keyed freeze-map. TTL >= 360s (> core JOB_TTL 300s) so a share arriving
     // near the tail of a job's core-side lifetime still resolves (R5).
-    struct FreezeEntry { HeaderFreeze freeze; std::vector<unsigned char> coinbase; std::chrono::steady_clock::time_point at; };
+    // coinbase       = NON-witness serialization (txid/merkle/share source).
+    // coinbase_block = BIP144 witness serialization for the BLOCK BODY (carries
+    //                  the 1x32-byte witness reserved value the commitment output
+    //                  requires; == coinbase when no commitment). See DEFECT 1.
+    struct FreezeEntry { HeaderFreeze freeze; std::vector<unsigned char> coinbase; std::vector<unsigned char> coinbase_block; std::chrono::steady_clock::time_point at; };
     mutable std::mutex           freeze_mutex_;
     mutable std::map<std::string, FreezeEntry> freeze_map_;   // key = hex(h2)
     static constexpr std::chrono::seconds FREEZE_TTL{360};

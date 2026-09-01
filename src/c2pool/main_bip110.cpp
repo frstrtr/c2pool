@@ -24,6 +24,7 @@
 
 #include <core/uint256.hpp>
 #include <core/target_utils.hpp>
+#include <core/address_utils.hpp>
 #include <core/netaddress.hpp>
 #include <core/stratum_server.hpp>
 #include <core/log.hpp>
@@ -80,7 +81,9 @@ void print_banner(const char* argv0)
         "  --coin-p2p-discover  discover NODE_BLAKE2B fork peers (DNS + fixed seeds)\n"
         "  --peer IP:PORT       add an explicit fork peer (repeatable)\n"
         "  --fork-checkpoint    seed the Knots 961640 checkpoint for a fast proof\n"
-        "  --http [HOST:]PORT   serve a JSON sync-status endpoint\n\n"
+        "  --http [HOST:]PORT   serve a JSON sync-status endpoint\n"
+        "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
+        "                       miner has no resolvable payout address (base58/bech32)\n\n"
         "PoW: BLAKE2b commitment pipeline (bip110::pow); block hash == PoW hash.\n"
         "Fork: Blake2bHeight=%u; RDTS weight cap=%u WU; network==Bitcoin mainnet\n"
         "      (magic f9beb4d9, default port %u).\n",
@@ -199,7 +202,8 @@ int run_embedded(bool coin_p2p_discover,
                  const std::vector<NetService>& explicit_peers,
                  bool fork_checkpoint,
                  const std::string& http_host, uint16_t http_port,
-                 uint16_t stratum_port)
+                 uint16_t stratum_port,
+                 const std::string& donation_address)
 {
     core::log::Logger::init();
 
@@ -249,6 +253,29 @@ int run_embedded(bool coin_p2p_discover,
         };
     auto work_source = std::make_shared<bip110::stratum::Bip110WorkSource>(
         header_chain, /*is_testnet=*/false, std::move(stratum_submit_fn));
+
+    // ── DEFECT 2: node-owner / donation address (OPERATOR-PROVIDED, never hard-
+    // coded). When a miner authorizes with a resolvable payout address it is paid
+    // the subsidy; if the miner address fails to resolve, the subsidy falls back
+    // to this donation script. If NEITHER resolves the work source REFUSES to
+    // serve (burn guard) rather than emit all-zero-value work. Accepts any
+    // Bitcoin base58/bech32 address (address_to_script). ──
+    if (!donation_address.empty()) {
+        auto donation_script = core::address_to_script(donation_address);
+        if (donation_script.empty()) {
+            LOG_ERROR << "[EMB-BIP110] --node-owner-address '" << donation_address
+                      << "' did not decode to a scriptPubKey — REFUSING to start "
+                         "(would fall through to the burn guard). Fix the address.";
+            return 2;
+        }
+        work_source->set_donation_script(donation_script);
+        LOG_INFO << "[EMB-BIP110] node-owner/donation address set: " << donation_address
+                 << " (script " << donation_script.size() << " B) — subsidy fallback armed";
+    } else {
+        LOG_WARNING << "[EMB-BIP110] no --node-owner-address configured: only miners "
+                       "with a resolvable payout address get work; unresolved payout + "
+                       "no donation => work is REFUSED (burn guard), never zero-value.";
+    }
 
     std::unique_ptr<core::StratumServer> stratum_server;
     if (stratum_port != 0) {
@@ -445,6 +472,7 @@ int main(int argc, char** argv)
     std::string http_host = "0.0.0.0";
     uint16_t http_port = 0;
     uint16_t stratum_port = 9336;  // BIP-110 Stratum port (params.hpp worker_port)
+    std::string donation_address;  // operator-provided node-owner/donation address
     std::vector<NetService> explicit_peers;
 
     auto parse_hostport = [](const std::string& v, std::string& h, uint16_t& p) {
@@ -473,6 +501,9 @@ int main(int argc, char** argv)
             stratum_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         }
         else if (a == "--no-stratum") { stratum_port = 0; }
+        else if ((a == "--node-owner-address" || a == "--donation") && i + 1 < argc) {
+            donation_address = argv[++i];
+        }
     }
 
     if (run) {
@@ -480,7 +511,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_port);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_port, donation_address);
     }
 
     print_banner(argv[0]);
