@@ -426,12 +426,13 @@ int run_embedded(bool coin_p2p_discover,
 
                 uint256 share_hash;
                 try {
-                    // NOTE (PR-C gap): bip110 M2 build_connection_coinbase does not
-                    // yet freeze the sharechain ref fields into JobSnapshot
-                    // (frozen_ref/prev_share_hash are default), so has_frozen=false
-                    // — create_local_share derives absheight/abswork/target from the
-                    // tracker. The abswork %2^64 wrap (NIT-2) is already applied at
-                    // all three sites inside create_local_share.
+                    // PR-C: build_connection_coinbase now FREEZES the sharechain ref
+                    // fields into JobSnapshot.frozen_ref (populated by ref_hash_fn)
+                    // and stamps job.prev_share_hash from best_share_hash_fn, so
+                    // has_frozen=TRUE — create_local_share reproduces the EXACT
+                    // ref_hash the coinbase committed (extend-off-real-tip), instead
+                    // of re-deriving from the tracker and taking the genesis branch.
+                    // The abswork %2^64 wrap (NIT-2) is applied inside create_local_share.
                     share_hash = bip110::pool::create_local_share(
                         node_raw->tracker(),
                         full_hdr,
@@ -455,7 +456,7 @@ int run_embedded(bool coin_p2p_discover,
                         /* frozen_far_share_hash */ job.frozen_ref.far_share_hash,
                         /* frozen_timestamp */      job.frozen_ref.timestamp,
                         /* frozen_merged_payout */  job.frozen_ref.merged_payout_hash,
-                        /* has_frozen */            false,
+                        /* has_frozen */            true,
                         /* frozen_merkle_branches*/ job.frozen_ref.frozen_merkle_branches,
                         /* frozen_witness_root */   job.frozen_ref.frozen_witness_root,
                         /* frozen_merged_cb_info */ job.frozen_ref.frozen_merged_coinbase_info,
@@ -487,6 +488,217 @@ int run_embedded(bool coin_p2p_discover,
                 }
                 return share_hash;
             });
+
+        // (6b) M3 PR-C: the coinbase's donation output (p2pool-canonical SECOND-
+        // TO-LAST, immediately before the OP_RETURN ref) MUST carry the canonical
+        // p2pool donation script — compute_gentx_before_refhash(36) (share_check.hpp)
+        // hardcodes it as the hash_link const-ending, so a peer reconstructing the
+        // gentx from the share's hash_link re-supplies exactly those bytes. Any
+        // other donation script (e.g. the operator node-owner address set at M2
+        // startup) makes the peer's reconstruction diverge -> the share is rejected.
+        // Mirrors main_btc.cpp:1829 (set_donation_script(PoolConfig::get_donation_
+        // script(ver))). Overrides the M2 node-owner donation ONLY on the flag-ON
+        // path; the OFF path keeps the operator address (byte-identical M2).
+        work_source->set_donation_script(bip110::pool::PoolConfig::get_donation_script(36));
+        LOG_INFO << "[EMB-BIP110] M3 PR-C donation output -> canonical p2pool script "
+                    "(hash_link const-ending parity; overrides M2 node-owner donation)";
+
+        // (7) M3 PR-C: feed the sharechain tip into JobSnapshot.prev_share_hash.
+        // The generic stratum_server seam (stratum_server.cpp:1607) calls this to
+        // freeze the tip ONCE per job and stores it on the job (:1807) — the SAME
+        // value build_connection_coinbase's ref walk uses. Cold start / empty chain
+        // => uint256::ZERO, and the ref walk then takes the genesis branch (correct
+        // pre-bootstrap). Mirrors main_btc.cpp:1812-1816.
+        work_source->set_best_share_hash_fn(
+            [node_raw]() -> uint256 {
+                if (!node_raw) return uint256::ZERO;
+                return node_raw->best_share_hash();
+            });
+
+        // (8) M3 PR-C: the coinbase ref-commitment producer. Walks the share
+        // tracker off prev_share_hash for the deterministic chain-position fields
+        // (absheight/abswork/far_share_hash) + the share target (compute_share_
+        // target), then computes the p2pool ref_hash via the lane SSOT
+        // bip110::pool::compute_ref_hash_for_work. build_connection_coinbase embeds
+        // the returned ref_hash in the coinbase OP_RETURN and freezes these fields
+        // into JobSnapshot.frozen_ref; create_local_share (has_frozen=TRUE) then
+        // reproduces the EXACT ref_hash, so the commitment the coinbase carries ==
+        // what a peer recomputes off the minted share (mint==verify, peers accept).
+        //
+        // Near-verbatim port of main_btc.cpp:1869-2125 with the bip110 v36 deltas:
+        //   • share_version = desired_version = 36 (no AutoRatchet — v36 always)
+        //   • donation u16 = 66 (WIRE-GENESIS freeze, 0.1%; NOT btc's 50)
+        //   • no merged mining (merged_addresses / merged_coinbase_info empty)
+        //   • segwit_data = SegwitDataDefault::get() none-sentinel (2^256-1 root):
+        //     coinbase-only templates carry no witness_commitment_hex into the mint,
+        //     so create_local_share stores the sentinel SegwitData — the ref MUST
+        //     serialize the SAME sentinel (has_segwit=true path) or the ref_hash
+        //     diverges (has_segwit=false would write a ZERO root, not the sentinel).
+        //   • timestamp clipped to prev->m_timestamp+1 BEFORE compute_share_target,
+        //     matching create_local_share's ordering (share_check.hpp:2256-2269) so
+        //     the (bits,max_bits) the ref commits equal what peers derive.
+        work_source->set_ref_hash_fn(
+            [node_raw](const uint256& prev_share_hash,
+                       const std::vector<unsigned char>& scriptSig,
+                       const std::vector<unsigned char>& payout_script,
+                       uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)
+            -> core::stratum::RefHashResult
+            {
+                core::stratum::RefHashResult result;
+                result.share_version   = 36;
+                result.desired_version = 36;
+                result.timestamp       = timestamp;   // overwritten below if clipped
+
+                bip110::pool::RefHashParams p;
+                p.share_version   = 36;
+                p.desired_version = 36;
+                p.prev_share      = prev_share_hash;
+                p.coinbase_scriptSig = scriptSig;
+                p.share_nonce     = 0;                // share commitment nonce (== m_nonce)
+                p.subsidy         = subsidy;          // BLOCK subsidy (== job.subsidy)
+                p.donation        = 66;               // WIRE-GENESIS freeze (0.1%)
+                p.stale_info      = 0;
+                p.timestamp       = timestamp;
+
+                // Pubkey extract — MUST mirror create_local_share (share_check.hpp:
+                // 2296-2316) so the payout identity the ref commits == the minted
+                // share's. P2PKH(25)/P2SH(23)/P2WPKH(22).
+                if (payout_script.size() >= 20) {
+                    if (payout_script.size() == 25 &&
+                        payout_script[0] == 0x76 && payout_script[1] == 0xa9 &&
+                        payout_script[2] == 0x14 && payout_script[23] == 0x88 &&
+                        payout_script[24] == 0xac) {
+                        std::memcpy(p.pubkey_hash.data(), payout_script.data() + 3, 20);
+                        p.pubkey_type = 0;
+                    } else if (payout_script.size() == 23 &&
+                               payout_script[0] == 0xa9 && payout_script[1] == 0x14 &&
+                               payout_script[22] == 0x87) {
+                        std::memcpy(p.pubkey_hash.data(), payout_script.data() + 2, 20);
+                        p.pubkey_type = 2;
+                    } else if (payout_script.size() == 22 &&
+                               payout_script[0] == 0x00 && payout_script[1] == 0x14) {
+                        std::memcpy(p.pubkey_hash.data(), payout_script.data() + 2, 20);
+                        p.pubkey_type = 1;
+                    } else {
+                        std::memcpy(p.pubkey_hash.data(), payout_script.data(), 20);
+                        p.pubkey_type = 0;
+                    }
+                }
+
+                // Segwit sentinel (coinbase-only): match create_local_share's
+                // SegwitDataDefault (empty branch + 2^256-1 wtxid root). MUST be the
+                // has_segwit=TRUE path so the sentinel — not a zero root — is written.
+                p.has_segwit  = true;
+                p.segwit_data = bip110::pool::SegwitDataDefault::get();
+
+                // Genesis / tracker-busy fallbacks (ref_hash won't match a live tip,
+                // but that IS the right answer pre-bootstrap / when prev unknown).
+                auto set_genesis = [&] {
+                    p.absheight = 1;
+                    p.far_share_hash = uint256::ZERO;
+                    p.abswork = uint128(chain::target_to_average_attempts(
+                        chain::bits_to_target(p.bits)).GetLow64());
+                };
+                auto set_block_bits_fallback = [&] {
+                    p.bits = block_bits; p.max_bits = block_bits;
+                    result.bits = block_bits; result.max_bits = block_bits;
+                };
+
+                if (node_raw) {
+                    auto guard = node_raw->read_tracker();
+                    if (guard) {
+                        auto& tracker = *guard;
+                        // Step 1: clip timestamp + absheight + far_share_hash off prev
+                        // (BEFORE compute_share_target — share_check.hpp ordering).
+                        if (!prev_share_hash.IsNull() && tracker.chain.contains(prev_share_hash)) {
+                            tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
+                                p.absheight = prev->m_absheight + 1;
+                                if (p.timestamp <= prev->m_timestamp)
+                                    p.timestamp = prev->m_timestamp + 1;
+                            });
+                            auto [prev_height, _last] =
+                                tracker.chain.get_height_and_last(prev_share_hash);
+                            if (prev_height >= 99) {
+                                try {
+                                    p.far_share_hash =
+                                        tracker.chain.get_nth_parent_key(prev_share_hash, 99);
+                                } catch (const std::exception&) {
+                                    p.far_share_hash = uint256::ZERO;
+                                }
+                            } else {
+                                p.far_share_hash = uint256::ZERO;
+                            }
+                            // Step 2: share_target with the CLIPPED timestamp.
+                            try {
+                                auto st = tracker.compute_share_target(
+                                    prev_share_hash, p.timestamp,
+                                    chain::bits_to_target(block_bits));
+                                p.bits = st.bits; p.max_bits = st.max_bits;
+                                result.bits = st.bits; result.max_bits = st.max_bits;
+                            } catch (const std::exception&) {
+                                set_block_bits_fallback();
+                            }
+                            // Step 3: abswork = prev_abswork + aps(this-share-bits).
+                            tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
+                                auto attempts = chain::target_to_average_attempts(
+                                    chain::bits_to_target(p.bits));
+                                p.abswork = uint128(
+                                    (prev->m_abswork + uint128(attempts.GetLow64())).GetLow64());
+                            });
+                            // Step 4: merged_payout_hash — computed on THIS guard (no
+                            // re-lock). Verify recomputes with the BLOCK target
+                            // (share.m_min_header.m_bits), so use block_bits here.
+                            try {
+                                p.merged_payout_hash = tracker.compute_merged_payout_hash(
+                                    prev_share_hash, chain::bits_to_target(block_bits));
+                            } catch (const std::exception&) {
+                                p.merged_payout_hash = uint256();
+                            }
+                        } else {
+                            // prev unknown / genesis: derive share_target off null prev
+                            // (compute_share_target returns the floor), then genesis.
+                            try {
+                                auto st = tracker.compute_share_target(
+                                    prev_share_hash, p.timestamp,
+                                    chain::bits_to_target(block_bits));
+                                p.bits = st.bits; p.max_bits = st.max_bits;
+                                result.bits = st.bits; result.max_bits = st.max_bits;
+                            } catch (const std::exception&) {
+                                set_block_bits_fallback();
+                            }
+                            set_genesis();
+                        }
+                    } else {
+                        // Tracker busy — fallback (ref_hash won't match peers).
+                        set_block_bits_fallback();
+                        set_genesis();
+                    }
+                } else {
+                    set_block_bits_fallback();
+                    set_genesis();
+                }
+
+                // Mirror the walked values into the result for snap.frozen_ref.
+                result.absheight      = p.absheight;
+                result.abswork        = p.abswork;
+                result.far_share_hash = p.far_share_hash;
+                result.timestamp      = p.timestamp;
+                result.merged_payout_hash = p.merged_payout_hash;
+
+                try {
+                    auto [rh, nn] = bip110::pool::compute_ref_hash_for_work(p);
+                    result.ref_hash         = rh;
+                    result.last_txout_nonce = nn;
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[BIP110-STRATUM] compute_ref_hash_for_work threw: "
+                                << e.what();
+                    // result.ref_hash stays null -> build_connection_coinbase refuses.
+                }
+                return result;
+            });
+
+        LOG_INFO << "[EMB-BIP110] M3 PR-C ref-commitment wired (best_share + ref_hash;"
+                    " coinbase carries the v36 ref_hash, mint has_frozen=TRUE)";
 
         // (6) IRREVERSIBLE first-outbound to the fresh federation sharechain.
         // Stays INSIDE the flag-ON block so it never runs by default.

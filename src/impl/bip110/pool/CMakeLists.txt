@@ -151,3 +151,38 @@ target_link_libraries(bip110_pool_mint_kat
     Threads::Threads
 )
 add_test(NAME bip110_pool_mint_kat COMMAND bip110_pool_mint_kat)
+
+# bip110_extend_mint_kat: the F2 EXTEND-OFF-REAL-TIP + PEER ref/coinbase-consistency
+# KAT (M3 PR-C). Where the genesis mint_kat proves mint/verify SYMMETRY with a fake
+# coinbase, THIS KAT seeds a real tip, mints a share EXTENDING it (has_frozen=TRUE,
+# absheight==2), and proves the coinbase carries a REAL ref commitment that a PEER
+# recomputes off the STORED share fields byte-for-byte (compute_ref_hash_for_work)
+# and then reconstructs the exact share hash via the share_check verify path
+# (check_hash_link -> check_merkle_link -> compute_share_hash) — i.e. peers ACCEPT
+# the minted share (the F1 wire failure is closed). Same heavy link closure as the
+# mint_kat (create_local_share + assemble_gentx_coinbase + the verify surface +
+# BLAKE2b via share_identity.hpp -> pow.hpp). blake2b.c compiled directly.
+add_executable(bip110_extend_mint_kat
+    test/bip110_extend_mint_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_extend_mint_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_extend_mint_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_extend_mint_kat COMMAND bip110_extend_mint_kat)

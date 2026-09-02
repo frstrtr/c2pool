@@ -90,6 +90,25 @@ public:
         const core::stratum::JobSnapshot&  job,
         const std::vector<unsigned char>& payout_script)>;
 
+    // Sharechain REF-COMMITMENT producer (M3 PR-C, flag-ON only). Given the job's
+    // prev_share_hash (the sharechain tip fed by best_share_hash_fn_), the coinbase
+    // scriptSig, the miner payout script, the block subsidy/bits/timestamp, returns
+    // the p2pool ref_hash + the frozen share fields (absheight/abswork/far/bits/
+    // max_bits/timestamp/merged_payout) that create_local_share must reproduce so
+    // the OP_RETURN commitment the coinbase carries == the ref_hash a peer recomputes
+    // off the minted share (mint==verify). main_bip110.cpp wires this to a lambda
+    // that walks the share tracker (near-verbatim port of main_btc.cpp's ref_hash_fn,
+    // minus merged-mining — bip110 v36 is single-chain, segwit sentinel constant).
+    // Left UNSET in M2 (default OFF) => build_connection_coinbase emits the empty
+    // {0x6a,0x00} M2 OP_RETURN and populates no frozen_ref (byte-identical to today).
+    // Coinbase-only: no txid_merkle_branches / witness_root / merged blob args (the
+    // segwit_data is the SegwitDataDefault none-sentinel, folded in by the lambda).
+    using RefHashFn = std::function<core::stratum::RefHashResult(
+        const uint256& prev_share_hash,
+        const std::vector<unsigned char>& coinbase_scriptSig,
+        const std::vector<unsigned char>& payout_script,
+        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)>;
+
     Bip110WorkSource(bip110::coin::HeaderChain& chain,
                      bool is_testnet,
                      SubmitBlockFn submit_fn,
@@ -159,6 +178,15 @@ public:
     void set_node_owner_fee_ppm(uint64_t ppm) { node_owner_fee_ppm_ = ppm; }
     void set_create_share_fn(CreateShareFn fn) { create_share_fn_ = std::move(fn); }
 
+    // M3 PR-C sharechain wiring (flag-ON only). set from main_bip110 INSIDE the
+    // --bip110-sharechain block. When unset (M2 default OFF) the OP_RETURN stays
+    // the empty {0x6a,0x00} commitment and no frozen_ref is populated — byte-
+    // identical to M2. best_share_hash_fn_ feeds the sharechain tip into the job's
+    // prev_share_hash (via get_best_share_hash_fn -> the generic stratum_server
+    // seam); ref_hash_fn_ produces the coinbase ref commitment + frozen fields.
+    void set_best_share_hash_fn(std::function<uint256()> fn) { best_share_hash_fn_ = std::move(fn); }
+    void set_ref_hash_fn(RefHashFn fn) { ref_hash_fn_ = std::move(fn); }
+
     // ── M3 daemonless mempool tx-serving ─────────────────────────────────
     // Wire the embedded mempool (P2P-ingested, daemonlessly priced) so templates
     // include REAL network txs instead of coinbase-only EMPTY blocks. serve=false
@@ -206,14 +234,20 @@ private:
     core::stratum::StratumConfig config_;
 
     std::atomic<uint64_t>        work_generation_{1};
-    std::atomic<uint32_t>        share_bits_{0};
-    std::atomic<uint32_t>        share_max_bits_{0};
+    // mutable: build_connection_coinbase() is const but freezes the ref's share
+    // target into these on the flag-ON path (mirrors btc work_source.hpp:355-356).
+    mutable std::atomic<uint32_t> share_bits_{0};
+    mutable std::atomic<uint32_t> share_max_bits_{0};
 
     std::vector<unsigned char>   donation_script_;     // author/dev donation destination
     std::vector<unsigned char>   node_owner_script_;   // node-owner fee destination (empty => == donation)
     uint64_t                     give_author_ppm_{0};  // author donation, ppm of coinbasevalue (0.1% = 1000)
     uint64_t                     node_owner_fee_ppm_{0};// node-owner fee, ppm of coinbasevalue (1% = 10000)
     CreateShareFn                create_share_fn_;
+
+    // M3 PR-C sharechain ref-commitment (flag-ON only; unset in M2). See setters.
+    std::function<uint256()>     best_share_hash_fn_;   // sharechain tip -> job.prev_share_hash
+    RefHashFn                    ref_hash_fn_;          // coinbase ref_hash + frozen fields
 
     // M3 mempool tx-serving. Read-only pointer; owned by main_bip110.
     bip110::coin::Mempool*       mempool_{nullptr};

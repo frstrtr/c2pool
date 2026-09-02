@@ -89,7 +89,12 @@ Bip110WorkSource::~Bip110WorkSource() = default;
 
 std::function<uint256()> Bip110WorkSource::get_best_share_hash_fn() const
 {
-    return {};  // M2: no p2pool sharechain best-share (create_share_fn unset)
+    // M3 PR-C (flag-ON): return the wired best-share accessor so the generic
+    // stratum_server seam (stratum_server.cpp:1607) feeds the sharechain tip into
+    // JobSnapshot.prev_share_hash and into build_connection_coinbase's ref walk.
+    // M2 (default OFF): best_share_hash_fn_ is unset -> return {} exactly as before
+    // (no p2pool sharechain best-share; create_share_fn/ref_hash_fn also unset).
+    return best_share_hash_fn_;
 }
 
 Bip110WorkSource::NextWork Bip110WorkSource::next_work() const
@@ -143,7 +148,7 @@ std::string Bip110WorkSource::get_current_gbt_prevhash() const
 }
 
 CoinbaseResult Bip110WorkSource::build_connection_coinbase(
-    const uint256& /*prev_share_hash*/,
+    const uint256& prev_share_hash,
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged_addrs*/) const
@@ -366,8 +371,62 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         }
     }
 
-    // OP_RETURN ref marker (M2: empty commitment; M3 carries the share ref).
-    std::vector<unsigned char> op_return = {0x6a, 0x00};
+    // OP_RETURN ref marker.
+    //   M2 (default OFF, ref_hash_fn_ unset): EMPTY commitment {0x6a,0x00} —
+    //     byte-identical to the M2 header-follower coinbase. This is the exact btc
+    //     degrade pattern (emit_op_return = ref_hash_fn && !ref_hash.IsNull()).
+    //   M3 PR-C (flag-ON, --bip110-sharechain, ref_hash_fn_ set): the real 42-byte
+    //     p2pool ref commitment {0x6a, 0x28, ref_hash[32], last_txout_nonce[8]}.
+    //     ref_hash_fn_ walks the share tracker off prev_share_hash and returns both
+    //     the ref_hash AND the frozen share fields create_local_share reproduces —
+    //     so the commitment the coinbase carries == the ref_hash a peer recomputes
+    //     off the minted share (mint==verify; peers accept the share). The 8-byte
+    //     last_txout_nonce is BAKED IN here (unlike btc, where extranonce fills it
+    //     between coinb1/coinb2): on BIP-110 the extranonce lives in the 164B Sia
+    //     header, not the coinbase, so the coinbase tail is fully frozen at build.
+    //     The mint (create_local_share, share_check.hpp:2458/2569) extracts
+    //     ref_hash + last_txout_nonce from the coinbase's last 44 bytes
+    //     (ref_hash[32] + nonce[8] + locktime[4]) — this layout produces exactly
+    //     that tail.
+    // F1b (companion gap, NOT this PR): the reward split above still pays a SINGLE
+    // miner (coinbase-only), not the PPLNS distribution. A peer's share_check
+    // (share_check.hpp:1840-1952) rebuilds the expected coinbase from PPLNS weights
+    // (generate_share_transaction) and THROWS on mismatch — so a share minted off
+    // THIS coinbase passes the ref/hash_link check (below) but is still declined on
+    // PPLNS grounds until build_connection_coinbase serves the PPLNS-distributed
+    // coinbase (btc's set_pplns_fn / get_expected_payouts pattern). F1 (this PR)
+    // closes the empty-commitment blocker; F1b is the remaining peer-acceptance step.
+    std::vector<unsigned char> op_return = {0x6a, 0x00};   // M2 empty commitment
+    core::stratum::RefHashResult rh_result;
+    const bool sharechain_ref = static_cast<bool>(ref_hash_fn_);
+    if (sharechain_ref) {
+        try {
+            rh_result = ref_hash_fn_(prev_share_hash, cb_script, payout_script,
+                                     w.subsidy, w.nbits, w.curtime);
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[BIP110-WS] ref_hash_fn threw: " << e.what()
+                        << " — refusing job (would emit an unverifiable coinbase)";
+            return CoinbaseResult{};
+        }
+        if (rh_result.ref_hash.IsNull()) {
+            LOG_WARNING << "[BIP110-WS] ref_hash_fn returned null ref_hash (height="
+                        << w.height << ") — refusing job (unverifiable coinbase)";
+            return CoinbaseResult{};
+        }
+        // 6a 28 (OP_RETURN PUSH_40) + ref_hash[32] + last_txout_nonce[8] = 42 bytes.
+        op_return.assign({0x6a, 0x28});
+        op_return.insert(op_return.end(), rh_result.ref_hash.data(),
+                         rh_result.ref_hash.data() + 32);
+        const uint64_t nn = rh_result.last_txout_nonce;
+        const auto* np = reinterpret_cast<const unsigned char*>(&nn);
+        op_return.insert(op_return.end(), np, np + 8);   // LE nonce slot (baked)
+        // Freeze the SAME share target the ref committed so the job's difficulty
+        // classification and the mint's override_bits agree (btc work_source:717).
+        if (rh_result.bits != 0) {
+            share_bits_.store(rh_result.bits, std::memory_order_relaxed);
+            share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
+        }
+    }
 
     auto cb = bip110::coin::assemble_gentx_coinbase(
         cb_script, segwit_commit, payouts, donation_amt, donation, op_return);
@@ -563,6 +622,30 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
     s.segwit_active   = true;
     s.merkle_branches = {};                                   // literally empty
     s.witness_root    = uint256::ZERO;
+
+    // ── M3 PR-C: freeze the share fields the ref committed into the snapshot ──
+    // The generic stratum_server seam copies these into the JobEntry (stratum_
+    // server.cpp:1823-1834) and rebuilds them into JobSnapshot.frozen_ref, which
+    // create_local_share consumes on the has_frozen=TRUE path (main_bip110) so the
+    // minted share reproduces the EXACT ref_hash this coinbase embedded. Only on
+    // the flag-ON path; M2 leaves frozen_ref default (byte-identical to today).
+    if (sharechain_ref) {
+        s.frozen_ref.ref_hash          = rh_result.ref_hash;
+        s.frozen_ref.last_txout_nonce  = rh_result.last_txout_nonce;
+        s.frozen_ref.absheight         = rh_result.absheight;
+        s.frozen_ref.abswork           = rh_result.abswork;
+        s.frozen_ref.far_share_hash    = rh_result.far_share_hash;
+        s.frozen_ref.bits              = rh_result.bits;
+        s.frozen_ref.max_bits          = rh_result.max_bits;
+        s.frozen_ref.timestamp         = rh_result.timestamp;
+        s.frozen_ref.merged_payout_hash = rh_result.merged_payout_hash;
+        s.frozen_ref.share_version     = 36;   // v36-genesis (no AutoRatchet)
+        s.frozen_ref.desired_version   = 36;
+        // Coinbase-only: no merged mining, segwit is the none-sentinel constant;
+        // frozen_merkle_branches / frozen_witness_root / frozen_merged_coinbase_info
+        // stay empty (create_local_share then uses the sentinel SegwitData, matching
+        // the ref_hash_fn's segwit serialization).
+    }
     return out;
 }
 
