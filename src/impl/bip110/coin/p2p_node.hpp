@@ -120,6 +120,22 @@ private:
     using RawBlockParser = std::function<BlockType(const uint8_t*, size_t)>;
     RawBlockParser m_raw_block_parser;
 
+    // Coin-peer-manager lifecycle feedback (mirror of the DASH p2p_client seam,
+    // task #40). Without these the ported core::CoinAddrMan never learns which
+    // dialed peers actually completed the NODE_BLAKE2B handshake — its tried
+    // table stays empty and scoring/backoff run blind. Fired on the dial-result
+    // edges: connect_failed (socket never came up) / verack (handshake done) /
+    // error (an established link dropped, or a mid-handshake drop such as the
+    // NODE_BLAKE2B reject). Keys = m_target_addr.to_string() so they match the
+    // manager's stored PeerEndpoint key exactly.
+    using PeerLifecycleCallback = std::function<void(const NetService&)>;
+    PeerLifecycleCallback m_on_peer_connected;
+    PeerLifecycleCallback m_on_peer_disconnected;
+    PeerLifecycleCallback m_on_dial_failed;
+    // When set (discovery mode), request the peer's known-address set once the
+    // handshake completes so gossiped NODE_BLAKE2B peers grow the fork mesh.
+    bool m_send_getaddr_on_connect{false};
+
 public:
     NodeP2P(io::io_context* context, bip110::interfaces::Node* coin, config_t* config,
             const std::string& chain_label = "CoinP2P")
@@ -237,6 +253,11 @@ public:
         NetService svc_copy = service;
         LOG_WARNING << "[" << m_chain_label << "] Peer " << svc_copy.to_string()
                     << " disconnected: " << err;
+        // Capture the pre-reset state so the coin-peer-manager feedback fires at
+        // most once per link and distinguishes a lost established connection from
+        // a mid-handshake drop (e.g. a peer rejected at the NODE_BLAKE2B gate).
+        const bool had_peer = (m_peer != nullptr);
+        const bool was_up   = m_handshake_complete;
         if (m_peer)
         {
             m_peer.reset();
@@ -247,11 +268,36 @@ public:
         stop_timeout_timer();
         m_handshake_complete = false;
         m_idle_gate.reset();
+
+        if (had_peer) {
+            if (was_up) {
+                // An established outbound link dropped — refresh the addrman's
+                // believed-alive stamp (dashd Connected()).
+                if (m_on_peer_disconnected) m_on_peer_disconnected(m_target_addr);
+            } else {
+                // Socket came up but the handshake never completed (non-fork peer
+                // dropped at the version gate, or a broken peer): penalise it
+                // (attempt++/backoff) so the dialer rotates away from it.
+                if (m_on_dial_failed) m_on_dial_failed(m_target_addr);
+            }
+        }
     }
 
     void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
         error(parse_net_error(ec), service, where);
+    }
+
+    // #940 (BIP-110): an outbound dial failed BEFORE the socket came up
+    // (ECONNREFUSED / ETIMEDOUT / DNS-resolve error), so connected() and the
+    // error() disconnect seam never ran. Feed the dead target to the scored
+    // peer manager so its addrman lowers the entry's GetChance() (Attempt())
+    // and the dialer walks to a fresh fork peer instead of re-drawing it.
+    void connect_failed(const ::NetService& addr) override
+    {
+        LOG_WARNING << "[" << m_chain_label << "] dial failed to "
+                    << addr.to_string() << " — feeding peer scorer";
+        if (m_on_dial_failed) m_on_dial_failed(m_target_addr);
     }
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
@@ -383,6 +429,21 @@ public:
             std::chrono::steady_clock::now() - m_connected_at).count();
     }
     const std::string& chain_label() const { return m_chain_label; }
+    /// Remote address of the connected peer for the dashboard peers panel.
+    /// Prefer the live socket endpoint; fall back to the dialed target before
+    /// the socket is up. (Fixes the empty ADDRESS column: the peers entry never
+    /// carried an "addr" key.)
+    std::string peer_addr() const {
+        if (m_peer) return m_peer->get_addr().to_string();
+        return m_target_addr.to_string();
+    }
+
+    /// Coin-peer-manager feedback wiring (see member docs above).
+    void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }
+    void set_on_peer_disconnected(PeerLifecycleCallback cb) { m_on_peer_disconnected = std::move(cb); }
+    void set_on_dial_failed(PeerLifecycleCallback cb) { m_on_dial_failed = std::move(cb); }
+    /// Enable the post-handshake getaddr crawl (fork-mesh discovery).
+    void set_send_getaddr_on_connect(bool on) { m_send_getaddr_on_connect = on; }
 
     /// Set mempool reference for compact block reconstruction.
     void set_mempool(Mempool* mp) { m_mempool = mp; }
@@ -615,6 +676,12 @@ private:
         );
 
         m_handshake_complete = true;
+        // Feed the coin-peer-manager: this dialed target completed the
+        // NODE_BLAKE2B handshake, so mark it Good() -> its addrman tried table.
+        if (m_on_peer_connected) m_on_peer_connected(m_target_addr);
+        // Fork-mesh growth: pull the peer's known-address set. The addr handler
+        // filters the reply to NODE_BLAKE2B entries before banking them.
+        if (m_send_getaddr_on_connect) send_getaddr();
         m_idle_gate.reset();
         // The idle-progress gate now owns the eviction window. Nothing is pending
         // yet, so it stays disarmed (a synced/idle peer is never evicted); the
@@ -834,12 +901,19 @@ private:
     ADD_P2P_HANDLER(addr)
     {
         if (m_addr_callback && !msg->m_addrs.empty()) {
+            // Fork-mesh filter: a gossiped addr entry carries the advertised
+            // service flags of the peer it describes. Only peers advertising
+            // NODE_BLAKE2B (bit 28) follow the BLAKE2b hard-fork chain, so bank
+            // ONLY those into the addrman — a generic-BTC addr would poison the
+            // fork table with a non-fork peer that the version gate drops anyway.
+            static constexpr uint64_t NODE_BLAKE2B = (uint64_t{1} << 28);
             std::vector<NetService> addrs;
             addrs.reserve(msg->m_addrs.size());
             for (auto& rec : msg->m_addrs) {
+                if (!(rec.m_services & NODE_BLAKE2B)) continue;
                 addrs.push_back(rec.m_endpoint);
             }
-            m_addr_callback(addrs);
+            if (!addrs.empty()) m_addr_callback(addrs);
         }
     }
 

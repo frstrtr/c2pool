@@ -485,6 +485,32 @@ int run_embedded(bool coin_p2p_discover,
         const auto st = coin_peer_mgr->peer_stats();
         LOG_INFO << "[EMB-BIP110] NODE_BLAKE2B peer discovery ARMED: peers=" << st.total
                  << " groups=" << st.unique_groups;
+
+        // Wire the ported addrman (core::CoinAddrMan) FEEDBACK loop — the piece
+        // the deployed binary was missing (all discovered peers stayed
+        // in_tried:false because these edges never fired). Mirror of the DASH
+        // p2p_client seam (task #40), adapted to this single-connection lane:
+        // the callbacks are stashed on coin_node and re-applied to every
+        // NodeP2P start_p2p rebuilds on failover.
+        //   • addr crawl  -> add_discovered_peer (fork-filtered in the addr
+        //                    handler to NODE_BLAKE2B entries only)
+        //   • handshake   -> notify_connected (Good() -> tried table + anchors)
+        //   • disconnect  -> notify_disconnected (believed-alive refresh)
+        //   • dial fail   -> notify_dial_failed (Attempt()/backoff penalty)
+        // getaddr is requested post-handshake so the mesh grows fork-peer ->
+        // fork-peer, then persists to addrman_BIP110.json / peers_BIP110.json.
+        auto* mgr = coin_peer_mgr.get();
+        coin_node.set_addr_callback(
+            [mgr](const std::vector<NetService>& addrs) {
+                for (auto& a : addrs) mgr->add_discovered_peer(a);
+            });
+        coin_node.set_on_peer_connected(
+            [mgr](const NetService& s) { mgr->notify_connected(s.to_string()); });
+        coin_node.set_on_peer_disconnected(
+            [mgr](const NetService& s) { mgr->notify_disconnected(s.to_string()); });
+        coin_node.set_on_dial_failed(
+            [mgr](const NetService& s) { mgr->notify_dial_failed(s.to_string()); });
+        coin_node.set_send_getaddr_on_connect(true);
     }
 
     // Round-robin dialer over explicit peers + the discovered set. Redials the
@@ -669,6 +695,7 @@ int run_embedded(bool coin_p2p_discover,
                 const uint32_t sh = p2p->peer_start_height();
                 if (sh > th) th = sh;
                 peers.push_back({
+                    {"addr", p2p->peer_addr()},   // fixes the empty ADDRESS column
                     {"subver", p2p->peer_subver()},
                     {"startingheight", sh},
                     {"conntime", p2p->peer_uptime_sec()},

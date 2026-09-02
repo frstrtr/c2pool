@@ -2,6 +2,8 @@
 #pragma once
 
 #include <memory>
+#include <functional>  // std::function (stashed coin-peer-manager callbacks)
+#include <vector>
 #include <limits>       // std::numeric_limits (found-block RPC-fallback sentinel)
 
 #include <boost/asio.hpp>
@@ -32,6 +34,31 @@ class Node : public bip110::interfaces::Node
     std::unique_ptr<NodeRPC> m_rpc;
     std::unique_ptr<NodeP2P<config_t>> m_p2p;
     bool m_request_mempool_on_connect{false};  // BIP 35 pull on (re)connect
+
+    // Coin-peer-manager feedback + addr-crawl callbacks. This lane is
+    // single-connection: start_p2p REBUILDS m_p2p on every failover dial, so
+    // the callbacks are stashed on the node and re-applied to each fresh
+    // NodeP2P — otherwise they would be lost after the first redial and the
+    // ported addrman would never receive connect/disconnect/dial-failed
+    // feedback (its tried table would stay permanently empty).
+    using PeerLifecycleCallback = std::function<void(const NetService&)>;
+    using AddrCallback = std::function<void(const std::vector<NetService>&)>;
+    PeerLifecycleCallback m_on_peer_connected;
+    PeerLifecycleCallback m_on_peer_disconnected;
+    PeerLifecycleCallback m_on_dial_failed;
+    AddrCallback m_addr_callback;
+    bool m_send_getaddr_on_connect{false};
+
+    /// Push the stashed discovery callbacks onto the current NodeP2P.
+    void apply_p2p_callbacks()
+    {
+        if (!m_p2p) return;
+        if (m_on_peer_connected)    m_p2p->set_on_peer_connected(m_on_peer_connected);
+        if (m_on_peer_disconnected) m_p2p->set_on_peer_disconnected(m_on_peer_disconnected);
+        if (m_on_dial_failed)       m_p2p->set_on_dial_failed(m_on_dial_failed);
+        if (m_addr_callback)        m_p2p->set_addr_callback(m_addr_callback);
+        m_p2p->set_send_getaddr_on_connect(m_send_getaddr_on_connect);
+    }
 
     void init_p2p()
     {
@@ -84,9 +111,19 @@ public:
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
         if (m_request_mempool_on_connect)
             m_p2p->enable_mempool_request();
+        apply_p2p_callbacks();   // re-arm discovery/scorer feedback on the fresh peer
         m_p2p->connect(addr);
         LOG_INFO << "Coin P2P broadcaster connecting to " << addr.to_string();
     }
+
+    /// Register coin-peer-manager feedback + addr-crawl callbacks. Stashed so
+    /// start_p2p re-applies them to every NodeP2P it creates; also applied to
+    /// the current peer immediately (idempotent).
+    void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); apply_p2p_callbacks(); }
+    void set_on_peer_disconnected(PeerLifecycleCallback cb) { m_on_peer_disconnected = std::move(cb); apply_p2p_callbacks(); }
+    void set_on_dial_failed(PeerLifecycleCallback cb) { m_on_dial_failed = std::move(cb); apply_p2p_callbacks(); }
+    void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); apply_p2p_callbacks(); }
+    void set_send_getaddr_on_connect(bool on) { m_send_getaddr_on_connect = on; apply_p2p_callbacks(); }
 
     /// Opt into the BIP 35 `mempool` request on (re)connect. Without this the
     /// embedded mempool only learns txs announced via `inv` AFTER we connect,
