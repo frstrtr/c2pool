@@ -51,9 +51,20 @@ public:
     // Sharechain WRITE seam (M3). Called when a share meets sharechain (not
     // block) target. Left unset in M2 => shares are validated + counted but not
     // minted into a p2pool sharechain. Returns the share hash or uint256::ZERO.
+    //
+    // M3 SEAM PARITY (btc reference, main_btc.cpp:2215-2345): the mint must pay
+    // the SUBMITTING miner, so the connection's payout_script — the same bytes
+    // build_connection_coinbase() baked into this job's coinbase outputs — is
+    // handed to the share builder. bip110's freeze (keyed by h2) now carries the
+    // payout_script alongside the coinbase so it is recoverable at submit time
+    // without re-deriving it from the coinbase outputs. Left unset in M2/M3-seam:
+    // installing the fn requires the bip110 sharechain lane (share_types/share/
+    // share_check/share_tracker/pool node — the ~10k-line btc-family port, still
+    // absent on this branch), so shares are validated + counted but not minted.
     using CreateShareFn = std::function<uint256(
         const std::vector<unsigned char>& full_coinbase,
         const std::vector<unsigned char>& header_164b,
+        const std::vector<unsigned char>& payout_script,
         const core::stratum::JobSnapshot&  job)>;
 
     Bip110WorkSource(bip110::coin::HeaderChain& chain,
@@ -170,7 +181,10 @@ private:
     // coinbase_block = BIP144 witness serialization for the BLOCK BODY (carries
     //                  the 1x32-byte witness reserved value the commitment output
     //                  requires; == coinbase when no commitment). See DEFECT 1.
-    struct FreezeEntry { HeaderFreeze freeze; std::vector<unsigned char> coinbase; std::vector<unsigned char> coinbase_block; std::chrono::steady_clock::time_point at; };
+    // payout_script = the submitting connection's payout destination, captured
+    // at build_connection_coinbase() time so the M3 mint (create_share_fn_) can
+    // pay the miner without re-parsing the frozen coinbase outputs (btc parity).
+    struct FreezeEntry { HeaderFreeze freeze; std::vector<unsigned char> coinbase; std::vector<unsigned char> coinbase_block; std::vector<unsigned char> payout_script; std::chrono::steady_clock::time_point at; };
     mutable std::mutex           freeze_mutex_;
     mutable std::map<std::string, FreezeEntry> freeze_map_;   // key = hex(h2)
     static constexpr std::chrono::seconds FREEZE_TTL{360};

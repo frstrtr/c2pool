@@ -295,6 +295,7 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         FreezeEntry e; e.freeze = f;
         e.coinbase       = cb.bytes;        // non-witness (txid/merkle/share source)
         e.coinbase_block = cb.block_bytes;  // BIP144 witness form for the block body
+        e.payout_script  = payout_script;   // M3: the miner the share must pay
         e.at = std::chrono::steady_clock::now();
         freeze_map_[to_hex(f.h2)] = std::move(e);
     }
@@ -413,12 +414,19 @@ nlohmann::json Bip110WorkSource::mining_submit(
     // counted by the core, no mint.
     if (create_share_fn_) {
         std::vector<unsigned char> coinbase;
+        std::vector<unsigned char> payout_script;
         {
             std::lock_guard<std::mutex> lk(freeze_mutex_);
             auto it = freeze_map_.find(to_hex(f.h2));
-            if (it != freeze_map_.end()) coinbase = it->second.coinbase;
+            if (it != freeze_map_.end()) {
+                coinbase      = it->second.coinbase;
+                payout_script = it->second.payout_script;
+            }
         }
-        create_share_fn_(coinbase, hdr, *job);
+        // M3 mint seam: pay the SUBMITTING miner (payout_script), mirroring the
+        // btc create_local_share path (main_btc.cpp:2338-2345). Unset here until
+        // the bip110 sharechain lane exists — see the header note.
+        create_share_fn_(coinbase, hdr, payout_script, *job);
     }
     return nlohmann::json(true);
 }
