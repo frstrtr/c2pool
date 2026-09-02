@@ -10,8 +10,9 @@
 //   [2] donation == 66 (the wire-genesis FREEZE value, 0.1%);
 //   [3] the abswork %2^64 wrap (PR-A-cont NIT-2) actually dropped the high 64
 //       bits (we feed an abswork with bit-64 set and prove only the low 64 survive);
-//   [4] segwit_data is populated with the none-sentinel wtxid root = 2^256-1
-//       (SegwitDataDefault) when no witness commitment is supplied;
+//   [4] segwit_data is populated with the REAL coinbase-only witness merkle root
+//       ZERO (merkle([0]), python v36 data.py:1090) when no witness commitment is
+//       supplied — NOT the 0xff None-sentinel;
 //   [5] the coinbase OP_RETURN round-trips: the last_txout_nonce embedded in the
 //       mined coinbase is the one stored on the share;
 //   [6] MINT/VERIFY HASH SYMMETRY: recomputing compute_share_hash over the minted
@@ -157,7 +158,7 @@ int main()
                 /* merged_addrs */          {},
                 /* stale_info */            StaleInfo::none,
                 /* segwit_active */         true,
-                /* witness_commitment */    std::string{},   // -> SegwitDataDefault sentinel
+                /* witness_commitment */    std::string{},   // coinbase-only -> ZERO root
                 /* message_data */          {},
                 /* actual_coinbase_bytes */ actual_coinbase,
                 /* witness_root */          uint256(),
@@ -205,9 +206,10 @@ int main()
         expect_true("[4] segwit_data populated (v36-genesis: always has_value)",
                     s->m_segwit_data.has_value());
         if (s->m_segwit_data.has_value())
-            expect_eq_hex("[4] wtxid root == none-sentinel 2^256-1 (SegwitDataDefault)",
+            expect_eq_hex("[4] wtxid root == ZERO (coinbase-only real root, merkle([0]); "
+                          "python v36 data.py:1090 — NOT the 0xff None-sentinel)",
                           s->m_segwit_data->m_wtxid_merkle_root.GetHex(),
-                          SegwitDataDefault::get().m_wtxid_merkle_root.GetHex());
+                          uint256().GetHex());
 
         expect_true("[5] coinbase last_txout_nonce round-trips onto the share",
                     s->m_last_txout_nonce == KAT_NONCE);

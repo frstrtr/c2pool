@@ -626,11 +626,13 @@ int run_embedded(bool coin_p2p_discover,
         //   • share_version = desired_version = 36 (no AutoRatchet — v36 always)
         //   • donation u16 = 66 (WIRE-GENESIS freeze, 0.1%; NOT btc's 50)
         //   • no merged mining (merged_addresses / merged_coinbase_info empty)
-        //   • segwit_data = SegwitDataDefault::get() none-sentinel (2^256-1 root):
-        //     coinbase-only templates carry no witness_commitment_hex into the mint,
-        //     so create_local_share stores the sentinel SegwitData — the ref MUST
-        //     serialize the SAME sentinel (has_segwit=true path) or the ref_hash
-        //     diverges (has_segwit=false would write a ZERO root, not the sentinel).
+        //   • segwit_data = a REAL SegwitData with the coinbase-only witness merkle
+        //     root ZERO (merkle([0]), python v36 data.py:1090) — NOT the 0xff None-
+        //     sentinel. create_local_share stores this same ZERO root for a segwit-
+        //     active coinbase-only share, so the ref MUST serialize ZERO too
+        //     (has_segwit=true path) or the ref_hash diverges. This is also what the
+        //     found-block coinbase witness commitment is computed over, so a won
+        //     block passes segwit's witness-commitment consensus check.
         //   • timestamp clipped to prev->m_timestamp+1 BEFORE compute_share_target,
         //     matching create_local_share's ordering (share_check.hpp:2256-2269) so
         //     the (bits,max_bits) the ref commits equal what peers derive.
@@ -682,11 +684,19 @@ int run_embedded(bool coin_p2p_discover,
                     }
                 }
 
-                // Segwit sentinel (coinbase-only): match create_local_share's
-                // SegwitDataDefault (empty branch + 2^256-1 wtxid root). MUST be the
-                // has_segwit=TRUE path so the sentinel — not a zero root — is written.
+                // Segwit (coinbase-only): match create_local_share's segwit-active
+                // coinbase-only SegwitData — empty txid_merkle_link branch + the REAL
+                // witness merkle root ZERO (merkle([0]), python v36 data.py:1090), NOT
+                // the 0xff None-sentinel. MUST be the has_segwit=TRUE path so this
+                // exact root is serialized into the ref_hash. The found-block coinbase
+                // witness commitment is computed over this same ZERO root, so a won
+                // block passes segwit's witness-commitment consensus check.
                 p.has_segwit  = true;
-                p.segwit_data = bip110::pool::SegwitDataDefault::get();
+                {
+                    bip110::pool::SegwitData sd = bip110::pool::SegwitDataDefault::get();
+                    sd.m_wtxid_merkle_root = uint256::ZERO;   // coinbase-only real root
+                    p.segwit_data = sd;
+                }
 
                 // Genesis / tracker-busy fallbacks (ref_hash won't match a live tip,
                 // but that IS the right answer pre-bootstrap / when prev unknown).

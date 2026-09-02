@@ -198,9 +198,12 @@ int main()
     // pubkey from PAYOUT_SCRIPT (P2PKH).
     std::memcpy(p.pubkey_hash.data(), PAYOUT_SCRIPT.data() + 3, 20);
     p.pubkey_type = 0;
-    // segwit sentinel (coinbase-only) — MUST match create_local_share's SegwitDataDefault.
+    // segwit (coinbase-only): real witness merkle root ZERO (merkle([0]), python
+    // v36 data.py:1090) — MUST match create_local_share's segwit-active coinbase-only
+    // store (ZERO root, NOT the 0xff None-sentinel) or the recomputed ref diverges.
     p.has_segwit  = true;
     p.segwit_data = SegwitDataDefault::get();
+    p.segwit_data.m_wtxid_merkle_root = uint256();  // ZERO
     // chain position off the real tip.
     p.absheight      = tip_absheight + 1;                 // == 2
     p.timestamp      = (carrier.m_timestamp <= tip_ts) ? (tip_ts + 1) : carrier.m_timestamp;

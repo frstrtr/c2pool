@@ -24,7 +24,7 @@
 //      coinbase with the P2POOL witness-commitment segwit output + those payouts +
 //      the donation output second-to-last + the OP_RETURN ref last -> mined_gentx.
 //   3. Mint the extend share via create_local_share(prev = tip, has_frozen = TRUE)
-//      with that coinbase (witness_commitment empty -> SegwitDataDefault sentinel).
+//      with that coinbase (witness_commitment empty -> ZERO coinbase-only root).
 //   4. Run generate_share_transaction(minted share, tracker, /*v36_active=*/true)
 //      -> verify_gentx, and assert:
 //        [X] mined_gentx.txid == verify_gentx  (the extend KAT's "Cross-check" that
@@ -44,6 +44,7 @@
 #include "../share_types.hpp"          // SegwitDataDefault
 #include "../../coin/block.hpp"        // coin::BlockHeaderType
 #include "../../coin/gentx_coinbase.hpp"  // assemble_gentx_coinbase (SSOT)
+#include "../../coin/template_builder.hpp" // coin::witness_merkle_root
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -148,7 +149,11 @@ RefHashParams frozen_params(ShareTracker& tracker,
     std::memcpy(p.pubkey_hash.data(), payout_script.data() + 3, 20);
     p.pubkey_type = 0;
     p.has_segwit  = true;
+    // Coinbase-only real witness merkle root ZERO (merkle([0]), python v36
+    // data.py:1090) — matches create_local_share's segwit-active coinbase-only store
+    // and the ref_hash_fn, NOT the 0xff None-sentinel.
     p.segwit_data = SegwitDataDefault::get();
+    p.segwit_data.m_wtxid_merkle_root = uint256();  // ZERO
     p.timestamp   = carrier.m_timestamp;
     // The mint applies override_max_bits = override_bits = EASY_BITS (the easy share
     // target we grind against), so the ref MUST commit EASY_BITS too — matching the
@@ -279,11 +284,14 @@ int main()
         expect_true("[2] total coinbase value == block subsidy (w.subsidy, no fees)", total == SUBSIDY);
     }
 
-    // (c) P2POOL witness-commitment segwit output over the SegwitData none-sentinel
-    //     (== what generate_share_transaction emits for a coinbase-only v36 share).
+    // (c) P2POOL witness-commitment segwit output over the REAL coinbase-only
+    //     witness merkle root ZERO (witness_merkle_root({}) == merkle([0]),
+    //     python v36 data.py:1090) — == what generate_share_transaction emits now
+    //     that create_local_share stores the ZERO root (NOT the 0xff sentinel).
+    const uint256 real_wroot = coin::witness_merkle_root({});   // ZERO (coinbase-only)
     std::optional<std::vector<unsigned char>> segwit_commit;
     {
-        uint256 wc = compute_p2pool_witness_commitment(SegwitDataDefault::get().m_wtxid_merkle_root);
+        uint256 wc = compute_p2pool_witness_commitment(real_wroot);
         std::vector<unsigned char> sc = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
         auto wcb = wc.GetChars();
         sc.insert(sc.end(), wcb.begin(), wcb.end());
@@ -299,9 +307,68 @@ int main()
     { const auto* np = reinterpret_cast<const unsigned char*>(&intended_nonce);
       op_return.insert(op_return.end(), np, np + 8); }
 
-    // (e) assemble the FLAG-ON coinbase.
+    // (e) assemble the FLAG-ON coinbase, splicing the P2Pool witness reserved value
+    //     ('[P2Pool]'*4) into the block-body witness stack — the found-block form.
+    std::vector<unsigned char> witness_reserved(
+        std::begin(bip110::pool::P2POOL_WITNESS_NONCE),
+        std::end(bip110::pool::P2POOL_WITNESS_NONCE));
     auto mined = coin::assemble_gentx_coinbase(
-        p.coinbase_scriptSig, segwit_commit, payouts, donation_amt, donation_script, op_return);
+        p.coinbase_scriptSig, segwit_commit, payouts, donation_amt, donation_script,
+        op_return, witness_reserved);
+
+    // ── [WR] WITNESS-RECONCILE PROOF (found-block validity) ───────────────────
+    // A flag-ON share that ALSO meets the coin target is submitted as a FOUND BLOCK
+    // built from mined.block_bytes. Segwit consensus recomputes the coinbase witness
+    // commitment as SHA256d(witness_merkle_root || reserved) and checks it against
+    // the aa21a9ed output. Prove the two agree BYTE-FOR-BYTE (block would be valid):
+    {
+        const auto& bb = mined.block_bytes;
+        expect_true("[WR] block_bytes carries a BIP144 witness (+marker/flag +stack +34B)",
+                    bb.size() == mined.bytes.size() + 2 + 34);
+        // (1) block-body witness reserved value (32 bytes ending 4 before the end,
+        //     just before the 4-byte locktime) == '[P2Pool]'*4.
+        std::vector<unsigned char> reserved_in_block(bb.end() - 36, bb.end() - 4);
+        expect_true("[WR] block-body witness reserved value == '[P2Pool]'*4",
+                    reserved_in_block == witness_reserved);
+        // (2) extract the committed 32 bytes from the coinbase aa21a9ed output.
+        const std::vector<unsigned char> wtag = {0x6a,0x24,0xaa,0x21,0xa9,0xed};
+        auto wit = std::search(mined.bytes.begin(), mined.bytes.end(),
+                               wtag.begin(), wtag.end());
+        expect_true("[WR] coinbase carries an aa21a9ed witness-commitment output",
+                    wit != mined.bytes.end());
+        uint256 committed;
+        if (wit != mined.bytes.end())
+            std::memcpy(committed.data(), &*(wit + 6), 32);
+        // (3) THE PROOF: SHA256d(actual_witness_root || reserved_from_block) ==
+        //     committed. actual_witness_root = witness_merkle_root({}) = ZERO
+        //     (coinbase-only) — exactly what a validating node computes.
+        uint256 reserved256;
+        std::memcpy(reserved256.data(), reserved_in_block.data(), 32);
+        uint256 recomputed = Hash(coin::witness_merkle_root({}), reserved256);
+        expect_eq_hex("[WR] SHA256d(witness_root(ZERO) || block reserved) == coinbase "
+                      "commitment (found block passes segwit CheckWitnessMalleation)",
+                      recomputed.GetHex(), committed.GetHex());
+    }
+
+    // ── [WR-OFF] OFF/M2 regression: no witness_reserved arg => 32-zero reserved,
+    //     commitment over reserved 0*32 — byte-identical to M2, still consensus-valid.
+    {
+        uint256 zero_root;                                   // ZERO
+        uint256 m2_commit = Hash(zero_root, zero_root);      // SHA256d(ZERO || 0*32)
+        std::vector<unsigned char> m2_sc = {0x6a,0x24,0xaa,0x21,0xa9,0xed};
+        { auto cbz = m2_commit.GetChars(); m2_sc.insert(m2_sc.end(), cbz.begin(), cbz.end()); }
+        std::optional<std::vector<unsigned char>> m2_commit_opt = m2_sc;
+        auto m2 = coin::assemble_gentx_coinbase(
+            p.coinbase_scriptSig, m2_commit_opt, payouts, donation_amt, donation_script,
+            op_return);   // NO witness_reserved arg => 32 zeros (OFF/M2 byte-identical)
+        std::vector<unsigned char> m2_reserved(m2.block_bytes.end() - 36, m2.block_bytes.end() - 4);
+        expect_true("[WR-OFF] OFF-path block-body reserved value == 32 zeros",
+                    m2_reserved == std::vector<unsigned char>(32, 0x00));
+        uint256 m2_reserved256; std::memcpy(m2_reserved256.data(), m2_reserved.data(), 32);
+        uint256 m2_recomputed = Hash(coin::witness_merkle_root({}), m2_reserved256);
+        expect_eq_hex("[WR-OFF] SHA256d(ZERO || 0*32) == M2 commitment (OFF path valid, unchanged)",
+                      m2_recomputed.GetHex(), m2_commit.GetHex());
+    }
 
     // ── Step 3: mint the extend share carrying that PPLNS coinbase ────────────
     BaseScript coinbase_bs; coinbase_bs.m_data = p.coinbase_scriptSig;
