@@ -394,15 +394,22 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         if (donation.empty()) donation = {0x6a};                // never (get_donation_script(36) non-empty)
 
         // Rebuild the witness-commitment output as the P2POOL commitment the verify
-        // SSOT reconstructs (compute_p2pool_witness_commitment over the SegwitData
-        // none-sentinel wtxid root = 2^256-1) — NOT the M2 standard zero-nonce
-        // commitment. A coinbase-only flag-ON job mints a share whose m_segwit_data
-        // is the SegwitDataDefault sentinel, and generate_share_transaction emits
-        // {6a 24 aa 21 a9 ed} ++ compute_p2pool_witness_commitment(sentinel). We
-        // MUST emit that same 32-byte body or the reconstruction diverges.
+        // SSOT reconstructs: compute_p2pool_witness_commitment over the REAL witness
+        // merkle root. Flag-ON is hard coinbase-only (n_other==0 above), so the real
+        // root is witness_merkle_root({}) = merkle([0]) = ZERO — exactly the python
+        // v36 fork's segwit_data['wtxid_merkle_root'] for a coinbase-only mined share
+        // (data.py:1090, merkle_hash([0])==0). It is NOT the 0xff None-sentinel
+        // (2^256-1): that value is only the PossiblyNoneType WIRE ENCODING of "no
+        // segwit_data", never a real root. Committing over the sentinel made the
+        // found block consensus-INVALID (segwit recomputes the commitment over the
+        // real root ZERO, not 0xff => bad-witness-merkle-match) AND diverged from a
+        // python-fork peer. The block-body reserved value spliced by assemble_gentx_
+        // coinbase below is '[P2Pool]'*4, so segwit consensus' check
+        // commitment == SHA256d(ZERO || '[P2Pool]'*4) passes. create_local_share and
+        // the ref_hash_fn store the SAME real root, so mint==verify still holds.
         {
-            const uint256 wc = bip110::pool::compute_p2pool_witness_commitment(
-                bip110::pool::SegwitDataDefault::get().m_wtxid_merkle_root);
+            const uint256 real_wroot = bip110::coin::witness_merkle_root({});  // ZERO
+            const uint256 wc = bip110::pool::compute_p2pool_witness_commitment(real_wroot);
             std::vector<unsigned char> sc = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
             const auto wcb = wc.GetChars();
             sc.insert(sc.end(), wcb.begin(), wcb.end());
@@ -523,8 +530,20 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         }
     }
 
+    // Flag-ON found blocks MUST carry the P2Pool witness reserved value
+    // ('[P2Pool]'*4) in the coinbase input's witness stack so segwit consensus'
+    // witness-commitment check (commitment == SHA256d(witness_root || reserved))
+    // matches the P2Pool commitment output built above. Gated on the SAME
+    // discriminator (pplns_fn_) that chose that commitment. OFF/M2 leaves it empty
+    // => 32-zero reserved value, byte-identical to M2 (whose commitment is computed
+    // over reserved 0*32).
+    std::vector<unsigned char> witness_reserved;
+    if (pplns_fn_)
+        witness_reserved.assign(std::begin(bip110::pool::P2POOL_WITNESS_NONCE),
+                                std::end(bip110::pool::P2POOL_WITNESS_NONCE));
     auto cb = bip110::coin::assemble_gentx_coinbase(
-        cb_script, segwit_commit, payouts, donation_amt, donation, op_return);
+        cb_script, segwit_commit, payouts, donation_amt, donation, op_return,
+        witness_reserved);
 
     // ── Header tx-set commitment: the txid-merkle root over [coinbase] ++ the
     // selected txs (block order), and the u16 txcount = 1 + N. On BIP-110 BOTH
@@ -736,10 +755,13 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         s.frozen_ref.merged_payout_hash = rh_result.merged_payout_hash;
         s.frozen_ref.share_version     = 36;   // v36-genesis (no AutoRatchet)
         s.frozen_ref.desired_version   = 36;
-        // Coinbase-only: no merged mining, segwit is the none-sentinel constant;
-        // frozen_merkle_branches / frozen_witness_root / frozen_merged_coinbase_info
-        // stay empty (create_local_share then uses the sentinel SegwitData, matching
-        // the ref_hash_fn's segwit serialization).
+        // Coinbase-only: no merged mining. frozen_merkle_branches /
+        // frozen_witness_root / frozen_merged_coinbase_info stay empty — a
+        // coinbase-only share's real witness merkle root is ZERO (merkle([0]),
+        // python v36 data.py:1090), which is exactly what create_local_share's
+        // segwit-active coinbase-only branch stores (frozen_witness_root default
+        // uint256() IsNull => witness_root default uint256() == ZERO) and what the
+        // ref_hash_fn serializes. NOT the 0xff None-sentinel.
     }
     return out;
 }

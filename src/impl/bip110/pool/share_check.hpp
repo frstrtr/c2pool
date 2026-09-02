@@ -2386,19 +2386,42 @@ uint256 create_local_share(
     share.m_merkle_link.m_index  = 0;
 
     // segwit_data — v36 >= SEGWIT_ACTIVATION => ALWAYS active on this v36-genesis
-    // chain, so m_segwit_data is ALWAYS populated (has_value == true): a real
-    // SegwitData when a witness commitment exists, else the SegwitDataDefault
-    // none-sentinel (2^256-1 wtxid root, share_types.hpp) — the lane's SSOT, NOT
-    // the BTC lane's zero. This keeps the ref_hash / wire encoding self-consistent
-    // (the Formatter's Optional(..., SegwitDataDefault) always writes a value).
-    if (segwit_active && !witness_commitment_hex.empty())
+    // chain, so m_segwit_data is ALWAYS populated with a REAL SegwitData whose
+    // wtxid_merkle_root is the actual witness merkle root:
+    //   • tx-bearing share  => merkle([0] ++ selected wtxids) (witness_root arg)
+    //   • coinbase-only share => merkle([0]) = ZERO
+    // This mirrors python v36 data.py:1090 (generate_transaction computes
+    // segwit_data with wtxid_merkle_root = merkle_hash([0] ++ wtxids) whenever
+    // known_txs is not None — i.e. every mined share, coinbase-only included).
+    // We do NOT store the SegwitDataDefault 0xff None-sentinel (2^256-1) here: that
+    // value is only the PossiblyNoneType WIRE ENCODING of "no segwit_data", never a
+    // real root. Storing it made the found-block coinbase witness commitment
+    // (SHA256d(root || '[P2Pool]'*4)) consensus-INVALID — segwit recomputes the
+    // commitment over the real witness root (ZERO coinbase-only), not 0xff — AND
+    // diverged from a python-fork peer whose mined coinbase-only share carries a
+    // PRESENT segwit_data with root 0. The sentinel is used only when segwit is
+    // inactive (never on this v36-genesis chain).
+    if (segwit_active)
     {
         SegwitData sd;
         sd.m_txid_merkle_link.m_branch = (has_frozen && !frozen_merkle_branches.empty())
             ? frozen_merkle_branches : merkle_branches;
         sd.m_txid_merkle_link.m_index  = 0;
-        sd.m_wtxid_merkle_root = !frozen_witness_root.IsNull()
-            ? frozen_witness_root : witness_root;
+        if (!witness_commitment_hex.empty())
+        {
+            // tx-bearing share: real wtxid merkle root over [0] ++ selected wtxids.
+            sd.m_wtxid_merkle_root = !frozen_witness_root.IsNull()
+                ? frozen_witness_root : witness_root;
+        }
+        else
+        {
+            // coinbase-only share: the witness merkle root is merkle([0]) = ZERO
+            // (python v36 merkle_hash([0])==0). The coinbase carries the P2Pool
+            // commitment SHA256d(ZERO || '[P2Pool]'*4) and the won block's coinbase
+            // witness reserved value is '[P2Pool]'*4, so segwit consensus' witness-
+            // commitment check passes.
+            sd.m_wtxid_merkle_root = uint256();  // ZERO
+        }
         share.m_segwit_data = sd;
     }
     else
