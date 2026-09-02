@@ -674,17 +674,23 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         // (d) weight cap.
         if (ok && body_weight + 4000u > bip110::RDTS_MAX_BLOCK_WEIGHT) ok = false;
 
-        // (e) witness commitment recompute.
+        // (e) witness commitment recompute (shared SSOT: serve_xcheck.hpp). The
+        //     commitment is SHA256d(witness_merkle_root || reserved), and the
+        //     reserved value MUST be the one the coinbase actually carries
+        //     (witness_reserved, spliced into the coinbase witness stack above):
+        //     32 zero bytes on the OFF/M2 path (witness_reserved empty), or
+        //     '[P2Pool]'*4 on the flag-ON PPLNS path (whose commitment output was
+        //     built as the P2Pool witness commitment over the real ZERO root).
+        //     A previous hardcoded 32-zero reserved value here REJECTED every
+        //     flag-ON coinbase — a valid, consensus-required construction — and
+        //     suppressed ALL served work. Deriving the reserved value from the
+        //     coinbase the block will actually carry keeps the check at full
+        //     strength (still the exact segwit consensus rule) yet flag-agnostic.
+        //     OFF stays byte-identical (empty => 32 zeros, unchanged recompute).
         if (ok && segwit_commit.has_value()) {
-            uint256 wmr = bip110::coin::witness_merkle_root(chk_wtxids);
-            std::vector<unsigned char> pre(64, 0);
-            std::memcpy(pre.data(), wmr.data(), 32);
-            unsigned char a[32], bb[32];
-            CSHA256().Write(pre.data(), pre.size()).Finalize(a);
-            CSHA256().Write(a, 32).Finalize(bb);
-            std::vector<unsigned char> expect = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
-            expect.insert(expect.end(), bb, bb + 32);
-            if (expect != segwit_commit.value()) ok = false;
+            if (!bip110::stratum::xcheck_witness_commitment(
+                    chk_wtxids, witness_reserved, segwit_commit.value()))
+                ok = false;
         }
 
         if (!ok) {

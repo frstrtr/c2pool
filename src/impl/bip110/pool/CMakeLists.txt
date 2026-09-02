@@ -221,3 +221,42 @@ target_link_libraries(bip110_multiminer_pplns_kat
     Threads::Threads
 )
 add_test(NAME bip110_multiminer_pplns_kat COMMAND bip110_multiminer_pplns_kat)
+
+# bip110_serve_xcheck_kat: the SERVE-PATH pre-serve reward-safety XCHECK KAT (M3).
+# The other bip110 KATs exercise the MINT / consensus math; NONE exercised the live
+# SERVE template + the [BIP110-WS] pre-serve reward-safety XCHECK that build_
+# connection_coinbase runs before serving a job. That gap hid a flag-ON regression
+# caught LIVE on contabo (every notify: "XCHECK FAILED — refusing to serve populated
+# template ... job suppressed" => NO work served with --bip110-sharechain ON). Root
+# cause: XCHECK sub-check (e) recomputed the coinbase witness commitment with a
+# HARDCODED 32-zero reserved value, so it rejected the flag-ON coinbase whose
+# commitment is over the P2Pool reserved value '[P2Pool]'*4 (a valid, consensus-
+# required construction). THIS KAT drives the production SSOT bip110::stratum::
+# xcheck_witness_commitment (serve_xcheck.hpp) against the production mint-side
+# compute_p2pool_witness_commitment (share_check.hpp) and asserts the flag-ON serve
+# template PASSES, the OFF/M2 path is unchanged, and the check is NOT weakened
+# (wrong-reserved / tampered commitments still fail). Same link set as the pplns KAT.
+add_executable(bip110_serve_xcheck_kat
+    test/bip110_serve_xcheck_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_serve_xcheck_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_serve_xcheck_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_serve_xcheck_kat COMMAND bip110_serve_xcheck_kat)
