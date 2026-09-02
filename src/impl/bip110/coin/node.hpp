@@ -2,6 +2,7 @@
 #pragma once
 
 #include <memory>
+#include <cassert>      // dial-lifetime arm assertion (fail loud, not SEGV)
 #include <limits>       // std::numeric_limits (found-block RPC-fallback sentinel)
 
 #include <boost/asio.hpp>
@@ -30,7 +31,14 @@ class Node : public bip110::interfaces::Node
     config_t* m_config;
 
     std::unique_ptr<NodeRPC> m_rpc;
-    std::unique_ptr<NodeP2P<config_t>> m_p2p;
+    // ROBUST dial-teardown UAF fix (successor to e527abfe): the coin-P2P node is
+    // the DOMINANT crasher — start_p2p() frees the prior NodeP2P on every redial
+    // while its own in-flight async_resolve completion is still queued, and the
+    // completion then runs make_socket()'s dynamic_cast on the freed vtable →
+    // SEGV (amplified ~40x by the 7fdf06ba6 getaddr dial-storm). It MUST be
+    // shared_ptr-owned so core::Client can pin it with a strong ref for the dial
+    // duration (set_lifetime below); a unique_ptr node leaves the guard a no-op.
+    std::shared_ptr<NodeP2P<config_t>> m_p2p;
     bool m_request_mempool_on_connect{false};  // BIP 35 pull on (re)connect
 
     // Knots peer-discovery seams. start_p2p() rebuilds m_p2p on every (re)dial, so
@@ -58,7 +66,12 @@ class Node : public bip110::interfaces::Node
 
     void init_p2p()
     {
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
+        // Register the OWNING control block with core::Client BEFORE connect() so
+        // every async resolve/connect pins the node with a strong ref. Robust
+        // regardless of enable_shared_from_this enrollment.
+        m_p2p->set_lifetime(m_p2p);
+        assert(m_p2p->lifetime_armed() && "coin-P2P dial lifetime failed to arm");
         apply_p2p_discovery_seams(m_p2p.get());
         m_p2p->connect(m_config->coin()->m_p2p.address);
     }
@@ -105,7 +118,15 @@ public:
     /// Call after run() when P2P address is configured.
     void start_p2p(const NetService& addr)
     {
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        // Reassigning m_p2p frees the PRIOR NodeP2P. Its core::Client base may
+        // still have an async_resolve/async_connect completion queued on the
+        // io_context; because that handler captured a STRONG ref to the old node
+        // (set_lifetime + strong-ref capture in core::Client), the old node stays
+        // alive until the handler runs — make_socket()'s dynamic_cast can NEVER
+        // touch freed memory. This is the exact race the addrman dial-storm hit.
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p->set_lifetime(m_p2p);
+        assert(m_p2p->lifetime_armed() && "coin-P2P dial lifetime failed to arm");
         if (m_request_mempool_on_connect)
             m_p2p->enable_mempool_request();
         apply_p2p_discovery_seams(m_p2p.get());

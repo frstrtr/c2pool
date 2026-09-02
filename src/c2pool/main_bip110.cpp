@@ -13,6 +13,7 @@
 // PER-COIN ISOLATION: src/impl/bip110 lane + the lane-local BLAKE2b primitive.
 // No SHA256d/scrypt/X11 lane is touched.
 
+#include <cassert>   // sharechain dial/accept lifetime arm assertion
 #include <impl/bip110/params.hpp>
 #include <impl/bip110/pow.hpp>
 #include <impl/bip110/coin/header_chain.hpp>
@@ -365,15 +366,17 @@ int run_embedded(bool coin_p2p_discover,
     // the operator performs the explicit params-freeze checkpoint before enabling
     // it in production.
     std::unique_ptr<bip110::pool::Config> sharechain_cfg;
-    // FINDING B (core UAF, class of #759): hold the sharechain node as a
-    // shared_ptr (NOT unique_ptr). core::Client::resolve()/connect_socket() guard
-    // the async dial teardown race with node->weak_from_this() — but for an
-    // UNMANAGED (unique_ptr) node weak_from_this() is empty, was_managed=false,
-    // and the guard is a NO-OP, so make_socket() dynamic_casts a DANGLING node on
-    // teardown → SEGV. make_shared enrolls the enable_shared_from_this control
-    // block, so weak_from_this() is real and the guard fires (clean dial abort).
-    // Flag-ON exercises this hard (beacon :9337 self-dial + coin-P2P + ioc.stop()
-    // mid-resolve). All .get() call sites below are unchanged.
+    // ROBUST dial-teardown UAF fix (successor to e527abfe): hold the sharechain
+    // node as a shared_ptr and register its OWNING control block with the node's
+    // core::Client + core::Server bases via set_lifetime() below. core::Client/
+    // Server pin the node with a STRONG ref for each async resolve/connect/accept,
+    // so make_socket()'s dynamic_cast can never run on a freed node. Critically
+    // this does NOT rely on node->weak_from_this(): the pool Node is a virtual-
+    // inheritance diamond (public virtual NodeImpl → … → core::INetwork) whose
+    // enable_shared_from_this base is not enrolled through the owning control
+    // block, so weak_from_this() returns EMPTY — exactly the silent no-op that
+    // made the e527abfe guard inert. Flag-ON exercises this hard (beacon :9337
+    // self-dial + coin-P2P + ioc.stop() mid-resolve). All .get() sites unchanged.
     std::shared_ptr<bip110::pool::Node>   sharechain_node;
     if (sharechain_enabled) {
         sharechain_cfg  = std::make_unique<bip110::pool::Config>();          // (1) lifetime >= node
@@ -408,8 +411,19 @@ int run_embedded(bool coin_p2p_discover,
             break;
         }
 
-        sharechain_node = std::make_unique<bip110::pool::Node>(&ioc, sharechain_cfg.get());
+        sharechain_node = std::make_shared<bip110::pool::Node>(&ioc, sharechain_cfg.get());
         auto* node_raw  = sharechain_node.get();
+
+        // ROBUST dial-teardown UAF fix (successor to e527abfe): register the
+        // OWNING control block with the pool node's core::Client + core::Server
+        // bases so their async resolve/connect/accept handlers pin the node with a
+        // strong ref for the op's duration. This does NOT depend on the
+        // enable_shared_from_this diamond enrollment (public virtual NodeImpl → …
+        // → core::INetwork), which silently yields an empty weak_from_this() —
+        // exactly why e527abfe's guard no-opped. Must precede listen()/outbound.
+        sharechain_node->set_lifetime(sharechain_node);
+        assert(sharechain_node->lifetime_armed() &&
+               "sharechain node dial/accept lifetime failed to arm");
 
         node_raw->set_target_outbound_peers(
             sharechain_addnodes.empty() ? 4 : std::max<size_t>(1, sharechain_addnodes.size()));

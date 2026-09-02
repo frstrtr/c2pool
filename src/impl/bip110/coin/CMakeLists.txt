@@ -62,3 +62,35 @@ target_link_libraries(bip110_peer_discovery_kat
     Threads::Threads
 )
 add_test(NAME bip110_peer_discovery_kat COMMAND bip110_peer_discovery_kat)
+
+# bip110_dial_lifetime_realnode_kat: the REAL-TYPE dial-teardown UAF gate
+# (successor to the e527abfe guard whose StubNode KAT passed while the fix
+# no-opped live). Drives the REAL bip110::coin::p2p::NodeP2P (the dominant
+# crasher) through make_shared + set_lifetime, asserts the explicit strong-ref
+# guard is genuinely ARMED on the real type, reproduces the unmanaged-skip
+# failure mode, and simulates a start_p2p() redial to prove make_socket's
+# dynamic_cast runs on a strong-ref-pinned (never freed) node. Same link
+# closure as the sibling coin KAT.
+add_executable(bip110_dial_lifetime_realnode_kat
+    test/bip110_dial_lifetime_realnode_kat.cpp
+)
+target_compile_definitions(bip110_dial_lifetime_realnode_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_dial_lifetime_realnode_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_dial_lifetime_realnode_kat COMMAND bip110_dial_lifetime_realnode_kat)

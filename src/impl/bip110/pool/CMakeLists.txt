@@ -323,11 +323,13 @@ target_link_libraries(bip110_persistence_roundtrip_kat
 )
 add_test(NAME bip110_persistence_roundtrip_kat COMMAND bip110_persistence_roundtrip_kat)
 
-# bip110_dial_lifetime_guard_kat: FINDING B (core UAF, class of #759) mechanism.
-# Asserts the enable_shared_from_this lifetime invariant the core dial-teardown
-# guard relies on (managed node -> lockable/expiring weak_from_this arms the
-# guard; unmanaged node -> empty weak_from_this skips it as pre-fix). Header-only
-# (core/inetwork.hpp) — links against core for INetwork's typeinfo/vtable.
+# bip110_dial_lifetime_guard_kat: CORE dial/accept-teardown UAF guard mechanism
+# (successor to the e527abfe esft-primitive KAT that passed while the fix
+# no-opped). Drives REAL core::Factory-derived nodes in BOTH shapes that broke
+# esft — single inheritance (coin NodeP2P) and a virtual-inheritance diamond
+# (pool Node) — and asserts set_lifetime ARMS the explicit strong-ref guard,
+# that the pre-fix skip is reproducible, and that a redial-freed node stays alive
+# for make_socket's dynamic_cast. Links against core for factory/socket/INetwork.
 add_executable(bip110_dial_lifetime_guard_kat
     test/bip110_dial_lifetime_guard_kat.cpp
 )
