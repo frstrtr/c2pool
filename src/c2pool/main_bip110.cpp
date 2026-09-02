@@ -174,7 +174,7 @@ int run_embedded(bool coin_p2p_discover,
                  const std::vector<NetService>& explicit_peers,
                  bool fork_checkpoint,
                  const std::string& http_host, uint16_t http_port,
-                 uint16_t stratum_port,
+                 const std::string& stratum_addr, uint16_t stratum_port,
                  const std::string& donation_address,
                  double give_author_pct,
                  double node_owner_fee_pct,
@@ -315,7 +315,7 @@ int run_embedded(bool coin_p2p_discover,
     std::unique_ptr<core::StratumServer> stratum_server;
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(
-            ioc, "0.0.0.0", stratum_port, work_source);
+            ioc, stratum_addr, stratum_port, work_source);
         if (stratum_server->start())
             LOG_INFO << "[EMB-BIP110] stratum server LIVE on :" << stratum_port
                      << " (BLAKE2b Sv1 work source, coinbase-only M2)";
@@ -609,7 +609,21 @@ int run_embedded(bool coin_p2p_discover,
         // Advertise real runtime ports on /node_info. BIP-110 has no inbound
         // sharechain P2P listener (fork peers are dialed outbound), so p2p_port
         // is honestly 0; the stratum bind is the worker port.
-        web_server->set_stratum_port(stratum_port);
+        //
+        // DELIBERATE: set_stratum_port(0), NOT stratum_port. This lane already
+        // binds its OWN core::StratumServer on stratum_port above (fed by the
+        // BLAKE2b Sv1 work_source). A nonzero value here would make
+        // WebServer::start() construct a SECOND core::StratumServer on the same
+        // port via start_stratum_server(), whose bind throws EADDRINUSE ("bind:
+        // Address already in use") and serves miners from the wrong work source
+        // if the first ever failed. This is the exact hazard main_dash.cpp
+        // documents (main_dash.cpp:1289-1297,1539-1542) and opts out of the same
+        // way. The call MUST remain (not be deleted): the WebServer ctor DEFAULTS
+        // stratum_port_ to http_port+10 (web_server.cpp:9514), so omitting it
+        // would auto-bind a stray listener on http_port+10. The dashboard's
+        // displayed worker port comes from MiningInterface::set_worker_port()
+        // below (fully independent of WebServer::stratum_port_).
+        web_server->set_stratum_port(0);
         mi->set_worker_port(stratum_port);
         mi->set_p2p_port(0);
         // Point static serving at the on-disk frontend (CWD-relative, same as
@@ -822,6 +836,7 @@ int main(int argc, char** argv)
     std::string http_host = "0.0.0.0";
     uint16_t http_port = 0;
     uint16_t stratum_port = 9336;  // BIP-110 Stratum port (params.hpp worker_port)
+    std::string stratum_addr = "0.0.0.0";  // listen all interfaces by default
     std::string donation_address;  // operator-provided node-owner/donation address
     std::vector<NetService> explicit_peers;
 
@@ -868,7 +883,20 @@ int main(int argc, char** argv)
             parse_hostport(argv[++i], http_host, http_port);
         }
         else if (arg == "--stratum" && i + 1 < argc) {
-            stratum_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+            // --stratum [HOST:]PORT — bind a stratum TCP listener for miners.
+            // HOST defaults to 0.0.0.0 (all interfaces). Mirrors main_btc.cpp /
+            // main_dgb.cpp so the standard `--stratum 0.0.0.0:9336` form parses
+            // the port correctly (bare std::stoi stopped at the first '.',
+            // yielding 0 and silently disabling the listener). A bare `--stratum
+            // 9336` is still accepted.
+            std::string ep = argv[++i];
+            auto colon = ep.find(':');
+            if (colon == std::string::npos) {
+                stratum_port = static_cast<uint16_t>(std::stoi(ep));
+            } else {
+                stratum_addr = ep.substr(0, colon);
+                stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+            }
         }
         else if (arg == "--no-stratum") { stratum_port = 0; }
         else if ((arg == "--node-owner-address" || arg == "--donation") && i + 1 < argc) {
@@ -890,7 +918,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs);
     }
 
     print_banner(argv[0]);
