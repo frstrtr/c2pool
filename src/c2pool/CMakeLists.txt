@@ -412,6 +412,20 @@ target_link_libraries(c2pool-bip110
     ${Boost_LIBRARIES}
 )
 
+# Dashboard assets: the shared coin-generic WebServer serves the web-static/
+# frontend from a CWD-relative "web-static" dir (core::WebServer::set_dashboard_dir,
+# same convention btc/dgb/dash use — no lane compiles it into the binary). On the
+# fleet the DEPLOY pairs a web-static copied from this commit next to the binary;
+# for LOCAL runs / curl verification, mirror the repo's web-static next to the
+# built c2pool-bip110 so "/" resolves to the HTML dashboard from the build dir.
+# c2pool-bip110-scoped, additive, build-only — touches no other lane.
+add_custom_command(TARGET c2pool-bip110 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/web-static
+        $<TARGET_FILE_DIR:c2pool-bip110>/web-static
+    COMMENT "c2pool-bip110: staging web-static dashboard assets next to the binary"
+)
+
 # bip110_blake2b_kat: the KILLER known-answer test for the BIP-110 lane.
 #   (A) BLAKE2b primitive vs the RFC 7693 vector; (B) the full BIP-110 block-
 #   hash pipeline reproduces the CANONICAL block hash of two REAL BIP-110 chain

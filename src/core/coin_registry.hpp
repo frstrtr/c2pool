@@ -42,6 +42,7 @@ inline const CoinDescriptor* coin_descriptor(const std::string& symbol_uc)
         {"DGB",  "digibyte",    "DigiByte"},
         {"BCH",  "bitcoincash", "Bitcoin Cash"},
         {"NMC",  "namecoin",    "Namecoin"},
+        {"BIP110", "bip110",    "Bitcoin BIP-110"},
     };
     for (const auto& d : kCoins) {
         if (symbol_uc == d.symbol) return &d;
