@@ -61,6 +61,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef C2POOL_VERSION
@@ -110,7 +111,11 @@ void print_banner(const char* argv0)
         "                       the sharechain node on :9337, mint local shares, and\n"
         "                       dial the fresh federation sharechain. IRREVERSIBLE\n"
         "                       first-outbound — gated by the operator wire-genesis\n"
-        "                       params-freeze checkpoint. Absent => M2 header-follower.\n\n"
+        "                       params-freeze checkpoint. Absent => M2 header-follower.\n"
+        "  --sharechain-addnode HOST:PORT  override the default sharechain bootstrap\n"
+        "                       beacon list with explicit :9337 peer(s) (repeatable;\n"
+        "                       unified TOML key sharechain.addnodes). Default dials\n"
+        "                       our-fork beacon(s) so the sharechain can form.\n\n"
         "PoW: BLAKE2b commitment pipeline (bip110::pow); block hash == PoW hash.\n"
         "Fork: Blake2bHeight=%u; RDTS weight cap=%u WU; network==Bitcoin mainnet\n"
         "      (magic f9beb4d9, default port %u).\n",
@@ -189,7 +194,8 @@ int run_embedded(bool coin_p2p_discover,
                  double give_author_pct,
                  double node_owner_fee_pct,
                  bool serve_mempool_txs,
-                 bool sharechain_enabled)
+                 bool sharechain_enabled,
+                 const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes)
 {
     core::log::Logger::init();
 
@@ -342,11 +348,42 @@ int run_embedded(bool coin_p2p_discover,
     std::unique_ptr<bip110::pool::Node>   sharechain_node;
     if (sharechain_enabled) {
         sharechain_cfg  = std::make_unique<bip110::pool::Config>();          // (1) lifetime >= node
+
+        // SHARECHAIN BOOTSTRAP SEED — populate m_bootstrap_addrs BEFORE the Node
+        // ctor (node.hpp:237 m_addrs.load(config->pool()->m_bootstrap_addrs)), so
+        // the node dials the beacon on start_outbound_connections. Mirrors
+        // main_btc.cpp:1536-1618. Precedence: explicit --sharechain-addnode >
+        // regtest > OurBeacon (default seed list). This whole block is INSIDE the
+        // flag-ON guard: flag-OFF constructs no sharechain node and never dials.
+        using PC = bip110::pool::PoolConfig;
+        const auto sc_mode = PC::select_bootstrap_mode(
+            /*has_explicit_peers=*/!sharechain_addnodes.empty(), /*regtest=*/false);
+        auto& sc_addrs = sharechain_cfg->pool()->m_bootstrap_addrs;
+        switch (sc_mode) {
+        case PC::BootstrapMode::ExplicitPeers:
+            for (const auto& [h, p] : sharechain_addnodes) sc_addrs.emplace_back(h, p);
+            LOG_INFO << "[EMB-BIP110] sharechain bootstrap: " << sc_addrs.size()
+                     << " explicit --sharechain-addnode peer(s) (OurBeacon suppressed)";
+            break;
+        case PC::BootstrapMode::OurBeacon:
+            for (const auto& host : PC::default_bootstrap_hosts()) {
+                std::string a = host.find(':') == std::string::npos
+                    ? host + ":" + std::to_string(PC::P2P_PORT) : host;   // btc:1609 guard
+                sc_addrs.emplace_back(a);
+            }
+            LOG_INFO << "[EMB-BIP110] sharechain bootstrap: OurBeacon — " << sc_addrs.size()
+                     << " default seed(s) (prefix=" << PC::prefix_hex() << " :9337)";
+            break;
+        case PC::BootstrapMode::RegtestIsolated:
+            LOG_INFO << "[EMB-BIP110] sharechain bootstrap: regtest — 0 seeds (isolated)";
+            break;
+        }
+
         sharechain_node = std::make_unique<bip110::pool::Node>(&ioc, sharechain_cfg.get());
         auto* node_raw  = sharechain_node.get();
 
         node_raw->set_target_outbound_peers(
-            explicit_peers.empty() ? 4 : std::max<size_t>(1, explicit_peers.size()));
+            sharechain_addnodes.empty() ? 4 : std::max<size_t>(1, sharechain_addnodes.size()));
         node_raw->set_seed_escalation_enabled(false);                        // (4) federation/fresh — fail-safe
         node_raw->core::Server::listen(bip110::pool::PoolConfig::P2P_PORT);   // 9337
 
@@ -1266,6 +1303,12 @@ int main(int argc, char** argv)
     std::string stratum_addr = "0.0.0.0";  // listen all interfaces by default
     std::string donation_address;  // operator-provided node-owner/donation address
     std::vector<NetService> explicit_peers;
+    // ── SHARECHAIN (pool-P2P, :9337) explicit peer override (--sharechain-addnode
+    // HOST:PORT, repeatable). This is a DIFFERENT layer from --peer (coin-P2P fork
+    // peers on 8333/9333): when non-empty it OVERRIDES the OurBeacon default seed
+    // list (config_pool.hpp DEFAULT_BOOTSTRAP_HOSTS), dialing ONLY these hosts.
+    // Unified TOML key: sharechain.addnodes (param_catalog.inc). Mirrors main_btc. ──
+    std::vector<std::pair<std::string, uint16_t>> sharechain_addnodes;
 
     // ── REWARD SPLIT L0 (resolved config): author/dev donation percent and the
     // node-owner fee percent read from the settings catalog defaults (mirrors
@@ -1343,6 +1386,20 @@ int main(int argc, char** argv)
         else if (arg == "--serve-mempool-txs") { serve_mempool_txs = true; }
         else if (arg == "--no-serve-mempool-txs") { serve_mempool_txs = false; }
         else if (arg == "--bip110-sharechain") { sharechain_enabled = true; }
+        else if (arg == "--sharechain-addnode" && i + 1 < argc) {
+            // --sharechain-addnode HOST:PORT — repeatable. Explicit sharechain
+            // (pool-P2P, :9337) peer override; overrides the OurBeacon default
+            // seed list. Mirrors main_btc.cpp --sharechain-addnode.
+            std::string ep = argv[++i];
+            auto colon = ep.rfind(':');
+            if (colon == std::string::npos) {
+                std::fprintf(stderr, "--sharechain-addnode requires HOST:PORT\n");
+                return 1;
+            }
+            sharechain_addnodes.emplace_back(
+                ep.substr(0, colon),
+                static_cast<uint16_t>(std::stoi(ep.substr(colon + 1))));
+        }
     }
 
     if (run) {
@@ -1350,7 +1407,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs, sharechain_enabled);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs, sharechain_enabled, sharechain_addnodes);
     }
 
     print_banner(argv[0]);

@@ -28,9 +28,10 @@
 // chain_length(), share_period(), TARGET_LOOKBEHIND) stay direct calls on the static
 // bip110::pool::PoolConfig — no adapter needed for those.
 //
-// The empty-seed ladder SURVIVES: m_bootstrap_addrs initializes EMPTY and
-// PoolConfig::default_bootstrap_hosts() returns {} with no PublicDefault/btc-seed
-// arm, so the node cannot dial 9333 / the live BTC sharechain.
+// m_bootstrap_addrs is populated by main_bip110 from PoolConfig::default_bootstrap_hosts()
+// (the OurBeacon list = our-fork :9337 hosts) before the Node ctor loads it (node.hpp:237
+// m_addrs.load). The PREFIX guard — not emptiness — prevents dialing btc: our beacons
+// speak e2bdb110 on :9337, so a btc node on 9333/2472ef can never handshake them.
 
 #include "config_pool.hpp"          // static SSOT + params.hpp SHARECHAIN_*
 #include <core/netaddress.hpp>
@@ -48,12 +49,14 @@ namespace bip110::pool
 struct PoolConfigRuntime
 {
     std::vector<std::byte>  m_prefix;           // = ParseHexBytes(SHARECHAIN_PREFIX_HEX)
-    std::vector<NetService> m_bootstrap_addrs;  // EMPTY — empty-seed ladder (decision #2)
+    std::vector<NetService> m_bootstrap_addrs;  // seeded by main_bip110 (OurBeacon list)
 
     PoolConfigRuntime()
     {
         m_prefix = ParseHexBytes(PoolConfig::prefix_hex());
-        // m_bootstrap_addrs stays empty: no PublicDefault arm, no cross-lane seeds.
+        // m_bootstrap_addrs is default-empty here; main_bip110 fills it BEFORE the
+        // Node ctor (from PoolConfig::default_bootstrap_hosts, or --sharechain-addnode
+        // overrides). The prefix guard, not emptiness, keeps us off btc's sharechain.
     }
 };
 

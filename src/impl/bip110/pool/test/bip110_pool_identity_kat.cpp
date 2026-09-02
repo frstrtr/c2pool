@@ -191,8 +191,25 @@ int main()
         expect_true("[D] identity constants: CHAIN_LENGTH 8640 (BTC-verbatim)", PoolConfig::CHAIN_LENGTH == 8640);
         expect_true("[D] identity constants: SPREAD 3 (BTC-verbatim)", PoolConfig::SPREAD == 3);
         expect_true("[D] identity constants: MIN_PROTO 3600 (v36 floor)", PoolConfig::MINIMUM_PROTOCOL_VERSION == 3600);
-        expect_true("[D] bootstrap ladder has NO public fallback (empty default seeds)",
-                    PoolConfig::default_bootstrap_hosts().empty());
+        // Bootstrap beacon guard: the OUR-BEACON seed list MUST carry our fork
+        // sharechain bootstrap node and MUST NEVER contain a btc host (port 9333 /
+        // btc prefix 2472ef / a btc seed). The PREFIX — not an empty list — is what
+        // keeps us off btc's sharechain (a 9333/2472ef peer can never handshake our
+        // e2bdb110 prefix on 9337), and a non-empty list is REQUIRED for the
+        // sharechain to form (a fresh miner needs a seed to dial).
+        {
+            const auto& seeds = PoolConfig::default_bootstrap_hosts();
+            bool has_beacon = false, has_btc = false;
+            for (const auto& h : seeds) {
+                if (h.find("bip110.voidbind.com:9337") != std::string::npos) has_beacon = true;
+                if (h.find(":9333")   != std::string::npos) has_btc = true;
+                if (h.find("2472ef")  != std::string::npos) has_btc = true;
+                if (h.find("p2p-spb") != std::string::npos) has_btc = true;
+            }
+            expect_true("[D] bootstrap beacon present (bip110.voidbind.com:9337)", has_beacon);
+            expect_true("[D] bootstrap list carries NO btc host (no :9333/2472ef/p2p-spb)", !has_btc);
+            expect_true("[D] bootstrap list non-empty (sharechain can form)", !seeds.empty());
+        }
         ShareChain chain;   // instantiate the chain container
         (void)chain;
         // Compile-check the rest of the pool wire surface (peer state, message

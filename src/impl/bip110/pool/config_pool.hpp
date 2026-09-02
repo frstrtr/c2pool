@@ -8,15 +8,20 @@
 // pool config.
 //
 // ⚠️ CROSS-POLLUTION GUARD (decision card #2, IRREVERSIBLE). This file DELIBERATELY
-// does NOT copy the BTC lane's config_pool.hpp, which hard-codes the LIVE BTC
-// p2pool sharechain identity (P2P_PORT 9333, PREFIX 2472ef181efcd37b, the
-// p2p-spb / jtoomim DEFAULT_BOOTSTRAP_HOSTS) AND — the actual trap — falls back
-// to that public seed list even under a custom prefix (btc config_pool.hpp
-// SharechainBootstrapMode::PublicDefault). Replicating that here would dial the
-// LIVE BTC sharechain and cross-pollute it (the prefix-regression class). The
-// BIP-110 bootstrap ladder below has NO PublicDefault arm: with zero explicit
-// peers and zero seeds it stays ISOLATED (solo / wire-genesis), never falling
-// back to any other lane's list.
+// does NOT copy the BTC lane's config_pool.hpp SEED HOSTS: btc hard-codes the LIVE
+// BTC p2pool sharechain identity (P2P_PORT 9333, PREFIX 2472ef181efcd37b, the
+// p2p-spb / jtoomim DEFAULT_BOOTSTRAP_HOSTS). BIP-110 carries its OWN, disjoint
+// beacon list (DEFAULT_BOOTSTRAP_HOSTS below = our-fork hosts on :9337).
+//
+// THE GUARD IS THE PREFIX, NOT AN EMPTY LIST. Our beacons speak ONLY the fresh
+// SHARECHAIN_PREFIX_HEX (e2bdb110…) on the fresh port 9337, so a btc node on 9333
+// (prefix 2472ef…) can NEVER handshake them (read_prefix disconnect). We therefore
+// SEED our own beacon list by default — a fresh miner needs a seed to dial or the
+// sharechain can never form — while structurally staying off btc's (or any other
+// lane's) sharechain. The mistake the empty-ladder made was over-correcting the
+// btc PublicDefault trap into "no seeds ever": that guarantees an empty peer set,
+// so the broadcaster has nobody to fan shares to. The correct decision #2 is our
+// OWN beacon list (OurBeacon), never a cross-lane fallback.
 //
 // This is the pool-lane identity/constants provider consumed by share_types.hpp
 // (SEGWIT_ACTIVATION_VERSION) and, in PR-B, by the SharechainNode wiring. The
@@ -110,30 +115,42 @@ public:
         return kPfx;
     }
 
-    // ---- Bootstrap ladder — FAIL-LOUD, no cross-lane fallback ---------------
-    // Precedence: explicit peers > regtest > (custom-id | public) => ISOLATED.
-    // There is NO PublicDefault arm on purpose (see the header note): with no
-    // explicit peers and no seeds the node runs solo rather than dialing any
-    // other sharechain. No public BIP-110 c2pool node exists yet; the operator
-    // fills explicit --peer hosts at PR-B / deploy.
+    // ---- Bootstrap seed list — OUR bip110 sharechain bootstrap nodes ---------
+    // p2pool-style BOOTSTRAP_ADDRS (mirror p2pool-merged-v36 networks/*.py): a
+    // named, extensible LIST of our-fork beacons a fresh miner dials to ENTER the
+    // sharechain mesh; gossip grows the set from here. These hosts speak ONLY the
+    // fresh SHARECHAIN_PREFIX_HEX (e2bdb110…) on port 9337, so a btc node on 9333
+    // (prefix 2472ef…) can NEVER handshake them — the "never btc / never
+    // cross-pollute" guard is the PREFIX, not an empty list. Append more fork-host
+    // beacons here (one place). Mirrors btc/config_pool.hpp DEFAULT_BOOTSTRAP_HOSTS.
+    static inline const std::vector<std::string> DEFAULT_BOOTSTRAP_HOSTS = {
+        "bip110.voidbind.com:9337",
+    };
+
+    // ---- Bootstrap ladder — OurBeacon default, prefix-guarded ---------------
+    // Precedence: explicit peers > regtest > OurBeacon (default). With no
+    // explicit --sharechain-addnode and not regtest we dial DEFAULT_BOOTSTRAP_HOSTS
+    // (our own beacons); the PREFIX (e2bdb110 / :9337) — not an empty list — keeps
+    // us off btc's (2472ef / :9333) or any other lane's sharechain. A user or the
+    // qt configurator can OVERRIDE/extend the list via --sharechain-addnode (the
+    // unified TOML `sharechain.addnodes` key).
     enum class BootstrapMode {
-        ExplicitPeers,   // --peer/--sharechain-addnode given: dial ONLY those
+        ExplicitPeers,   // --sharechain-addnode given: dial ONLY those
         RegtestIsolated, // --regtest: 0 seeds, solo/local
-        Isolated,        // default: 0 seeds, wire-genesis / solo (NEVER a fallback list)
+        OurBeacon,       // default (non-regtest, no explicit peers): dial DEFAULT_BOOTSTRAP_HOSTS
     };
 
     static BootstrapMode select_bootstrap_mode(bool has_explicit_peers, bool regtest)
     {
         if (has_explicit_peers) return BootstrapMode::ExplicitPeers;
         if (regtest)            return BootstrapMode::RegtestIsolated;
-        return BootstrapMode::Isolated;
+        return BootstrapMode::OurBeacon;
     }
 
-    // EMPTY default seed list. Never falls back to another lane's hosts.
+    // Default seed list = OUR bip110 beacons (never another lane's hosts).
     static const std::vector<std::string>& default_bootstrap_hosts()
     {
-        static const std::vector<std::string> kNone{};
-        return kNone;
+        return DEFAULT_BOOTSTRAP_HOSTS;
     }
 };
 

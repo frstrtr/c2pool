@@ -157,9 +157,10 @@ C2P_PARAM("sharechain.listen", Sharechain, HOSTPORT, RESTART, C_ALL, FROM_POOL_C
   C2P_ALIAS("sharechain.listen", BIN_DGB, "--sharechain-port", VALUE)
   C2P_ALIAS("sharechain.listen", BIN_BCH, "--p2p-port", VALUE)
 
-C2P_PARAM("sharechain.addnodes", Sharechain, LIST_HOSTPORT, RESTART, C_DASH|C_BTC, LIT, "", HOSTPORT_V, "persistent outbound sharechain peers")
+C2P_PARAM("sharechain.addnodes", Sharechain, LIST_HOSTPORT, RESTART, C_DASH|C_BTC|C_BIP110, LIT, "", HOSTPORT_V, "persistent outbound sharechain peers")
   C2P_ALIAS("sharechain.addnodes", BIN_DASH, "--addnode", VALUE)
   C2P_ALIAS("sharechain.addnodes", BIN_BTC, "--sharechain-addnode", VALUE)
+  C2P_ALIAS("sharechain.addnodes", BIN_BIP110, "--sharechain-addnode", VALUE)
 
 C2P_PARAM("sharechain.connects", Sharechain, LIST_HOSTPORT, RESTART, C_DASH, LIT, "", HOSTPORT_V, "connect-only sharechain peers")
   C2P_ALIAS("sharechain.connects", BIN_DASH, "--connect", VALUE)
