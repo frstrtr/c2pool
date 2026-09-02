@@ -20,6 +20,8 @@
 #include <impl/bip110/coin/node.hpp>
 #include <impl/bip110/coin/node_interface.hpp>
 #include <impl/bip110/coin/coin_peer_manager.hpp>
+#include <impl/bip110/coin/broadcaster.hpp>        // M3 PR-C2 NODE_BLAKE2B fan-out pool
+#include <impl/bip110/coin/broadcaster_full.hpp>   // M3 PR-C2 found-block keystone
 #include <impl/bip110/coin/chain_seeds.hpp>
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
@@ -232,6 +234,16 @@ int run_embedded(bool coin_p2p_discover,
 
     bip110::coin::Node<MiniConfig> coin_node(&ioc, &config);
 
+    // ── M3 PR-C2 addrman-backed FOUND-BLOCK fan-out (behind --bip110-sharechain;
+    // DEFAULT OFF) ───────────────────────────────────────────────────────────
+    // Declared at run_embedded scope so they outlive work_source / the stratum
+    // server / ioc.run(). Constructed ONLY on the flag-ON path, AFTER coin_peer_mgr
+    // exists (the NODE_BLAKE2B addrman that feeds the fan-out slot set). With the
+    // flag OFF both stay null and stratum_submit_fn calls
+    // coin_node.submit_block_with_fallback directly — byte-identical to M2.
+    std::unique_ptr<bip110::coin::Bip110Broadcaster<MiniConfig>>     coin_broadcaster;
+    std::unique_ptr<bip110::coin::Bip110BroadcasterFull<MiniConfig>> coin_broadcaster_full;
+
     // ── M3 DAEMONLESS MEMPOOL SERVING: own UTXO view + mempool + T3 resolver ──
     // BIP-110 has NO coin daemon, so there is no getblocktemplate to hand us txs
     // or fees. We do the daemon's job ourselves: ingest the fork mempool over
@@ -260,9 +272,17 @@ int run_embedded(bool coin_p2p_discover,
     // backup). The work source serves coinbase-only jobs, validates shares with
     // an independent BLAKE2b recompute, and dispatches block-target hits here.
     auto stratum_submit_fn =
-        [&coin_node](const std::vector<unsigned char>& block_bytes, uint32_t height) -> bool {
+        [&coin_node, &coin_broadcaster_full](const std::vector<unsigned char>& block_bytes,
+                                             uint32_t height) -> bool {
             LOG_INFO << "[EMB-BIP110] submitting won block height=" << height
                      << " bytes=" << block_bytes.size();
+            // FLAG-ON: route through the found-block keystone — ARM A fans the
+            // block to every live NODE_BLAKE2B fan-out peer, ARM B is the same
+            // coin_node.submit_block_with_fallback (primary relay + optional RPC).
+            // FLAG-OFF: coin_broadcaster_full is null -> the single M2 call,
+            // byte-identical to today.
+            if (coin_broadcaster_full)
+                return coin_broadcaster_full->on_block_found(block_bytes).reached_network();
             return coin_node.submit_block_with_fallback(block_bytes);
         };
     auto work_source = std::make_shared<bip110::stratum::Bip110WorkSource>(
@@ -386,6 +406,20 @@ int run_embedded(bool coin_p2p_discover,
             sharechain_addnodes.empty() ? 4 : std::max<size_t>(1, sharechain_addnodes.size()));
         node_raw->set_seed_escalation_enabled(false);                        // (4) federation/fresh — fail-safe
         node_raw->core::Server::listen(bip110::pool::PoolConfig::P2P_PORT);   // 9337
+
+        // M3 PR-C2 (job 2 — WON-SHARE robustness): wire the p2pool
+        // best_share_var.changed.watch(broadcast_share) RE-SPREAD trigger
+        // (p2pool/node.py:150). The per-peer fan-out already exists
+        // (broadcast_share -> broadcast_and_mark over the WHOLE m_peers set);
+        // the missing robustness was re-spreading when think() adopts a new best
+        // (a downloaded/re-evaluated tip), not just on the local mint. Fires on
+        // the IO thread with NO tracker lock held (node.cpp ASYNC-THINK IO-phase),
+        // and broadcast_share takes its OWN shared try-lock, so this respects the
+        // lock-drop-before-fan-out invariant. Set ONLY on the flag-ON path.
+        node_raw->set_on_best_share_changed([node_raw]() {
+            if (!node_raw) return;
+            node_raw->broadcast_share(node_raw->best_share_hash());
+        });
 
         // (2) MINT on the stratum submit path. Mirrors main_btc.cpp:2215-2411,
         // adapted to bip110 (164B v2 header; BLAKE2b compute_share_hash inside
@@ -981,6 +1015,61 @@ int run_embedded(bool coin_p2p_discover,
         return false;
     };
     dial_next();
+
+    // ── M3 PR-C2: construct the addrman-backed FOUND-BLOCK fan-out pool + the
+    // found-block keystone (flag-ON only). Placed AFTER coin_peer_mgr (the
+    // NODE_BLAKE2B addrman) and dial_next (the primary is now dialing). With the
+    // flag OFF this whole block is skipped: coin_broadcaster* stay null and
+    // stratum_submit_fn keeps calling coin_node.submit_block_with_fallback —
+    // byte-identical to M2. ─────────────────────────────────────────────────────
+    std::shared_ptr<io::steady_timer> broadcaster_timer;
+    if (sharechain_enabled) {
+        constexpr size_t kFanoutMaxPeers = 8;
+        coin_broadcaster = std::make_unique<bip110::coin::Bip110Broadcaster<MiniConfig>>(
+            &ioc,
+            static_cast<bip110::interfaces::Node*>(&coin_node),
+            &config,
+            kFanoutMaxPeers);
+        coin_broadcaster_full =
+            std::make_unique<bip110::coin::Bip110BroadcasterFull<MiniConfig>>(
+                coin_broadcaster.get());
+        // ARM B — the standing primary sink (M2 path: primary coin-P2P relay +
+        // optional submitblock RPC backup). Never masked by ARM A.
+        coin_broadcaster_full->set_primary_submit(
+            [&coin_node](const std::vector<unsigned char>& b) {
+                return coin_node.submit_block_with_fallback(b);
+            });
+        LOG_INFO << "[EMB-BIP110] M3 PR-C2 found-block fan-out ARMED (max_peers="
+                 << kFanoutMaxPeers << ") — ARM A embedded NODE_BLAKE2B fan-out + "
+                    "ARM B primary relay/RPC";
+
+        // Self-rescheduling discovery tick: grow the fan-out pool from the
+        // addrman tried set + explicit fork peers, and prune dead slots. The
+        // pool stays warm so a found block fans to many peers immediately.
+        broadcaster_timer = std::make_shared<io::steady_timer>(ioc);
+        auto bc_tick = std::make_shared<std::function<void()>>();
+        std::weak_ptr<std::function<void()>> weak_bc_tick = bc_tick;
+        *bc_tick = [broadcaster_timer, weak_bc_tick, &coin_broadcaster, &coin_peer_mgr,
+                    explicit_list]() {
+            std::vector<NetService> targets;
+            // Explicit fork peers first (the operator's pinned NODE_BLAKE2B set).
+            for (const auto& ep : *explicit_list) targets.push_back(ep);
+            // Then the addrman tried set (NODE_BLAKE2B-filtered, scored).
+            if (coin_peer_mgr)
+                for (const auto& ep : coin_peer_mgr->get_tried_peers(/*max_count=*/16))
+                    targets.push_back(ep.to_net_service());
+            if (coin_broadcaster) {
+                coin_broadcaster->prune_dead();
+                coin_broadcaster->discover(targets);
+            }
+            if (auto self = weak_bc_tick.lock()) {
+                broadcaster_timer->expires_after(std::chrono::seconds(30));
+                broadcaster_timer->async_wait(
+                    [self](const boost::system::error_code& ec) { if (!ec) (*self)(); });
+            }
+        };
+        (*bc_tick)();
+    }
 
     // Self-rescheduling driver: (re)issue getheaders on a fresh handshake or a
     // stall, and fail over to the next candidate after no header progress.

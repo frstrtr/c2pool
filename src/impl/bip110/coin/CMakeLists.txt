@@ -7,6 +7,8 @@ set(bip110_coin_impl
     p2p_messages.hpp
     node.hpp
     coin_node.hpp coin_node.cpp
+    broadcaster.hpp          # M3 PR-C2 NODE_BLAKE2B fan-out pool (header-only leaf)
+    broadcaster_full.hpp     # M3 PR-C2 found-block keystone (header-only leaf)
 )
 
 set(bip110_coin_interface
