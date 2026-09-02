@@ -100,13 +100,19 @@ jobs:
         run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
 
       - name: Install system dependencies
-        if: steps.presence.outputs.exists == '1'
+        # github-hosted ONLY: the c2pool-build self-hosted host has these libs
+        # (and conan, cmake, g++) baked in / persisted from prior runs, exactly
+        # like conan at /usr/local/bin below. Running sudo apt there is both
+        # redundant AND fatal when the runner has no passwordless sudo ("sudo: a
+        # terminal is required to authenticate", run 33596952781) -- so skip apt
+        # on self-hosted entirely and only provision fresh github-hosted VMs.
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
         # Serialize apt across the concurrent coin package jobs sharing the one
-        # c2pool-build self-hosted host. Without this, the 5 Linux matrix cells
-        # race on /var/lib/apt/lists/lock (and corrupt srcpkgcache.bin), and the
-        # loser fails before the build starts (e.g. LTC on v0.2.0, run
-        # 29148852306). flock on a host-wide lock makes apt atomic; on
-        # github-hosted runners the lock is per-VM and uncontended, so no-op.
+        # host. Without this, the Linux matrix cells race on
+        # /var/lib/apt/lists/lock (and corrupt srcpkgcache.bin), and the loser
+        # fails before the build starts (e.g. LTC on v0.2.0, run 29148852306).
+        # flock on a host-wide lock makes apt atomic; on github-hosted runners
+        # the lock is per-VM and uncontended, so no-op.
         run: |
           exec {lockfd}>/tmp/c2pool-apt.lock
           flock "$lockfd"
