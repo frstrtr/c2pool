@@ -6,12 +6,13 @@ name: Release matrix
 # (c2pool-<coin>-<version>-<platform>.{tar.gz,zip} + SHA256SUMS).
 #
 # Coins: btc, ltc (carries doge merged-mining aux — no separate doge
-# binary), dgb, dash, bch. Each coin×platform cell gates on source
-# presence (same entrypoint gate as coin-matrix.yml: the real entrypoint
-# src/c2pool/main_<coin>.cpp, not src/impl/<coin>/main — see PR #66) and
-# every matrix is fail-fast:false, so one red coin never blocks the other
-# coins' packages. This implements the ship decouple: a red btc cell
-# still lets ltc/dash/doge/dgb/bch package.
+# binary), dgb, dash, bch, bip110 (Bitcoin Knots BLAKE2b hard fork —
+# standalone lane, no BLS/aux, no per-coin configure flag). Each
+# coin×platform cell gates on source presence (same entrypoint gate as
+# coin-matrix.yml: the real entrypoint src/c2pool/main_<coin>.cpp, not
+# src/impl/<coin>/main — see PR #66) and every matrix is fail-fast:false,
+# so one red coin never blocks the other coins' packages. This implements
+# the ship decouple: a red btc cell still lets ltc/dash/doge/dgb/bch package.
 #
 # macOS: ships UNIVERSAL (arm64+x86_64) at tag time (operator decision
 # 2026-06-11). Each arch builds natively on its own runner — macos-14
@@ -38,7 +39,7 @@ on:
         required: false
         default: ""
       coins:
-        description: "JSON array of coins to build (e.g. [\"ltc\"]). Blank = all five."
+        description: "JSON array of coins to build (e.g. [\"ltc\"]). Blank = all six."
         required: false
         default: ""
 
@@ -67,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch","bip110"]') }}
     steps:
       - uses: actions/checkout@v6
 
@@ -286,7 +287,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch","bip110"]') }}
         arch: [arm64, x86_64]
         include:
           - arch: arm64
@@ -403,7 +404,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch","bip110"]') }}
     steps:
       - uses: actions/checkout@v6
 
@@ -514,7 +515,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch","bip110"]') }}
     steps:
       - uses: actions/checkout@v6
 
