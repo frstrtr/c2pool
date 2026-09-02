@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### BIP-110 — new experimental parent-chain lane (BLAKE2b minority Bitcoin fork)
+- **Foundation (#1430):** clean-room BLAKE2b-256 (RFC 7693), KAT-proven, plus the
+  `c2pool-bip110` coin-lane skeleton and per-binary define. BIP-110 is the Bitcoin
+  Knots BLAKE2b minority hard fork: proof-of-work switches SHA256d→BLAKE2b at block
+  height 961640 with a one-off difficulty reset, reduced block weight 800000 WU
+  (RDTS); it shares Bitcoin mainnet network magic/port until the fork, and fork
+  peers advertise `NODE_BLAKE2B` (service bit 28).
+- **M1 embedded daemonless fork-following:** the lane follows the BLAKE2b fork chain
+  over coin P2P with no bitcoind on the serve path (embedded SPV header follow gated
+  at height 961640 — SHA256d below the fork, byte-exact BLAKE2b PoW of the 164-byte
+  v2 header at/after it; a SHA256d block past the fork is rejected so the node tracks
+  the BLAKE2b chain rather than the higher-work canonical chain; bit-28 peer
+  selection). A known-answer test reproduces the canonical hash of live fork block
+  961640. Running live: `bip110.voidbind.com` is synced to the fork tip.
+- **In review (PR #1439, not yet merged):** the mineable + daemonless
+  reward-safe mempool-serving stack (Stratum-v1 work source, block assembler,
+  reward-safety cross-checks, 0.1% author-donation split, identity single-sourced
+  from `params.hpp`). This lane imports no Dash consensus machinery. Status is
+  experimental — the fork coin is effectively unlisted (block reward ≈ 0), so the
+  value is strategic, not revenue.
+
 ### DASH — daemonless masternode set: seed completeness (the reinstatement gap)
 - **The pinned anchor and the RPC seed now carry the REGISTERED masternode set,
   not the valid one.** `protx list valid` filters every PoSe-banned masternode
