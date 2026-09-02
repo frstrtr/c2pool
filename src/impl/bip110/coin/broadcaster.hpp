@@ -86,6 +86,13 @@ public:
     using FanOutHook =
         std::function<bool(Node& /*slot*/, const std::vector<unsigned char>& /*block_bytes*/)>;
 
+    // Injectable per-slot configurator, applied to each NEW default-factory slot
+    // BEFORE it dials. main uses it to wire the Knots peer-discovery seams onto
+    // fan-out slots (getaddr-on-connect + NODE_BLAKE2B addr ingest + scorer
+    // feedback), so every fan-out peer ALSO crawls the fork mesh into the shared
+    // addrman — not just the primary arm. Optional (unset = plain fan-out slots).
+    using SlotConfigurator = std::function<void(Node& /*slot*/)>;
+
     Bip110Broadcaster(boost::asio::io_context* ioc,
                       bip110::interfaces::Node* coin,
                       config_t* config,
@@ -94,7 +101,7 @@ public:
         , m_coin(coin)
         , m_config(config)
         , m_max_peers(max_peers)
-        , m_factory(default_factory(ioc, coin, config))
+        , m_factory([this](const NetService& addr) { return this->make_default_slot(addr); })
         , m_is_live([](const Node& n) { return n.is_handshake_complete(); })
         , m_fan_out([](Node& n, const std::vector<unsigned char>& b) {
               return n.submit_block_raw(b);
@@ -105,6 +112,9 @@ public:
     void set_slot_factory(SlotFactory f) { m_factory = std::move(f); }
     void set_live_predicate(LivePredicate p) { m_is_live = std::move(p); }
     void set_fan_out_hook(FanOutHook h) { m_fan_out = std::move(h); }
+    /// Configure each new default-factory slot before it dials (peer-discovery
+    /// seams). No-op for injected test factories (they build their own slots).
+    void set_slot_configurator(SlotConfigurator c) { m_slot_config = std::move(c); }
 
     // Exclude the primary coin-P2P peer (already reached by broadcaster_full's
     // ARM B) so a pool slot is not spent re-dialing it. Optional: a duplicate
@@ -239,18 +249,19 @@ public:
     }
 
 private:
-    static SlotFactory default_factory(boost::asio::io_context* ioc,
-                                       bip110::interfaces::Node* coin,
-                                       config_t* config)
+    /// Default slot builder: construct a fan-out NodeP2P, apply the optional
+    /// per-slot configurator (peer-discovery seams) BEFORE dialing, then connect.
+    Slot make_default_slot(const NetService& addr)
     {
-        return [ioc, coin, config](const NetService& addr) -> Slot {
-            auto node = std::make_unique<Node>(ioc, coin, config, "BIP110-Fanout");
-            // Single-peer coins run their own stall recovery; a fan-out slot must
-            // NOT idle-evict itself between blocks (matches the primary's policy).
-            node->set_idle_eviction_enabled(false);
-            node->connect(addr);
-            return node;
-        };
+        auto node = std::make_unique<Node>(m_ioc, m_coin, m_config, "BIP110-Fanout");
+        // Single-peer coins run their own stall recovery; a fan-out slot must
+        // NOT idle-evict itself between blocks (matches the primary's policy).
+        node->set_idle_eviction_enabled(false);
+        // Wire getaddr/addr-ingest/scorer-feedback onto the slot before it dials,
+        // so a fan-out peer's addr gossip also grows the shared addrman.
+        if (m_slot_config) m_slot_config(*node);
+        node->connect(addr);
+        return node;
     }
 
     static std::string slot_key(const NetService& addr)
@@ -264,9 +275,10 @@ private:
     size_t                     m_max_peers{};
     std::string                m_primary_key;
 
-    SlotFactory   m_factory;
-    LivePredicate m_is_live;
-    FanOutHook    m_fan_out;
+    SlotFactory      m_factory;
+    LivePredicate    m_is_live;
+    FanOutHook       m_fan_out;
+    SlotConfigurator m_slot_config;   // optional per-slot peer-discovery seams
 
     std::map<std::string, Slot>                                  m_slots;
     std::map<std::string, std::chrono::steady_clock::time_point> m_backoff;

@@ -995,6 +995,32 @@ int run_embedded(bool coin_p2p_discover,
                  << " groups=" << st.unique_groups;
     }
 
+    // ── Knots peer-discovery wiring (getaddr crawl + addr ingest + scorer
+    // feedback), ported from Bitcoin Knots net/net_processing. The PRIMARY
+    // coin-P2P arm now (1) sends getaddr on connect, (2) banks the NODE_BLAKE2B-
+    // filtered addr gossip into the bucketed addrman (source-group keyed), and
+    // (3) feeds connect / disconnect / dial-failure back to the scorer so the
+    // tried table fills. Without this the embedded node latched at the single
+    // oracle peer and never grew (dashboard "CONNECTIONS 1 Active/Target").
+    // Stored on the coin Node and re-applied to every start_p2p() redial. ───────
+    if (coin_peer_mgr) {
+        auto* mgr = coin_peer_mgr.get();
+        coin_node.enable_getaddr_discovery();
+        coin_node.set_addr_callback(
+            [mgr](const std::vector<NetService>& addrs, const NetService& source) {
+                for (const auto& a : addrs)
+                    mgr->add_discovered_peer(a, source.address());
+            });
+        coin_node.set_on_peer_connected(
+            [mgr](const NetService& s) { mgr->notify_connected(s.to_string()); });
+        coin_node.set_on_peer_disconnected(
+            [mgr](const NetService& s) { mgr->notify_disconnected(s.to_string()); });
+        coin_node.set_on_dial_failed(
+            [mgr](const NetService& s) { mgr->notify_dial_failed(s.to_string()); });
+        LOG_INFO << "[EMB-BIP110] Knots peer crawl wired (primary arm): "
+                    "getaddr-on-connect + NODE_BLAKE2B addr ingest + scorer feedback";
+    }
+
     // Round-robin dialer over explicit peers + the discovered set. Redials the
     // next candidate whenever the handshake is not complete (a non-fork peer is
     // dropped at the NODE_BLAKE2B version gate and we walk on).
@@ -1049,6 +1075,27 @@ int run_embedded(bool coin_p2p_discover,
             [&coin_node](const std::vector<unsigned char>& b) {
                 return coin_node.submit_block_with_fallback(b);
             });
+        // Wire the SAME Knots peer-discovery seams onto every fan-out slot, so a
+        // fan-out peer's addr gossip ALSO grows the shared addrman + tried set
+        // (not just the primary arm). Only when the scored peer manager exists.
+        if (coin_peer_mgr) {
+            auto* mgr = coin_peer_mgr.get();
+            coin_broadcaster->set_slot_configurator(
+                [mgr](bip110::coin::p2p::NodeP2P<MiniConfig>& slot) {
+                    slot.enable_getaddr_discovery();
+                    slot.set_addr_callback(
+                        [mgr](const std::vector<NetService>& addrs, const NetService& source) {
+                            for (const auto& a : addrs)
+                                mgr->add_discovered_peer(a, source.address());
+                        });
+                    slot.set_on_peer_connected(
+                        [mgr](const NetService& s) { mgr->notify_connected(s.to_string()); });
+                    slot.set_on_peer_disconnected(
+                        [mgr](const NetService& s) { mgr->notify_disconnected(s.to_string()); });
+                    slot.set_on_dial_failed(
+                        [mgr](const NetService& s) { mgr->notify_dial_failed(s.to_string()); });
+                });
+        }
         LOG_INFO << "[EMB-BIP110] M3 PR-C2 found-block fan-out ARMED (max_peers="
                  << kFanoutMaxPeers << ") — ARM A embedded NODE_BLAKE2B fan-out + "
                     "ARM B primary relay/RPC";
@@ -1068,6 +1115,17 @@ int run_embedded(bool coin_p2p_discover,
             if (coin_peer_mgr)
                 for (const auto& ep : coin_peer_mgr->get_tried_peers(/*max_count=*/16))
                     targets.push_back(ep.to_net_service());
+            // GAP-6 (raise the fan-out target off 1): ALSO draw NEW, learned-but-
+            // not-yet-tried fork peers straight from the bucketed addrman via the
+            // scored dial planner (group diversity + backoff + feeler enforced in
+            // get_peers_to_connect). Without this the fan-out could only redial
+            // the tried set, so a freshly-crawled oracle mesh was never dialed and
+            // the pool stayed pinned at the explicit/primary peer.
+            if (coin_peer_mgr) {
+                std::set<std::string> none;
+                for (const auto& ep : coin_peer_mgr->get_peers_to_connect(none))
+                    targets.push_back(ep.to_net_service());
+            }
             if (coin_broadcaster) {
                 coin_broadcaster->prune_dead();
                 coin_broadcaster->discover(targets);

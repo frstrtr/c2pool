@@ -33,9 +33,33 @@ class Node : public bip110::interfaces::Node
     std::unique_ptr<NodeP2P<config_t>> m_p2p;
     bool m_request_mempool_on_connect{false};  // BIP 35 pull on (re)connect
 
+    // Knots peer-discovery seams. start_p2p() rebuilds m_p2p on every (re)dial, so
+    // these are stored on the Node and RE-APPLIED to each fresh NodeP2P — otherwise
+    // getaddr/addr-ingest/scorer-feedback would only cover the very first peer.
+    using AddrCallback =
+        std::function<void(const std::vector<NetService>&, const NetService& /*source*/)>;
+    using PeerLifecycleCallback = std::function<void(const NetService&)>;
+    AddrCallback m_addr_cb;
+    PeerLifecycleCallback m_on_peer_connected_cb;
+    PeerLifecycleCallback m_on_peer_disconnected_cb;
+    PeerLifecycleCallback m_on_dial_failed_cb;
+    bool m_getaddr_discovery{false};
+
+    /// Re-apply the stored discovery seams to a freshly-created NodeP2P.
+    void apply_p2p_discovery_seams(NodeP2P<config_t>* p2p)
+    {
+        if (!p2p) return;
+        if (m_addr_cb)                 p2p->set_addr_callback(m_addr_cb);
+        if (m_on_peer_connected_cb)    p2p->set_on_peer_connected(m_on_peer_connected_cb);
+        if (m_on_peer_disconnected_cb) p2p->set_on_peer_disconnected(m_on_peer_disconnected_cb);
+        if (m_on_dial_failed_cb)       p2p->set_on_dial_failed(m_on_dial_failed_cb);
+        if (m_getaddr_discovery)       p2p->enable_getaddr_discovery();
+    }
+
     void init_p2p()
     {
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        apply_p2p_discovery_seams(m_p2p.get());
         m_p2p->connect(m_config->coin()->m_p2p.address);
     }
 
@@ -84,8 +108,41 @@ public:
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
         if (m_request_mempool_on_connect)
             m_p2p->enable_mempool_request();
+        apply_p2p_discovery_seams(m_p2p.get());
         m_p2p->connect(addr);
         LOG_INFO << "Coin P2P broadcaster connecting to " << addr.to_string();
+    }
+
+    // ── Knots peer-discovery seams (stored + re-applied on every start_p2p) ────
+    /// Fork-filtered addr ingest sink (NODE_BLAKE2B survivors + gossip source).
+    void set_addr_callback(AddrCallback cb)
+    {
+        m_addr_cb = std::move(cb);
+        if (m_p2p) m_p2p->set_addr_callback(m_addr_cb);
+    }
+    /// handshake-complete -> notify_connected (addrman Good -> tried).
+    void set_on_peer_connected(PeerLifecycleCallback cb)
+    {
+        m_on_peer_connected_cb = std::move(cb);
+        if (m_p2p) m_p2p->set_on_peer_connected(m_on_peer_connected_cb);
+    }
+    /// disconnect -> notify_disconnected.
+    void set_on_peer_disconnected(PeerLifecycleCallback cb)
+    {
+        m_on_peer_disconnected_cb = std::move(cb);
+        if (m_p2p) m_p2p->set_on_peer_disconnected(m_on_peer_disconnected_cb);
+    }
+    /// pre-socket dial failure -> notify_dial_failed (#940 leg).
+    void set_on_dial_failed(PeerLifecycleCallback cb)
+    {
+        m_on_dial_failed_cb = std::move(cb);
+        if (m_p2p) m_p2p->set_on_dial_failed(m_on_dial_failed_cb);
+    }
+    /// Enable Knots getaddr-on-connect peer crawl for the coin-P2P arm.
+    void enable_getaddr_discovery()
+    {
+        m_getaddr_discovery = true;
+        if (m_p2p) m_p2p->enable_getaddr_discovery();
     }
 
     /// Opt into the BIP 35 `mempool` request on (re)connect. Without this the

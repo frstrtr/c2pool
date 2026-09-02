@@ -33,6 +33,38 @@ namespace p2p
 
 std::string parse_net_error(const boost::system::error_code& ec);
 
+// BIP-110 fork service bit (NODE_BLAKE2B, bit 28), advertised by fork peers and
+// enforced at BOTH the version gate and addr-ingest (Knots protocol.h
+// SeedsServiceFlags 0x10000009).
+inline constexpr uint64_t COIN_NODE_BLAKE2B = (uint64_t{1} << 28);
+
+// Fork-filtered addr ingest — the load-bearing half of the Knots addr handler
+// (net_processing.cpp addr handling), BLAKE2b-adjusted. PURE + socket-free so
+// KATs drive it directly. From gossiped `addr` records it keeps ONLY peers
+// advertising NODE_BLAKE2B (a canonical-SHA256d peer would poison the fork
+// addrman) and drops grossly FUTURE-dated records (>now+10min) as poison; every
+// other record is forwarded (the bucketed addrman stamps its own nTime, so a
+// clamp of an OLD timestamp into the past is already subsumed — see
+// core/coin_addrman.hpp). `Rec` is any type exposing m_services / m_timestamp /
+// m_endpoint (the wire btc_addr_record_t). Returns the survivors' endpoints.
+template <typename Rec>
+inline std::vector<NetService> filter_fork_addr_records(
+    const std::vector<Rec>& recs, int64_t now,
+    size_t* out_dropped_nonfork = nullptr, size_t* out_dropped_future = nullptr)
+{
+    std::vector<NetService> ok;
+    ok.reserve(recs.size());
+    size_t dropped_nonfork = 0, dropped_future = 0;
+    for (const auto& rec : recs) {
+        if (!(rec.m_services & COIN_NODE_BLAKE2B)) { ++dropped_nonfork; continue; }
+        if (static_cast<int64_t>(rec.m_timestamp) > now + 10 * 60) { ++dropped_future; continue; }
+        ok.push_back(rec.m_endpoint);
+    }
+    if (out_dropped_nonfork) *out_dropped_nonfork = dropped_nonfork;
+    if (out_dropped_future)  *out_dropped_future  = dropped_future;
+    return ok;
+}
+
 //-core::ICommmunicator:
 // void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
 // void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
@@ -107,11 +139,37 @@ private:
     // External mempool for compact block tx matching
     Mempool* m_mempool{nullptr};
 
-    // Callbacks for broadcaster integration
-    using AddrCallback = std::function<void(const std::vector<NetService>&)>;
+    // BIP-110 fork service bit (NODE_BLAKE2B, bit 28). Advertised by fork peers;
+    // enforced at BOTH the version gate AND at addr-ingest so only fork-capable
+    // peers ever enter the addrman (Knots protocol.h SeedsServiceFlags 0x10000009).
+    static constexpr uint64_t NODE_BLAKE2B = COIN_NODE_BLAKE2B;
+
+    // Callbacks for broadcaster integration.
+    // Fork-filtered addr ingest sink: the NODE_BLAKE2B + sanity survivors, plus
+    // the peer that gossiped them (source) so the addrman bucket-keys the banked
+    // entries by source-group — dashd/Core keying that bounds how far one source
+    // can spray the new table.
+    using AddrCallback =
+        std::function<void(const std::vector<NetService>&, const NetService& /*source*/)>;
     AddrCallback m_addr_callback;
     using PeerHeightCallback = std::function<void(uint32_t)>;
     PeerHeightCallback m_on_peer_height;
+
+    // ── Knots peer discovery (getaddr/addr crawl + scorer feedback) ───────────
+    // getaddr-on-connect: Core sends GETADDR to outbound peers at verack so the
+    // peer gossips its address set back (net_processing.cpp SetupAddressRelay).
+    // Default OFF; main enables it on the discovery path. Guarded so exactly ONE
+    // GETADDR goes out per connection (no spam).
+    bool m_send_getaddr_on_connect{false};
+    bool m_getaddr_sent{false};
+    // Peer-lifecycle seams feeding the scored/bucketed peer manager:
+    // handshake-complete -> notify_connected (addrman Good -> tried),
+    // disconnect -> notify_disconnected, pre-socket dial failure ->
+    // notify_dial_failed (#940 leg). NetService = the dialed key.
+    using PeerLifecycleCallback = std::function<void(const NetService&)>;
+    PeerLifecycleCallback m_on_peer_connected;
+    PeerLifecycleCallback m_on_peer_disconnected;
+    PeerLifecycleCallback m_on_dial_failed;
     // Raw headers parser: if set, called with raw payload data instead of
     // the standard 80+1 byte parser.  Used for DOGE AuxPoW extended headers.
     using RawHeadersParser = std::function<std::vector<BlockHeaderType>(const uint8_t*, size_t)>;
@@ -151,6 +209,7 @@ public:
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
+        m_getaddr_sent = false;   // fresh Connection -> re-arm the one-shot getaddr
         m_idle_gate.reset();   // fresh Connection -> fresh progress high-water mark
         LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
 
@@ -167,7 +226,6 @@ public:
         // Protocol 70016 = BIP 339 wtxidrelay activation point (Bitcoin Core 0.21+).
         static constexpr uint64_t NODE_NETWORK = 1;
         static constexpr uint64_t NODE_WITNESS = (1 << 3);
-        static constexpr uint64_t NODE_BLAKE2B = (uint64_t{1} << 28);
         uint64_t our_services = NODE_NETWORK | NODE_WITNESS | NODE_BLAKE2B;
         uint32_t protocol_version = 70016;
 
@@ -187,11 +245,26 @@ public:
 
     void disconnect() override
     {
+        // A handshaked peer going away is a live-link loss: report it to the
+        // scorer so the addrman ages the entry (dashd Connected/attempt cadence).
+        if (m_handshake_complete && m_on_peer_disconnected)
+            m_on_peer_disconnected(m_target_addr);
         stop_ping_timer();
         stop_timeout_timer();
         m_handshake_complete = false;
         m_idle_gate.reset();
         m_peer.reset();
+    }
+
+    // INetwork: an outbound dial failed BEFORE the socket came up (ECONNREFUSED /
+    // ETIMEDOUT / DNS-resolve). connected() never ran, so feed the dead target to
+    // the peer scorer (#940 dial-failure leg: attempt++/backoff + score drop +
+    // addrman Attempt) so the dial plan rotates off it. No redial issued here —
+    // the driver/reconnect loop owns the actual retry (no retry-storm).
+    void connect_failed(const NetService& addr) override
+    {
+        if (m_on_dial_failed)
+            m_on_dial_failed(addr);
     }
 
     /// Send a getheaders request to the connected peer.
@@ -237,6 +310,9 @@ public:
         NetService svc_copy = service;
         LOG_WARNING << "[" << m_chain_label << "] Peer " << svc_copy.to_string()
                     << " disconnected: " << err;
+        // Report a handshaked peer's loss to the scorer (see disconnect()).
+        if (m_handshake_complete && m_on_peer_disconnected)
+            m_on_peer_disconnected(m_target_addr);
         if (m_peer)
         {
             m_peer.reset();
@@ -299,8 +375,18 @@ public:
         }
     }
 
-    /// Set callback for received addr messages (peer discovery).
+    /// Set callback for received addr messages (peer discovery). The vector is
+    /// already NODE_BLAKE2B-filtered + sanity-clamped by the addr handler; the
+    /// second arg is the peer that gossiped them (addrman source-group key).
     void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
+    /// Peer-lifecycle seams (feed the scored/bucketed peer manager).
+    void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }
+    void set_on_peer_disconnected(PeerLifecycleCallback cb) { m_on_peer_disconnected = std::move(cb); }
+    void set_on_dial_failed(PeerLifecycleCallback cb) { m_on_dial_failed = std::move(cb); }
+    /// Enable Knots getaddr-on-connect peer crawl (one GETADDR per connection).
+    void enable_getaddr_discovery() { m_send_getaddr_on_connect = true; }
+    /// Whether getaddr-on-connect crawl is enabled (diagnostics / KATs).
+    bool getaddr_discovery_enabled() const { return m_send_getaddr_on_connect; }
     /// Set callback for peer's reported chain height (from version message).
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Set custom raw headers parser (for DOGE AuxPoW extended headers).
@@ -584,7 +670,6 @@ private:
         // BLAKE2b hard-fork chain. A canonical-SHA256d Bitcoin node would feed us
         // the foreign (higher-work) SHA256d chain, so drop it before verack and
         // let the standalone failover dialer walk to a fork peer.
-        static constexpr uint64_t NODE_BLAKE2B = (uint64_t{1} << 28);
         if (!(msg->m_services & NODE_BLAKE2B)) {
             LOG_INFO << "[" << m_chain_label << "] REJECT peer — no NODE_BLAKE2B (services=0x"
                      << std::hex << msg->m_services << std::dec << " subver=" << msg->m_subversion
@@ -664,6 +749,25 @@ private:
                          << " — peer lacks NODE_BLOOM (0x" << std::hex << m_peer_services
                          << std::dec << "), would cause disconnect";
             }
+        }
+
+        // Peer-lifecycle: a completed handshake is a live, answerable NODE_BLAKE2B
+        // fork peer. Promote it in the scored/bucketed peer manager (addrman
+        // Good() -> tried), so the tried set fills and the fan-out pool + serve
+        // path have real dial candidates. m_target_addr is the dialed key.
+        if (m_on_peer_connected)
+            m_on_peer_connected(m_target_addr);
+
+        // Knots getaddr-on-connect (peer crawl). Core sends GETADDR to outbound
+        // peers at verack (net_processing.cpp SetupAddressRelay); we ask this peer
+        // once for its address set. A fork ORACLE answers with the reachable
+        // NODE_BLAKE2B mesh, which the addr handler fork-filters + banks into the
+        // addrman — this is what turns ONE oracle link into MANY dial candidates.
+        if (m_send_getaddr_on_connect && !m_getaddr_sent) {
+            m_getaddr_sent = true;
+            send_getaddr();
+            LOG_INFO << "[" << m_chain_label << "] Sent getaddr (peer crawl) to "
+                     << m_target_addr.to_string();
         }
     }
 
@@ -833,14 +937,30 @@ private:
 
     ADD_P2P_HANDLER(addr)
     {
-        if (m_addr_callback && !msg->m_addrs.empty()) {
-            std::vector<NetService> addrs;
-            addrs.reserve(msg->m_addrs.size());
-            for (auto& rec : msg->m_addrs) {
-                addrs.push_back(rec.m_endpoint);
-            }
-            m_addr_callback(addrs);
+        // Knots addr ingest (net_processing.cpp addr handling), fork-adjusted.
+        // Every gossiped record is filtered HERE, where the wire services +
+        // timestamp are still present, then the survivors are forwarded to the
+        // bucketed addrman via m_addr_callback (the addrman intake is a NetService
+        // + source-group, so the filter MUST happen upstream of it).
+        if (!m_addr_callback || msg->m_addrs.empty())
+            return;
+
+        // Fork filter + future-poison drop (the SSOT lives in
+        // filter_fork_addr_records above; the handler only wires the socket).
+        const int64_t now = static_cast<int64_t>(core::timestamp());
+        size_t dropped_nonfork = 0, dropped_future = 0;
+        std::vector<NetService> ok = filter_fork_addr_records(
+            msg->m_addrs, now, &dropped_nonfork, &dropped_future);
+        if (!ok.empty()) {
+            // source = the peer that gossiped these (addrman source-group key,
+            // bounds how far one source can spray the new table).
+            const NetService source = m_peer ? m_peer->get_addr() : m_target_addr;
+            m_addr_callback(ok, source);
         }
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] addr: " << msg->m_addrs.size()
+                        << " received, " << ok.size() << " NODE_BLAKE2B kept ("
+                        << dropped_nonfork << " non-fork, " << dropped_future
+                        << " future-dated dropped)";
     }
 
     ADD_P2P_HANDLER(reject)
