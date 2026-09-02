@@ -32,6 +32,11 @@ class Node : public bip110::interfaces::Node
     std::unique_ptr<NodeRPC> m_rpc;
     std::unique_ptr<NodeP2P<config_t>> m_p2p;
     bool m_request_mempool_on_connect{false};  // BIP 35 pull on (re)connect
+    // Coin-P2P addr-gossip sink, re-applied to every peer start_p2p spins up
+    // (each dial builds a fresh NodeP2P). Feeds harvested NODE_BLAKE2B peers to
+    // the coin peer manager's addrman. Empty = no sink (addr replies dropped).
+    std::function<void(const std::vector<NetService>&, const std::string&)>
+        m_addr_callback;
 
     void init_p2p()
     {
@@ -84,6 +89,8 @@ public:
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
         if (m_request_mempool_on_connect)
             m_p2p->enable_mempool_request();
+        if (m_addr_callback)
+            m_p2p->set_addr_callback(m_addr_callback);
         m_p2p->connect(addr);
         LOG_INFO << "Coin P2P broadcaster connecting to " << addr.to_string();
     }
@@ -124,6 +131,17 @@ public:
 
     /// True once arm_submit_rpc has bound the submitblock backup leg.
     bool has_rpc() const { return m_rpc != nullptr; }
+
+    /// Install the coin-P2P addr-gossip callback (harvested NODE_BLAKE2B peers ->
+    /// peer-manager addrman). Stored so every future start_p2p re-installs it on
+    /// the fresh NodeP2P; also applied to the current peer if one is live.
+    void set_addr_callback(
+        std::function<void(const std::vector<NetService>&, const std::string&)> cb)
+    {
+        m_addr_callback = std::move(cb);
+        if (m_p2p)
+            m_p2p->set_addr_callback(m_addr_callback);
+    }
 
     /// Submit a block via P2P directly (faster propagation than RPC).
     void submit_block_p2p(BlockType& block)

@@ -91,11 +91,12 @@ void print_banner(const char* argv0)
     std::printf(
         "c2pool-bip110 %s — Bitcoin Knots BLAKE2b hard fork (BIP-110)\n\n"
         "Usage: %s [--version] [--help] [--selftest]\n"
-        "       %s --run [--coin-p2p-discover] [--peer IP:PORT ...]\n"
+        "       %s --run [--coin-p2p-discover] [--addnode IP:PORT ...]\n"
         "                 [--fork-checkpoint] [--http [HOST:]PORT]\n\n"
         "  --run                embedded daemonless SPV header-follower\n"
         "  --coin-p2p-discover  discover NODE_BLAKE2B fork peers (DNS + fixed seeds)\n"
-        "  --peer IP:PORT       add an explicit fork peer (repeatable)\n"
+        "  --addnode IP:PORT    pin a fork peer, MERGED with discovery (addnode,\n"
+        "                       not connect; repeatable). --peer is a legacy alias.\n"
         "  --fork-checkpoint    seed the Knots 961640 checkpoint for a fast proof\n"
         "  --http [HOST:]PORT   serve the shared coin-generic dashboard (HTML at\n"
         "                       \"/\", JSON /node_info for health probes)\n"
@@ -482,9 +483,29 @@ int run_embedded(bool coin_p2p_discover,
         coin_peer_mgr->set_dns_seeds(bip110::coin::btc_dns_seeds(false));
         coin_peer_mgr->set_fixed_seeds(bip110::coin::btc_fixed_seeds(false));
         coin_peer_mgr->start();
+        // ADDNODE (not connect): explicit --addnode/--peer entries become
+        // persistent high-priority candidates MERGED into the scored dial pool
+        // alongside discovered peers — discovery is NEVER disabled by them.
+        for (const auto& ep : explicit_peers)
+            coin_peer_mgr->add_addnode_peer(ep);
         const auto st = coin_peer_mgr->peer_stats();
         LOG_INFO << "[EMB-BIP110] NODE_BLAKE2B peer discovery ARMED: peers=" << st.total
-                 << " groups=" << st.unique_groups;
+                 << " groups=" << st.unique_groups
+                 << " addnode=" << explicit_peers.size();
+    }
+
+    // Gossip edge: install the addr-harvest sink on the coin node so every peer
+    // start_p2p spins up solicits getaddr and routes the NODE_BLAKE2B-filtered
+    // reply into the bucketed addrman (bootstrap -> gossip -> tried/new ->
+    // peers.dat persistence). Set BEFORE the first dial so the very first
+    // connection already harvests.
+    if (coin_peer_mgr) {
+        coin_node.set_addr_callback(
+            [pm = coin_peer_mgr.get()](const std::vector<NetService>& fork_peers,
+                                       const std::string& source_host) {
+                for (const auto& a : fork_peers)
+                    pm->add_discovered_peer(a, source_host);
+            });
     }
 
     // Round-robin dialer over explicit peers + the discovered set. Redials the
@@ -493,27 +514,38 @@ int run_embedded(bool coin_p2p_discover,
     auto explicit_list = std::make_shared<std::vector<NetService>>(explicit_peers);
     auto explicit_idx  = std::make_shared<size_t>(0);
     auto tried = std::make_shared<std::set<std::string>>();
-    auto dial_next = [&coin_node, &coin_peer_mgr, explicit_list, explicit_idx, tried]() -> bool {
-        // Prefer explicit peers first (round-robin), then discovered candidates.
-        if (!explicit_list->empty()) {
-            NetService ep = (*explicit_list)[(*explicit_idx)++ % explicit_list->size()];
-            LOG_INFO << "[EMB-BIP110] dialing explicit fork peer " << ep.to_string();
-            coin_node.start_p2p(ep);
-            return true;
-        }
+    auto current_dial = std::make_shared<std::string>();  // key of the in-flight dial target
+    auto dial_next = [&coin_node, &coin_peer_mgr, explicit_list, explicit_idx, tried,
+                      current_dial]() -> bool {
+        // ADDNODE semantics: when discovery is on, explicit --addnode/--peer
+        // entries are already registered as high-priority MANUAL candidates in
+        // the peer manager, so a single merged draw covers both them and the
+        // discovered set (manual peers score to the front; discovered fill in).
+        // The manager is the authority — NOT an exclusive explicit round-robin.
         if (coin_peer_mgr) {
             auto cands = coin_peer_mgr->get_peers_to_connect(*tried);
             if (cands.empty()) { tried->clear(); cands = coin_peer_mgr->get_peers_to_connect(*tried); }
-            if (cands.empty()) {
-                LOG_WARNING << "[EMB-BIP110] no fork peers to dial yet";
-                return false;
+            if (!cands.empty()) {
+                const auto& ep = cands.front();
+                *current_dial = ep.to_string();
+                tried->insert(*current_dial);
+                LOG_INFO << "[EMB-BIP110] dialing fork peer " << *current_dial
+                         << " (merged addnode+discovered pool)";
+                coin_node.start_p2p(ep.to_net_service());
+                return true;
             }
-            const auto& ep = cands.front();
-            tried->insert(ep.to_string());
-            LOG_INFO << "[EMB-BIP110] dialing discovered fork peer " << ep.to_string();
-            coin_node.start_p2p(ep.to_net_service());
+            // Manager has nothing yet (seeds still resolving): fall through to
+            // any explicit peers so the very first dial is not blocked.
+        }
+        if (!explicit_list->empty()) {
+            NetService ep = (*explicit_list)[(*explicit_idx)++ % explicit_list->size()];
+            *current_dial = ep.to_string();
+            LOG_INFO << "[EMB-BIP110] dialing explicit fork peer " << *current_dial;
+            coin_node.start_p2p(ep);
             return true;
         }
+        if (coin_peer_mgr)
+            LOG_WARNING << "[EMB-BIP110] no fork peers to dial yet";
         return false;
     };
     dial_next();
@@ -527,11 +559,11 @@ int run_embedded(bool coin_p2p_discover,
     auto driver = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak_driver = driver;
     auto keepalive = driver;  // outlive this scope
-    *driver = [timer, weak_driver, &coin_node, &header_chain, &chain_params,
-               dial_next, hdr_caught_up, last_height, last_progress, was_handshaked]() {
+    *driver = [timer, weak_driver, &coin_node, &header_chain, &chain_params, &coin_peer_mgr,
+               dial_next, hdr_caught_up, last_height, last_progress, was_handshaked, current_dial]() {
         timer->expires_after(std::chrono::seconds(kTickSec));
-        timer->async_wait([timer, weak_driver, &coin_node, &header_chain, &chain_params,
-                           dial_next, hdr_caught_up, last_height, last_progress, was_handshaked]
+        timer->async_wait([timer, weak_driver, &coin_node, &header_chain, &chain_params, &coin_peer_mgr,
+                           dial_next, hdr_caught_up, last_height, last_progress, was_handshaked, current_dial]
                           (const boost::system::error_code& ec) {
             if (ec) return;
             const uint32_t h = header_chain.height();
@@ -552,11 +584,21 @@ int run_embedded(bool coin_p2p_discover,
             if (handshaked && !caught_up) {
                 if (!*was_handshaked || !advanced) send_locator();
             }
+            // Handshake edge (false->true): the dialed peer completed version/
+            // verack, so it is a live NODE_BLAKE2B peer. Good() it in the addrman
+            // (promotes it toward the tried table + persists it) so the fork mesh
+            // accumulates a quality-ranked archival peer set across restarts.
+            if (handshaked && !*was_handshaked && coin_peer_mgr && !current_dial->empty())
+                coin_peer_mgr->notify_connected(*current_dial);
             *was_handshaked = handshaked;
 
             if (!caught_up && now - *last_progress >= std::chrono::seconds(kNoProgressFailoverSec)) {
                 LOG_INFO << "[EMB-BIP110] no header progress for " << kNoProgressFailoverSec
                          << "s (height=" << h << ", handshaked=" << handshaked << ") — failover";
+                // Count the failed dial in the addrman (Attempt(): lowers this
+                // target's GetChance so Select() stops re-drawing a dead peer).
+                if (coin_peer_mgr && !current_dial->empty())
+                    coin_peer_mgr->notify_dial_failed(*current_dial);
                 dial_next();
                 *last_progress = now;
                 *was_handshaked = false;
@@ -659,21 +701,37 @@ int run_embedded(bool coin_p2p_discover,
         // target_height + the single embedded fork peer's version-advertised
         // tip so the sync cards render the REAL BIP-110 header tip. Mirror of
         // main_btc.cpp coin_sync_status_fn.
-        mi->set_coin_sync_status_fn([&header_chain, &coin_node]() -> nlohmann::json {
+        mi->set_coin_sync_status_fn([&header_chain, &coin_node, &coin_peer_mgr]() -> nlohmann::json {
             nlohmann::json s = nlohmann::json::object();
             const uint32_t hh = header_chain.height();
             uint32_t th = header_chain.peer_tip_height();
             nlohmann::json peers = nlohmann::json::array();
+            std::string connected_addr;
             auto* p2p = coin_node.p2p();
             if (p2p != nullptr && p2p->peer_version() > 0) {
                 const uint32_t sh = p2p->peer_start_height();
                 if (sh > th) th = sh;
+                connected_addr = p2p->peer_addr();
                 peers.push_back({
+                    {"addr", connected_addr},   // FIX: ADDRESS column was blank ('–')
                     {"subver", p2p->peer_subver()},
                     {"startingheight", sh},
                     {"conntime", p2p->peer_uptime_sec()},
                     {"connected", true},
                 });
+            }
+            // Total-Peers truth: surface the learned NODE_BLAKE2B set (the addrman
+            // DB + scored working set) as address-only, NON-connected rows. The
+            // dashboard counts peers.length for "Total Peers" but only renders
+            // connected=true rows in the table and only raises target_height from
+            // connected peers, so these rows fix the count without polluting the
+            // table or the sync math. Was previously the 1-element connected array.
+            if (coin_peer_mgr) {
+                for (const auto& ep : coin_peer_mgr->list_known_peers(200)) {
+                    const auto a = ep.to_string();
+                    if (a == connected_addr) continue;
+                    peers.push_back({{"addr", a}, {"connected", false}});
+                }
             }
             s["header_height"] = hh;
             s["target_height"] = th;
@@ -874,7 +932,10 @@ int main(int argc, char** argv)
         else if (arg == "--run") { run = true; selftest = false; }
         else if (arg == "--coin-p2p-discover") { coin_p2p_discover = true; }
         else if (arg == "--fork-checkpoint") { fork_checkpoint = true; }
-        else if (arg == "--peer" && i + 1 < argc) {
+        else if ((arg == "--addnode" || arg == "--peer") && i + 1 < argc) {
+            // --addnode (preferred) / --peer (legacy alias): pin a fork peer with
+            // ADDNODE semantics — merged into the discovery pool, NOT an exclusive
+            // connect list (see add_addnode_peer + dial_next).
             std::string host = "127.0.0.1"; uint16_t port = 8333;
             parse_hostport(argv[++i], host, port);
             explicit_peers.emplace_back(host, port);

@@ -372,6 +372,68 @@ public:
                             source_host);
     }
 
+    /// Register an explicit --addnode / --peer fork peer with ADDNODE semantics
+    /// (NOT connect): a persistent, high-priority, never-give-up candidate that
+    /// is MERGED into the normal scored dial pool alongside discovered peers
+    /// (get_peers_to_connect draws both), and banked in the bucketed addrman so
+    /// Select()/get_addr() surface it too. Unlike the old exclusive --peer round
+    /// robin, discovery is never disabled — the fork mesh keeps growing while the
+    /// operator's pinned peers stay always-dialable. Isolated to this manager.
+    bool add_addnode_peer(const NetService& addr)
+    {
+        auto ep = PeerEndpoint::from(addr);
+        if (!ep) {
+            LOG_WARNING << "[" << m_symbol << "] Rejected invalid addnode peer: "
+                        << addr.to_string();
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto key = ep->to_string();
+        auto& peer = m_peers[key];
+        peer.address = ep->to_net_service();
+        peer.addr_class = ep->addr_class();
+        peer.source = BtcPeerInfo::Source::manual;
+        peer.is_protected = true;      // addnode: never dropped, always retryable
+        peer.score = 900000;           // high, below the single local-node 999999
+        peer.network_group = peer_network_group(ep->host());
+        peer.first_seen = std::chrono::steady_clock::now();
+        peer.last_seen = std::chrono::steady_clock::now();
+        peer.max_attempts = 999999;
+        // Bank in the bucketed DB too (manual source => own-group keyed).
+        m_addrman.add(ep->to_net_service(), std::string());
+        LOG_INFO << "[" << m_symbol << "] addnode fork peer (merged, addnode-not-connect): "
+                 << key;
+        return true;
+    }
+
+    /// All known fork peers for DISPLAY (dashboard Total-Peers + ADDRESS): the
+    /// scored working-set entries plus a sample of the bucketed addrman DB,
+    /// routable, deduped. Read-only — never influences dialing. Lets the panel
+    /// show the true learned NODE_BLAKE2B set instead of the 1 live connection.
+    std::vector<PeerEndpoint> list_known_peers(int max_count = 200) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<PeerEndpoint> out;
+        std::set<std::string> seen;
+        for (auto& [k, p] : m_peers) {
+            auto ep = PeerEndpoint::from(p.address);
+            if (!ep || !ep->is_routable()) continue;
+            if (!seen.insert(ep->to_string()).second) continue;
+            out.push_back(*ep);
+            if (static_cast<int>(out.size()) >= max_count) return out;
+        }
+        for (auto& ns : m_addrman.get_addr(/*max_pct=*/100,
+                                           /*max_count=*/static_cast<size_t>(max_count),
+                                           /*tried_only=*/false)) {
+            auto ep = PeerEndpoint::from(ns);
+            if (!ep || !ep->is_routable()) continue;
+            if (!seen.insert(ep->to_string()).second) continue;
+            out.push_back(*ep);
+            if (static_cast<int>(out.size()) >= max_count) break;
+        }
+        return out;
+    }
+
     /// Get list of peers that should be connected right now.
     /// Returns up to max_connections_per_cycle validated PeerEndpoints sorted
     /// by score, excluding already-connected, backed-off, and invalid peers.

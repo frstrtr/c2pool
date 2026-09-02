@@ -107,8 +107,11 @@ private:
     // External mempool for compact block tx matching
     Mempool* m_mempool{nullptr};
 
-    // Callbacks for broadcaster integration
-    using AddrCallback = std::function<void(const std::vector<NetService>&)>;
+    // Callbacks for broadcaster integration.
+    // fork_peers = NODE_BLAKE2B-advertising addresses only (filtered at intake);
+    // source_host = the peer that gossiped them (bucket-keys the addrman entry).
+    using AddrCallback =
+        std::function<void(const std::vector<NetService>&, const std::string&)>;
     AddrCallback m_addr_callback;
     using PeerHeightCallback = std::function<void(uint32_t)>;
     PeerHeightCallback m_on_peer_height;
@@ -378,6 +381,8 @@ public:
     uint32_t peer_version() const { return m_peer_version; }
     const std::string& peer_subver() const { return m_peer_subver; }
     uint32_t peer_start_height() const { return m_peer_start_height; }
+    /// Remote endpoint we dialed — the ADDRESS the dashboard peers panel shows.
+    std::string peer_addr() const { return m_target_addr.to_string(); }
     int64_t peer_uptime_sec() const {
         return std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_connected_at).count();
@@ -648,6 +653,14 @@ private:
             send_feefilter(0);
         }
 
+        // Fork-mesh growth (the gossip edge): solicit the peer's address book so
+        // the addrman learns more NODE_BLAKE2B peers. The addr handler filters
+        // the reply on the service bit before banking it. Only meaningful when a
+        // broadcaster installed an addr callback; harmless otherwise (the peer's
+        // addr reply is simply dropped by the handler when no sink is wired).
+        if (m_addr_callback)
+            send_getaddr();
+
         // BIP 35: Request mempool contents from peer.
         // CRITICAL: Peers without NODE_BLOOM (0x04) will DISCONNECT us if we
         // send the mempool message (litecoind net_processing.cpp:3918-3926).
@@ -833,14 +846,26 @@ private:
 
     ADD_P2P_HANDLER(addr)
     {
-        if (m_addr_callback && !msg->m_addrs.empty()) {
-            std::vector<NetService> addrs;
-            addrs.reserve(msg->m_addrs.size());
-            for (auto& rec : msg->m_addrs) {
-                addrs.push_back(rec.m_endpoint);
-            }
-            m_addr_callback(addrs);
+        // BIP-110 fork-mesh gossip harvest: bank ONLY peers advertising
+        // NODE_BLAKE2B (bit 28). A gossiped generic-BTC address would seed the
+        // addrman with a peer we'd drop at the version gate anyway, so filter on
+        // the service bit at intake — the fork table grows among fork peers, not
+        // across the whole BTC network. (The wire record carries m_services;
+        // this handler previously discarded it, dropping the filter signal.)
+        if (!m_addr_callback || msg->m_addrs.empty())
+            return;
+        static constexpr uint64_t NODE_BLAKE2B = (uint64_t{1} << 28);
+        std::vector<NetService> fork_peers;
+        fork_peers.reserve(msg->m_addrs.size());
+        for (auto& rec : msg->m_addrs) {
+            if (rec.m_services & NODE_BLAKE2B)
+                fork_peers.push_back(rec.m_endpoint);
         }
+        if (fork_peers.empty())
+            return;
+        // source host = the peer that gossiped these; bucket-keys the banked
+        // entries so one source cannot spray the whole new table (dashd Add()).
+        m_addr_callback(fork_peers, m_target_addr.address());
     }
 
     ADD_P2P_HANDLER(reject)
