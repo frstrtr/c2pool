@@ -16,6 +16,9 @@ set(bip110_coin_interface
     transaction.hpp transaction.cpp
     header_chain.hpp
     mempool.hpp
+    block_assembler.hpp
+    sigops.hpp
+    utxo_reorg.hpp
     template_builder.hpp
 )
 

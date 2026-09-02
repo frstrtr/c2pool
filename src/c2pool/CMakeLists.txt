@@ -451,6 +451,34 @@ target_link_libraries(bip110_m2_workshape_kat
 )
 add_test(NAME bip110_m2_workshape_kat COMMAND bip110_m2_workshape_kat)
 
+# bip110_m3_serving_kat: the KILLER KAT for BIP-110 M3 daemonless mempool
+# tx-serving. Network-free reward-safety proof over block_assembler.hpp +
+# template_builder.hpp: CPFP package selection with topological parent-before-
+# child ordering, fail-closed exclusion of an unpriced-parent child and an
+# over-weight tx, coinbasevalue == subsidy + Σ(fees) to the satoshi, and the
+# txid-merkle / witness-commitment SSOT. A failure is a money-path defect.
+add_executable(bip110_m3_serving_kat
+    bip110_m3_serving_kat.cpp
+)
+target_compile_definitions(bip110_m3_serving_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_m3_serving_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME bip110_m3_serving_kat COMMAND bip110_m3_serving_kat)
+
 # KAT: pre-anchor header-backfill PARALLEL GETHEADERS WINDOW (extends #1263 /
 # task #151; base PR #1278). Drives the real BulkFetchLane header lane against a
 # scripted peer set: RED (window=1, no disconnect) serializes/wedges on a silent

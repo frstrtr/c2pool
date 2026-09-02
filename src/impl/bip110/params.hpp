@@ -47,6 +47,12 @@ inline constexpr uint32_t BLAKE2B_HEIGHT      = 961640;      // first BLAKE2b bl
 inline constexpr uint32_t BLAKE2B_TARGET_SHIFT = 22;         // one-off reset at 961640
 inline constexpr uint32_t RDTS_MAX_BLOCK_WEIGHT = 800000;    // reduced-data weight cap
 inline constexpr uint32_t RDTS_EXPIRY_TIME    = 1819756800;  // 2027-09-01 MTP gate
+// Conservative block-sigop-cost cap (GAP3). Bitcoin's MAX_BLOCK_SIGOPS_COST is
+// 80000 against a 4,000,000-WU block; RDTS caps weight at 800000 WU, so the
+// weight-scaled bound is 80000 × 800000/4000000 = 16000. VERIFY against the
+// Knots BIP-110 source: if Knots kept 80000 unscaled our cap is merely STRICTER
+// (an inclusion-% cost, never a validity risk) — the fail-closed direction.
+inline constexpr uint32_t RDTS_MAX_BLOCK_SIGOPS_COST = 16000;
 inline constexpr const char* GENESIS_HASH =
     "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
 // getblocktemplate rule the pool MUST request against a Knots 29.4.1 backend
