@@ -12,6 +12,7 @@
 
 #include "block.hpp"
 #include "transaction.hpp"
+#include "check_transaction.hpp"
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -97,6 +98,14 @@ public:
     void set_tip_height(uint32_t h) { m_tip_height = h; }
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
+    // GAP2 — read access to the live UTXO view so the work source can build the
+    // template-time input_confirmed predicate over the SAME view the pricer used
+    // (compute_fee_locked), keeping inclusion and pricing agreed.
+    core::coin::UTXOViewCache* utxo() const { return m_utxo.load(); }
+    // Current tip height (for coinbase-maturity agreement in the predicate).
+    uint32_t tip_height() const { return m_tip_height; }
+    const core::coin::ChainLimits& limits() const { return m_limits; }
+
     /// Monotonic mutation counter, bumped on every add/remove/clear that
     /// could change the selected tx set. Readers (e.g. the stratum work
     /// template cache) compare it across calls to skip rebuilding when the
@@ -122,11 +131,51 @@ public:
     bool add_tx(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
         uint256 txid = compute_txid(tx);
 
+        // ── STRUCTURAL VALIDITY — fail-closed BEFORE pricing (Bitcoin Core
+        // CheckTransaction + coinbase mempool-reject). check_transaction() reads
+        // only the tx (lock-free), so it runs ahead of the mutex. A tx that fails
+        // here is NEVER priced (compute_fee_locked never runs), NEVER enters
+        // m_pool/m_spent_outputs/m_feerate_index, and never bumps the epoch. This
+        // closes the pre-M3 hole: a within-tx duplicate input (CVE-2018-17144)
+        // fabricated a positive fee, and an empty-vout tx priced fee=value_in —
+        // either would reach a consensus-INVALID served block. Modelled on the
+        // GAP1 Layer-A REJECT log line below.
+        {
+            std::string reason;
+            if (!check_transaction(tx, m_limits, reason)) {
+                LOG_INFO << "[EMB-BIP110] Mempool REJECT structural " << reason
+                         << " txid=" << txid.GetHex().substr(0, 16);
+                return false;
+            }
+        }
+
         std::lock_guard<std::mutex> lock(m_mutex);
 
         // Reject duplicates
         if (m_pool.count(txid))
             return false;
+
+        // GAP1 LAYER A — intra-mempool double-spend REJECT (first-seen wins, NO
+        // RBF). If any input is already claimed by a spender still in the pool,
+        // reject the newcomer. A pool template must never depend on a replacement
+        // race, and admitting a second spender would (a) corrupt the m_spent_outputs
+        // bookkeeping (the [key]=txid overwrite below silently drops the earlier
+        // spender's claim, breaking remove_tx_locked's single-spender erase and
+        // remove_for_block Phase-2 conflict detection) and (b) let both price via
+        // the same UTXO coin => a double-spending, consensus-INVALID assembled
+        // block => lost reward. Fail closed, deterministically.
+        for (const auto& vin : tx.vin) {
+            auto ckey = std::make_pair(vin.prevout.hash, vin.prevout.index);
+            auto so = m_spent_outputs.find(ckey);
+            if (so != m_spent_outputs.end() && m_pool.count(so->second)) {
+                LOG_INFO << "[EMB-BIP110] Mempool REJECT conflict txid="
+                         << txid.GetHex().substr(0, 16) << " spends "
+                         << vin.prevout.hash.GetHex().substr(0, 16) << ":"
+                         << vin.prevout.index << " already claimed by "
+                         << so->second.GetHex().substr(0, 16);
+                return false;
+            }
+        }
 
         MempoolEntry entry;
         entry.tx    = tx;
@@ -469,6 +518,136 @@ public:
         return static_cast<int>(to_remove.size());
     }
 
+    // ─── TIER-3 daemonless input pricing (parent-tx fetch) ───────────────
+    //
+    // An SPV node has no full UTXO set, so a mempool tx spending a coin that is
+    // neither in our post-anchor UTXO view (T2) nor in an in-mempool parent
+    // (T1/CPFP) is fee-UNKNOWN and therefore EXCLUDED from templates (fail
+    // closed). Tier 3 recovers a subset: for each fee-unknown entry, request the
+    // missing prevout parent txs over P2P (getdata MSG_WITNESS_TX). An arriving
+    // parent is SELF-AUTHENTICATING — its SHA256d txid must equal the requested
+    // hash, which a peer cannot forge — so its vout VALUES are trustworthy inputs
+    // to the fee computation. add_parent_priced records those values here; the
+    // next recompute_unknown_fees consults them (see compute_fee_locked T3 arm).
+    //
+    // HONEST LIMITATION: Bitcoin-family nodes answer getdata(tx) only from their
+    // mempool/relay set, NOT confirmed history, so a tx spending an OLD confirmed
+    // coin resolves via neither tier and stays excluded — fewer txs, never a
+    // guessed fee. Coverage grows with uptime (the T2 view deepens each block).
+
+    /// Record the vout values of a parent tx fetched/relayed over P2P, keyed by
+    /// its (recomputed) txid. Self-authenticating: the txid is derived from the
+    /// tx bytes, so the stored values are exactly the parent's real outputs.
+    /// TTL-bounded; superseded once the coin lands in the UTXO view.
+    void add_parent_priced(const MutableTransaction& parent) {
+        // Same structural floor as add_tx: the subscriber (main_bip110.cpp) calls
+        // add_parent_priced BEFORE add_tx, so without this a structurally invalid
+        // tx would still seed the T3 priced-parent side table and pollute a
+        // child's fee-known pricing off a parent that can never confirm. Fetched
+        // parents arrive over relay (getdata tx), which never serves coinbases, so
+        // the coinbase-reject arm never rejects a legitimate parent here.
+        {
+            std::string reason;
+            if (!check_transaction(parent, m_limits, reason)) {
+                LOG_INFO << "[EMB-BIP110] Parent-priced REJECT structural " << reason
+                         << " txid=" << compute_txid(parent).GetHex().substr(0, 16);
+                return;
+            }
+        }
+        uint256 ptxid = compute_txid(parent);
+        std::vector<int64_t> vals;
+        vals.reserve(parent.vout.size());
+        for (const auto& o : parent.vout) vals.push_back(o.value);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_parent_values[ptxid] = { std::move(vals), std::time(nullptr) };
+    }
+
+    /// Snapshot of prevout parent txids that block a fee-unknown entry from
+    /// being priced: NOT in the pool (would be CPFP), NOT already in the priced
+    /// side table, and NOT in the UTXO view. These are the getdata(MSG_WITNESS_TX)
+    /// targets the ParentTxResolver requests. De-duplicated.
+    std::vector<uint256> missing_parents() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto* utxo = m_utxo.load();
+        std::set<uint256> want;
+        for (const auto& [txid, entry] : m_pool) {
+            if (entry.fee_known) continue;
+            for (const auto& vin : entry.tx.vin) {
+                const uint256& ph = vin.prevout.hash;
+                if (m_pool.count(ph)) continue;              // T1 in-mempool parent
+                if (m_parent_values.count(ph)) continue;     // T3 already priced
+                if (utxo) {                                   // T2 already in view
+                    core::coin::Outpoint op(ph, vin.prevout.index);
+                    core::coin::Coin coin;
+                    if (utxo->get_coin(op, coin)) continue;
+                }
+                want.insert(ph);
+            }
+        }
+        return std::vector<uint256>(want.begin(), want.end());
+    }
+
+    /// Evict priced-parent side-table entries older than expiry_sec.
+    void evict_expired_parents() {
+        time_t cutoff = std::time(nullptr) - m_expiry_sec;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto it = m_parent_values.begin(); it != m_parent_values.end();) {
+            if (it->second.second < cutoff) it = m_parent_values.erase(it);
+            else ++it;
+        }
+    }
+
+    /// Priced (fee_known) entries copied out for the block assembler. The
+    /// assembler runs its ancestor-package selection + topological ordering on
+    /// this immutable snapshot, so template building never holds the pool lock.
+    std::vector<MempoolEntry> snapshot_priced() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<MempoolEntry> out;
+        out.reserve(m_pool.size());
+        for (const auto& [txid, entry] : m_pool)
+            if (entry.fee_known) out.push_back(entry);
+        return out;
+    }
+
+    // GAP6 — good-citizen naming: fee-unknown (unpriceable) entries are filtered
+    // out by snapshot_priced() before the assembler ever sees them, so they never
+    // reach the per-template exclusion ledger. These accessors let the work source
+    // merge them in and NAME them at template time (#1038/#1039 no-silent-refusals).
+    size_t unpriced_count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (const auto& [txid, entry] : m_pool)
+            if (!entry.fee_known) ++n;
+        return n;
+    }
+    /// A bounded sample of unpriceable txids (keeps the log line free of flood).
+    std::vector<uint256> unpriced_sample(size_t n) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<uint256> out;
+        for (const auto& [txid, entry] : m_pool) {
+            if (entry.fee_known) continue;
+            if (out.size() >= n) break;
+            out.push_back(txid);
+        }
+        return out;
+    }
+
+    // GAP4 — reorg recovery: after a fork-chain disconnect, every priced fee was
+    // derived against a now-off-chain UTXO view. Quarantine ALL entries (set
+    // fee_known=false, drop the feerate index) so the next recompute_unknown_fees
+    // re-prices them against the reconciled post-disconnect view; KEEP the T3
+    // priced-parent side table (m_parent_values is txid-authenticated, chain-
+    // independent). Bumps epoch so template caches rebuild.
+    void requarantine_all() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& [txid, entry] : m_pool) {
+            entry.fee_known = false;
+            entry.fee = 0;
+        }
+        m_feerate_index.clear();
+        m_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+
     /// Snapshot of all txids currently in the pool.
     std::vector<uint256> all_txids() const {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -641,8 +820,28 @@ private:
                         return false;
                     }
                 } else {
-                    all_found = false;
-                    break;
+                    // TIER 3: authenticated priced-parent side table (parent tx
+                    // fetched over P2P via getdata(MSG_WITNESS_TX); its vout values
+                    // recorded by add_parent_priced after a SHA256d txid recompute,
+                    // so a peer cannot forge a value). Consulted only after the UTXO
+                    // view (T2) and the in-mempool parent (T1/CPFP) both miss.
+                    auto pv = m_parent_values.find(vin.prevout.hash);
+                    if (pv != m_parent_values.end()
+                        && vin.prevout.index < pv->second.first.size()) {
+                        int64_t parent_val = pv->second.first[vin.prevout.index];
+                        if (!core::coin::money_range(parent_val, m_limits)) {
+                            entry.fee = 0; entry.fee_known = false;
+                            return false;
+                        }
+                        value_in += parent_val;
+                        if (!core::coin::money_range(value_in, m_limits)) {
+                            entry.fee = 0; entry.fee_known = false;
+                            return false;
+                        }
+                    } else {
+                        all_found = false;
+                        break;
+                    }
                 }
             }
         }
@@ -734,6 +933,11 @@ private:
     /// Conflict detection: (prev_txid, prev_n) → spending mempool txid.
     /// Mirrors Litecoin Core's mapNextTx for O(1) double-spend detection.
     std::map<std::pair<uint256, uint32_t>, uint256> m_spent_outputs;
+
+    /// TIER-3 priced-parent side table: parent txid → (vout values, added time).
+    /// Populated by add_parent_priced from self-authenticated P2P-fetched parent
+    /// txs; consulted by compute_fee_locked after the UTXO/CPFP tiers miss.
+    std::map<uint256, std::pair<std::vector<int64_t>, time_t>> m_parent_values;
 
     size_t m_total_bytes{0};    // sum of base_size across all entries
     size_t m_max_bytes;

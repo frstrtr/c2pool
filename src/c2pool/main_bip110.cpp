@@ -20,15 +20,31 @@
 #include <impl/bip110/coin/node_interface.hpp>
 #include <impl/bip110/coin/coin_peer_manager.hpp>
 #include <impl/bip110/coin/chain_seeds.hpp>
+#include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
+#include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
+#include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
+#include <impl/bip110/stratum/work_source.hpp>
+
+#include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
+#include <core/coin/utxo_view_cache.hpp>
+#include <core/pack.hpp>
+#include <core/hash.hpp>
 
 #include <core/uint256.hpp>
 #include <core/target_utils.hpp>
+#include <core/address_utils.hpp>
 #include <core/netaddress.hpp>
+#include <core/stratum_server.hpp>
 #include <core/log.hpp>
+#include <core/param_catalog.hpp>           // M0b catalog: C_BIP110 / BIN_BIP110
+#include <core/settings_file.hpp>           // M0b resolved-config (give_author / fee L0)
+#include <impl/bip110/catalog_defaults.hpp> // M0b L0 compiled defaults (author 0.1%)
 
 #include <boost/asio.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -78,7 +94,9 @@ void print_banner(const char* argv0)
         "  --coin-p2p-discover  discover NODE_BLAKE2B fork peers (DNS + fixed seeds)\n"
         "  --peer IP:PORT       add an explicit fork peer (repeatable)\n"
         "  --fork-checkpoint    seed the Knots 961640 checkpoint for a fast proof\n"
-        "  --http [HOST:]PORT   serve a JSON sync-status endpoint\n\n"
+        "  --http [HOST:]PORT   serve a JSON sync-status endpoint\n"
+        "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
+        "                       miner has no resolvable payout address (base58/bech32)\n\n"
         "PoW: BLAKE2b commitment pipeline (bip110::pow); block hash == PoW hash.\n"
         "Fork: Blake2bHeight=%u; RDTS weight cap=%u WU; network==Bitcoin mainnet\n"
         "      (magic f9beb4d9, default port %u).\n",
@@ -196,7 +214,12 @@ private:
 int run_embedded(bool coin_p2p_discover,
                  const std::vector<NetService>& explicit_peers,
                  bool fork_checkpoint,
-                 const std::string& http_host, uint16_t http_port)
+                 const std::string& http_host, uint16_t http_port,
+                 uint16_t stratum_port,
+                 const std::string& donation_address,
+                 double give_author_pct,
+                 double node_owner_fee_pct,
+                 bool serve_mempool_txs)
 {
     core::log::Logger::init();
 
@@ -233,20 +256,245 @@ int run_embedded(bool coin_p2p_discover,
 
     bip110::coin::Node<MiniConfig> coin_node(&ioc, &config);
 
+    // ── M3 DAEMONLESS MEMPOOL SERVING: own UTXO view + mempool + T3 resolver ──
+    // BIP-110 has NO coin daemon, so there is no getblocktemplate to hand us txs
+    // or fees. We do the daemon's job ourselves: ingest the fork mempool over
+    // P2P, maintain a post-anchor UTXO view for input pricing (T2), fetch missing
+    // parents over P2P (T3), and select txs Bitcoin-BlockAssembler-style. All
+    // fail-closed: an unprice-able tx is EXCLUDED, never guessed.
+    const std::string utxo_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".")
+                                   + "/.c2pool/bip110/utxo_view_db";
+    core::coin::UTXOViewDB utxo_db(utxo_db_path);
+    if (!utxo_db.open())
+        LOG_WARNING << "[EMB-BIP110] UTXOViewDB open failed — running without UTXO persistence";
+    core::coin::UTXOViewCache utxo_cache(&utxo_db);
+    bip110::coin::Mempool mempool;
+    mempool.set_utxo(&utxo_cache);
+    mempool.set_tip_height(header_chain.height());
+    // BIP-110 keeps txid over the NON-witness serialization (segwit-invariant).
+    auto bip110_txid = [](const bip110::coin::MutableTransaction& tx) {
+        auto packed = pack(bip110::coin::TX_NO_WITNESS(tx));
+        return Hash(packed.get_span());
+    };
+    constexpr uint32_t BIP110_KEEP_DEPTH = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
+
+    // ── M2 MINING: stratum server + BLAKE2b Sv1 work source (miner-facing) ──
+    // submit_block_fn relays a won 164-byte v2 block to the FORK peers over the
+    // coin P2P (submit_block_with_fallback: P2P relay + optional submitblock RPC
+    // backup). The work source serves coinbase-only jobs, validates shares with
+    // an independent BLAKE2b recompute, and dispatches block-target hits here.
+    auto stratum_submit_fn =
+        [&coin_node](const std::vector<unsigned char>& block_bytes, uint32_t height) -> bool {
+            LOG_INFO << "[EMB-BIP110] submitting won block height=" << height
+                     << " bytes=" << block_bytes.size();
+            return coin_node.submit_block_with_fallback(block_bytes);
+        };
+    auto work_source = std::make_shared<bip110::stratum::Bip110WorkSource>(
+        header_chain, /*is_testnet=*/false, std::move(stratum_submit_fn));
+
+    // Wire the embedded mempool into the work source. serve gated on the header
+    // chain being caught up (never serve mid-sync) AND the fork gate — each tx is
+    // still independently fail-closed on pricing, so this only avoids churning
+    // templates before we are following the fork tip. The work source READS the
+    // mempool only.
+    // GAP4 — serve gate also requires the UTXO view to be CONSISTENT with the
+    // active chain. On a reorg the tip-changed handler flips this false while it
+    // rolls the view back to the fork (and permanently on an unrecoverable
+    // rollback), so templates are NEVER built from a diverged ledger — the
+    // work source falls back to coinbase-only (never a wrong fee).
+    std::atomic<bool> utxo_consistent{true};
+    work_source->set_mempool(&mempool, serve_mempool_txs,
+        [&header_chain, &utxo_consistent]() {
+            return utxo_consistent.load(std::memory_order_relaxed)
+                && header_chain.height() >= header_chain.params().blake2b_height;
+        });
+    LOG_INFO << "[EMB-BIP110] mempool tx-serving "
+             << (serve_mempool_txs ? "ENABLED" : "DISABLED (coinbase-only)")
+             << " — daemonless ingest+price+select+xcheck";
+
+    // ── DEFECT 2: node-owner / donation address (OPERATOR-PROVIDED, never hard-
+    // coded). When a miner authorizes with a resolvable payout address it is paid
+    // the subsidy; if the miner address fails to resolve, the subsidy falls back
+    // to this donation script. If NEITHER resolves the work source REFUSES to
+    // serve (burn guard) rather than emit all-zero-value work. Accepts any
+    // Bitcoin base58/bech32 address (address_to_script). ──
+    if (!donation_address.empty()) {
+        auto donation_script = core::address_to_script(donation_address);
+        if (donation_script.empty()) {
+            LOG_ERROR << "[EMB-BIP110] --node-owner-address '" << donation_address
+                      << "' did not decode to a scriptPubKey — REFUSING to start "
+                         "(would fall through to the burn guard). Fix the address.";
+            return 2;
+        }
+        work_source->set_donation_script(donation_script);
+        LOG_INFO << "[EMB-BIP110] node-owner/donation address set: " << donation_address
+                 << " (script " << donation_script.size() << " B) — subsidy fallback armed";
+    } else {
+        LOG_WARNING << "[EMB-BIP110] no --node-owner-address configured: only miners "
+                       "with a resolvable payout address get work; unresolved payout + "
+                       "no donation => work is REFUSED (burn guard), never zero-value.";
+    }
+
+    // ── REWARD SPLIT: author/dev donation (give_author_pct, default 0.1%) +
+    // node-owner fee (node_owner_fee_pct, default 0). Percent -> parts-per-million
+    // (integer): 0.1% = 1000 ppm, 1% = 10000 ppm. llround keeps the ppm exact for
+    // typical human inputs; the split itself is integer FLOOR division and the
+    // miner absorbs every remainder. The node-owner address == the donation
+    // address here (single key), so a non-zero fee CONSOLIDATES with the donation
+    // into ONE coinbase output (see work_source.cpp build_connection_coinbase). ──
+    const uint64_t give_author_ppm = static_cast<uint64_t>(
+        std::llround(std::max(0.0, give_author_pct) * 10000.0));
+    const uint64_t node_owner_fee_ppm = static_cast<uint64_t>(
+        std::llround(std::max(0.0, node_owner_fee_pct) * 10000.0));
+    work_source->set_give_author_ppm(give_author_ppm);
+    work_source->set_node_owner_fee_ppm(node_owner_fee_ppm);
+    LOG_INFO << "[EMB-BIP110] reward split: give-author=" << give_author_pct << "% ("
+             << give_author_ppm << " ppm) node-owner-fee=" << node_owner_fee_pct << "% ("
+             << node_owner_fee_ppm << " ppm) — integer floor split, miner absorbs remainder"
+             << (node_owner_fee_ppm > 0 ? "; owner+donation consolidated (single key)" : "");
+
+    std::unique_ptr<core::StratumServer> stratum_server;
+    if (stratum_port != 0) {
+        stratum_server = std::make_unique<core::StratumServer>(
+            ioc, "0.0.0.0", stratum_port, work_source);
+        if (stratum_server->start())
+            LOG_INFO << "[EMB-BIP110] stratum server LIVE on :" << stratum_port
+                     << " (BLAKE2b Sv1 work source, coinbase-only M2)";
+        else
+            LOG_WARNING << "[EMB-BIP110] stratum server failed to bind :" << stratum_port;
+    }
+
     auto header_block_hash = [](const bip110::coin::BlockHeaderType& hdr) {
         return bip110::coin::block_hash(hdr);
     };
 
     auto hdr_caught_up = std::make_shared<bool>(false);
 
+    // ── M3 UTXO maintenance: connect every full block into the own-UTXO view ──
+    // The p2p_node auto-requests every inv'd block via getdata(MSG_WITNESS_BLOCK),
+    // so witness data arrives intact. Registration order matters: UTXO connect
+    // FIRST (so the post-tip mempool passes see the applied block), mirroring
+    // main_btc.cpp. This deepens the T2 pricing view one block at a time.
+    coin_node.full_block.subscribe(
+        [&header_chain, &utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH]
+        (const bip110::coin::BlockType& block)
+        {
+            auto packed_hdr = pack(static_cast<const bip110::coin::BlockHeaderType&>(block));
+            uint256 block_hash = Hash(packed_hdr.get_span());
+            auto entry = header_chain.get_header(block_hash);
+            if (!entry) return;                     // header sync lagging — drop
+            uint32_t height = entry->height;
+            if (height <= utxo_cache.get_best_height()) return;   // monotonic
+            // GAP4 continuity gate: only connect a block that extends the current
+            // view tip. A non-contiguous block means a reorg is pending — the
+            // tip-changed handler rolls the view back to the fork first, then the
+            // new branch re-connects contiguously from fork+1. Skip (named) here.
+            {
+                uint256 view_best = utxo_cache.get_best_block();
+                if (!view_best.IsNull() && block.m_previous_block != view_best) {
+                    LOG_WARNING << "[EMB-BIP110] utxo-connect skipped: non-contiguous "
+                                   "(reorg pending) h=" << height
+                                << " prev=" << block.m_previous_block.GetHex().substr(0, 16)
+                                << " view_best=" << view_best.GetHex().substr(0, 16);
+                    return;
+                }
+            }
+            try {
+                auto undo = utxo_cache.connect_block(block, height, bip110_txid);
+                utxo_db.put_block_undo(height, undo);
+                utxo_cache.flush(block_hash, height);
+                utxo_cache.prune_undo(height, BIP110_KEEP_DEPTH);
+                mempool.set_tip_height(height);
+                LOG_INFO << "[EMB-BIP110] UTXO connect: h=" << height
+                         << " txs=" << block.m_txs.size()
+                         << " best_height=" << utxo_cache.get_best_height();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[EMB-BIP110] UTXO connect_block failed h=" << height
+                            << ": " << e.what();
+            }
+        });
+
+    // ── GAP4 UTXO-view reorg handling ───────────────────────────────────────
+    // On a fork-chain reorg the header chain fires on_tip_changed. If the view's
+    // best is already on the new chain this is a plain extension (no-op — the
+    // connect handler applies the new blocks). Otherwise the view is on an
+    // abandoned branch: flag it inconsistent (serve coinbase-only), roll the view
+    // back to the common ancestor via undo data (removing rolled-back coins;
+    // fail-closed on missing/too-deep undo), requarantine + re-price the mempool
+    // against the reconciled view, then clear the flag. A rolled-back coin can
+    // NEVER be priced/included afterwards (GAP2's inclusion rule is the 2nd wall).
+    header_chain.set_on_tip_changed(
+        [&utxo_cache, &utxo_db, &header_chain, &mempool, &utxo_consistent, BIP110_KEEP_DEPTH]
+        (const uint256& /*old_tip*/, uint32_t old_h, const uint256& new_tip, uint32_t new_h)
+        {
+            uint256  view_best = utxo_cache.get_best_block();
+            uint32_t view_h    = utxo_cache.get_best_height();
+            if (view_best.IsNull()) return;    // nothing connected yet
+            auto active_at = header_chain.get_header_by_height(view_h);
+            if (active_at && active_at->block_hash == view_best)
+                return;                        // view already on the new chain — plain extension
+
+            utxo_consistent.store(false, std::memory_order_relaxed);
+            auto res = bip110::coin::reorg_disconnect_to_fork(
+                utxo_cache, utxo_db, header_chain, new_tip, BIP110_KEEP_DEPTH);
+            if (res != bip110::coin::ReorgResult::OK) {
+                LOG_ERROR << "[EMB-BIP110] UTXO reorg FAILED ("
+                          << bip110::coin::reorg_result_name(res) << ") old_h=" << old_h
+                          << " new_h=" << new_h << " — serving coinbase-only until view "
+                             "rebuild (fail closed, never a wrong ledger)";
+                return;   // leave utxo_consistent=false (until restart / rebuild)
+            }
+            mempool.requarantine_all();
+            mempool.set_tip_height(utxo_cache.get_best_height());
+            mempool.recompute_unknown_fees(&utxo_cache);
+            mempool.revalidate_inputs(&utxo_cache);
+            utxo_consistent.store(true, std::memory_order_relaxed);
+            LOG_INFO << "[EMB-BIP110] UTXO reorg reconciled to fork h="
+                     << utxo_cache.get_best_height() << " (new tip h=" << new_h << ")";
+        });
+
+    // ── M3 mempool tx ingest ──────────────────────────────────────────────
+    // new_tx fires for every tx relayed via inv->getdata(MSG_WITNESS_TX). We
+    // add it to the mempool (priced from the UTXO view where possible) AND feed
+    // its output values to the tier-3 priced-parent side table (self-authenticating
+    // — a fetched parent that a child spends is priced from THESE bytes).
+    coin_node.new_tx.subscribe(
+        [&mempool, &utxo_cache](const bip110::coin::Transaction& tx) {
+            bip110::coin::MutableTransaction mtx(tx);
+            mempool.add_parent_priced(mtx);         // T3: record output values
+            (void)mempool.add_tx(mtx, &utxo_cache);  // T1/T2: admit + price
+        });
+
+    // Post-tip mempool maintenance (after the UTXO connect above): drop confirmed
+    // + conflicting txs, evict stale-input txs, re-price previously-unknown fees.
+    coin_node.full_block.subscribe(
+        [&mempool, &utxo_cache](const bip110::coin::BlockType& block) {
+            mempool.remove_for_block(block);
+            int evicted  = mempool.revalidate_inputs(&utxo_cache);
+            int resolved = mempool.recompute_unknown_fees(&utxo_cache);
+            mempool.evict_expired();
+            mempool.evict_expired_parents();
+            if (evicted > 0 || resolved > 0)
+                LOG_INFO << "[EMB-BIP110] post-tip mempool: evicted=" << evicted
+                         << " resolved_fees=" << resolved << " size=" << mempool.size();
+        });
+
+    // ── TIER-3 parent-tx resolver (daemonless input pricing driver) ──────────
+    auto parent_resolver = std::make_shared<bip110::coin::ParentTxResolver>(
+        mempool, [&coin_node](const std::vector<uint256>& txids) {
+            coin_node.request_tx(txids);
+        });
+
     // Ingest header batches, drive the peer's start_height into the fast-sync
-    // gate, and chain the next getheaders forward until caught up.
+    // gate, and chain the next getheaders forward until caught up. Bump the work
+    // generation on every fork-tip move so stratum sessions re-push fresh work.
     coin_node.new_headers.subscribe(
-        [&header_chain, &coin_node, header_block_hash, hdr_caught_up]
+        [&header_chain, &coin_node, header_block_hash, hdr_caught_up, work_source]
         (const std::vector<bip110::coin::BlockHeaderType>& headers)
         {
             if (headers.empty()) return;
             int accepted = header_chain.add_headers(headers);
+            if (accepted > 0) work_source->bump_work_generation();
             uint256 last_hash = header_block_hash(headers.back());
             const auto& lh = headers.back();
             LOG_INFO << "[EMB-BIP110] new_headers: received=" << headers.size()
@@ -392,6 +640,36 @@ int run_embedded(bool coin_p2p_discover,
     };
     (*tip_log)();
 
+    // ── M3: tier-3 resolver pump + mempool-epoch re-job cadence ──────────────
+    // Every few seconds: request missing parents (T3), and if the mempool tx-set
+    // changed, bump the work generation so stratum re-pushes a template reflecting
+    // the new set (BIP-110 freezes the tx set per job — there is no miner-side
+    // merkle fold, so a fresh set needs a fresh job).
+    if (serve_mempool_txs) {
+        coin_node.enable_mempool_request();   // BIP35 pull (skipped if peer !NODE_BLOOM)
+        auto mp_timer = std::make_shared<io::steady_timer>(ioc);
+        auto mp_ka = mp_timer;
+        auto last_epoch = std::make_shared<uint64_t>(mempool.epoch());
+        auto mp_loop = std::make_shared<std::function<void()>>();
+        std::weak_ptr<std::function<void()>> weak_mp = mp_loop;
+        *mp_loop = [mp_timer, weak_mp, &mempool, parent_resolver, work_source, last_epoch]() {
+            mp_timer->expires_after(std::chrono::seconds(5));
+            mp_timer->async_wait([mp_timer, weak_mp, &mempool, parent_resolver, work_source, last_epoch]
+                                 (const boost::system::error_code& ec) {
+                if (ec) return;
+                parent_resolver->pump();
+                uint64_t e = mempool.epoch();
+                if (e != *last_epoch) { *last_epoch = e; work_source->bump_work_generation(); }
+                if (auto self = weak_mp.lock()) (*self)();
+            });
+        };
+        (*mp_loop)();
+        // keep the loop alive for the io_context lifetime
+        static std::shared_ptr<std::function<void()>> mp_keepalive;
+        mp_keepalive = mp_loop;
+        (void)mp_ka;
+    }
+
     io::signal_set signals(ioc, SIGINT, SIGTERM);
     signals.async_wait([&ioc](const boost::system::error_code&, int) {
         LOG_INFO << "[EMB-BIP110] shutdown signal — stopping";
@@ -414,7 +692,29 @@ int main(int argc, char** argv)
     bool fork_checkpoint = false;
     std::string http_host = "0.0.0.0";
     uint16_t http_port = 0;
+    uint16_t stratum_port = 9336;  // BIP-110 Stratum port (params.hpp worker_port)
+    std::string donation_address;  // operator-provided node-owner/donation address
     std::vector<NetService> explicit_peers;
+
+    // ── REWARD SPLIT L0 (resolved config): author/dev donation percent and the
+    // node-owner fee percent read from the settings catalog defaults (mirrors
+    // main_ltc/main_dash). money.give_author_pct is a FROM_POOL_CONFIG row filled
+    // by impl/bip110/catalog_defaults.hpp (0.1%); money.node_owner_fee_pct is the
+    // LIT "0" catalog row seeded by seed_compiled_defaults. CLI flags below win. ──
+    double give_author_pct   = 0.1;   // HARD RULE: author-fee default = 0.1%
+    double node_owner_fee_pct = 0.0;  // node-owner fee default = 0
+    // M3 good-citizen mandate: include REAL network txs by default (never mine
+    // coinbase-only EMPTY blocks while the fork network has pending txs). Money
+    // path — --no-serve-mempool-txs is the canary escape hatch back to M2.
+    bool serve_mempool_txs = true;
+    {
+        namespace cs = c2pool::settings;
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(c2pool::catalog::C_BIP110);
+        c2pool::impl::bip110::register_catalog_defaults(rc);
+        give_author_pct    = rc.get_double("money.give_author_pct").value_or(give_author_pct);
+        node_owner_fee_pct = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee_pct);
+    }
 
     auto parse_hostport = [](const std::string& v, std::string& h, uint16_t& p) {
         auto c = v.rfind(':');
@@ -423,21 +723,37 @@ int main(int argc, char** argv)
     };
 
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--version") { std::printf("c2pool-bip110 %s\n", C2POOL_VERSION); return 0; }
-        if (a == "--help" || a == "-h") { print_banner(argv[0]); return 0; }
-        else if (a == "--selftest") { selftest = true; run = false; }
-        else if (a == "--run") { run = true; selftest = false; }
-        else if (a == "--coin-p2p-discover") { coin_p2p_discover = true; }
-        else if (a == "--fork-checkpoint") { fork_checkpoint = true; }
-        else if (a == "--peer" && i + 1 < argc) {
+        const std::string arg = argv[i];
+        if (arg == "--version") { std::printf("c2pool-bip110 %s\n", C2POOL_VERSION); return 0; }
+        if (arg == "--help" || arg == "-h") { print_banner(argv[0]); return 0; }
+        else if (arg == "--selftest") { selftest = true; run = false; }
+        else if (arg == "--run") { run = true; selftest = false; }
+        else if (arg == "--coin-p2p-discover") { coin_p2p_discover = true; }
+        else if (arg == "--fork-checkpoint") { fork_checkpoint = true; }
+        else if (arg == "--peer" && i + 1 < argc) {
             std::string host = "127.0.0.1"; uint16_t port = 8333;
             parse_hostport(argv[++i], host, port);
             explicit_peers.emplace_back(host, port);
         }
-        else if (a == "--http" && i + 1 < argc) {
+        else if (arg == "--http" && i + 1 < argc) {
             parse_hostport(argv[++i], http_host, http_port);
         }
+        else if (arg == "--stratum" && i + 1 < argc) {
+            stratum_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        }
+        else if (arg == "--no-stratum") { stratum_port = 0; }
+        else if ((arg == "--node-owner-address" || arg == "--donation") && i + 1 < argc) {
+            donation_address = argv[++i];
+        }
+        // Money-class CLI flags (CLI wins over the catalog L0 defaults above).
+        else if ((arg == "--give-author" || arg == "--dev-donation") && i + 1 < argc) {
+            give_author_pct = std::stod(argv[++i]);
+        }
+        else if ((arg == "--fee" || arg == "-f") && i + 1 < argc) {
+            node_owner_fee_pct = std::stod(argv[++i]);
+        }
+        else if (arg == "--serve-mempool-txs") { serve_mempool_txs = true; }
+        else if (arg == "--no-serve-mempool-txs") { serve_mempool_txs = false; }
     }
 
     if (run) {
@@ -445,7 +761,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs);
     }
 
     print_banner(argv[0]);

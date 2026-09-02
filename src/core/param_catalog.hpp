@@ -26,7 +26,8 @@ enum CoinBit : uint32_t {
     C_DGB  = 1u << 4,
     C_BCH  = 1u << 5,
     C_NMC  = 1u << 6,
-    C_ALL  = C_LTC | C_BTC | C_DOGE | C_DASH | C_DGB | C_BCH | C_NMC,
+    C_BIP110 = 1u << 7,
+    C_ALL  = C_LTC | C_BTC | C_DOGE | C_DASH | C_DGB | C_BCH | C_NMC | C_BIP110,
 };
 
 enum class Sec {
@@ -52,7 +53,7 @@ enum class Validator {
     HOSTPORT_V, PAIR_REQUIRED, ENUM_MEMBER, MIN_101_CONF,
 };
 
-enum class Bin { BIN_DASH, BIN_LTC, BIN_BTC, BIN_DGB, BIN_BCH };
+enum class Bin { BIN_DASH, BIN_LTC, BIN_BTC, BIN_DGB, BIN_BCH, BIN_BIP110 };
 
 enum class AliasStyle {
     VALUE, FLAG, FLAG_OPT_EQFALSE, FLAG_NO_PREFIX, VALUE_HOSTPORT_COMBINED,

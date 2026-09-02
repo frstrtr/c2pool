@@ -68,6 +68,27 @@ struct StratumConfig {
     // Default false: LTC/BTC/DGB behavior is byte-unchanged.
     bool require_job_snapshot{false};
 
+    // ── Raw wire prevhash (BIP-110 BLAKE2b Sv1) ──────────────────────────────
+    // BIP-110's mining.notify prevhash field is the Sia "prevblock_hidden"
+    // (32 bytes, top-6 zeroed) that the BLAKE2b profile-0 buffer consumes
+    // VERBATIM — it is NOT a Bitcoin block hash and MUST NOT be run through
+    // gbt_to_stratum_prevhash (the BE-display -> internal-LE, per-4-byte-chunk
+    // reversal). When set, the stratum server sends the work source's
+    // WorkSnapshot::gbt_prevhash on the wire exactly as produced. Everything
+    // else (extranonce strings, nonce strings, JobSnapshot) is unchanged.
+    // Default false: every other coin's prevhash is byte-identical.
+    bool raw_prevhash_wire{false};
+
+    // ── Disable BIP310 version-rolling negotiation (BIP-110 BLAKE2b Sv1) ──────
+    // BIP-110's header commits the block version INSIDE h1 (the frozen
+    // pseudo-header), so a version-rolling miner that mutates the version bits
+    // produces a header the pool never committed to — every such share is
+    // 100%-rejected (fail-closed, no money loss, but wasted hashrate). When set,
+    // mining.configure refuses the "version-rolling" extension (responds
+    // version-rolling:false) so miners never roll a version this lane cannot use.
+    // Default false: every other coin negotiates version-rolling as before.
+    bool disable_version_rolling{false};
+
     // ── Live-session hygiene (mining-hotel ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
     // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and

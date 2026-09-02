@@ -155,6 +155,7 @@ const char* bin_name(Bin b) {
         case Bin::BIN_BTC: return "btc";
         case Bin::BIN_DGB: return "dgb";
         case Bin::BIN_BCH: return "bch";
+        case Bin::BIN_BIP110: return "bip110";
     }
     return "?";
 }

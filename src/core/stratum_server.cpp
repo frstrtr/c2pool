@@ -869,6 +869,18 @@ nlohmann::json StratumSession::handle_configure(const nlohmann::json& params, co
         std::string ext_name = ext.get<std::string>();
 
         if (ext_name == "version-rolling") {
+            // BIP-110 (and any lane that commits the block version inside the
+            // frozen pseudo-header) MUST NOT let miners roll the version — a
+            // rolled version yields a header the pool never committed to and the
+            // share is 100%-rejected. Refuse the extension so miners don't waste
+            // shares (fail-closed, no money loss).
+            if (mining_interface_->get_stratum_config().disable_version_rolling) {
+                version_rolling_enabled_ = false;
+                result["version-rolling"] = false;
+                LOG_INFO << "[Stratum] Version-rolling DISABLED for this lane "
+                            "(header commits version) — declining negotiation";
+                continue;
+            }
             // Miner provides its mask and optional min-bit-count
             std::string miner_mask_hex = "ffffffff";
             if (ext_params.contains("version-rolling.mask") && ext_params["version-rolling.mask"].is_string())
@@ -1538,7 +1550,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // Populate from live block template
     {
         gbt_prevhash = tmpl.value("previousblockhash", "");
-        prevhash = gbt_to_stratum_prevhash(gbt_prevhash);
+        // BIP-110: the wire prevhash is the raw Sia prevblock_hidden; other coins
+        // apply the BE-display -> stratum-internal transform (default).
+        prevhash = mining_interface_->get_stratum_config().raw_prevhash_wire
+                       ? gbt_prevhash
+                       : gbt_to_stratum_prevhash(gbt_prevhash);
 
         version_u32 = static_cast<uint32_t>(tmpl.value("version", 0x20000000));
         std::ostringstream ss;
@@ -1638,7 +1654,9 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // Work sources that leave has_header false are byte-unchanged.
     if (cbr.snapshot.has_header) {
         gbt_prevhash = cbr.snapshot.gbt_prevhash;
-        prevhash     = gbt_to_stratum_prevhash(gbt_prevhash);
+        prevhash     = mining_interface_->get_stratum_config().raw_prevhash_wire
+                           ? gbt_prevhash
+                           : gbt_to_stratum_prevhash(gbt_prevhash);
         version_u32  = cbr.snapshot.header_version;
         {
             std::ostringstream ss;
