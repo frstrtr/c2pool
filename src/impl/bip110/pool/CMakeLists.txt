@@ -1,0 +1,43 @@
+# BIP-110 (Bitcoin Knots BLAKE2b hard fork) — M3 v36 SHARECHAIN lane, PR-A.
+#
+# The v36 (decayed-PPLNS + P2SH donation + MergedMiningShare-family) sharechain
+# lane. PR-A ships the FOUNDATION — the wire types, the ONE consensus delta
+# (Bip110SmallBlockHeaderType + BLAKE2b share-hash identity), the fresh-identity
+# constants + BTC-verbatim diff, the p2p message set, peer state, and the pure
+# donation validators — as a header lane, plus the KILLER identity KAT. PR-B
+# wires create_share_fn + pool::SharechainNode into main_bip110; the large
+# mechanical namespace-copies (share_check / share_tracker / node / protocol)
+# land in PR-A-continuation (see the PR's remaining-work map). Header-only lane:
+# nothing to compile into a library yet (matches the coin lane's blake2b note),
+# so the KAT is the compile+correctness gate.
+
+# INTERFACE target so PR-B can `target_link_libraries(... bip110_pool)` to pick up
+# the include surface + the shared/coin/sharechain deps the pool lane rides on.
+add_library(bip110_pool INTERFACE)
+target_include_directories(bip110_pool INTERFACE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bip110_pool INTERFACE core sharechain pool bip110_coin btclibs)
+
+# bip110_pool_identity_kat: proves the pool-lane header set COMPILES (forces the
+# v36 share templates to instantiate) AND that the share-hash == block-identity
+# path reproduces REAL BIP-110 block 961640's canonical hash byte-for-byte.
+# Lean, isolated link set (blake2b.c compiled directly, like the M2 KATs).
+# Lean, isolated link set (like the M2 bip110_blake2b_kat): compile only the
+# minimal core sources the identity path needs (uint256 + the lane BLAKE2b
+# primitive) rather than linking the full `core` OBJECT lib, which would drag in
+# web_server/stratum and the whole pool/payout/merged runtime. The pool-lane
+# headers (share_types/share_identity/share/config_pool) + coin/block.hpp are
+# header-only template code, so no library link is required to prove they compile.
+add_executable(bip110_pool_identity_kat
+    test/bip110_pool_identity_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+    ${CMAKE_SOURCE_DIR}/src/core/uint256.cpp
+)
+target_compile_definitions(bip110_pool_identity_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_pool_identity_kat
+    btclibs
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_pool_identity_kat COMMAND bip110_pool_identity_kat)

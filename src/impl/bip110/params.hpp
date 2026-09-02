@@ -69,18 +69,29 @@ inline constexpr const char* GBT_RULE = "blake2b";
 // INDEPENDENT transport constants (p2pool model); PREFIX is never derived from
 // IDENTIFIER. This mirrors the DASH lane's single-definition discipline (one
 // place owns the identity; the factory and PoolConfig both read it).
-inline constexpr uint16_t SHARECHAIN_P2P_PORT    = 9335;  // BIP-110 sharechain P2P port
+// M3 WIRE-GENESIS bump (operator decision card 2026-09-02, IRREVERSIBLE once a
+// share is minted): the M2 SPV-follower placeholders (9335 / SPREAD 30 /
+// CHAIN_LENGTH 5760 / MIN_PROTO 3500) are replaced by the operator-signed
+// wire-genesis constants BEFORE any share exists. Port 9337 (decision #2),
+// SHARE-DIFF BTC-verbatim (decision #3: CHAIN_LENGTH 8640, SPREAD 3), v36
+// MergedMiningShare requires protocol >= 3600 (python fork data.py:2267). The
+// PREFIX / IDENTIFIER stay as already-minted-fresh (no BTC collision). Worker
+// port 9336 keeps. Nothing is live on this sharechain yet, so a pre-genesis
+// bump is safe; after the first mint these values freeze.
+inline constexpr uint16_t SHARECHAIN_P2P_PORT    = 9337;  // BIP-110 sharechain P2P port (decision #2)
 inline constexpr uint16_t SHARECHAIN_WORKER_PORT = 9336;  // BIP-110 Stratum/worker port
 inline constexpr const char* SHARECHAIN_IDENTIFIER_HEX = "b1101100b1a4e2bd";
 inline constexpr const char* SHARECHAIN_PREFIX_HEX     = "e2bdb1101100b1a4";
-// Pool-lane tuning constants (BIP-110-native; distinct from the BTC fossil's
-// SPREAD=3 / CHAIN_LENGTH=8640 / ADVERTISED=3502 / SEGWIT_ACTIVATION=33).
-inline constexpr uint32_t SHARECHAIN_SPREAD                    = 30;
-inline constexpr uint32_t SHARECHAIN_CHAIN_LENGTH             = 5760;
+// Pool-lane tuning constants. SHARE-DIFF = BTC-verbatim (decision #3): CHAIN_LENGTH
+// 8640, SPREAD 3, SHARE_PERIOD 30s, TARGET_LOOKBEHIND 200, standard MAX_TARGET
+// floor. MIN_PROTO/ADVERTISED = 3600 (v36 MergedMiningShare floor). SEGWIT
+// activation 4 (v36 >= 4 => always segwit-active on this v36-genesis chain).
+inline constexpr uint32_t SHARECHAIN_SPREAD                    = 3;       // BTC-verbatim (decision #3)
+inline constexpr uint32_t SHARECHAIN_CHAIN_LENGTH             = 8640;    // BTC-verbatim (decision #3)
 inline constexpr uint32_t SHARECHAIN_TARGET_LOOKBEHIND        = 200;
 inline constexpr uint32_t SHARECHAIN_SHARE_PERIOD            = 30;
-inline constexpr uint32_t SHARECHAIN_MINIMUM_PROTOCOL_VERSION = 3500;
-inline constexpr uint32_t SHARECHAIN_ADVERTISED_PROTOCOL_VERSION = 3501;
+inline constexpr uint32_t SHARECHAIN_MINIMUM_PROTOCOL_VERSION = 3600;   // v36 floor (data.py:2267)
+inline constexpr uint32_t SHARECHAIN_ADVERTISED_PROTOCOL_VERSION = 3600;
 inline constexpr uint32_t SHARECHAIN_SEGWIT_ACTIVATION_VERSION = 4;
 inline constexpr uint32_t SHARECHAIN_BLOCK_MAX_SIZE          = 1000000;
 inline constexpr uint64_t SHARECHAIN_DUST_THRESHOLD          = 546;  // Bitcoin relay dust floor
