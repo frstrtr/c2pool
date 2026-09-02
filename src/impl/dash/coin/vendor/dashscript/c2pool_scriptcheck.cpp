@@ -35,11 +35,11 @@
 // and hides all DLL symbols by default, so the equivalent is __declspec(
 // dllexport) on exactly these entry points — WITHOUT it the c2pool_dash_*
 // symbols stay unexported and c2pool-dash fails to link.
-#if defined(_MSC_VER)
-#  define C2POOL_DASH_SCRIPT_EXPORT __declspec(dllexport)
-#else
-#  define C2POOL_DASH_SCRIPT_EXPORT __attribute__((visibility("default")))
-#endif
+//
+// C2POOL_DASH_SCRIPT_EXPORT is defined in c2pool_dash_export.h, included via
+// c2pool_scriptcheck.h above. Sharing it there ensures the DECLARATIONS in the
+// header and the DEFINITIONS below carry IDENTICAL linkage — MSVC emits C2375
+// otherwise (dllexport def whose decl lacked the same dllexport).
 
 namespace {
 
