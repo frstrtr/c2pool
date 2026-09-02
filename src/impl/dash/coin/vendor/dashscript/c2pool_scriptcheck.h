@@ -19,6 +19,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Export marker (dllexport on MSVC / visibility(default) on GCC-Clang). Shared
+// with c2pool_scriptcheck.cpp so the DECLARATIONS below and the DEFINITIONS
+// there carry IDENTICAL linkage — MSVC rejects a dllexport def whose decl was
+// not also dllexport (C2375). No-op on Linux (visibility default, as before).
+#include "c2pool_dash_export.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,6 +45,7 @@ enum {
 // script mismatch, out-of-range index, deserialization error, or a size
 // mismatch between the deserialized tx and `tx_to_len`. FAIL-CLOSED: the caller
 // treats 0 as "exclude this tx from the template".
+C2POOL_DASH_SCRIPT_EXPORT
 int c2pool_dash_verify_input(const unsigned char* script_pubkey, unsigned int script_pubkey_len,
                              const unsigned char* tx_to,         unsigned int tx_to_len,
                              unsigned int nIn, unsigned int flags);
@@ -49,12 +56,14 @@ int c2pool_dash_verify_input(const unsigned char* script_pubkey, unsigned int sc
 // deserialize/index error. Used ONLY by the C4 self-signing KAT to produce a
 // valid signature exercising the real interpreter path; not called on the serve
 // path.
+C2POOL_DASH_SCRIPT_EXPORT
 int c2pool_dash_legacy_sighash(const unsigned char* tx_to, unsigned int tx_to_len,
                                unsigned int nIn,
                                const unsigned char* script_code, unsigned int script_code_len,
                                int hash_type, unsigned char* out32);
 
 // KAT helper: Hash160 (RIPEMD160(SHA256(data))). Test-only.
+C2POOL_DASH_SCRIPT_EXPORT
 void c2pool_dash_hash160(const unsigned char* data, unsigned int len, unsigned char* out20);
 
 #ifdef __cplusplus
