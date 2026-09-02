@@ -35,9 +35,9 @@ The mining and reward-safe daemonless mempool-serving stack — Stratum-v1 work
 source, block assembler, and fail-closed reward-safety cross-checks
 (`coinbasevalue == subsidy + fees`, committed tx-merkle/txcount, refuse-to-serve
 on mismatch, submit-side merkle re-verify), plus the 0.1% author-donation split —
-is **in integration review (PR #1439) and not yet merged to `master`**. Until it
-lands, the live node follows the fork tip; it does not yet mine or serve
-mempool transactions.
+is on `master` (merged via #1439). The live node at `bip110.voidbind.com` serves
+the fork mempool and accepts Stratum miners at `stratum+tcp://bip110.voidbind.com:9336`,
+behind a full coin-generic dashboard.
 
 The value of this lane is strategic, not revenue: BIP-110 is a minority fork
 whose coin is effectively unlisted (block reward ≈ 0 in fiat), and mining a demo
@@ -761,7 +761,7 @@ cd build && ctest --output-on-failure -j$(nproc)
 | Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
 | Embedded LTC SPV node | Working |
 | Embedded DOGE SPV node | Working |
-| Embedded BIP-110 SPV node (BLAKE2b fork-follow) | Experimental (live on bip110.voidbind.com; mining/serving in review, PR #1439) |
+| Embedded BIP-110 daemonless pool (BLAKE2b fork) | Experimental (live on bip110.voidbind.com; fork-follow + Stratum mining + reward-safe mempool-serving on `master` #1439) |
 | Coin daemon RPC/P2P | Hardened |
 | Stratum mining server | Working |
 | VARDIFF | Working |
