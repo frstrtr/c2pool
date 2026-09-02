@@ -39,6 +39,34 @@ namespace bip110::coin { class HeaderChain; class Mempool; }
 
 namespace bip110::stratum {
 
+// Extract the coinbase scriptSig from a serialized (non-witness) coinbase tx.
+// The share's m_coinbase field is the coinbase *scriptSig* (share_init_verify
+// bounds it to 2..100 bytes), NOT the whole coinbase transaction — so the M3
+// mint path (main_bip110.cpp create_share_fn) slices it here before calling
+// bip110::pool::create_local_share. Per-coin copy of the btc/dgb helper
+// (btc/stratum/work_source.hpp:75) per the coin-isolation invariant; fail-closed
+// (returns {} on any truncation/overrun -> the mint declines on size<2).
+inline std::vector<unsigned char>
+extract_coinbase_scriptsig(const std::vector<unsigned char>& coinbase_tx) {
+    constexpr size_t kScriptOffset = 4 + 1 + 32 + 4;  // version|marker?|prevout(null)|index = 41
+    if (coinbase_tx.size() < kScriptOffset + 1)
+        return {};
+    size_t off = kScriptOffset;
+    uint64_t len = coinbase_tx[off++];
+    if (len == 0xfd) {
+        if (off + 2 > coinbase_tx.size()) return {};
+        len = static_cast<uint64_t>(coinbase_tx[off])
+            | (static_cast<uint64_t>(coinbase_tx[off + 1]) << 8);
+        off += 2;
+    } else if (len >= 0xfe) {
+        return {};  // implausible for a consensus-capped (<=100B) coinbase scriptSig
+    }
+    if (off + len > coinbase_tx.size())
+        return {};
+    return std::vector<unsigned char>(coinbase_tx.begin() + off,
+                                      coinbase_tx.begin() + off + len);
+}
+
 class Bip110WorkSource : public core::stratum::IWorkSource
 {
 public:
@@ -51,10 +79,16 @@ public:
     // Sharechain WRITE seam (M3). Called when a share meets sharechain (not
     // block) target. Left unset in M2 => shares are validated + counted but not
     // minted into a p2pool sharechain. Returns the share hash or uint256::ZERO.
+    // PR-B (M3): the 4th arg is the miner payout_script derived in mining_submit
+    // from the authorized username (core::address_to_script, donation fallback).
+    // create_local_share REQUIRES it to build the share's PPLNS payout identity;
+    // BTC's CreateShareFn is likewise 4-arg (main_btc.cpp:2219). Left unset in
+    // M2 (default OFF) => shares are validated + counted but not minted.
     using CreateShareFn = std::function<uint256(
         const std::vector<unsigned char>& full_coinbase,
         const std::vector<unsigned char>& header_164b,
-        const core::stratum::JobSnapshot&  job)>;
+        const core::stratum::JobSnapshot&  job,
+        const std::vector<unsigned char>& payout_script)>;
 
     Bip110WorkSource(bip110::coin::HeaderChain& chain,
                      bool is_testnet,

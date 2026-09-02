@@ -14,6 +14,7 @@
 #include <core/coin/utxo.hpp>             // Coin / Outpoint / money_range (GAP2/3/5)
 
 #include <core/target_utils.hpp>
+#include <core/address_utils.hpp>          // M3 mint: username -> payout_script
 #include <core/log.hpp>
 
 #include <algorithm>
@@ -704,11 +705,33 @@ nlohmann::json Bip110WorkSource::mining_submit(
         bool sunk = submit_block_fn_ ? submit_block_fn_(block, f.height) : false;
         if (!sunk)
             LOG_ERROR << "[BIP110-WS] won block reached NO network sink (height=" << f.height << ")";
+
+        // GAP B (M3): a WON block is also a share — mint it into the sharechain
+        // after the block is dispatched (never behind the tracker lock; block
+        // relay must not wait on the mint), mirroring btc write_solved_share on
+        // the won-block arm. Unset in M2 (default OFF) => byte-identical to today.
+        // Uses the NON-witness coinbase (the txid/hash-link basis), NOT the
+        // BIP144 witness coinbase_block reassembled above.
+        if (create_share_fn_) {
+            std::vector<unsigned char> mint_cb;
+            {
+                std::lock_guard<std::mutex> lk(freeze_mutex_);
+                auto it = freeze_map_.find(to_hex(f.h2));
+                if (it != freeze_map_.end()) mint_cb = it->second.coinbase;
+            }
+            std::vector<unsigned char> payout_script = core::address_to_script(username);
+            if (payout_script.empty()) payout_script = donation_script_;
+            create_share_fn_(mint_cb, hdr, *job, payout_script);
+        }
         return nlohmann::json(true);
     }
 
     // SHARE ARM (M3 seam): p2pool sharechain write. Unset in M2 -> validated +
-    // counted by the core, no mint.
+    // counted by the core, no mint. When set (main_bip110 --bip110-sharechain),
+    // the callback mints via bip110::pool::create_local_share. The payout_script
+    // is derived here from the authorized username (the miner's own address),
+    // falling back to the node-owner/donation script — the same identity the
+    // coinbase pays — so the minted share's PPLNS payout is consistent.
     if (create_share_fn_) {
         std::vector<unsigned char> coinbase;
         {
@@ -716,7 +739,9 @@ nlohmann::json Bip110WorkSource::mining_submit(
             auto it = freeze_map_.find(to_hex(f.h2));
             if (it != freeze_map_.end()) coinbase = it->second.coinbase;
         }
-        create_share_fn_(coinbase, hdr, *job);
+        std::vector<unsigned char> payout_script = core::address_to_script(username);
+        if (payout_script.empty()) payout_script = donation_script_;
+        create_share_fn_(coinbase, hdr, *job, payout_script);
     }
     return nlohmann::json(true);
 }

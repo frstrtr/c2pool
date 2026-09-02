@@ -389,6 +389,14 @@ target_link_libraries(c2pool-dash
 add_executable(c2pool-bip110
     main_bip110.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/stratum/work_source.cpp
+    # M3 sharechain MINT lane (behind --bip110-sharechain; default OFF): the
+    # namespace-copied sharechain node + single-protocol v36-genesis bridge +
+    # c2pool protocol handler. main_bip110 references bip110::pool::Node (ctor,
+    # listen, broadcast_share, notify_local_share, register_template_txs,
+    # start_outbound_connections) which are DEFINED in these TUs — same set the
+    # bip110_pool_node_compile KAT links. Dormant unless the flag is passed.
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/pool/node.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/pool/protocol_actual.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
 )
 c2pool_wire_version(c2pool-bip110)
@@ -410,6 +418,8 @@ target_link_libraries(c2pool-bip110
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
 )
 
 # Dashboard assets: the shared coin-generic WebServer serves the web-static/

@@ -26,6 +26,11 @@
 #include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
 #include <impl/bip110/stratum/work_source.hpp>
 
+// ── M3 sharechain MINT lane (behind --bip110-sharechain; default OFF) ────────
+#include <impl/bip110/pool/node.hpp>               // bip110::pool::Node / Config
+#include <impl/bip110/pool/config_pool.hpp>        // PoolConfig SSOT (P2P_PORT 9337, STALE_SHARES)
+#include <impl/bip110/pool/share_check.hpp>        // bip110::pool::create_local_share (MINT)
+
 #include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
 #include <core/coin/utxo_view_cache.hpp>
 #include <core/pack.hpp>
@@ -100,7 +105,12 @@ void print_banner(const char* argv0)
         "  --http [HOST:]PORT   serve the shared coin-generic dashboard (HTML at\n"
         "                       \"/\", JSON /node_info for health probes)\n"
         "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
-        "                       miner has no resolvable payout address (base58/bech32)\n\n"
+        "                       miner has no resolvable payout address (base58/bech32)\n"
+        "  --bip110-sharechain  ARM the M3 v36 sharechain MINT (DEFAULT OFF): start\n"
+        "                       the sharechain node on :9337, mint local shares, and\n"
+        "                       dial the fresh federation sharechain. IRREVERSIBLE\n"
+        "                       first-outbound — gated by the operator wire-genesis\n"
+        "                       params-freeze checkpoint. Absent => M2 header-follower.\n\n"
         "PoW: BLAKE2b commitment pipeline (bip110::pow); block hash == PoW hash.\n"
         "Fork: Blake2bHeight=%u; RDTS weight cap=%u WU; network==Bitcoin mainnet\n"
         "      (magic f9beb4d9, default port %u).\n",
@@ -178,7 +188,8 @@ int run_embedded(bool coin_p2p_discover,
                  const std::string& donation_address,
                  double give_author_pct,
                  double node_owner_fee_pct,
-                 bool serve_mempool_txs)
+                 bool serve_mempool_txs,
+                 bool sharechain_enabled)
 {
     core::log::Logger::init();
 
@@ -311,6 +322,184 @@ int run_embedded(bool coin_p2p_discover,
              << give_author_ppm << " ppm) node-owner-fee=" << node_owner_fee_pct << "% ("
              << node_owner_fee_ppm << " ppm) — integer floor split, miner absorbs remainder"
              << (node_owner_fee_ppm > 0 ? "; owner+donation consolidated (single key)" : "");
+
+    // ── M3 SHARECHAIN MINT (behind --bip110-sharechain; DEFAULT OFF) ─────────
+    // With the flag OFF this block is skipped ENTIRELY: no bip110::pool::Node is
+    // constructed, no :9337 listen, set_create_share_fn is never called (so
+    // work_source's create_share_fn_ stays null and mining_submit's share arm is
+    // a no-op — byte-identical to the M2 header-follower), and the IRREVERSIBLE
+    // first-outbound to the fresh federation sharechain never runs. The C++ v36
+    // wiring precedent is main_btc.cpp (node ctor + set_create_share_fn +
+    // start_outbound_connections). Lifetime: sharechain_cfg + sharechain_node are
+    // declared at run_embedded scope so they outlive work_source, the stratum
+    // server, and ioc.run() (the lambda captures the raw node pointer; the
+    // io_context drives its peers). WIRE-GENESIS FREEZE: params live in
+    // params.hpp / config_pool.hpp (9337 / 8640 / SPREAD 3 / proto 3600 /
+    // donation u16 66) — DO NOT change them here and DO NOT default the flag ON;
+    // the operator performs the explicit params-freeze checkpoint before enabling
+    // it in production.
+    std::unique_ptr<bip110::pool::Config> sharechain_cfg;
+    std::unique_ptr<bip110::pool::Node>   sharechain_node;
+    if (sharechain_enabled) {
+        sharechain_cfg  = std::make_unique<bip110::pool::Config>();          // (1) lifetime >= node
+        sharechain_node = std::make_unique<bip110::pool::Node>(&ioc, sharechain_cfg.get());
+        auto* node_raw  = sharechain_node.get();
+
+        node_raw->set_target_outbound_peers(
+            explicit_peers.empty() ? 4 : std::max<size_t>(1, explicit_peers.size()));
+        node_raw->set_seed_escalation_enabled(false);                        // (4) federation/fresh — fail-safe
+        node_raw->core::Server::listen(bip110::pool::PoolConfig::P2P_PORT);   // 9337
+
+        // (2) MINT on the stratum submit path. Mirrors main_btc.cpp:2215-2411,
+        // adapted to bip110 (164B v2 header; BLAKE2b compute_share_hash inside
+        // create_local_share). Drops the EXCLUSIVE tracker lock BEFORE broadcast.
+        work_source->set_create_share_fn(
+            [node_raw](const std::vector<unsigned char>& full_coinbase,
+                       const std::vector<unsigned char>& header_164b,
+                       const core::stratum::JobSnapshot&  job,
+                       const std::vector<unsigned char>& payout_script) -> uint256
+            {
+                if (!node_raw || header_164b.size() != 164) return uint256::ZERO;
+
+                // Parse the 164B v2 header into a full coin::BlockHeaderType.
+                bip110::coin::BlockHeaderType full_hdr;
+                try {
+                    PackStream ps(std::vector<std::byte>(
+                        reinterpret_cast<const std::byte*>(header_164b.data()),
+                        reinterpret_cast<const std::byte*>(header_164b.data()) + 164));
+                    ps >> full_hdr;
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[BIP110-CREATE-SHARE] header parse failed: " << e.what();
+                    return uint256::ZERO;
+                }
+
+                // Coinbase scriptSig (share.m_coinbase is the scriptSig, 2..100B).
+                BaseScript coinbase_bs(
+                    bip110::stratum::extract_coinbase_scriptsig(full_coinbase));
+
+                // Stratum merkle branches: hex of LE-internal bytes (ParseHex+memcpy,
+                // NOT SetHex — SetHex would reverse and break the miner's root).
+                std::vector<uint256> merkle_branches;
+                merkle_branches.reserve(job.merkle_branches.size());
+                for (const auto& bhex : job.merkle_branches) {
+                    uint256 b;
+                    auto bb = ParseHex(bhex);
+                    if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
+                    merkle_branches.push_back(b);
+                }
+
+                // EXCLUSIVE tracker lock (try, non-blocking) — decline if the
+                // compute thread is mid-think, exactly like btc.
+                std::unique_lock<std::shared_mutex> lk(
+                    node_raw->tracker_mutex(), std::try_to_lock);
+                if (!lk.owns_lock()) {
+                    LOG_INFO << "[BIP110-CREATE-SHARE] tracker busy — share deferred";
+                    return uint256::ZERO;
+                }
+
+                // (5) Caller-side mint-freshness gate — PoolConfig::STALE_SHARES
+                // (=30). Refuse to extend a stale verified tip (a private low-diff
+                // fork peers would reject). Genesis / unknown prev is exempt so the
+                // first shares can still form. BTC C1 precedent (main_btc.cpp:2287).
+                {
+                    auto& tk = node_raw->tracker();
+                    int32_t raw_h = -1;
+                    for (const auto& [hh, th] : tk.chain.get_heads()) {
+                        (void)th;
+                        auto h = tk.chain.get_height(hh);
+                        if (h > raw_h) raw_h = h;
+                    }
+                    int32_t v_h = (!job.prev_share_hash.IsNull()
+                                   && tk.chain.contains(job.prev_share_hash))
+                        ? tk.chain.get_height(job.prev_share_hash) : -1;
+                    if (raw_h >= 0 && v_h >= 0 &&
+                        (raw_h - v_h) > (int32_t)bip110::pool::PoolConfig::STALE_SHARES) {
+                        static int stale_log = 0;
+                        if (stale_log++ % 20 == 0)
+                            LOG_WARNING << "[BIP110-CREATE-SHARE] refused: verified tip stale"
+                                        << " (v_h=" << v_h << " raw_h=" << raw_h
+                                        << " gap=" << (raw_h - v_h) << " > "
+                                        << bip110::pool::PoolConfig::STALE_SHARES << ")";
+                        return uint256::ZERO;
+                    }
+                }
+
+                uint256 share_hash;
+                try {
+                    // NOTE (PR-C gap): bip110 M2 build_connection_coinbase does not
+                    // yet freeze the sharechain ref fields into JobSnapshot
+                    // (frozen_ref/prev_share_hash are default), so has_frozen=false
+                    // — create_local_share derives absheight/abswork/target from the
+                    // tracker. The abswork %2^64 wrap (NIT-2) is already applied at
+                    // all three sites inside create_local_share.
+                    share_hash = bip110::pool::create_local_share(
+                        node_raw->tracker(),
+                        full_hdr,
+                        coinbase_bs,
+                        /* subsidy */               job.subsidy,
+                        /* prev_share */            job.prev_share_hash,
+                        merkle_branches,
+                        payout_script,
+                        /* donation */              66,   // WIRE-GENESIS FREEZE (0.1%)
+                        /* merged_addrs */          {},   // no merged mining on bip110
+                        /* stale_info */            bip110::pool::StaleInfo::none,
+                        /* segwit_active */         job.segwit_active,
+                        /* witness_commitment */    job.witness_commitment_hex,
+                        /* message_data */          {},
+                        /* actual_coinbase_bytes */ full_coinbase,
+                        /* witness_root */          job.witness_root,
+                        /* override_max_bits */     job.frozen_ref.max_bits,
+                        /* override_bits */         job.frozen_ref.bits,
+                        /* frozen_absheight */      job.frozen_ref.absheight,
+                        /* frozen_abswork */        job.frozen_ref.abswork,
+                        /* frozen_far_share_hash */ job.frozen_ref.far_share_hash,
+                        /* frozen_timestamp */      job.frozen_ref.timestamp,
+                        /* frozen_merged_payout */  job.frozen_ref.merged_payout_hash,
+                        /* has_frozen */            false,
+                        /* frozen_merkle_branches*/ job.frozen_ref.frozen_merkle_branches,
+                        /* frozen_witness_root */   job.frozen_ref.frozen_witness_root,
+                        /* frozen_merged_cb_info */ job.frozen_ref.frozen_merged_coinbase_info,
+                        /* share_version */         36,
+                        /* desired_version */       36);
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[BIP110-CREATE-SHARE] threw: " << e.what();
+                    return uint256::ZERO;
+                }
+
+                // Drop the EXCLUSIVE lock BEFORE broadcast (lock-discipline
+                // invariant — a held-lock broadcast is the serve-dead/deadlock
+                // class; broadcast_share/notify_local_share take their own locks).
+                lk.unlock();
+
+                if (!share_hash.IsNull()) {
+                    // (3) F3: hand the template tx set to the node BEFORE broadcast
+                    // so the share is backable ([{"data": <raw-tx-hex>}, ...]).
+                    nlohmann::json tmpl_txs = nlohmann::json::array();
+                    if (job.tx_data)
+                        for (const auto& tx_hex : *job.tx_data)
+                            tmpl_txs.push_back(nlohmann::json::object({{"data", tx_hex}}));
+                    node_raw->register_template_txs(share_hash, tmpl_txs);
+
+                    node_raw->broadcast_share(share_hash);
+                    node_raw->notify_local_share(share_hash);
+                    LOG_INFO << "[BIP110-CREATE-SHARE] OK + broadcast: hash="
+                             << share_hash.GetHex().substr(0, 16);
+                }
+                return share_hash;
+            });
+
+        // (6) IRREVERSIBLE first-outbound to the fresh federation sharechain.
+        // Stays INSIDE the flag-ON block so it never runs by default.
+        node_raw->start_outbound_connections();
+        LOG_INFO << "[EMB-BIP110] M3 sharechain MINT wired + node LIVE on :"
+                 << bip110::pool::PoolConfig::P2P_PORT
+                 << " (--bip110-sharechain; prefix=" << bip110::pool::PoolConfig::prefix_hex()
+                 << " proto=" << bip110::pool::PoolConfig::ADVERTISED_PROTOCOL_VERSION
+                 << " share=v36) — outbound dialing started";
+    } else {
+        LOG_INFO << "[EMB-BIP110] M3 sharechain DISABLED (M2 header-follower; pass "
+                    "--bip110-sharechain to arm the mint) — nothing minted, no sharechain node";
+    }
 
     std::unique_ptr<core::StratumServer> stratum_server;
     if (stratum_port != 0) {
@@ -851,6 +1040,10 @@ int main(int argc, char** argv)
     // coinbase-only EMPTY blocks while the fork network has pending txs). Money
     // path — --no-serve-mempool-txs is the canary escape hatch back to M2.
     bool serve_mempool_txs = true;
+    // ── M3 SHARECHAIN MINT arm (DEFAULT OFF). The mint/sharechain node only
+    // starts with --bip110-sharechain; absent, the binary is the M2 header-
+    // follower byte-for-byte. IRREVERSIBLE first-outbound is behind this flag. ──
+    bool sharechain_enabled = false;
     {
         namespace cs = c2pool::settings;
         cs::ResolvedConfig rc;
@@ -911,6 +1104,7 @@ int main(int argc, char** argv)
         }
         else if (arg == "--serve-mempool-txs") { serve_mempool_txs = true; }
         else if (arg == "--no-serve-mempool-txs") { serve_mempool_txs = false; }
+        else if (arg == "--bip110-sharechain") { sharechain_enabled = true; }
     }
 
     if (run) {
@@ -918,7 +1112,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs, sharechain_enabled);
     }
 
     print_banner(argv[0]);

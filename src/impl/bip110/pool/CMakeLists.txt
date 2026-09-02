@@ -117,3 +117,37 @@ target_link_libraries(bip110_pool_node_compile
     Threads::Threads
 )
 add_test(NAME bip110_pool_node_compile COMMAND bip110_pool_node_compile)
+
+# bip110_pool_mint_kat: the END-TO-END MINT known-answer test (PR-B). Unlike the
+# node_compile KAT (which only takes create_local_share's address), this RUNS the
+# mint against a ShareTracker, pulls the minted share back out, and asserts field
+# round-trip (donation=66, abswork %2^64 wrap, segwit none-sentinel 2^256-1,
+# coinbase last_txout_nonce) AND mint/verify BLAKE2b hash symmetry
+# (compute_share_hash on the minted small-header reproduces the stored share hash).
+# Same heavy shared/core/pool/sharechain/storage link closure as
+# bip110_pool_sharechain_compile (the mint reaches the whole verify surface +
+# BLAKE2b via share_identity.hpp -> pow.hpp). blake2b.c compiled directly.
+add_executable(bip110_pool_mint_kat
+    test/bip110_pool_mint_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_pool_mint_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_pool_mint_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_pool_mint_kat COMMAND bip110_pool_mint_kat)
