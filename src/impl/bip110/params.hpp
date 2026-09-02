@@ -53,6 +53,36 @@ inline constexpr const char* GENESIS_HASH =
 // (the RPC rejects the request otherwise); the response reports "!blake2b".
 inline constexpr const char* GBT_RULE = "blake2b";
 
+// --- Sharechain (pool-P2P) identity — SINGLE SOURCE OF TRUTH ------------------
+// These namespace-level constants are the ONE place BIP-110's c2pool sharechain
+// identity and pool-lane parameters are defined. BOTH make_coin_params() (below)
+// and config_pool.hpp's PoolConfig reference them, so the sharechain identity can
+// never drift between the two. Every value is BIP-110-native and distinct from
+// every other lane (BTC = 9333 / fc70035c7a81bc6f / 2472ef181efcd37b) so no
+// cross-lane sharechain handshake can succeed. IDENTIFIER and PREFIX are TWO
+// INDEPENDENT transport constants (p2pool model); PREFIX is never derived from
+// IDENTIFIER. This mirrors the DASH lane's single-definition discipline (one
+// place owns the identity; the factory and PoolConfig both read it).
+inline constexpr uint16_t SHARECHAIN_P2P_PORT    = 9335;  // BIP-110 sharechain P2P port
+inline constexpr uint16_t SHARECHAIN_WORKER_PORT = 9336;  // BIP-110 Stratum/worker port
+inline constexpr const char* SHARECHAIN_IDENTIFIER_HEX = "b1101100b1a4e2bd";
+inline constexpr const char* SHARECHAIN_PREFIX_HEX     = "e2bdb1101100b1a4";
+// Pool-lane tuning constants (BIP-110-native; distinct from the BTC fossil's
+// SPREAD=3 / CHAIN_LENGTH=8640 / ADVERTISED=3502 / SEGWIT_ACTIVATION=33).
+inline constexpr uint32_t SHARECHAIN_SPREAD                    = 30;
+inline constexpr uint32_t SHARECHAIN_CHAIN_LENGTH             = 5760;
+inline constexpr uint32_t SHARECHAIN_TARGET_LOOKBEHIND        = 200;
+inline constexpr uint32_t SHARECHAIN_SHARE_PERIOD            = 30;
+inline constexpr uint32_t SHARECHAIN_MINIMUM_PROTOCOL_VERSION = 3500;
+inline constexpr uint32_t SHARECHAIN_ADVERTISED_PROTOCOL_VERSION = 3501;
+inline constexpr uint32_t SHARECHAIN_SEGWIT_ACTIVATION_VERSION = 4;
+inline constexpr uint32_t SHARECHAIN_BLOCK_MAX_SIZE          = 1000000;
+inline constexpr uint64_t SHARECHAIN_DUST_THRESHOLD          = 546;  // Bitcoin relay dust floor
+// Share difficulty floor (easiest allowed share PoW) == Bitcoin powLimit; BIP-110
+// leaves CheckProofOfWorkImpl untouched, so the share floor sits at that limit.
+inline constexpr const char* SHARECHAIN_MAX_TARGET_HEX =
+    "00000000ffff0000000000000000000000000000000000000000000000000000";
+
 // Standard Bitcoin subsidy: 50 BTC, halving every 210000 blocks. Unchanged by
 // BIP-110 (coinbasevalue at the 961640 era = 3.125 BTC + fees).
 inline uint64_t subsidy(uint32_t height)
@@ -89,44 +119,44 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.subsidy_func = [](uint32_t height) -> uint64_t { return bip110::subsidy(height); };
 
     // Dust: Bitcoin relay-policy dust floor (546 sat for a P2PKH output).
-    p.dust_threshold = 546;
+    p.dust_threshold = SHARECHAIN_DUST_THRESHOLD;
 
     // Softforks / segwit — segwit stays active on the BIP-110 chain.
     p.softforks_required = {"segwit", "blake2b"};  // GBT must request "blake2b"
-    p.segwit_activation_version = 4;
+    p.segwit_activation_version = SHARECHAIN_SEGWIT_ACTIVATION_VERSION;
 
     // Block-size rule: RDTS reduced-data weight cap while active (until the
     // 2027-09-01 MTP gate); the classic 1 MB base-size is unchanged.
-    p.block_max_size   = 1000000;
+    p.block_max_size   = SHARECHAIN_BLOCK_MAX_SIZE;
     p.block_max_weight = RDTS_MAX_BLOCK_WEIGHT;  // 800000 WU (vs Bitcoin 4,000,000)
 
     // ===== Pool-level (net) — c2pool sharechain identity =====
     // BIP-110 is a NEW sharechain, distinct from the BTC lane. p2p/worker ports
     // and identifier/prefix are BIP-110-native so the sharechain can never merge
     // with the BTC p2pool sharechain (which uses 9333 / fc70035c7a81bc6f).
-    p.p2p_port    = 9335;  // BIP-110 p2pool sharechain P2P port
-    p.worker_port = 9336;  // BIP-110 Stratum port
+    p.p2p_port    = SHARECHAIN_P2P_PORT;     // BIP-110 p2pool sharechain P2P port
+    p.worker_port = SHARECHAIN_WORKER_PORT;  // BIP-110 Stratum port
 
-    p.share_period      = 30;
-    p.chain_length      = 5760;
-    p.real_chain_length = 5760;
-    p.target_lookbehind = 200;
-    p.spread            = 30;
-    p.minimum_protocol_version    = 3500;
-    p.advertised_protocol_version = 3501;
+    p.share_period      = SHARECHAIN_SHARE_PERIOD;
+    p.chain_length      = SHARECHAIN_CHAIN_LENGTH;
+    p.real_chain_length = SHARECHAIN_CHAIN_LENGTH;
+    p.target_lookbehind = SHARECHAIN_TARGET_LOOKBEHIND;
+    p.spread            = SHARECHAIN_SPREAD;
+    p.minimum_protocol_version    = SHARECHAIN_MINIMUM_PROTOCOL_VERSION;
+    p.advertised_protocol_version = SHARECHAIN_ADVERTISED_PROTOCOL_VERSION;
 
     // Max target (easiest share difficulty). Bitcoin powLimit
     // 00000000ffff0000... is unchanged by BIP-110 (CheckProofOfWorkImpl is
     // untouched); the share floor sits at that limit.
-    p.max_target = uint256S("00000000ffff0000000000000000000000000000000000000000000000000000");
+    p.max_target = uint256S(SHARECHAIN_MAX_TARGET_HEX);
 
     // Sharechain network identification — BIP-110-native 8-byte values, chosen
     // distinct from every other lane so no cross-lane sharechain handshake can
     // succeed. (Independent transport constants; prefix is not derived from id.)
-    p.identifier_hex         = "b1101100b1a4e2bd";
-    p.prefix_hex             = "e2bdb1101100b1a4";
-    p.testnet_identifier_hex = "b1101100b1a4e2bd";
-    p.testnet_prefix_hex     = "e2bdb1101100b1a4";
+    p.identifier_hex         = SHARECHAIN_IDENTIFIER_HEX;
+    p.prefix_hex             = SHARECHAIN_PREFIX_HEX;
+    p.testnet_identifier_hex = SHARECHAIN_IDENTIFIER_HEX;
+    p.testnet_prefix_hex     = SHARECHAIN_PREFIX_HEX;
 
     // Bootstrap peers — populated as BIP-110 c2pool nodes come online.
     p.bootstrap_addrs = {};
