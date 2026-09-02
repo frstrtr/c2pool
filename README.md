@@ -51,6 +51,8 @@ public pools that run with no coin daemon on the serve path:
 `btc.voidbind.com`, `bch.voidbind.com`, `dgb.voidbind.com`, `dash.voidbind.com`,
 and `bip110.voidbind.com`.
 
+Mining (experimental, live): point a BLAKE2b (Sia-algorithm) miner at `stratum+tcp://bip110.voidbind.com:9336` with username `<BIP-110-address>.<worker>` and any password. Daemonless standalone node on the BLAKE2b fork; block reward is effectively zero today (coin unlisted) — a decentralized-pool proof, not a revenue venue.
+
 ## Governance
 
 Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
