@@ -388,6 +388,7 @@ target_link_libraries(c2pool-dash
 # (164-byte template assembly / Knots-GBT backend) is M2+, untouched here.
 add_executable(c2pool-bip110
     main_bip110.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/stratum/work_source.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
 )
 c2pool_wire_version(c2pool-bip110)
@@ -428,6 +429,27 @@ target_link_libraries(bip110_blake2b_kat
     ${Boost_LIBRARIES}
 )
 add_test(NAME bip110_blake2b_kat COMMAND bip110_blake2b_kat)
+
+# bip110_m2_workshape_kat: the KILLER KAT for BIP-110 M2 mining.
+#   (A) the Stratum-v1 BLAKE2b work-shape (pseudoheader.hpp SSOT) reproduces the
+#       CANONICAL block hash of live fork block 961640 via the 80-byte profile-0
+#       buffer (wire coinb1 h2 + extranonce); (B) a coinbase-only job is built,
+#       CPU-ground to a trivial local target, submitted, and the reassembled
+#       164-byte v2 header || varint || coinbase re-hashes to the SAME PoW ==
+#       byte-exact serialization (the submit-roundtrip proof; R2 nonce split +
+#       R10 zero-flags pinned). Same lean, isolated link set as the M1 KAT.
+add_executable(bip110_m2_workshape_kat
+    bip110_m2_workshape_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+    ${CMAKE_SOURCE_DIR}/src/core/uint256.cpp
+)
+target_compile_definitions(bip110_m2_workshape_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_m2_workshape_kat
+    btclibs
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME bip110_m2_workshape_kat COMMAND bip110_m2_workshape_kat)
 
 # KAT: pre-anchor header-backfill PARALLEL GETHEADERS WINDOW (extends #1263 /
 # task #151; base PR #1278). Drives the real BulkFetchLane header lane against a
