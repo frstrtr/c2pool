@@ -16,6 +16,7 @@
 #include <impl/bip110/params.hpp>
 #include <impl/bip110/pow.hpp>
 #include <impl/bip110/coin/header_chain.hpp>
+#include <impl/bip110/coin/template_builder.hpp>  // get_block_subsidy (dashboard block-value projection)
 #include <impl/bip110/coin/node.hpp>
 #include <impl/bip110/coin/node_interface.hpp>
 #include <impl/bip110/coin/coin_peer_manager.hpp>
@@ -35,6 +36,8 @@
 #include <core/address_utils.hpp>
 #include <core/netaddress.hpp>
 #include <core/stratum_server.hpp>
+#include <core/web_server.hpp>              // shared coin-generic dashboard + /node_info
+#include <core/filesystem.hpp>             // config_path() for graph_db stats persistence
 #include <core/log.hpp>
 #include <core/param_catalog.hpp>           // M0b catalog: C_BIP110 / BIN_BIP110
 #include <core/settings_file.hpp>           // M0b resolved-config (give_author / fee L0)
@@ -94,7 +97,8 @@ void print_banner(const char* argv0)
         "  --coin-p2p-discover  discover NODE_BLAKE2B fork peers (DNS + fixed seeds)\n"
         "  --peer IP:PORT       add an explicit fork peer (repeatable)\n"
         "  --fork-checkpoint    seed the Knots 961640 checkpoint for a fast proof\n"
-        "  --http [HOST:]PORT   serve a JSON sync-status endpoint\n"
+        "  --http [HOST:]PORT   serve the shared coin-generic dashboard (HTML at\n"
+        "                       \"/\", JSON /node_info for health probes)\n"
         "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
         "                       miner has no resolvable payout address (base58/bech32)\n\n"
         "PoW: BLAKE2b commitment pipeline (bip110::pow); block hash == PoW hash.\n"
@@ -159,57 +163,12 @@ struct MiniConfig {
     MiniCoinCfg* coin() { return &m_coin; }
 };
 
-// ── Minimal JSON status HTTP endpoint (live-proof surface) ───────────────────
-// Serves one JSON body describing the header tip on any request, then closes.
-class StatusHttp : public std::enable_shared_from_this<StatusHttp> {
-public:
-    StatusHttp(io::io_context& ioc, const std::string& host, uint16_t port,
-               bip110::coin::HeaderChain& chain, uint32_t fork_height)
-        : m_acceptor(ioc), m_chain(chain), m_fork_height(fork_height)
-    {
-        io::ip::tcp::endpoint ep(io::ip::make_address(host), port);
-        m_acceptor.open(ep.protocol());
-        m_acceptor.set_option(io::socket_base::reuse_address(true));
-        m_acceptor.bind(ep);
-        m_acceptor.listen();
-    }
-    void start() { do_accept(); }
-private:
-    void do_accept() {
-        auto self = shared_from_this();
-        m_acceptor.async_accept([self](const boost::system::error_code& ec, io::ip::tcp::socket sock) {
-            if (!ec) self->serve(std::move(sock));
-            self->do_accept();
-        });
-    }
-    void serve(io::ip::tcp::socket sock) {
-        auto s = std::make_shared<io::ip::tcp::socket>(std::move(sock));
-        auto buf = std::make_shared<std::array<char, 1024>>();
-        s->async_read_some(io::buffer(*buf), [this, s, buf](const boost::system::error_code&, std::size_t) {
-            auto tip = m_chain.tip();
-            const uint32_t h = m_chain.height();
-            const std::string hash = tip ? tip->block_hash.GetHex() : std::string("null");
-            const uint32_t peer_tip = m_chain.peer_tip_height();
-            char body[512];
-            std::snprintf(body, sizeof(body),
-                "{\"coin\":\"BIP110\",\"header_height\":%u,\"header_tip\":\"%s\","
-                "\"peer_tip\":%u,\"blake2b_height\":%u,\"on_blake2b_chain\":%s}\n",
-                h, hash.c_str(), peer_tip, m_fork_height,
-                (h >= m_fork_height ? "true" : "false"));
-            auto resp = std::make_shared<std::string>();
-            *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                    "Connection: close\r\nContent-Length: " + std::to_string(std::strlen(body)) +
-                    "\r\n\r\n" + std::string(body);
-            io::async_write(*s, io::buffer(*resp),
-                [s, resp](const boost::system::error_code&, std::size_t) {
-                    boost::system::error_code ig; s->shutdown(io::ip::tcp::socket::shutdown_both, ig);
-                });
-        });
-    }
-    io::ip::tcp::acceptor m_acceptor;
-    bip110::coin::HeaderChain& m_chain;
-    uint32_t m_fork_height;
-};
+// The old bespoke StatusHttp JSON-on-every-path endpoint has been replaced by
+// the shared coin-generic core::WebServer dashboard (see run_embedded --http):
+// the WebServer serves the version-coupled web-static frontend at "/" and keeps
+// the /node_info JSON (routed BEFORE static files in http_session.cpp). The
+// header_height/blake2b_height/on_blake2b_chain fields the old endpoint carried
+// now ride /api/node_topology (node_topology_fn) + /broadcaster_status.
 
 int run_embedded(bool coin_p2p_discover,
                  const std::vector<NetService>& explicit_peers,
@@ -607,16 +566,186 @@ int run_embedded(bool coin_p2p_discover,
     };
     (*driver)();
 
-    // Optional JSON status endpoint.
-    std::shared_ptr<StatusHttp> http;
+    // ── Shared coin-generic dashboard (--http) ───────────────────────────────
+    // Serve the SAME refined web-static dashboard the BTC/DGB/DASH lanes serve
+    // (btc.voidbind parity), rendered per-coin from the runtime coin LABEL. This
+    // replaces the old bespoke StatusHttp JSON-on-every-path endpoint: the shared
+    // core::WebServer routes REST endpoints (incl /node_info) BEFORE static files
+    // in http_session.cpp, so "/" now resolves to the HTML dashboard while
+    // /node_info stays JSON (caddy's health_uri probe keeps its 200). This lane
+    // passes a NULL IMiningNode (proven BTC/DGB/DASH pattern — the Blockchain
+    // enum only selects graph_db constants + address validation), so refresh_work
+    // never fills m_cached_template; set_dashboard_always_ready(true) is MANDATORY
+    // or http_session's readiness gate 307-redirects every .html to loading.html
+    // forever. All feeds below are display-only lambdas over already-published
+    // header/peer state — no share/reward/consensus/PoW path is touched.
+    std::unique_ptr<core::WebServer> web_server;
+    std::shared_ptr<io::steady_timer> stats_timer;
     if (http_port != 0) {
-        try {
-            http = std::make_shared<StatusHttp>(ioc, http_host, http_port, header_chain, chain_params.blake2b_height);
-            http->start();
-            LOG_INFO << "[EMB-BIP110] status endpoint on " << http_host << ":" << http_port;
-        } catch (const std::exception& e) {
-            LOG_WARNING << "[EMB-BIP110] status endpoint bind failed: " << e.what();
+        LOG_INFO << "[EMB-BIP110] standing up core::WebServer + MiningInterface (http bind "
+                 << http_host << ":" << http_port << ") ...";
+        web_server = std::make_unique<core::WebServer>(
+            ioc, http_host, http_port, /*testnet=*/false,
+            std::shared_ptr<core::IMiningNode>{},            // NULL IMiningNode (BTC/DGB pattern)
+            c2pool::address::Blockchain::BITCOIN);           // SHA256d graph_db pairing
+        auto* mi = web_server->get_mining_interface();
+        if (mi == nullptr) {
+            LOG_ERROR << "[EMB-BIP110] core::WebServer constructed but MiningInterface is"
+                      << " NULL -- dashboard disabled, run-loop continues.";
+            web_server.reset();
         }
+        if (mi != nullptr) {
+        LOG_INFO << "[EMB-BIP110] core::WebServer + MiningInterface constructed (coin=BIP110, "
+                 << "http " << http_host << ":" << http_port << ").";
+        // Coin identity — the whole UI renders from the LABEL (registry row +
+        // rest_web_currency_info "BIP110" branch brand it; the BITCOIN enum alone
+        // would render as Bitcoin).
+        mi->set_coin_label("BIP110");
+#ifdef C2POOL_VERSION
+        mi->set_pool_version("c2pool/" C2POOL_VERSION);
+#endif
+        mi->set_io_context(&ioc);
+        mi->set_dashboard_always_ready(true);   // load-bearing on a NULL IMiningNode
+        // Advertise real runtime ports on /node_info. BIP-110 has no inbound
+        // sharechain P2P listener (fork peers are dialed outbound), so p2p_port
+        // is honestly 0; the stratum bind is the worker port.
+        web_server->set_stratum_port(stratum_port);
+        mi->set_worker_port(stratum_port);
+        mi->set_p2p_port(0);
+        // Point static serving at the on-disk frontend (CWD-relative, same as
+        // btc/dgb): "/" -> web-static/dashboard.html. The deploy pairs a
+        // web-static copied from THIS commit next to the binary/CWD.
+        web_server->set_dashboard_dir("web-static");
+        // Node fee card — configured node-owner fee percent.
+        mi->set_pool_fee_percent(node_owner_fee_pct);
+
+        // Node topology card: embedded SPV follower state + the old StatusHttp
+        // fork fields (blake2b_height / on_blake2b_chain) find their honest new
+        // home here. Mirror of main_btc.cpp node_topology_fn.
+        mi->set_node_topology_fn([&header_chain, &coin_node, &chain_params]() {
+            const uint32_t synced   = header_chain.height();
+            const uint32_t peer_tip = header_chain.peer_tip_height();
+            const bool     emb_p2p  = coin_node.has_p2p();
+            const bool     ext_rpc  = coin_node.has_rpc();
+            return nlohmann::json{
+                {"coin", "BIP110"},
+                {"embedded", true},
+                {"has_rpc", ext_rpc},
+                {"synced_height", synced},
+                {"peer_tip_height", peer_tip},
+                {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
+                {"embedded_peers", emb_p2p ? 1 : 0},
+                {"broadcast_route", emb_p2p ? "p2p" : (ext_rpc ? "rpc" : "none")},
+                {"blake2b_height", chain_params.blake2b_height},
+                {"on_blake2b_chain", synced >= chain_params.blake2b_height},
+            };
+        });
+
+        // Coin sync-status cards: feed /broadcaster_status header_height/
+        // target_height + the single embedded fork peer's version-advertised
+        // tip so the sync cards render the REAL BIP-110 header tip. Mirror of
+        // main_btc.cpp coin_sync_status_fn.
+        mi->set_coin_sync_status_fn([&header_chain, &coin_node]() -> nlohmann::json {
+            nlohmann::json s = nlohmann::json::object();
+            const uint32_t hh = header_chain.height();
+            uint32_t th = header_chain.peer_tip_height();
+            nlohmann::json peers = nlohmann::json::array();
+            auto* p2p = coin_node.p2p();
+            if (p2p != nullptr && p2p->peer_version() > 0) {
+                const uint32_t sh = p2p->peer_start_height();
+                if (sh > th) th = sh;
+                peers.push_back({
+                    {"subver", p2p->peer_subver()},
+                    {"startingheight", sh},
+                    {"conntime", p2p->peer_uptime_sec()},
+                    {"connected", true},
+                });
+            }
+            s["header_height"] = hh;
+            s["target_height"] = th;
+            s["peers"] = std::move(peers);
+            return s;
+        });
+
+        // Miners-Block-Value / Node-Fee cards: daemonless zero-rig projection of
+        // the next block's subsidy from the header-follower tip + the ported BTC
+        // subsidy formula (same math template_builder.hpp uses). BIP-110 (like
+        // BTC) has no treasury / MN split / burn: the whole subsidy is the
+        // miners' gross block value. Projection excludes tx fees, flagged
+        // block_value_basis="projected" (template_age_sec=-1). NON-fetching read
+        // of already-published header state.
+        mi->set_coin_work_fn(
+            [&header_chain, halving = chain_params.subsidy_halving_interval]()
+                -> core::MiningInterface::CoinWorkInfo {
+                core::MiningInterface::CoinWorkInfo info;
+                const uint32_t tip = header_chain.height();
+                if (tip == 0) return info;   // header follower not yet synced
+                const uint32_t height = tip + 1;
+                info.valid              = true;
+                info.projected          = true;
+                info.height             = height;
+                info.coinbase_value_sat = bip110::coin::get_block_subsidy(height, halving);
+                info.payment_amount_sat = 0;
+                info.payments_total_sat = 0;
+                info.burn_sat           = 0;
+                // Coin network difficulty from the chain tip's nBits.
+                if (auto t = header_chain.tip())
+                    info.network_difficulty =
+                        chain::target_to_difficulty(chain::bits_to_target(t->header.m_bits));
+                info.template_age_sec = -1;   // projected, no sourced template
+                return info;
+            });
+
+        // Local hashrate graph + miners/workers table: bridge the stratum worker
+        // registry (rigs register on the Bip110WorkSource). Honestly zero until
+        // rigs connect. Coin-generic per #1141.
+        mi->set_stratum_workers_fn([ws = work_source.get()]() {
+            return ws ? ws->snapshot_stratum_workers()
+                      : std::map<std::string, core::stratum::WorkerInfo>{};
+        });
+        mi->set_stratum_hashrate_fn([ws = work_source.get()]() -> double {
+            if (!ws) return 0.0;
+            double total = 0.0;
+            for (auto& [id, w] : ws->snapshot_stratum_workers()) total += w.hashrate;
+            return total;
+        });
+
+        // Deliberately NOT installed (sharechain-sourced; BIP-110 has NO
+        // sharechain node in this lane): set_pplns_fn, set_sharechain_window_fn,
+        // set_sharechain_stats_fn, set_best_share_hash_fn, set_peer_info_fn,
+        // set_pool_hashrate_fn. Absent feeds render honestly empty — NEVER faked.
+
+        // graph_db-persisted stats history (LTC/BTC parity): namespaced sub-dir.
+        {
+            std::string graph_db_path = (core::filesystem::config_path()
+                / "mainnet" / "bip110" / "graph_db").string();
+            std::error_code mkdir_ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(graph_db_path).parent_path(), mkdir_ec);
+            mi->set_stat_log_path(graph_db_path);
+            mi->load_stat_log();
+            LOG_INFO << "[EMB-BIP110] graph_db stats persistence -> " << graph_db_path;
+        }
+
+        if (web_server->start()) {
+            // Periodic save every 100s on the SAME ioc the run-loop drives.
+            stats_timer = std::make_shared<io::steady_timer>(ioc);
+            auto save_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            *save_fn = [stats_timer, save_fn, mi](boost::system::error_code ec) {
+                if (ec) return;
+                mi->save_stat_log();
+                stats_timer->expires_after(std::chrono::seconds(100));
+                stats_timer->async_wait(*save_fn);
+            };
+            stats_timer->expires_after(std::chrono::seconds(100));
+            stats_timer->async_wait(*save_fn);
+            LOG_INFO << "[EMB-BIP110] dashboard live on http://" << http_host << ":"
+                     << http_port << " (coin=BIP110, graph_db persist every 100s).";
+        } else {
+            LOG_ERROR << "[EMB-BIP110] WebServer FAILED to bind " << http_host << ":"
+                      << http_port << " -- dashboard disabled, run-loop continues.";
+        }
+        } // if (mi != nullptr)
     }
 
     // Periodic tip log — the live-proof capture line.

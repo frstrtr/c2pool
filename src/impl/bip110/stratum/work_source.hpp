@@ -134,6 +134,17 @@ public:
     void set_mempool(bip110::coin::Mempool* mp, bool serve, std::function<bool()> ready_fn)
     { mempool_ = mp; serve_txs_ = serve; utxo_ready_fn_ = std::move(ready_fn); }
 
+    // Lock-safe copy of the per-connection worker registry for the shared
+    // dashboard (set_stratum_workers_fn / set_stratum_hashrate_fn on the web
+    // MiningInterface). The stratum sessions register/update here (workers_) but
+    // nothing bridged it to the WebServer. Mirror of the BTC lane accessor
+    // (src/impl/btc/stratum/work_source.hpp) — display-only, never a work path.
+    std::map<std::string, core::stratum::WorkerInfo> snapshot_stratum_workers() const
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex_);
+        return workers_;
+    }
+
 private:
     // Recompute the PoW from a submit tuple by rebuilding the 164-byte header from
     // the h2-keyed freeze. Returns false if the job's freeze is unknown/expired.

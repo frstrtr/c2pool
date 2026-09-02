@@ -4867,6 +4867,21 @@ nlohmann::json MiningInterface::rest_web_currency_info()
             result["block_explorer_url_prefix"]   = "https://nmc.tokenview.io/en/blockdetail/";
             result["tx_explorer_url_prefix"]      = "https://nmc.tokenview.io/en/tx/";
         }
+    } else if (coin_label_uc == "BIP110") {
+        // BIP-110 (Bitcoin Knots BLAKE2b hard fork) runs on Blockchain::BITCOIN
+        // + set_coin_label("BIP110"); without this branch the BITCOIN switch case
+        // would advertise Bitcoin's symbol/name/explorer on a BIP-110 node.
+        result["symbol"] = "BIP110";
+        result["name"] = "Bitcoin BIP-110";
+        result["block_period"] = 600;  // 10 min average (BTC retarget schedule)
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        }
+        // else: no public BIP-110 fork explorer exists yet -> omit the prefixes
+        // entirely (honesty rule: the frontend renders NO explorer link rather
+        // than a wrong mainnet-Bitcoin URL for a fork-chain hash).
     } else
     switch (m_blockchain) {
     case Blockchain::LITECOIN:
