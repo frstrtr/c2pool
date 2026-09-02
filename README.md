@@ -3,7 +3,7 @@
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 [![Claude for Open Source](https://img.shields.io/badge/Claude%20for%20Open%20Source-supported-D97757?logo=claude&logoColor=white)](https://claude.com/contact-sales/claude-for-oss)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for five parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, and **Dash**. See [Supported chains](#supported-chains) for the full matrix and status.
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for six parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, **Dash**, and **BIP-110** (the Bitcoin Knots BLAKE2b minority hard fork — embedded daemonless, experimental). See [Supported chains](#supported-chains) for the full matrix and status.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 
@@ -18,6 +18,40 @@ Blocks built this way have been accepted on Dash mainnet, including the pool
 development-fee split. Independence from dashd is not yet complete; the
 Supported-chains matrix marks DASH in development. The remaining work is the
 daemonless-finalize item below.
+
+## Daemonless BIP-110
+
+c2pool-bip110 follows the BLAKE2b hard-fork chain over coin P2P with no bitcoind
+on the serve path. It is an embedded SPV header-follower: below height 961640 it
+validates SHA256d, and at/after the fork it validates the byte-exact BLAKE2b
+proof-of-work of the 164-byte v2 header — a SHA256d block past the fork is
+rejected, so the node tracks the BLAKE2b chain rather than the higher-work
+canonical Bitcoin chain. A known-answer test reproduces the canonical hash of
+live fork block 961640 (a block the fork network mined, not c2pool). This
+fork-following node is on `master` and is running live: `bip110.voidbind.com` is
+synced to the BLAKE2b fork tip.
+
+The mining and reward-safe daemonless mempool-serving stack — Stratum-v1 work
+source, block assembler, and fail-closed reward-safety cross-checks
+(`coinbasevalue == subsidy + fees`, committed tx-merkle/txcount, refuse-to-serve
+on mismatch, submit-side merkle re-verify), plus the 0.1% author-donation split —
+is on `master` (merged via #1439). The live node at `bip110.voidbind.com` serves
+the fork mempool and accepts Stratum miners at `stratum+tcp://bip110.voidbind.com:9336`,
+behind a full coin-generic dashboard.
+
+The value of this lane is strategic, not revenue: BIP-110 is a minority fork
+whose coin is effectively unlisted (block reward ≈ 0 in fiat), and mining a demo
+block requires renting BLAKE2b (Sia-algorithm) hashrate. The goal is to be a
+working *decentralized* pool on a fresh fork — a P2Pool-style alternative to
+centralized fork-mining gateways — not an earnings lane. This lane imports **zero
+Dash consensus machinery**; it is Bitcoin-native.
+
+`bip110.voidbind.com` is part of the **voidbind daemonless-standalone fleet** —
+public pools that run with no coin daemon on the serve path:
+`btc.voidbind.com`, `bch.voidbind.com`, `dgb.voidbind.com`, `dash.voidbind.com`,
+and `bip110.voidbind.com`.
+
+Mining (experimental, live): point a BLAKE2b (Sia-algorithm) miner at `stratum+tcp://bip110.voidbind.com:9336` with username `<BIP-110-address>.<worker>` and any password. Daemonless standalone node on the BLAKE2b fork; block reward is effectively zero today (coin unlisted) — a decentralized-pool proof, not a revenue venue.
 
 ## Governance
 
@@ -47,8 +81,11 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 | **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | In development |
 | **Bitcoin Cash** (BCH) | SHA256d | — | In development |
 | **Dash** (DASH) | X11 | — | In development (embedded coin-state) |
+| **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) |
 
 ¹ DigiByte is a MultiAlgo chain; c2pool runs its **Scrypt** algorithm as a standalone parent — it is **not** an AuxPoW child of Litecoin.
+
+² BIP-110 is a minority Bitcoin hard fork (Bitcoin Knots): its proof-of-work switches SHA256d→BLAKE2b at block height 961640 with a one-off difficulty reset, and it uses a reduced block weight of 800000 WU (RDTS). It shares Bitcoin mainnet's network magic and port until the fork; fork peers advertise `NODE_BLAKE2B` (service bit 28).
 
 ## Status & Maturity — read this before evaluating
 
@@ -724,6 +761,7 @@ cd build && ctest --output-on-failure -j$(nproc)
 | Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
 | Embedded LTC SPV node | Working |
 | Embedded DOGE SPV node | Working |
+| Embedded BIP-110 daemonless pool (BLAKE2b fork) | Experimental (live on bip110.voidbind.com; fork-follow + Stratum mining + reward-safe mempool-serving on `master` #1439) |
 | Coin daemon RPC/P2P | Hardened |
 | Stratum mining server | Working |
 | VARDIFF | Working |
