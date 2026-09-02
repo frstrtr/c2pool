@@ -26,6 +26,21 @@
 #include <exception>
 #include <ios>
 
+// Export marker for the pure-C entry points of this HIDDEN-VISIBILITY SHARED
+// object (dash_scriptcheck .so/.dll — see src/impl/dash/CMakeLists.txt). On
+// GCC/Clang, -fvisibility=hidden hides every bitcoin-derived symbol so it can
+// never ODR-collide with c2pool's own btclibs copies at the final c2pool-dash
+// link; __attribute__((visibility("default"))) re-exports just these entry
+// points. MSVC rejects the GNU attribute (error C4430/C3861 on 'visibility')
+// and hides all DLL symbols by default, so the equivalent is __declspec(
+// dllexport) on exactly these entry points — WITHOUT it the c2pool_dash_*
+// symbols stay unexported and c2pool-dash fails to link.
+#if defined(_MSC_VER)
+#  define C2POOL_DASH_SCRIPT_EXPORT __declspec(dllexport)
+#else
+#  define C2POOL_DASH_SCRIPT_EXPORT __attribute__((visibility("default")))
+#endif
+
 namespace {
 
 // A stream that deserializes a single CTransaction one time (verbatim from
@@ -71,7 +86,7 @@ static_assert((unsigned)C2POOL_DASH_SCRIPT_VERIFY_NULLDUMMY == (unsigned)SCRIPT_
 static_assert((unsigned)C2POOL_DASH_SCRIPT_VERIFY_CLTV == (unsigned)SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY, "CLTV bit");
 static_assert((unsigned)C2POOL_DASH_SCRIPT_VERIFY_CSV == (unsigned)SCRIPT_VERIFY_CHECKSEQUENCEVERIFY, "CSV bit");
 
-extern "C" __attribute__((visibility("default")))
+extern "C" C2POOL_DASH_SCRIPT_EXPORT
 int c2pool_dash_verify_input(const unsigned char* script_pubkey, unsigned int script_pubkey_len,
                              const unsigned char* tx_to,         unsigned int tx_to_len,
                              unsigned int nIn, unsigned int flags)
@@ -95,7 +110,7 @@ int c2pool_dash_verify_input(const unsigned char* script_pubkey, unsigned int sc
     }
 }
 
-extern "C" __attribute__((visibility("default")))
+extern "C" C2POOL_DASH_SCRIPT_EXPORT
 int c2pool_dash_legacy_sighash(const unsigned char* tx_to, unsigned int tx_to_len,
                                unsigned int nIn,
                                const unsigned char* script_code, unsigned int script_code_len,
@@ -119,7 +134,7 @@ int c2pool_dash_legacy_sighash(const unsigned char* tx_to, unsigned int tx_to_le
 // KAT helper: Hash160 = RIPEMD160(SHA256(data)), dashcore CHash160. Lets the
 // self-signing KAT build a P2PKH scriptPubKey with no extra crypto dependency.
 // Test-only; never on the serve path.
-extern "C" __attribute__((visibility("default")))
+extern "C" C2POOL_DASH_SCRIPT_EXPORT
 void c2pool_dash_hash160(const unsigned char* data, unsigned int len, unsigned char* out20)
 {
     uint160 h = Hash160(Span<const unsigned char>(data, len));
