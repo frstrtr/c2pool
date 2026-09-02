@@ -624,6 +624,67 @@ public:
         return true;
     }
 
+    // -- Directly mark a LOCALLY-MINTED share verified (#941 mint-path fix) --
+    // A node's OWN minted share is trivially valid: create_local_share already
+    // built AND cross-checked its gentx (share_check.hpp "Cross-check PASSED").
+    // Re-running the throw-prone peer verify_share() over it (hash-link / merkle
+    // / PoW recompute) is redundant and was the path disabled after the kr1z1s
+    // SIGSEGV — so we do NOT route own shares through attempt_verify(). Instead
+    // we add the share straight to the verified set + fire the persistence
+    // callback, so it counts in verified_size / has_shares and enters the
+    // verified-flush buffer. Peer shares are UNAFFECTED (they still go through
+    // attempt_verify). The kr1z1s crash was a prune-vs-read UAF on the tracker
+    // (clean_tracker freeing chain nodes under an IO reader), NOT the verify
+    // step — so it is not reintroduced here: the CALLER MUST hold the tracker's
+    // EXCLUSIVE lock (same discipline attempt_verify runs under), and this body
+    // performs no re-verification that could throw. Returns true if the share is
+    // (now) in the verified set.
+    bool mark_own_share_verified(const uint256& share_hash)
+    {
+        if (verified.contains(share_hash))
+            return true;
+        if (!chain.contains(share_hash))
+            return false;
+
+        // Resolve pow_hash the SAME way attempt_verify's success tail does:
+        // an own share carries m_pow_hash from create_local_share; fall back to
+        // the cached index pow if present. No recompute — no throw.
+        auto& share_var = chain.get_share(share_hash);
+        auto* idx = chain.get_index(share_hash);
+        uint256 pow_hash;
+        share_var.invoke([&](auto* s) { pow_hash = s->m_pow_hash; });
+        if (pow_hash.IsNull() && idx)
+            pow_hash = idx->pow_hash;
+        if (idx && !pow_hash.IsNull())
+            idx->pow_hash = pow_hash;
+
+        // Add to the verified chain (verified BORROWS the chain's share data —
+        // trim(owns_data=false); same call attempt_verify makes at success).
+        verified.add(share_var);
+
+        // Clear any stale fail-count so a later attempt_verify short-circuits.
+        m_verify_fail_count.erase(share_hash);
+
+        // Notify the LevelDB persistence layer (feeds m_verified_flush_buf).
+        if (m_on_share_verified)
+            m_on_share_verified(share_hash);
+
+        // Block detection: an own share can itself meet the COIN block target
+        // (min_header.m_bits from GBT — far harder than the share target).
+        if (m_on_block_found && !pow_hash.IsNull()) {
+            bool is_block = false;
+            share_var.invoke([&](auto* s) {
+                uint256 block_target = chain::bits_to_target(s->m_min_header.m_bits);
+                is_block = !block_target.IsNull() && pow_hash <= block_target;
+            });
+            if (is_block) {
+                if (idx) idx->is_block_solution = true;
+                m_on_block_found(share_hash);
+            }
+        }
+        return true;
+    }
+
     // -- Score a chain from share_hash to CHAIN_LENGTH*15/16 ancestor --
     // Returns (chain_len, hashrate_score) — higher is better.
     // p2pool data.py:2335-2347 — uses self.verified for ALL operations.

@@ -1584,14 +1584,120 @@ void NodeImpl::flush_verified_to_leveldb()
     m_verified_flush_buf.clear();
 }
 
+// FINDING A/#941 + persistence — public entry: take the exclusive tracker lock,
+// then verify + persist the own share. Used off the mint path (e.g. tests / any
+// caller that does NOT already hold the lock).
+void NodeImpl::verify_and_persist_local_share(const uint256& share_hash)
+{
+    if (share_hash.IsNull())
+        return;
+    std::unique_lock<std::shared_mutex> lock(m_tracker_mutex);
+    verify_and_persist_local_share_locked(share_hash);
+}
+
+// FINDING A/#941 + persistence — CALLER MUST HOLD the exclusive tracker lock.
+// The mint path (main_bip110) calls this INSIDE its create_local_share lock
+// window (before it drops the lock to broadcast), so there is no re-lock and no
+// IO-thread stall. Three effects, all required for a mined share to be VISIBLE
+// and to SURVIVE a restart:
+//   (1) mark the own share verified (tracker.mark_own_share_verified) so it
+//       counts in verified_size / has_shares and fires the persist callback;
+//   (2) persist the share BODY to LevelDB — the local mint path never went
+//       through handle_shares() (which is the ONLY place peer-share bodies are
+//       stored), so without this the body is lost on restart even though the
+//       verified STATUS was flushed;
+//   (3) flush the verified-status buffer immediately so the just-minted share's
+//       verified flag is durable at once (mint rate is low; the >=50 fast path
+//       and the periodic timer still cover the bulk / idle cases).
+void NodeImpl::verify_and_persist_local_share_locked(const uint256& share_hash)
+{
+    if (share_hash.IsNull())
+        return;
+    if (!m_tracker.chain.contains(share_hash))
+        return;
+
+    // (1) mark verified directly (own share; no throw-prone re-verify).
+    m_tracker.mark_own_share_verified(share_hash);
+
+    // (2) persist the share BODY (mirrors the handle_shares db_batch entry).
+    if (m_storage && m_storage->is_available())
+    {
+        auto& share = m_tracker.chain.get_share(share_hash);
+        std::vector<uint8_t> bytes;
+        {
+            PackStream ps = pack(share);
+            auto span = ps.get_span();
+            bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
+                         reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+        }
+        uint64_t ver = share.version();
+        std::vector<uint8_t> versioned;
+        versioned.resize(8 + bytes.size());
+        std::memcpy(versioned.data(), &ver, 8);
+        std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
+
+        std::vector<c2pool::storage::SharechainStorage::ShareBatchEntry> db_batch;
+        share.ACTION({
+            uint256 target = chain::bits_to_target(obj->m_bits);
+            uint256 abswork_256;
+            std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
+            c2pool::storage::SharechainStorage::ShareBatchEntry entry;
+            entry.hash = obj->m_hash;
+            entry.serialized_data = std::move(versioned);
+            entry.prev_hash = obj->m_prev_hash;
+            entry.height = obj->m_absheight;
+            entry.timestamp = obj->m_timestamp;
+            entry.work = abswork_256;
+            entry.target = target;
+            db_batch.push_back(std::move(entry));
+        });
+        if (!db_batch.empty())
+            m_storage->store_shares_batch(db_batch);
+    }
+
+    // (3) flush verified status now (own share durable immediately).
+    flush_verified_to_leveldb();
+}
+
+// FINDING C — standalone periodic verified-flush. Independent of think()
+// cadence and the >=50 gate. Non-blocking: skips this tick if the compute
+// thread holds the exclusive lock, and always reschedules itself.
+void NodeImpl::arm_flush_timer()
+{
+    if (!m_context)
+        return;
+    if (!m_flush_timer)
+        m_flush_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+    m_flush_timer->expires_after(std::chrono::seconds(FLUSH_TIMER_SECONDS));
+    m_flush_timer->async_wait([this](const boost::system::error_code& ec) {
+        if (ec) return;  // cancelled (shutdown)
+        {
+            std::unique_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
+            if (lk.owns_lock())
+                flush_verified_to_leveldb();
+        }
+        arm_flush_timer();  // reschedule
+    });
+}
+
 void NodeImpl::shutdown()
 {
     LOG_INFO << "[Pool] NodeImpl shutdown: flushing pending LevelDB buffers...";
-    flush_verified_to_leveldb();
-    if (!m_removal_flush_buf.empty() && m_storage && m_storage->is_available())
+    // Stop the periodic flush timer so it does not re-fire during teardown.
+    if (m_flush_timer)
+        m_flush_timer->cancel();
+    // Final flush must take the exclusive lock (m_verified_flush_buf is guarded
+    // by m_tracker_mutex; flush reads chain indices). shutdown() runs from the
+    // signal handler on the IO thread while the compute thread is idle, so a
+    // blocking lock here is safe and guarantees the tail is persisted.
     {
-        m_storage->remove_shares_batch(m_removal_flush_buf);
-        m_removal_flush_buf.clear();
+        std::unique_lock<std::shared_mutex> lock(m_tracker_mutex);
+        flush_verified_to_leveldb();
+        if (!m_removal_flush_buf.empty() && m_storage && m_storage->is_available())
+        {
+            m_storage->remove_shares_batch(m_removal_flush_buf);
+            m_removal_flush_buf.clear();
+        }
     }
     LOG_INFO << "[Pool] NodeImpl shutdown complete";
 }

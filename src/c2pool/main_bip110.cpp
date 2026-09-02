@@ -365,7 +365,16 @@ int run_embedded(bool coin_p2p_discover,
     // the operator performs the explicit params-freeze checkpoint before enabling
     // it in production.
     std::unique_ptr<bip110::pool::Config> sharechain_cfg;
-    std::unique_ptr<bip110::pool::Node>   sharechain_node;
+    // FINDING B (core UAF, class of #759): hold the sharechain node as a
+    // shared_ptr (NOT unique_ptr). core::Client::resolve()/connect_socket() guard
+    // the async dial teardown race with node->weak_from_this() — but for an
+    // UNMANAGED (unique_ptr) node weak_from_this() is empty, was_managed=false,
+    // and the guard is a NO-OP, so make_socket() dynamic_casts a DANGLING node on
+    // teardown → SEGV. make_shared enrolls the enable_shared_from_this control
+    // block, so weak_from_this() is real and the guard fires (clean dial abort).
+    // Flag-ON exercises this hard (beacon :9337 self-dial + coin-P2P + ioc.stop()
+    // mid-resolve). All .get() call sites below are unchanged.
+    std::shared_ptr<bip110::pool::Node>   sharechain_node;
     if (sharechain_enabled) {
         sharechain_cfg  = std::make_unique<bip110::pool::Config>();          // (1) lifetime >= node
 
@@ -537,6 +546,18 @@ int run_embedded(bool coin_p2p_discover,
                     LOG_WARNING << "[BIP110-CREATE-SHARE] threw: " << e.what();
                     return uint256::ZERO;
                 }
+
+                // FINDING A/#941 — mark the OWN minted share verified + persist
+                // its body, WHILE the exclusive lock is still held (no re-lock,
+                // no IO-thread stall). Without this the share only ever landed in
+                // the RAW chain: verified_size / has_shares stayed 0 (the operator
+                // "no bip110 shares" symptom) and the body was never written to
+                // LevelDB (local mint never goes through handle_shares), so it did
+                // not survive a restart. Own share is trivially valid — the gentx
+                // cross-check above already passed — so we mark it verified
+                // DIRECTLY, never through the crash-prone peer attempt_verify path.
+                if (!share_hash.IsNull())
+                    node_raw->verify_and_persist_local_share_locked(share_hash);
 
                 // Drop the EXCLUSIVE lock BEFORE broadcast (lock-discipline
                 // invariant — a held-lock broadcast is the serve-dead/deadlock
@@ -806,6 +827,12 @@ int run_embedded(bool coin_p2p_discover,
 
         LOG_INFO << "[EMB-BIP110] M3 PR-C ref-commitment wired (best_share + ref_hash;"
                     " coinbase carries the v36 ref_hash, mint has_frozen=TRUE)";
+
+        // FINDING C — arm the standalone periodic verified-flush timer so a
+        // low-share-rate / idle node persists recent verified shares on a fixed
+        // cadence, independent of think() events and the >=50 fast path. Flag-ON
+        // only. The graceful-shutdown flush is wired at the signal handler below.
+        node_raw->arm_flush_timer();
 
         // (6) IRREVERSIBLE first-outbound to the fresh federation sharechain.
         // Stays INSIDE the flag-ON block so it never runs by default.
@@ -1345,10 +1372,43 @@ int run_embedded(bool coin_p2p_discover,
             return total;
         });
 
-        // Deliberately NOT installed (sharechain-sourced; BIP-110 has NO
-        // sharechain node in this lane): set_pplns_fn, set_sharechain_window_fn,
-        // set_sharechain_stats_fn, set_best_share_hash_fn, set_peer_info_fn,
-        // set_pool_hashrate_fn. Absent feeds render honestly empty — NEVER faked.
+        // FINDING A1 — dashboard sharechain feeds. Under M3 flag-ON the
+        // sharechain node EXISTS (sharechain_node != null), so wire the two
+        // callbacks rest_sync_status() reads. When they are absent, that handler
+        // leaves chain_size / verified_size / has_shares / has_best_share at their
+        // 0/false DEFAULTS regardless of the real tracker state — which is exactly
+        // the operator's "no bip110 shares even though it is live" symptom (the
+        // tracker had grown to height 29 but /web/sync_status reported all zero).
+        // Both callbacks read the LOCK-FREE published snapshot (get_tracker_snapshot,
+        // set by think() under the exclusive lock) — never the tracker lock and
+        // never an off-lock chain walk, so no kr1z1s prune-vs-read UAF. This
+        // mirrors main_btc.cpp (chain_height = raw chain_count, not verified), so
+        // a single mint flips has_shares=true even before the verified tip settles.
+        if (sharechain_node) {
+            auto* scn = sharechain_node.get();
+            mi->set_sharechain_stats_fn([scn]() -> nlohmann::json {
+                auto snap = scn->get_tracker_snapshot();
+                nlohmann::json out;
+                out["chain_height"]   = snap.chain_count;      // RAW chain size
+                out["total_shares"]   = snap.chain_count;
+                out["verified_count"] = snap.verified_count;
+                out["fork_count"]     = snap.fork_count;
+                out["orphan_shares"]  = snap.orphan_shares;
+                out["dead_shares"]    = snap.dead_shares;
+                return out;
+            });
+            mi->set_best_share_hash_fn([scn]() -> uint256 {
+                return scn->get_tracker_snapshot().best_share;
+            });
+            LOG_INFO << "[EMB-BIP110] dashboard sharechain feeds wired "
+                        "(set_sharechain_stats_fn + set_best_share_hash_fn; lock-free "
+                        "snapshot) — chain_size/has_shares now reflect the mint";
+        }
+
+        // Still deliberately NOT installed even on flag-ON (no PPLNS/window/peer
+        // producer wired for bip110 yet): set_pplns_fn, set_sharechain_window_fn,
+        // set_peer_info_fn, set_pool_hashrate_fn. Absent feeds render honestly
+        // empty — NEVER faked.
 
         // graph_db-persisted stats history (LTC/BTC parity): namespaced sub-dir.
         {
@@ -1435,8 +1495,16 @@ int run_embedded(bool coin_p2p_discover,
     }
 
     io::signal_set signals(ioc, SIGINT, SIGTERM);
-    signals.async_wait([&ioc](const boost::system::error_code&, int) {
+    // FINDING C — graceful-shutdown flush. NodeImpl::shutdown() flushes the
+    // pending verified/removal buffers to LevelDB (and cancels the periodic flush
+    // timer). It existed but was NEVER called — the handler only did ioc.stop(),
+    // so a clean SIGTERM lost every verified share minted since the last flush.
+    // Flag-OFF: sharechain_node is null, so this is a no-op (M2 unchanged). The
+    // capture keeps a shared_ptr copy so the node outlives the flush call.
+    signals.async_wait([&ioc, sharechain_node](const boost::system::error_code&, int) {
         LOG_INFO << "[EMB-BIP110] shutdown signal — stopping";
+        if (sharechain_node)
+            sharechain_node->shutdown();
         ioc.stop();
     });
 

@@ -260,3 +260,88 @@ target_link_libraries(bip110_serve_xcheck_kat
     Threads::Threads
 )
 add_test(NAME bip110_serve_xcheck_kat COMMAND bip110_serve_xcheck_kat)
+
+# bip110_local_mint_verify_kat: FINDING A / #941 red->green. Mints a share against
+# a ShareTracker and asserts the pre-fix bug (create_local_share alone leaves
+# verified_size==0 and never fires the persist callback) then the fix
+# (mark_own_share_verified marks it verified + fires persist, idempotently). Same
+# lean ShareTracker link closure as bip110_pool_mint_kat (no node.cpp needed).
+add_executable(bip110_local_mint_verify_kat
+    test/bip110_local_mint_verify_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_local_mint_verify_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_local_mint_verify_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_local_mint_verify_kat COMMAND bip110_local_mint_verify_kat)
+
+# bip110_persistence_roundtrip_kat: FINDING C round-trip. Drives a REAL NodeImpl
+# over an isolated LevelDB dir: mint N (<50) shares -> verify_and_persist each ->
+# shutdown() -> destroy -> reopen -> load_persisted_shares must reload them
+# (chain_size>0). Same heavy node.cpp + protocol_actual.cpp + storage link
+# closure as bip110_pool_node_compile.
+add_executable(bip110_persistence_roundtrip_kat
+    test/bip110_persistence_roundtrip_kat.cpp
+    node.cpp
+    protocol_actual.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_persistence_roundtrip_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_persistence_roundtrip_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_persistence_roundtrip_kat COMMAND bip110_persistence_roundtrip_kat)
+
+# bip110_dial_lifetime_guard_kat: FINDING B (core UAF, class of #759) mechanism.
+# Asserts the enable_shared_from_this lifetime invariant the core dial-teardown
+# guard relies on (managed node -> lockable/expiring weak_from_this arms the
+# guard; unmanaged node -> empty weak_from_this skips it as pre-fix). Header-only
+# (core/inetwork.hpp) — links against core for INetwork's typeinfo/vtable.
+add_executable(bip110_dial_lifetime_guard_kat
+    test/bip110_dial_lifetime_guard_kat.cpp
+)
+target_compile_definitions(bip110_dial_lifetime_guard_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_dial_lifetime_guard_kat
+    core
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_dial_lifetime_guard_kat COMMAND bip110_dial_lifetime_guard_kat)

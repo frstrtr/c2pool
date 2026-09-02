@@ -117,6 +117,12 @@ protected:
         int dead_shares{0};
         int fork_count{0};
         double pool_hashrate{0};
+        // Lock-free best-share tip for the dashboard (set_best_share_hash_fn).
+        // Published under the exclusive tracker lock, read off-lock by the web
+        // thread — reading a plain uint256 is a benign torn-read at worst (no
+        // pointer deref), unlike best_share_hash()/advertised_best_share() which
+        // walk m_chain off-lock (the kr1z1s prune-vs-read UAF class).
+        uint256 best_share;
     };
     void publish_snapshot() {
         TrackerSnapshot s;
@@ -137,6 +143,11 @@ protected:
                 auto h = m_tracker.chain.get_height(head_hash);
                 if (h > best_h) { best = head_hash; best_h = h; }
             }
+            // Best-share tip for the dashboard: prefer think()'s current best
+            // (verified head); fall back to the tallest RAW head so a fresh
+            // node that has minted shares reports has_best_share=true instead of
+            // the all-zero sentinel. Computed here under the exclusive lock.
+            s.best_share = !m_best_share_hash.IsNull() ? m_best_share_hash : best;
             if (!best.IsNull() && best_h >= 2) {
                 auto lookback = std::min(best_h,
                     static_cast<int32_t>(bip110::pool::PoolConfig::TARGET_LOOKBEHIND));
@@ -215,6 +226,14 @@ protected:
 
     // Buffer of pruned share hashes, batch-deleted from LevelDB after clean_tracker()
     std::vector<uint256> m_removal_flush_buf;
+
+    // FINDING C: standalone periodic flush timer. The verified callback only
+    // flushes at the >=50 fast-path, and run_think() only fires on share events,
+    // so an idle / low-share-rate node could hold recent verified shares in RAM
+    // indefinitely. This timer flushes m_verified_flush_buf on a fixed cadence,
+    // independent of think() and the 50-share gate. Armed on the flag-ON path.
+    std::unique_ptr<boost::asio::steady_timer> m_flush_timer;
+    static constexpr int FLUSH_TIMER_SECONDS = 20;
 
 public:
     NodeImpl()
@@ -466,6 +485,21 @@ public:
     /// Load persisted shares from LevelDB storage into the tracker.
     void load_persisted_shares();
     void flush_verified_to_leveldb();
+
+    /// FINDING A/#941 + persistence: mark a LOCALLY-MINTED share verified AND
+    /// persist its body to LevelDB, so it counts in chain_size/verified_size,
+    /// sets has_shares/has_best_share, and survives a restart. A node's own
+    /// share is trivially valid (create_local_share cross-checked its gentx), so
+    /// this marks it verified DIRECTLY (tracker.mark_own_share_verified) instead
+    /// of the crash-prone peer attempt_verify path. The _locked variant assumes
+    /// the caller already holds the tracker's EXCLUSIVE lock (the mint path
+    /// does — main_bip110); the public variant takes the lock itself.
+    void verify_and_persist_local_share(const uint256& share_hash);
+    void verify_and_persist_local_share_locked(const uint256& share_hash);
+
+    /// FINDING C: arm the standalone periodic verified-flush timer (see
+    /// m_flush_timer). Non-blocking: uses try_to_lock and reschedules itself.
+    void arm_flush_timer();
 
     /// Graceful shutdown: flush pending verified/removal buffers to LevelDB.
     void shutdown();

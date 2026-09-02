@@ -125,18 +125,32 @@ private:
     std::optional<io::ip::tcp::resolver> m_resolver;
     std::string m_label = "Net";  // chain/protocol label for log messages
 
-	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints, NetService addr)
+	// weak_node / was_managed are CAPTURED BY resolve() while the node was
+	// provably alive (before async_resolve), and threaded through here — see the
+	// FINDING B note below. Do NOT re-derive them by dereferencing m_node: on the
+	// dial-teardown race m_node may already be dangling.
+	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints, NetService addr,
+	                    std::weak_ptr<INetwork> weak_node, bool was_managed)
 	{
+		// FINDING B (core UAF, class of #759): guard node liveness BEFORE
+		// make_socket(). make_socket() does dynamic_cast<ICommunicator*>(node) /
+		// dynamic_cast<INetwork*>(node) (socket.hpp) which read the node's vtable
+		// — if the owning node was destroyed while the async resolve was in
+		// flight (e.g. ioc.stop() during teardown), that dereferences freed
+		// memory → SEGV. The weak_ptr was captured by resolve() while the node
+		// was alive; lock it here and abort the dial cleanly if the node is gone,
+		// so no dynamic_cast ever touches a dangling pointer. Happy path
+		// (node alive): strong_node is non-null and everything below is
+		// byte-identical to before. For legacy UNMANAGED nodes (was_managed=false,
+		// e.g. a unique_ptr node) the guard is skipped exactly as before — those
+		// lanes must migrate to make_shared to be protected (bip110 M3 does).
+		std::shared_ptr<INetwork> guard_node = weak_node.lock();
+		if (was_managed && !guard_node)
+			return;
+
 		auto tcp_socket = std::make_unique<io::ip::tcp::socket>(*m_context);
 		auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::outgoing, m_node);
 
-		// Bug 3 root-cause fix: weak_from_this() into the async lambda so the
-		// async_connect callback keeps the node alive across the in-flight
-		// connect() → connected() handoff. Without this, the lambda's bare `&`
-		// (this) capture meant connected() could fire on a freed NodeP2P,
-		// reading garbage m_target_addr and crashing in boost::log codecvt.
-		auto weak_node = m_node->weak_from_this();
-		bool was_managed = weak_node.lock() != nullptr;
 		io::async_connect(*socket->raw(), endpoints,
 			[this, weak_node, was_managed, addr, socket = socket]
 			(const auto& ec, boost::asio::ip::tcp::endpoint ep)
@@ -232,7 +246,10 @@ private:
 				// on m_node->connected(socket) inside connect_socket().
 				if (was_managed && weak_node.expired()) return;
 
-				connect_socket(endpoints, addr);
+				// FINDING B: thread the alive-captured weak_node/was_managed into
+				// connect_socket so its pre-make_socket guard uses THIS liveness
+				// proof (it must not re-derive from a possibly-dangling m_node).
+				connect_socket(endpoints, addr, weak_node, was_managed);
 			}
 		);
 	}
