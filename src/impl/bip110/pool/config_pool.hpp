@@ -26,6 +26,7 @@
 
 #include "../params.hpp"        // SSOT: bip110::SHARECHAIN_* + coin identity
 #include <core/donation.hpp>    // chain-agnostic donation SSOT
+#include <core/uint256.hpp>     // uint256 / uint256S for max_target()
 
 #include <cstdint>
 #include <string>
@@ -71,6 +72,42 @@ public:
     static std::vector<unsigned char> get_donation_script(int64_t share_version)
     {
         return core::donation::get_donation_script(share_version);
+    }
+
+    // ---- Verify-path accessors (share_check.hpp / share_tracker.hpp) --------
+    // The v36-genesis chain has no separate testnet parameter set: the SSOT in
+    // params.hpp defines the single mainnet identity, and is_testnet stays false.
+    // These function accessors mirror the BTC lane's PoolConfig call surface so
+    // the namespace-copied share_check/share_tracker bind unchanged; every value
+    // is read from the params.hpp SHARECHAIN_* SSOT (never drifts).
+    static inline bool is_testnet = false;
+
+    static uint32_t share_period()      { return SHARECHAIN_SHARE_PERIOD; }
+    static uint32_t chain_length()      { return SHARECHAIN_CHAIN_LENGTH; }
+    static uint32_t real_chain_length() { return SHARECHAIN_CHAIN_LENGTH; }
+
+    static uint64_t dust_threshold()    { return SHARECHAIN_DUST_THRESHOLD; }
+
+    // MAX_TARGET: share difficulty floor (easiest allowed share PoW), from the
+    // params.hpp SSOT (SHARECHAIN_MAX_TARGET_HEX — standard bdiff-1 2^224 floor).
+    static uint256 max_target()
+    {
+        static const uint256 MAINNET_MAX = uint256S(SHARECHAIN_MAX_TARGET_HEX);
+        return MAINNET_MAX;
+    }
+
+    // Chain identity — BIP-110-native, from the params.hpp SSOT. No override /
+    // XOR-derivation surface (decision #2: this lane never joins another network).
+    static const std::string& identifier_hex()
+    {
+        static const std::string kId = SHARECHAIN_IDENTIFIER_HEX;
+        return kId;
+    }
+
+    static const std::string& prefix_hex()
+    {
+        static const std::string kPfx = SHARECHAIN_PREFIX_HEX;
+        return kPfx;
     }
 
     // ---- Bootstrap ladder — FAIL-LOUD, no cross-lane fallback ---------------

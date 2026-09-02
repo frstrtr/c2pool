@@ -97,10 +97,22 @@ struct SegwitDataDefault
 {
     static SegwitData get()
     {
-        // Sentinel matches p2pool's PossiblyNoneType sentinel:
-        // dict(txid_merkle_link=dict(branch=[], index=0), wtxid_merkle_root=0).
-        // (all-0xff would be read as a valid wtxid root -> different coinbase txid.)
-        return SegwitData{{}, uint256()}; // zero = None sentinel
+        // NIT-1 (wire-genesis, IRREVERSIBLE): the BIP-110 v36 SSOT is the python
+        // fork p2pool-merged-v36/p2pool/data.py, whose segwit_data PossiblyNoneType
+        // none_value is wtxid_merkle_root = 2**256-1 (data.py:767 AND :2301). This
+        // DELIBERATELY DIVERGES from the BTC lane, which uses zero because it
+        // interops with UPSTREAM jtoomim p2pool (a DIFFERENT reference python whose
+        // none_value is 0). Copying the BTC zero here would break byte-parity with a
+        // python-fork bip110 peer — the whole point of the v36-match wire-genesis.
+        // When segwit_data is None (no txs) the coinbase carries no witness
+        // commitment derived from this value, so both c2pool-bip110 and a
+        // python-fork bip110 peer decode 0xff->None identically and the coinbase
+        // txid matches; the "0xff read as a valid wtxid root" failure the BTC
+        // comment warns of applies only against upstream-p2pool, not our v36 fork.
+        uint256 none_root;
+        none_root.SetHex(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"); // 2**256-1
+        return SegwitData{{}, none_root}; // all-0xff = None sentinel (data.py:767/2301)
     }
 };
 

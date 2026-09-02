@@ -92,4 +92,59 @@ inline DonationValidationResult validate_coinbase_total(
     return {true, {}};
 }
 
+// ---------------------------------------------------------------------------
+// File 5 — the tracker-coupled entry point the header comment forecasts.
+//
+// build_expected_payouts() feeds the pure validators above. It runs the v36
+// decayed-PPLNS distribution over the sharechain (ShareTracker::get_expected_
+// payouts, share_tracker.hpp) to produce the canonical map<scriptPubKey, amount>
+// the coinbase MUST match, then hands it to validate_donation_output with
+// share_version=36 => COMBINED_DONATION_SCRIPT (P2SH). Templated on TrackerT so
+// donation_consensus.hpp stays decoupled from the heavy share_tracker.hpp include
+// (the caller — the sharechain node's accept path — supplies the concrete
+// ShareTracker & and already holds share_tracker.hpp).
+//
+// F11 exclude-then-append canonicalization: the donation is the rounding
+// remainder and is ALWAYS the last payout output. get_expected_payouts() already
+// computes it as subsidy − sum(miner amounts) and appends it under donation_script
+// (share_tracker.hpp), guarding the double-count when a miner's own script equals
+// the donation script via `result.contains(donation_script) ? result[...] : 0`.
+// We therefore do NOT re-derive or re-append it here — build_expected_payouts is a
+// thin, side-effect-free bridge that preserves that canonical map verbatim.
+template <typename TrackerT>
+inline std::map<std::vector<unsigned char>, double>
+build_expected_payouts(TrackerT& tracker,
+                       const uint256& best_share_hash,
+                       const uint256& block_target,
+                       uint64_t subsidy,
+                       int64_t share_version = 36)
+{
+    auto donation_script = PoolConfig::get_donation_script(share_version);
+    // The tracker owns the decayed walk + the >=1-sat donation floor tiebreak +
+    // the exclude-then-append donation canonicalization. We surface its result
+    // unchanged so it can be fed to validate_donation_output / validate_coinbase_total.
+    return tracker.get_expected_payouts(best_share_hash, block_target, subsidy, donation_script);
+}
+
+// Convenience: build the expected map from the tracker AND run both pure
+// validators against the miner's coinbase outputs in one call. This is the
+// reward-safety cross-check the sharechain accept path invokes for a v36 share
+// that claims to be a block solution.
+template <typename TrackerT>
+inline DonationValidationResult validate_payouts_against_tracker(
+    TrackerT& tracker,
+    const uint256& best_share_hash,
+    const uint256& block_target,
+    uint64_t subsidy,
+    const std::vector<CoinbaseOutput>& coinbase_outputs,
+    int64_t share_version = 36)
+{
+    auto expected = build_expected_payouts(tracker, best_share_hash, block_target,
+                                           subsidy, share_version);
+    auto total_res = validate_coinbase_total(coinbase_outputs, subsidy);
+    if (!total_res.valid)
+        return total_res;
+    return validate_donation_output(coinbase_outputs, expected, share_version);
+}
+
 } // namespace bip110::pool::consensus

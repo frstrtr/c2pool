@@ -41,3 +41,39 @@ target_link_libraries(bip110_pool_identity_kat
     Threads::Threads
 )
 add_test(NAME bip110_pool_identity_kat COMMAND bip110_pool_identity_kat)
+
+# bip110_pool_sharechain_compile: the COMPILE + INSTANTIATION gate for the M3
+# PR-A-continuation sharechain lane (share_check.hpp / share_tracker.hpp /
+# share_messages.hpp + the tracker-coupled donation build_expected_payouts). It
+# #includes share_tracker.hpp (which transitively pulls the whole verify surface)
+# and ODR-uses verify_share<MergedMiningShare, ShareTracker> so every verify-path
+# template — including the BLAKE2b header-hash consensus delta (compute_share_hash
+# / check_header_fail_closed) and the v36 decayed-PPLNS walk — is fully compiled
+# and linked. Unlike the identity KAT (deliberately lean), this target rides the
+# same heavy shared/core/pool/sharechain link closure as c2pool-bip110, because
+# the verify path uses core LOG / target_utils / address_utils, sharechain, the
+# coin block/transaction types, and (via share_identity.hpp -> pow.hpp) BLAKE2b.
+add_executable(bip110_pool_sharechain_compile
+    test/bip110_pool_sharechain_compile.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_pool_sharechain_compile PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_pool_sharechain_compile
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_pool_sharechain_compile COMMAND bip110_pool_sharechain_compile)
