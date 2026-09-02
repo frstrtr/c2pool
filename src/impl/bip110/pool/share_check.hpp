@@ -2172,21 +2172,494 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
 }
 
 // ============================================================================
-// create_local_share() / create_local_share_v35() — MINT PATH — deferred to PR-B.
+// create_local_share() — MINT PATH (PR-A-cont2).
 //
-// The BTC lane's two local-share constructors build a share from a
-// coin::SmallBlockHeaderType (the classic 5-field SHA256d small header) and, for
-// v35, a PaddingBugfixShare variant. Neither maps onto the BIP-110 v36-genesis
-// lane as-is: bip110's min_header is Bip110SmallBlockHeaderType (the 164-byte v2
-// BLAKE2b header minus merkle, share_types.hpp) and there is no v35 variant on
-// this wire. The bip110 mint constructor therefore builds a MergedMiningShare
-// directly from the full coin::BlockHeaderType (via Bip110SmallBlockHeaderType::
-// from_full) and computes the share-hash through compute_share_hash() /
-// check_header_fail_closed() — this is the PR-B money/mint path, wired with
-// pool::SharechainNode into main_bip110. PR-A-cont ships the VERIFY surface only
-// (share_init_verify / generate_share_transaction / share_check / verify_share +
-// the BLAKE2b header-hash delta), which is what the sharechain follower needs to
-// accept a peer's v36 shares. See the PR remaining-work map.
+// Constructs the v36 MergedMiningshare from locally-generated block data and adds
+// it to the share tracker. Returns the share hash (the BLAKE2b block-identity hash).
+//
+// v36-GENESIS DELTAS vs the BTC lane's create_local_share (src/impl/btc/
+// share_check.hpp):
+//   • takes the FULL coin::BlockHeaderType (the 164-byte v2 BLAKE2b header) and
+//     splits it internally via Bip110SmallBlockHeaderType::from_full — the BTC lane
+//     takes the classic 5-field SmallBlockHeaderType.
+//   • no v35 delegation (there is no PaddingBugfixShare on this wire); share_version
+//     / desired_version default to 36.
+//   • FAIL-CLOSED FIRST: check_header_fail_closed(min_header) before any hashing
+//     (decision card #6: nonzero flags/clear_bits/xor_key refused pre-hash).
+//   • donation u16 default = 66 (0.1%, decision card #5) — was 50 on BTC.
+//   • abswork stored %2^64 (NIT-2) so the in-memory value == the wire value
+//     (AbsworkV36Format::Write emits GetLow64()).
+//   • segwit_data ALWAYS populated (v36 >= SEGWIT_ACTIVATION => always active): a
+//     real SegwitData when a witness commitment exists, else SegwitDataDefault::get()
+//     (the 2^256-1 none-sentinel SSOT, share_types.hpp) rather than nullopt.
+//   • THE header-hash delta: share_hash = compute_share_hash(min_header, merkle_root)
+//     = BLAKE2b(reconstructed 164B v2 header) — replaces the BTC 80-byte SHA256d
+//     header assembly. PoW == block-identity duality preserved (share_identity.hpp),
+//     so pow_hash = share_hash exactly as the BTC lane. tx HASHING stays SHA256d.
+//
+// DEFINED-BUT-UNWIRED: nothing calls this at runtime. main_bip110 stays the M2
+// header-follower; PR-B wires create_share_fn + pool::SharechainNode and the
+// operator wire-genesis checkpoint gates the first mint.
 // ============================================================================
+template <typename TrackerT>
+uint256 create_local_share(
+    TrackerT& tracker,
+    const coin::BlockHeaderType& full_header,      // full 164B v2 header (was min_header)
+    const BaseScript& coinbase,
+    uint64_t subsidy,
+    const uint256& prev_share,
+    const std::vector<uint256>& merkle_branches,
+    const std::vector<unsigned char>& payout_script,
+    uint16_t donation = 66,                         // decision #5: 0.1% -> u16 66 (was 50)
+    const std::vector<MergedAddressEntry>& merged_addrs = {},
+    StaleInfo stale_info = StaleInfo::none,
+    bool segwit_active = true,                       // v36-genesis: segwit always active
+    const std::string& witness_commitment_hex = {},
+    const std::vector<unsigned char>& message_data = {},
+    const std::vector<unsigned char>& actual_coinbase_bytes = {},
+    const uint256& witness_root = uint256(),
+    uint32_t override_max_bits = 0,
+    uint32_t override_bits = 0,
+    // Frozen share fields from template time — when set, override computed values
+    // so ref_hash matches the one embedded in the coinbase.
+    uint32_t frozen_absheight = 0,
+    uint128  frozen_abswork = uint128(),
+    uint256  frozen_far_share_hash = uint256(),
+    uint32_t frozen_timestamp = 0,
+    uint256  frozen_merged_payout_hash = uint256(),
+    bool     has_frozen = false,
+    const std::vector<uint256>& frozen_merkle_branches = {},
+    const uint256& frozen_witness_root = uint256(),
+    const std::vector<unsigned char>& frozen_merged_coinbase_info = {},
+    int64_t share_version = 36,                      // v36-genesis: 36 only (was 35)
+    uint64_t desired_version = 36)
+{
+    (void)share_version;  // v36-genesis: no legacy branch to select.
+
+    // Split the full v2 header into the wire small header (drops the merkle root).
+    Bip110SmallBlockHeaderType min_header = Bip110SmallBlockHeaderType::from_full(full_header);
+
+    // FAIL-CLOSED (decision #6): refuse a header with nonzero flags/clear_bits/
+    // xor_key BEFORE anything is hashed. Throws std::invalid_argument (the share
+    // rejection convention). Every live BIP-110 fork block is flags=0.
+    check_header_fail_closed(min_header);
+
+    MergedMiningShare share;
+    share.m_min_header = min_header;
+    share.m_coinbase   = coinbase;
+    share.m_subsidy    = subsidy;
+    share.m_prev_hash  = prev_share;
+    share.m_donation   = donation;
+    share.m_stale_info = stale_info;
+    share.m_desired_version = desired_version;
+
+    // Timestamp: clip to at least previous_share.timestamp + 1 (matches Python)
+    share.m_timestamp  = min_header.m_timestamp;
+    if (!prev_share.IsNull() && tracker.chain.contains(prev_share)) {
+        uint32_t prev_ts = 0;
+        tracker.chain.get(prev_share).share.invoke([&](auto* prev) {
+            prev_ts = prev->m_timestamp;
+        });
+        if (share.m_timestamp <= prev_ts)
+            share.m_timestamp = prev_ts + 1;
+    }
+
+    // Compute pool-level share target AFTER timestamp clipping (matches ref_hash_fn).
+    auto desired_target = chain::bits_to_target(min_header.m_bits);
+    auto [share_max_bits, share_bits] = tracker.compute_share_target(
+        prev_share, share.m_timestamp, desired_target);
+    share.m_max_bits   = share_max_bits;
+    share.m_bits       = share_bits;
+
+    share.m_nonce      = 0; // share commitment nonce (not block nonce)
+    share.m_merged_addresses = merged_addrs;
+
+    {
+        LOG_INFO << "[create_local_share] merged_addresses=" << merged_addrs.size();
+    }
+
+    // Embed encrypted message_data (from create_message_data()) if provided
+    if (!message_data.empty())
+        share.m_message_data.m_data = message_data;
+
+    // Compute merged_payout_hash: deterministic hash of V36-only PPLNS weight
+    // distribution so peers can verify merged mining payouts.
+    if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
+    {
+        auto block_target = chain::bits_to_target(min_header.m_bits);
+        share.m_merged_payout_hash = tracker.compute_merged_payout_hash(
+            prev_share, block_target);
+    }
+
+    // Payout identity — extract pubkey_hash + pubkey_type from scriptPubKey.
+    // p2pool V36: 0=P2PKH, 1=P2WPKH, 2=P2SH.
+    if (payout_script.size() >= 20) {
+        if (payout_script.size() == 25 &&
+            payout_script[0] == 0x76 && payout_script[1] == 0xa9 &&
+            payout_script[2] == 0x14 && payout_script[23] == 0x88 &&
+            payout_script[24] == 0xac) {
+            std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 3, 20);
+            share.m_pubkey_type = 0;
+        } else if (payout_script.size() == 23 &&
+                   payout_script[0] == 0xa9 && payout_script[1] == 0x14 &&
+                   payout_script[22] == 0x87) {
+            std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 2, 20);
+            share.m_pubkey_type = 2;
+        } else if (payout_script.size() == 22 &&
+                   payout_script[0] == 0x00 && payout_script[1] == 0x14) {
+            std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 2, 20);
+            share.m_pubkey_type = 1;
+        } else {
+            std::memcpy(share.m_pubkey_hash.data(), payout_script.data(), 20);
+            share.m_pubkey_type = 0;
+        }
+    }
+
+    // Chain position: absheight and abswork from previous share.
+    if (!prev_share.IsNull() && tracker.chain.contains(prev_share)) {
+        auto [prev_height, last] = tracker.chain.get_height_and_last(prev_share);
+        tracker.chain.get(prev_share).share.invoke([&](auto* prev) {
+            share.m_absheight = prev->m_absheight + 1;
+        });
+
+        {
+            auto current_attempts = chain::target_to_average_attempts(
+                chain::bits_to_target(share.m_bits));
+            uint128 prev_abswork;
+            tracker.chain.get(prev_share).share.invoke([&](auto* prev) {
+                prev_abswork = prev->m_abswork;
+            });
+            share.m_abswork = prev_abswork + uint128(current_attempts.GetLow64());
+            // NIT-2: store mod 2^64 so the in-memory abswork == the wire value
+            // (AbsworkV36Format::Write emits GetLow64()); keeps a re-serialized
+            // local share byte-identical to a peer's decode of it.
+            share.m_abswork = uint128(share.m_abswork.GetLow64());
+        }
+
+        if (last.IsNull() && prev_height < 99) {
+            share.m_far_share_hash = uint256();
+        } else {
+            share.m_far_share_hash = tracker.chain.get_nth_parent_key(prev_share, 99);
+        }
+    } else {
+        // Genesis: absheight = 1, abswork = aps(bits) (mod 2^64, NIT-2).
+        share.m_absheight = 1;
+        share.m_abswork = uint128(chain::target_to_average_attempts(
+            chain::bits_to_target(share.m_bits)).GetLow64());
+        share.m_abswork = uint128(share.m_abswork.GetLow64());
+        share.m_far_share_hash = uint256();
+    }
+
+    // Override with frozen fields from template time (if available).
+    if (has_frozen) {
+        share.m_absheight = frozen_absheight;
+        share.m_abswork = uint128(frozen_abswork.GetLow64());   // NIT-2 wrap
+        share.m_far_share_hash = frozen_far_share_hash;
+        share.m_timestamp = frozen_timestamp;
+        share.m_merged_payout_hash = frozen_merged_payout_hash;
+        if (override_max_bits) share.m_max_bits = override_max_bits;
+        if (override_bits) share.m_bits = override_bits;
+        if (!frozen_merged_coinbase_info.empty()) {
+            try {
+                PackStream ps;
+                ps.write(std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(frozen_merged_coinbase_info.data()),
+                    frozen_merged_coinbase_info.size()));
+                ps >> share.m_merged_coinbase_info;
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[frozen] Failed to deserialize merged_coinbase_info ("
+                            << frozen_merged_coinbase_info.size() << " bytes): " << e.what();
+            }
+        }
+    }
+
+    // Random last_txout_nonce for OP_RETURN uniqueness.
+    share.m_last_txout_nonce = static_cast<uint64_t>(std::time(nullptr)) ^
+                               (static_cast<uint64_t>(min_header.m_nonce) << 32);
+
+    // ref_merkle_link: empty branch (ref_hash = hash_ref directly).
+    share.m_ref_merkle_link.m_branch.clear();
+    share.m_ref_merkle_link.m_index = 0;
+
+    // merkle_link: from Stratum merkle branches.
+    share.m_merkle_link.m_branch = merkle_branches;
+    share.m_merkle_link.m_index  = 0;
+
+    // segwit_data — v36 >= SEGWIT_ACTIVATION => ALWAYS active on this v36-genesis
+    // chain, so m_segwit_data is ALWAYS populated (has_value == true): a real
+    // SegwitData when a witness commitment exists, else the SegwitDataDefault
+    // none-sentinel (2^256-1 wtxid root, share_types.hpp) — the lane's SSOT, NOT
+    // the BTC lane's zero. This keeps the ref_hash / wire encoding self-consistent
+    // (the Formatter's Optional(..., SegwitDataDefault) always writes a value).
+    if (segwit_active && !witness_commitment_hex.empty())
+    {
+        SegwitData sd;
+        sd.m_txid_merkle_link.m_branch = (has_frozen && !frozen_merkle_branches.empty())
+            ? frozen_merkle_branches : merkle_branches;
+        sd.m_txid_merkle_link.m_index  = 0;
+        sd.m_wtxid_merkle_root = !frozen_witness_root.IsNull()
+            ? frozen_witness_root : witness_root;
+        share.m_segwit_data = sd;
+    }
+    else
+    {
+        share.m_segwit_data = SegwitDataDefault::get();
+    }
+
+    // --- Compute the ref_hash ---
+    PackStream ref_stream;
+    {
+        auto hex = PoolConfig::identifier_hex();
+        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+            unsigned char byte = static_cast<unsigned char>(
+                std::stoul(hex.substr(i, 2), nullptr, 16));
+            ref_stream.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(&byte), 1));
+        }
+    }
+    ref_stream << share.m_prev_hash;
+    ref_stream << share.m_coinbase;
+    ref_stream << share.m_nonce;
+    ref_stream << share.m_pubkey_hash;
+    ref_stream << share.m_pubkey_type;
+    ::Serialize(ref_stream, VarInt(share.m_subsidy));
+    ref_stream << share.m_donation;
+    { uint8_t si = static_cast<uint8_t>(share.m_stale_info); ref_stream << si; }
+    ::Serialize(ref_stream, VarInt(share.m_desired_version));
+    // segwit_data: PossiblyNoneType in p2pool — ALWAYS serialize. m_segwit_data is
+    // always populated on this v36-genesis chain (see above), so the value branch
+    // always runs; the None branch is retained for structural parity with verify.
+    if (share.m_segwit_data.has_value()) {
+        ref_stream << share.m_segwit_data.value();
+    } else {
+        std::vector<uint256> empty_branch;
+        ref_stream << empty_branch;
+        uint256 zero_root;
+        ref_stream << zero_root;
+    }
+    ref_stream << share.m_merged_addresses;
+    ref_stream << share.m_far_share_hash;
+    ref_stream << share.m_max_bits;
+    ref_stream << share.m_bits;
+    ref_stream << share.m_timestamp;
+    ref_stream << share.m_absheight;
+    ::Serialize(ref_stream, Using<AbsworkV36Format>(share.m_abswork));
+    ref_stream << share.m_merged_coinbase_info;
+    ref_stream << share.m_merged_payout_hash;
+    ref_stream << share.m_message_data;
+
+    auto ref_span_v = std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
+    uint256 hash_ref = Hash(ref_span_v);
+    uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
+
+    // Prefer the ref_hash frozen into the actual mined coinbase (last 44 bytes =
+    // ref_hash[32] + last_txout_nonce[8] + locktime[4]).
+    if (!actual_coinbase_bytes.empty() && actual_coinbase_bytes.size() > 44) {
+        uint256 coinbase_ref_hash;
+        std::memcpy(coinbase_ref_hash.data(),
+                     actual_coinbase_bytes.data() + actual_coinbase_bytes.size() - 44, 32);
+        ref_hash = coinbase_ref_hash;
+    }
+
+    // --- Derive hash_link from the actual mined coinbase (SHA256d gentx path,
+    // UNCHANGED by BIP-110 — tx hashing stays SHA256d) ---
+    auto gentx_before_refhash = compute_gentx_before_refhash(int64_t(36));
+
+    std::vector<unsigned char> coinbase_bytes_for_hashlink;
+    if (!actual_coinbase_bytes.empty()) {
+        coinbase_bytes_for_hashlink = actual_coinbase_bytes;
+    } else {
+        // Fallback (no actual bytes): reconstruct from PPLNS (unit-test path).
+        std::map<std::vector<unsigned char>, uint288> weights;
+        uint288 total_weight;
+
+        if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
+        {
+            auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+            auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
+            auto max_weight = chain::target_to_average_attempts(block_target)
+                              * PoolConfig::SPREAD * 65535;
+            auto result = tracker.get_v36_decayed_cumulative_weights(prev_share, chain_len, max_weight);
+            weights = std::move(result.weights);
+            total_weight = result.total_weight;
+        }
+
+        std::map<std::vector<unsigned char>, uint64_t> amounts;
+        if (!total_weight.IsNull()) {
+            for (auto& [script, weight] : weights) {
+                uint64_t amount = (uint288(subsidy) * weight / total_weight).GetLow64();
+                if (amount > 0)
+                    amounts[script] = amount;
+            }
+        }
+        uint64_t sum_amounts = 0;
+        for (auto& [s, a] : amounts) sum_amounts += a;
+        uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
+        if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
+            auto largest = std::max_element(amounts.begin(), amounts.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
+            if (largest != amounts.end() && largest->second > 0) {
+                largest->second -= 1; sum_amounts -= 1;
+                donation_amount = subsidy - sum_amounts;
+            }
+        }
+
+        const std::vector<unsigned char> combined_donation_script(
+            core::donation::COMBINED_DONATION_SCRIPT.begin(), core::donation::COMBINED_DONATION_SCRIPT.end());
+        const std::vector<unsigned char> p2pk_donation_script(
+            core::donation::DONATION_SCRIPT.begin(), core::donation::DONATION_SCRIPT.end());
+        auto payout_outputs = build_payout_outputs_excluding_donation(
+            amounts, combined_donation_script, p2pk_donation_script, donation_amount);
+        std::sort(payout_outputs.begin(), payout_outputs.end(),
+            [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second;
+                return a.first < b.first;
+            });
+        if (payout_outputs.size() > 4000)
+            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 4000);
+
+        PackStream gentx;
+        { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }
+        { unsigned char one = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&one), 1)); }
+        { uint256 z; gentx << z; }
+        { uint32_t idx = 0xffffffff; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&idx), 4)); }
+        gentx << share.m_coinbase;
+        { uint32_t seq = 0xffffffff; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&seq), 4)); }
+        size_t n_outs = payout_outputs.size() + 1 + 1;
+        bool has_segwit_fb = share.m_segwit_data.has_value();
+        if (has_segwit_fb) n_outs += 1;
+        if (n_outs < 253) { uint8_t cnt = (uint8_t)n_outs; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 1)); }
+        else { uint8_t m = 0xfd; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&m), 1)); uint16_t cnt = (uint16_t)n_outs; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 2)); }
+        auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script) {
+            gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), 8));
+            BaseScript bs; bs.m_data = script; gentx << bs;
+        };
+        if (has_segwit_fb) {
+            auto& sd = share.m_segwit_data.value();
+            std::vector<unsigned char> wscript = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+            uint256 commitment = compute_p2pool_witness_commitment(sd.m_wtxid_merkle_root);
+            auto cb = commitment.GetChars();
+            wscript.insert(wscript.end(), cb.begin(), cb.end());
+            write_txout(0, wscript);
+        }
+        for (auto& [script, amount] : payout_outputs) write_txout(amount, script);
+        write_txout(donation_amount, PoolConfig::get_donation_script(int64_t(36)));
+        { std::vector<unsigned char> op; op.push_back(0x6a); op.push_back(0x28);
+          op.insert(op.end(), ref_hash.data(), ref_hash.data() + 32);
+          uint64_t n = share.m_last_txout_nonce; auto* p = reinterpret_cast<const unsigned char*>(&n);
+          op.insert(op.end(), p, p + 8); write_txout(0, op); }
+        { uint32_t lt = 0; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&lt), 4)); }
+
+        coinbase_bytes_for_hashlink.assign(
+            reinterpret_cast<const unsigned char*>(gentx.data()),
+            reinterpret_cast<const unsigned char*>(gentx.data()) + gentx.size());
+    }
+
+    constexpr size_t suffix_len = 32 + 8 + 4; // ref_hash + last_txout_nonce + locktime
+    if (coinbase_bytes_for_hashlink.size() > suffix_len) {
+        std::vector<unsigned char> prefix(
+            coinbase_bytes_for_hashlink.begin(), coinbase_bytes_for_hashlink.end() - suffix_len);
+        share.m_hash_link = prefix_to_hash_link(prefix, gentx_before_refhash);
+
+        // Extract last_txout_nonce (8 bytes before locktime).
+        size_t nonce_offset = coinbase_bytes_for_hashlink.size() - 4 - 8;
+        uint64_t extracted_nonce = 0;
+        std::memcpy(&extracted_nonce, coinbase_bytes_for_hashlink.data() + nonce_offset, 8);
+        share.m_last_txout_nonce = extracted_nonce;
+    }
+
+    // --- Compute share hash (BIP-110 BLAKE2b block-identity over the 164B v2
+    // header — THE consensus delta vs the SHA256d lanes) ---
+    // tx HASHING is UNCHANGED (SHA256d): reconstruct the tx-merkle-root from the
+    // mined coinbase gentx + job merkle branches exactly as the BTC lane, then hash
+    // the reconstructed full v2 header through the BLAKE2b pipeline.
+    uint256 gentx_hash_for_header;
+    if (!actual_coinbase_bytes.empty()) {
+        auto actual_span = std::span<const unsigned char>(
+            actual_coinbase_bytes.data(), actual_coinbase_bytes.size());
+        gentx_hash_for_header = Hash(actual_span);
+    } else {
+        auto cb_span = std::span<const unsigned char>(
+            coinbase_bytes_for_hashlink.data(), coinbase_bytes_for_hashlink.size());
+        gentx_hash_for_header = Hash(cb_span);
+    }
+    // For the block-header merkle root, always use the actual job merkle branches
+    // (share.m_merkle_link), NOT the frozen segwit_data.txid_merkle_link.
+    uint256 merkle_root = check_merkle_link(gentx_hash_for_header, share.m_merkle_link);
+
+    // compute_share_hash() reinserts merkle_root @ offset 36 of the v2 header and
+    // runs bip110::pow::blake2b_block_hash. This IS the block-identity hash, so the
+    // p2pool share-hash/block-hash duality is preserved (pow_hash == share_hash).
+    uint256 share_hash = compute_share_hash(share.m_min_header, merkle_root);
+    share.m_hash = share_hash;
+
+    // Self-validation: PoW check against share target. pow_hash == share_hash
+    // because compute_share_hash is the block-identity hash.
+    {
+        uint256 target = chain::bits_to_target(share.m_bits);
+        if (!target.IsNull()) {
+            uint256 pow_hash = share_hash;
+
+            if (pow_hash > target) {
+                // Expected: most stratum pseudoshares don't meet share target.
+                return uint256();
+            }
+            share.m_pow_hash = pow_hash;
+            LOG_INFO << "[Pool] REAL SHARE CREATED! pow=" << pow_hash.GetHex().substr(0, 16)
+                     << " target=" << target.GetHex().substr(0, 16)
+                     << " diff=" << chain::target_to_difficulty(target);
+
+            // Cross-check the hash_link round-trip against the coinbase ref_hash.
+            {
+                auto gentx_before_refhash_xc = compute_gentx_before_refhash(int64_t(36));
+                std::vector<unsigned char> xc_data;
+                xc_data.insert(xc_data.end(), ref_hash.data(), ref_hash.data() + 32);
+                { uint64_t n = share.m_last_txout_nonce;
+                  auto* p = reinterpret_cast<const unsigned char*>(&n);
+                  xc_data.insert(xc_data.end(), p, p + 8); }
+                { uint32_t z = 0;
+                  auto* p = reinterpret_cast<const unsigned char*>(&z);
+                  xc_data.insert(xc_data.end(), p, p + 4); }
+                uint256 xc_gentx = check_hash_link(share.m_hash_link, xc_data, gentx_before_refhash_xc);
+                if (xc_gentx != gentx_hash_for_header) {
+                    static int xc_warn = 0;
+                    if (xc_warn++ < 10)
+                        LOG_WARNING << "[Pool] Cross-check mismatch (non-blocking)"
+                                    << " hl_gentx=" << xc_gentx.GetHex().substr(0, 16)
+                                    << " direct_gentx=" << gentx_hash_for_header.GetHex().substr(0, 16);
+                } else {
+                    LOG_INFO << "[Pool] Cross-check PASSED";
+                }
+            }
+        }
+    }
+
+    // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer).
+    auto* heap_share = new MergedMiningShare(share);
+    tracker.add(heap_share);
+    LOG_INFO << "create_local_share: added share " << share_hash.GetHex()
+             << " height=" << share.m_absheight
+             << " prev=" << prev_share.GetHex().substr(0, 16) << "...";
+
+    // Cross-check: generate_share_transaction on the just-created share must
+    // reproduce the same gentx_hash a peer will compute.
+    {
+        uint256 verify_hash = generate_share_transaction<MergedMiningShare>(
+            *heap_share, tracker, true,
+            (core::version_gate::is_v36_active(MergedMiningShare::version)));
+        if (verify_hash == gentx_hash_for_header) {
+            LOG_INFO << "[Pool] Cross-check PASSED";
+        } else {
+            LOG_WARNING << "[Pool] Cross-check FAILED! mined_gentx=" << gentx_hash_for_header.GetHex()
+                        << " verify_gentx=" << verify_hash.GetHex();
+        }
+    }
+
+    return share_hash;
+}
 
 } // namespace bip110::pool

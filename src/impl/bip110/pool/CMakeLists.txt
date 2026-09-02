@@ -77,3 +77,43 @@ target_link_libraries(bip110_pool_sharechain_compile
     Threads::Threads
 )
 add_test(NAME bip110_pool_sharechain_compile COMMAND bip110_pool_sharechain_compile)
+
+# bip110_pool_node_compile: the COMPILE + INSTANTIATION + LINK gate for the M3
+# PR-A-cont2 sharechain NODE layer + MINT path. It builds node.cpp +
+# protocol_actual.cpp (the namespace-copied sharechain node, the v36-genesis
+# single-protocol bridge, and the c2pool protocol handler) AS SOURCES, and the
+# test TU ODR-uses bip110::pool::Node / Actual::handle_message, constructs the
+# config-seam adapter (bip110::pool::Config), and instantiates the MINT template
+# create_local_share<ShareTracker> (from_full split + fail-closed + abswork %2^64
+# + BLAKE2b compute_share_hash header-identity). Same heavy shared/core/pool/
+# sharechain/storage link closure as bip110_pool_sharechain_compile because the
+# node reaches SharechainStorage, ReplyMatcher, the tx-advertiser, the coin seed
+# bootstrapper / template_other_txs, and (via share_identity.hpp -> pow.hpp)
+# BLAKE2b. NO protocol_legacy.cpp and NO config_*.cpp — the v36-genesis lane has a
+# single protocol and a header-only config adapter (no Fileconfig).
+add_executable(bip110_pool_node_compile
+    test/bip110_pool_node_compile.cpp
+    node.cpp
+    protocol_actual.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_pool_node_compile PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_pool_node_compile
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_pool_node_compile COMMAND bip110_pool_node_compile)
