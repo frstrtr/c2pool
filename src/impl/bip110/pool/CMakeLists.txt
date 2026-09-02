@@ -186,3 +186,38 @@ target_link_libraries(bip110_extend_mint_kat
     Threads::Threads
 )
 add_test(NAME bip110_extend_mint_kat COMMAND bip110_extend_mint_kat)
+
+# bip110_multiminer_pplns_kat: the F1b PPLNS-DISTRIBUTED-COINBASE KAT (M3 PR-C).
+# Where the extend_mint_kat proved the ref/hash_link half of peer acceptance with a
+# SINGLE-MINER coinbase (and its create_local_share log SHOWS the remaining gap:
+# "Cross-check FAILED! mined_gentx=<single-miner> verify_gentx=<PPLNS>"), THIS KAT
+# seeds a real 2-share window (miner A <- miner B), builds the FLAG-ON coinbase the
+# way build_connection_coinbase now does (get_expected_payouts -> sorted/capped
+# outputs + P2POOL witness commitment + donation second-to-last + OP_RETURN ref),
+# mints the extend share, and asserts generate_share_transaction == that coinbase
+# byte-for-byte — i.e. the Cross-check now PASSES and peers ACCEPT the share. Same
+# heavy link closure as the extend_mint_kat. blake2b.c compiled directly.
+add_executable(bip110_multiminer_pplns_kat
+    test/bip110_multiminer_pplns_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_multiminer_pplns_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_multiminer_pplns_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_multiminer_pplns_kat COMMAND bip110_multiminer_pplns_kat)

@@ -109,6 +109,23 @@ public:
         const std::vector<unsigned char>& payout_script,
         uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)>;
 
+    // Sharechain PPLNS-payout producer (M3 PR-C F1b, flag-ON only). Given the job's
+    // prev_share_hash (the sharechain tip) + the BLOCK subsidy + the canonical
+    // donation script, returns the {scriptPubKey -> amount} map for the ENTIRE
+    // decayed PPLNS window — EXACTLY what the verify SSOT generate_share_transaction
+    // (share_check.hpp) reconstructs off the minted share (get_expected_payouts,
+    // share_tracker.hpp). main_bip110 wires this to a lambda that, under
+    // read_tracker(), calls ShareTracker::get_expected_payouts. build_connection_
+    // coinbase consumes the map on the flag-ON path: extracts the donation entry,
+    // sorts the miner outputs asc(amount, script), applies the 4000-output cap, and
+    // emits them (donation output second-to-last, OP_RETURN ref last) so the minted
+    // coinbase == generate_share_transaction byte-for-byte (peers ACCEPT the share).
+    // Left UNSET in M2 (default OFF) => build_connection_coinbase keeps the single-
+    // miner split (byte-identical to today). Mirrors main_btc.cpp set_pplns_fn.
+    using PplnsFn = std::function<std::map<std::vector<unsigned char>, double>(
+        const uint256& prev_share_hash, const uint256& block_target,
+        uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
+
     Bip110WorkSource(bip110::coin::HeaderChain& chain,
                      bool is_testnet,
                      SubmitBlockFn submit_fn,
@@ -186,6 +203,11 @@ public:
     // seam); ref_hash_fn_ produces the coinbase ref commitment + frozen fields.
     void set_best_share_hash_fn(std::function<uint256()> fn) { best_share_hash_fn_ = std::move(fn); }
     void set_ref_hash_fn(RefHashFn fn) { ref_hash_fn_ = std::move(fn); }
+    // M3 PR-C F1b: the PPLNS-distributed coinbase producer (flag-ON only). Set from
+    // main_bip110 INSIDE the --bip110-sharechain block alongside set_ref_hash_fn.
+    // When unset (M2 default OFF) build_connection_coinbase keeps the single-miner
+    // split — byte-identical to M2.
+    void set_pplns_fn(PplnsFn fn) { pplns_fn_ = std::move(fn); }
 
     // ── M3 daemonless mempool tx-serving ─────────────────────────────────
     // Wire the embedded mempool (P2P-ingested, daemonlessly priced) so templates
@@ -248,6 +270,7 @@ private:
     // M3 PR-C sharechain ref-commitment (flag-ON only; unset in M2). See setters.
     std::function<uint256()>     best_share_hash_fn_;   // sharechain tip -> job.prev_share_hash
     RefHashFn                    ref_hash_fn_;          // coinbase ref_hash + frozen fields
+    PplnsFn                      pplns_fn_;             // F1b: PPLNS-distributed coinbase payouts (flag-ON only)
 
     // M3 mempool tx-serving. Read-only pointer; owned by main_bip110.
     bip110::coin::Mempool*       mempool_{nullptr};

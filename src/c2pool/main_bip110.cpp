@@ -515,6 +515,32 @@ int run_embedded(bool coin_p2p_discover,
                 return node_raw->best_share_hash();
             });
 
+        // (7b) M3 PR-C F1b: the PPLNS-distributed coinbase producer. Under
+        // read_tracker() (non-blocking; refuses the refresh if the compute thread
+        // holds the exclusive lock), calls ShareTracker::get_expected_payouts —
+        // the SSOT that returns the {scriptPubKey -> amount} map for the ENTIRE
+        // decayed PPLNS window, folding the residual into the donation script.
+        // build_connection_coinbase emits those outputs (sorted/capped, donation
+        // second-to-last) so the minted coinbase == generate_share_transaction
+        // byte-for-byte and peers ACCEPT the share. Mirrors main_btc.cpp
+        // set_pplns_fn; no AutoRatchet (v36 always), no v35 branch, no merged
+        // mining. Empty map (tracker busy) => build_connection_coinbase refuses the
+        // sharechain job (fail-closed). Set ONLY inside this flag-ON block, so its
+        // presence is the exact --bip110-sharechain predicate.
+        work_source->set_pplns_fn(
+            [node_raw](const uint256& prev, const uint256& block_target,
+                       uint64_t subsidy, const std::vector<unsigned char>& donation_script)
+                -> std::map<std::vector<unsigned char>, double> {
+                if (!node_raw) return {};
+                auto guard = node_raw->read_tracker();
+                if (!guard) return {};                 // tracker busy -> refuse this refresh
+                try {
+                    return guard->get_expected_payouts(prev, block_target, subsidy, donation_script);
+                } catch (const std::exception&) {
+                    return {};
+                }
+            });
+
         // (8) M3 PR-C: the coinbase ref-commitment producer. Walks the share
         // tracker off prev_share_hash for the deterministic chain-position fields
         // (absheight/abswork/far_share_hash) + the share target (compute_share_
