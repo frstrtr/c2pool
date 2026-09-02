@@ -1,0 +1,45 @@
+# C2Pool Bitcoin BIP110 (Knots BLAKE2b fork) Mainnet Configuration
+#
+# Zero-config startup: run ./start.sh (Linux/macOS) or start.bat (Windows).
+# Miners set their payout address as the stratum username (p2pool-style).
+# CLI arguments always override values set here.
+#
+# BIP-110 is a minority hard fork of Bitcoin (Bitcoin Knots 29.4.1) that
+# replaces SHA256d proof-of-work with the BLAKE2b commitment pipeline from
+# block 961640 onward. It shares Bitcoin mainnet's address encoding, network
+# magic, and genesis, but runs its own c2pool sharechain (distinct P2P
+# identity) so it never cross-dials the BTC p2pool network.
+
+# --- Network -----------------------------------------------------------------
+port: 9335                     # p2pool sharechain P2P port (BIP-110 mainnet default)
+# stratum_port:                # Stratum is opt-in for this coin: enable with --stratum [HOST:]PORT
+web_port: 8080                 # Web dashboard / JSON-RPC API port
+http_host: "0.0.0.0"           # HTTP bind address
+# external_ip: ""              # Public IP/domain for stratum URL display
+#
+# Port forwarding (if behind NAT/firewall):
+#   9335 TCP  — P2P sharechain (REQUIRED for full p2pool participation)
+#   8333 TCP  — coin P2P (recommended for faster daemon sync)
+
+# --- Operating mode ----------------------------------------------------------
+# Deployment: EXTERNAL Bitcoin Knots 29.4.1 RPC for block templates
+# (getblocktemplate with the "blake2b" rule). Run a full Knots BIP-110 node
+# and set the rpc fields below. The pool MUST request the "blake2b" GBT rule;
+# a non-BIP-110 backend rejects it.
+
+# --- Fork peers (BIP-110 minority chain) -------------------------------------
+# BIP-110 is a minority fork; seed from known fork nodes with addnode (NOT
+# connect, which would restrict you to only those peers):
+# addnode:
+#   - "<fork-peer-host>:8333"
+
+# --- Bootstrap header checkpoint (optional) ----------------------------------
+# Skip old headers on first sync.  Format: HEIGHT:BLOCK_HASH
+# header_checkpoint: "HEIGHT:BLOCK_HASH"   # set for faster first sync
+
+# --- Coin daemon RPC (for non-embedded / daemon mode) ------------------------
+# Keys accept the btc_rpc_* aliases (BIP-110 reuses the Bitcoin RPC client).
+# btc_rpc_host: 127.0.0.1
+# btc_rpc_port: 8332           # your Knots BIP-110 daemon's RPC port
+# btc_rpc_user: user
+# btc_rpc_password: pass
