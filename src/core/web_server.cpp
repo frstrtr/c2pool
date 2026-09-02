@@ -4826,6 +4826,15 @@ nlohmann::json MiningInterface::rest_web_currency_info()
 {
     nlohmann::json result = nlohmann::json::object();
 
+    // Coin capability flag consumed by the dashboard's Miners-Block-Value card.
+    // Only DASH carries protocol lanes deducted from the coinbase before the
+    // miner split (masternode payment + platform/treasury DIP-0027 burn); the
+    // card must NOT claim MN/treasury deductions on a Bitcoin-family coin
+    // (BTC/LTC/DOGE/DGB/BCH/NMC/BIP110), whose block value IS the plain coinbase
+    // subsidy. Default false here; the DASH case flips it true. This is the
+    // authority — the front-end falls back to sym==='DASH' only if it is absent.
+    result["has_treasury"] = false;
+
     // Label-keyed coins that share a Blockchain enum value with another chain
     // resolve their identity from the configured coin label, NOT the enum:
     //   - BCH runs on Blockchain::BITCOIN + set_coin_label("BCH") (it has no
@@ -4943,6 +4952,7 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     case Blockchain::DASH:
         result["symbol"] = "DASH";
         result["name"] = "Dash";
+        result["has_treasury"] = true;  // MN payment + platform/treasury (DIP-0027) lanes
         result["block_period"] = 150;  // 2.5 min average
         if (!m_custom_address_explorer.empty()) {
             result["address_explorer_url_prefix"] = m_custom_address_explorer;
