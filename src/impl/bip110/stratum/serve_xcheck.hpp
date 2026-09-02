@@ -39,6 +39,8 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace bip110 {
@@ -53,6 +55,11 @@ inline std::optional<uint64_t> xcheck_resum_fees(
     const core::coin::ChainLimits& limits)
 {
     std::map<uint256, std::vector<int64_t>> decoded_vout;  // in-template parents
+    // BELT-3(b) — TEMPLATE-WIDE outpoint set across ALL decoded txs' inputs. A
+    // failed insert catches BOTH an across-tx double-spend AND a within-tx
+    // duplicate input (CVE-2018-17144) directly from the frozen bytes the block
+    // will actually carry — independent of add_tx and the assembler.
+    std::set<std::pair<uint256, uint32_t>> seen_outpoints;
     uint64_t fee_sum = 0;
 
     for (const auto& bytes : frozen_body_bytes) {
@@ -61,6 +68,11 @@ inline std::optional<uint64_t> xcheck_resum_fees(
         try { bip110::coin::UnserializeTransaction(dtx, ps, bip110::coin::TX_WITH_WITNESS); }
         catch (...) { return std::nullopt; }
         if (!ps.empty()) return std::nullopt;    // trailing bytes ⇒ malformed
+
+        // BELT-3(a) — structural floor on the DECODED bytes: an empty-vin or
+        // empty-vout tx must never sit in a served template (an empty-vout tx
+        // otherwise prices fee=value_in and would PASS the re-sum below).
+        if (dtx.vin.empty() || dtx.vout.empty()) return std::nullopt;
 
         // txid over the NON-witness serialization (segwit-invariant).
         uint256 txid;
@@ -71,6 +83,9 @@ inline std::optional<uint64_t> xcheck_resum_fees(
 
         int64_t value_in = 0;
         for (const auto& vin : dtx.vin) {
+            // BELT-3(b) — template-wide outpoint uniqueness (within-tx AND across-tx).
+            if (!seen_outpoints.insert({vin.prevout.hash, vin.prevout.index}).second)
+                return std::nullopt;
             int64_t v = -1;
             auto pit = decoded_vout.find(vin.prevout.hash);
             if (pit != decoded_vout.end() && vin.prevout.index < pit->second.size()) {

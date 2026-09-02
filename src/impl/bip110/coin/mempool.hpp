@@ -12,6 +12,7 @@
 
 #include "block.hpp"
 #include "transaction.hpp"
+#include "check_transaction.hpp"
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -129,6 +130,24 @@ public:
     /// or from a parent mempool transaction (chain-of-unconfirmed / CPFP).
     bool add_tx(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
         uint256 txid = compute_txid(tx);
+
+        // ── STRUCTURAL VALIDITY — fail-closed BEFORE pricing (Bitcoin Core
+        // CheckTransaction + coinbase mempool-reject). check_transaction() reads
+        // only the tx (lock-free), so it runs ahead of the mutex. A tx that fails
+        // here is NEVER priced (compute_fee_locked never runs), NEVER enters
+        // m_pool/m_spent_outputs/m_feerate_index, and never bumps the epoch. This
+        // closes the pre-M3 hole: a within-tx duplicate input (CVE-2018-17144)
+        // fabricated a positive fee, and an empty-vout tx priced fee=value_in —
+        // either would reach a consensus-INVALID served block. Modelled on the
+        // GAP1 Layer-A REJECT log line below.
+        {
+            std::string reason;
+            if (!check_transaction(tx, m_limits, reason)) {
+                LOG_INFO << "[EMB-BIP110] Mempool REJECT structural " << reason
+                         << " txid=" << txid.GetHex().substr(0, 16);
+                return false;
+            }
+        }
 
         std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -521,6 +540,20 @@ public:
     /// tx bytes, so the stored values are exactly the parent's real outputs.
     /// TTL-bounded; superseded once the coin lands in the UTXO view.
     void add_parent_priced(const MutableTransaction& parent) {
+        // Same structural floor as add_tx: the subscriber (main_bip110.cpp) calls
+        // add_parent_priced BEFORE add_tx, so without this a structurally invalid
+        // tx would still seed the T3 priced-parent side table and pollute a
+        // child's fee-known pricing off a parent that can never confirm. Fetched
+        // parents arrive over relay (getdata tx), which never serves coinbases, so
+        // the coinbase-reject arm never rejects a legitimate parent here.
+        {
+            std::string reason;
+            if (!check_transaction(parent, m_limits, reason)) {
+                LOG_INFO << "[EMB-BIP110] Parent-priced REJECT structural " << reason
+                         << " txid=" << compute_txid(parent).GetHex().substr(0, 16);
+                return;
+            }
+        }
         uint256 ptxid = compute_txid(parent);
         std::vector<int64_t> vals;
         vals.reserve(parent.vout.size());

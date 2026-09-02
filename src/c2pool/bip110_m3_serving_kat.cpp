@@ -25,6 +25,7 @@
 
 #include <impl/bip110/coin/block_assembler.hpp>
 #include <impl/bip110/coin/mempool.hpp>
+#include <impl/bip110/coin/check_transaction.hpp>
 #include <impl/bip110/coin/template_builder.hpp>
 #include <impl/bip110/coin/transaction.hpp>
 #include <impl/bip110/coin/block.hpp>
@@ -102,6 +103,28 @@ bip110::coin::MutableTransaction mk_tx_spk(const uint256& prev, uint32_t idx, in
                                            std::vector<unsigned char> spk) {
     auto tx = mk_tx(prev, idx, value);
     tx.vout[0].scriptPubKey.m_data = std::move(spk);
+    return tx;
+}
+
+// A tx with an EXPLICIT list of (prevhash, index) inputs and (value) outputs —
+// used by the adversarial structural cases (dup input, empty vin/vout, negative /
+// overflow outputs, coinbase / prevout-null, oversize).
+bip110::coin::MutableTransaction mk_tx_multi(
+    const std::vector<std::pair<uint256, uint32_t>>& ins,
+    const std::vector<int64_t>& outs) {
+    bip110::coin::MutableTransaction tx;
+    for (const auto& in_pair : ins) {
+        bip110::coin::TxIn in;
+        in.prevout.hash = in_pair.first;
+        in.prevout.index = in_pair.second;
+        in.sequence = 0xffffffff;
+        tx.vin.push_back(in);
+    }
+    for (int64_t v : outs) {
+        bip110::coin::TxOut o;
+        o.value = v;
+        tx.vout.push_back(o);
+    }
     return tx;
 }
 
@@ -520,6 +543,167 @@ int main() {
         expect("unpriced_count() == 1", pool.unpriced_count() == 1);
         auto samp = pool.unpriced_sample(8);
         expect("unpriced_sample surfaces the unpriceable txid", samp.size() == 1);
+    }
+
+    // ── (15) STRUCTURAL CheckTransaction port — named-reason adversarial cases ─
+    // The OPEN HOLE Fable proved: no structural tx validation existed between the
+    // wire and the template. check_transaction() (Bitcoin Core consensus/
+    // tx_check.cpp + coinbase mempool-reject) is the fail-closed floor. Assert the
+    // EXACT Core error string for every shape.
+    std::printf("--- (15) STRUCTURAL CheckTransaction (adversarial, named) ---\n");
+    {
+        std::string why;
+        const uint256 op1h = h_of(0x51);
+        const int64_t maxm = core::coin::LTC_LIMITS.max_money;
+
+        // A. WITHIN-TX DUP INPUT (CVE-2018-17144). PRE-FIX the pricer double-
+        //    counts the coin ⇒ FABRICATED fee 2*100000-150000 = 50000.
+        auto dup = mk_tx_multi({{op1h, 0}, {op1h, 0}}, {150000});
+        expect("A dup-input REJECT bad-txns-inputs-duplicate",
+               !check_transaction(dup, core::coin::LTC_LIMITS, why) && why == "bad-txns-inputs-duplicate");
+        // B. EMPTY VOUT. PRE-FIX priced fee = whole input (100000).
+        auto evout = mk_tx_multi({{op1h, 0}}, {});
+        expect("B empty-vout REJECT bad-txns-vout-empty",
+               !check_transaction(evout, core::coin::LTC_LIMITS, why) && why == "bad-txns-vout-empty");
+        // C. EMPTY VIN.
+        auto evin = mk_tx_multi({}, {1000});
+        expect("C empty-vin REJECT bad-txns-vin-empty",
+               !check_transaction(evin, core::coin::LTC_LIMITS, why) && why == "bad-txns-vin-empty");
+        // D. NEGATIVE OUTPUT — single, and hidden inside a netting {+X,-X} pair
+        //    (per-output check precedes summation, so a negative cannot hide).
+        auto negv = mk_tx_multi({{op1h, 0}}, {-1});
+        expect("D negative-output REJECT bad-txns-vout-negative",
+               !check_transaction(negv, core::coin::LTC_LIMITS, why) && why == "bad-txns-vout-negative");
+        auto netv = mk_tx_multi({{op1h, 0}}, {100000, -100000});
+        expect("D netting {+X,-X} STILL REJECT bad-txns-vout-negative",
+               !check_transaction(netv, core::coin::LTC_LIMITS, why) && why == "bad-txns-vout-negative");
+        // E. OVERFLOW — single > MAX_MONEY, and two below-cap summing above.
+        auto over1 = mk_tx_multi({{op1h, 0}}, {maxm + 1});
+        expect("E single>MAX_MONEY REJECT bad-txns-vout-toolarge",
+               !check_transaction(over1, core::coin::LTC_LIMITS, why) && why == "bad-txns-vout-toolarge");
+        auto over2 = mk_tx_multi({{op1h, 0}}, {maxm - 10, 100});
+        expect("E sum>MAX_MONEY REJECT bad-txns-txouttotal-toolarge",
+               !check_transaction(over2, core::coin::LTC_LIMITS, why) && why == "bad-txns-txouttotal-toolarge");
+        // F. COINBASE-IN-MEMPOOL + prevout-null in a non-coinbase.
+        auto cb = mk_tx_multi({{uint256::ZERO, 0xffffffff}}, {5000000000LL});
+        cb.vin[0].scriptSig.m_data = std::vector<unsigned char>(10, 0x00);  // 2..100 bytes
+        expect("F coinbase-in-mempool REJECT coinbase",
+               !check_transaction(cb, core::coin::LTC_LIMITS, why) && why == "coinbase");
+        auto pnull = mk_tx_multi({{op1h, 0}, {uint256::ZERO, 0xffffffff}}, {1000});
+        expect("F prevout-null (2-vin non-coinbase) REJECT bad-txns-prevout-null",
+               !check_transaction(pnull, core::coin::LTC_LIMITS, why) && why == "bad-txns-prevout-null");
+        // G. OVERSIZE — base_size*4 > RDTS 800000 (base > 200000 bytes).
+        auto big = mk_tx_multi({{op1h, 0}}, {1000});
+        big.vin[0].scriptSig.m_data = std::vector<unsigned char>(250000, 0x00);
+        expect("G oversize REJECT bad-txns-oversize",
+               !check_transaction(big, core::coin::LTC_LIMITS, why) && why == "bad-txns-oversize");
+        // Sanity: an honest 1-in/1-out spend PASSES.
+        auto honest = mk_tx_multi({{op1h, 0}}, {90000});
+        expect("honest 1-in/1-out spend PASSES check_transaction",
+               check_transaction(honest, core::coin::LTC_LIMITS, why));
+    }
+
+    // ── (15b) PRODUCTION-PATH PROBE re-run (the exact shape Fable used) ───────
+    // Drive the REAL Mempool::add_tx (+ add_parent_priced subscriber ordering) +
+    // UTXOViewCache pricing with the two proven exploits. admitted=0, no
+    // fabricated fee, and the assembled template stays coinbase-only.
+    std::printf("--- (15b) PRODUCTION PATH probe: dup-input + empty-vout admitted=0 ---\n");
+    {
+        std::string path = "/tmp/bip110_kat_struct_" + std::to_string(::getpid());
+        core::coin::UTXOViewDB db(path); db.open();
+        core::coin::UTXOViewCache utxo(&db);
+        uint256 fund = h_of(0x77);
+        utxo.add_coin(core::coin::Outpoint(fund, 0),
+                      core::coin::Coin(100000, OPScript{}, /*height*/1, /*coinbase*/false));
+        Mempool pool; pool.set_utxo(&utxo); pool.set_tip_height(1000);
+
+        // (a) within-tx dup input — PRE-FIX fabricated fee 2*100000-150000=50000.
+        auto dup = mk_tx_multi({{fund, 0}, {fund, 0}}, {150000});
+        pool.add_parent_priced(dup);                 // subscriber runs this FIRST
+        bool dup_added = pool.add_tx(dup, &utxo);
+        expect("(a) dup-input NOT admitted", !dup_added);
+        // (b) empty vout — PRE-FIX priced fee = whole input (100000).
+        auto evout = mk_tx_multi({{fund, 0}}, {});
+        pool.add_parent_priced(evout);
+        bool ev_added = pool.add_tx(evout, &utxo);
+        expect("(b) empty-vout NOT admitted", !ev_added);
+
+        expect("mempool empty after both probes (size==0)", pool.size() == 0);
+        expect("mempool fees==0 (no fabricated fee)", pool.total_fees() == 0);
+
+        auto ps = pool.snapshot_priced();
+        auto pt = pool.all_txids();
+        std::set<uint256> ids(pt.begin(), pt.end());
+        ConfirmedInputView v;
+        v.is_confirmed_mature = [&utxo](const uint256& h, uint32_t i) {
+            core::coin::Outpoint o(h, i); core::coin::Coin c; return utxo.get_coin(o, c); };
+        v.script_of = [&utxo](const uint256& h, uint32_t i)
+            -> std::optional<std::vector<unsigned char>> {
+            core::coin::Outpoint o(h, i); core::coin::Coin c;
+            if (!utxo.get_coin(o, c)) return std::nullopt; return c.scriptPubKey.m_data; };
+        AssemblyResult rr = assemble_block_txs(ps, ids, 799000, v);
+        std::printf("PROBE: dup_added=%d empty_added=%d pool=%zu fees=%llu template_txs=%zu\n",
+                    (int)dup_added, (int)ev_added, pool.size(),
+                    (unsigned long long)pool.total_fees(), rr.txs.size());
+        expect("template txcount stays coinbase-only (0 selected txs)", rr.txs.size() == 0);
+    }
+
+    // ── (16) BELT-AND-SUSPENDERS (each independent of add_tx) ─────────────────
+    std::printf("--- (16) BELT: assembler self-conflict (bypasses add_tx) ---\n");
+    {
+        // A priced entry (fee_known=true, the set_tx_fee/test path) whose OWN vin
+        // lists an outpoint twice. is_safe marks it self-conflict ⇒ excluded, and
+        // the global uniqueness sweep proves no outpoint repeats.
+        const uint256 SC = h_of(0x71);
+        MempoolEntry e;
+        e.tx = mk_tx_multi({{CONFIRMED, 7}, {CONFIRMED, 7}}, {1000});
+        e.txid = SC; e.fee = 5000; e.weight = 400; e.fee_known = true; e.base_size = 100;
+        std::vector<MempoolEntry> ps = { e };
+        std::set<uint256> pt = { SC };
+        AssemblyResult r = assemble_block_txs(ps, pt, cap, synth_view);
+        expect("self-conflict tx EXCLUDED from template", index_of(r.txs, SC) == SIZE_MAX);
+        expect("self-conflict tx named self-conflict", has_exclusion(r, SC, "self-conflict"));
+        std::set<std::pair<uint256, uint32_t>> ops; bool uniq = true;
+        for (const auto& t : r.txs)
+            for (const auto& vin : t.tx.vin)
+                if (!ops.insert({vin.prevout.hash, vin.prevout.index}).second) uniq = false;
+        expect("no repeated outpoint in assembled set", uniq);
+    }
+
+    std::printf("--- (16b) BELT: serve_xcheck structural floor + template-wide dup ---\n");
+    {
+        std::string path = "/tmp/bip110_kat_xbelt_" + std::to_string(::getpid());
+        core::coin::UTXOViewDB db(path); db.open();
+        core::coin::UTXOViewCache utxo(&db);
+        uint256 fund  = h_of(0x88);
+        uint256 fund2 = h_of(0x89);
+        utxo.add_coin(core::coin::Outpoint(fund, 0),  core::coin::Coin(200000, OPScript{}, 1, false));
+        utxo.add_coin(core::coin::Outpoint(fund2, 0), core::coin::Coin(200000, OPScript{}, 1, false));
+        auto utxo_get = [&utxo](const core::coin::Outpoint& op, core::coin::Coin& c) -> bool {
+            return utxo.get_coin(op, c); };
+        auto ser = [](bip110::coin::MutableTransaction tx) {
+            auto packed = pack(TX_WITH_WITNESS(tx));
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(packed.data());
+            return std::vector<unsigned char>(p, p + packed.size()); };
+
+        // (i) within-tx dup — caught by the template-wide seen-outpoint set.
+        auto dupb = mk_tx_multi({{fund, 0}, {fund, 0}}, {150000});
+        expect("xcheck within-tx-dup body ⇒ nullopt",
+               !bip110::stratum::xcheck_resum_fees({ ser(dupb) }, utxo_get, core::coin::LTC_LIMITS).has_value());
+        // (ii) two txs spending the same outpoint — across-tx double-spend.
+        auto s1 = mk_tx_multi({{fund, 0}}, {150000});
+        auto s2 = mk_tx_multi({{fund, 0}}, {140000});
+        expect("xcheck across-tx double-spend body ⇒ nullopt",
+               !bip110::stratum::xcheck_resum_fees({ ser(s1), ser(s2) }, utxo_get, core::coin::LTC_LIMITS).has_value());
+        // (iii) empty-vout — structural floor (pre-fix priced fee=value_in, PASSED).
+        auto eb = mk_tx_multi({{fund, 0}}, {});
+        expect("xcheck empty-vout body ⇒ nullopt",
+               !bip110::stratum::xcheck_resum_fees({ ser(eb) }, utxo_get, core::coin::LTC_LIMITS).has_value());
+        // Control: two DISTINCT-outpoint honest txs re-sum fine (50000+20000).
+        auto h1 = mk_tx_multi({{fund, 0}},  {150000});
+        auto h2 = mk_tx_multi({{fund2, 0}}, {180000});
+        auto rok = bip110::stratum::xcheck_resum_fees({ ser(h1), ser(h2) }, utxo_get, core::coin::LTC_LIMITS);
+        expect("xcheck honest distinct-outpoint pair re-sums (70000)", rok.has_value() && *rok == 70000);
     }
 
     std::printf("%s\n", g_fail == 0 ? "bip110_m3_serving_kat PASS" : "bip110_m3_serving_kat FAIL");

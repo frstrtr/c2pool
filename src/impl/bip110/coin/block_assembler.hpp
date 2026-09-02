@@ -144,8 +144,17 @@ inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced
         visiting[i] = 1;
         bool ok = true;
         std::string reason;
+        // BELT-1 — WITHIN-TX duplicate input (self-conflict). A tx whose own vin
+        // lists an outpoint twice fabricates a positive fee via the pricer's
+        // double-count (CVE-2018-17144 shape). check_transaction at add_tx already
+        // rejects it, but this independent per-tx set makes it UNSAFE (never a
+        // candidate, never emitted) even if a future add-path bug lets one in.
+        std::set<std::pair<uint256, uint32_t>> own_ops;
         for (const auto& vin : priced[i].tx.vin) {
             const uint256& ph = vin.prevout.hash;
+            if (!own_ops.insert({ph, vin.prevout.index}).second) {
+                ok = false; reason = "self-conflict"; break;
+            }
             auto it = idx_of.find(ph);
             if (it != idx_of.end()) {                 // in-mempool priced parent
                 if (!is_safe(it->second)) { ok = false; reason = "unpriced-in-mempool-parent"; break; }
@@ -238,6 +247,23 @@ inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced
         topo(c.i, order);   // emits only not-yet-emitted, parents first
         for (size_t j : order) {
             if (selected[j]) continue;
+            // BELT-2 — WITHIN-TX self-conflict, detected on a per-tx local set
+            // FIRST so a rejected tx's outpoints never poison the template-wide
+            // `claimed` set (which would falsely exclude later honest txs). Layer
+            // B below then checks `claimed` and bulk-inserts. is_safe already
+            // marks self-conflict UNSAFE, so this is defense against add-path /
+            // test-path (set_tx_fee) entries that bypass is_safe's exclusion.
+            {
+                bool self_conflict = false;
+                std::set<std::pair<uint256, uint32_t>> own;
+                for (const auto& vin : priced[j].tx.vin)
+                    if (!own.insert({vin.prevout.hash, vin.prevout.index}).second) { self_conflict = true; break; }
+                if (self_conflict) {
+                    emitted[j] = 1;   // stays unselected; never counted / emitted
+                    R.excluded.emplace_back(priced[j].txid, "self-conflict");
+                    continue;
+                }
+            }
             // GAP1 Layer B — refuse any tx whose input was already claimed by an
             // earlier-emitted tx in this template. With Layer A (reject-at-add)
             // this is nearly unreachable in production, but it still catches
@@ -280,12 +306,13 @@ inline AssemblyResult assemble_block_txs(const std::vector<MempoolEntry>& priced
                 auto it = pos.find(vin.prevout.hash);
                 // parent in our selected set but NOT earlier => invariant broken
                 if (idx_of.count(vin.prevout.hash) && it == pos.end()) { ok = false; break; }
-                // outpoint already spent by an earlier selected tx => double-spend
-                if (seen_ops.count({vin.prevout.hash, vin.prevout.index})) { ok = false; break; }
+                // BELT-2 — insert-with-result: a failed insert means this outpoint
+                // already appears, either in an EARLIER selected tx (across-tx
+                // double-spend) OR earlier in THIS tx's own vin (within-tx dup /
+                // CVE-2018-17144). Both trip ok=false and drop the offending suffix.
+                if (!seen_ops.insert({vin.prevout.hash, vin.prevout.index}).second) { ok = false; break; }
             }
             if (!ok) { good = k; break; }
-            for (const auto& vin : R.txs[k].tx.vin)
-                seen_ops.insert({vin.prevout.hash, vin.prevout.index});
             pos[R.txs[k].txid] = k;
         }
         if (good < R.txs.size()) {
