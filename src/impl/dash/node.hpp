@@ -338,6 +338,37 @@ protected:
     // to protect the best chains from head pruning.
     std::vector<uint256> m_last_top5_heads;
 
+    // Restart-reorg supersede hint from the last think()/clean cycle
+    // (ShareTracker::compute_supersede_hint). When active it names a genuine
+    // higher-work fork the node is converging onto after a warm restart; used
+    // by clean_tracker() to exempt the converging challenger segment from
+    // stale-head eating and tail-dropping so its verification is not thrown
+    // away and restarted every ~300s (which would re-create the original
+    // stuck-on-persisted-head latch). Inactive on a healthy node.
+    dash::SupersedeHint m_supersede_hint;
+
+    // ── Supersede-convergence liveness (tip-freeze livelock fix) ──────────
+    // The restart-reorg elevated verify budget assumes the challenger segment
+    // will eventually verify to CHAIN_LENGTH and the Phase-3 argmax will flip.
+    // That assumption fails when the challenger's missing parent is UNOBTAINABLE
+    // — no connected peer still retains it. Then the challenger's verified height
+    // never advances, compute_supersede_hint re-arms it every cycle, and think()
+    // draws the elevated verify budget on the same never-winning shares forever:
+    // a treadmill that holds the exclusive tracker lock. We detect zero forward
+    // progress over SUPERSEDE_STALL_LIMIT consecutive cycles and denylist the
+    // segment (keyed by its stable target_segment_last) for SUPERSEDE_DENYLIST_TTL,
+    // which deactivates the hint — stopping the treadmill AND re-enabling GC of
+    // the zombie segment. A later-obtainable parent retries after TTL.
+    struct SupersedeProgress { int32_t last_acc_height{-1}; int stall_cycles{0}; };
+    std::map<uint256, SupersedeProgress> m_supersede_progress;
+    std::map<uint256, std::chrono::steady_clock::time_point> m_supersede_denylist;
+    static constexpr int SUPERSEDE_STALL_LIMIT = 20;
+    static constexpr std::chrono::minutes SUPERSEDE_DENYLIST_TTL{60};
+    // Deactivate the hint if the challenger segment is proven unconvergeable
+    // (already denylisted, or freshly stalled this call). Compute-thread only,
+    // called under the exclusive tracker lock. Returns the (possibly cleared) hint.
+    dash::SupersedeHint gate_supersede_convergence(dash::SupersedeHint hint);
+
     // Buffer of newly verified share hashes, flushed to LevelDB periodically.
     std::vector<uint256> m_verified_flush_buf;
     // Buffer of pruned share hashes, batch-deleted from LevelDB after clean.

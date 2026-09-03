@@ -504,6 +504,71 @@ void NodeImpl::apply_min_protocol_ratchet()
     }
 }
 
+dash::SupersedeHint NodeImpl::gate_supersede_convergence(dash::SupersedeHint hint)
+{
+    // Compute-thread only; caller holds the exclusive tracker lock.
+    const auto now = std::chrono::steady_clock::now();
+
+    // Expire old denylist entries so a segment whose parent later becomes
+    // obtainable can be retried.
+    for (auto it = m_supersede_denylist.begin(); it != m_supersede_denylist.end(); )
+    {
+        if (now - it->second >= SUPERSEDE_DENYLIST_TTL)
+            it = m_supersede_denylist.erase(it);
+        else
+            ++it;
+    }
+
+    if (!hint.active)
+        return hint;
+
+    const uint256 seg = hint.target_segment_last;
+
+    // Already proven unconvergeable and not yet expired — keep it suppressed so
+    // the elevated-verify treadmill stays off and GC can reclaim the segment.
+    if (m_supersede_denylist.count(seg))
+    {
+        static int dl_log = 0;
+        if (dl_log++ % 20 == 0)
+            LOG_INFO << "[SUPERSEDE] challenger segment " << seg.GetHex().substr(0, 16)
+                     << " denylisted as unconvergeable (parent unobtainable) — hint"
+                        " suppressed; normal argmax + GC continue";
+        return dash::SupersedeHint{};
+    }
+
+    // Forward-progress metric: the challenger's verified accumulated height. On a
+    // genuinely converging fork this climbs every cycle as the elevated budget
+    // verifies deeper; on an unrooted/unobtainable-parent fork it stays pinned.
+    int32_t acc = 0;
+    try { acc = m_tracker.verified.get_acc_height(hint.target_head); }
+    catch (...) { acc = 0; }
+
+    auto& prog = m_supersede_progress[seg];
+    if (acc > prog.last_acc_height)
+    {
+        prog.last_acc_height = acc;
+        prog.stall_cycles = 0;
+    }
+    else
+    {
+        ++prog.stall_cycles;
+    }
+
+    if (prog.stall_cycles >= SUPERSEDE_STALL_LIMIT)
+    {
+        LOG_WARNING << "[SUPERSEDE] challenger segment " << seg.GetHex().substr(0, 16)
+                    << " made no verified-height progress in " << prog.stall_cycles
+                    << " cycles (verified_acc_height stuck at " << acc
+                    << "; missing parent unobtainable from all peers) — denylisting for "
+                    << SUPERSEDE_DENYLIST_TTL.count()
+                    << "m to break the elevated-verify treadmill and re-enable GC";
+        m_supersede_denylist[seg] = now;
+        m_supersede_progress.erase(seg);
+        return dash::SupersedeHint{};
+    }
+    return hint;
+}
+
 void NodeImpl::run_think()
 {
     // THREAD-CONFINEMENT (enforced, not assumed — register_template_txs
@@ -558,16 +623,56 @@ void NodeImpl::run_think()
             // Bootstrap: no verified chain yet → verify everything in one
             // pass (p2pool think() runs synchronously during initial sync).
             const bool bootstrap = m_tracker.verified.size() == 0;
+
+            // Restart-reorg: detect a genuine higher-work fork the warm-loaded
+            // node is stuck away from (see SupersedeHint). Skipped during
+            // bootstrap (empty start already downloads to 2*CL+10 under the
+            // unlimited budget). No-op on a healthy node whose persisted head
+            // already carries the most work. gate_supersede_convergence() clears
+            // the hint after SUPERSEDE_STALL_LIMIT cycles of zero progress so an
+            // unconvergeable (missing-parent-unobtainable) challenger can never
+            // pin the elevated-verify treadmill.
+            constexpr int SUPERSEDE_VERIFY_BUDGET = 400;  // bounded elevated per-tick verify
+            dash::SupersedeHint supersede = bootstrap
+                ? dash::SupersedeHint{}
+                : gate_supersede_convergence(
+                      m_tracker.compute_supersede_hint(m_best_share_hash, SUPERSEDE_VERIFY_BUDGET));
+            m_supersede_hint = supersede;
+            uint256 prev_best_for_flip = m_best_share_hash;
+            if (supersede.active) {
+                LOG_WARNING << "[SUPERSEDE] restart-reorg trigger: incumbent="
+                            << m_best_share_hash.GetHex().substr(0,16)
+                            << " challenger=" << supersede.target_head.GetHex().substr(0,16)
+                            << " challenger_chain_h="
+                            << (m_tracker.chain.contains(supersede.target_head)
+                                ? m_tracker.chain.get_height(supersede.target_head) : -1)
+                            << " challenger_verified_h="
+                            << m_tracker.verified.get_acc_height(supersede.target_head)
+                            << " — challenger received work STRICTLY > incumbent verified work;"
+                            << " granting bounded elevated verify budget + 2*CL+10 backfill";
+            }
             auto t0 = std::chrono::steady_clock::now();
             result = m_tracker.think(block_rel_height,
                                      /*previous_block=*/uint256(),
-                                     /*bits=*/0, bootstrap);
+                                     /*bits=*/0, bootstrap, supersede);
             think_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
 
             m_last_top5_heads = std::move(result.top5_heads);
             if (!result.best.IsNull()) {
                 best_changed = (m_best_share_hash != result.best);
+                if (best_changed && supersede.active) {
+                    bool onto_challenger = false;
+                    try {
+                        onto_challenger =
+                            (m_tracker.chain.get_last(result.best) == supersede.target_segment_last);
+                    } catch (...) {}
+                    if (onto_challenger)
+                        LOG_WARNING << "[SUPERSEDE] head FLIPPED to challenger chain: prev_best="
+                                    << prev_best_for_flip.GetHex().substr(0,16)
+                                    << " new_best=" << result.best.GetHex().substr(0,16)
+                                    << " — converged onto the network highest-work chain";
+                }
                 m_best_share_hash = result.best;
                 apply_min_protocol_ratchet();  // v36 accept-floor ratchet (dgb node.cpp:1526 parallel)
             }
@@ -1003,9 +1108,17 @@ void NodeImpl::clean_tracker()
         // Step 1: run think() inline (already holds the lock).
         {
             bootstrap = m_tracker.verified.size() == 0;
+            // Restart-reorg hint (same detector as run_think). Recomputed here so
+            // the Step-2/Step-3 GC exemptions below act on a current view, and so
+            // Step-1 think() also advances the converging challenger.
+            constexpr int SUPERSEDE_VERIFY_BUDGET = 400;
+            m_supersede_hint = bootstrap
+                ? dash::SupersedeHint{}
+                : gate_supersede_convergence(
+                      m_tracker.compute_supersede_hint(m_best_share_hash, SUPERSEDE_VERIFY_BUDGET));
             auto result = m_tracker.think(block_rel_height,
                                           /*previous_block=*/uint256(),
-                                          /*bits=*/0, bootstrap);
+                                          /*bits=*/0, bootstrap, m_supersede_hint);
             m_last_top5_heads = std::move(result.top5_heads);
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
@@ -1032,6 +1145,18 @@ void NodeImpl::clean_tracker()
                 {
                     if (!m_tracker.chain.contains(head_hash)) continue;
                     if (top5_set.count(head_hash)) continue;             // guard 1
+                    // Guard 1b (restart-reorg): keep the converging challenger
+                    // segment. Its verified height is below CHAIN_LENGTH so it is
+                    // never in the top-5; without this exemption its partial
+                    // verification would be eaten every ~300s and restarted forever
+                    // — the original stuck-on-persisted-head latch in a different
+                    // guise. Matched by segment id. No-op when the hint is inactive.
+                    if (m_supersede_hint.active) {
+                        try {
+                            if (m_tracker.chain.get_last(head_hash) == m_supersede_hint.target_segment_last)
+                                continue;
+                        } catch (...) {}
+                    }
                     auto* idx = m_tracker.chain.get_index(head_hash);
                     if (!idx || idx->time_seen > now_sec - 300) continue; // guard 2
                     if (!m_tracker.verified.contains(head_hash))          // guard 3
@@ -1078,6 +1203,21 @@ void NodeImpl::clean_tracker()
                 auto tails_copy = m_tracker.chain.get_tails();
                 for (auto& [tail_hash, head_hashes] : tails_copy)
                 {
+                    // Restart-reorg: never drop the tail of the converging
+                    // challenger segment. An unrooted challenger needs its FULL
+                    // ~2*CL depth to reach CHAIN_LENGTH verified shares; trimming
+                    // its bottom mid-verification silently restarts convergence
+                    // (looks like the original stickiness). The exemption lifts
+                    // once it verifies to CHAIN_LENGTH and the hint deactivates.
+                    // Matched by segment id (the shared missing-parent).
+                    if (m_supersede_hint.active) {
+                        try {
+                            if (m_tracker.chain.contains(tail_hash) &&
+                                m_tracker.chain.get_last(tail_hash) == m_supersede_hint.target_segment_last)
+                                continue;
+                        } catch (...) {}
+                    }
+
                     int32_t min_height = 0;  // 0 → skip if no valid heads
                     for (auto& hh : head_hashes) {
                         if (!m_tracker.chain.contains(hh)) continue;
@@ -1122,9 +1262,16 @@ void NodeImpl::clean_tracker()
 
         // Step 4: re-score after pruning (inline, still holding the lock).
         {
+            // Restart-reorg: re-detect after pruning and pass the hint so the
+            // re-score also advances/flips onto the challenger.
+            constexpr int SUPERSEDE_VERIFY_BUDGET = 400;
+            m_supersede_hint = bootstrap
+                ? dash::SupersedeHint{}
+                : gate_supersede_convergence(
+                      m_tracker.compute_supersede_hint(m_best_share_hash, SUPERSEDE_VERIFY_BUDGET));
             auto result = m_tracker.think(block_rel_height,
                                           /*previous_block=*/uint256(),
-                                          /*bits=*/0, bootstrap);
+                                          /*bits=*/0, bootstrap, m_supersede_hint);
             m_last_top5_heads = std::move(result.top5_heads);
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
