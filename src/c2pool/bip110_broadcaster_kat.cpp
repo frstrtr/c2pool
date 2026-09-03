@@ -188,6 +188,45 @@ int main() {
         expect("no slots => live_count 0", bc.live_count() == 0);
     }
 
+    // ── KAT 7: for_each_live_slot surfaces per-peer version/height/uptime ───────
+    // The dashboard peer-detail gap: live fan-out rows must carry each fork
+    // peer's subver/startingheight/conntime, not blanks. The factory stamps a
+    // distinct metadata tuple per slot (the version handler's job on a live
+    // handshake); for_each_live_slot must yield one entry per live slot, every
+    // one with a non-empty subver, its stamped start_height, and conntime >= 0.
+    {
+        Broadcaster bc(&ioc, &coin_iface, &config, /*max_peers=*/8);
+        int seq = 0;
+        bc.set_slot_factory([&](const NetService&) {
+            auto n = std::make_shared<Node>(&ioc, &coin_iface, &config, "kat");
+            // Stamp a distinct handshake-advertised tuple per slot (what the
+            // version handler would set on a real connection).
+            n->set_peer_metadata_for_test(
+                70016,
+                "/Satoshi:29.4.1/Knots:2026050" + std::to_string(seq) + "/",
+                966370u + static_cast<uint32_t>(seq));
+            ++seq;
+            return n;
+        });
+        bc.set_live_predicate([](const Node&) { return true; });
+        bc.discover(cands);   // 3 distinct live slots
+
+        int rows = 0, with_subver = 0, height_ok = 0, conntime_ok = 0;
+        std::set<std::string> keys_seen;
+        bc.for_each_live_slot([&](const std::string& key, const Node& n) {
+            ++rows;
+            keys_seen.insert(key);
+            if (!n.peer_subver().empty()) ++with_subver;
+            if (n.peer_start_height() >= 966370u) ++height_ok;
+            if (n.peer_uptime_sec() >= 0) ++conntime_ok;
+        });
+        expect("for_each_live_slot yields one row per live slot (3)", rows == 3);
+        expect("all 3 rows carry a non-empty subver", with_subver == 3);
+        expect("all 3 rows carry the stamped startingheight", height_ok == 3);
+        expect("all 3 rows carry a non-negative conntime", conntime_ok == 3);
+        expect("rows are distinct keys (deduped by slot map)", keys_seen.size() == 3);
+    }
+
     std::printf("%s\n", g_fail == 0 ? "bip110_broadcaster_kat PASS"
                                     : "bip110_broadcaster_kat FAIL");
     return g_fail == 0 ? 0 : 1;

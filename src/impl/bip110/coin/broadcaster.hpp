@@ -250,6 +250,19 @@ public:
         return keys;
     }
 
+    // Per-live-slot read seam (key + const Node&) for the dashboard peer detail
+    // rows. Same liveness predicate as live_slot_keys(); no dial, no I/O. Unlike
+    // the keys-only observer this surfaces the slot object so the caller can read
+    // the per-peer version/subver/start_height/uptime the NodeP2P already stamped
+    // from the version handshake. Read-only — never mutates a slot or the dial
+    // lifetime (UAF/set_lifetime guard untouched).
+    void for_each_live_slot(
+        const std::function<void(const std::string&, const Node&)>& fn) const
+    {
+        for (const auto& [key, slot] : m_slots)
+            if (slot && m_is_live && m_is_live(*slot)) fn(key, *slot);
+    }
+
     size_t slot_count() const { return m_slots.size(); }
     bool has_slot(const std::string& key) const { return m_slots.count(key) != 0; }
     bool is_backed_off(const std::string& key) const

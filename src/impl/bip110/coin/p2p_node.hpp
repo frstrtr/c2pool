@@ -476,6 +476,16 @@ public:
     const NetService& target_addr() const { return m_target_addr; }
     const std::string& chain_label() const { return m_chain_label; }
 
+    /// TEST-ONLY seam: stamp the version-message metadata the version handler
+    /// would set on a live handshake, so network-free KATs can exercise the
+    /// dashboard peer-detail read path (for_each_live_slot) without a socket.
+    /// Not used by production code.
+    void set_peer_metadata_for_test(uint32_t v, std::string subver, uint32_t h) {
+        m_peer_version = v;
+        m_peer_subver = std::move(subver);
+        m_peer_start_height = h;
+    }
+
     /// Set mempool reference for compact block reconstruction.
     void set_mempool(Mempool* mp) { m_mempool = mp; }
 

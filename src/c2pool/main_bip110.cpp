@@ -1362,21 +1362,42 @@ int run_embedded(bool coin_p2p_discover,
         // target_height + the single embedded fork peer's version-advertised
         // tip so the sync cards render the REAL BIP-110 header tip. Mirror of
         // main_btc.cpp coin_sync_status_fn.
-        mi->set_coin_sync_status_fn([&header_chain, &coin_node]() -> nlohmann::json {
+        mi->set_coin_sync_status_fn([&header_chain, &coin_node, &coin_broadcaster]()
+                                        -> nlohmann::json {
             nlohmann::json s = nlohmann::json::object();
             const uint32_t hh = header_chain.height();
             uint32_t th = header_chain.peer_tip_height();
             nlohmann::json peers = nlohmann::json::array();
+            std::set<std::string> seen;
             auto* p2p = coin_node.p2p();
             if (p2p != nullptr && p2p->peer_version() > 0) {
                 const uint32_t sh = p2p->peer_start_height();
                 if (sh > th) th = sh;
+                seen.insert(p2p->target_addr().to_string());
                 peers.push_back({
                     {"subver", p2p->peer_subver()},
                     {"startingheight", sh},
                     {"conntime", p2p->peer_uptime_sec()},
                     {"connected", true},
                 });
+            }
+            // Fold EVERY live fork peer into the sync cards, not just the
+            // primary — so target_height is honest over the whole NODE_BLAKE2B
+            // mesh and the peers array counts all connected forks. Deduped
+            // against the primary by dialed address.
+            if (coin_broadcaster) {
+                coin_broadcaster->for_each_live_slot(
+                    [&](const std::string& key, const auto& n) {
+                        if (!seen.insert(key).second) return;
+                        const uint32_t sh = n.peer_start_height();
+                        if (sh > th) th = sh;
+                        peers.push_back({
+                            {"subver", n.peer_subver()},
+                            {"startingheight", sh},
+                            {"conntime", n.peer_uptime_sec()},
+                            {"connected", true},
+                        });
+                    });
             }
             s["header_height"] = hh;
             s["target_height"] = th;
@@ -1414,18 +1435,23 @@ int run_embedded(bool coin_p2p_discover,
                 }
             }
             // (2) Live fan-out slots (handshake-complete NODE_BLAKE2B peers).
+            // Surface the slot OBJECT (not just its key) so each fork peer's
+            // version-advertised subver/height/uptime render — the same rich
+            // fields the primary already shows. The version handler stamps this
+            // per slot; for_each_live_slot only reads it (no dial, no mutation).
             if (coin_broadcaster) {
-                for (const auto& key : coin_broadcaster->live_slot_keys()) {
-                    if (!seen.insert(key).second) continue;
-                    arr.push_back({
-                        {"addr", key},
-                        {"connected", true},
-                        {"subver", ""},
-                        {"startingheight", 0},
-                        {"conntime", 0},
-                        {"role", "fanout"},
+                coin_broadcaster->for_each_live_slot(
+                    [&](const std::string& key, const auto& n) {
+                        if (!seen.insert(key).second) return;
+                        arr.push_back({
+                            {"addr", key},
+                            {"connected", true},
+                            {"subver", n.peer_subver()},
+                            {"startingheight", n.peer_start_height()},
+                            {"conntime", n.peer_uptime_sec()},
+                            {"role", "fanout"},
+                        });
                     });
-                }
             }
             // (3) Learned fork-mesh breadth (banked, not-currently-primary/fanout).
             if (coin_peer_mgr) {
