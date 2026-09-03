@@ -80,7 +80,7 @@ int main() {
         // Inject a factory that constructs a real (unconnected) NodeP2P slot, and
         // a liveness predicate that reports every slot live (transport-free).
         bc.set_slot_factory([&](const NetService&) {
-            return std::make_unique<Node>(&ioc, &coin_iface, &config, "kat");
+            return std::make_shared<Node>(&ioc, &coin_iface, &config, "kat");
         });
         bc.set_live_predicate([](const Node&) { return true; });
 
@@ -97,7 +97,7 @@ int main() {
         Broadcaster bc(&ioc, &coin_iface, &config, /*max_peers=*/8);
         int fanned = 0;
         bc.set_slot_factory([&](const NetService&) {
-            return std::make_unique<Node>(&ioc, &coin_iface, &config, "kat");
+            return std::make_shared<Node>(&ioc, &coin_iface, &config, "kat");
         });
         bc.set_live_predicate([](const Node&) { return true; });
         bc.set_fan_out_hook([&](Node&, const std::vector<unsigned char>&) {
@@ -114,7 +114,7 @@ int main() {
     {
         Broadcaster bc(&ioc, &coin_iface, &config, /*max_peers=*/2);
         bc.set_slot_factory([&](const NetService&) {
-            return std::make_unique<Node>(&ioc, &coin_iface, &config, "kat");
+            return std::make_shared<Node>(&ioc, &coin_iface, &config, "kat");
         });
         bc.set_live_predicate([](const Node&) { return true; });
         bc.set_primary_addr(NetService("10.0.0.2", 8333));  // primary excluded
@@ -129,7 +129,7 @@ int main() {
         Broadcaster bc(&ioc, &coin_iface, &config, /*max_peers=*/8);
         bool alive = true;
         bc.set_slot_factory([&](const NetService&) {
-            return std::make_unique<Node>(&ioc, &coin_iface, &config, "kat");
+            return std::make_shared<Node>(&ioc, &coin_iface, &config, "kat");
         });
         bc.set_live_predicate([&](const Node&) { return alive; });
         bc.discover({ NetService("10.0.0.9", 8333) });
@@ -145,7 +145,7 @@ int main() {
         // (a) ARM A reaches peers, no ARM B wired -> reached_network via peers.
         Broadcaster bc(&ioc, &coin_iface, &config, /*max_peers=*/8);
         bc.set_slot_factory([&](const NetService&) {
-            return std::make_unique<Node>(&ioc, &coin_iface, &config, "kat");
+            return std::make_shared<Node>(&ioc, &coin_iface, &config, "kat");
         });
         bc.set_live_predicate([](const Node&) { return true; });
         bc.set_fan_out_hook([](Node&, const std::vector<unsigned char>&) { return true; });

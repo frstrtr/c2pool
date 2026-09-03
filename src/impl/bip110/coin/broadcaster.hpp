@@ -41,6 +41,7 @@
 #include "node_interface.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -66,7 +67,17 @@ class Bip110Broadcaster
 public:
     using config_t = ConfigType;
     using Node = bip110::coin::p2p::NodeP2P<config_t>;
-    using Slot = std::unique_ptr<Node>;
+    // Slot MUST be a shared_ptr, NOT unique_ptr: this is the SAME dial-teardown
+    // UAF crasher class fixed for coin::Node::m_p2p (see node.hpp start_p2p).
+    // Every default slot arms its own strong-ref lifetime (make_shared +
+    // set_lifetime BEFORE connect, see make_default_slot) so a resolve/connect
+    // completion queued on the single ioc holds the slot alive by value. When
+    // prune_dead() erases a still-dialing slot (TCP connect > 30s, a dead
+    // addrman peer), the erase drops ONLY the owner; the in-flight handler's
+    // captured strong ref keeps the node live until the completion runs (its
+    // make_socket dynamic_cast sees a live vtable) and frees cleanly afterward.
+    // A unique_ptr slot would free the node under the pending handler -> SEGV.
+    using Slot = std::shared_ptr<Node>;
 
     // Injectable DIAL/slot factory. Default constructs a NodeP2P bound to the
     // io_context + coin interface + config and CONNECTs it to the fork peer.
@@ -253,10 +264,17 @@ private:
     /// per-slot configurator (peer-discovery seams) BEFORE dialing, then connect.
     Slot make_default_slot(const NetService& addr)
     {
-        auto node = std::make_unique<Node>(m_ioc, m_coin, m_config, "BIP110-Fanout");
+        auto node = std::make_shared<Node>(m_ioc, m_coin, m_config, "BIP110-Fanout");
         // Single-peer coins run their own stall recovery; a fan-out slot must
         // NOT idle-evict itself between blocks (matches the primary's policy).
         node->set_idle_eviction_enabled(false);
+        // ARM the dial-teardown UAF guard BEFORE connect(): register the slot's
+        // own shared control block as its INetwork lifetime so core::Client's
+        // resolve/connect_socket completion captures a STRONG ref by value.
+        // Mirror of coin::Node::start_p2p — MUST precede connect() so the very
+        // first async op already sees an armed lifetime.
+        node->set_lifetime(node);
+        assert(node->lifetime_armed() && "broadcaster slot dial lifetime failed to arm");
         // Wire getaddr/addr-ingest/scorer-feedback onto the slot before it dials,
         // so a fan-out peer's addr gossip also grows the shared addrman.
         if (m_slot_config) m_slot_config(*node);

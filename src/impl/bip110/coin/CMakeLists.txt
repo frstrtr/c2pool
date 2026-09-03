@@ -94,3 +94,36 @@ target_link_libraries(bip110_dial_lifetime_realnode_kat
     Threads::Threads
 )
 add_test(NAME bip110_dial_lifetime_realnode_kat COMMAND bip110_dial_lifetime_realnode_kat)
+
+# bip110_broadcaster_slot_lifetime_kat: the REAL fan-out SLOT dial-teardown UAF
+# gate. v2 (the coin::Node::m_p2p fix) passed its realnode KAT yet the flag-ON
+# canary STILL crash-looped via the Bip110Broadcaster fan-out pool, whose slots
+# were unmanaged unique_ptr<NodeP2P> dialed WITHOUT set_lifetime and freed by the
+# 30s prune_dead() tick under a still-pending dial. This KAT drives the REAL
+# broadcaster: the default factory arming (make_shared + set_lifetime BEFORE
+# connect), and a prune_dead() during a pending dial completion — asserting the
+# slot survives the owner drop and make_socket's dynamic_cast runs on a live
+# node. Same link closure as the sibling coin KAT.
+add_executable(bip110_broadcaster_slot_lifetime_kat
+    test/bip110_broadcaster_slot_lifetime_kat.cpp
+)
+target_compile_definitions(bip110_broadcaster_slot_lifetime_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_broadcaster_slot_lifetime_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_broadcaster_slot_lifetime_kat COMMAND bip110_broadcaster_slot_lifetime_kat)
