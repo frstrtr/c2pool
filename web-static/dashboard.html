@@ -5307,6 +5307,13 @@
             dogeSet: {},       // short hashes of DOGE block solutions (parent hash)
             headSet: {},       // short hashes of chain heads
             myAddress: '',
+            // Set of THIS node's self-identity addresses (node-owner/payout ∪
+            // local stratum worker addresses), from window.my_addresses. The
+            // single myAddress cannot represent a node whose rigs mine under
+            // their own rig addresses, so "mine" is set membership, not ==.
+            // Lanes that emit only my_address degenerate to the single-address
+            // semantics (myAddrSet then holds just that one entry).
+            myAddrSet: {},
             windowSize: 8640,
             pplnsData: [],     // cached [{addr, pct, amt}] sorted by pct desc
             pplnsCache: {},    // share_hash → [{addr, pct, amt}] from server
@@ -5415,6 +5422,17 @@
                     }
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Build the self-identity set: single my_address ∪ the
+                    // my_addresses array (node-owner ∪ local stratum workers).
+                    // Backward-compatible — a lane emitting only my_address
+                    // yields a one-entry set, preserving old == semantics.
+                    self.myAddrSet = {};
+                    if (self.myAddress) self.myAddrSet[self.myAddress] = true;
+                    if (Array.isArray(data.my_addresses)) {
+                        data.my_addresses.forEach(function(a) {
+                            if (a) self.myAddrSet[a] = true;
+                        });
+                    }
                     self.windowSize = data.window_size || 8640;
 
                     self.blockSet = {};
@@ -5673,6 +5691,17 @@
                     // Update data
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Build the self-identity set: single my_address ∪ the
+                    // my_addresses array (node-owner ∪ local stratum workers).
+                    // Backward-compatible — a lane emitting only my_address
+                    // yields a one-entry set, preserving old == semantics.
+                    self.myAddrSet = {};
+                    if (self.myAddress) self.myAddrSet[self.myAddress] = true;
+                    if (Array.isArray(data.my_addresses)) {
+                        data.my_addresses.forEach(function(a) {
+                            if (a) self.myAddrSet[a] = true;
+                        });
+                    }
                     self.windowSize = data.window_size || 8640;
                     self.blockSet = {};
                     if (data.blocks) data.blocks.forEach(function(h) { self.blockSet[h] = true; });
@@ -6336,7 +6365,7 @@
                 // Node fee share - purple
                 if (share.fee) return '#9c27b0';
 
-                var isMine = this.myAddress && share.m === this.myAddress;
+                var isMine = this.isMine(share.m);
                 // Coin-aware native cutoff (LTC=36, DASH=16). A literal 36
                 // here painted every DASH V16 share as the dim "below"
                 // band. The signaling tier only exists for coins with a
@@ -6424,7 +6453,7 @@
 
             showTooltip: function(share, e) {
                 var tip = this.tooltip;
-                var isMine = this.myAddress && share.m === this.myAddress;
+                var isMine = this.isMine(share.m);
                 var isLtcBlock = !!this.blockSet[share.h];
                 var isDogeBlock = !!this.dogeSet[share.h];
                 var age = Math.floor(Date.now() / 1000 - share.t);
@@ -6638,13 +6667,13 @@
                 // Squarified treemap of PPLNS at this share's position
                 var rects = this.treemap(pplnsAtPos, 2, 2, sz - 4, sz - 4);
                 var minerAddr = share ? share.m : '';
-                var myAddr = this.myAddress;
+                var self = this;
 
                 for (var i = 0; i < rects.length; i++) {
                     var r = rects[i];
                     var addr = r.addr;
                     var isThisMiner = addr === minerAddr;
-                    var isMe = addr === myAddr;
+                    var isMe = self.isMine(addr);
 
                     var hue = this.addrHue(addr);
                     if (isThisMiner) {
@@ -6814,6 +6843,16 @@
                 return (0xffff * Math.pow(256, 26)) / target_top;
             },
 
+            // True when `addr` is one of THIS node's self-identity addresses
+            // (node-owner/payout ∪ local stratum workers). Set membership so a
+            // node whose rigs mine under their own addresses still highlights
+            // blue; falls back to the single myAddress when myAddrSet is empty.
+            isMine: function(addr) {
+                if (!addr) return false;
+                if (this.myAddrSet && this.myAddrSet[addr]) return true;
+                return !!(this.myAddress && addr === this.myAddress);
+            },
+
             updateStats: function(data) {
                 var shares = data.shares || [];
                 var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0, v36native = 0;
@@ -6823,7 +6862,7 @@
                 // read it from the active coin's share-version descriptor.
                 var vthr = (window.__shareVersionDescriptor && window.__shareVersionDescriptor.threshold) || 36;
                 shares.forEach(function(s) {
-                    if (self.myAddress && s.m === self.myAddress) mine++;
+                    if (self.isMine(s.m)) mine++;
                     if (s.s === 1) stale++;
                     if (s.s === 2) dead++;
                     if (s.v) verified++;
@@ -6911,9 +6950,11 @@
             var myContainer = document.getElementById('my_share_hashes');
             if (myContainer) {
                 myContainer.innerHTML = '';
-                if (defrag.myAddress) {
+                var hasSelfIdentity = !!(defrag.myAddress ||
+                    (defrag.myAddrSet && Object.keys(defrag.myAddrSet).length > 0));
+                if (hasSelfIdentity) {
                     var myShares = defrag.shares.filter(function(s) {
-                        return s.m === defrag.myAddress;
+                        return defrag.isMine(s.m);
                     }).slice(0, 50);
                     if (myShares.length > 0) {
                         myShares.forEach(function(s) {

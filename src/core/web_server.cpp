@@ -3388,9 +3388,34 @@ nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
 std::pair<std::string, std::string> MiningInterface::get_cached_window_response()
 {
     std::lock_guard<std::mutex> lock(m_window_cache_mutex);
-    // Check if cache is valid (has real tip hash, not empty/stub)
-    if (!m_window_cache_etag.empty())
-        return {m_window_cache_json, m_window_cache_etag};
+    // Tip-keyed cache: the cached body is valid ONLY while it still describes
+    // the CURRENT best share. Previously it was returned unconditionally while
+    // the etag was non-empty, and the etag is only cleared by
+    // invalidate_window_cache() — a call site reached by the LTC/DASH/BTC share
+    // paths but NEVER on bip110 (MI stratum off; its own Bip110WorkSource fires
+    // no MI tip-refresh event). So on bip110 the FIRST /sharechain/window
+    // response froze the explorer forever (Chain Length stuck while the tracker
+    // grew). Compare the live tip (m_best_share_hash_fn — RCU-cached and
+    // HTTP-thread safe, does not take this mutex) against the etag; on a match
+    // serve the cache, on a mismatch fall through and regenerate. On lanes that
+    // invalidate on every tip this compare is a no-op (etag already == tip). If
+    // the fn is unwired or the live tip is null, keep the prior behaviour and
+    // serve whatever is cached (honest, never fabricated). Bounded staleness on
+    // bip110 collapses from "forever" to one share-tip generation.
+    if (!m_window_cache_etag.empty()) {
+        bool tip_matches = true;
+        if (m_best_share_hash_fn) {
+            uint256 live_tip = m_best_share_hash_fn();
+            if (!live_tip.IsNull()) {
+                std::string tip = live_tip.GetHex();
+                if (tip.size() > 16) tip = tip.substr(0, 16);
+                tip_matches = (tip == m_window_cache_etag);
+            }
+        }
+        if (tip_matches)
+            return {m_window_cache_json, m_window_cache_etag};
+        // else: the tip advanced past the cached body — regenerate below.
+    }
 
     // Regenerate
     auto data = rest_sharechain_window();

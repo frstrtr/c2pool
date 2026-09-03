@@ -2070,20 +2070,56 @@ int run_embedded(bool coin_p2p_discover,
             // and call current_pplns() (which takes + releases its OWN guard)
             // BEFORE taking this fn's guard — DASH ordering (main_dash.cpp:1886-1888).
             mi->set_sharechain_window_fn(
-                [scn, mi, current_pplns]() -> nlohmann::json {
+                [scn, mi, current_pplns, ws = work_source.get()]() -> nlohmann::json {
                     const uint256 best = scn->get_tracker_snapshot().best_share;  // lock-free
                     auto cur = current_pplns();          // takes + releases its own guard
                     auto guard = scn->read_tracker();
                     if (!guard) return nlohmann::json::object();  // tracker busy -> honest empty
                     std::string fee_hash160 = mi ? mi->get_node_fee_hash160() : std::string{};
-                    // DASH/every miner authorizes with its own address over
-                    // stratum, so there is no node-level "my" address to mark;
-                    // leave it empty (honest "not mining") rather than guess.
+                    const bool testnet = bip110::pool::PoolConfig::is_testnet;
+                    // "This node" self-identity for the explorer's blue highlight
+                    // + This-Node count. The window fn previously left my_address
+                    // EMPTY ("every miner authorizes with its own address, so
+                    // there is no node-level 'my' address") — but this node's rigs
+                    // ARE its local stratum workers, so every share they author IS
+                    // this node's. Mark the node-owner/payout address AND every
+                    // current stratum worker address blue. Each candidate is
+                    // normalized through the SAME script->address encoder the
+                    // report uses for s["m"] (address_to_script ->
+                    // current_payouts_script_to_address) so the frontend string
+                    // compare matches exactly. Display-only: no consensus/coinbase
+                    // /PPLNS/wire state is read or written here. LTC ref
+                    // main_ltc.cpp:3916-3924 (owner addr); the worker-set union is
+                    // the bip110 correction (owner-only would still render 0 blue,
+                    // since the window owners are the rig addresses).
+                    auto normalize_addr =
+                        [testnet](const std::string& a) -> std::string {
+                            if (a.empty()) return {};
+                            auto script = core::address_to_script(a);
+                            if (script.empty()) return {};
+                            return bip110::pool::current_payouts_script_to_address(
+                                script, testnet);
+                        };
+                    std::string my_address =
+                        normalize_addr(mi ? mi->get_payout_address() : std::string{});
+                    nlohmann::json my_addrs = nlohmann::json::array();
+                    std::set<std::string> seen;
+                    auto add_addr = [&](const std::string& a) {
+                        if (!a.empty() && seen.insert(a).second)
+                            my_addrs.push_back(a);
+                    };
+                    add_addr(my_address);
+                    if (ws) {
+                        for (auto& [id, wi] : ws->snapshot_stratum_workers())
+                            add_addr(normalize_addr(wi.username));
+                    }
                     auto w = bip110::pool::sharechain_window_report(
                         *guard, best,
                         bip110::pool::PoolConfig::chain_length(),
-                        /*my_address=*/std::string{}, fee_hash160,
-                        bip110::pool::PoolConfig::is_testnet);
+                        my_address, fee_hash160,
+                        testnet);
+                    if (!my_addrs.empty())
+                        w["my_addresses"] = std::move(my_addrs);
                     // Fold the projected split in as the explorer's per-share
                     // PPLNS overlay fallback (dashboard.html getPPLNSForShare
                     // reads window.pplns_current). bip110 has no per-tip PPLNS
