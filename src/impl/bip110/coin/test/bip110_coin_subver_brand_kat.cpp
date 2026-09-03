@@ -11,7 +11,7 @@
 //
 // This KAT pins the fix: the outgoing subver is the SINGLE named constant
 // bip110::coin::p2p::BIP110_COIN_SUBVER, defaulting to the branded BIP14 form
-// "/c2pool:0.1/bip110/", and a serialized message_version carrying that exact
+// "/c2pool:0.1/bip110/frstrtr/", and a serialized message_version carrying that exact
 // constant embeds it as a correctly length-prefixed var-string at the subver
 // field offset — the precise bytes a fork peer / crawler reads as our UA.
 //
@@ -74,7 +74,7 @@ int main()
 
     // ── (A) The constant is the branded BIP14 default ──
     expect_true("[A] BIP110_COIN_SUBVER == \"/c2pool:0.1/bip110/\" (branded default)",
-                subver == "/c2pool:0.1/bip110/");
+                subver == "/c2pool:0.1/bip110/frstrtr/");
     expect_true("[A] subver is BIP14-shaped (leading '/', trailing '/')",
                 subver.size() >= 2 && subver.front() == '/' && subver.back() == '/');
     expect_true("[A] subver advertises c2pool (crawler/bitnodes brand reach)",

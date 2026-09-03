@@ -45,7 +45,7 @@ inline constexpr uint64_t COIN_NODE_BLAKE2B = (uint64_t{1} << 28);
 // BOLD form (default) advertises c2pool to crawlers/bitnodes and any dialer.
 // SAFE Knots-uacomment alternative (1-line flip, INTEGRATOR pick):
 //   inline constexpr const char* BIP110_COIN_SUBVER = "/Satoshi:29.4.1/Knots:20260508(c2pool-bip110)/";
-inline constexpr const char* BIP110_COIN_SUBVER = "/c2pool:0.1/bip110/";
+inline constexpr const char* BIP110_COIN_SUBVER = "/c2pool:0.1/bip110/frstrtr/";
 
 // Fork-filtered addr ingest — the load-bearing half of the Knots addr handler
 // (net_processing.cpp addr handling), BLAKE2b-adjusted. PURE + socket-free so
