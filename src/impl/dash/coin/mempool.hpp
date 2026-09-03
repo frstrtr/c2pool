@@ -64,6 +64,7 @@
 #include <core/log.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
+#include <algorithm>             // get_summary(): feerate percentile sort (display-only)
 #include <atomic>
 #include <cmath>                 // block_min_fee_for_size: dashd CFeeRate::GetFee std::ceil
 #include <functional>
@@ -979,6 +980,78 @@ public:
         out.reserve(m_pool.size());
         for (auto& [txid, _] : m_pool) out.push_back(txid);
         return out;
+    }
+
+    /// Read-only display snapshot for the lite explorer API
+    /// (/api/explorer/getmempoolinfo, getrawmempool). DISPLAY-ONLY: taken under
+    /// m_mutex like every other accessor, it touches NO selection/gentx/fee
+    /// path — it copies the same fields the dashboard already reads elsewhere
+    /// into one atomic snapshot so the three explorer callbacks need a single
+    /// lock acquisition. Feerate percentiles are computed over fee_known
+    /// entries (feerate_satvb == 0 for unpriced txs, consistent with the DASH
+    /// exclusion-discipline selector).
+    struct MempoolSummary {
+        struct Entry {
+            uint256  txid;
+            uint32_t base_size{0};
+            uint64_t fee{0};
+            bool     fee_known{false};
+            double   feerate{0.0};   // sat/vB (== MempoolEntry::feerate_satvb())
+            size_t   n_vin{0};
+            size_t   n_vout{0};
+            time_t   time_added{0};
+        };
+        size_t   tx_count{0};
+        uint64_t total_bytes{0};
+        uint64_t total_fees{0};       // sum of KNOWN fees (satoshi)
+        size_t   fee_known_count{0};
+        double   min_feerate{0.0};
+        double   max_feerate{0.0};
+        double   median_feerate{0.0};
+        double   avg_feerate{0.0};
+        time_t   oldest_time{0};
+        std::vector<Entry> entries;
+    };
+
+    MempoolSummary get_summary() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        MempoolSummary s;
+        s.tx_count    = m_pool.size();
+        s.total_bytes = m_total_bytes;
+        s.entries.reserve(m_pool.size());
+        std::vector<double> frs;
+        frs.reserve(m_pool.size());
+        for (const auto& [txid, e] : m_pool) {
+            MempoolSummary::Entry se;
+            se.txid       = txid;
+            se.base_size  = e.base_size;
+            se.fee        = e.fee;
+            se.fee_known  = e.fee_known;
+            se.feerate    = e.feerate_satvb();
+            se.n_vin      = e.tx.vin.size();
+            se.n_vout     = e.tx.vout.size();
+            se.time_added = e.time_added;
+            if (e.fee_known) {
+                s.total_fees += e.fee;
+                ++s.fee_known_count;
+                frs.push_back(se.feerate);
+            }
+            if (e.time_added > 0 &&
+                (s.oldest_time == 0 || e.time_added < s.oldest_time))
+                s.oldest_time = e.time_added;
+            s.entries.push_back(std::move(se));
+        }
+        if (!frs.empty()) {
+            std::sort(frs.begin(), frs.end());
+            s.min_feerate    = frs.front();
+            s.max_feerate    = frs.back();
+            s.median_feerate = frs[frs.size() / 2];
+            double sum = 0.0;
+            for (double f : frs) sum += f;
+            s.avg_feerate = sum / static_cast<double>(frs.size());
+        }
+        return s;
     }
 
     /// #107 PHASE 2: the pending type-8 (TRANSACTION_ASSET_LOCK) txs currently
