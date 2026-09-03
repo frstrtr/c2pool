@@ -255,6 +255,14 @@ public:
     nlohmann::json rest_pplns_current();             // /pplns/current — spec §5.1 shape
     nlohmann::json rest_pplns_miner(const std::string& address);  // /pplns/miner/<addr> — spec §5.2
     nlohmann::json compute_current_merged_payouts(); // full computation (main thread only)
+    // Cold-cache fallback: wrap the live /current_payouts seam in the merged
+    // {addr:{amount,merged:[]}} shape WITHOUT touching the main-thread-owned
+    // m_cached_merged_payouts. Lets lanes that never run the tip cache pump
+    // (e.g. bip110 — MI stratum off, no fire_share_tip_refresh) still serve
+    // populated /current_merged_payouts + /pplns/current. Returns {} when the
+    // primary seam itself is empty. Safe on any thread (no merged-child walk,
+    // no mm_manager access). See rest_current_merged_payouts.
+    nlohmann::json wrap_primary_payouts_as_merged();
     nlohmann::json rest_recent_merged_blocks();      // /recent_merged_blocks — recent merged blocks
     nlohmann::json rest_all_merged_blocks();         // /all_merged_blocks — all merged blocks
     nlohmann::json rest_discovered_merged_blocks();  // /discovered_merged_blocks — merged block proofs

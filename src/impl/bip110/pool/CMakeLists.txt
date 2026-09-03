@@ -295,6 +295,41 @@ target_link_libraries(bip110_current_payouts_kat
 )
 add_test(NAME bip110_current_payouts_kat COMMAND bip110_current_payouts_kat)
 
+# bip110_sharechain_window_kat: the /sharechain/window DASHBOARD-SEAM KAT (M3). The
+# sharechain-transparency EXPLORER was empty and the "Current Payouts" card's V36?
+# column blank on contabo despite a live 197+ share chain because
+# MiningInterface::m_sharechain_window_fn was UNWIRED on this lane (rest_sharechain_
+# window served the {shares:[]} stub). main_bip110 now wires it via
+# sharechain_window_report, which walks the SAME tallest-chain PPLNS window the
+# coinbase + /current_payouts use. THIS KAT drives that EXACT transform: seeds a real
+# 2-share window, asserts shares.size()==2 with V==36 and address-form s.m that MATCH
+# the /current_payouts keys (the client-side V36? join), and shares==[] on an
+# empty/null-best chain. Same heavy link closure as the current_payouts KAT.
+add_executable(bip110_sharechain_window_kat
+    test/bip110_sharechain_window_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_sharechain_window_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_sharechain_window_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_sharechain_window_kat COMMAND bip110_sharechain_window_kat)
+
 # bip110_serve_xcheck_kat: the SERVE-PATH pre-serve reward-safety XCHECK KAT (M3).
 # The other bip110 KATs exercise the MINT / consensus math; NONE exercised the live
 # SERVE template + the [BIP110-WS] pre-serve reward-safety XCHECK that build_

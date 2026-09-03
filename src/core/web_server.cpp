@@ -6877,13 +6877,40 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
     return filtered;
 }
 
+nlohmann::json MiningInterface::wrap_primary_payouts_as_merged()
+{
+    // Cold-cache fallback (see header). Wrap the live /current_payouts seam in
+    // the merged {addr:{amount,merged:[]}} shape — the EXACT shape
+    // compute_current_merged_payouts() produces for a node with no merged
+    // children (web_server.cpp compute path :6717-6719). Read-only: it only
+    // re-shapes rest_current_payouts(), which reads m_current_payouts_fn under
+    // its own guard; it touches neither m_cached_merged_payouts nor m_mm_manager,
+    // so it is safe on the REST thread.
+    nlohmann::json out = nlohmann::json::object();
+    auto payouts_json = rest_current_payouts();
+    if (!payouts_json.is_object()) return out;
+    for (auto& [addr, amount] : payouts_json.items())
+        out[addr] = {{"amount", amount}, {"merged", nlohmann::json::array()}};
+    return out;
+}
+
 nlohmann::json MiningInterface::rest_current_merged_payouts()
 {
     // Return pre-computed cache from cache_pplns_at_tip() (main thread, every 2s)
-    std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
-    if (!m_cached_merged_payouts.is_null() && !m_cached_merged_payouts.empty())
-        return m_cached_merged_payouts;
-    return nlohmann::json::object();
+    {
+        std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
+        if (!m_cached_merged_payouts.is_null() && !m_cached_merged_payouts.empty())
+            return m_cached_merged_payouts;
+    }
+    // Cold-cache fallback for lanes that never run the tip cache pump (bip110:
+    // MI stratum off, no fire_share_tip_refresh -> cache_pplns_at_tip is never
+    // called, so the cache stays {} even though /current_payouts is populated).
+    // Serve the primary /current_payouts seam wrapped in the merged shape so the
+    // "Current Payouts" card (loadPayouts fetches THIS endpoint), the main-page
+    // PPLNS treemap (loadMainPPLNS) and /pplns/current all fill. On LTC/DASH the
+    // cache is populated by the pump, so this branch is unreachable there — the
+    // behaviour where it IS reached today is {}, so this is strictly additive.
+    return wrap_primary_payouts_as_merged();
 }
 
 namespace {
@@ -6927,6 +6954,13 @@ nlohmann::json MiningInterface::rest_pplns_current()
         std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
         cache = m_cached_merged_payouts;
     }
+    // Cold-cache fallback (parity with rest_current_merged_payouts): on lanes
+    // that never run the tip cache pump the cache is {}, which would leave
+    // miners[] empty even though /current_payouts is live. Wrap the primary
+    // seam so the PPLNS view aggregate fills. Strictly additive — only reached
+    // when the cache is empty, where today's behaviour is {}.
+    if (!cache.is_object() || cache.empty())
+        cache = wrap_primary_payouts_as_merged();
 
     // Build enrichment table from the current window. Non-fatal if the
     // window isn't available — the module degrades gracefully.

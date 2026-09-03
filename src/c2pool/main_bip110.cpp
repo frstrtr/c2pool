@@ -35,6 +35,7 @@
 #include <impl/bip110/pool/config_pool.hpp>        // PoolConfig SSOT (P2P_PORT 9337, STALE_SHARES)
 #include <impl/bip110/pool/share_check.hpp>        // bip110::pool::create_local_share (MINT)
 #include <impl/bip110/pool/current_payouts_report.hpp> // /current_payouts dashboard PPLNS split (read-only)
+#include <impl/bip110/pool/sharechain_window_report.hpp> // /sharechain/window explorer + V36? column (read-only)
 
 #include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
 #include <core/coin/utxo_view_cache.hpp>
@@ -1725,16 +1726,25 @@ int run_embedded(bool coin_p2p_discover,
             // READ-ONLY: this REPORTS the split the node would pay; it never touches
             // share_check gentx, build_connection_coinbase, the donation consensus,
             // or any reward path (get_expected_payouts is a const window walk under
-            // the read guard). It also lights /current_merged_payouts (web_server.cpp
-            // compute_current_merged_payouts starts from rest_current_payouts()),
-            // which the front-end loadPayouts prefers — both cards fill.
+            // the read guard). The front-end loadPayouts actually fetches
+            // /current_merged_payouts (NOT /current_payouts); that endpoint's
+            // main-thread cache pump is dead on bip110, so a cold-cache fallback
+            // in rest_current_merged_payouts (web_server.cpp) now wraps THIS seam
+            // in the merged shape — see wrap_primary_payouts_as_merged.
             //
             // Nested-lock hazard: read the LOCK-FREE published snapshot best_share
             // BEFORE taking read_tracker() — re-acquiring the tracker's shared_mutex
             // from a thread that already holds it stops being harmless the moment a
             // writer queues (main_dash.cpp:1853-1858). Snapshot is set by think()
             // under the exclusive lock; no off-lock chain walk here.
-            mi->set_current_payouts_fn(
+            // The pool-wide projected PPLNS split — shared by /current_payouts,
+            // the main-page treemap (via /current_merged_payouts) and the
+            // sharechain window's own `pplns_current` overlay. Hoisted into a
+            // named lambda (DASH pattern main_dash.cpp:1856) so the window fn
+            // below reuses the EXACT same SSOT walk instead of re-deriving it.
+            // Snapshot the LOCK-FREE published best BEFORE read_tracker() — the
+            // documented nested shared-lock hazard (main_dash.cpp:1853-1858).
+            auto current_pplns =
                 [scn, &header_chain,
                  halving = chain_params.subsidy_halving_interval]() -> nlohmann::json {
                     const uint256 best = scn->get_tracker_snapshot().best_share;  // lock-free
@@ -1756,20 +1766,91 @@ int run_embedded(bool coin_p2p_discover,
                         *guard, best, block_target, subsidy,
                         bip110::pool::PoolConfig::get_donation_script(36),
                         bip110::pool::PoolConfig::is_testnet);
-                });
+                };
+            mi->set_current_payouts_fn(current_pplns);
             LOG_INFO << "[EMB-BIP110] /current_payouts seam wired "
                         "(get_expected_payouts projected next-block PPLNS split; "
                         "read-only preview) — 'Current Payouts' card now shows the "
                         "live window split instead of 0.0000/empty";
+
+            // FINDING P2 — the sharechain-transparency EXPLORER and the V36?
+            // column. GET /sharechain/window served the stub {shares:[]} because
+            // m_sharechain_window_fn was unwired on bip110 (web_server.cpp
+            // rest_sharechain_window). The explorer was therefore empty, and the
+            // "Current Payouts" card's V36? column stayed blank — it is filled
+            // ENTIRELY client-side by getMinerVersion(addr) scanning
+            // defrag.shares (= this window) for s.m === addr (dashboard.html).
+            // Wire it to the SAME PPLNS SSOT walk /current_payouts uses; the
+            // report emits the address form for s.m (so it matches the payout
+            // keys and the V36? column fills) and the native share version for
+            // s.V. Read-only: a const window walk under the read guard.
+            //
+            // Nested-lock hazard: snapshot the LOCK-FREE best BEFORE read_tracker(),
+            // and call current_pplns() (which takes + releases its OWN guard)
+            // BEFORE taking this fn's guard — DASH ordering (main_dash.cpp:1886-1888).
+            mi->set_sharechain_window_fn(
+                [scn, mi, current_pplns]() -> nlohmann::json {
+                    const uint256 best = scn->get_tracker_snapshot().best_share;  // lock-free
+                    auto cur = current_pplns();          // takes + releases its own guard
+                    auto guard = scn->read_tracker();
+                    if (!guard) return nlohmann::json::object();  // tracker busy -> honest empty
+                    std::string fee_hash160 = mi ? mi->get_node_fee_hash160() : std::string{};
+                    // DASH/every miner authorizes with its own address over
+                    // stratum, so there is no node-level "my" address to mark;
+                    // leave it empty (honest "not mining") rather than guess.
+                    auto w = bip110::pool::sharechain_window_report(
+                        *guard, best,
+                        bip110::pool::PoolConfig::chain_length(),
+                        /*my_address=*/std::string{}, fee_hash160,
+                        bip110::pool::PoolConfig::is_testnet);
+                    // Fold the projected split in as the explorer's per-share
+                    // PPLNS overlay fallback (dashboard.html getPPLNSForShare
+                    // reads window.pplns_current). bip110 has no per-tip PPLNS
+                    // cache pump (that DASH path is dead here), so pplns_current
+                    // is the overlay source. Read-only.
+                    if (cur.is_object() && !cur.empty())
+                        w["pplns_current"] = std::move(cur);
+                    return w;
+                });
+            // bip110 has no share-tip refresh event (MI stratum off, no
+            // fire_share_tip_refresh), so opt this cache into the periodic
+            // fallback refresh (web_server mark_last_cache_tip_driven) — correct
+            // cadence for a ~10 s share period.
+            mi->mark_last_cache_tip_driven();
+
+            // MI's own window-PPLNS overlay producer (pplns_fn_t). On bip110 its
+            // consumers are inert (MI stratum off, no refresh trigger, no
+            // m_cached_template), but wire it for LTC/BTC/DASH parity and so the
+            // web_server precompute path (should it ever run) has the SSOT split.
+            // BTC shape (main_btc.cpp set_pplns_fn) minus the v35/AutoRatchet
+            // branch — bip110 is v36-always. Read-only: get_expected_payouts is a
+            // const window walk; no coinbase/gentx/reward touched.
+            mi->set_pplns_fn(
+                [scn](const uint256& best_share_hash,
+                      const uint256& block_target,
+                      uint64_t subsidy,
+                      const std::vector<unsigned char>& donation_script)
+                -> std::map<std::vector<unsigned char>, double> {
+                    auto guard = scn->read_tracker();
+                    if (!guard) return {};
+                    try {
+                        return guard->get_expected_payouts(
+                            best_share_hash, block_target, subsidy, donation_script);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[EMB-BIP110] web pplns get_expected_payouts threw: "
+                                    << e.what();
+                        return {};
+                    }
+                });
+            LOG_INFO << "[EMB-BIP110] /sharechain/window + pplns seams wired "
+                        "(explorer window walk + V36? column feed + pplns overlay; "
+                        "read-only) — explorer/PPLNS-view/V36? now reflect the mint";
         }
 
-        // Still deliberately NOT installed even on flag-ON: set_pplns_fn (MI's own
-        // window-PPLNS overlay), set_sharechain_window_fn. The V36? column
-        // (dashboard.html:2102) is filled client-side from the sharechain-window
-        // feed, so it stays blank until set_sharechain_window_fn is wired — a
-        // separate follow-up seam, NOT required for the payout rows. Absent feeds
-        // render honestly empty — NEVER faked. (set_pool_hashrate_fn,
-        // set_current_payouts_fn AND set_peer_info_fn ARE now wired above.)
+        // All dashboard sharechain feeds are now wired on flag-ON:
+        // set_sharechain_stats_fn, set_best_share_hash_fn, set_pool_hashrate_fn,
+        // set_peer_info_fn, set_current_payouts_fn, set_sharechain_window_fn and
+        // set_pplns_fn. Absent feeds (flag-OFF) render honestly empty — NEVER faked.
 
         // graph_db-persisted stats history (LTC/BTC parity): namespaced sub-dir.
         {
