@@ -1332,6 +1332,13 @@ int run_embedded(bool coin_p2p_discover,
         // construction below), so the honest static answer is 36. Without this
         // the explorer misclassifies live v36 share cells as v35.
         mi->set_cached_share_version(36);
+        // F2b — native share-version declaration (display-only). bip110's genesis
+        // share-version already EQUALS the target (v36) with no lower predecessor,
+        // so there is no crossing and no voting. This makes /v36_status report
+        // state='native' instead of fabricating a 'voting' / V36->V36 crossing
+        // (the Share-Version Crossing card lied ACTIVE+VOTING on a chain that
+        // never crossed). Consensus/mint untouched -- purely the ratchet widget.
+        mi->set_native_share_version(true);
         // F3 — currency_info + node_topology "embedded" flag. This lane is fully
         // daemonless (no external node RPC) but runs on a NULL IMiningNode with
         // no m_coin_node (bip110::coin::Node is NOT a core::coin::ICoinNode), so

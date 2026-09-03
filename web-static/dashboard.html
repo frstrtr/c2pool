@@ -1848,7 +1848,7 @@
                     <h3><span class="icon">🔀</span> Share-Version Crossing</h3>
                     <div class="stat-value" id="v36_status_label">-</div>
                     <div class="stat-sub">Signalling: <span id="v36_signal_pct">-</span></div>
-                    <div class="stat-detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span></div>
+                    <div class="stat-detail" id="v36_cross_detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span></div>
                     <div class="stat-detail">Live latch: <span id="v36_active_label" style="font-weight:600;">-</span></div>
                 </div>
                 <!-- Per-node topology: THIS node's REAL coin set from /api/node_topology (charter #2, config-driven/auto-detected -- never a baked-in coin list) -->
@@ -3005,6 +3005,16 @@
                 statNative: 'V16 Current', statSignaling: null,
                 legendNative: 'V16 (others)', legendSignaling: null,
                 legendStale: 'Below V16'
+            },
+            // BIP110 launched at share-version V36 from genesis -- there is no
+            // lower predecessor, so no signalling boundary. signaling:false
+            // suppresses the LTC "V35 only" / "V36 Signaling" legend rows that
+            // the fall-back-to-LTC default would otherwise show on a native coin.
+            BIP110: {
+                threshold: 36, signaling: false,
+                statNative: 'V36 Native', statSignaling: null,
+                legendNative: 'V36 (others)', legendSignaling: null,
+                legendStale: 'Below V36'
             }
         };
         function shareVersionDescriptor(sym) {
@@ -3230,14 +3240,28 @@
             if (!crossing) { card.style.display = 'none'; return; }
             card.style.display = '';
             card.classList.toggle('transitioning', state === 'voting' && active !== true);
+            // Native-version coins (genesis share-version already == target, no lower
+            // predecessor) never cross and never vote -- the backend emits state='native'
+            // ONLY for them (bip110: v36 from genesis). Show a truthful "no crossing"
+            // detail instead of the meaningless VOTING / V36 -> V36 line. Signalling is
+            // '--' (nothing to signal), the latch line below stays ACTIVE (V36) -- true.
+            // No other coin emits 'native', so DASH/LTC crossing display is untouched.
+            var isNative = state === 'native';
             // Label vocabulary matches what the endpoint actually emits (auto_ratchet.state).
-            var labels = { voting: 'VOTING', activated: 'ACTIVATED', confirmed: 'CONFIRMED' };
+            var labels = { voting: 'VOTING', activated: 'ACTIVATED', confirmed: 'CONFIRMED', native: 'NATIVE' };
             d3.select('#v36_status_label').text(labels[state] || (state ? state.toUpperCase() : '-'));
-            d3.select('#v36_signal_pct').text(typeof pct === 'number' ? pct + '%' : '-');
+            d3.select('#v36_signal_pct').text(isNative ? '—' : (typeof pct === 'number' ? pct + '%' : '-'));
             // current -> target: current is the live latch version; the ratchet endpoint
-            // is V36 for every coin's cross (LTC/DOGE V35->V36, DASH V16->V36).
-            d3.select('#v36_share_label').text(live != null ? 'V' + live : '-');
-            d3.select('#v36_target_label').text('V36');
+            // is V36 for every coin's cross (LTC/DOGE V35->V36, DASH V16->V36). For a
+            // native coin there is no "from" version -- collapse the row to a plain
+            // no-crossing statement.
+            if (isNative) {
+                d3.select('#v36_cross_detail').text('V36 native (no crossing)');
+            } else {
+                d3.select('#v36_cross_detail').html('<span id="v36_share_label"></span> &rarr; <span id="v36_target_label"></span>');
+                d3.select('#v36_share_label').text(live != null ? 'V' + live : '-');
+                d3.select('#v36_target_label').text('V36');
+            }
             // Authoritative live-latch ground truth (m_cached_share_version / DASH's
             // ratchet-derived live_share_version). Only rendered when the backend
             // reports it (charter #3).

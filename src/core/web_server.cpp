@@ -6565,6 +6565,16 @@ nlohmann::json MiningInterface::rest_v36_status()
         v36_active = ar.value("v36_active", v36_active);
     }
 
+    // Native-version coins (genesis share-version == target, no lower
+    // predecessor) never cross and never vote. Override the vs-derived state
+    // AFTER it is read so a latched-native coin (bip110: v36 from genesis)
+    // reports 'native' instead of the fabricated 'voting'/V36->V36 crossing.
+    // Display-only; leaves live_share_version / v36_active as computed and does
+    // not touch any share_chain counts. Only bip110 opts in via
+    // set_native_share_version(true) -> DASH/LTC output is byte-identical.
+    if (m_native_share_version)
+        state = "native";
+
     result["auto_ratchet"] = {
         {"state", state},
         {"persisted_state", state},

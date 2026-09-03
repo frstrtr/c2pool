@@ -647,6 +647,14 @@ public:
     // Cached share version (v35/v36) — updated by PPLNS hook from AutoRatchet
     void set_cached_share_version(int64_t v) { m_cached_share_version = v; }
     int64_t get_cached_share_version() const { return m_cached_share_version; }
+    // Native share version: the coin's genesis/minimum share version already
+    // EQUALS the target (v36) — there is no lower predecessor, so there is no
+    // crossing and no voting. Display-only flag consumed by rest_v36_status()
+    // so the dashboard reports a truthful 'native' state instead of fabricating
+    // a VOTING/V36->V36 crossing. bip110 mints v36 from genesis; DASH/LTC
+    // crossed v35->v36 and leave this false to keep the real ratchet display.
+    void set_native_share_version(bool v) { m_native_share_version = v; }
+    bool get_native_share_version() const { return m_native_share_version; }
     // Local stratum hashrate (H/s) — set via callback from WebServer
     void set_stratum_hashrate_fn(std::function<double()> fn) { m_stratum_hashrate_fn = thread_safe_wrap(std::move(fn)); }
     double get_stratum_total_hashrate() const { return m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0; }
@@ -1385,6 +1393,9 @@ private:
     // AutoRatchet state machine was VOTING and minting v35. The truthful floor is
     // v35 — the ratchet lifts it to 36 only after the chain actually votes.
     int64_t m_cached_share_version{35};
+    // See set_native_share_version(): true only for a coin launched at the
+    // target share version (bip110 = v36 from genesis, no crossing).
+    bool m_native_share_version{false};
     std::string m_cached_witness_commitment;
     uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;
