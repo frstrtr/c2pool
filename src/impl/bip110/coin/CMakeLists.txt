@@ -159,3 +159,36 @@ target_link_libraries(bip110_coin_subver_brand_kat
     Threads::Threads
 )
 add_test(NAME bip110_coin_subver_brand_kat COMMAND bip110_coin_subver_brand_kat)
+
+# bip110_inbound_listener_kat: the coin-p2p INBOUND accept path (:8333) gate.
+# Drives the REAL InboundListener over a REAL loopback socket (reusing
+# core::Server's accept + eb60bf4c strong-ref UAF guard, armed by set_lifetime
+# BEFORE listen(), plus core::Socket framing on both sides). Proves: [A] loopback
+# accept + full accepting-side handshake (peer version FIRST -> our branded
+# version subver==BIP110_COIN_SUBVER + NODE_BLAKE2B + verack -> getaddr->addr),
+# crash-free; [B] a non-fork dialer (no NODE_BLAKE2B) dropped pre-verack at the
+# same gate as the outbound arm; [C] the MAX_INBOUND cap with drop-on-overflow.
+# Same link closure as the sibling coin KATs.
+add_executable(bip110_inbound_listener_kat
+    test/bip110_inbound_listener_kat.cpp
+)
+target_compile_definitions(bip110_inbound_listener_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_inbound_listener_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_inbound_listener_kat COMMAND bip110_inbound_listener_kat)

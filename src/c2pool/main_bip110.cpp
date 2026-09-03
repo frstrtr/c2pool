@@ -23,6 +23,7 @@
 #include <impl/bip110/coin/coin_peer_manager.hpp>
 #include <impl/bip110/coin/broadcaster.hpp>        // M3 PR-C2 NODE_BLAKE2B fan-out pool
 #include <impl/bip110/coin/broadcaster_full.hpp>   // M3 PR-C2 found-block keystone
+#include <impl/bip110/coin/inbound_listener.hpp>   // coin-p2p INBOUND accept path (:8333)
 #include <impl/bip110/coin/chain_seeds.hpp>
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
@@ -1034,6 +1035,51 @@ int run_embedded(bool coin_p2p_discover,
         const auto st = coin_peer_mgr->peer_stats();
         LOG_INFO << "[EMB-BIP110] NODE_BLAKE2B peer discovery ARMED: peers=" << st.total
                  << " groups=" << st.unique_groups;
+    }
+
+    // ── COIN-P2P INBOUND LISTENER (:8333) ─────────────────────────────────────
+    // Make the branded coin-p2p node (/c2pool:0.1/bip110/frstrtr/ + NODE_BLAKE2B)
+    // REACHABLE: the primary NodeP2P is outbound-only, so only the ~6 fork peers
+    // we dial ever see our UA. A separate accept-only InboundListener on
+    // 0.0.0.0:8333 lets bitnodes/crawlers and any fork node DIAL US and record
+    // our brand + services. It REUSES core::Server's accept path (the same
+    // eb60bf4c strong-ref UAF guard as the outbound arm) via set_lifetime BEFORE
+    // listen(), the broadcaster per-slot session pattern, and the addrman getaddr
+    // supplier. The primary NodeP2P (coin_node) stays UNTOUCHED — zero regression
+    // to the outbound fork peers. Network-identity only: version/verack/ping/
+    // getaddr are FREE p2p (no consensus/wire/params change). Always-on whenever
+    // coin p2p is armed (not sharechain-flag-gated). Declared at run_embedded
+    // scope so it outlives ioc.run().
+    std::shared_ptr<bip110::coin::p2p::InboundListener<MiniConfig>> inbound_listener;
+    if (coin_p2p_discover) {
+        inbound_listener =
+            std::make_shared<bip110::coin::p2p::InboundListener<MiniConfig>>(&ioc, &config);
+        // ARM the accept-path UAF guard BEFORE listen(): register the listener's
+        // own control block as its INetwork lifetime so core::Server::accept's
+        // async_accept completion pins it by a strong ref (factory.hpp:83-117).
+        inbound_listener->set_lifetime(inbound_listener);
+        assert(inbound_listener->lifetime_armed() && "inbound listener lifetime failed to arm");
+        // getaddr replies come from the SAME fork-filtered, routable tried set the
+        // fan-out broadcaster draws from (mutex-guarded, read-only, io-safe).
+        if (coin_peer_mgr) {
+            auto* mgr = coin_peer_mgr.get();
+            inbound_listener->set_addr_supplier([mgr]() {
+                std::vector<NetService> out;
+                for (const auto& ep : mgr->get_tried_peers(/*max_count=*/25))
+                    out.push_back(ep.to_net_service());
+                return out;
+            });
+        }
+        // Advertise our header-chain tip in the version reply (cosmetic; crawlers
+        // only record UA + services).
+        inbound_listener->set_height_supplier([&header_chain]() {
+            return static_cast<uint32_t>(header_chain.height());
+        });
+        inbound_listener->core::Server::listen(uint16_t{8333});   // 0.0.0.0:8333
+        LOG_INFO << "[EMB-BIP110] coin-p2p INBOUND listener ARMED on 0.0.0.0:8333 "
+                    "(subver=" << bip110::coin::p2p::BIP110_COIN_SUBVER
+                 << ", services=NODE_NETWORK|NODE_WITNESS|NODE_BLAKE2B, cap="
+                 << bip110::coin::p2p::InboundListener<MiniConfig>::MAX_INBOUND << ")";
     }
 
     // ── Knots peer-discovery wiring (getaddr crawl + addr ingest + scorer
