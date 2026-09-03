@@ -5573,40 +5573,71 @@
                     return;
                 }
 
-                // Pre-compute average age per row for axis labels
+                // Time axis (left margin). The grid is SHARE-INDEXED, not
+                // time-uniform: each row holds `cols` consecutive shares, so
+                // equal vertical pitch does NOT mean equal elapsed time. To keep
+                // the axis honest we derive every label from a REAL share
+                // timestamp — the age of the row's first (newest, top-left)
+                // cell, `now - shares[r*cols].t` — never a fabricated row mean,
+                // and we place the tick+label at the row TOP, exactly where that
+                // boundary share sits. Uneven label spacing is the correct
+                // outcome: on a share-indexed grid, label density encodes share
+                // density (clumps of recent shares → tightly packed labels).
                 var now = Date.now() / 1000;
-                var rowAges = [];
-                for (var r = 0; r < this.rows; r++) {
-                    var start = r * this.cols;
-                    var end = Math.min(start + this.cols, this.shares.length);
-                    var sum = 0;
-                    for (var j = start; j < end; j++) sum += (now - this.shares[j].t);
-                    rowAges.push(sum / (end - start));
-                }
 
-                // Draw time axis labels on the left margin — hours only
-                ctx.font = 'bold 11px -apple-system, sans-serif';
-                ctx.textAlign = 'right';
-                ctx.textBaseline = 'middle';
+                var fmtAge = function(s) {
+                    s = Math.round(s);
+                    var d = Math.floor(s / 86400); s -= d * 86400;
+                    var h = Math.floor(s / 3600);  s -= h * 3600;
+                    var m = Math.floor(s / 60);
+                    var parts = [];
+                    if (d > 0) parts.push(d + 'd');
+                    if (h > 0) parts.push(h + 'h');
+                    if (m > 0) parts.push(m + 'm');
+                    return parts.length ? parts.join(' ') : '0m';
+                };
 
-                // Find which rows cross whole-hour boundaries and label those
-                var lastLabeledHour = -1;
-                for (var r = 0; r < this.rows; r++) {
-                    var hour = Math.floor(rowAges[r] / 3600);
-                    if (hour !== lastLabeledHour && hour >= 0) {
-                        lastLabeledHour = hour;
-                        var label = hour + 'h';
-                        var yLabel = r * step + step / 2;
-                        ctx.fillStyle = '#b0b0cc';
-                        ctx.fillText(label, ml - 4, yLabel);
+                // Label only when there is a real second axis to describe:
+                // more than one row of shares and a positive age span.
+                if (this.rows > 1 && this.shares.length > this.cols) {
+                    var lastIdx = (this.rows - 1) * this.cols;
+                    if (lastIdx >= this.shares.length) lastIdx = this.shares.length - 1;
+                    var span = now - this.shares[lastIdx].t; // age of the oldest row's first cell
 
-                        // Tick line
-                        ctx.strokeStyle = 'rgba(140,140,180,0.2)';
-                        ctx.lineWidth = 0.5;
-                        ctx.beginPath();
-                        ctx.moveTo(ml, r * step);
-                        ctx.lineTo(cssW, r * step);
-                        ctx.stroke();
+                    if (span > 0) {
+                        // Pick the finest step that keeps the axis to <= ~8 labels.
+                        var STEPS = [900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+                        var stepSec = STEPS[STEPS.length - 1];
+                        for (var si = 0; si < STEPS.length; si++) {
+                            if (span / STEPS[si] <= 8) { stepSec = STEPS[si]; break; }
+                        }
+
+                        ctx.font = 'bold 11px -apple-system, sans-serif';
+                        ctx.textAlign = 'right';
+                        ctx.textBaseline = 'top';
+
+                        // Walk rows top→bottom; when the boundary share's age
+                        // crosses into a new multiple of stepSec, label it there.
+                        var lastK = -1;
+                        for (var r = 0; r < this.rows; r++) {
+                            var bIdx = r * this.cols;
+                            if (bIdx >= this.shares.length) break;
+                            var k = Math.floor((now - this.shares[bIdx].t) / stepSec);
+                            if (r === 0) { lastK = k; continue; } // top boundary = "now"
+                            if (k > lastK) {
+                                lastK = k;
+                                var yLabel = r * step;
+                                ctx.fillStyle = '#b0b0cc';
+                                ctx.fillText(fmtAge(k * stepSec), ml - 4, yLabel + 1);
+
+                                ctx.strokeStyle = 'rgba(140,140,180,0.2)';
+                                ctx.lineWidth = 0.5;
+                                ctx.beginPath();
+                                ctx.moveTo(ml, yLabel);
+                                ctx.lineTo(cssW, yLabel);
+                                ctx.stroke();
+                            }
+                        }
                     }
                 }
 
@@ -6870,8 +6901,8 @@
             // blue; falls back to the single myAddress when myAddrSet is empty.
             isMine: function(addr) {
                 if (!addr) return false;
-                if (this.myAddrSet && this.myAddrSet[addr]) return true;
-                return !!(this.myAddress && addr === this.myAddress);
+                if (defrag.myAddrSet && defrag.myAddrSet[addr]) return true;
+                return !!(defrag.myAddress && addr === defrag.myAddress);
             },
 
             updateStats: function(data) {
