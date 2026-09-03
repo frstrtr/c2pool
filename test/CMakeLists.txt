@@ -1467,7 +1467,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # --target allowlist AND already compiles coin/replay_bulk_fetch.hpp, so its
     # link set resolves BulkBlockScheduler/bulkpolicy with no new deps; a
     # standalone executable was a NOT_BUILT/"Not Run" CTest sentinel.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp)
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp test_dash_restart_reorg_supersede_kat.cpp)
     target_compile_definitions(test_dash_p2p_node PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE
