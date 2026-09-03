@@ -66,6 +66,12 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from html import escape
 
+# Reverse-proxy sub-path mount (set from --url-prefix in main()). Empty string
+# = served at root, and every generated page is byte-identical to before this
+# option existed. When set (e.g. "/explorer") it is prepended to generated
+# links and stripped from incoming request paths in ExplorerHandler.
+URL_PREFIX = ""
+
 # ============================================================================
 # COIN PROFILES — data-driven per-coin configuration.
 #
@@ -2010,13 +2016,28 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
-        return parsed.path, {k: v[0] for k, v in params.items()}
+        path = parsed.path
+        # Strip the reverse-proxy mount prefix so the exact-match routing below
+        # is unchanged whether or not the proxy forwards the sub-path.
+        if URL_PREFIX and path.startswith(URL_PREFIX):
+            path = path[len(URL_PREFIX):] or "/"
+        return path, {k: v[0] for k, v in params.items()}
 
     def _respond(self, code, content, content_type="text/html"):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+        # Reverse-proxy mount: rewrite the site-absolute links in generated HTML
+        # so navigation stays inside the sub-path. Only HTML pages carry links;
+        # JSON/SSE responses are untouched. No-op (byte-identical) when unset.
+        if URL_PREFIX and content_type.startswith("text/html"):
+            if isinstance(content, bytes):
+                content = content.decode()
+            content = (content
+                       .replace('href="/', f'href="{URL_PREFIX}/')
+                       .replace('action="/', f'action="{URL_PREFIX}/')
+                       .replace('EventSource("/', f'EventSource("{URL_PREFIX}/'))
         if isinstance(content, str):
             content = content.encode()
         self.wfile.write(content)
@@ -2204,7 +2225,21 @@ def main():
     parser.add_argument("--doge-c2pool", default=None, help="[legacy] c2pool explorer API URL for DOGE")
 
     parser.add_argument("--web-port", type=int, default=8888, help="Explorer web port")
+    parser.add_argument("--url-prefix", default="",
+                        help="Serve under a sub-path (e.g. /explorer) behind a reverse "
+                             "proxy. Prepended to every generated link and stripped from "
+                             "incoming request paths. Default \"\" = root (byte-identical).")
     args = parser.parse_args()
+
+    # URL sub-path support (reverse-proxy mount). Normalised to leading-slash,
+    # no trailing slash; empty string leaves every generated page byte-identical.
+    global URL_PREFIX
+    up = (args.url_prefix or "").strip()
+    if up:
+        if not up.startswith("/"):
+            up = "/" + up
+        up = up.rstrip("/")
+    URL_PREFIX = up
 
     coins = OrderedDict()
     primary = None

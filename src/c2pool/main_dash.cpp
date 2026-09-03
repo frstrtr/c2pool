@@ -90,6 +90,7 @@
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
+#include <impl/dash/coin/block_json.hpp>         // dash::coin::block_to_explorer_json — /api/explorer getblock body decode
 #include <impl/dash/coin/bestblock_diag.hpp>     // #1046 bestblock out=0 diagnostic classifier (RpcNotString/BadHexLen/Ok)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
@@ -1090,9 +1091,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // The #1218 gbt-xcheck-txmerkle guard is UNTOUCHED and stays
              // the referee on any divergence.
              const std::string& embedded_utxo_fold_fees_db = std::string(),
-             const std::string& embedded_utxo_fold_expect = std::string())
+             const std::string& embedded_utxo_fold_expect = std::string(),
+             // --explorer / --no-explorer: the loopback-only /api/explorer
+             // surface consumed by explorer.py --coin dash --c2pool. Default ON
+             // (read-only + loopback-guarded, so exposing it is safe). Enabling
+             // it (a) opens the http_session gate (set_explorer_enabled), (b)
+             // wires the three mempool explorer callbacks, (c) extends the
+             // coin-chain-query getblock hook to serve decoded block BODIES from
+             // retained raw blocks, and (d) arms flag-gated raw-block retention
+             // (depth DASH_EXPLORER_DEPTH) into the node's own UTXO LevelDB.
+             // Retention additionally requires --embedded-utxo (the lane that
+             // owns that DB); without it getblock stays the honest header-only
+             // #99 partial. ZERO consensus/gentx/reward/coinbase/share path.
+             bool explorer_enabled = true)
 {
     namespace io = boost::asio;
+
+    // Explorer raw-block retention window: heights whose full block bodies are
+    // kept in the UTXO LevelDB for /api/explorer getblock decode. 288 ≈ 2 days
+    // at Dash's 2.5-min block target (the LTC/bip110 explorer default). Storage
+    // only, flag-gated on explorer_enabled; NEVER a consensus/reward path.
+    constexpr uint32_t DASH_EXPLORER_DEPTH = 288;
 
     dash::coin::RpcConf conf;
     std::string conf_path = rpc_conf_path;
@@ -2945,8 +2964,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     ? dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet
                     : dash::coin::UtxoImmaturePolicy::Refuse);
             utxo_block_sub = coin_state.block_connected.subscribe(
-                [&utxo_lane](const dash::interfaces::BlockConnected& bc) {
+                [&utxo_lane, explorer_enabled, DASH_EXPLORER_DEPTH]
+                (const dash::interfaces::BlockConnected& bc) {
                     utxo_lane.on_block_connected(bc.block, bc.height);
+                    // Explorer raw-block retention (flag-gated, pruned to depth).
+                    // The embedded arm already downloaded this full block for the
+                    // UTXO fold; keep the last DASH_EXPLORER_DEPTH bodies in the
+                    // lane's own LevelDB so /api/explorer getblock can decode them.
+                    // STORAGE ONLY — no consensus/reward/coinbase path is touched;
+                    // below the window getblock stays the honest #99 partial.
+                    if (explorer_enabled && utxo_lane.db()) {
+                        PackStream ps;
+                        ps << bc.block;
+                        auto span = ps.get_span();
+                        std::vector<uint8_t> raw(
+                            reinterpret_cast<const uint8_t*>(span.data()),
+                            reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+                        utxo_lane.db()->put_raw_block(bc.height, raw);
+                        utxo_lane.db()->prune_raw_blocks(bc.height, DASH_EXPLORER_DEPTH);
+                    }
                 });
             std::cout << "[run] embedded UTXO/fee lane ARMED: db=" << utxo_path
                       << " best_height=" << utxo_lane.cache()->get_best_height()
@@ -4457,18 +4493,243 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // named condition with its measured value and threshold, never a zero.
         if (web_server) {
             web_server->get_mining_interface()->set_coin_chain_query_fn(
-                [hc = header_chain.get()](const std::string& method,
-                                          const nlohmann::json& params,
-                                          const std::string& chain) -> nlohmann::json {
+                [hc = header_chain.get(), &utxo_lane, explorer_enabled,
+                 DASH_EXPLORER_DEPTH, testnet]
+                (const std::string& method,
+                 const nlohmann::json& params,
+                 const std::string& chain) -> nlohmann::json {
                     if (chain != "dash")
                         return nlohmann::json{
                             {"error", "chain '" + chain + "' is not served by this "
                                       "node (owned chain: dash)"}};
+
+                    // ── Explorer getblock BODY serve (read-only) ──────────────
+                    // http_session routes getblock to THIS coin-chain-query hook
+                    // (it precedes the explorer_getblock_fn family for coin-owned
+                    // methods). chain_rpc::getblock can only answer a header-only
+                    // #99 PARTIAL — it holds no block bodies. When the explorer is
+                    // enabled AND the embedded UTXO lane retained this block's
+                    // body (depth DASH_EXPLORER_DEPTH), decode it into a full
+                    // verbosity-2 JSON (tx list, DIP4 extraPayload, MN-payee
+                    // vouts). GOOD-CITIZEN: this only ADDS bodies; anything not
+                    // retained (below the window, body absent, verbosity 0 raw
+                    // hex) falls through to chain_rpc's existing named refusals —
+                    // nothing currently servable is removed.
+                    if (explorer_enabled && method == "getblock"
+                        && params.is_array() && !params.empty()
+                        && params[0].is_string() && utxo_lane.db()) {
+                        bool want_decode = true;   // no verbosity == full decode
+                        if (params.size() > 1) {
+                            if (params[1].is_number())
+                                want_decode = params[1].get<int>() >= 1;
+                            else if (params[1].is_boolean())
+                                want_decode = params[1].get<bool>();
+                        }
+                        if (want_decode) {
+                            uint256 blk_hash;
+                            blk_hash.SetHex(params[0].get<std::string>());
+                            auto entry = hc->get_header(blk_hash);
+                            if (entry) {
+                                uint32_t height = entry->height;
+                                uint32_t tip = hc->height();
+                                const bool in_window =
+                                    !(tip > DASH_EXPLORER_DEPTH
+                                      && height < tip - DASH_EXPLORER_DEPTH);
+                                if (in_window) {
+                                    auto raw = utxo_lane.db()->get_raw_block(height);
+                                    if (raw) {
+                                        try {
+                                            PackStream ps(*raw);
+                                            dash::coin::BlockType block;
+                                            ps >> block;
+                                            dash::coin::ExplorerChainParams ep;
+                                            ep.bech32_hrp = "";            // Dash: no bech32
+                                            ep.p2pkh_ver  = testnet ? 0x8c : 0x4c;
+                                            ep.p2sh_ver   = testnet ? 0x13 : 0x10;
+                                            ep.chain_name = testnet ? "test" : "main";
+                                            return dash::coin::block_to_explorer_json(
+                                                block, height, blk_hash, ep);
+                                        } catch (...) {
+                                            // Fall through to the header-chain
+                                            // partial; never fake a body.
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     return dash::coin::chain_rpc::chain_query(*hc, method, params);
                 });
             std::cout << "[run] daemonless chain queries ARMED "
                          "(getbestblockhash/getblockhash/getblockchaininfo "
-                         "answered from the header chain)\n";
+                         "answered from the header chain"
+                      << (explorer_enabled
+                              ? "; getblock bodies from retained raw blocks)"
+                              : ")")
+                      << "\n";
+
+            // ── Explorer API surface (loopback-only, read-only) ───────────────
+            // Open the http_session /api/explorer gate + wire the mempool
+            // callbacks explorer.py --coin dash --c2pool consumes. This is the
+            // ONLY caller of set_explorer_enabled on the DASH lane (main_ltc.cpp
+            // is the reference); without it the gate answers
+            // {"error":"Explorer not enabled"}.
+            //
+            // Only THREE callbacks are wired here — getmempoolinfo / getrawmempool
+            // / getmempoolentry. The chain-info / blockhash / getblock methods are
+            // coin-OWNED (served by the coin-chain-query hook above), so their
+            // explorer_*_fn siblings would be dead code and are deliberately NOT
+            // installed. All feeds are display-only reads over the mempool
+            // snapshot — no gentx/selection/reward/coinbase/share path is touched.
+            if (explorer_enabled) {
+                auto* mi = web_server->get_mining_interface();
+                mi->set_explorer_enabled(true);
+                auto* mp = &node_coin_state.mempool();
+                auto chain_ok = [](const std::string& c) {
+                    return c.empty() || c == "dash";
+                };
+
+                // getmempoolinfo — summary stats + feerate histogram.
+                mi->set_explorer_mempoolinfo_fn(
+                    [mp, chain_ok](const std::string& chain) -> nlohmann::json {
+                        if (!chain_ok(chain))
+                            return nlohmann::json{{"error", "Mempool not available for chain"}};
+                        auto snap = mp->get_summary();
+                        time_t now = std::time(nullptr);
+                        struct Bucket { double lo, hi; size_t count{0}; size_t bytes{0}; };
+                        std::vector<Bucket> buckets = {{0,1},{1,5},{5,20},{20,100},{100,1e9}};
+                        for (const auto& e : snap.entries) {
+                            double fr = e.feerate;
+                            for (auto& b : buckets) {
+                                if (fr >= b.lo && fr < b.hi) { ++b.count; b.bytes += e.base_size; break; }
+                            }
+                        }
+                        nlohmann::json hist = nlohmann::json::array();
+                        for (const auto& b : buckets) {
+                            hist.push_back({
+                                {"min_feerate", b.lo},
+                                {"max_feerate", b.hi >= 1e9 ? nlohmann::json("inf") : nlohmann::json(b.hi)},
+                                {"count", b.count}, {"bytes", b.bytes}});
+                        }
+                        return nlohmann::json{
+                            {"size", snap.tx_count},
+                            {"bytes", snap.total_bytes},
+                            {"total_fees", snap.total_fees},
+                            {"fee_known_count", snap.fee_known_count},
+                            {"fee_unknown_count", snap.tx_count - snap.fee_known_count},
+                            {"min_feerate", snap.min_feerate},
+                            {"max_feerate", snap.max_feerate},
+                            {"median_feerate", snap.median_feerate},
+                            {"avg_feerate", snap.avg_feerate},
+                            {"oldest_age_sec", (snap.oldest_time > 0 && now > snap.oldest_time)
+                                                  ? (now - snap.oldest_time) : 0},
+                            {"fee_histogram", hist},
+                            {"chain", "dash"}};
+                    });
+
+                // getrawmempool — txid list or verbose entries.
+                mi->set_explorer_rawmempool_fn(
+                    [mp, chain_ok](const std::string& chain, bool verbose, uint32_t limit) -> nlohmann::json {
+                        if (!chain_ok(chain))
+                            return nlohmann::json{{"error", "Mempool not available for chain"}};
+                        if (!verbose) {
+                            auto txids = mp->all_txids();
+                            nlohmann::json arr = nlohmann::json::array();
+                            for (const auto& id : txids) arr.push_back(id.GetHex());
+                            return arr;
+                        }
+                        auto snap = mp->get_summary();
+                        time_t now = std::time(nullptr);
+                        nlohmann::json arr = nlohmann::json::array();
+                        uint32_t count = 0;
+                        for (const auto& e : snap.entries) {
+                            if (count >= limit) break;
+                            arr.push_back({
+                                {"txid", e.txid.GetHex()},
+                                {"size", e.base_size},
+                                {"fee", e.fee},
+                                {"fee_known", e.fee_known},
+                                {"feerate", e.feerate},
+                                {"time_added", e.time_added},
+                                {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                                {"n_vin", e.n_vin},
+                                {"n_vout", e.n_vout}});
+                            ++count;
+                        }
+                        return arr;
+                    });
+
+                // getmempoolentry — single tx full detail with vin/vout.
+                mi->set_explorer_mempoolentry_fn(
+                    [mp, chain_ok, testnet](const std::string& txid_hex, const std::string& chain) -> nlohmann::json {
+                        if (!chain_ok(chain))
+                            return nlohmann::json{{"error", "Mempool not available for chain"}};
+                        uint256 txid;
+                        txid.SetHex(txid_hex);
+                        auto opt = mp->get_entry(txid);
+                        if (!opt) return nlohmann::json{{"error", "Transaction not in mempool"}};
+                        const auto& e = *opt;
+                        time_t now = std::time(nullptr);
+                        const uint8_t p2pkh = testnet ? 0x8c : 0x4c;
+                        const uint8_t p2sh  = testnet ? 0x13 : 0x10;
+                        nlohmann::json vin_arr = nlohmann::json::array();
+                        for (const auto& inp : e.tx.vin) {
+                            vin_arr.push_back({
+                                {"prevout_hash", inp.prevout.hash.GetHex()},
+                                {"prevout_n", inp.prevout.index},
+                                {"sequence", inp.sequence}});
+                        }
+                        nlohmann::json vout_arr = nlohmann::json::array();
+                        for (size_t i = 0; i < e.tx.vout.size(); ++i) {
+                            const auto& out = e.tx.vout[i];
+                            std::vector<unsigned char> script(out.scriptPubKey.m_data.begin(),
+                                                              out.scriptPubKey.m_data.end());
+                            auto cls = core::classify_script(script, "", p2pkh, p2sh);
+                            nlohmann::json vout_obj = {
+                                {"n", i},
+                                {"value_sat", out.value},
+                                {"scriptPubKey_hex", cls.hex},
+                                {"type", cls.type}};
+                            if (!cls.addresses.empty()) vout_obj["address"] = cls.addresses[0];
+                            if (cls.addresses.size() > 1) vout_obj["addresses"] = cls.addresses;
+                            vout_arr.push_back(std::move(vout_obj));
+                        }
+                        nlohmann::json r = {
+                            {"txid", e.txid.GetHex()},
+                            {"size", e.base_size},
+                            {"fee", e.fee},
+                            {"fee_known", e.fee_known},
+                            {"feerate", e.feerate_satvb()},
+                            {"type", static_cast<int>(e.tx.type)},
+                            {"version", e.tx.version},
+                            {"time_added", e.time_added},
+                            {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                            {"vin", vin_arr},
+                            {"vout", vout_arr},
+                            {"chain", "dash"}};
+                        // DIP2/DIP3/DIP4 special-tx payload (explorer.py decodes
+                        // client-side). Present iff version==3 && type!=0.
+                        if (e.tx.version == 3 && e.tx.type != 0 && !e.tx.extra_payload.empty()) {
+                            static const char H[] = "0123456789abcdef";
+                            std::string ep;
+                            ep.reserve(e.tx.extra_payload.size() * 2);
+                            for (unsigned char b : e.tx.extra_payload) {
+                                ep += H[b >> 4]; ep += H[b & 0x0f];
+                            }
+                            r["extraPayload"] = ep;
+                        }
+                        return r;
+                    });
+
+                std::cout << "[run] explorer /api/explorer ARMED (loopback-only): "
+                             "getblock bodies + mempool info/raw/entry, retention depth="
+                          << DASH_EXPLORER_DEPTH
+                          << (embedded_utxo ? "" : " (NOTE: --embedded-utxo absent -> "
+                                                  "no raw-block retention; getblock stays "
+                                                  "header-only #99 partial)")
+                          << "\n";
+            }
 
             // ── DEFECT-3 operator surface: WHY the embedded arm is not serving ──
             // web-static/dashboard.html has read a per-coin `no_work_reason` since
@@ -10491,6 +10752,7 @@ int main(int argc, char** argv)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
+    bool explorer_enabled = true;              // --explorer (default ON) / --no-explorer: loopback-only /api/explorer
     // --embedded-utxo-immature-serve-empty: pure-daemonless OPT-IN. Default
     // OFF refuses every embedded template until the UTXO lane reaches
     // blocks_connected >= 106 (p2pool semantics: an unsynced node does not
@@ -10673,6 +10935,10 @@ int main(int argc, char** argv)
             embedded_govsync = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if (std::strcmp(argv[i], "--explorer") == 0)
+            explorer_enabled = true;
+        else if (std::strcmp(argv[i], "--no-explorer") == 0)
+            explorer_enabled = false;
         else if (std::strcmp(argv[i], "--embedded-utxo-immature-serve-empty") == 0)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
@@ -11217,7 +11483,8 @@ int main(int argc, char** argv)
                         embedded_fold_live_expect,     // PR-C1 store-verify hash
                         embedded_fold_checkscripts,   // PR-C4 input-script check
                         embedded_utxo_fold_fees_db,    // W5-A fold fee source
-                        embedded_utxo_fold_expect);    // W5-A anchor restatement
+                        embedded_utxo_fold_expect,     // W5-A anchor restatement
+                        explorer_enabled);             // /api/explorer surface (default ON)
     }
     return run_selftest();
 }

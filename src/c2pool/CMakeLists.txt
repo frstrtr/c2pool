@@ -549,6 +549,27 @@ target_link_libraries(dash_tx_serve_self_validation_kat
 )
 add_test(NAME dash_tx_serve_self_validation_kat COMMAND dash_tx_serve_self_validation_kat)
 
+# dash_explorer_json_kat — KAT for the read-only /api/explorer getblock body
+# decode (dash::coin::block_to_explorer_json): DIP4 CbTx type/extraPayload +
+# masternode-payee X-address + txid. Decode-only, no node/network.
+add_executable(dash_explorer_json_kat dash_explorer_json_kat.cpp)
+target_link_libraries(dash_explorer_json_kat
+    core pool sharechain
+    c2pool_node_enhanced
+    dash
+    c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+    dash_x11
+    dash_rpc
+    dash_stratum
+    dash_block_replay
+    dash_bls_verify
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME dash_explorer_json_kat COMMAND dash_explorer_json_kat)
+
 # ---- Control-plane M0: money-gate KAT (Qt-free sibling of test_reward_safe_launch)
 # The settings-file loader + param catalog are self-contained (stdlib only), so
 # this test compiles them directly rather than dragging the full core object lib
