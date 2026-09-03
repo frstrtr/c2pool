@@ -4,6 +4,7 @@
 // manual compile without the generated include dir still builds; existing
 // C2POOL_VERSION #ifdef guards and per-main "dev" fallbacks then apply.
 #if __has_include(<c2pool_build_version.h>)
+#include <cassert>
 #include <c2pool_build_version.h>
 #endif
 #include <algorithm>
@@ -2802,7 +2803,11 @@ int main(int argc, char* argv[]) {
 
             // For testnet, discard hardcoded mainnet bootstrap peers before Node construction
             // (Node constructor copies bootstrap_addrs into its addr store)
-            std::unique_ptr<ltc::Node> p2p_node;
+            // shared_ptr-owned + set_lifetime (below) so the sharechain node's
+            // core::Server(accept)/core::Client(dial) pin it with a strong ref per
+            // async op -- no freed-node make_socket dynamic_cast on teardown
+            // (#759-class). Legacy unique_ptr left the core guard a no-op.
+            std::shared_ptr<ltc::Node> p2p_node;
             if (solo_mode || custodial_mode) {
                 LOG_INFO << (solo_mode ? "Solo" : "Custodial")
                          << " pool mode: no P2P sharechain, "
@@ -2814,7 +2819,9 @@ int main(int argc, char* argv[]) {
                     ltc_p2p_config->pool()->m_bootstrap_addrs.emplace_back(seed);
                     LOG_INFO << "Added seed node: " << seed;
                 }
-                p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
+                p2p_node = std::make_shared<ltc::Node>(&ioc, ltc_p2p_config.get());
+                p2p_node->set_lifetime(p2p_node);
+                assert(p2p_node->lifetime_armed() && "LTC sharechain node dial/accept lifetime failed to arm");
             } // P2P node creation
             if (p2p_node) {
 #ifdef C2POOL_VERSION
@@ -2844,15 +2851,20 @@ int main(int argc, char* argv[]) {
                 if (coind_p2p_port > 0)
                     LOG_INFO << "Auto-detected parent coin P2P port: " << coind_p2p_port;
             }
-            std::unique_ptr<ltc::coin::p2p::NodeP2P<ltc::Config>> coin_p2p;
+            // shared_ptr-owned + set_lifetime so core::Client pins this parent-coin
+            // dialer with a strong ref per async op -- a resolve/connect completion
+            // can never run make_socket() on a freed NodeP2P (the #759-class UAF).
+            std::shared_ptr<ltc::coin::p2p::NodeP2P<ltc::Config>> coin_p2p;
             if (!embedded_ltc && coind_p2p_port > 0) {
                 std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
                 // Override coin config P2P prefix + address with correct values
                 auto parent_symbol = blockchain_to_symbol(blockchain);
                 ltc_p2p_config->coin()->m_p2p.prefix = get_chain_p2p_prefix(parent_symbol, settings->m_testnet);
                 ltc_p2p_config->coin()->m_p2p.address = NetService(p2p_host, static_cast<uint16_t>(coind_p2p_port));
-                coin_p2p = std::make_unique<ltc::coin::p2p::NodeP2P<ltc::Config>>(
+                coin_p2p = std::make_shared<ltc::coin::p2p::NodeP2P<ltc::Config>>(
                     &ioc, &coin_node, ltc_p2p_config.get());
+                coin_p2p->set_lifetime(coin_p2p);
+                assert(coin_p2p->lifetime_armed() && "LTC parent-coin P2P dial lifetime failed to arm");
                 coin_p2p->connect(NetService(p2p_host, static_cast<uint16_t>(coind_p2p_port)));
                 LOG_INFO << "Parent coin P2P broadcaster connecting to " << p2p_host << ":" << coind_p2p_port;
             }
