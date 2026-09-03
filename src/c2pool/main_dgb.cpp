@@ -669,7 +669,16 @@ int run_node(const core::CoinParams& params, bool testnet,
 
     dgb::coin::CoinNode coin_node(/*embedded=*/&embedded_coin, /*rpc=*/rpc.get());
 
-    dgb::Node p2p_node(&ioc, &config);
+    // shared_ptr-owned + set_lifetime so the sharechain node's core::Server(accept)
+    // and start_outbound_connections() dials pin a strong ref for make_socket's
+    // dynamic_cast, closing the #759-class dial/accept-teardown UAF on a
+    // redial-freed node. The holder owns the node; a reference alias keeps every
+    // existing &p2p_node / p2p_node. site unchanged (holder lives to end of scope
+    // exactly as the stack object did).
+    auto p2p_node_holder = std::make_shared<dgb::Node>(&ioc, &config);
+    dgb::Node& p2p_node = *p2p_node_holder;
+    p2p_node_holder->set_lifetime(p2p_node_holder);
+    assert(p2p_node_holder->lifetime_armed() && "DGB sharechain node dial/accept lifetime failed to arm");
     p2p_node.set_target_outbound_peers(4);
     // Default sharechain P2P port is 5024 (oracle byte-parity); --sharechain-port
     // overrides it for an isolated second instance (G3b tuned-net) without
