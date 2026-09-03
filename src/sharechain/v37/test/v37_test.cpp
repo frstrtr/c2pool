@@ -212,18 +212,27 @@ static void test_fixed_point() {
     CHECK(t1.decay == t2.decay);
     CHECK(t1.inv_decay == t2.inv_decay);
     CHECK(t1.epoch_shift == t2.epoch_shift);
-    u64 expect_per = Q_ONE - static_cast<u64>(
-        (u128(Q_ONE) * LN2_MICRO) / (u128(1000000) * 2160));
-    CHECK(t1.decay_per == expect_per);
+    // Ratified default geometry uses the EXACT hl-th-root base (golden
+    // d659c801): the per-step factor is the exact lambda / lambda^-1, i.e.
+    // decay[1] / inv_decay[1], not the first-order approximation.
+    CHECK(t1.decay_per == 4610206359018591605ULL);   // exact lambda   = decay[1]
+    CHECK(t1.inv_per   == 4613166152737261408ULL);    // exact lambda^-1 = inv_decay[1]
     for (std::size_t d = 1; d < t1.decay.size(); ++d)
         CHECK(t1.decay[d] < t1.decay[d - 1]);
     for (std::size_t j = 1; j < t1.inv_decay.size(); ++j)
         CHECK(t1.inv_decay[j] > t1.inv_decay[j - 1]);
-    // Half-life sanity: decay[half_life] ~ 0.5. The V36-lineage per-step
-    // factor is first-order (1 - ln2/HL), so (1-x)^HL deviates from exactly
-    // 0.5 by ~ln2^2/(2*HL) ~ 5.5e-5 relative — allow 2^-12 slack.
-    u64 half = t1.decay[2160];
-    CHECK(half > (Q_ONE / 2) - (Q_ONE >> 12) && half < (Q_ONE / 2) + (Q_ONE >> 12));
+    // Exact half-life: under the canonical exact-root base (golden d659c801)
+    // decay[half_life] == 2^(FRAC_BITS-1) EXACTLY — no first-order slack.
+    CHECK(t1.decay[2160] == (Q_ONE >> 1));            // 2^61
+    // Golden-match regression pins: decay[]/inv_decay[] MUST reproduce the
+    // ratified golden d659c801 bit-for-bit at these anchors.
+    CHECK(t1.decay[0]        == Q_ONE);                       // 2^62 = ONE
+    CHECK(t1.decay[1]        == 4610206359018591605ULL);
+    CHECK(t1.decay[2160]     == 2305843009213693952ULL);      // 2^61
+    CHECK(t1.decay[4096]     == 1238846976710486712ULL);
+    CHECK(t1.inv_decay[0]    == Q_ONE);
+    CHECK(t1.inv_decay[1]    == 4613166152737261408ULL);
+    CHECK(t1.inv_decay[4095] == 17161783987563169425ULL);
     // Inverse headroom: inv_decay max < 4.0 (E/HL = 4096/2160 -> 2^1.9).
     // Compare in u128: 4.0 in Q62 == 2^64, which overflows u64.
     CHECK(u128(t1.inv_decay.back()) < (u128(4) << FRAC_BITS));
