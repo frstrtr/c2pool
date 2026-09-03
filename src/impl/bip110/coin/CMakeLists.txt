@@ -5,6 +5,8 @@ set(bip110_coin_impl
     p2p_connection.hpp p2p_connection.cpp
     p2p_node.cpp p2p_node.hpp
     p2p_messages.hpp
+    local_addr.hpp           # self-address advertise + self-connect nonce (Knots net.cpp)
+    inbound_listener.hpp     # coin-p2p INBOUND accept path (:8333)
     node.hpp
     coin_node.hpp coin_node.cpp
     broadcaster.hpp          # M3 PR-C2 NODE_BLAKE2B fan-out pool (header-only leaf)
@@ -192,3 +194,37 @@ target_link_libraries(bip110_inbound_listener_kat
     Threads::Threads
 )
 add_test(NAME bip110_inbound_listener_kat COMMAND bip110_inbound_listener_kat)
+
+# bip110_coin_reachability_kat: the SELF-ADDRESS ADVERTISEMENT gate (Knots net.cpp
+# GetLocalAddress / SeenLocal / MaybeSendAddr + CConnman self-connect nonce). Pins
+# the reachability fix that closes the live "listener up, zero inbound" defect:
+# LocalAddrTable peer-echo scoring (routable-only, listen-port substitution) +
+# --coin-externalip override; SelfNonceRegistry self-connect guard + bounded
+# eviction; the outgoing version addr_from carrying OUR reachable addr (never the
+# old 192.168.0.1); the self-addr push record (NODE_BLAKE2B+NODE_WITNESS); the
+# getaddr reply now including our own address FIRST with the full service set; the
+# addr-relay fresh-batch selection; and a compile-proof that both arms accept the
+# shared tables. Zero-socket / deterministic. Same link closure as the siblings.
+add_executable(bip110_coin_reachability_kat
+    test/bip110_coin_reachability_kat.cpp
+)
+target_compile_definitions(bip110_coin_reachability_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_coin_reachability_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_coin_reachability_kat COMMAND bip110_coin_reachability_kat)

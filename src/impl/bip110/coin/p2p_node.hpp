@@ -7,6 +7,7 @@
 #include "compact_blocks.hpp"
 #include "mempool.hpp"
 #include "idle_progress_gate.hpp"
+#include "local_addr.hpp"        // LocalAddrTable, SelfNonceRegistry (self-advertise)
 
 #include <memory>
 
@@ -152,6 +153,34 @@ private:
     // enforced at BOTH the version gate AND at addr-ingest so only fork-capable
     // peers ever enter the addrman (Knots protocol.h SeedsServiceFlags 0x10000009).
     static constexpr uint64_t NODE_BLAKE2B = COIN_NODE_BLAKE2B;
+    // The service set WE advertise everywhere (version, self-addr, getaddr-self):
+    // truthful per Knots protocol.h SeedsServiceFlags 0x10000009 = NODE_NETWORK |
+    // NODE_WITNESS | NODE_BLAKE2B. Same set the InboundListener advertises.
+    static constexpr uint64_t SVC_NODE_NETWORK = 1;
+    static constexpr uint64_t SVC_NODE_WITNESS = (uint64_t{1} << 3);
+    static constexpr uint64_t OUR_SERVICES = SVC_NODE_NETWORK | SVC_NODE_WITNESS | NODE_BLAKE2B;
+
+    // ── Self-address advertisement (Knots net.cpp GetLocalAddress / MaybeSendAddr)
+    // Shared local-address table (peer-echo scored + --coin-externalip) answering
+    // "what is OUR reachable address?" and the self-connect nonce guard. Both are
+    // owned in main and shared across the primary + fan-out + inbound arms; null
+    // when self-advertise is not wired (KATs / non-discovery mode) → every path
+    // below is a no-op, so behaviour is byte-identical to before.
+    std::shared_ptr<LocalAddrTable>    m_local_addr;
+    std::shared_ptr<SelfNonceRegistry> m_self_nonce;
+    // Self-announce cadence (Knots AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL is 24h;
+    // a bootstrapping fork mesh re-announces faster so a newly-learned local addr
+    // reaches peers within one interval — documented deviation).
+    static constexpr time_t SELF_ADDR_INTERVAL_SEC = 30 * 60;
+    bool m_self_addr_sent{false};
+    std::chrono::steady_clock::time_point m_last_self_addr{};
+    // addr-relay sink (Knots net_processing RelayAddress, 2-hop gossip): a fresh
+    // gossip batch we banked is forwarded to a couple of OTHER fork slots. main
+    // wires this to the inbound listener's session relay + addrman. Null → no
+    // relay (still banks locally via m_addr_callback).
+    using AddrRelaySink =
+        std::function<void(const std::vector<btc_addr_record_t>&, const NetService& /*source*/)>;
+    AddrRelaySink m_addr_relay_sink;
 
     // Callbacks for broadcaster integration.
     // Fork-filtered addr ingest sink: the NODE_BLAKE2B + sanity survivors, plus
@@ -219,6 +248,7 @@ public:
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
         m_getaddr_sent = false;   // fresh Connection -> re-arm the one-shot getaddr
+        m_self_addr_sent = false; // fresh Connection -> re-announce our self-addr
         m_connected_at = std::chrono::steady_clock::now();  // stamp THIS connection
         m_idle_gate.reset();   // fresh Connection -> fresh progress high-water mark
         LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
@@ -234,18 +264,34 @@ public:
         // NODE_BLAKE2B because this node enforces the BLAKE2b hard-fork rules —
         // truthful per Knots protocol.h:353-355 (SeedsServiceFlags=0x10000009).
         // Protocol 70016 = BIP 339 wtxidrelay activation point (Bitcoin Core 0.21+).
-        static constexpr uint64_t NODE_NETWORK = 1;
-        static constexpr uint64_t NODE_WITNESS = (1 << 3);
-        uint64_t our_services = NODE_NETWORK | NODE_WITNESS | NODE_BLAKE2B;
+        uint64_t our_services = OUR_SERVICES;
         uint32_t protocol_version = 70016;
+
+        // addr_from = our reachable IP:listen-port when we know it (Knots
+        // GetLocalAddress). Previously a HARDCODED 192.168.0.1:8333 — an
+        // untruthful RFC1918 literal that told every peer nothing usable. When we
+        // do not yet know a routable local addr, send an unspecified endpoint
+        // (Knots sends an empty CService and receivers ignore addr_from anyway;
+        // the load-bearing advertisement is the self-addr push at verack below).
+        NetService from_ep{"0.0.0.0", 0};
+        if (m_local_addr) {
+            if (auto best = m_local_addr->best_local())
+                from_ep = *best;
+        }
+
+        // Self-connect guard (Knots CConnman nonce): record the nonce we send so
+        // the version handler can drop a handshake whose nonce matches — i.e. we
+        // dialed our own listener (only reachable once self-advertise lands).
+        uint64_t nonce = core::random::random_nonce();
+        if (m_self_nonce) m_self_nonce->record(nonce);
 
         auto msg_version = message_version::make_raw(
             protocol_version,
             our_services,
             core::timestamp(),
             addr_t{our_services, m_peer->get_addr()},
-            addr_t{our_services, NetService{"192.168.0.1", 8333}},
-            core::random::random_nonce(),
+            addr_t{our_services, from_ep},
+            nonce,
             BIP110_COIN_SUBVER,
             0
         );
@@ -395,6 +441,13 @@ public:
     void set_on_dial_failed(PeerLifecycleCallback cb) { m_on_dial_failed = std::move(cb); }
     /// Enable Knots getaddr-on-connect peer crawl (one GETADDR per connection).
     void enable_getaddr_discovery() { m_send_getaddr_on_connect = true; }
+    /// Self-address advertisement seams (Knots net.cpp GetLocalAddress /
+    /// SeenLocal / MaybeSendAddr). Shared with the inbound + fan-out arms.
+    void set_local_addr_table(std::shared_ptr<LocalAddrTable> t) { m_local_addr = std::move(t); }
+    void set_self_nonce_registry(std::shared_ptr<SelfNonceRegistry> r) { m_self_nonce = std::move(r); }
+    /// addr-relay sink (Knots RelayAddress 2-hop gossip). Fresh banked batches are
+    /// forwarded here for onward relay to other fork slots.
+    void set_addr_relay_sink(AddrRelaySink cb) { m_addr_relay_sink = std::move(cb); }
     /// Whether getaddr-on-connect crawl is enabled (diagnostics / KATs).
     bool getaddr_discovery_enabled() const { return m_send_getaddr_on_connect; }
     /// Set callback for peer's reported chain height (from version message).
@@ -412,6 +465,36 @@ public:
             auto msg = message_getaddr::make_raw();
             m_peer->write(msg);
         }
+    }
+
+    /// Knots MaybeSendAddr self-announce: push a 1-record `addr` carrying OUR
+    /// reachable IP:listen-port + NODE_BLAKE2B so this peer banks us and gossips
+    /// us onward — the load-bearing half of the reachability fix (just listening
+    /// is not enough; the fork network must LEARN our address). No-op until we
+    /// know a routable local addr (best_local()), and rate-limited to
+    /// SELF_ADDR_INTERVAL_SEC. Called at verack and on the ping tick so a
+    /// later-learned local addr is announced on the next opportunity.
+    void maybe_send_self_addr()
+    {
+        if (!m_peer || !m_handshake_complete || !m_local_addr)
+            return;
+        auto best = m_local_addr->best_local();
+        if (!best)
+            return;
+        auto now = std::chrono::steady_clock::now();
+        if (m_self_addr_sent &&
+            now - m_last_self_addr < std::chrono::seconds(SELF_ADDR_INTERVAL_SEC))
+            return;
+        btc_addr_record_t rec;
+        rec.m_services  = OUR_SERVICES;
+        rec.m_endpoint  = *best;
+        rec.m_timestamp = static_cast<uint32_t>(core::timestamp());
+        auto msg = message_addr::make_raw(std::vector<btc_addr_record_t>{rec});
+        m_peer->write(msg);
+        m_self_addr_sent = true;
+        m_last_self_addr = now;
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] self-addr announced "
+                        << best->to_string() << " to " << m_target_addr.to_string();
     }
 
     /// Send inv for a block hash (merged chain relay — announcement only).
@@ -683,6 +766,18 @@ private:
 
     ADD_P2P_HANDLER(version)
     {
+        // Self-connect guard (Knots CConnman: a version whose nonce equals one WE
+        // sent means we dialed our own listener). Drop before anything else so our
+        // own address never latches a slot or gets re-banked. Only reachable once
+        // self-advertise is live (our routable addr is gossiped back + drawn by
+        // the dial planner).
+        if (m_self_nonce && m_self_nonce->is_self(msg->m_nonce)) {
+            LOG_INFO << "[" << m_chain_label << "] REJECT peer — connected to self "
+                     << "(version nonce match) at " << m_target_addr.to_string();
+            timeout("connected to self");
+            return;
+        }
+
         m_peer_services = msg->m_services;
         m_peer_version = msg->m_version;
         m_peer_subver = msg->m_subversion;
@@ -691,6 +786,13 @@ private:
                  << " start_height=" << msg->m_start_height
                  << " services=0x" << std::hex << msg->m_services << std::dec
                  << " subver=" << msg->m_subversion;
+
+        // Knots SeenLocal(): the peer echoed the address it saw us dial FROM in its
+        // version.addr_to. On a no-NAT host that IP IS our reachable IP; score it
+        // (the port is discarded — best_local() substitutes our real listen port).
+        if (m_local_addr)
+            m_local_addr->seen_local(msg->m_addr_to.m_endpoint.address());
+
         // BIP-110 fork-peer gate: only NODE_BLAKE2B (bit 28) peers follow the
         // BLAKE2b hard-fork chain. A canonical-SHA256d Bitcoin node would feed us
         // the foreign (higher-work) SHA256d chain, so drop it before verack and
@@ -736,6 +838,7 @@ private:
         m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
             send_ping();
             sample_idle_gate();   // catch a silent, non-progressing peer
+            maybe_send_self_addr();  // re-announce our reachable addr (Knots MaybeSendAddr)
         });
 
         bool is_doge = (m_chain_label == "DOGE" || m_chain_label == "doge");
@@ -813,6 +916,10 @@ private:
             LOG_INFO << "[" << m_chain_label << "] Sent getaddr (peer crawl) to "
                      << m_target_addr.to_string();
         }
+
+        // Knots MaybeSendAddr self-announce at handshake (the reachability fix):
+        // tell this peer our reachable IP:8333 so it banks + gossips us onward.
+        maybe_send_self_addr();
     }
 
     ADD_P2P_HANDLER(ping)
@@ -995,11 +1102,29 @@ private:
         size_t dropped_nonfork = 0, dropped_future = 0;
         std::vector<NetService> ok = filter_fork_addr_records(
             msg->m_addrs, now, &dropped_nonfork, &dropped_future);
+        const NetService source = m_peer ? m_peer->get_addr() : m_target_addr;
         if (!ok.empty()) {
             // source = the peer that gossiped these (addrman source-group key,
             // bounds how far one source can spray the new table).
-            const NetService source = m_peer ? m_peer->get_addr() : m_target_addr;
             m_addr_callback(ok, source);
+        }
+
+        // Knots RelayAddress (2-hop gossip): forward a SMALL, FRESH batch of the
+        // NODE_BLAKE2B survivors to other fork slots so a learned peer's
+        // reachability spreads through us. Batch capped at 10 and only records
+        // stamped within the last 10 min (Knots relays nTime <= 10 min old); the
+        // sink (main) excludes the source and picks <=2 destinations.
+        if (m_addr_relay_sink) {
+            std::vector<btc_addr_record_t> fresh;
+            for (const auto& rec : msg->m_addrs) {
+                if (!(rec.m_services & NODE_BLAKE2B)) continue;
+                const int64_t ts = static_cast<int64_t>(rec.m_timestamp);
+                if (ts > now + 10 * 60 || ts < now - 10 * 60) continue;
+                fresh.push_back(rec);
+                if (fresh.size() >= 10) break;
+            }
+            if (!fresh.empty())
+                m_addr_relay_sink(fresh, source);
         }
         LOG_DEBUG_COIND << "[" << m_chain_label << "] addr: " << msg->m_addrs.size()
                         << " received, " << ok.size() << " NODE_BLAKE2B kept ("

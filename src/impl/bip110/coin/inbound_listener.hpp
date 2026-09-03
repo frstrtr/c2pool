@@ -129,6 +129,8 @@ public:
     bool dead()               const { return m_dead; }
     bool handshake_complete() const { return m_handshake_complete; }
     bool got_version()        const { return m_got_version; }
+    bool getaddr_served()     const { return m_getaddr_served; }
+    void mark_getaddr_served()      { m_getaddr_served = true; }
     const std::string& remote_key() const { return m_remote_key; }
 
     // Peer metadata captured from the version handshake (display/dashboard).
@@ -157,6 +159,7 @@ private:
     bool     m_dead{false};
     bool     m_got_version{false};
     bool     m_handshake_complete{false};
+    bool     m_getaddr_served{false};   // Knots m_getaddr_recvd: answer getaddr once/conn
 
     uint64_t    m_peer_services{0};
     uint32_t    m_peer_version{0};
@@ -201,8 +204,39 @@ public:
     {
     }
 
+    // addr-ingest sink: NODE_BLAKE2B-filtered survivors from inbound `addr`
+    // gossip, banked into the shared addrman (same signature as NodeP2P's
+    // AddrCallback). Without this an inbound peer's gossip was dropped on the
+    // floor (dispatch fallback), so a dialer could never grow our address DB.
+    using AddrCallback =
+        std::function<void(const std::vector<NetService>&, const NetService& /*source*/)>;
+
     void set_addr_supplier(AddrSupplier fn)     { m_addr_supplier = std::move(fn); }
     void set_height_supplier(HeightSupplier fn) { m_height_supplier = std::move(fn); }
+    void set_addr_callback(AddrCallback fn)     { m_addr_callback = std::move(fn); }
+    // Self-address advertisement seams (Knots GetLocalAddress / self-connect
+    // nonce), shared with the outbound + fan-out arms.
+    void set_local_addr_table(std::shared_ptr<LocalAddrTable> t) { m_local_addr = std::move(t); }
+    void set_self_nonce_registry(std::shared_ptr<SelfNonceRegistry> r) { m_self_nonce = std::move(r); }
+
+    // Knots RelayAddress destination: push a fresh gossip batch to up to `fanout`
+    // handshaked inbound sessions other than `exclude`. Called by the outbound
+    // arm's addr-relay sink (main) so a learned peer's reachability spreads to our
+    // inbound peers too. Public so the outbound seam can reach it.
+    void relay_addr(const std::vector<btc_addr_record_t>& recs,
+                    const std::string& exclude_key, size_t fanout = 2)
+    {
+        if (recs.empty()) return;
+        size_t sent = 0;
+        for (auto& [key, s] : m_slots) {
+            if (sent >= fanout) break;
+            if (!s || s->dead() || !s->handshake_complete()) continue;
+            if (key == exclude_key) continue;
+            auto msg = message_addr::make_raw(recs);
+            s->write(msg);
+            ++sent;
+        }
+    }
 
     // ── INetwork ──────────────────────────────────────────────────────────────
     // Called by core::Server::accept for each accepted (incoming) socket, with
@@ -357,12 +391,30 @@ private:
     // but with the reply choreography INVERTED (we send AFTER receiving).
     void dispatch(std::shared_ptr<InboundSession>& session, std::unique_ptr<message_version> msg)
     {
+        // Self-connect guard (Knots CConnman): a dialer whose version nonce equals
+        // one WE sent is us dialing our own listener. Drop before replying so we
+        // never waste an inbound slot on ourselves (reachable once self-advertise
+        // gossips our own routable addr back into the dial planner).
+        if (m_self_nonce && m_self_nonce->is_self(msg->m_nonce)) {
+            LOG_INFO << "[" << m_label << "] REJECT inbound " << session->remote_key()
+                     << " — connected to self (version nonce match)";
+            session->drop("connected to self");
+            return;
+        }
+
         session->set_version(msg->m_services, msg->m_version, msg->m_subversion, msg->m_start_height);
 
         LOG_INFO << "[" << m_label << "] inbound version from " << session->remote_key()
                  << " services=0x" << std::hex << msg->m_services << std::dec
                  << " subver=" << msg->m_subversion
                  << " start_height=" << msg->m_start_height;
+
+        // Knots SeenLocal(): the dialer's version.addr_to is the address it dialed
+        // us AT — i.e. OUR reachable IP as the network sees it. Strongest local-
+        // address signal there is (no NAT ambiguity). Port discarded (best_local()
+        // substitutes our listen port).
+        if (m_local_addr)
+            m_local_addr->seen_local(msg->m_addr_to.m_endpoint.address());
 
         // BIP-110 fork-peer gate — same rule as the outbound version handler: a
         // canonical SHA256d node (no NODE_BLAKE2B) does not follow the BLAKE2b
@@ -375,6 +427,21 @@ private:
             return;
         }
 
+        // addr_from = our reachable IP:listen-port when known (Knots
+        // GetLocalAddress); else unspecified (Knots sends empty CService and
+        // receivers ignore addr_from — the load-bearing advertise is the self-addr
+        // push at handshake-complete below). Previously a hardcoded 0.0.0.0:8333.
+        NetService from_ep{"0.0.0.0", 0};
+        if (m_local_addr) {
+            if (auto best = m_local_addr->best_local())
+                from_ep = *best;
+        }
+
+        // Self-connect guard: record the nonce we send so our OWN dialer detects
+        // the loopback at its version handler.
+        uint64_t nonce = core::random::random_nonce();
+        if (m_self_nonce) m_self_nonce->record(nonce);
+
         // Reply OUR branded version (accepting side sends AFTER the peer's).
         NetService peer_addr{session->remote_key()};
         auto version_reply = message_version::make_raw(
@@ -382,8 +449,8 @@ private:
             OUR_SERVICES,
             core::timestamp(),
             addr_t{OUR_SERVICES, peer_addr},                       // addr_to = the dialer
-            addr_t{OUR_SERVICES, NetService{"0.0.0.0", 8333}},     // addr_from (our listen)
-            core::random::random_nonce(),
+            addr_t{OUR_SERVICES, from_ep},                         // addr_from (our reachable addr)
+            nonce,
             BIP110_COIN_SUBVER,                                    // /c2pool:0.1/bip110/frstrtr/
             advertise_height()
         );
@@ -404,6 +471,12 @@ private:
         session->stop_handshake_timer();
         LOG_INFO << "[" << m_label << "] inbound handshake complete " << session->remote_key()
                  << " subver=" << session->peer_subver();
+
+        // Knots MaybeSendAddr self-announce: push our reachable IP:listen-port +
+        // NODE_BLAKE2B so this dialer banks + gossips us onward. This is the
+        // reachability keystone on the accept path (a crawler/fork node that
+        // dialed us now RELAYS us into the fork addrman).
+        maybe_send_self_addr(session);
     }
 
     void dispatch(std::shared_ptr<InboundSession>& session, std::unique_ptr<message_ping> msg)
@@ -419,14 +492,43 @@ private:
 
     void dispatch(std::shared_ptr<InboundSession>& session, std::unique_ptr<message_getaddr> /*msg*/)
     {
+        // Knots m_getaddr_recvd: answer getaddr AT MOST ONCE per connection; a
+        // repeat is a fingerprinting probe and is ignored.
+        if (session->getaddr_served()) {
+            LOG_DEBUG_OTHER << "[" << m_label << "] ignoring repeat getaddr from "
+                            << session->remote_key();
+            return;
+        }
+        session->mark_getaddr_served();
+
         std::vector<btc_addr_record_t> records;
+        const auto now = static_cast<uint32_t>(core::timestamp());
+
+        // Our OWN reachable address FIRST (Knots includes the local addr in the
+        // getaddr reply). Full service set — we truthfully offer all three bits.
+        if (m_local_addr) {
+            if (auto best = m_local_addr->best_local()) {
+                btc_addr_record_t self;
+                self.m_services  = OUR_SERVICES;   // NODE_NETWORK|NODE_WITNESS|NODE_BLAKE2B
+                self.m_endpoint  = *best;
+                self.m_timestamp = now;
+                records.push_back(self);
+            }
+        }
+
+        // Then the fork-filtered tried set from the supplier (Knots GetAddresses
+        // 23%/1000; the supplier is drawn from addrman.get_addr, MAX_ADDR_REPLY
+        // caps the reply). Services carry the full fork set (NODE_WITNESS was
+        // previously dropped) — the addrman lacks a per-entry services field
+        // (deferred G7 residual), so a uniform truthful fork-peer set is the
+        // honest approximation (every banked non-seed entry passed the
+        // NODE_BLAKE2B ingest gate).
         if (m_addr_supplier) {
-            const auto now = static_cast<uint32_t>(core::timestamp());
             for (const auto& ns : m_addr_supplier()) {
                 if (records.size() >= MAX_ADDR_REPLY)
                     break;
                 btc_addr_record_t rec;
-                rec.m_services  = COIN_NODE_BLAKE2B | NODE_NETWORK;  // advertise fork peers
+                rec.m_services  = OUR_SERVICES;
                 rec.m_endpoint  = ns;
                 rec.m_timestamp = now;
                 records.push_back(rec);
@@ -438,6 +540,57 @@ private:
                         << ") to " << session->remote_key();
     }
 
+    // Inbound `addr` gossip (Knots addr handler, fork-adjusted). Previously
+    // DROPPED on the floor (generic fallback), so a dialer could never grow our
+    // address DB. Fork-filter the records, bank the survivors into the addrman
+    // (m_addr_callback), and RelayAddress a fresh subset to <=2 other inbound
+    // sessions (2-hop gossip). Reuses the SSOT filter_fork_addr_records.
+    void dispatch(std::shared_ptr<InboundSession>& session, std::unique_ptr<message_addr> msg)
+    {
+        if (msg->m_addrs.empty())
+            return;
+        const int64_t now = static_cast<int64_t>(core::timestamp());
+        auto ok = filter_fork_addr_records(msg->m_addrs, now);
+        if (!ok.empty() && m_addr_callback) {
+            NetService source{session->remote_key()};
+            m_addr_callback(ok, source);
+        }
+        // 2-hop relay: forward a fresh, small batch of NODE_BLAKE2B survivors to
+        // other handshaked inbound sessions (Knots RelayAddress: nTime <= 10 min,
+        // batch <= 10).
+        std::vector<btc_addr_record_t> fresh;
+        for (const auto& rec : msg->m_addrs) {
+            if (!(rec.m_services & COIN_NODE_BLAKE2B)) continue;
+            const int64_t ts = static_cast<int64_t>(rec.m_timestamp);
+            if (ts > now + 10 * 60 || ts < now - 10 * 60) continue;
+            fresh.push_back(rec);
+            if (fresh.size() >= 10) break;
+        }
+        if (!fresh.empty())
+            relay_addr(fresh, session->remote_key(), /*fanout=*/2);
+        LOG_DEBUG_OTHER << "[" << m_label << "] inbound addr from " << session->remote_key()
+                        << ": " << msg->m_addrs.size() << " recv, " << ok.size()
+                        << " NODE_BLAKE2B banked, " << fresh.size() << " relayed";
+    }
+
+    // Knots MaybeSendAddr: push a 1-record `addr` with OUR reachable address to a
+    // freshly-handshaked inbound dialer so it banks + gossips us onward. No-op
+    // until we know a routable local addr (best_local()).
+    void maybe_send_self_addr(std::shared_ptr<InboundSession>& session)
+    {
+        if (!m_local_addr) return;
+        auto best = m_local_addr->best_local();
+        if (!best) return;
+        btc_addr_record_t rec;
+        rec.m_services  = OUR_SERVICES;
+        rec.m_endpoint  = *best;
+        rec.m_timestamp = static_cast<uint32_t>(core::timestamp());
+        auto msg = message_addr::make_raw(std::vector<btc_addr_record_t>{rec});
+        session->write(msg);
+        LOG_DEBUG_OTHER << "[" << m_label << "] self-addr announced " << best->to_string()
+                        << " to " << session->remote_key();
+    }
+
     io::io_context* m_context;
     config_t*       m_config;
     std::string     m_label;
@@ -445,6 +598,9 @@ private:
 
     AddrSupplier    m_addr_supplier;
     HeightSupplier  m_height_supplier;
+    AddrCallback    m_addr_callback;                    // inbound addr -> addrman
+    std::shared_ptr<LocalAddrTable>    m_local_addr;    // our reachable addr (self-advertise)
+    std::shared_ptr<SelfNonceRegistry> m_self_nonce;    // self-connect guard
 
     std::map<std::string, std::shared_ptr<InboundSession>> m_slots;  // key = remote addr
 };

@@ -52,6 +52,14 @@ class Node : public bip110::interfaces::Node
     PeerLifecycleCallback m_on_peer_disconnected_cb;
     PeerLifecycleCallback m_on_dial_failed_cb;
     bool m_getaddr_discovery{false};
+    // Self-address advertisement seams (Knots net.cpp GetLocalAddress / SeenLocal /
+    // MaybeSendAddr + self-connect nonce). Stored on the Node and re-applied to each
+    // fresh NodeP2P so self-advertise survives a start_p2p() redial.
+    std::shared_ptr<p2p::LocalAddrTable>    m_local_addr;
+    std::shared_ptr<p2p::SelfNonceRegistry> m_self_nonce;
+    using AddrRelaySink =
+        std::function<void(const std::vector<p2p::btc_addr_record_t>&, const NetService& /*source*/)>;
+    AddrRelaySink m_addr_relay_sink;
 
     /// Re-apply the stored discovery seams to a freshly-created NodeP2P.
     void apply_p2p_discovery_seams(NodeP2P<config_t>* p2p)
@@ -62,6 +70,9 @@ class Node : public bip110::interfaces::Node
         if (m_on_peer_disconnected_cb) p2p->set_on_peer_disconnected(m_on_peer_disconnected_cb);
         if (m_on_dial_failed_cb)       p2p->set_on_dial_failed(m_on_dial_failed_cb);
         if (m_getaddr_discovery)       p2p->enable_getaddr_discovery();
+        if (m_local_addr)              p2p->set_local_addr_table(m_local_addr);
+        if (m_self_nonce)              p2p->set_self_nonce_registry(m_self_nonce);
+        if (m_addr_relay_sink)         p2p->set_addr_relay_sink(m_addr_relay_sink);
     }
 
     void init_p2p()
@@ -160,6 +171,24 @@ public:
         if (m_p2p) m_p2p->set_on_dial_failed(m_on_dial_failed_cb);
     }
     /// Enable Knots getaddr-on-connect peer crawl for the coin-P2P arm.
+    /// Self-address advertisement seams (forwarded to the inner NodeP2P and
+    /// re-applied across redials). Shared with the inbound + fan-out arms.
+    void set_local_addr_table(std::shared_ptr<p2p::LocalAddrTable> t)
+    {
+        m_local_addr = std::move(t);
+        if (m_p2p) m_p2p->set_local_addr_table(m_local_addr);
+    }
+    void set_self_nonce_registry(std::shared_ptr<p2p::SelfNonceRegistry> r)
+    {
+        m_self_nonce = std::move(r);
+        if (m_p2p) m_p2p->set_self_nonce_registry(m_self_nonce);
+    }
+    void set_addr_relay_sink(AddrRelaySink cb)
+    {
+        m_addr_relay_sink = std::move(cb);
+        if (m_p2p) m_p2p->set_addr_relay_sink(m_addr_relay_sink);
+    }
+
     void enable_getaddr_discovery()
     {
         m_getaddr_discovery = true;

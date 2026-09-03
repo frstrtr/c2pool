@@ -200,7 +200,8 @@ int run_embedded(bool coin_p2p_discover,
                  double node_owner_fee_pct,
                  bool serve_mempool_txs,
                  bool sharechain_enabled,
-                 const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes)
+                 const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes,
+                 const std::string& coin_externalip = std::string())
 {
     core::log::Logger::init();
 
@@ -1038,6 +1039,25 @@ int run_embedded(bool coin_p2p_discover,
                  << " groups=" << st.unique_groups;
     }
 
+    // ── SELF-ADDRESS ADVERTISEMENT primitives (Knots net.cpp GetLocalAddress /
+    // SeenLocal / self-connect nonce). Shared by the primary NodeP2P, every
+    // fan-out slot, and the InboundListener so a reachable-address vote learned on
+    // ANY arm advertises on ALL. This is the reachability keystone: just listening
+    // on :8333 is not enough — the fork network must LEARN our address, which
+    // happens when we self-announce it and peers gossip it onward. Declared at
+    // run_embedded scope so the shared_ptrs outlive ioc.run(). ──────────────────
+    auto local_addr =
+        std::make_shared<bip110::coin::p2p::LocalAddrTable>(uint16_t{8333});
+    if (!coin_externalip.empty()) {
+        local_addr->set_external(coin_externalip);
+        LOG_INFO << "[EMB-BIP110] self-advertise external IP pinned: "
+                 << coin_externalip << ":8333 (--coin-externalip)";
+    } else {
+        LOG_INFO << "[EMB-BIP110] self-advertise: no --coin-externalip; will learn "
+                    "our reachable IP from fork-peer version echoes (Knots SeenLocal)";
+    }
+    auto self_nonce = std::make_shared<bip110::coin::p2p::SelfNonceRegistry>();
+
     // ── COIN-P2P INBOUND LISTENER (:8333) ─────────────────────────────────────
     // Make the branded coin-p2p node (/c2pool:0.1/bip110/frstrtr/ + NODE_BLAKE2B)
     // REACHABLE: the primary NodeP2P is outbound-only, so only the ~6 fork peers
@@ -1060,16 +1080,30 @@ int run_embedded(bool coin_p2p_discover,
         // async_accept completion pins it by a strong ref (factory.hpp:83-117).
         inbound_listener->set_lifetime(inbound_listener);
         assert(inbound_listener->lifetime_armed() && "inbound listener lifetime failed to arm");
+        // Self-address advertisement on the accept path: version addr_from + the
+        // self-addr push at handshake + the self record in getaddr replies all
+        // read our reachable addr from here; the self-connect nonce guard drops a
+        // loopback dial. Shared with the outbound arms.
+        inbound_listener->set_local_addr_table(local_addr);
+        inbound_listener->set_self_nonce_registry(self_nonce);
         // getaddr replies come from the SAME fork-filtered, routable tried set the
-        // fan-out broadcaster draws from (mutex-guarded, read-only, io-safe).
+        // fan-out broadcaster draws from (mutex-guarded, read-only, io-safe). A
+        // large cap (Knots serves up to 1000) so a crawler learns the whole mesh.
         if (coin_peer_mgr) {
             auto* mgr = coin_peer_mgr.get();
             inbound_listener->set_addr_supplier([mgr]() {
                 std::vector<NetService> out;
-                for (const auto& ep : mgr->get_tried_peers(/*max_count=*/25))
+                for (const auto& ep : mgr->get_tried_peers(/*max_count=*/1000))
                     out.push_back(ep.to_net_service());
                 return out;
             });
+            // Inbound `addr` gossip → the shared addrman (was dropped on the floor):
+            // a dialer's address set now grows our DB just like the outbound crawl.
+            inbound_listener->set_addr_callback(
+                [mgr](const std::vector<NetService>& addrs, const NetService& source) {
+                    for (const auto& a : addrs)
+                        mgr->add_discovered_peer(a, source.address());
+                });
         }
         // Advertise our header-chain tip in the version reply (cosmetic; crawlers
         // only record UA + services).
@@ -1105,8 +1139,27 @@ int run_embedded(bool coin_p2p_discover,
             [mgr](const NetService& s) { mgr->notify_disconnected(s.to_string()); });
         coin_node.set_on_dial_failed(
             [mgr](const NetService& s) { mgr->notify_dial_failed(s.to_string()); });
+        // Self-address advertisement on the primary arm: addr_from = our reachable
+        // IP, SeenLocal from the peer's version echo, self-addr push at verack +
+        // on the ping tick, and the self-connect nonce guard. Shared tables.
+        coin_node.set_local_addr_table(local_addr);
+        coin_node.set_self_nonce_registry(self_nonce);
+        // addr-relay sink (Knots RelayAddress 2-hop gossip): a fresh batch we
+        // banked is forwarded to a couple of inbound sessions so a learned peer's
+        // reachability spreads through us. Weak-capture the listener (may be null
+        // in non-discovery builds; here it is always set alongside coin_peer_mgr).
+        if (inbound_listener) {
+            std::weak_ptr<bip110::coin::p2p::InboundListener<MiniConfig>> weak_il = inbound_listener;
+            coin_node.set_addr_relay_sink(
+                [weak_il](const std::vector<bip110::coin::p2p::btc_addr_record_t>& recs,
+                          const NetService& source) {
+                    if (auto il = weak_il.lock())
+                        il->relay_addr(recs, source.to_string(), /*fanout=*/2);
+                });
+        }
         LOG_INFO << "[EMB-BIP110] Knots peer crawl wired (primary arm): "
-                    "getaddr-on-connect + NODE_BLAKE2B addr ingest + scorer feedback";
+                    "getaddr-on-connect + NODE_BLAKE2B addr ingest + scorer feedback "
+                    "+ self-advertise (addr_from/SeenLocal/self-addr) + addr-relay";
     }
 
     // Round-robin dialer over explicit peers + the discovered set. Redials the
@@ -1180,8 +1233,9 @@ int run_embedded(bool coin_p2p_discover,
         // (not just the primary arm). Only when the scored peer manager exists.
         if (coin_peer_mgr) {
             auto* mgr = coin_peer_mgr.get();
+            std::weak_ptr<bip110::coin::p2p::InboundListener<MiniConfig>> weak_il = inbound_listener;
             coin_broadcaster->set_slot_configurator(
-                [mgr](bip110::coin::p2p::NodeP2P<MiniConfig>& slot) {
+                [mgr, local_addr, self_nonce, weak_il](bip110::coin::p2p::NodeP2P<MiniConfig>& slot) {
                     slot.enable_getaddr_discovery();
                     slot.set_addr_callback(
                         [mgr](const std::vector<NetService>& addrs, const NetService& source) {
@@ -1194,6 +1248,16 @@ int run_embedded(bool coin_p2p_discover,
                         [mgr](const NetService& s) { mgr->notify_disconnected(s.to_string()); });
                     slot.set_on_dial_failed(
                         [mgr](const NetService& s) { mgr->notify_dial_failed(s.to_string()); });
+                    // Same self-advertise seams on every fan-out slot so a peer
+                    // echo / self-addr learned on any link advertises on all.
+                    slot.set_local_addr_table(local_addr);
+                    slot.set_self_nonce_registry(self_nonce);
+                    slot.set_addr_relay_sink(
+                        [weak_il](const std::vector<bip110::coin::p2p::btc_addr_record_t>& recs,
+                                  const NetService& source) {
+                            if (auto il = weak_il.lock())
+                                il->relay_addr(recs, source.to_string(), /*fanout=*/2);
+                        });
                 });
         }
         LOG_INFO << "[EMB-BIP110] M3 PR-C2 found-block fan-out ARMED (max_peers="
@@ -1789,6 +1853,7 @@ int main(int argc, char** argv)
     bool selftest = true;
     bool run = false;
     bool coin_p2p_discover = false;
+    std::string coin_externalip;   // --coin-externalip: self-advertise override
     bool fork_checkpoint = false;
     std::string http_host = "0.0.0.0";
     uint16_t http_port = 0;
@@ -1840,6 +1905,13 @@ int main(int argc, char** argv)
         else if (arg == "--selftest") { selftest = true; run = false; }
         else if (arg == "--run") { run = true; selftest = false; }
         else if (arg == "--coin-p2p-discover") { coin_p2p_discover = true; }
+        else if (arg == "--coin-externalip" && i + 1 < argc) {
+            // Operator-pinned reachable IP for self-address advertisement (Knots
+            // -externalip). Optional: peer-echo scoring auto-discovers it on a
+            // no-NAT host; this override wins when set. Bare IP (no port — the
+            // listen port 8333 is substituted).
+            coin_externalip = argv[++i];
+        }
         else if (arg == "--fork-checkpoint") { fork_checkpoint = true; }
         else if (arg == "--peer" && i + 1 < argc) {
             std::string host = "127.0.0.1"; uint16_t port = 8333;
@@ -1900,7 +1972,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs, sharechain_enabled, sharechain_addnodes);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs, sharechain_enabled, sharechain_addnodes, coin_externalip);
     }
 
     print_banner(argv[0]);
