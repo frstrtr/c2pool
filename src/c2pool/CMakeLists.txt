@@ -549,6 +549,27 @@ target_link_libraries(dash_tx_serve_self_validation_kat
 )
 add_test(NAME dash_tx_serve_self_validation_kat COMMAND dash_tx_serve_self_validation_kat)
 
+# dial_lifetime_guard_kat: CORE dial/accept-teardown UAF guard mechanism
+# (coin-agnostic; the shared mechanism every coin now relies on after the all-coin
+# set_lifetime migration). Drives REAL core::Factory<Client> and
+# Factory<Server,Client> shapes and asserts set_lifetime ARMS the explicit
+# strong-ref guard, that the pre-fix skip is reproducible, and that a redial-freed
+# node stays alive for make_socket's dynamic_cast. Links only core (+ the shared
+# object graph). KAT is necessary NOT sufficient — the real gate is each coin's
+# runtime lifetime_armed() assert on the REAL node + the live soak.
+add_executable(dial_lifetime_guard_kat dial_lifetime_guard_kat.cpp)
+target_link_libraries(dial_lifetime_guard_kat
+    core
+    c2pool_payout c2pool_merged_mining c2pool_hashrate
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME dial_lifetime_guard_kat COMMAND dial_lifetime_guard_kat)
+
 # ---- Control-plane M0: money-gate KAT (Qt-free sibling of test_reward_safe_launch)
 # The settings-file loader + param catalog are self-contained (stdlib only), so
 # this test compiles them directly rather than dragging the full core object lib
