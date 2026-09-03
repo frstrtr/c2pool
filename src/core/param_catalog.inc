@@ -318,6 +318,10 @@ C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-st
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
 
+C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
+  C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)
+  C2P_ALIAS("web.explorer", BIN_DASH, "--no-explorer", FLAG_NO_PREFIX)
+
 C2P_PARAM("web.cors_origin", WebOps, STRING, LIVE, C_LTC, LIT, "", NONE, "CORS origin")
   C2P_ALIAS("web.cors_origin", BIN_LTC, "--cors-origin", VALUE)
 
