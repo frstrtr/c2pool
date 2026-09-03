@@ -42,6 +42,26 @@ target_link_libraries(bip110_pool_identity_kat
 )
 add_test(NAME bip110_pool_identity_kat COMMAND bip110_pool_identity_kat)
 
+# bip110_download_retry_kat: the parent-share download CONTINUATION KAT. Proves
+# the empty / timed-out SHAREREQ reply re-drives the walk (p2pool node.py:108-141
+# `timeout→continue`, `empty→sleep(1); continue` parity) instead of stranding it
+# until the next periodic tick — the root cause of the bip110 cold-attach 30-min
+# gap. Drives the header-only SSOT download_retry.hpp; lean link set (uint256
+# only), like the identity KAT — no NodeImpl/ReplyMatcher/peer standup needed.
+add_executable(bip110_download_retry_kat
+    test/bip110_download_retry_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/uint256.cpp
+)
+target_compile_definitions(bip110_download_retry_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_download_retry_kat
+    btclibs
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_download_retry_kat COMMAND bip110_download_retry_kat)
+
 # bip110_pool_sharechain_compile: the COMPILE + INSTANTIATION gate for the M3
 # PR-A-continuation sharechain lane (share_check.hpp / share_tracker.hpp /
 # share_messages.hpp + the tracker-coupled donation build_expected_payouts). It

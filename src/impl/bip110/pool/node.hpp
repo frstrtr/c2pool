@@ -470,6 +470,18 @@ public:
     /// Recursively fetches parents until the chain is connected or CHAIN_LENGTH reached.
     void download_shares(peer_ptr peer, const uint256& target_hash);
 
+    /// p2pool-parity retry-on-empty (node.py:127-140 `sleep(1); continue`).
+    /// download_shares() only chained the next request on a NON-empty reply, so a
+    /// timed-out / empty round-trip ended the parent-share walk until the next
+    /// periodic tick (minutes on a quiet chain — the bip110 30-min cold-attach
+    /// gap). schedule_download_retry() queues target_hash and arms a single 1s
+    /// IO-thread timer; run_download_retries() drains the deduped pending set and
+    /// re-issues download_shares() for each still-missing hash against a fresh
+    /// random peer. arm_download_retry_timer() is the shared (re)arm helper.
+    void schedule_download_retry(const uint256& target_hash);
+    void run_download_retries();
+    void arm_download_retry_timer();
+
     /// Return the best VERIFIED share head for work/template selection, or
     /// uint256::ZERO when no verified chain exists yet and peers are connected
     /// (so work never builds on a MAX_TARGET head).  NOT for the wire advert —
@@ -723,6 +735,18 @@ protected:
     // + sleep(1) backoff. We use explicit failure counting.
     static constexpr int MAX_EMPTY_RETRIES = 3;
     std::unordered_map<uint256, int, ShareHasher> m_download_fail_count;
+
+    // p2pool-parity retry-on-empty state (download_retry.hpp). A single IO-thread
+    // 1s timer drains a deduped set of hashes that returned an empty/timed-out
+    // reply but are still below MAX_EMPTY_RETRIES, re-issuing download_shares
+    // against a fresh random peer — the c2pool spelling of node.py's
+    // `sleep(1); continue`. All three are touched only on the IO thread (the
+    // download_shares reply callback and the timer handler both run there), so
+    // no additional locking is needed. m_download_retry_armed guards against
+    // arming the single timer more than once while a wait is already pending.
+    std::set<uint256> m_download_retry_pending;
+    std::unique_ptr<boost::asio::steady_timer> m_download_retry_timer;
+    bool m_download_retry_armed = false;
 
     // Track req_id → peer addr for selective cancellation on disconnect.
     // p2pool has per-peer get_shares (GenericDeferrer), so connectionLost calls

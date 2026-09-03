@@ -2394,6 +2394,64 @@ int run_embedded(bool coin_p2p_discover,
         (void)mp_ka;
     }
 
+    // ── M3: periodic think/clean tick (5s) + heartbeat (30s) ─────────────────
+    // Port of main_ltc.cpp:6685-6723. The bip110 main NEVER scheduled these, so
+    // clean_tracker() (stale-head eating, drop-tails pruning, re-score AND — since
+    // the desired-republish fix — the parent-share download RE-ARM) simply never
+    // ran. On the busy LTC/DASH chains run_think() fires on every share batch and
+    // masks the absence; on the quiet bip110 federation nothing re-drove the
+    // downloader between share events, so a cold-attach that hit one empty/timed-out
+    // round-trip stalled for ~30 min until the next genuinely-new share (the
+    // node2 `parents=145` → `parents=3` gap). With the tick wired, the download
+    // walk is re-armed every 5s worst case (retry-on-empty covers the ~1s case),
+    // and the tracker is finally pruned instead of growing unbounded.
+    // Guarded on sharechain_node: flag-OFF (M2, no sharechain) stays a no-op.
+    std::shared_ptr<io::steady_timer> think_timer;
+    std::shared_ptr<io::steady_timer> hb_timer;
+    if (sharechain_node) {
+        auto* scn = sharechain_node.get();
+
+        think_timer = std::make_shared<io::steady_timer>(ioc);
+        auto think_loop = std::make_shared<std::function<void()>>();
+        std::weak_ptr<std::function<void()>> weak_think = think_loop;
+        *think_loop = [think_timer, weak_think, scn]() {
+            think_timer->expires_after(std::chrono::seconds(5));
+            think_timer->async_wait([think_timer, weak_think, scn]
+                                    (const boost::system::error_code& ec) {
+                if (ec) return;
+                try {
+                    scn->clean_tracker();
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "[EMB-BIP110][CLEAN-TRACKER] error: " << e.what();
+                } catch (...) {
+                    LOG_ERROR << "[EMB-BIP110][CLEAN-TRACKER] unknown error";
+                }
+                if (auto self = weak_think.lock()) (*self)();
+            });
+        };
+        (*think_loop)();
+        static std::shared_ptr<std::function<void()>> think_keepalive;
+        think_keepalive = think_loop;
+
+        hb_timer = std::make_shared<io::steady_timer>(ioc);
+        auto hb_loop = std::make_shared<std::function<void()>>();
+        std::weak_ptr<std::function<void()>> weak_hb = hb_loop;
+        *hb_loop = [hb_timer, weak_hb, scn]() {
+            hb_timer->expires_after(std::chrono::seconds(30));
+            hb_timer->async_wait([hb_timer, weak_hb, scn]
+                                 (const boost::system::error_code& ec) {
+                if (ec) return;
+                try { scn->heartbeat_log(); } catch (...) {}
+                if (auto self = weak_hb.lock()) (*self)();
+            });
+        };
+        (*hb_loop)();
+        static std::shared_ptr<std::function<void()>> hb_keepalive;
+        hb_keepalive = hb_loop;
+
+        LOG_INFO << "[EMB-BIP110] sharechain think/clean tick (5s) + heartbeat (30s) armed";
+    }
+
     io::signal_set signals(ioc, SIGINT, SIGTERM);
     // FINDING C — graceful-shutdown flush. NodeImpl::shutdown() flushes the
     // pending verified/removal buffers to LevelDB (and cancels the periodic flush

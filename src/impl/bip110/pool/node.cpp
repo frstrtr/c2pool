@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
+#include "download_retry.hpp"          // p2pool-parity retry-on-empty continuation SSOT
 #include "known_txs_retention.hpp"      // F3 retain_template_txs + select_backable_shares
 #include "share_tx_refs.hpp"          // bip110::pool::new_tx_hashes -- uniform gate probe (#880)
 #include "../coin/template_other_txs.hpp"  // deserialize_template_other_txs (GBT data[] -> MutableTransaction)
@@ -1361,12 +1362,10 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
              << " from " << peer->addr().to_string()
              << " (parents=" << parents << " stops=" << stops.size() << ")";
 
-    // weak_ptr prevents use-after-free if peer disconnects before reply
-    std::weak_ptr<::pool::Peer<bip110::pool::Peer>> weak_peer = peer;
     auto peer_addr_for_log = peer->addr();
 
     request_shares(req_id, peer, hashes, parents, stops,
-        [this, weak_peer, target_hash, peer_addr_for_log, req_id](bip110::pool::ShareReplyData reply)
+        [this, target_hash, peer_addr_for_log, req_id](bip110::pool::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
             m_pending_share_reqs.erase(req_id);
@@ -1381,6 +1380,15 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
                          << target_hash.ToString().substr(0,16)
                          << " from " << peer_addr_for_log.to_string()
                          << " (fail " << fail_cnt << "/" << MAX_EMPTY_RETRIES << ")";
+                // p2pool node.py:127-140 — a timeout / empty reply does NOT end the
+                // parent-share walk: the downloader loops (timeout→continue,
+                // empty→sleep(1); continue) and re-requests the SAME still-missing
+                // desired hash from a fresh random peer. Without this, one dead
+                // round-trip strands the download until the next 5s clean_tracker
+                // tick — minutes on a quiet chain (the bip110 30-min cold-attach
+                // gap). schedule_download_retry() re-arms the walk in ~1s.
+                if (bip110::pool::should_retry_after_empty(fail_cnt, MAX_EMPTY_RETRIES))
+                    schedule_download_retry(target_hash);
                 return;
             }
 
@@ -1400,18 +1408,82 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
             }
             processing_shares(data, peer_addr_for_log);
 
-            // Find the oldest share's parent — if unknown, keep fetching
+            // Find the oldest share's parent — if unknown, keep fetching.
+            // p2pool picks a FRESH random peer for each iteration
+            // (random.choice(self.peers)), so continue the walk unconditionally:
+            // download_shares() ignores the passed peer and chooses its own.
+            // Gating this on weak_peer.lock() (the peer that just replied) stalled
+            // the whole walk whenever that peer disconnected between reply and
+            // continuation — a needless single-peer coupling absent from p2pool.
             uint256 oldest_parent;
             reply.m_items.back().invoke([&](auto* obj) { oldest_parent = obj->m_prev_hash; });
 
             if (!oldest_parent.IsNull() && !m_chain->contains(oldest_parent))
-            {
-                auto locked = weak_peer.lock();
-                if (locked)
-                    download_shares(locked, oldest_parent);
-            }
+                download_shares(nullptr, oldest_parent);
         }
     );
+}
+
+// ── p2pool-parity retry-on-empty continuation (download_retry.hpp) ──────────
+// download_shares() chains the NEXT request only on a NON-empty reply. A
+// timed-out / empty round-trip therefore ended the parent-share walk until the
+// next periodic clean_tracker tick — minutes on a quiet chain (the bip110
+// cold-attach 30-min gap). These three helpers re-arm the walk in ~1s, the
+// c2pool spelling of p2pool node.py:127-140 (`timeout→continue`,
+// `empty→sleep(1); continue`). All run on the IO thread (download_shares reply
+// callback + the timer handler), so the pending set / fail map need no locking.
+void NodeImpl::arm_download_retry_timer()
+{
+    if (m_download_retry_armed)
+        return;   // a wait is already pending — it will drain the whole set
+    if (!m_download_retry_timer)
+        m_download_retry_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+    m_download_retry_armed = true;
+    m_download_retry_timer->expires_after(std::chrono::seconds(1));
+    m_download_retry_timer->async_wait([this](const boost::system::error_code& ec) {
+        m_download_retry_armed = false;
+        if (ec)
+            return;   // cancelled (shutdown)
+        run_download_retries();
+    });
+}
+
+void NodeImpl::schedule_download_retry(const uint256& target_hash)
+{
+    // Already arrived via another peer/path → nothing to retry.
+    if (m_chain->contains(target_hash))
+        return;
+    m_download_retry_pending.insert(target_hash);
+    arm_download_retry_timer();
+}
+
+void NodeImpl::run_download_retries()
+{
+    std::vector<uint256> pending(m_download_retry_pending.begin(),
+                                 m_download_retry_pending.end());
+    auto plan = bip110::pool::plan_download_retries(
+        pending,
+        /*have_peers=*/!m_peers.empty(),
+        /*in_chain=*/[this](const uint256& h) { return m_chain->contains(h); },
+        /*fail_count=*/[this](const uint256& h) {
+            auto it = m_download_fail_count.find(h);
+            return it == m_download_fail_count.end() ? 0 : it->second;
+        },
+        MAX_EMPTY_RETRIES);
+
+    if (plan.rearm_no_peers) {
+        // p2pool: `if not self.peers: sleep(1); continue`. Keep the pending set
+        // and re-arm so the walk resumes the instant a peer connects, without
+        // needing a share event or the 5s tick.
+        arm_download_retry_timer();
+        return;
+    }
+
+    // Drain: every survivor is (re)issued; hashes that arrived meanwhile or hit
+    // the permanent-failure ceiling are dropped from the pending set here.
+    m_download_retry_pending.clear();
+    for (const auto& h : plan.to_request)
+        download_shares(nullptr, h);   // picks a fresh random peer
 }
 
 void NodeImpl::load_persisted_shares()
@@ -2411,6 +2483,15 @@ void NodeImpl::clean_tracker()
 
       bool clean_best_changed = false;
       bool bootstrap = false;
+      // p2pool's clean_tracker() ends in set_best_share() which republishes
+      // desired_var and re-arms the downloader (node.py:418→339). c2pool's
+      // clean_tracker discarded think()'s desired set, so the 5s tick pruned
+      // and re-scored but never re-drove the parent-share download — leaving
+      // run_think() (share-event-driven only) as the sole re-arm. On a quiet
+      // chain that is exactly the missing continuation. Carry desired out of the
+      // exclusive phase and dispatch it on the IO thread below, mirroring
+      // run_think()'s IO-phase desired dispatch (state resets included).
+      std::vector<std::pair<NetService, uint256>> clean_desired;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
 
@@ -2608,6 +2689,9 @@ void NodeImpl::clean_tracker()
             clean_best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
         }
+        // Carry the re-scored desired set out to the IO phase so the tick
+        // re-arms the parent-share download (p2pool clean_tracker→set_best_share).
+        clean_desired = std::move(result.desired);
         publish_snapshot();
         flush_verified_to_leveldb();
         // Work refresh deferred to IO thread (after lock release)
@@ -2673,11 +2757,27 @@ void NodeImpl::clean_tracker()
       // Lock released — post work refresh + drain to IO thread.
       // Work refresh (1-5s) runs WITHOUT any lock so shared_lock readers
       // (handle_get_share, send_shares) are never blocked.
-      boost::asio::post(*m_context, [this, clean_best_changed]() {
+      boost::asio::post(*m_context, [this, clean_best_changed,
+                                     clean_desired = std::move(clean_desired)]() {
         if (clean_best_changed && m_on_best_share_changed) {
             LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
             m_on_best_share_changed();
             readvertise_best_share();   // root-2: re-announce new head to peers
+        }
+        // p2pool clean_tracker() ends in set_best_share() → desired_var.set() →
+        // the downloader loop wakes and re-requests every still-missing parent
+        // (node.py:418→339→108-141). Mirror run_think()'s IO-phase re-arm here so
+        // the 5s tick is a true downloader re-drive even when NO new share
+        // arrived (the quiet-chain case run_think() never covers). Clear the
+        // in-flight + fail state first, exactly as run_think() does, so a hash
+        // that stalled last cycle is retried against a fresh random peer.
+        m_downloading_shares.clear();
+        m_download_fail_count.clear();
+        if (!clean_desired.empty() && !m_peers.empty()) {
+            for (auto& [peer_addr, hash] : clean_desired) {
+                (void)peer_addr;                 // download_shares picks its own peer
+                download_shares(nullptr, hash);
+            }
         }
         drain_pending_adds();
         m_think_running.store(false);
