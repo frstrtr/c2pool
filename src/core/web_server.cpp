@@ -4993,7 +4993,8 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     // Mode indicators for conditional UI. Coin targets whose daemon RPC is an
     // external NodeRPC arm (c2pool-dash dashd) rather than an ICoinNode set the
     // m_coin_rpc_available flag so has_rpc is truthful.
-    result["embedded"] = (m_coin_node && m_coin_node->is_embedded());
+    result["embedded"] = m_embedded_display_override.value_or(
+                             m_coin_node && m_coin_node->is_embedded());
     result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
                          || m_coin_rpc_available.load(std::memory_order_relaxed);
 
@@ -5596,7 +5597,8 @@ nlohmann::json MiningInterface::rest_node_topology()
         if (is_primary) {
             // Real embedded/RPC flags for this node's own daemon. Coin targets
             // with an external NodeRPC arm (c2pool-dash) set m_coin_rpc_available.
-            entry["embedded"] = (m_coin_node && m_coin_node->is_embedded());
+            entry["embedded"] = m_embedded_display_override.value_or(
+                                    m_coin_node && m_coin_node->is_embedded());
             entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
                                 || m_coin_rpc_available.load(std::memory_order_relaxed);
             // Truthful tip from the embedded daemon's cached template (front-end

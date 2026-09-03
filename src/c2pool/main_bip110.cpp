@@ -1280,6 +1280,19 @@ int run_embedded(bool coin_p2p_discover,
         // rest_web_currency_info "BIP110" branch brand it; the BITCOIN enum alone
         // would render as Bitcoin).
         mi->set_coin_label("BIP110");
+        // F2 — currency_info share_version. The MI default is 35 (the V35/V36
+        // ratchet cross default for the LTC family); bip110 never runs the
+        // AutoRatchet and its mint is hardwired v36 (see the v36 header/share
+        // construction below), so the honest static answer is 36. Without this
+        // the explorer misclassifies live v36 share cells as v35.
+        mi->set_cached_share_version(36);
+        // F3 — currency_info + node_topology "embedded" flag. This lane is fully
+        // daemonless (no external node RPC) but runs on a NULL IMiningNode with
+        // no m_coin_node (bip110::coin::Node is NOT a core::coin::ICoinNode), so
+        // the default (m_coin_node && is_embedded()) reads false and contradicts
+        // /api/node_topology embedded:true. Display-only override; does NOT arm
+        // any coin-node submit/refresh path (m_coin_node stays null).
+        mi->set_embedded_display(true);
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
 #endif
@@ -1503,15 +1516,31 @@ int run_embedded(bool coin_p2p_discover,
             mi->set_best_share_hash_fn([scn]() -> uint256 {
                 return scn->get_tracker_snapshot().best_share;
             });
+            // FINDING F1 — reported pool hashrate (dashboard CURRENT/AVERAGE/PEAK,
+            // the "Good" graph series, /global_stats.pool_hash_rate, and the CI
+            // footer's "reported" value all read m_pool_hashrate_fn via
+            // update_stat_log → pool_rates.good). The producer already exists:
+            // publish_snapshot() computes TrackerSnapshot.pool_hashrate with the
+            // p2pool-exact get_pool_attempts_per_second over TARGET_LOOKBEHIND —
+            // a WINDOWED attempts/sec, i.e. already smoothed, so the Good series
+            // is a stable line and not per-interval spikes-to-0. It was simply
+            // never handed to the web MI, so every sample read the default 0.0 →
+            // summary 0 H/s while the node was really minting. Exact BTC/BCH shape
+            // (main_btc.cpp:2653, bch/pool_entrypoint.hpp:726). Lock-free snapshot;
+            // no tracker lock, no off-lock chain walk. Display/accounting only.
+            mi->set_pool_hashrate_fn([scn]() -> double {
+                return scn->get_tracker_snapshot().pool_hashrate;
+            });
             LOG_INFO << "[EMB-BIP110] dashboard sharechain feeds wired "
-                        "(set_sharechain_stats_fn + set_best_share_hash_fn; lock-free "
-                        "snapshot) — chain_size/has_shares now reflect the mint";
+                        "(set_sharechain_stats_fn + set_best_share_hash_fn + "
+                        "set_pool_hashrate_fn; lock-free snapshot) — chain_size/"
+                        "has_shares/pool_hashrate now reflect the mint";
         }
 
         // Still deliberately NOT installed even on flag-ON (no PPLNS/window/peer
         // producer wired for bip110 yet): set_pplns_fn, set_sharechain_window_fn,
-        // set_peer_info_fn, set_pool_hashrate_fn. Absent feeds render honestly
-        // empty — NEVER faked.
+        // set_peer_info_fn. Absent feeds render honestly empty — NEVER faked.
+        // (set_pool_hashrate_fn IS now wired above — F1.)
 
         // graph_db-persisted stats history (LTC/BTC parity): namespaced sub-dir.
         {

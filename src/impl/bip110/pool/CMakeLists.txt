@@ -187,6 +187,45 @@ target_link_libraries(bip110_extend_mint_kat
 )
 add_test(NAME bip110_extend_mint_kat COMMAND bip110_extend_mint_kat)
 
+# bip110_pool_hashrate_kat: F1 REPORTED-POOL-HASHRATE known-answer test. The dashboard
+# "Pool Hashrate" summary (CURRENT/AVERAGE/PEAK), the "Good" graph series and the
+# effective-CI footer's "reported" value all read TrackerSnapshot.pool_hashrate, which
+# publish_snapshot() (node.hpp) fills from ShareTracker::get_pool_attempts_per_second
+# folded to a double. The live defect was the wiring (set_pool_hashrate_fn never
+# installed on the bip110 web MI -> every sample read 0.0 -> "0 H/s" while minting);
+# main_bip110 now installs it against this exact snapshot field. THIS KAT proves the
+# underlying computation is sound: mints a REAL share stream (genesis + extends, easy
+# override target) and asserts the reported hashrate is 0 with no window, NON-ZERO over
+# a multi-share window, EQUALS an independent sum(target_to_average_attempts(bits))/dt
+# hand computation (no get_delta), folds to a finite H/s double via the exact
+# publish_snapshot code, and survives a large trailing gap (smoothed, not spiky-zero).
+# Same heavy link closure as the extend_mint_kat (create_local_share + assemble_gentx_
+# coinbase + target_utils + the verify surface + BLAKE2b). blake2b.c compiled directly.
+add_executable(bip110_pool_hashrate_kat
+    test/bip110_pool_hashrate_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_pool_hashrate_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_pool_hashrate_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_pool_hashrate_kat COMMAND bip110_pool_hashrate_kat)
+
 # bip110_multiminer_pplns_kat: the F1b PPLNS-DISTRIBUTED-COINBASE KAT (M3 PR-C).
 # Where the extend_mint_kat proved the ref/hash_link half of peer acceptance with a
 # SINGLE-MINER coinbase (and its create_local_share log SHOWS the remaining gap:

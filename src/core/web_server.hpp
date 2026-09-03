@@ -755,6 +755,14 @@ public:
     // arm, not an ICoinNode). OR'd into the /api/node_topology has_rpc flag.
     void set_coin_rpc_available(bool v) { m_coin_rpc_available.store(v, std::memory_order_relaxed); }
 
+    // Display-only override for the /api/node_topology + currency_info "embedded"
+    // flag. The default source is (m_coin_node && m_coin_node->is_embedded()),
+    // but lanes that run daemonless on a NULL IMiningNode dashboard (e.g. BIP-110,
+    // whose bip110::coin::Node is NOT a core::coin::ICoinNode) have no m_coin_node
+    // yet ARE embedded. Mirrors the m_coin_rpc_available precedent: additive,
+    // consulted only when set, byte-identical on every lane that never calls it.
+    void set_embedded_display(bool v) { m_embedded_display_override = v; }
+
     // Current PPLNS outputs for payout display
     // Coin targets (c2pool-dash) that compute PPLNS outside the
     // refresh_work() path can push the current distribution here so
@@ -1957,6 +1965,7 @@ private:
     std::function<std::map<std::string, WorkerInfo>()> m_stratum_workers_fn;  // external provider (coin targets)
     std::function<CoinWorkInfo()> m_coin_work_fn;                             // live template summary (coin targets)
     std::atomic<bool> m_coin_rpc_available{false};                           // external daemon RPC present
+    std::optional<bool> m_embedded_display_override;                          // display-only embedded flag (NULL-node lanes)
     std::chrono::steady_clock::time_point m_stratum_start_time{std::chrono::steady_clock::now()};
 };
 

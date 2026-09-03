@@ -1177,3 +1177,56 @@ TEST(DashboardData, BackfillPersistsRepairedRows)
     ASSERT_TRUE(blk["luck"].is_number());
     EXPECT_DOUBLE_EQ(blk["luck"].get<double>(), 50.0);
 }
+
+// ── BIP-110 dashboard F1/F2/F3 (integrator 2026-09-03) ───────────────────────
+// The bip110 lane runs the shared core dashboard on a NULL IMiningNode. Three
+// display-only defects were reported live on bip110.voidbind: the reported pool
+// hashrate summary read 0 H/s while minting (set_pool_hashrate_fn was never
+// installed — the summary reads m_pool_hashrate_fn), currency_info.share_version
+// read the default 35 (mint is v36), and currency_info.embedded read false
+// (no m_coin_node, yet the lane is daemonless-embedded). These pin the web-side
+// contract main_bip110's F1/F2/F3 wiring depends on.
+
+TEST(Bip110Dashboard, ReportedPoolHashrateReadsTheWiredFn)
+{
+    // BITCOIN == the blockchain bip110 constructs its WebServer with.
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::BITCOIN);
+
+    // DEFECT reproduction: with no producer wired, the summary is 0 (exactly what
+    // the dashboard showed — "reported 0 H/s" — while the node was really mining).
+    EXPECT_DOUBLE_EQ(mi.rest_global_stats().value("pool_hash_rate", -1.0), 0.0);
+
+    // FIX: wire the snapshot-backed producer (the F1 shape in main_bip110). With
+    // no stale shares the stale-proportion is 0, so pool_hash_rate == the fn value.
+    const double HR = 3.78e9;  // in the effective-CI ballpark (GH/s), like live
+    mi.set_pool_hashrate_fn([HR]() { return HR; });
+    EXPECT_DOUBLE_EQ(mi.rest_global_stats().value("pool_hash_rate", -1.0), HR);
+}
+
+TEST(Bip110Dashboard, CurrencyInfoShareVersionIs36)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::BITCOIN);
+
+    // Default (unset) is the V35/V36-ratchet default 35 — the reported defect.
+    EXPECT_EQ(mi.rest_web_currency_info().value("share_version", -1), 35);
+
+    // F2: bip110 pins v36 (its mint is hardwired v36, no AutoRatchet).
+    mi.set_cached_share_version(36);
+    EXPECT_EQ(mi.rest_web_currency_info().value("share_version", -1), 36);
+}
+
+TEST(Bip110Dashboard, CurrencyInfoEmbeddedTrueViaDisplayOverride)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::BITCOIN);
+
+    // Default: no m_coin_node -> embedded false (the reported contradiction with
+    // /api/node_topology embedded:true).
+    EXPECT_FALSE(mi.rest_web_currency_info().value("embedded", true));
+
+    // F3: display-only override flips it true without arming any coin-node path.
+    mi.set_embedded_display(true);
+    EXPECT_TRUE(mi.rest_web_currency_info().value("embedded", false));
+}
