@@ -27,6 +27,7 @@
 #include <impl/bip110/coin/chain_seeds.hpp>
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
 #include <impl/bip110/coin/block_json.hpp>         // explorer getblock verbosity=2 JSON
+#include <impl/bip110/coin/block_confirm.hpp>      // found-block confirm/orphan resolver (B2 telemetry)
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
 #include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
 #include <impl/bip110/stratum/work_source.hpp>
@@ -64,6 +65,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <set>
 #include <span>
@@ -451,9 +453,10 @@ int run_embedded(bool coin_p2p_discover,
         // the IO thread with NO tracker lock held (node.cpp ASYNC-THINK IO-phase),
         // and broadcast_share takes its OWN shared try-lock, so this respects the
         // lock-drop-before-fan-out invariant. Set ONLY on the flag-ON path.
-        node_raw->set_on_best_share_changed([node_raw]() {
+        node_raw->set_on_best_share_changed([node_raw, ws = work_source.get()]() {
             if (!node_raw) return;
             node_raw->broadcast_share(node_raw->best_share_hash());
+            ws->bump_work_generation();   // refresh miner jobs: new prev_share_hash (LTC-shape main_ltc.cpp:2943-2947)
         });
 
         // (2) MINT on the stratum submit path. Mirrors main_btc.cpp:2215-2411,
@@ -2356,6 +2359,69 @@ int run_embedded(bool coin_p2p_discover,
             mi->set_stat_log_path(graph_db_path);
             mi->load_stat_log();
             LOG_INFO << "[EMB-BIP110] graph_db stats persistence -> " << graph_db_path;
+        }
+
+        // Found-block confirm/orphan telemetry (BTC-shape, main_btc.cpp:3100-3153).
+        // TELEMETRY ONLY — the dashboard found-blocks card + /web/share/<hash>
+        // (fb.confirmations/fb.status, :2318-2320) go from human-only to
+        // instrumented. Isolated-orphan money-risk becomes visible. No consensus,
+        // reward, share-validity or wire surface is touched.
+        if (mi) {
+            mi->set_block_verify_fn(
+                [mi, &header_chain, &coin_node](const std::string& hash_hex) -> int {
+                    uint256 h; h.SetHex(hash_hex);
+
+                    // found_height: authoritative from our own found-block record
+                    // (survives an orphan whose header peers never relayed to us);
+                    // else recovered from the embedded header chain.
+                    uint32_t found_height = 0;
+                    bool     have_height  = false;
+                    for (const auto& b : mi->get_found_blocks()) {
+                        if (b.hash == hash_hex) {
+                            found_height = static_cast<uint32_t>(b.height);
+                            have_height  = true;
+                            break;
+                        }
+                    }
+                    if (!have_height) {
+                        if (auto e = header_chain.get_header(h)) {
+                            found_height = e->height;
+                            have_height  = true;
+                        }
+                    }
+
+                    if (have_height) {
+                        auto winner_at = [&header_chain](uint32_t hh)
+                            -> std::optional<uint256> {
+                            if (auto e = header_chain.get_header_by_height(hh))
+                                return e->block_hash;
+                            return std::nullopt;
+                        };
+                        int v = bip110::coin::block_confirm::resolve_status(
+                            winner_at, header_chain.height(), h, found_height);
+                        // Daemonless-first: trust a definite confirmed/orphaned
+                        // verdict. A 0 (pending) with the header chain ALREADY past
+                        // found_height is a genuine shallow-pending; only fall
+                        // through to RPC when the header chain has not yet reached
+                        // the height.
+                        if (v != 0) return v;
+                        if (header_chain.height() >= found_height) return 0;
+                    }
+
+                    // Fallback arm (header chain absent or behind): external node
+                    // getblockheader confirmations. Returns INT_MIN when no RPC is
+                    // configured, so the daemonless arm falls through to pending.
+                    int c = coin_node.rpc_block_confirmations(h);
+                    if (c != std::numeric_limits<int>::min()) {
+                        if (c < 0) return -1;
+                        if (c >= static_cast<int>(
+                                bip110::coin::block_confirm::kDefaultConfirmDepth))
+                            return c;
+                    }
+                    return 0;  // still pending
+                });
+            LOG_INFO << "[EMB-BIP110] found-block confirm/orphan lane ARMED "
+                     << "(embedded HeaderChain verdict; getblockheader fallback)";
         }
 
         if (web_server->start()) {

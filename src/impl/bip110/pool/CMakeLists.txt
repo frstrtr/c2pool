@@ -35,6 +35,7 @@ add_executable(bip110_pool_identity_kat
 target_compile_definitions(bip110_pool_identity_kat PRIVATE __C2POOL_COIN_BIP110__=1)
 target_link_libraries(bip110_pool_identity_kat
     btclibs
+    yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
     ${SECP256K1_LIBRARIES}

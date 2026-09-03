@@ -203,6 +203,9 @@ C2P_PARAM("coin_p2p.connect", CoinP2P, LIST_HOSTPORT, RESTART, C_DASH|C_BCH, LIT
   C2P_ALIAS("coin_p2p.connect", BIN_DASH, "--coin-p2p-connect", VALUE)
   C2P_ALIAS("coin_p2p.connect", BIN_BCH, "--peer", VALUE)
 
+C2P_PARAM("coin_p2p.externalip", CoinP2P, STRING, RESTART, C_BIP110, LIT, "", NONE, "operator-pinned reachable IP for self-address advertisement")
+  C2P_ALIAS("coin_p2p.externalip", BIN_BIP110, "--coin-externalip", VALUE)
+
 C2P_PARAM("coin_p2p.discover", CoinP2P, BOOL, RESTART, C_DASH|C_BTC|C_DGB, LIT, "false", NONE, "scored/diverse coin-P2P discovery")
   C2P_ALIAS("coin_p2p.discover", BIN_DASH, "--coin-p2p-discover", FLAG)
   C2P_ALIAS("coin_p2p.discover", BIN_BTC, "--coin-p2p-discover", FLAG)
@@ -319,9 +322,11 @@ C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-st
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
 
-C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
+C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
   C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)
   C2P_ALIAS("web.explorer", BIN_DASH, "--no-explorer", FLAG_NO_PREFIX)
+  C2P_ALIAS("web.explorer", BIN_BIP110, "--explorer", FLAG)
+  C2P_ALIAS("web.explorer", BIN_BIP110, "--no-explorer", FLAG_NO_PREFIX)
 
 C2P_PARAM("web.cors_origin", WebOps, STRING, LIVE, C_LTC, LIT, "", NONE, "CORS origin")
   C2P_ALIAS("web.cors_origin", BIN_LTC, "--cors-origin", VALUE)
