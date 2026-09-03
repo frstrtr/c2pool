@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <random>
@@ -209,6 +210,27 @@ protected:
     // Top-5 scored heads from last think() — used by clean_tracker()
     // to protect the best chains from head pruning (p2pool node.py:363).
     std::vector<uint256> m_last_top5_heads;
+
+    // Restart-reorg supersede hint from the last think()/clean cycle
+    // (ShareTracker::compute_supersede_hint). When active it names a genuine
+    // higher-work fork the node is converging onto after a warm restart; used by
+    // clean_tracker() to exempt the converging challenger segment from stale-head
+    // eating and tail-dropping. Inactive on a healthy node.
+    btc::SupersedeHint m_supersede_hint;
+
+    // ── Supersede-convergence liveness (tip-freeze livelock fix) ──────────
+    // When a challenger's missing parent is UNOBTAINABLE its verified height
+    // never advances, compute_supersede_hint re-arms every cycle, and think()
+    // draws the elevated verify budget forever (treadmill holding the exclusive
+    // lock). Detect zero progress over SUPERSEDE_STALL_LIMIT cycles and denylist
+    // the segment (keyed by target_segment_last) for SUPERSEDE_DENYLIST_TTL,
+    // deactivating the hint and re-enabling GC. A later-obtainable parent retries.
+    struct SupersedeProgress { int32_t last_acc_height{-1}; int stall_cycles{0}; };
+    std::map<uint256, SupersedeProgress> m_supersede_progress;
+    std::map<uint256, std::chrono::steady_clock::time_point> m_supersede_denylist;
+    static constexpr int SUPERSEDE_STALL_LIMIT = 20;
+    static constexpr std::chrono::minutes SUPERSEDE_DENYLIST_TTL{60};
+    btc::SupersedeHint gate_supersede_convergence(btc::SupersedeHint hint);
 
     // Buffer of newly verified share hashes, flushed to LevelDB periodically
     std::vector<uint256> m_verified_flush_buf;

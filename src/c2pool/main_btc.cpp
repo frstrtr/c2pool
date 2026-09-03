@@ -3203,6 +3203,30 @@ int main(int argc, char* argv[])
         LOG_INFO << "[BTC-POOL] dashboard disabled (no --http bind given).";
     }
 
+    // Restart-reorg / liveness safety-net: periodic clean_tracker() tick (5s).
+    // clean_tracker() runs think() inline (advancing verification + the restart-
+    // reorg supersede convergence) and prunes stale heads/tails. Without this tick
+    // think() fires ONLY on inbound share arrival, so a node with no live share
+    // flow (all peers silent/hostile, no local miners) never re-attempts a
+    // timed-out bootstrap download and never advances a warm-restart reorg — the
+    // consumer-side single-peer-wedge / stuck-tip liveness gap. Mirrors
+    // main_ltc.cpp:6682. Self-rescheduling on the run-loop ioc; stops when the
+    // timer is cancelled at shutdown (ec set).
+    auto think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+    std::function<void(boost::system::error_code)> think_tick;
+    if (p2p_node) {
+        think_tick = [&, think_timer](boost::system::error_code ec) {
+            if (ec) return;
+            think_timer->expires_after(std::chrono::seconds(5));
+            think_timer->async_wait(think_tick);
+            try { p2p_node->clean_tracker(); }
+            catch (const std::exception& e) { LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what(); }
+            catch (...) { LOG_ERROR << "[CLEAN-TRACKER] unknown error"; }
+        };
+        think_timer->expires_after(std::chrono::seconds(5));
+        think_timer->async_wait(think_tick);
+    }
+
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
 
     // Diagnostic [IOC-LAT]: when a single run_for slice takes far longer
