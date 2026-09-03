@@ -261,6 +261,40 @@ target_link_libraries(bip110_multiminer_pplns_kat
 )
 add_test(NAME bip110_multiminer_pplns_kat COMMAND bip110_multiminer_pplns_kat)
 
+# bip110_current_payouts_kat: the /current_payouts DASHBOARD-SEAM KAT (M3). The live
+# "Current Payouts" card showed 0.0000/empty on contabo despite 196+ shares because
+# rest_current_payouts() (web_server.cpp:2408) had all three of its sources dead on
+# this lane. main_bip110 now wires the #939 direct seam via current_payouts_report,
+# which walks the SAME ShareTracker::get_expected_payouts SSOT the coinbase is minted
+# from. THIS KAT drives that EXACT reporting transform: seeds a real 2-share window,
+# asserts >= 3 rows (2 miners + donation) whose coins sum EXACTLY to the payable
+# coinbase, and {} on an empty/null-best chain. Same heavy link closure as the
+# multiminer KAT. blake2b.c compiled directly.
+add_executable(bip110_current_payouts_kat
+    test/bip110_current_payouts_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_current_payouts_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_current_payouts_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_current_payouts_kat COMMAND bip110_current_payouts_kat)
+
 # bip110_serve_xcheck_kat: the SERVE-PATH pre-serve reward-safety XCHECK KAT (M3).
 # The other bip110 KATs exercise the MINT / consensus math; NONE exercised the live
 # SERVE template + the [BIP110-WS] pre-serve reward-safety XCHECK that build_

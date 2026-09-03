@@ -34,6 +34,7 @@
 #include <impl/bip110/pool/node.hpp>               // bip110::pool::Node / Config
 #include <impl/bip110/pool/config_pool.hpp>        // PoolConfig SSOT (P2P_PORT 9337, STALE_SHARES)
 #include <impl/bip110/pool/share_check.hpp>        // bip110::pool::create_local_share (MINT)
+#include <impl/bip110/pool/current_payouts_report.hpp> // /current_payouts dashboard PPLNS split (read-only)
 
 #include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
 #include <core/coin/utxo_view_cache.hpp>
@@ -1614,12 +1615,68 @@ int run_embedded(bool coin_p2p_discover,
                         "(set_sharechain_stats_fn + set_best_share_hash_fn + "
                         "set_pool_hashrate_fn; lock-free snapshot) — chain_size/"
                         "has_shares/pool_hashrate now reflect the mint";
+
+            // FINDING P1 — the "Current Payouts" dashboard card. rest_current_
+            // payouts() (web_server.cpp:2408) returned {} on bip110 because NONE of
+            // its three sources is live on this lane: the #939 direct seam was wired
+            // ONLY by DASH (main_dash.cpp:1882), MI stratum is OFF (set_stratum_port
+            // (0) above) so MI's refresh_work() never fills the PPLNS cache, and no
+            // PayoutManager is set. So the handler fell through all three -> {}, and
+            // the card showed "0.0000 BIP110" over an empty ADDRESS/V36?/AMOUNT table
+            // even with 196+ shares in the window. Wire the direct seam with the SAME
+            // PPLNS SSOT that mints the coinbase — ShareTracker::get_expected_payouts,
+            // the exact map the work_source pplns_fn_ (line ~638) already emits — so
+            // the card previews the projected NEXT-BLOCK split (subsidy x each
+            // address's decayed PPLNS weight, donation residual folded in).
+            //
+            // READ-ONLY: this REPORTS the split the node would pay; it never touches
+            // share_check gentx, build_connection_coinbase, the donation consensus,
+            // or any reward path (get_expected_payouts is a const window walk under
+            // the read guard). It also lights /current_merged_payouts (web_server.cpp
+            // compute_current_merged_payouts starts from rest_current_payouts()),
+            // which the front-end loadPayouts prefers — both cards fill.
+            //
+            // Nested-lock hazard: read the LOCK-FREE published snapshot best_share
+            // BEFORE taking read_tracker() — re-acquiring the tracker's shared_mutex
+            // from a thread that already holds it stops being harmless the moment a
+            // writer queues (main_dash.cpp:1853-1858). Snapshot is set by think()
+            // under the exclusive lock; no off-lock chain walk here.
+            mi->set_current_payouts_fn(
+                [scn, &header_chain,
+                 halving = chain_params.subsidy_halving_interval]() -> nlohmann::json {
+                    const uint256 best = scn->get_tracker_snapshot().best_share;  // lock-free
+                    if (best.IsNull()) return nlohmann::json::object();
+                    const uint32_t tip = header_chain.height();
+                    if (tip == 0) return nlohmann::json::object();  // header follower cold
+                    // Same next-block subsidy projection the Miners-Block-Value card
+                    // uses (set_coin_work_fn); bip110 (like BTC) has no treasury/burn,
+                    // so the whole subsidy is the miners' gross block value.
+                    const uint64_t subsidy = bip110::coin::get_block_subsidy(tip + 1, halving);
+                    // v36 ignores block_target (work_source.cpp:345 "pass real"), but
+                    // pass the real tip nBits target for correctness/parity.
+                    uint256 block_target = uint256::ZERO;
+                    if (auto t = header_chain.tip())
+                        block_target = chain::bits_to_target(t->header.m_bits);
+                    auto guard = scn->read_tracker();
+                    if (!guard) return nlohmann::json::object();  // tracker busy -> honest empty
+                    return bip110::pool::current_payouts_report(
+                        *guard, best, block_target, subsidy,
+                        bip110::pool::PoolConfig::get_donation_script(36),
+                        bip110::pool::PoolConfig::is_testnet);
+                });
+            LOG_INFO << "[EMB-BIP110] /current_payouts seam wired "
+                        "(get_expected_payouts projected next-block PPLNS split; "
+                        "read-only preview) — 'Current Payouts' card now shows the "
+                        "live window split instead of 0.0000/empty";
         }
 
-        // Still deliberately NOT installed even on flag-ON (no PPLNS/window/peer
-        // producer wired for bip110 yet): set_pplns_fn, set_sharechain_window_fn,
-        // set_peer_info_fn. Absent feeds render honestly empty — NEVER faked.
-        // (set_pool_hashrate_fn IS now wired above — F1.)
+        // Still deliberately NOT installed even on flag-ON: set_pplns_fn (MI's own
+        // window-PPLNS overlay), set_sharechain_window_fn, set_peer_info_fn. The
+        // V36? column (dashboard.html:2102) is filled client-side from the
+        // sharechain-window feed, so it stays blank until set_sharechain_window_fn
+        // is wired — a separate follow-up seam, NOT required for the payout rows.
+        // Absent feeds render honestly empty — NEVER faked.
+        // (set_pool_hashrate_fn AND set_current_payouts_fn ARE now wired above.)
 
         // graph_db-persisted stats history (LTC/BTC parity): namespaced sub-dir.
         {
