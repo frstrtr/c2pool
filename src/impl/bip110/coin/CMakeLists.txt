@@ -127,3 +127,35 @@ target_link_libraries(bip110_broadcaster_slot_lifetime_kat
     Threads::Threads
 )
 add_test(NAME bip110_broadcaster_slot_lifetime_kat COMMAND bip110_broadcaster_slot_lifetime_kat)
+
+# bip110_coin_subver_brand_kat: the outgoing coin-p2p user-agent BRAND gate.
+# Pins that NodeP2P's outgoing version subver is the single named constant
+# BIP110_COIN_SUBVER (branded BIP14 "/c2pool:0.1/bip110/"), that a serialized
+# message_version embeds it as a length-prefixed var-string at the subver
+# offset (the exact bytes a Knots/Core fork peer + crawler read as our UA), and
+# that the version still advertises NODE_BLAKE2B — proving the identity change
+# is display-only and cannot break the service-bit-gated handshake. Same link
+# closure as the sibling coin KATs.
+add_executable(bip110_coin_subver_brand_kat
+    test/bip110_coin_subver_brand_kat.cpp
+)
+target_compile_definitions(bip110_coin_subver_brand_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_coin_subver_brand_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_coin_subver_brand_kat COMMAND bip110_coin_subver_brand_kat)

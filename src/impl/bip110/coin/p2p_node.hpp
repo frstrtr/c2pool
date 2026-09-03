@@ -38,6 +38,15 @@ std::string parse_net_error(const boost::system::error_code& ec);
 // SeedsServiceFlags 0x10000009).
 inline constexpr uint64_t COIN_NODE_BLAKE2B = (uint64_t{1} << 28);
 
+// Outgoing coin-p2p user agent (BIP14 free-text `/name:ver/` — display/identity
+// ONLY, zero consensus). Fork-peer acceptance is gated on the NODE_BLAKE2B
+// service bit (p2p_node.hpp version gate below), NEVER on this string, so the
+// brand is safe to change: Knots/Core fork peers still accept the handshake.
+// BOLD form (default) advertises c2pool to crawlers/bitnodes and any dialer.
+// SAFE Knots-uacomment alternative (1-line flip, INTEGRATOR pick):
+//   inline constexpr const char* BIP110_COIN_SUBVER = "/Satoshi:29.4.1/Knots:20260508(c2pool-bip110)/";
+inline constexpr const char* BIP110_COIN_SUBVER = "/c2pool:0.1/bip110/";
+
 // Fork-filtered addr ingest — the load-bearing half of the Knots addr handler
 // (net_processing.cpp addr handling), BLAKE2b-adjusted. PURE + socket-free so
 // KATs drive it directly. From gossiped `addr` records it keeps ONLY peers
@@ -237,7 +246,7 @@ public:
             addr_t{our_services, m_peer->get_addr()},
             addr_t{our_services, NetService{"192.168.0.1", 8333}},
             core::random::random_nonce(),
-            "c2pool-bip110",
+            BIP110_COIN_SUBVER,
             0
         );
 
