@@ -28,6 +28,7 @@
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
 #include <impl/bip110/coin/block_json.hpp>         // explorer getblock verbosity=2 JSON
 #include <impl/bip110/coin/explorer_getblock.hpp>  // explorer getblock full-then-partial decision (SSOT for the KAT)
+#include <impl/bip110/coin/explorer_retention.hpp> // raw-block retention seam (SSOT for the retention KAT)
 #include <impl/bip110/coin/block_confirm.hpp>      // found-block confirm/orphan resolver (B2 telemetry)
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
 #include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
@@ -904,6 +905,28 @@ int run_embedded(bool coin_p2p_discover,
          explorer_enabled, EXPLORER_DEPTH]
         (const bip110::coin::BlockType& block)
         {
+            // ── Explorer raw-block retention — persist EVERY received full block ─
+            // DASH/LTC parity (main_ltc.cpp:2588, main_dash.cpp:2976): retention
+            // lives OUTSIDE the UTXO-connect gate, so a reorg / non-contiguous /
+            // already-seen body is still stored and served. bip110::coin::
+            // retain_full_block resolves the block IDENTITY (BLAKE2b at/after the
+            // v2 fork, SHA256d below) against the header chain — the SAME key the
+            // chain is indexed by — NOT SHA256d(header). The Hash() the connect leg
+            // below uses never matches the BLAKE2b key past the fork, which is why
+            // retention never fired live. STORAGE / SERVE ONLY — no consensus /
+            // share / reward / coinbase / gentx / wire path is touched here.
+            if (explorer_enabled) {
+                auto stored = bip110::coin::retain_full_block(
+                    [&header_chain](const uint256& id) -> std::optional<uint32_t> {
+                        auto e = header_chain.get_header(id);
+                        if (!e) return std::nullopt;
+                        return e->height;
+                    },
+                    utxo_db, block, EXPLORER_DEPTH);
+                if (stored)
+                    LOG_INFO << "[EMB-BIP110] explorer retain: h=" << *stored;
+            }
+
             auto packed_hdr = pack(static_cast<const bip110::coin::BlockHeaderType&>(block));
             uint256 block_hash = Hash(packed_hdr.get_span());
             auto entry = header_chain.get_header(block_hash);
@@ -929,20 +952,9 @@ int run_embedded(bool coin_p2p_discover,
                 utxo_db.put_block_undo(height, undo);
                 utxo_cache.flush(block_hash, height);
                 utxo_cache.prune_undo(height, BIP110_KEEP_DEPTH);
-                // Explorer raw-block retention (flag-gated, pruned to depth). The
-                // bip110 node already downloads every full block for its UTXO
-                // view; keep the last EXPLORER_DEPTH bodies for /api/explorer
-                // getblock. Storage only — no consensus/reward/coinbase change.
-                if (explorer_enabled) {
-                    PackStream ps;
-                    ps << block;
-                    auto span = ps.get_span();
-                    std::vector<uint8_t> raw(
-                        reinterpret_cast<const uint8_t*>(span.data()),
-                        reinterpret_cast<const uint8_t*>(span.data()) + span.size());
-                    utxo_db.put_raw_block(height, raw);
-                    utxo_db.prune_raw_blocks(height, EXPLORER_DEPTH);
-                }
+                // (Explorer raw-block retention hoisted OUT of this connect gate to
+                // the top of the subscriber — DASH/LTC parity — so it persists every
+                // received body regardless of connect contiguity.)
                 mempool.set_tip_height(height);
                 LOG_INFO << "[EMB-BIP110] UTXO connect: h=" << height
                          << " txs=" << block.m_txs.size()

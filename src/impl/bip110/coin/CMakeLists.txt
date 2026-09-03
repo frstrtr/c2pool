@@ -265,3 +265,40 @@ target_link_libraries(bip110_explorer_getblock_kat
     Threads::Threads
 )
 add_test(NAME bip110_explorer_getblock_kat COMMAND bip110_explorer_getblock_kat)
+
+# bip110_explorer_retention_kat: drives the SHIPPED bip110::coin::retain_full_block
+# seam (explorer_retention.hpp) — the exact function the live full_block subscriber
+# calls to persist EVERY received full block into the bounded 288-body store.
+# Locks down the live root cause: retention resolves the height by the BIP-110
+# block IDENTITY (BLAKE2b at/after the v2 fork), NOT by SHA256d(header); a real v2
+# post-fork block WRITES its body (put_raw_block, round-trips) and then serves a
+# FULL getblock, while a SHA256d-keyed resolver (the pre-fix Hash() lookup) stores
+# nothing. Also proves the prune window stays bounded to ~288. Pure store/decode,
+# network-free, reward-safe. Same link closure as the sibling coin KATs.
+add_executable(bip110_explorer_retention_kat
+    test/bip110_explorer_retention_kat.cpp
+    # The retention KAT drives a REAL v2 post-fork block, whose identity is the
+    # BLAKE2b commitment hash — compile the lane-local primitive directly (same
+    # pattern as the pool-lane BLAKE2b KATs).
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_explorer_retention_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_explorer_retention_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_explorer_retention_kat COMMAND bip110_explorer_retention_kat)
