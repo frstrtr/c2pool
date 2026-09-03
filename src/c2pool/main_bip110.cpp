@@ -40,6 +40,7 @@
 #include <impl/bip110/pool/share_check.hpp>        // bip110::pool::create_local_share (MINT)
 #include <impl/bip110/pool/current_payouts_report.hpp> // /current_payouts dashboard PPLNS split (read-only)
 #include <impl/bip110/pool/sharechain_window_report.hpp> // /sharechain/window explorer + V36? column (read-only)
+#include <impl/bip110/pool/share_detail_report.hpp>   // /web/share rich detail (DASH parity, read-only)
 
 #include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
 #include <core/coin/utxo_view_cache.hpp>
@@ -2299,29 +2300,29 @@ int run_embedded(bool coin_p2p_discover,
                 return result;
             });
 
-            // /web/share/<hash> (LTC ref main_ltc.cpp:4250, no DOGE/merged).
+            // /web/share/<hash> — DASH-parity RICH detail document (parent/
+            // far_parent/type_name/children + local/share_data/block/v36 +
+            // pplns), built by bip110::pool::build_share_detail off the SAME
+            // sharechain node. Was a reduced 12-key stub that hung share.html
+            // (share.parent undefined -> renderShare TypeError -> stuck on
+            // "Loading"). READ-ONLY: the builder does const tracker walks only;
+            // the found-block enrichment reads MiningInterface::get_found_blocks().
             mi->set_share_lookup_fn([scn, mi](const std::string& hash_hex)
                                         -> nlohmann::json {
                 auto guard = scn->read_tracker();
                 if (!guard) return nlohmann::json{{"error", "tracker busy"}};
                 const bool testnet = bip110::pool::PoolConfig::is_testnet;
-                auto& chain    = guard->chain;
-                auto& verified = guard->verified;
-                uint256 hash; hash.SetHex(hash_hex);
-                if (hash.IsNull() || !chain.contains(hash))
-                    return nlohmann::json{{"error", "share not found"}};
 
-                nlohmann::json result;
-                auto* idx = chain.get_index(hash);
-                bool is_block = idx && idx->is_block_solution;
-                result["is_block_solution"] = is_block;
-                result["hash"]     = hash.GetHex();
-                result["verified"] = verified.contains(hash);
-                result["height"]   = chain.get_height(hash);
-                if (is_block && mi) {
+                nlohmann::json result = bip110::pool::build_share_detail(
+                    *guard, hash_hex,
+                    bip110::pool::PoolConfig::get_donation_script(36), testnet);
+                if (result.contains("error")) return result;
+
+                if (result.value("is_block_solution", false) && mi) {
+                    const std::string hh = result.value("hash", std::string{});
                     for (const auto& fb : mi->get_found_blocks()) {
-                        if (fb.hash == hash.GetHex() ||
-                            (!fb.share_hash.empty() && fb.share_hash == hash.GetHex())) {
+                        if (fb.hash == hh ||
+                            (!fb.share_hash.empty() && fb.share_hash == hh)) {
                             result["block_height"]        = fb.height;
                             result["block_confirmations"] = fb.confirmations;
                             result["block_status"]        = static_cast<int>(fb.status);
@@ -2329,18 +2330,6 @@ int run_embedded(bool coin_p2p_discover,
                         }
                     }
                 }
-                chain.get_share(hash).invoke([&](auto* obj) {
-                    result["timestamp"]       = obj->m_timestamp;
-                    result["bits"]            = obj->m_bits;
-                    result["absheight"]       = obj->m_absheight;
-                    result["version"]         = 36;
-                    result["desired_version"] = obj->m_desired_version;
-                    result["stale_info"]      = static_cast<int>(obj->m_stale_info);
-                    auto script = bip110::pool::get_share_script(obj);
-                    std::string addr = core::script_to_address(script, false, testnet);
-                    result["miner_address"] = addr.empty() ? HexStr(script) : addr;
-                    result["miner_script"]  = HexStr(script);
-                });
                 return result;
             });
 
