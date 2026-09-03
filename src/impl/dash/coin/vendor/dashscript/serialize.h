@@ -889,7 +889,13 @@ template<typename Stream, typename T> void Unserialize(Stream& is, std::atomic<T
 /**
  * If none of the specialized versions above matched and T is a class, default to calling member function.
  */
-template <class T, class Stream, typename std::enable_if<std::is_class<T>::value>::type* = nullptr >
+// NB: the redundant `enable_if<is_class<T>>` head that used to sit here made
+// MSVC's two-phase lookup evaluate `enable_if<false>::type` at concept-
+// definition time (error C2794); GCC deferred it. Bitcoin Core's serialize.h
+// (MSVC-clean) carries the bare concept — the `requires { a.Serialize(s); }`
+// body already excludes every non-class scalar (int/enum have no .Serialize),
+// so the overload set is byte-identical; this is a pure portability fix.
+template <class T, class Stream>
 concept Serializable = requires(T a, Stream s) { a.Serialize(s); };
 template <typename Stream, typename T>
     requires Serializable<T, Stream>
@@ -898,7 +904,7 @@ void Serialize(Stream& os, const T& a)
     a.Serialize(os);
 }
 
-template <class T, class Stream, typename std::enable_if<std::is_class<std::remove_reference<T> >::value>::type* = nullptr>
+template <class T, class Stream>
 concept Unserializable = requires(T a, Stream s) { a.Unserialize(s); };
 template <typename Stream, typename T>
     requires Unserializable<T, Stream>

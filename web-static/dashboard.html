@@ -1892,10 +1892,10 @@
                 
                 <!-- Second Row: Miners Block Value -->
                 <div class="stat-card">
-                    <h3><span class="icon">💰</span> Miners Block Value <small style="opacity:0.7;">(after MN + treasury; before pool fee)</small></h3>
+                    <h3><span class="icon">💰</span> Miners Block Value <small id="block_value_subtitle" style="opacity:0.7;">(after MN + treasury; before pool fee)</small></h3>
                     <div class="stat-value warning"><span id="block_value_miner">-</span> <small class="symbol-small" id="block_value_symbol">-</small></div>
                     <div class="stat-sub merged-child-hint" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> <span class="merged-child-symbol-hint">DOGE</span></div>
-                    <div class="stat-detail" style="white-space: nowrap;" title="This card headline is the MINERS' share of the block — the DASH subsidy AFTER the masternode payment and the platform/treasury lane (DIP-0027 burn) are deducted. It is chain-truth: a deterministic function of the block HEIGHT, identical on every node, the same split embedded_gbt.hpp uses to build accepted coinbases. 'Gross'/'pre-fee' here means before the POOL fee only; the pool fee is then subtracted to give the NET amount the API reports as block_value_miner.">Fee: <span id="block_value_fee">-</span> &rarr; net <span id="block_value_miner_net">-</span></div>
+                    <div class="stat-detail" id="block_value_headline_hint" style="white-space: nowrap;" title="This card headline is the MINERS' share of the block — the DASH subsidy AFTER the masternode payment and the platform/treasury lane (DIP-0027 burn) are deducted. It is chain-truth: a deterministic function of the block HEIGHT, identical on every node, the same split embedded_gbt.hpp uses to build accepted coinbases. 'Gross'/'pre-fee' here means before the POOL fee only; the pool fee is then subtracted to give the NET amount the API reports as block_value_miner.">Fee: <span id="block_value_fee">-</span> &rarr; net <span id="block_value_miner_net">-</span></div>
                     <!-- #block_value and #block_value_payments were both written
                          by renderLocalStats but had NO elements in this page. The
                          card showed the miner slice with nothing to compare it
@@ -3054,6 +3054,27 @@
             window.currency_info = currency_info;
             var sym = (info && info.symbol) || 'COIN';
             var chainName = (info && info.name) || sym;
+
+            // Coin capability: only DASH (among LTC/BTC/DOGE/DASH/DGB/BCH/NMC/
+            // BIP110) carries protocol lanes — a masternode payment plus the
+            // platform/treasury lane (DIP-0027 burn) — deducted from the
+            // coinbase before the miner split. Bitcoin-family coins have
+            // neither: the block value IS the plain coinbase subsidy. Prefer a
+            // server-declared flag if present, else derive from the symbol so
+            // the Miners-Block-Value card labels one source in one branch and
+            // never claims MN/treasury deductions on a Bitcoin-family lane.
+            var hasTreasury = (currency_info.has_treasury === true)
+                           || (currency_info.has_treasury == null && sym === 'DASH');
+            if (hasTreasury) {
+                d3.select('#block_value_subtitle').text('(after MN + treasury; before pool fee)');
+                d3.select('#block_value_headline_hint').attr('title',
+                    "This card headline is the MINERS' share of the block — the DASH subsidy AFTER the masternode payment and the platform/treasury lane (DIP-0027 burn) are deducted. It is chain-truth: a deterministic function of the block HEIGHT, identical on every node, the same split embedded_gbt.hpp uses to build accepted coinbases. 'Gross'/'pre-fee' here means before the POOL fee only; the pool fee is then subtracted to give the NET amount the API reports as block_value_miner.");
+            } else {
+                d3.select('#block_value_subtitle').text('(block subsidy; before pool fee)');
+                d3.select('#block_value_headline_hint').attr('title',
+                    "This card headline is the MINERS' gross block subsidy — the plain coinbase reward for the block being worked on (e.g. the post-halving BTC-family subsidy). It is chain-truth: a deterministic function of the block HEIGHT, identical on every node. This coin has no masternode or treasury lane, so nothing is deducted before the miner split. 'Gross'/'pre-fee' means before the POOL fee only; the pool fee is then subtracted to give the NET amount the API reports as block_value_miner.");
+            }
+
             d3.selectAll('.symbol-small').text(sym);
             d3.select('#currency-symbol').text(sym);
             d3.selectAll('.parent-symbol-hint').text(sym + '_ADDR');

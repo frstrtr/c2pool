@@ -7,13 +7,20 @@
 
 #include <cstring>
 
-#if defined(WIN32)
+// _MSC_VER (not bare WIN32) is the correct "this is MSVC" discriminator: MSVC
+// predefines _WIN32/_MSC_VER but NOT WIN32 (only the build system / windows.h
+// sets that token, and this vendored lib's CMake never does), so a WIN32 guard
+// fell through to the GCC inline-asm branch on MSVC (C2065 __asm__/C3861
+// __volatile__). Mirrors Bitcoin Core's _MSC_VER cleanse guard. MinGW-GCC
+// (which supports __asm__) correctly stays on the asm branch. Linux defines
+// neither token → still takes the #else memset+barrier, byte-identical.
+#if defined(_MSC_VER)
 #include <windows.h>
 #endif
 
 void memory_cleanse(void *ptr, size_t len)
 {
-#if defined(WIN32)
+#if defined(_MSC_VER)
     /* SecureZeroMemory is guaranteed not to be optimized out. */
     SecureZeroMemory(ptr, len);
 #else
