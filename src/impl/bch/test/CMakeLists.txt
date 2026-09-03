@@ -55,6 +55,23 @@ if(BUILD_TESTING)
         BCH_SHARE_TRACKER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../share_tracker.hpp")
     add_test(NAME bch_share_remove_owns_data_test COMMAND bch_share_remove_owns_data_test)
 
+    # Restart-reorg SupersedeHint behavioral KAT (BCH-lane mirror of the
+    # dash/btc/dgb/ltc KATs): drives the REAL bch::ShareTracker accounting —
+    # warm full-CL incumbent vs higher-work sub-CL challenger -> the hint
+    # activates and names the challenger; lower/equal-work + own-chain-extension
+    # + healthy-single-head stay inactive; challenger-first scheduling prevents
+    # starvation. Plain main()+CHECK (BCH tree has no GTest); links the ABLA set
+    # since bch::ShareTracker/MergedMiningShare are header-only over coin/*.hpp.
+    # Standalone add_executable + add_test (the #1131 precedent). Also listed in
+    # build.yml's bch --target set so CI compiles+runs it (unregistered = fake green).
+    add_executable(bch_restart_reorg_supersede_test restart_reorg_supersede_test.cpp)
+    target_include_directories(bch_restart_reorg_supersede_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_restart_reorg_supersede_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_restart_reorg_supersede_test COMMAND bch_restart_reorg_supersede_test)
+
     # block_connector_test exercises the full-block -> mempool reconciliation
     # path, so it constructs MutableTransaction objects whose ctors are out-of-line
     # in coin/transaction.cpp. Add that single TU to this test only; the link set

@@ -863,6 +863,31 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         LOG_INFO << "[BCH-POOL] dashboard disabled (no --http bind given).";
     }
 
+    // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
+    // tick. Without it, think() fired only on share arrival: no stale-head
+    // eating, unbounded raw-tracker growth past 2*CHAIN_LENGTH+10, and a timed-
+    // out bootstrap download was never retried if all peers went silent.
+    // clean_tracker() runs think() inline then prunes on the compute thread under
+    // the exclusive lock. `node` is a by-value local that outlives ioc.run(),
+    // captured by reference. On shutdown ioc.stop() cancels the timer → the
+    // handler is invoked with ec set and returns without re-arming.
+    auto bch_think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+    std::function<void(boost::system::error_code)> bch_think_tick;
+    bch_think_tick = [&node, bch_think_timer, &bch_think_tick](boost::system::error_code ec) {
+        if (ec) return;
+        bch_think_timer->expires_after(std::chrono::seconds(5));
+        bch_think_timer->async_wait(bch_think_tick);
+        try {
+            node.clean_tracker();
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what();
+        } catch (...) {
+            LOG_ERROR << "[CLEAN-TRACKER] unknown error";
+        }
+    };
+    bch_think_timer->expires_after(std::chrono::seconds(5));
+    bch_think_timer->async_wait(bch_think_tick);
+
     // Drive the shared io_context: pool node + embedded daemon + stratum run together.
     ioc.run();
 

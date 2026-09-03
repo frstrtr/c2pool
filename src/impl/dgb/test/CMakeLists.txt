@@ -7,7 +7,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # F1 retention + F2/F3 broadcast-gate KATs are actually compiled and run;
     # a fresh target would need a build.yml entry and would otherwise report
     # the silently-passing NOT_BUILT sentinel.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp)
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp restart_reorg_supersede_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
