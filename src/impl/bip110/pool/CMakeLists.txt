@@ -396,6 +396,45 @@ target_link_libraries(bip110_persistence_roundtrip_kat
 )
 add_test(NAME bip110_persistence_roundtrip_kat COMMAND bip110_persistence_roundtrip_kat)
 
+# bip110_peer_info_snapshot_kat: the 'c2pool Nodes' card / /peer_list FEED KAT.
+# The dashboard peer panel + /peer_list read MiningInterface::m_peer_info_fn,
+# which main_bip110 now wires to NodeImpl::get_peer_info_json() (the lock-free
+# snapshot built by publish_peer_info_snapshot() on the IO thread). The LIVE bug
+# was the wiring gap (set_peer_info_fn never installed on the bip110 web MI ->
+# /peer_list returned [] while the sharechain had ESTABLISHED :9337 peers). THIS
+# KAT proves the PRODUCER is sound: it drives a REAL Node, injects display-only
+# peers over real loopback sockets (distinct addrs; outbound vs inbound via
+# m_outbound_addrs membership) and asserts the feed returns the connected peers
+# with the exact frontend shape (address/version/incoming/uptime/downtime/
+# web_port) and is empty ONLY when there are genuinely none. Same heavy node.cpp
+# + protocol_actual.cpp + storage link closure as bip110_persistence_roundtrip_kat.
+add_executable(bip110_peer_info_snapshot_kat
+    test/bip110_peer_info_snapshot_kat.cpp
+    node.cpp
+    protocol_actual.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_peer_info_snapshot_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_peer_info_snapshot_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_peer_info_snapshot_kat COMMAND bip110_peer_info_snapshot_kat)
+
 # bip110_dial_lifetime_guard_kat: CORE dial/accept-teardown UAF guard mechanism
 # (successor to the e527abfe esft-primitive KAT that passed while the fix
 # no-opped). Drives REAL core::Factory-derived nodes in BOTH shapes that broke

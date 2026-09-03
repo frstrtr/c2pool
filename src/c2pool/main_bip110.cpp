@@ -1470,6 +1470,17 @@ int run_embedded(bool coin_p2p_discover,
                 {"peer_tip_height", peer_tip},
                 {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
                 {"embedded_peers", embedded_peers},
+                // Node-topology "peers" key (renderNodeTopology c.peers,
+                // dashboard.html:3266): LTC/DGB emit the coin-P2P connected
+                // count here (main_ltc.cpp:3854 e["peers"]=bc->connected_count),
+                // and the auto-detect fallback fills it too (web_server.cpp:5617).
+                // bip110 previously emitted only "embedded_peers" with NO "peers"
+                // key, so the topology row read the 0 default and always showed
+                // "0 peers"/faulted while genuinely connected to fork nodes.
+                // Mirror LTC semantics: topology "peers" = coin-P2P links (NOT
+                // sharechain peers — the c2pool-Nodes card gets those via
+                // set_peer_info_fn below). Keep "embedded_peers" for compat.
+                {"peers", embedded_peers},
                 {"broadcast_route", emb_p2p ? "p2p" : (ext_rpc ? "rpc" : "none")},
                 {"blake2b_height", chain_params.blake2b_height},
                 {"on_blake2b_chain", synced >= chain_params.blake2b_height},
@@ -1675,10 +1686,28 @@ int run_embedded(bool coin_p2p_discover,
             mi->set_pool_hashrate_fn([scn]() -> double {
                 return scn->get_tracker_snapshot().pool_hashrate;
             });
+            // 'c2pool Nodes' card + /peer_list + /peer_versions + /pings +
+            // /local_stats.connections all read MiningInterface::m_peer_info_fn
+            // (web_server.cpp:5358 rest_peer_list, :2121 connections, :5340
+            // peer_versions). Under M3 flag-ON the sharechain node has 2+ live
+            // ESTABLISHED :9337 links, but the fn was UNWIRED, so /peer_list fell
+            // through to nlohmann::json::array() -> the card showed "No peers
+            // connected"/badge 0 while genuinely syncing shares. The producer
+            // already exists on the sharechain node: get_peer_info_json()
+            // (node.hpp:414) returns the IO-thread-published lock-free snapshot
+            // (publish_peer_info_snapshot, node.hpp:389) with the exact frontend
+            // shape {address,version,incoming,uptime,downtime,web_port}. Reads the
+            // published snapshot under m_snapshot_mutex — never the live m_peers
+            // map (DASH #828 UAF back-port), never the tracker lock. Byte-parallel
+            // to main_dash.cpp:2159 / main_ltc.cpp:3004. Display-only; ZERO consensus.
+            mi->set_peer_info_fn([scn]() -> nlohmann::json {
+                return scn->get_peer_info_json();
+            });
             LOG_INFO << "[EMB-BIP110] dashboard sharechain feeds wired "
                         "(set_sharechain_stats_fn + set_best_share_hash_fn + "
-                        "set_pool_hashrate_fn; lock-free snapshot) — chain_size/"
-                        "has_shares/pool_hashrate now reflect the mint";
+                        "set_pool_hashrate_fn + set_peer_info_fn; lock-free "
+                        "snapshot) — chain_size/has_shares/pool_hashrate/peer_list "
+                        "now reflect the mint";
 
             // FINDING P1 — the "Current Payouts" dashboard card. rest_current_
             // payouts() (web_server.cpp:2408) returned {} on bip110 because NONE of
@@ -1735,12 +1764,12 @@ int run_embedded(bool coin_p2p_discover,
         }
 
         // Still deliberately NOT installed even on flag-ON: set_pplns_fn (MI's own
-        // window-PPLNS overlay), set_sharechain_window_fn, set_peer_info_fn. The
-        // V36? column (dashboard.html:2102) is filled client-side from the
-        // sharechain-window feed, so it stays blank until set_sharechain_window_fn
-        // is wired — a separate follow-up seam, NOT required for the payout rows.
-        // Absent feeds render honestly empty — NEVER faked.
-        // (set_pool_hashrate_fn AND set_current_payouts_fn ARE now wired above.)
+        // window-PPLNS overlay), set_sharechain_window_fn. The V36? column
+        // (dashboard.html:2102) is filled client-side from the sharechain-window
+        // feed, so it stays blank until set_sharechain_window_fn is wired — a
+        // separate follow-up seam, NOT required for the payout rows. Absent feeds
+        // render honestly empty — NEVER faked. (set_pool_hashrate_fn,
+        // set_current_payouts_fn AND set_peer_info_fn ARE now wired above.)
 
         // graph_db-persisted stats history (LTC/BTC parity): namespaced sub-dir.
         {
