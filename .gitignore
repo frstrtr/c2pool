@@ -171,6 +171,14 @@ tools/dash/*
 # W1 replay-fold KAT fixture generator — tracked source: the fixture .inc
 # headers under test/data/ name it as their reproduction path.
 !tools/dash/gen_replay_kat.py
+# BIP-110 Stratum-v1 test miners — tracked source: GPU (CUDA/CuPy) + CPU
+# reference miners that drive real pool-diff shares into a BIP-110 node to
+# exercise the M3 sharechain / PPLNS / multi-miner convergence.
+!tools/bip110/
+tools/bip110/*
+!tools/bip110/bip110_gpu_miner.py
+!tools/bip110/bip110_miner.py
+!tools/bip110/README.md
 
 # CMake out-of-source build trees (any name starting with `build-`).
 # Catches build-spv/, build-qt/, build-relwithdebinfo/, etc.
