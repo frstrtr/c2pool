@@ -210,6 +210,7 @@ public:
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
         m_getaddr_sent = false;   // fresh Connection -> re-arm the one-shot getaddr
+        m_connected_at = std::chrono::steady_clock::now();  // stamp THIS connection
         m_idle_gate.reset();   // fresh Connection -> fresh progress high-water mark
         LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
 
@@ -468,6 +469,11 @@ public:
         return std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_connected_at).count();
     }
+    /// Steady-clock stamp of the current connection (peer-discovery diagnostics).
+    std::chrono::steady_clock::time_point connected_at() const { return m_connected_at; }
+    /// The address this node was dialed at (the addrman/scorer key). Stable across
+    /// the connection lifetime; used by the dashboard peer directory + tests.
+    const NetService& target_addr() const { return m_target_addr; }
     const std::string& chain_label() const { return m_chain_label; }
 
     /// Set mempool reference for compact block reconstruction.
@@ -757,6 +763,25 @@ private:
         // path have real dial candidates. m_target_addr is the dialed key.
         if (m_on_peer_connected)
             m_on_peer_connected(m_target_addr);
+
+        // Self-authenticated fork-peer harvest into the shared addrman. We have
+        // DIRECTLY observed this peer advertise NODE_BLAKE2B in its version (the
+        // gate in handle(version) rejected non-fork peers BEFORE verack), so this
+        // is a proven, live fork node — bank it as if it had been gossiped by
+        // itself. This is the load-bearing growth path: Core/Knots answers getaddr
+        // slowly (poisson ~30-120s), rate-limits it, and the reply is dominated by
+        // canonical (non-NODE_BLAKE2B) addrs that the fork filter drops — so the
+        // gossip crawl alone leaves the addrman latched at the seed (DATABASE=1).
+        // Every fork peer we ACTUALLY connect to (explicit seed, primary, fan-out
+        // probe) is a real dial candidate; banking it on handshake is what grows
+        // the addrman past 1 with the reachable fork mesh. notify_connected above
+        // only PROMOTES an already-present entry (addrman.good early-returns when
+        // absent), so without this the connect never adds. Idempotent: a repeat
+        // handshake just refreshes the entry. Source == self (the peer vouches for
+        // its own address); m_addr_callback is the same NODE_BLAKE2B-only intake
+        // wired for gossip, so a non-fork peer can never reach here (gated above).
+        if (m_addr_callback)
+            m_addr_callback({ m_target_addr }, m_target_addr);
 
         // Knots getaddr-on-connect (peer crawl). Core sends GETADDR to outbound
         // peers at verack (net_processing.cpp SetupAddressRelay); we ask this peer

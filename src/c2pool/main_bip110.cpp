@@ -1068,10 +1068,21 @@ int run_embedded(bool coin_p2p_discover,
     auto explicit_list = std::make_shared<std::vector<NetService>>(explicit_peers);
     auto explicit_idx  = std::make_shared<size_t>(0);
     auto tried = std::make_shared<std::set<std::string>>();
-    auto dial_next = [&coin_node, &coin_peer_mgr, explicit_list, explicit_idx, tried]() -> bool {
+    // The address the PRIMARY coin-P2P arm is currently dialing. Captured on every
+    // (re)dial so the fan-out broadcaster can EXCLUDE it (set_primary_addr): with
+    // the addrman near-empty the fan-out candidate set would otherwise be the same
+    // one peer the primary already holds, so a fan-out probe opens a DUPLICATE
+    // inbound to it, which Knots drops as redundant (the "EOF shortly after
+    // getaddr" churn). Excluding the primary makes each fan-out probe dial a
+    // DISTINCT fork peer, stay handshaked, and survive to receive the delayed addr
+    // reply (and, via the self-authenticated add, bank itself into the addrman).
+    auto primary_addr = std::make_shared<NetService>();
+    auto dial_next = [&coin_node, &coin_peer_mgr, explicit_list, explicit_idx, tried,
+                      primary_addr]() -> bool {
         // Prefer explicit peers first (round-robin), then discovered candidates.
         if (!explicit_list->empty()) {
             NetService ep = (*explicit_list)[(*explicit_idx)++ % explicit_list->size()];
+            *primary_addr = ep;
             LOG_INFO << "[EMB-BIP110] dialing explicit fork peer " << ep.to_string();
             coin_node.start_p2p(ep);
             return true;
@@ -1085,6 +1096,7 @@ int run_embedded(bool coin_p2p_discover,
             }
             const auto& ep = cands.front();
             tried->insert(ep.to_string());
+            *primary_addr = ep.to_net_service();
             LOG_INFO << "[EMB-BIP110] dialing discovered fork peer " << ep.to_string();
             coin_node.start_p2p(ep.to_net_service());
             return true;
@@ -1148,7 +1160,12 @@ int run_embedded(bool coin_p2p_discover,
         auto bc_tick = std::make_shared<std::function<void()>>();
         std::weak_ptr<std::function<void()>> weak_bc_tick = bc_tick;
         *bc_tick = [broadcaster_timer, weak_bc_tick, &coin_broadcaster, &coin_peer_mgr,
-                    explicit_list]() {
+                    explicit_list, primary_addr]() {
+            // Keep the fan-out's primary-exclusion current with the primary arm's
+            // live dial target, so a slot is never spent dueling the primary for
+            // the same peer (the redundant-inbound EOF). Harmless if unset.
+            if (coin_broadcaster && !primary_addr->address().empty())
+                coin_broadcaster->set_primary_addr(*primary_addr);
             std::vector<NetService> targets;
             // Explicit fork peers first (the operator's pinned NODE_BLAKE2B set).
             for (const auto& ep : *explicit_list) targets.push_back(ep);
@@ -1298,11 +1315,22 @@ int run_embedded(bool coin_p2p_discover,
         // Node topology card: embedded SPV follower state + the old StatusHttp
         // fork fields (blake2b_height / on_blake2b_chain) find their honest new
         // home here. Mirror of main_btc.cpp node_topology_fn.
-        mi->set_node_topology_fn([&header_chain, &coin_node, &chain_params]() {
+        mi->set_node_topology_fn([&header_chain, &coin_node, &chain_params,
+                                  &coin_broadcaster]() {
             const uint32_t synced   = header_chain.height();
             const uint32_t peer_tip = header_chain.peer_tip_height();
             const bool     emb_p2p  = coin_node.has_p2p();
             const bool     ext_rpc  = coin_node.has_rpc();
+            // Count ALL live NODE_BLAKE2B fork links, not just "a primary object
+            // exists": the handshaked primary (1) PLUS every handshake-complete
+            // fan-out slot (Bip110Broadcaster::live_count). The old `emb_p2p ? 1 : 0`
+            // reported 1 even while the node was connected to 6+ fork nodes (the
+            // fan-out arm was never counted) — and 1 even before the primary had
+            // handshaked. Gate the primary on the completed handshake so the number
+            // reflects real, answerable links.
+            int embedded_peers = coin_node.is_handshake_complete() ? 1 : 0;
+            if (coin_broadcaster)
+                embedded_peers += static_cast<int>(coin_broadcaster->live_count());
             return nlohmann::json{
                 {"coin", "BIP110"},
                 {"embedded", true},
@@ -1310,7 +1338,7 @@ int run_embedded(bool coin_p2p_discover,
                 {"synced_height", synced},
                 {"peer_tip_height", peer_tip},
                 {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
-                {"embedded_peers", emb_p2p ? 1 : 0},
+                {"embedded_peers", embedded_peers},
                 {"broadcast_route", emb_p2p ? "p2p" : (ext_rpc ? "rpc" : "none")},
                 {"blake2b_height", chain_params.blake2b_height},
                 {"on_blake2b_chain", synced >= chain_params.blake2b_height},
@@ -1341,6 +1369,67 @@ int run_embedded(bool coin_p2p_discover,
             s["target_height"] = th;
             s["peers"] = std::move(peers);
             return s;
+        });
+
+        // Fork-peer directory card (/broadcaster_status "peers"): the honest set of
+        // NODE_BLAKE2B links + learned fork mesh. Drives the dashboard CONNECTIONS
+        // (entries with connected==true) and DATABASE (total entries) counters.
+        // Previously UNWIRED, so rest_broadcaster_status fell through to the header-
+        // sync provider whose peers array is JUST the primary — hence the stuck
+        // "CONNECTIONS 1 / DATABASE 1" while the node was connected to 6+ fork
+        // nodes. Composed from: (1) the primary coin-P2P arm (rich subver/height),
+        // (2) every live fan-out slot (redundant NODE_BLAKE2B header/broadcast
+        // peers), (3) the peer manager's routable directory (the learned breadth,
+        // grown by the self-authenticated handshake add + addr crawl + seeds).
+        // Deduped by addr; the primary/live entries win their richer fields.
+        mi->set_coin_peer_info_fn([&coin_node, &coin_broadcaster, &coin_peer_mgr]()
+                                      -> nlohmann::json {
+            nlohmann::json arr = nlohmann::json::array();
+            std::set<std::string> seen;
+            // (1) Primary coin-P2P arm.
+            if (auto* p = coin_node.p2p(); p != nullptr) {
+                const std::string key = p->target_addr().to_string();
+                if (!key.empty() && seen.insert(key).second) {
+                    arr.push_back({
+                        {"addr", key},
+                        {"connected", p->is_handshake_complete()},
+                        {"subver", p->peer_subver()},
+                        {"startingheight", p->peer_start_height()},
+                        {"conntime", p->peer_uptime_sec()},
+                        {"role", "primary"},
+                    });
+                }
+            }
+            // (2) Live fan-out slots (handshake-complete NODE_BLAKE2B peers).
+            if (coin_broadcaster) {
+                for (const auto& key : coin_broadcaster->live_slot_keys()) {
+                    if (!seen.insert(key).second) continue;
+                    arr.push_back({
+                        {"addr", key},
+                        {"connected", true},
+                        {"subver", ""},
+                        {"startingheight", 0},
+                        {"conntime", 0},
+                        {"role", "fanout"},
+                    });
+                }
+            }
+            // (3) Learned fork-mesh breadth (banked, not-currently-primary/fanout).
+            if (coin_peer_mgr) {
+                for (const auto& [ns, connected] : coin_peer_mgr->peer_directory()) {
+                    const std::string key = ns.to_string();
+                    if (!seen.insert(key).second) continue;
+                    arr.push_back({
+                        {"addr", key},
+                        {"connected", connected},
+                        {"subver", ""},
+                        {"startingheight", 0},
+                        {"conntime", 0},
+                        {"role", "database"},
+                    });
+                }
+            }
+            return arr;
         });
 
         // Miners-Block-Value / Node-Fee cards: daemonless zero-rig projection of

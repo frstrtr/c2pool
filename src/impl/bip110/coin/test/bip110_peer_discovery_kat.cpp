@@ -253,6 +253,76 @@ void t4_oracle_bootstraps_many()
               << " fanout_targets=" << chosen.size() << " (was 1)\n";
 }
 
+// ── T5: SELF-AUTHENTICATED harvest + peer directory + embedded_peers count ───
+// The live defect this closes: getaddr gossip yielded 0 usable fork addrs (Core
+// answers slowly + rate-limited, and the reply is dominated by canonical non-
+// NODE_BLAKE2B addrs the fork filter drops), so the addrman latched at the seed
+// (DATABASE=1) and embedded_peers reported 1 even while 6+ fork nodes were
+// connected. The fix: (a) bank every fork peer we DIRECTLY handshake as a
+// self-authenticated NODE_BLAKE2B node (NodeP2P verack -> m_addr_callback of its
+// OWN addr, which main routes to add_discovered_peer), so the addrman grows with
+// the reachable mesh; (b) a peer_directory() exposing connected flags for the
+// dashboard DATABASE/CONNECTIONS card; (c) embedded_peers = handshaked primary +
+// Bip110Broadcaster::live_count (ALL live fork links, not "an object exists").
+void t5_self_auth_directory_and_count()
+{
+    boost::asio::io_context ioc;
+    BtcPeerManagerConfig cfg;
+    cfg.valid_ports = { 8333, 9333 };
+    cfg.max_peers = 64;
+    BtcCoinPeerManager mgr(ioc, "BIP110", "/tmp/bip110_peerdisc_kat_t5", cfg);
+
+    // (a) Self-authenticated add: on a completed NODE_BLAKE2B handshake, NodeP2P
+    // calls m_addr_callback({target}, target). main wires that to
+    // add_discovered_peer(addr, addr.address()). Replicate that exact call for
+    // three DISTINCT fork peers we connected to (explicit seed / primary / fan-out)
+    // — the addrman must grow past the single seed (DATABASE 1 -> 3).
+    const NetService a("45.13.214.55", 8333);
+    const NetService b("47.203.64.175", 9333);
+    const NetService c("82.9.109.96",   8333);
+    mgr.add_discovered_peer(a, a.address());   // self-source (the peer vouches for itself)
+    mgr.add_discovered_peer(b, b.address());
+    mgr.add_discovered_peer(c, c.address());
+    CHECK(mgr.addrman().size() == 3u);         // grew past 1 from direct handshakes alone
+
+    // (b) peer_directory: total breadth == 3; connected flag tracks the live
+    // outbound census. Mark two of them connected (notify_connected).
+    mgr.notify_connected(a.to_string());
+    mgr.notify_connected(b.to_string());
+    auto dir = mgr.peer_directory();
+    CHECK(dir.size() == 3u);                    // DATABASE reflects the whole mesh
+    int connected = 0;
+    for (auto& [ns, is_conn] : dir) if (is_conn) ++connected;
+    CHECK(connected == 2);                      // CONNECTIONS reflects live links
+
+    // (c) embedded_peers count: handshaked primary (1) + live fan-out slots. Drive
+    // the REAL broadcaster with a stub factory (real NodeP2P slots) + a live
+    // predicate, exactly as the slot-lifetime KAT does, so live_count() is the
+    // number of handshake-complete fan-out peers.
+    bip110::coin::Bip110Broadcaster<KatConfig> bc(&ioc, nullptr, nullptr, /*max_peers=*/8);
+    KatConfig kcfg;
+    bc.set_slot_factory([&](const NetService&) {
+        auto n = std::make_shared<bip110::coin::p2p::NodeP2P<KatConfig>>(
+            &ioc, nullptr, &kcfg, "kat-fanout");
+        n->set_lifetime(n);   // UAF-safe: make_shared + set_lifetime BEFORE (no) dial
+        return n;
+    });
+    bc.set_live_predicate([](const bip110::coin::p2p::NodeP2P<KatConfig>&) { return true; });
+    bc.discover({ NetService("77.1.1.1", 9333),
+                  NetService("77.2.2.2", 9333),
+                  NetService("77.3.3.3", 9333) });
+    CHECK(bc.live_count() == 3u);
+    const int primary_handshaked = 1;                       // simulate primary up
+    const int embedded_peers = primary_handshaked + static_cast<int>(bc.live_count());
+    CHECK(embedded_peers == 4);                             // the node_topology_fn formula
+    CHECK(embedded_peers > 1);                              // the ACCEPTANCE inequality
+
+    std::cout << "T5 self-auth/directory/count: addrman=" << mgr.addrman().size()
+              << " directory=" << dir.size() << " connected=" << connected
+              << " live_slots=" << bc.live_count()
+              << " embedded_peers=" << embedded_peers << " (was pinned at 1)\n";
+}
+
 } // namespace
 
 int main()
@@ -262,6 +332,7 @@ int main()
     t2_seams_and_fanout_target();
     t3_ingest_bucket_tried_plan();
     t4_oracle_bootstraps_many();
+    t5_self_auth_directory_and_count();
 
     if (g_failures) {
         std::cerr << "\nbip110_peer_discovery_kat: " << g_failures << " CHECK(s) FAILED\n";
