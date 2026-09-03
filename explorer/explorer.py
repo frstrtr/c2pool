@@ -460,7 +460,11 @@ class C2PoolClient:
         if method == "getblockchaininfo":
             return self._get(f"/getblockchaininfo?chain={self.chain}", timeout)
         elif method == "getblockhash":
-            return self._get(f"/getblockhash?height={args[0]}&chain={self.chain}", timeout)["result"]
+            r = self._get(f"/getblockhash?height={args[0]}&chain={self.chain}", timeout)
+            # Two live node answer shapes: the explorer-callback path wraps the
+            # hash as {"result": hash} (LTC), the coin-owned chain-query path
+            # returns the bare hash string (DASH's daemonless header chain).
+            return r if isinstance(r, str) else r["result"]
         elif method == "getblock":
             return self._get(f"/getblock?hash={args[0]}&chain={self.chain}", timeout)
         elif method == "getmempoolinfo":
