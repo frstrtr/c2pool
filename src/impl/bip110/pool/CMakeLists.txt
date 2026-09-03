@@ -351,6 +351,44 @@ target_link_libraries(bip110_sharechain_window_kat
 )
 add_test(NAME bip110_sharechain_window_kat COMMAND bip110_sharechain_window_kat)
 
+# bip110_share_detail_kat: the GET /web/share/<hash> DETAIL-DOCUMENT KAT (M3, DASH
+# parity). The individual share page (share.html) hung on "Loading" on contabo
+# because the /web/share handler served a REDUCED 12-key flat object with NO
+# parent/far_parent/type_name/children; renderShare reads share.parent.substr(-8)
+# -> TypeError on undefined -> abort -> stuck. main_bip110 now builds the RICH
+# document via bip110::pool::build_share_detail (share_detail_report.hpp, DASH
+# dashboard_views.hpp parity). THIS KAT drives that EXACT builder: seeds a real
+# 2-share window, asserts parent/far_parent are 64-hex strings (the field whose
+# absence hung the page), type_name=="V36", children[], the full share_data key
+# set + local/block/v36_metadata, the 12 back-compat flat keys (no regression),
+# pplns keys that MATCH the /current_payouts SSOT, an honest {"error"} miss, and a
+# genesis share whose null parent renders as the null-hash string (never undefined)
+# while omitting pplns honestly. Same heavy link closure as the window KAT.
+add_executable(bip110_share_detail_kat
+    test/bip110_share_detail_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
+)
+target_compile_definitions(bip110_share_detail_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_share_detail_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_share_detail_kat COMMAND bip110_share_detail_kat)
+
 # bip110_serve_xcheck_kat: the SERVE-PATH pre-serve reward-safety XCHECK KAT (M3).
 # The other bip110 KATs exercise the MINT / consensus math; NONE exercised the live
 # SERVE template + the [BIP110-WS] pre-serve reward-safety XCHECK that build_

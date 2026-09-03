@@ -27,6 +27,8 @@
 #include <impl/bip110/coin/chain_seeds.hpp>
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
 #include <impl/bip110/coin/block_json.hpp>         // explorer getblock verbosity=2 JSON
+#include <impl/bip110/coin/explorer_getblock.hpp>  // explorer getblock full-then-partial decision (SSOT for the KAT)
+#include <impl/bip110/coin/explorer_retention.hpp> // raw-block retention seam (SSOT for the retention KAT)
 #include <impl/bip110/coin/block_confirm.hpp>      // found-block confirm/orphan resolver (B2 telemetry)
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
 #include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
@@ -38,6 +40,7 @@
 #include <impl/bip110/pool/share_check.hpp>        // bip110::pool::create_local_share (MINT)
 #include <impl/bip110/pool/current_payouts_report.hpp> // /current_payouts dashboard PPLNS split (read-only)
 #include <impl/bip110/pool/sharechain_window_report.hpp> // /sharechain/window explorer + V36? column (read-only)
+#include <impl/bip110/pool/share_detail_report.hpp>   // /web/share rich detail (DASH parity, read-only)
 
 #include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
 #include <core/coin/utxo_view_cache.hpp>
@@ -903,6 +906,28 @@ int run_embedded(bool coin_p2p_discover,
          explorer_enabled, EXPLORER_DEPTH]
         (const bip110::coin::BlockType& block)
         {
+            // ── Explorer raw-block retention — persist EVERY received full block ─
+            // DASH/LTC parity (main_ltc.cpp:2588, main_dash.cpp:2976): retention
+            // lives OUTSIDE the UTXO-connect gate, so a reorg / non-contiguous /
+            // already-seen body is still stored and served. bip110::coin::
+            // retain_full_block resolves the block IDENTITY (BLAKE2b at/after the
+            // v2 fork, SHA256d below) against the header chain — the SAME key the
+            // chain is indexed by — NOT SHA256d(header). The Hash() the connect leg
+            // below uses never matches the BLAKE2b key past the fork, which is why
+            // retention never fired live. STORAGE / SERVE ONLY — no consensus /
+            // share / reward / coinbase / gentx / wire path is touched here.
+            if (explorer_enabled) {
+                auto stored = bip110::coin::retain_full_block(
+                    [&header_chain](const uint256& id) -> std::optional<uint32_t> {
+                        auto e = header_chain.get_header(id);
+                        if (!e) return std::nullopt;
+                        return e->height;
+                    },
+                    utxo_db, block, EXPLORER_DEPTH);
+                if (stored)
+                    LOG_INFO << "[EMB-BIP110] explorer retain: h=" << *stored;
+            }
+
             auto packed_hdr = pack(static_cast<const bip110::coin::BlockHeaderType&>(block));
             uint256 block_hash = Hash(packed_hdr.get_span());
             auto entry = header_chain.get_header(block_hash);
@@ -928,20 +953,9 @@ int run_embedded(bool coin_p2p_discover,
                 utxo_db.put_block_undo(height, undo);
                 utxo_cache.flush(block_hash, height);
                 utxo_cache.prune_undo(height, BIP110_KEEP_DEPTH);
-                // Explorer raw-block retention (flag-gated, pruned to depth). The
-                // bip110 node already downloads every full block for its UTXO
-                // view; keep the last EXPLORER_DEPTH bodies for /api/explorer
-                // getblock. Storage only — no consensus/reward/coinbase change.
-                if (explorer_enabled) {
-                    PackStream ps;
-                    ps << block;
-                    auto span = ps.get_span();
-                    std::vector<uint8_t> raw(
-                        reinterpret_cast<const uint8_t*>(span.data()),
-                        reinterpret_cast<const uint8_t*>(span.data()) + span.size());
-                    utxo_db.put_raw_block(height, raw);
-                    utxo_db.prune_raw_blocks(height, EXPLORER_DEPTH);
-                }
+                // (Explorer raw-block retention hoisted OUT of this connect gate to
+                // the top of the subscriber — DASH/LTC parity — so it persists every
+                // received body regardless of connect contiguity.)
                 mempool.set_tip_height(height);
                 LOG_INFO << "[EMB-BIP110] UTXO connect: h=" << height
                          << " txs=" << block.m_txs.size()
@@ -1484,65 +1498,25 @@ int run_embedded(bool coin_p2p_discover,
                     if (!entry)
                         return nlohmann::json{{"error", "Block not in header chain"}};
 
-                    // DASH-shape (#1460/#99) header partial: every indexed header
-                    // answers; bodies stay honestly absent — never tx: [], never
-                    // fabricated sizes. The explorer drops any getblock JSON that
-                    // carries an "error" key, so an un-retained/out-of-window block
-                    // must still return header truth (no "error") to render a row.
-                    // Bodies only ADD detail in the 288-block window; they never
-                    // remove the header answer. Mirrors main_dash.cpp:4496-4563.
-                    auto header_partial = [hc](const bip110::coin::IndexEntry& e) -> nlohmann::json {
-                        nlohmann::json r;
-                        r["hash"]              = e.block_hash.GetHex();
-                        r["height"]            = e.height;
-                        r["version"]           = static_cast<int64_t>(e.header.m_version);
-                        r["previousblockhash"] = e.header.m_previous_block.GetHex();
-                        r["merkleroot"]        = e.header.m_merkle_root.GetHex();
-                        r["time"]              = e.header.m_timestamp;
-                        r["bits"]              = bip110::coin::detail::bits_to_hex_str(e.header.m_bits);
-                        r["nonce"]             = e.header.m_nonce;
-                        r["confirmations"]     = static_cast<int64_t>(hc->height()) - static_cast<int64_t>(e.height) + 1;
-                        if (auto nxt = hc->get_header_by_height(e.height + 1))
-                            r["nextblockhash"] = nxt->block_hash.GetHex();
-                        auto target = bip110::coin::target_from_bits(e.header.m_bits);
-                        if (!target.IsNull())
-                            r["difficulty"] = hc->params().pow_limit.getdouble() / target.getdouble();
-                        const char* why = "requires the block body; this SPV node retains headers only "
-                                          "(bodies kept for the last 288 blocks once received)";
-                        nlohmann::json unavailable = nlohmann::json::object();
-                        for (const char* f : {"tx", "nTx", "size", "strippedsize", "weight"})
-                            unavailable[f] = why;
-                        r["unavailable"] = unavailable;
-                        r["partial"] = true;
-                        return r;
-                    };
-
-                    uint32_t height = entry->height;
+                    // DASH-shape (#1460/#99) full-then-partial getblock. Every
+                    // indexed header answers; bodies stay honestly absent below the
+                    // 288-block retention window (never tx: [], never fabricated
+                    // sizes, never an "error" key so the row still renders). The
+                    // decision + header-partial builder are hoisted verbatim into
+                    // bip110::coin::explorer_getblock_body so the getblock KAT binds
+                    // the EXACT shipped logic. Mirrors main_dash.cpp:4496-4563.
                     uint32_t tip = hc->height();
-                    if (tip > EXPLORER_DEPTH && height < tip - EXPLORER_DEPTH)
-                        return header_partial(*entry);
-                    auto raw = udb->get_raw_block(height);
-                    if (!raw)
-                        return header_partial(*entry);
-                    bip110::coin::BlockType block;
-                    try {
-                        PackStream ps(*raw);
-                        ps >> block;
-                    } catch (...) {
-                        return header_partial(*entry);
-                    }
+                    std::optional<uint256> next_block_hash;
+                    if (auto nxt = hc->get_header_by_height(entry->height + 1))
+                        next_block_hash = nxt->block_hash;
                     bip110::coin::ExplorerChainParams params;
                     params.bech32_hrp = "bc";
                     params.p2pkh_ver  = 0x00;
                     params.p2sh_ver   = 0x05;
                     params.chain_name = "main";
-                    try {
-                        return bip110::coin::block_to_explorer_json(block, height, blk_hash, params);
-                    } catch (const std::exception&) {
-                        return header_partial(*entry);
-                    } catch (...) {
-                        return header_partial(*entry);
-                    }
+                    return bip110::coin::explorer_getblock_body(
+                        *entry, blk_hash, tip, next_block_hash,
+                        hc->params().pow_limit, *udb, EXPLORER_DEPTH, params);
                 });
 
             // getmempoolinfo — summary stats + feerate histogram.
@@ -2326,29 +2300,29 @@ int run_embedded(bool coin_p2p_discover,
                 return result;
             });
 
-            // /web/share/<hash> (LTC ref main_ltc.cpp:4250, no DOGE/merged).
+            // /web/share/<hash> — DASH-parity RICH detail document (parent/
+            // far_parent/type_name/children + local/share_data/block/v36 +
+            // pplns), built by bip110::pool::build_share_detail off the SAME
+            // sharechain node. Was a reduced 12-key stub that hung share.html
+            // (share.parent undefined -> renderShare TypeError -> stuck on
+            // "Loading"). READ-ONLY: the builder does const tracker walks only;
+            // the found-block enrichment reads MiningInterface::get_found_blocks().
             mi->set_share_lookup_fn([scn, mi](const std::string& hash_hex)
                                         -> nlohmann::json {
                 auto guard = scn->read_tracker();
                 if (!guard) return nlohmann::json{{"error", "tracker busy"}};
                 const bool testnet = bip110::pool::PoolConfig::is_testnet;
-                auto& chain    = guard->chain;
-                auto& verified = guard->verified;
-                uint256 hash; hash.SetHex(hash_hex);
-                if (hash.IsNull() || !chain.contains(hash))
-                    return nlohmann::json{{"error", "share not found"}};
 
-                nlohmann::json result;
-                auto* idx = chain.get_index(hash);
-                bool is_block = idx && idx->is_block_solution;
-                result["is_block_solution"] = is_block;
-                result["hash"]     = hash.GetHex();
-                result["verified"] = verified.contains(hash);
-                result["height"]   = chain.get_height(hash);
-                if (is_block && mi) {
+                nlohmann::json result = bip110::pool::build_share_detail(
+                    *guard, hash_hex,
+                    bip110::pool::PoolConfig::get_donation_script(36), testnet);
+                if (result.contains("error")) return result;
+
+                if (result.value("is_block_solution", false) && mi) {
+                    const std::string hh = result.value("hash", std::string{});
                     for (const auto& fb : mi->get_found_blocks()) {
-                        if (fb.hash == hash.GetHex() ||
-                            (!fb.share_hash.empty() && fb.share_hash == hash.GetHex())) {
+                        if (fb.hash == hh ||
+                            (!fb.share_hash.empty() && fb.share_hash == hh)) {
                             result["block_height"]        = fb.height;
                             result["block_confirmations"] = fb.confirmations;
                             result["block_status"]        = static_cast<int>(fb.status);
@@ -2356,18 +2330,6 @@ int run_embedded(bool coin_p2p_discover,
                         }
                     }
                 }
-                chain.get_share(hash).invoke([&](auto* obj) {
-                    result["timestamp"]       = obj->m_timestamp;
-                    result["bits"]            = obj->m_bits;
-                    result["absheight"]       = obj->m_absheight;
-                    result["version"]         = 36;
-                    result["desired_version"] = obj->m_desired_version;
-                    result["stale_info"]      = static_cast<int>(obj->m_stale_info);
-                    auto script = bip110::pool::get_share_script(obj);
-                    std::string addr = core::script_to_address(script, false, testnet);
-                    result["miner_address"] = addr.empty() ? HexStr(script) : addr;
-                    result["miner_script"]  = HexStr(script);
-                });
                 return result;
             });
 
