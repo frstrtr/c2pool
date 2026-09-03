@@ -683,6 +683,19 @@ protected:
     std::set<uint256> m_rejected_share_hashes; // shares rejected by peers — never re-broadcast
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 
+    // Serve requested ancestor shares from the persistent LevelDB store instead
+    // of the hot in-memory tracker. Used by handle_get_share on the two paths
+    // the in-memory serve cannot cover: (1) the try_to_lock MISS (compute thread
+    // holds the exclusive lock during a long think()/fold self-check), and (2) a
+    // requested hash that has been pruned out of the hot tracker but still lives
+    // in LevelDB (never pruned). Historical shares are IMMUTABLE once in the
+    // chain, so this reads storage WITHOUT m_tracker_mutex — no lock contention
+    // and no reintroduction of the 2026-04 IO-thread freeze class. Returns OWNED
+    // ShareTypes (freshly deserialized), which the sharereq handler destroy()s.
+    std::vector<btc::ShareType> serve_shares_from_storage(
+        const std::vector<uint256>& hashes, uint64_t parents,
+        const std::vector<uint256>& stops, NetService peer_addr);
+
     // Track share hashes that peers couldn't provide (empty reply).
     // After MAX_EMPTY_RETRIES failures, stop requesting — the share is
     // pruned from the network. p2pool avoids this via reactive desired_var

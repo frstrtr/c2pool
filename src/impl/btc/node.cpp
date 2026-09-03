@@ -663,8 +663,86 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     }
 }
 
+std::vector<btc::ShareType> NodeImpl::serve_shares_from_storage(
+    const std::vector<uint256>& hashes, uint64_t parents,
+    const std::vector<uint256>& stops, NetService peer_addr)
+{
+    // Serve ancestor shares straight from the persistent LevelDB store. Called
+    // by handle_get_share when the hot in-memory tracker cannot answer — either
+    // the try_to_lock missed (compute thread holds the exclusive lock) or the
+    // requested hash was pruned out of memory but still lives in LevelDB (never
+    // pruned). Historical shares are IMMUTABLE, so NO m_tracker_mutex is taken
+    // here: LevelDB is internally synchronized for concurrent reads/writes, and
+    // this reads only owned bytes it deserializes into fresh ShareTypes.
+    std::vector<btc::ShareType> shares;
+    if (!m_storage || !m_storage->is_available())
+        return shares;
+
+    std::set<uint256> stop_set(stops.begin(), stops.end());
+    for (const auto& start_hash : hashes)
+    {
+        // Walk backward from start_hash: the share itself + up to `parents`
+        // ancestors, following prev_hash from each entry's stored metadata (one
+        // LevelDB read per share — no double walk).
+        uint256 current = start_hash;
+        for (uint64_t depth = 0; depth <= parents; ++depth)
+        {
+            if (current.IsNull())
+                break;
+            if (stop_set.count(current))
+                break;
+
+            std::vector<uint8_t> data;
+            core::ShareMetadata meta;
+            if (!m_storage->load_share(current, data, meta))
+                break;  // gap in storage — cannot serve deeper on this branch
+            if (data.size() < 8)
+                break;  // corrupt entry (missing version prefix)
+
+            // Stored format: [version:uint64 LE][packed share contents].
+            // Mirrors the store path in handle_shares and the cold-load path in
+            // load_sharechain (recompute of pow_hash is NOT needed to serve).
+            try
+            {
+                uint64_t ver;
+                std::memcpy(&ver, data.data(), 8);
+                std::vector<unsigned char> share_bytes(data.begin() + 8, data.end());
+                PackStream ps(share_bytes);
+                auto share = btc::load_share(static_cast<int64_t>(ver), ps, peer_addr);
+                // m_hash is not part of the serialized format — restore it from
+                // the LevelDB key so the reply is addressable by the requested
+                // hash (identical to load_sharechain's key-restore).
+                share.ACTION({ obj->m_hash = current; });
+                shares.push_back(share);
+            }
+            catch (const std::exception& e)
+            {
+                static int deser_log = 0;
+                if (deser_log++ < 5)
+                    LOG_WARNING << "[handle_get_share/storage] deserialize failed for "
+                                << current.ToString().substr(0, 16) << ": " << e.what();
+                break;
+            }
+
+            current = meta.prev_hash;  // step to the parent
+        }
+    }
+
+    if (!shares.empty())
+        LOG_INFO << "[Pool] Served " << shares.size()
+                 << " ancestor share(s) from storage to " << peer_addr.to_string();
+    return shares;
+}
+
 std::vector<btc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
 {
+    if (hashes.empty())
+        return {};
+
+    // Cap the reply at ~1000 shares total (p2pool wire limit), computed before
+    // the lock so both the in-memory and the storage-fallback paths honour it.
+    parents = std::min(parents, (uint64_t)1000/hashes.size());
+
     // try_to_lock per the architectural rule (node.hpp:67) — IO thread MUST
     // never block on m_tracker_mutex.  A blocking shared_lock here was the
     // root cause of the periodic event-loop freeze + SIGABRT cycle on
@@ -673,33 +751,37 @@ std::vector<btc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
     // chain (~30+s), an incoming SHAREREQ on the IO thread would block
     // here, the watchdog would fire after 30s of io_context unresponsive,
     // and systemd would restart.
-    //
-    // Empty reply does NOT cause peer disconnect — p2pool's downloader
-    // (node.py:120) picks a random peer per request and retries; an empty
-    // hit just shifts to a different peer next iteration.
     std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
+        // Previously returned {} here. That made this node an intermittent
+        // BLACK HOLE: whenever the compute thread held the exclusive lock (a
+        // large fraction of the time on a big chain under the fold self-check),
+        // EVERY ancestor request got an empty "success", and a requesting
+        // python p2pool peer that had us as its only/primary peer re-requested
+        // the same parent forever and never converged (kr1z1s desync, 2026-09).
+        // Serve the request from the immutable LevelDB history instead — no
+        // tracker lock needed. The peer gets real shares and fills its gap.
         static int defer_log = 0;
         if (defer_log++ % 50 == 0)
-            LOG_INFO << "[handle_get_share] tracker busy — returning empty to "
-                     << peer_addr.to_string()
-                     << " (peer will retry against another peer)";
-        return {};
+            LOG_INFO << "[handle_get_share] tracker busy — serving "
+                     << hashes.size() << " request(s) from storage for "
+                     << peer_addr.to_string();
+        return serve_shares_from_storage(hashes, parents, stops, peer_addr);
     }
 
-    parents = std::min(parents, (uint64_t)1000/hashes.size());
 	std::vector<btc::ShareType> shares;
+	std::vector<uint256> storage_fallback;  // requested hashes not in the hot tracker
 	for (const auto& handle_hash : hashes)
 	{
 		if (!m_chain->contains(handle_hash))
 		{
-			static int miss_log = 0;
-			if (miss_log++ < 5)
-				LOG_WARNING << "[handle_get_share] hash NOT in chain: "
-				            << handle_hash.ToString().substr(0, 16)
-				            << " chain_size=" << m_chain->size()
-				            << " tracker_chain_size=" << m_tracker.chain.size();
+			// Deep ancestor pruned out of the hot in-memory tracker but still
+			// in LevelDB (never pruned). Defer it to the storage path below so a
+			// peer filling a deep gap gets real shares instead of a silent skip
+			// (the second half of the black-hole class the try_to_lock miss above
+			// covers). This is the common case for a 5000+ deep sync gap.
+			storage_fallback.push_back(handle_hash);
 			continue;
 		}
 		uint64_t n = std::min(parents+1, (uint64_t) m_chain->get_height(handle_hash));
@@ -713,17 +795,31 @@ std::vector<btc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 		}
 	}
 
-	if (!shares.empty())
-	{
-		LOG_INFO << "[Pool] Sending " << shares.size() << " shares to " << peer_addr.to_string();
-	}
 	// #1130: hand back OWNED copies. Until here `shares` aliased raw
 	// pointers the sharechain owns and frees under m_tracker_mutex; the
 	// sharereq handler (protocol_actual/legacy) serializes them AFTER this
 	// lock is released, so a concurrent think()/prune would free the share
 	// mid-pack — a use-after-free / double-free. clone() gives the caller
 	// independent memory it destroy()s. Same borrow-vs-own rule as #1131/#1163.
+	// (The storage-fallback shares appended below are already owned copies.)
 	for (auto& s : shares) s = s.clone();
+
+	// Serve any hot-tracker misses from immutable storage history. Release the
+	// tracker lock first — storage reads never need it, and holding the shared
+	// lock across LevelDB IO would needlessly extend contention with the
+	// compute thread.
+	if (!storage_fallback.empty())
+	{
+		lock.unlock();
+		auto from_db = serve_shares_from_storage(storage_fallback, parents, stops, peer_addr);
+		for (auto& s : from_db)
+			shares.push_back(s);
+	}
+
+	if (!shares.empty())
+	{
+		LOG_INFO << "[Pool] Sending " << shares.size() << " shares to " << peer_addr.to_string();
+	}
 	return shares;
 }
 
