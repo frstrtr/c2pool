@@ -26,6 +26,7 @@
 #include <impl/bip110/coin/inbound_listener.hpp>   // coin-p2p INBOUND accept path (:8333)
 #include <impl/bip110/coin/chain_seeds.hpp>
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
+#include <impl/bip110/coin/block_json.hpp>         // explorer getblock verbosity=2 JSON
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
 #include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
 #include <impl/bip110/stratum/work_source.hpp>
@@ -202,6 +203,7 @@ int run_embedded(bool coin_p2p_discover,
                  bool serve_mempool_txs,
                  bool sharechain_enabled,
                  const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes,
+                 bool explorer_enabled = true,
                  const std::string& coin_externalip = std::string())
 {
     core::log::Logger::init();
@@ -270,6 +272,12 @@ int run_embedded(bool coin_p2p_discover,
         return Hash(packed.get_span());
     };
     constexpr uint32_t BIP110_KEEP_DEPTH = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
+
+    // Explorer raw-block retention window (heights kept for /api/explorer
+    // getblock body lookups). 288 ≈ 2 days at 10-min blocks — matches the LTC
+    // lane default (main_ltc.cpp explorer_depth_ltc). Retention is flag-gated on
+    // explorer_enabled: storage only, never a consensus/reward path.
+    constexpr uint32_t EXPLORER_DEPTH = 288;
 
     // ── M2 MINING: stratum server + BLAKE2b Sv1 work source (miner-facing) ──
     // submit_block_fn relays a won 164-byte v2 block to the FORK peers over the
@@ -888,7 +896,8 @@ int run_embedded(bool coin_p2p_discover,
     // FIRST (so the post-tip mempool passes see the applied block), mirroring
     // main_btc.cpp. This deepens the T2 pricing view one block at a time.
     coin_node.full_block.subscribe(
-        [&header_chain, &utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH]
+        [&header_chain, &utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH,
+         explorer_enabled, EXPLORER_DEPTH]
         (const bip110::coin::BlockType& block)
         {
             auto packed_hdr = pack(static_cast<const bip110::coin::BlockHeaderType&>(block));
@@ -916,6 +925,20 @@ int run_embedded(bool coin_p2p_discover,
                 utxo_db.put_block_undo(height, undo);
                 utxo_cache.flush(block_hash, height);
                 utxo_cache.prune_undo(height, BIP110_KEEP_DEPTH);
+                // Explorer raw-block retention (flag-gated, pruned to depth). The
+                // bip110 node already downloads every full block for its UTXO
+                // view; keep the last EXPLORER_DEPTH bodies for /api/explorer
+                // getblock. Storage only — no consensus/reward/coinbase change.
+                if (explorer_enabled) {
+                    PackStream ps;
+                    ps << block;
+                    auto span = ps.get_span();
+                    std::vector<uint8_t> raw(
+                        reinterpret_cast<const uint8_t*>(span.data()),
+                        reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+                    utxo_db.put_raw_block(height, raw);
+                    utxo_db.prune_raw_blocks(height, EXPLORER_DEPTH);
+                }
                 mempool.set_tip_height(height);
                 LOG_INFO << "[EMB-BIP110] UTXO connect: h=" << height
                          << " txs=" << block.m_txs.size()
@@ -1392,6 +1415,226 @@ int run_embedded(bool coin_p2p_discover,
         // rest_web_currency_info "BIP110" branch brand it; the BITCOIN enum alone
         // would render as Bitcoin).
         mi->set_coin_label("BIP110");
+
+        // ── Explorer API callbacks (loopback-only, read-only) ─────────────────
+        // Enable the node /api/explorer surface that explorer.py --c2pool
+        // consumes. This is the ONLY caller of set_explorer_enabled on this lane
+        // (main_ltc.cpp is the reference); without it http_session's gate answers
+        // {"error":"Explorer not enabled"}. All feeds are display-only reads over
+        // the header chain / retained raw blocks / mempool snapshot — no
+        // consensus/reward/share/coinbase/wire path is touched. #99 SPV bounds:
+        // fields the node cannot serve are named-refused, never faked.
+        //
+        // Chain-key trap: explorer.py always sends ?chain=bip110, but the node's
+        // own primary_chain_key() returns "btc" on a BITCOIN-enum lane (the
+        // default when ?chain= is absent). Accept "bip110", "btc", and "" — this
+        // is a single-chain node, so any of them means the bip110 chain.
+        if (explorer_enabled) {
+            mi->set_explorer_enabled(true);
+            auto chain_ok = [](const std::string& c) {
+                return c.empty() || c == "bip110" || c == "btc";
+            };
+            auto* hc  = &header_chain;
+            auto* udb = &utxo_db;
+            auto* mp  = &mempool;
+
+            // getblockchaininfo — header-chain derived (always servable).
+            mi->set_explorer_chaininfo_fn(
+                [hc, chain_ok, EXPLORER_DEPTH](const std::string& chain) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Unknown chain or chain not enabled"}};
+                    nlohmann::json r;
+                    r["chain"]   = "main";
+                    r["blocks"]  = hc->height();
+                    r["headers"] = static_cast<uint64_t>(hc->size());
+                    r["explorer_depth"] = EXPLORER_DEPTH;
+                    auto t = hc->tip();
+                    r["bestblockhash"] = t ? t->block_hash.GetHex() : "";
+                    if (t) {
+                        auto target = bip110::coin::target_from_bits(t->header.m_bits);
+                        double diff = target.IsNull() ? 0.0
+                            : hc->params().pow_limit.getdouble() / target.getdouble();
+                        r["difficulty"] = diff;
+                    }
+                    return r;
+                });
+
+            // getblockhash — header-chain derived (always servable within chain).
+            mi->set_explorer_blockhash_fn(
+                [hc, chain_ok](uint32_t height, const std::string& chain) -> std::string {
+                    if (!chain_ok(chain)) return {};
+                    auto e = hc->get_header_by_height(height);
+                    if (e) return e->block_hash.GetHex();
+                    return {};
+                });
+
+            // getblock — deserialize retained raw block, run block_to_explorer_json.
+            // #99: below the retention depth OR body not yet stored → named refusal.
+            mi->set_explorer_getblock_fn(
+                [hc, udb, chain_ok, EXPLORER_DEPTH](const std::string& hash_hex,
+                                    const std::string& chain) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Unknown chain or chain not enabled"}};
+                    uint256 blk_hash;
+                    blk_hash.SetHex(hash_hex);
+                    auto entry = hc->get_header(blk_hash);
+                    if (!entry)
+                        return nlohmann::json{{"error", "Block not in header chain"}};
+                    uint32_t height = entry->height;
+                    uint32_t tip = hc->height();
+                    if (tip > EXPLORER_DEPTH && height < tip - EXPLORER_DEPTH)
+                        return nlohmann::json{
+                            {"error", "Block not in explorer range"},
+                            {"explorer_depth", EXPLORER_DEPTH}};
+                    auto raw = udb->get_raw_block(height);
+                    if (!raw)
+                        return nlohmann::json{{"error", "Raw block not stored yet"}};
+                    bip110::coin::BlockType block;
+                    try {
+                        PackStream ps(*raw);
+                        ps >> block;
+                    } catch (...) {
+                        return nlohmann::json{{"error", "Failed to deserialize block"}};
+                    }
+                    bip110::coin::ExplorerChainParams params;
+                    params.bech32_hrp = "bc";
+                    params.p2pkh_ver  = 0x00;
+                    params.p2sh_ver   = 0x05;
+                    params.chain_name = "main";
+                    try {
+                        return bip110::coin::block_to_explorer_json(block, height, blk_hash, params);
+                    } catch (const std::exception& e) {
+                        return nlohmann::json{{"error", std::string("Block decode error: ") + e.what()}};
+                    } catch (...) {
+                        return nlohmann::json{{"error", "Block decode error (unknown)"}};
+                    }
+                });
+
+            // getmempoolinfo — summary stats + feerate histogram.
+            mi->set_explorer_mempoolinfo_fn(
+                [mp, chain_ok](const std::string& chain) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Mempool not available for chain"}};
+                    auto snap = mp->get_summary();
+                    time_t now = std::time(nullptr);
+                    struct Bucket { double lo, hi; size_t count{0}; size_t bytes{0}; };
+                    std::vector<Bucket> buckets = {{0,1},{1,5},{5,20},{20,100},{100,1e9}};
+                    for (const auto& e : snap.entries) {
+                        double fr = e.feerate();
+                        for (auto& b : buckets) {
+                            if (fr >= b.lo && fr < b.hi) { ++b.count; b.bytes += e.base_size; break; }
+                        }
+                    }
+                    nlohmann::json hist = nlohmann::json::array();
+                    for (const auto& b : buckets) {
+                        hist.push_back({
+                            {"min_feerate", b.lo},
+                            {"max_feerate", b.hi >= 1e9 ? nlohmann::json("inf") : nlohmann::json(b.hi)},
+                            {"count", b.count}, {"bytes", b.bytes}});
+                    }
+                    return nlohmann::json{
+                        {"size", snap.tx_count},
+                        {"bytes", snap.total_bytes},
+                        {"total_weight", snap.total_weight},
+                        {"total_fees", snap.total_fees},
+                        {"fee_known_count", snap.fee_known_count},
+                        {"fee_unknown_count", snap.tx_count - snap.fee_known_count},
+                        {"min_feerate", snap.min_feerate},
+                        {"max_feerate", snap.max_feerate},
+                        {"median_feerate", snap.median_feerate},
+                        {"avg_feerate", snap.avg_feerate},
+                        {"oldest_age_sec", (snap.oldest_time > 0 && now > snap.oldest_time)
+                                              ? (now - snap.oldest_time) : 0},
+                        {"fee_histogram", hist},
+                        {"chain", "bip110"}};
+                });
+
+            // getrawmempool — txid list or verbose entries.
+            mi->set_explorer_rawmempool_fn(
+                [mp, chain_ok](const std::string& chain, bool verbose, uint32_t limit) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Mempool not available for chain"}};
+                    if (!verbose) {
+                        auto txids = mp->all_txids();
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (const auto& id : txids) arr.push_back(id.GetHex());
+                        return arr;
+                    }
+                    auto snap = mp->get_summary();
+                    time_t now = std::time(nullptr);
+                    nlohmann::json arr = nlohmann::json::array();
+                    uint32_t count = 0;
+                    for (const auto& e : snap.entries) {
+                        if (count >= limit) break;
+                        arr.push_back({
+                            {"txid", e.txid.GetHex()},
+                            {"size", e.base_size},
+                            {"weight", e.weight},
+                            {"fee", e.fee},
+                            {"fee_known", e.fee_known},
+                            {"feerate", e.feerate()},
+                            {"time_added", e.time_added},
+                            {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                            {"n_vin", e.n_vin},
+                            {"n_vout", e.n_vout}});
+                        ++count;
+                    }
+                    return arr;
+                });
+
+            // getmempoolentry — single tx full detail with vin/vout.
+            mi->set_explorer_mempoolentry_fn(
+                [mp, chain_ok](const std::string& txid_hex, const std::string& chain) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Mempool not available for chain"}};
+                    uint256 txid;
+                    txid.SetHex(txid_hex);
+                    auto opt = mp->get_entry(txid);
+                    if (!opt) return nlohmann::json{{"error", "Transaction not in mempool"}};
+                    const auto& e = *opt;
+                    time_t now = std::time(nullptr);
+                    nlohmann::json vin_arr = nlohmann::json::array();
+                    for (const auto& inp : e.tx.vin) {
+                        vin_arr.push_back({
+                            {"prevout_hash", inp.prevout.hash.GetHex()},
+                            {"prevout_n", inp.prevout.index},
+                            {"sequence", inp.prevout.index == 0xffffffff
+                                            ? "ffffffff" : std::to_string(inp.sequence)}});
+                    }
+                    nlohmann::json vout_arr = nlohmann::json::array();
+                    for (size_t i = 0; i < e.tx.vout.size(); ++i) {
+                        const auto& out = e.tx.vout[i];
+                        std::vector<unsigned char> script(out.scriptPubKey.m_data.begin(),
+                                                          out.scriptPubKey.m_data.end());
+                        auto cls = core::classify_script(script, "bc", 0x00, 0x05);
+                        nlohmann::json vout_obj = {
+                            {"n", i},
+                            {"value_sat", out.value},
+                            {"scriptPubKey_hex", cls.hex},
+                            {"type", cls.type}};
+                        if (!cls.addresses.empty()) vout_obj["address"] = cls.addresses[0];
+                        if (cls.addresses.size() > 1) vout_obj["addresses"] = cls.addresses;
+                        vout_arr.push_back(std::move(vout_obj));
+                    }
+                    return nlohmann::json{
+                        {"txid", e.txid.GetHex()},
+                        {"size", e.base_size},
+                        {"witness_size", e.witness_size},
+                        {"weight", e.weight},
+                        {"fee", e.fee},
+                        {"fee_known", e.fee_known},
+                        {"feerate", e.feerate()},
+                        {"time_added", e.time_added},
+                        {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                        {"vin", vin_arr},
+                        {"vout", vout_arr},
+                        {"chain", "bip110"}};
+                });
+
+            LOG_INFO << "[EMB-BIP110] Explorer API wired (loopback-only): header browse + "
+                        "found-block coinbase + mempool, retention depth=" << EXPLORER_DEPTH;
+        }
+
         // F2 — currency_info share_version. The MI default is 35 (the V35/V36
         // ratchet cross default for the LTC family); bip110 never runs the
         // AutoRatchet and its mint is hardwired v36 (see the v36 header/share
@@ -1993,6 +2236,10 @@ int main(int argc, char** argv)
     // starts with --bip110-sharechain; absent, the binary is the M2 header-
     // follower byte-for-byte. IRREVERSIBLE first-outbound is behind this flag. ──
     bool sharechain_enabled = false;
+    // Explorer /api/explorer surface (default ON — loopback-only + read-only, so
+    // exposing it is safe; --no-explorer disables both the gate and raw-block
+    // retention). Consumed by explorer.py --coin bip110 --c2pool ...
+    bool explorer_enabled = true;
     {
         namespace cs = c2pool::settings;
         cs::ResolvedConfig rc;
@@ -2061,6 +2308,8 @@ int main(int argc, char** argv)
         else if (arg == "--serve-mempool-txs") { serve_mempool_txs = true; }
         else if (arg == "--no-serve-mempool-txs") { serve_mempool_txs = false; }
         else if (arg == "--bip110-sharechain") { sharechain_enabled = true; }
+        else if (arg == "--explorer") { explorer_enabled = true; }
+        else if (arg == "--no-explorer") { explorer_enabled = false; }
         else if (arg == "--sharechain-addnode" && i + 1 < argc) {
             // --sharechain-addnode HOST:PORT — repeatable. Explicit sharechain
             // (pool-P2P, :9337) peer override; overrides the OurBeacon default
@@ -2082,7 +2331,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs, sharechain_enabled, sharechain_addnodes, coin_externalip);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs, sharechain_enabled, sharechain_addnodes, explorer_enabled, coin_externalip);
     }
 
     print_banner(argv[0]);

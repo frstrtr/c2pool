@@ -203,13 +203,36 @@ COIN_PROFILES = {
         "coinbase": "generic",
         "completeness": "basic",  # TODO: cashaddr encoding
     },
+    "bip110": {
+        "name": "Bitcoin BIP-110", "unit": "BIP110", "algo": "BLAKE2b",
+        "networks": {
+            # BIP-110 is a Bitcoin fork; addresses stay Bitcoin-shaped.
+            "mainnet": {"p2pkh": 0x00, "p2sh": 0x05, "hrp": "bc"},
+            "testnet": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": "tb"},
+            "regtest": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": "bcrt"},
+        },
+        # No public BIP-110 explorer exists (blockchair / mempool.space do not
+        # index the BLAKE2b fork); c2pool is the de-facto explorer.
+        "blockchair": {"mainnet": None, "testnet": None},
+        "subversion": ["bip110"],   # node subver "/c2pool:0.1/bip110/frstrtr/"
+        "symbols": ["bip110"],      # /web/currency_info symbol "BIP110" (lowercased)
+        "genesis": {
+            # BIP-110 keeps Bitcoin's genesis (the BLAKE2b fork activates at
+            # height 961640).  The dict-order genesis auto-detect resolves this
+            # hash to "btc" first (btc precedes bip110), so a bip110 node is
+            # identified via subversion / symbols / --coin, never genesis alone.
+            "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        },
+        "coinbase": "generic",
+        "completeness": "full",
+    },
 }
 
 # Aliases accepted on the --coin CLI flag.
 COIN_ALIASES = {
     "litecoin": "ltc", "dogecoin": "doge", "bitcoin": "btc",
     "digibyte": "dgb", "bitcoincash": "bch", "bitcoin-cash": "bch",
-    "bcash": "bch",
+    "bcash": "bch", "bip-110": "bip110", "blake2b": "bip110",
 }
 
 
@@ -567,6 +590,11 @@ def decode_scriptsig(raw_hex):
     # so the tag search area may be empty — structural detection handles that.
     tag_search = remaining[auxpow_end:]
     known_tags = [
+        # Coin-specific c2pool tags first so the exact tag is decoded (the search
+        # breaks on first match). /c2pool-bip110/ is the BLAKE2b fork work-source
+        # tag; /c2pool-btc/ the BTC lane. Both still contain "c2pool", so the
+        # found-block highlight fires either way — this only sharpens the label.
+        b"/c2pool-bip110/", b"/c2pool-btc/",
         b"/c2pool/",
         b"/P2Pool v36/", b"/P2Pool-Scrypt/", b"/P2Pool/", b"/p2pool/",
         b"c2pool", b"p2pool",
