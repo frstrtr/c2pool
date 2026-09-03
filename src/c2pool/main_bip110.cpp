@@ -27,6 +27,7 @@
 #include <impl/bip110/coin/chain_seeds.hpp>
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
 #include <impl/bip110/coin/block_json.hpp>         // explorer getblock verbosity=2 JSON
+#include <impl/bip110/coin/explorer_getblock.hpp>  // explorer getblock full-then-partial decision (SSOT for the KAT)
 #include <impl/bip110/coin/block_confirm.hpp>      // found-block confirm/orphan resolver (B2 telemetry)
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
 #include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
@@ -1484,65 +1485,25 @@ int run_embedded(bool coin_p2p_discover,
                     if (!entry)
                         return nlohmann::json{{"error", "Block not in header chain"}};
 
-                    // DASH-shape (#1460/#99) header partial: every indexed header
-                    // answers; bodies stay honestly absent — never tx: [], never
-                    // fabricated sizes. The explorer drops any getblock JSON that
-                    // carries an "error" key, so an un-retained/out-of-window block
-                    // must still return header truth (no "error") to render a row.
-                    // Bodies only ADD detail in the 288-block window; they never
-                    // remove the header answer. Mirrors main_dash.cpp:4496-4563.
-                    auto header_partial = [hc](const bip110::coin::IndexEntry& e) -> nlohmann::json {
-                        nlohmann::json r;
-                        r["hash"]              = e.block_hash.GetHex();
-                        r["height"]            = e.height;
-                        r["version"]           = static_cast<int64_t>(e.header.m_version);
-                        r["previousblockhash"] = e.header.m_previous_block.GetHex();
-                        r["merkleroot"]        = e.header.m_merkle_root.GetHex();
-                        r["time"]              = e.header.m_timestamp;
-                        r["bits"]              = bip110::coin::detail::bits_to_hex_str(e.header.m_bits);
-                        r["nonce"]             = e.header.m_nonce;
-                        r["confirmations"]     = static_cast<int64_t>(hc->height()) - static_cast<int64_t>(e.height) + 1;
-                        if (auto nxt = hc->get_header_by_height(e.height + 1))
-                            r["nextblockhash"] = nxt->block_hash.GetHex();
-                        auto target = bip110::coin::target_from_bits(e.header.m_bits);
-                        if (!target.IsNull())
-                            r["difficulty"] = hc->params().pow_limit.getdouble() / target.getdouble();
-                        const char* why = "requires the block body; this SPV node retains headers only "
-                                          "(bodies kept for the last 288 blocks once received)";
-                        nlohmann::json unavailable = nlohmann::json::object();
-                        for (const char* f : {"tx", "nTx", "size", "strippedsize", "weight"})
-                            unavailable[f] = why;
-                        r["unavailable"] = unavailable;
-                        r["partial"] = true;
-                        return r;
-                    };
-
-                    uint32_t height = entry->height;
+                    // DASH-shape (#1460/#99) full-then-partial getblock. Every
+                    // indexed header answers; bodies stay honestly absent below the
+                    // 288-block retention window (never tx: [], never fabricated
+                    // sizes, never an "error" key so the row still renders). The
+                    // decision + header-partial builder are hoisted verbatim into
+                    // bip110::coin::explorer_getblock_body so the getblock KAT binds
+                    // the EXACT shipped logic. Mirrors main_dash.cpp:4496-4563.
                     uint32_t tip = hc->height();
-                    if (tip > EXPLORER_DEPTH && height < tip - EXPLORER_DEPTH)
-                        return header_partial(*entry);
-                    auto raw = udb->get_raw_block(height);
-                    if (!raw)
-                        return header_partial(*entry);
-                    bip110::coin::BlockType block;
-                    try {
-                        PackStream ps(*raw);
-                        ps >> block;
-                    } catch (...) {
-                        return header_partial(*entry);
-                    }
+                    std::optional<uint256> next_block_hash;
+                    if (auto nxt = hc->get_header_by_height(entry->height + 1))
+                        next_block_hash = nxt->block_hash;
                     bip110::coin::ExplorerChainParams params;
                     params.bech32_hrp = "bc";
                     params.p2pkh_ver  = 0x00;
                     params.p2sh_ver   = 0x05;
                     params.chain_name = "main";
-                    try {
-                        return bip110::coin::block_to_explorer_json(block, height, blk_hash, params);
-                    } catch (const std::exception&) {
-                        return header_partial(*entry);
-                    } catch (...) {
-                        return header_partial(*entry);
-                    }
+                    return bip110::coin::explorer_getblock_body(
+                        *entry, blk_hash, tip, next_block_hash,
+                        hc->params().pow_limit, *udb, EXPLORER_DEPTH, params);
                 });
 
             // getmempoolinfo — summary stats + feerate histogram.

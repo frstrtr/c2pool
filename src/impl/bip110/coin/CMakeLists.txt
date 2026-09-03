@@ -228,3 +228,40 @@ target_link_libraries(bip110_coin_reachability_kat
     Threads::Threads
 )
 add_test(NAME bip110_coin_reachability_kat COMMAND bip110_coin_reachability_kat)
+
+# bip110_explorer_getblock_kat: the explorer raw-block RETENTION + full-then-
+# partial getblock SERVE gate (DASH #1460/#99 parity). Binds the SHIPPED
+# primitives directly: core::coin::UTXOViewDB put/get/prune_raw_block (the
+# bounded 288-body window the full_block subscriber writes) and bip110::coin::
+# explorer_getblock_body / explorer_header_partial (hoisted verbatim out of the
+# main_bip110 set_explorer_getblock_fn closure). Proves: [A] a retained in-window
+# block serves the FULL body (tx array + size, no partial/unavailable/error);
+# [B] a block below the window degrades to an honest HEADER PARTIAL (partial:true
+# + named unavailable {tx,nTx,size,strippedsize,weight}, never a faked tx:[],
+# never an "error" key that would drop the row, confirmations exact); [C] an
+# in-window body-miss degrades identically; [D] prune keeps the window bounded to
+# ~288 recent bodies (daemonless storage bound). Pure decode/store, network-free,
+# reward-safe. Same link closure as the sibling coin KATs.
+add_executable(bip110_explorer_getblock_kat
+    test/bip110_explorer_getblock_kat.cpp
+)
+target_compile_definitions(bip110_explorer_getblock_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_explorer_getblock_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    ltc
+    ltc_coin
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
+)
+add_test(NAME bip110_explorer_getblock_kat COMMAND bip110_explorer_getblock_kat)
