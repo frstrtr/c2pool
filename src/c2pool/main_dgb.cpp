@@ -2347,6 +2347,26 @@ int run_node(const core::CoinParams& params, bool testnet,
     }
 
     std::cout << "[DGB] run-loop up: " << network_summary(params) << "\n";
+    // Restart-reorg / liveness safety-net: periodic clean_tracker() tick (5s).
+    // clean_tracker() runs think() inline (advancing verification + the restart-
+    // reorg supersede convergence) and prunes stale heads/tails. Without this tick
+    // think() fires ONLY on inbound share arrival, so a node with no live share
+    // flow never re-attempts a timed-out bootstrap download and never advances a
+    // warm-restart reorg — the consumer-side single-peer-wedge / stuck-tip
+    // liveness gap. Mirrors main_ltc.cpp:6682.
+    auto think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+    std::function<void(boost::system::error_code)> think_tick;
+    think_tick = [&, think_timer](boost::system::error_code ec) {
+        if (ec) return;
+        think_timer->expires_after(std::chrono::seconds(5));
+        think_timer->async_wait(think_tick);
+        try { p2p_node.clean_tracker(); }
+        catch (const std::exception& e) { LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what(); }
+        catch (...) { LOG_ERROR << "[CLEAN-TRACKER] unknown error"; }
+    };
+    think_timer->expires_after(std::chrono::seconds(5));
+    think_timer->async_wait(think_tick);
+
     std::cout << "[DGB] io_context running. Ctrl-C to stop." << std::endl;
 
     ioc.run();

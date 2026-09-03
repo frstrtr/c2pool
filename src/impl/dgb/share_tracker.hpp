@@ -123,6 +123,27 @@ struct DecoratedData
     }
 };
 
+// ── Restart-reorg supersede hint (see LTC #1357) ─────────────────────────
+// A warm-restarted node that loads its persisted, fully-verified sharechain
+// then peers with a higher-work network STICKS on the old head: TailScore
+// compares chain_len FIRST and score() short-circuits below CHAIN_LENGTH, so a
+// warm-loaded full-CL verified tail beats any challenger whose VERIFIED height
+// is still below CHAIN_LENGTH — and the challenger never verifies to CHAIN_LENGTH
+// because think() only extends an unrooted segment ~8 deep. This hint lets the
+// EXISTING think() argmax see the challenger (deeper backfill + a bounded
+// elevated verify budget through the ordinary attempt_verify loop); it never
+// bypasses verification, never scores unverified work, and is a no-op on a
+// healthy node whose head already carries the most work.
+struct SupersedeHint
+{
+    bool     active{false};
+    uint256  target_head;
+    uint256  target_segment_last;
+    int      budget{0};
+    uint288  challenger_work;
+    uint288  incumbent_work;
+};
+
 // --- Result types ---
 
 struct TrackerThinkResult
@@ -690,16 +711,64 @@ public:
         return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
     }
 
+    // -- Restart-reorg supersede detector (see SupersedeHint) --
+    SupersedeHint compute_supersede_hint(const uint256& incumbent_best, int budget)
+    {
+        SupersedeHint hint;
+        if (incumbent_best.IsNull() || !verified.contains(incumbent_best))
+            return hint;
+        const auto CL = static_cast<int32_t>(PoolConfig::chain_length());
+        const uint288 incumbent_work = verified.get_work(incumbent_best);
+        uint256 best_ch; uint288 best_ch_work; bool found = false;
+        for (auto& [head, tail] : chain.get_heads())
+        {
+            if (head == incumbent_best) continue;
+            if (!chain.contains(head)) continue;
+            try { if (chain.is_child_of(incumbent_best, head)) continue; }
+            catch (...) {}
+            if (verified.get_acc_height(head) >= CL) continue;
+            uint288 w;
+            try { w = chain.get_work(head); } catch (...) { continue; }
+            if (!found || w > best_ch_work) { best_ch_work = w; best_ch = head; found = true; }
+        }
+        if (found && incumbent_work < best_ch_work)
+        {
+            hint.active = true;
+            hint.target_head = best_ch;
+            try { hint.target_segment_last = chain.get_last(best_ch); } catch (...) {}
+            hint.budget = budget;
+            hint.challenger_work = best_ch_work;
+            hint.incumbent_work = incumbent_work;
+        }
+        return hint;
+    }
+
+    // -- Restart-reorg liveness: challenger-first Phase-2 scheduling --
+    size_t prioritize_challenger_heads(
+        std::vector<std::pair<uint256, uint256>>& heads,
+        const SupersedeHint& supersede)
+    {
+        if (!supersede.active) return 0;
+        auto is_ch = [&](const std::pair<uint256, uint256>& hv) -> bool {
+            try { return chain.get_last(hv.first) == supersede.target_segment_last; }
+            catch (...) { return false; }
+        };
+        auto mid = std::stable_partition(heads.begin(), heads.end(), is_ch);
+        return static_cast<size_t>(std::distance(heads.begin(), mid));
+    }
+
     // -- Best-chain selection with verification and punishment --
     // bootstrap_mode: when true, removes verification budget limit so the
     // entire chain is verified in one call.  Used during initial sync when
     // stratum isn't serving work — no IO needs the tracker lock.
     // Matches p2pool where think() runs synchronously on the reactor and
     // blocks everything else until verification completes.
+    // supersede: restart-reorg hint (default-inactive; healthy path byte-unchanged).
     TrackerThinkResult think(const std::function<int32_t(uint256)>& block_rel_height_func,
                              const uint256& previous_block,
                              uint32_t bits,
-                             bool bootstrap_mode = false)
+                             bool bootstrap_mode = false,
+                             const SupersedeHint& supersede = SupersedeHint{})
     {
         // p2pool: desired is a set of (peer_addr, hash, max_timestamp, min_target)
         // The timestamp is used to filter stale requests at return time.
@@ -913,7 +982,21 @@ public:
         // now, so budgeting is a safety net for cold starts only.
         constexpr int THINK_VERIFY_BUDGET = 100;
         int budget_remaining = bootstrap_mode ? INT_MAX : THINK_VERIFY_BUDGET;
+        int elevated_remaining = supersede.active ? supersede.budget : 0;
+        if (supersede.active)
+            LOG_INFO << "[SUPERSEDE] elevated verify armed: target="
+                     << supersede.target_head.GetHex().substr(0,16)
+                     << " budget=" << supersede.budget;
         m_think_needs_continue = false;
+
+        const auto think_wall_t0 = std::chrono::steady_clock::now();
+        constexpr int64_t THINK_MAX_WALL_MS = 2000;
+        auto think_wall_exceeded = [&]() -> bool {
+            return !bootstrap_mode &&
+                   std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - think_wall_t0).count()
+                       >= THINK_MAX_WALL_MS;
+        };
         {
             static int p2_skip_log = 0;
             if (p2_skip_log++ % 20 == 0)
@@ -932,9 +1015,22 @@ public:
                 auto wb = verified.contains(b.first) ? verified.get_work(b.first) : uint288{};
                 return wa > wb;  // highest work first
             });
+        prioritize_challenger_heads(sorted_vheads, supersede);
         for (auto& [head_hash, tail_hash] : sorted_vheads)
         {
-            if (budget_remaining <= 0) {
+            if (think_wall_exceeded()) {
+                m_think_needs_continue = true;
+                LOG_INFO << "[think-P2] wall-clock cap hit between heads, deferring remainder";
+                break;
+            }
+
+            bool is_challenger = false;
+            if (supersede.active) {
+                try { is_challenger = (chain.get_last(head_hash) == supersede.target_segment_last); }
+                catch (...) { is_challenger = false; }
+            }
+
+            if (budget_remaining <= 0 && !(is_challenger && elevated_remaining > 0)) {
                 m_think_needs_continue = true;
                 break;
             }
@@ -959,7 +1055,8 @@ public:
             // short of CHAIN_LENGTH (want), capped by how many the rooted peer
             // can actually supply (can); to_get = min(want, can).
             auto CL = static_cast<int32_t>(PoolConfig::chain_length());
-            auto want = std::max(CL - head_height, 0);
+            auto want_depth = is_challenger ? (2 * CL + 10) : CL;
+            auto want = std::max(want_depth - head_height, 0);
             auto can = last_last_hash.IsNull()
                 ? last_height
                 : std::max(last_height - 1 - CL, 0);
@@ -991,9 +1088,18 @@ public:
                 int p2_verified_count = 0;
                 for (auto [hash, data] : chain_view)
                 {
-                    if (budget_remaining <= 0) {
+                    bool can_spend = budget_remaining > 0
+                                     || (is_challenger && elevated_remaining > 0);
+                    if (!can_spend) {
                         m_think_needs_continue = true;
                         LOG_INFO << "[think-P2] budget exhausted after " << p2_verified_count
+                                 << " verifications, deferring remainder"
+                                 << (is_challenger ? " (challenger elevated pool spent)" : "");
+                        break;
+                    }
+                    if ((p2_verified_count & 7) == 0 && think_wall_exceeded()) {
+                        m_think_needs_continue = true;
+                        LOG_INFO << "[think-P2] wall-clock cap hit after " << p2_verified_count
                                  << " verifications, deferring remainder";
                         break;
                     }
@@ -1068,7 +1174,8 @@ public:
                         break;
                     ++p2_verified_count;
                     if (!was_already_verified) {
-                        --budget_remaining;
+                        if (budget_remaining > 0) --budget_remaining;
+                        else if (is_challenger && elevated_remaining > 0) --elevated_remaining;
                     }
                     // Throttled progress log: contabo freeze-diag (2026-05-24) caught
                     // this loop wedging the io_context for 2-7.5s at a time when emit
@@ -1085,8 +1192,13 @@ public:
                 }
             }
 
-            // Request more shares if verified chain is short
-            if (head_height < static_cast<int32_t>(PoolConfig::chain_length()) && !last_last_hash.IsNull())
+            // Request more shares if verified chain is short (challenger: to 2*CL+10).
+            auto main_ht_req = chain.get_height(head_hash);
+            auto CL_req = static_cast<int32_t>(PoolConfig::chain_length());
+            bool want_more_parents = is_challenger
+                ? (main_ht_req < 2 * CL_req + 10)
+                : (head_height < CL_req);
+            if (want_more_parents && !last_last_hash.IsNull())
             {
                 // Option A: check MAIN chain height (not verified height).
                 // If main chain is already in pruning zone, the unverified

@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <random>
@@ -183,6 +184,20 @@ protected:
     // Top-5 scored heads from last think() — used by clean_tracker()
     // to protect the best chains from head pruning (p2pool node.py:363).
     std::vector<uint256> m_last_top5_heads;
+
+    // Restart-reorg supersede hint (see share_tracker SupersedeHint). Names a
+    // genuine higher-work fork a warm-restarted node is converging onto; used by
+    // clean_tracker() to exempt the challenger segment from GC. Inactive when healthy.
+    dgb::SupersedeHint m_supersede_hint;
+    // Supersede-convergence liveness: denylist an unconvergeable challenger after
+    // SUPERSEDE_STALL_LIMIT stalled cycles (TTL-bounded) to stop the elevated-verify
+    // treadmill and re-enable GC.
+    struct SupersedeProgress { int32_t last_acc_height{-1}; int stall_cycles{0}; };
+    std::map<uint256, SupersedeProgress> m_supersede_progress;
+    std::map<uint256, std::chrono::steady_clock::time_point> m_supersede_denylist;
+    static constexpr int SUPERSEDE_STALL_LIMIT = 20;
+    static constexpr std::chrono::minutes SUPERSEDE_DENYLIST_TTL{60};
+    dgb::SupersedeHint gate_supersede_convergence(dgb::SupersedeHint hint);
 
     // Buffer of newly verified share hashes, flushed to LevelDB periodically
     std::vector<uint256> m_verified_flush_buf;
