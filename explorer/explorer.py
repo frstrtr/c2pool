@@ -45,6 +45,30 @@ Usage:
     # Back-compat: legacy LTC + DOGE two-chain mode (unchanged defaults):
     python3 explorer.py [--ltc-host H --ltc-port P] [--doge-host H --doge-port P]
 
+Reverse-proxy sub-path mount (e.g. serve at <coin>.voidbind.com/explorer, same
+host as the dashboard, no separate subdomain):
+    python3 explorer.py --coin <coin> --c2pool http://127.0.0.1:8086/api/explorer \
+                        --url-prefix /explorer
+  Every emitted URL (nav links, the search form, footer API links, the SSE
+  EventSource) is then prefixed, so a click resolves under /explorer/ and the
+  proxy forwards it to the explorer instead of the dashboard. --url-prefix ""
+  (the default) is byte-identical to a plain root mount. The proxy may instead
+  set the X-Forwarded-Prefix header, which overrides --url-prefix per-request;
+  the explorer self-strips the prefix from the request path, so both a
+  prefix-preserving (proxy_pass .../8888;) and a prefix-stripping
+  (proxy_pass .../8888/;) nginx mount work. Coin-generic nginx snippet:
+
+    location = /explorer { return 301 /explorer/; }
+    location /explorer/ {
+        proxy_pass http://127.0.0.1:8888;      # no URI part: /explorer/... passes
+                                               # through; the explorer self-strips it
+        proxy_set_header X-Forwarded-Prefix /explorer;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;                   # SSE: /explorer/api/stream
+        proxy_read_timeout 3600s;
+    }
+
 Requires: Python 3.8+, no external dependencies (uses only stdlib).
 """
 
@@ -1470,15 +1494,25 @@ def blockchair_link(engine, coin_id, item_type, value, display=None):
     return escape(str(display))
 
 
-def render_page(title, body, chain, engine):
+def _norm_prefix(p):
+    """Normalize a reverse-proxy base path: '' or '/explorer' (no trailing slash)."""
+    p = (p or "").strip()
+    if not p or p == "/":
+        return ""
+    if not p.startswith("/"):
+        p = "/" + p
+    return p.rstrip("/")
+
+
+def render_page(title, body, chain, engine, prefix=""):
     chain_nav = ""
     for cid in engine.coins:
         active = "active" if cid == chain else ""
-        chain_nav += f'<a href="/?chain={cid}" class="{active}">{escape(engine.chain_label(cid))}</a>\n'
+        chain_nav += f'<a href="{prefix}/?chain={cid}" class="{active}">{escape(engine.chain_label(cid))}</a>\n'
     chain_nav += f"""
-    <a href="/found?chain={chain}">Pool Blocks</a>
-    <a href="/mempool?chain={chain}">Mempool</a>
-    <a href="/api/status">API Status</a>
+    <a href="{prefix}/found?chain={chain}">Pool Blocks</a>
+    <a href="{prefix}/mempool?chain={chain}">Mempool</a>
+    <a href="{prefix}/api/status">API Status</a>
     <span id="sound-toggle" style="cursor:pointer;margin-left:12px;font-size:18px" title="Toggle block sounds">&#128263;</span>
     """
     footer_label = engine.footer_label()
@@ -1489,7 +1523,7 @@ def render_page(title, body, chain, engine):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 </head><body>
 <div class="nav">{chain_nav}
-<form style="display:inline" method="get" action="/block">
+<form style="display:inline" method="get" action="{prefix}/block">
 <input type="text" name="q" placeholder="Block height or hash..." />
 <input type="hidden" name="chain" value="{chain}" />
 <button class="btn" type="submit">Go</button>
@@ -1500,15 +1534,15 @@ def render_page(title, body, chain, engine):
 <div class="dim" style="margin-top:40px;font-size:11px">
 <span id="live-status">&#9679; connecting...</span> |
 {escape(footer_label)}
-| <a href="/api/chain_info?chain={chain}">chain_info</a>
-| <a href="/api/recent?chain={chain}&count=50">recent(50)</a>
-| <a href="/api/found?chain={chain}&depth=200">found(200)</a>
+| <a href="{prefix}/api/chain_info?chain={chain}">chain_info</a>
+| <a href="{prefix}/api/recent?chain={chain}&count=50">recent(50)</a>
+| <a href="{prefix}/api/found?chain={chain}&depth=200">found(200)</a>
 </div>
 <script>
 (function() {{
   var chain = "{chain}";
   var statusEl = document.getElementById("live-status");
-  var es = new EventSource("/api/stream?chain=all");
+  var es = new EventSource("{prefix}/api/stream?chain=all");
   var soundEnabled = localStorage.getItem("blockSound") === "true";
   var soundBtn = document.getElementById("sound-toggle");
   if (soundBtn) {{
@@ -1561,7 +1595,7 @@ def render_page(title, body, chain, engine):
     setTimeout(function(){{ toast.style.opacity = "0"; }}, 3000);
     setTimeout(function(){{ toast.remove(); }}, 3500);
     var path = window.location.pathname;
-    if (path === "/" || path === "/index.html" || path === "/found") {{
+    if (path === "{prefix}/" || path === "{prefix}/index.html" || path === "{prefix}/found") {{
       setTimeout(function(){{ window.location.reload(); }}, 1500);
     }}
   }});
@@ -1596,10 +1630,10 @@ def render_tag(tag):
     return f'<span class="{cls}">{escape(tag)}</span>'
 
 
-def render_dashboard(engine, chain):
+def render_dashboard(engine, chain, prefix=""):
     info = engine.get_chain_info(chain)
     if "error" in info:
-        return render_page("Explorer", f'<p class="red">Daemon offline: {escape(str(info["error"]))}</p>', chain, engine)
+        return render_page("Explorer", f'<p class="red">Daemon offline: {escape(str(info["error"]))}</p>', chain, engine, prefix)
 
     blocks = engine.get_recent_blocks(30, chain)
     prof = engine.profile(chain)
@@ -1615,7 +1649,7 @@ def render_dashboard(engine, chain):
     <tr><td>Headers</td><td>{info.get('headers', '?')}</td></tr>
     <tr><td>Chain</td><td>{info.get('chain', '?')}</td></tr>
     <tr><td>Difficulty</td><td>{float(info.get('difficulty', 0)):,.4f}</td></tr>
-    <tr><td>Best block</td><td class="mono"><a href="/block?q={info.get('bestblockhash', '')}&chain={chain}">{info.get('bestblockhash', '?')[:32]}...</a></td></tr>
+    <tr><td>Best block</td><td class="mono"><a href="{prefix}/block?q={info.get('bestblockhash', '')}&chain={chain}">{info.get('bestblockhash', '?')[:32]}...</a></td></tr>
     </table></div>
     <div class="card"><h2>Legend</h2>
     <p style="margin:0;line-height:2">
@@ -1640,8 +1674,8 @@ def render_dashboard(engine, chain):
             tags += ' <span class="tag-the">THE</span>'
         ts = datetime.fromtimestamp(b["time"], tz=timezone.utc).strftime("%H:%M:%S") if b.get("time") else "?"
         rows += f"""<tr>
-        <td><a href="/block?q={b['height']}&chain={chain}">{b['height']}</a></td>
-        <td class="mono"><a href="/block?q={b['hash']}&chain={chain}">{b['hash'][:16]}...</a></td>
+        <td><a href="{prefix}/block?q={b['height']}&chain={chain}">{b['height']}</a></td>
+        <td class="mono"><a href="{prefix}/block?q={b['hash']}&chain={chain}">{b['hash'][:16]}...</a></td>
         <td>{ts}</td>
         <td>{b.get('tx_count', '?')}</td>
         <td>{b.get('size', '?')}</td>
@@ -1652,7 +1686,7 @@ def render_dashboard(engine, chain):
     <table><tr><th>Height</th><th>Hash</th><th>Time</th><th>Txs</th><th>Size</th><th>Tags</th></tr>
     {rows}</table>"""
 
-    return render_page(f"{chain_name} Explorer", stats + table, chain, engine)
+    return render_page(f"{chain_name} Explorer", stats + table, chain, engine, prefix)
 
 
 def _render_output_rows(engine, chain, outputs):
@@ -1685,10 +1719,10 @@ def _render_output_rows(engine, chain, outputs):
     return rows
 
 
-def render_block_detail(engine, query, chain):
+def render_block_detail(engine, query, chain, prefix=""):
     block = engine.get_block(query, chain)
     if "error" in block:
-        return render_page("Block Not Found", f'<p class="red">{escape(str(block["error"]))}</p>', chain, engine)
+        return render_page("Block Not Found", f'<p class="red">{escape(str(block["error"]))}</p>', chain, engine, prefix)
 
     height = block.get("height", "?")
     bhash = block.get("hash", "?")
@@ -1696,15 +1730,15 @@ def render_block_detail(engine, query, chain):
     outputs = block.get("_outputs_decoded", [])
 
     # Navigation
-    nav = f'<a href="/block?q={height-1}&chain={chain}">&larr; Prev</a> | '
-    nav += f'<a href="/block?q={height+1}&chain={chain}">Next &rarr;</a>'
+    nav = f'<a href="{prefix}/block?q={height-1}&chain={chain}">&larr; Prev</a> | '
+    nav += f'<a href="{prefix}/block?q={height+1}&chain={chain}">Next &rarr;</a>'
 
     # Block header
     header = f"""<div class="card">
     <table>
     <tr><td>Height</td><td class="green">{height}</td></tr>
     <tr><td>Hash</td><td class="mono">{blockchair_link(engine, chain, "block", bhash)}</td></tr>
-    <tr><td>Previous</td><td class="mono"><a href="/block?q={block.get('previousblockhash','')}&chain={chain}">{block.get('previousblockhash','?')}</a></td></tr>
+    <tr><td>Previous</td><td class="mono"><a href="{prefix}/block?q={block.get('previousblockhash','')}&chain={chain}">{block.get('previousblockhash','?')}</a></td></tr>
     <tr><td>Time</td><td>{datetime.fromtimestamp(block.get('time',0), tz=timezone.utc).isoformat()}</td></tr>
     <tr><td>Difficulty</td><td>{block.get('difficulty', '?')}</td></tr>
     <tr><td>nBits</td><td class="mono">{block.get('bits', '?')}</td></tr>
@@ -1824,10 +1858,10 @@ def render_block_detail(engine, query, chain):
         title += f" ({pool_tag})"
 
     body = header + cb_html + cbtx_html + out_html + auxpow_html + tx_html
-    return render_page(title, body, chain, engine)
+    return render_page(title, body, chain, engine, prefix)
 
 
-def render_found_blocks(engine, chain, depth=200):
+def render_found_blocks(engine, chain, depth=200, prefix=""):
     found = engine.scan_for_pool_blocks(chain, depth)
 
     rows = ""
@@ -1840,7 +1874,7 @@ def render_found_blocks(engine, chain, depth=200):
         ts = datetime.fromtimestamp(b["time"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if b.get("time") else "?"
         value = f'{b.get("coinbase_value", 0) / 1e8:.8f}'
         rows += f"""<tr>
-        <td><a href="/block?q={b['height']}&chain={chain}">{b['height']}</a></td>
+        <td><a href="{prefix}/block?q={b['height']}&chain={chain}">{b['height']}</a></td>
         <td class="mono">{blockchair_link(engine, chain, "block", b['hash'], b['hash'][:24] + "...")}</td>
         <td>{ts}</td>
         <td>{value}</td>
@@ -1853,14 +1887,14 @@ def render_found_blocks(engine, chain, depth=200):
     <tr><th>Height</th><th>Hash</th><th>Time</th><th>Coinbase Value</th><th>Tags</th></tr>
     {rows}</table>"""
 
-    return render_page(f"Pool Blocks Found ({engine.chain_label(chain)}, last {depth})", table, chain, engine)
+    return render_page(f"Pool Blocks Found ({engine.chain_label(chain)}, last {depth})", table, chain, engine, prefix)
 
 
-def render_mempool_dashboard(engine, chain):
+def render_mempool_dashboard(engine, chain, prefix=""):
     """Render the live mempool dashboard page with summary, histogram, and top txs."""
     info = engine.get_mempool_info(chain)
     if "error" in info:
-        return render_page("Mempool", f'<p class="red">Mempool unavailable: {escape(str(info["error"]))}</p>', chain, engine)
+        return render_page("Mempool", f'<p class="red">Mempool unavailable: {escape(str(info["error"]))}</p>', chain, engine, prefix)
 
     unit = engine.unit(chain)
     tx_count = info.get("size", 0)
@@ -1930,7 +1964,7 @@ def render_mempool_dashboard(engine, chain):
             n_vin = e.get("n_vin", 0)
             n_vout = e.get("n_vout", 0)
             age_str = f"{age // 60}m" if age < 3600 else f"{age // 3600}h {(age % 3600) // 60}m"
-            txid_display = f'<a href="/mempool/tx?txid={txid}&chain={chain}">{txid[:24]}...</a>'
+            txid_display = f'<a href="{prefix}/mempool/tx?txid={txid}&chain={chain}">{txid[:24]}...</a>'
             fr_class = "green" if feerate >= 20 else ("yellow" if feerate >= 5 else "dim")
             rows += f"""<tr>
             <td class="mono">{txid_display}</td>
@@ -1951,16 +1985,16 @@ def render_mempool_dashboard(engine, chain):
 
     refresh = '<meta http-equiv="refresh" content="15">'
     body = stats + hist_html + tx_table
-    page = render_page(f"{unit} Mempool ({tx_count} txs)", body, chain, engine)
+    page = render_page(f"{unit} Mempool ({tx_count} txs)", body, chain, engine, prefix)
     page = page.replace('<meta charset="utf-8">', f'<meta charset="utf-8">{refresh}', 1)
     return page
 
 
-def render_mempool_tx_detail(engine, txid, chain):
+def render_mempool_tx_detail(engine, txid, chain, prefix=""):
     """Render detail page for a single mempool transaction."""
     entry = engine.get_mempool_entry(txid, chain)
     if isinstance(entry, dict) and "error" in entry:
-        return render_page("Mempool Tx", f'<p class="red">Transaction not found: {escape(str(entry["error"]))}</p>', chain, engine)
+        return render_page("Mempool Tx", f'<p class="red">Transaction not found: {escape(str(entry["error"]))}</p>', chain, engine, prefix)
 
     unit = engine.unit(chain)
 
@@ -2020,8 +2054,8 @@ def render_mempool_tx_detail(engine, txid, chain):
     else:
         vout_html = ''
 
-    back_link = f'<p><a href="/mempool?chain={chain}">&larr; Back to Mempool</a></p>'
-    return render_page(f"Mempool Tx {txid[:16]}...", back_link + header + vin_html + vout_html, chain, engine)
+    back_link = f'<p><a href="{prefix}/mempool?chain={chain}">&larr; Back to Mempool</a></p>'
+    return render_page(f"Mempool Tx {txid[:16]}...", back_link + header + vin_html + vout_html, chain, engine, prefix)
 
 
 # ============================================================================
@@ -2030,6 +2064,7 @@ def render_mempool_tx_detail(engine, txid, chain):
 
 class ExplorerHandler(http.server.BaseHTTPRequestHandler):
     engine: ExplorerEngine = None
+    url_prefix: str = ""  # reverse-proxy base path (e.g. "/explorer"); "" = root-mounted
 
     def log_message(self, format, *args):
         pass  # suppress default logging
@@ -2053,30 +2088,39 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
         path, params = self._parse_params()
         chain = self.engine.coin_or_primary(params.get("chain", self.engine.primary))
 
+        # Reverse-proxy base path: X-Forwarded-Prefix (per-request, set by the proxy)
+        # overrides the static --url-prefix. Self-strip the prefix from the path so
+        # BOTH nginx styles work — prefix-preserving (proxy_pass .../8888;) and
+        # prefix-stripping (proxy_pass .../8888/;). Empty prefix = a no-op.
+        fwd = (self.headers.get("X-Forwarded-Prefix") or "").strip()
+        prefix = _norm_prefix(fwd) if fwd else self.url_prefix
+        if prefix and (path == prefix or path.startswith(prefix + "/")):
+            path = path[len(prefix):] or "/"
+
         try:
             if path == "/" or path == "/index.html":
-                self._respond(200, render_dashboard(self.engine, chain))
+                self._respond(200, render_dashboard(self.engine, chain, prefix))
 
             elif path == "/block":
                 q = params.get("q", "")
                 if not q:
-                    self._respond(400, render_page("Error", '<p class="red">Missing block height or hash</p>', chain, self.engine))
+                    self._respond(400, render_page("Error", '<p class="red">Missing block height or hash</p>', chain, self.engine, prefix))
                     return
-                self._respond(200, render_block_detail(self.engine, q, chain))
+                self._respond(200, render_block_detail(self.engine, q, chain, prefix))
 
             elif path == "/found":
                 depth = int(params.get("depth", "200"))
-                self._respond(200, render_found_blocks(self.engine, chain, depth))
+                self._respond(200, render_found_blocks(self.engine, chain, depth, prefix))
 
             elif path == "/mempool":
-                self._respond(200, render_mempool_dashboard(self.engine, chain))
+                self._respond(200, render_mempool_dashboard(self.engine, chain, prefix))
 
             elif path == "/mempool/tx":
                 txid = params.get("txid", "")
                 if not txid:
-                    self._respond(400, render_page("Error", '<p class="red">Missing txid parameter</p>', chain, self.engine))
+                    self._respond(400, render_page("Error", '<p class="red">Missing txid parameter</p>', chain, self.engine, prefix))
                     return
-                self._respond(200, render_mempool_tx_detail(self.engine, txid, chain))
+                self._respond(200, render_mempool_tx_detail(self.engine, txid, chain, prefix))
 
             # ---- REST API ----
             elif path == "/api/status":
@@ -2157,11 +2201,11 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             else:
-                self._respond(404, render_page("404", '<p class="red">Page not found</p>', chain, self.engine))
+                self._respond(404, render_page("404", '<p class="red">Page not found</p>', chain, self.engine, prefix))
 
         except Exception as e:
             traceback.print_exc()
-            self._respond(500, render_page("Error", f'<pre class="red">{escape(traceback.format_exc())}</pre>', chain, self.engine))
+            self._respond(500, render_page("Error", f'<pre class="red">{escape(traceback.format_exc())}</pre>', chain, self.engine, prefix))
 
 
 # ============================================================================
@@ -2232,6 +2276,9 @@ def main():
     parser.add_argument("--doge-c2pool", default=None, help="[legacy] c2pool explorer API URL for DOGE")
 
     parser.add_argument("--web-port", type=int, default=8888, help="Explorer web port")
+    parser.add_argument("--url-prefix", default="",
+                        help="Base path when mounted behind a reverse-proxy sub-path, "
+                             "e.g. /explorer (X-Forwarded-Prefix header overrides per-request)")
     args = parser.parse_args()
 
     coins = OrderedDict()
@@ -2322,9 +2369,10 @@ def main():
         daemon_threads = True
 
     ExplorerHandler.engine = engine
+    ExplorerHandler.url_prefix = _norm_prefix(args.url_prefix)
     engine.start_block_poller(interval=2)
     server = ThreadedServer(("0.0.0.0", args.web_port), ExplorerHandler)
-    print(f"\nExplorer running at http://0.0.0.0:{args.web_port}/")
+    print(f"\nExplorer running at http://0.0.0.0:{args.web_port}{ExplorerHandler.url_prefix}/")
     for cid in engine.coins:
         prof = engine.profile(cid)
         print(f"  {prof['name']} ({prof.get('completeness','?')}): "
