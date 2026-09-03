@@ -29,11 +29,14 @@
 // ---------------------------------------------------------------------------
 
 #include "../coin/transaction.hpp"
+#include "../coin/template_builder.hpp"   // witness_merkle_root (SSOT)
 
 #include <core/coin/utxo.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
+
+#include <cstring>
 
 #include <cstdint>
 #include <functional>
@@ -116,6 +119,42 @@ inline std::optional<uint64_t> xcheck_resum_fees(
         decoded_vout[txid] = std::move(vals);   // available to later children
     }
     return fee_sum;
+}
+
+// ---------------------------------------------------------------------------
+// xcheck_witness_commitment — pre-serve reward-safety sub-check (e).
+//
+// Re-derive the BIP141 witness-commitment output the coinbase MUST carry from
+// the frozen body's wtxids and compare it to the commitment embedded in the
+// coinbase. The commitment is SHA256d(witness_merkle_root || reserved). The
+// reserved value MUST be the one the coinbase actually carries:
+//   • OFF / M2 path            — witness_reserved EMPTY ⇒ 32 zero bytes;
+//   • flag-ON PPLNS path       — witness_reserved == '[P2Pool]'*4 (the P2Pool
+//     witness reserved value spliced into the coinbase witness stack, whose
+//     commitment output was built as the P2Pool witness commitment over the
+//     real ZERO witness root).
+// Hardcoding a 32-zero reserved value here (the pre-fix bug) REJECTED every
+// flag-ON coinbase — a valid, consensus-required construction — and suppressed
+// ALL served work. Deriving the reserved value from the coinbase the block will
+// actually carry keeps the check at FULL strength (it still asserts the exact
+// segwit consensus rule commitment == SHA256d(witness_root || reserved)) while
+// making it flag-agnostic: a WRONG reserved value or a tampered commitment still
+// fails. Returns true iff the embedded commitment matches. ZERO DASH code.
+inline bool xcheck_witness_commitment(
+    const std::vector<uint256>&        body_wtxids,
+    const std::vector<unsigned char>&  witness_reserved,
+    const std::vector<unsigned char>&  embedded_commitment)
+{
+    const uint256 wmr = bip110::coin::witness_merkle_root(body_wtxids);
+    uint256 reserved256;   // 32 zeros by default (OFF/M2)
+    if (!witness_reserved.empty())
+        std::memcpy(reserved256.data(), witness_reserved.data(),
+                    std::min<size_t>(32, witness_reserved.size()));
+    const uint256 recomputed = Hash(wmr, reserved256);   // SHA256d(root || reserved)
+    std::vector<unsigned char> expect = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+    const auto rc = recomputed.GetChars();
+    expect.insert(expect.end(), rc.begin(), rc.end());
+    return expect == embedded_commitment;
 }
 
 } // namespace stratum

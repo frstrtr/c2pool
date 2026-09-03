@@ -389,6 +389,14 @@ target_link_libraries(c2pool-dash
 add_executable(c2pool-bip110
     main_bip110.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/stratum/work_source.cpp
+    # M3 sharechain MINT lane (behind --bip110-sharechain; default OFF): the
+    # namespace-copied sharechain node + single-protocol v36-genesis bridge +
+    # c2pool protocol handler. main_bip110 references bip110::pool::Node (ctor,
+    # listen, broadcast_share, notify_local_share, register_template_txs,
+    # start_outbound_connections) which are DEFINED in these TUs — same set the
+    # bip110_pool_node_compile KAT links. Dormant unless the flag is passed.
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/pool/node.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/pool/protocol_actual.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
 )
 c2pool_wire_version(c2pool-bip110)
@@ -410,6 +418,8 @@ target_link_libraries(c2pool-bip110
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
 )
 
 # Dashboard assets: the shared coin-generic WebServer serves the web-static/
@@ -492,6 +502,33 @@ target_link_libraries(bip110_m3_serving_kat
     ${Boost_LIBRARIES}
 )
 add_test(NAME bip110_m3_serving_kat COMMAND bip110_m3_serving_kat)
+
+# bip110_broadcaster_kat: M3 PR-C2 addrman-backed FOUND-BLOCK fan-out. Network-
+# free red/green over coin/broadcaster.hpp + broadcaster_full.hpp: discover
+# dedupe/cap/primary-exclude, prune_dead + backoff, submit_block_raw_all fans to
+# every live slot, and the dual-arm on_block_found verdict (ARM A embedded fan-
+# out + ARM B primary relay; reached_network iff >=1 arm placed the block). The
+# money property: a won block reaches the whole reachable NODE_BLAKE2B set, not a
+# single submit, and never silently drops when both arms fail.
+add_executable(bip110_broadcaster_kat
+    bip110_broadcaster_kat.cpp
+)
+target_compile_definitions(bip110_broadcaster_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_broadcaster_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME bip110_broadcaster_kat COMMAND bip110_broadcaster_kat)
 
 # KAT: pre-anchor header-backfill PARALLEL GETHEADERS WINDOW (extends #1263 /
 # task #151; base PR #1278). Drives the real BulkFetchLane header lane against a

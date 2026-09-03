@@ -61,3 +61,45 @@ TEST(CurrentPayoutsSeam, NoSeamUnchangedHonestEmpty) {
     ASSERT_TRUE(r.is_object());
     EXPECT_TRUE(r.empty());
 }
+
+// ---------------------------------------------------------------------------
+// /current_merged_payouts cold-cache fallback. The "Current Payouts" card
+// (loadPayouts) fetches /current_merged_payouts, NOT /current_payouts. On lanes
+// that never run the per-tip cache pump (bip110: MI stratum off, no
+// fire_share_tip_refresh), m_cached_merged_payouts stays {} even though the
+// /current_payouts seam is populated — so the card stayed EMPTY. rest_current_
+// merged_payouts now falls back to the primary seam wrapped in the merged shape.
+// ---------------------------------------------------------------------------
+
+// Cold merged cache but a live /current_payouts seam -> merged reflects the
+// primary payouts as {addr:{amount,merged:[]}}. FAILS WITHOUT THE FALLBACK ({}).
+TEST(CurrentMergedPayoutsColdCache, ReflectsPrimarySeam) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+
+    nlohmann::json feed = {
+        {"XmR5w1yQ8oExampleDashAddr0000000000", 1.25},
+        {"XpQ7z2aB9nExampleDashAddr1111111111", 0.50},
+    };
+    mi.set_current_payouts_fn([feed]() { return feed; });
+
+    auto merged = mi.rest_current_merged_payouts();
+    ASSERT_TRUE(merged.is_object());
+    ASSERT_FALSE(merged.empty()) << "cold merged cache must fall back to the primary seam";
+    ASSERT_EQ(merged.size(), feed.size());
+    for (auto it = feed.begin(); it != feed.end(); ++it) {
+        ASSERT_TRUE(merged.contains(it.key()));
+        EXPECT_DOUBLE_EQ(merged[it.key()]["amount"].get<double>(), it.value().get<double>());
+        ASSERT_TRUE(merged[it.key()]["merged"].is_array());
+        EXPECT_TRUE(merged[it.key()]["merged"].empty());
+    }
+}
+
+// No primary seam either -> honest {} (fallback never fabricates).
+TEST(CurrentMergedPayoutsColdCache, HonestEmptyWithoutSource) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+    auto merged = mi.rest_current_merged_payouts();
+    ASSERT_TRUE(merged.is_object());
+    EXPECT_TRUE(merged.empty());
+}

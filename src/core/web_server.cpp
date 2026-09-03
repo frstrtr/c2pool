@@ -3388,9 +3388,34 @@ nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
 std::pair<std::string, std::string> MiningInterface::get_cached_window_response()
 {
     std::lock_guard<std::mutex> lock(m_window_cache_mutex);
-    // Check if cache is valid (has real tip hash, not empty/stub)
-    if (!m_window_cache_etag.empty())
-        return {m_window_cache_json, m_window_cache_etag};
+    // Tip-keyed cache: the cached body is valid ONLY while it still describes
+    // the CURRENT best share. Previously it was returned unconditionally while
+    // the etag was non-empty, and the etag is only cleared by
+    // invalidate_window_cache() — a call site reached by the LTC/DASH/BTC share
+    // paths but NEVER on bip110 (MI stratum off; its own Bip110WorkSource fires
+    // no MI tip-refresh event). So on bip110 the FIRST /sharechain/window
+    // response froze the explorer forever (Chain Length stuck while the tracker
+    // grew). Compare the live tip (m_best_share_hash_fn — RCU-cached and
+    // HTTP-thread safe, does not take this mutex) against the etag; on a match
+    // serve the cache, on a mismatch fall through and regenerate. On lanes that
+    // invalidate on every tip this compare is a no-op (etag already == tip). If
+    // the fn is unwired or the live tip is null, keep the prior behaviour and
+    // serve whatever is cached (honest, never fabricated). Bounded staleness on
+    // bip110 collapses from "forever" to one share-tip generation.
+    if (!m_window_cache_etag.empty()) {
+        bool tip_matches = true;
+        if (m_best_share_hash_fn) {
+            uint256 live_tip = m_best_share_hash_fn();
+            if (!live_tip.IsNull()) {
+                std::string tip = live_tip.GetHex();
+                if (tip.size() > 16) tip = tip.substr(0, 16);
+                tip_matches = (tip == m_window_cache_etag);
+            }
+        }
+        if (tip_matches)
+            return {m_window_cache_json, m_window_cache_etag};
+        // else: the tip advanced past the cached body — regenerate below.
+    }
 
     // Regenerate
     auto data = rest_sharechain_window();
@@ -5003,7 +5028,8 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     // Mode indicators for conditional UI. Coin targets whose daemon RPC is an
     // external NodeRPC arm (c2pool-dash dashd) rather than an ICoinNode set the
     // m_coin_rpc_available flag so has_rpc is truthful.
-    result["embedded"] = (m_coin_node && m_coin_node->is_embedded());
+    result["embedded"] = m_embedded_display_override.value_or(
+                             m_coin_node && m_coin_node->is_embedded());
     result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
                          || m_coin_rpc_available.load(std::memory_order_relaxed);
 
@@ -5606,7 +5632,8 @@ nlohmann::json MiningInterface::rest_node_topology()
         if (is_primary) {
             // Real embedded/RPC flags for this node's own daemon. Coin targets
             // with an external NodeRPC arm (c2pool-dash) set m_coin_rpc_available.
-            entry["embedded"] = (m_coin_node && m_coin_node->is_embedded());
+            entry["embedded"] = m_embedded_display_override.value_or(
+                                    m_coin_node && m_coin_node->is_embedded());
             entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
                                 || m_coin_rpc_available.load(std::memory_order_relaxed);
             // Truthful tip from the embedded daemon's cached template (front-end
@@ -6453,11 +6480,28 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         result["authority_announcements"] = m_cached_authority_announcements;
 
     // ── Address format warnings (node-generated, matches p2pool) ──
+    //
+    // Two registry-driven gates keep these off coins the text does not describe
+    // (the crossing-card native-v36 class, generalised to the warning endpoint):
+    //
+    //   * v35_addr_limitation — a "during the V35 phase…" caveat. A NATIVE-v36
+    //     coin (genesis share-version == target, no lower predecessor; only bip110
+    //     opts in via set_native_share_version(true)) never had a V35 phase, so
+    //     this warning is a pure lie there. Suppress it when m_native_share_version.
+    //     LTC/DASH/BTC/DGB/BCH DID cross V35→V36 → flag false → byte-identical.
+    //
+    //   * multiaddr_format / auto_convert / invalid_addr_redist — merged-mining
+    //     (LTC,DOGE) instructions. They only apply to a coin that HAS a merged
+    //     child. The single such coin is LTC (m_mm_manager != null, DOGE); every
+    //     standalone lane (bip110/BTC/DASH/DGB/BCH/NMC) has no mm_manager and was
+    //     emitting "configure LTC_ADDRESS,DOGE_ADDRESS" — wrong-coin content. Gate
+    //     on m_mm_manager so only merged-capable coins emit them.
     {
         bool ratchet_confirmed = all_target && confirmed;
+        const bool has_merged_child = (m_mm_manager != nullptr);
         nlohmann::json warnings = nlohmann::json::array();
 
-        if (!ratchet_confirmed && TARGET_VERSION >= 36) {
+        if (!ratchet_confirmed && TARGET_VERSION >= 36 && !m_native_share_version) {
             warnings.push_back({
                 {"id", "v35_addr_limitation"},
                 {"urgency", "recommended"},
@@ -6470,37 +6514,39 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             });
         }
 
-        warnings.push_back({
-            {"id", "multiaddr_format"},
-            {"urgency", "recommended"},
-            {"title", "Multi-Address Mining Format"},
-            {"text", "V36 introduces merged mining. To receive rewards on both "
-                     "chains, configure your miner's stratum username as: "
-                     "LTC_ADDRESS,DOGE_ADDRESS.worker_name  "
-                     "Example: ltc1q...abc,D9ab...def.rig1"}
-        });
+        if (has_merged_child) {
+            warnings.push_back({
+                {"id", "multiaddr_format"},
+                {"urgency", "recommended"},
+                {"title", "Multi-Address Mining Format"},
+                {"text", "V36 introduces merged mining. To receive rewards on both "
+                         "chains, configure your miner's stratum username as: "
+                         "LTC_ADDRESS,DOGE_ADDRESS.worker_name  "
+                         "Example: ltc1q...abc,D9ab...def.rig1"}
+            });
 
-        warnings.push_back({
-            {"id", "auto_convert"},
-            {"urgency", "info"},
-            {"title", "Address Auto-Conversion"},
-            {"text", "If you only provide a LTC address, a DOGE address will be "
-                     "auto-derived from its public key hash. This derived address "
-                     "may NOT match your actual DOGE wallet \u2014 you could lose "
-                     "merged mining rewards. Always specify your own DOGE address "
-                     "explicitly."}
-        });
+            warnings.push_back({
+                {"id", "auto_convert"},
+                {"urgency", "info"},
+                {"title", "Address Auto-Conversion"},
+                {"text", "If you only provide a LTC address, a DOGE address will be "
+                         "auto-derived from its public key hash. This derived address "
+                         "may NOT match your actual DOGE wallet \u2014 you could lose "
+                         "merged mining rewards. Always specify your own DOGE address "
+                         "explicitly."}
+            });
 
-        warnings.push_back({
-            {"id", "invalid_addr_redist"},
-            {"urgency", "info"},
-            {"title", "Invalid Address Redistribution"},
-            {"text", "Miners with invalid or unparseable addresses are handled "
-                     "per case: (1) Invalid LTC + no DOGE = both redistributed. "
-                     "(2) Invalid LTC + valid DOGE = DOGE preserved, LTC "
-                     "reverse-derived from DOGE key (Case 4). "
-                     "Redistributed shares go probabilistically to PPLNS miners."}
-        });
+            warnings.push_back({
+                {"id", "invalid_addr_redist"},
+                {"urgency", "info"},
+                {"title", "Invalid Address Redistribution"},
+                {"text", "Miners with invalid or unparseable addresses are handled "
+                         "per case: (1) Invalid LTC + no DOGE = both redistributed. "
+                         "(2) Invalid LTC + valid DOGE = DOGE preserved, LTC "
+                         "reverse-derived from DOGE key (Case 4). "
+                         "Redistributed shares go probabilistically to PPLNS miners."}
+            });
+        }
 
         result["address_warnings"] = warnings;
     }
@@ -6572,6 +6618,16 @@ nlohmann::json MiningInterface::rest_v36_status()
         live_share_version = ar.value("live_share_version", live_share_version);
         v36_active = ar.value("v36_active", v36_active);
     }
+
+    // Native-version coins (genesis share-version == target, no lower
+    // predecessor) never cross and never vote. Override the vs-derived state
+    // AFTER it is read so a latched-native coin (bip110: v36 from genesis)
+    // reports 'native' instead of the fabricated 'voting'/V36->V36 crossing.
+    // Display-only; leaves live_share_version / v36_active as computed and does
+    // not touch any share_chain counts. Only bip110 opts in via
+    // set_native_share_version(true) -> DASH/LTC output is byte-identical.
+    if (m_native_share_version)
+        state = "native";
 
     result["auto_ratchet"] = {
         {"state", state},
@@ -6875,13 +6931,40 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
     return filtered;
 }
 
+nlohmann::json MiningInterface::wrap_primary_payouts_as_merged()
+{
+    // Cold-cache fallback (see header). Wrap the live /current_payouts seam in
+    // the merged {addr:{amount,merged:[]}} shape — the EXACT shape
+    // compute_current_merged_payouts() produces for a node with no merged
+    // children (web_server.cpp compute path :6717-6719). Read-only: it only
+    // re-shapes rest_current_payouts(), which reads m_current_payouts_fn under
+    // its own guard; it touches neither m_cached_merged_payouts nor m_mm_manager,
+    // so it is safe on the REST thread.
+    nlohmann::json out = nlohmann::json::object();
+    auto payouts_json = rest_current_payouts();
+    if (!payouts_json.is_object()) return out;
+    for (auto& [addr, amount] : payouts_json.items())
+        out[addr] = {{"amount", amount}, {"merged", nlohmann::json::array()}};
+    return out;
+}
+
 nlohmann::json MiningInterface::rest_current_merged_payouts()
 {
     // Return pre-computed cache from cache_pplns_at_tip() (main thread, every 2s)
-    std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
-    if (!m_cached_merged_payouts.is_null() && !m_cached_merged_payouts.empty())
-        return m_cached_merged_payouts;
-    return nlohmann::json::object();
+    {
+        std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
+        if (!m_cached_merged_payouts.is_null() && !m_cached_merged_payouts.empty())
+            return m_cached_merged_payouts;
+    }
+    // Cold-cache fallback for lanes that never run the tip cache pump (bip110:
+    // MI stratum off, no fire_share_tip_refresh -> cache_pplns_at_tip is never
+    // called, so the cache stays {} even though /current_payouts is populated).
+    // Serve the primary /current_payouts seam wrapped in the merged shape so the
+    // "Current Payouts" card (loadPayouts fetches THIS endpoint), the main-page
+    // PPLNS treemap (loadMainPPLNS) and /pplns/current all fill. On LTC/DASH the
+    // cache is populated by the pump, so this branch is unreachable there — the
+    // behaviour where it IS reached today is {}, so this is strictly additive.
+    return wrap_primary_payouts_as_merged();
 }
 
 namespace {
@@ -6925,6 +7008,13 @@ nlohmann::json MiningInterface::rest_pplns_current()
         std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
         cache = m_cached_merged_payouts;
     }
+    // Cold-cache fallback (parity with rest_current_merged_payouts): on lanes
+    // that never run the tip cache pump the cache is {}, which would leave
+    // miners[] empty even though /current_payouts is live. Wrap the primary
+    // seam so the PPLNS view aggregate fills. Strictly additive — only reached
+    // when the cache is empty, where today's behaviour is {}.
+    if (!cache.is_object() || cache.empty())
+        cache = wrap_primary_payouts_as_merged();
 
     // Build enrichment table from the current window. Non-fatal if the
     // window isn't available — the module degrades gracefully.

@@ -1848,7 +1848,7 @@
                     <h3><span class="icon">🔀</span> Share-Version Crossing</h3>
                     <div class="stat-value" id="v36_status_label">-</div>
                     <div class="stat-sub">Signalling: <span id="v36_signal_pct">-</span></div>
-                    <div class="stat-detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span></div>
+                    <div class="stat-detail" id="v36_cross_detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span></div>
                     <div class="stat-detail">Live latch: <span id="v36_active_label" style="font-weight:600;">-</span></div>
                 </div>
                 <!-- Per-node topology: THIS node's REAL coin set from /api/node_topology (charter #2, config-driven/auto-detected -- never a baked-in coin list) -->
@@ -3005,6 +3005,16 @@
                 statNative: 'V16 Current', statSignaling: null,
                 legendNative: 'V16 (others)', legendSignaling: null,
                 legendStale: 'Below V16'
+            },
+            // BIP110 launched at share-version V36 from genesis -- there is no
+            // lower predecessor, so no signalling boundary. signaling:false
+            // suppresses the LTC "V35 only" / "V36 Signaling" legend rows that
+            // the fall-back-to-LTC default would otherwise show on a native coin.
+            BIP110: {
+                threshold: 36, signaling: false,
+                statNative: 'V36 Native', statSignaling: null,
+                legendNative: 'V36 (others)', legendSignaling: null,
+                legendStale: 'Below V36'
             }
         };
         function shareVersionDescriptor(sym) {
@@ -3251,14 +3261,28 @@
             if (!crossing) { card.style.display = 'none'; return; }
             card.style.display = '';
             card.classList.toggle('transitioning', state === 'voting' && active !== true);
+            // Native-version coins (genesis share-version already == target, no lower
+            // predecessor) never cross and never vote -- the backend emits state='native'
+            // ONLY for them (bip110: v36 from genesis). Show a truthful "no crossing"
+            // detail instead of the meaningless VOTING / V36 -> V36 line. Signalling is
+            // '--' (nothing to signal), the latch line below stays ACTIVE (V36) -- true.
+            // No other coin emits 'native', so DASH/LTC crossing display is untouched.
+            var isNative = state === 'native';
             // Label vocabulary matches what the endpoint actually emits (auto_ratchet.state).
-            var labels = { voting: 'VOTING', activated: 'ACTIVATED', confirmed: 'CONFIRMED' };
+            var labels = { voting: 'VOTING', activated: 'ACTIVATED', confirmed: 'CONFIRMED', native: 'NATIVE' };
             d3.select('#v36_status_label').text(labels[state] || (state ? state.toUpperCase() : '-'));
-            d3.select('#v36_signal_pct').text(typeof pct === 'number' ? pct + '%' : '-');
+            d3.select('#v36_signal_pct').text(isNative ? '—' : (typeof pct === 'number' ? pct + '%' : '-'));
             // current -> target: current is the live latch version; the ratchet endpoint
-            // is V36 for every coin's cross (LTC/DOGE V35->V36, DASH V16->V36).
-            d3.select('#v36_share_label').text(live != null ? 'V' + live : '-');
-            d3.select('#v36_target_label').text('V36');
+            // is V36 for every coin's cross (LTC/DOGE V35->V36, DASH V16->V36). For a
+            // native coin there is no "from" version -- collapse the row to a plain
+            // no-crossing statement.
+            if (isNative) {
+                d3.select('#v36_cross_detail').text('V36 native (no crossing)');
+            } else {
+                d3.select('#v36_cross_detail').html('<span id="v36_share_label"></span> &rarr; <span id="v36_target_label"></span>');
+                d3.select('#v36_share_label').text(live != null ? 'V' + live : '-');
+                d3.select('#v36_target_label').text('V36');
+            }
             // Authoritative live-latch ground truth (m_cached_share_version / DASH's
             // ratchet-derived live_share_version). Only rendered when the backend
             // reports it (charter #3).
@@ -5304,6 +5328,13 @@
             dogeSet: {},       // short hashes of DOGE block solutions (parent hash)
             headSet: {},       // short hashes of chain heads
             myAddress: '',
+            // Set of THIS node's self-identity addresses (node-owner/payout ∪
+            // local stratum worker addresses), from window.my_addresses. The
+            // single myAddress cannot represent a node whose rigs mine under
+            // their own rig addresses, so "mine" is set membership, not ==.
+            // Lanes that emit only my_address degenerate to the single-address
+            // semantics (myAddrSet then holds just that one entry).
+            myAddrSet: {},
             windowSize: 8640,
             pplnsData: [],     // cached [{addr, pct, amt}] sorted by pct desc
             pplnsCache: {},    // share_hash → [{addr, pct, amt}] from server
@@ -5412,6 +5443,17 @@
                     }
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Build the self-identity set: single my_address ∪ the
+                    // my_addresses array (node-owner ∪ local stratum workers).
+                    // Backward-compatible — a lane emitting only my_address
+                    // yields a one-entry set, preserving old == semantics.
+                    self.myAddrSet = {};
+                    if (self.myAddress) self.myAddrSet[self.myAddress] = true;
+                    if (Array.isArray(data.my_addresses)) {
+                        data.my_addresses.forEach(function(a) {
+                            if (a) self.myAddrSet[a] = true;
+                        });
+                    }
                     self.windowSize = data.window_size || 8640;
 
                     self.blockSet = {};
@@ -5531,40 +5573,71 @@
                     return;
                 }
 
-                // Pre-compute average age per row for axis labels
+                // Time axis (left margin). The grid is SHARE-INDEXED, not
+                // time-uniform: each row holds `cols` consecutive shares, so
+                // equal vertical pitch does NOT mean equal elapsed time. To keep
+                // the axis honest we derive every label from a REAL share
+                // timestamp — the age of the row's first (newest, top-left)
+                // cell, `now - shares[r*cols].t` — never a fabricated row mean,
+                // and we place the tick+label at the row TOP, exactly where that
+                // boundary share sits. Uneven label spacing is the correct
+                // outcome: on a share-indexed grid, label density encodes share
+                // density (clumps of recent shares → tightly packed labels).
                 var now = Date.now() / 1000;
-                var rowAges = [];
-                for (var r = 0; r < this.rows; r++) {
-                    var start = r * this.cols;
-                    var end = Math.min(start + this.cols, this.shares.length);
-                    var sum = 0;
-                    for (var j = start; j < end; j++) sum += (now - this.shares[j].t);
-                    rowAges.push(sum / (end - start));
-                }
 
-                // Draw time axis labels on the left margin — hours only
-                ctx.font = 'bold 11px -apple-system, sans-serif';
-                ctx.textAlign = 'right';
-                ctx.textBaseline = 'middle';
+                var fmtAge = function(s) {
+                    s = Math.round(s);
+                    var d = Math.floor(s / 86400); s -= d * 86400;
+                    var h = Math.floor(s / 3600);  s -= h * 3600;
+                    var m = Math.floor(s / 60);
+                    var parts = [];
+                    if (d > 0) parts.push(d + 'd');
+                    if (h > 0) parts.push(h + 'h');
+                    if (m > 0) parts.push(m + 'm');
+                    return parts.length ? parts.join(' ') : '0m';
+                };
 
-                // Find which rows cross whole-hour boundaries and label those
-                var lastLabeledHour = -1;
-                for (var r = 0; r < this.rows; r++) {
-                    var hour = Math.floor(rowAges[r] / 3600);
-                    if (hour !== lastLabeledHour && hour >= 0) {
-                        lastLabeledHour = hour;
-                        var label = hour + 'h';
-                        var yLabel = r * step + step / 2;
-                        ctx.fillStyle = '#b0b0cc';
-                        ctx.fillText(label, ml - 4, yLabel);
+                // Label only when there is a real second axis to describe:
+                // more than one row of shares and a positive age span.
+                if (this.rows > 1 && this.shares.length > this.cols) {
+                    var lastIdx = (this.rows - 1) * this.cols;
+                    if (lastIdx >= this.shares.length) lastIdx = this.shares.length - 1;
+                    var span = now - this.shares[lastIdx].t; // age of the oldest row's first cell
 
-                        // Tick line
-                        ctx.strokeStyle = 'rgba(140,140,180,0.2)';
-                        ctx.lineWidth = 0.5;
-                        ctx.beginPath();
-                        ctx.moveTo(ml, r * step);
-                        ctx.lineTo(cssW, r * step);
-                        ctx.stroke();
+                    if (span > 0) {
+                        // Pick the finest step that keeps the axis to <= ~8 labels.
+                        var STEPS = [900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+                        var stepSec = STEPS[STEPS.length - 1];
+                        for (var si = 0; si < STEPS.length; si++) {
+                            if (span / STEPS[si] <= 8) { stepSec = STEPS[si]; break; }
+                        }
+
+                        ctx.font = 'bold 11px -apple-system, sans-serif';
+                        ctx.textAlign = 'right';
+                        ctx.textBaseline = 'top';
+
+                        // Walk rows top→bottom; when the boundary share's age
+                        // crosses into a new multiple of stepSec, label it there.
+                        var lastK = -1;
+                        for (var r = 0; r < this.rows; r++) {
+                            var bIdx = r * this.cols;
+                            if (bIdx >= this.shares.length) break;
+                            var k = Math.floor((now - this.shares[bIdx].t) / stepSec);
+                            if (r === 0) { lastK = k; continue; } // top boundary = "now"
+                            if (k > lastK) {
+                                lastK = k;
+                                var yLabel = r * step;
+                                ctx.fillStyle = '#b0b0cc';
+                                ctx.fillText(fmtAge(k * stepSec), ml - 4, yLabel + 1);
+
+                                ctx.strokeStyle = 'rgba(140,140,180,0.2)';
+                                ctx.lineWidth = 0.5;
+                                ctx.beginPath();
+                                ctx.moveTo(ml, yLabel);
+                                ctx.lineTo(cssW, yLabel);
+                                ctx.stroke();
+                            }
+                        }
                     }
                 }
 
@@ -5670,6 +5743,17 @@
                     // Update data
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    // Build the self-identity set: single my_address ∪ the
+                    // my_addresses array (node-owner ∪ local stratum workers).
+                    // Backward-compatible — a lane emitting only my_address
+                    // yields a one-entry set, preserving old == semantics.
+                    self.myAddrSet = {};
+                    if (self.myAddress) self.myAddrSet[self.myAddress] = true;
+                    if (Array.isArray(data.my_addresses)) {
+                        data.my_addresses.forEach(function(a) {
+                            if (a) self.myAddrSet[a] = true;
+                        });
+                    }
                     self.windowSize = data.window_size || 8640;
                     self.blockSet = {};
                     if (data.blocks) data.blocks.forEach(function(h) { self.blockSet[h] = true; });
@@ -6333,7 +6417,7 @@
                 // Node fee share - purple
                 if (share.fee) return '#9c27b0';
 
-                var isMine = this.myAddress && share.m === this.myAddress;
+                var isMine = this.isMine(share.m);
                 // Coin-aware native cutoff (LTC=36, DASH=16). A literal 36
                 // here painted every DASH V16 share as the dim "below"
                 // band. The signaling tier only exists for coins with a
@@ -6421,7 +6505,7 @@
 
             showTooltip: function(share, e) {
                 var tip = this.tooltip;
-                var isMine = this.myAddress && share.m === this.myAddress;
+                var isMine = this.isMine(share.m);
                 var isLtcBlock = !!this.blockSet[share.h];
                 var isDogeBlock = !!this.dogeSet[share.h];
                 var age = Math.floor(Date.now() / 1000 - share.t);
@@ -6635,13 +6719,13 @@
                 // Squarified treemap of PPLNS at this share's position
                 var rects = this.treemap(pplnsAtPos, 2, 2, sz - 4, sz - 4);
                 var minerAddr = share ? share.m : '';
-                var myAddr = this.myAddress;
+                var self = this;
 
                 for (var i = 0; i < rects.length; i++) {
                     var r = rects[i];
                     var addr = r.addr;
                     var isThisMiner = addr === minerAddr;
-                    var isMe = addr === myAddr;
+                    var isMe = self.isMine(addr);
 
                     var hue = this.addrHue(addr);
                     if (isThisMiner) {
@@ -6811,6 +6895,16 @@
                 return (0xffff * Math.pow(256, 26)) / target_top;
             },
 
+            // True when `addr` is one of THIS node's self-identity addresses
+            // (node-owner/payout ∪ local stratum workers). Set membership so a
+            // node whose rigs mine under their own addresses still highlights
+            // blue; falls back to the single myAddress when myAddrSet is empty.
+            isMine: function(addr) {
+                if (!addr) return false;
+                if (defrag.myAddrSet && defrag.myAddrSet[addr]) return true;
+                return !!(defrag.myAddress && addr === defrag.myAddress);
+            },
+
             updateStats: function(data) {
                 var shares = data.shares || [];
                 var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0, v36native = 0;
@@ -6820,7 +6914,7 @@
                 // read it from the active coin's share-version descriptor.
                 var vthr = (window.__shareVersionDescriptor && window.__shareVersionDescriptor.threshold) || 36;
                 shares.forEach(function(s) {
-                    if (self.myAddress && s.m === self.myAddress) mine++;
+                    if (self.isMine(s.m)) mine++;
                     if (s.s === 1) stale++;
                     if (s.s === 2) dead++;
                     if (s.v) verified++;
@@ -6908,9 +7002,11 @@
             var myContainer = document.getElementById('my_share_hashes');
             if (myContainer) {
                 myContainer.innerHTML = '';
-                if (defrag.myAddress) {
+                var hasSelfIdentity = !!(defrag.myAddress ||
+                    (defrag.myAddrSet && Object.keys(defrag.myAddrSet).length > 0));
+                if (hasSelfIdentity) {
                     var myShares = defrag.shares.filter(function(s) {
-                        return s.m === defrag.myAddress;
+                        return defrag.isMine(s.m);
                     }).slice(0, 50);
                     if (myShares.length > 0) {
                         myShares.forEach(function(s) {

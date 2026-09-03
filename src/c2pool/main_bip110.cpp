@@ -13,6 +13,7 @@
 // PER-COIN ISOLATION: src/impl/bip110 lane + the lane-local BLAKE2b primitive.
 // No SHA256d/scrypt/X11 lane is touched.
 
+#include <cassert>   // sharechain dial/accept lifetime arm assertion
 #include <impl/bip110/params.hpp>
 #include <impl/bip110/pow.hpp>
 #include <impl/bip110/coin/header_chain.hpp>
@@ -20,11 +21,23 @@
 #include <impl/bip110/coin/node.hpp>
 #include <impl/bip110/coin/node_interface.hpp>
 #include <impl/bip110/coin/coin_peer_manager.hpp>
+#include <impl/bip110/coin/broadcaster.hpp>        // M3 PR-C2 NODE_BLAKE2B fan-out pool
+#include <impl/bip110/coin/broadcaster_full.hpp>   // M3 PR-C2 found-block keystone
+#include <impl/bip110/coin/inbound_listener.hpp>   // coin-p2p INBOUND accept path (:8333)
 #include <impl/bip110/coin/chain_seeds.hpp>
 #include <impl/bip110/coin/mempool.hpp>            // M3 daemonless tx-serving
+#include <impl/bip110/coin/block_json.hpp>         // explorer getblock verbosity=2 JSON
+#include <impl/bip110/coin/block_confirm.hpp>      // found-block confirm/orphan resolver (B2 telemetry)
 #include <impl/bip110/coin/parent_tx_resolver.hpp> // M3 tier-3 input pricing
 #include <impl/bip110/coin/utxo_reorg.hpp>         // GAP4 reorg-blindness fix
 #include <impl/bip110/stratum/work_source.hpp>
+
+// ── M3 sharechain MINT lane (behind --bip110-sharechain; default OFF) ────────
+#include <impl/bip110/pool/node.hpp>               // bip110::pool::Node / Config
+#include <impl/bip110/pool/config_pool.hpp>        // PoolConfig SSOT (P2P_PORT 9337, STALE_SHARES)
+#include <impl/bip110/pool/share_check.hpp>        // bip110::pool::create_local_share (MINT)
+#include <impl/bip110/pool/current_payouts_report.hpp> // /current_payouts dashboard PPLNS split (read-only)
+#include <impl/bip110/pool/sharechain_window_report.hpp> // /sharechain/window explorer + V36? column (read-only)
 
 #include <core/coin/utxo_view_db.hpp>              // M3 own-UTXO view (T2 pricing)
 #include <core/coin/utxo_view_cache.hpp>
@@ -52,10 +65,12 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef C2POOL_VERSION
@@ -100,7 +115,16 @@ void print_banner(const char* argv0)
         "  --http [HOST:]PORT   serve the shared coin-generic dashboard (HTML at\n"
         "                       \"/\", JSON /node_info for health probes)\n"
         "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
-        "                       miner has no resolvable payout address (base58/bech32)\n\n"
+        "                       miner has no resolvable payout address (base58/bech32)\n"
+        "  --bip110-sharechain  ARM the M3 v36 sharechain MINT (DEFAULT OFF): start\n"
+        "                       the sharechain node on :9337, mint local shares, and\n"
+        "                       dial the fresh federation sharechain. IRREVERSIBLE\n"
+        "                       first-outbound — gated by the operator wire-genesis\n"
+        "                       params-freeze checkpoint. Absent => M2 header-follower.\n"
+        "  --sharechain-addnode HOST:PORT  override the default sharechain bootstrap\n"
+        "                       beacon list with explicit :9337 peer(s) (repeatable;\n"
+        "                       unified TOML key sharechain.addnodes). Default dials\n"
+        "                       our-fork beacon(s) so the sharechain can form.\n\n"
         "PoW: BLAKE2b commitment pipeline (bip110::pow); block hash == PoW hash.\n"
         "Fork: Blake2bHeight=%u; RDTS weight cap=%u WU; network==Bitcoin mainnet\n"
         "      (magic f9beb4d9, default port %u).\n",
@@ -178,7 +202,11 @@ int run_embedded(bool coin_p2p_discover,
                  const std::string& donation_address,
                  double give_author_pct,
                  double node_owner_fee_pct,
-                 bool serve_mempool_txs)
+                 bool serve_mempool_txs,
+                 bool sharechain_enabled,
+                 const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes,
+                 bool explorer_enabled = true,
+                 const std::string& coin_externalip = std::string())
 {
     core::log::Logger::init();
 
@@ -215,6 +243,16 @@ int run_embedded(bool coin_p2p_discover,
 
     bip110::coin::Node<MiniConfig> coin_node(&ioc, &config);
 
+    // ── M3 PR-C2 addrman-backed FOUND-BLOCK fan-out (behind --bip110-sharechain;
+    // DEFAULT OFF) ───────────────────────────────────────────────────────────
+    // Declared at run_embedded scope so they outlive work_source / the stratum
+    // server / ioc.run(). Constructed ONLY on the flag-ON path, AFTER coin_peer_mgr
+    // exists (the NODE_BLAKE2B addrman that feeds the fan-out slot set). With the
+    // flag OFF both stay null and stratum_submit_fn calls
+    // coin_node.submit_block_with_fallback directly — byte-identical to M2.
+    std::unique_ptr<bip110::coin::Bip110Broadcaster<MiniConfig>>     coin_broadcaster;
+    std::unique_ptr<bip110::coin::Bip110BroadcasterFull<MiniConfig>> coin_broadcaster_full;
+
     // ── M3 DAEMONLESS MEMPOOL SERVING: own UTXO view + mempool + T3 resolver ──
     // BIP-110 has NO coin daemon, so there is no getblocktemplate to hand us txs
     // or fees. We do the daemon's job ourselves: ingest the fork mempool over
@@ -237,15 +275,29 @@ int run_embedded(bool coin_p2p_discover,
     };
     constexpr uint32_t BIP110_KEEP_DEPTH = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
 
+    // Explorer raw-block retention window (heights kept for /api/explorer
+    // getblock body lookups). 288 ≈ 2 days at 10-min blocks — matches the LTC
+    // lane default (main_ltc.cpp explorer_depth_ltc). Retention is flag-gated on
+    // explorer_enabled: storage only, never a consensus/reward path.
+    constexpr uint32_t EXPLORER_DEPTH = 288;
+
     // ── M2 MINING: stratum server + BLAKE2b Sv1 work source (miner-facing) ──
     // submit_block_fn relays a won 164-byte v2 block to the FORK peers over the
     // coin P2P (submit_block_with_fallback: P2P relay + optional submitblock RPC
     // backup). The work source serves coinbase-only jobs, validates shares with
     // an independent BLAKE2b recompute, and dispatches block-target hits here.
     auto stratum_submit_fn =
-        [&coin_node](const std::vector<unsigned char>& block_bytes, uint32_t height) -> bool {
+        [&coin_node, &coin_broadcaster_full](const std::vector<unsigned char>& block_bytes,
+                                             uint32_t height) -> bool {
             LOG_INFO << "[EMB-BIP110] submitting won block height=" << height
                      << " bytes=" << block_bytes.size();
+            // FLAG-ON: route through the found-block keystone — ARM A fans the
+            // block to every live NODE_BLAKE2B fan-out peer, ARM B is the same
+            // coin_node.submit_block_with_fallback (primary relay + optional RPC).
+            // FLAG-OFF: coin_broadcaster_full is null -> the single M2 call,
+            // byte-identical to today.
+            if (coin_broadcaster_full)
+                return coin_broadcaster_full->on_block_found(block_bytes).reached_network();
             return coin_node.submit_block_with_fallback(block_bytes);
         };
     auto work_source = std::make_shared<bip110::stratum::Bip110WorkSource>(
@@ -312,6 +364,518 @@ int run_embedded(bool coin_p2p_discover,
              << node_owner_fee_ppm << " ppm) — integer floor split, miner absorbs remainder"
              << (node_owner_fee_ppm > 0 ? "; owner+donation consolidated (single key)" : "");
 
+    // ── M3 SHARECHAIN MINT (behind --bip110-sharechain; DEFAULT OFF) ─────────
+    // With the flag OFF this block is skipped ENTIRELY: no bip110::pool::Node is
+    // constructed, no :9337 listen, set_create_share_fn is never called (so
+    // work_source's create_share_fn_ stays null and mining_submit's share arm is
+    // a no-op — byte-identical to the M2 header-follower), and the IRREVERSIBLE
+    // first-outbound to the fresh federation sharechain never runs. The C++ v36
+    // wiring precedent is main_btc.cpp (node ctor + set_create_share_fn +
+    // start_outbound_connections). Lifetime: sharechain_cfg + sharechain_node are
+    // declared at run_embedded scope so they outlive work_source, the stratum
+    // server, and ioc.run() (the lambda captures the raw node pointer; the
+    // io_context drives its peers). WIRE-GENESIS FREEZE: params live in
+    // params.hpp / config_pool.hpp (9337 / 8640 / SPREAD 3 / proto 3600 /
+    // donation u16 66) — DO NOT change them here and DO NOT default the flag ON;
+    // the operator performs the explicit params-freeze checkpoint before enabling
+    // it in production.
+    std::unique_ptr<bip110::pool::Config> sharechain_cfg;
+    // ROBUST dial-teardown UAF fix (successor to e527abfe): hold the sharechain
+    // node as a shared_ptr and register its OWNING control block with the node's
+    // core::Client + core::Server bases via set_lifetime() below. core::Client/
+    // Server pin the node with a STRONG ref for each async resolve/connect/accept,
+    // so make_socket()'s dynamic_cast can never run on a freed node. Critically
+    // this does NOT rely on node->weak_from_this(): the pool Node is a virtual-
+    // inheritance diamond (public virtual NodeImpl → … → core::INetwork) whose
+    // enable_shared_from_this base is not enrolled through the owning control
+    // block, so weak_from_this() returns EMPTY — exactly the silent no-op that
+    // made the e527abfe guard inert. Flag-ON exercises this hard (beacon :9337
+    // self-dial + coin-P2P + ioc.stop() mid-resolve). All .get() sites unchanged.
+    std::shared_ptr<bip110::pool::Node>   sharechain_node;
+    if (sharechain_enabled) {
+        sharechain_cfg  = std::make_unique<bip110::pool::Config>();          // (1) lifetime >= node
+
+        // SHARECHAIN BOOTSTRAP SEED — populate m_bootstrap_addrs BEFORE the Node
+        // ctor (node.hpp:237 m_addrs.load(config->pool()->m_bootstrap_addrs)), so
+        // the node dials the beacon on start_outbound_connections. Mirrors
+        // main_btc.cpp:1536-1618. Precedence: explicit --sharechain-addnode >
+        // regtest > OurBeacon (default seed list). This whole block is INSIDE the
+        // flag-ON guard: flag-OFF constructs no sharechain node and never dials.
+        using PC = bip110::pool::PoolConfig;
+        const auto sc_mode = PC::select_bootstrap_mode(
+            /*has_explicit_peers=*/!sharechain_addnodes.empty(), /*regtest=*/false);
+        auto& sc_addrs = sharechain_cfg->pool()->m_bootstrap_addrs;
+        switch (sc_mode) {
+        case PC::BootstrapMode::ExplicitPeers:
+            for (const auto& [h, p] : sharechain_addnodes) sc_addrs.emplace_back(h, p);
+            LOG_INFO << "[EMB-BIP110] sharechain bootstrap: " << sc_addrs.size()
+                     << " explicit --sharechain-addnode peer(s) (OurBeacon suppressed)";
+            break;
+        case PC::BootstrapMode::OurBeacon:
+            for (const auto& host : PC::default_bootstrap_hosts()) {
+                std::string a = host.find(':') == std::string::npos
+                    ? host + ":" + std::to_string(PC::P2P_PORT) : host;   // btc:1609 guard
+                sc_addrs.emplace_back(a);
+            }
+            LOG_INFO << "[EMB-BIP110] sharechain bootstrap: OurBeacon — " << sc_addrs.size()
+                     << " default seed(s) (prefix=" << PC::prefix_hex() << " :9337)";
+            break;
+        case PC::BootstrapMode::RegtestIsolated:
+            LOG_INFO << "[EMB-BIP110] sharechain bootstrap: regtest — 0 seeds (isolated)";
+            break;
+        }
+
+        sharechain_node = std::make_shared<bip110::pool::Node>(&ioc, sharechain_cfg.get());
+        auto* node_raw  = sharechain_node.get();
+
+        // ROBUST dial-teardown UAF fix (successor to e527abfe): register the
+        // OWNING control block with the pool node's core::Client + core::Server
+        // bases so their async resolve/connect/accept handlers pin the node with a
+        // strong ref for the op's duration. This does NOT depend on the
+        // enable_shared_from_this diamond enrollment (public virtual NodeImpl → …
+        // → core::INetwork), which silently yields an empty weak_from_this() —
+        // exactly why e527abfe's guard no-opped. Must precede listen()/outbound.
+        sharechain_node->set_lifetime(sharechain_node);
+        assert(sharechain_node->lifetime_armed() &&
+               "sharechain node dial/accept lifetime failed to arm");
+
+        node_raw->set_target_outbound_peers(
+            sharechain_addnodes.empty() ? 4 : std::max<size_t>(1, sharechain_addnodes.size()));
+        node_raw->set_seed_escalation_enabled(false);                        // (4) federation/fresh — fail-safe
+        node_raw->core::Server::listen(bip110::pool::PoolConfig::P2P_PORT);   // 9337
+
+        // M3 PR-C2 (job 2 — WON-SHARE robustness): wire the p2pool
+        // best_share_var.changed.watch(broadcast_share) RE-SPREAD trigger
+        // (p2pool/node.py:150). The per-peer fan-out already exists
+        // (broadcast_share -> broadcast_and_mark over the WHOLE m_peers set);
+        // the missing robustness was re-spreading when think() adopts a new best
+        // (a downloaded/re-evaluated tip), not just on the local mint. Fires on
+        // the IO thread with NO tracker lock held (node.cpp ASYNC-THINK IO-phase),
+        // and broadcast_share takes its OWN shared try-lock, so this respects the
+        // lock-drop-before-fan-out invariant. Set ONLY on the flag-ON path.
+        node_raw->set_on_best_share_changed([node_raw, ws = work_source.get()]() {
+            if (!node_raw) return;
+            node_raw->broadcast_share(node_raw->best_share_hash());
+            ws->bump_work_generation();   // refresh miner jobs: new prev_share_hash (LTC-shape main_ltc.cpp:2943-2947)
+        });
+
+        // (2) MINT on the stratum submit path. Mirrors main_btc.cpp:2215-2411,
+        // adapted to bip110 (164B v2 header; BLAKE2b compute_share_hash inside
+        // create_local_share). Drops the EXCLUSIVE tracker lock BEFORE broadcast.
+        work_source->set_create_share_fn(
+            [node_raw](const std::vector<unsigned char>& full_coinbase,
+                       const std::vector<unsigned char>& header_164b,
+                       const core::stratum::JobSnapshot&  job,
+                       const std::vector<unsigned char>& payout_script) -> uint256
+            {
+                if (!node_raw || header_164b.size() != 164) return uint256::ZERO;
+
+                // Parse the 164B v2 header into a full coin::BlockHeaderType.
+                bip110::coin::BlockHeaderType full_hdr;
+                try {
+                    PackStream ps(std::vector<std::byte>(
+                        reinterpret_cast<const std::byte*>(header_164b.data()),
+                        reinterpret_cast<const std::byte*>(header_164b.data()) + 164));
+                    ps >> full_hdr;
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[BIP110-CREATE-SHARE] header parse failed: " << e.what();
+                    return uint256::ZERO;
+                }
+
+                // Coinbase scriptSig (share.m_coinbase is the scriptSig, 2..100B).
+                BaseScript coinbase_bs(
+                    bip110::stratum::extract_coinbase_scriptsig(full_coinbase));
+
+                // Stratum merkle branches: hex of LE-internal bytes (ParseHex+memcpy,
+                // NOT SetHex — SetHex would reverse and break the miner's root).
+                std::vector<uint256> merkle_branches;
+                merkle_branches.reserve(job.merkle_branches.size());
+                for (const auto& bhex : job.merkle_branches) {
+                    uint256 b;
+                    auto bb = ParseHex(bhex);
+                    if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
+                    merkle_branches.push_back(b);
+                }
+
+                // EXCLUSIVE tracker lock (try, non-blocking) — decline if the
+                // compute thread is mid-think, exactly like btc.
+                std::unique_lock<std::shared_mutex> lk(
+                    node_raw->tracker_mutex(), std::try_to_lock);
+                if (!lk.owns_lock()) {
+                    LOG_INFO << "[BIP110-CREATE-SHARE] tracker busy — share deferred";
+                    return uint256::ZERO;
+                }
+
+                // (5) Caller-side mint-freshness gate — PoolConfig::STALE_SHARES
+                // (=30). Refuse to extend a stale verified tip (a private low-diff
+                // fork peers would reject). Genesis / unknown prev is exempt so the
+                // first shares can still form. BTC C1 precedent (main_btc.cpp:2287).
+                {
+                    auto& tk = node_raw->tracker();
+                    int32_t raw_h = -1;
+                    for (const auto& [hh, th] : tk.chain.get_heads()) {
+                        (void)th;
+                        auto h = tk.chain.get_height(hh);
+                        if (h > raw_h) raw_h = h;
+                    }
+                    int32_t v_h = (!job.prev_share_hash.IsNull()
+                                   && tk.chain.contains(job.prev_share_hash))
+                        ? tk.chain.get_height(job.prev_share_hash) : -1;
+                    if (raw_h >= 0 && v_h >= 0 &&
+                        (raw_h - v_h) > (int32_t)bip110::pool::PoolConfig::STALE_SHARES) {
+                        static int stale_log = 0;
+                        if (stale_log++ % 20 == 0)
+                            LOG_WARNING << "[BIP110-CREATE-SHARE] refused: verified tip stale"
+                                        << " (v_h=" << v_h << " raw_h=" << raw_h
+                                        << " gap=" << (raw_h - v_h) << " > "
+                                        << bip110::pool::PoolConfig::STALE_SHARES << ")";
+                        return uint256::ZERO;
+                    }
+                }
+
+                uint256 share_hash;
+                try {
+                    // PR-C: build_connection_coinbase now FREEZES the sharechain ref
+                    // fields into JobSnapshot.frozen_ref (populated by ref_hash_fn)
+                    // and stamps job.prev_share_hash from best_share_hash_fn, so
+                    // has_frozen=TRUE — create_local_share reproduces the EXACT
+                    // ref_hash the coinbase committed (extend-off-real-tip), instead
+                    // of re-deriving from the tracker and taking the genesis branch.
+                    // The abswork %2^64 wrap (NIT-2) is applied inside create_local_share.
+                    share_hash = bip110::pool::create_local_share(
+                        node_raw->tracker(),
+                        full_hdr,
+                        coinbase_bs,
+                        /* subsidy */               job.subsidy,
+                        /* prev_share */            job.prev_share_hash,
+                        merkle_branches,
+                        payout_script,
+                        /* donation */              66,   // WIRE-GENESIS FREEZE (0.1%)
+                        /* merged_addrs */          {},   // no merged mining on bip110
+                        /* stale_info */            bip110::pool::StaleInfo::none,
+                        /* segwit_active */         job.segwit_active,
+                        /* witness_commitment */    job.witness_commitment_hex,
+                        /* message_data */          {},
+                        /* actual_coinbase_bytes */ full_coinbase,
+                        /* witness_root */          job.witness_root,
+                        /* override_max_bits */     job.frozen_ref.max_bits,
+                        /* override_bits */         job.frozen_ref.bits,
+                        /* frozen_absheight */      job.frozen_ref.absheight,
+                        /* frozen_abswork */        job.frozen_ref.abswork,
+                        /* frozen_far_share_hash */ job.frozen_ref.far_share_hash,
+                        /* frozen_timestamp */      job.frozen_ref.timestamp,
+                        /* frozen_merged_payout */  job.frozen_ref.merged_payout_hash,
+                        /* has_frozen */            true,
+                        /* frozen_merkle_branches*/ job.frozen_ref.frozen_merkle_branches,
+                        /* frozen_witness_root */   job.frozen_ref.frozen_witness_root,
+                        /* frozen_merged_cb_info */ job.frozen_ref.frozen_merged_coinbase_info,
+                        /* share_version */         36,
+                        /* desired_version */       36);
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[BIP110-CREATE-SHARE] threw: " << e.what();
+                    return uint256::ZERO;
+                }
+
+                // FINDING A/#941 — mark the OWN minted share verified + persist
+                // its body, WHILE the exclusive lock is still held (no re-lock,
+                // no IO-thread stall). Without this the share only ever landed in
+                // the RAW chain: verified_size / has_shares stayed 0 (the operator
+                // "no bip110 shares" symptom) and the body was never written to
+                // LevelDB (local mint never goes through handle_shares), so it did
+                // not survive a restart. Own share is trivially valid — the gentx
+                // cross-check above already passed — so we mark it verified
+                // DIRECTLY, never through the crash-prone peer attempt_verify path.
+                if (!share_hash.IsNull())
+                    node_raw->verify_and_persist_local_share_locked(share_hash);
+
+                // Drop the EXCLUSIVE lock BEFORE broadcast (lock-discipline
+                // invariant — a held-lock broadcast is the serve-dead/deadlock
+                // class; broadcast_share/notify_local_share take their own locks).
+                lk.unlock();
+
+                if (!share_hash.IsNull()) {
+                    // (3) F3: hand the template tx set to the node BEFORE broadcast
+                    // so the share is backable ([{"data": <raw-tx-hex>}, ...]).
+                    nlohmann::json tmpl_txs = nlohmann::json::array();
+                    if (job.tx_data)
+                        for (const auto& tx_hex : *job.tx_data)
+                            tmpl_txs.push_back(nlohmann::json::object({{"data", tx_hex}}));
+                    node_raw->register_template_txs(share_hash, tmpl_txs);
+
+                    node_raw->broadcast_share(share_hash);
+                    node_raw->notify_local_share(share_hash);
+                    LOG_INFO << "[BIP110-CREATE-SHARE] OK + broadcast: hash="
+                             << share_hash.GetHex().substr(0, 16);
+                }
+                return share_hash;
+            });
+
+        // (6b) M3 PR-C: the coinbase's donation output (p2pool-canonical SECOND-
+        // TO-LAST, immediately before the OP_RETURN ref) MUST carry the canonical
+        // p2pool donation script — compute_gentx_before_refhash(36) (share_check.hpp)
+        // hardcodes it as the hash_link const-ending, so a peer reconstructing the
+        // gentx from the share's hash_link re-supplies exactly those bytes. Any
+        // other donation script (e.g. the operator node-owner address set at M2
+        // startup) makes the peer's reconstruction diverge -> the share is rejected.
+        // Mirrors main_btc.cpp:1829 (set_donation_script(PoolConfig::get_donation_
+        // script(ver))). Overrides the M2 node-owner donation ONLY on the flag-ON
+        // path; the OFF path keeps the operator address (byte-identical M2).
+        work_source->set_donation_script(bip110::pool::PoolConfig::get_donation_script(36));
+        LOG_INFO << "[EMB-BIP110] M3 PR-C donation output -> canonical p2pool script "
+                    "(hash_link const-ending parity; overrides M2 node-owner donation)";
+
+        // (7) M3 PR-C: feed the sharechain tip into JobSnapshot.prev_share_hash.
+        // The generic stratum_server seam (stratum_server.cpp:1607) calls this to
+        // freeze the tip ONCE per job and stores it on the job (:1807) — the SAME
+        // value build_connection_coinbase's ref walk uses. Cold start / empty chain
+        // => uint256::ZERO, and the ref walk then takes the genesis branch (correct
+        // pre-bootstrap). Mirrors main_btc.cpp:1812-1816.
+        work_source->set_best_share_hash_fn(
+            [node_raw]() -> uint256 {
+                if (!node_raw) return uint256::ZERO;
+                return node_raw->best_share_hash();
+            });
+
+        // (7b) M3 PR-C F1b: the PPLNS-distributed coinbase producer. Under
+        // read_tracker() (non-blocking; refuses the refresh if the compute thread
+        // holds the exclusive lock), calls ShareTracker::get_expected_payouts —
+        // the SSOT that returns the {scriptPubKey -> amount} map for the ENTIRE
+        // decayed PPLNS window, folding the residual into the donation script.
+        // build_connection_coinbase emits those outputs (sorted/capped, donation
+        // second-to-last) so the minted coinbase == generate_share_transaction
+        // byte-for-byte and peers ACCEPT the share. Mirrors main_btc.cpp
+        // set_pplns_fn; no AutoRatchet (v36 always), no v35 branch, no merged
+        // mining. Empty map (tracker busy) => build_connection_coinbase refuses the
+        // sharechain job (fail-closed). Set ONLY inside this flag-ON block, so its
+        // presence is the exact --bip110-sharechain predicate.
+        work_source->set_pplns_fn(
+            [node_raw](const uint256& prev, const uint256& block_target,
+                       uint64_t subsidy, const std::vector<unsigned char>& donation_script)
+                -> std::map<std::vector<unsigned char>, double> {
+                if (!node_raw) return {};
+                auto guard = node_raw->read_tracker();
+                if (!guard) return {};                 // tracker busy -> refuse this refresh
+                try {
+                    return guard->get_expected_payouts(prev, block_target, subsidy, donation_script);
+                } catch (const std::exception&) {
+                    return {};
+                }
+            });
+
+        // (8) M3 PR-C: the coinbase ref-commitment producer. Walks the share
+        // tracker off prev_share_hash for the deterministic chain-position fields
+        // (absheight/abswork/far_share_hash) + the share target (compute_share_
+        // target), then computes the p2pool ref_hash via the lane SSOT
+        // bip110::pool::compute_ref_hash_for_work. build_connection_coinbase embeds
+        // the returned ref_hash in the coinbase OP_RETURN and freezes these fields
+        // into JobSnapshot.frozen_ref; create_local_share (has_frozen=TRUE) then
+        // reproduces the EXACT ref_hash, so the commitment the coinbase carries ==
+        // what a peer recomputes off the minted share (mint==verify, peers accept).
+        //
+        // Near-verbatim port of main_btc.cpp:1869-2125 with the bip110 v36 deltas:
+        //   • share_version = desired_version = 36 (no AutoRatchet — v36 always)
+        //   • donation u16 = 66 (WIRE-GENESIS freeze, 0.1%; NOT btc's 50)
+        //   • no merged mining (merged_addresses / merged_coinbase_info empty)
+        //   • segwit_data = a REAL SegwitData with the coinbase-only witness merkle
+        //     root ZERO (merkle([0]), python v36 data.py:1090) — NOT the 0xff None-
+        //     sentinel. create_local_share stores this same ZERO root for a segwit-
+        //     active coinbase-only share, so the ref MUST serialize ZERO too
+        //     (has_segwit=true path) or the ref_hash diverges. This is also what the
+        //     found-block coinbase witness commitment is computed over, so a won
+        //     block passes segwit's witness-commitment consensus check.
+        //   • timestamp clipped to prev->m_timestamp+1 BEFORE compute_share_target,
+        //     matching create_local_share's ordering (share_check.hpp:2256-2269) so
+        //     the (bits,max_bits) the ref commits equal what peers derive.
+        work_source->set_ref_hash_fn(
+            [node_raw](const uint256& prev_share_hash,
+                       const std::vector<unsigned char>& scriptSig,
+                       const std::vector<unsigned char>& payout_script,
+                       uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)
+            -> core::stratum::RefHashResult
+            {
+                core::stratum::RefHashResult result;
+                result.share_version   = 36;
+                result.desired_version = 36;
+                result.timestamp       = timestamp;   // overwritten below if clipped
+
+                bip110::pool::RefHashParams p;
+                p.share_version   = 36;
+                p.desired_version = 36;
+                p.prev_share      = prev_share_hash;
+                p.coinbase_scriptSig = scriptSig;
+                p.share_nonce     = 0;                // share commitment nonce (== m_nonce)
+                p.subsidy         = subsidy;          // BLOCK subsidy (== job.subsidy)
+                p.donation        = 66;               // WIRE-GENESIS freeze (0.1%)
+                p.stale_info      = 0;
+                p.timestamp       = timestamp;
+
+                // Pubkey extract — MUST mirror create_local_share (share_check.hpp:
+                // 2296-2316) so the payout identity the ref commits == the minted
+                // share's. P2PKH(25)/P2SH(23)/P2WPKH(22).
+                if (payout_script.size() >= 20) {
+                    if (payout_script.size() == 25 &&
+                        payout_script[0] == 0x76 && payout_script[1] == 0xa9 &&
+                        payout_script[2] == 0x14 && payout_script[23] == 0x88 &&
+                        payout_script[24] == 0xac) {
+                        std::memcpy(p.pubkey_hash.data(), payout_script.data() + 3, 20);
+                        p.pubkey_type = 0;
+                    } else if (payout_script.size() == 23 &&
+                               payout_script[0] == 0xa9 && payout_script[1] == 0x14 &&
+                               payout_script[22] == 0x87) {
+                        std::memcpy(p.pubkey_hash.data(), payout_script.data() + 2, 20);
+                        p.pubkey_type = 2;
+                    } else if (payout_script.size() == 22 &&
+                               payout_script[0] == 0x00 && payout_script[1] == 0x14) {
+                        std::memcpy(p.pubkey_hash.data(), payout_script.data() + 2, 20);
+                        p.pubkey_type = 1;
+                    } else {
+                        std::memcpy(p.pubkey_hash.data(), payout_script.data(), 20);
+                        p.pubkey_type = 0;
+                    }
+                }
+
+                // Segwit (coinbase-only): match create_local_share's segwit-active
+                // coinbase-only SegwitData — empty txid_merkle_link branch + the REAL
+                // witness merkle root ZERO (merkle([0]), python v36 data.py:1090), NOT
+                // the 0xff None-sentinel. MUST be the has_segwit=TRUE path so this
+                // exact root is serialized into the ref_hash. The found-block coinbase
+                // witness commitment is computed over this same ZERO root, so a won
+                // block passes segwit's witness-commitment consensus check.
+                p.has_segwit  = true;
+                {
+                    bip110::pool::SegwitData sd = bip110::pool::SegwitDataDefault::get();
+                    sd.m_wtxid_merkle_root = uint256::ZERO;   // coinbase-only real root
+                    p.segwit_data = sd;
+                }
+
+                // Genesis / tracker-busy fallbacks (ref_hash won't match a live tip,
+                // but that IS the right answer pre-bootstrap / when prev unknown).
+                auto set_genesis = [&] {
+                    p.absheight = 1;
+                    p.far_share_hash = uint256::ZERO;
+                    p.abswork = uint128(chain::target_to_average_attempts(
+                        chain::bits_to_target(p.bits)).GetLow64());
+                };
+                auto set_block_bits_fallback = [&] {
+                    p.bits = block_bits; p.max_bits = block_bits;
+                    result.bits = block_bits; result.max_bits = block_bits;
+                };
+
+                if (node_raw) {
+                    auto guard = node_raw->read_tracker();
+                    if (guard) {
+                        auto& tracker = *guard;
+                        // Step 1: clip timestamp + absheight + far_share_hash off prev
+                        // (BEFORE compute_share_target — share_check.hpp ordering).
+                        if (!prev_share_hash.IsNull() && tracker.chain.contains(prev_share_hash)) {
+                            tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
+                                p.absheight = prev->m_absheight + 1;
+                                if (p.timestamp <= prev->m_timestamp)
+                                    p.timestamp = prev->m_timestamp + 1;
+                            });
+                            auto [prev_height, _last] =
+                                tracker.chain.get_height_and_last(prev_share_hash);
+                            if (prev_height >= 99) {
+                                try {
+                                    p.far_share_hash =
+                                        tracker.chain.get_nth_parent_key(prev_share_hash, 99);
+                                } catch (const std::exception&) {
+                                    p.far_share_hash = uint256::ZERO;
+                                }
+                            } else {
+                                p.far_share_hash = uint256::ZERO;
+                            }
+                            // Step 2: share_target with the CLIPPED timestamp.
+                            try {
+                                auto st = tracker.compute_share_target(
+                                    prev_share_hash, p.timestamp,
+                                    chain::bits_to_target(block_bits));
+                                p.bits = st.bits; p.max_bits = st.max_bits;
+                                result.bits = st.bits; result.max_bits = st.max_bits;
+                            } catch (const std::exception&) {
+                                set_block_bits_fallback();
+                            }
+                            // Step 3: abswork = prev_abswork + aps(this-share-bits).
+                            tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
+                                auto attempts = chain::target_to_average_attempts(
+                                    chain::bits_to_target(p.bits));
+                                p.abswork = uint128(
+                                    (prev->m_abswork + uint128(attempts.GetLow64())).GetLow64());
+                            });
+                            // Step 4: merged_payout_hash — computed on THIS guard (no
+                            // re-lock). Verify recomputes with the BLOCK target
+                            // (share.m_min_header.m_bits), so use block_bits here.
+                            try {
+                                p.merged_payout_hash = tracker.compute_merged_payout_hash(
+                                    prev_share_hash, chain::bits_to_target(block_bits));
+                            } catch (const std::exception&) {
+                                p.merged_payout_hash = uint256();
+                            }
+                        } else {
+                            // prev unknown / genesis: derive share_target off null prev
+                            // (compute_share_target returns the floor), then genesis.
+                            try {
+                                auto st = tracker.compute_share_target(
+                                    prev_share_hash, p.timestamp,
+                                    chain::bits_to_target(block_bits));
+                                p.bits = st.bits; p.max_bits = st.max_bits;
+                                result.bits = st.bits; result.max_bits = st.max_bits;
+                            } catch (const std::exception&) {
+                                set_block_bits_fallback();
+                            }
+                            set_genesis();
+                        }
+                    } else {
+                        // Tracker busy — fallback (ref_hash won't match peers).
+                        set_block_bits_fallback();
+                        set_genesis();
+                    }
+                } else {
+                    set_block_bits_fallback();
+                    set_genesis();
+                }
+
+                // Mirror the walked values into the result for snap.frozen_ref.
+                result.absheight      = p.absheight;
+                result.abswork        = p.abswork;
+                result.far_share_hash = p.far_share_hash;
+                result.timestamp      = p.timestamp;
+                result.merged_payout_hash = p.merged_payout_hash;
+
+                try {
+                    auto [rh, nn] = bip110::pool::compute_ref_hash_for_work(p);
+                    result.ref_hash         = rh;
+                    result.last_txout_nonce = nn;
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[BIP110-STRATUM] compute_ref_hash_for_work threw: "
+                                << e.what();
+                    // result.ref_hash stays null -> build_connection_coinbase refuses.
+                }
+                return result;
+            });
+
+        LOG_INFO << "[EMB-BIP110] M3 PR-C ref-commitment wired (best_share + ref_hash;"
+                    " coinbase carries the v36 ref_hash, mint has_frozen=TRUE)";
+
+        // FINDING C — arm the standalone periodic verified-flush timer so a
+        // low-share-rate / idle node persists recent verified shares on a fixed
+        // cadence, independent of think() events and the >=50 fast path. Flag-ON
+        // only. The graceful-shutdown flush is wired at the signal handler below.
+        node_raw->arm_flush_timer();
+
+        // (6) IRREVERSIBLE first-outbound to the fresh federation sharechain.
+        // Stays INSIDE the flag-ON block so it never runs by default.
+        node_raw->start_outbound_connections();
+        LOG_INFO << "[EMB-BIP110] M3 sharechain MINT wired + node LIVE on :"
+                 << bip110::pool::PoolConfig::P2P_PORT
+                 << " (--bip110-sharechain; prefix=" << bip110::pool::PoolConfig::prefix_hex()
+                 << " proto=" << bip110::pool::PoolConfig::ADVERTISED_PROTOCOL_VERSION
+                 << " share=v36) — outbound dialing started";
+    } else {
+        LOG_INFO << "[EMB-BIP110] M3 sharechain DISABLED (M2 header-follower; pass "
+                    "--bip110-sharechain to arm the mint) — nothing minted, no sharechain node";
+    }
+
     std::unique_ptr<core::StratumServer> stratum_server;
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(
@@ -335,7 +899,8 @@ int run_embedded(bool coin_p2p_discover,
     // FIRST (so the post-tip mempool passes see the applied block), mirroring
     // main_btc.cpp. This deepens the T2 pricing view one block at a time.
     coin_node.full_block.subscribe(
-        [&header_chain, &utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH]
+        [&header_chain, &utxo_cache, &utxo_db, &mempool, bip110_txid, BIP110_KEEP_DEPTH,
+         explorer_enabled, EXPLORER_DEPTH]
         (const bip110::coin::BlockType& block)
         {
             auto packed_hdr = pack(static_cast<const bip110::coin::BlockHeaderType&>(block));
@@ -363,6 +928,20 @@ int run_embedded(bool coin_p2p_discover,
                 utxo_db.put_block_undo(height, undo);
                 utxo_cache.flush(block_hash, height);
                 utxo_cache.prune_undo(height, BIP110_KEEP_DEPTH);
+                // Explorer raw-block retention (flag-gated, pruned to depth). The
+                // bip110 node already downloads every full block for its UTXO
+                // view; keep the last EXPLORER_DEPTH bodies for /api/explorer
+                // getblock. Storage only — no consensus/reward/coinbase change.
+                if (explorer_enabled) {
+                    PackStream ps;
+                    ps << block;
+                    auto span = ps.get_span();
+                    std::vector<uint8_t> raw(
+                        reinterpret_cast<const uint8_t*>(span.data()),
+                        reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+                    utxo_db.put_raw_block(height, raw);
+                    utxo_db.prune_raw_blocks(height, EXPLORER_DEPTH);
+                }
                 mempool.set_tip_height(height);
                 LOG_INFO << "[EMB-BIP110] UTXO connect: h=" << height
                          << " txs=" << block.m_txs.size()
@@ -487,16 +1066,150 @@ int run_embedded(bool coin_p2p_discover,
                  << " groups=" << st.unique_groups;
     }
 
+    // ── SELF-ADDRESS ADVERTISEMENT primitives (Knots net.cpp GetLocalAddress /
+    // SeenLocal / self-connect nonce). Shared by the primary NodeP2P, every
+    // fan-out slot, and the InboundListener so a reachable-address vote learned on
+    // ANY arm advertises on ALL. This is the reachability keystone: just listening
+    // on :8333 is not enough — the fork network must LEARN our address, which
+    // happens when we self-announce it and peers gossip it onward. Declared at
+    // run_embedded scope so the shared_ptrs outlive ioc.run(). ──────────────────
+    auto local_addr =
+        std::make_shared<bip110::coin::p2p::LocalAddrTable>(uint16_t{8333});
+    if (!coin_externalip.empty()) {
+        local_addr->set_external(coin_externalip);
+        LOG_INFO << "[EMB-BIP110] self-advertise external IP pinned: "
+                 << coin_externalip << ":8333 (--coin-externalip)";
+    } else {
+        LOG_INFO << "[EMB-BIP110] self-advertise: no --coin-externalip; will learn "
+                    "our reachable IP from fork-peer version echoes (Knots SeenLocal)";
+    }
+    auto self_nonce = std::make_shared<bip110::coin::p2p::SelfNonceRegistry>();
+
+    // ── COIN-P2P INBOUND LISTENER (:8333) ─────────────────────────────────────
+    // Make the branded coin-p2p node (/c2pool:0.1/bip110/frstrtr/ + NODE_BLAKE2B)
+    // REACHABLE: the primary NodeP2P is outbound-only, so only the ~6 fork peers
+    // we dial ever see our UA. A separate accept-only InboundListener on
+    // 0.0.0.0:8333 lets bitnodes/crawlers and any fork node DIAL US and record
+    // our brand + services. It REUSES core::Server's accept path (the same
+    // eb60bf4c strong-ref UAF guard as the outbound arm) via set_lifetime BEFORE
+    // listen(), the broadcaster per-slot session pattern, and the addrman getaddr
+    // supplier. The primary NodeP2P (coin_node) stays UNTOUCHED — zero regression
+    // to the outbound fork peers. Network-identity only: version/verack/ping/
+    // getaddr are FREE p2p (no consensus/wire/params change). Always-on whenever
+    // coin p2p is armed (not sharechain-flag-gated). Declared at run_embedded
+    // scope so it outlives ioc.run().
+    std::shared_ptr<bip110::coin::p2p::InboundListener<MiniConfig>> inbound_listener;
+    if (coin_p2p_discover) {
+        inbound_listener =
+            std::make_shared<bip110::coin::p2p::InboundListener<MiniConfig>>(&ioc, &config);
+        // ARM the accept-path UAF guard BEFORE listen(): register the listener's
+        // own control block as its INetwork lifetime so core::Server::accept's
+        // async_accept completion pins it by a strong ref (factory.hpp:83-117).
+        inbound_listener->set_lifetime(inbound_listener);
+        assert(inbound_listener->lifetime_armed() && "inbound listener lifetime failed to arm");
+        // Self-address advertisement on the accept path: version addr_from + the
+        // self-addr push at handshake + the self record in getaddr replies all
+        // read our reachable addr from here; the self-connect nonce guard drops a
+        // loopback dial. Shared with the outbound arms.
+        inbound_listener->set_local_addr_table(local_addr);
+        inbound_listener->set_self_nonce_registry(self_nonce);
+        // getaddr replies come from the SAME fork-filtered, routable tried set the
+        // fan-out broadcaster draws from (mutex-guarded, read-only, io-safe). A
+        // large cap (Knots serves up to 1000) so a crawler learns the whole mesh.
+        if (coin_peer_mgr) {
+            auto* mgr = coin_peer_mgr.get();
+            inbound_listener->set_addr_supplier([mgr]() {
+                std::vector<NetService> out;
+                for (const auto& ep : mgr->get_tried_peers(/*max_count=*/1000))
+                    out.push_back(ep.to_net_service());
+                return out;
+            });
+            // Inbound `addr` gossip → the shared addrman (was dropped on the floor):
+            // a dialer's address set now grows our DB just like the outbound crawl.
+            inbound_listener->set_addr_callback(
+                [mgr](const std::vector<NetService>& addrs, const NetService& source) {
+                    for (const auto& a : addrs)
+                        mgr->add_discovered_peer(a, source.address());
+                });
+        }
+        // Advertise our header-chain tip in the version reply (cosmetic; crawlers
+        // only record UA + services).
+        inbound_listener->set_height_supplier([&header_chain]() {
+            return static_cast<uint32_t>(header_chain.height());
+        });
+        inbound_listener->core::Server::listen(uint16_t{8333});   // 0.0.0.0:8333
+        LOG_INFO << "[EMB-BIP110] coin-p2p INBOUND listener ARMED on 0.0.0.0:8333 "
+                    "(subver=" << bip110::coin::p2p::BIP110_COIN_SUBVER
+                 << ", services=NODE_NETWORK|NODE_WITNESS|NODE_BLAKE2B, cap="
+                 << bip110::coin::p2p::InboundListener<MiniConfig>::MAX_INBOUND << ")";
+    }
+
+    // ── Knots peer-discovery wiring (getaddr crawl + addr ingest + scorer
+    // feedback), ported from Bitcoin Knots net/net_processing. The PRIMARY
+    // coin-P2P arm now (1) sends getaddr on connect, (2) banks the NODE_BLAKE2B-
+    // filtered addr gossip into the bucketed addrman (source-group keyed), and
+    // (3) feeds connect / disconnect / dial-failure back to the scorer so the
+    // tried table fills. Without this the embedded node latched at the single
+    // oracle peer and never grew (dashboard "CONNECTIONS 1 Active/Target").
+    // Stored on the coin Node and re-applied to every start_p2p() redial. ───────
+    if (coin_peer_mgr) {
+        auto* mgr = coin_peer_mgr.get();
+        coin_node.enable_getaddr_discovery();
+        coin_node.set_addr_callback(
+            [mgr](const std::vector<NetService>& addrs, const NetService& source) {
+                for (const auto& a : addrs)
+                    mgr->add_discovered_peer(a, source.address());
+            });
+        coin_node.set_on_peer_connected(
+            [mgr](const NetService& s) { mgr->notify_connected(s.to_string()); });
+        coin_node.set_on_peer_disconnected(
+            [mgr](const NetService& s) { mgr->notify_disconnected(s.to_string()); });
+        coin_node.set_on_dial_failed(
+            [mgr](const NetService& s) { mgr->notify_dial_failed(s.to_string()); });
+        // Self-address advertisement on the primary arm: addr_from = our reachable
+        // IP, SeenLocal from the peer's version echo, self-addr push at verack +
+        // on the ping tick, and the self-connect nonce guard. Shared tables.
+        coin_node.set_local_addr_table(local_addr);
+        coin_node.set_self_nonce_registry(self_nonce);
+        // addr-relay sink (Knots RelayAddress 2-hop gossip): a fresh batch we
+        // banked is forwarded to a couple of inbound sessions so a learned peer's
+        // reachability spreads through us. Weak-capture the listener (may be null
+        // in non-discovery builds; here it is always set alongside coin_peer_mgr).
+        if (inbound_listener) {
+            std::weak_ptr<bip110::coin::p2p::InboundListener<MiniConfig>> weak_il = inbound_listener;
+            coin_node.set_addr_relay_sink(
+                [weak_il](const std::vector<bip110::coin::p2p::btc_addr_record_t>& recs,
+                          const NetService& source) {
+                    if (auto il = weak_il.lock())
+                        il->relay_addr(recs, source.to_string(), /*fanout=*/2);
+                });
+        }
+        LOG_INFO << "[EMB-BIP110] Knots peer crawl wired (primary arm): "
+                    "getaddr-on-connect + NODE_BLAKE2B addr ingest + scorer feedback "
+                    "+ self-advertise (addr_from/SeenLocal/self-addr) + addr-relay";
+    }
+
     // Round-robin dialer over explicit peers + the discovered set. Redials the
     // next candidate whenever the handshake is not complete (a non-fork peer is
     // dropped at the NODE_BLAKE2B version gate and we walk on).
     auto explicit_list = std::make_shared<std::vector<NetService>>(explicit_peers);
     auto explicit_idx  = std::make_shared<size_t>(0);
     auto tried = std::make_shared<std::set<std::string>>();
-    auto dial_next = [&coin_node, &coin_peer_mgr, explicit_list, explicit_idx, tried]() -> bool {
+    // The address the PRIMARY coin-P2P arm is currently dialing. Captured on every
+    // (re)dial so the fan-out broadcaster can EXCLUDE it (set_primary_addr): with
+    // the addrman near-empty the fan-out candidate set would otherwise be the same
+    // one peer the primary already holds, so a fan-out probe opens a DUPLICATE
+    // inbound to it, which Knots drops as redundant (the "EOF shortly after
+    // getaddr" churn). Excluding the primary makes each fan-out probe dial a
+    // DISTINCT fork peer, stay handshaked, and survive to receive the delayed addr
+    // reply (and, via the self-authenticated add, bank itself into the addrman).
+    auto primary_addr = std::make_shared<NetService>();
+    auto dial_next = [&coin_node, &coin_peer_mgr, explicit_list, explicit_idx, tried,
+                      primary_addr]() -> bool {
         // Prefer explicit peers first (round-robin), then discovered candidates.
         if (!explicit_list->empty()) {
             NetService ep = (*explicit_list)[(*explicit_idx)++ % explicit_list->size()];
+            *primary_addr = ep;
             LOG_INFO << "[EMB-BIP110] dialing explicit fork peer " << ep.to_string();
             coin_node.start_p2p(ep);
             return true;
@@ -510,6 +1223,7 @@ int run_embedded(bool coin_p2p_discover,
             }
             const auto& ep = cands.front();
             tried->insert(ep.to_string());
+            *primary_addr = ep.to_net_service();
             LOG_INFO << "[EMB-BIP110] dialing discovered fork peer " << ep.to_string();
             coin_node.start_p2p(ep.to_net_service());
             return true;
@@ -517,6 +1231,109 @@ int run_embedded(bool coin_p2p_discover,
         return false;
     };
     dial_next();
+
+    // ── M3 PR-C2: construct the addrman-backed FOUND-BLOCK fan-out pool + the
+    // found-block keystone (flag-ON only). Placed AFTER coin_peer_mgr (the
+    // NODE_BLAKE2B addrman) and dial_next (the primary is now dialing). With the
+    // flag OFF this whole block is skipped: coin_broadcaster* stay null and
+    // stratum_submit_fn keeps calling coin_node.submit_block_with_fallback —
+    // byte-identical to M2. ─────────────────────────────────────────────────────
+    std::shared_ptr<io::steady_timer> broadcaster_timer;
+    if (sharechain_enabled) {
+        constexpr size_t kFanoutMaxPeers = 8;
+        coin_broadcaster = std::make_unique<bip110::coin::Bip110Broadcaster<MiniConfig>>(
+            &ioc,
+            static_cast<bip110::interfaces::Node*>(&coin_node),
+            &config,
+            kFanoutMaxPeers);
+        coin_broadcaster_full =
+            std::make_unique<bip110::coin::Bip110BroadcasterFull<MiniConfig>>(
+                coin_broadcaster.get());
+        // ARM B — the standing primary sink (M2 path: primary coin-P2P relay +
+        // optional submitblock RPC backup). Never masked by ARM A.
+        coin_broadcaster_full->set_primary_submit(
+            [&coin_node](const std::vector<unsigned char>& b) {
+                return coin_node.submit_block_with_fallback(b);
+            });
+        // Wire the SAME Knots peer-discovery seams onto every fan-out slot, so a
+        // fan-out peer's addr gossip ALSO grows the shared addrman + tried set
+        // (not just the primary arm). Only when the scored peer manager exists.
+        if (coin_peer_mgr) {
+            auto* mgr = coin_peer_mgr.get();
+            std::weak_ptr<bip110::coin::p2p::InboundListener<MiniConfig>> weak_il = inbound_listener;
+            coin_broadcaster->set_slot_configurator(
+                [mgr, local_addr, self_nonce, weak_il](bip110::coin::p2p::NodeP2P<MiniConfig>& slot) {
+                    slot.enable_getaddr_discovery();
+                    slot.set_addr_callback(
+                        [mgr](const std::vector<NetService>& addrs, const NetService& source) {
+                            for (const auto& a : addrs)
+                                mgr->add_discovered_peer(a, source.address());
+                        });
+                    slot.set_on_peer_connected(
+                        [mgr](const NetService& s) { mgr->notify_connected(s.to_string()); });
+                    slot.set_on_peer_disconnected(
+                        [mgr](const NetService& s) { mgr->notify_disconnected(s.to_string()); });
+                    slot.set_on_dial_failed(
+                        [mgr](const NetService& s) { mgr->notify_dial_failed(s.to_string()); });
+                    // Same self-advertise seams on every fan-out slot so a peer
+                    // echo / self-addr learned on any link advertises on all.
+                    slot.set_local_addr_table(local_addr);
+                    slot.set_self_nonce_registry(self_nonce);
+                    slot.set_addr_relay_sink(
+                        [weak_il](const std::vector<bip110::coin::p2p::btc_addr_record_t>& recs,
+                                  const NetService& source) {
+                            if (auto il = weak_il.lock())
+                                il->relay_addr(recs, source.to_string(), /*fanout=*/2);
+                        });
+                });
+        }
+        LOG_INFO << "[EMB-BIP110] M3 PR-C2 found-block fan-out ARMED (max_peers="
+                 << kFanoutMaxPeers << ") — ARM A embedded NODE_BLAKE2B fan-out + "
+                    "ARM B primary relay/RPC";
+
+        // Self-rescheduling discovery tick: grow the fan-out pool from the
+        // addrman tried set + explicit fork peers, and prune dead slots. The
+        // pool stays warm so a found block fans to many peers immediately.
+        broadcaster_timer = std::make_shared<io::steady_timer>(ioc);
+        auto bc_tick = std::make_shared<std::function<void()>>();
+        std::weak_ptr<std::function<void()>> weak_bc_tick = bc_tick;
+        *bc_tick = [broadcaster_timer, weak_bc_tick, &coin_broadcaster, &coin_peer_mgr,
+                    explicit_list, primary_addr]() {
+            // Keep the fan-out's primary-exclusion current with the primary arm's
+            // live dial target, so a slot is never spent dueling the primary for
+            // the same peer (the redundant-inbound EOF). Harmless if unset.
+            if (coin_broadcaster && !primary_addr->address().empty())
+                coin_broadcaster->set_primary_addr(*primary_addr);
+            std::vector<NetService> targets;
+            // Explicit fork peers first (the operator's pinned NODE_BLAKE2B set).
+            for (const auto& ep : *explicit_list) targets.push_back(ep);
+            // Then the addrman tried set (NODE_BLAKE2B-filtered, scored).
+            if (coin_peer_mgr)
+                for (const auto& ep : coin_peer_mgr->get_tried_peers(/*max_count=*/16))
+                    targets.push_back(ep.to_net_service());
+            // GAP-6 (raise the fan-out target off 1): ALSO draw NEW, learned-but-
+            // not-yet-tried fork peers straight from the bucketed addrman via the
+            // scored dial planner (group diversity + backoff + feeler enforced in
+            // get_peers_to_connect). Without this the fan-out could only redial
+            // the tried set, so a freshly-crawled oracle mesh was never dialed and
+            // the pool stayed pinned at the explicit/primary peer.
+            if (coin_peer_mgr) {
+                std::set<std::string> none;
+                for (const auto& ep : coin_peer_mgr->get_peers_to_connect(none))
+                    targets.push_back(ep.to_net_service());
+            }
+            if (coin_broadcaster) {
+                coin_broadcaster->prune_dead();
+                coin_broadcaster->discover(targets);
+            }
+            if (auto self = weak_bc_tick.lock()) {
+                broadcaster_timer->expires_after(std::chrono::seconds(30));
+                broadcaster_timer->async_wait(
+                    [self](const boost::system::error_code& ec) { if (!ec) (*self)(); });
+            }
+        };
+        (*bc_tick)();
+    }
 
     // Self-rescheduling driver: (re)issue getheaders on a fresh handshake or a
     // stall, and fail over to the next candidate after no header progress.
@@ -601,14 +1418,290 @@ int run_embedded(bool coin_p2p_discover,
         // rest_web_currency_info "BIP110" branch brand it; the BITCOIN enum alone
         // would render as Bitcoin).
         mi->set_coin_label("BIP110");
+
+        // ── Explorer API callbacks (loopback-only, read-only) ─────────────────
+        // Enable the node /api/explorer surface that explorer.py --c2pool
+        // consumes. This is the ONLY caller of set_explorer_enabled on this lane
+        // (main_ltc.cpp is the reference); without it http_session's gate answers
+        // {"error":"Explorer not enabled"}. All feeds are display-only reads over
+        // the header chain / retained raw blocks / mempool snapshot — no
+        // consensus/reward/share/coinbase/wire path is touched. #99 SPV bounds:
+        // fields the node cannot serve are named-refused, never faked.
+        //
+        // Chain-key trap: explorer.py always sends ?chain=bip110, but the node's
+        // own primary_chain_key() returns "btc" on a BITCOIN-enum lane (the
+        // default when ?chain= is absent). Accept "bip110", "btc", and "" — this
+        // is a single-chain node, so any of them means the bip110 chain.
+        if (explorer_enabled) {
+            mi->set_explorer_enabled(true);
+            auto chain_ok = [](const std::string& c) {
+                return c.empty() || c == "bip110" || c == "btc";
+            };
+            auto* hc  = &header_chain;
+            auto* udb = &utxo_db;
+            auto* mp  = &mempool;
+
+            // getblockchaininfo — header-chain derived (always servable).
+            mi->set_explorer_chaininfo_fn(
+                [hc, chain_ok, EXPLORER_DEPTH](const std::string& chain) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Unknown chain or chain not enabled"}};
+                    nlohmann::json r;
+                    r["chain"]   = "main";
+                    r["blocks"]  = hc->height();
+                    r["headers"] = static_cast<uint64_t>(hc->size());
+                    r["explorer_depth"] = EXPLORER_DEPTH;
+                    auto t = hc->tip();
+                    r["bestblockhash"] = t ? t->block_hash.GetHex() : "";
+                    if (t) {
+                        auto target = bip110::coin::target_from_bits(t->header.m_bits);
+                        double diff = target.IsNull() ? 0.0
+                            : hc->params().pow_limit.getdouble() / target.getdouble();
+                        r["difficulty"] = diff;
+                    }
+                    return r;
+                });
+
+            // getblockhash — header-chain derived (always servable within chain).
+            mi->set_explorer_blockhash_fn(
+                [hc, chain_ok](uint32_t height, const std::string& chain) -> std::string {
+                    if (!chain_ok(chain)) return {};
+                    auto e = hc->get_header_by_height(height);
+                    if (e) return e->block_hash.GetHex();
+                    return {};
+                });
+
+            // getblock — deserialize retained raw block, run block_to_explorer_json.
+            // #99: below the retention depth OR body not yet stored → named refusal.
+            mi->set_explorer_getblock_fn(
+                [hc, udb, chain_ok, EXPLORER_DEPTH](const std::string& hash_hex,
+                                    const std::string& chain) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Unknown chain or chain not enabled"}};
+                    uint256 blk_hash;
+                    blk_hash.SetHex(hash_hex);
+                    auto entry = hc->get_header(blk_hash);
+                    if (!entry)
+                        return nlohmann::json{{"error", "Block not in header chain"}};
+
+                    // DASH-shape (#1460/#99) header partial: every indexed header
+                    // answers; bodies stay honestly absent — never tx: [], never
+                    // fabricated sizes. The explorer drops any getblock JSON that
+                    // carries an "error" key, so an un-retained/out-of-window block
+                    // must still return header truth (no "error") to render a row.
+                    // Bodies only ADD detail in the 288-block window; they never
+                    // remove the header answer. Mirrors main_dash.cpp:4496-4563.
+                    auto header_partial = [hc](const bip110::coin::IndexEntry& e) -> nlohmann::json {
+                        nlohmann::json r;
+                        r["hash"]              = e.block_hash.GetHex();
+                        r["height"]            = e.height;
+                        r["version"]           = static_cast<int64_t>(e.header.m_version);
+                        r["previousblockhash"] = e.header.m_previous_block.GetHex();
+                        r["merkleroot"]        = e.header.m_merkle_root.GetHex();
+                        r["time"]              = e.header.m_timestamp;
+                        r["bits"]              = bip110::coin::detail::bits_to_hex_str(e.header.m_bits);
+                        r["nonce"]             = e.header.m_nonce;
+                        r["confirmations"]     = static_cast<int64_t>(hc->height()) - static_cast<int64_t>(e.height) + 1;
+                        if (auto nxt = hc->get_header_by_height(e.height + 1))
+                            r["nextblockhash"] = nxt->block_hash.GetHex();
+                        auto target = bip110::coin::target_from_bits(e.header.m_bits);
+                        if (!target.IsNull())
+                            r["difficulty"] = hc->params().pow_limit.getdouble() / target.getdouble();
+                        const char* why = "requires the block body; this SPV node retains headers only "
+                                          "(bodies kept for the last 288 blocks once received)";
+                        nlohmann::json unavailable = nlohmann::json::object();
+                        for (const char* f : {"tx", "nTx", "size", "strippedsize", "weight"})
+                            unavailable[f] = why;
+                        r["unavailable"] = unavailable;
+                        r["partial"] = true;
+                        return r;
+                    };
+
+                    uint32_t height = entry->height;
+                    uint32_t tip = hc->height();
+                    if (tip > EXPLORER_DEPTH && height < tip - EXPLORER_DEPTH)
+                        return header_partial(*entry);
+                    auto raw = udb->get_raw_block(height);
+                    if (!raw)
+                        return header_partial(*entry);
+                    bip110::coin::BlockType block;
+                    try {
+                        PackStream ps(*raw);
+                        ps >> block;
+                    } catch (...) {
+                        return header_partial(*entry);
+                    }
+                    bip110::coin::ExplorerChainParams params;
+                    params.bech32_hrp = "bc";
+                    params.p2pkh_ver  = 0x00;
+                    params.p2sh_ver   = 0x05;
+                    params.chain_name = "main";
+                    try {
+                        return bip110::coin::block_to_explorer_json(block, height, blk_hash, params);
+                    } catch (const std::exception&) {
+                        return header_partial(*entry);
+                    } catch (...) {
+                        return header_partial(*entry);
+                    }
+                });
+
+            // getmempoolinfo — summary stats + feerate histogram.
+            mi->set_explorer_mempoolinfo_fn(
+                [mp, chain_ok](const std::string& chain) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Mempool not available for chain"}};
+                    auto snap = mp->get_summary();
+                    time_t now = std::time(nullptr);
+                    struct Bucket { double lo, hi; size_t count{0}; size_t bytes{0}; };
+                    std::vector<Bucket> buckets = {{0,1},{1,5},{5,20},{20,100},{100,1e9}};
+                    for (const auto& e : snap.entries) {
+                        double fr = e.feerate();
+                        for (auto& b : buckets) {
+                            if (fr >= b.lo && fr < b.hi) { ++b.count; b.bytes += e.base_size; break; }
+                        }
+                    }
+                    nlohmann::json hist = nlohmann::json::array();
+                    for (const auto& b : buckets) {
+                        hist.push_back({
+                            {"min_feerate", b.lo},
+                            {"max_feerate", b.hi >= 1e9 ? nlohmann::json("inf") : nlohmann::json(b.hi)},
+                            {"count", b.count}, {"bytes", b.bytes}});
+                    }
+                    return nlohmann::json{
+                        {"size", snap.tx_count},
+                        {"bytes", snap.total_bytes},
+                        {"total_weight", snap.total_weight},
+                        {"total_fees", snap.total_fees},
+                        {"fee_known_count", snap.fee_known_count},
+                        {"fee_unknown_count", snap.tx_count - snap.fee_known_count},
+                        {"min_feerate", snap.min_feerate},
+                        {"max_feerate", snap.max_feerate},
+                        {"median_feerate", snap.median_feerate},
+                        {"avg_feerate", snap.avg_feerate},
+                        {"oldest_age_sec", (snap.oldest_time > 0 && now > snap.oldest_time)
+                                              ? (now - snap.oldest_time) : 0},
+                        {"fee_histogram", hist},
+                        {"chain", "bip110"}};
+                });
+
+            // getrawmempool — txid list or verbose entries.
+            mi->set_explorer_rawmempool_fn(
+                [mp, chain_ok](const std::string& chain, bool verbose, uint32_t limit) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Mempool not available for chain"}};
+                    if (!verbose) {
+                        auto txids = mp->all_txids();
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (const auto& id : txids) arr.push_back(id.GetHex());
+                        return arr;
+                    }
+                    auto snap = mp->get_summary();
+                    time_t now = std::time(nullptr);
+                    nlohmann::json arr = nlohmann::json::array();
+                    uint32_t count = 0;
+                    for (const auto& e : snap.entries) {
+                        if (count >= limit) break;
+                        arr.push_back({
+                            {"txid", e.txid.GetHex()},
+                            {"size", e.base_size},
+                            {"weight", e.weight},
+                            {"fee", e.fee},
+                            {"fee_known", e.fee_known},
+                            {"feerate", e.feerate()},
+                            {"time_added", e.time_added},
+                            {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                            {"n_vin", e.n_vin},
+                            {"n_vout", e.n_vout}});
+                        ++count;
+                    }
+                    return arr;
+                });
+
+            // getmempoolentry — single tx full detail with vin/vout.
+            mi->set_explorer_mempoolentry_fn(
+                [mp, chain_ok](const std::string& txid_hex, const std::string& chain) -> nlohmann::json {
+                    if (!chain_ok(chain))
+                        return nlohmann::json{{"error", "Mempool not available for chain"}};
+                    uint256 txid;
+                    txid.SetHex(txid_hex);
+                    auto opt = mp->get_entry(txid);
+                    if (!opt) return nlohmann::json{{"error", "Transaction not in mempool"}};
+                    const auto& e = *opt;
+                    time_t now = std::time(nullptr);
+                    nlohmann::json vin_arr = nlohmann::json::array();
+                    for (const auto& inp : e.tx.vin) {
+                        vin_arr.push_back({
+                            {"prevout_hash", inp.prevout.hash.GetHex()},
+                            {"prevout_n", inp.prevout.index},
+                            {"sequence", inp.prevout.index == 0xffffffff
+                                            ? "ffffffff" : std::to_string(inp.sequence)}});
+                    }
+                    nlohmann::json vout_arr = nlohmann::json::array();
+                    for (size_t i = 0; i < e.tx.vout.size(); ++i) {
+                        const auto& out = e.tx.vout[i];
+                        std::vector<unsigned char> script(out.scriptPubKey.m_data.begin(),
+                                                          out.scriptPubKey.m_data.end());
+                        auto cls = core::classify_script(script, "bc", 0x00, 0x05);
+                        nlohmann::json vout_obj = {
+                            {"n", i},
+                            {"value_sat", out.value},
+                            {"scriptPubKey_hex", cls.hex},
+                            {"type", cls.type}};
+                        if (!cls.addresses.empty()) vout_obj["address"] = cls.addresses[0];
+                        if (cls.addresses.size() > 1) vout_obj["addresses"] = cls.addresses;
+                        vout_arr.push_back(std::move(vout_obj));
+                    }
+                    return nlohmann::json{
+                        {"txid", e.txid.GetHex()},
+                        {"size", e.base_size},
+                        {"witness_size", e.witness_size},
+                        {"weight", e.weight},
+                        {"fee", e.fee},
+                        {"fee_known", e.fee_known},
+                        {"feerate", e.feerate()},
+                        {"time_added", e.time_added},
+                        {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                        {"vin", vin_arr},
+                        {"vout", vout_arr},
+                        {"chain", "bip110"}};
+                });
+
+            LOG_INFO << "[EMB-BIP110] Explorer API wired (loopback-only): header browse + "
+                        "found-block coinbase + mempool, retention depth=" << EXPLORER_DEPTH;
+        }
+
+        // F2 — currency_info share_version. The MI default is 35 (the V35/V36
+        // ratchet cross default for the LTC family); bip110 never runs the
+        // AutoRatchet and its mint is hardwired v36 (see the v36 header/share
+        // construction below), so the honest static answer is 36. Without this
+        // the explorer misclassifies live v36 share cells as v35.
+        mi->set_cached_share_version(36);
+        // F2b — native share-version declaration (display-only). bip110's genesis
+        // share-version already EQUALS the target (v36) with no lower predecessor,
+        // so there is no crossing and no voting. This makes /v36_status report
+        // state='native' instead of fabricating a 'voting' / V36->V36 crossing
+        // (the Share-Version Crossing card lied ACTIVE+VOTING on a chain that
+        // never crossed). Consensus/mint untouched -- purely the ratchet widget.
+        mi->set_native_share_version(true);
+        // F3 — currency_info + node_topology "embedded" flag. This lane is fully
+        // daemonless (no external node RPC) but runs on a NULL IMiningNode with
+        // no m_coin_node (bip110::coin::Node is NOT a core::coin::ICoinNode), so
+        // the default (m_coin_node && is_embedded()) reads false and contradicts
+        // /api/node_topology embedded:true. Display-only override; does NOT arm
+        // any coin-node submit/refresh path (m_coin_node stays null).
+        mi->set_embedded_display(true);
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool/" C2POOL_VERSION);
 #endif
         mi->set_io_context(&ioc);
         mi->set_dashboard_always_ready(true);   // load-bearing on a NULL IMiningNode
-        // Advertise real runtime ports on /node_info. BIP-110 has no inbound
-        // sharechain P2P listener (fork peers are dialed outbound), so p2p_port
-        // is honestly 0; the stratum bind is the worker port.
+        // Advertise real runtime ports on /node_info. Under M3 flag-ON the
+        // sharechain node binds a REAL inbound listener on PoolConfig::P2P_PORT
+        // (node_raw->core::Server::listen(9337)), so p2p_port is the live
+        // sharechain peer port — mirrors LTC semantics (main_ltc.cpp:1776 passes
+        // the sharechain p2p_port to /node_info). Flag-OFF (M2, no sharechain
+        // node) keeps 0 since nothing listens. The stratum bind is the worker
+        // port (set_worker_port below), independent of this.
         //
         // DELIBERATE: set_stratum_port(0), NOT stratum_port. This lane already
         // binds its OWN core::StratumServer on stratum_port above (fed by the
@@ -625,7 +1718,26 @@ int run_embedded(bool coin_p2p_discover,
         // below (fully independent of WebServer::stratum_port_).
         web_server->set_stratum_port(0);
         mi->set_worker_port(stratum_port);
-        mi->set_p2p_port(0);
+        // Sharechain peer port (LTC semantics): the live :9337 inbound listener
+        // when the sharechain node exists, else 0 (M2 has no listener).
+        mi->set_p2p_port(sharechain_enabled
+                             ? bip110::pool::PoolConfig::P2P_PORT : 0);
+        // Self-advertised public IP for the miner-config URL + peer endpoint.
+        // Without this /node_info emits external_ip "0.0.0.0" (the miner-config
+        // card then shows 0.0.0.0:port). The operator-supplied --coin-externalip
+        // (the reachable public IP of this host, e.g. 158.220.92.171) is the same
+        // address the sharechain :9337 + coin-p2p :8333 listeners bind on; surface
+        // it. Auto-detect from peer echoes still fills it later when unset. LTC
+        // ref main_ltc.cpp:1778.
+        if (!coin_externalip.empty())
+            mi->set_external_ip(coin_externalip);
+        // Payout/owner address for the dashboard: powers the sharechain-window
+        // "mine" highlight (my_address), the Node-Fee card's own-entitlement line
+        // (/payout_addrs ∩ /current_merged_payouts) and the explorer's fee-share
+        // marking. LTC ref main_ltc.cpp:2071. Display-only: the consensus donation
+        // script is set separately on the work_source above.
+        if (!donation_address.empty())
+            mi->set_payout_address(donation_address);
         // Point static serving at the on-disk frontend (CWD-relative, same as
         // btc/dgb): "/" -> web-static/dashboard.html. The deploy pairs a
         // web-static copied from THIS commit next to the binary/CWD.
@@ -636,11 +1748,22 @@ int run_embedded(bool coin_p2p_discover,
         // Node topology card: embedded SPV follower state + the old StatusHttp
         // fork fields (blake2b_height / on_blake2b_chain) find their honest new
         // home here. Mirror of main_btc.cpp node_topology_fn.
-        mi->set_node_topology_fn([&header_chain, &coin_node, &chain_params]() {
+        mi->set_node_topology_fn([&header_chain, &coin_node, &chain_params,
+                                  &coin_broadcaster]() {
             const uint32_t synced   = header_chain.height();
             const uint32_t peer_tip = header_chain.peer_tip_height();
             const bool     emb_p2p  = coin_node.has_p2p();
             const bool     ext_rpc  = coin_node.has_rpc();
+            // Count ALL live NODE_BLAKE2B fork links, not just "a primary object
+            // exists": the handshaked primary (1) PLUS every handshake-complete
+            // fan-out slot (Bip110Broadcaster::live_count). The old `emb_p2p ? 1 : 0`
+            // reported 1 even while the node was connected to 6+ fork nodes (the
+            // fan-out arm was never counted) — and 1 even before the primary had
+            // handshaked. Gate the primary on the completed handshake so the number
+            // reflects real, answerable links.
+            int embedded_peers = coin_node.is_handshake_complete() ? 1 : 0;
+            if (coin_broadcaster)
+                embedded_peers += static_cast<int>(coin_broadcaster->live_count());
             return nlohmann::json{
                 {"coin", "BIP110"},
                 {"embedded", true},
@@ -648,7 +1771,18 @@ int run_embedded(bool coin_p2p_discover,
                 {"synced_height", synced},
                 {"peer_tip_height", peer_tip},
                 {"sync_pct", (peer_tip > 0 ? 100.0 * synced / peer_tip : 0.0)},
-                {"embedded_peers", emb_p2p ? 1 : 0},
+                {"embedded_peers", embedded_peers},
+                // Node-topology "peers" key (renderNodeTopology c.peers,
+                // dashboard.html:3266): LTC/DGB emit the coin-P2P connected
+                // count here (main_ltc.cpp:3854 e["peers"]=bc->connected_count),
+                // and the auto-detect fallback fills it too (web_server.cpp:5617).
+                // bip110 previously emitted only "embedded_peers" with NO "peers"
+                // key, so the topology row read the 0 default and always showed
+                // "0 peers"/faulted while genuinely connected to fork nodes.
+                // Mirror LTC semantics: topology "peers" = coin-P2P links (NOT
+                // sharechain peers — the c2pool-Nodes card gets those via
+                // set_peer_info_fn below). Keep "embedded_peers" for compat.
+                {"peers", embedded_peers},
                 {"broadcast_route", emb_p2p ? "p2p" : (ext_rpc ? "rpc" : "none")},
                 {"blake2b_height", chain_params.blake2b_height},
                 {"on_blake2b_chain", synced >= chain_params.blake2b_height},
@@ -659,15 +1793,18 @@ int run_embedded(bool coin_p2p_discover,
         // target_height + the single embedded fork peer's version-advertised
         // tip so the sync cards render the REAL BIP-110 header tip. Mirror of
         // main_btc.cpp coin_sync_status_fn.
-        mi->set_coin_sync_status_fn([&header_chain, &coin_node]() -> nlohmann::json {
+        mi->set_coin_sync_status_fn([&header_chain, &coin_node, &coin_broadcaster]()
+                                        -> nlohmann::json {
             nlohmann::json s = nlohmann::json::object();
             const uint32_t hh = header_chain.height();
             uint32_t th = header_chain.peer_tip_height();
             nlohmann::json peers = nlohmann::json::array();
+            std::set<std::string> seen;
             auto* p2p = coin_node.p2p();
             if (p2p != nullptr && p2p->peer_version() > 0) {
                 const uint32_t sh = p2p->peer_start_height();
                 if (sh > th) th = sh;
+                seen.insert(p2p->target_addr().to_string());
                 peers.push_back({
                     {"subver", p2p->peer_subver()},
                     {"startingheight", sh},
@@ -675,10 +1812,94 @@ int run_embedded(bool coin_p2p_discover,
                     {"connected", true},
                 });
             }
+            // Fold EVERY live fork peer into the sync cards, not just the
+            // primary — so target_height is honest over the whole NODE_BLAKE2B
+            // mesh and the peers array counts all connected forks. Deduped
+            // against the primary by dialed address.
+            if (coin_broadcaster) {
+                coin_broadcaster->for_each_live_slot(
+                    [&](const std::string& key, const auto& n) {
+                        if (!seen.insert(key).second) return;
+                        const uint32_t sh = n.peer_start_height();
+                        if (sh > th) th = sh;
+                        peers.push_back({
+                            {"subver", n.peer_subver()},
+                            {"startingheight", sh},
+                            {"conntime", n.peer_uptime_sec()},
+                            {"connected", true},
+                        });
+                    });
+            }
             s["header_height"] = hh;
             s["target_height"] = th;
             s["peers"] = std::move(peers);
             return s;
+        });
+
+        // Fork-peer directory card (/broadcaster_status "peers"): the honest set of
+        // NODE_BLAKE2B links + learned fork mesh. Drives the dashboard CONNECTIONS
+        // (entries with connected==true) and DATABASE (total entries) counters.
+        // Previously UNWIRED, so rest_broadcaster_status fell through to the header-
+        // sync provider whose peers array is JUST the primary — hence the stuck
+        // "CONNECTIONS 1 / DATABASE 1" while the node was connected to 6+ fork
+        // nodes. Composed from: (1) the primary coin-P2P arm (rich subver/height),
+        // (2) every live fan-out slot (redundant NODE_BLAKE2B header/broadcast
+        // peers), (3) the peer manager's routable directory (the learned breadth,
+        // grown by the self-authenticated handshake add + addr crawl + seeds).
+        // Deduped by addr; the primary/live entries win their richer fields.
+        mi->set_coin_peer_info_fn([&coin_node, &coin_broadcaster, &coin_peer_mgr]()
+                                      -> nlohmann::json {
+            nlohmann::json arr = nlohmann::json::array();
+            std::set<std::string> seen;
+            // (1) Primary coin-P2P arm.
+            if (auto* p = coin_node.p2p(); p != nullptr) {
+                const std::string key = p->target_addr().to_string();
+                if (!key.empty() && seen.insert(key).second) {
+                    arr.push_back({
+                        {"addr", key},
+                        {"connected", p->is_handshake_complete()},
+                        {"subver", p->peer_subver()},
+                        {"startingheight", p->peer_start_height()},
+                        {"conntime", p->peer_uptime_sec()},
+                        {"role", "primary"},
+                    });
+                }
+            }
+            // (2) Live fan-out slots (handshake-complete NODE_BLAKE2B peers).
+            // Surface the slot OBJECT (not just its key) so each fork peer's
+            // version-advertised subver/height/uptime render — the same rich
+            // fields the primary already shows. The version handler stamps this
+            // per slot; for_each_live_slot only reads it (no dial, no mutation).
+            if (coin_broadcaster) {
+                coin_broadcaster->for_each_live_slot(
+                    [&](const std::string& key, const auto& n) {
+                        if (!seen.insert(key).second) return;
+                        arr.push_back({
+                            {"addr", key},
+                            {"connected", true},
+                            {"subver", n.peer_subver()},
+                            {"startingheight", n.peer_start_height()},
+                            {"conntime", n.peer_uptime_sec()},
+                            {"role", "fanout"},
+                        });
+                    });
+            }
+            // (3) Learned fork-mesh breadth (banked, not-currently-primary/fanout).
+            if (coin_peer_mgr) {
+                for (const auto& [ns, connected] : coin_peer_mgr->peer_directory()) {
+                    const std::string key = ns.to_string();
+                    if (!seen.insert(key).second) continue;
+                    arr.push_back({
+                        {"addr", key},
+                        {"connected", connected},
+                        {"subver", ""},
+                        {"startingheight", 0},
+                        {"conntime", 0},
+                        {"role", "database"},
+                    });
+                }
+            }
+            return arr;
         });
 
         // Miners-Block-Value / Node-Fee cards: daemonless zero-rig projection of
@@ -724,10 +1945,441 @@ int run_embedded(bool coin_p2p_discover,
             return total;
         });
 
-        // Deliberately NOT installed (sharechain-sourced; BIP-110 has NO
-        // sharechain node in this lane): set_pplns_fn, set_sharechain_window_fn,
-        // set_sharechain_stats_fn, set_best_share_hash_fn, set_peer_info_fn,
-        // set_pool_hashrate_fn. Absent feeds render honestly empty — NEVER faked.
+        // FINDING A1 — dashboard sharechain feeds. Under M3 flag-ON the
+        // sharechain node EXISTS (sharechain_node != null), so wire the two
+        // callbacks rest_sync_status() reads. When they are absent, that handler
+        // leaves chain_size / verified_size / has_shares / has_best_share at their
+        // 0/false DEFAULTS regardless of the real tracker state — which is exactly
+        // the operator's "no bip110 shares even though it is live" symptom (the
+        // tracker had grown to height 29 but /web/sync_status reported all zero).
+        // Both callbacks read the LOCK-FREE published snapshot (get_tracker_snapshot,
+        // set by think() under the exclusive lock) — never the tracker lock and
+        // never an off-lock chain walk, so no kr1z1s prune-vs-read UAF. This
+        // mirrors main_btc.cpp (chain_height = raw chain_count, not verified), so
+        // a single mint flips has_shares=true even before the verified tip settles.
+        if (sharechain_node) {
+            auto* scn = sharechain_node.get();
+            mi->set_sharechain_stats_fn([scn]() -> nlohmann::json {
+                auto snap = scn->get_tracker_snapshot();
+                nlohmann::json out;
+                out["chain_height"]   = snap.chain_count;      // RAW chain size
+                out["total_shares"]   = snap.chain_count;
+                out["verified_count"] = snap.verified_count;
+                out["fork_count"]     = snap.fork_count;
+                out["orphan_shares"]  = snap.orphan_shares;
+                out["dead_shares"]    = snap.dead_shares;
+                // P6 — the LTC-family version tally the Shares-card version line
+                // (#share_versions_line: "V36:N | want V36:N") and /version_signaling
+                // read. bip110 is NATIVE v36 (every share, own or relayed, is format
+                // v36 from genesis — create_local_share stamps share_version=36 and
+                // the chain admits no lower version), so the whole raw chain is v36
+                // with no walk needed. Emitting these makes all_target=true (correct);
+                // it does NOT surface the crossing banner (higher_desired_signalled
+                // needs dominant_desired > lowest_share_type, but both are 36) and the
+                // V35 caveat stays suppressed by set_native_share_version(true) above.
+                // Without these keys the version line rendered BLANK (reads broken).
+                const int n = static_cast<int>(snap.chain_count);
+                out["chain_length"] = static_cast<int>(
+                    bip110::pool::PoolConfig::chain_length());
+                out["shares_by_version"]         = nlohmann::json{{"36", n}};
+                out["shares_by_desired_version"] = nlohmann::json{{"36", n}};
+                return out;
+            });
+            mi->set_best_share_hash_fn([scn]() -> uint256 {
+                return scn->get_tracker_snapshot().best_share;
+            });
+            // FINDING F1 — reported pool hashrate (dashboard CURRENT/AVERAGE/PEAK,
+            // the "Good" graph series, /global_stats.pool_hash_rate, and the CI
+            // footer's "reported" value all read m_pool_hashrate_fn via
+            // update_stat_log → pool_rates.good). The producer already exists:
+            // publish_snapshot() computes TrackerSnapshot.pool_hashrate with the
+            // p2pool-exact get_pool_attempts_per_second over TARGET_LOOKBEHIND —
+            // a WINDOWED attempts/sec, i.e. already smoothed, so the Good series
+            // is a stable line and not per-interval spikes-to-0. It was simply
+            // never handed to the web MI, so every sample read the default 0.0 →
+            // summary 0 H/s while the node was really minting. Exact BTC/BCH shape
+            // (main_btc.cpp:2653, bch/pool_entrypoint.hpp:726). Lock-free snapshot;
+            // no tracker lock, no off-lock chain walk. Display/accounting only.
+            mi->set_pool_hashrate_fn([scn]() -> double {
+                return scn->get_tracker_snapshot().pool_hashrate;
+            });
+            // 'c2pool Nodes' card + /peer_list + /peer_versions + /pings +
+            // /local_stats.connections all read MiningInterface::m_peer_info_fn
+            // (web_server.cpp:5358 rest_peer_list, :2121 connections, :5340
+            // peer_versions). Under M3 flag-ON the sharechain node has 2+ live
+            // ESTABLISHED :9337 links, but the fn was UNWIRED, so /peer_list fell
+            // through to nlohmann::json::array() -> the card showed "No peers
+            // connected"/badge 0 while genuinely syncing shares. The producer
+            // already exists on the sharechain node: get_peer_info_json()
+            // (node.hpp:414) returns the IO-thread-published lock-free snapshot
+            // (publish_peer_info_snapshot, node.hpp:389) with the exact frontend
+            // shape {address,version,incoming,uptime,downtime,web_port}. Reads the
+            // published snapshot under m_snapshot_mutex — never the live m_peers
+            // map (DASH #828 UAF back-port), never the tracker lock. Byte-parallel
+            // to main_dash.cpp:2159 / main_ltc.cpp:3004. Display-only; ZERO consensus.
+            mi->set_peer_info_fn([scn]() -> nlohmann::json {
+                return scn->get_peer_info_json();
+            });
+            LOG_INFO << "[EMB-BIP110] dashboard sharechain feeds wired "
+                        "(set_sharechain_stats_fn + set_best_share_hash_fn + "
+                        "set_pool_hashrate_fn + set_peer_info_fn; lock-free "
+                        "snapshot) — chain_size/has_shares/pool_hashrate/peer_list "
+                        "now reflect the mint";
+
+            // FINDING P1 — the "Current Payouts" dashboard card. rest_current_
+            // payouts() (web_server.cpp:2408) returned {} on bip110 because NONE of
+            // its three sources is live on this lane: the #939 direct seam was wired
+            // ONLY by DASH (main_dash.cpp:1882), MI stratum is OFF (set_stratum_port
+            // (0) above) so MI's refresh_work() never fills the PPLNS cache, and no
+            // PayoutManager is set. So the handler fell through all three -> {}, and
+            // the card showed "0.0000 BIP110" over an empty ADDRESS/V36?/AMOUNT table
+            // even with 196+ shares in the window. Wire the direct seam with the SAME
+            // PPLNS SSOT that mints the coinbase — ShareTracker::get_expected_payouts,
+            // the exact map the work_source pplns_fn_ (line ~638) already emits — so
+            // the card previews the projected NEXT-BLOCK split (subsidy x each
+            // address's decayed PPLNS weight, donation residual folded in).
+            //
+            // READ-ONLY: this REPORTS the split the node would pay; it never touches
+            // share_check gentx, build_connection_coinbase, the donation consensus,
+            // or any reward path (get_expected_payouts is a const window walk under
+            // the read guard). The front-end loadPayouts actually fetches
+            // /current_merged_payouts (NOT /current_payouts); that endpoint's
+            // main-thread cache pump is dead on bip110, so a cold-cache fallback
+            // in rest_current_merged_payouts (web_server.cpp) now wraps THIS seam
+            // in the merged shape — see wrap_primary_payouts_as_merged.
+            //
+            // Nested-lock hazard: read the LOCK-FREE published snapshot best_share
+            // BEFORE taking read_tracker() — re-acquiring the tracker's shared_mutex
+            // from a thread that already holds it stops being harmless the moment a
+            // writer queues (main_dash.cpp:1853-1858). Snapshot is set by think()
+            // under the exclusive lock; no off-lock chain walk here.
+            // The pool-wide projected PPLNS split — shared by /current_payouts,
+            // the main-page treemap (via /current_merged_payouts) and the
+            // sharechain window's own `pplns_current` overlay. Hoisted into a
+            // named lambda (DASH pattern main_dash.cpp:1856) so the window fn
+            // below reuses the EXACT same SSOT walk instead of re-deriving it.
+            // Snapshot the LOCK-FREE published best BEFORE read_tracker() — the
+            // documented nested shared-lock hazard (main_dash.cpp:1853-1858).
+            auto current_pplns =
+                [scn, &header_chain,
+                 halving = chain_params.subsidy_halving_interval]() -> nlohmann::json {
+                    const uint256 best = scn->get_tracker_snapshot().best_share;  // lock-free
+                    if (best.IsNull()) return nlohmann::json::object();
+                    const uint32_t tip = header_chain.height();
+                    if (tip == 0) return nlohmann::json::object();  // header follower cold
+                    // Same next-block subsidy projection the Miners-Block-Value card
+                    // uses (set_coin_work_fn); bip110 (like BTC) has no treasury/burn,
+                    // so the whole subsidy is the miners' gross block value.
+                    const uint64_t subsidy = bip110::coin::get_block_subsidy(tip + 1, halving);
+                    // v36 ignores block_target (work_source.cpp:345 "pass real"), but
+                    // pass the real tip nBits target for correctness/parity.
+                    uint256 block_target = uint256::ZERO;
+                    if (auto t = header_chain.tip())
+                        block_target = chain::bits_to_target(t->header.m_bits);
+                    auto guard = scn->read_tracker();
+                    if (!guard) return nlohmann::json::object();  // tracker busy -> honest empty
+                    return bip110::pool::current_payouts_report(
+                        *guard, best, block_target, subsidy,
+                        bip110::pool::PoolConfig::get_donation_script(36),
+                        bip110::pool::PoolConfig::is_testnet);
+                };
+            mi->set_current_payouts_fn(current_pplns);
+            LOG_INFO << "[EMB-BIP110] /current_payouts seam wired "
+                        "(get_expected_payouts projected next-block PPLNS split; "
+                        "read-only preview) — 'Current Payouts' card now shows the "
+                        "live window split instead of 0.0000/empty";
+
+            // FINDING P2 — the sharechain-transparency EXPLORER and the V36?
+            // column. GET /sharechain/window served the stub {shares:[]} because
+            // m_sharechain_window_fn was unwired on bip110 (web_server.cpp
+            // rest_sharechain_window). The explorer was therefore empty, and the
+            // "Current Payouts" card's V36? column stayed blank — it is filled
+            // ENTIRELY client-side by getMinerVersion(addr) scanning
+            // defrag.shares (= this window) for s.m === addr (dashboard.html).
+            // Wire it to the SAME PPLNS SSOT walk /current_payouts uses; the
+            // report emits the address form for s.m (so it matches the payout
+            // keys and the V36? column fills) and the native share version for
+            // s.V. Read-only: a const window walk under the read guard.
+            //
+            // Nested-lock hazard: snapshot the LOCK-FREE best BEFORE read_tracker(),
+            // and call current_pplns() (which takes + releases its OWN guard)
+            // BEFORE taking this fn's guard — DASH ordering (main_dash.cpp:1886-1888).
+            mi->set_sharechain_window_fn(
+                [scn, mi, current_pplns, ws = work_source.get()]() -> nlohmann::json {
+                    const uint256 best = scn->get_tracker_snapshot().best_share;  // lock-free
+                    auto cur = current_pplns();          // takes + releases its own guard
+                    auto guard = scn->read_tracker();
+                    if (!guard) return nlohmann::json::object();  // tracker busy -> honest empty
+                    std::string fee_hash160 = mi ? mi->get_node_fee_hash160() : std::string{};
+                    const bool testnet = bip110::pool::PoolConfig::is_testnet;
+                    // "This node" self-identity for the explorer's blue highlight
+                    // + This-Node count. The window fn previously left my_address
+                    // EMPTY ("every miner authorizes with its own address, so
+                    // there is no node-level 'my' address") — but this node's rigs
+                    // ARE its local stratum workers, so every share they author IS
+                    // this node's. Mark the node-owner/payout address AND every
+                    // current stratum worker address blue. Each candidate is
+                    // normalized through the SAME script->address encoder the
+                    // report uses for s["m"] (address_to_script ->
+                    // current_payouts_script_to_address) so the frontend string
+                    // compare matches exactly. Display-only: no consensus/coinbase
+                    // /PPLNS/wire state is read or written here. LTC ref
+                    // main_ltc.cpp:3916-3924 (owner addr); the worker-set union is
+                    // the bip110 correction (owner-only would still render 0 blue,
+                    // since the window owners are the rig addresses).
+                    auto normalize_addr =
+                        [testnet](const std::string& a) -> std::string {
+                            if (a.empty()) return {};
+                            auto script = core::address_to_script(a);
+                            if (script.empty()) return {};
+                            return bip110::pool::current_payouts_script_to_address(
+                                script, testnet);
+                        };
+                    std::string my_address =
+                        normalize_addr(mi ? mi->get_payout_address() : std::string{});
+                    nlohmann::json my_addrs = nlohmann::json::array();
+                    std::set<std::string> seen;
+                    auto add_addr = [&](const std::string& a) {
+                        if (!a.empty() && seen.insert(a).second)
+                            my_addrs.push_back(a);
+                    };
+                    add_addr(my_address);
+                    if (ws) {
+                        for (auto& [id, wi] : ws->snapshot_stratum_workers())
+                            add_addr(normalize_addr(wi.username));
+                    }
+                    auto w = bip110::pool::sharechain_window_report(
+                        *guard, best,
+                        bip110::pool::PoolConfig::chain_length(),
+                        my_address, fee_hash160,
+                        testnet);
+                    if (!my_addrs.empty())
+                        w["my_addresses"] = std::move(my_addrs);
+                    // Fold the projected split in as the explorer's per-share
+                    // PPLNS overlay fallback (dashboard.html getPPLNSForShare
+                    // reads window.pplns_current). bip110 has no per-tip PPLNS
+                    // cache pump (that DASH path is dead here), so pplns_current
+                    // is the overlay source. Read-only.
+                    if (cur.is_object() && !cur.empty())
+                        w["pplns_current"] = std::move(cur);
+                    return w;
+                });
+            // bip110 has no share-tip refresh event (MI stratum off, no
+            // fire_share_tip_refresh), so opt this cache into the periodic
+            // fallback refresh (web_server mark_last_cache_tip_driven) — correct
+            // cadence for a ~10 s share period.
+            mi->mark_last_cache_tip_driven();
+
+            // MI's own window-PPLNS overlay producer (pplns_fn_t). On bip110 its
+            // consumers are inert (MI stratum off, no refresh trigger, no
+            // m_cached_template), but wire it for LTC/BTC/DASH parity and so the
+            // web_server precompute path (should it ever run) has the SSOT split.
+            // BTC shape (main_btc.cpp set_pplns_fn) minus the v35/AutoRatchet
+            // branch — bip110 is v36-always. Read-only: get_expected_payouts is a
+            // const window walk; no coinbase/gentx/reward touched.
+            mi->set_pplns_fn(
+                [scn](const uint256& best_share_hash,
+                      const uint256& block_target,
+                      uint64_t subsidy,
+                      const std::vector<unsigned char>& donation_script)
+                -> std::map<std::vector<unsigned char>, double> {
+                    auto guard = scn->read_tracker();
+                    if (!guard) return {};
+                    try {
+                        return guard->get_expected_payouts(
+                            best_share_hash, block_target, subsidy, donation_script);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[EMB-BIP110] web pplns get_expected_payouts threw: "
+                                    << e.what();
+                        return {};
+                    }
+                });
+            LOG_INFO << "[EMB-BIP110] /sharechain/window + pplns seams wired "
+                        "(explorer window walk + V36? column feed + pplns overlay; "
+                        "read-only) — explorer/PPLNS-view/V36? now reflect the mint";
+
+            // P5 — Best Share card + hashrate ring. The tracker already FIRES
+            // m_on_share_difficulty for every verified share (share_tracker.hpp)
+            // with (difficulty, miner); it was never wired on this lane, so
+            // record_share_difficulty() was never called and the card read
+            // "— / no record yet" FOREVER while 4 rigs submitted shares all day.
+            // Set once at startup before think() begins; the callback runs under
+            // the compute thread's exclusive lock (same as the stats publish),
+            // touches no consensus/mint/coinbase state. LTC ref main_ltc.cpp:4446.
+            scn->tracker().m_on_share_difficulty =
+                [mi](double diff, const std::string& miner) {
+                    mi->record_share_difficulty(diff, miner);
+                };
+
+            // P2-remainder — the seams the window+pplns commit left unwired:
+            // /sharechain/tip (RealTime SSE poll), /sharechain/delta (incremental
+            // stream) and /web/share/<hash> (explorer click-through). Without them
+            // the RealTime toggle poll reads a null tip, the SSE never streams new
+            // shares, and share.html 404s. Port the LTC feeders, BITCOIN-encoded
+            // and native-v36; all walks run under the lock-free read_tracker()
+            // guard. Read-only.
+
+            // /sharechain/tip (LTC ref main_ltc.cpp:4082).
+            mi->set_sharechain_tip_fn([scn]() -> std::optional<core::SharechainTip> {
+                auto guard = scn->read_tracker();
+                if (!guard) {
+                    auto snap = scn->get_tracker_snapshot();
+                    if (snap.chain_count == 0) return std::nullopt;
+                    core::SharechainTip t;
+                    t.hash   = "";
+                    t.height = snap.verified_count > 0
+                                   ? static_cast<int64_t>(snap.chain_count) : -1;
+                    t.total  = static_cast<int32_t>(snap.chain_count);
+                    return t;
+                }
+                auto& chain = guard->chain;
+                uint256 best; int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    (void)tail_hash;
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+                if (best.IsNull() && chain.size() == 0) return std::nullopt;
+                core::SharechainTip t;
+                t.hash   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                t.height = best_height;
+                t.total  = static_cast<int>(chain.size());
+                return t;
+            });
+
+            // /sharechain/delta (LTC ref main_ltc.cpp:4115), no merged arrays.
+            mi->set_sharechain_delta_fn([scn, mi](const std::string& since_hash)
+                                            -> nlohmann::json {
+                auto guard = scn->read_tracker();
+                if (!guard) return nlohmann::json::object();
+                const bool testnet = bip110::pool::PoolConfig::is_testnet;
+                auto& chain    = guard->chain;
+                auto& verified = guard->verified;
+                std::string fee_addr = mi ? mi->get_node_fee_hash160() : std::string{};
+
+                uint256 best; int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    (void)tail_hash;
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+                nlohmann::json shares_arr = nlohmann::json::array();
+                int count = 0;
+                if (!best.IsNull()) {
+                    int walk = std::min(static_cast<int>(chain.get_height(best)),
+                        static_cast<int>(bip110::pool::PoolConfig::chain_length()));
+                    try {
+                        auto view = chain.get_chain(best, walk);
+                        for (auto [hash, data] : view) {
+                            std::string short_h = hash.GetHex().substr(0, 16);
+                            if (short_h == since_hash || hash.GetHex() == since_hash)
+                                break;
+                            nlohmann::json s;
+                            s["h"] = short_h;
+                            s["H"] = hash.GetHex();
+                            s["p"] = count;
+                            s["v"] = verified.contains(hash) ? 1 : 0;
+                            auto* idx = chain.get_index(hash);
+                            if (idx && idx->is_block_solution) s["blk"] = 1;
+                            data.share.invoke([&](auto* obj) {
+                                s["t"]  = obj->m_timestamp;
+                                s["V"]  = 36;
+                                s["s"]  = static_cast<int>(obj->m_stale_info);
+                                s["b"]  = obj->m_bits;
+                                s["a"]  = obj->m_absheight;
+                                s["dv"] = obj->m_desired_version;
+                                auto script = bip110::pool::get_share_script(obj);
+                                std::string addr =
+                                    core::script_to_address(script, false, testnet);
+                                s["m"] = addr.empty() ? HexStr(script) : addr;
+                                if (!fee_addr.empty() && script.size() >= 22) {
+                                    int off = -1;
+                                    if (script.size()==25 && script[0]==0x76) off=3;
+                                    else if (script.size()==22 && script[0]==0x00) off=2;
+                                    else if (script.size()==23 && script[0]==0xa9) off=2;
+                                    if (off >= 0) {
+                                        std::string h160 = HexStr(std::vector<unsigned char>(
+                                            script.begin()+off, script.begin()+off+20));
+                                        if (h160 == fee_addr) s["fee"] = 1;
+                                    }
+                                }
+                            });
+                            shares_arr.push_back(std::move(s));
+                            if (++count >= 200) break;   // safety cap
+                        }
+                    } catch (...) {}
+                }
+                nlohmann::json heads_arr = nlohmann::json::array();
+                for (auto& [hh, _] : chain.get_heads())
+                    heads_arr.push_back(hh.GetHex().substr(0, 16));
+                nlohmann::json blocks_arr = nlohmann::json::array();
+                if (mi) for (const auto& fb : mi->get_found_blocks())
+                    if (!fb.share_hash.empty())
+                        blocks_arr.push_back(fb.share_hash.substr(0, 16));
+
+                nlohmann::json result;
+                result["shares"] = std::move(shares_arr);
+                result["count"]  = count;
+                result["tip"]    = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                result["heads"]  = std::move(heads_arr);
+                result["blocks"] = std::move(blocks_arr);
+                return result;
+            });
+
+            // /web/share/<hash> (LTC ref main_ltc.cpp:4250, no DOGE/merged).
+            mi->set_share_lookup_fn([scn, mi](const std::string& hash_hex)
+                                        -> nlohmann::json {
+                auto guard = scn->read_tracker();
+                if (!guard) return nlohmann::json{{"error", "tracker busy"}};
+                const bool testnet = bip110::pool::PoolConfig::is_testnet;
+                auto& chain    = guard->chain;
+                auto& verified = guard->verified;
+                uint256 hash; hash.SetHex(hash_hex);
+                if (hash.IsNull() || !chain.contains(hash))
+                    return nlohmann::json{{"error", "share not found"}};
+
+                nlohmann::json result;
+                auto* idx = chain.get_index(hash);
+                bool is_block = idx && idx->is_block_solution;
+                result["is_block_solution"] = is_block;
+                result["hash"]     = hash.GetHex();
+                result["verified"] = verified.contains(hash);
+                result["height"]   = chain.get_height(hash);
+                if (is_block && mi) {
+                    for (const auto& fb : mi->get_found_blocks()) {
+                        if (fb.hash == hash.GetHex() ||
+                            (!fb.share_hash.empty() && fb.share_hash == hash.GetHex())) {
+                            result["block_height"]        = fb.height;
+                            result["block_confirmations"] = fb.confirmations;
+                            result["block_status"]        = static_cast<int>(fb.status);
+                            break;
+                        }
+                    }
+                }
+                chain.get_share(hash).invoke([&](auto* obj) {
+                    result["timestamp"]       = obj->m_timestamp;
+                    result["bits"]            = obj->m_bits;
+                    result["absheight"]       = obj->m_absheight;
+                    result["version"]         = 36;
+                    result["desired_version"] = obj->m_desired_version;
+                    result["stale_info"]      = static_cast<int>(obj->m_stale_info);
+                    auto script = bip110::pool::get_share_script(obj);
+                    std::string addr = core::script_to_address(script, false, testnet);
+                    result["miner_address"] = addr.empty() ? HexStr(script) : addr;
+                    result["miner_script"]  = HexStr(script);
+                });
+                return result;
+            });
+
+            LOG_INFO << "[EMB-BIP110] /sharechain/tip + /sharechain/delta + "
+                        "/share/<hash> + best-share difficulty wired — RealTime SSE "
+                        "poll, share.html click-through and the Best-Share card now live";
+        }
+
+        // All dashboard sharechain feeds are now wired on flag-ON:
+        // set_sharechain_stats_fn, set_best_share_hash_fn, set_pool_hashrate_fn,
+        // set_peer_info_fn, set_current_payouts_fn, set_sharechain_window_fn and
+        // set_pplns_fn. Absent feeds (flag-OFF) render honestly empty — NEVER faked.
 
         // graph_db-persisted stats history (LTC/BTC parity): namespaced sub-dir.
         {
@@ -739,6 +2391,69 @@ int run_embedded(bool coin_p2p_discover,
             mi->set_stat_log_path(graph_db_path);
             mi->load_stat_log();
             LOG_INFO << "[EMB-BIP110] graph_db stats persistence -> " << graph_db_path;
+        }
+
+        // Found-block confirm/orphan telemetry (BTC-shape, main_btc.cpp:3100-3153).
+        // TELEMETRY ONLY — the dashboard found-blocks card + /web/share/<hash>
+        // (fb.confirmations/fb.status, :2318-2320) go from human-only to
+        // instrumented. Isolated-orphan money-risk becomes visible. No consensus,
+        // reward, share-validity or wire surface is touched.
+        if (mi) {
+            mi->set_block_verify_fn(
+                [mi, &header_chain, &coin_node](const std::string& hash_hex) -> int {
+                    uint256 h; h.SetHex(hash_hex);
+
+                    // found_height: authoritative from our own found-block record
+                    // (survives an orphan whose header peers never relayed to us);
+                    // else recovered from the embedded header chain.
+                    uint32_t found_height = 0;
+                    bool     have_height  = false;
+                    for (const auto& b : mi->get_found_blocks()) {
+                        if (b.hash == hash_hex) {
+                            found_height = static_cast<uint32_t>(b.height);
+                            have_height  = true;
+                            break;
+                        }
+                    }
+                    if (!have_height) {
+                        if (auto e = header_chain.get_header(h)) {
+                            found_height = e->height;
+                            have_height  = true;
+                        }
+                    }
+
+                    if (have_height) {
+                        auto winner_at = [&header_chain](uint32_t hh)
+                            -> std::optional<uint256> {
+                            if (auto e = header_chain.get_header_by_height(hh))
+                                return e->block_hash;
+                            return std::nullopt;
+                        };
+                        int v = bip110::coin::block_confirm::resolve_status(
+                            winner_at, header_chain.height(), h, found_height);
+                        // Daemonless-first: trust a definite confirmed/orphaned
+                        // verdict. A 0 (pending) with the header chain ALREADY past
+                        // found_height is a genuine shallow-pending; only fall
+                        // through to RPC when the header chain has not yet reached
+                        // the height.
+                        if (v != 0) return v;
+                        if (header_chain.height() >= found_height) return 0;
+                    }
+
+                    // Fallback arm (header chain absent or behind): external node
+                    // getblockheader confirmations. Returns INT_MIN when no RPC is
+                    // configured, so the daemonless arm falls through to pending.
+                    int c = coin_node.rpc_block_confirmations(h);
+                    if (c != std::numeric_limits<int>::min()) {
+                        if (c < 0) return -1;
+                        if (c >= static_cast<int>(
+                                bip110::coin::block_confirm::kDefaultConfirmDepth))
+                            return c;
+                    }
+                    return 0;  // still pending
+                });
+            LOG_INFO << "[EMB-BIP110] found-block confirm/orphan lane ARMED "
+                     << "(embedded HeaderChain verdict; getblockheader fallback)";
         }
 
         if (web_server->start()) {
@@ -813,9 +2528,75 @@ int run_embedded(bool coin_p2p_discover,
         (void)mp_ka;
     }
 
+    // ── M3: periodic think/clean tick (5s) + heartbeat (30s) ─────────────────
+    // Port of main_ltc.cpp:6685-6723. The bip110 main NEVER scheduled these, so
+    // clean_tracker() (stale-head eating, drop-tails pruning, re-score AND — since
+    // the desired-republish fix — the parent-share download RE-ARM) simply never
+    // ran. On the busy LTC/DASH chains run_think() fires on every share batch and
+    // masks the absence; on the quiet bip110 federation nothing re-drove the
+    // downloader between share events, so a cold-attach that hit one empty/timed-out
+    // round-trip stalled for ~30 min until the next genuinely-new share (the
+    // node2 `parents=145` → `parents=3` gap). With the tick wired, the download
+    // walk is re-armed every 5s worst case (retry-on-empty covers the ~1s case),
+    // and the tracker is finally pruned instead of growing unbounded.
+    // Guarded on sharechain_node: flag-OFF (M2, no sharechain) stays a no-op.
+    std::shared_ptr<io::steady_timer> think_timer;
+    std::shared_ptr<io::steady_timer> hb_timer;
+    if (sharechain_node) {
+        auto* scn = sharechain_node.get();
+
+        think_timer = std::make_shared<io::steady_timer>(ioc);
+        auto think_loop = std::make_shared<std::function<void()>>();
+        std::weak_ptr<std::function<void()>> weak_think = think_loop;
+        *think_loop = [think_timer, weak_think, scn]() {
+            think_timer->expires_after(std::chrono::seconds(5));
+            think_timer->async_wait([think_timer, weak_think, scn]
+                                    (const boost::system::error_code& ec) {
+                if (ec) return;
+                try {
+                    scn->clean_tracker();
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "[EMB-BIP110][CLEAN-TRACKER] error: " << e.what();
+                } catch (...) {
+                    LOG_ERROR << "[EMB-BIP110][CLEAN-TRACKER] unknown error";
+                }
+                if (auto self = weak_think.lock()) (*self)();
+            });
+        };
+        (*think_loop)();
+        static std::shared_ptr<std::function<void()>> think_keepalive;
+        think_keepalive = think_loop;
+
+        hb_timer = std::make_shared<io::steady_timer>(ioc);
+        auto hb_loop = std::make_shared<std::function<void()>>();
+        std::weak_ptr<std::function<void()>> weak_hb = hb_loop;
+        *hb_loop = [hb_timer, weak_hb, scn]() {
+            hb_timer->expires_after(std::chrono::seconds(30));
+            hb_timer->async_wait([hb_timer, weak_hb, scn]
+                                 (const boost::system::error_code& ec) {
+                if (ec) return;
+                try { scn->heartbeat_log(); } catch (...) {}
+                if (auto self = weak_hb.lock()) (*self)();
+            });
+        };
+        (*hb_loop)();
+        static std::shared_ptr<std::function<void()>> hb_keepalive;
+        hb_keepalive = hb_loop;
+
+        LOG_INFO << "[EMB-BIP110] sharechain think/clean tick (5s) + heartbeat (30s) armed";
+    }
+
     io::signal_set signals(ioc, SIGINT, SIGTERM);
-    signals.async_wait([&ioc](const boost::system::error_code&, int) {
+    // FINDING C — graceful-shutdown flush. NodeImpl::shutdown() flushes the
+    // pending verified/removal buffers to LevelDB (and cancels the periodic flush
+    // timer). It existed but was NEVER called — the handler only did ioc.stop(),
+    // so a clean SIGTERM lost every verified share minted since the last flush.
+    // Flag-OFF: sharechain_node is null, so this is a no-op (M2 unchanged). The
+    // capture keeps a shared_ptr copy so the node outlives the flush call.
+    signals.async_wait([&ioc, sharechain_node](const boost::system::error_code&, int) {
         LOG_INFO << "[EMB-BIP110] shutdown signal — stopping";
+        if (sharechain_node)
+            sharechain_node->shutdown();
         ioc.stop();
     });
 
@@ -832,6 +2613,7 @@ int main(int argc, char** argv)
     bool selftest = true;
     bool run = false;
     bool coin_p2p_discover = false;
+    std::string coin_externalip;   // --coin-externalip: self-advertise override
     bool fork_checkpoint = false;
     std::string http_host = "0.0.0.0";
     uint16_t http_port = 0;
@@ -839,6 +2621,12 @@ int main(int argc, char** argv)
     std::string stratum_addr = "0.0.0.0";  // listen all interfaces by default
     std::string donation_address;  // operator-provided node-owner/donation address
     std::vector<NetService> explicit_peers;
+    // ── SHARECHAIN (pool-P2P, :9337) explicit peer override (--sharechain-addnode
+    // HOST:PORT, repeatable). This is a DIFFERENT layer from --peer (coin-P2P fork
+    // peers on 8333/9333): when non-empty it OVERRIDES the OurBeacon default seed
+    // list (config_pool.hpp DEFAULT_BOOTSTRAP_HOSTS), dialing ONLY these hosts.
+    // Unified TOML key: sharechain.addnodes (param_catalog.inc). Mirrors main_btc. ──
+    std::vector<std::pair<std::string, uint16_t>> sharechain_addnodes;
 
     // ── REWARD SPLIT L0 (resolved config): author/dev donation percent and the
     // node-owner fee percent read from the settings catalog defaults (mirrors
@@ -851,6 +2639,14 @@ int main(int argc, char** argv)
     // coinbase-only EMPTY blocks while the fork network has pending txs). Money
     // path — --no-serve-mempool-txs is the canary escape hatch back to M2.
     bool serve_mempool_txs = true;
+    // ── M3 SHARECHAIN MINT arm (DEFAULT OFF). The mint/sharechain node only
+    // starts with --bip110-sharechain; absent, the binary is the M2 header-
+    // follower byte-for-byte. IRREVERSIBLE first-outbound is behind this flag. ──
+    bool sharechain_enabled = false;
+    // Explorer /api/explorer surface (default ON — loopback-only + read-only, so
+    // exposing it is safe; --no-explorer disables both the gate and raw-block
+    // retention). Consumed by explorer.py --coin bip110 --c2pool ...
+    bool explorer_enabled = true;
     {
         namespace cs = c2pool::settings;
         cs::ResolvedConfig rc;
@@ -873,6 +2669,13 @@ int main(int argc, char** argv)
         else if (arg == "--selftest") { selftest = true; run = false; }
         else if (arg == "--run") { run = true; selftest = false; }
         else if (arg == "--coin-p2p-discover") { coin_p2p_discover = true; }
+        else if (arg == "--coin-externalip" && i + 1 < argc) {
+            // Operator-pinned reachable IP for self-address advertisement (Knots
+            // -externalip). Optional: peer-echo scoring auto-discovers it on a
+            // no-NAT host; this override wins when set. Bare IP (no port — the
+            // listen port 8333 is substituted).
+            coin_externalip = argv[++i];
+        }
         else if (arg == "--fork-checkpoint") { fork_checkpoint = true; }
         else if (arg == "--peer" && i + 1 < argc) {
             std::string host = "127.0.0.1"; uint16_t port = 8333;
@@ -911,6 +2714,23 @@ int main(int argc, char** argv)
         }
         else if (arg == "--serve-mempool-txs") { serve_mempool_txs = true; }
         else if (arg == "--no-serve-mempool-txs") { serve_mempool_txs = false; }
+        else if (arg == "--bip110-sharechain") { sharechain_enabled = true; }
+        else if (arg == "--explorer") { explorer_enabled = true; }
+        else if (arg == "--no-explorer") { explorer_enabled = false; }
+        else if (arg == "--sharechain-addnode" && i + 1 < argc) {
+            // --sharechain-addnode HOST:PORT — repeatable. Explicit sharechain
+            // (pool-P2P, :9337) peer override; overrides the OurBeacon default
+            // seed list. Mirrors main_btc.cpp --sharechain-addnode.
+            std::string ep = argv[++i];
+            auto colon = ep.rfind(':');
+            if (colon == std::string::npos) {
+                std::fprintf(stderr, "--sharechain-addnode requires HOST:PORT\n");
+                return 1;
+            }
+            sharechain_addnodes.emplace_back(
+                ep.substr(0, colon),
+                static_cast<uint16_t>(std::stoi(ep.substr(colon + 1))));
+        }
     }
 
     if (run) {
@@ -918,7 +2738,7 @@ int main(int argc, char** argv)
             // Default to discovery so `--run` alone still finds fork peers.
             coin_p2p_discover = true;
         }
-        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs);
+        return run_embedded(coin_p2p_discover, explicit_peers, fork_checkpoint, http_host, http_port, stratum_addr, stratum_port, donation_address, give_author_pct, node_owner_fee_pct, serve_mempool_txs, sharechain_enabled, sharechain_addnodes, explorer_enabled, coin_externalip);
     }
 
     print_banner(argv[0]);

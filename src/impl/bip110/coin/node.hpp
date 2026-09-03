@@ -2,6 +2,7 @@
 #pragma once
 
 #include <memory>
+#include <cassert>      // dial-lifetime arm assertion (fail loud, not SEGV)
 #include <limits>       // std::numeric_limits (found-block RPC-fallback sentinel)
 
 #include <boost/asio.hpp>
@@ -30,12 +31,59 @@ class Node : public bip110::interfaces::Node
     config_t* m_config;
 
     std::unique_ptr<NodeRPC> m_rpc;
-    std::unique_ptr<NodeP2P<config_t>> m_p2p;
+    // ROBUST dial-teardown UAF fix (successor to e527abfe): the coin-P2P node is
+    // the DOMINANT crasher — start_p2p() frees the prior NodeP2P on every redial
+    // while its own in-flight async_resolve completion is still queued, and the
+    // completion then runs make_socket()'s dynamic_cast on the freed vtable →
+    // SEGV (amplified ~40x by the 7fdf06ba6 getaddr dial-storm). It MUST be
+    // shared_ptr-owned so core::Client can pin it with a strong ref for the dial
+    // duration (set_lifetime below); a unique_ptr node leaves the guard a no-op.
+    std::shared_ptr<NodeP2P<config_t>> m_p2p;
     bool m_request_mempool_on_connect{false};  // BIP 35 pull on (re)connect
+
+    // Knots peer-discovery seams. start_p2p() rebuilds m_p2p on every (re)dial, so
+    // these are stored on the Node and RE-APPLIED to each fresh NodeP2P — otherwise
+    // getaddr/addr-ingest/scorer-feedback would only cover the very first peer.
+    using AddrCallback =
+        std::function<void(const std::vector<NetService>&, const NetService& /*source*/)>;
+    using PeerLifecycleCallback = std::function<void(const NetService&)>;
+    AddrCallback m_addr_cb;
+    PeerLifecycleCallback m_on_peer_connected_cb;
+    PeerLifecycleCallback m_on_peer_disconnected_cb;
+    PeerLifecycleCallback m_on_dial_failed_cb;
+    bool m_getaddr_discovery{false};
+    // Self-address advertisement seams (Knots net.cpp GetLocalAddress / SeenLocal /
+    // MaybeSendAddr + self-connect nonce). Stored on the Node and re-applied to each
+    // fresh NodeP2P so self-advertise survives a start_p2p() redial.
+    std::shared_ptr<p2p::LocalAddrTable>    m_local_addr;
+    std::shared_ptr<p2p::SelfNonceRegistry> m_self_nonce;
+    using AddrRelaySink =
+        std::function<void(const std::vector<p2p::btc_addr_record_t>&, const NetService& /*source*/)>;
+    AddrRelaySink m_addr_relay_sink;
+
+    /// Re-apply the stored discovery seams to a freshly-created NodeP2P.
+    void apply_p2p_discovery_seams(NodeP2P<config_t>* p2p)
+    {
+        if (!p2p) return;
+        if (m_addr_cb)                 p2p->set_addr_callback(m_addr_cb);
+        if (m_on_peer_connected_cb)    p2p->set_on_peer_connected(m_on_peer_connected_cb);
+        if (m_on_peer_disconnected_cb) p2p->set_on_peer_disconnected(m_on_peer_disconnected_cb);
+        if (m_on_dial_failed_cb)       p2p->set_on_dial_failed(m_on_dial_failed_cb);
+        if (m_getaddr_discovery)       p2p->enable_getaddr_discovery();
+        if (m_local_addr)              p2p->set_local_addr_table(m_local_addr);
+        if (m_self_nonce)              p2p->set_self_nonce_registry(m_self_nonce);
+        if (m_addr_relay_sink)         p2p->set_addr_relay_sink(m_addr_relay_sink);
+    }
 
     void init_p2p()
     {
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
+        // Register the OWNING control block with core::Client BEFORE connect() so
+        // every async resolve/connect pins the node with a strong ref. Robust
+        // regardless of enable_shared_from_this enrollment.
+        m_p2p->set_lifetime(m_p2p);
+        assert(m_p2p->lifetime_armed() && "coin-P2P dial lifetime failed to arm");
+        apply_p2p_discovery_seams(m_p2p.get());
         m_p2p->connect(m_config->coin()->m_p2p.address);
     }
 
@@ -81,11 +129,70 @@ public:
     /// Call after run() when P2P address is configured.
     void start_p2p(const NetService& addr)
     {
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        // Reassigning m_p2p frees the PRIOR NodeP2P. Its core::Client base may
+        // still have an async_resolve/async_connect completion queued on the
+        // io_context; because that handler captured a STRONG ref to the old node
+        // (set_lifetime + strong-ref capture in core::Client), the old node stays
+        // alive until the handler runs — make_socket()'s dynamic_cast can NEVER
+        // touch freed memory. This is the exact race the addrman dial-storm hit.
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p->set_lifetime(m_p2p);
+        assert(m_p2p->lifetime_armed() && "coin-P2P dial lifetime failed to arm");
         if (m_request_mempool_on_connect)
             m_p2p->enable_mempool_request();
+        apply_p2p_discovery_seams(m_p2p.get());
         m_p2p->connect(addr);
         LOG_INFO << "Coin P2P broadcaster connecting to " << addr.to_string();
+    }
+
+    // ── Knots peer-discovery seams (stored + re-applied on every start_p2p) ────
+    /// Fork-filtered addr ingest sink (NODE_BLAKE2B survivors + gossip source).
+    void set_addr_callback(AddrCallback cb)
+    {
+        m_addr_cb = std::move(cb);
+        if (m_p2p) m_p2p->set_addr_callback(m_addr_cb);
+    }
+    /// handshake-complete -> notify_connected (addrman Good -> tried).
+    void set_on_peer_connected(PeerLifecycleCallback cb)
+    {
+        m_on_peer_connected_cb = std::move(cb);
+        if (m_p2p) m_p2p->set_on_peer_connected(m_on_peer_connected_cb);
+    }
+    /// disconnect -> notify_disconnected.
+    void set_on_peer_disconnected(PeerLifecycleCallback cb)
+    {
+        m_on_peer_disconnected_cb = std::move(cb);
+        if (m_p2p) m_p2p->set_on_peer_disconnected(m_on_peer_disconnected_cb);
+    }
+    /// pre-socket dial failure -> notify_dial_failed (#940 leg).
+    void set_on_dial_failed(PeerLifecycleCallback cb)
+    {
+        m_on_dial_failed_cb = std::move(cb);
+        if (m_p2p) m_p2p->set_on_dial_failed(m_on_dial_failed_cb);
+    }
+    /// Enable Knots getaddr-on-connect peer crawl for the coin-P2P arm.
+    /// Self-address advertisement seams (forwarded to the inner NodeP2P and
+    /// re-applied across redials). Shared with the inbound + fan-out arms.
+    void set_local_addr_table(std::shared_ptr<p2p::LocalAddrTable> t)
+    {
+        m_local_addr = std::move(t);
+        if (m_p2p) m_p2p->set_local_addr_table(m_local_addr);
+    }
+    void set_self_nonce_registry(std::shared_ptr<p2p::SelfNonceRegistry> r)
+    {
+        m_self_nonce = std::move(r);
+        if (m_p2p) m_p2p->set_self_nonce_registry(m_self_nonce);
+    }
+    void set_addr_relay_sink(AddrRelaySink cb)
+    {
+        m_addr_relay_sink = std::move(cb);
+        if (m_p2p) m_p2p->set_addr_relay_sink(m_addr_relay_sink);
+    }
+
+    void enable_getaddr_discovery()
+    {
+        m_getaddr_discovery = true;
+        if (m_p2p) m_p2p->enable_getaddr_discovery();
     }
 
     /// Opt into the BIP 35 `mempool` request on (re)connect. Without this the

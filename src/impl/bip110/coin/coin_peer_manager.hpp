@@ -774,6 +774,27 @@ public:
         return result;
     }
 
+    /// Working-set peer directory for the dashboard "peers/database" card: one
+    /// entry per known routable peer as {NetService, connected}. `connected`
+    /// reflects the live outbound census (m_connected_keys, maintained by
+    /// notify_connected/notify_disconnected/notify_dial_failed). This is the
+    /// honest breadth of the fork mesh we have learned — it grows as fork peers
+    /// are banked (addr crawl, self-authenticated handshake add, seeds) — and is
+    /// what makes the dashboard DATABASE count reflect more than the single
+    /// primary peer. Routable-only (never leak private/loopback).
+    std::vector<std::pair<NetService, bool>> peer_directory() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::pair<NetService, bool>> out;
+        out.reserve(m_peers.size());
+        for (const auto& [key, peer] : m_peers) {
+            auto ep = PeerEndpoint::from(peer.address);
+            if (!ep || !ep->is_routable()) continue;
+            out.emplace_back(peer.address, m_connected_keys.count(key) != 0);
+        }
+        return out;
+    }
+
     /// Bucketed address DB (dashd CAddrMan port) — diagnostics/KATs.
     core::CoinAddrMan& addrman() { return m_addrman; }
     const core::CoinAddrMan& addrman() const { return m_addrman; }
