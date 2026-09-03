@@ -4,6 +4,7 @@
 // manual compile without the generated include dir still builds; existing
 // C2POOL_VERSION #ifdef guards and per-main "dev" fallbacks then apply.
 #if __has_include(<c2pool_build_version.h>)
+#include <cassert>
 #include <c2pool_build_version.h>
 #endif
 // c2pool-dgb — DigiByte Scrypt-only (V36) p2pool node entry point.
@@ -706,7 +707,10 @@ int run_node(const core::CoinParams& params, bool testnet,
     // Declared ahead of the m_on_block_found binding so the won-block P2P-relay
     // sink below can capture it. Constructed later only when --coin-daemon is
     // supplied (stays null otherwise -> sink no-ops, RPC fallback still fires).
-    std::unique_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
+    // shared_ptr-owned + set_lifetime (at each make site) so core::Client pins this
+    // coin-P2P dialer with a strong ref per async op -- a resolve/connect completion
+    // can never run make_socket()'s dynamic_cast on a freed NodeP2P (#759-class UAF).
+    std::shared_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
 
     // ── #82 FAITHFUL won-block reconstruct closure (replaces the interim
     // nullopt stub) ── make_reconstruct_closure_from_template (#280) composes
@@ -959,8 +963,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         const NetService target(host, port);
         config.coin()->m_p2p.address = target;
 
-        coin_p2p = std::make_unique<dgb::coin::p2p::NodeP2P<dgb::Config>>(
+        coin_p2p = std::make_shared<dgb::coin::p2p::NodeP2P<dgb::Config>>(
             &ioc, &coin_iface, &config, "DGB-CoinP2P");
+        coin_p2p->set_lifetime(coin_p2p);
+        assert(coin_p2p->lifetime_armed() && "DGB coin-P2P dial lifetime failed to arm");
         coin_p2p->enable_mempool_request();  // also exercise the tx ingest seam
         coin_p2p->connect(target);
         std::cout << "[DGB] embedded coin-daemon P2P producer dialing "
@@ -1052,8 +1058,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         if (!genesis.IsNull())
             genesis_locator.push_back(genesis);
 
-        coin_p2p = std::make_unique<dgb::coin::p2p::NodeP2P<dgb::Config>>(
+        coin_p2p = std::make_shared<dgb::coin::p2p::NodeP2P<dgb::Config>>(
             &ioc, &coin_iface, &config, "DGB-CoinP2P");
+        coin_p2p->set_lifetime(coin_p2p);
+        assert(coin_p2p->lifetime_armed() && "DGB coin-P2P dial lifetime failed to arm");
 
         // Peers already dialed this run (exclusion set for failover); cleared to
         // re-sweep once the banked set is exhausted so a dead first pick — or a
