@@ -1660,9 +1660,13 @@ int run_embedded(bool coin_p2p_discover,
 #endif
         mi->set_io_context(&ioc);
         mi->set_dashboard_always_ready(true);   // load-bearing on a NULL IMiningNode
-        // Advertise real runtime ports on /node_info. BIP-110 has no inbound
-        // sharechain P2P listener (fork peers are dialed outbound), so p2p_port
-        // is honestly 0; the stratum bind is the worker port.
+        // Advertise real runtime ports on /node_info. Under M3 flag-ON the
+        // sharechain node binds a REAL inbound listener on PoolConfig::P2P_PORT
+        // (node_raw->core::Server::listen(9337)), so p2p_port is the live
+        // sharechain peer port — mirrors LTC semantics (main_ltc.cpp:1776 passes
+        // the sharechain p2p_port to /node_info). Flag-OFF (M2, no sharechain
+        // node) keeps 0 since nothing listens. The stratum bind is the worker
+        // port (set_worker_port below), independent of this.
         //
         // DELIBERATE: set_stratum_port(0), NOT stratum_port. This lane already
         // binds its OWN core::StratumServer on stratum_port above (fed by the
@@ -1679,7 +1683,26 @@ int run_embedded(bool coin_p2p_discover,
         // below (fully independent of WebServer::stratum_port_).
         web_server->set_stratum_port(0);
         mi->set_worker_port(stratum_port);
-        mi->set_p2p_port(0);
+        // Sharechain peer port (LTC semantics): the live :9337 inbound listener
+        // when the sharechain node exists, else 0 (M2 has no listener).
+        mi->set_p2p_port(sharechain_enabled
+                             ? bip110::pool::PoolConfig::P2P_PORT : 0);
+        // Self-advertised public IP for the miner-config URL + peer endpoint.
+        // Without this /node_info emits external_ip "0.0.0.0" (the miner-config
+        // card then shows 0.0.0.0:port). The operator-supplied --coin-externalip
+        // (the reachable public IP of this host, e.g. 158.220.92.171) is the same
+        // address the sharechain :9337 + coin-p2p :8333 listeners bind on; surface
+        // it. Auto-detect from peer echoes still fills it later when unset. LTC
+        // ref main_ltc.cpp:1778.
+        if (!coin_externalip.empty())
+            mi->set_external_ip(coin_externalip);
+        // Payout/owner address for the dashboard: powers the sharechain-window
+        // "mine" highlight (my_address), the Node-Fee card's own-entitlement line
+        // (/payout_addrs ∩ /current_merged_payouts) and the explorer's fee-share
+        // marking. LTC ref main_ltc.cpp:2071. Display-only: the consensus donation
+        // script is set separately on the work_source above.
+        if (!donation_address.empty())
+            mi->set_payout_address(donation_address);
         // Point static serving at the on-disk frontend (CWD-relative, same as
         // btc/dgb): "/" -> web-static/dashboard.html. The deploy pairs a
         // web-static copied from THIS commit next to the binary/CWD.
@@ -1910,6 +1933,21 @@ int run_embedded(bool coin_p2p_discover,
                 out["fork_count"]     = snap.fork_count;
                 out["orphan_shares"]  = snap.orphan_shares;
                 out["dead_shares"]    = snap.dead_shares;
+                // P6 — the LTC-family version tally the Shares-card version line
+                // (#share_versions_line: "V36:N | want V36:N") and /version_signaling
+                // read. bip110 is NATIVE v36 (every share, own or relayed, is format
+                // v36 from genesis — create_local_share stamps share_version=36 and
+                // the chain admits no lower version), so the whole raw chain is v36
+                // with no walk needed. Emitting these makes all_target=true (correct);
+                // it does NOT surface the crossing banner (higher_desired_signalled
+                // needs dominant_desired > lowest_share_type, but both are 36) and the
+                // V35 caveat stays suppressed by set_native_share_version(true) above.
+                // Without these keys the version line rendered BLANK (reads broken).
+                const int n = static_cast<int>(snap.chain_count);
+                out["chain_length"] = static_cast<int>(
+                    bip110::pool::PoolConfig::chain_length());
+                out["shares_by_version"]         = nlohmann::json{{"36", n}};
+                out["shares_by_desired_version"] = nlohmann::json{{"36", n}};
                 return out;
             });
             mi->set_best_share_hash_fn([scn]() -> uint256 {
@@ -2088,6 +2126,183 @@ int run_embedded(bool coin_p2p_discover,
             LOG_INFO << "[EMB-BIP110] /sharechain/window + pplns seams wired "
                         "(explorer window walk + V36? column feed + pplns overlay; "
                         "read-only) — explorer/PPLNS-view/V36? now reflect the mint";
+
+            // P5 — Best Share card + hashrate ring. The tracker already FIRES
+            // m_on_share_difficulty for every verified share (share_tracker.hpp)
+            // with (difficulty, miner); it was never wired on this lane, so
+            // record_share_difficulty() was never called and the card read
+            // "— / no record yet" FOREVER while 4 rigs submitted shares all day.
+            // Set once at startup before think() begins; the callback runs under
+            // the compute thread's exclusive lock (same as the stats publish),
+            // touches no consensus/mint/coinbase state. LTC ref main_ltc.cpp:4446.
+            scn->tracker().m_on_share_difficulty =
+                [mi](double diff, const std::string& miner) {
+                    mi->record_share_difficulty(diff, miner);
+                };
+
+            // P2-remainder — the seams the window+pplns commit left unwired:
+            // /sharechain/tip (RealTime SSE poll), /sharechain/delta (incremental
+            // stream) and /web/share/<hash> (explorer click-through). Without them
+            // the RealTime toggle poll reads a null tip, the SSE never streams new
+            // shares, and share.html 404s. Port the LTC feeders, BITCOIN-encoded
+            // and native-v36; all walks run under the lock-free read_tracker()
+            // guard. Read-only.
+
+            // /sharechain/tip (LTC ref main_ltc.cpp:4082).
+            mi->set_sharechain_tip_fn([scn]() -> std::optional<core::SharechainTip> {
+                auto guard = scn->read_tracker();
+                if (!guard) {
+                    auto snap = scn->get_tracker_snapshot();
+                    if (snap.chain_count == 0) return std::nullopt;
+                    core::SharechainTip t;
+                    t.hash   = "";
+                    t.height = snap.verified_count > 0
+                                   ? static_cast<int64_t>(snap.chain_count) : -1;
+                    t.total  = static_cast<int32_t>(snap.chain_count);
+                    return t;
+                }
+                auto& chain = guard->chain;
+                uint256 best; int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    (void)tail_hash;
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+                if (best.IsNull() && chain.size() == 0) return std::nullopt;
+                core::SharechainTip t;
+                t.hash   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                t.height = best_height;
+                t.total  = static_cast<int>(chain.size());
+                return t;
+            });
+
+            // /sharechain/delta (LTC ref main_ltc.cpp:4115), no merged arrays.
+            mi->set_sharechain_delta_fn([scn, mi](const std::string& since_hash)
+                                            -> nlohmann::json {
+                auto guard = scn->read_tracker();
+                if (!guard) return nlohmann::json::object();
+                const bool testnet = bip110::pool::PoolConfig::is_testnet;
+                auto& chain    = guard->chain;
+                auto& verified = guard->verified;
+                std::string fee_addr = mi ? mi->get_node_fee_hash160() : std::string{};
+
+                uint256 best; int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    (void)tail_hash;
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+                nlohmann::json shares_arr = nlohmann::json::array();
+                int count = 0;
+                if (!best.IsNull()) {
+                    int walk = std::min(static_cast<int>(chain.get_height(best)),
+                        static_cast<int>(bip110::pool::PoolConfig::chain_length()));
+                    try {
+                        auto view = chain.get_chain(best, walk);
+                        for (auto [hash, data] : view) {
+                            std::string short_h = hash.GetHex().substr(0, 16);
+                            if (short_h == since_hash || hash.GetHex() == since_hash)
+                                break;
+                            nlohmann::json s;
+                            s["h"] = short_h;
+                            s["H"] = hash.GetHex();
+                            s["p"] = count;
+                            s["v"] = verified.contains(hash) ? 1 : 0;
+                            auto* idx = chain.get_index(hash);
+                            if (idx && idx->is_block_solution) s["blk"] = 1;
+                            data.share.invoke([&](auto* obj) {
+                                s["t"]  = obj->m_timestamp;
+                                s["V"]  = 36;
+                                s["s"]  = static_cast<int>(obj->m_stale_info);
+                                s["b"]  = obj->m_bits;
+                                s["a"]  = obj->m_absheight;
+                                s["dv"] = obj->m_desired_version;
+                                auto script = bip110::pool::get_share_script(obj);
+                                std::string addr =
+                                    core::script_to_address(script, false, testnet);
+                                s["m"] = addr.empty() ? HexStr(script) : addr;
+                                if (!fee_addr.empty() && script.size() >= 22) {
+                                    int off = -1;
+                                    if (script.size()==25 && script[0]==0x76) off=3;
+                                    else if (script.size()==22 && script[0]==0x00) off=2;
+                                    else if (script.size()==23 && script[0]==0xa9) off=2;
+                                    if (off >= 0) {
+                                        std::string h160 = HexStr(std::vector<unsigned char>(
+                                            script.begin()+off, script.begin()+off+20));
+                                        if (h160 == fee_addr) s["fee"] = 1;
+                                    }
+                                }
+                            });
+                            shares_arr.push_back(std::move(s));
+                            if (++count >= 200) break;   // safety cap
+                        }
+                    } catch (...) {}
+                }
+                nlohmann::json heads_arr = nlohmann::json::array();
+                for (auto& [hh, _] : chain.get_heads())
+                    heads_arr.push_back(hh.GetHex().substr(0, 16));
+                nlohmann::json blocks_arr = nlohmann::json::array();
+                if (mi) for (const auto& fb : mi->get_found_blocks())
+                    if (!fb.share_hash.empty())
+                        blocks_arr.push_back(fb.share_hash.substr(0, 16));
+
+                nlohmann::json result;
+                result["shares"] = std::move(shares_arr);
+                result["count"]  = count;
+                result["tip"]    = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                result["heads"]  = std::move(heads_arr);
+                result["blocks"] = std::move(blocks_arr);
+                return result;
+            });
+
+            // /web/share/<hash> (LTC ref main_ltc.cpp:4250, no DOGE/merged).
+            mi->set_share_lookup_fn([scn, mi](const std::string& hash_hex)
+                                        -> nlohmann::json {
+                auto guard = scn->read_tracker();
+                if (!guard) return nlohmann::json{{"error", "tracker busy"}};
+                const bool testnet = bip110::pool::PoolConfig::is_testnet;
+                auto& chain    = guard->chain;
+                auto& verified = guard->verified;
+                uint256 hash; hash.SetHex(hash_hex);
+                if (hash.IsNull() || !chain.contains(hash))
+                    return nlohmann::json{{"error", "share not found"}};
+
+                nlohmann::json result;
+                auto* idx = chain.get_index(hash);
+                bool is_block = idx && idx->is_block_solution;
+                result["is_block_solution"] = is_block;
+                result["hash"]     = hash.GetHex();
+                result["verified"] = verified.contains(hash);
+                result["height"]   = chain.get_height(hash);
+                if (is_block && mi) {
+                    for (const auto& fb : mi->get_found_blocks()) {
+                        if (fb.hash == hash.GetHex() ||
+                            (!fb.share_hash.empty() && fb.share_hash == hash.GetHex())) {
+                            result["block_height"]        = fb.height;
+                            result["block_confirmations"] = fb.confirmations;
+                            result["block_status"]        = static_cast<int>(fb.status);
+                            break;
+                        }
+                    }
+                }
+                chain.get_share(hash).invoke([&](auto* obj) {
+                    result["timestamp"]       = obj->m_timestamp;
+                    result["bits"]            = obj->m_bits;
+                    result["absheight"]       = obj->m_absheight;
+                    result["version"]         = 36;
+                    result["desired_version"] = obj->m_desired_version;
+                    result["stale_info"]      = static_cast<int>(obj->m_stale_info);
+                    auto script = bip110::pool::get_share_script(obj);
+                    std::string addr = core::script_to_address(script, false, testnet);
+                    result["miner_address"] = addr.empty() ? HexStr(script) : addr;
+                    result["miner_script"]  = HexStr(script);
+                });
+                return result;
+            });
+
+            LOG_INFO << "[EMB-BIP110] /sharechain/tip + /sharechain/delta + "
+                        "/share/<hash> + best-share difficulty wired — RealTime SSE "
+                        "poll, share.html click-through and the Best-Share card now live";
         }
 
         // All dashboard sharechain feeds are now wired on flag-ON:

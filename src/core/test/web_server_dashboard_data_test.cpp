@@ -1230,3 +1230,87 @@ TEST(Bip110Dashboard, CurrencyInfoEmbeddedTrueViaDisplayOverride)
     mi.set_embedded_display(true);
     EXPECT_TRUE(mi.rest_web_currency_info().value("embedded", false));
 }
+
+// ---------------------------------------------------------------------------
+// bip110 dashboard-completeness KATs (display-only). version_signaling warning
+// gates + node_info runtime endpoint. Reference = LTC.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Minimal 100%-v36 stats blob that clears version_signaling's overall_total<10
+// early-return and lands with all_target=true, confirmed=false (chain_height <
+// 3×chain_length) — i.e. the phase where v35_addr_limitation would normally be
+// emitted for a non-native coin.
+nlohmann::json v36_stats_blob() {
+    return nlohmann::json{
+        {"chain_height", 100},
+        {"chain_length", 8640},
+        {"total_shares", 100},
+        {"shares_by_version",         {{"36", 100}}},
+        {"shares_by_desired_version", {{"36", 100}}},
+    };
+}
+bool has_warning(const nlohmann::json& vs, const std::string& id) {
+    if (!vs.contains("address_warnings") || !vs["address_warnings"].is_array())
+        return false;
+    for (const auto& w : vs["address_warnings"])
+        if (w.value("id", std::string{}) == id) return true;
+    return false;
+}
+} // namespace
+
+// A native-v36 coin (bip110: genesis share-version == target, no lower
+// predecessor) never had a V35 phase → the "During V35…" caveat must be
+// suppressed. With no merged child (no mm_manager) the three LTC,DOGE merged
+// warnings must be absent too. address_warnings is empty.
+TEST(VersionSignalingWarnings, NativeV36SuppressesV35AndMergedWarnings) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::BITCOIN);
+    mi.set_coin_label("BIP110");
+    mi.set_native_share_version(true);
+    mi.set_sharechain_stats_fn([]() { return v36_stats_blob(); });
+
+    auto vs = mi.rest_version_signaling();
+    EXPECT_FALSE(has_warning(vs, "v35_addr_limitation"))
+        << "native-v36 coin must not show a V35-phase warning";
+    EXPECT_FALSE(has_warning(vs, "multiaddr_format"));
+    EXPECT_FALSE(has_warning(vs, "auto_convert"));
+    EXPECT_FALSE(has_warning(vs, "invalid_addr_redist"));
+    ASSERT_TRUE(vs.contains("address_warnings"));
+    EXPECT_TRUE(vs["address_warnings"].empty())
+        << "native-v36 + no merged child → no address warnings at all";
+}
+
+// A NON-native coin (crossed V35→V36) with the SAME stats still emits the V35
+// caveat (confirmed=false) — proves the suppression is gated on the native flag,
+// not a blanket removal that would regress LTC/DASH/BTC/DGB/BCH. Merged warnings
+// stay absent because this MI has no mm_manager (only LTC wires one).
+TEST(VersionSignalingWarnings, NonNativeStillEmitsV35Caveat) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::BITCOIN);
+    mi.set_sharechain_stats_fn([]() { return v36_stats_blob(); });
+
+    auto vs = mi.rest_version_signaling();
+    EXPECT_TRUE(has_warning(vs, "v35_addr_limitation"))
+        << "a V35-crossing coin must keep the V35 caveat (no regression)";
+}
+
+// /node_info surfaces the real runtime coin/sharechain endpoint once the lane
+// sets them: external_ip from --coin-externalip, p2p_port = live sharechain
+// listener. Before the wiring these read "0.0.0.0" / 0 and the miner-config URL
+// showed a bogus 0.0.0.0:port.
+TEST(NodeInfoRuntimeEndpoint, ExternalIpAndP2pPortSurfaced) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::BITCOIN);
+    mi.set_coin_label("BIP110");
+
+    auto before = mi.rest_node_info();
+    EXPECT_EQ(before.value("external_ip", std::string{}), "0.0.0.0");
+    EXPECT_EQ(before.value("p2p_port", -1), 0);
+
+    mi.set_external_ip("158.220.92.171");
+    mi.set_p2p_port(9337);
+    auto after = mi.rest_node_info();
+    EXPECT_EQ(after.value("external_ip", std::string{}), "158.220.92.171");
+    EXPECT_EQ(after.value("p2p_port", -1), 9337);
+}
