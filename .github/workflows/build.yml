@@ -770,6 +770,7 @@ jobs:
                     bch_header_sync_progress_test bch_block_download_test \
                     bch_idle_watchdog_kat_test \
                     bch_seed_tier_kat_test \
+                    bch_sharechain_bootstrap_test \
                     bch_graph_db_shutdown_persist_test \
                     bch_known_txs_evict_wiring_test \
                     bch_found_block_verify_test \
@@ -925,6 +926,7 @@ jobs:
                     bch_header_sync_progress_test bch_block_download_test \
                     bch_idle_watchdog_kat_test \
                     bch_seed_tier_kat_test \
+                    bch_sharechain_bootstrap_test \
                     bch_graph_db_shutdown_persist_test \
                     bch_known_txs_evict_wiring_test \
                     bch_found_block_verify_test \
