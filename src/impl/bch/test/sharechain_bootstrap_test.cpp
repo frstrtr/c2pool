@@ -3,12 +3,13 @@
 // bch::seed_sharechain_bootstrap KAT -- pins the pure sharechain bootstrap-addr
 // resolver + builder added for the contabo BCH revival (2026-09-04).
 //
-// THE INCIDENT (regression witness, section 1): run_pool (main_bch.cpp) hand-
-// builds bch::Config WITHOUT PoolConfig::load() -- the YAML load() was the ONLY
-// populator of m_bootstrap_addrs. So on master the addr store was ALWAYS empty
-// (contabo state/bch/addrs.json = literal `null`) -> the sharechain node had 0
-// peers forever. Section 1 pins that empty-BEFORE state; sections 2-5 pin the
-// fix's builder output (empty -> populated).
+// THE INCIDENT: run_pool (main_bch.cpp) hand-builds bch::Config WITHOUT
+// PoolConfig::load() -- the YAML load() was the ONLY populator of
+// m_bootstrap_addrs. So on master the addr store was ALWAYS empty (contabo
+// state/bch/addrs.json = literal `null`) -> the sharechain node had 0 peers
+// forever. Section 1 pins the fix's empty -> populated directly: the exact
+// no-explicit-peers/mainnet inputs run_pool now feeds must yield a NON-empty
+// bootstrap set (the broken baseline was 0).
 //
 // The resolver/builder are PURE (no I/O, no PoolConfig construction), so this
 // KAT is header-only over config_pool.hpp + <core/netaddress.hpp>; no coin lib
@@ -50,15 +51,12 @@ using AddNodes = std::vector<std::pair<std::string, uint16_t>>;
 
 int main()
 {
-    // ---- 1) REGRESSION WITNESS: empty BEFORE seed --------------------------
+    // ---- 1) REGRESSION WITNESS: empty BEFORE seed -> populated AFTER -------
     // The pre-fix live state: run_pool never populated m_bootstrap_addrs, so it
-    // stayed default-empty (contabo addrs.json = null, 0 sharechain peers). A
-    // node that never runs the seeder has an empty store -- this pins today's
-    // broken baseline so the fix (sections 2-5) is a proven empty -> populated.
+    // stayed default-empty (contabo addrs.json = null, 0 sharechain peers). The
+    // fix, fed the exact inputs run_pool now uses (no explicit peers, mainnet),
+    // must produce a NON-empty set -- a proven empty(0) -> populated.
     {
-        std::vector<NetService> unseeded;               // what run_pool's config had
-        CHECK(unseeded.empty());                        // == the contabo live bug
-        // The fix, same inputs run_pool now uses (no explicit peers, mainnet):
         auto after = build_sharechain_bootstrap(
             select_sharechain_bootstrap_mode(/*has_explicit_peers=*/false, /*regtest=*/false),
             AddNodes{});

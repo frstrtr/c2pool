@@ -673,10 +673,12 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
         // Explicit pin: reset any stale public addr book so saved public peers
         // (scored by first_seen/last_seen) can't outrank the pinned target.
         // Mirrors main_btc.cpp's ExplicitPeers addrs.json reset. Best-effort;
-        // the addr store lives under <data-dir>/<net>/bch/addrs.json.
-        std::string net_label = (testnet || testnet4 || regtest) ? "testnet" : "mainnet";
+        // the addr store lives under <data-dir>/bch/addrs.json -- AddrStore
+        // (addr_store.hpp:59) builds config_path()/<coin_name>/addrs.json with
+        // NO <net> subdir, so a net_label segment pointed the reset at a path
+        // that never exists and the stale public book was never cleared.
         std::filesystem::path addrs_path = core::filesystem::config_path()
-            / net_label / "bch" / "addrs.json";
+            / "bch" / "addrs.json";
         std::error_code rm_ec;
         std::filesystem::remove(addrs_path, rm_ec);  // best-effort
     }
