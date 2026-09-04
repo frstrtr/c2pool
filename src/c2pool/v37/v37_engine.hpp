@@ -190,8 +190,13 @@ private:
 
     // Executor thread only: get-or-create the atomic slot for a lane. Slots
     // are never erased (RemoveLane store()s nullptr), so a slot's address is
-    // stable for the engine's life and readers can load() it lock-free after
-    // the brief structural lookup.
+    // stable for the engine's life. The slot's POINTER VALUE is published via an
+    // atomic store()/load() (acquire/release), so a reader always observes a
+    // fully-constructed snapshot and never a torn pointer. This is NOT a
+    // lock-free read in the strict sense, though: the reader path (snapshot())
+    // first takes m_slots_mtx briefly for the map structural lookup and only then
+    // does the atomic load() — only the publication of the pointer value itself
+    // is lock-free, not the lane lookup.
     std::atomic<std::shared_ptr<const ::v37::LaneSnapshot>>& slot(
         ::v37::ChainId c) {
         std::lock_guard<std::mutex> lk(m_slots_mtx);

@@ -794,9 +794,17 @@ target_link_libraries(c2pool-v37 Threads::Threads)
 # is hand-listed add_subdirectory/add_test — there is no file(GLOB) over
 # */test — and the test-floor-guard only floors lanes already present in
 # test-floors.json, so a test dir that is never added is a silent hollow-green.
-# This add_subdirectory is that mitigation (spec §5.2). The linux-lane floor
-# raise for the new v37 scaffold test is deferred to A1's CI-lane PR (a floor is
-# raised only AFTER capturing a green-baseline junit).
+# add_subdirectory(v37/test) is NECESSARY but is NOT itself the hollow-green
+# mitigation: a CTest registered here yet absent from build.yml's `cmake --build
+# --target` list is NOT_BUILT under CI and its ctest run silently passes (the DGB
+# #137 / #769 unregistered-KAT class; identical to PR #1467's executor test). The
+# actual mitigation is that v37_scaffold_test is now listed in the build.yml
+# --target lists (BOTH the Linux x86_64 and the ASan+UBSan legs) so CI compiles +
+# runs it, PLUS the drift-guard glob in tools/ci/check_test_target_allowlist.py
+# now covers src/c2pool/**/test/ so any future unlisted add_test here fails the
+# guard at PR time rather than hollow-greening. The linux-lane floor raise for the
+# new v37 scaffold test is deferred to A1's CI-lane PR (a floor is raised only
+# AFTER capturing a green-baseline junit).
 add_subdirectory(v37/test)
 
 # Legacy applications have been archived to ../../archive/
