@@ -27,6 +27,8 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <cstdlib>       // ::mkdtemp
+#include <filesystem>    // std::filesystem::remove_all
 
 #include <boost/asio/io_context.hpp>
 
@@ -70,6 +72,45 @@ btc_addr_record_t make_rec(uint64_t services, uint32_t ts, const NetService& ep)
     r.m_endpoint  = ep;
     return r;
 }
+
+// Per-invocation unique data dir. Each BtcCoinPeerManager persists addrman +
+// working-set JSON into its data_dir on teardown (~mgr -> stop -> save_peers).
+// A fixed shared /tmp path let a warm runner reuse leftover files and, under
+// ctest -j, let concurrent runs write the same tree; mkdtemp isolates every
+// invocation and remove_all reclaims it on scope exit (RAII also covers the
+// CHECK-failure path). NOTE: path isolation is hygiene, NOT the flake fix --
+// see KAT_ADDRMAN_K* below.
+struct KatTempDir {
+    std::string path;
+    explicit KatTempDir(const char* stem)
+    {
+        auto tmpl = (std::filesystem::temp_directory_path() /
+                     (std::string(stem) + "_XXXXXX")).string();
+        std::vector<char> buf(tmpl.begin(), tmpl.end());
+        buf.push_back('\0');
+        const char* made = ::mkdtemp(buf.data());
+        if (!made) { std::cerr << "mkdtemp failed for " << tmpl << "\n"; std::abort(); }
+        path = made;
+    }
+    ~KatTempDir()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    KatTempDir(const KatTempDir&) = delete;
+    KatTempDir& operator=(const KatTempDir&) = delete;
+};
+
+// THE FLAKE FIX. CoinAddrMan(0,0) seeds its SipHash bucket key from
+// std::random_device, so which new-table slot each address lands in varies
+// run to run. When two fresh distinct-group addrs happen to collide into one
+// occupied slot, add() drops the newcomer (coin_addrman.hpp: erase_new_entry
+// -> return false), so the banked count comes up one short. Measured ~1/300
+// even sequentially with a freshly cleaned dir -> the shared /tmp path is NOT
+// the cause. A fixed non-zero key makes bucketing deterministic; this value
+// is arbitrary but verified collision-free for every set the KAT banks.
+constexpr uint64_t KAT_ADDRMAN_K0 = 0x0123456789abcdefULL;
+constexpr uint64_t KAT_ADDRMAN_K1 = 0xfedcba9876543210ULL;
 
 int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -170,7 +211,10 @@ void t3_ingest_bucket_tried_plan()
     boost::asio::io_context ioc;
     BtcPeerManagerConfig cfg;
     cfg.valid_ports = { 8333, 9333 };
-    BtcCoinPeerManager mgr(ioc, "BIP110", "/tmp/bip110_peerdisc_kat", cfg);
+    cfg.addrman_key0 = KAT_ADDRMAN_K0;
+    cfg.addrman_key1 = KAT_ADDRMAN_K1;
+    KatTempDir tmp("bip110_peerdisc_kat");
+    BtcCoinPeerManager mgr(ioc, "BIP110", tmp.path, cfg);
 
     // A single fork peer gossiped by the oracle enters the bucketed addrman.
     const NetService peer("8.8.8.8", 8333);
@@ -208,7 +252,10 @@ void t4_oracle_bootstraps_many()
     BtcPeerManagerConfig cfg;
     cfg.valid_ports = { 8333, 9333 };
     cfg.max_peers = 64;
-    BtcCoinPeerManager mgr(ioc, "BIP110", "/tmp/bip110_peerdisc_kat_e2e", cfg);
+    cfg.addrman_key0 = KAT_ADDRMAN_K0;
+    cfg.addrman_key1 = KAT_ADDRMAN_K1;
+    KatTempDir tmp("bip110_peerdisc_kat_e2e");
+    BtcCoinPeerManager mgr(ioc, "BIP110", tmp.path, cfg);
 
     const int64_t now = static_cast<int64_t>(core::timestamp());
 
@@ -270,7 +317,10 @@ void t5_self_auth_directory_and_count()
     BtcPeerManagerConfig cfg;
     cfg.valid_ports = { 8333, 9333 };
     cfg.max_peers = 64;
-    BtcCoinPeerManager mgr(ioc, "BIP110", "/tmp/bip110_peerdisc_kat_t5", cfg);
+    cfg.addrman_key0 = KAT_ADDRMAN_K0;
+    cfg.addrman_key1 = KAT_ADDRMAN_K1;
+    KatTempDir tmp("bip110_peerdisc_kat_t5");
+    BtcCoinPeerManager mgr(ioc, "BIP110", tmp.path, cfg);
 
     // (a) Self-authenticated add: on a completed NODE_BLAKE2B handshake, NodeP2P
     // calls m_addr_callback({target}, target). main wires that to
