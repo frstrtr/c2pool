@@ -205,25 +205,88 @@ static void test_fixed_point() {
     CHECK(big.mul_q(Q_ONE) == big);
     CHECK(mul_q64(Q_ONE, Q_ONE) == Q_ONE);
 
-    // Table generation: deterministic, monotonic, V36-lineage formula
+    // Table generation at the RATIFIED geometry: the exact per-entry hl-th-root
+    // base, embedded from v37_decay_canonical.hpp. The V36-lineage iterated
+    // first-order formula governs every OTHER geometry and is exercised
+    // separately (test_generic_path_values below) — the two constructions
+    // disagree from decay[1] onward, so no single test covers both.
     DecayTables t1, t2;
     t1.init(2160, 4096, 8192, 8);
     t2.init(2160, 4096, 8192, 8);
+    // NOTE: at this geometry both tables are memcpy-equivalents of the same
+    // constexpr array, so these three compare copy-determinism, not the
+    // determinism of a computation. The computed path's determinism is pinned
+    // in test_generic_path_values.
     CHECK(t1.decay == t2.decay);
     CHECK(t1.inv_decay == t2.inv_decay);
     CHECK(t1.epoch_shift == t2.epoch_shift);
-    u64 expect_per = Q_ONE - static_cast<u64>(
-        (u128(Q_ONE) * LN2_MICRO) / (u128(1000000) * 2160));
-    CHECK(t1.decay_per == expect_per);
+    // Ratified default geometry uses the EXACT hl-th-root base (golden
+    // d659c801): the per-step factor is the exact lambda / lambda^-1, i.e.
+    // decay[1] / inv_decay[1], not the first-order approximation.
+    CHECK(t1.decay_per == 4610206359018591605ULL);   // exact lambda   = decay[1]
+    CHECK(t1.inv_per   == 4613166152737261408ULL);    // exact lambda^-1 = inv_decay[1]
     for (std::size_t d = 1; d < t1.decay.size(); ++d)
         CHECK(t1.decay[d] < t1.decay[d - 1]);
     for (std::size_t j = 1; j < t1.inv_decay.size(); ++j)
         CHECK(t1.inv_decay[j] > t1.inv_decay[j - 1]);
-    // Half-life sanity: decay[half_life] ~ 0.5. The V36-lineage per-step
-    // factor is first-order (1 - ln2/HL), so (1-x)^HL deviates from exactly
-    // 0.5 by ~ln2^2/(2*HL) ~ 5.5e-5 relative — allow 2^-12 slack.
-    u64 half = t1.decay[2160];
-    CHECK(half > (Q_ONE / 2) - (Q_ONE >> 12) && half < (Q_ONE / 2) + (Q_ONE >> 12));
+    // Exact half-life: under the canonical exact-root base (golden d659c801)
+    // decay[half_life] == 2^(FRAC_BITS-1) EXACTLY — no first-order slack.
+    CHECK(t1.decay[2160] == (Q_ONE >> 1));            // 2^61
+    // Golden-match regression pins: decay[]/inv_decay[] MUST reproduce the
+    // ratified golden d659c801 at these published anchors.
+    CHECK(t1.decay[0]        == Q_ONE);                       // 2^62 = ONE
+    CHECK(t1.decay[1]        == 4610206359018591605ULL);
+    CHECK(t1.decay[2160]     == 2305843009213693952ULL);      // 2^61
+    CHECK(t1.decay[4096]     == 1238846976710486712ULL);
+    CHECK(t1.inv_decay[0]    == Q_ONE);
+    CHECK(t1.inv_decay[1]    == 4613166152737261408ULL);
+    CHECK(t1.inv_decay[4095] == 17161783987563169425ULL);
+
+    // FULL-ARRAY PIN. The anchors above cover 7 of 12289 entries; the golden
+    // vector itself publishes anchors and a sampled subset, not the whole
+    // table. So nothing in-tree noticed an edit to, say, decay[5000] — the
+    // generated header is 3800 lines of bare literals with a DO NOT EDIT banner
+    // and no other enforcement, and a bad merge or a partial regeneration lands
+    // there as easily as a deliberate edit. Pin the LOT: SHA-256 over every
+    // entry init() installs, decay[0..8192] then inv_decay[0..4095], each as
+    // 8 little-endian bytes (98312 bytes total). One flipped bit anywhere reds
+    // this check. Constant recomputed from the current table by construction —
+    // if it ever needs updating, that is the regeneration asking to be reviewed.
+    {
+        std::vector<std::uint8_t> buf;
+        buf.reserve((t1.decay.size() + t1.inv_decay.size()) * 8);
+        auto put = [&buf](u64 x) {
+            for (int b = 0; b < 8; ++b)
+                buf.push_back(static_cast<std::uint8_t>(x >> (8 * b)));
+        };
+        for (u64 v : t1.decay) put(v);
+        for (u64 v : t1.inv_decay) put(v);
+        CHECK(buf.size() == (8193u + 4096u) * 8u);
+        auto h = sha256(buf.data(), buf.size());
+        static const std::uint8_t want[32] = {
+            0x65, 0x75, 0x8e, 0x8a, 0xad, 0x42, 0x64, 0x07,
+            0x44, 0xa1, 0x03, 0x2a, 0xed, 0x08, 0x7c, 0x7a,
+            0x78, 0x25, 0x13, 0xec, 0xfc, 0x1f, 0x8c, 0x6b,
+            0xa5, 0x85, 0x81, 0xcb, 0x39, 0xc5, 0xed, 0xa0};
+        CHECK(std::memcmp(h.data(), want, 32) == 0);
+    }
+
+    // epoch_shift is DEFINED as the iterated truncating product of the
+    // one-epoch factor decay[epoch_len]:
+    //     epoch_shift[i] = trunc(epoch_shift[i-1] * decay[E])   (Q62)
+    // It is emphatically NOT decay[E*i], and the difference is observable on
+    // the canonical base: epoch_shift[2] here is 332794085627726496 while the
+    // exact root decay[8192] is 332794085627726497, one ULP higher. Anyone
+    // "simplifying" the ladder into a table lookup would move consensus by that
+    // ULP on every bucket two or more epochs old. The iterated form is correct
+    // because a bucket is re-based one epoch at a time, each rebuild applying
+    // exactly this factor — the ladder replays that history rather than
+    // computing a closed form for it.
+    CHECK(t1.epoch_shift[0] == Q_ONE);
+    CHECK(t1.epoch_shift[1] == 1238846976710486712ULL);   // == decay[4096]
+    CHECK(t1.epoch_shift[2] == 332794085627726496ULL);    // decay[8192] - 1
+    CHECK(t1.decay[8192]    == 332794085627726497ULL);    // the 1-ULP trap
+    CHECK(t1.epoch_shift[2] != t1.decay[8192]);
     // Inverse headroom: inv_decay max < 4.0 (E/HL = 4096/2160 -> 2^1.9).
     // Compare in u128: 4.0 in Q62 == 2^64, which overflows u64.
     CHECK(u128(t1.inv_decay.back()) < (u128(4) << FRAC_BITS));
@@ -261,6 +324,171 @@ static void test_headroom_guard() {
     LaneParams def;
     Lane ok(def);
     CHECK(ok.tables().inv_decay.size() == def.epoch_len());
+}
+
+// The canonical gate is keyed on (half_life, epoch_len) — the pair the lane
+// digest commits. max_depth is derived caller-side and is NOT committed, so a
+// ratified-geometry request the embedded canonical table cannot serve must be
+// REFUSED; silently downgrading it to the first-order base would put a node on
+// non-golden consensus values while every committed parameter still agreed.
+static void test_canonical_gate() {
+    {   // ratified (2160, 4096), max_depth one past the canonical table:
+        // must throw rather than construct a different decay table.
+        DecayTables t;
+        bool threw = false;
+        try { t.init(2160, 4096, 8192 + 1, 8); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+    {   // exactly at the canonical depth: canonical path, golden d659c801
+        // values — NOT the first-order 4610206121978955086 this used to yield.
+        DecayTables t;
+        t.init(2160, 4096, 8192, 8);
+        CHECK(t.decay.size() == 8193);
+        CHECK(t.decay[1] == 4610206359018591605ULL);
+        CHECK(t.decay[2160] == (Q_ONE >> 1));            // 2^61, exact half-life
+    }
+    {   // genuinely different geometry: generic first-order path, unchanged —
+        // constructs without throwing and does not use the canonical base.
+        DecayTables t;
+        bool threw = false;
+        try { t.init(64, 128, 256, 6); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(!threw);
+        CHECK(t.decay.size() == 257);
+        CHECK(t.decay[1] != 4610206359018591605ULL);
+    }
+    {   // the refusal is scoped to the ratified identity: a different geometry
+        // may still ask for any depth it likes.
+        DecayTables t;
+        bool threw = false;
+        try { t.init(64, 128, 16384, 6); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(!threw);
+        CHECK(t.decay.size() == 16385);
+    }
+}
+
+// The generic V36-lineage construction, at PRODUCTION scale. Before the
+// ratified geometry moved to the embedded exact-root base, test_fixed_point's
+// value pins were the first-order path's coverage; afterwards the only generic
+// exercise left was the small (64, 128) harness geometry, and no test asserted
+// a computed VALUE at a real half_life again. half_life 2161 is the ratified
+// geometry off by one — it misses the canonical gate by a single unit and so
+// runs the whole first-order construction at full depth.
+static void test_generic_path_values() {
+    DecayTables g, g2;
+    g.init(2161, 4096, 8192, 8);
+    g2.init(2161, 4096, 8192, 8);
+    // Determinism of the COMPUTED path (the canonical path can only pin the
+    // determinism of a memcpy).
+    CHECK(g.decay == g2.decay);
+    CHECK(g.inv_decay == g2.inv_decay);
+    CHECK(g.epoch_shift == g2.epoch_shift);
+
+    // decay[1] is the first-order per-step factor itself, and it must be
+    // exactly Q_ONE - Q_ONE*LN2_MICRO/(10^6 * half_life) evaluated in the same
+    // widened integer ops V36 used at Q40. Both forms are pinned: the literal
+    // catches a change of construction, the expression says where it comes from.
+    const u64 hl = 2161;
+    const u64 first_order =
+        Q_ONE - static_cast<u64>((u128(Q_ONE) * LN2_MICRO) /
+                                 (u128(1000000) * hl));
+    CHECK(first_order == 4610206806799153342ULL);
+    CHECK(g.decay_per == first_order);
+    CHECK(g.decay[0] == Q_ONE);
+    CHECK(g.decay[1] == first_order);
+    // ...and the table above it is that factor ITERATED with truncation, not
+    // re-derived per entry: decay[2] == trunc(decay[1] * decay_per).
+    CHECK(g.decay[2] == mul_q64(g.decay[1], g.decay_per));
+    CHECK(g.decay[2] == 4608728069632326681ULL);
+    CHECK(g.decay[8192] == 333058986374812924ULL);
+    // inv_per = floor(2^124 / decay_per), and inv_decay iterates it likewise.
+    CHECK(g.inv_per == 4613165704669264066ULL);
+    CHECK(g.inv_decay[1] == g.inv_per);
+    // Accumulated floor bias made visible: the exact base hits half at the
+    // half-life EXACTLY (2^61); the first-order base, after 2161 truncating
+    // multiplies, lands ~2.6e8 ULPs short. That gap is the whole reason the
+    // ratified geometry does not use this path.
+    CHECK(g.decay[2161] == 2305587057162438918ULL);
+    CHECK(g.decay[2161] < (Q_ONE >> 1));
+    // Shared epilogue, generic branch: epoch_shift[1] == decay[epoch_len].
+    CHECK(g.epoch_shift[0] == Q_ONE);
+    CHECK(g.epoch_shift[1] == g.decay[4096]);
+    CHECK(g.epoch_shift[1] == 1239339933503446235ULL);
+    // A one-unit half_life difference is a wholly different table.
+    CHECK(g.decay[1] != 4610206359018591605ULL);
+}
+
+// The canonical branch's remaining paths — the ones test_canonical_gate does
+// not reach because it only ever asks for the full depth.
+static void test_canonical_branch_paths() {
+    {   // Ratified geometry, depth INSIDE the canonical table but shorter than
+        // one epoch. The gate passes (1000 <= 8192), so this is a canonical
+        // request; it is refused anyway, because epoch_shift needs
+        // decay[epoch_len] and no table this short has it.
+        //
+        // The guard is now an argument-only precondition checked at the top of
+        // init rather than after both tables are built, so the refusal is also
+        // a STRONG exception guarantee: init that throws leaves the object
+        // exactly as it was. Pin that, not just the throw — a lane whose
+        // re-init is refused must keep running on the geometry it had.
+        DecayTables t;
+        t.init(2160, 4096, 8192, 8);
+        const auto keep_decay = t.decay;
+        const auto keep_inv   = t.inv_decay;
+        const auto keep_shift = t.epoch_shift;
+        bool threw = false;
+        try { t.init(2160, 4096, 1000, 8); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+        CHECK(t.half_life == 2160 && t.epoch_len == 4096);
+        CHECK(t.decay == keep_decay);
+        CHECK(t.inv_decay == keep_inv);
+        CHECK(t.epoch_shift == keep_shift);
+        CHECK(t.decay.size() == 8193);
+
+        // Same guarantee for the OTHER argument-decidable refusals: the
+        // over-depth near-miss on the ratified geometry, and a zero parameter.
+        threw = false;
+        try { t.init(2160, 4096, 8193, 8); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+        CHECK(t.decay == keep_decay);
+        CHECK(t.inv_decay == keep_inv);
+        CHECK(t.epoch_shift == keep_shift);
+        threw = false;
+        try { t.init(0, 4096, 8192, 8); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+        CHECK(t.half_life == 2160 && t.epoch_len == 4096);
+        CHECK(t.decay == keep_decay);
+    }
+    {   // Canonical re-init, SHRINKING, on a live object: every container must
+        // be resized, not merely overwritten in its leading part. A stale tail
+        // would leave decay[] claiming depths the new geometry never granted
+        // and epoch_shift[] carrying a previous max_epochs' worth of rungs.
+        DecayTables t;
+        t.init(2160, 4096, 8192, 8);
+        CHECK(t.decay.size() == 8193);
+        CHECK(t.epoch_shift.size() == 9);
+        t.init(2160, 4096, 4096, 4);
+        CHECK(t.decay.size() == 4097);
+        CHECK(t.inv_decay.size() == 4096);
+        CHECK(t.epoch_shift.size() == 5);
+        // No stale tail: the last entry is the canonical decay[4096], not the
+        // old decay[8192] left in place.
+        CHECK(t.decay.back() == 1238846976710486712ULL);
+        CHECK(t.decay.back() != 332794085627726497ULL);
+        CHECK(t.epoch_shift.back() == 24015490860880768ULL);
+        // Still the golden base after the re-init.
+        CHECK(t.decay[1] == 4610206359018591605ULL);
+        CHECK(t.decay[2160] == (Q_ONE >> 1));
+        // Growing back is symmetric.
+        t.init(2160, 4096, 8192, 8);
+        CHECK(t.decay.size() == 8193);
+        CHECK(t.decay.back() == 332794085627726497ULL);
+    }
 }
 
 static void test_lane_vs_reference(const LaneParams& p, u64 pushes, u64 seed,
@@ -668,6 +896,9 @@ int main() {
     test_sha256();
     test_fixed_point();
     test_headroom_guard();
+    test_canonical_gate();
+    test_canonical_branch_paths();
+    test_generic_path_values();
     // small geometry: 5+ epochs, constant folding + eviction churn
     test_lane_vs_reference(small_params(), 1500, 1234, "small");
     // default OQ-5 geometry: cross two epoch rebuilds (>8192 pushes)
