@@ -505,6 +505,9 @@ C2P_PARAM("embedded.accrue_asset_unlocks", Embedded, BOOL, RESTART, C_DASH, LIT,
 C2P_PARAM("embedded.null_arm", Embedded, TRISTATE_BOOL, MONEY_RESTART, C_DASH, NONE, "", NONE, "optimistic null commitment (money/consensus)")
   C2P_ALIAS("embedded.null_arm", BIN_DASH, "--embedded-null-arm", FLAG_OPT_EQFALSE)
 
+C2P_PARAM("embedded.include_mn_special_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "DIP special-tx superset types 1-4 (daemonless default ON)")
+  C2P_ALIAS("embedded.include_mn_special_txs", BIN_DASH, "--embedded-include-mn-special-txs", FLAG_OPT_EQFALSE)
+
 C2P_PARAM("embedded.fresh_datum_race", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "race freshest getmnlistd (default ON)")
   C2P_ALIAS("embedded.fresh_datum_race", BIN_DASH, "--embedded-fresh-datum-race", FLAG_OPT_EQFALSE)
 

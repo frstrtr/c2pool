@@ -43,6 +43,39 @@
 ///   ingest_dstx        — CoinJoin DSTX lane; without it CoinJoin txs are
 ///                        structurally excluded from served blocks (a
 ///                        fullness gap vs dashd).
+///   embedded_mainnet   THE GATE. Without it resolve_embedded_arm returns
+///                        DashdFallback/NoOptIn and a daemonless node (no
+///                        dashd, no --coin-rpc) serves NOTHING — miners idle.
+///                        Flipping it ON in the daemonless posture also implies
+///                        coin-P2P discovery (arm_resolution.hpp discover_implied),
+///                        so a bare `--run` syncs and serves. Byte-parity of the
+///                        mainnet embedded template is proven (v0.2.4 gate-lift).
+///   embedded_utxo      the E2b UTXO/fee lane. Without it no mempool tx ever
+///                        fee-proves (fee_fold_proven=false → coinbase-only), so
+///                        serve_mempool_txs above is vacuous. Selection still
+///                        admits only fee_fold_proven txs (never overstated).
+///   null_arm           #127: at a required-not-yet-mined DKG window slot,
+///                        serve the consensus-valid NULL commitment (dashd's own
+///                        GetMineableCommitments behaviour) instead of refusing
+///                        the whole height. Freshness-gated: unproven ⇒ no null ⇒
+///                        refuse (today's benign gap), NEVER a guessed reject.
+///   superblock         daemonless superblock payee sourcing via govsync. Three
+///                        fail-closed layers (BLS operator-key vote verify +
+///                        EvoNode-4x weight, completeness, desync latch); a
+///                        non-confident trigger refuses exactly as today, never a
+///                        guessed payee. Implies the govsync pull at the call site.
+///   include_mn_special_txs  the special-tx superset (DIP types 1-4). The builder
+///                        DROPS any tx the SML fold cannot apply exactly and the
+///                        emit gate re-folds and rejects on root drift, so an
+///                        included special tx always commits a folded MN root.
+///   accrue_asset_locks type-8 DIP-0027 asset-lock accrual. Body membership and
+///                        creditPool accrual are the SAME bit (embedded_gbt.hpp
+///                        allow_locks == accrue), so CbTx creditPoolBalance always
+///                        reflects the served body.
+///   accrue_asset_unlocks  type-9 asset-unlock admission. INERT until the
+///                        CreditPool INDEX follower is seeded (work_source.hpp
+///                        passes nullptr today); the predicate, not the flag,
+///                        admits — so defaulting it ON is safe and honest.
 ///
 /// Each lever keeps an explicit opt-out (--<flag>=false). An explicit ON is
 /// honoured in both postures. The resolver is a pure function so the
@@ -70,13 +103,25 @@ struct TxServeLever {
     bool explicit_off{false};
 };
 
-/// The five levers the good-citizen default governs.
+/// The levers the good-citizen default governs. The first five arm the mempool
+/// FILL + serve + referee lane; the next seven are the template-completeness
+/// levers (arm gate, fee lane, null slot, superblock, special-tx superset,
+/// asset-lock/unlock accrual) that make "serve the full mempool" non-vacuous —
+/// without them a bare `--run` either serves nothing (embedded_mainnet OFF) or a
+/// coinbase-only body.
 struct TxServeLevers {
     TxServeLever serve_mempool_txs;
     TxServeLever tx_serve_own_set;
     TxServeLever mempool_ingest;
     TxServeLever ingest_isdlock;
     TxServeLever ingest_dstx;
+    TxServeLever embedded_mainnet;
+    TxServeLever embedded_utxo;
+    TxServeLever null_arm;
+    TxServeLever superblock;
+    TxServeLever include_mn_special_txs;
+    TxServeLever accrue_asset_locks;
+    TxServeLever accrue_asset_unlocks;
 };
 
 /// Resolved arming decision plus the facts a caller needs to log truthfully.
@@ -86,6 +131,13 @@ struct TxServeResolution {
     bool mempool_ingest{false};
     bool ingest_isdlock{false};
     bool ingest_dstx{false};
+    bool embedded_mainnet{false};
+    bool embedded_utxo{false};
+    bool null_arm{false};
+    bool superblock{false};
+    bool include_mn_special_txs{false};
+    bool accrue_asset_locks{false};
+    bool accrue_asset_unlocks{false};
     /// True iff the daemonless default flipped at least one lever ON that the
     /// operator did not spell out — the caller logs WHICH posture armed it.
     bool defaulted_any{false};
@@ -120,6 +172,16 @@ inline TxServeResolution resolve_good_citizen_tx_serve(
     r.mempool_ingest    = resolve(req.mempool_ingest,    r.defaulted_any);
     r.ingest_isdlock    = resolve(req.ingest_isdlock,    r.defaulted_any);
     r.ingest_dstx       = resolve(req.ingest_dstx,       r.defaulted_any);
+    r.embedded_mainnet  = resolve(req.embedded_mainnet,  r.defaulted_any);
+    r.embedded_utxo     = resolve(req.embedded_utxo,     r.defaulted_any);
+    r.null_arm          = resolve(req.null_arm,          r.defaulted_any);
+    r.superblock        = resolve(req.superblock,        r.defaulted_any);
+    r.include_mn_special_txs =
+        resolve(req.include_mn_special_txs, r.defaulted_any);
+    r.accrue_asset_locks =
+        resolve(req.accrue_asset_locks,   r.defaulted_any);
+    r.accrue_asset_unlocks =
+        resolve(req.accrue_asset_unlocks, r.defaulted_any);
     r.unsafe_serve_without_referee =
         daemonless_posture && r.serve_mempool_txs && !r.tx_serve_own_set;
     return r;
