@@ -3269,6 +3269,31 @@ int main(int argc, char* argv[])
         LOG_INFO << "[BTC-POOL] dashboard disabled (no --http bind given).";
     }
 
+    // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
+    // tick (main_ltc.cpp think_timer). Without it, think() fired only on share
+    // arrival: no stale-head eating, unbounded raw-tracker growth past
+    // 2*CHAIN_LENGTH+10, and a timed-out bootstrap download was never retried if
+    // all peers went silent. clean_tracker() runs think() inline then prunes on
+    // the compute thread under the exclusive lock. Guarded on p2p_node non-null.
+    auto btc_think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+    std::function<void(boost::system::error_code)> btc_think_tick;
+    if (p2p_node) {
+        btc_think_tick = [&, btc_think_timer](boost::system::error_code ec) {
+            if (ec || shutdown_initiated) return;
+            btc_think_timer->expires_after(std::chrono::seconds(5));
+            btc_think_timer->async_wait(btc_think_tick);
+            try {
+                p2p_node->clean_tracker();
+            } catch (const std::exception& e) {
+                LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what();
+            } catch (...) {
+                LOG_ERROR << "[CLEAN-TRACKER] unknown error";
+            }
+        };
+        btc_think_timer->expires_after(std::chrono::seconds(5));
+        btc_think_timer->async_wait(btc_think_tick);
+    }
+
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
 
     // Diagnostic [IOC-LAT]: when a single run_for slice takes far longer
