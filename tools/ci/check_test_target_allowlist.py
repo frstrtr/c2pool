@@ -7,10 +7,17 @@
 # master in the DGB #137 / test_dgb_subsidy regression. This guard fails closed
 # on that drift so it is caught at PR time, not after merge.
 #
-# Scope: per-coin (src/impl/*/test) and per-sharechain (src/sharechain/*/test)
-# test trees, plus the singleton shared trees test/ and src/core/test. Widened
-# from per-coin-only 2026-09-04 (#1467 post-mortem) -- a missing target under
-# any of these paths is the same silent NOT_BUILT trap.
+# Scope: per-coin test trees (src/impl/<coin>/test/), the sharechain engine
+# trees (src/sharechain/**/test/ -- both src/sharechain/test/ and
+# src/sharechain/<module>/test/), the c2pool consumer-side trees
+# (src/c2pool/**/test/ -- e.g. src/c2pool/v37/test/, where the v37 node
+# scaffold lands its unit test), the shared core test tree (src/core/test/)
+# and the top-level test/ tree. The sharechain + core trees were previously
+# unaudited, so a standalone add_executable there could land NOT_BUILT-silent
+# (the coverage gap that let PR #1467's src/sharechain/v37/test/ go unguarded).
+# The c2pool tree is the same surface: PR #1477 (W0 node scaffold) adds
+# src/c2pool/v37/test/v37_scaffold_test, which this glob now audits so a future
+# add_test there missing from build.yml fails closed instead of hollow-greening.
 #
 # Escape hatch: a target intentionally NOT built in CI (e.g. a compile-only TU
 # or a live-only harness) must be declared explicitly with a comment line:
@@ -24,19 +31,23 @@ import glob
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUILD_YML = os.path.join(REPO, ".github", "workflows", "build.yml")
-# Globbed per-parent test trees: <parent>/*/test/CMakeLists.txt.
 COIN_GLOB = os.path.join(REPO, "src", "impl", "*", "test", "CMakeLists.txt")
-SHARECHAIN_GLOB = os.path.join(REPO, "src", "sharechain", "*", "test", "CMakeLists.txt")
-GLOB_ROOTS = (COIN_GLOB, SHARECHAIN_GLOB)
-# Singleton shared test trees are ALSO a NOT_BUILT surface: a standalone
+# The sharechain engine trees and the shared core test tree are the same
+# NOT_BUILT surface as the coin trees, and the v37 engine work lands its test
+# code there. Recursive on sharechain so src/sharechain/test/ (no module
+# directory) and src/sharechain/<module>/test/ are both audited.
+SHARECHAIN_GLOB = os.path.join(REPO, "src", "sharechain", "**", "test", "CMakeLists.txt")
+# The c2pool consumer-side trees are the same NOT_BUILT surface: the v37 node
+# scaffold (PR #1477) lands its unit test under src/c2pool/v37/test/. Recursive
+# so src/c2pool/test/ (no module directory) and src/c2pool/<module>/test/ are
+# both audited.
+C2POOL_GLOB = os.path.join(REPO, "src", "c2pool", "**", "test", "CMakeLists.txt")
+CORE_TEST = os.path.join(REPO, "src", "core", "test", "CMakeLists.txt")
+# The top-level shared test tree is ALSO a NOT_BUILT surface: a standalone
 # add_executable here that is missing from build.yml is silently "Not Run"
 # too (this is why targets get hand-folded into allowlisted executables to
-# dodge the trap). Audit them with the same fail-closed rule. Widened
-# 2026-09-04 (#1467 post-mortem) to src/core/test alongside top-level test/.
-SINGLETON_TESTS = (
-    os.path.join(REPO, "test", "CMakeLists.txt"),
-    os.path.join(REPO, "src", "core", "test", "CMakeLists.txt"),
-)
+# dodge the trap). Audit it with the same fail-closed rule.
+TOP_LEVEL_TEST = os.path.join(REPO, "test", "CMakeLists.txt")
 
 
 def strip_comment(line):
@@ -116,17 +127,30 @@ def parse_coin_targets(path):
     return targets
 
 
+def audited_roots():
+    """Every test CMakeLists.txt the guard polices, deduplicated, in a stable
+    order: per-coin trees, sharechain engine trees, c2pool consumer trees,
+    core, then top-level."""
+    roots = sorted(glob.glob(COIN_GLOB))
+    roots += sorted(glob.glob(SHARECHAIN_GLOB, recursive=True))
+    roots += sorted(glob.glob(C2POOL_GLOB, recursive=True))
+    if os.path.exists(CORE_TEST):
+        roots.append(CORE_TEST)
+    if os.path.exists(TOP_LEVEL_TEST):
+        roots.append(TOP_LEVEL_TEST)
+    seen = set()
+    return [r for r in roots if not (r in seen or seen.add(r))]
+
+
 def main():
     allowlist = build_yml_targets(BUILD_YML)
     violations = []
     audited = 0
-    roots = []
-    for g in GLOB_ROOTS:
-        roots.extend(sorted(glob.glob(g)))
-    roots.extend(p for p in SINGLETON_TESTS if os.path.exists(p))
+    roots = audited_roots()
     for cml in roots:
-        # Label: coin name for a per-coin tree (src/impl/<coin>/test/...),
-        # "test/" for the shared top-level tree.
+        # Label: coin/module name for a src/ tree (src/impl/<coin>/test/,
+        # src/sharechain/<module>/test/, src/core/test/), "test/" for the
+        # shared top-level tree.
         rel = os.path.relpath(cml, REPO)
         coin = cml.split(os.sep)[-3] if rel.startswith("src" + os.sep) else "test/"
         with open(cml) as f:
@@ -138,14 +162,14 @@ def main():
             violations.append((coin, tgt, cml))
 
     if violations:
-        print("CI drift-guard FAILED: coin test target(s) missing from "
+        print("CI drift-guard FAILED: test target(s) missing from "
               ".github/workflows/build.yml --target allowlist (NOT_BUILT risk):\n")
         for coin, tgt, cml in violations:
             print("  [%s] %s  (declared in %s)"
                   % (coin, tgt, os.path.relpath(cml, REPO)))
         print("\nFix: add the target to the relevant build.yml --target list, "
               "or declare it '# ci-allowlist-exempt: <target>  -- <reason>' in "
-              "the coin test CMakeLists.txt.")
+              "that test CMakeLists.txt.")
         return 1
 
     print("CI drift-guard OK: %d test target(s) across %d test tree(s) "

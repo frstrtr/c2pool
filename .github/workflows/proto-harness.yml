@@ -1,0 +1,59 @@
+name: proto-harness
+
+# Truth-in-CI guard for the proto/ Python harness corpus (the six conformance
+# harnesses + decay golden from PR #1465). No workflow referenced proto/, so
+# the pinned goldens (rev3-falsifiers 3692d922, p3-testbed bc2b5c84,
+# p5-integration 328a292b, p4-messaging 61ea15ed/8839b966, p3-overlay
+# d0d49556, refimpl decay d659c801, payment-hardening real-block replay) were
+# INERT: a PR that broke a harness rendered green. This lane runs every entry
+# point via tools/ci/run_proto_harnesses.py and fails on a non-zero exit, a
+# stamp/digest mismatch against its pin or committed .sha256, or any change
+# to a committed golden after the run (git diff). Python twin of
+# libmrr-go.yml (issue #1076). Prototypes-only, stdlib-only, seconds to run:
+# zero load on any coin lane, so it runs unconditionally (no path filter)
+# when called from ci-required.yml.
+#
+# Not covered on purpose: proto/payment-hardening/hmin-dust-anchor-longitudinal.py
+# needs the ~94 MB uncommitted data/longitudinal/blocks.json.
+
+on:
+  push:
+    branches:
+      - master
+      - v37-dev
+      - 'ci-steward/**'
+    paths:
+      - 'proto/**'
+      - 'tools/ci/run_proto_harnesses.py'
+      - '.github/workflows/proto-harness.yml'
+  workflow_call:      # required-but-skip-tolerant job in ci-required.yml
+
+permissions:
+  contents: read
+
+env:
+  # Match the fleet fail-fast-on-stalled-fetch convention (see pplns-parse-seedpin.yml).
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '20'
+
+jobs:
+  proto-harness:
+    name: proto harness corpus
+    # Self-hosted for trusted events; fork PRs fall back to GitHub-hosted
+    # (never run untrusted fork code self-hosted) -- the libmrr-go.yml pattern.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run proto harness corpus (exit + stamp + golden-drift gates)
+        run: python3 tools/ci/run_proto_harnesses.py
+
+      # Steady-state disk hygiene on the self-hosted runners (same as the
+      # build.yml no-build guard jobs). Always runs; no-op on GitHub-hosted.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

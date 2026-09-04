@@ -174,6 +174,9 @@ tools/dash/*
 # W0 loopback simnet harness (Track A2) — tracked source: launches the
 # c2pool-v37 >= 8-process mesh and asserts the W0 exit criteria.
 !tools/v37_simnet.sh
+# tools/ci/ is tracked CI source (the test-target drift guard and the
+# proto-harness driver), not build output.
+!tools/ci/
 
 # CMake out-of-source build trees (any name starting with `build-`).
 # Catches build-spv/, build-qt/, build-relwithdebinfo/, etc.
