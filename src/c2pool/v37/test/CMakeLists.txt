@@ -50,4 +50,21 @@ if (BUILD_TESTING)
     target_include_directories(v37_w4_prereq_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w4_prereq_test Threads::Threads)
     add_test(NAME v37_w4_prereq_test COMMAND v37_w4_prereq_test)
+
+    # Track A2 / W4 — per-lane settlement (src/c2pool/v37/w4_settlement.hpp):
+    # the consensus split, the per-chain fold over the burial-gated prefix, the
+    # KEYED_CRDT OWED ledger (SETTLED-terminal, D_conf-gated), K_fair + h_min,
+    # O5.5 persisted high-water, the O2 incarnation-keyed consistent cut, and the
+    # D-B flagged geometry seam. Drives the real V37Engine and reproduces the
+    # rev3-falsifiers acceptance SHAPES (proto/rev3-falsifiers golden 3692d922).
+    # Same stdlib-only shape as the scaffold/W2/W4-prereq suites. HOLLOW-GREEN
+    # GUARD (the same two-part mitigation as above): this target is ALSO listed
+    # in the build.yml --target lists (BOTH the Linux x86_64 leg and the
+    # ASan+UBSan leg) so CI actually compiles + runs it, not just registers it
+    # as a NOT_BUILT CTest sentinel (the DGB #137 / #769 / PR #1467 / #1477 class).
+    add_executable(v37_w4_settlement_test v37_w4_settlement_test.cpp)
+    target_compile_features(v37_w4_settlement_test PRIVATE cxx_std_20)
+    target_include_directories(v37_w4_settlement_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_w4_settlement_test Threads::Threads)
+    add_test(NAME v37_w4_settlement_test COMMAND v37_w4_settlement_test)
 endif()
