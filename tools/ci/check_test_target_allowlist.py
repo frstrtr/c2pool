@@ -7,8 +7,10 @@
 # master in the DGB #137 / test_dgb_subsidy regression. This guard fails closed
 # on that drift so it is caught at PR time, not after merge.
 #
-# Scope: per-coin test trees only (the integrator-scoped surface). Core/shared
-# test targets are out of scope.
+# Scope: per-coin (src/impl/*/test) and per-sharechain (src/sharechain/*/test)
+# test trees, plus the singleton shared trees test/ and src/core/test. Widened
+# from per-coin-only 2026-09-04 (#1467 post-mortem) -- a missing target under
+# any of these paths is the same silent NOT_BUILT trap.
 #
 # Escape hatch: a target intentionally NOT built in CI (e.g. a compile-only TU
 # or a live-only harness) must be declared explicitly with a comment line:
@@ -22,12 +24,19 @@ import glob
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUILD_YML = os.path.join(REPO, ".github", "workflows", "build.yml")
+# Globbed per-parent test trees: <parent>/*/test/CMakeLists.txt.
 COIN_GLOB = os.path.join(REPO, "src", "impl", "*", "test", "CMakeLists.txt")
-# The top-level shared test tree is ALSO a NOT_BUILT surface: a standalone
+SHARECHAIN_GLOB = os.path.join(REPO, "src", "sharechain", "*", "test", "CMakeLists.txt")
+GLOB_ROOTS = (COIN_GLOB, SHARECHAIN_GLOB)
+# Singleton shared test trees are ALSO a NOT_BUILT surface: a standalone
 # add_executable here that is missing from build.yml is silently "Not Run"
 # too (this is why targets get hand-folded into allowlisted executables to
-# dodge the trap). Audit it with the same fail-closed rule.
-TOP_LEVEL_TEST = os.path.join(REPO, "test", "CMakeLists.txt")
+# dodge the trap). Audit them with the same fail-closed rule. Widened
+# 2026-09-04 (#1467 post-mortem) to src/core/test alongside top-level test/.
+SINGLETON_TESTS = (
+    os.path.join(REPO, "test", "CMakeLists.txt"),
+    os.path.join(REPO, "src", "core", "test", "CMakeLists.txt"),
+)
 
 
 def strip_comment(line):
@@ -111,9 +120,10 @@ def main():
     allowlist = build_yml_targets(BUILD_YML)
     violations = []
     audited = 0
-    roots = sorted(glob.glob(COIN_GLOB))
-    if os.path.exists(TOP_LEVEL_TEST):
-        roots.append(TOP_LEVEL_TEST)
+    roots = []
+    for g in GLOB_ROOTS:
+        roots.extend(sorted(glob.glob(g)))
+    roots.extend(p for p in SINGLETON_TESTS if os.path.exists(p))
     for cml in roots:
         # Label: coin name for a per-coin tree (src/impl/<coin>/test/...),
         # "test/" for the shared top-level tree.
@@ -138,9 +148,9 @@ def main():
               "the coin test CMakeLists.txt.")
         return 1
 
-    print("CI drift-guard OK: %d per-coin test target(s) across %d coin lane(s) "
+    print("CI drift-guard OK: %d test target(s) across %d test tree(s) "
           "all present in build.yml --target allowlist."
-          % (audited, len(glob.glob(COIN_GLOB)) + (1 if os.path.exists(TOP_LEVEL_TEST) else 0)))
+          % (audited, len(roots)))
     return 0
 
 
