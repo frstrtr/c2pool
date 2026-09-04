@@ -30,13 +30,17 @@
 ///                        here. It is carried in the struct so the resolver's
 ///                        contract does not change shape when S2 wires it.
 ///
-/// == DEFAULT (this PR) ======================================================
-/// embedded_utxo defaults OFF. It is dormant infrastructure: its only consumer
-/// that changes SERVED bytes — the S2 job-commit — is not wired yet, and it
-/// imposes a UTXO view build. When S2 lands, the good-citizen default for the
-/// daemonless posture flips ON (serve the full mempool unless the operator opts
-/// out), matching the DASH good_citizen_defaults rationale. An explicit
-/// --embedded-serve-mempool-txs / =false is always honoured in both directions.
+/// == DEFAULT (S1) ===========================================================
+/// embedded_utxo defaults ON (good-citizen): a DGB node opens the UTXO view and
+/// fee-proves the relayed mempool by default, so its advisory GBT template is
+/// fee-bearing rather than coinbase-only — matching digibyted's CreateNewBlock.
+/// An explicit --embedded-serve-mempool-txs=false opts out. serve_mempool_txs
+/// (the S2 job-commit lever) stays default OFF: until S2 wires the merkle/
+/// witness/fee-fold into the mined block it is inert (won_block_serialize
+/// fail-closes on a merkle-less job), so defaulting it on would change nothing
+/// and is deferred. REWARD SAFETY (below) is unchanged: arming embedded_utxo
+/// only makes fees COMPUTABLE for the advisory template; the connection
+/// coinbase stays subsidy-only and the won-block merkle stays coinbase-only.
 ///
 /// == REWARD SAFETY ==========================================================
 /// Arming embedded_utxo only makes fees COMPUTABLE for the advisory GBT
@@ -71,24 +75,38 @@ struct TxServePosture {
 
 /// Pure resolver.
 ///
-/// `good_citizen_default_on` is the default the daemonless posture would apply
-/// when the operator said nothing. This PR passes it false (dormant S1 infra);
-/// the S2 follow-on flips it true for the daemonless arm. An explicit ON always
-/// wins; an explicit OFF always wins. serve_mempool_txs can never be armed
-/// without embedded_utxo (a fee-bearing commit requires fee-proved txs), so the
-/// resolver clamps it.
+/// The two levers carry SEPARATE good-citizen defaults:
+///   `embedded_utxo_default_on`     — the default for the S1 fee-proof lane.
+///                                    S1 (this lane) passes it TRUE: a
+///                                    daemonless DGB node serves the fee-paying
+///                                    mempool by default, matching digibyted's
+///                                    CreateNewBlock (good citizen). An explicit
+///                                    --embedded-serve-mempool-txs=false opts out.
+///   `serve_mempool_txs_default_on` — the default for the S2 job-commit lever.
+///                                    It defaults FALSE and stays opt-out until
+///                                    S2 wires the merkle/witness/fee-fold into
+///                                    the actually-mined block; arming it before
+///                                    then would be inert anyway (won_block_
+///                                    serialize fail-closes on a job with no
+///                                    merkle branches). Callers keep the default
+///                                    (omit the argument) until S2.
+///
+/// An explicit ON always wins; an explicit OFF always wins. serve_mempool_txs
+/// can never be armed without embedded_utxo (a fee-bearing commit requires
+/// fee-proved txs behind it), so the resolver clamps it.
 inline TxServePosture resolve_tx_serve_posture(const TxServeLevers& levers,
-                                               bool good_citizen_default_on)
+                                               bool embedded_utxo_default_on,
+                                               bool serve_mempool_txs_default_on = false)
 {
-    auto resolve = [&](const TxServeLever& l) -> bool {
+    auto resolve = [](const TxServeLever& l, bool default_on) -> bool {
         if (l.explicit_off) return false;   // explicit opt-out wins
         if (l.on)           return true;    // explicit opt-in wins
-        return good_citizen_default_on;     // silence -> the posture default
+        return default_on;                  // silence -> the posture default
     };
 
     TxServePosture out;
-    out.arm_embedded_utxo     = resolve(levers.embedded_utxo);
-    out.arm_serve_mempool_txs = resolve(levers.serve_mempool_txs);
+    out.arm_embedded_utxo     = resolve(levers.embedded_utxo, embedded_utxo_default_on);
+    out.arm_serve_mempool_txs = resolve(levers.serve_mempool_txs, serve_mempool_txs_default_on);
     // Clamp: no fee-bearing commit without the fee-proof lane behind it.
     if (!out.arm_embedded_utxo)
         out.arm_serve_mempool_txs = false;

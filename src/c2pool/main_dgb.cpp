@@ -45,6 +45,7 @@
 #include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
 #include <impl/dgb/coin/good_citizen_defaults.hpp> // resolve_tx_serve_posture (S1 fee-proof lane arm)
 #include <impl/dgb/coin/header_sample_build.hpp>   // make_header_sample (full_block anchoring SSOT)
+#include <impl/dgb/coin/utxo_accrual.hpp>          // classify_full_block_accrual (restart-liveness re-anchor)
 #include <core/coin/utxo.hpp>                      // core::coin::DGB_LIMITS / DGB_MIN_BLOCKS_TO_KEEP
 #include <core/coin/utxo_view_db.hpp>              // core::coin::UTXOViewDB (embedded UTXO persistence)
 #include <core/coin/utxo_view_cache.hpp>           // core::coin::UTXOViewCache (spent-aware fee view)
@@ -387,14 +388,17 @@ int run_node(const core::CoinParams& params, bool testnet,
     // the selected set into the actually-mined stratum job (merkle branches +
     // BIP141 witness commitment + fee-fold into the coinbase) is the S2
     // follow-on; until it lands a won block is coinbase-only + subsidy-only by
-    // construction regardless of this lane. Default OFF (dormant infra); the
-    // good-citizen default flips ON in the daemonless posture when S2 lands.
+    // construction regardless of this lane. S1 GOOD-CITIZEN DEFAULT: the
+    // fee-proof lane (embedded_utxo) defaults ON so the advisory template is
+    // fee-bearing by default; --embedded-serve-mempool-txs=false opts out. The
+    // S2 job-commit lever stays default OFF (inert until S2 wires the merkle).
     const dgb::coin::TxServePosture tx_serve_posture =
         dgb::coin::resolve_tx_serve_posture(
             dgb::coin::TxServeLevers{
                 /*embedded_utxo    =*/{serve_mempool_txs, serve_mempool_txs_off},
                 /*serve_mempool_txs=*/{serve_mempool_txs, serve_mempool_txs_off}},
-            /*good_citizen_default_on=*/false);
+            /*embedded_utxo_default_on=*/true,       // S1 good-citizen: serve fee-paying mempool
+            /*serve_mempool_txs_default_on=*/false); // S2 job-commit stays opt-out until wired
 
     std::unique_ptr<core::coin::UTXOViewDB>    dgb_utxo_db;
     std::unique_ptr<core::coin::UTXOViewCache> dgb_utxo_cache;
@@ -1030,8 +1034,38 @@ int run_node(const core::CoinParams& params, bool testnet,
 
                 const uint32_t height  = *tip_h;
                 const uint32_t best_h  = dgb_utxo_ptr->get_best_height();
-                if (best_h != 0 && height != best_h + 1)
-                    return;  // gap / reorg -> fail-closed (stop accruing).
+                // Classify the confirmed-tip block against the persisted view
+                // (pure SSOT, utxo_accrual.hpp). RESTART-LIVENESS: best_h is read
+                // back from the view's LevelDB, so after a restart the header
+                // tip is many blocks past best_h+1 -- the pre-fix handler
+                // returned on that forward gap forever and the fee-proof lane
+                // was silently DEAD for the rest of the process. Re-anchor
+                // instead so accrual resumes.
+                switch (dgb::coin::classify_full_block_accrual(best_h, height)) {
+                    case dgb::coin::FullBlockAccrualAction::Connect:
+                        break;  // first anchor or normal +1 extend -> connect.
+                    case dgb::coin::FullBlockAccrualAction::Drop:
+                        return; // reorg / height <= view -> fail-closed hold.
+                    case dgb::coin::FullBlockAccrualAction::ReAnchorThenConnect:
+                        // Forward tip-gap (e.g. restart): wipe the stale view
+                        // (coins from before the gap may have been spent
+                        // on-chain during it -- keeping them could fee-prove an
+                        // already-spent output) and resume accrual with THIS
+                        // block as a fresh anchor. Coverage regrows with uptime
+                        // (accrual-only #145 partial-UTXO model), never
+                        // overstated. Fail-closed if the wipe fails: hold the
+                        // old view, drop this block.
+                        if (!dgb_utxo_ptr->reanchor()) {
+                            LOG_WARNING << "[EMB-DGB] full_block re-anchor FAILED at h="
+                                        << height << " (tip gap, stale best_h=" << best_h
+                                        << ") -- view held, fee-proof lane fail-closed.";
+                            return;
+                        }
+                        LOG_INFO << "[EMB-DGB] full_block re-anchored fee-proof view: tip h="
+                                 << height << " ran past stale best_h=" << best_h
+                                 << " (>1 gap, e.g. restart) -- accrual resumes here.";
+                        break;  // best_height now 0; connect this block as anchor.
+                }
 
                 // DGB txid = sha256d over the non-witness serialization (block
                 // id and prevout keys both use sha256d(no-witness)).
@@ -2748,6 +2782,18 @@ int main(int argc, char** argv)
         if (rc.file_set("sharechain.no_p2p_relay") && rc.get_string("sharechain.no_p2p_relay").value_or("") == "true") no_p2p_relay = true;
         if (rc.file_set("money.redistribute"))       redistribute_spec  = rc.get_string("money.redistribute").value_or(redistribute_spec);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        // embedded.serve_mempool_txs (S1 fee-proof lane): a [dgb] settings-file
+        // key arms / opts out of the lane exactly like the --embedded-serve-
+        // mempool-txs CLI flag. CLI (L2) wins over the file (L1): consult the
+        // file only when neither CLI spelling was given.
+        if (!serve_mempool_txs && !serve_mempool_txs_off
+                && rc.file_set("embedded.serve_mempool_txs")) {
+            switch (rc.get_tri("embedded.serve_mempool_txs")) {
+                case cs::TriBool::True:  serve_mempool_txs     = true; break;
+                case cs::TriBool::False: serve_mempool_txs_off = true; break;
+                case cs::TriBool::Unset: break;
+            }
+        }
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);

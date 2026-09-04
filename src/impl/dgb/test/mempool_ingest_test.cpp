@@ -27,6 +27,7 @@
 #include <impl/dgb/coin/transaction.hpp>
 #include <impl/dgb/coin/embedded_tx_select.hpp>     // make_mempool_tx_source (fee-proof selection)
 #include <impl/dgb/coin/good_citizen_defaults.hpp>  // resolve_tx_serve_posture (S1 truth table)
+#include <impl/dgb/coin/utxo_accrual.hpp>            // classify_full_block_accrual (restart-liveness)
 #include <core/coin/utxo.hpp>                        // core::coin::Coin/Outpoint/DGB_LIMITS
 #include <core/coin/utxo_view_cache.hpp>            // core::coin::UTXOViewCache (fee view)
 
@@ -285,4 +286,94 @@ TEST(GoodCitizenDefaults, ServeClampedWithoutUtxoLane)
     auto p = resolve_tx_serve_posture(lv, /*default_on=*/false);
     EXPECT_FALSE(p.arm_embedded_utxo);
     EXPECT_FALSE(p.arm_serve_mempool_txs);  // clamped
+}
+// ===========================================================================
+// full_block accrual RESTART-LIVENESS re-anchor (utxo_accrual.hpp + reanchor).
+//
+// The pre-remediation full_block handler dropped every block whose height did
+// not equal best_height + 1 and — because best_height is PERSISTED across a
+// restart — that made the fee-proof lane silently DEAD after the first restart
+// (the header tip is far past best_height + 1, so every block is dropped and
+// the view never extends again). These pin the fix: a FORWARD tip-gap must
+// re-anchor rather than drop, and reanchor() must actually clear the view.
+// ===========================================================================
+
+using dgb::coin::FullBlockAccrualAction;
+using dgb::coin::classify_full_block_accrual;
+
+// 10a. Fresh view (best_height == 0): the first confirmed-tip block anchors.
+TEST(FullBlockAccrual, FreshViewConnectsFirstAnchor)
+{
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/0, /*incoming=*/1),
+              FullBlockAccrualAction::Connect);
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/0, /*incoming=*/900'000),
+              FullBlockAccrualAction::Connect);  // cold start at a live tip
+}
+
+// 10b. Normal +1 extend connects.
+TEST(FullBlockAccrual, ExactNextHeightConnects)
+{
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/101),
+              FullBlockAccrualAction::Connect);
+}
+
+// 10c. THE BUG: a forward tip-gap (height > best+1, e.g. the tip after a
+//      restart) must RE-ANCHOR, not drop. This is the liveness fix.
+TEST(FullBlockAccrual, ForwardGapReAnchors)
+{
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/102),
+              FullBlockAccrualAction::ReAnchorThenConnect);   // one-block gap
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/900'000),
+              FullBlockAccrualAction::ReAnchorThenConnect);   // restart jump
+}
+
+// 10d. A reorg / duplicate (height <= best) stays fail-closed DROP: an
+//      accrual-only view cannot safely fold a reorg, and dropping never
+//      overstates a fee.
+TEST(FullBlockAccrual, ReorgOrEqualDrops)
+{
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/100),
+              FullBlockAccrualAction::Drop);   // duplicate / same tip
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/99),
+              FullBlockAccrualAction::Drop);   // reorg to a lower height
+}
+
+// 10e. reanchor() WIPES the view: seeded coins vanish and the pending cache is
+//      emptied, so accrual restarts from a clean slate (in-memory view, no
+//      LevelDB base — the wipe still clears the cache and returns true).
+TEST(FullBlockAccrual, ReAnchorClearsView)
+{
+    using core::coin::UTXOViewCache;
+    using core::coin::Outpoint;
+
+    UTXOViewCache utxo(nullptr);
+    seed_coin(utxo, /*index=*/0, /*value=*/60'000);
+    seed_coin(utxo, /*index=*/1, /*value=*/55'000);
+
+    uint256 null_hash; null_hash.SetNull();
+    Outpoint op0(null_hash, 0);
+    Outpoint op1(null_hash, 1);
+    EXPECT_TRUE(utxo.have_coin(op0));
+    EXPECT_TRUE(utxo.have_coin(op1));
+    EXPECT_EQ(utxo.cache_size(), 2u);
+
+    EXPECT_TRUE(utxo.reanchor());
+
+    EXPECT_FALSE(utxo.have_coin(op0));   // stale coins dropped
+    EXPECT_FALSE(utxo.have_coin(op1));
+    EXPECT_EQ(utxo.cache_size(), 0u);
+    EXPECT_EQ(utxo.blocks_connected(), 0u);
+}
+
+// 10f. S1 DEFAULT (blocker 3): with the operator silent, the S1 good-citizen
+//      default arms the fee-proof lane (embedded_utxo) but leaves the S2
+//      job-commit lever (serve_mempool_txs) OFF — it stays opt-out until S2.
+TEST(GoodCitizenDefaults, S1DefaultArmsUtxoButNotServe)
+{
+    auto p = resolve_tx_serve_posture(
+        TxServeLevers{},
+        /*embedded_utxo_default_on=*/true,
+        /*serve_mempool_txs_default_on=*/false);
+    EXPECT_TRUE(p.arm_embedded_utxo);        // fee-proof lane serves by default
+    EXPECT_FALSE(p.arm_serve_mempool_txs);   // S2 job-commit stays opt-out
 }

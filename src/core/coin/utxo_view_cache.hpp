@@ -271,6 +271,27 @@ public:
         return true;
     }
 
+    /// Re-anchor the view: drop all in-memory pending changes AND wipe the
+    /// backing DB, resetting the accrual anchor to zero so the next
+    /// connect_block() starts a fresh partial view from the current tip. Used
+    /// by the full_block accrual handler on a forward tip-gap (e.g. after a
+    /// restart) — see impl/dgb/coin/utxo_accrual.hpp and UTXOViewDB::reset().
+    ///
+    /// Fail-closed: if the backing wipe fails the cache is left UNTOUCHED and
+    /// false is returned; the caller must then NOT connect the current block.
+    /// With no backing DB (an in-memory-only view) there is nothing on disk to
+    /// wipe — the in-memory cache and counters are still reset and true is
+    /// returned.
+    bool reanchor() {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
+        if (m_base && !m_base->reset())
+            return false;  // DB wipe failed -> fail-closed, cache held.
+        m_cache.clear();
+        m_blocks_connected = 0;
+        m_oldest_undo_height = 0;
+        return true;
+    }
+
     /// Number of entries in the cache (for diagnostics).
     size_t cache_size() const {
         std::shared_lock<std::shared_mutex> lock(m_mu);
