@@ -1261,12 +1261,14 @@ void NodeImpl::readvertise_best_share()
              << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
 }
 
-void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
+void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash)
 {
     // download_shares(): C++ implementation of the p2pool share-download loop.
     //
-    // Key differences from old c2pool implementation:
-    // 1. RANDOM peer selection (not the reporting peer)
+    // v36-0.24 kr1z1s convergence hotfix #25(C) — parent-fetch failover:
+    // 1. FAIL OVER across peers: skip peers that failed THIS hash within the TTL,
+    //    prefer the peer that advertised it (the `advertiser` argument, which was
+    //    previously discarded), and back off only once every peer has failed it.
     // 2. RANDOM parent count 0-499 (not fixed 500)
     // 3. STOPS list: known heads + their 10th parents (not empty)
     // 4. Log format: "Requesting parent share XXXX from IP:PORT"
@@ -1274,18 +1276,6 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
     // Already downloading this hash — avoid duplicate requests
     if (m_downloading_shares.count(target_hash))
         return;
-
-    // Stop requesting hashes that have returned empty too many times —
-    // the share is pruned from the network. p2pool uses reactive desired_var
-    // + sleep(1) backoff; we use explicit failure counting.
-    if (m_download_fail_count[target_hash] >= MAX_EMPTY_RETRIES) {
-        static int fail_log = 0;
-        if (fail_log++ % 20 == 0)
-            LOG_INFO << "[Pool] Skipping permanently failed hash "
-                     << target_hash.ToString().substr(0,16)
-                     << " (failed " << m_download_fail_count[target_hash] << " times)";
-        return;
-    }
 
     m_downloading_shares.insert(target_hash);
 
@@ -1295,12 +1285,46 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
         return;
     }
 
-    // p2pool: peer = random.choice(self.peers.values())
-    auto peer_it = m_peers.begin();
-    if (m_peers.size() > 1) {
-        std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
+    // Build the connected-peer key set and a key->peer lookup (IO thread owns
+    // m_peers). The advertiser is the peer that told us about this hash.
+    std::vector<NetService> peer_keys;
+    peer_keys.reserve(m_peers.size());
+    std::map<NetService, peer_ptr> by_key;
+    for (auto& [nonce, p] : m_peers) {
+        if (!p) continue;
+        auto k = p->addr();
+        peer_keys.push_back(k);
+        by_key.emplace(k, p);
     }
-    auto& peer = peer_it->second;
+    std::optional<NetService> advertiser_key;
+    if (advertiser) advertiser_key = advertiser->addr();
+
+    // #25(C): pick a peer that has NOT recently failed this exact hash, preferring
+    // the advertiser. nullopt => every peer has failed it within the TTL: back off
+    // this cycle (the failures age out and a different desired parent is tried).
+    const double fnow = static_cast<double>(std::time(nullptr));
+    std::optional<NetService> chosen_key;
+    {
+        std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
+        m_fetch_failures.prune(fnow);
+        m_peer_keys_snapshot = peer_keys;  // keep fresh for clean_tracker's parent_abandoned
+        chosen_key = m_fetch_failures.choose(
+            target_hash, advertiser_key, peer_keys, fnow,
+            [](std::size_t n) -> std::size_t {
+                return static_cast<std::size_t>(core::random::random_uint256().GetLow64() % n);
+            });
+    }
+    if (!chosen_key.has_value()) {
+        m_downloading_shares.erase(target_hash);
+        return;
+    }
+    auto pk_it = by_key.find(*chosen_key);
+    if (pk_it == by_key.end()) {
+        m_downloading_shares.erase(target_hash);
+        return;
+    }
+    auto& peer = pk_it->second;
+    const NetService chosen_key_val = *chosen_key;
 
     // p2pool: parents=random.randrange(500)
     uint64_t parents = core::random::random_uint256().GetLow64() % 500;
@@ -1352,26 +1376,34 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
     auto peer_addr_for_log = peer->addr();
 
     request_shares(req_id, peer, hashes, parents, stops,
-        [this, weak_peer, target_hash, peer_addr_for_log, req_id](ltc::ShareReplyData reply)
+        [this, weak_peer, target_hash, peer_addr_for_log, req_id, chosen_key_val](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
             m_pending_share_reqs.erase(req_id);
 
             if (reply.m_items.empty())
             {
-                // Empty reply = timeout or peer had no matching shares.
-                // Track failures — stop requesting after MAX_EMPTY_RETRIES.
-                auto& fail_cnt = m_download_fail_count[target_hash];
-                ++fail_cnt;
+                // Empty reply = timeout or this peer had no matching shares.
+                // #25(C): remember the (hash, peer) failure so we fail over to a
+                // DIFFERENT peer next cycle, and only abandon the head once the
+                // whole peer set has failed it (see FetchFailureMemory::abandoned).
+                {
+                    std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
+                    m_fetch_failures.record(target_hash, chosen_key_val,
+                                            static_cast<double>(std::time(nullptr)));
+                }
                 LOG_INFO << "[Pool] Share request empty for "
                          << target_hash.ToString().substr(0,16)
                          << " from " << peer_addr_for_log.to_string()
-                         << " (fail " << fail_cnt << "/" << MAX_EMPTY_RETRIES << ")";
+                         << " (failing over to another peer)";
                 return;
             }
 
-            // Success — clear failure count for this hash
-            m_download_fail_count.erase(target_hash);
+            // Success — this parent is fetchable again; clear its failure memory.
+            {
+                std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
+                m_fetch_failures.clear_hash(target_hash);
+            }
 
             LOG_INFO << "[Pool] Received " << reply.m_items.size() << " shares for download request";
 
@@ -2040,20 +2072,29 @@ void NodeImpl::run_think()
             // Clear stale download set (p2pool node.py:108-141)
             m_downloading_shares.clear();
 
-            // Reset fail counts each think() cycle — matches p2pool which
-            // re-adds desired hashes from scratch every cycle with sleep(1)
-            // backoff.  Permanent blacklisting caused bootstrap stalls:
-            // the tail parent hash would get 3 empty replies and never be
-            // requested again, leaving the chain stuck at <CHAIN_LENGTH.
-            m_download_fail_count.clear();
+            // v36-0.24 #25(C): no per-think() fail-count reset. The old peer-blind
+            // counter had to be cleared every cycle (else a tail parent that got 3
+            // empty replies was blacklisted forever and the chain stuck below
+            // CHAIN_LENGTH). The per-(hash,peer) failover memory ages out on its
+            // 90s TTL instead, so a transiently-failed peer is retried on schedule
+            // while a persistent black-hole stays skipped for that hash.
+            {
+                std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
+                m_fetch_failures.prune(static_cast<double>(std::time(nullptr)));
+            }
+            // Keep the peer-key snapshot fresh for clean_tracker's parent_abandoned.
+            refresh_peer_keys_snapshot();
 
-            // Request desired shares from random peers
+            // Request desired shares. #25(C): pass the ADVERTISER (the peer whose
+            // desired entry named the hash) so download_shares prefers it and fails
+            // over to other peers instead of picking a fully random one.
             if (!result.desired.empty() && !m_peers.empty()) {
                 for (auto& [peer_addr, hash] : result.desired) {
-                    auto peer_it = m_peers.begin();
-                    if (m_peers.size() > 1)
-                        std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
-                    download_shares(peer_it->second, hash);
+                    peer_ptr advertiser;
+                    for (auto& [nonce, p] : m_peers) {
+                        if (p && p->addr() == peer_addr) { advertiser = p; break; }
+                    }
+                    download_shares(advertiser, hash);
                 }
             }
 
@@ -2328,6 +2369,10 @@ void NodeImpl::clean_tracker()
 
       bool clean_best_changed = false;
       bool bootstrap = false;
+      // v36-0.24 #25(B): the missing parents think() still wants (its `desired`
+      // set), captured from Step-1's think() result and consulted by Step-2's head
+      // GC so a head we are ACTIVELY downloading toward is not purged mid-catch-up.
+      std::set<uint256> desired_parents;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
 
@@ -2361,6 +2406,10 @@ void NodeImpl::clean_tracker()
 
             m_last_top5_heads = std::move(result.top5_heads);
 
+            // #25(B): snapshot the parents think() still wants for Step-2's GC.
+            for (const auto& [peer, hash] : result.desired)
+                desired_parents.insert(hash);
+
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
             }
@@ -2391,33 +2440,49 @@ void NodeImpl::clean_tracker()
             {
                 if (!m_tracker.chain.contains(head_hash)) continue;
 
-                // Guard 1: keep top-5 scored heads (p2pool node.py:363)
-                if (top5_set.count(head_hash)) continue;
+                // Assemble the retain/reap inputs for this head and delegate the
+                // policy to ltc::head_retained() (p2pool node.py Node.clean_tracker
+                // after the F2 (#23) + #25(B) convergence hotfixes). Extracting the
+                // predicate into a pure header makes it KAT-testable; the guards
+                // themselves are unchanged apart from the two ported fixes.
+                ltc::HeadGcInput gc;
+                gc.now = now_sec;
 
-                // Guard 1b (restart-reorg): keep the converging challenger segment.
+                // Guard 1: top-5 scored heads (p2pool node.py:363).
+                gc.in_top5 = top5_set.count(head_hash) != 0;
+
+                // Guard 1b (c2pool restart-reorg): converging challenger segment.
                 // Its verified height is below CHAIN_LENGTH so it is never in the
                 // top-5; without this exemption its partial verification would be
-                // eaten every ~300s and restarted forever — the original stuck-on-
-                // persisted-head latch in a different guise. Matched by segment id.
+                // eaten every ~300s and restarted forever. Matched by segment id.
+                gc.in_supersede_segment = false;
                 if (m_supersede_hint.active) {
                     try {
-                        if (m_tracker.chain.contains(head_hash) &&
-                            m_tracker.chain.get_last(head_hash) == m_supersede_hint.target_segment_last)
-                            continue;
+                        if (m_tracker.chain.get_last(head_hash) == m_supersede_hint.target_segment_last)
+                            gc.in_supersede_segment = true;
                     } catch (...) {}
                 }
 
-                // Guard 2: keep heads seen < 300s ago (p2pool node.py:366)
+                // Guard 2: head seen recently (p2pool node.py:366).
                 auto* idx = m_tracker.chain.get_index(head_hash);
-                if (!idx || idx->time_seen > now_sec - 300) continue;
+                gc.head_time_seen = idx ? idx->time_seen : 0;
+                if (!idx) {
+                    // No index => cannot evaluate freshness; keep (matches the old
+                    // `!idx || ... continue` short-circuit) and move on.
+                    continue;
+                }
 
-                // Guard 3: keep unverified heads with recent tail activity (p2pool node.py:369)
-                if (!m_tracker.verified.contains(head_hash))
+                gc.head_verified = m_tracker.verified.contains(head_hash);
+
+                // Guard 3 (F2): frontier freshness — newest time_seen across
+                // reverse[tail] (the oldest-downloaded shares). Evaluated
+                // regardless of verification state after the fix.
                 {
                     auto& rev = m_tracker.chain.get_reverse();
                     auto rev_it = rev.find(tail_hash);
                     if (rev_it != rev.end() && !rev_it->second.empty())
                     {
+                        gc.frontier_present = true;
                         int64_t max_child_ts = 0;
                         for (const auto& child : rev_it->second)
                         {
@@ -2425,9 +2490,19 @@ void NodeImpl::clean_tracker()
                             if (cidx && cidx->time_seen > max_child_ts)
                                 max_child_ts = cidx->time_seen;
                         }
-                        if (max_child_ts > now_sec - 120) continue;
+                        gc.frontier_max_time_seen = max_child_ts;
                     }
                 }
+
+                // Guard 2b (#25B): the node still wants this head's missing parent
+                // (tail in `desired`) and the peer set has not collectively given
+                // up on it (parent_fetch_abandoned takes m_fetch_failover_mtx).
+                gc.tail_in_desired = desired_parents.count(tail_hash) != 0;
+                gc.parent_abandoned = gc.tail_in_desired
+                                      ? parent_fetch_abandoned(tail_hash)
+                                      : false;
+
+                if (ltc::head_retained(gc)) continue;
 
                 to_remove.push_back(head_hash);
             }
