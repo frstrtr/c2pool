@@ -9,10 +9,15 @@
 #
 # Scope: per-coin test trees (src/impl/<coin>/test/), the sharechain engine
 # trees (src/sharechain/**/test/ -- both src/sharechain/test/ and
-# src/sharechain/<module>/test/), the shared core test tree (src/core/test/)
+# src/sharechain/<module>/test/), the c2pool consumer-side trees
+# (src/c2pool/**/test/ -- e.g. src/c2pool/v37/test/, where the v37 node
+# scaffold lands its unit test), the shared core test tree (src/core/test/)
 # and the top-level test/ tree. The sharechain + core trees were previously
 # unaudited, so a standalone add_executable there could land NOT_BUILT-silent
 # (the coverage gap that let PR #1467's src/sharechain/v37/test/ go unguarded).
+# The c2pool tree is the same surface: PR #1477 (W0 node scaffold) adds
+# src/c2pool/v37/test/v37_scaffold_test, which this glob now audits so a future
+# add_test there missing from build.yml fails closed instead of hollow-greening.
 #
 # Escape hatch: a target intentionally NOT built in CI (e.g. a compile-only TU
 # or a live-only harness) must be declared explicitly with a comment line:
@@ -32,6 +37,11 @@ COIN_GLOB = os.path.join(REPO, "src", "impl", "*", "test", "CMakeLists.txt")
 # code there. Recursive on sharechain so src/sharechain/test/ (no module
 # directory) and src/sharechain/<module>/test/ are both audited.
 SHARECHAIN_GLOB = os.path.join(REPO, "src", "sharechain", "**", "test", "CMakeLists.txt")
+# The c2pool consumer-side trees are the same NOT_BUILT surface: the v37 node
+# scaffold (PR #1477) lands its unit test under src/c2pool/v37/test/. Recursive
+# so src/c2pool/test/ (no module directory) and src/c2pool/<module>/test/ are
+# both audited.
+C2POOL_GLOB = os.path.join(REPO, "src", "c2pool", "**", "test", "CMakeLists.txt")
 CORE_TEST = os.path.join(REPO, "src", "core", "test", "CMakeLists.txt")
 # The top-level shared test tree is ALSO a NOT_BUILT surface: a standalone
 # add_executable here that is missing from build.yml is silently "Not Run"
@@ -119,9 +129,11 @@ def parse_coin_targets(path):
 
 def audited_roots():
     """Every test CMakeLists.txt the guard polices, deduplicated, in a stable
-    order: per-coin trees, sharechain engine trees, core, then top-level."""
+    order: per-coin trees, sharechain engine trees, c2pool consumer trees,
+    core, then top-level."""
     roots = sorted(glob.glob(COIN_GLOB))
     roots += sorted(glob.glob(SHARECHAIN_GLOB, recursive=True))
+    roots += sorted(glob.glob(C2POOL_GLOB, recursive=True))
     if os.path.exists(CORE_TEST):
         roots.append(CORE_TEST)
     if os.path.exists(TOP_LEVEL_TEST):
