@@ -67,4 +67,21 @@ if (BUILD_TESTING)
     target_include_directories(v37_w4_settlement_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w4_settlement_test Threads::Threads)
     add_test(NAME v37_w4_settlement_test COMMAND v37_w4_settlement_test)
+
+    # Track A2 / W5 — coinbase assembly (src/c2pool/v37/w5_coinbase.hpp): the
+    # OLDEST-OWED-FIRST K_fair selection (whitepaper erratum E-1 — NOT
+    # largest-first) consumed from W4's OwedLedger::propose_coinbase, the
+    # byte-denominated h_min dust floor + carry-forward, the fixed output/byte
+    # budget, the D_conf buried gate, and the §13 state-root-in-coinbase with an
+    # O(log n) balance proof verified by the shipped ::v37::Lane::verify_proof.
+    # Same stdlib-only shape as the scaffold/W2/W4 suites. HOLLOW-GREEN GUARD
+    # (the same two-part mitigation as above): this target is ALSO listed in the
+    # build.yml --target lists (BOTH the Linux x86_64 leg and the ASan+UBSan
+    # leg) so CI actually compiles + runs it, not just registers it as a
+    # NOT_BUILT CTest sentinel (the DGB #137 / #769 / PR #1467 / #1477 class).
+    add_executable(v37_w5_coinbase_test v37_w5_coinbase_test.cpp)
+    target_compile_features(v37_w5_coinbase_test PRIVATE cxx_std_20)
+    target_include_directories(v37_w5_coinbase_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_w5_coinbase_test Threads::Threads)
+    add_test(NAME v37_w5_coinbase_test COMMAND v37_w5_coinbase_test)
 endif()
