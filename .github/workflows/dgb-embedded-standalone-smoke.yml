@@ -7,8 +7,9 @@ name: DGB embedded-standalone daemonless smoke
 #
 # Builds the c2pool-dgb target, boots it daemonless, and asserts (bounded):
 # process stays up, coin-network peer discovery ARMS against real DGB DNS
-# seeds + a live coin-peer version handshake is observed, and the HTTP ENGINE
-# endpoint returns 200. Runs github-hosted for guaranteed real DNS + P2P
+# seeds, and the HTTP ENGINE endpoint returns 200 (a live coin-peer version
+# handshake is observed BEST-EFFORT — see the gate script for the #1469
+# network-dependency downgrade). Runs github-hosted for real DNS + P2P
 # egress (the whole point of the smoke). The gate emits a NAMED, logged skip
 # if the DGB network is unreachable, so a silent skip can never read as green.
 #
