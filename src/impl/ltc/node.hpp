@@ -7,6 +7,8 @@
 #include "share_tracker.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
+#include "head_retention.hpp"        // v36-0.24 convergence: clean_tracker Guard predicate (F2 + #25B)
+#include "share_fetch_failover.hpp"  // v36-0.24 convergence: parent-fetch failover memory (#25C)
 
 #include <core/coin_params.hpp>
 #include <core/tx_advertiser.hpp>
@@ -713,12 +715,44 @@ protected:
     std::atomic<uint64_t> m_broadcast_reached_send{0};
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 
-    // Track share hashes that peers couldn't provide (empty reply).
-    // After MAX_EMPTY_RETRIES failures, stop requesting — the share is
-    // pruned from the network. p2pool avoids this via reactive desired_var
-    // + sleep(1) backoff. We use explicit failure counting.
-    static constexpr int MAX_EMPTY_RETRIES = 3;
-    std::unordered_map<uint256, int, ShareHasher> m_download_fail_count;
+    // v36-0.24 kr1z1s convergence hotfix #25(C): per-(hash,peer) parent-fetch
+    // failure memory. Replaces the old peer-BLIND per-hash counter
+    // (m_download_fail_count / MAX_EMPTY_RETRIES) which let a single black-hole
+    // peer that answered "empty" starve every other peer that actually had the
+    // parent. Now a peer is skipped only for the hash IT failed, we fail over to
+    // other peers, prefer the advertiser, and back off only once EVERY peer has
+    // failed (failures age out on a 90s TTL, so no per-think() reset is needed).
+    //
+    // Written on the IO thread (download_shares + the run_think dispatch loop);
+    // read on the compute thread (clean_tracker Guard 2b, parent_abandoned).
+    // m_fetch_failover_mtx guards BOTH the memory and the peer-key snapshot it is
+    // queried against so the compute-thread read never races the IO-thread peer
+    // map. Contention is negligible (a handful of hashes per cycle).
+    std::mutex m_fetch_failover_mtx;
+    ltc::FetchFailureMemory<uint256, NetService> m_fetch_failures;  // guarded by m_fetch_failover_mtx
+    std::vector<NetService> m_peer_keys_snapshot;                   // guarded by m_fetch_failover_mtx
+
+    // Refresh the peer-key snapshot from the live IO-owned m_peers map. MUST be
+    // called on the IO thread. Takes m_fetch_failover_mtx.
+    void refresh_peer_keys_snapshot()
+    {
+        std::vector<NetService> keys;
+        keys.reserve(m_peers.size());
+        for (const auto& [nonce, p] : m_peers)
+            if (p) keys.push_back(p->addr());
+        std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
+        m_peer_keys_snapshot = std::move(keys);
+    }
+
+    // True iff every currently-connected peer has recently failed to serve
+    // `parent_hash` (clean_tracker Guard 2b input). Thread-safe; safe to call
+    // from the compute thread. No peers / any peer not-yet-failed -> false.
+    bool parent_fetch_abandoned(const uint256& parent_hash)
+    {
+        std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
+        return m_fetch_failures.abandoned(parent_hash, m_peer_keys_snapshot,
+                                          static_cast<double>(std::time(nullptr)));
+    }
 
     // Track req_id → peer addr for selective cancellation on disconnect.
     // p2pool has per-peer get_shares (GenericDeferrer), so connectionLost calls

@@ -82,16 +82,6 @@ inline constexpr int64_t kHeadFreshWindow = 300;
 //   else                                                     -> reap
 inline bool head_retained(const HeadGcInput& in)
 {
-    // ⛔ MASTER SEMANTICS (pre-fix) — this is the c2pool clean_tracker Step-2
-    // policy BEFORE the F2 (#23) + #25(B) convergence hotfixes. The
-    // head_retention_test.cpp KAT is RED against this body and GREEN once it is
-    // replaced by the ported fix. The two defects encoded here:
-    //   * Guard 3 is gated on `!head_verified` and a 120s window, so the instant
-    //     the incremental verifier verifies a still-downloading head it loses
-    //     protection and is purged mid-catch-up (the 505,935-share livelock).
-    //   * There is NO desired-parent guard, so a slow / black-hole peer stalling
-    //     the frontier triggers the purge + full re-download loop.
-
     // Guard 1 — top-5 scored heads (p2pool node.py:363).
     if (in.in_top5)
         return true;
@@ -104,10 +94,19 @@ inline bool head_retained(const HeadGcInput& in)
     if (in.head_time_seen > in.now - kHeadFreshWindow)
         return true;
 
-    // Guard 3 (master) — protect only UNVERIFIED heads with frontier activity in
-    // the last 120s.
-    if (!in.head_verified && in.frontier_present
-        && in.frontier_max_time_seen > in.now - 120)
+    // Guard 2b — #25(B): the node is ACTIVELY downloading this head's missing
+    // parent (tail in `desired`) and the peer set has not collectively given up
+    // on it. This is the PRIMARY protection: a slow / black-hole peer can no
+    // longer trigger the purge + full re-download loop. Bounded by
+    // parent_abandoned so a peer re-advertising an unservable fragment cannot
+    // pin memory.
+    if (in.tail_in_desired && !in.parent_abandoned)
+        return true;
+
+    // Guard 3 — F2: protect any head whose FRONTIER received a share in the last
+    // 300s, REGARDLESS of the head's verification state. On master this was gated
+    // on `!head_verified` and 120s; that gate is the kr1z1s livelock and is gone.
+    if (in.frontier_present && in.frontier_max_time_seen > in.now - kFrontierFreshWindow)
         return true;
 
     return false;

@@ -103,23 +103,27 @@ public:
                                    double now,
                                    PickIndexFn&& pick_index) const
     {
-        // ⛔ MASTER SEMANTICS (pre-fix) — this is the c2pool download-path policy
-        // BEFORE the #25(C) failover hotfix: a peer-BLIND per-hash counter. Any
-        // failure recorded for the hash within the TTL skips it for the WHOLE peer
-        // set (the m_download_fail_count / MAX_EMPTY_RETRIES model), so one
-        // black-hole peer that answers "empty" starves every other peer that has
-        // the parent. share_fetch_failover_test.cpp is RED against this body and
-        // GREEN once it is replaced by the per-peer failover.
         if (peers.empty())
             return std::nullopt;
-        if (!failed_keys(hash, now).empty())
-            return std::nullopt;                 // peer-blind: any failure blocks all
+        const std::set<PeerKeyT> failed = failed_keys(hash, now);
+
+        std::vector<PeerKeyT> eligible;
+        eligible.reserve(peers.size());
+        for (const auto& p : peers)
+            if (!failed.count(p))
+                eligible.push_back(p);
+
+        if (eligible.empty())
+            return std::nullopt;
+
+        // Prefer the advertiser when it is still eligible.
         if (advertiser.has_value())
-            for (const auto& p : peers)
+            for (const auto& p : eligible)
                 if (p == *advertiser)
                     return p;
-        const std::size_t idx = pick_index(peers.size());
-        return peers[idx % peers.size()];
+
+        const std::size_t idx = pick_index(eligible.size());
+        return eligible[idx % eligible.size()];
     }
 
     // True iff there ARE connected peers and EVERY one has recently failed
