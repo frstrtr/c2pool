@@ -17,7 +17,6 @@ they span the seams between slices:
       receipt is live (TTL), coupling P4-messaging to P4-market at the seam.
   X5  atomic-cross isolation: a failed (non-atomic) venue cross leaves settlement owed untouched.
 """
-from ports import h
 
 
 class InvariantError(AssertionError):

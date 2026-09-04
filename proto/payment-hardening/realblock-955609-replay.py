@@ -1,7 +1,8 @@
 import json
 import os
 
-data = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "coinbase.json")))
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "coinbase.json")) as _f:
+    data = json.load(_f)
 
 # full serialized output size = 8 (value) + 1 (varint scriptlen, all <253) + len(script_bytes)
 def script_len(spk_hex):

@@ -265,7 +265,6 @@ def p3_5():
     # (small-miner liveness), (c) value conserved each round, (d) pot stays 0 (self-carry,
     # not sweep).
     big = ["m0", "m1", "m2"]
-    miners = big + ["dust"]
     descriptors = {m: PayoutDescriptor(m) for m in big}
     descriptors["dust"] = PayoutDescriptor("dust", h_min=3)   # needs to accumulate to 3
     C = 3
@@ -381,7 +380,7 @@ def p3_8():
     # NEGATIVE surfacing: an orphan DEEPER than D_f is out-of-floor. The node must halt-and-
     # resurvey (surface), NOT silently revert. Assert the guard fires (does not swallow it).
     oracle = ChainOracle("c0", d_f=6)
-    halted = False
+    halted, msg = False, ""
     try:
         _apply_orphan_guarded(oracle, depth=9)       # 9 > D_f=6
     except OutOfFloorHalt as e:
@@ -545,14 +544,15 @@ def p3_14():
 
     # ACCEPTED: the template pays and drains its slots exactly once (assemble == accept binding).
     outs_acc, cb_acc = _settle_round(owed, first_eligible, 0, C, descriptors)
-    assert cb_acc == cb_a, "P3-14: accepted coinbase == the assembled template (binding holds)"
+    binding_holds = cb_acc == cb_a
+    assert binding_holds, "P3-14: accepted coinbase == the assembled template (binding holds)"
     paid = sorted(m for (m, _amt, _s) in outs_acc)
     assert paid == set_a, "P3-14: accepted pays exactly the assembled set (paid once)"
     paid_total = sum(amt for (_m, amt, _s) in outs_acc)
     assert paid_total + sum(owed.values()) == initial_total, "P3-14: value conserved across lifecycle"
     return {"row": "P3-14", "miners": M, "slot_budget": C, "assembled_set": set_a,
             "cb_assembled": cb_a[:16], "cb_accepted": cb_acc[:16],
-            "binding_holds": cb_acc == cb_a, "residual_owed": sum(owed.values()),
+            "binding_holds": binding_holds, "residual_owed": sum(owed.values()),
             "value_conserved": paid_total + sum(owed.values()) == initial_total}
 
 
@@ -589,13 +589,14 @@ def p3_15():
     outs_B, cb_B = _settle_round(owed, first_eligible, 1, C, descriptors)
     paid_B = sorted(m for (m, _amt, _s) in outs_B)
 
-    assert set(paid_A).isdisjoint(paid_B), "P3-15: no miner paid on both chains (no double-pay)"
+    double_pay = not set(paid_A).isdisjoint(paid_B)
+    assert not double_pay, "P3-15: no miner paid on both chains (no double-pay)"
     assert sorted(paid_A + paid_B) == miners, "P3-15: every miner paid exactly once across chains"
     paid_total = sum(amt for (_m, amt, _s) in outs_A) + sum(amt for (_m, amt, _s) in outs_B)
     assert paid_total == initial_total and sum(owed.values()) == 0, "P3-15: value conserved, owed drained"
     return {"row": "P3-15", "miners": M, "slot_budget": C, "paid_A": paid_A, "paid_B": paid_B,
             "stale_template_rejected": stale_rejected,
-            "double_pay": not set(paid_A).isdisjoint(paid_B),
+            "double_pay": double_pay,
             "residual_owed": sum(owed.values()), "value_conserved": paid_total == initial_total}
 
 

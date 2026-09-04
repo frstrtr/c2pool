@@ -18,7 +18,7 @@ feerate cannot be derived from it. We key k_live off an external monthly SUSTAIN
 series (EMA-smoothed) by block date. Recommend enriching the dataset with vsize for a fully
 self-contained model; until then this is the feerate ground truth.
 """
-import json, sys
+import json
 from collections import defaultdict, OrderedDict
 
 import os
@@ -76,7 +76,8 @@ def epoch(date):
     return "2025-2026 (calm 4-6)"
 
 def main():
-    d = json.load(open(DATA))
+    with open(DATA) as f:
+        d = json.load(f)
     agg = defaultdict(lambda: {"outs":0, "clr_dust":0, "acc_dust":0,
                                "clr_max":0, "acc_max":0, "kmin":1e9, "kmax":0})
     type_seen = defaultdict(int)

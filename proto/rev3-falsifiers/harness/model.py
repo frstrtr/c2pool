@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 
 # ============================================================================================
 # CONFIG BLOCK -- the spec addendum references these names verbatim.
