@@ -8,12 +8,23 @@
 //      decay[d] = floor( (2^(FRAC*HL - d)) ^ (1/HL) )   d in [0, 8192]
 //      InvD[j]  = floor( (2^(FRAC*HL + j)) ^ (1/HL) )   j in [0, 4095]
 //
-//  The [0, 4096] slice is BIT-IDENTICAL to the ratified golden vector
+//  Ratified golden vector:
 //      proto/refimpl/golden/decay_table_canonical_golden_v1.json
 //      sha256 d659c801a2544672e383c2a6ae6c68047c574d0cb212d3140794ca1f3b5b1349
+//  It publishes ANCHORS and a sampled subset, not all 12289 entries, so
+//  no artefact compares this table against it byte for byte. What DOES pin the
+//  values here:
+//    1. the defining floor-root construction above — self-verifying per entry
+//       (x^HL <= 2^k < (x+1)^HL), asserted by the generator on every entry;
+//    2. the golden's published anchors, listed below, asserted by the generator
+//       before it writes and re-checked in test/v37_test.cpp;
+//    3. a SHA-256 over the FULL arrays, pinned in test/v37_test.cpp — the
+//       anchors cover 7 of 12289 entries and would not notice an edit
+//       to the interior; the digest reds on one flipped bit anywhere.
 //
 //  Regenerate with src/sharechain/v37/tools/gen_decay_canonical.py
-//  (self-contained; reproducible bit-for-bit, no floating point).
+//  (integers only; reproducible bit-for-bit, no floating point). A changed
+//  full-array digest is a review event, not a constant to be updated.
 //
 //  Anchors (self-checked by the generator against the published golden):
 //      decay[0]    = 4611686018427387904ULL  (= 2^62 = Q_ONE)
@@ -25,6 +36,7 @@
 //      InvD[4095]  = 17161783987563169425ULL
 // ─────────────────────────────────────────────────────────────────────────
 #include <cstdint>
+#include <iterator>   // std::size, for the array-extent asserts below
 
 namespace v37 {
 namespace decay_canonical {
@@ -3855,6 +3867,22 @@ inline constexpr u64 INV_DECAY[] = {
     17145270212524619071ULL, 17150773037867065887ULL, 17156277629357632512ULL,
     17161783987563169425ULL,
 };
+
+// Extents are compiler-checked, not hand-trusted. Both arrays are declared
+// UNSIZED, so their true lengths come from the initialiser lists above and from
+// nothing else — while DecayTables::init indexes them against CANON_MAX_DEPTH
+// and CANON_EPOCH_LEN, which are separate literals a few lines up. Nothing but
+// these asserts ties the two together. A regeneration cut short, a bad merge
+// resolution, a hand-trimmed row: any of them shortens an array while leaving
+// the constants saying otherwise, and the result is an out-of-bounds read in
+// the consensus path, silently, with whatever happened to follow in memory
+// serving as a decay factor. Fail the BUILD instead.
+static_assert(std::size(DECAY) == CANON_MAX_DEPTH + 1,
+              "v37: DECAY[] must cover [0, CANON_MAX_DEPTH] exactly; "
+              "regenerate with tools/gen_decay_canonical.py");
+static_assert(std::size(INV_DECAY) == CANON_EPOCH_LEN,
+              "v37: INV_DECAY[] must cover [0, CANON_EPOCH_LEN) exactly; "
+              "regenerate with tools/gen_decay_canonical.py");
 
 }  // namespace decay_canonical
 }  // namespace v37
