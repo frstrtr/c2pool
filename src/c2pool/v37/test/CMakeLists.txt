@@ -84,4 +84,17 @@ if (BUILD_TESTING)
     target_include_directories(v37_w5_coinbase_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w5_coinbase_test Threads::Threads)
     add_test(NAME v37_w5_coinbase_test COMMAND v37_w5_coinbase_test)
+
+    # Track A2 / W3 — carrier-relay KAT (src/c2pool/v37/w3_relay.hpp). Same
+    # stdlib-only shape; it additionally forks child processes over 127.0.0.1
+    # loopback sockets for the multi-process propagation smoke (POSIX sockets +
+    # fork, no Boost/ASIO). SAME HOLLOW-GREEN GUARD as above: this target is ALSO
+    # listed in the build.yml --target lists (BOTH the Linux x86_64 leg and the
+    # ASan+UBSan leg) so CI actually compiles + runs it, not just registers it as
+    # a NOT_BUILT CTest sentinel (the DGB #137 / #769 / PR #1467 / #1477 class).
+    add_executable(v37_w3_relay_test v37_w3_relay_test.cpp)
+    target_compile_features(v37_w3_relay_test PRIVATE cxx_std_20)
+    target_include_directories(v37_w3_relay_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_w3_relay_test Threads::Threads)
+    add_test(NAME v37_w3_relay_test COMMAND v37_w3_relay_test)
 endif()
