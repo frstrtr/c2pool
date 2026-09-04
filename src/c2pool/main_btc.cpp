@@ -47,6 +47,7 @@
 #include <impl/btc/auto_ratchet.hpp>     // AutoRatchet V35->V36 forward-version-voting
 #include <impl/btc/share_check.hpp>      // RefHashParams + compute_ref_hash_for_work
 #include <impl/btc/share_tracker.hpp>    // get_v35_expected_payouts
+#include <impl/btc/dashboard_pplns.hpp>  // btc::dashboard::pplns_payouts_current — pool-wide Current Payouts (read-only)
 #include <impl/btc/stratum/work_source.hpp>
 #include <impl/btc/coin/template_capture.hpp>     // per-share template retain -> won-block reconstruct (slice 7/7)
 #include <impl/btc/coin/template_other_txs.hpp>    // make_template_other_txs_fn bridge (#840)
@@ -2770,6 +2771,50 @@ int main(int argc, char* argv[])
                 }
             });
 
+        // §3b Pool-wide "Current Payouts" — the #939 direct seam that lights
+        // /current_payouts, /current_merged_payouts (the MAIN dashboard treemap,
+        // which wraps the primary payouts) and the window feeder's own
+        // `pplns_current` fallback. The set_pplns_fn seam above only feeds
+        // MiningInterface's OWN cache, which stays cold on this NULL-IMiningNode
+        // web MI (refresh_work / start_pplns_precompute both gate on an
+        // m_cached_template this MI never fills — same class of inert wiring the
+        // DASH lane documents at main_dash.cpp). So compute the split DIRECTLY
+        // from the sharechain the node already holds, exactly as the stratum
+        // coinbase does, via btc::dashboard::pplns_payouts_current (no payout
+        // arithmetic re-implemented; the mint's own get_{v35_,}expected_payouts
+        // is called). Read-only: walks the sharechain under read_tracker(), reads
+        // no mutable/verified state, sends no wire bytes, builds no coinbase. It
+        // is DELIBERATELY pure — unlike the set_pplns_fn seam it does NOT call
+        // ws->set_donation_script(), which is a stratum work-refresh side effect
+        // and must not fire from a display timer.
+        auto current_pplns =
+            [p2p_node_raw, auto_ratchet, &header_chain, ws = work_source.get(),
+             halving = chain_params.subsidy_halving_interval, testnet]()
+            -> nlohmann::json {
+                if (!p2p_node_raw) return nlohmann::json::object();
+                // best_share_hash() takes its OWN try-shared-lock; read it BEFORE
+                // read_tracker() so we never re-enter the same shared_mutex from a
+                // thread already holding it (the nested-acquire hazard the DASH
+                // lane calls out at main_dash.cpp).
+                const uint256 best = p2p_node_raw->best_share_hash();
+                const uint32_t tip = header_chain.height();
+                if (best.IsNull() || tip == 0) return nlohmann::json::object();
+                // Difficulty epoch bits: GBT block bits when a stratum session has
+                // built work; on a zero-rig relay that never built any, fall back
+                // to the header follower's own tip bits.
+                uint32_t bb = ws ? ws->last_block_bits() : 0;
+                if (!bb) if (auto t = header_chain.tip()) bb = t->header.m_bits;
+                if (!bb) return nlohmann::json::object();
+                auto guard = p2p_node_raw->read_tracker();
+                if (!guard) return nlohmann::json::object();
+                auto [ver, dv] = auto_ratchet->get_share_version(*guard, best);
+                (void)dv;
+                return btc::dashboard::pplns_payouts_current(
+                    *guard, best, static_cast<int>(ver), bb,
+                    btc::coin::get_block_subsidy(tip + 1, halving), testnet);
+            };
+        mi->set_current_payouts_fn(current_pplns);
+
         // §4 Sharechain explorer — /sharechain/window requires m_sharechain_window_fn.
         // Port the proven DGB feeder shape (main_dgb.cpp:1721, itself copied from
         // the LTC wiring): walk the tallest chain head back through the PPLNS
@@ -2777,7 +2822,11 @@ int main(int argc, char* argv[])
         // dependency, so the explorer fills with the real public sharechain
         // immediately. Address markers use the raw scriptPubKey hex (self-
         // consistent with my_address below for the frontend's "mine" highlight).
-        mi->set_sharechain_window_fn([p2p_node_raw, mi]() -> nlohmann::json {
+        mi->set_sharechain_window_fn([p2p_node_raw, mi, current_pplns]() -> nlohmann::json {
+            // Compute the pool-wide split FIRST — current_pplns takes and
+            // RELEASES its own read guard, so it must not run nested inside the
+            // window walk's guard below.
+            auto cur = current_pplns();
             auto guard = p2p_node_raw->read_tracker();
             if (!guard) return nlohmann::json::object();
             nlohmann::json result;
@@ -2839,6 +2888,23 @@ int main(int argc, char* argv[])
             int total_n = static_cast<int>(shares_arr.size());
             result["shares"] = std::move(shares_arr);
             result["total"] = total_n;
+
+            // Attach the pool-wide PPLNS split so the "Current Payouts" card and
+            // the per-share treemap have a present, honest source (parity with
+            // DASH main_dash.cpp / LTC main_ltc.cpp). `pplns_current` is the
+            // pool-wide fallback the frontend reads for any share; `pplns` keys
+            // the tip's own 16-hex short hash to the SAME split (the tip's window
+            // IS the current window), which the frontend's nearest-newer walk
+            // resolves every share to. A true per-share map would be 8640 tracker
+            // walks per request — not computed on demand.
+            if (cur.is_object() && !cur.empty()) {
+                if (!best.IsNull()) {
+                    result["pplns"] = {
+                        { best.GetHex().substr(0, 16), cur }
+                    };
+                }
+                result["pplns_current"] = std::move(cur);
+            }
             return result;
         });
 
