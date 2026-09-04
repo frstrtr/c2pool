@@ -69,7 +69,9 @@ private:
 struct PubkeyHashHasher {
     size_t operator()(const std::array<uint8_t, 20>& a) const {
         size_t h = 0;
-        for (int i = 0; i < 8 && i < 20; ++i)
+        // 8 bytes is the widest prefix a 64-bit size_t can hold, and 8 <= a.size()
+        // (std::array<uint8_t, 20>), so no second bounds clause is needed.
+        for (int i = 0; i < 8; ++i)
             h |= size_t(a[i]) << (8 * i);
         return h;
     }
