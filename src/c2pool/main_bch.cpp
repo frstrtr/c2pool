@@ -86,7 +86,8 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --with-peer-verify [--testnet] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
         << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n"
-        << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT] [--anchor N] [--rpc-conf PATH]\n"
+        << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT]\n"
+        << "              [--sharechain-addnode HOST:PORT ...] [--anchor N] [--rpc-conf PATH]\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
         << "                   isolates co-located instances\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
@@ -634,7 +635,8 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
              bool testnet4, bool regtest, uint32_t anchor_height,
              const std::string& stratum_addr, uint16_t stratum_port,
              const std::string& rpc_conf,
-             const std::string& http_addr, uint16_t http_port)
+             const std::string& http_addr, uint16_t http_port,
+             const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes)
 {
     boost::asio::io_context ioc;
 
@@ -654,6 +656,38 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
     // Sharechain identity: BCH p2pool PREFIX namespaces the sharechain P2P
     // framing. standup_pool_run's Node reads pool()->m_prefix.
     config.pool()->m_prefix = ParseHexBytes(bch::PoolConfig::prefix_hex());
+
+    // Sharechain bootstrap addr-store seed (contabo BCH revival FIX).
+    // run_pool hand-builds Config WITHOUT PoolConfig::load() (the sole YAML
+    // populator of m_bootstrap_addrs), so on master the addr store was ALWAYS
+    // empty -> 0 sharechain peers forever (contabo addrs.json = null). Seed it
+    // here, BEFORE standup_pool_run constructs the Node (node.hpp: the ctor
+    // reads pool()->m_bootstrap_addrs into m_addrs). --sharechain-addnode pins
+    // an explicit peer (e.g. 92.53.224.27:9349, the live kr1z1s BCH sharechain);
+    // with none given, the public DEFAULT_BOOTSTRAP_HOSTS are seeded at :9349.
+    // REWARD-SAFE: transport addresses only -- PREFIX/IDENTIFIER/port/proto/
+    // share/PPLNS/coinbase untouched; the node JOINS the existing chain via the
+    // standard handshake, it cannot fork it.
+    bch::seed_sharechain_bootstrap(*config.pool(), sharechain_addnodes, regtest);
+    if (!sharechain_addnodes.empty()) {
+        // Explicit pin: reset any stale public addr book so saved public peers
+        // (scored by first_seen/last_seen) can't outrank the pinned target.
+        // Mirrors main_btc.cpp's ExplicitPeers addrs.json reset. Best-effort;
+        // the addr store lives under <data-dir>/<net>/bch/addrs.json.
+        std::string net_label = (testnet || testnet4 || regtest) ? "testnet" : "mainnet";
+        std::filesystem::path addrs_path = core::filesystem::config_path()
+            / net_label / "bch" / "addrs.json";
+        std::error_code rm_ec;
+        std::filesystem::remove(addrs_path, rm_ec);  // best-effort
+    }
+    {
+        const char* mode_name = !sharechain_addnodes.empty()
+            ? "explicit --sharechain-addnode"
+            : (regtest ? "regtest-isolated" : "public-default");
+        std::cout << "[pool] sharechain bootstrap: "
+                  << config.pool()->m_bootstrap_addrs.size()
+                  << " addr(s) (" << mode_name << ")\n";
+    }
 
     // External BCHN-RPC fallback endpoint (v36 external_fallback invariant): the
     // embedded daemon is the PRIMARY work source, but coin::Node::init_rpc still
@@ -692,7 +726,7 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
     try {
         bch::standup_pool_run(ioc, config, anchor_height,
                               stratum_addr, stratum_port, testnet || testnet4 || regtest, regtest,
-                              http_addr, http_port);
+                              http_addr, http_port, sharechain_addnodes.size());
     } catch (const std::exception& e) {
         std::cout << "[pool] FATAL: " << e.what() << "\n";
         return 1;
@@ -728,6 +762,11 @@ int main(int argc, char** argv)
     std::string settings_path;       // --settings PATH (M0b; empty => default probe)
     bool want_dump_config = false;   // --dump-resolved-config (M0b)
     bool want_ack_money   = false;   // --ack-money-settings (M0b)
+    // --sharechain-addnode HOST:PORT (repeatable): explicit sharechain (pool
+    // P2P) peer(s) to pin. Seeds m_bootstrap_addrs before the Node ctor reads
+    // it (contabo BCH revival FIX). e.g. --sharechain-addnode 92.53.224.27:9349
+    // pins the live kr1z1s BCH sharechain. Mirrors main_btc.cpp:205.
+    std::vector<std::pair<std::string, uint16_t>> sharechain_addnodes;
 
     // Parse loop. M0b: converted from a chain of independent `if`s to an
     // else-if chain with a trailing else, so an unknown flag is rejected with a
@@ -803,6 +842,21 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--max-seconds") == 0 && i + 1 < argc)
             max_seconds = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else if (std::strcmp(argv[i], "--sharechain-addnode") == 0 && i + 1 < argc) {
+            // --sharechain-addnode HOST:PORT -- repeatable; pin explicit
+            // sharechain peer(s). HOST:PORT validated via rfind(':') (IPv6-safe
+            // enough for the numeric-IP/hostname seeds we pin). Reject a bare
+            // HOST with no port (matches main_btc.cpp:304-319).
+            std::string ep = argv[++i];
+            const auto c = ep.rfind(':');
+            if (c == std::string::npos) {
+                std::cerr << "--sharechain-addnode requires HOST:PORT\n";
+                return 1;
+            }
+            sharechain_addnodes.emplace_back(
+                ep.substr(0, c),
+                static_cast<uint16_t>(std::stoi(ep.substr(c + 1))));
+        }
         else {
             std::cerr << "unknown argument: " << argv[i] << "\n";
             return 1;
@@ -868,7 +922,7 @@ int main(int argc, char** argv)
 
     if (want_pool)
         return run_pool(host, port, testnet, testnet4, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf,
-                        http_addr, http_port);
+                        http_addr, http_port, sharechain_addnodes);
 
     if (want_with_peer_verify)
         return run_with_peer_verify(host, port, testnet, max_seconds);

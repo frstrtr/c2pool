@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -265,5 +266,86 @@ public:
     std::string m_worker;
     std::vector<NetService> m_bootstrap_addrs;
 };
+
+// ---------------------------------------------------------------------------
+// Sharechain bootstrap-source selection (pure, testable seam)
+//
+// FIX (contabo BCH revival, 2026-09-04): run_pool (main_bch.cpp) hand-builds
+// bch::Config WITHOUT the YAML load() that is the sole populator of
+// m_bootstrap_addrs -- so NodeImpl's ctor (node.hpp) loaded an EMPTY addr store
+// and the node had 0 sharechain peers forever (contabo addrs.json = null). This
+// resolver + builder let run_pool seed the addr store deterministically before
+// the Node ctor reads it, WITHOUT a YAML file. Mirrors the BTC seam
+// (src/impl/btc/config_pool.hpp select_sharechain_bootstrap_mode) minus the
+// CustomNetSuppressed arm -- BCH has no --network-id federation CLI, so there is
+// no custom-net precedence tier here.
+//
+// REWARD-SAFE: this touches ONLY which transport addresses are dialed. PREFIX/
+// IDENTIFIER (m_prefix), P2P_PORT, protocol versions, share format, PPLNS and
+// coinbase are UNCHANGED -- the node joins the existing kr1z1s sharechain
+// through the standard handshake (prefix ac9a8fda9a911bce, proto >= 3301); it
+// cannot fork it.
+// ---------------------------------------------------------------------------
+enum class SharechainBootstrapMode {
+    ExplicitPeers,    // --sharechain-addnode given: dial ONLY those peers
+    RegtestIsolated,  // --regtest: 0 seeds (never dial public mainnet 9349 seeds)
+    PublicDefault,    // public net, no explicit peers: DEFAULT_BOOTSTRAP_HOSTS
+};
+
+// Precedence: explicit peers > regtest > public default.
+inline SharechainBootstrapMode select_sharechain_bootstrap_mode(
+    bool has_explicit_peers, bool regtest)
+{
+    if (has_explicit_peers) return SharechainBootstrapMode::ExplicitPeers;
+    if (regtest)            return SharechainBootstrapMode::RegtestIsolated;
+    return SharechainBootstrapMode::PublicDefault;
+}
+
+// Pure builder: compute the sharechain bootstrap address list. No I/O, no
+// config mutation -- the whole logic lives here so it is unit-testable without
+// constructing a PoolConfig or touching the network.
+//   ExplicitPeers   -> exactly `addnodes`, at the ports given.
+//   RegtestIsolated -> empty (solo/local; a won share is never relayed to the
+//                      public net -- same isolation the BTC .121 incident forced).
+//   PublicDefault   -> DEFAULT_BOOTSTRAP_HOSTS, each at P2P_PORT (9349) unless
+//                      the host literal already carries an explicit ":port".
+inline std::vector<NetService> build_sharechain_bootstrap(
+    SharechainBootstrapMode mode,
+    const std::vector<std::pair<std::string, uint16_t>>& addnodes)
+{
+    std::vector<NetService> out;
+    switch (mode)
+    {
+    case SharechainBootstrapMode::ExplicitPeers:
+        for (const auto& [host, port] : addnodes)
+            out.emplace_back(host, port);
+        break;
+    case SharechainBootstrapMode::RegtestIsolated:
+        break;  // empty by design
+    case SharechainBootstrapMode::PublicDefault:
+        for (const auto& host : PoolConfig::DEFAULT_BOOTSTRAP_HOSTS)
+        {
+            if (host.find(':') == std::string::npos)
+                out.emplace_back(host, PoolConfig::P2P_PORT);
+            else
+                out.emplace_back(host);  // literal already HOST:PORT
+        }
+        break;
+    }
+    return out;
+}
+
+// Populate pool.m_bootstrap_addrs from the resolved mode (thin plumbing over the
+// pure builder). Called by run_pool BEFORE the Node ctor reads the vector.
+inline void seed_sharechain_bootstrap(
+    PoolConfig& pool,
+    const std::vector<std::pair<std::string, uint16_t>>& addnodes,
+    bool regtest)
+{
+    pool.m_bootstrap_addrs = build_sharechain_bootstrap(
+        select_sharechain_bootstrap_mode(/*has_explicit_peers=*/!addnodes.empty(),
+                                          /*regtest=*/regtest),
+        addnodes);
+}
 
 } // namespace bch

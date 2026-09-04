@@ -119,7 +119,8 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                              bool is_testnet = false,
                              bool is_regtest = false,
                              const std::string& http_addr = "0.0.0.0",
-                             uint16_t http_port = 0)
+                             uint16_t http_port = 0,
+                             size_t explicit_sharechain_peers = 0)
 {
     // 1+2: embedded daemon up first -- it owns the work source + RPC fallback
     // the pool node consumes, and is the broadcast sink the node wires into.
@@ -143,6 +144,28 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
              << " won-block sink LIVE (dual-path: embedded P2P primary + BCHN"
              << " submitblock fallback). Structural broadcaster-gate criterion-C"
              << " satisfied; live VM300 e2e is the behavioural half.";
+
+    // 5b: SHARECHAIN LISTENER + OUTBOUND DIAL (contabo BCH revival FIX).
+    // Until now this entrypoint stood up NO sharechain listener and NEVER called
+    // start_outbound_connections(), so the node had 0 sharechain peers forever
+    // (no :9349 LISTEN, addrs never dialed). Bind the pool P2P listener on
+    // P2P_PORT (9349) and start the outbound dial loop that consumes the addr
+    // store seeded from m_bootstrap_addrs (run_pool). node inherits
+    // core::Server via BaseNode : core::Factory<core::Server, core::Client>
+    // (src/pool/node.hpp), so node.core::Server::listen(...) resolves exactly as
+    // in main_dgb.cpp:678 / main_btc.cpp:1638. When explicit --sharechain-addnode
+    // peers were pinned, raise the outbound target to at least that count so all
+    // pins are dialed (default m_target_outbound_peers = 8 otherwise).
+    if (explicit_sharechain_peers)
+        node.set_target_outbound_peers(std::max<size_t>(1, explicit_sharechain_peers));
+    node.core::Server::listen(PoolConfig::P2P_PORT);
+    LOG_INFO << "[BCH-POOL] sharechain listening :" << PoolConfig::P2P_PORT
+             << " proto adv=" << PoolConfig::ADVERTISED_PROTOCOL_VERSION
+             << " min=" << PoolConfig::MINIMUM_PROTOCOL_VERSION
+             << " prefix=" << PoolConfig::prefix_hex();
+    node.start_outbound_connections();
+    LOG_INFO << "[BCH-POOL] outbound sharechain dialing started ("
+             << config.pool()->m_bootstrap_addrs.size() << " bootstrap addr(s))";
 
     // 6: miner-facing IWorkSource + Stratum front-end. BCHWorkSource generates
     // work off the embedded daemon's HeaderChain + Mempool (SHA256d, no-segwit,
@@ -690,10 +713,11 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
         // Advertise the REAL stratum bind as worker_port (was the LTC-template
-        // default 9327). This entrypoint stands up NO sharechain listener, so
-        // p2p_port is intentionally left 0 (truthful "no listener") rather than
-        // a template constant.
+        // default 9327). The sharechain listener IS now stood up (step 5b above,
+        // core::Server::listen(P2P_PORT)), so advertise the real 9349 p2p_port
+        // rather than a truthful-0 or a template constant.
         mi->set_worker_port(stratum_port);
+        mi->set_p2p_port(PoolConfig::P2P_PORT);
 
         // Cross-coin dashboard parity: serve the shared refined web-static
         // dashboard over --http (bch.voidbind, same UI as LTC/DASH). This lane
