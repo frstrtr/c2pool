@@ -1,0 +1,13 @@
+{
+  "coinbase_sha256": "575bd25cb72365c8a205cf8d0445eb8adf7c818bb967c0cf44ae608feed9c2aa",
+  "finalized_owed": {
+    "live": 8,
+    "silent": 0
+  },
+  "payable_now": [
+    "live"
+  ],
+  "pending_silent": true,
+  "row": "P3-7b",
+  "stamp": "5e854ed6507f71f008b5def862213418548fac55c3fe1fe5f0a6d2b2e22e4673"
+}

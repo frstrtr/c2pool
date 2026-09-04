@@ -1,0 +1,12 @@
+{
+  "coinbase_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "owed_after_revert": {
+    "m1": 0,
+    "m2": 0,
+    "m3": 0
+  },
+  "pot": 0,
+  "row": "P3-2",
+  "stamp": "def55e0ef0c9f04e050a52212eaf2249b630a2bd5a05dd11db4ecdd77a368510",
+  "work_paid_S1": false
+}

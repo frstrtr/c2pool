@@ -1,0 +1,10 @@
+{
+  "digest": "cfbead8efd3dfa19bef18427cc6fd1bb6d7c1ce9b870618ce2ec30f1a337083e",
+  "result": {
+    "a_paid": 0,
+    "b_paid": 0,
+    "cross_atomic": false,
+    "owed_unchanged": true,
+    "row": "E2E-5"
+  }
+}

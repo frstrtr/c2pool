@@ -1,0 +1,10 @@
+{
+  "all_paid": true,
+  "bounded_lag": 3,
+  "miners": 7,
+  "residual_owed": 0,
+  "rounds_used": 3,
+  "row": "P3-7",
+  "slot_budget": 3,
+  "stamp": "f367fcd6c15bb1fb3d2fbbf386485b4cdb06995c6873061400880d3230755909"
+}

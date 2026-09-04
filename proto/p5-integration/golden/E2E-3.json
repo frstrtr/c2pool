@@ -1,0 +1,22 @@
+{
+  "digest": "92ac56681ae885b1ca84f0ab9668c3c29966c5c7d1beedc01a1d96920d550bc5",
+  "result": {
+    "coinbase": [
+      [
+        "m0",
+        80
+      ],
+      [
+        "m1",
+        20
+      ]
+    ],
+    "coinbase_sum": 100,
+    "m2_paid": false,
+    "owed": {
+      "m0": 80,
+      "m1": 20
+    },
+    "row": "E2E-3"
+  }
+}

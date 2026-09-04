@@ -1,0 +1,15 @@
+[PASS] P4-1a fresh-current-epoch-admits: got=True want=True
+[PASS] P4-1b backdated-precompute-rejected: got='expired-ttl' want='expired-ttl'
+[PASS] P4-1c future-epoch-rejected: got='future-epoch' want='future-epoch'
+[PASS] P4-2a ttl-edge-inclusive-fresh: got=True want=True
+[PASS] P4-2b ttl-over-edge-dead: got='expired-ttl' want='expired-ttl'
+[PASS] P4-3a forged-sig-rejected: got='bad-sig' want='bad-sig'
+[PASS] P4-3b cannot-mint-under-victim-id: got='bad-sig' want='bad-sig'
+[PASS] P4-3c victim-id-unchanged: got=True want=True
+[PASS] P4-4a honest-standing: got=5 want=5
+[PASS] P4-4b sybil-split-linear-no-superlinear: got=5 want=5
+[PASS] P4-4c domain-scoped: got=0 want=0
+[PASS] P4-4d standing-ephemeral-gc: got=0 want=0
+
+12/12 invariants PASS
+golden-digest sha256: 61ea15edf2726d4af3aa9c71729a803badddcbd9ab2c556254a064d7fa64741f

@@ -1,0 +1,406 @@
+{
+ "cases": [
+  {
+   "checks": [
+    {
+     "id": "R1a in-window share is entitled on the lagging chain",
+     "pass": true
+    },
+    {
+     "id": "R1b D_spine gate defers it (payable == 0)",
+     "pass": true
+    },
+    {
+     "id": "R1c nothing broadcast to it yet",
+     "pass": true
+    },
+    {
+     "id": "R1d repaired within N_repair windows",
+     "pass": true
+    },
+    {
+     "id": "R1e verdict REPAIRED",
+     "pass": true
+    },
+    {
+     "id": "R1f no invariant violation",
+     "pass": true
+    },
+    {
+     "id": "R2a the orphaned block is off the canonical history",
+     "pass": true
+    },
+    {
+     "id": "R2b its payouts are orphaned and still PENDING",
+     "pass": true
+    },
+    {
+     "id": "R2b2 non-vacuous: miners actually lost broadcast value",
+     "pass": true
+    },
+    {
+     "id": "R2b3 the orphaned slice RETURNED TO OWED",
+     "pass": true
+    },
+    {
+     "id": "R2c nothing silently vanished",
+     "pass": true
+    },
+    {
+     "id": "R2d the re-owed slice is re-minted within N_repair windows",
+     "pass": true
+    },
+    {
+     "id": "R2e at quiescence every in-window miner is made exactly whole",
+     "pass": true
+    },
+    {
+     "id": "R2f no miner ends FALSIFIES:F-REPAIR",
+     "pass": true
+    },
+    {
+     "id": "R2g no invariant violation",
+     "pass": true
+    },
+    {
+     "id": "R3a the share is outside the lagging chain's PPLNS window",
+     "pass": true
+    },
+    {
+     "id": "R3b so it is never credited on the lagging chain",
+     "pass": true
+    },
+    {
+     "id": "R3c verdict is the declared exclusion, not a falsifier",
+     "pass": true
+    },
+    {
+     "id": "R3d NOT counted as F-REPAIR falsification",
+     "pass": true
+    },
+    {
+     "id": "R4a the departing miner was paid before departure",
+     "pass": true
+    },
+    {
+     "id": "R4b the re-derivation leaves it over-credited",
+     "pass": true
+    },
+    {
+     "id": "R4c verdict is the declared exclusion",
+     "pass": true
+    },
+    {
+     "id": "R4d NOT counted as F-REPAIR falsification",
+     "pass": true
+    },
+    {
+     "id": "R4e funds already broadcast were not clawed back",
+     "pass": true
+    }
+   ],
+   "falsifier": "F-REPAIR",
+   "record": {
+    "R1_earned_late": 125000,
+    "R1_moved_late": 375000,
+    "R1_repaired_at_window": 2,
+    "R2_hurt_miners": [
+     "m0",
+     "m1",
+     "m2"
+    ],
+    "R2_reorg_dropped": 1,
+    "R2_repaired_at_window": 1,
+    "R3_expire_earned_B": 0,
+    "R4_overcredit_residual": 500000
+   },
+   "test": "AT-REPAIR"
+  },
+  {
+   "checks": [
+    {
+     "id": "S1a no broadcast was made against a prefix a later reorg rewrote",
+     "pass": true
+    },
+    {
+     "id": "S1b nothing vanished",
+     "pass": true
+    },
+    {
+     "id": "S1c no invariant violation",
+     "pass": true
+    },
+    {
+     "id": "S1d non-vacuous: payouts and reorgs both happened",
+     "pass": true
+    },
+    {
+     "id": "S2a the reorg really rewrote the tail (non-vacuous)",
+     "pass": true
+    },
+    {
+     "id": "S2b silent: no payout emitted, none unwound",
+     "pass": true
+    },
+    {
+     "id": "S2c no broadcast prefix touched",
+     "pass": true
+    },
+    {
+     "id": "S2d re-derivation created no over-credit",
+     "pass": true
+    },
+    {
+     "id": "S2e nothing vanished",
+     "pass": true
+    },
+    {
+     "id": "S2f no invariant violation",
+     "pass": true
+    },
+    {
+     "id": "S3a the exhibit exists: a broadcast prefix WAS re-derived away",
+     "pass": true
+    },
+    {
+     "id": "S3b divergence appears in both directions",
+     "pass": true
+    },
+    {
+     "id": "S3c under-credit strictly decreases at every settled window until it is zero (monotone progress; NO deadline, N_repair not consulted)",
+     "pass": true
+    },
+    {
+     "id": "S3c2 non-vacuous: the aggregate started positive over a non-empty active set",
+     "pass": true
+    },
+    {
+     "id": "S3c3 monotone progress therefore drives the aggregate to zero",
+     "pass": true
+    },
+    {
+     "id": "S3d over-credit is NOT clawed back (effect boundary honoured)",
+     "pass": true
+    },
+    {
+     "id": "S3e no payout is ever issued while owed is negative",
+     "pass": true
+    },
+    {
+     "id": "S3f the residual is surfaced, not silent",
+     "pass": true
+    },
+    {
+     "id": "S3g not an F-SPINE falsification: the divergence was corrected forward (no under-credit left on the active set) -- stated without any N",
+     "pass": true
+    }
+   ],
+   "falsifier": "F-SPINE",
+   "record": {
+    "INFO_B_sizing_max_payable_created": 875000,
+    "INFO_B_sizing_one_block_reward": 1000000,
+    "INFO_B_sizing_payable_created_per_window": [
+     750000,
+     875000
+    ],
+    "INFO_B_sizing_stayed_below_one_block_reward": true,
+    "S1_payouts": 27,
+    "S1_reorgs": 8,
+    "S3_drained_at_window": 2,
+    "S3_over_credited": [
+     "m2"
+    ],
+    "S3_probe_first_depth_monotone_progress_stalls": 7,
+    "S3_probe_first_depth_not_clearing_in_N_repair": 7,
+    "S3_reorg_depth": 6,
+    "S3_residual_units": 250000,
+    "S3_under_credited": [
+     "m3"
+    ],
+    "S3_undercredit_series": [
+     375000,
+     125000,
+     0
+    ]
+   },
+   "test": "AT-SPINE"
+  },
+  {
+   "checks": [
+    {
+     "id": "B1a the block being orphaned did broadcast a payout",
+     "pass": true
+    },
+    {
+     "id": "B1b the orphaned coinbase moved no funds",
+     "pass": true
+    },
+    {
+     "id": "B1b2 the orphaned amount RETURNED TO OWED",
+     "pass": true
+    },
+    {
+     "id": "B1c nothing vanished (ledger belief == funds actually moved)",
+     "pass": true
+    },
+    {
+     "id": "B1d it is re-minted by a later settlement",
+     "pass": true
+    },
+    {
+     "id": "B1e every miner exactly whole after re-mint",
+     "pass": true
+    },
+    {
+     "id": "B1f no invariant violation",
+     "pass": true
+    },
+    {
+     "id": "B2a some payouts reached SETTLED",
+     "pass": true
+    },
+    {
+     "id": "B2b none marked SETTLED below D_conf confirmations",
+     "pass": true
+    },
+    {
+     "id": "B2c every SETTLED payout held >= D_conf confirmations when marked",
+     "pass": true
+    },
+    {
+     "id": "B2d payouts younger than D_conf are still PENDING",
+     "pass": true
+    },
+    {
+     "id": "B3a no SETTLED payout was ever orphaned",
+     "pass": true
+    },
+    {
+     "id": "B3b nothing vanished under sub-D_conf reorgs",
+     "pass": true
+    },
+    {
+     "id": "B3c no invariant violation",
+     "pass": true
+    },
+    {
+     "id": "B3d at quiescence the ledger drains to exact payable",
+     "pass": true
+    },
+    {
+     "id": "B4a total broadcast <= total minted by the canonical chain",
+     "pass": true
+    },
+    {
+     "id": "B4b no miner received more than its high-water entitlement",
+     "pass": true
+    },
+    {
+     "id": "B4c no invariant violation",
+     "pass": true
+    },
+    {
+     "id": "B5a a beyond-acceptance reorg does orphan a SETTLED payout",
+     "pass": true
+    },
+    {
+     "id": "B5b the residual is exactly bounded by the orphaned SETTLED amount",
+     "pass": true
+    },
+    {
+     "id": "B5c the residual is surfaced by the model, not silent",
+     "pass": true
+    },
+    {
+     "id": "B6a non-vacuous: SETTLED payouts exist and the composed rewrite would be deeper than D_conf",
+     "pass": true
+    },
+    {
+     "id": "B6b the clause refuses both shortening candidates (settlement is not re-evaluated against a lower height)",
+     "pass": true
+    },
+    {
+     "id": "B6c best-chain height never fell below its persisted high-water",
+     "pass": true
+    },
+    {
+     "id": "B6d NO SETTLED payout is orphaned -- the composition hazard cannot arise",
+     "pass": true
+    },
+    {
+     "id": "B6e nothing vanished and no invariant violation",
+     "pass": true
+    }
+   ],
+   "falsifier": "F-BROADCAST",
+   "record": {
+    "B1_orphaned_amount": 750000,
+    "B1_remint_window": 1,
+    "B2_pending": 6,
+    "B2_settled": 12,
+    "B3_payouts": 51,
+    "B3_reorgs": 3,
+    "B4_ceiling": 7000000,
+    "B4_moved": 5000000,
+    "B5_orphaned_settled_units": 1625000,
+    "B5_reorg_depth": 4,
+    "B6_composed_depth": 4,
+    "B6_height_high_water": 6,
+    "B6_lost_units": 0,
+    "B6_rejected_candidates": 2,
+    "B6_shallow_depth": 2
+   },
+   "test": "AT-BROADCAST"
+  },
+  {
+   "checks": [
+    {
+     "id": "CONS-1/2/3 hold at every step of all 100 schedules",
+     "pass": true
+    },
+    {
+     "id": "CONS-1 per-chain value ceiling never exceeded",
+     "pass": true
+    },
+    {
+     "id": "CONS-4 every positive owed drains at quiescence",
+     "pass": true
+    },
+    {
+     "id": "non-vacuous: schedules exercised deep spine reorgs",
+     "pass": true
+    },
+    {
+     "id": "non-vacuous: schedules exercised coin-chain reorgs",
+     "pass": true
+    },
+    {
+     "id": "non-vacuous: schedules broadcast payouts",
+     "pass": true
+    }
+   ],
+   "falsifier": "cross-invariant",
+   "record": {
+    "events_per_schedule": 30,
+    "first_violation": null,
+    "moved_total": 2657500000,
+    "schedules": 100,
+    "schedules_undrained": 0,
+    "schedules_with_violation": 0,
+    "total_coin_reorgs": 300,
+    "total_deep_spine_reorgs": 116,
+    "total_payouts": 12045
+   },
+   "test": "CONS"
+  }
+ ],
+ "config": {
+  "BLOCK_REWARD": 1000000,
+  "D_conf": 3,
+  "D_spine": 4,
+  "N_repair": 3,
+  "SETTLED_TERMINAL": true,
+  "W_pplns": 8
+ },
+ "stamp": "3692d922af75b61bc3d40b431e0c048ee5ed0412b093c05911294b3ec5af4efe"
+}
