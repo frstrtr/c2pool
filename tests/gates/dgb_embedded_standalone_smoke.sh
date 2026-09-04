@@ -73,18 +73,38 @@ if ! kill -0 "$NODE_PID" 2>/dev/null; then
 fi
 echo "[dgb-smoke] engine still up after ${BOOT_GRACE}s boot grace"
 
-# Egress-honest NAMED skip: coin-network unreachable => logged skip, not green.
-# All 8 DNS seeds failing / zero peers added is the network-isolated signature.
-if grep -qiE "no route to host|network is unreachable|temporary failure in name resolution" "$LOG" \
-   || grep -qE "DNS seeds:.* 0 (new peers added|total)" "$LOG" \
-   || grep -qE "DgbCoinPeerManager started: 0 peers" "$LOG"; then
-  echo "::notice::[dgb-smoke] SKIP — DGB coin-network egress blocked (DNS/P2P unreachable). NAMED skip, not a silent green."
-  echo "---- node.log (tail) ----"; tail -40 "$LOG"; exit 0
-fi
-
-# Assert peer discovery ARMED against real peers (structural red-line).
-if ! grep -qE "\[DGB\] coin-network peer discovery ARMED" "$LOG"; then
-  echo "::error::coin-network peer discovery did not ARM under --coin-p2p-discover"
+# 2) coin-network peer discovery ARMED (structural red-line) — POLLED, not a
+# single post-sleep grep. The "[DGB] coin-network peer discovery ARMED" marker
+# is emitted by DgbCoinPeerManager::start() (main_dgb.cpp), which resolves the
+# 8 DGB DNS seeds SYNCHRONOUSLY on the boot thread. On GH-hosted runners the
+# unreachable seeds each burn the full resolver timeout, so start() — and thus
+# the ARMED line — can land WELL AFTER the 25s boot grace (observed: 2 seeds
+# still timing out at +21s). A single grep right after the sleep therefore
+# false-reds on a binary that arms fine, just slowly. Poll up to ARM_WAIT; still
+# fail HARD if it never arms, and honor the egress-blocked NAMED skip in-loop.
+ARM_WAIT="${ARM_WAIT:-45}"           # extra seconds past boot grace for synchronous seed resolution to finish
+arm_deadline=$(( SECONDS + ARM_WAIT ))
+armed=0
+while [ "$SECONDS" -lt "$arm_deadline" ]; do
+  if ! kill -0 "$NODE_PID" 2>/dev/null; then
+    echo "::error::c2pool-dgb exited while arming coin-network peer discovery"
+    echo "---- node.log ----"; cat "$LOG"; exit 1
+  fi
+  # Egress-honest NAMED skip: coin-network fully unreachable => logged skip, not
+  # green. All 8 DNS seeds failing / zero peers added is the isolated signature.
+  if grep -qiE "no route to host|network is unreachable|temporary failure in name resolution" "$LOG" \
+     || grep -qE "DNS seeds:.* 0 (new peers added|total)" "$LOG" \
+     || grep -qE "DgbCoinPeerManager started: 0 peers" "$LOG"; then
+    echo "::notice::[dgb-smoke] SKIP — DGB coin-network egress blocked (DNS/P2P unreachable). NAMED skip, not a silent green."
+    echo "---- node.log (tail) ----"; tail -40 "$LOG"; exit 0
+  fi
+  if grep -qE "\[DGB\] coin-network peer discovery ARMED" "$LOG"; then
+    armed=1; break
+  fi
+  sleep 3
+done
+if [ "$armed" -ne 1 ]; then
+  echo "::error::coin-network peer discovery did not ARM under --coin-p2p-discover within $(( BOOT_GRACE + ARM_WAIT ))s"
   echo "---- node.log ----"; cat "$LOG"; exit 1
 fi
 echo "[dgb-smoke] coin-network peer discovery ARMED"
