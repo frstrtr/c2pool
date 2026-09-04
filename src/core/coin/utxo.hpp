@@ -43,12 +43,31 @@ static constexpr ChainLimits LTC_LIMITS  = {8'400'000'000'000'000LL, 100, 6};
 /// Reference: dogecoin/src/chainparams.cpp digishieldConsensus.nCoinbaseMaturity
 static constexpr ChainLimits DOGE_LIMITS = {1'000'000'000'000'000'000LL, 240, 0};
 
+/// DGB: 21B DGB max supply * 1e8 sat = 2.1e18 sat, 100-block coinbase maturity
+///      at the current chain tip, no pegout (no MWEB).
+/// Reference: digibyte/src/consensus/consensus.h defines COINBASE_MATURITY = 8
+///   (legacy, early chain) AND COINBASE_MATURITY_2 = 100, selected by height
+///   (DigiByte-Core PR #157). c2pool-dgb only ever validates at the current
+///   tip, which is deep past the transition, so 100 is the operative value.
+///   100 is also the conservative choice for the embedded fee lane: if a coin's
+///   real maturity were lower, using 100 only OVER-rejects a young-coinbase
+///   spend (that tx is excluded from selection, never falsely admitted) — the
+///   same "never overstated" ceiling LTC/BTC/DASH accept. max_money 2.1e18 is
+///   above LTC's 8.4e15 so a legitimately large DGB output is not falsely
+///   rejected by a too-small bound (which LTC_LIMITS, the prior Mempool()
+///   default for DGB, would have done above 84M DGB in one output).
+static constexpr ChainLimits DGB_LIMITS = {2'100'000'000'000'000'000LL, 100, 0};
+
 /// Minimum blocks of undo data to keep for reorg safety + pruning.
 /// Matches the MIN_BLOCKS_TO_KEEP constant in each daemon's validation.h.
 /// Reference: litecoin/src/validation.h  MIN_BLOCKS_TO_KEEP = 288
 /// Reference: dogecoin/src/validation.h  MIN_BLOCKS_TO_KEEP = 1440
 static constexpr uint32_t LTC_MIN_BLOCKS_TO_KEEP  = 288;
 static constexpr uint32_t DOGE_MIN_BLOCKS_TO_KEEP = 1440;
+/// DGB: MIN_BLOCKS_TO_KEEP = 288 (matches digibyte/src/validation.h, same as
+/// Bitcoin Core). DGB's ~15 s block time makes 288 blocks ~72 min of undo
+/// data — ample for the shallow reorgs DGB sees.
+static constexpr uint32_t DGB_MIN_BLOCKS_TO_KEEP  = 288;
 
 /// Minimum UTXO depth before mining can start: coinbase_maturity + reorg_buffer.
 /// LTC: 100 (COINBASE_MATURITY) + 6 (PEGOUT_MATURITY reorg depth) = 106
@@ -56,6 +75,8 @@ static constexpr uint32_t DOGE_MIN_BLOCKS_TO_KEEP = 1440;
 /// Reference: litecoin/src/consensus/consensus.h, dogecoin/src/chainparams.cpp
 static constexpr uint32_t LTC_MINING_GATE_DEPTH  = LTC_LIMITS.coinbase_maturity + LTC_LIMITS.pegout_maturity; // 106
 static constexpr uint32_t DOGE_MINING_GATE_DEPTH = DOGE_LIMITS.coinbase_maturity + 10; // 250
+/// DGB: 100 (COINBASE_MATURITY_2) + 10-block reorg safety buffer = 110.
+static constexpr uint32_t DGB_MINING_GATE_DEPTH  = DGB_LIMITS.coinbase_maturity + 10; // 110
 
 /// Tip age threshold for considering chain synced (seconds).
 /// Both LTC and DOGE use 24 hours (86400s) as DEFAULT_MAX_TIP_AGE.

@@ -187,6 +187,48 @@ public:
         return pruned;
     }
 
+    // ── Re-anchor (wipe) ────────────────────────────────────────────────
+
+    /// Wipe the entire persisted accrual view — every coin ('C'), undo record
+    /// ('U') and retained raw block ('F') — and reset best-block state to zero,
+    /// so accrual restarts fresh from the next connected block. Used when the
+    /// confirmed header tip has advanced past the persisted view by more than
+    /// one block (e.g. after a restart): the stale view cannot legally extend
+    /// by one, so it is dropped and re-anchored rather than latching dead.
+    ///
+    /// Fail-closed: on a scan or commit failure the on-disk view and the cached
+    /// best_* fields are left UNCHANGED and false is returned; the caller must
+    /// then NOT connect the current block (hold the old view).
+    bool reset() {
+        // Snapshot every key under the three data prefixes first (not removing
+        // mid-iteration) so the scan reads a stable view, then batch-remove
+        // them + zero the best-state marker in one atomic commit.
+        std::vector<std::string> keys;
+        auto collect = [&keys](const std::string& key,
+                               const std::vector<uint8_t>&) {
+            keys.push_back(key);
+            return true;
+        };
+        for (char prefix : {'C', 'U', 'F'}) {
+            if (!m_store.for_each_prefix(std::string(1, prefix), collect))
+                return false;  // scan failure -> fail-closed, view untouched.
+        }
+        auto batch = m_store.create_batch();
+        for (const auto& k : keys)
+            batch.remove(k);
+        // Reset best-block state to genesis-of-accrual (null hash, height 0).
+        {
+            std::vector<uint8_t> state_data(36, 0);
+            batch.put(make_state_key(), state_data);
+        }
+        if (!batch.commit())
+            return false;  // commit failure -> fail-closed, cached fields intact.
+        m_best_block = uint256();
+        m_best_height = 0;
+        m_oldest_block_height = 0;
+        return true;
+    }
+
 private:
     LevelDBStore m_store;
     uint256  m_best_block;

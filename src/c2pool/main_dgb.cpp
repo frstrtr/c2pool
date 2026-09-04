@@ -43,6 +43,12 @@
 #include <impl/dgb/coin/coin_node.hpp>
 #include <impl/dgb/coin/embedded_coin_node.hpp>
 #include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
+#include <impl/dgb/coin/good_citizen_defaults.hpp> // resolve_tx_serve_posture (S1 fee-proof lane arm)
+#include <impl/dgb/coin/header_sample_build.hpp>   // make_header_sample (full_block anchoring SSOT)
+#include <impl/dgb/coin/utxo_accrual.hpp>          // classify_full_block_accrual (restart-liveness re-anchor)
+#include <core/coin/utxo.hpp>                      // core::coin::DGB_LIMITS / DGB_MIN_BLOCKS_TO_KEEP
+#include <core/coin/utxo_view_db.hpp>              // core::coin::UTXOViewDB (embedded UTXO persistence)
+#include <core/coin/utxo_view_cache.hpp>           // core::coin::UTXOViewCache (spent-aware fee view)
 #include <impl/dgb/coin/won_block_dispatch.hpp>
 #include <impl/dgb/coin/reconstruct_closure.hpp>  // make_reconstruct_closure_from_template (#280)
 #include <impl/dgb/coin/template_capture.hpp>      // TemplateCapture per-job retain (#300/#271)
@@ -150,7 +156,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--node-owner-address ADDR]\n"
-        << "       [--sharechain-port P]\n"
+        << "       [--sharechain-port P] [--embedded-serve-mempool-txs[=true|false]]\n"
         << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n"
         << "       [--coin-p2p-discover]\n\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
@@ -232,7 +238,13 @@ int run_node(const core::CoinParams& params, bool testnet,
              const std::vector<std::string>& merged_chain_specs = {},
              const std::string& doge_p2p_address = "",
              int doge_p2p_port = 0,
-             bool embedded_doge = false)
+             bool embedded_doge = false,
+             // Embedded UTXO fee-proof lane (S1). serve_mempool_txs = the
+             // positive --embedded-serve-mempool-txs; serve_mempool_txs_off = the
+             // explicit --embedded-serve-mempool-txs=false opt-out. Both false =
+             // operator said nothing (resolver applies the posture default).
+             bool serve_mempool_txs = false,
+             bool serve_mempool_txs_off = false)
 {
     io::io_context ioc;
 
@@ -353,7 +365,64 @@ int run_node(const core::CoinParams& params, bool testnet,
     // embedded port; header_chain is likewise still unfed), so nothing calls
     // add_tx and the pool stays empty until that node lands. The selection
     // below is therefore byte-identical to the subsidy-only #237 baseline today.
-    dgb::coin::Mempool       mempool;
+    //
+    // Constructed with core::coin::DGB_LIMITS (21B*1e8 MoneyRange, 100-block
+    // coinbase maturity) rather than the prior LTC_LIMITS default so the
+    // embedded fee-proof lane below prices DGB txs against DGB's own money
+    // range (LTC's 8.4e15 bound would falsely reject a >84M-DGB output).
+    dgb::coin::Mempool       mempool(core::coin::DGB_LIMITS);
+
+    // ── Embedded UTXO fee-proof lane (S1, --embedded-serve-mempool-txs) ───────
+    // GOOD-CITIZEN: a daemonless DGB node's served template is built ONLY by the
+    // embedded builder (the DGB RPC arm supplies just previousblockhash+bits, no
+    // transactions[]). Without a UTXO view every relayed tx stays fee_known=false
+    // (mempool.hpp compute_fee_locked returns false with no view), so
+    // make_mempool_tx_source selects nothing and the template is coinbase-only.
+    // This lane opens a spent-aware UTXO view and fee-proves each relayed tx
+    // against it (mirror BTC main_btc.cpp / LTC main_ltc.cpp), so the embedded
+    // template becomes FEE-BEARING. Selection admits ONLY fee_known txs (never
+    // overstated). REWARD SAFETY: this lane only makes fees COMPUTABLE for the
+    // advisory GBT template — it does NOT touch the connection coinbase
+    // (subsidy-only) or the won-block merkle (coinbase-only, fail-closed via
+    // won_block_serialize when the job carries no merkle branches). Committing
+    // the selected set into the actually-mined stratum job (merkle branches +
+    // BIP141 witness commitment + fee-fold into the coinbase) is the S2
+    // follow-on; until it lands a won block is coinbase-only + subsidy-only by
+    // construction regardless of this lane. S1 GOOD-CITIZEN DEFAULT: the
+    // fee-proof lane (embedded_utxo) defaults ON so the advisory template is
+    // fee-bearing by default; --embedded-serve-mempool-txs=false opts out. The
+    // S2 job-commit lever stays default OFF (inert until S2 wires the merkle).
+    const dgb::coin::TxServePosture tx_serve_posture =
+        dgb::coin::resolve_tx_serve_posture(
+            dgb::coin::TxServeLevers{
+                /*embedded_utxo    =*/{serve_mempool_txs, serve_mempool_txs_off},
+                /*serve_mempool_txs=*/{serve_mempool_txs, serve_mempool_txs_off}},
+            /*embedded_utxo_default_on=*/true,       // S1 good-citizen: serve fee-paying mempool
+            /*serve_mempool_txs_default_on=*/false); // S2 job-commit stays opt-out until wired
+
+    std::unique_ptr<core::coin::UTXOViewDB>    dgb_utxo_db;
+    std::unique_ptr<core::coin::UTXOViewCache> dgb_utxo_cache;
+    if (tx_serve_posture.arm_embedded_utxo) {
+        const std::string utxo_db_path = (net_dir / "utxo_view_db").string();
+        dgb_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_db_path);
+        if (!dgb_utxo_db->open()) {
+            std::cout << "[DGB] WARNING: UTXOViewDB open failed at " << utxo_db_path
+                      << " — embedded fee-proof lane DISABLED (coinbase-only "
+                         "templates), running without UTXO persistence" << std::endl;
+            dgb_utxo_db.reset();
+        } else {
+            dgb_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(dgb_utxo_db.get());
+            mempool.set_utxo(dgb_utxo_cache.get());
+            std::cout << "[DGB] embedded UTXO fee-proof lane ARMED "
+                         "(--embedded-serve-mempool-txs): db=" << utxo_db_path
+                      << " best_height=" << dgb_utxo_cache->get_best_height()
+                      << std::endl;
+        }
+    }
+    // Non-owning view pointer shared by the tx-ingest connector and the
+    // full_block connect pipeline below; nullptr when the lane is disarmed
+    // (byte-identical to the pre-lane coinbase-only baseline).
+    core::coin::UTXOViewCache* const dgb_utxo_ptr = dgb_utxo_cache.get();
 
 #ifdef AUX_DOGE
     // ══════════════════════════════════════════════════════════════════════
@@ -923,9 +992,113 @@ int run_node(const core::CoinParams& params, bool testnet,
     // directed (2026-06-20).
     dgb::interfaces::Node coin_iface;
     auto header_ingest_sub  = c2pool::dgb::wire_header_ingest(coin_iface, header_chain);
-    auto mempool_ingest_sub = c2pool::dgb::wire_mempool_ingest(coin_iface, mempool);
+    // Pass the fee-proof UTXO view (nullptr when the lane is disarmed) so a
+    // relayed tx is fee-proved at ingest against the SAME view selection uses.
+    auto mempool_ingest_sub = c2pool::dgb::wire_mempool_ingest(coin_iface, mempool, dgb_utxo_ptr);
     std::cout << "[DGB] embedded coin-daemon ingest surface up — header+tx "
                  "feeds wired (NodeP2P producer standup next)" << std::endl;
+
+    // ── full_block -> UTXO connect + mempool maintenance (S1 fee-proof lane) ──
+    // Armed only when the UTXO lane is (dgb_utxo_ptr != nullptr). NodeP2P already
+    // auto-requests MSG_WITNESS_BLOCK on short header announcements, so witness
+    // data arrives intact for connect_block. DGB's HeaderChain is a rolling
+    // window with NO hash->height map and NO tip-changed/reorg hook, so we cannot
+    // look a block's height up the way BTC/LTC do. Instead we FAIL-CLOSED ACCRUE:
+    // connect a block ONLY when it is the confirmed header-chain tip (its
+    // sha256d id == header_chain.tip_hash(), giving a REAL absolute DGB height)
+    // AND it extends our own view by exactly one (height == best_height+1). Any
+    // block that does not — a gap, a reorg, or the first block before the header
+    // tip is identified — is DROPPED: the view simply stops accruing and every
+    // unproven tx stays fee_known=false (coinbase-only), never a wrong fee. This
+    // is the #145 partial-UTXO ceiling (coverage grows with uptime, never
+    // overstated). Full last-288 / genesis bootstrap of the UTXO set is a
+    // follow-on; accrual-only is the safe v1.
+    std::shared_ptr<EventDisposable> full_block_ingest_sub;
+    if (dgb_utxo_ptr) {
+        full_block_ingest_sub = coin_iface.full_block.subscribe(
+            [&header_chain, &mempool, &dgb_utxo_db, dgb_utxo_ptr]
+            (const dgb::coin::BlockType& block)
+            {
+                auto tip_h  = header_chain.tip_height();
+                auto tip_id = header_chain.tip_hash();
+                if (!tip_h || !tip_id)
+                    return;  // header tip not identified yet -> cannot anchor.
+
+                // Identify this block by its header id via the ingest SSOT
+                // (make_header_sample: block_hash = sha256d(80-byte header), the
+                // SAME u256 tip_hash() carries), so no manual hash conversion.
+                const c2pool::dgb::HeaderSample s = c2pool::dgb::make_header_sample(
+                    static_cast<const dgb::coin::BlockHeaderType&>(block));
+                if (!(s.block_hash == *tip_id))
+                    return;  // not the confirmed header tip -> fail-closed drop.
+
+                const uint32_t height  = *tip_h;
+                const uint32_t best_h  = dgb_utxo_ptr->get_best_height();
+                // Classify the confirmed-tip block against the persisted view
+                // (pure SSOT, utxo_accrual.hpp). RESTART-LIVENESS: best_h is read
+                // back from the view's LevelDB, so after a restart the header
+                // tip is many blocks past best_h+1 -- the pre-fix handler
+                // returned on that forward gap forever and the fee-proof lane
+                // was silently DEAD for the rest of the process. Re-anchor
+                // instead so accrual resumes.
+                switch (dgb::coin::classify_full_block_accrual(best_h, height)) {
+                    case dgb::coin::FullBlockAccrualAction::Connect:
+                        break;  // first anchor or normal +1 extend -> connect.
+                    case dgb::coin::FullBlockAccrualAction::Drop:
+                        return; // reorg / height <= view -> fail-closed hold.
+                    case dgb::coin::FullBlockAccrualAction::ReAnchorThenConnect:
+                        // Forward tip-gap (e.g. restart): wipe the stale view
+                        // (coins from before the gap may have been spent
+                        // on-chain during it -- keeping them could fee-prove an
+                        // already-spent output) and resume accrual with THIS
+                        // block as a fresh anchor. Coverage regrows with uptime
+                        // (accrual-only #145 partial-UTXO model), never
+                        // overstated. Fail-closed if the wipe fails: hold the
+                        // old view, drop this block.
+                        if (!dgb_utxo_ptr->reanchor()) {
+                            LOG_WARNING << "[EMB-DGB] full_block re-anchor FAILED at h="
+                                        << height << " (tip gap, stale best_h=" << best_h
+                                        << ") -- view held, fee-proof lane fail-closed.";
+                            return;
+                        }
+                        LOG_INFO << "[EMB-DGB] full_block re-anchored fee-proof view: tip h="
+                                 << height << " ran past stale best_h=" << best_h
+                                 << " (>1 gap, e.g. restart) -- accrual resumes here.";
+                        break;  // best_height now 0; connect this block as anchor.
+                }
+
+                // DGB txid = sha256d over the non-witness serialization (block
+                // id and prevout keys both use sha256d(no-witness)).
+                auto dgb_txid = [](const dgb::coin::MutableTransaction& tx) {
+                    auto packed = pack(dgb::coin::TX_NO_WITNESS(tx));
+                    return Hash(packed.get_span());
+                };
+
+                try {
+                    auto undo = dgb_utxo_ptr->connect_block(block, height, dgb_txid);
+                    dgb_utxo_db->put_block_undo(height, undo);
+                    // flush anchors best_block/best_height to this block's id.
+                    auto packed_hdr = pack(
+                        static_cast<const dgb::coin::BlockHeaderType&>(block));
+                    dgb_utxo_ptr->flush(Hash(packed_hdr.get_span()), height);
+                    dgb_utxo_ptr->prune_undo(height, core::coin::DGB_MIN_BLOCKS_TO_KEEP);
+
+                    // Post-tip mempool maintenance (mirror BTC/LTC): drop mined
+                    // txs, then price newly-provable txs and evict inputs the
+                    // block spent out from under us.
+                    mempool.set_tip_height(height);
+                    mempool.remove_for_block(block);
+                    mempool.recompute_unknown_fees(dgb_utxo_ptr);
+                    mempool.revalidate_inputs(dgb_utxo_ptr);
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[EMB-DGB] full_block UTXO connect failed h="
+                                << height << ": " << e.what()
+                                << " — view held, fee-proof lane fail-closed.";
+                }
+            });
+        std::cout << "[DGB] embedded full_block UTXO connect pipeline ARMED "
+                     "(fee-proof accrual)" << std::endl;
+    }
 
     // ── Embedded coin-daemon P2P PRODUCER standup (Phase B) ───────────────
     //
@@ -2437,6 +2610,8 @@ int main(int argc, char** argv)
     // taproot (a real consensus floor; operator-gated, not relaxed here).
     bool dev_relax_algo_softforks = false;  // --dev-relax-algo-softforks (dev boot aid)
     bool coin_p2p_discover = false;         // --coin-p2p-discover: DGB-isolated scored/diverse coin-network peer discovery (network-standalone arm; independent of local digibyted)
+    bool serve_mempool_txs = false;         // --embedded-serve-mempool-txs: arm the embedded UTXO fee-proof lane (S1)
+    bool serve_mempool_txs_off = false;     // --embedded-serve-mempool-txs=false: explicit opt-out
     // ── DGB-as-DOGE-parent embedded merged-mining arm (--merged DOGE) [SLICE 2] ──
     // --merged SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]] stands up an
     // embedded DOGE aux backend DAEMONLESS (DOGE chain_id=98, P2P port 22556). The
@@ -2547,6 +2722,15 @@ int main(int argc, char** argv)
             doge_p2p_port = std::stoi(argv[++i]);
         }
         else if (std::strcmp(argv[i], "--embedded-doge") == 0) embedded_doge = true;
+        // --embedded-serve-mempool-txs[=true|false]: arm / opt out of the
+        // embedded UTXO fee-proof lane (S1). Bare flag or =true arms it; =false
+        // is the explicit opt-out. Mirrors the DASH parse pattern.
+        else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
+            serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs=true") == 0)
+            serve_mempool_txs = true;
+        else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs=false") == 0)
+            serve_mempool_txs_off = true;
         else {
             std::cerr << "unknown argument: " << argv[i] << "\n";
             return 1;
@@ -2598,6 +2782,18 @@ int main(int argc, char** argv)
         if (rc.file_set("sharechain.no_p2p_relay") && rc.get_string("sharechain.no_p2p_relay").value_or("") == "true") no_p2p_relay = true;
         if (rc.file_set("money.redistribute"))       redistribute_spec  = rc.get_string("money.redistribute").value_or(redistribute_spec);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        // embedded.serve_mempool_txs (S1 fee-proof lane): a [dgb] settings-file
+        // key arms / opts out of the lane exactly like the --embedded-serve-
+        // mempool-txs CLI flag. CLI (L2) wins over the file (L1): consult the
+        // file only when neither CLI spelling was given.
+        if (!serve_mempool_txs && !serve_mempool_txs_off
+                && rc.file_set("embedded.serve_mempool_txs")) {
+            switch (rc.get_tri("embedded.serve_mempool_txs")) {
+                case cs::TriBool::True:  serve_mempool_txs     = true; break;
+                case cs::TriBool::False: serve_mempool_txs_off = true; break;
+                case cs::TriBool::Unset: break;
+            }
+        }
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
@@ -2617,7 +2813,8 @@ int main(int argc, char** argv)
                         coin_p2p_discover,
                         http_addr, http_port,
                         merged_chain_specs, doge_p2p_address, doge_p2p_port,
-                        embedded_doge);
+                        embedded_doge,
+                        serve_mempool_txs, serve_mempool_txs_off);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
