@@ -119,6 +119,53 @@ struct SubmitResult {
     bool applied() const { return status == SubmitStatus::Applied; }
 };
 
+// ── OI-W4-1: the append-only, incarnation-scoped identity view ────────────
+// LaneSnapshot::payout is keyed by node-local MinerId; the consensus bytes a
+// settlement fold must emit (split tie-break, K_fair key, coinbase output
+// script) need the CANONICAL identity — MinerIntern::key (the 32-byte name,
+// S-3) and the payout ScriptRef. Those live only in the executor-private
+// MinerIntern, whose accessors are non-const and whose returned refs point
+// into live state. This view publishes, ALONGSIDE each snapshot, a VALUE COPY
+// of that mapping for exactly the miners pushed into this lane during its
+// current incarnation. It is:
+//   • append-only — it grows as new identities are interned into the lane; an
+//     already-published view is never mutated (a fresh value is published on
+//     growth, older ones stay frozen — O1.1, the same discipline as the
+//     snapshot; a version that added no identity shares the prior view value);
+//   • incarnation-scoped — RemoveLane erases the lane cell (and this map), so a
+//     re-added lane starts with an EMPTY view under a new incarnation and a
+//     stale MinerId cannot resolve against a fresh lane (the F2 ABA, applied to
+//     identity resolution);
+//   • digest-consistent — the `key` bytes are exactly the MinerIntern::key
+//     values Roundabout::lane_digest folds, so any settlement byte derived from
+//     this view agrees with the committed digest.
+// O1: the view is a value carried by shared_ptr<const>; no reference into the
+// live MinerIntern escapes, and it is a superset of `payout`'s keys (an evicted
+// miner stays resolvable, so a past-version read via the ring still resolves).
+struct IdentityEntry {
+    bytes32   key{};   // canonical identity (MinerIntern::key) — consensus name
+    ScriptRef pay{};   // payout ScriptRef (MinerIntern::pay_ref) — value copy
+};
+
+class IdentityView {
+public:
+    // Resolve one node-local MinerId to its canonical identity; nullptr if the
+    // id was never pushed into this lane during this incarnation.
+    const IdentityEntry* find(MinerId id) const {
+        auto it = m_map.find(id);
+        return it == m_map.end() ? nullptr : &it->second;
+    }
+    bool contains(MinerId id) const { return m_map.find(id) != m_map.end(); }
+    std::size_t size() const { return m_map.size(); }
+    // Read-only enumeration (K_fair identity walk; tests). The published
+    // pointer is shared_ptr<const>, so callers cannot mutate the map.
+    const std::map<MinerId, IdentityEntry>& entries() const { return m_map; }
+
+private:
+    friend class LaneExecutor;   // the SOLE writer — appends on the executor thread
+    std::map<MinerId, IdentityEntry> m_map;
+};
+
 // ── the published view (O1.1: immutable; O2.1: versioned) ─────────────────
 // Every field is a VALUE COPY cut at publication. Nothing here aliases live
 // lane state; mutating the lane after publication cannot change a snapshot.
@@ -145,6 +192,12 @@ struct LaneSnapshot {
                                      // Keys are node-local intern ids —
                                      // display/local reads only; the
                                      // consensus quantity is `digest`.
+    // OI-W4-1: canonical identity resolver for this snapshot's payout keys —
+    // append-only, incarnation-scoped, published immutably ALONGSIDE the
+    // snapshot (never a reference into the live MinerIntern). Every MinerId in
+    // `payout` is resolvable here; the map is a superset (evicted miners stay).
+    // Never null once published: an empty lane carries an empty view.
+    std::shared_ptr<const IdentityView> identities;
     bytes32 digest{};            // canonical lane digest (MinerIntern::key
                                  // resolver — the consensus commitment)
 
@@ -207,6 +260,16 @@ public:
                         version(r.chain)};
             MinerId id = m_rb.push(r.chain, r.desc, r.w_raw, r.flags);
             auto& cell = m_cells[r.chain];
+            // OI-W4-1: extend this lane+incarnation's identity view. Done here
+            // (the non-const writer, with the just-interned id in hand) because
+            // MinerIntern's key()/pay_ref() are non-const-reachable only from
+            // the writer; the value is copied out, so no live ref is retained.
+            if (cell.ids_working.find(id) == cell.ids_working.end()) {
+                cell.ids_working.emplace(
+                    id, IdentityEntry{m_rb.miners().key(id),
+                                      m_rb.miners().pay_ref(id)});
+                cell.identity_dirty = true;   // republish the frozen view
+            }
             ++cell.version;
             ++m_ops;
             return {SubmitStatus::Applied, id, cell.version};
@@ -254,8 +317,17 @@ public:
         auto& cell = m_cells[chain];
         if (cell.published && cell.published->version == cell.version)
             return cell.published;
+        // OI-W4-1: materialize a frozen identity view only when a new identity
+        // has appeared since the last publication (append-only). Unchanged
+        // versions reuse the prior value, so the pointer is shared across them.
+        if (cell.identity_dirty || !cell.published_ids) {
+            auto v = std::make_shared<IdentityView>();
+            v->m_map = cell.ids_working;   // value copy: freezes this version
+            cell.published_ids = std::move(v);
+            cell.identity_dirty = false;
+        }
         cell.published = build_snapshot(chain, *l, cell.version,
-                                        cell.incarnation);
+                                        cell.incarnation, cell.published_ids);
         return cell.published;
     }
 
@@ -273,6 +345,15 @@ private:
         std::uint64_t version = 0;
         std::uint64_t incarnation = 0;   // F2: current incarnation of this lane
         std::shared_ptr<const LaneSnapshot> published;
+        // OI-W4-1: the working (mutable) identity map for THIS lane's current
+        // incarnation, appended on each Push; and the last frozen value
+        // published from it. Both are erased with the cell on RemoveLane, so a
+        // re-added lane restarts empty (incarnation-scoped). identity_dirty
+        // starts true so the first publication always materializes a view
+        // (an empty one for a fresh lane with no pushes yet).
+        std::map<MinerId, IdentityEntry> ids_working;
+        std::shared_ptr<const IdentityView> published_ids;
+        bool identity_dirty = true;
     };
 
     // The ONLY place the Lane accessors' const references into live state
@@ -280,7 +361,8 @@ private:
     // immutable snapshot at publication). Everything is copied by value.
     std::shared_ptr<const LaneSnapshot> build_snapshot(
         ChainId chain, const Lane& l, std::uint64_t v,
-        std::uint64_t incarnation) const {
+        std::uint64_t incarnation,
+        std::shared_ptr<const IdentityView> identities) const {
         auto s = std::make_shared<LaneSnapshot>();
         s->version = v;
         s->incarnation = incarnation;   // F2: carry the executor-minted id
@@ -293,6 +375,7 @@ private:
         s->decayed_total = l.decayed_total();
         s->raw_total = l.raw_total();
         s->payout = l.payout_map();
+        s->identities = std::move(identities);  // OI-W4-1: carried alongside
         s->digest = m_rb.lane_digest(chain);
         s->bands.reserve(l.l0().size() + 16);
         for (const auto& slot : l.l0())
@@ -340,5 +423,16 @@ static_assert(!std::is_copy_constructible_v<LaneExecutor> &&
                   !std::is_move_constructible_v<LaneExecutor> &&
                   !std::is_move_assignable_v<LaneExecutor>,
               "O1.5: exactly one writer — the executor cannot be duplicated");
+// OI-W4-1: the identity view is published immutably (a shared-const value on
+// the snapshot), and its accessor hands out const — never a live MinerIntern
+// reference. O1: no reference into live lane state escapes this surface.
+static_assert(std::is_same_v<
+                  decltype(std::declval<const LaneSnapshot&>().identities),
+                  std::shared_ptr<const IdentityView>>,
+              "OI-W4-1: identity view is published as a shared immutable value");
+static_assert(std::is_same_v<decltype(std::declval<const IdentityView&>().find(
+                                 std::declval<MinerId>())),
+                             const IdentityEntry*>,
+              "OI-W4-1: the identity view resolves to const, never a live ref");
 
 } // namespace v37

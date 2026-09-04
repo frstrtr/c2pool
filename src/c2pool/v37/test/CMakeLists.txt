@@ -36,4 +36,18 @@ if (BUILD_TESTING)
     target_include_directories(v37_w2_ingestion_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w2_ingestion_test Threads::Threads)
     add_test(NAME v37_w2_ingestion_test COMMAND v37_w2_ingestion_test)
+
+    # Track A2 / W4 prerequisites — the OI-W4-1 identity view + OI-W4-3
+    # read-at-version ring on the V37Engine/executor snapshot surface
+    # (src/sharechain/v37/v37_lane_executor.hpp + src/c2pool/v37/v37_engine.hpp).
+    # Same stdlib-only shape as the scaffold/W2 suites. HOLLOW-GREEN GUARD (the
+    # same two-part mitigation as above): this target is ALSO listed in the
+    # build.yml --target lists (BOTH the Linux x86_64 leg and the ASan+UBSan
+    # leg) so CI actually compiles + runs it, not just registers it as a
+    # NOT_BUILT CTest sentinel (the DGB #137 / #769 / PR #1467 / #1477 class).
+    add_executable(v37_w4_prereq_test v37_w4_prereq_test.cpp)
+    target_compile_features(v37_w4_prereq_test PRIVATE cxx_std_20)
+    target_include_directories(v37_w4_prereq_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_w4_prereq_test Threads::Threads)
+    add_test(NAME v37_w4_prereq_test COMMAND v37_w4_prereq_test)
 endif()
