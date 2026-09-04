@@ -1,0 +1,11 @@
+{
+  "credited_total": 64,
+  "dust_emitted_round": 2,
+  "max_coinbase_outputs": 3,
+  "paid_total": 58,
+  "residual_owed": 6,
+  "row": "P3-5",
+  "slot_budget": 3,
+  "stamp": "8e5d9f6dd6b4f1226e861cca4c289ae3abf381b8fa520890cd34ed12129982ea",
+  "value_conserved": true
+}

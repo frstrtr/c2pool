@@ -1,0 +1,152 @@
+{
+  "G_A_anchors": {
+    "InvD_0": "4611686018427387904",
+    "InvD_E": "17167292113050709038",
+    "decay_0": "4611686018427387904",
+    "decay_E": "1238846976710486712",
+    "decay_halflife": "2305843009213693952",
+    "two_pow_frac_minus_1": "2305843009213693952"
+  },
+  "G_A_canonical_invariants": {
+    "C1_InvD0_is_ONE": true,
+    "C1_decay0_is_ONE": true,
+    "C2_decay_halflife_exact_half": true,
+    "C3_exact_floor_property_sampled": true,
+    "C3_sample_size": "22",
+    "C4_InvD_strictly_increasing": true,
+    "C4_decay_strictly_decreasing": true,
+    "C5_reciprocal_max_abs_err": "17347799265565230262",
+    "C5_reciprocal_within_2^(frac+2)": true,
+    "C6_geometry_independent": true
+  },
+  "G_A_sampled_entries": {
+    "0": {
+      "InvD": "4611686018427387904",
+      "decay": "4611686018427387904"
+    },
+    "1": {
+      "InvD": "4613166152737261408",
+      "decay": "4610206359018591605"
+    },
+    "1024": {
+      "InvD": "6405753869923371004",
+      "decay": "3320085092937401410"
+    },
+    "1536": {
+      "InvD": "7549627184877507681",
+      "decay": "2817046115225320291"
+    },
+    "2048": {
+      "InvD": "8897761573115719489",
+      "decay": "2390224525325349308"
+    },
+    "2159": {
+      "InvD": "9220412718037183210",
+      "decay": "2306583076368630704"
+    },
+    "2160": {
+      "InvD": "9223372036854775808",
+      "decay": "2305843009213693952"
+    },
+    "2161": {
+      "InvD": "9226332305474522817",
+      "decay": "2305103179509295802"
+    },
+    "2560": {
+      "InvD": "10486631865822292924",
+      "decay": "2028072331009684436"
+    },
+    "3072": {
+      "InvD": "12359226192523347493",
+      "decay": "1720791221170821516"
+    },
+    "3584": {
+      "InvD": "14566209058581982588",
+      "decay": "1460067464844490914"
+    },
+    "4095": {
+      "InvD": "17161783987563169425",
+      "decay": "1239244588323156202"
+    },
+    "4096": {
+      "InvD": "17167292113050709038",
+      "decay": "1238846976710486712"
+    },
+    "512": {
+      "InvD": "5435193240300913396",
+      "decay": "3912951571779110179"
+    }
+  },
+  "G_B_drift_vs_v0_per_step_table": {
+    "InvD_argmax_index": 4096,
+    "InvD_max_abs_ulp": "2244",
+    "decay_argmax_index": 4074,
+    "decay_max_abs_ulp": "162",
+    "note": "v0 iterated-multiply table biases ~O(index) ULPs; canonical base is per-entry exact, so this drift is the error the canonical base removes"
+  },
+  "G_C_accumulator_on_canonical_base": {
+    "P1_determinism_bitidentical": true,
+    "P2_oq2_rebuild_matches_acc": true,
+    "boundaries_checked": 3
+  },
+  "G_C_sampled_decayed_payouts": {
+    "0": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 118,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    },
+    "12288": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 516,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    },
+    "14335": {
+      "0": 84857,
+      "1": 102562,
+      "2": 87056,
+      "3": 91790,
+      "4": 98827,
+      "5": 99275,
+      "6": 83805,
+      "7": 90936
+    },
+    "4096": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 1,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    },
+    "8192": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 275,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    }
+  },
+  "construction": "decay[d]=floor((2^(frac*hl - d))^(1/hl)); InvD[j]=floor((2^(frac*hl + j))^(1/hl)) -- exact per-entry hl-th root",
+  "geometry": {
+    "E": 4096,
+    "ONE_q62": "4611686018427387904",
+    "frac_bits": 62,
+    "half_life": 2160
+  },
+  "spec": "c2pool-v37-mrr-roundabout-buffer.md sec.8.2 (canonical decay-table base)"
+}

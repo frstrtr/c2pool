@@ -1,0 +1,19 @@
+{
+  "double_pay": false,
+  "miners": 5,
+  "paid_A": [
+    "m0",
+    "m1",
+    "m2"
+  ],
+  "paid_B": [
+    "m3",
+    "m4"
+  ],
+  "residual_owed": 0,
+  "row": "P3-15",
+  "slot_budget": 3,
+  "stale_template_rejected": true,
+  "stamp": "10c2e96272d90e788c94b7ab99bcffd974e87502459d753c85e9a6d99c6f3719",
+  "value_conserved": true
+}

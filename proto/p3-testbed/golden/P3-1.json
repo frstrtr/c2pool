@@ -1,0 +1,28 @@
+{
+  "coinbase_outputs": [
+    [
+      "m1",
+      6,
+      "p2wpkh"
+    ],
+    [
+      "m2",
+      4,
+      "p2wpkh"
+    ],
+    [
+      "m3",
+      5,
+      "p2wpkh"
+    ]
+  ],
+  "coinbase_sha256": "ed636682a9e09bc130181d8bfccad602fe0409613aa521185aef51ba7e04d3bd",
+  "final_owed": {
+    "m1": 6,
+    "m2": 4,
+    "m3": 5
+  },
+  "pot": 0,
+  "row": "P3-1",
+  "stamp": "1ee912e4de39b5f181247f6a2e50297d77c7666f5ca07aa1e62c7f4047a6e475"
+}

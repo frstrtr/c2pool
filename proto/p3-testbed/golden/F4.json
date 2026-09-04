@@ -1,0 +1,10 @@
+{
+  "bounty": 100,
+  "distributed": 99,
+  "miners": 3,
+  "per_miner": 33,
+  "remainder_pot": 1,
+  "row": "F4",
+  "stamp": "f8a48b7ff3ae43c5d7dc10d1553a1ecab1dbc9ea1b816fe3902fecff4476dcb3",
+  "value_conserved": true
+}

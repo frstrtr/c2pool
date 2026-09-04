@@ -1,0 +1,12 @@
+{
+  "converged_ledger": {
+    "_pot": 0,
+    "ma": 0,
+    "mb": 9
+  },
+  "distinct_ledgers": 1,
+  "interleavings": 90,
+  "row": "P3-6",
+  "stamp": "5b2580284329bd654198bca89f37065f0d11b59b85328841a9c9f9bea4403601",
+  "storm_events": 6
+}

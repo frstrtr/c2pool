@@ -1,0 +1,14 @@
+{
+  "admitted": [
+    "s_ok"
+  ],
+  "final_owed": {
+    "ma": 5,
+    "mb": 0
+  },
+  "rejected": [
+    "s_bad"
+  ],
+  "row": "P3-9",
+  "stamp": "a2157ce5c0e6b7fa8ed358013344fc6c31183d2489e2c935aeba8ad3725fca53"
+}

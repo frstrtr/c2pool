@@ -1,0 +1,9 @@
+{
+  "d_f": 6,
+  "halted": true,
+  "out_of_floor_depth": 9,
+  "row": "P3-8",
+  "stamp": "af386104dcb5a7bc4c1f1a31583ce5e34c3a1c0cd2ace8218e5b8dae1720314a",
+  "surfaced_msg": "chain c0: reorg depth 9 > D_f 6",
+  "within_floor_depth_ok": true
+}
