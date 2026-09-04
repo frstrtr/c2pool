@@ -773,6 +773,7 @@ jobs:
                     bch_graph_db_shutdown_persist_test \
                     bch_known_txs_evict_wiring_test \
                     bch_found_block_verify_test \
+                    bch_seed_tier_recovery_gate_test \
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
@@ -928,6 +929,7 @@ jobs:
                     bch_graph_db_shutdown_persist_test \
                     bch_known_txs_evict_wiring_test \
                     bch_found_block_verify_test \
+                    bch_seed_tier_recovery_gate_test \
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
