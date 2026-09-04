@@ -124,6 +124,15 @@ struct SubmitResult {
 // lane state; mutating the lane after publication cannot change a snapshot.
 struct LaneSnapshot {
     std::uint64_t version = 0;   // per-lane, monotonic (O2.1)
+    // F2 (W1 finding, folded in by the W0 consumer): a NODE-monotone lane
+    // incarnation, minted by the executor on every AddLane and never reused
+    // for any ChainId. `version` alone is ABA-unsafe across
+    // RemoveLane(c)->AddLane(c) (version resets to 1), so a cut token keying
+    // only on (chain, version) can confuse a stale snapshot for the fresh
+    // incarnation. The executor is the SOLE minter (X-4); the snapshot merely
+    // CARRIES the value so a reader/cut-token (W4) keys on
+    // (chain, incarnation, version). 0 = never assigned.
+    std::uint64_t incarnation = 0;
     ChainId chain = 0;
     LaneParams params;           // geometry (also digest-committed)
     u64 next_pos = 0;
@@ -183,6 +192,7 @@ public:
             }
             auto& cell = m_cells[r.chain];
             cell.version = 1;
+            cell.incarnation = ++m_next_incarnation;  // F2: sole minter (X-4)
             ++m_ops;
             return {SubmitStatus::Applied, 0, cell.version};
         }
@@ -232,13 +242,20 @@ public:
     // unknown chain. Publication is cached per version — repeated receives
     // between mutations return the same published object; content is a pure
     // function of the committed record prefix either way.
+    //
+    // F1 (W1 finding): this call MUTATES the per-lane cache (m_cells) on a
+    // version miss, so it is EXECUTOR-THREAD-ONLY — it is NOT a reader-safe
+    // API despite returning a shared_ptr. Reader threads MUST consume the
+    // published mailbox (the shell's per-lane atomic snapshot slot, stored by
+    // the executor thread from this call), never call receive() themselves.
     std::shared_ptr<const LaneSnapshot> receive(ChainId chain) {
         const Lane* l = m_rb.lane(chain);
         if (!l) return nullptr;
         auto& cell = m_cells[chain];
         if (cell.published && cell.published->version == cell.version)
             return cell.published;
-        cell.published = build_snapshot(chain, *l, cell.version);
+        cell.published = build_snapshot(chain, *l, cell.version,
+                                        cell.incarnation);
         return cell.published;
     }
 
@@ -254,6 +271,7 @@ public:
 private:
     struct LaneCell {
         std::uint64_t version = 0;
+        std::uint64_t incarnation = 0;   // F2: current incarnation of this lane
         std::shared_ptr<const LaneSnapshot> published;
     };
 
@@ -261,9 +279,11 @@ private:
     // are touched (the F-2 allowance: fold executor, copying into an
     // immutable snapshot at publication). Everything is copied by value.
     std::shared_ptr<const LaneSnapshot> build_snapshot(
-        ChainId chain, const Lane& l, std::uint64_t v) const {
+        ChainId chain, const Lane& l, std::uint64_t v,
+        std::uint64_t incarnation) const {
         auto s = std::make_shared<LaneSnapshot>();
         s->version = v;
+        s->incarnation = incarnation;   // F2: carry the executor-minted id
         s->chain = chain;
         s->params = l.params();
         s->next_pos = l.next_pos();
@@ -286,6 +306,11 @@ private:
     Roundabout m_rb;                     // owned; never escapes
     std::map<ChainId, LaneCell> m_cells;
     std::uint64_t m_ops = 0;
+    // F2: the single node-monotone incarnation source (X-4: exactly one
+    // minter). Bumped on every AddLane, never reset, never reused for any
+    // ChainId across the node's life. A W0 mailbox/shell MUST NOT run its
+    // own counter — it only carries this value out through the snapshot.
+    std::uint64_t m_next_incarnation = 0;
 };
 
 // ── O1.2 surface audit, compile-time where expressible ────────────────────

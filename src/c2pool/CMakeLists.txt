@@ -776,6 +776,37 @@ add_test(NAME dash_asn_diversity_kat COMMAND dash_asn_diversity_kat)
 add_executable(dash_getmnlistd_tracker_kat dash_getmnlistd_tracker_kat.cpp)
 add_test(NAME dash_getmnlistd_tracker_kat COMMAND dash_getmnlistd_tracker_kat)
 
+# ── Track A2 / W0: the v37 node scaffold ─────────────────────────────────────
+# c2pool-v37: the node shell the v37 executor (PR #1467, the O1 single-writer
+# lane executor) plugs into. W0 stands an >= 8-process single-host loopback
+# simnet that meshes and idles EXCHANGING NOTHING (the receipt wire schema is
+# W2/W3). MINIMAL link graph by design (the W0 spec §5.1) and by necessity
+# (memory-pressured CI host): the v37 consensus module is header-only and
+# self-contained, and the W0 loopback mesh uses plain POSIX sockets, so this
+# target links only Threads — NOT core/pool/Boost/coin/payout/storage. The
+# donor coin mains (main_btc.cpp / main_dash.cpp) are left untouched.
+add_executable(c2pool-v37 v37/main_v37.cpp)
+c2pool_wire_version(c2pool-v37)
+target_include_directories(c2pool-v37 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(c2pool-v37 Threads::Threads)
+
+# W0 HAND-WIRES its consumer-side test dir explicitly. Test wiring in this repo
+# is hand-listed add_subdirectory/add_test — there is no file(GLOB) over
+# */test — and the test-floor-guard only floors lanes already present in
+# test-floors.json, so a test dir that is never added is a silent hollow-green.
+# add_subdirectory(v37/test) is NECESSARY but is NOT itself the hollow-green
+# mitigation: a CTest registered here yet absent from build.yml's `cmake --build
+# --target` list is NOT_BUILT under CI and its ctest run silently passes (the DGB
+# #137 / #769 unregistered-KAT class; identical to PR #1467's executor test). The
+# actual mitigation is that v37_scaffold_test is now listed in the build.yml
+# --target lists (BOTH the Linux x86_64 and the ASan+UBSan legs) so CI compiles +
+# runs it, PLUS the drift-guard glob in tools/ci/check_test_target_allowlist.py
+# now covers src/c2pool/**/test/ so any future unlisted add_test here fails the
+# guard at PR time rather than hollow-greening. The linux-lane floor raise for the
+# new v37 scaffold test is deferred to A1's CI-lane PR (a floor is raised only
+# AFTER capturing a green-baseline junit).
+add_subdirectory(v37/test)
+
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)
 # - c2pool_node_legacy.cpp (original c2pool_node.cpp)
