@@ -272,6 +272,49 @@ static void test_headroom_guard() {
     CHECK(ok.tables().inv_decay.size() == def.epoch_len());
 }
 
+// The canonical gate is keyed on (half_life, epoch_len) — the pair the lane
+// digest commits. max_depth is derived caller-side and is NOT committed, so a
+// ratified-geometry request the embedded canonical table cannot serve must be
+// REFUSED; silently downgrading it to the first-order base would put a node on
+// non-golden consensus values while every committed parameter still agreed.
+static void test_canonical_gate() {
+    {   // ratified (2160, 4096), max_depth one past the canonical table:
+        // must throw rather than construct a different decay table.
+        DecayTables t;
+        bool threw = false;
+        try { t.init(2160, 4096, 8192 + 1, 8); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+    {   // exactly at the canonical depth: canonical path, golden d659c801
+        // values — NOT the first-order 4610206121978955086 this used to yield.
+        DecayTables t;
+        t.init(2160, 4096, 8192, 8);
+        CHECK(t.decay.size() == 8193);
+        CHECK(t.decay[1] == 4610206359018591605ULL);
+        CHECK(t.decay[2160] == (Q_ONE >> 1));            // 2^61, exact half-life
+    }
+    {   // genuinely different geometry: generic first-order path, unchanged —
+        // constructs without throwing and does not use the canonical base.
+        DecayTables t;
+        bool threw = false;
+        try { t.init(64, 128, 256, 6); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(!threw);
+        CHECK(t.decay.size() == 257);
+        CHECK(t.decay[1] != 4610206359018591605ULL);
+    }
+    {   // the refusal is scoped to the ratified identity: a different geometry
+        // may still ask for any depth it likes.
+        DecayTables t;
+        bool threw = false;
+        try { t.init(64, 128, 16384, 6); }
+        catch (const std::invalid_argument&) { threw = true; }
+        CHECK(!threw);
+        CHECK(t.decay.size() == 16385);
+    }
+}
+
 static void test_lane_vs_reference(const LaneParams& p, u64 pushes, u64 seed,
                                    const char* tag) {
     Lane lane(p);
@@ -677,6 +720,7 @@ int main() {
     test_sha256();
     test_fixed_point();
     test_headroom_guard();
+    test_canonical_gate();
     // small geometry: 5+ epochs, constant folding + eviction churn
     test_lane_vs_reference(small_params(), 1500, 1234, "small");
     // default OQ-5 geometry: cross two epoch rebuilds (>8192 pushes)

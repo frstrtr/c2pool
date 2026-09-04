@@ -37,6 +37,17 @@ static constexpr unsigned FRAC_BITS = 62;
 static constexpr u64 Q_ONE = u64(1) << FRAC_BITS;            // 1.0 in Q62
 static constexpr u64 LN2_MICRO = 693147;                     // V36 lineage
 
+// Q-scale drift tripwire between this header and the generated canonical
+// table. Both sides are compile-time constants, so this belongs in the build
+// and not in DecayTables::init's runtime gate: as a runtime term it could
+// only ever be true, and were the two to disagree the gate would go
+// permanently false and every node would SILENTLY use the first-order base
+// instead of the ratified golden d659c801. Fail the build instead.
+static_assert(FRAC_BITS == decay_canonical::CANON_FRAC_BITS,
+              "v37: FRAC_BITS must match the Q-scale of the generated "
+              "canonical decay table (v37_decay_canonical.hpp); regenerate "
+              "the table with tools/gen_decay_canonical.py if it changes");
+
 // ── U256: minimal unsigned 256-bit integer (4 x u64 limbs, little-endian) ──
 // Only the operations the consensus path needs; all wrap-free uses are
 // guarded by the Q62 range pinning above.
@@ -150,10 +161,21 @@ struct DecayTables {
         // decay_per / inv_per become the EXACT per-step factors lambda,
         // lambda^-1 (= decay[1], inv_decay[1]) rather than the first-order
         // approximation. epoch_shift is derived from the exact decay[epoch_len].
+        // The ratified geometry is identified by (half_life, epoch_len) alone
+        // — exactly the pair the lane digest commits. max_depth is NOT digest-
+        // committed (it is derived caller-side as epoch_len + c0), so it must
+        // never be allowed to silently divert the ratified geometry off the
+        // golden base: two nodes agreeing on every committed parameter would
+        // then build different decay tables with nothing to attribute the
+        // divergence to. A depth the embedded canonical table cannot serve is
+        // therefore refused, not downgraded to the first-order base.
         namespace dc = decay_canonical;
-        if (half_life == dc::CANON_HALF_LIFE && epoch_len == dc::CANON_EPOCH_LEN
-            && FRAC_BITS == dc::CANON_FRAC_BITS
-            && max_depth <= dc::CANON_MAX_DEPTH) {
+        if (half_life == dc::CANON_HALF_LIFE && epoch_len == dc::CANON_EPOCH_LEN) {
+            if (max_depth > dc::CANON_MAX_DEPTH)
+                throw std::invalid_argument(
+                    "v37: ratified lane geometry (half_life 2160, E 4096) "
+                    "requested with max_depth beyond the canonical table; "
+                    "refusing to fall back to the non-golden first-order base");
             decay_per = dc::DECAY[1];
             inv_per   = dc::INV_DECAY[1];
 
