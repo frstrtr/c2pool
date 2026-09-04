@@ -477,13 +477,16 @@ void print_banner(const char* argv0)
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
-        << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-null-arm] [--embedded-mn-bridge-max N]\n"
+        << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
+        << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
+        << "           [--embedded-accrue-asset-locks[=false]] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs[=false]]\n"
         << "           [--embedded-tx-serve-own-set[=false]]\n"
-        << "             (mempool serving levers default ON when NO dashd arm is given —\n"
-        << "              daemonless nodes serve the FULL mempool; =false opts out)\n"
+        << "             (ALL embedded serving levers default ON when NO dashd arm is given —\n"
+        << "              bare `--run` = daemonless, serves the FULL mempool + special txs (DIP\n"
+        << "              types 1-4) + funded superblocks, reward-safe; =false opts each out)\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
@@ -537,12 +540,14 @@ void print_banner(const char* argv0)
         << "        clean_jobs notify on the fallback arm; absent/unreachable => the 3 s\n"
         << "        getbestblockhash poll is the active path (requires dashd\n"
         << "        zmqpubhashblock=tcp://HOST:PORT). No consensus effect.\n"
-        << "        --embedded-mainnet (DEFAULT OFF) is the single opt-in for the\n"
-        << "        DAEMONLESS embedded template arm on MAINNET. It lifts the arm gate\n"
-        << "        AND arms the coin-state feed that populates it (seed-based peer\n"
-        << "        discovery unless --coin-p2p-connect names peers), so one flag takes\n"
-        << "        the arm end to end. WITHOUT it a mainnet node ALWAYS serves the\n"
-        << "        reward-safe dashd-RPC fallback: --coin-p2p-connect/--coin-p2p-discover\n"
+        << "        --embedded-mainnet drives the DAEMONLESS embedded template arm on\n"
+        << "        MAINNET. It DEFAULTS ON when no dashd arm is requested (bare `--run`\n"
+        << "        = daemonless; good_citizen_defaults.hpp), and is default OFF on a\n"
+        << "        dashd-armed node. It lifts the arm gate AND arms the coin-state feed\n"
+        << "        that populates it (seed-based peer discovery unless --coin-p2p-connect\n"
+        << "        names peers), so one flag takes the arm end to end. With\n"
+        << "        --embedded-mainnet=false a mainnet node serves the reward-safe\n"
+        << "        dashd-RPC fallback: --coin-p2p-connect/--coin-p2p-discover\n"
         << "        are transport only and NEVER move the arm. Even when armed, every\n"
         << "        per-template gate (SML fresh at tip, non-superblock, credit-pool seed\n"
         << "        height, bestCL, MN-payee cursor, DKG plan) fails closed to dashd.\n"
@@ -1103,7 +1108,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // Retention additionally requires --embedded-utxo (the lane that
              // owns that DB); without it getblock stays the honest header-only
              // #99 partial. ZERO consensus/gentx/reward/coinbase/share path.
-             bool explorer_enabled = true)
+             bool explorer_enabled = true,
+             // --embedded-include-mn-special-txs: the special-tx superset (DIP
+             // types 1-4). DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp),
+             // resolved by the good-citizen resolver in main(). Forwarded to
+             // NodeCoinState::set_include_mn_special_txs; the builder DROPS any
+             // special tx the SML fold cannot apply exactly and the emit gate
+             // re-folds and rejects on root drift, so an included special tx
+             // always commits a folded MN root. Default false = today's
+             // exclude-all (coinbase-only body for special txs).
+             bool embedded_include_mn_special_txs = false)
 {
     namespace io = boost::asio;
 
@@ -2725,6 +2739,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // committing this accrual is valid only once the same type-8 txs ride the
     // served body (blocked on #125); otherwise a submitted coinbase-only block
     // is bad-cbtx-assetlocked-amount. Hence OFF by default.
+    // Special-tx superset (DIP types 1-4): wire the seam that
+    // work_source.hpp already forwards to embedded_gbt (include_mn_special_txs).
+    // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): dashd's CreateNewBlock
+    // serves these, so excluding them is a good-citizen gap. Reward-safe — the
+    // builder drops any special tx the SML fold cannot apply exactly and the
+    // emit gate re-folds and rejects on root drift.
+    node_coin_state.set_include_mn_special_txs(embedded_include_mn_special_txs);
+    std::cout << "[run] embedded special-tx superset (DIP types 1-4): "
+              << (embedded_include_mn_special_txs
+                      ? "ON (--embedded-include-mn-special-txs: SML-folded "
+                        "special txs admitted; root re-folded + drift-rejected "
+                        "at emit)"
+                      : "OFF (default off / dashd-armed: special txs excluded, "
+                        "coinbase-only for those types)")
+              << "\n";
     node_coin_state.set_accrue_pending_asset_locks(embedded_accrue_asset_locks);
     std::cout << "[run] embedded #107 asset-lock accrual: "
               << (embedded_accrue_asset_locks
@@ -6928,9 +6957,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             std::cout << "[run] --embedded-mempool-ingest: coin-P2P MSG_TX pull"
                          " ARMED (budget 64 in flight, yields to the tip body)."
                          " The mempool will now FILL from the DASH network.\n"
-                      << "      This does NOT put transactions into served"
-                         " templates: that stays --embedded-serve-mempool-txs"
-                         " (default OFF), gated on the [MEMPOOL-VALIDITY]"
+                      << "      Whether these reach served templates is"
+                         " --embedded-serve-mempool-txs (daemonless default ON,"
+                         " good_citizen_defaults.hpp; dashd-armed default OFF),"
+                         " backed by the [MEMPOOL-VALIDITY]"
                          " testmempoolaccept series -- zero INVALID over "
                       << dash::coin::MempoolValidityGate::kCleanHeightsRequired
                       << " consecutive evidence-bearing DISTINCT heights.\n";
@@ -10738,7 +10768,15 @@ int main(int argc, char** argv)
     std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
     bool coin_p2p_discover = false;            // --coin-p2p-discover: DASH-isolated scored/diverse peer discovery (network-standalone arm; independent of local dashd)
     bool no_p2p_relay = false;                 // --no-p2p-relay: suppress the embedded P2P-relay won-block arm (A/B isolation; RPC backup stays live)
-    bool embedded_mainnet = false;             // --embedded-mainnet: gate-lift, allow the daemonless embedded template arm on MAINNET (byte-parity proven; default OFF = dashd fallback)
+    // --embedded-mainnet: THE embedded-arm gate. DAEMONLESS DEFAULT ON
+    // (good_citizen_defaults.hpp): with no dashd arm requested a bare `--run`
+    // resolves the embedded arm (and coin-P2P discovery) so the node actually
+    // serves; without it resolve_embedded_arm returns DashdFallback/NoOptIn and
+    // a daemonless node serves NOTHING. Byte-parity of the mainnet embedded
+    // template is proven (v0.2.4 gate-lift). dashd-armed posture UNCHANGED
+    // (default OFF = dashd fallback). Explicit opt-out: --embedded-mainnet=false.
+    bool embedded_mainnet = false;
+    bool embedded_mainnet_off = false;         // --embedded-mainnet=false
     std::string coin_p2p_magic = "";           // --coin-p2p-magic HEX: override the embedded CoinClient wire magic (e.g. regtest fcc1b7dc); default mainnet/testnet
     // --coin-p2p-peers N: CONCURRENT embedded coin-P2P peers (default 8, cap 16).
     // EVIDENCE knob, not bandwidth: a DKG final commitment is announced exactly
@@ -10747,11 +10785,27 @@ int main(int argc, char** argv)
     std::size_t coin_p2p_peers =
         dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS;
     bool force_won_block = false;              // --regtest-force-won-block: fail-closed regtest E5 harness (drive one real won block through the run-path dual-path)
-    bool embedded_superblock = false;          // --embedded-superblock: OPT-IN daemonless superblock payee sourcing via govsync (E-SUPERBLOCK); default OFF = superblock heights fall back to dashd (reward-safe)
+    // --embedded-superblock: daemonless superblock payee sourcing via govsync
+    // (E-SUPERBLOCK). DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): a
+    // superblock height served coinbase-only-without-the-trigger-payees is a
+    // good-citizen violation; three fail-closed layers (BLS operator-key vote
+    // verify + EvoNode-4x weight, completeness, desync latch) mean a
+    // non-confident trigger REFUSES exactly as today — never a guessed payee.
+    // Implies the govsync pull at the serve call site. dashd-armed posture
+    // UNCHANGED. Explicit opt-out: --embedded-superblock=false.
+    bool embedded_superblock = false;
+    bool embedded_superblock_off = false;      // --embedded-superblock=false
     bool embedded_govsync = false;             // --embedded-govsync: OBSERVE-ONLY arm of the governance sourcing lane (inv 17/18 pull + store populate); default OFF; does NOT arm serving (that is --embedded-superblock)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
-    bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
+    // --embedded-utxo: the E2b UTXO/fee lane. DAEMONLESS DEFAULT ON
+    // (good_citizen_defaults.hpp): without it no mempool tx ever fee-proves
+    // (fee_fold_proven=false → coinbase-only body), so full-mempool serving is
+    // vacuous. Selection still admits ONLY fee_fold_proven txs against the
+    // spent-aware UTXO view (fees never overstated). dashd-armed posture
+    // UNCHANGED. Explicit opt-out: --embedded-utxo=false.
+    bool embedded_utxo = false;
+    bool embedded_utxo_off = false;            // --embedded-utxo=false
     bool explorer_enabled = true;              // --explorer (default ON) / --no-explorer: loopback-only /api/explorer
     // --embedded-utxo-immature-serve-empty: pure-daemonless OPT-IN. Default
     // OFF refuses every embedded template until the UTXO lane reaches
@@ -10779,8 +10833,31 @@ int main(int argc, char** argv)
     bool embedded_serve_mempool_txs_off = false;  // --embedded-serve-mempool-txs=false
     bool embedded_tx_serve_own_set = false;  // --embedded-tx-serve-own-set; daemonless default ON
     bool embedded_tx_serve_own_set_off = false;   // --embedded-tx-serve-own-set=false
-    bool embedded_accrue_asset_locks = false;  // #107 PHASE 2, default OFF
-    bool embedded_accrue_asset_unlocks = false;  // #143 Variant B (type-9), default OFF
+    // #107 PHASE 2 (--embedded-accrue-asset-locks): type-8 asset-lock accrual.
+    // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): body membership and the
+    // CbTx creditPool accrual are the SAME bit (embedded_gbt.hpp allow_locks ==
+    // accrue), so the served body always matches the committed creditPool.
+    // dashd-armed posture UNCHANGED. Explicit opt-out:
+    // --embedded-accrue-asset-locks=false.
+    bool embedded_accrue_asset_locks = false;
+    bool embedded_accrue_asset_locks_off = false;   // --embedded-accrue-asset-locks=false
+    // #143 Variant B (--embedded-accrue-asset-unlocks): type-9 admission.
+    // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp) — but INERT until the
+    // CreditPool INDEX follower is seeded (work_source.hpp passes nullptr today):
+    // the predicate, not the flag, admits, so this is safe to default ON.
+    // dashd-armed posture UNCHANGED. Explicit opt-out:
+    // --embedded-accrue-asset-unlocks=false.
+    bool embedded_accrue_asset_unlocks = false;
+    bool embedded_accrue_asset_unlocks_off = false; // --embedded-accrue-asset-unlocks=false
+    // --embedded-include-mn-special-txs: the special-tx superset (DIP types
+    // 1-4). DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): dashd's
+    // CreateNewBlock serves these, so excluding them is a good-citizen gap. The
+    // builder DROPS any special tx the SML fold cannot apply exactly and the
+    // emit gate re-folds and rejects on root drift (node_coin_state.hpp), so an
+    // included special tx always commits a folded MN root. dashd-armed posture
+    // UNCHANGED. Explicit opt-out: --embedded-include-mn-special-txs=false.
+    bool embedded_include_mn_special_txs = false;
+    bool embedded_include_mn_special_txs_off = false; // --embedded-include-mn-special-txs=false
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
     // pool AT THE SERVE TIP rather than at the folded body height (PR-5,
     // dashd GetCreditPool(pindexPrev) parity). MONEY PATH -> default OFF: it
@@ -10803,9 +10880,14 @@ int main(int argc, char** argv)
     bool embedded_mempool_ingest = false;
     bool embedded_mempool_ingest_off = false;     // --embedded-mempool-ingest=false
     // --embedded-null-arm (#127): optimistic null commitment at fresh
-    // window-open slots + template upgrade to the real commitment. DEFAULT
-    // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
+    // window-open slots + template upgrade to the real commitment. DAEMONLESS
+    // DEFAULT ON (good_citizen_defaults.hpp): without it a required-not-yet-mined
+    // DKG slot refuses the whole height (qc-plan-underivable) and a daemonless
+    // node has no fallback. Freshness-gated: unproven ⇒ no null ⇒ refuse
+    // (today's benign gap), NEVER a guessed reject. dashd-armed posture
+    // UNCHANGED. Explicit opt-out: --embedded-null-arm=false.
     bool embedded_null_arm = false;
+    bool embedded_null_arm_off = false;        // --embedded-null-arm=false
     bool embedded_asn_diversity = false;   // PR-4 (--embedded-asn-diversity): default OFF
     // --embedded-fold-live PATH (PR-C1): full-history replay UTXO fold store
     // wired as the LIVE serve-path input-pricing view. EMPTY (default) => OFF,
@@ -10923,6 +11005,8 @@ int main(int argc, char** argv)
             no_p2p_relay = true;
         else if (std::strcmp(argv[i], "--embedded-mainnet") == 0)
             embedded_mainnet = true;
+        else if (std::strcmp(argv[i], "--embedded-mainnet=false") == 0)
+            embedded_mainnet_off = true;            // good-citizen opt-out
         else if (std::strcmp(argv[i], "--coin-p2p-magic") == 0 && i + 1 < argc)
             coin_p2p_magic = argv[++i];
         else if (std::strcmp(argv[i], "--coin-p2p-peers") == 0 && i + 1 < argc)
@@ -10931,10 +11015,14 @@ int main(int argc, char** argv)
             force_won_block = true;
         else if (std::strcmp(argv[i], "--embedded-superblock") == 0)
             embedded_superblock = true;
+        else if (std::strcmp(argv[i], "--embedded-superblock=false") == 0)
+            embedded_superblock_off = true;         // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-govsync") == 0)
             embedded_govsync = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if (std::strcmp(argv[i], "--embedded-utxo=false") == 0)
+            embedded_utxo_off = true;               // good-citizen opt-out
         else if (std::strcmp(argv[i], "--explorer") == 0)
             explorer_enabled = true;
         else if (std::strcmp(argv[i], "--no-explorer") == 0)
@@ -10951,8 +11039,16 @@ int main(int argc, char** argv)
             embedded_tx_serve_own_set_off = true;   // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks") == 0)
             embedded_accrue_asset_locks = true;   // #107 PHASE 2
+        else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks=false") == 0)
+            embedded_accrue_asset_locks_off = true;   // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks") == 0)
             embedded_accrue_asset_unlocks = true; // #143 Variant B (type-9)
+        else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks=false") == 0)
+            embedded_accrue_asset_unlocks_off = true; // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs") == 0)
+            embedded_include_mn_special_txs = true;   // special-tx superset (DIP types 1-4)
+        else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs=false") == 0)
+            embedded_include_mn_special_txs_off = true; // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest=false") == 0)
@@ -10960,7 +11056,7 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--embedded-null-arm") == 0)
             embedded_null_arm = true;   // #127
         else if (std::strcmp(argv[i], "--embedded-null-arm=false") == 0)
-            embedded_null_arm = false;  // #127: explicit OFF (OFF-equivalence)
+            embedded_null_arm_off = true;  // #127: good-citizen opt-out (daemonless default ON)
         // PR-2 FRESH-DATUM RACE (dashd-cut coin-P2P). Race the SINGLE freshest
         // object (the fold snapshot's getmnlistd today) to K distinct-netgroup
         // CanServeBlocks carriers and fold the first valid self-checked reply,
@@ -11419,15 +11515,32 @@ int main(int argc, char** argv)
                         {embedded_tx_serve_own_set,  embedded_tx_serve_own_set_off},
                         {embedded_mempool_ingest,    embedded_mempool_ingest_off},
                         {embedded_ingest_isdlock,    embedded_ingest_isdlock_off},
-                        {embedded_ingest_dstx,       embedded_ingest_dstx_off}});
+                        {embedded_ingest_dstx,       embedded_ingest_dstx_off},
+                        {embedded_mainnet,           embedded_mainnet_off},
+                        {embedded_utxo,              embedded_utxo_off},
+                        {embedded_null_arm,          embedded_null_arm_off},
+                        {embedded_superblock,        embedded_superblock_off},
+                        {embedded_include_mn_special_txs,
+                                                     embedded_include_mn_special_txs_off},
+                        {embedded_accrue_asset_locks,
+                                                     embedded_accrue_asset_locks_off},
+                        {embedded_accrue_asset_unlocks,
+                                                     embedded_accrue_asset_unlocks_off}});
             embedded_serve_mempool_txs = txr.serve_mempool_txs;
             embedded_tx_serve_own_set  = txr.tx_serve_own_set;
             embedded_mempool_ingest    = txr.mempool_ingest;
             embedded_ingest_isdlock    = txr.ingest_isdlock;
             embedded_ingest_dstx       = txr.ingest_dstx;
+            embedded_mainnet           = txr.embedded_mainnet;
+            embedded_utxo              = txr.embedded_utxo;
+            embedded_null_arm          = txr.null_arm;
+            embedded_superblock        = txr.superblock;
+            embedded_include_mn_special_txs = txr.include_mn_special_txs;
+            embedded_accrue_asset_locks     = txr.accrue_asset_locks;
+            embedded_accrue_asset_unlocks   = txr.accrue_asset_unlocks;
             if (txr.defaulted_any)
                 std::cout << "[run] good-citizen default (daemonless posture): "
-                             "FULL-MEMPOOL tx-serving armed"
+                             "FULL-MEMPOOL + special-tx + superblock serving armed"
                              " serve-mempool-txs="
                           << (txr.serve_mempool_txs ? "on" : "off")
                           << " tx-serve-own-set="
@@ -11438,8 +11551,21 @@ int main(int argc, char** argv)
                           << (txr.ingest_isdlock ? "on" : "off")
                           << " ingest-dstx="
                           << (txr.ingest_dstx ? "on" : "off")
-                          << " (opt-out: --embedded-serve-mempool-txs=false "
-                             "et al.)\n";
+                          << " embedded-mainnet="
+                          << (txr.embedded_mainnet ? "on" : "off")
+                          << " embedded-utxo="
+                          << (txr.embedded_utxo ? "on" : "off")
+                          << " null-arm="
+                          << (txr.null_arm ? "on" : "off")
+                          << " superblock="
+                          << (txr.superblock ? "on" : "off")
+                          << " include-mn-special-txs="
+                          << (txr.include_mn_special_txs ? "on" : "off")
+                          << " accrue-asset-locks="
+                          << (txr.accrue_asset_locks ? "on" : "off")
+                          << " accrue-asset-unlocks="
+                          << (txr.accrue_asset_unlocks ? "on" : "off")
+                          << " (opt-out: --embedded-<lever>=false)\n";
             if (txr.unsafe_serve_without_referee)
                 std::cout << "[run] WARNING: --embedded-tx-serve-own-set=false"
                              " with mempool-tx serving ON in the daemonless"
@@ -11484,7 +11610,8 @@ int main(int argc, char** argv)
                         embedded_fold_checkscripts,   // PR-C4 input-script check
                         embedded_utxo_fold_fees_db,    // W5-A fold fee source
                         embedded_utxo_fold_expect,     // W5-A anchor restatement
-                        explorer_enabled);             // /api/explorer surface (default ON)
+                        explorer_enabled,             // /api/explorer surface (default ON)
+                        embedded_include_mn_special_txs); // special-tx superset (DIP types 1-4)
     }
     return run_selftest();
 }

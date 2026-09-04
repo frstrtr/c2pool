@@ -302,9 +302,9 @@ Legacy `--standalone` mode (minimal stratum + RPC daemon, no embedded SPV) is av
 
 ### DASH daemonless masternode-set checkpoint — trust anchor
 
-**If you run DASH with `--embedded-mainnet` and no dashd, you are trusting the
-c2pool release build for one specific piece of data. This section says exactly
-which, and why.**
+**If you run DASH without a dashd arm (a bare `--run` is daemonless by default),
+you are trusting the c2pool release build for one specific piece of data. This
+section says exactly which, and why.**
 
 To build a DASH block, c2pool must know which masternode is next in the DIP-3
 payment queue. Paying the wrong one produces a coinbase the network rejects
