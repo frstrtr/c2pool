@@ -925,7 +925,24 @@ nlohmann::json Bip110WorkSource::mining_submit(
                 auto it = freeze_map_.find(to_hex(f.h2));
                 if (it != freeze_map_.end()) mint_cb = it->second.coinbase;
             }
-            std::vector<unsigned char> payout_script = core::address_to_script(username);
+            // #961: validate against BIP-110's OWN version bytes / HRP (Bitcoin
+            // format: mainnet 0x00/0x05 + "bc", testnet 0x6f/0xc4 + "tb") before
+            // building a script, so a foreign-coin address is rejected (→ empty
+            // → donation fallback) rather than repurposed into a wrong-coin
+            // payout that MISDIRECTS funds.
+            std::vector<unsigned char> payout_script;
+            {
+                auto amatch = core::classify_address_for_coin(
+                    username,
+                    is_testnet_ ? std::vector<uint8_t>{0x6f} : std::vector<uint8_t>{0x00},
+                    is_testnet_ ? std::vector<uint8_t>{0xc4} : std::vector<uint8_t>{0x05},
+                    is_testnet_ ? std::vector<std::string>{"tb"} : std::vector<std::string>{"bc"},
+                    payout_script);
+                if (amatch == core::AddressCoinMatch::Foreign)
+                    LOG_WARNING << "[BIP110-STRATUM] REJECTED foreign-coin payout "
+                                   "address (user=" << username << ") — not a "
+                                   "BIP-110 address; refusing to misdirect funds";
+            }
             if (payout_script.empty()) payout_script = donation_script_;
             create_share_fn_(mint_cb, hdr, *job, payout_script);
         }
@@ -945,7 +962,22 @@ nlohmann::json Bip110WorkSource::mining_submit(
             auto it = freeze_map_.find(to_hex(f.h2));
             if (it != freeze_map_.end()) coinbase = it->second.coinbase;
         }
-        std::vector<unsigned char> payout_script = core::address_to_script(username);
+        // #961: validate against BIP-110's OWN version bytes / HRP before
+        // building a script (see the won-block arm above) — a foreign-coin
+        // address is rejected (→ empty → donation fallback), never repurposed.
+        std::vector<unsigned char> payout_script;
+        {
+            auto amatch = core::classify_address_for_coin(
+                username,
+                is_testnet_ ? std::vector<uint8_t>{0x6f} : std::vector<uint8_t>{0x00},
+                is_testnet_ ? std::vector<uint8_t>{0xc4} : std::vector<uint8_t>{0x05},
+                is_testnet_ ? std::vector<std::string>{"tb"} : std::vector<std::string>{"bc"},
+                payout_script);
+            if (amatch == core::AddressCoinMatch::Foreign)
+                LOG_WARNING << "[BIP110-STRATUM] REJECTED foreign-coin payout "
+                               "address (user=" << username << ") — not a BIP-110 "
+                               "address; refusing to misdirect funds";
+        }
         if (payout_script.empty()) payout_script = donation_script_;
         create_share_fn_(coinbase, hdr, *job, payout_script);
     }

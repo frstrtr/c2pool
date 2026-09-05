@@ -50,6 +50,48 @@ bool is_address_for_chain(const std::string& address,
     const std::vector<std::string>& chain_hrps,
     const std::vector<uint8_t>& chain_versions);
 
+// -- Per-coin address validation (issue #961) ---------------------------------
+// The plain address_to_script()/address_to_hash160() decoders are chain-AGNOSTIC:
+// they accept the version byte / bech32 HRP of ANY supported coin and then build
+// a scriptPubKey for whatever coin the caller happens to be running. Fed a
+// foreign-coin payout address that path silently emits a wrong-coin script and
+// MISDIRECTS the miner's funds. classify_address_for_coin() closes that hole by
+// validating the version byte / HRP against the running coin BEFORE building a
+// script, so a foreign address is rejected loudly instead of being repurposed.
+
+/// Result of classify_address_for_coin().
+enum class AddressCoinMatch {
+    Invalid,   ///< Not a Base58Check or bech32 address this decoder understands
+               ///< (e.g. a CashAddr, or a checksum failure). out_script empty.
+               ///< The caller MAY consult a coin-specific decoder next.
+    Foreign,   ///< Well-formed address, but for a DIFFERENT coin (version byte /
+               ///< bech32 HRP not in this coin's accepted set). out_script empty;
+               ///< the caller MUST reject — never pay it.
+    Own        ///< Valid address for THIS coin. out_script holds its scriptPubKey.
+};
+
+/// Decode `address` and classify it against the running coin's accepted
+/// Base58Check version bytes and bech32 HRPs. On Own, out_script is the
+/// scriptPubKey (P2PKH/P2SH for base58, witness program for bech32); on
+/// Foreign/Invalid out_script is left empty. `accepted_hrps` are BARE prefixes
+/// with NO trailing '1' (e.g. {"ltc","tltc"}); pass {} for coins without bech32.
+AddressCoinMatch classify_address_for_coin(
+    const std::string& address,
+    const std::vector<uint8_t>& p2pkh_versions,
+    const std::vector<uint8_t>& p2sh_versions,
+    const std::vector<std::string>& accepted_hrps,
+    std::vector<unsigned char>& out_script);
+
+/// Convenience wrapper: returns the scriptPubKey ONLY for an own-coin address,
+/// and an EMPTY vector for a foreign-coin OR unparseable address. Use this in
+/// place of address_to_script() on the payout money-path so a foreign address
+/// can never be repurposed into a wrong-coin script.
+std::vector<unsigned char> address_to_script_for_coin(
+    const std::string& address,
+    const std::vector<uint8_t>& p2pkh_versions,
+    const std::vector<uint8_t>& p2sh_versions,
+    const std::vector<std::string>& accepted_hrps);
+
 /// Build a scriptPubKey from either a Base58Check or Bech32 address.
 /// Returns empty vector on failure.
 std::vector<unsigned char> address_to_script(const std::string& address);

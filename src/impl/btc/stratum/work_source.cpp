@@ -1069,9 +1069,28 @@ nlohmann::json BTCWorkSource::mining_submit(
             // substituted share hits the #1394 gentx-mismatch decline. Inputs
             // (job->prev_share_hash, session extranonce1, miner script) are the
             // exact ones the build side rolled on. Default (fee off) => identity.
+            // #961: validate the payout address against BTC's OWN version bytes
+            // / HRP before building a script. The chain-agnostic
+            // address_to_script() would repurpose a foreign-coin address into a
+            // BTC script and MISDIRECT the miner's funds; a Foreign address here
+            // yields an empty script — the same behaviour as an unparseable
+            // address (share added locally, no wrong-coin payment). BTC: mainnet
+            // 0x00/0x05 + hrp "bc", testnet 0x6f/0xc4 + hrp "tb".
+            std::vector<unsigned char> miner_script;
+            {
+                auto amatch = core::classify_address_for_coin(
+                    username,
+                    is_testnet_ ? std::vector<uint8_t>{0x6f} : std::vector<uint8_t>{0x00},
+                    is_testnet_ ? std::vector<uint8_t>{0xc4} : std::vector<uint8_t>{0x05},
+                    is_testnet_ ? std::vector<std::string>{"tb"} : std::vector<std::string>{"bc"},
+                    miner_script);
+                if (amatch == core::AddressCoinMatch::Foreign)
+                    LOG_WARNING << "[BTC-STRATUM] REJECTED foreign-coin payout "
+                                   "address (user=" << username << ") — not a BTC "
+                                   "address; refusing to misdirect funds";
+            }
             auto payout_script = effective_payout_script(
-                core::address_to_script(username),
-                job->prev_share_hash, extranonce1);
+                miner_script, job->prev_share_hash, extranonce1);
 
             try {
                 share_hash = create_fn(coinbase, header, *job, payout_script);

@@ -722,7 +722,30 @@ nlohmann::json BCHWorkSource::mining_submit(
 
         uint256 share_hash;
         if (create_fn) {
-            auto payout_script = core::address_to_script(username);
+            // #961: validate the payout address against BCH's OWN version bytes
+            // before building a script, so a foreign-coin base58 address (e.g.
+            // an LTC/DASH/DGB address) is rejected rather than repurposed into a
+            // BCH script — which would MISDIRECT the miner's funds. BCH legacy
+            // base58: mainnet 0x00/0x05, testnet 0x6f/0xc4 (no segwit). BCH's
+            // native CashAddr is a different format with no base58 version byte;
+            // it (and only it) falls through to the coin-registered CashAddr
+            // decoder via address_to_script(). NOTE: BCH legacy base58 shares
+            // BTC's version bytes, an inherent BCH/BTC ambiguity — a BTC legacy
+            // address is therefore accepted here (same hash160/key), which is
+            // NOT a misdirection.
+            std::vector<unsigned char> payout_script;
+            auto amatch = core::classify_address_for_coin(
+                username,
+                is_testnet_ ? std::vector<uint8_t>{0x6f} : std::vector<uint8_t>{0x00},
+                is_testnet_ ? std::vector<uint8_t>{0xc4} : std::vector<uint8_t>{0x05},
+                /*accepted_hrps=*/{},
+                payout_script);
+            if (amatch == core::AddressCoinMatch::Foreign)
+                LOG_WARNING << "[BCH-STRATUM] REJECTED foreign-coin payout address "
+                               "(user=" << username << ") — not a BCH address; "
+                               "refusing to misdirect funds";
+            else if (amatch == core::AddressCoinMatch::Invalid)
+                payout_script = core::address_to_script(username);  // CashAddr decoder
             try { share_hash = create_fn(coinbase, header, *job, payout_script); }
             catch (const std::exception& e) {
                 LOG_WARNING << tag << " create_share_fn threw: " << e.what()

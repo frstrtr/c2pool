@@ -644,7 +644,26 @@ nlohmann::json DGBWorkSource::mining_submit(
         in.subsidy         = job->subsidy;
         in.prev_share      = job->prev_share_hash;
         in.merkle_branches = branch_hashes;
-        in.payout_script   = core::address_to_script(username);
+        // #961: validate the payout address against DGB's OWN version bytes / HRP
+        // before building a script, so a foreign-coin address is rejected rather
+        // than repurposed into a DGB script (which would MISDIRECT funds). DGB:
+        // mainnet 0x1e/0x3f + hrp "dgb", testnet 0x7e/0x8c + hrp "dgbt"
+        // (digibyte chainparams). Foreign → empty → the existing redistribute/
+        // empty fallback below; never a wrong-coin payment.
+        {
+            std::vector<unsigned char> payout_script;
+            auto amatch = core::classify_address_for_coin(
+                username,
+                is_testnet_ ? std::vector<uint8_t>{0x7e} : std::vector<uint8_t>{0x1e},
+                is_testnet_ ? std::vector<uint8_t>{0x8c} : std::vector<uint8_t>{0x3f},
+                is_testnet_ ? std::vector<std::string>{"dgbt"} : std::vector<std::string>{"dgb"},
+                payout_script);
+            if (amatch == core::AddressCoinMatch::Foreign)
+                LOG_WARNING << "[DGB-STRATUM] REJECTED foreign-coin payout address "
+                               "(user=" << username << ") — not a DGB address; "
+                               "refusing to misdirect funds";
+            in.payout_script = std::move(payout_script);
+        }
         // Redistribute V2 (#307): a miner with empty/broken stratum creds
         // yields no payout script. When the operator opted into a
         // --redistribute policy (fallback bound) let it choose the pubkey this
