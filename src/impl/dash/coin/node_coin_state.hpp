@@ -22,6 +22,7 @@
 #include <impl/dash/coin/work_source.hpp>        // EmbeddedWorkInputs, select_dash_work, WorkSelection
 #include <impl/dash/coin/mn_state_machine.hpp>   // MnStateMachine
 #include <impl/dash/coin/mempool.hpp>            // Mempool
+#include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
 #include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
@@ -579,6 +580,89 @@ public:
     /// implicit consequence of the UTXO lane maturing.
     void set_serve_mempool_txs(bool on) { m_serve_mempool_txs = on; }
     bool serve_mempool_txs() const { return m_serve_mempool_txs; }
+
+    /// ── MINER/USER TX-INJECTION (#157, --embedded-tx-inject, default OFF) ────
+    /// Opt-in, post-cut Tier-3. A submitted consensus-valid tx is admitted to
+    /// the mempool with PRIORITY (Mempool::add_inject → a large mapDeltas delta)
+    /// so it lands in the block c2pool mines regardless of its fee rate, and is
+    /// non-standard-tolerant — the ONLY gate is consensus-validity, enforced by
+    /// the SAME get_sorted_txs_with_fees selector guards (topology, double-spend,
+    /// script, finality, sigops, maturity, islock) that every served body tx
+    /// passes. REWARD-SAFE: an inject is an ordinary body tx; the coinbase /
+    /// subsidy / PPLNS / payee path is byte-unchanged (a 0-fee inject adds 0 to
+    /// total_fees). Injected txs ride the served-body path, so this augments —
+    /// and requires — the serve-mempool-txs / daemonless serve posture.
+    void set_tx_inject_enabled(bool on) { m_tx_inject_enabled = on; }
+    bool tx_inject_enabled() const { return m_tx_inject_enabled; }
+
+    /// Named outcome of a submit_inject call — every refusal carries its cause
+    /// (DEF3 discipline: no silent drops).
+    struct InjectSubmitResult {
+        bool        ok{false};
+        std::string cause;    // "ok" or a named refusal
+        uint256     txid;
+    };
+
+    /// Submit a raw transaction for injection. Cheapest-checks-first gate
+    /// (design §4.3): feature-enabled → DoS caps (pool full / total bytes / per-
+    /// tx size, TxInjectPool) → mempool admission (Mempool::add_inject: size,
+    /// script-check-armed, dedup, already-confirmed, priceable). Priority is
+    /// applied by add_inject; the authoritative consensus validation (scripts /
+    /// finality / double-spend) runs at template build and DROPS an invalid
+    /// inject there — it is never served. `flags` and `expiry_height` are the
+    /// design's wire fields (carried for M2/M3). io-thread only.
+    InjectSubmitResult submit_inject(const MutableTransaction& tx,
+                                     uint32_t flags = 0,
+                                     int32_t expiry_height = 0) {
+        InjectSubmitResult r;
+        r.txid = dash::coin::dash_txid(tx);
+        if (!m_tx_inject_enabled) { r.cause = "inject-disabled"; return r; }
+        // PR-1: classic (type-0) txs only. Special types interact with the CbTx
+        // roots the template commits; refuse by name (staged to a later PR).
+        if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
+            r.cause = "inject-type-unsupported"; return r;
+        }
+        // Lazily reconcile the pool with the mempool before admitting: forget
+        // any tracked inject no longer in the mempool (confirmed / evicted) and
+        // reap expired ones, so the caps reflect what is actually live.
+        reconcile_inject_pool();
+        const uint32_t byte_size =
+            static_cast<uint32_t>(::pack(tx).get_span().size());
+        // DoS caps FIRST (cheap, no consensus work): a full / over-cap pool
+        // refuses before the mempool pays for pricing.
+        auto pv = m_inject_pool.would_admit(r.txid, byte_size);
+        if (pv != dash::coin::TxInjectPool::Admit::Ok) {
+            r.cause = dash::coin::TxInjectPool::admit_name(pv); return r;
+        }
+        // Mempool admission with priority (runs the validity/dedup/script-armed
+        // gate). Priority = offered first, NOT a guard bypass.
+        auto gv = m_mempool.add_inject(tx);
+        if (gv != dash::coin::Mempool::InjectGate::Ok) {
+            r.cause = dash::coin::Mempool::inject_gate_name(gv); return r;
+        }
+        // Track it for DoS accounting + expiry.
+        m_inject_pool.admit(r.txid, flags, expiry_height, byte_size);
+        r.ok = true;
+        r.cause = "ok";
+        return r;
+    }
+
+    /// Reconcile the inject ledger with the live mempool + tip: drop tracked
+    /// injects that have left the mempool (confirmed / conflict-evicted) or have
+    /// expired, evicting the expired ones from the mempool too. Called lazily
+    /// from submit_inject and exposed for a block-connect wiring in a later PR.
+    void reconcile_inject_pool() {
+        if (m_inject_pool.empty()) return;
+        // Expiry against our own tip.
+        if (m_prev_height != 0) {
+            for (const auto& id : m_inject_pool.reap_expired(
+                     static_cast<int32_t>(m_prev_height + 1))) {
+                m_mempool.remove_tx(id);
+            }
+        }
+    }
+
+    size_t inject_pool_size() const { return m_inject_pool.size(); }
 
     /// PINNED LOCAL TX (--pin-local-tx-hex, donation-dust consolidation): an
     /// operator-supplied, externally-signed, zero-fee tx that can only reach
@@ -1927,6 +2011,11 @@ private:
     // fee-carrying mempool-tx body path is an explicit operator opt-in (see
     // set_serve_mempool_txs).
     bool m_serve_mempool_txs{false};
+    // #157 (--embedded-tx-inject): DEFAULT OFF — opt-in miner/user tx-injection.
+    // The bounded inject ledger (DoS caps + expiry); template inclusion is via
+    // m_mempool (Mempool::add_inject priority), not this structure.
+    bool                         m_tx_inject_enabled{false};
+    dash::coin::TxInjectPool     m_inject_pool;
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
     // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs

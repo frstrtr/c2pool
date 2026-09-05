@@ -491,6 +491,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-getmnlistd-tracker]\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-fold-checkscripts]\n"
+        << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -1079,6 +1080,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // armed (fold_live_db). DEFAULT false => no check, byte-
              // identical to master.
              bool embedded_fold_checkscripts = false,
+             // --embedded-tx-inject (#157, post-cut Tier-3): opt-in miner/user
+             // tx-injection. A raw consensus-valid tx handed to c2pool is
+             // admitted to the mempool with PRIORITY (a large mapDeltas delta)
+             // so it lands in the block c2pool mines regardless of fee rate and
+             // is non-standard-tolerant — the only gate is consensus-validity,
+             // enforced by the SAME selector guards every body tx passes.
+             // DEFAULT OFF. REWARD-SAFE: an inject is an ordinary body tx; the
+             // coinbase / subsidy / PPLNS / payee path is byte-unchanged (a
+             // 0-fee inject adds 0 to fees). Injects ride the served-body path,
+             // so this augments the daemonless / --embedded-serve-mempool-txs
+             // serve posture and requires the consensus-exact input-script check
+             // (--embedded-fold-checkscripts) to be armed (new ingestion seam).
+             bool embedded_tx_inject = false,
+             // --embedded-tx-inject-hex FILE: local submit path (M1). One raw
+             // tx hex per line (classic type-0 only, all-or-nothing at load),
+             // mirroring --pin-local-tx-hex. Each is submitted through the
+             // validation + priority gate at wiring time and its named verdict
+             // logged; continuous re-submission + the p2p tx-inject transport
+             // are M2. Empty (default) => no local injects.
+             const std::string& embedded_tx_inject_hex_path = std::string(),
              // --embedded-utxo-fold-fees DBPATH (+ REQUIRED
              // --embedded-utxo-fold-expect HEX): W5-A. Open the W3 full-
              // history UTXO fold at DBPATH and install FoldFeeSource as the
@@ -2705,6 +2726,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // never coincide) and blind to a strict SUBSET that contains an invalid
     // transaction, which is exactly the case that costs a whole block.
     node_coin_state.set_serve_mempool_txs(embedded_serve_mempool_txs);
+    // #157 (--embedded-tx-inject): arm the opt-in miner/user tx-injection lane.
+    // Default OFF; the actual local submits happen after the mempool + the
+    // consensus-exact script check are wired (see --embedded-tx-inject-hex).
+    node_coin_state.set_tx_inject_enabled(embedded_tx_inject);
+    if (embedded_tx_inject) {
+        std::cout << "[run] embedded-tx-inject ARMED (#157): miner/user tx-injection "
+                     "ON — submitted txs ride the block with priority through the "
+                     "SAME validity gate; reward path byte-unchanged. Requires "
+                     "--embedded-fold-checkscripts + the served-body posture.\n";
+    }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
     // dashd's miner refuses any not-yet-islocked tx with vins younger than 10
     // minutes when spork2 (InstantSend) AND spork3 (RejectConflictingBlocks)
@@ -6585,6 +6616,60 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          "advance-on-connect + reorg-undo + at-tip serving guard "
                          "(fold consulted only while fold_height >= serve_tip and "
                          "chain-identical; behind tip => fee-unknown = master)\n";
+        }
+
+        // #157 (--embedded-tx-inject-hex): local submit path (M1). Parse the
+        // file (one classic raw tx hex per line, all-or-nothing) and submit each
+        // through the validation + priority gate now that the mempool + the
+        // consensus-exact script check are wired. Every verdict is logged by
+        // name (DEF3). An inject whose inputs are not yet in the view is refused
+        // "inject-unpriceable" and NOT retried here — continuous re-submission
+        // and the p2p tx-inject transport are M2. Reward path untouched.
+        if (embedded_tx_inject && !embedded_tx_inject_hex_path.empty()) {
+            std::ifstream inf(embedded_tx_inject_hex_path);
+            std::vector<dash::coin::MutableTransaction> inj_txs;
+            bool inj_load_ok = true;
+            std::string iline;
+            unsigned ilineno = 0;
+            while (std::getline(inf, iline)) {
+                ++ilineno;
+                iline.erase(std::remove_if(iline.begin(), iline.end(),
+                                [](unsigned char c) { return std::isspace(c); }),
+                            iline.end());
+                if (iline.empty()) continue;
+                if (iline.size() % 2 != 0) {
+                    std::cout << "[run] --embedded-tx-inject-hex line " << ilineno
+                              << ": odd hex length — injects DISABLED\n";
+                    inj_txs.clear(); inj_load_ok = false; break;
+                }
+                try {
+                    auto raw = ParseHex(iline);
+                    PackStream ps(raw);
+                    dash::coin::MutableTransaction tx;
+                    ps >> tx;
+                    if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
+                        std::cout << "[run] --embedded-tx-inject-hex line " << ilineno
+                                  << ": not a classic non-empty tx — injects DISABLED\n";
+                        inj_txs.clear(); inj_load_ok = false; break;
+                    }
+                    inj_txs.push_back(std::move(tx));
+                } catch (const std::exception& e) {
+                    std::cout << "[run] --embedded-tx-inject-hex line " << ilineno
+                              << " PARSE FAILED (" << e.what() << ") — injects DISABLED\n";
+                    inj_txs.clear(); inj_load_ok = false; break;
+                }
+            }
+            if (inj_load_ok && !inj_txs.empty()) {
+                for (auto& tx : inj_txs) {
+                    auto r = node_coin_state.submit_inject(tx);
+                    std::cout << "[run] tx-inject submit txid="
+                              << r.txid.GetHex().substr(0, 16)
+                              << " => " << r.cause
+                              << (r.ok ? " (prioritised; validated at template build)"
+                                       : " (refused, not served)")
+                              << "\n";
+                }
+            }
         }
 
         // new_block(inv hash) -> pull the headers THEN the full block from the
@@ -10845,6 +10930,12 @@ int main(int argc, char** argv)
     bool embedded_serve_mempool_txs_off = false;  // --embedded-serve-mempool-txs=false
     bool embedded_tx_serve_own_set = false;  // --embedded-tx-serve-own-set; daemonless default ON
     bool embedded_tx_serve_own_set_off = false;   // --embedded-tx-serve-own-set=false
+    // #157 (--embedded-tx-inject): opt-in miner/user tx-injection. DEFAULT OFF
+    // and NEVER a good-citizen default (NOT in TxServeLevers): it changes which
+    // consensus-valid txs a node prioritises into its own block and must always
+    // be an explicit operator decision. Reward path is byte-unchanged.
+    bool embedded_tx_inject = false;
+    std::string embedded_tx_inject_hex_path;   // --embedded-tx-inject-hex FILE (local M1 submit)
     // #107 PHASE 2 (--embedded-accrue-asset-locks): type-8 asset-lock accrual.
     // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): body membership and the
     // CbTx creditPool accrual are the SAME bit (embedded_gbt.hpp allow_locks ==
@@ -11126,6 +11217,10 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
+        else if (std::strcmp(argv[i], "--embedded-tx-inject") == 0)
+            embedded_tx_inject = true;   // #157: opt-in miner/user tx-injection (default OFF)
+        else if (std::strcmp(argv[i], "--embedded-tx-inject-hex") == 0 && i + 1 < argc)
+            embedded_tx_inject_hex_path = argv[++i];   // #157 local M1 submit file
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
@@ -11620,6 +11715,8 @@ int main(int argc, char** argv)
                         embedded_fold_live_db,         // PR-C1 embedded-fold-live
                         embedded_fold_live_expect,     // PR-C1 store-verify hash
                         embedded_fold_checkscripts,   // PR-C4 input-script check
+                        embedded_tx_inject,            // #157 miner/user tx-injection (default OFF)
+                        embedded_tx_inject_hex_path,   // #157 local M1 submit file
                         embedded_utxo_fold_fees_db,    // W5-A fold fee source
                         embedded_utxo_fold_expect,     // W5-A anchor restatement
                         explorer_enabled,             // /api/explorer surface (default ON)

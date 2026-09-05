@@ -1,10 +1,17 @@
 # Miner / user tx-injection over the c2pool sharechain p2p (post-cut, SV2-like)
 
-Status: **DESIGN ONLY. Not implemented.** This is a **post-cut (Tier-3)** feature,
-not a `--coin-rpc` (dashd) cut blocker. It is sequenced strictly **after** the
-daemonless block-template self-derive close (#154) and the full-mempool serving
-canary (#132). Nothing here touches the coinbase, the reward split, or the
-masternode-payee queue.
+Status: **M1 IMPLEMENTED (DASH, `--embedded-tx-inject`, default OFF); M2/M3
+staged.** This is a **post-cut (Tier-3)** feature, not a `--coin-rpc` (dashd)
+cut blocker. It is sequenced strictly **after** the daemonless block-template
+self-derive close (#154) and the full-mempool serving canary (#132). Nothing
+here touches the coinbase, the reward split, or the masternode-payee queue.
+
+M1 (this PR) lands the runtime: the inject pool, the validation gate, the
+priority class, the DoS caps, the local submit path, and — see §9/§10 below —
+the isolated-signer SEAM and the design for sandboxed tx-blob construction. The
+`tx-inject` p2p transport (§4.2) and its first-see fan-out (§4.5) are M2;
+per-peer token buckets / capability advertisement (§4.6) and the full sandboxed
+signer are M3. §11 is the exact per-milestone code map.
 
 Scope: DASH first, but the transport (`tx-inject` p2p subtype) and the
 validation gate are coin-agnostic and reuse existing core/ infrastructure.
@@ -353,3 +360,123 @@ per repo convention for anything near the reward path.
 6. **Expiry vs. persistence.** Should injects survive a node restart (persisted
    inject pool) or be intentionally ephemeral? Ephemeral is simpler and limits
    liability; persistence is friendlier to a user who submitted and went away.
+
+---
+
+## 9. Embedded-daemon tx-blob construction + isolated signing modules
+
+The proof-of-capability in §6 (the daemonless donation at block 2518186)
+established that c2pool can construct, sign, and broadcast an arbitrary tx with
+no daemon in the loop. tx-injection generalises that: a miner or user must be
+able to build a raw, consensus-valid transaction — including the non-standard
+and 0-fee shapes a public mempool refuses — and hand it to c2pool for inclusion.
+This section specifies **where the signing happens** and the **module boundary**
+that keeps private keys out of the injection runtime.
+
+### 9.1 The runtime accepts an ALREADY-SIGNED blob (the SEAM)
+
+The injection runtime — `Mempool::add_inject`, the inject pool, the p2p
+`tx-inject` transport, the fan-out — operates **exclusively on fully-serialized,
+already-signed transaction bytes**. It never sees a private key, never
+constructs a scriptSig, and never re-serializes or mutates the tx: `tx_bytes` is
+the exact bytes that will appear in the block, and `sha256d(tx_bytes)` is the
+txid used for dedup/gossip. This is the **isolated-signer SEAM**:
+
+```
+   ┌─────────────────────────┐        signed raw tx bytes        ┌──────────────────────┐
+   │  tx-blob construction +  │  ───────────────────────────────▶ │  injection runtime    │
+   │  signing (isolated,      │      (opaque, never mutated)      │  (add_inject, pool,   │
+   │  key-bearing)            │                                   │   p2p, fan-out)       │
+   └─────────────────────────┘                                   └──────────────────────┘
+        holds keys                                                    holds NO keys
+```
+
+Consequences of the seam:
+
+- **The runtime is key-free.** A compromise of the injection path (a malicious
+  peer flooding `tx-inject`, a bug in the pool) cannot reach signing material —
+  there is none on that side of the seam.
+- **The signer is swappable.** Any external tool that emits a signed raw tx —
+  a dashd `createrawtransaction`+`signrawtransactionwithkey`, a hardware wallet,
+  the c2wallet PIN-TX offline signer already used for the donation lane, or the
+  sandboxed builder of §10 — satisfies the seam. The runtime is indifferent to
+  which produced the bytes.
+- **Validity is re-checked regardless of origin.** Because the runtime trusts no
+  signer, every injected blob passes the SAME consensus gate as any mempool tx
+  (script-verify, topology, double-spend, finality, sigops, maturity) at
+  template build — a mis-signed or malicious blob is dropped, never served.
+
+### 9.2 M1 seam implementation (this PR)
+
+M1 wires the seam at two entry points, both taking already-signed bytes:
+
+- **`--embedded-tx-inject-hex FILE`** — a local operator/miner submit: one raw
+  signed tx hex per line (classic type-0, all-or-nothing at load, mirroring the
+  proven `--pin-local-tx-hex` loader). Each line is deserialized and handed to
+  `NodeCoinState::submit_inject`, which runs the gate and reports a named verdict.
+- **`NodeCoinState::submit_inject(tx, flags, expiry_height)`** — the in-process
+  API the file loader (M1) and the p2p handler (M2) both call. It takes a
+  deserialized `MutableTransaction` whose scriptSigs are already populated; it
+  never signs.
+
+A minimal build/sign helper for producing the blob is intentionally **out of the
+runtime**: for M1 the operator uses the existing offline path (c2wallet PIN-TX
+procedure / dashd `signrawtransactionwithkey`) — the same tooling that signed the
+2518186 donation — and drops the resulting hex into the file. This keeps PR-1
+key-free while delivering an end-to-end submit path.
+
+### 9.3 Reward isolation restated for the seam
+
+The signer produces `tx_bytes`; the runtime places those bytes **only** into the
+block body (tx-merkle / fee-total). Neither side writes the coinbase, subsidy,
+PPLNS, donation, payee queue, or `give_author`. The `submitter_hint` (§4.2), when
+it arrives on the wire in M2, is a **local DoS-accounting label only** — it is
+never a reward key and never influences funds, because the runtime never
+rewrites the tx to pay it.
+
+## 10. Sandboxed tx-blob construction (staged to M3)
+
+M1 ships the SEAM; the **full sandboxed signer** — a self-contained builder that
+constructs and signs the blob inside an isolation boundary — is staged. Its
+design:
+
+- **A separate process / module** with the sole capability of turning a
+  (inputs, outputs, keys) request into signed raw tx bytes. It links the
+  consensus-exact script/sighash primitives already vendored for c2pool
+  (`dash_scriptcheck.so` / the c2pool_dash_* legacy-sighash + secp256k1 path the
+  M1 KATs sign against), so a blob it produces verifies under the very
+  interpreter the runtime re-checks it with.
+- **No network, no mempool, no sharechain access.** The sandbox cannot see peers
+  or the pool; it emits bytes on a single pipe. This bounds the blast radius of a
+  signing bug to the blob itself.
+- **Immature-coinbase + maturity filtering at build** (the lesson from the PIN
+  consolidation lane): the builder refuses to spend an immature coinbase input,
+  so a blob never fails maturity at template build.
+- **All-or-nothing, offline-first**: the builder is usable fully offline (the
+  donation precedent), so a user can construct a 0-fee sweep / non-standard tx
+  without exposing keys to any online component.
+
+The sandbox is **not** required for the runtime to function — the seam (§9.1)
+means any signer suffices — so it is correctly deferred without blocking M1.
+
+## 11. Per-milestone code map (implementation reality)
+
+| Milestone | Component | Where |
+|-----------|-----------|-------|
+| **M1 (this PR)** | inject pool (cap/expiry/dedup, DoS) | `src/impl/dash/coin/tx_inject_pool.hpp` |
+| M1 | priority delta + gate + `add_inject` | `src/impl/dash/coin/mempool.hpp` (`INJECT_FEE_DELTA`, `InjectGate`, `add_inject`, `kMaxInjectTxBytes`) |
+| M1 | intra-template double-spend guard (`consumed`) | `src/impl/dash/coin/mempool.hpp` `get_sorted_txs_with_fees` |
+| M1 | submit gate + reconcile + node ownership | `src/impl/dash/coin/node_coin_state.hpp` (`submit_inject`, `set_tx_inject_enabled`, `m_inject_pool`) |
+| M1 | flag + local submit (SEAM entry) + catalog | `src/c2pool/main_dash.cpp` (`--embedded-tx-inject`, `--embedded-tx-inject-hex`), `src/core/param_catalog.inc` |
+| M1 | KATs (priority, reward-safety, double-spend, bad-script, missing-input, oversize, seam-unarmed, DoS, never-defaulted) | `test/test_dash_tx_inject.cpp` (in `test_dash_mempool`) |
+| **M2** | `tx-inject` p2p subtype + handler wiring | `src/impl/dash/messages.hpp`, `node.hpp` handler tables, `protocol_actual.cpp` / `protocol_legacy.cpp` |
+| M2 | first-see fan-out + `register_template_txs` | `node.cpp` (advertise pattern), reconstruct-won-block path |
+| M2 | continuous re-submission per tip | block-connect wiring of `reconcile_inject_pool` |
+| **M3** | per-peer token buckets, misbehaviour score, capability advertisement | coin_peer_manager / handler |
+| M3 | `submitter_hint` rate-accounting | inject pool |
+| M3 | full sandboxed signer (§10) | new isolated build/sign module |
+
+### Reward-safety proof obligation (every milestone)
+
+`git diff master --stat -- src/impl/dash/coinbase_builder.hpp src/core/coinbase_builder.hpp src/impl/dash/coin/gentx_coinbase.hpp src/impl/dash/coin/subsidy.hpp src/impl/dash/pplns.hpp src/core/donation.hpp`
+must be **empty**, and `grep -n "give_author\|donation\|payee\|m_payment_amount\|subsidy"` over the injection files must be **empty**. An injected tx enters ONLY the block body; the coinbase is `subsidy + Σ base-fees` exactly, and the priority delta is scoring-only (`total_fees` reads base `fee`).

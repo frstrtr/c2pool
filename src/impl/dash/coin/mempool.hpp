@@ -532,6 +532,112 @@ public:
         return add_tx_locked(tx, m_utxo.load(), /*is_dstx=*/true);
     }
 
+    // ── MINER/USER TX-INJECTION (#157, post-cut Tier-3, --embedded-tx-inject) ──
+    /// The single consensus maximum an injected tx may occupy — mirrors the
+    /// PIN lane's kMaxPinnedTxBytes (Dash rejects an oversize tx at CONSENSUS,
+    /// "bad-txns-oversize"; that once cost block 2517855). Checked first in
+    /// add_inject because it is the cheapest verdict and true against any
+    /// chain state.
+    static constexpr size_t kMaxInjectTxBytes = 100000;
+
+    /// INJECTION PRIORITY DELTA (W5-B mapDeltas, dashd PrioritiseTransaction).
+    /// An injected tx is prioritised by recording this delta, exactly the
+    /// mechanism dashd uses for DSTX (+0.1 COIN) and MNHF-signal txs. It lifts
+    /// the tx's MODIFIED fee so it sorts to the very top of the ancestor-score
+    /// index AND clears the blockMinFeeRate floor even at base fee 0 — the tx
+    /// is OFFERED FIRST, never guard-bypassed. 1000 DASH in duffs dominates any
+    /// real mempool fee; INJECT_POOL_MAX_ENTRIES bounds how many can be pooled,
+    /// keeping the modfee_wa ancestor aggregation far below uint64 overflow.
+    ///
+    /// REWARD-SAFE BY CONSTRUCTION: modified_fee() feeds ONLY scoring /
+    /// ordering / the blockMinFeeRate gate (dashd nModFeesWithAncestors). The
+    /// base `fee` that feeds total_fees → coinbasevalue / SelectedTx.fee is
+    /// UNTOUCHED (see get_sorted_txs_with_fees total_fees += e->fee). A 0-fee
+    /// inject therefore contributes exactly 0 to the coinbase, as any 0-fee
+    /// body tx would — the delta cannot inflate a single duff of reward.
+    static constexpr uint64_t INJECT_FEE_DELTA = 100'000'000'000ULL;   // 1000 DASH, duffs
+
+    /// Every add_inject refusal is NAMED (DEF3 discipline — no silent drops).
+    enum class InjectGate : uint8_t {
+        Ok = 0,
+        TooLarge,            // serialized size > kMaxInjectTxBytes
+        ScriptCheckUnarmed,  // has_script_check()==false — a NEW ingestion seam
+                             // MUST script-verify (sole-ingestion-path invariant)
+        AlreadyKnown,        // txid already in our pool
+        AlreadyConfirmed,    // #125 own-output-present: the tx is already mined
+        Unpriceable,         // inputs not present in our view/fold → fee not
+                             // fold-proven → would be template-excluded silently
+    };
+    static const char* inject_gate_name(InjectGate g) {
+        switch (g) {
+            case InjectGate::Ok:                 return "ok";
+            case InjectGate::TooLarge:           return "inject-oversize";
+            case InjectGate::ScriptCheckUnarmed: return "inject-script-check-unarmed";
+            case InjectGate::AlreadyKnown:       return "inject-already-known";
+            case InjectGate::AlreadyConfirmed:   return "inject-already-confirmed";
+            case InjectGate::Unpriceable:        return "inject-unpriceable";
+        }
+        return "inject-unknown";
+    }
+
+    /// Admit an INJECTED transaction into the mempool with priority.
+    ///
+    /// An inject rides the SAME add_tx path and the SAME selector as any other
+    /// mempool tx — the topology (G1), double-spend (`consumed`), script
+    /// (CheckInputScripts), finality (IsFinalTx), sigop (G2), coinbase-maturity
+    /// (G3) and islock (G4) guards in get_sorted_txs_with_fees all run over it
+    /// UNCHANGED. Priority = the tx is OFFERED FIRST (a large mapDeltas delta
+    /// so it out-sorts the fee market and clears the min-fee floor); it is NOT
+    /// a guard bypass. An invalid inject is DROPPED by the selector, never
+    /// served — its only effect is having occupied a pool slot.
+    ///
+    /// This is a new ingestion seam, so per the sole-ingestion-path invariant
+    /// at the top of this header it REFUSES unless the consensus-exact
+    /// CheckInputScripts callback is wired (has_script_check()); the selector
+    /// then script-verifies it, and IsFinalTx runs when the caller passes a
+    /// non-zero lock_time_cutoff (the embedded GBT always does). An inject
+    /// whose inputs cannot be fold-priced is REFUSED here BY NAME (never left
+    /// in the pool to be silently template-excluded).
+    ///
+    /// Caller holds no lock. Returns a named InjectGate verdict.
+    InjectGate add_inject(const MutableTransaction& tx) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // (1) size — cheapest, chain-state-independent.
+        if (::pack(tx).get_span().size() > kMaxInjectTxBytes)
+            return InjectGate::TooLarge;
+        // (2) new-seam script-verify requirement (fail-closed).
+        if (!m_script_check)
+            return InjectGate::ScriptCheckUnarmed;
+        const uint256 txid = dash_txid(tx);
+        // (3) dedup against our own pool.
+        if (m_pool.count(txid))
+            return InjectGate::AlreadyKnown;
+        // (4) record the priority delta BEFORE admission — dashd mapDeltas
+        //     order (the delta pre-dates and survives acceptance; add_tx_locked
+        //     picks it up into entry.fee_delta). REWARD-SAFE: scoring-only.
+        record_fee_delta_locked(txid, INJECT_FEE_DELTA);
+        // (5) admit through the SAME path as any tx (runs the #125
+        //     already-confirmed reject). A false return here, after the pool
+        //     dedup above, is the own-output-present (already-mined) case.
+        if (!add_tx_locked(tx, m_utxo.load(), /*is_dstx=*/false)) {
+            m_fee_deltas.erase(txid);            // undo the speculative delta
+            return InjectGate::AlreadyConfirmed;
+        }
+        // (6) the tx MUST be fold-priced (inputs present, in_sum >= out_sum) or
+        //     the selector's fee_fold_proven gate would silently exclude it.
+        //     Refuse by name and roll back rather than leave a dead entry.
+        auto it = m_pool.find(txid);
+        if (it == m_pool.end() || !it->second.fee_fold_proven) {
+            remove_tx_locked(txid);
+            m_fee_deltas.erase(txid);
+            return InjectGate::Unpriceable;
+        }
+        LOG_INFO << "[MEMPOOL] inject admitted txid=" << txid.GetHex().substr(0, 16)
+                 << " base_fee=" << it->second.fee
+                 << " prioritised (delta=" << INJECT_FEE_DELTA << " duffs, scoring-only)";
+        return InjectGate::Ok;
+    }
+
 private:
     bool add_tx_locked(const MutableTransaction& tx,
                        ::core::coin::UTXOViewCache* utxo,
@@ -1202,6 +1308,18 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         std::vector<SelectedTx> result;
         std::set<uint256> selected;   // G1: the parent-in-selected-set check
+        // INTRA-TEMPLATE DOUBLE-SPEND GUARD (the #1494/#1497 `consumed` set,
+        // ported into DASH's richer dashd-port selector — DASH had no per-
+        // template consumed-outpoint set: m_spent_outputs is last-writer, so two
+        // pool txs spending the same outpoint could BOTH be selected and produce
+        // a bad-txns-inputs-* (double-spent) INVALID block). Every outpoint an
+        // already-selected package spends is recorded here; a later package whose
+        // member spends the same outpoint is DROPPED (kept: the higher
+        // ancestor-score one, selected first). Load-bearing for tx-injection —
+        // a double-spending inject is dropped PER-TX, never per-template — and a
+        // latent correctness fix for the whole serve path. Reward-safe: dropping
+        // a conflicting tx can only lower total_fees, and the coinbase follows.
+        std::set<std::pair<uint256, uint32_t>> consumed;
         uint64_t total_fees   = 0;
         uint32_t total_bytes  = 0;
         uint32_t total_sigops = DASH_COINBASE_SIGOPS_RESERVE;   // G2
@@ -1406,6 +1524,15 @@ public:
             std::set<uint256> in_package;
             for (const auto* e : package) in_package.insert(e->txid);
 
+            // Outpoints THIS package spends. Seeded empty; every member's vin is
+            // checked against the committed `consumed` set (a prior selected
+            // package) AND against this set (two members of the same package
+            // spending one outpoint), then inserted. Merged into `consumed` only
+            // if the whole package is admitted (block h). This is the per-tx
+            // double-spend drop — a conflicting tx is excluded, never the
+            // template refused.
+            std::set<std::pair<uint256, uint32_t>> pkg_spends;
+
             // ── (f) Validate the WHOLE package; any failing member drops the
             // candidate (never a partial package — that is exactly the
             // childless-parent / parentless-child shape G1 forbids). This block
@@ -1512,6 +1639,21 @@ public:
                     auto lk = m_islock_outpoints.find(opkey);
                     if (lk != m_islock_outpoints.end()
                         && lk->second != e->txid) {
+                        ok = false;
+                        break;
+                    }
+
+                    // INTRA-TEMPLATE DOUBLE-SPEND: this outpoint is already
+                    // spent by an ALREADY-SELECTED package (`consumed`), or by
+                    // an earlier member of THIS package (pkg_spends insert
+                    // fails) → drop the whole candidate. Two txs spending one
+                    // coin cannot both be valid in a block; the higher-scored
+                    // one won selection first, so this drop is deterministic.
+                    // (An in-package parent's OUTPUT is a distinct outpoint from
+                    // any coin's, so a normal parent→child spend never trips
+                    // this — only a genuine conflict does.)
+                    if (consumed.count(opkey)
+                        || !pkg_spends.insert(opkey).second) {
                         ok = false;
                         break;
                     }
@@ -1648,6 +1790,9 @@ public:
             // counter ONCE per admitted PACKAGE (dashd miner.cpp:625, before
             // SortForBlock), not per-tx.
             nConsecutiveFailed = 0;
+            // COMMIT this package's spends so a later package that double-spends
+            // any of them is dropped in block (f) above.
+            consumed.insert(pkg_spends.begin(), pkg_spends.end());
             sort_package_for_block(package, anc);
             for (const auto* e : package) {
                 selected.insert(e->txid);
