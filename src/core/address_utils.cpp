@@ -27,10 +27,17 @@ void register_address_decoder(AddressDecoderFn fn) {
     address_decoders().push_back(std::move(fn));
 }
 
-std::string base58check_to_hash160(const std::string& address)
+// Decode a 25-byte Base58Check address (1 version + 20 hash160 + 4 checksum)
+// and return the hash160 as 40-char lowercase hex, ALSO handing back the
+// version byte. Returns "" on any invalid character, overflow, or checksum
+// failure. Single source of truth for the version-aware decoders below.
+static std::string base58check_decode_versioned(const std::string& address,
+                                                uint8_t& version_out)
 {
     static constexpr const char* B58 =
         "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    if (address.empty()) return "";
 
     // decoded[0..24]: 1 version byte + 20 hash160 bytes + 4 checksum bytes
     uint8_t decoded[25] = {};
@@ -53,6 +60,7 @@ std::string base58check_to_hash160(const std::string& address)
     for (int i = 0; i < 4; ++i)
         if (chk[i] != decoded[21 + i]) return "";
 
+    version_out = decoded[0];
     static const char* HEX = "0123456789abcdef";
     std::string hex;
     hex.reserve(40);
@@ -61,6 +69,12 @@ std::string base58check_to_hash160(const std::string& address)
         hex += HEX[decoded[i] & 0x0f];
     }
     return hex;
+}
+
+std::string base58check_to_hash160(const std::string& address)
+{
+    uint8_t version = 0;
+    return base58check_decode_versioned(address, version);
 }
 
 std::string address_to_hash160(const std::string& address, std::string& addr_type)
@@ -207,6 +221,80 @@ bool is_address_for_chain(const std::string& address,
         }
     }
     return false;
+}
+
+AddressCoinMatch classify_address_for_coin(
+    const std::string& address,
+    const std::vector<uint8_t>& p2pkh_versions,
+    const std::vector<uint8_t>& p2sh_versions,
+    const std::vector<std::string>& accepted_hrps,
+    std::vector<unsigned char>& out_script)
+{
+    out_script.clear();
+
+    // ── Bech32 / segwit ────────────────────────────────────────────────
+    // A bech32 address is "<hrp>1<data>". The bech32 data charset excludes '1',
+    // so the separator is the FINAL '1' and the HRP is everything before it. We
+    // try to decode the address as segwit under that extracted HRP:
+    //   • decodes AND HRP is ours   → Own (build the witness scriptPubKey)
+    //   • decodes but HRP is foreign → Foreign (a valid segwit address for a
+    //                                  DIFFERENT coin — never repurpose it)
+    //   • does not decode            → fall through to Base58Check (a base58
+    //                                  address can legitimately contain '1', so
+    //                                  a failed segwit decode is NOT a verdict)
+    auto sep = address.rfind('1');
+    if (sep != std::string::npos && sep > 0) {
+        const std::string hrp = address.substr(0, sep);
+        int witver = -1;
+        std::vector<uint8_t> prog;
+        if (bech32::decode_segwit(hrp, address, witver, prog)) {
+            bool own = false;
+            for (const auto& h : accepted_hrps) if (h == hrp) { own = true; break; }
+            if (!own) return AddressCoinMatch::Foreign;
+            out_script.push_back(static_cast<unsigned char>(
+                witver == 0 ? 0x00 : (0x50 + witver)));
+            out_script.push_back(static_cast<unsigned char>(prog.size()));
+            out_script.insert(out_script.end(), prog.begin(), prog.end());
+            return AddressCoinMatch::Own;
+        }
+    }
+
+    // ── Base58Check (P2PKH / P2SH) ─────────────────────────────────────
+    uint8_t version = 0;
+    const std::string h160 = base58check_decode_versioned(address, version);
+    if (h160.size() == 40) {
+        for (uint8_t v : p2pkh_versions) {
+            if (v == version) {
+                out_script = hash160_to_merged_script(h160, "p2pkh");
+                return AddressCoinMatch::Own;
+            }
+        }
+        for (uint8_t v : p2sh_versions) {
+            if (v == version) {
+                out_script = hash160_to_merged_script(h160, "p2sh");
+                return AddressCoinMatch::Own;
+            }
+        }
+        // Valid Base58Check, but a version byte this coin does not use → a
+        // well-formed address for a DIFFERENT coin. Reject, never repurpose.
+        return AddressCoinMatch::Foreign;
+    }
+
+    // Neither an own/foreign segwit address nor any Base58Check address. The
+    // caller may consult a coin-specific decoder (e.g. BCH CashAddr) next.
+    return AddressCoinMatch::Invalid;
+}
+
+std::vector<unsigned char> address_to_script_for_coin(
+    const std::string& address,
+    const std::vector<uint8_t>& p2pkh_versions,
+    const std::vector<uint8_t>& p2sh_versions,
+    const std::vector<std::string>& accepted_hrps)
+{
+    std::vector<unsigned char> script;
+    classify_address_for_coin(address, p2pkh_versions, p2sh_versions,
+                              accepted_hrps, script);
+    return script;  // non-empty only for AddressCoinMatch::Own
 }
 
 std::string script_to_address(const std::vector<unsigned char>& script,

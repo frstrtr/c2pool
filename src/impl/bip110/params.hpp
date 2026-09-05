@@ -33,9 +33,39 @@
 #include "pow.hpp"
 
 #include <core/coin_params.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
 namespace bip110
 {
+
+// ─── Address-encoding SSOT (issue #961 blocker #3) ───────────────────────────
+// The ONE place BIP-110's payout version bytes / bech32 HRPs live. BIP-110 keeps
+// the Bitcoin address formats unchanged (Knots-GBT parent): mainnet PUBKEY 0 /
+// SCRIPT 5 / bech32 "bc"; testnet PUBKEY 111 / SCRIPT 196 / bech32 "tb"; regtest
+// reuses the testnet base58 bytes with bech32 "bcrt". make_coin_params() reads
+// the MAINNET entry (the Knots-GBT parent runs mainnet) and address_acceptance()
+// reads all three, so the money-path acceptance set never drifts from the coin
+// params. HRPs here are BARE.
+struct AddressEncoding { uint8_t p2pkh; uint8_t p2sh; const char* hrp_bare; };
+inline constexpr AddressEncoding MAINNET_ADDR{ 0x00, 0x05, "bc"   };
+inline constexpr AddressEncoding TESTNET_ADDR{ 0x6f, 0xc4, "tb"   };  // 111 / 196
+inline constexpr AddressEncoding REGTEST_ADDR{ 0x6f, 0xc4, "bcrt" };  // testnet bytes, "bcrt"
+
+// Registry-sourced payout-address acceptance for BIP-110 on the ACTIVE network
+// (issue #961). DERIVED from the AddressEncoding SSOT above — no re-typed
+// literals. Deriving from the true network keeps a --regtest address from being
+// rejected as Foreign.
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
+{
+    const AddressEncoding& e = regtest ? REGTEST_ADDR
+                             : testnet ? TESTNET_ADDR
+                             : MAINNET_ADDR;
+    core::CoinAddressAcceptance a;
+    a.p2pkh_versions = { e.p2pkh };
+    a.p2sh_versions  = { e.p2sh };
+    a.bech32_hrps    = { e.hrp_bare };
+    return a;
+}
 
 // --- Coin-network identity (documented for the GBT/coin-P2P backend) ---------
 // These are NOT core::CoinParams fields; they live here as the single place the
@@ -120,11 +150,14 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.symbol       = "BIP110";
     p.block_period = 600;  // 10-minute target interval (unchanged from Bitcoin)
 
-    // Address encoding — Bitcoin mainnet base58/bech32 (unchanged by BIP-110).
-    p.address_version       = 0;    // P2PKH version byte (mainnet "1...")
-    p.address_p2sh_version  = 5;    // P2SH version byte (mainnet "3...")
-    p.address_p2sh_version2 = 0;    // no secondary P2SH prefix
-    p.bech32_hrp            = "bc"; // bech32 HRP
+    // Address encoding — Bitcoin mainnet base58/bech32 (unchanged by BIP-110),
+    // from the AddressEncoding SSOT (issue #961 blocker #3). The Knots-GBT parent
+    // runs mainnet, so make_coin_params encodes the MAINNET entry; address_
+    // acceptance() reads the testnet/regtest entries for --regtest/--testnet.
+    p.address_version       = MAINNET_ADDR.p2pkh;   // 0x00 (mainnet "1...")
+    p.address_p2sh_version  = MAINNET_ADDR.p2sh;    // 0x05 (mainnet "3...")
+    p.address_p2sh_version2 = 0;                    // no secondary P2SH prefix
+    p.bech32_hrp            = MAINNET_ADDR.hrp_bare; // "bc"
 
     // PoW: BLAKE2b commitment pipeline as BOTH the work and the block identity
     // (the block hash == PoW hash shape, like DASH's X11). Span-typed, so the

@@ -21,9 +21,32 @@
 
 #include <core/coin_params.hpp>
 #include <core/pow.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
 namespace dgb
 {
+
+// Registry-sourced payout-address acceptance for DGB on the ACTIVE network
+// (issue #961). Every consensus byte comes from the dgb::CoinParams SSOT
+// (config_coin.hpp), NEVER a literal at the stratum call site. Regtest is a
+// distinct network: DigiByte Core CRegTestParams reuses the TESTNET base58
+// version bytes and swaps the bech32 HRP to "dgbrt" — deriving the set from the
+// true network (not a mainnet-or-not bool) is what stops a --regtest payout
+// address being rejected as Foreign.
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
+{
+    core::CoinAddressAcceptance a;
+    if (testnet || regtest) {
+        a.p2pkh_versions = { CoinParams::TESTNET_ADDRESS_VERSION };  // 0x7e
+        a.p2sh_versions  = { CoinParams::TESTNET_P2SH_VERSION };     // 0x8c
+        a.bech32_hrps    = { regtest ? "dgbrt" : CoinParams::TESTNET_BECH32_HRP };
+    } else {
+        a.p2pkh_versions = { CoinParams::ADDRESS_VERSION };          // 0x1e (D...)
+        a.p2sh_versions  = { CoinParams::ADDRESS_P2SH_VERSION };     // 0x3f (S...)
+        a.bech32_hrps    = { CoinParams::BECH32_HRP };               // "dgb"
+    }
+    return a;
+}
 
 // --- Merged-mining aux chain identity (bucket-1 isolation primitive) ---------
 // DGB's OWN AuxPoW chain id, consumed when DGB registers an embedded backend

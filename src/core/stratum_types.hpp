@@ -131,6 +131,23 @@ struct StratumConfig {
     //     not reset. 0 = off (LTC/BTC/DGB unchanged: periodic push stays purely
     //     work-generation-gated).
     uint32_t keepalive_notify_sec       = 0;
+
+    // ── Payout-address acceptance for the running coin (issue #961) ──────────
+    // The Base58Check version bytes and bech32 HRPs (BARE, no trailing '1') this
+    // coin accepts as its OWN payout addresses on the ACTIVE network. Populated
+    // by the coin's main() from its registry (e.g. ltc::address_acceptance) so
+    // the stratum payout money-path validates a miner's address against the
+    // running coin BEFORE building a scriptPubKey: a foreign-coin address is
+    // rejected loudly instead of being repurposed into a wrong-coin script that
+    // MISDIRECTS the reward. Left EMPTY by lanes that validate at mining_submit
+    // (BTC/BCH/DASH/DGB/BIP110 work sources) — an all-empty triple means "no
+    // acceptance configured", and the core stratum server then preserves the
+    // legacy chain-agnostic build (byte-identical) rather than rejecting every
+    // address. The LTC/DOGE merged-mining server populates it so its per-job
+    // coinbase payout is checked at the parse.
+    std::vector<uint8_t>     payout_p2pkh_versions;
+    std::vector<uint8_t>     payout_p2sh_versions;
+    std::vector<std::string> payout_bech32_hrps;   // BARE HRPs, no trailing '1'
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These

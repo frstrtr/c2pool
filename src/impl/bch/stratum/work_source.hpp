@@ -148,6 +148,22 @@ public:
     uint64_t                            get_work_generation() const override;
     bool                                has_merged_chain(uint32_t chain_id) const override;
 
+    /// #961 cross-lane (B4): publish BCH's OWN payout-address acceptance (legacy
+    /// base58; CashAddr is a registered native decoder consulted by decide_payout_
+    /// address()) into the StratumConfig the core StratumServer reads, so the SAME
+    /// decide_payout_address() door-reject + no-empty-payout guard LTC runs apply
+    /// on the BCH lane — a foreign-unconfigured payout is rejected at the door
+    /// instead of building a zero-hash160 (unspendable) coinbase that PPLNS burns.
+    /// Own-coin (base58 + CashAddr) stay accepted, byte-identical. Set once at
+    /// startup, before the server reads config_.
+    void set_payout_acceptance(std::vector<uint8_t> p2pkh_versions,
+                               std::vector<uint8_t> p2sh_versions,
+                               std::vector<std::string> bech32_hrps) {
+        config_.payout_p2pkh_versions = std::move(p2pkh_versions);
+        config_.payout_p2sh_versions  = std::move(p2sh_versions);
+        config_.payout_bech32_hrps    = std::move(bech32_hrps);
+    }
+
     // ── IWorkSource: per-connection bookkeeping ──────────────────────────
     void register_stratum_worker(const std::string& session_id,
                                  const core::stratum::WorkerInfo& info) override;
@@ -254,11 +270,18 @@ public:
     /// are broadcast but not recorded to the dashboard. TELEMETRY ONLY.
     void set_on_found_block_fn(OnFoundBlockFn fn);
 
+    /// #961: mark this node as running on the BCH regtest network so the payout
+    /// money-path validates a miner's legacy base58 address against the REGTEST
+    /// set (testnet base58 bytes) instead of mainnet. Address-validation scope
+    /// only; called from the entrypoint under --regtest.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
+
 private:
     // External dependencies (non-owning references)
     bch::coin::HeaderChain&     chain_;
     bch::coin::Mempool&         mempool_;
     const bool                  is_testnet_;
+    bool                        is_regtest_ = false;  // #961: --regtest address set
 
     // Submission dispatch
     SubmitBlockFn               submit_block_fn_;

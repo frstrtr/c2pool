@@ -18,6 +18,7 @@
 
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/mempool.hpp>
+#include <impl/btc/config_coin.hpp>             // btc::address_acceptance (#961 registry-sourced payout check)
 #include <impl/btc/coin/template_builder.hpp>  // build_template + merkle_hash_pair
 #include <impl/btc/coin/transaction.hpp>
 #include <c2pool/merged/merged_mining.hpp>   // MergedMiningManager::has_chain (PR-2a)
@@ -1069,9 +1070,27 @@ nlohmann::json BTCWorkSource::mining_submit(
             // substituted share hits the #1394 gentx-mismatch decline. Inputs
             // (job->prev_share_hash, session extranonce1, miner script) are the
             // exact ones the build side rolled on. Default (fee off) => identity.
+            // #961: validate the payout address against BTC's OWN version bytes
+            // / HRP before building a script. The chain-agnostic
+            // address_to_script() would repurpose a foreign-coin address into a
+            // BTC script and MISDIRECT the miner's funds; a Foreign address here
+            // yields an empty script — the same behaviour as an unparseable
+            // address (share added locally, no wrong-coin payment). The accepted
+            // set is REGISTRY-SOURCED (btc::address_acceptance) and derived from
+            // the TRUE network (mainnet/testnet/regtest) so a --regtest payout
+            // address is accepted rather than rejected as Foreign.
+            std::vector<unsigned char> miner_script;
+            {
+                auto amatch = core::classify_address_for_coin(
+                    username, btc::address_acceptance(is_testnet_, is_regtest_),
+                    miner_script);
+                if (amatch == core::AddressCoinMatch::Foreign)
+                    LOG_WARNING << "[BTC-STRATUM] REJECTED foreign-coin payout "
+                                   "address (user=" << username << ") — not a BTC "
+                                   "address; refusing to misdirect funds";
+            }
             auto payout_script = effective_payout_script(
-                core::address_to_script(username),
-                job->prev_share_hash, extranonce1);
+                miner_script, job->prev_share_hash, extranonce1);
 
             try {
                 share_hash = create_fn(coinbase, header, *job, payout_script);

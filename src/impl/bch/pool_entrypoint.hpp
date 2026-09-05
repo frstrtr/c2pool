@@ -62,6 +62,8 @@
 #include "coin/embedded_daemon.hpp"
 #include "stratum/work_source.hpp"
 #include "config_pool.hpp"      // bch::PoolConfig::get_donation_script
+#include "config_coin.hpp"      // bch::address_acceptance (#961 cross-lane payout publish)
+#include "coin/cashaddr.hpp"    // bch::coin::cashaddr::register_cashaddr_decoder (#961 CashAddr payout)
 #include "share_check.hpp"      // bch::create_local_share (transitive via node.hpp)
 #include "share_types.hpp"      // bch::StaleInfo
 #include "coin/block.hpp"       // bch::coin::SmallBlockHeaderType
@@ -187,6 +189,28 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 daemon.broadcast_won_block(block_bytes, HexStr(block_bytes));
             return r.any();
         });
+
+    work_source->set_regtest(is_regtest);  // #961: --regtest legacy-address set
+
+    // #961 cross-lane (B4): register BCH's native CashAddr decoder into the
+    // generic core address hook so core::address_to_script() (and therefore the
+    // decide_payout_address() SSOT the core stratum door-reject consults) resolves
+    // a miner's CashAddr username to a real scriptPubKey. Without it a CashAddr
+    // payout decoded to EMPTY -> a zero-hash160 (unspendable) coinbase PPLNS burns.
+    // Idempotent (once per process).
+    coin::cashaddr::register_cashaddr_decoder(is_testnet, is_regtest);
+    // Publish BCH's REGISTRY-SOURCED own-coin payout-address acceptance (legacy
+    // base58; CashAddr is the registered native decoder above) into the
+    // StratumConfig the core StratumServer reads, so the SAME decide_payout_
+    // address() door-reject (mining.authorize) + no-empty-payout guard LTC runs
+    // also apply on the BCH lane — a foreign-unconfigured payout is rejected at
+    // the door instead of building the zero-hash160 burn. Own-coin (base58 +
+    // CashAddr) stay accepted byte-identically.
+    {
+        const auto acc = bch::address_acceptance(is_testnet, is_regtest);
+        work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
+                                           acc.bech32_hrps);
+    }
 
     // ── Sharechain WRITE path: local-share author wiring ─────────────────
     // Without these callbacks BCHWorkSource accepts miner submissions that

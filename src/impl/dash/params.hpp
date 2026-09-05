@@ -24,6 +24,7 @@
 
 #include <core/coin_params.hpp>
 #include <core/pow.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
 #include <optional>
 #include <string>
@@ -31,6 +32,33 @@
 
 namespace dash
 {
+
+// ─── Address-encoding SSOT (issue #961 blocker #3) ───────────────────────────
+// The ONE place DASH's payout version bytes live (oracle networks/dash.py):
+// mainnet PUBKEY 76 (X...) / SCRIPT 16 (7...); testnet PUBKEY 140 (y...) / SCRIPT
+// 19. DASH has a SINGLE P2SH version and NO segwit/bech32 on any network. BOTH
+// make_coin_params() and address_acceptance() read these constants, so the
+// stratum money-path acceptance set can NEVER drift from the coin params.
+struct AddressEncoding { uint8_t p2pkh; uint8_t p2sh; };
+inline constexpr AddressEncoding MAINNET_ADDR{ 76,  16 };  // X... / 7...
+inline constexpr AddressEncoding TESTNET_ADDR{ 140, 19 };  // y...
+inline constexpr const AddressEncoding& address_encoding(bool testnet)
+{ return testnet ? TESTNET_ADDR : MAINNET_ADDR; }
+
+// Registry-sourced payout-address acceptance for DASH on the ACTIVE network
+// (issue #961). DERIVED from the AddressEncoding SSOT above — no re-typed
+// literals. DASH regtest (dashd CRegTestParams) reuses the testnet base58 version
+// bytes, so a --regtest payout address decodes under the testnet set rather than
+// being rejected as Foreign.
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
+{
+    const auto& e = address_encoding(testnet || regtest);
+    core::CoinAddressAcceptance a;
+    a.p2pkh_versions = { e.p2pkh };
+    a.p2sh_versions  = { e.p2sh };
+    a.bech32_hrps    = {};           // DASH: no bech32 on any network
+    return a;
+}
 
 // Runtime override seam for pool.yaml (Fileconfig consume-side, S6 follow-on).
 // ONLY operationally-tunable, NON-consensus, NON-isolation pool fields may be
@@ -57,14 +85,13 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
     p.symbol       = "DASH";
     p.block_period = 150;  // target_spacing (2.5 min), matches header_chain DGW target_spacing
 
-    // Address encoding (oracle PARENT). DASH has a SINGLE P2SH version; there is
-    // no secondary P2SH prefix and no bech32 HRP on the older baseline.
-    if (testnet) {
-        p.address_version      = 140;  // testnet PUBKEY_ADDRESS (y...)
-        p.address_p2sh_version = 19;   // testnet SCRIPT_ADDRESS
-    } else {
-        p.address_version      = 76;   // mainnet PUBKEY_ADDRESS (X...)
-        p.address_p2sh_version = 16;   // mainnet SCRIPT_ADDRESS (7...)
+    // Address encoding (oracle PARENT) — from the AddressEncoding SSOT (issue
+    // #961 blocker #3). DASH has a SINGLE P2SH version; there is no secondary
+    // P2SH prefix and no bech32 HRP on the older baseline.
+    {
+        const auto& e = address_encoding(testnet);
+        p.address_version      = e.p2pkh;  // testnet 140 (y...) / mainnet 76 (X...)
+        p.address_p2sh_version = e.p2sh;   // testnet 19 / mainnet 16 (7...)
     }
     p.address_p2sh_version2 = 0;  // DASH: no secondary P2SH prefix
     p.bech32_hrp            = "";  // DASH: no segwit / no bech32

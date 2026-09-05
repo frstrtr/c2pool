@@ -20,11 +20,35 @@
 #include <core/config.hpp>
 #include <core/fileconfig.hpp>
 #include <core/netaddress.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
 #include <yaml-cpp/yaml.h>
 
 namespace bch
 {
+
+// Registry-sourced LEGACY-base58 payout-address acceptance for BCH on the ACTIVE
+// network (issue #961). BCH legacy base58 shares Bitcoin's version bytes
+// (BCHN chainparams.cpp): mainnet PUBKEY 0 / SCRIPT 5; testnet & regtest both
+// PUBKEY 111 / SCRIPT 196. BCH has NO segwit/bech32 — its native CashAddr is a
+// DISTINCT format with no base58 version byte, so a CashAddr yields
+// AddressCoinMatch::Invalid here and (only then) falls through to the
+// coin-registered CashAddr decoder. Deriving from the true network keeps a
+// --regtest legacy address from being rejected as Foreign.
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
+{
+    core::CoinAddressAcceptance a;
+    if (testnet || regtest) {
+        a.p2pkh_versions = { 0x6f };  // 111
+        a.p2sh_versions  = { 0xc4 };  // 196
+    } else {
+        a.p2pkh_versions = { 0x00 };
+        a.p2sh_versions  = { 0x05 };
+    }
+    a.bech32_hrps = {};               // BCH: no bech32 (CashAddr via fallback)
+    return a;
+}
+
 namespace config
 {
     struct P2PData

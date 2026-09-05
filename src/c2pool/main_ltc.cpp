@@ -66,6 +66,7 @@
 // AppleClang/arm64 ("use of undeclared identifier s / ser_action").
 #include <impl/ltc/coin/coin_node.hpp>
 #include <impl/ltc/config.hpp>
+#include <impl/ltc/params.hpp>  // ltc::address_acceptance (#961 registry-sourced payout check)
 #include <impl/ltc/work_target.hpp>
 
 // Chain seed discovery
@@ -1765,6 +1766,19 @@ int main(int argc, char* argv[]) {
             // during SPV header sync and share loading.
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port),
                                      settings->m_testnet, enhanced_node, blockchain);
+            // #961: publish the running coin's REGISTRY-SOURCED payout-address
+            // acceptance (LTC on the active network) so the core stratum server
+            // validates each per-job coinbase payout against LTC's own version
+            // bytes / HRP at the parse — a foreign-coin address is rejected
+            // (empty payout) instead of being repurposed into a wrong-coin
+            // script, while a configured merged chain's address (DOGE etc.) is
+            // still honoured via the shared merged-chain table.
+            {
+                auto acc = ltc::address_acceptance(settings->m_testnet);
+                stratum_config.payout_p2pkh_versions = acc.p2pkh_versions;
+                stratum_config.payout_p2sh_versions  = acc.p2sh_versions;
+                stratum_config.payout_bech32_hrps    = acc.bech32_hrps;
+            }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
             // (lambdas read the immutable snapshot published in main()). POST

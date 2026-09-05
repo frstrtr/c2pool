@@ -35,6 +35,7 @@
 // Mirrors src/c2pool/main_btc.cpp s target shape.
 
 #include <impl/dgb/node.hpp>
+#include <impl/dgb/params.hpp>          // dgb::address_acceptance (#961 cross-lane payout publish)
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <impl/dgb/catalog_defaults.hpp>  // M0b L0 compiled defaults
@@ -1422,6 +1423,22 @@ int run_node(const core::CoinParams& params, bool testnet,
     auto work_source = std::make_shared<dgb::stratum::DGBWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
+    // #961: the DGBWorkSource ctor takes only a testnet bool; --regtest is a
+    // THIRD network (DigiByte CRegTestParams reuses the testnet base58 bytes and
+    // uses the "dgbrt" bech32 HRP). Pass it through so a legitimate --regtest
+    // payout address is accepted rather than rejected as Foreign.
+    work_source->set_regtest(regtest);
+    // #961 cross-lane (B4): publish DGB's REGISTRY-SOURCED own-coin payout-address
+    // acceptance into the StratumConfig the core StratumServer reads, so the SAME
+    // decide_payout_address() door-reject (mining.authorize) + no-empty-payout
+    // guard (send_notify_work) LTC runs also apply on the DGB lane — a foreign-
+    // unconfigured payout is rejected at the door instead of left empty/redirected.
+    // Network-derived; own-coin + a CONFIGURED merged chain (DOGE) stay accepted.
+    {
+        const auto acc = dgb::address_acceptance(testnet, regtest);
+        work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
+                                           acc.bech32_hrps);
+    }
 
 #ifdef AUX_DOGE
     // Arm the #1413 DGBWorkSource merged-mining seams: once bound, every built

@@ -34,6 +34,7 @@
 #include <impl/bch/coin/merkle.hpp>            // merkle_hash_pair (CTOR SHA256d)
 #include <impl/bch/coin/template_builder.hpp>  // build_template + rpc::WorkData
 #include <impl/bch/config_pool.hpp>            // PoolConfig::max_target (G2 cold-start floor)
+#include <impl/bch/config_coin.hpp>            // bch::address_acceptance (#961 registry-sourced payout check)
 
 #include <core/log.hpp>
 #include <btclibs/util/strencodings.h>         // HexStr
@@ -722,11 +723,51 @@ nlohmann::json BCHWorkSource::mining_submit(
 
         uint256 share_hash;
         if (create_fn) {
-            auto payout_script = core::address_to_script(username);
-            try { share_hash = create_fn(coinbase, header, *job, payout_script); }
-            catch (const std::exception& e) {
-                LOG_WARNING << tag << " create_share_fn threw: " << e.what()
-                            << " -- share not added";
+            // #961: validate the payout address against BCH's OWN version bytes
+            // before building a script, so a foreign-coin base58 address (e.g.
+            // an LTC/DASH/DGB address) is rejected rather than repurposed into a
+            // BCH script — which would MISDIRECT the miner's funds. BCH legacy
+            // base58: mainnet 0x00/0x05, testnet 0x6f/0xc4 (no segwit). BCH's
+            // native CashAddr is a different format with no base58 version byte;
+            // it (and only it) falls through to the coin-registered CashAddr
+            // decoder via address_to_script(). NOTE: BCH legacy base58 shares
+            // BTC's version bytes, an inherent BCH/BTC ambiguity — a BTC legacy
+            // address is therefore accepted here (same hash160/key), which is
+            // NOT a misdirection.
+            // Accepted set REGISTRY-SOURCED (bch::address_acceptance): legacy
+            // base58 only (BCH's native CashAddr yields Invalid and falls through
+            // to the coin-registered decoder below), derived from the active
+            // network so a --regtest legacy address is accepted.
+            std::vector<unsigned char> payout_script;
+            auto amatch = core::classify_address_for_coin(
+                username, bch::address_acceptance(is_testnet_, is_regtest_),
+                payout_script);
+            if (amatch == core::AddressCoinMatch::Foreign)
+                LOG_WARNING << "[BCH-STRATUM] REJECTED foreign-coin payout address "
+                               "(user=" << username << ") — not a BCH address; "
+                               "refusing to misdirect funds";
+            else if (amatch == core::AddressCoinMatch::Invalid)
+                payout_script = core::address_to_script(username);  // CashAddr decoder
+            // #961 B4 — ZERO-HASH160 BURN GUARD (money path): a Foreign (wrong-
+            // coin) or otherwise-undecodable username leaves payout_script EMPTY.
+            // Building the share anyway made create_local_share() default the
+            // finder's pubkey_hash to all-zero — an UNSPENDABLE coinbase output
+            // PPLNS then credits this miner's work against every block, BURNING
+            // their reward (the fresh cycle-1 BCH accept-and-burn). Refuse to
+            // build the share at all: no zero-hash160 share is ever minted. The
+            // core StratumServer already door-rejects such a username at
+            // mining.authorize (payout_* now published), so a live rig never
+            // reaches here; this is the defence-in-depth money-path backstop.
+            if (payout_script.empty()) {
+                LOG_WARNING << tag << " REFUSING to build share for user=" << username
+                            << " — no BCH payout script (foreign/undecodable address);"
+                               " never minting a zero-hash160 (unspendable) share (#961)";
+            } else {
+                try { share_hash = create_fn(coinbase, header, *job, payout_script); }
+                catch (const std::exception& e) {
+                    LOG_WARNING << tag << " create_share_fn threw: " << e.what()
+                                << " -- share not added";
+                }
             }
         }
 

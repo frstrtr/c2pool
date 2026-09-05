@@ -2624,7 +2624,26 @@ nlohmann::json DASHWorkSource::mining_submit(
             in.subsidy         = job->subsidy;
             in.prev_share_hash = job->prev_share_hash;
             in.merkle_branches = std::move(branch_hashes);
-            in.payout_script   = core::address_to_script(username);
+            // #961: validate the payout address against DASH's OWN version bytes
+            // before building a script. The chain-agnostic address_to_script()
+            // would happily turn a foreign-coin address into a DASH script and
+            // MISDIRECT the miner's funds; classify_address_for_coin rejects a
+            // foreign address (→ empty script → the mint's existing empty-payout
+            // fallback), never repurposes it. The accepted set is REGISTRY-SOURCED
+            // (dash::address_acceptance → oracle networks/dash.py): mainnet
+            // 76/16, testnet 140/19, no bech32; DASH regtest reuses testnet
+            // base58 bytes.
+            {
+                std::vector<unsigned char> payout_script;
+                auto amatch = core::classify_address_for_coin(
+                    username, dash::address_acceptance(is_testnet_, is_regtest_),
+                    payout_script);
+                if (amatch == core::AddressCoinMatch::Foreign)
+                    LOG_WARNING << "[DASH-STRATUM] REJECTED foreign-coin payout "
+                                   "address (user=" << username << ") — not a DASH "
+                                   "address; refusing to misdirect funds";
+                in.payout_script = std::move(payout_script);
+            }
             in.pow_hash        = pow_hash;
             // #889: tell the mint binding this solve is a WON BLOCK, so it
             // takes a bounded wait on the tracker rather than the ordinary

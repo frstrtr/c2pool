@@ -142,6 +142,20 @@ public:
     uint64_t                            get_work_generation() const override { return work_generation_.load(); }
     bool                                has_merged_chain(uint32_t) const override { return false; }
 
+    /// #961 cross-lane (B4): publish BIP-110's OWN payout-address acceptance into
+    /// the StratumConfig the core StratumServer reads, so the SAME decide_payout_
+    /// address() door-reject + no-empty-payout guard LTC runs apply on this lane —
+    /// a foreign-unconfigured payout is rejected at the door instead of redirected.
+    /// Own-coin addresses stay accepted, byte-identical. Set once at startup,
+    /// before the server reads config_.
+    void set_payout_acceptance(std::vector<uint8_t> p2pkh_versions,
+                               std::vector<uint8_t> p2sh_versions,
+                               std::vector<std::string> bech32_hrps) {
+        config_.payout_p2pkh_versions = std::move(p2pkh_versions);
+        config_.payout_p2sh_versions  = std::move(p2sh_versions);
+        config_.payout_bech32_hrps    = std::move(bech32_hrps);
+    }
+
     // ── IWorkSource: per-connection bookkeeping ──────────────────────────
     void register_stratum_worker(const std::string& id, const core::stratum::WorkerInfo& info) override;
     void unregister_stratum_worker(const std::string& id) override;
@@ -183,6 +197,11 @@ public:
     void set_share_target(uint32_t bits, uint32_t max_bits)
     { share_bits_.store(bits); share_max_bits_.store(max_bits); }
     void set_donation_script(std::vector<unsigned char> s) { donation_script_ = std::move(s); }
+    /// #961: mark this node as running on the BIP-110 regtest network so the
+    /// payout money-path validates a miner's address against the REGTEST set
+    /// (testnet base58 bytes + "bcrt" HRP) instead of mainnet. Address-validation
+    /// scope only; called from main under --regtest.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
     // Node-owner fee destination. When empty the node-owner fee (if any) is paid
     // to the donation script (single-key consolidation, our 13zQ/bc1qyr94… key).
     void set_node_owner_script(std::vector<unsigned char> s) { node_owner_script_ = std::move(s); }
@@ -252,6 +271,7 @@ private:
 
     bip110::coin::HeaderChain&   chain_;
     const bool                   is_testnet_;
+    bool                         is_regtest_ = false;  // #961: --regtest address set
     SubmitBlockFn                submit_block_fn_;
     core::stratum::StratumConfig config_;
 
