@@ -49,11 +49,33 @@ struct LaneParams {
 // matches their per-share nature (FLAG_PERSISTENT semantics: operator OQ).
 constexpr std::uint32_t L0F_FEE_SHARE     = 0x01;
 constexpr std::uint32_t L0F_STALE_DOA     = 0x02;
+constexpr std::uint32_t L0F_RECEIPT       = 0x04;  // RDWR work-receipt credit
+// (Track A2 / W2 — src/c2pool/v37/w2_admission.hpp). Annotation-only, exactly
+// like every other L0F_* bit: NOT a digest leaf and never weight-bearing
+// (build_leaves() below hashes geometry, B, next_pos, counts, L0/bucket sums,
+// and acc — never `flags`), so ADDING this constant changes no golden, no
+// weight, no digest. It marks an L0 slot whose weight credit came from an
+// admitted RDWR receipt (a stale share re-presented within N_CTX) rather than
+// a freshly-chained share; the lane treats it as an opaque pass-through set by
+// the W2 admission emitter BEFORE push. CONSENSUS-SURFACE NOTE (W2-F-B): this
+// one-line addition is digest-neutral by construction, but it touches the
+// consensus header, so it lands under the integrator's digest-neutral tap
+// (standing no-self-merge rule), not by W2's own hand. It does not block the
+// W2 impl or its tests.
 constexpr std::uint32_t L0F_AUTHORITY_MSG = 0x08;
 constexpr std::uint32_t L0F_MINER_MSG     = 0x10;  // permissionless miner
 // message present (c2pool-v37-miner-messages.md: plaintext envelope, sig
 // bound to the payout identity, TTL funded by decayed_weight() — the lane
 // is the budget ledger; the live-message index is view-layer, not here)
+
+// L0F_RECEIPT must be the one free low bit (spec §6) and must collide with no
+// already-assigned annotation.
+static_assert(L0F_RECEIPT == 0x04,
+              "W2 spec §6 pins the receipt bit to the one free low bit (0x04)");
+static_assert((L0F_RECEIPT & (L0F_FEE_SHARE | L0F_STALE_DOA |
+                              L0F_AUTHORITY_MSG | L0F_MINER_MSG)) == 0,
+              "L0F_RECEIPT must occupy the free bit, colliding with no "
+              "assigned L0F_* annotation bit");
 
 // Level-0 slot (SoA in the production layout; AoS here for clarity — the
 // arrays are contiguous std::vector rings either way).
