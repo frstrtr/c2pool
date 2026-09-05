@@ -71,6 +71,42 @@ TEST(PoolRateHeadSelect, VerifiedBestLiveWins) {
     EXPECT_EQ(select_pool_rate_head(verified, /*present=*/true, raw), H(7));
 }
 
+// ---- (1b) FUTURE-DATED head is LIVE, not dead (blocker A) ----------------
+
+TEST(PoolRateHeadSelect, FutureDatedHeadIsLive) {
+    // A newest share dated a few seconds AHEAD of the sampling clock (clock skew
+    // or a legitimately future-dated share) makes now-ts NEGATIVE. That head is
+    // maximally live -- it MUST stay anchorable. The pre-fix code overloaded the
+    // -1 "undatable" sentinel with any negative age, so a share 1 s in the future
+    // read as DEAD, the verified head lost liveness, and the anchor flipped off
+    // it (the #1482 symptom). With kUnknownAge = INT64_MIN the two are distinct.
+    using sharechain::pool_rate_head_is_live;
+    using sharechain::kUnknownAge;
+
+    // A future-dated head is live at any negative age; the undatable sentinel is
+    // NOT live even though it too is "negative".
+    EXPECT_TRUE(pool_rate_head_is_live(mk(1, 100, /*age*/ -5, 10.0), 600));
+    EXPECT_TRUE(pool_rate_head_is_live(mk(2, 100, /*age*/ -1, 10.0), 600));
+    PoolRateHead undatable = mk(3, 100, /*age*/ 0, 10.0);
+    undatable.newest_share_age_s = kUnknownAge;
+    EXPECT_FALSE(pool_rate_head_is_live(undatable, 600));
+
+    // A verified best whose newest share is 5 s in the FUTURE still wins outright
+    // -- it does not fall through to the raw-head branch.
+    PoolRateHead verified = mk(7, 900, /*age*/ -5, /*aps*/ 100.0);
+    std::vector<PoolRateHead> raw = {mk(11, 901, 5, 999.0)};
+    EXPECT_EQ(select_pool_rate_head(verified, /*present=*/true, raw), H(7));
+
+    // And a future-dated RAW head is a valid live anchor when no verified head is
+    // present (beats an undatable head that must be skipped).
+    PoolRateHead undatable_raw = mk(12, 950, /*age*/ 0, 1e9);
+    undatable_raw.newest_share_age_s = kUnknownAge;
+    std::vector<PoolRateHead> raw2 = {undatable_raw,
+                                      mk(13, 400, /*age*/ -3, 42.0)};
+    EXPECT_EQ(select_pool_rate_head(PoolRateHead{}, /*present=*/false, raw2),
+              H(13));
+}
+
 // ---- (2) STALE verified best -> fastest LIVE raw head --------------------
 
 TEST(PoolRateHeadSelect, StaleVerifiedBestYieldsFastestLiveRawHead) {

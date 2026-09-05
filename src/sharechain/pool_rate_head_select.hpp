@@ -59,6 +59,18 @@
 
 namespace sharechain {
 
+// Sentinel age: this head has NO datable newest share (its timestamp was
+// absent / non-positive), so it can never be anchored on. It must be a value
+// no real (now - ts) difference can ever equal -- and in particular NOT a small
+// negative number, because a share whose timestamp is a few seconds AHEAD of
+// the sampling clock (clock skew / a legitimately future-dated newest share)
+// produces a small NEGATIVE age that is maximally LIVE, not undatable. INT64_MIN
+// is unreachable by any wall-clock subtraction, so it can never collide with a
+// real age. (The pre-fix sentinel of -1 collided with a share dated 1 s in the
+// future: it was mis-read as "undatable" -> the head went DEAD -> the anchor
+// flipped off the live verified head. Issue #1482 / PR #1495 blocker A.)
+inline constexpr int64_t kUnknownAge = INT64_MIN;
+
 // A candidate sharechain head for the dashboard pool-rate estimator. The caller
 // fills these from ShareChain::get_heads() + get_height() + the head share's
 // timestamp + ShareTracker::get_pool_attempts_per_second(), all under the
@@ -66,17 +78,22 @@ namespace sharechain {
 struct PoolRateHead {
     uint256 hash;
     int32_t height{0};
-    // Seconds between now and the newest share on this head. NEGATIVE means
-    // "unknown / no datable share" -> treated as NOT live (never anchored on).
-    int64_t newest_share_age_s{-1};
+    // Seconds between now and the newest share on this head. kUnknownAge means
+    // "no datable share" -> treated as NOT live (never anchored on). A NEGATIVE
+    // value (a future-dated newest share, now < ts) is maximally live, NOT dead.
+    int64_t newest_share_age_s{kUnknownAge};
     // get_pool_attempts_per_second over the display lookbehind on this head.
     double  aps{0.0};
 };
 
-// A head is LIVE when its newest share is datable and within the horizon.
+// A head is LIVE when its newest share is datable and no OLDER than the horizon.
+// A negative age (future-dated share) is maximally live; only kUnknownAge (and
+// an age strictly past the horizon) is not live. Guarding on kUnknownAge rather
+// than `>= 0` is blocker-A's fix: a future-dated head must stay anchorable.
 inline bool pool_rate_head_is_live(const PoolRateHead& h, int64_t horizon_s)
 {
-    return h.newest_share_age_s >= 0 && h.newest_share_age_s <= horizon_s;
+    return h.newest_share_age_s != kUnknownAge &&
+           h.newest_share_age_s <= horizon_s;
 }
 
 // Choose the head to anchor the dashboard pool-rate estimator on (see header).

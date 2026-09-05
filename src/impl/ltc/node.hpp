@@ -192,6 +192,10 @@ protected:
                     cd.share.invoke([&](auto* sh) {
                         ts = static_cast<int64_t>(sh->m_timestamp);
                     });
+                    // A future-dated newest share (ts > now) yields a NEGATIVE
+                    // age; keep it verbatim -- it is maximally live, not dead.
+                    // Only an undatable share (ts<=0) leaves the kUnknownAge
+                    // default (the not-live sentinel). Issue #1482 blocker A.
                     if (ts > 0) rh.newest_share_age_s = now_s - ts;
                 } catch (...) {}
                 if (rh.height >= 3) {

@@ -3585,6 +3585,9 @@ int main(int argc, char* argv[]) {
                         cd.share.invoke([&](auto* s) {
                             ts = static_cast<int64_t>(s->m_timestamp);
                         });
+                        // Future-dated newest share (ts > now) -> NEGATIVE age,
+                        // kept verbatim (maximally live). Only ts<=0 leaves the
+                        // kUnknownAge default (not-live). Issue #1482 blocker A.
                         if (ts > 0) rh.newest_share_age_s = stats_now_s - ts;
                     } catch (...) {}
                     if (rh.height >= 3) {

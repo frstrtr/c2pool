@@ -4611,10 +4611,14 @@ nlohmann::json MiningInterface::rest_local_stats()
         // target a 60-136 s gap is a perfectly NORMAL Poisson inter-block wait,
         // so the banner fired routinely on a synced, advancing node. It is also
         // gated on "coin peers > 0 AND tip not advancing over the window" -- a
-        // recent work refresh means a new block arrived (tip advancing), and no
-        // coin peers is a different condition (warning #4 covers it). The benign
-        // sub-threshold / peer-starved case is left SILENT ("awaiting next block,
-        // normal") instead of a red LOST CONTACT banner.
+        // recent work refresh means a new block arrived (tip advancing). Zero
+        // coin peers is a SEPARATE, LOUDER condition: warning #4 below counts
+        // POOL (sharechain) peers, a different network, so it does NOT surface a
+        // coin-P2P isolation -- when the tip is stalled AND the coin provider
+        // reports 0 parent-chain peers, that is a genuine outage and gets its own
+        // red "NO COIN P2P PEERS" banner (blocker B). Only the benign
+        // sub-threshold gap on a still-peered node is left SILENT ("awaiting next
+        // block, normal") instead of a red LOST CONTACT banner.
         auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         {
@@ -4663,6 +4667,21 @@ nlohmann::json MiningInterface::rest_local_stats()
                     + std::to_string(now_s - m_last_work_update_time) + "s! "
                     + ((m_coin_node && m_coin_node->is_embedded()) ? "No new blocks received from P2P peers."
                                        : "Check that it isn't frozen or dead!"));
+            } else if (tip_stalled && !have_coin_peers) {
+                // Tip stalled past the 3x-block-period window AND the coin sync
+                // provider reports ZERO parent-chain peers -- a real coin-network
+                // isolation, distinct from the benign "awaiting next block". This
+                // branch only reaches when the provider IS wired and returns 0
+                // (have_coin_peers defaults true without the hook), so it never
+                // fires on a lane lacking the hook. Warning #4 counts POOL peers,
+                // not these, so without this the outage would be SILENT (blocker
+                // B). Name the coin P2P peers explicitly.
+                warnings.push_back("NO COIN P2P PEERS — the "
+                    + std::string((m_coin_node && m_coin_node->is_embedded())
+                                      ? "embedded coin node" : "coin daemon")
+                    + " has 0 parent-chain peers and the tip has not advanced for "
+                    + std::to_string(now_s - m_last_work_update_time)
+                    + "s; no new blocks can arrive until a peer connects.");
             }
         }
 
