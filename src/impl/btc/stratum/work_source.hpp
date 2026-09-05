@@ -328,6 +328,13 @@ public:
     /// web_server.cpp set_node_fee_from_address.
     void set_node_owner_fee(double pct, std::vector<unsigned char> script);
 
+    /// #961: mark this node as running on the BTC regtest network so the payout
+    /// money-path validates a miner's address against the REGTEST address set
+    /// (testnet base58 bytes + "bcrt" HRP) instead of mainnet — otherwise a
+    /// legitimate --regtest payout address is wrongly rejected as Foreign.
+    /// Called from main under --regtest. Address-validation scope only.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
+
 private:
     /// Resolve the effective payout script for a job/share: the node owner's
     /// script with probability node_owner_fee_pct_%, else the miner's own
@@ -341,6 +348,7 @@ private:
     btc::coin::HeaderChain&     chain_;
     btc::coin::Mempool&         mempool_;
     const bool                  is_testnet_;
+    bool                        is_regtest_ = false;  // #961: --regtest address set
 
     // Submission dispatch
     SubmitBlockFn               submit_block_fn_;

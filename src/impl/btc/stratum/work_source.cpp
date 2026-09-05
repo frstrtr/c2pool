@@ -18,6 +18,7 @@
 
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/mempool.hpp>
+#include <impl/btc/config_coin.hpp>             // btc::address_acceptance (#961 registry-sourced payout check)
 #include <impl/btc/coin/template_builder.hpp>  // build_template + merkle_hash_pair
 #include <impl/btc/coin/transaction.hpp>
 #include <c2pool/merged/merged_mining.hpp>   // MergedMiningManager::has_chain (PR-2a)
@@ -1074,15 +1075,14 @@ nlohmann::json BTCWorkSource::mining_submit(
             // address_to_script() would repurpose a foreign-coin address into a
             // BTC script and MISDIRECT the miner's funds; a Foreign address here
             // yields an empty script — the same behaviour as an unparseable
-            // address (share added locally, no wrong-coin payment). BTC: mainnet
-            // 0x00/0x05 + hrp "bc", testnet 0x6f/0xc4 + hrp "tb".
+            // address (share added locally, no wrong-coin payment). The accepted
+            // set is REGISTRY-SOURCED (btc::address_acceptance) and derived from
+            // the TRUE network (mainnet/testnet/regtest) so a --regtest payout
+            // address is accepted rather than rejected as Foreign.
             std::vector<unsigned char> miner_script;
             {
                 auto amatch = core::classify_address_for_coin(
-                    username,
-                    is_testnet_ ? std::vector<uint8_t>{0x6f} : std::vector<uint8_t>{0x00},
-                    is_testnet_ ? std::vector<uint8_t>{0xc4} : std::vector<uint8_t>{0x05},
-                    is_testnet_ ? std::vector<std::string>{"tb"} : std::vector<std::string>{"bc"},
+                    username, btc::address_acceptance(is_testnet_, is_regtest_),
                     miner_script);
                 if (amatch == core::AddressCoinMatch::Foreign)
                     LOG_WARNING << "[BTC-STRATUM] REJECTED foreign-coin payout "

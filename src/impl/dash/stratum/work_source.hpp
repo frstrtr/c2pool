@@ -810,6 +810,7 @@ private:
 
     // Network selector for coin-params resolution (address versions + v36 gate).
     bool is_testnet_{false};
+    bool is_regtest_{false};  // #961: --regtest payout-address acceptance set
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
     bool tx_serve_own_set_{false};   // --embedded-tx-serve-own-set: serve own valid tx set instead of dashd-parity swap (DEFAULT OFF)

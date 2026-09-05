@@ -33,9 +33,30 @@
 #include "pow.hpp"
 
 #include <core/coin_params.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
 namespace bip110
 {
+
+// Registry-sourced payout-address acceptance for BIP-110 on the ACTIVE network
+// (issue #961). BIP-110 keeps the Bitcoin address formats unchanged (Knots-GBT
+// parent): mainnet PUBKEY 0 / SCRIPT 5 / bech32 "bc"; testnet & regtest both
+// PUBKEY 111 / SCRIPT 196, bech32 "tb" (testnet) vs "bcrt" (regtest). Deriving
+// from the true network keeps a --regtest address from being rejected as Foreign.
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
+{
+    core::CoinAddressAcceptance a;
+    if (testnet || regtest) {
+        a.p2pkh_versions = { 0x6f };  // 111
+        a.p2sh_versions  = { 0xc4 };  // 196
+        a.bech32_hrps    = { regtest ? "bcrt" : "tb" };
+    } else {
+        a.p2pkh_versions = { 0x00 };
+        a.p2sh_versions  = { 0x05 };
+        a.bech32_hrps    = { "bc" };
+    }
+    return a;
+}
 
 // --- Coin-network identity (documented for the GBT/coin-P2P backend) ---------
 // These are NOT core::CoinParams fields; they live here as the single place the

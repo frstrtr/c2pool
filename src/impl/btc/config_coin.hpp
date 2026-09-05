@@ -4,6 +4,7 @@
 #include <core/config.hpp>
 #include <core/fileconfig.hpp>
 #include <core/netaddress.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 #include <string>
 
 #include <yaml-cpp/yaml.h>
@@ -85,6 +86,28 @@ inline std::string sharechain_net_name(bool regtest, bool testnet)
     if (regtest) return "bitcoin_regtest";
     if (testnet) return "bitcoin_testnet";
     return "bitcoin";
+}
+
+// Registry-sourced payout-address acceptance for BTC on the ACTIVE network
+// (issue #961). Bitcoin Core chainparams.cpp: mainnet PUBKEY_ADDRESS=0 /
+// SCRIPT_ADDRESS=5 / bech32 "bc"; testnet & regtest both PUBKEY_ADDRESS=111 /
+// SCRIPT_ADDRESS=196, with bech32 "tb" (testnet) vs "bcrt" (regtest). Deriving
+// the set from the true network — not a mainnet-or-not bool — is what keeps a
+// --regtest address from being rejected as Foreign (blocker #2), and centralises
+// the version bytes out of the stratum money path (blocker #3).
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
+{
+    core::CoinAddressAcceptance a;
+    if (testnet || regtest) {
+        a.p2pkh_versions = { 0x6f };  // 111 (m/n...)
+        a.p2sh_versions  = { 0xc4 };  // 196 (2...)
+        a.bech32_hrps    = { regtest ? "bcrt" : "tb" };
+    } else {
+        a.p2pkh_versions = { 0x00 };  // 1...
+        a.p2sh_versions  = { 0x05 };  // 3...
+        a.bech32_hrps    = { "bc" };
+    }
+    return a;
 }
 
 class CoinConfig : protected core::Fileconfig

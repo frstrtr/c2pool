@@ -2629,15 +2629,14 @@ nlohmann::json DASHWorkSource::mining_submit(
             // would happily turn a foreign-coin address into a DASH script and
             // MISDIRECT the miner's funds; classify_address_for_coin rejects a
             // foreign address (→ empty script → the mint's existing empty-payout
-            // fallback), never repurposes it. DASH: mainnet 0x4c/0x10, testnet
-            // 0x8c/0x13, no bech32 (dashpay/dash chainparams.cpp).
+            // fallback), never repurposes it. The accepted set is REGISTRY-SOURCED
+            // (dash::address_acceptance → oracle networks/dash.py): mainnet
+            // 76/16, testnet 140/19, no bech32; DASH regtest reuses testnet
+            // base58 bytes.
             {
                 std::vector<unsigned char> payout_script;
                 auto amatch = core::classify_address_for_coin(
-                    username,
-                    is_testnet_ ? std::vector<uint8_t>{0x8c} : std::vector<uint8_t>{0x4c},
-                    is_testnet_ ? std::vector<uint8_t>{0x13} : std::vector<uint8_t>{0x10},
-                    /*accepted_hrps=*/{},
+                    username, dash::address_acceptance(is_testnet_, is_regtest_),
                     payout_script);
                 if (amatch == core::AddressCoinMatch::Foreign)
                     LOG_WARNING << "[DASH-STRATUM] REJECTED foreign-coin payout "

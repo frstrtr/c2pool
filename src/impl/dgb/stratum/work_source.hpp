@@ -286,11 +286,19 @@ public:
     /// (DOGE) block a submitted share solves via try_submit_merged_blocks().
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mm) { mm_manager_ = mm; }
 
+    /// #961: mark this node as running on the DGB regtest network so the payout
+    /// money-path validates a miner's address against the REGTEST address set
+    /// (testnet base58 bytes + "dgbrt" HRP) instead of mainnet — otherwise a
+    /// legitimate --regtest payout address is wrongly rejected as Foreign.
+    /// Called from main under --regtest. Address-validation scope only.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
+
 private:
     // External dependencies (non-owning references)
     c2pool::dgb::HeaderChain&   chain_;
     dgb::coin::Mempool&         mempool_;
     const bool                  is_testnet_;
+    bool                        is_regtest_ = false;  // #961: --regtest address set
 
     // Submission dispatch
     SubmitBlockFn               submit_block_fn_;

@@ -6,9 +6,35 @@
 
 #include <core/coin_params.hpp>
 #include <core/pow.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
 namespace ltc
 {
+
+// Registry-sourced payout-address acceptance for LTC on the ACTIVE network
+// (issue #961). Mirrors make_coin_params() below (p2pool-merged-v36): mainnet
+// PUBKEY 48 (L...) / SCRIPT {50 (M...), 5 (legacy 3...)} / bech32 "ltc"; testnet
+// PUBKEY 111 / SCRIPT {196, 58 (Q...)} / bech32 "tltc". The legacy 0x05 P2SH is
+// an inherent LTC/BTC collision (both encode "3..." at version byte 5): an
+// address at 0x05 maps to the SAME hash160 the same key controls, so building
+// an LTC P2SH script for it is a valid own-coin payout, not a misdirection.
+// The core stratum server passes this set (via StratumConfig.payout_*) so the
+// per-job coinbase payout is validated at the parse and never fed a foreign
+// version byte. bech32 HRPs are returned BARE (no trailing '1').
+inline core::CoinAddressAcceptance address_acceptance(bool testnet)
+{
+    core::CoinAddressAcceptance a;
+    if (testnet) {
+        a.p2pkh_versions = { 111 };
+        a.p2sh_versions  = { 196, 58 };
+        a.bech32_hrps    = { "tltc" };
+    } else {
+        a.p2pkh_versions = { 48 };
+        a.p2sh_versions  = { 50, 5 };
+        a.bech32_hrps    = { "ltc" };
+    }
+    return a;
+}
 
 inline core::CoinParams make_coin_params(bool testnet)
 {

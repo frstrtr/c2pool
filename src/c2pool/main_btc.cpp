@@ -1752,6 +1752,12 @@ int main(int argc, char* argv[])
     // both outlive it (stack-scoped main() lifetime).
     auto work_source = std::make_shared<btc::stratum::BTCWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn));
+    // #961: the BTCWorkSource ctor takes only a testnet bool; --regtest is a
+    // THIRD network (testnet base58 bytes + "bcrt" bech32 HRP). Pass it through
+    // so the payout-address check accepts a legitimate --regtest address instead
+    // of rejecting it as Foreign (regtest reuses testnet base58 bytes, so
+    // testnet=false + regtest=true must NOT resolve to the mainnet set).
+    work_source->set_regtest(regtest);
     work_source_for_shutdown = work_source;  // expose to signal handler
 
     // ── Node-owner fee (p2pool -f/--fee + --node-owner-address) ──

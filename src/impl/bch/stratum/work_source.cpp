@@ -34,6 +34,7 @@
 #include <impl/bch/coin/merkle.hpp>            // merkle_hash_pair (CTOR SHA256d)
 #include <impl/bch/coin/template_builder.hpp>  // build_template + rpc::WorkData
 #include <impl/bch/config_pool.hpp>            // PoolConfig::max_target (G2 cold-start floor)
+#include <impl/bch/config_coin.hpp>            // bch::address_acceptance (#961 registry-sourced payout check)
 
 #include <core/log.hpp>
 #include <btclibs/util/strencodings.h>         // HexStr
@@ -733,12 +734,13 @@ nlohmann::json BCHWorkSource::mining_submit(
             // BTC's version bytes, an inherent BCH/BTC ambiguity — a BTC legacy
             // address is therefore accepted here (same hash160/key), which is
             // NOT a misdirection.
+            // Accepted set REGISTRY-SOURCED (bch::address_acceptance): legacy
+            // base58 only (BCH's native CashAddr yields Invalid and falls through
+            // to the coin-registered decoder below), derived from the active
+            // network so a --regtest legacy address is accepted.
             std::vector<unsigned char> payout_script;
             auto amatch = core::classify_address_for_coin(
-                username,
-                is_testnet_ ? std::vector<uint8_t>{0x6f} : std::vector<uint8_t>{0x00},
-                is_testnet_ ? std::vector<uint8_t>{0xc4} : std::vector<uint8_t>{0x05},
-                /*accepted_hrps=*/{},
+                username, bch::address_acceptance(is_testnet_, /*regtest=*/false),
                 payout_script);
             if (amatch == core::AddressCoinMatch::Foreign)
                 LOG_WARNING << "[BCH-STRATUM] REJECTED foreign-coin payout address "

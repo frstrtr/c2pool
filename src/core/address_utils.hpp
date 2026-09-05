@@ -59,6 +59,18 @@ bool is_address_for_chain(const std::string& address,
 // validating the version byte / HRP against the running coin BEFORE building a
 // script, so a foreign address is rejected loudly instead of being repurposed.
 
+/// The set of Base58Check version bytes and bech32 HRPs a given coin accepts as
+/// its OWN payout addresses on a given network (mainnet / testnet / regtest).
+/// Populated by each coin's registry (address_acceptance()) from its chainparams
+/// SSOT — NEVER hardcoded at a stratum money-path call site (issue #961 blocker
+/// #3) — and network-derived so a --regtest address is accepted rather than
+/// silently rejected as Foreign (blocker #2).
+struct CoinAddressAcceptance {
+    std::vector<uint8_t>     p2pkh_versions;   ///< accepted P2PKH version bytes
+    std::vector<uint8_t>     p2sh_versions;    ///< accepted P2SH version bytes
+    std::vector<std::string> bech32_hrps;      ///< BARE HRPs, NO trailing '1' (e.g. "ltc")
+};
+
 /// Result of classify_address_for_coin().
 enum class AddressCoinMatch {
     Invalid,   ///< Not a Base58Check or bech32 address this decoder understands
@@ -91,6 +103,23 @@ std::vector<unsigned char> address_to_script_for_coin(
     const std::vector<uint8_t>& p2pkh_versions,
     const std::vector<uint8_t>& p2sh_versions,
     const std::vector<std::string>& accepted_hrps);
+
+/// Overloads taking a registry-sourced CoinAddressAcceptance (issue #961). Every
+/// stratum payout money-path passes the running coin's acceptance for the ACTIVE
+/// network so the check needs no hardcoded version bytes and honours regtest.
+inline AddressCoinMatch classify_address_for_coin(
+    const std::string& address, const CoinAddressAcceptance& acc,
+    std::vector<unsigned char>& out_script)
+{
+    return classify_address_for_coin(address, acc.p2pkh_versions,
+        acc.p2sh_versions, acc.bech32_hrps, out_script);
+}
+inline std::vector<unsigned char> address_to_script_for_coin(
+    const std::string& address, const CoinAddressAcceptance& acc)
+{
+    return address_to_script_for_coin(address, acc.p2pkh_versions,
+        acc.p2sh_versions, acc.bech32_hrps);
+}
 
 /// Build a scriptPubKey from either a Base58Check or Bech32 address.
 /// Returns empty vector on failure.

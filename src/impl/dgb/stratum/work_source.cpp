@@ -23,6 +23,7 @@
 #include <impl/dgb/coin/template_builder.hpp>
 #include <impl/dgb/coin/embedded_tx_select.hpp>  // make_mempool_tx_source (mempool -> GBT transactions[])
 #include <impl/dgb/config_pool.hpp>              // dgb::PoolConfig::BLOCK_MAX_WEIGHT
+#include <impl/dgb/params.hpp>                   // dgb::address_acceptance (#961 registry-sourced payout check)
 #include <impl/dgb/coin/hash_format.hpp>
 #include <impl/dgb/coin/scrypt_pow.hpp>        // scrypt_pow_hash (DGB-Scrypt PoW SSOT)
 #include <impl/dgb/coin/submit_classify.hpp>   // classify_submission (Stage-4d decision SSOT)
@@ -646,17 +647,16 @@ nlohmann::json DGBWorkSource::mining_submit(
         in.merkle_branches = branch_hashes;
         // #961: validate the payout address against DGB's OWN version bytes / HRP
         // before building a script, so a foreign-coin address is rejected rather
-        // than repurposed into a DGB script (which would MISDIRECT funds). DGB:
-        // mainnet 0x1e/0x3f + hrp "dgb", testnet 0x7e/0x8c + hrp "dgbt"
-        // (digibyte chainparams). Foreign → empty → the existing redistribute/
-        // empty fallback below; never a wrong-coin payment.
+        // than repurposed into a DGB script (which would MISDIRECT funds). The
+        // accepted set is REGISTRY-SOURCED (dgb::address_acceptance → config_coin
+        // SSOT) and derived from the TRUE network (mainnet/testnet/regtest) so a
+        // --regtest payout address is accepted, not rejected as Foreign. Foreign
+        // → empty → the existing redistribute/empty fallback below; never a
+        // wrong-coin payment.
         {
             std::vector<unsigned char> payout_script;
             auto amatch = core::classify_address_for_coin(
-                username,
-                is_testnet_ ? std::vector<uint8_t>{0x7e} : std::vector<uint8_t>{0x1e},
-                is_testnet_ ? std::vector<uint8_t>{0x8c} : std::vector<uint8_t>{0x3f},
-                is_testnet_ ? std::vector<std::string>{"dgbt"} : std::vector<std::string>{"dgb"},
+                username, dgb::address_acceptance(is_testnet_, is_regtest_),
                 payout_script);
             if (amatch == core::AddressCoinMatch::Foreign)
                 LOG_WARNING << "[DGB-STRATUM] REJECTED foreign-coin payout address "

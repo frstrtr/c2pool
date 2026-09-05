@@ -183,6 +183,11 @@ public:
     void set_share_target(uint32_t bits, uint32_t max_bits)
     { share_bits_.store(bits); share_max_bits_.store(max_bits); }
     void set_donation_script(std::vector<unsigned char> s) { donation_script_ = std::move(s); }
+    /// #961: mark this node as running on the BIP-110 regtest network so the
+    /// payout money-path validates a miner's address against the REGTEST set
+    /// (testnet base58 bytes + "bcrt" HRP) instead of mainnet. Address-validation
+    /// scope only; called from main under --regtest.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
     // Node-owner fee destination. When empty the node-owner fee (if any) is paid
     // to the donation script (single-key consolidation, our 13zQ/bc1qyr94… key).
     void set_node_owner_script(std::vector<unsigned char> s) { node_owner_script_ = std::move(s); }
@@ -252,6 +257,7 @@ private:
 
     bip110::coin::HeaderChain&   chain_;
     const bool                   is_testnet_;
+    bool                         is_regtest_ = false;  // #961: --regtest address set
     SubmitBlockFn                submit_block_fn_;
     core::stratum::StratumConfig config_;
 

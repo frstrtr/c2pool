@@ -1422,6 +1422,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     auto work_source = std::make_shared<dgb::stratum::DGBWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
+    // #961: the DGBWorkSource ctor takes only a testnet bool; --regtest is a
+    // THIRD network (DigiByte CRegTestParams reuses the testnet base58 bytes and
+    // uses the "dgbrt" bech32 HRP). Pass it through so a legitimate --regtest
+    // payout address is accepted rather than rejected as Foreign.
+    work_source->set_regtest(regtest);
 
 #ifdef AUX_DOGE
     // Arm the #1413 DGBWorkSource merged-mining seams: once bound, every built

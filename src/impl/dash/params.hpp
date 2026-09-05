@@ -24,6 +24,7 @@
 
 #include <core/coin_params.hpp>
 #include <core/pow.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
 #include <optional>
 #include <string>
@@ -31,6 +32,26 @@
 
 namespace dash
 {
+
+// Registry-sourced payout-address acceptance for DASH on the ACTIVE network
+// (issue #961). Values track make_coin_params() below (oracle networks/dash.py):
+// mainnet PUBKEY 76 (X...) / SCRIPT 16 (7...); testnet PUBKEY 140 (y...) /
+// SCRIPT 19. DASH has NO segwit/bech32. DASH regtest (dashd CRegTestParams)
+// reuses the testnet base58 version bytes, so a --regtest payout address decodes
+// under the testnet set rather than being rejected as Foreign.
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
+{
+    core::CoinAddressAcceptance a;
+    if (testnet || regtest) {
+        a.p2pkh_versions = { 140 };  // y...
+        a.p2sh_versions  = { 19 };
+    } else {
+        a.p2pkh_versions = { 76 };   // X...
+        a.p2sh_versions  = { 16 };   // 7...
+    }
+    a.bech32_hrps = {};              // DASH: no bech32 on any network
+    return a;
+}
 
 // Runtime override seam for pool.yaml (Fileconfig consume-side, S6 follow-on).
 // ONLY operationally-tunable, NON-consensus, NON-isolation pool fields may be

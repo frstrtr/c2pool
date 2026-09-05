@@ -274,3 +274,90 @@ TEST(AddressCoinValidation, ConcreteMisdirectionCases)
     EXPECT_EQ(run(coin("BTC"), "not an address", script), AddressCoinMatch::Invalid);
     EXPECT_TRUE(script.empty());
 }
+
+// ── LTC lane: an UNCONFIGURED foreign address is rejected (issue #961 blocker 1)
+// The production LTC/DOGE merged-mining server built its per-job coinbase payout
+// with the chain-agnostic address_to_script(), so a foreign-coin address whose
+// coin is NOT a configured merged chain was repurposed into an LTC script from a
+// hash160 the miner does not control on Litecoin — the money leak. At the
+// classify gate (what send_notify_work now consults before building the script),
+// LTC must classify every non-LTC address as Foreign and yield an EMPTY script.
+// (The stratum server then additionally honours a CONFIGURED merged chain's
+// address via the shared merged-chain table; the classify gate itself, tested
+// here, is the reject-unconfigured-foreign half.)
+TEST(AddressCoinValidation, LtcRejectsUnconfiguredForeign)
+{
+    const Coin& ltc = coin("LTC");
+    std::vector<unsigned char> script;
+
+    // A DOGE address (0x1e) — the classic "unconfigured merged coin" case. When
+    // DOGE is NOT a configured merged chain, LTC must NOT pay it.
+    EXPECT_EQ(run(ltc, b58(0x1e), script), AddressCoinMatch::Foreign);
+    EXPECT_TRUE(script.empty())
+        << "LTC repurposed a DOGE address into an LTC script — MISDIRECTION (#961)";
+
+    // A DASH address (0x4c) — a coin LTC can never merge-mine.
+    EXPECT_EQ(run(ltc, b58(0x4c), script), AddressCoinMatch::Foreign);
+    EXPECT_TRUE(script.empty());
+
+    // A real BTC mainnet bech32 — Foreign to LTC (HRP "bc" ∉ {"ltc"}), empty.
+    EXPECT_EQ(run(ltc, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", script),
+              AddressCoinMatch::Foreign);
+    EXPECT_TRUE(script.empty());
+
+    // LTC's OWN addresses (incl. the legacy 0x05 P2SH collision) stay Own — the
+    // reject must not become a false-reject of a real LTC payout.
+    EXPECT_EQ(run(ltc, b58(0x30), script), AddressCoinMatch::Own);       // L... P2PKH
+    EXPECT_FALSE(script.empty());
+    EXPECT_EQ(run(ltc, b58(0x32), script), AddressCoinMatch::Own);       // M... P2SH
+    EXPECT_FALSE(script.empty());
+    EXPECT_EQ(run(ltc, b58(0x05), script), AddressCoinMatch::Own);       // legacy 3... P2SH
+    EXPECT_FALSE(script.empty());
+    EXPECT_EQ(run(ltc, bech32_v0("ltc"), script), AddressCoinMatch::Own);
+    EXPECT_FALSE(script.empty());
+}
+
+// ── Regtest addresses are ACCEPTED (issue #961 blocker 2, FALSE-REJECT fix) ───
+// The wirings previously keyed the accepted set on a single is_testnet_ bool, so
+// a --regtest node (testnet=false) resolved to the MAINNET set and rejected a
+// legitimate regtest payout address as Foreign. The registry helpers now derive
+// the set from the TRUE network. These sets mirror what
+// {btc,dgb,ltc}::address_acceptance(testnet,regtest) returns for regtest:
+// bitcoin-family regtest reuses the TESTNET base58 version bytes and swaps the
+// bech32 HRP (BTC "bcrt", DGB "dgbrt", LTC "rltc"). A regtest own address must
+// classify as Own; a MAINNET address must be Foreign under the regtest set
+// (proving the set is network-derived, not mainnet-or-not).
+TEST(AddressCoinValidation, AcceptsRegtestAddresses)
+{
+    struct RegtestSet { std::string name; Coin set; uint8_t mainnet_p2pkh; };
+    const std::vector<RegtestSet> regtests = {
+        // BTC regtest: testnet 0x6f/0xc4 + hrp "bcrt"; mainnet P2PKH 0x00.
+        {"BTC",  {"BTCrt",  {0x6f}, {0xc4}, {"bcrt"}},  0x00},
+        // DGB regtest: testnet 0x7e/0x8c + hrp "dgbrt"; mainnet P2PKH 0x1e.
+        {"DGB",  {"DGBrt",  {0x7e}, {0x8c}, {"dgbrt"}}, 0x1e},
+        // LTC regtest: testnet 111/196(+58) + hrp "rltc"; mainnet P2PKH 0x30.
+        {"LTC",  {"LTCrt",  {0x6f}, {0xc4, 0x3a}, {"rltc"}}, 0x30},
+    };
+
+    for (const auto& r : regtests) {
+        std::vector<unsigned char> script;
+
+        // Regtest own P2PKH / P2SH / bech32 all classify Own with correct scripts.
+        EXPECT_EQ(run(r.set, b58(r.set.p2pkh.front()), script), AddressCoinMatch::Own)
+            << r.name << " regtest must accept its own P2PKH address";
+        EXPECT_EQ(script, p2pkh_script());
+        EXPECT_EQ(run(r.set, b58(r.set.p2sh.front()), script), AddressCoinMatch::Own)
+            << r.name << " regtest must accept its own P2SH address";
+        EXPECT_EQ(script, p2sh_script());
+        EXPECT_EQ(run(r.set, bech32_v0(r.set.hrps.front()), script), AddressCoinMatch::Own)
+            << r.name << " regtest must accept its own bech32 address";
+        EXPECT_EQ(script, p2wpkh_script());
+
+        // A MAINNET address of the same coin is Foreign under the regtest set —
+        // the network-derived set is what closes the FALSE-REJECT without
+        // silently widening acceptance back to mainnet.
+        EXPECT_EQ(run(r.set, b58(r.mainnet_p2pkh), script), AddressCoinMatch::Foreign)
+            << r.name << " regtest set must not accept a mainnet address";
+        EXPECT_TRUE(script.empty());
+    }
+}

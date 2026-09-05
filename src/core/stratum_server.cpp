@@ -36,6 +36,39 @@ inline double sample_tcp_rtt_ms(int fd) {
 #endif
     return 0.0;
 }
+
+// ─── Merged-chain address identification table (issue #961) ──────────────────
+// Hoisted to file scope so BOTH handle_authorize() (merged-chain resolution) and
+// send_notify_work() (the #961 payout money-path check) share ONE table. A
+// username that resolves to a CONFIGURED merged chain here is a legitimate
+// merged-mining payout — the same hash160 / secp256k1 key is spendable on the
+// parent and the merged chain, so paying the parent's P2PKH to that hash160 is
+// the intended reuse, NOT the foreign-coin misdirection #961 closes.
+// Each entry: {chain_id, bech32_hrps (BARE), base58 version bytes}.
+struct ChainAddrInfo {
+    uint32_t chain_id;
+    std::vector<std::string> hrps;
+    std::vector<uint8_t> versions;
+};
+inline const std::vector<ChainAddrInfo>& merged_chain_table() {
+    static const std::vector<ChainAddrInfo> t = {
+        // DOGE: D... (0x1e), 9/A... (0x16), testnet n... (0x71)
+        {98,   {},      {0x1e, 0x16, 0x71}},
+        // PEP:  P... (0x38), testnet n... (0x71)
+        {63,   {},      {0x38, 0x16, 0x71}},
+        // BELLS: B... (0x19), bech32 "bel"/"tbel"
+        {16,   {"bel", "tbel"}, {0x19, 0x1e, 0x21}},
+        // LKY:  L... (0x2f), testnet n... (0x71)
+        {8211, {},      {0x2f, 0x05, 0x71}},
+        // JKC:  7... (0x10), testnet m/n... (0x6f)
+        {8224, {},      {0x10, 0x05, 0x6f}},
+        // SHIC: S... (0x3f), testnet n... (0x71)
+        {74,   {},      {0x3f, 0x16, 0x71}},
+        // DINGO: same versions as DOGE (fork), chain_id=98 (conflicts with DOGE!)
+        // Cannot be used simultaneously with DOGE. Omitted from auto-detect.
+    };
+    return t;
+}
 }  // namespace
 
 namespace core {
@@ -650,34 +683,23 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         //
         // Vnish firmware and some ASIC control software cannot use commas in the
         // login field, so we support pipe (|) and space as alternatives.
-        // ─── Merged chain address identification table ───
-        // Each entry: {chain_id, bech32_hrps, base58_version_bytes}
-        // Used to auto-detect which chain a merged address belongs to.
-        struct ChainAddrInfo {
-            uint32_t chain_id;
-            std::vector<std::string> hrps;
-            std::vector<uint8_t> versions;
-        };
-        static const std::vector<ChainAddrInfo> MERGED_CHAINS = {
-            // DOGE: D... (0x1e), 9/A... (0x16), testnet n... (0x71)
-            {98,   {},      {0x1e, 0x16, 0x71}},
-            // PEP:  P... (0x38), testnet n... (0x71)
-            {63,   {},      {0x38, 0x16, 0x71}},
-            // BELLS: B... (0x19), bech32 "bel"/"tbel"
-            {16,   {"bel", "tbel"}, {0x19, 0x1e, 0x21}},
-            // LKY:  L... (0x2f), testnet n... (0x71)
-            {8211, {},      {0x2f, 0x05, 0x71}},
-            // JKC:  7... (0x10), testnet m/n... (0x6f)
-            {8224, {},      {0x10, 0x05, 0x6f}},
-            // SHIC: S... (0x3f), testnet n... (0x71)
-            {74,   {},      {0x3f, 0x16, 0x71}},
-            // DINGO: same versions as DOGE (fork), chain_id=98 (conflicts with DOGE!)
-            // Cannot be used simultaneously with DOGE. Omitted from auto-detect.
-        };
+        // ─── Merged chain address identification table (file-scope SSOT) ───
+        // Shared with send_notify_work()'s #961 payout check (see merged_chain_
+        // table() above). Used to auto-detect which chain a merged address
+        // belongs to.
+        const auto& MERGED_CHAINS = merged_chain_table();
 
-        // LTC identification (for swap detection)
-        static const std::vector<std::string> LTC_HRPS = {"ltc", "tltc"};
-        static const std::vector<uint8_t> LTC_VERSIONS = {0x30, 0x32, 0x05, 0x6f, 0xc4, 0x3a};
+        // Parent/primary-coin identification (for swap + Case-5 detection),
+        // REGISTRY-SOURCED from the running coin's StratumConfig (issue #961
+        // blocker #3 — no hardcoded LTC version bytes here). Empty when a coin's
+        // main() left the acceptance triple unset; the merged-chain resolution
+        // below only fires when a merged chain is configured, so an empty set
+        // simply disables parent-address detection for non-merged coins.
+        const auto& scfg = mining_interface_->get_stratum_config();
+        const std::vector<std::string>& LTC_HRPS = scfg.payout_bech32_hrps;
+        std::vector<uint8_t> LTC_VERSIONS = scfg.payout_p2pkh_versions;
+        LTC_VERSIONS.insert(LTC_VERSIONS.end(),
+            scfg.payout_p2sh_versions.begin(), scfg.payout_p2sh_versions.end());
 
         std::string merged_addr_raw;
         parse_address_separators(username_, merged_addr_raw);
@@ -1607,10 +1629,65 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     else if (auto fn = mining_interface_->get_best_share_hash_fn())
         frozen_prev_share = fn();  // standalone call (VARDIFF, safety timer)
     {
-        // Build payout script from username (authorized address: P2PKH, P2SH, or bech32)
+        // Build payout script from username (authorized address: P2PKH, P2SH, or bech32).
+        //
+        // #961 (LTC-lane money leak): the chain-agnostic address_to_script()
+        // decodes the version byte / bech32 HRP of ANY supported coin and builds
+        // a scriptPubKey for whatever coin THIS node runs — so a foreign-coin
+        // payout address (an unconfigured coin's address) was silently
+        // repurposed into a wrong-coin script, MISDIRECTING the miner's reward
+        // from a hash160 they do not control on this chain. Validate against the
+        // running coin's own registry-sourced acceptance set FIRST (via
+        // StratumConfig.payout_*), keeping the legitimate merged-mining reuse:
+        //   • Own-coin address                       → build it (byte-identical).
+        //   • A CONFIGURED merged chain's address    → build it: the same
+        //     hash160 pays P2PKH on the parent — the intended merged-mining
+        //     reuse (Case 5 / auto-derive), byte-identical to before.
+        //   • Foreign-and-unconfigured, or unparseable → REJECT loudly, empty
+        //     payout (the existing degenerate/empty-payout path), never a
+        //     wrong-coin payment.
+        // When a coin's main() left payout_* unset (empty triple), no acceptance
+        // is configured for this server and the legacy chain-agnostic build is
+        // preserved byte-for-byte (non-LTC lanes validate at mining_submit).
         std::vector<unsigned char> payout_script;
         if (!username_.empty()) {
-            payout_script = address_to_script(username_);
+            const auto& scfg = mining_interface_->get_stratum_config();
+            const bool acceptance_configured =
+                !scfg.payout_p2pkh_versions.empty() ||
+                !scfg.payout_p2sh_versions.empty() ||
+                !scfg.payout_bech32_hrps.empty();
+            if (!acceptance_configured) {
+                payout_script = address_to_script(username_);  // legacy, byte-identical
+            } else {
+                std::vector<unsigned char> own_script;
+                auto m = core::classify_address_for_coin(
+                    username_, scfg.payout_p2pkh_versions, scfg.payout_p2sh_versions,
+                    scfg.payout_bech32_hrps, own_script);
+                bool acceptable = (m == core::AddressCoinMatch::Own);
+                if (!acceptable && m == core::AddressCoinMatch::Foreign) {
+                    // Not an own-coin address — but a CONFIGURED merged chain's
+                    // address is still a legitimate merged-mining payout.
+                    for (const auto& chain : merged_chain_table()) {
+                        if (mining_interface_->has_merged_chain(chain.chain_id) &&
+                            is_address_for_chain(username_, chain.hrps, chain.versions)) {
+                            acceptable = true;
+                            break;
+                        }
+                    }
+                }
+                if (acceptable) {
+                    // Byte-identical to the pre-#961 build for every accepted
+                    // address (own-coin OR configured-merged) — reward-safe.
+                    payout_script = address_to_script(username_);
+                } else {
+                    LOG_WARNING << "[Stratum] REJECTED foreign-coin payout address (user="
+                                << username_ << ") — not a"
+                                << (scfg.coin_symbol.empty() ? "" : " " + scfg.coin_symbol)
+                                << " address and not a configured merged chain; refusing "
+                                   "to misdirect the reward (empty payout)";
+                    // payout_script stays empty -> existing degenerate-payout path.
+                }
+            }
         }
 
         // Build merged address entries (bech32+base58, P2PKH+P2SH)
