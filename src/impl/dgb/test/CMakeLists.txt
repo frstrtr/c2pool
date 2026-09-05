@@ -374,7 +374,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the tx serialization codec, so it links the same proven SCC set as
     # dgb_embedded_coin_node_test. MUST also be in BOTH build.yml --target
     # allowlists (#143 NOT_BUILT trap).
-    add_executable(dgb_embedded_tx_select_test embedded_tx_select_test.cpp)
+    # #1437 topology KAT (child-without-parent + intra-template double-spend)
+    # folds into this EXISTING allowlisted target; gtest_add_tests AUTO discovers
+    # its TEST() cases (no new executable / no #143 NOT_BUILT trap).
+    add_executable(dgb_embedded_tx_select_test embedded_tx_select_test.cpp template_topology_spend_test.cpp)
     target_link_libraries(dgb_embedded_tx_select_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb dgb_stratum
