@@ -985,6 +985,115 @@ static dash::producer::BuiltShare mint_scene(SyntheticChain& sc,
         sc.chain, params, info, fixture_min_header(), F1_NONCE64, /*check_pow=*/false);
 }
 
+// The 20-byte pubkey hash embedded in dash::DONATION_SCRIPT (76a914 <20> 88ac),
+// i.e. hash160 of the P2PKH donation address XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u.
+// Sliced from DONATION_SCRIPT itself so byte-order can never drift from the key
+// the verifier / producer actually compare against.
+static uint160 donation_h160() {
+    return uint160(std::vector<unsigned char>(dash::DONATION_SCRIPT.begin() + 3,
+                                              dash::DONATION_SCRIPT.begin() + 23));
+}
+
+// mint_scene's sibling: identical g(A)<-s1(B)<-s2(C) window, but the newly minted
+// share's FINDER (m_pubkey_hash) is the donation address, so pubkey_hash_to_script2
+// of the finder collides with DONATION_SCRIPT and the 2% finder fee lands in
+// amounts[DONATION_SCRIPT]. The PPLNS window {s1(B), g(A)} stays non-colliding, so
+// this isolates the finder-fee collision (F11 "Trigger 1", a single share).
+static dash::producer::BuiltShare mint_scene_finder_is_donation(
+        SyntheticChain& sc, const core::CoinParams& params) {
+    const uint160 A = h160_uniform(0xaa), B = h160_uniform(0xbb), C = h160_uniform(0xcc);
+    uint256 g  = sc.add(0x01, uint256(), BITS_DIFF1, BITS_DIFF1, 1699999900, A, 0,
+                        1, u128_hex(ATA_DIFF1_HEX));
+    uint256 s1 = sc.add(0x02, g,  BITS_DIFF1, BITS_DIFF1, 1699999920, B, 0,
+                        2, u128_hex(ATA_DIFF1_HEX) * 2u);
+    uint256 s2 = sc.add(0x03, s1, BITS_DIFF1, BITS_DIFF1, 1699999940, C, 0,
+                        3, u128_hex(ATA_DIFF1_HEX) * 3u);
+    ProducerJobInputs in;
+    in.prev_share_hash = s2; in.coinbase_scriptSig = {0x03,0x01,0x02,0x03};
+    in.share_nonce = 7; in.pubkey_hash = donation_h160();   // finder == donation addr
+    in.subsidy = 500000000;
+    in.donation = 0; in.desired_version = 16; in.desired_timestamp = 1700000000;
+    in.desired_target = params.max_target;
+    in.packed_payments = { mn_payment(0xd1, 150000000), mn_payment(0xd2, 100000000) };
+    in.payment_amount  = 250000000;
+    in.desired_tx_hashes = { h256_tag(0x71), h256_tag(0x72) };
+    auto info = dash::producer::generate_prospective_share_info(sc.chain, params, in);
+    return dash::producer::build_share(
+        sc.chain, params, info, fixture_min_header(), F1_NONCE64, /*check_pow=*/false);
+}
+
+// ── F11 REGRESSION (donation-keyed finder share) ─────────────────────────────
+// A share whose finder is the P2PKH donation address collides the 2% finder fee
+// onto DONATION_SCRIPT. The producer AND p2pool-dash (ref data.py:223) MERGE that
+// amount into the single donation txout. The verifier MUST do the same; the
+// pre-fix code subtracted it inside sum_amounts, dropped it from worker_outputs,
+// and emitted ONLY the residual -> reconstructed coinbase short by the finder fee
+// -> txid diverges -> a VALID share the shared sharechain accepts is FALSELY
+// REJECTED (cross-impl FORK). This KAT is RED on master (txid mismatch ->
+// verify_payout_commitment throws) and GREEN with the fix (byte-identical).
+TEST(DashPayoutCommitment, DonationKeyedFinderShareAccepted) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    auto built = mint_scene_finder_is_donation(sc, params);
+    PayoutTrackerView tv{sc.chain};
+
+    const std::vector<unsigned char> DON(dash::DONATION_SCRIPT.begin(),
+                                         dash::DONATION_SCRIPT.end());
+
+    // Precondition: the collision is REAL -- the finder script IS DONATION_SCRIPT.
+    ASSERT_EQ(dash::pubkey_hash_to_script2(built.share.m_pubkey_hash), DON)
+        << "scene must mint with finder == donation address for the collision";
+
+    // (b) Verifier reconstruction is byte-identical to the producer's committed
+    // gentx. On master the merged finder fee is dropped, so this txid diverges
+    // (RED); with the fix it matches (GREEN). gc exposes the reconstructed bytes.
+    dash::coin::GentxCoinbase gc;
+    uint256 expected = dash::generate_share_transaction(built.share, tv, params, &gc);
+    EXPECT_EQ(hex_of(expected), hex_of(built.gentx_hash))
+        << "F11: verifier must fold the donation-keyed finder fee into the "
+           "donation output exactly like the producer / p2pool-dash";
+    EXPECT_EQ(hex_of(gc.txid), hex_of(built.gentx_hash));
+
+    // Parse the reconstructed coinbase outputs (layout pinned by the F1 golden).
+    struct Out { uint64_t value; std::vector<unsigned char> script; };
+    std::vector<Out> outs;
+    {
+        const auto& v = gc.bytes;
+        size_t p = 4 /*ver+type*/ + 1 /*vin cnt*/ + 32 + 4;
+        p += 1 + v[p];                 // scriptSig VarStr (short)
+        p += 4;                        // sequence
+        size_t n = v[p++];             // vout count (short)
+        for (size_t i = 0; i < n; ++i) {
+            Out o; o.value = 0;
+            for (int k = 0; k < 8; ++k) o.value |= static_cast<uint64_t>(v[p + k]) << (8 * k);
+            p += 8;
+            size_t sl = v[p++];
+            o.script.assign(v.begin() + p, v.begin() + p + sl);
+            p += sl;
+            outs.push_back(std::move(o));
+        }
+    }
+
+    // Exactly one donation output, carrying the merged 2% finder fee
+    // (worker_payout/50 = (5e8 - 2.5e8 payments)/50 = 5000000) + residual (0),
+    // NOT zero -- 5000000 is the exact satoshi master silently drops.
+    uint64_t donation_value = 0; int donation_count = 0;
+    for (auto& o : outs) if (o.script == DON) { donation_value = o.value; ++donation_count; }
+    EXPECT_EQ(donation_count, 1) << "exactly one donation output";
+    EXPECT_EQ(donation_value, 5000000u)
+        << "donation output must include the 2% finder fee master drops";
+
+    // Coinbase value conservation: outputs sum to the subsidy. Master's short
+    // donation would sum to subsidy - 5000000, proving money was destroyed.
+    uint64_t total = 0; for (auto& o : outs) total += o.value;
+    EXPECT_EQ(total, 500000000u) << "reconstructed coinbase must conserve subsidy";
+
+    // (a) The live accept-path gate: RED on master (throws -> valid share falsely
+    // rejected), GREEN with the fix (admitted).
+    EXPECT_NO_THROW(dash::verify_payout_commitment(
+        built.share, tv, params, built.gentx_hash));
+}
+
 // (b)+(c) The accept-path recompute reproduces the EXACT gentx the producer
 // committed to, so verify_payout_commitment admits our own freshly-minted share.
 TEST(DashPayoutCommitment, LocalMintCoinbaseAccepted) {
