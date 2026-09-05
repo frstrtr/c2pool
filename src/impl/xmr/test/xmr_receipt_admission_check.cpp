@@ -1,3 +1,21 @@
+/*
+ * This file is part of c2pool <https://github.com/frstrtr/c2pool>
+ * Copyright (c) 2024-2026 The c2pool developers
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 // Light single-TU syntax + static-budget check for the Family-B receipt headers.
 // Build (light, no link needed):  g++ -std=c++20 -fsyntax-only _compile_check.cpp
 // Or a tiny run:                  g++ -std=c++20 _compile_check.cpp -o /tmp/xcc && /tmp/xcc

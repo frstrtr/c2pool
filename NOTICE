@@ -12,7 +12,14 @@ upstream-licenses/.
 
 --------------------------------------------------------------------------------
 1. RandomX  —  tevador/RandomX  —  BSD-3-Clause
-   Pinned: v1.2.3 @ 7c761cf007c758056dcb6eb438a32f780f81bdbd (read 2026-09-05)
+   Pinned (vendored consensus code): 12f2c2ffe2108d6cf54c391fee33c8bc3646cdab
+   (read 2026-09-05) — the exact commit monero-project/monero references at
+   external/randomx on master; this is the RandomX the running Monero mainnet
+   ("rx/0") consensus uses. See src/impl/xmr/third_party/randomx/PROVENANCE.txt.
+
+   7c761cf007c758056dcb6eb438a32f780f81bdbd is a FUTURE-FORK reference only
+   (post-RandomX-2.0 HEAD, adds RANDOMX_FLAG_V2) — NOT vendored now; it is the
+   upgrade target if/when a Monero hard-fork adopts RandomX 2.0.
 
    Copyright (c) 2018-2019, tevador <tevador@gmail.com>
    Copyright (c) 2014-2019, The Monero Project
@@ -37,8 +44,6 @@ upstream-licenses/.
      - src/crypto/hash-ops.h
      - src/crypto/keccak.c/.h   (baseline Keccak; additionally attributed to
        Markku-Juhani O. Saarinen <mjos@iki.fi>, 19-Nov-11 — retain that line)
-     - contrib/epee serialization (varint / portable_storage), copyright
-       (c) 2006-2013 Andrey N. Sabelnikov, www.sabelnikov.net (BSD-3-Clause)
 
 --------------------------------------------------------------------------------
 3. Monero P2Pool  —  SChernykh/p2pool  —  GNU GPL v3 (GPL-3.0-only)
