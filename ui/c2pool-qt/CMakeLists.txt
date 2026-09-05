@@ -93,7 +93,12 @@ qt_add_resources(c2pool-qt "explorer_bundle"
         "${C2POOL_EXPLORER_DIR}/dist/pplns-view.js"
 )
 
-target_include_directories(c2pool-qt PRIVATE src)
+# The panel reads the node's parameter catalog (src/core/param_catalog.*) and the
+# per-coin address-encoding registry leaf headers (src/impl/<coin>/
+# address_encoding.hpp) so its generated argv + payout-address check can never
+# drift from the node. Both are Qt-free leaf headers; expose the node src root.
+set(C2POOL_NODE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+target_include_directories(c2pool-qt PRIVATE src "${C2POOL_NODE_SRC}")
 
 target_link_libraries(c2pool-qt PRIVATE
     Qt6::Widgets
@@ -161,7 +166,8 @@ if(C2POOL_QT_BUILD_TESTS)
     add_executable(c2pool-qt_test_reward_safe_launch
         test/test_reward_safe_launch.cpp
     )
-    target_include_directories(c2pool-qt_test_reward_safe_launch PRIVATE src)
+    target_include_directories(c2pool-qt_test_reward_safe_launch PRIVATE
+        src "${C2POOL_NODE_SRC}")
     add_test(NAME reward_safe_launch
              COMMAND c2pool-qt_test_reward_safe_launch)
 
@@ -173,7 +179,8 @@ if(C2POOL_QT_BUILD_TESTS)
     add_executable(c2pool-qt_test_address_validator
         test/test_address_validator.cpp
     )
-    target_include_directories(c2pool-qt_test_address_validator PRIVATE src)
+    target_include_directories(c2pool-qt_test_address_validator PRIVATE
+        src "${C2POOL_NODE_SRC}")
     target_link_libraries(c2pool-qt_test_address_validator PRIVATE Qt6::Core)
     add_test(NAME address_validator
              COMMAND c2pool-qt_test_address_validator)

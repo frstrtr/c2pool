@@ -36,6 +36,8 @@
 
 #pragma once
 
+#include <core/param_catalog.hpp>   // c2pool::catalog::Bin (per-coin binary key)
+
 #include <QLatin1String>
 #include <QString>
 
@@ -60,6 +62,13 @@ struct CoinProfile {
     CliFamily cli;          ///< which launch CLI family this coin uses
     QString   subcommand;   ///< PerCoinRun run-loop subcommand ("--run"/"--pool"); empty for legacy
 
+    /// Which node binary this coin maps to in the parameter catalog
+    /// (src/core/param_catalog.inc). LaunchCommand keys every flag spelling on
+    /// this so the panel emits ONLY flags the target binary accepts. For the
+    /// LegacyUnified `c2pool --net …` coins it records the closest catalog binary
+    /// (unused on that path, which builds the Python-p2pool-compatible argv).
+    c2pool::catalog::Bin bin;
+
     // Parent-daemon RPC link (PerCoinRun). For LegacyUnified these are the
     // --coind-rpc-port defaults; PageLaunch maps them to the right flag.
     int rpcPortMainnet;
@@ -81,15 +90,11 @@ struct CoinProfile {
     bool masternodePayee;   ///< coin pays a masternode/founder split (DASH) — surfaced as a note
     bool experimental;      ///< PerCoinRun binary still stabilising (DGB/BCH) — surfaced as a note
 
-    // Base58 address version bytes (P2PKH / P2SH, mainnet / testnet), used by
-    // AddressValidator to reject a wrong-coin payout address in the UI. Values
-    // mirror the node's impl/<coin>/params.hpp base58Prefixes and CoinBridge's
-    // JS descriptor table. DASH cross-checked vs dashpay/dash chainparams.cpp
-    // (mainnet 76/16, testnet 140/19).
-    int p2pkhVersionMainnet;
-    int p2shVersionMainnet;
-    int p2pkhVersionTestnet;
-    int p2shVersionTestnet;
+    // NOTE: this table no longer carries base58 version bytes. AddressValidator
+    // reads the accepted version bytes / bech32 HRPs straight from the node
+    // registry (src/impl/<coin>/address_encoding.hpp — the same
+    // <coin>::address_acceptance() the stratum money-path uses, issue #961), so
+    // the UI check can never drift from the node. See AddressValidator.hpp.
 };
 
 /// Ordered profile table. Order drives the chain combo. DASH is first-class.
@@ -99,59 +104,53 @@ inline const CoinProfile* coinProfiles(int& countOut)
         // ── LegacyUnified: unified `c2pool` binary, chain via --net ──────────
         {"litecoin", "Litecoin", "c2pool", "litecoind", "Scrypt",
          "L… / M… (P2PKH/P2SH)",
-         CliFamily::LegacyUnified, "",
+         CliFamily::LegacyUnified, "", c2pool::catalog::Bin::BIN_LTC,
          9332, 19332,
          "", "", "", "", false, true,
-         0, 0, false, false,
-         48, 50, 111, 58},
+         0, 0, false, false},
         {"bitcoin", "Bitcoin", "c2pool", "bitcoind", "SHA-256d",
          "1… / bc1… (P2PKH/bech32)",
-         CliFamily::LegacyUnified, "",
+         CliFamily::LegacyUnified, "", c2pool::catalog::Bin::BIN_BTC,
          8332, 18332,
          "", "", "", "", false, true,
-         0, 0, false, false,
-         0, 5, 111, 196},
+         0, 0, false, false},
         {"dogecoin", "Dogecoin", "c2pool", "dogecoind", "Scrypt (AuxPoW)",
          "D… (P2PKH)",
-         CliFamily::LegacyUnified, "",
+         CliFamily::LegacyUnified, "", c2pool::catalog::Bin::BIN_LTC,
          22555, 44555,
          "", "", "", "", false, true,
-         0, 0, false, false,
-         30, 22, 113, 196},
+         0, 0, false, false},
 
         // ── PerCoinRun: dedicated per-coin binaries ──────────────────────────
         // DASH — X11, masternode-payee coin, dashd parent. Default launch is
         // the reward-SAFE dashd-RPC arm; embedded P2P is opt-in only.
         {"dash", "Dash", "c2pool-dash", "dashd", "X11",
          "X… / 7… (P2PKH/P2SH)",
-         CliFamily::PerCoinRun, "--run",
+         CliFamily::PerCoinRun, "--run", c2pool::catalog::Bin::BIN_DASH,
          9998, 19998,
          "--coin-rpc", "--coin-rpc-auth", "~/.dashcore/dash.conf",
          "--listen", /*testnet*/ true, /*webPort*/ true,
-         3333, 8080, /*masternode*/ true, /*experimental*/ false,
-         76, 16, 140, 19},
+         3333, 8080, /*masternode*/ true, /*experimental*/ false},
 
         // DigiByte — multi-algo (Scrypt here), digibyted parent. No --testnet
         // flag (mainnet/regtest only) and no --web-port on this binary.
         {"digibyte", "DigiByte", "c2pool-dgb", "digibyted", "Scrypt",
          "D… / S… (P2PKH/P2SH)",
-         CliFamily::PerCoinRun, "--run",
+         CliFamily::PerCoinRun, "--run", c2pool::catalog::Bin::BIN_DGB,
          14024, 14025,
          "--coin-rpc", "--coin-rpc-auth", "~/.digibyte/digibyte.conf",
          "--sharechain-port", /*testnet*/ false, /*webPort*/ false,
-         5022, 0, /*masternode*/ false, /*experimental*/ true,
-         30, 63, 126, 140},
+         5022, 0, /*masternode*/ false, /*experimental*/ true},
 
         // Bitcoin Cash — BCHN parent. Uses `--pool`, creds via --rpc-conf
         // (no --coin-rpc endpoint override), --p2p-port for the sharechain.
         {"bitcoincash", "Bitcoin Cash", "c2pool-bch", "bitcoind (BCHN)", "SHA-256d",
          "1… / q… (legacy/cashaddr)",
-         CliFamily::PerCoinRun, "--pool",
+         CliFamily::PerCoinRun, "--pool", c2pool::catalog::Bin::BIN_BCH,
          8332, 18332,
          "", "--rpc-conf", "~/.bitcoin/bitcoin.conf",
          "--p2p-port", /*testnet*/ true, /*webPort*/ false,
-         3333, 0, /*masternode*/ false, /*experimental*/ true,
-         0, 5, 111, 196},
+         3333, 0, /*masternode*/ false, /*experimental*/ true},
     };
     countOut = static_cast<int>(sizeof(kProfiles) / sizeof(kProfiles[0]));
     return kProfiles;

@@ -25,6 +25,7 @@
 #include <core/coin_params.hpp>
 #include <core/pow.hpp>
 #include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
+#include "address_encoding.hpp"     // dash::AddressEncoding / address_acceptance SSOT (leaf)
 
 #include <optional>
 #include <string>
@@ -34,31 +35,11 @@ namespace dash
 {
 
 // ─── Address-encoding SSOT (issue #961 blocker #3) ───────────────────────────
-// The ONE place DASH's payout version bytes live (oracle networks/dash.py):
-// mainnet PUBKEY 76 (X...) / SCRIPT 16 (7...); testnet PUBKEY 140 (y...) / SCRIPT
-// 19. DASH has a SINGLE P2SH version and NO segwit/bech32 on any network. BOTH
-// make_coin_params() and address_acceptance() read these constants, so the
-// stratum money-path acceptance set can NEVER drift from the coin params.
-struct AddressEncoding { uint8_t p2pkh; uint8_t p2sh; };
-inline constexpr AddressEncoding MAINNET_ADDR{ 76,  16 };  // X... / 7...
-inline constexpr AddressEncoding TESTNET_ADDR{ 140, 19 };  // y...
-inline constexpr const AddressEncoding& address_encoding(bool testnet)
-{ return testnet ? TESTNET_ADDR : MAINNET_ADDR; }
-
-// Registry-sourced payout-address acceptance for DASH on the ACTIVE network
-// (issue #961). DERIVED from the AddressEncoding SSOT above — no re-typed
-// literals. DASH regtest (dashd CRegTestParams) reuses the testnet base58 version
-// bytes, so a --regtest payout address decodes under the testnet set rather than
-// being rejected as Foreign.
-inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
-{
-    const auto& e = address_encoding(testnet || regtest);
-    core::CoinAddressAcceptance a;
-    a.p2pkh_versions = { e.p2pkh };
-    a.p2sh_versions  = { e.p2sh };
-    a.bech32_hrps    = {};           // DASH: no bech32 on any network
-    return a;
-}
+// Moved to the LEAF header dash/address_encoding.hpp so the standalone c2pool-qt
+// payout validator reads DASH's version bytes from the SAME source as
+// make_coin_params() and the stratum money-path acceptance set, without pulling
+// this factory's pow/x11/config_pool graph. AddressEncoding, MAINNET_ADDR,
+// TESTNET_ADDR, address_encoding() and address_acceptance() are declared there.
 
 // Runtime override seam for pool.yaml (Fileconfig consume-side, S6 follow-on).
 // ONLY operationally-tunable, NON-consensus, NON-isolation pool fields may be

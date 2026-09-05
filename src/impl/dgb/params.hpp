@@ -22,31 +22,21 @@
 #include <core/coin_params.hpp>
 #include <core/pow.hpp>
 #include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
+#include "address_encoding.hpp"     // dgb::addr / address_acceptance SSOT (leaf, shared with c2pool-qt)
 
 namespace dgb
 {
 
-// Registry-sourced payout-address acceptance for DGB on the ACTIVE network
-// (issue #961). Every consensus byte comes from the dgb::CoinParams SSOT
-// (config_coin.hpp), NEVER a literal at the stratum call site. Regtest is a
-// distinct network: DigiByte Core CRegTestParams reuses the TESTNET base58
-// version bytes and swaps the bech32 HRP to "dgbrt" — deriving the set from the
-// true network (not a mainnet-or-not bool) is what stops a --regtest payout
-// address being rejected as Foreign.
-inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
-{
-    core::CoinAddressAcceptance a;
-    if (testnet || regtest) {
-        a.p2pkh_versions = { CoinParams::TESTNET_ADDRESS_VERSION };  // 0x7e
-        a.p2sh_versions  = { CoinParams::TESTNET_P2SH_VERSION };     // 0x8c
-        a.bech32_hrps    = { regtest ? "dgbrt" : CoinParams::TESTNET_BECH32_HRP };
-    } else {
-        a.p2pkh_versions = { CoinParams::ADDRESS_VERSION };          // 0x1e (D...)
-        a.p2sh_versions  = { CoinParams::ADDRESS_P2SH_VERSION };     // 0x3f (S...)
-        a.bech32_hrps    = { CoinParams::BECH32_HRP };               // "dgb"
-    }
-    return a;
-}
+// dgb::address_acceptance() moved to the LEAF header dgb/address_encoding.hpp
+// (included above) so the standalone c2pool-qt payout validator reads DGB's
+// version bytes / bech32 HRPs from the SAME source without pulling this
+// config_coin(yaml-cpp)/config_pool graph. The leaf mirrors the dgb::CoinParams
+// SSOT; the static_asserts below make any drift between the leaf and CoinParams a
+// compile error, so there is still exactly one authoritative set of bytes.
+static_assert(addr::P2PKH_MAIN    == CoinParams::ADDRESS_VERSION,         "DGB P2PKH mainnet drift");
+static_assert(addr::P2SH_MAIN     == CoinParams::ADDRESS_P2SH_VERSION,    "DGB P2SH mainnet drift");
+static_assert(addr::P2PKH_TESTNET == CoinParams::TESTNET_ADDRESS_VERSION, "DGB P2PKH testnet drift");
+static_assert(addr::P2SH_TESTNET  == CoinParams::TESTNET_P2SH_VERSION,    "DGB P2SH testnet drift");
 
 // --- Merged-mining aux chain identity (bucket-1 isolation primitive) ---------
 // DGB's OWN AuxPoW chain id, consumed when DGB registers an embedded backend

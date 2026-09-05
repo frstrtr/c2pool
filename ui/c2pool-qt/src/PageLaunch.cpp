@@ -319,8 +319,27 @@ void PageLaunch::setupUi()
         giveAuthorSpinBox_->setDecimals(2);
         giveAuthorSpinBox_->setSuffix(" %");
         giveAuthorSpinBox_->setValue(0.0);
-        giveAuthorSpinBox_->setToolTip("--give-author / --dev-donation");
+        // ★ Tri-state / reward-safety: at 0.00 the flag is OMITTED so the
+        // binary default applies (0.1% for DASH/LTC/BIP110, 0.5% for BTC). The
+        // special-value text says so; an explicit 0 requires the ack below.
+        giveAuthorSpinBox_->setSpecialValueText("binary default (0.1% / BTC 0.5%)");
+        giveAuthorSpinBox_->setToolTip(
+            "--give-author / --dev-donation\n"
+            "0.00 ⇒ OMITTED (binary default author donation applies).\n"
+            "Set a value to override, or tick the box below to donate 0% "
+            "explicitly (opt-in — never a silent default for a public node).");
         form->addRow("Dev donation (--give-author):", giveAuthorSpinBox_);
+
+        giveAuthorZeroAckCheck_ = new QCheckBox(
+            "Donate 0% to the author explicitly (opt-in; emits --give-author 0)");
+        giveAuthorZeroAckCheck_->setChecked(false);
+        giveAuthorZeroAckCheck_->setToolTip(
+            "Reward-safety guard. Only with this ticked does the panel emit "
+            "--give-author 0. Left unticked, a 0.00 spin value means \"use the "
+            "binary default\", never a forced zero.");
+        form->addRow("", giveAuthorZeroAckCheck_);
+        connect(giveAuthorZeroAckCheck_, &QCheckBox::stateChanged, this,
+                [this](int) { onBuildPreview(); });
 
         redistributeCombo_ = new QComboBox;
         redistributeCombo_->addItems({"pplns", "fee", "boost", "donate"});
@@ -500,6 +519,48 @@ void PageLaunch::setupUi()
         vbox->addWidget(g);
     }
 
+    // ── 9b. PerCoinRun run-loop controls (DASH/DGB/BCH) ──────────────────────
+    // Deeper, reward-NEUTRAL run-loop knobs for the dedicated per-coin binaries.
+    // Every flag is catalog-gated on the active binary, so a control that the
+    // selected coin's binary does not accept is simply not emitted (and the row
+    // is greyed out by applyProfileUi()). Shown only for PerCoinRun coins.
+    {
+        auto* g = makeGroup("Run-loop controls (per-coin binary)");
+        runLoopGroup_ = g;
+        auto* form = new QFormLayout(g);
+
+        coinP2pDiscoverCheck_ = new QCheckBox(
+            "Scored coin-P2P peer discovery (--coin-p2p-discover)");
+        coinP2pDiscoverCheck_->setToolTip(
+            "--coin-p2p-discover — diverse/scored coin-network peer discovery. "
+            "Transport only; reward-neutral (never moves the block-producing arm). "
+            "DASH/DGB.");
+        form->addRow("Peer discovery:", coinP2pDiscoverCheck_);
+
+        noP2pRelayCheck_ = new QCheckBox(
+            "Suppress embedded won-block relay (--no-p2p-relay)");
+        noP2pRelayCheck_->setToolTip(
+            "--no-p2p-relay — do not relay a won block over the embedded coin "
+            "P2P arm (RPC submit still happens). DASH/DGB.");
+        form->addRow("Won-block relay:", noP2pRelayCheck_);
+
+        bchAnchorEdit_ = new QLineEdit;
+        bchAnchorEdit_->setPlaceholderText("HEIGHT:HASH (BCH cold-start ABLA floor, optional)");
+        bchAnchorEdit_->setToolTip(
+            "--anchor HEIGHT:HASH — BCH cold-start ABLA (adaptive blocksize) "
+            "anchor. Reward-neutral bootstrap hint; BCH only.");
+        form->addRow("BCH anchor:", bchAnchorEdit_);
+
+        connect(coinP2pDiscoverCheck_, &QCheckBox::stateChanged, this,
+                [this](int) { onBuildPreview(); });
+        connect(noP2pRelayCheck_, &QCheckBox::stateChanged, this,
+                [this](int) { onBuildPreview(); });
+        connect(bchAnchorEdit_, &QLineEdit::textChanged, this,
+                [this]() { onBuildPreview(); });
+
+        vbox->addWidget(g);
+    }
+
     // ── 10. ★ Advanced / embedded (opt-in, REWARD-UNSAFE) ────────────────────
     // Default OFF. This is the ONLY place --coin-p2p-connect /
     // --embedded-mainnet may be emitted. The default per-coin launch is the
@@ -550,10 +611,46 @@ void PageLaunch::setupUi()
             "Reward-unsafe until validated. Default OFF.");
         gLayout->addWidget(embeddedMainnetCheck_);
 
+        // DGB embedded coin-network producer target (--coin-daemon + --coin-magic
+        // + --coin-genesis). Emitted ONLY when the embedded-P2P opt-in is on and
+        // only where the catalog carries the alias for the active binary.
+        auto* embForm = new QFormLayout;
+        embeddedCoinDaemonEdit_ = new QLineEdit;
+        embeddedCoinDaemonEdit_->setEnabled(false);
+        embeddedCoinDaemonEdit_->setPlaceholderText("HOST:PORT (DGB --coin-daemon producer target)");
+        embeddedCoinDaemonEdit_->setToolTip(
+            "--coin-daemon HOST:PORT — DGB embedded-P2P producer target. "
+            "Reward-unsafe embedded arm; emitted only with the opt-in above.");
+        embForm->addRow("Coin daemon (DGB):", embeddedCoinDaemonEdit_);
+
+        embeddedCoinMagicEdit_ = new QLineEdit;
+        embeddedCoinMagicEdit_->setEnabled(false);
+        embeddedCoinMagicEdit_->setPlaceholderText("HEX wire magic (regtest/embedded override)");
+        embeddedCoinMagicEdit_->setToolTip(
+            "--coin-magic / --coin-p2p-magic HEX — wire magic override for the "
+            "embedded coin P2P (MONEY_RESTART). Emitted only with the opt-in above.");
+        embForm->addRow("Coin magic:", embeddedCoinMagicEdit_);
+
+        embeddedCoinGenesisEdit_ = new QLineEdit;
+        embeddedCoinGenesisEdit_->setEnabled(false);
+        embeddedCoinGenesisEdit_->setPlaceholderText("HASH (DGB --coin-genesis override)");
+        embeddedCoinGenesisEdit_->setToolTip(
+            "--coin-genesis HASH — DGB genesis override for the embedded arm. "
+            "Emitted only with the opt-in above.");
+        embForm->addRow("Coin genesis (DGB):", embeddedCoinGenesisEdit_);
+        gLayout->addLayout(embForm);
+
         connect(embeddedP2pCheck_, &QCheckBox::stateChanged, this, [this](int st) {
-            embeddedP2pPeersEdit_->setEnabled(st == Qt::Checked);
+            const bool on = (st == Qt::Checked);
+            embeddedP2pPeersEdit_->setEnabled(on);
+            embeddedCoinDaemonEdit_->setEnabled(on);
+            embeddedCoinMagicEdit_->setEnabled(on);
+            embeddedCoinGenesisEdit_->setEnabled(on);
             onBuildPreview();
         });
+        connect(embeddedCoinDaemonEdit_,  &QLineEdit::textChanged, this, [this]() { onBuildPreview(); });
+        connect(embeddedCoinMagicEdit_,   &QLineEdit::textChanged, this, [this]() { onBuildPreview(); });
+        connect(embeddedCoinGenesisEdit_, &QLineEdit::textChanged, this, [this]() { onBuildPreview(); });
         connect(embeddedMainnetCheck_, &QCheckBox::stateChanged, this,
                 [this](int) { onBuildPreview(); });
         connect(embeddedP2pPeersEdit_, &QPlainTextEdit::textChanged, this,
@@ -783,36 +880,58 @@ QString PageLaunch::buildPerCoinCommand() const
     // Marshal form + profile state into the Qt-free command core. The
     // reward-safety invariant (embedded flags gated behind default-OFF
     // opt-ins) lives in build_percoin_argv() and is unit-tested there.
+    c2pool_qt::PerCoinParams pp = marshalPerCoinParams();
+    return QString::fromStdString(
+        c2pool_qt::join_argv(c2pool_qt::build_percoin_argv(pp)));
+}
+
+// Marshal the form + active profile into the Qt-free command core. Every flag
+// SPELLING is chosen by build_percoin_argv() from the parameter catalog keyed on
+// prof.bin, so the panel emits only flags the target binary accepts. Shared by
+// buildPerCoinCommand() and launch()'s validate_percoin() precheck.
+c2pool_qt::PerCoinParams PageLaunch::marshalPerCoinParams() const
+{
+    const QString chain = currentChain();
+    const c2pool_qt::CoinProfile& prof = c2pool_qt::coinProfile(chain);
+
     c2pool_qt::PerCoinParams pp;
+    pp.bin        = prof.bin;
     pp.binary     = binaryEdit_->text().trimmed().toStdString();
     pp.subcommand = prof.subcommand.toStdString();
     if (dataDirEdit_) pp.dataDir = dataDirEdit_->text().trimmed().toStdString();
 
-    pp.testnet             = testnetCheck_->isChecked();
-    pp.supportsTestnetFlag = prof.supportsTestnetFlag;
+    pp.testnet = testnetCheck_->isChecked();
 
-    pp.coinRpcFlag = prof.coinRpcFlag.toStdString();
-    pp.rpcHost     = coindHostEdit_->text().trimmed().toStdString();
-    pp.rpcPort     = coindPortSpin_->value();
-    pp.rpcAuthFlag = prof.rpcAuthFlag.toStdString();
+    pp.rpcHost = coindHostEdit_->text().trimmed().toStdString();
+    pp.rpcPort = coindPortSpin_->value();
     if (rpcConfPathEdit_) pp.confPath = rpcConfPathEdit_->text().trimmed().toStdString();
 
     pp.stratumPort = stratumPortSpin_->value();
 
-    pp.supportsWebPort = prof.supportsWebPort;
-    pp.webPort         = httpPortSpin_->value();
-    pp.webHost         = httpHostEdit_->text().trimmed().toStdString();
+    pp.webPort = httpPortSpin_->value();
+    pp.webHost = httpHostEdit_->text().trimmed().toStdString();
 
-    pp.sharechainPortFlag = prof.sharechainPortFlag.toStdString();
-    pp.sharechainPort     = p2pPortSpin_->value();
+    pp.sharechainPort = p2pPortSpin_->value();
     for (const QString& line : seedNodesEdit_->toPlainText().split('\n', Qt::SkipEmptyParts))
         pp.addnodes.push_back(line.trimmed().toStdString());
 
     pp.payoutAddress = addressEdit_->text().trimmed().toStdString();
     pp.fee           = feeSpinBox_->value();
+    // ★ give-author tri-state: default OMIT (binary default). An explicit value
+    // is emitted only when the operator overrode it, and an explicit ZERO only
+    // behind the ack checkbox — never a silent --give-author 0 (reward-safety).
     pp.giveAuthor    = giveAuthorSpinBox_->value();
+    pp.giveAuthorExplicitZeroAck =
+        giveAuthorZeroAckCheck_ && giveAuthorZeroAckCheck_->isChecked();
+    pp.giveAuthorSet = pp.giveAuthor > 0.0 || pp.giveAuthorExplicitZeroAck;
     pp.redistribute  = redistributeCombo_->currentText().toStdString();
     pp.messageBlob   = messageBlobEdit_->text().trimmed().toStdString();
+
+    // ── DGB/BCH deeper run-loop controls (emitted only where the catalog has
+    //    the alias for this binary — a no-op on coins that lack the flag). ──
+    pp.coinP2pDiscover = coinP2pDiscoverCheck_ && coinP2pDiscoverCheck_->isChecked();
+    pp.noP2pRelay      = noP2pRelayCheck_ && noP2pRelayCheck_->isChecked();
+    if (bchAnchorEdit_) pp.bchAnchor = bchAnchorEdit_->text().trimmed().toStdString();
 
     // ── ★ Embedded reward-UNSAFE arm — OPT-IN ONLY (default OFF) ──────────
     pp.embeddedP2p = embeddedP2pCheck_ && embeddedP2pCheck_->isChecked();
@@ -821,10 +940,17 @@ QString PageLaunch::buildPerCoinCommand() const
              embeddedP2pPeersEdit_->toPlainText().split('\n', Qt::SkipEmptyParts))
             pp.embeddedP2pPeers.push_back(line.trimmed().toStdString());
     }
+    if (pp.embeddedP2p) {
+        if (embeddedCoinDaemonEdit_)
+            pp.coinDaemon = embeddedCoinDaemonEdit_->text().trimmed().toStdString();
+        if (embeddedCoinMagicEdit_)
+            pp.coinMagic = embeddedCoinMagicEdit_->text().trimmed().toStdString();
+        if (embeddedCoinGenesisEdit_)
+            pp.coinGenesis = embeddedCoinGenesisEdit_->text().trimmed().toStdString();
+    }
     pp.embeddedMainnet = embeddedMainnetCheck_ && embeddedMainnetCheck_->isChecked();
 
-    return QString::fromStdString(
-        c2pool_qt::join_argv(c2pool_qt::build_percoin_argv(pp)));
+    return pp;
 }
 
 QString PageLaunch::suggestedApiBaseUrl() const
@@ -891,6 +1017,54 @@ void PageLaunch::applyProfileUi()
         embeddedGroup_->setVisible(perCoin);
     if (embeddedMainnetCheck_)
         embeddedMainnetCheck_->setVisible(chain == QStringLiteral("dash"));
+    // Embedded DGB producer-target fields are DGB-only.
+    {
+        const bool isDgb = (chain == QStringLiteral("digibyte"));
+        if (embeddedCoinDaemonEdit_)  embeddedCoinDaemonEdit_->setVisible(isDgb);
+        if (embeddedCoinGenesisEdit_) embeddedCoinGenesisEdit_->setVisible(isDgb);
+        // --coin-magic exists for DASH and DGB.
+        if (embeddedCoinMagicEdit_)
+            embeddedCoinMagicEdit_->setVisible(
+                isDgb || chain == QStringLiteral("dash"));
+    }
+
+    // ── Catalog-driven per-coin control gating ────────────────────────────────
+    // For a PerCoinRun coin, grey out any flag its binary does not accept per the
+    // parameter catalog (keyed on prof.bin), so the form can never invite the
+    // operator to set a value that would be silently dropped. LegacyUnified coins
+    // keep every money widget enabled (they build the Python-p2pool argv).
+    if (perCoin) {
+        using c2pool_qt::catview::spelling_for;
+        const auto bin = prof.bin;
+        auto has = [&](const char* canon) {
+            return spelling_for(bin, canon).has_value();
+        };
+        const bool hasFee        = has("money.node_owner_fee_pct");
+        const bool hasGiveAuthor = has("money.give_author_pct");
+        const bool hasOwnerAddr  = has("money.node_owner_address");
+        const bool hasRedist     = has("money.redistribute");
+        if (feeSpinBox_)             feeSpinBox_->setEnabled(hasFee);
+        if (giveAuthorSpinBox_)      giveAuthorSpinBox_->setEnabled(hasGiveAuthor);
+        if (giveAuthorZeroAckCheck_) giveAuthorZeroAckCheck_->setEnabled(hasGiveAuthor);
+        if (nodeOwnerAddrEdit_)      nodeOwnerAddrEdit_->setEnabled(hasOwnerAddr);
+        if (redistributeCombo_)      redistributeCombo_->setEnabled(hasRedist);
+
+        // Run-loop rows: enable only where the catalog carries the alias.
+        if (coinP2pDiscoverCheck_) coinP2pDiscoverCheck_->setEnabled(has("coin_p2p.discover"));
+        if (noP2pRelayCheck_)      noP2pRelayCheck_->setEnabled(has("sharechain.no_p2p_relay"));
+        if (bchAnchorEdit_)        bchAnchorEdit_->setEnabled(has("embedded.anchor"));
+    } else {
+        // Legacy coins: money widgets always available.
+        if (feeSpinBox_)             feeSpinBox_->setEnabled(true);
+        if (giveAuthorSpinBox_)      giveAuthorSpinBox_->setEnabled(true);
+        if (giveAuthorZeroAckCheck_) giveAuthorZeroAckCheck_->setEnabled(true);
+        if (nodeOwnerAddrEdit_)      nodeOwnerAddrEdit_->setEnabled(true);
+        if (redistributeCombo_)      redistributeCombo_->setEnabled(true);
+    }
+
+    // Run-loop group is only meaningful for PerCoinRun binaries.
+    if (runLoopGroup_)
+        runLoopGroup_->setVisible(perCoin);
 
     // Per-coin note: CLI arm, masternode-payee, experimental status.
     if (coinNoteLabel_) {
@@ -902,6 +1076,13 @@ void PageLaunch::applyProfileUi()
                             prof.rpcAuthFlag.isEmpty() ? QStringLiteral("RPC")
                                                        : prof.rpcAuthFlag,
                             prof.confHint);
+            if (chain == QStringLiteral("bitcoincash"))
+                note += QStringLiteral("  c2pool-bch has no operator fee surface "
+                                       "(param catalog) — fee/donation/redistribute "
+                                       "are disabled.");
+            else if (chain == QStringLiteral("digibyte"))
+                note += QStringLiteral("  c2pool-dgb: node-owner address + "
+                                       "redistribute live; no author-fee surface.");
         } else {
             note = QStringLiteral("%1 · %2 · unified c2pool binary (--net %3).")
                        .arg(prof.displayLabel, prof.algoLabel, prof.symbol);
@@ -910,8 +1091,7 @@ void PageLaunch::applyProfileUi()
             note += QStringLiteral("  Masternode-payee coin (block reward is split "
                                    "with the masternode network).");
         if (prof.experimental)
-            note += QStringLiteral("  ⚠ per-coin binary still stabilising — deeper "
-                                   "controls are TODO (qt-steward).");
+            note += QStringLiteral("  ⚠ per-coin binary still stabilising.");
         coinNoteLabel_->setText(note);
     }
 }
@@ -1023,6 +1203,23 @@ void PageLaunch::launch()
         return;
     }
 
+    // ── ★ Reward-safety precheck (PerCoinRun) ─────────────────────────────────
+    // F5: a DASH launch with a blank --coin-rpc endpoint and no explicit embedded
+    // opt-in would run daemonless with embedded MAINNET block production auto-ON
+    // (reward-UNSAFE). validate_percoin() catches that (and any future per-coin
+    // reward guard) BEFORE build_percoin_argv() is ever run.
+    if (c2pool_qt::coinProfile(chain).cli == c2pool_qt::CliFamily::PerCoinRun) {
+        const std::string reason =
+            c2pool_qt::validate_percoin(marshalPerCoinParams());
+        if (!reason.empty()) {
+            emit daemonStateChanged(
+                QStringLiteral("Daemon: refused — %1")
+                    .arg(QString::fromStdString(reason)),
+                "color: #b04020;");
+            return;
+        }
+    }
+
     onBuildPreview();
     const QString cmd = buildCommand();
     if (cmd.trimmed().isEmpty()) {
@@ -1105,6 +1302,14 @@ void PageLaunch::saveSettings() const
     if (embeddedP2pCheck_)     s.setValue("embeddedP2p",      embeddedP2pCheck_->isChecked());
     if (embeddedP2pPeersEdit_) s.setValue("embeddedP2pPeers", embeddedP2pPeersEdit_->toPlainText());
     if (embeddedMainnetCheck_) s.setValue("embeddedMainnet",  embeddedMainnetCheck_->isChecked());
+    if (embeddedCoinDaemonEdit_)  s.setValue("embeddedCoinDaemon",  embeddedCoinDaemonEdit_->text());
+    if (embeddedCoinMagicEdit_)   s.setValue("embeddedCoinMagic",   embeddedCoinMagicEdit_->text());
+    if (embeddedCoinGenesisEdit_) s.setValue("embeddedCoinGenesis", embeddedCoinGenesisEdit_->text());
+    // give-author explicit-zero ack + run-loop controls
+    if (giveAuthorZeroAckCheck_) s.setValue("giveAuthorZeroAck", giveAuthorZeroAckCheck_->isChecked());
+    if (coinP2pDiscoverCheck_)   s.setValue("coinP2pDiscover",  coinP2pDiscoverCheck_->isChecked());
+    if (noP2pRelayCheck_)        s.setValue("noP2pRelay",       noP2pRelayCheck_->isChecked());
+    if (bchAnchorEdit_)          s.setValue("bchAnchor",        bchAnchorEdit_->text());
 
     // Merged chains
     s.remove("merged");
@@ -1174,6 +1379,24 @@ void PageLaunch::loadSettings()
     }
     if (embeddedMainnetCheck_)
         embeddedMainnetCheck_->setChecked(s.value("embeddedMainnet", false).toBool());
+    if (embeddedCoinDaemonEdit_)  embeddedCoinDaemonEdit_->setText(s.value("embeddedCoinDaemon").toString());
+    if (embeddedCoinMagicEdit_)   embeddedCoinMagicEdit_->setText(s.value("embeddedCoinMagic").toString());
+    if (embeddedCoinGenesisEdit_) embeddedCoinGenesisEdit_->setText(s.value("embeddedCoinGenesis").toString());
+    if (embeddedCoinDaemonEdit_ && embeddedP2pCheck_)
+        embeddedCoinDaemonEdit_->setEnabled(embeddedP2pCheck_->isChecked());
+    if (embeddedCoinMagicEdit_ && embeddedP2pCheck_)
+        embeddedCoinMagicEdit_->setEnabled(embeddedP2pCheck_->isChecked());
+    if (embeddedCoinGenesisEdit_ && embeddedP2pCheck_)
+        embeddedCoinGenesisEdit_->setEnabled(embeddedP2pCheck_->isChecked());
+    // give-author explicit-zero ack + run-loop controls (default OFF / empty).
+    if (giveAuthorZeroAckCheck_)
+        giveAuthorZeroAckCheck_->setChecked(s.value("giveAuthorZeroAck", false).toBool());
+    if (coinP2pDiscoverCheck_)
+        coinP2pDiscoverCheck_->setChecked(s.value("coinP2pDiscover", false).toBool());
+    if (noP2pRelayCheck_)
+        noP2pRelayCheck_->setChecked(s.value("noP2pRelay", false).toBool());
+    if (bchAnchorEdit_)
+        bchAnchorEdit_->setText(s.value("bchAnchor").toString());
 
     // Merged chains
     mergedTable_->setRowCount(0);
