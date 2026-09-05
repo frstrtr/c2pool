@@ -557,6 +557,19 @@ public:
     /// body tx would — the delta cannot inflate a single duff of reward.
     static constexpr uint64_t INJECT_FEE_DELTA = 100'000'000'000ULL;   // 1000 DASH, duffs
 
+    /// dashcore consensus/amount.h: MAX_MONEY = 21e6 * COIN (COIN = 1e8 duffs).
+    /// MoneyRange(v) := 0 <= v <= MAX_MONEY — the exact CheckTransaction /
+    /// GetValueOut value-range predicate (vendor/dashscript consensus/amount.h).
+    static constexpr int64_t DASH_MAX_MONEY = 21'000'000LL * 100'000'000LL;
+    static constexpr bool money_range(int64_t v) {
+        return v >= 0 && v <= DASH_MAX_MONEY;
+    }
+
+    /// BIP68 relative-locktime opt-in sentinel (dashcore consensus/txinfo.h
+    /// CTxIn::SEQUENCE_LOCKTIME_DISABLE_FLAG). A vin whose nSequence has this
+    /// bit CLEAR (and a tx of nVersion >= 2) opts into a relative time-lock.
+    static constexpr uint32_t SEQUENCE_LOCKTIME_DISABLE_FLAG = 0x80000000u;
+
     /// Every add_inject refusal is NAMED (DEF3 discipline — no silent drops).
     enum class InjectGate : uint8_t {
         Ok = 0,
@@ -567,6 +580,16 @@ public:
         AlreadyConfirmed,    // #125 own-output-present: the tx is already mined
         Unpriceable,         // inputs not present in our view/fold → fee not
                              // fold-proven → would be template-excluded silently
+        Bip68Unsupported,    // GAP-1: nVersion>=2 with a BIP68 relative-lock input.
+                             // The new ingestion seam breaks the sole-ingestion-
+                             // path invariant's "relay-admitted txs are final at
+                             // admission" premise (bad-txns-nonfinal). Full
+                             // SequenceLocks is M2; until then FAIL-CLOSED.
+        BadVoutRange,        // GAP-2: a vout value outside MoneyRange. Admitting
+                             // it lets the uint64 cast in compute_fee wrap out_sum
+                             // (INT64_MIN → huge) → inflated total_fees → the
+                             // coinbase value moves → an invalid, reward-unsafe
+                             // block (CheckTransaction bad-txns-vout-* / -txouttotal).
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -576,6 +599,8 @@ public:
             case InjectGate::AlreadyKnown:       return "inject-already-known";
             case InjectGate::AlreadyConfirmed:   return "inject-already-confirmed";
             case InjectGate::Unpriceable:        return "inject-unpriceable";
+            case InjectGate::Bip68Unsupported:   return "inject-bip68-unsupported";
+            case InjectGate::BadVoutRange:       return "inject-bad-txns-vout-range";
         }
         return "inject-unknown";
     }
@@ -608,6 +633,39 @@ public:
         // (2) new-seam script-verify requirement (fail-closed).
         if (!m_script_check)
             return InjectGate::ScriptCheckUnarmed;
+        // (2a) GAP-1 — BIP68 relative-locktime FAIL-CLOSED. This is a NEW
+        //     ingestion seam, so the sole-ingestion-path invariant's argument
+        //     that bad-txns-nonfinal is N/A ("relay-admitted txs are final at
+        //     admission") no longer holds: a directly-injected tx never passed a
+        //     relaying dashd's SequenceLocks. We port absolute-locktime finality
+        //     (is_final_tx, run in the selector), but NOT relative BIP68
+        //     SequenceLocks (that is M2). Until then, refuse any tx that OPTS IN
+        //     to a relative lock — nVersion >= 2 with an input whose nSequence
+        //     leaves SEQUENCE_LOCKTIME_DISABLE_FLAG clear — rather than risk
+        //     selecting a bad-txns-nonfinal tx into a template. Chain-state
+        //     independent, so it sits with the other cheap pre-admission gates.
+        if (tx.version >= 2) {
+            for (const auto& vin : tx.vin) {
+                if ((vin.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0)
+                    return InjectGate::Bip68Unsupported;
+            }
+        }
+        // (2b) GAP-2 — CheckTransaction output value-range (bad-txns-vout-*).
+        //     dashcore CheckTransaction / CTransaction::GetValueOut reject any
+        //     vout outside MoneyRange and any running-sum overflow BEFORE the tx
+        //     is priced. compute_fee_locked casts vout.value to uint64 for
+        //     out_sum, so an out-of-range value (e.g. INT64_MIN) would wrap the
+        //     sum and inflate in_sum - out_sum → total_fees → the coinbase.
+        //     Refuse by name here, ahead of admission/pricing. No-op for any
+        //     valid tx (every vout already in range).
+        {
+            int64_t vout_running = 0;
+            for (const auto& vout : tx.vout) {
+                if (!money_range(vout.value) || !money_range(vout_running + vout.value))
+                    return InjectGate::BadVoutRange;
+                vout_running += vout.value;
+            }
+        }
         const uint256 txid = dash_txid(tx);
         // (3) dedup against our own pool.
         if (m_pool.count(txid))
@@ -2347,6 +2405,21 @@ private:
             return false;
         }
         for (const auto& vout : entry.tx.vout) {
+            // GAP-2 — MoneyRange guard (CheckTransaction bad-txns-vout-*). Any
+            // ingestion seam other than add_inject (relay add_tx, BIP35 drain,
+            // …) reaches this pricing path WITHOUT the add_inject range gate, so
+            // an out-of-range vout must be caught HERE too: static_cast<uint64_t>
+            // of a negative value (INT64_MIN → 2^63) wraps out_sum, so
+            // in_sum - out_sum would report a fabricated positive fee, a value-
+            // creating hole that moves the coinbase. Fail-closed: unpriced,
+            // fee_fold_proven stays false → template-excluded. No-op for any
+            // valid tx (every vout already in MoneyRange).
+            if (!money_range(vout.value)) {
+                entry.fee_known = false;
+                entry.fee_fold_proven = false;
+                entry.fee = 0;
+                return false;
+            }
             out_sum += static_cast<uint64_t>(vout.value);
         }
         if (in_sum < out_sum) {

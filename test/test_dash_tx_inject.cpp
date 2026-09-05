@@ -21,7 +21,15 @@
 //        * a missing-input inject is REFUSED at submit (unpriceable, by name).
 //   4. DoS + SEAM DISCIPLINE — oversize is refused by name; a new ingestion
 //      seam refuses unless the consensus-exact CheckInputScripts callback is
-//      armed (sole-ingestion-path invariant).
+//      armed (sole-ingestion-path invariant). The seam ALSO closes the two
+//      admission rows the invariant used to argue N-A on relay-only ingestion:
+//        * FAIL-CLOSED BIP68 (bad-txns-nonfinal) — a v2 inject that opts into a
+//          relative sequence-lock is refused (inject-bip68-unsupported), since
+//          SequenceLocks is not yet ported (M2);
+//        * REWARD-SAFE value range (bad-txns-vout-*) — an inject with a vout
+//          outside MoneyRange is refused (inject-bad-txns-vout-range), and the
+//          shared compute_fee pricing path MoneyRange-guards out_sum so a
+//          relay/BIP35 tx cannot wrap the sum into a fabricated coinbase fee.
 //
 // The signed-spend + script-verify scaffolding is the SAME dashcore VerifyScript
 // (dash_scriptcheck.so) the KAT signs a real P2PKH spend against — no hand-rolled
@@ -346,6 +354,120 @@ TEST(DashTxInject, InjectPoolDoSCaps)
     auto d2 = pool.reap_expired(/*height=*/101);
     ASSERT_EQ(d2.size(), 1u);
     EXPECT_EQ(d2[0], tExp);
+}
+
+// (4d) GAP-1 FAIL-CLOSED — BIP68 relative-locktime. This is a NEW ingestion
+//      seam, so the sole-ingestion-path invariant's "relay-admitted txs are
+//      final at admission" premise no longer holds: a directly-injected tx
+//      never passed a relaying dashd's SequenceLocks. We port absolute-locktime
+//      finality (is_final_tx) but NOT relative BIP68 (that is M2), so an inject
+//      that OPTS IN to a relative lock — nVersion>=2 with an input whose
+//      nSequence leaves SEQUENCE_LOCKTIME_DISABLE_FLAG clear — is FAIL-CLOSED
+//      refused by name rather than risked into a bad-txns-nonfinal template.
+//      RED on 9e859686: InjectGate::Bip68Unsupported does not exist and the tx
+//      is admitted (Ok) → selectable → an invalid block. GREEN after: refused.
+TEST(DashTxInject, Bip68RelativeLockInjectRefusedFailClosed)
+{
+    Key k(0x88);
+    uint256 prev = prevhash(0xba);
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+
+    // NEGATIVE: nVersion==2 with a BIP68 relative-lock input (bit 31 clear).
+    auto rel = make_signed_spend(k, prev, 90'000);
+    rel.version = 2;
+    rel.vin[0].sequence = 0x0000000au;   // disable-flag clear ⇒ relative lock ON
+    EXPECT_EQ(mp.add_inject(rel), Mempool::InjectGate::Bip68Unsupported)
+        << "a v2 inject that opts into a BIP68 relative lock must be fail-closed refused";
+
+    // POSITIVE TWIN 1: nVersion==2 but every input disables the relative lock
+    // (SEQUENCE_FINAL has bit 31 set) ⇒ no BIP68 opt-in ⇒ admitted.
+    auto v2_final = make_signed_spend(k, prev, 90'000);
+    v2_final.version = 2;                 // vin sequence stays 0xffffffff
+    EXPECT_EQ(mp.add_inject(v2_final), Mempool::InjectGate::Ok)
+        << "a v2 inject with no relative-lock input rides the normal path";
+
+    // POSITIVE TWIN 2: nVersion==1 never activates BIP68, even with the same
+    // relative-lock sequence bits — version-gated, exactly as consensus does it.
+    uint256 prev2 = prevhash(0xbb);
+    utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, to_script(k.spk), 1, false));
+    auto v1_rel = make_signed_spend(k, prev2, 90'000);
+    v1_rel.version = 1;
+    v1_rel.vin[0].sequence = 0x0000000au;
+    EXPECT_EQ(mp.add_inject(v1_rel), Mempool::InjectGate::Ok)
+        << "BIP68 is nVersion>=2 only; a v1 inject is unaffected";
+}
+
+// (4e) GAP-2 REWARD-SAFETY — CheckTransaction output value-range (MoneyRange).
+//      compute_fee casts vout.value to uint64 for out_sum, so an out-of-range
+//      value (INT64_MIN) wraps the sum and fabricates a positive fee → inflated
+//      total_fees → the coinbase value MOVES → an invalid, reward-unsafe block.
+//      Two guards close it: add_inject refuses by name BEFORE pricing, and
+//      compute_fee_locked (the shared pricing path every ingestion seam uses)
+//      MoneyRange-guards out_sum so a relay/BIP35 tx is template-EXCLUDED.
+//      RED on 9e859686: InjectGate::BadVoutRange does not exist, the inject is
+//      admitted, and a 2×INT64_MIN relay tx prices to a fabricated fee and is
+//      SELECTED. GREEN after: refused / excluded, coinbase untouched.
+TEST(DashTxInject, VoutValueRangeInjectRefusedAndPricingFailClosed)
+{
+    Key k(0x99);
+    uint256 prev = prevhash(0xca);
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+
+    // NEGATIVE (add_inject gate): a vout outside MoneyRange (INT64_MIN — the
+    // exact wrap value) is refused by name, ahead of admission/pricing.
+    auto badneg = make_signed_spend(k, prev, 90'000);
+    badneg.vout[0].value = INT64_MIN;
+    EXPECT_EQ(mp.add_inject(badneg), Mempool::InjectGate::BadVoutRange)
+        << "an inject with a vout below MoneyRange must be refused by name";
+
+    // NEGATIVE (upper bound): a vout above MAX_MONEY is equally refused.
+    auto badhi = make_signed_spend(k, prev, 90'000);
+    badhi.vout[0].value = Mempool::DASH_MAX_MONEY + 1;
+    EXPECT_EQ(mp.add_inject(badhi), Mempool::InjectGate::BadVoutRange)
+        << "an inject with a vout above MoneyRange must be refused by name";
+
+    // POSITIVE TWIN: an in-range inject prices normally and is served at its
+    // true base fee — the guard is a no-op for any valid tx.
+    auto good = make_signed_spend(k, prev, 90'000);   // fee 10'000
+    EXPECT_EQ(mp.add_inject(good), Mempool::InjectGate::Ok);
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+        ASSERT_EQ(selected.size(), 1u);
+        EXPECT_EQ(dash_txid(selected[0].tx), dash_txid(good));
+        EXPECT_EQ(fees, 10'000u) << "a valid inject prices to its true base fee (guard is a no-op)";
+    }
+
+    // compute_fee_locked GUARD via the RELAY seam (add_tx), which has NO inject
+    // gate: two INT64_MIN vouts wrap out_sum to 0, so on 9e859686 the tx prices
+    // to a fabricated fee (in_sum) and is SELECTED — a value-creating block.
+    // Script-check is left UNARMED so the selector's fee_fold_proven gate is the
+    // sole discriminator (no signature confound). GREEN after: MoneyRange makes
+    // the tx unpriceable ⇒ fee_fold_proven false ⇒ template-excluded.
+    uint256 prevW = prevhash(0xcb);
+    UTXOViewCache utxo2(nullptr);
+    utxo2.add_coin(Outpoint(prevW, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp2; mp2.set_utxo(&utxo2);
+    // NO arm_script_check — isolate the pricing guard.
+    MutableTransaction wrap;
+    wrap.version = 1; wrap.type = 0; wrap.locktime = 0;
+    TxIn win; win.prevout.hash = prevW; win.prevout.index = 0; win.sequence = 0xffffffffu;
+    win.scriptSig = to_script(k.spk);
+    wrap.vin.push_back(win);
+    TxOut wo1; wo1.value = INT64_MIN; wo1.scriptPubKey = to_script(k.spk); wrap.vout.push_back(wo1);
+    TxOut wo2; wo2.value = INT64_MIN; wo2.scriptPubKey = to_script(k.spk); wrap.vout.push_back(wo2);
+    ASSERT_TRUE(mp2.add_tx(wrap));   // admitted (unpriceable txs are admitted, then excluded)
+    auto [sel2, fees2] = mp2.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+    EXPECT_EQ(sel2.size(), 0u)
+        << "a relay tx whose vouts wrap out_sum must be template-excluded, not priced to a fake fee";
+    EXPECT_EQ(fees2, 0u) << "the fabricated fee must never reach total_fees / the coinbase";
 }
 
 // (5) GOOD-CITIZEN: injection is opt-in ONLY. It is NOT a TxServeLever, so the
