@@ -225,6 +225,39 @@ struct u256 {
         return r;
     }
 
+    // Index (1-based) of the highest set bit; 0 for a zero value. Mirrors
+    // arith_uint256::bits() -- target_to_compact() reads it to size the compact
+    // exponent, exactly as DigiByte Core's GetCompact does.
+    unsigned int bits() const {
+        for (int i = 3; i >= 0; --i) {
+            if (limb[i] != 0) {
+                for (int b = 63; b >= 0; --b)
+                    if (limb[i] & (uint64_t(1) << b))
+                        return static_cast<unsigned int>(64 * i + b + 1);
+            }
+        }
+        return 0;
+    }
+
+    // Right-shift by an arbitrary bit count in [0, 255] (>= 256 -> zero),
+    // truncating at 256 bits. arith_uint256::operator>> equivalent; the only
+    // caller (target_to_compact) shifts by whole bytes (8*(nSize-3)).
+    u256 shr_bits(unsigned int n) const {
+        u256 r;
+        if (n >= 256) return r;
+        const unsigned int word = n / 64, bit = n % 64;
+        for (int i = 0; i < 4; ++i) {
+            const int src = i + static_cast<int>(word);
+            if (src < 4) {
+                uint64_t v = limb[src] >> bit;
+                if (bit != 0 && src + 1 < 4)
+                    v |= limb[src + 1] << (64 - bit);
+                r.limb[i] = v;
+            }
+        }
+        return r;
+    }
+
     // Add another 256-bit value, truncating carry past limb[3] (256-bit wrap,
     // same width discipline as mul_u64). Accumulates the retarget window's
     // target sum before the divide-by-count average.
@@ -253,6 +286,59 @@ struct u256 {
 // first would lose low-order precision and is NOT what consensus computes.
 inline u256 mul_div_u256(const u256& avg, uint64_t mul, uint64_t div) {
     return avg.mul_u64(mul).div_u64(div);
+}
+
+// Expand a compact "nBits" difficulty target into a full 256-bit value,
+// mirroring DigiByte Core arith_uint256::SetCompact (Bitcoin's bnTarget
+// decode): the high byte is a base-256 exponent, the low 3 bytes the mantissa.
+//
+//   target = mantissa * 256^(exponent - 3)
+//
+// The sign bit (0x00800000) and the overflow/negative flags SetCompact sets are
+// not reproduced: a block header's declared target is never negative, and an
+// over-pow_limit mantissa is caught by the caller's pow_limit ceiling -- so the
+// numeric expansion is all the retarget/ingest paths need. The multiply runs
+// through mul_u64(256), which truncates at 256 bits exactly as arith_uint256
+// does, so a pathological huge exponent saturates rather than wrapping into a
+// small value. SSOT for both header_sample_build.hpp (nBits -> target ingest)
+// and dgb_multishield.hpp (SetCompact(prevAlgo.nBits) in the V4 walk).
+inline u256 compact_to_target(uint32_t bits) {
+    const uint32_t mantissa = bits & 0x007fffffu;
+    const uint32_t exponent = bits >> 24;
+
+    u256 target = u256::from_u64(mantissa);
+    if (exponent <= 3) {
+        for (uint32_t i = 0, n = 3 - exponent; i < n; ++i)
+            target = target.div_u64(256);
+    } else {
+        for (uint32_t i = 0, n = exponent - 3; i < n; ++i)
+            target = target.mul_u64(256);
+    }
+    return target;
+}
+
+// Compress a full 256-bit target back into compact "nBits", mirroring DigiByte
+// Core arith_uint256::GetCompact for a non-negative value. GetNextWorkRequiredV4
+// returns bnNew.GetCompact(); this is the inverse of compact_to_target on the
+// canonical nBits DigiByte Core produces, so target_to_compact(compact_to_target
+// (x)) == x for every canonical block nBits (proven over 150 mainnet vectors in
+// the KAT). The sign-bit branch of GetCompact reduces, for a non-negative
+// target, to the 0x00800000 normalisation (shift the mantissa right one byte and
+// bump the exponent) -- byte-identical to Core.
+inline uint32_t target_to_compact(const u256& v) {
+    int nSize = static_cast<int>((v.bits() + 7) / 8);
+    uint32_t nCompact;
+    if (nSize <= 3)
+        nCompact = static_cast<uint32_t>(v.low64() << (8 * (3 - nSize)));
+    else
+        nCompact = static_cast<uint32_t>(v.shr_bits(8 * (nSize - 3)).low64());
+    // The 0x00800000 bit denotes sign; if set, shift down a byte and grow size.
+    if (nCompact & 0x00800000u) {
+        nCompact >>= 8;
+        nSize++;
+    }
+    nCompact |= static_cast<uint32_t>(nSize) << 24;
+    return nCompact;
 }
 
 
