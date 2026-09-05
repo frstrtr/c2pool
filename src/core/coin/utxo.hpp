@@ -58,6 +58,26 @@ static constexpr ChainLimits DOGE_LIMITS = {1'000'000'000'000'000'000LL, 240, 0}
 ///   default for DGB, would have done above 84M DGB in one output).
 static constexpr ChainLimits DGB_LIMITS = {2'100'000'000'000'000'000LL, 100, 0};
 
+/// XMR (Monero): 60-block coinbase maturity (a mined output unlocks at
+///   height + 60), no pegout. Sibling of the LTC/DOGE/DGB rows for the XMR
+///   settlement lane (Family B).
+/// coinbase_maturity = 60: monero-project cryptonote_config.h
+///   CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW = 60 (~2 h at the 120 s v2 target);
+///   this is the D_conf floor the XMR settlement executor enforces
+///   (src/impl/xmr/settle/xmr_coinbase.hpp XMR_COINBASE_MATURITY, scoping §2.1).
+/// pegout_maturity = 0: Monero has no MWEB/pegout.
+/// max_money: DENOMINATION AND RANGE CAVEAT. Monero amounts are piconero
+///   (1 XMR = 1e12 atomic units — NOT the 1e8-sat convention of the BTC
+///   family), and Monero has no fixed supply cap (MONEY_SUPPLY is the
+///   ((uint64_t)-1) sentinel; tail emission is 0.6 XMR/block forever). c2pool's
+///   money_range() ceiling is int64_t, so we take INT64_MAX: it guards only
+///   against negative / overflowed output amounts and never falsely rejects a
+///   real coinbase output (per-output amounts sit far below 2^63 piconero).
+///   Supply-cap and per-output validity are enforced by Monero consensus'
+///   validate_miner_transaction; c2pool re-derives (P_i, view_tag_i) and
+///   byte-compares outputs — it does not re-run XMR supply accounting.
+static constexpr ChainLimits XMR_LIMITS = {9'223'372'036'854'775'807LL, 60, 0};
+
 /// Minimum blocks of undo data to keep for reorg safety + pruning.
 /// Matches the MIN_BLOCKS_TO_KEEP constant in each daemon's validation.h.
 /// Reference: litecoin/src/validation.h  MIN_BLOCKS_TO_KEEP = 288
@@ -68,6 +88,12 @@ static constexpr uint32_t DOGE_MIN_BLOCKS_TO_KEEP = 1440;
 /// Bitcoin Core). DGB's ~15 s block time makes 288 blocks ~72 min of undo
 /// data — ample for the shallow reorgs DGB sees.
 static constexpr uint32_t DGB_MIN_BLOCKS_TO_KEEP  = 288;
+/// XMR: keep one coinbase-unlock window's worth of undo data. Monero has no
+/// Bitcoin-style MIN_BLOCKS_TO_KEEP; its practical reorg depth is shallow and
+/// the 60-block maturity window bounds what a settlement reorg can touch, so
+/// 60 is the conservative keep depth. [est] engineering choice, not a cited
+/// Monero constant.
+static constexpr uint32_t XMR_MIN_BLOCKS_TO_KEEP  = 60;
 
 /// Minimum UTXO depth before mining can start: coinbase_maturity + reorg_buffer.
 /// LTC: 100 (COINBASE_MATURITY) + 6 (PEGOUT_MATURITY reorg depth) = 106
@@ -77,6 +103,8 @@ static constexpr uint32_t LTC_MINING_GATE_DEPTH  = LTC_LIMITS.coinbase_maturity 
 static constexpr uint32_t DOGE_MINING_GATE_DEPTH = DOGE_LIMITS.coinbase_maturity + 10; // 250
 /// DGB: 100 (COINBASE_MATURITY_2) + 10-block reorg safety buffer = 110.
 static constexpr uint32_t DGB_MINING_GATE_DEPTH  = DGB_LIMITS.coinbase_maturity + 10; // 110
+/// XMR: 60 (CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW) + 10-block reorg buffer = 70.
+static constexpr uint32_t XMR_MINING_GATE_DEPTH  = XMR_LIMITS.coinbase_maturity + 10; // 70
 
 /// Tip age threshold for considering chain synced (seconds).
 /// Both LTC and DOGE use 24 hours (86400s) as DEFAULT_MAX_TIP_AGE.
