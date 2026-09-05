@@ -1,0 +1,40 @@
+/* ============================================================================
+ * PORTED / ADAPTED FROM p2pool (GPLv3) — the original GPLv3 notice below is
+ * reproduced verbatim and MUST NOT be stripped or relicensed. This file is a
+ * derivative work of SChernykh/p2pool and therefore remains licensed under
+ * GNU GPL version 3; it is combined into the c2pool distributable under
+ * AGPLv3 §13 / GPLv3 §13 (see LICENSING.md §GPL and the top-level NOTICE).
+ * The combined c2pool work as a whole is conveyed under AGPL-3.0, and the
+ * AGPL §13 network-source-offer obligation attaches to the combination.
+ *
+ * c2pool provenance (added by us; NOT part of the upstream notice):
+ *   Upstream : SChernykh/p2pool
+ *   File     : <upstream path, e.g. src/block_template.cpp>
+ *   Pinned   : <release tag, e.g. v4.18> @ <full 40-char commit SHA>  (read YYYY-MM-DD)
+ *   Adapted  : <describe EXACTLY what monero-plumbing was taken and what was
+ *               changed, e.g. "miner_tx assembly + extra-nonce padding + hashing
+ *               blob; PPLNS get_shares()/uncle logic REMOVED and replaced by the
+ *               v37 K_fair settlement caller">
+ *   Scope    : MONERO-PLUMBING ONLY. The p2pool POOL-MODEL (SideChain / PPLNS
+ *               window / uncle mechanism / PoolBlock share-consensus) is NOT
+ *               ported — v37 supplies its own RDWR / work-receipts model.
+ *   Used by  : src/impl/xmr/<...>
+ *   Licence  : GPL-3.0-only (this file) within the AGPL-3.0 combined work
+ * ============================================================================ */
+
+/*
+ * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
+ * Copyright (c) 2021-2026 SChernykh <https://github.com/SChernykh>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */

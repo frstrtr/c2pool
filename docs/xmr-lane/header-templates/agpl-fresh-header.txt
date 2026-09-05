@@ -1,0 +1,29 @@
+/*
+ * This file is part of c2pool <https://github.com/frstrtr/c2pool>
+ * Copyright (c) 2024-2026 The c2pool developers
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/* NOTE for authors of fresh XMR-lane files:
+ *   - This header is for code WE write for c2pool (the src/impl/xmr/ tree that
+ *     has no upstream ancestor): the whole Family-B receipt/settlement model,
+ *     the RDWR caller, W2/W3/W4/W5 XMR logic, KATs, glue.
+ *   - It MUST be attribution-clean: NO "Co-Authored-By", NO "Claude", NO AI/
+ *     assistant/session lines anywhere in the file. The repo attribution-gate
+ *     rejects them.
+ *   - If a file mixes fresh code with an upstream-derived function, it is NOT
+ *     a "fresh" file: use the bsd-ported or gpl-ported header instead and keep
+ *     the upstream notice.
+ */

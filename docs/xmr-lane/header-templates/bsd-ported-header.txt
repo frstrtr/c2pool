@@ -1,0 +1,42 @@
+/* ============================================================================
+ * VENDORED FROM UPSTREAM — DO NOT rewrite the copyright/licence block below.
+ * The original BSD-3-Clause notice is reproduced verbatim as BSD-3 requires
+ * (clause 1: "Redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer").
+ *
+ * c2pool provenance (added by us; NOT part of the upstream notice):
+ *   Upstream : <e.g. tevador/RandomX  |  monero-project/monero>
+ *   File     : <upstream path, e.g. src/crypto/crypto-ops.c>
+ *   Pinned   : <release tag> @ <full 40-char commit SHA>   (read YYYY-MM-DD)
+ *   Vendored : <verbatim | adapted: describe exactly what changed and why>
+ *   Used by  : src/impl/xmr/<...>
+ *   Licence  : BSD-3-Clause (compatible with the c2pool AGPL-3.0 combined work;
+ *              see LICENSING.md §BSD and the top-level NOTICE file)
+ * ============================================================================ */
+
+/*  <<< PASTE THE UPSTREAM FILE'S ORIGINAL COPYRIGHT + BSD-3 HEADER HERE,
+        BYTE-FOR-BYTE, UNMODIFIED.  Example for a RandomX file:
+
+Copyright (c) 2018-2019, tevador <tevador@gmail.com>
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+	* Redistributions of source code must retain the above copyright
+	  notice, this list of conditions and the following disclaimer.
+	* Redistributions in binary form must reproduce the above copyright
+	  notice, this list of conditions and the following disclaimer in the
+	  documentation and/or other materials provided with the distribution.
+	* Neither the name of the copyright holder nor the
+	  names of its contributors may be used to endorse or promote products
+	  derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+... (full disclaimer, unmodified) ...
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+    For a Monero-core file the retained block instead reads:
+      "Copyright (c) 2014-2024, The Monero Project" + the 3-clause body +
+      any trailing "Parts of this file are originally copyright (c) 2012-2013
+      The Cryptonote developers" line — keep that line too.                >>> */
