@@ -7,7 +7,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # F1 retention + F2/F3 broadcast-gate KATs are actually compiled and run;
     # a fresh target would need a build.yml entry and would otherwise report
     # the silently-passing NOT_BUILT sentinel.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp)
+    # sharechain_bootstrap_test: contabo revival KAT for seed_sharechain_bootstrap
+    # (resolver+builder) -- empty-before regression witness + explicit-pin/
+    # public-default/regtest-isolated modes + reward-safe identity constants.
+    # Pure over config_pool.hpp; folded here (not a fresh target) to ride the
+    # allowlist and dodge the NOT_BUILT sentinel.
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb

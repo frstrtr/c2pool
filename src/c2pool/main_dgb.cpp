@@ -156,7 +156,8 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--node-owner-address ADDR]\n"
-        << "       [--sharechain-port P] [--embedded-serve-mempool-txs[=true|false]]\n"
+        << "       [--sharechain-port P] [--sharechain-addnode HOST:PORT ...]\n"
+        << "       [--embedded-serve-mempool-txs[=true|false]]\n"
         << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n"
         << "       [--coin-p2p-discover]\n\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
@@ -244,7 +245,12 @@ int run_node(const core::CoinParams& params, bool testnet,
              // explicit --embedded-serve-mempool-txs=false opt-out. Both false =
              // operator said nothing (resolver applies the posture default).
              bool serve_mempool_txs = false,
-             bool serve_mempool_txs_off = false)
+             bool serve_mempool_txs_off = false,
+             // --sharechain-addnode HOST:PORT (repeatable): explicit sharechain
+             // (pool P2P) peer(s) to pin. When non-empty, seeds ONLY these into
+             // m_bootstrap_addrs (public defaults suppressed); empty falls back to
+             // DEFAULT_BOOTSTRAP_HOSTS. Contabo DGB revival lever. Mirrors BCH.
+             const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes = {})
 {
     io::io_context ioc;
 
@@ -270,14 +276,36 @@ int run_node(const core::CoinParams& params, bool testnet,
     // the YAML path never sets it here). OFF by default; the only flip is the
     // explicit --dev-relax-algo-softforks marker. Mainnet stays fail-closed.
     config.coin()->m_dev_relax_algo_softforks = dev_relax_algo_softforks;
-    // DEFAULT_BOOTSTRAP_HOSTS is empty until DGB p2pool nodes come online, so
-    // there are no outbound seeds to dial this slice — the node binds its
-    // listener and waits for inbound sharechain peers.
-    for (const auto& host : dgb::PoolConfig::DEFAULT_BOOTSTRAP_HOSTS) {
-        const std::string addr = host.find(':') == std::string::npos
-            ? host + ":" + std::to_string(dgb::PoolConfig::P2P_PORT)
-            : host;
-        config.pool()->m_bootstrap_addrs.emplace_back(addr);
+    // Sharechain bootstrap addr-store seed (contabo DGB revival FIX).
+    // run_node hand-builds Config WITHOUT PoolConfig::load() (the sole YAML
+    // populator of m_bootstrap_addrs), and on master DEFAULT_BOOTSTRAP_HOSTS was
+    // ALSO empty AND there was no --sharechain-addnode flag -> a public DGB node
+    // had 0 outbound sharechain seeds and never joined the kr1z1s DGB (scrypt)
+    // sharechain. Seed it here, BEFORE the NodeImpl ctor reads
+    // pool()->m_bootstrap_addrs into the addr store (below). --sharechain-addnode
+    // pins an explicit peer (e.g. 92.53.224.27:5024, the live kr1z1s DGB
+    // sharechain); with none given, the public DEFAULT_BOOTSTRAP_HOSTS are
+    // seeded at :5024. REWARD-SAFE: transport addresses only -- PREFIX/
+    // IDENTIFIER/port/proto/share/PPLNS/coinbase untouched; the node JOINS the
+    // existing chain via the standard handshake, it cannot fork it.
+    dgb::seed_sharechain_bootstrap(*config.pool(), sharechain_addnodes, regtest);
+    if (!sharechain_addnodes.empty()) {
+        // Explicit pin: reset any stale public addr book so saved public peers
+        // (scored by first_seen/last_seen) can't outrank the pinned target.
+        // AddrStore builds config_path()/<net_subdir>/addrs.json (DGB keeps a
+        // per-net dir, unlike BCH). Best-effort.
+        std::filesystem::path addrs_path =
+            core::filesystem::config_path() / net_subdir / "addrs.json";
+        std::error_code rm_ec;
+        std::filesystem::remove(addrs_path, rm_ec);  // best-effort
+    }
+    {
+        const char* mode_name = !sharechain_addnodes.empty()
+            ? "explicit --sharechain-addnode"
+            : (regtest ? "regtest-isolated" : "public-default");
+        std::cout << "[DGB] sharechain bootstrap: "
+                  << config.pool()->m_bootstrap_addrs.size()
+                  << " addr(s) (" << mode_name << ")\n";
     }
 
     // ── DGB coin-network peer discovery (--coin-p2p-discover) ────────────────
@@ -2612,6 +2640,11 @@ int main(int argc, char** argv)
     bool coin_p2p_discover = false;         // --coin-p2p-discover: DGB-isolated scored/diverse coin-network peer discovery (network-standalone arm; independent of local digibyted)
     bool serve_mempool_txs = false;         // --embedded-serve-mempool-txs: arm the embedded UTXO fee-proof lane (S1)
     bool serve_mempool_txs_off = false;     // --embedded-serve-mempool-txs=false: explicit opt-out
+    // --sharechain-addnode HOST:PORT (repeatable): explicit sharechain (pool
+    // P2P) peer(s) to pin. Seeds m_bootstrap_addrs before the Node ctor reads it
+    // (contabo DGB revival FIX). e.g. --sharechain-addnode 92.53.224.27:5024
+    // pins the live kr1z1s DGB sharechain. Mirrors main_bch.cpp.
+    std::vector<std::pair<std::string, uint16_t>> sharechain_addnodes;
     // ── DGB-as-DOGE-parent embedded merged-mining arm (--merged DOGE) [SLICE 2] ──
     // --merged SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]] stands up an
     // embedded DOGE aux backend DAEMONLESS (DOGE chain_id=98, P2P port 22556). The
@@ -2711,6 +2744,24 @@ int main(int argc, char** argv)
             // STAYS 5024 (PoolConfig::P2P_PORT) when omitted, preserving G1 oracle
             // byte-parity + share_test pins. DGB-fenced opt-in; no shared-base touch.
             sharechain_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        }
+        else if (std::strcmp(argv[i], "--sharechain-addnode") == 0 && i + 1 < argc) {
+            // --sharechain-addnode HOST:PORT -- repeatable; pin explicit
+            // sharechain (pool P2P) peer(s). HOST:PORT split via rfind(':')
+            // (IPv6-safe enough for the numeric-IP/hostname seeds we pin).
+            // Reject a bare HOST with no port (matches main_bch.cpp). Seeds
+            // m_bootstrap_addrs (public defaults suppressed) so a public DGB
+            // node joins the kr1z1s DGB sharechain -- e.g.
+            // --sharechain-addnode 92.53.224.27:5024.
+            std::string ep = argv[++i];
+            const auto c = ep.rfind(':');
+            if (c == std::string::npos) {
+                std::cerr << "--sharechain-addnode requires HOST:PORT\n";
+                return 1;
+            }
+            sharechain_addnodes.emplace_back(
+                ep.substr(0, c),
+                static_cast<uint16_t>(std::stoi(ep.substr(c + 1))));
         }
         else if (std::strcmp(argv[i], "--merged") == 0 && i + 1 < argc) {
             merged_chain_specs.emplace_back(argv[++i]);  // SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]]
@@ -2814,7 +2865,8 @@ int main(int argc, char** argv)
                         http_addr, http_port,
                         merged_chain_specs, doge_p2p_address, doge_p2p_port,
                         embedded_doge,
-                        serve_mempool_txs, serve_mempool_txs_off);
+                        serve_mempool_txs, serve_mempool_txs_off,
+                        sharechain_addnodes);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
