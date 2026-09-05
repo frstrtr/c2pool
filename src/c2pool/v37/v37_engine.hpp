@@ -64,9 +64,44 @@
 
 namespace c2pool::v37n {
 
+// ── OI-W4-3: the read-at-version settlement projection ────────────────────
+// A LaneSnapshot minus its raw-work bands (the bulk of a snapshot's bytes) —
+// exactly the fields a settlement fold reads at a burial-gated PAST prefix
+// (W4 spec §2.2): the versioned, incarnation-stamped payout map, the geometry,
+// the committed digest, and the OI-W4-1 identity view that resolves the payout
+// keys to consensus identities. Published immutably and retained in a bounded
+// per-lane ring so W4's O2 cut token can re-read one specific (incarnation,
+// version). A projection, not a full snapshot, precisely so the ring can hold
+// D_spine-deep history without carrying the band arrays.
+struct SettlementView {
+    std::uint64_t   version = 0;      // per-lane monotonic (O2.1)
+    std::uint64_t   incarnation = 0;  // F2 node-monotone lane incarnation
+    ::v37::ChainId  chain = 0;
+    ::v37::LaneParams params;         // digest-committed geometry
+    ::v37::u64      next_pos = 0;     // == P, the prefix the fold reads at
+    ::v37::U256     acc_total;
+    ::v37::U256     decayed_total;
+    ::v37::u128     raw_total = 0;
+    std::map<::v37::MinerId, ::v37::U256> payout;   // value copy, immutable
+    ::v37::bytes32  digest{};         // the broadcast-against commitment at P
+    std::shared_ptr<const ::v37::IdentityView> identities;  // OI-W4-1, rides along
+};
+
 class V37Engine {
 public:
-    V37Engine() = default;
+    // Retention depth of the OI-W4-3 per-lane ring (W4 spec §3.3):
+    // K_ring >= D_spine·(1+R_MAX) + journal_depth + slack
+    //        =  6·5              + 64            + 34    = 128
+    // at the recommended defaults (D_spine=6, R_MAX=4, journal_depth D=64).
+    // >= D_spine coverage so a burial-gated read is always in the ring; a miss
+    // (a version older than the ring) is served by W4's replay-to-prefix slow
+    // path, never by a neighbouring version (O2.3).
+    static constexpr std::size_t kDefaultRingDepth = 128;
+
+    // Default-constructible (the scaffold/W2 seam does `V37Engine e;`); the
+    // ring depth is overridable for tests that exercise eviction cheaply.
+    explicit V37Engine(std::size_t ring_depth = kDefaultRingDepth)
+        : m_ring_depth(ring_depth ? ring_depth : 1) {}
     ~V37Engine() { stop(); }
 
     // O1.5 / wraps a non-movable LaneExecutor: exactly one writer, and the
@@ -143,6 +178,28 @@ public:
     // published by the executor thread after each committed record).
     std::uint64_t ops_committed() const { return m_ops_mirror.load(); }
 
+    // ── OI-W4-3 reader seam (any thread) ──────────────────────────────────
+    // Re-read the immutable settlement projection at a PAST (incarnation,
+    // version) from the bounded per-lane ring. Returns nullptr when that
+    // version is not retained: evicted (older than the ring), a different
+    // incarnation than the one the ring currently holds (the F2 ABA — a
+    // RemoveLane dropped the old incarnation's ring), or never published.
+    // A nullptr is a fail-and-retry / slow-path signal for W4, NEVER a licence
+    // to read a neighbouring version (O2.3). The map lookup is briefly guarded
+    // (like snapshot()); the returned value is a shared_ptr<const>, safe to
+    // hold across any number of later mutations (O1.1).
+    std::shared_ptr<const SettlementView> settlement_view_at(
+        ::v37::ChainId c, std::uint64_t incarnation,
+        std::uint64_t version) const {
+        std::lock_guard<std::mutex> lk(m_ring_mtx);
+        auto it = m_rings.find(c);
+        if (it == m_rings.end()) return nullptr;
+        for (const auto& sv : it->second)
+            if (sv->incarnation == incarnation && sv->version == version)
+                return sv;
+        return nullptr;
+    }
+
 private:
     struct Command {
         ::v37::LaneRecord rec;
@@ -179,13 +236,48 @@ private:
         ::v37::ChainId c = rec.chain;
         if (rec.kind == K::RemoveLane) {
             // Lane is gone; clear its slot so readers see nullptr until it is
-            // re-added (a fresh incarnation, F2).
+            // re-added (a fresh incarnation, F2), and DROP the ring so the old
+            // incarnation's versions can never be re-read (OI-W4-3 scoping).
             slot(c).store(nullptr);
+            drop_ring(c);
             return;
         }
         // AddLane / Push / Rewind applied: the lane exists. receive() is safe
         // here — this is the one thread that owns m_exec.
-        slot(c).store(m_exec.receive(c));
+        auto s = m_exec.receive(c);
+        slot(c).store(s);
+        ring_append(c, s);   // OI-W4-3: retain this version for read-at-version
+    }
+
+    // Executor thread only (the single writer of the ring's structure and
+    // contents). Append the immutable projection of one published snapshot,
+    // evicting the oldest beyond the retention depth. Reads take m_ring_mtx
+    // only to guard the map/deque structure; the projections themselves are
+    // immutable shared_ptr<const>, so a reader holding one is never disturbed.
+    void ring_append(::v37::ChainId c,
+                     const std::shared_ptr<const ::v37::LaneSnapshot>& s) {
+        if (!s) return;
+        auto sv = std::make_shared<SettlementView>();
+        sv->version = s->version;
+        sv->incarnation = s->incarnation;
+        sv->chain = s->chain;
+        sv->params = s->params;
+        sv->next_pos = s->next_pos;
+        sv->acc_total = s->acc_total;
+        sv->decayed_total = s->decayed_total;
+        sv->raw_total = s->raw_total;
+        sv->payout = s->payout;          // value copy: the projection is frozen
+        sv->digest = s->digest;
+        sv->identities = s->identities;  // OI-W4-1 view (already immutable)
+        std::lock_guard<std::mutex> lk(m_ring_mtx);
+        auto& ring = m_rings[c];
+        ring.push_back(std::move(sv));
+        while (ring.size() > m_ring_depth) ring.pop_front();
+    }
+
+    void drop_ring(::v37::ChainId c) {
+        std::lock_guard<std::mutex> lk(m_ring_mtx);
+        m_rings.erase(c);
     }
 
     // Executor thread only: get-or-create the atomic slot for a lane. Slots
@@ -233,6 +325,17 @@ private:
     std::atomic<std::uint64_t> m_ops_mirror{0};
     std::thread m_thread;
     std::atomic<bool> m_running{false};
+
+    // OI-W4-3: per-lane bounded ring of immutable settlement projections,
+    // keyed by (incarnation, version). Written ONLY by the executor thread
+    // (ring_append/drop_ring), read from any thread (settlement_view_at) under
+    // m_ring_mtx. A lane's ring only ever holds its current incarnation's
+    // versions (RemoveLane drops it), so incarnation-scoping is structural.
+    mutable std::mutex m_ring_mtx;
+    std::map<::v37::ChainId,
+             std::deque<std::shared_ptr<const SettlementView>>>
+        m_rings;
+    std::size_t m_ring_depth;
 };
 
 // ── O1.2 surface audit: no reference into lane state escapes the engine ────
@@ -263,5 +366,12 @@ static_assert(!std::is_copy_constructible_v<V37Engine> &&
                   !std::is_move_constructible_v<V37Engine> &&
                   !std::is_move_assignable_v<V37Engine>,
               "O1.5: exactly one writer — the engine cannot be duplicated");
+// OI-W4-3: read-at-version returns a shared pointer to an immutable projection
+// (a value safe to hold across later mutations), never a reference into state.
+static_assert(
+    std::is_same_v<decltype(std::declval<const V37Engine&>().settlement_view_at(
+                       ::v37::ChainId{}, std::uint64_t{}, std::uint64_t{})),
+                   std::shared_ptr<const SettlementView>>,
+    "OI-W4-3: settlement_view_at returns a shared immutable projection");
 
 } // namespace c2pool::v37n
