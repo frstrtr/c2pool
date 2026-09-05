@@ -242,9 +242,33 @@ int main()
         CHECK(out.empty());                     // no recovery, no phantom peer
     }
 
+    // NO-COIN-SOURCE WEDGE (contabo-prod 2026-09-05: BCH tip=0, no embedded
+    // dirs AND no bchd, 0 shares in 4h23m). Pins the maybe_start_p2p() gate
+    // CONTRACT for the terminal state prod is actually hitting. Two facts the
+    // reader must not conflate: (i) the embedded HeaderChain is IN-MEMORY
+    // (EmbeddedDaemon constructs it with the default empty db_path), so it
+    // writes ZERO on-disk dirs -- "no embedded dirs on the host" is the
+    // EXPECTED footprint of a healthy embedded daemon, NOT a missing-provision
+    // signal; (ii) the coin arm goes dark only when the embedded P2P leg does
+    // not arm AND the external BCHN-RPC fallback has no bchd behind it. This
+    // gate fixes exactly WHEN the embedded P2P leg declines to arm.
+    {
+        // No explicit peer AND at least one tier seeded -> the ladder RUNS
+        // (a live seed then recovers a peer -- proven by the tier cases above).
+        CHECK(SeedTier::should_run_ladder(/*port=*/0,     /*has_seeds=*/true)  == true);
+        // No explicit peer AND no seeds -> the ladder does NOT run; the daemon
+        // stays strictly RPC-only. With no bchd behind the RPC fallback THIS is
+        // the contabo no-coin-source wedge -- tip stuck at 0, no share source.
+        CHECK(SeedTier::should_run_ladder(/*port=*/0,     /*has_seeds=*/false) == false);
+        // An explicit peer bypasses this gate in maybe_start_p2p (start_p2p is
+        // called directly), so the ladder is never consulted when port!=0.
+        CHECK(SeedTier::should_run_ladder(/*port=*/38333, /*has_seeds=*/true)  == false);
+        CHECK(SeedTier::should_run_ladder(/*port=*/38333, /*has_seeds=*/false) == false);
+    }
+
     if (g_failures == 0) {
         std::cout << "[bch_seed_tier_recovery_gate] PASS -- all 3 tiers "
-                     "recovered + all 3 negative controls held\n";
+                     "recovered + all 3 negative controls held + no-source wedge gate held\n";
         return 0;
     }
     std::cerr << "[bch_seed_tier_recovery_gate] FAIL -- " << g_failures
