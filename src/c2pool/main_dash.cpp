@@ -3438,6 +3438,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
     // SML+quorum freshness + superblock viability gates keep it fail-safe.
     work_source->set_embedded_mainnet(embedded_mainnet);
+    // #961 cross-lane (B4): publish DASH's REGISTRY-SOURCED own-coin payout-address
+    // acceptance into the StratumConfig the core StratumServer reads, so the SAME
+    // decide_payout_address() door-reject (mining.authorize) + no-empty-payout
+    // guard (send_notify_work) LTC runs also apply on the DASH lane — a foreign-
+    // unconfigured payout is rejected at the door instead of redirected. DASH
+    // rides the testnet flag for --regtest (its regtest reuses the testnet address
+    // bytes X.../7... → y.../8...); own-coin addresses stay accepted byte-identically.
+    {
+        const auto acc = dash::address_acceptance(testnet, /*regtest=*/false);
+        work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
+                                           acc.bech32_hrps);
+    }
     // Publish the live template to the dashboard PPLNS view (declared far above,
     // where the WebServer seams are bound). peek_template() is the SAME
     // non-fetching peek the block-value card already uses — it never triggers a

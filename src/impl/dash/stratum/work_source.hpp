@@ -259,6 +259,20 @@ public:
     uint64_t                            get_work_generation() const override { return work_generation_.load(); }
     bool                                has_merged_chain(uint32_t chain_id) const override;
 
+    /// #961 cross-lane (B4): publish DASH's OWN payout-address acceptance into the
+    /// StratumConfig the core StratumServer reads, so the SAME decide_payout_
+    /// address() door-reject + no-empty-payout guard LTC runs apply on the DASH
+    /// lane — a foreign-unconfigured payout is rejected at the door instead of
+    /// redirected. Own-coin addresses stay accepted, byte-identical. Set once at
+    /// startup, before the server reads config_.
+    void set_payout_acceptance(std::vector<uint8_t> p2pkh_versions,
+                               std::vector<uint8_t> p2sh_versions,
+                               std::vector<std::string> bech32_hrps) {
+        config_.payout_p2pkh_versions = std::move(p2pkh_versions);
+        config_.payout_p2sh_versions  = std::move(p2sh_versions);
+        config_.payout_bech32_hrps    = std::move(bech32_hrps);
+    }
+
     // ── IWorkSource: per-connection bookkeeping ──────────────────────────
     void register_stratum_worker(const std::string& session_id,
                                  const core::stratum::WorkerInfo& info) override;

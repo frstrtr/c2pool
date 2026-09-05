@@ -49,6 +49,7 @@
 #include <impl/btc/share_tracker.hpp>    // get_v35_expected_payouts
 #include <impl/btc/dashboard_pplns.hpp>  // btc::dashboard::pplns_payouts_current — pool-wide Current Payouts (read-only)
 #include <impl/btc/stratum/work_source.hpp>
+#include <impl/btc/config_coin.hpp>              // btc::address_acceptance (#961 cross-lane payout publish)
 #include <impl/btc/coin/template_capture.hpp>     // per-share template retain -> won-block reconstruct (slice 7/7)
 #include <impl/btc/coin/template_other_txs.hpp>    // make_template_other_txs_fn bridge (#840)
 #include <impl/btc/coin/reconstruct_won_block.hpp> // make_reconstruct_closure — faithful won-block body (#839)
@@ -1758,7 +1759,18 @@ int main(int argc, char* argv[])
     // of rejecting it as Foreign (regtest reuses testnet base58 bytes, so
     // testnet=false + regtest=true must NOT resolve to the mainnet set).
     work_source->set_regtest(regtest);
-    work_source_for_shutdown = work_source;  // expose to signal handler
+    // #961 cross-lane (B4): publish BTC's REGISTRY-SOURCED own-coin payout-address
+    // acceptance into the StratumConfig the core StratumServer reads, so the SAME
+    // decide_payout_address() door-reject (mining.authorize) + no-empty-payout
+    // guard (send_notify_work) that LTC runs also apply on the BTC lane — a
+    // foreign-unconfigured payout address is rejected at the door instead of
+    // repurposed into a wrong-coin script. Network-derived (mainnet/testnet/
+    // regtest); own-coin + a configured merged chain stay accepted byte-identically.
+    {
+        const auto acc = btc::address_acceptance(testnet, regtest);
+        work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
+                                           acc.bech32_hrps);
+    }
 
     // ── Node-owner fee (p2pool -f/--fee + --node-owner-address) ──
     // Ported from main_dash.cpp: with probability node_owner_fee%, a job's

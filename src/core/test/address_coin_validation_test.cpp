@@ -452,3 +452,92 @@ TEST(AddressCoinValidation, AcceptsRegtestAddresses)
         EXPECT_TRUE(script.empty());
     }
 }
+
+// ── #961 B4 cross-lane: the payout DOOR-REJECT decision applies on EVERY lane ─
+// Cycle-1 published the acceptance set (StratumConfig.payout_*) on the LTC lane
+// only, so the core stratum door-reject + no-empty-payout guard ran on LTC alone.
+// The other five mains (BTC/BCH/DGB/DASH/BIP-110) authorized a foreign-
+// unconfigured address — and the fresh BCH lane then BURNED it to a zero-hash160
+// coinbase. B4 publishes each coin's OWN registry-sourced acceptance from its main
+// so decide_payout_address() — the SSOT the door consults — runs identically on
+// every lane. Prove the decision each published set now feeds: own → AcceptOwn;
+// a foreign coin's address that is NOT a configured merged chain → Reject.
+TEST(AddressCoinValidation, CrossLaneDoorRejectsForeignEveryLane)
+{
+    const std::vector<MergedChainAddr> no_merged{};
+    for (const auto& running : kCoins) {
+        const CoinAddressAcceptance& acc = running.acc;
+
+        // Own P2PKH / P2SH → AcceptOwn (reward-safe: still built byte-identically).
+        EXPECT_EQ(decide_payout_address(b58(acc.p2pkh_versions.front()), acc, no_merged),
+                  PayoutAddressDecision::AcceptOwn)
+            << running.name << " must AcceptOwn its own P2PKH at the door";
+        EXPECT_EQ(decide_payout_address(b58(acc.p2sh_versions.front()), acc, no_merged),
+                  PayoutAddressDecision::AcceptOwn)
+            << running.name << " must AcceptOwn its own P2SH at the door";
+        if (!acc.bech32_hrps.empty())
+            EXPECT_EQ(decide_payout_address(bech32_v0(acc.bech32_hrps.front()), acc, no_merged),
+                      PayoutAddressDecision::AcceptOwn)
+                << running.name << " must AcceptOwn its own bech32 at the door";
+
+        // A DASH mainnet P2PKH (version 0x4c) is foreign to every non-DASH lane and
+        // is not a configured merged chain of any lane → the door MUST Reject it
+        // (the cross-lane fix: previously these lanes authorized-and-redirected/
+        // burned it). DASH itself accepts its own address.
+        const auto verdict = decide_payout_address(b58(0x4c), acc, no_merged);
+        const bool dash_own = set_has(acc.p2pkh_versions, uint8_t(0x4c)) ||
+                              set_has(acc.p2sh_versions,  uint8_t(0x4c));
+        if (dash_own)
+            EXPECT_EQ(verdict, PayoutAddressDecision::AcceptOwn) << running.name;
+        else
+            EXPECT_EQ(verdict, PayoutAddressDecision::Reject)
+                << running.name << " must door-reject a foreign DASH address, "
+                << "never authorize-and-redirect/burn it (#961 B4)";
+    }
+}
+
+// ── #961 B4: a coin's NATIVE-format own address is AcceptOwn at the door ───────
+// BCH's native CashAddr is not Base58Check/bech32, so classify_address_for_coin()
+// returns Invalid for it. On the PARENT tree (4a9dd316) decide_payout_address()
+// returned Reject for any Invalid classification — so once BCH publishes its
+// acceptance set (B4), the door would REJECT a legitimate BCH CashAddr miner and
+// the guard would refuse to build their work: a reward-UNSAFE regression. B4 makes
+// the SSOT consult the coin-registered native decoder (address_to_script): an
+// address the running node CAN pay is AcceptOwn. This test is RED on 4a9dd316
+// (parent returns Reject for the native address) and green here.
+TEST(AddressCoinValidation, NativeDecoderOwnAddressAcceptedAtDoor)
+{
+    // A sentinel that only the registered decoder below understands. It matches
+    // exactly ONE fixed string (empty for everything else), so no other test's
+    // addresses are affected by this process-global registration.
+    const std::string kNative = "cashaddr:sentinel-b4-961-own";
+    core::register_address_decoder(
+        [kNative](const std::string& a) -> std::vector<unsigned char> {
+            if (a == kNative) return p2pkh_script();  // a real, spendable scriptPubKey
+            return {};
+        });
+
+    const CoinAddressAcceptance bch_acc = bch::address_acceptance(false, false);
+    const std::vector<MergedChainAddr> no_merged{};
+
+    // The native-format own address the node CAN build a script for → AcceptOwn.
+    // RED on parent 4a9dd316: there the Invalid classification short-circuits to
+    // Reject without consulting the registered decoder.
+    EXPECT_EQ(decide_payout_address(kNative, bch_acc, no_merged),
+              PayoutAddressDecision::AcceptOwn)
+        << "a coin's own native (CashAddr) address must be accepted at the door — "
+        << "rejecting it would refuse legitimate BCH miners (reward-unsafe)";
+
+    // The fix opens NO hole: a truly-undecodable Invalid address (no decoder
+    // matches) still Rejects, so a foreign/garbage username can never slip through.
+    EXPECT_EQ(decide_payout_address("still not any address at all", bch_acc, no_merged),
+              PayoutAddressDecision::Reject);
+    EXPECT_EQ(decide_payout_address("", bch_acc, no_merged),
+              PayoutAddressDecision::Reject);
+
+    // And a well-formed FOREIGN base58 address (BTC genesis P2PKH, version 0x00 —
+    // not in BCH's set? it IS: BCH shares BTC's 0x00) — use a DASH address instead,
+    // foreign to BCH and not a merged chain → Reject even with the decoder armed.
+    EXPECT_EQ(decide_payout_address(b58(0x4c), bch_acc, no_merged),
+              PayoutAddressDecision::Reject);
+}

@@ -740,7 +740,7 @@ nlohmann::json BCHWorkSource::mining_submit(
             // network so a --regtest legacy address is accepted.
             std::vector<unsigned char> payout_script;
             auto amatch = core::classify_address_for_coin(
-                username, bch::address_acceptance(is_testnet_, /*regtest=*/false),
+                username, bch::address_acceptance(is_testnet_, is_regtest_),
                 payout_script);
             if (amatch == core::AddressCoinMatch::Foreign)
                 LOG_WARNING << "[BCH-STRATUM] REJECTED foreign-coin payout address "
@@ -748,10 +748,26 @@ nlohmann::json BCHWorkSource::mining_submit(
                                "refusing to misdirect funds";
             else if (amatch == core::AddressCoinMatch::Invalid)
                 payout_script = core::address_to_script(username);  // CashAddr decoder
-            try { share_hash = create_fn(coinbase, header, *job, payout_script); }
-            catch (const std::exception& e) {
-                LOG_WARNING << tag << " create_share_fn threw: " << e.what()
-                            << " -- share not added";
+            // #961 B4 — ZERO-HASH160 BURN GUARD (money path): a Foreign (wrong-
+            // coin) or otherwise-undecodable username leaves payout_script EMPTY.
+            // Building the share anyway made create_local_share() default the
+            // finder's pubkey_hash to all-zero — an UNSPENDABLE coinbase output
+            // PPLNS then credits this miner's work against every block, BURNING
+            // their reward (the fresh cycle-1 BCH accept-and-burn). Refuse to
+            // build the share at all: no zero-hash160 share is ever minted. The
+            // core StratumServer already door-rejects such a username at
+            // mining.authorize (payout_* now published), so a live rig never
+            // reaches here; this is the defence-in-depth money-path backstop.
+            if (payout_script.empty()) {
+                LOG_WARNING << tag << " REFUSING to build share for user=" << username
+                            << " — no BCH payout script (foreign/undecodable address);"
+                               " never minting a zero-hash160 (unspendable) share (#961)";
+            } else {
+                try { share_hash = create_fn(coinbase, header, *job, payout_script); }
+                catch (const std::exception& e) {
+                    LOG_WARNING << tag << " create_share_fn threw: " << e.what()
+                                << " -- share not added";
+                }
             }
         }
 

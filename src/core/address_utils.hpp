@@ -154,6 +154,12 @@ struct MergedChainAddr {
 ///                    refuse (no empty/zero-hash160 payout, which PPLNS would burn).
 enum class PayoutAddressDecision { AcceptOwn, AcceptMerged, Reject };
 
+// Forward declaration (full declaration below): the payout-decision SSOT
+// consults the coin-registered native-format decoders (e.g. BCH CashAddr) so a
+// running coin's OWN address that the built-in Base58Check / bech32 classifier
+// cannot parse is still accepted rather than door-rejected (issue #961 cross-lane).
+std::vector<unsigned char> address_to_script(const std::string& address);
+
 inline PayoutAddressDecision decide_payout_address(
     const std::string& address,
     const CoinAddressAcceptance& own,
@@ -164,12 +170,26 @@ inline PayoutAddressDecision decide_payout_address(
     if (m == AddressCoinMatch::Own)
         return PayoutAddressDecision::AcceptOwn;
     // Only a well-formed-but-Foreign address can still be a configured merged
-    // chain; an Invalid (unparseable) address is never payable.
+    // chain; an Invalid (unparseable) address is never a base58/bech32 payout.
     if (m == AddressCoinMatch::Foreign) {
         for (const auto& c : configured_merged) {
             if (is_address_for_chain(address, c.hrps, c.versions))
                 return PayoutAddressDecision::AcceptMerged;
         }
+        return PayoutAddressDecision::Reject;
+    }
+    // Invalid to the built-in Base58Check / bech32 decoders — but the running
+    // coin may register a NATIVE-format decoder for its own addresses (BCH
+    // registers a CashAddr decoder into address_to_script). A non-empty script
+    // means THIS node can build the miner's own-coin payout, so accept it
+    // (reward-safe: the door must not reject a coin's native address format).
+    // This can only fire via a registered decoder: an Invalid classification
+    // means the built-in base58/bech32 in address_to_script() also fail, so a
+    // truly undecodable address still Rejects, and a well-formed foreign address
+    // is Foreign (handled above), never Invalid — no misdirection is opened.
+    if (m == AddressCoinMatch::Invalid && !address.empty()) {
+        if (!address_to_script(address).empty())
+            return PayoutAddressDecision::AcceptOwn;
     }
     return PayoutAddressDecision::Reject;
 }

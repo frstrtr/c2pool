@@ -326,6 +326,20 @@ int run_embedded(bool coin_p2p_discover,
              << (serve_mempool_txs ? "ENABLED" : "DISABLED (coinbase-only)")
              << " — daemonless ingest+price+select+xcheck";
 
+    // #961 cross-lane (B4): publish BIP-110's REGISTRY-SOURCED own-coin payout-
+    // address acceptance into the StratumConfig the core StratumServer reads, so
+    // the SAME decide_payout_address() door-reject (mining.authorize) + no-empty-
+    // payout guard (send_notify_work) LTC runs also apply on this lane — a foreign-
+    // unconfigured payout is rejected at the door instead of redirected. The
+    // Knots-GBT parent runs mainnet (is_testnet=false above); own-coin addresses
+    // stay accepted byte-identically.
+    {
+        const auto acc = bip110::address_acceptance(
+            bip110::pool::PoolConfig::is_testnet, /*regtest=*/false);
+        work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
+                                           acc.bech32_hrps);
+    }
+
     // ── DEFECT 2: node-owner / donation address (OPERATOR-PROVIDED, never hard-
     // coded). When a miner authorizes with a resolvable payout address it is paid
     // the subsidy; if the miner address fails to resolve, the subsidy falls back

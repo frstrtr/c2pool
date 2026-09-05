@@ -293,6 +293,20 @@ public:
     /// Called from main under --regtest. Address-validation scope only.
     void set_regtest(bool regtest) { is_regtest_ = regtest; }
 
+    /// #961 cross-lane (B4): publish DGB's OWN payout-address acceptance into the
+    /// StratumConfig the core StratumServer reads, so the SAME decide_payout_
+    /// address() door-reject + no-empty-payout guard LTC runs apply on the DGB
+    /// lane — a foreign-unconfigured payout is rejected at the door instead of
+    /// redirected/left-empty. Own-coin + a CONFIGURED merged chain (DOGE) stay
+    /// accepted, byte-identical. Set once at startup, before the server reads it.
+    void set_payout_acceptance(std::vector<uint8_t> p2pkh_versions,
+                               std::vector<uint8_t> p2sh_versions,
+                               std::vector<std::string> bech32_hrps) {
+        config_.payout_p2pkh_versions = std::move(p2pkh_versions);
+        config_.payout_p2sh_versions  = std::move(p2sh_versions);
+        config_.payout_bech32_hrps    = std::move(bech32_hrps);
+    }
+
 private:
     // External dependencies (non-owning references)
     c2pool::dgb::HeaderChain&   chain_;
