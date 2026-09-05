@@ -1,0 +1,81 @@
+{
+ "_comment": "X0 feasibility KAT: real Monero mainnet block, recomputed hashing_blob/block_id/miner_tx_hash + Keccak-midstate coinbase-opening. Ground truth = monerod get_block.",
+ "network": "monero-mainnet",
+ "source_rpc_method": "get_block",
+ "height": 3000000,
+ "major_version": 16,
+ "minor_version": 16,
+ "timestamp": 1697813342,
+ "prev_id": "cc64d29f62794dbb5309732f74447d88389198cfbf86a499bd5b4b5347bc43ae",
+ "nonce_le_u32": 822116395,
+ "difficulty": 308739704685,
+ "n_tx_including_coinbase": 38,
+ "full_block_blob_len": 1334,
+ "header_blob": "1010dea6caa906cc64d29f62794dbb5309732f74447d88389198cfbf86a499bd5b4b5347bc43ae2b800031",
+ "miner_tx": {
+  "version": 2,
+  "unlock_time": 3000060,
+  "unlock_minus_height": 60,
+  "vin": [
+   [
+    "txin_gen",
+    3000000
+   ]
+  ],
+  "vout0_type": "txout_to_tagged_key",
+  "vout0_amount_piconero": 603782160000,
+  "vout0_view_tag": 243,
+  "rct_type": 0,
+  "prefix_blob": "02fc8db70101ffc08db7010180bde2a1c911031f214b304e74e9fe437ccd1f62b4777b204dea7afdf844420dc5214971ef8d6cf334017543af4f79becc9e3d8701bfc6c405696a52d60332692703faad3475e0a8cfe402110000007147a42756000000000000000000",
+  "prefix_len": 105,
+  "extra": "017543af4f79becc9e3d8701bfc6c405696a52d60332692703faad3475e0a8cfe402110000007147a42756000000000000000000",
+  "extra_start_in_prefix": 53,
+  "extra_parsed": [
+   [
+    "pubkey",
+    "7543af4f79becc9e3d8701bfc6c405696a52d60332692703faad3475e0a8cfe4"
+   ],
+   [
+    "extra_nonce",
+    "0000007147a42756000000000000000000"
+   ]
+  ],
+  "H_prefix": "18b7efb2ab347082fc161ff480b0554dbf94de87251e676d8b67d7f5d9173b24",
+  "H_rct_base": "bc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a",
+  "H_prunable": "0000000000000000000000000000000000000000000000000000000000000000",
+  "miner_tx_hash": "7f88a52afdab303ddb9d444cb5b53adb5a12c63a82e898a9d2db9f76dd1127f6"
+ },
+ "tree_root": "3cc88694451e92299e5283b2c51985e5c0d31b8d910f53d9a8b167a24e7bdf06",
+ "tree_branch_leaf0": {
+  "leaf": "7f88a52afdab303ddb9d444cb5b53adb5a12c63a82e898a9d2db9f76dd1127f6",
+  "depth": 5,
+  "path_bits": "00000",
+  "branch": [
+   "e4516854a5984eaf5f8750ac7af41d1e0b2c602a2297a673001e8c0af88eba11",
+   "160b280159f52461dcb661e49f30cae2a7f235acbdd68a8d002183b2358ed144",
+   "03330ad5f7bee104763d8c19b207d52d4323d86a888229790801934c177629d3",
+   "2244a793730a85480efc9301dde5045088ee4d8b61e4849ccf757ab8a99d5f44",
+   "3d5a1ba12f721187cf632d75f220ee7c412420572fe6aca17cce1eecb569e93d"
+  ]
+ },
+ "hashing_blob": "1010dea6caa906cc64d29f62794dbb5309732f74447d88389198cfbf86a499bd5b4b5347bc43ae2b8000313cc88694451e92299e5283b2c51985e5c0d31b8d910f53d9a8b167a24e7bdf0626",
+ "hashing_blob_len": 76,
+ "block_id": "d29c51c4354a396f370335035540fc94372bd277c2f65b50cc5bd2608a92c69c",
+ "keccak_midstate_opening": {
+  "boundary": "start of tx_extra (last transaction_prefix field)",
+  "head_len_bytes": 53,
+  "tail_len_bytes": 52,
+  "complete_keccak_blocks_before_boundary": 0,
+  "midstate_state_200B": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "midstate_buffer": "02fc8db70101ffc08db7010180bde2a1c911031f214b304e74e9fe437ccd1f62b4777b204dea7afdf844420dc5214971ef8d6cf334",
+  "recovered_prefix_hash": "18b7efb2ab347082fc161ff480b0554dbf94de87251e676d8b67d7f5d9173b24",
+  "recovered_miner_tx_hash": "7f88a52afdab303ddb9d444cb5b53adb5a12c63a82e898a9d2db9f76dd1127f6",
+  "recovered_tree_root": "3cc88694451e92299e5283b2c51985e5c0d31b8d910f53d9a8b167a24e7bdf06"
+ },
+ "ground_truth_from_daemon": {
+  "block_id": "d29c51c4354a396f370335035540fc94372bd277c2f65b50cc5bd2608a92c69c",
+  "miner_tx_hash": "7f88a52afdab303ddb9d444cb5b53adb5a12c63a82e898a9d2db9f76dd1127f6",
+  "num_txes": 37
+ },
+ "all_checks_passed": true
+}

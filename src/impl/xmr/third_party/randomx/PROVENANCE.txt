@@ -1,0 +1,38 @@
+RandomX — vendored third-party source (verbatim, unmodified)
+============================================================
+
+Upstream:      https://github.com/tevador/RandomX
+License:       BSD-3-Clause (see ./LICENSE, copied verbatim)
+Copyright:     (c) 2018-2019 tevador <tevador@gmail.com>; (c) 2014-2019 The Monero Project
+
+CONSENSUS PIN (what we vendor):
+  tevador/RandomX @ 12f2c2ffe2108d6cf54c391fee33c8bc3646cdab
+  This is the EXACT commit monero-project/monero references at
+  external/randomx on master (read 2026-09-05). It is the RandomX the
+  running Monero mainnet ("rx/0") consensus uses. It PREDATES RandomX 2.0:
+  it defines NO RANDOMX_FLAG_V2 (verified — enum tops out at RANDOMX_FLAG_ARGON2).
+  Vendoring this exact commit gives c2pool bug-for-bug hash identity with monerod.
+
+Files in this directory, copied BYTE-IDENTICAL from that commit (no edits,
+BSD-3 header preserved verbatim on each):
+
+  randomx.h         <- src/randomx.h        sha256 ba6784194be25810f0c25d4b767907e9aa133cb3cf8ba605ce94ab593856f4c3
+  configuration.h   <- src/configuration.h  sha256 637719f77c263cab40ca306ca0326ef37d6f6eb12564c7feb5c74c0426c74051
+  LICENSE           <- LICENSE              sha256 7d85758a95990168395d0940b2a103b6be0c2eba3995f00cbb59d23a86c2214e
+
+These two headers are the ONLY upstream files needed at c2pool COMPILE time
+(the wrapper randomx_verify.hpp includes "randomx.h"). The rest of the library
+is consumed as a linked static archive (librandomx.a) built from the pinned
+submodule at package time — NOT copied into this tree.
+
+FUTURE-FORK REFERENCE (not vendored now):
+  tevador/RandomX @ 7c761cf007c758056dcb6eb438a32f780f81bdbd (post-2.0 HEAD)
+  adds RANDOMX_FLAG_V2 and the v2 program constants. It is the upgrade target
+  IF/WHEN a Monero hard-fork adopts RandomX 2.0 (see VENDOR-MANIFEST.md, PowAlgo
+  RX_2). The wrapper #ifdef-guards every RANDOMX_FLAG_V2 use, so it already
+  compiles unchanged against either pin.
+
+Nothing here is adapted or modified; therefore no per-file provenance comment
+is injected into the copied sources (that would break a byte-diff against
+upstream, which auditors use to confirm the vendored consensus code is
+untouched). Provenance for these verbatim copies lives in this sidecar.

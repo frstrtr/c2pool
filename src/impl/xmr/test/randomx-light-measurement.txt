@@ -1,0 +1,23 @@
+randomx_flags (auto) = 0x6a  [ JIT HARD_AES ARGON2_SSSE3 ARGON2_AVX2 ]  (LIGHT mode: FULL_MEM deliberately NOT set)
+RANDOMX_HASH_SIZE=32  (light cache = RANDOMX_ARGON_MEMORY 262144 KiB = 256 MiB)
+
+--- LIGHT-MODE verify of REAL mainnet block 3000000 ---
+seed_height=2998272  seed=32B  hashing_blob=76B
+PoW(randomx) = 309e84a7d1175490a14cf722f8f3862b3adda4fff904a5d72175ec0100000000
+  (interpret little-endian; caller checks pow_LE * difficulty(308739704685) < 2^256)
+
+=== MEASURED on THIS host ===
+cache alloc          :     0.06 ms
+cache init (Argon2d) :   702.52 ms   <- per-epoch (every 2048 blocks), amortized
+ONE cold verify hash :    29.05 ms
+per-hash min/med/max : 20.61 / 24.50 / 26.22 ms  (N=16, warm cache)
+RSS baseline         :      3.6 MiB
+RSS after cache alloc:      3.8 MiB  (+0.2)
+RSS after cache init :    259.9 MiB  (+256.1 = the 256 MiB light cache, touched)
+RSS after VM create  :    259.9 MiB  (+0.0 = ~2 MiB scratchpad)
+RSS peak (maxrss)    :    261.9 MiB
+
+--- official RandomX v1 KAT ---
+KAT  computed = 639183aae1bf4c9a35884cb46b09cad9175f04efd7684e7262a0ac1c2f0b4e3f
+KAT  expected = 639183aae1bf4c9a35884cb46b09cad9175f04efd7684e7262a0ac1c2f0b4e3f  (RandomX v1)
+KAT  MATCH  -> build is Monero's RandomX v1

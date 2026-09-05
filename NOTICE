@@ -1,0 +1,67 @@
+c2pool — Family B: Monero / RandomX settlement lane (src/impl/xmr/)
+THIRD-PARTY SOFTWARE NOTICES AND ATTRIBUTIONS
+
+c2pool is distributed as a whole under the GNU Affero General Public License,
+version 3 (AGPL-3.0). See COPYING / LICENSE at the repository root.
+
+The XMR lane vendors and/or adapts third-party components. Their notices are
+reproduced below and preserved verbatim in each ported file's header. Full
+licence texts are shipped under third_party/licenses/ (RandomX.LICENSE,
+Monero.LICENSE, p2pool.LICENSE) and are also staged in this manifest under
+upstream-licenses/.
+
+--------------------------------------------------------------------------------
+1. RandomX  —  tevador/RandomX  —  BSD-3-Clause
+   Pinned: v1.2.3 @ 7c761cf007c758056dcb6eb438a32f780f81bdbd (read 2026-09-05)
+
+   Copyright (c) 2018-2019, tevador <tevador@gmail.com>
+   Copyright (c) 2014-2019, The Monero Project
+   All rights reserved. Redistributed under the 3-clause BSD licence; the full
+   notice and disclaimer are retained in every vendored RandomX source file and
+   in third_party/licenses/RandomX.LICENSE.
+
+   Used for: light-mode (cache-only, 256 MiB) proof-of-work verification of XMR
+   receipts. The 2 GiB dataset (fast mode) is optional and off by default.
+
+--------------------------------------------------------------------------------
+2. Monero core cryptography  —  monero-project/monero  —  BSD-3-Clause
+   Pinned: v0.18.5.1 @ 3d3920d7487b5df7ac388b6b8577fd04d505885f (read 2026-09-05)
+
+   Copyright (c) 2014-2024, The Monero Project
+   Portions originally copyright (c) 2012-2013 The Cryptonote developers.
+   All rights reserved. Redistributed under the 3-clause BSD licence.
+
+   Vendored files carry their original notice verbatim:
+     - src/crypto/crypto-ops.c  (ed25519 group operations)
+     - src/crypto/tree-hash.c   (Monero tree_hash / tree_branch)
+     - src/crypto/hash-ops.h
+     - src/crypto/keccak.c/.h   (baseline Keccak; additionally attributed to
+       Markku-Juhani O. Saarinen <mjos@iki.fi>, 19-Nov-11 — retain that line)
+     - contrib/epee serialization (varint / portable_storage), copyright
+       (c) 2006-2013 Andrey N. Sabelnikov, www.sabelnikov.net (BSD-3-Clause)
+
+--------------------------------------------------------------------------------
+3. Monero P2Pool  —  SChernykh/p2pool  —  GNU GPL v3 (GPL-3.0-only)
+   Pinned: v4.18 @ 128643114f9bea55bfdb95462eaeffa2e3f666bd (read 2026-09-05)
+
+   This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
+   Copyright (c) 2021-2026 SChernykh <https://github.com/SChernykh>
+   Licensed under the GNU General Public License, version 3.
+
+   c2pool adapts p2pool's MONERO-PLUMBING only (deterministic tx-secret-key
+   coinbase derivation, whole-block template building, monerod JSON-RPC/ZMQ
+   glue, the CryptoNote/XMRig stratum dialect, and the RandomX integration
+   pattern). These adaptations remain licensed under GPL-3.0-only and are
+   combined into the AGPL-3.0 c2pool work under AGPLv3 §13 / GPLv3 §13
+   (see LICENSING.md). The full GPLv3 text is shipped at
+   third_party/licenses/p2pool.LICENSE.
+
+   c2pool does NOT incorporate p2pool's pool-model: its sidechain (SideChain /
+   PoolBlock share consensus), its PPLNS payout window, or its uncle mechanism.
+   Those are replaced by c2pool's own RDWR / work-receipts settlement model.
+
+--------------------------------------------------------------------------------
+Every ported file additionally carries a "c2pool provenance" comment naming the
+upstream repo, path, pinned tag+commit, and exactly what was adapted. The
+authoritative machine-readable table is src/impl/xmr/xmr_provenance.hpp; the
+narrative plan is PROVENANCE.md.
