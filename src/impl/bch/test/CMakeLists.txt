@@ -256,8 +256,13 @@ if(BUILD_TESTING)
     # add, which CTest would then report as a silently-passing NOT_BUILT sentinel.
     target_sources(bch_embedded_block_broadcast_test PRIVATE broadcast_gate_test.cpp)
 
+    # #1437 topology KAT (child-without-parent + intra-template double-spend)
+    # rides this EXISTING allowlisted target (bch tree is plain main()/CHECK,
+    # no GTest); run_template_topology_spend_checks() is invoked from the
+    # roundtrip test's main (no new executable / no #143 NOT_BUILT trap).
     add_executable(bch_g2_block_assembly_roundtrip_test
         g2_block_assembly_roundtrip_test.cpp
+        template_topology_spend_test.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
     target_include_directories(bch_g2_block_assembly_roundtrip_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(bch_g2_block_assembly_roundtrip_test PRIVATE

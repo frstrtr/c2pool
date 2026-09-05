@@ -29,7 +29,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # merkle test does (core + nmc_coin for the out-of-line transaction ctor).
     # The underfill guard KAT that used to be compiled into this target now
     # lives in its own nmc_underfill_guard_test target below (btc/dash/dgb symmetry).
-    add_executable(nmc_template_builder_test nmc_template_builder_test.cpp)
+    # #1437 topology KAT (child-without-parent + intra-template double-spend)
+    # folds into this EXISTING allowlisted target (no new executable / no #143
+    # NOT_BUILT trap); gtest_add_tests AUTO below discovers its TEST() cases.
+    add_executable(nmc_template_builder_test nmc_template_builder_test.cpp template_topology_spend_test.cpp)
     target_link_libraries(nmc_template_builder_test PRIVATE
         GTest::gtest_main GTest::gtest
         core nlohmann_json::nlohmann_json)

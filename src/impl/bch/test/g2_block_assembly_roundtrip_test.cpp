@@ -536,6 +536,9 @@ void test_won_block_undecodable_username_refuses_share()
 
 } // namespace
 
+// #1437 topology KAT, defined in template_topology_spend_test.cpp (same target).
+int run_template_topology_spend_checks();
+
 int main()
 {
     test_roundtrip_ok();
@@ -547,6 +550,9 @@ int main()
     test_won_block_survives_throwing_share_write();
     test_plain_share_still_writes_and_does_not_broadcast();
     test_won_block_undecodable_username_refuses_share();
+
+    // #1437: mempool tx-selection topology + intra-template double-spend guard.
+    failures += run_template_topology_spend_checks();
 
     if (failures) {
         std::cerr << failures << " CHECK(s) failed\n";
