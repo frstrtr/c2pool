@@ -17,6 +17,7 @@
 
 #include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/coin/header_chain.hpp>
+#include <impl/dgb/coin/dgb_arith256.hpp>  // compact_to_target (#179 MultiShield V4 served-bits window)
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/coin/connection_coinbase.hpp>  // build_connection_coinbase_from_pplns (SSOT under test)
 #include <impl/dgb/config_coin.hpp>   // dgb::CoinParams::subsidy (oracle SSOT)
@@ -28,6 +29,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -569,17 +572,21 @@ TEST(DgbCoinParams, SubsidyFuncBoundToOracleScheduleInProduction)
 }
 
 
-// previousblockhash: emitted as GBT-conventional big-endian display hex ONLY
-// when the HeaderChain carries a real tip hash (tip_hash() accessor). With a
-// known tip block_hash, the template surfaces it MSB-limb-first; bits stays
-// HELD (no faithful embedded V36 next-target -- MultiShield V4 is V37).
-TEST(DgbWorkSource, WorkTemplateEmitsPreviousBlockHashWhenTipCarriesHash)
+// #179 fail-closed contract: a REAL tip hash but a MultiShield V4 window too
+// shallow to derive the next Scrypt target (< 61 headers) HOLDS the whole
+// template (empty object) rather than shipping a fabricated diff-1 (0x1d00ffff)
+// -- the invalid-block bug this PR fixes. The stratum layer then takes its
+// existing "waiting for block template (header sync)" wait path. The dedicated
+// prevhash getter is INDEPENDENT of the V4 window (it reads tip_hash() directly)
+// and still surfaces the tip: the tip IS known, only the next-target is not yet.
+TEST(DgbWorkSource, WorkTemplateHeldWhenTipKnownButV4WindowTooShallow)
 {
     Fixture fx;
     fx.chain.set_base_height(400000);
     // Seed one Scrypt header carrying a distinctive block id. n_version with
     // algo nibble 0x0000 is the Scrypt lane; target 100 with pow_hash 0 (<=
     // target) clears the context-free PoW gate; empty-chain MTP is unconstrained.
+    // One header is a real tip but nowhere near the 61-header V4 window depth.
     c2pool::dgb::HeaderSample h;
     h.n_version  = 0x20000000;
     h.n_time     = 1000;
@@ -589,22 +596,28 @@ TEST(DgbWorkSource, WorkTemplateEmitsPreviousBlockHashWhenTipCarriesHash)
               c2pool::dgb::IngestResult::VALIDATED_SCRYPT);
 
     auto ws = fx.make();
-    auto tmpl = ws->get_current_work_template();
-    ASSERT_TRUE(tmpl.contains("previousblockhash"));
-    // limb[0] is least-significant -> renders as the trailing 16 hex digits,
-    // preceded by 48 zero digits (limbs 3..1 are zero). 64 chars total.
-    EXPECT_EQ(tmpl["previousblockhash"].get<std::string>(),
-              std::string(48, '0') + "123456789abcdef0");
-    // bits remains deliberately absent (V37 MultiShield V4 wall).
+    const auto tmpl = ws->get_current_work_template();
+    // Held: an EMPTY object on the wire -- never a fabricated bits, and never a
+    // partial (previousblockhash-only) template either. Fail-closed.
+    EXPECT_TRUE(tmpl.is_object());
+    EXPECT_TRUE(tmpl.empty());
     EXPECT_FALSE(tmpl.contains("bits"));
+    EXPECT_FALSE(tmpl.contains("previousblockhash"));
+    // The tip is still known: the window-independent getter returns it.
+    EXPECT_EQ(ws->get_current_gbt_prevhash(),
+              std::string(48, '0') + "123456789abcdef0");
 }
 
-// The dedicated prevhash getter and the assembled template draw the tip hash
-// from ONE source (chain_.tip_hash() through u256_be_display_hex), so they can
-// never diverge: with a real tip the getter returns the SAME BE-display-hex the
-// template emits; with no tip BOTH are absent (getter empty string, template
-// omits the field).
-TEST(DgbWorkSource, GbtPrevhashGetterMatchesTemplateField)
+// The dedicated prevhash getter draws the tip hash from chain_.tip_hash()
+// through u256_be_display_hex -- INDEPENDENT of the #179 V4 next-target gate.
+// Contract across states:
+//   * no tip           -> getter empty AND template omits previousblockhash.
+//   * tip, shallow win  -> getter returns the tip, but the template is HELD
+//                         (empty), so they deliberately diverge in PRESENCE:
+//                         the getter is not gated on the V4 window.
+// The served (deep-window) reconvergence -- getter == template's
+// previousblockhash -- is pinned by WorkTemplateServesRealV4BitsAndPrevhash.
+TEST(DgbWorkSource, GbtPrevhashGetterIndependentOfV4Window)
 {
     Fixture fx;
     // No tip yet -> getter empty, template omits previousblockhash.
@@ -613,8 +626,8 @@ TEST(DgbWorkSource, GbtPrevhashGetterMatchesTemplateField)
         EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
         EXPECT_FALSE(ws->get_current_work_template().contains("previousblockhash"));
     }
-    // Seed a Scrypt header carrying a distinctive block id (mirrors the
-    // previousblockhash emit test) -> getter == template field, BE-display-hex.
+    // Seed a Scrypt header carrying a distinctive block id -> tip known, but the
+    // V4 window is one-deep so the template holds. The getter is unaffected.
     fx.chain.set_base_height(400000);
     c2pool::dgb::HeaderSample h;
     h.n_version  = 0x20000000;
@@ -627,8 +640,134 @@ TEST(DgbWorkSource, GbtPrevhashGetterMatchesTemplateField)
     auto ws = fx.make();
     const std::string expected = std::string(48, '0') + "123456789abcdef0";
     EXPECT_EQ(ws->get_current_gbt_prevhash(), expected);
-    EXPECT_EQ(ws->get_current_work_template()["previousblockhash"].get<std::string>(),
-              expected);
+    // Template HELD (V4 window too shallow) -> previousblockhash absent, so the
+    // getter and the template diverge exactly where the fail-closed gate fires.
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+}
+
+// #179 served-path positive: fed a DEEP MultiShield V4 window (61+ real DigiByte
+// mainnet headers), the daemonless work source stamps the template `bits` with
+// the REAL network-accepted next-target -- NOT the fabricated 0x1d00ffff that
+// made every won block invalid. Golden window: 62 consecutive mainnet headers
+// (24155880..24155941, all 5 algos) below Scrypt block 24155942, whose accepted
+// nBits is 0x1a47e953 (the same fixture verify_v4.py / multishield_v4_kat_test
+// prove byte-exact against DigiByte-Core consensus). The tip carries a real
+// block id, so previousblockhash is emitted too and equals the window-independent
+// getter -- the served-path reconvergence GbtPrevhashGetterIndependentOfV4Window
+// references.
+TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
+{
+    // {height, version, time, bits} -- heights 24155880..24155941, the 62
+    // ancestors of Scrypt block 24155942 (a full 61-header V4 window + tip).
+    // Reused from the #179 MultiShield V4 KAT fixture (multishield_v4_kat_test.cpp
+    // header, re-derivable via /home/ubuntu/dgb179-vectors/fetch_de.py).
+    struct Row { uint32_t height; uint32_t version; int64_t time; uint32_t bits; };
+    static const Row kWindow[] = {
+        {24155880, 536874498u, 1788581092, 0x1b061689u},
+        {24155881, 536872450u, 1788581160, 0x1a020fbfu},
+        {24155882, 536872450u, 1788581391, 0x1a01d9f9u},
+        {24155883, 536872962u, 1788581158, 0x1a1db51cu},
+        {24155884, 536874498u, 1788581164, 0x1b062685u},
+        {24155885, 536870914u, 1788581167, 0x1a5f80dau},
+        {24155886, 536870914u, 1788581173, 0x1a558e21u},
+        {24155887, 536874498u, 1788581183, 0x1b05ebe6u},
+        {24155888, 714605058u, 1788581187, 0x190a11d9u},
+        {24155889, 536874498u, 1788581203, 0x1b05708cu},
+        {24155890, 536870914u, 1788581209, 0x1a5501bbu},
+        {24155891, 536872450u, 1788581213, 0x1a023db3u},
+        {24155892, 536870914u, 1788581227, 0x1a4e7e25u},
+        {24155893, 536870914u, 1788581228, 0x1a4582eau},
+        {24155894, 536874498u, 1788581230, 0x1b059965u},
+        {24155895, 536872962u, 1788581246, 0x1a284ab6u},
+        {24155896, 537338370u, 1788581253, 0x190b89dbu},
+        {24155897, 536874498u, 1788581277, 0x1b0545fdu},
+        {24155898, 594264578u, 1788581284, 0x190a64fau},
+        {24155899, 584040962u, 1788581296, 0x1908f4cfu},
+        {24155900, 536874498u, 1788581304, 0x1b04cf7fu},
+        {24155901, 536874498u, 1788581307, 0x1b04036cu},
+        {24155902, 536872450u, 1788581315, 0x1a02c47du},
+        {24155903, 536872450u, 1788581599, 0x1a025181u},
+        {24155904, 536872450u, 1788581674, 0x1a01f289u},
+        {24155905, 536870914u, 1788581360, 0x1a59661cu},
+        {24155906, 536872962u, 1788581365, 0x1a31485au},
+        {24155907, 740106754u, 1788581368, 0x1909af5fu},
+        {24155908, 536870914u, 1788581372, 0x1a4f918au},
+        {24155909, 537428482u, 1788581378, 0x19086450u},
+        {24155910, 536872450u, 1788581584, 0x1a01f480u},
+        {24155911, 536870914u, 1788581434, 0x1a46d1b1u},
+        {24155912, 536874498u, 1788581453, 0x1b04de48u},
+        {24155913, 536870914u, 1788581455, 0x1a3c458fu},
+        {24155914, 536872450u, 1788581488, 0x1a01d27du},
+        {24155915, 537108994u, 1788581467, 0x190872bfu},
+        {24155916, 536872962u, 1788581468, 0x1a3a0a87u},
+        {24155917, 536870914u, 1788581470, 0x1a38687bu},
+        {24155918, 536872962u, 1788581506, 0x1a322751u},
+        {24155919, 536870914u, 1788581513, 0x1a30acf7u},
+        {24155920, 536870914u, 1788581520, 0x1a279c67u},
+        {24155921, 536872962u, 1788581524, 0x1a2bc5e9u},
+        {24155922, 536872962u, 1788581533, 0x1a22c5f3u},
+        {24155923, 536872962u, 1788581541, 0x1a1b8140u},
+        {24155924, 536872450u, 1788581871, 0x1a020f72u},
+        {24155925, 545260034u, 1788581558, 0x190990dfu},
+        {24155926, 536874498u, 1788581584, 0x1b0672dcu},
+        {24155927, 536872962u, 1788581595, 0x1a18a60bu},
+        {24155928, 536872450u, 1788581619, 0x1a01d54au},
+        {24155929, 536872962u, 1788581599, 0x1a1428d6u},
+        {24155930, 536874498u, 1788581610, 0x1b05b89bu},
+        {24155931, 551477762u, 1788581616, 0x19092714u},
+        {24155932, 536874498u, 1788581620, 0x1b04adddu},
+        {24155933, 572326402u, 1788581674, 0x19077c59u},
+        {24155934, 536874498u, 1788581689, 0x1b03d3b4u},
+        {24155935, 536872450u, 1788582059, 0x1a01d2f9u},
+        {24155936, 536872450u, 1788581727, 0x1a016f3cu},
+        {24155937, 536874498u, 1788581727, 0x1b034153u},
+        {24155938, 536874498u, 1788581746, 0x1b028f57u},
+        {24155939, 600031746u, 1788581796, 0x1907298fu},
+        {24155940, 758211074u, 1788581784, 0x1905a837u},
+        {24155941, 579609090u, 1788581808, 0x1904850fu},
+    };
+    constexpr std::size_t kWindowN = sizeof(kWindow) / sizeof(kWindow[0]);
+    static_assert(kWindowN == 62, "62 ancestors == full 61-header V4 window + tip");
+
+    // Distinctive real tip block id (block 24155941), so tip_hash() is non-null
+    // and the template takes the embedded (not GBT-fallback) previousblockhash+
+    // bits branch.
+    const uint64_t kTipId = 0xfeedface00c0ffeeULL;
+
+    Fixture fx;
+    fx.chain.set_base_height(kWindow[0].height);
+    for (std::size_t i = 0; i < kWindowN; ++i) {
+        const Row& r = kWindow[i];
+        c2pool::dgb::HeaderSample s;
+        s.n_version = static_cast<int32_t>(r.version);
+        s.n_time    = r.time;
+        s.target    = dgb::coin::compact_to_target(r.bits);
+        s.pow_hash  = 0;                       // inert PoW gate (0 <= any target)
+        s.n_bits    = r.bits;                  // fed verbatim to the V4 walk
+        if (i + 1 == kWindowN)                 // populate the tip's real block id
+            s.block_hash = dgb::coin::u256::from_u64(kTipId);
+        const auto res = fx.chain.validate_and_append(s);
+        ASSERT_NE(res, c2pool::dgb::IngestResult::REJECTED)
+            << "fixture header " << r.height << " unexpectedly rejected";
+    }
+
+    auto ws = fx.make();
+    const auto tmpl = ws->get_current_work_template();
+
+    // The window is deep enough: the template is SERVED, not held.
+    ASSERT_TRUE(tmpl.contains("bits"))
+        << "deep V4 window must serve a real next-target, not hold";
+    // Real network-accepted next-target for Scrypt block 24155942.
+    EXPECT_EQ(tmpl["bits"].get<std::string>(), "1a47e953");
+    // The regression sentinel: never the fabricated diff-1.
+    EXPECT_NE(tmpl["bits"].get<std::string>(), "1d00ffff");
+
+    // Real tip -> previousblockhash present, and it equals the window-independent
+    // getter (served-path reconvergence).
+    const std::string expected_prev = std::string(48, '0') + "feedface00c0ffee";
+    ASSERT_TRUE(tmpl.contains("previousblockhash"));
+    EXPECT_EQ(tmpl["previousblockhash"].get<std::string>(), expected_prev);
+    EXPECT_EQ(ws->get_current_gbt_prevhash(), expected_prev);
 }
 
 
