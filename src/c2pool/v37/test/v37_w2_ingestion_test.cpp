@@ -753,7 +753,17 @@ static void test_kr1_carrier_position_branch_a() {
     e2.stop();
 }
 
+// Ratified-constant regression pin (disposition B, 2026-09-05): N_CTX and R_MAX
+// are fixed V37.0 protocol constants. A literal pin here (mirroring the decay
+// golden-pin pattern) makes any value change trip a visible test failure, in
+// addition to the compile-time static_asserts in w2_receipt.hpp.
+static void test_ratified_constants() {
+    CHECK(W2_N_CTX == 2);   // V37.0 ratified admission window
+    CHECK(W2_R_MAX == 4);   // V37.0 ratified receipts-per-carrier cap
+}
+
 int main() {
+    test_ratified_constants();
     test_work_narrowing();
     test_ka1_recovery_envelope();
     test_ka2_dedup();

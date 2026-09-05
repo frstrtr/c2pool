@@ -37,18 +37,27 @@ using ::v37::bytes32;
 using ::v37::sha256d;
 using u64 = std::uint64_t;
 
-// ── W2-layer consensus parameters ─────────────────────────────────────────
-// KP-F1 (KAT plan §7): N_CTX and R_MAX are NOT LaneParams fields. The shipped
-// LaneParams is {window, c0, rollup, level_caps, half_life, journal_depth} —
-// adding N_CTX/R_MAX to that header leaf WOULD change the consensus digest
-// (the header leaf hashes geometry). So they live HERE, as W2-layer consensus
-// params (values from docs/c2pool-v37-share-format.md §7), never baked into the
-// lane header leaf. FLAG (dispatch): whether these must become digest-committed
-// LaneParams (a NON-digest-neutral header change, unlike L0F_RECEIPT) is an
-// open integrator question; W2 does not silently commit them.
+// ── W2-layer consensus parameters (RATIFIED V37.0) ─────────────────────────
+// N_CTX=2 and R_MAX=4 are RATIFIED V37.0 protocol constants (disposition B of
+// the operator-ordered N_CTX/R_MAX digest investigation, 2026-09-05). Both are
+// content-affecting — they gate receipt admission, which sets the annotated L0
+// slot's next_pos and the carrier's push positions — yet NEITHER value is part
+// of the lane_digest preimage (build_leaves() hashes geometry, B, next_pos,
+// counts, L0/bucket sums, and acc — never these admission params). They are
+// therefore FROZEN here alongside the geometry tuple as fixed V37.0 constants,
+// not digest-committed LaneParams fields (values from
+// docs/c2pool-v37-share-format.md §7). KP-F1 (KAT plan §7) still holds: the
+// shipped LaneParams is {window, c0, rollup, level_caps, half_life,
+// journal_depth} and these two are NOT members of it. See the static_asserts
+// below and the KAT literal-pin (a value change trips a test).
 constexpr u64           W2_N_CTX           = 2;              // context window bins
 constexpr u64           W2_DEDUP_RETENTION = W2_N_CTX + 2;   // §5 retention horizon
 constexpr std::uint32_t W2_R_MAX           = 4;              // receipts per carrier
+static_assert(W2_N_CTX == 2 && W2_R_MAX == 4,
+              "V37.0 ratified receipt-admission constants; changing either "
+              "forks lane_digest via admission -> next_pos/positions");
+static_assert(W2_DEDUP_RETENTION >= W2_N_CTX,
+              "dedup horizon must cover the admission window");
 
 // L0F_RECEIPT annotation bit — the header symbol (this PR's owed one-liner,
 // v37_lane.hpp). Named here so the emitter and tests share one definition.
