@@ -19,6 +19,7 @@
 #include <core/reply_matcher.hpp>
 #include <core/known_txs_eviction.hpp>
 #include <sharechain/prepared_list.hpp>
+#include <sharechain/pool_rate_head_select.hpp> // sharechain::select_pool_rate_head — dashboard pool-rate head selection (#1482)
 #include <c2pool/storage/sharechain_storage.hpp>
 
 #include <atomic>
@@ -149,6 +150,11 @@ protected:
         int dead_shares{0};
         int fork_count{0};
         double pool_hashrate{0};
+        // Wall-clock seconds when pool_hashrate was last computed > 0. The web
+        // set_pool_hashrate_fn applies a 600 s staleness bound on this so a
+        // stalled think() (dead node) breaks the graph line instead of serving
+        // a frozen value forever. 0 = never computed.
+        int64_t pool_hashrate_ts{0};
     };
     void publish_snapshot() {
         TrackerSnapshot s;
@@ -156,7 +162,90 @@ protected:
         s.verified_count = static_cast<int>(m_tracker.verified.size());
         s.head_count = static_cast<int>(m_tracker.chain.get_heads().size());
         s.fork_count = s.head_count;
+
+        // ── Dashboard pool hashrate (issue #1482) ────────────────────────────
+        // Computed HERE, under the compute-thread exclusive tracker lock, so the
+        // web set_pool_hashrate_fn reads a FRESH snapshot value instead of
+        // try-locking the tracker and returning a cached last-good latch. That
+        // latch emitted bit-identical repeats whenever the try-lock lost to a
+        // think() chunk, and the web frozen-guard (kMaxIdenticalPoolRateRun) then
+        // zeroed those runs into false 0-drops — the rectangular ltc.voidbind
+        // graph. Head choice is the pure sharechain::select_pool_rate_head SSOT
+        // (verified best when live, else the fastest live raw head). Display-only:
+        // the vardiff retarget runs on the verified chain over TARGET_LOOKBEHIND
+        // and never reads this snapshot.
+        {
+            const int64_t now_s = static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            const uint32_t sp = m_coin_params.share_period ? m_coin_params.share_period : 1u;
+            const int display_lookbehind = static_cast<int>(3600u / sp);
+
+            auto make_head = [&](const uint256& hh) -> sharechain::PoolRateHead {
+                sharechain::PoolRateHead rh;
+                rh.hash = hh;
+                if (hh.IsNull() || !m_tracker.chain.contains(hh)) return rh;
+                rh.height = static_cast<int32_t>(m_tracker.chain.get_height(hh));
+                try {
+                    auto& cd = m_tracker.chain.get(hh);
+                    int64_t ts = 0;
+                    cd.share.invoke([&](auto* sh) {
+                        ts = static_cast<int64_t>(sh->m_timestamp);
+                    });
+                    // A future-dated newest share (ts > now) yields a NEGATIVE
+                    // age; keep it verbatim -- it is maximally live, not dead.
+                    // Only an undatable share (ts<=0) leaves the kUnknownAge
+                    // default (the not-live sentinel). Issue #1482 blocker A.
+                    if (ts > 0) rh.newest_share_age_s = now_s - ts;
+                } catch (...) {}
+                if (rh.height >= 3) {
+                    int lb = rh.height - 1 < display_lookbehind
+                                 ? rh.height - 1 : display_lookbehind;
+                    try {
+                        auto aps = m_tracker.get_pool_attempts_per_second(hh, lb, false);
+                        rh.aps = static_cast<double>(aps.GetLow64());
+                    } catch (...) {}
+                }
+                return rh;
+            };
+
+            sharechain::PoolRateHead verified;
+            bool verified_present = false;
+            if (!m_best_share_hash.IsNull() &&
+                m_tracker.chain.contains(m_best_share_hash)) {
+                verified = make_head(m_best_share_hash);
+                verified_present = true;
+            }
+            std::vector<sharechain::PoolRateHead> raw_heads;
+            for (const auto& kv : m_tracker.chain.get_heads())
+                raw_heads.push_back(make_head(kv.first));
+
+            uint256 sel = sharechain::select_pool_rate_head(
+                verified, verified_present, raw_heads);
+
+            double hr = 0.0;
+            if (!sel.IsNull()) {
+                if (verified_present && verified.hash == sel)
+                    hr = verified.aps;
+                else
+                    for (const auto& rh : raw_heads)
+                        if (rh.hash == sel) { hr = rh.aps; break; }
+            }
+            if (hr > 0.0) {
+                s.pool_hashrate = hr;
+                s.pool_hashrate_ts = now_s;
+            }
+        }
+
         std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        // Carry the last-good pool hashrate forward when this cycle produced none
+        // (empty/short chain), so a transient gap does not blank the graph; the
+        // web fn applies the 600 s staleness bound on pool_hashrate_ts to break
+        // the line if think() itself has stalled.
+        if (s.pool_hashrate <= 0.0 && m_snapshot.pool_hashrate > 0.0) {
+            s.pool_hashrate = m_snapshot.pool_hashrate;
+            s.pool_hashrate_ts = m_snapshot.pool_hashrate_ts;
+        }
         m_snapshot = s;
     }
     mutable std::mutex m_snapshot_mutex;

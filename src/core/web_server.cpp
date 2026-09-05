@@ -2969,6 +2969,9 @@ nlohmann::json MiningInterface::rest_global_stats()
     // while the chain is too young, so the field is emitted as null rather than
     // a literal 1.0 that reads as a real floor.
     std::optional<double> min_difficulty;
+    // #1482: the sharechain provider's anchored get_average_stale_prop, when it
+    // supplies one (see below).
+    std::optional<double> sc_pool_stale_prop;
 
     // Populate from sharechain
     if (m_sharechain_stats_fn) {
@@ -2984,6 +2987,8 @@ nlohmann::json MiningInterface::rest_global_stats()
         if (sc.contains("min_difficulty") && sc["min_difficulty"].is_number()
             && sc["min_difficulty"].get<double>() > 0.0)
             min_difficulty = sc["min_difficulty"].get<double>();
+        if (sc.contains("pool_stale_prop") && sc["pool_stale_prop"].is_number())
+            sc_pool_stale_prop = sc["pool_stale_prop"].get<double>();
         if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object())
             unique_miners = static_cast<int>(sc["shares_by_miner"].size());
     }
@@ -3008,6 +3013,14 @@ nlohmann::json MiningInterface::rest_global_stats()
     int stales = orphan_shares + dead_shares;
     int good = total_shares - stales;
     double pool_stale_prop = (good + stales > 0) ? static_cast<double>(stales) / (good + stales) : 0.0;
+    // #1482: prefer the ANCHORED-window get_average_stale_prop the sharechain
+    // stats provider computes over min(height, 3600/SHARE_PERIOD) from the LIVE
+    // head, when it supplies one. The count-over-CHAIN_LENGTH value above flapped
+    // (0.05<->0.40) because it changed with whichever raw fork was tallest; the
+    // anchored value does not. Coin-generic: absent on lanes that don't set it,
+    // so they keep the legacy value.
+    if (sc_pool_stale_prop)
+        pool_stale_prop = *sc_pool_stale_prop;
     // p2pool web.py get_global_stats():
     //     nonstale_hash_rate      = get_pool_attempts_per_second(...)
     //     pool_nonstale_hash_rate = nonstale_hash_rate
@@ -4592,15 +4605,84 @@ nlohmann::json MiningInterface::rest_local_stats()
     {
         auto warnings = nlohmann::json::array();
 
-        // 1. LTC block source contact check (>60s since last work update)
+        // 1. Coin block-source contact check (issue #1482).
+        // The threshold is >=3x the coin block_period (from the same source as
+        // /web/currency_info), NEVER the old hardcoded 60 s: at LTC's 150 s
+        // target a 60-136 s gap is a perfectly NORMAL Poisson inter-block wait,
+        // so the banner fired routinely on a synced, advancing node. It is also
+        // gated on "coin peers > 0 AND tip not advancing over the window" -- a
+        // recent work refresh means a new block arrived (tip advancing). Zero
+        // coin peers is a SEPARATE, LOUDER condition: warning #4 below counts
+        // POOL (sharechain) peers, a different network, so it does NOT surface a
+        // coin-P2P isolation -- when the tip is stalled AND the coin provider
+        // reports 0 parent-chain peers, that is a genuine outage and gets its own
+        // red "NO COIN P2P PEERS" banner (blocker B). Only the benign
+        // sub-threshold gap on a still-peered node is left SILENT ("awaiting next
+        // block, normal") instead of a red LOST CONTACT banner.
         auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (m_last_work_update_time > 0 && now_s - m_last_work_update_time > 60) {
-            std::string src = (m_coin_node && m_coin_node->is_embedded()) ? "EMBEDDED LTC NODE" : "LTC DAEMON";
-            warnings.push_back("LOST CONTACT WITH " + src + " for "
-                + std::to_string(now_s - m_last_work_update_time) + "s! "
-                + ((m_coin_node && m_coin_node->is_embedded()) ? "No new blocks received from P2P peers."
-                                   : "Check that it isn't frozen or dead!"));
+        {
+            // Coin block period in seconds, mirroring rest_web_currency_info's
+            // label-first-then-enum resolution so BCH/NMC/BIP110 (which share the
+            // BITCOIN enum) are not read as 150 s.
+            int64_t block_period = 150;  // LTC/DASH default
+            std::string cl = m_coin_label;
+            for (auto& ch : cl)
+                if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+            if (cl == "BCH" || cl == "NMC" || cl == "BIP110") {
+                block_period = 600;
+            } else {
+                switch (m_blockchain) {
+                case Blockchain::LITECOIN: block_period = 150; break;
+                case Blockchain::BITCOIN:  block_period = 600; break;
+                case Blockchain::DOGECOIN: block_period = 60;  break;
+                case Blockchain::DASH:     block_period = 150; break;
+                case Blockchain::DIGIBYTE: block_period = 15;  break;
+                default: break;
+                }
+            }
+            const int64_t threshold = block_period * 3;  // >=3x mean block interval
+
+            // Coin peers: prefer the embedded coin-sync provider's peer array
+            // (the parent-chain P2P peers that actually deliver new blocks). When
+            // no provider is wired the count is unknown -> treat as "have peers"
+            // so a lane without the hook still fires on a genuine long stall
+            // (already 3x-gated); never fabricate a peer count.
+            bool have_coin_peers = true;
+            if (m_coin_sync_status_fn) {
+                auto ss = m_coin_sync_status_fn();
+                if (ss.is_object() && ss.contains("peers") && ss["peers"].is_array())
+                    have_coin_peers = !ss["peers"].empty();
+                else if (ss.is_object() && ss.contains("connected_peers")
+                         && ss["connected_peers"].is_number())
+                    have_coin_peers = ss["connected_peers"].get<int>() > 0;
+            }
+
+            const bool tip_stalled =
+                m_last_work_update_time > 0 &&
+                now_s - m_last_work_update_time > threshold;
+            if (tip_stalled && have_coin_peers) {
+                std::string src = (m_coin_node && m_coin_node->is_embedded()) ? "EMBEDDED LTC NODE" : "LTC DAEMON";
+                warnings.push_back("LOST CONTACT WITH " + src + " for "
+                    + std::to_string(now_s - m_last_work_update_time) + "s! "
+                    + ((m_coin_node && m_coin_node->is_embedded()) ? "No new blocks received from P2P peers."
+                                       : "Check that it isn't frozen or dead!"));
+            } else if (tip_stalled && !have_coin_peers) {
+                // Tip stalled past the 3x-block-period window AND the coin sync
+                // provider reports ZERO parent-chain peers -- a real coin-network
+                // isolation, distinct from the benign "awaiting next block". This
+                // branch only reaches when the provider IS wired and returns 0
+                // (have_coin_peers defaults true without the hook), so it never
+                // fires on a lane lacking the hook. Warning #4 counts POOL peers,
+                // not these, so without this the outage would be SILENT (blocker
+                // B). Name the coin P2P peers explicitly.
+                warnings.push_back("NO COIN P2P PEERS — the "
+                    + std::string((m_coin_node && m_coin_node->is_embedded())
+                                      ? "embedded coin node" : "coin daemon")
+                    + " has 0 parent-chain peers and the tip has not advanced for "
+                    + std::to_string(now_s - m_last_work_update_time)
+                    + "s; no new blocks can arrive until a peer connects.");
+            }
         }
 
         // 2. No work template yet
@@ -8009,11 +8091,20 @@ void MiningInterface::update_stat_log()
     // Pool stale proportion from sharechain orphan+dead counts
     if (m_sharechain_stats_fn) {
         auto sc = m_sharechain_stats_fn();
-        int ts = sc.value("total_shares", 0);
-        int os = sc.value("orphan_shares", 0);
-        int ds = sc.value("dead_shares", 0);
-        int st = os + ds;
-        entry.pool_stale_prop = (ts > 0) ? static_cast<double>(st) / ts : 0.0;
+        // #1482: prefer the provider's anchored get_average_stale_prop
+        // (stales/(lookbehind+stales) over min(height, 3600/SHARE_PERIOD)) when
+        // present, so the persisted graph series stops flapping with the tallest
+        // raw fork. Coin-generic: fall back to the whole-window count for lanes
+        // that don't publish the field.
+        if (sc.contains("pool_stale_prop") && sc["pool_stale_prop"].is_number()) {
+            entry.pool_stale_prop = sc["pool_stale_prop"].get<double>();
+        } else {
+            int ts = sc.value("total_shares", 0);
+            int os = sc.value("orphan_shares", 0);
+            int ds = sc.value("dead_shares", 0);
+            int st = os + ds;
+            entry.pool_stale_prop = (ts > 0) ? static_cast<double>(st) / ts : 0.0;
+        }
     } else {
         entry.pool_stale_prop = 0.0;
     }
