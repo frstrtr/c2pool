@@ -237,7 +237,11 @@ inline uint64_t get_doge_block_subsidy(uint32_t height, const DOGEChainParams& p
     int halvings = static_cast<int>(height) / DOGEChainParams::SUBSIDY_HALVING_INTERVAL;
 
     if (params.simplified_rewards) {
-        if (height >= 600000) return 10000ULL * COIN;
+        // Exact upstream shape (dogecoin.cpp GetDogecoinBlockSubsidy): below the
+        // 6th halving interval (600000) the fixed 500000 schedule applies, at or
+        // above it the reward is flat 10000 forever. A duplicate `height >= 600000`
+        // early return used to precede this test, which made the test below — and
+        // therefore its else-path — statically unreachable (CodeQL #434).
         if (height < 6u * DOGEChainParams::SUBSIDY_HALVING_INTERVAL)
             return (500000ULL * COIN) >> halvings;
         return 10000ULL * COIN;

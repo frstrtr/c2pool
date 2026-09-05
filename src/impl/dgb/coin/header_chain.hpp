@@ -52,6 +52,7 @@
 #include <impl/dgb/coin/dgb_arith256.hpp>
 #include <impl/dgb/coin/dgb_block_algo.hpp>
 #include <impl/dgb/coin/dgb_digishield.hpp>
+#include <impl/dgb/coin/dgb_multishield.hpp>
 
 namespace c2pool::dgb {
 
@@ -63,6 +64,10 @@ using ::dgb::coin::is_scrypt_header;
 using ::dgb::coin::mul_div_u256;
 using ::dgb::coin::scrypt_window_ancestors;
 using ::dgb::coin::u256;
+using ::dgb::coin::MsHeader;
+using ::dgb::coin::MsAccessor;
+using ::dgb::coin::MultiShieldV4Params;
+using ::dgb::coin::multishield_v4_next_bits;
 
 // Minimal header sample the Scrypt-only retarget body consumes. The embedded
 // DigiByte Core port (M3+) carries the full CBlockHeader; the validate() +
@@ -82,6 +87,11 @@ struct HeaderSample {
     u256     target     = 0;   // expanded PoW target (smaller == more work)
     u256     pow_hash    = 0;  // scrypt(header) digest; hash <= target == valid PoW
     u256     block_hash  = 0;  // sha256d(header) block id; 0 == not populated here
+    // Raw compact nBits, carried verbatim for the MultiShield V4 next-target walk
+    // (next_scrypt_bits() -> SetCompact(prevAlgo.nBits)). LAST field so the
+    // 19-field positional brace-inits in the tests stay valid (each just omits
+    // it, defaulting to 0). make_header_sample fills it from the wire header.
+    uint32_t n_bits     = 0;
 };
 
 // Outcome of validating + ingesting one header.
@@ -247,17 +257,20 @@ public:
             // scrypt(header) <= target) ARE the correct, complete V36
             // parent-difficulty validation.
             //
-            // Re-derivation is also structurally impossible here: DigiByte's
-            // live retarget is MultiShield V4, whose averaging window is GLOBAL
-            // across all 5 algos (Scrypt/SHA256d/Skein/Qubit/Odocrypt) with
-            // per-algo adjust + MedianTimePast deltas + /4 damping. A Scrypt-only
-            // header walk cannot reconstruct that window without full multi-algo
-            // header tracking == V37 (5-algo validation) by definition.
-            // digishield_next_target() / next_retarget_window() are retained as
-            // test scaffolding and a reference for the V37 embedded-daemon port;
-            // the ingest path deliberately does NOT call them here (an nBits-exact
-            // gate would only deepen the wrong single-algo retarget model). See
-            // V37 backlog: full V4 MultiShield recompute.
+            // NOTE (#179): the DEMOTED gate is about INGEST-time per-header
+            // difficulty VALIDATION, which stays a no-op for p2pool-merged-v36
+            // compat. It is NOT the same as computing the next block's target for
+            // the SERVED template: the "Scrypt-only walk can't see the 5-algo
+            // window" premise is FALSE here, because continuity (non-Scrypt)
+            // headers ARE appended (work-neutral) with their target + timestamp +
+            // nBits, so the GLOBAL MultiShield V4 averaging window is fully
+            // present in m_chain. next_scrypt_bits() (below) reconstructs V4
+            // byte-exact from it to stamp the template `bits` (replacing the
+            // fabricated 0x1d00ffff). The OLD digishield_next_target() /
+            // next_retarget_window() model the WRONG (DigiShield-v3, Scrypt-only-
+            // avg) retarget and are retained only as test scaffolding -- the
+            // ingest path deliberately does NOT call them, and neither does the
+            // served path (which uses the V4 walk instead).
 
             // MTP monotonicity (DigiByte Core ContextualCheckBlockHeader
             // "time-too-old"): a Scrypt header's nTime must be STRICTLY GREATER
@@ -445,6 +458,35 @@ public:
             times.push_back(m_chain[m_chain.size() - 1 - i].n_time);
         std::sort(times.begin(), times.end());
         return times[times.size() / 2];
+    }
+
+    // Next block's Scrypt nBits via DigiByte-Core MultiShield V4, derived from
+    // the synced header window (coin/dgb_multishield.hpp). This is the SERVED
+    // target the daemonless work source stamps into the block-template `bits`
+    // field, replacing the fabricated diff-1 (0x1d00ffff) that made every won
+    // block INVALID (#179). It reconstructs the GLOBAL 5-algo V4 window the
+    // header chain now carries in full -- continuity (non-Scrypt) headers are
+    // appended with their target + timestamp + nBits, so the 50-block averaging
+    // window and the nearest-Scrypt-ancestor base target are both present.
+    //
+    // Returns nullopt when the local window is too shallow (< 61 headers: the
+    // 50-back pindexFirst plus its 10-ancestor MedianTimePast) or holds no Scrypt
+    // ancestor -- a TRUTHFUL absence the caller turns into "hold work / wait for
+    // sync", never a fabricated target. Distinct from the demoted parent-difficulty
+    // INGEST gate above (which stays a no-op, per p2pool-merged-v36 compat): this
+    // is the forward, template-emit direction, not a per-header validation.
+    std::optional<uint32_t> next_scrypt_bits() const
+    {
+        const std::size_t depth = m_chain.size();
+        if (depth == 0)
+            return std::nullopt;
+        // Nearest-first accessor into the rolling window: k == 0 is the tip.
+        const MsAccessor at = [this, depth](std::size_t k) -> MsHeader {
+            const HeaderSample& s = m_chain[depth - 1 - k];
+            return MsHeader{ s.n_version, s.n_bits, s.n_time };
+        };
+        return multishield_v4_next_bits(at, depth, MultiShieldV4Params{},
+                                        ::dgb::coin::DgbAlgo::SCRYPT);
     }
 
 private:

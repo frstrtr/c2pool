@@ -389,6 +389,14 @@ target_link_libraries(c2pool-dash
 add_executable(c2pool-bip110
     main_bip110.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/stratum/work_source.cpp
+    # M3 sharechain MINT lane (behind --bip110-sharechain; default OFF): the
+    # namespace-copied sharechain node + single-protocol v36-genesis bridge +
+    # c2pool protocol handler. main_bip110 references bip110::pool::Node (ctor,
+    # listen, broadcast_share, notify_local_share, register_template_txs,
+    # start_outbound_connections) which are DEFINED in these TUs — same set the
+    # bip110_pool_node_compile KAT links. Dormant unless the flag is passed.
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/pool/node.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/pool/protocol_actual.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
 )
 c2pool_wire_version(c2pool-bip110)
@@ -410,6 +418,8 @@ target_link_libraries(c2pool-bip110
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
+    ${SECP256K1_LIBRARIES}
+    Threads::Threads
 )
 
 # Dashboard assets: the shared coin-generic WebServer serves the web-static/
@@ -493,6 +503,33 @@ target_link_libraries(bip110_m3_serving_kat
 )
 add_test(NAME bip110_m3_serving_kat COMMAND bip110_m3_serving_kat)
 
+# bip110_broadcaster_kat: M3 PR-C2 addrman-backed FOUND-BLOCK fan-out. Network-
+# free red/green over coin/broadcaster.hpp + broadcaster_full.hpp: discover
+# dedupe/cap/primary-exclude, prune_dead + backoff, submit_block_raw_all fans to
+# every live slot, and the dual-arm on_block_found verdict (ARM A embedded fan-
+# out + ARM B primary relay; reached_network iff >=1 arm placed the block). The
+# money property: a won block reaches the whole reachable NODE_BLAKE2B set, not a
+# single submit, and never silently drops when both arms fail.
+add_executable(bip110_broadcaster_kat
+    bip110_broadcaster_kat.cpp
+)
+target_compile_definitions(bip110_broadcaster_kat PRIVATE __C2POOL_COIN_BIP110__=1)
+target_link_libraries(bip110_broadcaster_kat
+    bip110_coin
+    c2pool_payout
+    c2pool_merged_mining
+    c2pool_hashrate
+    core
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME bip110_broadcaster_kat COMMAND bip110_broadcaster_kat)
+
 # KAT: pre-anchor header-backfill PARALLEL GETHEADERS WINDOW (extends #1263 /
 # task #151; base PR #1278). Drives the real BulkFetchLane header lane against a
 # scripted peer set: RED (window=1, no disconnect) serializes/wedges on a silent
@@ -569,6 +606,27 @@ target_link_libraries(dial_lifetime_guard_kat
     Threads::Threads
 )
 add_test(NAME dial_lifetime_guard_kat COMMAND dial_lifetime_guard_kat)
+
+# dash_explorer_json_kat — KAT for the read-only /api/explorer getblock body
+# decode (dash::coin::block_to_explorer_json): DIP4 CbTx type/extraPayload +
+# masternode-payee X-address + txid. Decode-only, no node/network.
+add_executable(dash_explorer_json_kat dash_explorer_json_kat.cpp)
+target_link_libraries(dash_explorer_json_kat
+    core pool sharechain
+    c2pool_node_enhanced
+    dash
+    c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+    dash_x11
+    dash_rpc
+    dash_stratum
+    dash_block_replay
+    dash_bls_verify
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+add_test(NAME dash_explorer_json_kat COMMAND dash_explorer_json_kat)
 
 # ---- Control-plane M0: money-gate KAT (Qt-free sibling of test_reward_safe_launch)
 # The settings-file loader + param catalog are self-contained (stdlib only), so
@@ -738,6 +796,37 @@ add_test(NAME dash_asn_diversity_kat COMMAND dash_asn_diversity_kat)
 # like the rest of the dash suite; carries no BLS symbols.
 add_executable(dash_getmnlistd_tracker_kat dash_getmnlistd_tracker_kat.cpp)
 add_test(NAME dash_getmnlistd_tracker_kat COMMAND dash_getmnlistd_tracker_kat)
+
+# ── Track A2 / W0: the v37 node scaffold ─────────────────────────────────────
+# c2pool-v37: the node shell the v37 executor (PR #1467, the O1 single-writer
+# lane executor) plugs into. W0 stands an >= 8-process single-host loopback
+# simnet that meshes and idles EXCHANGING NOTHING (the receipt wire schema is
+# W2/W3). MINIMAL link graph by design (the W0 spec §5.1) and by necessity
+# (memory-pressured CI host): the v37 consensus module is header-only and
+# self-contained, and the W0 loopback mesh uses plain POSIX sockets, so this
+# target links only Threads — NOT core/pool/Boost/coin/payout/storage. The
+# donor coin mains (main_btc.cpp / main_dash.cpp) are left untouched.
+add_executable(c2pool-v37 v37/main_v37.cpp)
+c2pool_wire_version(c2pool-v37)
+target_include_directories(c2pool-v37 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(c2pool-v37 Threads::Threads)
+
+# W0 HAND-WIRES its consumer-side test dir explicitly. Test wiring in this repo
+# is hand-listed add_subdirectory/add_test — there is no file(GLOB) over
+# */test — and the test-floor-guard only floors lanes already present in
+# test-floors.json, so a test dir that is never added is a silent hollow-green.
+# add_subdirectory(v37/test) is NECESSARY but is NOT itself the hollow-green
+# mitigation: a CTest registered here yet absent from build.yml's `cmake --build
+# --target` list is NOT_BUILT under CI and its ctest run silently passes (the DGB
+# #137 / #769 unregistered-KAT class; identical to PR #1467's executor test). The
+# actual mitigation is that v37_scaffold_test is now listed in the build.yml
+# --target lists (BOTH the Linux x86_64 and the ASan+UBSan legs) so CI compiles +
+# runs it, PLUS the drift-guard glob in tools/ci/check_test_target_allowlist.py
+# now covers src/c2pool/**/test/ so any future unlisted add_test here fails the
+# guard at PR time rather than hollow-greening. The linux-lane floor raise for the
+# new v37 scaffold test is deferred to A1's CI-lane PR (a floor is raised only
+# AFTER capturing a green-baseline junit).
+add_subdirectory(v37/test)
 
 # Legacy applications have been archived to ../../archive/
 # - c2pool_legacy.cpp (original c2pool.cpp)

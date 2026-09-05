@@ -1,0 +1,44 @@
+{
+  "final_owed": {
+    "m0": 7,
+    "m1": 7,
+    "m2": 7
+  },
+  "per_chain": {
+    "c0": {
+      "f_consensus": 1,
+      "outputs": [
+        [
+          "m0",
+          7,
+          "p2wpkh"
+        ]
+      ],
+      "sha256": "9f7ab6569b6b15f68b7ac934e5b452f8dc3cdfc0324af64cf6b4c1aeb3fee5c2"
+    },
+    "c1": {
+      "f_consensus": 2,
+      "outputs": [
+        [
+          "m1",
+          14,
+          "p2wpkh"
+        ]
+      ],
+      "sha256": "1901ecf1ae12a7747ab3f51960feb3153822eb17f85ece8360d5bfe0028ce32c"
+    },
+    "c2": {
+      "f_consensus": 5,
+      "outputs": [
+        [
+          "m2",
+          35,
+          "p2wpkh"
+        ]
+      ],
+      "sha256": "e48aaf9c2f3004d1f7342e59a326aba536d65e79b7be7f4cc22d55471d24fe6f"
+    }
+  },
+  "row": "P3-3",
+  "stamp": "24aac8b18af966723caf0b3c43337beaa42c03f84b87eae7fe895219cad23b4f"
+}

@@ -204,6 +204,16 @@ protected:
     void save_whitelist_to_disk() const
     {
         if (m_whitelist_path.empty()) return;
+        // Same containment guard as the load path: refuse to write a whitelist
+        // that resolves outside its configured base directory. Covers both
+        // sinks below — the ".new" temporary is a sibling of m_whitelist_path
+        // (same parent), so containing m_whitelist_path contains the rename
+        // target and the temporary it is renamed from.
+        if (!path_within_base(m_whitelist_path, m_whitelist_dir)) {
+            LOG_WARNING << "[Pool] Refusing to save whitelist outside config dir: "
+                        << m_whitelist_path;
+            return;
+        }
         try {
             nlohmann::json j;
             j["version"] = 1;

@@ -1,0 +1,130 @@
+name: DGB embedded-standalone daemonless smoke
+
+# ci-steward 2026-09-04. First CI coverage of the dgb embedded-standalone
+# (daemonless) path: c2pool-dgb with NO digibyted, --run --coin-p2p-discover
+# + --http :809x. bip110 M1-M3 wired main_dgb to parse --coin-p2p-discover/
+# --http; a regression on that boot path is otherwise invisible until prod.
+#
+# Builds the c2pool-dgb target, boots it daemonless, and asserts (bounded):
+# process stays up, coin-network peer discovery ARMS against real DGB DNS
+# seeds, and the HTTP ENGINE endpoint returns 200 (a live coin-peer version
+# handshake is observed BEST-EFFORT — see the gate script for the #1469
+# network-dependency downgrade). Runs github-hosted for real DNS + P2P
+# egress (the whole point of the smoke). The gate emits a NAMED, logged skip
+# if the DGB network is unreachable, so a silent skip can never read as green.
+#
+# Deliberately does NOT assert header-tip advance: the dgb standalone header
+# source does not reliably climb chain_height past 0 within a bounded CI
+# window today (a btc-style tip-advance assertion would false-red). That is a
+# tracked follow-up; this smoke gates boot + peer-discovery + HTTP-200.
+#
+# Neutral-skip on branches/coins without the dgb embedded-standalone sources
+# (PR #47 per-coin source-presence guard preserved — this job is an ADDITIVE
+# guard and does NOT relax the coin-matrix guard).
+
+on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'ci-steward/dgb-daemonless-smoke'
+  pull_request:
+    paths:
+      - 'src/c2pool/main_dgb.cpp'
+      - 'src/impl/dgb/coin/coin_peer_manager.hpp'
+      - 'src/impl/dgb/coin/chain_seeds.hpp'
+      - 'src/impl/dgb/coin/header_chain.hpp'
+      - 'tests/gates/dgb_embedded_standalone_smoke.sh'
+      - '.github/workflows/dgb-embedded-standalone-smoke.yml'
+
+concurrency:
+  group: dgb-standalone-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+jobs:
+  dgb-embedded-standalone-smoke:
+    name: DGB embedded-standalone daemonless smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check dgb embedded-standalone source presence
+        id: presence
+        run: |
+          if [ -f "src/c2pool/main_dgb.cpp" ] && [ -f "tests/gates/dgb_embedded_standalone_smoke.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::dgb embedded-standalone sources present — running daemonless smoke."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::dgb embedded-standalone sources absent on this branch — neutral skip (PR #47 guard preserved)."
+          fi
+
+      - name: Set per-job Conan home
+        if: steps.presence.outputs.exists == '1'
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          pip install "conan>=2.0,<3.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-dgb-smoke-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-dgb-smoke-
+            conan2-ubuntu24-gcc13-
+
+      # Match the green coin-matrix provisioning exactly: lockfile-pinned deps
+      # and an EXPLICIT build_type=Release so conan generates the Release dep
+      # data cmake then consumes (no host/build build_type drift).
+      - name: Conan install
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          for attempt in 1 2 3; do
+            if conan install . \
+              -pr:a=ci/conan/linux-gcc13.profile \
+              --lockfile=conan.lock \
+              --build=missing \
+              --output-folder=build_ci \
+              --settings=build_type=Release; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          exit 1
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake -S . -B build_ci \
+            -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build c2pool-dgb target
+        if: steps.presence.outputs.exists == '1'
+        run: cmake --build build_ci --target c2pool-dgb -j"$(nproc)"
+
+      - name: Run dgb embedded-standalone daemonless smoke
+        if: steps.presence.outputs.exists == '1'
+        shell: bash
+        env:
+          BUILD_DIR: build_ci
+        run: bash tests/gates/dgb_embedded_standalone_smoke.sh

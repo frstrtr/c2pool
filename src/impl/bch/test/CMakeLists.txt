@@ -31,8 +31,10 @@ if(BUILD_TESTING)
         share_tx_refs_kat_test    # #905: bch::new_tx_hashes accessor -- send-side flat-probe regression pin (v17/v33 nested, v34+ none) (pure)
         idle_watchdog_kat_test    # compact-relay: progress-gated block-download stall watchdog -- at-tip anti-churn + IBD stall-drop predicate (pure)
         seed_tier_kat_test        # Option-A discovery ladder: build_ladder tier-3 ordering/dedup + should_run_ladder explicit-peer-bypass gate + CandidateWalk tail-walk/wrap + EmergencyReArm backoff/re-entry/recovery (pure)
+        sharechain_bootstrap_test # contabo revival: seed_sharechain_bootstrap resolver+builder -- empty-before regression witness + explicit-pin/public-default/regtest-isolated modes + reward-safe identity-constant pins (pure)
         graph_db_shutdown_persist_test # B-STATS.944: graph_db stat-log save-on-clean-shutdown -- Saved N == Loaded N across a graceful stop (site 3/3) (pure over core web_server)
         known_txs_evict_wiring_test # B-BCH.EVICT: clean_tracker() live-pass known_txs cap-enforcement wiring gate (wired bounded / unwired grows-past-cap perturbation) (pure over core::evict_known_txs_to_cap)
+        seed_tier_recovery_gate_test # IMPLEMENTED!=PROVEN: drives live resolve_candidates() ladder recovery over a real io_context -- DNS->fixed->http-peer, each tier a SOURCE + each failure a NEGATIVE CONTROL (loopback DNS + in-proc HTTP stub + closed port; network-free)
         found_block_verify_test    # #995 BCH arm: found-block confirm/orphan verdict logic (resolve_status confirmed/orphaned/pending branches) feeding MiningInterface::set_block_verify_fn (pure over coin/block_confirm.hpp)
     )
     foreach(t IN LISTS BCH_ABLA_TESTS)
@@ -254,8 +256,13 @@ if(BUILD_TESTING)
     # add, which CTest would then report as a silently-passing NOT_BUILT sentinel.
     target_sources(bch_embedded_block_broadcast_test PRIVATE broadcast_gate_test.cpp)
 
+    # #1437 topology KAT (child-without-parent + intra-template double-spend)
+    # rides this EXISTING allowlisted target (bch tree is plain main()/CHECK,
+    # no GTest); run_template_topology_spend_checks() is invoked from the
+    # roundtrip test's main (no new executable / no #143 NOT_BUILT trap).
     add_executable(bch_g2_block_assembly_roundtrip_test
         g2_block_assembly_roundtrip_test.cpp
+        template_topology_spend_test.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
     target_include_directories(bch_g2_block_assembly_roundtrip_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(bch_g2_block_assembly_roundtrip_test PRIVATE

@@ -2218,6 +2218,19 @@ uint256 create_local_share_v35(
     const uint256& frozen_witness_root = uint256(),
     uint64_t desired_version = 36)
 {
+    // #961 B4 — ZERO-HASH160 BURN GUARD (money path). An empty payout_script
+    // reaches the extraction block below with no branch matching, leaving
+    // share.m_pubkey_hash all-zero — an UNSPENDABLE coinbase output PPLNS credits
+    // this miner's work against, BURNING the reward every block. Refuse to mint:
+    // the caller (work_source) already skips this on a foreign/undecodable
+    // address, and the core stratum door-rejects it at authorize; this is the
+    // final money-path backstop so a zero-hash160 share can never be created.
+    if (payout_script.empty()) {
+        LOG_WARNING << "[create_local_share_v35] REFUSING to mint: empty payout "
+                       "script would burn the reward to a zero-hash160 output (#961)";
+        return uint256();
+    }
+
     PaddingBugfixShare share;
     share.m_min_header = min_header;
     share.m_coinbase   = coinbase;
@@ -2653,6 +2666,17 @@ uint256 create_local_share(
     int64_t share_version = 35,
     uint64_t desired_version = 35)
 {
+    // #961 B4 — ZERO-HASH160 BURN GUARD (money path). An empty payout_script
+    // would leave share.m_pubkey_hash all-zero (the extraction block below only
+    // runs for size >= 20), minting an UNSPENDABLE coinbase output PPLNS then
+    // burns the miner's reward against. Refuse to mint — final money-path backstop
+    // behind the work_source skip and the core stratum door-reject.
+    if (payout_script.empty()) {
+        LOG_WARNING << "[create_local_share] REFUSING to mint: empty payout script "
+                       "would burn the reward to a zero-hash160 output (#961)";
+        return uint256();
+    }
+
     // V35 path: delegate to version-specific implementation
     if (share_version <= 35)
         return create_local_share_v35(

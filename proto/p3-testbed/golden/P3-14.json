@@ -1,0 +1,16 @@
+{
+  "assembled_set": [
+    "m0",
+    "m1",
+    "m2"
+  ],
+  "binding_holds": true,
+  "cb_accepted": "cdb282aa04f1c7a6",
+  "cb_assembled": "cdb282aa04f1c7a6",
+  "miners": 5,
+  "residual_owed": 10,
+  "row": "P3-14",
+  "slot_budget": 3,
+  "stamp": "34020cb147fb0d1659c2008b727cd7ae6927cc06e87aea965872a74375760918",
+  "value_conserved": true
+}

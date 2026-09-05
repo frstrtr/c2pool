@@ -1,0 +1,14 @@
+{
+  "coinbase_sha256": "0da951dcbf81b3f220f2214d0539287ebe78d4b850e30ea163870708756c5ca8",
+  "distinct_coinbases": 1,
+  "distinct_ledgers": 1,
+  "interleavings": 6,
+  "invariant_ledger": {
+    "_pot": 0,
+    "ma": 0,
+    "mb": 0,
+    "mc": 10
+  },
+  "row": "P3-12",
+  "stamp": "ae9359fd6599d6b5bf5d7798d8e7299e29f531b8d48145777d0281137bd1161a"
+}

@@ -255,6 +255,14 @@ public:
     nlohmann::json rest_pplns_current();             // /pplns/current — spec §5.1 shape
     nlohmann::json rest_pplns_miner(const std::string& address);  // /pplns/miner/<addr> — spec §5.2
     nlohmann::json compute_current_merged_payouts(); // full computation (main thread only)
+    // Cold-cache fallback: wrap the live /current_payouts seam in the merged
+    // {addr:{amount,merged:[]}} shape WITHOUT touching the main-thread-owned
+    // m_cached_merged_payouts. Lets lanes that never run the tip cache pump
+    // (e.g. bip110 — MI stratum off, no fire_share_tip_refresh) still serve
+    // populated /current_merged_payouts + /pplns/current. Returns {} when the
+    // primary seam itself is empty. Safe on any thread (no merged-child walk,
+    // no mm_manager access). See rest_current_merged_payouts.
+    nlohmann::json wrap_primary_payouts_as_merged();
     nlohmann::json rest_recent_merged_blocks();      // /recent_merged_blocks — recent merged blocks
     nlohmann::json rest_all_merged_blocks();         // /all_merged_blocks — all merged blocks
     nlohmann::json rest_discovered_merged_blocks();  // /discovered_merged_blocks — merged block proofs
@@ -647,6 +655,14 @@ public:
     // Cached share version (v35/v36) — updated by PPLNS hook from AutoRatchet
     void set_cached_share_version(int64_t v) { m_cached_share_version = v; }
     int64_t get_cached_share_version() const { return m_cached_share_version; }
+    // Native share version: the coin's genesis/minimum share version already
+    // EQUALS the target (v36) — there is no lower predecessor, so there is no
+    // crossing and no voting. Display-only flag consumed by rest_v36_status()
+    // so the dashboard reports a truthful 'native' state instead of fabricating
+    // a VOTING/V36->V36 crossing. bip110 mints v36 from genesis; DASH/LTC
+    // crossed v35->v36 and leave this false to keep the real ratchet display.
+    void set_native_share_version(bool v) { m_native_share_version = v; }
+    bool get_native_share_version() const { return m_native_share_version; }
     // Local stratum hashrate (H/s) — set via callback from WebServer
     void set_stratum_hashrate_fn(std::function<double()> fn) { m_stratum_hashrate_fn = thread_safe_wrap(std::move(fn)); }
     double get_stratum_total_hashrate() const { return m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0; }
@@ -754,6 +770,14 @@ public:
     // exposed through m_coin_node (c2pool-dash uses an external dashd NodeRPC
     // arm, not an ICoinNode). OR'd into the /api/node_topology has_rpc flag.
     void set_coin_rpc_available(bool v) { m_coin_rpc_available.store(v, std::memory_order_relaxed); }
+
+    // Display-only override for the /api/node_topology + currency_info "embedded"
+    // flag. The default source is (m_coin_node && m_coin_node->is_embedded()),
+    // but lanes that run daemonless on a NULL IMiningNode dashboard (e.g. BIP-110,
+    // whose bip110::coin::Node is NOT a core::coin::ICoinNode) have no m_coin_node
+    // yet ARE embedded. Mirrors the m_coin_rpc_available precedent: additive,
+    // consulted only when set, byte-identical on every lane that never calls it.
+    void set_embedded_display(bool v) { m_embedded_display_override = v; }
 
     // Current PPLNS outputs for payout display
     // Coin targets (c2pool-dash) that compute PPLNS outside the
@@ -1377,6 +1401,9 @@ private:
     // AutoRatchet state machine was VOTING and minting v35. The truthful floor is
     // v35 — the ratchet lifts it to 36 only after the chain actually votes.
     int64_t m_cached_share_version{35};
+    // See set_native_share_version(): true only for a coin launched at the
+    // target share version (bip110 = v36 from genesis, no crossing).
+    bool m_native_share_version{false};
     std::string m_cached_witness_commitment;
     uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;
@@ -1957,6 +1984,7 @@ private:
     std::function<std::map<std::string, WorkerInfo>()> m_stratum_workers_fn;  // external provider (coin targets)
     std::function<CoinWorkInfo()> m_coin_work_fn;                             // live template summary (coin targets)
     std::atomic<bool> m_coin_rpc_available{false};                           // external daemon RPC present
+    std::optional<bool> m_embedded_display_override;                          // display-only embedded flag (NULL-node lanes)
     std::chrono::steady_clock::time_point m_stratum_start_time{std::chrono::steady_clock::now()};
 };
 

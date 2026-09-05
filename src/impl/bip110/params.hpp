@@ -33,9 +33,39 @@
 #include "pow.hpp"
 
 #include <core/coin_params.hpp>
+#include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
 namespace bip110
 {
+
+// ─── Address-encoding SSOT (issue #961 blocker #3) ───────────────────────────
+// The ONE place BIP-110's payout version bytes / bech32 HRPs live. BIP-110 keeps
+// the Bitcoin address formats unchanged (Knots-GBT parent): mainnet PUBKEY 0 /
+// SCRIPT 5 / bech32 "bc"; testnet PUBKEY 111 / SCRIPT 196 / bech32 "tb"; regtest
+// reuses the testnet base58 bytes with bech32 "bcrt". make_coin_params() reads
+// the MAINNET entry (the Knots-GBT parent runs mainnet) and address_acceptance()
+// reads all three, so the money-path acceptance set never drifts from the coin
+// params. HRPs here are BARE.
+struct AddressEncoding { uint8_t p2pkh; uint8_t p2sh; const char* hrp_bare; };
+inline constexpr AddressEncoding MAINNET_ADDR{ 0x00, 0x05, "bc"   };
+inline constexpr AddressEncoding TESTNET_ADDR{ 0x6f, 0xc4, "tb"   };  // 111 / 196
+inline constexpr AddressEncoding REGTEST_ADDR{ 0x6f, 0xc4, "bcrt" };  // testnet bytes, "bcrt"
+
+// Registry-sourced payout-address acceptance for BIP-110 on the ACTIVE network
+// (issue #961). DERIVED from the AddressEncoding SSOT above — no re-typed
+// literals. Deriving from the true network keeps a --regtest address from being
+// rejected as Foreign.
+inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest)
+{
+    const AddressEncoding& e = regtest ? REGTEST_ADDR
+                             : testnet ? TESTNET_ADDR
+                             : MAINNET_ADDR;
+    core::CoinAddressAcceptance a;
+    a.p2pkh_versions = { e.p2pkh };
+    a.p2sh_versions  = { e.p2sh };
+    a.bech32_hrps    = { e.hrp_bare };
+    return a;
+}
 
 // --- Coin-network identity (documented for the GBT/coin-P2P backend) ---------
 // These are NOT core::CoinParams fields; they live here as the single place the
@@ -69,18 +99,29 @@ inline constexpr const char* GBT_RULE = "blake2b";
 // INDEPENDENT transport constants (p2pool model); PREFIX is never derived from
 // IDENTIFIER. This mirrors the DASH lane's single-definition discipline (one
 // place owns the identity; the factory and PoolConfig both read it).
-inline constexpr uint16_t SHARECHAIN_P2P_PORT    = 9335;  // BIP-110 sharechain P2P port
+// M3 WIRE-GENESIS bump (operator decision card 2026-09-02, IRREVERSIBLE once a
+// share is minted): the M2 SPV-follower placeholders (9335 / SPREAD 30 /
+// CHAIN_LENGTH 5760 / MIN_PROTO 3500) are replaced by the operator-signed
+// wire-genesis constants BEFORE any share exists. Port 9337 (decision #2),
+// SHARE-DIFF BTC-verbatim (decision #3: CHAIN_LENGTH 8640, SPREAD 3), v36
+// MergedMiningShare requires protocol >= 3600 (python fork data.py:2267). The
+// PREFIX / IDENTIFIER stay as already-minted-fresh (no BTC collision). Worker
+// port 9336 keeps. Nothing is live on this sharechain yet, so a pre-genesis
+// bump is safe; after the first mint these values freeze.
+inline constexpr uint16_t SHARECHAIN_P2P_PORT    = 9337;  // BIP-110 sharechain P2P port (decision #2)
 inline constexpr uint16_t SHARECHAIN_WORKER_PORT = 9336;  // BIP-110 Stratum/worker port
 inline constexpr const char* SHARECHAIN_IDENTIFIER_HEX = "b1101100b1a4e2bd";
 inline constexpr const char* SHARECHAIN_PREFIX_HEX     = "e2bdb1101100b1a4";
-// Pool-lane tuning constants (BIP-110-native; distinct from the BTC fossil's
-// SPREAD=3 / CHAIN_LENGTH=8640 / ADVERTISED=3502 / SEGWIT_ACTIVATION=33).
-inline constexpr uint32_t SHARECHAIN_SPREAD                    = 30;
-inline constexpr uint32_t SHARECHAIN_CHAIN_LENGTH             = 5760;
+// Pool-lane tuning constants. SHARE-DIFF = BTC-verbatim (decision #3): CHAIN_LENGTH
+// 8640, SPREAD 3, SHARE_PERIOD 30s, TARGET_LOOKBEHIND 200, standard MAX_TARGET
+// floor. MIN_PROTO/ADVERTISED = 3600 (v36 MergedMiningShare floor). SEGWIT
+// activation 4 (v36 >= 4 => always segwit-active on this v36-genesis chain).
+inline constexpr uint32_t SHARECHAIN_SPREAD                    = 3;       // BTC-verbatim (decision #3)
+inline constexpr uint32_t SHARECHAIN_CHAIN_LENGTH             = 8640;    // BTC-verbatim (decision #3)
 inline constexpr uint32_t SHARECHAIN_TARGET_LOOKBEHIND        = 200;
 inline constexpr uint32_t SHARECHAIN_SHARE_PERIOD            = 30;
-inline constexpr uint32_t SHARECHAIN_MINIMUM_PROTOCOL_VERSION = 3500;
-inline constexpr uint32_t SHARECHAIN_ADVERTISED_PROTOCOL_VERSION = 3501;
+inline constexpr uint32_t SHARECHAIN_MINIMUM_PROTOCOL_VERSION = 3600;   // v36 floor (data.py:2267)
+inline constexpr uint32_t SHARECHAIN_ADVERTISED_PROTOCOL_VERSION = 3600;
 inline constexpr uint32_t SHARECHAIN_SEGWIT_ACTIVATION_VERSION = 4;
 inline constexpr uint32_t SHARECHAIN_BLOCK_MAX_SIZE          = 1000000;
 inline constexpr uint64_t SHARECHAIN_DUST_THRESHOLD          = 546;  // Bitcoin relay dust floor
@@ -109,11 +150,14 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.symbol       = "BIP110";
     p.block_period = 600;  // 10-minute target interval (unchanged from Bitcoin)
 
-    // Address encoding — Bitcoin mainnet base58/bech32 (unchanged by BIP-110).
-    p.address_version       = 0;    // P2PKH version byte (mainnet "1...")
-    p.address_p2sh_version  = 5;    // P2SH version byte (mainnet "3...")
-    p.address_p2sh_version2 = 0;    // no secondary P2SH prefix
-    p.bech32_hrp            = "bc"; // bech32 HRP
+    // Address encoding — Bitcoin mainnet base58/bech32 (unchanged by BIP-110),
+    // from the AddressEncoding SSOT (issue #961 blocker #3). The Knots-GBT parent
+    // runs mainnet, so make_coin_params encodes the MAINNET entry; address_
+    // acceptance() reads the testnet/regtest entries for --regtest/--testnet.
+    p.address_version       = MAINNET_ADDR.p2pkh;   // 0x00 (mainnet "1...")
+    p.address_p2sh_version  = MAINNET_ADDR.p2sh;    // 0x05 (mainnet "3...")
+    p.address_p2sh_version2 = 0;                    // no secondary P2SH prefix
+    p.bech32_hrp            = MAINNET_ADDR.hrp_bare; // "bc"
 
     // PoW: BLAKE2b commitment pipeline as BOTH the work and the block identity
     // (the block hash == PoW hash shape, like DASH's X11). Span-typed, so the

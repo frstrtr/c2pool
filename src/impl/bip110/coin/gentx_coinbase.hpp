@@ -46,8 +46,16 @@ struct GentxCoinbase
     // BIP144 (segwit) serialization used for the BLOCK BODY when a witness
     // commitment output is present:
     //   version | 0x00 0x01 (marker+flag) | vin | vout |
-    //   witness_for_input0{ 0x01 (stack items) | 0x20 (len 32) | 32*0x00 reserved }
+    //   witness_for_input0{ 0x01 (stack items) | 0x20 (len 32) | reserved(32) }
     //   | locktime
+    // The 32-byte reserved value is the caller-supplied witness_reserved_value
+    // (defaults to 32 zeros). Segwit consensus recomputes the coinbase witness
+    // commitment as SHA256d(witness_merkle_root || reserved) and checks it against
+    // the aa21a9ed commitment output — so the reserved value spliced here MUST be
+    // the SAME 32 bytes the commitment output was computed over, or the won block
+    // is rejected with bad-witness-merkle-match. OFF/M2 (commitment over reserved
+    // 0*32) => empty arg => 32 zeros. Flag-ON P2Pool (commitment over '[P2Pool]'*4)
+    // => caller passes those 32 bytes.
     // Knots/Core CheckWitnessMalleation REQUIRES exactly one 32-byte witness
     // element on the coinbase input whenever a commitment output exists;
     // shipping `bytes` (empty witness stack) => bad-witness-nonce-size => the
@@ -65,7 +73,11 @@ inline GentxCoinbase assemble_gentx_coinbase(
     const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payout_outputs,
     uint64_t donation_amount,
     const std::vector<unsigned char>& donation_script,
-    const std::vector<unsigned char>& op_return_script)
+    const std::vector<unsigned char>& op_return_script,
+    // Block-body witness reserved value (coinbase input witness stack item). Empty
+    // => 32 zeros (OFF/M2, byte-identical to before). On the flag-ON P2Pool path
+    // the caller passes '[P2Pool]'*4 to match the P2Pool witness commitment.
+    const std::vector<unsigned char>& witness_reserved_value = {})
 {
     PackStream tx;
 
@@ -146,9 +158,12 @@ inline GentxCoinbase assemble_gentx_coinbase(
     // bad-witness-nonce-size. Splice the marker+flag after the 4-byte version and
     // the witness+locktime around the non-witness body:
     //   version(4) | 0x00 0x01 | vin | vout | witness | locktime(4)
-    // The reserved value is 32 zero bytes — the SAME preimage the commitment math
-    // above consumed (SHA256d(witness_merkle_root(0) || reserved(0*32))). No
-    // commitment output => no witness => block_bytes == bytes (byte-unchanged).
+    // The reserved value is witness_reserved_value (or 32 zeros when empty) — it
+    // MUST be the SAME preimage the commitment output consumed
+    // (SHA256d(witness_merkle_root || reserved)). OFF/M2: reserved 0*32 matches the
+    // M2 commitment over reserved 0*32. Flag-ON: reserved '[P2Pool]'*4 matches the
+    // P2Pool commitment over the real witness root. No commitment output => no
+    // witness => block_bytes == bytes (byte-unchanged).
     if (segwit_commitment_script.has_value() && out.bytes.size() >= 8)
     {
         const size_t n = out.bytes.size();
@@ -161,10 +176,14 @@ inline GentxCoinbase assemble_gentx_coinbase(
         b.push_back(0x01);
         // vin || vout  (everything between version and locktime)
         b.insert(b.end(), out.bytes.begin() + 4, out.bytes.begin() + (n - 4));
-        // witness for input[0]: 1 stack item, 32-byte reserved value (all zero)
+        // witness for input[0]: 1 stack item, 32-byte reserved value.
         b.push_back(0x01);                 // stack item count
         b.push_back(0x20);                 // element length = 32
-        b.insert(b.end(), 32, 0x00);       // reserved value
+        if (witness_reserved_value.size() == 32)
+            b.insert(b.end(), witness_reserved_value.begin(),
+                     witness_reserved_value.end());   // flag-ON: '[P2Pool]'*4
+        else
+            b.insert(b.end(), 32, 0x00);   // OFF/M2: 32-zero reserved value
         // locktime (4)
         b.insert(b.end(), out.bytes.begin() + (n - 4), out.bytes.end());
     }

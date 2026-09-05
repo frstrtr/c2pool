@@ -62,6 +62,8 @@
 #include "coin/embedded_daemon.hpp"
 #include "stratum/work_source.hpp"
 #include "config_pool.hpp"      // bch::PoolConfig::get_donation_script
+#include "config_coin.hpp"      // bch::address_acceptance (#961 cross-lane payout publish)
+#include "coin/cashaddr.hpp"    // bch::coin::cashaddr::register_cashaddr_decoder (#961 CashAddr payout)
 #include "share_check.hpp"      // bch::create_local_share (transitive via node.hpp)
 #include "share_types.hpp"      // bch::StaleInfo
 #include "coin/block.hpp"       // bch::coin::SmallBlockHeaderType
@@ -119,7 +121,8 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                              bool is_testnet = false,
                              bool is_regtest = false,
                              const std::string& http_addr = "0.0.0.0",
-                             uint16_t http_port = 0)
+                             uint16_t http_port = 0,
+                             size_t explicit_sharechain_peers = 0)
 {
     // 1+2: embedded daemon up first -- it owns the work source + RPC fallback
     // the pool node consumes, and is the broadcast sink the node wires into.
@@ -144,6 +147,28 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
              << " submitblock fallback). Structural broadcaster-gate criterion-C"
              << " satisfied; live VM300 e2e is the behavioural half.";
 
+    // 5b: SHARECHAIN LISTENER + OUTBOUND DIAL (contabo BCH revival FIX).
+    // Until now this entrypoint stood up NO sharechain listener and NEVER called
+    // start_outbound_connections(), so the node had 0 sharechain peers forever
+    // (no :9349 LISTEN, addrs never dialed). Bind the pool P2P listener on
+    // P2P_PORT (9349) and start the outbound dial loop that consumes the addr
+    // store seeded from m_bootstrap_addrs (run_pool). node inherits
+    // core::Server via BaseNode : core::Factory<core::Server, core::Client>
+    // (src/pool/node.hpp), so node.core::Server::listen(...) resolves exactly as
+    // in main_dgb.cpp:678 / main_btc.cpp:1638. When explicit --sharechain-addnode
+    // peers were pinned, raise the outbound target to at least that count so all
+    // pins are dialed (default m_target_outbound_peers = 8 otherwise).
+    if (explicit_sharechain_peers)
+        node.set_target_outbound_peers(std::max<size_t>(1, explicit_sharechain_peers));
+    node.core::Server::listen(PoolConfig::P2P_PORT);
+    LOG_INFO << "[BCH-POOL] sharechain listening :" << PoolConfig::P2P_PORT
+             << " proto adv=" << PoolConfig::ADVERTISED_PROTOCOL_VERSION
+             << " min=" << PoolConfig::MINIMUM_PROTOCOL_VERSION
+             << " prefix=" << PoolConfig::prefix_hex();
+    node.start_outbound_connections();
+    LOG_INFO << "[BCH-POOL] outbound sharechain dialing started ("
+             << config.pool()->m_bootstrap_addrs.size() << " bootstrap addr(s))";
+
     // 6: miner-facing IWorkSource + Stratum front-end. BCHWorkSource generates
     // work off the embedded daemon's HeaderChain + Mempool (SHA256d, no-segwit,
     // CashTokens transparent-carry), and routes a mainnet-hit block through the
@@ -164,6 +189,28 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 daemon.broadcast_won_block(block_bytes, HexStr(block_bytes));
             return r.any();
         });
+
+    work_source->set_regtest(is_regtest);  // #961: --regtest legacy-address set
+
+    // #961 cross-lane (B4): register BCH's native CashAddr decoder into the
+    // generic core address hook so core::address_to_script() (and therefore the
+    // decide_payout_address() SSOT the core stratum door-reject consults) resolves
+    // a miner's CashAddr username to a real scriptPubKey. Without it a CashAddr
+    // payout decoded to EMPTY -> a zero-hash160 (unspendable) coinbase PPLNS burns.
+    // Idempotent (once per process).
+    coin::cashaddr::register_cashaddr_decoder(is_testnet, is_regtest);
+    // Publish BCH's REGISTRY-SOURCED own-coin payout-address acceptance (legacy
+    // base58; CashAddr is the registered native decoder above) into the
+    // StratumConfig the core StratumServer reads, so the SAME decide_payout_
+    // address() door-reject (mining.authorize) + no-empty-payout guard LTC runs
+    // also apply on the BCH lane — a foreign-unconfigured payout is rejected at
+    // the door instead of building the zero-hash160 burn. Own-coin (base58 +
+    // CashAddr) stay accepted byte-identically.
+    {
+        const auto acc = bch::address_acceptance(is_testnet, is_regtest);
+        work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
+                                           acc.bech32_hrps);
+    }
 
     // ── Sharechain WRITE path: local-share author wiring ─────────────────
     // Without these callbacks BCHWorkSource accepts miner submissions that
@@ -690,10 +737,11 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         mi->set_io_context(&ioc);
         web_server->set_stratum_port(stratum_port);
         // Advertise the REAL stratum bind as worker_port (was the LTC-template
-        // default 9327). This entrypoint stands up NO sharechain listener, so
-        // p2p_port is intentionally left 0 (truthful "no listener") rather than
-        // a template constant.
+        // default 9327). The sharechain listener IS now stood up (step 5b above,
+        // core::Server::listen(P2P_PORT)), so advertise the real 9349 p2p_port
+        // rather than a truthful-0 or a template constant.
         mi->set_worker_port(stratum_port);
+        mi->set_p2p_port(PoolConfig::P2P_PORT);
 
         // Cross-coin dashboard parity: serve the shared refined web-static
         // dashboard over --http (bch.voidbind, same UI as LTC/DASH). This lane

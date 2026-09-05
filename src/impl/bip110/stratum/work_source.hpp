@@ -39,6 +39,34 @@ namespace bip110::coin { class HeaderChain; class Mempool; }
 
 namespace bip110::stratum {
 
+// Extract the coinbase scriptSig from a serialized (non-witness) coinbase tx.
+// The share's m_coinbase field is the coinbase *scriptSig* (share_init_verify
+// bounds it to 2..100 bytes), NOT the whole coinbase transaction — so the M3
+// mint path (main_bip110.cpp create_share_fn) slices it here before calling
+// bip110::pool::create_local_share. Per-coin copy of the btc/dgb helper
+// (btc/stratum/work_source.hpp:75) per the coin-isolation invariant; fail-closed
+// (returns {} on any truncation/overrun -> the mint declines on size<2).
+inline std::vector<unsigned char>
+extract_coinbase_scriptsig(const std::vector<unsigned char>& coinbase_tx) {
+    constexpr size_t kScriptOffset = 4 + 1 + 32 + 4;  // version|marker?|prevout(null)|index = 41
+    if (coinbase_tx.size() < kScriptOffset + 1)
+        return {};
+    size_t off = kScriptOffset;
+    uint64_t len = coinbase_tx[off++];
+    if (len == 0xfd) {
+        if (off + 2 > coinbase_tx.size()) return {};
+        len = static_cast<uint64_t>(coinbase_tx[off])
+            | (static_cast<uint64_t>(coinbase_tx[off + 1]) << 8);
+        off += 2;
+    } else if (len >= 0xfe) {
+        return {};  // implausible for a consensus-capped (<=100B) coinbase scriptSig
+    }
+    if (off + len > coinbase_tx.size())
+        return {};
+    return std::vector<unsigned char>(coinbase_tx.begin() + off,
+                                      coinbase_tx.begin() + off + len);
+}
+
 class Bip110WorkSource : public core::stratum::IWorkSource
 {
 public:
@@ -51,10 +79,52 @@ public:
     // Sharechain WRITE seam (M3). Called when a share meets sharechain (not
     // block) target. Left unset in M2 => shares are validated + counted but not
     // minted into a p2pool sharechain. Returns the share hash or uint256::ZERO.
+    // PR-B (M3): the 4th arg is the miner payout_script derived in mining_submit
+    // from the authorized username (core::address_to_script, donation fallback).
+    // create_local_share REQUIRES it to build the share's PPLNS payout identity;
+    // BTC's CreateShareFn is likewise 4-arg (main_btc.cpp:2219). Left unset in
+    // M2 (default OFF) => shares are validated + counted but not minted.
     using CreateShareFn = std::function<uint256(
         const std::vector<unsigned char>& full_coinbase,
         const std::vector<unsigned char>& header_164b,
-        const core::stratum::JobSnapshot&  job)>;
+        const core::stratum::JobSnapshot&  job,
+        const std::vector<unsigned char>& payout_script)>;
+
+    // Sharechain REF-COMMITMENT producer (M3 PR-C, flag-ON only). Given the job's
+    // prev_share_hash (the sharechain tip fed by best_share_hash_fn_), the coinbase
+    // scriptSig, the miner payout script, the block subsidy/bits/timestamp, returns
+    // the p2pool ref_hash + the frozen share fields (absheight/abswork/far/bits/
+    // max_bits/timestamp/merged_payout) that create_local_share must reproduce so
+    // the OP_RETURN commitment the coinbase carries == the ref_hash a peer recomputes
+    // off the minted share (mint==verify). main_bip110.cpp wires this to a lambda
+    // that walks the share tracker (near-verbatim port of main_btc.cpp's ref_hash_fn,
+    // minus merged-mining — bip110 v36 is single-chain, segwit sentinel constant).
+    // Left UNSET in M2 (default OFF) => build_connection_coinbase emits the empty
+    // {0x6a,0x00} M2 OP_RETURN and populates no frozen_ref (byte-identical to today).
+    // Coinbase-only: no txid_merkle_branches / witness_root / merged blob args (the
+    // segwit_data is the SegwitDataDefault none-sentinel, folded in by the lambda).
+    using RefHashFn = std::function<core::stratum::RefHashResult(
+        const uint256& prev_share_hash,
+        const std::vector<unsigned char>& coinbase_scriptSig,
+        const std::vector<unsigned char>& payout_script,
+        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)>;
+
+    // Sharechain PPLNS-payout producer (M3 PR-C F1b, flag-ON only). Given the job's
+    // prev_share_hash (the sharechain tip) + the BLOCK subsidy + the canonical
+    // donation script, returns the {scriptPubKey -> amount} map for the ENTIRE
+    // decayed PPLNS window — EXACTLY what the verify SSOT generate_share_transaction
+    // (share_check.hpp) reconstructs off the minted share (get_expected_payouts,
+    // share_tracker.hpp). main_bip110 wires this to a lambda that, under
+    // read_tracker(), calls ShareTracker::get_expected_payouts. build_connection_
+    // coinbase consumes the map on the flag-ON path: extracts the donation entry,
+    // sorts the miner outputs asc(amount, script), applies the 4000-output cap, and
+    // emits them (donation output second-to-last, OP_RETURN ref last) so the minted
+    // coinbase == generate_share_transaction byte-for-byte (peers ACCEPT the share).
+    // Left UNSET in M2 (default OFF) => build_connection_coinbase keeps the single-
+    // miner split (byte-identical to today). Mirrors main_btc.cpp set_pplns_fn.
+    using PplnsFn = std::function<std::map<std::vector<unsigned char>, double>(
+        const uint256& prev_share_hash, const uint256& block_target,
+        uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
 
     Bip110WorkSource(bip110::coin::HeaderChain& chain,
                      bool is_testnet,
@@ -71,6 +141,20 @@ public:
     std::string                         get_current_gbt_prevhash() const override;
     uint64_t                            get_work_generation() const override { return work_generation_.load(); }
     bool                                has_merged_chain(uint32_t) const override { return false; }
+
+    /// #961 cross-lane (B4): publish BIP-110's OWN payout-address acceptance into
+    /// the StratumConfig the core StratumServer reads, so the SAME decide_payout_
+    /// address() door-reject + no-empty-payout guard LTC runs apply on this lane —
+    /// a foreign-unconfigured payout is rejected at the door instead of redirected.
+    /// Own-coin addresses stay accepted, byte-identical. Set once at startup,
+    /// before the server reads config_.
+    void set_payout_acceptance(std::vector<uint8_t> p2pkh_versions,
+                               std::vector<uint8_t> p2sh_versions,
+                               std::vector<std::string> bech32_hrps) {
+        config_.payout_p2pkh_versions = std::move(p2pkh_versions);
+        config_.payout_p2sh_versions  = std::move(p2sh_versions);
+        config_.payout_bech32_hrps    = std::move(bech32_hrps);
+    }
 
     // ── IWorkSource: per-connection bookkeeping ──────────────────────────
     void register_stratum_worker(const std::string& id, const core::stratum::WorkerInfo& info) override;
@@ -113,6 +197,11 @@ public:
     void set_share_target(uint32_t bits, uint32_t max_bits)
     { share_bits_.store(bits); share_max_bits_.store(max_bits); }
     void set_donation_script(std::vector<unsigned char> s) { donation_script_ = std::move(s); }
+    /// #961: mark this node as running on the BIP-110 regtest network so the
+    /// payout money-path validates a miner's address against the REGTEST set
+    /// (testnet base58 bytes + "bcrt" HRP) instead of mainnet. Address-validation
+    /// scope only; called from main under --regtest.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
     // Node-owner fee destination. When empty the node-owner fee (if any) is paid
     // to the donation script (single-key consolidation, our 13zQ/bc1qyr94… key).
     void set_node_owner_script(std::vector<unsigned char> s) { node_owner_script_ = std::move(s); }
@@ -124,6 +213,20 @@ public:
     // Default 0 => no node-owner output. Integer floor split.
     void set_node_owner_fee_ppm(uint64_t ppm) { node_owner_fee_ppm_ = ppm; }
     void set_create_share_fn(CreateShareFn fn) { create_share_fn_ = std::move(fn); }
+
+    // M3 PR-C sharechain wiring (flag-ON only). set from main_bip110 INSIDE the
+    // --bip110-sharechain block. When unset (M2 default OFF) the OP_RETURN stays
+    // the empty {0x6a,0x00} commitment and no frozen_ref is populated — byte-
+    // identical to M2. best_share_hash_fn_ feeds the sharechain tip into the job's
+    // prev_share_hash (via get_best_share_hash_fn -> the generic stratum_server
+    // seam); ref_hash_fn_ produces the coinbase ref commitment + frozen fields.
+    void set_best_share_hash_fn(std::function<uint256()> fn) { best_share_hash_fn_ = std::move(fn); }
+    void set_ref_hash_fn(RefHashFn fn) { ref_hash_fn_ = std::move(fn); }
+    // M3 PR-C F1b: the PPLNS-distributed coinbase producer (flag-ON only). Set from
+    // main_bip110 INSIDE the --bip110-sharechain block alongside set_ref_hash_fn.
+    // When unset (M2 default OFF) build_connection_coinbase keeps the single-miner
+    // split — byte-identical to M2.
+    void set_pplns_fn(PplnsFn fn) { pplns_fn_ = std::move(fn); }
 
     // ── M3 daemonless mempool tx-serving ─────────────────────────────────
     // Wire the embedded mempool (P2P-ingested, daemonlessly priced) so templates
@@ -168,18 +271,26 @@ private:
 
     bip110::coin::HeaderChain&   chain_;
     const bool                   is_testnet_;
+    bool                         is_regtest_ = false;  // #961: --regtest address set
     SubmitBlockFn                submit_block_fn_;
     core::stratum::StratumConfig config_;
 
     std::atomic<uint64_t>        work_generation_{1};
-    std::atomic<uint32_t>        share_bits_{0};
-    std::atomic<uint32_t>        share_max_bits_{0};
+    // mutable: build_connection_coinbase() is const but freezes the ref's share
+    // target into these on the flag-ON path (mirrors btc work_source.hpp:355-356).
+    mutable std::atomic<uint32_t> share_bits_{0};
+    mutable std::atomic<uint32_t> share_max_bits_{0};
 
     std::vector<unsigned char>   donation_script_;     // author/dev donation destination
     std::vector<unsigned char>   node_owner_script_;   // node-owner fee destination (empty => == donation)
     uint64_t                     give_author_ppm_{0};  // author donation, ppm of coinbasevalue (0.1% = 1000)
     uint64_t                     node_owner_fee_ppm_{0};// node-owner fee, ppm of coinbasevalue (1% = 10000)
     CreateShareFn                create_share_fn_;
+
+    // M3 PR-C sharechain ref-commitment (flag-ON only; unset in M2). See setters.
+    std::function<uint256()>     best_share_hash_fn_;   // sharechain tip -> job.prev_share_hash
+    RefHashFn                    ref_hash_fn_;          // coinbase ref_hash + frozen fields
+    PplnsFn                      pplns_fn_;             // F1b: PPLNS-distributed coinbase payouts (flag-ON only)
 
     // M3 mempool tx-serving. Read-only pointer; owned by main_bip110.
     bip110::coin::Mempool*       mempool_{nullptr};

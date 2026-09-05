@@ -409,6 +409,19 @@ core::stratum::JobSnapshot make_submit_job(uint32_t share_bits,
     return j;
 }
 
+// The rig runs mainnet (is_testnet=false). #961 B4 refuses to build a share for
+// any username that does not decode to a BCH payout script on the ACTIVE
+// network, so the share-write assertions below must submit a genuine
+// mainnet-door-accepted BCH address. This is a mainnet BCH legacy base58 P2PKH
+// (version byte 0x00) — classify_address_for_coin() Matches it against BCH's own
+// version bytes and yields a non-empty payout_script, exactly as a live door
+// (mining.authorize) would have admitted before mining_submit is ever reached.
+// (Its earlier value "bchtest.worker1" was a TESTNET cashaddr prefix, undecodable
+// on mainnet — that is precisely the accept-and-burn B4 now refuses, which is
+// what the new test_won_block_undecodable_username_refuses_share pins.)
+constexpr const char* kBchMainnetPayoutAddr =
+    "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+
 void test_won_block_also_writes_share()
 {
     WorkSourceRig rig;
@@ -432,7 +445,7 @@ void test_won_block_also_writes_share()
 
     auto job = make_submit_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
     auto result = ws->mining_submit(
-        "bchtest.worker1", "job-won-share", "00000000", "00000000",
+        kBchMainnetPayoutAddr, "job-won-share", "00000000", "00000000",
         "60000000", "00000000", "rid", /*merged_addresses=*/{}, &job);
 
     CHECK(result.is_boolean() && result.get<bool>());
@@ -456,7 +469,7 @@ void test_won_block_survives_throwing_share_write()
 
     auto job = make_submit_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
     auto result = ws->mining_submit(
-        "bchtest.worker1", "job-won-throw", "00000000", "00000000",
+        kBchMainnetPayoutAddr, "job-won-throw", "00000000", "00000000",
         "60000000", "00000000", "rid", /*merged_addresses=*/{}, &job);
 
     CHECK(rig.submit_called);                     // block reached the sink
@@ -480,7 +493,7 @@ void test_plain_share_still_writes_and_does_not_broadcast()
     // block target 1 -> no digest is a block; share target maximal -> accepted.
     auto job = make_submit_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"03000001");
     auto result = ws->mining_submit(
-        "bchtest.worker1", "job-share", "00000000", "00000000",
+        kBchMainnetPayoutAddr, "job-share", "00000000", "00000000",
         "60000000", "00000000", "rid", /*merged_addresses=*/{}, &job);
 
     CHECK(result.is_boolean() && result.get<bool>());
@@ -488,7 +501,43 @@ void test_plain_share_still_writes_and_does_not_broadcast()
     CHECK(!rig.submit_called);
 }
 
+// #961 B4 lock -- a WON BLOCK whose username does NOT decode to a BCH payout
+// script on the active network is still dispatched (the subsidy is never held
+// hostage to a bad payout string), but NO share is written: building it anyway
+// would default the finder pubkey_hash to all-zero -- an unspendable coinbase
+// output that PPLNS then credits every block against, burning the reward. The
+// block/share seams are independent, and the burn guard sits ONLY on the share
+// arm. Uses a testnet cashaddr prefix (undecodable on this mainnet rig) as the
+// undecodable username -- the exact accept-and-burn input B4 now refuses.
+void test_won_block_undecodable_username_refuses_share()
+{
+    WorkSourceRig rig;
+    auto ws = rig.make();
+
+    bool share_written = false;
+    ws->set_create_share_fn(
+        [&](const std::vector<unsigned char>&,
+            const std::vector<uint8_t>&,
+            const core::stratum::JobSnapshot&,
+            const std::vector<unsigned char>&) -> uint256 {
+            share_written = true;                 // MUST NOT be reached
+            return uint256(uint64_t(0xdeadbeef));
+        });
+
+    auto job = make_submit_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    auto result = ws->mining_submit(
+        "bchtest.worker1", "job-won-nopayout", "00000000", "00000000",
+        "60000000", "00000000", "rid", /*merged_addresses=*/{}, &job);
+
+    CHECK(result.is_boolean() && result.get<bool>());  // block still accepted
+    CHECK(rig.submit_called);                          // ...and dispatched
+    CHECK(!share_written);                             // but NO zero-hash160 share
+}
+
 } // namespace
+
+// #1437 topology KAT, defined in template_topology_spend_test.cpp (same target).
+int run_template_topology_spend_checks();
 
 int main()
 {
@@ -500,6 +549,10 @@ int main()
     test_won_block_also_writes_share();
     test_won_block_survives_throwing_share_write();
     test_plain_share_still_writes_and_does_not_broadcast();
+    test_won_block_undecodable_username_refuses_share();
+
+    // #1437: mempool tx-selection topology + intra-template double-spend guard.
+    failures += run_template_topology_spend_checks();
 
     if (failures) {
         std::cerr << failures << " CHECK(s) failed\n";

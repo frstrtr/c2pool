@@ -20,6 +20,11 @@ jobs:
   param-catalog-tripwire:
     uses: ./.github/workflows/param-catalog-tripwire.yml
     secrets: inherit
+  # proto/ Python harness corpus: exit + stamp + golden-drift gates. Cheap
+  # (seconds, stdlib-only) so it runs on every PR to master, unconditionally.
+  proto-harness:
+    uses: ./.github/workflows/proto-harness.yml
+    secrets: inherit
   coin-matrix:
     uses: ./.github/workflows/coin-matrix.yml
     secrets: inherit
@@ -44,7 +49,7 @@ jobs:
 
   aggregate:
     name: aggregate
-    needs: [param-catalog-tripwire, coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b, btc-daemonless-smoke]
+    needs: [param-catalog-tripwire, proto-harness, coin-matrix, dash-g1, dash-g3a, dgb-phase-b, bch-g3a, bch-g3b, btc-daemonless-smoke]
     if: always()
     runs-on: ubuntu-24.04
     steps:

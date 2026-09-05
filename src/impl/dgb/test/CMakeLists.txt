@@ -7,7 +7,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # F1 retention + F2/F3 broadcast-gate KATs are actually compiled and run;
     # a fresh target would need a build.yml entry and would otherwise report
     # the silently-passing NOT_BUILT sentinel.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp)
+    # sharechain_bootstrap_test: contabo revival KAT for seed_sharechain_bootstrap
+    # (resolver+builder) -- empty-before regression witness + explicit-pin/
+    # public-default/regtest-isolated modes + reward-safe identity constants.
+    # Pure over config_pool.hpp; folded here (not a fresh target) to ride the
+    # allowlist and dodge the NOT_BUILT sentinel.
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
@@ -369,7 +374,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the tx serialization codec, so it links the same proven SCC set as
     # dgb_embedded_coin_node_test. MUST also be in BOTH build.yml --target
     # allowlists (#143 NOT_BUILT trap).
-    add_executable(dgb_embedded_tx_select_test embedded_tx_select_test.cpp)
+    # #1437 topology KAT (child-without-parent + intra-template double-spend)
+    # folds into this EXISTING allowlisted target; gtest_add_tests AUTO discovers
+    # its TEST() cases (no new executable / no #143 NOT_BUILT trap).
+    add_executable(dgb_embedded_tx_select_test embedded_tx_select_test.cpp template_topology_spend_test.cpp)
     target_link_libraries(dgb_embedded_tx_select_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb dgb_stratum
@@ -410,7 +418,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(dgb_coinbase_value_parity_test "" AUTO)
 
 
-    foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test)
+    # multishield_v4_kat_test (#179): DigiByte-Core MultiShield V4 next-target
+    # byte-parity KAT over 150 real mainnet headers -- proves the daemonless work
+    # source stamps a REAL nBits (via header_chain.hpp next_scrypt_bits) instead of
+    # the fabricated diff-1 0x1d00ffff that made every won block INVALID. Pure
+    # header math (header_chain.hpp / dgb_multishield.hpp / dgb_arith256.hpp are
+    # std-only), so it links GTest-only like the other guards. MUST also appear in
+    # BOTH build.yml --target allowlists (#143 NOT_BUILT trap).
+    foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test multishield_v4_kat_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
         target_link_libraries(${dgb_guard} PRIVATE
             GTest::gtest_main GTest::gtest nlohmann_json::nlohmann_json)

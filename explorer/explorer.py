@@ -66,6 +66,12 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from html import escape
 
+# Reverse-proxy sub-path mount (set from --url-prefix in main()). Empty string
+# = served at root, and every generated page is byte-identical to before this
+# option existed. When set (e.g. "/explorer") it is prepended to generated
+# links and stripped from incoming request paths in ExplorerHandler.
+URL_PREFIX = ""
+
 # ============================================================================
 # COIN PROFILES — data-driven per-coin configuration.
 #
@@ -203,13 +209,36 @@ COIN_PROFILES = {
         "coinbase": "generic",
         "completeness": "basic",  # TODO: cashaddr encoding
     },
+    "bip110": {
+        "name": "Bitcoin BIP-110", "unit": "BIP110", "algo": "BLAKE2b",
+        "networks": {
+            # BIP-110 is a Bitcoin fork; addresses stay Bitcoin-shaped.
+            "mainnet": {"p2pkh": 0x00, "p2sh": 0x05, "hrp": "bc"},
+            "testnet": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": "tb"},
+            "regtest": {"p2pkh": 0x6f, "p2sh": 0xc4, "hrp": "bcrt"},
+        },
+        # No public BIP-110 explorer exists (blockchair / mempool.space do not
+        # index the BLAKE2b fork); c2pool is the de-facto explorer.
+        "blockchair": {"mainnet": None, "testnet": None},
+        "subversion": ["bip110"],   # node subver "/c2pool:0.1/bip110/frstrtr/"
+        "symbols": ["bip110"],      # /web/currency_info symbol "BIP110" (lowercased)
+        "genesis": {
+            # BIP-110 keeps Bitcoin's genesis (the BLAKE2b fork activates at
+            # height 961640).  The dict-order genesis auto-detect resolves this
+            # hash to "btc" first (btc precedes bip110), so a bip110 node is
+            # identified via subversion / symbols / --coin, never genesis alone.
+            "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        },
+        "coinbase": "generic",
+        "completeness": "full",
+    },
 }
 
 # Aliases accepted on the --coin CLI flag.
 COIN_ALIASES = {
     "litecoin": "ltc", "dogecoin": "doge", "bitcoin": "btc",
     "digibyte": "dgb", "bitcoincash": "bch", "bitcoin-cash": "bch",
-    "bcash": "bch",
+    "bcash": "bch", "bip-110": "bip110", "blake2b": "bip110",
 }
 
 
@@ -454,7 +483,11 @@ class C2PoolClient:
         if method == "getblockchaininfo":
             return self._get(f"/getblockchaininfo?chain={self.chain}", timeout)
         elif method == "getblockhash":
-            return self._get(f"/getblockhash?height={args[0]}&chain={self.chain}", timeout)["result"]
+            r = self._get(f"/getblockhash?height={args[0]}&chain={self.chain}", timeout)
+            # Two live node answer shapes: the explorer-callback path wraps the
+            # hash as {"result": hash} (LTC), the coin-owned chain-query path
+            # returns the bare hash string (DASH's daemonless header chain).
+            return r if isinstance(r, str) else r["result"]
         elif method == "getblock":
             return self._get(f"/getblock?hash={args[0]}&chain={self.chain}", timeout)
         elif method == "getmempoolinfo":
@@ -567,6 +600,11 @@ def decode_scriptsig(raw_hex):
     # so the tag search area may be empty — structural detection handles that.
     tag_search = remaining[auxpow_end:]
     known_tags = [
+        # Coin-specific c2pool tags first so the exact tag is decoded (the search
+        # breaks on first match). /c2pool-bip110/ is the BLAKE2b fork work-source
+        # tag; /c2pool-btc/ the BTC lane. Both still contain "c2pool", so the
+        # found-block highlight fires either way — this only sharpens the label.
+        b"/c2pool-bip110/", b"/c2pool-btc/",
         b"/c2pool/",
         b"/P2Pool v36/", b"/P2Pool-Scrypt/", b"/P2Pool/", b"/p2pool/",
         b"c2pool", b"p2pool",
@@ -2010,13 +2048,28 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
-        return parsed.path, {k: v[0] for k, v in params.items()}
+        path = parsed.path
+        # Strip the reverse-proxy mount prefix so the exact-match routing below
+        # is unchanged whether or not the proxy forwards the sub-path.
+        if URL_PREFIX and path.startswith(URL_PREFIX):
+            path = path[len(URL_PREFIX):] or "/"
+        return path, {k: v[0] for k, v in params.items()}
 
     def _respond(self, code, content, content_type="text/html"):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+        # Reverse-proxy mount: rewrite the site-absolute links in generated HTML
+        # so navigation stays inside the sub-path. Only HTML pages carry links;
+        # JSON/SSE responses are untouched. No-op (byte-identical) when unset.
+        if URL_PREFIX and content_type.startswith("text/html"):
+            if isinstance(content, bytes):
+                content = content.decode()
+            content = (content
+                       .replace('href="/', f'href="{URL_PREFIX}/')
+                       .replace('action="/', f'action="{URL_PREFIX}/')
+                       .replace('EventSource("/', f'EventSource("{URL_PREFIX}/'))
         if isinstance(content, str):
             content = content.encode()
         self.wfile.write(content)
@@ -2204,7 +2257,21 @@ def main():
     parser.add_argument("--doge-c2pool", default=None, help="[legacy] c2pool explorer API URL for DOGE")
 
     parser.add_argument("--web-port", type=int, default=8888, help="Explorer web port")
+    parser.add_argument("--url-prefix", default="",
+                        help="Serve under a sub-path (e.g. /explorer) behind a reverse "
+                             "proxy. Prepended to every generated link and stripped from "
+                             "incoming request paths. Default \"\" = root (byte-identical).")
     args = parser.parse_args()
+
+    # URL sub-path support (reverse-proxy mount). Normalised to leading-slash,
+    # no trailing slash; empty string leaves every generated page byte-identical.
+    global URL_PREFIX
+    up = (args.url_prefix or "").strip()
+    if up:
+        if not up.startswith("/"):
+            up = "/" + up
+        up = up.rstrip("/")
+    URL_PREFIX = up
 
     coins = OrderedDict()
     primary = None

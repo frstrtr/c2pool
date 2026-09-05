@@ -65,20 +65,13 @@ namespace c2pool::dgb {
 // multiply runs through u256::mul_u64(256), which truncates at 256 bits exactly
 // as arith_uint256 does, so a pathological huge exponent saturates rather than
 // wrapping into a small value.
+// Thin alias preserving the c2pool::dgb::compact_to_target call sites; the SSOT
+// body now lives in dgb_arith256.hpp (dgb::coin::compact_to_target), std-only so
+// the MultiShield V4 walk (dgb_multishield.hpp) reuses the SAME expansion in the
+// standalone GTest guard without this btclibs-bearing TU.
 inline u256 compact_to_target(uint32_t bits)
 {
-    const uint32_t mantissa = bits & 0x007fffffu;
-    const uint32_t exponent = bits >> 24;
-
-    u256 target = u256::from_u64(mantissa);
-    if (exponent <= 3) {
-        for (uint32_t i = 0, n = 3 - exponent; i < n; ++i)
-            target = target.div_u64(256);
-    } else {
-        for (uint32_t i = 0, n = exponent - 3; i < n; ++i)
-            target = target.mul_u64(256);
-    }
-    return target;
+    return ::dgb::coin::compact_to_target(bits);
 }
 
 // Build the ingestable HeaderSample from a parsed block header. Pure function
@@ -91,6 +84,11 @@ inline HeaderSample make_header_sample(const ::dgb::coin::BlockHeaderType& h)
     s.n_version = static_cast<int32_t>(h.m_version);
     s.n_time    = static_cast<int64_t>(h.m_timestamp);
     s.target    = compact_to_target(h.m_bits);
+    // Raw compact nBits, carried verbatim for the MultiShield V4 next-target walk
+    // (dgb_multishield.hpp SetCompact(prevAlgo.nBits)). Stored raw rather than
+    // re-derived from `target` so the V4 global retarget is byte-exact to the
+    // value the network accepted, with no GetCompact round-trip in the hot path.
+    s.n_bits    = h.m_bits;
 
     // Serialize once: the block-identity hash and the Scrypt PoW digest are
     // both pure functions of the same canonical 80-byte header.

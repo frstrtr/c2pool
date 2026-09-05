@@ -336,6 +336,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_dependencies(test_dash_serve_gate_journal dash_proactive_rotation_kat)  # coin-P2P KAT: not in build.yml --target allowlist; piggyback on allowlisted anchor so CI builds it (avoids NOT_BUILT/Not-Run)
     add_dependencies(test_dash_serve_gate_journal dash_asn_diversity_kat)  # coin-P2P KAT: not in build.yml --target allowlist; piggyback on allowlisted anchor so CI builds it (avoids NOT_BUILT/Not-Run)
     add_dependencies(test_dash_serve_gate_journal dash_getmnlistd_tracker_kat)  # coin-P2P KAT: not in build.yml --target allowlist; piggyback on allowlisted anchor so CI builds it (avoids NOT_BUILT/Not-Run)
+    add_dependencies(test_dash_serve_gate_journal dash_explorer_json_kat)  # explorer block->JSON KAT: not in build.yml --target allowlist; piggyback on allowlisted anchor so CI builds it (avoids NOT_BUILT/Not-Run)
 
     # DASH serve-gate LEDGER cross-restart never-a-reject accounting KAT: the
     # CUMULATIVE, persisted companion to ServeGateJournal (the journal wipes on
@@ -667,6 +668,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_dash_mempool test_dash_mempool.cpp test_dash_replay_utxo_fold.cpp
         test_dash_mempool_validity_gate.cpp
         test_dash_checkinputscripts.cpp   # PR-C4: consensus-exact CheckInputScripts KAT
+        test_dash_tx_inject.cpp           # #157: miner/user tx-injection (priority + validity + DoS)
         test_dash_fold_fee_source.cpp)    # W5-A: fold-backed fee pricing source
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
@@ -1467,7 +1469,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # --target allowlist AND already compiles coin/replay_bulk_fetch.hpp, so its
     # link set resolves BulkBlockScheduler/bulkpolicy with no new deps; a
     # standalone executable was a NOT_BUILT/"Not Run" CTest sentinel.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp)
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp test_dash_coin_p2p_pool.cpp test_dash_qrinfo_wire.cpp test_dash_coin_peer_rearm.cpp test_dash_replay_bulk_fetch.cpp test_dash_spork.cpp test_dash_bulk_local_primary_kat.cpp test_dash_restart_reorg_supersede_kat.cpp)
     target_compile_definitions(test_dash_p2p_node PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_p2p_node PRIVATE

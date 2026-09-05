@@ -1,0 +1,15 @@
+{
+  "cold_owed": {
+    "ma": 6,
+    "mb": 4,
+    "mc": 5
+  },
+  "full_owed": {
+    "ma": 6,
+    "mb": 4,
+    "mc": 5
+  },
+  "match": true,
+  "row": "P3-10",
+  "stamp": "bab709889c82a5f0780dc2e40b8655ee0ac78017aba98c352693b0b329872300"
+}

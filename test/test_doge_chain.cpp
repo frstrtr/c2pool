@@ -142,6 +142,41 @@ TEST(DOGESubsidyTest, SimplifiedIgnoresPrevHash) {
     EXPECT_EQ(get_doge_block_subsidy(200000, p, h1), 125000ULL * 100000000ULL);
 }
 
+// Pins the prevHash overload across the 600000 (= 6 * SUBSIDY_HALVING_INTERVAL)
+// simplified-rewards boundary, which no other case covered. This is the byte-
+// identity guard for the removal of the duplicate `height >= 600000` early
+// return in get_doge_block_subsidy(): every height below the boundary must keep
+// the 500000 >> halvings schedule, every height at or above it the flat 10000.
+TEST(DOGESubsidyTest, SimplifiedPrevHashOverloadAcross600kBoundary) {
+    static constexpr uint64_t COIN = 100000000ULL;
+    auto p = DOGEChainParams::mainnet();
+    uint256 h;
+    h.SetHex("ae162af2b7efd37f8ca439eb4e8df06eee3e7ffab1a2ed098ad5d7d4005bc774");
+
+    // Below the boundary: fixed 500000 >> (height / 100000).
+    EXPECT_EQ(get_doge_block_subsidy(0, p, h),      500000ULL * COIN);  // halving 0
+    EXPECT_EQ(get_doge_block_subsidy(99999, p, h),  500000ULL * COIN);
+    EXPECT_EQ(get_doge_block_subsidy(100000, p, h), 250000ULL * COIN);  // halving 1
+    EXPECT_EQ(get_doge_block_subsidy(500000, p, h),  15625ULL * COIN);  // halving 5
+    EXPECT_EQ(get_doge_block_subsidy(599999, p, h),  15625ULL * COIN);  // last pre-flat
+
+    // At and above the boundary: flat 10000 forever.
+    EXPECT_EQ(get_doge_block_subsidy(600000, p, h),  10000ULL * COIN);
+    EXPECT_EQ(get_doge_block_subsidy(600001, p, h),  10000ULL * COIN);
+    EXPECT_EQ(get_doge_block_subsidy(1000000, p, h), 10000ULL * COIN);
+    EXPECT_EQ(get_doge_block_subsidy(5000000, p, h), 10000ULL * COIN);
+
+    // The boundary result must not depend on prevHash under simplified rewards.
+    uint256 h2;
+    h2.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    EXPECT_EQ(get_doge_block_subsidy(599999, p, h), get_doge_block_subsidy(599999, p, h2));
+    EXPECT_EQ(get_doge_block_subsidy(600000, p, h), get_doge_block_subsidy(600000, p, h2));
+
+    // Both overloads must agree on both sides of the boundary.
+    EXPECT_EQ(get_doge_block_subsidy(599999, p, h), get_doge_block_subsidy(599999, p));
+    EXPECT_EQ(get_doge_block_subsidy(600000, p, h), get_doge_block_subsidy(600000, p));
+}
+
 // ─── DigiShield v3 Tests ────────────────────────────────────────────────────
 
 TEST(DigiShieldTest, NoChangeAtTargetSpacing) {

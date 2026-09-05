@@ -36,6 +36,39 @@ inline double sample_tcp_rtt_ms(int fd) {
 #endif
     return 0.0;
 }
+
+// ─── Merged-chain address identification table (issue #961) ──────────────────
+// Hoisted to file scope so BOTH handle_authorize() (merged-chain resolution) and
+// send_notify_work() (the #961 payout money-path check) share ONE table. A
+// username that resolves to a CONFIGURED merged chain here is a legitimate
+// merged-mining payout — the same hash160 / secp256k1 key is spendable on the
+// parent and the merged chain, so paying the parent's P2PKH to that hash160 is
+// the intended reuse, NOT the foreign-coin misdirection #961 closes.
+// Each entry: {chain_id, bech32_hrps (BARE), base58 version bytes}.
+struct ChainAddrInfo {
+    uint32_t chain_id;
+    std::vector<std::string> hrps;
+    std::vector<uint8_t> versions;
+};
+inline const std::vector<ChainAddrInfo>& merged_chain_table() {
+    static const std::vector<ChainAddrInfo> t = {
+        // DOGE: D... (0x1e), 9/A... (0x16), testnet n... (0x71)
+        {98,   {},      {0x1e, 0x16, 0x71}},
+        // PEP:  P... (0x38), testnet n... (0x71)
+        {63,   {},      {0x38, 0x16, 0x71}},
+        // BELLS: B... (0x19), bech32 "bel"/"tbel"
+        {16,   {"bel", "tbel"}, {0x19, 0x1e, 0x21}},
+        // LKY:  L... (0x2f), testnet n... (0x71)
+        {8211, {},      {0x2f, 0x05, 0x71}},
+        // JKC:  7... (0x10), testnet m/n... (0x6f)
+        {8224, {},      {0x10, 0x05, 0x6f}},
+        // SHIC: S... (0x3f), testnet n... (0x71)
+        {74,   {},      {0x3f, 0x16, 0x71}},
+        // DINGO: same versions as DOGE (fork), chain_id=98 (conflicts with DOGE!)
+        // Cannot be used simultaneously with DOGE. Omitted from auto-detect.
+    };
+    return t;
+}
 }  // namespace
 
 namespace core {
@@ -650,34 +683,23 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         //
         // Vnish firmware and some ASIC control software cannot use commas in the
         // login field, so we support pipe (|) and space as alternatives.
-        // ─── Merged chain address identification table ───
-        // Each entry: {chain_id, bech32_hrps, base58_version_bytes}
-        // Used to auto-detect which chain a merged address belongs to.
-        struct ChainAddrInfo {
-            uint32_t chain_id;
-            std::vector<std::string> hrps;
-            std::vector<uint8_t> versions;
-        };
-        static const std::vector<ChainAddrInfo> MERGED_CHAINS = {
-            // DOGE: D... (0x1e), 9/A... (0x16), testnet n... (0x71)
-            {98,   {},      {0x1e, 0x16, 0x71}},
-            // PEP:  P... (0x38), testnet n... (0x71)
-            {63,   {},      {0x38, 0x16, 0x71}},
-            // BELLS: B... (0x19), bech32 "bel"/"tbel"
-            {16,   {"bel", "tbel"}, {0x19, 0x1e, 0x21}},
-            // LKY:  L... (0x2f), testnet n... (0x71)
-            {8211, {},      {0x2f, 0x05, 0x71}},
-            // JKC:  7... (0x10), testnet m/n... (0x6f)
-            {8224, {},      {0x10, 0x05, 0x6f}},
-            // SHIC: S... (0x3f), testnet n... (0x71)
-            {74,   {},      {0x3f, 0x16, 0x71}},
-            // DINGO: same versions as DOGE (fork), chain_id=98 (conflicts with DOGE!)
-            // Cannot be used simultaneously with DOGE. Omitted from auto-detect.
-        };
+        // ─── Merged chain address identification table (file-scope SSOT) ───
+        // Shared with send_notify_work()'s #961 payout check (see merged_chain_
+        // table() above). Used to auto-detect which chain a merged address
+        // belongs to.
+        const auto& MERGED_CHAINS = merged_chain_table();
 
-        // LTC identification (for swap detection)
-        static const std::vector<std::string> LTC_HRPS = {"ltc", "tltc"};
-        static const std::vector<uint8_t> LTC_VERSIONS = {0x30, 0x32, 0x05, 0x6f, 0xc4, 0x3a};
+        // Parent/primary-coin identification (for swap + Case-5 detection),
+        // REGISTRY-SOURCED from the running coin's StratumConfig (issue #961
+        // blocker #3 — no hardcoded LTC version bytes here). Empty when a coin's
+        // main() left the acceptance triple unset; the merged-chain resolution
+        // below only fires when a merged chain is configured, so an empty set
+        // simply disables parent-address detection for non-merged coins.
+        const auto& scfg = mining_interface_->get_stratum_config();
+        const std::vector<std::string>& LTC_HRPS = scfg.payout_bech32_hrps;
+        std::vector<uint8_t> LTC_VERSIONS = scfg.payout_p2pkh_versions;
+        LTC_VERSIONS.insert(LTC_VERSIONS.end(),
+            scfg.payout_p2sh_versions.begin(), scfg.payout_p2sh_versions.end());
 
         std::string merged_addr_raw;
         parse_address_separators(username_, merged_addr_raw);
@@ -746,6 +768,49 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                                     << "reverse-derived P2PKH from same pubkey_hash";
                         break;
                     }
+                }
+            }
+        }
+
+        // ─── #961 B1: reject a foreign-coin payout at the door ──────────────
+        // If this coin published its OWN acceptance set (StratumConfig.payout_*
+        // — the LTC/DOGE merged-mining server does), a username that is neither
+        // an own-coin address NOR a CONFIGURED merged chain's address MUST be
+        // rejected here. Authorizing it would put the miner on jobs whose
+        // coinbase pays a script this node cannot build for their key — an
+        // empty / zero-hash160 payout that PPLNS burns every block (accept-and-
+        // burn). Own-coin and configured-merged stay accepted (reward-safe);
+        // lanes that leave payout_* empty keep the legacy accept-any behaviour
+        // (they validate at mining_submit in their work source, where an empty
+        // payout falls back to the node-owner/donation script, not a burn).
+        {
+            const auto& acfg = mining_interface_->get_stratum_config();
+            const bool acceptance_configured =
+                !acfg.payout_p2pkh_versions.empty() ||
+                !acfg.payout_p2sh_versions.empty() ||
+                !acfg.payout_bech32_hrps.empty();
+            if (acceptance_configured && !username_.empty()) {
+                const core::CoinAddressAcceptance own{acfg.payout_p2pkh_versions,
+                    acfg.payout_p2sh_versions, acfg.payout_bech32_hrps};
+                std::vector<core::MergedChainAddr> merged_cfg;
+                for (const auto& chain : MERGED_CHAINS)
+                    if (mining_interface_->has_merged_chain(chain.chain_id))
+                        merged_cfg.push_back({chain.hrps, chain.versions});
+                if (core::decide_payout_address(username_, own, merged_cfg)
+                        == core::PayoutAddressDecision::Reject) {
+                    LOG_WARNING << "[Stratum] REJECTED mining.authorize: payout address "
+                                << username_ << " is not a"
+                                << (acfg.coin_symbol.empty() ? "" : " " + acfg.coin_symbol)
+                                << " address and not a configured merged chain — refusing "
+                                   "to authorize (issue #961: would burn the reward)";
+                    authorized_ = false;
+                    nlohmann::json response;
+                    response["id"] = request_id;
+                    response["result"] = false;
+                    response["error"] = nlohmann::json::array(
+                        {24, "Unauthorized: payout address is not for this coin "
+                             "(and not a configured merged chain)", nullptr});
+                    return response;
                 }
             }
         }
@@ -1501,7 +1566,17 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
 {
     // Don't send work until a valid block template is available
     auto tmpl = mining_interface_->get_current_work_template();
-    if (tmpl.empty() || tmpl.is_null()) {
+    // Fail-closed on a template that carries no difficulty bits. Every coin lane
+    // emits "bits" in its work template (btc/ltc/bch/dash/nmc template_builder,
+    // bip110 work_source, dgb MultiShield V4 / GBT fallback); a NON-empty template
+    // that omits it can only mean a broken work source, and the old default here
+    // fabricated diff-1 (0x1d00ffff) -- putting a KNOWN-INVALID nBits into the
+    // header the miner hashes, so any won block was rejected and every share was
+    // weighed against a fake coin target (#179, the daemonless DGB arm). Treat a
+    // bits-less template as "no template": wait and retry, never fabricate.
+    const bool no_template   = tmpl.empty() || tmpl.is_null();
+    const bool missing_bits  = !no_template && !tmpl.contains("bits");
+    if (no_template || missing_bits) {
         // Rate-limit "no template" log to avoid spam during header sync
         static std::atomic<int64_t> s_last_warn{0};
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1514,8 +1589,14 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 // the wrong coin). Neutral fallback when unset.
                 const std::string& sym =
                     mining_interface_->get_stratum_config().coin_symbol;
-                LOG_WARNING << "[" << (sym.empty() ? "Stratum" : sym)
-                            << "] Waiting for block template (header sync in progress)...";
+                if (missing_bits)
+                    LOG_ERROR << "[" << (sym.empty() ? "Stratum" : sym)
+                              << "] Work template missing difficulty bits — holding"
+                                 " work (fail-closed, refusing to fabricate a"
+                                 " diff-1 nBits that would invalidate any won block).";
+                else
+                    LOG_WARNING << "[" << (sym.empty() ? "Stratum" : sym)
+                                << "] Waiting for block template (header sync in progress)...";
             }
         }
         auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
@@ -1562,11 +1643,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
            << version_u32;
         version = ss.str();
 
-        // Save original GBT block bits for block-level target check
-        if (tmpl.contains("bits"))
-            gbt_block_nbits = tmpl["bits"].get<std::string>();
-        else
-            gbt_block_nbits = "1d00ffff";
+        // Save original GBT block bits for block-level target check. Presence is
+        // guaranteed by the fail-closed guard above (a bits-less template is held
+        // as "no template" and never reaches here), so this reads the authoritative
+        // value directly — no fabricated diff-1 default (#179).
+        gbt_block_nbits = tmpl["bits"].get<std::string>();
 
         // nbits in mining.notify = GBT BLOCK difficulty (not share target).
         // p2pool sends block_bits here. The miner puts this in the 80-byte header's
@@ -1607,10 +1688,66 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     else if (auto fn = mining_interface_->get_best_share_hash_fn())
         frozen_prev_share = fn();  // standalone call (VARDIFF, safety timer)
     {
-        // Build payout script from username (authorized address: P2PKH, P2SH, or bech32)
+        // Build payout script from username (authorized address: P2PKH, P2SH, or bech32).
+        //
+        // #961 (LTC-lane money leak): the chain-agnostic address_to_script()
+        // decodes the version byte / bech32 HRP of ANY supported coin and builds
+        // a scriptPubKey for whatever coin THIS node runs — so a foreign-coin
+        // payout address (an unconfigured coin's address) was silently
+        // repurposed into a wrong-coin script, MISDIRECTING the miner's reward
+        // from a hash160 they do not control on this chain. Validate against the
+        // running coin's own registry-sourced acceptance set FIRST (via
+        // StratumConfig.payout_*), keeping the legitimate merged-mining reuse:
+        //   • Own-coin address                       → build it (byte-identical).
+        //   • A CONFIGURED merged chain's address    → build it: the same
+        //     hash160 pays P2PKH on the parent — the intended merged-mining
+        //     reuse (Case 5 / auto-derive), byte-identical to before.
+        //   • Foreign-and-unconfigured, or unparseable → REJECT loudly, empty
+        //     payout (the existing degenerate/empty-payout path), never a
+        //     wrong-coin payment.
+        // When a coin's main() left payout_* unset (empty triple), no acceptance
+        // is configured for this server and the legacy chain-agnostic build is
+        // preserved byte-for-byte (non-LTC lanes validate at mining_submit).
         std::vector<unsigned char> payout_script;
         if (!username_.empty()) {
-            payout_script = address_to_script(username_);
+            const auto& scfg = mining_interface_->get_stratum_config();
+            const bool acceptance_configured =
+                !scfg.payout_p2pkh_versions.empty() ||
+                !scfg.payout_p2sh_versions.empty() ||
+                !scfg.payout_bech32_hrps.empty();
+            if (!acceptance_configured) {
+                payout_script = address_to_script(username_);  // legacy, byte-identical
+            } else {
+                // #961 B1: consult the shared payout decision (SSOT with
+                // handle_authorize's door check). Own-coin OR a CONFIGURED merged
+                // chain builds byte-identically to the pre-#961 script (reward-
+                // safe); a foreign-unconfigured address is REJECTED.
+                const core::CoinAddressAcceptance own{scfg.payout_p2pkh_versions,
+                    scfg.payout_p2sh_versions, scfg.payout_bech32_hrps};
+                std::vector<core::MergedChainAddr> merged_cfg;
+                for (const auto& chain : merged_chain_table())
+                    if (mining_interface_->has_merged_chain(chain.chain_id))
+                        merged_cfg.push_back({chain.hrps, chain.versions});
+                if (core::decide_payout_address(username_, own, merged_cfg)
+                        == core::PayoutAddressDecision::Reject) {
+                    // ── B1 GUARD: never build a share with an empty/zero-hash160
+                    // payout. An empty payout_script here would make build_
+                    // connection_coinbase() emit the degenerate value-0 / zero-
+                    // hash160 coinbase; PPLNS would then record this miner's work
+                    // weight against an UNSPENDABLE output and BURN their reward
+                    // every block. Refuse to issue the job at all (no active_jobs_
+                    // entry, no mining.notify) — combined with handle_authorize's
+                    // reject, a foreign-unconfigured address can never be mined.
+                    LOG_WARNING << "[Stratum] REFUSING to build work: foreign-coin "
+                                   "payout address (user=" << username_ << ") — not a"
+                                << (scfg.coin_symbol.empty() ? "" : " " + scfg.coin_symbol)
+                                << " address and not a configured merged chain; "
+                                   "no zero-payout share will be built (issue #961)";
+                    return;
+                }
+                // Accepted (own-coin OR configured-merged): byte-identical build.
+                payout_script = address_to_script(username_);
+            }
         }
 
         // Build merged address entries (bech32+base58, P2PKH+P2SH)

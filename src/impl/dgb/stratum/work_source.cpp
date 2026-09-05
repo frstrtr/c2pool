@@ -23,6 +23,7 @@
 #include <impl/dgb/coin/template_builder.hpp>
 #include <impl/dgb/coin/embedded_tx_select.hpp>  // make_mempool_tx_source (mempool -> GBT transactions[])
 #include <impl/dgb/config_pool.hpp>              // dgb::PoolConfig::BLOCK_MAX_WEIGHT
+#include <impl/dgb/params.hpp>                   // dgb::address_acceptance (#961 registry-sourced payout check)
 #include <impl/dgb/coin/hash_format.hpp>
 #include <impl/dgb/coin/scrypt_pow.hpp>        // scrypt_pow_hash (DGB-Scrypt PoW SSOT)
 #include <impl/dgb/coin/submit_classify.hpp>   // classify_submission (Stage-4d decision SSOT)
@@ -380,9 +381,23 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     in.transactions      = tx_sel.transactions;
     if (auto th = chain_.tip_hash()) {
         // Embedded chain carries a real tip -> source previousblockhash from it.
-        // bits stays absent here: the Scrypt-only walk cannot reconstruct the
-        // MultiShield-V4 5-algo window (== V37) -- unchanged truthful absence.
         in.previousblockhash = u256_be_display_hex(*th);
+        // #179: derive the block-template bits from the synced header chain via
+        // DigiByte-Core MultiShield V4 (chain_.next_scrypt_bits()), replacing the
+        // fabricated diff-1 (0x1d00ffff) that made every won block INVALID and
+        // every sharechain share weigh against a fake coin target. The V4 walk is
+        // GLOBAL across all 5 algos and the header chain carries every algo's
+        // header (continuity headers appended work-neutral), so the window is
+        // fully present. When it is too shallow to run (< 61 headers) the accessor
+        // returns nullopt: emit an EMPTY template so the stratum layer takes its
+        // existing "waiting for block template (header sync)" wait path instead of
+        // fabricating -- fail-closed, never a known-wrong target on the wire.
+        auto nb = chain_.next_scrypt_bits();
+        if (!nb)
+            return nlohmann::json::object();  // hold work until the window fills.
+        char bits_buf[9];
+        std::snprintf(bits_buf, sizeof(bits_buf), "%08x", *nb);
+        in.bits = std::string(bits_buf);
     } else if (auto tip = resolve_gbt_tip_fallback()) {
         // Embedded HeaderChain unfed -> external-daemon GBT fallback (persist per
         // V36). Sources BOTH previousblockhash and the daemon-authoritative bits
@@ -644,7 +659,25 @@ nlohmann::json DGBWorkSource::mining_submit(
         in.subsidy         = job->subsidy;
         in.prev_share      = job->prev_share_hash;
         in.merkle_branches = branch_hashes;
-        in.payout_script   = core::address_to_script(username);
+        // #961: validate the payout address against DGB's OWN version bytes / HRP
+        // before building a script, so a foreign-coin address is rejected rather
+        // than repurposed into a DGB script (which would MISDIRECT funds). The
+        // accepted set is REGISTRY-SOURCED (dgb::address_acceptance → config_coin
+        // SSOT) and derived from the TRUE network (mainnet/testnet/regtest) so a
+        // --regtest payout address is accepted, not rejected as Foreign. Foreign
+        // → empty → the existing redistribute/empty fallback below; never a
+        // wrong-coin payment.
+        {
+            std::vector<unsigned char> payout_script;
+            auto amatch = core::classify_address_for_coin(
+                username, dgb::address_acceptance(is_testnet_, is_regtest_),
+                payout_script);
+            if (amatch == core::AddressCoinMatch::Foreign)
+                LOG_WARNING << "[DGB-STRATUM] REJECTED foreign-coin payout address "
+                               "(user=" << username << ") — not a DGB address; "
+                               "refusing to misdirect funds";
+            in.payout_script = std::move(payout_script);
+        }
         // Redistribute V2 (#307): a miner with empty/broken stratum creds
         // yields no payout script. When the operator opted into a
         // --redistribute policy (fallback bound) let it choose the pubkey this

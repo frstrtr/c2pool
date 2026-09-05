@@ -23,6 +23,33 @@
   experimental — the fork coin is effectively unlisted (block reward ≈ 0), so the
   value is strategic, not revenue.
 
+### DASH — good-citizen serving is the daemonless binary default (opt-out)
+- **A bare `c2pool-dash --run` (no `--coin-rpc`/`--coin-rpc-auth`/`--submit-block`)
+  now serves the FULL mempool + special txs (DIP types 1-4) + funded superblocks
+  by default — it used to serve NOTHING.** With no dashd arm the embedded-arm gate
+  (`--embedded-mainnet`) and the fee/serve levers all defaulted OFF, so a daemonless
+  node either idled (no arm) or produced coinbase-only blocks. All twelve serving
+  levers (`--embedded-mainnet`, `--embedded-utxo`, `--embedded-null-arm`,
+  `--embedded-superblock`, `--embedded-include-mn-special-txs`,
+  `--embedded-accrue-asset-locks`/`-unlocks`, `--embedded-serve-mempool-txs`,
+  `--embedded-tx-serve-own-set`, `--embedded-mempool-ingest`,
+  `--embedded-ingest-isdlock`/`-dstx`) now default ON in the daemonless posture and
+  are resolved by one pure, KAT-tested function (`good_citizen_defaults.hpp`).
+  Each keeps an explicit `--<flag>=false` opt-out; a **dashd-armed** node is
+  byte-identical to before (defaults stay OFF, dashd's template provides fullness).
+- **Reward-safety is unchanged and runs by default whenever serving:** the
+  serve-time internal-consistency referee (`--embedded-tx-serve-own-set`, armed
+  together with serving), the tx-merkle/creditPool cross-checks (#1218/#1230), the
+  special-tx SML re-fold + root-drift rejection at emit, and fee_fold_proven-only
+  selection all fail closed to last-good-work, never to an unvalidated serve.
+- **Not flipped (deliberate):** `--embedded-utxo-immature-serve-empty` (p2pool
+  semantics; the window clears in minutes), `--embedded-creditpool-publish-at-serve-tip`
+  (creditpool is ahead), and the path-bearing full-history fold flags. Type-9
+  asset-unlock admission remains gated behind its seeded CreditPool index follower
+  (the default flip is inert until then). Cross-coin: bip110/LTC/DOGE/BTC already
+  serve by default; DGB is coinbase-only structurally (mempool ingest port pending)
+  and is tracked as a follow-up.
+
 ### DASH — daemonless masternode set: seed completeness (the reinstatement gap)
 - **The pinned anchor and the RPC seed now carry the REGISTERED masternode set,
   not the valid one.** `protx list valid` filters every PoSe-banned masternode

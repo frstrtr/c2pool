@@ -5,6 +5,8 @@
 #include "../coin/header_chain.hpp"
 #include "../coin/template_builder.hpp"   // get_block_subsidy, compute_merkle_root, witness_merkle_root
 #include "../coin/gentx_coinbase.hpp"
+#include "../pool/share_check.hpp"        // F1b: compute_p2pool_witness_commitment (SSOT segwit commitment)
+#include "../pool/share_types.hpp"        // F1b: SegwitDataDefault none-sentinel wtxid root
 #include "../coin/mempool.hpp"            // M3 tx-serving
 #include "../coin/block_assembler.hpp"    // M3 ancestor-package tx selection
 #include "serve_xcheck.hpp"               // GAP5 independent fee re-derivation
@@ -14,6 +16,7 @@
 #include <core/coin/utxo.hpp>             // Coin / Outpoint / money_range (GAP2/3/5)
 
 #include <core/target_utils.hpp>
+#include <core/address_utils.hpp>          // M3 mint: username -> payout_script
 #include <core/log.hpp>
 
 #include <algorithm>
@@ -88,7 +91,12 @@ Bip110WorkSource::~Bip110WorkSource() = default;
 
 std::function<uint256()> Bip110WorkSource::get_best_share_hash_fn() const
 {
-    return {};  // M2: no p2pool sharechain best-share (create_share_fn unset)
+    // M3 PR-C (flag-ON): return the wired best-share accessor so the generic
+    // stratum_server seam (stratum_server.cpp:1607) feeds the sharechain tip into
+    // JobSnapshot.prev_share_hash and into build_connection_coinbase's ref walk.
+    // M2 (default OFF): best_share_hash_fn_ is unset -> return {} exactly as before
+    // (no p2pool sharechain best-share; create_share_fn/ref_hash_fn also unset).
+    return best_share_hash_fn_;
 }
 
 Bip110WorkSource::NextWork Bip110WorkSource::next_work() const
@@ -142,7 +150,7 @@ std::string Bip110WorkSource::get_current_gbt_prevhash() const
 }
 
 CoinbaseResult Bip110WorkSource::build_connection_coinbase(
-    const uint256& /*prev_share_hash*/,
+    const uint256& prev_share_hash,
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged_addrs*/) const
@@ -302,7 +310,7 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
     // fee_total came ONLY from tier-1/2/3-priced entries with MoneyRange checks;
     // over-claiming here = INVALID block = lost reward, so the value guard below
     // and the independent pre-serve xcheck both re-derive this sum.
-    const uint64_t subsidy = w.subsidy + fee_total;   // == coinbasevalue
+    const uint64_t subsidy = w.subsidy + fee_total;   // == coinbasevalue (M2 path)
     const std::vector<unsigned char>& owner_script =
         !node_owner_script_.empty() ? node_owner_script_ : donation_script_;
 
@@ -310,8 +318,106 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
     uint64_t donation_amt = 0;
     std::vector<unsigned char> donation = donation_script_;
 
-    if (!payout_script.empty()) {
-        // NORMAL MINING: split the subsidy between miner, author donation, owner.
+    // ── M3 PR-C (F1b): PPLNS-DISTRIBUTED coinbase on the FLAG-ON path ─────────
+    // When --bip110-sharechain is ON, main_bip110 installs pplns_fn_ (alongside
+    // ref_hash_fn_). A peer verifying a share runs generate_share_transaction
+    // (share_check.hpp:1840-1952, the SSOT), which rebuilds the coinbase paying the
+    // ENTIRE decayed PPLNS window and THROWS on any byte mismatch. So the minted
+    // coinbase MUST equal that reconstruction. pplns_fn_ returns exactly the
+    // {script->amount} map generate_share_transaction computes (ShareTracker::
+    // get_expected_payouts, share_tracker.hpp:2016 — the SAME get_v36_decayed_
+    // cumulative_weights, the SAME (uint288(subsidy)*weight/total).GetLow64()
+    // truncation, the SAME >=1-sat donation guard). Here we reproduce generate_
+    // share_transaction's ordering EXACTLY: extract the donation entry, drop empty/
+    // zero outputs, sort asc(amount, script), keep-LAST 4000, donation output
+    // second-to-last (absorbs the residual, == subsidy - Σamounts), OP_RETURN ref
+    // last. Byte-for-byte == generate_share_transaction => peers ACCEPT the share.
+    //
+    // Subsidy source: the flag-ON path distributes w.subsidy (BLOCK subsidy, NO
+    // fees) because ref_hash_fn_ is called with w.subsidy so the minted share
+    // stores m_subsidy = w.subsidy and verify distributes share.m_subsidy. Fees are
+    // NOT representable in generate_share_transaction, so we HARD-GUARD a fee- or
+    // tx-bearing job off the sharechain path (coinbase-only) until fee-into-PPLNS
+    // is designed (PR-D). Off the flag (pplns_fn_ unset) the single-miner split
+    // below is untouched — byte-identical to M2.
+    std::map<std::vector<unsigned char>, double> pmap;
+    if (pplns_fn_) {
+        const uint256 block_target = chain::bits_to_target(w.nbits);   // v36 ignores; pass real
+        try {
+            pmap = pplns_fn_(prev_share_hash, block_target, w.subsidy, donation_script_);
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[BIP110-WS] pplns_fn threw: " << e.what()
+                        << " — refusing job (unverifiable coinbase)";
+            return CoinbaseResult{};
+        }
+        if (pmap.empty()) {
+            // Tracker busy / not walkable this refresh. Genesis is NOT empty (the
+            // window has no miners but pplns_fn folds the full-subsidy donation in),
+            // so an empty map means we cannot build a peer-verifiable coinbase —
+            // refuse rather than emit a single-miner coinbase peers would reject.
+            LOG_WARNING << "[BIP110-WS] pplns_fn returned empty (tracker busy) — "
+                           "refusing sharechain job (height=" << w.height << ")";
+            return CoinbaseResult{};
+        }
+        // Fees/txs are not in generate_share_transaction — refuse a tx-bearing job.
+        if (fee_total != 0 || n_other != 0) {
+            LOG_WARNING << "[BIP110-WS] flag-ON PPLNS refuses tx-bearing job (fee_total="
+                        << fee_total << " n_other=" << n_other << ", height=" << w.height
+                        << ") — fee-into-PPLNS unimplemented; sharechain path is coinbase-only";
+            return CoinbaseResult{};
+        }
+    }
+
+    if (pplns_fn_) {
+        // FLAG-ON PPLNS path (reproduces generate_share_transaction exactly).
+        // donation_script_ == PoolConfig::get_donation_script(36) here (set in
+        // main_bip110:502) — the SAME key pplns_fn folded the residual into, and the
+        // donation output script the assembler must emit second-to-last.
+        donation = donation_script_;
+        donation_amt = 0;
+        if (auto it = pmap.find(donation_script_); it != pmap.end()) {
+            donation_amt = static_cast<uint64_t>(it->second);   // pre-cap residual (SSOT)
+            pmap.erase(it);                                      // never amount-sorted among payouts
+        }
+        for (auto& [s, a] : pmap) {
+            if (s.empty()) continue;                            // empty-script drop (matches verify)
+            uint64_t v = static_cast<uint64_t>(a);              // GetLow64 truncation already applied
+            if (v > 0) payouts.emplace_back(s, v);              // dust (<1 sat) drop
+        }
+        std::sort(payouts.begin(), payouts.end(),
+            [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second;  // asc by amount
+                return a.first < b.first;                              // tie-break asc by script
+            });
+        if (payouts.size() > 4000)                              // keep-LAST 4000 (== verify's [-4000:])
+            payouts.erase(payouts.begin(), payouts.end() - 4000);
+        if (donation.empty()) donation = {0x6a};                // never (get_donation_script(36) non-empty)
+
+        // Rebuild the witness-commitment output as the P2POOL commitment the verify
+        // SSOT reconstructs: compute_p2pool_witness_commitment over the REAL witness
+        // merkle root. Flag-ON is hard coinbase-only (n_other==0 above), so the real
+        // root is witness_merkle_root({}) = merkle([0]) = ZERO — exactly the python
+        // v36 fork's segwit_data['wtxid_merkle_root'] for a coinbase-only mined share
+        // (data.py:1090, merkle_hash([0])==0). It is NOT the 0xff None-sentinel
+        // (2^256-1): that value is only the PossiblyNoneType WIRE ENCODING of "no
+        // segwit_data", never a real root. Committing over the sentinel made the
+        // found block consensus-INVALID (segwit recomputes the commitment over the
+        // real root ZERO, not 0xff => bad-witness-merkle-match) AND diverged from a
+        // python-fork peer. The block-body reserved value spliced by assemble_gentx_
+        // coinbase below is '[P2Pool]'*4, so segwit consensus' check
+        // commitment == SHA256d(ZERO || '[P2Pool]'*4) passes. create_local_share and
+        // the ref_hash_fn store the SAME real root, so mint==verify still holds.
+        {
+            const uint256 real_wroot = bip110::coin::witness_merkle_root({});  // ZERO
+            const uint256 wc = bip110::pool::compute_p2pool_witness_commitment(real_wroot);
+            std::vector<unsigned char> sc = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+            const auto wcb = wc.GetChars();
+            sc.insert(sc.end(), wcb.begin(), wcb.end());
+            segwit_commit = std::move(sc);
+        }
+    } else if (!payout_script.empty()) {
+        // NORMAL MINING (M2, flag OFF): split the subsidy between miner, author
+        // donation, owner. UNTOUCHED — byte-identical to M2.
         uint64_t don   = (!donation_script_.empty() && give_author_ppm_ > 0)
                        ? (subsidy * give_author_ppm_ / 1000000ULL) : 0;   // floor
         uint64_t owner = (!owner_script.empty() && node_owner_fee_ppm_ > 0)
@@ -351,25 +457,93 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
     if (donation.empty()) donation = {0x6a};      // OP_RETURN placeholder (0-value)
 
     // Value-conservation guard: the sum of all non-commitment output values MUST
-    // equal subsidy + fees (M2: fees == 0). A mismatch means a construction bug
-    // would over-claim or burn value — refuse rather than emit an invalid/burning
-    // coinbase.
+    // equal the distributed subsidy — w.subsidy on the flag-ON PPLNS path (fees
+    // hard-guarded to 0), subsidy+fees on the M2 path. A mismatch means a
+    // construction bug would over-claim or burn value — refuse rather than emit an
+    // invalid/burning coinbase. (On flag-ON this also fails-closed if the 4000-cap
+    // ever drops outputs, which cannot happen on the tiny federation window.)
     {
+        const uint64_t expect = pplns_fn_ ? w.subsidy : subsidy;
         uint64_t total_out = donation_amt;
         for (const auto& [scr, amt] : payouts) { (void)scr; total_out += amt; }
-        if (total_out != subsidy) {
+        if (total_out != expect) {
             LOG_ERROR << "[BIP110-WS] REFUSING work: coinbase output value " << total_out
-                      << " != subsidy+fees " << subsidy << " (subsidy=" << w.subsidy
-                      << " fees=" << fee_total << " height=" << w.height << ")";
+                      << " != expected " << expect << " (subsidy=" << w.subsidy
+                      << " fees=" << fee_total << " pplns=" << (pplns_fn_ ? 1 : 0)
+                      << " height=" << w.height << ")";
             return CoinbaseResult{};
         }
     }
 
-    // OP_RETURN ref marker (M2: empty commitment; M3 carries the share ref).
-    std::vector<unsigned char> op_return = {0x6a, 0x00};
+    // OP_RETURN ref marker.
+    //   M2 (default OFF, ref_hash_fn_ unset): EMPTY commitment {0x6a,0x00} —
+    //     byte-identical to the M2 header-follower coinbase. This is the exact btc
+    //     degrade pattern (emit_op_return = ref_hash_fn && !ref_hash.IsNull()).
+    //   M3 PR-C (flag-ON, --bip110-sharechain, ref_hash_fn_ set): the real 42-byte
+    //     p2pool ref commitment {0x6a, 0x28, ref_hash[32], last_txout_nonce[8]}.
+    //     ref_hash_fn_ walks the share tracker off prev_share_hash and returns both
+    //     the ref_hash AND the frozen share fields create_local_share reproduces —
+    //     so the commitment the coinbase carries == the ref_hash a peer recomputes
+    //     off the minted share (mint==verify; peers accept the share). The 8-byte
+    //     last_txout_nonce is BAKED IN here (unlike btc, where extranonce fills it
+    //     between coinb1/coinb2): on BIP-110 the extranonce lives in the 164B Sia
+    //     header, not the coinbase, so the coinbase tail is fully frozen at build.
+    //     The mint (create_local_share, share_check.hpp:2458/2569) extracts
+    //     ref_hash + last_txout_nonce from the coinbase's last 44 bytes
+    //     (ref_hash[32] + nonce[8] + locktime[4]) — this layout produces exactly
+    //     that tail.
+    // F1b (CLOSED here): on the flag-ON path the reward split above is now the FULL
+    // PPLNS distribution (pplns_fn_ branch) — byte-for-byte == generate_share_
+    // transaction (share_check.hpp:1840-1952), so the peer's PPLNS reconstruction no
+    // longer THROWS and the share is ACCEPTED. F1 closed the empty-commitment
+    // blocker (ref/hash_link); F1b closes the PPLNS-payout blocker. Off the flag the
+    // split stays the single-miner M2 coinbase (byte-identical to M2).
+    std::vector<unsigned char> op_return = {0x6a, 0x00};   // M2 empty commitment
+    core::stratum::RefHashResult rh_result;
+    const bool sharechain_ref = static_cast<bool>(ref_hash_fn_);
+    if (sharechain_ref) {
+        try {
+            rh_result = ref_hash_fn_(prev_share_hash, cb_script, payout_script,
+                                     w.subsidy, w.nbits, w.curtime);
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[BIP110-WS] ref_hash_fn threw: " << e.what()
+                        << " — refusing job (would emit an unverifiable coinbase)";
+            return CoinbaseResult{};
+        }
+        if (rh_result.ref_hash.IsNull()) {
+            LOG_WARNING << "[BIP110-WS] ref_hash_fn returned null ref_hash (height="
+                        << w.height << ") — refusing job (unverifiable coinbase)";
+            return CoinbaseResult{};
+        }
+        // 6a 28 (OP_RETURN PUSH_40) + ref_hash[32] + last_txout_nonce[8] = 42 bytes.
+        op_return.assign({0x6a, 0x28});
+        op_return.insert(op_return.end(), rh_result.ref_hash.data(),
+                         rh_result.ref_hash.data() + 32);
+        const uint64_t nn = rh_result.last_txout_nonce;
+        const auto* np = reinterpret_cast<const unsigned char*>(&nn);
+        op_return.insert(op_return.end(), np, np + 8);   // LE nonce slot (baked)
+        // Freeze the SAME share target the ref committed so the job's difficulty
+        // classification and the mint's override_bits agree (btc work_source:717).
+        if (rh_result.bits != 0) {
+            share_bits_.store(rh_result.bits, std::memory_order_relaxed);
+            share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
+        }
+    }
 
+    // Flag-ON found blocks MUST carry the P2Pool witness reserved value
+    // ('[P2Pool]'*4) in the coinbase input's witness stack so segwit consensus'
+    // witness-commitment check (commitment == SHA256d(witness_root || reserved))
+    // matches the P2Pool commitment output built above. Gated on the SAME
+    // discriminator (pplns_fn_) that chose that commitment. OFF/M2 leaves it empty
+    // => 32-zero reserved value, byte-identical to M2 (whose commitment is computed
+    // over reserved 0*32).
+    std::vector<unsigned char> witness_reserved;
+    if (pplns_fn_)
+        witness_reserved.assign(std::begin(bip110::pool::P2POOL_WITNESS_NONCE),
+                                std::end(bip110::pool::P2POOL_WITNESS_NONCE));
     auto cb = bip110::coin::assemble_gentx_coinbase(
-        cb_script, segwit_commit, payouts, donation_amt, donation, op_return);
+        cb_script, segwit_commit, payouts, donation_amt, donation, op_return,
+        witness_reserved);
 
     // ── Header tx-set commitment: the txid-merkle root over [coinbase] ++ the
     // selected txs (block order), and the u16 txcount = 1 + N. On BIP-110 BOTH
@@ -500,17 +674,23 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
         // (d) weight cap.
         if (ok && body_weight + 4000u > bip110::RDTS_MAX_BLOCK_WEIGHT) ok = false;
 
-        // (e) witness commitment recompute.
+        // (e) witness commitment recompute (shared SSOT: serve_xcheck.hpp). The
+        //     commitment is SHA256d(witness_merkle_root || reserved), and the
+        //     reserved value MUST be the one the coinbase actually carries
+        //     (witness_reserved, spliced into the coinbase witness stack above):
+        //     32 zero bytes on the OFF/M2 path (witness_reserved empty), or
+        //     '[P2Pool]'*4 on the flag-ON PPLNS path (whose commitment output was
+        //     built as the P2Pool witness commitment over the real ZERO root).
+        //     A previous hardcoded 32-zero reserved value here REJECTED every
+        //     flag-ON coinbase — a valid, consensus-required construction — and
+        //     suppressed ALL served work. Deriving the reserved value from the
+        //     coinbase the block will actually carry keeps the check at full
+        //     strength (still the exact segwit consensus rule) yet flag-agnostic.
+        //     OFF stays byte-identical (empty => 32 zeros, unchanged recompute).
         if (ok && segwit_commit.has_value()) {
-            uint256 wmr = bip110::coin::witness_merkle_root(chk_wtxids);
-            std::vector<unsigned char> pre(64, 0);
-            std::memcpy(pre.data(), wmr.data(), 32);
-            unsigned char a[32], bb[32];
-            CSHA256().Write(pre.data(), pre.size()).Finalize(a);
-            CSHA256().Write(a, 32).Finalize(bb);
-            std::vector<unsigned char> expect = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
-            expect.insert(expect.end(), bb, bb + 32);
-            if (expect != segwit_commit.value()) ok = false;
+            if (!bip110::stratum::xcheck_witness_commitment(
+                    chk_wtxids, witness_reserved, segwit_commit.value()))
+                ok = false;
         }
 
         if (!ok) {
@@ -562,6 +742,33 @@ CoinbaseResult Bip110WorkSource::build_connection_coinbase(
     s.segwit_active   = true;
     s.merkle_branches = {};                                   // literally empty
     s.witness_root    = uint256::ZERO;
+
+    // ── M3 PR-C: freeze the share fields the ref committed into the snapshot ──
+    // The generic stratum_server seam copies these into the JobEntry (stratum_
+    // server.cpp:1823-1834) and rebuilds them into JobSnapshot.frozen_ref, which
+    // create_local_share consumes on the has_frozen=TRUE path (main_bip110) so the
+    // minted share reproduces the EXACT ref_hash this coinbase embedded. Only on
+    // the flag-ON path; M2 leaves frozen_ref default (byte-identical to today).
+    if (sharechain_ref) {
+        s.frozen_ref.ref_hash          = rh_result.ref_hash;
+        s.frozen_ref.last_txout_nonce  = rh_result.last_txout_nonce;
+        s.frozen_ref.absheight         = rh_result.absheight;
+        s.frozen_ref.abswork           = rh_result.abswork;
+        s.frozen_ref.far_share_hash    = rh_result.far_share_hash;
+        s.frozen_ref.bits              = rh_result.bits;
+        s.frozen_ref.max_bits          = rh_result.max_bits;
+        s.frozen_ref.timestamp         = rh_result.timestamp;
+        s.frozen_ref.merged_payout_hash = rh_result.merged_payout_hash;
+        s.frozen_ref.share_version     = 36;   // v36-genesis (no AutoRatchet)
+        s.frozen_ref.desired_version   = 36;
+        // Coinbase-only: no merged mining. frozen_merkle_branches /
+        // frozen_witness_root / frozen_merged_coinbase_info stay empty — a
+        // coinbase-only share's real witness merkle root is ZERO (merkle([0]),
+        // python v36 data.py:1090), which is exactly what create_local_share's
+        // segwit-active coinbase-only branch stores (frozen_witness_root default
+        // uint256() IsNull => witness_root default uint256() == ZERO) and what the
+        // ref_hash_fn serializes. NOT the 0xff None-sentinel.
+    }
     return out;
 }
 
@@ -704,11 +911,48 @@ nlohmann::json Bip110WorkSource::mining_submit(
         bool sunk = submit_block_fn_ ? submit_block_fn_(block, f.height) : false;
         if (!sunk)
             LOG_ERROR << "[BIP110-WS] won block reached NO network sink (height=" << f.height << ")";
+
+        // GAP B (M3): a WON block is also a share — mint it into the sharechain
+        // after the block is dispatched (never behind the tracker lock; block
+        // relay must not wait on the mint), mirroring btc write_solved_share on
+        // the won-block arm. Unset in M2 (default OFF) => byte-identical to today.
+        // Uses the NON-witness coinbase (the txid/hash-link basis), NOT the
+        // BIP144 witness coinbase_block reassembled above.
+        if (create_share_fn_) {
+            std::vector<unsigned char> mint_cb;
+            {
+                std::lock_guard<std::mutex> lk(freeze_mutex_);
+                auto it = freeze_map_.find(to_hex(f.h2));
+                if (it != freeze_map_.end()) mint_cb = it->second.coinbase;
+            }
+            // #961: validate against BIP-110's OWN version bytes / HRP before
+            // building a script, so a foreign-coin address is rejected (→ empty
+            // → donation fallback) rather than repurposed into a wrong-coin
+            // payout that MISDIRECTS funds. Accepted set REGISTRY-SOURCED
+            // (bip110::address_acceptance) and derived from the TRUE network so a
+            // --regtest address is accepted rather than rejected as Foreign.
+            std::vector<unsigned char> payout_script;
+            {
+                auto amatch = core::classify_address_for_coin(
+                    username, bip110::address_acceptance(is_testnet_, is_regtest_),
+                    payout_script);
+                if (amatch == core::AddressCoinMatch::Foreign)
+                    LOG_WARNING << "[BIP110-STRATUM] REJECTED foreign-coin payout "
+                                   "address (user=" << username << ") — not a "
+                                   "BIP-110 address; refusing to misdirect funds";
+            }
+            if (payout_script.empty()) payout_script = donation_script_;
+            create_share_fn_(mint_cb, hdr, *job, payout_script);
+        }
         return nlohmann::json(true);
     }
 
     // SHARE ARM (M3 seam): p2pool sharechain write. Unset in M2 -> validated +
-    // counted by the core, no mint.
+    // counted by the core, no mint. When set (main_bip110 --bip110-sharechain),
+    // the callback mints via bip110::pool::create_local_share. The payout_script
+    // is derived here from the authorized username (the miner's own address),
+    // falling back to the node-owner/donation script — the same identity the
+    // coinbase pays — so the minted share's PPLNS payout is consistent.
     if (create_share_fn_) {
         std::vector<unsigned char> coinbase;
         {
@@ -716,7 +960,22 @@ nlohmann::json Bip110WorkSource::mining_submit(
             auto it = freeze_map_.find(to_hex(f.h2));
             if (it != freeze_map_.end()) coinbase = it->second.coinbase;
         }
-        create_share_fn_(coinbase, hdr, *job);
+        // #961: validate against BIP-110's OWN version bytes / HRP before
+        // building a script (see the won-block arm above) — a foreign-coin
+        // address is rejected (→ empty → donation fallback), never repurposed.
+        // Accepted set REGISTRY-SOURCED and network-derived (incl. regtest).
+        std::vector<unsigned char> payout_script;
+        {
+            auto amatch = core::classify_address_for_coin(
+                username, bip110::address_acceptance(is_testnet_, is_regtest_),
+                payout_script);
+            if (amatch == core::AddressCoinMatch::Foreign)
+                LOG_WARNING << "[BIP110-STRATUM] REJECTED foreign-coin payout "
+                               "address (user=" << username << ") — not a BIP-110 "
+                               "address; refusing to misdirect funds";
+        }
+        if (payout_script.empty()) payout_script = donation_script_;
+        create_share_fn_(coinbase, hdr, *job, payout_script);
     }
     return nlohmann::json(true);
 }

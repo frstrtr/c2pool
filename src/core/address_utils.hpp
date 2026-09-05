@@ -50,6 +50,150 @@ bool is_address_for_chain(const std::string& address,
     const std::vector<std::string>& chain_hrps,
     const std::vector<uint8_t>& chain_versions);
 
+// -- Per-coin address validation (issue #961) ---------------------------------
+// The plain address_to_script()/address_to_hash160() decoders are chain-AGNOSTIC:
+// they accept the version byte / bech32 HRP of ANY supported coin and then build
+// a scriptPubKey for whatever coin the caller happens to be running. Fed a
+// foreign-coin payout address that path silently emits a wrong-coin script and
+// MISDIRECTS the miner's funds. classify_address_for_coin() closes that hole by
+// validating the version byte / HRP against the running coin BEFORE building a
+// script, so a foreign address is rejected loudly instead of being repurposed.
+
+/// The set of Base58Check version bytes and bech32 HRPs a given coin accepts as
+/// its OWN payout addresses on a given network (mainnet / testnet / regtest).
+/// Populated by each coin's registry (address_acceptance()) from its chainparams
+/// SSOT — NEVER hardcoded at a stratum money-path call site (issue #961 blocker
+/// #3) — and network-derived so a --regtest address is accepted rather than
+/// silently rejected as Foreign (blocker #2).
+struct CoinAddressAcceptance {
+    std::vector<uint8_t>     p2pkh_versions;   ///< accepted P2PKH version bytes
+    std::vector<uint8_t>     p2sh_versions;    ///< accepted P2SH version bytes
+    std::vector<std::string> bech32_hrps;      ///< BARE HRPs, NO trailing '1' (e.g. "ltc")
+};
+
+/// Result of classify_address_for_coin().
+enum class AddressCoinMatch {
+    Invalid,   ///< Not a Base58Check or bech32 address this decoder understands
+               ///< (e.g. a CashAddr, or a checksum failure). out_script empty.
+               ///< The caller MAY consult a coin-specific decoder next.
+    Foreign,   ///< Well-formed address, but for a DIFFERENT coin (version byte /
+               ///< bech32 HRP not in this coin's accepted set). out_script empty;
+               ///< the caller MUST reject — never pay it.
+    Own        ///< Valid address for THIS coin. out_script holds its scriptPubKey.
+};
+
+/// Decode `address` and classify it against the running coin's accepted
+/// Base58Check version bytes and bech32 HRPs. On Own, out_script is the
+/// scriptPubKey (P2PKH/P2SH for base58, witness program for bech32); on
+/// Foreign/Invalid out_script is left empty. `accepted_hrps` are BARE prefixes
+/// with NO trailing '1' (e.g. {"ltc","tltc"}); pass {} for coins without bech32.
+AddressCoinMatch classify_address_for_coin(
+    const std::string& address,
+    const std::vector<uint8_t>& p2pkh_versions,
+    const std::vector<uint8_t>& p2sh_versions,
+    const std::vector<std::string>& accepted_hrps,
+    std::vector<unsigned char>& out_script);
+
+/// Convenience wrapper: returns the scriptPubKey ONLY for an own-coin address,
+/// and an EMPTY vector for a foreign-coin OR unparseable address. Use this in
+/// place of address_to_script() on the payout money-path so a foreign address
+/// can never be repurposed into a wrong-coin script.
+std::vector<unsigned char> address_to_script_for_coin(
+    const std::string& address,
+    const std::vector<uint8_t>& p2pkh_versions,
+    const std::vector<uint8_t>& p2sh_versions,
+    const std::vector<std::string>& accepted_hrps);
+
+/// Overloads taking a registry-sourced CoinAddressAcceptance (issue #961). Every
+/// stratum payout money-path passes the running coin's acceptance for the ACTIVE
+/// network so the check needs no hardcoded version bytes and honours regtest.
+inline AddressCoinMatch classify_address_for_coin(
+    const std::string& address, const CoinAddressAcceptance& acc,
+    std::vector<unsigned char>& out_script)
+{
+    return classify_address_for_coin(address, acc.p2pkh_versions,
+        acc.p2sh_versions, acc.bech32_hrps, out_script);
+}
+inline std::vector<unsigned char> address_to_script_for_coin(
+    const std::string& address, const CoinAddressAcceptance& acc)
+{
+    return address_to_script_for_coin(address, acc.p2pkh_versions,
+        acc.p2sh_versions, acc.bech32_hrps);
+}
+
+/// Normalise a CoinParams-style bech32 HRP to the BARE form the acceptance set
+/// wants (issue #961 blocker #3). CoinParams.bech32_hrp is stored inconsistently
+/// across the lanes — LTC keeps the separator ("ltc1"), DGB/BIP-110 store it bare
+/// ("dgb"/"bc") — so a registry-derived address_acceptance() strips a single
+/// trailing '1' (the bech32 HRP/data separator) to get the bare prefix. A bare
+/// HRP never ends in '1' (it is the separator), so this is loss-free.
+inline std::string bare_bech32_hrp(const std::string& hrp)
+{
+    if (!hrp.empty() && hrp.back() == '1') return hrp.substr(0, hrp.size() - 1);
+    return hrp;
+}
+
+/// A CONFIGURED merged-mining chain's address-identification triple (issue #961).
+/// bech32 HRPs (bare) + Base58Check version bytes, exactly as the stratum server's
+/// merged-chain table records them — passed to decide_payout_address() so a
+/// legitimate merged-mining payout (same secp256k1 key, spendable on the parent's
+/// P2PKH) is accepted while an UNconfigured foreign coin's address is rejected.
+struct MergedChainAddr {
+    std::vector<std::string> hrps;
+    std::vector<uint8_t>     versions;
+};
+
+/// The stratum payout money-path decision for a miner-supplied address on a node
+/// that has published its own acceptance set (issue #961 blocker #1). This is the
+/// SSOT the stratum server consults at BOTH mining.authorize (reject at the door)
+/// and per-job coinbase build (guard: never build a zero/foreign payout):
+///   • AcceptOwn    — an own-coin address; the caller builds its script.
+///   • AcceptMerged — a CONFIGURED merged chain's address; the caller builds the
+///                    parent P2PKH to the same hash160 (the intended reuse).
+///   • Reject       — foreign-and-unconfigured, or unparseable; the caller MUST
+///                    refuse (no empty/zero-hash160 payout, which PPLNS would burn).
+enum class PayoutAddressDecision { AcceptOwn, AcceptMerged, Reject };
+
+// Forward declaration (full declaration below): the payout-decision SSOT
+// consults the coin-registered native-format decoders (e.g. BCH CashAddr) so a
+// running coin's OWN address that the built-in Base58Check / bech32 classifier
+// cannot parse is still accepted rather than door-rejected (issue #961 cross-lane).
+std::vector<unsigned char> address_to_script(const std::string& address);
+
+inline PayoutAddressDecision decide_payout_address(
+    const std::string& address,
+    const CoinAddressAcceptance& own,
+    const std::vector<MergedChainAddr>& configured_merged)
+{
+    std::vector<unsigned char> own_script;
+    auto m = classify_address_for_coin(address, own, own_script);
+    if (m == AddressCoinMatch::Own)
+        return PayoutAddressDecision::AcceptOwn;
+    // Only a well-formed-but-Foreign address can still be a configured merged
+    // chain; an Invalid (unparseable) address is never a base58/bech32 payout.
+    if (m == AddressCoinMatch::Foreign) {
+        for (const auto& c : configured_merged) {
+            if (is_address_for_chain(address, c.hrps, c.versions))
+                return PayoutAddressDecision::AcceptMerged;
+        }
+        return PayoutAddressDecision::Reject;
+    }
+    // Invalid to the built-in Base58Check / bech32 decoders — but the running
+    // coin may register a NATIVE-format decoder for its own addresses (BCH
+    // registers a CashAddr decoder into address_to_script). A non-empty script
+    // means THIS node can build the miner's own-coin payout, so accept it
+    // (reward-safe: the door must not reject a coin's native address format).
+    // This can only fire via a registered decoder: an Invalid classification
+    // means the built-in base58/bech32 in address_to_script() also fail, so a
+    // truly undecodable address still Rejects, and a well-formed foreign address
+    // is Foreign (handled above), never Invalid — no misdirection is opened.
+    if (m == AddressCoinMatch::Invalid && !address.empty()) {
+        if (!address_to_script(address).empty())
+            return PayoutAddressDecision::AcceptOwn;
+    }
+    return PayoutAddressDecision::Reject;
+}
+
 /// Build a scriptPubKey from either a Base58Check or Bech32 address.
 /// Returns empty vector on failure.
 std::vector<unsigned char> address_to_script(const std::string& address);

@@ -58,6 +58,7 @@
 #include <impl/ltc/share_messages.hpp>
 #include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/node.hpp>
+#include <sharechain/pool_rate_head_select.hpp> // sharechain::select_pool_rate_head + average_stale_prop (#1482)
 #include <impl/ltc/messages.hpp>
 // NOTE: must follow node.hpp/messages.hpp. coin_node.hpp pulls in
 // btclibs/serialize.h, which #undefs READWRITE and redefines it to the
@@ -66,6 +67,7 @@
 // AppleClang/arm64 ("use of undeclared identifier s / ser_action").
 #include <impl/ltc/coin/coin_node.hpp>
 #include <impl/ltc/config.hpp>
+#include <impl/ltc/params.hpp>  // ltc::address_acceptance (#961 registry-sourced payout check)
 #include <impl/ltc/work_target.hpp>
 
 // Chain seed discovery
@@ -1765,6 +1767,19 @@ int main(int argc, char* argv[]) {
             // during SPV header sync and share loading.
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port),
                                      settings->m_testnet, enhanced_node, blockchain);
+            // #961: publish the running coin's REGISTRY-SOURCED payout-address
+            // acceptance (LTC on the active network) so the core stratum server
+            // validates each per-job coinbase payout against LTC's own version
+            // bytes / HRP at the parse — a foreign-coin address is rejected
+            // (empty payout) instead of being repurposed into a wrong-coin
+            // script, while a configured merged chain's address (DOGE etc.) is
+            // still honoured via the shared merged-chain table.
+            {
+                auto acc = ltc::address_acceptance(settings->m_testnet);
+                stratum_config.payout_p2pkh_versions = acc.p2pkh_versions;
+                stratum_config.payout_p2sh_versions  = acc.p2sh_versions;
+                stratum_config.payout_bech32_hrps    = acc.bech32_hrps;
+            }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
             // (lambdas read the immutable snapshot published in main()). POST
@@ -3050,48 +3065,31 @@ int main(int argc, char* argv[]) {
                 // (think+clean holds write lock ~30% of sampling intervals).
                 web_server.get_mining_interface()->set_pool_hashrate_fn(
                     [&p2p_node]() -> double {
-                        static double s_last_good = 0.0;
-                        // ── STALENESS BOUND (#57) ─────────────────────────
-                        // The last-good latch smooths transient tracker lock
-                        // contention, but unbounded it also turns a frozen
-                        // estimator into a permanent flat plateau (the DASH
-                        // dash.voidbind.com symptom). Bound it: if no fresh
-                        // hr>0 for >10 min, publish 0 so the chart breaks the
-                        // line instead of holding a stuck value forever.
+                        // #1482: read the pool hashrate straight off the lock-free
+                        // TrackerSnapshot, which NodeImpl::publish_snapshot()
+                        // computes under the compute-thread exclusive lock every
+                        // think() cycle (over sharechain::select_pool_rate_head's
+                        // live head, DISPLAY LOOKBEHIND = min(height-1,
+                        // 3600/SHARE_PERIOD), p2pool web.py get_global_stats).
+                        // No try-lock, so no cached last-good latch and no
+                        // bit-identical repeats for the web frozen-guard to zero
+                        // into false 0-drops (the rectangular graph). The 600 s
+                        // staleness bound (#57) still applies, keyed on the
+                        // snapshot's own compute timestamp so a stalled think()
+                        // breaks the line instead of holding a frozen value.
                         // Display-only; the retarget never reads this hook.
-                        static int64_t s_last_good_ts = 0;
+                        auto snap = p2p_node->get_tracker_snapshot();
+                        if (snap.pool_hashrate <= 0.0 || snap.pool_hashrate_ts == 0)
+                            return 0.0;
                         const int64_t now_s =
                             std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::steady_clock::now()
+                                std::chrono::system_clock::now()
                                     .time_since_epoch())
                                 .count();
                         constexpr int64_t kStaleSeconds = 600;  // 10 min
-                        auto held = [&]() -> double {
-                            if (s_last_good_ts != 0 &&
-                                now_s - s_last_good_ts > kStaleSeconds)
-                                return 0.0;
-                            return s_last_good;
-                        };
-                        auto best = p2p_node->best_share_hash();
-                        if (best.IsNull()) return held();
-                        auto guard = p2p_node->read_tracker();
-                        if (!guard) return held();
-                        if (!guard->chain.contains(best)) return held();
-                        int height = guard->chain.get_height(best);
-                        if (height < 3) return held();
-                        // DISPLAY LOOKBEHIND (#864): p2pool web.py get_global_stats()
-                        // averages the gauge over ONE HOUR of shares --
-                        // min(height, 3600//SHARE_PERIOD) -- not TARGET_LOOKBEHIND.
-                        // DISPLAY ONLY: the CONSENSUS retarget keeps TARGET_LOOKBEHIND
-                        // (p2pool data.py:137,140) and is untouched; m_pool_hashrate_fn
-                        // is read exclusively by web_server REST handlers.
-                        const int display_lookbehind =
-                            3600 / static_cast<int>(ltc::PoolConfig::share_period());
-                        auto lookbehind = std::min(height - 1, display_lookbehind);
-                        auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
-                        double hr = static_cast<double>(aps.GetLow64());
-                        if (hr > 0) { s_last_good = hr; s_last_good_ts = now_s; }
-                        return held();
+                        if (now_s - snap.pool_hashrate_ts > kStaleSeconds)
+                            return 0.0;
+                        return snap.pool_hashrate;
                     });
                 // pool_hashrate is derived from the sharechain tip — move off
                 // the 1 Hz periodic timer onto the tip-change signal, same
@@ -3589,12 +3587,70 @@ int main(int argc, char* argv[]) {
                 nlohmann::json result;
                 auto& chain = guard->chain;
 
-                // Use tallest chain head (not verified best) so stats stay current during sync
-                uint256 best;
-                int32_t best_height = -1;
+                // #1482: anchor the stats on the pool's best-known LIVE head, not
+                // the tallest RAW head. The tallest-raw rule flipped the anchor
+                // between two near-equal-height forks sample-to-sample, which is
+                // what made the pool-rate graph a rectangle and the stale-prop
+                // series flap. Pure SSOT sharechain::select_pool_rate_head:
+                // verified best when live, else the fastest live raw head.
+                // Display-only; the vardiff retarget never reads this.
+                const int64_t stats_now_s = static_cast<int64_t>(std::time(nullptr));
+                const int stats_share_period =
+                    static_cast<int>(ltc::PoolConfig::share_period());
+                const int stats_lookbehind =
+                    3600 / (stats_share_period > 0 ? stats_share_period : 1);
+                auto make_stat_head = [&](const uint256& hh)
+                        -> sharechain::PoolRateHead {
+                    sharechain::PoolRateHead rh;
+                    rh.hash = hh;
+                    if (hh.IsNull() || !chain.contains(hh)) return rh;
+                    rh.height = static_cast<int32_t>(chain.get_height(hh));
+                    try {
+                        auto& cd = chain.get(hh);
+                        int64_t ts = 0;
+                        cd.share.invoke([&](auto* s) {
+                            ts = static_cast<int64_t>(s->m_timestamp);
+                        });
+                        // Future-dated newest share (ts > now) -> NEGATIVE age,
+                        // kept verbatim (maximally live). Only ts<=0 leaves the
+                        // kUnknownAge default (not-live). Issue #1482 blocker A.
+                        if (ts > 0) rh.newest_share_age_s = stats_now_s - ts;
+                    } catch (...) {}
+                    if (rh.height >= 3) {
+                        int lb = rh.height - 1 < stats_lookbehind
+                                     ? rh.height - 1 : stats_lookbehind;
+                        try {
+                            auto aps = guard->get_pool_attempts_per_second(hh, lb, false);
+                            rh.aps = static_cast<double>(aps.GetLow64());
+                        } catch (...) {}
+                    }
+                    return rh;
+                };
+                uint256 verified_best_stat = p2p_node->best_share_hash();
+                sharechain::PoolRateHead stat_vhead;
+                bool stat_vpresent = false;
+                if (!verified_best_stat.IsNull() && chain.contains(verified_best_stat)) {
+                    stat_vhead = make_stat_head(verified_best_stat);
+                    stat_vpresent = true;
+                }
+                std::vector<sharechain::PoolRateHead> stat_raw_heads;
                 for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
-                    auto h = chain.get_height(head_hash);
-                    if (h > best_height) { best = head_hash; best_height = h; }
+                    (void)tail_hash;
+                    stat_raw_heads.push_back(make_stat_head(head_hash));
+                }
+                uint256 best = sharechain::select_pool_rate_head(
+                    stat_vhead, stat_vpresent, stat_raw_heads);
+                int32_t best_height = -1;
+                if (best.IsNull()) {
+                    // Nothing live (empty/bootstrapping tracker): fall back to the
+                    // tallest raw head so the explorer fields still populate.
+                    for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                        (void)tail_hash;
+                        auto h = chain.get_height(head_hash);
+                        if (h > best_height) { best = head_hash; best_height = h; }
+                    }
+                } else {
+                    best_height = static_cast<int32_t>(chain.get_height(best));
                 }
 
                 result["fork_count"]      = static_cast<int>(chain.get_heads().size());
@@ -3652,6 +3708,40 @@ int main(int argc, char* argv[]) {
                 result["total_shares"]    = sr.share_count;
                 result["orphan_shares"]   = sr.orphan_count;
                 result["dead_shares"]     = sr.dead_count;
+
+                // #1482: pool_stale_prop as p2pool data.py get_average_stale_prop
+                // = stales / (lookbehind + stales), counting stales among the
+                // ANCHORED lookbehind window (min(height, 3600/SHARE_PERIOD))
+                // walking back from the selected LIVE head — NOT stales over the
+                // whole CHAIN_LENGTH window. The whole-window count-based formula
+                // (the consumer default) is what flapped 0.05<->0.40 and grossed
+                // pool_hash_rate up by 1/(1-p). Consumers (rest_global_stats,
+                // update_stat_log) prefer this field when present; absent on
+                // other coins -> they keep the legacy path. Display-only.
+                {
+                    int lb_actual = best_height > 0
+                        ? (best_height < stats_lookbehind ? best_height
+                                                          : stats_lookbehind)
+                        : 0;
+                    int stale_ct = 0;
+                    if (lb_actual > 0 && !best.IsNull()) {
+                        uint256 pos = best;
+                        for (int i = 0; i < lb_actual && !pos.IsNull(); ++i) {
+                            if (!chain.contains(pos)) break;
+                            try {
+                                auto& cd = chain.get(pos);
+                                cd.share.invoke([&](auto* s) {
+                                    int si = static_cast<int>(s->m_stale_info);
+                                    if (si == 253 || si == 254) ++stale_ct;
+                                    pos = s->m_prev_hash;
+                                });
+                            } catch (...) { break; }
+                        }
+                    }
+                    result["pool_stale_prop"] =
+                        sharechain::average_stale_prop(stale_ct, lb_actual);
+                }
+
                 result["shares_by_version"] = sr.version_counts;
                 result["shares_by_desired_version"] = sr.desired_version_counts;
                 result["shares_by_miner"]   = sr.miner_counts;

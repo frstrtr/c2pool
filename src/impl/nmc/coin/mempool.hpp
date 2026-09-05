@@ -458,6 +458,27 @@ public:
     /// Return transactions sorted by feerate (highest first), up to max_weight.
     /// Transactions with known fees are prioritized; unknown-fee txs fill remaining space.
     /// Returns total_fees across all selected transactions (known fees only).
+    ///
+    /// #1437 — template validity: the selected set MUST be a self-consistent
+    /// block body or the daemon rejects the whole template
+    /// (bad-txns-inputs-missingorspent) and the found block is LOST. Two hazards
+    /// the naive highest-feerate-first pass admits:
+    ///   (a) child-without-parent — an input funded by another MEMPOOL tx (the
+    ///       parent) selected AFTER the child, or not selected at all. A block
+    ///       must place every parent before its children; a CPFP child normally
+    ///       out-feerates its parent, so pure feerate order emits the child
+    ///       first. Fix: a tx is admissible only once every one of its in-
+    ///       mempool parents is already selected (parents-before-children), and
+    ///       a fixed-point re-scan lets the high-feerate child still land in a
+    ///       later pass — never dropped, never mis-ordered.
+    ///   (b) intra-template double-spend — m_spent_outputs keeps only the LAST
+    ///       writer per outpoint, so two mempool txs spending the same outpoint
+    ///       both stay selectable. An outpoint may be spent by at most one tx in
+    ///       a block. Fix: a per-template consumed-outpoint set refuses the
+    ///       second spender (the lower-feerate one, visited later).
+    /// Reward-neutral: total_fees sums only INCLUDED txs' known fees, so
+    /// coinbasevalue tracks exactly the txs that ship — excluding an invalid tx
+    /// correctly excludes its fee (an invalid tx could never have paid it).
     std::pair<std::vector<SelectedTx>, uint64_t>
     get_sorted_txs_with_fees(uint32_t max_weight) const {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -466,39 +487,71 @@ public:
         uint64_t total_fees = 0;
         uint32_t total_weight = 0;
         std::set<uint256> selected;
+        // Per-template consumed outpoints — (a) prevents intra-template
+        // double-spend (b). One entry per input of every already-selected tx.
+        std::set<std::pair<uint256, uint32_t>> consumed;
 
-        // Pass 1: highest feerate first (known-fee txs)
         auto* utxo = m_utxo.load();
-        for (auto it = m_feerate_index.begin(); it != m_feerate_index.end(); ++it) {
-            auto pit = m_pool.find(it->second);
-            if (pit == m_pool.end()) continue;
-            const auto& entry = pit->second;
-            if (!entry.fee_known) continue;
-            if (total_weight + entry.weight > max_weight) continue;
 
-            // Guard: verify inputs still exist in UTXO (or parent mempool tx).
-            // Catches stale txs in the window between tip-change and full_block arrival.
-            if (utxo) {
-                bool inputs_ok = true;
-                for (const auto& vin : entry.tx.vin) {
-                    core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+        // Can `entry` join the template given the current selection state?
+        //   - refuse if any input outpoint is already consumed (double-spend)
+        //   - if an input is funded by another MEMPOOL tx (parent), that parent
+        //     must already be selected (topological: parents before children);
+        //     otherwise defer — a later fixed-point pass admits it once the
+        //     parent lands.
+        //   - with a UTXO view: an input in neither the UTXO set nor a mempool
+        //     parent is stale/orphan — refuse (unchanged pre-#1437 guard).
+        //   - without a UTXO view: an input with no mempool parent is assumed a
+        //     confirmed coin we cannot see (unchanged legacy behaviour; the fee
+        //     was computable, so the input resolved at add time).
+        auto admissible = [&](const MempoolEntry& entry) -> bool {
+            for (const auto& vin : entry.tx.vin) {
+                std::pair<uint256, uint32_t> op(vin.prevout.hash, vin.prevout.index);
+                if (consumed.count(op)) return false;  // intra-template double-spend
+
+                auto parent = m_pool.find(vin.prevout.hash);
+                const bool has_mempool_parent =
+                    parent != m_pool.end() &&
+                    vin.prevout.index < parent->second.tx.vout.size();
+
+                if (has_mempool_parent) {
+                    if (!selected.count(vin.prevout.hash))
+                        return false;  // parent not yet in template — defer
+                } else if (utxo) {
+                    core::coin::Outpoint uop(vin.prevout.hash, vin.prevout.index);
                     core::coin::Coin coin;
-                    if (!utxo->get_coin(op, coin)) {
-                        // Check if parent is in mempool (CPFP chain)
-                        if (!m_pool.count(vin.prevout.hash) ||
-                            vin.prevout.index >= m_pool.at(vin.prevout.hash).tx.vout.size()) {
-                            inputs_ok = false;
-                            break;
-                        }
-                    }
+                    if (!utxo->get_coin(uop, coin))
+                        return false;  // absent from UTXO and mempool — stale
                 }
-                if (!inputs_ok) continue;  // skip stale tx
             }
+            return true;
+        };
 
-            total_weight += entry.weight;
-            total_fees += entry.fee;
-            result.push_back({entry.tx, entry.fee, true});
-            selected.insert(entry.txid);
+        // Fixed-point selection over the feerate index (highest first). Each
+        // pass admits every currently-admissible fee-known tx; passes repeat
+        // until one adds nothing, so a high-feerate CPFP child admitted only
+        // after its lower-feerate parent still lands — parent first, never
+        // dropped. Bounded by the tx count (each pass adds ≥1 or terminates).
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (auto it = m_feerate_index.begin(); it != m_feerate_index.end(); ++it) {
+                if (selected.count(it->second)) continue;  // already in template
+                auto pit = m_pool.find(it->second);
+                if (pit == m_pool.end()) continue;
+                const auto& entry = pit->second;
+                if (!entry.fee_known) continue;
+                if (total_weight + entry.weight > max_weight) continue;
+                if (!admissible(entry)) continue;
+
+                total_weight += entry.weight;
+                total_fees += entry.fee;
+                result.push_back({entry.tx, entry.fee, true});
+                selected.insert(entry.txid);
+                for (const auto& vin : entry.tx.vin)
+                    consumed.emplace(vin.prevout.hash, vin.prevout.index);
+                progress = true;
+            }
         }
 
         // Unknown-fee txs excluded from template — they'll be included

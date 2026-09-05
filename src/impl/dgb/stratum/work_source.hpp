@@ -286,11 +286,33 @@ public:
     /// (DOGE) block a submitted share solves via try_submit_merged_blocks().
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mm) { mm_manager_ = mm; }
 
+    /// #961: mark this node as running on the DGB regtest network so the payout
+    /// money-path validates a miner's address against the REGTEST address set
+    /// (testnet base58 bytes + "dgbrt" HRP) instead of mainnet — otherwise a
+    /// legitimate --regtest payout address is wrongly rejected as Foreign.
+    /// Called from main under --regtest. Address-validation scope only.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
+
+    /// #961 cross-lane (B4): publish DGB's OWN payout-address acceptance into the
+    /// StratumConfig the core StratumServer reads, so the SAME decide_payout_
+    /// address() door-reject + no-empty-payout guard LTC runs apply on the DGB
+    /// lane — a foreign-unconfigured payout is rejected at the door instead of
+    /// redirected/left-empty. Own-coin + a CONFIGURED merged chain (DOGE) stay
+    /// accepted, byte-identical. Set once at startup, before the server reads it.
+    void set_payout_acceptance(std::vector<uint8_t> p2pkh_versions,
+                               std::vector<uint8_t> p2sh_versions,
+                               std::vector<std::string> bech32_hrps) {
+        config_.payout_p2pkh_versions = std::move(p2pkh_versions);
+        config_.payout_p2sh_versions  = std::move(p2sh_versions);
+        config_.payout_bech32_hrps    = std::move(bech32_hrps);
+    }
+
 private:
     // External dependencies (non-owning references)
     c2pool::dgb::HeaderChain&   chain_;
     dgb::coin::Mempool&         mempool_;
     const bool                  is_testnet_;
+    bool                        is_regtest_ = false;  // #961: --regtest address set
 
     // Submission dispatch
     SubmitBlockFn               submit_block_fn_;

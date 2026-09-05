@@ -45,6 +45,7 @@ ALLOWLIST = {
     ("BIN_BIP110", "--run"),               # embedded run mode toggle
     ("BIN_BIP110", "--coin-p2p-discover"), # fork-peer discovery toggle
     ("BIN_BIP110", "--fork-checkpoint"),   # BLAKE2b fork checkpoint seed toggle
+    ("BIN_BIP110", "--bip110-sharechain"), # M3 sharechain MINT ARM run-mode toggle (default OFF)
     ("BIN_BIP110", "--peer"),              # explicit fork peer host:port
     ("BIN_BIP110", "--http"),              # dashboard/http bind host:port
     ("BIN_BIP110", "--stratum"),           # stratum bind port

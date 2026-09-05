@@ -157,9 +157,12 @@ C2P_PARAM("sharechain.listen", Sharechain, HOSTPORT, RESTART, C_ALL, FROM_POOL_C
   C2P_ALIAS("sharechain.listen", BIN_DGB, "--sharechain-port", VALUE)
   C2P_ALIAS("sharechain.listen", BIN_BCH, "--p2p-port", VALUE)
 
-C2P_PARAM("sharechain.addnodes", Sharechain, LIST_HOSTPORT, RESTART, C_DASH|C_BTC, LIT, "", HOSTPORT_V, "persistent outbound sharechain peers")
+C2P_PARAM("sharechain.addnodes", Sharechain, LIST_HOSTPORT, RESTART, C_DASH|C_BTC|C_BIP110|C_BCH|C_DGB, LIT, "", HOSTPORT_V, "persistent outbound sharechain peers")
   C2P_ALIAS("sharechain.addnodes", BIN_DASH, "--addnode", VALUE)
   C2P_ALIAS("sharechain.addnodes", BIN_BTC, "--sharechain-addnode", VALUE)
+  C2P_ALIAS("sharechain.addnodes", BIN_BIP110, "--sharechain-addnode", VALUE)
+  C2P_ALIAS("sharechain.addnodes", BIN_BCH, "--sharechain-addnode", VALUE)
+  C2P_ALIAS("sharechain.addnodes", BIN_DGB, "--sharechain-addnode", VALUE)
 
 C2P_PARAM("sharechain.connects", Sharechain, LIST_HOSTPORT, RESTART, C_DASH, LIT, "", HOSTPORT_V, "connect-only sharechain peers")
   C2P_ALIAS("sharechain.connects", BIN_DASH, "--connect", VALUE)
@@ -201,6 +204,9 @@ C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC, LIT,
 C2P_PARAM("coin_p2p.connect", CoinP2P, LIST_HOSTPORT, RESTART, C_DASH|C_BCH, LIT, "", HOSTPORT_V, "explicit coin-network dial")
   C2P_ALIAS("coin_p2p.connect", BIN_DASH, "--coin-p2p-connect", VALUE)
   C2P_ALIAS("coin_p2p.connect", BIN_BCH, "--peer", VALUE)
+
+C2P_PARAM("coin_p2p.externalip", CoinP2P, STRING, RESTART, C_BIP110, LIT, "", NONE, "operator-pinned reachable IP for self-address advertisement")
+  C2P_ALIAS("coin_p2p.externalip", BIN_BIP110, "--coin-externalip", VALUE)
 
 C2P_PARAM("coin_p2p.discover", CoinP2P, BOOL, RESTART, C_DASH|C_BTC|C_DGB, LIT, "false", NONE, "scored/diverse coin-P2P discovery")
   C2P_ALIAS("coin_p2p.discover", BIN_DASH, "--coin-p2p-discover", FLAG)
@@ -317,6 +323,12 @@ C2P_PARAM("web.external_ip", WebOps, STRING, LIVE, C_DASH|C_LTC, LIT, "", NONE, 
 C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-static", NONE, "dashboard static asset dir")
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
+
+C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
+  C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)
+  C2P_ALIAS("web.explorer", BIN_DASH, "--no-explorer", FLAG_NO_PREFIX)
+  C2P_ALIAS("web.explorer", BIN_BIP110, "--explorer", FLAG)
+  C2P_ALIAS("web.explorer", BIN_BIP110, "--no-explorer", FLAG_NO_PREFIX)
 
 C2P_PARAM("web.cors_origin", WebOps, STRING, LIVE, C_LTC, LIT, "", NONE, "CORS origin")
   C2P_ALIAS("web.cors_origin", BIN_LTC, "--cors-origin", VALUE)
@@ -469,8 +481,9 @@ C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", 
 C2P_PARAM("embedded.govsync", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "observe-only governance store")
   C2P_ALIAS("embedded.govsync", BIN_DASH, "--embedded-govsync", FLAG)
 
-C2P_PARAM("embedded.serve_mempool_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "fee-carrying templates (daemonless default ON)")
+C2P_PARAM("embedded.serve_mempool_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110|C_DGB, NONE, "", NONE, "fee-carrying templates (daemonless default ON)")
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DASH, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
+  C2P_ALIAS("embedded.serve_mempool_txs", BIN_DGB, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_BIP110, "--serve-mempool-txs", FLAG)
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_BIP110, "--no-serve-mempool-txs", FLAG_NO_PREFIX)
 
@@ -494,6 +507,9 @@ C2P_PARAM("embedded.accrue_asset_unlocks", Embedded, BOOL, RESTART, C_DASH, LIT,
 
 C2P_PARAM("embedded.null_arm", Embedded, TRISTATE_BOOL, MONEY_RESTART, C_DASH, NONE, "", NONE, "optimistic null commitment (money/consensus)")
   C2P_ALIAS("embedded.null_arm", BIN_DASH, "--embedded-null-arm", FLAG_OPT_EQFALSE)
+
+C2P_PARAM("embedded.include_mn_special_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "DIP special-tx superset types 1-4 (daemonless default ON)")
+  C2P_ALIAS("embedded.include_mn_special_txs", BIN_DASH, "--embedded-include-mn-special-txs", FLAG_OPT_EQFALSE)
 
 C2P_PARAM("embedded.fresh_datum_race", Embedded, TRISTATE_BOOL, LIVE, C_DASH, NONE, "", NONE, "race freshest getmnlistd (default ON)")
   C2P_ALIAS("embedded.fresh_datum_race", BIN_DASH, "--embedded-fresh-datum-race", FLAG_OPT_EQFALSE)
@@ -521,6 +537,12 @@ C2P_PARAM("embedded.fold_live_expect", Embedded, HEX, RESTART, C_DASH, LIT, "", 
 
 C2P_PARAM("embedded.fold_checkscripts", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "consensus-exact input-script check")
   C2P_ALIAS("embedded.fold_checkscripts", BIN_DASH, "--embedded-fold-checkscripts", FLAG)
+
+C2P_PARAM("embedded.tx_inject", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "#157 miner/user tx-injection (opt-in, default OFF, reward-neutral)")
+  C2P_ALIAS("embedded.tx_inject", BIN_DASH, "--embedded-tx-inject", FLAG)
+
+C2P_PARAM("embedded.tx_inject_hex", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "#157 local tx-inject submit file (raw tx hex per line)")
+  C2P_ALIAS("embedded.tx_inject_hex", BIN_DASH, "--embedded-tx-inject-hex", VALUE)
 
 C2P_PARAM("embedded.utxo_fold_fees", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "W5 fold fee pricing path (pairs with expect)")
   C2P_ALIAS("embedded.utxo_fold_fees", BIN_DASH, "--embedded-utxo-fold-fees", VALUE)

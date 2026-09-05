@@ -43,8 +43,10 @@
 
 #include <ctime>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <functional>
+#include <string>
 #include <utility>
 
 #include <core/pow.hpp>   // core::SubsidyFunc
@@ -121,8 +123,18 @@ public:
         in.median_time_past = m_chain.median_time_past();
         in.curtime          = curtime;
         in.transactions     = std::move(sel.transactions);
-        if (auto th = m_chain.tip_hash())
+        if (auto th = m_chain.tip_hash()) {
             in.previousblockhash = u256_be_display_hex(*th);
+            // #179: real DigiByte-Core MultiShield V4 next-target from the synced
+            // header chain (SAME SSOT as the stratum work source), replacing the
+            // fabricated diff-1. nullopt (window too shallow) leaves bits unset --
+            // build_work_template then omits it, a truthful absence, never 1d00ffff.
+            if (auto nb = m_chain.next_scrypt_bits()) {
+                char bits_buf[9];
+                std::snprintf(bits_buf, sizeof(bits_buf), "%08x", *nb);
+                in.bits = std::string(bits_buf);
+            }
+        }
         return in;
     }
 

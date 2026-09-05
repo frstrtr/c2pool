@@ -472,6 +472,17 @@
                 return;
             }
 
+            /* BIP110-SHARE-FIELD-GUARD */
+            // bip110 /web/share returns a reduced object (no parent/far_parent/
+            // children/type_name yet). Normalize so renderShare does not throw on
+            // .substr of undefined and hang the page. DASH already carries these.
+            if (share && !share.error) {
+                if (typeof share.parent !== 'string') share.parent = '';
+                if (typeof share.far_parent !== 'string') share.far_parent = '';
+                if (!Array.isArray(share.children)) share.children = [];
+                if (typeof share.type_name !== 'string') share.type_name = share.type_name ? String(share.type_name) : '';
+            }
+
             var html = '';
 
             // Header

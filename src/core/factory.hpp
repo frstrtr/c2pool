@@ -22,9 +22,9 @@ namespace core
 // e527abfe tried to keep the node alive across an async resolve/connect/accept by
 // capturing `node->weak_from_this()`. That silently no-ops for TWO real node
 // shapes:
-//   (a) a virtual-inheritance diamond (e.g. a pool::Node whose INetwork base is
-//       reached through virtual inheritance), where the enable_shared_from_this
-//       base was never enrolled through the owning control block, and
+//   (a) a virtual-inheritance diamond (bip110::pool::Node : virtual NodeImpl :
+//       … : core::INetwork), where the enable_shared_from_this base was never
+//       enrolled through the owning control block, and
 //   (b) a unique_ptr/stack-owned node (the coin NodeP2P — the DOMINANT crasher),
 //       which is not shared_ptr-managed at all.
 // In both cases weak_from_this() is EMPTY → was_managed=false → the guard is a

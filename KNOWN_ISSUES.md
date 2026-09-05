@@ -8,7 +8,7 @@ documented in the [postmortem archive](https://github.com/frstrtr/the/tree/maste
 ## DASH daemonless masternode set is seeded from a TRUST ANCHOR
 
 **Severity**: Medium (security-model disclosure, not a defect)
-**Affects**: DASH `--embedded-mainnet` run WITHOUT a dashd RPC
+**Affects**: DASH daemonless run (bare `--run`, no dashd RPC — the default posture)
 
 c2pool cannot derive the payout-bearing DASH masternode set from the P2P
 network: the Simplified MN List omits `scriptPayout` and `nLastPaidHeight`,

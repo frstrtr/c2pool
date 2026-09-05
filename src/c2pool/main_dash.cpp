@@ -91,6 +91,7 @@
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
+#include <impl/dash/coin/block_json.hpp>         // dash::coin::block_to_explorer_json — /api/explorer getblock body decode
 #include <impl/dash/coin/bestblock_diag.hpp>     // #1046 bestblock out=0 diagnostic classifier (RpcNotString/BadHexLen/Ok)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
@@ -477,17 +478,21 @@ void print_banner(const char* argv0)
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
-        << "           [--embedded-utxo] [--embedded-mainnet] [--embedded-null-arm] [--embedded-mn-bridge-max N]\n"
+        << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
+        << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
+        << "           [--embedded-accrue-asset-locks[=false]] [--embedded-mn-bridge-max N]\n"
         << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs[=false]]\n"
         << "           [--embedded-tx-serve-own-set[=false]]\n"
-        << "             (mempool serving levers default ON when NO dashd arm is given —\n"
-        << "              daemonless nodes serve the FULL mempool; =false opts out)\n"
+        << "             (ALL embedded serving levers default ON when NO dashd arm is given —\n"
+        << "              bare `--run` = daemonless, serves the FULL mempool + special txs (DIP\n"
+        << "              types 1-4) + funded superblocks, reward-safe; =false opts each out)\n"
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-fold-checkscripts]\n"
+        << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -537,12 +542,14 @@ void print_banner(const char* argv0)
         << "        clean_jobs notify on the fallback arm; absent/unreachable => the 3 s\n"
         << "        getbestblockhash poll is the active path (requires dashd\n"
         << "        zmqpubhashblock=tcp://HOST:PORT). No consensus effect.\n"
-        << "        --embedded-mainnet (DEFAULT OFF) is the single opt-in for the\n"
-        << "        DAEMONLESS embedded template arm on MAINNET. It lifts the arm gate\n"
-        << "        AND arms the coin-state feed that populates it (seed-based peer\n"
-        << "        discovery unless --coin-p2p-connect names peers), so one flag takes\n"
-        << "        the arm end to end. WITHOUT it a mainnet node ALWAYS serves the\n"
-        << "        reward-safe dashd-RPC fallback: --coin-p2p-connect/--coin-p2p-discover\n"
+        << "        --embedded-mainnet drives the DAEMONLESS embedded template arm on\n"
+        << "        MAINNET. It DEFAULTS ON when no dashd arm is requested (bare `--run`\n"
+        << "        = daemonless; good_citizen_defaults.hpp), and is default OFF on a\n"
+        << "        dashd-armed node. It lifts the arm gate AND arms the coin-state feed\n"
+        << "        that populates it (seed-based peer discovery unless --coin-p2p-connect\n"
+        << "        names peers), so one flag takes the arm end to end. With\n"
+        << "        --embedded-mainnet=false a mainnet node serves the reward-safe\n"
+        << "        dashd-RPC fallback: --coin-p2p-connect/--coin-p2p-discover\n"
         << "        are transport only and NEVER move the arm. Even when armed, every\n"
         << "        per-template gate (SML fresh at tip, non-superblock, credit-pool seed\n"
         << "        height, bestCL, MN-payee cursor, DKG plan) fails closed to dashd.\n"
@@ -1074,6 +1081,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // armed (fold_live_db). DEFAULT false => no check, byte-
              // identical to master.
              bool embedded_fold_checkscripts = false,
+             // --embedded-tx-inject (#157, post-cut Tier-3): opt-in miner/user
+             // tx-injection. A raw consensus-valid tx handed to c2pool is
+             // admitted to the mempool with PRIORITY (a large mapDeltas delta)
+             // so it lands in the block c2pool mines regardless of fee rate and
+             // is non-standard-tolerant — the only gate is consensus-validity,
+             // enforced by the SAME selector guards every body tx passes.
+             // DEFAULT OFF. REWARD-SAFE: an inject is an ordinary body tx; the
+             // coinbase / subsidy / PPLNS / payee path is byte-unchanged (a
+             // 0-fee inject adds 0 to fees). Injects ride the served-body path,
+             // so this augments the daemonless / --embedded-serve-mempool-txs
+             // serve posture and requires the consensus-exact input-script check
+             // (--embedded-fold-checkscripts) to be armed (new ingestion seam).
+             bool embedded_tx_inject = false,
+             // --embedded-tx-inject-hex FILE: local submit path (M1). One raw
+             // tx hex per line (classic type-0 only, all-or-nothing at load),
+             // mirroring --pin-local-tx-hex. Each is submitted through the
+             // validation + priority gate at wiring time and its named verdict
+             // logged; continuous re-submission + the p2p tx-inject transport
+             // are M2. Empty (default) => no local injects.
+             const std::string& embedded_tx_inject_hex_path = std::string(),
              // --embedded-utxo-fold-fees DBPATH (+ REQUIRED
              // --embedded-utxo-fold-expect HEX): W5-A. Open the W3 full-
              // history UTXO fold at DBPATH and install FoldFeeSource as the
@@ -1091,9 +1118,36 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // The #1218 gbt-xcheck-txmerkle guard is UNTOUCHED and stays
              // the referee on any divergence.
              const std::string& embedded_utxo_fold_fees_db = std::string(),
-             const std::string& embedded_utxo_fold_expect = std::string())
+             const std::string& embedded_utxo_fold_expect = std::string(),
+             // --explorer / --no-explorer: the loopback-only /api/explorer
+             // surface consumed by explorer.py --coin dash --c2pool. Default ON
+             // (read-only + loopback-guarded, so exposing it is safe). Enabling
+             // it (a) opens the http_session gate (set_explorer_enabled), (b)
+             // wires the three mempool explorer callbacks, (c) extends the
+             // coin-chain-query getblock hook to serve decoded block BODIES from
+             // retained raw blocks, and (d) arms flag-gated raw-block retention
+             // (depth DASH_EXPLORER_DEPTH) into the node's own UTXO LevelDB.
+             // Retention additionally requires --embedded-utxo (the lane that
+             // owns that DB); without it getblock stays the honest header-only
+             // #99 partial. ZERO consensus/gentx/reward/coinbase/share path.
+             bool explorer_enabled = true,
+             // --embedded-include-mn-special-txs: the special-tx superset (DIP
+             // types 1-4). DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp),
+             // resolved by the good-citizen resolver in main(). Forwarded to
+             // NodeCoinState::set_include_mn_special_txs; the builder DROPS any
+             // special tx the SML fold cannot apply exactly and the emit gate
+             // re-folds and rejects on root drift, so an included special tx
+             // always commits a folded MN root. Default false = today's
+             // exclude-all (coinbase-only body for special txs).
+             bool embedded_include_mn_special_txs = false)
 {
     namespace io = boost::asio;
+
+    // Explorer raw-block retention window: heights whose full block bodies are
+    // kept in the UTXO LevelDB for /api/explorer getblock decode. 288 ≈ 2 days
+    // at Dash's 2.5-min block target (the LTC/bip110 explorer default). Storage
+    // only, flag-gated on explorer_enabled; NEVER a consensus/reward path.
+    constexpr uint32_t DASH_EXPLORER_DEPTH = 288;
 
     dash::coin::RpcConf conf;
     std::string conf_path = rpc_conf_path;
@@ -2693,6 +2747,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // never coincide) and blind to a strict SUBSET that contains an invalid
     // transaction, which is exactly the case that costs a whole block.
     node_coin_state.set_serve_mempool_txs(embedded_serve_mempool_txs);
+    // #157 (--embedded-tx-inject): arm the opt-in miner/user tx-injection lane.
+    // Default OFF; the actual local submits happen after the mempool + the
+    // consensus-exact script check are wired (see --embedded-tx-inject-hex).
+    node_coin_state.set_tx_inject_enabled(embedded_tx_inject);
+    if (embedded_tx_inject) {
+        std::cout << "[run] embedded-tx-inject ARMED (#157): miner/user tx-injection "
+                     "ON — submitted txs ride the block with priority through the "
+                     "SAME validity gate; reward path byte-unchanged. Requires "
+                     "--embedded-fold-checkscripts + the served-body posture.\n";
+    }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
     // dashd's miner refuses any not-yet-islocked tx with vins younger than 10
     // minutes when spork2 (InstantSend) AND spork3 (RejectConflictingBlocks)
@@ -2727,6 +2791,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // committing this accrual is valid only once the same type-8 txs ride the
     // served body (blocked on #125); otherwise a submitted coinbase-only block
     // is bad-cbtx-assetlocked-amount. Hence OFF by default.
+    // Special-tx superset (DIP types 1-4): wire the seam that
+    // work_source.hpp already forwards to embedded_gbt (include_mn_special_txs).
+    // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): dashd's CreateNewBlock
+    // serves these, so excluding them is a good-citizen gap. Reward-safe — the
+    // builder drops any special tx the SML fold cannot apply exactly and the
+    // emit gate re-folds and rejects on root drift.
+    node_coin_state.set_include_mn_special_txs(embedded_include_mn_special_txs);
+    std::cout << "[run] embedded special-tx superset (DIP types 1-4): "
+              << (embedded_include_mn_special_txs
+                      ? "ON (--embedded-include-mn-special-txs: SML-folded "
+                        "special txs admitted; root re-folded + drift-rejected "
+                        "at emit)"
+                      : "OFF (default off / dashd-armed: special txs excluded, "
+                        "coinbase-only for those types)")
+              << "\n";
     node_coin_state.set_accrue_pending_asset_locks(embedded_accrue_asset_locks);
     std::cout << "[run] embedded #107 asset-lock accrual: "
               << (embedded_accrue_asset_locks
@@ -2966,8 +3045,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     ? dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet
                     : dash::coin::UtxoImmaturePolicy::Refuse);
             utxo_block_sub = coin_state.block_connected.subscribe(
-                [&utxo_lane](const dash::interfaces::BlockConnected& bc) {
+                [&utxo_lane, explorer_enabled, DASH_EXPLORER_DEPTH]
+                (const dash::interfaces::BlockConnected& bc) {
                     utxo_lane.on_block_connected(bc.block, bc.height);
+                    // Explorer raw-block retention (flag-gated, pruned to depth).
+                    // The embedded arm already downloaded this full block for the
+                    // UTXO fold; keep the last DASH_EXPLORER_DEPTH bodies in the
+                    // lane's own LevelDB so /api/explorer getblock can decode them.
+                    // STORAGE ONLY — no consensus/reward/coinbase path is touched;
+                    // below the window getblock stays the honest #99 partial.
+                    if (explorer_enabled && utxo_lane.db()) {
+                        PackStream ps;
+                        ps << bc.block;
+                        auto span = ps.get_span();
+                        std::vector<uint8_t> raw(
+                            reinterpret_cast<const uint8_t*>(span.data()),
+                            reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+                        utxo_lane.db()->put_raw_block(bc.height, raw);
+                        utxo_lane.db()->prune_raw_blocks(bc.height, DASH_EXPLORER_DEPTH);
+                    }
                 });
             std::cout << "[run] embedded UTXO/fee lane ARMED: db=" << utxo_path
                       << " best_height=" << utxo_lane.cache()->get_best_height()
@@ -3394,6 +3490,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
     // SML+quorum freshness + superblock viability gates keep it fail-safe.
     work_source->set_embedded_mainnet(embedded_mainnet);
+    // #961 cross-lane (B4): publish DASH's REGISTRY-SOURCED own-coin payout-address
+    // acceptance into the StratumConfig the core StratumServer reads, so the SAME
+    // decide_payout_address() door-reject (mining.authorize) + no-empty-payout
+    // guard (send_notify_work) LTC runs also apply on the DASH lane — a foreign-
+    // unconfigured payout is rejected at the door instead of redirected. DASH
+    // rides the testnet flag for --regtest (its regtest reuses the testnet address
+    // bytes X.../7... → y.../8...); own-coin addresses stay accepted byte-identically.
+    {
+        const auto acc = dash::address_acceptance(testnet, /*regtest=*/false);
+        work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
+                                           acc.bech32_hrps);
+    }
     // Publish the live template to the dashboard PPLNS view (declared far above,
     // where the WebServer seams are bound). peek_template() is the SAME
     // non-fetching peek the block-value card already uses — it never triggers a
@@ -4478,18 +4586,243 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // named condition with its measured value and threshold, never a zero.
         if (web_server) {
             web_server->get_mining_interface()->set_coin_chain_query_fn(
-                [hc = header_chain.get()](const std::string& method,
-                                          const nlohmann::json& params,
-                                          const std::string& chain) -> nlohmann::json {
+                [hc = header_chain.get(), &utxo_lane, explorer_enabled,
+                 DASH_EXPLORER_DEPTH, testnet]
+                (const std::string& method,
+                 const nlohmann::json& params,
+                 const std::string& chain) -> nlohmann::json {
                     if (chain != "dash")
                         return nlohmann::json{
                             {"error", "chain '" + chain + "' is not served by this "
                                       "node (owned chain: dash)"}};
+
+                    // ── Explorer getblock BODY serve (read-only) ──────────────
+                    // http_session routes getblock to THIS coin-chain-query hook
+                    // (it precedes the explorer_getblock_fn family for coin-owned
+                    // methods). chain_rpc::getblock can only answer a header-only
+                    // #99 PARTIAL — it holds no block bodies. When the explorer is
+                    // enabled AND the embedded UTXO lane retained this block's
+                    // body (depth DASH_EXPLORER_DEPTH), decode it into a full
+                    // verbosity-2 JSON (tx list, DIP4 extraPayload, MN-payee
+                    // vouts). GOOD-CITIZEN: this only ADDS bodies; anything not
+                    // retained (below the window, body absent, verbosity 0 raw
+                    // hex) falls through to chain_rpc's existing named refusals —
+                    // nothing currently servable is removed.
+                    if (explorer_enabled && method == "getblock"
+                        && params.is_array() && !params.empty()
+                        && params[0].is_string() && utxo_lane.db()) {
+                        bool want_decode = true;   // no verbosity == full decode
+                        if (params.size() > 1) {
+                            if (params[1].is_number())
+                                want_decode = params[1].get<int>() >= 1;
+                            else if (params[1].is_boolean())
+                                want_decode = params[1].get<bool>();
+                        }
+                        if (want_decode) {
+                            uint256 blk_hash;
+                            blk_hash.SetHex(params[0].get<std::string>());
+                            auto entry = hc->get_header(blk_hash);
+                            if (entry) {
+                                uint32_t height = entry->height;
+                                uint32_t tip = hc->height();
+                                const bool in_window =
+                                    !(tip > DASH_EXPLORER_DEPTH
+                                      && height < tip - DASH_EXPLORER_DEPTH);
+                                if (in_window) {
+                                    auto raw = utxo_lane.db()->get_raw_block(height);
+                                    if (raw) {
+                                        try {
+                                            PackStream ps(*raw);
+                                            dash::coin::BlockType block;
+                                            ps >> block;
+                                            dash::coin::ExplorerChainParams ep;
+                                            ep.bech32_hrp = "";            // Dash: no bech32
+                                            ep.p2pkh_ver  = testnet ? 0x8c : 0x4c;
+                                            ep.p2sh_ver   = testnet ? 0x13 : 0x10;
+                                            ep.chain_name = testnet ? "test" : "main";
+                                            return dash::coin::block_to_explorer_json(
+                                                block, height, blk_hash, ep);
+                                        } catch (...) {
+                                            // Fall through to the header-chain
+                                            // partial; never fake a body.
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     return dash::coin::chain_rpc::chain_query(*hc, method, params);
                 });
             std::cout << "[run] daemonless chain queries ARMED "
                          "(getbestblockhash/getblockhash/getblockchaininfo "
-                         "answered from the header chain)\n";
+                         "answered from the header chain"
+                      << (explorer_enabled
+                              ? "; getblock bodies from retained raw blocks)"
+                              : ")")
+                      << "\n";
+
+            // ── Explorer API surface (loopback-only, read-only) ───────────────
+            // Open the http_session /api/explorer gate + wire the mempool
+            // callbacks explorer.py --coin dash --c2pool consumes. This is the
+            // ONLY caller of set_explorer_enabled on the DASH lane (main_ltc.cpp
+            // is the reference); without it the gate answers
+            // {"error":"Explorer not enabled"}.
+            //
+            // Only THREE callbacks are wired here — getmempoolinfo / getrawmempool
+            // / getmempoolentry. The chain-info / blockhash / getblock methods are
+            // coin-OWNED (served by the coin-chain-query hook above), so their
+            // explorer_*_fn siblings would be dead code and are deliberately NOT
+            // installed. All feeds are display-only reads over the mempool
+            // snapshot — no gentx/selection/reward/coinbase/share path is touched.
+            if (explorer_enabled) {
+                auto* mi = web_server->get_mining_interface();
+                mi->set_explorer_enabled(true);
+                auto* mp = &node_coin_state.mempool();
+                auto chain_ok = [](const std::string& c) {
+                    return c.empty() || c == "dash";
+                };
+
+                // getmempoolinfo — summary stats + feerate histogram.
+                mi->set_explorer_mempoolinfo_fn(
+                    [mp, chain_ok](const std::string& chain) -> nlohmann::json {
+                        if (!chain_ok(chain))
+                            return nlohmann::json{{"error", "Mempool not available for chain"}};
+                        auto snap = mp->get_summary();
+                        time_t now = std::time(nullptr);
+                        struct Bucket { double lo, hi; size_t count{0}; size_t bytes{0}; };
+                        std::vector<Bucket> buckets = {{0,1},{1,5},{5,20},{20,100},{100,1e9}};
+                        for (const auto& e : snap.entries) {
+                            double fr = e.feerate;
+                            for (auto& b : buckets) {
+                                if (fr >= b.lo && fr < b.hi) { ++b.count; b.bytes += e.base_size; break; }
+                            }
+                        }
+                        nlohmann::json hist = nlohmann::json::array();
+                        for (const auto& b : buckets) {
+                            hist.push_back({
+                                {"min_feerate", b.lo},
+                                {"max_feerate", b.hi >= 1e9 ? nlohmann::json("inf") : nlohmann::json(b.hi)},
+                                {"count", b.count}, {"bytes", b.bytes}});
+                        }
+                        return nlohmann::json{
+                            {"size", snap.tx_count},
+                            {"bytes", snap.total_bytes},
+                            {"total_fees", snap.total_fees},
+                            {"fee_known_count", snap.fee_known_count},
+                            {"fee_unknown_count", snap.tx_count - snap.fee_known_count},
+                            {"min_feerate", snap.min_feerate},
+                            {"max_feerate", snap.max_feerate},
+                            {"median_feerate", snap.median_feerate},
+                            {"avg_feerate", snap.avg_feerate},
+                            {"oldest_age_sec", (snap.oldest_time > 0 && now > snap.oldest_time)
+                                                  ? (now - snap.oldest_time) : 0},
+                            {"fee_histogram", hist},
+                            {"chain", "dash"}};
+                    });
+
+                // getrawmempool — txid list or verbose entries.
+                mi->set_explorer_rawmempool_fn(
+                    [mp, chain_ok](const std::string& chain, bool verbose, uint32_t limit) -> nlohmann::json {
+                        if (!chain_ok(chain))
+                            return nlohmann::json{{"error", "Mempool not available for chain"}};
+                        if (!verbose) {
+                            auto txids = mp->all_txids();
+                            nlohmann::json arr = nlohmann::json::array();
+                            for (const auto& id : txids) arr.push_back(id.GetHex());
+                            return arr;
+                        }
+                        auto snap = mp->get_summary();
+                        time_t now = std::time(nullptr);
+                        nlohmann::json arr = nlohmann::json::array();
+                        uint32_t count = 0;
+                        for (const auto& e : snap.entries) {
+                            if (count >= limit) break;
+                            arr.push_back({
+                                {"txid", e.txid.GetHex()},
+                                {"size", e.base_size},
+                                {"fee", e.fee},
+                                {"fee_known", e.fee_known},
+                                {"feerate", e.feerate},
+                                {"time_added", e.time_added},
+                                {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                                {"n_vin", e.n_vin},
+                                {"n_vout", e.n_vout}});
+                            ++count;
+                        }
+                        return arr;
+                    });
+
+                // getmempoolentry — single tx full detail with vin/vout.
+                mi->set_explorer_mempoolentry_fn(
+                    [mp, chain_ok, testnet](const std::string& txid_hex, const std::string& chain) -> nlohmann::json {
+                        if (!chain_ok(chain))
+                            return nlohmann::json{{"error", "Mempool not available for chain"}};
+                        uint256 txid;
+                        txid.SetHex(txid_hex);
+                        auto opt = mp->get_entry(txid);
+                        if (!opt) return nlohmann::json{{"error", "Transaction not in mempool"}};
+                        const auto& e = *opt;
+                        time_t now = std::time(nullptr);
+                        const uint8_t p2pkh = testnet ? 0x8c : 0x4c;
+                        const uint8_t p2sh  = testnet ? 0x13 : 0x10;
+                        nlohmann::json vin_arr = nlohmann::json::array();
+                        for (const auto& inp : e.tx.vin) {
+                            vin_arr.push_back({
+                                {"prevout_hash", inp.prevout.hash.GetHex()},
+                                {"prevout_n", inp.prevout.index},
+                                {"sequence", inp.sequence}});
+                        }
+                        nlohmann::json vout_arr = nlohmann::json::array();
+                        for (size_t i = 0; i < e.tx.vout.size(); ++i) {
+                            const auto& out = e.tx.vout[i];
+                            std::vector<unsigned char> script(out.scriptPubKey.m_data.begin(),
+                                                              out.scriptPubKey.m_data.end());
+                            auto cls = core::classify_script(script, "", p2pkh, p2sh);
+                            nlohmann::json vout_obj = {
+                                {"n", i},
+                                {"value_sat", out.value},
+                                {"scriptPubKey_hex", cls.hex},
+                                {"type", cls.type}};
+                            if (!cls.addresses.empty()) vout_obj["address"] = cls.addresses[0];
+                            if (cls.addresses.size() > 1) vout_obj["addresses"] = cls.addresses;
+                            vout_arr.push_back(std::move(vout_obj));
+                        }
+                        nlohmann::json r = {
+                            {"txid", e.txid.GetHex()},
+                            {"size", e.base_size},
+                            {"fee", e.fee},
+                            {"fee_known", e.fee_known},
+                            {"feerate", e.feerate_satvb()},
+                            {"type", static_cast<int>(e.tx.type)},
+                            {"version", e.tx.version},
+                            {"time_added", e.time_added},
+                            {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                            {"vin", vin_arr},
+                            {"vout", vout_arr},
+                            {"chain", "dash"}};
+                        // DIP2/DIP3/DIP4 special-tx payload (explorer.py decodes
+                        // client-side). Present iff version==3 && type!=0.
+                        if (e.tx.version == 3 && e.tx.type != 0 && !e.tx.extra_payload.empty()) {
+                            static const char H[] = "0123456789abcdef";
+                            std::string ep;
+                            ep.reserve(e.tx.extra_payload.size() * 2);
+                            for (unsigned char b : e.tx.extra_payload) {
+                                ep += H[b >> 4]; ep += H[b & 0x0f];
+                            }
+                            r["extraPayload"] = ep;
+                        }
+                        return r;
+                    });
+
+                std::cout << "[run] explorer /api/explorer ARMED (loopback-only): "
+                             "getblock bodies + mempool info/raw/entry, retention depth="
+                          << DASH_EXPLORER_DEPTH
+                          << (embedded_utxo ? "" : " (NOTE: --embedded-utxo absent -> "
+                                                  "no raw-block retention; getblock stays "
+                                                  "header-only #99 partial)")
+                          << "\n";
+            }
 
             // ── DEFECT-3 operator surface: WHY the embedded arm is not serving ──
             // web-static/dashboard.html has read a per-coin `no_work_reason` since
@@ -6306,6 +6639,60 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          "chain-identical; behind tip => fee-unknown = master)\n";
         }
 
+        // #157 (--embedded-tx-inject-hex): local submit path (M1). Parse the
+        // file (one classic raw tx hex per line, all-or-nothing) and submit each
+        // through the validation + priority gate now that the mempool + the
+        // consensus-exact script check are wired. Every verdict is logged by
+        // name (DEF3). An inject whose inputs are not yet in the view is refused
+        // "inject-unpriceable" and NOT retried here — continuous re-submission
+        // and the p2p tx-inject transport are M2. Reward path untouched.
+        if (embedded_tx_inject && !embedded_tx_inject_hex_path.empty()) {
+            std::ifstream inf(embedded_tx_inject_hex_path);
+            std::vector<dash::coin::MutableTransaction> inj_txs;
+            bool inj_load_ok = true;
+            std::string iline;
+            unsigned ilineno = 0;
+            while (std::getline(inf, iline)) {
+                ++ilineno;
+                iline.erase(std::remove_if(iline.begin(), iline.end(),
+                                [](unsigned char c) { return std::isspace(c); }),
+                            iline.end());
+                if (iline.empty()) continue;
+                if (iline.size() % 2 != 0) {
+                    std::cout << "[run] --embedded-tx-inject-hex line " << ilineno
+                              << ": odd hex length — injects DISABLED\n";
+                    inj_txs.clear(); inj_load_ok = false; break;
+                }
+                try {
+                    auto raw = ParseHex(iline);
+                    PackStream ps(raw);
+                    dash::coin::MutableTransaction tx;
+                    ps >> tx;
+                    if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
+                        std::cout << "[run] --embedded-tx-inject-hex line " << ilineno
+                                  << ": not a classic non-empty tx — injects DISABLED\n";
+                        inj_txs.clear(); inj_load_ok = false; break;
+                    }
+                    inj_txs.push_back(std::move(tx));
+                } catch (const std::exception& e) {
+                    std::cout << "[run] --embedded-tx-inject-hex line " << ilineno
+                              << " PARSE FAILED (" << e.what() << ") — injects DISABLED\n";
+                    inj_txs.clear(); inj_load_ok = false; break;
+                }
+            }
+            if (inj_load_ok && !inj_txs.empty()) {
+                for (auto& tx : inj_txs) {
+                    auto r = node_coin_state.submit_inject(tx);
+                    std::cout << "[run] tx-inject submit txid="
+                              << r.txid.GetHex().substr(0, 16)
+                              << " => " << r.cause
+                              << (r.ok ? " (prioritised; validated at template build)"
+                                       : " (refused, not served)")
+                              << "\n";
+                }
+            }
+        }
+
         // new_block(inv hash) -> pull the headers THEN the full block from the
         // peer. The getheaders-first ordering is the steady-state tip-follow
         // fix (E2c): dashd announces new blocks via inv (we never negotiate
@@ -6688,9 +7075,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             std::cout << "[run] --embedded-mempool-ingest: coin-P2P MSG_TX pull"
                          " ARMED (budget 64 in flight, yields to the tip body)."
                          " The mempool will now FILL from the DASH network.\n"
-                      << "      This does NOT put transactions into served"
-                         " templates: that stays --embedded-serve-mempool-txs"
-                         " (default OFF), gated on the [MEMPOOL-VALIDITY]"
+                      << "      Whether these reach served templates is"
+                         " --embedded-serve-mempool-txs (daemonless default ON,"
+                         " good_citizen_defaults.hpp; dashd-armed default OFF),"
+                         " backed by the [MEMPOOL-VALIDITY]"
                          " testmempoolaccept series -- zero INVALID over "
                       << dash::coin::MempoolValidityGate::kCleanHeightsRequired
                       << " consecutive evidence-bearing DISTINCT heights.\n";
@@ -10498,7 +10886,15 @@ int main(int argc, char** argv)
     std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
     bool coin_p2p_discover = false;            // --coin-p2p-discover: DASH-isolated scored/diverse peer discovery (network-standalone arm; independent of local dashd)
     bool no_p2p_relay = false;                 // --no-p2p-relay: suppress the embedded P2P-relay won-block arm (A/B isolation; RPC backup stays live)
-    bool embedded_mainnet = false;             // --embedded-mainnet: gate-lift, allow the daemonless embedded template arm on MAINNET (byte-parity proven; default OFF = dashd fallback)
+    // --embedded-mainnet: THE embedded-arm gate. DAEMONLESS DEFAULT ON
+    // (good_citizen_defaults.hpp): with no dashd arm requested a bare `--run`
+    // resolves the embedded arm (and coin-P2P discovery) so the node actually
+    // serves; without it resolve_embedded_arm returns DashdFallback/NoOptIn and
+    // a daemonless node serves NOTHING. Byte-parity of the mainnet embedded
+    // template is proven (v0.2.4 gate-lift). dashd-armed posture UNCHANGED
+    // (default OFF = dashd fallback). Explicit opt-out: --embedded-mainnet=false.
+    bool embedded_mainnet = false;
+    bool embedded_mainnet_off = false;         // --embedded-mainnet=false
     std::string coin_p2p_magic = "";           // --coin-p2p-magic HEX: override the embedded CoinClient wire magic (e.g. regtest fcc1b7dc); default mainnet/testnet
     // --coin-p2p-peers N: CONCURRENT embedded coin-P2P peers (default 8, cap 16).
     // EVIDENCE knob, not bandwidth: a DKG final commitment is announced exactly
@@ -10507,11 +10903,28 @@ int main(int argc, char** argv)
     std::size_t coin_p2p_peers =
         dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS;
     bool force_won_block = false;              // --regtest-force-won-block: fail-closed regtest E5 harness (drive one real won block through the run-path dual-path)
-    bool embedded_superblock = false;          // --embedded-superblock: OPT-IN daemonless superblock payee sourcing via govsync (E-SUPERBLOCK); default OFF = superblock heights fall back to dashd (reward-safe)
+    // --embedded-superblock: daemonless superblock payee sourcing via govsync
+    // (E-SUPERBLOCK). DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): a
+    // superblock height served coinbase-only-without-the-trigger-payees is a
+    // good-citizen violation; three fail-closed layers (BLS operator-key vote
+    // verify + EvoNode-4x weight, completeness, desync latch) mean a
+    // non-confident trigger REFUSES exactly as today — never a guessed payee.
+    // Implies the govsync pull at the serve call site. dashd-armed posture
+    // UNCHANGED. Explicit opt-out: --embedded-superblock=false.
+    bool embedded_superblock = false;
+    bool embedded_superblock_off = false;      // --embedded-superblock=false
     bool embedded_govsync = false;             // --embedded-govsync: OBSERVE-ONLY arm of the governance sourcing lane (inv 17/18 pull + store populate); default OFF; does NOT arm serving (that is --embedded-superblock)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
-    bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
+    // --embedded-utxo: the E2b UTXO/fee lane. DAEMONLESS DEFAULT ON
+    // (good_citizen_defaults.hpp): without it no mempool tx ever fee-proves
+    // (fee_fold_proven=false → coinbase-only body), so full-mempool serving is
+    // vacuous. Selection still admits ONLY fee_fold_proven txs against the
+    // spent-aware UTXO view (fees never overstated). dashd-armed posture
+    // UNCHANGED. Explicit opt-out: --embedded-utxo=false.
+    bool embedded_utxo = false;
+    bool embedded_utxo_off = false;            // --embedded-utxo=false
+    bool explorer_enabled = true;              // --explorer (default ON) / --no-explorer: loopback-only /api/explorer
     // --embedded-utxo-immature-serve-empty: pure-daemonless OPT-IN. Default
     // OFF refuses every embedded template until the UTXO lane reaches
     // blocks_connected >= 106 (p2pool semantics: an unsynced node does not
@@ -10538,8 +10951,37 @@ int main(int argc, char** argv)
     bool embedded_serve_mempool_txs_off = false;  // --embedded-serve-mempool-txs=false
     bool embedded_tx_serve_own_set = false;  // --embedded-tx-serve-own-set; daemonless default ON
     bool embedded_tx_serve_own_set_off = false;   // --embedded-tx-serve-own-set=false
-    bool embedded_accrue_asset_locks = false;  // #107 PHASE 2, default OFF
-    bool embedded_accrue_asset_unlocks = false;  // #143 Variant B (type-9), default OFF
+    // #157 (--embedded-tx-inject): opt-in miner/user tx-injection. DEFAULT OFF
+    // and NEVER a good-citizen default (NOT in TxServeLevers): it changes which
+    // consensus-valid txs a node prioritises into its own block and must always
+    // be an explicit operator decision. Reward path is byte-unchanged.
+    bool embedded_tx_inject = false;
+    std::string embedded_tx_inject_hex_path;   // --embedded-tx-inject-hex FILE (local M1 submit)
+    // #107 PHASE 2 (--embedded-accrue-asset-locks): type-8 asset-lock accrual.
+    // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): body membership and the
+    // CbTx creditPool accrual are the SAME bit (embedded_gbt.hpp allow_locks ==
+    // accrue), so the served body always matches the committed creditPool.
+    // dashd-armed posture UNCHANGED. Explicit opt-out:
+    // --embedded-accrue-asset-locks=false.
+    bool embedded_accrue_asset_locks = false;
+    bool embedded_accrue_asset_locks_off = false;   // --embedded-accrue-asset-locks=false
+    // #143 Variant B (--embedded-accrue-asset-unlocks): type-9 admission.
+    // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp) — but INERT until the
+    // CreditPool INDEX follower is seeded (work_source.hpp passes nullptr today):
+    // the predicate, not the flag, admits, so this is safe to default ON.
+    // dashd-armed posture UNCHANGED. Explicit opt-out:
+    // --embedded-accrue-asset-unlocks=false.
+    bool embedded_accrue_asset_unlocks = false;
+    bool embedded_accrue_asset_unlocks_off = false; // --embedded-accrue-asset-unlocks=false
+    // --embedded-include-mn-special-txs: the special-tx superset (DIP types
+    // 1-4). DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): dashd's
+    // CreateNewBlock serves these, so excluding them is a good-citizen gap. The
+    // builder DROPS any special tx the SML fold cannot apply exactly and the
+    // emit gate re-folds and rejects on root drift (node_coin_state.hpp), so an
+    // included special tx always commits a folded MN root. dashd-armed posture
+    // UNCHANGED. Explicit opt-out: --embedded-include-mn-special-txs=false.
+    bool embedded_include_mn_special_txs = false;
+    bool embedded_include_mn_special_txs_off = false; // --embedded-include-mn-special-txs=false
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
     // pool AT THE SERVE TIP rather than at the folded body height (PR-5,
     // dashd GetCreditPool(pindexPrev) parity). MONEY PATH -> default OFF: it
@@ -10562,9 +11004,14 @@ int main(int argc, char** argv)
     bool embedded_mempool_ingest = false;
     bool embedded_mempool_ingest_off = false;     // --embedded-mempool-ingest=false
     // --embedded-null-arm (#127): optimistic null commitment at fresh
-    // window-open slots + template upgrade to the real commitment. DEFAULT
-    // OFF, money/consensus path; byte-unchanged when off (nullptr null_evidence).
+    // window-open slots + template upgrade to the real commitment. DAEMONLESS
+    // DEFAULT ON (good_citizen_defaults.hpp): without it a required-not-yet-mined
+    // DKG slot refuses the whole height (qc-plan-underivable) and a daemonless
+    // node has no fallback. Freshness-gated: unproven ⇒ no null ⇒ refuse
+    // (today's benign gap), NEVER a guessed reject. dashd-armed posture
+    // UNCHANGED. Explicit opt-out: --embedded-null-arm=false.
     bool embedded_null_arm = false;
+    bool embedded_null_arm_off = false;        // --embedded-null-arm=false
     bool embedded_asn_diversity = false;   // PR-4 (--embedded-asn-diversity): default OFF
     // --embedded-fold-live PATH (PR-C1): full-history replay UTXO fold store
     // wired as the LIVE serve-path input-pricing view. EMPTY (default) => OFF,
@@ -10682,6 +11129,8 @@ int main(int argc, char** argv)
             no_p2p_relay = true;
         else if (std::strcmp(argv[i], "--embedded-mainnet") == 0)
             embedded_mainnet = true;
+        else if (std::strcmp(argv[i], "--embedded-mainnet=false") == 0)
+            embedded_mainnet_off = true;            // good-citizen opt-out
         else if (std::strcmp(argv[i], "--coin-p2p-magic") == 0 && i + 1 < argc)
             coin_p2p_magic = argv[++i];
         else if (std::strcmp(argv[i], "--coin-p2p-peers") == 0 && i + 1 < argc)
@@ -10690,10 +11139,18 @@ int main(int argc, char** argv)
             force_won_block = true;
         else if (std::strcmp(argv[i], "--embedded-superblock") == 0)
             embedded_superblock = true;
+        else if (std::strcmp(argv[i], "--embedded-superblock=false") == 0)
+            embedded_superblock_off = true;         // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-govsync") == 0)
             embedded_govsync = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if (std::strcmp(argv[i], "--embedded-utxo=false") == 0)
+            embedded_utxo_off = true;               // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--explorer") == 0)
+            explorer_enabled = true;
+        else if (std::strcmp(argv[i], "--no-explorer") == 0)
+            explorer_enabled = false;
         else if (std::strcmp(argv[i], "--embedded-utxo-immature-serve-empty") == 0)
             embedded_utxo_immature_serve_empty = true;
         else if (std::strcmp(argv[i], "--embedded-serve-mempool-txs") == 0)
@@ -10706,8 +11163,16 @@ int main(int argc, char** argv)
             embedded_tx_serve_own_set_off = true;   // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks") == 0)
             embedded_accrue_asset_locks = true;   // #107 PHASE 2
+        else if (std::strcmp(argv[i], "--embedded-accrue-asset-locks=false") == 0)
+            embedded_accrue_asset_locks_off = true;   // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks") == 0)
             embedded_accrue_asset_unlocks = true; // #143 Variant B (type-9)
+        else if (std::strcmp(argv[i], "--embedded-accrue-asset-unlocks=false") == 0)
+            embedded_accrue_asset_unlocks_off = true; // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs") == 0)
+            embedded_include_mn_special_txs = true;   // special-tx superset (DIP types 1-4)
+        else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs=false") == 0)
+            embedded_include_mn_special_txs_off = true; // good-citizen opt-out
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest=false") == 0)
@@ -10715,7 +11180,7 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--embedded-null-arm") == 0)
             embedded_null_arm = true;   // #127
         else if (std::strcmp(argv[i], "--embedded-null-arm=false") == 0)
-            embedded_null_arm = false;  // #127: explicit OFF (OFF-equivalence)
+            embedded_null_arm_off = true;  // #127: good-citizen opt-out (daemonless default ON)
         // PR-2 FRESH-DATUM RACE (dashd-cut coin-P2P). Race the SINGLE freshest
         // object (the fold snapshot's getmnlistd today) to K distinct-netgroup
         // CanServeBlocks carriers and fold the first valid self-checked reply,
@@ -10773,6 +11238,10 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i],
                              "--embedded-creditpool-publish-at-serve-tip") == 0)
             embedded_creditpool_publish_at_serve_tip = true;
+        else if (std::strcmp(argv[i], "--embedded-tx-inject") == 0)
+            embedded_tx_inject = true;   // #157: opt-in miner/user tx-injection (default OFF)
+        else if (std::strcmp(argv[i], "--embedded-tx-inject-hex") == 0 && i + 1 < argc)
+            embedded_tx_inject_hex_path = argv[++i];   // #157 local M1 submit file
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
@@ -11174,15 +11643,32 @@ int main(int argc, char** argv)
                         {embedded_tx_serve_own_set,  embedded_tx_serve_own_set_off},
                         {embedded_mempool_ingest,    embedded_mempool_ingest_off},
                         {embedded_ingest_isdlock,    embedded_ingest_isdlock_off},
-                        {embedded_ingest_dstx,       embedded_ingest_dstx_off}});
+                        {embedded_ingest_dstx,       embedded_ingest_dstx_off},
+                        {embedded_mainnet,           embedded_mainnet_off},
+                        {embedded_utxo,              embedded_utxo_off},
+                        {embedded_null_arm,          embedded_null_arm_off},
+                        {embedded_superblock,        embedded_superblock_off},
+                        {embedded_include_mn_special_txs,
+                                                     embedded_include_mn_special_txs_off},
+                        {embedded_accrue_asset_locks,
+                                                     embedded_accrue_asset_locks_off},
+                        {embedded_accrue_asset_unlocks,
+                                                     embedded_accrue_asset_unlocks_off}});
             embedded_serve_mempool_txs = txr.serve_mempool_txs;
             embedded_tx_serve_own_set  = txr.tx_serve_own_set;
             embedded_mempool_ingest    = txr.mempool_ingest;
             embedded_ingest_isdlock    = txr.ingest_isdlock;
             embedded_ingest_dstx       = txr.ingest_dstx;
+            embedded_mainnet           = txr.embedded_mainnet;
+            embedded_utxo              = txr.embedded_utxo;
+            embedded_null_arm          = txr.null_arm;
+            embedded_superblock        = txr.superblock;
+            embedded_include_mn_special_txs = txr.include_mn_special_txs;
+            embedded_accrue_asset_locks     = txr.accrue_asset_locks;
+            embedded_accrue_asset_unlocks   = txr.accrue_asset_unlocks;
             if (txr.defaulted_any)
                 std::cout << "[run] good-citizen default (daemonless posture): "
-                             "FULL-MEMPOOL tx-serving armed"
+                             "FULL-MEMPOOL + special-tx + superblock serving armed"
                              " serve-mempool-txs="
                           << (txr.serve_mempool_txs ? "on" : "off")
                           << " tx-serve-own-set="
@@ -11193,8 +11679,21 @@ int main(int argc, char** argv)
                           << (txr.ingest_isdlock ? "on" : "off")
                           << " ingest-dstx="
                           << (txr.ingest_dstx ? "on" : "off")
-                          << " (opt-out: --embedded-serve-mempool-txs=false "
-                             "et al.)\n";
+                          << " embedded-mainnet="
+                          << (txr.embedded_mainnet ? "on" : "off")
+                          << " embedded-utxo="
+                          << (txr.embedded_utxo ? "on" : "off")
+                          << " null-arm="
+                          << (txr.null_arm ? "on" : "off")
+                          << " superblock="
+                          << (txr.superblock ? "on" : "off")
+                          << " include-mn-special-txs="
+                          << (txr.include_mn_special_txs ? "on" : "off")
+                          << " accrue-asset-locks="
+                          << (txr.accrue_asset_locks ? "on" : "off")
+                          << " accrue-asset-unlocks="
+                          << (txr.accrue_asset_unlocks ? "on" : "off")
+                          << " (opt-out: --embedded-<lever>=false)\n";
             if (txr.unsafe_serve_without_referee)
                 std::cout << "[run] WARNING: --embedded-tx-serve-own-set=false"
                              " with mempool-tx serving ON in the daemonless"
@@ -11237,8 +11736,12 @@ int main(int argc, char** argv)
                         embedded_fold_live_db,         // PR-C1 embedded-fold-live
                         embedded_fold_live_expect,     // PR-C1 store-verify hash
                         embedded_fold_checkscripts,   // PR-C4 input-script check
+                        embedded_tx_inject,            // #157 miner/user tx-injection (default OFF)
+                        embedded_tx_inject_hex_path,   // #157 local M1 submit file
                         embedded_utxo_fold_fees_db,    // W5-A fold fee source
-                        embedded_utxo_fold_expect);    // W5-A anchor restatement
+                        embedded_utxo_fold_expect,     // W5-A anchor restatement
+                        explorer_enabled,             // /api/explorer surface (default ON)
+                        embedded_include_mn_special_txs); // special-tx superset (DIP types 1-4)
     }
     return run_selftest();
 }

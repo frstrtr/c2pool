@@ -328,6 +328,29 @@ public:
     /// web_server.cpp set_node_fee_from_address.
     void set_node_owner_fee(double pct, std::vector<unsigned char> script);
 
+    /// #961: mark this node as running on the BTC regtest network so the payout
+    /// money-path validates a miner's address against the REGTEST address set
+    /// (testnet base58 bytes + "bcrt" HRP) instead of mainnet — otherwise a
+    /// legitimate --regtest payout address is wrongly rejected as Foreign.
+    /// Called from main under --regtest. Address-validation scope only.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
+
+    /// #961 cross-lane (B4): publish this coin's OWN payout-address acceptance
+    /// into the StratumConfig the core StratumServer reads, so the SAME
+    /// decide_payout_address() door-reject (mining.authorize) + no-empty-payout
+    /// guard (send_notify_work) that LTC already runs apply on the BTC lane —
+    /// a foreign-unconfigured payout is rejected at the door instead of being
+    /// repurposed / burned. Own-coin + configured-merged stay accepted, so the
+    /// built script is byte-identical for every previously-honoured address.
+    /// Set once at startup, before the StratumServer starts reading config_.
+    void set_payout_acceptance(std::vector<uint8_t> p2pkh_versions,
+                               std::vector<uint8_t> p2sh_versions,
+                               std::vector<std::string> bech32_hrps) {
+        config_.payout_p2pkh_versions = std::move(p2pkh_versions);
+        config_.payout_p2sh_versions  = std::move(p2sh_versions);
+        config_.payout_bech32_hrps    = std::move(bech32_hrps);
+    }
+
 private:
     /// Resolve the effective payout script for a job/share: the node owner's
     /// script with probability node_owner_fee_pct_%, else the miner's own
@@ -341,6 +364,7 @@ private:
     btc::coin::HeaderChain&     chain_;
     btc::coin::Mempool&         mempool_;
     const bool                  is_testnet_;
+    bool                        is_regtest_ = false;  // #961: --regtest address set
 
     // Submission dispatch
     SubmitBlockFn               submit_block_fn_;

@@ -1,0 +1,24 @@
+{
+  "digest": "793659ff739acfa1fe7bc94a2ff1fe560e602519ba920c9a068e46f135be858d",
+  "result": {
+    "coinbase": [
+      [
+        "m0",
+        60
+      ],
+      [
+        "m1",
+        40
+      ]
+    ],
+    "coinbase_sum": 100,
+    "cross_atomic": true,
+    "market_filled": true,
+    "owed": {
+      "m0": 60,
+      "m1": 40
+    },
+    "root_len": 64,
+    "row": "E2E-1"
+  }
+}

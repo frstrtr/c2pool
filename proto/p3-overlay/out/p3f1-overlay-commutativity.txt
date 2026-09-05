@@ -1,0 +1,42 @@
+P3-F1 overlay-commutativity / P3-12 invariant
+event multiset = [('FOUND', 'c0'), ('ORPHAN', 'c0'), ('FOUND', 'c1'), ('FINALIZED', 'c1')]
+legal interleavings (per-chain causal order enforced): 6
+
+=== B1 SNAPSHOT_WHOLE  (restore pre-FOUND whole ledger) : 6 legal interleavings ===
+  distinct final owed-ledgers : 2
+  distinct assembled coinbases: 2
+  COMMUTATIVE (order-independent): False
+  !! NON-COMMUTATIVE -> chain-split surface. Divergent ledgers:
+     [FOU.c0 ORP.c0 FOU.c1 FIN.c1] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  cb=4035aa22b744
+     [FOU.c0 FOU.c1 ORP.c0 FIN.c1] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 0}  cb=4f53cda18c2b
+     [FOU.c0 FOU.c1 FIN.c1 ORP.c0] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 0}  cb=4f53cda18c2b
+     [FOU.c1 FOU.c0 ORP.c0 FIN.c1] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  cb=4035aa22b744
+     [FOU.c1 FOU.c0 FIN.c1 ORP.c0] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  cb=4035aa22b744
+     [FOU.c1 FIN.c1 FOU.c0 ORP.c0] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  cb=4035aa22b744
+
+=== B2 SNAPSHOT_DELTA  (subtract stale absolute delta; FINALIZE compacts) : 6 legal interleavings ===
+  distinct final owed-ledgers : 2
+  distinct assembled coinbases: 2
+  COMMUTATIVE (order-independent): False
+  !! NON-COMMUTATIVE -> chain-split surface. Divergent ledgers:
+     [FOU.c0 ORP.c0 FOU.c1 FIN.c1] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  cb=4035aa22b744
+     [FOU.c0 FOU.c1 ORP.c0 FIN.c1] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  cb=4035aa22b744
+     [FOU.c0 FOU.c1 FIN.c1 ORP.c0] -> {"R_pot": 2, "m1": 0, "m2": -2, "m3": 10}  cb=dd841f31b9c8
+     [FOU.c1 FOU.c0 ORP.c0 FIN.c1] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  cb=4035aa22b744
+     [FOU.c1 FOU.c0 FIN.c1 ORP.c0] -> {"R_pot": 2, "m1": 0, "m2": -2, "m3": 10}  cb=dd841f31b9c8
+     [FOU.c1 FIN.c1 FOU.c0 ORP.c0] -> {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  cb=4035aa22b744
+
+=== FIX KEYED_CRDT     (keyed pending multiset; compact finalized-only) : 6 legal interleavings ===
+  distinct final owed-ledgers : 1
+  distinct assembled coinbases: 1
+  COMMUTATIVE (order-independent): True
+  final L = {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}  (== ground truth: True)
+  golden coinbase sha256: 4035aa22b744654dd49eb970e57fc5226e22681fb1b2260907d5c9432075e37a
+
+=== VERDICT ===
+  B1 snapshot-whole : NON-commutative (wipes interleaved cross-chain events)  [as predicted]
+  B2 snapshot-delta : NON-commutative (compaction rebases; stale delta misfires) [as predicted]
+  FIX keyed-CRDT    : COMMUTATIVE over all legal interleavings, == ground truth  [P3-12 GREEN]
+
+  GOLDEN VECTOR sha256: d0d495569a4ddd11604d8cdd119b590e17e527d8499b26bfaf8b1176a0c32ac8
+  golden: {"P3-12": "event-order-permutation invariance", "assembled_coinbase_sha256": "4035aa22b744654dd49eb970e57fc5226e22681fb1b2260907d5c9432075e37a", "final_owed_ledger": {"R_pot": 0, "m1": 0, "m2": 0, "m3": 10}, "fix": "KEYED_CRDT (per-(chain,block) pending multiset + finalized-only compaction)", "interleavings_tested": 6}
