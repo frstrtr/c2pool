@@ -1501,7 +1501,17 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
 {
     // Don't send work until a valid block template is available
     auto tmpl = mining_interface_->get_current_work_template();
-    if (tmpl.empty() || tmpl.is_null()) {
+    // Fail-closed on a template that carries no difficulty bits. Every coin lane
+    // emits "bits" in its work template (btc/ltc/bch/dash/nmc template_builder,
+    // bip110 work_source, dgb MultiShield V4 / GBT fallback); a NON-empty template
+    // that omits it can only mean a broken work source, and the old default here
+    // fabricated diff-1 (0x1d00ffff) -- putting a KNOWN-INVALID nBits into the
+    // header the miner hashes, so any won block was rejected and every share was
+    // weighed against a fake coin target (#179, the daemonless DGB arm). Treat a
+    // bits-less template as "no template": wait and retry, never fabricate.
+    const bool no_template   = tmpl.empty() || tmpl.is_null();
+    const bool missing_bits  = !no_template && !tmpl.contains("bits");
+    if (no_template || missing_bits) {
         // Rate-limit "no template" log to avoid spam during header sync
         static std::atomic<int64_t> s_last_warn{0};
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1514,8 +1524,14 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 // the wrong coin). Neutral fallback when unset.
                 const std::string& sym =
                     mining_interface_->get_stratum_config().coin_symbol;
-                LOG_WARNING << "[" << (sym.empty() ? "Stratum" : sym)
-                            << "] Waiting for block template (header sync in progress)...";
+                if (missing_bits)
+                    LOG_ERROR << "[" << (sym.empty() ? "Stratum" : sym)
+                              << "] Work template missing difficulty bits — holding"
+                                 " work (fail-closed, refusing to fabricate a"
+                                 " diff-1 nBits that would invalidate any won block).";
+                else
+                    LOG_WARNING << "[" << (sym.empty() ? "Stratum" : sym)
+                                << "] Waiting for block template (header sync in progress)...";
             }
         }
         auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
@@ -1562,11 +1578,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
            << version_u32;
         version = ss.str();
 
-        // Save original GBT block bits for block-level target check
-        if (tmpl.contains("bits"))
-            gbt_block_nbits = tmpl["bits"].get<std::string>();
-        else
-            gbt_block_nbits = "1d00ffff";
+        // Save original GBT block bits for block-level target check. Presence is
+        // guaranteed by the fail-closed guard above (a bits-less template is held
+        // as "no template" and never reaches here), so this reads the authoritative
+        // value directly — no fabricated diff-1 default (#179).
+        gbt_block_nbits = tmpl["bits"].get<std::string>();
 
         // nbits in mining.notify = GBT BLOCK difficulty (not share target).
         // p2pool sends block_bits here. The miner puts this in the 80-byte header's

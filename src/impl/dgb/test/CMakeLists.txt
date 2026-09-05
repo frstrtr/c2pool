@@ -415,7 +415,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(dgb_coinbase_value_parity_test "" AUTO)
 
 
-    foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test)
+    # multishield_v4_kat_test (#179): DigiByte-Core MultiShield V4 next-target
+    # byte-parity KAT over 150 real mainnet headers -- proves the daemonless work
+    # source stamps a REAL nBits (via header_chain.hpp next_scrypt_bits) instead of
+    # the fabricated diff-1 0x1d00ffff that made every won block INVALID. Pure
+    # header math (header_chain.hpp / dgb_multishield.hpp / dgb_arith256.hpp are
+    # std-only), so it links GTest-only like the other guards. MUST also appear in
+    # BOTH build.yml --target allowlists (#143 NOT_BUILT trap).
+    foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test multishield_v4_kat_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
         target_link_libraries(${dgb_guard} PRIVATE
             GTest::gtest_main GTest::gtest nlohmann_json::nlohmann_json)

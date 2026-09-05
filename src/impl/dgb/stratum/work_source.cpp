@@ -380,9 +380,23 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     in.transactions      = tx_sel.transactions;
     if (auto th = chain_.tip_hash()) {
         // Embedded chain carries a real tip -> source previousblockhash from it.
-        // bits stays absent here: the Scrypt-only walk cannot reconstruct the
-        // MultiShield-V4 5-algo window (== V37) -- unchanged truthful absence.
         in.previousblockhash = u256_be_display_hex(*th);
+        // #179: derive the block-template bits from the synced header chain via
+        // DigiByte-Core MultiShield V4 (chain_.next_scrypt_bits()), replacing the
+        // fabricated diff-1 (0x1d00ffff) that made every won block INVALID and
+        // every sharechain share weigh against a fake coin target. The V4 walk is
+        // GLOBAL across all 5 algos and the header chain carries every algo's
+        // header (continuity headers appended work-neutral), so the window is
+        // fully present. When it is too shallow to run (< 61 headers) the accessor
+        // returns nullopt: emit an EMPTY template so the stratum layer takes its
+        // existing "waiting for block template (header sync)" wait path instead of
+        // fabricating -- fail-closed, never a known-wrong target on the wire.
+        auto nb = chain_.next_scrypt_bits();
+        if (!nb)
+            return nlohmann::json::object();  // hold work until the window fills.
+        char bits_buf[9];
+        std::snprintf(bits_buf, sizeof(bits_buf), "%08x", *nb);
+        in.bits = std::string(bits_buf);
     } else if (auto tip = resolve_gbt_tip_fallback()) {
         // Embedded HeaderChain unfed -> external-daemon GBT fallback (persist per
         // V36). Sources BOTH previousblockhash and the daemon-authoritative bits
