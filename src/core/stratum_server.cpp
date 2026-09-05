@@ -772,6 +772,49 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             }
         }
 
+        // ─── #961 B1: reject a foreign-coin payout at the door ──────────────
+        // If this coin published its OWN acceptance set (StratumConfig.payout_*
+        // — the LTC/DOGE merged-mining server does), a username that is neither
+        // an own-coin address NOR a CONFIGURED merged chain's address MUST be
+        // rejected here. Authorizing it would put the miner on jobs whose
+        // coinbase pays a script this node cannot build for their key — an
+        // empty / zero-hash160 payout that PPLNS burns every block (accept-and-
+        // burn). Own-coin and configured-merged stay accepted (reward-safe);
+        // lanes that leave payout_* empty keep the legacy accept-any behaviour
+        // (they validate at mining_submit in their work source, where an empty
+        // payout falls back to the node-owner/donation script, not a burn).
+        {
+            const auto& acfg = mining_interface_->get_stratum_config();
+            const bool acceptance_configured =
+                !acfg.payout_p2pkh_versions.empty() ||
+                !acfg.payout_p2sh_versions.empty() ||
+                !acfg.payout_bech32_hrps.empty();
+            if (acceptance_configured && !username_.empty()) {
+                const core::CoinAddressAcceptance own{acfg.payout_p2pkh_versions,
+                    acfg.payout_p2sh_versions, acfg.payout_bech32_hrps};
+                std::vector<core::MergedChainAddr> merged_cfg;
+                for (const auto& chain : MERGED_CHAINS)
+                    if (mining_interface_->has_merged_chain(chain.chain_id))
+                        merged_cfg.push_back({chain.hrps, chain.versions});
+                if (core::decide_payout_address(username_, own, merged_cfg)
+                        == core::PayoutAddressDecision::Reject) {
+                    LOG_WARNING << "[Stratum] REJECTED mining.authorize: payout address "
+                                << username_ << " is not a"
+                                << (acfg.coin_symbol.empty() ? "" : " " + acfg.coin_symbol)
+                                << " address and not a configured merged chain — refusing "
+                                   "to authorize (issue #961: would burn the reward)";
+                    authorized_ = false;
+                    nlohmann::json response;
+                    response["id"] = request_id;
+                    response["result"] = false;
+                    response["error"] = nlohmann::json::array(
+                        {24, "Unauthorized: payout address is not for this coin "
+                             "(and not a configured merged chain)", nullptr});
+                    return response;
+                }
+            }
+        }
+
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
 
         // Auto-derive: for each configured merged chain without an explicit address,
@@ -1659,34 +1702,35 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
             if (!acceptance_configured) {
                 payout_script = address_to_script(username_);  // legacy, byte-identical
             } else {
-                std::vector<unsigned char> own_script;
-                auto m = core::classify_address_for_coin(
-                    username_, scfg.payout_p2pkh_versions, scfg.payout_p2sh_versions,
-                    scfg.payout_bech32_hrps, own_script);
-                bool acceptable = (m == core::AddressCoinMatch::Own);
-                if (!acceptable && m == core::AddressCoinMatch::Foreign) {
-                    // Not an own-coin address — but a CONFIGURED merged chain's
-                    // address is still a legitimate merged-mining payout.
-                    for (const auto& chain : merged_chain_table()) {
-                        if (mining_interface_->has_merged_chain(chain.chain_id) &&
-                            is_address_for_chain(username_, chain.hrps, chain.versions)) {
-                            acceptable = true;
-                            break;
-                        }
-                    }
-                }
-                if (acceptable) {
-                    // Byte-identical to the pre-#961 build for every accepted
-                    // address (own-coin OR configured-merged) — reward-safe.
-                    payout_script = address_to_script(username_);
-                } else {
-                    LOG_WARNING << "[Stratum] REJECTED foreign-coin payout address (user="
-                                << username_ << ") — not a"
+                // #961 B1: consult the shared payout decision (SSOT with
+                // handle_authorize's door check). Own-coin OR a CONFIGURED merged
+                // chain builds byte-identically to the pre-#961 script (reward-
+                // safe); a foreign-unconfigured address is REJECTED.
+                const core::CoinAddressAcceptance own{scfg.payout_p2pkh_versions,
+                    scfg.payout_p2sh_versions, scfg.payout_bech32_hrps};
+                std::vector<core::MergedChainAddr> merged_cfg;
+                for (const auto& chain : merged_chain_table())
+                    if (mining_interface_->has_merged_chain(chain.chain_id))
+                        merged_cfg.push_back({chain.hrps, chain.versions});
+                if (core::decide_payout_address(username_, own, merged_cfg)
+                        == core::PayoutAddressDecision::Reject) {
+                    // ── B1 GUARD: never build a share with an empty/zero-hash160
+                    // payout. An empty payout_script here would make build_
+                    // connection_coinbase() emit the degenerate value-0 / zero-
+                    // hash160 coinbase; PPLNS would then record this miner's work
+                    // weight against an UNSPENDABLE output and BURN their reward
+                    // every block. Refuse to issue the job at all (no active_jobs_
+                    // entry, no mining.notify) — combined with handle_authorize's
+                    // reject, a foreign-unconfigured address can never be mined.
+                    LOG_WARNING << "[Stratum] REFUSING to build work: foreign-coin "
+                                   "payout address (user=" << username_ << ") — not a"
                                 << (scfg.coin_symbol.empty() ? "" : " " + scfg.coin_symbol)
-                                << " address and not a configured merged chain; refusing "
-                                   "to misdirect the reward (empty payout)";
-                    // payout_script stays empty -> existing degenerate-payout path.
+                                << " address and not a configured merged chain; "
+                                   "no zero-payout share will be built (issue #961)";
+                    return;
                 }
+                // Accepted (own-coin OR configured-merged): byte-identical build.
+                payout_script = address_to_script(username_);
             }
         }
 

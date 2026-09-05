@@ -1,25 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// KAT for issue #961: cross-coin address pay-misdirection.
-//
-// core::classify_address_for_coin() is the money-path gate that decides whether
-// a miner-supplied payout address belongs to the RUNNING coin. Before it, the
-// chain-agnostic address_to_script() would decode ANY supported coin's version
-// byte / bech32 HRP and build a scriptPubKey for whatever coin the node runs —
-// so a foreign address (valid on another chain) was silently repurposed into a
-// wrong-coin script and the miner's funds were MISDIRECTED.
-//
-// This KAT proves, for BTC / LTC / DOGE / DASH / BCH / DGB:
-//   • ACCEPT-OWN   : each coin's own P2PKH / P2SH (and bech32 where it exists)
-//                    address classifies as Own and yields the correct script.
-//   • REJECT-FOREIGN: an address whose version byte / HRP is NOT in the running
-//                     coin's accepted set classifies as Foreign and yields an
-//                     EMPTY script (never a repurposed wrong-coin payment).
+// KAT for issue #961: cross-coin address pay-misdirection (the LTC-lane money
+// leak) and its remediation. This test is RED on the parent commit (208ba2f7):
+// every acceptance set it checks comes from a REAL registry helper
+//   ltc::address_acceptance / btc::address_acceptance / bch::address_acceptance /
+//   dgb::address_acceptance / bip110::address_acceptance / dash::address_acceptance
+// and the payout decision it exercises is core::decide_payout_address() — NONE of
+// which exist on the parent. The earlier revision of this file supplied its own
+// hardcoded coin tables and called only the pre-existing classify_address_for_coin(),
+// so it passed on the parent and proved nothing about the fix (a blind KAT). This
+// revision instead:
+//   1. Pins each coin's registry-sourced acceptance to its real chainparams
+//      (catches a re-typed / drifted version byte — blocker #3), calling the
+//      helper, never a literal in the test.
+//   2. Exercises the stratum money-path decision core::decide_payout_address()
+//      that handle_authorize() (door reject) and send_notify_work() (no-empty-
+//      payout guard) both consult (blocker #1): own-coin → AcceptOwn, a
+//      CONFIGURED merged chain → AcceptMerged, foreign-and-unconfigured or
+//      unparseable → Reject (never a burned / misdirected payout).
+//   3. Runs the cross-coin ACCEPT-OWN / REJECT-FOREIGN matrix against those real
+//      registry sets, incl. network-derived regtest sets (blocker #2).
 //
 // Addresses are CONSTRUCTED in-test from a fixed hash160 with each coin's real
 // chainparams version byte (via EncodeBase58Check / bech32::encode_segwit), so
-// the checksums are always valid and the version constants are pinned by the
-// assertions themselves — a wrong constant in the wiring makes the matching
+// the checksums are always valid and a wrong registry constant makes the matching
 // coin's own address classify as Foreign and fails the test.
 
 #include <gtest/gtest.h>
@@ -30,12 +34,25 @@
 
 #include <core/address_utils.hpp>
 
+// The REAL per-coin registry helpers under test (issue #961). Including these and
+// calling address_acceptance() is what makes this KAT non-blind and red on parent.
+#include <impl/ltc/params.hpp>
+#include <impl/btc/config_coin.hpp>
+#include <impl/bch/config_coin.hpp>
+#include <impl/dgb/params.hpp>
+#include <impl/bip110/params.hpp>
+#include <impl/dash/params.hpp>
+
 #include <btclibs/base58.h>
 #include <btclibs/bech32.h>
 #include <btclibs/span.h>
 
 using core::AddressCoinMatch;
+using core::CoinAddressAcceptance;
 using core::classify_address_for_coin;
+using core::decide_payout_address;
+using core::MergedChainAddr;
+using core::PayoutAddressDecision;
 
 namespace {
 
@@ -83,28 +100,20 @@ std::vector<unsigned char> p2wpkh_script()
     return s;
 }
 
-// One running coin's accepted set (mainnet), mirroring each chain's chainparams.
+// One running coin, its accepted set sourced from the REAL registry helper.
 struct Coin {
     std::string name;
-    std::vector<uint8_t> p2pkh;   // accepted P2PKH version bytes
-    std::vector<uint8_t> p2sh;    // accepted P2SH version bytes
-    std::vector<std::string> hrps; // accepted bech32 HRPs (bare, no trailing '1')
+    CoinAddressAcceptance acc;
 };
 
-// Mainnet chainparams (verified against each coin's chainparams.cpp):
-//   BTC : P2PKH 0x00, P2SH 0x05, hrp "bc"
-//   LTC : P2PKH 0x30, P2SH 0x32 (+ legacy 0x05), hrp "ltc"
-//   DOGE: P2PKH 0x1e, P2SH 0x16, no bech32
-//   DASH: P2PKH 0x4c, P2SH 0x10, no bech32
-//   BCH : P2PKH 0x00, P2SH 0x05 (legacy base58 == BTC), CashAddr via decoder
-//   DGB : P2PKH 0x1e, P2SH 0x3f, hrp "dgb"
+// Every set here is REGISTRY-SOURCED (mainnet) — no literals in the test.
 const std::vector<Coin> kCoins = {
-    {"BTC",  {0x00},       {0x05},        {"bc"}},
-    {"LTC",  {0x30},       {0x32, 0x05},  {"ltc"}},
-    {"DOGE", {0x1e},       {0x16},        {}},
-    {"DASH", {0x4c},       {0x10},        {}},
-    {"BCH",  {0x00},       {0x05},        {}},
-    {"DGB",  {0x1e},       {0x3f},        {"dgb"}},
+    {"BTC",    btc::address_acceptance(/*testnet=*/false, /*regtest=*/false)},
+    {"LTC",    ltc::address_acceptance(/*testnet=*/false)},
+    {"DASH",   dash::address_acceptance(/*testnet=*/false, /*regtest=*/false)},
+    {"BCH",    bch::address_acceptance(/*testnet=*/false, /*regtest=*/false)},
+    {"DGB",    dgb::address_acceptance(/*testnet=*/false, /*regtest=*/false)},
+    {"BIP110", bip110::address_acceptance(/*testnet=*/false, /*regtest=*/false)},
 };
 
 const Coin& coin(const std::string& name)
@@ -116,7 +125,7 @@ const Coin& coin(const std::string& name)
 
 AddressCoinMatch run(const Coin& c, const std::string& addr, std::vector<unsigned char>& script)
 {
-    return classify_address_for_coin(addr, c.p2pkh, c.p2sh, c.hrps, script);
+    return classify_address_for_coin(addr, c.acc, script);
 }
 
 bool set_has(const std::vector<uint8_t>& v, uint8_t x)
@@ -132,11 +141,109 @@ bool set_has(const std::vector<std::string>& v, const std::string& x)
 
 } // namespace
 
-// ── ACCEPT-OWN: each coin accepts its own P2PKH / P2SH address ───────────────
+// ── Registry values match chainparams (blocker #3: derived, not re-typed) ─────
+// The version bytes / HRPs come from make_coin_params()/params SSOT via the
+// address_acceptance() helper. Pinning them here catches a drifted constant AND
+// makes the file fail to compile on the parent (the helpers do not exist there).
+TEST(AddressCoinValidation, RegistryValuesMatchChainparams)
+{
+    // LTC: mainnet 48 / {50,5} / "ltc"; testnet 111 / {196,58} / "tltc".
+    EXPECT_EQ(ltc::address_acceptance(false).p2pkh_versions, (std::vector<uint8_t>{48}));
+    EXPECT_EQ(ltc::address_acceptance(false).p2sh_versions,  (std::vector<uint8_t>{50, 5}));
+    EXPECT_EQ(ltc::address_acceptance(false).bech32_hrps,    (std::vector<std::string>{"ltc"}));
+    EXPECT_EQ(ltc::address_acceptance(true).p2pkh_versions,  (std::vector<uint8_t>{111}));
+    EXPECT_EQ(ltc::address_acceptance(true).p2sh_versions,   (std::vector<uint8_t>{196, 58}));
+    EXPECT_EQ(ltc::address_acceptance(true).bech32_hrps,     (std::vector<std::string>{"tltc"}));
+
+    // BTC: mainnet 0 / 5 / "bc"; testnet 0x6f / 0xc4 / "tb"; regtest hrp "bcrt".
+    EXPECT_EQ(btc::address_acceptance(false, false).p2pkh_versions, (std::vector<uint8_t>{0x00}));
+    EXPECT_EQ(btc::address_acceptance(false, false).p2sh_versions,  (std::vector<uint8_t>{0x05}));
+    EXPECT_EQ(btc::address_acceptance(false, false).bech32_hrps,    (std::vector<std::string>{"bc"}));
+    EXPECT_EQ(btc::address_acceptance(true,  false).bech32_hrps,    (std::vector<std::string>{"tb"}));
+    EXPECT_EQ(btc::address_acceptance(false, true ).bech32_hrps,    (std::vector<std::string>{"bcrt"}));
+
+    // BCH: legacy base58 == BTC bytes; NO bech32 (CashAddr is a distinct format).
+    EXPECT_EQ(bch::address_acceptance(false, false).p2pkh_versions, (std::vector<uint8_t>{0x00}));
+    EXPECT_EQ(bch::address_acceptance(false, false).p2sh_versions,  (std::vector<uint8_t>{0x05}));
+    EXPECT_TRUE(bch::address_acceptance(false, false).bech32_hrps.empty());
+
+    // DGB: mainnet 0x1e / 0x3f / "dgb"; regtest hrp "dgbrt".
+    EXPECT_EQ(dgb::address_acceptance(false, false).p2pkh_versions, (std::vector<uint8_t>{0x1e}));
+    EXPECT_EQ(dgb::address_acceptance(false, false).p2sh_versions,  (std::vector<uint8_t>{0x3f}));
+    EXPECT_EQ(dgb::address_acceptance(false, false).bech32_hrps,    (std::vector<std::string>{"dgb"}));
+    EXPECT_EQ(dgb::address_acceptance(false, true ).bech32_hrps,    (std::vector<std::string>{"dgbrt"}));
+
+    // BIP-110: Bitcoin address formats unchanged; mainnet 0/5/"bc".
+    EXPECT_EQ(bip110::address_acceptance(false, false).p2pkh_versions, (std::vector<uint8_t>{0x00}));
+    EXPECT_EQ(bip110::address_acceptance(false, false).p2sh_versions,  (std::vector<uint8_t>{0x05}));
+    EXPECT_EQ(bip110::address_acceptance(false, false).bech32_hrps,    (std::vector<std::string>{"bc"}));
+    EXPECT_EQ(bip110::address_acceptance(false, true ).bech32_hrps,    (std::vector<std::string>{"bcrt"}));
+
+    // DASH: mainnet 76 / 16; testnet 140 / 19; regtest == testnet; no bech32.
+    EXPECT_EQ(dash::address_acceptance(false, false).p2pkh_versions, (std::vector<uint8_t>{76}));
+    EXPECT_EQ(dash::address_acceptance(false, false).p2sh_versions,  (std::vector<uint8_t>{16}));
+    EXPECT_TRUE(dash::address_acceptance(false, false).bech32_hrps.empty());
+    EXPECT_EQ(dash::address_acceptance(false, true ).p2pkh_versions, (std::vector<uint8_t>{140}));
+    EXPECT_EQ(dash::address_acceptance(true,  false).p2sh_versions,  (std::vector<uint8_t>{19}));
+}
+
+// ── The stratum payout decision (blocker #1: reject / guard, not accept-burn) ──
+// core::decide_payout_address() is the SSOT that handle_authorize() consults to
+// reject a foreign-unconfigured address at the door, and that send_notify_work()
+// consults to refuse building a zero-payout share. Prove: own-coin → AcceptOwn;
+// a CONFIGURED merged chain → AcceptMerged (legit reuse, same hash160 pays the
+// parent P2PKH); foreign-unconfigured OR unparseable → Reject.
+TEST(AddressCoinValidation, StratumPayoutDecision)
+{
+    const CoinAddressAcceptance ltc_acc = ltc::address_acceptance(false);
+
+    // DOGE identification triple, exactly as the stratum server's merged-chain
+    // table records it (D... 0x1e, 9/A... 0x16, testnet n... 0x71; no bech32).
+    const MergedChainAddr doge{{}, {0x1e, 0x16, 0x71}};
+    const std::vector<MergedChainAddr> no_merged{};
+    const std::vector<MergedChainAddr> with_doge{doge};
+
+    // Own LTC addresses → AcceptOwn regardless of merged config.
+    EXPECT_EQ(decide_payout_address(b58(48), ltc_acc, no_merged),
+              PayoutAddressDecision::AcceptOwn);          // L... P2PKH
+    EXPECT_EQ(decide_payout_address(b58(50), ltc_acc, no_merged),
+              PayoutAddressDecision::AcceptOwn);          // M... P2SH
+    EXPECT_EQ(decide_payout_address(b58(5),  ltc_acc, no_merged),
+              PayoutAddressDecision::AcceptOwn);          // legacy 3... P2SH
+    EXPECT_EQ(decide_payout_address(bech32_v0("ltc"), ltc_acc, with_doge),
+              PayoutAddressDecision::AcceptOwn);
+
+    // A DOGE address (0x1e): the ACCEPT-AND-BURN case. Rejected when DOGE is NOT
+    // a configured merged chain (the #961 money leak — previously repurposed into
+    // an LTC script from a hash160 the miner does not control), but AcceptMerged
+    // once DOGE IS configured (the intended merged-mining reuse).
+    EXPECT_EQ(decide_payout_address(b58(0x1e), ltc_acc, no_merged),
+              PayoutAddressDecision::Reject);
+    EXPECT_EQ(decide_payout_address(b58(0x1e), ltc_acc, with_doge),
+              PayoutAddressDecision::AcceptMerged);
+
+    // A DASH address (0x4c) LTC can never merge-mine → Reject even with DOGE cfg.
+    EXPECT_EQ(decide_payout_address(b58(0x4c), ltc_acc, with_doge),
+              PayoutAddressDecision::Reject);
+
+    // A real BTC mainnet bech32 (HRP "bc" ∉ {"ltc"}) → Reject.
+    EXPECT_EQ(decide_payout_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                                    ltc_acc, with_doge),
+              PayoutAddressDecision::Reject);
+
+    // Unparseable → Reject (an Invalid address is never payable, even if a merged
+    // chain is configured — the merged check only runs for a well-formed Foreign).
+    EXPECT_EQ(decide_payout_address("not an address", ltc_acc, with_doge),
+              PayoutAddressDecision::Reject);
+    EXPECT_EQ(decide_payout_address("", ltc_acc, with_doge),
+              PayoutAddressDecision::Reject);
+}
+
+// ── ACCEPT-OWN: each coin accepts its own P2PKH / P2SH / bech32 address ───────
 TEST(AddressCoinValidation, AcceptsOwnP2PKH)
 {
     for (const auto& c : kCoins) {
-        const std::string addr = b58(c.p2pkh.front());
+        const std::string addr = b58(c.acc.p2pkh_versions.front());
         std::vector<unsigned char> script;
         EXPECT_EQ(run(c, addr, script), AddressCoinMatch::Own)
             << c.name << " must accept its own P2PKH address " << addr;
@@ -147,7 +254,7 @@ TEST(AddressCoinValidation, AcceptsOwnP2PKH)
 TEST(AddressCoinValidation, AcceptsOwnP2SH)
 {
     for (const auto& c : kCoins) {
-        const std::string addr = b58(c.p2sh.front());
+        const std::string addr = b58(c.acc.p2sh_versions.front());
         std::vector<unsigned char> script;
         EXPECT_EQ(run(c, addr, script), AddressCoinMatch::Own)
             << c.name << " must accept its own P2SH address " << addr;
@@ -158,8 +265,8 @@ TEST(AddressCoinValidation, AcceptsOwnP2SH)
 TEST(AddressCoinValidation, AcceptsOwnBech32)
 {
     for (const auto& c : kCoins) {
-        if (c.hrps.empty()) continue;  // DOGE/DASH/BCH have no segwit
-        const std::string addr = bech32_v0(c.hrps.front());
+        if (c.acc.bech32_hrps.empty()) continue;  // DOGE/DASH/BCH have no segwit
+        const std::string addr = bech32_v0(c.acc.bech32_hrps.front());
         std::vector<unsigned char> script;
         EXPECT_EQ(run(c, addr, script), AddressCoinMatch::Own)
             << c.name << " must accept its own bech32 address " << addr;
@@ -168,36 +275,33 @@ TEST(AddressCoinValidation, AcceptsOwnBech32)
 }
 
 // ── REJECT-FOREIGN: full cross product of base58 addresses ───────────────────
-// Every coin's own P2PKH and P2SH address is offered to every OTHER coin. The
-// expected verdict is derived from the running coin's accepted set: Own iff the
+// Every coin's own P2PKH and P2SH version is offered to every OTHER coin. The
+// expected verdict is derived from the running coin's REGISTRY set: Own iff the
 // version byte is in the set (handles the inherent BTC/BCH 0x00,0x05 and
-// DOGE/DGB 0x1e collisions), Foreign otherwise — and Foreign MUST yield an
-// empty script so the money path can never emit a wrong-coin payment.
+// DOGE/DGB 0x1e collisions), Foreign otherwise — and Foreign MUST yield an empty
+// script so the money path can never emit a wrong-coin payment.
 TEST(AddressCoinValidation, RejectsForeignBase58)
 {
-    struct Sample { std::string owner; uint8_t version; };
-    std::vector<Sample> samples;
+    std::vector<uint8_t> versions;
     for (const auto& c : kCoins) {
-        for (uint8_t v : c.p2pkh) samples.push_back({c.name, v});
-        for (uint8_t v : c.p2sh)  samples.push_back({c.name, v});
+        for (uint8_t v : c.acc.p2pkh_versions) versions.push_back(v);
+        for (uint8_t v : c.acc.p2sh_versions)  versions.push_back(v);
     }
 
     for (const auto& running : kCoins) {
-        for (const auto& s : samples) {
-            const std::string addr = b58(s.version);
+        for (uint8_t v : versions) {
+            const std::string addr = b58(v);
             std::vector<unsigned char> script;
             auto verdict = run(running, addr, script);
-            const bool own = set_has(running.p2pkh, s.version) ||
-                             set_has(running.p2sh,  s.version);
+            const bool own = set_has(running.acc.p2pkh_versions, v) ||
+                             set_has(running.acc.p2sh_versions,  v);
             if (own) {
                 EXPECT_EQ(verdict, AddressCoinMatch::Own)
-                    << running.name << " should accept version 0x"
-                    << std::hex << int(s.version) << " (from " << s.owner << ")";
+                    << running.name << " should accept version 0x" << std::hex << int(v);
                 EXPECT_FALSE(script.empty());
             } else {
                 EXPECT_EQ(verdict, AddressCoinMatch::Foreign)
-                    << running.name << " must REJECT foreign version 0x"
-                    << std::hex << int(s.version) << " (from " << s.owner << ")";
+                    << running.name << " must REJECT foreign version 0x" << std::hex << int(v);
                 EXPECT_TRUE(script.empty())
                     << running.name << " emitted a script for a foreign address "
                     << "— MISDIRECTION (issue #961)";
@@ -207,9 +311,6 @@ TEST(AddressCoinValidation, RejectsForeignBase58)
 }
 
 // ── REJECT-FOREIGN: a bech32 address for another chain ───────────────────────
-// A well-formed segwit address under a HRP the running coin does not accept is
-// Foreign (never repurposed), and a coin with no segwit at all rejects every
-// bech32 address it is offered.
 TEST(AddressCoinValidation, RejectsForeignBech32)
 {
     const std::vector<std::string> all_hrps = {"bc", "ltc", "dgb", "tb"};
@@ -218,7 +319,7 @@ TEST(AddressCoinValidation, RejectsForeignBech32)
             const std::string addr = bech32_v0(hrp);
             std::vector<unsigned char> script;
             auto verdict = run(running, addr, script);
-            if (set_has(running.hrps, hrp)) {
+            if (set_has(running.acc.bech32_hrps, hrp)) {
                 EXPECT_EQ(verdict, AddressCoinMatch::Own)
                     << running.name << " should accept its own hrp " << hrp;
             } else {
@@ -233,8 +334,6 @@ TEST(AddressCoinValidation, RejectsForeignBech32)
 }
 
 // ── Concrete money-leak cases with real, checksum-valid mainnet addresses ────
-// These pin the exact behaviour the issue describes, independent of the
-// constructed-address matrix above.
 TEST(AddressCoinValidation, ConcreteMisdirectionCases)
 {
     std::vector<unsigned char> script;
@@ -279,19 +378,16 @@ TEST(AddressCoinValidation, ConcreteMisdirectionCases)
 // The production LTC/DOGE merged-mining server built its per-job coinbase payout
 // with the chain-agnostic address_to_script(), so a foreign-coin address whose
 // coin is NOT a configured merged chain was repurposed into an LTC script from a
-// hash160 the miner does not control on Litecoin — the money leak. At the
-// classify gate (what send_notify_work now consults before building the script),
-// LTC must classify every non-LTC address as Foreign and yield an EMPTY script.
-// (The stratum server then additionally honours a CONFIGURED merged chain's
-// address via the shared merged-chain table; the classify gate itself, tested
-// here, is the reject-unconfigured-foreign half.)
+// hash160 the miner does not control on Litecoin — the money leak. At the classify
+// gate (what send_notify_work now consults before building the script), LTC must
+// classify every non-LTC address as Foreign and yield an EMPTY script. The
+// running set is the REAL ltc::address_acceptance(false).
 TEST(AddressCoinValidation, LtcRejectsUnconfiguredForeign)
 {
     const Coin& ltc = coin("LTC");
     std::vector<unsigned char> script;
 
-    // A DOGE address (0x1e) — the classic "unconfigured merged coin" case. When
-    // DOGE is NOT a configured merged chain, LTC must NOT pay it.
+    // A DOGE address (0x1e) — the classic "unconfigured merged coin" case.
     EXPECT_EQ(run(ltc, b58(0x1e), script), AddressCoinMatch::Foreign);
     EXPECT_TRUE(script.empty())
         << "LTC repurposed a DOGE address into an LTC script — MISDIRECTION (#961)";
@@ -305,8 +401,7 @@ TEST(AddressCoinValidation, LtcRejectsUnconfiguredForeign)
               AddressCoinMatch::Foreign);
     EXPECT_TRUE(script.empty());
 
-    // LTC's OWN addresses (incl. the legacy 0x05 P2SH collision) stay Own — the
-    // reject must not become a false-reject of a real LTC payout.
+    // LTC's OWN addresses (incl. the legacy 0x05 P2SH collision) stay Own.
     EXPECT_EQ(run(ltc, b58(0x30), script), AddressCoinMatch::Own);       // L... P2PKH
     EXPECT_FALSE(script.empty());
     EXPECT_EQ(run(ltc, b58(0x32), script), AddressCoinMatch::Own);       // M... P2SH
@@ -321,42 +416,38 @@ TEST(AddressCoinValidation, LtcRejectsUnconfiguredForeign)
 // The wirings previously keyed the accepted set on a single is_testnet_ bool, so
 // a --regtest node (testnet=false) resolved to the MAINNET set and rejected a
 // legitimate regtest payout address as Foreign. The registry helpers now derive
-// the set from the TRUE network. These sets mirror what
-// {btc,dgb,ltc}::address_acceptance(testnet,regtest) returns for regtest:
-// bitcoin-family regtest reuses the TESTNET base58 version bytes and swaps the
-// bech32 HRP (BTC "bcrt", DGB "dgbrt", LTC "rltc"). A regtest own address must
-// classify as Own; a MAINNET address must be Foreign under the regtest set
-// (proving the set is network-derived, not mainnet-or-not).
+// the set from the TRUE network (testnet, regtest). These come from the REAL
+// address_acceptance(testnet=false, regtest=true): a regtest own address must
+// classify as Own; a MAINNET address must be Foreign under the regtest set.
 TEST(AddressCoinValidation, AcceptsRegtestAddresses)
 {
-    struct RegtestSet { std::string name; Coin set; uint8_t mainnet_p2pkh; };
+    struct RegtestSet { std::string name; CoinAddressAcceptance set; uint8_t mainnet_p2pkh; bool has_bech32; };
     const std::vector<RegtestSet> regtests = {
-        // BTC regtest: testnet 0x6f/0xc4 + hrp "bcrt"; mainnet P2PKH 0x00.
-        {"BTC",  {"BTCrt",  {0x6f}, {0xc4}, {"bcrt"}},  0x00},
-        // DGB regtest: testnet 0x7e/0x8c + hrp "dgbrt"; mainnet P2PKH 0x1e.
-        {"DGB",  {"DGBrt",  {0x7e}, {0x8c}, {"dgbrt"}}, 0x1e},
-        // LTC regtest: testnet 111/196(+58) + hrp "rltc"; mainnet P2PKH 0x30.
-        {"LTC",  {"LTCrt",  {0x6f}, {0xc4, 0x3a}, {"rltc"}}, 0x30},
+        {"BTC",    btc::address_acceptance(false, true),    0x00, true},
+        {"DGB",    dgb::address_acceptance(false, true),    0x1e, true},
+        {"BIP110", bip110::address_acceptance(false, true), 0x00, true},
+        {"DASH",   dash::address_acceptance(false, true),   76,   false},
     };
 
     for (const auto& r : regtests) {
+        const Coin c{r.name, r.set};
         std::vector<unsigned char> script;
 
-        // Regtest own P2PKH / P2SH / bech32 all classify Own with correct scripts.
-        EXPECT_EQ(run(r.set, b58(r.set.p2pkh.front()), script), AddressCoinMatch::Own)
+        EXPECT_EQ(run(c, b58(r.set.p2pkh_versions.front()), script), AddressCoinMatch::Own)
             << r.name << " regtest must accept its own P2PKH address";
         EXPECT_EQ(script, p2pkh_script());
-        EXPECT_EQ(run(r.set, b58(r.set.p2sh.front()), script), AddressCoinMatch::Own)
+        EXPECT_EQ(run(c, b58(r.set.p2sh_versions.front()), script), AddressCoinMatch::Own)
             << r.name << " regtest must accept its own P2SH address";
         EXPECT_EQ(script, p2sh_script());
-        EXPECT_EQ(run(r.set, bech32_v0(r.set.hrps.front()), script), AddressCoinMatch::Own)
-            << r.name << " regtest must accept its own bech32 address";
-        EXPECT_EQ(script, p2wpkh_script());
+        if (r.has_bech32) {
+            EXPECT_EQ(run(c, bech32_v0(r.set.bech32_hrps.front()), script), AddressCoinMatch::Own)
+                << r.name << " regtest must accept its own bech32 address";
+            EXPECT_EQ(script, p2wpkh_script());
+        }
 
         // A MAINNET address of the same coin is Foreign under the regtest set —
-        // the network-derived set is what closes the FALSE-REJECT without
-        // silently widening acceptance back to mainnet.
-        EXPECT_EQ(run(r.set, b58(r.mainnet_p2pkh), script), AddressCoinMatch::Foreign)
+        // proving the set is network-derived, not mainnet-or-not.
+        EXPECT_EQ(run(c, b58(r.mainnet_p2pkh), script), AddressCoinMatch::Foreign)
             << r.name << " regtest set must not accept a mainnet address";
         EXPECT_TRUE(script.empty());
     }

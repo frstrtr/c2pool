@@ -121,6 +121,59 @@ inline std::vector<unsigned char> address_to_script_for_coin(
         acc.p2sh_versions, acc.bech32_hrps);
 }
 
+/// Normalise a CoinParams-style bech32 HRP to the BARE form the acceptance set
+/// wants (issue #961 blocker #3). CoinParams.bech32_hrp is stored inconsistently
+/// across the lanes — LTC keeps the separator ("ltc1"), DGB/BIP-110 store it bare
+/// ("dgb"/"bc") — so a registry-derived address_acceptance() strips a single
+/// trailing '1' (the bech32 HRP/data separator) to get the bare prefix. A bare
+/// HRP never ends in '1' (it is the separator), so this is loss-free.
+inline std::string bare_bech32_hrp(const std::string& hrp)
+{
+    if (!hrp.empty() && hrp.back() == '1') return hrp.substr(0, hrp.size() - 1);
+    return hrp;
+}
+
+/// A CONFIGURED merged-mining chain's address-identification triple (issue #961).
+/// bech32 HRPs (bare) + Base58Check version bytes, exactly as the stratum server's
+/// merged-chain table records them — passed to decide_payout_address() so a
+/// legitimate merged-mining payout (same secp256k1 key, spendable on the parent's
+/// P2PKH) is accepted while an UNconfigured foreign coin's address is rejected.
+struct MergedChainAddr {
+    std::vector<std::string> hrps;
+    std::vector<uint8_t>     versions;
+};
+
+/// The stratum payout money-path decision for a miner-supplied address on a node
+/// that has published its own acceptance set (issue #961 blocker #1). This is the
+/// SSOT the stratum server consults at BOTH mining.authorize (reject at the door)
+/// and per-job coinbase build (guard: never build a zero/foreign payout):
+///   • AcceptOwn    — an own-coin address; the caller builds its script.
+///   • AcceptMerged — a CONFIGURED merged chain's address; the caller builds the
+///                    parent P2PKH to the same hash160 (the intended reuse).
+///   • Reject       — foreign-and-unconfigured, or unparseable; the caller MUST
+///                    refuse (no empty/zero-hash160 payout, which PPLNS would burn).
+enum class PayoutAddressDecision { AcceptOwn, AcceptMerged, Reject };
+
+inline PayoutAddressDecision decide_payout_address(
+    const std::string& address,
+    const CoinAddressAcceptance& own,
+    const std::vector<MergedChainAddr>& configured_merged)
+{
+    std::vector<unsigned char> own_script;
+    auto m = classify_address_for_coin(address, own, own_script);
+    if (m == AddressCoinMatch::Own)
+        return PayoutAddressDecision::AcceptOwn;
+    // Only a well-formed-but-Foreign address can still be a configured merged
+    // chain; an Invalid (unparseable) address is never payable.
+    if (m == AddressCoinMatch::Foreign) {
+        for (const auto& c : configured_merged) {
+            if (is_address_for_chain(address, c.hrps, c.versions))
+                return PayoutAddressDecision::AcceptMerged;
+        }
+    }
+    return PayoutAddressDecision::Reject;
+}
+
 /// Build a scriptPubKey from either a Base58Check or Bech32 address.
 /// Returns empty vector on failure.
 std::vector<unsigned char> address_to_script(const std::string& address);
