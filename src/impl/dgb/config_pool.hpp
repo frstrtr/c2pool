@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dgb
@@ -138,9 +139,17 @@ public:
         "nversionbips", "csv", "segwit", "reservealgo", "odo", "taproot"
     };
 
-    // Bootstrap peers for the DGB Scrypt p2pool network
+    // Bootstrap peers for the DGB Scrypt p2pool network.
+    // 92.53.224.27 is the live kr1z1s DGB sharechain node (host p2p-spb.xyz,
+    // web :5025), the anchor of the public DGB (scrypt) sharechain this lane
+    // joins. Seeded at P2P_PORT (5024) by run_node / the bootstrap seam below
+    // unless a host literal already carries an explicit ":port". Was empty on
+    // master, so a public DGB node had 0 outbound sharechain seeds to dial and
+    // never joined the chain. REWARD-SAFE: a transport address only -- PREFIX/
+    // IDENTIFIER/P2P_PORT/proto/share/PPLNS/coinbase are untouched, so a node
+    // JOINS the existing chain through the standard handshake; it cannot fork it.
     static inline const std::vector<std::string> DEFAULT_BOOTSTRAP_HOSTS = {
-        // Will be populated as DGB p2pool nodes come online
+        "92.53.224.27",   // kr1z1s DGB scrypt sharechain (p2p-spb.xyz), :5024
     };
 
     // -----------------------------------------------------------------------
@@ -150,5 +159,86 @@ public:
     std::string m_worker;
     std::vector<NetService> m_bootstrap_addrs;
 };
+
+// ---------------------------------------------------------------------------
+// Sharechain bootstrap-source selection (pure, testable seam)
+//
+// FIX (contabo DGB revival, 2026-09-05): run_node (main_dgb.cpp) hand-builds
+// dgb::Config WITHOUT the YAML load() that is the sole populator of
+// m_bootstrap_addrs. On master DEFAULT_BOOTSTRAP_HOSTS was ALSO empty AND there
+// was no --sharechain-addnode flag, so a public DGB node had 0 outbound
+// sharechain seeds and never joined the kr1z1s DGB (scrypt) sharechain. This
+// resolver + builder let run_node seed the addr store deterministically before
+// the Node ctor reads it, WITHOUT a YAML file. Mirrors the BCH seam
+// (src/impl/bch/config_pool.hpp select_sharechain_bootstrap_mode): DGB has no
+// --network-id federation CLI either, so there is no custom-net precedence tier.
+//
+// REWARD-SAFE: this touches ONLY which transport addresses are dialed. PREFIX
+// (1c0553f23ebfcffe), IDENTIFIER (4b62545b1a631afe), P2P_PORT (5024), protocol
+// versions, share format, PPLNS and coinbase are UNCHANGED -- the node joins the
+// existing kr1z1s DGB sharechain through the standard handshake; it cannot fork
+// it.
+// ---------------------------------------------------------------------------
+enum class SharechainBootstrapMode {
+    ExplicitPeers,    // --sharechain-addnode given: dial ONLY those peers
+    RegtestIsolated,  // --regtest: 0 seeds (never dial public mainnet 5024 seeds)
+    PublicDefault,    // public net, no explicit peers: DEFAULT_BOOTSTRAP_HOSTS
+};
+
+// Precedence: explicit peers > regtest > public default.
+inline SharechainBootstrapMode select_sharechain_bootstrap_mode(
+    bool has_explicit_peers, bool regtest)
+{
+    if (has_explicit_peers) return SharechainBootstrapMode::ExplicitPeers;
+    if (regtest)            return SharechainBootstrapMode::RegtestIsolated;
+    return SharechainBootstrapMode::PublicDefault;
+}
+
+// Pure builder: compute the sharechain bootstrap address list. No I/O, no
+// config mutation -- the whole logic lives here so it is unit-testable without
+// constructing a PoolConfig or touching the network.
+//   ExplicitPeers   -> exactly `addnodes`, at the ports given.
+//   RegtestIsolated -> empty (solo/local; a won share is never relayed to the
+//                      public net).
+//   PublicDefault   -> DEFAULT_BOOTSTRAP_HOSTS, each at P2P_PORT (5024) unless
+//                      the host literal already carries an explicit ":port".
+inline std::vector<NetService> build_sharechain_bootstrap(
+    SharechainBootstrapMode mode,
+    const std::vector<std::pair<std::string, uint16_t>>& addnodes)
+{
+    std::vector<NetService> out;
+    switch (mode)
+    {
+    case SharechainBootstrapMode::ExplicitPeers:
+        for (const auto& [host, port] : addnodes)
+            out.emplace_back(host, port);
+        break;
+    case SharechainBootstrapMode::RegtestIsolated:
+        break;  // empty by design
+    case SharechainBootstrapMode::PublicDefault:
+        for (const auto& host : PoolConfig::DEFAULT_BOOTSTRAP_HOSTS)
+        {
+            if (host.find(':') == std::string::npos)
+                out.emplace_back(host, PoolConfig::P2P_PORT);
+            else
+                out.emplace_back(host);  // literal already HOST:PORT
+        }
+        break;
+    }
+    return out;
+}
+
+// Populate pool.m_bootstrap_addrs from the resolved mode (thin plumbing over the
+// pure builder). Called by run_node BEFORE the Node ctor reads the vector.
+inline void seed_sharechain_bootstrap(
+    PoolConfig& pool,
+    const std::vector<std::pair<std::string, uint16_t>>& addnodes,
+    bool regtest)
+{
+    pool.m_bootstrap_addrs = build_sharechain_bootstrap(
+        select_sharechain_bootstrap_mode(/*has_explicit_peers=*/!addnodes.empty(),
+                                          /*regtest=*/regtest),
+        addnodes);
+}
 
 } // namespace dgb
