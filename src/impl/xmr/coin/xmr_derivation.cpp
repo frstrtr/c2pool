@@ -33,9 +33,10 @@
 //   Upstream : monero-project/monero  src/crypto/crypto.cpp
 //   Commit   : 3d3920d7487b5df7ac388b6b8577fd04d505885f (master, fetched 2026-09-05)
 //   License  : BSD-3-Clause (header above preserved verbatim from upstream)
-//   Subset   : the function BODIES of hash_to_scalar, generate_key_derivation,
-//              derivation_to_scalar, derive_public_key and derive_view_tag are
-//              reproduced VERBATIM from crypto_ops:: in the upstream file.
+//   Subset   : the function BODIES of hash_to_scalar, secret_key_to_public_key,
+//              generate_key_derivation, derivation_to_scalar, derive_public_key
+//              and derive_view_tag are reproduced VERBATIM from crypto_ops:: in
+//              the upstream file.
 //   Adapted  : (a) wrapped in namespace xmr::coin instead of crypto::;
 //              (b) upstream crypto:: POD types (public_key/secret_key/
 //                  key_derivation/ec_scalar/view_tag) replaced by the
@@ -67,6 +68,17 @@ namespace xmr::coin {
 void hash_to_scalar(const void *data, std::size_t length, EcScalar &res) {
   cn_fast_hash(data, length, reinterpret_cast<char *>(res.data()));
   sc_reduce32(res.data());
+}
+
+// --- crypto.cpp: crypto_ops::secret_key_to_public_key ----------------------
+bool secret_key_to_public_key(const SecretKey &sec, PublicKey &pub) {
+  ge_p3 point;
+  if (sc_check(sec.data()) != 0) {
+    return false;
+  }
+  ge_scalarmult_base(&point, sec.data());
+  ge_p3_tobytes(pub.data(), &point);
+  return true;
 }
 
 // --- crypto.cpp: crypto_ops::generate_key_derivation -----------------------
