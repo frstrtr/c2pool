@@ -148,6 +148,9 @@ TEST(DashPoolNodeMessages, Handler_TypeList_Compiles) {
 namespace {
 // A minimal 1-in 1-out classic (type-0) tx so the wire round-trip exercises a
 // real MutableTransaction body (not an empty one).
+static OPScript to_opscript(const std::vector<unsigned char>& v) {
+    return OPScript(v.data(), v.data() + v.size());
+}
 static coin::MutableTransaction make_inject_tx() {
     coin::MutableTransaction tx;
     tx.version = 1; tx.type = 0; tx.locktime = 0;
@@ -155,11 +158,11 @@ static coin::MutableTransaction make_inject_tx() {
     in.prevout.hash = uint256(0x9a9a9aull);
     in.prevout.index = 3;
     in.sequence = 0xffffffffu;
-    in.scriptSig = OPScript(std::vector<unsigned char>{0x51, 0x52, 0x53});
+    in.scriptSig = to_opscript({0x51, 0x52, 0x53});
     tx.vin.push_back(in);
     coin::TxOut out;
     out.value = 123456;
-    out.scriptPubKey = OPScript(std::vector<unsigned char>{0x76, 0xa9, 0x14});
+    out.scriptPubKey = to_opscript({0x76, 0xa9, 0x14});
     tx.vout.push_back(out);
     return tx;
 }
