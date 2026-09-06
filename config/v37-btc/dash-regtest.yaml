@@ -1,0 +1,49 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# c2pool-v37  BITCOIN-FAMILY node — DASH REGTEST (Milestone A-BTC)
+#
+#   *** EXPERIMENTAL / PROTOTYPE — DO NOT RUN IN PRODUCTION ***
+#
+# The SHIPPED DEFAULT for the controlled mine-and-settle + reorg-drill demo.
+# regtest is REORG-INJECTABLE (invalidateblock / reconsiderblock), which the
+# controlled falsifier validation drives to exercise the F1 controlled-reorg path.
+# NEVER mainnet: --mainnet is refused by the daemon unless --i-understand-
+# experimental is also passed.
+#
+# CLI arguments always override values here. Maps to the main_v37_btc arg surface:
+#   --coin dash  --regtest  --rpc-host/-port/-user/-pass  --stratum-port
+#   --store  --d-conf  --slot-budget  --max-payout-bytes  --k-floor
+#   --subthreshold-estimator   (default OFF)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── Coin + network ─────────────────────────────────────────────────────────
+coin: dash
+network: regtest                 # DEFAULT; reorg-injectable for the falsifier drill
+                                 # (alternatives: devnet, testnet4[ltc]; NEVER mainnet)
+
+# ─── Coin daemon RPC endpoint (placeholder — point at your dashd regtest) ────
+rpc_host: 127.0.0.1
+rpc_port: 19998                  # dashd regtest RPC (placeholder; set to yours)
+rpc_user: "REPLACE_ME"           # dashd -rpcuser
+rpc_password: "REPLACE_ME"       # dashd -rpcpassword
+# In the shipped default build the daemon runs against a MOCK coin backend
+# (canned getblocktemplate/submitblock) so the lifecycle is host-safe; wire the
+# real embedded-SPV / daemon adapter with the CI FULL_LINK build.
+
+# ─── Stratum (miners connect here; payout address = stratum username) ────────
+stratum_port: 3333
+
+# ─── W6 settlement store (opened + RecoveryDriver run BEFORE start) ──────────
+store: "./v37btc-dash-regtest-store"
+
+# ─── v37 lane / settlement params ───────────────────────────────────────────
+lane_params:
+  d_conf: 6                      # coin finality depth before a found block settles
+  slot_budget_C: 2700            # K_fair coinbase output-count cap
+  max_payout_bytes: 0            # K_max payout byte budget (0 = unbounded)
+  k_floor: 1                     # byte-denominated h_min coefficient (h_min = k_floor*output_size)
+  subthreshold_estimator: false  # DEFAULT OFF — turning ON is a consensus change
+                                 # (RDWR-OQ2) NOT activated here.
+
+# ─── Payout descriptor canon (NATIVE ratified V37.0) ────────────────────────
+# BTC-family PayoutDescriptor kinds P2PKH/P2SH/P2WPKH/P2WSH/P2TR/RAW are the
+# native canon: NO P-1 activation, NO X6, NO RandomX. SHA-256d PoW is native.

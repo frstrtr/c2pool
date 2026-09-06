@@ -170,6 +170,71 @@ if (BUILD_TESTING)
              COMMAND v37_w4_estimator_wiring_test
              WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_w4_estimator_wiring_test>)
 
+    # Track A2 / Milestone A — the live XmrNode daemon smoke
+    # (src/c2pool/v37/xmr/xmr_node_smoke.hpp). Stands the WHOLE single-node
+    # stagenet daemon up against a monerod STUB (MockMonerodTransport — no
+    # RandomX, no libzmq, no sockets, no live monerod) and asserts the four
+    # milestone invariants: (S1) construction/donor order — the W6 settlement
+    # store + RecoveryDriver are built BEFORE V37Engine::start(); (S2) BOTH
+    # descriptor backends live + fail-closed without one; (S3) the X2 adapter
+    # Extend/Reorg stream drives the node; (S4) the F1 CONTRACT —
+    # OwedLedger::on_block_finalized is called once per coin-height, IN ORDER,
+    # with bin_height = the high-water AT THE STEP (H+D_conf), NEVER the live
+    # tip; (S5) consensus DIGEST unchanged (lane digest + owed_digest
+    # byte-identical to a bare-library replay); (S6) restart recovery round-trip
+    # + F2 fail-closed on a torn store. Links the X2 adapter lib (xmr_node) for
+    # the RPC/ZMQ decoder symbols + Threads for the engine executor thread; NO
+    # crypto link (a test point-check backend is injected). Its own harness
+    # (nonzero exit on any failed check). SAME HOLLOW-GREEN GUARD as the sibling
+    # suites: listed in the build.yml --target lists (BOTH the Linux x86_64 leg
+    # and the ASan+UBSan leg) so CI compiles + runs it, and audited by the
+    # src/c2pool/**/test drift-guard.
+    add_executable(v37_xmr_node_smoke v37_xmr_node_smoke.cpp)
+    target_compile_features(v37_xmr_node_smoke PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_node_smoke PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_node_smoke PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_node_smoke COMMAND v37_xmr_node_smoke)
+    # ── Track A2 / Milestone A-BTC — the live BITCOIN-FAMILY node CI gates ────
+    # The single-node c2pool-v37-btc daemon (XbtcNode) wires the MERGED v37
+    # engine (V37Engine / OwedLedger / W5 native coinbase) to the mature v36 coin
+    # plumbing behind ICoinBackend. These three targets are the NON-HOLLOW gates.
+    # SAME two-part hollow-green guard as the sibling suites: each is ALSO listed
+    # in the build.yml --target lists (BOTH the Linux x86_64 leg AND the
+    # ASan+UBSan leg — all three are sanitizer-clean, verified
+    # -fsanitize=address,undefined -fno-sanitize-recover=all), and the
+    # src/c2pool/**/test/ drift-guard (check_test_target_allowlist.py) fails
+    # closed on any add_test here missing from build.yml. Header-only lifecycle +
+    # MockCoinBackend: link only Threads (no coin lib, no Boost — HARD SAFETY 6).
+
+    # (1) the live lifecycle smoke — open-before-start, mainnet fence, F1 per-
+    #     height finalize, on_block_won W5 coinbase+submit, reorg drill,
+    #     W6 restart round-trip + F2 fail-closed (13 checks).
+    add_executable(v37_btc_node_smoke v37_btc_node_smoke.cpp)
+    target_compile_features(v37_btc_node_smoke PRIVATE cxx_std_20)
+    target_include_directories(v37_btc_node_smoke PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_btc_node_smoke Threads::Threads)
+    add_test(NAME v37_btc_node_smoke COMMAND v37_btc_node_smoke)
+
+    # (2) the drift-guard (HARD SAFETY 1): the lane digest the node publishes and
+    #     the owed digest after an F1 schedule are BYTE-IDENTICAL to a bare
+    #     ::v37::Roundabout / a fresh OwedLedger — the node changes no consensus
+    #     digest, it only SEQUENCES merged-engine calls.
+    add_executable(v37_btc_digest_drift_kat v37_btc_digest_drift_kat.cpp)
+    target_compile_features(v37_btc_digest_drift_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_btc_digest_drift_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_btc_digest_drift_kat Threads::Threads)
+    add_test(NAME v37_btc_digest_drift_kat COMMAND v37_btc_digest_drift_kat)
+
+    # (3) the F1 finalize-driver KAT over the COIN-AGNOSTIC settle_finalize_driver
+    #     (src/c2pool/v37/settle_finalize_driver.hpp — the driver shared byte-for-
+    #     byte with Milestone A-XMR). Proves in-order/per-height catch-up ==
+    #     real-time, restart-safe, O5.5 shorter-branch refusal, AND the FALSIFIER:
+    #     a jump-to-tip driver FORKS the owed_digest (7 checks). Stdlib-only.
+    add_executable(f1_finalize_kat_btc f1_finalize_kat_btc.cpp)
+    target_compile_features(f1_finalize_kat_btc PRIVATE cxx_std_20)
+    target_include_directories(f1_finalize_kat_btc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME f1_finalize_kat_btc COMMAND f1_finalize_kat_btc)
+
     # Track A2 / RDWR-OQ2 V37.1 CONSENSUS ACTIVATION — proves the SHIPPED default
     # is now V37.1 (the gate ON under the sybil-neutral Combined rule) via the
     # add-only LaneParams version marker (LaneParams::v37_0()/v37_1()/shipped(),
