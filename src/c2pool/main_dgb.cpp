@@ -1088,6 +1088,15 @@ int run_node(const core::CoinParams& params, bool testnet,
 
                 const uint32_t height  = *tip_h;
                 const uint32_t best_h  = dgb_utxo_ptr->get_best_height();
+                // PREV-HASH CONTINUITY: does this block build directly on the tip
+                // the view flushed? flush() stores sha256d(80-byte header) as
+                // best_block, the SAME id space as m_previous_block, so an exact
+                // string-of-bytes match proves the incoming block extends OUR
+                // tip rather than a same-height reorg that replaced it. Only the
+                // exact-next-height branch consults this (see utxo_accrual.hpp).
+                const bool parent_matches =
+                    (static_cast<const dgb::coin::BlockHeaderType&>(block).m_previous_block
+                        == dgb_utxo_ptr->get_best_block());
                 // Classify the confirmed-tip block against the persisted view
                 // (pure SSOT, utxo_accrual.hpp). RESTART-LIVENESS: best_h is read
                 // back from the view's LevelDB, so after a restart the header
@@ -1095,11 +1104,28 @@ int run_node(const core::CoinParams& params, bool testnet,
                 // returned on that forward gap forever and the fee-proof lane
                 // was silently DEAD for the rest of the process. Re-anchor
                 // instead so accrual resumes.
-                switch (dgb::coin::classify_full_block_accrual(best_h, height)) {
+                switch (dgb::coin::classify_full_block_accrual(best_h, height, parent_matches)) {
                     case dgb::coin::FullBlockAccrualAction::Connect:
-                        break;  // first anchor or normal +1 extend -> connect.
+                        break;  // first anchor or continuous +1 extend -> connect.
                     case dgb::coin::FullBlockAccrualAction::Drop:
-                        return; // reorg / height <= view -> fail-closed hold.
+                        // reorg / height <= view -> fail-closed hold. A DROP at
+                        // exactly best_h+1 is the same-height-reorg continuity
+                        // guard: the incoming block's parent is not our flushed
+                        // tip, so folding it would spend against a view that
+                        // never saw the replacement (over-proving an already-
+                        // spent output). Hold the view coinbase-only until a
+                        // block that truly extends our tip arrives.
+                        if (best_h > 0 && height == best_h + 1 && !parent_matches) {
+                            LOG_WARNING << "[EMB-DGB] full_block parent mismatch at h="
+                                        << height << ": incoming parent "
+                                        << static_cast<const dgb::coin::BlockHeaderType&>(block)
+                                               .m_previous_block.GetHex()
+                                        << " != view best_block "
+                                        << dgb_utxo_ptr->get_best_block().GetHex()
+                                        << " (same-height reorg replaced our tip) -- view held,"
+                                           " fee-proof lane fail-closed.";
+                        }
+                        return;
                     case dgb::coin::FullBlockAccrualAction::ReAnchorThenConnect:
                         // Forward tip-gap (e.g. restart): wipe the stale view
                         // (coins from before the gap may have been spent
