@@ -14,6 +14,7 @@
 // Pure state struct, no socket/IO — header-only, rig-free, fenced to src/impl/dash/.
 
 #include "coin/transaction.hpp"
+#include "tx_inject_relay.hpp"   // #157 M2: dash::PeerInjectGuard
 
 #include <chrono>
 #include <map>
@@ -46,6 +47,11 @@ struct Peer
     // have_tx / losing_tx. Mirror image of m_remote_txs above (what the peer
     // told us IT holds). See core/tx_advertiser.hpp for canonical semantics.
     core::TxAdvertState m_tx_advert;
+
+    // #157 M2: per-peer tx-injection DoS state — a sliding-window rate cap plus a
+    // bounded per-peer txid dedup set, consulted by ingest_peer_inject before any
+    // submit_inject work. Inert unless --embedded-tx-inject is armed.
+    dash::PeerInjectGuard m_inject_guard;
 };
 
 }; // namespace dash

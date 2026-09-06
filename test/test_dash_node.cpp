@@ -140,7 +140,7 @@ struct has_msg_handler<P, M, std::void_t<decltype(
     : std::true_type {};
 
 template <class P>
-constexpr bool registers_all_12()
+constexpr bool registers_all_13()
 {
     return has_msg_handler<P, dash::message_addrs>::value
         && has_msg_handler<P, dash::message_addrme>::value
@@ -153,13 +153,15 @@ constexpr bool registers_all_12()
         && has_msg_handler<P, dash::message_have_tx>::value
         && has_msg_handler<P, dash::message_losing_tx>::value
         && has_msg_handler<P, dash::message_remember_tx>::value
-        && has_msg_handler<P, dash::message_forget_tx>::value;
+        && has_msg_handler<P, dash::message_forget_tx>::value
+        && has_msg_handler<P, dash::message_tx_inject>::value;   // #157 M2
 }
 
 } // namespace
 
-// 6. Legacy registers a handler overload for all 12 established-peer messages.
-TEST(DashNodeDispatch, LegacyRegistersAll12Handlers)
+// 6. Legacy registers a handler overload for all 13 established-peer messages
+//    (the original 12 + the #157 M2 tx_inject subtype).
+TEST(DashNodeDispatch, LegacyRegistersAll13Handlers)
 {
     EXPECT_TRUE((has_msg_handler<dash::Legacy, dash::message_addrs>::value));
     EXPECT_TRUE((has_msg_handler<dash::Legacy, dash::message_addrme>::value));
@@ -173,12 +175,13 @@ TEST(DashNodeDispatch, LegacyRegistersAll12Handlers)
     EXPECT_TRUE((has_msg_handler<dash::Legacy, dash::message_losing_tx>::value));
     EXPECT_TRUE((has_msg_handler<dash::Legacy, dash::message_remember_tx>::value));
     EXPECT_TRUE((has_msg_handler<dash::Legacy, dash::message_forget_tx>::value));
-    static_assert(registers_all_12<dash::Legacy>(),
-                  "Legacy must register all 12 sharechain-p2p dispatch handlers");
+    EXPECT_TRUE((has_msg_handler<dash::Legacy, dash::message_tx_inject>::value));
+    static_assert(registers_all_13<dash::Legacy>(),
+                  "Legacy must register all 13 sharechain-p2p dispatch handlers");
 }
 
-// 7. Actual registers the identical 12-handler set (bodies diverge, surface does not).
-TEST(DashNodeDispatch, ActualRegistersAll12Handlers)
+// 7. Actual registers the identical 13-handler set (bodies diverge, surface does not).
+TEST(DashNodeDispatch, ActualRegistersAll13Handlers)
 {
     EXPECT_TRUE((has_msg_handler<dash::Actual, dash::message_addrs>::value));
     EXPECT_TRUE((has_msg_handler<dash::Actual, dash::message_addrme>::value));
@@ -192,8 +195,9 @@ TEST(DashNodeDispatch, ActualRegistersAll12Handlers)
     EXPECT_TRUE((has_msg_handler<dash::Actual, dash::message_losing_tx>::value));
     EXPECT_TRUE((has_msg_handler<dash::Actual, dash::message_remember_tx>::value));
     EXPECT_TRUE((has_msg_handler<dash::Actual, dash::message_forget_tx>::value));
-    static_assert(registers_all_12<dash::Actual>(),
-                  "Actual must register all 12 sharechain-p2p dispatch handlers");
+    EXPECT_TRUE((has_msg_handler<dash::Actual, dash::message_tx_inject>::value));
+    static_assert(registers_all_13<dash::Actual>(),
+                  "Actual must register all 13 sharechain-p2p dispatch handlers");
 }
 
 // 8. The Node alias binds NodeImpl + both protocols through the shared NodeBridge.

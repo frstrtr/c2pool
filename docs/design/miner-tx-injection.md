@@ -1,7 +1,10 @@
 # Miner / user tx-injection over the c2pool sharechain p2p (post-cut, SV2-like)
 
-Status: **M1 IMPLEMENTED (DASH, `--embedded-tx-inject`, default OFF); M2/M3
-staged.** This is a **post-cut (Tier-3)** feature, not a `--coin-rpc` (dashd)
+Status: **M1 + M2 IMPLEMENTED (DASH, `--embedded-tx-inject`, default OFF); M3
+staged.** M2 adds the `tx_inject` sharechain-p2p subtype (Legacy + Actual),
+routing a peer's tx through the SAME `submit_inject` gate, first-see fan-out
+(txid-deduped), a per-peer DoS guard, and the unknown-command-is-a-warning
+wire-compat property. This is a **post-cut (Tier-3)** feature, not a `--coin-rpc` (dashd)
 cut blocker. It is sequenced strictly **after** the daemonless block-template
 self-derive close (#154) and the full-mempool serving canary (#132). Nothing
 here touches the coinbase, the reward split, or the masternode-payee queue.
@@ -469,9 +472,11 @@ means any signer suffices — so it is correctly deferred without blocking M1.
 | M1 | submit gate + reconcile + node ownership | `src/impl/dash/coin/node_coin_state.hpp` (`submit_inject`, `set_tx_inject_enabled`, `m_inject_pool`) |
 | M1 | flag + local submit (SEAM entry) + catalog | `src/c2pool/main_dash.cpp` (`--embedded-tx-inject`, `--embedded-tx-inject-hex`), `src/core/param_catalog.inc` |
 | M1 | KATs (priority, reward-safety, double-spend, bad-script, missing-input, oversize, seam-unarmed, DoS, never-defaulted) | `test/test_dash_tx_inject.cpp` (in `test_dash_mempool`) |
-| **M2** | `tx-inject` p2p subtype + handler wiring | `src/impl/dash/messages.hpp`, `node.hpp` handler tables, `protocol_actual.cpp` / `protocol_legacy.cpp` |
-| M2 | first-see fan-out + `register_template_txs` | `node.cpp` (advertise pattern), reconstruct-won-block path |
-| M2 | continuous re-submission per tip | block-connect wiring of `reconcile_inject_pool` |
+| **M2 (implemented)** | `tx_inject` p2p subtype + handler wiring | `src/impl/dash/messages.hpp`, `node.hpp` handler tables (`ADD_HANDLER(tx_inject)` Legacy+Actual), `protocol_actual.cpp` / `protocol_legacy.cpp` |
+| M2 (implemented) | relay policy (flag short-circuit, per-peer dedup + rate guard, node-level seen set, first-see fan-out) | `src/impl/dash/tx_inject_relay.hpp` (`ingest_peer_inject`), `src/impl/dash/peer.hpp` (`m_inject_guard`) |
+| M2 (implemented) | submit sink seam (routes the peer path through the armed `NodeCoinState::submit_inject`) | `node.hpp` (`set_tx_inject_sink` / `handle_peer_tx_inject` / `relay_tx_inject`), `src/c2pool/main_dash.cpp` (wired next to the arm) |
+| M2 (implemented) | first-see fan-out + `register_template_txs` ride | `relay_tx_inject` (fan-out); an accepted inject is an ordinary body tx, so it rides `register_template_txs` unchanged (KAT-proven) |
+| M2 (staged) | continuous re-submission per tip | block-connect wiring of `reconcile_inject_pool` (lazy reconcile inside `submit_inject` suffices for M2) |
 | **M3** | per-peer token buckets, misbehaviour score, capability advertisement | coin_peer_manager / handler |
 | M3 | `submitter_hint` rate-accounting | inject pool |
 | M3 | full sandboxed signer (§10) | new isolated build/sign module |
