@@ -554,11 +554,6 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_asan
 
-      - name: Heavy-leg disk headroom guard (+ bounded prune)
-        if: runner.environment != 'github-hosted'
-        uses: ./.github/actions/heavy-disk-guard
-
-
       # Conan prime: the ONLY step here that reaches out to conancenter; bounded
       # retry+backoff warms the cache, the install below runs --no-remote.
       - name: Conan prime (only conancenter egress)
@@ -596,6 +591,10 @@ jobs:
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr"
+
+      - name: Heavy-leg disk headroom guard (+ bounded prune)
+        if: runner.environment != 'github-hosted'
+        uses: ./.github/actions/heavy-disk-guard
 
       - name: Build c2pool + tests
         run: |
@@ -909,11 +908,6 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_bch_asan
 
-      - name: Heavy-leg disk headroom guard (+ bounded prune)
-        if: runner.environment != 'github-hosted'
-        uses: ./.github/actions/heavy-disk-guard
-
-
       # Conan prime: the ONLY step here that reaches out to conancenter; bounded
       # retry+backoff warms the cache, the install below runs --no-remote.
       - name: Conan prime (only conancenter egress)
@@ -939,6 +933,10 @@ jobs:
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr"
+
+      - name: Heavy-leg disk headroom guard (+ bounded prune)
+        if: runner.environment != 'github-hosted'
+        uses: ./.github/actions/heavy-disk-guard
 
       - name: Build c2pool-bch + BCH tests
         run: |
