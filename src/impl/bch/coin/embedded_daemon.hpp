@@ -68,6 +68,7 @@
 #include "bchn_anchor_record.hpp" // BchnAnchorRecord (cold-start anchor)
 #include "seed_tier.hpp"        // SeedTier (Option-A embedded peer discovery ladder)
 #include "chain_seeds.hpp"      // bch_dns_seeds / bch_fixed_seeds (tier 1 + 2 data)
+#include "coin_peer_manager.hpp" // BchCoinPeerManager (--coin-p2p-discover: scored/diverse CoinAddrMan bank)
 
 #include <core/log.hpp>
 #include <core/timer.hpp>    // core::Timer (dedicated emergency re-arm timer)
@@ -119,6 +120,19 @@ public:
         if (m_emergency_timer)
             m_emergency_timer->stop();
     }
+
+    /// Arm the CoinAddrMan-backed --coin-p2p-discover network-standalone peer
+    /// discovery arm. MUST be called BEFORE run()/arm_p2p_no_rpc(): the manager
+    /// is constructed + start()ed inside configure_seed_tier(). Default (unset)
+    /// keeps the explicit-peer and the additive SeedTier-ladder paths bit-for-bit
+    /// unchanged, and the manager is never constructed. Reward-safe: peer
+    /// discovery + usage only, no coinbase/PPLNS/payee surface.
+    void enable_coin_p2p_discover() { m_coin_p2p_discover = true; }
+
+    /// The scored/diverse CoinAddrMan peer manager, or null when
+    /// --coin-p2p-discover was not armed. Surfaced so the pool entrypoint can
+    /// feed /api/coin_peers (get_tried_peers) — good-citizen, default-ON.
+    BchCoinPeerManager* peer_manager() { return m_peer_mgr.get(); }
 
     /// Bring the daemon up: start the node front-end (external RPC fallback +
     /// P2P relay) and close the ABLA size loop. After this, full_block events
@@ -335,6 +349,15 @@ public:
     bool maybe_start_p2p() {
         const auto& peer = m_config->coin()->m_p2p.address;
         if (peer.port() == 0) {
+            // --coin-p2p-discover (BCH FIX-2): the scored/group-diverse
+            // CoinAddrMan network-standalone arm takes precedence over the
+            // additive SeedTier ladder when armed. It dials from the manager's
+            // scored working set, harvests addr into the persistent bank, and
+            // scores dial-failure vs post-handshake-drop (#940). The manager is
+            // null unless enable_coin_p2p_discover() ran before run(), so the
+            // SeedTier / RPC-only defaults below are bit-for-bit unchanged.
+            if (m_peer_mgr)
+                return start_managed_discovery();
             // No EXPLICIT peer configured. ADDITIVE Option-A discovery: consult
             // the SeedTier ladder (DNS tier-1 -> fixed tier-2 -> HTTP-peer
             // tier-3) ONLY under should_run_ladder() -- i.e. only when no
@@ -706,19 +729,54 @@ private:
     /// tier 3. No network here -- pure data population; the ladder is only
     /// walked (and only when no explicit peer is set) inside maybe_start_p2p().
     void configure_seed_tier() {
-        if (m_seed_tier.has_seeds())
-            return;                        // populate once (idempotent)
+        if (!m_seed_tier.has_seeds()) {    // populate once (idempotent)
+            const bool testnet = m_config->m_testnet;
+            m_seed_tier.set_dns_seeds(bch_dns_seeds(testnet));     // tier 1: DNS
+            m_seed_tier.set_fixed_seeds(bch_fixed_seeds(testnet)); // tier 2: fixed
+            // Tier 3 (last-resort) bootstrap: the c2pool HTTP seed aggregator.
+            // Fires only when the DNS + fixed tiers both resolve nothing, so a BCH
+            // lane that loses its DNS and fixed seeds still has a recovery path.
+            // Coin selection is by the "bch" JSON key inside http_fetch_coin_peers,
+            // not the host, so the shared aggregator serves BCH peers without a
+            // BCH-specific endpoint. Shaped after the DGB tier-3 wire. No-op if the
+            // list is empty.
+            m_seed_tier.set_http_peer_seeds({{"voidbind.com", 8080}});
+        }
+        maybe_start_peer_manager();
+    }
+
+    /// The coin-network P2P port for this chain (valid_ports gate + the port a
+    /// port-less discovered/seed address is dialed on). Mirrors the network
+    /// table in main_bch.cpp: regtest 18444, testnet4 28333, testnet3 18333,
+    /// mainnet 8333.
+    uint16_t coin_p2p_port() const {
+        if (m_regtest)             return 18444;
+        if (m_config->m_testnet4)  return 28333;
+        if (m_config->m_testnet)   return 18333;
+        return 8333;
+    }
+
+    /// Construct + start the CoinAddrMan-backed peer manager when
+    /// --coin-p2p-discover armed it (idempotent). Populated with the SAME
+    /// DNS/fixed/HTTP seed data the SeedTier ladder uses so a fresh bank
+    /// bootstraps from tier 1/2/3. No-op default: the manager is never built
+    /// unless enable_coin_p2p_discover() was called before run(). Reward-safe:
+    /// peer discovery + usage only.
+    void maybe_start_peer_manager() {
+        if (!m_coin_p2p_discover || m_peer_mgr || !m_context)
+            return;
         const bool testnet = m_config->m_testnet;
-        m_seed_tier.set_dns_seeds(bch_dns_seeds(testnet));     // tier 1: DNS
-        m_seed_tier.set_fixed_seeds(bch_fixed_seeds(testnet)); // tier 2: fixed
-        // Tier 3 (last-resort) bootstrap: the c2pool HTTP seed aggregator.
-        // Fires only when the DNS + fixed tiers both resolve nothing, so a BCH
-        // lane that loses its DNS and fixed seeds still has a recovery path.
-        // Coin selection is by the "bch" JSON key inside http_fetch_coin_peers,
-        // not the host, so the shared aggregator serves BCH peers without a
-        // BCH-specific endpoint. Shaped after the DGB tier-3 wire. No-op if the
-        // list is empty.
-        m_seed_tier.set_http_peer_seeds({{"voidbind.com", 8080}});
+        BchPeerManagerConfig cfg;
+        cfg.valid_ports = { coin_p2p_port() };
+        m_peer_mgr = std::make_unique<BchCoinPeerManager>(
+            *m_context, /*symbol=*/"BCH", /*data_dir=*/std::string(), cfg);
+        m_peer_mgr->set_dns_seeds(bch_dns_seeds(testnet));
+        m_peer_mgr->set_fixed_seeds(bch_fixed_seeds(testnet));
+        m_peer_mgr->set_http_peer_seeds({{"voidbind.com", 8080}});
+        m_peer_mgr->start();
+        LOG_INFO << "[EMB-BCH] --coin-p2p-discover ARMED: CoinAddrMan peer manager"
+                 << " started (port=" << coin_p2p_port() << ", "
+                 << m_peer_mgr->peer_count() << " peers known).";
     }
 
     /// Dial a discovery-resolved candidate through the SAME transport arm the
@@ -730,6 +788,94 @@ private:
         bind_locator_provider();
         if (auto* p2p = m_node.p2p())
             p2p->enable_auto_getheaders();
+    }
+
+    /// --coin-p2p-discover arm: draw the FIRST dial from the CoinAddrMan scored
+    /// working set, dial it, and install the manager-backed transport callbacks
+    /// (scored rotation, addr harvest, connect/loss scoring). Returns true when
+    /// a dial was issued (sync) or is pending (async first-tick ladder seed).
+    /// Falls back to a one-shot SeedTier ladder resolve when the manager's bank
+    /// is still empty on the first tick (DNS bootstrap raced), then dials the
+    /// re-drawn front; stays RPC-only only if that too yields nothing.
+    bool start_managed_discovery() {
+        std::set<std::string> none;   // nothing connected yet
+        auto plan = m_peer_mgr->get_peers_to_connect(none);
+        if (!plan.empty()) {
+            dial_managed(plan.front().to_net_service());
+            return true;
+        }
+        // First-tick bank empty (start()'s DNS bootstrap may not have resolved
+        // yet). Seed the manager once from the SeedTier ladder, then re-draw.
+        if (!m_context)
+            return false;
+        m_seed_tier.resolve_candidates(*m_context,
+            [this](std::vector<NetService> candidates) {
+                for (auto& c : candidates)
+                    m_peer_mgr->add_discovered_peer(c, /*source_host=*/std::string());
+                std::set<std::string> none2;
+                auto plan2 = m_peer_mgr->get_peers_to_connect(none2);
+                if (plan2.empty()) {
+                    LOG_WARNING << "[EMB-BCH] --coin-p2p-discover: manager bank + "
+                                   "SeedTier ladder both resolved 0 candidates -> "
+                                   "staying RPC-only.";
+                    return;
+                }
+                dial_managed(plan2.front().to_net_service());
+            });
+        return true;                  // async dial pending on resolution
+    }
+
+    /// Dial a manager-drawn candidate through the SAME transport arm the
+    /// explicit-peer path uses (start_discovered_p2p), then install the
+    /// CoinAddrMan-backed callbacks: scored next-target rotation (excluding the
+    /// current key), a peer-connected recovery + notify_connected, addr harvest
+    /// into the bank, and the dial-failure-vs-post-handshake-drop peer-lost
+    /// scorer. getaddr-on-handshake is armed so the bank grows from every peer.
+    void dial_managed(const NetService& dial) {
+        m_current_dial = dial;
+        start_discovered_p2p(dial);   // start_p2p + locator provider + auto-getheaders
+        if (auto* p2p = m_node.p2p()) {
+            p2p->enable_getaddr_on_handshake();
+            p2p->set_next_target_provider(
+                [this]() { return next_managed_target(); });
+            p2p->set_peer_connected_callback([this]() {
+                m_peer_mgr->notify_connected(m_current_dial.to_string());
+                clear_emergency_state();   // spec 2.3 recovery: reset backoff
+            });
+            p2p->set_addr_callback([this](const std::vector<NetService>& addrs) {
+                for (auto& a : addrs)
+                    m_peer_mgr->add_discovered_peer(a, /*source_host=*/m_current_dial.address());
+            });
+            p2p->set_peer_lost_callback(
+                [this](const NetService& target, bool was_handshaked) {
+                    const std::string key = target.to_string();
+                    if (was_handshaked)
+                        m_peer_mgr->notify_disconnected(key);   // real peer dropped
+                    else
+                        m_peer_mgr->notify_dial_failed(key);    // dead dial (#940)
+                });
+        }
+        LOG_INFO << "[EMB-BCH] --coin-p2p-discover dial -> " << dial.to_string()
+                 << " (CoinAddrMan-backed: getaddr+addr harvest, scored rotation,"
+                 << " dial/drop scoring armed).";
+    }
+
+    /// Manager-backed next-target provider (replaces the SeedTier CandidateWalk
+    /// on the --coin-p2p-discover path). On peer loss, draw the highest-scored
+    /// candidate EXCLUDING the current (dead) key; empty draw escalates to the
+    /// emergency re-arm (ladder re-resolve re-seeds the bank) and leaves the
+    /// transport on its current target meanwhile.
+    std::optional<NetService> next_managed_target() {
+        std::set<std::string> exclude;
+        if (m_current_dial.port() != 0)
+            exclude.insert(m_current_dial.to_string());
+        auto plan = m_peer_mgr->get_peers_to_connect(exclude);
+        if (plan.empty()) {
+            arm_emergency_fallbacks();
+            return std::nullopt;
+        }
+        m_current_dial = plan.front().to_net_service();
+        return m_current_dial;
     }
 
     /// Discovery tail-walk provider body: hand the transport the NEXT resolved
@@ -779,8 +925,17 @@ private:
             // HTTP thread, so a bad tier cannot kill the io_context or the cycle.
             m_seed_tier.resolve_candidates(*m_context,
                 [this](std::vector<NetService> fresh) {
-                    if (!fresh.empty())
+                    if (fresh.empty())
+                        return;
+                    // --coin-p2p-discover path: re-seed the CoinAddrMan bank so
+                    // the next next_managed_target() draw has fresh candidates.
+                    // The SeedTier CandidateWalk is not used on that path.
+                    if (m_peer_mgr) {
+                        for (auto& c : fresh)
+                            m_peer_mgr->add_discovered_peer(c, /*source_host=*/std::string());
+                    } else {
                         m_walk.rearm(std::move(fresh));
+                    }
                 });
         });
     }
@@ -832,6 +987,18 @@ private:
     SeedTier::EmergencyReArm     m_emergency;
     std::unique_ptr<core::Timer> m_emergency_timer;
     bool             m_running = true;   // cleared by stop()/~EmbeddedDaemon: timer handlers early-return
+    // --coin-p2p-discover (BCH FIX-2): scored/group-diverse CoinAddrMan peer
+    // manager -- the network-standalone discovery arm. Constructed + start()ed
+    // in configure_seed_tier() ONLY when enable_coin_p2p_discover() armed it
+    // before run(); null otherwise so the explicit-peer / SeedTier-ladder /
+    // RPC-only defaults are bit-for-bit unchanged. Declared AFTER m_context (its
+    // ctor takes *m_context) and reward-safe (peer discovery + usage only).
+    bool                                m_coin_p2p_discover = false;
+    std::unique_ptr<BchCoinPeerManager> m_peer_mgr;
+    // Last target dialed on the managed-discovery arm: the SSOT the connect /
+    // addr / peer-lost callbacks key notify_connected/add_discovered_peer against
+    // (kept in lock-step with NodeP2P::m_target_addr via next_managed_target()).
+    NetService                          m_current_dial;
 };
 
 } // namespace coin

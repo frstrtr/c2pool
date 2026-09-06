@@ -129,7 +129,12 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                              // (default 0 off) + owner address (-f destination).
                              double dev_donation = core::kAuthorFeeDefaultPct,
                              double node_owner_fee = 0.0,
-                             const std::string& node_owner_address = "")
+                             const std::string& node_owner_address = "",
+                             // --coin-p2p-discover: arm the CoinAddrMan-backed
+                             // network-standalone coin-peer discovery arm on the
+                             // embedded daemon (independent of any explicit
+                             // --peer). Reward-safe (peer discovery + usage only).
+                             bool coin_p2p_discover = false)
 {
     // Author/dev donation u16 (p2pool committed donation field). Built-in default
     // 0.1% -> u16 66 via the SSOT conversion, shared with DASH/LTC/BTC/BIP110.
@@ -140,6 +145,8 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     // 1+2: embedded daemon up first -- it owns the work source + RPC fallback
     // the pool node consumes, and is the broadcast sink the node wires into.
     coin::EmbeddedDaemon<Config> daemon(&ioc, &config, anchor_height, is_regtest);
+    if (coin_p2p_discover)
+        daemon.enable_coin_p2p_discover();   // arm BEFORE run(): configure_seed_tier() builds the manager
     daemon.run();
 
     // 3: the pool node (sharechain, LevelDB, P2P, Stratum).
@@ -801,6 +808,20 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         // reads are display-only (lock-free snapshots / atomics).
         //   /api/node_topology -- BCHN embedded daemon peers + synced height.
         mi->set_node_topology_fn([&daemon]() { return daemon.dashboard_topology(); });
+        //   /api/coin_peers -- the CoinAddrMan tried-peer set (good-citizen,
+        //   default-ON feed shaped after the DGB wire). Empty array unless
+        //   --coin-p2p-discover armed the manager; keyed "bch" (the feed key that
+        //   http_fetch_coin_peers and other lanes select on).
+        mi->set_coin_peers_fn([&daemon]() {
+            nlohmann::json r = nlohmann::json::object();
+            nlohmann::json bch_arr = nlohmann::json::array();
+            if (auto* pm = daemon.peer_manager()) {
+                for (const auto& pe : pm->get_tried_peers(25))
+                    bch_arr.push_back(pe.to_string());
+            }
+            r["bch"] = bch_arr;
+            return r;
+        });
         //   /broadcaster_status header-sync fields -- the embedded BCH
         //   header-chain tip + single-peer startingheight (display-only; the
         //   core merge computes sync_percent/synced/connected_peers from it).
