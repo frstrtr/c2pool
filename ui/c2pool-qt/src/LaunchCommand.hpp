@@ -17,15 +17,22 @@
 //      combined --http [HOST:]PORT). This is the fix for the launch-failure class
 //      where every PerCoinRun coin was fed the DASH flag spellings verbatim.
 //
-//   2. ★ REWARD SAFETY. With the embedded opt-ins OFF (their default) the
-//      generated argv for ANY coin NEVER contains --coin-p2p-connect / --peer /
-//      --embedded-mainnet / a coin-magic override, and the default parent-daemon
-//      link is the reward-SAFE --coin-rpc arm. The author donation is left to the
-//      binary default (0.1% for all coins) unless the operator explicitly sets it;
-//      --give-author 0 is emitted ONLY behind an explicit opt-in ack, never as a
-//      default for a public node. validate_percoin() additionally refuses a DASH
-//      launch whose blank RPC endpoint would silently run daemonless (embedded
-//      MAINNET auto-ON) without an explicit embedded opt-in.
+//   2. ★ REWARD SAFETY. The panel only ASSEMBLES argv; it never carries a
+//      reward decision — the node's own good-citizen defaults do. The default
+//      DASH launch is a bare `--run` (daemonless cut mode): with no dashd arm
+//      the node keeps its serving levers ON (embedded-mainnet + serve defaults
+//      per good_citizen_defaults.hpp), so the panel does NOT emit
+//      --embedded-mainnet for that default. The dashd/coin-RPC arm
+//      (--coin-rpc + --coin-rpc-auth) is emitted ONLY behind an explicit
+//      "attach external dashd" opt-in (PerCoinParams::externalDaemonRpc) — on
+//      DASH both --coin-rpc AND --coin-rpc-auth re-arm dashd, so auth alone is
+//      also gated. The embedded --coin-p2p-connect / coin-magic knobs stay
+//      opt-in (transport / explicit gate-lift, not "reward-UNSAFE"). The author
+//      donation is left to the binary default (0.1% for all coins) unless the
+//      operator explicitly sets it; --give-author 0 is emitted ONLY behind an
+//      explicit opt-in ack, never as a default for a public node.
+//      validate_percoin() no longer refuses a daemonless DASH launch (that is
+//      the intended default) — it only checks launchability of an attached arm.
 
 #pragma once
 
@@ -52,13 +59,19 @@ struct PerCoinParams {
     bool testnet = false;              ///< network.testnet (emitted iff the bin has the alias)
     bool regtest = false;              ///< network.regtest
 
-    // Reward-SAFE parent-daemon RPC arm. Host+port ⇒ daemon_rpc.endpoint (DASH
-    // --coin-rpc / BTC --bitcoind) or daemon_rpc.submit_endpoint (DGB --coin-rpc).
-    // confPath ⇒ daemon_rpc.auth_file (--coin-rpc-auth / --rpc-conf). The
-    // rpcpassword NEVER touches argv — it is read from the coin's .conf.
+    // Parent-daemon RPC arm. Host+port ⇒ daemon_rpc.endpoint (DASH --coin-rpc /
+    // BTC --bitcoind) or daemon_rpc.submit_endpoint (DGB --coin-rpc). confPath ⇒
+    // daemon_rpc.auth_file (--coin-rpc-auth / --rpc-conf). The rpcpassword NEVER
+    // touches argv — it is read from the coin's .conf.
     std::string rpcHost;
     int         rpcPort = 0;
     std::string confPath;
+
+    // Explicit opt-in to the dashd/coin-RPC arm (--coin-rpc + --coin-rpc-auth).
+    // DASH: default OFF = daemonless cut mode (bare --run, node's good-citizen
+    // serving defaults). Consulted for BIN_DASH only; DGB/BCH keep their existing
+    // endpoint/auth emission (this flag is forced true for them by the marshaller).
+    bool        externalDaemonRpc = false;
 
     int         stratumPort = 0;       ///< stratum.bind PORT (0 ⇒ omit)
 
@@ -83,7 +96,10 @@ struct PerCoinParams {
     bool        noP2pRelay = false;        ///< sharechain.no_p2p_relay
     std::string bchAnchor;                 ///< embedded.anchor (BCH cold-start ABLA floor)
 
-    // ── ★ Embedded reward-UNSAFE arm — OPT-IN, default OFF ────────────────────
+    // ── ★ Embedded coin-network transport / explicit gate-lift — OPT-IN, OFF ──
+    // (DASH defaults ON daemonless: with no dashd arm the node already runs the
+    //  embedded arm with --embedded-mainnet, so these only pin peers or force the
+    //  flag explicitly — needed only when dashd is attached, where it is OFF.)
     bool                     embeddedP2p = false;      ///< coin_p2p.connect (DASH --coin-p2p-connect / BCH --peer)
     std::vector<std::string> embeddedP2pPeers;         ///< HOST:PORT peers
     bool                     embeddedMainnet = false;  ///< embedded.mainnet (DASH)
@@ -132,30 +148,28 @@ inline void emit_flag(std::vector<std::string>& a, Bin bin, const char* canon)
 
 } // namespace detail
 
-/// Reward-safety / launchability precheck. Returns "" when the params are safe
-/// to launch, else a human-readable reason PageLaunch surfaces and refuses on.
+/// Launchability precheck. Returns "" when the params are launchable, else a
+/// human-readable reason PageLaunch surfaces and refuses on. Nothing here may
+/// refuse a daemonless DASH launch — bare `--run` (no dashd arm) is the intended
+/// default cut mode. The ONLY DASH check is that an explicitly-requested external
+/// dashd attach actually carries a HOST:PORT to attach to.
 inline std::string validate_percoin(const PerCoinParams& p)
 {
-    // ★ F5 — DASH daemonless guard. On DASH, the ABSENCE of a --coin-rpc arm
-    // means daemonless == embedded MAINNET block production auto-ON, which is
-    // reward-UNSAFE. Refuse a blank RPC endpoint UNLESS an embedded arm was
-    // explicitly opted into (then the operator owns the risk knowingly).
-    if (p.bin == Bin::BIN_DASH) {
+    if (p.bin == Bin::BIN_DASH && p.externalDaemonRpc) {
         const bool haveRpc = !detail::trim(p.rpcHost).empty() && p.rpcPort > 0;
-        const bool embeddedOptIn = p.embeddedP2p || p.embeddedMainnet;
-        if (!haveRpc && !embeddedOptIn) {
-            return "DASH needs a --coin-rpc HOST:PORT (dashd RPC arm). A blank RPC "
-                   "endpoint runs the node DAEMONLESS with embedded MAINNET block "
-                   "production auto-ON — reward-UNSAFE. Set the RPC host/port, or "
-                   "explicitly enable the embedded arm below.";
+        if (!haveRpc) {
+            return "External dashd attach is ticked but no RPC HOST:PORT is set. "
+                   "Set the RPC host/port for --coin-rpc, or untick 'Attach external "
+                   "dashd' to run daemonless (the default).";
         }
     }
     return "";
 }
 
-/// Assemble the argv (binary first). The embedded reward-UNSAFE flags are
-/// appended ONLY when their opt-in bools are true — the single choke point that
-/// enforces the reward-safe default.
+/// Assemble the argv (binary first). The embedded coin-network transport /
+/// explicit gate-lift flags (DASH defaults ON daemonless) are appended ONLY when
+/// their opt-in bools are true — the single choke point that keeps the default
+/// argv minimal.
 inline std::vector<std::string> build_percoin_argv(const PerCoinParams& p)
 {
     using detail::trim;
@@ -174,17 +188,24 @@ inline std::vector<std::string> build_percoin_argv(const PerCoinParams& p)
     if (p.testnet) emit_flag(a, bin, "network.testnet");
     if (p.regtest) emit_flag(a, bin, "network.regtest");
 
-    // Reward-SAFE RPC arm. daemon_rpc.endpoint (DASH --coin-rpc / BTC --bitcoind)
-    // where the bin has it; else daemon_rpc.submit_endpoint (DGB --coin-rpc).
-    // BCH has neither and links creds only via --rpc-conf.
-    if (!trim(p.rpcHost).empty() && p.rpcPort > 0) {
+    // Parent-daemon RPC arm. daemon_rpc.endpoint (DASH --coin-rpc / BTC
+    // --bitcoind) where the bin has it; else daemon_rpc.submit_endpoint
+    // (DGB --coin-rpc). BCH has neither and links creds only via --rpc-conf.
+    //
+    // On DASH the whole arm is gated behind the explicit external-dashd opt-in:
+    // both --coin-rpc AND --coin-rpc-auth re-arm dashd (main_dash.cpp:1191-1192),
+    // so auth alone must NOT leak out and silently leave daemonless cut mode. For
+    // every other binary the arm emits as before.
+    const bool rpcArm = (bin != Bin::BIN_DASH) || p.externalDaemonRpc;
+    if (rpcArm && !trim(p.rpcHost).empty() && p.rpcPort > 0) {
         const std::string ep = trim(p.rpcHost) + ":" + std::to_string(p.rpcPort);
         if (catview::spelling_for(bin, "daemon_rpc.endpoint"))
             emit_value(a, bin, "daemon_rpc.endpoint", ep);
         else
             emit_value(a, bin, "daemon_rpc.submit_endpoint", ep);
     }
-    emit_value(a, bin, "daemon_rpc.auth_file", trim(p.confPath));
+    if (rpcArm)
+        emit_value(a, bin, "daemon_rpc.auth_file", trim(p.confPath));
 
     if (p.stratumPort > 0)
         emit_value(a, bin, "stratum.bind", std::to_string(p.stratumPort));
@@ -245,7 +266,8 @@ inline std::vector<std::string> build_percoin_argv(const PerCoinParams& p)
 
     emit_value(a, bin, "global.message_blob_hex", trim(p.messageBlob));
 
-    // ── ★ Embedded reward-UNSAFE arm — appended ONLY when opted in ────────────
+    // ── ★ Embedded coin-network transport / explicit gate-lift — opt-in only ──
+    // (DASH defaults ON daemonless; these pin peers / force the flag explicitly.)
     if (p.embeddedP2p) {
         for (const auto& peer : p.embeddedP2pPeers) {
             const std::string t = trim(peer);
@@ -269,6 +291,31 @@ inline std::string join_argv(const std::vector<std::string>& a)
         out += a[i];
     }
     return out;
+}
+
+// ── Legacy (`c2pool --net …`) operation mode ──────────────────────────────────
+// The unified binary's mode combo. Order matches the LegacyUnified mode combo in
+// PageLaunch. The flag SPELLING is resolved from the catalog (BIN_LTC mode
+// aliases in param_catalog.inc) so the panel can never drift from the node — the
+// same Qt-free seam the reward test proves. `Integrated` emits --integrated
+// explicitly (harmless; the binary default is integrated anyway); `Solo` MUST
+// emit --solo (a legacy "solo" that emitted nothing silently produced an
+// integrated PPLNS node). Returns "" only if the catalog has no alias.
+enum class LegacyMode { Integrated = 0, Sharechain = 1, Solo = 2, Custodial = 3, Standalone = 4 };
+
+inline std::string legacy_mode_flag(LegacyMode m)
+{
+    const char* canon = nullptr;
+    switch (m) {
+        case LegacyMode::Integrated: canon = "meta.mode_integrated"; break;
+        case LegacyMode::Sharechain: canon = "meta.mode_sharechain"; break;
+        case LegacyMode::Solo:       canon = "meta.mode_solo";       break;
+        case LegacyMode::Custodial:  canon = "meta.mode_custodial";  break;
+        case LegacyMode::Standalone: canon = "meta.mode_standalone"; break;
+    }
+    if (!canon) return std::string();
+    auto s = catview::spelling_for(Bin::BIN_LTC, canon);
+    return s ? s->first : std::string();
 }
 
 } // namespace c2pool_qt

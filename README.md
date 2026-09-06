@@ -15,9 +15,17 @@ c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
 are reconstructed inside c2pool. No Dash Core node is required on the serve path.
 Blocks built this way have been accepted on Dash mainnet, including the pool
-development-fee split. Independence from dashd is not yet complete; the
-Supported-chains matrix marks DASH in development. The remaining work is the
-daemonless-finalize item below.
+development-fee split. A bare `c2pool-dash --run` is daemonless: with no
+`--coin-rpc` given, every embedded serving lever defaults ON
+(`src/c2pool/main_dash.cpp` banner, "ALL embedded serving levers default ON
+when NO dashd arm is given"; resolver in
+`src/impl/dash/coin/good_citizen_defaults.hpp`). The public node
+`dash.voidbind.com` runs this posture with no dashd on the host. A node started
+with `--coin-rpc H:P` keeps dashd as the reward-safe fallback arm — the
+operator's hotel deployment still runs dashd-attached — so both postures are
+supported by the same binary. The remaining work is the daemonless-finalize item
+below (retiring the `--coin-rpc` fallback entirely). See
+[Per-binary launch reference](#per-binary-launch-reference) for the flags.
 
 ## Governance
 
@@ -76,12 +84,17 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 
 | Parent chain | Algorithm | Merged-mining children | Status |
 |---|---|---|---|
-| **Litecoin** (LTC) | Scrypt | DOGE, PEP, BELLS, LKY, JKC, SHIC — external daemons | **Production** (V36; live LTC+DOGE blocks) |
-| **Bitcoin** (BTC) | SHA256d | Namecoin (NMC) | Supported; NMC embedded merged mining in development |
-| **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | In development |
-| **Bitcoin Cash** (BCH) | SHA256d | — | In development |
-| **Dash** (DASH) | X11 | — | In development (embedded coin-state) |
-| **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) |
+| **Litecoin** (LTC) | Scrypt | DOGE, PEP, BELLS, LKY, JKC, SHIC — external daemons | **Production** (V36; live LTC+DOGE blocks) — `c2pool-ltc` |
+| **Bitcoin** (BTC) | SHA256d | Namecoin (NMC) | Live, daemonless (`c2pool-btc --coin-p2p-discover`; btc.voidbind.com); NMC embedded merged mining in development |
+| **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | Live, daemonless (`c2pool-dgb --run --coin-p2p-discover`; dgb.voidbind.com) — mainnet only, no testnet mode |
+| **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
+| **Dash** (DASH) | X11 | — | Live, daemonless (`c2pool-dash --run`; dash.voidbind.com); dashd-attached posture via `--coin-rpc` still supported |
+| **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
+
+"Live" means a public voidbind node runs that per-coin binary with no coin
+daemon on the serve path. It is not a production-maturity claim: only the LTC
+line has the crossing-soak record behind it. Each binary's real flag surface is
+in [Per-binary launch reference](#per-binary-launch-reference).
 
 ¹ DigiByte is a MultiAlgo chain; c2pool runs its **Scrypt** algorithm as a standalone parent — it is **not** an AuxPoW child of Litecoin.
 
@@ -227,7 +240,7 @@ Development is supported by Anthropic's [Claude for Open Source](https://claude.
 
 ## Download
 
-Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases). The current release line is **v0.2.x** (V36). Packages are built **per parent chain** and named `c2pool-<coin>-<version>-<platform>` (`ltc`, `btc`, `dgb`, `dash`, `bch`).
+Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases). The current release line is **v0.2.x** (V36). Packages are built **per parent chain** and named `c2pool-<coin>-<version>-<platform>` (`ltc`, `btc`, `dgb`, `dash`, `bch`, `bip110` — the coin matrix in `.github/workflows/release.yml`).
 
 | Platform | Package | Notes |
 |----------|---------|-------|
@@ -318,6 +331,12 @@ Common operator questions (merged coins, payouts, dashboard): [docs/FAQ.md](docs
 ---
 
 ## Operating modes
+
+> The **Operating modes**, **Defaults**, **Peer discovery**, **Merged mining**,
+> **Ports** and **Configuration reference** sections below describe the LTC
+> binary (`c2pool-ltc`, dev alias `c2pool`, `src/c2pool/main_ltc.cpp`). The
+> other per-coin binaries have their own, smaller flag surfaces — see
+> [Per-binary launch reference](#per-binary-launch-reference).
 
 c2pool has four operating modes. The default is a full P2P pool — no flags required.
 
@@ -539,8 +558,11 @@ Other chains need their daemon running externally.
 DOGE merged mining activates automatically when `--embedded-doge` is on (default).
 External daemons use `createauxblock`/`submitauxblock` RPC.
 
-**DigiByte Scrypt** is planned as a second parent chain (`--net digibyte`),
-running its own P2Pool sharechain network.
+**DigiByte Scrypt** is its own parent chain with its own binary and sharechain:
+`c2pool-dgb` (`src/c2pool/main_dgb.cpp`, sharechain port 5024). It is not
+selected through the LTC binary — `--net digibyte` on `c2pool-ltc` is the LTC
+binary's legacy chain selector (`--net CHAIN`, `main_ltc.cpp` usage text), not
+the DGB pool. See [c2pool-dgb](#c2pool-dgb--digibyte-scrypt) below.
 
 ---
 
@@ -556,18 +578,55 @@ running its own P2Pool sharechain network.
 
 ## Configuration
 
-CLI arguments always take priority over YAML values.
+### Settings file (TOML) — all binaries
+
+Every node binary resolves its launch configuration in three layers
+(`src/core/settings_cli.hpp`): **compiled defaults (L0) < settings file (L1) <
+command line (L2)**. The CLI always wins, even over a money-class key that the
+file has acknowledged. The catalog of every key and its per-binary CLI spelling
+is `src/core/param_catalog.inc`.
+
+| Flag | Binaries | Behaviour |
+|------|----------|-----------|
+| `--settings PATH` | ltc, dash, btc, dgb, bch | Explicit settings-file path. The file **must exist** — a typo is fatal (exit 78), it never falls through silently. Omitted: `<data-dir>/c2pool.toml` is loaded if present, else the run is pure compiled+CLI. (`settings_cli.hpp` `resolve_settings_path`) |
+| `--dump-resolved-config` | ltc, dash, btc, dgb, bch | Print the fully resolved config with the source of every key (compiled / file / CLI) between `=== RESOLVED CONFIG BEGIN ===` / `END` markers, then exit 0 **without starting the node**. Works with no coin endpoint configured. |
+| `--ack-money-settings` | ltc, dash, btc, dgb, bch | Compute and print the money-ack hash for the resolved settings file, then exit. Requires a settings file (`--settings PATH` or the data-dir default); exit 78 otherwise. |
+| `--data-dir PATH` | ltc, dash, btc, dgb, bch | Root all per-instance state (sharechain LevelDB, addr store, logs, …) under `PATH` (default `~/.c2pool`). Handled before the settings probe, so the default `c2pool.toml` is looked up under the final data dir. Requires a non-empty, non-flag argument (exit 1 otherwise). |
+
+**Money gate.** A settings file can never silently arm a money-class key
+(`MONEY_*` rows in the catalog: fees, donation, payout addresses, network
+identity, `embedded.null_arm`, …). A file that sets such a key without a
+matching `[gate].money_ack_hash` is refused and the node exits 78 (`EX_CONFIG`)
+before anything starts (`src/core/settings_file.hpp`). Run
+`--ack-money-settings` to obtain the hash for the file as it stands, put it in
+`[gate].money_ack_hash`, and the file is accepted; any later edit to a money key
+invalidates the hash.
+
+`c2pool-bip110` does not take `--settings` / `--data-dir` / `--dump-resolved-config`
+(no `BIN_BIP110` alias for those rows in `param_catalog.inc`); its money
+defaults are seeded from the catalog and overridden only by CLI flags
+(`main_bip110.cpp` `main()`).
+
+### Legacy YAML config (`--config`, LTC only, deprecated)
+
+`--config FILE` loads a YAML overlay on the LTC binary only. It is catalogued as
+`meta.config_yaml` — "DEPRECATED legacy YAML config overlay"
+(`param_catalog.inc`) — and is kept this release for byte-identical behaviour of
+existing YAML deployments. If both a `--config` YAML and a TOML settings file
+resolve, the **TOML is skipped with a loud warning and the YAML wins** for this
+release (`main_ltc.cpp`, M0b wiring block). Migrate to the TOML settings file;
+the YAML path will be removed.
 
 ```bash
-# Use a YAML config file
+# Legacy (LTC only, deprecated)
 ./c2pool --config config/c2pool_mainnet.yaml
 ```
 
 See [config/c2pool_mainnet.yaml](config/c2pool_mainnet.yaml) (mainnet) and
-[config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) (testnet) for
-complete examples with all options documented.
+[config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) (testnet) for the
+legacy YAML key set.
 
-### Configuration reference
+### Configuration reference (LTC binary)
 
 | CLI flag | YAML key | Default | Description |
 |----------|----------|---------|-------------|
@@ -580,9 +639,12 @@ complete examples with all options documented.
 | `--no-embedded-ltc` | | | Disable embedded LTC, use RPC daemon |
 | `--embedded-doge` | `embedded_doge` | **true** | Embedded DOGE SPV for merged mining |
 | `--no-embedded-doge` | | | Disable embedded DOGE |
-| `--net` | -- | litecoin | Blockchain: `litecoin`, `digibyte`, `bitcoin`, `dogecoin` |
+| `--net` | -- | litecoin | LTC-binary chain selector (`--net CHAIN`; alias `--blockchain`). Not the way to run DGB/BTC/BCH/DASH pools — those are separate binaries |
 | `--testnet` | `testnet` | false | Enable testnet mode |
-| `--config FILE` | -- | -- | YAML config file path |
+| `--settings FILE` | -- | `<data-dir>/c2pool.toml` | TOML settings file (all binaries; see above) |
+| `--dump-resolved-config` | -- | -- | Print resolved config with sources, exit 0 |
+| `--ack-money-settings` | -- | -- | Print the money-ack hash for the settings file, exit |
+| `--config FILE` | -- | -- | **Deprecated** legacy YAML overlay (LTC only); takes precedence over TOML this release |
 | `--address` | `solo_address` | -- | Node operator payout address (optional) |
 | `--give-author` | `donation_percentage` | 0.1 | Developer fee % (p2pool default: 0.5%) |
 | `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee % |
@@ -631,6 +693,318 @@ complete examples with all options documented.
 | `--coinbase-text` | `coinbase_text` | see below | Custom coinbase scriptSig text |
 | `--message-blob-hex` | -- | -- | V36 authority message blob |
 | `--doge-testnet4alpha` | `doge_testnet4alpha` | false | Use DOGE testnet4alpha |
+
+---
+
+## Per-binary launch reference
+
+Each parent chain ships as its own binary with its own hand-written argv parser.
+The tables below are transcribed from those parsers on `master` — the `--help`
+text of some binaries lags the parser, so the parser is the source of truth
+cited here (`src/c2pool/main_<coin>.cpp`; canonical key names in
+`src/core/param_catalog.inc`). The `--settings` / `--dump-resolved-config` /
+`--ack-money-settings` / `--data-dir` control-plane flags are described once
+under [Settings file (TOML)](#settings-file-toml--all-binaries) and only
+listed here.
+
+Common conventions:
+
+- `[HOST:]PORT` — a bare port binds `0.0.0.0`; `HOST:PORT` binds one interface.
+- Stratum and the web dashboard are **off unless bound** on `btc`, `dgb`, `bch`
+  and `dash` (`--stratum` / `--http`; DASH's dashboard is the exception and is
+  on at 8080 by default). `bip110` binds Stratum on 9336 by default.
+- Unknown flags: `dash`, `btc`, `dgb`, `bch` reject them with a non-zero exit;
+  `bip110` **silently ignores** them (its parse loop has no trailing `else`).
+- Coin-daemon RPC credentials are never taken on argv: every `--coin-rpc-auth`
+  / `--rpc-conf` points at a `bitcoin.conf`-style file.
+
+### Default ports by binary
+
+| Binary | Sharechain P2P | Stratum | Web dashboard | Coin P2P (embedded) |
+|--------|---------------:|--------:|--------------:|--------------------:|
+| `c2pool-ltc` | 9326 (`--p2pool-port`) | 9327 (`-w`) | 8080 (`--web-port`) | embedded LTC + DOGE SPV (DNS seeds) |
+| `c2pool-btc` | 9333 (`--sharechain-port`) | off (`--stratum`) | off (`--http`) | 8333 (`--coin-p2p-discover`) |
+| `c2pool-dgb` | 5024 (`--sharechain-port`) | off (`--stratum`) | off (`--http`) | 12024 (`--coin-p2p-discover` / `--coin-daemon`) |
+| `c2pool-bch` | 9349 (fixed) | off (`--stratum`) | off (`--http`) | 8333 (`--peer`, or seed ladder when `--peer` port is 0) |
+| `c2pool-dash` | 8999 mainnet / 18999 testnet (`--listen`) | off (`--stratum`) | 8080 (`--web-port`; 0 disables) | 9999 (`--coin-p2p-connect` / `--coin-p2p-discover`) |
+| `c2pool-bip110` | 9337 (`--bip110-sharechain` to enable) | 9336 (`--no-stratum` to disable) | off (`--http`) | 8333 (`--peer` / `--coin-p2p-discover`) |
+
+Sources: `src/impl/{btc,dgb,bch,dash}/config_pool.hpp` `P2P_PORT`;
+`src/impl/bip110/params.hpp` `SHARECHAIN_P2P_PORT` / `SHARECHAIN_WORKER_PORT` /
+`COIN_P2P_PORT`; each `main_<coin>.cpp` local-variable defaults.
+
+### c2pool-dash — Dash (X11)
+
+Source: `src/c2pool/main_dash.cpp` — `print_banner()` (usage text) and the
+`main()` parse loop. Unknown argument → `unknown argument: …`, exit 1.
+
+```bash
+# Daemonless public pool (the dash.voidbind.com posture, no dashd on the host)
+./c2pool-dash --run --data-dir /var/lib/c2pool/dash \
+  --coin-p2p-discover --coin-p2p-peers 8 \
+  --listen 0.0.0.0:8999 --addnode <sharechain-peer>:8999 \
+  --stratum 0.0.0.0:7903 --web-host 127.0.0.1 --web-port 8082 \
+  --dashboard-dir /opt/c2pool/web-static \
+  --node-owner-address <your-DASH-address>
+
+# dashd-attached (reward-safe fallback arm kept; creds read from dash.conf)
+./c2pool-dash --run --coin-rpc 127.0.0.1:9998 --coin-rpc-auth ~/.dashcore/dash.conf \
+  --stratum 3335
+```
+
+A bare `--run` **with no `--coin-rpc`** is the daemonless posture: every
+embedded serving lever below defaults ON ("ALL embedded serving levers default
+ON when NO dashd arm is given", banner text; resolver
+`src/impl/dash/coin/good_citizen_defaults.hpp`). With `--coin-rpc` given, the
+node is dashd-attached and the `--embedded-*` levers default OFF unless named.
+Only the daemonless trust anchor applies to a daemonless node — see
+[DASH daemonless masternode-set checkpoint](#dash-daemonless-masternode-set-checkpoint--trust-anchor).
+
+**Modes and control plane**
+
+| Flag | Meaning |
+|------|---------|
+| `--run` | Stand up the node (sharechain peer, coin feed, Stratum, web). Without it the binary runs the self-test and exits. |
+| `--selftest` | Accepted explicitly; same as the default path. |
+| `--version` / `--help` | Print and exit. |
+| `--data-dir PATH`, `--settings PATH`, `--dump-resolved-config`, `--ack-money-settings` | Control plane, see [Settings file](#settings-file-toml--all-binaries). |
+| `--testnet` / `--regtest` | Both set the testnet flag (the parser treats them identically). Sharechain port becomes 18999. |
+| `--mine-block [--payout-pubkey-hash HEX] [--max-nonce N]` | One-shot CPU miner harness. |
+| `--submit-block HEX` / `--submit-block-file PATH` | Drive one real `submitblock` through the dashd arm, then exit. |
+| `--replay-utxo-db PATH [--replay-utxo-hash] [--replay-utxo-expect HEX]` | Standalone UTXO-fold utility; runs and exits, never serves. |
+| `--dump-mn-checkpoint H FILE` | Write the self-derived masternode set at height H as a checkpoint `.inc`; two arguments. |
+
+**Coin daemon arm (optional)**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--coin-rpc H:P` (alias `--coin-daemon`) | none = daemonless | dashd RPC endpoint. Endpoint only, no secret. |
+| `--coin-rpc-auth PATH` | `~/.dashcore/dash.conf` | `dash.conf` with `rpcuser`/`rpcpassword`. |
+| `--coin-zmq-hashblock tcp://H:P` | off | Subscribe to dashd ZMQ `hashblock` for instant tip refresh on the fallback arm (needs `zmqpubhashblock` in dashd). |
+| `--embedded-oracle-shadow`, `--oracle-graduation-blocks N` (5000), `--oracle-class-coverage K` (20) | off | Observe-only per-block dashd cross-check + graduation ledger. Needs the RPC arm. |
+| `--embedded-shadow-compare` | off | Observe-only served-template vs `getblocktemplate` diff on a worker thread. No-op without dashd. |
+| `--embedded-no-dashd-mn-seed` [`--embedded-fold-only-proof`] | off | Cut the `protx list` payee seed while keeping dashd for observation (cut rehearsal); the second flag also leaves the checkpoint bridge unarmed. |
+
+**Sharechain and coin P2P**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--listen [HOST:]PORT` | `0.0.0.0:8999` | Sharechain (pool P2P) bind. |
+| `--addnode H:P` (repeatable) | — | Persistent outbound sharechain peers. |
+| `--connect H:P` (repeatable) | — | Connect-only sharechain peers. |
+| `--no-p2p-relay` | off | Suppress the embedded won-block P2P relay (isolates the RPC submit arm). |
+| `--coin-p2p-connect H:P` (repeatable) | — | Pin explicit DASH coin-network peers (port 9999). |
+| `--coin-p2p-discover` | off | Seed-based (dnsseed.dash.org + fixed), scored, group-diverse coin-peer discovery — the network-standalone arm. Pinned peers are kept alongside. |
+| `--coin-p2p-peers N` | 8 (cap 16) | Concurrent coin-network peers held. An evidence knob: `qfcommit`/`clsig` are announced once, so more peers = lower miss probability. |
+| `--coin-p2p-magic HEX` | mainnet `bf0c6bbd` | Wire-magic override (testnet `cee2caff`, regtest `fcc1b7dc`). |
+| `--embedded-fresh-datum-race[=false]`, `--embedded-fresh-datum-race-k N` (2) | off (`fresh_datum_race.hpp`: `static bool f = false`; the catalog help string says "default ON" — the code is authoritative) | Race the freshest `getmnlistd` to K distinct netgroups; fold the first self-checked reply. |
+| `--embedded-getmnlistd-tracker[=false]` | off (`getmnlistd_tracker.hpp`: `static bool f = false`; same catalog/code mismatch) | Fixed 10 s per-slot re-ask tracker for the MnListDiff class. |
+| `--embedded-asn-diversity[=false]` | off | Require the racing set to span ≥2 ASNs. |
+| `--embedded-peer-latency-score[=false]` | off | Latency tie-breaker inside the eligible peer set. |
+| `--embedded-proactive-rotate` | off | Low-rate proactive coin-peer rotation (default is stall-only). |
+
+**Embedded serving levers** (all daemonless-default ON, `=false` opts out;
+dashd-attached default OFF)
+
+| Flag | Meaning |
+|------|---------|
+| `--embedded-mainnet[=false]` | The arm gate: serve embedded templates on mainnet and arm the coin-state feed. `=false` on a mainnet node serves only the dashd fallback. |
+| `--embedded-utxo[=false]` | Embedded UTXO / fee lane. |
+| `--embedded-null-arm[=false]` | Optimistic null quorum commitment at fresh window-open slots, freshness-gated (#127). |
+| `--embedded-superblock[=false]` | Daemonless superblock payee sourcing via govsync. |
+| `--embedded-govsync` | Observe-only governance store (inv 17/18 pull). Does not arm serving by itself. |
+| `--embedded-serve-mempool-txs[=false]` | Serve fee-carrying templates from the embedded mempool. |
+| `--embedded-tx-serve-own-set[=false]` | Serve-time self-validation referee. |
+| `--embedded-mempool-ingest[=false]` | Coin-P2P `MSG_TX` pull (fills the mempool). |
+| `--embedded-ingest-isdlock[=false]` | `MSG_ISDLOCK` feed (InstantSend conflict locks, BLS-gated). |
+| `--embedded-ingest-dstx[=false]` | CoinJoin DSTX lane. |
+| `--embedded-include-mn-special-txs[=false]` | DIP special-tx superset (types 1–4). |
+| `--embedded-accrue-asset-locks[=false]` / `--embedded-accrue-asset-unlocks[=false]` | Type-8 / type-9 asset-lock/unlock fold. |
+| `--embedded-utxo-immature-serve-empty` | Serve coinbase-only until the UTXO view is mature. |
+| `--embedded-creditpool-publish-at-serve-tip` | Publish the derived credit pool at the serve tip (money path, default OFF). |
+| `--embedded-mined-commitment-index` | Arm the mined-commitment store on live tips. |
+| `--embedded-mn-bridge-max N` | Max blocks the pinned masternode anchor may lag the tip before the bridge refuses it as stale (default 20000, `mn_checkpoint_lane.hpp`). |
+| `--embedded-mn-bridge-no-cursor` | Replay the whole window from the anchor on every start instead of resuming the saved cursor. |
+| `--embedded-fold-live PATH` + `--embedded-fold-live-expect HASH`, `--embedded-fold-checkscripts` | Wire a full-history UTXO fold store as the live input-pricing view (store hash must match); consensus-exact input-script check. |
+| `--embedded-utxo-fold-fees DBPATH` + `--embedded-utxo-fold-expect HEX` | Graduated fold fee pricing; both required together. |
+| `--bestcl-policy freshness\|consensus-exact` | How the bestCL gate decides (default `freshness`). |
+| `--serve-staleness-sentinel[=off]` | Report-only served-height staleness detector, ON by default; `=off`/`=0`/`=false` disables. |
+| `--serve-gate-state-file PATH` | Cross-restart serve-gate accounting (soak convenience). |
+| `--regtest-force-won-block` | Regtest-only: drive one won block through the dual-path dispatch. |
+
+**Transactions, replay, checkpoints**
+
+| Flag | Meaning |
+|------|---------|
+| `--embedded-tx-inject`, `--embedded-tx-inject-hex FILE` | Opt-in miner/user tx injection (#157), default OFF. |
+| `--pin-local-tx-hex FILE`, `--pin-splice-xcheck-arm`, `--pin-splice-block-budget` | Pin a zero-fee self-mined tx (e.g. donation consolidation) into served templates; splice policy knobs default OFF. |
+| `--replay-bulk`, `--replay-bulk-capture DIR`, `--replay-bulk-start H` | Full-history bulk block-fetch lane from DIP3 (1028160); capture caches bodies. |
+| `--replay-fold-prestate FILE`, `--replay-fold-quorums`, `--replay-fold-qsnapshot FILE`, `--replay-fold-worklists FILE` | Anchor-seeded DML fold driven by the bulk lane, with derived quorum member sets. |
+| `--replay-mnlist-seed-height H --replay-mnlist-seed-source getmnlistdiff --replay-mnlist-seed-file FILE` | Optional V20 `getmnlistdiff` seed instead of deriving from DIP3 (implies `--replay-bulk`). |
+| `--replay-mined-commitment-index` | Mined-commitment store fed from replay. |
+
+**Web, money, misc**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--stratum [HOST:]PORT` | off | Miner-facing Stratum listener. |
+| `--web-port PORT` (alias `--http-port`) | 8080 | Dashboard + JSON API; `0` disables. If it collides with the Stratum port it moves to stratum+1. |
+| `--web-host ADDR` | `0.0.0.0` | Dashboard bind interface. |
+| `--dashboard-dir PATH` | `web-static` | Static dashboard root. |
+| `--external-ip ADDR` (aliases `--stratum-advertise`, `--public-host`) | auto-detect | Miner-facing host shown in the dashboard Stratum URL (NAT). |
+| `--explorer` / `--no-explorer` | on | Loopback-only `/api/explorer` surface + raw-block retention. |
+| `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
+| `-f` / `--fee PCT` | 0 | Node-owner fee percent. |
+| `--node-owner-address ADDR` | — | Fee destination. |
+| `--redistribute pplns\|fee\|boost\|donate` | `pplns` | Unnamed-share redistribution. |
+| `--coinbase-text TEXT` | `/P2Pool-DASH/c2pool/` | Coinbase scriptSig text, max 64 bytes (see [Coinbase structure](#coinbase-structure)). |
+| `--message-blob-hex HEX` (alias `--transition-message`) | — | Encrypted authority message blob. |
+
+### c2pool-btc — Bitcoin (SHA256d)
+
+Source: `src/c2pool/main_btc.cpp` — `print_usage()` and the `main()` parse
+loop. Unknown argument → `unknown arg: …` + usage, exit 1. There is **no
+`--version`** flag on this binary. A coin source is mandatory: without
+`--bitcoind` **or** `--coin-p2p-discover` the binary prints usage and exits 1.
+
+```bash
+# Daemonless public pool (btc.voidbind.com posture)
+./c2pool-btc --data-dir /var/lib/c2pool/btc --coin-p2p-discover \
+  --http 127.0.0.1:8083 --stratum 0.0.0.0:9334 \
+  --fee 0.1 --node-owner-address <your-BTC-address> --give-author 0
+
+# Against a local bitcoind P2P port, with the submitblock RPC backup
+./c2pool-btc --bitcoind 127.0.0.1:8333 --coin-rpc 127.0.0.1:8332 \
+  --coin-rpc-auth ~/.bitcoin/bitcoin.conf --stratum 9332
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-h` / `--help` | | Usage and exit 0. |
+| `--data-dir PATH`, `--settings PATH`, `--dump-resolved-config`, `--ack-money-settings` | | Control plane, see [Settings file](#settings-file-toml--all-binaries). `--dump-resolved-config` runs before the mandatory-coin-source check, so it works with no endpoint. |
+| `--testnet` / `--testnet4` / `--regtest` | mainnet | Chain selection (testnet4 also sets the testnet flag). |
+| `--bitcoind HOST:PORT` | — | bitcoind **P2P** endpoint (8333 / 18333 / 48333 testnet4 / 18443 regtest). Required unless `--coin-p2p-discover`. |
+| `--coin-p2p-discover` | off | BTC-isolated scored, group-diverse coin-peer discovery (DNS + fixed + HTTP seeds); streams headers with no bitcoind. |
+| `--p2pool HOST:PORT` | — | Single BTC p2pool peer; folds into `--sharechain-addnode` as an exclusive target. |
+| `--sharechain-addnode HOST:PORT` (repeatable) | — | Explicit sharechain peers. When given, the public seed list is **not** dialed and the saved addr book is reset. |
+| `--sharechain-port P` | 9333 | Sharechain listener port (second instance on one host). |
+| `--network-id HEX` (≤8 bytes), `--prefix HEX` | public BTC | Private sharechain identifier / prefix — two independent constants. Setting `--network-id` alone also suppresses the public seed list. |
+| `--stratum [HOST:]PORT` | off | Stratum listener. |
+| `--http [HOST:]PORT` | off | Operator dashboard (`web-static` relative to the working directory; parser only — not in the `--help` text). |
+| `--coin-rpc HOST:PORT` | — | `submitblock` RPC backup endpoint (no secret on argv). |
+| `--coin-rpc-auth PATH` | `~/.bitcoin/bitcoin.conf` | `rpcuser`/`rpcpassword` file for the backup. Omit both to run daemonless. |
+| `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` (repeatable) | — | Embedded merged-mined aux chain (NMC under BTC). |
+| `-f` / `--fee PCT` | 0 | Node-owner fee as a committed payout-identity substitution (not a separate output). Requires `--node-owner-address`. |
+| `--node-owner-address ADDR` | — | Fee destination (P2PKH/P2SH/P2WPKH). Undecodable → fee disabled. |
+| `--give-author PCT` (alias `--dev-donation`) | compiled-in `donation_u16 = 50` (the usage text labels it 0.5%) | Donation **amount** only; `0` allowed (dust-marker output still emitted). The donation script is never changed. |
+
+### c2pool-dgb — DigiByte (Scrypt)
+
+Source: `src/c2pool/main_dgb.cpp` — `print_banner()` and the `main()` parse
+loop. Unknown argument → `unknown argument: …`, exit 1. **Mainnet only**: there
+is no `--testnet` flag and `make_coin_params(/*testnet=*/false)` is hardwired;
+a settings file that sets `network.testnet` is refused. The DGB parser has no
+`--fee` / `--give-author` (the catalog's `money.give_author_pct` and
+`money.node_owner_fee_pct` rows exclude DGB); operator payout goes through
+`--redistribute` + `--node-owner-address`.
+
+```bash
+# Daemonless public pool (dgb.voidbind.com posture)
+./c2pool-dgb --run --coin-p2p-discover --data-dir /var/lib/c2pool/dgb \
+  --http 127.0.0.1:8084 --stratum 0.0.0.0:9434 \
+  --sharechain-port 5024 --sharechain-addnode 92.53.224.27:5024
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--version` / `--help` | | Print and exit. |
+| `--data-dir PATH`, `--settings PATH`, `--dump-resolved-config`, `--ack-money-settings` | | Control plane, see [Settings file](#settings-file-toml--all-binaries). |
+| `--run` | | Stand up the run-loop (io_context + sharechain peer + Stratum). Without it (or with `--selftest`) the binary runs the self-test and exits. |
+| `--stratum [HOST:]PORT` | off | Stratum listener. |
+| `--http [HOST:]PORT` | off | Dashboard + stats persistence (`web-static` relative to the working directory). |
+| `--sharechain-port P` | 5024 | Sharechain listener port. |
+| `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers; suppresses the default bootstrap list. `92.53.224.27:5024` is the live public DGB sharechain seed named in the source. |
+| `--coin-p2p-discover` | off | DGB-isolated scored, diverse coin-peer discovery — daemonless. |
+| `--coin-daemon HOST:PORT` | — | Explicit embedded coin-P2P producer target (a `digibyted` P2P port). |
+| `--coin-magic HEX`, `--coin-genesis HASH` | mainnet | Wire-magic / genesis overrides (regtest). |
+| `--coin-rpc HOST:PORT`, `--coin-rpc-auth PATH` | — | External `digibyted` `submitblock` arm; creds stay in `digibyte.conf`. |
+| `--regtest`, `--regtest-force-won-share` | off | Regtest marker; forced won share is refused unless `--regtest` **and** `--coin-daemon` are both given. |
+| `--no-p2p-relay` | off | Suppress the embedded won-block relay (isolates the RPC arm). |
+| `--dev-relax-algo-softforks` | off | Dev-only: relax the algo-softfork readiness gate for an isolated tuned testnet; ignored on mainnet. |
+| `--redistribute SPEC` | `pplns` | `pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. |
+| `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm. |
+| `--merged SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]]` (repeatable) | — | Embedded DOGE aux backend (`-DAUX_DOGE` build; DOGE chain_id 98, P2P 22556). |
+| `--doge-p2p-address HOST`, `--doge-p2p-port PORT`, `--embedded-doge` | — | DOGE peer overrides; `--embedded-doge` forces the embedded path. |
+| `--embedded-serve-mempool-txs[=true\|=false]` | posture default | Arm / opt out of the embedded UTXO fee-proof lane. CLI wins over the settings file. |
+
+### c2pool-bch — Bitcoin Cash (SHA256d)
+
+Source: `src/c2pool/main_bch.cpp` — `print_banner()` and the `main()` parse
+loop. Unknown argument → `unknown argument: …`, exit 1. The pool mode is
+`--pool`; the other modes are harnesses.
+
+```bash
+# Daemonless public pool (bch.voidbind.com posture): --peer with port 0 means
+# "no explicit BCHN peer" and turns on the DNS/fixed/HTTP seed ladder
+./c2pool-bch --pool --peer 0.0.0.0:0 --data-dir /var/lib/c2pool/bch \
+  --http 127.0.0.1:8085 --stratum 0.0.0.0:9534 \
+  --sharechain-addnode 92.53.224.27:9349
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--version` / `--help` | | Print and exit (help prints the banner after the settings probe). |
+| `--data-dir PATH`, `--settings PATH`, `--dump-resolved-config`, `--ack-money-settings` | | Control plane, see [Settings file](#settings-file-toml--all-binaries). |
+| `--pool` | | Pool run-loop: embedded daemon + sharechain + Stratum. |
+| `--selftest` | default | ABLA budget self-test, exit. |
+| `--ibd [--near-tip] [--auto-kick]`, `--with-peer-verify`, `--max-seconds N` (600) | | Headers-first IBD / peer-verify harnesses against one BCHN peer. |
+| `--leg-c-capture [--rpc-conf PATH]`, `--leg-c-capture-p2p [--p2p-port N]` (18444) | | Regtest capture harnesses; `--rpc-conf` defaults to `~/bch-regtest/bitcoin.conf` here. **`--p2p-port` is the leg-C BCHN regtest port, not the sharechain port** (the catalog maps it to `sharechain.listen`; the parser does not). |
+| `--peer HOST[:PORT]` | `192.168.86.110:8333` (a developer-host default — always supply your own) | BCHN coin-P2P peer. Port `0` = no explicit peer → SeedTier discovery ladder (`src/impl/bch/coin/embedded_daemon.hpp` `maybe_start_p2p`). |
+| `--testnet` / `--testnet4` / `--regtest` | mainnet | Chain selection; also moves the default peer port (18333 / 28333 / 18444). |
+| `--anchor N` | 0 | Cold-start ABLA floor anchor height. |
+| `--stratum [HOST:]PORT` | off | Stratum listener. |
+| `--http [HOST:]PORT` | off | Dashboard. |
+| `--rpc-conf PATH` | — | BCHN `bitcoin.conf` for the external-RPC fallback (`rpcuser`/`rpcpassword`; endpoint is `127.0.0.1:<rpcport>`). |
+| `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers (`92.53.224.27:9349` is the live public BCH sharechain seed named in the source). |
+
+No money flags on this binary: BCH has no `--fee` / `--give-author` /
+`--node-owner-address` in the parser (the catalog rows exclude `C_BCH`).
+
+### c2pool-bip110 — Bitcoin Knots BLAKE2b fork
+
+Source: `src/c2pool/main_bip110.cpp` — `print_banner()` and the `main()` parse
+loop. **Unknown flags are ignored silently** (no trailing `else`), and the
+binary takes no `--data-dir` / `--settings` / `--dashboard-dir`: the dashboard
+is served from `web-static` relative to the working directory
+(`web_server->set_dashboard_dir("web-static")` in `run_embedded`), so deploy a
+`web-static` copy next to the binary and start it from that directory.
+
+```bash
+# Public fork pool (bip110.voidbind.com posture)
+cd /opt/c2pool-bip110 && ./c2pool-bip110 --run --coin-p2p-discover \
+  --coin-externalip <your-public-ip> --fork-checkpoint \
+  --http 127.0.0.1:8086 --stratum 9336 --serve-mempool-txs \
+  --give-author 0.1 --fee 0 --node-owner-address <your-BTC-address> \
+  --bip110-sharechain --explorer
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--version`, `-h` / `--help` | | Print and exit. |
+| `--run` | | Embedded daemonless BLAKE2b fork follower + Stratum. Without it (or with `--selftest`) the KAT self-test runs and exits. If neither `--coin-p2p-discover` nor `--peer` is given, discovery is switched on automatically. |
+| `--coin-p2p-discover` | auto with `--run` | Discover `NODE_BLAKE2B` fork peers (DNS + fixed seeds). |
+| `--peer IP[:PORT]` (repeatable) | port 8333 | Explicit fork peer. |
+| `--coin-externalip IP` | peer-echo auto | Operator-pinned reachable IP for self-advertisement (bare IP; port 8333 substituted). |
+| `--fork-checkpoint` | off | Seed the Knots 961640 checkpoint for a fast proof. |
+| `--http [HOST:]PORT` | off | Shared coin-generic dashboard (`/`, `/node_info`, `/api/node_topology`, `/broadcaster_status`). |
+| `--stratum [HOST:]PORT` / `--no-stratum` | `0.0.0.0:9336` on | Stratum listener; `--no-stratum` disables. |
+| `--serve-mempool-txs` / `--no-serve-mempool-txs` | on | Include real network txs in served templates (M3 good-citizen); the `--no-` form is the coinbase-only escape hatch. |
+| `--bip110-sharechain` | off | Arm the M3 sharechain mint on `:9337` and dial the federation sharechain. First outbound is irreversible (params-freeze checkpoint). Absent → M2 header-follower only. |
+| `--sharechain-addnode HOST:PORT` (repeatable) | beacon list | Override the default sharechain bootstrap beacons. |
+| `--explorer` / `--no-explorer` | on | Loopback-only `/api/explorer` + raw-block retention. |
+| `--node-owner-address ADDR` (alias `--donation`) | — | Node-owner fee destination and subsidy fallback when a miner's username has no resolvable address. |
+| `--give-author PCT` (alias `--dev-donation`) | 0.1 (catalog `money.give_author_pct`) | Author donation percent. |
+| `-f` / `--fee PCT` | 0 | Node-owner fee percent. |
 
 ---
 
@@ -772,6 +1146,11 @@ See [above](#configuration-reference) for details.
 | Target | Description |
 |--------|-------------|
 | `c2pool-ltc` | Primary binary — release packages ship this per-coin name (`c2pool` is the dev-build alias) |
+| `c2pool-btc` | Bitcoin parent (`src/c2pool/main_btc.cpp`) |
+| `c2pool-dgb` | DigiByte Scrypt parent (`src/c2pool/main_dgb.cpp`; `-DAUX_DOGE` for embedded DOGE) |
+| `c2pool-bch` | Bitcoin Cash parent (`src/c2pool/main_bch.cpp`) |
+| `c2pool-dash` | Dash parent (`src/c2pool/main_dash.cpp`) |
+| `c2pool-bip110` | BIP-110 BLAKE2b fork (`src/c2pool/main_bip110.cpp`) |
 | `test_hardening` | Softfork gate + reply-matcher regression tests |
 | `test_share_messages` | V36 authority message decrypt/verify tests |
 | `test_coin_broadcaster` | Coin peer-manager and broadcaster tests |
@@ -787,7 +1166,8 @@ cd build && ctest --output-on-failure -j$(nproc)
 | Area | Status |
 |---|---|
 | V36 share format (LTC parent chain) | Released (v0.2.0); prod cutover gated on crossing soak |
-| V36 share format (DGB Scrypt parent chain) | In development |
+| V36 share format (DGB Scrypt parent chain) | Running — `c2pool-dgb` daemonless public node (dgb.voidbind.com), joined to the live DGB sharechain via `--sharechain-addnode` |
+| Daemonless per-coin nodes (BTC, BCH, DASH) | Running — public voidbind nodes with no coin daemon on the serve path |
 | Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
 | Embedded LTC SPV node | Working |
 | Embedded DOGE SPV node | Working |

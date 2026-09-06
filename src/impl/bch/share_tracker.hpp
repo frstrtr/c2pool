@@ -342,6 +342,40 @@ struct DecoratedData
 //   bad_peer_addresses  = peers that served unverifiable shares (ban targets)
 //   top5_heads          = best-scored heads protected from head-pruning
 // The s1 link-skeleton think() returns this EMPTY; s2 populates it.
+
+// ── Restart-reorg supersede hint ─────────────────────────────────────────
+// Computed by NodeImpl before each think() cycle (compute_supersede_hint()).
+// Closes the Class-A self-sustained-minority-fork defect: score() short-circuits
+// to {verified_height,0} for any tail below CHAIN_LENGTH and TailScore compares
+// chain_len FIRST, so a warm-loaded full-CL verified tail beats any challenger
+// whose VERIFIED height is still below CHAIN_LENGTH — and the challenger never
+// verifies to CHAIN_LENGTH because think() never backfills its unrooted segment
+// to the ~2*CL depth a CHAIN_LENGTH-tall verified tail needs. A node with local
+// hashrate then keeps extending its own verified incumbent = self-sustained
+// minority fork.
+//
+// This hint makes the EXISTING think() argmax able to see the challenger,
+// mirroring p2pool's re-pick-best-after-download, WITHOUT a reorg code path and
+// WITHOUT weakening verified-only selection: when a chain head's RECEIVED work is
+// STRICTLY greater than the incumbent best's VERIFIED work AND it is a genuine
+// fork (not an extension of the incumbent) AND its verified height is still below
+// CHAIN_LENGTH, think() (a) deepens Phase-2 backfill for that segment to 2*CL+10
+// and (b) spends a BOUNDED elevated verification budget on it through the ordinary
+// Phase-2 attempt_verify loop. Over successive ticks the challenger verifies to
+// CHAIN_LENGTH, the Phase-3 TailScore comparison flips on its own, and the head
+// moves. It NEVER bypasses attempt_verify, never scores unverified work, and is a
+// no-op when the incumbent already IS the best head — a healthy node is unaffected.
+struct SupersedeHint
+{
+    bool     active{false};
+    uint256  target_head;          // challenger chain head (highest received work)
+    uint256  target_segment_last;  // chain.get_last(target_head): its missing parent —
+                                   // the stable identity of the whole challenger segment
+    int      budget{0};            // bounded elevated per-tick verify budget for the segment
+    uint288  challenger_work;      // received cumulative work of the challenger (diagnostics)
+    uint288  incumbent_work;       // verified cumulative work of the incumbent best (diagnostics)
+};
+
 struct TrackerThinkResult
 {
     uint256 best;
@@ -651,16 +685,80 @@ public:
         return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
     }
 
+    // -- Restart-reorg supersede detector (see SupersedeHint) --
+    // Returns an ACTIVE hint iff a genuine competing fork exists whose RECEIVED
+    // cumulative work is STRICTLY greater than the incumbent best's VERIFIED
+    // work and whose verified height is still below CHAIN_LENGTH. Pure read over
+    // chain + verified. Guardrails: strictly-greater only, genuine-fork only
+    // (is_child_of skips extensions of our own chain), verified-height < CL only.
+    SupersedeHint compute_supersede_hint(const uint256& incumbent_best, int budget)
+    {
+        SupersedeHint hint;
+        if (incumbent_best.IsNull() || !verified.contains(incumbent_best))
+            return hint;  // bootstrap / no incumbent — bootstrap budget path applies
+        const auto CL = static_cast<int32_t>(PoolConfig::chain_length());
+        const uint288 incumbent_work = verified.get_work(incumbent_best);
+
+        uint256 best_ch;
+        uint288 best_ch_work;
+        bool found = false;
+        for (auto& [head, tail] : chain.get_heads())
+        {
+            if (head == incumbent_best) continue;
+            if (!chain.contains(head)) continue;
+            try { if (chain.is_child_of(incumbent_best, head)) continue; }
+            catch (...) { /* concurrent trim — treat as fork candidate */ }
+            if (verified.get_acc_height(head) >= CL) continue;
+            uint288 w;
+            try { w = chain.get_work(head); } catch (...) { continue; }
+            if (!found || w > best_ch_work) { best_ch_work = w; best_ch = head; found = true; }
+        }
+
+        if (found && incumbent_work < best_ch_work)  // STRICTLY higher received work
+        {
+            hint.active = true;
+            hint.target_head = best_ch;
+            try { hint.target_segment_last = chain.get_last(best_ch); } catch (...) {}
+            hint.budget = budget;
+            hint.challenger_work = best_ch_work;
+            hint.incumbent_work = incumbent_work;
+        }
+        return hint;
+    }
+
+    // -- Restart-reorg liveness: challenger-first Phase-2 scheduling --
+    // Move the challenger-segment heads to the FRONT of the work-descending
+    // Phase-2 head order so a shorter non-challenger verified head cannot spend
+    // the whole normal budget and trip the outer per-head gate before the
+    // challenger's iteration is entered. Inactive supersede => no-op and the
+    // healthy-node order is byte-identical. Returns the number moved.
+    size_t prioritize_challenger_heads(
+        std::vector<std::pair<uint256, uint256>>& heads,
+        const SupersedeHint& supersede)
+    {
+        if (!supersede.active)
+            return 0;
+        auto is_challenger_head = [&](const std::pair<uint256, uint256>& hv) -> bool {
+            try { return chain.get_last(hv.first) == supersede.target_segment_last; }
+            catch (...) { return false; }
+        };
+        auto mid = std::stable_partition(heads.begin(), heads.end(), is_challenger_head);
+        return static_cast<size_t>(std::distance(heads.begin(), mid));
+    }
+
     // -- Best-chain selection with verification + punishment (oracle think) --
     // bootstrap_mode: removes the per-call verification budget so the entire
     // chain is verified in one pass (initial sync, no IO needs the lock).
     // Oracle: p2pool/data.py:731-845 (Tracker.think); p2pool runs think()
     // synchronously on the reactor. The known_txs/feecache/block_abs_height
     // args fold into verify_share via share_check.hpp.
+    // supersede: restart-reorg hint (see SupersedeHint). Default-inactive, so
+    // every existing caller and the healthy-node path are byte-unchanged.
     TrackerThinkResult think(const std::function<int32_t(uint256)>& block_rel_height_func,
                              const uint256& /*previous_block*/,
                              uint32_t /*bits*/,
-                             bool bootstrap_mode = false)
+                             bool bootstrap_mode = false,
+                             const SupersedeHint& supersede = SupersedeHint{})
     {
         // oracle: desired is a set of (peer_addr, hash, max_timestamp, min_target).
         // The timestamp filters stale requests at return time.
@@ -796,6 +894,21 @@ public:
         int budget_remaining = bootstrap_mode ? INT_MAX : THINK_VERIFY_BUDGET;
         m_think_needs_continue = false;
 
+        // Wall-clock bound on a single think() cycle (ported with the restart-
+        // reorg stack). The elevated verify pool (SupersedeHint) could otherwise
+        // draw hundreds of verifies in one cycle and pin the exclusive lock for
+        // seconds, degrading the IO serve path to EMPTY replies. Cap the per-cycle
+        // hold; m_think_needs_continue reposts the remainder next tick. Bootstrap
+        // is exempt (initial full verify runs uncapped).
+        const auto think_wall_t0 = std::chrono::steady_clock::now();
+        constexpr int64_t THINK_MAX_WALL_MS = 2000;
+        auto think_wall_exceeded = [&]() -> bool {
+            return !bootstrap_mode &&
+                   std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - think_wall_t0).count()
+                       >= THINK_MAX_WALL_MS;
+        };
+
         // V36 livelock mirror: cooperative-yield budget for the scoring walk.
         // Sized FAR above a normal full-window pass so it NEVER trips on healthy
         // load (semantics unchanged); a pure starvation circuit breaker.
@@ -806,6 +919,17 @@ public:
         // Sort verified heads by work (descending) so the best chain gets budget
         // priority. p2pool iterates in arbitrary order but has no budget; with a
         // budget, a low-work side chain going first could starve the best chain.
+        // Restart-reorg elevated budget (SupersedeHint): a BOUNDED extra pool
+        // that ONLY the challenger segment may draw from, after the normal budget
+        // is spent. Inactive → identical to before.
+        int elevated_remaining = supersede.active ? supersede.budget : 0;
+        if (supersede.active) {
+            LOG_INFO << "[SUPERSEDE] elevated verify armed: target="
+                     << supersede.target_head.GetHex().substr(0,16)
+                     << " segment_last=" << supersede.target_segment_last.GetHex().substr(0,16)
+                     << " budget=" << supersede.budget
+                     << " challenger_work>incumbent_work (strictly greater)";
+        }
         std::vector<std::pair<uint256, uint256>> sorted_vheads(
             verified.get_heads().begin(), verified.get_heads().end());
         std::sort(sorted_vheads.begin(), sorted_vheads.end(),
@@ -814,10 +938,35 @@ public:
                 auto wb = verified.contains(b.first) ? verified.get_work(b.first) : uint288{};
                 return wa > wb;
             });
+        // Restart-reorg liveness: move challenger-segment heads to the FRONT so a
+        // shorter non-challenger head cannot spend the normal budget and trip the
+        // outer per-head gate before the challenger's iteration is entered. No-op
+        // when supersede is inactive.
+        prioritize_challenger_heads(sorted_vheads, supersede);
 
         for (auto& [head_hash, tail_hash] : sorted_vheads)
         {
-            if (budget_remaining <= 0) { m_think_needs_continue = true; break; }
+            // Wall-clock bound: stop the per-head sweep once this cycle has held
+            // the exclusive lock long enough; resume next tick.
+            if (think_wall_exceeded()) {
+                m_think_needs_continue = true;
+                LOG_INFO << "[think-P2] wall-clock cap hit between heads, deferring remainder";
+                break;
+            }
+            // Restart-reorg: is this verified head the frontier of the challenger
+            // segment named by the hint? Hoisted above the per-head budget gate.
+            bool is_challenger = false;
+            if (supersede.active) {
+                try {
+                    is_challenger = (chain.get_last(head_hash) == supersede.target_segment_last);
+                } catch (...) { is_challenger = false; }
+            }
+            // Per-head budget gate. Only a challenger head may additionally draw
+            // the bounded elevated pool. Inactive supersede → original break.
+            if (budget_remaining <= 0 && !(is_challenger && elevated_remaining > 0)) {
+                m_think_needs_continue = true;
+                break;
+            }
             if (!chain.contains(head_hash)) continue;
 
             auto [head_height, last_hash] = verified.get_height_and_last(head_hash);
@@ -829,7 +978,12 @@ public:
             // short of CHAIN_LENGTH (want), capped by how many the rooted peer
             // can actually supply (can); to_get = min(want, can).
             auto CL = static_cast<int32_t>(PoolConfig::chain_length());
-            auto want = std::max(CL - head_height, 0);
+            // For an UNROOTED challenger segment a CHAIN_LENGTH-tall VERIFIED tail
+            // needs ~2*CL depth; target the fresh-bootstrap load depth 2*CL+10 so
+            // the segment can reach CHAIN_LENGTH verified shares. Rooted / non-
+            // challenger tails keep the original CL target (byte-unchanged).
+            auto want_depth = is_challenger ? (2 * CL + 10) : CL;
+            auto want = std::max(want_depth - head_height, 0);
             auto can = last_last_hash.IsNull()
                 ? last_height
                 : std::max(last_height - 1 - CL, 0);
@@ -851,7 +1005,16 @@ public:
                 int p2_verified_count = 0;
                 for (auto [hash, data] : chain_view)
                 {
-                    if (budget_remaining <= 0) { m_think_needs_continue = true; break; }
+                    // Normal budget for everyone; the challenger segment may draw
+                    // from the bounded elevated pool AFTER the normal budget is spent.
+                    bool can_spend = budget_remaining > 0
+                                     || (is_challenger && elevated_remaining > 0);
+                    if (!can_spend) { m_think_needs_continue = true; break; }
+                    // Wall-clock bound: do not hold the exclusive lock past
+                    // THINK_MAX_WALL_MS even with budget left. Checked every 8 verifies.
+                    if ((p2_verified_count & 7) == 0 && think_wall_exceeded()) {
+                        m_think_needs_continue = true; break;
+                    }
 
                     uint256 prev_hash;
                     int share_ver = 0;
@@ -892,14 +1055,27 @@ public:
                     bool was_already_verified = verified.contains(hash);
                     if (!attempt_verify(hash)) break;
                     ++p2_verified_count;
-                    if (!was_already_verified) --budget_remaining;
+                    if (!was_already_verified) {
+                        // Spend the normal budget first; only the challenger may
+                        // then draw from the bounded elevated pool.
+                        if (budget_remaining > 0) --budget_remaining;
+                        else if (is_challenger && elevated_remaining > 0) --elevated_remaining;
+                    }
                 }
             }
 
             // oracle data.py:781-788: request more shares if the verified chain
             // is still short. Skip if the MAIN chain is already in the pruning
             // zone (the unverified shares exist — they just need verification).
-            if (head_height < static_cast<int32_t>(PoolConfig::chain_length()) && !last_last_hash.IsNull())
+            // Non-challenger: request until the MAIN chain reaches CHAIN_LENGTH.
+            // Challenger (restart-reorg): keep requesting parents until the segment
+            // reaches 2*CL+10 depth so it is no longer pinned at ~CL+8.
+            auto main_ht_req = chain.get_height(head_hash);
+            auto CL_req = static_cast<int32_t>(PoolConfig::chain_length());
+            bool want_more_parents = is_challenger
+                ? (main_ht_req < 2 * CL_req + 10)
+                : (head_height < CL_req);
+            if (want_more_parents && !last_last_hash.IsNull())
             {
                 auto main_ht = chain.get_height(head_hash);
                 auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());

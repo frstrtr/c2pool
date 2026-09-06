@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <random>
@@ -752,6 +753,29 @@ protected:
 
     // Cached best share hash from the most recent think() cycle
     uint256 m_best_share_hash;
+
+    // ── Restart-reorg supersede hint (see share_tracker.hpp SupersedeHint) ──
+    // From the last think()/clean cycle. When active it names a genuine
+    // higher-work fork the node is converging onto after a warm restart; used
+    // by clean_tracker() to exempt the converging challenger segment from
+    // stale-head eating and tail-dropping so its verification is not thrown away
+    // and restarted every clean (which would re-create the stuck-on-persisted-
+    // head latch). Inactive on a healthy node.
+    btc::SupersedeHint m_supersede_hint;
+
+    // ── Supersede-convergence liveness (tip-freeze livelock fix) ──────────
+    // Detect zero forward progress over SUPERSEDE_STALL_LIMIT cycles and denylist
+    // an unconvergeable challenger segment (missing parent unobtainable) for
+    // SUPERSEDE_DENYLIST_TTL, deactivating the hint and re-enabling GC. A later-
+    // obtainable parent retries after TTL.
+    struct SupersedeProgress { int32_t last_acc_height{-1}; int stall_cycles{0}; };
+    std::map<uint256, SupersedeProgress> m_supersede_progress;
+    std::map<uint256, std::chrono::steady_clock::time_point> m_supersede_denylist;
+    static constexpr int SUPERSEDE_STALL_LIMIT = 20;
+    static constexpr std::chrono::minutes SUPERSEDE_DENYLIST_TTL{60};
+    // Deactivate the hint if the challenger segment is proven unconvergeable.
+    // Compute-thread only, called under the exclusive tracker lock.
+    btc::SupersedeHint gate_supersede_convergence(btc::SupersedeHint hint);
 
     // ROOT-2: fire exactly one delayed re-advert when the verified chain
     // first transitions from empty to non-empty (peers that handshook

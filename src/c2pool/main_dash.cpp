@@ -4,6 +4,7 @@
 // manual compile without the generated include dir still builds; existing
 // C2POOL_VERSION #ifdef guards and per-main "dev" fallbacks then apply.
 #if __has_include(<c2pool_build_version.h>)
+#include <cassert>
 #include <c2pool_build_version.h>
 #endif
 // c2pool-dash — DASH (X11 standalone parent, older-than-v35 -> V36) p2pool node
@@ -1254,7 +1255,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     for (const auto& a : peer.addnodes)  config.pool()->m_bootstrap_addrs.push_back(a);
     for (const auto& c : peer.connects)  config.pool()->m_bootstrap_addrs.push_back(c);
 
-    dash::Node p2p_node(&ioc, &config);
+    // shared_ptr-owned + set_lifetime so the sharechain node's core::Server(accept)
+    // and core::Client(dial) pin it with a strong ref per async op -- a resolve/
+    // connect/accept completion can never run make_socket()'s dynamic_cast on a
+    // freed node (the #759-class dial/accept-teardown UAF). The holder owns the
+    // node; `p2p_node` is a reference alias so every existing `p2p_node.`/`&p2p_node`
+    // use site is byte-identical (same object, same address), and destruction order
+    // is unchanged (holder lives to end of scope exactly as the stack object did).
+    auto p2p_node_holder = std::make_shared<dash::Node>(&ioc, &config);
+    dash::Node& p2p_node = *p2p_node_holder;
+    p2p_node_holder->set_lifetime(p2p_node_holder);
+    assert(p2p_node_holder->lifetime_armed() && "DASH sharechain node dial/accept lifetime failed to arm");
 
     // ── Mint slice 3/3: consensus params + sharechain persistence ────────
     // The tracker's CoinParams carry the X11 pow_func + targets every
@@ -2427,7 +2438,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // the three so it is destroyed LAST — the CoinClient's callbacks and the
     // refresh timer both capture it by raw pointer, so it must outlive both.
     std::unique_ptr<dash::coin::DashCoinPeerManager> coin_peer_mgr;
-    std::unique_ptr<dash::coin::p2p::CoinClient<dash::Config>> coin_p2p;
+    // shared_ptr-owned + set_lifetime (below) so core::Client pins this coin-P2P
+    // dialer with a strong ref per async op -- a resolve/connect completion can
+    // never run make_socket()'s dynamic_cast on a freed CoinClient (the #759-class
+    // dial-teardown UAF). A stall-rotation redial frees/rebuilds peers on this same
+    // node; the strong ref keeps an in-flight dial's node alive until its handler.
+    std::shared_ptr<dash::coin::p2p::CoinClient<dash::Config>> coin_p2p;
     // Refresh timer declared LAST -> destroyed FIRST: it stops (and its lambda
     // stops capturing coin_p2p / coin_peer_mgr) before either is torn down.
     std::unique_ptr<core::Timer> coin_dial_refresh_timer;
@@ -2445,8 +2461,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         if (!coin_p2p_targets.empty())
             config.coin()->m_p2p.address = coin_p2p_targets.front();
 
-        coin_p2p = std::make_unique<dash::coin::p2p::CoinClient<dash::Config>>(
+        coin_p2p = std::make_shared<dash::coin::p2p::CoinClient<dash::Config>>(
             &ioc, &coin_state, &config, "COIN-P2P");
+        // Arm the core dial guard BEFORE any connect() so a resolve/connect
+        // completion pins this CoinClient with a strong ref (make_socket can never
+        // dynamic_cast a freed node on a rotation redial / ioc teardown).
+        coin_p2p->set_lifetime(coin_p2p);
+        assert(coin_p2p->lifetime_armed() && "DASH coin-P2P dial lifetime failed to arm");
         // MULTI-PEER POOL. The embedded arm holds N concurrent coin-network
         // peers instead of one. This is the precondition for ever trusting
         // "we hold no commitment for this slot, therefore mine null": a DKG

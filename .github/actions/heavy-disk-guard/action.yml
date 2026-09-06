@@ -1,0 +1,36 @@
+name: Heavy-leg disk headroom guard
+description: >
+  Pre-build disk-headroom guard + bounded prune for the c2pool heavy sanitizer
+  legs (linux-asan, coin-bch-asan). A sanitizer build tree measures ~44G; two
+  co-resident legs on one physical oplex7020 box put ~88G of trees on ~88G of
+  free space and the final `ld` link ENOSPCs mid-build, surfacing as a
+  code-shaped red on an unrelated diff. This action reclaims orphaned build
+  trees + caps ccache, then fails FAST with an explicit infra error if the
+  floor is still not met -- so the red reads as infra, not the diff. No-op on
+  github-hosted runners (ephemeral, large disk).
+
+inputs:
+  floor-gb:
+    description: Minimum free GB required on the build volume before configure.
+    default: "50"
+  ccache-max:
+    description: Cap for the shared ccache (passed to `ccache -M`).
+    default: "15G"
+  stale-hours:
+    description: >
+      Age in hours above which a sibling build tree is treated as orphaned by a
+      host-reaped job and reaped. A heavy build+test finishes in ~25 min, so the
+      default of 6h can only ever match a dead job's leftovers.
+    default: "6"
+
+runs:
+  using: composite
+  steps:
+    - name: Disk headroom guard (+ bounded prune)
+      if: runner.environment != 'github-hosted'
+      shell: bash
+      env:
+        HEAVY_DISK_FLOOR_GB: ${{ inputs.floor-gb }}
+        HEAVY_DISK_CCACHE_MAX: ${{ inputs.ccache-max }}
+        HEAVY_DISK_STALE_HOURS: ${{ inputs.stale-hours }}
+      run: bash "$GITHUB_ACTION_PATH/guard.sh"

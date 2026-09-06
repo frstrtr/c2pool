@@ -1,0 +1,30 @@
+# Honesty gate for the heavy-leg disk headroom guard used by build.yml's
+# sanitizer legs (linux-asan, coin-bch-asan). Runs the ACTUAL guard.sh against
+# a planted orphan + a live tree and asserts: the sweep reaps only the orphan,
+# an unreachable floor hard-fails with the infra error, a reachable floor
+# passes. Pure shell on a gh-hosted runner -- no self-hosted host, no build.
+# See .github/actions/heavy-disk-guard/test.sh.
+name: heavy-disk-guard-test
+
+on:
+  push:
+    branches: [master, v37-dev]
+    paths:
+      - .github/workflows/heavy-disk-guard-test.yml
+      - .github/actions/heavy-disk-guard/**
+  pull_request:
+    paths:
+      - .github/workflows/heavy-disk-guard-test.yml
+      - .github/actions/heavy-disk-guard/**
+
+permissions:
+  contents: read
+
+jobs:
+  disk-guard-honesty:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run disk-headroom guard honesty gate
+        run: bash .github/actions/heavy-disk-guard/test.sh

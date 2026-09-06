@@ -158,9 +158,10 @@ if(C2POOL_QT_BUILD_TESTS)
     endif()
 
     # ── ★ Reward-safety gate ─────────────────────────────────────────────
-    # Proves the per-coin launch command core never emits the reward-UNSAFE
-    # embedded arm (--coin-p2p-connect / --embedded-mainnet) by default and
-    # that the default parent-daemon link is the reward-SAFE --coin-rpc arm.
+    # Proves the per-coin launch command core: the default DASH command is a
+    # bare --run (daemonless) and never emits the dashd/embedded arms
+    # (--coin-rpc / --coin-p2p-connect / --embedded-mainnet) unless their
+    # explicit opt-ins are set; the author donation is never silently zeroed.
     # Qt-free (LaunchCommand.hpp is std-only) so it runs anywhere.
     enable_testing()
     add_executable(c2pool-qt_test_reward_safe_launch

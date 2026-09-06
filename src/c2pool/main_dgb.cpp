@@ -4,6 +4,7 @@
 // manual compile without the generated include dir still builds; existing
 // C2POOL_VERSION #ifdef guards and per-main "dev" fallbacks then apply.
 #if __has_include(<c2pool_build_version.h>)
+#include <cassert>
 #include <c2pool_build_version.h>
 #endif
 // c2pool-dgb — DigiByte Scrypt-only (V36) p2pool node entry point.
@@ -778,7 +779,16 @@ int run_node(const core::CoinParams& params, bool testnet,
 
     dgb::coin::CoinNode coin_node(/*embedded=*/&embedded_coin, /*rpc=*/rpc.get());
 
-    dgb::Node p2p_node(&ioc, &config);
+    // shared_ptr-owned + set_lifetime so the sharechain node's core::Server(accept)
+    // and start_outbound_connections() dials pin a strong ref for make_socket's
+    // dynamic_cast, closing the #759-class dial/accept-teardown UAF on a
+    // redial-freed node. The holder owns the node; a reference alias keeps every
+    // existing &p2p_node / p2p_node. site unchanged (holder lives to end of scope
+    // exactly as the stack object did).
+    auto p2p_node_holder = std::make_shared<dgb::Node>(&ioc, &config);
+    dgb::Node& p2p_node = *p2p_node_holder;
+    p2p_node_holder->set_lifetime(p2p_node_holder);
+    assert(p2p_node_holder->lifetime_armed() && "DGB sharechain node dial/accept lifetime failed to arm");
     p2p_node.set_target_outbound_peers(4);
     // Default sharechain P2P port is 5024 (oracle byte-parity); --sharechain-port
     // overrides it for an isolated second instance (G3b tuned-net) without
@@ -816,7 +826,10 @@ int run_node(const core::CoinParams& params, bool testnet,
     // Declared ahead of the m_on_block_found binding so the won-block P2P-relay
     // sink below can capture it. Constructed later only when --coin-daemon is
     // supplied (stays null otherwise -> sink no-ops, RPC fallback still fires).
-    std::unique_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
+    // shared_ptr-owned + set_lifetime (at each make site) so core::Client pins this
+    // coin-P2P dialer with a strong ref per async op -- a resolve/connect completion
+    // can never run make_socket()'s dynamic_cast on a freed NodeP2P (#759-class UAF).
+    std::shared_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
 
     // ── #82 FAITHFUL won-block reconstruct closure (replaces the interim
     // nullopt stub) ── make_reconstruct_closure_from_template (#280) composes
@@ -1173,8 +1186,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         const NetService target(host, port);
         config.coin()->m_p2p.address = target;
 
-        coin_p2p = std::make_unique<dgb::coin::p2p::NodeP2P<dgb::Config>>(
+        coin_p2p = std::make_shared<dgb::coin::p2p::NodeP2P<dgb::Config>>(
             &ioc, &coin_iface, &config, "DGB-CoinP2P");
+        coin_p2p->set_lifetime(coin_p2p);
+        assert(coin_p2p->lifetime_armed() && "DGB coin-P2P dial lifetime failed to arm");
         coin_p2p->enable_mempool_request();  // also exercise the tx ingest seam
         coin_p2p->connect(target);
         std::cout << "[DGB] embedded coin-daemon P2P producer dialing "
@@ -1266,8 +1281,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         if (!genesis.IsNull())
             genesis_locator.push_back(genesis);
 
-        coin_p2p = std::make_unique<dgb::coin::p2p::NodeP2P<dgb::Config>>(
+        coin_p2p = std::make_shared<dgb::coin::p2p::NodeP2P<dgb::Config>>(
             &ioc, &coin_iface, &config, "DGB-CoinP2P");
+        coin_p2p->set_lifetime(coin_p2p);
+        assert(coin_p2p->lifetime_armed() && "DGB coin-P2P dial lifetime failed to arm");
 
         // Peers already dialed this run (exclusion set for failover); cleared to
         // re-sweep once the banked set is exhausted so a dead first pick — or a
@@ -2599,6 +2616,31 @@ int run_node(const core::CoinParams& params, bool testnet,
     } else {
         std::cout << "[DGB] dashboard disabled (no --http flag)" << std::endl;
     }
+
+    // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
+    // tick. Without it, think() fired only on share arrival: no stale-head
+    // eating, unbounded raw-tracker growth past 2*CHAIN_LENGTH+10, and a timed-
+    // out bootstrap download was never retried if all peers went silent (the
+    // first-ever drop-tails is also a memory WIN for the long-warm dgb node,
+    // task #165). clean_tracker() runs think() inline then prunes on the compute
+    // thread under the exclusive lock. p2p_node is a by-value local that outlives
+    // ioc.run(), captured by reference.
+    auto dgb_think_timer = std::make_shared<io::steady_timer>(ioc);
+    std::function<void(boost::system::error_code)> dgb_think_tick;
+    dgb_think_tick = [&, dgb_think_timer](boost::system::error_code ec) {
+        if (ec || shutdown_initiated) return;
+        dgb_think_timer->expires_after(std::chrono::seconds(5));
+        dgb_think_timer->async_wait(dgb_think_tick);
+        try {
+            p2p_node.clean_tracker();
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what();
+        } catch (...) {
+            LOG_ERROR << "[CLEAN-TRACKER] unknown error";
+        }
+    };
+    dgb_think_timer->expires_after(std::chrono::seconds(5));
+    dgb_think_timer->async_wait(dgb_think_tick);
 
     std::cout << "[DGB] run-loop up: " << network_summary(params) << "\n";
     std::cout << "[DGB] io_context running. Ctrl-C to stop." << std::endl;

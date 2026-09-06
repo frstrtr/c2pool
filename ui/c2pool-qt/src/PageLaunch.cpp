@@ -146,7 +146,15 @@ void PageLaunch::setupUi()
         auto* form = new QFormLayout(g);
 
         modeCombo_ = new QComboBox;
-        modeCombo_->addItems({"Integrated (full pool)", "Sharechain (P2P node)", "Solo (default)"});
+        // Order matches c2pool_qt::LegacyMode. Each item maps to a catalog mode
+        // alias; a legacy "solo" MUST emit --solo (emitting nothing silently ran
+        // an integrated PPLNS node). Appending custodial/standalone at 3/4 keeps
+        // older persisted `mode` indices (0/1/2) valid.
+        modeCombo_->addItems({"Integrated (full pool, binary default)",
+                              "Sharechain (P2P node)",
+                              "Solo (no sharechain, --solo)",
+                              "Custodial (--custodial, coinbase to --address)",
+                              "Standalone legacy (--standalone, no embedded SPV)"});
         modeCombo_->setCurrentIndex(1);
         form->addRow("Mode:", modeCombo_);
 
@@ -160,7 +168,8 @@ void PageLaunch::setupUi()
         chainCombo_->setToolTip(
             "Coin-generic (profile-driven). LTC/BTC/DOGE use the unified\n"
             "`c2pool --net …` binary; DASH/DGB/BCH use the dedicated per-coin\n"
-            "binary with the reward-safe --coin-rpc arm.");
+            "binary. DASH runs daemonless by default (bare --run); attaching an\n"
+            "external dashd (--coin-rpc) is an explicit opt-in.");
         form->addRow("Blockchain:", chainCombo_);
 
         testnetCheck_ = new QCheckBox("Use testnet");
@@ -218,10 +227,29 @@ void PageLaunch::setupUi()
         coindGroup_ = g;
         auto* form = new QFormLayout(g);
 
+        // DASH runs daemonless by default (bare --run). Attaching an external
+        // dashd (--coin-rpc HOST:PORT [+ --coin-rpc-auth]) is an explicit opt-in;
+        // default OFF. Shown only for DASH (applyProfileUi()).
+        dashdAttachCheck_ = new QCheckBox(
+            "Attach external dashd (--coin-rpc HOST:PORT [+ --coin-rpc-auth]) "
+            "— optional; default is daemonless");
+        dashdAttachCheck_->setChecked(false);
+        dashdAttachCheck_->setToolTip(
+            "DASH only. Left unticked (default), the node launches with a bare\n"
+            "`--run` — DAEMONLESS cut mode, with the node's good-citizen serving\n"
+            "levers ON. Tick this to attach an external dashd via --coin-rpc\n"
+            "(and --coin-rpc-auth); the RPC host/port below are then used.");
+        connect(dashdAttachCheck_, &QCheckBox::stateChanged, this, [this](int) {
+            applyProfileUi();
+            onBuildPreview();
+        });
+        form->addRow("", dashdAttachCheck_);
+
         coindHostEdit_ = new QLineEdit("127.0.0.1");
         coindHostEdit_->setToolTip(
             "Legacy (LTC/BTC/DOGE): --coind-address / --rpchost\n"
-            "Per-coin (DASH/DGB): host of --coin-rpc HOST:PORT");
+            "Per-coin (DGB): host of --coin-rpc HOST:PORT\n"
+            "Per-coin (DASH): only with 'Attach external dashd' ticked");
         form->addRow("RPC host:", coindHostEdit_);
 
         coindPortSpin_ = new QSpinBox;
@@ -561,38 +589,34 @@ void PageLaunch::setupUi()
         vbox->addWidget(g);
     }
 
-    // ── 10. ★ Advanced / embedded (opt-in, REWARD-UNSAFE) ────────────────────
-    // Default OFF. This is the ONLY place --coin-p2p-connect /
-    // --embedded-mainnet may be emitted. The default per-coin launch is the
-    // reward-SAFE dashd-RPC arm. See the DASH hotel incident: an unguarded
-    // embedded arm produced reward-unsafe blocks.
+    // ── 10. ★ Advanced / embedded coin-network (transport + gate-lift) ───────
+    // Opt-in, default OFF. This is the ONLY place --coin-p2p-connect /
+    // --embedded-mainnet may be emitted. DASH runs the embedded arm by default
+    // when daemonless (bare --run): these controls only pin peers or force the
+    // flag explicitly (needed when an external dashd is attached, where it is OFF).
     {
-        auto* g = makeGroup("Advanced / embedded (opt-in — REWARD-UNSAFE)");
+        auto* g = makeGroup("Advanced / embedded coin-network (transport + gate-lift)");
         embeddedGroup_ = g;
-        g->setStyleSheet(
-            "QGroupBox { font-weight: bold; margin-top: 6px; "
-            "  border: 1px solid #b04020; border-radius: 4px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left: 8px; color: #b04020; }");
         auto* gLayout = new QVBoxLayout(g);
 
         embeddedWarnLabel_ = new QLabel(
-            "⚠ These options dial the coin's own P2P network directly and/or "
-            "let this node produce mainnet blocks WITHOUT the validated dashd-RPC "
-            "arm. They are REWARD-UNSAFE until validated for your coin and MUST "
-            "stay OFF for normal mining. Leave everything here unchecked to run "
-            "the safe RPC arm.");
+            "These options pin the coin-P2P peers the embedded arm dials "
+            "(--coin-p2p-connect) and/or force the embedded-mainnet gate open "
+            "explicitly (--embedded-mainnet). For DASH the daemonless default "
+            "(bare --run) already runs the embedded arm with --embedded-mainnet "
+            "ON — you only need these to pin specific peers, or to force the flag "
+            "when you have attached an external dashd (where it defaults OFF).");
         embeddedWarnLabel_->setWordWrap(true);
-        embeddedWarnLabel_->setStyleSheet("color: #b04020;");
+        embeddedWarnLabel_->setStyleSheet("color: #555;");
         gLayout->addWidget(embeddedWarnLabel_);
 
         embeddedP2pCheck_ = new QCheckBox(
-            "Enable embedded coin-network P2P (--coin-p2p-connect) — reward-unsafe");
+            "Pin embedded coin-network P2P peers (--coin-p2p-connect)");
         embeddedP2pCheck_->setChecked(false);   // ★ default OFF
         embeddedP2pCheck_->setToolTip(
             "--coin-p2p-connect HOST:PORT (repeatable)\n"
-            "OPT-IN. Dials the coin network directly instead of relying only on\n"
-            "the dashd-RPC submitblock arm. Default OFF — leave unchecked unless\n"
-            "you are deliberately validating the embedded arm.");
+            "Pins the coin-network peers the embedded arm dials. Optional —\n"
+            "left off, the node discovers peers on its own. Default OFF.");
         gLayout->addWidget(embeddedP2pCheck_);
 
         embeddedP2pPeersEdit_ = new QPlainTextEdit;
@@ -603,12 +627,13 @@ void PageLaunch::setupUi()
         gLayout->addWidget(embeddedP2pPeersEdit_);
 
         embeddedMainnetCheck_ = new QCheckBox(
-            "Enable embedded MAINNET block production (--embedded-mainnet) — reward-unsafe");
+            "Force embedded MAINNET block production explicitly (--embedded-mainnet)");
         embeddedMainnetCheck_->setChecked(false);   // ★ default OFF
         embeddedMainnetCheck_->setToolTip(
             "--embedded-mainnet (DASH)\n"
-            "Lifts the gate that keeps embedded mainnet block production OFF.\n"
-            "Reward-unsafe until validated. Default OFF.");
+            "Forces the embedded mainnet gate open explicitly. The daemonless\n"
+            "default (bare --run) already has it ON — this is only needed when an\n"
+            "external dashd is attached (where it defaults OFF). Default OFF.");
         gLayout->addWidget(embeddedMainnetCheck_);
 
         // DGB embedded coin-network producer target (--coin-daemon + --coin-magic
@@ -736,11 +761,12 @@ QString PageLaunch::buildLegacyCommand() const
     // Binary
     parts << binaryEdit_->text().trimmed();
 
-    // Mode
-    const int modeIdx = modeCombo_->currentIndex();
-    if (modeIdx == 0)      parts << "--integrated";
-    else if (modeIdx == 1) parts << "--sharechain";
-    // solo = default, no flag
+    // Mode — resolved via the catalog (Qt-free seam, unit-tested). A legacy
+    // "solo" MUST emit --solo: emitting nothing silently ran an integrated
+    // PPLNS node. Integrated emits --integrated explicitly (harmless).
+    const std::string mf = c2pool_qt::legacy_mode_flag(
+        static_cast<c2pool_qt::LegacyMode>(modeCombo_->currentIndex()));
+    if (!mf.empty()) parts << QString::fromStdString(mf);
 
     // Network
     if (testnetCheck_->isChecked()) parts << "--testnet";
@@ -863,14 +889,15 @@ QString PageLaunch::buildLegacyCommand() const
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-coin run-loop command (c2pool-dash / -dgb / -bch)
 //
-// ★ REWARD SAFETY: builds the dashd-RPC arm by default —
-//   `<binary> <subcommand> [--testnet] --coin-rpc HOST:PORT
-//    [--coin-rpc-auth PATH] [--stratum PORT] [--web-port PORT]
-//    [--data-dir PATH] …`. The embedded reward-UNSAFE flags
-//   (--coin-p2p-connect / --embedded-mainnet) are appended ONLY when the
-//   explicit, default-OFF "Advanced / embedded (opt-in)" controls are
-//   checked. With those unchecked the generated command NEVER contains
-//   them — proven by the reward-safe launch test.
+// DASH default is DAEMONLESS — a bare `--run` (plus stratum/web/listen/etc.):
+//   `<binary> --run [--testnet] [--stratum PORT] [--web-port PORT]
+//    [--data-dir PATH] …`. With no dashd arm the node keeps its good-citizen
+//   serving levers ON (embedded-mainnet included), so the panel does NOT emit
+//   --embedded-mainnet for that default. The dashd/coin-RPC arm (--coin-rpc +
+//   --coin-rpc-auth) is appended ONLY behind the explicit "Attach external
+//   dashd" opt-in; the embedded --coin-p2p-connect / --embedded-mainnet knobs
+//   only when the "Advanced / embedded" controls are checked. All of this is
+//   assembled in the Qt-free core (build_percoin_argv) and unit-tested there.
 // ─────────────────────────────────────────────────────────────────────────────
 QString PageLaunch::buildPerCoinCommand() const
 {
@@ -906,6 +933,13 @@ c2pool_qt::PerCoinParams PageLaunch::marshalPerCoinParams() const
     pp.rpcPort = coindPortSpin_->value();
     if (rpcConfPathEdit_) pp.confPath = rpcConfPathEdit_->text().trimmed().toStdString();
 
+    // External dashd attach is an explicit opt-in on DASH only (default OFF =
+    // daemonless cut mode). For every other binary the RPC/auth arm emits as
+    // before, so force the flag true there.
+    pp.externalDaemonRpc =
+        (prof.bin != c2pool::catalog::Bin::BIN_DASH)
+        || (dashdAttachCheck_ && dashdAttachCheck_->isChecked());
+
     pp.stratumPort = stratumPortSpin_->value();
 
     pp.webPort = httpPortSpin_->value();
@@ -933,7 +967,7 @@ c2pool_qt::PerCoinParams PageLaunch::marshalPerCoinParams() const
     pp.noP2pRelay      = noP2pRelayCheck_ && noP2pRelayCheck_->isChecked();
     if (bchAnchorEdit_) pp.bchAnchor = bchAnchorEdit_->text().trimmed().toStdString();
 
-    // ── ★ Embedded reward-UNSAFE arm — OPT-IN ONLY (default OFF) ──────────
+    // ── ★ Embedded coin-network transport / gate-lift — explicit controls ──
     pp.embeddedP2p = embeddedP2pCheck_ && embeddedP2pCheck_->isChecked();
     if (pp.embeddedP2p && embeddedP2pPeersEdit_) {
         for (const QString& line :
@@ -995,10 +1029,31 @@ void PageLaunch::applyProfileUi()
     const c2pool_qt::CoinProfile& prof = c2pool_qt::coinProfile(chain);
     const bool perCoin = (prof.cli == c2pool_qt::CliFamily::PerCoinRun);
 
+    using c2pool_qt::catview::spelling_for;
+    const auto bin = prof.bin;
+    auto has = [&](const char* canon) {
+        return spelling_for(bin, canon).has_value();
+    };
+
+    // DASH runs daemonless by default (bare --run); the dashd/coin-RPC arm is an
+    // explicit opt-in. Every other per-coin binary keeps its arm always on.
+    const bool isDash = (prof.bin == c2pool::catalog::Bin::BIN_DASH);
+    const bool attach = !isDash || (dashdAttachCheck_ && dashdAttachCheck_->isChecked());
+    if (dashdAttachCheck_)
+        dashdAttachCheck_->setVisible(isDash);
+
     // Relabel the parent-daemon group with the coin's daemon name.
     if (coindGroup_)
         coindGroup_->setTitle(
             QStringLiteral("Parent Coin Daemon (%1)").arg(prof.daemonLabel));
+
+    // Daemon RPC fields: enabled only where the binary carries the alias AND (for
+    // DASH) the external-dashd attach is ticked. BCH has no endpoint alias at all
+    // (creds only via --rpc-conf), so its host/port stay disabled.
+    const bool hasRpcEndpoint =
+        has("daemon_rpc.endpoint") || has("daemon_rpc.submit_endpoint");
+    if (coindHostEdit_) coindHostEdit_->setEnabled(perCoin ? (hasRpcEndpoint && attach) : true);
+    if (coindPortSpin_) coindPortSpin_->setEnabled(perCoin ? (hasRpcEndpoint && attach) : true);
 
     // Suggest the coin's default RPC conf path (PerCoinRun only).
     if (rpcConfPathEdit_) {
@@ -1006,7 +1061,8 @@ void PageLaunch::applyProfileUi()
             perCoin && !prof.confHint.isEmpty()
                 ? QStringLiteral("%1 (default)").arg(prof.confHint)
                 : QStringLiteral("(legacy coin uses RPC user/password below)"));
-        rpcConfPathEdit_->setEnabled(perCoin);
+        rpcConfPathEdit_->setEnabled(perCoin ? (has("daemon_rpc.auth_file") && attach)
+                                             : false);
     }
     if (dataDirEdit_)
         dataDirEdit_->setEnabled(perCoin);
@@ -1034,11 +1090,6 @@ void PageLaunch::applyProfileUi()
     // operator to set a value that would be silently dropped. LegacyUnified coins
     // keep every money widget enabled (they build the Python-p2pool argv).
     if (perCoin) {
-        using c2pool_qt::catview::spelling_for;
-        const auto bin = prof.bin;
-        auto has = [&](const char* canon) {
-            return spelling_for(bin, canon).has_value();
-        };
         const bool hasFee        = has("money.node_owner_fee_pct");
         const bool hasGiveAuthor = has("money.give_author_pct");
         const bool hasOwnerAddr  = has("money.node_owner_address");
@@ -1049,17 +1100,57 @@ void PageLaunch::applyProfileUi()
         if (nodeOwnerAddrEdit_)      nodeOwnerAddrEdit_->setEnabled(hasOwnerAddr);
         if (redistributeCombo_)      redistributeCombo_->setEnabled(hasRedist);
 
+        // The "Payout address" field marshals to money.node_owner_address on the
+        // per-coin path (marshalPerCoinParams). BCH has no such alias → the value
+        // would be silently dropped, so disable the field there.
+        if (addressEdit_)     addressEdit_->setEnabled(hasOwnerAddr);
+        if (messageBlobEdit_) messageBlobEdit_->setEnabled(has("global.message_blob_hex"));
+
         // Run-loop rows: enable only where the catalog carries the alias.
         if (coinP2pDiscoverCheck_) coinP2pDiscoverCheck_->setEnabled(has("coin_p2p.discover"));
         if (noP2pRelayCheck_)      noP2pRelayCheck_->setEnabled(has("sharechain.no_p2p_relay"));
         if (bchAnchorEdit_)        bchAnchorEdit_->setEnabled(has("embedded.anchor"));
+
+        // Legacy-only widgets are never read by marshalPerCoinParams(); disable
+        // them on the per-coin path so the form cannot invite a silently-dropped
+        // value. (Re-enabled in the else branch below.)
+        if (rpcUserEdit_)          rpcUserEdit_->setEnabled(false);
+        if (rpcPassEdit_)          rpcPassEdit_->setEnabled(false);
+        if (coindP2pPortSpin_)     coindP2pPortSpin_->setEnabled(false);
+        if (coindP2pAddrEdit_)     coindP2pAddrEdit_->setEnabled(false);
+        if (nodeOwnerScriptEdit_)  nodeOwnerScriptEdit_->setEnabled(false);
+        if (autoDetectWalletCheck_) autoDetectWalletCheck_->setEnabled(false);
+        if (maxConnsSpinBox_)      maxConnsSpinBox_->setEnabled(false);
+        if (configFileEdit_)       configFileEdit_->setEnabled(false);
+        if (coinbaseTextEdit_)     coinbaseTextEdit_->setEnabled(false);
+        if (privateChainCheck_)    privateChainCheck_->setEnabled(false);
+        if (networkIdEdit_)        networkIdEdit_->setEnabled(false);
+        if (generateIdBtn_)        generateIdBtn_->setEnabled(false);
+        if (startupModeCombo_)     startupModeCombo_->setEnabled(false);
     } else {
-        // Legacy coins: money widgets always available.
+        // Legacy coins: money + Python-p2pool widgets always available.
         if (feeSpinBox_)             feeSpinBox_->setEnabled(true);
         if (giveAuthorSpinBox_)      giveAuthorSpinBox_->setEnabled(true);
         if (giveAuthorZeroAckCheck_) giveAuthorZeroAckCheck_->setEnabled(true);
         if (nodeOwnerAddrEdit_)      nodeOwnerAddrEdit_->setEnabled(true);
         if (redistributeCombo_)      redistributeCombo_->setEnabled(true);
+        if (addressEdit_)            addressEdit_->setEnabled(true);
+        if (messageBlobEdit_)        messageBlobEdit_->setEnabled(true);
+        if (rpcUserEdit_)            rpcUserEdit_->setEnabled(true);
+        if (rpcPassEdit_)            rpcPassEdit_->setEnabled(true);
+        if (coindP2pPortSpin_)       coindP2pPortSpin_->setEnabled(true);
+        if (coindP2pAddrEdit_)       coindP2pAddrEdit_->setEnabled(true);
+        if (nodeOwnerScriptEdit_)    nodeOwnerScriptEdit_->setEnabled(true);
+        if (autoDetectWalletCheck_)  autoDetectWalletCheck_->setEnabled(true);
+        if (maxConnsSpinBox_)        maxConnsSpinBox_->setEnabled(true);
+        if (configFileEdit_)         configFileEdit_->setEnabled(true);
+        if (coinbaseTextEdit_)       coinbaseTextEdit_->setEnabled(true);
+        if (privateChainCheck_)      privateChainCheck_->setEnabled(true);
+        if (startupModeCombo_)       startupModeCombo_->setEnabled(true);
+        // network-id field follows the private-chain checkbox (its own logic).
+        const bool priv = privateChainCheck_ && privateChainCheck_->isChecked();
+        if (networkIdEdit_) networkIdEdit_->setEnabled(priv);
+        if (generateIdBtn_) generateIdBtn_->setEnabled(priv);
     }
 
     // Run-loop group is only meaningful for PerCoinRun binaries.
@@ -1070,16 +1161,26 @@ void PageLaunch::applyProfileUi()
     if (coinNoteLabel_) {
         QString note;
         if (perCoin) {
-            note = QStringLiteral(
-                       "%1 · %2 · binary %3 · reward-safe %4 arm (creds from %5).")
-                       .arg(prof.displayLabel, prof.algoLabel, prof.binary,
-                            prof.rpcAuthFlag.isEmpty() ? QStringLiteral("RPC")
-                                                       : prof.rpcAuthFlag,
-                            prof.confHint);
+            if (isDash)
+                note = QStringLiteral(
+                           "%1 · %2 · binary %3 · daemonless by default (bare "
+                           "--run); tick 'Attach external dashd' to use --coin-rpc "
+                           "(creds from %4).")
+                           .arg(prof.displayLabel, prof.algoLabel, prof.binary,
+                                prof.confHint);
+            else
+                note = QStringLiteral(
+                           "%1 · %2 · binary %3 · %4 arm (creds from %5).")
+                           .arg(prof.displayLabel, prof.algoLabel, prof.binary,
+                                prof.rpcAuthFlag.isEmpty() ? QStringLiteral("RPC")
+                                                           : prof.rpcAuthFlag,
+                                prof.confHint);
             if (chain == QStringLiteral("bitcoincash"))
                 note += QStringLiteral("  c2pool-bch has no operator fee surface "
                                        "(param catalog) — fee/donation/redistribute "
-                                       "are disabled.");
+                                       "are disabled; no RPC endpoint flag either "
+                                       "(creds only via --rpc-conf), so RPC host/port "
+                                       "and the payout-address field are disabled.");
             else if (chain == QStringLiteral("digibyte"))
                 note += QStringLiteral("  c2pool-dgb: node-owner address + "
                                        "redistribute live; no author-fee surface.");
@@ -1203,11 +1304,10 @@ void PageLaunch::launch()
         return;
     }
 
-    // ── ★ Reward-safety precheck (PerCoinRun) ─────────────────────────────────
-    // F5: a DASH launch with a blank --coin-rpc endpoint and no explicit embedded
-    // opt-in would run daemonless with embedded MAINNET block production auto-ON
-    // (reward-UNSAFE). validate_percoin() catches that (and any future per-coin
-    // reward guard) BEFORE build_percoin_argv() is ever run.
+    // ── Launchability precheck (PerCoinRun) ───────────────────────────────────
+    // Only refuses when an explicitly-requested external-dashd attach carries no
+    // RPC HOST:PORT to attach to. A daemonless DASH launch (bare --run, the
+    // default) is always allowed. Runs BEFORE build_percoin_argv().
     if (c2pool_qt::coinProfile(chain).cli == c2pool_qt::CliFamily::PerCoinRun) {
         const std::string reason =
             c2pool_qt::validate_percoin(marshalPerCoinParams());
@@ -1215,6 +1315,18 @@ void PageLaunch::launch()
             emit daemonStateChanged(
                 QStringLiteral("Daemon: refused — %1")
                     .arg(QString::fromStdString(reason)),
+                "color: #b04020;");
+            return;
+        }
+    } else {
+        // Legacy custodial mode pays the coinbase to --address (main_ltc.cpp
+        // requires it). Refuse a blank payout address in that mode.
+        if (static_cast<c2pool_qt::LegacyMode>(modeCombo_->currentIndex())
+                == c2pool_qt::LegacyMode::Custodial
+            && addressEdit_->text().trimmed().isEmpty()) {
+            emit daemonStateChanged(
+                "Daemon: refused — custodial mode (--custodial) needs a payout "
+                "--address to send the coinbase to.",
                 "color: #b04020;");
             return;
         }
@@ -1297,6 +1409,8 @@ void PageLaunch::saveSettings() const
     // Per-coin run-loop fields
     if (rpcConfPathEdit_) s.setValue("rpcConfPath", rpcConfPathEdit_->text());
     if (dataDirEdit_)     s.setValue("dataDir",     dataDirEdit_->text());
+    // DASH external-dashd attach opt-in (default OFF = daemonless).
+    if (dashdAttachCheck_) s.setValue("dashdAttach", dashdAttachCheck_->isChecked());
     // Embedded reward-UNSAFE opt-in state (persisted so it is never silently
     // re-enabled; defaults stay OFF on load).
     if (embeddedP2pCheck_)     s.setValue("embeddedP2p",      embeddedP2pCheck_->isChecked());
@@ -1368,6 +1482,10 @@ void PageLaunch::loadSettings()
     // Per-coin run-loop fields
     if (rpcConfPathEdit_) rpcConfPathEdit_->setText(s.value("rpcConfPath").toString());
     if (dataDirEdit_)     dataDirEdit_->setText(s.value("dataDir").toString());
+    // DASH external-dashd attach opt-in — default false, so a profile that used
+    // to force --coin-rpc 127.0.0.1:9998 now launches daemonless (intended).
+    if (dashdAttachCheck_)
+        dashdAttachCheck_->setChecked(s.value("dashdAttach", false).toBool());
     // Embedded reward-UNSAFE opt-in — restore prior state (still defaults OFF
     // for a fresh profile).
     if (embeddedP2pCheck_)

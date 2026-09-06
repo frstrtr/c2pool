@@ -27,6 +27,8 @@
 
 #include <boost/asio.hpp>
 
+#include <cassert>      // dial-lifetime arm assert (UAF guard)
+
 #include "rpc.hpp"
 #include "p2p_node.hpp"
 #include "node_interface.hpp"
@@ -48,11 +50,17 @@ class Node : public bch::interfaces::Node
     config_t* m_config;
 
     std::unique_ptr<NodeRPC> m_rpc;
-    std::unique_ptr<NodeP2P<config_t>> m_p2p;
+    // shared_ptr-owned so core::Client can pin it with a strong ref for the dial
+    // duration (set_lifetime below). A unique_ptr node leaves the core dial guard
+    // a silent no-op -> make_socket()'s dynamic_cast can run on a freed NodeP2P on
+    // a start_p2p() redial / teardown race (the #759-class dial-teardown UAF).
+    std::shared_ptr<NodeP2P<config_t>> m_p2p;
 
     void init_p2p()
     {
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p->set_lifetime(m_p2p);
+        assert(m_p2p->lifetime_armed() && "coin-P2P dial lifetime failed to arm");
         m_p2p->connect(m_config->coin()->m_p2p.address);
     }
 
@@ -100,7 +108,12 @@ public:
     /// Call after run() when P2P address is configured.
     void start_p2p(const NetService& addr)
     {
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        // Reassigning m_p2p frees the PRIOR NodeP2P; a still-in-flight resolve/
+        // connect on it is kept alive by core::Client's captured strong ref
+        // (set_lifetime) until its handler runs -- no freed-vtable make_socket.
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p->set_lifetime(m_p2p);
+        assert(m_p2p->lifetime_armed() && "coin-P2P dial lifetime failed to arm");
         m_p2p->connect(addr);
         LOG_INFO << "Coin P2P broadcaster connecting to " << addr.to_string();
     }

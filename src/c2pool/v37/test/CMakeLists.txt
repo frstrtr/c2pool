@@ -97,4 +97,31 @@ if (BUILD_TESTING)
     target_include_directories(v37_w3_relay_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w3_relay_test Threads::Threads)
     add_test(NAME v37_w3_relay_test COMMAND v37_w3_relay_test)
+
+    # Track A2 / DROPS — sub-threshold work estimator KAT
+    # (src/c2pool/v37/v37_subthreshold_estimator.hpp). The "raindrops -> bucket"
+    # DROPS half: crediting a worker's below-target work as the unbiased estimate
+    # Hhat = (K-1)*D_K, D_K = 2^256/(h_(K)+1), behind the EXPERIMENTAL gate
+    # SubthresholdParams::enabled (DEFAULT OFF). Ships the CORRECTED sybil-neutral
+    # rule (the E-2 fix) ONLY; the broken clamp is a negative reference the KAT
+    # proves is rejected. Gate ON is a consensus change (RDWR-OQ2) NOT activated
+    # here: the KAT pins gate-off byte-identity of BOTH the owed_digest (w4) and
+    # the add-only receipt/share carrier. Stdlib-only (no Threads: integer math +
+    # a deterministic splitmix64 Monte-Carlo). SAME HOLLOW-GREEN GUARD as the
+    # sibling suites: this target is ALSO listed in the build.yml --target lists
+    # (BOTH the Linux x86_64 leg and the ASan+UBSan leg) so CI actually compiles +
+    # runs it, not just registers it as a NOT_BUILT CTest sentinel (the DGB #137 /
+    # #769 / PR #1467 / #1477 unregistered-KAT class). The frozen golden JSON is
+    # copied next to the binary (and the test runs there via WORKING_DIRECTORY) so
+    # the stamp-verification case (case 10) reads it in-CI regardless of cwd.
+    add_executable(v37_subthreshold_estimator_test v37_subthreshold_estimator_test.cpp)
+    target_compile_features(v37_subthreshold_estimator_test PRIVATE cxx_std_20)
+    target_include_directories(v37_subthreshold_estimator_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_custom_command(TARGET v37_subthreshold_estimator_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/subthreshold_estimator_golden_v1.json
+                $<TARGET_FILE_DIR:v37_subthreshold_estimator_test>/subthreshold_estimator_golden_v1.json)
+    add_test(NAME v37_subthreshold_estimator_test
+             COMMAND v37_subthreshold_estimator_test
+             WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_subthreshold_estimator_test>)
 endif()

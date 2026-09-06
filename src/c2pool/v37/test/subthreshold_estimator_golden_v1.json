@@ -1,0 +1,156 @@
+{
+ "N": 1000000,
+ "censoring_corrected": [
+  {
+   "K": 3,
+   "corrected_dec": "799999",
+   "h_K_hex": "00003254e6e221c8a7a41e57d9dba908a265f0f5a1016ce789e774eebf65dbfc",
+   "h_T_hex": "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54"
+  },
+  {
+   "K": 4,
+   "corrected_dec": "857142",
+   "h_K_hex": "0000431bde82d7b634dad31fcd24e160d887ebf22c01e68a0d349be8ff327aa6",
+   "h_T_hex": "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54"
+  },
+  {
+   "K": 8,
+   "corrected_dec": "933333",
+   "h_K_hex": "00008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54d",
+   "h_T_hex": "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54"
+  },
+  {
+   "K": 16,
+   "corrected_dec": "967741",
+   "h_K_hex": "00010c6f7a0b5ed8d36b4c7f34938583621fafc8b0079a2834d26fa3fcc9ea9a",
+   "h_T_hex": "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54"
+  },
+  {
+   "K": 32,
+   "corrected_dec": "984126",
+   "h_K_hex": "000218def416bdb1a6d698fe69270b06c43f5f91600f345069a4df47f993d534",
+   "h_T_hex": "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54"
+  }
+ ],
+ "clamp_negative_reference": {
+  "K": 4,
+  "S": 500000,
+  "clamp_broken_dec": "1000000000000",
+  "combined_dec": "125000749999",
+  "estimate_dec": "749999",
+  "h_K_hex": "0000431bde82d7b634dad31fcd24e160d887ebf22c01e68a0d349be8ff327aa6",
+  "h_T_hex": "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54",
+  "note": "clamp_broken > combined => double-count; consensus path uses combined/estimate only"
+ },
+ "combined": [
+  {
+   "Hcomb_dec": "749999",
+   "K": 4,
+   "S": 0,
+   "h_K_hex": "0000431bde82d7b634dad31fcd24e160d887ebf22c01e68a0d349be8ff327aa6"
+  },
+  {
+   "Hcomb_dec": "999999",
+   "K": 4,
+   "S": 1,
+   "h_K_hex": "0000431bde82d7b634dad31fcd24e160d887ebf22c01e68a0d349be8ff327aa6"
+  },
+  {
+   "Hcomb_dec": "1999999",
+   "K": 4,
+   "S": 5,
+   "h_K_hex": "0000431bde82d7b634dad31fcd24e160d887ebf22c01e68a0d349be8ff327aa6"
+  },
+  {
+   "Hcomb_dec": "13249999",
+   "K": 4,
+   "S": 50,
+   "h_K_hex": "0000431bde82d7b634dad31fcd24e160d887ebf22c01e68a0d349be8ff327aa6"
+  },
+  {
+   "Hcomb_dec": "874999",
+   "K": 8,
+   "S": 0,
+   "h_K_hex": "00008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54d"
+  },
+  {
+   "Hcomb_dec": "999999",
+   "K": 8,
+   "S": 1,
+   "h_K_hex": "00008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54d"
+  },
+  {
+   "Hcomb_dec": "1499999",
+   "K": 8,
+   "S": 5,
+   "h_K_hex": "00008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54d"
+  },
+  {
+   "Hcomb_dec": "7124999",
+   "K": 8,
+   "S": 50,
+   "h_K_hex": "00008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54d"
+  }
+ ],
+ "cross_check_oracles": {
+  "mc_estimator_v1_json_sha256": "6526a5c0f56ba8867c4dfdcd303aa573f857a9c45cd6498ea0f36c08394e5084",
+  "sim_py_results_sha256": "a341a3469514324db3344cf535ddb332fe2e1bb1256c1cfd3219860c38c79b95"
+ },
+ "estimate": [
+  {
+   "Hhat_dec": "666666",
+   "Hhat_over_N": 0.666666,
+   "K": 3,
+   "h_K_hex": "00003254e6e221c8a7a41e57d9dba908a265f0f5a1016ce789e774eebf65dbfc"
+  },
+  {
+   "Hhat_dec": "749999",
+   "Hhat_over_N": 0.749999,
+   "K": 4,
+   "h_K_hex": "0000431bde82d7b634dad31fcd24e160d887ebf22c01e68a0d349be8ff327aa6"
+  },
+  {
+   "Hhat_dec": "874999",
+   "Hhat_over_N": 0.874999,
+   "K": 8,
+   "h_K_hex": "00008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54d"
+  },
+  {
+   "Hhat_dec": "937499",
+   "Hhat_over_N": 0.937499,
+   "K": 16,
+   "h_K_hex": "00010c6f7a0b5ed8d36b4c7f34938583621fafc8b0079a2834d26fa3fcc9ea9a"
+  },
+  {
+   "Hhat_dec": "968749",
+   "Hhat_over_N": 0.968749,
+   "K": 32,
+   "h_K_hex": "000218def416bdb1a6d698fe69270b06c43f5f91600f345069a4df47f993d534"
+  }
+ ],
+ "gate": {
+  "byte_identical_off_vs_master": true,
+  "owed_digest_gate_off_hex": "fc97e47d65f86cb1b36f064dc82b1af1884b233f4a67e5613e2dc465e1177670",
+  "owed_digest_gate_on_hex": "7e0efdb1f2a1eecf41d328ee31f24a3f00b9214f044643992be15cef1fcdec8a",
+  "payeeB_credit_low63_dec": "874999"
+ },
+ "h_T_hex": "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54",
+ "model": "Hhat=(K-1)*2^256//(h_K+1); comb=(S+K-1)*..; corrected=(K-1)*..//(h_K+1-h_T)",
+ "straddle_ratio": [
+  {
+   "K": 3,
+   "ratio_den": 5,
+   "ratio_num": 7
+  },
+  {
+   "K": 4,
+   "ratio_den": 7,
+   "ratio_num": 10
+  },
+  {
+   "K": 8,
+   "ratio_den": 15,
+   "ratio_num": 22
+  }
+ ]
+}
