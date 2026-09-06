@@ -169,4 +169,29 @@ if (BUILD_TESTING)
     add_test(NAME v37_w4_estimator_wiring_test
              COMMAND v37_w4_estimator_wiring_test
              WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_w4_estimator_wiring_test>)
+
+    # Track A2 / RDWR-OQ2 V37.1 CONSENSUS ACTIVATION — proves the SHIPPED default
+    # is now V37.1 (the gate ON under the sybil-neutral Combined rule) via the
+    # add-only LaneParams version marker (LaneParams::v37_0()/v37_1()/shipped(),
+    # SHIPPED_CONSENSUS_VERSION==1), that the ACTIVE credit rule is the E-2
+    # corrected combined estimator Hhat_comb=(S+K-1)*D'_K and NEVER the broken
+    # clamp (kept only as the module's NEVER_CONSENSUS witness), and that the
+    # activation is NON-DESTRUCTIVE: gate-OFF (V37.0, LaneParams::v37_0())
+    # owed_digest is BYTE-IDENTICAL to master AND to the pre-existing V37.0 golden,
+    # gate-ON (V37.1) owed_digest == the NEW pinned V37.1 golden, and the two
+    # differ (non-vacuous). Stdlib-only, same self-harness shape. SAME HOLLOW-GREEN
+    # GUARD: this target is ALSO listed in the build.yml --target lists (BOTH the
+    # Linux x86_64 leg and the ASan+UBSan leg) so CI compiles + runs it, not just
+    # registers it as a NOT_BUILT CTest sentinel. Its frozen golden JSON is copied
+    # next to the binary so the stamp case reads it in-CI regardless of cwd.
+    add_executable(v37_1_activation_test v37_1_activation_test.cpp)
+    target_compile_features(v37_1_activation_test PRIVATE cxx_std_20)
+    target_include_directories(v37_1_activation_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_custom_command(TARGET v37_1_activation_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/v371_activation_golden_v1.json
+                $<TARGET_FILE_DIR:v37_1_activation_test>/v371_activation_golden_v1.json)
+    add_test(NAME v37_1_activation_test
+             COMMAND v37_1_activation_test
+             WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_1_activation_test>)
 endif()

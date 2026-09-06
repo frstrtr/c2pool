@@ -51,7 +51,45 @@ struct SubthresholdGate {
     std::uint32_t K = 4;         // K-best near-misses; estimator enforces K >= 3
     std::uint32_t mode = 0;      // 0 = EstimateOnly (S==0 only), 1 = Combined (sybil-neutral)
     std::uint32_t version = 0;   // consensus version marker: 0 = base; 1 = V37.1 estimator-on
+
+    // ── CANONICAL version → gate map (the ADD-ONLY consensus version marker).
+    // for_version() is the SINGLE SOURCE OF TRUTH translating a V37.x consensus
+    // version into its gate configuration, so the (version, enabled, mode) triple
+    // can never drift out of agreement when built through the LaneParams factories
+    // below:
+    //   version 0  → V37.0 base: gate OFF. Byte-identical to master on every
+    //                schedule (owed_digest, add-only receipt/share carrier, lane
+    //                digest) — the bare {} default equals this, so all pre-existing
+    //                goldens stay valid for replay/audit.
+    //   version 1  → V37.1 activation: gate ON, the RDWR-OQ2 sub-threshold
+    //                estimator LIVE under the E-2-corrected sybil-neutral COMBINED
+    //                rule  Hhat_comb = (S + K - 1) * D'_K  (measures <= 1.00, no
+    //                sybil profit; a 2000-identity split collects <= ~1.0x). The
+    //                broken clamp  max(S*T, Hhat)  (double-counts, sybil-profits
+    //                ~1.98x) is NEVER selected — it exists only as the
+    //                v37_subthreshold_estimator.hpp NEVER_CONSENSUS witness. K = 4
+    //                (the module enforces K >= 3).
+    // An unrecognised future version keeps the OFF default (fail-safe: it credits
+    // nothing rather than guessing a rule).
+    static SubthresholdGate for_version(std::uint32_t v) {
+        SubthresholdGate g{};              // v == 0 (or unknown): V37.0 base, OFF
+        if (v == 1) {                      // V37.1: RDWR-OQ2 consensus activation
+            g.enabled = true;
+            g.K       = 4;
+            g.mode    = 1;                 // Combined => Hhat_comb = (S + K - 1) * D'_K
+            g.version = 1;
+        }
+        return g;
+    }
 };
+
+// The consensus version the node SHIPS as its default lane configuration. V37.1
+// turns the RDWR-OQ2 sub-threshold estimator ON under the sybil-neutral Combined
+// rule; the earlier versions stay selectable byte-for-byte via
+// LaneParams::for_version()/v37_0() for replay and audit. Bumping this constant
+// is the consensus-activation lever. (No live v37 lane is instantiated yet, so
+// shipping V37.1 forks no running lane — it declares the default the node adopts.)
+constexpr std::uint32_t SHIPPED_CONSENSUS_VERSION = 1;   // V37.1
 
 struct LaneParams {
     u64 window = 8640;          // W   (OQ-5 default)
@@ -66,6 +104,22 @@ struct LaneParams {
 
     u64 epoch_len() const { return c0; }
     std::size_t levels() const { return 1 + level_caps.size(); }
+
+    // ── Named consensus versions (ADD-ONLY). The digested geometry is IDENTICAL
+    // across every version — only the non-digested `subthreshold` gate differs —
+    // so the lane digest is version-invariant and the bare {} default constructor
+    // is retained as the V37.0 base (gate OFF): every pre-existing owed_digest /
+    // lane-digest golden built from a default LaneParams stays byte-identical.
+    // shipped() is the node's default lane configuration, currently V37.1 (gate
+    // ON, Combined). v37_0()/v37_1() name the endpoints for KATs and audit replay.
+    static LaneParams for_version(std::uint32_t v) {
+        LaneParams p;
+        p.subthreshold = SubthresholdGate::for_version(v);
+        return p;
+    }
+    static LaneParams v37_0()   { return for_version(0); }  // pre-activation base
+    static LaneParams v37_1()   { return for_version(1); }  // RDWR-OQ2 activation
+    static LaneParams shipped() { return for_version(SHIPPED_CONSENSUS_VERSION); }
 };
 
 // L0 slot flag bits. Annotation-only: flags are NOT digest leaves and never
