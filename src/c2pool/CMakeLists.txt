@@ -857,6 +857,20 @@ target_include_directories(c2pool-v37-xmr PRIVATE
 target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
 target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_node xmr_coin Threads::Threads)
+# ── Track A2 / Milestone A-BTC: the live BITCOIN-FAMILY single-node daemon ────
+# c2pool-v37-btc: the single-node DASH-regtest/devnet-capable (LTC testnet4
+# alternate) daemon (XbtcNode, src/c2pool/v37/btc/). It wires the MERGED v37
+# lane (V37Engine / OwedLedger / W5 NATIVE coinbase) to the mature v36 coin
+# plumbing behind ICoinBackend + core::StratumServer; it defines NO consensus
+# digest. Like c2pool-v37 it links ONLY Threads — the lifecycle is header-only
+# and the local/CI compile gate runs against MockCoinBackend (HARD SAFETY 6: the
+# heavy DASH/LTC coin libs link on the follow-on that fills DashCoinBackend /
+# LtcCoinBackend). EXPERIMENTAL — prototype, DASH-regtest/devnet only (mainnet
+# refused without --i-understand-mainnet); see the file banner + btc/README.md.
+add_executable(c2pool-v37-btc v37/main_v37_btc.cpp)
+c2pool_wire_version(c2pool-v37-btc)
+target_include_directories(c2pool-v37-btc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(c2pool-v37-btc Threads::Threads)
 
 # W0 HAND-WIRES its consumer-side test dir explicitly. Test wiring in this repo
 # is hand-listed add_subdirectory/add_test — there is no file(GLOB) over

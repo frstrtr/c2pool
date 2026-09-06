@@ -1,0 +1,40 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# c2pool-v37  BITCOIN-FAMILY node — LTC TESTNET4 (Milestone A-BTC, ALTERNATE)
+#
+#   *** EXPERIMENTAL / PROTOTYPE — DO NOT RUN IN PRODUCTION ***
+#
+# The ALTERNATE backend to the DASH-regtest default: a public Scrypt testnet.
+# Same native BTC-family lane, same F1 finalize contract — only the coin backend
+# differs (litecoind testnet4 via the v36 embedded-SPV / daemon adapter). NEVER
+# mainnet.
+#
+# CLI: --coin ltc --testnet4 --rpc-* --stratum-port --store --d-conf ...
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── Coin + network ─────────────────────────────────────────────────────────
+coin: ltc
+network: testnet4                # public Scrypt testnet (NEVER mainnet)
+
+# ─── Coin daemon RPC endpoint (placeholder — point at your litecoind testnet) ─
+rpc_host: 127.0.0.1
+rpc_port: 19332                  # litecoind testnet RPC (placeholder; set to yours)
+rpc_user: "REPLACE_ME"
+rpc_password: "REPLACE_ME"
+
+# ─── Stratum ────────────────────────────────────────────────────────────────
+stratum_port: 3334
+
+# ─── W6 settlement store ────────────────────────────────────────────────────
+store: "./v37btc-ltc-testnet4-store"
+
+# ─── v37 lane / settlement params ───────────────────────────────────────────
+lane_params:
+  d_conf: 12                     # LTC has faster blocks → deeper finality depth
+  slot_budget_C: 2700
+  max_payout_bytes: 0
+  k_floor: 1
+  subthreshold_estimator: false  # DEFAULT OFF (RDWR-OQ2 not activated)
+
+# ─── Payout descriptor canon (NATIVE ratified V37.0) ────────────────────────
+# P2PKH/P2SH/P2WPKH/P2WSH/P2TR/RAW native canon; Scrypt PoW is native — NO P-1,
+# NO RandomX.
