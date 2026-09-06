@@ -14,13 +14,22 @@
 //       (capacity then refill-limited) and refunds valid work;
 //   T4  a confirmed invalid-PoW carrier BANS the peer; a valid one is Accepted
 //       and its token refunded; a budget-starved carrier DEFERS with no penalty;
-//   T5  the ~65-bogus-carriers/s saturation arithmetic the budget is sized to.
+//   T5  the ~65-bogus-carriers/s saturation arithmetic the budget is sized to;
+//   T6  RELAY DEDUP: a replayed carrier hits stage-1 dedup (the §5 RelaySeenSet
+//       seam) and is DroppedCheap having spent ZERO additional RandomX — the
+//       duplicate-relay collapse that keeps an echoed carrier off the hasher;
+//   T7  RELAY FLOOD, END-TO-END: N bogus carriers pushed through the real
+//       handle_xmr_carrier ingress inside one wall-second reach the RandomX
+//       hasher only bucket-many times, so the flood cannot saturate one light
+//       verify core (the ~65/s threat, now demonstrated through the relay, not
+//       just arithmetic).
 
 #include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <vector>
 
 #include "xmr_carrier_wire.hpp"
@@ -183,15 +192,23 @@ static void t3_token_bucket() {
 }
 
 // A fake LaneEnv whose cheap checks all pass; rx_verify verdict is configurable.
+// Two optional hooks let the relay-level tests observe the load-bearing seams:
+//   * seen_set (if non-null) makes the stage-1 dedup predicate consult a real
+//     recent-carrier set — the same std::set<bytes32> shape the merged v37
+//     relay's RelaySeenSet (c2pool::v37n, w3_relay.hpp §5.2) keys on;
+//   * rx_calls counts every rx_verify invocation, i.e. every RandomX evaluation
+//     that actually reached the hasher — the quantity the DoS budget bounds.
 struct Fake {
     cx::RxVerdict verdict = cx::RxVerdict::Accept;
     Difficulty pinned{1000, 0};
+    std::set<bytes32>* seen_set = nullptr;   // null => never seen (T1-T5 behaviour)
+    int rx_calls = 0;                        // RandomX evaluations that actually ran
     cx::LaneEnv env() {
         cx::LaneEnv e;
         e.cheap_digest = [](const HashingBlob& hb) {
             bytes32 d{}; for (size_t i = 0; i < hb.bytes.size() && i < 32; ++i) d[i] = hb.bytes[i]; return d;
         };
-        e.seen = [](const bytes32&) { return false; };
+        e.seen = [this](const bytes32& id) { return seen_set && seen_set->count(id) != 0; };
         e.bin_of = [](const HashingBlob&, std::uint64_t& out) { out = 5000; return true; };
         e.open_and_bind = [this](const MoneroReceipt&, const bytes32& id, std::uint32_t cid,
                                  OpenedCommitment& oc) {
@@ -200,7 +217,7 @@ struct Fake {
         e.consensus_difficulty = [this](std::uint64_t, Difficulty& out) { out = pinned; return true; };
         e.seed_resolve = [](std::uint64_t, const SeedRef&, bytes32& s) { s.fill(0xAB); return true; };
         e.rx_verify = [this](const bytes32&, const HashingBlob&, const Difficulty&, std::uint8_t h[32]) {
-            std::memset(h, 0x7c, 32); return verdict;
+            ++rx_calls; std::memset(h, 0x7c, 32); return verdict;
         };
         return e;
     }
@@ -309,12 +326,126 @@ static void t5_saturation_arithmetic() {
                 hashes_per_core_s, throttled_core_fraction * 100.0, global_core_fraction * 100.0);
 }
 
+// ---------------------------------------------------------------------------
+// T6 — RELAY DEDUP. A carrier relayed twice must hit stage-1 dedup on the replay
+// and cost ZERO additional RandomX. This exercises the `seen` seam the merged
+// v37 relay fills with RelaySeenSet (w3_relay.hpp §5.2, a std::set<bytes32> keyed
+// on the carrier's own identity) — network hygiene, never consensus. The caller
+// inserts the accepted carrier/receipt's cheap dedup key (cheap_digest of the
+// hashing blob, §5 / xmr_admission.hpp stage D) on accept; the echo is then
+// collapsed before the hasher.
+static void t6_relay_dedup() {
+    std::set<bytes32> store;                 // the relay-seen set (RelaySeenSet shape)
+    Fake f; f.verdict = cx::RxVerdict::Accept; f.seen_set = &store;
+    cx::CarrierDosBudget dos;                // default policy
+    auto env = f.env();
+    LaneKeyedHeavy lp;
+    const cx::nanos_t t = 12'000'000'000LL;
+
+    // On accept, the caller records the dedup key so the next echo is suppressed.
+    auto cheap = env.cheap_digest;
+    auto on_accept = [&](const MoneroReceipt& r, bool) { store.insert(cheap(r.hashing_blob)); };
+
+    w::CarrierMessage m; m.chain_id = 7; m.carrier = make_receipt(0x40);
+    m.receipts.push_back(make_receipt(0x41));                 // distinct blob => distinct key
+    std::vector<std::uint8_t> bytes = w::encode_carrier(m);
+
+    // Round 1: fresh carrier -> carrier + receipt Accepted, exactly 2 RandomX evals.
+    cx::CarrierIngestReport r1 = cx::handle_xmr_carrier(
+        77, /*lane*/7, bytes.data(), bytes.size(), lp, env, dos, t, on_accept);
+    CHECK(r1.carrier == cx::RelayResult::Accepted, "T6 round1 carrier accepted");
+    CHECK(r1.receipts.size() == 1 && r1.receipts[0] == cx::RelayResult::Accepted,
+          "T6 round1 receipt accepted");
+    CHECK(f.rx_calls == 2, "T6 round1 spent exactly 2 RandomX evals (carrier + receipt)");
+    CHECK(dos.state(77).granted == 2, "T6 round1 two RandomX grants");
+    CHECK(store.size() == 2, "T6 dedup store holds carrier + receipt keys");
+
+    // Round 2: identical frame replayed. The carrier's own key is already in the
+    // seen set => stage-1 Dedup reject => DroppedCheap, receipts never reached,
+    // NO new RandomX.
+    const int before = f.rx_calls;
+    cx::CarrierIngestReport r2 = cx::handle_xmr_carrier(
+        77, /*lane*/7, bytes.data(), bytes.size(), lp, env, dos, t, on_accept);
+    CHECK(r2.carrier == cx::RelayResult::DroppedCheap, "T6 replayed carrier DroppedCheap (dedup)");
+    CHECK(r2.receipts.empty(), "T6 replayed carrier carries no receipts past dedup");
+    CHECK(f.rx_calls == before, "T6 dedup spent ZERO additional RandomX");
+    CHECK(dos.state(77).granted == 2, "T6 no new grant on a dedup hit");
+    CHECK(dos.state(77).structural >= 1, "T6 dedup hit scored as a cheap reject");
+    CHECK(!dos.banned(77), "T6 an honest replay is never ban-worthy");
+    std::printf("T6 relay dedup OK (replay collapsed pre-hash; 0 extra RandomX, DroppedCheap)\n");
+}
+
+// ---------------------------------------------------------------------------
+// T7 — RELAY FLOOD, END TO END. A single hostile peer floods N structurally
+// valid but PoW-failing carriers through the REAL handle_xmr_carrier ingress,
+// all timestamped inside one wall-second. Without a budget this is N * ~15 ms of
+// RandomX; the per-peer token bucket caps the evaluations that actually run to
+// its allowance (capacity + <=1 s of refill), so the flood costs a small,
+// bounded fraction of one light verify core rather than saturating it. The ban
+// is deliberately disarmed (huge threshold) so this isolates the TOKEN BUCKET as
+// the limiter (the ban path is proven separately in T4b).
+static void t7_relay_flood_bounded() {
+    cx::DosPolicy p;
+    p.per_peer_capacity = 20; p.per_peer_refill = 1;      // the sized default
+    p.global_capacity   = 256; p.global_refill = 16;
+    p.ban_threshold     = 1'000'000'000u;                 // disarm the ban; isolate the bucket
+    cx::CarrierDosBudget dos(p);
+
+    Fake f; f.verdict = cx::RxVerdict::BelowTarget;        // every carrier is bogus
+    auto env = f.env();                                    // no rx_reverify => confirmed invalid
+    LaneKeyedHeavy lp;
+
+    const int         N      = 2000;                       // 2000 bogus carriers ...
+    const cx::nanos_t t0     = 20'000'000'000LL;
+    const cx::nanos_t window = 1'000'000'000LL;            // ... inside ONE second
+    const std::uint32_t peer = 0xBADu;
+    int accepted = 0;
+    auto on_accept = [&](const MoneroReceipt&, bool) { ++accepted; };
+
+    for (int i = 0; i < N; ++i) {
+        w::CarrierMessage m; m.chain_id = 9;
+        m.carrier = make_receipt(std::uint8_t(i & 0xff));
+        // vary two blob bytes so the N carriers are genuinely distinct (no dedup
+        // collapse doing the bucket's job for it — seen_set is null here anyway).
+        m.carrier.hashing_blob.bytes[0] = std::uint8_t(i & 0xff);
+        m.carrier.hashing_blob.bytes[1] = std::uint8_t((i >> 8) & 0xff);
+        std::vector<std::uint8_t> b = w::encode_carrier(m);
+        const cx::nanos_t t = t0 + (cx::nanos_t)i * window / N;   // spread across 1 s
+        cx::handle_xmr_carrier(peer, /*lane*/9, b.data(), b.size(), lp, env, dos, t, on_accept);
+    }
+
+    // Every carrier is bogus => none accepted.
+    CHECK(accepted == 0, "T7 no bogus carrier is accepted");
+    // RandomX evaluations actually run == bucket allowance over the window:
+    // capacity (20) plus at most ~1 s of refill (1) => <= 22, and certainly
+    // nowhere near N.
+    CHECK((std::uint64_t)f.rx_calls == dos.state(peer).granted, "T7 rx evals == grants recorded");
+    CHECK(f.rx_calls <= 22, "T7 RandomX evals capped at the token-bucket allowance");
+    CHECK(f.rx_calls >= 20, "T7 the bucket did spend its burst (not falsely idle)");
+    CHECK(f.rx_calls < N / 20, "T7 <5% of the flood ever reached the hasher");
+    CHECK(dos.state(peer).deferred == (std::uint64_t)(N - f.rx_calls),
+          "T7 the rest were deferred with NO penalty");
+
+    // The load statement: rx_calls * 15 ms of core time inside a 1-s window is a
+    // small fraction of one core; the same N unmetered would be ~30 core-seconds.
+    const double ms_per_hash = 15.0;
+    const double core_frac_metered   = (f.rx_calls * ms_per_hash) / 1000.0;   // of one core-second
+    const double core_frac_unmetered = (N * ms_per_hash) / 1000.0;
+    CHECK(core_frac_metered < 0.50, "T7 metered flood stays under half of one light core");
+    CHECK(core_frac_unmetered > 1.0, "T7 the same flood unmetered WOULD saturate (>1 core-second)");
+    std::printf("T7 relay flood OK (N=%d bogus/s -> %d RandomX evals; %.0f%% of one core "
+                "metered vs %.0fx unmetered)\n",
+                N, f.rx_calls, core_frac_metered * 100.0, core_frac_unmetered);
+}
+
 int main() {
     t1_roundtrip();
     t2_bounds();
     t3_token_bucket();
     t4_relay_actions();
     t5_saturation_arithmetic();
+    t6_relay_dedup();
+    t7_relay_flood_bounded();
     std::printf("ALL W3-WIRE CHECKS PASSED (%d assertions)\n", g_checks);
     return 0;
 }

@@ -84,20 +84,11 @@
 // --- PayoutDescriptor canon + the XMR kind extension (descriptor-kinds leg) --
 #include "sharechain/v37/v37_descriptor_xmr.hpp" // v37::xmr::XMR_STD/XMR_SUB, fences
 
-// ---------------------------------------------------------------------------
-// Coin-layer surface REQUIRED by W5 but not yet declared in xmr_derivation.hpp.
-// r*G (the tx pubkey R). Trivially ge_scalarmult_base(&P, r) + ge_p3_tobytes over
-// the vendored ref10 (monero-project crypto-ops, BSD-3) already used inside
-// xmr_derivation.cpp::derive_public_key. Forward-declared here in the coin
-// namespace as the contract W5 depends on; the primitives leg should add the
-// one-line definition to xmr_derivation.{hpp,cpp} (cross-leg interface item,
-// see notes / open questions). Returns false iff `sec` is not a reduced scalar.
-// ---------------------------------------------------------------------------
-namespace xmr {
-namespace coin {
-bool secret_key_to_public_key(const SecretKey& sec, PublicKey& pub);
-} // namespace coin
-} // namespace xmr
+// The coin-layer surface W5 depends on is declared in the leg headers included
+// above: r*G (the tx pubkey R = r*G) is xmr::coin::secret_key_to_public_key in
+// xmr_derivation.hpp; ECDH derivation (generate_key_derivation / derive_public_
+// key / derive_view_tag / hash_to_scalar) is the rest of that header; the blob
+// serializer + consensus hashes are in xmr_blob.hpp.
 
 namespace v37 {
 namespace xmr {

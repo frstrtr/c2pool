@@ -322,12 +322,242 @@ static void test_submit_flow() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KAT: CryptoNote login round-trip against the SERVER (not a hand-built job).
+// Asserts the login OK the server emits carries the template's own seed_hash,
+// height and the correctly-encoded lane target — i.e. the job the miner will
+// hash is byte-consistent with the template source. (CryptoNote has no
+// separate subscribe/authorize; "login" is the single handshake that both
+// authenticates and delivers the first job — the round-trip is login -> job.)
+// ---------------------------------------------------------------------------
+static void test_login_roundtrip() {
+    FakeTemplateSource ts; FakeVerifier vf; FakeSink sk; FakeTransport tx;
+    XmrStratumServer srv(ts, vf, sk, tx);
+    XmrStratumSession s(1);
+
+    ts.seed_hash.fill(0xAA);
+    ts.lane_target = 0x00000000FFFFFFFFULL;          // full-8-byte encoding regime
+
+    CHECK(srv.handle_login(s, 7, "48addr.rig"), "roundtrip login true");
+    const std::string& lo = tx.last();
+    CHECK(contains(lo, "\"id\":7,"), "roundtrip req id echoed");
+    CHECK(contains(lo, "\"job_id\":\"00000001\""), "roundtrip first job_id=1");
+    CHECK(contains(lo, "\"height\":3000000"), "roundtrip height from template");
+    // seed_hash serialized big-endian as the template gave it
+    CHECK(contains(lo, "\"seed_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""),
+          "roundtrip seed_hash full 32B");
+    CHECK(contains(lo, "\"next_seed_hash\":\"bbbbbbbb"), "roundtrip next_seed_hash");
+    // lane target 0x00000000FFFFFFFF -> full 8 LE bytes "ffffffff00000000"
+    CHECK(contains(lo, "\"target\":\"ffffffff00000000\""), "roundtrip lane target");
+    CHECK(contains(lo, "\"algo\":\"rx/0\""), "roundtrip algo rx/0");
+    CHECK(s.rpc_id() != 0, "roundtrip rpc id assigned");
+}
+
+// ---------------------------------------------------------------------------
+// KAT: extra_nonce uniqueness. The per-server counter must hand every login a
+// distinct extra_nonce (p2pool StratumServer::m_extraNonce). We drive N logins
+// and require N distinct values, monotonically increasing, that the template
+// source actually received (proves the value is threaded into get_job()).
+// ---------------------------------------------------------------------------
+static void test_extra_nonce_uniqueness() {
+    FakeTemplateSource ts; FakeVerifier vf; FakeSink sk; FakeTransport tx;
+    XmrStratumServer srv(ts, vf, sk, tx);
+
+    const int N = 256;
+    std::vector<std::uint32_t> seen;
+    seen.reserve(N);
+    std::uint32_t prev = 0;
+    bool monotone = true, distinct = true;
+    for (int i = 0; i < N; ++i) {
+        XmrStratumSession s(static_cast<std::uint64_t>(100 + i));
+        CHECK(srv.handle_login(s, 1, "48addr"), "uniq login true");
+        const std::uint32_t en = ts.last_extra_nonce;   // value the template saw
+        if (i > 0 && en <= prev) monotone = false;
+        for (std::uint32_t v : seen) if (v == en) { distinct = false; break; }
+        seen.push_back(en);
+        prev = en;
+    }
+    CHECK(seen.size() == static_cast<std::size_t>(N), "uniq drove N logins");
+    CHECK(distinct, "uniq extra_nonces all distinct");
+    CHECK(monotone, "uniq extra_nonces strictly increasing");
+    // fetch_add starts at 0: first login gets 0, so the last saw N-1.
+    CHECK(seen.front() == 0u, "uniq first extra_nonce == 0");
+    CHECK(seen.back() == static_cast<std::uint32_t>(N - 1), "uniq last extra_nonce == N-1");
+}
+
+// ---------------------------------------------------------------------------
+// KAT: job-ring eviction. Each session keeps only the last JOBS_RING(=4) jobs
+// (p2pool StratumClient::m_jobs). Issue 5 jobs; the 1st must age out and every
+// later one stay resolvable — both at the SavedJob layer and end-to-end (a
+// submit naming the evicted job id is rejected "Invalid job id").
+// ---------------------------------------------------------------------------
+static void test_job_ring_eviction() {
+    // (a) direct SavedJob layer
+    {
+        XmrStratumSession s(1);
+        std::uint32_t ids[5];
+        for (int i = 0; i < 5; ++i)
+            ids[i] = s.remember_job(/*extra_nonce=*/static_cast<std::uint32_t>(i),
+                                    /*template_id=*/7, /*target=*/0x100 + i);
+        CHECK(ids[0] == 1 && ids[4] == 5, "ring job ids 1..5");
+        XmrStratumSession::SavedJob out;
+        CHECK(!s.find_job(ids[0], out), "ring job 1 evicted");   // slot 1%4 reused by job 5
+        for (int i = 1; i < 5; ++i)
+            CHECK(s.find_job(ids[i], out), "ring job survives");
+        // the surviving newest job carries its own bookkeeping intact
+        CHECK(s.find_job(ids[4], out) && out.extra_nonce == 4 && out.target == 0x104,
+              "ring newest job bookkeeping");
+        CHECK(!s.find_job(0, out), "ring job id 0 never resolves");
+    }
+    // (b) end-to-end: submit against an evicted job id -> Invalid job id
+    {
+        FakeTemplateSource ts; FakeVerifier vf; FakeSink sk; FakeTransport tx;
+        XmrStratumServer srv(ts, vf, sk, tx);
+        XmrStratumSession s(1);
+        srv.handle_login(s, 1, "48addr");            // issues job 1
+        for (int i = 0; i < 4; ++i) srv.broadcast_job(s);  // issues jobs 2..5, evicts 1
+        SubmitFields f; f.rpc_id = "0"; f.job_id = "00000001"; // the evicted job
+        f.nonce = "01000000"; f.result.assign(64, '0');
+        tx.clear();
+        srv.handle_submit(s, 2, f);
+        CHECK(contains(tx.last(), "Invalid job id"), "ring evicted submit rejected");
+        CHECK(sk.accepted == 0, "ring evicted submit not accepted");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A DETERMINISTIC known-answer stand-in for RandomX (no engine, host is
+// OOM-pressured / RandomX is CI-gated). The "PoW" of a blob is a fixed,
+// reproducible function of the 4 header-nonce bytes the server inserts at
+// nonce_offset: top LE word of the hash := (nonce_le * A + C). Because the
+// stub reads the nonce back OUT of the blob, an accepted submit proves the
+// whole chain end-to-end: parse -> rebuild blob -> insert nonce @ offset ->
+// recompute -> target check. The client-supplied `result` is never consulted.
+// ---------------------------------------------------------------------------
+struct KeyedPowStub : IPowVerifier {
+    std::size_t nonce_offset = EXPECTED_NONCE_OFFSET_V16;
+    static constexpr std::uint64_t A = 0x9E3779B97F4A7C15ULL; // fixed multiplier
+    static constexpr std::uint64_t C = 0x0000000000000007ULL; // fixed addend
+    // The known answer, computed the same way the stub does, for a given nonce.
+    static std::uint64_t answer_top_word(std::uint32_t nonce_le) {
+        return static_cast<std::uint64_t>(nonce_le) * A + C;
+    }
+    bool randomx_hash(const std::uint8_t* blob, std::size_t n, std::uint64_t,
+                      const std::array<std::uint8_t, HASH_SIZE>&,
+                      std::array<std::uint8_t, HASH_SIZE>& out, bool) override {
+        if (nonce_offset + NONCE_SIZE > n) return false;
+        std::uint32_t nonce_le = 0;
+        for (int i = 0; i < static_cast<int>(NONCE_SIZE); ++i)
+            nonce_le |= static_cast<std::uint32_t>(blob[nonce_offset + i]) << (8 * i);
+        const std::uint64_t top = answer_top_word(nonce_le);
+        out.fill(0);
+        for (int i = 0; i < 8; ++i)
+            out[HASH_SIZE - 8 + i] = static_cast<std::uint8_t>(top >> (8 * i));
+        return true;
+    }
+    bool meets_target(const std::array<std::uint8_t, HASH_SIZE>& h,
+                      std::uint64_t target) const override {
+        std::uint64_t top = 0;
+        for (int i = 0; i < 8; ++i)
+            top |= static_cast<std::uint64_t>(h[HASH_SIZE - 8 + i]) << (8 * i);
+        return top <= target;
+    }
+};
+
+// Submit a specific nonce and return the transport reply line.
+static std::string submit_nonce(XmrStratumServer& srv, XmrStratumSession& s,
+                                FakeTransport& tx, std::uint32_t nonce_le,
+                                const char* result_hex64) {
+    SubmitFields f;
+    f.rpc_id = "00000000";
+    f.job_id = "00000001";
+    std::uint8_t nb[4] = { static_cast<std::uint8_t>(nonce_le),
+                           static_cast<std::uint8_t>(nonce_le >> 8),
+                           static_cast<std::uint8_t>(nonce_le >> 16),
+                           static_cast<std::uint8_t>(nonce_le >> 24) };
+    f.nonce = StratumDialect::to_hex(nb, 4);
+    f.result.assign(result_hex64);
+    tx.clear();
+    srv.handle_submit(s, 2, f);
+    return tx.last();
+}
+
+// ---------------------------------------------------------------------------
+// KAT: known-good vs known-bad nonce against the deterministic PoW oracle.
+// lane_target is chosen so that exactly one of two hand-computed nonces clears
+// it. The accept/reject verdict is therefore a genuine known-answer test of
+// the recompute+target path, not a preset flag.
+// ---------------------------------------------------------------------------
+static void test_known_answer_nonce() {
+    FakeTemplateSource ts; KeyedPowStub pow; FakeSink sk; FakeTransport tx;
+    // No network block in this KAT: make the mainchain target unreachable so we
+    // isolate the lane accept/reject decision.
+    ts.mainchain_target = 0;                       // disables the network-block branch
+    // Pick a lane target between two known answers.
+    const std::uint32_t GOOD = 0x00000002u;        // answer = 2*A + C  (small-ish)
+    const std::uint32_t BAD  = 0xF0000000u;        // answer = huge
+    const std::uint64_t good_ans = KeyedPowStub::answer_top_word(GOOD);
+    const std::uint64_t bad_ans  = KeyedPowStub::answer_top_word(BAD);
+    CHECK(good_ans < bad_ans, "KAT good answer < bad answer");
+    ts.lane_target = good_ans;                     // GOOD meets (==), BAD does not
+
+    XmrStratumServer srv(ts, pow, sk, tx);
+    XmrStratumSession s(1);
+    CHECK(srv.handle_login(s, 1, "48addr.rig"), "KAT login");
+
+    // Known-GOOD nonce: recomputed top word == lane target -> accepted.
+    // The `result` field is deliberate garbage to prove it is never trusted.
+    std::string rg = submit_nonce(srv, s, tx, GOOD, std::string(64, 'f').c_str());
+    CHECK(contains(rg, "\"status\":\"OK\""), "KAT good nonce accepted");
+    CHECK(sk.accepted == 1, "KAT good nonce reached sink");
+    CHECK(sk.last.nonce == GOOD, "KAT accepted share carries the good nonce");
+    CHECK(!sk.last.is_network_block, "KAT good nonce not a network block");
+
+    // Known-BAD nonce (same job still in ring): recomputed word > target -> Low diff.
+    std::string rb = submit_nonce(srv, s, tx, BAD, std::string(64, '0').c_str());
+    CHECK(contains(rb, "Low diff share"), "KAT bad nonce rejected low-diff");
+    CHECK(sk.accepted == 1, "KAT bad nonce did NOT reach sink");
+
+    // Boundary: a nonce one unit 'harder' than GOOD (answer = target - A + ... )
+    // Confirm the comparison is inclusive (<=) by re-submitting GOOD: still OK.
+    std::string rg2 = submit_nonce(srv, s, tx, GOOD, std::string(64, 'a').c_str());
+    CHECK(contains(rg2, "\"status\":\"OK\""), "KAT good nonce inclusive re-accept");
+}
+
+// ---------------------------------------------------------------------------
+// KAT: a share that ALSO clears the Monero mainchain target drives a real
+// block submission AND is still handed to the v37 receipt sink (the XMR-lane
+// divergence: accepted share -> work-receipt, plus submit_network_block).
+// Uses the deterministic oracle so the network-block verdict is a known answer.
+// ---------------------------------------------------------------------------
+static void test_known_answer_network_block() {
+    FakeTemplateSource ts; KeyedPowStub pow; FakeSink sk; FakeTransport tx;
+    const std::uint32_t WIN = 0x00000001u;
+    const std::uint64_t ans = KeyedPowStub::answer_top_word(WIN);
+    ts.mainchain_target = ans;                     // WIN clears the network target
+    ts.lane_target = ans;                          // and the lane target
+    XmrStratumServer srv(ts, pow, sk, tx);
+    XmrStratumSession s(1);
+    CHECK(srv.handle_login(s, 1, "48addr"), "KAT-net login");
+    std::string r = submit_nonce(srv, s, tx, WIN, std::string(64, '0').c_str());
+    CHECK(contains(r, "\"status\":\"OK\""), "KAT-net status OK");
+    CHECK(sk.network_submits == 1, "KAT-net submit_network_block called once");
+    CHECK(sk.accepted == 1 && sk.last.is_network_block, "KAT-net receipt + flag");
+    CHECK(sk.last.height == ts.height, "KAT-net share carries template height");
+}
+
 int main() {
     test_hex_and_target();
     test_login_string();
     test_submit_parse();
     test_response_goldens();
     test_submit_flow();
+    test_login_roundtrip();
+    test_extra_nonce_uniqueness();
+    test_job_ring_eviction();
+    test_known_answer_nonce();
+    test_known_answer_network_block();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -103,6 +103,28 @@ if (BUILD_TESTING)
     target_compile_features(xmr_provenance_gate PRIVATE cxx_std_20)
     add_test(NAME xmr_provenance_gate COMMAND xmr_provenance_gate)
 
+    # 6b) X6 (W5) coinbase-settlement KAT. Finalizes the OWED -> miner_tx
+    #     executor (../settle/xmr_coinbase.cpp): deterministic-r reproducibility
+    #     (same inputs -> same R and same P_i set; changed lane_commitment /
+    #     prev_id / height -> a fresh r), R = r*G anchored to an OFFICIAL monero
+    #     generate_keys vector, a stealth one-time key against monero-project
+    #     tests/crypto/tests.txt (generate_key_derivation + derive_public_key)
+    #     plus a coinbase-path reproduction of every P_i, exact-sum (Sum(vout) ==
+    #     base_reward+fees to the piconero incl. residual sink -- HF13, no burn),
+    #     the weight-aware output cap, and the CARROT/FCMP++ fence trip
+    #     (major_version 17 -> CarrotFence, no coinbase). Compiles the settle TU
+    #     and links xmr_coin for the REAL vendored ed25519 (ge_*) + keccak; the
+    #     src/ root resolves the "impl/xmr/..." and read-only "sharechain/v37/..."
+    #     (v37_descriptor_xmr.hpp value-consumer) includes. NO RandomX, monerod,
+    #     libsodium or boost -- runs in the ordinary lane.
+    add_executable(xmr_coinbase_kat
+        xmr_coinbase_kat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp)
+    target_link_libraries(xmr_coinbase_kat PRIVATE xmr_coin)
+    target_include_directories(xmr_coinbase_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(xmr_coinbase_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_coinbase_kat COMMAND xmr_coinbase_kat)
+
     # =========================================================================
     # X1 Known-Answer Tests (NEW) — link the xmr_coin library.
     # =========================================================================

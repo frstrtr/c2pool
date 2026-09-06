@@ -52,4 +52,9 @@ void derive_view_tag(const KeyDerivation& D, std::size_t output_index, ViewTag& 
 // (scoping S16, "tx_secret_key" domain) also needs it. (crypto.cpp: hash_to_scalar)
 void hash_to_scalar(const void* data, std::size_t length, EcScalar& s);
 
+// R = sec * G. The tx public key R = r*G the settlement executor (W5) publishes
+// in tx_extra 0x01; `sec` must be a reduced scalar (sc_check). Returns false if
+// `sec` is not canonical. (crypto.cpp: crypto_ops::secret_key_to_public_key)
+bool secret_key_to_public_key(const SecretKey& sec, PublicKey& pub);
+
 } // namespace xmr::coin
