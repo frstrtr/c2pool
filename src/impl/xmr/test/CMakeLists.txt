@@ -125,6 +125,39 @@ if (BUILD_TESTING)
     target_compile_features(xmr_coinbase_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_coinbase_kat COMMAND xmr_coinbase_kat)
 
+    # 6c) X8 END-TO-END integration KAT. Stitches the whole XMR-lane path the
+    #     per-slice KATs each cover only in isolation: block-template context feeds
+    #     the coinbase inputs; the settle leg (../settle/xmr_coinbase.cpp) builds
+    #     the canonical miner_tx from a finality-gated OWED ledger (exact-sum, no
+    #     burn; owed outputs are real 8rA stealth keys); the stratum front-end
+    #     (../stratum/xmr_stratum.cpp) serves the coinbase-framed hashing blob, a
+    #     miner grinds it and submits a share that the deterministic W3 PoW oracle
+    #     accepts (the blob the miner signs is byte-identical to the receipt's);
+    #     the carrier wire (../wire, header-only) encodes/decodes the receipt
+    #     byte-for-byte; and the receipt verifier (../receipt/xmr_receipt_verify.cpp)
+    #     accepts the well-formed carrier and REJECTS a tampered one at the
+    #     STRUCTURAL stage, before RandomX. The single stitch: the settle
+    #     owed_digest (lane_commitment) IS the receipt side-data info_digest, so the
+    #     coinbase's tx_extra 0x03 leaf == the leaf the receipt path recomputes.
+    #     Links xmr_coin for the REAL vendored ed25519 (ge_*) + keccak; the src/
+    #     root resolves the "impl/xmr/..." and read-only "sharechain/v37/..."
+    #     includes. RandomX is CI-gated INSIDE the test (deterministic oracle, no
+    #     256-MiB cache / JIT) so this target carries NO RandomX dependency and runs
+    #     in the ordinary lane on BOTH build.yml legs. NO monerod, libsodium, boost.
+    add_executable(xmr_e2e_kat
+        xmr_e2e_kat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt/xmr_receipt_verify.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum/xmr_stratum.cpp)
+    target_link_libraries(xmr_e2e_kat PRIVATE xmr_coin)
+    target_include_directories(xmr_e2e_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
+        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum
+        ${CMAKE_CURRENT_SOURCE_DIR}/../wire)
+    target_compile_features(xmr_e2e_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_e2e_kat COMMAND xmr_e2e_kat)
+
     # =========================================================================
     # X1 Known-Answer Tests (NEW) — link the xmr_coin library.
     # =========================================================================
@@ -163,21 +196,45 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_difficulty_kat COMMAND xmr_difficulty_kat)
 
-    # 10) randomx-verify: OFFICIAL tevador/RandomX engine vectors (../pow/
-    #     randomx_verify_kat.cpp, suite A) against the REAL vendored library.
-    #     HEAVY: 256 MiB Argon2d cache + a light VM per key. OOM-hostile, and its
-    #     asm/JIT + intentional unaligned reads do not survive -fsanitize, so it
-    #     is OFF by default and NOT built locally. It is NOT enabled in CI in this
-    #     wave either: the foundation vendored only the RandomX *headers*
-    #     (third_party/randomx/randomx.h + configuration.h) — there is no RandomX
-    #     source/CMakeLists to compile yet, so -DXMR_BUILD_RANDOMX=ON would fail
-    #     to configure. A later wave vendors the tevador/RandomX source (submodule
-    #     at consensus pin 12f2c2ff), flips this target into build.yml's non-san
-    #     --target leg, and drops the exempt below.
-    #
-    #     The drift-guard SEES this add_executable (regex, ignores the if()), so
-    #     until it is in build.yml it is declared exempt (fail-closed escape hatch):
-    # ci-allowlist-exempt: xmr_randomx_verify_kat -- heavy RandomX (256 MiB Argon2d cache + JIT); CI-gated behind XMR_BUILD_RANDOMX, OFF until the tevador/RandomX source is vendored in a later wave (foundation ships headers only)
+    # 9b) cross-impl goldens: the LOAD-BEARING Family-B golden regression gate
+    #     (the analogue of the Bitcoin-family proto/ decay-table golden). It
+    #     recomputes the deterministic XMR-lane outputs — difficulty check_hash
+    #     boundaries, CryptoNote stealth one-time keys, deterministic coinbase
+    #     r/R=r*G/mm-root, receipt cheap-id + info digest, and the wire carrier
+    #     codec bytes — through the merged primitives and byte-compares each to
+    #     the frozen cross-impl-goldens/xmr_lane_goldens_golden.hpp (emitted by
+    #     cross-impl-goldens/gen_xmr_goldens.cpp, which is a dev tool, NOT a CMake
+    #     target — mirroring tools/gen_decay_canonical.py). LIGHT: links xmr_coin
+    #     (keccak/ed25519/boost-free check_hash) + the header-only receipt/wire
+    #     codec; NO RandomX / libsodium / boost. Negative-controlled internally.
+    #     Added to BOTH build.yml light legs by this wave (drift-guard clean).
+    add_executable(xmr_goldens_kat
+        ${CMAKE_CURRENT_SOURCE_DIR}/cross-impl-goldens/xmr_goldens_kat.cpp)
+    target_link_libraries(xmr_goldens_kat PRIVATE xmr_coin)
+    target_include_directories(xmr_goldens_kat PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/cross-impl-goldens
+        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
+        ${CMAKE_CURRENT_SOURCE_DIR}/../wire)
+    target_compile_features(xmr_goldens_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_goldens_kat COMMAND xmr_goldens_kat)
+
+    # 10) randomx-verify: the REAL RandomX engine, now vendored and wired.
+    #     ../pow/randomx_verify_kat.cpp runs three suites against librandomx.a
+    #     built from the vendored tevador/RandomX source (third_party/randomx/src,
+    #     consensus pin 12f2c2ff):
+    #       (A) OFFICIAL tevador/RandomX rx/0 (v1) engine vectors,
+    #       (B) the pure-arithmetic difficulty/seed-height rule (always),
+    #       (C) a REAL Monero mainnet block (3,000,000) verified end-to-end
+    #           through the production LightVerifier (X0-proven path).
+    #     HEAVY: 256 MiB Argon2d cache + a light VM per key. Its asm/JIT +
+    #     intentional unaligned reads do NOT survive -fsanitize, and 256 MiB is
+    #     OOM-hostile on a laptop, so XMR_BUILD_RANDOMX defaults OFF: it is NOT
+    #     built locally and NOT built on the sanitizer leg. It IS built and run on
+    #     the NON-sanitizer Linux x86_64 leg, which passes -DXMR_BUILD_RANDOMX=ON
+    #     and lists xmr_randomx_verify_kat in its --target set (see
+    #     .github/workflows/build.yml). Because it is now a real build.yml target
+    #     the drift-guard finds it there — no ci-allowlist-exempt entry is needed
+    #     (the previous exempt, valid while only headers were vendored, is dropped).
     option(XMR_BUILD_RANDOMX
         "Build the heavy RandomX verify KAT (librandomx from tevador/RandomX pin 12f2c2ff)" OFF)
     if (XMR_BUILD_RANDOMX)
@@ -202,7 +259,8 @@ if (BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/../pow
             ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx)
         target_compile_features(xmr_randomx_verify_kat PRIVATE cxx_std_20)
-        # --engine runs suite (A) (the RandomX vectors); suite (B) runs always.
+        # --engine runs suites (A) RandomX vectors + (C) the real block 3,000,000
+        # end-to-end verify; suite (B) arithmetic runs always.
         add_test(NAME xmr_randomx_verify_kat COMMAND xmr_randomx_verify_kat --engine)
     endif()
 endif()
