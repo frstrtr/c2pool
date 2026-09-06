@@ -106,7 +106,16 @@ static bool ref10_point_check(const std::uint8_t* pt) {
 // explicitly during startup.
 namespace {
 struct BackendInstaller {
-    BackendInstaller() { set_point_check_backend(&ref10_point_check); }
+    BackendInstaller() {
+        set_point_check_backend(&ref10_point_check);
+        // P-1 canon activation: register the whole-descriptor XMR validator
+        // with the ratified PayoutDescriptor canon so PayoutDescriptor::valid()
+        // RECOGNIZES the reserved XMR kinds (0x10/0x11) wherever this torsion
+        // backend is linked. Co-located by design: XMR validity is meaningless
+        // without the point-check backend, so both come online in the same TU
+        // (the canon is fail-closed — XMR rejected — until this runs).
+        ::v37::set_xmr_descriptor_validator(&xmr_descriptor_valid);
+    }
 };
 const BackendInstaller g_install_xmr_point_check_backend;
 } // namespace

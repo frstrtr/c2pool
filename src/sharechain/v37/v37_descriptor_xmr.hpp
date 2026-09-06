@@ -197,13 +197,39 @@ inline bool xmr_descriptor_valid(const PayoutDescriptor& d,
         }
         return true;
     }
-    // Non-XMR pay: canon owns validity, but an XMR aux ref still needs the
-    // torsion check (the canon would otherwise reject the unknown kind).
+    // Non-XMR pay: the canon core owns validity, but an XMR-kind ref carried in
+    // the ATTRIBUTION slot or any AUX entry still needs the torsion / prime-order
+    // check (the canon core would otherwise reject the unknown kind byte). Every
+    // such XMR-kind ref MUST be validated HERE and then EXCLUDED from the
+    // descriptor we delegate to the core: the core valid() re-enters the P-1
+    // dispatch prologue on ANY XMR kind it still sees, so handing it a descriptor
+    // that still carries an XMR attribution (or XMR aux) makes
+    //   xmr_descriptor_valid -> valid() -> dispatch -> xmr_descriptor_valid ...
+    // cycle forever (unbounded recursion -> stack overflow SIGSEGV -- a
+    // consensus-DoS reachable at allow_attribution=false, the V37.0 default).
+    // `pay` is non-XMR by construction in this branch; once the XMR attribution
+    // and XMR aux are stripped, the delegated descriptor carries NO XMR kind and
+    // therefore CANNOT re-enter the dispatch -- the recursion is structurally
+    // impossible and valid() is total for every input.
+
+    // Honour the F-2 attribution gate up front, so an XMR attribution yields the
+    // SAME verdict the canon core gives a non-XMR attribution: present under the
+    // V37.0 default (allow_attribution=false) => reject. Without this, stripping
+    // the XMR attribution below would let a disallowed attribution slip through.
+    if (d.attribution.has_value() && !allow_attribution) return false;
+    if (d.attribution.has_value() && is_xmr_kind(d.attribution->kind)) {
+        if (!xmr_ref_valid(*d.attribution)) return false;  // torsion / prime-order
+    }
     for (const auto& e : d.aux) {
         if (is_xmr_kind(e.ref.kind) && !xmr_ref_valid(e.ref)) return false;
     }
-    // Delegate the rest to the canon by temporarily excluding XMR aux entries.
+    // Delegate the remainder to the canon core with EVERY XMR-kind ref stripped:
+    // the XMR attribution (already torsion-checked above) is removed, and only
+    // non-XMR aux entries are carried over. The delegated valid() thus sees no
+    // XMR kind and never re-dispatches.
     PayoutDescriptor tmp = d;
+    if (tmp.attribution.has_value() && is_xmr_kind(tmp.attribution->kind))
+        tmp.attribution.reset();
     tmp.aux.clear();
     for (const auto& e : d.aux)
         if (!is_xmr_kind(e.ref.kind)) tmp.aux.push_back(e);
