@@ -19,6 +19,23 @@ development-fee split. Independence from dashd is not yet complete; the
 Supported-chains matrix marks DASH in development. The remaining work is the
 daemonless-finalize item below.
 
+## Governance
+
+Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
+The c2pool-daemonless-finalize proposal is in its voting phase; masternode
+operators can vote on it before the next superblock.
+
+- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-finalize
+- Governance object: fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631
+- Vote from a masternode:
+
+  ```
+  dash-cli gobject vote-many fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631 funding yes
+  ```
+
+Funding requires net yes votes equal to 10 percent of enabled masternodes by the
+next superblock.
+
 ## Daemonless BIP-110
 
 c2pool-bip110 follows the BLAKE2b hard-fork chain over coin P2P with no bitcoind
@@ -52,23 +69,6 @@ public pools that run with no coin daemon on the serve path:
 and `bip110.voidbind.com`.
 
 Mining (experimental, live): point a BLAKE2b (Sia-algorithm) miner at `stratum+tcp://bip110.voidbind.com:9336` with username `<BIP-110-address>.<worker>` and any password. Daemonless standalone node on the BLAKE2b fork; block reward is effectively zero today (coin unlisted) — a decentralized-pool proof, not a revenue venue.
-
-## Governance
-
-Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
-The c2pool-daemonless-finalize proposal is in its voting phase; masternode
-operators can vote on it before the next superblock.
-
-- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-finalize
-- Governance object: fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631
-- Vote from a masternode:
-
-  ```
-  dash-cli gobject vote-many fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631 funding yes
-  ```
-
-Funding requires net yes votes equal to 10 percent of enabled masternodes by the
-next superblock.
 
 ## Supported chains
 
