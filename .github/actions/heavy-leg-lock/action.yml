@@ -1,0 +1,38 @@
+name: heavy-leg-lock
+description: >-
+  Acquire a per-host slotted flock semaphore (reap-guard) governing a RAM- or
+  disk-heavy CI leg. Holds a disowned slot that auto-frees when the runner-worker
+  dies at job end; stale holders from dead jobs are reaped at acquire. Same proven
+  logic as the inline pre-checkout RAM lock in build.yml (which cannot use this
+  action because it must run before checkout).
+inputs:
+  lock-file:
+    description: Base path of the per-slot lock files.
+    default: /tmp/c2pool-heavy-leg.lock
+  holder-file:
+    description: Base path of the per-slot holder markers.
+    default: /tmp/c2pool-heavy-leg.holder
+  slots:
+    description: Number of concurrent slots on the host.
+    default: "2"
+  wait:
+    description: Max seconds to wait for a free slot before failing.
+    default: "5400"
+  ttl:
+    description: Holder ceiling in seconds (worker-death frees earlier).
+    default: "14400"
+  holder-env:
+    description: Name of the env var to export the holder pid into (for release).
+    default: HEAVY_LEG_LOCK_HOLDER
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        HEAVY_LEG_LOCK: ${{ inputs.lock-file }}
+        HEAVY_LEG_HOLDERFILE: ${{ inputs.holder-file }}
+        HEAVY_LEG_SLOTS: ${{ inputs.slots }}
+        HEAVY_LEG_WAIT: ${{ inputs.wait }}
+        HEAVY_LEG_TTL: ${{ inputs.ttl }}
+        HEAVY_LEG_HOLDER_ENV: ${{ inputs.holder-env }}
+      run: bash "$GITHUB_ACTION_PATH/acquire.sh"
