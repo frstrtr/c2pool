@@ -15,6 +15,7 @@
 #include <impl/doge/coin/header_chain.hpp>
 #include <impl/doge/coin/template_builder.hpp>
 #include <impl/doge/coin/auxpow_header.hpp>
+#include <impl/doge/coin/aux_block_assembler.hpp>
 
 using namespace doge::coin;
 
@@ -899,4 +900,137 @@ TEST(DOGEFromGenesisRetargetTest, AcceptsHeader960AndWalksPast) {
     EXPECT_TRUE(make_and_add(961)) << "header 961 must be accepted";
     EXPECT_TRUE(make_and_add(962)) << "header 962 must be accepted";
     EXPECT_EQ(chain.height(), 962u);
+}
+
+// ─── DOGE-aux SUBMIT-BLOCK ASSEMBLER — byte-exact layout KAT ─────────────────
+// Mirrors dgb's assembled-block layout verifier (bff613aca) for the DOGE-owned
+// standalone assembler (impl/doge/coin/aux_block_assembler.hpp). The golden block
+// hex below was produced by an INDEPENDENT SHA256d reference (not the assembler
+// under test) over the fixed template + auxpow, so exact equality pins the full
+// on-wire layout: header80(0x100 bit) || auxpow || varint(n_tx) || coinbase || txs.
+namespace {
+
+// Fixed template shared by the byte-exact + structural cases below.
+DogeSubmitTemplate make_kat_template() {
+    DogeSubmitTemplate t;
+    t.version      = 0x00620004u;                 // chain_id 0x0062 << 16 | 4 (AuxPoW bit added by assembler)
+    t.prev_hash.SetHex("00000000000000000000000000000000000000000000000000000000000000aa");
+    t.curtime      = 0x12345678u;
+    t.nbits        = 0x1e0ffff0u;
+    t.coinbase_hex = "0100000001abcdef00";        // opaque coinbase bytes (SHA256d'd for the merkle)
+    t.tx_data_hex  = { "aa11", "bb2222", "cc333333" };
+    t.tx_ids       = {
+        uint256S("1111111111111111111111111111111111111111111111111111111111111111"),
+        uint256S("2222222222222222222222222222222222222222222222222222222222222222"),
+        uint256S("3333333333333333333333333333333333333333333333333333333333333333"),
+    };
+    return t;
+}
+
+} // namespace
+
+// 1) BYTE-EXACT assembled DOGE submit block vs an independent SHA256d reference.
+//    The acceptance criterion: known template + auxpow_hex -> expected block hex.
+TEST(DOGEAuxBlockAssemblerTest, ByteExactAssembledBlock) {
+    const std::string auxpow = "deadbeef";
+    const std::string GOLDEN =
+        "04016200aa0000000000000000000000000000000000000000000000000000000000"
+        "00000650f4892c09e21e2aa80a64f1d1071e177a551af82f0cd67e04b29836b54e55"
+        "78563412f0ff0f1e00000000"     // curtime(LE) || bits(LE) || nonce=0
+        "deadbeef"                     // CAuxPow proof (opaque, passed through verbatim)
+        "04"                           // varint(n_tx) = 1 coinbase + 3 template txs
+        "0100000001abcdef00"           // coinbase
+        "aa11bb2222cc333333";          // template txs, in order
+
+    const std::string blk = doge::coin::assemble_doge_submit_block_hex(make_kat_template(), auxpow);
+    EXPECT_EQ(blk, GOLDEN) << "assembled DOGE submit block diverged from the byte-exact reference";
+    EXPECT_EQ(blk.size() / 2, 103u) << "block byte length changed";
+}
+
+// 2) AuxPoW version bit + region offsets. The child header's nVersion MUST carry
+//    bit 0x100, and each region must land at its contracted offset.
+TEST(DOGEAuxBlockAssemblerTest, AuxPowBitAndRegionOffsets) {
+    const std::string auxpow = "deadbeef";
+    const std::string blk = doge::coin::assemble_doge_submit_block_hex(make_kat_template(), auxpow);
+    ASSERT_GE(blk.size(), 160u);
+
+    // version is the first LE32 of the 80-byte header.
+    uint32_t ver_le = static_cast<uint32_t>(std::stoul(blk.substr(0, 8), nullptr, 16));
+    uint32_t version = ((ver_le & 0xFF) << 24) | ((ver_le & 0xFF00) << 8)
+                     | ((ver_le >> 8) & 0xFF00) | ((ver_le >> 24) & 0xFF);
+    EXPECT_EQ(version & 0x100u, 0x100u) << "AuxPoW version bit (0x100) must be set";
+    EXPECT_EQ(version, 0x00620104u)     << "chain_id | base_version | auxpow bit";
+
+    const std::string HDR = blk.substr(0, 160);           // 80 bytes
+    EXPECT_EQ(blk.substr(160, auxpow.size()), auxpow)     << "auxpow follows the 80-byte header";
+    size_t off = 160 + auxpow.size();
+    EXPECT_EQ(blk.substr(off, 2), std::string("04"))      << "varint(n_tx) follows auxpow";
+    off += 2;
+    EXPECT_EQ(blk.substr(off, 18), std::string("0100000001abcdef00")) << "coinbase follows varint";
+    off += 18;
+    EXPECT_EQ(blk.substr(off), std::string("aa11bb2222cc333333")) << "template txs are the trailing region";
+    EXPECT_EQ(off + 18, blk.size()) << "no trailing bytes beyond template txs";
+}
+
+// 3) n_tx CompactSize boundaries — the varint the assembler writes for the block
+//    tx count. Pins the encoder against the 1/253/0x10000 thresholds.
+TEST(DOGEAuxBlockAssemblerTest, TxCountVarintBoundaries) {
+    using doge::coin::detail::varint_hex;
+    EXPECT_EQ(varint_hex(1),       std::string("01"));
+    EXPECT_EQ(varint_hex(0xfc),    std::string("fc"));
+    EXPECT_EQ(varint_hex(0xfd),    std::string("fdfd00"));
+    EXPECT_EQ(varint_hex(0xffff),  std::string("fdffff"));
+    EXPECT_EQ(varint_hex(0x10000), std::string("fe00000100"));
+}
+
+// 4) Coinbase-only template (n_tx=1): merkle root == coinbase hash, varint 01.
+TEST(DOGEAuxBlockAssemblerTest, CoinbaseOnlyTemplate) {
+    DogeSubmitTemplate t = make_kat_template();
+    t.tx_data_hex.clear();
+    t.tx_ids.clear();
+    const std::string blk = doge::coin::assemble_doge_submit_block_hex(t, "deadbeef");
+    ASSERT_GE(blk.size(), 162u);
+    // header(160) || auxpow(8) || varint(01) || coinbase
+    EXPECT_EQ(blk.substr(160, 8), std::string("deadbeef"));
+    EXPECT_EQ(blk.substr(168, 2), std::string("01")) << "n_tx = 1 (coinbase only)";
+    EXPECT_EQ(blk.substr(170), std::string("0100000001abcdef00")) << "coinbase is the only body tx";
+}
+
+// 5) Unassemblable guards — a won-block submit cannot proceed without a coinbase
+//    or an AuxPoW proof; a txid/txdata length mismatch is malformed. All -> "".
+TEST(DOGEAuxBlockAssemblerTest, UnassemblableGuards) {
+    DogeSubmitTemplate t = make_kat_template();
+
+    DogeSubmitTemplate no_cb = t; no_cb.coinbase_hex.clear();
+    EXPECT_TRUE(doge::coin::assemble_doge_submit_block_hex(no_cb, "deadbeef").empty())
+        << "missing coinbase is unassemblable";
+
+    EXPECT_TRUE(doge::coin::assemble_doge_submit_block_hex(t, "").empty())
+        << "missing auxpow proof is unassemblable";
+
+    DogeSubmitTemplate bad_ids = t; bad_ids.tx_ids.pop_back();
+    EXPECT_TRUE(doge::coin::assemble_doge_submit_block_hex(bad_ids, "deadbeef").empty())
+        << "tx_ids size must equal tx_data_hex size (or be empty)";
+}
+
+// 6) Factory closure shape — make_doge_aux_block_assembler adapts a provider into
+//    the (share_hash, auxpow_hex) -> optional<block_hex> seam dgb binds.
+TEST(DOGEAuxBlockAssemblerTest, FactoryClosureShape) {
+    const uint256 win = uint256S("00000000000000000000000000000000000000000000000000000000000000ff");
+
+    // Bound provider -> assembled block for the winning share.
+    auto ok = doge::coin::make_doge_aux_block_assembler(
+        [&](const uint256&) -> std::optional<DogeSubmitTemplate> { return make_kat_template(); });
+    auto out = ok(win, "deadbeef");
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(*out, doge::coin::assemble_doge_submit_block_hex(make_kat_template(), "deadbeef"));
+
+    // Provider with no frozen template for the share -> nullopt (skip, never ban).
+    auto none = doge::coin::make_doge_aux_block_assembler(
+        [](const uint256&) -> std::optional<DogeSubmitTemplate> { return std::nullopt; });
+    EXPECT_FALSE(none(win, "deadbeef").has_value());
+
+    // Null provider -> nullopt.
+    doge::coin::AuxDogeBlockAssembler empty = doge::coin::make_doge_aux_block_assembler({});
+    EXPECT_FALSE(empty(win, "deadbeef").has_value());
 }
