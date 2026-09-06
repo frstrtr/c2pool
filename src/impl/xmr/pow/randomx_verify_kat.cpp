@@ -159,6 +159,121 @@ int run_randomx_kats(bool v2) {
 }
 
 // =====================================================================
+// (C) Real Monero mainnet block — end-to-end LIGHT verify through the
+//     production wrapper (LightVerifier). This is the X0-proven path:
+//     rx_probe.cpp measured EXACTLY this input on-host and recorded the
+//     resulting PoW hash (see test/randomx-light-measurement.txt); monerod's
+//     own rx_slow_hash consumes the identical 76-byte hashing_blob keyed by
+//     the same seed-height block id. Passing this proves the vendored library
+//     + our two-cache light verifier reproduce Monero mainnet consensus PoW.
+//
+//     Unlike suite (A)'s short ASCII keys, the RandomX key here is a real
+//     32-byte Monero block id, so we drive the FULL production surface:
+//     LightVerifier::init -> prefetch_epoch (Argon2d cache fill) ->
+//     verify (VM hash + the hash*difficulty<2^256 acceptance rule).
+//
+//     Ground truth: monerod get_block(3000000). seed_height(3000000)=2998272.
+// =====================================================================
+struct MoneroBlockVector {
+    uint64_t    height;
+    uint64_t    seed_height;
+    const char* seed_hash_hex;      // Monero block id at seed_height (RandomX key)
+    const char* hashing_blob_hex;   // the 76-byte rx_slow_hash input
+    const char* expected_pow_hex;   // RandomX PoW hash (little-endian)
+    uint64_t    difficulty;         // block's network difficulty (must be met)
+};
+
+// Monero mainnet block 3,000,000 (2023-10-20, major_version 16 / rx/0).
+const MoneroBlockVector kBlock3000000 = {
+    3000000, 2998272,
+    "3c512c1a6e8210e985b47e855eaf93af952abb61b9bd032872a376910ba7d448",
+    "1010dea6caa906cc64d29f62794dbb5309732f74447d88389198cfbf86a499bd"
+    "5b4b5347bc43ae2b8000313cc88694451e92299e5283b2c51985e5c0d31b8d91"
+    "0f53d9a8b167a24e7bdf0626",
+    "309e84a7d1175490a14cf722f8f3862b3adda4fff904a5d72175ec0100000000",
+    308739704685ULL,
+};
+
+int run_block_kat() {
+    using namespace c2pool::xmr;
+    const MoneroBlockVector& v = kBlock3000000;
+    int fails = 0;
+
+    std::vector<uint8_t> seed_bytes, blob, expect;
+    if (!hex_to_bytes(v.seed_hash_hex, seed_bytes) || seed_bytes.size() != kSeedHashSize) {
+        std::fprintf(stderr, "KAT(C): bad seed hex\n"); return 1;
+    }
+    if (!hex_to_bytes(v.hashing_blob_hex, blob) || blob.empty()) {
+        std::fprintf(stderr, "KAT(C): bad blob hex\n"); return 1;
+    }
+    if (!hex_to_bytes(v.expected_pow_hex, expect) || expect.size() != 32) {
+        std::fprintf(stderr, "KAT(C): bad expected-pow hex\n"); return 1;
+    }
+    // seed_height() must reproduce Monero's rx_seedheight for this height.
+    if (seed_height(v.height) != v.seed_height) {
+        std::printf("  [FAIL] seed_height(%llu)=%llu (want %llu)\n",
+                    (unsigned long long)v.height,
+                    (unsigned long long)seed_height(v.height),
+                    (unsigned long long)v.seed_height);
+        ++fails;
+    }
+
+    SeedHash seed{};
+    std::memcpy(seed.data(), seed_bytes.data(), kSeedHashSize);
+
+    VerifierOptions opts;              // RX_0 (V2 OFF), JIT on, light (no FULL_MEM)
+    LightVerifier lv;
+    if (!lv.init(opts)) {
+        // A W^X-restricted runner can refuse JIT pages. The hash is identical
+        // under the portable interpreter — fall back rather than flake CI.
+        std::fprintf(stderr, "KAT(C): JIT init failed; retrying with interpreter\n");
+        opts.use_jit = false;
+        // init() is safe to re-run here: it failed because randomx_create_vm
+        // returned null (vm_ stays null, nothing to leak); the two CacheSlots
+        // are move-reassigned, releasing any cache already allocated.
+        if (!lv.init(opts)) {
+            std::fprintf(stderr, "KAT(C): LightVerifier init failed (OOM?)\n");
+            return 2;
+        }
+    }
+    // Argon2d cache fill for the block's epoch (the expensive, off-hot-path step).
+    lv.prefetch_epoch(seed, std::nullopt);
+    if (!lv.seed_resident(seed)) {
+        std::fprintf(stderr, "KAT(C): seed not resident after prefetch\n");
+        return 2;
+    }
+
+    // The production hot path: VM hash + Monero acceptance rule.
+    uint8_t pow[32];
+    VerifyStatus st = lv.verify(blob.data(), blob.size(), seed, v.difficulty, pow);
+
+    std::string got = bytes_to_hex(pow, 32);
+    bool hash_ok = (got == v.expected_pow_hex);
+    std::printf("  [%s] block %llu PoW = %s\n", hash_ok ? "PASS" : "FAIL",
+                (unsigned long long)v.height, got.c_str());
+    if (!hash_ok) {
+        std::printf("         (want %s)\n", v.expected_pow_hex);
+        ++fails;
+    }
+
+    // The mined block MUST meet its own network difficulty -> Accept.
+    bool accept_ok = (st == VerifyStatus::Accept);
+    std::printf("  [%s] block %llu meets difficulty %llu -> %s\n",
+                accept_ok ? "PASS" : "FAIL", (unsigned long long)v.height,
+                (unsigned long long)v.difficulty,
+                st == VerifyStatus::Accept ? "Accept" :
+                st == VerifyStatus::BelowTarget ? "BelowTarget" :
+                st == VerifyStatus::SeedNotResident ? "SeedNotResident" : "NotInitialized");
+    if (!accept_ok) ++fails;
+
+    // Cross-check the raw arithmetic rule directly on the produced hash.
+    bool d64 = meets_difficulty_64(pow, v.difficulty);
+    if (!d64) { std::printf("  [FAIL] meets_difficulty_64 disagrees with verify()\n"); ++fails; }
+
+    return fails;
+}
+
+// =====================================================================
 // (B) Difficulty-rule + seed-height KATs — pure arithmetic (the light check).
 // =====================================================================
 struct DiffVector { const char* hash_hex; uint64_t difficulty; bool expect_accept; const char* note; };
@@ -242,6 +357,8 @@ int main(int argc, char** argv) {
             std::printf("== (A) RandomX engine KATs v2 (future fork only) ==\n");
             fails += run_randomx_kats(/*v2=*/true);
         }
+        std::printf("== (C) real Monero mainnet block 3000000 light verify ==\n");
+        fails += run_block_kat();
     } else {
         std::printf("(skipping RandomX engine KATs; pass --engine to run against librandomx.a)\n");
     }

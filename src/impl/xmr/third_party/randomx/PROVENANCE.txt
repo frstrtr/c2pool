@@ -10,29 +10,73 @@ CONSENSUS PIN (what we vendor):
   This is the EXACT commit monero-project/monero references at
   external/randomx on master (read 2026-09-05). It is the RandomX the
   running Monero mainnet ("rx/0") consensus uses. It PREDATES RandomX 2.0:
-  it defines NO RANDOMX_FLAG_V2 (verified — enum tops out at RANDOMX_FLAG_ARGON2).
-  Vendoring this exact commit gives c2pool bug-for-bug hash identity with monerod.
+  it defines NO RANDOMX_FLAG_V2 (verified — enum tops out at RANDOMX_FLAG_ARGON2
+  = 96). Vendoring this exact commit gives c2pool bug-for-bug hash identity
+  with monerod.
 
-Files in this directory, copied BYTE-IDENTICAL from that commit (no edits,
-BSD-3 header preserved verbatim on each):
+────────────────────────────────────────────────────────────────────────────
+WHAT IS VENDORED (updated in wave X8 — the full source now lands)
+────────────────────────────────────────────────────────────────────────────
 
-  randomx.h         <- src/randomx.h        sha256 ba6784194be25810f0c25d4b767907e9aa133cb3cf8ba605ce94ab593856f4c3
-  configuration.h   <- src/configuration.h  sha256 637719f77c263cab40ca306ca0326ef37d6f6eb12564c7feb5c74c0426c74051
-  LICENSE           <- LICENSE              sha256 7d85758a95990168395d0940b2a103b6be0c2eba3995f00cbb59d23a86c2214e
+Until X8 only the two compile-time API headers were vendored (the library was
+to be consumed as a package-time submodule archive). X8 vendors the ENTIRE
+upstream src/ tree so the RandomX static library builds on CI hosts WITHOUT a
+submodule init or network fetch, and so an auditor can byte-diff the consensus
+code against upstream in one command.
 
-These two headers are the ONLY upstream files needed at c2pool COMPILE time
-(the wrapper randomx_verify.hpp includes "randomx.h"). The rest of the library
-is consumed as a linked static archive (librandomx.a) built from the pinned
-submodule at package time — NOT copied into this tree.
+1) ./src/  — the COMPLETE upstream src/ tree, copied BYTE-IDENTICAL from
+   tevador/RandomX @ 12f2c2ff (no edits; every upstream BSD-3 file header
+   preserved verbatim). 106 files, including src/asm/, src/blake2/, src/tests/.
+   29 C/C++/asm translation units. This is the code librandomx.a is built from.
+
+   Re-verify (must print nothing / exit 0):
+       git clone https://github.com/tevador/RandomX rx && \
+       git -C rx checkout 12f2c2ffe2108d6cf54c391fee33c8bc3646cdab && \
+       diff -r rx/src ./src
+
+   Reproducible aggregate of the vendored src/ tree
+   (path-sorted per-file sha256, hashed):
+       6f4315da5572fbc2bc8aa33adcf2329a91948aec5d3eec63fba65e77f1668e7b
+   Reproduce with:
+       ( cd ./src && find . -type f | LC_ALL=C sort | xargs sha256sum \
+         | sha256sum )
+
+2) ./randomx.h, ./configuration.h  — the two compile-time API headers, kept at
+   this directory ROOT (unchanged since the foundation). They are BYTE-IDENTICAL
+   to ./src/randomx.h and ./src/configuration.h; they remain here because the
+   c2pool wrapper (pow/randomx_verify.hpp) and the foundation include path
+   reference them directly. Duplication is intentional and harmless — both are
+   the same bytes as upstream.
+
+       randomx.h        <- src/randomx.h        sha256 ba6784194be25810f0c25d4b767907e9aa133cb3cf8ba605ce94ab593856f4c3
+       configuration.h  <- src/configuration.h  sha256 637719f77c263cab40ca306ca0326ef37d6f6eb12564c7feb5c74c0426c74051
+
+3) ./LICENSE  — upstream LICENSE, copied verbatim.
+       LICENSE          <- LICENSE              sha256 7d85758a95990168395d0940b2a103b6be0c2eba3995f00cbb59d23a86c2214e
+
+NOT UPSTREAM (c2pool-authored, AGPL-3.0-or-later — NOT part of the byte-diff):
+  ./CMakeLists.txt  — c2pool's OWN build wiring. Builds a single static archive
+      `randomx` from ./src in LIGHT mode (256 MiB Argon2d cache only; NO
+      FULL_MEM / NO 2 GiB dataset; RANDOMX_FLAG_JIT optional with a portable
+      interpreter fallback). It contains none of upstream's CMake text — only
+      the source LIST (the TUs RandomX needs) is common, which is data, not
+      code. c2pool AGPL applies to this file; the vendored ./src stays BSD-3.
+      (Exclude ./CMakeLists.txt when byte-diffing ./ against upstream — it has
+      no upstream counterpart at this path.)
+
+LICENSE COMPATIBILITY:
+  RandomX is BSD-3-Clause; c2pool is AGPL-3.0-or-later. BSD-3 is permissively
+  portable into an AGPL work: the vendored BSD-3 files keep their headers and
+  LICENSE verbatim (above), and the combined binary is distributed under AGPL.
 
 FUTURE-FORK REFERENCE (not vendored now):
   tevador/RandomX @ 7c761cf007c758056dcb6eb438a32f780f81bdbd (post-2.0 HEAD)
   adds RANDOMX_FLAG_V2 and the v2 program constants. It is the upgrade target
-  IF/WHEN a Monero hard-fork adopts RandomX 2.0 (see VENDOR-MANIFEST.md, PowAlgo
-  RX_2). The wrapper #ifdef-guards every RANDOMX_FLAG_V2 use, so it already
-  compiles unchanged against either pin.
+  IF/WHEN a Monero hard-fork adopts RandomX 2.0 (PowAlgo RX_2). The wrapper
+  #ifdef-guards every RANDOMX_FLAG_V2 use, so it already compiles unchanged
+  against either pin.
 
-Nothing here is adapted or modified; therefore no per-file provenance comment
-is injected into the copied sources (that would break a byte-diff against
-upstream, which auditors use to confirm the vendored consensus code is
-untouched). Provenance for these verbatim copies lives in this sidecar.
+Nothing under ./src (or the root header/LICENSE copies) is adapted or modified;
+therefore no per-file provenance comment is injected into the copied sources
+(that would break the byte-diff auditors use to confirm the vendored consensus
+code is untouched). Provenance for these verbatim copies lives in this sidecar.
