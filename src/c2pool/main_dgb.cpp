@@ -2581,6 +2581,31 @@ int run_node(const core::CoinParams& params, bool testnet,
         std::cout << "[DGB] dashboard disabled (no --http flag)" << std::endl;
     }
 
+    // Periodic think/clean tick (every 5s, safety net) — mirrors the LTC/dash
+    // tick. Without it, think() fired only on share arrival: no stale-head
+    // eating, unbounded raw-tracker growth past 2*CHAIN_LENGTH+10, and a timed-
+    // out bootstrap download was never retried if all peers went silent (the
+    // first-ever drop-tails is also a memory WIN for the long-warm dgb node,
+    // task #165). clean_tracker() runs think() inline then prunes on the compute
+    // thread under the exclusive lock. p2p_node is a by-value local that outlives
+    // ioc.run(), captured by reference.
+    auto dgb_think_timer = std::make_shared<io::steady_timer>(ioc);
+    std::function<void(boost::system::error_code)> dgb_think_tick;
+    dgb_think_tick = [&, dgb_think_timer](boost::system::error_code ec) {
+        if (ec || shutdown_initiated) return;
+        dgb_think_timer->expires_after(std::chrono::seconds(5));
+        dgb_think_timer->async_wait(dgb_think_tick);
+        try {
+            p2p_node.clean_tracker();
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what();
+        } catch (...) {
+            LOG_ERROR << "[CLEAN-TRACKER] unknown error";
+        }
+    };
+    dgb_think_timer->expires_after(std::chrono::seconds(5));
+    dgb_think_timer->async_wait(dgb_think_tick);
+
     std::cout << "[DGB] run-loop up: " << network_summary(params) << "\n";
     std::cout << "[DGB] io_context running. Ctrl-C to stop." << std::endl;
 

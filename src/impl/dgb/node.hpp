@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <random>
@@ -695,6 +696,20 @@ protected:
 
     // Cached best share hash from the most recent think() cycle
     uint256 m_best_share_hash;
+
+    // ── Restart-reorg supersede hint (see share_tracker.hpp SupersedeHint) ──
+    // From the last think()/clean cycle; used by clean_tracker() to exempt the
+    // converging challenger segment from GC. Inactive on a healthy node.
+    dgb::SupersedeHint m_supersede_hint;
+    // Supersede-convergence liveness: detect zero forward progress over
+    // SUPERSEDE_STALL_LIMIT cycles and denylist an unconvergeable challenger
+    // segment for SUPERSEDE_DENYLIST_TTL (breaks the elevated-verify treadmill).
+    struct SupersedeProgress { int32_t last_acc_height{-1}; int stall_cycles{0}; };
+    std::map<uint256, SupersedeProgress> m_supersede_progress;
+    std::map<uint256, std::chrono::steady_clock::time_point> m_supersede_denylist;
+    static constexpr int SUPERSEDE_STALL_LIMIT = 20;
+    static constexpr std::chrono::minutes SUPERSEDE_DENYLIST_TTL{60};
+    dgb::SupersedeHint gate_supersede_convergence(dgb::SupersedeHint hint);
 
     // ROOT-2: fire exactly one delayed re-advert when the verified chain first
     // transitions from empty to non-empty (peers that handshook during the
