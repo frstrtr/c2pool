@@ -24,6 +24,20 @@ if (BUILD_TESTING)
     target_compile_features(v37_descriptor_xmr_test PRIVATE cxx_std_20)
     add_test(NAME v37_descriptor_xmr_test COMMAND v37_descriptor_xmr_test)
 
+    # P-1 canon-activation KAT: proves the ratified PayoutDescriptor canon
+    # (v37_descriptor.hpp) RECOGNIZES the reserved XMR kinds 0x10/0x11 — its own
+    # valid() dispatches an XMR-carrying descriptor to the isolated XMR validator
+    # instead of rejecting it as unknown. ADD-ONLY: a fixed non-XMR corpus is
+    # fingerprinted and asserted BYTE-IDENTICAL to a golden derived from the
+    # PRISTINE master canon header (the same file compiled -DV37_P1_NONXMR_ONLY),
+    # so any perturbation of a non-XMR validity/digest REDs. Installs a TEST
+    # point-check stub + the canon validator hook; SHA-256-only, no crypto
+    # backend. Same stdlib-only harness.
+    add_executable(v37_xmr_canon_p1_kat v37_xmr_canon_p1_kat.cpp)
+    target_include_directories(v37_xmr_canon_p1_kat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_compile_features(v37_xmr_canon_p1_kat PRIVATE cxx_std_20)
+    add_test(NAME v37_xmr_canon_p1_kat COMMAND v37_xmr_canon_p1_kat)
+
     # X3 (W2) torsion / prime-order KAT for the finalized descriptor point check.
     # Compiles the ref10 backend (v37_descriptor_xmr_point_check_ref10.cpp) under
     # -DV37_XMR_HAVE_MONERO_CRYPTO against the X1-vendored Monero crypto-ops (BSD-3,

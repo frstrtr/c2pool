@@ -90,6 +90,65 @@ struct AuxEntry {
     ScriptRef ref;
 };
 
+// ===========================================================================
+// P-1 — XMR (Family B) payout-kind activation dispatch  (ADD-ONLY)
+//
+// The ratified canon (kinds 0..4 + RAW=255) rejects every other kind byte as
+// unknown (see ref_well_formed's trailing `return false`). Two kind bytes are
+// reserved by the isolated extension header v37_descriptor_xmr.hpp for Monero
+// payout targets:
+//
+//     XMR_STD = 0x10   payload = spend_pub B (32) || view_pub A (32)  = 64 B
+//     XMR_SUB = 0x11   payload = sub-spend D_i (32) || main-view A (32) = 64 B
+//
+// whose validity is NOT a script-width check but an ed25519 structural + prime-
+// order (torsion) check (xmr_ref_valid / xmr_descriptor_valid). P-1 wires the
+// canon to RECOGNIZE these two kinds: PayoutDescriptor::valid() delegates a
+// descriptor that carries an XMR kind to the installed XMR validator instead of
+// rejecting it as unknown.
+//
+// WHY A REGISTRATION HOOK (not a direct call / #include): v37_descriptor_xmr.hpp
+// #includes THIS canon header, so the canon cannot #include it back (circular).
+// The seam is therefore a function-pointer hook — the exact pattern the XMR
+// header already uses for its ed25519 point-check backend. The concrete
+// validator (xmr::xmr_descriptor_valid) is installed alongside the torsion
+// backend (v37_descriptor_xmr_point_check_ref10.cpp) or, in tests, directly.
+//
+// ADD-ONLY INVARIANT (the whole point of P-1): a descriptor that carries NO XMR
+// kind never enters the dispatch branch, so its validity AND every consensus
+// digest (identity_key / canonical_bytes — both left completely untouched) are
+// BYTE-IDENTICAL to the pre-P-1 canon. No existing kind's behavior changes; the
+// two kind-byte values are unchanged; there is no collision (0x10/0x11 were
+// previously unknown-and-rejected). FAIL-CLOSED: with no validator installed an
+// XMR descriptor is rejected exactly as the unknown kind byte was before P-1.
+// ===========================================================================
+
+struct PayoutDescriptor;  // forward decl for the dispatch-hook signature
+
+// The two reserved XMR kind bytes (consensus reservation; mirrors
+// v37_descriptor_xmr.hpp XMR_STD/XMR_SUB and is_xmr_kind()). Naming them here is
+// only the DISPATCH decision — the actual XMR validity logic is never
+// reimplemented in the canon; it stays entirely in the extension header and is
+// reached solely through the hook below.
+inline bool is_xmr_dispatch_kind(ScriptKind k) {
+    const auto b = static_cast<std::uint8_t>(k);
+    return b == 0x10 || b == 0x11;
+}
+
+// Whole-descriptor XMR validator hook. Installed by the XMR extension via
+// set_xmr_descriptor_validator(&v37::xmr::xmr_descriptor_valid). Fail-closed
+// default (nullptr) => XMR-carrying descriptors are rejected, identical to the
+// pre-P-1 unknown-kind rejection.
+using xmr_descriptor_validator_fn =
+    bool (*)(const PayoutDescriptor& d, bool allow_attribution);
+inline xmr_descriptor_validator_fn& xmr_descriptor_validator() {
+    static xmr_descriptor_validator_fn fn = nullptr;  // fail-closed
+    return fn;
+}
+inline void set_xmr_descriptor_validator(xmr_descriptor_validator_fn fn) {
+    xmr_descriptor_validator() = fn;
+}
+
 struct PayoutDescriptor {
     static constexpr std::uint8_t VERSION = 1;
 
@@ -103,6 +162,26 @@ struct PayoutDescriptor {
     // Validity per the ratified canon. allow_attribution stays false for the
     // whole of V37.0; flipping it is the V37.x validity-rule change.
     bool valid(bool allow_attribution = false) const {
+        // --- P-1 XMR (Family B) activation dispatch (ADD-ONLY; see the block
+        // above AuxEntry). If THIS descriptor carries a reserved XMR kind
+        // (0x10/0x11) in pay, attribution, or any aux ref, hand the whole
+        // validity decision to the installed XMR validator. A descriptor with
+        // NO XMR kind skips this branch entirely and takes the byte-identical
+        // pre-P-1 path below. Fail-closed when no validator is installed.
+        {
+            bool has_xmr = is_xmr_dispatch_kind(pay.kind);
+            if (!has_xmr && attribution.has_value())
+                has_xmr = is_xmr_dispatch_kind(attribution->kind);
+            if (!has_xmr)
+                for (const auto& e : aux)
+                    if (is_xmr_dispatch_kind(e.ref.kind)) { has_xmr = true; break; }
+            if (has_xmr) {
+                auto fn = xmr_descriptor_validator();
+                return fn != nullptr && fn(*this, allow_attribution);
+            }
+        }
+        // --- unchanged canon below: byte-identical to master for any
+        //     descriptor that carries no XMR kind ---------------------------
         if (attribution.has_value() && !allow_attribution) return false;
         if (attribution.has_value() && !ref_well_formed(*attribution))
             return false;
