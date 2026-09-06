@@ -19,6 +19,23 @@ development-fee split. Independence from dashd is not yet complete; the
 Supported-chains matrix marks DASH in development. The remaining work is the
 daemonless-finalize item below.
 
+## Governance
+
+Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
+The c2pool-daemonless-finalize proposal is in its voting phase; masternode
+operators can vote on it before the next superblock.
+
+- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-finalize
+- Governance object: fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631
+- Vote from a masternode:
+
+  ```
+  dash-cli gobject vote-many fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631 funding yes
+  ```
+
+Funding requires net yes votes equal to 10 percent of enabled masternodes by the
+next superblock.
+
 ## Daemonless BIP-110
 
 c2pool-bip110 follows the BLAKE2b hard-fork chain over coin P2P with no bitcoind
@@ -53,23 +70,6 @@ and `bip110.voidbind.com`.
 
 Mining (experimental, live): point a BLAKE2b (Sia-algorithm) miner at `stratum+tcp://bip110.voidbind.com:9336` with username `<BIP-110-address>.<worker>` and any password. Daemonless standalone node on the BLAKE2b fork; block reward is effectively zero today (coin unlisted) — a decentralized-pool proof, not a revenue venue.
 
-## Governance
-
-Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
-The c2pool-daemonless-finalize proposal is in its voting phase; masternode
-operators can vote on it before the next superblock.
-
-- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-finalize
-- Governance object: fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631
-- Vote from a masternode:
-
-  ```
-  dash-cli gobject vote-many fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631 funding yes
-  ```
-
-Funding requires net yes votes equal to 10 percent of enabled masternodes by the
-next superblock.
-
 ## Supported chains
 
 c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents also merge-mine **AuxPoW child chains** in the same coinbase.
@@ -99,17 +99,44 @@ and does not yet exist, so the work can be judged on what it actually is.
 - A **formally specified** settlement/lanes core: TLA⁺ specs, model-checked with
   TLC (green over the bounded configurations checked in). This is a proof over a
   *model*, not evidence at scale.
+- **A v37 engine consumer tree implemented in C++** under `src/c2pool/v37/` — the
+  Work Receipts / Roundabout settlement pipeline as a **reference/prototype engine
+  behind CI, not a production node.** Merged behind CI: the W1 O1 executor and W2
+  receipt ingestion (admission-first, carrier-position credit — PR #1483), the W4
+  prerequisites (identity view + read-at-version ring — PR #1485), W4 per-lane
+  settlement (OWED-ledger fold + O2 cut + O5.5 — PR #1486), W5 coinbase assembly
+  (oldest-owed-first K_fair + h_min carry + §13 root — PR #1487), and W3 carrier
+  relay over the v36 p2p (wire extension + R_MAX — PR #1484). W6 persistence /
+  restart-recovery is a **reviewed draft, not landed** (PR #1506).
+- An isolated **"Family B: XMR lane"** (Monero / RandomX) under `src/impl/xmr/`,
+  which does **not** touch the v37 consensus digest. Merged: the lane foundation
+  (scaffold + vendored RandomX + X0 — PR #1500), buildable KAT-tested primitives
+  (RandomX CI-gated — PR #1502), the monerod adapter + descriptor-finalize + receipt
+  envelope (PR #1503), and stratum + FCMP-fenced coinbase-settlement + carrier wire
+  (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **in progress
+  (draft, not merged)**; a live stagenet run is **not started**.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
-  feasibility harness, testbeds) and the v37 spec/headers under
+  feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
 - The production multi-coin pool code (v36 line) that c2pool actually runs.
 
 ### What does NOT yet exist — the honest gaps
+- **Not wired into a live node.** The v37 engine exists as a **reference/prototype
+  behind CI**; it is **not** connected to a live production node lifecycle for
+  settlement. The F1 finalize-driver obligation is **dormant** — no production
+  finalize caller is wired — so nothing settles on a live network today.
+- **No public v37 testnet.** There is no running v37 network; the engine and lanes
+  exercise **simnet / loopback only**. The runnable v37 artifacts are the engine
+  tree and the prototypes above.
 - **No performance benchmark.** The only performance artifact is a Python
   *feasibility* harness (M4). There is **no benchmark of the real engine**;
   throughput, latency, and scaling claims are **unproven** until one exists.
-- **No live v37 testnet.** There is no running v37 network. The runnable v37
-  artifacts are the prototypes above.
+- **XMR lane is pre-stagenet.** Its RandomX verify runs **CI-gated in light mode**;
+  there is no run against a live `monerod`-stagenet + real miner yet, and the XMR
+  PayoutDescriptor kind-bytes are staged/reserved pending a canon ruling, not
+  activated.
+- **No token, no production deployments.** There is no v37 token, and nothing v37 is
+  deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
   it does **not** substitute for a benchmark or a live network.
 
@@ -148,9 +175,12 @@ and does not yet exist, so the work can be judged on what it actually is.
   be run in production.
 
 ### CI / repo state
-- The v37 research line is merged to `master` (PR #809, "V37 dev"). **Current master
-  CI is green across the required per-coin gates and the coin matrix** (DASH / LTC /
-  BCH / DGB / DOGE); the CodeQL security scan is a non-gating job.
+- The v37 research line is merged to `master` (PR #809, "V37 dev"), and the v37
+  engine consumer tree (`src/c2pool/v37/`, W1–W5) and the isolated XMR Family-B lane
+  (`src/impl/xmr/`) now build behind CI on both build legs. **Current master CI is
+  green across the required per-coin gates and the coin matrix** (DASH / LTC / BCH /
+  DGB / DOGE); the RandomX-dependent XMR checks run CI-gated in light mode, and the
+  CodeQL security scan is a non-gating job.
 
 ### Provenance
 c2pool builds on ideas from p2pool but is an **independent codebase**. No outside
