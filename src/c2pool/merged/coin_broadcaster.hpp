@@ -17,6 +17,7 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <cassert>
 #include <functional>
 
 namespace c2pool {
@@ -453,8 +454,26 @@ private:
             }
 
             LOG_INFO << "[" << m_symbol << "] Connecting to P2P peer: " << key;
-            auto peer = std::make_unique<BroadcastPeer>(
+            // shared_ptr-owned so the fan-out slot's node_p2p (a by-value
+            // core::INetwork subobject) can register an ALIASING strong ref via
+            // set_lifetime BEFORE connect (see below). A unique_ptr slot leaves the
+            // core dial guard a no-op -> a resolve/connect completion queued on the
+            // ioc can run make_socket()'s dynamic_cast on a freed peer when this
+            // slot is erased mid-dial (the #759-class dial-teardown UAF).
+            auto peer = std::make_shared<BroadcastPeer>(
                 &m_ioc, key, m_prefix, addr, m_symbol);
+
+            // Arm the dial-lifetime guard on the fan-out slot's NodeP2P. node_p2p
+            // is a value subobject of BroadcastPeer, so build an ALIASING shared_ptr
+            // that shares `peer`'s control block but points at the node subobject:
+            // locking it (as core::Client's async handler does) pins the WHOLE
+            // BroadcastPeer alive, so an erase of this slot during a pending dial
+            // drops only the owner -- the in-flight completion keeps it live until
+            // make_socket runs on a valid vtable, then frees cleanly.
+            std::shared_ptr<core::INetwork> slot_life(peer, &peer->node_p2p);
+            peer->node_p2p.set_lifetime(slot_life);
+            assert(peer->node_p2p.lifetime_armed()
+                   && "merged coin-P2P fan-out slot dial lifetime failed to arm");
 
             // Wire addr callback for peer discovery (disabled on isolated networks)
             bool should_discover = m_peer_manager.discovery_enabled();
@@ -609,7 +628,7 @@ private:
     boost::asio::steady_timer m_maintenance_timer;
 
     mutable std::mutex m_mutex;
-    std::map<std::string, std::unique_ptr<BroadcastPeer>> m_peers;
+    std::map<std::string, std::shared_ptr<BroadcastPeer>> m_peers;
     bool m_running{true};
 
     BlockCallback        m_on_new_block;

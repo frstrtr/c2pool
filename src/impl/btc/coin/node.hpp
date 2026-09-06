@@ -2,6 +2,7 @@
 #pragma once
 
 #include <memory>
+#include <cassert>      // dial-lifetime arm assert (UAF guard)
 #include <limits>       // std::numeric_limits (found-block RPC-fallback sentinel)
 
 #include <boost/asio.hpp>
@@ -30,12 +31,20 @@ class Node : public btc::interfaces::Node
     config_t* m_config;
 
     std::unique_ptr<NodeRPC> m_rpc;
-    std::unique_ptr<NodeP2P<config_t>> m_p2p;
+    // shared_ptr-owned so core::Client can pin it with a strong ref for the dial
+    // duration (set_lifetime below). A unique_ptr node leaves the core dial guard
+    // a silent no-op -> make_socket()'s dynamic_cast can run on a freed NodeP2P on
+    // a start_p2p() redial / teardown race (the #759-class dial-teardown UAF).
+    std::shared_ptr<NodeP2P<config_t>> m_p2p;
     bool m_request_mempool_on_connect{false};  // BIP 35 pull on (re)connect
 
     void init_p2p()
     {
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
+        // Register the OWNING control block with core::Client BEFORE connect so a
+        // pending resolve/connect completion captures a strong ref by value.
+        m_p2p->set_lifetime(m_p2p);
+        assert(m_p2p->lifetime_armed() && "coin-P2P dial lifetime failed to arm");
         m_p2p->connect(m_config->coin()->m_p2p.address);
     }
 
@@ -81,7 +90,13 @@ public:
     /// Call after run() when P2P address is configured.
     void start_p2p(const NetService& addr)
     {
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        // Reassigning m_p2p frees the PRIOR NodeP2P. If a resolve/connect on the
+        // old node is still in flight, core::Client's handler holds a strong ref
+        // (from set_lifetime) so the old node stays alive until the completion
+        // runs -- no freed-vtable dynamic_cast in make_socket. Arm the NEW node too.
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p->set_lifetime(m_p2p);
+        assert(m_p2p->lifetime_armed() && "coin-P2P dial lifetime failed to arm");
         if (m_request_mempool_on_connect)
             m_p2p->enable_mempool_request();
         m_p2p->connect(addr);

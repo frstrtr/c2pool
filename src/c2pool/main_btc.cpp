@@ -4,6 +4,7 @@
 // manual compile without the generated include dir still builds; existing
 // C2POOL_VERSION #ifdef guards and per-main "dev" fallbacks then apply.
 #if __has_include(<c2pool_build_version.h>)
+#include <cassert>
 #include <c2pool_build_version.h>
 #endif
 // c2pool-btc — Bitcoin embedded SPV p2pool node.
@@ -1620,7 +1621,14 @@ int main(int argc, char* argv[])
         break;
     }
 
-    auto p2p_node = std::make_unique<btc::Node>(&ioc, &config);
+    // shared_ptr-owned + set_lifetime so the sharechain node's core::Server(accept)
+    // and core::Client(dial) both pin it with a strong ref for each async op -- a
+    // resolve/connect/accept completion can never run make_socket()'s dynamic_cast
+    // on a freed node (the #759-class dial/accept-teardown UAF). Legacy stack/
+    // unique_ptr ownership left the core guard a silent no-op.
+    auto p2p_node = std::make_shared<btc::Node>(&ioc, &config);
+    p2p_node->set_lifetime(p2p_node);
+    assert(p2p_node->lifetime_armed() && "BTC sharechain node dial/accept lifetime failed to arm");
     p2p_node->set_target_outbound_peers(
         sharechain_addnodes.empty()
             ? 4
