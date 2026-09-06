@@ -693,6 +693,18 @@ public:
         return fwd;                                        // fwd[0] == lane_genesis
     }
 
+    // A real, FINITE backward-walk ceiling. Every lane share contributes at
+    // least one lane position (its carrier push), so the durable tip's absolute
+    // position `tip_next_pos` is an upper bound on the number of shares from
+    // lane genesis to tip. Passing it (+1 boundary slack) caps a runaway
+    // prev_hash walk at the lane's true length on a corrupt / forked chain,
+    // instead of relying on the sharechain reader to self-terminate at genesis.
+    // A caller may still pass an explicit walk_max (>0) to override; walk_max==0
+    // means "derive the ceiling from the tip record".
+    static u64 walk_ceiling(u64 walk_max, u64 tip_next_pos) {
+        return walk_max ? walk_max : (tip_next_pos + 1);
+    }
+
     // Decode one carrier into its fixed W2 §4.2 push order (carrier first, then
     // accepted receipts in embedded order). Descriptors from the stored share
     // bytes; w_raw / accepted_mask / flags from the pinned C3 record (§4.3 —
@@ -723,13 +735,14 @@ public:
     // Returns the reached (digest, next_pos, carriers), or nullopt on any
     // fail-closed condition. The caller checks the digest against digest_after.
     struct RebuildOut { bytes32 digest{}; u64 next_pos = 0; u64 carriers = 0; };
-    std::optional<RebuildOut> rebuild(ChainId c, IEngineSeam& engine, u64 walk_max = ~u64(0)) {
+    std::optional<RebuildOut> rebuild(ChainId c, IEngineSeam& engine, u64 walk_max = 0) {
         auto gv = m_store.get(keys::genesis(c));
         auto tv = m_store.get(keys::tip(c));
         if (!gv || !tv) return std::nullopt;
         auto g = decode_genesis(*gv); auto t = decode_tip(*tv);
         if (!g || !t) return std::nullopt;
-        auto fwd = walk_lane_forward(t->share_hash, g->first_share_hash, walk_max);
+        auto fwd = walk_lane_forward(t->share_hash, g->first_share_hash,
+                                     walk_ceiling(walk_max, t->next_pos));
         if (!fwd) return std::nullopt;                     // F4: never reached genesis
 
         engine.submit(LaneRecord::RemoveLane(c));          // fresh incarnation (§5.3)
@@ -750,13 +763,14 @@ public:
     // Emit the full canonical [AddLane, pushes...] stream — the input the
     // PrefixResolver replays into a scratch engine. Touches no engine.
     std::optional<std::vector<LaneRecord>>
-    canonical_records(ChainId c, u64 walk_max = ~u64(0)) {
+    canonical_records(ChainId c, u64 walk_max = 0) {
         auto gv = m_store.get(keys::genesis(c));
         auto tv = m_store.get(keys::tip(c));
         if (!gv || !tv) return std::nullopt;
         auto g = decode_genesis(*gv); auto t = decode_tip(*tv);
         if (!g || !t) return std::nullopt;
-        auto fwd = walk_lane_forward(t->share_hash, g->first_share_hash, walk_max);
+        auto fwd = walk_lane_forward(t->share_hash, g->first_share_hash,
+                                     walk_ceiling(walk_max, t->next_pos));
         if (!fwd) return std::nullopt;
         std::vector<LaneRecord> rs;
         rs.push_back(LaneRecord::AddLane(c, g->params));

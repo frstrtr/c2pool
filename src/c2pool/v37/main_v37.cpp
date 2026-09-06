@@ -47,15 +47,25 @@
 #include <sharechain/v37/v37_roundabout.hpp>
 
 // ── W6 (Track A2 / persistence) wiring, ADD-ONLY and compile-guarded ────────
-// The W0 simnet scaffold links Threads only (a deliberate minimal link graph on
-// a memory-pressured host — see the NETWORKING NOTE above); it carries no
-// settlement events. The W6 settlement store, restart recovery and
-// SettlementJournal wiring below is therefore gated behind W6_ENABLE_LEVELDB,
-// which a PRODUCTION node target (one that links core + leveldb) defines. The
-// header's LevelDBSettleStore is the only thing that pulls <core/leveldb_store.hpp>
-// (spec §7.1), so leaving W6_ENABLE_LEVELDB undefined keeps this scaffold
-// leveldb-free while the wiring stays present, reviewed, and CI-compiled on the
-// production leg. (Binding the ReplayDriver to the live V37Engine is OI-W6-3.)
+// The W0 simnet scaffold (this file's c2pool-v37 target) links Threads only (a
+// deliberate minimal link graph on a memory-pressured host — see the NETWORKING
+// NOTE above); it carries no settlement events, so it does NOT define
+// W6_ENABLE_LEVELDB and stays leveldb-free. The W6 settlement store, restart
+// recovery and SettlementJournal lifecycle below (store open BEFORE
+// engine.start(), RecoveryDriver::recover(), close AFTER engine.stop()) is
+// therefore gated behind W6_ENABLE_LEVELDB, which a production node target (one
+// that links core + leveldb) defines. The header's LevelDBSettleStore is the
+// only thing that pulls <core/leveldb_store.hpp> (spec §7.1).
+//
+// The gated code below is NOT dead and is NOT unchecked: a dedicated
+// compile-only CI target, c2pool-v37-w6-leveldb-compile-check (an OBJECT library
+// in src/c2pool/CMakeLists.txt), recompiles THIS translation unit with
+// W6_ENABLE_LEVELDB defined and inherits core's include dirs, so both the header
+// binding (LevelDBOptions' 9-field positional aggregate + create_batch()'s
+// guaranteed-elided prvalue) and this lifecycle wiring are type-checked against
+// src/core on every CI run. It is build-only (compiled, never linked or run) and
+// is listed in build.yml's --target list on both legs so it cannot silently
+// go NOT_BUILT. (Binding the ReplayDriver to the live V37Engine is OI-W6-3.)
 #if defined(W6_ENABLE_LEVELDB)
 #include <optional>
 #include <core/filesystem.hpp>

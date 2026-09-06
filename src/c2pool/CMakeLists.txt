@@ -811,6 +811,28 @@ c2pool_wire_version(c2pool-v37)
 target_include_directories(c2pool-v37 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(c2pool-v37 Threads::Threads)
 
+# ── Track A2 / W6: compile-only type-check of the LevelDB-backed persistence ──
+# HONESTY GUARD (bch-embedded #1506 review). The W6 persistence binding
+# (LevelDBSettleStore in c2pool/v37/w6_persistence.hpp) and the main_v37.cpp W6
+# lifecycle (store open -> RecoveryDriver::recover -> close) sit behind
+# W6_ENABLE_LEVELDB, which the leveldb-free c2pool-v37 simnet scaffold above does
+# NOT define. Left at that, the binding + wiring would compile on NO target in
+# the tree -- proven only through the in-memory FaultSettleStore double, never
+# against core. This target recompiles THAT SAME main_v37.cpp translation unit
+# with W6_ENABLE_LEVELDB defined; linking core (PRIVATE, usage-requirements only)
+# inherits the leveldb + Boost include dirs, so LevelDBOptions' 9-field
+# positional aggregate and create_batch()'s guaranteed-elided prvalue are
+# type-checked against src/core. COMPILE-ONLY by design -- an OBJECT library:
+# its source is compiled (which is the whole point), nothing is linked or run.
+# It is listed in build.yml's --target list on BOTH legs so CI actually compiles
+# it; a c2pool/ target (not under */test/) it is outside the drift-guard glob,
+# and being build-only it registers no CTest.
+add_library(c2pool-v37-w6-leveldb-compile-check OBJECT v37/main_v37.cpp)
+target_compile_features(c2pool-v37-w6-leveldb-compile-check PRIVATE cxx_std_20)
+target_compile_definitions(c2pool-v37-w6-leveldb-compile-check PRIVATE W6_ENABLE_LEVELDB)
+target_include_directories(c2pool-v37-w6-leveldb-compile-check PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(c2pool-v37-w6-leveldb-compile-check PRIVATE core Threads::Threads)
+
 # W0 HAND-WIRES its consumer-side test dir explicitly. Test wiring in this repo
 # is hand-listed add_subdirectory/add_test — there is no file(GLOB) over
 # */test — and the test-floor-guard only floors lanes already present in
