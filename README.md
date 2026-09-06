@@ -935,7 +935,7 @@ a settings file that sets `network.testnet` is refused. The DGB parser has no
 | `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm. |
 | `--merged SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]]` (repeatable) | — | Embedded DOGE aux backend (`-DAUX_DOGE` build; DOGE chain_id 98, P2P 22556). |
 | `--doge-p2p-address HOST`, `--doge-p2p-port PORT`, `--embedded-doge` | — | DOGE peer overrides; `--embedded-doge` forces the embedded path. |
-| `--embedded-serve-mempool-txs[=true\|=false]` | posture default | Arm / opt out of the embedded UTXO fee-proof lane. CLI wins over the settings file. |
+| `--embedded-serve-mempool-txs[=true\|=false]` | posture default | Arm / opt out of the embedded UTXO fee-proof lane. On DGB this makes the **advisory GBT** template fee-bearing only — the mined block stays coinbase-only (subsidy-only) until the S2 job-commit lands, so it is reward-neutral. CLI wins over the settings file. |
 
 ### c2pool-bch — Bitcoin Cash (SHA256d)
 

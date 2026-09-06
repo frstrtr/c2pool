@@ -1087,7 +1087,8 @@ int run_node(const core::CoinParams& params, bool testnet,
                     return;  // not the confirmed header tip -> fail-closed drop.
 
                 const uint32_t height  = *tip_h;
-                const uint32_t best_h  = dgb_utxo_ptr->get_best_height();
+                const uint32_t best_h   = dgb_utxo_ptr->get_best_height();
+                const uint256  best_blk = dgb_utxo_ptr->get_best_block();
                 // Classify the confirmed-tip block against the persisted view
                 // (pure SSOT, utxo_accrual.hpp). RESTART-LIVENESS: best_h is read
                 // back from the view's LevelDB, so after a restart the header
@@ -1095,11 +1096,26 @@ int run_node(const core::CoinParams& params, bool testnet,
                 // returned on that forward gap forever and the fee-proof lane
                 // was silently DEAD for the rest of the process. Re-anchor
                 // instead so accrual resumes.
-                switch (dgb::coin::classify_full_block_accrual(best_h, height)) {
+                //
+                // PREV-HASH CONTINUITY (same-height-reorg guard): on a normal
+                // +1 extend the classifier additionally requires THIS block's
+                // parent (m_previous_block) to be the block the view currently
+                // sits on (best_blk). A reorg can swap the block at best_h for a
+                // sibling and advance one, so the height still lines up (+1) but
+                // the parent does not -- folding it would connect a STALE UTXO
+                // set (re-spent outputs look unspent -> an overstated fee). That
+                // case is TIGHTENED Connect->Drop: fail-closed, view holds,
+                // coinbase-only, never a wrong fee. First anchor / re-anchor
+                // carry no parent to match and are unaffected.
+                switch (dgb::coin::classify_full_block_accrual_continuous(
+                            best_h, height, best_blk, block.m_previous_block)) {
                     case dgb::coin::FullBlockAccrualAction::Connect:
                         break;  // first anchor or normal +1 extend -> connect.
                     case dgb::coin::FullBlockAccrualAction::Drop:
-                        return; // reorg / height <= view -> fail-closed hold.
+                        // reorg / height <= view, OR a +1 extend whose parent is
+                        // not the view's best_block (same-height reorg) ->
+                        // fail-closed hold, view stays coinbase-only.
+                        return;
                     case dgb::coin::FullBlockAccrualAction::ReAnchorThenConnect:
                         // Forward tip-gap (e.g. restart): wipe the stale view
                         // (coins from before the gap may have been spent

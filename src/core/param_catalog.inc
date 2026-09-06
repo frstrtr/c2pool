@@ -490,7 +490,7 @@ C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", 
 C2P_PARAM("embedded.govsync", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "observe-only governance store")
   C2P_ALIAS("embedded.govsync", BIN_DASH, "--embedded-govsync", FLAG)
 
-C2P_PARAM("embedded.serve_mempool_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110|C_DGB, NONE, "", NONE, "fee-carrying templates (daemonless default ON)")
+C2P_PARAM("embedded.serve_mempool_txs", Embedded, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110|C_DGB, NONE, "", NONE, "fee-carrying GBT templates (daemonless default ON; on DGB this arms the advisory-GBT fee-proof lane only -- the mined block stays coinbase-only until the S2 job-commit lands)")
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DASH, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_DGB, "--embedded-serve-mempool-txs", FLAG_OPT_EQFALSE)
   C2P_ALIAS("embedded.serve_mempool_txs", BIN_BIP110, "--serve-mempool-txs", FLAG)

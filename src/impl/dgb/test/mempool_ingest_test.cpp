@@ -377,3 +377,76 @@ TEST(GoodCitizenDefaults, S1DefaultArmsUtxoButNotServe)
     EXPECT_TRUE(p.arm_embedded_utxo);        // fee-proof lane serves by default
     EXPECT_FALSE(p.arm_serve_mempool_txs);   // S2 job-commit stays opt-out
 }
+
+// ===========================================================================
+// full_block PREV-HASH CONTINUITY (utxo_accrual.hpp
+// classify_full_block_accrual_continuous). The height-only classifier says
+// Connect on ANY +1 extend; a same-height reorg swaps the block at best_height
+// for a sibling and advances one, so the height still lines up (+1) but the
+// tip's PARENT is the sibling, not the block the view sits on. Folding it would
+// connect a STALE UTXO set (re-spent outputs still look unspent -> an
+// overstated fee). These pin the guard: on a +1 extend the parent MUST match
+// the view's best_block, else the Connect is tightened to a fail-closed Drop.
+// The first anchor and a forward gap carry no parent to match and are
+// unaffected. The guard only ever TIGHTENS; it never turns Drop/ReAnchor into
+// Connect.
+// ===========================================================================
+
+using dgb::coin::classify_full_block_accrual_continuous;
+
+namespace {
+// Distinct non-null block-id hashes for the continuity KATs.
+uint256 hash_of(const char* hex64) { uint256 h; h.SetHex(hex64); return h; }
+const uint256 kBlkA = hash_of("00000000000000000000000000000000000000000000000000000000000000aa");
+const uint256 kBlkB = hash_of("00000000000000000000000000000000000000000000000000000000000000bb");
+} // namespace
+
+// 10g. Continuous +1 extend: the incoming tip's parent IS the view's
+//      best_block -> Connect (the normal, honest extend).
+TEST(FullBlockContinuity, MatchingParentExtendConnects)
+{
+    EXPECT_EQ(classify_full_block_accrual_continuous(
+                  /*best=*/100, /*incoming=*/101,
+                  /*view_best_block=*/kBlkA, /*incoming_prev=*/kBlkA),
+              FullBlockAccrualAction::Connect);
+}
+
+// 10h. THE HOLE: a +1 extend whose parent is NOT the view's best_block is a
+//      same-height reorg. The height-only classifier still says Connect (it
+//      cannot see the parent); the continuity classifier TIGHTENS it to Drop.
+TEST(FullBlockContinuity, MismatchedParentExtendDrops)
+{
+    // Documents the gap the height-only view has: same inputs, it says Connect.
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/101),
+              FullBlockAccrualAction::Connect);
+    // The continuity guard fail-closes it (stale-UTXO fold prevented).
+    EXPECT_EQ(classify_full_block_accrual_continuous(
+                  /*best=*/100, /*incoming=*/101,
+                  /*view_best_block=*/kBlkA, /*incoming_prev=*/kBlkB),
+              FullBlockAccrualAction::Drop);
+}
+
+// 10i. First anchor (best_height == 0): there is no parent to match, so the
+//      parent hash is irrelevant and the block connects regardless.
+TEST(FullBlockContinuity, FirstAnchorIgnoresParent)
+{
+    EXPECT_EQ(classify_full_block_accrual_continuous(
+                  /*best=*/0, /*incoming=*/900'000,
+                  /*view_best_block=*/uint256(), /*incoming_prev=*/kBlkB),
+              FullBlockAccrualAction::Connect);
+}
+
+// 10j. A forward gap re-anchors (view about to be wiped) regardless of parent,
+//      and a lower/equal height still drops — the guard only tightens the +1
+//      Connect, it never rewrites the other actions.
+TEST(FullBlockContinuity, ForwardGapAndReorgUnaffectedByParent)
+{
+    EXPECT_EQ(classify_full_block_accrual_continuous(
+                  /*best=*/100, /*incoming=*/900'000,
+                  /*view_best_block=*/kBlkA, /*incoming_prev=*/kBlkB),
+              FullBlockAccrualAction::ReAnchorThenConnect);   // forward gap
+    EXPECT_EQ(classify_full_block_accrual_continuous(
+                  /*best=*/100, /*incoming=*/100,
+                  /*view_best_block=*/kBlkA, /*incoming_prev=*/kBlkA),
+              FullBlockAccrualAction::Drop);                  // duplicate / same tip
+}

@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+#include <core/uint256.hpp>
+
 /// Pure decision for the embedded UTXO fee-proof lane's full_block accrual
 /// (main_dgb.cpp full_block handler) — extracted so the RESTART-LIVENESS
 /// contract is KAT-testable (dgb_mempool_ingest_test) rather than buried in a
@@ -55,6 +57,37 @@ inline FullBlockAccrualAction classify_full_block_accrual(uint32_t best_height,
     if (incoming_height > best_height + 1)
         return FullBlockAccrualAction::ReAnchorThenConnect;  // forward gap (restart)
     return FullBlockAccrualAction::Drop;                     // reorg / <= best
+}
+
+/// == THE SAME-HEIGHT-REORG HOLE THIS CLOSES ================================
+/// classify_full_block_accrual() decides on HEIGHT alone. On a normal +1
+/// extend it returns Connect. But a reorg can swap the block at best_height for
+/// a sibling and then advance one: the new confirmed tip arrives at
+/// best_height + 1, so the height lines up and the height-only classifier still
+/// says Connect — yet the tip's PARENT is the sibling, NOT the block the
+/// accrual view currently sits on. Folding it would connect a STALE UTXO set:
+/// outputs the reorg re-spent still look unspent in the view, so a relayed tx
+/// could fee-prove against an already-spent coin (an overstated fee). Heights
+/// cannot see this; only the parent hash can.
+///
+/// This overload adds the PREV-HASH CONTINUITY guard: on a +1 extend it
+/// additionally requires the incoming block's parent (incoming_prev_block) to
+/// equal the view's current best_block (view_best_block). When it does not, the
+/// Connect is TIGHTENED to Drop — fail-closed, the view holds and stays
+/// coinbase-only, never a wrong fee. It only ever tightens; it never turns a
+/// Drop/ReAnchor into a Connect. The first anchor (best_height == 0) and a
+/// forward gap (ReAnchorThenConnect — the view is about to be wiped) carry no
+/// parent to match and pass through unchanged.
+inline FullBlockAccrualAction classify_full_block_accrual_continuous(
+    uint32_t best_height, uint32_t incoming_height,
+    const uint256& view_best_block, const uint256& incoming_prev_block)
+{
+    const FullBlockAccrualAction base =
+        classify_full_block_accrual(best_height, incoming_height);
+    if (base == FullBlockAccrualAction::Connect && best_height != 0 &&
+        !(view_best_block == incoming_prev_block))
+        return FullBlockAccrualAction::Drop;  // same-height reorg -> fail-closed
+    return base;
 }
 
 } // namespace coin
