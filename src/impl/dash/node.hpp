@@ -419,6 +419,15 @@ protected:
     // Chain-relative block height for think() scoring; unbound -> zero fn.
     std::function<int32_t(uint256)> m_block_rel_height_fn;
 
+    // #157 M2: peer tx-injection sink (submit_inject, injected by main_dash next
+    // to the arm) + node-level decided-txid set. Both IO-thread-confined (same
+    // discipline as m_known_txs). Null sink / empty set ⇒ feature dormant. The
+    // full std::function type is spelled out here (the tx_inject_sink_t alias is
+    // declared with the public setter further down, after this member).
+    std::function<coin::NodeCoinState::InjectSubmitResult(
+        const coin::MutableTransaction&, uint32_t, int32_t)> m_tx_inject_sink;
+    dash::NodeInjectSeen m_inject_seen;
+
     // ── Share-download leg (#754) state — IO-thread only ────────────────
     // De-dup + per-cycle retry gate for in-flight sharereq targets (shared
     // pool/share_download.hpp; ltc m_downloading_shares/m_download_fail_count).
@@ -1078,6 +1087,94 @@ public:
     void set_on_best_share_changed(std::function<void()> fn) { m_on_best_share_changed = std::move(fn); }
     void set_block_rel_height_fn(std::function<int32_t(uint256)> fn) { m_block_rel_height_fn = std::move(fn); }
 
+    // ── #157 M2: peer tx-injection SINK seam ─────────────────────────────
+    // The tx_inject handler routes a peer's tx through the SAME M1 gate the
+    // --embedded-tx-inject-hex loader uses (NodeCoinState::submit_inject). But
+    // NodeImpl::m_coin_state is NOT the object main_dash arms — main_dash owns a
+    // standalone `dash::coin::NodeCoinState node_coin_state` and calls
+    // set_tx_inject_enabled() on THAT one (main_dash.cpp). A handler that called
+    // m_coin_state.submit_inject() would fail-closed forever ("inject-disabled")
+    // — a silent dead transport. So the sink is injected from main_dash next to
+    // the arm, exactly like set_on_best_share_changed / set_block_rel_height_fn.
+    //
+    // Flag OFF ⇒ main_dash installs a NULL sink ⇒ the handler ignores every
+    // tx_inject (belt); submit_inject would also refuse (suspenders). The sink
+    // signature mirrors submit_inject(tx, flags, expiry_height).
+    using tx_inject_sink_t = std::function<
+        coin::NodeCoinState::InjectSubmitResult(
+            const coin::MutableTransaction&, uint32_t, int32_t)>;
+    void set_tx_inject_sink(tx_inject_sink_t fn) { m_tx_inject_sink = std::move(fn); }
+    bool has_tx_inject_sink() const { return static_cast<bool>(m_tx_inject_sink); }
+
+    // Route ONE inbound peer tx_inject through the relay policy + the M1 gate,
+    // then first-see fan it out. IO-THREAD ONLY (reads IO-owned m_peers, mutates
+    // IO-confined m_inject_seen + the peer guard — same discipline as m_known_txs
+    // / advertise_known_txs). Reward-safe: transport + a txid + submit_inject; no
+    // coinbase / subsidy / PPLNS / payee / won-block state is touched.
+    void handle_peer_tx_inject(const message_tx_inject& msg, const peer_ptr& from)
+    {
+        // Belt: no sink ⇒ feature not armed on this node ⇒ ignore + forward
+        // nothing. Never disconnect the peer (wire-compat: an old/new peer that
+        // sends tx_inject to a non-participating node is not misbehaving).
+        if (!m_tx_inject_sink)
+        {
+            LOG_DEBUG_POOL << "[tx-inject] ignoring peer tx_inject (feature off)";
+            return;
+        }
+
+        const uint256 txid = dash::coin::dash_txid(msg.m_tx);
+        const uint32_t byte_size =
+            static_cast<uint32_t>(::pack(coin::TX_WITH_WITNESS(msg.m_tx)).get_span().size());
+
+        auto verdict = dash::ingest_peer_inject(
+            /*enabled=*/true, m_inject_seen, from->m_inject_guard, txid, byte_size,
+            core::timestamp(),
+            [&]() -> dash::InjectSubmitOutcome {
+                auto r = m_tx_inject_sink(msg.m_tx, msg.m_flags, msg.m_expiry_height);
+                return dash::InjectSubmitOutcome{ r.ok, r.cause };
+            });
+
+        using Kind = dash::InjectRelayVerdict::Kind;
+        switch (verdict.kind)
+        {
+        case Kind::Accepted:
+            LOG_INFO << "[tx-inject] accepted " << txid.ToString()
+                     << " from " << from->addr().to_string() << " — fanning out";
+            break;
+        case Kind::Rejected:
+            LOG_WARNING << "[tx-inject] rejected " << txid.ToString()
+                        << " from " << from->addr().to_string()
+                        << " (" << verdict.cause << ")";
+            break;
+        case Kind::RateLimited:
+            LOG_WARNING << "[tx-inject] rate-limited peer "
+                        << from->addr().to_string() << " on " << txid.ToString();
+            break;
+        case Kind::Duplicate:
+            LOG_DEBUG_POOL << "[tx-inject] duplicate " << txid.ToString()
+                           << " (" << verdict.cause << ")";
+            break;
+        case Kind::Disabled:
+            break; // unreachable with a non-null sink
+        }
+
+        if (verdict.forward)
+            relay_tx_inject(msg, from);
+    }
+
+    // First-see fan-out: forward the tx_inject frame VERBATIM (no re-derivation)
+    // to every connected pool peer except the one it came from. IO-THREAD ONLY.
+    void relay_tx_inject(const message_tx_inject& msg, const peer_ptr& from)
+    {
+        for (auto& entry : m_peers)
+        {
+            auto& p = entry.second;
+            if (p && p != from)
+                p->write(dash::message_tx_inject::make_raw(
+                    msg.m_version, msg.m_flags, msg.m_expiry_height, msg.m_tx));
+        }
+    }
+
     // ── #754 share-download leg surface ─────────────────────────────────
 
     /// Async share download: register the reply callback + dispatch the
@@ -1424,6 +1521,7 @@ public:
     ADD_HANDLER(losing_tx, dash::message_losing_tx);
     ADD_HANDLER(remember_tx, dash::message_remember_tx);
     ADD_HANDLER(forget_tx, dash::message_forget_tx);
+    ADD_HANDLER(tx_inject, dash::message_tx_inject);   // #157 M2 miner/user tx-injection
 };
 
 class Actual : public pool::Protocol<NodeImpl>
@@ -1443,6 +1541,7 @@ public:
     ADD_HANDLER(losing_tx, dash::message_losing_tx);
     ADD_HANDLER(remember_tx, dash::message_remember_tx);
     ADD_HANDLER(forget_tx, dash::message_forget_tx);
+    ADD_HANDLER(tx_inject, dash::message_tx_inject);   // #157 M2 miner/user tx-injection
 };
 
 using Node = pool::NodeBridge<NodeImpl, Legacy, Actual>;

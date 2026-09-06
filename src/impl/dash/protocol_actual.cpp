@@ -285,4 +285,13 @@ void Actual::HANDLER(forget_tx)
     }
 }
 
+// #157 M2: route a peer's tx-injection through the SAME submit_inject gate as the
+// local --embedded-tx-inject-hex loader (all M1 validity checks), then first-see
+// fan it out. The whole policy lives in NodeImpl::handle_peer_tx_inject so the
+// Legacy/Actual bodies stay byte-identical (only the dispatch table differs).
+void Actual::HANDLER(tx_inject)
+{
+    handle_peer_tx_inject(*msg, peer);
+}
+
 } // namespace dash

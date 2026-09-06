@@ -181,6 +181,28 @@ BEGIN_MESSAGE(remember_tx)
     }
 END_MESSAGE()
 
+// message_tx_inject (#157 M2) — miner/user tx-injection over the sharechain p2p.
+// A peer offers a raw tx for injection; the receiver routes it through the SAME
+// NodeCoinState::submit_inject gate as the local --embedded-tx-inject-hex path
+// (all M1 validity checks — no new add_tx seam) and, on a first-see ACCEPT,
+// fans it out to its other peers. `m_version` is the injection-envelope version
+// (1 = M2), `m_flags` / `m_expiry_height` are submit_inject's wire fields
+// (carried verbatim), and `m_tx` is the transaction itself. `submitter_hint` is
+// deferred to M3 and deliberately absent. Command "tx_inject" = 9 chars (<= 12).
+BEGIN_MESSAGE(tx_inject)
+    MESSAGE_FIELDS
+    (
+        (uint32_t, m_version),
+        (uint32_t, m_flags),
+        (int32_t, m_expiry_height),
+        (coin::MutableTransaction, m_tx)
+    )
+    {
+        READWRITE(obj.m_version, obj.m_flags, obj.m_expiry_height,
+                  coin::TX_WITH_WITNESS(obj.m_tx));
+    }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_ping,
     message_addrme,
@@ -193,7 +215,8 @@ using Handler = MessageHandler<
     message_have_tx,
     message_losing_tx,
     message_forget_tx,
-    message_remember_tx
+    message_remember_tx,
+    message_tx_inject
 >;
 
 } // namespace dash

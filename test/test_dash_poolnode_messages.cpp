@@ -144,6 +144,79 @@ TEST(DashPoolNodeMessages, Handler_TypeList_Compiles) {
     EXPECT_GT(sizeof(HandlerResult), 0u);
 }
 
+// ── #157 M2: tx_inject subtype ──────────────────────────────────────────────
+namespace {
+// A minimal 1-in 1-out classic (type-0) tx so the wire round-trip exercises a
+// real MutableTransaction body (not an empty one).
+static coin::MutableTransaction make_inject_tx() {
+    coin::MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 0;
+    coin::TxIn in;
+    in.prevout.hash = uint256(0x9a9a9aull);
+    in.prevout.index = 3;
+    in.sequence = 0xffffffffu;
+    in.scriptSig = OPScript(std::vector<unsigned char>{0x51, 0x52, 0x53});
+    tx.vin.push_back(in);
+    coin::TxOut out;
+    out.value = 123456;
+    out.scriptPubKey = OPScript(std::vector<unsigned char>{0x76, 0xa9, 0x14});
+    tx.vout.push_back(out);
+    return tx;
+}
+} // namespace
+
+TEST(DashPoolNodeMessages, Message_TxInject_RoundTrip) {
+    auto tx = make_inject_tx();
+    auto rmsg = message_tx_inject::make_raw(/*version=*/1u, /*flags=*/0x2Au,
+                                            /*expiry_height=*/987654, tx);
+    EXPECT_EQ(rmsg->m_command, "tx_inject");
+    EXPECT_LE(std::string("tx_inject").size(), 12u);   // fits the command field
+
+    auto parsed = message_tx_inject::make(rmsg->m_data);
+    EXPECT_EQ(parsed->m_version, 1u);
+    EXPECT_EQ(parsed->m_flags, 0x2Au);
+    EXPECT_EQ(parsed->m_expiry_height, 987654);
+    ASSERT_EQ(parsed->m_tx.vin.size(), 1u);
+    ASSERT_EQ(parsed->m_tx.vout.size(), 1u);
+    EXPECT_EQ(parsed->m_tx.vin[0].prevout.index, 3u);
+    EXPECT_EQ(parsed->m_tx.vout[0].value, 123456);
+    EXPECT_EQ(parsed->m_tx.version, 1);
+    EXPECT_EQ(parsed->m_tx.type, 0);
+}
+
+// WIRE-COMPAT: an OLD peer whose dispatch set predates M2 has no tx_inject
+// handler. Feeding it a tx_inject frame throws std::out_of_range — which
+// handle_message() catches as `const std::exception&` and turns into a
+// LOG_WARNING, NOT a disconnect. The NEW dash::Handler parses it cleanly.
+TEST(DashPoolNodeMessages, OldPeerUnknownTxInjectIsWarningNotDisconnect) {
+    // Documents the catch site's contract: the throw is a std::exception.
+    static_assert(std::is_base_of_v<std::exception, std::out_of_range>,
+                  "handle_message catches std::exception → LOG_WARNING, not disconnect");
+
+    // The pre-M2 dispatch type-list, literally the old dash::Handler (12 types,
+    // no message_tx_inject).
+    using OldHandler = MessageHandler<
+        message_ping, message_addrme, message_getaddrs, message_addrs,
+        message_shares, message_sharereq, message_sharereply, message_bestblock,
+        message_have_tx, message_losing_tx, message_forget_tx, message_remember_tx>;
+
+    auto tx = make_inject_tx();
+
+    // An old peer cannot parse tx_inject → out_of_range (→ caught as LOG_WARNING).
+    {
+        OldHandler oldh;
+        auto rmsg = message_tx_inject::make_raw(1u, 0u, 0, tx);
+        EXPECT_THROW(oldh.parse(rmsg), std::out_of_range);
+    }
+
+    // The current dash::Handler DOES parse it (feature present).
+    {
+        Handler newh;
+        auto rmsg = message_tx_inject::make_raw(1u, 0u, 0, tx);
+        EXPECT_NO_THROW(newh.parse(rmsg));
+    }
+}
+
 
 // #1046: the bestblock-origination fetch classifier. Drives the REAL
 // nlohmann::json type (not a mock). These FAIL to compile/pass without

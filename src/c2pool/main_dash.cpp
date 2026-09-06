@@ -2730,11 +2730,29 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // Default OFF; the actual local submits happen after the mempool + the
     // consensus-exact script check are wired (see --embedded-tx-inject-hex).
     node_coin_state.set_tx_inject_enabled(embedded_tx_inject);
+    // #157 M2 (peer tx-injection over the sharechain p2p): install the sink the
+    // tx_inject HANDLER routes a peer's tx through. It MUST target THIS
+    // node_coin_state (the armed one) — NodeImpl::m_coin_state is a different
+    // object that main_dash never arms, so a handler calling m_coin_state would
+    // fail-closed forever. Flag OFF ⇒ a NULL sink ⇒ the handler ignores every
+    // tx_inject (belt), and submit_inject would refuse anyway (suspenders).
+    // node_coin_state and p2p_node both live in run_node scope; node_coin_state
+    // (declared later) is destroyed first, but only AFTER ioc.run() returns, so
+    // no dispatch can reach a dangling ref. Reward-safe: transport only.
     if (embedded_tx_inject) {
+        p2p_node.set_tx_inject_sink(
+            [&node_coin_state](const dash::coin::MutableTransaction& tx,
+                               uint32_t flags, int32_t expiry_height) {
+                return node_coin_state.submit_inject(tx, flags, expiry_height);
+            });
         std::cout << "[run] embedded-tx-inject ARMED (#157): miner/user tx-injection "
                      "ON — submitted txs ride the block with priority through the "
                      "SAME validity gate; reward path byte-unchanged. Requires "
-                     "--embedded-fold-checkscripts + the served-body posture.\n";
+                     "--embedded-fold-checkscripts + the served-body posture. M2 "
+                     "peer tx_inject transport is live (first-see fan-out, "
+                     "per-peer DoS guard).\n";
+    } else {
+        p2p_node.set_tx_inject_sink(nullptr);   // explicit: feature dormant
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
     // dashd's miner refuses any not-yet-islocked tx with vins younger than 10

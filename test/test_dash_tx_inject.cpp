@@ -39,6 +39,8 @@
 
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/tx_inject_pool.hpp>
+#include <impl/dash/coin/node_coin_state.hpp>   // #157 M2: submit_inject gate (relay routes through it)
+#include <impl/dash/tx_inject_relay.hpp>        // #157 M2: ingest_peer_inject relay policy
 #include <impl/dash/coin/good_citizen_defaults.hpp>
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>
 
@@ -489,4 +491,235 @@ TEST(DashTxInject, NeverGoodCitizenDefaulted)
     // test exists so a future refactor that tried to fold injection into the
     // good-citizen levers would have to delete it — a loud tripwire.
     SUCCEED();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #157 M2 — PEER TX-INJECTION RELAY (src/impl/dash/tx_inject_relay.hpp).
+//
+// These KATs drive dash::ingest_peer_inject — the transport-side policy that
+// sits IN FRONT of submit_inject. They are RED on master by construction:
+// tx_inject_relay.hpp does not exist there, so this TU fails to compile. GREEN
+// after: the relay routes a peer's tx through the SAME M1 submit_inject gate,
+// deduplicates, rate-limits, and first-see fans out.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+using dash::coin::NodeCoinState;
+
+// Arm the consensus-exact CheckInputScripts callback on a NodeCoinState's mempool
+// (same VerifyScript the local hex loader uses), then enable injection.
+void arm_ncs(NodeCoinState& st, UTXOViewCache& utxo) {
+    st.mempool().set_utxo(&utxo);
+    st.set_script_check([](const std::vector<uint8_t>& t, uint32_t n,
+                           const std::vector<uint8_t>& s, uint32_t f) {
+        return c2pool_dash_verify_input(s.data(), (unsigned)s.size(),
+                                        t.data(), (unsigned)t.size(), n, f) == 1;
+    });
+    st.set_tx_inject_enabled(true);
+}
+
+// The submit_fn the handler builds: route the peer tx through submit_inject and
+// collapse the rich result into the relay's InjectSubmitOutcome.
+auto make_sink(NodeCoinState& st, const MutableTransaction& tx,
+               uint32_t flags = 0, int32_t expiry = 0) {
+    return [&st, tx, flags, expiry]() -> dash::InjectSubmitOutcome {
+        auto r = st.submit_inject(tx, flags, expiry);
+        return dash::InjectSubmitOutcome{ r.ok, r.cause };
+    };
+}
+
+} // namespace
+
+// (M2-1) A valid signed spend from a peer is ACCEPTED through submit_inject and
+//        flagged for first-see fan-out; the inject lands in the pool + mempool.
+TEST(DashTxInject, PeerInjectAcceptedAndForwardedOnFirstSee)
+{
+    Key k(0xa1);
+    uint256 prev = prevhash(0x71);
+    auto tx = make_signed_spend(k, prev, 100'000);   // fee 0 (injected)
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    dash::NodeInjectSeen node_seen;
+    dash::PeerInjectGuard peer;
+    const uint256 txid = dash_txid(tx);
+
+    auto v = dash::ingest_peer_inject(/*enabled=*/true, node_seen, peer, txid,
+                                      /*byte_size=*/225, /*now=*/1000,
+                                      make_sink(st, tx));
+    EXPECT_EQ(v.kind, dash::InjectRelayVerdict::Kind::Accepted);
+    EXPECT_TRUE(v.forward) << "a first-see ACCEPT must fan out";
+    EXPECT_EQ(v.txid, txid);
+    EXPECT_EQ(st.inject_pool_size(), 1u);
+    EXPECT_TRUE(node_seen.contains(txid));
+}
+
+// (M2-2) A missing-input tx is REJECTED by name (submit_inject → unpriceable)
+//        and NOT forwarded.
+TEST(DashTxInject, PeerInjectRejectedByNameNotForwarded)
+{
+    Key k(0xa2);
+    uint256 prev = prevhash(0x72);   // NOT in the UTXO view
+    auto tx = make_signed_spend(k, prev, 90'000);
+
+    UTXOViewCache utxo(nullptr);     // empty
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    dash::NodeInjectSeen node_seen;
+    dash::PeerInjectGuard peer;
+    const uint256 txid = dash_txid(tx);
+
+    auto v = dash::ingest_peer_inject(true, node_seen, peer, txid, 225, 1000,
+                                      make_sink(st, tx));
+    EXPECT_EQ(v.kind, dash::InjectRelayVerdict::Kind::Rejected);
+    EXPECT_EQ(v.cause, "inject-unpriceable");
+    EXPECT_FALSE(v.forward);
+    EXPECT_EQ(st.inject_pool_size(), 0u);
+    // A rejected txid is still REMEMBERED (as rejected) so a re-send is not
+    // re-validated.
+    EXPECT_TRUE(node_seen.contains(txid));
+}
+
+// (M2-3) The same tx re-sent by the same peer, and by a DIFFERENT peer, is a
+//        Duplicate — submit_inject is called EXACTLY ONCE (no re-validation).
+TEST(DashTxInject, PeerInjectDuplicateNotReforwarded)
+{
+    Key k(0xa3);
+    uint256 prev = prevhash(0x73);
+    auto tx = make_signed_spend(k, prev, 100'000);
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    dash::NodeInjectSeen node_seen;
+    dash::PeerInjectGuard peerA, peerB;
+    const uint256 txid = dash_txid(tx);
+
+    int submit_calls = 0;
+    auto counting_sink = [&]() -> dash::InjectSubmitOutcome {
+        ++submit_calls;
+        auto r = st.submit_inject(tx, 0, 0);
+        return dash::InjectSubmitOutcome{ r.ok, r.cause };
+    };
+
+    // First-see from peer A: accepted + forwarded, one submit.
+    auto v1 = dash::ingest_peer_inject(true, node_seen, peerA, txid, 225, 1000, counting_sink);
+    EXPECT_EQ(v1.kind, dash::InjectRelayVerdict::Kind::Accepted);
+    EXPECT_TRUE(v1.forward);
+
+    // Same tx again from peer A: per-peer duplicate, no submit, no forward.
+    auto v2 = dash::ingest_peer_inject(true, node_seen, peerA, txid, 225, 1001, counting_sink);
+    EXPECT_EQ(v2.kind, dash::InjectRelayVerdict::Kind::Duplicate);
+    EXPECT_FALSE(v2.forward);
+
+    // Same tx from peer B: node-wide duplicate, no submit, no forward.
+    auto v3 = dash::ingest_peer_inject(true, node_seen, peerB, txid, 225, 1002, counting_sink);
+    EXPECT_EQ(v3.kind, dash::InjectRelayVerdict::Kind::Duplicate);
+    EXPECT_FALSE(v3.forward);
+
+    EXPECT_EQ(submit_calls, 1) << "a duplicate must NEVER re-run the (script-checking) submit gate";
+    EXPECT_EQ(st.inject_pool_size(), 1u);
+}
+
+// (M2-4) DoS: one peer sending many distinct injects inside a window is cut off
+//        at the per-peer budget; the over-budget request never reaches submit.
+TEST(DashTxInject, PeerInjectRateLimitedDoS)
+{
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st; arm_ncs(st, utxo);   // view left empty on purpose
+
+    dash::NodeInjectSeen node_seen;
+    dash::PeerInjectGuard peer;
+
+    int submit_calls = 0;
+    const std::size_t cap = dash::PeerInjectGuard::kMaxInjectsPerPeerPerWindow;
+
+    // Fire `cap` distinct txids inside one window (now fixed): each is allowed
+    // through to submit (and rejected as unpriceable — irrelevant to the cap).
+    for (std::size_t i = 0; i < cap; ++i) {
+        uint256 id = prevhash(static_cast<uint8_t>(0x80 + i));
+        auto v = dash::ingest_peer_inject(true, node_seen, peer, id, 225, /*now=*/5000,
+            [&]() -> dash::InjectSubmitOutcome { ++submit_calls; return {false, "inject-unpriceable"}; });
+        EXPECT_NE(v.kind, dash::InjectRelayVerdict::Kind::RateLimited)
+            << "request " << i << " is within budget";
+    }
+    EXPECT_EQ(submit_calls, static_cast<int>(cap));
+
+    // The next distinct txid in the SAME window is refused BEFORE submit.
+    uint256 over = prevhash(static_cast<uint8_t>(0x80 + cap));
+    auto vr = dash::ingest_peer_inject(true, node_seen, peer, over, 225, /*now=*/5000,
+        [&]() -> dash::InjectSubmitOutcome { ++submit_calls; return {false, "x"}; });
+    EXPECT_EQ(vr.kind, dash::InjectRelayVerdict::Kind::RateLimited);
+    EXPECT_FALSE(vr.forward);
+    EXPECT_EQ(submit_calls, static_cast<int>(cap)) << "the rate-limited request must not reach submit";
+
+    // The window slides: the same txid a full window later is admitted through.
+    auto vlater = dash::ingest_peer_inject(true, node_seen, peer, over, 225,
+        /*now=*/5000 + dash::PeerInjectGuard::kWindowSeconds,
+        [&]() -> dash::InjectSubmitOutcome { ++submit_calls; return {false, "x"}; });
+    EXPECT_NE(vlater.kind, dash::InjectRelayVerdict::Kind::RateLimited)
+        << "after the window slides the peer recovers its budget";
+}
+
+// (M2-5) FLAG OFF: a disabled node ignores every tx_inject — no submit, no state
+//        mutation (node seen-set + peer guard untouched), no forward.
+TEST(DashTxInject, PeerInjectIgnoredWhenFlagOff)
+{
+    Key k(0xa5);
+    uint256 prev = prevhash(0x75);
+    auto tx = make_signed_spend(k, prev, 100'000);
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; st.mempool().set_utxo(&utxo);
+    st.set_tx_inject_enabled(false);   // DISABLED
+
+    dash::NodeInjectSeen node_seen;
+    dash::PeerInjectGuard peer;
+    const uint256 txid = dash_txid(tx);
+
+    int submit_calls = 0;
+    auto v = dash::ingest_peer_inject(/*enabled=*/false, node_seen, peer, txid, 225, 1000,
+        [&]() -> dash::InjectSubmitOutcome { ++submit_calls; return {true, "ok"}; });
+
+    EXPECT_EQ(v.kind, dash::InjectRelayVerdict::Kind::Disabled);
+    EXPECT_FALSE(v.forward);
+    EXPECT_EQ(submit_calls, 0) << "a disabled node must not call submit_inject";
+    EXPECT_EQ(node_seen.size(), 0u) << "no node-level state may be mutated when the flag is OFF";
+    EXPECT_FALSE(peer.peer_has_seen(txid)) << "no per-peer state may be mutated when the flag is OFF";
+    EXPECT_TRUE(peer.window.empty());
+    EXPECT_EQ(st.inject_pool_size(), 0u);
+}
+
+// (M2-6) An accepted inject is an ordinary mempool body tx: it is SELECTED into
+//        the template body (the same hashes register_template_txs would receive),
+//        so it rides that path with zero extra code. Structural proof, no NodeImpl.
+TEST(DashTxInject, InjectedTxRidesRegisterTemplateTxs)
+{
+    Key k(0xa6);
+    uint256 prev = prevhash(0x76);
+    auto tx = make_signed_spend(k, prev, 100'000);
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    dash::NodeInjectSeen node_seen;
+    dash::PeerInjectGuard peer;
+    const uint256 txid = dash_txid(tx);
+
+    auto v = dash::ingest_peer_inject(true, node_seen, peer, txid, 225, 1000, make_sink(st, tx));
+    ASSERT_EQ(v.kind, dash::InjectRelayVerdict::Kind::Accepted);
+
+    // The body the template builder selects — the same {tx, fee} vector whose
+    // hashes register_template_txs(m_txs, m_tx_hashes) would carry into m_known_txs.
+    auto [selected, fees] = st.mempool().get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+    ASSERT_EQ(selected.size(), 1u);
+    EXPECT_EQ(dash_txid(selected[0].tx), txid)
+        << "the accepted inject must be in the served body (rides register_template_txs)";
+    EXPECT_EQ(fees, 0u) << "a 0-fee inject contributes 0 to total_fees — reward path unchanged";
 }
