@@ -95,7 +95,7 @@ int main()
         m->add_discovered_peer(ns("192.168.86.110", 8333));   // the old LAN default
         CHECK(m->peer_count() == 0);
         CHECK(m->addrman().size() == 0);
-        m->add_discovered_peer(ns("203.0.113.5", 8333));      // routable
+        m->add_discovered_peer(ns("8.8.8.8", 8333));          // globally-routable
         CHECK(m->peer_count() == 1);
         CHECK(m->addrman().size() == 1);
         // Empty/unparseable local node rejected; valid private local node pinned.
@@ -124,12 +124,12 @@ int main()
     }
 
     // ---- 3) /16 Sybil cap: bank-before-gate ------------------------------
-    // 5 routable addrs in one /16 (203.0.0.0/16): the working set is capped at
+    // 5 routable addrs in one /16 (8.8.0.0/16): the working set is capped at
     // max_new_peers_per_group (3) but the bucketed addrman banks ALL 5.
     {
         auto m = make_mgr(ioc, BchPeerManagerConfig{}, "sybil");  // default cap = 3 new/group
         for (int i = 1; i <= 5; ++i)
-            m->add_discovered_peer(ns("203.0.113." + std::to_string(i), 8333));
+            m->add_discovered_peer(ns("8.8.100." + std::to_string(i), 8333)); // all group "8.8"
         CHECK(m->peer_count() <= 3);                            // working-set group cap
         CHECK(m->addrman().size() == 5);                        // bank keeps them all
     }
@@ -139,11 +139,11 @@ int main()
         BchPeerManagerConfig cfg;
         cfg.max_connections_per_cycle = 4;
         auto m = make_mgr(ioc, cfg, "plan");
-        // Group A (198.51.x): admit up to the new-per-group cap; group B (8.8.x).
+        // Group A (8.8.x): admit up to the new-per-group cap; groups B/C distinct /16s.
         for (int i = 1; i <= 3; ++i)
-            m->add_discovered_peer(ns("198.51.100." + std::to_string(i), 8333));
-        m->add_discovered_peer(ns("8.8.8.8", 8333));
+            m->add_discovered_peer(ns("8.8.100." + std::to_string(i), 8333));
         m->add_discovered_peer(ns("1.1.1.1", 8333));
+        m->add_discovered_peer(ns("9.9.9.9", 8333));
 
         std::set<std::string> none;
         auto plan = m->get_peers_to_connect(none);
@@ -152,7 +152,7 @@ int main()
         // <= 2 outbound per /16 in the plan.
         int grpA = 0;
         for (const auto& pe : plan)
-            if (pe.host().rfind("198.51.", 0) == 0) ++grpA;
+            if (pe.host().rfind("8.8.", 0) == 0) ++grpA;
         CHECK(grpA <= 2);
         // Excludes an already-connected key.
         const std::string excl = plan.front().to_string();
@@ -164,8 +164,8 @@ int main()
     // ---- 5) #940 dial-failure vs post-handshake-drop scoring --------------
     {
         auto m = make_mgr(ioc, BchPeerManagerConfig{}, "score");
-        m->add_discovered_peer(ns("203.0.113.7", 8333));
-        const std::string key = ns("203.0.113.7", 8333).to_string();
+        m->add_discovered_peer(ns("8.8.8.8", 8333));
+        const std::string key = ns("8.8.8.8", 8333).to_string();
 
         // A failed dial backs the peer OFF the very next plan (backoff gate).
         m->notify_dial_failed(key);
@@ -217,10 +217,10 @@ int main()
     // ---- 7) JSON persistence round-trip ----------------------------------
     {
         const std::string dir = unique_dir("persist");
-        const std::string key = ns("203.0.113.9", 8333).to_string();
+        const std::string key = ns("8.8.8.8", 8333).to_string();
         {
             BchCoinPeerManager m(ioc, "BCH", dir, BchPeerManagerConfig{});
-            m.add_discovered_peer(ns("203.0.113.9", 8333));
+            m.add_discovered_peer(ns("8.8.8.8", 8333));
             m.notify_connected(key);                  // promote to tried in both books
             CHECK(m.peer_count() == 1);
             CHECK(m.addrman().tried_count() >= 1);
@@ -242,7 +242,7 @@ int main()
     // ---- 8) discovery_enabled() gate -------------------------------------
     {
         auto on = make_mgr(ioc, BchPeerManagerConfig{}, "disc_on");
-        on->add_discovered_peer(ns("203.0.113.11", 8333));
+        on->add_discovered_peer(ns("8.8.8.8", 8333));
         CHECK(on->discovery_enabled());               // armed + bank << soft-capacity
 
         BchPeerManagerConfig off_cfg;
