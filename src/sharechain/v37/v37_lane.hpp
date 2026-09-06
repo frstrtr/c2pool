@@ -27,6 +27,32 @@ namespace v37 {
 
 using MinerId = std::uint32_t;
 
+// RDWR-OQ2 sub-threshold estimator gate (the "raindrops -> bucket" DROPS half).
+// A self-contained POD carried in LaneParams so W4 (the consumer-tree settlement
+// fold, src/c2pool/v37/w4_settlement.hpp) can read the gate WITHOUT this pure
+// consensus header ever taking a consumer-tree include: the header stays
+// header-only, stdlib-only. W4 translates this POD into the merged estimator
+// module's c2pool::v37::subthreshold::SubthresholdParams at its own seam.
+//
+// ★★ DIGEST-NEUTRAL BY CONSTRUCTION (the PRIME invariant for the lane digest):
+// build_leaves() hashes the geometry by APPENDING each field explicitly
+// (window, c0, rollup, half_life, level_caps.size(), level_caps[...]) into the
+// "V37H" header leaf — it never serializes the whole LaneParams struct — so
+// ADDING this field appends nothing to any leaf and changes NO lane digest, on
+// any schedule. This is exactly the L0F_RECEIPT annotation-bit argument (§6):
+// a consensus-header addition that is digest-neutral by construction. DEFAULT
+// OFF (enabled == false) => W4's seam credits nothing, so the owed_digest, the
+// add-only receipt/share carrier, and the lane digest are byte-identical to
+// master. Turning it ON is the RDWR-OQ2 consensus activation (owed_digest
+// changes because credited amounts change); `version` names the V37.x consensus
+// version that the activation ships under.
+struct SubthresholdGate {
+    bool enabled = false;        // ★ DEFAULT OFF (RDWR-OQ2; flip = consensus change)
+    std::uint32_t K = 4;         // K-best near-misses; estimator enforces K >= 3
+    std::uint32_t mode = 0;      // 0 = EstimateOnly (S==0 only), 1 = Combined (sybil-neutral)
+    std::uint32_t version = 0;   // consensus version marker: 0 = base; 1 = V37.1 estimator-on
+};
+
 struct LaneParams {
     u64 window = 8640;          // W   (OQ-5 default)
     u64 c0 = 4096;              // C0, power of two; also E (epoch length)
@@ -34,6 +60,9 @@ struct LaneParams {
     std::vector<u64> level_caps = {568};  // slot counts for levels >= 1
     u64 half_life = 2160;       // W/4 (OQ-5)
     u64 journal_depth = 64;     // D   (OQ-7)
+    // ADD-ONLY, NOT part of the digested geometry (see SubthresholdGate above):
+    // the RDWR-OQ2 estimator gate, default OFF => digest byte-identical to master.
+    SubthresholdGate subthreshold{};
 
     u64 epoch_len() const { return c0; }
     std::size_t levels() const { return 1 + level_caps.size(); }

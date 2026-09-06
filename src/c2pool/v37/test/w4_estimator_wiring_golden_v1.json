@@ -1,0 +1,26 @@
+{
+  "schema": "v37-rdwr-oq2-w4-estimator-wiring-golden/1",
+  "note": "Wiring-level goldens for v37_w4_estimator_wiring_test. gate-OFF owed_digest is byte-identical to master (master_style) on the fixed schedule; gate-ON is the RDWR-OQ2 consensus activation (V37.1); lane digest is gate-neutral.",
+  "schedule": {
+    "chain": 7,
+    "block": "blk1",
+    "base_credit": {"A(0xA1)": 1000000, "B(0xB2)": 500000},
+    "payout": {},
+    "harvested": [
+      {"payee": "C(0xC3)", "interval": 100, "S": 0, "K": 8, "class": "uncovered"},
+      {"payee": "A(0xA1)", "interval": 100, "S": 5, "K": 8, "class": "covered"}
+    ],
+    "bin_height": 100
+  },
+  "owed_digest_gate_off_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
+  "owed_digest_master_style_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
+  "owed_digest_gate_on_hex": "56caec4cff671eed36d53e11140f0a0de44f35e98900df3010cdd296ea5a0f58",
+  "lane_digest_hex": "37756e9fa59be4aa30acfa6a18b0e1c131c9601cfceec802f19133a1ecde1a50",
+  "uncovered_credit_low63_dec": "874999",
+  "invariants": {
+    "gate_off_equals_master": true,
+    "gate_on_differs_from_off": true,
+    "lane_digest_gate_neutral": true,
+    "no_double_count_covered_worker": true
+  }
+}

@@ -52,6 +52,7 @@
 #include <vector>
 
 #include <c2pool/v37/v37_engine.hpp>          // V37Engine, SettlementView
+#include <c2pool/v37/v37_subthreshold_estimator.hpp>  // RDWR-OQ2 DROPS estimator (merged, gated)
 #include <sharechain/v37/v37_lane_executor.hpp>  // LaneSnapshot, IdentityView
 #include <sharechain/v37/v37_descriptor.hpp>     // ScriptRef, ScriptKind
 #include <sharechain/v37/v37_fixed.hpp>          // U256, u64
@@ -342,6 +343,90 @@ inline bool assert_ratified_geometry(const View& v, bool strict) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// RDWR-OQ2 seam — the sub-threshold work estimator ("DROPS") wired into the W4
+// OwedLedger credit path, behind the ::v37::LaneParams::subthreshold gate.
+//
+// The estimator MODULE (src/c2pool/v37/v37_subthreshold_estimator.hpp, merged)
+// owns the CORRECTED sybil-neutral arithmetic (the E-2 fix): apply_credit() is
+// "the ONLY entry point that turns receipts into OwedLedger credit". This seam
+// is the ONLY caller of it in the engine; it does NOT re-implement any estimator
+// maths. It translates the LaneParams POD gate into the module's params and, for
+// each harvested interval, folds apply_credit()'s per-payee delta into a credit
+// map shaped exactly like settle_block()'s E_b (bytes32 -> i64), ready to merge
+// into on_block_found().
+//
+// ★★ PRIME SAFETY INVARIANT. Gate OFF (SubthresholdGate::enabled == false, the
+// default): to_subthreshold_params() carries enabled==false, apply_credit()
+// returns {} for every interval, subthreshold_credit() returns an EMPTY map, and
+// on_block_found_with_estimator() forwards a credit map byte-identical to its
+// base_credit argument to the plain on_block_found() — so the composed
+// owed_digest, the add-only receipt/share carrier, and the lane digest are all
+// byte-identical to master on any shared schedule. Gate ON is the RDWR-OQ2
+// consensus activation (owed_digest changes because credited amounts change).
+//
+// F1 CONTRACT: `interval` is the per-coin-height, in-order monotone bin_height
+// (the same K_fair clock the ledger's rearm uses) — the caller supplies it from
+// OUT-of-interval, BURIED data and never jumps to tip. Dedup is per (payee,
+// interval): a given (payee, interval) yields at most one estimator credit no
+// matter how many carriers replay the stream (the module's DedupKey/straddle
+// rule). No-double-count: in EstimateOnly the module credits the estimate ONLY
+// where the worker's shares do not already account for its work (S == 0 in the
+// interval); a share-covered worker is credited by its shares (E_b), never the
+// estimate.
+// ─────────────────────────────────────────────────────────────────────────
+
+namespace subthreshold = ::c2pool::v37::subthreshold;
+
+// One harvested interval's receipt evidence for a payee: the K-best near-miss
+// hashes and the in-interval share count, presented as the module's own
+// ReceiptCollector (the caller builds it from the interval's observed hashes
+// during ingestion — the module's supported "out-of-interval data" surface).
+// `payee` is the canonical identity key (== OwedLedger key / DedupKey::payee,
+// both std::array<uint8_t,32>); `interval` is the F1 monotone bin_height.
+struct HarvestedReceipt {
+    bytes32 payee{};
+    u64     interval = 0;
+    subthreshold::ReceiptCollector collector;  // built by the caller (K, h_T, observe())
+};
+
+// Translate the LaneParams POD gate into the merged estimator module's params.
+inline subthreshold::SubthresholdParams to_subthreshold_params(
+    const ::v37::LaneParams& p) {
+    subthreshold::SubthresholdParams sp;
+    sp.enabled = p.subthreshold.enabled;          // ★ default false => gate OFF
+    sp.K       = p.subthreshold.K;
+    sp.mode    = (p.subthreshold.mode == 1) ? subthreshold::CreditMode::Combined
+                                            : subthreshold::CreditMode::EstimateOnly;
+    return sp;
+}
+
+// The gated estimator credit delta for a set of harvested intervals. GATE OFF =>
+// EMPTY map (nothing merged; on_block_found stays byte-identical to master).
+// GATE ON => the additive, per-(payee,interval)-deduped, sybil-neutral estimator
+// credit. Never emits the broken clamp (the module refuses it structurally).
+// Shape == OwedLedger::Amounts (std::map<bytes32, long long>, the E_b shape).
+inline std::map<bytes32, long long> subthreshold_credit(
+    const ::v37::LaneParams& params,
+    const std::vector<HarvestedReceipt>& harvested) {
+    std::map<bytes32, long long> credit;
+    const subthreshold::SubthresholdParams sp = to_subthreshold_params(params);
+    if (!sp.enabled) return credit;                 // ★ GATE OFF: nothing enters
+    std::map<subthreshold::DedupKey, bool> already_seen;
+    for (const auto& hr : harvested) {
+        subthreshold::DedupKey key;
+        key.payee = hr.payee;                       // bytes32 == array<uint8_t,32>
+        key.seq   = hr.interval;                    // F1 monotone bin_height
+        // apply_credit is the module's ONLY receipts->credit entry point; it
+        // enforces K>=3, per-(payee,interval) dedup, J>=K, and no-double-count.
+        const auto delta =
+            subthreshold::apply_credit(sp, key, hr.collector, already_seen);
+        for (const auto& [payee, amt] : delta)
+            if (amt != 0) credit[payee] += amt;     // bytes32-keyed, add-only
+    }
+    return credit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // (3) The OWED ledger — ledger #2, KEYED_CRDT overlay, finality-gated, SETTLED
 // terminal (§4). Off the coin chain (M4 lock): every node computes it from the
 // same events. Single-writer fold; ledger_seq is its monotonic version. Amounts
@@ -370,6 +455,31 @@ public:
         for (const auto& [k, v] : payout) if (v != 0) p.payout[k] = v;
         m_pending.emplace(bid, std::move(p));
         bump();
+    }
+
+    // ── RDWR-OQ2 wiring: FOUND(b) with the gated sub-threshold estimator folded
+    // into the per-key credit. `base_credit` is the ordinary E_b entitlement
+    // (settle_block over b's burial-gated prefix); `harvested` carries the
+    // OUT-of-interval, buried near-miss receipts (F1 monotone bin_height, never
+    // tip). GATE OFF (default) => subthreshold_credit() returns {} and this
+    // forwards `base_credit` UNCHANGED to on_block_found() — byte-identical to
+    // master (the estimator credit is add-only and materialises only when ON).
+    // GATE ON => the corrected sybil-neutral estimate is added to the credit for
+    // the UNCOVERED (S==0) workers whose near-misses reached J>=K, deduped per
+    // (payee, interval); a share-covered worker keeps ONLY its E_b (no double
+    // count). This is the single call site of the estimator in the fold.
+    void on_block_found_with_estimator(
+        const std::string& bid, const Amounts& base_credit, const Amounts& payout,
+        const ::v37::LaneParams& params,
+        const std::vector<HarvestedReceipt>& harvested) {
+        const Amounts est = subthreshold_credit(params, harvested);
+        if (est.empty()) {                       // ★ GATE OFF (or nothing eligible):
+            on_block_found(bid, base_credit, payout);  // identical to master path
+            return;
+        }
+        Amounts credit = base_credit;            // GATE ON: add-only merge
+        for (const auto& [k, v] : est) credit[k] += v;
+        on_block_found(bid, credit, payout);
     }
 
     // ── FINALIZE(b): b is canonical AND buried >= D_conf on its own chain AND
