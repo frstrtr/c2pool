@@ -46,6 +46,22 @@
 #include <c2pool/v37/v37_engine.hpp>
 #include <sharechain/v37/v37_roundabout.hpp>
 
+// ── W6 (Track A2 / persistence) wiring, ADD-ONLY and compile-guarded ────────
+// The W0 simnet scaffold links Threads only (a deliberate minimal link graph on
+// a memory-pressured host — see the NETWORKING NOTE above); it carries no
+// settlement events. The W6 settlement store, restart recovery and
+// SettlementJournal wiring below is therefore gated behind W6_ENABLE_LEVELDB,
+// which a PRODUCTION node target (one that links core + leveldb) defines. The
+// header's LevelDBSettleStore is the only thing that pulls <core/leveldb_store.hpp>
+// (spec §7.1), so leaving W6_ENABLE_LEVELDB undefined keeps this scaffold
+// leveldb-free while the wiring stays present, reviewed, and CI-compiled on the
+// production leg. (Binding the ReplayDriver to the live V37Engine is OI-W6-3.)
+#if defined(W6_ENABLE_LEVELDB)
+#include <optional>
+#include <core/filesystem.hpp>
+#include <c2pool/v37/w6_persistence.hpp>
+#endif
+
 using c2pool::v37n::V37Engine;
 
 // ── the ratified OQ-5 default lane geometry (LaneParams{} == the defaults) ──
@@ -181,6 +197,31 @@ static int run_node(std::uint16_t listen_port,
                     const std::vector<std::uint16_t>& peers, int node_id,
                     int hold_ms) {
     V37Engine engine;
+
+#if defined(W6_ENABLE_LEVELDB)
+    // ── W6: construct the settlement store, run restart recovery BEFORE the
+    // engine starts, hand a SettlementJournal to the W4/W5 settlement callers.
+    // Donor lifecycle order preserved: the store is opened before engine.start()
+    // and closed after engine.stop() (below).
+    const std::string w6_net = "v37sim";
+    c2pool::v37n::persist::LevelDBSettleStore w6_store(
+        core::filesystem::config_path().string(), w6_net);
+    std::optional<c2pool::v37n::persist::SettlementJournal> w6_journal;
+    if (auto w6_boot = w6_store.open()) {
+        c2pool::v37n::recover::RecoveryHooks w6_hooks;   // families A/B; lane replay hook is OI-W6-3
+        c2pool::v37n::recover::RecoveryDriver w6_recovery(w6_store, w6_hooks);
+        auto w6_res = w6_recovery.recover();
+        if (!w6_res.ok())
+            std::printf("node %d: W6 recovery fail-closed — a chain did not start\n", node_id);
+        // The journal is the single writer the W4 (settlement) / W5 (coinbase)
+        // callers use; idle in the W0 scaffold, which emits no settlement events.
+        w6_journal.emplace(w6_store, *w6_boot);
+        (void)w6_journal;
+    } else {
+        std::printf("node %d: W6 settlement store open FAILED\n", node_id);
+    }
+#endif
+
     engine.start();
 
     ::v37::bytes32 digest{};
@@ -262,6 +303,10 @@ static int run_node(std::uint16_t listen_port,
     ::close(lfd);
 
     engine.stop();
+
+#if defined(W6_ENABLE_LEVELDB)
+    w6_store.close();   // W6 teardown: after the engine has drained (donor order)
+#endif
 
     std::uint64_t ops = engine.ops_committed();
     bool ok = (ops == 1);   // nothing was ever submitted but the one AddLane
