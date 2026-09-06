@@ -289,9 +289,21 @@ int run_embedded(bool coin_p2p_discover,
     // coin P2P (submit_block_with_fallback: P2P relay + optional submitblock RPC
     // backup). The work source serves coinbase-only jobs, validates shares with
     // an independent BLAKE2b recompute, and dispatches block-target hits here.
+    // ── #995-shape found-block PRODUCER slot (dashboard telemetry) ──────────
+    // Fired from stratum_submit_fn right after a won block is dispatched, this
+    // records the block into the MiningInterface for the /recent_blocks card +
+    // the confirm/orphan verdict lane (set_block_verify_fn below). Declared here
+    // so the stratum submit path can fire it; BOUND later inside the web-server
+    // wiring where the MiningInterface (mi) is live. Empty until bound and when
+    // the dashboard is off → a no-op. TELEMETRY ONLY: strictly downstream of the
+    // block submit, never gates broadcast/mint/target/payout, zero consensus.
+    auto found_block_report =
+        std::make_shared<std::function<
+            void(const std::vector<unsigned char>&, uint32_t)>>();
+
     auto stratum_submit_fn =
-        [&coin_node, &coin_broadcaster_full](const std::vector<unsigned char>& block_bytes,
-                                             uint32_t height) -> bool {
+        [&coin_node, &coin_broadcaster_full, found_block_report](
+            const std::vector<unsigned char>& block_bytes, uint32_t height) -> bool {
             LOG_INFO << "[EMB-BIP110] submitting won block height=" << height
                      << " bytes=" << block_bytes.size();
             // FLAG-ON: route through the found-block keystone — ARM A fans the
@@ -299,9 +311,17 @@ int run_embedded(bool coin_p2p_discover,
             // coin_node.submit_block_with_fallback (primary relay + optional RPC).
             // FLAG-OFF: coin_broadcaster_full is null -> the single M2 call,
             // byte-identical to today.
-            if (coin_broadcaster_full)
-                return coin_broadcaster_full->on_block_found(block_bytes).reached_network();
-            return coin_node.submit_block_with_fallback(block_bytes);
+            const bool reached = coin_broadcaster_full
+                ? coin_broadcaster_full->on_block_found(block_bytes).reached_network()
+                : coin_node.submit_block_with_fallback(block_bytes);
+            // TELEMETRY (dashboard only, downstream of submit): record the won
+            // block so the found-blocks card + confirm/orphan lane observe it.
+            // The block met block target (independent BLAKE2b recompute upstream)
+            // → it is a real found block; the verdict poller resolves whether it
+            // actually buried on-chain. Never gates the submit above.
+            if (found_block_report && *found_block_report)
+                (*found_block_report)(block_bytes, height);
+            return reached;
         };
     auto work_source = std::make_shared<bip110::stratum::Bip110WorkSource>(
         header_chain, /*is_testnet=*/false, std::move(stratum_submit_fn));
@@ -2375,6 +2395,39 @@ int run_embedded(bool coin_p2p_discover,
         // instrumented. Isolated-orphan money-risk becomes visible. No consensus,
         // reward, share-validity or wire surface is touched.
         if (mi) {
+            // PRODUCER (pairs with the VERDICT fn below): feed the found-block
+            // record. Keyed on the BIP-110 block IDENTITY — bip110::coin::block_hash
+            // (SHA256d below the fork, BLAKE2b v2 at/after), computed the SAME way
+            // header_chain stores block_hash, so the verdict fn resolves this exact
+            // row. Reading the leading header off the won block bytes yields the
+            // identity. this_node: the stratum work source built + dispatched it.
+            *found_block_report =
+                [mi](const std::vector<unsigned char>& block_bytes, uint32_t height) {
+                    bip110::coin::BlockHeaderType hdr;
+                    try {
+                        PackStream ps(block_bytes);
+                        ps >> hdr;
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[EMB-BIP110] found-block record: header "
+                                       "parse failed: " << e.what();
+                        return;
+                    }
+                    const uint256 id = bip110::coin::block_hash(hdr);
+                    if (id == uint256::ZERO) return;  // unsupported layout: no key
+                    mi->record_found_block(
+                        static_cast<uint64_t>(height), id,
+                        static_cast<uint64_t>(std::time(nullptr)),
+                        /*chain=*/"BIP110", /*miner=*/"",
+                        /*share_hash=*/id.GetHex(),
+                        mi->get_network_difficulty(), /*share_difficulty=*/0.0,
+                        mi->get_local_hashrate(), /*subsidy=*/0,
+                        core::MiningInterface::BlockAuthorship::this_node);
+                    mi->schedule_block_verification(id.GetHex());
+                    LOG_INFO << "[EMB-BIP110] recorded found block h=" << height
+                             << " id=" << id.GetHex().substr(0, 16)
+                             << " -- confirm/orphan poller armed";
+                };
+
             mi->set_block_verify_fn(
                 [mi, &header_chain, &coin_node](const std::string& hash_hex) -> int {
                     uint256 h; h.SetHex(hash_hex);
