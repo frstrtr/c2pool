@@ -218,6 +218,37 @@ if (BUILD_TESTING)
     target_compile_features(xmr_goldens_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_goldens_kat COMMAND xmr_goldens_kat)
 
+    # 9c) Milestone-A miner->block end-to-end smoke (Track A2 / Family-B). Binds
+    #     the X5 stratum seams (ITemplateSource / IPowVerifier / IShareSink) to
+    #     the live-node components and drives the whole block-winning path:
+    #       accepted network-block share -> read the finality-gated OWED ledger
+    #       (W4 OwedLedger) -> build the X6 canonical coinbase (settle/xmr_coinbase,
+    #       FCMP-fenced, exact-sum, real 8rA stealth one-time keys) -> submit_block
+    #       via the X2 IMonerodTransport (MockMonerodTransport). It ALSO exercises
+    #       the F1 finalize driver (per-height, in-order on_block_finalized, never
+    #       the live tip) and an FCMP-fence negative control (a post-CARROT
+    #       major_version is REFUSED, no submit fired). PoW is a deterministic
+    #       known-answer mock: NO RandomX / monerod / libsodium (sanitizer-safe,
+    #       OOM-safe). Links xmr_coin for the vendored ed25519 (ge_*) + keccak and
+    #       compiles the ref10 point-check backend with V37_XMR_HAVE_MONERO_CRYPTO
+    #       so XMR descriptors validate live (SAFETY (4)). Its own harness (nonzero
+    #       exit on any failed stage). Listed on BOTH build.yml legs + drift-guard
+    #       clean (see .github/workflows/build.yml).
+    add_executable(xmr_miner_block_path_smoke
+        miner_block_path_smoke.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum/xmr_stratum.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_link_libraries(xmr_miner_block_path_smoke PRIVATE xmr_coin)
+    target_include_directories(xmr_miner_block_path_smoke PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../mbp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum
+        ${CMAKE_CURRENT_SOURCE_DIR}/../coin)
+    target_compile_definitions(xmr_miner_block_path_smoke PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_compile_features(xmr_miner_block_path_smoke PRIVATE cxx_std_20)
+    add_test(NAME xmr_miner_block_path_smoke COMMAND xmr_miner_block_path_smoke)
+
     # 10) randomx-verify: the REAL RandomX engine, now vendored and wired.
     #     ../pow/randomx_verify_kat.cpp runs three suites against librandomx.a
     #     built from the vendored tevador/RandomX source (third_party/randomx/src,
