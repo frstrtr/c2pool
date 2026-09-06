@@ -38,7 +38,7 @@
 #include <deque>
 #include <functional>
 #include <string>
-#include <unordered_map>
+#include <map>
 
 namespace dash {
 
@@ -90,7 +90,7 @@ struct PeerInjectGuard {
 
     std::deque<std::time_t> window;   // submit timestamps inside kWindowSeconds
     std::deque<uint256>     seen_order;
-    std::unordered_map<uint256, char> seen;  // txid -> present (this peer only)
+    std::map<uint256, char> seen;  // txid -> present (this peer only)
 
     // Drop timestamps older than the window; return the count still inside it.
     std::size_t prune_window(std::time_t now) {
@@ -125,7 +125,7 @@ struct NodeInjectSeen {
     static constexpr std::size_t kMaxNodeSeen = 8192;
 
     std::deque<uint256>              order;
-    std::unordered_map<uint256, bool> accepted;  // txid -> was accepted
+    std::map<uint256, bool> accepted;  // txid -> was accepted
 
     bool contains(const uint256& txid) const {
         return accepted.find(txid) != accepted.end();

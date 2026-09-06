@@ -155,11 +155,13 @@ static coin::MutableTransaction make_inject_tx() {
     in.prevout.hash = uint256(0x9a9a9aull);
     in.prevout.index = 3;
     in.sequence = 0xffffffffu;
-    in.scriptSig = OPScript(std::vector<unsigned char>{0x51, 0x52, 0x53});
+    std::vector<unsigned char> sig_bytes{0x51, 0x52, 0x53};
+    in.scriptSig = OPScript(sig_bytes.data(), sig_bytes.data() + sig_bytes.size());
     tx.vin.push_back(in);
     coin::TxOut out;
     out.value = 123456;
-    out.scriptPubKey = OPScript(std::vector<unsigned char>{0x76, 0xa9, 0x14});
+    std::vector<unsigned char> spk_bytes{0x76, 0xa9, 0x14};
+    out.scriptPubKey = OPScript(spk_bytes.data(), spk_bytes.data() + spk_bytes.size());
     tx.vout.push_back(out);
     return tx;
 }
