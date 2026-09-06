@@ -1,0 +1,30 @@
+{
+  "schema": "v37-rdwr-oq2-v371-activation-golden/1",
+  "note": "V37.1 RDWR-OQ2 consensus-activation goldens for v37_1_activation_test. The shipped default is V37.1 (LaneParams::shipped()==v37_1(): gate ON, Combined, version=1). gate-OFF (V37.0, LaneParams::v37_0()) owed_digest is BYTE-IDENTICAL to master and to the pre-existing V37.0 gate-OFF golden (w4_estimator_wiring_golden_v1: 3ba6481a...); gate-ON is the activation (owed_digest moves). The active rule is the E-2-corrected sybil-neutral combined estimator Hhat_comb=(S+K-1)*D'_K, never the broken clamp. lane digest is version-invariant.",
+  "consensus_version": {"shipped": 1, "name": "V37.1", "gate": "on", "rule": "combined", "K": 4},
+  "schedule": {
+    "chain": 7,
+    "block": "blk1",
+    "base_credit": {"A(0xA1)": 1000000, "B(0xB2)": 500000},
+    "payout": {},
+    "harvested": [
+      {"payee": "C(0xC3)", "interval": 200, "S": 0, "K": 4, "class": "uncovered", "base_credit": 0},
+      {"payee": "D(0xD4)", "interval": 201, "S": 2, "K": 4, "class": "buried-shares", "base_credit": 0}
+    ],
+    "bin_height": 100
+  },
+  "owed_digest_gate_off_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
+  "owed_digest_master_style_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
+  "owed_digest_gate_on_hex": "2a7dc41dcc231ce8a81f93801b495d65d6841e8067f58e48894985c9ebd8e692",
+  "lane_digest_hex": "37756e9fa59be4aa30acfa6a18b0e1c131c9601cfceec802f19133a1ecde1a50",
+  "c_credit_dec": "374999",
+  "d_credit_dec": "624999",
+  "note_s_coefficient": "D/C == 624999/374999 == 5/3 == (2+K-1)/(0+K-1) with K=4: the (S+K-1) coefficient of the combined estimator, a direct witness that S enters the ACTIVE rule.",
+  "invariants": {
+    "shipped_default_is_v371": true,
+    "gate_off_equals_master_and_prior_v370_golden": true,
+    "gate_on_differs_from_off": true,
+    "active_rule_is_combined_not_clamp": true,
+    "lane_digest_version_invariant": true
+  }
+}
