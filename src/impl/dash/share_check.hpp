@@ -657,11 +657,32 @@ uint256 generate_share_transaction(const DashShare& share, TrackerT& tracker,
     auto finder_script = pubkey_hash_to_script2(share.m_pubkey_hash);
     amounts[finder_script] += worker_payout / 50;
 
-    // Donation: remainder (rounding + donation weight)
+    // Donation: any pre-existing DONATION_SCRIPT-keyed amount MERGED with the
+    // leftover (rounding + donation weight). This mirrors BOTH authors exactly:
+    //   - producer  share_producer.hpp: amounts[donation_script] += (worker_payout - sum)
+    //   - oracle    ref/p2pool-dash data.py:223:
+    //                 amounts[DONATION_SCRIPT] = amounts.get(DONATION_SCRIPT,0) + worker_payout - sum(...)
+    //     (both then emit amounts[DONATION_SCRIPT] as the single donation txout).
+    //
+    // Reachability: DASH's DONATION_SCRIPT is P2PKH (hash160 20cb5c22...,
+    // address XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u), so pubkey_hash_to_script2 of a
+    // share whose m_pubkey_hash == that hash160 collides with DONATION_SCRIPT and
+    // the finder-fee / PPLNS-weight amount lands in amounts[DONATION_SCRIPT].
+    // The previous code subtracted that amount inside sum_amounts, dropped it
+    // from worker_outputs, and emitted ONLY the residual -- so the reconstructed
+    // coinbase was low by exactly that amount, its txid diverged from the
+    // committed gentx_hash, and a VALID share was falsely rejected. Because
+    // p2pool-dash (the shared sharechain) and our own producer both preserve it,
+    // that was a cross-impl FORK (F11): our nodes orphaned shares the network
+    // accepted. Folding it back in makes the reconstruction byte-identical to
+    // both authors. Non-colliding shares are unaffected (no DONATION_SCRIPT key
+    // in amounts -> donation_amount == residual, exactly as before).
     uint64_t sum_amounts = 0;
     for (auto& [s, a] : amounts)
         sum_amounts += a;
-    uint64_t donation_amount = (worker_payout > sum_amounts) ? (worker_payout - sum_amounts) : 0;
+    uint64_t residual = (worker_payout > sum_amounts) ? (worker_payout - sum_amounts) : 0;
+    auto don_it = amounts.find(DONATION_SCRIPT);
+    uint64_t donation_amount = (don_it != amounts.end() ? don_it->second : 0) + residual;
 
     // ── 4. Build sorted output list ──
     // worker_scripts: sorted, excluding donation
