@@ -340,6 +340,9 @@ jobs:
     #     PMTU. See the note in codeql-analysis.yml; it is revisitable, but
     #     flock separation would still keep these two on different hosts.
     # Do not consolidate these two onto one label.
+    # The per-coin ASan mirrors (COIN_BCH AsAN+UBSan, etc.) follow this SAME rule: they run on
+    # c2pool-heavy too (not c2pool-build, whose 232G volume floors out at the 50G disk guard), and
+    # are serialized against this leg on a shared heavy host by the per-host disk semaphore (SLOTS=1).
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
@@ -865,7 +868,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-bch-asan:
     name: COIN_BCH Linux x86_64 (AsAN+UBSan)
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-heavy"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
