@@ -21,7 +21,7 @@ GATE="DOGE AuxPoW smoke"
 # DOGE-specific suites in test_doge_chain: AuxPoW parent-link (structured +
 # real-block KAT), the parser, and the coin_params/consensus-era load. These are
 # the embedded impl/doge/coin/* surfaces the merged c2pool-ltc binary depends on.
-TEST_REGEX="^(AuxPowKnownAnswer|AuxPowStructured|AuxPowParser|DOGEChainParams|DOGESubsidy|DigiShield|MersenneTwister)Test\."
+TEST_REGEX="^(AuxPowKnownAnswer|AuxPowStructured|AuxPowParser|DOGEChainParams|DOGESubsidy|DigiShield|MersenneTwister|DOGEAuxBlockAssembler)Test\."
 TARGETS=(test_doge_chain)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
