@@ -124,4 +124,24 @@ if (BUILD_TESTING)
     add_test(NAME v37_subthreshold_estimator_test
              COMMAND v37_subthreshold_estimator_test
              WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_subthreshold_estimator_test>)
+    # Track A2 / W6 — persistence, restart-recovery, and the >D rebuild path
+    # (src/c2pool/v37/w6_persistence.hpp): the ISettleStore seam + all §2.3
+    # record codecs, the F2 fail-closed open census (union-of-prefixes +
+    # lhead-vs-levt), the SettlementJournal single-writer crash-consistency path
+    # (F1 per-height monotone bin_height), the RecoveryDriver (§4.1 steps 1-9),
+    # and the ReplayDriver + PrefixResolver >D slow path (F4 lane-genesis
+    # truncation). Stdlib-only by construction: this TU NEVER links leveldb
+    # (LevelDBSettleStore is behind W6_ENABLE_LEVELDB in the header); the
+    # persistence layer is exercised through the ISettleStore seam driven by a
+    # deterministic FaultSettleStore double, plus the CM-1/G1-G2-G3/F1 falsifier
+    # arms (guard-off arms MUST exhibit the violation, else VACUOUS-fail). SAME
+    # HOLLOW-GREEN GUARD as the suites above: this target is ALSO listed in the
+    # build.yml --target lists (BOTH the Linux x86_64 leg and the ASan+UBSan leg)
+    # so CI actually compiles + runs it, not just registers it as a NOT_BUILT
+    # CTest sentinel (the DGB #137 / #769 / PR #1467 / #1477 unregistered-KAT class).
+    add_executable(v37_w6_persistence_test v37_w6_persistence_test.cpp)
+    target_compile_features(v37_w6_persistence_test PRIVATE cxx_std_20)
+    target_include_directories(v37_w6_persistence_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_w6_persistence_test Threads::Threads)
+    add_test(NAME v37_w6_persistence_test COMMAND v37_w6_persistence_test)
 endif()
