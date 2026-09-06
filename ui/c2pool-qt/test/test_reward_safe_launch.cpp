@@ -347,8 +347,9 @@ int main()
     }
 
     // 10) ★ A4 — the catalog fact the BCH widget gating relies on: c2pool-bch
-    //     carries NO endpoint/submit/money/message alias, so those form fields
-    //     would silently drop and must be disabled.
+    //     carries NO endpoint/submit/message alias, so those form fields would
+    //     silently drop and must be disabled. Post-W-MONEY it DOES carry the
+    //     money payout / author-fee / owner-fee surface (but still no redistribute).
     {
         using c2pool_qt::catview::spelling_for;
         auto bchHas = [](const char* c) {
@@ -356,11 +357,11 @@ int main()
         };
         check(!bchHas("daemon_rpc.endpoint") && !bchHas("daemon_rpc.submit_endpoint"),
               "BCH catalog has no RPC endpoint alias (host/port disabled)");
-        check(!bchHas("money.node_owner_address"),
-              "BCH catalog has no node_owner_address (payout field disabled)");
-        check(!bchHas("money.give_author_pct") && !bchHas("money.node_owner_fee_pct")
+        check(bchHas("money.node_owner_address"),
+              "BCH catalog has node_owner_address (payout field enabled by W-MONEY)");
+        check(bchHas("money.give_author_pct") && bchHas("money.node_owner_fee_pct")
                   && !bchHas("money.redistribute"),
-              "BCH catalog has no author-fee / owner-fee / redistribute surface");
+              "BCH catalog has author-fee / owner-fee surface (W-MONEY) but still no redistribute");
         check(!bchHas("global.message_blob_hex"),
               "BCH catalog has no message-blob alias (message field disabled)");
     }
