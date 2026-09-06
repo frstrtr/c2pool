@@ -600,6 +600,26 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr"
 
+      # Per-host DISK semaphore (SLOTS=1): serializes the two ~44G sanitizer
+      # build trees (build_asan + build_bch_asan) so they never co-admit on one
+      # host and exhaust the disk -- the concurrent-admission ENOSPC class
+      # (run 34006115987 / #1506) that the stale-hours clamp (#1517) and a floor
+      # bump cannot gate. DISTINCT from the RAM heavy-leg lock (SLOTS=2, linux-asan
+      # + CodeQL), which stays 2-up: this governs ONLY {linux-asan, coin-bch-asan}
+      # at SLOTS=1. Per-host (/tmp flock), so heavy pairs on DIFFERENT hosts still
+      # run in parallel. The disowned holder auto-frees when the runner-worker dies
+      # at job end -- i.e. AFTER Prune runner workspace has dropped the 44G tree,
+      # which is exactly when the disk pressure clears (an earlier release would
+      # free the slot while the tree is still on disk). Reap-guard identical to the
+      # RAM lock; honesty-gated at SLOTS=1 in heavy-leg-lock/test.sh.
+      - name: Acquire per-host heavy-disk semaphore
+        if: runner.environment != 'github-hosted'
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-heavy-disk.lock
+          holder-file: /tmp/c2pool-heavy-disk.holder
+          slots: "1"
+          holder-env: HEAVY_DISK_LOCK_HOLDER
       - name: Heavy-leg disk headroom guard (+ bounded prune)
         if: runner.environment != 'github-hosted'
         uses: ./.github/actions/heavy-disk-guard
@@ -944,6 +964,26 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr"
 
+      # Per-host DISK semaphore (SLOTS=1): serializes the two ~44G sanitizer
+      # build trees (build_asan + build_bch_asan) so they never co-admit on one
+      # host and exhaust the disk -- the concurrent-admission ENOSPC class
+      # (run 34006115987 / #1506) that the stale-hours clamp (#1517) and a floor
+      # bump cannot gate. DISTINCT from the RAM heavy-leg lock (SLOTS=2, linux-asan
+      # + CodeQL), which stays 2-up: this governs ONLY {linux-asan, coin-bch-asan}
+      # at SLOTS=1. Per-host (/tmp flock), so heavy pairs on DIFFERENT hosts still
+      # run in parallel. The disowned holder auto-frees when the runner-worker dies
+      # at job end -- i.e. AFTER Prune runner workspace has dropped the 44G tree,
+      # which is exactly when the disk pressure clears (an earlier release would
+      # free the slot while the tree is still on disk). Reap-guard identical to the
+      # RAM lock; honesty-gated at SLOTS=1 in heavy-leg-lock/test.sh.
+      - name: Acquire per-host heavy-disk semaphore
+        if: runner.environment != 'github-hosted'
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-heavy-disk.lock
+          holder-file: /tmp/c2pool-heavy-disk.holder
+          slots: "1"
+          holder-env: HEAVY_DISK_LOCK_HOLDER
       - name: Heavy-leg disk headroom guard (+ bounded prune)
         if: runner.environment != 'github-hosted'
         uses: ./.github/actions/heavy-disk-guard
