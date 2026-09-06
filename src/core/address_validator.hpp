@@ -41,6 +41,7 @@ enum class AddressType {
     MONERO_INTEGRATED,      // Monero integrated addresses
     MONERO_STANDARD,        // Monero standard addresses
     ZCASH_SHIELDED,         // Zcash shielded addresses
+    MONERO_SUBADDRESS,      // Monero subaddress ('8...', mainnet network byte 42)
     INVALID
 };
 

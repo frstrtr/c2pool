@@ -29,6 +29,11 @@
 # consumed by later waves; compiles only when a dependent target is built).
 add_subdirectory(coin)
 
+# X2 (W2): daemon-ful monerod adapter library (xmr_node). Unconditional like
+# coin — production lane code; its TUs compile only when a dependent target (the
+# X2 node KAT in test/, or later W3 wire / W5 coinbase legs) is built.
+add_subdirectory(node)
+
 if (BUILD_TESTING)
     add_subdirectory(test)
 endif()

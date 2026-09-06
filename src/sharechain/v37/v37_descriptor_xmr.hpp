@@ -55,13 +55,19 @@
  *   header is fail-closed (no backend => XMR descriptors are INVALID, never
  *   silently accepted).
  *
- *   Reference algorithm (re-expressed, NOT copied) mirrors
+ *   Reference algorithm (re-expressed, NOT copied) mirrors, in intent,
  *   SChernykh/p2pool @ src/wallet.cpp `Wallet::torsion_check()` (GPL-3.0;
- *   combinable into this AGPL-3.0 work under AGPLv3 §13). It decodes each
- *   point with Monero `ge_frombytes_vartime()` (crypto-ops.h, BSD-3, ref10)
- *   and then requires `!fcmp_pp::mul8_is_identity(P) &&
- *   fcmp_pp::torsion_check_vartime(P)` (fcmp_pp_crypto.h). A conforming
- *   backend adapter is provided in xmr_point_check_ref10.cpp.
+ *   combinable into this AGPL-3.0 work under AGPLv3 §13). It decodes each point
+ *   with Monero `ge_frombytes_vartime()` (crypto-ops.h, BSD-3, ref10; rejects
+ *   non-canonical / off-curve), rejects the identity, and requires prime-order
+ *   subgroup membership via the exact cofactor test  [L]P == 𝒪  (L = the
+ *   ed25519 group order). Because the group is Z_L × Z_8 and gcd(L,8)=1, this
+ *   holds IFF P is torsion-free, so it rejects every small-order point AND any
+ *   mixed prime+torsion point. It uses ONLY the ge_* primitives X1 vendored —
+ *   it does NOT depend on monero/fcmp_pp (out of tree; FCMP-fenced to X6). The
+ *   conforming backend adapter is xmr_descriptor_xmr_point_check_ref10.cpp;
+ *   the torsion KAT (test/xmr_torsion_kat.cpp) proves accept/reject including
+ *   the mixed-point adversarial case.
  *
  * FCMP++ / CARROT FENCE  (READ BEFORE EXTENDING)
  *

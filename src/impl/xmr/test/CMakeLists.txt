@@ -48,20 +48,37 @@ if (BUILD_TESTING)
     target_compile_features(xmr_primitives_selfcheck PRIVATE c_std_11 cxx_std_20)
     add_test(NAME xmr_primitives_selfcheck COMMAND xmr_primitives_selfcheck)
 
-    # 2) monerod-adapter mainchain index. STL-only, header-only index.
-    add_executable(xmr_node_index_check
-        ${CMAKE_CURRENT_SOURCE_DIR}/../node/xmr_node_index_check.cpp)
-    target_include_directories(xmr_node_index_check PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../node)
-    target_compile_features(xmr_node_index_check PRIVATE cxx_std_20)
-    add_test(NAME xmr_node_index_check COMMAND xmr_node_index_check)
+    # 2) X2 (W2) monerod adapter KAT. SUPERSEDES the foundation's header-only
+    #    xmr_node_index_check scaffold: the finalized adapter links the xmr_node
+    #    library (../node: RPC + ZMQ decoders) and drives the whole seam through
+    #    the MockMonerodTransport — minijson parse, get_miner_data tip/reorg,
+    #    >=2112 seed reach via ::xmr::coin::rx_seedheight (primitive-reuse, no
+    #    duplicated 2048/64), ZMQ 3-topic decode, submit_block round-trip.
+    #    STL-only + xmr_node; NO RandomX, NO monerod, NO libzmq. Src/ root on the
+    #    path so the "impl/xmr/node/…" and "impl/xmr/coin/…" includes resolve.
+    add_executable(xmr_x2_node_kat x2_adapter_kat.cpp)
+    target_link_libraries(xmr_x2_node_kat PRIVATE xmr_node)
+    target_include_directories(xmr_x2_node_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(xmr_x2_node_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_x2_node_kat COMMAND xmr_x2_node_kat)
 
-    # 3) Family-B receipt envelope + inverted keyed_heavy admission order. STL-only.
-    add_executable(xmr_receipt_admission_check xmr_receipt_admission_check.cpp)
-    target_include_directories(xmr_receipt_admission_check PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt)
-    target_compile_features(xmr_receipt_admission_check PRIVATE cxx_std_20)
-    add_test(NAME xmr_receipt_admission_check COMMAND xmr_receipt_admission_check)
+    # 3) X4 (W2) receipt-envelope KAT. SUPERSEDES the foundation's
+    #    xmr_receipt_admission_check scaffold: exercises the FINALIZED admission
+    #    pipeline (xmr_admission.hpp) + the real verify bodies
+    #    (xmr_receipt_verify.cpp) over X1's coin primitives (xmr_blob via
+    #    xmr_coin). RandomX is CI-gated INSIDE the test (rx_check null ->
+    #    stage-5 SkippedCIGated), so this target carries NO RandomX dependency
+    #    and runs in the ordinary lane. Links xmr_coin for the coinbase
+    #    serializer used by KAT-2.
+    add_executable(xmr_receipt_kat
+        xmr_receipt_kat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt/xmr_receipt_verify.cpp)
+    target_link_libraries(xmr_receipt_kat PRIVATE xmr_coin)
+    target_include_directories(xmr_receipt_kat PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
+        ${CMAKE_CURRENT_SOURCE_DIR}/../coin)
+    target_compile_features(xmr_receipt_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_receipt_kat COMMAND xmr_receipt_kat)
 
     # 4) W3 carrier wire codec + RandomX DoS budget. STL-only.
     add_executable(xmr_wire_dos_check xmr_wire_dos_check.cpp)

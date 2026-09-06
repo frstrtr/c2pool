@@ -120,7 +120,8 @@ void BlockchainAddressValidator::initialize_monero_configs() {
     xmr_mainnet.min_length = 95;
     xmr_mainnet.max_length = 106;
     xmr_mainnet.custom_validator = [](const std::string& addr) {
-        // Monero addresses start with 4 (standard) or 8 (integrated)
+        // Monero mainnet: '4' = standard/integrated (integrated is 106 chars),
+        // '8' = subaddress (network byte 42). Both are valid receive prefixes.
         return (addr[0] == '4' || addr[0] == '8') && utils::is_base58_string(addr);
     };
     
@@ -443,11 +444,22 @@ bool BlockchainAddressValidator::validate_monero_address(const std::string& addr
         return false;
     }
     
+    // Mainnet network bytes fix the human-readable leading char: standard '4'
+    // (byte 18), integrated '4' (byte 19), subaddress '8' (byte 42). Standard
+    // vs integrated is NOT the leading char (both are '4') but the LENGTH: an
+    // integrated address embeds an 8-byte payment ID and base58-encodes to 106
+    // chars; a standard address is 95.
     if (address[0] == '4') {
-        result.type = AddressType::MONERO_STANDARD;
+        if (address.length() == 106) {
+            result.type = AddressType::MONERO_INTEGRATED;
+            result.requires_memo = true;   // carries the embedded payment ID
+        } else {
+            result.type = AddressType::MONERO_STANDARD;
+        }
     } else if (address[0] == '8') {
-        result.type = AddressType::MONERO_INTEGRATED;
-        result.requires_memo = true;
+        // '8...' (network byte 42) is a SUBADDRESS, not an integrated address.
+        // A subaddress carries no payment ID and needs no memo.
+        result.type = AddressType::MONERO_SUBADDRESS;
     } else if (address[0] == '9' || address[0] == 'A') {
         result.type = AddressType::MONERO_STANDARD;
         result.network = Network::TESTNET;
@@ -580,6 +592,7 @@ std::string BlockchainAddressValidator::get_address_type_name(AddressType type) 
         case AddressType::ETHEREUM_STYLE: return "Ethereum Style";
         case AddressType::MONERO_STANDARD: return "Monero Standard";
         case AddressType::MONERO_INTEGRATED: return "Monero Integrated";
+        case AddressType::MONERO_SUBADDRESS: return "Monero Subaddress";
         case AddressType::ZCASH_SHIELDED: return "Zcash Shielded";
         default: return "Invalid";
     }

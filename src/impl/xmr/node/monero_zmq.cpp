@@ -2,93 +2,135 @@
  * This file is part of c2pool <https://github.com/frstrtr/c2pool>
  * Copyright (c) 2024-2026 The c2pool developers
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.  (Full header: monero_zmq.hpp)
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Affero General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your option)
+ * any later version. See COPYING in the repository root.
  */
 
 // ===========================================================================
-// src/impl/xmr/node/monero_zmq.cpp  --  subscribe + dispatch; per-topic parse is
-// the X2 rapidjson stub (documented field paths).
+// src/impl/xmr/node/monero_zmq.cpp   (Track X / Family B: XMR lane, X2)
+//
+// AUTHORED for c2pool (not ported). minijson decoders for the three monerod ZMQ
+// topics. Field keys follow monero-project src/serialization/json_object.cpp.
+// Production swaps in the vetted rapidjson path; this exists so the topic->struct
+// MAPPING is testable single-TU on an OOM host.
 // ===========================================================================
 #include "monero_zmq.hpp"
 
-#include <cstring>
+#include "minijson.hpp"
 
 namespace c2pool::xmr::node {
+
+namespace mj = minijson;
+
 namespace {
 
-// PARSE STUBS (X2). Documented payload shapes; replace with rapidjson parse.
-// Each returns whether the parse succeeded so a malformed frame is skipped (as
-// p2pool logs and skips a bad frame rather than aborting).
-
-// json-minimal-txpool_add : JSON array of objects, one per newly-added tx.
-//   [{"id":hex32,"blob_size":u64,"weight":u64,"fee":u64}, ...]
-bool parse_txpool_add(const char* /*body*/, std::size_t /*len*/,
-                      IMoneroNodeObserver& /*obs*/) {
-    // for each element -> TxBacklogEntry{id,blob_size,weight,fee,
-    //   time_received=now}; obs.on_txpool_add(e);
-    return false; // TODO(X2): rapidjson array walk
+Difficulty128 read_difficulty(const mj::Value& obj) {
+    Difficulty128 d;
+    d.lo = obj["difficulty"].as_u64();
+    d.hi = obj["difficulty_top64"].as_u64();
+    return d;
 }
 
-// json-full-miner_data : JSON object identical to get_miner_data's result.
-//   {"major_version","height","prev_id","seed_hash","difficulty",
-//    "difficulty_top64","median_weight","already_generated_coins",
-//    "median_timestamp","tx_backlog":[{"id","weight","fee","blob_size"}]}
-bool parse_miner_data(const char* /*body*/, std::size_t /*len*/,
-                      IMoneroNodeObserver& /*obs*/) {
-    // fill MinerData (see monero_rpc.cpp parse_miner_data field paths);
-    // md.local_recv_ns = monotonic_now(); obs.on_miner_data(md);
-    return false; // TODO(X2)
+// Read a MinerData from a minijson object (the miner_data body, no RPC wrapper).
+std::optional<MinerData> read_miner_data_obj(const mj::Value& r) {
+    if (!r.is_object()) return std::nullopt;
+    MinerData md;
+    md.major_version           = static_cast<std::uint8_t>(r["major_version"].as_u32());
+    md.height                  = r["height"].as_u64();
+    md.difficulty              = read_difficulty(r);
+    md.median_weight           = r["median_weight"].as_u64();
+    md.already_generated_coins = r["already_generated_coins"].as_u64();
+    md.median_timestamp        = r["median_timestamp"].as_u64();
+    if (!mj::hex_to_hash(r["prev_id"].as_string(), md.prev_id)) return std::nullopt;
+    mj::hex_to_hash(r["seed_hash"].as_string(), md.seed_hash);
+
+    const mj::Value& tb = r["tx_backlog"];
+    if (tb.is_array()) {
+        md.tx_backlog.reserve(tb.arr.size());
+        for (const auto& e : tb.arr) {
+            TxBacklogEntry t;
+            mj::hex_to_hash(e["id"].as_string(), t.id);
+            t.weight    = e["weight"].as_u64();
+            t.fee       = e["fee"].as_u64();
+            t.blob_size = e["blob_size"].as_u64();
+            md.tx_backlog.push_back(t);
+        }
+    }
+    if (!md.valid()) return std::nullopt;
+    return md;
 }
 
-// json-full-chain_main : JSON array of just-accepted main-chain blocks. Each
-// carries block CONTENT (miner_tx, extra, inputs[gen->height], outputs,
-// timestamp, tx-hash list) but NOT the canonical block id. The id is computed by
-// the coin leg's block-id hasher (Keccak tree hash over the 76-B hashing blob
-// header) OR correlated with the next miner_data.prev_id (p2pool's approach).
-// `reward` = sum(miner_tx.vout amounts). The mined tx-hash list is returned so
-// the adapter can prune them from the backlog (p2pool: m_mempool->remove(...)).
-bool parse_chain_main(const char* /*body*/, std::size_t /*len*/,
-                      IMoneroNodeObserver& /*obs*/,
-                      std::vector<Hash>& /*mined_tx_hashes_out*/) {
-    // for each block -> ChainMainBlock{height (from gen input),
-    //   timestamp, reward (sum vout), prev_id (from header or correlation),
-    //   id (coin-leg hasher)}; obs.on_chain_main(cmb);
-    // collect its tx hashes into mined_tx_hashes_out.
-    return false; // TODO(X2)
+// Decode one cryptonote block object into ChainMainZmq (directly-present fields).
+std::optional<ChainMainZmq> read_chain_block_obj(const mj::Value& b) {
+    if (!b.is_object()) return std::nullopt;
+    ChainMainZmq c;
+    c.major_version = static_cast<std::uint8_t>(b["major_version"].as_u32());
+    c.minor_version = static_cast<std::uint8_t>(b["minor_version"].as_u32());
+    c.timestamp     = b["timestamp"].as_u64();
+    mj::hex_to_hash(b["prev_id"].as_string(), c.prev_id);
+
+    const mj::Value& miner = b["miner_tx"];
+    // height from txin_gen: miner_tx.vin[0].gen.height
+    const mj::Value& vin = miner["vin"];
+    if (vin.is_array() && !vin.arr.empty()) {
+        const mj::Value& gen = vin.arr[0]["gen"];
+        c.height = gen["height"].as_u64();
+    }
+    // plaintext reward = sum of miner_tx.vout[].amount
+    const mj::Value& vout = miner["vout"];
+    if (vout.is_array()) {
+        std::uint64_t sum = 0;
+        for (const auto& o : vout.arr) sum += o["amount"].as_u64();
+        c.reward = sum;
+    }
+    const mj::Value& txh = b["tx_hashes"];
+    if (txh.is_array()) c.n_tx = txh.arr.size();
+
+    // Minimally valid if we recovered a height and a parent id.
+    c.valid = (c.height != 0) && !is_zero(c.prev_id);
+    return c;
 }
 
 } // namespace
 
-bool MoneroZmqReader::start(const std::string& zmq_endpoint) {
-    sub_.set_frame_handler([this](const std::string& topic, const char* body, std::size_t len) {
-        on_frame(topic, body, len);
-    });
-    const bool ok = sub_.connect(zmq_endpoint);
-    sub_.subscribe(ZMQ_TOPIC_CHAIN_MAIN);
-    sub_.subscribe(ZMQ_TOPIC_MINER_DATA);
-    sub_.subscribe(ZMQ_TOPIC_TXPOOL_ADD);
-    sub_.start();
-    return ok;
+std::optional<MinerData> ZmqSubscriber::parse_miner_data_payload(const std::vector<char>& payload) {
+    mj::Value root;
+    if (!mj::parse(payload.data(), payload.size(), root)) return std::nullopt;
+    // ZMQ payload is the object at top level; tolerate a {"result":...} wrapper too.
+    if (root["result"].is_object()) return read_miner_data_obj(root["result"]);
+    return read_miner_data_obj(root);
 }
 
-void MoneroZmqReader::stop() { sub_.stop(); }
-
-void MoneroZmqReader::on_frame(const std::string& topic, const char* body, std::size_t len) {
-    if (topic == ZMQ_TOPIC_TXPOOL_ADD) {
-        parse_txpool_add(body, len, observer_);
-    } else if (topic == ZMQ_TOPIC_MINER_DATA) {
-        parse_miner_data(body, len, observer_);
-    } else if (topic == ZMQ_TOPIC_CHAIN_MAIN) {
-        std::vector<Hash> mined;              // pruned from the backlog by the adapter
-        parse_chain_main(body, len, observer_, mined);
-        // The adapter, as the observer, prunes `mined` from MainchainIndex's
-        // backlog inside on_chain_main using the block's tx-hash list; we keep
-        // the collection local here to mirror p2pool's remove-on-mined step.
+std::vector<TxBacklogEntry> ZmqSubscriber::parse_txpool_add_payload(const std::vector<char>& payload) {
+    std::vector<TxBacklogEntry> out;
+    mj::Value root;
+    if (!mj::parse(payload.data(), payload.size(), root)) return out;
+    if (!root.is_array()) return out;
+    out.reserve(root.arr.size());
+    for (const auto& e : root.arr) {
+        TxBacklogEntry t;
+        mj::hex_to_hash(e["id"].as_string(), t.id);
+        t.blob_size     = e["blob_size"].as_u64();
+        t.weight        = e["weight"].as_u64();
+        t.fee           = e["fee"].as_u64();
+        t.time_received = e["receive_time"].as_u64();
+        if (t.weight == 0) t.weight = t.blob_size; // some builds omit weight
+        out.push_back(t);
     }
-    // Any other topic: ignore (we subscribed to exactly three).
+    return out;
+}
+
+std::optional<ChainMainZmq> ZmqSubscriber::parse_chain_main_payload(const std::vector<char>& payload) {
+    mj::Value root;
+    if (!mj::parse(payload.data(), payload.size(), root)) return std::nullopt;
+    // Array of added blocks (newest last); or a single block object.
+    if (root.is_array()) {
+        if (root.arr.empty()) return std::nullopt;
+        return read_chain_block_obj(root.arr.back());
+    }
+    return read_chain_block_obj(root);
 }
 
 } // namespace c2pool::xmr::node

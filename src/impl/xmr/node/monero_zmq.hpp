@@ -2,104 +2,97 @@
  * This file is part of c2pool <https://github.com/frstrtr/c2pool>
  * Copyright (c) 2024-2026 The c2pool developers
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Affero General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your option)
+ * any later version. See COPYING in the repository root.
  */
 
 // ===========================================================================
-// src/impl/xmr/node/monero_zmq.hpp
+// src/impl/xmr/node/monero_zmq.hpp   (Track X / Family B: XMR lane, X2)
 //
-// AUTHORED for c2pool (not ported). The monerod ZMQ-pub subscriber for the XMR
-// lane. Subscribes to the three topics and forwards parsed events to an
-// IMoneroNodeObserver. The zmq socket is behind IZmqSubscriber so this carries no
-// libzmq / cppzmq dependency and is syntax-checkable in isolation.
+// AUTHORED for c2pool (not ported). Decodes the three monerod --zmq-pub topics
+// the daemon-ful lane subscribes to, behind the same IMonerodTransport seam:
+//   json-full-miner_data   -> MinerData        (primary tip/template trigger)
+//   json-minimal-txpool_add -> [TxBacklogEntry] (backlog deltas)
+//   json-full-chain_main   -> ChainMainZmq     (a block was added: reward/height)
 //
-// PATTERN PROVENANCE (topic set + dispatch; clean reimpl, NO lines copied):
-//   SChernykh/p2pool v4.18 @ 128643114f9bea55bfdb95462eaeffa2e3f666bd
-//     src/zmq_reader.cpp  set(zmq::sockopt::subscribe, "json-full-chain_main");
-//                         set(..., "json-full-miner_data");
-//                         set(..., "json-minimal-txpool_add");
-//                         parse(): strcmp(topic,...) -> handle_tx /
-//                         handle_miner_data / handle_chain_main /
-//                         handle_monero_block_broadcast.
-//     src/zmq_reader.h    class ZMQReader; the worker+monitor thread pattern,
-//                         the TxMempoolData/MinerData/ChainMain scratch members.
+// PATTERN PROVENANCE (topics + decode intent; clean reimpl, NO lines copied):
+//   SChernykh/p2pool (GPL-3.0; portable to AGPL-3.0 via AGPLv3 §13)
+//     src/zmq_reader.cpp  ZMQReader subscribing to exactly these three topics and
+//                         dispatching one decoded message per callback; p2pool
+//                         treats json-full-miner_data as the primary new-block
+//                         trigger (get_miner_data pushed on each block).
 //
-//   v37 DELTAS:
-//     * handle_monero_block_broadcast is DROPPED (it re-gossips a found Monero
-//       block for the p2pool pool-model; v37 publishes only via submit_block).
-//     * the transport thread + monitor are abstracted behind IZmqSubscriber so
-//       the reader is unit-testable and loop-agnostic.
-//     * the chain_main block id is NOT taken from the ZMQ payload (which carries
-//       content, not the canonical id): it is either computed by the coin leg's
-//       block-id hasher or correlated with the next miner_data.prev_id — exactly
-//       p2pool's "data.id not filled in here, but c.id should be available".
+// WIRE-SCHEMA NOTE: json-full-chain_main carries the newly added cryptonote block
+// object(s) (monero-project src/serialization/json_object.cpp keys: "miner_tx",
+// "vin"/"gen"/"height", "vout"/"amount", "tx_hashes", header "prev_id"/"timestamp").
+// The block *id* is NOT in that payload -- it is Keccak(hashing_blob), computed by
+// the X1 coin leg. So this decoder returns ChainMainZmq (the directly-available
+// fields incl. plaintext coinbase reward), and the adapter uses it to annotate the
+// tip's reward for W4's CONS-2 audit; the authoritative tip is driven by the
+// unambiguous json-full-miner_data (prev_id = new tip id, height = tip+1).
 // ===========================================================================
 #pragma once
 
-#include "xmr_node_observer.hpp"
+#include "monerod_transport.hpp"
 #include "xmr_node_types.hpp"
 
-#include <cstddef>
 #include <functional>
-#include <string>
+#include <optional>
 #include <vector>
 
 namespace c2pool::xmr::node {
 
-// The three ZMQ topics monerod publishes (monerod --zmq-pub tcp://...:18083).
-inline constexpr const char* ZMQ_TOPIC_CHAIN_MAIN  = "json-full-chain_main";
-inline constexpr const char* ZMQ_TOPIC_MINER_DATA  = "json-full-miner_data";
-inline constexpr const char* ZMQ_TOPIC_TXPOOL_ADD  = "json-minimal-txpool_add";
-
-// --- transport seam ---------------------------------------------------------
-// Real build: a ZMQ_SUB socket on its own thread (cppzmq), with a monitor for
-// connect/disconnect like p2pool's Monitor. Delivers each publication already
-// split into (topic, json_body). A monerod pub frame is "topic:json"; the impl
-// splits at the first ':' after the subscribed prefix.
-class IZmqSubscriber {
-public:
-    virtual ~IZmqSubscriber() = default;
-    using FrameCb = std::function<void(const std::string& topic, const char* body, std::size_t len)>;
-
-    virtual bool connect(const std::string& endpoint) = 0; // e.g. tcp://127.0.0.1:18083
-    virtual void subscribe(const std::string& topic) = 0;
-    virtual void set_frame_handler(FrameCb cb) = 0;
-    virtual void start() = 0;   // begin the receive loop (own thread)
-    virtual void stop() = 0;
-    virtual bool is_connected() const = 0;
+// The directly-decodable content of a json-full-chain_main block. `id` is left
+// for the coin leg to fill (Keccak of the hashing blob); `reward` is the summed
+// plaintext coinbase amount (Monero coinbase amounts are not RingCT-masked).
+struct ChainMainZmq {
+    std::uint8_t  major_version = 0;
+    std::uint8_t  minor_version = 0;
+    std::uint64_t height    = 0;    // miner_tx.vin[0].gen.height
+    std::uint64_t timestamp = 0;
+    Hash          prev_id{};        // header prev_id
+    std::uint64_t reward    = 0;    // sum of miner_tx.vout[].amount (piconero)
+    std::uint64_t n_tx      = 0;    // tx_hashes.size()
+    bool          valid     = false;
 };
 
-// ===========================================================================
-// MoneroZmqReader — wires the three subscriptions to the observer callbacks.
-// ===========================================================================
-class MoneroZmqReader {
+class ZmqSubscriber {
 public:
-    MoneroZmqReader(IZmqSubscriber& sub, IMoneroNodeObserver& observer)
-        : sub_(sub), observer_(observer) {}
+    explicit ZmqSubscriber(IMonerodTransport& transport) : tx_(transport) {}
 
-    // Connect + subscribe to all three topics + start the loop. Returns false if
-    // the initial connect fails (the real subscriber then auto-retries).
-    bool start(const std::string& zmq_endpoint);
-    void stop();
-    bool is_connected() const { return sub_.is_connected(); }
+    // Callbacks the adapter wires. Any may be left null.
+    std::function<void(const MinerData&)>              on_miner_data;
+    std::function<void(std::vector<TxBacklogEntry>)>   on_txpool_add;
+    std::function<void(const ChainMainZmq&)>           on_chain_main;
+
+    // Subscribe to all three topics through the transport seam.
+    void start() {
+        tx_.zmq_subscribe(ZMQ_TOPIC_MINER_DATA, [this](const ZmqFrame& f) {
+            if (auto md = parse_miner_data_payload(f.payload); md && on_miner_data) on_miner_data(*md);
+        });
+        tx_.zmq_subscribe(ZMQ_TOPIC_TXPOOL_ADD, [this](const ZmqFrame& f) {
+            auto txs = parse_txpool_add_payload(f.payload);
+            if (on_txpool_add) on_txpool_add(std::move(txs));
+        });
+        tx_.zmq_subscribe(ZMQ_TOPIC_CHAIN_MAIN, [this](const ZmqFrame& f) {
+            if (auto c = parse_chain_main_payload(f.payload); c && c->valid && on_chain_main) on_chain_main(*c);
+        });
+    }
+
+    // --- static payload decoders (public so the KAT drives them directly) --------
+    // json-full-miner_data payload is the miner_data object at TOP LEVEL (no
+    // JSON-RPC {"result":...} wrapper, unlike the get_miner_data RPC response).
+    static std::optional<MinerData> parse_miner_data_payload(const std::vector<char>& payload);
+    // json-minimal-txpool_add payload is a JSON array of {id, blob_size, weight, fee}.
+    static std::vector<TxBacklogEntry> parse_txpool_add_payload(const std::vector<char>& payload);
+    // json-full-chain_main payload is a JSON array of added cryptonote blocks
+    // (newest last); returns the newest decoded (the one that moved the tip).
+    static std::optional<ChainMainZmq> parse_chain_main_payload(const std::vector<char>& payload);
 
 private:
-    // Frame dispatch (topic -> parse -> observer). Mirrors p2pool parse().
-    void on_frame(const std::string& topic, const char* body, std::size_t len);
-
-    IZmqSubscriber&      sub_;
-    IMoneroNodeObserver& observer_;
+    IMonerodTransport& tx_;
 };
 
 } // namespace c2pool::xmr::node
