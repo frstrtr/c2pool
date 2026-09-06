@@ -1212,6 +1212,18 @@ jobs:
       - name: Build leak harness
         run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j8
 
+      # ── Reward-safety + address-registry gates (Qt-free / Qt-Core; no display) ─
+      # These prove the per-coin argv is reward-safe (no silent embedded arm, no
+      # forced --give-author 0, only catalog-valid flags per binary) and that the
+      # payout-address check matches the node registry. They were ctest-registered
+      # but never built/run in CI before — build + run them here.
+      - name: Build + run reward-safe launch and address-validator gates
+        run: |
+          cmake --build build-qt \
+            --target c2pool-qt_test_reward_safe_launch c2pool-qt_test_address_validator -j8
+          ./build-qt/c2pool-qt_test_reward_safe_launch
+          ./build-qt/c2pool-qt_test_address_validator
+
       - name: Run leak harness under xvfb
         continue-on-error: true
         env:

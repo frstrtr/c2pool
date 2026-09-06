@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include "LaunchCommand.hpp"   // c2pool_qt::PerCoinParams (marshal target)
+
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
@@ -94,6 +96,9 @@ private:
     /// Build the command line for a PerCoinRun coin (c2pool-dash/-dgb/-bch,
     /// reward-SAFE dashd-RPC arm; embedded arm only when opted in).
     QString buildPerCoinCommand() const;
+    /// Marshal the form + active profile into the Qt-free command core. Shared
+    /// by buildPerCoinCommand() and launch()'s reward-safety precheck.
+    c2pool_qt::PerCoinParams marshalPerCoinParams() const;
     /// Currently-selected chain symbol (chain combo userData/text).
     QString currentChain() const;
     /// Apply profile-driven UI state (daemon-group label, per-coin note,
@@ -142,6 +147,7 @@ private:
     QCheckBox*     autoDetectWalletCheck_; ///< --auto-detect-wallet (default on)
     QDoubleSpinBox* feeSpinBox_;        ///< -f / --fee (node-owner fee %)
     QDoubleSpinBox* giveAuthorSpinBox_; ///< --give-author (dev donation %)
+    QCheckBox*     giveAuthorZeroAckCheck_{nullptr}; ///< explicit 0% opt-in (reward-safety ack)
     QLineEdit*     nodeOwnerAddrEdit_;
     QLineEdit*     nodeOwnerScriptEdit_; ///< --node-owner-script (hex)
     QComboBox*     redistributeCombo_;  ///< pplns / fee / boost / donate
@@ -169,6 +175,12 @@ private:
     QLineEdit* messageBlobEdit_;     ///< --message-blob-hex
     QLineEdit* coinbaseTextEdit_;    ///< --coinbase-text
 
+    // ── PerCoinRun run-loop controls (DASH/DGB/BCH; catalog-gated per binary) ─
+    QGroupBox* runLoopGroup_{nullptr};        ///< shown only for PerCoinRun coins
+    QCheckBox* coinP2pDiscoverCheck_{nullptr};///< --coin-p2p-discover (transport, reward-neutral)
+    QCheckBox* noP2pRelayCheck_{nullptr};     ///< --no-p2p-relay (DASH/DGB)
+    QLineEdit* bchAnchorEdit_{nullptr};       ///< --anchor H:HASH (BCH cold-start ABLA floor)
+
     // ── ★ Advanced / embedded (opt-in, REWARD-UNSAFE) ────────────────────────
     // Default OFF. This is the ONLY place --coin-p2p-connect /
     // --embedded-mainnet may be emitted. Guarded per the DASH hotel
@@ -178,6 +190,11 @@ private:
     QPlainTextEdit* embeddedP2pPeersEdit_{nullptr}; ///< HOST:PORT per line
     QCheckBox*      embeddedMainnetCheck_{nullptr}; ///< enables --embedded-mainnet (default OFF, DASH)
     QLabel*         embeddedWarnLabel_{nullptr};
+    // Embedded coin-network producer target (DGB --coin-daemon + --coin-magic +
+    // --coin-genesis). Emitted ONLY when embeddedP2pCheck_ is on.
+    QLineEdit*      embeddedCoinDaemonEdit_{nullptr};  ///< --coin-daemon HOST:PORT (DGB)
+    QLineEdit*      embeddedCoinMagicEdit_{nullptr};   ///< --coin-magic / --coin-p2p-magic HEX
+    QLineEdit*      embeddedCoinGenesisEdit_{nullptr}; ///< --coin-genesis HASH (DGB)
 
     // ── Command Preview ─────────────────────────────────────────────────────
     QTextEdit*   cmdPreview_;
