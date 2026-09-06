@@ -17,18 +17,19 @@
 //
 //   • CliFamily::PerCoinRun — the dedicated per-coin binaries
 //     (c2pool-dash / c2pool-dgb / c2pool-bch) whose run-loop is stood up
-//     with a subcommand (`--run` or `--pool`) and whose parent-daemon
-//     link is the reward-SAFE RPC arm: `--coin-rpc HOST:PORT` +
-//     `--coin-rpc-auth PATH` (or `--rpc-conf PATH` for BCHN). The
-//     rpcpassword NEVER touches argv — it is read from the coin's .conf.
+//     with a subcommand (`--run` or `--pool`). DASH's default launch is a
+//     bare `--run` (DAEMONLESS); the dashd RPC arm (`--coin-rpc HOST:PORT`
+//     + `--coin-rpc-auth PATH`) is an explicit opt-in. DGB/BCH keep their
+//     RPC arm (`--coin-rpc` / `--rpc-conf PATH`). The rpcpassword NEVER
+//     touches argv — it is read from the coin's .conf.
 //
-// ★ REWARD SAFETY: the embedded coin-network arm (`--coin-p2p-connect`
-//   and `--embedded-mainnet`) is reward-UNSAFE until validated and is
-//   NEVER emitted by default. PageLaunch only emits it from an explicit,
-//   default-OFF "Advanced / embedded (opt-in, reward-unsafe)" control.
-//   See the DASH hotel incident: an unguarded embedded arm produced
-//   reward-unsafe blocks. The default per-coin launch is the dashd-RPC
-//   arm.
+// ★ REWARD SAFETY: the panel only assembles argv; the node's own
+//   good-citizen defaults own the reward decision. The embedded
+//   coin-network knobs (`--coin-p2p-connect` / `--embedded-mainnet`) are
+//   emitted ONLY from an explicit, default-OFF "Advanced / embedded"
+//   control. DASH's daemonless default already runs the embedded arm with
+//   `--embedded-mainnet` ON in the node, so the panel does not emit it for
+//   that default.
 //
 // This header mirrors the coin-generic, profile-driven approach the web
 // dashboard/explorer already use (see CoinBridge's descriptor table):
@@ -123,7 +124,9 @@ inline const CoinProfile* coinProfiles(int& countOut)
 
         // ── PerCoinRun: dedicated per-coin binaries ──────────────────────────
         // DASH — X11, masternode-payee coin, dashd parent. Default launch is
-        // the reward-SAFE dashd-RPC arm; embedded P2P is opt-in only.
+        // bare `--run` (DAEMONLESS); the dashd RPC arm and the embedded P2P
+        // knobs are explicit opt-ins. (coinRpcFlag/rpcAuthFlag below are
+        // display-only now — the catalog drives emission.)
         {"dash", "Dash", "c2pool-dash", "dashd", "X11",
          "X… / 7… (P2PKH/P2SH)",
          CliFamily::PerCoinRun, "--run", c2pool::catalog::Bin::BIN_DASH,

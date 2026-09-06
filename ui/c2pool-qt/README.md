@@ -27,7 +27,7 @@ uses, plus its binary, daemon, algo and default RPC ports:
 | litecoin | `c2pool` | litecoind | Scrypt | unified `--net litecoin` |
 | bitcoin | `c2pool` | bitcoind | SHA-256d | unified `--net bitcoin` |
 | dogecoin | `c2pool` | dogecoind | Scrypt (AuxPoW) | unified `--net dogecoin` |
-| dash | `c2pool-dash` | dashd | X11 | per-coin `--run` (masternode-payee) |
+| dash | `c2pool-dash` | dashd | X11 | per-coin `--run` (daemonless; masternode-payee) |
 | digibyte | `c2pool-dgb` | digibyted | Scrypt | per-coin `--run` (experimental) |
 | bitcoincash | `c2pool-bch` | bitcoind (BCHN) | SHA-256d | per-coin `--pool` (experimental) |
 
@@ -36,17 +36,21 @@ mirroring the coin-generic web dashboard/explorer.
 
 ## ★ Reward safety
 
-The default per-coin launch profile is the reward-SAFE dashd-RPC arm
-(`--coin-rpc HOST:PORT` + `--coin-rpc-auth PATH`; the rpcpassword is read
-from the coin's .conf and never placed on argv). The embedded coin-network
-arm (`--coin-p2p-connect` / `--embedded-mainnet`) is reward-UNSAFE until
-validated and is **default OFF** — it is emitted only from the explicit
-"Advanced / embedded (opt-in — REWARD-UNSAFE)" controls. See the DASH hotel
-incident that motivated this gate.
+The panel only assembles argv — the node's own good-citizen defaults own the
+reward decision. The default DASH launch is a bare `--run` (**daemonless** cut
+mode): with no dashd arm the node keeps its serving levers ON (embedded-mainnet
+included), so the panel does not emit `--embedded-mainnet` there. Attaching an
+external dashd (`--coin-rpc HOST:PORT` + `--coin-rpc-auth PATH`; the rpcpassword
+is read from the coin's .conf and never placed on argv) is an explicit opt-in
+("Attach external dashd"). The embedded coin-network knobs
+(`--coin-p2p-connect` / `--embedded-mainnet`) are **default OFF** — emitted only
+from the explicit "Advanced / embedded" controls (transport pinning / explicit
+gate-lift). The author donation is left to the binary default (0.1% / BTC 0.5%)
+unless explicitly overridden, and `--give-author 0` is never emitted silently.
 
 The invariant is unit-tested Qt-free in `test/test_reward_safe_launch.cpp`
-(the default DASH command omits both flags); build tests with
-`-DC2POOL_QT_BUILD_TESTS=ON` and run via `ctest`.
+(the default DASH command is a bare `--run` and omits the dashd/embedded arms);
+build tests with `-DC2POOL_QT_BUILD_TESTS=ON` and run via `ctest`.
 
 ## TODO (qt-steward)
 

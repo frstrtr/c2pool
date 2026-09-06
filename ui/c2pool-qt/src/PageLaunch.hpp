@@ -24,20 +24,21 @@ class SettingsStore;
 /// Coin-generic (profile-driven — see CoinProfiles.hpp). Supports both
 /// c2pool launch CLIs: the unified `c2pool --net …` binary (LTC/BTC/DOGE)
 /// and the dedicated per-coin binaries (c2pool-dash / c2pool-dgb /
-/// c2pool-bch) whose run-loop uses the reward-SAFE `--coin-rpc` /
-/// `--coin-rpc-auth` arm.
+/// c2pool-bch). DASH runs DAEMONLESS by default (bare `--run`); the dashd
+/// `--coin-rpc` / `--coin-rpc-auth` arm is an explicit opt-in ("Attach
+/// external dashd").
 ///
 /// Provides a GUI form covering the important c2pool CLI flags:
-///   • Operation mode (integrated / sharechain / solo)
+///   • Operation mode (integrated / sharechain / solo / custodial / standalone)
 ///   • Network (litecoin / bitcoin / dogecoin / dash / digibyte /
 ///     bitcoincash, testnet toggle)
 ///   • Binary path + ports (P2P, stratum, HTTP API)
-///   • Parent coin-daemon RPC credentials / conf-file path
+///   • Parent coin-daemon RPC credentials / conf-file path (DASH: opt-in)
 ///   • Payout address, node-owner fee (-f), dev donation (--give-author)
 ///   • Redistribute mode for invalid-address miners (--redistribute)
 ///   • Merged-mining chains table (--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P])
-///   • ★ Advanced / embedded (opt-in, reward-UNSAFE) — default OFF; the
-///     only place --coin-p2p-connect / --embedded-mainnet can be emitted
+///   • Advanced / embedded coin-network (transport + gate-lift) — opt-in;
+///     the only place --coin-p2p-connect / --embedded-mainnet can be emitted
 ///   • Generated-command preview
 ///   • Launch / Stop / Restart daemon buttons
 ///
@@ -93,8 +94,9 @@ private:
     QGroupBox* makeGroup(const QString& title);
     /// Build the command line for a LegacyUnified coin (`c2pool --net …`).
     QString buildLegacyCommand() const;
-    /// Build the command line for a PerCoinRun coin (c2pool-dash/-dgb/-bch,
-    /// reward-SAFE dashd-RPC arm; embedded arm only when opted in).
+    /// Build the command line for a PerCoinRun coin (c2pool-dash/-dgb/-bch).
+    /// DASH default is bare `--run` (daemonless); the dashd-RPC arm and the
+    /// embedded transport knobs are emitted only when their opt-ins are on.
     QString buildPerCoinCommand() const;
     /// Marshal the form + active profile into the Qt-free command core. Shared
     /// by buildPerCoinCommand() and launch()'s reward-safety precheck.
@@ -115,7 +117,7 @@ private:
     QProcess* process_;
 
     // ── Mode / Network ──────────────────────────────────────────────────────
-    QComboBox* modeCombo_;       ///< integrated / sharechain / solo
+    QComboBox* modeCombo_;       ///< integrated / sharechain / solo / custodial / standalone
     QCheckBox* testnetCheck_;
     QComboBox* chainCombo_;      ///< coin-generic (CoinProfiles.hpp order)
     QLabel*    coinNoteLabel_{nullptr};  ///< per-coin note (masternode / experimental / CLI arm)
@@ -130,6 +132,7 @@ private:
 
     // ── Parent Coin Daemon ──────────────────────────────────────────────────
     QGroupBox* coindGroup_{nullptr}; ///< relabelled per coin (daemon name)
+    QCheckBox* dashdAttachCheck_{nullptr}; ///< DASH: attach external dashd (--coin-rpc/--coin-rpc-auth); default OFF = daemonless
     QLineEdit* coindHostEdit_;
     QSpinBox*  coindPortSpin_;       ///< 0 = auto-detect from chain
     QLineEdit* rpcUserEdit_;
@@ -181,10 +184,12 @@ private:
     QCheckBox* noP2pRelayCheck_{nullptr};     ///< --no-p2p-relay (DASH/DGB)
     QLineEdit* bchAnchorEdit_{nullptr};       ///< --anchor H:HASH (BCH cold-start ABLA floor)
 
-    // ── ★ Advanced / embedded (opt-in, REWARD-UNSAFE) ────────────────────────
-    // Default OFF. This is the ONLY place --coin-p2p-connect /
-    // --embedded-mainnet may be emitted. Guarded per the DASH hotel
-    // incident: an unguarded embedded arm produced reward-unsafe blocks.
+    // ── ★ Advanced / embedded coin-network (transport + gate-lift) ───────────
+    // Opt-in, default OFF. This is the ONLY place --coin-p2p-connect /
+    // --embedded-mainnet may be emitted. DASH runs the embedded arm by default
+    // when daemonless (bare --run, --embedded-mainnet ON in the node); these
+    // controls only pin peers or force the flag explicitly (needed when dashd is
+    // attached, where it defaults OFF).
     QGroupBox*      embeddedGroup_{nullptr};
     QCheckBox*      embeddedP2pCheck_{nullptr};   ///< enables --coin-p2p-connect (default OFF)
     QPlainTextEdit* embeddedP2pPeersEdit_{nullptr}; ///< HOST:PORT per line
