@@ -320,9 +320,9 @@ void PageLaunch::setupUi()
         giveAuthorSpinBox_->setSuffix(" %");
         giveAuthorSpinBox_->setValue(0.0);
         // ★ Tri-state / reward-safety: at 0.00 the flag is OMITTED so the
-        // binary default applies (0.1% for DASH/LTC/BIP110, 0.5% for BTC). The
-        // special-value text says so; an explicit 0 requires the ack below.
-        giveAuthorSpinBox_->setSpecialValueText("binary default (0.1% / BTC 0.5%)");
+        // binary default applies (0.1% for all coins). The special-value text
+        // says so; an explicit 0 requires the ack below.
+        giveAuthorSpinBox_->setSpecialValueText("binary default (0.1% for all coins)");
         giveAuthorSpinBox_->setToolTip(
             "--give-author / --dev-donation\n"
             "0.00 ⇒ OMITTED (binary default author donation applies).\n"

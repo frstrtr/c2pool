@@ -229,11 +229,14 @@ int main()
                   && !contains(argv, "--embedded-mainnet"),
               "BCH default omits embedded reward-unsafe flags");
         check(contains(argv, "--rpc-conf"), "BCH default uses --rpc-conf creds arm");
-        // F4: BCH has no money surface — none of these may appear even when set.
-        check(!contains(argv, "-f") && !contains(argv, "--fee")
-                  && !contains(argv, "--give-author") && !contains(argv, "--node-owner-address")
+        // F4: BCH now HAS a money surface (--fee / --give-author / --node-owner-address,
+        // W-MONEY). bchDefault() sets fee=1.0, giveAuthor=0.5, payoutAddress, so those
+        // three are emitted (catalog-driven). BCH still has NO --redistribute /
+        // --message-blob-hex alias, so those stay dropped even when set.
+        check(contains(argv, "--fee") && contains(argv, "--give-author")
+                  && contains(argv, "--node-owner-address")
                   && !contains(argv, "--redistribute") && !contains(argv, "--message-blob-hex"),
-              "BCH argv omits every money flag (BCH has none)");
+              "BCH emits its money surface (--fee/--give-author/--node-owner-address), drops redistribute/message-blob");
         check(!contains(argv, "--addnode") && contains(argv, "--sharechain-addnode"),
               "BCH uses --sharechain-addnode (not DASH's --addnode)");
         check(contains(argv, "--http"), "BCH binds web via combined --http");
@@ -249,7 +252,7 @@ int main()
               "DGB uses --sharechain-addnode (not --addnode)");
         check(contains(argv, "--http"), "DGB binds web via combined --http");
         check(!contains(argv, "-f") && !contains(argv, "--give-author"),
-              "DGB omits author-fee flags it has no surface for");
+              "DGB default omits --fee/--give-author (surface exists but dgbDefault sets neither)");
         check(contains(argv, "--redistribute") && contains(argv, "boost:70,donate:30"),
               "DGB emits hybrid --redistribute SPEC");
         check(contains(argv, "--node-owner-address"),

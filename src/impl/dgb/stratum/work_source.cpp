@@ -422,6 +422,56 @@ std::pair<std::string, std::string> DGBWorkSource::get_coinbase_parts() const
     return { {}, {} };
 }
 
+void DGBWorkSource::set_node_owner_fee(double pct, std::vector<unsigned char> script)
+{
+    std::lock_guard<std::mutex> lk(node_owner_fee_mutex_);
+    node_owner_fee_pct_ = pct;
+    node_owner_script_  = std::move(script);
+}
+
+// Deterministic per-(tip, connection) node-fee roll — ported verbatim from
+// BTCWorkSource::effective_payout_script. The DGB payout script is derived from
+// the miner's username at BOTH job build (build_connection_coinbase) and submit
+// (mining_submit), so a random template-side roll would make the created share's
+// committed identity mismatch the frozen job coinbase (a self-decline). A pure
+// function of data BOTH sites hold (prev_share_hash + the session extranonce1 +
+// the miner script) keeps template + share + verify coherent with no job-state
+// carry: prev_share_hash re-rolls the decision every share interval, extranonce1
+// decorrelates concurrent connections. The fee is NOT a coinbase output — it is a
+// payout-identity substitution that flows into the share's existing committed
+// pubkey_hash, so verify reproduces the resulting coinbase byte-for-byte.
+std::vector<unsigned char> DGBWorkSource::effective_payout_script(
+    const std::vector<unsigned char>& miner_script,
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex) const
+{
+    double pct;
+    std::vector<unsigned char> owner;
+    {
+        std::lock_guard<std::mutex> lk(node_owner_fee_mutex_);
+        pct   = node_owner_fee_pct_;
+        owner = node_owner_script_;
+    }
+    if (pct <= 0.0 || owner.empty() || miner_script.empty())
+        return miner_script;
+
+    std::vector<uint8_t> buf;
+    buf.reserve(32 + extranonce1_hex.size() + miner_script.size());
+    uint256 psh = prev_share_hash;  // non-const copy: uint256 begin()/end() are non-const-only
+    buf.insert(buf.end(), psh.begin(), psh.end());
+    buf.insert(buf.end(), extranonce1_hex.begin(), extranonce1_hex.end());
+    buf.insert(buf.end(), miner_script.begin(), miner_script.end());
+
+    uint256 h = Hash(std::span<const uint8_t>(buf.data(), buf.size()));
+    // First 8 bytes as a little-endian u64; modulo 100000 gives 0.001%-granular rolls.
+    uint64_t roll = 0;
+    for (int i = 0; i < 8; ++i)
+        roll |= static_cast<uint64_t>(h.begin()[i]) << (8 * i);
+    roll %= 100000;
+
+    return (static_cast<double>(roll) < pct * 1000.0) ? owner : miner_script;
+}
+
 core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     const uint256& prev_share_hash,
     const std::string& extranonce1_hex,
@@ -448,8 +498,17 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     if (!fn)
         return {};  // unbound: pre-wire behavior (empty job).
 
+    // Node-owner fee (p2pool -f/--fee): resolve the payout IDENTITY that receives
+    // this share's finder value (and, via the committed share, its future PPLNS
+    // weight). effective_payout_script substitutes the node owner's script for
+    // ~fee% of jobs, deterministically on (prev_share_hash, extranonce1,
+    // payout_script) so the SAME decision is reproduced at submit time and by
+    // verify. Default (fee 0 / no owner) => eff == payout_script, byte-identical.
+    const std::vector<unsigned char> eff_payout_script =
+        effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
+
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
-        fn(prev_share_hash, extranonce1_hex, payout_script, merged_addrs);
+        fn(prev_share_hash, extranonce1_hex, eff_payout_script, merged_addrs);
     if (!inputs)
         return {};  // producer declined (e.g. tip not yet known) -> safe empty job.
 
@@ -676,7 +735,16 @@ nlohmann::json DGBWorkSource::mining_submit(
                 LOG_WARNING << "[DGB-STRATUM] REJECTED foreign-coin payout address "
                                "(user=" << username << ") — not a DGB address; "
                                "refusing to misdirect funds";
-            in.payout_script = std::move(payout_script);
+            // Node-owner fee (p2pool -f/--fee): substitute the owner's payout
+            // identity for ~fee% of shares, deterministically on (prev_share,
+            // extranonce1, miner_script) so this matches build_connection_coinbase
+            // and verify exactly. A non-empty miner script that is substituted
+            // stays non-empty (owner script), so the empty-only redistribute
+            // fallback below never fires on it; an empty script is left empty
+            // (effective_payout_script returns miner on empty) so --redistribute
+            // is untouched. Default (fee 0) => byte-identical to before.
+            in.payout_script =
+                effective_payout_script(payout_script, job->prev_share_hash, extranonce1);
         }
         // Redistribute V2 (#307): a miner with empty/broken stratum creds
         // yields no payout script. When the operator opted into a

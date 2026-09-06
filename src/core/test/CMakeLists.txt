@@ -94,7 +94,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # one KAT covers every coin lane, so it is FOLDED into the EXISTING
     # allowlisted core_test target -- never a new add_executable (the #769
     # "Not Run" trap).
-    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp web_server_current_payouts_test.cpp web_server_local_hashps_test.cpp web_server_relay_block_test.cpp web_server_dashboard_data_test.cpp web_server_frozen_pool_rate_guard_test.cpp web_server_daemonless_graph_feed_test.cpp web_server_config_endpoint_test.cpp graph_history_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp random_choice_guard_test.cpp p2p_message_stats_test.cpp netaddress_resolution_test.cpp coin_addrman_test.cpp address_coin_validation_test.cpp)
+    # author_fee_test.cpp: the W-MONEY SSOT KAT for the built-in author/dev
+    # donation default (core/author_fee.hpp) — pins the 0.1% default and its
+    # perfect_round -> u16 66 conversion that every coin lane commits. Same
+    # fold-into-core_test reasoning as every TU here (one KAT covers all lanes;
+    # a new add_executable is the #769 "Not Run" trap).
+    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp block_broadcast_test.cpp broadcast_convergence_matrix_test.cpp core_merkle_branches_test.cpp version_gate_test.cpp filesystem_test.cpp web_server_submitblock_test.cpp web_server_current_payouts_test.cpp web_server_local_hashps_test.cpp web_server_relay_block_test.cpp web_server_dashboard_data_test.cpp web_server_frozen_pool_rate_guard_test.cpp web_server_daemonless_graph_feed_test.cpp web_server_config_endpoint_test.cpp graph_history_test.cpp known_txs_eviction_test.cpp tx_advertiser_test.cpp socket_write_queue_test.cpp known_txs_backing_test.cpp random_choice_guard_test.cpp p2p_message_stats_test.cpp netaddress_resolution_test.cpp coin_addrman_test.cpp address_coin_validation_test.cpp author_fee_test.cpp)
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)

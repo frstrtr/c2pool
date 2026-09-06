@@ -276,7 +276,24 @@ public:
     /// only; called from the entrypoint under --regtest.
     void set_regtest(bool regtest) { is_regtest_ = regtest; }
 
+    /// Node-owner fee (p2pool -f/--fee). Arms the deterministic per-(tip,
+    /// connection) payout-identity substitution used by build_connection_coinbase
+    /// and mining_submit. pct 0 or empty script => disabled (byte-identical to no
+    /// fee). Ported from BTCWorkSource::set_node_owner_fee.
+    void set_node_owner_fee(double pct, std::vector<unsigned char> script);
+
 private:
+    /// Resolve the effective payout script for a job/share: the node owner's
+    /// script with probability node_owner_fee_pct_%, else the miner's own
+    /// script. Deterministic in its inputs (prev_share_hash + extranonce1 +
+    /// miner_script) so job build and submit agree and verify reproduces the
+    /// coinbase byte-for-byte. NOT a coinbase output — a payout-identity
+    /// substitution. Ported from BTCWorkSource::effective_payout_script.
+    std::vector<unsigned char> effective_payout_script(
+        const std::vector<unsigned char>& miner_script,
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex) const;
+
     // External dependencies (non-owning references)
     bch::coin::HeaderChain&     chain_;
     bch::coin::Mempool&         mempool_;
@@ -315,6 +332,12 @@ private:
     CreateShareFn               create_share_fn_;
     std::vector<unsigned char>  donation_script_;
     std::function<int64_t()>    author_version_fn_;
+    // Node-owner fee (p2pool -f/--fee). Guarded by node_owner_fee_mutex_.
+    // Default off (pct 0, empty script) => effective_payout_script returns the
+    // miner script, byte-identical to the pre-fee coinbase.
+    mutable std::mutex          node_owner_fee_mutex_;
+    double                      node_owner_fee_pct_{0.0};
+    std::vector<unsigned char>  node_owner_script_;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage c populates these.

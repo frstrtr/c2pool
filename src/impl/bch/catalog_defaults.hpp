@@ -19,6 +19,7 @@ inline void register_catalog_defaults(c2pool::settings::ResolvedConfig& rc) {
     using c2pool::settings::Source;
     rc.set("sharechain.listen", "0.0.0.0:9349", Source::CompiledDefault); // 9349 (bch/config_pool.hpp:64 PoolConfig::P2P_PORT)
     rc.set("web.port", "0", Source::CompiledDefault);                 // 0 (main_bch.cpp:714 http_port default, 0=off)
+    rc.set("money.give_author_pct", "0.1", Source::CompiledDefault);  // 0.1% (main_bch.cpp dev_donation default = core::kAuthorFeeDefaultPct)
 }
 
 } // namespace c2pool::impl::bch

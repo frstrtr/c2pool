@@ -19,6 +19,7 @@ inline void register_catalog_defaults(c2pool::settings::ResolvedConfig& rc) {
     using c2pool::settings::Source;
     rc.set("sharechain.listen", "0.0.0.0:5024", Source::CompiledDefault); // 5024 (dgb/config_pool.hpp:35 PoolConfig::P2P_PORT)
     rc.set("web.port", "0", Source::CompiledDefault);                 // 0 (main_dgb.cpp:2088 http_port default, 0=off)
+    rc.set("money.give_author_pct", "0.1", Source::CompiledDefault);  // 0.1% (main_dgb.cpp dev_donation default = core::kAuthorFeeDefaultPct)
 }
 
 } // namespace c2pool::impl::dgb

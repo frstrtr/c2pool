@@ -1,6 +1,6 @@
 coin_p2p.discover=true source=cli
 meta.data_dir=<DATADIR> source=cli
-money.give_author_pct=0 source=compiled
+money.give_author_pct=0.1 source=compiled
 network.testnet4=true source=cli
 sharechain.listen=9334 source=cli
 web.port=0 source=compiled
