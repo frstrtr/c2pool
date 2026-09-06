@@ -3,6 +3,19 @@
 Operator handbook for running c2pool as a DASH stratum endpoint at a professional
 mining site. Applies to v0.2.3 on Ubuntu-class Linux x86_64.
 
+> **Current `master` (post-v0.2.4) note.** This guide describes the
+> **dashd-attached** posture (`--coin-rpc` + `--coin-rpc-auth`), which is still
+> supported and is what the operator's own hotel deployment runs. On current
+> `master` a bare `c2pool-dash --run` with **no `--coin-rpc`** is the
+> **daemonless** posture: every embedded serving lever defaults ON and no dashd
+> is needed on the host (`src/c2pool/main_dash.cpp` banner: "ALL embedded
+> serving levers default ON when NO dashd arm is given"; the public node
+> `dash.voidbind.com` runs that way). The complete flag surface — sharechain
+> `--listen`/`--addnode`, coin-P2P `--coin-p2p-discover`, the dashboard
+> `--web-port`/`--web-host`/`--dashboard-dir`, the money flags and the
+> settings-file control plane — is in the README's
+> [c2pool-dash launch reference](../README.md#c2pool-dash--dash-x11).
+
 ## 1. What v0.2.3 is (and is not)
 
 v0.2.3 provides functional DASH stratum mining with **solo-mode payouts**:
@@ -59,12 +72,23 @@ Run against your dashd, with stratum on your chosen port:
   --stratum 3335
 ```
 
-- `--coin-rpc H:P` — the dashd RPC endpoint.
+- `--coin-rpc H:P` (alias `--coin-daemon`) — the dashd RPC endpoint. Endpoint
+  only; no secret on argv.
 - `--coin-rpc-auth PATH` — path to `dash.conf`; c2pool reads the RPC credentials
-  from it (credentials never appear on argv).
+  from it (credentials never appear on argv). Defaults to
+  `~/.dashcore/dash.conf` when omitted.
 - `--stratum [HOST:]PORT` — bind the miner-facing stratum listener (e.g.
   `--stratum 3335` or `--stratum 127.0.0.1:3335`); omit to disable.
-- `--testnet` — testnet variant, for staging.
+- `--testnet` — testnet variant, for staging (`--regtest` is parsed as the
+  same flag).
+- `--data-dir PATH` — root all on-disk state under `PATH` (default
+  `~/.c2pool`); required when two instances share a host.
+- `--web-port PORT` — the dashboard + JSON API is **on by default at 8080**
+  (`--web-host` binds the interface, `--web-port 0` disables). If it collides
+  with the stratum port it moves to stratum+1.
+
+Unknown flags are rejected with `unknown argument: …` and exit 1 — the binary
+never silently ignores a typo.
 
 Healthy startup looks like:
 
@@ -92,11 +116,15 @@ someone else or burns the reward.
 
 ## 4. Per-node capacity and clustering
 
-Each node enforces a **strict stratum connection cap** — default **100**,
-tunable with `--max-stratum-connections`. Connections beyond the cap are refused,
-not queued.
+`c2pool-dash` has **no stratum connection-cap flag**. `--max-stratum-connections`
+exists only on the LTC binary (`stratum.max_connections` is catalogued for
+`BIN_LTC` alone in `src/core/param_catalog.inc`); passing it to `c2pool-dash`
+is an unknown argument and the process exits 1. The practical per-node ceiling
+is set by the host — CPU, the open-file limit (`ulimit -n`) and network — so
+establish S_max for your hardware with a load test before committing rigs to
+it.
 
-Size the cluster for M rigs with per-node cap S_max:
+Size the cluster for M rigs with the measured per-node ceiling S_max:
 
 ```
 N = max(2, ceil(M / (0.7 × S_max)))
@@ -156,7 +184,7 @@ spendable.
 | Absurd (scrypt-scale) difficulty on an X11 rig | Pre-0.2.3 difficulty handling | Upgrade to v0.2.3. |
 | `CoindRPC` errors / no new templates | dashd down, unsynced, or stale RPC creds | Check `dash-cli getblockchaininfo`; verify `dash.conf` creds; restart dashd, then c2pool. |
 | Rigs cannot connect at all | Port not open / firewall | `ss -ltn \| grep 3335`; open the stratum port on the host and site firewall. |
-| New rigs refused, existing ones fine | Connection cap reached | Check connection count in the log; raise `--max-stratum-connections` or add a node per §4. |
+| New rigs refused, existing ones fine | Host limit reached (open files, CPU, bandwidth) — there is no c2pool-side connection cap on `c2pool-dash` | Check `ulimit -n` for the service user and the connection count in the log; raise the host limit or add a node per §4. |
 | Shares rejected in bulk | Wrong coin/algo or wrong port on the rig | Confirm the rig is set to X11/DASH and the URL/port match the node. |
 
 When in doubt: node log first, then dashd log, then the rig's firmware log.

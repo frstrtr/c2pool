@@ -2,7 +2,11 @@
 
 Common questions from operators running `./c2pool`. See the
 [README](../README.md) for the full option reference and `./c2pool --help`
-for every flag.
+for every flag. Unless stated otherwise the answers below describe the LTC
+binary (`c2pool-ltc`, dev alias `c2pool`); the per-coin binaries
+(`c2pool-dash`, `-btc`, `-bch`, `-dgb`, `-bip110`) have their own flag
+surfaces, documented in the README's
+[per-binary launch reference](../README.md#per-binary-launch-reference).
 
 ---
 
@@ -59,9 +63,19 @@ AuxPoW coins (DOGE, PEP, BELLS, LKY, JKC, SHIC).
 
 In c2pool, DGB-Scrypt is therefore handled as its **own parent chain** — a
 standalone DGB-Scrypt P2Pool node running its own sharechain (Scrypt-only in
-V36; the other four DGB algos are out of scope for now). That parent-chain
-support is **in development** (`--net digibyte`), not yet in the stable LTC
-release. Until it ships there is no LTC-side path to mine DGB through c2pool.
+V36; the other four DGB algos are out of scope for now). It is a **separate
+binary, `c2pool-dgb`** (`src/c2pool/main_dgb.cpp`), released per-coin alongside
+`c2pool-ltc`, and it runs daemonless:
+
+```bash
+./c2pool-dgb --run --coin-p2p-discover --stratum 0.0.0.0:9434 --http 127.0.0.1:8084 \
+  --sharechain-addnode 92.53.224.27:5024
+```
+
+A public node runs this posture at `dgb.voidbind.com`. There is no LTC-side
+path to mine DGB — `--net digibyte` on the LTC binary is that binary's legacy
+chain selector, not the DGB pool. The full `c2pool-dgb` flag surface is in the
+README's [per-binary launch reference](../README.md#c2pool-dgb--digibyte-scrypt).
 
 ---
 
@@ -165,15 +179,23 @@ python3 explorer/explorer.py \
 
 Then browse `http://localhost:9090/`.
 
-> **Note:** the README currently links `docs/DASHBOARD_INTEGRATION.md` for the
-> full REST API reference, but that file is missing from the tree — tracked in
-> [#677](https://github.com/frstrtr/c2pool/issues/677). The API endpoints
-> themselves work and are listed in the README's API table; the dashboard is
-> served automatically as described above.
+The full REST API reference and the dashboard/explorer integration guide are in
+[DASHBOARD_INTEGRATION.md](DASHBOARD_INTEGRATION.md) (the earlier gap tracked in
+[#677](https://github.com/frstrtr/c2pool/issues/677) is closed — the file is in
+the tree).
+
+On the non-LTC binaries the dashboard is **off until bound**: `c2pool-btc`,
+`c2pool-dgb`, `c2pool-bch` and `c2pool-bip110` take `--http [HOST:]PORT`, and
+`c2pool-dash` serves on `--web-port` (default 8080; `0` disables). Those
+binaries serve the dashboard from a `web-static` directory relative to the
+working directory (DASH: `--dashboard-dir`), so start them from the directory
+that holds `web-static`.
 
 ---
 
 ## Ports (defaults)
+
+LTC binary (`c2pool-ltc` / `c2pool`):
 
 | Port  | Purpose                          | Override         |
 |-------|----------------------------------|------------------|
@@ -182,3 +204,7 @@ Then browse `http://localhost:9090/`.
 | 8080  | Web dashboard + REST API         | `--web-port`     |
 
 On `--testnet`, P2P shifts to 19326 and stratum to 19327.
+
+The other binaries have different sharechain ports (BTC 9333, DGB 5024, BCH
+9349, DASH 8999, BIP-110 9337) and leave Stratum/dashboard off until bound —
+see the README's [default ports by binary](../README.md#default-ports-by-binary).
