@@ -1,0 +1,7 @@
+meta.data_dir=<DATADIR> source=cli
+meta.run=true source=cli
+money.give_author_pct=0.2 source=cli
+money.node_owner_address=DExampleDgbAddress source=cli
+money.node_owner_fee_pct=0.5 source=cli
+sharechain.listen=0.0.0.0:5024 source=compiled
+web.port=0 source=compiled

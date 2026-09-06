@@ -67,6 +67,7 @@
 #include <impl/ltc/config_coin.hpp>               // ltc::config::P2PData/RPCData — BroadcasterConfig adapter dep (coin_broadcaster.hpp; main_ltc pulls it via config.hpp)
 #include <c2pool/merged/coin_broadcaster.hpp>     // CoinBroadcaster (NMC coin-P2P header-feed)
 
+#include <core/author_fee.hpp>                   // SSOT author-fee default + donation_percent_to_u16
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 #include <core/coin/utxo_view_db.hpp>
@@ -172,7 +173,7 @@ static void print_usage()
         "  --node-owner-address ADDR  destination for the node-owner fee\n"
         "                  (P2PKH/P2SH/P2WPKH). Ignored (fee disabled) if undecodable.\n"
         "  --give-author PCT  dev-donation percent (alias --dev-donation). Default\n"
-        "                  keeps the built-in 0.5%; 0 allowed (donation output still\n"
+        "                  is the built-in 0.1%; 0 allowed (donation output still\n"
         "                  emits per p2pool dust-marker semantics, amount 0). Changes\n"
         "                  the donation AMOUNT only — the donation script is unchanged.\n";
 }
@@ -217,14 +218,14 @@ int main(int argc, char* argv[])
     std::string rpc_conf_path;              // --coin-rpc-auth PATH: bitcoin.conf creds (default ~/.bitcoin/bitcoin.conf)
     std::vector<std::string> merged_chain_specs; // --merged SPEC entries (embedded NMC aux; consumed in later PE slices)
     // Node-owner fee + dev-donation (ported from main_dash.cpp -f/--fee /
-    // --node-owner-address / --give-author). Defaults leave an UNFLAGGED BTC
-    // deployment byte-identical: fee 0 (off) and donation u16 = 50 (0.5%, the
-    // pre-existing hardcoded value). --give-author only changes the donation
-    // AMOUNT; the donation SCRIPT (forrestv) is never touched.
+    // --node-owner-address / --give-author). The built-in author/dev donation
+    // default is HARD-PINNED at 0.1% (core::kAuthorFeeDefaultPct → u16 66),
+    // matching DASH/LTC/BIP110; fee defaults to 0 (off). --give-author only
+    // changes the donation AMOUNT; the donation SCRIPT (forrestv) is never touched.
     double      node_owner_fee    = 0.0;   // -f/--fee PCT: node-owner fee %, default 0 (off)
     std::string node_owner_address;        // --node-owner-address ADDR: fee destination
-    double      dev_donation      = 0.0;   // --give-author PCT: dev donation %
-    bool        give_author_set   = false; // true once --give-author/--dev-donation seen
+    double      dev_donation      = core::kAuthorFeeDefaultPct; // --give-author PCT: dev donation %, default 0.1%
+    bool        give_author_set   = false; // true once --give-author/--dev-donation seen (diagnostics only)
     std::string settings_path;             // --settings PATH (M0b; empty => default probe)
     bool        want_dump_config  = false; // --dump-resolved-config (M0b)
     bool        want_ack_money    = false; // --ack-money-settings (M0b)
@@ -478,20 +479,14 @@ int main(int argc, char* argv[])
     }
 
     // ── Dev-donation u16 (p2pool committed donation field) ──
-    // Default 50 (0.5%) keeps an UNFLAGGED deployment byte-identical to the two
-    // pre-existing hardcoded donation=50 sites below (ref_hash + create_local_share).
-    // --give-author overrides it: round(65535 * pct / 100), clamped to [0,65535].
+    // The built-in author default is 0.1% (core::kAuthorFeeDefaultPct → u16 66),
+    // shared with DASH/LTC/BIP110 via the SSOT conversion. dev_donation already
+    // carries the default (or the --give-author / money.give_author_pct override),
+    // so ALWAYS compute the committed field from it — the two donation sites below
+    // (ref_hash + create_local_share) consume this same donation_u16.
     // 0 is allowed (the donation output still emits as the p2pool dust marker; only
     // its amount goes to ~0). The donation SCRIPT is never affected here.
-    uint16_t donation_u16 = 50;
-    if (give_author_set) {
-        double pct = dev_donation;
-        if (pct < 0.0)   pct = 0.0;
-        if (pct > 100.0) pct = 100.0;
-        uint64_t v = static_cast<uint64_t>(65535.0 * pct / 100.0 + 0.5);
-        if (v > 65535) v = 65535;
-        donation_u16 = static_cast<uint16_t>(v);
-    }
+    uint16_t donation_u16 = core::donation_percent_to_u16(dev_donation);
 
     btc::PoolConfig::is_testnet = testnet;
 
@@ -1931,7 +1926,7 @@ int main(int argc, char* argv[])
             p.coinbase_scriptSig  = scriptSig;
             p.share_nonce         = 0;             // matches LTC line 4281
             p.subsidy             = subsidy;
-            p.donation            = donation_u16;  // --give-author (default 50 = 0.5%)
+            p.donation            = donation_u16;  // --give-author (default 66 = 0.1%)
             p.stale_info          = 0;
             p.desired_version     = 35;
             p.timestamp           = timestamp;
@@ -2370,7 +2365,7 @@ int main(int argc, char* argv[])
                     /* prev_share */            job.prev_share_hash,
                     merkle_branches,
                     payout_script,
-                    /* donation */              donation_u16,  // --give-author (default 50)
+                    /* donation */              donation_u16,  // --give-author (default 66 = 0.1%)
                     /* merged_addrs */          merged_addrs,
                     /* stale_info */            btc::StaleInfo::none,
                     /* segwit_active */         job.segwit_active,

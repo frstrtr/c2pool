@@ -48,6 +48,7 @@
 #include <impl/dgb/coin/good_citizen_defaults.hpp> // resolve_tx_serve_posture (S1 fee-proof lane arm)
 #include <impl/dgb/coin/header_sample_build.hpp>   // make_header_sample (full_block anchoring SSOT)
 #include <impl/dgb/coin/utxo_accrual.hpp>          // classify_full_block_accrual (restart-liveness re-anchor)
+#include <core/author_fee.hpp>                     // SSOT author-fee default + donation_percent_to_u16
 #include <core/coin/utxo.hpp>                      // core::coin::DGB_LIMITS / DGB_MIN_BLOCKS_TO_KEEP
 #include <core/coin/utxo_view_db.hpp>              // core::coin::UTXOViewDB (embedded UTXO persistence)
 #include <core/coin/utxo_view_cache.hpp>           // core::coin::UTXOViewCache (spent-aware fee view)
@@ -158,6 +159,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--node-owner-address ADDR]\n"
+        << "       [--give-author PCT] [-f|--fee PCT]\n"
         << "       [--sharechain-port P] [--sharechain-addnode HOST:PORT ...]\n"
         << "       [--embedded-serve-mempool-txs[=true|false]]\n"
         << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n"
@@ -234,6 +236,9 @@ int run_node(const core::CoinParams& params, bool testnet,
              bool no_p2p_relay = false,
              const std::string& redistribute_spec = "",
              const std::string& node_owner_address = "",
+             // Author/dev donation (default 0.1%) + node-owner fee (default 0 off).
+             double dev_donation = core::kAuthorFeeDefaultPct,
+             double node_owner_fee = 0.0,
              bool dev_relax_algo_softforks = false,
              bool coin_p2p_discover = false,
              const std::string& http_addr = "0.0.0.0",
@@ -255,6 +260,13 @@ int run_node(const core::CoinParams& params, bool testnet,
              const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes = {})
 {
     io::io_context ioc;
+
+    // Author/dev donation u16 (p2pool committed donation field). Built-in default
+    // 0.1% -> u16 66 via the SSOT conversion, shared with DASH/LTC/BTC/BIP110.
+    // BOTH share-identity sites below (ref preimage + create_local_share mint)
+    // consume this SAME value so the committed ref_hash matches the created share
+    // (a mismatch = 100% self-decline). --give-author overrides the AMOUNT only.
+    const uint16_t donation_u16 = core::donation_percent_to_u16(dev_donation);
 
     // Per-coin config root: ~/.c2pool/<net>/ (sharechain LevelDB + addrs.json
     // open underneath). Bucket-1 isolation primitive: DGB never shares LTC's
@@ -1457,6 +1469,30 @@ int run_node(const core::CoinParams& params, bool testnet,
                                            acc.bech32_hrps);
     }
 
+    // Node-owner fee (p2pool -f/--fee): arm the deterministic payout-identity
+    // substitution in DGBWorkSource. The owner address is classified against
+    // DGB's OWN registry-sourced acceptance (issue #961) so a foreign-coin
+    // --node-owner-address CANNOT misdirect a substituted share — the fee is
+    // DISABLED (never armed) rather than paid to a wrong-coin script. Default
+    // (fee 0 / no owner) leaves the coinbase byte-identical. --node-owner-address
+    // is now double-duty: it also feeds the --redistribute fee identity below.
+    if (node_owner_fee > 0.0 && !node_owner_address.empty()) {
+        std::vector<unsigned char> owner_script;
+        auto owner_match = core::classify_address_for_coin(
+            node_owner_address, dgb::address_acceptance(testnet, regtest), owner_script);
+        if (owner_match != core::AddressCoinMatch::Foreign
+                && owner_match != core::AddressCoinMatch::Invalid
+                && !owner_script.empty()) {
+            work_source->set_node_owner_fee(node_owner_fee, std::move(owner_script));
+            std::cout << "[DGB] node-owner fee ARMED: " << node_owner_fee
+                      << "% -> " << node_owner_address << std::endl;
+        } else {
+            LOG_WARNING << "[DGB] --fee " << node_owner_fee
+                        << " set but --node-owner-address '" << node_owner_address
+                        << "' is not a valid DGB address — node-owner fee DISABLED";
+        }
+    }
+
 #ifdef AUX_DOGE
     // Arm the #1413 DGBWorkSource merged-mining seams: once bound, every built
     // coinbase splices the cached 44-byte DOGE AuxPoW commitment and every
@@ -1547,7 +1583,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     {
         auto& pplns_tracker = p2p_node.tracker();
         work_source->set_pplns_inputs_fn(
-            [&pplns_tracker, &p2p_node, &params, &header_chain](
+            [&pplns_tracker, &p2p_node, &params, &header_chain, donation_u16](
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
@@ -1673,7 +1709,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                 rin.share_nonce     = 0;            // share commitment nonce (not block)
                 rin.payout_script   = payout_script;
                 rin.subsidy         = subsidy;
-                rin.donation        = 50;          // 0.5% bps (create_local_share default)
+                rin.donation        = donation_u16;  // author default 0.1% (u16 66); --give-author overrides
                 rin.stale_info      = 0;
                 rin.has_segwit      = false;       // segwit populated by template-cache follow-on
                 rin.merged_addresses    = merged_addresses;
@@ -1736,7 +1772,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // create_local_share returns null (a correctly-declined stale share).
     {
         work_source->set_mint_share_fn(
-            [&p2p_node, &params](
+            [&p2p_node, &params, donation_u16](
                 const dgb::stratum::DGBWorkSource::MintShareInputs& in) -> uint256
             {
                 // in.coinbase_bytes is the coinbase scriptSig (BIP34 height +
@@ -1769,7 +1805,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                         p2p_node.tracker(), params, *min_header, coinbase,
                         in.subsidy, in.prev_share, in.merkle_branches,
                         in.payout_script,
-                        /*donation=*/50,
+                        /*donation=*/donation_u16,
                         std::vector<dgb::MergedAddressEntry>{},
                         dgb::StaleInfo::none,
                         /*segwit_active=*/false,  // producer emits non-segwit coinbase
@@ -2676,7 +2712,12 @@ int main(int argc, char** argv)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
     std::string redistribute_spec;         // --redistribute SPEC (node-local payout policy, #307)
-    std::string node_owner_address;        // --node-owner-address ADDR (operator payout identity for --redistribute fee, #307)
+    std::string node_owner_address;        // --node-owner-address ADDR (operator payout identity for --redistribute fee, #307; also -f/--fee destination)
+    // Author/dev donation + node-owner fee (ported from BTC/DASH). The built-in
+    // author default is HARD-PINNED at 0.1% (core::kAuthorFeeDefaultPct → u16 66);
+    // --give-author overrides the AMOUNT only. Node-owner fee defaults 0 (off).
+    double      dev_donation   = core::kAuthorFeeDefaultPct; // --give-author PCT, default 0.1%
+    double      node_owner_fee = 0.0;      // -f/--fee PCT: node-owner fee %, default 0 (off)
     // ── #82 regtest-gated forced-won-share LIVE seam (decision (a), 2026-06-21) ──
     // --regtest-force-won-share synthesizes ONE won share into the live
     // ShareTracker and fires m_on_block_found AFTER both broadcast arms are
@@ -2794,7 +2835,15 @@ int main(int argc, char** argv)
             redistribute_spec = argv[++i];     // pplns|fee|boost|donate or hybrid "boost:70,donate:20"
         }
         else if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc) {
-            node_owner_address = argv[++i];    // operator payout addr -> "fee" identity (#307 fee arm)
+            node_owner_address = argv[++i];    // operator payout addr -> "fee" identity (#307 fee arm + -f/--fee destination)
+        }
+        else if ((std::strcmp(argv[i], "--give-author") == 0
+                  || std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc) {
+            dev_donation = std::atof(argv[++i]);  // author/dev donation percent (default 0.1%)
+        }
+        else if ((std::strcmp(argv[i], "-f") == 0
+                  || std::strcmp(argv[i], "--fee") == 0) && i + 1 < argc) {
+            node_owner_fee = std::atof(argv[++i]);  // node-owner fee percent (default 0 = off)
         }
         else if (std::strcmp(argv[i], "--sharechain-port") == 0 && i + 1 < argc) {
             // --sharechain-port PORT - bind the sharechain (pool P2P) listener on
@@ -2892,6 +2941,8 @@ int main(int argc, char** argv)
         if (rc.file_set("sharechain.no_p2p_relay") && rc.get_string("sharechain.no_p2p_relay").value_or("") == "true") no_p2p_relay = true;
         if (rc.file_set("money.redistribute"))       redistribute_spec  = rc.get_string("money.redistribute").value_or(redistribute_spec);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
+        if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         // embedded.serve_mempool_txs (S1 fee-proof lane): a [dgb] settings-file
         // key arms / opts out of the lane exactly like the --embedded-serve-
         // mempool-txs CLI flag. CLI (L2) wins over the file (L1): consult the
@@ -2919,7 +2970,8 @@ int main(int argc, char** argv)
                         coin_daemon, coin_magic, coin_genesis,
                         rpc_endpoint, rpc_conf_path,
                         regtest, force_won_share, no_p2p_relay,
-                        redistribute_spec, node_owner_address, dev_relax_algo_softforks,
+                        redistribute_spec, node_owner_address,
+                        dev_donation, node_owner_fee, dev_relax_algo_softforks,
                         coin_p2p_discover,
                         http_addr, http_port,
                         merged_chain_specs, doge_p2p_address, doge_p2p_port,

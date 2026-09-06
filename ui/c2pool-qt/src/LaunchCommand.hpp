@@ -28,7 +28,7 @@
 //      DASH both --coin-rpc AND --coin-rpc-auth re-arm dashd, so auth alone is
 //      also gated. The embedded --coin-p2p-connect / coin-magic knobs stay
 //      opt-in (transport / explicit gate-lift, not "reward-UNSAFE"). The author
-//      donation is left to the binary default (0.1% / BTC 0.5%) unless the
+//      donation is left to the binary default (0.1% for all coins) unless the
 //      operator explicitly sets it; --give-author 0 is emitted ONLY behind an
 //      explicit opt-in ack, never as a default for a public node.
 //      validate_percoin() no longer refuses a daemonless DASH launch (that is
@@ -248,7 +248,7 @@ inline std::vector<std::string> build_percoin_argv(const PerCoinParams& p)
         emit_value(a, bin, "money.node_owner_fee_pct", fmt_pct(p.fee));
 
     // ★ give-author tri-state (F6). Default = OMIT ⇒ the binary default applies
-    // (DASH/LTC/BIP110 0.1%, BTC 0.5%). An explicit value is emitted only when
+    // (0.1% for all coins). An explicit value is emitted only when
     // the operator overrode it, and an explicit ZERO ONLY behind an ack — never
     // a silent --give-author 0 for a public node.
     if (p.giveAuthorSet) {

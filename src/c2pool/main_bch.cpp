@@ -46,6 +46,7 @@
 #include <btclibs/util/strencodings.h>   // ParseHexBytes (sharechain prefix)
 
 #include <core/core_util.hpp>
+#include <core/author_fee.hpp>   // SSOT author-fee default + donation_percent_to_u16
 #include <core/filesystem.hpp>   // core::filesystem::set_data_dir (--data-dir, #722)
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
@@ -88,6 +89,7 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n"
         << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT]\n"
         << "              [--sharechain-addnode HOST:PORT ...] [--anchor N] [--rpc-conf PATH]\n"
+        << "              [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
         << "                   isolates co-located instances\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
@@ -636,7 +638,9 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
              const std::string& stratum_addr, uint16_t stratum_port,
              const std::string& rpc_conf,
              const std::string& http_addr, uint16_t http_port,
-             const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes)
+             const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes,
+             double dev_donation, double node_owner_fee,
+             const std::string& node_owner_address)
 {
     boost::asio::io_context ioc;
 
@@ -728,7 +732,8 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
     try {
         bch::standup_pool_run(ioc, config, anchor_height,
                               stratum_addr, stratum_port, testnet || testnet4 || regtest, regtest,
-                              http_addr, http_port, sharechain_addnodes.size());
+                              http_addr, http_port, sharechain_addnodes.size(),
+                              dev_donation, node_owner_fee, node_owner_address);
     } catch (const std::exception& e) {
         std::cout << "[pool] FATAL: " << e.what() << "\n";
         return 1;
@@ -764,6 +769,12 @@ int main(int argc, char** argv)
     std::string settings_path;       // --settings PATH (M0b; empty => default probe)
     bool want_dump_config = false;   // --dump-resolved-config (M0b)
     bool want_ack_money   = false;   // --ack-money-settings (M0b)
+    // Author/dev donation + node-owner fee (ported from BTC/DASH). The built-in
+    // author default is HARD-PINNED at 0.1% (core::kAuthorFeeDefaultPct → u16 66);
+    // --give-author overrides the AMOUNT only. Node-owner fee defaults 0 (off).
+    double dev_donation   = core::kAuthorFeeDefaultPct;  // --give-author PCT, default 0.1%
+    double node_owner_fee = 0.0;     // -f/--fee PCT: node-owner fee %, default 0 (off)
+    std::string node_owner_address;  // --node-owner-address ADDR: fee destination
     // --sharechain-addnode HOST:PORT (repeatable): explicit sharechain (pool
     // P2P) peer(s) to pin. Seeds m_bootstrap_addrs before the Node ctor reads
     // it (contabo BCH revival FIX). e.g. --sharechain-addnode 92.53.224.27:9349
@@ -859,6 +870,14 @@ int main(int argc, char** argv)
                 ep.substr(0, c),
                 static_cast<uint16_t>(std::stoi(ep.substr(c + 1))));
         }
+        else if ((std::strcmp(argv[i], "--give-author") == 0
+                  || std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc)
+            dev_donation = std::atof(argv[++i]);   // author/dev donation percent (default 0.1%)
+        else if ((std::strcmp(argv[i], "-f") == 0
+                  || std::strcmp(argv[i], "--fee") == 0) && i + 1 < argc)
+            node_owner_fee = std::atof(argv[++i]);  // node-owner fee percent (default 0 = off)
+        else if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc)
+            node_owner_address = argv[++i];         // node-owner fee destination address
         else {
             std::cerr << "unknown argument: " << argv[i] << "\n";
             return 1;
@@ -900,6 +919,9 @@ int main(int argc, char** argv)
         if (rc.file_set("web.port"))        http_port  = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
         if (rc.file_set("daemon_rpc.auth_file")) rpc_conf = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf);
         if (rc.file_set("embedded.anchor")) anchor_height = static_cast<uint32_t>(rc.get_i64("embedded.anchor").value_or(anchor_height));
+        if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
+        if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
+        if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
     }
 
     print_banner(argv[0]);
@@ -924,7 +946,8 @@ int main(int argc, char** argv)
 
     if (want_pool)
         return run_pool(host, port, testnet, testnet4, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf,
-                        http_addr, http_port, sharechain_addnodes);
+                        http_addr, http_port, sharechain_addnodes,
+                        dev_donation, node_owner_fee, node_owner_address);
 
     if (want_with_peer_verify)
         return run_with_peer_verify(host, port, testnet, max_seconds);

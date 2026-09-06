@@ -48,8 +48,10 @@ VECTORS=(
   "btc|v2|--testnet4 --sharechain-port 9334 --coin-p2p-discover"
   "dgb|v1|"
   "dgb|v2|--run --stratum 7902 --http 8081 --coin-p2p-discover --sharechain-port 5025"
+  "dgb|v3|--run -f 0.5 --give-author 0.2 --node-owner-address DExampleDgbAddress"
   "bch|v1|"
   "bch|v2|--testnet --p2p-port 9350 --stratum 3333"
+  "bch|v3|--pool -f 0.5 --give-author 0.2 --node-owner-address bitcoincash:qexample"
 )
 
 capture_one() {  # coin vN args -> normalized dump on stdout

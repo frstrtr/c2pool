@@ -70,6 +70,8 @@
 #include "coin/block_confirm.hpp" // #995 BCH arm: found-block confirm/orphan resolver
 
 #include <core/pack_types.hpp>    // BaseScript
+#include <core/author_fee.hpp>    // SSOT author-fee default + donation_percent_to_u16
+#include <core/address_utils.hpp> // core::classify_address_for_coin (node-owner fee arm)
 
 #include <core/log.hpp>
 #include <core/stratum_server.hpp>
@@ -122,8 +124,19 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                              bool is_regtest = false,
                              const std::string& http_addr = "0.0.0.0",
                              uint16_t http_port = 0,
-                             size_t explicit_sharechain_peers = 0)
+                             size_t explicit_sharechain_peers = 0,
+                             // Author/dev donation (default 0.1%) + node-owner fee
+                             // (default 0 off) + owner address (-f destination).
+                             double dev_donation = core::kAuthorFeeDefaultPct,
+                             double node_owner_fee = 0.0,
+                             const std::string& node_owner_address = "")
 {
+    // Author/dev donation u16 (p2pool committed donation field). Built-in default
+    // 0.1% -> u16 66 via the SSOT conversion, shared with DASH/LTC/BTC/BIP110.
+    // BOTH BCH share-identity sites (ref preimage + create_local_share) consume
+    // this SAME value so the committed ref_hash matches the created share (a
+    // mismatch = 100% self-decline). --give-author overrides the AMOUNT only.
+    const uint16_t donation_u16 = core::donation_percent_to_u16(dev_donation);
     // 1+2: embedded daemon up first -- it owns the work source + RPC fallback
     // the pool node consumes, and is the broadcast sink the node wires into.
     coin::EmbeddedDaemon<Config> daemon(&ioc, &config, anchor_height, is_regtest);
@@ -212,6 +225,30 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                                            acc.bech32_hrps);
     }
 
+    // Node-owner fee (p2pool -f/--fee): arm the deterministic payout-identity
+    // substitution in BCHWorkSource. The owner address is classified against
+    // BCH's OWN registry-sourced legacy-base58 acceptance and, failing that, the
+    // native CashAddr decoder (same fallback the mining_submit money path uses,
+    // work_source.cpp), so a foreign-coin --node-owner-address CANNOT misdirect a
+    // substituted share — the fee is DISABLED rather than paid to a wrong-coin
+    // script. Default (fee 0 / no owner) leaves the coinbase byte-identical.
+    if (node_owner_fee > 0.0 && !node_owner_address.empty()) {
+        std::vector<unsigned char> owner_script;
+        auto owner_match = core::classify_address_for_coin(
+            node_owner_address, bch::address_acceptance(is_testnet, is_regtest), owner_script);
+        if (owner_match == core::AddressCoinMatch::Invalid)
+            owner_script = core::address_to_script(node_owner_address);  // CashAddr decoder
+        if (owner_match != core::AddressCoinMatch::Foreign && !owner_script.empty()) {
+            work_source->set_node_owner_fee(node_owner_fee, std::move(owner_script));
+            std::cout << "[BCH-POOL] node-owner fee ARMED: " << node_owner_fee
+                      << "% -> " << node_owner_address << std::endl;
+        } else {
+            LOG_WARNING << "[BCH-POOL] --fee " << node_owner_fee
+                        << " set but --node-owner-address '" << node_owner_address
+                        << "' is not a valid BCH address — node-owner fee DISABLED";
+        }
+    }
+
     // ── Sharechain WRITE path: local-share author wiring ─────────────────
     // Without these callbacks BCHWorkSource accepts miner submissions that
     // clear the sharechain target but DROPS them ("accepted (no-tracker)",
@@ -259,7 +296,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     // create_local_share_v35 (share_check.hpp:2724); BCH is standalone
     // SHA256d -- no segwit, no merged dimension.
     work_source->set_ref_hash_fn(
-        [&node](const uint256& prev_share_hash,
+        [&node, donation_u16](const uint256& prev_share_hash,
                 const std::vector<unsigned char>& scriptSig,
                 const std::vector<unsigned char>& payout_script,
                 uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)
@@ -275,7 +312,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             p.coinbase_scriptSig = scriptSig;
             p.share_nonce        = 0;
             p.subsidy            = subsidy;
-            p.donation           = 50;      // 0.5% finder fee (matches create side)
+            p.donation           = donation_u16;  // author default 0.1% (u16 66); matches create side
             p.stale_info         = 0;
             p.desired_version    = core::version_gate::V36_ACTIVATION_VERSION;   // vote to ratchet toward v36
             p.has_segwit         = false;   // BCH: never segwit
@@ -489,7 +526,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         });
 
     work_source->set_create_share_fn(
-        [&node, stratum_notify](const std::vector<unsigned char>& full_coinbase,
+        [&node, stratum_notify, donation_u16](const std::vector<unsigned char>& full_coinbase,
                 const std::vector<uint8_t>&        header_80b,
                 const core::stratum::JobSnapshot&  job,
                 const std::vector<unsigned char>& payout_script) -> uint256
@@ -599,7 +636,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                     /* subsidy */               job.subsidy,
                     /* prev_share */            job.prev_share_hash,
                     merkle_branches, payout_script,
-                    /* donation bps */          50,
+                    /* donation bps */          donation_u16,
                     /* merged_addrs */          {},
                     /* stale_info */            StaleInfo::none,
                     /* segwit_active */         false,        // BCH: no segwit

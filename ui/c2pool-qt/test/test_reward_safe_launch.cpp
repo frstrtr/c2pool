@@ -280,11 +280,14 @@ int main()
                   && !contains(argv, "--embedded-mainnet"),
               "BCH default omits embedded reward-unsafe flags");
         check(contains(argv, "--rpc-conf"), "BCH default uses --rpc-conf creds arm");
-        // F4: BCH has no money surface — none of these may appear even when set.
-        check(!contains(argv, "-f") && !contains(argv, "--fee")
-                  && !contains(argv, "--give-author") && !contains(argv, "--node-owner-address")
+        // F4: BCH now HAS a money surface (--fee / --give-author / --node-owner-address,
+        // W-MONEY). bchDefault() sets fee=1.0, giveAuthor=0.5, payoutAddress, so those
+        // three are emitted (catalog-driven). BCH still has NO --redistribute /
+        // --message-blob-hex alias, so those stay dropped even when set.
+        check(contains(argv, "--fee") && contains(argv, "--give-author")
+                  && contains(argv, "--node-owner-address")
                   && !contains(argv, "--redistribute") && !contains(argv, "--message-blob-hex"),
-              "BCH argv omits every money flag (BCH has none)");
+              "BCH emits its money surface (--fee/--give-author/--node-owner-address), drops redistribute/message-blob");
         check(!contains(argv, "--addnode") && contains(argv, "--sharechain-addnode"),
               "BCH uses --sharechain-addnode (not DASH's --addnode)");
         check(contains(argv, "--http"), "BCH binds web via combined --http");
@@ -304,7 +307,7 @@ int main()
               "DGB uses --sharechain-addnode (not --addnode)");
         check(contains(argv, "--http"), "DGB binds web via combined --http");
         check(!contains(argv, "-f") && !contains(argv, "--give-author"),
-              "DGB omits author-fee flags it has no surface for");
+              "DGB default omits --fee/--give-author (surface exists but dgbDefault sets neither)");
         check(contains(argv, "--redistribute") && contains(argv, "boost:70,donate:30"),
               "DGB emits hybrid --redistribute SPEC");
         check(contains(argv, "--node-owner-address"),
@@ -344,8 +347,9 @@ int main()
     }
 
     // 10) ★ A4 — the catalog fact the BCH widget gating relies on: c2pool-bch
-    //     carries NO endpoint/submit/money/message alias, so those form fields
-    //     would silently drop and must be disabled.
+    //     carries NO endpoint/submit/message alias, so those form fields would
+    //     silently drop and must be disabled. Post-W-MONEY it DOES carry the
+    //     money payout / author-fee / owner-fee surface (but still no redistribute).
     {
         using c2pool_qt::catview::spelling_for;
         auto bchHas = [](const char* c) {
@@ -353,11 +357,11 @@ int main()
         };
         check(!bchHas("daemon_rpc.endpoint") && !bchHas("daemon_rpc.submit_endpoint"),
               "BCH catalog has no RPC endpoint alias (host/port disabled)");
-        check(!bchHas("money.node_owner_address"),
-              "BCH catalog has no node_owner_address (payout field disabled)");
-        check(!bchHas("money.give_author_pct") && !bchHas("money.node_owner_fee_pct")
+        check(bchHas("money.node_owner_address"),
+              "BCH catalog has node_owner_address (payout field enabled by W-MONEY)");
+        check(bchHas("money.give_author_pct") && bchHas("money.node_owner_fee_pct")
                   && !bchHas("money.redistribute"),
-              "BCH catalog has no author-fee / owner-fee / redistribute surface");
+              "BCH catalog has author-fee / owner-fee surface (W-MONEY) but still no redistribute");
         check(!bchHas("global.message_blob_hex"),
               "BCH catalog has no message-blob alias (message field disabled)");
     }

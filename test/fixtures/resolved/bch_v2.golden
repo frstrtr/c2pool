@@ -1,4 +1,5 @@
 meta.data_dir=<DATADIR> source=cli
+money.give_author_pct=0.1 source=compiled
 network.testnet=true source=cli
 sharechain.listen=9350 source=cli
 stratum.bind=3333 source=cli

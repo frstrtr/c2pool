@@ -19,7 +19,7 @@ inline void register_catalog_defaults(c2pool::settings::ResolvedConfig& rc) {
     using c2pool::settings::Source;
     rc.set("sharechain.listen", "0.0.0.0:9333", Source::CompiledDefault); // 9333 (btc/config_pool.hpp:40 PoolConfig::P2P_PORT)
     rc.set("web.port", "0", Source::CompiledDefault);                 // 0 (main_btc.cpp:206 http_port default, 0=off)
-    rc.set("money.give_author_pct", "0", Source::CompiledDefault);      // 0 (main_btc.cpp:220 dev_donation default 0.0)
+    rc.set("money.give_author_pct", "0.1", Source::CompiledDefault);    // 0.1% (main_btc.cpp dev_donation default = core::kAuthorFeeDefaultPct)
 }
 
 } // namespace c2pool::impl::btc

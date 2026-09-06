@@ -38,6 +38,7 @@
 #include "stratum/work_source.hpp"     // DASHWorkSource::{MintShareInputs, ProducerJob, PplnsWeights}
 #include "stratum/work_target.hpp"     // dash::stratum::modulate_desired_share_target (Cap 1)
 
+#include <core/author_fee.hpp>
 #include <core/coin_params.hpp>
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
@@ -282,13 +283,12 @@ struct MintFeePolicy
 
 // round(65535 * pct / 100), clamped to the u16 field — the oracle's
 // math.perfect_round(65535*donation_percentage/100) (p2pool work.py).
+// SSOT hoisted to core::donation_percent_to_u16 (src/core/author_fee.hpp) so
+// all lanes share one formula; this thin forwarder keeps existing
+// dash::mint::donation_percent_to_u16 callers working.
 inline uint16_t donation_percent_to_u16(double pct)
 {
-    if (pct <= 0.0)   return 0;
-    if (pct >= 100.0) return 65535;
-    const double v = 65535.0 * pct / 100.0;
-    const uint64_t r = static_cast<uint64_t>(v + 0.5);
-    return r > 65535 ? 65535 : static_cast<uint16_t>(r);
+    return core::donation_percent_to_u16(pct);
 }
 
 // The share identity + donation a producer job freezes, after fee policy.
