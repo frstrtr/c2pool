@@ -806,6 +806,7 @@ jobs:
                     bch_muldiv_kat_test \
                     bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test test_bch_underfill_guard \
                     bch_g2_block_assembly_roundtrip_test \
+                    bch_dashboard_pplns_current_test \
             -j8
 
       - name: Run BCH tests
@@ -963,6 +964,7 @@ jobs:
                     bch_muldiv_kat_test \
                     bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test test_bch_underfill_guard \
                     bch_g2_block_assembly_roundtrip_test \
+                    bch_dashboard_pplns_current_test \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
 
       - name: Run BCH tests under sanitizers
