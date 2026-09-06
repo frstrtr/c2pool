@@ -224,7 +224,52 @@ int main() {
         CHECK(!bad.valid(false));
     }
 
-    // (8) ★ the XMR validator hook did NOT perturb the non-XMR path: recompute
+    // (8) ★ CONSENSUS-DoS REGRESSION — {non-XMR pay, XMR-kind ATTRIBUTION}.
+    //     Before the fix the canon prologue dispatched on the XMR attribution and
+    //     xmr_descriptor_valid's non-XMR-pay path delegated a descriptor that
+    //     STILL carried that XMR attribution back to valid(), re-entering the
+    //     dispatch forever (unbounded recursion -> stack-overflow SIGSEGV) —
+    //     reachable at allow_attribution=false, the V37.0 default. valid() must be
+    //     TOTAL: every shape returns a verdict in bounded time, never crashes. The
+    //     KAT previously never exercised an XMR attribution (the coverage gap).
+    {
+        ScriptRef btc; btc.kind = ScriptKind::P2WPKH; btc.payload.assign(20, 0x22);
+        ScriptRef xattr = xmr::make_xmr_std(xmr::kat::STD_KAT.p0, xmr::kat::STD_KAT.p1);
+
+        // allow=false: attribution present under V37.0 => REJECTED (not a crash).
+        PayoutDescriptor d; d.pay = btc; d.attribution = xattr;
+        CHECK(!d.valid(false));
+        // allow=true: verdict is the attribution's torsion check — good => valid.
+        CHECK(d.valid(true));
+        // allow=true + torsion-bad spend half => rejected by the torsion check.
+        {
+            PayoutDescriptor bad = d;
+            std::memcpy(bad.attribution->payload.data(),
+                        xmr::kat::TORSION_FAIL_IDENTITY.data(), 32);
+            CHECK(!bad.valid(true));
+        }
+        // malformed XMR attribution width (63 B) => rejected, still bounded.
+        {
+            PayoutDescriptor mal = d; mal.attribution->payload.pop_back();
+            CHECK(!mal.valid(false));
+            CHECK(!mal.valid(true));
+        }
+        // STRESS — the exact shape that used to recurse forever now returns in
+        // bounded time. Each call is O(descriptor), not recursive: a large call
+        // count completes near-instantly; a regression would stack-overflow here
+        // instead of finishing. sink pins the expected verdicts per iteration.
+        {
+            const int N = 100000;
+            volatile int sink = 0;
+            for (int i = 0; i < N; ++i) {
+                sink += d.valid(false) ? 0 : 1;   // false => +1
+                sink += d.valid(true)  ? 1 : 0;   // true  => +1
+            }
+            CHECK(sink == N * 2);
+        }
+    }
+
+    // (9) ★ the XMR validator hook did NOT perturb the non-XMR path: recompute
     //     the corpus fingerprint AFTER install — still byte-identical to master.
     const bytes32 fp_after = corpus_fingerprint();
     CHECK(hex(fp_after) == std::string(MASTER_NONXMR_FINGERPRINT));
