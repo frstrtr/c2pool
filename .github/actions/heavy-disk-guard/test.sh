@@ -6,6 +6,10 @@
 #   B. the guard FAILS FAST (exit 1) with the infra error when the floor is
 #      unreachable -- i.e. the guard actually blocks, it is not a silent no-op;
 #   C. the guard PASSES (exit 0) when the floor is met.
+#   D. the STALE_HOURS clamp is real -- a sub-floor stale-hours is raised to the
+#      3h floor, so a tree younger than 3h is SPARED (not reaped) even though the
+#      requested 1h would have reaped it. Guards the "someone lowers STALE_HOURS
+#      near job runtime and starts reaping live sibling trees" foot-gun.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -31,12 +35,14 @@ plant () {
   echo "$d"
 }
 
-ORPHAN="$(plant actions-runner-heavy-9 build_asan '3 hours ago')"
+# Ages are well clear of the 3h STALE_HOURS floor so CASE A's stale-hours=3 is
+# used verbatim (not clamped): 4h orphan is reaped, a fresh live tree is spared.
+ORPHAN="$(plant actions-runner-heavy-9 build_asan '4 hours ago')"
 LIVE="$(plant   actions-runner-heavy-8 build_asan 'now')"
-NONBUILD="$(plant actions-runner-heavy-7 srcdir   '3 hours ago')"
+NONBUILD="$(plant actions-runner-heavy-7 srcdir   '4 hours ago')"
 
 # ---- CASE A: sweep reaps the orphan, spares the live + non-build -----------
-HEAVY_DISK_FLOOR_GB=0 HEAVY_DISK_STALE_HOURS=1 \
+HEAVY_DISK_FLOOR_GB=0 HEAVY_DISK_STALE_HOURS=3 \
   HEAVY_DISK_SWEEP_ROOTS="$SBX/actions-runner*" \
   bash "$GUARD" >"$SBX/a.log" 2>&1
 rcA=$?
@@ -61,6 +67,18 @@ HEAVY_DISK_FLOOR_GB=1 HEAVY_DISK_STALE_HOURS=6 \
 rcC=$?
 [ $rcC -eq 0 ] && ok "C: guard passes on reachable floor" || bad "C: expected exit 0, got $rcC"
 grep -q "heavy-disk-guard: OK" "$SBX/c.log" && ok "C: prints OK line" || bad "C: missing OK line"
+
+# ---- CASE D: STALE_HOURS clamp protects a near-runtime tree ----------------
+# A 2h-old tree is younger than the 3h floor. A requested stale-hours=1 asks to
+# reap it, but the clamp raises the threshold to 3h -- so it MUST be spared.
+NEAR="$(plant actions-runner-heavy-6 build_asan '2 hours ago')"
+HEAVY_DISK_FLOOR_GB=0 HEAVY_DISK_STALE_HOURS=1 \
+  HEAVY_DISK_SWEEP_ROOTS="$SBX/actions-runner*" \
+  bash "$GUARD" >"$SBX/d.log" 2>&1
+rcD=$?
+[ $rcD -eq 0 ]     && ok "D: guard exit 0 with clamped stale-hours"        || bad "D: expected exit 0, got $rcD"
+grep -qi "clamped to 3h" "$SBX/d.log" && ok "D: emits clamp warning"       || bad "D: missing clamp warning"
+[ -d "$NEAR" ]     && ok "D: 2h tree spared by clamp (would die at 1h)"    || bad "D: clamp failed -- 2h tree reaped: $NEAR"
 
 echo "-----"
 if [ "$fails" -eq 0 ]; then

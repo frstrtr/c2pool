@@ -18,6 +18,26 @@ set -uo pipefail
 FLOOR_GB="${HEAVY_DISK_FLOOR_GB:-64}"
 CCACHE_MAX="${HEAVY_DISK_CCACHE_MAX:-15G}"
 STALE_HOURS="${HEAVY_DISK_STALE_HOURS:-6}"
+# Hard floor on STALE_HOURS. The ONLY thing that keeps the mtime sweep below from
+# reaping a LIVE co-resident build tree is that the tree is younger than
+# STALE_HOURS -- and `find -mmin` reads the TOP-LEVEL build dir's own mtime, which
+# stops advancing once configure finishes creating it. So the real liveness margin
+# is STALE_HOURS minus (job time after configure), not STALE_HOURS. At the ~25min
+# heavy-leg runtime the 6h default is a huge margin, but anyone lowering this near
+# job runtime would start reaping live sibling trees mid-build -- turning a green
+# sibling into a red. Refuse to go below 3h (still >> job runtime); clamp with a
+# loud warning rather than fail, so a config typo can never itself cause a red.
+STALE_HOURS_FLOOR=3
+case "$STALE_HOURS" in
+  ''|*[!0-9]*)
+    echo "::warning::heavy-disk-guard: non-integer stale-hours '$STALE_HOURS' -- clamped to ${STALE_HOURS_FLOOR}h floor to protect live co-resident build trees"
+    STALE_HOURS=$STALE_HOURS_FLOOR ;;
+  *)
+    if [ "$STALE_HOURS" -lt "$STALE_HOURS_FLOOR" ]; then
+      echo "::warning::heavy-disk-guard: stale-hours ${STALE_HOURS}h is below the ${STALE_HOURS_FLOOR}h floor (heavy-leg runtime ~25min) -- clamped to ${STALE_HOURS_FLOOR}h to protect live co-resident build trees"
+      STALE_HOURS=$STALE_HOURS_FLOOR
+    fi ;;
+esac
 BUILD_VOLUME="${HEAVY_DISK_BUILD_VOLUME:-${GITHUB_WORKSPACE:-$PWD}}"
 # Runner-home roots to sweep for orphaned build trees. Default: every
 # actions-runner* home of the current user -- the co-resident heavy runners

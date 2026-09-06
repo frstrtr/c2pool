@@ -20,7 +20,11 @@ inputs:
     description: >
       Age in hours above which a sibling build tree is treated as orphaned by a
       host-reaped job and reaped. A heavy build+test finishes in ~25 min, so the
-      default of 6h can only ever match a dead job's leftovers.
+      default of 6h can only ever match a dead job's leftovers. Hard-clamped to a
+      3h floor by guard.sh: the sweep's only protection for a LIVE co-resident
+      tree is its mtime being younger than this window, so a value near job
+      runtime would reap live trees mid-build. Values below 3h are raised to 3h
+      with a warning, never honored.
     default: "6"
 
 runs:
