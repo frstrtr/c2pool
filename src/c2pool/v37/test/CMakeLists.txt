@@ -144,4 +144,29 @@ if (BUILD_TESTING)
     target_include_directories(v37_w6_persistence_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w6_persistence_test Threads::Threads)
     add_test(NAME v37_w6_persistence_test COMMAND v37_w6_persistence_test)
+
+    # Track A2 / RDWR-OQ2 ACTIVATION — the sub-threshold estimator WIRED into the
+    # real W4 OwedLedger credit/fold path (src/c2pool/v37/w4_settlement.hpp) behind
+    # the ::v37::LaneParams::subthreshold gate. Proves the PRIME safety invariant
+    # at the wiring level: gate OFF (the default) => the composed owed_digest, the
+    # add-only receipt/share carrier, AND the lane digest are BYTE-IDENTICAL to
+    # master on a shared fixed schedule; gate ON is the RDWR-OQ2 consensus
+    # activation (owed_digest changes; goldens re-stamped, pinned here). Stdlib-only
+    # (integer math + deterministic splitmix64 MC), same self-harness shape as the
+    # sibling suites. SAME HOLLOW-GREEN GUARD: this target is ALSO listed in the
+    # build.yml --target lists (BOTH the Linux x86_64 leg and the ASan+UBSan leg)
+    # so CI actually compiles + runs it, not just registers it as a NOT_BUILT CTest
+    # sentinel (the DGB #137 / #769 / PR #1467 / #1477 unregistered-KAT class). The
+    # frozen golden JSON is copied next to the binary (WORKING_DIRECTORY) so the
+    # stamp-verification case reads it in-CI regardless of cwd.
+    add_executable(v37_w4_estimator_wiring_test v37_w4_estimator_wiring_test.cpp)
+    target_compile_features(v37_w4_estimator_wiring_test PRIVATE cxx_std_20)
+    target_include_directories(v37_w4_estimator_wiring_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_custom_command(TARGET v37_w4_estimator_wiring_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/w4_estimator_wiring_golden_v1.json
+                $<TARGET_FILE_DIR:v37_w4_estimator_wiring_test>/w4_estimator_wiring_golden_v1.json)
+    add_test(NAME v37_w4_estimator_wiring_test
+             COMMAND v37_w4_estimator_wiring_test
+             WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_w4_estimator_wiring_test>)
 endif()
