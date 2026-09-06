@@ -832,6 +832,31 @@ target_compile_features(c2pool-v37-w6-leveldb-compile-check PRIVATE cxx_std_20)
 target_compile_definitions(c2pool-v37-w6-leveldb-compile-check PRIVATE W6_ENABLE_LEVELDB)
 target_include_directories(c2pool-v37-w6-leveldb-compile-check PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(c2pool-v37-w6-leveldb-compile-check PRIVATE core Threads::Threads)
+# ── Track A2 / Milestone A: the live stagenet Monero/RandomX daemon ──────────
+# c2pool-v37-xmr: the single-node, stagenet-capable Family-B daemon (XmrNode).
+# It wires the MERGED lane (V37Engine / OwedLedger / X2 MonerodAdapter / X6
+# coinbase) against a live monerod; it defines NO consensus digest. Links the
+# X2 adapter library (xmr_node: RPC/ZMQ decoders) + the coin crypto (xmr_coin:
+# vendored ed25519 ge_* + keccak) + the P-1 / ed25519 point-check registrar
+# (v37_descriptor_xmr_point_check_ref10.cpp, guarded by V37_XMR_HAVE_MONERO_
+# CRYPTO — so the descriptor validator is LIVE and the daemon is not fail-closed).
+# NO RandomX / libzmq / async-HTTP is linked here: the live transport is the
+# dependency-free raw-socket RPC client with an RPC-poll ZMQ fallback (heavy
+# RandomX + real libzmq land in a later wave; see xmr/xmr_live_transport.hpp).
+# EXPERIMENTAL — prototype / stagenet only (see the file banner + README).
+# Built on demand (like c2pool-v37); the non-san CI leg lists it for a compile
+# gate. The V37Engine/OwedLedger consensus stays header-only + untouched.
+add_executable(c2pool-v37-xmr
+    v37/main_v37_xmr.cpp
+    ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+c2pool_wire_version(c2pool-v37-xmr)
+target_include_directories(c2pool-v37-xmr PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+    ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
+target_link_libraries(c2pool-v37-xmr PRIVATE xmr_node xmr_coin Threads::Threads)
 
 # W0 HAND-WIRES its consumer-side test dir explicitly. Test wiring in this repo
 # is hand-listed add_subdirectory/add_test — there is no file(GLOB) over

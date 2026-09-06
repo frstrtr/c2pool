@@ -169,4 +169,29 @@ if (BUILD_TESTING)
     add_test(NAME v37_w4_estimator_wiring_test
              COMMAND v37_w4_estimator_wiring_test
              WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_w4_estimator_wiring_test>)
+
+    # Track A2 / Milestone A — the live XmrNode daemon smoke
+    # (src/c2pool/v37/xmr/xmr_node_smoke.hpp). Stands the WHOLE single-node
+    # stagenet daemon up against a monerod STUB (MockMonerodTransport — no
+    # RandomX, no libzmq, no sockets, no live monerod) and asserts the four
+    # milestone invariants: (S1) construction/donor order — the W6 settlement
+    # store + RecoveryDriver are built BEFORE V37Engine::start(); (S2) BOTH
+    # descriptor backends live + fail-closed without one; (S3) the X2 adapter
+    # Extend/Reorg stream drives the node; (S4) the F1 CONTRACT —
+    # OwedLedger::on_block_finalized is called once per coin-height, IN ORDER,
+    # with bin_height = the high-water AT THE STEP (H+D_conf), NEVER the live
+    # tip; (S5) consensus DIGEST unchanged (lane digest + owed_digest
+    # byte-identical to a bare-library replay); (S6) restart recovery round-trip
+    # + F2 fail-closed on a torn store. Links the X2 adapter lib (xmr_node) for
+    # the RPC/ZMQ decoder symbols + Threads for the engine executor thread; NO
+    # crypto link (a test point-check backend is injected). Its own harness
+    # (nonzero exit on any failed check). SAME HOLLOW-GREEN GUARD as the sibling
+    # suites: listed in the build.yml --target lists (BOTH the Linux x86_64 leg
+    # and the ASan+UBSan leg) so CI compiles + runs it, and audited by the
+    # src/c2pool/**/test drift-guard.
+    add_executable(v37_xmr_node_smoke v37_xmr_node_smoke.cpp)
+    target_compile_features(v37_xmr_node_smoke PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_node_smoke PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_node_smoke PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_node_smoke COMMAND v37_xmr_node_smoke)
 endif()
