@@ -162,7 +162,7 @@ stop_after A3
 # ── A4. start the live node ──────────────────────────────────────────────────
 pkill -INT -f "c2pool-v37-btc-dash .*--network regtest" 2>/dev/null || true; sleep 1
 mkdir -p "$V37_STORE"
-nohup v37 --stratum-bind "$V37_STRATUM" > "$V37_LOG" 2>&1 &
+nohup "$V37_BIN" --network regtest --daemon-rpc "127.0.0.1:$DASH_RPC_PORT" --coin-rpc-auth "$V37_AUTH" --settle-db "${V37_STORE_OVERRIDE:-$V37_STORE}" --d-conf "$V37_DCONF" --poll-ms 500 --stratum-bind "$V37_STRATUM" > "$V37_LOG" 2>&1 &
 for i in $(seq 1 30); do grep -q "stratum listening" "$V37_LOG" && break; sleep 1; done
 grep -E "dashd ready|boot:|stratum listening|REFUSED|refused" "$V37_LOG"
 grep -q "stratum listening" "$V37_LOG" || { echo "node did not start (exit codes: 3 mainnet 4 creds 5 dashd/fence 6 store 7 start 8 bind)"; exit 1; }
@@ -215,7 +215,7 @@ wait_found 3                                                      # a third bloc
 WON3="$(last_found)"; H3="$(cli getblockheader "$WON3" | jq .height)"
 pkill -INT -f "c2pool-v37-btc-dash .*--network regtest"; sleep 2
 STOP="$(grep '\[v37-dash\] stop:' "$V37_LOG" | tail -1 | sed -E 's/.*(ledger_seq=[0-9]+ pending=[0-9]+ owed_digest=[0-9a-f]+).*/\1/')"
-nohup v37 --stratum-bind "$V37_STRATUM" >> "$V37_LOG" 2>&1 &
+nohup "$V37_BIN" --network regtest --daemon-rpc "127.0.0.1:$DASH_RPC_PORT" --coin-rpc-auth "$V37_AUTH" --settle-db "${V37_STORE_OVERRIDE:-$V37_STORE}" --d-conf "$V37_DCONF" --poll-ms 500 --stratum-bind "$V37_STRATUM" >> "$V37_LOG" 2>&1 &
 sleep 5
 BOOT="$(grep '\[v37-dash\] boot:' "$V37_LOG" | tail -1 | sed -E 's/.*(ledger_seq=[0-9]+ pending=[0-9]+ owed_digest=[0-9a-f]+).*/\1/')"
 [ "$STOP" = "$BOOT" ] && echo "RECOVERY OK: $BOOT" || { echo "FAIL: RECOVERY MISMATCH stop=[$STOP] boot=[$BOOT]"; exit 1; }

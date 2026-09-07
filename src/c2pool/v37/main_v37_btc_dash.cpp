@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
     {
         std::lock_guard<std::mutex> g(bed.mutex());
         LOG_INFO << "[v37-dash] boot: ledger_seq=" << node.ledger().ledger_seq()
-                 << " pending=" << bed.pending_count()
+                 << " pending=" << bed.pending_count_locked()
                  << " owed_digest=" << hex32(node.ledger().owed_digest())
                  << " reseeded=" << boot.reseeded << " stale=" << boot.stale_dropped
                  << " unrecoverable=" << boot.unrecoverable;   // A8 compares this triple with the stop: line
@@ -400,7 +400,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> g(bed.mutex());
         node.stop();
         LOG_INFO << "[v37-dash] stop: ledger_seq=" << node.ledger().ledger_seq()
-                 << " pending=" << bed.pending_count()
+                 << " pending=" << bed.pending_count_locked()
                  << " owed_digest=" << hex32(node.ledger().owed_digest());   // A8 compares with the next boot: line
     }
     teardown_io();

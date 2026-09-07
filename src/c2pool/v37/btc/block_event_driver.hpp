@@ -283,6 +283,10 @@ public:
         std::lock_guard<std::mutex> g(m_mu);
         return m_pending.size();
     }
+    // Same read, but the CALLER already holds mutex() (m_mu is non-recursive):
+    // used by main's boot/stop observability blocks, which hold the lock across
+    // the whole scope. Calling the locking pending_count() there self-deadlocks.
+    std::size_t pending_count_locked() const { return m_pending.size(); }
     // The one lock. main takes it around XbtcNode::stop() and the boot/stop
     // observability reads so no second caller can forget GAP-7.
     std::mutex& mutex() const { return m_mu; }
