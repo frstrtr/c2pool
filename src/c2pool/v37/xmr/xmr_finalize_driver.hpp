@@ -138,8 +138,23 @@ public:
         // the D_conf burial threshold, the high-water at that step is h + D_conf
         // (NOT best_height): that is the value the K_fair clock must see, so a
         // node catching up replays the SAME per-height clock a synced node saw.
+        //
+        // CURSOR PERSISTENCE (O-1, X9 stagenet bring-up): the cursor is written
+        // once after the walk, plus immediately after any height that actually
+        // finalized / orphaned a found block (so a crash between such steps
+        // never re-plays a step whose write-ahead is already durable). It used
+        // to be written on EVERY height: on a fresh store against live stagenet
+        // (tip ~2.2M) that is ~2.2M whole-image rewrites of settle.img inside
+        // bring_up() -- minutes of silence and heavy I/O -- for heights that
+        // carry no found block at all. The F1 contract is untouched: the per-
+        // height bin_height, the in-order stepping and the write-ahead-then-
+        // mutate ordering are exactly as before; only the cursor checkpoint
+        // cadence changed, and the walk is idempotent on replay (is_pending /
+        // canonical guards) so a stale cursor after a crash is harmless.
+        const std::uint64_t cursor_before = m_cursor_h;
         for (std::uint64_t h = m_cursor_h + 1; h <= frontier; ++h) {
             const std::uint64_t bin_height = h + m_d_conf;   // high-water at this step
+            bool touched = false;                            // a found block was disposed at h
 
             auto bit = m_by_height.find(h);
             if (bit != m_by_height.end()) {
@@ -149,6 +164,7 @@ public:
                     if (!fit->second.canonical) continue;             // already orphaned
                     if (m_is_canonical && !m_is_canonical(h, bid)) {  // orphaned at maturity
                         on_block_orphaned(bid);
+                        touched = true;
                         continue;
                     }
                     if (!m_ledger.is_pending(bid)) continue;          // idempotent / already settled
@@ -163,11 +179,13 @@ public:
                     write_event(ev);
                     m_ledger.on_block_finalized(bid, bin_height);
                     steps.push_back(FinalizeStep{bid, h, bin_height});
+                    touched = true;
                 }
             }
             m_cursor_h = h;
-            persist_cursor();
+            if (touched) persist_cursor();
         }
+        if (m_cursor_h != cursor_before) persist_cursor();
         persist_hw();
         return steps;
     }

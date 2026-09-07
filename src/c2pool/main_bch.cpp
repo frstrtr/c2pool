@@ -12,8 +12,8 @@
 // EXE-WIRE slice (integrator 2026-06-18) closed the "no runnable c2pool-bch
 // entrypoint" gap. This slice adds the --ibd RUN-LOOP: a read-only headers-first
 // initial-block-download harness that stands up the embedded daemon over its
-// P2P front-end against VM300 bchn-bch (192.168.86.110:8333) and reports the
-// live sync evidence the M5 size loop rests on:
+// P2P front-end against the BCHN peer supplied by --peer HOST:PORT (there is no
+// hardcoded default) and reports the live sync evidence the M5 size loop rests on:
 //   - synced height advancing PAST the init() checkpoint  (chain-ingest works)
 //   - false_evict_count                                   (0 == clean sync)
 //   - in_flight / reissue_count                           (download-window health)
@@ -87,11 +87,44 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --with-peer-verify [--testnet] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
         << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n"
-        << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT]\n"
+        << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT]\n"
+        << "              [--peer HOST:PORT | --coin-p2p-discover] [--http [HOST:]PORT]\n"
         << "              [--sharechain-addnode HOST:PORT ...] [--anchor N] [--rpc-conf PATH]\n"
-        << "              [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
-        << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
-        << "                   isolates co-located instances\n\n"
+        << "              [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n\n"
+        << "Coin-network peer (there is NO default; --pool needs --peer OR --coin-p2p-discover):\n"
+        << "  --peer HOST:PORT          explicit BCHN coin-network peer to dial. No\n"
+        << "                            default -- a public deploy must set this or\n"
+        << "                            --coin-p2p-discover (never a hardcoded LAN IP).\n"
+        << "  --coin-p2p-discover       network-standalone discovery: reach the BCH\n"
+        << "                            network via a scored, group-diverse CoinAddrMan\n"
+        << "                            peer set bootstrapped from DNS/fixed/HTTP seeds\n"
+        << "                            (no explicit --peer, no external BCHN needed).\n"
+        << "Network + ports (mainnet default):\n"
+        << "  --testnet                 BCH testnet3   (coin P2P 18333)\n"
+        << "  --testnet4                BCH testnet4   (coin P2P 28333)\n"
+        << "  --regtest                 BCH regtest    (coin P2P 18444)\n"
+        << "                            default: mainnet (coin P2P 8333)\n"
+        << "Pool / sharechain:\n"
+        << "  --stratum [HOST:]PORT     bind the stratum miner endpoint (else disabled)\n"
+        << "  --http [HOST:]PORT        bind the dashboard/HTTP endpoint (else disabled)\n"
+        << "  --sharechain-addnode H:P  pin explicit sharechain (pool P2P) peer(s);\n"
+        << "                            REPEATABLE. Given => only these are dialed.\n"
+        << "  --anchor N                cold-start ABLA floor anchor height\n"
+        << "  --rpc-conf PATH           external BCHN-RPC fallback creds (host:port+auth)\n"
+        << "  --data-dir PATH           root all per-instance state here (default\n"
+        << "                            ~/.c2pool); isolates co-located instances\n"
+        << "Control-plane / config:\n"
+        << "  --settings PATH           load an L1 settings file\n"
+        << "  --dump-resolved-config    print the resolved launch config and exit\n"
+        << "  --ack-money-settings      print the money-settings ack hash and exit\n"
+        << "Money (reward) flags:\n"
+        << "  --give-author PCT         author/dev donation percent (default 0.1%)\n"
+        << "  -f, --fee PCT             node-owner fee percent (default 0 = off)\n"
+        << "  --node-owner-address ADDR node-owner fee destination address\n"
+        << "Harness modes (read-only, single --peer required):\n"
+        << "  --ibd [--near-tip] [--auto-kick] [--max-seconds N]   headers-first IBD evidence\n"
+        << "  --with-peer-verify [--max-seconds N]                 P2P won-block-route verify\n"
+        << "  --selftest                                           ABLA budget selftest (default)\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
         << "        The embedded daemon (coin/embedded_daemon.hpp) is the primary\n"
         << "        work source; external BCHN-RPC stays as the fallback.\n"
@@ -640,7 +673,8 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
              const std::string& http_addr, uint16_t http_port,
              const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes,
              double dev_donation, double node_owner_fee,
-             const std::string& node_owner_address)
+             const std::string& node_owner_address,
+             bool coin_p2p_discover)
 {
     boost::asio::io_context ioc;
 
@@ -652,7 +686,12 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
     config.coin()->m_testnet = testnet || testnet4 || regtest;
     config.coin()->m_testnet4 = testnet4;            // -> BCHChainParams::testnet4() (own genesis 000000001dd4.., magic e2b7daaf)
     config.coin()->m_symbol  = "BCH";
-    config.coin()->m_p2p.address = NetService(peer_host, peer_port);
+    // Empty host = no explicit coin peer (discovery-only run): leave the address
+    // at port 0 so EmbeddedDaemon::maybe_start_p2p takes the discovery arm, NOT
+    // the explicit-peer arm (a "":<port> NetService would dial a bogus target).
+    config.coin()->m_p2p.address = peer_host.empty()
+        ? NetService()
+        : NetService(peer_host, peer_port);
     // BCH P2P network magic (pchMessageStart, BCHN chainparams.cpp): mainnet
     // e3e1f3e8, testnet3 f4e5f3f4, regtest dab5bffa. Wrong magic == BCHN drops
     // the peer with EOF right after connect.
@@ -717,7 +756,10 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
     std::cout
         << "[pool] c2pool-bch pool run-loop"
         << (regtest ? " (regtest)" : (testnet4 ? " (testnet4)" : (testnet ? " (testnet)" : " (mainnet)")))
-        << " -- BCHN peer " << peer_host << ":" << peer_port
+        << " -- coin peer "
+        << (peer_host.empty()
+                ? (coin_p2p_discover ? "discovery (addrman)" : "NONE")
+                : (peer_host + ":" + std::to_string(peer_port)))
         << ", cold-start anchor=" << anchor_height;
     if (stratum_port)
         std::cout << ", stratum " << stratum_addr << ":" << stratum_port;
@@ -733,7 +775,8 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
         bch::standup_pool_run(ioc, config, anchor_height,
                               stratum_addr, stratum_port, testnet || testnet4 || regtest, regtest,
                               http_addr, http_port, sharechain_addnodes.size(),
-                              dev_donation, node_owner_fee, node_owner_address);
+                              dev_donation, node_owner_fee, node_owner_address,
+                              coin_p2p_discover);
     } catch (const std::exception& e) {
         std::cout << "[pool] FATAL: " << e.what() << "\n";
         return 1;
@@ -763,8 +806,12 @@ int main(int argc, char** argv)
     bool testnet4 = false;
     bool near_tip = false;
     bool auto_kick = false;
-    std::string host = "192.168.86.110";   // VM300 bchn-bch
-    uint16_t port = 8333;
+    // Coin peer host: NO default. Empty = unset; --peer HOST[:PORT] or
+    // --coin-p2p-discover must supply the coin-network peer, else the run modes
+    // fail closed (public deploys must never dial a hardcoded private LAN IP).
+    std::string host;
+    uint16_t port = 8333;   // default coin P2P port (mainnet); --testnet/4/regtest + --peer override it
+    bool coin_p2p_discover = false;   // --coin-p2p-discover: CoinAddrMan-backed network-standalone coin-peer discovery (no explicit --peer needed)
     uint32_t max_seconds = 600;
     std::string settings_path;       // --settings PATH (M0b; empty => default probe)
     bool want_dump_config = false;   // --dump-resolved-config (M0b)
@@ -811,6 +858,7 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
         else if (std::strcmp(argv[i], "--with-peer-verify") == 0) want_with_peer_verify = true;
         else if (std::strcmp(argv[i], "--pool") == 0)     want_pool = true;
+        else if (std::strcmp(argv[i], "--coin-p2p-discover") == 0) coin_p2p_discover = true;
         else if (std::strcmp(argv[i], "--regtest") == 0)  { regtest = true; testnet = true; port = 18444; }
         else if (std::strcmp(argv[i], "--anchor") == 0 && i + 1 < argc)
             anchor_height = static_cast<uint32_t>(std::stoul(argv[++i]));
@@ -918,6 +966,22 @@ int main(int argc, char** argv)
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))        http_port  = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
         if (rc.file_set("daemon_rpc.auth_file")) rpc_conf = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf);
+        // Coin-network peer (--peer alias) + --coin-p2p-discover from the settings
+        // file (L1). coin_p2p.connect is HOST[:PORT]; an omitted port keeps the
+        // network default. Mirrors the DGB coin_p2p.discover overlay.
+        if (rc.file_set("coin_p2p.connect")) {
+            std::string v = rc.get_string("coin_p2p.connect").value_or("");
+            if (!v.empty()) {
+                const auto c = v.rfind(':');
+                if (c != std::string::npos) {
+                    host = v.substr(0, c);
+                    port = static_cast<uint16_t>(std::stoi(v.substr(c + 1)));
+                } else {
+                    host = v;
+                }
+            }
+        }
+        if (rc.file_set("coin_p2p.discover") && rc.get_string("coin_p2p.discover").value_or("") == "true") coin_p2p_discover = true;
         if (rc.file_set("embedded.anchor")) anchor_height = static_cast<uint32_t>(rc.get_i64("embedded.anchor").value_or(anchor_height));
         if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
@@ -927,6 +991,22 @@ int main(int argc, char** argv)
     print_banner(argv[0]);
     if (want_help)
         return 0;
+
+    // FAIL-CLOSED coin-peer gate (BCH FIX-2): a run mode that dials the coin
+    // network must have an explicit --peer OR --coin-p2p-discover. Placed AFTER
+    // the M0b block (so a settings-file coin_p2p.connect/discover counts) and
+    // after --dump-resolved-config / --ack-money-settings / --help have already
+    // returned (the golden gate + help paths must still exit 0 with no --peer).
+    // --pool accepts discovery; the single-peer --ibd / --with-peer-verify
+    // harnesses require an explicit --peer (discovery does not apply there).
+    if (want_pool && host.empty() && !coin_p2p_discover) {
+        std::cerr << "error: no coin peer configured: pass --peer HOST:PORT or --coin-p2p-discover\n";
+        return 1;
+    }
+    if ((want_ibd || want_with_peer_verify) && host.empty()) {
+        std::cerr << "error: --ibd/--with-peer-verify require an explicit --peer HOST:PORT\n";
+        return 1;
+    }
 
     if (want_leg_c_p2p) {
         if (rpc_conf.empty()) {
@@ -947,7 +1027,7 @@ int main(int argc, char** argv)
     if (want_pool)
         return run_pool(host, port, testnet, testnet4, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf,
                         http_addr, http_port, sharechain_addnodes,
-                        dev_donation, node_owner_fee, node_owner_address);
+                        dev_donation, node_owner_fee, node_owner_address, coin_p2p_discover);
 
     if (want_with_peer_verify)
         return run_with_peer_verify(host, port, testnet, max_seconds);
