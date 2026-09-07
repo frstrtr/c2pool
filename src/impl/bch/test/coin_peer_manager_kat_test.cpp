@@ -129,7 +129,12 @@ int main()
     {
         auto m = make_mgr(ioc, BchPeerManagerConfig{}, "sybil");  // default cap = 3 new/group
         for (int i = 1; i <= 5; ++i)
-            m->add_discovered_peer(ns("8.8.100." + std::to_string(i), 8333)); // all group "8.8"
+            // Peers all share one /16 (group "8.8") so the working-set group
+            // cap binds, but each is gossiped by a DISTINCT source /16 so the
+            // addrman banks every one in its own new-table bucket — no same-
+            // bucket slot collision, size() is deterministically 5.
+            m->add_discovered_peer(ns("8.8.100." + std::to_string(i), 8333),
+                                   "51." + std::to_string(i) + ".0.1"); // peer /16 "8.8", source /16 distinct
         CHECK(m->peer_count() <= 3);                            // working-set group cap
         CHECK(m->addrman().size() == 5);                        // bank keeps them all
     }
