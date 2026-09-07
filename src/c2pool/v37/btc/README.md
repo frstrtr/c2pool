@@ -20,6 +20,10 @@ W5 coinbase (`w5_coinbase.hpp`) is the native BTC-family coinbase.
 | `btc_finalize_driver.hpp` | the live **F1** driver the node runs (same contract, adds W6 write-ahead persistence) |
 | `btc_node.hpp` | `XbtcNode` lifecycle: `open()` → `start()` → `on_tip()`/`on_block_won()` → `stop()` |
 | `btc_node_smoke.hpp` | `run_btc_node_smoke()` — shared body |
+| `dash_rpc_coin_backend.hpp` | `DashRpcCoinBackend` — the REAL `ICoinBackend` for ONE `dashd -regtest`/`-devnet` over the v36 `dash::coin::NodeRPC` client (getblockchaininfo / getblockheader tri-state / getblocktemplate miner-spendable value / submitblock); chain-tag + regtest-genesis fence; D6 byte-order pin; `height_of()` (D8). HEAVY TU (Boost/jsonrpccxx) — `c2pool-v37-btc-dash` only, never the Threads-only leg |
+| `block_event_driver.hpp` | `BlockEventDriver` — coin-agnostic, header-only sequencer of FOUND → FINALIZED → ORPHANED into `XbtcNode`; write-ahead pending-FOUND sidecar + `reseed_after_open()` restart re-drive (D10) through `BtcFinalizeDriver::reseed_found`; D11 poll-side reorg re-check; the one GAP-7 mutex |
+| `../main_v37_btc_dash.cpp` | the `c2pool-v37-btc-dash` entrypoint — the live DASH-regtest daemon (v36 `DASHWorkSource` + `core::StratumServer` front-end, height-watch, exit codes 2..9) |
+| `../tools/runbook_dash_regtest.sh` | the VM100 A1–A9 DASH-regtest runbook (Dash Core v23.1.7 pinned); the runtime gate of the heavy leg — operator-run only |
 | `../settle_finalize_driver.hpp` | the coin-agnostic **F1** driver, **byte-for-byte the driver A-XMR runs** (`c2pool::v37n::settle::FinalizeDriver`); the node's `btc_finalize_driver.hpp` is the persistence-integrated wrapper of this same per-height contract (unifying the two is the noted follow-on) |
 | `../main_v37_btc.cpp` | the `c2pool-v37-btc` entrypoint |
 | `../test/v37_btc_node_smoke.cpp` | lifecycle smoke — CI gate (both build.yml legs) |

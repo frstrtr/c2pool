@@ -107,6 +107,26 @@ public:
         m_by_height[b.height].push_back(b.bid);
     }
 
+    // W6 restart re-drive (PR-1 / verify-round fix 3, D10). RecoveryDriver
+    // replays a FOUND event into the OwedLedger's pending set, but this driver
+    // is constructed EMPTY at XbtcNode::open() (btc_node.hpp:121-123), so a
+    // block found before a restart and not yet buried D_conf deep would never
+    // be stepped at maturity (never FINALIZED, never ORPHANED). reseed_found()
+    // re-enters such a bid into m_found/m_by_height WITHOUT writing a second
+    // FOUND event (the original is already in the log) and WITHOUT touching the
+    // ledger (already pending). Refuses a bid the ledger does not hold pending
+    // (finalized or orphaned before the restart). Idempotent per bid. Sole
+    // caller: BlockEventDriver::reseed_after_open() (block_event_driver.hpp),
+    // which supplies the height from its write-ahead sidecar and credit/payout
+    // from the persisted FOUND event.
+    bool reseed_found(const FoundBlock& b) {
+        if (m_found.count(b.bid)) return true;
+        if (!m_ledger.is_pending(b.bid)) return false;
+        m_found.emplace(b.bid, b);
+        m_by_height[b.height].push_back(b.bid);
+        return true;
+    }
+
     // A block left the best chain (an Orphan / a Reorg that dropped it). Dispose
     // per the merged ledger's O3.5 rule (pre-SETTLED: pure removal; post-SETTLED:
     // priced residual). Write-ahead the ORPHAN event.

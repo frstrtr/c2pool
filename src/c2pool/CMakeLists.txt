@@ -872,6 +872,52 @@ c2pool_wire_version(c2pool-v37-btc)
 target_include_directories(c2pool-v37-btc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(c2pool-v37-btc Threads::Threads)
 
+# ── Track A2 / Milestone A-BTC, PR-1: the DASH-regtest LIVE leg ──────────────
+# c2pool-v37-btc-dash: the same XbtcNode lifecycle as c2pool-v37-btc, bound to
+# ONE `dashd -regtest`/`-devnet` over the mature v36 dash::coin::NodeRPC client
+# (btc/dash_rpc_coin_backend.hpp, a REAL ICoinBackend: getblockchaininfo /
+# getblockheader / getblocktemplate / submitblock) and the v36 DASHWorkSource
+# stratum front-end, plus the coin-agnostic block-event driver
+# (btc/block_event_driver.hpp: FOUND -> FINALIZED -> ORPHANED sequencing, the
+# write-ahead pending-FOUND sidecar and the restart re-drive through the one
+# consumer-tree seam BtcFinalizeDriver::reseed_found). It defines NO consensus
+# digest; nothing under src/sharechain/v37 and no w4_settlement.hpp line changes.
+# This is the HEAVY leg (Boost.Asio/Beast + jsonrpccxx + LevelDB + X11):
+# c2pool-v37-btc above STAYS Threads-only (HARD SAFETY 6) and keeps the
+# CI-runnable --selftest. Link set = the DASH library set of c2pool-dash /
+# dash_hdr_backfill_window_kat (the DASHWorkSource bodies pull the whole
+# c2pool-dash SCC); dash_scriptcheck is omitted exactly as the DASH KATs omit it
+# (its only consumer is main_dash.cpp's --embedded-fold-checkscripts lambda).
+# Listed in build.yml's linux-leg --target list next to c2pool-v37-btc so it is
+# compiled + linked at PR time (a c2pool/ target, not under */test/, so outside
+# the drift-guard glob; registers no CTest -- the runtime gate is the
+# operator-run DASH-regtest runbook, v37/tools/runbook_dash_regtest.sh). Like
+# c2pool-dash it is NOT on the ASan+UBSan leg: that leg carries no heavy coin
+# executable (its -j4 memory cap), and the DASH object graph it would exercise
+# is already sanitizer-built there through dash_hdr_backfill_window_kat.
+# EXPERIMENTAL -- DASH regtest/devnet only; mainnet refused without
+# --i-understand-mainnet. Build: cmake --build <dir> --target c2pool-v37-btc-dash
+add_executable(c2pool-v37-btc-dash v37/main_v37_btc_dash.cpp)
+c2pool_wire_version(c2pool-v37-btc-dash)
+target_compile_features(c2pool-v37-btc-dash PRIVATE cxx_std_20)
+target_include_directories(c2pool-v37-btc-dash PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(c2pool-v37-btc-dash
+    core pool sharechain
+    c2pool_node_enhanced
+    dash
+    c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+    dash_x11
+    dash_rpc
+    dash_stratum
+    dash_block_replay
+    dash_bls_verify
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+    Threads::Threads
+)
+
 # W0 HAND-WIRES its consumer-side test dir explicitly. Test wiring in this repo
 # is hand-listed add_subdirectory/add_test — there is no file(GLOB) over
 # */test — and the test-floor-guard only floors lanes already present in
