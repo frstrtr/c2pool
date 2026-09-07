@@ -119,6 +119,51 @@ else
 fi
 reap "$L2" "$H2"
 
+echo; echo "### acquire.sh (composite-action body used by the SLOTS=1 disk semaphore)"
+# The disk semaphore reuses the SAME reap-guard logic via .github/actions/heavy-leg-lock.
+# Gate it at SLOTS=1 (its production slot count) so a hollow sweep there is caught too,
+# and prove the holder-env override lands the pid under the requested var name.
+ACQ2="$ROOT/.github/actions/heavy-leg-lock/acquire.sh"
+[ -s "$ACQ2" ] || { echo "FATAL: missing $ACQ2"; exit 2; }
+run_disk() {  # $1 sweep(0/1)  $2 wait(s)  $3 lock-base  $4 marker-base
+  HEAVY_LEG_LOCK="$3" HEAVY_LEG_HOLDERFILE="$4" \
+  HEAVY_LEG_WAIT="$2" HEAVY_LEG_TTL=3 HEAVY_LEG_SWEEP="$1" HEAVY_LEG_SLOTS=1 \
+  HEAVY_LEG_HOLDER_ENV=HEAVY_DISK_LOCK_HOLDER \
+  RUNNER_NAME="honesty-test-disk" GITHUB_ENV="$TMP/genv-disk" \
+  bash "$ACQ2"
+}
+disk_reap() {  # $1 marker  $2 lock
+  [ -f "$1" ] && awk {print } "$1" | xargs -r kill 2>/dev/null || true
+  fuser -k "$2" 2>/dev/null || true
+  sleep 0.3 || true
+}
+
+echo; echo "### CASE 3  DISK FIXED (sweep on, SLOTS=1): sole slot saturated -> reaped -> GREEN"
+L3="$TMP/case3.lock"; H3="$TMP/case3.holder"
+SLOTS=1 plant_orphan "$L3.1" "$H3.1" || exit 1
+rm -f "$TMP/genv-disk"
+if run_disk 1 20 "$L3" "$H3"; then
+  echo "-> PASS: disk semaphore reaped the stale holder and acquired slot 1"
+  if grep -q ^HEAVY_DISK_LOCK_HOLDER= "$TMP/genv-disk" 2>/dev/null; then
+    echo "-> PASS: holder pid exported under HEAVY_DISK_LOCK_HOLDER"
+  else
+    echo "-> FAIL: holder-env override did not export HEAVY_DISK_LOCK_HOLDER"; fail=1
+  fi
+else
+  echo "-> FAIL: disk semaphore did NOT recover from a reapable orphan on its sole slot"; fail=1
+fi
+disk_reap "$H3.1" "$L3.1"
+
+echo; echo "### CASE 4  DISK LEAKED (sweep off, SLOTS=1): saturation must block -> RED"
+L4="$TMP/case4.lock"; H4="$TMP/case4.holder"
+SLOTS=1 plant_orphan "$L4.1" "$H4.1" || exit 1
+if run_disk 0 5 "$L4" "$H4"; then
+  echo "-> FAIL: disk semaphore acquired despite a live orphan on its sole slot -- hollow sweep"; fail=1
+else
+  echo "-> PASS: orphan blocked the sole slot and acquire failed red without the sweep"
+fi
+disk_reap "$H4.1" "$L4.1"
+
 echo
 if [ "$fail" = 0 ]; then
   echo "HONESTY GATE PASSED: perturb -> reaped -> green ; restore leak -> red"
