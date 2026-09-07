@@ -301,40 +301,58 @@ TEST(GoodCitizenDefaults, ServeClampedWithoutUtxoLane)
 using dgb::coin::FullBlockAccrualAction;
 using dgb::coin::classify_full_block_accrual;
 
-// 10a. Fresh view (best_height == 0): the first confirmed-tip block anchors.
+// 10a. Fresh view (best_height == 0): the first confirmed-tip block anchors,
+//      regardless of parent_matches (there is no predecessor to match).
 TEST(FullBlockAccrual, FreshViewConnectsFirstAnchor)
 {
-    EXPECT_EQ(classify_full_block_accrual(/*best=*/0, /*incoming=*/1),
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/0, /*incoming=*/1, /*parent=*/false),
               FullBlockAccrualAction::Connect);
-    EXPECT_EQ(classify_full_block_accrual(/*best=*/0, /*incoming=*/900'000),
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/0, /*incoming=*/900'000, /*parent=*/false),
               FullBlockAccrualAction::Connect);  // cold start at a live tip
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/0, /*incoming=*/1, /*parent=*/true),
+              FullBlockAccrualAction::Connect);  // parent flag ignored at anchor
 }
 
-// 10b. Normal +1 extend connects.
+// 10b. Normal +1 extend connects ONLY when the block builds on our tip
+//      (parent_matches). A +1 block whose parent is NOT our flushed tip is a
+//      same-height reorg that replaced the tip -> continuity guard DROPS it
+//      (10b2) so we never fold against a stale view.
 TEST(FullBlockAccrual, ExactNextHeightConnects)
 {
-    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/101),
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/101, /*parent=*/true),
               FullBlockAccrualAction::Connect);
+}
+
+// 10b2. THE CONTINUITY GAP: incoming height is exactly best+1 but its parent is
+//       not the view's flushed best_block (a same-height reorg swapped our tip
+//       out). Height alone said Connect; the parent-hash guard DROPS it.
+TEST(FullBlockAccrual, SameHeightReorgParentMismatchDrops)
+{
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/101, /*parent=*/false),
+              FullBlockAccrualAction::Drop);
 }
 
 // 10c. THE BUG: a forward tip-gap (height > best+1, e.g. the tip after a
-//      restart) must RE-ANCHOR, not drop. This is the liveness fix.
+//      restart) must RE-ANCHOR, not drop. This is the liveness fix. reanchor()
+//      wipes the view, so parent_matches is irrelevant here (proved both ways).
 TEST(FullBlockAccrual, ForwardGapReAnchors)
 {
-    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/102),
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/102, /*parent=*/false),
               FullBlockAccrualAction::ReAnchorThenConnect);   // one-block gap
-    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/900'000),
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/900'000, /*parent=*/false),
               FullBlockAccrualAction::ReAnchorThenConnect);   // restart jump
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/102, /*parent=*/true),
+              FullBlockAccrualAction::ReAnchorThenConnect);   // parent flag ignored on gap
 }
 
 // 10d. A reorg / duplicate (height <= best) stays fail-closed DROP: an
 //      accrual-only view cannot safely fold a reorg, and dropping never
-//      overstates a fee.
+//      overstates a fee. (parent_matches cannot rescue a backward height.)
 TEST(FullBlockAccrual, ReorgOrEqualDrops)
 {
-    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/100),
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/100, /*parent=*/true),
               FullBlockAccrualAction::Drop);   // duplicate / same tip
-    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/99),
+    EXPECT_EQ(classify_full_block_accrual(/*best=*/100, /*incoming=*/99, /*parent=*/true),
               FullBlockAccrualAction::Drop);   // reorg to a lower height
 }
 
