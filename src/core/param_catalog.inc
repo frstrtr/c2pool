@@ -208,10 +208,11 @@ C2P_PARAM("coin_p2p.connect", CoinP2P, LIST_HOSTPORT, RESTART, C_DASH|C_BCH, LIT
 C2P_PARAM("coin_p2p.externalip", CoinP2P, STRING, RESTART, C_BIP110, LIT, "", NONE, "operator-pinned reachable IP for self-address advertisement")
   C2P_ALIAS("coin_p2p.externalip", BIN_BIP110, "--coin-externalip", VALUE)
 
-C2P_PARAM("coin_p2p.discover", CoinP2P, BOOL, RESTART, C_DASH|C_BTC|C_DGB, LIT, "false", NONE, "scored/diverse coin-P2P discovery")
+C2P_PARAM("coin_p2p.discover", CoinP2P, BOOL, RESTART, C_DASH|C_BTC|C_DGB|C_BCH, LIT, "false", NONE, "scored/diverse coin-P2P discovery")
   C2P_ALIAS("coin_p2p.discover", BIN_DASH, "--coin-p2p-discover", FLAG)
   C2P_ALIAS("coin_p2p.discover", BIN_BTC, "--coin-p2p-discover", FLAG)
   C2P_ALIAS("coin_p2p.discover", BIN_DGB, "--coin-p2p-discover", FLAG)
+  C2P_ALIAS("coin_p2p.discover", BIN_BCH, "--coin-p2p-discover", FLAG)
 
 C2P_PARAM("coin_p2p.magic", CoinP2P, HEX, MONEY_RESTART, C_DASH|C_DGB, LIT, "", HEX8_MAGIC, "wire magic override (regtest)")
   C2P_ALIAS("coin_p2p.magic", BIN_DASH, "--coin-p2p-magic", VALUE)

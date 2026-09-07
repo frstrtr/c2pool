@@ -32,6 +32,7 @@ set(bch_coin_bchn
     header_sync.hpp block_download.hpp block_connector.hpp
     compact_blocks.hpp block_broadcast_guard.hpp
     bchn_anchor_record.hpp chain_seeds.hpp
+    coin_peer_manager.hpp
     embedded_daemon.hpp
 )
 
