@@ -132,8 +132,16 @@
 #include <c2pool/v37/btc/block_event_driver.hpp>      // BlockEventDriver, Canon
 #include <c2pool/v37/btc/dash_rpc_coin_backend.hpp>   // DashRpcCoinBackend, parse_block_id, display_hex_of_internal
 
+// Track A2 CONSUMER half — the carrier p2p layer (cross-node share/receipt
+// ingestion). Non-consensus: every append rides CarrierRelay -> CarrierIngest
+// -> V37Engine (node.engine()), never src/sharechain/v37 canon.
+#include <c2pool/v37/carrier_ingest.hpp>              // CarrierIngest, CallbackMainchainIndex, MemShareTracker
+#include <c2pool/v37/carrier_net.hpp>                 // CarrierPeerNode (ICarrierTransport over sockets)
+#include <c2pool/v37/w3_relay.hpp>                    // CarrierRelay
+
 namespace io = boost::asio;
 using namespace c2pool::v37n::btc;
+using namespace c2pool::v37n;   // A2 consumer: CarrierRelay/CarrierIngest/CarrierPeerNode/… (parent ns)
 
 static std::atomic<bool> g_stop{false};
 static void on_signal(int) { g_stop = true; }
@@ -157,6 +165,8 @@ static void usage() {
         "  --d-conf N                         (default 100; regtest drills use 6)\n"
         "  --poll-ms N                        height-watch period (default 500)\n"
         "  --oracle-patience-ms N             is_canonical transport retry budget before deferring (default 30000)\n"
+        "  --p2p-bind HOST:PORT               carrier-relay listen addr (A2 consumer; empty = no inbound bind)\n"
+        "  --peer HOST:PORT                   dial a carrier-relay peer (A2 consumer; repeatable)\n"
         "  --i-understand-mainnet             loud mainnet opt-in (HARD SAFETY 4)\n");
 }
 
@@ -169,6 +179,8 @@ int main(int argc, char** argv) {
                                                     // regtest rpc is 19898 (v23.1.7 src/chainparamsbase.cpp:48)
     std::string auth_path;
     std::string stratum_bind = "127.0.0.1:3032";
+    std::string p2p_bind;                 // A2: empty = no inbound carrier bind
+    std::vector<std::string> peers;       // A2: --peer HOST:PORT, repeatable
     int  poll_ms = 500;
     long oracle_patience_ms = 30000;
     for (int i = 1; i < argc; ++i) {
@@ -184,6 +196,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--daemon-rpc"))                          next(rpc_hostport);
         else if (!std::strcmp(a, "--coin-rpc-auth"))                       next(auth_path);
         else if (!std::strcmp(a, "--stratum-bind"))                        next(stratum_bind);
+        else if (!std::strcmp(a, "--p2p-bind"))                            next(p2p_bind);
+        else if (!std::strcmp(a, "--peer") && i + 1 < argc)                peers.emplace_back(argv[++i]);
         else if (!std::strcmp(a, "--settle-db"))                           next(cfg.settle_db_path);
         else if (!std::strcmp(a, "--d-conf") && i + 1 < argc)              cfg.d_conf = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(a, "--poll-ms") && i + 1 < argc)             poll_ms = std::atoi(argv[++i]);
@@ -269,6 +283,68 @@ int main(int argc, char** argv) {
                  << " owed_digest=" << hex32(node.ledger().owed_digest())
                  << " reseeded=" << boot.reseeded << " stale=" << boot.stale_dropped
                  << " unrecoverable=" << boot.unrecoverable;   // A8 compares this triple with the stop: line
+    }
+
+    // ── A2 CONSUMER: the carrier-relay p2p layer (cross-node share ingestion) ─
+    // The gap the Phase-B single-node run proved: no --peer, no cross-node
+    // ingestion. This stands up the W3 carrier relay on a real socket transport
+    // so a peer's carriers are decoded, W2-admitted, and ACCOUNTED in THIS node's
+    // engine (node.engine()). NON-CONSENSUS: every append rides
+    // CarrierRelay -> CarrierIngest -> V37Engine, never src/sharechain/v37 canon.
+    //
+    // WIRED HERE = the RECEIVE side (fully live: a carrier arriving over --peer
+    // is accounted). The SEND side (emitting THIS node's own mined shares as W3
+    // carriers) is deferred with S-1: a real-share carrier needs the RDWR wire
+    // envelope of a real DASH share (the W3-B5 byte freeze) and the real target
+    // pinning — neither exists until S-1/W3-B5 land. So this node ingests peers'
+    // carriers today; it does not yet originate its own. The multi-node
+    // acceptance proof (src/c2pool/v37/test/v37_a2_multinode_test.cpp) exercises
+    // both directions against the synthetic RDWR model over the same sockets.
+    std::unique_ptr<MemShareTracker>        carrier_tracker;
+    std::unique_ptr<CallbackMainchainIndex> carrier_index;
+    std::unique_ptr<CarrierIngest>          carrier_ingest;
+    std::unique_ptr<CarrierPeerNode>        carrier_net;
+    std::unique_ptr<CarrierRelay>           carrier_relay;
+    if (!p2p_bind.empty() || !peers.empty()) {
+        auto snap = node.lane_snapshot();
+        const std::uint64_t incarnation = snap ? snap->incarnation : 1;
+        carrier_tracker = std::make_unique<MemShareTracker>();
+        // The node's mainchain index: resolve a carrier's prev_block_hash to a
+        // coin height via dashd. NOTE (S-1/W3-B5): hex32() is v37-internal byte
+        // order; a real carrier's prev_block_hash byte order must be reconciled
+        // with backend->height_of's display-hex expectation at the byte freeze.
+        carrier_index = std::make_unique<CallbackMainchainIndex>(
+            [backend](const ::v37::bytes32& prev) -> std::optional<std::uint64_t> {
+                return backend->height_of(hex32(prev));
+            });
+        carrier_ingest = std::make_unique<CarrierIngest>(
+            node.engine(), cfg.lane_chain, *carrier_index, *carrier_tracker, incarnation);
+        carrier_net   = std::make_unique<CarrierPeerNode>();
+        carrier_relay = std::make_unique<CarrierRelay>(carrier_ingest->fn(), *carrier_net);
+        carrier_net->set_inbound([&carrier_relay](const std::vector<std::uint8_t>& f) {
+            carrier_relay->handle_inbound(f);   // decode + W2 admit + account + relay
+        });
+        if (!p2p_bind.empty()) {
+            const auto c = p2p_bind.rfind(':');
+            if (c == std::string::npos) { usage(); teardown_io(); return 2; }
+            const std::string ph = p2p_bind.substr(0, c);
+            const std::uint16_t pp = static_cast<std::uint16_t>(std::stoi(p2p_bind.substr(c + 1)));
+            if (!carrier_net->listen(ph, pp)) {
+                std::fprintf(stderr, "carrier p2p bind %s failed\n", p2p_bind.c_str());
+                teardown_io();
+                return 8;
+            }
+            LOG_INFO << "[v37-dash] carrier-relay listening on " << ph << ":" << carrier_net->listen_port();
+        }
+        for (const auto& p : peers) {
+            const auto c = p.rfind(':');
+            if (c == std::string::npos) { LOG_ERROR << "[v37-dash] bad --peer " << p; continue; }
+            const std::string ph = p.substr(0, c);
+            const std::uint16_t pp = static_cast<std::uint16_t>(std::stoi(p.substr(c + 1)));
+            const bool up = carrier_net->add_peer(ph, pp);
+            LOG_INFO << "[v37-dash] carrier-relay peer " << p << (up ? " connected" : " UNREACHABLE");
+        }
+        LOG_INFO << "[v37-dash] A2 carrier-relay up: peers=" << carrier_net->n_peers();
     }
 
     // ── 2f: stratum front-end on the v36 DASH work source ────────────────────
@@ -396,6 +472,12 @@ int main(int argc, char** argv) {
 
     // ── stop: network first, then engine (btc_node.hpp:37-38) ────────────────
     stratum.stop();
+    if (carrier_net) {
+        carrier_net->stop();   // stop inbound carriers BEFORE the engine drains
+        if (carrier_ingest)
+            LOG_INFO << "[v37-dash] carrier-relay stop: pushes_forwarded="
+                     << carrier_ingest->pushes_forwarded();
+    }
     {
         std::lock_guard<std::mutex> g(bed.mutex());
         node.stop();

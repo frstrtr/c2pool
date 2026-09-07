@@ -308,4 +308,21 @@ if (BUILD_TESTING)
         target_link_libraries(v37_xmr_o2_randomx_kat PRIVATE xmr_coin randomx Threads::Threads)
         add_test(NAME v37_xmr_o2_randomx_kat COMMAND v37_xmr_o2_randomx_kat)
     endif()
+
+    # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.
+    # Proves the gap the Phase-B single-node daemon had: node B accounts node A's
+    # shares. Wires the SAME production consumer code the daemon does — the W3
+    # CarrierRelay on the carrier_net.hpp socket transport, admitted through
+    # carrier_ingest.hpp into a live V37Engine — across two nodes on loopback TCP,
+    # and asserts a carrier mined on A appears as accounted weight in B's OWN
+    # engine snapshot (plus duplex reception + relay-dedup no-double-count). POSIX
+    # sockets + Threads (no Boost). SAME HOLLOW-GREEN GUARD as the sibling suites:
+    # ALSO listed in the build.yml --target lists (BOTH the Linux x86_64 leg and
+    # the ASan+UBSan leg) so CI compiles + runs it, not just registers a NOT_BUILT
+    # CTest sentinel, and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_a2_multinode_test v37_a2_multinode_test.cpp)
+    target_compile_features(v37_a2_multinode_test PRIVATE cxx_std_20)
+    target_include_directories(v37_a2_multinode_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_a2_multinode_test Threads::Threads)
+    add_test(NAME v37_a2_multinode_test COMMAND v37_a2_multinode_test)
 endif()
