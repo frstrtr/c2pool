@@ -189,6 +189,21 @@ private:
     using PeerConnectedCallback = std::function<void()>;
     PeerConnectedCallback m_peer_connected_cb;
 
+    // Peer-lost (scored discovery) hook. When set (by the --coin-p2p-discover
+    // CoinAddrMan path), error() invokes it with the dial target and whether the
+    // handshake had completed BEFORE the drop, so the owner's peer manager can
+    // score a post-handshake DISCONNECT vs a DEAD DIAL differently (the #940
+    // dial-failure-vs-drop distinction). Unset on the explicit-peer / RPC-only /
+    // SeedTier-ladder paths, so those score nothing. Pure transport wiring; no
+    // share/PoW/handshake surface change.
+    using PeerLostCallback = std::function<void(const NetService&, bool)>;
+    PeerLostCallback m_peer_lost_cb;
+
+    // getaddr-on-handshake arm. When set (by the --coin-p2p-discover path), the
+    // verack handler issues a getaddr so inbound addr records feed the address
+    // bank via m_addr_callback. Unset elsewhere -> no getaddr (unchanged wire).
+    bool m_getaddr_on_handshake = false;
+
 public:
     NodeP2P(io::io_context* context, bch::interfaces::Node* coin, config_t* config,
             const std::string& chain_label = "CoinP2P")
@@ -325,6 +340,12 @@ public:
         NetService svc_copy = service;
         LOG_WARNING << "[" << m_chain_label << "] Peer " << svc_copy.to_string()
                     << " disconnected: " << err;
+        // Read the handshake state BEFORE the reset below: error() fires for BOTH
+        // a dial that never completed a handshake AND a post-handshake drop, and
+        // the scored-discovery peer manager scores them differently (#940). The
+        // dial target (m_target_addr) is the key the manager stored, NOT the peer
+        // service (which may be a resolved/remote form).
+        const bool was_handshaked = m_handshake_complete;
         if (m_peer)
         {
             m_peer.reset();
@@ -335,6 +356,8 @@ public:
         stop_timeout_timer();
         stop_block_dl_timer();
         m_handshake_complete = false;
+        if (m_peer_lost_cb)
+            m_peer_lost_cb(m_target_addr, was_handshaked);
     }
 
     void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override
@@ -385,6 +408,13 @@ public:
 
     /// Set callback for received addr messages (peer discovery).
     void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
+    /// Install the scored-discovery peer-lost hook (--coin-p2p-discover). Fired
+    /// from error() with (dial target, was_handshaked) so the owner scores a
+    /// post-handshake DISCONNECT vs a DEAD DIAL. No-op elsewhere (never set).
+    void set_peer_lost_callback(PeerLostCallback cb) { m_peer_lost_cb = std::move(cb); }
+    /// Arm getaddr-on-handshake so the verack path harvests the peer's address
+    /// records into the address bank (via set_addr_callback). Idempotent.
+    void enable_getaddr_on_handshake() { m_getaddr_on_handshake = true; }
     /// Set callback for peer's reported chain height (from version message).
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Set provider for the robust IBD getheaders locator (HeaderChain
@@ -781,6 +811,13 @@ private:
             LOG_INFO << "[" << m_chain_label << "] IBD: auto getheaders kick ("
                      << locator.size() << "-hash locator)";
         }
+
+        // --coin-p2p-discover: harvest the peer's known addresses into the
+        // CoinAddrMan bank. Only fires when the scored-discovery arm armed it;
+        // the explicit-peer / RPC-only / SeedTier paths never set the flag so
+        // the wire is unchanged there.
+        if (m_getaddr_on_handshake && m_peer)
+            send_getaddr();
     }
 
     ADD_P2P_HANDLER(ping)
