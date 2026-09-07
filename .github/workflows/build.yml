@@ -637,8 +637,6 @@ jobs:
                     xmr_primitives_selfcheck xmr_x2_node_kat xmr_receipt_kat xmr_torsion_kat xmr_wire_dos_check xmr_stratum_selftest xmr_provenance_gate \
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
-                    xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat \
-            -j4 # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
                  # xmr_provenance_gate: previously omitted here because
                  # -fsanitize=undefined rejected its constexpr pointer comparison
                  # (kManifest[i].upstream == &kP2pool). Fixed by replacing the
