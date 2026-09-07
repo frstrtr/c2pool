@@ -338,6 +338,91 @@ int main() {
               "submit_block posted the blob hex through the seam");
     }
 
+    // ======================================================================
+    std::printf("== [7] live-wire regression: monerod v0.18 hex-string difficulty ==\n");
+    {
+        // VERBATIM get_miner_data response body captured from monerod v0.18.5.1
+        // (stagenet, 2026-09-07, height 2202216), CRLF pretty-print included.
+        // "difficulty" is a "0x..." hex STRING, not a number: before this vector
+        // the parsers read it as 0, MinerData::valid() rejected every frame and
+        // the live c2pool-v37-xmr daemon never applied a tip (hw_height stayed 0).
+        static const char* kWire =
+            "{\r\n  \"id\": \"0\",\r\n  \"jsonrpc\": \"2.0\",\r\n  \"result\": {\r\n"
+            "    \"already_generated_coins\": 18162842501536847281,\r\n"
+            "    \"difficulty\": \"0x36de33\",\r\n"
+            "    \"height\": 2202216,\r\n"
+            "    \"major_version\": 16,\r\n"
+            "    \"median_weight\": 300000,\r\n"
+            "    \"prev_id\": \"914d16a7fb163667e7837ea728ed326d7fbf483d8f364388c00814294559d2a5\",\r\n"
+            "    \"seed_hash\": \"9bde15898b36a6b811fa85bb4fb403aed61006318a7762b33b87a0be333976dc\",\r\n"
+            "    \"status\": \"OK\",\r\n"
+            "    \"tx_backlog\": [{\r\n"
+            "      \"fee\": 121920000,\r\n"
+            "      \"id\": \"80f854da409ddb7b49b792a91c48f87f541b271128228a7abdf0442a535b2fa7\",\r\n"
+            "      \"weight\": 1524\r\n"
+            "    }],\r\n"
+            "    \"untrusted\": false\r\n"
+            "  }\r\n}";
+
+        // (a) the hex_to_u128 primitive.
+        std::uint64_t hi = 1, lo = 1;
+        CHECK(mj::hex_to_u128("0x36de33", hi, lo) && hi == 0 && lo == 0x36de33ull,
+              "hex_to_u128(\"0x36de33\") == (0, 0x36de33)");
+        CHECK(mj::hex_to_u128("0x1ffffffffffffffff", hi, lo) && hi == 1 && lo == 0xffffffffffffffffull,
+              "hex_to_u128 crosses the 64-bit boundary into hi");
+        CHECK(mj::hex_to_u128("36DE33", hi, lo) && hi == 0 && lo == 0x36de33ull,
+              "hex_to_u128 accepts no-prefix upper-case hex");
+        CHECK(!mj::hex_to_u128("0x", hi, lo) && !mj::hex_to_u128("", hi, lo) &&
+              !mj::hex_to_u128("0xzz", hi, lo) &&
+              !mj::hex_to_u128("0x123456789012345678901234567890123", hi, lo),
+              "hex_to_u128 rejects empty / non-hex / > 128-bit");
+
+        // (b) RPC path: MoneroDaemonRpc::get_miner_data through the seam.
+        MockMonerodTransport mock;
+        mock.set_method_body("get_miner_data", kWire);
+        MoneroDaemonRpc rpc(mock);
+        std::optional<MinerData> got;
+        rpc.get_miner_data([&](std::optional<MinerData> md, const std::string&){ got = md; });
+        CHECK(got.has_value(), "RPC: live stagenet get_miner_data body parses");
+        CHECK(got && got->difficulty.lo == 0x36de33ull && got->difficulty.hi == 0,
+              "RPC: hex-string difficulty == 0x36de33");
+        CHECK(got && got->valid() && got->height == 2202216 && got->major_version == 16,
+              "RPC: MinerData::valid() holds on the live body");
+        CHECK(got && got->tx_backlog.size() == 1 && got->tx_backlog[0].fee == 121920000ull &&
+              got->tx_backlog[0].weight == 1524,
+              "RPC: live tx_backlog entry decoded");
+        CHECK(got && got->already_generated_coins == 18162842501536847281ull,
+              "RPC: already_generated_coins > 2^63 preserved");
+
+        // (c) poll-fallback path: the live transport (xmr_live_transport.hpp
+        //     pump_poll) forwards this SAME result-wrapped body as a
+        //     json-full-miner_data frame; the ZMQ decoder must accept it too.
+        std::vector<char> payload(kWire, kWire + std::strlen(kWire));
+        auto md2 = ZmqSubscriber::parse_miner_data_payload(payload);
+        CHECK(md2.has_value() && md2->valid() && md2->difficulty.lo == 0x36de33ull,
+              "ZMQ/poll: result-wrapped live body parses with hex difficulty");
+
+        // (d) numeric difficulty (mock / older wire shape) still parses.
+        const Hash prev = H(3000000), seed = H(2998272);
+        MockMonerodTransport mock_num;
+        mock_num.set_method_body("get_miner_data", miner_data_rpc(3000001, prev, seed, 123456789ull));
+        MoneroDaemonRpc rpc_num(mock_num);
+        std::optional<MinerData> got_num;
+        rpc_num.get_miner_data([&](std::optional<MinerData> md, const std::string&){ got_num = md; });
+        CHECK(got_num && got_num->difficulty.lo == 123456789ull && got_num->difficulty.hi == 0,
+              "RPC: numeric difficulty + difficulty_top64 still parse");
+
+        // (e) end-to-end: the adapter applies the live tip from the wire body.
+        MonerodAdapter adapter(mock);
+        adapter.start();
+        adapter.initial_sync();
+        CHECK(adapter.index().best_height() == 2202215, "adapter: live body drives tip == 2202215");
+        Hash want_tip;
+        CHECK(mj::hex_to_hash("914d16a7fb163667e7837ea728ed326d7fbf483d8f364388c00814294559d2a5", want_tip) &&
+              adapter.index().best_id() == want_tip,
+              "adapter: tip id == live prev_id");
+    }
+
     std::printf("\n%s (%d failure%s)\n", g_fail ? "RESULT: FAIL" : "RESULT: PASS",
                 g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;

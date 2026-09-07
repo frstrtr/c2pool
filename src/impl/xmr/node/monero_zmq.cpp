@@ -28,7 +28,16 @@ namespace {
 
 Difficulty128 read_difficulty(const mj::Value& obj) {
     Difficulty128 d;
-    d.lo = obj["difficulty"].as_u64();
+    const mj::Value& v = obj["difficulty"];
+    if (v.is_string()) {
+        // monerod >= v0.18 emits miner_data "difficulty" as a "0x..." hex STRING
+        // (128-bit) on both the RPC and the json-full-miner_data feeds; the
+        // RPC-poll fallback (xmr_live_transport.hpp) forwards that same body
+        // here. See monero_rpc.cpp read_difficulty for the live-wire evidence.
+        if (!mj::hex_to_u128(v.as_string(), d.hi, d.lo)) d = Difficulty128{};
+        return d;
+    }
+    d.lo = v.as_u64();
     d.hi = obj["difficulty_top64"].as_u64();
     return d;
 }
