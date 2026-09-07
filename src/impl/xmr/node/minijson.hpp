@@ -247,4 +247,30 @@ inline std::string hash_to_hex(const std::array<std::uint8_t, 32>& h) {
     return out;
 }
 
+// monerod >= v0.18 emits get_miner_data.difficulty (and block_header
+// .wide_difficulty) as a "0x..." hex STRING of up to 32 nibbles -- a 128-bit
+// cryptonote::difficulty_type -- not as a JSON number. Parses it into (hi, lo).
+// Returns false on an empty, non-hex, or > 128-bit string (caller keeps zero).
+inline bool hex_to_u128(const std::string& hex, std::uint64_t& hi, std::uint64_t& lo) {
+    std::size_t p = 0;
+    if (hex.size() >= 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) p = 2;
+    if (p >= hex.size() || hex.size() - p > 32) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::uint64_t h = 0, l = 0;
+    for (; p < hex.size(); ++p) {
+        int n = nib(hex[p]);
+        if (n < 0) return false;
+        h = (h << 4) | (l >> 60);
+        l = (l << 4) | static_cast<std::uint64_t>(n);
+    }
+    hi = h;
+    lo = l;
+    return true;
+}
+
 } // namespace c2pool::xmr::node::minijson

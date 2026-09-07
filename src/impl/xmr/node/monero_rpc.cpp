@@ -92,7 +92,17 @@ bool root_result(const std::vector<char>& body, mj::Value& root, const mj::Value
 
 Difficulty128 read_difficulty(const mj::Value& obj) {
     Difficulty128 d;
-    d.lo = obj["difficulty"].as_u64();
+    const mj::Value& v = obj["difficulty"];
+    if (v.is_string()) {
+        // monerod >= v0.18.0.0 get_miner_data emits "difficulty" as a "0x..."
+        // hex STRING (128-bit), NOT a number (verified on the v0.18.5.1 stagenet
+        // wire: "difficulty": "0x36de33"). Reading it as a number yielded 0, so
+        // MinerData::valid() rejected every frame and the live daemon never
+        // applied a tip. Block headers keep the numeric lo64 / top64 pair below.
+        if (!mj::hex_to_u128(v.as_string(), d.hi, d.lo)) d = Difficulty128{};
+        return d;
+    }
+    d.lo = v.as_u64();
     d.hi = obj["difficulty_top64"].as_u64(); // absent => 0 (fits u64 today)
     return d;
 }
