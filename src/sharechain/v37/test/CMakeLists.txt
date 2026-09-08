@@ -48,6 +48,16 @@ if (BUILD_TESTING)
     # FCMP-fenced to X6). STL + vendored C; NO RandomX. Self-contained (compiles
     # the vendored .c directly, order-independent of the xmr_coin target); compat/
     # first so crypto-ops.c's <sodium/crypto_verify_32.h> hits the authored shim.
+
+    # Task #926 — dashboard frozen tab-descriptor (steward -> renderer contract).
+    # Pins the field set / order / canonical serialization of DashboardTab and
+    # the derived pin digests (single record + ordered tab set) so the renderer
+    # binds to a byte-stable shape; any drift REDs. Header-only, SHA-256-only
+    # (v37_dashboard_tab.hpp -> v37_hash.hpp one dir up), no crypto backend.
+    add_executable(v37_dashboard_tab_test v37_dashboard_tab_test.cpp)
+    target_compile_features(v37_dashboard_tab_test PRIVATE cxx_std_20)
+    add_test(NAME v37_dashboard_tab_test COMMAND v37_dashboard_tab_test)
+
     add_executable(xmr_torsion_kat
         xmr_torsion_kat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../v37_descriptor_xmr_point_check_ref10.cpp
