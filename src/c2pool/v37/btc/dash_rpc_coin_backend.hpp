@@ -186,6 +186,17 @@ inline std::string display_hex_of_internal(const unsigned char* p32) {
     }
     return s;
 }
+// A2 carrier index seam: a WorkEvent's prev_block_hash is the header
+// hashPrevBlock in INTERNAL byte order (w2_receipt.hpp / share-format §2), which
+// is the reverse of the display hex dashd prints and getblockheader/uint256S
+// parse. Reverse here so a getblockheader probe resolves it. This is the ONE
+// byte-order pin (D6) for the carrier index: the daemon passes this function to
+// c2pool::v37n::make_live_mainchain_index (carrier_index.hpp), which never
+// re-derives it. NOTE: the landed b4c91687 receive-side fed the internal-order
+// hex straight in (hex32(prev)), which never matched a real block.
+inline std::string display_hex_of_bytes32(const ::v37::bytes32& internal) {
+    return display_hex_of_internal(internal.data());
+}
 
 // The chain-tag fence. Exact, except "devnet" ⊇ "devnet-<name>": a -devnet=<name>
 // daemon reports NetworkIDString "devnet-<name>" (v23.1.7 src/util/system.cpp:

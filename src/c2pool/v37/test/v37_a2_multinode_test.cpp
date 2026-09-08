@@ -11,8 +11,10 @@
 //   * w3_relay.hpp        CarrierRelay     (decode + relay + admission routing)
 //   * carrier_ingest.hpp  CarrierIngest    (W2 admission -> V37Engine push)
 //   * v37_engine.hpp      V37Engine        (the W0 seam; the executor accounts)
-// Only the mainchain index is a synthetic map (the W2/W3 layer is the RDWR
-// synthetic model until the W3-B5 byte freeze; see the report's honest boundary).
+// Only the mainchain index is a synthetic map here (the daemon binds the LIVE
+// LiveMainchainIndex, carrier_index.hpp; v37_a2_live_index_test proves that
+// class). The carrier's PoW envelope stays the RDWR synthetic model (S-1).
+// Every Node runs the W3-B5 frozen-wire policy gate, as the daemon does.
 //
 // stdlib-only + POSIX sockets, the same self-harness shape as the W3 KAT.
 
@@ -21,18 +23,22 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include <c2pool/v37/carrier_emit.hpp>
 #include <c2pool/v37/carrier_ingest.hpp>
 #include <c2pool/v37/carrier_net.hpp>
 #include <c2pool/v37/v37_engine.hpp>
 #include <c2pool/v37/w2_admission.hpp>
 #include <c2pool/v37/w2_receipt.hpp>
 #include <c2pool/v37/w3_relay.hpp>
+#include <c2pool/v37/w3_wire_freeze.hpp>   // W3-B5 policy gate (make_relay_policy)
 
 using namespace c2pool::v37n;
 using ::v37::ChainId;
@@ -110,6 +116,7 @@ struct Node {
     MemShareTracker tracker;
     std::unique_ptr<CarrierIngest> ingest;
     std::unique_ptr<CarrierPeerNode> net;
+    c2pool::v37n::wire_freeze::PolicyStats policy_stats;   // W3-B5 policy gate counters
     std::unique_ptr<CarrierRelay> relay;
 
     explicit Node(u64 tip) {
@@ -121,6 +128,10 @@ struct Node {
         ingest = std::make_unique<CarrierIngest>(engine, CHAIN, *index, tracker, inc);
         net    = std::make_unique<CarrierPeerNode>();
         relay  = std::make_unique<CarrierRelay>(ingest->fn(), *net);
+        // The production configuration: the W3-B5 frozen-wire policy gate (F-1
+        // tag cap / F-2 descriptor validity) on every inbound frame, exactly as
+        // main_v37_btc_dash.cpp binds it.
+        relay->set_frame_policy(c2pool::v37n::wire_freeze::make_relay_policy(&policy_stats));
         net->set_inbound([this](const std::vector<std::uint8_t>& f) {
             relay->handle_inbound(f);
         });
@@ -250,10 +261,134 @@ static void test_mn3_no_double_account() {
     CHECK(B.raw_total() == w);                           // still single-counted
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// The real-index byte-order contract (Track A2 step (b)).
+// A WorkEvent's prev_block_hash is header/INTERNAL byte order; dashd's
+// getblockheader wants DISPLAY hex (reversed). The daemon's LiveMainchainIndex
+// (carrier_index.hpp, bound with dash_rpc_coin_backend.hpp display_hex_of_bytes32)
+// resolves by reversing then asking dashd. These two mirror that reversal so the
+// KAT proves the contract WITHOUT a live daemon (the VM100 run proves it end to
+// end against real dashd; v37_a2_live_index_test drives the index class itself).
+// ═══════════════════════════════════════════════════════════════════════════
+static std::string display_hex_of(const bytes32& internal) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string s(64, '0');
+    for (int i = 0; i < 32; ++i) {
+        const unsigned char b = internal[31 - i];
+        s[2 * i] = kHex[b >> 4];
+        s[2 * i + 1] = kHex[b & 0x0f];
+    }
+    return s;
+}
+static bytes32 internal_of_display(const std::string& disp) {
+    bytes32 b{};
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return 0;
+    };
+    for (int i = 0; i < 32; ++i)
+        b[31 - i] = static_cast<std::uint8_t>((nib(disp[2 * i]) << 4) | nib(disp[2 * i + 1]));
+    return b;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MN-4 — real IMainchainIndex binding: a carrier keyed to a REAL block hash
+// (internal byte order) resolves through the internal->display reversal and is
+// accounted; a carrier keyed to a block the chain does NOT know is rejected.
+// Also drives the PRODUCTION send-side emitter (CarrierEmitter / carrier_emit.hpp).
+// ═══════════════════════════════════════════════════════════════════════════
+static void test_mn4_real_index_byteorder() {
+    // A "real chain": the display-hex block ids dashd would answer -> height.
+    auto chain = std::make_shared<std::map<std::string, u64>>();
+    const std::string disp200 =
+        "0000000fa1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c";
+    (*chain)[disp200] = 200;
+
+    // The REAL-index resolver: reverse internal->display, ask the chain (== what
+    // LiveMainchainIndex's bound probe does with the live daemon).
+    CallbackMainchainIndex::Resolver real_resolver =
+        [chain](const bytes32& prev) -> std::optional<u64> {
+            auto it = chain->find(display_hex_of(prev));
+            return it == chain->end() ? std::nullopt : std::optional<u64>(it->second);
+        };
+
+    V37Engine eng;
+    eng.start();
+    eng.submit_tracked(LaneRecord::add_lane(CHAIN, small_params())).get();
+    auto s0 = eng.snapshot(CHAIN);
+    const u64 inc = s0 ? s0->incarnation : 1;
+    CallbackMainchainIndex index(real_resolver);
+    MemShareTracker tracker;
+    CarrierIngest ingest(eng, CHAIN, index, tracker, inc);
+    CarrierPeerNode net;                       // no peers: this is a local admit test
+    CarrierRelay relay(ingest.fn(), net);
+    CarrierEmitter emitter(relay, CHAIN, ALICE_DESC());
+
+    // (a) carrier keyed to the REAL block (internal = reverse of disp200) resolves.
+    const bytes32 prev_internal = internal_of_display(disp200);
+    const auto er = emitter.emit_own_win(prev_internal, consensus_lz(200), "real.c");
+    CHECK(er.minted);
+    CHECK(er.outcome.admitted);                            // reversal resolved -> accounted
+    const u64 w = work_of_lz(consensus_lz(200));
+    // S-6: CarrierIngest submits fire-and-forget into the engine mailbox; the
+    // snapshot is read through wait_until like every other MN check (a bare
+    // read immediately after emit raced the executor deterministically).
+    CHECK(wait_until([&] { auto s = eng.snapshot(CHAIN); return s && static_cast<u64>(s->raw_total) == w; }));
+    CHECK(emitter.emitted() == 1);
+
+    // (b) carrier keyed to a block the chain does NOT know is REJECTED (nullopt
+    //     bin -> REJECT_POW), and never accounted.
+    const bytes32 unknown = internal_of_display(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+    const auto er2 = emitter.emit_own_win(unknown, consensus_lz(200), "unknown.c");
+    CHECK(er2.minted);                                     // mint is local PoW, succeeds
+    CHECK(!er2.outcome.admitted);                          // but admission rejects it
+    {
+        auto s = eng.snapshot(CHAIN);
+        CHECK(s && static_cast<u64>(s->raw_total) == w);   // unchanged
+    }
+    CHECK(emitter.emitted() == 1);                         // own-chain did NOT advance
+    eng.stop();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MN-5 — SEND-SIDE over the socket: node A ORIGINATES its own carriers through
+// the production CarrierEmitter (not hand-mined + handle_local), and node B
+// accounts them. Two chained own carriers => B accounts both. This is the
+// formerly-deferred send half, now bidirectional with MN-1's receive half.
+// ═══════════════════════════════════════════════════════════════════════════
+static void test_mn5_sendside_emitter_over_socket() {
+    Node A(110), B(110);
+    CHECK(B.net->listen("127.0.0.1", 0));
+    CHECK(A.net->add_peer("127.0.0.1", B.net->listen_port()));
+    CHECK(wait_until([&] { return B.net->n_peers() >= 1; }));
+
+    CarrierEmitter emitterA(*A.relay, CHAIN, ALICE_DESC());
+    const u64 w = work_of_lz(consensus_lz(100));
+
+    const auto er = emitterA.emit_own_win(mainchain_hash(100), consensus_lz(100), "A.emit");
+    CHECK(er.minted);
+    CHECK(er.outcome.admitted);                            // A accounts its own win
+    CHECK(er.outcome.relayed && er.outcome.peers_reached >= 1);  // and it reached B
+    CHECK(emitterA.emitted() == 1);
+    CHECK(wait_until([&] { return B.raw_total() == w; }));
+    CHECK(B.accounts_identity(ALICE_DESC().identity_key()));
+
+    // A second, chained own carrier: B accounts both (2 × w).
+    const auto er2 = emitterA.emit_own_win(mainchain_hash(101), consensus_lz(101), "A.emit2");
+    CHECK(er2.minted && er2.outcome.admitted);
+    CHECK(emitterA.emitted() == 2);
+    CHECK(wait_until([&] { return B.raw_total() == 2 * w; }));
+    CHECK(B.identity_count() == 1);                        // still only ALICE
+}
+
 int main() {
     test_mn1_b_accounts_a();
     test_mn2_duplex_and_receipts();
     test_mn3_no_double_account();
+    test_mn4_real_index_byteorder();
+    test_mn5_sendside_emitter_over_socket();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

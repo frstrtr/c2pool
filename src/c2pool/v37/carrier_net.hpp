@@ -192,7 +192,12 @@ private:
             if (len > kMaxCarrierFrame) break;                 // protocol error -> drop
             std::vector<std::uint8_t> frame(len);
             if (len && !recv_all(fd, frame.data(), len)) break;
-            if (m_inbound) m_inbound(frame);                    // -> CarrierRelay::handle_inbound
+            // -> CarrierRelay::handle_inbound. ONE reader thread PER PEER calls
+            // this concurrently; CarrierRelay serializes its handlers under its
+            // own mutex (w3_relay.hpp THREADING), so the handler needs no lock
+            // of its own. A slow admit (the live index's bounded Unknown retry,
+            // carrier_index.hpp) stalls only this peer's reader.
+            if (m_inbound) m_inbound(frame);
         }
         drop_peer(fd);
     }

@@ -81,7 +81,9 @@
 //
 // EXIT CODES: 2 usage · 3 mainnet fence · 4 creds unresolved · 5 dashd not
 // ready / chain or genesis fence at start · 6 store refused (torn image, F2) or
-// open() refused · 7 start() · 8 stratum bind · 9 FATAL chain mismatch while running.
+// open() refused · 7 start() · 8 stratum bind · 9 FATAL chain mismatch while running
+// · 10 W3-B5 wire-freeze selfcheck failed at boot (this build's CarrierWire
+// drifted from the frozen v0x01 goldens; refusing to peer, never floods frames).
 //
 // BUILD (src/c2pool/CMakeLists.txt, target c2pool-v37-btc-dash, next to
 // c2pool-v37-btc; c2pool-v37-btc STAYS Threads-only, HARD SAFETY 6).
@@ -104,6 +106,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -135,9 +138,12 @@
 // Track A2 CONSUMER half — the carrier p2p layer (cross-node share/receipt
 // ingestion). Non-consensus: every append rides CarrierRelay -> CarrierIngest
 // -> V37Engine (node.engine()), never src/sharechain/v37 canon.
-#include <c2pool/v37/carrier_ingest.hpp>              // CarrierIngest, CallbackMainchainIndex, MemShareTracker
+#include <c2pool/v37/carrier_ingest.hpp>              // CarrierIngest, MemShareTracker
+#include <c2pool/v37/carrier_index.hpp>               // LiveMainchainIndex / SyntheticMainchainIndex (A2 step-b real index)
 #include <c2pool/v37/carrier_net.hpp>                 // CarrierPeerNode (ICarrierTransport over sockets)
+#include <c2pool/v37/carrier_send.hpp>                // CarrierSendQueue (A2 send-side: own stratum wins -> carriers, off the hot path)
 #include <c2pool/v37/w3_relay.hpp>                    // CarrierRelay
+#include <c2pool/v37/w3_wire_freeze.hpp>              // W3-B5 freeze: boot selfcheck + relay policy gate
 
 namespace io = boost::asio;
 using namespace c2pool::v37n::btc;
@@ -167,6 +173,13 @@ static void usage() {
         "  --oracle-patience-ms N             is_canonical transport retry budget before deferring (default 30000)\n"
         "  --p2p-bind HOST:PORT               carrier-relay listen addr (A2 consumer; empty = no inbound bind)\n"
         "  --peer HOST:PORT                   dial a carrier-relay peer (A2 consumer; repeatable)\n"
+        "  --carrier-synthetic-index N        DEBUG: index carriers against the synthetic {mainchain_hash(h)->h} map with\n"
+        "                                     tip=N (the W2/W3 KAT model) instead of live dashd. Under this flag THIS node's\n"
+        "                                     own stratum wins (keyed to REAL parent hashes) never resolve -> they are NOT\n"
+        "                                     emitted as carriers (counted as unresolved_parent); only synthetic-keyed\n"
+        "                                     peers' carriers account\n"
+        "  --carrier-index-horizon N          live index: reject carriers keyed further than N blocks behind the tip (default 64)\n"
+        "  --carrier-index-patience-ms N      live index: bounded retry budget while dashd answers Unknown (default 2000)\n"
         "  --i-understand-mainnet             loud mainnet opt-in (HARD SAFETY 4)\n");
 }
 
@@ -181,6 +194,9 @@ int main(int argc, char** argv) {
     std::string stratum_bind = "127.0.0.1:3032";
     std::string p2p_bind;                 // A2: empty = no inbound carrier bind
     std::vector<std::string> peers;       // A2: --peer HOST:PORT, repeatable
+    std::optional<std::uint64_t> synthetic_index_tip;   // A2: --carrier-synthetic-index N (KAT model)
+    std::uint64_t carrier_index_horizon = 64;           // A2 step-b: LiveMainchainIndex::Options::horizon
+    long          carrier_index_patience_ms = 2000;     // A2 step-b: LiveMainchainIndex::Options::unknown_patience
     int  poll_ms = 500;
     long oracle_patience_ms = 30000;
     for (int i = 1; i < argc; ++i) {
@@ -198,6 +214,9 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--stratum-bind"))                        next(stratum_bind);
         else if (!std::strcmp(a, "--p2p-bind"))                            next(p2p_bind);
         else if (!std::strcmp(a, "--peer") && i + 1 < argc)                peers.emplace_back(argv[++i]);
+        else if (!std::strcmp(a, "--carrier-synthetic-index") && i + 1 < argc) synthetic_index_tip = std::strtoull(argv[++i], nullptr, 10);
+        else if (!std::strcmp(a, "--carrier-index-horizon") && i + 1 < argc)     carrier_index_horizon = std::strtoull(argv[++i], nullptr, 10);
+        else if (!std::strcmp(a, "--carrier-index-patience-ms") && i + 1 < argc) carrier_index_patience_ms = std::atol(argv[++i]);
         else if (!std::strcmp(a, "--settle-db"))                           next(cfg.settle_db_path);
         else if (!std::strcmp(a, "--d-conf") && i + 1 < argc)              cfg.d_conf = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(a, "--poll-ms") && i + 1 < argc)             poll_ms = std::atoi(argv[++i]);
@@ -205,7 +224,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--i-understand-mainnet"))                cfg.i_understand_mainnet = true;
         else { usage(); return 2; }
     }
-    if (cfg.d_conf == 0 || poll_ms <= 0 || oracle_patience_ms < 0) { usage(); return 2; }
+    if (cfg.d_conf == 0 || poll_ms <= 0 || oracle_patience_ms < 0 || carrier_index_patience_ms < 0) { usage(); return 2; }
     cfg.pow_verify_enabled = true;   // live: the v36 work source verifies X11 itself
     if (cfg.network == BtcNetwork::Mainnet && !cfg.i_understand_mainnet) {
         std::fprintf(stderr, "REFUSED: mainnet without --i-understand-mainnet (HARD SAFETY 4)\n");
@@ -292,37 +311,147 @@ int main(int argc, char** argv) {
     // engine (node.engine()). NON-CONSENSUS: every append rides
     // CarrierRelay -> CarrierIngest -> V37Engine, never src/sharechain/v37 canon.
     //
-    // WIRED HERE = the RECEIVE side (fully live: a carrier arriving over --peer
-    // is accounted). The SEND side (emitting THIS node's own mined shares as W3
-    // carriers) is deferred with S-1: a real-share carrier needs the RDWR wire
-    // envelope of a real DASH share (the W3-B5 byte freeze) and the real target
-    // pinning — neither exists until S-1/W3-B5 land. So this node ingests peers'
-    // carriers today; it does not yet originate its own. The multi-node
-    // acceptance proof (src/c2pool/v37/test/v37_a2_multinode_test.cpp) exercises
-    // both directions against the synthetic RDWR model over the same sockets.
+    // WIRED HERE = BOTH directions (Track A2 step (b)):
+    //   RECEIVE: a carrier arriving over --peer is decoded, gated by the W3-B5
+    //     frozen-wire POLICY (tag cap / descriptor validity), W2-admitted, and
+    //     accounted in THIS node's engine, its prev_block_hash resolved against
+    //     the LIVE dashd via LiveMainchainIndex (carrier_index.hpp: the real
+    //     IMainchainIndex — live dashd, context horizon, bounded Unknown retry,
+    //     per-hash cache).
+    //   SEND (formerly deferred): EVERY own stratum win — share arm AND block
+    //     arm — reaches CarrierSendQueue through DASHWorkSource::set_mint_share_fn
+    //     (the H-SHARE seam); its worker resolves the REAL parent through the
+    //     SAME carrier_index, grinds, admits locally and floods the FROZEN
+    //     CarrierWire frame (W3-B5) under the MINER's payout identity — so a
+    //     remote node's real index resolves and accounts it.
+    // HONEST BOUNDARY: the minted work is still the SYNTHETIC RDWR PoW envelope,
+    // not a real DASH X11 share; the real WIRE / real INDEX / real IDENTITY /
+    // real cross-node FLOW are what step (b) makes live. Real share-format PoW
+    // is S-1+ (a wire version bump with its own goldens).
+    // The synthetic in-memory index model (the W2/W3 KAT) stays reachable behind
+    // --carrier-synthetic-index N for a self-contained loopback drill.
     std::unique_ptr<MemShareTracker>        carrier_tracker;
-    std::unique_ptr<CallbackMainchainIndex> carrier_index;
+    wire_freeze::PolicyStats                carrier_policy_stats;   // W3-B5 gate counters (atomic); outlives carrier_relay
+    std::unique_ptr<IMainchainIndex>        carrier_index;
+    LiveMainchainIndex*                     live_index = nullptr;   // typed view for observe_tip()/invalidate()/stats(); owned by carrier_index
     std::unique_ptr<CarrierIngest>          carrier_ingest;
     std::unique_ptr<CarrierPeerNode>        carrier_net;
     std::unique_ptr<CarrierRelay>           carrier_relay;
+    std::unique_ptr<CarrierSendQueue>       carrier_send;   // declared AFTER carrier_index/carrier_relay: destroyed FIRST (it references both)
+    // Inbound telemetry (never consensus): what the peer path did with each
+    // frame. Atomic: one reader thread per peer drives set_inbound.
+    struct InboundStats {
+        std::atomic<std::uint64_t> frames{0}, admitted{0}, echo{0}, wire_rejected{0}, policy_rejected{0}, admit_rejected{0};
+    } carrier_inbound;
+    // FALLBACK identity ONLY: used for a BLOCK win whose miner has no payout
+    // script (foreign/malformed username -> empty script). Every share carries
+    // the miner's OWN identity (canonicalize_script(payout_script)); a share
+    // without one is declined, not credited to the pool. identity ==
+    // descriptor.identity_key() (W3-MUST holds on wire).
+    ::v37::PayoutDescriptor pool_desc;
+    {
+        ::v37::ScriptRef r;
+        r.kind = ::v37::ScriptKind::P2PKH;
+        r.payload.assign(20, 0xB0);            // fixed pool-payout placeholder
+        pool_desc.pay = r;
+    }
     if (!p2p_bind.empty() || !peers.empty()) {
+        // W3-B5 BOOT SELF-CHECK: the byte-KAT body (goldens A/B/C, size model,
+        // decode rules, policy pins) runs BEFORE any listen/dial. A build whose
+        // CarrierWire drifted from the frozen v0x01 layout must never flood
+        // frames to peers.
+        {
+            const wire_freeze::SelfCheck sc = wire_freeze::selfcheck();
+            if (!sc.ok()) {
+                LOG_ERROR << "[v37-dash] W3-B5 wire-freeze SELFCHECK FAILED (" << sc.failures << "/" << sc.checks
+                          << "): this build's CarrierWire drifted from the frozen v0x01 golden; refusing to peer\n" << sc.log;
+                std::fprintf(stderr, "carrier wire-freeze selfcheck failed\n");
+                teardown_io();
+                return 10;
+            }
+            LOG_INFO << "[v37-dash] wire-freeze selfcheck OK [" << wire_freeze::layout_id() << "] "
+                     << sc.checks << " checks; tag cap=" << wire_freeze::kTagMaxBytes;
+        }
         auto snap = node.lane_snapshot();
         const std::uint64_t incarnation = snap ? snap->incarnation : 1;
         carrier_tracker = std::make_unique<MemShareTracker>();
-        // The node's mainchain index: resolve a carrier's prev_block_hash to a
-        // coin height via dashd. NOTE (S-1/W3-B5): hex32() is v37-internal byte
-        // order; a real carrier's prev_block_hash byte order must be reconciled
-        // with backend->height_of's display-hex expectation at the byte freeze.
-        carrier_index = std::make_unique<CallbackMainchainIndex>(
-            [backend](const ::v37::bytes32& prev) -> std::optional<std::uint64_t> {
-                return backend->height_of(hex32(prev));
-            });
+        if (synthetic_index_tip) {
+            // DEBUG: the synthetic RDWR map (mainchain_hash(h) -> h), tip fixed (the W2/W3 KAT model).
+            carrier_index = std::make_unique<SyntheticMainchainIndex>(*synthetic_index_tip, /*horizon=*/64);
+            LOG_WARNING << "[v37-dash] A2 carrier index = SYNTHETIC (tip=" << *synthetic_index_tip
+                        << "); NOT the live chain (--carrier-synthetic-index): own wins keyed to real "
+                        << "parent hashes will NOT resolve -> no local carrier is emitted for them";
+        } else {
+            // The REAL IMainchainIndex: prev_block_hash (internal order) -> display hex
+            // (btc::display_hex_of_bytes32, the D6 pin) -> getblockheader via the backend,
+            // with the seam's context horizon vs the live tip, a bounded Unknown retry,
+            // and a per-hash Have cache (carrier_index.hpp header comment).
+            LiveMainchainIndex::Options iopt;
+            iopt.horizon          = carrier_index_horizon;
+            iopt.unknown_patience = std::chrono::milliseconds(carrier_index_patience_ms);
+            auto li = make_live_mainchain_index<DashRpcCoinBackend>(backend, &display_hex_of_bytes32, iopt);
+            live_index    = li.get();
+            carrier_index = std::move(li);
+            // Prime the tip view (nullopt in IBD -> the pull fallback answers). A
+            // ChainMismatch here is logged only: the height-watch owns exit 9 and
+            // re-checks on its first poll.
+            try {
+                if (const auto t = backend->try_best_tip()) live_index->observe_tip(t->height);
+            } catch (const ChainMismatch& e) {
+                LOG_ERROR << "[v37-dash] carrier-index prime: chain mismatch: " << e.what() << " (height-watch exits 9)";
+            }
+            LOG_INFO << "[v37-dash] A2 carrier index = LIVE dashd (horizon=" << iopt.horizon
+                     << " patience_ms=" << iopt.unknown_patience.count() << ")";
+        }
         carrier_ingest = std::make_unique<CarrierIngest>(
             node.engine(), cfg.lane_chain, *carrier_index, *carrier_tracker, incarnation);
         carrier_net   = std::make_unique<CarrierPeerNode>();
         carrier_relay = std::make_unique<CarrierRelay>(carrier_ingest->fn(), *carrier_net);
-        carrier_net->set_inbound([&carrier_relay](const std::vector<std::uint8_t>& f) {
-            carrier_relay->handle_inbound(f);   // decode + W2 admit + account + relay
+        // W3-B5 F-1/F-2 POLICY GATE on every inbound frame (post-decode, pre-admit).
+        carrier_relay->set_frame_policy(wire_freeze::make_relay_policy(&carrier_policy_stats));
+        {
+            // A2 SEND-SIDE: the dedicated emit worker behind the stratum mint seam.
+            // *carrier_index is the SAME IMainchainIndex the receive side admits
+            // against (live LiveMainchainIndex or the --carrier-synthetic-index
+            // map), so origin and peers agree on horizon / byte order.
+            CarrierSendQueue::Options so;
+            so.fallback_desc = pool_desc;                 // block-win-without-identity fallback ONLY
+            carrier_send = std::make_unique<CarrierSendQueue>(*carrier_relay, *carrier_index, cfg.lane_chain, so);
+            carrier_send->set_log([](bool warn, const std::string& line) { if (warn) LOG_WARNING << line; else LOG_INFO << line; });
+            carrier_send->start();
+        }
+        carrier_net->set_inbound([&](const std::vector<std::uint8_t>& f) {
+            // decode + W3-B5 policy + W2 admit + account + relay (CarrierRelay
+            // serializes; one reader thread per peer lands here).
+            const CarrierRelay::Outcome o = carrier_relay->handle_inbound(f);
+            carrier_inbound.frames.fetch_add(1, std::memory_order_relaxed);
+            if (o.wire == WireStatus::REJECT_POLICY) {
+                carrier_inbound.policy_rejected.fetch_add(1, std::memory_order_relaxed);
+                LOG_WARNING << "[v37-dash] carrier inbound REJECT_POLICY (tag cap / descriptor validity), " << f.size() << " B";
+            } else if (o.wire != WireStatus::OK) {
+                carrier_inbound.wire_rejected.fetch_add(1, std::memory_order_relaxed);
+                LOG_WARNING << "[v37-dash] carrier inbound wire-rejected status=" << static_cast<int>(o.wire) << ", " << f.size() << " B";
+            } else if (o.admitted) {
+                carrier_inbound.admitted.fetch_add(1, std::memory_order_relaxed);
+                const auto& p0 = o.admission.pushes.front();   // the carrier push (§4.2 step 1) always leads
+                LOG_INFO << "[v37-dash] carrier inbound ADMITTED tag=" << p0.tag
+                         << " identity=" << hex32(p0.identity).substr(0, 16)
+                         << " parent@" << p0.carrier_bin << " w_raw=" << p0.w_raw
+                         << " pushes=" << o.admission.pushes.size()
+                         << " relayed=" << o.relayed << " peers_reached=" << o.peers_reached;
+            } else if (o.admission.carrier_status == CarrierStatus::REJECT_DEDUP) {
+                // The flood-fill ECHO (W3 §5.2.1): a peer re-broadcasts what it
+                // admitted to ALL its peers, including the one it came from, and
+                // the relay admits always — W2's credit-once window is the
+                // authority. Expected once per hop per carrier; never a fault.
+                carrier_inbound.echo.fetch_add(1, std::memory_order_relaxed);
+                LOG_INFO << "[v37-dash] carrier inbound echo (already accounted; W2 REJECT_DEDUP), " << f.size() << " B";
+            } else {
+                carrier_inbound.admit_rejected.fetch_add(1, std::memory_order_relaxed);
+                LOG_WARNING << "[v37-dash] carrier inbound rejected by W2: carrier_status="
+                            << static_cast<int>(o.admission.carrier_status)
+                            << " (1=RMAX 2=POW/target/chain/unresolvable-parent)";
+            }
         });
         if (!p2p_bind.empty()) {
             const auto c = p2p_bind.rfind(':');
@@ -395,6 +524,12 @@ int main(int argc, char** argv) {
                           << ") and never at 0; operator: re-register by hand once H_b is known";
             else
                 LOG_INFO << "[v37-dash] FOUND " << bidh << " h=" << reg_h << " accepted=" << r.accepted;
+
+            // A2 SEND-SIDE: NOT here. The won block is ALSO a share: the v36 work source
+            // calls mint_solved_share(won_block=true) right after this returns
+            // (work_source.cpp:2885), which reaches CarrierSendQueue via set_mint_share_fn
+            // below — the single emission point for every own win. Emitting here too would
+            // mint + flood the block win twice (W2 dedup would reject the echo, wasted grind).
             return r.accepted;
         };
 
@@ -412,6 +547,25 @@ int main(int argc, char** argv) {
         LOG_INFO << "[v37-dash] v36-found " << bh.GetHex() << " template-h~=" << h << " by " << miner
                  << (reached ? " (reached network)" : " (NOT delivered)");   // telemetry only; registration is in submit_fn
     });
+    // ── A2 SEND-SIDE: every own stratum win (share arm AND block arm) -> carrier ──
+    // H-SHARE seam (work_source.hpp:188 MintShareFn; fires from mint_solved_share on both
+    // arms, work_source.cpp:2885/:2896). submit() is O(1) on the stratum io thread; the
+    // resolve/grind/admit/flood run on the CarrierSendQueue worker (S-3).
+    if (carrier_send) {
+        ws->set_mint_share_fn(
+            [send = carrier_send.get()](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+                const std::string h16 = in.pow_hash.GetHex().substr(0, 16);
+                auto req = own_win_request_of_header(
+                    in.header_bytes, in.payout_script, in.won_block,
+                    (in.won_block ? "win:" : "share:") + h16);
+                if (!req) { LOG_WARNING << "[v37-dash] carrier: short header for " << h16; return uint256(); }
+                (void)send->submit(std::move(*req));
+                // DEFERRED BY DESIGN (S-3): the worker mints/admits/floods and logs the outcome;
+                // null here = the work source's own "accepted (mint deferred/declined)" line
+                // (work_source.cpp:2685), which is exact.
+                return uint256();
+            });
+    }
     rpc->set_on_reconnect([ws] { ws->invalidate_template_cache("reconnect"); });
 
     const auto colon = stratum_bind.rfind(':');
@@ -439,6 +593,7 @@ int main(int argc, char** argv) {
             exit_code = 9;
             break;
         }
+        if (tip && live_index) live_index->observe_tip(tip->height);   // A2: the reader thread never asks getblockchaininfo
         if (tip && tip->hash != last_hash) {
             try {
                 // D11: a lowered tip, or a previous tip that left the active chain,
@@ -450,6 +605,7 @@ int main(int argc, char** argv) {
                     if (const auto on = backend->on_active_chain(last_hash)) forked = !*on;
                 }
                 if (lowered || forked) {
+                    if (live_index) live_index->invalidate();          // A2: active-chain status of cached headers may have flipped
                     const std::size_t n = bed.recheck_pending(probe);
                     LOG_WARNING << "[v37-dash] reorg signal (" << (lowered ? "tip lowered" : "previous tip off the active chain")
                                 << ") at " << tip->height << ": re-checked pending FOUNDs, ORPHAN " << n;
@@ -471,12 +627,46 @@ int main(int argc, char** argv) {
     }
 
     // ── stop: network first, then engine (btc_node.hpp:37-38) ────────────────
-    stratum.stop();
+    stratum.stop();                                   // no new submits
+    if (carrier_send) carrier_send->stop();           // worker may be mid-flood: BEFORE net stop, BEFORE engine drain
     if (carrier_net) {
         carrier_net->stop();   // stop inbound carriers BEFORE the engine drains
-        if (carrier_ingest)
-            LOG_INFO << "[v37-dash] carrier-relay stop: pushes_forwarded="
-                     << carrier_ingest->pushes_forwarded();
+        if (carrier_ingest) {
+            const auto ss = carrier_send ? carrier_send->stats() : CarrierSendStats{};
+            LOG_INFO << "[v37-dash] carrier-relay stop: pushes_forwarded=" << carrier_ingest->pushes_forwarded()
+                     << " inbound_frames=" << carrier_inbound.frames.load()
+                     << " inbound_admitted=" << carrier_inbound.admitted.load()
+                     << " inbound_echo=" << carrier_inbound.echo.load()
+                     << " inbound_wire_rejected=" << carrier_inbound.wire_rejected.load()
+                     << " inbound_admit_rejected=" << carrier_inbound.admit_rejected.load()
+                     << " own_carriers_emitted=" << ss.admitted << " block_winners=" << ss.block_winners
+                     << " relayed=" << ss.relayed << " deferred_relay=" << ss.deferred_relay
+                     << " unresolved_parent=" << ss.unresolved_parent << " no_identity=" << ss.no_identity
+                     << " shed=" << ss.shed_shares << " abandoned=" << ss.abandoned_at_stop
+                     << " policy_rejected=" << carrier_policy_stats.frames_rejected.load()
+                     << " policy_receipts_dropped=" << carrier_policy_stats.receipts_dropped.load();
+        }
+        if (live_index) {
+            const auto ist = live_index->stats();
+            LOG_INFO << "[v37-dash] carrier-index stop: probes=" << ist.probes << " cache_hits=" << ist.cache_hits
+                     << " resolved=" << ist.resolved << " missing=" << ist.missing << " inactive=" << ist.inactive
+                     << " beyond_horizon=" << ist.beyond_horizon << " future=" << ist.future
+                     << " unknown_retries=" << ist.unknown_retries << " unknown_exhausted=" << ist.unknown_exhausted
+                     << " tip_pulls=" << ist.tip_pulls;
+        }
+        // The cross-node observable: which payout identities THIS node's lane
+        // accounts (a peer's miner shows up here under its own identity key).
+        if (const auto s = node.lane_snapshot()) {
+            LOG_INFO << "[v37-dash] lane stop: raw_total=" << static_cast<unsigned long long>(s->raw_total)
+                     << " next_pos=" << s->next_pos
+                     << " identities=" << (s->identities ? s->identities->size() : 0);
+            if (s->identities)
+                for (const auto& [mid, ent] : s->identities->entries()) {
+                    const auto it = s->payout.find(mid);
+                    LOG_INFO << "[v37-dash] lane identity " << hex32(ent.key).substr(0, 16)
+                             << " payout=" << ((it != s->payout.end() && !(it->second == ::v37::U256{})) ? "nonzero" : "zero");
+                }
+        }
     }
     {
         std::lock_guard<std::mutex> g(bed.mutex());

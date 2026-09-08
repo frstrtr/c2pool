@@ -39,10 +39,12 @@
 namespace c2pool::v37n {
 
 // ── IMainchainIndex bound to a caller-supplied height resolver ──────────────
-// The daemon supplies the node's real mainchain index (a resolver that maps a
-// carrier's prev_block_hash to a coin height within the context horizon, or
-// nullopt); a test supplies a synthetic map. Kept behind a std::function so the
-// heavy coin backend never leaks into this stdlib-only header.
+// A KAT supplies a synthetic map (or any resolver shape) behind a std::function.
+// The DAEMON does not use this any more: Track A2 step (b)(2) binds the LIVE
+// LiveMainchainIndex / SyntheticMainchainIndex from carrier_index.hpp (context
+// horizon vs the live tip, bounded Unknown retry, per-hash cache) through the
+// same `const IMainchainIndex&` this class implements. Kept stdlib-only so the
+// heavy coin backend never leaks into this header.
 class CallbackMainchainIndex final : public IMainchainIndex {
 public:
     using Resolver = std::function<std::optional<u64>(const bytes32&)>;

@@ -325,4 +325,40 @@ if (BUILD_TESTING)
     target_include_directories(v37_a2_multinode_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_a2_multinode_test Threads::Threads)
     add_test(NAME v37_a2_multinode_test COMMAND v37_a2_multinode_test)
+
+    # Track A2 / W3-B5 — carrier-wire BYTE FREEZE golden KAT. Pins the frozen
+    # CarrierWire v0x01 layout (golden bytes for a fixed carrier) so the send-side
+    # can rely on the wire being byte-identical across nodes and builds. stdlib
+    # only, no threads. SAME HOLLOW-GREEN GUARD as the sibling suites: ALSO on the
+    # build.yml --target lists (both the Linux leg and the ASan+UBSan leg) so CI
+    # compiles + runs it, and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_w3_wire_freeze_kat v37_w3_wire_freeze_kat.cpp)
+    target_compile_features(v37_w3_wire_freeze_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_w3_wire_freeze_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME v37_w3_wire_freeze_kat COMMAND v37_w3_wire_freeze_kat)
+
+    # Track A2 step (b)(2) — the LIVE IMainchainIndex (carrier_index.hpp) KAT: horizon
+    # vs tip (I-1), bounded tri-state Unknown retry (I-2), per-hash Have cache (I-3),
+    # the synthetic model's byte-for-byte parity with the multinode-test resolver,
+    # the backend-binding templates against a DashRpcCoinBackend-shaped fake (D6
+    # display-order probe asserted), and an end-to-end W2 ReceiptAdmitter::admit over
+    # the live index. stdlib + Threads (it sleeps; no sockets, no Boost). SAME
+    # HOLLOW-GREEN GUARD as the sibling suites: ALSO on the build.yml --target lists
+    # (both the Linux leg and the ASan+UBSan leg) so CI compiles + runs it, and
+    # audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_a2_live_index_test v37_a2_live_index_test.cpp)
+    target_compile_features(v37_a2_live_index_test PRIVATE cxx_std_20)
+    target_include_directories(v37_a2_live_index_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_a2_live_index_test Threads::Threads)
+    add_test(NAME v37_a2_live_index_test COMMAND v37_a2_live_index_test)
+
+    # Track A2 step (b)(3) — SEND-SIDE: own stratum wins (share-level, per-miner
+    # identity) queued off the hot path and flooded as frozen carriers; node B
+    # accounts them under the miner's identity. POSIX sockets + Threads. SAME
+    # HOLLOW-GREEN GUARD as the siblings: ALSO on BOTH build.yml --target lists.
+    add_executable(v37_a2_sendside_test v37_a2_sendside_test.cpp)
+    target_compile_features(v37_a2_sendside_test PRIVATE cxx_std_20)
+    target_include_directories(v37_a2_sendside_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_a2_sendside_test Threads::Threads)
+    add_test(NAME v37_a2_sendside_test COMMAND v37_a2_sendside_test)
 endif()
