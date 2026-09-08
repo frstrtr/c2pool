@@ -392,4 +392,34 @@ if (BUILD_TESTING)
     target_include_directories(v37_w4_owed_incremental_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w4_owed_incremental_test Threads::Threads)
     add_test(NAME v37_w4_owed_incremental_test COMMAND v37_w4_owed_incremental_test)
+    # MMR PERMANENCE PEAKS — the "V37P" permanent-work-record SHADOW
+    # (src/c2pool/v37/mmr_permanence.hpp), a READ-ONLY side commitment over the
+    # canon v37::Lane. This KAT proves the shadow is both CORRECT and INERT:
+    #   (a) GATE-OFF BYTE-IDENTITY [the hard acceptance gate] — with the shadow's
+    #       own gate at its default (UINT64_MAX, decoupled from LaneParams::shipped()
+    #       / SHIPPED_CONSENSUS_VERSION) the shadow seals nothing and shadow_digest()
+    #       is lane.digest() VERBATIM; the ratified + small KAT-0 scripts reproduce
+    #       the frozen canon byte-identity fingerprint (2479d5b6..) unchanged, so the
+    #       consensus lane digest is proven untouched.
+    #   (b) MMR peaks correctness — the shadow's bagged peak-root equals an
+    #       independent binary-decomposition oracle and reproduces the proto I-2
+    #       goldens (leaf counts / roots / first leaves / peaks fingerprint).
+    #   (c) append-only monotonicity, and (d) rebuild / reorg determinism.
+    # Stdlib-only, no threads. The frozen golden JSON is copied next to the binary
+    # (and the test runs there via WORKING_DIRECTORY) so the JSON-stamp case can
+    # re-derive sha256d(mmr_permanence_golden_v1.json) in-CI (non-hollow pin).
+    # SAME HOLLOW-GREEN GUARD as the sibling suites: this target is ALSO on the
+    # build.yml --target lists (BOTH the Linux x86_64 leg and the ASan+UBSan leg)
+    # so CI compiles + runs it, and it is audited by the src/c2pool/**/test/
+    # drift-guard (tools/ci/check_test_target_allowlist.py).
+    add_executable(v37_mmr_permanence_test v37_mmr_permanence_test.cpp)
+    target_compile_features(v37_mmr_permanence_test PRIVATE cxx_std_20)
+    target_include_directories(v37_mmr_permanence_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_custom_command(TARGET v37_mmr_permanence_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/mmr_permanence_golden_v1.json
+                $<TARGET_FILE_DIR:v37_mmr_permanence_test>/mmr_permanence_golden_v1.json)
+    add_test(NAME v37_mmr_permanence_test
+             COMMAND v37_mmr_permanence_test
+             WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_mmr_permanence_test>)
 endif()

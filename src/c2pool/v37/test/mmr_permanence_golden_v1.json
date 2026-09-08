@@ -1,0 +1,46 @@
+{
+  "schema": "v37-mrr-permanence-peaks-shadow-golden/1",
+  "note": "Goldens for v37_mmr_permanence_test — the MMR permanence-peaks SHADOW (src/c2pool/v37/mmr_permanence.hpp). The shadow reads the REAL canon v37::Lane read-only and computes an append-only MMR of the leaves of evicted buckets; the gate is OFF by default (activation_pos=UINT64_MAX) and DECOUPLED from LaneParams::shipped()/SHIPPED_CONSENSUS_VERSION. It appends NOTHING into the canon lane digest. Wiring the peak-root into the live consensus digest (the inline V37P leaf + owed_digest fold + a gate-ON consensus golden) is the out-of-scope position-gated activation.",
+  "hard_acceptance_gate": {
+    "note": "GATE-OFF byte-identity: with the shadow compiled in but the gate at its UINT64_MAX default, shadow_digest()==lane.digest() at every step and the canon per-step digest fingerprint is unchanged. Driving the real canon v37::Lane over the KAT-0 scripts (ratified + small geometry) reproduces the frozen fingerprint. If it moves, the shadow is not inert -> NO-SHIP.",
+    "overall_byte_identity_fp": "2479d5b61933cbe62d8506ebfcd09483954b8b4cc4698e593f73c16c83fda4fd",
+    "ratified_trace_fp": "fec3da99da694406dc74ae8ba98e3cdda8798f118ba9f1cfdd96e2fed0ac7ce3",
+    "small_trace_fp": "5732de4ff690acfdcec93dcc81ff6e9afc964a0ce3c8c897908b7cb56729c5ba"
+  },
+  "hash_discipline": {
+    "leaf": "sha256d(0x00 || payload)",
+    "interior": "sha256d(0x01 || left || right)",
+    "bag": "right fold, tallest peak outermost; single peak = itself; empty range = all-zero",
+    "v37p_payload_bytes": 44,
+    "v37b_leaf_payload": "V37B || level(u64) || pos_lo(u64) || pos_hi(u64) || raw_work(u128) || epoch_tag(u64) || comp_hash(32), byte-equal to the lane's live bucket leaf"
+  },
+  "script_a": {
+    "note": "ratified geometry W=8640,c0=4096,R=8,half_life=2160,level_caps=[568]; XorShift64 seed 99; shadow activation_pos=4096 (epoch boundary). Reproduces the proto I-2 permanence goldens from the REAL canon buckets.",
+    "activation_pos": 4096,
+    "leaf_count": 1482,
+    "mmr_root": "b38bf8b301bc502c4163f37b54f37eab27804d4d6bc85eea926ac013e1756bce",
+    "peaks_fp": "833dadc05ea375662802c5a28853d0c59cae27762e67f6766d0639734e5039f7",
+    "first_leaf": "0d60bbff6a102a3d73ba29613d844ac66e6a18db9e53bf9bde6d5bfc12d5031c",
+    "first_leaf_bucket": "[4096,4103]",
+    "shadow_digest_gate_on": "11a85deb074baba2c0171b1c7c7383ec32a9bad3139cb459dfee54f070c8056a"
+  },
+  "script_b": {
+    "note": "small geometry W=256,c0=128,R=8,level_caps=[16],half_life=64; XorShift64 seed 1234; shadow activation_pos=301 (straddles bucket [296,303], which is NOT sealed).",
+    "activation_pos": 301,
+    "leaf_count": 859,
+    "mmr_root": "4c86dd8b6aef5faa60760b515dc3470da823202bf8786d8421ce8c6476cf8b2a",
+    "first_leaf": "2e2a59a7cd078a85db03bedeb683bf3953e562a85e568a01e312b4cef13fde9b",
+    "first_leaf_bucket": "[304,311]",
+    "shadow_digest_gate_on": "08fdcafd8761ad723f4c5f49388e9b1bb82825698ab62848c93fccc17a861570"
+  },
+  "invariants": {
+    "gate_off_default_is_uint64_max": true,
+    "gate_decoupled_from_shipped_consensus_version": true,
+    "shadow_digest_off_equals_lane_digest": true,
+    "canon_lane_digest_byte_unchanged": true,
+    "mmr_roots_reproduce_proto_i2": true,
+    "append_only_no_sealed_peak_ever_mutates": true,
+    "rewind_restores_peakset_bit_exactly": true,
+    "rebuild_from_scratch_deterministic": true
+  }
+}
