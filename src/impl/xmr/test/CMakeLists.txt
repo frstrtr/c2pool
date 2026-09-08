@@ -306,18 +306,18 @@ if (BUILD_TESTING)
     # provided ONCE by the library and neither TU defines
     # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES (the ODR rule).
     #
-    # ci-allowlist-exempt: xmr_template_primitives_kat  -- heavy option-B leg (pulls the whole template port); NOT built in build.yml this wave, so it is guarded behind the OFF-by-default XMR_BUILD_OPTION_B_KATS option below. Library compile-coverage is still had at PR time via the c2pool-v37-xmr daemon target (which links xmr_template) on the non-san Linux leg; a later wave flips this option ON in build.yml.
-    # ci-allowlist-exempt: xmr_block_assembly_kat  -- heavy option-B leg (template + X6 settle + ref10 point-check); same gating as above.
-    #
-    # Both add_executable/add_test are gated behind XMR_BUILD_OPTION_B_KATS
-    # (default OFF, run locally with -DXMR_BUILD_OPTION_B_KATS=ON). Without this
-    # guard the add_test() below registers in every BUILD_TESTING build while the
-    # binaries are (deliberately) absent from build.yml's --target list, so ctest
-    # reports them ***Not Run and CTest exits 8 -- a red that is NOT a test
-    # failure. This mirrors the ltc_embedded_bootstrap_gate exempt idiom: exempt
-    # from the allowlist AND unregistered unless its own option is set.
+    # RUN-COVERAGE (#1543): both KATs are now built + registered on the
+    # non-sanitizer Linux leg, which configures with -DXMR_BUILD_OPTION_B_KATS=ON
+    # and lists xmr_template_primitives_kat + xmr_block_assembly_kat in its
+    # `cmake --build --target` allowlist (under the #1522 -j"${BUILD_J}" cap).
+    # They are therefore allowlisted, NOT ci-allowlist-exempt: the drift-guard
+    # sees them in build.yml. The option still defaults OFF so a minimal local
+    # build (or the ASan leg, which leaves it OFF) does not register the add_test
+    # while the binaries are absent -- that combination is what made ctest report
+    # ***Not Run and exit 8 on #1539 before the gate. CI passes the flag ON
+    # explicitly; only the non-san leg builds the targets it registers.
     option(XMR_BUILD_OPTION_B_KATS
-           "Build the heavy X9 option-B XMR KATs (local; not in the CI --target allowlist)" OFF)
+           "Build the heavy X9 option-B XMR KATs (CI non-san leg passes this ON; default OFF for minimal local builds)" OFF)
     if (XMR_BUILD_OPTION_B_KATS)
         # (1) primitive seam byte-identity + template in-situ (component 1 + the leg).
         add_executable(xmr_template_primitives_kat xmr_template_primitives_kat.cpp)

@@ -181,7 +181,15 @@ jobs:
         # RandomX JIT/asm + intentional unaligned reads do not survive
         # -fsanitize, so the ASAN leg deliberately leaves it OFF. Light mode:
         # the KAT never allocates the 2 GiB dataset (256 MiB cache only).
-        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON
+        #
+        # -DXMR_BUILD_OPTION_B_KATS=ON: register + build the two heavy X9
+        # option-B KATs (xmr_template_primitives_kat, xmr_block_assembly_kat)
+        # so they get RUN coverage on this non-sanitizer leg, not the
+        # compile-only coverage #1539 shipped. Both link xmr_template
+        # (block-template port + settle + ref10 point-check); they are logic/
+        # byte-identity KATs (no RandomX JIT), so the non-san leg is the right
+        # home and the ASan leg deliberately leaves this OFF. #1543.
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON -DXMR_BUILD_OPTION_B_KATS=ON
 
       # Boost header-integrity + version gate: a torn/mixed Boost tree or apt-Boost
       # fallback fails HERE (fast, one TU), not deep in the coin build.
@@ -234,6 +242,7 @@ jobs:
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke c2pool-v37-xmr \
                     v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck \
                     xmr_randomx_verify_kat v37_xmr_o2_randomx_kat \
+                    xmr_template_primitives_kat xmr_block_assembly_kat \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
