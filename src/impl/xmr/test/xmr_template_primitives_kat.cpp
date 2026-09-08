@@ -127,7 +127,7 @@ void kat_varint() {
     struct V { uint64_t v; const char* hexv; } canon[] = {
         {0, "00"}, {1, "01"}, {127, "7f"}, {128, "8001"}, {255, "ff01"}, {300, "ac02"},
         {16383, "ff7f"}, {16384, "808001"}, {0xFFFFFFFFULL, "ffffffff0f"},
-        {600000000000ULL, "80a094a58b11"},                       // 0.6 XMR tail reward
+        {600000000000ULL, "80e0a596bb11"},                       // 0.6 XMR tail reward
         {(1ULL << 56) - 1, "ffffffffffffff7f"},                   // MAX_OUTPUT_VALUE
         {UINT64_MAX, "ffffffffffffffffff01"},
     };
