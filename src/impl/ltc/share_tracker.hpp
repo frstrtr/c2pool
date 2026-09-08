@@ -857,11 +857,24 @@ public:
         // synchronous initial sync).
         const auto think_wall_t0 = std::chrono::steady_clock::now();
         constexpr int64_t THINK_MAX_WALL_MS = 2000;
+        // Boot backfill on a large persisted sharechain must ALSO yield. An
+        // uncapped bootstrap think() walks the full chain x PPLNS under the
+        // exclusive tracker lock and freezes the io_context past the ~40s
+        // producer-dispatch watchdog -> abort() -> :8080 503 (contabo LTC boot,
+        // 2026-09-08; #1533 chunked steady-state only, left boot uncapped).
+        // Give bootstrap a larger-but-FINITE wall bound, well under the
+        // watchdog, so cold-start sync completes over several run_think()
+        // continuations (m_think_needs_continue) instead of one unbounded wedge.
+        // The SET of shares verified is unchanged -- only the scheduling is
+        // chunked across more ticks -- so GENTX parity is preserved. The
+        // steady-state (non-bootstrap) path is byte-identical to before.
+        constexpr int64_t THINK_BOOTSTRAP_WALL_MS = 8000;
         auto think_wall_exceeded = [&]() -> bool {
-            return !bootstrap_mode &&
-                   std::chrono::duration_cast<std::chrono::milliseconds>(
+            const int64_t cap = bootstrap_mode ? THINK_BOOTSTRAP_WALL_MS
+                                               : THINK_MAX_WALL_MS;
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - think_wall_t0).count()
-                       >= THINK_MAX_WALL_MS;
+                       >= cap;
         };
 
         // Phase-1 verification budget — async-model adaptation mirroring the
@@ -876,7 +889,15 @@ public:
         // continuation. The SET of shares verified is identical to p2pool --
         // only the scheduling is chunked, so GENTX parity is preserved.
         constexpr int THINK_P1_VERIFY_BUDGET = 100;
-        int p1_budget_remaining = bootstrap_mode ? INT_MAX : THINK_P1_VERIFY_BUDGET;
+        // Bootstrap draws an elevated but FINITE per-tick budget (not INT_MAX):
+        // cold-start sync verifies in large chunks yet still yields between
+        // run_think() continuations, bounding the exclusive-lock hold below the
+        // io_context watchdog. Verified status persists across ticks (heads
+        // already in `verified` are skipped), so the remainder makes forward
+        // progress each tick rather than re-walking.
+        constexpr int THINK_P1_BOOTSTRAP_BUDGET = 20000;
+        int p1_budget_remaining = bootstrap_mode ? THINK_P1_BOOTSTRAP_BUDGET
+                                                 : THINK_P1_VERIFY_BUDGET;
         {
             // Snapshot heads — we'll modify chain during iteration
             auto heads_snapshot = chain.get_heads();
@@ -1078,7 +1099,11 @@ public:
         // p2pool avoids this problem by persisting verified status — we do too
         // now, so budgeting is a safety net for cold starts only.
         constexpr int THINK_VERIFY_BUDGET = 100;
-        int budget_remaining = bootstrap_mode ? INT_MAX : THINK_VERIFY_BUDGET;
+        // Bootstrap: elevated but FINITE (see Phase-1). With the wall guard now
+        // active under bootstrap too, Phase-2 defers its remainder across ticks.
+        constexpr int THINK_BOOTSTRAP_VERIFY_BUDGET = 20000;
+        int budget_remaining = bootstrap_mode ? THINK_BOOTSTRAP_VERIFY_BUDGET
+                                              : THINK_VERIFY_BUDGET;
         // Restart-reorg elevated budget (SupersedeHint): a BOUNDED extra pool
         // that ONLY the challenger segment may draw from, after the normal
         // budget is spent. Bounds the per-tick lock hold (ref #1343 serve-path
