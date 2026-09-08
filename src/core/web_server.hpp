@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <deque>
+#include <chrono>
 #include <future>
 #include <set>
 #include <map>
@@ -958,8 +959,19 @@ public:
         };
     }
 
-    /// Parameterized overload: dispatch-and-wait (used for delta, lookup, etc.)
-    /// These are called less frequently so blocking is acceptable.
+    /// Max time an io_context worker (e.g. the HTTP thread) may wait on the
+    /// producer io_context before giving up. Kept well under the 40s liveness
+    /// watchdog so a wedged/oversubscribed producer degrades to a 5xx instead
+    /// of freezing the worker into the io_context-freeze abort seen in prod.
+    static constexpr std::chrono::seconds PRODUCER_DISPATCH_TIMEOUT{10};
+
+    /// Parameterized overload: dispatch-and-wait (used for delta, lookup, etc.).
+    /// An io_context worker must NEVER block on the producer unboundedly, so we
+    /// (a) own the promise via shared_ptr — the posted task then stays valid
+    /// even after we stop waiting (the old [&]-capture would UAF a destroyed
+    /// promise if the wait was ever abandoned), and (b) bound the wait to
+    /// PRODUCER_DISPATCH_TIMEOUT, throwing a std::runtime_error the REST router
+    /// turns into a 5xx rather than hanging the HTTP thread past the watchdog.
     template<typename R, typename Arg0, typename... Args>
     std::function<R(Arg0, Args...)> thread_safe_wrap(std::function<R(Arg0, Args...)> fn) {
         if (!fn) return fn;
@@ -967,20 +979,27 @@ public:
             if (!m_context || std::this_thread::get_id() == m_main_thread_id) {
                 return fn(arg0, args...);
             }
-            std::promise<R> prom;
-            auto fut = prom.get_future();
-            boost::asio::post(*m_context, [&]() {
+            auto prom = std::make_shared<std::promise<R>>();
+            auto fut  = prom->get_future();
+            boost::asio::post(*m_context, [prom, fn, arg0, args...]() mutable {
                 try {
-                    prom.set_value(fn(arg0, args...));
+                    prom->set_value(fn(arg0, args...));
                 } catch (...) {
-                    prom.set_exception(std::current_exception());
+                    try { prom->set_exception(std::current_exception()); } catch (...) {}
                 }
             });
+            if (fut.wait_for(PRODUCER_DISPATCH_TIMEOUT) != std::future_status::ready) {
+                throw std::runtime_error(
+                    "thread_safe_wrap: producer io_context did not service dispatch "
+                    "within timeout (io_context-freeze guard)");
+            }
             return fut.get();
         };
     }
 
-    /// Void-returning overload (parameterized)
+    /// Void-returning overload (parameterized). Same io_context-freeze guard as
+    /// the value-returning overload above: shared_ptr-owned promise + bounded
+    /// wait, never an unbounded block on an io_context worker.
     template<typename... Args>
     std::function<void(Args...)> thread_safe_wrap(std::function<void(Args...)> fn) {
         if (!fn) return fn;
@@ -989,16 +1008,21 @@ public:
                 fn(args...);
                 return;
             }
-            std::promise<void> prom;
-            auto fut = prom.get_future();
-            boost::asio::post(*m_context, [&]() {
+            auto prom = std::make_shared<std::promise<void>>();
+            auto fut  = prom->get_future();
+            boost::asio::post(*m_context, [prom, fn, args...]() mutable {
                 try {
                     fn(args...);
-                    prom.set_value();
+                    prom->set_value();
                 } catch (...) {
-                    prom.set_exception(std::current_exception());
+                    try { prom->set_exception(std::current_exception()); } catch (...) {}
                 }
             });
+            if (fut.wait_for(PRODUCER_DISPATCH_TIMEOUT) != std::future_status::ready) {
+                throw std::runtime_error(
+                    "thread_safe_wrap: producer io_context did not service dispatch "
+                    "within timeout (io_context-freeze guard)");
+            }
             fut.get();
         };
     }
