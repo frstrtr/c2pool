@@ -259,4 +259,53 @@ if (BUILD_TESTING)
     add_test(NAME v37_1_activation_test
              COMMAND v37_1_activation_test
              WORKING_DIRECTORY $<TARGET_FILE_DIR:v37_1_activation_test>)
+
+    # ── Track A2 / X9 O-2 — the XMR serve-side wiring gates (network-free) ────
+    # v37_xmr_o2_live_submit_selfcheck: the block-blob assembler + submit_block
+    # ack parser (incl. result.block_id) + LiveBlockSubmitter over the monerod
+    # STUB, pinned by a REAL golden (keccak256(varint(len)||hashing_blob) of the
+    # Monero mainnet genesis block == its published id), and the IShareSink ->
+    # FoundBlockQueue hand-off. Links xmr_node (RPC bodies/parsers) + xmr_coin
+    # (vendored keccak + varint). No RandomX, no sockets.
+    add_executable(v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_live_submit_selfcheck.cpp)
+    target_compile_features(v37_xmr_o2_live_submit_selfcheck PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_o2_live_submit_selfcheck PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_o2_live_submit_selfcheck PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_o2_live_submit_selfcheck COMMAND v37_xmr_o2_live_submit_selfcheck)
+    # v37_xmr_o2_finalize_connect_selfcheck: queued win -> XmrNode::
+    # on_network_block_won (amount-honest FOUND) -> restart inside the D_conf
+    # window -> pending-FOUND sidecar re-drive -> FINALIZE at bin_height =
+    # H_b + D_conf -> finalW nets to 0; late-FOUND / malformed / all-zero bid
+    # refusals; orphan disposition. Same shape as v37_xmr_node_smoke (monerod
+    # STUB, injected test point-check backend). SAME HOLLOW-GREEN GUARD: both
+    # targets are listed in the build.yml --target lists (BOTH the Linux x86_64
+    # leg and the ASan+UBSan leg) so CI compiles + runs them.
+    add_executable(v37_xmr_o2_finalize_connect_selfcheck v37_xmr_o2_finalize_connect_selfcheck.cpp)
+    target_compile_features(v37_xmr_o2_finalize_connect_selfcheck PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_o2_finalize_connect_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_o2_finalize_connect_selfcheck PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_o2_finalize_connect_selfcheck COMMAND v37_xmr_o2_finalize_connect_selfcheck)
+    # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
+    # the production LightVerifier + librandomx) reproducing the X8 KAT vector
+    # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
+    # handle_login/handle_submit, plus the exact 128-bit network gate, the
+    # strict no-Argon2d-on-submit invariant, the seed mailbox and the
+    # fail-closed disabled/compiled-out modes. HEAVY (2 x 256 MiB caches) and
+    # JIT: like xmr_randomx_verify_kat it is built ONLY under XMR_BUILD_RANDOMX
+    # (the non-sanitizer CI leg) and is listed in that leg's --target list.
+    if (XMR_BUILD_RANDOMX AND TARGET randomx)
+        add_executable(v37_xmr_o2_randomx_kat
+            v37_xmr_o2_randomx_kat.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+        target_compile_features(v37_xmr_o2_randomx_kat PRIVATE cxx_std_20)
+        target_include_directories(v37_xmr_o2_randomx_kat PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+        target_compile_definitions(v37_xmr_o2_randomx_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
+        target_link_libraries(v37_xmr_o2_randomx_kat PRIVATE xmr_coin randomx Threads::Threads)
+        add_test(NAME v37_xmr_o2_randomx_kat COMMAND v37_xmr_o2_randomx_kat)
+    endif()
 endif()

@@ -34,6 +34,20 @@ add_subdirectory(coin)
 # X2 node KAT in test/, or later W3 wire / W5 coinbase legs) is built.
 add_subdirectory(node)
 
+# X8 / O-2: librandomx from the VENDORED tevador/RandomX tree (consensus pin
+# 12f2c2ff, third_party/randomx). OFF by default — 2 x 256 MiB light caches +
+# a JIT are OOM-hostile on a laptop and do not survive -fsanitize — and turned
+# ON by the non-sanitizer CI leg (-DXMR_BUILD_RANDOMX=ON). Declared HERE (not
+# only in test/) so the c2pool-v37-xmr daemon can link `randomx` for its
+# runtime submit-path verify without BUILD_TESTING; test/ re-declares the same
+# option (idempotent) and guards its own add_subdirectory with NOT TARGET.
+option(XMR_BUILD_RANDOMX
+    "Build librandomx (tevador/RandomX pin 12f2c2ff) for the runtime verify + KAT" OFF)
+if (XMR_BUILD_RANDOMX AND NOT TARGET randomx
+    AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/randomx/CMakeLists.txt)
+    add_subdirectory(third_party/randomx ${CMAKE_CURRENT_BINARY_DIR}/randomx_build)
+endif()
+
 if (BUILD_TESTING)
     add_subdirectory(test)
 endif()

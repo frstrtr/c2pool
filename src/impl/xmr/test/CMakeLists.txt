@@ -272,16 +272,20 @@ if (BUILD_TESTING)
         # Primary: full tevador/RandomX source vendored/submoduled under
         # ../third_party/randomx (later wave); fall back to FetchContent at the
         # foundation's consensus pin. Either path defines the `randomx` lib.
-        if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx/CMakeLists.txt)
-            add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx
-                             ${CMAKE_CURRENT_BINARY_DIR}/randomx_build)
-        else()
-            include(FetchContent)
-            FetchContent_Declare(randomx
-                GIT_REPOSITORY https://github.com/tevador/RandomX.git
-                GIT_TAG        12f2c2ff  # consensus pin (see third_party/randomx/PROVENANCE.txt)
-            )
-            FetchContent_MakeAvailable(randomx)
+        # O-2: ../CMakeLists.txt now defines the target first (so the daemon can
+        # link it without BUILD_TESTING); only define it here if that did not.
+        if (NOT TARGET randomx)
+            if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx/CMakeLists.txt)
+                add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx
+                                 ${CMAKE_CURRENT_BINARY_DIR}/randomx_build)
+            else()
+                include(FetchContent)
+                FetchContent_Declare(randomx
+                    GIT_REPOSITORY https://github.com/tevador/RandomX.git
+                    GIT_TAG        12f2c2ff  # consensus pin (see third_party/randomx/PROVENANCE.txt)
+                )
+                FetchContent_MakeAvailable(randomx)
+            endif()
         endif()
         add_executable(xmr_randomx_verify_kat
             ${CMAKE_CURRENT_SOURCE_DIR}/../pow/randomx_verify_kat.cpp)
