@@ -12,9 +12,44 @@
 // interplay, §8.4 bloat hook, and the closing "W3-MUST" identity-binding
 // requirement). Wire contract of record: docs/c2pool-v37-share-format.md
 // (frstrtr/the, blob 08f157df) §1-§8 — the RDWR receipt envelope / carrier
-// rules; this header is the draft-v0 encode/decode of that contract (W3-B5:
-// the byte freeze is a Phase-B integrator item, so this layout is PROVISIONAL,
-// and the §8.1 differential compares digests, not wire bytes).
+// rules; this header is the encode/decode of that contract.
+//
+// ── W3-B5 CARRIER-WIRE BYTE FREEZE (Track A2 step (b), 2026-09-07) ───────────
+// The CarrierWire layout below is FROZEN as canonical wire version 0x01. The
+// send-side (a node emitting its own stratum wins as carriers) relies on this
+// being stable across nodes and builds, so the layout is now byte-pinned by a
+// golden byte-KAT (src/c2pool/v37/test/v37_w3_wire_freeze_kat.cpp) — any change
+// to a field, its width, its order, or its endianness trips that test. A future
+// wire change is a VISIBLE version bump (W3_WIRE_VERSION), never a silent
+// re-pack of 0x01. The frozen v0x01 layout, little-endian throughout:
+//
+//   frame  := u8 version(=0x01)
+//             event   carrier
+//             u8      receipt_count (0..R_MAX; a decoder seeing >R_MAX rejects)
+//             event   receipt[receipt_count]
+//   event  := u32 chain_id
+//             b32 identity              (payout-descriptor identity key)
+//             b32 prev_block_hash       (header hashPrevBlock, INTERNAL order)
+//             b32 prev_own_share
+//             u32 lz_bits
+//             u64 nonce
+//             desc descriptor
+//             str tag                   (u16 len + bytes; bookkeeping, not PoW)
+//   desc   := ref pay
+//             u8  has_attribution ; if 1: ref attribution
+//             u16 aux_count ; aux_count × { u32 chain_id ; ref ref }
+//             u16 raw_script_len ; raw_script_len bytes
+//   ref    := u8 kind ; u8 payload_len ; payload_len bytes
+//   str    := u16 len ; len bytes
+//   b32    := 32 raw bytes (no length prefix)
+//   uN     := N/8 bytes, LITTLE-ENDIAN
+//
+// The transport framing that carries a frame between nodes (carrier_net.hpp) is
+// [u32 LE length][length bytes = frame]; that prefix is transport-layer, not
+// part of the carrier body, and is frozen alongside this layout.
+// NOTE (still deferred to S-1/real share format): prev_block_hash/lz_bits carry
+// the SYNTHETIC RDWR PoW envelope, not a real DASH block-header PoW. The freeze
+// pins the CONTAINER; the field SEMANTICS widen when real share format lands.
 //
 // ── the v36 transport this layer REUSES (cite, never reinvent) ──────────────
 // W3 adds ZERO new transport. A carrier is an extended share body, not a new
@@ -40,6 +75,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -49,8 +85,9 @@
 
 namespace c2pool::v37n {
 
-// W3 draft-v0 wire version tag (W3-B5: provisional until the integrator freezes
-// the byte packing at Phase-B exit). Present so a later freeze is a visible bump.
+// W3 wire version tag. 0x01 is the W3-B5 FROZEN carrier-wire layout (see the
+// byte-map in this file's header and the golden byte-KAT). A later wire change
+// is a visible bump of this tag, never a silent re-pack of 0x01.
 constexpr std::uint8_t W3_WIRE_VERSION = 0x01;
 
 // R_MAX is the W2-layer consensus bound (share-format §7); W3 enforces it at
@@ -71,6 +108,9 @@ enum class WireStatus {
     REJECT_BAD_VERSION,        // unknown wire version tag
     REJECT_RMAX,              // > R_MAX receipts: whole carrier rejected (§2.3)
     REJECT_CARRIER_UNBOUND,   // W3-MUST: carrier identity != descriptor key
+    REJECT_POLICY,            // W3-B5 frozen-wire policy (w3_wire_freeze.hpp):
+                              // tag cap (F-1) / V37.0 descriptor validity (F-2)
+                              // on the CARRIER; applied post-decode, pre-admit
 };
 
 // Why a single receipt was dropped at decode (carrier still stands, §2.4/WT-2).
@@ -88,7 +128,8 @@ struct DecodeResult {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Wire codec (spec §2; share-format §1/§3) — draft v0, provisional (W3-B5).
+// Wire codec (spec §2; share-format §1/§3) — FROZEN wire v0x01 (W3-B5; byte-map
+// in this file's header, constants/size-model/goldens in w3_wire_freeze.hpp).
 // Little-endian fixed-width fields, simple length prefixes, no varints. The
 // carrier's receipts ride the ref_hash-committed region conceptually; here they
 // are serialized in-body so a downloaded carrier carries its receipts with it
@@ -412,6 +453,26 @@ public:
     CarrierRelay(AdmitFn admit, ICarrierTransport& transport)
         : m_admit(std::move(admit)), m_transport(transport) {}
 
+    // W3-B5 frozen-wire POLICY hook (F-1 tag cap, F-2 descriptor validity),
+    // run on an INBOUND frame after decode and before admission. false =>
+    // the frame is rejected as WireStatus::REJECT_POLICY (never admitted,
+    // never relayed); true => proceed with the carrier as (possibly) cleaned
+    // by the hook (a policy-dropped receipt is stripped exactly like a
+    // mis-bound one). Bind wire_freeze::make_relay_policy(); unset => no-op,
+    // so every existing KAT keeps its behavior. Never consensus.
+    using FramePolicyFn = std::function<bool(Carrier&)>;
+    void set_frame_policy(FramePolicyFn f) { m_policy = std::move(f); }
+
+    // THREADING (Track A2 step (b)): the three public handlers below are
+    // serialized under m_mtx. CarrierPeerNode runs ONE READER THREAD PER PEER
+    // into handle_inbound (carrier_net.hpp reader_loop), and the send-side
+    // worker (carrier_send.hpp) drives handle_local / append_block_winner from
+    // its own thread — without this lock RelaySeenSet (a bare std::set) and
+    // CarrierBloatStats race with >= 2 peers. Lock order (never reversed):
+    //   relay m_mtx -> CarrierIngest::m_mtx -> engine mailbox
+    //   relay m_mtx -> CarrierPeerNode::m_write_mtx (inside do_broadcast)
+    //   CarrierSendQueue::m_emit_mtx -> relay m_mtx
+    // stats()/seen() are unlocked accessors for single-threaded KAT reads.
     CarrierBloatStats& stats() { return m_stats; }
     RelaySeenSet& seen() { return m_seen; }
 
@@ -428,11 +489,16 @@ public:
     // decode (enforce R_MAX + W3-MUST binding) -> W2 admission -> relay onward.
     // The relay-seen set suppresses the ECHO only; a novel carrier still admits.
     Outcome handle_inbound(const std::vector<std::uint8_t>& frame) {
+        std::lock_guard<std::mutex> lk(m_mtx);
         Outcome o;
         DecodeResult dr = CarrierWire::decode(frame);
         o.wire = dr.status;
         o.wire_dropped = dr.dropped;
         if (!dr.ok()) return o;                 // malformed / R_MAX / carrier unbound
+        if (m_policy && !m_policy(dr.carrier)) {   // W3-B5 policy (tag cap / desc validity)
+            o.wire = WireStatus::REJECT_POLICY;
+            return o;
+        }
 
         bool novel_to_relay = !m_seen.seen(dr.carrier.carrier.hash());
         m_stats.observe_received(!novel_to_relay);
@@ -457,6 +523,7 @@ public:
     // ── local carrier (mined, or newly accepted), spec §3.1 ─────────────────
     // Ordinary local flow: admit, then relay (marking only what reached a peer).
     Outcome handle_local(const Carrier& c) {
+        std::lock_guard<std::mutex> lk(m_mtx);
         Outcome o;
         o.wire = WireStatus::OK;
         o.admission = m_admit(c.carrier, c.receipts);
@@ -481,6 +548,7 @@ public:
     // retry — the credit is NEVER conditional on the relay succeeding (§4 close,
     // the #889/#903 defect: a block-winning share silently dropped => PPLNS loss).
     Outcome append_block_winner(const Carrier& c) {
+        std::lock_guard<std::mutex> lk(m_mtx);
         Outcome o;
         o.wire = WireStatus::OK;
         // Unconditional append: no m_seen check, no backpressure gate.
@@ -508,6 +576,8 @@ private:
 
     AdmitFn m_admit;
     ICarrierTransport& m_transport;
+    FramePolicyFn m_policy;      // unset => no policy gate (KAT default)
+    mutable std::mutex m_mtx;    // serializes the three public handlers (see THREADING)
     RelaySeenSet m_seen;
     CarrierBloatStats m_stats;
 };
