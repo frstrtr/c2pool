@@ -31,13 +31,20 @@ namespace c2pool::v37n::xmr {
 
 // The Monero network the daemon binds to. Stagenet is the shipped default —
 // a v37 XMR node is prototype-grade and must never default to real value.
-enum class MoneroNetwork : std::uint8_t { Stagenet = 0, Testnet = 1, Mainnet = 2 };
+//
+// Regtest (monerod --regtest) is FAKECHAIN: it runs the MAINNET config (mainnet
+// base58 prefixes, mainnet default ports) on a private chain with
+// --fixed-difficulty and in-daemon generateblocks. It carries no value, so it
+// does NOT trip the --i-understand-mainnet fence — but it must never be confused
+// with Mainnet either (its own settlement store dir, its own label).
+enum class MoneroNetwork : std::uint8_t { Stagenet = 0, Testnet = 1, Mainnet = 2, Regtest = 3 };
 
 inline const char* to_string(MoneroNetwork n) {
     switch (n) {
         case MoneroNetwork::Stagenet: return "stagenet";
         case MoneroNetwork::Testnet:  return "testnet";
         case MoneroNetwork::Mainnet:  return "mainnet";
+        case MoneroNetwork::Regtest:  return "regtest";
     }
     return "stagenet";
 }
@@ -57,6 +64,11 @@ inline c2pool::xmr::node::DaemonEndpoint default_endpoint(MoneroNetwork n) {
         case MoneroNetwork::Stagenet: e.rpc_port = 38081; e.zmq_port = 38083; break;
         case MoneroNetwork::Testnet:  e.rpc_port = 28081; e.zmq_port = 28083; break;
         case MoneroNetwork::Mainnet:  e.rpc_port = 18081; e.zmq_port = 18083; break;
+        // FAKECHAIN uses the mainnet defaults; a private regtest monerod should be
+        // started with explicit --rpc-bind-port / --zmq-pub and the daemon pointed
+        // at them (--rpc-port / --zmq-port) so it can never collide with a mainnet
+        // monerod on the same host.
+        case MoneroNetwork::Regtest:  e.rpc_port = 18081; e.zmq_port = 18083; break;
     }
     return e;
 }
@@ -94,6 +106,41 @@ struct XmrNodeConfig {
     // --- stratum front-end (X5) --------------------------------------------
     std::string     stratum_bind_host = "127.0.0.1";
     std::uint16_t   stratum_bind_port = 3333;   // XMRig default; single-node
+
+    // --- O-2 serve side (stratum listener + live submit) --------------------
+    // The wallet address monerod's get_block_template pays the block reward to
+    // (network-prefixed standard address; regtest = mainnet '4…' format). EMPTY
+    // = the stratum port is NOT served and the daemon runs observe-side only
+    // (index + settlement + F1 driver), exactly as the X9 bring-up did.
+    //
+    // HONEST SCOPE (option A): the block bytes served and submitted are
+    // monerod's own template — a single coinbase to this address — with the
+    // winning nonce patched. That is a genuine, monerod-validated block end to
+    // end, but NOT yet the v37 K_fair settlement coinbase (option B follow-on).
+    std::string     payout_address;
+    // get_block_template reserve_size (tx_extra nonce reservation). 0 = none:
+    // one blob for every worker (max_extra_nonces == 1). Per-client extra_nonce
+    // (>= 4) is a follow-on of the template source.
+    std::uint32_t   template_reserve_size = 0;
+    // Share (lane) difficulty served to miners. 0 = solo: the job target IS the
+    // network target, so every accepted share is a network block. A lower value
+    // (e.g. 1000 on regtest) makes miners report shares between blocks.
+    std::uint64_t   stratum_share_diff = 0;
+    // Main-loop cadence: tip poll fallback, template refresh, found-queue drain.
+    // 5 s suits stagenet; ~1000 ms for a regtest demo.
+    std::uint32_t   poll_ms = 5000;
+    // Pending-FOUND sidecar (pfound.tsv next to settle.img) so a restart inside
+    // the D_conf window does not lose a pending FOUND (D10). --no-found-sidecar.
+    bool            found_sidecar = true;
+    // Optional payee identity (the address boundary's OUTPUT): the raw public
+    // spend + view keys of the payout address, 64 hex each. When both are set,
+    // FOUND/FINALIZE records are amount-honest ({identity_key : reward}); when
+    // absent the block is recorded as a valueless {}/{} record.
+    std::string     payee_spend_key_hex;
+    std::string     payee_view_key_hex;
+    bool            payee_subaddress = false;
+    // Seconds between the main loop's one-line status reports (0 = never).
+    std::uint32_t   status_every_s = 30;
 
     // --- storage ------------------------------------------------------------
     // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).

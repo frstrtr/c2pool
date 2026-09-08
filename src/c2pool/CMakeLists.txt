@@ -840,14 +840,24 @@ target_link_libraries(c2pool-v37-w6-leveldb-compile-check PRIVATE core Threads::
 # vendored ed25519 ge_* + keccak) + the P-1 / ed25519 point-check registrar
 # (v37_descriptor_xmr_point_check_ref10.cpp, guarded by V37_XMR_HAVE_MONERO_
 # CRYPTO — so the descriptor validator is LIVE and the daemon is not fail-closed).
-# NO RandomX / libzmq / async-HTTP is linked here: the live transport is the
-# dependency-free raw-socket RPC client with an RPC-poll ZMQ fallback (heavy
-# RandomX + real libzmq land in a later wave; see xmr/xmr_live_transport.hpp).
-# EXPERIMENTAL — prototype / stagenet only (see the file banner + README).
+# X9 O-2 (serve side): the X5 stratum front-end bodies (impl/xmr/stratum/
+# xmr_stratum.cpp — login/job/submit over the ITemplateSource / IPowVerifier /
+# IShareSink seams) are compiled INTO the daemon; the POSIX listener, the
+# monerod-template source, the live submit and the finalize-connect glue are
+# header-only under v37/xmr/. RandomX: linked ONLY when -DXMR_BUILD_RANDOMX=ON
+# (the non-sanitizer CI leg) — then V37_XMR_O2_WITH_RANDOMX puts the production
+# light verifier (impl/xmr/pow/randomx_verify.hpp) on the live submit path and
+# --randomx enables it. Without it the verifier is compiled out and the daemon
+# stays FAIL-CLOSED: every stratum submit is answered "Couldn't check PoW" and
+# no block is ever promoted/submitted. No libzmq / async-HTTP: the live
+# transport is the dependency-free raw-socket RPC client with an RPC-poll ZMQ
+# fallback (see xmr/xmr_live_transport.hpp).
+# EXPERIMENTAL — prototype / stagenet / regtest only (see the file banner).
 # Built on demand (like c2pool-v37); the non-san CI leg lists it for a compile
 # gate. The V37Engine/OwedLedger consensus stays header-only + untouched.
 add_executable(c2pool-v37-xmr
     v37/main_v37_xmr.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp
     ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
 c2pool_wire_version(c2pool-v37-xmr)
 target_include_directories(c2pool-v37-xmr PRIVATE
@@ -857,6 +867,12 @@ target_include_directories(c2pool-v37-xmr PRIVATE
 target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
 target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_node xmr_coin Threads::Threads)
+if (XMR_BUILD_RANDOMX AND TARGET randomx)
+    target_link_libraries(c2pool-v37-xmr PRIVATE randomx)
+    target_include_directories(c2pool-v37-xmr PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+    target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_O2_WITH_RANDOMX)
+endif()
 # ── Track A2 / Milestone A-BTC: the live BITCOIN-FAMILY single-node daemon ────
 # c2pool-v37-btc: the single-node DASH-regtest/devnet-capable (LTC testnet4
 # alternate) daemon (XbtcNode, src/c2pool/v37/btc/). It wires the MERGED v37

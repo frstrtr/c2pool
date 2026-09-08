@@ -8,25 +8,57 @@
 // ===========================================================================
 // src/c2pool/v37/main_v37_xmr.cpp   (Track A2 / Milestone A — the live daemon)
 //
-// c2pool-v37-xmr — the single-node, stagenet-capable Monero/RandomX (Family-B)
-// v37 daemon entrypoint. It stands up XmrNode (see xmr/xmr_node.hpp) against a
-// live monerod and runs the mine-and-settle path.
+// c2pool-v37-xmr — the single-node, stagenet/regtest-capable Monero/RandomX
+// (Family-B) v37 daemon entrypoint. It stands up XmrNode (see xmr/xmr_node.hpp)
+// against a live monerod and runs the mine-and-settle path.
 //
-// EXPERIMENTAL — PROTOTYPE / STAGENET ONLY. Do NOT run against mainnet value.
-// The default network is stagenet; mainnet requires --i-understand-mainnet and
-// is still fenced at the coinbase (FCMP/CARROT + mainnet acknowledgement).
+// EXPERIMENTAL — PROTOTYPE / STAGENET / REGTEST ONLY. Do NOT run against
+// mainnet value. The default network is stagenet; mainnet requires
+// --i-understand-mainnet and is still fenced at the coinbase (FCMP/CARROT +
+// mainnet acknowledgement).
 //
 // Modes:
 //   --mock-smoke    network-free CI smoke against a monerod STUB
-//                   (MockMonerodTransport); prints S1..S6 and exits.
+//                   (MockMonerodTransport); prints S1..S6 + FC1..FC16 and exits.
 //   (default)       connect to monerod at --rpc-host/--rpc-port (+ --zmq-port),
-//                   bring the node up, and run until SIGINT.
+//                   bring the node up, and run until SIGINT. With
+//                   --payout-address the X9 O-2 SERVE SIDE is up as well:
+//                   the stratum port is bound and miners are served.
+//
+// X9 O-2 — the SERVE side, assembled here in donor order (xmr/ headers):
+//   wire 1  xmr_stratum_listener.hpp   POSIX poll() listener = the X5 server's
+//                                      ITransport; login/job/submit/keepalived
+//                                      in the xmrig dialect; NEW-TEMPLATE PUSH.
+//   wire 2  xmr_o2_randomx_verify.hpp  IPowVerifier over the production light
+//                                      RandomX verifier (librandomx, under
+//                                      V37_XMR_O2_WITH_RANDOMX + --randomx);
+//                                      every submit is RE-HASHED here, and the
+//                                      EXACT 128-bit network rule gates submit.
+//   wire 3  xmr_live_submit.hpp        block blob = monerod template + nonce ->
+//                                      submit_block -> block_id resolved
+//                                      (monerod > local keccak > header).
+//   wire 4  xmr_o2_finalize_connect.hpp  FOUND -> XmrNode::on_network_block_won
+//                                      -> F1 driver; FINALIZE at D_conf burial;
+//                                      pending-FOUND sidecar across restarts.
+//   xmr_o2_template.hpp                monerod get_block_template provider +
+//                                      the ITemplateSource seam.
+// HONEST SCOPE (option A): the block bytes are monerod's own template (single
+// coinbase to --payout-address) with the winning nonce patched — a genuine,
+// monerod-validated block end to end, NOT yet the v37 K_fair settlement
+// coinbase (option B = XmrBlockTemplate + X6 over an implemented
+// xmr_coin_primitives seam; slots in behind the same two seams).
+//
+// THREADING: the listener thread owns sockets, sessions, the X5 server, the
+// RandomX verifier and the submit_block RPC; the main thread owns XmrNode /
+// MonerodAdapter / MainchainIndex / XmrFinalizeDriver / OwedLedger, the
+// template refresh and all stdout. The template snapshot (mutex) and the found
+// queues (mutex) are the only state that crosses.
 //
 // NOTE (single-node): real multi-node p2p carrier relay (src/pool p2p) is a
 // NOTED FOLLOW-ON. This cut runs single-node (its own carriers), enough for the
-// X9 stagenet mine-and-settle demo. RandomX verify + the X6 coinbase crypto are
-// linked only in the CI/stagenet build (V37_XMR_HAVE_MONERO_CRYPTO / RandomX);
-// the light build runs index + settlement + the F1 driver.
+// X9 mine-and-settle demo. The light build (no XMR_BUILD_RANDOMX) still runs
+// index + settlement + the F1 driver and can serve miners, but answers every
+// submit "Couldn't check PoW" and never promotes a block (fail-closed).
 // ===========================================================================
 
 #include <atomic>
@@ -36,6 +68,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -43,8 +77,15 @@
 #include "xmr/xmr_node_config.hpp"
 #include "xmr/xmr_node_smoke.hpp"
 #include "xmr/xmr_live_transport.hpp"
+#include "xmr/xmr_o2_template.hpp"           // O-2: monerod template provider + ITemplateSource
+#include "xmr/xmr_o2_randomx_verify.hpp"     // O-2 wire 2: runtime RandomX IPowVerifier + exact gate
+#include "xmr/xmr_live_submit.hpp"           // O-2 wire 3: block-blob assembly + submit_block
+#include "xmr/xmr_stratum_listener.hpp"      // O-2 wire 1: POSIX stratum listener (ITransport)
+#include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
 
 using namespace c2pool::v37n::xmr;
+namespace strat = ::v37::xmr::stratum;
+namespace sub   = c2pool::v37n::xmr::submit;
 
 static std::atomic<bool> g_stop{false};
 static void on_sigint(int) { g_stop.store(true); }
@@ -52,6 +93,7 @@ static void on_sigint(int) { g_stop.store(true); }
 static MoneroNetwork parse_net(const std::string& s) {
     if (s == "mainnet")  return MoneroNetwork::Mainnet;
     if (s == "testnet")  return MoneroNetwork::Testnet;
+    if (s == "regtest")  return MoneroNetwork::Regtest;
     return MoneroNetwork::Stagenet;
 }
 
@@ -63,6 +105,11 @@ static int run_mock_smoke() {
     std::filesystem::create_directories(tmp);
 
     auto rep = smoke::run(tmp);
+    // O-2 wire 4: the finalize-connect self-check (network-free, RandomX-free)
+    // rides in the same report so `--mock-smoke` gates FOUND -> FINALIZE too.
+    auto fc = o2::finalize_connect_selfcheck(tmp / "fc");
+    for (const auto& c : fc.checks) rep.checks.push_back(c);
+
     std::printf("== c2pool-v37-xmr mock smoke ==\n");
     int fails = 0;
     for (const auto& c : rep.checks) {
@@ -75,6 +122,83 @@ static int run_mock_smoke() {
     std::filesystem::remove_all(tmp);
     return fails ? 1 : 0;
 }
+
+// ---------------------------------------------------------------------------
+// The EXACT network gate in front of the live submitter (listener thread).
+//
+// XmrStratumServer's own "network block" decision (top-64-bit word <= target,
+// xmr_stratum.cpp handle_submit) is a strict SUPERSET of Monero's rule — it can
+// pass a boundary hash monerod would reject. So the bytes the server just
+// hashed are re-checked here with O2RandomXVerifier::verify_network_block
+// (hash * difficulty < 2^256, 128-bit, reusing the memoised hash) and ONLY an
+// Accept reaches LiveSubmitShareSink -> submit_block. Fail-closed: with RandomX
+// compiled out / disabled / not initialised nothing is ever submitted.
+// ---------------------------------------------------------------------------
+class GatedShareSink final : public strat::IShareSink {
+public:
+    GatedShareSink(o2::O2RandomXVerifier& rx, const o2::MonerodTemplateProvider& provider,
+                   strat::ITemplateSource& source, sub::LiveSubmitShareSink& inner)
+        : m_rx(rx), m_provider(provider), m_source(source), m_inner(inner) {}
+
+    void on_accepted_share(const strat::AcceptedShare& s) override { m_inner.on_accepted_share(s); }
+
+    void submit_network_block(std::uint32_t template_id, std::uint32_t nonce,
+                              std::uint32_t extra_nonce) override {
+        m_calls.fetch_add(1, std::memory_order_relaxed);
+        strat::TemplateJob tj;
+        o2::MonerodTemplate t;
+        if (!m_source.rebuild_blob(template_id, extra_nonce, tj) ||
+            !m_provider.by_id(template_id, t) ||
+            tj.nonce_offset + strat::NONCE_SIZE > tj.blob.size()) {
+            m_stale.fetch_add(1, std::memory_order_relaxed);
+            set_last("template " + std::to_string(template_id) + " gone (stale)");
+            return;
+        }
+        for (std::size_t i = 0; i < strat::NONCE_SIZE; ++i)   // == the bytes the server hashed
+            tj.blob[tj.nonce_offset + i] = static_cast<std::uint8_t>(nonce >> (8 * i));
+        if (!m_rx.network_blocks_allowed()) {
+            m_refused.fetch_add(1, std::memory_order_relaxed);
+            set_last(std::string("refused: randomx ") + o2::O2RandomXVerifier::to_string(m_rx.mode()) +
+                     " (fail-closed, no submit)");
+            return;
+        }
+        o2::Hash32 pow{};
+        const o2::NetworkVerdict v = m_rx.verify_network_block(
+            tj.blob.data(), tj.blob.size(), tj.seed_hash,
+            o2::NetworkDifficulty{t.difficulty, t.difficulty_top64}, pow);
+        if (v != o2::NetworkVerdict::Accept) {
+            m_rejected.fetch_add(1, std::memory_order_relaxed);
+            set_last(std::string("exact network gate: ") + o2::to_string(v) + " (no submit)");
+            return;
+        }
+        m_accepted.fetch_add(1, std::memory_order_relaxed);
+        set_last("exact network gate: Accept pow=" + sub::to_hex(pow.data(), pow.size()));
+        m_inner.submit_network_block(template_id, nonce, extra_nonce);
+    }
+
+    std::uint64_t calls()    const { return m_calls.load(std::memory_order_relaxed); }
+    std::uint64_t accepted() const { return m_accepted.load(std::memory_order_relaxed); }
+    std::uint64_t rejected() const { return m_rejected.load(std::memory_order_relaxed); }
+    std::uint64_t refused()  const { return m_refused.load(std::memory_order_relaxed); }
+    std::uint64_t stale()    const { return m_stale.load(std::memory_order_relaxed); }
+    std::string last() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_last;
+    }
+
+private:
+    void set_last(std::string s) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_last = std::move(s);
+    }
+    o2::O2RandomXVerifier&              m_rx;
+    const o2::MonerodTemplateProvider&  m_provider;
+    strat::ITemplateSource&             m_source;
+    sub::LiveSubmitShareSink&           m_inner;
+    std::atomic<std::uint64_t> m_calls{0}, m_accepted{0}, m_rejected{0}, m_refused{0}, m_stale{0};
+    mutable std::mutex m_mtx;
+    std::string        m_last;
+};
 
 static int run_live(const XmrNodeConfig& cfg) {
     std::printf("c2pool-v37-xmr: EXPERIMENTAL prototype — network=%s monerod=%s:%u (zmq %u)\n",
@@ -95,21 +219,263 @@ static int run_live(const XmrNodeConfig& cfg) {
     }
     for (const auto& line : node.construction_log()) std::printf("  %s\n", line.c_str());
 
-    std::signal(SIGINT, on_sigint);
-    std::signal(SIGTERM, on_sigint);
-    std::printf("node up. Ctrl-C to stop. (ZMQ push drives the tip; RPC poll fallback every 5s)\n");
-
-    // Main loop: pump the RPC poll fallback (no-op under real ZMQ) so the
-    // MainchainIndex keeps tracking the tip + seed reach, and re-issue the
-    // adapter's ensure_seed_reach on each tick.
-    while (!g_stop.load()) {
-        transport.pump_poll();
-        node.adapter().ensure_seed_reach();
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+    // ── wire 4: finalize connect (main thread) — BEFORE the listener and BEFORE
+    //    the first pump_poll, so a pending FOUND from the sidecar is re-driven
+    //    into the fresh driver before any Extend can step past its height.
+    o2::FoundBlockQueue found_q;
+    o2::FinalizeConnectOptions fo;
+    if (cfg.found_sidecar) fo.sidecar_path = cfg.resolved_settle_db_path() + "/pfound.tsv";
+    o2::FinalizeConnect fc(node, cfg, found_q, fo);
+    {
+        const auto boot = fc.reseed_after_bring_up();
+        std::printf("finalize-connect: sidecar=%s reseeded=%zu reregistered=%zu stale=%zu "
+                    "UNRECOVERABLE=%zu malformed=%zu (D_conf=%llu)\n",
+                    fo.sidecar_path.empty() ? "disabled" : (boot.sidecar_present ? "present" : "none"),
+                    boot.reseeded, boot.reregistered, boot.stale_dropped, boot.unrecoverable,
+                    boot.malformed, static_cast<unsigned long long>(cfg.d_conf));
     }
 
+    // ── payee identity key (the address boundary's OUTPUT) ───────────────────
+    std::optional<::v37::bytes32> payee_key;
+    if (!cfg.payee_spend_key_hex.empty() || !cfg.payee_view_key_hex.empty()) {
+        o2::PayeeKeys pk;
+        if (!o2::hash_from_hex(cfg.payee_spend_key_hex, pk.spend) ||
+            !o2::hash_from_hex(cfg.payee_view_key_hex, pk.view)) {
+            std::printf("REFUSED: --payee-spend-hex and --payee-view-hex must both be 64 hex chars\n");
+            node.stop();
+            return 2;
+        }
+        pk.subaddress = cfg.payee_subaddress;
+        payee_key = o2::payee_identity_key(pk);
+        if (!payee_key) {
+            std::printf("REFUSED: payee keys do not validate as an XMR payout descriptor "
+                        "(ed25519 point check) — no ledger key\n");
+            node.stop();
+            return 2;
+        }
+        std::printf("payee: identity_key=%s… (amount-honest FOUND/FINALIZE records)\n",
+                    hex_of(*payee_key).substr(0, 16).c_str());
+    } else {
+        std::printf("payee: no --payee-spend-hex/--payee-view-hex -> FOUND records are valueless "
+                    "{}/{} (the ledger still registers the block)\n");
+    }
+
+    // ── wire 2: RandomX runtime verify (init on main, BEFORE the listener) ───
+    o2::O2RandomXVerifier rx;
+    rx.init(o2::RandomXPolicy::from_config(cfg));
+    std::printf("  %s\n", rx.describe().c_str());
+    if (cfg.randomx_enabled && !rx.ready()) {
+        std::printf("REFUSED: --randomx requested but RandomX is %s "
+                    "(build with -DXMR_BUILD_RANDOMX=ON / check memory)\n",
+                    o2::O2RandomXVerifier::to_string(rx.mode()));
+        node.stop();
+        return 3;
+    }
+    if (!rx.ready())
+        std::printf("WARNING: RandomX verify %s — every stratum submit is answered "
+                    "\"Couldn't check PoW\"; network-block promotion is refused (fail-closed)\n",
+                    o2::O2RandomXVerifier::to_string(rx.mode()));
+
+    // ── the template + wire 3 (live submit) + wire 1 (listener) ─────────────
+    const bool serving = !cfg.payout_address.empty();
+    o2::MonerodTemplateProvider provider(transport, cfg.payout_address, cfg.template_reserve_size);
+    o2::MonerodStratumTemplateSource template_source(provider, cfg.stratum_share_diff);
+
+    sub::LiveBlockSubmitter submitter(transport);   // fresh socket per RPC: safe off-thread
+    sub::FoundBlockQueue    submit_q;
+    sub::LiveSubmitShareSink live_sink(
+        submitter, submit_q,
+        [&](std::uint32_t tid, std::uint32_t en, sub::BlockCandidate& out) {
+            o2::MonerodTemplate t;
+            if (!provider.by_id(tid, t)) return false;
+            strat::TemplateJob tj;
+            if (!template_source.rebuild_blob(tid, en, tj)) return false;
+            out.template_id     = tid;
+            out.height          = t.height;
+            out.full_blob       = t.full_blob;
+            out.hashing_blob    = tj.blob;          // the exact blob served for this job
+            out.nonce_offset    = t.nonce_offset;
+            out.major_version   = t.major_version;
+            out.prev_id         = t.prev_id;
+            out.expected_reward = t.expected_reward;
+            out.reserved_offset = 0;                // single template, extra_nonce not baked
+            out.reserved_size   = 0;
+            return true;
+        });
+    submitter.enable_network_submit(rx.network_blocks_allowed());   // fail-closed gate
+    GatedShareSink sink(rx, provider, template_source, live_sink);
+
+    o2::StratumListenerOptions lo;
+    lo.bind_host = cfg.stratum_bind_host;
+    lo.bind_port = cfg.stratum_bind_port;
+    o2::StratumListener listener(template_source, rx, sink, lo);
+    // Seed prefetch on the LISTENER thread, before jobs are pushed (Argon2d
+    // cache init never lands inside a miner's submit; the verifier is only ever
+    // touched from that thread once start() has run).
+    listener.set_template_hook([&](const strat::TemplateJob& peek) { rx.on_template(peek); });
+
+    std::uint32_t last_tid = 0;
+    if (serving) {
+        if (std::string e = listener.bind(); !e.empty()) {
+            std::printf("%s\n", e.c_str());
+            node.stop();
+            return 1;
+        }
+        // First template BEFORE start(): the dirty flag is latched and consumed
+        // on the loop's first pass, so the first logins are served immediately.
+        if (provider.refresh()) {
+            last_tid = provider.template_id();
+            listener.notify_new_template();
+            const o2::MonerodTemplate t = provider.current();
+            std::printf("template: id=%u height=%llu difficulty=%llu%s reward=%llu piconero "
+                        "major=%u nonce_offset=%zu hashing=%zuB full=%zuB%s%s\n",
+                        t.template_id, static_cast<unsigned long long>(t.height),
+                        static_cast<unsigned long long>(t.difficulty),
+                        t.difficulty_top64 ? " (+top64)" : "",
+                        static_cast<unsigned long long>(t.expected_reward),
+                        static_cast<unsigned>(t.major_version), t.nonce_offset,
+                        t.hashing_blob.size(), t.full_blob.size(),
+                        provider.offset_note().empty() ? "" : " ",
+                        provider.offset_note().c_str());
+        } else {
+            std::printf("template: first get_block_template FAILED: %s (miners are parked until "
+                        "it succeeds; is --payout-address a %s-format standard address?)\n",
+                        provider.last_error().c_str(), to_string(cfg.network));
+        }
+        listener.start();
+        std::printf("stratum: listening on %s:%u (share diff %s, network submit %s)\n",
+                    cfg.stratum_bind_host.c_str(), listener.bound_port(),
+                    cfg.stratum_share_diff ? std::to_string(cfg.stratum_share_diff).c_str() : "network",
+                    submitter.network_submit_enabled() ? "ENABLED" : "DISABLED (fail-closed)");
+    } else {
+        std::printf("stratum: NOT served (no --payout-address) — observe-side only\n");
+    }
+
+    std::signal(SIGINT, on_sigint);
+    std::signal(SIGTERM, on_sigint);
+    const std::uint32_t poll_ms = cfg.poll_ms ? cfg.poll_ms : 5000;
+    std::printf("node up. Ctrl-C to stop. (ZMQ push drives the tip; RPC poll fallback every %u ms)\n",
+                poll_ms);
+
+    // listener thread -> main thread: the accepted-block events (wire 3 -> wire 4).
+    auto bridge_found = [&]() {
+        sub::FoundBlockEvent s;
+        while (submit_q.pop(s)) {
+            std::printf("  [submit] %s\n", sub::describe(s).c_str());
+            o2::FoundBlockEvent e;
+            e.height          = s.height;
+            e.block_id_hex    = hex_of(s.block_id);   // monerod's own block hash (or its cross-checked equal)
+            e.prev_id_hex     = hex_of(s.prev_id);
+            e.reward_piconero = s.reward;
+            e.payee           = payee_key;
+            e.template_id     = s.template_id;
+            e.nonce           = s.nonce;
+            e.extra_nonce     = s.extra_nonce;
+            e.worker          = s.worker;
+            e.address         = s.address;
+            found_q.push(std::move(e));
+        }
+    };
+    auto drain_stratum_log = [&]() {
+        for (const auto& l : listener.drain_log()) std::printf("  [stratum] %s\n", l.c_str());
+    };
+    auto status = [&]() {
+        const auto ls = listener.stats();
+        const auto fs = fc.stats();
+        const o2::MonerodTemplate t = provider.current();
+        std::printf("status: hw=%llu cursor=%llu tip=%llu | template id=%u h=%llu diff=%llu "
+                    "refresh=%llu fail=%llu changes=%llu | stratum conn=%llu active=%llu logins=%llu "
+                    "submits=%llu shares=%llu net=%llu rejected=%llu pushes=%llu malformed=%llu | "
+                    "gate calls=%llu accept=%llu reject=%llu refused=%llu stale=%llu | "
+                    "submit calls=%zu ok=%zu rejected=%zu refused=%zu transport_err=%zu "
+                    "id_mismatch=%zu unattributable=%zu | found registered=%llu settled=%llu "
+                    "orphaned=%llu refused=%llu pending=%zu\n",
+                    static_cast<unsigned long long>(node.hw().hw_height),
+                    static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
+                    static_cast<unsigned long long>(node.adapter().index().best_height()),
+                    t.template_id, static_cast<unsigned long long>(t.height),
+                    static_cast<unsigned long long>(t.difficulty),
+                    static_cast<unsigned long long>(provider.refreshes()),
+                    static_cast<unsigned long long>(provider.failures()),
+                    static_cast<unsigned long long>(provider.changes()),
+                    static_cast<unsigned long long>(ls.connections),
+                    static_cast<unsigned long long>(ls.active),
+                    static_cast<unsigned long long>(ls.logins),
+                    static_cast<unsigned long long>(ls.submits),
+                    static_cast<unsigned long long>(ls.accepted_shares),
+                    static_cast<unsigned long long>(ls.network_blocks),
+                    static_cast<unsigned long long>(ls.rejected_submits),
+                    static_cast<unsigned long long>(ls.job_pushes),
+                    static_cast<unsigned long long>(ls.malformed),
+                    static_cast<unsigned long long>(sink.calls()),
+                    static_cast<unsigned long long>(sink.accepted()),
+                    static_cast<unsigned long long>(sink.rejected()),
+                    static_cast<unsigned long long>(sink.refused()),
+                    static_cast<unsigned long long>(sink.stale()),
+                    submitter.calls(), submitter.ok(), submitter.rejected(), submitter.refused(),
+                    submitter.transport_errors(), submitter.id_mismatches(), submitter.unattributable(),
+                    static_cast<unsigned long long>(fs.registered),
+                    static_cast<unsigned long long>(fs.settled),
+                    static_cast<unsigned long long>(fs.orphaned),
+                    static_cast<unsigned long long>(fs.refused),
+                    fc.pending().size());
+        std::printf("  %s\n", rx.describe().c_str());
+        const std::string g = sink.last();
+        if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
+        const std::string se = submitter.last_error();
+        if (!se.empty()) std::printf("  submit: last_error=%s\n", se.c_str());
+        std::fflush(stdout);
+    };
+
+    // Main loop (donor order per tick): drain wins -> register FOUND (durable)
+    // BEFORE the tip can advance past them; then pump the tip; then refresh the
+    // template and push it to miners ONLY when it changed.
+    auto last_status = std::chrono::steady_clock::now();
+    std::string last_template_err;
+    while (!g_stop.load()) {
+        bridge_found();
+        fc.tick();
+        transport.pump_poll();
+        node.adapter().ensure_seed_reach();
+        if (serving) {
+            if (provider.refresh()) {
+                const std::uint32_t tid = provider.template_id();
+                if (tid != last_tid) {
+                    last_tid = tid;
+                    listener.notify_new_template();   // -> listener: peek, seed prefetch, parked logins, broadcast_job
+                    const o2::MonerodTemplate t = provider.current();
+                    std::printf("template: id=%u height=%llu difficulty=%llu prev=%s… -> pushed to miners\n",
+                                t.template_id, static_cast<unsigned long long>(t.height),
+                                static_cast<unsigned long long>(t.difficulty),
+                                hex_of(t.prev_id).substr(0, 12).c_str());
+                }
+            } else {
+                const std::string e = provider.last_error();
+                if (e != last_template_err) {
+                    std::printf("template: refresh failed: %s\n", e.c_str());
+                    last_template_err = e;
+                }
+            }
+        }
+        drain_stratum_log();
+        if (cfg.status_every_s &&
+            std::chrono::steady_clock::now() - last_status >= std::chrono::seconds(cfg.status_every_s)) {
+            status();
+            last_status = std::chrono::steady_clock::now();
+        }
+        std::fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+    }
+
+    // Teardown in donor order: network first (join the listener, so no submit is
+    // in flight), register any last-second win, THEN the node.
     std::printf("\nstopping…\n");
+    listener.stop();
+    drain_stratum_log();
+    bridge_found();
+    fc.drain_before_stop();
     node.stop();
+    status();
     std::printf("stopped. hw_height=%llu\n",
                 static_cast<unsigned long long>(node.hw().hw_height));
     return 0;
@@ -133,22 +499,44 @@ int main(int argc, char** argv) {
                      static_cast<std::uint16_t>(std::stoi(next("38083")));
         else if (a == "--stratum-port") cfg.stratum_bind_port =
                      static_cast<std::uint16_t>(std::stoi(next("3333")));
+        else if (a == "--stratum-bind-host") cfg.stratum_bind_host = next("127.0.0.1");
+        else if (a == "--payout-address") cfg.payout_address = next("");
+        else if (a == "--share-diff") cfg.stratum_share_diff = std::stoull(next("0"));
+        else if (a == "--template-reserve") cfg.template_reserve_size =
+                     static_cast<std::uint32_t>(std::stoul(next("0")));
+        else if (a == "--poll-ms") cfg.poll_ms = static_cast<std::uint32_t>(std::stoul(next("5000")));
+        else if (a == "--status-every") cfg.status_every_s =
+                     static_cast<std::uint32_t>(std::stoul(next("30")));
+        else if (a == "--no-found-sidecar") cfg.found_sidecar = false;
+        else if (a == "--payee-spend-hex") cfg.payee_spend_key_hex = next("");
+        else if (a == "--payee-view-hex")  cfg.payee_view_key_hex = next("");
+        else if (a == "--payee-subaddress") cfg.payee_subaddress = true;
         else if (a == "--lane-chain") cfg.lane_chain =
                      static_cast<::v37::ChainId>(std::stoul(next("0")));
         else if (a == "--d-conf") cfg.d_conf = std::stoull(next("60"));
         else if (a == "--data-dir") cfg.settle_db_path = next("");
         else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
         else if (a == "--randomx") cfg.randomx_enabled = true;
+        else if (a == "--randomx-large-pages") cfg.randomx_large_pages = true;
         else if (a == "--help" || a == "-h") {
             std::printf(
                 "c2pool-v37-xmr (EXPERIMENTAL prototype; stagenet default)\n"
                 "  --mock-smoke                 network-free CI smoke (monerod stub), then exit\n"
-                "  --network <stagenet|testnet|mainnet>   default stagenet\n"
+                "  --network <stagenet|testnet|mainnet|regtest>   default stagenet\n"
                 "  --rpc-host <h>  --rpc-port <p>  --zmq-port <p>\n"
-                "  --stratum-port <p>  --lane-chain <id>  --d-conf <n>\n"
+                "  --lane-chain <id>  --d-conf <n>  --poll-ms <ms>  --status-every <s>\n"
                 "  --data-dir <path>            override the settlement store dir\n"
+                "  --no-found-sidecar           do not persist pending FOUNDs across restarts\n"
                 "  --i-understand-mainnet       required to settle a mainnet block\n"
-                "  --randomx                    enable heavy RandomX verify (CI/stagenet)\n");
+                "  --randomx                    enable heavy RandomX verify (needs XMR_BUILD_RANDOMX)\n"
+                "  --randomx-large-pages        RandomX cache in huge pages\n"
+                " serve side (X9 O-2; the stratum port is served only with a payout address):\n"
+                "  --payout-address <addr>      get_block_template wallet address (network-prefixed)\n"
+                "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
+                "  --share-diff <n>             share (lane) difficulty; 0 = network (solo)\n"
+                "  --template-reserve <n>       get_block_template reserve_size (default 0)\n"
+                "  --payee-spend-hex <64hex> --payee-view-hex <64hex> [--payee-subaddress]\n"
+                "                               payout address keys -> amount-honest FOUND records\n");
             return 0;
         }
     }
