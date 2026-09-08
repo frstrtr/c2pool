@@ -77,11 +77,13 @@
 #include "xmr/xmr_node_config.hpp"
 #include "xmr/xmr_node_smoke.hpp"
 #include "xmr/xmr_live_transport.hpp"
-#include "xmr/xmr_o2_template.hpp"           // O-2: monerod template provider + ITemplateSource
+#include "xmr/xmr_o2_template.hpp"           // O-2: monerod template provider + ITemplateSource (option A)
 #include "xmr/xmr_o2_randomx_verify.hpp"     // O-2 wire 2: runtime RandomX IPowVerifier + exact gate
 #include "xmr/xmr_live_submit.hpp"           // O-2 wire 3: block-blob assembly + submit_block
 #include "xmr/xmr_stratum_listener.hpp"      // O-2 wire 1: POSIX stratum listener (ITransport)
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
+#include "xmr/xmr_o2_settlement_fixture.hpp"  // O-2 option B: XmrSettlementConfig + XmrOwedFixture (proof ledger)
+#include "xmr/xmr_o2_settlement_provider.hpp" // O-2 option B: v37 K_fair settlement template provider + source
 
 using namespace c2pool::v37n::xmr;
 namespace strat = ::v37::xmr::stratum;
@@ -134,10 +136,16 @@ static int run_mock_smoke() {
 // Accept reaches LiveSubmitShareSink -> submit_block. Fail-closed: with RandomX
 // compiled out / disabled / not initialised nothing is ever submitted.
 // ---------------------------------------------------------------------------
-class GatedShareSink final : public strat::IShareSink {
+// Templated on the template PROVIDER + its SNAPSHOT type so BOTH the option-A
+// monerod provider (MonerodTemplateProvider / MonerodTemplate) and the option-B
+// v37 settlement provider (XmrSettlementTemplateProvider / SettlementSnapshot)
+// drive the identical exact 128-bit gate. Snapshot needs only .difficulty and
+// .difficulty_top64; Provider needs by_id(id, Snapshot&).
+template <class Provider, class Snapshot>
+class GatedShareSinkT final : public strat::IShareSink {
 public:
-    GatedShareSink(o2::O2RandomXVerifier& rx, const o2::MonerodTemplateProvider& provider,
-                   strat::ITemplateSource& source, sub::LiveSubmitShareSink& inner)
+    GatedShareSinkT(o2::O2RandomXVerifier& rx, const Provider& provider,
+                    strat::ITemplateSource& source, sub::LiveSubmitShareSink& inner)
         : m_rx(rx), m_provider(provider), m_source(source), m_inner(inner) {}
 
     void on_accepted_share(const strat::AcceptedShare& s) override { m_inner.on_accepted_share(s); }
@@ -146,7 +154,7 @@ public:
                               std::uint32_t extra_nonce) override {
         m_calls.fetch_add(1, std::memory_order_relaxed);
         strat::TemplateJob tj;
-        o2::MonerodTemplate t;
+        Snapshot t;
         if (!m_source.rebuild_blob(template_id, extra_nonce, tj) ||
             !m_provider.by_id(template_id, t) ||
             tj.nonce_offset + strat::NONCE_SIZE > tj.blob.size()) {
@@ -192,13 +200,222 @@ private:
         m_last = std::move(s);
     }
     o2::O2RandomXVerifier&              m_rx;
-    const o2::MonerodTemplateProvider&  m_provider;
+    const Provider&                     m_provider;
     strat::ITemplateSource&             m_source;
     sub::LiveSubmitShareSink&           m_inner;
     std::atomic<std::uint64_t> m_calls{0}, m_accepted{0}, m_rejected{0}, m_refused{0}, m_stale{0};
     mutable std::mutex m_mtx;
     std::string        m_last;
 };
+
+// The reward a snapshot's coinbase pays, and a one-line kind-specific tail for
+// the template log. Overloaded so serve_and_run() stays provider-agnostic.
+static inline std::uint64_t snap_reward(const o2::MonerodTemplate& t)    { return t.expected_reward; }
+static inline std::uint64_t snap_reward(const o2::SettlementSnapshot& t) { return t.reward; }
+static inline std::string   snap_extra(const o2::MonerodTemplate& t) {
+    return "hashing=" + std::to_string(t.hashing_blob.size()) + "B full=" + std::to_string(t.full_blob.size()) + "B";
+}
+static inline std::string   snap_extra(const o2::SettlementSnapshot& t) {
+    return "outputs=" + std::to_string(t.n_outputs) + " n_tx=" + std::to_string(t.n_tx) +
+           " (v37 K_fair settlement coinbase)";
+}
+
+// ---------------------------------------------------------------------------
+// serve_and_run — the serve side + main loop + teardown, generic over the
+// template PROVIDER / SNAPSHOT / SOURCE so option A (monerod template) and
+// option B (v37 settlement coinbase) share ONE body. Provider must expose
+// refresh()/template_id()/current()->Snapshot/by_id(id,Snapshot&)/last_error()/
+// offset_note()/refreshes()/failures()/changes(); Snapshot must expose
+// template_id/height/difficulty/difficulty_top64/major_version/nonce_offset/
+// prev_id (+ the reward/extra via snap_reward()/snap_extra()); Source is a
+// strat::ITemplateSource. `candidate_lookup` maps (template_id, extra_nonce) to
+// a submit::BlockCandidate for the live submitter (mode-specific).
+// ---------------------------------------------------------------------------
+template <class Provider, class Source>
+static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transport,
+                         XmrNode& node, o2::FinalizeConnect& fc, o2::FoundBlockQueue& found_q,
+                         const std::optional<::v37::bytes32>& payee_key, o2::O2RandomXVerifier& rx,
+                         bool serving, const char* not_served_reason,
+                         Provider& provider, Source& template_source,
+                         sub::LiveSubmitShareSink::CandidateLookup candidate_lookup) {
+    using Snapshot = std::decay_t<decltype(provider.current())>;
+
+    sub::LiveBlockSubmitter submitter(transport);   // fresh socket per RPC: safe off-thread
+    sub::FoundBlockQueue    submit_q;
+    sub::LiveSubmitShareSink live_sink(submitter, submit_q, std::move(candidate_lookup));
+    submitter.enable_network_submit(rx.network_blocks_allowed());   // fail-closed gate
+    GatedShareSinkT<Provider, Snapshot> sink(rx, provider, template_source, live_sink);
+
+    o2::StratumListenerOptions lo;
+    lo.bind_host = cfg.stratum_bind_host;
+    lo.bind_port = cfg.stratum_bind_port;
+    o2::StratumListener listener(template_source, rx, sink, lo);
+    // Seed prefetch on the LISTENER thread, before jobs are pushed (Argon2d
+    // cache init never lands inside a miner's submit).
+    listener.set_template_hook([&](const strat::TemplateJob& peek) { rx.on_template(peek); });
+
+    std::uint32_t last_tid = 0;
+    if (serving) {
+        if (std::string e = listener.bind(); !e.empty()) {
+            std::printf("%s\n", e.c_str());
+            node.stop();
+            return 1;
+        }
+        // First template BEFORE start(): the dirty flag is latched and consumed
+        // on the loop's first pass, so the first logins are served immediately.
+        if (provider.refresh()) {
+            last_tid = provider.template_id();
+            listener.notify_new_template();
+            const Snapshot t = provider.current();
+            std::printf("template: id=%u height=%llu difficulty=%llu%s reward=%llu piconero "
+                        "major=%u nonce_offset=%zu %s%s%s\n",
+                        t.template_id, static_cast<unsigned long long>(t.height),
+                        static_cast<unsigned long long>(t.difficulty),
+                        t.difficulty_top64 ? " (+top64)" : "",
+                        static_cast<unsigned long long>(snap_reward(t)),
+                        static_cast<unsigned>(t.major_version), t.nonce_offset,
+                        snap_extra(t).c_str(),
+                        provider.offset_note().empty() ? "" : " ",
+                        provider.offset_note().c_str());
+        } else {
+            std::printf("template: first build FAILED: %s (miners are parked until it "
+                        "succeeds; %s coinbase)\n",
+                        provider.last_error().c_str(), to_string(cfg.coinbase));
+        }
+        listener.start();
+        std::printf("stratum: listening on %s:%u (%s coinbase, share diff %s, network submit %s)\n",
+                    cfg.stratum_bind_host.c_str(), listener.bound_port(), to_string(cfg.coinbase),
+                    cfg.stratum_share_diff ? std::to_string(cfg.stratum_share_diff).c_str() : "network",
+                    submitter.network_submit_enabled() ? "ENABLED" : "DISABLED (fail-closed)");
+    } else {
+        std::printf("stratum: NOT served (%s) — observe-side only\n", not_served_reason);
+    }
+
+    std::signal(SIGINT, on_sigint);
+    std::signal(SIGTERM, on_sigint);
+    const std::uint32_t poll_ms = cfg.poll_ms ? cfg.poll_ms : 5000;
+    std::printf("node up. Ctrl-C to stop. (ZMQ push drives the tip; RPC poll fallback every %u ms)\n",
+                poll_ms);
+
+    auto bridge_found = [&]() {
+        sub::FoundBlockEvent s;
+        while (submit_q.pop(s)) {
+            std::printf("  [submit] %s\n", sub::describe(s).c_str());
+            o2::FoundBlockEvent e;
+            e.height          = s.height;
+            e.block_id_hex    = hex_of(s.block_id);
+            e.prev_id_hex     = hex_of(s.prev_id);
+            e.reward_piconero = s.reward;
+            e.payee           = payee_key;
+            e.template_id     = s.template_id;
+            e.nonce           = s.nonce;
+            e.extra_nonce     = s.extra_nonce;
+            e.worker          = s.worker;
+            e.address         = s.address;
+            found_q.push(std::move(e));
+        }
+    };
+    auto drain_stratum_log = [&]() {
+        for (const auto& l : listener.drain_log()) std::printf("  [stratum] %s\n", l.c_str());
+    };
+    auto status = [&]() {
+        const auto ls = listener.stats();
+        const auto fs = fc.stats();
+        const Snapshot t = provider.current();
+        std::printf("status: hw=%llu cursor=%llu tip=%llu | template id=%u h=%llu diff=%llu "
+                    "refresh=%llu fail=%llu changes=%llu | stratum conn=%llu active=%llu logins=%llu "
+                    "submits=%llu shares=%llu net=%llu rejected=%llu pushes=%llu malformed=%llu | "
+                    "gate calls=%llu accept=%llu reject=%llu refused=%llu stale=%llu | "
+                    "submit calls=%zu ok=%zu rejected=%zu refused=%zu transport_err=%zu "
+                    "id_mismatch=%zu unattributable=%zu | found registered=%llu settled=%llu "
+                    "orphaned=%llu refused=%llu pending=%zu\n",
+                    static_cast<unsigned long long>(node.hw().hw_height),
+                    static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
+                    static_cast<unsigned long long>(node.adapter().index().best_height()),
+                    t.template_id, static_cast<unsigned long long>(t.height),
+                    static_cast<unsigned long long>(t.difficulty),
+                    static_cast<unsigned long long>(provider.refreshes()),
+                    static_cast<unsigned long long>(provider.failures()),
+                    static_cast<unsigned long long>(provider.changes()),
+                    static_cast<unsigned long long>(ls.connections),
+                    static_cast<unsigned long long>(ls.active),
+                    static_cast<unsigned long long>(ls.logins),
+                    static_cast<unsigned long long>(ls.submits),
+                    static_cast<unsigned long long>(ls.accepted_shares),
+                    static_cast<unsigned long long>(ls.network_blocks),
+                    static_cast<unsigned long long>(ls.rejected_submits),
+                    static_cast<unsigned long long>(ls.job_pushes),
+                    static_cast<unsigned long long>(ls.malformed),
+                    static_cast<unsigned long long>(sink.calls()),
+                    static_cast<unsigned long long>(sink.accepted()),
+                    static_cast<unsigned long long>(sink.rejected()),
+                    static_cast<unsigned long long>(sink.refused()),
+                    static_cast<unsigned long long>(sink.stale()),
+                    submitter.calls(), submitter.ok(), submitter.rejected(), submitter.refused(),
+                    submitter.transport_errors(), submitter.id_mismatches(), submitter.unattributable(),
+                    static_cast<unsigned long long>(fs.registered),
+                    static_cast<unsigned long long>(fs.settled),
+                    static_cast<unsigned long long>(fs.orphaned),
+                    static_cast<unsigned long long>(fs.refused),
+                    fc.pending().size());
+        std::printf("  %s\n", rx.describe().c_str());
+        const std::string g = sink.last();
+        if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
+        const std::string se = submitter.last_error();
+        if (!se.empty()) std::printf("  submit: last_error=%s\n", se.c_str());
+        std::fflush(stdout);
+    };
+
+    auto last_status = std::chrono::steady_clock::now();
+    std::string last_template_err;
+    while (!g_stop.load()) {
+        bridge_found();
+        fc.tick();
+        transport.pump_poll();
+        node.adapter().ensure_seed_reach();
+        if (serving) {
+            if (provider.refresh()) {
+                const std::uint32_t tid = provider.template_id();
+                if (tid != last_tid) {
+                    last_tid = tid;
+                    listener.notify_new_template();
+                    const Snapshot t = provider.current();
+                    std::printf("template: id=%u height=%llu difficulty=%llu prev=%s… reward=%llu -> "
+                                "pushed to miners\n",
+                                t.template_id, static_cast<unsigned long long>(t.height),
+                                static_cast<unsigned long long>(t.difficulty),
+                                hex_of(t.prev_id).substr(0, 12).c_str(),
+                                static_cast<unsigned long long>(snap_reward(t)));
+                }
+            } else {
+                const std::string e = provider.last_error();
+                if (e != last_template_err) {
+                    std::printf("template: refresh failed: %s\n", e.c_str());
+                    last_template_err = e;
+                }
+            }
+        }
+        drain_stratum_log();
+        if (cfg.status_every_s &&
+            std::chrono::steady_clock::now() - last_status >= std::chrono::seconds(cfg.status_every_s)) {
+            status();
+            last_status = std::chrono::steady_clock::now();
+        }
+        std::fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+    }
+
+    std::printf("\nstopping…\n");
+    listener.stop();
+    drain_stratum_log();
+    bridge_found();
+    fc.drain_before_stop();
+    node.stop();
+    status();
+    std::printf("stopped. hw_height=%llu\n",
+                static_cast<unsigned long long>(node.hw().hw_height));
+    return 0;
+}
 
 static int run_live(const XmrNodeConfig& cfg) {
     std::printf("c2pool-v37-xmr: EXPERIMENTAL prototype — network=%s monerod=%s:%u (zmq %u)\n",
@@ -277,208 +494,83 @@ static int run_live(const XmrNodeConfig& cfg) {
                     o2::O2RandomXVerifier::to_string(rx.mode()));
 
     // ── the template + wire 3 (live submit) + wire 1 (listener) ─────────────
+    // Branch on the coinbase mode. Option A (monerod template) is byte-identical
+    // to PR #1534; option B (v37 settlement coinbase) drives the SAME listener /
+    // RandomX gate / live submitter / finalize-connect through serve_and_run.
+    if (cfg.coinbase == CoinbaseMode::V37Settlement) {
+        // fail-closed: v37 mode serves only with a torsion-valid residual sink.
+        const bool serving =
+            !cfg.residual_sink_spend_hex.empty() && !cfg.residual_sink_view_hex.empty();
+
+        o2::XmrSettlementConfig scfg;
+        scfg.chain_id   = cfg.lane_chain;
+        scfg.h_min      = cfg.settle_h_min;
+        scfg.output_cap = cfg.settle_output_cap;
+        std::array<std::uint8_t, 32> sink_B{}, sink_A{};
+        if (serving) {
+            if (!o2::hex32(cfg.residual_sink_spend_hex, sink_B) ||
+                !o2::hex32(cfg.residual_sink_view_hex, sink_A) ||
+                !scfg.set_residual_sink_hex(cfg.residual_sink_spend_hex, cfg.residual_sink_view_hex,
+                                            cfg.residual_sink_subaddress)) {
+                std::printf("REFUSED: --residual-sink-spend-hex/--residual-sink-view-hex must both be "
+                            "64 hex chars (the XMR wallet the exact-sum residual is paid to)\n");
+                node.stop();
+                return 2;
+            }
+        }
+
+        // The proof ledger (no live S-1 emission yet). Empty => the whole reward
+        // flows to the residual sink (one v37 output). --owed-demo-amount seeds a
+        // distinct K_fair OWED payee (the sink material with spend/view swapped —
+        // still two valid ed25519 points, a different identity) so the assembled
+        // coinbase carries an OWED output alongside the sink (multi-output proof).
+        o2::XmrOwedFixture ledger(cfg.lane_chain);
+        if (serving && cfg.owed_demo_amount) {
+            ledger.seed_owed_std(sink_A, sink_B, cfg.owed_demo_amount);
+            std::printf("owed-demo: seeded %llu piconero owed to a distinct K_fair payee "
+                        "(coinbase will carry OWED + residual sink)\n",
+                        static_cast<unsigned long long>(cfg.owed_demo_amount));
+        }
+
+        o2::XmrSettlementTemplateProvider provider(transport, ledger, scfg, cfg.stratum_share_diff);
+        o2::SettlementStratumTemplateSource template_source(provider);
+        std::printf("coinbase: %s (lane_chain=%u, residual sink %s)\n",
+                    to_string(cfg.coinbase), static_cast<unsigned>(cfg.lane_chain),
+                    serving ? "SET (torsion-checked at build)" : "UNSET (observe-side only)");
+
+        auto candidate = [&provider](std::uint32_t tid, std::uint32_t en, sub::BlockCandidate& out) {
+            std::string w;
+            return provider.candidate_by_id(tid, en, out, &w);
+        };
+        return serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
+                             "no --residual-sink-spend-hex/--residual-sink-view-hex",
+                             provider, template_source, candidate);
+    }
+
+    // ── option A (default): monerod's own get_block_template ────────────────
     const bool serving = !cfg.payout_address.empty();
     o2::MonerodTemplateProvider provider(transport, cfg.payout_address, cfg.template_reserve_size);
     o2::MonerodStratumTemplateSource template_source(provider, cfg.stratum_share_diff);
-
-    sub::LiveBlockSubmitter submitter(transport);   // fresh socket per RPC: safe off-thread
-    sub::FoundBlockQueue    submit_q;
-    sub::LiveSubmitShareSink live_sink(
-        submitter, submit_q,
-        [&](std::uint32_t tid, std::uint32_t en, sub::BlockCandidate& out) {
-            o2::MonerodTemplate t;
-            if (!provider.by_id(tid, t)) return false;
-            strat::TemplateJob tj;
-            if (!template_source.rebuild_blob(tid, en, tj)) return false;
-            out.template_id     = tid;
-            out.height          = t.height;
-            out.full_blob       = t.full_blob;
-            out.hashing_blob    = tj.blob;          // the exact blob served for this job
-            out.nonce_offset    = t.nonce_offset;
-            out.major_version   = t.major_version;
-            out.prev_id         = t.prev_id;
-            out.expected_reward = t.expected_reward;
-            out.reserved_offset = 0;                // single template, extra_nonce not baked
-            out.reserved_size   = 0;
-            return true;
-        });
-    submitter.enable_network_submit(rx.network_blocks_allowed());   // fail-closed gate
-    GatedShareSink sink(rx, provider, template_source, live_sink);
-
-    o2::StratumListenerOptions lo;
-    lo.bind_host = cfg.stratum_bind_host;
-    lo.bind_port = cfg.stratum_bind_port;
-    o2::StratumListener listener(template_source, rx, sink, lo);
-    // Seed prefetch on the LISTENER thread, before jobs are pushed (Argon2d
-    // cache init never lands inside a miner's submit; the verifier is only ever
-    // touched from that thread once start() has run).
-    listener.set_template_hook([&](const strat::TemplateJob& peek) { rx.on_template(peek); });
-
-    std::uint32_t last_tid = 0;
-    if (serving) {
-        if (std::string e = listener.bind(); !e.empty()) {
-            std::printf("%s\n", e.c_str());
-            node.stop();
-            return 1;
-        }
-        // First template BEFORE start(): the dirty flag is latched and consumed
-        // on the loop's first pass, so the first logins are served immediately.
-        if (provider.refresh()) {
-            last_tid = provider.template_id();
-            listener.notify_new_template();
-            const o2::MonerodTemplate t = provider.current();
-            std::printf("template: id=%u height=%llu difficulty=%llu%s reward=%llu piconero "
-                        "major=%u nonce_offset=%zu hashing=%zuB full=%zuB%s%s\n",
-                        t.template_id, static_cast<unsigned long long>(t.height),
-                        static_cast<unsigned long long>(t.difficulty),
-                        t.difficulty_top64 ? " (+top64)" : "",
-                        static_cast<unsigned long long>(t.expected_reward),
-                        static_cast<unsigned>(t.major_version), t.nonce_offset,
-                        t.hashing_blob.size(), t.full_blob.size(),
-                        provider.offset_note().empty() ? "" : " ",
-                        provider.offset_note().c_str());
-        } else {
-            std::printf("template: first get_block_template FAILED: %s (miners are parked until "
-                        "it succeeds; is --payout-address a %s-format standard address?)\n",
-                        provider.last_error().c_str(), to_string(cfg.network));
-        }
-        listener.start();
-        std::printf("stratum: listening on %s:%u (share diff %s, network submit %s)\n",
-                    cfg.stratum_bind_host.c_str(), listener.bound_port(),
-                    cfg.stratum_share_diff ? std::to_string(cfg.stratum_share_diff).c_str() : "network",
-                    submitter.network_submit_enabled() ? "ENABLED" : "DISABLED (fail-closed)");
-    } else {
-        std::printf("stratum: NOT served (no --payout-address) — observe-side only\n");
-    }
-
-    std::signal(SIGINT, on_sigint);
-    std::signal(SIGTERM, on_sigint);
-    const std::uint32_t poll_ms = cfg.poll_ms ? cfg.poll_ms : 5000;
-    std::printf("node up. Ctrl-C to stop. (ZMQ push drives the tip; RPC poll fallback every %u ms)\n",
-                poll_ms);
-
-    // listener thread -> main thread: the accepted-block events (wire 3 -> wire 4).
-    auto bridge_found = [&]() {
-        sub::FoundBlockEvent s;
-        while (submit_q.pop(s)) {
-            std::printf("  [submit] %s\n", sub::describe(s).c_str());
-            o2::FoundBlockEvent e;
-            e.height          = s.height;
-            e.block_id_hex    = hex_of(s.block_id);   // monerod's own block hash (or its cross-checked equal)
-            e.prev_id_hex     = hex_of(s.prev_id);
-            e.reward_piconero = s.reward;
-            e.payee           = payee_key;
-            e.template_id     = s.template_id;
-            e.nonce           = s.nonce;
-            e.extra_nonce     = s.extra_nonce;
-            e.worker          = s.worker;
-            e.address         = s.address;
-            found_q.push(std::move(e));
-        }
+    auto candidate = [&provider, &template_source](std::uint32_t tid, std::uint32_t en,
+                                                   sub::BlockCandidate& out) {
+        o2::MonerodTemplate t;
+        if (!provider.by_id(tid, t)) return false;
+        strat::TemplateJob tj;
+        if (!template_source.rebuild_blob(tid, en, tj)) return false;
+        out.template_id     = tid;
+        out.height          = t.height;
+        out.full_blob       = t.full_blob;
+        out.hashing_blob    = tj.blob;          // the exact blob served for this job
+        out.nonce_offset    = t.nonce_offset;
+        out.major_version   = t.major_version;
+        out.prev_id         = t.prev_id;
+        out.expected_reward = t.expected_reward;
+        out.reserved_offset = 0;                // single template, extra_nonce not baked
+        out.reserved_size   = 0;
+        return true;
     };
-    auto drain_stratum_log = [&]() {
-        for (const auto& l : listener.drain_log()) std::printf("  [stratum] %s\n", l.c_str());
-    };
-    auto status = [&]() {
-        const auto ls = listener.stats();
-        const auto fs = fc.stats();
-        const o2::MonerodTemplate t = provider.current();
-        std::printf("status: hw=%llu cursor=%llu tip=%llu | template id=%u h=%llu diff=%llu "
-                    "refresh=%llu fail=%llu changes=%llu | stratum conn=%llu active=%llu logins=%llu "
-                    "submits=%llu shares=%llu net=%llu rejected=%llu pushes=%llu malformed=%llu | "
-                    "gate calls=%llu accept=%llu reject=%llu refused=%llu stale=%llu | "
-                    "submit calls=%zu ok=%zu rejected=%zu refused=%zu transport_err=%zu "
-                    "id_mismatch=%zu unattributable=%zu | found registered=%llu settled=%llu "
-                    "orphaned=%llu refused=%llu pending=%zu\n",
-                    static_cast<unsigned long long>(node.hw().hw_height),
-                    static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
-                    static_cast<unsigned long long>(node.adapter().index().best_height()),
-                    t.template_id, static_cast<unsigned long long>(t.height),
-                    static_cast<unsigned long long>(t.difficulty),
-                    static_cast<unsigned long long>(provider.refreshes()),
-                    static_cast<unsigned long long>(provider.failures()),
-                    static_cast<unsigned long long>(provider.changes()),
-                    static_cast<unsigned long long>(ls.connections),
-                    static_cast<unsigned long long>(ls.active),
-                    static_cast<unsigned long long>(ls.logins),
-                    static_cast<unsigned long long>(ls.submits),
-                    static_cast<unsigned long long>(ls.accepted_shares),
-                    static_cast<unsigned long long>(ls.network_blocks),
-                    static_cast<unsigned long long>(ls.rejected_submits),
-                    static_cast<unsigned long long>(ls.job_pushes),
-                    static_cast<unsigned long long>(ls.malformed),
-                    static_cast<unsigned long long>(sink.calls()),
-                    static_cast<unsigned long long>(sink.accepted()),
-                    static_cast<unsigned long long>(sink.rejected()),
-                    static_cast<unsigned long long>(sink.refused()),
-                    static_cast<unsigned long long>(sink.stale()),
-                    submitter.calls(), submitter.ok(), submitter.rejected(), submitter.refused(),
-                    submitter.transport_errors(), submitter.id_mismatches(), submitter.unattributable(),
-                    static_cast<unsigned long long>(fs.registered),
-                    static_cast<unsigned long long>(fs.settled),
-                    static_cast<unsigned long long>(fs.orphaned),
-                    static_cast<unsigned long long>(fs.refused),
-                    fc.pending().size());
-        std::printf("  %s\n", rx.describe().c_str());
-        const std::string g = sink.last();
-        if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
-        const std::string se = submitter.last_error();
-        if (!se.empty()) std::printf("  submit: last_error=%s\n", se.c_str());
-        std::fflush(stdout);
-    };
-
-    // Main loop (donor order per tick): drain wins -> register FOUND (durable)
-    // BEFORE the tip can advance past them; then pump the tip; then refresh the
-    // template and push it to miners ONLY when it changed.
-    auto last_status = std::chrono::steady_clock::now();
-    std::string last_template_err;
-    while (!g_stop.load()) {
-        bridge_found();
-        fc.tick();
-        transport.pump_poll();
-        node.adapter().ensure_seed_reach();
-        if (serving) {
-            if (provider.refresh()) {
-                const std::uint32_t tid = provider.template_id();
-                if (tid != last_tid) {
-                    last_tid = tid;
-                    listener.notify_new_template();   // -> listener: peek, seed prefetch, parked logins, broadcast_job
-                    const o2::MonerodTemplate t = provider.current();
-                    std::printf("template: id=%u height=%llu difficulty=%llu prev=%s… -> pushed to miners\n",
-                                t.template_id, static_cast<unsigned long long>(t.height),
-                                static_cast<unsigned long long>(t.difficulty),
-                                hex_of(t.prev_id).substr(0, 12).c_str());
-                }
-            } else {
-                const std::string e = provider.last_error();
-                if (e != last_template_err) {
-                    std::printf("template: refresh failed: %s\n", e.c_str());
-                    last_template_err = e;
-                }
-            }
-        }
-        drain_stratum_log();
-        if (cfg.status_every_s &&
-            std::chrono::steady_clock::now() - last_status >= std::chrono::seconds(cfg.status_every_s)) {
-            status();
-            last_status = std::chrono::steady_clock::now();
-        }
-        std::fflush(stdout);
-        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
-    }
-
-    // Teardown in donor order: network first (join the listener, so no submit is
-    // in flight), register any last-second win, THEN the node.
-    std::printf("\nstopping…\n");
-    listener.stop();
-    drain_stratum_log();
-    bridge_found();
-    fc.drain_before_stop();
-    node.stop();
-    status();
-    std::printf("stopped. hw_height=%llu\n",
-                static_cast<unsigned long long>(node.hw().hw_height));
-    return 0;
+    return serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
+                         "no --payout-address", provider, template_source, candidate);
 }
 
 int main(int argc, char** argv) {
@@ -511,6 +603,18 @@ int main(int argc, char** argv) {
         else if (a == "--payee-spend-hex") cfg.payee_spend_key_hex = next("");
         else if (a == "--payee-view-hex")  cfg.payee_view_key_hex = next("");
         else if (a == "--payee-subaddress") cfg.payee_subaddress = true;
+        else if (a == "--coinbase") {
+            const std::string m = next("monerod");
+            cfg.coinbase = (m == "v37" || m == "settlement" || m == "v37-settlement")
+                               ? CoinbaseMode::V37Settlement : CoinbaseMode::MonerodTemplate;
+        }
+        else if (a == "--residual-sink-spend-hex") cfg.residual_sink_spend_hex = next("");
+        else if (a == "--residual-sink-view-hex")  cfg.residual_sink_view_hex = next("");
+        else if (a == "--residual-sink-subaddress") cfg.residual_sink_subaddress = true;
+        else if (a == "--settle-h-min") cfg.settle_h_min = std::stoull(next("0"));
+        else if (a == "--settle-output-cap") cfg.settle_output_cap =
+                     static_cast<std::uint32_t>(std::stoul(next("0")));
+        else if (a == "--owed-demo-amount") cfg.owed_demo_amount = std::stoull(next("0"));
         else if (a == "--lane-chain") cfg.lane_chain =
                      static_cast<::v37::ChainId>(std::stoul(next("0")));
         else if (a == "--d-conf") cfg.d_conf = std::stoull(next("60"));
@@ -536,7 +640,17 @@ int main(int argc, char** argv) {
                 "  --share-diff <n>             share (lane) difficulty; 0 = network (solo)\n"
                 "  --template-reserve <n>       get_block_template reserve_size (default 0)\n"
                 "  --payee-spend-hex <64hex> --payee-view-hex <64hex> [--payee-subaddress]\n"
-                "                               payout address keys -> amount-honest FOUND records\n");
+                "                               payout address keys -> amount-honest FOUND records\n"
+                " option B (X9): the v37 K_fair SETTLEMENT coinbase (not monerod's template):\n"
+                "  --coinbase <monerod|v37>     monerod (default, option A) | v37 (option B)\n"
+                "  --residual-sink-spend-hex <64hex> --residual-sink-view-hex <64hex>\n"
+                "                               REQUIRED for v37 mode: the XMR wallet the exact-sum\n"
+                "                               residual is paid to (torsion-checked at build)\n"
+                "  --residual-sink-subaddress   the sink keys are a subaddress (D_i, A_main)\n"
+                "  --settle-h-min <pico>        owed-output floor (0 on XMR)\n"
+                "  --settle-output-cap <n>      TOTAL outputs cap (0 = weight-aware default)\n"
+                "  --owed-demo-amount <pico>    seed one K_fair OWED payee into the proof ledger\n"
+                "                               (coinbase carries OWED + residual sink)\n");
             return 0;
         }
     }

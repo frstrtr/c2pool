@@ -298,4 +298,37 @@ if (BUILD_TESTING)
         # end-to-end verify; suite (B) arithmetic runs always.
         add_test(NAME xmr_randomx_verify_kat COMMAND xmr_randomx_verify_kat --engine)
     endif()
+
+    # =========================================================================
+    # X9 OPTION B — whole-block settlement coinbase (consumer-tree; no consensus
+    # digest). Both link xmr_template (the p2pool block-template port + the
+    # authored xmr_coin_primitives.cpp seam bodies), so the primitive bodies are
+    # provided ONCE by the library and neither TU defines
+    # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES (the ODR rule).
+    #
+    # ci-allowlist-exempt: xmr_template_primitives_kat  -- heavy option-B leg (pulls the whole template port); compilation is gated at PR time by the c2pool-v37-xmr daemon target (which links xmr_template) on the non-san Linux leg, not by BUILD_TESTING; a later wave folds it into build.yml.
+    # ci-allowlist-exempt: xmr_block_assembly_kat  -- heavy option-B leg (template + X6 settle + ref10 point-check); same gating as above.
+
+    # (1) primitive seam byte-identity + template in-situ (component 1 + the leg).
+    add_executable(xmr_template_primitives_kat xmr_template_primitives_kat.cpp)
+    target_link_libraries(xmr_template_primitives_kat PRIVATE xmr_template)
+    target_compile_features(xmr_template_primitives_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_template_primitives_kat COMMAND xmr_template_primitives_kat)
+
+    # (2) whole-block assembly self-check K0..K6 ("the X6 K_fair coinbase IS the
+    #     block's coinbase"): xmr_block_assembly.hpp over the X6 executor
+    #     (settle/xmr_coinbase.cpp) + the ed25519 point-check registrar
+    #     (v37_descriptor_xmr_point_check_ref10.cpp, V37_XMR_HAVE_MONERO_CRYPTO).
+    add_executable(xmr_block_assembly_kat
+        xmr_block_assembly_selfcheck.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_link_libraries(xmr_block_assembly_kat PRIVATE xmr_template)
+    target_include_directories(xmr_block_assembly_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../coin/vendor
+        ${CMAKE_CURRENT_SOURCE_DIR}/../coin/compat)
+    target_compile_definitions(xmr_block_assembly_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_compile_features(xmr_block_assembly_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_block_assembly_kat COMMAND xmr_block_assembly_kat)
 endif()

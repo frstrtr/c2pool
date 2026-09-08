@@ -34,6 +34,13 @@ add_subdirectory(coin)
 # X2 node KAT in test/, or later W3 wire / W5 coinbase legs) is built.
 add_subdirectory(node)
 
+# X9 OPTION B: the whole-block template builder library (xmr_template =
+# xmr_block_template.cpp p2pool port + the authored xmr_coin_primitives.cpp seam
+# bodies over xmr_coin). Unconditional like coin/node — its TUs compile only when
+# a dependent target links it (the c2pool-v37-xmr daemon behind --coinbase v37,
+# and the assembly KAT in test/). See template/CMakeLists.txt.
+add_subdirectory(template)
+
 # X8 / O-2: librandomx from the VENDORED tevador/RandomX tree (consensus pin
 # 12f2c2ff, third_party/randomx). OFF by default — 2 x 256 MiB light caches +
 # a JIT are OOM-hostile on a laptop and do not survive -fsanitize — and turned

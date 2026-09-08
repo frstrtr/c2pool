@@ -55,6 +55,26 @@ inline const char* to_string(MoneroNetwork n) {
 // family uses via core::config).
 inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 
+// Which coinbase the serve side builds, serves and submits.
+//   MonerodTemplate (option A, default, PR #1534): monerod's own get_block_template
+//     block — a single coinbase to --payout-address, nonce patched. A genuine,
+//     monerod-validated block, but NOT the v37 settlement coinbase.
+//   V37Settlement (option B): a v37-BUILT Monero block whose miner_tx is the
+//     K_fair settlement coinbase (oldest-owed-first EffectiveOwed payees ++
+//     mandated fixed outputs ++ exact-sum residual sink), assembled from
+//     get_miner_data over the W4 OwedLedger. Requires a torsion-valid residual
+//     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
+//     without a valid sink the daemon refuses to serve.
+enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
+
+inline const char* to_string(CoinbaseMode m) {
+    switch (m) {
+        case CoinbaseMode::MonerodTemplate: return "monerod-template (option A)";
+        case CoinbaseMode::V37Settlement:   return "v37-settlement (option B)";
+    }
+    return "monerod-template (option A)";
+}
+
 // Default monerod RPC/ZMQ ports per network (monerod >= v0.18.0.0). The X2
 // adapter needs get_miner_data + the three ZMQ topics, all >= v0.18.
 inline c2pool::xmr::node::DaemonEndpoint default_endpoint(MoneroNetwork n) {
@@ -141,6 +161,30 @@ struct XmrNodeConfig {
     bool            payee_subaddress = false;
     // Seconds between the main loop's one-line status reports (0 = never).
     std::uint32_t   status_every_s = 30;
+
+    // --- O-2 OPTION B: the v37 K_fair settlement coinbase -------------------
+    // --coinbase monerod (option A, default) | v37 (option B). In v37 mode the
+    // block the pool assembles + submits is the settlement coinbase, not
+    // monerod's get_block_template — so --payout-address is not consulted for
+    // the coinbase bytes (it may stay empty; the serve port opens when the
+    // residual sink is set, mirroring option A's payout_address gate).
+    CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
+    // The mandated residual sink (REQUIRED for v37 mode): the raw public spend
+    // (B) + view (A) keys, 64 hex each, of the XMR wallet the exact-sum residual
+    // is paid to. Torsion-checked at build; the daemon REFUSES v37 mode without
+    // a valid sink. --residual-sink-subaddress builds an XMR_SUB (D_i, A_main).
+    std::string     residual_sink_spend_hex;
+    std::string     residual_sink_view_hex;
+    bool            residual_sink_subaddress = false;
+    // The v37 lane parameters (consensus once multi-node; explicit here).
+    std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
+    std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
+    // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
+    // the assembled coinbase carries a real K_fair OWED payee alongside the sink
+    // (a multi-output settlement coinbase). 0 => empty ledger (sink-only).
+    // The owed payee is a distinct torsion-valid payee derived from the sink
+    // material with spend/view swapped (see main). Proof-only; no live ledger yet.
+    std::uint64_t   owed_demo_amount = 0;
 
     // --- storage ------------------------------------------------------------
     // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).
