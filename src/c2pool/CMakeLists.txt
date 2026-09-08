@@ -855,9 +855,15 @@ target_link_libraries(c2pool-v37-w6-leveldb-compile-check PRIVATE core Threads::
 # EXPERIMENTAL — prototype / stagenet / regtest only (see the file banner).
 # Built on demand (like c2pool-v37); the non-san CI leg lists it for a compile
 # gate. The V37Engine/OwedLedger consensus stays header-only + untouched.
+# X9 OPTION B (--coinbase v37): the v37 K_fair SETTLEMENT coinbase. main_v37_xmr
+# includes the settlement provider/fixture (header-only, src/c2pool/v37/xmr/),
+# which drive the X6 executor (settle/xmr_coinbase.cpp, compiled in here) and the
+# whole-block template builder (xmr_template, linked below). No consensus digest
+# is defined; src/sharechain/v37 is untouched. Option A stays the default.
 add_executable(c2pool-v37-xmr
     v37/main_v37_xmr.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
     ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
 c2pool_wire_version(c2pool-v37-xmr)
 target_include_directories(c2pool-v37-xmr PRIVATE
@@ -866,7 +872,10 @@ target_include_directories(c2pool-v37-xmr PRIVATE
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
 target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
 target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
-target_link_libraries(c2pool-v37-xmr PRIVATE xmr_node xmr_coin Threads::Threads)
+# xmr_template carries the p2pool block-template port + the authored primitive
+# seam bodies (xmr_coin_primitives.cpp). Link it EXACTLY ONCE and NEVER define
+# XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES here (that ODR path is KAT-only).
+target_link_libraries(c2pool-v37-xmr PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
 if (XMR_BUILD_RANDOMX AND TARGET randomx)
     target_link_libraries(c2pool-v37-xmr PRIVATE randomx)
     target_include_directories(c2pool-v37-xmr PRIVATE
