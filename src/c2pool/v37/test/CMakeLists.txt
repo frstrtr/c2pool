@@ -354,6 +354,23 @@ if (BUILD_TESTING)
     target_include_directories(v37_w3_wire_freeze_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME v37_w3_wire_freeze_kat COMMAND v37_w3_wire_freeze_kat)
 
+    # Track A2 / S-1 — carrier-wire 0x02 (real X11 share envelope) byte-KAT
+    # (src/c2pool/v37/w3_relay_x11.hpp). The honest replacement for the synthetic
+    # v0x01 WorkEvent: it carries the fields that RECONSTRUCT and VERIFY a real
+    # DASH X11 share (80-byte header + coinbase + merkle branch), version-bumped
+    # to 0x02 behind a dual-accept front door that leaves the frozen v0x01 codec +
+    # its goldens untouched. This KAT pins the 0x02 golden hex, the independent
+    # size/offset model, lossless decode + byte-identical re-encode, every-prefix
+    # truncation, bad-version, W3-MUST mis-bind, dual-accept routing of BOTH a real
+    # 0x01 and a 0x02 frame, and the injected-hook X11 verify incl. fail-closed.
+    # Stdlib-only (the X11 permutation is injected as a hook, so no SSOT link) —
+    # exactly the shape of v37_w3_wire_freeze_kat above. SAME HOLLOW-GREEN GUARD:
+    # ALSO on BOTH build.yml --target lists so CI compiles + runs it.
+    add_executable(v37_a2_x11_wire_kat v37_a2_x11_wire_kat.cpp)
+    target_compile_features(v37_a2_x11_wire_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_a2_x11_wire_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME v37_a2_x11_wire_kat COMMAND v37_a2_x11_wire_kat)
+
     # Track A2 step (b)(2) — the LIVE IMainchainIndex (carrier_index.hpp) KAT: horizon
     # vs tip (I-1), bounded tri-state Unknown retry (I-2), per-hash Have cache (I-3),
     # the synthetic model's byte-for-byte parity with the multinode-test resolver,
