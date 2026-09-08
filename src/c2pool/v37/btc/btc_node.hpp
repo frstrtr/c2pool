@@ -175,8 +175,19 @@ public:
         if (!m_started) return out;
 
         const std::uint64_t reward = m_coin->block_reward(won_height);
-        cb::CoinbaseBudget budget;                 // ratified defaults (unbounded C/K_max here)
-        budget.k_floor = 0;
+        // R1: the ratified defaults are UNBOUNDED output-count C and byte budget
+        // K_max (spec §4.6) — pay every eligible owed balance the reward covers.
+        // slot_budget_C == 0 / max_payout_bytes == 0 BOTH mean UNBOUNDED (the two
+        // caps are symmetric and honored in OwedLedger::propose_coinbase / the W5
+        // assemble byte loop), NOT "emit nothing". k_floor > 0 ARMS the byte-
+        // denominated no-dust floor (coinbase-prioritization Rule 0):
+        // h_min(P2PKH) = 34 sat, so no sub-floor dust output is ever emitted (a
+        // below-floor balance carries forward, owed unchanged). All three caps
+        // are consensus-fixed and identical fleet-wide (shipped defaults).
+        cb::CoinbaseBudget budget;
+        budget.slot_budget_C    = 0;   // unbounded output-count C (ratified default)
+        budget.max_payout_bytes = 0;   // unbounded byte budget K_max (ratified default)
+        budget.k_floor          = 1;   // real byte floor -> h_min > 0 (no dust emitted)
 
         auto pay_of = [this](const ::v37::bytes32& k) { return m_pay_of(k); };
 

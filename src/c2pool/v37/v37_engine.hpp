@@ -59,6 +59,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <sharechain/v37/v37_lane_executor.hpp>
 
@@ -207,11 +208,27 @@ private:
         bool tracked = false;
     };
 
-    // The executor-thread body: pop one record, apply it, publish the fresh
-    // snapshot (F1: sole receive() caller), fulfill any tracked promise.
+    // R2 (hot-path digest): the full lane_digest recompute lives in
+    // LaneExecutor::receive()/build_snapshot() and is therefore a per-
+    // PUBLICATION cost, not a per-submit cost. The executor thread coalesces a
+    // BURST of already-queued commands — a carrier and the receipts that arrive
+    // with it land as one group in the FIFO — into ONE publication per affected
+    // lane, so the O(N) Merkle recompute runs once per lane per burst instead
+    // of once per record. This defers only the read-side PUBLICATION; the
+    // consensus fold input is untouched (one submit() per record, strict FIFO,
+    // no reorder/defer/parallel — see the class banner). The cap bounds a
+    // single burst so a firehose queue still yields a fresh publication within
+    // kCoalesceBurst records; it is an upper bound on coalescing, never a floor
+    // (a typical carrier+<=4-receipt group of 5 coalesces fully). Correctness
+    // and digest bytes are independent of the cap's value (any value >= 1).
+    static constexpr std::size_t kCoalesceBurst = 64;
+
+    // The executor-thread body: drain a burst of queued commands under one lock
+    // acquisition, then apply-and-publish it (F1: the sole receive() caller).
     void run() {
+        std::vector<Command> batch;
         for (;;) {
-            Command c;
+            batch.clear();
             {
                 std::unique_lock<std::mutex> lk(m_qmtx);
                 m_qcv.wait(lk, [this] { return !m_q.empty() || m_stopping; });
@@ -219,34 +236,66 @@ private:
                     if (m_stopping) break;
                     continue;
                 }
-                c = std::move(m_q.front());
-                m_q.pop_front();
+                std::size_t n = m_q.size();
+                if (n > kCoalesceBurst) n = kCoalesceBurst;
+                batch.reserve(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    batch.push_back(std::move(m_q.front()));
+                    m_q.pop_front();
+                }
             }
-            ::v37::SubmitResult res = m_exec.submit(c.rec);
-            publish(c.rec, res);
-            m_ops_mirror.store(m_exec.ops_committed());
-            if (c.tracked) c.prom.set_value(res);
+            drain_burst(batch);
         }
     }
 
-    // Executor thread only. Re-publish the affected lane's mailbox slot.
-    void publish(const ::v37::LaneRecord& rec, const ::v37::SubmitResult& res) {
+    // Executor thread only. Apply every record of one burst in strict FIFO
+    // order, then publish each affected lane exactly once at the burst's end.
+    // Ordering within the burst reproduces the per-record driver's happens-
+    // before EXACTLY (for a size-1 burst it is bit-identical): apply -> publish
+    // -> store ops -> fulfill promises. So when a submit_tracked future
+    // resolves, that record's effect is already observable via snapshot() /
+    // settlement_view_at(), and readers polling ops_committed() never see a
+    // count ahead of the publication that produced it.
+    void drain_burst(std::vector<Command>& batch) {
         using K = ::v37::LaneRecord::Kind;
-        if (!res.applied()) return;                    // rejected: no change
-        ::v37::ChainId c = rec.chain;
-        if (rec.kind == K::RemoveLane) {
-            // Lane is gone; clear its slot so readers see nullptr until it is
-            // re-added (a fresh incarnation, F2), and DROP the ring so the old
-            // incarnation's versions can never be re-read (OI-W4-3 scoping).
-            slot(c).store(nullptr);
-            drop_ring(c);
-            return;
+        std::map<::v37::ChainId, char> dirty;        // lanes owing a publish
+        std::vector<::v37::SubmitResult> results;    // per-record disposition
+        results.reserve(batch.size());
+        // (1) Apply, in arrival order. RemoveLane's mailbox-clear + ring-drop
+        //     stay EAGER (both cheap, no build_snapshot) so a re-AddLane later
+        //     in the same burst sees a cleared slot/ring — exact per-record
+        //     RemoveLane semantics (OI-W4-3 F2 scoping) — while the costly
+        //     publication of AddLane/Push/Rewind is deferred to (2).
+        for (auto& c : batch) {
+            ::v37::SubmitResult res = m_exec.submit(c.rec);
+            if (res.applied()) {
+                ::v37::ChainId ch = c.rec.chain;
+                if (c.rec.kind == K::RemoveLane) {
+                    slot(ch).store(nullptr);
+                    drop_ring(ch);
+                    dirty.erase(ch);         // cancel a publish accrued earlier
+                } else {
+                    dirty[ch] = 1;           // owes a terminal publication
+                }
+            }
+            results.push_back(res);
         }
-        // AddLane / Push / Rewind applied: the lane exists. receive() is safe
-        // here — this is the one thread that owns m_exec.
-        auto s = m_exec.receive(c);
-        slot(c).store(s);
-        ring_append(c, s);   // OI-W4-3: retain this version for read-at-version
+        // (2) Coalesced publication: ONE receive()/build_snapshot per lane that
+        //     ended the burst live+mutated — its terminal committed version.
+        //     receive() is safe here (this thread owns m_exec). A dirty lane is
+        //     necessarily live (a later RemoveLane erased it from `dirty`), so
+        //     the null guard is defensive only.
+        for (const auto& kv : dirty) {
+            ::v37::ChainId ch = kv.first;
+            auto s = m_exec.receive(ch);
+            if (!s) continue;
+            slot(ch).store(s);
+            ring_append(ch, s);   // OI-W4-3: retain the terminal version
+        }
+        // (3) Account then notify, publication-first — the per-record order.
+        m_ops_mirror.store(m_exec.ops_committed());
+        for (std::size_t i = 0; i < batch.size(); ++i)
+            if (batch[i].tracked) batch[i].prom.set_value(results[i]);
     }
 
     // Executor thread only (the single writer of the ring's structure and

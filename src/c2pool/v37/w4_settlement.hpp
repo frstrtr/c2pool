@@ -57,6 +57,7 @@
 #include <sharechain/v37/v37_descriptor.hpp>     // ScriptRef, ScriptKind
 #include <sharechain/v37/v37_fixed.hpp>          // U256, u64
 #include <sharechain/v37/v37_hash.hpp>           // bytes32, sha256d
+#include <c2pool/v37/w4_owed_incremental.hpp>    // R3: DigestMemo, EffectiveOwedIndex
 
 namespace c2pool::v37n::settle {
 
@@ -453,6 +454,8 @@ public:
         Pending p;
         for (const auto& [k, v] : credit) if (v != 0) p.credit[k] = v;
         for (const auto& [k, v] : payout) if (v != 0) p.payout[k] = v;
+        m_eo_index.on_found(p.payout,                 // R3: eo -= payout (fe frozen)
+                            [this](const bytes32& k) { return fe_at(k); });
         m_pending.emplace(bid, std::move(p));
         bump();
     }
@@ -493,9 +496,11 @@ public:
         if (it == m_pending.end()) return;
         for (const auto& [k, v] : it->second.credit) m_finalW[k] += v;
         for (const auto& [k, v] : it->second.payout) m_finalW[k] -= v;
+        m_eo_index.apply_finalize_credit(it->second.credit);  // R3: eo += credit
         m_pending.erase(it);
         m_settled.insert(bid);
         rearm_first_eligible(bin_height);
+        prune_finalized_zero_rows();                          // R3: drop 0/unarmed rows
         bump();
     }
 
@@ -513,6 +518,8 @@ public:
     void on_block_orphaned(const std::string& bid, const Amounts& settled_payout) {
         auto it = m_pending.find(bid);
         if (it != m_pending.end()) {
+            m_eo_index.on_orphan_pre(it->second.payout,  // R3: eo += payout
+                                     [this](const bytes32& k) { return fe_at(k); });
             m_pending.erase(it);   // pre-SETTLED: pure key removal
             bump();
             return;
@@ -531,14 +538,11 @@ public:
     // EffectiveOwed(key) = finalW - Σ_{pending} payout. A coinbase draws on this
     // only (§4.4). Signed: a negative value is over-credit netted forward.
     long long effective_owed(const bytes32& k) const {
-        long long e = 0;
-        auto it = m_finalW.find(k);
-        if (it != m_finalW.end()) e = it->second;
-        for (const auto& [bid, p] : m_pending) {
-            auto pit = p.payout.find(k);
-            if (pit != p.payout.end()) e -= pit->second;
-        }
-        return e;
+        // R3: served from the incrementally-maintained index in O(log K); its
+        // value equals finalW(k) − Σ_pending payout(k) by construction (the
+        // delta algebra in w4_owed_incremental.hpp), byte-for-byte identical to
+        // the former rescan (oracle KAT v37_w4_owed_incremental_test).
+        return m_eo_index.value(k);
     }
 
     // The full EffectiveOwed vector over every key the ledger has ever touched.
@@ -564,29 +568,30 @@ public:
     template <typename PayOf, typename HminOf>
     Proposal propose_coinbase(u64 block_reward, unsigned slot_budget_C,
                               PayOf&& pay_of, HminOf&& h_min_of) const {
-        std::vector<std::pair<u64, bytes32>> elig;  // (first_eligible, key)
-        for (const auto& [k, e] : effective_owed_all()) {
-            if (e <= 0) continue;
-            u64 fe = 0;
-            auto it = m_first_eligible.find(k);
-            if (it != m_first_eligible.end()) fe = it->second;
-            elig.emplace_back(fe, k);
-        }
-        std::sort(elig.begin(), elig.end());  // (fe ASC, key ASC) — pair order
+        // R3: the (first_eligible ASC, key ASC) positive view is maintained in
+        // m_eo_index, so we take the first C in O(C log K) instead of rebuilding
+        // and re-sorting the whole eligible set. The loop body — count cap,
+        // budget stop, h_min CARRY (skip, no budget/age change), amount bound —
+        // is byte-for-byte the shipped one; the ordered view yields the identical
+        // sequence of keys (oracle KAT v37_w4_owed_incremental_test).
         Proposal prop;
         u64 budget = block_reward;
-        for (const auto& [fe, k] : elig) {
-            (void)fe;
-            if (prop.outs.size() >= slot_budget_C) break;
-            if (budget == 0) break;
-            long long owed = effective_owed(k);
-            if (owed <= 0) continue;
+        m_eo_index.for_each_eligible([&](const bytes32& k) -> bool {
+            // R1: slot_budget_C == 0 means UNBOUNDED output count (symmetric with
+            // W5's max_payout_bytes == 0) — a 0 cap means "no count limit", NOT
+            // "emit nothing". A positive C caps at the first C oldest-owed entries.
+            if (slot_budget_C != 0 && prop.outs.size() >= slot_budget_C)
+                return false;              // count cap (R1: 0 = unbounded)
+            if (budget == 0) return false;
+            long long owed = m_eo_index.value(k);
+            if (owed <= 0) return true;    // (index holds only >0; defensive)
             u64 take = std::min<u64>(static_cast<u64>(owed), budget);
             ScriptRef pay = pay_of(k);
-            if (take < h_min_of(pay.kind)) continue;   // sub-floor: CARRY
+            if (take < h_min_of(pay.kind)) return true;   // sub-floor: CARRY
             budget -= take;
             prop.outs.push_back(ProposedOut{k, pay, take});
-        }
+            return true;
+        });
         return prop;
     }
 
@@ -594,14 +599,18 @@ public:
     // are re-derivable from the spine + FOUND set). Domain-separated sha256d,
     // sorted by key: "V37O" || key || i64 finalW || u64 first_eligible.
     bytes32 owed_digest() const {
-        std::vector<std::pair<bytes32, long long>> rows(m_finalW.begin(),
-                                                        m_finalW.end());
-        std::sort(rows.begin(), rows.end(),
-                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        // R3: memoized on m_seq. owed_digest is a pure function of ledger state
+        // and m_seq bumps on every mutation, so a hit at an equal seq is the
+        // byte-identical digest (read_cut hashes twice per attempt at one seq).
+        if (const bytes32* c = m_digest_memo.get(m_seq)) return *c;
+        // R3: m_finalW is std::map<bytes32,long long>, already iterated in
+        // ascending bytes32 order under std::less — the SAME comparator the old
+        // std::sort used — so the removed sort reordered nothing; `pre` is
+        // built byte-for-byte identically.
         std::vector<std::uint8_t> pre;
         const char tag[4] = {'V', '3', '7', 'O'};
         pre.insert(pre.end(), tag, tag + 4);
-        for (const auto& [k, w] : rows) {
+        for (const auto& [k, w] : m_finalW) {
             if (w == 0) continue;  // zero rows carry no commitment weight
             pre.insert(pre.end(), k.begin(), k.end());
             std::uint64_t uw = static_cast<std::uint64_t>(w);
@@ -611,7 +620,9 @@ public:
             if (it != m_first_eligible.end()) fe = it->second;
             for (int i = 0; i < 8; ++i) pre.push_back((fe >> (8 * i)) & 0xff);
         }
-        return ::v37::sha256d(pre);
+        bytes32 d = ::v37::sha256d(pre);
+        m_digest_memo.put(m_seq, d);
+        return d;
     }
 
     // Diagnostics for the acceptance tests (never consensus).
@@ -636,13 +647,45 @@ private:
     // <=0 to >0 is armed at `bin_height` (its age start); a key back at <=0 is
     // disarmed. Monotone bin_height (the coin high-water) is the K_fair clock.
     void rearm_first_eligible(u64 bin_height) {
-        for (const auto& [k, e] : effective_owed_all()) {
+        // R3: arm/disarm over every key the index tracks. That key set is the
+        // shipped (finalW ∪ pending-payout) union PLUS only keys whose eo ≤ 0
+        // and which carry no fe (disarm is a no-op on them, since fe(k) is set
+        // only when eo>0 and fe implies a finalW row that keeps k in the union),
+        // so the resulting m_first_eligible map is identical to iterating
+        // effective_owed_all() (oracle KAT v37_w4_owed_incremental_test).
+        m_eo_index.for_each_eo([&](const bytes32& k, long long e) {
             if (e > 0) {
                 if (!m_first_eligible.count(k)) m_first_eligible[k] = bin_height;
             } else {
                 m_first_eligible.erase(k);
             }
+        });
+        // Re-establish the ordered positive view from the just-updated fe.
+        m_eo_index.rebuild_order([this](const bytes32& k) { return fe_at(k); });
+    }
+
+    // R3 (prune): drop finalW rows that are exactly 0 AND unarmed. owed_digest
+    // already skips w==0 (so the commitment is unchanged), StateCommitment reads
+    // only w>0 rows, and effective_owed on an absent key reads 0 identically to
+    // a present 0 row (a later credit recreates the row via m_finalW[k]+=v). The
+    // "unarmed" conjunct guarantees no live K_fair age state is dropped. Bounds
+    // finalW growth so it does not retain settled-to-zero payees forever.
+    void prune_finalized_zero_rows() {
+        for (auto it = m_finalW.begin(); it != m_finalW.end();) {
+            if (it->second == 0 && !m_first_eligible.count(it->first))
+                it = m_finalW.erase(it);
+            else
+                ++it;
         }
+    }
+
+    // fe(k) with a 0 default — the value the index reads to order the positive
+    // view (first_eligible stays owned HERE; the index is never a second
+    // source of truth for the age key). Concrete return type so it can be
+    // called from the mutation methods defined earlier in the class.
+    u64 fe_at(const bytes32& k) const {
+        auto it = m_first_eligible.find(k);
+        return it == m_first_eligible.end() ? u64(0) : it->second;
     }
 
     ::v37::ChainId m_chain;
@@ -653,6 +696,8 @@ private:
     std::map<bytes32, u64> m_first_eligible;       // K_fair age key
     long long m_residual = 0;                      // priced post-SETTLED loss
     std::vector<std::pair<std::string, long long>> m_residual_events;
+    detail::EffectiveOwedIndex m_eo_index;         // R3: incremental EffectiveOwed + ordered view
+    mutable detail::DigestMemo m_digest_memo;      // R3: seq-keyed owed_digest memo
 };
 
 // ─────────────────────────────────────────────────────────────────────────
