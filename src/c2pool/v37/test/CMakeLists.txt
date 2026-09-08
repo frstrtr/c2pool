@@ -85,6 +85,23 @@ if (BUILD_TESTING)
     target_link_libraries(v37_w5_coinbase_test Threads::Threads)
     add_test(NAME v37_w5_coinbase_test COMMAND v37_w5_coinbase_test)
 
+    # Track A2 / R1 — coinbase-budget non-empty regression pin
+    # (src/c2pool/v37/w5_coinbase.hpp + w4_settlement.hpp::propose_coinbase). Pins
+    # that a DEFAULT-constructed CoinbaseBudget (slot_budget_C == 0) assembles a
+    # NON-EMPTY coinbase — the R1 fix that makes a 0 count-cap mean UNBOUNDED
+    # (symmetric with the byte budget), plus the armed h_min dust floor and the
+    # digest-neutrality of assemble()/propose_coinbase() (owed_digest + §13 root
+    # byte-identical, budget-independent). Same stdlib-only self-harness shape.
+    # SAME HOLLOW-GREEN GUARD as the sibling suites: this target is ALSO listed in
+    # the build.yml --target lists (BOTH the Linux x86_64 leg and the ASan+UBSan
+    # leg) so CI compiles + runs it, not just registers a NOT_BUILT CTest sentinel
+    # (the DGB #137 / #769 / PR #1467 / #1477 unregistered-KAT class).
+    add_executable(v37_r1_coinbase_budget_test v37_r1_coinbase_budget_test.cpp)
+    target_compile_features(v37_r1_coinbase_budget_test PRIVATE cxx_std_20)
+    target_include_directories(v37_r1_coinbase_budget_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_r1_coinbase_budget_test Threads::Threads)
+    add_test(NAME v37_r1_coinbase_budget_test COMMAND v37_r1_coinbase_budget_test)
+
     # Track A2 / W3 — carrier-relay KAT (src/c2pool/v37/w3_relay.hpp). Same
     # stdlib-only shape; it additionally forks child processes over 127.0.0.1
     # loopback sockets for the multi-process propagation smoke (POSIX sockets +
@@ -361,4 +378,18 @@ if (BUILD_TESTING)
     target_include_directories(v37_a2_sendside_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_a2_sendside_test Threads::Threads)
     add_test(NAME v37_a2_sendside_test COMMAND v37_a2_sendside_test)
+
+    # Track A2 / W4 — R3 incremental OWED-ledger acceleration: DIGEST-NEUTRALITY
+    # oracle KAT (src/c2pool/v37/w4_owed_incremental.hpp). Drives OwedLedger via
+    # its public API and compares owed_digest / effective_owed / propose_coinbase
+    # byte-for-byte against an independent shadow of the pre-R3 algorithm across a
+    # long random FOUND/FINALIZE/ORPHAN schedule + adversarial zero-prune / found→
+    # orphan round-trip. Stdlib + Threads (w4 pulls in v37_engine). SAME HOLLOW-
+    # GREEN GUARD as the sibling suites: ALSO listed on BOTH build.yml --target
+    # lists so CI compiles + runs it, not a NOT_BUILT CTest sentinel.
+    add_executable(v37_w4_owed_incremental_test v37_w4_owed_incremental_test.cpp)
+    target_compile_features(v37_w4_owed_incremental_test PRIVATE cxx_std_20)
+    target_include_directories(v37_w4_owed_incremental_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_w4_owed_incremental_test Threads::Threads)
+    add_test(NAME v37_w4_owed_incremental_test COMMAND v37_w4_owed_incremental_test)
 endif()
