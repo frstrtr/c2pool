@@ -14,7 +14,10 @@ permissions:
 
 concurrency:
   group: ci-required-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # run_attempt == 1 so a RERUN of a superseded CI Required (attempt >= 2)
+  # does not cancel a live sibling run in the same ref group (e.g. B's coin
+  # matrix). Group stays keyed on github.ref. See ci-steward/leg-isolation (#1545).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 jobs:
   param-catalog-tripwire:
