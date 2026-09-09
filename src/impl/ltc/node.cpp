@@ -1425,11 +1425,43 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash)
             if (!oldest_parent.IsNull() && !m_chain->contains(oldest_parent))
             {
                 auto locked = weak_peer.lock();
-                if (locked)
-                    download_shares(locked, oldest_parent);
+                if (locked) {
+                    // half-2: route the recursive re-request through the budgeted
+                    // drain so backward chain-walk fan-out stays bounded on the io
+                    // thread (same guard as the IO-phase desired drain).
+                    m_pending_desired.emplace_back(locked->addr(), oldest_parent);
+                    drain_pending_desired();
+                }
             }
         }
     );
+}
+
+void NodeImpl::drain_pending_desired()
+{
+    // IO thread only. Process up to DESIRED_REQUEST_BUDGET queued desired-share
+    // requests per pass, then repost the remainder so the io_context pulse can
+    // fire between chunks (half-2 of the boot io-freeze fix). Mirrors the
+    // m_think_needs_continue chunk-yield-repost pattern already used by run_think.
+    if (m_peers.empty()) {
+        // No peers to ask; desired is recomputed next think(). Drop the queue
+        // (matches the old `!m_peers.empty()` guard that skipped requesting).
+        m_pending_desired.clear();
+        return;
+    }
+    std::size_t processed = 0;
+    while (!m_pending_desired.empty() && processed < DESIRED_REQUEST_BUDGET) {
+        auto entry = m_pending_desired.front();
+        m_pending_desired.pop_front();
+        peer_ptr advertiser;
+        for (auto& [nonce, p] : m_peers) {
+            if (p && p->addr() == entry.first) { advertiser = p; break; }
+        }
+        download_shares(advertiser, entry.second);
+        ++processed;
+    }
+    if (!m_pending_desired.empty())
+        boost::asio::post(*m_context, [this]() { drain_pending_desired(); });
 }
 
 void NodeImpl::load_persisted_shares()
@@ -2088,14 +2120,17 @@ void NodeImpl::run_think()
             // Request desired shares. #25(C): pass the ADVERTISER (the peer whose
             // desired entry named the hash) so download_shares prefers it and fails
             // over to other peers instead of picking a fully random one.
-            if (!result.desired.empty() && !m_peers.empty()) {
-                for (auto& [peer_addr, hash] : result.desired) {
-                    peer_ptr advertiser;
-                    for (auto& [nonce, p] : m_peers) {
-                        if (p && p->addr() == peer_addr) { advertiser = p; break; }
-                    }
-                    download_shares(advertiser, hash);
-                }
+            // half-2 boot io-freeze fix: queue the desired requests and drain
+            // them in bounded passes instead of synchronously here. A large
+            // persisted sharechain yields a huge result.desired; draining it all
+            // in one go monopolizes the io thread and starves the io_context
+            // pulse (main_ltc.cpp watchdog) -> abort during boot. result.desired
+            // is recomputed authoritatively each think(), so replace the queue.
+            m_pending_desired.clear();
+            if (!result.desired.empty()) {
+                for (auto& [peer_addr, hash] : result.desired)
+                    m_pending_desired.emplace_back(peer_addr, hash);
+                drain_pending_desired();
             }
 
             // Work refresh on IO thread — NO lock held. Takes 1-5s but doesn't

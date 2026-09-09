@@ -574,6 +574,12 @@ public:
     /// Recursively fetches parents until the chain is connected or CHAIN_LENGTH reached.
     void download_shares(peer_ptr peer, const uint256& target_hash);
 
+    /// Drain up to DESIRED_REQUEST_BUDGET queued desired-share requests
+    /// (m_pending_desired) per pass, reposting the remainder to the io_context
+    /// so its watchdog pulse fires between chunks (half-2 boot io-freeze fix).
+    /// IO thread only.
+    void drain_pending_desired();
+
     /// Return the hash of our tallest chain head, or uint256::ZERO if empty.
     uint256 best_share_hash();
 
@@ -803,6 +809,17 @@ protected:
     std::atomic<uint64_t> m_broadcast_acquired{0};
     std::atomic<uint64_t> m_broadcast_reached_send{0};
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
+
+    // ---- half-2 boot io-freeze fix: budgeted parent-share request drain ----
+    // A large persisted sharechain makes run_think's IO-phase produce a huge
+    // result.desired. Draining it all synchronously monopolizes the io thread
+    // and starves the io_context pulse (main_ltc.cpp watchdog: 5s pulse / 30s
+    // freeze) -> abort during boot. Queue the desired requests here and drain
+    // them in bounded passes, reposting the remainder so the pulse fires
+    // between chunks. IO-THREAD CONFINED, same discipline as m_downloading_shares
+    // above -- never touch off the io thread. Mirrors m_think_needs_continue.
+    static constexpr std::size_t DESIRED_REQUEST_BUDGET = 50;
+    std::deque<std::pair<NetService, uint256>> m_pending_desired;
 
     // v36-0.24 kr1z1s convergence hotfix #25(C): per-(hash,peer) parent-fetch
     // failure memory. Replaces the old peer-BLIND per-hash counter
