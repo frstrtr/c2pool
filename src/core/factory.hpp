@@ -68,6 +68,107 @@ inline void acquire_lifetime(INetwork* raw,
 	was_managed = (weak_out.lock() != nullptr);
 }
 
+
+// == #965 Phase-1: dual-stack (IPv6+IPv4) listener family selection ============
+//
+// The listener was hard-bound to tcp::v4() (this file, pre-#965), so a
+// v6-primary or CGNAT/v4-scarce host -- where the local dashd is dual-stack and
+// thrives -- starved c2pool with 0 inbound and a thin outbound peer set. This is
+// SHARED by every coin lane, so one fix covers all of them.
+//
+// ListenFamily::Auto (default; byte-unchanged for v4-only hosts): prefer a
+// single dual-stack IPv6 socket with v6_only(false) so it accepts native IPv6
+// AND IPv4-mapped clients. If IPv6 is unavailable, OR the host forces v6-only
+// (net.ipv6.bindv6only=1) -- which would SILENTLY drop IPv4 miners -- fall back
+// to a plain IPv4 bind. V4/V6 pin the family (V6 accepts the host v6-only
+// outcome). We READ BACK the effective v6_only after bind and report which
+// families are actually bound -- never infer it (the #965 risk note).
+enum class ListenFamily { Auto, V4, V6 };
+
+struct ListenResult
+{
+    bool     ok          = false;  // acceptor is open + bound (caller then listen()s)
+    bool     ipv6        = false;  // bound on an IPv6 socket
+    bool     ipv4_mapped = false;  // dual-stack: that v6 socket also accepts IPv4
+    uint16_t port        = 0;      // actual bound port (resolves an ephemeral :0)
+
+    const char* families() const
+    {
+        if (!ok)   return "none";
+        if (!ipv6) return "IPv4-only";
+        return ipv4_mapped ? "IPv6+IPv4(dual-stack)" : "IPv6-only";
+    }
+};
+
+// Bind `acc` to `port` per `family`. Never throws; on failure returns {ok=false}
+// with `ec` set and the acceptor left CLOSED. On success `ec` is cleared and the
+// acceptor is open+bound (the caller issues listen()).
+inline ListenResult bind_listener(io::ip::tcp::acceptor& acc, uint16_t port,
+                                  ListenFamily family, boost::system::error_code& ec)
+{
+    ListenResult r;
+    auto reset = [&] { boost::system::error_code ignore; if (acc.is_open()) acc.close(ignore); };
+
+    auto bind_v4 = [&]() -> bool {
+        reset();
+        io::ip::tcp::endpoint ep(io::ip::tcp::v4(), port);
+        acc.open(ep.protocol(), ec);                              if (ec) return false;
+        boost::system::error_code ig;
+        acc.set_option(io::socket_base::reuse_address(true), ig); // best-effort
+        acc.bind(ep, ec);                                         if (ec) { reset(); return false; }
+        r = ListenResult{}; r.ok = true; r.ipv6 = false; r.ipv4_mapped = false;
+        r.port = acc.local_endpoint().port();
+        return true;
+    };
+
+    auto bind_v6 = [&](bool want_dual) -> bool {
+        reset();
+        io::ip::tcp::endpoint ep(io::ip::tcp::v6(), port);
+        acc.open(ep.protocol(), ec);                              if (ec) return false;
+        boost::system::error_code ig;
+        acc.set_option(io::socket_base::reuse_address(true), ig); // best-effort
+        acc.set_option(io::ip::v6_only(!want_dual), ig);          // request dual-stack
+        acc.bind(ep, ec);                                         if (ec) { reset(); return false; }
+        io::ip::v6_only v6only_opt;                               // read back ACTUAL state
+        boost::system::error_code getec; acc.get_option(v6only_opt, getec);
+        const bool v6only_effective = getec ? true : v6only_opt.value();
+        r = ListenResult{}; r.ok = true; r.ipv6 = true;
+        r.ipv4_mapped = want_dual && !v6only_effective;
+        r.port = acc.local_endpoint().port();
+        return true;
+    };
+
+    switch (family)
+    {
+    case ListenFamily::V4:
+        bind_v4();
+        break;
+    case ListenFamily::V6:
+        bind_v6(false);   // caller pinned pure IPv6
+        break;
+    case ListenFamily::Auto:
+    default:
+        if (bind_v6(true))
+        {
+            // Dual-stack requested but host forced v6-only -> IPv4 miners would
+            // be dropped. Fall back to a plain IPv4 bind instead.
+            if (!r.ipv4_mapped)
+                bind_v4();
+        }
+        else
+        {
+            // No IPv6 at all -> v4-only host, historical byte-unchanged path.
+            ec.clear();
+            bind_v4();
+        }
+        break;
+    }
+
+    if (r.ok) ec.clear();
+    return r;
+}
+
+
 class Server
 {
 private:
@@ -140,22 +241,29 @@ public:
 			m_acceptor.emplace(*context);
 	}
 
-	void listen(auto listen_port)
+	void listen(auto listen_port, ListenFamily family = ListenFamily::Auto)
     {
         if (!m_acceptor)
         {
             LOG_ERROR << "listen() called on a context-less Server";
             return;
         }
-        io::ip::tcp::endpoint listen_ep(io::ip::tcp::v4(), listen_port);
 
-        m_acceptor->open(listen_ep.protocol());
-		m_acceptor->set_option(io::socket_base::reuse_address(true));
-		m_acceptor->bind(listen_ep);
-		m_acceptor->listen();
-		accept();
+        boost::system::error_code ec;
+        const ListenResult r = bind_listener(*m_acceptor,
+                                              static_cast<uint16_t>(listen_port), family, ec);
+        if (!r.ok)
+        {
+            LOG_ERROR << "listen() failed to bind port " << listen_port
+                      << ": " << ec.message();
+            return;
+        }
 
-		LOG_INFO << "Factory started for port: " << listen_ep.port();
+        m_acceptor->listen();
+        accept();
+
+        LOG_INFO << "Factory listening on port " << r.port
+                 << " [" << r.families() << "]";
     }
 
 	uint16_t listen_port() const { return m_acceptor->local_endpoint().port(); }
