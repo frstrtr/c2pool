@@ -55,11 +55,14 @@
 // consensus digest. It only READS OwedLedger::owed_digest() and serialises it
 // into the Monero coinbase's tx_extra 0x03; the Monero block is validated by
 // monerod (RandomX + HF13 exact-sum), not by any v37 rule. The single-pool
-// proof needs no operator tap. Two knobs become LANE consensus the moment
-// Option B goes multi-node and each must then ship as an operator-tap DRAFT
-// (never a silent flip): `kfair` (W4Propose vs X6Allocate) and `lc_source`
-// (which digest r and the MM root bind). They are EXPLICIT flags here until
-// tapped — the whole point of surfacing them in the config value.
+// proof needs no operator tap. Two knobs are LANE consensus the moment Option B
+// goes multi-node — `kfair` (which K_fair rule picks the payees) and
+// `lc_source` (which value r and the MM root bind). Both were RULED by the
+// operator on 2026-09-10 and are now PINNED, fail-closed, in
+// validate_structural(): kfair == W4Propose (the one ratified K_fair rule,
+// whitepaper E-1) and lc_source == StateRoot (the whitepaper §13
+// StateCommitment Merkle root). This PR ships them as a DRAFT: the operator
+// merges/activates, never a silent flip.
 //
 // FAIL-CLOSED (defence in depth over XmrOwedSettlementSource::build's own):
 //   * residual_sink MUST be a well-formed XMR ref (kind XMR_STD/XMR_SUB, 64-B
@@ -100,17 +103,31 @@ namespace c2pool::v37n::xmr::o2 {
 // Which digest r and the MM root bind. A consensus ruling the moment Option B
 // is multi-node (survey gate flag (2)); explicit here until tapped.
 // ---------------------------------------------------------------------------
+// RULED 2026-09-10 (multi-node): StateRoot. The other two are refused by
+// validate_structural unless allow_nonruled_local_only is set for a
+// single-pool experiment (never for a lane with peers).
+// ---------------------------------------------------------------------------
 enum class LaneCommitmentSource : std::uint8_t {
-    OwedDigest = 0,   // ledger.owed_digest() — the §4.5 OWED commitment (recommended)
+    OwedDigest = 0,   // ledger.owed_digest() — the §4.5 OWED commitment (pre-ruling default)
     Explicit   = 1,   // an operator-supplied bytes32 (lane digest / SettlementView::digest)
+    StateRoot  = 2,   // RULED: the whitepaper §13 StateCommitment Merkle root
 };
 
 inline const char* to_string(LaneCommitmentSource s) {
     switch (s) {
         case LaneCommitmentSource::OwedDigest: return "owed-digest";
         case LaneCommitmentSource::Explicit:   return "explicit";
+        case LaneCommitmentSource::StateRoot:  return "state-root";
     }
     return "?";
+}
+
+// Parse the --lane-commitment operator flag. Returns false on an unknown name.
+inline bool parse_lane_commitment_source(const std::string& s, LaneCommitmentSource& out) {
+    if (s == "state-root"  || s == "state_root")  { out = LaneCommitmentSource::StateRoot;  return true; }
+    if (s == "owed-digest" || s == "owed_digest") { out = LaneCommitmentSource::OwedDigest; return true; }
+    if (s == "explicit")                          { out = LaneCommitmentSource::Explicit;   return true; }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,10 +173,16 @@ struct XmrSettlementConfig {
     // --- mandated fixed outputs (dev / donation / finder), usually empty ---
     std::vector<x6::FixedOutput> fixed;
 
-    // --- rulings (operator-tap DRAFT once multi-node; explicit flags here) ---
+    // --- RULED 2026-09-10 (multi-node consensus): both values are now pinned.
+    //     kfair     == W4Propose : the ONE ratified K_fair rule (E-1).
+    //     lc_source == StateRoot : the coinbase commits the §13 state root.
+    //     Any other combination is REFUSED by validate_structural unless
+    //     allow_nonruled_local_only is set (single-pool experiments only —
+    //     a node that sets it can never agree with a ruled peer).
     KFairSource          kfair     = KFairSource::W4Propose;
-    LaneCommitmentSource lc_source = LaneCommitmentSource::OwedDigest;
+    LaneCommitmentSource lc_source = LaneCommitmentSource::StateRoot;
     ::v37::bytes32       lane_commitment_explicit{};   // used iff lc_source == Explicit
+    bool                 allow_nonruled_local_only = false;
 
     // ---- sink constructors (payout-target bytes, never address strings) ----
     // Set the sink from raw 32-byte key material; also fills residual_sink_identity.
@@ -210,6 +233,16 @@ struct XmrSettlementConfig {
         if (lc_source == LaneCommitmentSource::Explicit &&
             lane_commitment_explicit == ::v37::bytes32{})
             return no("XmrSettlementConfig: lc_source == Explicit but lane_commitment_explicit is zero");
+        // ---- the two multi-node rulings, enforced before any crypto ----
+        if (kfair != KFairSource::W4Propose)
+            return no("RULED 2026-09-10: KFairSource must be W4Propose "
+                      "(canonical K_fair propose_coinbase, whitepaper E-1); got " +
+                      std::string(to_string(kfair)));
+        if (lc_source != LaneCommitmentSource::StateRoot && !allow_nonruled_local_only)
+            return no("RULED 2026-09-10: lane_commitment must be the §13 StateCommitment "
+                      "state root (--lane-commitment state-root); got " +
+                      std::string(to_string(lc_source)) +
+                      " (set allow_nonruled_local_only only for a single-pool experiment)");
         if (why) why->clear();
         return true;
     }
@@ -266,8 +299,9 @@ inline ::v37::bytes32 resolve_lane_commitment(const XmrSettlementConfig& cfg,
     switch (cfg.lc_source) {
         case LaneCommitmentSource::OwedDigest: return lane_commitment_from_owed_digest(ledger);
         case LaneCommitmentSource::Explicit:   return cfg.lane_commitment_explicit;
+        case LaneCommitmentSource::StateRoot:  return lane_commitment_from_state_root(ledger);
     }
-    return lane_commitment_from_owed_digest(ledger);
+    return lane_commitment_from_state_root(ledger);   // RULED default
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +386,25 @@ inline x6::CoinbaseInputs assembly_settle_inputs(const XmrOwedSettlementSource& 
     return in;
 }
 
+// ---------------------------------------------------------------------------
+// The RULED per-reward re-projection callback for AssemblyInputs.reproject_owed
+// (RULED 2026-09-10). Binding it makes the assembler re-derive the canonical
+// K_fair owed rows — OwedLedger::propose_coinbase — at EVERY reward its
+// count-invariance fixpoint visits, and at the RESOLVED (weight-aware) total
+// output cap, so the payee set the block pays is the proposal at the reward the
+// block actually pays. Both the daemon provider and the KATs bind THIS
+// function, so there is exactly one wiring to review.
+//
+// The ledger is captured by POINTER (never by reference to a caller local): the
+// callback is copied into the assembler's seam, which the AssembledTemplate
+// owns for as long as that template is retained. `fixture` must therefore
+// outlive every template built with the returned callback.
+// ---------------------------------------------------------------------------
+class XmrOwedFixture;   // defined below
+inline ReprojectOwedFn make_reproject_owed(const XmrSettlementConfig& cfg,
+                                           XmrOwedFixture& fixture);
+
+
 // ===========================================================================
 // XmrOwedFixture — the deterministic proof ledger (survey item E). The X9
 // observe-side daemon has no live XMR OwedLedger yet, so the FOUND->FINALIZE
@@ -370,7 +423,23 @@ inline x6::CoinbaseInputs assembly_settle_inputs(const XmrOwedSettlementSource& 
 // ===========================================================================
 class XmrOwedFixture {
 public:
-    explicit XmrOwedFixture(::v37::ChainId chain) : m_ledger(chain) {}
+    // OWNING form (KATs, self-checks, single-shot experiments): the fixture
+    // holds its own OwedLedger.
+    explicit XmrOwedFixture(::v37::ChainId chain)
+        : m_owned(std::in_place, chain), m_ledger(*m_owned) {}
+
+    // NON-OWNING form — R-7 (2026-09-10), the ONE-LEDGER wiring. The live
+    // daemon MUST hand the provider the SAME OwedLedger the finalize driver
+    // writes (XmrNode::ledger(): store-backed, RecoveryDriver-replayed,
+    // XmrFinalizeDriver-driven). Two disjoint ledgers — a settlement one the
+    // coinbase pays from and a node one FINALIZE books into — is the split-brain
+    // this ctor exists to kill: block N+1's propose_coinbase would never see
+    // block N's pending payout deducted, so it would re-propose the SAME owed
+    // row at its full EffectiveOwed on EVERY block (a no-double-pay violation of
+    // whitepaper section 9 / OI-W4-5), while the node ledger's effective_owed
+    // went negative by one reward per pending FOUND.
+    // `external` must outlive this fixture and every template built from it.
+    explicit XmrOwedFixture(OwedLedger& external) : m_ledger(external) {}
 
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key
     // is the canon identity_key(pay); the resolver learns pay for that key.
@@ -409,11 +478,29 @@ public:
     std::size_t       seeded() const { return m_paymap.size(); }
 
 private:
-    OwedLedger                            m_ledger;
+    // Declaration order is load-bearing: m_owned is constructed before the
+    // reference that binds to it.
+    std::optional<OwedLedger>             m_owned;   // engaged only in the OWNING form
+    OwedLedger&                           m_ledger;  // the ledger actually used
     std::map<::v37::bytes32, ::v37::ScriptRef> m_paymap;
     std::uint64_t                         m_next_bid = 0;
     std::uint64_t                         m_next_age = 1;   // 0 reserved / unarmed
 };
+
+inline ReprojectOwedFn make_reproject_owed(const XmrSettlementConfig& cfg,
+                                           XmrOwedFixture& fixture) {
+    XmrOwedFixture*     fx      = &fixture;
+    PayOfFn             pay_of  = fixture.pay_of();
+    const std::uint64_t h_min   = cfg.h_min;
+    const std::size_t   n_fixed = cfg.fixed.size();
+    std::uint64_t       fixed_sum = 0;
+    for (const auto& f : cfg.fixed) fixed_sum += f.amount;
+    return [fx, pay_of, h_min, n_fixed, fixed_sum](std::uint64_t reward, std::uint32_t output_cap,
+                                                    std::vector<x6::OwedEntry>& out, std::string* why) {
+        return project_w4_owed(fx->ledger(), pay_of, h_min, n_fixed, fixed_sum,
+                               reward, output_cap, out, nullptr, why);
+    };
+}
 
 // ===========================================================================
 // Structural self-check (no crypto backend needed). A KAT TU can call
@@ -459,7 +546,7 @@ inline bool run(std::string* why = nullptr) {
         if (bad.validate_structural(&w)) return fail("S3: cap-too-small (fixed+sink) accepted");
     }
     // (S4) make_xmr_coinbase_context copies every field through and defaults the
-    //      lane commitment to the empty ledger's owed_digest.
+    //      lane commitment to the RULED §13 StateCommitment state root.
     {
         XmrOwedFixture fx(7);
         XmrParentContext parent;
@@ -469,8 +556,11 @@ inline bool run(std::string* why = nullptr) {
         if (!ctx) return fail("S4: context build refused: " + w);
         if (ctx->chain_id != 7)                       return fail("S4: chain_id not copied");
         if (ctx->output_cap != cfg.resolved_output_cap()) return fail("S4: output_cap not resolved");
-        if (!(ctx->lane_commitment == fx.ledger().owed_digest()))
-            return fail("S4: lane_commitment != owed_digest (default source)");
+        if (!(ctx->lane_commitment ==
+              ::c2pool::v37n::coinbase::StateCommitment(fx.ledger(), fx.ledger().chain()).root()))
+            return fail("S4: lane_commitment != §13 state root (RULED default source)");
+        if (ctx->lane_commitment == ::v37::bytes32{})
+            return fail("S4: §13 state root is zero (summary leaf must always exist)");
         if (!(ctx->residual_sink == cfg.residual_sink)) return fail("S4: sink not copied");
     }
     // (S5) chain-id mismatch between config and ledger is refused.
@@ -492,6 +582,55 @@ inline bool run(std::string* why = nullptr) {
         if (!::v37::xmr::is_xmr_kind(po(key).kind))    return fail("S6: resolver lost the seeded ref");
         ::v37::bytes32 miss{}; miss[0] = 0xEE;
         if (::v37::xmr::is_xmr_kind(po(miss).kind))    return fail("S6: resolver invented a ref (must be RAW/carry)");
+    }
+    // (S7) resolve_lane_commitment(StateRoot) IS StateCommitment::root(), and it
+    //      MOVES when one balance moves by a single piconero (the negative
+    //      control the §13 binding rests on).
+    {
+        XmrOwedFixture fx(7);
+        std::array<std::uint8_t, 32> b = ::v37::xmr::kat::STD_KAT.p0;
+        std::array<std::uint8_t, 32> a = ::v37::xmr::kat::STD_KAT.p1;
+        fx.seed_owed_std(b, a, 1000000);
+        const ::v37::bytes32 want =
+            ::c2pool::v37n::coinbase::StateCommitment(fx.ledger(), fx.ledger().chain()).root();
+        if (!(resolve_lane_commitment(cfg, fx.ledger()) == want))
+            return fail("S7: resolve_lane_commitment(StateRoot) != StateCommitment::root()");
+
+        XmrOwedFixture fx2(7);
+        fx2.seed_owed_std(b, a, 1000001);            // ONE piconero apart
+        const ::v37::bytes32 other =
+            ::c2pool::v37n::coinbase::StateCommitment(fx2.ledger(), fx2.ledger().chain()).root();
+        if (want == other) return fail("S7: §13 root did not move for a 1-piconero balance change");
+
+        XmrSettlementConfig od = cfg;
+        od.lc_source = LaneCommitmentSource::OwedDigest;
+        od.allow_nonruled_local_only = true;
+        if (!(resolve_lane_commitment(od, fx.ledger()) == fx.ledger().owed_digest()))
+            return fail("S7: the owed-digest escape hatch no longer resolves to owed_digest");
+        if (resolve_lane_commitment(od, fx.ledger()) == want)
+            return fail("S7: owed_digest == §13 root (the two bindings must differ)");
+    }
+    // (S8) the two RULED knobs are refused at config level, before any crypto.
+    {
+        XmrSettlementConfig bad = cfg;
+        bad.kfair = KFairSource::X6Allocate;
+        std::string w;
+        if (bad.validate_structural(&w)) return fail("S8: X6Allocate accepted");
+        if (w.find("RULED") == std::string::npos) return fail("S8: X6Allocate refusal does not name the ruling");
+
+        XmrSettlementConfig bad2 = cfg;
+        bad2.lc_source = LaneCommitmentSource::OwedDigest;
+        if (bad2.validate_structural(&w)) return fail("S8: non-ruled lane_commitment accepted");
+        if (w.find("RULED") == std::string::npos) return fail("S8: lane-commitment refusal does not name the ruling");
+
+        bad2.allow_nonruled_local_only = true;       // single-pool experiment escape hatch
+        if (!bad2.validate_structural(&w)) return fail("S8: local-only override still refused: " + w);
+
+        LaneCommitmentSource p{};
+        if (!parse_lane_commitment_source("state-root", p) || p != LaneCommitmentSource::StateRoot)
+            return fail("S8: parse_lane_commitment_source(state-root)");
+        if (parse_lane_commitment_source("nonsense", p))
+            return fail("S8: parse_lane_commitment_source accepted an unknown name");
     }
     if (why) why->clear();
     return true;

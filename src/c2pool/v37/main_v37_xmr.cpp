@@ -306,7 +306,15 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             e.block_id_hex    = hex_of(s.block_id);
             e.prev_id_hex     = hex_of(s.prev_id);
             e.reward_piconero = s.reward;
-            e.payee           = payee_key;
+            e.payee           = payee_key;   // informational since R-7 (never booked)
+            // R-7 (2026-09-10): the FOUND record books what the COINBASE PAID —
+            // the emitted Role::Owed set, captured at the SUBMIT seam from the
+            // very snapshot whose bytes went to monerod (never re-looked-up here:
+            // the provider ring can evict a template between submit and tick).
+            // Empty under option A (monerod's template pays no v37 owed) and for
+            // a sink-only option-B block. `credit` (E_b) stays empty until Track
+            // A2 S-1 emission exists.
+            e.coinbase_owed.insert(s.coinbase_owed.begin(), s.coinbase_owed.end());
             e.template_id     = s.template_id;
             e.nonce           = s.nonce;
             e.extra_nonce     = s.extra_nonce;
@@ -358,6 +366,15 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     static_cast<unsigned long long>(fs.orphaned),
                     static_cast<unsigned long long>(fs.refused),
                     fc.pending().size());
+        // R-7 acceptance probe, printed every status tick: the ledger-wide
+        // minimum EffectiveOwed. It must be 0 (i.e. no negative row) for the
+        // whole run, INCLUDING while blocks are pending. The pre-R-7 split-ledger
+        // wiring drove this to -reward per pending FOUND.
+        std::printf("  owed: min_effective_owed=%lld booked=%lld ledger_seq=%llu "
+                    "split_brain_refused=%llu\n",
+                    fc.min_effective_owed(), fc.stats().owed_booked,
+                    static_cast<unsigned long long>(node.ledger().ledger_seq()),
+                    static_cast<unsigned long long>(fc.stats().split_brain_refused));
         std::printf("  %s\n", rx.describe().c_str());
         const std::string g = sink.last();
         if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
@@ -470,11 +487,12 @@ static int run_live(const XmrNodeConfig& cfg) {
             node.stop();
             return 2;
         }
-        std::printf("payee: identity_key=%s… (amount-honest FOUND/FINALIZE records)\n",
+        std::printf("payee: identity_key=%s… (INFORMATIONAL since R-7: this key is logged with "
+                    "each FOUND but is NEVER booked into the ledger — the FOUND payout is the "
+                    "coinbase's own emitted K_fair owed set)\n",
                     hex_of(*payee_key).substr(0, 16).c_str());
     } else {
-        std::printf("payee: no --payee-spend-hex/--payee-view-hex -> FOUND records are valueless "
-                    "{}/{} (the ledger still registers the block)\n");
+        std::printf("payee: no --payee-spend-hex/--payee-view-hex (informational only since R-7)\n");
     }
 
     // ── wire 2: RandomX runtime verify (init on main, BEFORE the listener) ───
@@ -506,6 +524,14 @@ static int run_live(const XmrNodeConfig& cfg) {
         scfg.chain_id   = cfg.lane_chain;
         scfg.h_min      = cfg.settle_h_min;
         scfg.output_cap = cfg.settle_output_cap;
+        scfg.allow_nonruled_local_only = cfg.lane_commitment_local_only;
+        if (!o2::parse_lane_commitment_source(cfg.lane_commitment_source, scfg.lc_source)) {
+            std::printf("REFUSED: --lane-commitment must be one of "
+                        "state-root (RULED) | owed-digest | explicit; got \"%s\"\n",
+                        cfg.lane_commitment_source.c_str());
+            node.stop();
+            return 2;
+        }
         std::array<std::uint8_t, 32> sink_B{}, sink_A{};
         if (serving) {
             if (!o2::hex32(cfg.residual_sink_spend_hex, sink_B) ||
@@ -519,12 +545,32 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
         }
 
-        // The proof ledger (no live S-1 emission yet). Empty => the whole reward
-        // flows to the residual sink (one v37 output). --owed-demo-amount seeds a
-        // distinct K_fair OWED payee (the sink material with spend/view swapped —
-        // still two valid ed25519 points, a different identity) so the assembled
-        // coinbase carries an OWED output alongside the sink (multi-output proof).
-        o2::XmrOwedFixture ledger(cfg.lane_chain);
+        // ── R-7 (2026-09-10): ONE LEDGER ────────────────────────────────────
+        // The coinbase MUST be built against the SAME OwedLedger the finalize
+        // driver writes — the node's: store-backed, RecoveryDriver-replayed,
+        // XmrFinalizeDriver-driven. Before this fix the daemon held TWO disjoint
+        // OwedLedger objects (a settlement one the coinbase paid from, a node one
+        // FINALIZE booked into). The settlement one was never decremented, so
+        // propose_coinbase re-proposed the SAME owed row at its full
+        // EffectiveOwed on EVERY block (a no-double-pay violation of whitepaper
+        // section 9 / OI-W4-5) while the node one went negative by one full
+        // reward per concurrent pending FOUND.
+        // With one ledger, block N+1's proposal already sees block N's pending
+        // payout deducted (effective_owed = finalW - SUM_pending payout), so a
+        // row that is already in flight cannot be re-proposed.
+        // `node` outlives `ledger`, the provider and every retained template.
+        //
+        // --owed-demo-amount seeds a distinct K_fair OWED payee (the sink
+        // material with spend/view swapped — still two valid ed25519 points, a
+        // different identity) so the assembled coinbase carries an OWED output
+        // alongside the sink (multi-output proof). With no seed and an empty
+        // ledger the whole reward flows to the residual sink (one v37 output).
+        // NOTE (honest scope): the demo seed is written straight into the
+        // in-memory ledger, NOT through the settle-store write-ahead log, so it
+        // does not survive a restart and IS re-applied on every boot that passes
+        // the flag. It is a proof knob, not lane state; real owed arrives with
+        // Track A2 S-1 emission.
+        o2::XmrOwedFixture ledger(node.ledger());
         if (serving && cfg.owed_demo_amount) {
             ledger.seed_owed_std(sink_A, sink_B, cfg.owed_demo_amount);
             std::printf("owed-demo: seeded %llu piconero owed to a distinct K_fair payee "
@@ -534,9 +580,20 @@ static int run_live(const XmrNodeConfig& cfg) {
 
         o2::XmrSettlementTemplateProvider provider(transport, ledger, scfg, cfg.stratum_share_diff);
         o2::SettlementStratumTemplateSource template_source(provider);
-        std::printf("coinbase: %s (lane_chain=%u, residual sink %s)\n",
-                    to_string(cfg.coinbase), static_cast<unsigned>(cfg.lane_chain),
-                    serving ? "SET (torsion-checked at build)" : "UNSET (observe-side only)");
+        // Serve banner: name the two RULED consensus choices and print the
+        // resolved 32-byte lane commitment, so a node's committed value is
+        // auditable straight from the log (RULED 2026-09-10).
+        {
+            const ::v37::bytes32 lc = o2::resolve_lane_commitment(scfg, ledger.ledger());
+            char lc_hex[65];
+            for (int i = 0; i < 32; ++i) std::snprintf(lc_hex + 2 * i, 3, "%02x", lc[static_cast<std::size_t>(i)]);
+            std::printf("coinbase: %s (lane_chain=%u, residual sink %s, k_fair=%s, "
+                        "lane_commitment=%s%s %s)\n",
+                        to_string(cfg.coinbase), static_cast<unsigned>(cfg.lane_chain),
+                        serving ? "SET (torsion-checked at build)" : "UNSET (observe-side only)",
+                        o2::to_string(scfg.kfair), o2::to_string(scfg.lc_source),
+                        cfg.lane_commitment_local_only ? " LOCAL-ONLY-OVERRIDE" : "", lc_hex);
+        }
 
         auto candidate = [&provider](std::uint32_t tid, std::uint32_t en, sub::BlockCandidate& out) {
             std::string w;
@@ -615,6 +672,8 @@ int main(int argc, char** argv) {
         else if (a == "--settle-output-cap") cfg.settle_output_cap =
                      static_cast<std::uint32_t>(std::stoul(next("0")));
         else if (a == "--owed-demo-amount") cfg.owed_demo_amount = std::stoull(next("0"));
+        else if (a == "--lane-commitment") cfg.lane_commitment_source = next("state-root");
+        else if (a == "--lane-commitment-local-only") cfg.lane_commitment_local_only = true;
         else if (a == "--lane-chain") cfg.lane_chain =
                      static_cast<::v37::ChainId>(std::stoul(next("0")));
         else if (a == "--d-conf") cfg.d_conf = std::stoull(next("60"));
@@ -650,7 +709,14 @@ int main(int argc, char** argv) {
                 "  --settle-h-min <pico>        owed-output floor (0 on XMR)\n"
                 "  --settle-output-cap <n>      TOTAL outputs cap (0 = weight-aware default)\n"
                 "  --owed-demo-amount <pico>    seed one K_fair OWED payee into the proof ledger\n"
-                "                               (coinbase carries OWED + residual sink)\n");
+                "                               (coinbase carries OWED + residual sink)\n"
+                "  --lane-commitment <state-root|owed-digest|explicit>\n"
+                "                               what the tx_extra 0x03 MM root binds and what seeds\n"
+                "                               the tx secret key r. RULED 2026-09-10: state-root =\n"
+                "                               the whitepaper section 13 StateCommitment root\n"
+                "                               (default; strictly subsumes owed-digest)\n"
+                "  --lane-commitment-local-only accept a non-ruled --lane-commitment for a\n"
+                "                               SINGLE-POOL experiment (never for a lane with peers)\n");
             return 0;
         }
     }

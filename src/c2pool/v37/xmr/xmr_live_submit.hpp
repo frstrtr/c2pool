@@ -77,6 +77,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -154,7 +155,19 @@ inline bool patch_u32_le(std::vector<std::uint8_t>& blob, std::size_t off, std::
 // the same block header (varint major ‖ varint minor ‖ varint ts ‖ prev[32]) —
 // and validate_candidate() enforces it, so a mismatched pair can never be
 // submitted under the wrong id.
+//
+// R-7 (2026-09-10): the candidate ALSO carries `coinbase_owed` — the Role::Owed
+// outputs of the coinbase in `full_blob`, by identity key. This is the seam the
+// map is captured at ON PURPOSE: the candidate is resolved from the very
+// snapshot whose bytes are submitted, so the FOUND record can never book a
+// payout that a different (or evicted) template would have paid.
 // ===========================================================================
+
+// { identity_key : piconero } over the K_fair OWED outputs of a coinbase. Spelled
+// structurally (bytes32 == std::array<std::uint8_t,32>) so this consumer header
+// never pulls w4_settlement.hpp; it IS OwedLedger::Amounts, and assigns freely.
+using OwedPayout = std::map<std::array<std::uint8_t, 32>, long long>;
+
 struct BlockCandidate {
     std::uint32_t template_id = 0;
     std::uint64_t height = 0;                 // Monero height of the block
@@ -181,6 +194,13 @@ struct BlockCandidate {
     Hash          prev_id{};                  // template prev_hash (zero = unknown)
     std::uint64_t expected_reward = 0;        // piconero (get_block_template.expected_reward)
     std::uint8_t  major_version = 0;          // template major_version (diagnostic)
+
+    // R-7: the K_fair OWED outputs this exact block pays, { identity : amount },
+    // read from the EMITTED coinbase outputs (CoinbaseOutput::Role::Owed only —
+    // never Fixed, never Sink, never a re-run of the W4 projection). EMPTY under
+    // option A (monerod's get_block_template block is not a v37 settlement, so
+    // it extinguishes no owed) and empty for a sink-only option-B block.
+    OwedPayout    coinbase_owed;
 };
 
 // Validate a candidate BEFORE any bytes are touched. Returns "" when sane.
@@ -548,6 +568,11 @@ struct FoundBlockEvent {
     double        rpc_ms = 0.0;
     std::chrono::steady_clock::time_point at{};
 
+    // R-7: carried verbatim from the BlockCandidate that produced the submitted
+    // bytes — the K_fair OWED set this block actually paid. The main thread
+    // books EXACTLY this as OwedLedger's `payout` term.
+    OwedPayout    coinbase_owed;
+
     std::string block_id_hex() const { return mj::hash_to_hex(block_id); }
 };
 
@@ -646,6 +671,10 @@ public:
         ev.id_mismatch  = o.id_mismatch;
         ev.header_check = o.header_check;
         ev.rpc_ms       = o.rpc_ms;
+        // R-7: the K_fair OWED set the SUBMITTED bytes pay, captured from the
+        // same candidate. Never re-looked-up later (a template can be evicted
+        // from the provider ring between submit and the main thread's tick).
+        ev.coinbase_owed = c.coinbase_owed;
         ev.at           = std::chrono::steady_clock::now();
         m_found.push(std::move(ev));
         set_error({});
@@ -702,6 +731,11 @@ inline std::string describe(const FoundBlockEvent& e) {
     if (!e.worker.empty() || !e.address.empty())
         s += " worker=" + (e.worker.empty() ? std::string("-") : e.worker) +
              " addr=" + (e.address.size() > 12 ? e.address.substr(0, 12) + "…" : e.address);
+    // R-7 observability: how much owed this block actually extinguishes.
+    long long owed_sum = 0;
+    for (const auto& [k, v] : e.coinbase_owed) { (void)k; owed_sum += v; }
+    s += " owed_rows=" + std::to_string(e.coinbase_owed.size()) +
+         " owed_paid=" + std::to_string(owed_sum) + "pico";
     return s;
 }
 

@@ -292,11 +292,18 @@ if (BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
     target_link_libraries(v37_xmr_o2_live_submit_selfcheck PRIVATE xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_o2_live_submit_selfcheck COMMAND v37_xmr_o2_live_submit_selfcheck)
-    # v37_xmr_o2_finalize_connect_selfcheck: queued win -> XmrNode::
-    # on_network_block_won (amount-honest FOUND) -> restart inside the D_conf
-    # window -> pending-FOUND sidecar re-drive -> FINALIZE at bin_height =
-    # H_b + D_conf -> finalW nets to 0; late-FOUND / malformed / all-zero bid
-    # refusals; orphan disposition. Same shape as v37_xmr_node_smoke (monerod
+    # v37_xmr_o2_finalize_connect_selfcheck: an S-1-shaped credit block ARMS owed
+    # -> a settlement win whose coinbase pays part of it -> queued win ->
+    # XmrNode::on_network_block_won booking the EMITTED Role::Owed set (R-7) ->
+    # restart inside the D_conf window -> the schema-v2 pending-FOUND sidecar
+    # re-drives the SAME payout map -> FINALIZE at bin_height = H_b + D_conf
+    # extinguishes that owed EXACTLY ONCE. Pins R-7's two invariants: INV-1
+    # effective_owed >= 0 at every step (it used to go to -reward per pending
+    # FOUND) and INV-2 a FINALIZE moves effective_owed by exactly +credit
+    # (OI-W4-5). Plus the split-brain precheck, the option-A degenerate {}/{}
+    # record, the v1 legacy sidecar path, the sidecar codec round trip, and the
+    # late-FOUND / malformed / all-zero bid refusals + orphan disposition.
+    # Same shape as v37_xmr_node_smoke (monerod
     # STUB, injected test point-check backend). SAME HOLLOW-GREEN GUARD: both
     # targets are listed in the build.yml --target lists (BOTH the Linux x86_64
     # leg and the ASan+UBSan leg) so CI compiles + runs them.
@@ -324,6 +331,46 @@ if (BUILD_TESTING)
         target_compile_definitions(v37_xmr_o2_randomx_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
         target_link_libraries(v37_xmr_o2_randomx_kat PRIVATE xmr_coin randomx Threads::Threads)
         add_test(NAME v37_xmr_o2_randomx_kat COMMAND v37_xmr_o2_randomx_kat)
+    endif()
+
+    # v37_xmr_o2_settlement_kat: the MULTI-NODE settlement KATs for option B —
+    # the first test executable over the CONSUMER option-B settlement path
+    # (XmrOwedSettlementSource / xmr_o2_settlement_fixture / the assembler's
+    # per-reward re-projection hook). Pins the two operator rulings of
+    # 2026-09-10:
+    #   (KW) the payee set IS OwedLedger::propose_coinbase output AT THE REWARD
+    #        THE BLOCK PAYS, proven against an INDEPENDENT K_fair reference walk
+    #        written in the KAT; non-W4Propose sources are refused at both gates.
+    #   (KS) the coinbase's MM-root leaf commits the whitepaper section-13
+    #        StateCommitment root; a verifier holding the same ledger recovers
+    #        it; the section-13 O(log n) balance proof verifies against exactly
+    #        that root.
+    #   (KC) the reward/payee-set fixpoint stays fail-closed when re-projection
+    #        changes the set SIZE, and an EMPTY hook is byte-identical to before.
+    # Same recipe as impl/xmr/test's xmr_block_assembly_kat (it drives the same
+    # template port + X6 executor and needs the real ed25519 point-check
+    # backend), plus the consumer W4/W5 headers. Gated behind the SAME
+    # XMR_BUILD_OPTION_B_KATS option so ctest never registers a NOT_BUILT
+    # sentinel in a build whose --target list omits it; build.yml's Linux
+    # x86_64 leg sets the option AND lists the target.
+    # ci-allowlist-exempt: v37_xmr_o2_settlement_kat -- heavy option-B leg (template port + X6 settle + ref10 point-check), gated behind XMR_BUILD_OPTION_B_KATS exactly like its impl-side sibling.
+    # Idempotent re-declaration: option() never overwrites an existing cache
+    # entry, so this only matters if src/impl/xmr/test was not configured.
+    option(XMR_BUILD_OPTION_B_KATS
+           "Build the heavy X9 option-B XMR KATs (local; not in the CI --target allowlist)" OFF)
+    if (XMR_BUILD_OPTION_B_KATS AND TARGET xmr_template)
+        add_executable(v37_xmr_o2_settlement_kat
+            v37_xmr_o2_settlement_kat.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+        target_link_libraries(v37_xmr_o2_settlement_kat PRIVATE xmr_template)
+        target_include_directories(v37_xmr_o2_settlement_kat PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+        target_compile_definitions(v37_xmr_o2_settlement_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+        target_compile_features(v37_xmr_o2_settlement_kat PRIVATE cxx_std_20)
+        add_test(NAME v37_xmr_o2_settlement_kat COMMAND v37_xmr_o2_settlement_kat)
     endif()
 
     # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.

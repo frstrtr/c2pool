@@ -127,7 +127,15 @@ void kat_varint() {
     struct V { uint64_t v; const char* hexv; } canon[] = {
         {0, "00"}, {1, "01"}, {127, "7f"}, {128, "8001"}, {255, "ff01"}, {300, "ac02"},
         {16383, "ff7f"}, {16384, "808001"}, {0xFFFFFFFFULL, "ffffffff0f"},
-        {600000000000ULL, "80a094a58b11"},                       // 0.6 XMR tail reward
+        // 0.6 XMR tail reward. The literal here was a hand-written constant and
+        // was WRONG: LEB128(600000000000) is 80 e0 a5 96 bb 11 (600000000000 =
+        // 0x8BA43B7400; septets from the LSB are 0x00,0x60,0x25,0x16,0x3B,0x11).
+        // The old "80a094a58b11" decodes to 587146268672. The implementation was
+        // always right — xmr_block_assembly_kat's K0 already pins
+        // writeVarint(600000000000) against the vendored tools::write_varint —
+        // but this KAT was never in the CI target list, so the bad golden went
+        // unseen until the option-B KATs were wired into build.yml.
+        {600000000000ULL, "80e0a596bb11"},
         {(1ULL << 56) - 1, "ffffffffffffff7f"},                   // MAX_OUTPUT_VALUE
         {UINT64_MAX, "ffffffffffffffffff01"},
     };

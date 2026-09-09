@@ -24,8 +24,12 @@
 // It never touches src/sharechain/v37 (its descriptor_xmr header is a
 // read-only value consumer, exactly as X6 uses it).
 //
-// WHERE THE K_FAIR SET COMES FROM (the survey's gate flag, ruling owed):
-//   * KFairSource::W4Propose (DEFAULT, recommended): the owed output set and
+// WHERE THE K_FAIR SET COMES FROM — RULED 2026-09-10 (multi-node): W4Propose,
+// and ONLY W4Propose. build() REFUSES any other source (fail-closed), and the
+// projection lives in the free function project_w4_owed() below so the
+// assembler can RE-PROJECT it at every reward its fixpoint visits — the block
+// pays the proposal at the reward it ACTUALLY settles on, not at a stale hint.
+//   * KFairSource::W4Propose (RULED): the owed output set and
 //     order are OwedLedger::propose_coinbase (w4_settlement.hpp:565 — the
 //     canonical (first_eligible ASC, key ASC) walk with take = min(owed,
 //     budget) and CARRY on take < h_min). X6 is then a pure crypto/serialize
@@ -33,7 +37,9 @@
 //     index), h_min := 0, so allocate_exact_sum reproduces the proposal
 //     byte-for-byte and appends the residual sink. This is the BTC W5 shape
 //     ("the order is W4's and cannot drift", w5_coinbase.hpp:299-322).
-//   * KFairSource::X6Allocate (alternative, needs AgeOf): owed := every
+//   * KFairSource::X6Allocate (REFUSED since the ruling; the enum value is
+//     kept for one release so an old config fails LOUDLY instead of silently
+//     changing meaning): owed := every
 //     EffectiveOwed > 0 with first_eligible := age_of(key) and h_min := ctx.h_min;
 //     X6's own sort + skip/break rule decides (mbp_wiring.hpp OwedCoinbaseBridge
 //     shape). Kept ONLY so the operator ruling is a one-line flip.
@@ -49,6 +55,13 @@
 //   keccak(MM_LEAF_DOMAIN || chain_id_le32 || lane_commitment) are fixed for
 //   the template's lifetime. Only the AMOUNTS vary with the reward the template
 //   settles on, and those are re-allocated deterministically in split_reward().
+//
+// LANE COMMITMENT — RULED 2026-09-10 (multi-node): ctx.lane_commitment is the
+// whitepaper §13 StateCommitment Merkle root (lane_commitment_from_state_root
+// below), NOT the narrower owed_digest. The §13 summary leaf already contains
+// owed_digest, so the new binding strictly subsumes the old one. It also seeds
+// the deterministic tx secret key r, so the whole coinbase moves — every pinned
+// option-B byte golden had to be regenerated with this change.
 //
 // COUNT INVARIANCE (survey must_implement 3a — NOT solved here, by design):
 //   XmrBlockTemplate::update() calls split_reward twice (dry run at
@@ -104,6 +117,7 @@
 #include <vector>
 
 #include <c2pool/v37/w4_settlement.hpp>            // OwedLedger (merged; propose_coinbase, owed_digest)
+#include <c2pool/v37/w5_coinbase.hpp>              // StateCommitment (the whitepaper §13 state root)
 #include <sharechain/v37/v37_descriptor.hpp>        // ScriptRef, ScriptKind (read-only canon)
 #include <sharechain/v37/v37_descriptor_xmr.hpp>    // xmr_ref_valid, is_xmr_kind, xmr_precarrot_ok
 #include <sharechain/v37/v37_hash.hpp>              // bytes32
@@ -198,12 +212,156 @@ struct XmrCoinbaseContext {
 };
 
 // The lane_commitment source the survey recommends: the §4.5 OWED commitment
-// over the finalized partition (public, const, deterministic). Whether this or
-// the lane digest / SettlementView::digest goes into r and the MM root is a
-// consensus ruling; the provider picks EXPLICITLY and passes it in ctx.
+// over the finalized partition (public, const, deterministic). Superseded as
+// the DEFAULT by the §13 state root below (operator ruling 2026-09-10); kept
+// for single-pool experiments and for the golden-regeneration KAT.
 inline ::v37::bytes32 lane_commitment_from_owed_digest(const OwedLedger& ledger) {
     return ledger.owed_digest();
 }
+
+// RULED 2026-09-10 (multi-node): the MM-root leaf in the coinbase tx_extra 0x03
+// commits the FULL whitepaper §13 StateCommitment Merkle root — the SAME root
+// w5_coinbase.hpp builds (summary leaf "V37S" || chain || ledger_seq ||
+// num_balances || owed_digest, then per-key "V37E" || key || balance leaves,
+// key ASC). STRICT SUBSUMPTION: the summary leaf already CONTAINS owed_digest,
+// so committing the root strictly strengthens the previous owed_digest binding.
+//
+// We commit the ROOT VALUE the engine computes, never a re-derivation from
+// pinned constants, so the binding is robust to any later change in what §13
+// hashes — but note that such a change MOVES the root and is therefore
+// lane-consensus-visible (needs an activation gate; see the PR's ruling R-3).
+inline ::v37::bytes32 lane_commitment_from_state_root(const OwedLedger& ledger) {
+    return ::c2pool::v37n::coinbase::StateCommitment(ledger, ledger.chain()).root();
+}
+
+// ---------------------------------------------------------------------------
+// project_w4_owed — the ONE place the canonical K_fair owed set is computed.
+//
+// RULED 2026-09-10: KFairSource == W4Propose. The XMR coinbase selects payees
+// by the ONE ratified K_fair rule — OwedLedger::propose_coinbase (oldest-owed-
+// first: first_eligible ASC then identity ASC, whitepaper erratum E-1) — so
+// every node derives the SAME output set from the same ledger. X6 is then a
+// pure crypto/serialize + exact-sum sink executor: it is fed owed := take_i,
+// first_eligible := i (the proposal index) and h_min := 0, which makes
+// allocate_exact_sum reproduce the proposal byte-for-byte.
+//
+// This is a FREE function (not a build() private) because the assembler must
+// RE-PROJECT at every reward its count-invariance fixpoint visits — the payee
+// set has to be W4's proposal at the reward the block ACTUALLY pays, not at the
+// first sizing hint. One body, one order, no second implementation.
+//
+//   h_min           : the owed floor W4 applies (XMR dust = 0 today).
+//   n_fixed         : ctx.fixed.size() (mandated outputs, each takes a slot).
+//   fixed_sum       : Σ fixed amounts (subtracted from the owed budget).
+//   reward          : the exact-sum budget the set is chosen at.
+//   total_output_cap: the RESOLVED total-output cap C (never the 0 sentinel).
+//   out             : receives the projected x6::OwedEntry rows (cleared first).
+//   unpayable       : optional count of keys CARRIED for an unpayable ref.
+//   why             : filled on refusal.
+// ---------------------------------------------------------------------------
+inline bool project_w4_owed(const OwedLedger& ledger, const PayOfFn& pay_of,
+                            std::uint64_t h_min, std::size_t n_fixed,
+                            std::uint64_t fixed_sum, std::uint64_t reward,
+                            std::uint32_t total_output_cap,
+                            std::vector<x6::OwedEntry>& out,
+                            std::size_t* unpayable = nullptr,
+                            std::string* why = nullptr) {
+    auto no = [&](const std::string& m) { if (why) *why = m; return false; };
+    out.clear();
+    if (!pay_of)                        return no("project_w4_owed: no pay_of resolver");
+    if (reward == 0)                    return no("project_w4_owed: zero reward");
+    if (total_output_cap < n_fixed + 1) return no("project_w4_owed: output_cap leaves no room for fixed + sink");
+    if (fixed_sum > reward)             return no("project_w4_owed: Σfixed exceeds the reward");
+
+    // A key whose ref is not a payable XMR ref is downgraded to a RAW sentinel;
+    // W4's h_min_of(RAW) = UINT64_MAX then CARRIES it (canon branch,
+    // deterministic across nodes with the same point-check backend).
+    std::size_t carried = 0;
+    auto payable_ref = [&](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+        ::v37::ScriptRef r = pay_of(k);
+        if (!::v37::xmr::xmr_ref_valid(r)) {
+            ++carried;
+            ::v37::ScriptRef raw; raw.kind = ::v37::ScriptKind::RAW; raw.payload.clear();
+            return raw;
+        }
+        return r;
+    };
+
+    const unsigned cap_owed = static_cast<unsigned>(
+        std::min<std::size_t>(static_cast<std::size_t>(total_output_cap) - n_fixed - 1,
+                              std::numeric_limits<unsigned>::max()));
+    // ── COUNT-INVARIANCE GUARD (2026-09-10) ─────────────────────────────────
+    // The two layers that meet here use the SAME arithmetic with OPPOSITE
+    // conventions for 0:
+    //   * W4 canon reads slot_budget_C == 0 as UNBOUNDED output count
+    //     (w4_settlement.hpp:580-583, symmetric with W5's max_payout_bytes==0);
+    //   * X6 reads its own cap_owed == 0 as "no room for any owed output"
+    //     (xmr_coinbase.cpp:113-114 + :135).
+    // cap_owed == 0 <=> total_output_cap == n_fixed + 1: room for the mandated
+    // outputs and the residual sink and NOTHING else. Forwarding that 0 to W4
+    // would propose EVERY eligible key while X6 emits zero owed outputs — the
+    // whole owed budget silently lands in the residual sink while the proposal
+    // claims N rows. Reachable on ordinary FULL blocks, not a synthetic edge:
+    // weight_aware_output_cap floors its result at 1 ("always room for at least
+    // the residual sink", xmr_coinbase.cpp:430-433), so any block whose selected
+    // txs fill the penalty-free zone resolves the cap to 1 == n_fixed + 1 under
+    // the default empty `fixed` set.
+    //
+    // Disposition: CLEAR AND SUCCEED — emit ZERO owed rows and CARRY every key.
+    //   (a) it matches X6's OWN legality boundary (BuildError::CapTooSmall is
+    //       output_cap < fixed.size() + 1, xmr_coinbase.hpp:200 / .cpp:110-111),
+    //       so the projection accepts exactly the templates X6 accepts;
+    //   (b) a refusal here is PERMANENTLY fatal, not a retry signal: the outer
+    //       pass loop dies (xmr_block_assembly.hpp:585-586) and the split_reward
+    //       path asks for a rebuild at the same reward, whose weight-aware cap
+    //       is the same deterministic function of the same inputs — it would
+    //       refuse identically until max_passes is exhausted. The node would
+    //       STOP SERVING every time its block is full: fail-STOPPED, not
+    //       fail-closed;
+    //   (c) it IS fail-closed where it matters: nothing is over-paid, no payee
+    //       is short-changed. Every owed row is CARRIED with the SAME
+    //       disposition as W4's own sub-h_min CARRY ("skip, first_eligible
+    //       untouched -- no starvation, the entry keeps its age",
+    //       w4_settlement.hpp:586-587), so the K_fair queue ages are undamaged
+    //       and the next block with cap room pays them.
+    // A named refusal would be right only if cap_owed == 0 could signal an
+    // upstream sentinel leak. It cannot: total_output_cap == 0 is already
+    // refused at the :273 guard above, and xmr_block_assembly.hpp:572-573
+    // resolves the 0 sentinel before this hook is ever called.
+    if (cap_owed == 0) {
+        if (unpayable) *unpayable = 0;   // nothing was even walked
+        if (why) why->clear();
+        return true;                     // `out` was cleared at the top
+    }
+
+    const std::uint64_t owed_budget = reward - fixed_sum;
+    auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
+        return ::v37::xmr::is_xmr_kind(k) ? h_min : std::numeric_limits<std::uint64_t>::max();
+    };
+
+    OwedLedger::Proposal prop = ledger.propose_coinbase(owed_budget, cap_owed,
+                                                        payable_ref, h_min_of);
+    out.reserve(prop.outs.size());
+    for (std::size_t i = 0; i < prop.outs.size(); ++i) {
+        x6::OwedEntry e;
+        e.pay            = prop.outs[i].pay;
+        e.owed           = prop.outs[i].amount;   // exactly the proposed take
+        e.first_eligible = i;                     // proposal index == canonical order
+        e.identity       = prop.outs[i].key;
+        out.push_back(std::move(e));
+    }
+    if (unpayable) *unpayable = carried;
+    if (why) why->clear();
+    return true;
+}
+
+// The per-reward re-projection callback the assembler consumes. Structurally
+// identical to XmrBlockAssembler's X6SettlementSource::ReprojectOwedFn (the
+// impl tree must not include consumer headers, so the type is spelled twice —
+// it is the SAME std::function specialisation, so they assign freely).
+using ReprojectOwedFn =
+    std::function<bool(std::uint64_t reward, std::uint32_t output_cap,
+                       std::vector<x6::OwedEntry>& out, std::string* why)>;
 
 // ===========================================================================
 // XmrOwedSettlementSource
@@ -250,8 +408,16 @@ public:
                 return refuse(std::string("refused: ") + x6::to_string(x6::BuildError::FixedExceedsBudget));
             fixed_sum += f.amount;
         }
-        if (source == KFairSource::X6Allocate && !age_of)
-            return refuse("refused: KFairSource::X6Allocate needs an AgeOf resolver");
+        // RULED 2026-09-10 (multi-node consensus): the ONLY admissible K_fair
+        // source is W4Propose — OwedLedger::propose_coinbase, the one ratified
+        // rule (oldest-owed-first, whitepaper erratum E-1). X6Allocate would
+        // let a node derive a DIFFERENT output set from the same ledger, so it
+        // is refused here, fail-closed, rather than left silently selectable.
+        if (source != KFairSource::W4Propose)
+            return refuse("RULED 2026-09-10: KFairSource must be W4Propose "
+                          "(canonical K_fair propose_coinbase, whitepaper E-1); "
+                          "X6Allocate is refused for multi-node settlement");
+        (void)age_of;   // W4Propose never asks the ledger for an age
 
         std::unique_ptr<XmrOwedSettlementSource> s(new XmrOwedSettlementSource());
         s->m_ctx         = ctx;
@@ -273,60 +439,26 @@ public:
         in.output_cap             = ctx.output_cap;
         in.extra_nonce.clear();
 
-        // A key whose ref is not a payable XMR ref is downgraded to a RAW
-        // sentinel; W4's h_min_of(RAW) = UINT64_MAX then CARRIES it (canon
-        // branch, deterministic across nodes with the same backend).
+        // The canonical K_fair projection — the SAME free function the
+        // assembler's per-reward re-projection hook calls, so the set the block
+        // pays is OwedLedger::propose_coinbase output at the block's reward.
         std::size_t unpayable = 0;
-        auto payable_ref = [&](const ::v37::bytes32& k) -> ::v37::ScriptRef {
-            ::v37::ScriptRef r = pay_of(k);
-            if (!::v37::xmr::xmr_ref_valid(r)) {
-                ++unpayable;
-                ::v37::ScriptRef raw; raw.kind = ::v37::ScriptKind::RAW; raw.payload.clear();
-                return raw;
-            }
-            return r;
-        };
-
-        const unsigned cap_owed = static_cast<unsigned>(
-            std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - 1,
-                                  std::numeric_limits<unsigned>::max()));
-
-        if (source == KFairSource::W4Propose) {
-            // W4 canon picks the set over budget - Σfixed with C = cap - fixed - sink.
-            const std::uint64_t owed_budget = reward_hint - fixed_sum;
-            auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
-                return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
-                                                  : std::numeric_limits<std::uint64_t>::max();
-            };
-            OwedLedger::Proposal prop = ledger.propose_coinbase(owed_budget, cap_owed,
-                                                                payable_ref, h_min_of);
-            in.owed.reserve(prop.outs.size());
-            for (std::size_t i = 0; i < prop.outs.size(); ++i) {
-                x6::OwedEntry e;
-                e.pay            = prop.outs[i].pay;
-                e.owed           = prop.outs[i].amount;   // exactly the proposed take
-                e.first_eligible = i;                     // proposal index == canonical order
-                e.identity       = prop.outs[i].key;
-                in.owed.push_back(std::move(e));
-            }
-            in.h_min = 0;                                 // W4 already applied the floor
-        }
-        else {
-            // X6 decides: every EffectiveOwed > 0 with its real age; X6 sorts
-            // (first_eligible ASC, identity ASC) and applies its own h_min rule.
-            for (const auto& [k, owed] : ledger.effective_owed_all()) {
-                if (owed <= 0) continue;
-                ::v37::ScriptRef r = payable_ref(k);
-                if (!::v37::xmr::is_xmr_kind(r.kind)) continue;   // unpayable => carry
-                x6::OwedEntry e;
-                e.pay            = r;
-                e.owed           = static_cast<std::uint64_t>(owed);
-                e.first_eligible = age_of(k);
-                e.identity       = k;
-                in.owed.push_back(std::move(e));
-            }
-            in.h_min = ctx.h_min;
-        }
+        std::string pw;
+        if (!project_w4_owed(ledger, pay_of, ctx.h_min, ctx.fixed.size(), fixed_sum,
+                             reward_hint, ctx.output_cap, in.owed, &unpayable, &pw))
+            return refuse("refused: " + pw);
+        // LOAD-BEARING 0 (do not "restore" ctx.h_min here). W4 has already
+        // applied the owed floor while choosing the set, and each row's `owed`
+        // IS its accepted take. Feeding X6 a NON-zero h_min would reintroduce a
+        // two-conventions divergence of exactly the class the count-invariance
+        // guard above closes: on a budget-truncated final partial W4 CARRYs and
+        // KEEPS SCANNING (w4_settlement.hpp:586-587) while X6 BREAKs and stops
+        // (xmr_coinbase.cpp:137-139), so X6 would emit a strict PREFIX of the
+        // proposal and the residual sink would swallow the difference. The
+        // FOUND payout map is read from the EMITTED outputs (Role::Owed), so it
+        // stays correct either way — but the proposal/emission divergence would
+        // silently under-pay carried payees. Keep it 0.
+        in.h_min = 0;                                     // W4 already applied the floor
         s->m_unpayable = unpayable;
 
         // ---- run X6 once at reward_hint: fixes r, R, keys, view tags, MM leaf, ORDER ----
@@ -482,12 +614,35 @@ public:
         return outputs_at(reward).size();
     }
 
-    // FOUND-record `payout`: { identity_key : piconero } over EVERY output the
-    // coinbase actually pays (owed keys, fixed identities, the sink identity),
-    // at the reward the template settled on (XmrBlockTemplate::get_reward()).
-    // Duplicate identities (e.g. a sink that is also an owed key) SUM. Empty
-    // when the allocation at `reward` fails or its shape does not match.
-    Amounts payout_map_at(std::uint64_t reward) const {
+    // FOUND-record `payout` — R-7 (2026-09-10): the Role::Owed SUBSET ONLY,
+    // { identity_key : piconero }, at the reward the template settled on
+    // (XmrBlockTemplate::get_reward()). This is what OwedLedger::on_block_found
+    // may be handed: the payout term is SUBTRACTED from finalW at FINALIZE
+    // (w4_settlement.hpp:485-500) and is legal only for keys the ledger
+    // CREDITED. A Fixed or Sink identity was never credited, so booking it
+    // would drive that key's finalW permanently negative — they are EXCLUDED.
+    // Duplicate owed identities SUM. Empty when the allocation at `reward`
+    // fails or its shape does not match.
+    //
+    // NOTE for the live daemon: prefer the EMITTED outputs of the FINAL
+    // AssembledTemplate (AssembledTemplate::outputs()) over this re-derivation.
+    // They agree on the snapshot's own shape by construction (same_shape), but
+    // the assembled template is the thing the block actually broadcast.
+    Amounts owed_payout_map_at(std::uint64_t reward) const {
+        Amounts m;
+        bool ok = false;
+        const std::vector<x6::CoinbaseOutput> outs = outputs_at(reward, &ok);
+        if (!ok) return m;
+        for (const auto& o : outs)
+            if (o.role == x6::CoinbaseOutput::Role::Owed)
+                m[o.identity] += static_cast<long long>(o.amount);
+        return m;
+    }
+    Amounts owed_payout_map() const { return owed_payout_map_at(m_reward_hint); }
+
+    // EVERY output the coinbase pays (owed ++ fixed ++ sink), for AUDIT /
+    // exact-sum diagnostics only. NEVER a FOUND payout map — see above.
+    Amounts all_outputs_map_at(std::uint64_t reward) const {
         Amounts m;
         bool ok = false;
         const std::vector<x6::CoinbaseOutput> outs = outputs_at(reward, &ok);
@@ -495,7 +650,6 @@ public:
         for (const auto& o : outs) m[o.identity] += static_cast<long long>(o.amount);
         return m;
     }
-    Amounts payout_map() const { return payout_map_at(m_reward_hint); }
 
 private:
     XmrOwedSettlementSource() = default;
