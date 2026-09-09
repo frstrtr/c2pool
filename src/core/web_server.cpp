@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <core/host_port.hpp>
 #include "web_server.hpp"
 #include "stratum_server.hpp"
 #include <algorithm>   // std::max — authorship only ever climbs, never downgrades
@@ -2810,8 +2811,9 @@ nlohmann::json MiningInterface::rest_stratum_stats()
         unique_addrs.insert(w.username);
 
         // Track connections per IP
-        auto colon = w.remote_endpoint.rfind(':');
-        std::string ip = (colon != std::string::npos) ? w.remote_endpoint.substr(0, colon) : w.remote_endpoint;
+        // #965 Phase-2: IPv6-aware split (endpoint is bracketed for v6 at the
+        // stratum producer), so group by the bare host across both families.
+        std::string ip = core::parse_host_port(w.remote_endpoint).host;
         if (!ip.empty()) {
             ip_connections[ip]++;
             ip_workers_set[ip].insert(w.username);

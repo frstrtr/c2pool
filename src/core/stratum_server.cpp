@@ -881,8 +881,12 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             wi.difficulty = hashrate_tracker_.get_current_difficulty();
             wi.connected_at = connected_at_;
             try {
-                wi.remote_endpoint = socket_.remote_endpoint().address().to_string()
-                    + ":" + std::to_string(socket_.remote_endpoint().port());
+                const auto rep = socket_.remote_endpoint();
+                const auto addr = rep.address().to_string();
+                // #965 Phase-2: bracket IPv6 so "host:port" stays unambiguous
+                // for the web_server per-IP grouping consumer.
+                wi.remote_endpoint = (rep.address().is_v6() ? "[" + addr + "]" : addr)
+                    + ":" + std::to_string(rep.port());
             } catch (...) {}
             wi.rtt_ms = sample_tcp_rtt_ms(socket_.native_handle());
             mining_interface_->register_stratum_worker(session_id_, wi);
