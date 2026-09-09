@@ -1,0 +1,3 @@
+CRIT-2 two-run demo for #1547 run_attempt gate.
+DO NOT MERGE. Scratch PR to prove B coin-matrix survives rerun of stale A.
+run-A armed: 2026-09-09T16:38:33Z
