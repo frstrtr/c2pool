@@ -1,2 +1,5 @@
 Criterion-2 two-run demo scratch marker (PR #1545 concurrency fix).
 Commit 1 of 2 — arms CI Required run A. Do not merge.
+Commit 2 of 2 — arms CI Required run B on a fresh SHA. Do not merge.
+With #1545's per-run-instance concurrency groups, rerunning the superseded
+run A must NOT cancel run B's live coin matrix. This commit triggers run B.
