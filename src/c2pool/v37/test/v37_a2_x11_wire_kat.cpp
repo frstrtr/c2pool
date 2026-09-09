@@ -3,13 +3,18 @@
 // 0x02 golden hex, the independent frame_size/offset model, lossless decode +
 // byte-identical re-encode, every-strict-prefix -> REJECT_TRUNCATED, trailing
 // byte, bad-version, W3-MUST carrier mis-bind, the dual-accept front door
-// (routing BOTH a real 0x01 synthetic frame and a 0x02 X11 frame), and the
-// injected-hook X11 verify path incl. its FAIL-CLOSED no-hook case. Stdlib-only:
-// the X11 permutation is reached through an injected sha256d stub, so the KAT
-// needs no SSOT link (mirrors v37_w3_wire_freeze_kat). The daemon installs the
-// real dash::crypto::hash_x11 hook at boot; the SSOT-linked end-to-end real-X11
-// proof (dash::verify_x11_share + X11ReceiptAdmitter over a live mining.submit)
-// lives in the out-of-tree S-1 proof harness described in the PR.
+// (routing BOTH a real 0x01 synthetic frame and a 0x02 X11 frame), and the X11
+// crypto seam structurally (fail-closed when unset, set/get round-trip).
+// Stdlib-only and deliberately CRYPTO-FREE: this target keeps the BYTES honest
+// and states no PoW policy at all — target math, the X11 recompute and every
+// verify disposition are the DASH SSOT (impl/dash/x11_share_verify.hpp).
+//
+// Its counterpart v37_a2_x11_real_pow_kat keeps the WORK honest: it links the
+// genuine dash::crypto::hash_x11 and proves the same 0x02 envelope end-to-end
+// over a REAL accepted DASH share (recomputed X11 == the node's own logged
+// pow_hash, six forgeries rejected fail-closed, the frozen v0x01 golden still
+// version-gated decodable). Neither target can pass while the other's concern is
+// broken, and nothing S-1 relies on lives out of tree any more.
 #include <c2pool/v37/w3_relay_x11.hpp>
 #include <cstdio>
 

@@ -371,6 +371,35 @@ if (BUILD_TESTING)
     target_include_directories(v37_a2_x11_wire_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME v37_a2_x11_wire_kat COMMAND v37_a2_x11_wire_kat)
 
+    # Track A2 / S-1 -- REAL-X11 end-to-end KAT. Unlike v37_a2_x11_wire_kat above
+    # (stdlib-only, X11 injected as a sha256d STUB), this target links the genuine
+    # DASH X11 SSOT: the vendored 12-file sph reference C behind
+    # dash::crypto::hash_x11 (dash_x11, src/impl/dash/crypto), the same SSOT the
+    # shipped node hashes with. It proves the 0x02 envelope end-to-end over a REAL
+    # accepted DASH share: encode -> decode_any -> to_dash_envelope ->
+    # dash::verify_x11_share, with the recomputed X11 equal to the node's own
+    # logged pow_hash, plus six forgery mutations rejected fail-closed, the eleven
+    # sph stage outputs pinned per-primitive, the hook installer proven to BE the
+    # SSOT, and the frozen v0x01 golden still decodable and still version-gated.
+    # This is the FIRST target under src/c2pool/v37/test/ to link the SSOT (every
+    # other one is Threads::Threads only). Link set mirrors test/CMakeLists.txt
+    # test_dash_conformance (dash_x11 + core; header-only share_check /
+    # block_producer; no ltc/pool SCC dependency). Ordering is safe: src/CMakeLists
+    # processes impl/ before c2pool/, so dash_x11 exists here.
+    # SAME HOLLOW-GREEN GUARD as every target here: ALSO on BOTH build.yml
+    # --target lists, else tools/ci/check_test_target_allowlist.py fails closed.
+    add_executable(v37_a2_x11_real_pow_kat v37_a2_x11_real_pow_kat.cpp)
+    target_compile_features(v37_a2_x11_real_pow_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_a2_x11_real_pow_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_a2_x11_real_pow_kat PRIVATE
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+        Threads::Threads)
+    target_link_libraries(v37_a2_x11_real_pow_kat PRIVATE
+        c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    add_test(NAME v37_a2_x11_real_pow_kat COMMAND v37_a2_x11_real_pow_kat)
+
     # Track A2 step (b)(2) — the LIVE IMainchainIndex (carrier_index.hpp) KAT: horizon
     # vs tip (I-1), bounded tri-state Unknown retry (I-2), per-hash Have cache (I-3),
     # the synthetic model's byte-for-byte parity with the multinode-test resolver,

@@ -114,20 +114,34 @@ inline bool version_accepted_dual(std::uint8_t v) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// The X11 permutation hook (the ONE non-stdlib dependency), fail-closed.
-// Install with set_x11_hash(&adapter) where adapter wraps dash::crypto::hash_x11
-// and returns the 32-byte digest in BIG-ENDIAN NUMERIC order (most-significant
-// byte first) so it compares directly against target_from_nbits_be():
+// The X11 permutation SEAM (the ONE non-stdlib dependency), fail-closed.
 //
-//   c2pool::v37n::set_x11_hash([](const std::uint8_t* hdr80) {
-//       uint256 u = dash::crypto::hash_x11(hdr80, 80);   // internal LE (data())
-//       ::v37::bytes32 be; const unsigned char* d = u.data();
-//       for (int i = 0; i < 32; ++i) be[i] = d[31 - i];  // LE data() -> BE
-//       return be;
+// This file is the WIRE layer and deliberately links nothing: no target math, no
+// X11, no verify dispositions live here any more. They are the DASH SSOT
+// (impl/dash/x11_share_verify.hpp -> dash::crypto::hash_x11,
+// dash::coin::target_from_nbits / meets_target / serialize_header80 /
+// coinbase_txid, dash::fold_merkle_branch, dash::extract_op_return_commitment),
+// reached from the BIND/CREDIT layer (c2pool/v37/x11_share_envelope.hpp).
+//
+// The hook exists so a STDLIB-ONLY consumer (the relay hot path, a wire-only
+// unit target) can be handed the genuine permutation without linking the SSOT.
+// The single supported installer is
+// c2pool::v37n::install_dash_x11_hook() (x11_share_envelope.hpp), which sets
+//
+//   set_x11_hash([](const std::uint8_t* hdr80) {
+//       return internal_from_u256(dash::crypto::hash_x11(hdr80, 80));
 //   });
 //
-// With no hook installed, verify_x11_share() returns VERIFIER_UNAVAILABLE and
-// NEVER a spurious pass — identical fail-closed discipline to the XMR validator.
+// i.e. the digest in uint256 INTERNAL (little-endian data()) order — the same
+// bytes dash::X11VerifyResult::pow_hash carries, so the two are directly
+// comparable. v37_a2_x11_real_pow_kat (RX-12) asserts exactly that equality, and
+// asserts the hook is nullptr before installation. With no hook installed a
+// stdlib-only consumer gets nullptr and MUST fail closed; it never gets a
+// spurious pass — identical discipline to the XMR P-1 validator seam.
+//
+// GAP (declared, not hidden): until the S-1 activation wires w2_admission to the
+// real PoW, NOTHING in-tree calls the hook on a consensus path. It is an
+// installation seam under test, not a live verifier.
 // ═══════════════════════════════════════════════════════════════════════════
 using x11_hash_fn = ::v37::bytes32 (*)(const std::uint8_t* header80);
 inline x11_hash_fn& x11_hash_hook() {
@@ -137,67 +151,20 @@ inline x11_hash_fn& x11_hash_hook() {
 inline void set_x11_hash(x11_hash_fn fn) { x11_hash_hook() = fn; }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pure target / header helpers (stdlib-only; SSOT-equivalent).
-//   target_from_nbits_be : dash::coin::target_from_nbits (uint256 SetCompact),
-//                          emitted as a 32-byte BIG-ENDIAN target so it feeds
-//                          BOTH the PoW compare (meets_be) and work_from_target
-//                          (w2_receipt.hpp, which takes a big-endian target).
-//   meets_be             : dash::coin::meets_target (powhash <= target), both BE.
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Compact nBits -> 256-bit target, big-endian ([0]=MSB). ok=false on a negative
-// or overflowing compact (an invalid target -> all-zero, which meets_be only for
-// an all-zero hash, i.e. treated as unmeetable in practice). Matches uint256
-// SetCompact for every valid block/share bits value.
-inline bytes32 target_from_nbits_be(std::uint32_t nbits, bool* ok = nullptr) {
-    bytes32 be{};                                  // BE, all-zero
-    std::array<std::uint8_t, 32> le{};             // little-endian scratch
-    const std::uint32_t exp  = nbits >> 24;
-    const std::uint32_t mant = nbits & 0x007fffffu;
-    const bool neg = (nbits & 0x00800000u) != 0;
-    bool good = true;
-    if (mant == 0) {                               // zero target
-        if (ok) *ok = true;
-        return be;
-    }
-    if (neg) { if (ok) *ok = false; return be; }   // negative compact: invalid
-    if (exp <= 3) {
-        const std::uint32_t v = mant >> (8 * (3 - exp));
-        le[0] = std::uint8_t(v);
-        le[1] = std::uint8_t(v >> 8);
-        le[2] = std::uint8_t(v >> 16);
-        le[3] = std::uint8_t(v >> 24);
-    } else {
-        const int shift = int(exp) - 3;            // byte offset of mantissa LSB
-        const std::uint8_t m[3] = {
-            std::uint8_t(mant), std::uint8_t(mant >> 8), std::uint8_t(mant >> 16)};
-        for (int k = 0; k < 3; ++k) {
-            const int idx = shift + k;
-            if (idx >= 0 && idx < 32) le[idx] = m[k];
-            else if (m[k]) good = false;           // mantissa byte fell off -> overflow
-        }
-    }
-    if (!good) { if (ok) *ok = false; return bytes32{}; }
-    for (int i = 0; i < 32; ++i) be[i] = le[31 - i];   // LE scratch -> BE result
-    if (ok) *ok = true;
-    return be;
-}
-
-// powhash <= target, both big-endian ([0]=MSB). (dash::coin::meets_target).
-inline bool meets_be(const bytes32& powhash_be, const bytes32& target_be) {
-    for (int i = 0; i < 32; ++i)
-        if (powhash_be[i] != target_be[i]) return powhash_be[i] < target_be[i];
-    return true;   // equal meets
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// The v0x02 X11 work event — one carrier or one receipt.
-// Replaces WorkEvent's synthetic {lz_bits,u64 nonce}+preimage with the real
-// 80-byte-header fields + the coinbase/branch that make the payout trustlessly
-// verifiable. `descriptor` is the real self-carriage push target (as in v0x01);
-// `identity` is still carried and W3-MUST-bound to descriptor.identity_key(),
-// but its consensus binding is now the coinbase OP_RETURN commitment, not a
-// preimage. hash()/meets_own_target()/work() DELEGATE to X11-over-header.
+// The v0x02 X11 work event — one carrier or one receipt. A PURE POD: it carries
+// the fields, it does not hash them. Replaces WorkEvent's synthetic
+// {lz_bits, u64 nonce} + preimage with the real 80-byte-header fields plus the
+// coinbase/branch that make the payout trustlessly verifiable. `descriptor` is
+// the real self-carriage push target (as in v0x01); `identity` is still carried
+// and W3-MUST-bound to descriptor.identity_key(), but its consensus binding is
+// now the coinbase OP_RETURN commitment, not a preimage.
+//
+// The share id, the merkle fold, the 80-byte serialization, the targets and the
+// credit are NOT members: they are L3 free functions (x11_share_envelope.hpp:
+// x11_share_id / x11_merkle_root_u / x11_fill_header80 / x11_meets_own_target /
+// x11_work) that delegate to the DASH SSOT verbatim. One PoW implementation, in
+// one place. The only hash this struct computes is wire_id(), which is network
+// hygiene (relay dedup before verification is possible) and NEVER consensus.
 // ═══════════════════════════════════════════════════════════════════════════
 struct X11WorkEvent {
     std::uint32_t chain_id = 0;              // RDWR member 1
@@ -217,44 +184,11 @@ struct X11WorkEvent {
     ::v37::PayoutDescriptor descriptor;          // real descriptor (self-carriage)
     std::string tag;                             // bookkeeping only (NOT hashed)
 
-    // coinbase_txid = sha256d(coinbase) — dash::coin::coinbase_txid. Same raw
-    // digest bytes dash carries as uint256::data() (internal order).
-    bytes32 coinbase_txid() const { return ::v37::sha256d(coinbase); }
-
-    // Fold the coinbase txid up through the merkle branch. DASH v16 index==0, so
-    // the running hash is ALWAYS the left leaf: sha256d(cur || branch[i]).
-    // Equivalent to dash::check_merkle_link(coinbase_txid, {branch, index=0}).
-    bytes32 merkle_root() const {
-        bytes32 cur = coinbase_txid();
-        std::vector<std::uint8_t> buf(64);
-        for (const bytes32& sib : merkle_branch) {
-            for (int i = 0; i < 32; ++i) { buf[i] = cur[i]; buf[32 + i] = sib[i]; }
-            cur = ::v37::sha256d(buf);
-        }
-        return cur;
-    }
-
-    // Serialize the 80-byte DASH header (dash::coin::serialize_header80 byte
-    // layout): version(4 LE) || prev_block(32) || merkle_root(32) || time(4 LE)
-    // || bits(4 LE) || nonce(4 LE). prev_block/merkle_root are internal-LE bytes.
-    void serialize_header80(std::uint8_t out[80], const bytes32& mroot) const {
-        std::size_t o = 0;
-        auto put32 = [&](std::uint32_t v) {
-            for (int i = 0; i < 4; ++i) out[o++] = std::uint8_t(v >> (8 * i));
-        };
-        put32(header_version);
-        for (int i = 0; i < 32; ++i) out[o++] = prev_block_hash[i];
-        for (int i = 0; i < 32; ++i) out[o++] = mroot[i];
-        put32(ntime);
-        put32(nbits);
-        put32(nonce);
-    }
-
     // A stable, X11-independent id over the identity-bearing fields, for the
     // RELAY-layer dedup set (RelaySeenSet) BEFORE X11 verification is possible
     // (mirrors v0x01 relay keying on the carrier hash — network hygiene, never
     // consensus). The CONSENSUS dedup key is the verified X11 share id
-    // (verify -> X11VerifyResult::share_id), never this.
+    // (dash::verify_x11_share -> X11VerifyResult::pow_hash), never this.
     bytes32 wire_id() const {
         std::vector<std::uint8_t> v;
         for (int i = 0; i < 4; ++i) v.push_back(std::uint8_t(chain_id >> (8 * i)));
@@ -265,83 +199,6 @@ struct X11WorkEvent {
         return ::v37::sha256d(v);
     }
 };
-
-// Scan a coinbase for the LAST OP_RETURN ref_hash commitment output script
-// (0x6a 0x28 || ref_hash(32) || nonce64(8) — share_check.hpp:806-813). Returns
-// the 32-byte ref_hash. STRUCTURAL extractor: the authoritative binding (does
-// this ref_hash commit to THIS identity + share fields + the PPLNS payout set)
-// is dash::verify_payout_commitment / share_init_verify, fed the reconstructed
-// inputs this event carries — see the integration notes.
-inline std::optional<bytes32> find_op_return_ref_hash(
-    const std::vector<std::uint8_t>& coinbase) {
-    if (coinbase.size() < 42) return std::nullopt;
-    for (std::size_t i = coinbase.size() - 42 + 1; i-- > 0;) {
-        if (coinbase[i] == 0x6a && coinbase[i + 1] == 0x28 &&
-            i + 2 + 40 <= coinbase.size()) {
-            bytes32 rh{};
-            for (int k = 0; k < 32; ++k) rh[k] = coinbase[i + 2 + k];
-            return rh;
-        }
-    }
-    return std::nullopt;
-}
-
-// ── v0x02 X11 verification dispositions ─────────────────────────────────────
-enum class X11Disposition {
-    OK,                     // X11 over the header meets the share target
-    VERIFIER_UNAVAILABLE,   // no x11_hash hook installed (fail-closed)
-    REJECT_POW,             // X11 hash does NOT meet the share target
-    REJECT_TARGET_INVALID,  // share_bits / nbits is a malformed compact target
-};
-
-struct X11VerifyResult {
-    X11Disposition disp = X11Disposition::VERIFIER_UNAVAILABLE;
-    bytes32 pow_hash{};        // X11 over the header (BIG-endian numeric)
-    bytes32 merkle_root{};     // reconstructed (internal LE)
-    bytes32 coinbase_txid{};   // sha256d(coinbase) (internal LE)
-    bytes32 share_id{};        // consensus dedup key = pow_hash when verified
-    bool meets_share_target = false;   // real "meets_own_target"
-    bool meets_block_target = false;   // ALSO a solved DASH block (won block)
-    std::optional<bytes32> op_return_ref_hash;   // parsed payout commitment
-    std::uint64_t work_credit = 0;     // work_from_target(share target) — the
-                                       // target-based PPLNS credit (unchanged basis)
-    bool ok() const { return disp == X11Disposition::OK; }
-};
-
-// Reproduce DASHWorkSource::mining_submit + dash::share_init_verify's PoW arm:
-// rebuild coinbase_txid -> fold merkle branch -> serialize header -> X11 ->
-// target gates. This REPLACES WorkEvent::meets_own_target()'s sha256d test with
-// real X11, and detects a won block (pow <= block target). The identity/payout
-// binding (OP_RETURN ref_hash == recomputed ref_hash for THIS identity + PPLNS
-// window) is the dash SSOT (verify_payout_commitment) reached with the inputs
-// reconstructed here; op_return_ref_hash exposes the committed value.
-inline X11VerifyResult verify_x11_share(const X11WorkEvent& e) {
-    X11VerifyResult r;
-    r.coinbase_txid = e.coinbase_txid();
-    r.merkle_root   = e.merkle_root();
-    r.op_return_ref_hash = find_op_return_ref_hash(e.coinbase);
-
-    bool sok = false, bok = false;
-    const bytes32 share_target = target_from_nbits_be(e.share_bits, &sok);
-    const bytes32 block_target = target_from_nbits_be(e.nbits, &bok);
-    if (!sok) { r.disp = X11Disposition::REJECT_TARGET_INVALID; return r; }
-    r.work_credit = work_from_target(share_target);   // credit basis (§4.1), unchanged
-
-    x11_hash_fn hook = x11_hash_hook();
-    if (hook == nullptr) {                            // fail-closed
-        r.disp = X11Disposition::VERIFIER_UNAVAILABLE;
-        r.share_id = e.wire_id();                     // best-effort id for logging
-        return r;
-    }
-    std::uint8_t hdr[80];
-    e.serialize_header80(hdr, r.merkle_root);
-    r.pow_hash = hook(hdr);
-    r.share_id = r.pow_hash;                          // consensus dedup key
-    r.meets_share_target = meets_be(r.pow_hash, share_target);
-    r.meets_block_target = bok && meets_be(r.pow_hash, block_target);
-    r.disp = r.meets_share_target ? X11Disposition::OK : X11Disposition::REJECT_POW;
-    return r;
-}
 
 // ── a v0x02 carrier = ordinary X11 share + 0..R_MAX X11 receipts ────────────
 struct X11Carrier {
@@ -765,7 +622,7 @@ inline bool carriers_equal(const X11Carrier& a, const X11Carrier& b) {
 //   carrier : chain 1, P2PKH payout, header {version 0x20000000, ntime, nbits
 //             0x1e0ffff0, nonce}, share_bits 0x1f00ffff, max_bits 0x1f0fffff,
 //             a synthetic coinbase carrying an OP_RETURN (6a 28 || ref_hash ||
-//             nonce64) so find_op_return_ref_hash has a target, a 2-hash merkle
+//             nonce64) so the bytes carry a commitment shape, a 2-hash merkle
 //             branch, a DIP4 coinbase_payload, tag "cx".
 //   receipt : same identity (self-carriage), a shorter coinbase, empty payload,
 //             a 1-hash branch, tag "rx".
@@ -818,27 +675,6 @@ inline SelfCheck selfcheck() {
         !version_accepted_dual(0x00) && !version_accepted_dual(0x03),
         "dual-accept set is exactly {0x01,0x02}");
 
-    // target_from_nbits_be sanity: 0x1d00ffff -> Bitcoin genesis target
-    // 00000000ffff0000...0000 (BE). Check the two non-zero bytes land right.
-    {
-        bool tok = false;
-        bytes32 t = target_from_nbits_be(0x1d00ffffu, &tok);
-        bool shape = tok && t[0] == 0x00 && t[1] == 0x00 && t[2] == 0x00 &&
-                     t[3] == 0x00 && t[4] == 0xff && t[5] == 0xff && t[6] == 0x00;
-        chk(shape, "target_from_nbits_be(0x1d00ffff) == 00000000ffff0000..");
-        // meets_be: a hash one below the target meets; the target itself meets;
-        // one above does not.
-        bytes32 lo = t; // equal meets
-        chk(meets_be(lo, t), "meets_be: equal target meets");
-        bytes32 hi = t; hi[4] = 0xff; hi[5] = 0xff; hi[6] = 0x01;
-        chk(!meets_be(hi, t), "meets_be: above target does not meet");
-    }
-    // A malformed (negative) compact yields an invalid target.
-    {
-        bool tok = true;
-        (void)target_from_nbits_be(0x1d80ffffu, &tok);
-        chk(!tok, "target_from_nbits_be: negative compact flagged invalid");
-    }
 
     const X11Carrier c = fixture_x();
 
@@ -918,39 +754,22 @@ inline SelfCheck selfcheck() {
         chk(ab.status == WireStatus::REJECT_BAD_VERSION, "decode_any: 0x03 -> BAD_VERSION");
     }
 
-    // (11) X11 verify wiring (structural, with an injected deterministic hook).
-    //      Install a stub that returns sha256d(header) as the BE pow hash, and
-    //      point share_bits at an easy target so the stub meets it — this proves
-    //      the reconstruct+compare path (coinbase_txid -> merkle fold -> header
-    //      -> hook -> target gate) and the OP_RETURN ref_hash extraction, WITHOUT
-    //      the real X11 lib. The daemon installs dash::crypto::hash_x11.
+    // (11) the X11 crypto SEAM, structurally (stdlib-side). This file performs NO
+    //      PoW policy any more — target math, the X11 recompute and every verify
+    //      disposition are the DASH SSOT (impl/dash/x11_share_verify.hpp), reached
+    //      from L3 (x11_share_envelope.hpp). All this byte-KAT pins is that the
+    //      hook is FAIL-CLOSED by default and that set/get round-trips; that the
+    //      installed hook IS dash::crypto::hash_x11 is proven byte-for-byte by
+    //      v37_a2_x11_real_pow_kat (RX-12), which links the SSOT.
     {
         x11_hash_fn saved = x11_hash_hook();
+        set_x11_hash(nullptr);
+        chk(x11_hash_hook() == nullptr, "x11 hash hook is fail-closed when unset");
         set_x11_hash(+[](const std::uint8_t* h) -> bytes32 {
             std::vector<std::uint8_t> v(h, h + 80);
-            return ::v37::sha256d(v);   // deterministic stand-in (BE-order compare)
+            return ::v37::sha256d(v);   // stdlib stand-in; NEVER a consensus answer
         });
-        // Easy share target (0x2100ffff -> huge target): the sha256d stub meets it.
-        X11WorkEvent e = c.carrier;
-        e.share_bits = 0x2100ffffu;
-        X11VerifyResult vr = verify_x11_share(e);
-        chk(vr.disp == X11Disposition::OK && vr.meets_share_target,
-            "verify_x11_share: stub PoW meets an easy share target");
-        chk(vr.coinbase_txid == e.coinbase_txid() && vr.merkle_root == e.merkle_root(),
-            "verify_x11_share: coinbase_txid + reconstructed merkle root exposed");
-        chk(vr.op_return_ref_hash.has_value() &&
-            (*vr.op_return_ref_hash)[0] == 0x70 && (*vr.op_return_ref_hash)[31] == 0x8f,
-            "verify_x11_share: OP_RETURN ref_hash parsed from the coinbase");
-        chk(vr.share_id == vr.pow_hash, "verify_x11_share: consensus share id == X11 hash");
-        // Hard share target (0x0300ffff -> tiny target): the stub does NOT meet it.
-        e.share_bits = 0x03000001u;
-        X11VerifyResult vr2 = verify_x11_share(e);
-        chk(vr2.disp == X11Disposition::REJECT_POW && !vr2.meets_share_target,
-            "verify_x11_share: stub PoW misses a hard share target");
-        // Fail-closed with no hook installed.
-        set_x11_hash(nullptr);
-        chk(verify_x11_share(e).disp == X11Disposition::VERIFIER_UNAVAILABLE,
-            "verify_x11_share: no hook -> VERIFIER_UNAVAILABLE (fail-closed)");
+        chk(x11_hash_hook() != nullptr, "x11 hash hook set/get round-trips");
         set_x11_hash(saved);
     }
 
