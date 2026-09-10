@@ -9,9 +9,15 @@
 # table and its fence, and the RandomX seed epoch).
 #
 # Wave 1 adds one directory per component:
-#   * p2p/ (component C1a): the levin bucket-header codec, the epee
-#     portable-storage codec and the typed P2P messages -- pure codec, no
-#     socket and no connection state.
+#   * p2p/ (components C1a and C1b): C1a is the levin bucket-header codec, the
+#     epee portable-storage codec and the typed P2P messages -- pure codec, no
+#     socket and no connection state. C1b adds the TRANSPORT on top of it: the
+#     asio LevinSocket (framed read loop, single-composed-write FIFO queue,
+#     owner lifetime guard), the per-connection FIFO reply matcher (levin has
+#     no request id), the HANDSHAKE state machine and the LevinLink that drives
+#     the 1001 handshake and the 60-second 1002 TIMED_SYNC liveness beat.
+#     RandomX never runs on the io thread; C1 hands blobs to C2, which owns the
+#     verify thread.
 #   * consensus/ and chain/ (component C2a): the block parse and identity,
 #     medians, weights, reward, difficulty, timestamps and the R-HFFUSE
 #     hard-fork policy, plus the consensus state, the wire-to-state evaluation
@@ -20,7 +26,8 @@
 # Still header-only: nothing here is compiled until a target includes it, and
 # the KATs in test/ are those targets. Two of the C2a KATs link `xmr_coin` for
 # the keccak, tree hash and vendored difficulty oracle that already exist in
-# this repository -- see test/CMakeLists.txt.
+# this repository, and the two C1b KATs link boost::asio (header-only in the
+# pinned Boost 1.90) plus a thread library -- see test/CMakeLists.txt.
 #
 # SCOPE FENCE: this tree is a WORK SOURCE for the pool. It is not part of the
 # v37 share-chain record, it activates no consensus, and it does not touch

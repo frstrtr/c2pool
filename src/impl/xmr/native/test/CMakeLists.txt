@@ -156,4 +156,53 @@ if (BUILD_TESTING)
     target_compile_features(xmr_native_anchor_self_check_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_anchor_self_check_kat COMMAND xmr_native_anchor_self_check_kat)
 
+    # -----------------------------------------------------------------------
+    # Wave 1, component C1b: the levin TRANSPORT (../p2p/levin_socket.hpp,
+    # levin_invoke_queue.hpp, xmr_handshake.hpp, xmr_levin_link.hpp). Two
+    # targets, both registered in BOTH `--target` lists in build.yml -- see the
+    # DRIFT-GUARD note at the top of this file.
+    #
+    #   xmr_levin_socket_kat -- LevinSocket over real TCP on 127.0.0.1: the
+    #     33-byte-header-then-bounded-body read loop, the single-composed-write
+    #     FIFO queue (the issue #863 splice), the pre/post-handshake cap flip,
+    #     the owner lock-per-async-op lifetime guard written as the actual
+    #     use-after-free shape (which is what makes it worth running under
+    #     ASan on the sanitizer leg), and the io-thread fence that keeps
+    #     RandomX off this thread.
+    #   xmr_levin_link_kat -- the 1001 HANDSHAKE and 1002 TIMED_SYNC exchanges
+    #     against a hand-rolled monerod stand-in on loopback, every handshake
+    #     refusal, the FIFO reply matcher (levin has no request id), the
+    #     2003/2006 expect-response latch, and one assertion apiece for the
+    #     three C1-lens corrections (sorted epee keys, SIGNATURE_B byte order,
+    #     TIMED_SYNC response shape). Its `--live <host>:<port>` mode dials a
+    #     real daemon and is deliberately NOT what ctest runs.
+    #
+    # Unlike every target above these link boost::asio (header-only in the
+    # pinned Boost 1.90) plus a thread library. That is still a LIGHT link: no
+    # RandomX, no libsodium, no monerod, no compiled Boost component.
+    # -----------------------------------------------------------------------
+    foreach(_c1b_kat
+            xmr_levin_socket_kat
+            xmr_levin_link_kat)
+        add_executable(${_c1b_kat} ${_c1b_kat}.cpp)
+        target_include_directories(${_c1b_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_features(${_c1b_kat} PRIVATE cxx_std_20)
+        if (TARGET Boost::headers)
+            target_link_libraries(${_c1b_kat} PRIVATE Boost::headers)
+        elseif (TARGET Boost::boost)
+            target_link_libraries(${_c1b_kat} PRIVATE Boost::boost)
+        elseif (DEFINED Boost_INCLUDE_DIRS)
+            target_include_directories(${_c1b_kat} PRIVATE ${Boost_INCLUDE_DIRS})
+        endif()
+        if (TARGET Threads::Threads)
+            target_link_libraries(${_c1b_kat} PRIVATE Threads::Threads)
+        endif()
+        add_test(NAME ${_c1b_kat} COMMAND ${_c1b_kat})
+        # Loopback TCP plus compressed deadlines: comfortably under a minute on
+        # a loaded runner, but never unbounded.
+        set_tests_properties(${_c1b_kat} PROPERTIES TIMEOUT 300)
+    endforeach()
+
 endif()
