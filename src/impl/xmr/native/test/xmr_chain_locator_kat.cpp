@@ -42,13 +42,17 @@ using p2p::XmrNet;
 
 namespace {
 
-// The three ids, as hex, independently of the constants under test: a typo in
-// chain_seeds.hpp and a matching typo here would have to be the same typo made
-// twice, in two different notations.
+// The three ids, as hex. Re-typing the same hex string here is NOT an
+// independent check: the same typo made in both notations sails straight
+// through (that is exactly how cd8e6734 lived in both places at once). So the
+// hex below is the convenience form, and test_genesis_constants() pins the
+// distinguishing tail of the testnet id a SECOND way -- as numeric bytes copied
+// from monerod's `get_block 0` on testnet -- so a wrong constant in either file
+// has to survive two differently-written checks, not one check twice.
 constexpr const char* HEX_MAINNET_GENESIS =
     "418015bb9ae982a1975da7d79277c2705727a56894ba0fb246adaabb1f4632e3";
 constexpr const char* HEX_TESTNET_GENESIS =
-    "48ca7cd3c8de5b6a4d53d2861fbdaedca141553559f9be9520068053cd8e6734";
+    "48ca7cd3c8de5b6a4d53d2861fbdaedca141553559f9be9520068053cda8430b";
 constexpr const char* HEX_STAGENET_GENESIS =
     "76ee3cc98646292206cd3e86f74d88b4dcc1d937088645e9b0cbca84b7ce74eb";
 
@@ -77,6 +81,21 @@ void test_genesis_constants() {
                "testnet genesis id matches the pinned hex");
     kat::check(p2p::genesis_id(XmrNet::Stagenet) == hash_of_hex(HEX_STAGENET_GENESIS),
                "stagenet genesis id matches the live-verified hex");
+
+    // De-tautologized testnet pin. The hex line above and TESTNET_GENESIS_HEX in
+    // chain_seeds.hpp are the same notation, so a shared typo passes them both
+    // (cd8e6734 did). This second pin restates the id's distinguishing tail as
+    // numeric bytes read off monerod's `get_block 0` on testnet -- offsets 28..31
+    // are cd a8 43 0b, and the previous wrong constant ended cd 8e 67 34, which
+    // this catches. byte[0]=0x48 anchors the head for good measure.
+    {
+        const Hash tn = p2p::genesis_id(XmrNet::Testnet);
+        kat::check(tn[0]  == 0x48, "testnet genesis head byte is 0x48");
+        kat::check(tn[28] == 0xcd, "testnet genesis byte[28] is 0xcd");
+        kat::check(tn[29] == 0xa8, "testnet genesis byte[29] is 0xa8 (not 0x8e -- the old typo)");
+        kat::check(tn[30] == 0x43, "testnet genesis byte[30] is 0x43 (not 0x67 -- the old typo)");
+        kat::check(tn[31] == 0x0b, "testnet genesis byte[31] is 0x0b (not 0x34 -- the old typo)");
+    }
 
     // The constexpr reader is the thing that turns the hex literal into the
     // constant; prove it is not silently yielding zero on any of them.

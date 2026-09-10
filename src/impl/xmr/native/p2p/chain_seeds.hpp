@@ -127,7 +127,11 @@ inline std::vector<IpSeed> ip_seeds(XmrNet net) {
 inline constexpr const char* MAINNET_GENESIS_HEX =
     "418015bb9ae982a1975da7d79277c2705727a56894ba0fb246adaabb1f4632e3";
 inline constexpr const char* TESTNET_GENESIS_HEX =
-    "48ca7cd3c8de5b6a4d53d2861fbdaedca141553559f9be9520068053cd8e6734";
+    // Monero testnet block 0 id. Source: monerod `get_block 0` on testnet, and
+    // cryptonote::get_config(TESTNET) GENESIS_TX / GENESIS_NONCE (10001). The
+    // last four bytes are cda8430b (NOT cd8e6734, a transcription error that was
+    // caught by the locator KAT once its testnet pin stopped citing itself).
+    "48ca7cd3c8de5b6a4d53d2861fbdaedca141553559f9be9520068053cda8430b";
 inline constexpr const char* STAGENET_GENESIS_HEX =
     "76ee3cc98646292206cd3e86f74d88b4dcc1d937088645e9b0cbca84b7ce74eb";
 
