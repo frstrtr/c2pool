@@ -1339,24 +1339,46 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash)
     // parents=random(500), the chain grows along one lineage until it
     // crosses 2*CHAIN_LENGTH+10, at which point clean_tracker drop-tails
     // collapses the whole branch and verified resets to 0.
+    // The stops build reads the tracker, and get_heads() hands back a REFERENCE
+    // to the live m_heads container (sharechain.hpp:322). Walking it here — on
+    // the IO thread, while clean_tracker concurrently erases heads on the
+    // compute thread — is a use-after-free. That is the prod SIGSEGV of
+    // 2026-09-10 19:52:46: the fault was in base_uint<256>::CompareTo, inserting
+    // a freed head hash into the stop set, in the log lines immediately after
+    // [drop-heads-PRE] entries from the compute thread. The crash was latent for
+    // as long as the node froze before it could ever reach a mass head drop.
+    //
+    // try_to_lock, never a blocking lock: the IO thread must NOT block on
+    // m_tracker_mutex (node.cpp:1230, node.hpp:67, and the ":676" note recording
+    // that a blocking shared_lock here was itself a bug). Blocking would trade
+    // this segfault for the io-freeze watchdog — a strictly worse deal. When
+    // think() holds the lock we abandon the request instead of sending it with
+    // an empty stops list, because an unbounded reply is its own failure mode:
+    // the peer dumps up to `parents` shares along one lineage, the chain crosses
+    // 2*CHAIN_LENGTH+10, and drop-tails collapses the branch. The next think()
+    // cycle re-derives desired and retries.
+    //
+    // Ports the pattern dash already runs (dash/node.cpp:880-891) and reuses its
+    // shared helper, which is itself a port of the code replaced here — same
+    // heads, same 10th-parent rule, same 100-stop cap, no behaviour change.
     std::vector<uint256> stops;
     {
-        std::set<uint256> stop_set;
-        for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
-            stop_set.insert(head_hash);
-            auto h = m_tracker.chain.get_acc_height(head_hash);
-            auto nth = std::min(std::max(0, h - 1), 10);
-            if (nth > 0) {
-                auto parent = m_tracker.chain.get_nth_parent_via_skip(head_hash, nth);
-                if (!parent.IsNull())
-                    stop_set.insert(parent);
-            }
+        std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            m_downloading_shares.erase(target_hash);
+            // Visibility for the one cost this trade has: a request abandoned
+            // because think() held the tracker. Backfill throughput depends on
+            // how often that happens, so make it countable on a live node
+            // instead of a thing we argue about. Logged sparsely — the drain can
+            // call this hundreds of times a second.
+            const uint64_t busy = ++m_stops_lock_busy;
+            if (busy % 100 == 1)
+                LOG_INFO << "[Pool] stops build deferred (tracker busy) — "
+                         << "download abandoned, retried next think(); count="
+                         << busy;
+            return;
         }
-        int count = 0;
-        for (auto& s : stop_set) {
-            if (count++ >= 100) break;
-            stops.push_back(s);
-        }
+        stops = pool::download::build_stops(m_tracker.chain);
     }
 
     auto req_id = core::random::random_uint256();

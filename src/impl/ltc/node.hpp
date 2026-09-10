@@ -10,6 +10,7 @@
 #include "head_retention.hpp"        // v36-0.24 convergence: clean_tracker Guard predicate (F2 + #25B)
 #include "share_fetch_failover.hpp"  // v36-0.24 convergence: parent-fetch failover memory (#25C)
 #include "desired_request_pacer.hpp"   // futility backoff for the desired-request drain
+#include <pool/share_download.hpp>     // shared downloader helpers (build_stops)
 
 #include <core/coin_params.hpp>
 #include <core/tx_advertiser.hpp>
@@ -858,6 +859,12 @@ protected:
     // desired_request_pacer.hpp for why this is not the same thing as the
     // per-(hash,peer) failover memory below. IO-THREAD CONFINED.
     ltc::DesiredRequestPacer<uint256> m_desired_pacer;
+
+    // How many download_shares calls abandoned their request because the tracker
+    // lock was held by think(). The stops build must not block the IO thread, so
+    // a busy tracker costs us the request rather than a stall — this counts that
+    // cost so throttling shows up as a number on a live node.
+    std::atomic<uint64_t> m_stops_lock_busy{0};
 
     // v36-0.24 kr1z1s convergence hotfix #25(C): per-(hash,peer) parent-fetch
     // failure memory. Replaces the old peer-BLIND per-hash counter
