@@ -205,4 +205,37 @@ if (BUILD_TESTING)
         set_tests_properties(${_c1b_kat} PROPERTIES TIMEOUT 300)
     endforeach()
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Wave 1 / C2c: the chain index (../chain/xmr_chain_index.hpp and its
+    # neighbours): fork choice on recomputed cumulative difficulty, the bounded
+    # journaled reorg, the proof-of-work gate and its seed schedule, burial for
+    # the v37 section 3 clock, the io-thread serving reads, and snapshot resume.
+    #
+    # Links `xmr_coin` for the same reason the two C2a targets do -- block
+    # identity needs a keccak and a tree hash, and the difficulty adapter needs
+    # the vendored monerod retarget -- and boost's header-only multiprecision
+    # comes with it. Still a LIGHT link: no RandomX, no libsodium, no monerod.
+    # The RandomX verifier is reached through a duck-typed adapter, so the
+    # whole index is built and tested on a leg that links no RandomX at all.
+    #
+    # Same drift-guard rule as every target above: it is added to BOTH --target
+    # lists in .github/workflows/build.yml by the change that adds it here,
+    # because a registered-but-unbuilt target reports "***Not Run" and fails
+    # ctest (#1539).
+    # ─────────────────────────────────────────────────────────────────────────
+    add_executable(xmr_native_chain_index_kat xmr_chain_index_kat.cpp)
+    target_include_directories(xmr_native_chain_index_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_chain_index_kat PRIVATE xmr_coin)
+    target_compile_features(xmr_native_chain_index_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_chain_index_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_chain_index_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_chain_index_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME xmr_native_chain_index_kat COMMAND xmr_native_chain_index_kat)
+
 endif()

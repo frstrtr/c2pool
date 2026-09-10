@@ -237,7 +237,7 @@ jobs:
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
                     xmr_native_block_id_kat xmr_native_consensus_state_kat \
-                    xmr_native_anchor_self_check_kat \
+                    xmr_native_anchor_self_check_kat xmr_native_chain_index_kat \
                     xmr_levin_socket_kat xmr_levin_link_kat \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
@@ -669,7 +669,7 @@ jobs:
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
                     xmr_native_block_id_kat xmr_native_consensus_state_kat \
-                    xmr_native_anchor_self_check_kat \
+                    xmr_native_anchor_self_check_kat xmr_native_chain_index_kat \
                     xmr_levin_socket_kat xmr_levin_link_kat \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
                  # xmr_provenance_gate: previously omitted here because

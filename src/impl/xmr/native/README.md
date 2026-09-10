@@ -19,7 +19,7 @@ activates v37 consensus and nothing here touches `src/sharechain/v37`.
 | `contracts/fakes/` | a compiling fake per interface, so wave-1 components can be written and tested before their dependencies exist (Wave 0) |
 | `consensus/` | the shared primitives, plus the C2a consensus rules: block parse and identity, weights, reward, difficulty, timestamps, hard-fork policy |
 | `p2p/` | Wave 1 / C1a: the levin bucket-header codec, the epee portable-storage codec, and the typed P2P messages. Wave 1 / C1b: the transport on top of them — the asio `LevinSocket`, the FIFO reply matcher, the handshake state machine and the `LevinLink` that runs HANDSHAKE and the TIMED_SYNC beat |
-| `chain/` | Wave 1 / C2a: the consensus state, the wire-to-state evaluation seam, and the real `IChainView` |
+| `chain/` | Wave 1 / C2a: the consensus state, the wire-to-state evaluation seam, and the real `IChainView`. Wave 1 / C2c: the chain index over them — the height rows, fork choice, the bounded journaled reorg, the proof-of-work gate and burial |
 | `anchor/` | Wave 1 / C2b: the trust-anchor bundle — the `.inc` format, the fail-closed loader, the generator, and the release-pinned stagenet bundle |
 | `test/` | the KATs |
 
@@ -207,6 +207,7 @@ quietly undo them: epee sections serialize in **sorted key order**;
 | `xmr_native_consensus_state_kat` | 600 stagenet heights replayed through the windows — difficulty, long-term weight, reward, emission — plus rollback exactness, `connect()` on real blobs, the R-HFFUSE policy and the 128-bit arithmetic against boost |
 | `xmr_levin_socket_kat` | `LevinSocket` over real loopback TCP: the read loop assembles a frame split across writes and splits two frames out of one write; a bad header closes without resyncing onto the valid frame planted behind it; the per-command and pre-handshake caps are refused on the header alone; the cap flip admits a 300 KiB push it previously refused; twenty-four back-to-back multi-round writes arrive byte-identical and in order; a full outbound queue refuses loudly; a freed owner aborts the connection instead of dereferencing it (written as the real use-after-free, so ASan proves it on the sanitizer leg); and the frame handler runs on the io thread and nowhere else |
 | `xmr_levin_link_kat` | the 1001/1002 exchanges against a hand-rolled monerod stand-in whose frame reader is independent of `levin_codec`: the handshake request's bytes carry the right storage header and sorted keys, every refusal (network id, self-connect, zero peer id, 251 peers, impossible pruning seed, undecodable body, negative return code) closes with its own reason while exactly 250 peers is accepted, the TIMED_SYNC beat runs and is matched, an out-of-order answer and an unrequested 2004/2007 both close, the expect-response latch admits the one we asked for, the deadlines fire, we answer PING and REQUEST_SUPPORT_FLAGS and decline what we do not serve — plus the pure FIFO/latch/liveness/state-machine checks. `--live <host>:<port>` dials a real daemon; ctest does not |
+| `xmr_native_chain_index_kat` | the index: monerod's own difficulty and cumulative difficulty at 600 consecutive stagenet heights driven through it, the emission landing on `get_coinbase_tx_sum`; the fork-choice table including D-14 prefer-own; a heavier branch adopted with Orphan-per-block and one Reorg; a branch that fails consensus half-way restoring the exact chain, silently; the four refusals with their alarms; `RESPONSE_CHAIN_ENTRY` validation against monerod's drop conditions; the five burial answers; and a snapshot resume that re-runs no proof of work |
 | `xmr_native_anchor_self_check_kat` | SHA-256 against the NIST vectors; the `.inc` format round-trips and each documented damage produces its own `AnchorParse`; every `AnchorStatus` is reached by mutating one field; `load_anchor`'s four gates including a tampered file on disk; `generate_anchor` against an honest and a dishonest model daemon; and the real embedded stagenet bundle, whose digest is recomputed with the C++ canonical writer |
 
 The fuzz KAT's load-bearing assertion is that **canonical re-encoding is
@@ -327,6 +328,11 @@ version, because a stale advertisement is what actually gets a node dropped.
 | `xmr_consensus_state.hpp` | the five windows, `connect()` (version, timestamp, weight, reward, coinbase, emission, difficulty) and an exactly reversible `disconnect()`. Every connect returns an undo record carrying what fell out of each window, so a reorg is a rollback rather than a re-derivation. |
 | `xmr_block_eval.hpp` | the wire-to-state seam: parse, identify, then **authenticate every transaction body against the id the block commits to** before its weight is allowed to touch a median. This is what makes pruned sync safe. |
 | `xmr_chain_view.hpp` | `ChainStateView`, the real `IChainView`: tip, template inputs, lookups by id and height, confirmation depth, seed anchors across epoch boundaries, the event streams, own-block submission. |
+| `xmr_pow_gate.hpp` | Wave 1 / C2c. R-LEVEL (L4 pruned-authenticated), the `IPowSource` seam, the seed schedule that re-keys once per epoch and resolves a seed ON THE BRANCH being verified, and a duck-typed adapter over anything shaped like `LightVerifier` — so the index builds and is tested on a leg that links no RandomX. |
+| `xmr_row_store.hpp` | Wave 1 / C2c. The height index: 2048 rows (D-9), the id map, the seed anchors that outlive their rows, and the difficulty window a fork point needs — including the anchor bundle's own window, so a freshly booted node can weigh a fork instead of being blind for 735 blocks. |
+| `xmr_fork_choice.hpp` | Wave 1 / C2c. Strictly-greater cumulative difficulty, D-14 PREFER-OWN at a tie, and the bounded alt-branch pool that evicts the lightest branch first. |
+| `xmr_reorg_journal.hpp` | Wave 1 / C2c. Every switch and every refusal, written before the work and closed after: what W4 reads when a reorg crosses the burial depth, what an operator reads on a refusal, and what a crash between disconnect and re-apply leaves behind. |
+| `xmr_chain_index.hpp` | Wave 1 / C2c. `ChainIndex`: `IChainIndexInbound` + `IChainView` + `IChainServing` over the state view, the fork choice and the gate. Bounded journaled reorgs with exact restore, burial for the v37 section 3 clock, and a snapshot taken below the tip so a resume keeps a rollback horizon. |
 
 ### The C2a golden
 
@@ -345,10 +351,10 @@ blob and the first cut hashed the bare one.
 ## Not here yet
 
 Landed so far, each authored against the contracts here: the levin codec (C1a),
-the levin transport (C1b), the consensus state (C2a) and the trust-anchor
-bundle (C2b). Still to come: the peer pool and its DoS policy (C1c), the index
-and fork choice (C2c), the relayed txpool (C3), the template source (C4), the
-block relay (C5) and the parity oracle (C6).
+the levin transport (C1b), the consensus state (C2a), the trust-anchor
+bundle (C2b) and the chain index with its fork choice (C2c). Still to come:
+the peer pool and its DoS policy (C1c), the relayed txpool (C3), the template
+source (C4), the block relay (C5) and the parity oracle (C6).
 
 C1b stops at one connection. The dial plan, the peer store, the primary
 election, the refill and rotation loops, the token buckets, the chain locator
