@@ -1530,6 +1530,13 @@ public:
     uint32_t requested_through()  const { return m_requested_through; }
     uint32_t stalled_pumps()      const { return m_stalled_pumps; }
     size_t   sml_recovery_cap()   const { return m_sml_recovery_cap; }
+    /// How many times a window-sized budget has been CLAMPED by its ceiling
+    /// on THIS bridge -- one per budget, not one per pump. Sized budgets are
+    /// re-evaluated every pump, so a per-pump warning would be a flood and a
+    /// silent clamp would be exactly the quiet degradation this lane refuses;
+    /// this counter is what lets a test (and an operator) see which of the two
+    /// actually happened. Reset with the rest of the per-bridge counters.
+    size_t   budget_ceiling_warnings() const { return m_budget_ceiling_warnings; }
     /// The machine's SPENT per-bridge demotion-walk budget. MnStateMachine::
     /// load() does not zero it, so a re-armed bridge would otherwise inherit
     /// the previous bridge's spend and fail closed on its first PoSe ban.
@@ -2545,6 +2552,7 @@ private:
     {
         if (!clamped || already_logged) return;
         already_logged = true;
+        ++m_budget_ceiling_warnings;
         LOG_WARNING << "[MN-CKPT] budget CEILING reached: " << name
                     << " sized " << want << " for this replay window but is"
                        " clamped to " << ceiling
@@ -4186,6 +4194,7 @@ public:
         m_walk_ceiling_logged     = false;
         m_ondemand_ceiling_logged = false;
         m_revive_ceiling_logged   = false;
+        m_budget_ceiling_warnings = 0;
         if (!m_revive_probe_cap_forced) m_revive_probe_cap = kReviveProbeBase;
         m_pose_removed    = 0;
         m_pose_reinstated = 0;
@@ -4395,6 +4404,7 @@ public:
     size_t    m_revive_probe_cap{kReviveProbeBase};
     bool      m_revive_probe_cap_forced{false};
     bool      m_revive_probe_cap_hit{false};
+    size_t    m_budget_ceiling_warnings{0};
     bool      m_walk_ceiling_logged{false};
     bool      m_ondemand_ceiling_logged{false};
     bool      m_revive_ceiling_logged{false};
