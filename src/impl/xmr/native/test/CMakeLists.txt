@@ -48,4 +48,20 @@ if (BUILD_TESTING)
     target_compile_features(xmr_native_blob_reader_fuzz_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_blob_reader_fuzz_kat COMMAND xmr_native_blob_reader_fuzz_kat)
 
+    # 4) The trust-anchor KAT (WF-C2b): SHA-256 known answers, the .inc format
+    #    round-trip and each of its documented refusals, every AnchorStatus in
+    #    contracts/anchor.hpp reached by mutating one field, load_anchor's four
+    #    gates including a tampered file on disk, generate_anchor against an
+    #    honest and a dishonest model daemon, and the REAL embedded stagenet
+    #    bundle -- whose digest is recomputed with the C++ canonical writer,
+    #    which is what pins tools/xmr-anchor-gen/xmr_anchor_gen.py to it.
+    #
+    #    It writes two small temporary .inc files into the working directory and
+    #    removes them again; ctest runs it inside the build tree.
+    add_executable(xmr_native_anchor_self_check_kat xmr_anchor_self_check_kat.cpp)
+    target_include_directories(xmr_native_anchor_self_check_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(xmr_native_anchor_self_check_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_native_anchor_self_check_kat COMMAND xmr_native_anchor_self_check_kat)
+
 endif()
