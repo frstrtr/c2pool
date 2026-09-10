@@ -23,6 +23,7 @@ activates v37 consensus and nothing here touches `src/sharechain/v37`.
 | `anchor/` | Wave 1 / C2b: the trust-anchor bundle — the `.inc` format, the fail-closed loader, the generator, and the release-pinned stagenet bundle |
 | `rct/` | Wave 1 / C3: non-input consensus — commitment balance, the Bulletproof+ verifier, the key-image domain check. The one part of this tree that compiles rather than being header-only |
 | `txpool/` | Wave 1 / C3: the relay-side transaction decoder and the relayed transaction pool itself |
+| `relay/` | Wave 1 / C5: the dual-arm found-block relay — the self-contained 2008 fluffy push, the on-demand monerod backup arm, the 2009 responder, and the c2pool-side redundant-broadcast carrier |
 | `test/` | the KATs |
 
 ### contracts/
@@ -540,13 +541,106 @@ RPC per refresh it always did. `assemble()` is byte-for-byte the function it
 was. `SettlementSnapshot` gains `source_name` and the `MinerDataEpoch`, so a
 parity sample can always be attributed to an arm.
 
+## Wave 1 / C5 — the block relay, and why it mostly refuses
+
+`relay/` is where a found block leaves the pool. It is the one component whose
+mistakes are paid for by somebody else: an invalid block does not bounce, it
+bans our P2P identity at every peer that received it, and a block that quietly
+fails to go out is a found block thrown away along with the share that paid for
+it. So most of what this component does is refuse.
+
+Three files:
+
+* `xmr_block_relay.hpp` — `LevinBlockRelay`, the dual-arm dispatcher, the 2008
+  frame builder and the 2009 responder with its retained-block book.
+* `xmr_found_block_carrier.hpp` — the `xmr_found_block` carrier and
+  `FoundBlockIngress`, the admission ladder a c2pool peer's block-share goes
+  through before this node re-broadcasts it.
+* `xmr_block_relay_submit_bridge.hpp` — the only file here that includes the
+  live-submit surface: `BlockCandidate` in, the existing monerod
+  `LiveBlockSubmitter` wrapped as ARM B, and `CandidateBlockRelay`, which is the
+  plan's `relay(candidate, nonce, extra_nonce)` entry point.
+
+### The two arms
+
+ARM A is levin P2P: one `NOTIFY_NEW_FLUFFY_BLOCK` (2008) written to every
+handshaked peer in `state_normal` through C1c's `IBroadcastPort`. This is the
+DAEMONLESS-PRIMARY arm. ARM B is monerod `submit_block`, and it fires only when
+a daemon is actually configured — the backup, not the gate. The default order is
+therefore `Parallel` with the P2P arm first; `DaemonFirst` (the plan's M0–M4
+posture, where a daemon rejection suppresses the P2P push entirely) and
+`P2pOnly` are configurations, and all three are pinned by the KAT.
+
+An unset daemon sink reports `daemon_armed == false`, never `daemon_rejected`.
+The distinction is load-bearing downstream: C6 counts a daemon that REJECTED our
+block as a parity failure and no daemon at all as a void sample.
+
+### The frame is self-contained
+
+monerod relays a block it accepted as a fluffy block with `txs` EMPTY, because
+its peers hold the transactions in their own pools and can fill the gaps with
+one 2009 round trip. We do the opposite by default: the 2008 carries the block
+blob AND every transaction body, so a receiving peer can connect the block
+without asking us anything. The bytes are cheap — a stagenet or mainnet block is
+single-digit KB — and the round trip is not, because it is a round trip on the
+one message that must not be missed, against a peer that has never heard of us.
+`include_all_tx_bodies = false` mirrors monerod exactly for the parity run, and
+the 2009 responder stays wired either way.
+
+`current_blockchain_height` is H+1, our height AFTER the block, so a peer that
+cannot connect it treats us as ahead and asks for our chain instead of dropping
+us.
+
+### Only a verified block gets out
+
+`contracts/relay.hpp` states the RandomX precondition as a caller obligation.
+This component also enforces it, fail-closed: with no gate installed, nothing is
+ever relayed, and a gate that answers anything but `Accept` stops both arms.
+The found-block path installs an ATTESTATION — the id the O-2 verifier already
+accepted — rather than paying for a second ~25 ms RandomX hash on the hottest
+path. What the attestation still buys over a bare precondition is that the id
+the gate saw is compared against the id of the bytes about to go out, so a
+wiring bug cannot relay a different block than the one that was verified.
+
+Everything cheap happens before the gate: the blob must parse, hash to the id
+the caller named, commit to the caller's tx list, carry the winning nonce, and
+agree with the caller about the coinbase height. RandomX is never spent on
+something that is not a block.
+
+### Fail loud, never partial, never silent
+
+If any transaction in the block has no body we can produce — or has one that
+does not re-hash to the id the block commits to — ARM A is SUPPRESSED. An
+incomplete self-contained frame is worse than no frame: the peer that cannot
+complete the block drops and bans whoever sent it. ARM B still fires, because
+monerod has its own pool. And a verdict that reached nobody carries `why` and is
+logged at error level, with a counter behind it — zero peers and no daemon is a
+loud failure, not a shrug.
+
+### The c2pool-side redundant broadcast
+
+The v36/DASH pattern is that every peer that can rebuild the winning block
+broadcasts it: duplicates are a non-event at the receiving daemon, a miss is a
+lost block. `FoundBlockIngress` is the receiving half, and its order is the
+whole point (cheap → heavy, RandomX LAST): per-peer budget, dedup, structure and
+id, the tip relation, the canonical-coinbase check, and only then the RandomX
+verify. A forged id, a wrong height or a non-canonical coinbase is a ban; a
+block on a branch we do not have, or a RandomX verdict that blames OUR verifier,
+is a defer. Getting that asymmetry wrong is how a pool bans its own network.
+
+The coinbase check gates RELAY only. Whether a non-canonical coinbase is
+admissible to the LANE is a separate, still-unwired question (#1551), and this
+component does not answer it. An ingress with no coinbase check wired refuses to
+relay rather than relaying blind, and records that as our own gap rather than
+the peer's fault.
+
 ## Not here yet
 
 Landed so far, each authored against the contracts here: the levin codec (C1a),
-the levin transport (C1b), the consensus state (C2a), the trust-anchor
-bundle (C2b), the chain index with its fork choice (C2c), the relayed txpool
-(C3) and the template source (C4). Still to come: the peer pool and its DoS
-policy (C1c), the block relay (C5) and the parity oracle (C6).
+the levin transport (C1b), the peer pool and its DoS policy (C1c), the consensus
+state (C2a), the trust-anchor bundle (C2b), the chain index with its fork
+choice (C2c), the relayed txpool (C3), the template source (C4) and the block
+relay (C5). Still to come: the parity oracle (C6).
 
 C1b stops at one connection. The dial plan, the peer store, the primary
 election, the refill and rotation loops, the token buckets, the chain locator

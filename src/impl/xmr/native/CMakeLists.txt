@@ -25,6 +25,13 @@
 #   * rct/ + txpool/ (component C3): the relayed transaction pool and the
 #     non-input consensus it admits on. This is the ONE part of the native node
 #     that is not header-only, and the reason is below.
+#   * relay/ (component C5): the dual-arm found-block relay -- the self-contained
+#     NOTIFY_NEW_FLUFFY_BLOCK (2008) push over C1c's IBroadcastPort, the
+#     on-demand monerod submit_block backup arm, the 2009 responder with its
+#     retained-block book, and the c2pool-side redundant-broadcast carrier with
+#     its cheap-to-heavy admission ladder. Header-only. The RandomX gate is an
+#     injected closure, fail-closed, so the component builds and is tested with
+#     RandomX compiled out.
 #   * template/ (component C4): the IMinerDataSource seam the option-B
 #     settlement template provider is rebound through, with its two arms -- the
 #     existing get_miner_data path, wrapped, and the native one built from the
