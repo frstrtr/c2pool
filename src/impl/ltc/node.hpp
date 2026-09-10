@@ -9,6 +9,7 @@
 #include "messages.hpp"
 #include "head_retention.hpp"        // v36-0.24 convergence: clean_tracker Guard predicate (F2 + #25B)
 #include "share_fetch_failover.hpp"  // v36-0.24 convergence: parent-fetch failover memory (#25C)
+#include "desired_request_pacer.hpp"   // futility backoff for the desired-request drain
 
 #include <core/coin_params.hpp>
 #include <core/tx_advertiser.hpp>
@@ -580,6 +581,11 @@ public:
     /// IO thread only.
     void drain_pending_desired();
 
+    /// Arm the timer for the next drain pass (idempotent while one is pending).
+    /// Rate-caps the drain: the budget bounds work per pass, this bounds passes
+    /// per second. IO thread only.
+    void schedule_desired_drain();
+
     /// Return the hash of our tallest chain head, or uint256::ZERO if empty.
     uint256 best_share_hash();
 
@@ -820,6 +826,38 @@ protected:
     // above -- never touch off the io thread. Mirrors m_think_needs_continue.
     static constexpr std::size_t DESIRED_REQUEST_BUDGET = 50;
     std::deque<std::pair<NetService, uint256>> m_pending_desired;
+
+    // ---- desired-drain RATE cap (the budget above is not one) ----
+    // DESIRED_REQUEST_BUDGET bounds the work per PASS, and the continuation was
+    // reposted with a bare asio::post — i.e. immediately. That buys interleaving
+    // with other handlers but no rate limit at all: the queue is re-entered at
+    // once, 50 requests per pass, for as long as it is non-empty. Because empty
+    // replies leave result.desired unchanged, run_think refills the queue every
+    // cycle and the drain never stops. Measured on the public LTC node after the
+    // #1556 cutover: the io thread pinned at 98% CPU (ps -L: 1 thread R, 13 S)
+    // and :8080 dead for 12.7 minutes while the process happily logged ~29
+    // parent-share requests/s, 5137 distinct hashes, ~1:1 answered "empty".
+    // #1556 removed the abort; it could not remove the burn.
+    //
+    // Space the passes with a timer instead. At 50 requests per pass this caps
+    // the drain near 1000 req/s in the worst case while leaving the io thread
+    // idle between passes, and in the failing shape above it cuts the burn by
+    // the duty-cycle ratio. IO-THREAD CONFINED, like m_pending_desired.
+    static constexpr std::chrono::milliseconds DESIRED_DRAIN_INTERVAL{50};
+    std::unique_ptr<boost::asio::steady_timer> m_desired_drain_timer;
+    bool m_desired_drain_scheduled{false};
+
+    // Hard ceiling on the queue. result.desired is authoritative and replaces the
+    // queue each think(), so a pathological set cannot accumulate across cycles —
+    // but it CAN arrive huge in a single cycle on a large persisted sharechain.
+    // Truncating costs nothing: the remainder is recomputed and re-queued next
+    // cycle, now that the pacer keeps the futile members out of the way.
+    static constexpr std::size_t DESIRED_QUEUE_MAX = 2000;
+
+    // Per-hash futility backoff — the CAUSE-side half of the fix. See
+    // desired_request_pacer.hpp for why this is not the same thing as the
+    // per-(hash,peer) failover memory below. IO-THREAD CONFINED.
+    ltc::DesiredRequestPacer<uint256> m_desired_pacer;
 
     // v36-0.24 kr1z1s convergence hotfix #25(C): per-(hash,peer) parent-fetch
     // failure memory. Replaces the old peer-BLIND per-hash counter

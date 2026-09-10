@@ -1392,6 +1392,11 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash)
                     m_fetch_failures.record(target_hash, chosen_key_val,
                                             static_cast<double>(std::time(nullptr)));
                 }
+                // Futility backoff (io thread): damp THIS hash for a growing
+                // interval so a desired set nobody can serve stops being
+                // re-requested at full rate every think() cycle.
+                m_desired_pacer.record_empty(
+                    target_hash, static_cast<double>(std::time(nullptr)));
                 LOG_INFO << "[Pool] Share request empty for "
                          << target_hash.ToString().substr(0,16)
                          << " from " << peer_addr_for_log.to_string()
@@ -1404,6 +1409,7 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash)
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.clear_hash(target_hash);
             }
+            m_desired_pacer.record_success(target_hash);
 
             LOG_INFO << "[Pool] Received " << reply.m_items.size() << " shares for download request";
 
@@ -1449,10 +1455,17 @@ void NodeImpl::drain_pending_desired()
         m_pending_desired.clear();
         return;
     }
+    const double now = static_cast<double>(std::time(nullptr));
     std::size_t processed = 0;
     while (!m_pending_desired.empty() && processed < DESIRED_REQUEST_BUDGET) {
         auto entry = m_pending_desired.front();
         m_pending_desired.pop_front();
+        // Futility backoff. A hash whose last reply was empty is skipped until
+        // its backoff expires; unknown and healthy hashes are always eligible.
+        // A skip does NOT consume budget -- it is a map lookup, and the point of
+        // the pass is to reach the hashes that can still be served.
+        if (!m_desired_pacer.eligible(entry.second, now))
+            continue;
         peer_ptr advertiser;
         for (auto& [nonce, p] : m_peers) {
             if (p && p->addr() == entry.first) { advertiser = p; break; }
@@ -1461,7 +1474,27 @@ void NodeImpl::drain_pending_desired()
         ++processed;
     }
     if (!m_pending_desired.empty())
-        boost::asio::post(*m_context, [this]() { drain_pending_desired(); });
+        schedule_desired_drain();
+}
+
+void NodeImpl::schedule_desired_drain()
+{
+    // Space the next pass with a timer instead of reposting immediately. The
+    // bare asio::post this replaces yielded to other handlers but imposed no
+    // rate limit, so a desired set that keeps refilling (every reply empty) kept
+    // the io thread at 98% CPU indefinitely. IO thread only.
+    if (m_desired_drain_scheduled)
+        return;
+    if (!m_desired_drain_timer)
+        m_desired_drain_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+    m_desired_drain_scheduled = true;
+    m_desired_drain_timer->expires_after(DESIRED_DRAIN_INTERVAL);
+    m_desired_drain_timer->async_wait([this](const boost::system::error_code& ec) {
+        m_desired_drain_scheduled = false;
+        if (ec)  // cancelled at shutdown
+            return;
+        drain_pending_desired();
+    });
 }
 
 void NodeImpl::load_persisted_shares()
@@ -2127,9 +2160,15 @@ void NodeImpl::run_think()
             // pulse (main_ltc.cpp watchdog) -> abort during boot. result.desired
             // is recomputed authoritatively each think(), so replace the queue.
             m_pending_desired.clear();
+            // Forget stale backoff entries so a hash that became servable is
+            // retried (the backoff is a damper, never a permanent ban).
+            m_desired_pacer.prune(static_cast<double>(std::time(nullptr)));
             if (!result.desired.empty()) {
-                for (auto& [peer_addr, hash] : result.desired)
+                for (auto& [peer_addr, hash] : result.desired) {
+                    if (m_pending_desired.size() >= DESIRED_QUEUE_MAX)
+                        break;  // remainder is recomputed and re-queued next cycle
                     m_pending_desired.emplace_back(peer_addr, hash);
+                }
                 drain_pending_desired();
             }
 
