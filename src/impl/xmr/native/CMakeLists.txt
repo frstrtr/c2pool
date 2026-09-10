@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Native-minimal Monero embedded node -- Wave 0.
+# Native-minimal Monero embedded node -- Waves 0 and 1.
 #
 # There is no library here on purpose. Wave 0 is the pinned CONTRACTS family
 # (contracts/, header-only, STL plus the existing lane value types), a compiling
@@ -8,8 +8,13 @@
 # (consensus/: the blob reader, consensus transaction weight, the hard-fork
 # table and its fence, and the RandomX seed epoch).
 #
-# All of it is header-only, so nothing is compiled until a target includes it.
-# The three Wave 0 KATs in test/ are those targets.
+# Wave 1 / C2a adds consensus/ rules (block parse and identity, medians,
+# weights, reward, difficulty, timestamps, the R-HFFUSE hard-fork policy) and
+# chain/ (the consensus state, the wire-to-state evaluation seam and the real
+# IChainView). Still header-only: nothing here is compiled until a target
+# includes it, and the KATs in test/ are those targets. Two of them link
+# `xmr_coin` for the keccak, tree hash and vendored difficulty oracle that
+# already exist in this repository -- see test/CMakeLists.txt.
 #
 # SCOPE FENCE: this tree is a WORK SOURCE for the pool. It is not part of the
 # v37 share-chain record, it activates no consensus, and it does not touch

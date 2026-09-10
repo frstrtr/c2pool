@@ -1,4 +1,4 @@
-# Native-minimal Monero embedded node — Wave 0
+# Native-minimal Monero embedded node — Waves 0 and 1
 
 This tree is the pool-scoped Monero node c2pool speaks the Monero P2P protocol
 with directly, rather than linking monerod's libraries. monerod is not removed:
@@ -11,14 +11,15 @@ SOURCE for the pool — it tells the template what to build on and it pushes a
 found block — and it is **not** part of the v37 share-chain record. Nothing here
 activates v37 consensus and nothing here touches `src/sharechain/v37`.
 
-## What Wave 0 contains
+## What is here
 
 | directory | what |
 |---|---|
-| `contracts/` | the pinned interfaces every later component builds against, header-only |
-| `contracts/fakes/` | a compiling fake per interface, so wave-1 components can be written and tested before their dependencies exist |
-| `consensus/` | the four shared primitives that would otherwise have been implemented three times |
-| `test/` | the three Wave 0 KATs |
+| `contracts/` | the pinned interfaces every later component builds against, header-only (Wave 0) |
+| `contracts/fakes/` | a compiling fake per interface, so wave-1 components can be written and tested before their dependencies exist (Wave 0) |
+| `consensus/` | the shared primitives, plus the C2a consensus rules: block parse and identity, weights, reward, difficulty, timestamps, hard-fork policy |
+| `chain/` | Wave 1 / C2a: the consensus state, the wire-to-state evaluation seam, and the real `IChainView` |
+| `test/` | the KATs |
 
 ### contracts/
 
@@ -100,6 +101,8 @@ the live-submit surface). Nothing here re-opens either.
 | `xmr_native_contracts_kat` | every contract and fake compiles together; the fakes satisfy the interfaces; the pinned semantics hold; the hard-fork table and seed-epoch rules hold at their edges |
 | `xmr_native_tx_weight_kat` | the weight golden over real stagenet transactions |
 | `xmr_native_blob_reader_fuzz_kat` | reader unit rules plus a deterministic fuzz pass, over random input and over mutations of the real transaction corpus |
+| `xmr_native_block_id_kat` | block identity against monerod over whole captured blocks, with the negative controls (flipped bytes, truncation, trailing bytes, the length prefix) |
+| `xmr_native_consensus_state_kat` | 600 stagenet heights replayed through the windows — difficulty, long-term weight, reward, emission — plus rollback exactness, `connect()` on real blobs, the R-HFFUSE policy and the 128-bit arithmetic against boost |
 
 ## The tx-weight golden
 
@@ -116,8 +119,77 @@ transaction in it, that single number pins the per-transaction weights — exact
 for the blocks carrying a single transaction, and as a sum for the rest. Without
 it the golden would only prove that the code agrees with itself.
 
-## Not in Wave 0
+## Wave 1 / C2a — the consensus state
 
-The components themselves: the levin P2P client, the chain-state index, the
-relayed txpool, the template source, the block relay and the parity oracle. Each
-is a later wave, authored against the fakes here.
+C2a is the arithmetic of following the Monero chain: what a block weighs, what
+it pays, what difficulty it had to meet, what its id is, and what the five
+windows look like afterwards. It is deliberately NOT the index — no fork choice,
+no alt branches, no peers, no storage, which are C2c's — and that line is what
+makes every rule in it testable against monerod without a network.
+
+### consensus/ (C2a additions)
+
+| file | what |
+|---|---|
+| `xmr_block_parse.hpp` | the block blob parser. Slices the header rather than re-serializing it (a re-serializer that drifted by one byte would silently change every block id), parses the coinbase through the Wave 0 transaction parser, and re-reads the two coinbase fields that parser discards: the txin_gen height and the output sum. |
+| `xmr_block_id.hpp` | coinbase hash, transaction tree root, hashing blob and block id, over the keccak and tree-hash already in `xmr_coin`. The id is keccak of the **length-prefixed** hashing blob; the PoW input is the bare one. |
+| `xmr_median.hpp` | monerod's median, `get_mid` included, and a rolling window that answers a 100 000-entry median in O(distinct) and rolls **backwards** exactly — which the reorg path needs and monerod's own median heap cannot do. |
+| `xmr_weight.hpp` | block weight from (possibly pruned) bodies, the long-term weight recursion including the HF15 2021-scaling floor of `ltemw * 10 / 17`, the two medians and the effective median that sets the penalty knee. |
+| `xmr_reward.hpp` | the emission curve, the tail, the weight penalty in 128-bit arithmetic (both the `__int128` and the 32-bit-limb spellings, cross-checked), already-generated-coins with monerod's saturation, and the coinbase-amount rule including the v2..v12 partial-claim path that changes what the emission grows by. |
+| `xmr_difficulty.hpp` | the R-U128 adapter over the vendored `difficulty.cpp`, plus the 735-row window. The window is 735 and not 720 because `next_difficulty` drops the newest 15 rows itself; the KAT pins that against 600 heights and shows 720 and 721 reproducing none of them. |
+| `xmr_timestamp.hpp` | the 60-block timestamp median, the future-time limit (local, soft) and the below-median rule (consensus, hard). |
+| `xmr_hf_policy.hpp` | **R-HFFUSE**, the unknown-fork ruling Wave 0 left open. |
+
+### R-HFFUSE: code-rolling, not fail-closed
+
+The plan's original R-HF was: meet a fork we do not implement, halt the native
+path, fall back to an armed daemon. That is safe and useless — it turns every
+Monero hard fork into a total outage on a schedule we do not control, and it
+pays for the safety of the arm that needed it (block PRODUCTION) with the arm
+that needed none (chain FOLLOWING).
+
+The ruling splits them. At a fork above `MAX_IMPLEMENTED_HF_VERSION` the node
+KEEPS FOLLOWING, with rule lookups rolled forward to the newest version it
+implements, and a latching fuse withdraws exactly the two capabilities that can
+emit something the network judges:
+
+| capability | known fork | rolled fork |
+|---|---|---|
+| follow the chain | yes | yes (fail-open) |
+| serve / relay blocks | yes | yes |
+| admit transactions | yes | **no** (fail-closed) |
+| build a template | yes | **no** (fail-closed) |
+
+A version BELOW what the table requires at a height stays a hard reject: that is
+not an unknown fork, it is a block from a fork the network already left.
+`top_version` follows the CHAIN at a rolled fork rather than advertising a stale
+version, because a stale advertisement is what actually gets a node dropped.
+
+### chain/
+
+| file | what |
+|---|---|
+| `xmr_consensus_state.hpp` | the five windows, `connect()` (version, timestamp, weight, reward, coinbase, emission, difficulty) and an exactly reversible `disconnect()`. Every connect returns an undo record carrying what fell out of each window, so a reorg is a rollback rather than a re-derivation. |
+| `xmr_block_eval.hpp` | the wire-to-state seam: parse, identify, then **authenticate every transaction body against the id the block commits to** before its weight is allowed to touch a median. This is what makes pruned sync safe. |
+| `xmr_chain_view.hpp` | `ChainStateView`, the real `IChainView`: tip, template inputs, lookups by id and height, confirmation depth, seed anchors across epoch boundaries, the event streams, own-block submission. |
+
+### The C2a golden
+
+`test/xmr_c2a_golden.hpp` (regenerate with `test/gen_c2a_golden.py`) carries 600
+consecutive stagenet heights with the numbers monerod computed for them —
+difficulty, long-term weight, reward — the 100 000-entry long-term weight window
+that precedes them, ten whole block blobs with the daemon's ids, and
+already-generated-coins from `get_coinbase_tx_sum` at both ends of the run.
+Nothing in that file is computed by this repository, which is what lets the
+replay fail rather than agree with itself.
+
+It earned that on the first run: every window value matched and all ten block
+ids were wrong, because the id is keccak over the **length-prefixed** hashing
+blob and the first cut hashed the bare one.
+
+## Not here yet
+
+The rest of the components: the levin P2P client (C1), the anchor loader and
+RandomX verify (C2b), the index and fork choice (C2c), the relayed txpool (C3),
+the template source (C4), the block relay (C5) and the parity oracle (C6). Each
+is authored against the contracts here.
