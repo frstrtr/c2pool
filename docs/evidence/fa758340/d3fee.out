@@ -1,0 +1,5 @@
+...h=2535250 tot=1030554 old=385873
+...h=2535500 tot=16203335 old=7103158
+...h=2535750 tot=30355260 old=12969544
+...h=2536000 tot=45468352 old=19482139
+RESULT blocks=1000 txs=19420 total_fee_duffs=58438730 oldcoin_fee_duffs=22981557 oldcoin_frac=0.3933 oldcoin_txs=4497 oldcoin_tx_frac=0.2316

@@ -1,0 +1,38 @@
+D3 FEE-HALF: old-coin (dashd-only) fee class measurement
+=========================================================
+Date: 2026-09-10
+Node: an archival mainnet node, Dash Core v23.1.7, mainnet, txindex=1
+Method: getblock <hash> 3 per block (prevout height+value per input, 1 RPC/block,
+        no per-input lookups; node load 0.00 during scan, soak-safe).
+        A fee-bearing tx is OLD-COIN if any input spends a prevout at height < h-288,
+        i.e. an output the c2pool-dash --embedded-utxo 288-block sliding window has
+        pruned and therefore cannot value (fee_known=false). Whole-tx fee counted as
+        old-coin on >=1 old input (the sliding window cannot price the tx at all).
+        Boundary +/-1 on the 288 depth is immaterial to the result.
+Range: heights 2535178..2536177 (1000 blocks), the ground-truth fee window.
+
+RESULT:
+  blocks              = 1000
+  fee-bearing txs     = 19420
+  total fee           = 58,438,730 duffs
+  old-coin fee        = 22,981,557 duffs
+  old-coin fee frac   = 0.3933  (39.3%)
+  old-coin txs        = 4497  (23.2% of fee-bearing txs)
+
+VALIDATION:
+  total fee 58,438,730 duffs cross-checks the independently captured ground-truth
+  58,445,570 duffs (difference 0.012%). The classification is therefore a measurement,
+  not an estimate.
+
+INTERPRETATION:
+  The dashd-only class the sliding window drops is a large minority of fee revenue
+  (about 39%), not a rounding error. This reframes the D3 fee metric away from the
+  satisfiable no-op (fees vs subsidy = 0.0356%) toward a material ~39% pricing-coverage
+  gap the replay fold must recover.
+
+REMAINING (build-gated):
+  fold-vs-truth accuracy, i.e. whether the fold prices these old-coin txs correctly,
+  requires the fold binary and the operator's known-good fold-build invocation. This
+  buildless half establishes the size of the class; the accuracy half awaits the fold.
+
+Artifacts: d3fee.py (scanner), d3fee.out (run log with RESULT line).
