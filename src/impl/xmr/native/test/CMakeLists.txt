@@ -281,4 +281,66 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_native_chain_index_kat COMMAND xmr_native_chain_index_kat)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Wave 1 / C4: the template source seam (../template/). Two targets.
+    #
+    #   xmr_native_template_kat
+    #     The seam itself: NativeMinerDataSource over the real ChainStateView
+    #     and a canned txpool, MonerodMinerDataSource over a fake transport
+    #     replaying a REAL captured get_miner_data, the readiness matrix, the
+    #     difficulty sanity band, the epoch/rebuild rule, the body pins and the
+    #     arm resolver. Its centrepiece is the P-TPL parity table: the seven
+    #     get_miner_data fields the native arm derives, compared against the
+    #     values a synced stagenet monerod reported at that height.
+    #
+    #     Links `xmr_coin` for the same reason the C2a/C2c targets do (keccak,
+    #     tree hash, the vendored difficulty retarget), and `xmr_node` for the
+    #     PRODUCTION get_miner_data parser -- the monerod arm has to be the real
+    #     decode path, hex-string difficulty and all, or "this arm is the old
+    #     path" would be a claim about a re-typed struct instead. Both are LIGHT
+    #     links: no RandomX, no libsodium, no libzmq, no monerod, no network.
+    #     ctest passes no arguments; `--parity-json <file>` is the opt-in mode
+    #     that swaps in a freshly captured response and is deliberately NOT what
+    #     ctest runs.
+    #
+    #   xmr_native_template_coinbase_kat
+    #     The other half of the C4 claim: the option-B K_fair settlement
+    #     coinbase is unchanged by the rebind. Builds the X6 coinbase from the
+    #     native derivation (../../settle/xmr_coinbase.cpp -- the same executor
+    #     and the same file the daemon-ful path uses) and pins the owed payee
+    #     set, the exact-sum residual sink, the owed_digest under the tx_extra
+    #     0x03 merge-mining tag, the byte-identity of the two arms' coinbases
+    #     and the pre-CARROT fence. Same shape and cost as the existing
+    #     xmr_coinbase_kat target, which has been on both CI legs since X6.
+    #
+    # Same drift-guard rule as every target above: both are added to BOTH
+    # `--target` lists in .github/workflows/build.yml by the change that adds
+    # them here, because a registered-but-unbuilt target reports "***Not Run"
+    # and fails ctest (the #1539 lesson).
+    # ─────────────────────────────────────────────────────────────────────────
+    add_executable(xmr_native_template_kat xmr_native_template_kat.cpp)
+    target_include_directories(xmr_native_template_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_template_kat PRIVATE xmr_coin xmr_node)
+    target_compile_features(xmr_native_template_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_template_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_template_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_template_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME xmr_native_template_kat COMMAND xmr_native_template_kat)
+
+    add_executable(xmr_native_template_coinbase_kat
+        xmr_native_template_coinbase_kat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../settle/xmr_coinbase.cpp)
+    target_include_directories(xmr_native_template_coinbase_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_template_coinbase_kat PRIVATE xmr_coin)
+    target_compile_features(xmr_native_template_coinbase_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_native_template_coinbase_kat COMMAND xmr_native_template_coinbase_kat)
+
 endif()
