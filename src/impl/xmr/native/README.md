@@ -18,7 +18,7 @@ activates v37 consensus and nothing here touches `src/sharechain/v37`.
 | `contracts/` | the pinned interfaces every later component builds against, header-only (Wave 0) |
 | `contracts/fakes/` | a compiling fake per interface, so wave-1 components can be written and tested before their dependencies exist (Wave 0) |
 | `consensus/` | the shared primitives, plus the C2a consensus rules: block parse and identity, weights, reward, difficulty, timestamps, hard-fork policy |
-| `p2p/` | Wave 1 / C1a: the levin bucket-header codec, the epee portable-storage codec, and the typed P2P messages |
+| `p2p/` | Wave 1 / C1a: the levin bucket-header codec, the epee portable-storage codec, and the typed P2P messages. Wave 1 / C1b: the transport on top of them — the asio `LevinSocket`, the FIFO reply matcher, the handshake state machine and the `LevinLink` that runs HANDSHAKE and the TIMED_SYNC beat |
 | `chain/` | Wave 1 / C2a: the consensus state, the wire-to-state evaluation seam, and the real `IChainView` |
 | `anchor/` | Wave 1 / C2b: the trust-anchor bundle — the `.inc` format, the fail-closed loader, the generator, and the release-pinned stagenet bundle |
 | `test/` | the KATs |
@@ -144,6 +144,54 @@ That is hardest-unknown U5, it needs a daemon, and it belongs to the C6 parity
 rig. The goldens below are derived from the serialization rules instead, which
 checks the encoder rather than photographing it.
 
+### p2p/ — Wave 1, component C1b: the levin transport
+
+C1a turns 33 bytes into a struct. C1b opens the socket, decides who is on the
+other end of it, and keeps them talking to us.
+
+| file | what |
+|---|---|
+| `levin_socket.hpp` | one TCP connection on the node's `io_context`, framed by C1a's header. Three disciplines copied from `core::Socket`, each of which was paid for with a production incident: header-then-bounded-body reads with **no resync on a bad header**, exactly **one composed `async_write` in flight** with a FIFO drain (issue #863 — overlapping composed writes splice one message's bytes into another's), and the **owner lock-per-async-op** lifetime guard from `core/factory.hpp` that ends the Bug-9 use-after-free family |
+| `levin_invoke_queue.hpp` | the reply matcher, plus the `expect_response` latch for the two notify-answered legs and the inbound-only liveness deadline |
+| `xmr_handshake.hpp` | the pure 1001 state machine — `Idle → Dialed → HandshakeSent → Handshaked / Failed(reason)` — and the sync-data validator, including monerod's own pruning-seed rule |
+| `xmr_levin_link.hpp` | the per-connection driver: it binds the four pieces above, runs the HANDSHAKE exchange, flips the size caps on success, and drives the 60-second (±5 s, jittered) TIMED_SYNC beat in both directions |
+
+Three things about this layer are worth stating out loud, because each is a
+place a reasonable implementation goes wrong:
+
+* **Levin has no request id.** A bucket header carries a command, a flags word
+  and a return code, and nothing that ties an answer to its question. monerod
+  matches responses in ARRIVAL ORDER, per connection, and drops the peer when
+  the front of its list does not match the response's command. So the matcher
+  here is a FIFO, a mismatch is a close, and there is deliberately no "search
+  the queue for a better fit" — that search is exactly how a peer would steer
+  one answer onto another question.
+* **TIMED_SYNC is the heartbeat, not PING.** `COMMAND_PING` (1003) is only the
+  port-reachability call-back for nodes that advertise `my_port != 0`; we
+  advertise 0, so we are never pinged. `COMMAND_TIMED_SYNC` (1002) is
+  simultaneously the keepalive, the peer-height gauge, the reorg tripwire and
+  the peerlist source. Only INBOUND bytes push the liveness deadline: a
+  connection we keep writing to is not alive, a connection that answers is.
+* **An unknown invoke still gets an answer.** A command we do not serve is
+  answered with `LEVIN_ERROR_CONNECTION_HANDLER_NOT_DEFINED`, never with
+  silence — silence stalls the PEER's arrival-order matcher and it drops us for
+  non-response. The error costs 33 bytes.
+
+RandomX never runs on the io thread. `LightVerifier` is not thread-safe and an
+evaluation is milliseconds to hundreds of milliseconds, so one on this thread
+would stall every other peer on the same `io_context` and let a single crafted
+push wedge the node. C1b enforces that structurally — it includes no verifier
+and hashes nothing — and `LevinSocket::on_io_thread()` exists so the boundary is
+asserted in the KAT rather than promised in a comment.
+
+Three corrections found during the C1a verify against a live daemon are carried
+by the codec and re-asserted from this layer's KAT, so a later refactor cannot
+quietly undo them: epee sections serialize in **sorted key order**;
+`SIGNATURE_B` = `0x01020101` is the bytes `01 01 02 01` on the wire; and
+`COMMAND_TIMED_SYNC::response` is `payload_data` + `local_peerlist_new` **only**
+(no `local_time`, no legacy peerlist), where an absent or empty
+`local_peerlist_new` is a normal answer and never a drop.
+
 ### test/
 
 | target | what it proves |
@@ -157,6 +205,8 @@ checks the encoder rather than photographing it.
 | `xmr_levin_fuzz_kat` | the bounded deterministic fuzz pass; `--dump-corpus <dir>` exports the seeds for an external libFuzzer run |
 | `xmr_native_block_id_kat` | block identity against monerod over whole captured blocks, with the negative controls (flipped bytes, truncation, trailing bytes, the length prefix) |
 | `xmr_native_consensus_state_kat` | 600 stagenet heights replayed through the windows — difficulty, long-term weight, reward, emission — plus rollback exactness, `connect()` on real blobs, the R-HFFUSE policy and the 128-bit arithmetic against boost |
+| `xmr_levin_socket_kat` | `LevinSocket` over real loopback TCP: the read loop assembles a frame split across writes and splits two frames out of one write; a bad header closes without resyncing onto the valid frame planted behind it; the per-command and pre-handshake caps are refused on the header alone; the cap flip admits a 300 KiB push it previously refused; twenty-four back-to-back multi-round writes arrive byte-identical and in order; a full outbound queue refuses loudly; a freed owner aborts the connection instead of dereferencing it (written as the real use-after-free, so ASan proves it on the sanitizer leg); and the frame handler runs on the io thread and nowhere else |
+| `xmr_levin_link_kat` | the 1001/1002 exchanges against a hand-rolled monerod stand-in whose frame reader is independent of `levin_codec`: the handshake request's bytes carry the right storage header and sorted keys, every refusal (network id, self-connect, zero peer id, 251 peers, impossible pruning seed, undecodable body, negative return code) closes with its own reason while exactly 250 peers is accepted, the TIMED_SYNC beat runs and is matched, an out-of-order answer and an unrequested 2004/2007 both close, the expect-response latch admits the one we asked for, the deadlines fire, we answer PING and REQUEST_SUPPORT_FLAGS and decline what we do not serve — plus the pure FIFO/latch/liveness/state-machine checks. `--live <host>:<port>` dials a real daemon; ctest does not |
 | `xmr_native_anchor_self_check_kat` | SHA-256 against the NIST vectors; the `.inc` format round-trips and each documented damage produces its own `AnchorParse`; every `AnchorStatus` is reached by mutating one field; `load_anchor`'s four gates including a tampered file on disk; `generate_anchor` against an honest and a dishonest model daemon; and the real embedded stagenet bundle, whose digest is recomputed with the C++ canonical writer |
 
 The fuzz KAT's load-bearing assertion is that **canonical re-encoding is
@@ -295,7 +345,12 @@ blob and the first cut hashed the bare one.
 ## Not here yet
 
 Landed so far, each authored against the contracts here: the levin codec (C1a),
-the consensus state (C2a) and the trust-anchor bundle (C2b). Still to come: the
-levin transport and peer pool (C1b/C1c), the index and fork choice (C2c), the
-relayed txpool (C3), the template source (C4), the block relay (C5) and the
-parity oracle (C6).
+the levin transport (C1b), the consensus state (C2a) and the trust-anchor
+bundle (C2b). Still to come: the peer pool and its DoS policy (C1c), the index
+and fork choice (C2c), the relayed txpool (C3), the template source (C4), the
+block relay (C5) and the parity oracle (C6).
+
+C1b stops at one connection. The dial plan, the peer store, the primary
+election, the refill and rotation loops, the token buckets, the chain locator
+and the `IBroadcastPort` / `IChainFetcher` / `IChainServing` implementations are
+C1c, which is where `LevinLink`'s `on_frame` demux gets its consumers.
