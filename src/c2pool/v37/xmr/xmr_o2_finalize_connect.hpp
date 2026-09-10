@@ -1106,6 +1106,209 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
                 !FinalizeConnect::parse_sidecar_line(
                     "2 " + bid5 + " 4242 - 0 - 0 2 " + hex_of(payee) + ":1", junk_bid, junk));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // phase 4 — F-1: THE STARTUP OWED SEED ACROSS A RESTART
+    //
+    // WHY PHASES 1-3 MASKED F-1. They arm owed the RIGHT way — a FOUND carrying
+    // an S-1-shaped E_b credit, write-ahead-logged by XmrFinalizeDriver — so the
+    // credit leg replays on restart exactly like the payout leg, and FC8a/FC10b
+    // pass. The LIVE daemon's --owed-demo-amount armed owed a DIFFERENT way:
+    // straight into OwedLedger, bypassing the write-ahead log. No phase covered
+    // that path at all, so no assertion could fail on it. "The R-7 acceptance
+    // probe only checks the fresh-boot path" is exactly this: the restart
+    // assertions existed, but never over the seed the daemon actually used.
+    //
+    // 4a is the NEGATIVE CONTROL: it reproduces the OLD non-durable seed and
+    // REQUIRES the restart to come back NEGATIVE. Without it the non-negative
+    // assertion in 4b could pass vacuously (a run that never really paid out of
+    // the seed would satisfy it), and F-1 could walk back in unnoticed.
+    // 4b is the FIX: the same scenario through seed_owed_durable(), which must
+    // come back NON-NEGATIVE and must apply the seed EXACTLY ONCE.
+    // ═══════════════════════════════════════════════════════════════════════
+    {
+        const long long DEMO = 250000000000ll;      // the seeded owed row
+        const ::v37::bytes32 demo_payee = smoke::key_of(0xD1);
+        auto demo_owed = [&](long long a) { Amounts m; if (a) m[demo_payee] = a; return m; };
+
+        // min over effective_owed_all(), read straight off the ledger — this IS
+        // the acceptance probe (FinalizeConnect::min_effective_owed's rule).
+        auto min_eo = [](XmrNode& n) {
+            long long m = 0;
+            for (const auto& [k, v] : n.ledger().effective_owed_all()) { (void)k; if (v < m) m = v; }
+            return m;
+        };
+
+        // Drive one store dir through: seed -> win whose coinbase pays the WHOLE
+        // seed -> bury past D_conf -> FINALIZE -> destroy the node ("crash").
+        // `durable` picks which seed path is used.
+        auto run_and_crash = [&](const std::string& dir, bool durable) -> bool {
+            XmrNodeConfig c;
+            c.network = MoneroNetwork::Stagenet;
+            c.lane_chain = CHAIN;
+            c.d_conf = D_CONF;
+            c.settle_db_path = dir;
+            std::filesystem::create_directories(dir);
+
+            FinalizeConnectOptions fo;
+            fo.sidecar_path = (std::filesystem::path(dir) / "pfound.tsv").string();
+            fo.out = nullptr;
+
+            MockMonerodTransport mock;
+            XmrNode node(c, mock, &smoke::test_point_check);
+            try { node.bring_up(); } catch (const std::exception&) { return false; }
+
+            if (durable) {
+                // THE FIX: two write-ahead events under the stable seed bid.
+                if (node.finalize_driver().seed_owed_durable(
+                        kOwedDemoSeedBid, demo_owed(DEMO), kOwedDemoSeedBinHeight)
+                    != SeedOwedResult::Applied) return false;
+            } else {
+                // THE OLD PATH, verbatim: straight into the ledger, no WAL.
+                node.ledger().on_block_found("legacy-demo-seed", demo_owed(DEMO), /*payout=*/{});
+                node.ledger().on_block_finalized("legacy-demo-seed", kOwedDemoSeedBinHeight);
+            }
+            if (node.ledger().effective_owed(demo_payee) != DEMO) return false;
+
+            FoundBlockQueue lq;
+            FinalizeConnect lfc(node, c, lq, fo);
+            (void)lfc.reseed_after_bring_up();
+
+            chain(node, 1, 5);
+            FoundBlockEvent w;
+            w.height = 5; w.block_id_hex = bid5; w.prev_id_hex = hex_of(smoke::blk_id(4));
+            w.reward_piconero = REWARD; w.payee = demo_payee;
+            w.coinbase_owed = demo_owed(DEMO);       // the coinbase pays the whole seed
+            lq.push(w);
+            auto tt = lfc.tick();
+            if (tt.registered != 1) return false;
+            chain(node, 6, 8);                       // 5 + D_CONF = 8 => FINALIZE
+            tt = lfc.tick();
+            return tt.settled == 1 && node.ledger().is_settled(bid5);
+        };
+
+        // ── 4a NEGATIVE CONTROL — the pre-fix seed MUST come back negative ───
+        const std::string dir_a = (tmp_root / "f1-legacy-seed").string();
+        const bool ran_a = run_and_crash(dir_a, /*durable=*/false);
+        {
+            XmrNodeConfig c;
+            c.network = MoneroNetwork::Stagenet; c.lane_chain = CHAIN; c.d_conf = D_CONF;
+            c.settle_db_path = dir_a;
+            MockMonerodTransport mock;
+            XmrNode node(c, mock, &smoke::test_point_check);
+            bool up = true;
+            try { node.bring_up(); } catch (const std::exception&) { up = false; }
+            const long long m = up ? min_eo(node) : 0;
+            rep.add("FC20 F-1 NEGATIVE CONTROL: the OLD non-durable seed (written straight into the "
+                    "ledger, never into the write-ahead log) DOES leave a negative effective_owed "
+                    "row across a restart — so FC21's non-negative assertion is not vacuous",
+                    ran_a && up && m == -DEMO,
+                    "min_effective_owed=" + std::to_string(m) + " want=" + std::to_string(-DEMO));
+        }
+
+        // ── 4b THE FIX — durable seed, restart, NON-NEGATIVE, applied ONCE ───
+        const std::string dir_b = (tmp_root / "f1-durable-seed").string();
+        const bool ran_b = run_and_crash(dir_b, /*durable=*/true);
+        {
+            XmrNodeConfig c;
+            c.network = MoneroNetwork::Stagenet; c.lane_chain = CHAIN; c.d_conf = D_CONF;
+            c.settle_db_path = dir_b;
+            MockMonerodTransport mock;
+            XmrNode node(c, mock, &smoke::test_point_check);
+            bool up = true;
+            try { node.bring_up(); } catch (const std::exception&) { up = false; }
+
+            const long long m = up ? min_eo(node) : -1;
+            rep.add("FC21 F-1: after a RESTART against the SAME data-dir, NO effective_owed row is "
+                    "negative (min_effective_owed >= 0) — the seed's credit leg replayed out of the "
+                    "write-ahead log alongside the payout that drew on it",
+                    ran_b && up && m >= 0,
+                    "min_effective_owed=" + std::to_string(m));
+            rep.add("FC21b F-1: the seeded row nets to EXACTLY zero after the restart — credited "
+                    "once, paid once (whitepaper 9 no-double-pay / OI-W4-5)",
+                    up && node.ledger().effective_owed(demo_payee) == 0,
+                    "eo=" + std::to_string(up ? node.ledger().effective_owed(demo_payee) : -1));
+            rep.add("FC21c F-1: the store replay restored the seed as SETTLED (terminal) under its "
+                    "stable bid",
+                    up && node.ledger().is_settled(kOwedDemoSeedBid));
+
+            // Re-passing --owed-demo-amount on the restart must be a NO-OP: no
+            // ledger movement, and no new write-ahead event either.
+            const auto seq_before = up ? node.ledger().ledger_seq() : 0;
+            const auto evt_before = up ? node.finalize_driver().event_seq() : 0;
+            const auto again = up ? node.finalize_driver().seed_owed_durable(
+                                        kOwedDemoSeedBid, demo_owed(DEMO), kOwedDemoSeedBinHeight)
+                                  : SeedOwedResult::Refused;
+            rep.add("FC22 F-1: re-passing the startup seed after a restart is reported "
+                    "already-durable and applies NOTHING — ledger_seq and the write-ahead event "
+                    "sequence both unchanged (applied EXACTLY ONCE per data-dir)",
+                    up && again == SeedOwedResult::AlreadyDurable &&
+                    node.ledger().ledger_seq() == seq_before &&
+                    node.finalize_driver().event_seq() == evt_before &&
+                    min_eo(node) >= 0,
+                    std::string("result=") + to_string(again) +
+                    " seq=" + std::to_string(up ? node.ledger().ledger_seq() : 0) +
+                    "/" + std::to_string(seq_before) +
+                    " evt=" + std::to_string(up ? node.finalize_driver().event_seq() : 0) +
+                    "/" + std::to_string(evt_before));
+
+            // A seed with a DIFFERENT amount is equally refused — one demo seed
+            // per data-dir, ever. (Silently crediting a second amount is the
+            // same double-apply wearing a different number.)
+            const auto other = up ? node.finalize_driver().seed_owed_durable(
+                                        kOwedDemoSeedBid, demo_owed(DEMO * 3), kOwedDemoSeedBinHeight)
+                                  : SeedOwedResult::Refused;
+            rep.add("FC22b F-1: a restart passing a DIFFERENT --owed-demo-amount is also "
+                    "already-durable — the flag is ignored, never credited a second time",
+                    up && other == SeedOwedResult::AlreadyDurable && min_eo(node) >= 0);
+        }
+
+        // ── 4c restart INSIDE the D_conf window (the payout still pending):
+        //    effective_owed must be seed - in-flight payout == 0, never negative.
+        {
+            const std::string dir_c = (tmp_root / "f1-durable-midwindow").string();
+            std::filesystem::create_directories(dir_c);
+            XmrNodeConfig c;
+            c.network = MoneroNetwork::Stagenet; c.lane_chain = CHAIN; c.d_conf = D_CONF;
+            c.settle_db_path = dir_c;
+            FinalizeConnectOptions fo;
+            fo.sidecar_path = (std::filesystem::path(dir_c) / "pfound.tsv").string();
+            fo.out = nullptr;
+            bool armed = false;
+            {
+                MockMonerodTransport mock;
+                XmrNode node(c, mock, &smoke::test_point_check);
+                try { node.bring_up(); } catch (const std::exception&) {}
+                armed = node.finalize_driver().seed_owed_durable(
+                            kOwedDemoSeedBid, demo_owed(DEMO), kOwedDemoSeedBinHeight)
+                        == SeedOwedResult::Applied;
+                FoundBlockQueue lq;
+                FinalizeConnect lfc(node, c, lq, fo);
+                (void)lfc.reseed_after_bring_up();
+                chain(node, 1, 5);
+                FoundBlockEvent w;
+                w.height = 5; w.block_id_hex = bid5; w.prev_id_hex = hex_of(smoke::blk_id(4));
+                w.reward_piconero = REWARD; w.payee = demo_payee;
+                w.coinbase_owed = demo_owed(DEMO);
+                lq.push(w);
+                auto tt = lfc.tick();
+                armed = armed && tt.registered == 1;
+                chain(node, 6, 7);                   // hw = 7 < 5 + 3: still pending
+                tt = lfc.tick();
+                armed = armed && tt.settled == 0 && node.ledger().is_pending(bid5);
+            }
+            MockMonerodTransport mock;
+            XmrNode node(c, mock, &smoke::test_point_check);
+            bool up = true;
+            try { node.bring_up(); } catch (const std::exception&) { up = false; }
+            rep.add("FC23 F-1: a restart INSIDE the D_conf window (the payout still pending) also "
+                    "recovers non-negative — effective_owed == seed - in-flight payout == 0",
+                    armed && up && min_eo(node) >= 0 && node.ledger().is_pending(bid5) &&
+                    node.ledger().effective_owed(demo_payee) == 0,
+                    "min=" + std::to_string(up ? min_eo(node) : -1) +
+                    " eo=" + std::to_string(up ? node.ledger().effective_owed(demo_payee) : -1));
+        }
+    }
     return rep;
 }
 

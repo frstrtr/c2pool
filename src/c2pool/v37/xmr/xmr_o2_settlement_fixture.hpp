@@ -441,13 +441,64 @@ public:
     // `external` must outlive this fixture and every template built from it.
     explicit XmrOwedFixture(OwedLedger& external) : m_ledger(external) {}
 
+    // DURABLE non-owning form — F-1 (2026-09-10). Same wiring as above, but the
+    // caller declares that `external` is backed by the settle-store write-ahead
+    // log (XmrNode::ledger()). That single bit is what lets this fixture REFUSE
+    // a non-durable in-memory seed instead of silently creating a credit leg the
+    // store cannot replay (see seed_owed below). The live daemon uses THIS ctor;
+    // KATs driving a bare in-memory OwedLedger use the plain one above.
+    struct DurableLedger {};   // tag
+    XmrOwedFixture(OwedLedger& external, DurableLedger)
+        : m_ledger(external), m_durable(true) {}
+
+    // Is this fixture's ledger the fixture's OWN in-memory one?
+    bool owns_ledger() const { return m_owned.has_value(); }
+    // Is it declared settle-store backed (so a direct ledger write is not durable)?
+    bool durable_ledger() const { return m_durable; }
+
+    // ── F-1 (2026-09-10): RESOLVER-ONLY LEARN ──────────────────────────────
+    // Teach the pay_of resolver that identity_key(pay) is paid to `pay`, WITHOUT
+    // touching the ledger. This is what the live daemon calls on EVERY boot: the
+    // owed ROW is durable (settle-store WAL, replayed by RecoveryDriver) but this
+    // key->ScriptRef map is in-memory and must be rebuilt each run, or a
+    // recovered owed row would resolve to the RAW sentinel and be CARRIED
+    // forever instead of paid. Idempotent by construction. Returns the key.
+    ::v37::bytes32 learn_pay(const ::v37::ScriptRef& pay) {
+        ::v37::bytes32 key = ::v37::xmr::xmr_identity_key(pay);
+        m_paymap[key] = pay;
+        return key;
+    }
+    ::v37::bytes32 learn_pay_std(const std::array<std::uint8_t, 32>& spend_B,
+                                 const std::array<std::uint8_t, 32>& view_A) {
+        return learn_pay(::v37::xmr::make_xmr_std(spend_B, view_A));
+    }
+
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key
     // is the canon identity_key(pay); the resolver learns pay for that key.
     // bin_height auto-increments so each seed arms at a distinct (older-first)
     // age — matching the K_fair oldest-owed-first order. Returns the key.
+    //
+    // ── F-1 FAIL-CLOSED (2026-09-10) ────────────────────────────────────────
+    // This writes into the ledger DIRECTLY, which is fine for an in-memory
+    // ledger (the OWNING form, and the plain non-owning form the KATs drive:
+    // nothing there has to survive anything).
+    // Against a SETTLE-STORE-BACKED ledger it is the F-1 defect: a direct write
+    // is invisible to the write-ahead log, so RecoveryDriver cannot replay the
+    // credit leg on the next boot — while the PAYOUT that drew on it, which DID
+    // go through XmrFinalizeDriver's WAL, replays fine. finalW then lands at
+    // -(amount paid): a NEGATIVE effective_owed row that survives the restart
+    // (§9 no-double-pay / OI-W4-5), and re-passing the flag re-credits on top of
+    // the recovered ledger, so the row is applied once per boot instead of once
+    // ever. Silent, because this store's RecoveryDriver has no ledger_seq
+    // cross-check to trip on the missing events.
+    // So when the caller declared the ledger durable, this REFUSES: it learns
+    // the payee for the resolver and returns the key, but moves NO owed. The
+    // durable route is XmrFinalizeDriver::seed_owed_durable(), which is
+    // replay-exact and restart-idempotent. Refusing in code, rather than
+    // trusting a comment, is what keeps the defect from walking back in.
     ::v37::bytes32 seed_owed(const ::v37::ScriptRef& pay, std::uint64_t amount) {
-        ::v37::bytes32 key = ::v37::xmr::xmr_identity_key(pay);
-        m_paymap[key] = pay;
+        ::v37::bytes32 key = learn_pay(pay);
+        if (m_durable) return key;   // F-1: never a non-durable write to a store-backed ledger
         const std::string bid = "fixture-seed-" + std::to_string(m_next_bid++);
         OwedLedger::Amounts credit; credit[key] = static_cast<long long>(amount);
         m_ledger.on_block_found(bid, credit, /*payout=*/{});
@@ -485,6 +536,7 @@ private:
     std::map<::v37::bytes32, ::v37::ScriptRef> m_paymap;
     std::uint64_t                         m_next_bid = 0;
     std::uint64_t                         m_next_age = 1;   // 0 reserved / unarmed
+    bool                                  m_durable = false; // F-1: settle-store backed
 };
 
 inline ReprojectOwedFn make_reproject_owed(const XmrSettlementConfig& cfg,

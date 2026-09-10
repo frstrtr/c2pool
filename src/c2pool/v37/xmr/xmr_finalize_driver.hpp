@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,35 @@ struct FoundBlock {
     Amounts       payout;       // the coinbase outputs broadcast in b (K_fair)
     bool          canonical = true;
 };
+
+// Outcome of a durable owed seed (F-1). Applied == the write-ahead log grew by
+// exactly two events and the ledger moved; AlreadyDurable == the store already
+// carries this seed (this is a RESTART), so NOTHING was written and NOTHING
+// moved; Refused == the seed was malformed and was not written.
+enum class SeedOwedResult : std::uint8_t { Applied = 0, AlreadyDurable = 1, Refused = 2 };
+
+// The STABLE identity of the --owed-demo-amount startup seed inside one
+// data-dir. It is deliberately a fixed string, not a function of the amount or
+// the payee: one demo seed per data-dir, EVER. Re-passing the flag with a
+// different amount after the seed is durable is reported as already-durable and
+// IGNORED (loudly) rather than credited a second time — a second credit is
+// exactly the double-apply F-1 closed. It cannot collide with a Monero block id
+// (64 lowercase hex chars) or with a sidecar bid.
+inline constexpr const char* kOwedDemoSeedBid = "v37-owed-demo-seed";
+// The K_fair age stamp the seed arms at. 1 == the oldest arm-able age (0 is
+// reserved / unarmed), so the seeded row sorts oldest-owed-first ahead of every
+// row a later real FINALIZE arms. Persisted in the WAL and replayed verbatim,
+// so the age ordering is identical on every boot (F1).
+inline constexpr std::uint64_t kOwedDemoSeedBinHeight = 1;
+
+inline const char* to_string(SeedOwedResult r) {
+    switch (r) {
+        case SeedOwedResult::Applied:        return "applied";
+        case SeedOwedResult::AlreadyDurable: return "already-durable";
+        case SeedOwedResult::Refused:        return "refused";
+    }
+    return "?";
+}
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
 struct FinalizeStep {
@@ -91,6 +121,74 @@ public:
         m_ledger.on_block_found(b.bid, b.credit, b.payout);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
+    }
+
+    // ── F-1 (2026-09-10): THE DURABLE, RESTART-IDEMPOTENT OWED SEED ────────
+    // The ONLY supported way to put a startup-seeded owed row into the LIVE,
+    // store-backed ledger.
+    //
+    // THE DEFECT THIS CLOSES. Before this, --owed-demo-amount called
+    // OwedLedger::on_block_found()/on_block_finalized() DIRECTLY on the node's
+    // ledger, bypassing this driver and therefore the settle-store write-ahead
+    // log. The credit leg was in-memory only; the PAYOUT leg that later drew on
+    // it went through this driver and WAS write-ahead-logged. So after a restart
+    // against the same data-dir, RecoveryDriver replayed the payout with no
+    // matching credit and finalW(k) landed at -(amount paid): a NEGATIVE
+    // effective_owed row that SURVIVES the restart — a §9 no-double-pay /
+    // OI-W4-5 credit-at-finality violation, silent because this store's
+    // RecoveryDriver (unlike w6_persistence's) has no ledger_seq cross-check.
+    // Re-passing the flag then re-credited on top of the recovered ledger, so
+    // the row was applied once PER BOOT rather than once ever.
+    //
+    // THE FIX. The seed becomes two ordinary write-ahead events under a STABLE
+    // bid: FOUND(credit, payout={}) then FINALIZE(bin_height). Two consequences,
+    // both from machinery that already exists:
+    //   * REPLAY-EXACT — on the next boot RecoveryDriver replays those two
+    //     events, so the credit leg is restored exactly like the payout leg and
+    //     finalW nets to the same value a never-restarted node holds. No row can
+    //     go negative for want of a persisted credit.
+    //   * IDEMPOTENT — after that replay the bid sits in the ledger's SETTLED
+    //     (terminal) set, and OwedLedger::on_block_found() is already idempotent
+    //     per bid. We check the same two sets here and return AlreadyDurable
+    //     WITHOUT writing, so the WAL never grows a duplicate seed either.
+    // Net: the seeded row is applied EXACTLY ONCE for the life of the data-dir,
+    // however many times the daemon restarts with the flag still set.
+    //
+    // `bid` must be a stable, caller-owned identifier (NOT a Monero block id);
+    // it is deliberately kept out of m_found/m_by_height, because a seed is not
+    // a mined block and must never be walked by the D_conf finalize cursor.
+    // `bin_height` is the K_fair age stamp; it is persisted and replayed
+    // verbatim (F1), so the age ordering is identical on every boot.
+    //
+    // CONSENSUS-NEUTRAL: this defines no digest and invents no rule. It only
+    // sequences the SAME two OwedLedger calls the seed already made, through the
+    // durable path the rest of this driver already uses.
+    SeedOwedResult seed_owed_durable(const std::string& bid, const Amounts& credit,
+                                     std::uint64_t bin_height) {
+        if (bid.empty() || credit.empty()) return SeedOwedResult::Refused;
+        for (const auto& [k, v] : credit) { (void)k; if (v <= 0) return SeedOwedResult::Refused; }
+        // Already durable: replayed out of the WAL on this boot, or seeded
+        // earlier in this run. Write nothing, move nothing.
+        if (m_ledger.is_settled(bid) || m_ledger.is_pending(bid) || m_seeded.count(bid))
+            return SeedOwedResult::AlreadyDurable;
+
+        SettleEvent found;
+        found.kind   = SettleEvKind::Found;
+        found.bid    = bid;
+        found.credit = credit;                 // payout stays {} — a seed only credits
+        write_event(found);
+        m_ledger.on_block_found(bid, credit, /*payout=*/{});
+
+        SettleEvent fin;
+        fin.kind       = SettleEvKind::Finalize;
+        fin.bid        = bid;
+        fin.bin_height = bin_height;
+        write_event(fin);
+        m_ledger.on_block_finalized(bid, bin_height);
+
+        m_seeded.insert(bid);
+        persist_hw();
+        return SeedOwedResult::Applied;
     }
 
     // A block left the best chain (MainchainEvent Orphan / a Reorg that dropped
@@ -224,6 +322,7 @@ private:
 
     std::map<std::string, FoundBlock>              m_found;      // bid -> block
     std::map<std::uint64_t, std::vector<std::string>> m_by_height; // mined height -> bids
+    std::set<std::string>                          m_seeded;     // F-1: durable owed seeds written this run
 };
 
 } // namespace c2pool::v37n::xmr
