@@ -234,6 +234,7 @@ jobs:
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke c2pool-v37-xmr \
                     v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck \
                     xmr_randomx_verify_kat v37_xmr_o2_randomx_kat \
+                    xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
@@ -661,6 +662,7 @@ jobs:
                     v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck \
                     xmr_primitives_selfcheck xmr_x2_node_kat xmr_receipt_kat xmr_torsion_kat xmr_wire_dos_check xmr_stratum_selftest xmr_provenance_gate \
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke \
+                    xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
                  # xmr_provenance_gate: previously omitted here because
                  # -fsanitize=undefined rejected its constexpr pointer comparison
