@@ -3199,6 +3199,18 @@ void MiningInterface::start_pplns_precompute()
         LOG_INFO << "[PPLNS-Cache] Computing PPLNS for " << total << " shares...";
         auto start_time = std::chrono::steady_clock::now();
 
+        // --- precompute pacing (confined to this entrypoint; live caller main_ltc.cpp:4349) ---
+        // Each per-share m_pplns_fn walk takes the share-tracker lock that the boot
+        // backfill / think loop also needs; an unpaced burst can starve the io_context
+        // past its freeze-watchdog (~40s, main_ltc lambda) on a large persisted sharechain.
+        // Pace by a wall-clock work budget far under that watchdog, yielding the lock
+        // between bursts. BTC/DASH do not call this (comments only), so this is LTC-scoped.
+        constexpr auto kPrecomputeBootSettle  = std::chrono::seconds(30);      // let boot backfill/think quiesce
+        constexpr auto kPrecomputeBurstBudget = std::chrono::milliseconds(250); // ~160x under the 40s watchdog
+        constexpr auto kPrecomputeYield       = std::chrono::milliseconds(50);  // hand the tracker lock back
+        std::this_thread::sleep_for(kPrecomputeBootSettle);
+        auto burst_start = std::chrono::steady_clock::now();
+
         for (int i = 0; i < total; ++i) {
             auto& s = shares[i];
             if (!s.contains("H") || !s.contains("h")) continue;
@@ -3262,8 +3274,12 @@ void MiningInterface::start_pplns_precompute()
                              << " (" << (computed * 100 / total) << "%)";
                 }
 
-                // Yield to mining thread — don't hog the tracker lock
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                // Pace: once this burst has held the tracker for the work budget,
+                // yield long enough for the io_context/think loop to reclaim the lock.
+                if (std::chrono::steady_clock::now() - burst_start >= kPrecomputeBurstBudget) {
+                    std::this_thread::sleep_for(kPrecomputeYield);
+                    burst_start = std::chrono::steady_clock::now();
+                }
             } catch (const std::exception& e) {
                 // Skip shares that fail (e.g., at chain boundary)
                 continue;
