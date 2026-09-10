@@ -21,6 +21,8 @@ activates v37 consensus and nothing here touches `src/sharechain/v37`.
 | `p2p/` | Wave 1 / C1a: the levin bucket-header codec, the epee portable-storage codec, and the typed P2P messages. Wave 1 / C1b: the transport on top of them — the asio `LevinSocket`, the FIFO reply matcher, the handshake state machine and the `LevinLink` that runs HANDSHAKE and the TIMED_SYNC beat |
 | `chain/` | Wave 1 / C2a: the consensus state, the wire-to-state evaluation seam, and the real `IChainView`. Wave 1 / C2c: the chain index over them — the height rows, fork choice, the bounded journaled reorg, the proof-of-work gate and burial |
 | `anchor/` | Wave 1 / C2b: the trust-anchor bundle — the `.inc` format, the fail-closed loader, the generator, and the release-pinned stagenet bundle |
+| `rct/` | Wave 1 / C3: non-input consensus — commitment balance, the Bulletproof+ verifier, the key-image domain check. The one part of this tree that compiles rather than being header-only |
+| `txpool/` | Wave 1 / C3: the relay-side transaction decoder and the relayed transaction pool itself |
 | `test/` | the KATs |
 
 ### contracts/
@@ -348,12 +350,85 @@ It earned that on the first run: every window value matched and all ten block
 ids were wrong, because the id is keccak over the **length-prefixed** hashing
 blob and the first cut hashed the bare one.
 
+## Wave 1 / C3 — the relayed txpool, and the line ruling R-VAL draws
+
+`txpool/` holds the pool: fed only by transactions C1 delivers from levin
+`NOTIFY_NEW_TRANSACTIONS`, read only by the template assembler
+(`ITxpoolSnapshot`) and the block relay (`ITxBlobSource`). It talks to no
+daemon, reads no chain, and keeps no history.
+
+**Admission is `Structural | NonInputConsensus`** — the operator ruling R-VAL.
+Spelled out: a transaction is admitted when it decodes, satisfies every
+structural relay rule monerod applies (size, weight, ring size, output count,
+`tx_extra` cap, zero unlock time, distinct key images), **and** its commitments
+balance against its plaintext fee, its Bulletproof+ range proofs verify, and its
+key images are in the prime-order subgroup.
+
+What that buys, and what it does not:
+
+* a **bad-VALUE** transaction is caught here. Mining one would cost the pool a
+  block the network rejects, so it is worth the elliptic-curve arithmetic.
+* a **double spend** is not, and cannot be: deciding it needs the historical
+  spent-key-image set, which a pool-scoped node deliberately does not carry.
+  Losing one transaction's fee out of a template is the cheap failure; the
+  expensive one is above. Two partial defences are implemented anyway — a key
+  image already owned by a pool entry refuses the newcomer, and a key image
+  appearing in a connected block evicts the entry that shares it — and the
+  residual is left to monerod parity (C6) and to the network.
+
+**The residual risk is larger than one lost fee, and is worth naming.** Non-input
+consensus does not cover the transaction prefix and does not check ring
+signatures, so a transaction whose CLSAG does not verify is admissible here —
+and one is trivial to manufacture from any relayed transaction by changing a
+byte of its `tx_extra`. A template built on such a transaction is a block the
+network rejects. This is inherent to the ruling rather than to any choice made
+in this component: checking a CLSAG needs the ring members' public keys, which
+live in the global output set, which a node starting from a recent anchor does
+not have. Three defences outside this component must therefore stay armed until
+C2 can answer for inputs — the monerod submit arm, the parity oracle (C6), and
+the operator's option of requiring `DaemonConfirmed` evidence in the select
+policy while a daemon is armed.
+
+**First-seen wins on a key-image collision**, which is a deliberate divergence
+from the C3 design lens (it proposed excluding *both* sides). Non-input
+consensus does not cover the transaction prefix, so anyone can take a relayed
+transaction, change one byte of its `tx_extra`, and produce a twin with the same
+key images, the same commitments and the same range proof that passes every
+check this component runs. Under "exclude both" that twin evicts any transaction
+from our template for a few bytes; under first-seen-wins it is refused and the
+original keeps its place — which is also what monerod does. The KAT builds the
+twin and asserts it buys nothing.
+
+**Evidence this component does not produce.** `FeePolicy` needs C2's long-term
+effective median weight, so it is a later co-KAT; `DaemonConfirmed` belongs to
+the arm that has a daemon. A policy that *requires* either selects nothing
+rather than quietly relaxing — fail-closed, and asserted.
+
+### rct/ — the vendoring question, answered honestly
+
+`rct/PROVENANCE.md` is the record. The short version: the ed25519 group
+operations and Keccak everything here stands on are already vendored
+byte-for-byte at `../coin/vendor/` and are reached through `xmr_coin`; nothing
+under `rct/` re-vendors them. The Bulletproof+ verifier, the multi-scalar
+multiplication and the ringct helpers are a **derived port** rather than a
+verbatim copy, because upstream's `bulletproofs_plus.cc` reaches epee logging,
+epee spans, `cryptonote_config.h`, the monero serialization framework and
+`boost::thread` — vendoring it verbatim means vendoring far more trusted surface
+than the arithmetic it was meant to bring in. The prover is not ported at all: a
+pool never proves.
+
+The authoritative check on the port is not a diff. It is
+`xmr_native_rct_verify_kat`, which verifies real stagenet transactions that a
+real monerod already accepted, reproduces their ids and weights, and then
+asserts that mutating a commitment, a fee, a pseudo-output, a proof element or a
+key image makes exactly the check aimed at it fail.
+
 ## Not here yet
 
 Landed so far, each authored against the contracts here: the levin codec (C1a),
 the levin transport (C1b), the consensus state (C2a), the trust-anchor
-bundle (C2b) and the chain index with its fork choice (C2c). Still to come:
-the peer pool and its DoS policy (C1c), the relayed txpool (C3), the template
+bundle (C2b), the chain index with its fork choice (C2c) and the relayed txpool
+(C3). Still to come: the peer pool and its DoS policy (C1c), the template
 source (C4), the block relay (C5) and the parity oracle (C6).
 
 C1b stops at one connection. The dial plan, the peer store, the primary

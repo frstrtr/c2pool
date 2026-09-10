@@ -155,6 +155,49 @@ if (BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_native_anchor_self_check_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_anchor_self_check_kat COMMAND xmr_native_anchor_self_check_kat)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Wave 1 / C3: the relayed txpool (../txpool/) and the non-input consensus
+    # it admits on (../rct/).
+    #
+    # Both targets link `xmr_native_txpool`, which transitively links `xmr_coin`
+    # for the vendored ed25519 group operations and Keccak. This is the HEAVIEST
+    # pair in this file: xmr_native_rct_verify_kat builds a 2048-entry
+    # Bulletproof+ generator table once and then verifies real stagenet range
+    # proofs, so it costs seconds rather than milliseconds. It is still a LIGHT
+    # LINK in the sense that matters -- no RandomX, no libsodium, no monerod and
+    # no network -- and it runs in the ordinary lane on both CI legs.
+    #
+    #   xmr_native_rct_verify_kat -- ruling R-VAL's evidence, proven both ways:
+    #      real stagenet Bulletproof+ transactions verify (and their ids and
+    #      weights reproduce the daemon's own numbers), and mutating a
+    #      commitment, a fee, a pseudo-output, a proof element or a key image
+    #      makes exactly the check aimed at it fail. Plus the fail-closed
+    #      refusal of the pre-HF15 rct types in the same corpus.
+    #   xmr_native_txpool_kat     -- the pool: admission evidence, the
+    #      structural refusal table with monerod's drop/no-drop split, sighting
+    #      and Dandelion++ stem semantics, the snapshot contract, first-seen-wins
+    #      on a key-image conflict (including the tx_extra twin that makes any
+    #      other rule a censorship vector), mined and chain-conflict eviction,
+    #      the byte cap, the age cap, and the pin that outranks both.
+    #
+    # Same drift-guard rule as everything above: both are added to BOTH
+    # `--target` lists in .github/workflows/build.yml by the change that adds
+    # them here, because a registered-but-unbuilt target reports "***Not Run"
+    # and fails ctest (the #1539 lesson).
+    # ─────────────────────────────────────────────────────────────────────────
+    foreach(_c3_kat
+            xmr_native_rct_verify_kat
+            xmr_native_txpool_kat)
+        # The sources are named after the component, not the target prefix.
+        string(REPLACE "xmr_native_" "xmr_" _c3_src ${_c3_kat})
+        add_executable(${_c3_kat} ${_c3_src}.cpp)
+        target_include_directories(${_c3_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(${_c3_kat} PRIVATE xmr_native_txpool)
+        target_compile_features(${_c3_kat} PRIVATE cxx_std_20)
+        add_test(NAME ${_c3_kat} COMMAND ${_c3_kat})
+    endforeach()
 
     # -----------------------------------------------------------------------
     # Wave 1, component C1b: the levin TRANSPORT (../p2p/levin_socket.hpp,
