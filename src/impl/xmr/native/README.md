@@ -93,6 +93,54 @@ the live-submit surface). Nothing here re-opens either.
 | `xmr_hf_table.hpp` | the vendored hard-fork table, the version-dependent rules, and the CARROT / FCMP++ fence that reports anything above v16 rather than guessing at it. Two of the rules are **bands, not scalars**: Monero allows a new ring size or proof system at one fork and only requires it at the next, so `hf_ring_size_allowed()` and `hf_rct_type_allowed()` are the admission tests and the scalars say only what a freshly built transaction should use. Every threshold cites the `cryptonote_config.h` constant behind it and is pinned in the KAT against what a synced stagenet daemon actually reports over each activation band. |
 | `xmr_epoch.hpp` | the RandomX seed epoch, re-exported from `coin/xmr_seedheight.hpp` (which is the single source of the 2048/64 constants) plus the seed-pair scheduling rule. |
 
+### p2p/ — Wave 1, component C1a: the levin codec
+
+Pure codec for the Monero P2P wire. No socket, no thread, no connection state:
+the transport (C1b) and the peer pool (C1c) are separate components that build
+on these three headers.
+
+| file | what |
+|---|---|
+| `levin_codec.hpp` | the 33-byte levin bucket header, the command ids, the frame classification rules, and the inbound per-command size caps (R-CAPS) |
+| `epee_storage.hpp` | the epee portable-storage encoder and a bounded decoder: the size-mark varint, the type tags, sections and arrays |
+| `levin_messages.hpp` | the typed messages — 1001/1002/1003/1007 and 2001–2010 — decoding into the W0 contract types (`BlockEntry`, `ChainEntry`, `TxBlobEntry`, `PeerSyncData`) so C2 and C3 need no second conversion |
+
+Five things about the epee format were read out of monerod's source rather than
+inferred, and each is a place an independently written codec would have been
+wrong on the wire:
+
+* **Sections are emitted in sorted key order.** `epee::serialization::section`
+  holds a `std::map<std::string, storage_entry>`, so monerod writes entries
+  lexicographically, not in the order the KV map declares them. An encoder that
+  preserved declaration order would produce frames a daemon still parses — and
+  would never be byte-identical to a capture, which is exactly what the C6
+  parity rig exists to compare.
+* **`KV_SERIALIZE_OPT` omits the field at its default.** `rpc_port` at zero,
+  `pruned` at false, `dandelionpp_fluff` at true and `prune` at false are simply
+  absent from the frame. The omission is the format, not an optimisation.
+* **Empty containers are not written at all**, and the loader's failure to find
+  one is discarded (`KV_SERIALIZE` ignores its return value), so an absent
+  container means empty at both ends rather than a parse error at either.
+* **`cumulative_difficulty_top64` is unconditional on store.** monerod branches
+  on `is_store` and only makes the field optional when loading, so a frame that
+  omits it was written by neither monerod nor us.
+* **The size-mark varint is not the CryptoNote LEB128 varint** used inside block
+  and transaction blobs. Two varints, two codecs; the other one lives in
+  `consensus/xmr_blob_reader.hpp` and the two are never mixed.
+
+The decoder mirrors epee's bounds exactly — array counts refused against the
+bytes actually remaining, duplicate keys rejected, a bool byte above 1 rejected
+— and then tightens them: recursion depth 8 instead of 100, plus hard ceilings
+on entries, objects, strings and array elements. Where epee truncates an integer
+that does not fit the requested width, this decoder refuses it: an honest peer
+writes the declared width, so the only sender that trips it is one trying to
+make our number differ from the one it sent.
+
+What is NOT proven here is byte parity against a real captured monerod frame.
+That is hardest-unknown U5, it needs a daemon, and it belongs to the C6 parity
+rig. The goldens below are derived from the serialization rules instead, which
+checks the encoder rather than photographing it.
+
 ### test/
 
 | target | what it proves |
@@ -100,6 +148,16 @@ the live-submit surface). Nothing here re-opens either.
 | `xmr_native_contracts_kat` | every contract and fake compiles together; the fakes satisfy the interfaces; the pinned semantics hold; the hard-fork table and seed-epoch rules hold at their edges |
 | `xmr_native_tx_weight_kat` | the weight golden over real stagenet transactions |
 | `xmr_native_blob_reader_fuzz_kat` | reader unit rules plus a deterministic fuzz pass, over random input and over mutations of the real transaction corpus |
+| `xmr_levin_codec_kat` | the bucket header byte layout, the frame classification table (including the noise and fragment cases), and the cap table |
+| `xmr_epee_storage_kat` | the varint at every size-mark boundary, the type-tag matrix, sorted key order, and every decoder bound |
+| `xmr_levin_messages_kat` | goldens for the handshake, the chain request and the address encoding, plus a round trip of every message and both shapes of `block_complete_entry` |
+| `xmr_levin_fuzz_kat` | the bounded deterministic fuzz pass; `--dump-corpus <dir>` exports the seeds for an external libFuzzer run |
+
+The fuzz KAT's load-bearing assertion is that **canonical re-encoding is
+idempotent**: any buffer that decodes must re-encode and re-decode to the same
+value tree, and the second encoding must be a fixed point. That makes the
+encoder and the decoder each other's oracle, and it is what catches a sort-order
+or size-mark bug that a round trip through our own encoder alone would hide.
 
 ## The tx-weight golden
 
@@ -116,8 +174,9 @@ transaction in it, that single number pins the per-transaction weights — exact
 for the blocks carrying a single transaction, and as a sum for the rest. Without
 it the golden would only prove that the code agrees with itself.
 
-## Not in Wave 0
+## Still to come
 
-The components themselves: the levin P2P client, the chain-state index, the
-relayed txpool, the template source, the block relay and the parity oracle. Each
-is a later wave, authored against the fakes here.
+The rest of the components, each authored against the contracts and fakes here:
+the levin transport and handshake (C1b), the peer pool and DoS budgets (C1c),
+the chain-state index (C2), the relayed txpool (C3), the template source (C4),
+the block relay (C5) and the parity oracle (C6).
