@@ -113,7 +113,7 @@ and extranonce vary and are not part of the capture.
 
 ### Supporting
 
-- **`kr1z1s_node_spec.md`** — written for an external operator standing up a
+- **`second_node_spec.md`** — written for an external operator standing up a
   second node (the D6 precondition). Explains why a *fresh* deployment cannot
   reach a served masternode set on the cold path — the checkpoint bridge replays
   from the compiled-in anchor at height 2522504 against a flat ban-state probe

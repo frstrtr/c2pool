@@ -1,4 +1,4 @@
-# What the kr1z1s node needs to come up (technical section)
+# What the second node needs to come up (technical section)
 
 ## Why the old invitation is wrong on substance, not just timing
 
@@ -14,19 +14,19 @@ occasional failure. The running canary avoids it only because it holds a persist
 that already sits past the divergence and a diff store that answers ban-state queries
 locally at zero network cost.
 
-## The serve-versus-peer question is resolved: kr1z1s must serve
+## The serve-versus-peer question is resolved: the second node must serve
 
 R5 governance completeness is already satisfied by ordinary network peers. The canary holds
 gov_complete=1 with ten network governance peers, and the superblock serve-gate reuses the
 same completeness predicate with no stricter peer floor and no requirement for our own
-nodes. kr1z1s is therefore not needed for R5 at all.
+nodes. the second node is therefore not needed for R5 at all.
 
-That narrows kr1z1s to its D1 and D6 roles: providing hashrate, and cross-node PPLNS payout
+That narrows the second node to its D1 and D6 roles: providing hashrate, and cross-node PPLNS payout
 with rebroadcast. Both require its node to build templates for its own miners, so have_mn is
 genuinely required. The question is not whether it must serve but how to give it a working
 serve, which the options below address.
 
-## Options to make kr1z1s reach have_mn (if serving is required)
+## Options to make the second node reach have_mn (if serving is required)
 
 ### Option A: ship a ready post-divergence cursor plus diff store
 
@@ -51,7 +51,7 @@ datadir before first start, on the same binary the anchor belongs to (2522504, i
 
 Build c2pool-dash with the ban-state probe budget scaled to the replay window, or with the
 compiled masternode-set anchor re-pinned closer to the tip (self-derived dump via
-tools/dash/gen_mn_checkpoint.py), and give kr1z1s that binary.
+tools/dash/gen_mn_checkpoint.py), and give the second node that binary.
 
 - Pro: fixes the root cause. A fresh cold start succeeds with no seed blob, and the fix
   also covers unplanned cold restarts on any node, including the canary. This is the
@@ -74,14 +74,14 @@ budget entirely.
   for the payee set. Immune to the wall.
 - Con: roughly 9 to 11 hours to fold genesis to tip, heavier resource use for bulk block
   fetch, and it needs the exact fold-builder invocation, which is still build-gated and
-  unconfirmed on our side. Overkill if kr1z1s only needs to provide hashrate or peer
+  unconfirmed on our side. Overkill if the second node only needs to provide hashrate or peer
   redundancy.
 - External feasibility: low right now. We do not yet have a confirmed known-good fold
   launch to hand out. Not appropriate for an external operator until we run it ourselves.
 
 ## Recommendation
 
-kr1z1s must serve, so a working have_mn is genuinely required. Option A is the only package
+the second node must serve, so a working have_mn is genuinely required. Option A is the only package
 deliverable today, as a point-in-time seed, with an explicit note that it ages and that
 Option B is the durable fix. Option B is the right general answer and should be pursued in
 parallel so the next node, and the canary itself, no longer depends on a hand-issued seed.
