@@ -2947,6 +2947,28 @@ nlohmann::json MiningInterface::rest_miner_thresholds()
     return result;
 }
 
+// #921: observability-only additive V36 crossing summary. Flattens the real
+// ratchet figures rest_version_signaling() already computes (the same numbers
+// the /v36_status card and the debug.log crossing gauge read) into four flat
+// keys, so a dashboard polling /global_stats or /local_stats sees the V35->V36
+// cross without a second fetch. Additive only: no existing key is renamed or
+// removed. Never a stub -- every value tracks live sharechain state.
+static nlohmann::json v36_crossing_summary(const nlohmann::json& vs, int64_t cached_share_version)
+{
+    int64_t v36_shares = vs.value("overall_v36_shares", static_cast<int64_t>(0)); // format-latched
+    int64_t v36_votes  = vs.value("overall_v36_votes",  static_cast<int64_t>(0)); // desired-version
+    double  sampling   = vs.value("sampling_signaling", 0.0);                     // work-weighted %
+    bool    active     = cached_share_version >= 36;
+    if (vs.contains("auto_ratchet") && vs["auto_ratchet"].is_object())
+        active = vs["auto_ratchet"].value("v36_active", active);
+    return nlohmann::json{
+        {"v36_active",     active},
+        {"v36_percentage", sampling},
+        {"v36signaling",   v36_votes > v36_shares ? v36_votes - v36_shares : static_cast<int64_t>(0)},
+        {"v36native",      v36_shares},
+    };
+}
+
 nlohmann::json MiningInterface::rest_global_stats()
 {
     // Return p2pool-compatible pool statistics
@@ -2974,8 +2996,10 @@ nlohmann::json MiningInterface::rest_global_stats()
     std::optional<double> sc_pool_stale_prop;
 
     // Populate from sharechain
+    nlohmann::json sc_snapshot;  // #921: reused for the additive V36 crossing summary below
     if (m_sharechain_stats_fn) {
-        auto sc = m_sharechain_stats_fn();
+        sc_snapshot = m_sharechain_stats_fn();
+        auto& sc = sc_snapshot;
         if (sc.contains("total_shares"))
             total_shares = sc["total_shares"].get<int>();
         if (sc.contains("orphan_shares"))
@@ -3079,6 +3103,12 @@ nlohmann::json MiningInterface::rest_global_stats()
         result["last_block_ts"] =
             last_ts ? nlohmann::json(last_ts) : nlohmann::json(nullptr);
     }
+
+    // #921: additive V36 crossing summary (see v36_crossing_summary). Reuses the
+    // snapshot already read above; no key renamed or removed.
+    result.update(v36_crossing_summary(
+        rest_version_signaling(sc_snapshot.is_null() ? nullptr : &sc_snapshot),
+        m_cached_share_version));
 
     return result;
 }
@@ -4767,6 +4797,13 @@ nlohmann::json MiningInterface::rest_local_stats()
 
         result["warnings"] = warnings;
     }
+
+    // #921: additive V36 crossing summary (see v36_crossing_summary). Reuses the
+    // cached sharechain snapshot; no key renamed or removed.
+    result.update(v36_crossing_summary(
+        rest_version_signaling(cached_sc.is_null() ? nullptr : &cached_sc),
+        m_cached_share_version));
+
     result["donation_proportion"] = m_pool_fee_percent / 100.0;
     result["fee"] = m_pool_fee_percent;  // percentage (e.g. 1.0)
     // UNITS, stated (hotel, 2026-08-05: the operator could not tell from the
