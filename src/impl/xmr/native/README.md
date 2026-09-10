@@ -18,7 +18,9 @@ activates v37 consensus and nothing here touches `src/sharechain/v37`.
 | `contracts/` | the pinned interfaces every later component builds against, header-only (Wave 0) |
 | `contracts/fakes/` | a compiling fake per interface, so wave-1 components can be written and tested before their dependencies exist (Wave 0) |
 | `consensus/` | the shared primitives, plus the C2a consensus rules: block parse and identity, weights, reward, difficulty, timestamps, hard-fork policy |
+| `p2p/` | Wave 1 / C1a: the levin bucket-header codec, the epee portable-storage codec, and the typed P2P messages |
 | `chain/` | Wave 1 / C2a: the consensus state, the wire-to-state evaluation seam, and the real `IChainView` |
+| `anchor/` | Wave 1 / C2b: the trust-anchor bundle — the `.inc` format, the fail-closed loader, the generator, and the release-pinned stagenet bundle |
 | `test/` | the KATs |
 
 ### contracts/
@@ -155,12 +157,57 @@ checks the encoder rather than photographing it.
 | `xmr_levin_fuzz_kat` | the bounded deterministic fuzz pass; `--dump-corpus <dir>` exports the seeds for an external libFuzzer run |
 | `xmr_native_block_id_kat` | block identity against monerod over whole captured blocks, with the negative controls (flipped bytes, truncation, trailing bytes, the length prefix) |
 | `xmr_native_consensus_state_kat` | 600 stagenet heights replayed through the windows — difficulty, long-term weight, reward, emission — plus rollback exactness, `connect()` on real blobs, the R-HFFUSE policy and the 128-bit arithmetic against boost |
+| `xmr_native_anchor_self_check_kat` | SHA-256 against the NIST vectors; the `.inc` format round-trips and each documented damage produces its own `AnchorParse`; every `AnchorStatus` is reached by mutating one field; `load_anchor`'s four gates including a tampered file on disk; `generate_anchor` against an honest and a dishonest model daemon; and the real embedded stagenet bundle, whose digest is recomputed with the C++ canonical writer |
 
 The fuzz KAT's load-bearing assertion is that **canonical re-encoding is
 idempotent**: any buffer that decodes must re-encode and re-decode to the same
 value tree, and the second encoding must be a fixed point. That makes the
 encoder and the decoder each other's oracle, and it is what catches a sort-order
 or size-mark bug that a round trip through our own encoder alone would hide.
+
+## anchor/ — the trust root (Wave 1, WF-C2b)
+
+`contracts/anchor.hpp` (Wave 0) owns the `AnchorBundle` struct, the exact window
+sizes and `anchor_self_check()`. This directory owns everything downstream of
+that: how a bundle is spelled on disk, how it is loaded, and how it is minted.
+
+| file | what |
+|---|---|
+| `xmr_anchor_sha256.hpp` | a small SHA-256, because the digest is the one thing the contracts family cannot verify (it has no crypto dependency) |
+| `xmr_anchor_codec.hpp` | the `.inc` format: the canonical body, the digest rule, the writer, and a fail-closed reader that judges FORM only |
+| `xmr_anchor_load.hpp` | `load_anchor()` — the four gates: source, form, meaning, and the boot duty it cannot discharge |
+| `xmr_anchor_generate.hpp` | `generate_anchor()` — the minting rules behind an abstract read-only `MoneroDaemonRpc` port |
+| `xmr_anchor_embedded.hpp` | the release-pinned bundles compiled into the binary, one per network |
+| `xmr_chain_anchor_stagenet.inc` | the stagenet bundle itself, minted from a synced monerod |
+
+**R-ANCHOR** is a release-pinned self-generated bundle: we mint it, we review
+it, we freeze it into the release — the same class of artefact as monerod's own
+compiled-in checkpoints. A daemon-minted bundle at boot (M0–M4) is the same
+struct from a live daemon; the embedded one is the M5 path, where there is no
+daemon to ask.
+
+**Fail-closed, item by item.** Every pinned datum except the anchor id feeds a
+computation that is checked against real blocks, so a corrupted window makes the
+node reject the TRUE chain — a loud halt — rather than accept a cheap false one.
+The id is the exception, and it is why `load_anchor()` is explicitly *not* the
+last word: `anchor_confirmed_by_network()` must be called by C2's boot with the
+hash of the block peers actually served at `height`, and the node must refuse to
+start unless it matches.
+
+**One format, two implementations, one pin.** `tools/xmr-anchor-gen/xmr_anchor_gen.py`
+is the transport-bound capture path (monerod JSON-RPC, read-only); the C++
+`generate_anchor()` holds the same rules behind an abstract port so the
+dishonest-daemon cases can be tested at all. Both write the same canonical body,
+and the KAT proves it: it re-serialises the parsed real bundle with the C++
+writer and asserts the result hashes to the digest line the Python tool wrote.
+
+**The embedded stagenet bundle.** `H_a = 2204000`, id
+`c55f08bc…13dcdf5`, major version 16, minted from a synced monerod 0.18.5.1 over
+read-only RPC with the anchor 848 blocks below the tip. `already_generated_coins`
+is walked back from `get_miner_data` at the tip by subtracting each block's
+coinbase, cross-checked against `get_coinbase_tx_sum` over the same range. It
+carries no `checkpoint` rows: monerod's compiled-in stagenet checkpoints all sit
+below this height, and the field only ever holds checkpoints at or above it.
 
 ## The tx-weight golden
 
@@ -247,7 +294,8 @@ blob and the first cut hashed the bare one.
 
 ## Not here yet
 
-The rest of the components: the levin P2P client (C1), the anchor loader and
-RandomX verify (C2b), the index and fork choice (C2c), the relayed txpool (C3),
-the template source (C4), the block relay (C5) and the parity oracle (C6). Each
-is authored against the contracts here.
+Landed so far, each authored against the contracts here: the levin codec (C1a),
+the consensus state (C2a) and the trust-anchor bundle (C2b). Still to come: the
+levin transport and peer pool (C1b/C1c), the index and fork choice (C2c), the
+relayed txpool (C3), the template source (C4), the block relay (C5) and the
+parity oracle (C6).

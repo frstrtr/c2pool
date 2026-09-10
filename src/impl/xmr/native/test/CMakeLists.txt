@@ -1,13 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # KATs for the native-minimal Monero node: three from Wave 0, four from the
-# Wave 1 levin codec (C1a) and two from the Wave 1 consensus state (C2a).
+# Wave 1 levin codec (C1a), two from the Wave 1 consensus state (C2a) and one
+# from the Wave 1 trust-anchor bundle (C2b).
 #
-# The Wave 0 and C1a targets are STL-only: no RandomX, no monerod, no libzmq,
-# no boost. The two C2a targets additionally link `xmr_coin` (keccak, tree
-# hash, vendored difficulty) and boost's header-only multiprecision -- still a
-# LIGHT link (no RandomX, no libsodium, no monerod). All run in the ordinary
-# lane on both CI legs (the sanitizer leg is where the two fuzz KATs earn their
-# keep).
+# The Wave 0, C1a and C2b targets are STL-only: no RandomX, no monerod, no
+# libzmq, no boost. The two C2a targets additionally link `xmr_coin` (keccak,
+# tree hash, vendored difficulty) and boost's header-only multiprecision --
+# still a LIGHT link (no RandomX, no libsodium, no monerod). All run in the
+# ordinary lane on both CI legs (the sanitizer leg is where the two fuzz KATs
+# earn their keep).
 #
 # DRIFT-GUARD: tools/ci/check_test_target_allowlist.py audits
 # src/impl/<coin>/test/CMakeLists.txt; this tree sits one level deeper
@@ -134,5 +135,25 @@ if (BUILD_TESTING)
         target_include_directories(xmr_native_consensus_state_kat PRIVATE ${Boost_INCLUDE_DIRS})
     endif()
     add_test(NAME xmr_native_consensus_state_kat COMMAND xmr_native_consensus_state_kat)
+
+    # -----------------------------------------------------------------------
+    # Wave 1, component C2b: the trust-anchor bundle (../anchor/). One target,
+    # STL-only, registered in BOTH `--target` lists in build.yml.
+    #
+    # The trust-anchor KAT (WF-C2b): SHA-256 known answers, the .inc format
+    #    round-trip and each of its documented refusals, every AnchorStatus in
+    #    contracts/anchor.hpp reached by mutating one field, load_anchor's four
+    #    gates including a tampered file on disk, generate_anchor against an
+    #    honest and a dishonest model daemon, and the REAL embedded stagenet
+    #    bundle -- whose digest is recomputed with the C++ canonical writer,
+    #    which is what pins tools/xmr-anchor-gen/xmr_anchor_gen.py to it.
+    #
+    #    It writes two small temporary .inc files into the working directory and
+    #    removes them again; ctest runs it inside the build tree.
+    add_executable(xmr_native_anchor_self_check_kat xmr_anchor_self_check_kat.cpp)
+    target_include_directories(xmr_native_anchor_self_check_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(xmr_native_anchor_self_check_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_native_anchor_self_check_kat COMMAND xmr_native_anchor_self_check_kat)
 
 endif()
