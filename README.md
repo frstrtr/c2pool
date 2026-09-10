@@ -126,8 +126,10 @@ and does not yet exist, so the work can be judged on what it actually is.
   (scaffold + vendored RandomX + X0 — PR #1500), buildable KAT-tested primitives
   (RandomX CI-gated — PR #1502), the monerod adapter + descriptor-finalize + receipt
   envelope (PR #1503), and stratum + FCMP-fenced coinbase-settlement + carrier wire
-  (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **in progress
-  (draft, not merged)**; a live stagenet run is **not started**.
+  (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **merged**
+  (PR #1512); a **single-node stagenet daemon is live** (monerod-bound, PRs
+  #1520 / #1529). Multi-node canonical payees + section-13 state root are a
+  reviewed draft (PR #1551).
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
@@ -144,10 +146,11 @@ and does not yet exist, so the work can be judged on what it actually is.
 - **No performance benchmark.** The only performance artifact is a Python
   *feasibility* harness (M4). There is **no benchmark of the real engine**;
   throughput, latency, and scaling claims are **unproven** until one exists.
-- **XMR lane is pre-stagenet.** Its RandomX verify runs **CI-gated in light mode**;
-  there is no run against a live `monerod`-stagenet + real miner yet, and the XMR
-  PayoutDescriptor kind-bytes are staged/reserved pending a canon ruling, not
-  activated.
+- **XMR lane is single-node stagenet.** Its RandomX verify runs CI-gated in light
+  mode and against a live `monerod`-stagenet single node (PRs #1520 / #1529); the
+  XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR #1518).
+  The remaining gaps are multi-node consensus (PR #1551, draft) and mainnet, which
+  stays double-fenced.
 - **No token, no production deployments.** There is no v37 token, and nothing v37 is
   deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
