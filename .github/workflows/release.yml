@@ -196,12 +196,12 @@ jobs:
       - name: Boost sentinel
         if: steps.presence.outputs.exists == '1'
         run: |
-          cmake --build build_${{ matrix.coin }} --target boost_sentinel -j$(nproc)
+          cmake --build build_${{ matrix.coin }} --target boost_sentinel -j"${BUILD_J:-4}"
           ctest --test-dir build_${{ matrix.coin }} -R '^boost_sentinel$' --output-on-failure
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
-        run: cmake --build build_${{ matrix.coin }} --target c2pool-${{ matrix.coin }} -j$(nproc)
+        run: cmake --build build_${{ matrix.coin }} --target c2pool-${{ matrix.coin }} -j"${BUILD_J:-4}"
 
       - name: Smoke test (--help)
         if: steps.presence.outputs.exists == '1'
@@ -350,7 +350,7 @@ jobs:
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
-        run: cmake --build build --target c2pool-${{ matrix.coin }} -j$(sysctl -n hw.ncpu)
+        run: cmake --build build --target c2pool-${{ matrix.coin }} -j"${BUILD_J:-4}"
 
       - name: Smoke test (--help)
         if: steps.presence.outputs.exists == '1'

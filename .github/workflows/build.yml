@@ -1469,7 +1469,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_PREFIX_PATH=${{ steps.tc.outputs.prefix }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build
-        run: cmake --build build --target c2pool -j$(sysctl -n hw.ncpu)
+        run: cmake --build build --target c2pool -j"${BUILD_J:-4}"
 
       - name: Verify binary
         # `file` inspects the Mach-O without executing. The --help smoke actually
