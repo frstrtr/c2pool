@@ -1647,6 +1647,10 @@ public:
                   " (--coin-rpc-*) so the authoritative protx seed is used");
         }
 
+        // Budgets are sized from the replay window, which GROWS as headers
+        // sync -- so size them here, every pump, not once at the arm edge.
+        size_window_budgets(tip);
+
         if (m_state == State::Waiting) {
             m_state = State::Bridging;
             // ── #138: THE STATE ARMS ITS OWN PRECONDITION ─────────────────
@@ -1702,8 +1706,7 @@ public:
             // left as-is rather than widened — widening it would license
             // exactly the wholesale-override-by-inference this walk exists to
             // refuse, and the fold already removes the need.
-            m_sml_recovery_cap = 4 + (tip - m_anchor_height) / 1000;
-            m_machine.set_sml_recovery_cap(m_sml_recovery_cap);
+            // (sized by size_window_budgets(), re-evaluated every pump)
             // ── THE ON-DEMAND FOLD CAP ───────────────────────────────────
             // Bounds ROUND TRIPS, not trust: every on-demand fold is DIP-4
             // client-verified against the coinbase of the very block it
@@ -1729,15 +1732,7 @@ public:
             // round trips worst case, which is negligible against the 20000
             // getdata the same bridge already issues — while a runaway
             // stops after 88 instead of after 20000.
-            if (!m_ondemand_cap_forced) {
-                m_ondemand_cap = kOnDemandFoldBase
-                               + (tip - m_anchor_height) / kOnDemandFoldPerBlocks;
-            }
-            if (!m_revive_probe_cap_forced) {
-                m_revive_probe_cap =
-                    kReviveProbeBase
-                    + (tip - m_anchor_height) / kReviveProbePerBlocks;
-            }
+            // (both sized by size_window_budgets(), re-evaluated every pump)
             LOG_INFO << "[MN-CKPT] bridge START: replaying h=" << m_next
                      << ".." << tip << " (" << (tip - m_next + 1)
                      << " blocks) onto the anchored set";
@@ -2473,6 +2468,92 @@ private:
     /// the delivered high-water orphaned every height in between and destroyed
     /// derived state. m_requested_through and m_replay_target are both in scope
     /// here and neither may ever reach the record.
+    /// -- WINDOW-SIZED BUDGETS: re-evaluated as the replay window GROWS ----
+    ///
+    /// The demotion-walk, on-demand-fold and ban-state-probe budgets are all
+    /// sized from the replay distance (tip - anchor). They used to be computed
+    /// ONCE, at the Waiting->Bridging edge. On a COLD start that edge fires
+    /// while the header chain is still at the fast-start checkpoint -- which is
+    /// pinned to COINCIDE with this lane's anchor -- so the window measured
+    /// ZERO blocks and every budget collapsed to its base:
+    ///
+    ///     [MN-CKPT] bridge START: replaying h=2522505..2522504 (0 blocks)
+    ///
+    /// The headers then synced forward and the real replay became ~13.8k
+    /// blocks, but the budgets kept their start-time values. That is how a cold
+    /// mainnet bridge hit "PROBE CAP IS EXHAUSTED (8/8)" and fail-closed at
+    /// h=2529626, while a WARM restart of the SAME binary -- whose headers were
+    /// already at the tip when it armed -- sized the same budget to 146 and
+    /// completed with 23 used and 0 unmeasured. One mechanism, both numbers.
+    ///
+    /// So size them HERE, on every pump, from the CURRENT tip. GROWTH ONLY: a
+    /// budget already granted is never taken back mid-bridge, because shrinking
+    /// one could turn an allowance already spent into an exhaustion. Each is
+    /// clamped to an explicit ceiling so an unusually wide window cannot turn
+    /// the arm into an unbounded round-trip crawl, and reaching a ceiling is
+    /// LOGGED once per bridge -- a clamped budget is exactly the condition
+    /// under which rising "unmeasured" counts mean "this window is wider than
+    /// the lane is sized for" rather than "the chain was quiet".
+    ///
+    /// This widens no trust: every on-demand fold and every ban-state probe is
+    /// DIP-4 client-verified against the coinbase of the block it judges, so a
+    /// larger budget buys more verification round trips, never fewer checks.
+    void size_window_budgets(uint32_t tip)
+    {
+        if (tip < m_anchor_height) return;
+        const uint32_t window = tip - m_anchor_height;
+
+        const size_t want_walk = static_cast<size_t>(4 + window / 1000);
+        const size_t walk = want_walk < kSmlRecoveryCapMax
+                          ? want_walk : kSmlRecoveryCapMax;
+        if (walk > m_sml_recovery_cap) {
+            m_sml_recovery_cap = walk;
+            m_machine.set_sml_recovery_cap(m_sml_recovery_cap);
+        }
+        note_budget_ceiling(want_walk > kSmlRecoveryCapMax,
+                            m_walk_ceiling_logged, "demotion-walk",
+                            want_walk, kSmlRecoveryCapMax);
+
+        if (!m_ondemand_cap_forced) {
+            const size_t want = kOnDemandFoldBase
+                + static_cast<size_t>(window / kOnDemandFoldPerBlocks);
+            const size_t cap = want < kOnDemandFoldCapMax
+                             ? want : kOnDemandFoldCapMax;
+            if (cap > m_ondemand_cap) m_ondemand_cap = cap;
+            note_budget_ceiling(want > kOnDemandFoldCapMax,
+                                m_ondemand_ceiling_logged, "on-demand-fold",
+                                want, kOnDemandFoldCapMax);
+        }
+
+        if (!m_revive_probe_cap_forced) {
+            const size_t want = kReviveProbeBase
+                + static_cast<size_t>(window / kReviveProbePerBlocks);
+            const size_t cap = want < kReviveProbeCapMax
+                             ? want : kReviveProbeCapMax;
+            if (cap > m_revive_probe_cap) m_revive_probe_cap = cap;
+            note_budget_ceiling(want > kReviveProbeCapMax,
+                                m_revive_ceiling_logged, "ban-state-probe",
+                                want, kReviveProbeCapMax);
+        }
+    }
+
+    /// One WARNING line, once per bridge, when a window-sized budget is clamped
+    /// by its ceiling. Silence here would be the "quiet degradation" this lane
+    /// exists to avoid.
+    void note_budget_ceiling(bool clamped, bool& already_logged,
+                             const char* name, size_t want, size_t ceiling)
+    {
+        if (!clamped || already_logged) return;
+        already_logged = true;
+        LOG_WARNING << "[MN-CKPT] budget CEILING reached: " << name
+                    << " sized " << want << " for this replay window but is"
+                       " clamped to " << ceiling
+                    << " -- the window is wider than this lane is sized for;"
+                       " expect UNMEASURED counts to grow rather than a silent"
+                       " crawl. Re-pin a fresher anchor or lower"
+                       " --embedded-mn-bridge-max.";
+    }
+
     void note_persist(bool force)
     {
         if (!m_cursor_store) return;
@@ -2664,6 +2745,18 @@ public:
     /// that hammers a peer, and the blind spot is now nameable either way.
     static constexpr size_t   kReviveProbeBase      = 8;
     static constexpr uint32_t kReviveProbePerBlocks = 100;
+
+    /// -- Ceilings for the window-sized budgets --------------------------
+    /// The replay window is ALREADY bounded by the staleness gate
+    /// (max_bridge_blocks, default 20000), which at the default puts the three
+    /// formulas at 208 / 88 / 24 -- so under stock settings no ceiling is ever
+    /// reached. They exist so that raising --embedded-mn-bridge-max cannot
+    /// silently turn the arm into an unbounded round-trip crawl, and so the
+    /// bound is STATED here instead of being an emergent property of another
+    /// knob. Reaching one is logged, never silent.
+    static constexpr size_t   kReviveProbeCapMax    = 256;
+    static constexpr size_t   kOnDemandFoldCapMax   = 128;
+    static constexpr size_t   kSmlRecoveryCapMax    = 32;
 
     /// The next height at or after `cursor` at which we want a snapshot, or
     /// nullopt when none remains before `tip`. Always includes the tip so the
@@ -4090,6 +4183,9 @@ public:
         m_revive_unmeasured    = 0;
         m_revive_declined      = 0;
         m_revive_probe_cap_hit = false;
+        m_walk_ceiling_logged     = false;
+        m_ondemand_ceiling_logged = false;
+        m_revive_ceiling_logged   = false;
         if (!m_revive_probe_cap_forced) m_revive_probe_cap = kReviveProbeBase;
         m_pose_removed    = 0;
         m_pose_reinstated = 0;
@@ -4299,6 +4395,9 @@ public:
     size_t    m_revive_probe_cap{kReviveProbeBase};
     bool      m_revive_probe_cap_forced{false};
     bool      m_revive_probe_cap_hit{false};
+    bool      m_walk_ceiling_logged{false};
+    bool      m_ondemand_ceiling_logged{false};
+    bool      m_revive_ceiling_logged{false};
     RequestSnapshotFn m_request_snapshot;
     RequestSnapshotFn m_reask_snapshot;   // optional rotate+demote re-ask seam
     // PR-2 FRESH-DATUM RACE single-flight tracker (flag-gated). Keyed by the
