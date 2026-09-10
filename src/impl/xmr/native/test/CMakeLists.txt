@@ -281,4 +281,71 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_native_chain_index_kat COMMAND xmr_native_chain_index_kat)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Wave 1 / C1c: the peer manager and DoS (../p2p/chain_seeds.hpp,
+    # chain_locator.hpp, xmr_peer_store.hpp, xmr_dial_plan.hpp, xmr_p2p_dos.hpp,
+    # xmr_peer_pool.hpp). Four targets: three STL-only, one on boost::asio.
+    #
+    #   xmr_native_chain_locator_kat -- the seed tables and THE GENESIS
+    #     TERMINUS. monerod's find_blockchain_supplement drops the connection
+    #     when a locator's last id is not the genesis id, with no error frame,
+    #     so every path that can build a locator is checked to end in genesis --
+    #     including the cold-index path, where the index has no ids at all. The
+    #     stagenet id itself was verified live against a stagenet daemon.
+    #   xmr_native_peer_store_kat -- white/gray/anchor and the tier ratchet (only
+    #     our own handshake promotes), backoff-is-not-a-ban, the /16 ban carry,
+    #     candidate ordering, gray eviction, refill, the /16 connection cap in
+    #     both directions, rotation with its age floor, and primary election
+    #     with hysteresis. Injected clock throughout: a 24 h ban is tested in
+    #     microseconds.
+    #   xmr_native_p2p_dos_kat -- the token buckets and the fault table.
+    #     Exhaustion is a DEFER (drop plus one point), not a ban; the
+    #     transaction bucket counts transactions rather than frames; a completed
+    #     hash below target is the whole ban threshold on its own.
+    #   xmr_native_peer_pool_kat -- the pool against hand-rolled monerod
+    #     stand-ins on loopback: dial, handshake, peerlist learning, the 100-id
+    #     chunking of a 250-id span and its reassembly into ONE on_objects, the
+    #     genesis terminus applied on the way out, the 2006/2003 serving
+    #     obligation (the state_normal trap), push traffic in and broadcast out.
+    #     Its `--live <host>:<port>` mode dials a real daemon read-only and is
+    #     deliberately NOT what ctest runs.
+    #
+    # Same drift-guard rule as every target above: all four are added to BOTH
+    # `--target` lists in .github/workflows/build.yml by the change that adds
+    # them here, because a registered-but-unbuilt target reports "***Not Run"
+    # and fails ctest (the #1539 lesson).
+    # ─────────────────────────────────────────────────────────────────────────
+    foreach(_c1c_kat
+            xmr_native_chain_locator_kat
+            xmr_native_peer_store_kat
+            xmr_native_p2p_dos_kat)
+        string(REPLACE "xmr_native_" "xmr_" _c1c_src ${_c1c_kat})
+        add_executable(${_c1c_kat} ${_c1c_src}.cpp)
+        target_include_directories(${_c1c_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_features(${_c1c_kat} PRIVATE cxx_std_20)
+        add_test(NAME ${_c1c_kat} COMMAND ${_c1c_kat})
+    endforeach()
+
+    add_executable(xmr_native_peer_pool_kat xmr_peer_pool_kat.cpp)
+    target_include_directories(xmr_native_peer_pool_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(xmr_native_peer_pool_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_peer_pool_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_peer_pool_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_peer_pool_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_peer_pool_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_peer_pool_kat COMMAND xmr_native_peer_pool_kat)
+    # Loopback TCP with compressed deadlines: seconds on an idle runner, but
+    # never unbounded.
+    set_tests_properties(xmr_native_peer_pool_kat PROPERTIES TIMEOUT 300)
+
 endif()
