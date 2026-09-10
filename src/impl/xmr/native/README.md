@@ -423,13 +423,130 @@ real monerod already accepted, reproduces their ids and weights, and then
 asserts that mutating a commitment, a fee, a pseudo-output, a proof element or a
 key image makes exactly the check aimed at it fail.
 
+## Wave 1 / C4 — the template source, and what "rebind" actually means
+
+`template/` is the smallest component in this tree and it is the one the whole
+node exists for: it is where a Monero block template stops needing a daemon.
+
+Three files, all header-only:
+
+* `xmr_native_miner_data.hpp` — `NativeMinerDataSource`, an `IMinerDataSource`
+  over `IChainView` (C2c) and `ITxpoolSnapshot` / `ITxBlobSource` (C3).
+* `xmr_monerod_miner_data.hpp` — `MonerodMinerDataSource`, the existing
+  `get_miner_data` path wrapped in the same seam and otherwise unchanged.
+* `xmr_template_arm.hpp` — `ArmResolver`: which arm serves, which one shadows,
+  and a loud, counted fallback when the serving arm loses readiness.
+
+### It derives nothing
+
+`NativeMinerDataSource` computes no consensus value. All seven miner-data fields
+come out of `TemplateInputs`, which C2a/C2c already derive and which the C2a KAT
+already pins against monerod over 600 real heights. Re-deriving any of them in
+`template/` would be a second implementation of a consensus rule, which is the
+exact split-risk the `contracts/` family exists to prevent — the same rule that
+made `xmr_tx_weight.hpp` W0-owned instead of C3-owned.
+
+What C4 adds is the seam, the readiness gate, the epoch/rebuild rule, the body
+pins, and three guards that only make sense at the template layer:
+
+| guard | what it does | why it is not a consensus check |
+|---|---|---|
+| difficulty sanity band `[tip/4, tip*4]` | REFUSES the template | the retarget cannot legitimately move that far in one block, so a value outside it means our own window is corrupt — and a template on a corrupt target asks miners to grind the wrong number |
+| stale tip (default 30 min) | FLAGS, keeps serving | the tip we have is still the best chain we know; the flag is what the arm resolver falls back on |
+| peer floor | FLAGS, keeps serving | on regtest zero peers is a correct configuration, and a pool that stopped paying miners over a peer count would be broken, not safe |
+
+### The byte-stability rule
+
+The assembler stamps a fresh header timestamp on every build, so re-assembling
+under an unchanged tip changes bytes a miner is already grinding and its shares
+start missing on re-hash. So the epoch moves on a tip change always, and on a
+backlog change only under `backlog_refresh_s > 0` — at most once per interval,
+and only when the selectable set really changed. The default, `0`, is tip-only:
+jobs are byte-stable for the whole block, which is the behaviour the provider
+had before the seam existed.
+
+`backlog_seq` is an OPT-IN rebuild trigger, and the DEFAULT/PRODUCTION arm does
+not opt in: `MonerodMinerDataSource::epoch()` reports it frozen at `0`, so the
+epoch term the seam added to the provider is `0 == 0` on every refresh of the
+daemon path and that path rebuilds when, and only when, the parent tip moves —
+exactly the pre-seam rule. Anything derived from the daemon's txpool (its SIZE,
+for instance) would have made every mempool change force a full reassemble at
+the poll cadence, restamping the header under miners already grinding those
+bytes and churning the retained template ring down to seconds of job history.
+The native arm's sequence is ADDITIVE and off by default.
+
+### The body rule
+
+`tx_body(id)` returns the body OF THAT ID or nothing at all. `ITxBlobSource`
+COMPACTS its reply — an absent body is named in `missing` and simply does not
+appear in `out` — and `selectable_backlog()` and `get_blobs()` are two separate
+lock acquisitions, so an id CAN vanish in between (mined, key-image conflict,
+expiry). The fill therefore walks the ids and consumes `out` in order, skipping
+exactly what was reported missing; index-zipping `out[i]` with `ids[i]` would
+file every later body under a different transaction's id and C5 would relay a
+block whose bytes do not hash to the ids beside them. A reply that satisfies
+neither shape (`out.size() + missing.size() != ids.size()`) files NO body and is
+counted: a wrong body is worse than a missing one.
+
+The pin follows the same rule from the other side. The pin key IS the tip id, so
+a re-snapshot under an unchanged tip pins and de-duplicates under the SAME key;
+the superseded generation is therefore retired BEFORE the new pin is taken,
+because pinning a key and then unpinning it leaves the live template with no pin
+and the pool free to evict what it selected.
+
+### What the two KATs prove
+
+`xmr_native_template_kat` compares the native arm against a REAL
+`get_miner_data` captured from a synced stagenet monerod (0.18.5.1, height
+2 204 960) — height, prev_id, seed_hash, difficulty, median_weight,
+already_generated_coins, major_version. None of those seven numbers was computed
+by this repository, so a formula error cannot pass by agreeing with itself. The
+eighth field, `median_timestamp`, is not exposed by `get_miner_data` at all
+(p2pool derives it too), so it is checked against monerod's own median RULE over
+monerod's own captured timestamps. The same captured response is replayed
+through the production `MoneroDaemonRpc::parse_miner_data` — hex-string
+difficulty and all, the PR #1529 shape — which is what makes "the monerod arm IS
+the old path" a statement about the real decode path rather than about a
+re-typed struct.
+
+`xmr_native_template_coinbase_kat` answers the other half: the K_fair
+settlement coinbase does not move. It builds the X6 coinbase from the native
+derivation, through the same `settle/xmr_coinbase.cpp` executor the daemon-ful
+path uses, and pins the owed payee set in K_fair order, the exact-sum residual
+sink (Monero has no burn-the-remainder escape hatch), the owed_digest under the
+`tx_extra` `0x03` merge-mining tag, the byte-identity of the two arms' coinbases,
+and the pre-CARROT fence. It also proves each rebound field is load-bearing —
+without that, "the arms agree" would be consistent with the coinbase ignoring
+the miner data entirely.
+
+Three suites in `xmr_native_template_kat` are REGRESSION pins, one per defect
+the C4 review found — `R-C4-1` body/id alignment across a missing body,
+`R-C4-2` the pin surviving an unchanged-tip re-snapshot, and `R-C4-3` the
+production arm's rebuild rule against both the pre-seam oracle and the
+size-derived rule that regressed it. Each carries its own non-vacuity check, and
+on the code as it stood before the fix the three of them fail 28 checks.
+
+The capture itself is `tools/xmr-c4-parity/capture_miner_data.py`: read-only,
+paced, and the only thing in this component that ever touches a daemon.
+`xmr_native_template_kat --parity-json <file>` replays a fresh capture, and is
+deliberately not what ctest runs.
+
+### The rebind, in the consumer tree
+
+`src/c2pool/v37/xmr/xmr_o2_settlement_provider.hpp` gains an
+`IMinerDataSource&` constructor and keeps its `IMonerodTransport&` one, which
+now owns a `MonerodMinerDataSource` and pumps it once per refresh — the same one
+RPC per refresh it always did. `assemble()` is byte-for-byte the function it
+was. `SettlementSnapshot` gains `source_name` and the `MinerDataEpoch`, so a
+parity sample can always be attributed to an arm.
+
 ## Not here yet
 
 Landed so far, each authored against the contracts here: the levin codec (C1a),
 the levin transport (C1b), the consensus state (C2a), the trust-anchor
-bundle (C2b), the chain index with its fork choice (C2c) and the relayed txpool
-(C3). Still to come: the peer pool and its DoS policy (C1c), the template
-source (C4), the block relay (C5) and the parity oracle (C6).
+bundle (C2b), the chain index with its fork choice (C2c), the relayed txpool
+(C3) and the template source (C4). Still to come: the peer pool and its DoS
+policy (C1c), the block relay (C5) and the parity oracle (C6).
 
 C1b stops at one connection. The dial plan, the peer store, the primary
 election, the refill and rotation loops, the token buckets, the chain locator

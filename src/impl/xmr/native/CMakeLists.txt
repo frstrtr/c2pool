@@ -25,6 +25,13 @@
 #   * rct/ + txpool/ (component C3): the relayed transaction pool and the
 #     non-input consensus it admits on. This is the ONE part of the native node
 #     that is not header-only, and the reason is below.
+#   * template/ (component C4): the IMinerDataSource seam the option-B
+#     settlement template provider is rebound through, with its two arms -- the
+#     existing get_miner_data path, wrapped, and the native one built from the
+#     C2c chain index plus the C3 txpool -- and the resolver that decides which
+#     serves and which shadows. Header-only, derives no consensus value of its
+#     own, and adds only the readiness gate, the epoch/rebuild rule and the
+#     template-layer guards. The assembler above it is not modified at all.
 #
 # Everything else here is still header-only: nothing is compiled until a target
 # includes it, and the KATs in test/ are those targets. Two of the C2a KATs link
