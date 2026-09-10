@@ -26,6 +26,8 @@
 // STL only. No network, no crypto, no daemon.
 // ---------------------------------------------------------------------------
 
+#include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -50,6 +52,23 @@ static void check(bool cond, const char* what) {
         ++g_fail;
         std::fprintf(stderr, "FAIL: %s\n", what);
     }
+}
+
+// Same contract as check(), with a formatted description -- the table-driven
+// blocks below need to name the row that failed, not just the block.
+#if defined(__GNUC__)
+__attribute__((format(printf, 2, 3)))
+#endif
+static void checkf(bool cond, const char* fmt, ...) {
+    ++g_checks;
+    if (cond) return;
+    ++g_fail;
+    char buf[512];
+    std::va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    std::fprintf(stderr, "FAIL: %s\n", buf);
 }
 
 static Hash hash_of(std::uint8_t seed) {
@@ -307,15 +326,42 @@ static void test_txpool_fake() {
     check(backlog[0].weight == 2000, "the selectable entry is the expected one");
 
     // Same pool, a deployment that trusts an armed daemon instead.
-    pool.required_evidence = AdmissionEvidence::Structural | AdmissionEvidence::DaemonConfirmed;
+    pool.configured.required = AdmissionEvidence::Structural | AdmissionEvidence::DaemonConfirmed;
     check(snap.selectable_backlog().size() == 1,
           "switching the required mask switches which tx is selectable");
 
     // Corroboration is a separate condition from evidence.
-    pool.required_evidence = EVIDENCE_DAEMONLESS_DEFAULT;
-    pool.min_peers = 3;
+    pool.configured.required = EVIDENCE_DAEMONLESS_DEFAULT;
+    pool.configured.min_peers = 3;
     check(snap.selectable_backlog().empty(), "peer corroboration gates independently");
-    pool.min_peers = 1;
+    pool.configured.min_peers = 1;
+
+    // The pinned SELECTION POLICY (the contract that replaced the deleted
+    // scalar tier). The explicit-policy overload is what makes two arms
+    // comparable: the shadow arm can select under the served arm's rule rather
+    // than under its own configuration.
+    check(snap.policy() == pool.configured, "the configured policy is readable");
+    TxpoolSelectPolicy daemon_policy;
+    daemon_policy.required = AdmissionEvidence::Structural | AdmissionEvidence::DaemonConfirmed;
+    const auto under_daemon = snap.selectable_backlog(daemon_policy);
+    check(under_daemon.size() == 1 && under_daemon[0].weight == 3000,
+          "an explicit policy selects independently of the configured one");
+    check(snap.selectable_backlog().size() == 1
+          && snap.selectable_backlog()[0].weight == 2000,
+          "and selecting under an explicit policy does not change the configured one");
+    TxpoolSelectPolicy strict = pool.configured;
+    strict.min_peers = 3;
+    check(snap.selectable_backlog(strict).empty(),
+          "every term of the policy is honoured through the explicit overload");
+    // A conflicted transaction is unselectable at EVERY policy: it is the one
+    // term that is not a knob.
+    TxpoolSelectPolicy permissive;
+    permissive.required   = AdmissionEvidence::None;
+    permissive.min_peers  = 0;
+    permissive.allow_stem = true;
+    const auto everything = snap.selectable_backlog(permissive);
+    check(everything.size() == 2,
+          "the most permissive policy still refuses the key-image conflict");
 
     const auto verdicts = sink.on_relayed(PeerRef{2, "10.0.0.3:38080", 0},
                                           {{0x01, 0x02}, {}}, true);
@@ -401,21 +447,215 @@ static void test_relay_and_oracle() {
     IParityOracle& o = oracle;
     node::MainchainEvent ev; ev.block.height = 2204739;
     o.on_tip(ev, "native");
-    o.on_serve(MinerDataEpoch{2204740, hash_of(4), 1}, "native");
-    o.on_submit(hash_of(0x70), /*daemon_accepted*/ false, /*p2p*/ 0);
+
+    // P-TPL carries the SERVED artefact, not just its epoch tag. Here they
+    // agree, so the sample is clean.
+    const MinerDataEpoch serve_epoch{2204740, hash_of(4), 1};
+    node::MinerData served;
+    served.height  = serve_epoch.height;
+    served.prev_id = serve_epoch.prev_id;
+    o.on_serve(serve_epoch, served, "native");
+
+    // P-SUB carries the whole verdict. This one has NO daemon arm and reached
+    // nobody: Void, a sample that cannot be judged, never agreement.
+    BlockRelayVerdict void_submit;
+    void_submit.block_id     = hash_of(0x70);
+    void_submit.daemon_armed = false;
+    void_submit.why          = "no arm was up";
+    o.on_submit(void_submit);
 
     check(o.coverage().samples == 3, "every probe produced a sample");
     check(o.coverage().voided == 1,
           "an unjudgeable submit is Void, and Void is never counted as agreement");
     check(o.coverage().clean == 2, "the two judgeable probes are clean");
+
+    // The two distinctions the widened signatures exist to make, and which the
+    // epoch-only and three-field projections could not express.
+    //
+    // (1) A daemon that REJECTED our block is a real parity failure. Without
+    //     daemon_armed it is indistinguishable from "there was no daemon arm",
+    //     which is the Void case above -- and scoring that as a failure would
+    //     revoke graduation on nothing at all.
+    BlockRelayVerdict rejected;
+    rejected.block_id        = hash_of(0x71);
+    rejected.daemon_armed    = true;
+    rejected.daemon_rejected = true;
+    rejected.why             = "daemon rejected the block";
+    o.on_submit(rejected);
+    check(o.coverage().fail == 1 && o.coverage().voided == 1,
+          "a daemon REJECTION is a Fail, and stays separable from a Void no-arm sample");
+
+    // (2) Serving something neither arm would have produced is ServedMismatch,
+    //     the worst verdict -- and it is only detectable because what was
+    //     actually served is carried rather than re-read from the arm.
+    node::MinerData stale = served;
+    stale.prev_id = hash_of(9);            // not the prev_id the epoch names
+    o.on_serve(serve_epoch, stale, "native");
+    check(o.coverage().served_mismatch == 1,
+          "a template that does not match its own epoch is a ServedMismatch");
+    check(oracle.served_templates.size() == 2
+          && oracle.served_templates.back().prev_id == stale.prev_id,
+          "the oracle received the served artefact itself, not a re-read");
+
     o.revoke("operator");
     check(o.state() == GraduationState::Revoked, "graduation is revocable");
+}
+
+// The anchor bundle: the trust root both WF-C2b (boot) and WF-C6a (generator)
+// build against, pinned in Wave 0 so they cannot invent two layouts for it.
+static void test_anchor_bundle() {
+    // A well-formed stagenet bundle at a height inside the v16 band.
+    AnchorBundle b;
+    b.network       = "stagenet";
+    b.height        = 2203648;                 // an epoch boundary, 2048 * 1076
+    b.id            = hash_of(0x80);
+    b.prev_id       = hash_of(0x81);
+    b.timestamp     = 1789000000;
+    b.major_version = 16;
+    b.cumulative_difficulty = U128{842403882477ull, 0};
+    b.already_generated_coins = 18000000000000000ull;
+    b.seed_ids.push_back({b.height, hash_of(0x82)});
+    b.difficulty_window.resize(ANCHOR_DIFFICULTY_WINDOW);
+    for (std::size_t i = 0; i < b.difficulty_window.size(); ++i)
+        b.difficulty_window[i] = {1789000000 + i, U128{100 + i, 0}};
+    b.short_term_weights.assign(ANCHOR_SHORT_TERM_WEIGHTS, 3000);
+    b.long_term_weights.assign(ANCHOR_LONG_TERM_WEIGHTS, 3000);
+
+    std::string why;
+    check(anchor_self_check(b, XmrNet::Stagenet, why) == AnchorStatus::Ok && why.empty(),
+          "a well-formed bundle passes the shared self-check");
+
+    // Wrong network: the bundle is for someone else's chain.
+    check(anchor_self_check(b, XmrNet::Mainnet, why) == AnchorStatus::NetworkMismatch
+          && !why.empty(),
+          "a bundle is refused on the wrong network, with a reason");
+
+    // Window lengths are EXACT, not maxima: one row short means the first
+    // post-anchor block computes a wrong difficulty, so it is refused at load
+    // rather than at a confusing height later.
+    {
+        AnchorBundle s = b;
+        s.difficulty_window.pop_back();
+        check(anchor_self_check(s, XmrNet::Stagenet, why) == AnchorStatus::WindowSize,
+              "a difficulty window one row short is refused");
+        AnchorBundle w = b;
+        w.short_term_weights.pop_back();
+        check(anchor_self_check(w, XmrNet::Stagenet, why) == AnchorStatus::WindowSize,
+              "a short-term weight window one row short is refused");
+    }
+
+    // Seeds must sit on RandomX epoch boundaries at or below the anchor.
+    {
+        AnchorBundle s = b;
+        s.seed_ids[0].first = b.height - 1;
+        check(anchor_self_check(s, XmrNet::Stagenet, why) == AnchorStatus::SeedMisaligned,
+              "a seed height off the epoch boundary is refused");
+        AnchorBundle a = b;
+        a.seed_ids[0].first = b.height + SEEDHASH_EPOCH_BLOCKS;
+        check(anchor_self_check(a, XmrNet::Stagenet, why) == AnchorStatus::SeedMisaligned,
+              "a seed height above the anchor is refused");
+        AnchorBundle n = b;
+        n.seed_ids.clear();
+        check(anchor_self_check(n, XmrNet::Stagenet, why) == AnchorStatus::SeedMisaligned,
+              "a bundle with no seed at all is refused");
+    }
+
+    // Cumulative difficulty only ever goes up.
+    {
+        AnchorBundle m = b;
+        m.difficulty_window[400].second = U128{0, 0};
+        check(anchor_self_check(m, XmrNet::Stagenet, why) == AnchorStatus::NonMonotone,
+              "a non-monotone difficulty window is refused");
+    }
+
+    // The pinned version must be the one the hard-fork table requires, and it
+    // must be one this build implements.
+    {
+        AnchorBundle v = b;
+        v.major_version = 14;
+        check(anchor_self_check(v, XmrNet::Stagenet, why) == AnchorStatus::VersionMismatch,
+              "an anchor claiming a version below its own height's fork is refused");
+        AnchorBundle f = b;
+        f.major_version = MAX_IMPLEMENTED_HF_VERSION + 1;
+        check(anchor_self_check(f, XmrNet::Stagenet, why) == AnchorStatus::Fenced,
+              "an anchor at an unimplemented fork trips the fence");
+    }
+
+    // Copied monerod checkpoints are a SECOND source above the anchor; one
+    // below it would be describing history the anchor already settled.
+    {
+        AnchorBundle c = b;
+        c.monerod_checkpoints.push_back({b.height + 1000, hash_of(0x90)});
+        check(anchor_self_check(c, XmrNet::Stagenet, why) == AnchorStatus::Ok,
+              "checkpoints at or above the anchor are fine");
+        c.monerod_checkpoints.push_back({b.height - 1, hash_of(0x91)});
+        check(anchor_self_check(c, XmrNet::Stagenet, why) == AnchorStatus::CheckpointBelow,
+              "a checkpoint below the anchor is refused");
+    }
+
+    check(std::string(to_string(AnchorStatus::WindowSize)) == "WindowSize",
+          "anchor statuses render");
 }
 
 // ---------------------------------------------------------------------------
 // 4. The Wave 0 consensus tables that ship alongside the contracts
 // ---------------------------------------------------------------------------
 static void test_hard_fork_table() {
+    // EVERY row of all three public tables, from both sides of its activation,
+    // transcribed independently from monero-project src/hardforks/hardforks.cpp
+    // (release-v0.18). The table under test is a separate transcription of the
+    // same source, so a slip in either one shows up here rather than the first
+    // time the node syncs that stretch of chain.
+    {
+        struct Row { std::uint8_t v; std::uint64_t h; };
+        static const Row MAINNET[] = {
+            { 1,       1}, { 2, 1009827}, { 3, 1141317}, { 4, 1220516},
+            { 5, 1288616}, { 6, 1400000}, { 7, 1546000}, { 8, 1685555},
+            { 9, 1686275}, {10, 1788000}, {11, 1788720}, {12, 1978433},
+            {13, 2210000}, {14, 2210720}, {15, 2688888}, {16, 2689608},
+        };
+        static const Row TESTNET[] = {
+            { 1,       1}, { 2,  624634}, { 3,  800500}, { 4,  801219},
+            { 5,  802660}, { 6,  971400}, { 7, 1057027}, { 8, 1057058},
+            { 9, 1057778}, {10, 1154318}, {11, 1155038}, {12, 1308737},
+            {13, 1543939}, {14, 1544659}, {15, 1982800}, {16, 1983520},
+        };
+        static const Row STAGENET[] = {
+            { 1,       1}, { 2,   32000}, { 3,   33000}, { 4,   34000},
+            { 5,   35000}, { 6,   36000}, { 7,   37000}, { 8,  176456},
+            { 9,  177176}, {10,  269000}, {11,  269720}, {12,  454721},
+            {13,  675405}, {14,  676125}, {15, 1151000}, {16, 1151720},
+        };
+        struct Net { XmrNet net; const char* name; const Row* rows; std::size_t n; };
+        const Net NETS[] = {
+            {XmrNet::Mainnet,  "mainnet",  MAINNET,  sizeof(MAINNET)  / sizeof(Row)},
+            {XmrNet::Testnet,  "testnet",  TESTNET,  sizeof(TESTNET)  / sizeof(Row)},
+            {XmrNet::Stagenet, "stagenet", STAGENET, sizeof(STAGENET) / sizeof(Row)},
+        };
+        for (const Net& n : NETS) {
+            for (std::size_t i = 0; i < n.n; ++i) {
+                const Row& row = n.rows[i];
+                checkf(hf_version_for_height(n.net, row.h) == row.v,
+                       "%s v%u activates at %llu, table says v%u", n.name, unsigned(row.v),
+                       static_cast<unsigned long long>(row.h),
+                       unsigned(hf_version_for_height(n.net, row.h)));
+                checkf(hf_height_for_version(n.net, row.v) == row.h,
+                       "%s v%u height is %llu, table says %llu", n.name, unsigned(row.v),
+                       static_cast<unsigned long long>(row.h),
+                       static_cast<unsigned long long>(hf_height_for_version(n.net, row.v)));
+                // One below the row is the PREVIOUS version -- this is the side
+                // that catches a table shifted by one, and it is exactly the
+                // shape of slip that got past the first cut of the rule bands.
+                if (i > 0)
+                    checkf(hf_version_for_height(n.net, row.h - 1) == n.rows[i - 1].v,
+                           "%s at %llu is v%u, expected v%u", n.name,
+                           static_cast<unsigned long long>(row.h - 1),
+                           unsigned(hf_version_for_height(n.net, row.h - 1)),
+                           unsigned(n.rows[i - 1].v));
+            }
+        }
+    }
+
     // The rows either side of each activation, on all three public networks.
     check(hf_version_for_height(XmrNet::Mainnet, 2689607) == 15, "mainnet is v15 below the v16 row");
     check(hf_version_for_height(XmrNet::Mainnet, 2689608) == 16, "mainnet v16 activates on its row");
@@ -432,12 +672,115 @@ static void test_hard_fork_table() {
     check(hf_height_for_version(XmrNet::Mainnet, 12) == 1978433, "activation heights are queryable");
     check(hf_height_for_version(XmrNet::Mainnet, 99) == 0, "an unknown version has no height");
 
-    // Version-dependent rules.
+    // --- version-dependent rules ---------------------------------------------
     check(hf_randomx_active(12) && !hf_randomx_active(11), "RandomX starts at v12");
-    check(hf_ring_size(12) == 11 && hf_ring_size(15) == 16, "ring size steps at v15");
-    check(hf_required_rct_type(13) == 5 && hf_required_rct_type(15) == 6,
-          "CLSAG at v13, bulletproof plus at v15");
     check(hf_view_tags_active(15) && !hf_view_tags_active(14), "view tags start at v15");
+
+    // Ring size, the WHOLE monerod-pinned set rather than the two rows that
+    // happened to line up. cryptonote_config.h HF_VERSION_MIN_MIXIN_4 = 6,
+    // _MIN_MIXIN_6 = 7, _MIN_MIXIN_10 = 8, _MIN_MIXIN_15 = 15, over the pre-v6
+    // floor of mixin 2. Every row from v6 up is a distinct step, so a table
+    // shifted by one row cannot pass this block.
+    {
+        static const struct { std::uint8_t v; std::size_t ring; } RING_ROWS[] = {
+            { 1,  3}, { 5,  3},                       // pre-v6 floor, mixin 2
+            { 6,  5},                                 // HF_VERSION_MIN_MIXIN_4
+            { 7,  7},                                 // HF_VERSION_MIN_MIXIN_6
+            { 8, 11}, { 9, 11}, {10, 11}, {11, 11},   // HF_VERSION_MIN_MIXIN_10
+            {12, 11}, {13, 11}, {14, 11},
+            {15, 16}, {16, 16},                       // HF_VERSION_MIN_MIXIN_15
+        };
+        for (const auto& row : RING_ROWS)
+            checkf(hf_ring_size(row.v) == row.ring, "ring size at v%u is %zu, not %zu",
+                   unsigned(row.v), row.ring, hf_ring_size(row.v));
+        // The steps land on the fork, not one fork late: each threshold version
+        // differs from the version below it.
+        check(hf_ring_size(5) != hf_ring_size(6),   "the ring-size step lands exactly on v6");
+        check(hf_ring_size(6) != hf_ring_size(7),   "the ring-size step lands exactly on v7");
+        check(hf_ring_size(7) != hf_ring_size(8),   "the ring-size step lands exactly on v8");
+        check(hf_ring_size(14) != hf_ring_size(15), "the ring-size step lands exactly on v15");
+    }
+
+    // The ring-size ADMISSION band. Observed on a synced stagenet daemon: the
+    // major-15 band carries ring 11 AND ring 16 (the one-fork grace window),
+    // the major-16 band carries ring 16 only. A scalar equality test against
+    // hf_ring_size() would reject half of the real v15 chain.
+    check(hf_ring_size_allowed(15, 16) && hf_ring_size_allowed(15, 11),
+          "at v15 both ring 16 and the grace ring 11 are admitted");
+    check(hf_ring_size_allowed(16, 16) && !hf_ring_size_allowed(16, 11),
+          "the v15 grace window is gone at v16");
+    check(!hf_ring_size_allowed(15, 15) && !hf_ring_size_allowed(15, 10),
+          "no ring other than 16 or the grace 11 is admitted at v15");
+    check(hf_ring_size_allowed(8, 11) && hf_ring_size_allowed(8, 20)
+          && !hf_ring_size_allowed(8, 10),
+          "below v15 monerod enforces the ring band as a floor, not an equality");
+    check(hf_ring_size_allowed(7, 7) && !hf_ring_size_allowed(7, 5),
+          "stagenet 37000-37400 is major 7 with ring 7, which the floor admits");
+
+    // The rct-type ADMISSION bands. Each is allow-then-require: a type becomes
+    // legal at one fork and its predecessor only becomes illegal at the next,
+    // so for one fork window two types are simultaneously valid. Every row here
+    // was observed on a synced stagenet daemon (monerod 0.18.5.1, read-only)
+    // over the activation band named in the comment.
+    {
+        // {version, allowed set}, exactly as the daemon reports it.
+        static const struct { std::uint8_t v; bool allowed[XMR_RCT_TYPE_MAX + 1]; } RCT_ROWS[] = {
+            // type:          0      1      2      3      4      5      6
+            { 7, { false,  true,  true, false, false, false, false}},  // major  7 -> {1,2}
+            { 8, { false,  true,  true,  true, false, false, false}},  // major  8 -> {3} seen
+            { 9, { false, false, false,  true, false, false, false}},  // major  9 -> {3}
+            {10, { false, false, false,  true,  true, false, false}},  // major 10 -> {3,4}
+            {11, { false, false, false, false,  true, false, false}},  // major 11 -> {4}
+            {12, { false, false, false, false,  true, false, false}},  // major 12 -> {4}
+            {13, { false, false, false, false,  true,  true, false}},  // major 13 -> {4,5}
+            {14, { false, false, false, false, false,  true, false}},  // major 14 -> {5}
+            {15, { false, false, false, false, false,  true,  true}},  // major 15 -> {5,6}
+            {16, { false, false, false, false, false, false,  true}},  // major 16 -> {6}
+        };
+        for (const auto& row : RCT_ROWS)
+            for (std::uint8_t t = 0; t <= XMR_RCT_TYPE_MAX; ++t)
+                checkf(hf_rct_type_allowed(row.v, t) == row.allowed[t],
+                       "rct type %u at v%u: %s, expected %s", unsigned(t), unsigned(row.v),
+                       hf_rct_type_allowed(row.v, t) ? "allowed" : "refused",
+                       row.allowed[t] ? "allowed" : "refused");
+    }
+
+    // The three ALLOW edges and the three REQUIRE edges, stated as the pairs the
+    // verify pass asked for: allowed at N, still not required until N+1.
+    check(hf_rct_type_allowed(8, 3) && !hf_rct_type_allowed(7, 3),
+          "bulletproofs are ALLOWED at v8");
+    check(hf_min_rct_type(9) == 3 && hf_rct_type_allowed(8, 2) && !hf_rct_type_allowed(9, 2),
+          "bulletproofs are REQUIRED at v9, one fork after they were allowed");
+    check(hf_rct_type_allowed(10, 4) && !hf_rct_type_allowed(9, 4),
+          "bulletproof2 is ALLOWED at v10");
+    check(hf_min_rct_type(11) == 4 && hf_rct_type_allowed(10, 3) && !hf_rct_type_allowed(11, 3),
+          "bulletproof2 is REQUIRED at v11");
+    check(hf_rct_type_allowed(13, 5) && !hf_rct_type_allowed(12, 5),
+          "CLSAG is ALLOWED at v13");
+    check(hf_min_rct_type(14) == 5 && hf_rct_type_allowed(13, 4) && !hf_rct_type_allowed(14, 4),
+          "CLSAG is REQUIRED at v14, and v13 still admits bulletproof2");
+    check(hf_rct_type_allowed(15, 6) && !hf_rct_type_allowed(14, 6),
+          "bulletproof plus is ALLOWED at v15");
+    check(hf_min_rct_type(16) == 6 && hf_rct_type_allowed(15, 5) && !hf_rct_type_allowed(16, 5),
+          "bulletproof plus is REQUIRED at v16, and v15 still admits CLSAG");
+
+    // The newest type a freshly built transaction should carry, per band.
+    check(hf_newest_rct_type(13) == 5 && hf_newest_rct_type(14) == 5,
+          "a transaction built at v13 or v14 uses CLSAG");
+    check(hf_newest_rct_type(15) == 6 && hf_newest_rct_type(16) == 6,
+          "a transaction built at v15 or v16 uses bulletproof plus");
+    // The value the first cut of this table asserted, kept as a NEGATIVE row:
+    // v13 does not require CLSAG, and pinning it as a scalar was the defect.
+    check(hf_min_rct_type(13) != 5,
+          "v13 does not REQUIRE CLSAG -- stagenet 675405 is major 13 carrying rct type 4");
+
+    // Unknown types are never legal, at any version.
+    check(!hf_rct_type_allowed(16, XMR_RCT_TYPE_MAX + 1)
+          && !hf_rct_type_allowed(16, 255),
+          "a type outside the pinned numbering is refused everywhere");
+    // A coinbase carries type 0 and is exempt; the predicate is about the rest.
+    check(!hf_rct_type_allowed(16, 0) && hf_rct_type_allowed(5, 0),
+          "non-RingCT is refused from v6 (HF_VERSION_ENFORCE_RCT)");
 
     // The fence: fail-closed above what this build implements.
     std::string why;
@@ -506,6 +849,7 @@ int main() {
     test_txpool_fake();
     test_miner_data_seam();
     test_relay_and_oracle();
+    test_anchor_bundle();
     test_hard_fork_table();
     test_seed_epoch();
 

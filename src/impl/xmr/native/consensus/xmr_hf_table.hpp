@@ -21,17 +21,51 @@
 //
 // So the table is a compile-time constant (never read from a peer, never read
 // from the environment), and anything above the last version we actually
-// implement is FENCED: the node halts that path and falls back to an armed
-// daemon rather than guessing at a fork it was not built for. This is the
-// fail-closed side of ruling R-HF, and it is the standing cost of tracking
-// Monero: every hard fork needs a code change here.
+// implement is reported as FENCED by hf_is_fenced().
 //
-// Heights are monero-project src/cryptonote_basic/hardfork.cpp
-// (mainnet_hard_forks / testnet_hard_forks / stagenet_hard_forks) as of the
-// v0.18.x series. The stagenet rows are cross-checked against the live stagenet
+// WHAT THIS FILE DECIDES, AND WHAT IT DOES NOT. It decides the VALUES: which
+// version applies at a height, and which transaction shapes that version admits.
+// It does NOT decide the unknown-fork POLICY -- whether meeting a fenced version
+// halts the path and falls back to an armed daemon, or continues at risk. That
+// is a wave-1 C2a ruling; this header only reports the fact and names it, and
+// hf_check_block_version() returns HfStatus::Fenced as a distinct status
+// precisely so the caller can act on it either way.
+//
+// The structure is built for VERSION-ROLLING, which is the standing cost of
+// tracking Monero. Adding a fork is: one row in each net's table, one bump of
+// MAX_IMPLEMENTED_HF_VERSION, and one row in each rule band below that the fork
+// moves. Nothing else in the tree needs to change, and no rule is expressed as
+// "the value at the newest version" so that rolling forward never silently
+// reinterprets an older height.
+//
+// Heights are monero-project src/hardforks/hardforks.cpp
+// (mainnet_hard_forks / testnet_hard_forks / stagenet_hard_forks) on the
+// release-v0.18 branch. All 48 rows across the three networks were compared
+// against that file row for row and match, and the KAT re-asserts every one of
+// them from both sides of its activation -- a transcription slip in any row is
+// a test failure, not something that shows up the first time we sync a chain.
+// The stagenet rows are additionally cross-checked against the live stagenet
 // daemon this wave captured its transaction golden from: blocks at height
 // 1100000 report major_version 14 and blocks at 1399268 report 16, which
 // brackets the v15/v16 rows below.
+//
+// The VERSION-DEPENDENT RULE functions below carry their own source of truth,
+// which the first cut of this file did not: every threshold cites the constant
+// in monero-project src/cryptonote_config.h that produces it, and the ones that
+// can be observed are pinned against a synced stagenet daemon (monerod
+// 0.18.5.1, read-only get_block / get_transactions over the activation bands).
+// The observed values are reproduced in the KAT so a transcription slip cannot
+// pass again -- the previous ring-size row was correct in its values and wrong
+// in its thresholds, and the KAT only asserted the two rows that happened to
+// line up.
+//
+// TWO OF THESE RULES ARE BANDS, NOT SCALARS. Monero introduces a new proof
+// system (or ring size) as ALLOWED at one fork and only makes it REQUIRED at
+// the next, so for one fork window two shapes are simultaneously valid on the
+// chain. A single "the required value at version v" number cannot express that
+// and will reject blocks the network accepts, so the predicates below answer
+// "is this shape legal at this version" and the scalars answer only "what a
+// freshly built transaction should use".
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -140,24 +174,131 @@ inline constexpr bool hf_is_fenced(std::uint8_t version) noexcept {
 // that far from a modern anchor).
 inline constexpr bool hf_randomx_active(std::uint8_t version) noexcept { return version >= 12; }
 
-// Ring size: 11 from v12 (mixin 10), 16 from v15 (mixin 15).
+// --- ring size ---------------------------------------------------------------
+// monerod gates the ring size on the MINIMUM MIXIN band. cryptonote_config.h:
+//
+//   (no constant; the pre-v6 floor)  -> mixin  2 -> ring  3
+//   HF_VERSION_MIN_MIXIN_4  =  6     -> mixin  4 -> ring  5
+//   HF_VERSION_MIN_MIXIN_6  =  7     -> mixin  6 -> ring  7
+//   HF_VERSION_MIN_MIXIN_10 =  8     -> mixin 10 -> ring 11
+//   HF_VERSION_MIN_MIXIN_15 = 15     -> mixin 15 -> ring 16
+//
+// Observed on stagenet (monerod 0.18.5.1, read-only): height 37000-37400 is
+// major 7 with ring 7; 176481 is major 8 with ring 11; the whole major-15 band
+// carries BOTH ring 11 and ring 16; the major-16 band carries ring 16 only.
+//
+// This function answers "what a transaction built at this version should use".
+// It is NOT the admission test -- use hf_ring_size_allowed() for that.
 inline constexpr std::size_t hf_ring_size(std::uint8_t version) noexcept {
     if (version >= 15) return 16;
-    if (version >= 12) return 11;
-    if (version >= 8)  return 7;
-    if (version >= 7)  return 5;
-    if (version >= 6)  return 3;
-    return 0;   // not pinned before v6
+    if (version >= 8)  return 11;
+    if (version >= 7)  return 7;
+    if (version >= 6)  return 5;
+    return 3;   // monerod's pre-v6 floor: mixin 2
 }
 
-// The rct type a non-coinbase transaction must carry.
-//   v13, v14 -> CLSAG (5);  v15, v16 -> BulletproofPlus (6).
-// Returns 0 when the version is outside the pinned range.
-inline constexpr std::uint8_t hf_required_rct_type(std::uint8_t version) noexcept {
-    if (version >= 15) return 6;
-    if (version >= 13) return 5;
-    if (version >= 11) return 4;
-    if (version >= 10) return 3;
+// The admission test. Below v15 monerod enforces the band above as a FLOOR (a
+// larger ring is legal). From v15 the ring must be EXACTLY 16, with one
+// documented exception: at exactly v15 -- the fork window itself -- a ring of 11
+// is still accepted, which is why the major-15 stagenet band carries both. From
+// v16 the exception is gone.
+inline constexpr bool hf_ring_size_allowed(std::uint8_t version, std::size_t ring) noexcept {
+    if (version >= 15) {
+        if (ring == 16) return true;
+        return version == 15 && ring == 11;   // the one-fork grace window
+    }
+    return ring >= hf_ring_size(version);
+}
+
+// --- rct type ----------------------------------------------------------------
+// Type numbering is rct::RCTType, monero-project src/ringct/rctTypes.h:
+//   0 Null (coinbase and pre-RingCT), 1 Full, 2 Simple (both Borromean),
+//   3 Bulletproof, 4 Bulletproof2, 5 CLSAG, 6 BulletproofPlus.
+// The in-tree spelling of those numbers is the RCT_TYPE_* constant family in
+// consensus/xmr_tx_weight.hpp; this header deliberately does not re-declare it,
+// so there stays exactly one place where a type number is named.
+inline constexpr std::uint8_t XMR_RCT_TYPE_MAX = 6;
+
+// The fork at which a type FIRST becomes legal for a non-coinbase transaction.
+// 0 means "never legal" (an unknown type). cryptonote_config.h / blockchain.cpp
+// Blockchain::check_tx_inputs:
+//
+//   type 1, 2  RingCT enabled at v4 (allowed; mandatory at HF_VERSION_ENFORCE_RCT = 6)
+//   type 3     "Bulletproofs are not allowed before v8"          (hf_version < 8)
+//   type 4     "not allowed before v10"   HF_VERSION_SMALLER_BP      = 10
+//   type 5     "not allowed before v13"   HF_VERSION_CLSAG           = 13
+//   type 6     "not allowed before v15"   HF_VERSION_BULLETPROOF_PLUS = 15
+inline constexpr std::uint8_t hf_rct_type_allowed_from(std::uint8_t rct_type) noexcept {
+    switch (rct_type) {
+        case 0: return 1;    // non-RingCT; see the forbidden_from row below
+        case 1:
+        case 2: return 4;
+        case 3: return 8;
+        case 4: return 10;
+        case 5: return 13;
+        case 6: return 15;
+        default: return 0;
+    }
+}
+
+// The fork at which a type STOPS being legal. 0 means "still legal at the top of
+// the implemented range". Same source; each of these is the fork AFTER the one
+// that introduced its successor, which is what creates the one-fork grace band:
+//
+//   type 0     non-RingCT refused from HF_VERSION_ENFORCE_RCT = 6
+//   type 1, 2  "Borromean range proofs are not allowed after v8"  (hf_version > 8)
+//   type 3     "Ringct type 3 is not allowed from v11"            (hf_version > 10)
+//   type 4     "not allowed from v14"                  (hf_version > HF_VERSION_CLSAG)
+//   type 5     "Bulletproofs are not allowed from v16" (hf_version > HF_VERSION_BULLETPROOF_PLUS)
+//   type 6     still current
+inline constexpr std::uint8_t hf_rct_type_forbidden_from(std::uint8_t rct_type) noexcept {
+    switch (rct_type) {
+        case 0: return 6;
+        case 1:
+        case 2: return 9;
+        case 3: return 11;
+        case 4: return 14;
+        case 5: return 16;
+        case 6: return 0;
+        default: return 1;
+    }
+}
+
+// THE admission predicate for a non-coinbase transaction's rct type. A coinbase
+// always carries type 0 and is exempt; so is a pre-v7 transaction spending an
+// unmixable dust output, which this node never meets (it syncs from a modern
+// anchor) and deliberately does not model.
+//
+// Observed on stagenet (monerod 0.18.5.1, read-only), one line per activation
+// band, and every grace window is real chain data rather than a reading of the
+// source:
+//     major  7 -> {1, 2}     major 12 -> {4}
+//     major  8 -> {3}        major 13 -> {4, 5}   <- CLSAG allowed, BP2 still legal
+//     major  9 -> {3}        major 14 -> {5}
+//     major 10 -> {3, 4}     major 15 -> {5, 6}   <- BP+ allowed, CLSAG still legal
+//     major 11 -> {4}        major 16 -> {6}
+inline constexpr bool hf_rct_type_allowed(std::uint8_t version, std::uint8_t rct_type) noexcept {
+    const std::uint8_t from = hf_rct_type_allowed_from(rct_type);
+    if (from == 0 || version < from) return false;
+    const std::uint8_t until = hf_rct_type_forbidden_from(rct_type);
+    return until == 0 || version < until;
+}
+
+// The REQUIRE edge: the lowest rct type still legal at `version`. A structural
+// check that wants one number should use this as a FLOOR, never as an equality.
+// Returns XMR_RCT_TYPE_MAX + 1 when no type at all is legal. Fencing is a
+// separate question and hf_is_fenced() answers it.
+inline constexpr std::uint8_t hf_min_rct_type(std::uint8_t version) noexcept {
+    for (std::uint8_t t = 0; t <= XMR_RCT_TYPE_MAX; ++t)
+        if (hf_rct_type_allowed(version, t)) return t;
+    return XMR_RCT_TYPE_MAX + 1;
+}
+
+// The type a freshly built transaction should carry at `version`: the newest one
+// the fork allows. Returns 0 when no type is legal.
+inline constexpr std::uint8_t hf_newest_rct_type(std::uint8_t version) noexcept {
+    for (std::uint8_t t = XMR_RCT_TYPE_MAX; t > 0; --t)
+        if (hf_rct_type_allowed(version, t)) return t;
     return 0;
 }
 

@@ -38,11 +38,11 @@ public:
         AdmissionEvidence         evidence   = AdmissionEvidence::Structural;
         bool                      conflicted = false;
         std::uint32_t             seen_from_peers = 1;
+        bool                      stem       = false;   // still in the Dandelion++ stem
     };
 
-    // Config gates, mirroring the real pool's.
-    AdmissionEvidence required_evidence = EVIDENCE_DAEMONLESS_DEFAULT;
-    std::uint32_t     min_peers         = 1;
+    // The configured selection policy, standing in for the real pool's config.
+    TxpoolSelectPolicy configured{};
 
     std::map<std::string, Entry> entries;   // keyed by the 32-byte id
 
@@ -80,16 +80,25 @@ public:
 
     // --- ITxpoolSnapshot -----------------------------------------------------
     std::vector<node::TxBacklogEntry> selectable_backlog() const override {
+        return selectable_backlog(configured);
+    }
+
+    std::vector<node::TxBacklogEntry> selectable_backlog(
+            const TxpoolSelectPolicy& p) const override {
         std::vector<node::TxBacklogEntry> out;
         for (const auto& kv : entries) {
             const Entry& e = kv.second;
+            // Never a knob: a key-image conflict is unselectable at any policy.
             if (e.conflicted) continue;
-            if (!covers(e.evidence, required_evidence)) continue;
-            if (e.seen_from_peers < min_peers) continue;
+            if (!covers(e.evidence, p.required)) continue;
+            if (e.seen_from_peers < p.min_peers) continue;
+            if (e.stem && !p.allow_stem) continue;
             out.push_back(e.backlog);
         }
         return out;
     }
+
+    TxpoolSelectPolicy policy() const override { return configured; }
 
     std::uint64_t backlog_version() const override { return version_; }
 

@@ -27,6 +27,7 @@
 
 #include "types.hpp"
 #include "miner_data.hpp"
+#include "relay.hpp"
 
 namespace c2pool::xmr::native {
 
@@ -120,11 +121,38 @@ public:
 
     // P-TPL: a template was served. Enqueue-only; the comparison itself runs
     // off the serving thread so a slow oracle can never slow a share.
-    virtual void on_serve(const MinerDataEpoch&, const char* served_arm) = 0;
+    //
+    // CONTRACT NOTE (widened after the Wave 0 verify pass; plan section 4.10
+    // writes on_serve(const SettlementSnapshot&)). SettlementSnapshot stays out
+    // of contracts/ for the same reason BlockCandidate does -- it belongs to the
+    // settlement layer above this family. But an epoch TAG alone is not enough,
+    // and that projection would have cost C6 a rework:
+    //
+    //   P-TPL's claim is "the full_blob is byte-identical given the same
+    //   backlog". With only an epoch, the oracle has to go back to the served
+    //   arm and pull a fresh snapshot, which differs from the one that was
+    //   actually served whenever the backlog moved in between. The
+    //   ServedMismatch verdict -- the worst case, and the only one that catches
+    //   us serving something neither arm would have produced -- then becomes
+    //   unprovable, and P-TPL quietly degrades into a shadow-versus-shadow
+    //   compare that can never fail for the reason it exists.
+    //
+    // So the served ARTEFACT is carried, in the value type both arms already
+    // speak: node::MinerData. `served` must be exactly what went out, not a
+    // re-read. The epoch stays as the alignment key.
+    virtual void on_serve(const MinerDataEpoch&        epoch,
+                          const node::MinerData&       served,
+                          const char*                  served_arm) = 0;
 
     // P-SUB: a found block was relayed and its arms reported back.
-    virtual void on_submit(const Hash& block_id, bool daemon_accepted,
-                           std::size_t p2p_peers_sent) = 0;
+    //
+    // CONTRACT NOTE (same pass, same reason): the whole BlockRelayVerdict is
+    // carried rather than three fields of it. Without daemon_armed the oracle
+    // cannot tell "the daemon REJECTED our block", which is a real parity
+    // failure, from "there was no daemon arm at all", which is a VOID sample --
+    // and scoring the second as the first would revoke graduation on nothing.
+    // landed_first and why are what makes a sample readable afterwards.
+    virtual void on_submit(const BlockRelayVerdict&) = 0;
 
     virtual GraduationState state() const = 0;
     virtual ParityCoverage  coverage() const = 0;

@@ -28,7 +28,8 @@ activates v37 consensus and nothing here touches `src/sharechain/v37`.
 | `chain_index.hpp` | `IChainIndexInbound` (wire → index), `IChainView` (index → consumers) |
 | `fetcher.hpp` | `IChainFetcher` (index → wire), and the ≤100-id request cap |
 | `serving.hpp` | `IChainServing`, the io-thread read side that keeps peers from dropping us |
-| `txpool.hpp` | `AdmissionEvidence`, `TxRelayVerdict`, `IRelayedTxSink`, `ITxpoolSnapshot`, `ITxSource`, `ITxBlobSource` |
+| `anchor.hpp` | `AnchorBundle`, the exact window sizes, `AnchorStatus` + `anchor_self_check`, and the pinned `load_anchor` signature |
+| `txpool.hpp` | `AdmissionEvidence`, `TxpoolSelectPolicy`, `TxRelayVerdict`, `IRelayedTxSink`, `ITxpoolSnapshot`, `ITxSource`, `ITxBlobSource` |
 | `broadcast.hpp` | `IBroadcastPort` |
 | `miner_data.hpp` | `IMinerDataSource`, `MinerDataReadiness`, `MinerDataEpoch` — the one seam the template provider is rebound through |
 | `relay.hpp` | `ArmOrder`, `RelayPolicy`, `BlockRelayRequest`, `BlockRelayVerdict`, `IBlockRelay` |
@@ -40,7 +41,7 @@ threading dependencies. That is what makes it a collision fence for the parallel
 implementation waves. Changing a signature here after Wave 0 is a
 contract-amendment commit touching only `contracts/` and the affected fakes.
 
-Four things are worth calling out because they were changed during review, and
+Seven things are worth calling out because they were changed during review, and
 each of them was a real defect rather than a preference:
 
 * **`TxRelayVerdict` and `BlockRelayVerdict`.** Both used to be called
@@ -60,6 +61,24 @@ each of them was a real defect rather than a preference:
 * **`BlockTxEvent::tx_blobs` is best effort.** On a rollback the index returns
   what bodies it still has, which under pruned sync may be none, so the event
   carries `tx_blobs_complete` and the txpool must treat a missing body as gone.
+* **`TxpoolSelectPolicy` replaces the deleted tier.** Making evidence a bitmask
+  removed the `tier >= min_tier` term from the plan's `selectable_backlog()`
+  predicate and left nothing in its place, so the pool that implements the
+  filter and the assembler that consumes it would each have invented one. The
+  policy is now a pinned struct, with an explicit-policy overload — comparing
+  two arms is only meaningful when both selected under the same rule.
+* **`IParityOracle` carries the artefact, not a tag.** `on_serve` takes the
+  `node::MinerData` that was actually served alongside its epoch, and `on_submit`
+  takes the whole `BlockRelayVerdict`. With only an epoch the oracle has to
+  re-pull from the served arm, which differs whenever the backlog moved in
+  between, and `ServedMismatch` — the one verdict that catches us serving
+  something neither arm would produce — becomes unprovable. Without
+  `daemon_armed` a daemon *rejecting* our block is indistinguishable from there
+  being no daemon arm, which is a void sample rather than a failure.
+* **`AnchorBundle` is pinned in Wave 0.** The wave-1 table hands the anchor
+  generator to one workflow and anchor boot to another. It is the node's trust
+  root, so two independently invented layouts would not merely fail to compile —
+  they would disagree about what is trusted.
 
 There is one namespace root, `c2pool::xmr::native`, with aliases to the two
 neighbouring roots (`node::` for the existing lane value types, `submit::` for
@@ -71,7 +90,7 @@ the live-submit surface). Nothing here re-opens either.
 |---|---|
 | `xmr_blob_reader.hpp` | the bounds-checked read counterpart to `xmr_blob.hpp`'s `BlobWriter`. Nothing on master could read a CryptoNote blob back; three wave-1 components each needed one. Poisoning reader, monerod-exact varint rules, depth cap of 8, counted containers refused against the bytes actually present. |
 | `xmr_tx_weight.hpp` | consensus transaction weight, from a full blob **and** from a pruned one. The pruned path matters because chain sync is pruned by pinned decision D-4: the node never sees the prunable bytes and must reconstruct their length from structure. This is the most consensus-fatal function in the node. |
-| `xmr_hf_table.hpp` | the vendored hard-fork table, the version-dependent rules (RandomX from v12, ring size 16 from v15, CLSAG then bulletproof-plus), and the CARROT / FCMP++ fence: anything above v16 halts rather than guesses. |
+| `xmr_hf_table.hpp` | the vendored hard-fork table, the version-dependent rules, and the CARROT / FCMP++ fence that reports anything above v16 rather than guessing at it. Two of the rules are **bands, not scalars**: Monero allows a new ring size or proof system at one fork and only requires it at the next, so `hf_ring_size_allowed()` and `hf_rct_type_allowed()` are the admission tests and the scalars say only what a freshly built transaction should use. Every threshold cites the `cryptonote_config.h` constant behind it and is pinned in the KAT against what a synced stagenet daemon actually reports over each activation band. |
 | `xmr_epoch.hpp` | the RandomX seed epoch, re-exported from `coin/xmr_seedheight.hpp` (which is the single source of the 2048/64 constants) plus the seed-pair scheduling rule. |
 
 ### test/

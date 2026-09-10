@@ -274,6 +274,63 @@ static void test_full_blobs() {
 }
 
 // ---------------------------------------------------------------------------
+// The full-blob path enforces the SAME pinned rct scope as the prediction path.
+//
+// It measures the prunable bytes, so it looks safe for every type -- but the
+// clawback it adds on top is still derived from the output count, and that is
+// monerod's number only when the transaction carries exactly ONE aggregate
+// bulletproof. A type-3 transaction may legally carry several. Accepting one
+// would produce a wrong weight with status Ok and no signal at all, so both
+// paths refuse types 1-4 and this test pins the refusal.
+// ---------------------------------------------------------------------------
+static void test_full_blob_rct_scope() {
+    std::size_t exercised = 0;
+    for (std::size_t i = 0; i < G::FULL_TX_COUNT; ++i) {
+        const G::GoldenFullTx& g = G::FULL_TXS[i];
+        std::vector<std::uint8_t> blob;
+        if (!from_hex(g.full_hex, blob)) continue;
+
+        TxWeightInfo info;
+        if (parse_tx_full(blob, info) != TxParseStatus::Ok) continue;
+        if (info.rct_type != RCT_TYPE_BULLETPROOF_PLUS) continue;
+        if (info.prefix_size >= blob.size()) continue;
+
+        // The rct type is the first byte of the rct base. Bulletproof2 keeps
+        // the same base layout as BulletproofPlus (8-byte ecdhInfo, no
+        // pseudoOuts in the base), so flipping that one byte yields a blob that
+        // parses cleanly all the way to the scope check -- which is what we
+        // want to pin, rather than one that dies on a length mismatch.
+        std::vector<std::uint8_t> as_bp2 = blob;
+        as_bp2[info.prefix_size] = RCT_TYPE_BULLETPROOF2;
+
+        TxWeightInfo out;
+        const TxParseStatus st = parse_tx_full(as_bp2, out);
+        checkf(st == TxParseStatus::UnsupportedRctType,
+               "full tx %s retyped to bulletproof2: %s, expected UnsupportedRctType",
+               g.id_hex, to_string(st));
+
+        // Type 3, the one that can legally carry several proofs, is never
+        // accepted either -- by the scope check or by its own base layout.
+        std::vector<std::uint8_t> as_bp = blob;
+        as_bp[info.prefix_size] = RCT_TYPE_BULLETPROOF;
+        const TxParseStatus st3 = parse_tx_full(as_bp, out);
+        checkf(st3 != TxParseStatus::Ok,
+               "full tx %s retyped to bulletproof is refused, got %s",
+               g.id_hex, to_string(st3));
+
+        // The unmodified blob still parses to the same weight, so the two
+        // refusals above are about the type and not about a blob we broke.
+        TxWeightInfo again;
+        checkf(parse_tx_full(blob, again) == TxParseStatus::Ok
+               && again.weight == info.weight,
+               "full tx %s is unaffected by the retyping test", g.id_hex);
+        ++exercised;
+    }
+    check(exercised > 0, "the golden supplies at least one full bulletproof-plus blob");
+    std::printf("  full-blob rct scope: %zu blobs retyped and refused\n", exercised);
+}
+
+// ---------------------------------------------------------------------------
 // Truncation and corruption must be refused, never guessed at.
 // ---------------------------------------------------------------------------
 static void put_varint(std::vector<std::uint8_t>& v, std::uint64_t x) {
@@ -390,6 +447,7 @@ int main() {
     test_transactions();
     test_block_weight_sums();
     test_full_blobs();
+    test_full_blob_rct_scope();
     test_rejects();
     std::printf("xmr_tx_weight_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

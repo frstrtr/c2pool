@@ -51,14 +51,26 @@
 //   and for bulletproof / bulletproof2 / CLSAG (types 3,4,5) the proof body is
 //     9*32 (A,S,T1,T2,taux,mu,a,b,t) instead of 6*32.
 //
-// PINNED SCOPE (fail-closed, matching the plan's unknown-fork policy): the
-// structural prunable prediction is implemented for rct types 5 (CLSAG) and 6
-// (BulletproofPlus) -- everything a node syncing from a modern anchor can meet.
-// Types 1, 2, 3 and 4 return UnsupportedRctType from the prediction path rather
-// than a guess; type 3 in particular could legally carry several bulletproofs,
-// so its padded-output count is not a function of the output count alone.
-// Weight from a FULL blob is available for every type, because there the blob
-// size is measured rather than predicted.
+// PINNED SCOPE (fail-closed): BOTH entry points implement rct types 0
+// (coinbase), 5 (CLSAG) and 6 (BulletproofPlus) -- everything a node syncing
+// from a modern anchor can meet -- and return UnsupportedRctType for types 1, 2,
+// 3 and 4 rather than a guess.
+//
+// The full-blob path MEASURES the prunable bytes rather than predicting them, so
+// it is tempting to let it accept every type, and the first cut of this header
+// said it did. It must not, and the reason is the clawback rather than the
+// measurement: monerod derives the clawback from n_bulletproof_max_amounts(), a
+// sum over the proof VECTOR, while the formula here derives it from
+// n_padded_outputs_for(n_outputs), which is the same number only when the
+// transaction carries exactly ONE aggregate proof. Type 3 (RCTTypeBulletproof,
+// v8-v10) may legally carry several. Accepting it would return a WRONG weight
+// with status Ok and no signal at all -- a silent wrong answer in the most
+// consensus-fatal function in the tree.
+//
+// The case is unreachable today (a scan of the whole v8-v10 stagenet band found
+// no multi-bulletproof transaction), which is why this is a fence and not a bug
+// fix. Widening the scope means implementing the proof-vector sum, not relaxing
+// the check.
 //
 // Depends only on xmr_blob_reader.hpp and the STL.
 // ---------------------------------------------------------------------------
@@ -422,8 +434,11 @@ inline TxParseStatus parse_tx_pruned(const std::vector<std::uint8_t>& blob,
 }
 
 // Parse a FULL transaction blob. The prunable part is MEASURED (everything the
-// prefix and rct base did not consume), so no structural prediction is needed
-// and every rct type is accepted.
+// prefix and rct base did not consume) rather than predicted -- but the CLAWBACK
+// is still computed from the output count, so the pinned scope is the same one
+// the prediction path enforces. See PINNED SCOPE at the top of this file: types
+// 1-4 are refused here too, because a type-3 transaction carrying more than one
+// bulletproof would otherwise get a wrong weight with status Ok.
 inline TxParseStatus parse_tx_full(const std::uint8_t* data, std::size_t size,
                                    TxWeightInfo& info) {
     info = TxWeightInfo{};
@@ -435,6 +450,11 @@ inline TxParseStatus parse_tx_full(const std::uint8_t* data, std::size_t size,
     if (info.version >= 2) {
         st = detail::parse_rct_base(r, info);
         if (st != TxParseStatus::Ok) return st;
+
+        if (info.rct_type != RCT_TYPE_NULL
+            && info.rct_type != RCT_TYPE_CLSAG
+            && info.rct_type != RCT_TYPE_BULLETPROOF_PLUS)
+            return TxParseStatus::UnsupportedRctType;
     }
 
     info.prunable_size      = r.remaining();

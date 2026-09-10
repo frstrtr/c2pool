@@ -12,11 +12,13 @@
 // stay cheap: everything under contracts/ is header-only, STL plus the existing
 // lane value types, and free of transport, crypto and threading dependencies.
 // If that ever stops being true, the fence this family exists to provide is
-// gone -- see the CONTRACT NOTE in relay.hpp for the one place it was tested.
+// gone -- see the CONTRACT NOTE in relay.hpp and the WHAT IS NOT HERE note in
+// anchor.hpp for the two places it was tested.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include "types.hpp"
+#include "anchor.hpp"
 #include "chain_index.hpp"
 #include "fetcher.hpp"
 #include "serving.hpp"

@@ -155,6 +155,42 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// The selection policy (D-7).
+//
+// Plan section 4.7 writes the snapshot predicate as "!conflicted && tier >=
+// min_tier && (fluff || allow_stem) && peers >= min_peers". Must-fix (b)
+// deleted the scalar tier in favour of the AdmissionEvidence bitmask above, and
+// that left the PREDICATE unpinned -- WF-C3b implements the filter and WF-C4
+// consumes it, so with nothing shared each would have invented its own shape.
+// This struct is the replacement for the deleted `tier >= min_tier` term and is
+// the only thing either side needs to agree on.
+//
+// `conflicted` is deliberately NOT a knob: a transaction whose key image
+// collides with the chain or with another pool entry is never selectable, at
+// any policy.
+// ---------------------------------------------------------------------------
+struct TxpoolSelectPolicy {
+    // Every flag here must be present on an entry for it to be selectable.
+    // Defaults to the daemonless recommendation of ruling R-VAL.
+    AdmissionEvidence required = EVIDENCE_DAEMONLESS_DEFAULT;
+    // How many distinct peers must have shown us the transaction. 0 admits a
+    // transaction we have only seen once, which is the regtest case.
+    std::uint32_t min_peers = 1;
+    // Admit transactions still in the Dandelion++ stem phase. Off by default:
+    // a stem transaction has not been publicly fluffed and mining it leaks the
+    // path back to its origin.
+    bool allow_stem = false;
+
+    friend bool operator==(const TxpoolSelectPolicy& a, const TxpoolSelectPolicy& b) noexcept {
+        return a.required == b.required && a.min_peers == b.min_peers
+            && a.allow_stem == b.allow_stem;
+    }
+    friend bool operator!=(const TxpoolSelectPolicy& a, const TxpoolSelectPolicy& b) noexcept {
+        return !(a == b);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // C3 -> C4 (D-7): the assembler-facing snapshot. The element type is the
 // EXISTING node::TxBacklogEntry so the option-B assembler is not touched.
 // ---------------------------------------------------------------------------
@@ -162,10 +198,21 @@ class ITxpoolSnapshot {
 public:
     virtual ~ITxpoolSnapshot() = default;
 
-    // Already filtered: not conflicted, evidence covers the configured mask,
-    // fluffed (or stem allowed), and corroborated by at least the configured
-    // number of peers. The validity classification itself stays C3-internal.
+    // Already filtered by the CONFIGURED policy: not conflicted, evidence
+    // covers policy().required, fluffed (or stem allowed), and corroborated by
+    // at least policy().min_peers peers. The validity classification itself
+    // stays C3-internal.
     virtual std::vector<node::TxBacklogEntry> selectable_backlog() const = 0;
+
+    // The same filter under an EXPLICIT policy, which is what the parity oracle
+    // and the shadow arm need: comparing two arms is only meaningful when both
+    // selected under the same rule, and the configured one may differ per node.
+    virtual std::vector<node::TxBacklogEntry> selectable_backlog(
+            const TxpoolSelectPolicy&) const = 0;
+
+    // The configured policy. Carried into the settlement snapshot and into
+    // parity samples so a backlog difference can always be attributed.
+    virtual TxpoolSelectPolicy policy() const = 0;
 
     // Monotone; bumps whenever selectable_backlog() could differ.
     virtual std::uint64_t backlog_version() const = 0;

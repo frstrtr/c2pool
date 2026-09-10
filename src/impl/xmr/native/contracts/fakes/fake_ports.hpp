@@ -131,10 +131,11 @@ public:
 // ---------------------------------------------------------------------------
 class FakeParityOracle final : public IParityOracle {
 public:
-    std::vector<ParitySample> samples;
-    GraduationState           g = GraduationState::Observing;
-    ParityCoverage            cov{};
-    std::string               revoked_why;
+    std::vector<ParitySample>    samples;
+    std::vector<node::MinerData> served_templates;   // exactly what on_serve was handed
+    GraduationState              g = GraduationState::Observing;
+    ParityCoverage               cov{};
+    std::string                  revoked_why;
 
     void on_tip(const node::MainchainEvent& ev, const char* side) override {
         ParitySample s;
@@ -146,23 +147,33 @@ public:
         record(s);
     }
 
-    void on_serve(const MinerDataEpoch& e, const char* served_arm) override {
+    void on_serve(const MinerDataEpoch& e, const node::MinerData& served,
+                  const char* served_arm) override {
         ParitySample s;
         s.kind    = ProbeKind::Template;
         s.height  = e.height;
         s.prev_id = e.prev_id;
-        s.verdict = ParityVerdict::Clean;
+        // The point of carrying the served artefact: the alignment key and the
+        // thing that actually went out can disagree, and when they do the
+        // sample is a ServedMismatch, not a clean one. A recorder that only had
+        // the epoch could not tell the difference.
+        s.verdict = (served.height == e.height && served.prev_id == e.prev_id)
+                  ? ParityVerdict::Clean : ParityVerdict::ServedMismatch;
         s.note    = served_arm ? served_arm : "";
         record(s);
+        served_templates.push_back(served);
     }
 
-    void on_submit(const Hash&, bool daemon_accepted, std::size_t p2p_peers_sent) override {
+    void on_submit(const BlockRelayVerdict& v) override {
         ParitySample s;
-        s.kind    = ProbeKind::Submit;
-        // Coverage is a measurement: a submit nobody could judge is Void, and
-        // Void never counts as agreement.
-        s.verdict = (daemon_accepted || p2p_peers_sent) ? ParityVerdict::Clean
-                                                        : ParityVerdict::Void;
+        s.kind = ProbeKind::Submit;
+        // Coverage is a measurement, and the whole verdict is what makes the
+        // three outcomes separable: a daemon that REJECTED our block is a Fail,
+        // no daemon arm at all is Void, and Void never counts as agreement.
+        if (v.daemon_armed && v.daemon_rejected)      s.verdict = ParityVerdict::Fail;
+        else if (v.reached_network())                 s.verdict = ParityVerdict::Clean;
+        else                                          s.verdict = ParityVerdict::Void;
+        s.note = v.landed_first.empty() ? v.why : v.landed_first;
         record(s);
     }
 
