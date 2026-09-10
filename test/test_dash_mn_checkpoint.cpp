@@ -6526,3 +6526,177 @@ TEST(DashMnCheckpointReseed,
     EXPECT_LE(wire.size() + eaten, 12u)
         << "re-asking a withheld body must stay bounded";
 }
+
+// ===========================================================================
+// N. WINDOW-SIZED BUDGETS -- the value must track a GROWING replay window.
+//
+// The demotion-walk, on-demand-fold and ban-state-probe budgets are all sized
+// from the replay distance (tip - anchor). The formulas were always right; what
+// was wrong was the MOMENT they were evaluated. They were computed ONCE, at the
+// Waiting->Bridging edge -- and on a cold start that edge fires while the header
+// chain is still at the fast-start checkpoint, which is PINNED TO COINCIDE with
+// this lane's anchor. The window therefore measured zero blocks and every
+// budget collapsed to its base:
+//
+//     [MN-CKPT] bridge START: replaying h=2522505..2522504 (0 blocks)
+//
+// Headers then synced ~13.9k blocks forward while the budgets kept their
+// start-time values, and the mainnet cold bridge fail-closed at h=2529626 with
+// "PROBE CAP IS EXHAUSTED (8/8)". A WARM restart of the SAME binary -- armed
+// with headers already at the tip -- sized the same budget to 146 and completed.
+//
+// The reason that survived review is worth stating here, because it is what
+// these cases exist to keep from recurring: NO TEST EVER LOOKED AT A BUDGET
+// WHILE THE TIP MOVED. It was a defect of observability, not of arithmetic, so
+// fixing the behaviour without adding the observation would restore exactly the
+// blind spot -- the next edit near this code re-freezes the budget and nothing
+// notices until a cold start in the field.
+// ===========================================================================
+
+namespace {
+
+// Give the harness a header for every height in [from, to] so the lane can
+// position itself anywhere in the window. Distinct per height; only identity
+// and presence matter to these cases.
+void fill_headers(BridgeHarness& h, uint32_t from, uint32_t to)
+{
+    for (uint32_t i = from; i <= to; ++i) {
+        if (i == kAnchorHeight) { h.headers[i] = uint256S(kAnchorHash); continue; }
+        uint256 x;
+        std::memcpy(x.begin(), &i, sizeof(i));
+        h.headers[i] = x;
+    }
+}
+
+} // namespace
+
+// The cold shape itself: arm with the header chain still AT the checkpoint,
+// then let the headers arrive. Every budget must be re-sized from the CURRENT
+// tip.
+//
+// One deliberate difference from the field: mainnet armed on a window of ZERO
+// blocks, but this harness's 6-MN testnet anchor needs no anchor-body fold, so
+// a zero-block replay COMPLETES on the same pump and the lane leaves Bridging
+// before a second pump can happen. The smallest window that keeps the lane
+// bridging is one un-delivered body, and it collapses every budget to exactly
+// the same base the field recorded -- which is the property under test.
+TEST(DashMnCheckpointBudgets, ColdArmAtTheAnchorDoesNotFreezeTheBudgets)
+{
+    using Lane = MnCheckpointLane;
+    BridgeHarness h;
+    h.auto_deliver = false;            // the body never lands: the lane stays Bridging
+    fill_headers(h, kAnchorHeight, kAnchorHeight + 1);
+    h.tip = kAnchorHeight + 1;         // headers still AT the fast-start checkpoint
+
+    h.lane.arm(good_checkpoint());
+    h.lane.pump();                     // the Waiting->Bridging edge, window = 1 block
+
+    // This is the state the field log recorded -- and it is CORRECT at this
+    // instant. The defect was never that the base was chosen here; it was that
+    // nothing ever revisited it.
+    EXPECT_EQ(h.lane.revive_probe_cap(), Lane::kReviveProbeBase);
+    EXPECT_EQ(h.lane.ondemand_cap(),     Lane::kOnDemandFoldBase);
+
+    // Headers now sync forward -- the same distance the mainnet cold start
+    // covered between arming and publishing (anchor 2522504 -> 2536407).
+    const uint32_t kWindow = 13903;
+    fill_headers(h, kAnchorHeight, kAnchorHeight + kWindow);
+    h.tip = kAnchorHeight + kWindow;
+    h.lane.pump();
+
+    // 8 + 13903/100 = 147. Before the fix this stayed 8, and the bridge
+    // fail-closed the moment an eighth ban-state ambiguity appeared.
+    EXPECT_EQ(h.lane.revive_probe_cap(),
+              Lane::kReviveProbeBase + kWindow / Lane::kReviveProbePerBlocks)
+        << "the ban-state probe budget must be sized from the CURRENT tip;"
+           " frozen at the arm edge it is the h=2529626 cold fail-close";
+    EXPECT_EQ(h.lane.ondemand_cap(),
+              Lane::kOnDemandFoldBase + kWindow / Lane::kOnDemandFoldPerBlocks)
+        << "the on-demand fold budget must grow with the window too";
+    EXPECT_EQ(h.lane.sml_recovery_cap(), 4u + kWindow / 1000u)
+        << "the demotion-walk budget must grow with the window too";
+
+    // Nothing was clamped: this window is well inside every ceiling.
+    EXPECT_EQ(h.lane.budget_ceiling_warnings(), 0u);
+}
+
+// GROWTH ONLY. A budget already granted is never taken back mid-bridge --
+// shrinking one could turn an allowance ALREADY SPENT into an exhaustion, which
+// is the same fail-close the fix exists to remove, arrived at from the other
+// side. A tip that regresses (a reorg, a header-chain rollback) must not do it.
+TEST(DashMnCheckpointBudgets, AGrantedBudgetIsNeverTakenBackWhenTheWindowShrinks)
+{
+    using Lane = MnCheckpointLane;
+    BridgeHarness h;
+    h.auto_deliver = false;
+    const uint32_t kWindow = 13903;
+    fill_headers(h, kAnchorHeight, kAnchorHeight + kWindow);
+    h.tip = kAnchorHeight + 1;
+
+    h.lane.arm(good_checkpoint());
+    h.lane.pump();
+    h.tip = kAnchorHeight + kWindow;
+    h.lane.pump();
+
+    const size_t granted_revive   = h.lane.revive_probe_cap();
+    const size_t granted_ondemand = h.lane.ondemand_cap();
+    const size_t granted_walk     = h.lane.sml_recovery_cap();
+    ASSERT_GT(granted_revive, Lane::kReviveProbeBase);
+
+    // The tip falls back to a hundred blocks past the anchor. Re-evaluated
+    // naively, every formula would now return its base again.
+    h.tip = kAnchorHeight + 100;
+    h.lane.pump();
+
+    EXPECT_EQ(h.lane.revive_probe_cap(), granted_revive)
+        << "shrinking a granted budget can retroactively exhaust an allowance"
+           " this bridge has already spent";
+    EXPECT_EQ(h.lane.ondemand_cap(),     granted_ondemand);
+    EXPECT_EQ(h.lane.sml_recovery_cap(), granted_walk);
+}
+
+// The ceiling is a STATED bound, not an emergent one: raising
+// --embedded-mn-bridge-max must not silently turn the arm into an unbounded
+// round-trip crawl. And because the budgets are now re-evaluated on EVERY pump,
+// the announcement has to be once per budget per BRIDGE -- a per-pump warning
+// would be a flood, and a silent clamp would be the quiet degradation this lane
+// refuses. Both halves are asserted, because both are ways to get it wrong.
+TEST(DashMnCheckpointBudgets, AClampedBudgetIsAnnouncedOncePerBridgeNotOncePerPump)
+{
+    using Lane = MnCheckpointLane;
+    BridgeHarness h;
+    h.auto_deliver = false;
+    const uint32_t kWide = 40000;      // 8+400 / 8+160 / 4+40 -- all three clamp
+    fill_headers(h, kAnchorHeight, kAnchorHeight + kWide + 2000);
+    h.tip = kAnchorHeight + 1;
+
+    h.lane.set_max_bridge_blocks(100000);   // the knob the ceilings guard
+    h.lane.arm(good_checkpoint());
+    h.lane.pump();
+    ASSERT_EQ(h.lane.budget_ceiling_warnings(), 0u);
+
+    h.tip = kAnchorHeight + kWide;
+    h.lane.pump();
+
+    EXPECT_EQ(h.lane.revive_probe_cap(),  Lane::kReviveProbeCapMax);
+    EXPECT_EQ(h.lane.ondemand_cap(),      Lane::kOnDemandFoldCapMax);
+    EXPECT_EQ(h.lane.sml_recovery_cap(),  Lane::kSmlRecoveryCapMax);
+    EXPECT_EQ(h.lane.budget_ceiling_warnings(), 3u)
+        << "a clamped budget must be ANNOUNCED -- silence here is the quiet"
+           " degradation the lane exists to refuse";
+
+    // Twelve more pumps, the window still widening. The clamp holds and the
+    // announcement does not repeat.
+    for (int i = 1; i <= 12; ++i) {
+        h.tip = kAnchorHeight + kWide + static_cast<uint32_t>(i * 100);
+        h.lane.pump();
+    }
+    EXPECT_EQ(h.lane.revive_probe_cap(), Lane::kReviveProbeCapMax);
+    EXPECT_EQ(h.lane.budget_ceiling_warnings(), 3u)
+        << "one warning per budget per BRIDGE -- re-evaluating every pump must"
+           " not turn the ceiling into a log flood";
+
+    // A re-arm is a NEW bridge: the announcement is owed again.
+    h.lane.arm(good_checkpoint());
+    EXPECT_EQ(h.lane.budget_ceiling_warnings(), 0u);
+}
