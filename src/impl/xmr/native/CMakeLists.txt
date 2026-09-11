@@ -90,6 +90,25 @@ target_link_libraries(xmr_native_txpool PUBLIC xmr_coin)
 
 target_compile_features(xmr_native_txpool PUBLIC cxx_std_20)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# C5 live proof (relay/tools/): the one thing a KAT cannot check -- whether a
+# REAL monerod accepts the 2008 frame we build. BUILT here so it cannot bit-rot
+# (it is in both build.yml --target lists) and RUN by nobody in CI: it needs a
+# daemon, and CI must not depend on one. It registers no ctest test, so the
+# #1539 Not-Run rule does not apply to it.
+#
+# UNIX only (POSIX sockets, no asio) and deliberately so: it is a harness, not a
+# component, and keeping it dependency-free keeps it honest about what the relay
+# itself needs. relay/tools/README.md carries the two-node regtest recipe and
+# the run this component was landed on.
+# ─────────────────────────────────────────────────────────────────────────────
+if (BUILD_TESTING AND UNIX)
+    add_executable(xmr_c5_regtest_push relay/tools/xmr_c5_regtest_push.cpp)
+    target_include_directories(xmr_c5_regtest_push PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(xmr_c5_regtest_push PRIVATE xmr_coin)
+    target_compile_features(xmr_c5_regtest_push PRIVATE cxx_std_20)
+endif()
+
 if (BUILD_TESTING)
     add_subdirectory(test)
 endif()

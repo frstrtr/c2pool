@@ -243,7 +243,7 @@ jobs:
                     xmr_native_chain_locator_kat xmr_native_peer_store_kat \
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
-                    xmr_native_block_relay_kat \
+                    xmr_native_block_relay_kat xmr_c5_regtest_push \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
@@ -680,7 +680,7 @@ jobs:
                     xmr_native_chain_locator_kat xmr_native_peer_store_kat \
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
-                    xmr_native_block_relay_kat \
+                    xmr_native_block_relay_kat xmr_c5_regtest_push \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
                  # xmr_provenance_gate: previously omitted here because
                  # -fsanitize=undefined rejected its constexpr pointer comparison
