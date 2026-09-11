@@ -63,6 +63,15 @@ endif()
 # oracle) land in later waves against these contracts.
 add_subdirectory(native)
 
+# P2POOL SIDECHAIN OBSERVER: a strictly read-only client for SChernykh/p2pool's
+# own p2p sidechain, stacked on the native lane so that the Monero block
+# template embedded in every P2Pool sidechain block is read by the SAME parse
+# and identity code the native node runs against monerod. Header-only: this
+# subdirectory declares no library, only the parser KAT and the live harness,
+# both under BUILD_TESTING. It observes a FOREIGN network and participates in
+# nothing -- see p2pool/CMakeLists.txt and p2pool/README.md.
+add_subdirectory(p2pool)
+
 if (BUILD_TESTING)
     add_subdirectory(test)
 endif()
