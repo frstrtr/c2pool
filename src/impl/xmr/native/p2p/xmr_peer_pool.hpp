@@ -706,10 +706,34 @@ private:
                                : levinns::decode_new_block(body, n, m, err);
         if (!ok) { raise_fault(key, DosFault::MalformedBody, "block push body"); return; }
 
-        if (Peer* p = find(key)) p->last_relay_ms = now_ms();
+        if (Peer* p = find(key)) {
+            p->last_relay_ms = now_ms();
+            if (note_peer_height(*p, m.current_blockchain_height)) publish_snapshot();
+        }
         ++tel_.blocks_in;
         if (deps_.index)
             deps_.index->on_new_block(ref, std::move(m.b), m.current_blockchain_height, fluffy);
+    }
+
+    // A block push and an objects response both carry the sender's
+    // current_blockchain_height, and neither was folded into the peer's sync
+    // snapshot: only TIMED_SYNC was, on a 60 s beat. The sync driver decides
+    // whether to ask a peer for a chain by comparing that snapshot against our
+    // own tip, so for up to a minute after a peer moved onto a heavier branch we
+    // believed it was still level with us and asked it nothing -- while it
+    // relayed blocks whose parents we did not have. Folding the height in here
+    // makes the FIRST frame after the peer moves the thing that starts the
+    // catch-up, instead of the next beat.
+    //
+    // The HEIGHT only. cumulative_difficulty stays whatever the peer last put in
+    // a sync payload: it is the number the peer ranking and the fork choice are
+    // priced in, and deriving one from a height would be the claim-instead-of-
+    // work this whole layer refuses. Monotone, so a late frame from a peer that
+    // has since been rolled back cannot walk the snapshot backwards.
+    static bool note_peer_height(Peer& p, std::uint64_t current_blockchain_height) {
+        if (current_blockchain_height <= p.sync.current_height) return false;
+        p.sync.current_height = current_blockchain_height;
+        return true;
     }
 
     void handle_transactions(const std::string& key, const PeerRef& ref,
@@ -764,6 +788,7 @@ private:
         if (!p) return;
         ++tel_.objects_in;
         p->wire_busy = false;
+        note_peer_height(*p, m.current_blockchain_height);
 
         const std::uint64_t span_id = p->in_flight_span;
         p->in_flight_span = kNoSpan;

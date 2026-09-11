@@ -190,19 +190,48 @@ public:
         pre_begin_  = rows.size() ? end_height + 1 - rows.size() : end_height + 1;
     }
 
+    // The height of the first block this store can speak for: the start of the
+    // seeded pre-window when there is one, and otherwise the oldest row it
+    // retains. Zero means we hold the chain from its very first block, so there
+    // is nothing missing BELOW us -- only, possibly, nothing there at all yet.
+    std::uint64_t base_height() const noexcept {
+        if (!pre_window_.empty()) return pre_begin_;
+        return rows_.empty() ? 0 : rows_.front().row.height;
+    }
+
     // The (timestamp, cumulative difficulty) window ending at `height`, oldest
     // first, as the difficulty retarget wants it. Returns false when the store
     // cannot reach far enough back -- which is exactly the condition that makes
     // a deep fork unjudgeable and therefore refusable, rather than guessed at.
+    //
+    // `allow_young_chain` is the one case where a window SHORTER than `count` is
+    // the right answer rather than a refusal: the chain itself is younger than
+    // the window. monerod does not refuse there --
+    // Blockchain::get_difficulty_for_next_block collects min(height, 735) rows --
+    // and neither does this index's own tip fast path, which reads the consensus
+    // state's rolling window and therefore gets exactly the rows that exist.
+    // Only the BRANCH path came through here, so only the branch path refused,
+    // and a from-genesis node could not weigh ANY fork below its own tip until
+    // the chain was 735 blocks long: every regtest rig, always, and the first
+    // day of any from-genesis sync.
+    //
+    // The relaxation is granted only when base_height() == 0 -- we genuinely
+    // hold the chain from its first block. A store that merely STARTS high
+    // (trimmed rows, or an anchored boot whose pre-window does not reach the
+    // fork point) still cannot see far enough back, and that refusal must stay
+    // a refusal: a guessed window would put a wrong difficulty on a branch and
+    // the apply path would then disagree with itself.
     bool difficulty_window_ending_at(std::uint64_t height, std::size_t count,
-                                     std::vector<DifficultyRow>& out) const {
+                                     std::vector<DifficultyRow>& out,
+                                     bool allow_young_chain = false) const {
         out.clear();
         if (rows_.empty() || height > rows_.back().row.height) return false;
         if (height < rows_.front().row.height) return false;
 
         const std::uint64_t span = static_cast<std::uint64_t>(count);
-        if (height + 1 < span) return false;              // no such window exists
-        const std::uint64_t lo = height + 1 - span;
+        const bool young = allow_young_chain && base_height() == 0;
+        if (height + 1 < span && !young) return false;    // no such window exists
+        const std::uint64_t lo = height + 1 >= span ? height + 1 - span : 0;
 
         const std::uint64_t rows_lo = rows_.front().row.height;
         out.reserve(static_cast<std::size_t>(span));

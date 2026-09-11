@@ -655,10 +655,25 @@ public:
     // plus anything a refused reorg needs before it can be retried. The sync
     // driver reads this; the index never schedules its own network traffic
     // beyond the single hint request above.
+    //
+    // Ids whose BYTES we already hold are filtered out here rather than pruned
+    // from the lists: `wanted_` is replaced wholesale by the next chain entry
+    // and `refetch_` is deliberately a standing want list, so neither is a
+    // record of what is still missing. Without the filter the driver re-asked
+    // for a block it was already holding every refetch_reask_ms, forever --
+    // which is what a parked branch looks like from the outside, and what made
+    // "we are not making progress" indistinguishable from "the peer is not
+    // answering". Membership is not enough: a bodiless fluffy announcement and
+    // a row whose body has been evicted are both "known" and both still need
+    // fetching, so the test is whether we have bytes we could re-apply.
     std::vector<Hash> refetch_wanted() const {
         std::lock_guard<std::mutex> lk(mu_);
-        std::vector<Hash> out = wanted_;
-        out.insert(out.end(), refetch_.begin(), refetch_.end());
+        std::vector<Hash> out;
+        out.reserve(wanted_.size() + refetch_.size());
+        for (const Hash& id : wanted_)
+            if (!have_body_locked_(id)) out.push_back(id);
+        for (const Hash& id : refetch_)
+            if (!have_body_locked_(id) && !contains_hash_(out, id)) out.push_back(id);
         return out;
     }
 
@@ -776,8 +791,42 @@ private:
         // The difficulty this block had to beat, on ITS branch.
         U128 difficulty{};
         if (!branch_difficulty_locked_(prev, parent_height, rules, difficulty, why)) {
-            // We cannot see far enough back to judge it. Not a fault, not a
-            // rejection: park it and say what is missing.
+            // We cannot see far enough back to judge it YET. Not a fault, not a
+            // rejection -- and, until now, not a park either: this path SAID
+            // ParkedOrphan and then returned without storing the block, without
+            // asking for anything, and without a line in the journal. The block
+            // was destroyed. Every re-delivery hit the same return, so the
+            // fork-point child of a rival branch could be handed to this node
+            // forever and never be held once; AltPool::heaviest() never had a
+            // candidate, the fork choice never ran, and the node sat on its own
+            // tip while its peers moved on. Park it for real, so that the moment
+            // the missing piece lands -- the parent resolving, or the chain
+            // growing past the fork point -- resolve_descendants_locked_ picks
+            // it up and the fork choice finally gets to see it.
+            //
+            // Unresolved and un-adoptable, deliberately: it has no cumulative
+            // difficulty on its branch, heaviest() skips it, and the fail-closed
+            // bound in the switch refuses any branch containing it. Holding
+            // bytes is the whole of what happens here.
+            if (const AltBlock* have = alt_.find(r.id); have && have->has_entry) {
+                r.outcome = OfferOutcome::Duplicate;
+                r.why     = "already parked, unjudgeable: " + why;
+                return r;
+            }
+            const bool was_parked = alt_.contains(r.id);
+            AltBlock b;
+            b.id             = r.id;
+            b.prev_id        = prev;
+            b.height         = r.height;
+            b.resolved       = false;
+            b.adoptable      = false;
+            b.own_mined      = own_mined;
+            b.entry          = std::move(entry);
+            b.has_entry      = true;
+            b.first_seen_seq = ++seq_;
+            if (peer) b.source = *peer;
+            alt_.insert(std::move(b));
+            if (!was_parked) ++orphans_;
             r.outcome = OfferOutcome::ParkedOrphan;
             r.why     = why;
             return r;
@@ -843,7 +892,18 @@ private:
                 // parked behind it.
                 resolve_descendants_locked_(r.id);
                 connect_parked_children_locked_();
-                r.outcome = OfferOutcome::Connected;
+                // And then ask the fork choice, because the two calls above can
+                // have RESOLVED a branch that was unjudgeable a moment ago: a
+                // block whose difficulty window only became assemblable once the
+                // chain grew, or whose parent only just landed. The branch path
+                // runs the fork choice on every offer; this one did not, so a
+                // branch that became heavier as a side effect of an ordinary
+                // extend would sit resolved-and-ignored until the next block
+                // happened to arrive on it. maybe_switch_locked_() is a no-op
+                // when nothing outweighs the tip, so the cost is one comparison.
+                const bool switched = maybe_switch_locked_();
+                r.outcome = switched && !rows_.contains(r.id) ? OfferOutcome::StoredAsAlt
+                                                              : OfferOutcome::Connected;
                 return r;
             }
             if (co.status == ConnectStatus::BodiesMissing) {
@@ -975,7 +1035,14 @@ private:
                 return false;
             }
             const std::size_t need = DIFFICULTY_BLOCKS_COUNT - upper.size();
-            if (!rows_.difficulty_window_ending_at(anchor_row->row.height, need, window)) {
+            // allow_young_chain: a chain shorter than the window is not a chain
+            // we cannot see far enough back on -- it is a chain with nothing
+            // more to see. The tip fast path above already answers from a short
+            // window (the state's own), so refusing here is the branch path
+            // disagreeing with the tip path about the same rows. The store
+            // grants it only when it holds the chain from height 0.
+            if (!rows_.difficulty_window_ending_at(anchor_row->row.height, need, window,
+                                                   /*allow_young_chain=*/true)) {
                 why = "the retained window does not reach the fork point";
                 return false;
             }
@@ -1512,6 +1579,17 @@ private:
     static bool contains_hash_(const std::vector<Hash>& v, const Hash& h) {
         for (const Hash& x : v) if (x == h) return true;
         return false;
+    }
+
+    // Do we hold bytes we could re-apply for this id? Deliberately NOT "do we
+    // know it": a fluffy announcement parked without its transactions, and a
+    // best-chain row whose body has aged out of the entry cache, are both known
+    // and both still need fetching -- and a reorg that needs either of them is
+    // refused with MissingBodies and asks for exactly this id back.
+    bool have_body_locked_(const Hash& id) const {
+        if (entries_.find(key_(id)) != entries_.end()) return true;
+        const AltBlock* b = alt_.find(id);
+        return b && b->has_entry;
     }
 
     void penalize_locked_(const PeerRef* p, PeerFault f, const std::string& why) {
