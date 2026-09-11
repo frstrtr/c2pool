@@ -251,6 +251,7 @@ jobs:
                     v37_xmr_m3_arm_order_kat \
                     xmr_p2pool_parse_kat xmr_p2pool_observer \
                     xmr_p2pool_monitor_kat xmr_p2pool_monitor \
+                    xmr_p2pool_persist_kat \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
@@ -695,6 +696,7 @@ jobs:
                     v37_xmr_m3_arm_order_kat \
                     xmr_p2pool_parse_kat xmr_p2pool_observer \
                     xmr_p2pool_monitor_kat xmr_p2pool_monitor \
+                    xmr_p2pool_persist_kat \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
                  # xmr_provenance_gate: previously omitted here because
                  # -fsanitize=undefined rejected its constexpr pointer comparison

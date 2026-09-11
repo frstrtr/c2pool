@@ -21,16 +21,22 @@
 # a sidechain blob is handed to THOSE parsers rather than to a second copy
 # written here -- which is the whole reason this component is stacked on M3.
 #
-# Four targets, all under BUILD_TESTING:
+# Five targets, all under BUILD_TESTING:
 #
 #   xmr_p2pool_parse_kat    the deterministic parser KAT over two real captured
 #                           frames. REGISTERED with add_test and run in both CI
 #                           legs. Offline: the goldens are in the header.
 #   xmr_p2pool_monitor_kat  the deterministic RENDER KAT: three fixed read
 #                           models drawn to a golden frame, plus the emitted
-#                           message-id pin re-asserted for the monitor. Also
+#                           message-id pin re-asserted for the monitor, the
+#                           absence-vs-zero rules and the state-file codec. Also
 #                           REGISTERED, also offline -- it includes no socket
-#                           header and needs no terminal.
+#                           header, makes no syscall and needs no terminal.
+#   xmr_p2pool_persist_kat  the DURABILITY KAT: forks a child, has it save a
+#                           state, kills it with SIGKILL and reads every number
+#                           back; plus the directory lock, the no-HOME refusal
+#                           and journal rotation. REGISTERED, offline, and the
+#                           only KAT here that touches a filesystem.
 #   xmr_p2pool_observer     the live single-chain harness. BUILT by CI so it
 #                           cannot bit-rot, RUN by nobody in CI, because running
 #                           it dials a public network. Registers no ctest test,
@@ -49,7 +55,7 @@
 #
 # DRIFT-GUARD: tools/ci/check_test_target_allowlist.py audits
 # src/impl/<coin>/test/CMakeLists.txt; this tree sits one level deeper
-# (src/impl/xmr/p2pool/test/) and is outside that glob, so ALL FOUR targets are
+# (src/impl/xmr/p2pool/test/) and is outside that glob, so ALL FIVE targets are
 # added to BOTH `--target` lists in .github/workflows/build.yml by hand. A
 # target registered with add_test but never built reports "***Not Run" and
 # exits non-zero -- the #1539 lesson.

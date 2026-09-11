@@ -88,7 +88,9 @@
 #include <string>
 #include <vector>
 
+#include "impl/xmr/p2pool/p2pool_freshness.hpp"
 #include "impl/xmr/p2pool/p2pool_observer.hpp"
+#include "impl/xmr/p2pool/p2pool_state.hpp"
 #include "impl/xmr/p2pool/p2pool_tui.hpp"
 
 namespace c2pool::xmr::p2pool {
@@ -118,6 +120,16 @@ struct MonitorConfig {
     std::uint64_t reseed_idle_ms   = 20000;
     std::uint64_t seed             = 0;
     bool          verbose          = false;
+    // Chains that must NOT use the DNS seed list -- neither at start-up nor on
+    // the idle reseed. They dial only what `--peer` gave them, which is how a
+    // source is deliberately taken away from the monitor to prove that the
+    // panel says so instead of showing zeros, and that the other chains carry
+    // on. Without this, a chain pointed at a dead port is quietly rescued by
+    // the seeds twenty seconds later and the case under test disappears.
+    std::vector<Sidechain> seedless;
+    // How stale is stale. Exposed so an operator watching a chain with a very
+    // different cadence can move the bands without a rebuild.
+    FreshnessThresholds freshness;
 };
 
 class MultiWatch {
@@ -135,7 +147,12 @@ public:
             // generator.
             oc.seed = cfg_.seed ? (cfg_.seed + 1013904223ull * (i + 1)) : 0;
             oc.run_ms = 0;                      // this class owns the loop
-            slots_.push_back(Slot{std::make_unique<Observer>(oc), 0});
+            Slot sl;
+            sl.obs   = std::make_unique<Observer>(oc);
+            sl.seeds = true;
+            for (const Sidechain c : cfg_.seedless)
+                if (c == cfg_.chains[i]) sl.seeds = false;
+            slots_.push_back(std::move(sl));
         }
     }
 
@@ -146,24 +163,66 @@ public:
 
     void set_log(LogSink s) { for (Slot& sl : slots_) sl.obs->set_log(s); }
 
-    void seed_all() { for (Slot& sl : slots_) sl.obs->add_default_seeds(); }
+    void seed_all() {
+        for (Slot& sl : slots_) if (sl.seeds) sl.obs->add_default_seeds();
+    }
 
-    // Dial this endpoint first on the named chain; the DNS seeds still follow.
+    // Dial this endpoint first on the named chain; the DNS seeds still follow
+    // unless the chain is seedless. The endpoint is remembered, because a
+    // seedless chain has nothing else to retry when its only peer goes away.
     void add_peer(Sidechain c, const std::string& host, std::uint16_t port) {
         for (std::size_t i = 0; i < slots_.size(); ++i)
-            if (cfg_.chains[i] == c) slots_[i].obs->add_seed(host, port);
+            if (cfg_.chains[i] == c) {
+                slots_[i].obs->add_seed(host, port);
+                slots_[i].pinned.push_back({host, port});
+            }
     }
+
+    // CONTINUITY. The previous session's state, read off disk before the first
+    // packet. Two things come across, and deliberately only two: the freshness
+    // clock (see FreshnessTracker::carry_in) and the lifetime high-water marks.
+    // Everything else on a panel is a live reading or a `--`.
+    void set_carry(const state::MonitorState& prev) {
+        carry_         = prev;
+        carry_loaded_  = true;
+        carry_applied_ = false;
+    }
+
+    bool          carried() const noexcept { return carry_loaded_; }
+    std::uint64_t loop_stall_max_ms() const noexcept { return loop_stall_max_ms_; }
 
     // ONE turn of the shared loop. `extra_fd` (the tty, or -1) is polled beside
     // the sockets and its revents are returned, so a keypress wakes the loop
     // without a second poll and without a timeout race.
     short poll_once(int extra_fd, short extra_events, int timeout_ms) {
-        const std::uint64_t t = now_ms();
+        // STEADY. Everything this turn measures -- the gap since the previous
+        // turn, the per-chain reseed cool-off -- is a duration inside this
+        // process, and a wall clock that an NTP step moved backwards would
+        // report a negative loop stall or freeze a reseed timer for hours.
+        const std::uint64_t t = steady_ms();
+
+        // THE LOOP-STALL WATCH. One dead source must not stall the other two,
+        // and "must not" is worth measuring rather than asserting: every turn
+        // records the gap since the previous turn, and the worst gap of the
+        // session is rendered on the header row and written into the state
+        // file. A blocking getaddrinfo() on a chain whose seeds have gone away
+        // shows up here as a multi-second spike, and it shows up whether or not
+        // anybody was watching at the time.
+        if (last_turn_ms_) {
+            const std::uint64_t gap = t > last_turn_ms_ ? t - last_turn_ms_ : 0;
+            if (gap > loop_stall_max_ms_) loop_stall_max_ms_ = gap;
+        }
+        last_turn_ms_ = t;
 
         for (Slot& sl : slots_) {
             sl.obs->begin_tick();
             if (sl.obs->idle() && t >= sl.next_reseed_ms) {
-                sl.obs->reseed();
+                // A seedless chain retries exactly what it was given. It must
+                // not fall back to the DNS seeds: a chain deliberately pointed
+                // at a dead endpoint that quietly reconnects to the real
+                // network is a monitor that cannot be tested.
+                if (sl.seeds) sl.obs->reseed();
+                else for (const auto& p : sl.pinned) sl.obs->add_seed(p.first, p.second);
                 sl.next_reseed_ms = t + cfg_.reseed_idle_ms;
             }
         }
@@ -188,7 +247,19 @@ public:
 
         short extra_revents = 0;
         if (pfds_.empty()) {
-            ::poll(nullptr, 0, timeout_ms);     // nothing open yet: just wait
+            // NOTHING OPEN AT ALL. Wait out the timeout -- but take the
+            // freshness sample first.
+            //
+            // This early return used to skip it, and the case it skipped is
+            // exactly the worst one: a monitor whose chains are ALL dark never
+            // started a single clock, so the panels said "DARK never connected"
+            // with no age beside it, on the one run where how long it had been
+            // dark was the whole question. Caught by running the binary with
+            // every chain seedless; the three-chain case hid it, because one
+            // live chain's sockets are enough to make this array non-empty and
+            // sample all three.
+            sample_freshness();
+            ::poll(nullptr, 0, timeout_ms);
             return 0;
         }
         const int rc = ::poll(pfds_.data(), pfds_.size(), timeout_ms);
@@ -204,17 +275,30 @@ public:
             const std::size_t n = begins_[i + 1] - b;
             slots_[i].obs->dispatch(pfds_.data() + b, live_.data() + b, n);
         }
+
+        // Taken AFTER dispatch so a block that arrived on this turn counts on
+        // this turn.
+        sample_freshness();
         return extra_revents;
     }
 
     void close_all() { for (Slot& sl : slots_) sl.obs->close_all("monitor stopped"); }
 
-    // The frame, taken at one instant across all three chains.
-    tui::MonitorFrame frame(std::uint64_t elapsed_ms, bool interactive) const {
+    // The frame, taken at one instant across all three chains. This is also
+    // exactly what gets written to the state file: the file is built from the
+    // frame, so the two cannot disagree (see p2pool_state.hpp).
+    tui::MonitorFrame frame(std::uint64_t elapsed_ms, bool interactive,
+                            const tui::PersistView& persist = tui::PersistView{}) const {
         tui::MonitorFrame f;
         f.elapsed_ms  = elapsed_ms;
         f.interactive = interactive;
-        const std::uint64_t t = now_ms();
+        f.persist     = persist;
+        f.persist.loop_stall_max_ms = loop_stall_max_ms_;
+        // BOTH CLOCKS, read once each so every panel in this frame is resolved
+        // at one instant: steady for the per-session feed ages, wall for the
+        // freshness instants and for the age of the state the last session left.
+        const std::uint64_t t = steady_ms();
+        const std::uint64_t w = wall_ms();
         for (const Slot& sl : slots_) {
             tui::EmitCounts ec;
             const OutboundLedger& led = sl.obs->ledger();
@@ -222,16 +306,73 @@ public:
                 ec.messages[i] = led.messages[i];
                 ec.bytes[i]    = led.bytes[i];
             }
-            f.chains.push_back(tui::view_of(sl.obs->model(), ec, sl.obs->live_sessions(),
-                                            sl.obs->pending_dials(), t));
+            tui::ChainView v = tui::view_of(sl.obs->model(), ec, sl.obs->live_sessions(),
+                                            sl.obs->pending_dials(), t, w, sl.fresh.view(),
+                                            cfg_.freshness);
+
+            // What the previous session left behind, on its own row, with its
+            // age. The lifetime maxima are carried forward monotonically so a
+            // restart cannot un-see a height.
+            if (carry_loaded_) {
+                if (const state::ChainState* prev = carry_.find(to_string(sl.obs->model().chain()))) {
+                    v.carried             = true;
+                    v.carry_written_at_ms = carry_.written_at_ms;
+                    v.carry_age_ms        = FreshnessView::age(w, carry_.written_at_ms);
+                    v.carry_tip_height    = prev->tip_height;
+                    v.carry_tip_id8       = prev->tip_id.size() >= 8 ? prev->tip_id.substr(0, 8)
+                                                                     : std::string();
+                    v.lifetime_tip_max    = prev->lifetime.tip_height_max;
+                    v.lifetime_monero_max = prev->lifetime.monero_tpl_max;
+                }
+            }
+            if (v.tip_height > v.lifetime_tip_max)   v.lifetime_tip_max = v.tip_height;
+            if (v.monero_high > v.lifetime_monero_max) v.lifetime_monero_max = v.monero_high;
+            f.chains.push_back(std::move(v));
         }
         return f;
     }
 
 private:
+    // THE FRESHNESS SAMPLE, once per turn, per chain, from outside. Polling
+    // rather than hooking the observer keeps every chain's clock driven by that
+    // chain's own numbers and nothing else -- see the note on
+    // FreshnessTracker::sample. Called on EVERY path out of poll_once(),
+    // including the one where no socket exists yet.
+    void sample_freshness() {
+        // WALL. Every instant the tracker records from this sample is written to
+        // the state file and read back by a later process, on a later boot and
+        // sometimes on another machine, so it has to be on the clock those two
+        // processes share. This one line is the fix for the reboot bug described
+        // at the top of p2pool_observer.hpp.
+        const std::uint64_t t = wall_ms();
+        for (Slot& sl : slots_) {
+            sl.fresh.sample(sl.obs->model().tip_height(), sl.obs->model().distinct_blocks(),
+                            sl.obs->model().connected_peers(), sl.obs->live_sessions(),
+                            sl.obs->pending_dials(), t);
+        }
+        // The carried clock is applied once, after the trackers have started:
+        // carry_in() takes the EARLIER instant, and start() has just seeded
+        // them to `now`.
+        if (carry_loaded_ && !carry_applied_) {
+            carry_applied_ = true;
+            for (std::size_t i = 0; i < slots_.size(); ++i) {
+                const state::ChainState* prev = carry_.find(to_string(cfg_.chains[i]));
+                if (!prev) continue;
+                FreshnessView fv;
+                fv.known     = true;
+                fv.tip_at_ms = prev->tip_advanced_at_ms;
+                fv.rx_at_ms  = prev->rx_at_ms;
+                slots_[i].fresh.carry_in(fv);
+            }
+        }
+    }
+
     struct Slot {
         std::unique_ptr<Observer> obs;
         std::uint64_t             next_reseed_ms = 0;
+        bool                      seeds = true;
+        std::vector<std::pair<std::string, std::uint16_t>> pinned;
+        FreshnessTracker          fresh;
     };
 
     MonitorConfig            cfg_;
@@ -239,6 +380,12 @@ private:
     std::vector<pollfd>      pfds_;
     std::vector<PeerSession*> live_;
     std::vector<std::size_t> begins_;
+
+    state::MonitorState      carry_;
+    bool                     carry_loaded_  = false;
+    bool                     carry_applied_ = false;
+    std::uint64_t            last_turn_ms_  = 0;
+    std::uint64_t            loop_stall_max_ms_ = 0;
 };
 
 // ---------------------------------------------------------------------------
