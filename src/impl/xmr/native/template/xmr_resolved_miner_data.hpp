@@ -100,10 +100,17 @@ public:
             }
         }
 
+        // Attribute BEFORE latching, by pointer identity rather than by which
+        // branch above ran: the branch says what we tried, the pointer says
+        // what answered.
+        IMinerDataSource* const daemon_arm = resolver_->arm(TemplateArm::Monerod);
+        IMinerDataSource* const native_arm = resolver_->arm(TemplateArm::Native);
         {
             std::lock_guard<std::mutex> lk(mtx_);
             cur_ = picked;
             ++resolves_;
+            if (picked && picked == daemon_arm)      ++served_daemon_;
+            else if (picked && picked == native_arm) ++served_native_;
         }
         if (!picked) {
             const std::string r = resolver_->last_reason();
@@ -126,6 +133,33 @@ public:
     std::uint64_t daemon_pumps() const {
         std::lock_guard<std::mutex> lk(mtx_);
         return daemon_pumps_;
+    }
+
+    // WHICH ARM ACTUALLY SERVED, which is a different question from the one
+    // above and is the one an auditor is really asking.
+    //
+    // daemon_pumps() counts round trips. It answers "did the template path call
+    // the daemon?", and a pump is not required for the daemon arm to serve: if
+    // an earlier pump left MonerodMinerDataSource's cache filled and still
+    // fresh, a later refresh can resolve straight to it -- resolver_->serving()
+    // hands it back for free, the pump branch is never entered, and the pump
+    // counter does not move. A run reported as "template-path get_miner_data=0"
+    // could therefore contain templates the DAEMON built, and the number that
+    // was supposed to make the claim falsifiable would have said nothing about
+    // it.
+    //
+    // These two count the LATCHED ARM instead, by pointer identity against the
+    // resolver's own two arms, so every resolution that produced a template is
+    // attributed to the component that produced it. served_by_daemon() == 0 is
+    // the native-only claim; daemon_pumps() == 0 is the no-round-trip claim.
+    // Both are reported, because neither implies the other.
+    std::uint64_t served_by_native() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return served_native_;
+    }
+    std::uint64_t served_by_daemon() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return served_daemon_;
     }
 
     // --- IMinerDataSource ----------------------------------------------------
@@ -175,6 +209,8 @@ private:
     IMinerDataSource* cur_ = nullptr;
     std::uint64_t     resolves_ = 0;
     std::uint64_t     daemon_pumps_ = 0;
+    std::uint64_t     served_native_ = 0;
+    std::uint64_t     served_daemon_ = 0;
 };
 
 } // namespace c2pool::xmr::native::tmpl

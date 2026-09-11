@@ -227,6 +227,14 @@ struct XmrNodeConfig {
     // How long the daemon waits for the native arm to become ready before it
     // refuses to start (fail-closed: it never serves a half-built window).
     std::uint32_t   native_ready_timeout_s = 120;
+    // Rebuild the served template when the native POOL moves, not only when the
+    // parent tip does, at most once per this many seconds. 0 (the default, and
+    // what M0..M2 shipped) is TIP-ONLY. A block consumes the pool, so a
+    // tip-only arm serves the empty template built at the start of every block
+    // interval and collects almost none of the fees that arrive during it. The
+    // cost of turning it on is a restamped header under miners mid-grind, which
+    // is why the default does not move.
+    std::uint64_t   native_backlog_refresh_s = 0;
 
     // --- storage ------------------------------------------------------------
     // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).

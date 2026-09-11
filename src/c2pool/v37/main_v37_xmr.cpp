@@ -613,6 +613,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             ncfg.parity_ledger_path   = cfg.resolved_settle_db_path() + "/xmr_parity_ledger.json";
             ncfg.c2pool_commit        = C2POOL_VERSION;
             ncfg.ready_timeout_s      = cfg.native_ready_timeout_s;
+            ncfg.backlog_refresh_s    = cfg.native_backlog_refresh_s;
 
             std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned "
                         "peer(s)) feeds the option-B assembler; monerod stays the parity judge "
@@ -652,11 +653,20 @@ static int run_live(const XmrNodeConfig& cfg) {
         // mattered.
         std::uint64_t shape_ok = 0, shape_refused = 0;
         std::string   last_shape;
+        // n_tx of the block the gate judged -- the SELECTED count, which is not
+        // the same number as the backlog the arm OFFERED. The assembler applies
+        // monerod's own 5-second age gate (xmr_block_template.cpp), so a
+        // transaction that arrived moments before the rebuild is held back for
+        // the next one. Reporting only one of the two numbers would leave an
+        // auditor comparing "backlog=4" against a coinbase paying three fees and
+        // with no way to tell a filter from a bug, so both are printed.
+        std::size_t   last_selected_tx = 0;
         provider.set_shape_gate(
             [&](const ::c2pool::xmr::assembly::AssembledTemplate& t, std::string* w) {
                 const o2::KFairCoinbaseShape sh =
                     o2::inspect_kfair_coinbase(t, ledger.ledger().owed_digest());
                 last_shape = sh.describe();
+                last_selected_tx = t.n_tx();
                 if (!sh.ok) {
                     ++shape_refused;
                     if (w) *w = sh.why;
@@ -691,21 +701,64 @@ static int run_live(const XmrNodeConfig& cfg) {
         };
         hooks.status_extra = [&]() {
             if (!last_shape.empty())
-                std::printf("  coinbase: %s (gate ok=%llu refused=%llu)\n", last_shape.c_str(),
+                std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
+                            last_selected_tx, last_shape.c_str(),
                             static_cast<unsigned long long>(shape_ok),
                             static_cast<unsigned long long>(shape_refused));
             if (!native) return;
             const auto ns = native->node()->status();
-            std::printf("  native: arm=%s resolves=%llu template-path get_miner_data=%llu "
+            // The backlog the native arm OFFERED for the template that actually
+            // went out -- not the pool right now, because the number an auditor
+            // is checking is the one the miners were handed. Read off the
+            // provider's record of the served template, the same artefact the
+            // P-TPL oracle judges. `selected` beside it is what the assembler
+            // kept after monerod's 5-second age gate.
+            std::size_t served_backlog_n = 0;
+            {
+                node::MinerData md_out{};
+                if (provider.last_miner_data(md_out)) served_backlog_n = md_out.tx_backlog.size();
+            }
+            std::printf("  native: arm=%s resolves=%llu (native=%llu daemon=%llu) "
+                        "template-path get_miner_data=%llu "
                         "| verified_frontier=%llu peers=%zu txpool_accepted=%llu "
-                        "| node rpc(parity+submit)=%llu\n",
+                        "backlog offered=%zu selected=%zu\n",
                         native->arms()->describe().c_str(),
                         static_cast<unsigned long long>(native->source().resolves()),
+                        static_cast<unsigned long long>(native->source().served_by_native()),
+                        static_cast<unsigned long long>(native->source().served_by_daemon()),
                         static_cast<unsigned long long>(native->source().daemon_pumps()),
                         static_cast<unsigned long long>(ns.sync.verified_frontier),
                         ns.pool.peers_handshaked,
                         static_cast<unsigned long long>(ns.txpool.accepted),
-                        static_cast<unsigned long long>(ns.rpc_calls));
+                        served_backlog_n, last_selected_tx);
+
+            // THE WIRE LINE. Two independent sockets reach the same daemon: the
+            // embedded node's own transport (parity judge + submit arm) and the
+            // pool's consumer transport, whose no-libzmq tip poll is the bulk of
+            // the traffic. Printing only the first made the headline a tenth of
+            // the truth, and an auditor with tcpdump would have read the gap as
+            // a false claim rather than as a missing summand. TOTAL is what the
+            // wire shows; the split says which of it is on the template path,
+            // and that summand is the claim.
+            const unsigned long long node_rpc  = ns.rpc_calls;
+            const unsigned long long poll_rpc  = transport.tip_poll_calls();
+            const unsigned long long other_rpc = transport.other_calls();
+            std::printf("  wire RPC to monerod: TOTAL=%llu = template-path %llu "
+                        "+ node(parity+submit) %llu + tip-poll %llu + pool-other %llu"
+                        " [failures node=%llu pool=%llu]\n",
+                        node_rpc + poll_rpc + other_rpc,
+                        static_cast<unsigned long long>(native->source().daemon_pumps()),
+                        node_rpc, poll_rpc, other_rpc,
+                        static_cast<unsigned long long>(ns.rpc_failures),
+                        static_cast<unsigned long long>(transport.rpc_failures()));
+            if (auto* mon = native->node()->monerod_source())
+                std::printf("  daemon arm: cache age=%llums (limit %llums)%s\n",
+                            static_cast<unsigned long long>(mon->age_ms()),
+                            static_cast<unsigned long long>(mon->config().max_age_ms),
+                            mon->stale() ? " STALE -- not READY" : "");
+            if (auto* orc2 = native->oracle())
+                std::printf("  P-TPL backlog constraint: %s\n",
+                            orc2->backlog_famine().c_str());
             // The parity probe is drained HERE, on the status cadence, so it is
             // never in front of a miner (the DASH shadow-compare rule).
             std::string pw;
@@ -805,6 +858,8 @@ int main(int argc, char** argv) {
             const std::string m = next("on");
             cfg.native_template_fallback = !(m == "off" || m == "0" || m == "false");
         }
+        else if (a == "--native-backlog-refresh") cfg.native_backlog_refresh_s =
+                     static_cast<std::uint64_t>(std::stoull(next("0")));
         else if (a == "--native-ready-timeout") cfg.native_ready_timeout_s =
                      static_cast<std::uint32_t>(std::stoul(next("120")));
         else if (a == "--lane-chain") cfg.lane_chain =
@@ -860,7 +915,11 @@ int main(int argc, char** argv) {
                 "  --native-template-fallback <on|off>\n"
                 "                               on (default): serve from monerod when the native arm\n"
                 "                               is not ready. off: native-only, fail-closed.\n"
-                "  --native-ready-timeout <s>   how long to wait for the native arm (default 120)\n");
+                "  --native-ready-timeout <s>   how long to wait for the native arm (default 120)\n"
+                "  --native-backlog-refresh <s> rebuild the template when the POOL moves, at most\n"
+                "                               once per <s> seconds (0 = tip-only, the default:\n"
+                "                               a tip-only arm serves the empty template built at\n"
+                "                               the start of each block interval)\n");
             return 0;
         }
     }

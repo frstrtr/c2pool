@@ -106,6 +106,12 @@ struct NativeTemplateConfig {
     // "alone", so the publication gate is set rather than inferred (OR-C2-8).
     bool                     force_synced = false;
 
+    // Rebuild the served template when the POOL moves, not only when the tip
+    // does, at most once per this many seconds. 0 = tip-only, which is what
+    // shipped and is byte-identical to it. See NativeNodeConfig for why a
+    // tip-only native arm collects almost no fees.
+    std::uint64_t            backlog_refresh_s = 0;
+
     // A build without librandomx cannot check proof of work. Opt-in, loud.
     bool                     allow_unverified_pow = false;
 
@@ -144,6 +150,7 @@ public:
         nc.serve_arm            = cfg_.serve;
         nc.template_fallback    = cfg_.fallback;
         nc.force_synced         = cfg_.force_synced;
+        nc.backlog_refresh_s    = cfg_.backlog_refresh_s;
 
         node_ = std::make_unique<nrt::NativeNode>(std::move(nc));
         if (!node_->start(why)) { node_.reset(); return false; }

@@ -193,6 +193,24 @@ struct NativeNodeConfig {
     std::string              parity_ledger_path;
     std::string              c2pool_commit;        // one of the four graduation keys
 
+    // THE BACKLOG REBUILD TRIGGER, in seconds. 0 -- the default, and what M0
+    // through M2 shipped -- means TIP-ONLY: the served template is rebuilt when
+    // the parent tip moves and at no other time.
+    //
+    // That default is byte-stable for miners already grinding a job, and it is
+    // also why a native arm collects almost no fees. A block CONSUMES the pool,
+    // so at the instant of the tip move the pool is empty; everything that
+    // arrives during the block interval waits for the NEXT tip move, by which
+    // time somebody else has mined it. The template served for the whole
+    // interval is the empty one built at its start.
+    //
+    // A non-zero value admits the pool's backlog_version as a second rebuild
+    // trigger, RATE-LIMITED to at most one admission per this many seconds --
+    // which is the same bargain monerod's own get_block_template callers strike.
+    // The cost is real and is why it is opt-in: a rebuild restamps the header
+    // timestamp under miners mid-grind and shortens the retained job ring.
+    std::uint64_t            backlog_refresh_s = 0;
+
     TemplateArm              serve_arm = TemplateArm::Native;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
     // production posture (a pool that stops serving templates stops paying its
@@ -248,6 +266,10 @@ struct NodeStatus {
     // because the chain is quiet are the same picture without this flag.
     bool                         txpool_gate_open = false;
     std::uint64_t                rpc_calls = 0;
+    // Failed round trips on that same transport. A parity arm that is silently
+    // failing every call still reports rpc_calls climbing, so the count alone
+    // cannot distinguish "the judge is answering" from "the judge is gone".
+    std::uint64_t                rpc_failures = 0;
     std::string                  template_arm;
     std::string                  io_threads;
     std::string                  verify_thread;
@@ -451,6 +473,7 @@ public:
         s.txpool       = txpool_.stats();
         s.txpool_gate_open = tx_gate_.load();
         s.rpc_calls    = rpc_ ? rpc_->calls() : 0;
+        s.rpc_failures = rpc_ ? rpc_->failures() : 0;
         if (witness_) s.randomx = witness_->witness();
         s.randomx_mode = index_.pow_gate().mode();
         if (arms_)    s.template_arm = arms_->describe();
@@ -657,6 +680,7 @@ private:
         // On a private chain one pinned peer is the correct configuration, so
         // the peer floor is off; it is a flag rather than a refusal anyway.
         p.min_peers = 0;
+        p.backlog_refresh_s = cfg_.backlog_refresh_s;
         return p;
     }
 
