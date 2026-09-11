@@ -246,6 +246,7 @@ jobs:
                     xmr_native_block_relay_kat xmr_c5_regtest_push \
                     xmr_native_parity_kat xmr_native_txpool_parity_kat \
                     xmr_native_node_kat xmr_native_node \
+                    v37_xmr_m2_native_settlement_kat \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
@@ -685,6 +686,7 @@ jobs:
                     xmr_native_block_relay_kat xmr_c5_regtest_push \
                     xmr_native_parity_kat xmr_native_txpool_parity_kat \
                     xmr_native_node_kat xmr_native_node \
+                    v37_xmr_m2_native_settlement_kat \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
                  # xmr_provenance_gate: previously omitted here because
                  # -fsanitize=undefined rejected its constexpr pointer comparison
