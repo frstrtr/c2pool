@@ -83,6 +83,35 @@ inline const char* to_string(TemplateSourceMode m) {
     return m == TemplateSourceMode::Native ? "native" : "monerod";
 }
 
+// M3 (R-ARMORDER): which arm drives the FIND path -- the parent tip the
+// template is built on, the block-presence test the finalize driver asks, and
+// the arm a found block goes out on.
+//
+//   DaemonFirst (the DEFAULT, and what M0..M2h shipped): monerod drives. The
+//     tip arrives through LiveMonerodTransport's get_miner_data poll (or ZMQ),
+//     the MonerodAdapter's MainchainIndex answers "is this block still at this
+//     height", and a found block is published with submit_block. The native
+//     node may still BUILD the template (--xmr-template-source native), which
+//     is what M2h proved; the daemon stays on the find path either way.
+//
+//   P2PFirst: the embedded native node drives, end to end. Its levin-driven C2
+//     chain index is the tip, the same index answers the finalize driver's
+//     canonical test, and a found block goes out over levin as a 2008
+//     NOTIFY_NEW_FLUFFY_BLOCK (C5 ARM A, ArmOrder::P2pOnly). monerod is NOT
+//     consulted anywhere on that path -- not for the tip, not for the
+//     template, not for the submit. It may still be configured, and is then
+//     read ONLY by the C6 parity oracle off the status cadence, which is not
+//     the find path and is counted separately so the claim stays falsifiable.
+//
+// A runtime switch and not a build flag on purpose: daemon-assisted bring-up
+// and the daemonless posture are the same binary, and an operator moving
+// between them should not have to trust two builds to be the same program.
+enum class ArmOrderMode : std::uint8_t { DaemonFirst = 0, P2PFirst = 1 };
+
+inline const char* to_string(ArmOrderMode m) {
+    return m == ArmOrderMode::P2PFirst ? "p2p-first" : "daemon-first";
+}
+
 inline const char* to_string(CoinbaseMode m) {
     switch (m) {
         case CoinbaseMode::MonerodTemplate: return "monerod-template (option A)";
@@ -236,6 +265,20 @@ struct XmrNodeConfig {
     // is why the default does not move.
     std::uint64_t   native_backlog_refresh_s = 0;
 
+    // --- M3: the arm order on the FIND path ---------------------------------
+    // --arm-order daemon-first (default) | p2p-first. See ArmOrderMode above.
+    // p2p-first is fail-closed on its preconditions: it REFUSES to start unless
+    // the coinbase is the v37 settlement coinbase built from the native arm,
+    // because a daemonless find whose template came from a daemon is not one.
+    ArmOrderMode    arm_order = ArmOrderMode::DaemonFirst;
+    // --no-daemon-rpc: do not configure a monerod RPC endpoint for the embedded
+    // node AT ALL. Meaningful only with p2p-first, where it is the difference
+    // between "no daemon call on the find path" (a claim about which of the
+    // calls are where) and "no daemon call" (a claim a packet capture settles in
+    // one line). The C6 parity oracle then has no judge and scores its samples
+    // VOID, which is the honest cost and is exactly why this is not the default.
+    bool            no_daemon_rpc = false;
+
     // --- storage ------------------------------------------------------------
     // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).
     // Set to override the settlement-store directory (tests set a temp dir).
@@ -254,5 +297,31 @@ struct XmrNodeConfig {
     // to keep this header free of <filesystem>/core includes for cheap inclusion.
     std::string resolved_settle_db_path() const;
 };
+
+// M3: the arm-order preconditions, as a PURE function of the configuration, so
+// that the rules the daemon refuses on are the rules a KAT can pin. Returns ""
+// when the configuration is coherent, otherwise why it is refused.
+//
+// A daemonless FIND is a claim about three things at once -- the tip, the
+// template and the publish -- and only the first of them is the arm order's own.
+// Option A's block bytes ARE monerod's get_block_template, and the monerod
+// template source is a get_miner_data round trip per refresh; either of them
+// under p2p-first would leave a daemon on the find path while the flag said
+// otherwise. Refusing is the only honest answer, and it is given before
+// anything starts rather than degraded into a mode whose name has stopped
+// describing it.
+inline std::string arm_order_refusal(const XmrNodeConfig& c) {
+    if (c.arm_order != ArmOrderMode::P2PFirst) return {};
+    if (c.coinbase != CoinbaseMode::V37Settlement)
+        return "--arm-order p2p-first requires --coinbase v37: option A's block IS monerod's "
+               "get_block_template, so a daemonless find of it is a contradiction";
+    if (c.template_source != TemplateSourceMode::Native)
+        return "--arm-order p2p-first requires --xmr-template-source native: a find path whose "
+               "template came from get_miner_data is not daemonless";
+    if (c.native_connect.empty())
+        return "--arm-order p2p-first requires at least one --native-connect <ip:port> levin peer: "
+               "with no peer there is no chain to find on and nowhere to relay a found block";
+    return {};
+}
 
 } // namespace c2pool::v37n::xmr

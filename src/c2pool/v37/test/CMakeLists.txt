@@ -371,6 +371,39 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_m2_native_settlement_kat PRIVATE xmr_template xmr_node xmr_coin)
     add_test(NAME v37_xmr_m2_native_settlement_kat COMMAND v37_xmr_m2_native_settlement_kat)
 
+    # ------------------------------------------------------------------
+    # M3 — R-ARMORDER, the switchable FIND path.
+    #
+    #   v37_xmr_m3_arm_order_kat
+    #     Pins BOTH positions of the switch against one counting monerod
+    #     transport. daemon-first must still build the X2 adapter and TOUCH the
+    #     daemon (a zero there would be the default path having broken, not M3
+    #     having worked); p2p-first must build no adapter and make EXACTLY ZERO
+    #     touches across bring-up and a complete FOUND -> SETTLED driven by a
+    #     pumped native chain. It also pins the fail-closed rules: the arm-order
+    #     preconditions as a pure function, bring_up refusing p2p-first with no
+    #     canonical test installed, and the levin publisher refusing to push a
+    #     FOUND event for a block that reached no peer.
+    #
+    #     No sockets, no RandomX, no live daemon -- it links xmr_node for the
+    #     node + X2 adapter and xmr_coin for the keccak and block parsing C5
+    #     needs, and injects a test point-check rather than the ref10 registrar.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_m3_arm_order_kat v37_xmr_m3_arm_order_kat.cpp)
+    target_compile_features(v37_xmr_m3_arm_order_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_m3_arm_order_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_m3_arm_order_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_m3_arm_order_kat COMMAND v37_xmr_m3_arm_order_kat)
+
     # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.
     # Proves the gap the Phase-B single-node daemon had: node B accounts node A's
     # shares. Wires the SAME production consumer code the daemon does — the W3

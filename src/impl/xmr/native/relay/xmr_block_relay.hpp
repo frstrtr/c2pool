@@ -377,14 +377,14 @@ public:
         }
 
         // --- 4. the 2008 frame --------------------------------------------
-        std::vector<std::uint8_t> frame;
+        std::vector<std::uint8_t> body2008;
         if (!p2p_suppressed) {
             std::string why;
-            if (!build_fluffy_frame(req.block_blob,
-                                    m_cfg.policy.include_all_tx_bodies ? bodies
-                                                                       : std::vector<TxBlobEntry>{},
-                                    height + 1u,   // rule 6: OUR height after this block
-                                    frame, why)) {
+            if (!build_fluffy_body(req.block_blob,
+                                   m_cfg.policy.include_all_tx_bodies ? bodies
+                                                                      : std::vector<TxBlobEntry>{},
+                                   height + 1u,   // rule 6: OUR height after this block
+                                   body2008, why)) {
                 p2p_suppressed = true;
                 p2p_why        = "2008 encode failed: " + why;
             }
@@ -401,19 +401,19 @@ public:
                     p2p_suppressed = true;
                     if (p2p_why.empty()) p2p_why = "daemon arm rejected the block";
                 } else {
-                    fire_p2p(frame, v, p2p_suppressed);
+                    fire_p2p(body2008, v, p2p_suppressed);
                 }
                 break;
             }
             case ArmOrder::Parallel: {
                 // Daemonless-primary: P2P first, always, and the daemon is the
                 // on-demand backup behind it.
-                fire_p2p(frame, v, p2p_suppressed);
+                fire_p2p(body2008, v, p2p_suppressed);
                 fire_daemon(req, v);
                 break;
             }
             case ArmOrder::P2pOnly: {
-                fire_p2p(frame, v, p2p_suppressed);
+                fire_p2p(body2008, v, p2p_suppressed);
                 break;
             }
         }
@@ -498,7 +498,7 @@ public:
         }
 
         std::string why;
-        if (!build_fluffy_frame(blob, wanted, height + 1u, reply_frame, why)) {
+        if (!build_fluffy_body(blob, wanted, height + 1u, reply_frame, why)) {
             say(true, "2009: could not encode the reply for " + hex(block_id) + ": " + why);
             reply_frame.clear();
             return decline();
@@ -624,11 +624,25 @@ private:
         return true;
     }
 
-    static bool build_fluffy_frame(const std::vector<std::uint8_t>& block_blob,
-                                   const std::vector<TxBlobEntry>&  txs,
-                                   std::uint64_t                    our_height,
-                                   std::vector<std::uint8_t>&       frame,
-                                   std::string&                     why) {
+    // THE BODY, NOT A FRAME. IBroadcastPort takes the epee-encoded MESSAGE BODY
+    // and the transport writes the 33-byte levin bucket header around it
+    // (LevinLink::send_notify -> make_notify). Building a complete frame here
+    // and handing THAT to broadcast_notify produced a doubly-framed 2008: the
+    // receiving daemon read our outer header, then tried to parse the inner
+    // header as portable_storage, and answered
+    //
+    //     portable_storage: wrong binary format - signature mismatch
+    //     Failed to load_from_binary in notify 2008
+    //
+    // for every block we sent -- so the block reached the peer's socket and
+    // never reached its chain. Found by running the relay against a real
+    // monerod; no fake port could have shown it, because a fake port frames
+    // nothing, and the peers-written count looked perfect the whole time.
+    static bool build_fluffy_body(const std::vector<std::uint8_t>& block_blob,
+                                  const std::vector<TxBlobEntry>&  txs,
+                                  std::uint64_t                    our_height,
+                                  std::vector<std::uint8_t>&       body,
+                                  std::string&                     why) {
         levin::NewBlock m;
         m.b.block_blob                = block_blob;
         m.b.txs                       = txs;
@@ -636,20 +650,19 @@ private:
         m.b.block_weight_claimed_hint = 0;       // a hint we do not need to send
         m.current_blockchain_height   = our_height;
 
-        std::vector<std::uint8_t> body;
-        levin::MessageError       err = levin::MessageError::None;
+        levin::MessageError err = levin::MessageError::None;
         if (!levin::encode_new_fluffy_block(m, body, err)) {
             why = levin::to_string(err);
             return false;
         }
-        frame = levin::make_notify(levin::CMD_NEW_FLUFFY_BLOCK, body);
         return true;
     }
 
-    void fire_p2p(const std::vector<std::uint8_t>& frame, BlockRelayVerdict& v,
+    // `body` is the epee message body; the transport adds the levin header.
+    void fire_p2p(const std::vector<std::uint8_t>& body, BlockRelayVerdict& v,
                   bool suppressed) {
-        if (suppressed || frame.empty()) return;
-        const std::size_t n = m_port.broadcast_notify(levin::CMD_NEW_FLUFFY_BLOCK, frame);
+        if (suppressed || body.empty()) return;
+        const std::size_t n = m_port.broadcast_notify(levin::CMD_NEW_FLUFFY_BLOCK, body);
         v.p2p_peers_sent    = n;
         {
             std::lock_guard<std::mutex> lk(m_mx);
