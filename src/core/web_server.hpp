@@ -1855,6 +1855,13 @@ private:
     // Prev-cumulative snapshots for the per-interval diff (only touched from
     // update_stat_log, which runs single-threaded on the stat-log timer).
     uint64_t m_stat_shares_prev{0};
+    // Per-session cumulative accepted-share counters from the previous
+    // update_stat_log() tick; diffed to derive local_share_hash_rates
+    // (share-work H/s) directly from accepted+vardiff, no proxy. Keyed by
+    // stratum session id; a session that drops between ticks simply has no
+    // baseline next tick and contributes 0 (same discipline as m_stat_shares_prev).
+    std::map<std::string, uint64_t> m_share_accepted_prev;
+    double m_share_sample_prev_time{0.0};  // wall-clock of previous tick; 0 = none yet
     uint64_t m_stat_stale_prev{0};
 
     // Stat log for /web/log JSON endpoint (rolling 24h window)
@@ -1865,6 +1872,7 @@ private:
         double network_difficulty{0};   // chain difficulty snapshot at sample time
         double share_difficulty{0};     // real share (vardiff) difficulty; honest-absent 0
         nlohmann::json local_hash_rates;       // {addr: hashrate}
+        nlohmann::json local_share_hash_rates; // {addr: share-work H/s = accepted-delta * vardiff * 2^32 / dt}
         nlohmann::json local_dead_hash_rates;  // {addr: dead_hashrate}
         int worker_count{0};              // unique address.worker combos
         int miner_count{0};               // unique base addresses

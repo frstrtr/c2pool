@@ -7914,7 +7914,7 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
             result.push_back({entry.time, total, bin_width, 0});
         }
         else if (source == "local_share_hash_rates") {
-            result.push_back({entry.time, entry.local_hash_rates, bin_width, 0});
+            result.push_back({entry.time, entry.local_share_hash_rates, bin_width, 0});
         }
         else if (source == "miner_hash_rates") {
             result.push_back({entry.time, entry.local_hash_rates, bin_width, 0});
@@ -8163,6 +8163,36 @@ void MiningInterface::update_stat_log()
         }
         entry.miner_count = static_cast<int>(entry.local_hash_rates.size());
         entry.worker_count = static_cast<int>(worker_combos.size());
+
+        // Share-derived local hash rate — the REAL local_share_hash_rates
+        // series (formerly an alias of the measured-hashrate tracker). For each
+        // stratum session, diff its cumulative accepted-share counter since the
+        // previous tick and convert to hash-work: d_shares * vardiff * 2^32 / dt.
+        // Aggregated by payout address, from the SAME accepted+difficulty the
+        // getstats path reports, so it never fabricates: the first tick (no
+        // baseline) and any dt<=0 emit honest-absent (no entry), and a session
+        // whose counter dropped on reconnect contributes 0, not a negative spike.
+        entry.local_share_hash_rates = nlohmann::json::object();
+        {
+            const double now_t = entry.time;
+            const double dt = now_t - m_share_sample_prev_time;
+            std::map<std::string, uint64_t> cur_accepted;
+            for (const auto& [sid, w] : workers) cur_accepted[sid] = w.accepted;
+            if (m_share_sample_prev_time > 0.0 && dt > 0.0) {
+                for (const auto& [sid, w] : workers) {
+                    auto it = m_share_accepted_prev.find(sid);
+                    if (it == m_share_accepted_prev.end()) continue;  // new session, no baseline
+                    if (w.accepted <= it->second) continue;           // reset/reconnect -> 0, no spike
+                    uint64_t d_shares = w.accepted - it->second;
+                    double rate = static_cast<double>(d_shares) * w.difficulty
+                                  * 4294967296.0 / dt;  // 2^32
+                    double existing = entry.local_share_hash_rates.value(w.username, 0.0);
+                    entry.local_share_hash_rates[w.username] = existing + rate;
+                }
+            }
+            m_share_accepted_prev.swap(cur_accepted);
+            m_share_sample_prev_time = now_t;
+        }
     }
 
     // unique_miner_count fallback for the daemonless relay: with 0 local stratum
@@ -8524,7 +8554,7 @@ void MiningInterface::feed_history_entry(const StatLogEntry& e)
     m_history.add_scalar("local_hash_rate",      t, json_obj_sum(e.local_hash_rates));
     m_history.add_scalar("local_dead_hash_rate", t, json_obj_sum(e.local_dead_hash_rates));
 
-    m_history.add_multi("local_share_hash_rates", t, json_obj_to_map(e.local_hash_rates));
+    m_history.add_multi("local_share_hash_rates", t, json_obj_to_map(e.local_share_hash_rates));
     m_history.add_multi("miner_hash_rates",       t, json_obj_to_map(e.local_hash_rates));
     m_history.add_multi("miner_dead_hash_rates",  t, json_obj_to_map(e.local_dead_hash_rates));
 
@@ -8743,6 +8773,7 @@ void MiningInterface::save_stat_log()
                 nlohmann::json one = {
                     {"t", e.time}, {"phr", e.pool_hash_rate}, {"psp", e.pool_stale_prop},
                     {"lhr", e.local_hash_rates}, {"ldhr", e.local_dead_hash_rates},
+                    {"lshr", e.local_share_hash_rates},
                     {"wc", e.worker_count}, {"mc", e.miner_count}, {"cc", e.connected_count},
                     {"sh", e.shares}, {"st", e.stale_shares},
                     {"cp", e.current_payout}, {"cps", e.current_payouts},
@@ -8832,6 +8863,7 @@ void MiningInterface::load_stat_log()
             e.pool_hash_rate = j.value("phr", 0.0);
             e.pool_stale_prop = j.value("psp", 0.0);
             e.local_hash_rates = j.value("lhr", nlohmann::json::object());
+            e.local_share_hash_rates = j.value("lshr", nlohmann::json::object());
             e.local_dead_hash_rates = j.value("ldhr", nlohmann::json::object());
             e.worker_count = j.value("wc", 0);
             e.miner_count = j.value("mc", 0);
