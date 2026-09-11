@@ -52,9 +52,12 @@
 // WHAT IS DELIBERATELY NOT DRIVEN HERE. C5's relay is CONSTRUCTED and its 2009
 // responder is armed, but nothing in M0 calls relay(): a found block comes from
 // the stratum/settlement path, which is M3. C4's arms are constructed and
-// readable; rebinding the option-B settlement provider through them is M2. The
-// txpool is fed from levin and selectable, but M1 is where its per-transaction
-// equality against monerod's pool is proven. Each of those is wired to the seam
+// readable; rebinding the option-B settlement provider through them is M2.
+//
+// The txpool IS now driven: M1 added the P-POOL seam (txpool_parity_sample()),
+// the harness injection port (inject_relayed()), and publish_tx_gate_() -- the
+// C2 -> C3 sync gate M0 left unwired, without which the pool refused every
+// transaction that ever reached it. Each remaining item is wired to its seam
 // and left unexercised ON PURPOSE, so that the milestone that owns it has
 // something to prove rather than something to discover.
 //
@@ -95,6 +98,7 @@
 #include "impl/xmr/native/p2p/xmr_peer_pool.hpp"
 #include "impl/xmr/native/parity/xmr_parity_oracle.hpp"
 #include "impl/xmr/native/parity/xmr_parity_report.hpp"
+#include "impl/xmr/native/parity/xmr_txpool_parity.hpp"
 #include "impl/xmr/native/relay/xmr_block_relay.hpp"
 #include "impl/xmr/native/template/xmr_monerod_miner_data.hpp"
 #include "impl/xmr/native/template/xmr_native_miner_data.hpp"
@@ -233,6 +237,10 @@ struct NodeStatus {
     RandomXMode                  randomx_mode = RandomXMode::Disabled;
     ChainBoot::Stats             boot{};
     TxpoolStats                  txpool{};
+    // C3's relay gate, as last published by publish_tx_gate_(). A pool that
+    // holds nothing because the gate is shut and a pool that holds nothing
+    // because the chain is quiet are the same picture without this flag.
+    bool                         txpool_gate_open = false;
     std::uint64_t                rpc_calls = 0;
     std::string                  template_arm;
     std::string                  io_threads;
@@ -303,6 +311,11 @@ public:
             rpc_    = std::make_unique<MonerodHttp>(cfg_.monerod_rpc_host, cfg_.monerod_rpc_port);
             mon_src_ = std::make_unique<tmpl::MonerodMinerDataSource>(*rpc_);
             mon_tip_ = std::make_unique<parity::MonerodTipObserver>(*rpc_);
+            // M1's P-POOL arm. Constructed whenever a daemon endpoint is, so
+            // that "the probe was never armed" is impossible to confuse with
+            // "the probe found nothing": without an arm txpool_parity_sample()
+            // returns an UNJUDGED report that says so.
+            mon_pool_ = std::make_unique<parity::MonerodTxpoolObserver>(*rpc_);
         }
 
         tmpl::TemplateArmConfig arm_cfg;
@@ -429,6 +442,7 @@ public:
         s.pool_queue   = pool_loop_.stats();
         s.boot         = boot_.stats();
         s.txpool       = txpool_.stats();
+        s.txpool_gate_open = tx_gate_.load();
         s.rpc_calls    = rpc_ ? rpc_->calls() : 0;
         if (witness_) s.randomx = witness_->witness();
         s.randomx_mode = index_.pow_gate().mode();
@@ -462,6 +476,145 @@ public:
         if (!oracle_) return out;
         if (mon_tip_) (void)mon_tip_->poll();
         verify_loop_.call([this, &out] { out = oracle_->drain(); });
+        return out;
+    }
+
+    // -----------------------------------------------------------------------
+    // M1: the P-POOL seam.
+    //
+    // ONE SAMPLE IS A COHERENT CAPTURE OR IT IS NOTHING. Three things have to be
+    // true of it or the comparison is between two different questions:
+    //
+    //   * the native index must not have adopted a tip between the two reads --
+    //     a connected block drops mined transactions from BOTH pools, but not at
+    //     the same instant, so a sample that straddles one manufactures a set
+    //     difference out of nothing;
+    //   * the daemon must be at the same tip we are, for the same reason;
+    //   * both arms must actually have answered.
+    //
+    // Any of those failing yields an UNJUDGED report with a reason, which the
+    // tally counts as unjudged and never as agreement.
+    //
+    // The daemon round trip happens on the CALLER's thread and the native reads
+    // happen where their owners live: the tip on the verify thread, the pool
+    // facts under the pool's own mutex. Nothing here touches the io thread.
+    parity::TxpoolParityReport txpool_parity_sample() {
+        parity::TxpoolParityReport rep;
+        if (!mon_pool_) {
+            rep.why = "no monerod arm configured (--monerod-rpc)";
+            pool_tally_.add(rep);
+            return rep;
+        }
+
+        auto tip_key = [this](std::uint64_t& h, Hash& prev, Hash& id, bool& synced) {
+            verify_loop_.call([&] {
+                const ChainRow* t = index_.view().state().tip();
+                synced = index_.view().sync_state().synced;
+                if (t == nullptr) { h = 0; prev = Hash{}; id = Hash{}; synced = false; return; }
+                h = t->height; prev = t->prev_id; id = t->id;
+            });
+        };
+
+        std::uint64_t h0 = 0, h1 = 0;
+        Hash prev0{}, prev1{}, id0{}, id1{};
+        bool synced0 = false, synced1 = false;
+        tip_key(h0, prev0, id0, synced0);
+        if (!synced0) {
+            rep.why = "native index has no synced tip yet";
+            pool_tally_.add(rep);
+            return rep;
+        }
+
+        // The daemon's answer carries its own `why` when it could not answer, so
+        // the return value is not consulted: an unanswered arm must reach the
+        // comparator as an unanswered arm, not as an early return that loses the
+        // reason.
+        (void)mon_pool_->poll();
+        const std::vector<TxpoolFact> ours = txpool_.facts();
+
+        tip_key(h1, prev1, id1, synced1);
+        if (h0 != h1 || id0 != id1) {
+            rep.height = h1;
+            rep.why    = "incoherent capture: the native tip moved from height "
+                       + std::to_string(h0) + " to " + std::to_string(h1)
+                       + " while the two pools were being read";
+            pool_tally_.add(rep);
+            return rep;
+        }
+
+        if (mon_tip_) {
+            // Poll the daemon's tip HERE rather than reading the cache the
+            // P-TIP path filled. That cache is refreshed only when a new tip
+            // arrives, so between blocks it can be seconds old -- and a stale
+            // "the daemon is at our height" standing next to a LIVE read of the
+            // daemon's pool is exactly the incoherent capture this guard exists
+            // to refuse. Two extra RPCs per sample is what coherence costs.
+            (void)mon_tip_->poll();
+            const parity::ArmObservation& t = mon_tip_->observe();
+            if (!t.have || t.height != h1) {
+                rep.height = h1;
+                rep.why = t.have
+                    ? ("arms are at different tips: native " + std::to_string(h1)
+                       + ", monerod " + std::to_string(t.height))
+                    : ("monerod tip unknown: " + t.why);
+                pool_tally_.add(rep);
+                return rep;
+            }
+        }
+
+        parity::PoolSnapshot native;
+        native.arm  = "native";
+        native.have = true;
+        native.txs.reserve(ours.size());
+        for (const TxpoolFact& f : ours) {
+            parity::PoolTxObs o;
+            o.id        = f.id;
+            o.weight    = parity::Obs::u64(f.weight);
+            o.fee       = parity::Obs::u64(f.fee);
+            o.blob_size = parity::Obs::u64(f.blob_size);
+            o.peers     = parity::Obs::u64(f.peers);
+            o.evidence  = parity::Obs::u64(static_cast<std::uint64_t>(f.evidence));
+            native.txs.push_back(std::move(o));
+        }
+
+        const parity::PoolSnapshot& theirs = mon_pool_->observe();
+
+        parity::ClassifierInputs cls;
+        cls.height = h1;
+        rep = parity::compare_txpools(native, theirs, h1, prev1, cls);
+        pool_tally_.add(rep);
+        return rep;
+    }
+
+    const parity::TxpoolParityTally& txpool_tally() const noexcept { return pool_tally_; }
+    bool has_monerod_pool_arm() const noexcept { return mon_pool_ != nullptr; }
+
+    // -----------------------------------------------------------------------
+    // HARNESS SEAM (M1). Feed a transaction blob to C3 as if a peer had relayed
+    // it, and hand back the verdict.
+    //
+    // This is not a back door around the levin path: it is the SAME
+    // IRelayedTxSink entry point C1 calls, run on the SAME pool thread, with a
+    // PeerRef that says where it came from. It exists because two of M1's
+    // proofs are about what the pool does with a transaction the daemon will
+    // never relay to us -- the key-image twin, and the blob a wallet built with
+    // do_not_relay so that the daemon and the native pool can be made to hold
+    // DIFFERENT members of one double spend on purpose. There is no way to ask
+    // a real peer for that.
+    //
+    // Nothing in the node calls it; only the harness does.
+    TxRelayVerdict inject_relayed(std::vector<std::uint8_t> blob, std::uint64_t peer_id,
+                                  bool fluff = true) {
+        TxRelayVerdict out;
+        PeerRef from;
+        from.peer_id = peer_id;
+        from.addr    = "harness-injected";
+        std::vector<std::vector<std::uint8_t>> batch;
+        batch.push_back(std::move(blob));
+        pool_loop_.call([&] {
+            std::vector<TxRelayVerdict> v = txpool_.on_relayed(from, std::move(batch), fluff);
+            if (!v.empty()) out = v[0];
+        });
         return out;
     }
 
@@ -557,7 +710,10 @@ private:
         tick_.async_wait([this](const boost::system::error_code& ec) {
             if (ec || !running_) return;
             const std::uint64_t now = now_ms_();
-            verify_loop_.post([this, now] { if (driver_) driver_->tick(now); },
+            verify_loop_.post([this, now] {
+                                  if (driver_) driver_->tick(now);
+                                  publish_tx_gate_();
+                              },
                               /*control=*/true);
             arm_tick_();
         });
@@ -570,6 +726,34 @@ private:
     }
 
     // ON THE VERIFY THREAD.
+    //
+    // C3's RELAY GATE. The txpool refuses every transaction with NotSynced
+    // until somebody tells it the index reached the tip -- monerod's
+    // is_synchronized() rule, and fail-closed by construction so that a node
+    // catching up never builds a template on a pool it could not have
+    // populated correctly.
+    //
+    // M0 wired C2 -> C3 for BLOCK events and left this one seam open: nothing
+    // in the tree called RelayedTxPool::set_synced(), so the gate was shut for
+    // the life of the process and the pool refused every transaction that ever
+    // arrived over levin. It is invisible from every angle M0 looked from --
+    // the tip follows, the peer is healthy, levin `txs=` counts the frames
+    // coming IN -- and the only symptom is a pool that stays empty, which on a
+    // quiet chain is also what success looks like. M1 is where the pool is
+    // finally asked what it holds, which is why M1 is where this surfaced.
+    //
+    // Published from the verify thread (which owns the sync state) onto the
+    // pool thread (which owns the gate), only on a CHANGE, so the steady state
+    // costs one atomic compare per driver tick.
+    void publish_tx_gate_() {
+        const bool synced = index_.view().sync_state().synced;
+        bool expected = !synced;
+        if (!tx_gate_.compare_exchange_strong(expected, synced)) return;
+        pool_loop_.post([this, synced] { txpool_.set_synced(synced); });
+        note_(std::string("[txpool] relay gate ") + (synced ? "OPEN" : "CLOSED")
+              + " (index synced=" + (synced ? "1" : "0") + ")");
+    }
+
     void on_mainchain_(const node::MainchainEvent& ev) {
         if (ev.kind == node::MainchainEventKind::Orphan) return;
         TipRecord r;
@@ -601,6 +785,9 @@ private:
             if (tips_.size() > 8192) tips_.erase(tips_.begin());
         }
         if (oracle_) oracle_->on_tip(ev, "native");
+        // The gate is published here as well as on the driver tick so that it
+        // opens on the block that closed the sync, not up to a tick later.
+        publish_tx_gate_();
     }
 
     void note_(const std::string& line) {
@@ -640,6 +827,8 @@ private:
     std::unique_ptr<MonerodHttp>                     rpc_;
     std::unique_ptr<tmpl::MonerodMinerDataSource>    mon_src_;
     std::unique_ptr<parity::MonerodTipObserver>      mon_tip_;
+    std::unique_ptr<parity::MonerodTxpoolObserver>   mon_pool_;
+    parity::TxpoolParityTally                        pool_tally_;
     std::unique_ptr<parity::ChainViewTipObserver>    native_tip_;
     std::unique_ptr<tmpl::ArmResolver>               arms_;
     std::unique_ptr<relay::LevinBlockRelay>          block_relay_;
@@ -647,6 +836,8 @@ private:
     std::unique_ptr<SyncDriver>                      driver_;
 
     std::atomic<bool>                     running_{false};
+    // The last value published to C3's relay gate; see publish_tx_gate_().
+    std::atomic<bool>                     tx_gate_{false};
     std::chrono::steady_clock::time_point epoch_ = std::chrono::steady_clock::now();
 
     mutable std::mutex        rec_mu_;

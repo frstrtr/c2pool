@@ -32,7 +32,29 @@
 namespace c2pool::xmr::native {
 
 // Which probe produced a sample.
-enum class ProbeKind : std::uint8_t { Tip = 0, Template = 1, Submit = 2 };
+//
+// CONTRACT AMENDMENT (M1). `Pool` is added to the three probes plan section
+// 4.10 pinned. It is an addition, not a redefinition -- the three existing
+// values keep their numbers, their seams and their field tables -- but it is a
+// change to the FROZEN TABLE SET the comparator is keyed on, so
+// parity::COMPARATOR_VERSION is bumped alongside it. That bump is the point: a
+// node graduated under a comparator that never looked at the transaction pool
+// must not inherit that clean streak into one that does.
+//
+// P-POOL is KEYED DIFFERENTLY from P-TIP and P-TPL, and the difference belongs
+// here rather than in the implementation. A tip sample is one question at one
+// height. A pool sample is a SET comparison: both arms are asked what their
+// pool holds at the same tip, the per-transaction comparison runs over the
+// INTERSECTION, and the two set differences are carried as MEASUREMENTS. The
+// intersection is what can be judged; a difference is a fact about propagation
+// timing, and scoring it as failure would make the seam fail on nothing worse
+// than a transaction that had not reached us yet. What stops that from becoming
+// the blind spot the DASH incident was is a separate, cumulative claim the
+// probe keeps and the milestone is judged on: every id ever seen in the
+// daemon's pool must eventually have been compared field by field. A set
+// difference that never closes is therefore visible as an uncompared id, not as
+// a clean sample.
+enum class ProbeKind : std::uint8_t { Tip = 0, Template = 1, Submit = 2, Pool = 3 };
 
 // What kind of height the sample was taken at; a diff at an epoch edge or a
 // reorg means something different from a diff in the steady state.
