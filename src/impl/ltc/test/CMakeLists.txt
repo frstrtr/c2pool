@@ -33,7 +33,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # pool_rate_head_select.hpp, issue #1482) — verified best when live, else the
     # fastest LIVE raw head; stale-prop = stales/(lookbehind+stales). Pure
     # header-only KAT. Same folding rule: into the existing allowlisted target.
-    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp auto_ratchet_blocked_by_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp share_remove_owns_data_test.cpp share_message_unpack_bounds_test.cpp restart_reorg_supersede_test.cpp peer_block_pow_carry_test.cpp head_retention_test.cpp share_fetch_failover_test.cpp desired_request_pacer_test.cpp build_stops_test.cpp pool_rate_head_select_test.cpp template_topology_spend_test.cpp)
+    #
+    # ingest_bounds_test.cpp + ingest_ownership_test.cpp: the LTC inbound-share
+    # memory bounds that replace the rss_limit_mb self-abort (contabo
+    # 2026-09-09..11). The first is KAT + source-structural (IngestBudget,
+    # ancestor-walk depth bound, per-peer remembered-tx cap, and the guards that
+    # keep the cache eviction WIRED — its predecessor prune_shares had no call
+    # site at all). The second drives a REAL ltc::NodeImpl through
+    # processing_shares_phase2 to pin share OWNERSHIP: a dropped/duplicate/
+    # verify-failed/late-reply share is freed, an adopted one is not. Same
+    # folding rule: into the existing allowlisted target.
+    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp auto_ratchet_blocked_by_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp share_remove_owns_data_test.cpp share_message_unpack_bounds_test.cpp restart_reorg_supersede_test.cpp peer_block_pow_carry_test.cpp head_retention_test.cpp share_fetch_failover_test.cpp desired_request_pacer_test.cpp build_stops_test.cpp pool_rate_head_select_test.cpp template_topology_spend_test.cpp ingest_bounds_test.cpp ingest_ownership_test.cpp)
     target_link_libraries(share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc
