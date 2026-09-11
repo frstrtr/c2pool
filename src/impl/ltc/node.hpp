@@ -241,12 +241,14 @@ protected:
     // `shares` path constructs HandleSharesData without them), so that path
     // cannot bypass the byte ceiling by reporting zero.
     static constexpr std::size_t INGEST_BYTES_FALLBACK_PER_SHARE = 4096;
-    // How many deferred batches ONE admission attempt may evict before it gives
-    // up and refuses. The eviction loop already stops when m_pending_adds runs
-    // empty; this is the second, explicit bound that keeps a single inbound
-    // message from walking the whole queue, and it makes the loop trivially
-    // non-spinning: every iteration erases one element, so it runs at most
-    // min(MAX_ADMIT_EVICTIONS, m_pending_adds.size()) times.
+    // How far into the deferred queue ONE admission attempt may look, and so
+    // the most batches it may evict. admit_or_evict_oldest() SUMS the
+    // reservation held by at most this many of the oldest entries and evicts
+    // only if that sum covers the shortfall, so this bounds a scan, not a
+    // destroy-and-retry loop: a single inbound message can never walk the whole
+    // queue, and it can never destroy anything at all unless the exchange it is
+    // paying for is fundable. When the shortfall is smaller, fewer go: the scan
+    // stops at the first entry that closes it.
     static constexpr std::size_t MAX_ADMIT_EVICTIONS = 64;
     IngestBudget m_ingest_budget{MAX_INFLIGHT_SHARES, MAX_INFLIGHT_BYTES};
     std::atomic<int64_t>  m_think_deadline_ns{0};

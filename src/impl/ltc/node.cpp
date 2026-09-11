@@ -401,8 +401,8 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         return pool::PeerConnectionType::legacy;
 }
 
-// Take the ingest reservation for one inbound batch, evicting the OLDEST
-// deferred batch when the budget is full.
+// Take the ingest reservation for one inbound batch, EXCHANGING it for the
+// oldest deferred batches when — and only when — those can actually cover it.
 //
 // WHY THIS EXISTS (convergence, not memory). The admission budget is a second,
 // tighter bound sitting UPSTREAM of MAX_PENDING_ADDS, and on its own it makes
@@ -420,19 +420,45 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
 // challenger-backfill shares) that a wedged node needs to converge; the oldest
 // queued batch is the most stale thing in the process.
 //
-// So: when the budget refuses, evict the OLDEST deferred batch and retry.
-// ~HandleSharesData frees that batch's shares AND hands its reservation back,
-// which is what makes the retry able to succeed.
+// So: when the budget refuses, hand back the reservation of the OLDEST deferred
+// batches and retry. ~HandleSharesData frees those batches' shares AND returns
+// their reservation, which is what makes the retry able to succeed.
 //
-// BOUNDED, and it cannot spin: every iteration erases exactly one element, the
-// loop stops as soon as m_pending_adds is empty, and it never runs more than
-// MAX_ADMIT_EVICTIONS times for one batch. A batch too large to fit even an
-// empty budget is refused up front, so it can never destroy other work for a
-// reservation it could never obtain. If neither path yields room we still
-// refuse, exactly as before: the memory bound is never exceeded.
+// AN EVICTION IS AN EXCHANGE, NEVER A SACRIFICE. The first cut of this function
+// erased first and asked afterwards: it evicted one batch at a time, retried,
+// and gave up only after MAX_ADMIT_EVICTIONS tries. That is wrong whenever the
+// budget is held by something OTHER than the deferred queue — which is exactly
+// the storm shape the budget was introduced for, because the phase-1 scrypt
+// verify backlog is the biggest holder of the reservation under an ingest
+// storm. In that shape the queue can never free enough, so the loop destroyed
+// up to 64 already-verified batches and then refused ANYWAY: strictly worse
+// than both predecessors (budget-only admission lost just the newest batch;
+// drop-OLDEST was one-for-one and always admitted). It was also weaponisable at
+// 64:1, because proof-of-work is only established in phase 1, i.e. AFTER
+// admission: a peer feeding well-formed but PoW-invalid shares through
+// Actual::HANDLER(shares) pins the budget with its own junk and then destroys
+// up to 64 honest, already-verified batches per subsequent message.
 //
-// The warning is kept, one line per eviction: this is a degraded mode and it
-// has to stay visible in the log, the way the pending_adds cap line is.
+// So the reservation held by the queue is now SUMMED FIRST, over at most
+// MAX_ADMIT_EVICTIONS entries, and the eviction happens only if free headroom
+// plus that sum covers the deficit. If it does not, we refuse WITHOUT
+// destroying anything: finished work is never spent on a reservation that
+// cannot be granted. And when it does cover, only the MINIMUM number of
+// batches goes — the scan stops at the first entry that closes the deficit, so
+// a small shortfall costs one batch, not the whole bound.
+//
+// BOUNDED, and it cannot spin: the scan visits at most
+// min(MAX_ADMIT_EVICTIONS, m_pending_adds.size()) entries, the erase is a
+// single contiguous range of exactly that many or fewer, and there is at most
+// one retry. A batch too large to fit even an empty budget is refused up front.
+// If neither path yields room we still refuse, exactly as before: the memory
+// bound is never exceeded.
+//
+// ONE summary line per admission attempt, not one per eviction. The degraded
+// mode has to stay visible in the log, the way the pending_adds cap line is,
+// but this runs on the single io thread and the per-eviction line it replaces
+// could emit 64 records — each one formatting a NetService — for a single
+// inbound message.
 //
 // REWARD-SAFE: this only changes WHICH batch is dropped when the node cannot
 // hold both, never whether any share is accepted. Both the evicted batch and a
@@ -445,6 +471,9 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
 // handlers and from the download_shares reply callback, both io-thread, and
 // m_pending_adds is only ever mutated on that same thread (the phase-2 defer
 // and the think() IO-phase drain). No lock is taken here and none is needed.
+// The budget counters are atomic because release() may run on a verify-pool
+// worker, but release only ever LOWERS them, so a concurrent release between
+// the sum below and the retry can only make the retry more likely to succeed.
 bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, const NetService& addr)
 {
     if (m_ingest_budget.try_admit(n, admit_bytes))
@@ -455,30 +484,62 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
     const bool unsatisfiable = (n > m_ingest_budget.max_shares())
                             || (admit_bytes > m_ingest_budget.max_bytes());
 
+    const std::size_t pending_before = m_pending_adds.size();
+    std::size_t need_shares      = 0;   // how much the reservation is short by
+    std::size_t need_bytes       = 0;
+    std::size_t freed_shares     = 0;   // what the scanned queue head would return
+    std::size_t freed_bytes      = 0;
+    std::size_t evicted          = 0;
+    bool admitted                = false;
+
     if (!unsatisfiable)
     {
-        for (std::size_t evicted = 0; evicted < MAX_ADMIT_EVICTIONS; ++evicted)
-        {
-            if (m_pending_adds.empty())
-                break;
+        const std::size_t used_shares = m_ingest_budget.shares();
+        const std::size_t used_bytes  = m_ingest_budget.bytes();
+        need_shares = (used_shares + n > m_ingest_budget.max_shares())
+                    ? (used_shares + n - m_ingest_budget.max_shares()) : 0;
+        need_bytes  = (used_bytes + admit_bytes > m_ingest_budget.max_bytes())
+                    ? (used_bytes + admit_bytes - m_ingest_budget.max_bytes()) : 0;
 
-            LOG_WARNING << "[INGEST] BACKPRESSURE: budget full for " << n
-                        << " shares / " << admit_bytes << " B from " << addr.to_string()
-                        << " (inflight=" << m_ingest_budget.shares() << "/"
+        // PRE-CHECK. Sum the reservation actually held by the oldest entries,
+        // stopping at the first one that closes the deficit (evict the minimum)
+        // and never looking past MAX_ADMIT_EVICTIONS entries (the bound).
+        const std::size_t horizon = std::min(MAX_ADMIT_EVICTIONS, m_pending_adds.size());
+        std::size_t take = 0;
+        while (take < horizon && (freed_shares < need_shares || freed_bytes < need_bytes))
+        {
+            const auto& batch = *m_pending_adds[take].data;
+            freed_shares += batch.admitted_shares();
+            freed_bytes  += batch.admitted_bytes();
+            ++take;
+        }
+
+        if (freed_shares >= need_shares && freed_bytes >= need_bytes)
+        {
+            // The exchange is fundable: erase exactly `take` entries. Each
+            // ~HandleSharesData frees that batch's shares and releases its
+            // reservation, which is what makes the retry below succeed.
+            m_pending_adds.erase(m_pending_adds.begin(),
+                                 m_pending_adds.begin() + static_cast<std::ptrdiff_t>(take));
+            evicted  = take;
+            admitted = m_ingest_budget.try_admit(n, admit_bytes);
+        }
+    }
+
+    if (admitted)
+    {
+        if (evicted != 0)
+            LOG_WARNING << "[INGEST] BACKPRESSURE: admitted " << n << " shares / "
+                        << admit_bytes << " B from " << addr.to_string()
+                        << " by evicting the " << evicted << " OLDEST of "
+                        << pending_before << " deferred batches (returned "
+                        << freed_shares << " shares / " << freed_bytes
+                        << " B, needed " << need_shares << " / " << need_bytes
+                        << "); inflight=" << m_ingest_budget.shares() << "/"
                         << m_ingest_budget.max_shares() << " shares, "
                         << m_ingest_budget.bytes() << "/" << m_ingest_budget.max_bytes()
-                        << " B); evicting the OLDEST deferred batch ("
-                        << m_pending_adds.front().data->m_items.size()
-                        << " shares, pending=" << m_pending_adds.size()
-                        << ") to admit the newer one: think() is behind";
-
-            // ~HandleSharesData frees the batch's shares and releases its
-            // reservation, which is what can make the retry below succeed.
-            m_pending_adds.erase(m_pending_adds.begin());
-
-            if (m_ingest_budget.try_admit(n, admit_bytes))
-                return true;
-        }
+                        << " B; think() is behind";
+        return true;
     }
 
     LOG_WARNING << "[INGEST] BACKPRESSURE: refusing " << n << " shares / "
@@ -487,8 +548,12 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
                 << m_ingest_budget.max_shares() << " shares, "
                 << m_ingest_budget.bytes() << "/" << m_ingest_budget.max_bytes()
                 << " B, pending=" << m_pending_adds.size()
-                << (unsatisfiable ? ", batch larger than the whole budget" : "")
-                << "); verify pool is behind, peer will re-offer";
+                << "); evicted " << evicted << " — "
+                << (unsatisfiable
+                        ? "batch larger than the whole budget"
+                        : "the deferred queue cannot cover the shortfall, so nothing "
+                          "was destroyed for it")
+                << "; verify pool is behind, peer will re-offer";
     return false;
 }
 

@@ -19,9 +19,18 @@
 // refused) and GREEN once admission evicts the oldest deferred batch and
 // retries.
 //
-// The bound is tested too, because an eviction retry is a loop: it must stop on
-// an empty queue, stop at MAX_ADMIT_EVICTIONS, never evict for a batch that
-// could not fit an empty budget, and never drive the counters negative.
+// AN EVICTION IS AN EXCHANGE, NEVER A SACRIFICE. The reservation held by the
+// queue head is summed BEFORE anything is erased, and the eviction happens only
+// if that sum covers the shortfall. When the budget is held by something the
+// queue cannot hand back — the phase-1 verify backlog, which is the biggest
+// holder under an ingest storm — the attempt refuses and destroys NOTHING.
+// Those two directions are the pair of tests at the bottom of this file.
+//
+// The bound is tested too, because eviction is still a scan over a queue: it
+// must stop on an empty queue, never look or erase past MAX_ADMIT_EVICTIONS,
+// never evict for a batch that could not fit an empty budget, take the MINIMUM
+// number of batches rather than draining to the bound, and never drive the
+// counters negative.
 //
 // Folded into the EXISTING allowlisted `share_test` target rather than a new
 // add_executable: a standalone target is absent from build.yml's --target list,
@@ -203,38 +212,155 @@ TEST(LtcIngestConvergence, BatchLargerThanTheWholeBudgetEvictsNothing)
     EXPECT_EQ(node.m_ingest_budget.shares(), 5u * kBatch);
 }
 
-// ── The retry is bounded and terminates ─────────────────────────────────
+// ── THE DEFECT THIS FILE USED TO ENSHRINE ───────────────────────────────
 //
-// Budget held by a large reservation that is NOT in the deferred queue (the
-// phase-1 verify backlog), plus a queue deeper than MAX_ADMIT_EVICTIONS. No
-// number of evictions can free enough, so the loop must stop at exactly
-// MAX_ADMIT_EVICTIONS, refuse, and leave the counters sane.
-TEST(LtcIngestConvergence, EvictionRetryStopsAtItsBoundAndDoesNotSpin)
+// The case that stood here, `EvictionRetryStopsAtItsBoundAndDoesNotSpin`,
+// asserted that an admission attempt which CANNOT possibly succeed still
+// destroys MAX_ADMIT_EVICTIONS already-verified batches on its way to refusing,
+// and called the resulting counters "sane". That is the futile mode written
+// down as a contract.
+//
+// It is the storm shape the budget exists for: under an ingest storm the
+// largest holder of the reservation is the phase-1 scrypt verify backlog, which
+// is NOT in m_pending_adds, so draining the queue cannot hand it back. The old
+// loop erased 64 batches of finished work and refused anyway — strictly worse
+// than budget-only admission (which lost only the newest batch) and than
+// drop-OLDEST (one-for-one, and it always admitted). Worse still, PoW is only
+// established in phase 1, i.e. AFTER admission, so a peer sending well-formed
+// but PoW-invalid shares could pin the budget with junk and destroy up to 64
+// honest batches per subsequent message.
+//
+// The corrected contract: with the budget held OUTSIDE the pending queue, an
+// admission attempt refuses while destroying NOTHING.
+TEST(LtcIngestConvergence, BudgetHeldOutsideTheQueueRefusesWithoutDestroyingAnything)
 {
     TestNode node;
     std::unique_lock<std::shared_mutex> hold(node.tracker_mutex());
     ASSERT_TRUE(hold.owns_lock());
 
-    // Verify-pool backlog: reserved, in flight, not in m_pending_adds.
+    // Verify-pool backlog: reserved, in flight, NOT in m_pending_adds, so no
+    // number of evictions can hand it back.
     const std::size_t backlog = TestNode::MAX_INFLIGHT_SHARES - 1000;
     ASSERT_TRUE(node.m_ingest_budget.try_admit(backlog, 0));
+
+    // A queue deeper than the eviction bound, holding one share per batch, so
+    // everything the bound can reach still falls short of the deficit.
+    const std::size_t queued = TestNode::MAX_ADMIT_EVICTIONS + 36;
+    for (std::uint64_t i = 0; i < queued; ++i)
+        queue_deferred_batch(node, 1 + i, 1, TestNode::INGEST_BYTES_FALLBACK_PER_SHARE);
+    ASSERT_EQ(node.m_pending_adds.size(), queued);
+
+    const std::size_t want = 1000;
+    const std::size_t want_bytes = want * TestNode::INGEST_BYTES_FALLBACK_PER_SHARE;
+    // Precondition, stated in the units the policy reasons in: the shortfall is
+    // larger than every batch the bound can reach put together.
+    const std::size_t shortfall =
+        node.m_ingest_budget.shares() + want - TestNode::MAX_INFLIGHT_SHARES;
+    ASSERT_GT(shortfall, TestNode::MAX_ADMIT_EVICTIONS)
+        << "precondition: the queue head cannot fund this exchange";
+
+    const uint256 oldest_first = node.m_pending_adds.front().data->m_items.front().hash();
+    const std::uint64_t before = destroyed();
+
+    EXPECT_FALSE(node.admit_or_evict_oldest(want, want_bytes, NetService{}));
+
+    // THE ASSERTION: a refusal is not allowed to cost anything.
+    EXPECT_EQ(node.m_pending_adds.size(), queued)
+        << "the attempt destroyed verified batches for a reservation it could "
+           "not be granted: an eviction must be an exchange, never a sacrifice";
+    EXPECT_EQ(destroyed() - before, 0u)
+        << "no share may be freed by an admission attempt that refuses";
+    EXPECT_EQ(node.m_pending_adds.front().data->m_items.front().hash(), oldest_first);
+    EXPECT_EQ(node.m_ingest_budget.shares(), backlog + queued);
+    EXPECT_LE(node.m_ingest_budget.shares(), TestNode::MAX_INFLIGHT_SHARES);
+
+    node.m_ingest_budget.release(backlog, 0);
+}
+
+// ── The genuine exchange: budget held BY the queue ──────────────────────
+//
+// The other direction of the same rule. When the reservation the queue holds
+// DOES cover the shortfall, the exchange goes ahead — and takes the MINIMUM
+// number of batches, not the whole bound.
+TEST(LtcIngestConvergence, EvictsTheMinimumNeededNotTheWholeBound)
+{
+    TestNode node;
+    std::unique_lock<std::shared_mutex> hold(node.tracker_mutex());
+    ASSERT_TRUE(hold.owns_lock());
+
+    constexpr std::size_t kBatch = 50;
+    constexpr std::size_t kCount = 10;
+    const std::size_t kBytes = kBatch * TestNode::INGEST_BYTES_FALLBACK_PER_SHARE;
+    for (std::uint64_t b = 0; b < kCount; ++b)
+        queue_deferred_batch(node, 1 + b * kBatch, kBatch, kBytes);
+    ASSERT_EQ(node.m_pending_adds.size(), kCount);
+
+    // Size the rest of the reservation so the shortfall is exactly two queued
+    // batches: evicting two is enough, evicting ten would be destruction for
+    // its own sake.
+    const std::size_t want = 1000;
+    const std::size_t want_bytes = want * TestNode::INGEST_BYTES_FALLBACK_PER_SHARE;
+    const std::size_t backlog = TestNode::MAX_INFLIGHT_SHARES + 2 * kBatch
+                              - want - kCount * kBatch;
+    ASSERT_TRUE(node.m_ingest_budget.try_admit(backlog, 0));
+    ASSERT_FALSE(node.m_ingest_budget.try_admit(want, want_bytes))
+        << "precondition: the batch does not fit as things stand";
+
+    const uint256 third_first = node.m_pending_adds[2].data->m_items.front().hash();
+    const uint256 newest_first = node.m_pending_adds.back().data->m_items.front().hash();
+    const std::uint64_t before = destroyed();
+
+    EXPECT_TRUE(node.admit_or_evict_oldest(want, want_bytes, NetService{}))
+        << "the queue held enough reservation to fund this exchange";
+
+    EXPECT_EQ(node.m_pending_adds.size(), kCount - 2)
+        << "exactly the minimum number of batches may be evicted";
+    EXPECT_EQ(destroyed() - before, 2u * kBatch);
+    // The two OLDEST went; the rest of the queue, newest included, is intact.
+    EXPECT_EQ(node.m_pending_adds.front().data->m_items.front().hash(), third_first);
+    EXPECT_EQ(node.m_pending_adds.back().data->m_items.front().hash(), newest_first);
+    EXPECT_EQ(node.m_ingest_budget.shares(), TestNode::MAX_INFLIGHT_SHARES);
+    EXPECT_LE(node.m_ingest_budget.bytes(), node.m_ingest_budget.max_bytes());
+
+    node.m_ingest_budget.release(want, want_bytes);
+    node.m_ingest_budget.release(backlog, 0);
+}
+
+// ── The bound is still a bound, and the loop still cannot spin ──────────
+//
+// Same shape as the case above, sized so the shortfall is exactly
+// MAX_ADMIT_EVICTIONS single-share batches: the scan stops at the bound, the
+// exchange is funded to the last share, and the queue beyond the bound is never
+// touched. One admission attempt can therefore never walk more than
+// MAX_ADMIT_EVICTIONS entries, whichever way it ends.
+TEST(LtcIngestConvergence, EvictionNeverExceedsItsBoundAndStillAdmitsAtIt)
+{
+    TestNode node;
+    std::unique_lock<std::shared_mutex> hold(node.tracker_mutex());
+    ASSERT_TRUE(hold.owns_lock());
 
     const std::size_t queued = TestNode::MAX_ADMIT_EVICTIONS + 36;
     for (std::uint64_t i = 0; i < queued; ++i)
         queue_deferred_batch(node, 1 + i, 1, TestNode::INGEST_BYTES_FALLBACK_PER_SHARE);
     ASSERT_EQ(node.m_pending_adds.size(), queued);
 
-    // Needs more room than MAX_ADMIT_EVICTIONS single-share evictions can free.
     const std::size_t want = 1000;
     const std::size_t want_bytes = want * TestNode::INGEST_BYTES_FALLBACK_PER_SHARE;
-    EXPECT_FALSE(node.admit_or_evict_oldest(want, want_bytes, NetService{}));
+    const std::size_t backlog = TestNode::MAX_INFLIGHT_SHARES
+                              + TestNode::MAX_ADMIT_EVICTIONS - want - queued;
+    ASSERT_TRUE(node.m_ingest_budget.try_admit(backlog, 0));
+    ASSERT_FALSE(node.m_ingest_budget.try_admit(want, want_bytes));
 
+    const std::uint64_t before = destroyed();
+
+    EXPECT_TRUE(node.admit_or_evict_oldest(want, want_bytes, NetService{}));
     EXPECT_EQ(node.m_pending_adds.size(), queued - TestNode::MAX_ADMIT_EVICTIONS)
-        << "the eviction retry must stop at MAX_ADMIT_EVICTIONS";
-    EXPECT_EQ(node.m_ingest_budget.shares(),
-              backlog + (queued - TestNode::MAX_ADMIT_EVICTIONS));
-    EXPECT_LE(node.m_ingest_budget.shares(), TestNode::MAX_INFLIGHT_SHARES);
+        << "an admission attempt may never evict past MAX_ADMIT_EVICTIONS";
+    EXPECT_EQ(destroyed() - before, TestNode::MAX_ADMIT_EVICTIONS);
+    EXPECT_EQ(node.m_ingest_budget.shares(), TestNode::MAX_INFLIGHT_SHARES);
+    EXPECT_LE(node.m_ingest_budget.bytes(), node.m_ingest_budget.max_bytes());
 
+    node.m_ingest_budget.release(want, want_bytes);
     node.m_ingest_budget.release(backlog, 0);
 }
 
