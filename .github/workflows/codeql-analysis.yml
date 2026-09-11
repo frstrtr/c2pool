@@ -208,7 +208,7 @@ jobs:
           ' </dev/null >/dev/null 2>&1 &
           HOLDER=$!
           disown "$HOLDER" 2>/dev/null || true
-          echo "HEAVY_LEG_LOCK_HOLDER=$HOLDER" >> "${GITHUB_ENV:-/dev/null}"
+          echo "${HEAVY_LEG_HOLDER_ENV:-HEAVY_LEG_LOCK_HOLDER}=$HOLDER" >> "${GITHUB_ENV:-/dev/null}"
 
           # --- wait for the acquire handshake ---
           while kill -0 "$HOLDER" 2>/dev/null && [ ! -s "$ACQ" ]; do
