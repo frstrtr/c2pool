@@ -395,6 +395,48 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_native_template_kat COMMAND xmr_native_template_kat)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Wave 1 / C6: the monerod-parity oracle (../parity/). One target.
+    #
+    #   xmr_native_parity_kat -- the M4 gate, proven both ways. The agreeing
+    #     half runs the three seams over a read-only stagenet capture with the
+    #     native side DERIVED (C2a's retarget and emission driving C2c's index
+    #     and C4's NativeMinerDataSource) rather than copied, and that capture
+    #     corroborates the INDEPENDENT one the C4 component took days earlier:
+    #     the two agree on the block id and on the difficulty where they overlap,
+    #     which neither could fake alone. The disagreeing half is the reason the
+    #     target exists: every required EQUALITY field of every seam is perturbed
+    #     by ONE UNIT and must FAIL, then REMOVED and must FAIL again, because a
+    #     comparison that did not happen is not one that passed.
+    #
+    #     Links `xmr_coin` (keccak, tree hash, the vendored difficulty retarget)
+    #     and `xmr_node` (the PRODUCTION get_miner_data parser -- the monerod arm
+    #     has to be the real decode path, or "we match the daemon" would be a
+    #     claim about a re-typed struct). Both are LIGHT links: no RandomX, no
+    #     libsodium, no libzmq, no monerod, no network. It writes and removes one
+    #     small JSON file in the working directory; ctest runs it inside the
+    #     build tree with no arguments (`--verbose` prints every sample line).
+    #
+    # Same drift-guard rule as every target above: it is added to BOTH
+    # `--target` lists in .github/workflows/build.yml by the change that adds it
+    # here, because a registered-but-unbuilt target reports "***Not Run" and
+    # fails ctest (the #1539 lesson).
+    # ─────────────────────────────────────────────────────────────────────────
+    add_executable(xmr_native_parity_kat xmr_parity_kat.cpp)
+    target_include_directories(xmr_native_parity_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_parity_kat PRIVATE xmr_coin xmr_node)
+    target_compile_features(xmr_native_parity_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_parity_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_parity_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_parity_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME xmr_native_parity_kat COMMAND xmr_native_parity_kat)
+
     add_executable(xmr_native_template_coinbase_kat
         xmr_native_template_coinbase_kat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../settle/xmr_coinbase.cpp)
