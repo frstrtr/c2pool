@@ -245,6 +245,20 @@ inline std::string fmt_age(std::uint64_t ms) {
     return std::string(b);
 }
 
+// The same age, with a marker when the instant it was computed from lies in the
+// FUTURE of the clock we measured against -- an NTP step backwards, or a state
+// file written by a host whose clock is ahead of this one. The age has been
+// clamped to zero by FreshnessView::age(), and a bare "0s" would then read as
+// "this happened a moment ago", which is a statement nobody measured. `0s+`
+// reads as what it is: at least this old, by an amount this host cannot know.
+//
+// The marker is one character on purpose. It is appended to a figure inside a
+// sentence, and a panel whose layout shifts when a clock steps is a panel that
+// draws the eye to the wrong thing.
+inline std::string fmt_age(std::uint64_t ms, bool clock_ahead) {
+    return clock_ahead ? fmt_age(ms) + "+" : fmt_age(ms);
+}
+
 // The cadence bar. The scale runs 0 .. 2x target, so a chain exactly on target
 // fills exactly half and stops at the `:` mark; slower chains overrun it,
 // faster chains fall short of it. All integer maths -- a bar that rounds
@@ -395,12 +409,17 @@ struct ChainView {
     // incremented and a counter that counted nothing are the same integer.
     bool          have_data      = false;
     ChainSource   source         = ChainSource::Live;
-    FreshnessView fresh;                  // the absolute instants, for the file
+    FreshnessView fresh;                  // the absolute WALL instants, for the file
     std::uint64_t status_age_ms  = 0;     // how long the status word has held
     bool          status_age_known = false;
     std::uint64_t tip_age_ms     = 0;     // since the tip HEIGHT last increased
     std::uint64_t rx_age_ms      = 0;     // since a new distinct block arrived
     std::uint64_t data_age_ms    = 0;     // Restored only: age of the file read
+    // One or more of this chain's recorded instants is in the FUTURE of the
+    // clock the ages above were computed against, so every one of them was
+    // clamped and none is a measurement. Marks the ages rather than hiding
+    // them: see fmt_age(ms, clock_ahead).
+    bool          clock_ahead    = false;
 
     // ---- continuity carried across a restart, from the state file --------
     bool          carried             = false;
@@ -472,6 +491,7 @@ struct PersistView {
 
     bool          restored = false;       // a previous state was read at start
     std::uint64_t restored_age_ms = 0;    // how old that state was
+    bool          clock_ahead = false;    // that state was written in our future
     std::uint64_t sessions = 1;           // this one included
     std::uint64_t runtime_ms_total = 0;   // across every session, this one included
 };
@@ -486,6 +506,9 @@ struct MonitorFrame {
     // that dialled nothing must not be mistaken for one that did.
     bool                   from_file = false;
     std::uint64_t          file_age_ms = 0;
+    // The file's own write instant is in the future of the reading clock. Same
+    // rule as ChainView::clock_ahead, one level up.
+    bool                   clock_ahead = false;
 };
 
 struct MonitorTotals {
@@ -538,11 +561,28 @@ inline MonitorTotals totals_of(const std::vector<ChainView>& chains) {
 // ---------------------------------------------------------------------------
 // Turning one read model into one panel's worth of data, at one instant.
 //
-// `now_ms` is passed in rather than read, which is the whole reason a golden
-// frame is possible. Everything else is a straight read of the model.
+// BOTH CLOCKS ARE PASSED IN rather than read, which is the whole reason a
+// golden frame is possible. Everything else is a straight read of the model.
+//
+// `now_steady_ms` times things that happened INSIDE THIS PROCESS and is
+// comparable only with this process's other steady readings: the feed's "this
+// block arrived 7s ago" is measured against ObservedBlock::first_seen_ms, which
+// the observer stamps with p2p::steady_ms().
+//
+// `now_wall_ms` times things that are RECORDED AND OUTLIVE THE PROCESS: every
+// instant in FreshnessView, and therefore the status word, the tip age and the
+// rx age. Those are the numbers that get written to the state file and read
+// back after a restart or a reboot, and a monotonic clock cannot carry them --
+// see the two-clock note at the top of p2pool_observer.hpp.
+//
+// Neither has a default. A caller that has only one number to offer has not yet
+// worked out which of the two it is holding, and that is precisely the mistake
+// the split was introduced to make impossible to write. The offline KATs pass
+// one synthetic instant twice, deliberately and visibly.
 // ---------------------------------------------------------------------------
 inline ChainView view_of(const ReadModel& m, const EmitCounts& out, std::size_t sockets,
-                         std::size_t queued, std::uint64_t now_ms,
+                         std::size_t queued, std::uint64_t now_steady_ms,
+                         std::uint64_t now_wall_ms,
                          const FreshnessView& fresh = FreshnessView{},
                          const FreshnessThresholds& th = FreshnessThresholds{},
                          std::size_t feed_rows = 8, std::size_t pulse_width = 24) {
@@ -595,9 +635,10 @@ inline ChainView view_of(const ReadModel& m, const EmitCounts& out, std::size_t 
     v.have_data = m.distinct_blocks() > 0;
     v.fresh     = fresh;
     v.status    = classify(fresh, v.peers_up, v.sockets, v.queued, v.cadence_ok,
-                           v.target_s, now_ms, th);
-    v.tip_age_ms = fresh.tip_age_ms(now_ms);
-    v.rx_age_ms  = fresh.rx_age_ms(now_ms);
+                           v.target_s, now_wall_ms, th);
+    v.tip_age_ms = fresh.tip_age_ms(now_wall_ms);
+    v.rx_age_ms  = fresh.rx_age_ms(now_wall_ms);
+    v.clock_ahead = fresh.clock_ahead(now_wall_ms);
 
     // WHICH CLOCK THE STATUS WORD IS SHOWING. Each word is about a different
     // event, so each one is timed from that event and not from a single "age"
@@ -610,9 +651,9 @@ inline ChainView view_of(const ReadModel& m, const EmitCounts& out, std::size_t 
     if (!fresh.known) {
         v.status_age_ms = 0;
     } else if (v.status == ChainStatus::Down) {
-        v.status_age_ms = fresh.down_ms(now_ms);
+        v.status_age_ms = fresh.down_ms(now_wall_ms);
     } else if (v.status == ChainStatus::Dark || v.status == ChainStatus::Dialling) {
-        v.status_age_ms = FreshnessView::age(now_ms, fresh.started_at_ms);
+        v.status_age_ms = FreshnessView::age(now_wall_ms, fresh.started_at_ms);
     } else {
         v.status_age_ms = v.tip_age_ms;
     }
@@ -626,7 +667,9 @@ inline ChainView view_of(const ReadModel& m, const EmitCounts& out, std::size_t 
         FeedRow r;
         r.height   = b->sidechain_height;
         r.id8      = hex(b->sidechain_id).substr(0, 8);
-        r.age_ms   = now_ms >= b->first_seen_ms ? now_ms - b->first_seen_ms : 0;
+        // STEADY, not wall: first_seen_ms was stamped by this process from
+        // p2p::steady_ms() and the feed is a this-session-only row.
+        r.age_ms   = now_steady_ms >= b->first_seen_ms ? now_steady_ms - b->first_seen_ms : 0;
         r.shares   = b->share_outputs;
         r.uncles   = b->uncles.size();
         r.verified = b->id_verified;
@@ -677,7 +720,7 @@ inline const char* status_color(ChainStatus s) {
 inline std::string status_phrase(const ChainView& v) {
     std::string s = to_string(v.status);
     if (v.status_age_known && v.status != ChainStatus::Live)
-        s += " " + fmt_age(v.status_age_ms);
+        s += " " + fmt_age(v.status_age_ms, v.clock_ahead);
     switch (v.status) {
         case ChainStatus::Dark:  s += " never connected"; break;
         case ChainStatus::Down:  s += " no peers";        break;
@@ -711,7 +754,7 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
         l.put("  ").sgr(status_color(v.status)).put(status_phrase(v)).sgr(kReset);
         l.put("  ").sgr(kDim).put("target ").sgr(kReset).put(std::to_string(v.target_s)).put("s");
         if (v.source == ChainSource::Restored) {
-            l.put("  ").sgr(kYellow).put("[FROM FILE ").put(fmt_age(v.data_age_ms))
+            l.put("  ").sgr(kYellow).put("[FROM FILE ").put(fmt_age(v.data_age_ms, v.clock_ahead))
              .put(" OLD]").sgr(kReset);
         }
         l.put(" ").sgr(kDim).repeat('-', l.room()).sgr(kReset);
@@ -727,7 +770,8 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
         Line l(cols, color);
         label(l, "!");
         l.sgr(status_color(v.status)).sgr(kBold).put(to_string(v.status)).sgr(kReset).put("  ");
-        const std::string age = v.status_age_known ? fmt_age(v.status_age_ms) : std::string("?");
+        const std::string age = v.status_age_known ? fmt_age(v.status_age_ms, v.clock_ahead)
+                                                  : std::string("?");
         switch (v.status) {
             case ChainStatus::Down:
                 l.sgr(kDim).put("no peers for ").sgr(kReset).put(age).sgr(kDim)
@@ -744,12 +788,12 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
                 break;
             case ChainStatus::Stale:
                 l.sgr(kDim).put("no new height for ").sgr(kReset).put(age);
-                l.sgr(kDim).put(", last rx ").sgr(kReset).put(fmt_age(v.rx_age_ms));
+                l.sgr(kDim).put(", last rx ").sgr(kReset).put(fmt_age(v.rx_age_ms, v.clock_ahead));
                 l.sgr(kDim).put(" -- the figures below are that old");
                 break;
             case ChainStatus::Quiet:
                 l.sgr(kDim).put("no new height for ").sgr(kReset).put(age);
-                l.sgr(kDim).put(", last rx ").sgr(kReset).put(fmt_age(v.rx_age_ms));
+                l.sgr(kDim).put(", last rx ").sgr(kReset).put(fmt_age(v.rx_age_ms, v.clock_ahead));
                 l.sgr(kDim).put(" -- long for this chain, not yet wrong");
                 break;
             default:
@@ -777,7 +821,7 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
         l.put("  ").sgr(kDim).put("cum ").sgr(kReset).put(or_dash(have, fmt_si(v.cumulative_d)));
         if (have && v.status_age_known) {
             l.put("  ").sgr(is_degraded(v.status) ? kRed : kDim).put("as of ")
-             .put(fmt_age(v.tip_age_ms)).sgr(kReset);
+             .put(fmt_age(v.tip_age_ms, v.clock_ahead)).sgr(kReset);
         }
         rows.emplace_back(kAlways, l.take());
     }
@@ -843,7 +887,7 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
         label(l, "carry");
         l.sgr(kDim).put("prev tip ").sgr(kReset).put(std::to_string(v.carry_tip_height));
         if (!v.carry_tip_id8.empty()) l.put(" ").sgr(kDim).put(v.carry_tip_id8).sgr(kReset);
-        l.sgr(kDim).put("  saved ").sgr(kReset).put(fmt_age(v.carry_age_ms))
+        l.sgr(kDim).put("  saved ").sgr(kReset).put(fmt_age(v.carry_age_ms, v.clock_ahead))
          .sgr(kDim).put(" ago");
         l.sgr(kDim).put("  lifetime tip ").sgr(kReset).put(std::to_string(v.lifetime_tip_max));
         l.sgr(kDim).put("  monero tpl ").sgr(kReset).put(std::to_string(v.lifetime_monero_max));
@@ -977,7 +1021,7 @@ inline void header(const MonitorFrame& f, const MonitorTotals& t, std::size_t co
              .put(p.ever_saved ? fmt_age(p.saved_age_ms) + " ago" : std::string("never"));
             l.sgr(kDim).put("  session ").sgr(kReset).put(std::to_string(p.sessions));
             if (p.restored)
-                l.sgr(kDim).put(" from ").sgr(kReset).put(fmt_age(p.restored_age_ms))
+                l.sgr(kDim).put(" from ").sgr(kReset).put(fmt_age(p.restored_age_ms, p.clock_ahead))
                  .sgr(kDim).put("-old state");
             if (p.loop_stall_max_ms)
                 l.sgr(kDim).put("  stall ").sgr(kReset)
@@ -990,9 +1034,29 @@ inline void header(const MonitorFrame& f, const MonitorTotals& t, std::size_t co
         Line l(cols, color);
         l.put(" ").sgr(kBold).sgr(kYellow).put("RESTORED FRAME").sgr(kReset);
         l.sgr(kDim).put("  rendered from the state file, written ").sgr(kReset)
-         .put(fmt_age(f.file_age_ms)).sgr(kDim)
+         .put(fmt_age(f.file_age_ms, f.clock_ahead)).sgr(kDim)
          .put(" ago -- no network was dialled and no number below is current");
         rows.emplace_back(kAlways, l.take());
+    }
+    {
+        // THE CLOCK-SKEW ROW. Drawn only when something recorded is dated in
+        // this host's future, which happens for two ordinary reasons: the wall
+        // clock stepped backwards (an NTP correction), or the file came from a
+        // machine whose clock is ahead of this one. Every age computed from such
+        // an instant has been clamped to zero and marked `+`, and a lone `+` in
+        // the middle of a panel is not self-explanatory, so the frame says once,
+        // in words, what the marker means. At kAlways priority: an unexplained
+        // "0s" IS the failure this component exists to prevent.
+        bool skew = f.clock_ahead || f.persist.clock_ahead;
+        for (const ChainView& c : f.chains) skew = skew || c.clock_ahead;
+        if (skew) {
+            Line l(cols, color);
+            l.put(" ").sgr(kBold).sgr(kYellow).put("CLOCK SKEW").sgr(kReset);
+            l.sgr(kDim).put("  a recorded instant is AHEAD of this host's clock -- ages "
+                            "marked ").sgr(kReset).put("+").sgr(kDim)
+             .put(" are clamped to zero and are a lower bound, not a measurement");
+            rows.emplace_back(kAlways, l.take());
+        }
     }
     {
         Line l(cols, color);

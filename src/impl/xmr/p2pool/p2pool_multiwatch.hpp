@@ -195,7 +195,11 @@ public:
     // the sockets and its revents are returned, so a keypress wakes the loop
     // without a second poll and without a timeout race.
     short poll_once(int extra_fd, short extra_events, int timeout_ms) {
-        const std::uint64_t t = now_ms();
+        // STEADY. Everything this turn measures -- the gap since the previous
+        // turn, the per-chain reseed cool-off -- is a duration inside this
+        // process, and a wall clock that an NTP step moved backwards would
+        // report a negative loop stall or freeze a reseed timer for hours.
+        const std::uint64_t t = steady_ms();
 
         // THE LOOP-STALL WATCH. One dead source must not stall the other two,
         // and "must not" is worth measuring rather than asserting: every turn
@@ -290,7 +294,11 @@ public:
         f.interactive = interactive;
         f.persist     = persist;
         f.persist.loop_stall_max_ms = loop_stall_max_ms_;
-        const std::uint64_t t = now_ms();
+        // BOTH CLOCKS, read once each so every panel in this frame is resolved
+        // at one instant: steady for the per-session feed ages, wall for the
+        // freshness instants and for the age of the state the last session left.
+        const std::uint64_t t = steady_ms();
+        const std::uint64_t w = wall_ms();
         for (const Slot& sl : slots_) {
             tui::EmitCounts ec;
             const OutboundLedger& led = sl.obs->ledger();
@@ -299,7 +307,7 @@ public:
                 ec.bytes[i]    = led.bytes[i];
             }
             tui::ChainView v = tui::view_of(sl.obs->model(), ec, sl.obs->live_sessions(),
-                                            sl.obs->pending_dials(), t, sl.fresh.view(),
+                                            sl.obs->pending_dials(), t, w, sl.fresh.view(),
                                             cfg_.freshness);
 
             // What the previous session left behind, on its own row, with its
@@ -309,7 +317,7 @@ public:
                 if (const state::ChainState* prev = carry_.find(to_string(sl.obs->model().chain()))) {
                     v.carried             = true;
                     v.carry_written_at_ms = carry_.written_at_ms;
-                    v.carry_age_ms        = FreshnessView::age(t, carry_.written_at_ms);
+                    v.carry_age_ms        = FreshnessView::age(w, carry_.written_at_ms);
                     v.carry_tip_height    = prev->tip_height;
                     v.carry_tip_id8       = prev->tip_id.size() >= 8 ? prev->tip_id.substr(0, 8)
                                                                      : std::string();
@@ -331,7 +339,12 @@ private:
     // FreshnessTracker::sample. Called on EVERY path out of poll_once(),
     // including the one where no socket exists yet.
     void sample_freshness() {
-        const std::uint64_t t = now_ms();
+        // WALL. Every instant the tracker records from this sample is written to
+        // the state file and read back by a later process, on a later boot and
+        // sometimes on another machine, so it has to be on the clock those two
+        // processes share. This one line is the fix for the reboot bug described
+        // at the top of p2pool_observer.hpp.
+        const std::uint64_t t = wall_ms();
         for (Slot& sl : slots_) {
             sl.fresh.sample(sl.obs->model().tip_height(), sl.obs->model().distinct_blocks(),
                             sl.obs->model().connected_peers(), sl.obs->live_sessions(),

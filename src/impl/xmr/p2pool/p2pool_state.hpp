@@ -44,7 +44,7 @@
 // ---------------------------------------------------------------------------
 // WHAT THE FORMAT COMMITS TO
 // ---------------------------------------------------------------------------
-// JSON, one object, schema tag "p2pmon-state/1", about 3 KB for three chains.
+// JSON, one object, schema tag "p2pmon-state/2", about 3 KB for three chains.
 // A text format, because the whole point is that something other than this
 // program can read it -- jq, a spreadsheet, a person at 4am -- and a binary
 // format would make the file useful only to the code that wrote it.
@@ -56,6 +56,16 @@
 // CURRENT clock when it is read. That single rule is what makes a day-old file
 // render as STALE rather than as a healthy chain -- and it is the reason the
 // freshness clock lives in absolute instants in p2pool_freshness.hpp.
+//
+// WALL-CLOCK MEANS std::chrono::system_clock, MILLISECONDS SINCE THE UNIX
+// EPOCH -- p2p::wall_ms(). This paragraph said so from the first commit and the
+// producing code did not: every instant here was filled from a monotonic
+// ms-since-boot reading, which is indistinguishable from a wall instant inside
+// one boot and worthless across a reboot or a copy to another machine. A reader
+// can check a file by eye: written_at_ms is about 1.75e12 today, and any
+// instant in the low billions is a ms-since-boot value from the broken era.
+// The two clocks and the rule for choosing between them are set out at the top
+// of p2pool_observer.hpp.
 //
 // NUMBERS THAT MUST BE EXACT ARE STORED AS TEXT. Difficulty and cumulative
 // difficulty are up to 128 bits; JSON numbers are doubles in most readers, and
@@ -106,7 +116,22 @@ namespace c2pool::xmr::p2pool::state {
 // different namespace branch, so it gets an alias rather than a copy.
 namespace minijson = c2pool::xmr::node::minijson;
 
-inline constexpr const char* kSchema      = "p2pmon-state/1";
+// THE SCHEMA TAG, AND WHY IT WENT TO /2.
+//
+// The field NAMES did not change between /1 and /2; the MEANING of every
+// instant in them did. A /1 file's written_at_ms, tip_advanced_at_ms, rx_at_ms
+// and friends were milliseconds since the writing host BOOTED (see the two-clock
+// note in p2pool_observer.hpp); a /2 file's are milliseconds since the UNIX
+// epoch. Nothing in the bytes distinguishes them except magnitude, and a reader
+// that guessed from magnitude would be inventing provenance.
+//
+// So /1 is REFUSED rather than reinterpreted. The cost is one lost carry-over,
+// once, on the upgrade: the monitor says "starting fresh (schema is
+// p2pmon-state/1, expected p2pmon-state/2)" and begins a new lifetime record.
+// The alternative is a first session whose every panel is dated 20 000 days ago
+// -- numbers that are wrong in a way that looks like data, which is the one
+// thing this component is built never to print.
+inline constexpr const char* kSchema      = "p2pmon-state/2";
 inline constexpr const char* kStateFile   = "p2pmon-state.json";
 inline constexpr const char* kJournalFile = "p2pmon-history.jsonl";
 inline constexpr const char* kLockFile    = ".lock";
@@ -637,7 +662,7 @@ inline MonitorState state_of(const tui::MonitorFrame& f, const SessionMeta& meta
 // for a day renders as a day-old chain -- STALE, with the age spelled out --
 // rather than as whatever it looked like when it was written.
 // ---------------------------------------------------------------------------
-inline tui::ChainView chain_view_of(const ChainState& c, std::uint64_t now_ms) {
+inline tui::ChainView chain_view_of(const ChainState& c, std::uint64_t now_wall_ms) {
     tui::ChainView v;
     if (c.name == "mini")      v.chain = Sidechain::Mini;
     else if (c.name == "nano") v.chain = Sidechain::Nano;
@@ -703,28 +728,33 @@ inline tui::ChainView chain_view_of(const ChainState& c, std::uint64_t now_ms) {
     // word on a restored panel is therefore not the word that was saved: it is
     // what that data means NOW, which is the only reading that is not a lie.
     v.status = classify(v.fresh, v.peers_up, v.sockets, v.queued, v.cadence_ok,
-                        v.target_s, now_ms);
-    v.tip_age_ms = v.fresh.tip_age_ms(now_ms);
-    v.rx_age_ms  = v.fresh.rx_age_ms(now_ms);
+                        v.target_s, now_wall_ms);
+    v.tip_age_ms  = v.fresh.tip_age_ms(now_wall_ms);
+    v.rx_age_ms   = v.fresh.rx_age_ms(now_wall_ms);
+    v.clock_ahead = v.fresh.clock_ahead(now_wall_ms);
     v.status_age_known = true;
     if (v.status == tui::ChainStatus::Down)
-        v.status_age_ms = v.fresh.down_ms(now_ms);
+        v.status_age_ms = v.fresh.down_ms(now_wall_ms);
     else if (v.status == tui::ChainStatus::Dark || v.status == tui::ChainStatus::Dialling)
-        v.status_age_ms = FreshnessView::age(now_ms, v.fresh.started_at_ms);
+        v.status_age_ms = FreshnessView::age(now_wall_ms, v.fresh.started_at_ms);
     else
         v.status_age_ms = v.tip_age_ms;
     return v;
 }
 
-inline tui::MonitorFrame frame_of(const MonitorState& s, std::uint64_t now_ms) {
+inline tui::MonitorFrame frame_of(const MonitorState& s, std::uint64_t now_wall_ms) {
     tui::MonitorFrame f;
     f.elapsed_ms  = s.elapsed_ms;
     f.interactive = false;
     f.from_file   = true;
-    f.file_age_ms = FreshnessView::age(now_ms, s.written_at_ms);
+    f.file_age_ms = FreshnessView::age(now_wall_ms, s.written_at_ms);
+    f.clock_ahead = FreshnessView::ahead(now_wall_ms, s.written_at_ms);
     for (const ChainState& c : s.chains) {
-        tui::ChainView v = chain_view_of(c, now_ms);
+        tui::ChainView v = chain_view_of(c, now_wall_ms);
         v.data_age_ms = f.file_age_ms;
+        // A file dated in our future marks every panel it produced, not only the
+        // chains whose own instants happen to be ahead of us.
+        v.clock_ahead = v.clock_ahead || f.clock_ahead;
         if (v.lifetime_tip_max) {
             v.carried             = true;
             v.carry_written_at_ms = s.written_at_ms;
@@ -745,6 +775,7 @@ inline tui::MonitorFrame frame_of(const MonitorState& s, std::uint64_t now_ms) {
     f.persist.runtime_ms_total = s.lifetime.runtime_ms_total;
     f.persist.restored        = true;
     f.persist.restored_age_ms = f.file_age_ms;
+    f.persist.clock_ahead     = f.clock_ahead;
     return f;
 }
 

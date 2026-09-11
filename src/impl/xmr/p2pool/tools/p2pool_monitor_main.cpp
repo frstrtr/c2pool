@@ -222,7 +222,12 @@ int main(int argc, char** argv) {
                       << ": " << why << "\n";
             return 3;
         }
-        tui::MonitorFrame f = st::frame_of(s, p2p::now_ms());
+        // WALL, and this is the line the whole durability claim rests on: the
+        // file's instants are wall instants, so the age they render is real
+        // elapsed time even when the host has rebooted since the write or the
+        // file arrived from another machine. Read with a monotonic clock, a
+        // 4-minute-old file rendered "written 0s ago" after a reboot.
+        tui::MonitorFrame f = st::frame_of(s, p2p::wall_ms());
         f.persist.dir = store.dir();       // the file we read, named on the banner
         std::cout << tui::snapshot_text(f, o.width) << std::flush;
         return 0;
@@ -264,18 +269,25 @@ int main(int argc, char** argv) {
     st::LifetimeState lifetime;
     lifetime.sessions = 1;
 
-    const std::uint64_t t0  = p2p::now_ms();
+    // THE SESSION'S TWO ZEROES. `t0` is monotonic and answers "how long has
+    // this process been running" -- the run window, the elapsed figure, the save
+    // and repaint timers. `w0` is wall and answers "when did this session
+    // start", which is a fact about the world that goes into the file, into the
+    // session id, and into the lifetime record that spans every session ever run
+    // against this directory.
+    const std::uint64_t t0  = p2p::steady_ms();
+    const std::uint64_t w0  = p2p::wall_ms();
     const std::uint64_t pid = static_cast<std::uint64_t>(::getpid());
 
     if (store.enabled()) {
         std::string why;
         if (store.load(prev, why)) {
             restored        = true;
-            restored_age_ms = p2p::FreshnessView::age(t0, prev.written_at_ms);
+            restored_age_ms = p2p::FreshnessView::age(w0, prev.written_at_ms);
             watch.set_carry(prev);
             lifetime.sessions            = prev.lifetime.sessions + 1;
             lifetime.first_started_at_ms = prev.lifetime.first_started_at_ms
-                                         ? prev.lifetime.first_started_at_ms : t0;
+                                         ? prev.lifetime.first_started_at_ms : w0;
             lifetime.runtime_ms_total    = prev.lifetime.runtime_ms_total;
             std::fprintf(stderr, "state: restored seq %llu from %s (%llus old, session %llu)%s\n",
                          static_cast<unsigned long long>(prev.seq), store.state_path().c_str(),
@@ -284,12 +296,12 @@ int main(int argc, char** argv) {
                          prev.shutdown.empty() ? " -- previous session did not shut down cleanly"
                                                : "");
         } else {
-            lifetime.first_started_at_ms = t0;
+            lifetime.first_started_at_ms = w0;
             std::fprintf(stderr, "state: starting fresh in %s (%s)\n",
                          store.dir().c_str(), why.c_str());
         }
     } else {
-        lifetime.first_started_at_ms = t0;
+        lifetime.first_started_at_ms = w0;
         std::fprintf(stderr, "state: PERSIST OFF %s\n",
                      o.no_persist ? "(--no-persist)" : store.off_reason().c_str());
     }
@@ -298,7 +310,7 @@ int main(int argc, char** argv) {
     watch.seed_all();
 
     const std::uint64_t t_end = o.mc.run_ms ? t0 + o.mc.run_ms : 0;
-    const std::string   session_id = std::to_string(t0) + "-" + std::to_string(pid);
+    const std::string   session_id = std::to_string(w0) + "-" + std::to_string(pid);
     const std::string   host = p2p::StateStore::hostname();
 
     std::uint64_t last_save_ms = 0;
@@ -307,8 +319,11 @@ int main(int argc, char** argv) {
     // Build the frame at `now`, write it, and hand the same frame back so the
     // caller can print it. ONE frame object becomes both the file and the
     // screen, which is why the two can never disagree.
+    // `now` is the STEADY instant the caller's loop is on; the wall instant is
+    // taken here, once, and is what gets written down.
     auto capture = [&](std::uint64_t now, bool interactive,
                        const char* shutdown) -> tui::MonitorFrame {
+        const std::uint64_t wall = p2p::wall_ms();
         const tui::PersistView pv = persist_view(store, !o.no_persist, last_save_ms, now,
                                                  restored, restored_age_ms,
                                                  lifetime.sessions,
@@ -317,12 +332,12 @@ int main(int argc, char** argv) {
         if (!store.enabled()) return f;
 
         st::SessionMeta meta;
-        meta.written_at_ms = now;
+        meta.written_at_ms = wall;
         meta.seq  = store.seq() + 1;
         meta.pid  = pid;
         meta.host = host;
         meta.session_id            = session_id;
-        meta.session_started_at_ms = t0;
+        meta.session_started_at_ms = w0;
         meta.shutdown              = shutdown ? shutdown : "";
         meta.persist.errors            = store.errors();
         meta.persist.last_error        = store.last_error();
@@ -343,9 +358,9 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     if (o.snapshot) {
         std::uint64_t next_note = t0 + 15000;
-        while (!p2p::g_tui_quit && (!t_end || p2p::now_ms() < t_end)) {
+        while (!p2p::g_tui_quit && (!t_end || p2p::steady_ms() < t_end)) {
             watch.poll_once(-1, 0, 250);
-            const std::uint64_t t = p2p::now_ms();
+            const std::uint64_t t = p2p::steady_ms();
             if (t >= next_save_ms) {
                 next_save_ms = t + o.persist_ms;
                 capture(t, false, nullptr);
@@ -364,7 +379,7 @@ int main(int argc, char** argv) {
         // The frame is taken BEFORE the sockets are closed. Closing first would
         // print "4 peers up / 0 sockets", which is true of a process on its way
         // out and false of the window the frame is reporting on.
-        const tui::MonitorFrame f = capture(p2p::now_ms(), false, "clean");
+        const tui::MonitorFrame f = capture(p2p::steady_ms(), false, "clean");
         watch.close_all();
         store.close_all();
         std::cout << tui::snapshot_text(f, o.width) << std::flush;
@@ -393,7 +408,7 @@ int main(int argc, char** argv) {
     std::uint64_t next_paint = 0;
     bool quit = false;
 
-    while (!quit && !p2p::g_tui_quit && (!t_end || p2p::now_ms() < t_end)) {
+    while (!quit && !p2p::g_tui_quit && (!t_end || p2p::steady_ms() < t_end)) {
         const short rev = watch.poll_once(STDIN_FILENO, POLLIN, 200);
         if (rev & POLLIN) {
             char keys[32];
@@ -403,7 +418,7 @@ int main(int argc, char** argv) {
                 if (keys[k] == 'r' || keys[k] == 'R') next_paint = 0;
             }
         }
-        const std::uint64_t t = p2p::now_ms();
+        const std::uint64_t t = p2p::steady_ms();
         if (p2p::g_tui_resized) { p2p::g_tui_resized = 0; term.size(cols, rows); next_paint = 0; }
         if (t >= next_paint) {
             next_paint = t + o.mc.refresh_ms;
@@ -420,7 +435,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    const tui::MonitorFrame f = capture(p2p::now_ms(), false, "clean");   // before the sockets go
+    const tui::MonitorFrame f = capture(p2p::steady_ms(), false, "clean");   // before the sockets go
     watch.close_all();
     store.close_all();
     term.end();                       // back to the normal screen BEFORE printing

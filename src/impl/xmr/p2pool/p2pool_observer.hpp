@@ -105,10 +105,59 @@
 
 namespace c2pool::xmr::p2pool {
 
-inline std::uint64_t now_ms() {
+// ---------------------------------------------------------------------------
+// TWO CLOCKS, AND THE RULE FOR WHICH ONE A NUMBER BELONGS TO.
+//
+// There used to be one, spelled now_ms(), and it read std::chrono::steady_clock --
+// milliseconds since an arbitrary epoch, in practice since this host booted.
+// That is the correct clock for a duration measured inside one process, and the
+// wrong one for every instant that is WRITTEN DOWN, because the state file
+// outlives the process and frequently outlives the boot.
+//
+// A monitor killed and restarted on the same uptime got away with it, which is
+// why it survived review and a soak. A monitor whose host REBOOTED did not: it
+// read a four-minute-old file holding tip_advanced_at_ms = 3 000 000 (ms since
+// the PREVIOUS boot), subtracted it from a ms-since-THIS-boot now of 12 000,
+// clamped the negative result at zero, and rendered "written 0s ago" with every
+// chain "LIVE as of 0s". That is the exact silent freshness lie this component
+// exists to prevent, produced in the one case -- a reboot -- for which the
+// persistence layer already refuses to put the file in /tmp. Copy the file to
+// another machine and the same subtraction produces the mirror image: a
+// fabricated age of days on a file written a second ago.
+//
+// So the clock is split, and the split IS the rule:
+//
+//   steady_ms()  MONOTONIC. Never stepped by NTP, comparable only with itself
+//                and only inside one process. Every intra-session DURATION: the
+//                poll cadence, connect deadlines, the run window, the repaint
+//                and save timers, the loop-stall watch, block inter-arrival
+//                gaps, and how long ago a block arrived on this session's feed.
+//   wall_ms()    MILLISECONDS SINCE THE UNIX EPOCH. Every INSTANT that is
+//                persisted and later differenced against a clock in another
+//                process: everything in FreshnessView, written_at_ms,
+//                session_started_at_ms, first_started_at_ms, the journal's `t`.
+//                Freshness that has to survive a restart keys off these.
+//
+// Wall time can step BACKWARDS -- an NTP correction, or a file written by a
+// host whose clock is ahead of ours. That is handled where the ages are
+// computed rather than here: FreshnessView::age() clamps at zero and
+// FreshnessView::ahead() reports it, so such an age renders as "0s+" and never
+// as a 584-million-year one.
+//
+// There is deliberately no now_ms() any more. A name that says "now" and means
+// "ms since boot" is what made the bug above invisible at every call site; a
+// caller now has to name the clock it is asking for.
+// ---------------------------------------------------------------------------
+inline std::uint64_t steady_ms() {
     using namespace std::chrono;
     return static_cast<std::uint64_t>(
             duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+inline std::uint64_t wall_ms() {
+    using namespace std::chrono;
+    return static_cast<std::uint64_t>(
+            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
 }
 
 // Every byte this process puts on a P2Pool socket, bucketed. Four buckets, one
@@ -218,7 +267,7 @@ public:
         if (fd_ < 0) return fail("connect", log);
 
         state_        = State::Connecting;
-        deadline_ms_  = now_ms() + cfg_.connect_timeout_ms;
+        deadline_ms_  = steady_ms() + cfg_.connect_timeout_ms;
         (void)ledger;
         return true;
     }
@@ -234,7 +283,7 @@ public:
     bool step(short revents, OutboundLedger& ledger, const BlockSink& on_block,
               const LogSink& log, ReadModel& model) {
         if (state_ == State::Closed) return false;
-        const std::uint64_t t = now_ms();
+        const std::uint64_t t = steady_ms();
 
         if (state_ == State::Connecting) {
             if (t > deadline_ms_) return fail("connect timeout", log);
@@ -447,7 +496,7 @@ private:
                              + std::to_string(peer_id_) + ")");
                 // First tip request immediately; the poll cadence takes over.
                 request_block(Hash{}, ledger);
-                const std::uint64_t t = now_ms();
+                const std::uint64_t t = steady_ms();
                 next_tip_poll_ms_  = t + cfg_.tip_poll_ms;
                 next_peer_list_ms_ = t + 1000;
                 return true;
@@ -534,7 +583,7 @@ private:
             if (!cfg_.dump_failed_dir.empty()) {
                 const std::string path = cfg_.dump_failed_dir + "/failed-"
                                        + std::string(to_string(st)) + "-"
-                                       + std::to_string(now_ms()) + ".bin";
+                                       + std::to_string(wall_ms()) + ".bin";
                 if (FILE* f = std::fopen(path.c_str(), "wb")) {
                     std::fwrite(body, 1, len, f);
                     std::fclose(f);
@@ -620,7 +669,7 @@ class Observer {
 public:
     explicit Observer(const ObserverConfig& cfg)
         : cfg_(cfg), model_(cfg.chain), consensus_(consensus_id(cfg.chain)),
-          rng_(cfg.seed ? cfg.seed : now_ms()) {}
+          rng_(cfg.seed ? cfg.seed : steady_ms()) {}
 
     ReadModel&            model()  noexcept { return model_; }
     const ReadModel&      model()  const noexcept { return model_; }
@@ -708,11 +757,11 @@ public:
 
     // Blocking run for cfg_.run_ms. Returns the number of poll iterations.
     std::uint64_t run() {
-        const std::uint64_t t_end = now_ms() + cfg_.run_ms;
+        const std::uint64_t t_end = steady_ms() + cfg_.run_ms;
         std::uint64_t iterations = 0;
         std::vector<pollfd> pfds;
         std::vector<PeerSession*> live;
-        while (now_ms() < t_end) {
+        while (steady_ms() < t_end) {
             ++iterations;
             begin_tick();
             pfds.clear();
@@ -781,7 +830,7 @@ private:
     }
 
     void open_sessions() {
-        const std::uint64_t t = now_ms();
+        const std::uint64_t t = steady_ms();
         while (live_sessions() < cfg_.max_peers && !queue_.empty()) {
             const Dial d = queue_.front();
             queue_.pop_front();
@@ -805,7 +854,7 @@ private:
     }
 
     void harvest() {
-        const std::uint64_t t = now_ms();
+        const std::uint64_t t = steady_ms();
         for (auto& s : sessions_) {
             for (const PeerEntry& p : s->take_discovered()) {
                 if (p.port == 0 || p.port == 0xFFFF) continue;
@@ -871,7 +920,7 @@ inline void Observer::ingest(const PoolBlock& pb, const std::vector<std::uint8_t
     ob.tx_count              = pb.tx_hashes.size();
     ob.shape                 = pb.shape;
     ob.id_verified           = pb.sidechain_id_verified;
-    ob.first_seen_ms         = now_ms();
+    ob.first_seen_ms         = steady_ms();
     ob.from_peer             = endpoint;
 
     if (pb.monero_blob_contiguous() && pb.sidechain_offset > 0

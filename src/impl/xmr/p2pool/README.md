@@ -345,11 +345,26 @@ Four properties carry the design:
   whole new one, at every instant. A torn file that parses as *plausible*
   garbage would be worse than no file, in a component whose entire point is not
   lying.
-* **Every time is absolute.** "The tip last moved 40 s ago" becomes false while
-  the file sits on disk; "the tip last moved at 1757620000123" stays true, and
-  is turned back into an age against the *current* clock when it is read. That
-  one rule is why a day-old file renders as `STALE` with the age spelled out
-  rather than as a healthy chain.
+* **Every time is absolute, and on the wall clock.** "The tip last moved 40 s
+  ago" becomes false while the file sits on disk; "the tip last moved at
+  1757620000123" stays true, and is turned back into an age against the
+  *current* clock when it is read. That one rule is why a day-old file renders
+  as `STALE` with the age spelled out rather than as a healthy chain — and it
+  only holds if the instant is on a clock the *next* process agrees with. Every
+  persisted instant is therefore `system_clock` (ms since the UNIX epoch);
+  every intra-session duration — poll cadence, uptime, loop stall, the feed's
+  "arrived 7 s ago" — stays on `steady_clock`, which an NTP step cannot move.
+  Mixing those up is the one bug this file cannot survive: with monotonic
+  ms-since-boot instants the arithmetic is right inside one boot and collapses
+  after a reboot, rendering a four-minute-old file as "written 0s ago" with
+  every chain `LIVE as of 0s`. The split is set out at the top of
+  `p2pool_observer.hpp`; files from before it are tagged `p2pmon-state/1` and
+  are refused rather than reinterpreted.
+* **A clock that runs backwards is said out loud.** An NTP correction, or a file
+  from a host whose clock is ahead of this one, leaves a recorded instant in our
+  future. The age clamps to zero — it never wraps — and the frame marks it `0s+`
+  and draws a `CLOCK SKEW` row, because a bare `0s` reads as "this just
+  happened", which is nobody's measurement.
 * **The file cannot disagree with the screen.** `MonitorState` is built from the
   same `tui::MonitorFrame` the renderer draws, at the same instant — not from a
   second pass over the read models.

@@ -122,7 +122,8 @@ std::string panel_of(const std::string& frame, const char* chain) {
 // THE FIXTURE
 //
 // Three read models filled by hand. Every timestamp is explicit, so the frame
-// is a pure function of the numbers below and of the `now` passed to view_of().
+// is a pure function of the numbers below and of the two `now`s passed to
+// view_of() -- one steady, one wall, both synthetic and equal here.
 // The shape of each chain is chosen to exercise a different branch:
 //
 //   main  a live chain past the frontier, with a contested height whose loser
@@ -279,11 +280,11 @@ tui::MonitorFrame build_frame() {
     f.elapsed_ms  = 185000;      // 00:03:05
     f.interactive = false;
     f.persist     = mk_persist();
-    f.chains.push_back(tui::view_of(main_m, mk_emit(6, 6, 141, 6), 4, 12, kNow,
+    f.chains.push_back(tui::view_of(main_m, mk_emit(6, 6, 141, 6), 4, 12, kNow, kNow,
                                     mk_fresh(true, true, 995000, 1038000, 1038000, 999000, 0)));
-    f.chains.push_back(tui::view_of(mini_m, mk_emit(5, 5, 118, 5), 3,  7, kNow,
+    f.chains.push_back(tui::view_of(mini_m, mk_emit(5, 5, 118, 5), 3,  7, kNow, kNow,
                                     mk_fresh(true, true, 995000, 1039500, 1039500, 999000, 0)));
-    f.chains.push_back(tui::view_of(nano_m, mk_emit(3, 3,  64, 3), 2,  3, kNow,
+    f.chains.push_back(tui::view_of(nano_m, mk_emit(3, 3,  64, 3), 2,  3, kNow, kNow,
                                     mk_fresh(true, true, 995000, 1036000, 1036000, 999000, 0)));
     // Continuity, as it looks on a restarted monitor: what the previous session
     // left, with its age, on its own row.
@@ -316,17 +317,17 @@ tui::MonitorFrame build_degraded_frame() {
     f.persist     = mk_persist();
 
     // main: healthy, and it must STAY healthy in the same frame as the others.
-    f.chains.push_back(tui::view_of(main_m, mk_emit(6, 6, 141, 6), 4, 12, kNow,
+    f.chains.push_back(tui::view_of(main_m, mk_emit(6, 6, 141, 6), 4, 12, kNow, kNow,
                                     mk_fresh(true, true, 700000, 1038000, 1038000, 720000, 0)));
     // mini: peers up, data held, but the tip has not moved for 6m40s. Its
     // cadence is still computable from the blocks it holds -- and must not be
     // reported as a current reading.
-    f.chains.push_back(tui::view_of(mini_m, mk_emit(5, 5, 118, 5), 3, 7, kNow,
+    f.chains.push_back(tui::view_of(mini_m, mk_emit(5, 5, 118, 5), 3, 7, kNow, kNow,
                                     mk_fresh(true, true, 700000, kNow - 400000, kNow - 400000,
                                              720000, 0)));
     // nano: was connected, lost every peer 1m35s ago, and never received a
     // single block. Everything about it is an absence.
-    f.chains.push_back(tui::view_of(none_m, tui::EmitCounts{}, 0, 0, kNow,
+    f.chains.push_back(tui::view_of(none_m, tui::EmitCounts{}, 0, 0, kNow, kNow,
                                     mk_fresh(false, true, 700000, 700000, 700000, 0,
                                              kNow - 95000)));
     return f;
@@ -561,7 +562,7 @@ void check_honesty() {
 
     // An empty chain is DARK and says nothing it cannot support.
     p2p::ReadModel empty(p2p::Sidechain::Nano);
-    const tui::ChainView dark = tui::view_of(empty, tui::EmitCounts{}, 0, 0, kNow);
+    const tui::ChainView dark = tui::view_of(empty, tui::EmitCounts{}, 0, 0, kNow, kNow);
     check_eq(dark.status, tui::ChainStatus::Dark, "a chain with nothing on it is dark");
     check(!dark.have_data, "a chain with nothing on it holds no data");
     check_eq(dark.tip_id8, std::string("-"), "a dark chain shows no tip id");
@@ -790,6 +791,14 @@ void check_liveness_ladder() {
     p2p::FreshnessView future = mk_fresh(true, true, now + 5000, now + 5000, now + 5000,
                                          now + 5000, 0);
     check_eq(future.tip_age_ms(now), std::uint64_t(0), "an age never runs backwards");
+    // ... and the clamp is REPORTED rather than passed off as a measurement.
+    check(future.clock_ahead(now), "an instant in our future is recognised as skew");
+    check(p2p::FreshnessView::ahead(now, now + 1), "one millisecond ahead is ahead");
+    check(!p2p::FreshnessView::ahead(now, now), "the present instant is not ahead");
+    check(!p2p::FreshnessView::ahead(now, 0), "an absent instant is not ahead of anything");
+    check(!mk_fresh(true, true, now - 5000, now - 5000, now - 5000, now - 5000, 0)
+               .clock_ahead(now),
+          "a view entirely in the past reports no skew");
 }
 
 // ---------------------------------------------------------------------------
@@ -816,7 +825,7 @@ void check_state_codec() {
     const st::MonitorState a = st::state_of(f, meta);
     const std::string json = st::to_json(a);
     check(json.size() > 1000 && json.size() < 16000, "one state file is a few KB");
-    check(json.find("\"schema\":\"p2pmon-state/1\"") != std::string::npos,
+    check(json.find("\"schema\":\"p2pmon-state/2\"") != std::string::npos,
           "the file names its schema first");
     check(json.find("\"emitted_ids\":[0,1,3,6]") != std::string::npos,
           "the read-only claim is written into the file");
@@ -930,8 +939,19 @@ void check_state_codec() {
           "a foreign schema is refused");
     check(!st::from_json(json.substr(0, json.size() / 2), junk, why),
           "a truncated file is refused");
-    check(!st::from_json("{\"schema\":\"p2pmon-state/1\"}", junk, why),
+    check(!st::from_json("{\"schema\":\"p2pmon-state/2\"}", junk, why),
           "a state with no write time is refused");
+
+    // A FILE FROM THE MONOTONIC-CLOCK ERA. Its instants are milliseconds since
+    // that host booted and its schema still says so, so it is refused outright
+    // rather than reinterpreted into a panel dated twenty thousand days ago.
+    std::string v1 = json;
+    const std::string::size_type tag = v1.find("p2pmon-state/2");
+    if (tag != std::string::npos) v1.replace(tag, 14, "p2pmon-state/1");
+    check(!st::from_json(v1, junk, why), "a p2pmon-state/1 file is refused, not reinterpreted");
+    check(why.find("p2pmon-state/1") != std::string::npos
+          && why.find("p2pmon-state/2") != std::string::npos,
+          "and the refusal names both the schema found and the schema wanted");
 
     // THE READ PATH. A saved state renders through the SAME renderer, and its
     // age is resolved against the reader's clock: a day later it is STALE.
@@ -949,6 +969,35 @@ void check_state_codec() {
           "every restored panel carries the age of the file");
     check(restored.find("15200104") != std::string::npos,
           "a restored frame carries the numbers that were saved");
+
+    // THE REBOOT SHAPE. The case the clock split exists for: a file written
+    // 235 seconds ago, read by a process that did not write it. Because every
+    // instant in the file is wall-clock, the age is the time that actually
+    // passed -- it does not collapse to "0s" the way a ms-since-boot instant
+    // does once the host has rebooted between the write and the read.
+    const tui::MonitorFrame after_reboot = st::frame_of(b, meta.written_at_ms + 235000ull);
+    check_eq(after_reboot.file_age_ms, std::uint64_t(235000),
+             "a 235 s-old file is 235 s old, not 0 s old");
+    const std::string reboot_text = tui::snapshot_text(after_reboot, kCols);
+    check(reboot_text.find("written 3m55s ago") != std::string::npos,
+          "and the banner says so in words");
+    check(reboot_text.find("written 0s ago") == std::string::npos,
+          "the silent-freshness lie is not renderable from a wall-clock file");
+    for (const tui::ChainView& c : after_reboot.chains)
+        check(c.tip_age_ms >= 235000, "every chain's tip age carries the same real elapsed time");
+
+    // THE MIRROR IMAGE: a reader whose own clock is BEHIND the file's -- an NTP
+    // step, or a file copied from a host that is ahead. The age clamps to zero,
+    // the frame says why, and the clamped figure is marked.
+    const tui::MonitorFrame behind = st::frame_of(b, meta.written_at_ms - 5000ull);
+    check(behind.clock_ahead, "a file dated in our future is flagged");
+    check_eq(behind.file_age_ms, std::uint64_t(0), "its age clamps rather than wrapping");
+    const std::string behind_text = tui::snapshot_text(behind, kCols);
+    check(behind_text.find("CLOCK SKEW") != std::string::npos,
+          "the frame states the skew in words");
+    check(behind_text.find("0s+") != std::string::npos, "and marks the clamped age");
+    check(behind_text.find("584542046d") == std::string::npos,
+          "no unsigned wrap ever reaches the screen");
 
     // Read back one second later and the same file is a current reading, with
     // the same numbers -- the continuity property, in the renderer.
@@ -984,6 +1033,14 @@ void check_formatting() {
     check_str(tui::fmt_age(2000),         "2s", "age: seconds");
     check_str(tui::fmt_age(131000),       "2m11s", "age: minutes");
     check_str(tui::fmt_age(3900000),      "1h05m", "age: hours");
+
+    // The clock-skew marker. An age computed from an instant that lies in the
+    // FUTURE of the reading clock has been clamped to zero, and a bare "0s"
+    // would read as "this happened a moment ago" -- a statement nobody
+    // measured. `+` says the figure is a lower bound.
+    check_str(tui::fmt_age(0, true),      "0s+", "age: a clamped age is marked");
+    check_str(tui::fmt_age(131000, true), "2m11s+", "age: the marker rides any magnitude");
+    check_str(tui::fmt_age(2000, false),  "2s", "age: an ordinary age is not marked");
 
     // The bar's scale is 0..2x target, so on target is exactly half full and
     // stops at the `:` mark.

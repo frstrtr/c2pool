@@ -221,9 +221,11 @@ int main(int argc, char** argv) {
     std::cout << "observing p2pool " << p2p::to_string(cfg.chain)
               << " sidechain, read-only, for " << (cfg.run_ms / 1000) << " s\n" << std::flush;
 
-    const std::uint64_t t0 = p2p::now_ms();
+    // STEADY: this is the length of one run, start to finish, inside one
+    // process -- a duration, and the one clock an NTP step must not perturb.
+    const std::uint64_t t0 = p2p::steady_ms();
     const std::uint64_t iters = obs.run();
-    const std::uint64_t elapsed = p2p::now_ms() - t0;
+    const std::uint64_t elapsed = p2p::steady_ms() - t0;
 
     std::cout << "\n" << obs.model().status(elapsed);
     std::cout << "  outbound     : " << obs.ledger().to_string() << "\n";

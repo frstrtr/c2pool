@@ -83,6 +83,9 @@
 // is what lets a KAT drive a chain through all seven states in fixed
 // milliseconds with no sleeping and no network. STL only, deliberately
 // POSIX-free: this header is compiled by the offline render KAT.
+//
+// The `now` it is fed is WALL-CLOCK (p2p::wall_ms()), for the reason set out on
+// FreshnessView below: these instants outlive the process that recorded them.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -149,16 +152,29 @@ struct FreshnessThresholds {
 // back out of it, so a restored chain is classified by exactly the code that
 // classifies a live one -- against the CURRENT clock, which is what makes a
 // week-old file render as STALE rather than as a healthy chain.
+//
+// EVERY INSTANT HERE IS WALL-CLOCK MILLISECONDS SINCE THE UNIX EPOCH --
+// p2p::wall_ms(), never p2p::steady_ms(). That is not a stylistic choice: these
+// five numbers are written to the state file by one process and subtracted from
+// another process's clock, on another boot and sometimes on another machine, so
+// the only clock that can carry them is the one both processes agree on. A
+// monotonic ms-since-boot instant makes the subtraction meaningless across a
+// reboot and renders a stale chain as "LIVE as of 0s"; see the two-clock note
+// at the top of p2pool_observer.hpp for the full account of that failure.
+//
+// The durations this file compares them against -- the QUIET and STALE
+// thresholds -- are elapsed times and belong to neither clock: a threshold of
+// 180 000 ms is 180 000 ms on both.
 // ---------------------------------------------------------------------------
 struct FreshnessView {
     bool          known          = false;  // false: no freshness was recorded at all
     bool          have_data      = false;  // at least one sidechain block is held
     bool          ever_connected = false;  // a handshake completed at some point
-    std::uint64_t started_at_ms  = 0;      // when this chain started being watched
-    std::uint64_t tip_at_ms      = 0;      // last time the tip HEIGHT increased
-    std::uint64_t rx_at_ms       = 0;      // last time a new distinct block arrived
-    std::uint64_t up_since_ms    = 0;      // 0 when no peers are up
-    std::uint64_t down_since_ms  = 0;      // 0 while peers are up
+    std::uint64_t started_at_ms  = 0;      // wall: chain started being watched
+    std::uint64_t tip_at_ms      = 0;      // wall: the tip HEIGHT last increased
+    std::uint64_t rx_at_ms       = 0;      // wall: a new distinct block last arrived
+    std::uint64_t up_since_ms    = 0;      // wall; 0 when no peers are up
+    std::uint64_t down_since_ms  = 0;      // wall; 0 while peers are up
 
     // Age helpers. Clamped at zero: a state file written by a machine whose
     // clock is ahead of ours must produce "0s", never a 500-million-second age
@@ -166,6 +182,24 @@ struct FreshnessView {
     static std::uint64_t age(std::uint64_t now, std::uint64_t then) noexcept {
         return (then && now > then) ? now - then : 0;
     }
+
+    // THE CLAMP IS NOT ENOUGH ON ITS OWN. Wall time steps backwards for two
+    // ordinary reasons -- an NTP correction on this host, and a file written by
+    // a host whose clock is ahead of it -- and in both cases age() above returns
+    // a perfectly confident 0, which reads on the panel as "this happened just
+    // now". That is the same class of lie as the one the clock split fixes, in
+    // miniature. So a recorded instant that lies in OUR FUTURE is reported as
+    // such, and the renderer marks the age it clamped with a `+` rather than
+    // printing a bare "0s".
+    static bool ahead(std::uint64_t now, std::uint64_t then) noexcept {
+        return then != 0 && then > now;
+    }
+    // True when ANY instant this view holds is in the future of `now`.
+    bool clock_ahead(std::uint64_t now) const noexcept {
+        return ahead(now, started_at_ms) || ahead(now, tip_at_ms) || ahead(now, rx_at_ms)
+            || ahead(now, up_since_ms)   || ahead(now, down_since_ms);
+    }
+
     std::uint64_t tip_age_ms(std::uint64_t now) const noexcept { return age(now, tip_at_ms); }
     std::uint64_t rx_age_ms(std::uint64_t now)  const noexcept { return age(now, rx_at_ms); }
     std::uint64_t up_ms(std::uint64_t now)      const noexcept { return age(now, up_since_ms); }
@@ -215,8 +249,9 @@ inline Liveness classify(const FreshnessView& f, std::size_t peers_up, std::size
 class FreshnessTracker {
 public:
     // Called once when the chain starts being watched. Seeds both clocks to
-    // `now` so a chain that never receives anything reports "nothing has moved
-    // for 3m10s" rather than an age measured from the epoch.
+    // `now` -- WALL time, as everywhere in this file -- so a chain that never
+    // receives anything reports "nothing has moved for 3m10s" rather than an
+    // age measured from the epoch.
     void start(std::uint64_t now) {
         v_.known         = true;
         v_.started_at_ms = now;

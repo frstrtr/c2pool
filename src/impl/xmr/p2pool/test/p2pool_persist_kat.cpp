@@ -35,6 +35,15 @@
 //   * a directory that cannot be created, and a journal that has grown past its
 //     cap, are both handled without the caller noticing anything but a flag.
 //
+// And, since the reboot bug, the CLOCK the file is written on -- which is the
+// same kind of claim: operational, cross-process, and invisible to a round trip
+// through a string. Section 6 checks that every persisted instant is wall-clock
+// (seconds since the UNIX epoch, so it still means something on the next boot
+// and on another machine), that the monitor's own freshness trackers are fed
+// that clock and not the monotonic one, and that an age computed across two
+// processes is real elapsed time rather than the zero a ms-since-boot instant
+// collapses to. See the two-clock note at the top of p2pool_observer.hpp.
+//
 // Everything is done under a fresh mkdtemp() directory which is removed at the
 // end. This test writes nowhere else and needs no network.
 //
@@ -55,6 +64,7 @@
 #include <string>
 #include <vector>
 
+#include "impl/xmr/p2pool/p2pool_multiwatch.hpp"
 #include "impl/xmr/p2pool/p2pool_persist.hpp"
 #include "impl/xmr/p2pool/p2pool_read_model.hpp"
 #include "impl/xmr/p2pool/p2pool_state.hpp"
@@ -145,8 +155,8 @@ tui::MonitorFrame build_frame() {
     e.messages[1] = 6;   e.bytes[1] = 246;
     e.messages[2] = 141; e.bytes[2] = 4653;
     e.messages[3] = 6;   e.bytes[3] = 6;
-    f.chains.push_back(tui::view_of(main_m, e, 4, 12, kNow, mk_fresh()));
-    f.chains.push_back(tui::view_of(mini_m, e, 3, 7, kNow, mk_fresh()));
+    f.chains.push_back(tui::view_of(main_m, e, 4, 12, kNow, kNow, mk_fresh()));
+    f.chains.push_back(tui::view_of(mini_m, e, 3, 7, kNow, kNow, mk_fresh()));
     return f;
 }
 
@@ -476,6 +486,154 @@ void check_journal(const std::string& root) {
     check_eq(s.seq, std::uint64_t(9), "the state is unaffected by the journal");
 }
 
+// ---------------------------------------------------------------------------
+// 6) THE CLOCK EVERY PERSISTED INSTANT IS ON.
+//
+// THE BUG THIS SECTION EXISTS FOR. Every instant in the state file used to be
+// taken from std::chrono::steady_clock -- milliseconds since this host booted.
+// Inside one boot that is indistinguishable from a wall instant, which is why
+// the format round trip, the SIGKILL test above and a live soak all passed. It
+// is worthless the moment the file outlives the boot: after a reboot, a
+// four-minute-old file's tip_advanced_at_ms of 3 000 000 is subtracted from a
+// ms-since-THIS-boot "now" of 12 000, clamps to zero, and the monitor reports
+// "written 0s ago" with every chain "LIVE as of 0s". Copy the file to another
+// machine and the same subtraction fabricates an age of days instead.
+//
+// Three checks, because the bug had three faces:
+//
+//   a) the two clocks are DIFFERENT and tellable apart. A wall instant is about
+//      1.75e12 today; a monotonic one is ms of uptime, which stays in the low
+//      billions for the next thirty years. Anything persisted that is not
+//      epoch-scale is a ms-since-boot value.
+//   b) the PRODUCTION path feeds wall time to the freshness trackers. This
+//      drives a real MultiWatch turn -- the same poll_once() the monitor's loop
+//      calls -- and inspects the instants it recorded. Seedless and never
+//      seeded, so it opens no socket and resolves no name.
+//   c) an age computed ACROSS TWO PROCESSES is real elapsed time. A child
+//      writes the file and exits; the parent waits, reads it back in a process
+//      that never shared a variable with the writer, and the rendered age is
+//      the time that actually passed -- neither 0s nor a day.
+// ---------------------------------------------------------------------------
+
+// Epoch-scale: after 2023-11 and before 2096. Wide enough never to age out,
+// narrow enough that a ms-since-boot value cannot sit inside it.
+bool is_wall_ms(std::uint64_t v) { return v > 1700000000000ull && v < 4000000000000ull; }
+
+void check_wall_clock_instants(const std::string& root) {
+    // (a) two clocks, and they are not the same clock.
+    const std::uint64_t w = p2p::wall_ms();
+    const std::uint64_t s = p2p::steady_ms();
+    check(is_wall_ms(w), "wall_ms() is milliseconds since the UNIX epoch");
+    check(s < 1000000000000ull,
+          "steady_ms() is uptime, not epoch time -- the two clocks are distinguishable");
+    check(w > s, "the wall clock is far ahead of the monotonic one, as it must be");
+    // Monotonic within a process is the property the durations rely on.
+    check(p2p::steady_ms() >= s, "steady_ms() never goes backwards");
+
+    // (b) the production path. One turn of the real loop, no sockets: every
+    // chain is seedless and seed_all() is never called, so nothing is queued to
+    // dial and no name is resolved.
+    p2p::MonitorConfig mc;
+    mc.chains   = {p2p::Sidechain::Main, p2p::Sidechain::Mini};
+    mc.seedless = mc.chains;
+    p2p::MultiWatch watch(mc);
+    watch.poll_once(-1, 0, 0);                 // samples freshness, dials nothing
+    const tui::MonitorFrame f = watch.frame(0, false);
+    check_eq(f.chains.size(), std::size_t(2), "the watch produced a panel per chain");
+    for (const tui::ChainView& v : f.chains) {
+        check(v.fresh.known, "the freshness tracker started on the first turn");
+        check(is_wall_ms(v.fresh.started_at_ms),
+              "started_at_ms is a wall instant, not milliseconds since boot");
+        check(is_wall_ms(v.fresh.tip_at_ms),
+              "tip_advanced_at_ms is a wall instant -- the clock that survives a reboot");
+        check(is_wall_ms(v.fresh.rx_at_ms), "rx_at_ms is a wall instant");
+        check(is_wall_ms(v.fresh.down_since_ms),
+              "down_since_ms is a wall instant (no peers on a seedless first turn)");
+        check(!v.clock_ahead, "a freshly recorded instant is not in our own future");
+    }
+    // And the state built from that frame carries the same instants to disk.
+    st::SessionMeta live_meta;
+    live_meta.written_at_ms = p2p::wall_ms();
+    live_meta.session_started_at_ms = live_meta.written_at_ms;
+    const st::MonitorState live = st::state_of(f, live_meta);
+    for (const st::ChainState& c : live.chains) {
+        check(is_wall_ms(c.started_at_ms), "the state file receives a wall started_at_ms");
+        check(is_wall_ms(c.tip_advanced_at_ms),
+              "the state file receives a wall tip_advanced_at_ms");
+    }
+    check(st::journal_line(live).find("\"t\":" + std::to_string(live.written_at_ms))
+              != std::string::npos,
+          "the journal's `t` is that same wall write instant");
+
+    // (c) THE REBOOT SHAPE, across two processes. The child writes; the parent
+    // reads it in a process that shares nothing with the writer but the file.
+    const std::string dir = root + "/wallclock";
+    const std::uint64_t kWaitMs = 1200;
+
+    const pid_t child = ::fork();
+    if (child < 0) {
+        std::printf("SKIP: fork failed (%s); the cross-process age check needs a child\n",
+                    std::strerror(errno));
+        return;
+    }
+    if (child == 0) {
+        p2p::StateStore store;
+        if (!store.open(dir)) ::_exit(3);
+        st::SessionMeta meta;
+        meta.written_at_ms = p2p::wall_ms();       // the live path's instant
+        meta.seq = 1;
+        meta.pid = static_cast<std::uint64_t>(::getpid());
+        meta.session_started_at_ms = meta.written_at_ms;
+        if (!store.save_atomic(st::state_of(build_frame(), meta))) ::_exit(4);
+        ::_exit(0);
+    }
+    int status = 0;
+    check(::waitpid(child, &status, 0) == child, "the writer child was reaped");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "the writer child wrote and exited");
+
+    ::usleep(static_cast<useconds_t>(kWaitMs) * 1000);
+
+    p2p::StateStore reader;
+    reader.open_read_only(dir);
+    st::MonitorState got;
+    std::string why;
+    check(reader.load(got, why), "the file the other process wrote reads back");
+    check(is_wall_ms(got.written_at_ms), "written_at_ms on disk is a wall instant");
+
+    const std::uint64_t age = p2p::FreshnessView::age(p2p::wall_ms(), got.written_at_ms);
+    check(age >= kWaitMs,
+          "the age of the file is at least the time that actually passed -- never 0s");
+    check(age < 60000, "and it is not a fabricated age of hours or days");
+
+    // Rendered through the same path `--read` uses, at the reader's wall clock.
+    const tui::MonitorFrame rf = st::frame_of(got, p2p::wall_ms());
+    check(rf.file_age_ms >= kWaitMs, "the rendered file age is the real elapsed time");
+    check(!rf.clock_ahead, "a file written in the past is not flagged as clock skew");
+    const std::string text = tui::snapshot_text(rf, 100);
+    check(text.find("RESTORED FRAME") != std::string::npos, "the restored frame says so");
+    check(text.find("CLOCK SKEW") == std::string::npos,
+          "and says nothing about skew when there is none");
+
+    // THE OTHER DIRECTION: a file dated in our future -- an NTP step backwards,
+    // or a file from a host whose clock is ahead. The age clamps, and the frame
+    // says the age is a clamp rather than printing a confident 0s.
+    st::MonitorState ahead = got;
+    ahead.written_at_ms += 3600000;                  // an hour into our future
+    for (st::ChainState& c : ahead.chains) {
+        c.tip_advanced_at_ms += 3600000;
+        c.rx_at_ms           += 3600000;
+        c.started_at_ms      += 3600000;
+    }
+    const tui::MonitorFrame skewed = st::frame_of(ahead, p2p::wall_ms());
+    check(skewed.clock_ahead, "a file dated in our future is recognised as skewed");
+    check_eq(skewed.file_age_ms, std::uint64_t(0), "its age is clamped, never wrapped");
+    const std::string stext = tui::snapshot_text(skewed, 100);
+    check(stext.find("CLOCK SKEW") != std::string::npos,
+          "the frame says in words that a recorded instant is ahead of this host");
+    check(stext.find("0s+") != std::string::npos,
+          "and the clamped age is marked, so it cannot read as `this just happened`");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -494,9 +652,10 @@ int main(int argc, char** argv) {
     check_lock(root);
     check_degradation(root);
     check_journal(root);
+    check_wall_clock_instants(root);
 
     // Leave nothing behind. Each sub-test made its own directory under root.
-    for (const char* sub : {"rt", "kill", "lock", "empty", "corrupt", "journal"})
+    for (const char* sub : {"rt", "kill", "lock", "empty", "corrupt", "journal", "wallclock"})
         remove_tree(root + "/" + sub);
     remove_tree(root);
 
