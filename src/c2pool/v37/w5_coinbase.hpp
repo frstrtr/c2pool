@@ -172,7 +172,9 @@ class StateCommitment {
 public:
     // Build from W4's ledger. Balances are the FINALIZED partition (finalW),
     // the same rows W4's owed_digest commits — positive rows only, key ASC.
-    StateCommitment(const OwedLedger& ledger, u64 chain) {
+    StateCommitment(const OwedLedger& ledger, u64 chain)
+        : m_chain(chain), m_ledger_seq(ledger.ledger_seq()),
+          m_owed_digest(ledger.owed_digest()) {
         std::vector<std::pair<bytes32, u64>> rows;
         for (const auto& [k, w] : ledger.finalW())
             if (w > 0) rows.emplace_back(k, static_cast<u64>(w));
@@ -184,11 +186,14 @@ public:
             std::vector<std::uint8_t> p;
             const char tag[4] = {'V', '3', '7', 'S'};
             p.insert(p.end(), tag, tag + 4);
-            put_u64(p, chain);
-            put_u64(p, ledger.ledger_seq());
+            put_u64(p, m_chain);
+            put_u64(p, m_ledger_seq);
             put_u64(p, static_cast<u64>(rows.size()));
-            bytes32 od = ledger.owed_digest();
-            p.insert(p.end(), od.begin(), od.end());
+            // S-1: the ONE read, taken in the member init list above and
+            // committed here. Not a second call to owed_digest() and not a
+            // recomputation — the identical bytes by construction, so
+            // owed_digest() below is a true accessor of what is IN the leaf.
+            p.insert(p.end(), m_owed_digest.begin(), m_owed_digest.end());
             m_leaves.push_back(leaf_hash(p));
             m_keys.push_back(bytes32{});  // summary has no key
         }
@@ -208,6 +213,14 @@ public:
     bytes32 root() const { return merkle_root(m_leaves); }
 
     std::size_t leaf_count() const { return m_leaves.size(); }
+
+    // ★ S-1: exactly what the "V37S" summary leaf carries. These are reads of
+    // the values this object COMMITTED, so a caller comparing
+    // sc.owed_digest() with ledger.owed_digest() is comparing the emitted
+    // commitment against the S8 fold — not two independent recomputations.
+    bytes32 owed_digest() const { return m_owed_digest; }
+    u64     ledger_seq()  const { return m_ledger_seq; }
+    u64     chain()       const { return m_chain; }
 
     // Inclusion proof for one balance key. Fills the leaf hash and a
     // Lane::MerkleProof that ::v37::Lane::verify_proof accepts against root().
@@ -279,7 +292,36 @@ private:
 
     std::vector<bytes32> m_leaves;
     std::vector<bytes32> m_keys;  // parallel to m_leaves; empty bytes32 for [0]
+    u64     m_chain = 0;          // S-1: the values committed in leaf [0],
+    u64     m_ledger_seq = 0;     // read ONCE at construction so the emission
+    bytes32 m_owed_digest{};      // and the accessors cannot disagree
 };
+
+// ─────────────────────────────────────────────────────────────────────────
+// ★★ S-1 — the TEMPLATE-BUILD emission, bound to the O2 consistent cut.
+//
+// A block template must commit the owed state of ONE ledger position. This is
+// the only supported way to build that commitment: it takes the cut token the
+// caller already holds (w4 read_cut) and the SAME ledger the S8 fold
+// populated, and it refuses — hard, nullopt, never a retry and never a
+// partial — if the ledger has moved since the cut. On success the returned
+// commitment's owed_digest() is byte-for-byte the cut's owed_digest, which is
+// byte-for-byte OwedLedger::owed_digest(): S8 ≡ S-1 by construction rather
+// than by convention. A caller that skips this and constructs StateCommitment
+// directly is building against "now", which at template time is a race.
+// ─────────────────────────────────────────────────────────────────────────
+inline std::optional<StateCommitment> state_commitment_at_cut(
+    const OwedLedger& ledger, const ::c2pool::v37n::settle::CutToken& cut) {
+    const auto e = ::c2pool::v37n::settle::emit_owed_at_cut(ledger, cut);
+    if (!e) return std::nullopt;                       // the ledger moved
+    StateCommitment sc(ledger, static_cast<u64>(cut.chain));
+    // Defence in depth: the object must have committed the cut's value. This
+    // can only fire if the ledger mutated BETWEEN the check and the build, in
+    // which case emitting would be the fork — so refuse instead.
+    if (sc.owed_digest() != cut.owed_digest) return std::nullopt;
+    if (sc.ledger_seq() != cut.ledger_seq) return std::nullopt;
+    return sc;
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // (D) The assembled coinbase.
