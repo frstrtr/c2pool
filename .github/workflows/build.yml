@@ -1075,6 +1075,26 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Debug — checkout provenance (evidence only, never masks)
+        working-directory: ${{ github.workspace }}
+        continue-on-error: true
+        run: |
+          echo "HEAD:            $(git rev-parse HEAD || true)"
+          git log -1 --oneline || true
+          echo "merge parents (P1=base P2=PR head): $(git log -1 --format=%P || true)"
+          echo "-- ls web-static/sharechain-explorer/ --"
+          ls -la web-static/sharechain-explorer/ || true
+
+      - name: Assert lockfile present (fail clearly on broken checkout)
+        working-directory: ${{ github.workspace }}
+        run: |
+          f=web-static/sharechain-explorer/package-lock.json
+          if [ ! -f "$f" ]; then
+            echo "::error title=Checkout integrity::${f} is committed but ABSENT on disk — broken checkout / wrong merge-ref, not a code defect. See the Debug step above for HEAD and merge parents." >&2
+            exit 1
+          fi
+          echo "lockfile present: $f"
+
       - uses: actions/setup-node@v5
         with:
           # Node 22 — node --test supports glob expansion natively
