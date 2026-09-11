@@ -36,6 +36,7 @@
 #include <impl/dash/coin/dkg_window.hpp>
 
 #include <core/uint256.hpp>
+#include <core/p2p_message_stats.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 
@@ -2200,4 +2201,32 @@ TEST(DashQcVerifyMemoDeclineCause, UnlatchedSlotStillDeclinesAsPlanUnderivable) 
     // reason — and now says exactly that instead of "nullopt", a word that
     // could not disagree with anything.
     EXPECT_EQ(why.value, "reason-unreported");
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// #157 tx-inject STATUS publish (read-only observability wiring).
+//
+// The loopback /api/tx-inject-status endpoint reads core::obs::inject_status().
+// NodeCoinState must MIRROR its lane state there on arm and after each pool
+// mutation. This proves the publish wiring (compilation + behaviour). It
+// asserts NOTHING about arming policy or submission — the mirror is read-only.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashNodeCoinState, TxInjectStatusPublishMirrorsArmFlag) {
+    NodeCoinState st;
+    EXPECT_FALSE(st.tx_inject_enabled());
+
+    st.set_tx_inject_enabled(true);
+    const auto& s = core::obs::inject_status();
+    EXPECT_TRUE(s.enabled.load());
+    EXPECT_EQ(s.pool_entries.load(), 0u);   // freshly armed, nothing inflight
+    EXPECT_EQ(s.max_entries.load(),
+              static_cast<std::uint64_t>(
+                  dash::coin::TxInjectPool::INJECT_POOL_MAX_ENTRIES));
+    EXPECT_EQ(s.max_tx_bytes.load(),
+              static_cast<std::uint64_t>(
+                  dash::coin::TxInjectPool::kMaxInjectTxBytes));
+    EXPECT_NE(s.updated_at.load(), 0);      // publish stamped a time
+
+    st.set_tx_inject_enabled(false);        // disarm mirrors too
+    EXPECT_FALSE(core::obs::inject_status().enabled.load());
 }

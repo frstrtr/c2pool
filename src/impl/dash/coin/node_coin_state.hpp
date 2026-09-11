@@ -35,6 +35,9 @@
 #include <impl/dash/coin/governance_object.hpp>  // SuperblockPayment (daemonless superblock schedule)
 
 #include <core/uint256.hpp>
+#include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
+
+#include <ctime>
 
 #include <array>
 #include <cstdint>
@@ -592,7 +595,7 @@ public:
     /// subsidy / PPLNS / payee path is byte-unchanged (a 0-fee inject adds 0 to
     /// total_fees). Injected txs ride the served-body path, so this augments —
     /// and requires — the serve-mempool-txs / daemonless serve posture.
-    void set_tx_inject_enabled(bool on) { m_tx_inject_enabled = on; }
+    void set_tx_inject_enabled(bool on) { m_tx_inject_enabled = on; publish_inject_status(); }
     bool tx_inject_enabled() const { return m_tx_inject_enabled; }
 
     /// Named outcome of a submit_inject call — every refusal carries its cause
@@ -642,6 +645,7 @@ public:
         }
         // Track it for DoS accounting + expiry.
         m_inject_pool.admit(r.txid, flags, expiry_height, byte_size);
+        publish_inject_status();
         r.ok = true;
         r.cause = "ok";
         return r;
@@ -660,9 +664,28 @@ public:
                 m_mempool.remove_tx(id);
             }
         }
+        publish_inject_status();
     }
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
+
+    /// Publish the current tx-inject lane state into the process-global
+    /// read-only observability snapshot (core::obs::inject_status()),
+    /// consumed by the loopback /api/tx-inject-status endpoint. Pure MIRROR
+    /// of state the node already owns: NO money-path, NO config write, NO
+    /// arming — it only lets a panel DISPLAY the flag + inflight pool.
+    /// Cheap relaxed-atomic stores; called on arm and after each pool
+    /// mutation (io thread).
+    void publish_inject_status() const {
+        auto& s = core::obs::inject_status();
+        s.enabled.store(m_tx_inject_enabled, std::memory_order_relaxed);
+        s.pool_entries.store(m_inject_pool.size(), std::memory_order_relaxed);
+        s.pool_bytes.store(m_inject_pool.total_bytes(), std::memory_order_relaxed);
+        s.max_entries.store(TxInjectPool::INJECT_POOL_MAX_ENTRIES, std::memory_order_relaxed);
+        s.max_total_bytes.store(TxInjectPool::kMaxInjectTotalBytes, std::memory_order_relaxed);
+        s.max_tx_bytes.store(TxInjectPool::kMaxInjectTxBytes, std::memory_order_relaxed);
+        s.updated_at.store(static_cast<std::int64_t>(std::time(nullptr)), std::memory_order_relaxed);
+    }
 
     /// PINNED LOCAL TX (--pin-local-tx-hex, donation-dust consolidation): an
     /// operator-supplied, externally-signed, zero-fee tx that can only reach
