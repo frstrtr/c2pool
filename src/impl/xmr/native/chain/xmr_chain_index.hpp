@@ -805,6 +805,22 @@ private:
             r.connect = co.status;
             if (co.status == ConnectStatus::Ok) {
                 alt_.erase(r.id);
+                // A block that arrived BEFORE its parent was parked in the alt
+                // pool, and until now nothing ever revisited it: the branch path
+                // below resolves descendants, the fast path did not. So a node
+                // that was handed a block out of order kept it forever and
+                // stopped following the tip -- while its peers went on relaying
+                // blocks it had already been given.
+                //
+                // This is not a rare case, it is EVERY COLD START: monerod sends
+                // its top block to a peer whose advertised height is behind its
+                // own (process_payload_sync_data), so the first block a syncing
+                // node receives is normally one it cannot connect yet. Found by
+                // the M0 assembly on a live regtest run, where the index stopped
+                // at the height it had backfilled to and four pushed blocks sat
+                // parked behind it.
+                resolve_descendants_locked_(r.id);
+                connect_parked_children_locked_();
                 r.outcome = OfferOutcome::Connected;
                 return r;
             }
@@ -1023,6 +1039,40 @@ private:
                 alt_.insert(std::move(c));
                 stack.push_back(child_id);
             }
+        }
+    }
+
+    // Drain the parked children of the tip, in order, as ordinary EXTENDS.
+    //
+    // Going through maybe_switch_locked_() instead would work but would LIE: a
+    // switch whose fork point IS the current tip disconnects nothing, and it
+    // announces one Reorg of depth 0 for what is simply the next block. A
+    // consumer that un-confirms on a reorg would un-confirm nothing, repeatedly.
+    void connect_parked_children_locked_() {
+        for (std::size_t guard = 0; guard < 4096; ++guard) {
+            const RowRecord* tip = rows_.tip();
+            if (!tip) return;
+            const Hash tip_id = tip->row.id;
+
+            // Copied out of the pool before anything is connected: connecting
+            // mutates the caches a live pointer into the pool would outlive.
+            std::optional<AltBlock> pick;
+            for (const AltBlock* c : alt_.children_of(tip_id)) {
+                if (c->resolved && c->adoptable && c->has_entry) { pick = *c; break; }
+            }
+            if (!pick) return;
+
+            EvaluatedBlock ev;
+            std::string    why;
+            if (evaluate_block(pick->entry, ev, why) != EvalStatus::Ok) {
+                alt_.erase_branch(pick->id);
+                continue;
+            }
+            const ConnectOutcomeLocal co =
+                connect_to_tip_locked_(pick->entry, ev, pick->pow_verified, Hash{},
+                                       pick->own_mined, why);
+            if (co.status != ConnectStatus::Ok) return;   // leave it parked, and say nothing new
+            alt_.erase(pick->id);
         }
     }
 

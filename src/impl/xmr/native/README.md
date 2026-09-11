@@ -24,6 +24,8 @@ activates v37 consensus and nothing here touches `src/sharechain/v37`.
 | `rct/` | Wave 1 / C3: non-input consensus — commitment balance, the Bulletproof+ verifier, the key-image domain check. The one part of this tree that compiles rather than being header-only |
 | `txpool/` | Wave 1 / C3: the relay-side transaction decoder and the relayed transaction pool itself |
 | `relay/` | Wave 1 / C5: the dual-arm found-block relay — the self-contained 2008 fluffy push, the on-demand monerod backup arm, the 2009 responder, and the c2pool-side redundant-broadcast carrier |
+| `parity/` | Wave 1 / C6: the monerod-parity oracle — the anchor-keyed graduation ledger and the three seams (tip, template, submit) it judges against a real daemon |
+| `node/` | M0: the ASSEMBLY — the threads the components were written against, the boot, the sync schedule, the status surface, and `xmr_native_node`, the entrypoint that runs the whole thing against a daemon |
 | `test/` | the KATs |
 
 ### contracts/
@@ -634,15 +636,20 @@ component does not answer it. An ingress with no coinbase check wired refuses to
 relay rather than relaying blind, and records that as our own gap rather than
 the peer's fault.
 
-## Not here yet
+## Where the milestones stand
 
-Landed so far, each authored against the contracts here: the levin codec (C1a),
-the levin transport (C1b), the peer pool and its DoS policy (C1c), the consensus
-state (C2a), the trust-anchor bundle (C2b), the chain index with its fork
-choice (C2c), the relayed txpool (C3), the template source (C4) and the block
-relay (C5). Still to come: the parity oracle (C6).
+All thirteen components are landed, each authored against the contracts here:
+the levin codec (C1a), the levin transport (C1b), the peer pool and its DoS
+policy (C1c), the consensus state (C2a), the trust-anchor bundle (C2b), the
+chain index with its fork choice (C2c), the relayed txpool (C3), the template
+source (C4), the block relay (C5) and the parity oracle (C6).
 
-C1b stops at one connection. The dial plan, the peer store, the primary
-election, the refill and rotation loops, the token buckets, the chain locator
-and the `IBroadcastPort` / `IChainFetcher` / `IChainServing` implementations are
-C1c, which is where `LevinLink`'s `on_frame` demux gets its consumers.
+**M0 is closed on the short proof**: `node/` assembles them, and
+`node/README.md` carries the run — a private regtest chain followed from the
+genesis block over levin alone (20 heights backfilled, 4 followed live as they
+were mined), RandomX verified on the verify thread with a zero io-thread
+counter, P-TIP CLEAN on all nine fields at every sampled height, and zero
+monerod RPC on the tip-follow path. The plan's 48–72 h P-TIP soak is a separate,
+operator-scoped run; M1 (txpool equality), M2 (template rebind), M3 (block
+relay) and M4 (graduation) each have their seam wired and unexercised on
+purpose.
