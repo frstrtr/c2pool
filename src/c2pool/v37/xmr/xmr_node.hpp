@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -92,6 +93,70 @@ public:
     XmrNode(const XmrNode&) = delete;
     XmrNode& operator=(const XmrNode&) = delete;
 
+    // ── M3: the DAEMONLESS tip driver seam ─────────────────────────────────
+    //
+    // Under --arm-order daemon-first (the default) the X2 MonerodAdapter is the
+    // tip: it fills a MainchainIndex from get_miner_data / ZMQ and answers the
+    // finalize driver's "is this block still at this height" from that mirror.
+    //
+    // Under --arm-order p2p-first there is no adapter at all. The tip is the
+    // native node's own levin-driven, RandomX-verified C2 index, and these two
+    // functions are how it gets in: the consumer installs the presence test
+    // BEFORE bring_up(), and pumps each mainchain event the native index
+    // produced from its own loop.
+    //
+    // The presence test is installed before bring_up rather than after because
+    // an uninstalled one cannot be made safe: XmrFinalizeDriver asks it at
+    // maturity, a false answer ORPHANS a block that is perfectly canonical, and
+    // there is no third value to return. So bring_up() REFUSES p2p-first
+    // without it rather than starting into a window where the answer is wrong.
+    using ChainPresenceFn = std::function<bool(std::uint64_t height, const std::string& bid_hex)>;
+    void set_native_chain_presence(ChainPresenceFn fn) { m_native_presence = std::move(fn); }
+
+    // Feed ONE mainchain event from the native index. Same body the adapter's
+    // event sink runs, called from the consumer's main loop instead of from a
+    // monerod callback -- so Extend/Reorg advance settlement and Orphan disposes
+    // exactly as they always did, off a chain no daemon described to us.
+    void pump_mainchain_event(const c2pool::xmr::node::MainchainEvent& ev) {
+        on_mainchain_event(ev);
+    }
+
+    // True when the daemon-backed X2 adapter is the tip driver. False in
+    // p2p-first: adapter() must not be called, and nothing may poll monerod.
+    bool daemon_tip_active() const noexcept { return m_adapter != nullptr; }
+
+    // ── c2pool#1551: the ONE chain-observation seam ────────────────────────
+    //
+    // Every block this node's chain tells it about -- a new tip, a reorg tip, an
+    // orphan -- is announced here, whichever arm drives the tip. The accounting
+    // layer above needs it to SEE a same-height race at all, and it has to be
+    // one seam and not two: a prefer-own tiebreak fed by the daemon adapter in
+    // one mode and by the native index in the other would be two policies that
+    // happened to share a name.
+    using ChainObserverFn = std::function<void(std::uint64_t height, const std::string& bid_hex)>;
+    void set_chain_observer(ChainObserverFn fn) { m_chain_observer = std::move(fn); }
+
+    // The canonical test the F1 finalize driver runs at maturity, exposed so the
+    // accounting layer asks the SAME question of the SAME chain. A tiebreak that
+    // consulted a different oracle than the one that finalizes would be a
+    // second, disagreeing consensus -- and the one it disagreed with would be
+    // the one holding the money.
+    bool chain_carries(std::uint64_t height, const std::string& bid_hex) {
+        if (m_adapter) {
+            auto b = m_adapter->index().by_height(height);
+            return b && hex_of(b->id) == bid_hex;
+        }
+        return m_native_presence ? m_native_presence(height, bid_hex) : false;
+    }
+
+    // The best height the settlement path is working against, from whichever
+    // driver is live. In p2p-first this is the highest height a pumped event
+    // carried, which is the same number the finalize cursor chases.
+    std::uint64_t best_height() const {
+        if (m_adapter) return m_adapter->index().best_height();
+        return m_tip_height;
+    }
+
     // Full bring-up in donor order. Throws std::runtime_error on a fail-closed
     // condition (no descriptor backend; a torn store; a rejected AddLane; a
     // mainnet coinbase without acknowledgement is refused later, at submit).
@@ -135,26 +200,42 @@ public:
         log("engine: started; AddLane(chain=" + std::to_string(m_cfg.lane_chain) +
             ") committed; lane v1 seeded");
 
-        // 5) bind the X2 adapter and route its event stream into the F1 driver.
-        m_adapter = std::make_unique<c2pool::xmr::node::MonerodAdapter>(
-            m_transport, m_cfg.monerod,
-            static_cast<std::uint64_t>(m_cfg.index_retain_recent));
+        // 5) bind the tip driver and route its event stream into the F1 driver.
+        //    M3 (R-ARMORDER): WHICH driver is the switch. daemon-first builds
+        //    the X2 adapter; p2p-first builds none and takes the native node's
+        //    own chain index instead, which is what makes the find path
+        //    daemonless rather than merely daemon-light.
+        const bool daemon_tip = (m_cfg.arm_order == ArmOrderMode::DaemonFirst);
+        if (!daemon_tip && !m_native_presence)
+            throw std::runtime_error(
+                "XmrNode: --arm-order p2p-first requires the native chain presence test to be "
+                "installed before bring_up() (set_native_chain_presence). Fail-closed: a finalize "
+                "driver that cannot ask whether a block is still on the best chain would orphan "
+                "every block it settles.");
+
+        if (daemon_tip)
+            m_adapter = std::make_unique<c2pool::xmr::node::MonerodAdapter>(
+                m_transport, m_cfg.monerod,
+                static_cast<std::uint64_t>(m_cfg.index_retain_recent));
 
         m_finalize = std::make_unique<XmrFinalizeDriver>(
             m_ledger, m_hw, *m_store, m_cfg.lane_chain, m_cfg.d_conf,
             m_recovered.finalize_cursor_height, m_recovered.max_event_seq,
-            [this](std::uint64_t h, const std::string& bid) {
-                auto b = m_adapter->index().by_height(h);
-                return b && hex_of(b->id) == bid;
-            });
+            [this](std::uint64_t h, const std::string& bid) { return chain_carries(h, bid); });
 
-        m_adapter->set_event_sink(
-            [this](const c2pool::xmr::node::MainchainEvent& ev) { on_mainchain_event(ev); });
+        if (daemon_tip) {
+            m_adapter->set_event_sink(
+                [this](const c2pool::xmr::node::MainchainEvent& ev) { on_mainchain_event(ev); });
 
-        // 6) start the adapter: subscribe ZMQ topics + one-shot RPC sync.
-        m_adapter->start();
-        m_adapter->initial_sync();
-        log("adapter: started; subscribed miner_data/chain_main/txpool; initial_sync issued");
+            // 6) start the adapter: subscribe ZMQ topics + one-shot RPC sync.
+            m_adapter->start();
+            m_adapter->initial_sync();
+            log("adapter: started; subscribed miner_data/chain_main/txpool; initial_sync issued");
+        } else {
+            log("adapter: NOT built (--arm-order p2p-first) — the tip, the canonical test and "
+                "the found-block relay all come from the native node's own levin chain; "
+                "monerod is not on the find path");
+        }
 
         m_up = true;
         log("bring_up: complete");
@@ -227,9 +308,17 @@ private:
     // Route the X2 mainchain event stream into the F1 finalize driver.
     void on_mainchain_event(const c2pool::xmr::node::MainchainEvent& ev) {
         using K = c2pool::xmr::node::MainchainEventKind;
+        // c2pool#1551: announce the block BEFORE settlement moves on it, so a
+        // rival that arrives in the same event is already in the race book when
+        // the finalize driver reaches the height.
+        if (m_chain_observer) {
+            if (ev.kind == K::Orphan) m_chain_observer(ev.block.height, hex_of(ev.orphaned_id));
+            else                      m_chain_observer(ev.block.height, hex_of(ev.block.id));
+        }
         switch (ev.kind) {
             case K::Extend:
             case K::Reorg: {
+                if (ev.block.height > m_tip_height) m_tip_height = ev.block.height;
                 // Advance settlement finality per the F1 contract off the new
                 // best height (the driver steps per-height internally; it NEVER
                 // jumps to the tip for bin_height).
@@ -264,6 +353,14 @@ private:
 
     std::unique_ptr<c2pool::xmr::node::MonerodAdapter> m_adapter;
     std::unique_ptr<XmrFinalizeDriver>                 m_finalize;
+
+    // M3: the p2p-first tip driver. Null adapter + this predicate is the
+    // daemonless posture; an adapter and no predicate is the default one.
+    ChainPresenceFn                        m_native_presence;
+    std::uint64_t                          m_tip_height = 0;
+
+    // c2pool#1551: installed by the accounting layer (FinalizeConnect).
+    ChainObserverFn                        m_chain_observer;
 
     std::vector<std::string>               m_log;
     bool                                   m_up = false;

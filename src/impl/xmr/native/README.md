@@ -1,0 +1,655 @@
+# Native-minimal Monero embedded node — Waves 0 and 1
+
+This tree is the pool-scoped Monero node c2pool speaks the Monero P2P protocol
+with directly, rather than linking monerod's libraries. monerod is not removed:
+it stays as a bootstrap oracle, a fallback submit arm and a parity judge, and it
+is demoted to optional only after the parity oracle has graduated the native
+node against it.
+
+**Scope fence.** Everything lives under `src/impl/xmr/`. This node is a WORK
+SOURCE for the pool — it tells the template what to build on and it pushes a
+found block — and it is **not** part of the v37 share-chain record. Nothing here
+activates v37 consensus and nothing here touches `src/sharechain/v37`.
+
+## What is here
+
+| directory | what |
+|---|---|
+| `contracts/` | the pinned interfaces every later component builds against, header-only (Wave 0) |
+| `contracts/fakes/` | a compiling fake per interface, so wave-1 components can be written and tested before their dependencies exist (Wave 0) |
+| `consensus/` | the shared primitives, plus the C2a consensus rules: block parse and identity, weights, reward, difficulty, timestamps, hard-fork policy |
+| `p2p/` | Wave 1 / C1a: the levin bucket-header codec, the epee portable-storage codec, and the typed P2P messages. Wave 1 / C1b: the transport on top of them — the asio `LevinSocket`, the FIFO reply matcher, the handshake state machine and the `LevinLink` that runs HANDSHAKE and the TIMED_SYNC beat |
+| `chain/` | Wave 1 / C2a: the consensus state, the wire-to-state evaluation seam, and the real `IChainView`. Wave 1 / C2c: the chain index over them — the height rows, fork choice, the bounded journaled reorg, the proof-of-work gate and burial |
+| `anchor/` | Wave 1 / C2b: the trust-anchor bundle — the `.inc` format, the fail-closed loader, the generator, and the release-pinned stagenet bundle |
+| `rct/` | Wave 1 / C3: non-input consensus — commitment balance, the Bulletproof+ verifier, the key-image domain check. The one part of this tree that compiles rather than being header-only |
+| `txpool/` | Wave 1 / C3: the relay-side transaction decoder and the relayed transaction pool itself |
+| `relay/` | Wave 1 / C5: the dual-arm found-block relay — the self-contained 2008 fluffy push, the on-demand monerod backup arm, the 2009 responder, and the c2pool-side redundant-broadcast carrier |
+| `parity/` | Wave 1 / C6: the monerod-parity oracle — the anchor-keyed graduation ledger and the three seams (tip, template, submit) it judges against a real daemon |
+| `node/` | M0: the ASSEMBLY — the threads the components were written against, the boot, the sync schedule, the status surface, and `xmr_native_node`, the entrypoint that runs the whole thing against a daemon |
+| `test/` | the KATs |
+
+### contracts/
+
+| file | surfaces |
+|---|---|
+| `types.hpp` | `PeerRef`, `TxBlobEntry`, `BlockEntry`, `ChainEntry`, `PeerSyncData`, `PeerFault`, `TemplateInputs`, `BlockTxEvent`, `SyncState`, the 128-bit helpers |
+| `chain_index.hpp` | `IChainIndexInbound` (wire → index), `IChainView` (index → consumers) |
+| `fetcher.hpp` | `IChainFetcher` (index → wire), and the ≤100-id request cap |
+| `serving.hpp` | `IChainServing`, the io-thread read side that keeps peers from dropping us |
+| `anchor.hpp` | `AnchorBundle`, the exact window sizes, `AnchorStatus` + `anchor_self_check`, and the pinned `load_anchor` signature |
+| `txpool.hpp` | `AdmissionEvidence`, `TxpoolSelectPolicy`, `TxRelayVerdict`, `IRelayedTxSink`, `ITxpoolSnapshot`, `ITxSource`, `ITxBlobSource` |
+| `broadcast.hpp` | `IBroadcastPort` |
+| `miner_data.hpp` | `IMinerDataSource`, `MinerDataReadiness`, `MinerDataEpoch` — the one seam the template provider is rebound through |
+| `relay.hpp` | `ArmOrder`, `RelayPolicy`, `BlockRelayRequest`, `BlockRelayVerdict`, `IBlockRelay` |
+| `parity.hpp` | `ParitySample`, `GraduationState`, `ParityCoverage`, `IParityOracle` |
+
+The family is header-only, STL plus the existing lane value types from
+`src/impl/xmr/node/xmr_node_types.hpp`, and free of transport, crypto and
+threading dependencies. That is what makes it a collision fence for the parallel
+implementation waves. Changing a signature here after Wave 0 is a
+contract-amendment commit touching only `contracts/` and the affected fakes.
+
+Seven things are worth calling out because they were changed during review, and
+each of them was a real defect rather than a preference:
+
+* **`TxRelayVerdict` and `BlockRelayVerdict`.** Both used to be called
+  `RelayVerdict`. They are unrelated shapes with unrelated consumers, and
+  sharing the name made the transaction-relay and block-relay headers
+  unincludable in one translation unit.
+* **`AdmissionEvidence` is a bitmask, not a tier.** The four kinds of evidence a
+  pool can have about a relayed transaction — structural, our own fee-policy
+  replica, non-input consensus, and an armed daemon having accepted it — are
+  orthogonal. A scalar ladder could not express "daemon-confirmed, fee replica
+  has not run", which is the ordinary state of every transaction while a daemon
+  is armed.
+* **Hints are named as hints.** `ChainEntry::cumulative_difficulty_hint`,
+  `ChainEntry::weights_claimed_hint` and `BlockEntry::block_weight_claimed_hint`
+  are the peer's claims. They are recomputed and never trusted; the names say so
+  at every call site.
+* **`BlockTxEvent::tx_blobs` is best effort.** On a rollback the index returns
+  what bodies it still has, which under pruned sync may be none, so the event
+  carries `tx_blobs_complete` and the txpool must treat a missing body as gone.
+* **`TxpoolSelectPolicy` replaces the deleted tier.** Making evidence a bitmask
+  removed the `tier >= min_tier` term from the plan's `selectable_backlog()`
+  predicate and left nothing in its place, so the pool that implements the
+  filter and the assembler that consumes it would each have invented one. The
+  policy is now a pinned struct, with an explicit-policy overload — comparing
+  two arms is only meaningful when both selected under the same rule.
+* **`IParityOracle` carries the artefact, not a tag.** `on_serve` takes the
+  `node::MinerData` that was actually served alongside its epoch, and `on_submit`
+  takes the whole `BlockRelayVerdict`. With only an epoch the oracle has to
+  re-pull from the served arm, which differs whenever the backlog moved in
+  between, and `ServedMismatch` — the one verdict that catches us serving
+  something neither arm would produce — becomes unprovable. Without
+  `daemon_armed` a daemon *rejecting* our block is indistinguishable from there
+  being no daemon arm, which is a void sample rather than a failure.
+* **`AnchorBundle` is pinned in Wave 0.** The wave-1 table hands the anchor
+  generator to one workflow and anchor boot to another. It is the node's trust
+  root, so two independently invented layouts would not merely fail to compile —
+  they would disagree about what is trusted.
+
+There is one namespace root, `c2pool::xmr::native`, with aliases to the two
+neighbouring roots (`node::` for the existing lane value types, `submit::` for
+the live-submit surface). Nothing here re-opens either.
+
+### consensus/
+
+| file | what, and why it is Wave 0 rather than any one component's |
+|---|---|
+| `xmr_blob_reader.hpp` | the bounds-checked read counterpart to `xmr_blob.hpp`'s `BlobWriter`. Nothing on master could read a CryptoNote blob back; three wave-1 components each needed one. Poisoning reader, monerod-exact varint rules, depth cap of 8, counted containers refused against the bytes actually present. |
+| `xmr_tx_weight.hpp` | consensus transaction weight, from a full blob **and** from a pruned one. The pruned path matters because chain sync is pruned by pinned decision D-4: the node never sees the prunable bytes and must reconstruct their length from structure. This is the most consensus-fatal function in the node. |
+| `xmr_hf_table.hpp` | the vendored hard-fork table, the version-dependent rules, and the CARROT / FCMP++ fence that reports anything above v16 rather than guessing at it. Two of the rules are **bands, not scalars**: Monero allows a new ring size or proof system at one fork and only requires it at the next, so `hf_ring_size_allowed()` and `hf_rct_type_allowed()` are the admission tests and the scalars say only what a freshly built transaction should use. Every threshold cites the `cryptonote_config.h` constant behind it and is pinned in the KAT against what a synced stagenet daemon actually reports over each activation band. |
+| `xmr_epoch.hpp` | the RandomX seed epoch, re-exported from `coin/xmr_seedheight.hpp` (which is the single source of the 2048/64 constants) plus the seed-pair scheduling rule. |
+
+### p2p/ — Wave 1, component C1a: the levin codec
+
+Pure codec for the Monero P2P wire. No socket, no thread, no connection state:
+the transport (C1b) and the peer pool (C1c) are separate components that build
+on these three headers.
+
+| file | what |
+|---|---|
+| `levin_codec.hpp` | the 33-byte levin bucket header, the command ids, the frame classification rules, and the inbound per-command size caps (R-CAPS) |
+| `epee_storage.hpp` | the epee portable-storage encoder and a bounded decoder: the size-mark varint, the type tags, sections and arrays |
+| `levin_messages.hpp` | the typed messages — 1001/1002/1003/1007 and 2001–2010 — decoding into the W0 contract types (`BlockEntry`, `ChainEntry`, `TxBlobEntry`, `PeerSyncData`) so C2 and C3 need no second conversion |
+
+Five things about the epee format were read out of monerod's source rather than
+inferred, and each is a place an independently written codec would have been
+wrong on the wire:
+
+* **Sections are emitted in sorted key order.** `epee::serialization::section`
+  holds a `std::map<std::string, storage_entry>`, so monerod writes entries
+  lexicographically, not in the order the KV map declares them. An encoder that
+  preserved declaration order would produce frames a daemon still parses — and
+  would never be byte-identical to a capture, which is exactly what the C6
+  parity rig exists to compare.
+* **`KV_SERIALIZE_OPT` omits the field at its default.** `rpc_port` at zero,
+  `pruned` at false, `dandelionpp_fluff` at true and `prune` at false are simply
+  absent from the frame. The omission is the format, not an optimisation.
+* **Empty containers are not written at all**, and the loader's failure to find
+  one is discarded (`KV_SERIALIZE` ignores its return value), so an absent
+  container means empty at both ends rather than a parse error at either.
+* **`cumulative_difficulty_top64` is unconditional on store.** monerod branches
+  on `is_store` and only makes the field optional when loading, so a frame that
+  omits it was written by neither monerod nor us.
+* **The size-mark varint is not the CryptoNote LEB128 varint** used inside block
+  and transaction blobs. Two varints, two codecs; the other one lives in
+  `consensus/xmr_blob_reader.hpp` and the two are never mixed.
+
+The decoder mirrors epee's bounds exactly — array counts refused against the
+bytes actually remaining, duplicate keys rejected, a bool byte above 1 rejected
+— and then tightens them: recursion depth 8 instead of 100, plus hard ceilings
+on entries, objects, strings and array elements. Where epee truncates an integer
+that does not fit the requested width, this decoder refuses it: an honest peer
+writes the declared width, so the only sender that trips it is one trying to
+make our number differ from the one it sent.
+
+What is NOT proven here is byte parity against a real captured monerod frame.
+That is hardest-unknown U5, it needs a daemon, and it belongs to the C6 parity
+rig. The goldens below are derived from the serialization rules instead, which
+checks the encoder rather than photographing it.
+
+### p2p/ — Wave 1, component C1b: the levin transport
+
+C1a turns 33 bytes into a struct. C1b opens the socket, decides who is on the
+other end of it, and keeps them talking to us.
+
+| file | what |
+|---|---|
+| `levin_socket.hpp` | one TCP connection on the node's `io_context`, framed by C1a's header. Three disciplines copied from `core::Socket`, each of which was paid for with a production incident: header-then-bounded-body reads with **no resync on a bad header**, exactly **one composed `async_write` in flight** with a FIFO drain (issue #863 — overlapping composed writes splice one message's bytes into another's), and the **owner lock-per-async-op** lifetime guard from `core/factory.hpp` that ends the Bug-9 use-after-free family |
+| `levin_invoke_queue.hpp` | the reply matcher, plus the `expect_response` latch for the two notify-answered legs and the inbound-only liveness deadline |
+| `xmr_handshake.hpp` | the pure 1001 state machine — `Idle → Dialed → HandshakeSent → Handshaked / Failed(reason)` — and the sync-data validator, including monerod's own pruning-seed rule |
+| `xmr_levin_link.hpp` | the per-connection driver: it binds the four pieces above, runs the HANDSHAKE exchange, flips the size caps on success, and drives the 60-second (±5 s, jittered) TIMED_SYNC beat in both directions |
+
+Three things about this layer are worth stating out loud, because each is a
+place a reasonable implementation goes wrong:
+
+* **Levin has no request id.** A bucket header carries a command, a flags word
+  and a return code, and nothing that ties an answer to its question. monerod
+  matches responses in ARRIVAL ORDER, per connection, and drops the peer when
+  the front of its list does not match the response's command. So the matcher
+  here is a FIFO, a mismatch is a close, and there is deliberately no "search
+  the queue for a better fit" — that search is exactly how a peer would steer
+  one answer onto another question.
+* **TIMED_SYNC is the heartbeat, not PING.** `COMMAND_PING` (1003) is only the
+  port-reachability call-back for nodes that advertise `my_port != 0`; we
+  advertise 0, so we are never pinged. `COMMAND_TIMED_SYNC` (1002) is
+  simultaneously the keepalive, the peer-height gauge, the reorg tripwire and
+  the peerlist source. Only INBOUND bytes push the liveness deadline: a
+  connection we keep writing to is not alive, a connection that answers is.
+* **An unknown invoke still gets an answer.** A command we do not serve is
+  answered with `LEVIN_ERROR_CONNECTION_HANDLER_NOT_DEFINED`, never with
+  silence — silence stalls the PEER's arrival-order matcher and it drops us for
+  non-response. The error costs 33 bytes.
+
+RandomX never runs on the io thread. `LightVerifier` is not thread-safe and an
+evaluation is milliseconds to hundreds of milliseconds, so one on this thread
+would stall every other peer on the same `io_context` and let a single crafted
+push wedge the node. C1b enforces that structurally — it includes no verifier
+and hashes nothing — and `LevinSocket::on_io_thread()` exists so the boundary is
+asserted in the KAT rather than promised in a comment.
+
+Three corrections found during the C1a verify against a live daemon are carried
+by the codec and re-asserted from this layer's KAT, so a later refactor cannot
+quietly undo them: epee sections serialize in **sorted key order**;
+`SIGNATURE_B` = `0x01020101` is the bytes `01 01 02 01` on the wire; and
+`COMMAND_TIMED_SYNC::response` is `payload_data` + `local_peerlist_new` **only**
+(no `local_time`, no legacy peerlist), where an absent or empty
+`local_peerlist_new` is a normal answer and never a drop.
+
+### test/
+
+| target | what it proves |
+|---|---|
+| `xmr_native_contracts_kat` | every contract and fake compiles together; the fakes satisfy the interfaces; the pinned semantics hold; the hard-fork table and seed-epoch rules hold at their edges |
+| `xmr_native_tx_weight_kat` | the weight golden over real stagenet transactions |
+| `xmr_native_blob_reader_fuzz_kat` | reader unit rules plus a deterministic fuzz pass, over random input and over mutations of the real transaction corpus |
+| `xmr_levin_codec_kat` | the bucket header byte layout, the frame classification table (including the noise and fragment cases), and the cap table |
+| `xmr_epee_storage_kat` | the varint at every size-mark boundary, the type-tag matrix, sorted key order, and every decoder bound |
+| `xmr_levin_messages_kat` | goldens for the handshake, the chain request and the address encoding, plus a round trip of every message and both shapes of `block_complete_entry` |
+| `xmr_levin_fuzz_kat` | the bounded deterministic fuzz pass; `--dump-corpus <dir>` exports the seeds for an external libFuzzer run |
+| `xmr_native_block_id_kat` | block identity against monerod over whole captured blocks, with the negative controls (flipped bytes, truncation, trailing bytes, the length prefix) |
+| `xmr_native_consensus_state_kat` | 600 stagenet heights replayed through the windows — difficulty, long-term weight, reward, emission — plus rollback exactness, `connect()` on real blobs, the R-HFFUSE policy and the 128-bit arithmetic against boost |
+| `xmr_levin_socket_kat` | `LevinSocket` over real loopback TCP: the read loop assembles a frame split across writes and splits two frames out of one write; a bad header closes without resyncing onto the valid frame planted behind it; the per-command and pre-handshake caps are refused on the header alone; the cap flip admits a 300 KiB push it previously refused; twenty-four back-to-back multi-round writes arrive byte-identical and in order; a full outbound queue refuses loudly; a freed owner aborts the connection instead of dereferencing it (written as the real use-after-free, so ASan proves it on the sanitizer leg); and the frame handler runs on the io thread and nowhere else |
+| `xmr_levin_link_kat` | the 1001/1002 exchanges against a hand-rolled monerod stand-in whose frame reader is independent of `levin_codec`: the handshake request's bytes carry the right storage header and sorted keys, every refusal (network id, self-connect, zero peer id, 251 peers, impossible pruning seed, undecodable body, negative return code) closes with its own reason while exactly 250 peers is accepted, the TIMED_SYNC beat runs and is matched, an out-of-order answer and an unrequested 2004/2007 both close, the expect-response latch admits the one we asked for, the deadlines fire, we answer PING and REQUEST_SUPPORT_FLAGS and decline what we do not serve — plus the pure FIFO/latch/liveness/state-machine checks. `--live <host>:<port>` dials a real daemon; ctest does not |
+| `xmr_native_chain_index_kat` | the index: monerod's own difficulty and cumulative difficulty at 600 consecutive stagenet heights driven through it, the emission landing on `get_coinbase_tx_sum`; the fork-choice table including D-14 prefer-own; a heavier branch adopted with Orphan-per-block and one Reorg; a branch that fails consensus half-way restoring the exact chain, silently; the four refusals with their alarms; `RESPONSE_CHAIN_ENTRY` validation against monerod's drop conditions; the five burial answers; and a snapshot resume that re-runs no proof of work |
+| `xmr_native_anchor_self_check_kat` | SHA-256 against the NIST vectors; the `.inc` format round-trips and each documented damage produces its own `AnchorParse`; every `AnchorStatus` is reached by mutating one field; `load_anchor`'s four gates including a tampered file on disk; `generate_anchor` against an honest and a dishonest model daemon; and the real embedded stagenet bundle, whose digest is recomputed with the C++ canonical writer |
+
+The fuzz KAT's load-bearing assertion is that **canonical re-encoding is
+idempotent**: any buffer that decodes must re-encode and re-decode to the same
+value tree, and the second encoding must be a fixed point. That makes the
+encoder and the decoder each other's oracle, and it is what catches a sort-order
+or size-mark bug that a round trip through our own encoder alone would hide.
+
+## anchor/ — the trust root (Wave 1, WF-C2b)
+
+`contracts/anchor.hpp` (Wave 0) owns the `AnchorBundle` struct, the exact window
+sizes and `anchor_self_check()`. This directory owns everything downstream of
+that: how a bundle is spelled on disk, how it is loaded, and how it is minted.
+
+| file | what |
+|---|---|
+| `xmr_anchor_sha256.hpp` | a small SHA-256, because the digest is the one thing the contracts family cannot verify (it has no crypto dependency) |
+| `xmr_anchor_codec.hpp` | the `.inc` format: the canonical body, the digest rule, the writer, and a fail-closed reader that judges FORM only |
+| `xmr_anchor_load.hpp` | `load_anchor()` — the four gates: source, form, meaning, and the boot duty it cannot discharge |
+| `xmr_anchor_generate.hpp` | `generate_anchor()` — the minting rules behind an abstract read-only `MoneroDaemonRpc` port |
+| `xmr_anchor_embedded.hpp` | the release-pinned bundles compiled into the binary, one per network |
+| `xmr_chain_anchor_stagenet.inc` | the stagenet bundle itself, minted from a synced monerod |
+
+**R-ANCHOR** is a release-pinned self-generated bundle: we mint it, we review
+it, we freeze it into the release — the same class of artefact as monerod's own
+compiled-in checkpoints. A daemon-minted bundle at boot (M0–M4) is the same
+struct from a live daemon; the embedded one is the M5 path, where there is no
+daemon to ask.
+
+**Fail-closed, item by item.** Every pinned datum except the anchor id feeds a
+computation that is checked against real blocks, so a corrupted window makes the
+node reject the TRUE chain — a loud halt — rather than accept a cheap false one.
+The id is the exception, and it is why `load_anchor()` is explicitly *not* the
+last word: `anchor_confirmed_by_network()` must be called by C2's boot with the
+hash of the block peers actually served at `height`, and the node must refuse to
+start unless it matches.
+
+**One format, two implementations, one pin.** `tools/xmr-anchor-gen/xmr_anchor_gen.py`
+is the transport-bound capture path (monerod JSON-RPC, read-only); the C++
+`generate_anchor()` holds the same rules behind an abstract port so the
+dishonest-daemon cases can be tested at all. Both write the same canonical body,
+and the KAT proves it: it re-serialises the parsed real bundle with the C++
+writer and asserts the result hashes to the digest line the Python tool wrote.
+
+**The embedded stagenet bundle.** `H_a = 2204000`, id
+`c55f08bc…13dcdf5`, major version 16, minted from a synced monerod 0.18.5.1 over
+read-only RPC with the anchor 848 blocks below the tip. `already_generated_coins`
+is walked back from `get_miner_data` at the tip by subtracting each block's
+coinbase, cross-checked against `get_coinbase_tx_sum` over the same range. It
+carries no `checkpoint` rows: monerod's compiled-in stagenet checkpoints all sit
+below this height, and the field only ever holds checkpoints at or above it.
+
+## The tx-weight golden
+
+`test/xmr_tx_weight_golden.hpp` is generated from a live stagenet daemon
+(`test/gen_tx_weight_golden.py` regenerates it). It carries the transactions of
+177 real blocks: 249 non-coinbase transactions across CLSAG and bulletproof-plus
+shapes, ring sizes 11 and 16, one to forty-two inputs, one to six outputs, plus
+each block's coinbase.
+
+The one number in that file this repository does not compute is
+`GoldenBlock::block_weight`, which comes from the daemon's own block header.
+Since a block's weight is its coinbase weight plus the weight of every
+transaction in it, that single number pins the per-transaction weights — exactly,
+for the blocks carrying a single transaction, and as a sum for the rest. Without
+it the golden would only prove that the code agrees with itself.
+
+## Wave 1 / C2a — the consensus state
+
+C2a is the arithmetic of following the Monero chain: what a block weighs, what
+it pays, what difficulty it had to meet, what its id is, and what the five
+windows look like afterwards. It is deliberately NOT the index — no fork choice,
+no alt branches, no peers, no storage, which are C2c's — and that line is what
+makes every rule in it testable against monerod without a network.
+
+### consensus/ (C2a additions)
+
+| file | what |
+|---|---|
+| `xmr_block_parse.hpp` | the block blob parser. Slices the header rather than re-serializing it (a re-serializer that drifted by one byte would silently change every block id), parses the coinbase through the Wave 0 transaction parser, and re-reads the two coinbase fields that parser discards: the txin_gen height and the output sum. |
+| `xmr_block_id.hpp` | coinbase hash, transaction tree root, hashing blob and block id, over the keccak and tree-hash already in `xmr_coin`. The id is keccak of the **length-prefixed** hashing blob; the PoW input is the bare one. |
+| `xmr_median.hpp` | monerod's median, `get_mid` included, and a rolling window that answers a 100 000-entry median in O(distinct) and rolls **backwards** exactly — which the reorg path needs and monerod's own median heap cannot do. |
+| `xmr_weight.hpp` | block weight from (possibly pruned) bodies, the long-term weight recursion including the HF15 2021-scaling floor of `ltemw * 10 / 17`, the two medians and the effective median that sets the penalty knee. |
+| `xmr_reward.hpp` | the emission curve, the tail, the weight penalty in 128-bit arithmetic (both the `__int128` and the 32-bit-limb spellings, cross-checked), already-generated-coins with monerod's saturation, and the coinbase-amount rule including the v2..v12 partial-claim path that changes what the emission grows by. |
+| `xmr_difficulty.hpp` | the R-U128 adapter over the vendored `difficulty.cpp`, plus the 735-row window. The window is 735 and not 720 because `next_difficulty` drops the newest 15 rows itself; the KAT pins that against 600 heights and shows 720 and 721 reproducing none of them. |
+| `xmr_timestamp.hpp` | the 60-block timestamp median, the future-time limit (local, soft) and the below-median rule (consensus, hard). |
+| `xmr_hf_policy.hpp` | **R-HFFUSE**, the unknown-fork ruling Wave 0 left open. |
+
+### R-HFFUSE: code-rolling, not fail-closed
+
+The plan's original R-HF was: meet a fork we do not implement, halt the native
+path, fall back to an armed daemon. That is safe and useless — it turns every
+Monero hard fork into a total outage on a schedule we do not control, and it
+pays for the safety of the arm that needed it (block PRODUCTION) with the arm
+that needed none (chain FOLLOWING).
+
+The ruling splits them. At a fork above `MAX_IMPLEMENTED_HF_VERSION` the node
+KEEPS FOLLOWING, with rule lookups rolled forward to the newest version it
+implements, and a latching fuse withdraws exactly the two capabilities that can
+emit something the network judges:
+
+| capability | known fork | rolled fork |
+|---|---|---|
+| follow the chain | yes | yes (fail-open) |
+| serve / relay blocks | yes | yes |
+| admit transactions | yes | **no** (fail-closed) |
+| build a template | yes | **no** (fail-closed) |
+
+A version BELOW what the table requires at a height stays a hard reject: that is
+not an unknown fork, it is a block from a fork the network already left.
+`top_version` follows the CHAIN at a rolled fork rather than advertising a stale
+version, because a stale advertisement is what actually gets a node dropped.
+
+### chain/
+
+| file | what |
+|---|---|
+| `xmr_consensus_state.hpp` | the five windows, `connect()` (version, timestamp, weight, reward, coinbase, emission, difficulty) and an exactly reversible `disconnect()`. Every connect returns an undo record carrying what fell out of each window, so a reorg is a rollback rather than a re-derivation. |
+| `xmr_block_eval.hpp` | the wire-to-state seam: parse, identify, then **authenticate every transaction body against the id the block commits to** before its weight is allowed to touch a median. This is what makes pruned sync safe. |
+| `xmr_chain_view.hpp` | `ChainStateView`, the real `IChainView`: tip, template inputs, lookups by id and height, confirmation depth, seed anchors across epoch boundaries, the event streams, own-block submission. |
+| `xmr_pow_gate.hpp` | Wave 1 / C2c. R-LEVEL (L4 pruned-authenticated), the `IPowSource` seam, the seed schedule that re-keys once per epoch and resolves a seed ON THE BRANCH being verified, and a duck-typed adapter over anything shaped like `LightVerifier` — so the index builds and is tested on a leg that links no RandomX. |
+| `xmr_row_store.hpp` | Wave 1 / C2c. The height index: 2048 rows (D-9), the id map, the seed anchors that outlive their rows, and the difficulty window a fork point needs — including the anchor bundle's own window, so a freshly booted node can weigh a fork instead of being blind for 735 blocks. |
+| `xmr_fork_choice.hpp` | Wave 1 / C2c. Strictly-greater cumulative difficulty, D-14 PREFER-OWN at a tie, and the bounded alt-branch pool that evicts the lightest branch first. |
+| `xmr_reorg_journal.hpp` | Wave 1 / C2c. Every switch and every refusal, written before the work and closed after: what W4 reads when a reorg crosses the burial depth, what an operator reads on a refusal, and what a crash between disconnect and re-apply leaves behind. |
+| `xmr_chain_index.hpp` | Wave 1 / C2c. `ChainIndex`: `IChainIndexInbound` + `IChainView` + `IChainServing` over the state view, the fork choice and the gate. Bounded journaled reorgs with exact restore, burial for the v37 section 3 clock, and a snapshot taken below the tip so a resume keeps a rollback horizon. |
+
+### The C2a golden
+
+`test/xmr_c2a_golden.hpp` (regenerate with `test/gen_c2a_golden.py`) carries 600
+consecutive stagenet heights with the numbers monerod computed for them —
+difficulty, long-term weight, reward — the 100 000-entry long-term weight window
+that precedes them, ten whole block blobs with the daemon's ids, and
+already-generated-coins from `get_coinbase_tx_sum` at both ends of the run.
+Nothing in that file is computed by this repository, which is what lets the
+replay fail rather than agree with itself.
+
+It earned that on the first run: every window value matched and all ten block
+ids were wrong, because the id is keccak over the **length-prefixed** hashing
+blob and the first cut hashed the bare one.
+
+## Wave 1 / C3 — the relayed txpool, and the line ruling R-VAL draws
+
+`txpool/` holds the pool: fed only by transactions C1 delivers from levin
+`NOTIFY_NEW_TRANSACTIONS`, read only by the template assembler
+(`ITxpoolSnapshot`) and the block relay (`ITxBlobSource`). It talks to no
+daemon, reads no chain, and keeps no history.
+
+**Admission is `Structural | NonInputConsensus`** — the operator ruling R-VAL.
+Spelled out: a transaction is admitted when it decodes, satisfies every
+structural relay rule monerod applies (size, weight, ring size, output count,
+`tx_extra` cap, zero unlock time, distinct key images), **and** its commitments
+balance against its plaintext fee, its Bulletproof+ range proofs verify, and its
+key images are in the prime-order subgroup.
+
+What that buys, and what it does not:
+
+* a **bad-VALUE** transaction is caught here. Mining one would cost the pool a
+  block the network rejects, so it is worth the elliptic-curve arithmetic.
+* a **double spend** is not, and cannot be: deciding it needs the historical
+  spent-key-image set, which a pool-scoped node deliberately does not carry.
+  Losing one transaction's fee out of a template is the cheap failure; the
+  expensive one is above. Two partial defences are implemented anyway — a key
+  image already owned by a pool entry refuses the newcomer, and a key image
+  appearing in a connected block evicts the entry that shares it — and the
+  residual is left to monerod parity (C6) and to the network.
+
+**The residual risk is larger than one lost fee, and is worth naming.** Non-input
+consensus does not cover the transaction prefix and does not check ring
+signatures, so a transaction whose CLSAG does not verify is admissible here —
+and one is trivial to manufacture from any relayed transaction by changing a
+byte of its `tx_extra`. A template built on such a transaction is a block the
+network rejects. This is inherent to the ruling rather than to any choice made
+in this component: checking a CLSAG needs the ring members' public keys, which
+live in the global output set, which a node starting from a recent anchor does
+not have. Three defences outside this component must therefore stay armed until
+C2 can answer for inputs — the monerod submit arm, the parity oracle (C6), and
+the operator's option of requiring `DaemonConfirmed` evidence in the select
+policy while a daemon is armed.
+
+**First-seen wins on a key-image collision**, which is a deliberate divergence
+from the C3 design lens (it proposed excluding *both* sides). Non-input
+consensus does not cover the transaction prefix, so anyone can take a relayed
+transaction, change one byte of its `tx_extra`, and produce a twin with the same
+key images, the same commitments and the same range proof that passes every
+check this component runs. Under "exclude both" that twin evicts any transaction
+from our template for a few bytes; under first-seen-wins it is refused and the
+original keeps its place — which is also what monerod does. The KAT builds the
+twin and asserts it buys nothing.
+
+**Evidence this component does not produce.** `FeePolicy` needs C2's long-term
+effective median weight, so it is a later co-KAT; `DaemonConfirmed` belongs to
+the arm that has a daemon. A policy that *requires* either selects nothing
+rather than quietly relaxing — fail-closed, and asserted.
+
+### rct/ — the vendoring question, answered honestly
+
+`rct/PROVENANCE.md` is the record. The short version: the ed25519 group
+operations and Keccak everything here stands on are already vendored
+byte-for-byte at `../coin/vendor/` and are reached through `xmr_coin`; nothing
+under `rct/` re-vendors them. The Bulletproof+ verifier, the multi-scalar
+multiplication and the ringct helpers are a **derived port** rather than a
+verbatim copy, because upstream's `bulletproofs_plus.cc` reaches epee logging,
+epee spans, `cryptonote_config.h`, the monero serialization framework and
+`boost::thread` — vendoring it verbatim means vendoring far more trusted surface
+than the arithmetic it was meant to bring in. The prover is not ported at all: a
+pool never proves.
+
+The authoritative check on the port is not a diff. It is
+`xmr_native_rct_verify_kat`, which verifies real stagenet transactions that a
+real monerod already accepted, reproduces their ids and weights, and then
+asserts that mutating a commitment, a fee, a pseudo-output, a proof element or a
+key image makes exactly the check aimed at it fail.
+
+## Wave 1 / C4 — the template source, and what "rebind" actually means
+
+`template/` is the smallest component in this tree and it is the one the whole
+node exists for: it is where a Monero block template stops needing a daemon.
+
+Three files, all header-only:
+
+* `xmr_native_miner_data.hpp` — `NativeMinerDataSource`, an `IMinerDataSource`
+  over `IChainView` (C2c) and `ITxpoolSnapshot` / `ITxBlobSource` (C3).
+* `xmr_monerod_miner_data.hpp` — `MonerodMinerDataSource`, the existing
+  `get_miner_data` path wrapped in the same seam and otherwise unchanged.
+* `xmr_template_arm.hpp` — `ArmResolver`: which arm serves, which one shadows,
+  and a loud, counted fallback when the serving arm loses readiness.
+
+### It derives nothing
+
+`NativeMinerDataSource` computes no consensus value. All seven miner-data fields
+come out of `TemplateInputs`, which C2a/C2c already derive and which the C2a KAT
+already pins against monerod over 600 real heights. Re-deriving any of them in
+`template/` would be a second implementation of a consensus rule, which is the
+exact split-risk the `contracts/` family exists to prevent — the same rule that
+made `xmr_tx_weight.hpp` W0-owned instead of C3-owned.
+
+What C4 adds is the seam, the readiness gate, the epoch/rebuild rule, the body
+pins, and three guards that only make sense at the template layer:
+
+| guard | what it does | why it is not a consensus check |
+|---|---|---|
+| difficulty sanity band `[tip/4, tip*4]` | REFUSES the template | the retarget cannot legitimately move that far in one block, so a value outside it means our own window is corrupt — and a template on a corrupt target asks miners to grind the wrong number |
+| stale tip (default 30 min) | FLAGS, keeps serving | the tip we have is still the best chain we know; the flag is what the arm resolver falls back on |
+| peer floor | FLAGS, keeps serving | on regtest zero peers is a correct configuration, and a pool that stopped paying miners over a peer count would be broken, not safe |
+
+### The byte-stability rule
+
+The assembler stamps a fresh header timestamp on every build, so re-assembling
+under an unchanged tip changes bytes a miner is already grinding and its shares
+start missing on re-hash. So the epoch moves on a tip change always, and on a
+backlog change only under `backlog_refresh_s > 0` — at most once per interval,
+and only when the selectable set really changed. The default, `0`, is tip-only:
+jobs are byte-stable for the whole block, which is the behaviour the provider
+had before the seam existed.
+
+`backlog_seq` is an OPT-IN rebuild trigger, and the DEFAULT/PRODUCTION arm does
+not opt in: `MonerodMinerDataSource::epoch()` reports it frozen at `0`, so the
+epoch term the seam added to the provider is `0 == 0` on every refresh of the
+daemon path and that path rebuilds when, and only when, the parent tip moves —
+exactly the pre-seam rule. Anything derived from the daemon's txpool (its SIZE,
+for instance) would have made every mempool change force a full reassemble at
+the poll cadence, restamping the header under miners already grinding those
+bytes and churning the retained template ring down to seconds of job history.
+The native arm's sequence is ADDITIVE and off by default.
+
+### The body rule
+
+`tx_body(id)` returns the body OF THAT ID or nothing at all. `ITxBlobSource`
+COMPACTS its reply — an absent body is named in `missing` and simply does not
+appear in `out` — and `selectable_backlog()` and `get_blobs()` are two separate
+lock acquisitions, so an id CAN vanish in between (mined, key-image conflict,
+expiry). The fill therefore walks the ids and consumes `out` in order, skipping
+exactly what was reported missing; index-zipping `out[i]` with `ids[i]` would
+file every later body under a different transaction's id and C5 would relay a
+block whose bytes do not hash to the ids beside them. A reply that satisfies
+neither shape (`out.size() + missing.size() != ids.size()`) files NO body and is
+counted: a wrong body is worse than a missing one.
+
+The pin follows the same rule from the other side. The pin key IS the tip id, so
+a re-snapshot under an unchanged tip pins and de-duplicates under the SAME key;
+the superseded generation is therefore retired BEFORE the new pin is taken,
+because pinning a key and then unpinning it leaves the live template with no pin
+and the pool free to evict what it selected.
+
+### What the two KATs prove
+
+`xmr_native_template_kat` compares the native arm against a REAL
+`get_miner_data` captured from a synced stagenet monerod (0.18.5.1, height
+2 204 960) — height, prev_id, seed_hash, difficulty, median_weight,
+already_generated_coins, major_version. None of those seven numbers was computed
+by this repository, so a formula error cannot pass by agreeing with itself. The
+eighth field, `median_timestamp`, is not exposed by `get_miner_data` at all
+(p2pool derives it too), so it is checked against monerod's own median RULE over
+monerod's own captured timestamps. The same captured response is replayed
+through the production `MoneroDaemonRpc::parse_miner_data` — hex-string
+difficulty and all, the PR #1529 shape — which is what makes "the monerod arm IS
+the old path" a statement about the real decode path rather than about a
+re-typed struct.
+
+`xmr_native_template_coinbase_kat` answers the other half: the K_fair
+settlement coinbase does not move. It builds the X6 coinbase from the native
+derivation, through the same `settle/xmr_coinbase.cpp` executor the daemon-ful
+path uses, and pins the owed payee set in K_fair order, the exact-sum residual
+sink (Monero has no burn-the-remainder escape hatch), the owed_digest under the
+`tx_extra` `0x03` merge-mining tag, the byte-identity of the two arms' coinbases,
+and the pre-CARROT fence. It also proves each rebound field is load-bearing —
+without that, "the arms agree" would be consistent with the coinbase ignoring
+the miner data entirely.
+
+Three suites in `xmr_native_template_kat` are REGRESSION pins, one per defect
+the C4 review found — `R-C4-1` body/id alignment across a missing body,
+`R-C4-2` the pin surviving an unchanged-tip re-snapshot, and `R-C4-3` the
+production arm's rebuild rule against both the pre-seam oracle and the
+size-derived rule that regressed it. Each carries its own non-vacuity check, and
+on the code as it stood before the fix the three of them fail 28 checks.
+
+The capture itself is `tools/xmr-c4-parity/capture_miner_data.py`: read-only,
+paced, and the only thing in this component that ever touches a daemon.
+`xmr_native_template_kat --parity-json <file>` replays a fresh capture, and is
+deliberately not what ctest runs.
+
+### The rebind, in the consumer tree
+
+`src/c2pool/v37/xmr/xmr_o2_settlement_provider.hpp` gains an
+`IMinerDataSource&` constructor and keeps its `IMonerodTransport&` one, which
+now owns a `MonerodMinerDataSource` and pumps it once per refresh — the same one
+RPC per refresh it always did. `assemble()` is byte-for-byte the function it
+was. `SettlementSnapshot` gains `source_name` and the `MinerDataEpoch`, so a
+parity sample can always be attributed to an arm.
+
+## Wave 1 / C5 — the block relay, and why it mostly refuses
+
+`relay/` is where a found block leaves the pool. It is the one component whose
+mistakes are paid for by somebody else: an invalid block does not bounce, it
+bans our P2P identity at every peer that received it, and a block that quietly
+fails to go out is a found block thrown away along with the share that paid for
+it. So most of what this component does is refuse.
+
+Three files:
+
+* `xmr_block_relay.hpp` — `LevinBlockRelay`, the dual-arm dispatcher, the 2008
+  frame builder and the 2009 responder with its retained-block book.
+* `xmr_found_block_carrier.hpp` — the `xmr_found_block` carrier and
+  `FoundBlockIngress`, the admission ladder a c2pool peer's block-share goes
+  through before this node re-broadcasts it.
+* `xmr_block_relay_submit_bridge.hpp` — the only file here that includes the
+  live-submit surface: `BlockCandidate` in, the existing monerod
+  `LiveBlockSubmitter` wrapped as ARM B, and `CandidateBlockRelay`, which is the
+  plan's `relay(candidate, nonce, extra_nonce)` entry point.
+
+### The two arms
+
+ARM A is levin P2P: one `NOTIFY_NEW_FLUFFY_BLOCK` (2008) written to every
+handshaked peer in `state_normal` through C1c's `IBroadcastPort`. This is the
+DAEMONLESS-PRIMARY arm. ARM B is monerod `submit_block`, and it fires only when
+a daemon is actually configured — the backup, not the gate. The default order is
+therefore `Parallel` with the P2P arm first; `DaemonFirst` (the plan's M0–M4
+posture, where a daemon rejection suppresses the P2P push entirely) and
+`P2pOnly` are configurations, and all three are pinned by the KAT.
+
+An unset daemon sink reports `daemon_armed == false`, never `daemon_rejected`.
+The distinction is load-bearing downstream: C6 counts a daemon that REJECTED our
+block as a parity failure and no daemon at all as a void sample.
+
+### The frame is self-contained
+
+monerod relays a block it accepted as a fluffy block with `txs` EMPTY, because
+its peers hold the transactions in their own pools and can fill the gaps with
+one 2009 round trip. We do the opposite by default: the 2008 carries the block
+blob AND every transaction body, so a receiving peer can connect the block
+without asking us anything. The bytes are cheap — a stagenet or mainnet block is
+single-digit KB — and the round trip is not, because it is a round trip on the
+one message that must not be missed, against a peer that has never heard of us.
+`include_all_tx_bodies = false` mirrors monerod exactly for the parity run, and
+the 2009 responder stays wired either way.
+
+`current_blockchain_height` is H+1, our height AFTER the block, so a peer that
+cannot connect it treats us as ahead and asks for our chain instead of dropping
+us.
+
+### Only a verified block gets out
+
+`contracts/relay.hpp` states the RandomX precondition as a caller obligation.
+This component also enforces it, fail-closed: with no gate installed, nothing is
+ever relayed, and a gate that answers anything but `Accept` stops both arms.
+The found-block path installs an ATTESTATION — the id the O-2 verifier already
+accepted — rather than paying for a second ~25 ms RandomX hash on the hottest
+path. What the attestation still buys over a bare precondition is that the id
+the gate saw is compared against the id of the bytes about to go out, so a
+wiring bug cannot relay a different block than the one that was verified.
+
+Everything cheap happens before the gate: the blob must parse, hash to the id
+the caller named, commit to the caller's tx list, carry the winning nonce, and
+agree with the caller about the coinbase height. RandomX is never spent on
+something that is not a block.
+
+### Fail loud, never partial, never silent
+
+If any transaction in the block has no body we can produce — or has one that
+does not re-hash to the id the block commits to — ARM A is SUPPRESSED. An
+incomplete self-contained frame is worse than no frame: the peer that cannot
+complete the block drops and bans whoever sent it. ARM B still fires, because
+monerod has its own pool. And a verdict that reached nobody carries `why` and is
+logged at error level, with a counter behind it — zero peers and no daemon is a
+loud failure, not a shrug.
+
+### The c2pool-side redundant broadcast
+
+The v36/DASH pattern is that every peer that can rebuild the winning block
+broadcasts it: duplicates are a non-event at the receiving daemon, a miss is a
+lost block. `FoundBlockIngress` is the receiving half, and its order is the
+whole point (cheap → heavy, RandomX LAST): per-peer budget, dedup, structure and
+id, the tip relation, the canonical-coinbase check, and only then the RandomX
+verify. A forged id, a wrong height or a non-canonical coinbase is a ban; a
+block on a branch we do not have, or a RandomX verdict that blames OUR verifier,
+is a defer. Getting that asymmetry wrong is how a pool bans its own network.
+
+The coinbase check gates RELAY only. Whether a non-canonical coinbase is
+admissible to the LANE is a separate, still-unwired question (#1551), and this
+component does not answer it. An ingress with no coinbase check wired refuses to
+relay rather than relaying blind, and records that as our own gap rather than
+the peer's fault.
+
+## Where the milestones stand
+
+All thirteen components are landed, each authored against the contracts here:
+the levin codec (C1a), the levin transport (C1b), the peer pool and its DoS
+policy (C1c), the consensus state (C2a), the trust-anchor bundle (C2b), the
+chain index with its fork choice (C2c), the relayed txpool (C3), the template
+source (C4), the block relay (C5) and the parity oracle (C6).
+
+**M0 is closed on the short proof**: `node/` assembles them, and
+`node/README.md` carries the run — a private regtest chain followed from the
+genesis block over levin alone (20 heights backfilled, 4 followed live as they
+were mined), RandomX verified on the verify thread with a zero io-thread
+counter, P-TIP CLEAN on all nine fields at every sampled height, and zero
+monerod RPC on the tip-follow path. The plan's 48–72 h P-TIP soak is a separate,
+operator-scoped run; M1 (txpool equality), M2 (template rebind), M3 (block
+relay) and M4 (graduation) each have their seam wired and unexercised on
+purpose.
