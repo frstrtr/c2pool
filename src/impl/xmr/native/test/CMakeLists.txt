@@ -595,4 +595,35 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_native_backlog_famine_kat COMMAND xmr_native_backlog_famine_kat)
 
+    # ------------------------------------------------------------------
+    # M4 -- the two-posture parity soak (../parity/xmr_graduation_ledger.hpp and
+    # ../parity/xmr_soak_driver.hpp).
+    #
+    #   xmr_native_m4_soak_kat -- the streak state machine, the ledger and the
+    #   REFUSAL. CLEAN accrues; FAIL and SERVED-MISMATCH reset to zero with no
+    #   budget of allowed failures; VOID neither accrues nor resets, but a RUN
+    #   of VOIDs past the cap resets anyway; a reorg contributes no block; one
+    #   posture is not two; a tip-only stream never satisfies the P-TPL floor;
+    #   a ledger written under the previous comparator version is refused and
+    #   the streak restarts (the M1 lesson, made mechanical); and the negative
+    #   control runs end to end through the REAL comparator -- two agreeing arm
+    #   observations compare CLEAN, one field perturbed by ONE UNIT FAILs, and
+    #   the ledger resets the streak, drops the qualification and refuses to
+    #   graduate.
+    #
+    # STL only: no RandomX, no daemon, no network, no clock of its own (the
+    # ledger takes unix seconds from the caller, so 72 hours pass in
+    # microseconds). It writes and removes one small JSON file in the working
+    # directory; ctest runs it inside the build tree with no arguments.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml. A target registered with add_test but never
+    # built reports "***Not Run" and exits 8 -- the #1539 lesson.
+    add_executable(xmr_native_m4_soak_kat xmr_m4_soak_kat.cpp)
+    target_include_directories(xmr_native_m4_soak_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(xmr_native_m4_soak_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_native_m4_soak_kat COMMAND xmr_native_m4_soak_kat)
+
 endif()

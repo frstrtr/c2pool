@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <ctime>
 #include <iostream>
 #include <set>
 #include <string>
@@ -60,7 +61,9 @@
 #include <vector>
 
 #include "impl/xmr/native/node/xmr_native_node.hpp"
+#include "impl/xmr/native/parity/xmr_graduation_ledger.hpp"
 #include "impl/xmr/native/parity/xmr_parity_report.hpp"
+#include "impl/xmr/native/parity/xmr_soak_driver.hpp"
 
 namespace rt     = ::c2pool::xmr::native::rt;
 namespace native = ::c2pool::xmr::native;
@@ -150,7 +153,28 @@ void usage() {
         "                                             (default 0; raise it ONLY for a scenario\n"
         "                                             that holds a divergence on purpose)\n"
         "  --inject-dir <dir>                         feed <dir>/*.hex to C3 verbatim, and\n"
-        "                                             <dir>/*.twin as its key-image twin\n";
+        "                                             <dir>/*.twin as its key-image twin\n"
+        "\n"
+        "  M4 (the parity soak; the posture is whatever --serve-arm says):\n"
+        "  --m4-soak                                  run the two-posture soak driver\n"
+        "  --m4-ledger <file>                         the M4 graduation ledger (persisted,\n"
+        "                                             and the SAME file across both postures)\n"
+        "  --m4-thresholds <stagenet|regtest>         72h/720-block, or the scaled mini-soak\n"
+        "  --m4-min-clean <n>                         override: consecutive CLEAN samples\n"
+        "  --m4-min-blocks <n>                        override: blocks inside the streak\n"
+        "  --m4-min-seconds <n>                       override: wall clock of the streak\n"
+        "  --m4-min-tip <n>                           override: clean P-TIP samples of it\n"
+        "  --m4-min-tpl <n>                           override: clean P-TPL samples of it\n"
+        "  --m4-max-void-run <n>                      consecutive VOIDs before the streak\n"
+        "                                             is declared stalled and reset\n"
+        "  --m4-serve-every <ms>                      P-TPL cadence (default 2000)\n"
+        "  --m4-require graduated|refusal             exit non-zero unless the ledger\n"
+        "                                             GRADUATED / unless it REFUSED\n"
+        "  --m4-inject-field <name>                   NEGATIVE CONTROL: perturb this native\n"
+        "                                             tip field by one unit\n"
+        "  --m4-inject-after <n>                      ... only after n honest observations\n"
+        "  --m4-inject-for <n>                        ... and only for n of them (0 = all)\n"
+        "  --m4-inject-absent                         withhold the field instead\n";
 }
 
 void print_status(const rt::NodeStatus& s) {
@@ -213,6 +237,19 @@ int main(int argc, char** argv) {
     bool          m1_need_conflict_evict = false;
     std::size_t   m1_allow_uncompared    = 0;
     std::string   inject_dir;
+
+    // --- M4 ---------------------------------------------------------------
+    bool          m4_soak        = false;
+    std::string   m4_ledger_path;
+    std::string   m4_threshold_set;          // "" = pick from --net
+    std::uint64_t m4_serve_every = 2000;
+    std::string   m4_require;                // "graduated" | "refusal" | ""
+    parity::SoakThresholds m4_thr{};
+    bool          m4_thr_chosen  = false;
+    bool          m4_ov_clean = false, m4_ov_blocks = false, m4_ov_seconds = false;
+    bool          m4_ov_tip = false, m4_ov_tpl = false, m4_ov_void = false;
+    std::uint64_t m4_v_clean = 0, m4_v_blocks = 0, m4_v_seconds = 0;
+    std::uint64_t m4_v_tip = 0, m4_v_tpl = 0, m4_v_void = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -278,6 +315,23 @@ int main(int argc, char** argv) {
             m1_allow_uncompared = static_cast<std::size_t>(
                 std::strtoull(next("--m1-allow-uncompared").c_str(), nullptr, 10));
         else if (a == "--inject-dir")    inject_dir = next("--inject-dir");
+        else if (a == "--m4-soak")       m4_soak = true;
+        else if (a == "--m4-ledger")     m4_ledger_path = next("--m4-ledger");
+        else if (a == "--m4-thresholds") { m4_threshold_set = next("--m4-thresholds"); m4_thr_chosen = true; }
+        else if (a == "--m4-min-clean")  { m4_ov_clean = true;  m4_v_clean   = std::strtoull(next("--m4-min-clean").c_str(), nullptr, 10); }
+        else if (a == "--m4-min-blocks") { m4_ov_blocks = true; m4_v_blocks  = std::strtoull(next("--m4-min-blocks").c_str(), nullptr, 10); }
+        else if (a == "--m4-min-seconds"){ m4_ov_seconds = true; m4_v_seconds = std::strtoull(next("--m4-min-seconds").c_str(), nullptr, 10); }
+        else if (a == "--m4-min-tip")    { m4_ov_tip = true;    m4_v_tip     = std::strtoull(next("--m4-min-tip").c_str(), nullptr, 10); }
+        else if (a == "--m4-min-tpl")    { m4_ov_tpl = true;    m4_v_tpl     = std::strtoull(next("--m4-min-tpl").c_str(), nullptr, 10); }
+        else if (a == "--m4-max-void-run"){ m4_ov_void = true;  m4_v_void    = std::strtoull(next("--m4-max-void-run").c_str(), nullptr, 10); }
+        else if (a == "--m4-serve-every") m4_serve_every = std::strtoull(next("--m4-serve-every").c_str(), nullptr, 10);
+        else if (a == "--m4-require")    m4_require = next("--m4-require");
+        else if (a == "--m4-inject-field")  cfg.tip_fault.field = next("--m4-inject-field");
+        else if (a == "--m4-inject-after")
+            cfg.tip_fault.after_samples = std::strtoull(next("--m4-inject-after").c_str(), nullptr, 10);
+        else if (a == "--m4-inject-for")
+            cfg.tip_fault.for_samples = std::strtoull(next("--m4-inject-for").c_str(), nullptr, 10);
+        else if (a == "--m4-inject-absent") cfg.tip_fault.absent = true;
         else if (a == "--force-synced")  cfg.force_synced = true;
         else if (a == "--probe-only")    cfg.probe_only = true;
         else if (a == "--allow-unverified-pow") cfg.allow_unverified_pow = true;
@@ -290,6 +344,44 @@ int main(int argc, char** argv) {
     }
     if (txpool_parity && cfg.monerod_rpc_host.empty()) {
         std::cerr << "--txpool-parity needs a judge: pass --monerod-rpc host:port\n";
+        return 2;
+    }
+    if (m4_soak) {
+        if (cfg.monerod_rpc_host.empty()) {
+            std::cerr << "--m4-soak needs the arm it is judged against: pass --monerod-rpc host:port\n";
+            return 2;
+        }
+        if (!cfg.parity) {
+            std::cerr << "--m4-soak and --no-parity are contradictory: the soak IS the oracle\n";
+            return 2;
+        }
+        if (m4_ledger_path.empty()) {
+            std::cerr << "--m4-soak needs --m4-ledger <file>: a graduation that is not "
+                         "written down is a recollection\n";
+            return 2;
+        }
+        if (!m4_require.empty() && m4_require != "graduated" && m4_require != "refusal") {
+            std::cerr << "--m4-require wants 'graduated' or 'refusal'\n";
+            return 2;
+        }
+        // The default threshold set follows the network, because getting this
+        // wrong in the quiet direction is the only mistake that matters: a
+        // stagenet run must never silently inherit the mini-soak's numbers.
+        const std::string set = m4_thr_chosen ? m4_threshold_set
+                              : (cfg.net == rt::NativeNet::Regtest ? "regtest" : "stagenet");
+        if (set == "regtest")       m4_thr = parity::SoakThresholds::regtest_mini();
+        else if (set == "stagenet") m4_thr = parity::SoakThresholds::stagenet_m4();
+        else { std::cerr << "--m4-thresholds wants 'stagenet' or 'regtest'\n"; return 2; }
+        if (m4_ov_clean)   m4_thr.min_clean_samples  = m4_v_clean;
+        if (m4_ov_blocks)  m4_thr.min_blocks         = m4_v_blocks;
+        if (m4_ov_seconds) m4_thr.min_seconds        = m4_v_seconds;
+        if (m4_ov_tip)     m4_thr.min_tip_clean      = m4_v_tip;
+        if (m4_ov_tpl)     m4_thr.min_template_clean = m4_v_tpl;
+        if (m4_ov_void)    m4_thr.max_void_run       = m4_v_void;
+    }
+    if (cfg.tip_fault.armed() && !m4_soak) {
+        std::cerr << "--m4-inject-field is the soak's negative control and only means "
+                     "something with --m4-soak\n";
         return 2;
     }
 
@@ -314,6 +406,63 @@ int main(int argc, char** argv) {
     std::uint64_t clean = 0, failed = 0, mismatch = 0, voided = 0;
     int exit_code = 0;
 
+    // -----------------------------------------------------------------------
+    // M4 state. Off by default; costs one branch when it is.
+    //
+    // The ledger is constructed here rather than inside the node because it
+    // OUTLIVES a process: the two postures are two runs of this binary against
+    // the same --m4-ledger file, which is exactly the shape a 72 h + 72 h
+    // stagenet soak has. Persisting is therefore not an optimisation, it is the
+    // mechanism by which a leg survives its own posture flip.
+    // -----------------------------------------------------------------------
+    auto unix_now = [] { return static_cast<std::uint64_t>(std::time(nullptr)); };
+    native::GraduationKey m4_key;
+    m4_key.c2pool_commit   = cfg.c2pool_commit;
+    m4_key.monerod_version = "";               // bound on the daemon's first answer
+    m4_key.net             = rt::to_string(cfg.net);
+    parity::M4GraduationLedger m4_ledger(m4_key, m4_thr);
+    parity::SoakDriver::Config m4_cfg;
+    m4_cfg.posture = (cfg.serve_arm == native::TemplateArm::Native)
+                       ? parity::SoakPosture::ServeNativeShadowMonerod
+                       : parity::SoakPosture::ServeMonerodShadowNative;
+    m4_cfg.ledger_path = m4_ledger_path;
+    parity::SoakDriver m4(m4_ledger, m4_cfg);
+    if (m4_soak) {
+        std::string lwhy;
+        const bool loaded = m4_ledger.load(m4_ledger_path, &lwhy);
+        std::printf("[M4-SOAK] posture=%s thresholds: clean>=%llu blocks>=%llu seconds>=%llu "
+                    "tip>=%llu tpl>=%llu void_run<=%llu | ledger=%s (%s)\n",
+                    parity::posture_tag(m4_cfg.posture),
+                    (unsigned long long)m4_thr.min_clean_samples,
+                    (unsigned long long)m4_thr.min_blocks,
+                    (unsigned long long)m4_thr.min_seconds,
+                    (unsigned long long)m4_thr.min_tip_clean,
+                    (unsigned long long)m4_thr.min_template_clean,
+                    (unsigned long long)m4_thr.max_void_run,
+                    m4_ledger_path.c_str(),
+                    loaded ? "resumed" : (lwhy.empty() ? "new" : lwhy.c_str()));
+    }
+    std::uint64_t m4_last_serve = 0;
+    std::uint64_t m4_serve_ok = 0, m4_serve_refused = 0;
+    std::string   m4_last_serve_why;
+
+    // ONE place where a drained batch is turned into numbers, because there are
+    // now two callers (a tip moved; the M4 cadence fired) and two sets of
+    // counters that must not diverge.
+    auto absorb = [&](const std::vector<parity::SeamResult>& batch) {
+        for (const parity::SeamResult& r : batch) {
+            switch (r.sample.verdict) {
+                case native::ParityVerdict::Clean:          ++clean;    break;
+                case native::ParityVerdict::Fail:           ++failed;   break;
+                case native::ParityVerdict::ServedMismatch: ++mismatch; break;
+                case native::ParityVerdict::Void:           ++voided;   break;
+            }
+        }
+        if (!m4_soak) return;
+        for (const std::string& line : m4.ingest(batch, unix_now()))
+            std::printf("%s\n", line.c_str());
+    };
+
     // Draining is a function rather than a loop body because it has to happen
     // ONE MORE TIME after the exit condition fires: the tip that satisfied
     // --follow-to is normally recorded a few milliseconds after the read that
@@ -327,16 +476,32 @@ int main(int argc, char** argv) {
             // The oracle renders every sample through its own log sink, which
             // is drained just below -- printing it here as well would double
             // every line.
-            for (const parity::SeamResult& r : node.parity_sample()) {
-                switch (r.sample.verdict) {
-                    case native::ParityVerdict::Clean:          ++clean;    break;
-                    case native::ParityVerdict::Fail:           ++failed;   break;
-                    case native::ParityVerdict::ServedMismatch: ++mismatch; break;
-                    case native::ParityVerdict::Void:           ++voided;   break;
-                }
-            }
+            absorb(node.parity_sample());
         }
         for (const std::string& line : node.take_log()) std::printf("%s\n", line.c_str());
+        std::fflush(stdout);
+    };
+
+    // The M4 tick: serve a template from the POSTURE'S arm (which is what makes
+    // P-TPL fire at all -- nothing else in this binary calls on_serve), then
+    // drain. It runs on its own cadence rather than on tip events because a
+    // chain that has gone quiet must still produce samples, or "no samples"
+    // would be indistinguishable from "agreement".
+    auto m4_tick = [&] {
+        const rt::NativeNode::ServeProbe p = node.m4_serve_probe();
+        if (p.served) {
+            ++m4_serve_ok;
+        } else {
+            ++m4_serve_refused;
+            if (p.why != m4_last_serve_why) {
+                m4_last_serve_why = p.why;
+                std::printf("[M4-SOAK] serving arm '%s' produced no template: %s\n",
+                            p.arm.empty() ? "?" : p.arm.c_str(), p.why.c_str());
+            }
+        }
+        if (parity::MonerodTipObserver* mt = node.monerod_tip())
+            m4_ledger.bind_monerod_version(mt->daemon_version(), unix_now());
+        absorb(node.parity_sample());
         std::fflush(stdout);
     };
 
@@ -527,6 +692,10 @@ int main(int argc, char** argv) {
             last_pool_probe = elapsed_ms;
             probe_txpool();
         }
+        if (m4_soak && elapsed_ms - m4_last_serve >= m4_serve_every) {
+            m4_last_serve = elapsed_ms;
+            m4_tick();
+        }
 
         // --- exit conditions ---------------------------------------------------
         if (g_stop) break;
@@ -709,14 +878,90 @@ int main(int argc, char** argv) {
                     m1_why.empty() ? "" : " why=", m1_why.c_str());
     }
 
+    // --- M4 ----------------------------------------------------------------
+    //
+    // TWO KINDS OF RUN, and as with M1 the verdict must not confuse them.
+    //
+    // An HONEST run (--m4-require graduated) claims the posture soaked clean and
+    // is judged on the ledger reaching GRADUATED.
+    //
+    // A REFUSAL run (--m4-require refusal) is the negative control: it injects a
+    // divergence on purpose and its claim is the OPPOSITE one -- the ledger must
+    // NOT graduate, and it must have reset a streak on a real FAIL rather than
+    // merely failed to accumulate one. A refusal run that graduated is a broken
+    // gate; a refusal run whose injection never fired asserts nothing, and both
+    // are FAIL here.
+    bool m4_ok = true;
+    if (m4_soak) {
+        // One last tick, for the same reason M1 takes one last pool sample: the
+        // tail of a run is where the last template lives.
+        m4_tick();
+        std::string swhy;
+        if (!m4.save(&swhy) && !swhy.empty()) std::printf("[M4-SOAK] %s\n", swhy.c_str());
+
+        std::printf("\n=== M4: two-posture parity soak ===\n");
+        std::printf("drains         : %llu (of which produced no sample: %llu)\n",
+                    (unsigned long long)m4.drains(),
+                    (unsigned long long)m4_ledger.no_sample_drains(m4_cfg.posture));
+        std::printf("template probe : served=%llu refused=%llu%s%s\n",
+                    (unsigned long long)m4_serve_ok,
+                    (unsigned long long)m4_serve_refused,
+                    m4_last_serve_why.empty() ? "" : " last_refusal=",
+                    m4_last_serve_why.c_str());
+        if (parity::PerturbingTipObserver* inj = node.tip_fault())
+            std::printf("injection      : ARMED field='%s' observations=%llu perturbed=%llu "
+                        "(this run is a REFUSAL EXPERIMENT)\n",
+                        cfg.tip_fault.field.c_str(),
+                        (unsigned long long)inj->observations(),
+                        (unsigned long long)inj->injected());
+        std::printf("%s", m4_ledger.report().c_str());
+        for (const parity::SoakEntry& e : m4.failures())
+            std::printf("failure        : %s\n", e.render().c_str());
+        std::printf("%s\n", m4.verdict_line().c_str());
+
+        const parity::PostureLeg& L = m4_ledger.leg(m4_cfg.posture);
+        std::string m4_why;
+        if (m4_require == "graduated") {
+            m4_ok = m4_ledger.graduated();
+            if (!m4_ok) {
+                const std::vector<std::string> sf = m4_ledger.shortfalls();
+                m4_why = sf.empty() ? "not graduated" : sf.front();
+            }
+        } else if (m4_require == "refusal") {
+            if (m4_ledger.graduated()) {
+                m4_ok = false;
+                m4_why = "the ledger GRADUATED under an injected divergence";
+            } else if (L.fail == 0 && L.served_mismatch == 0) {
+                m4_ok = false;
+                m4_why = "no sample ever FAILED: the injection did not reach the comparator, "
+                         "so this run refuses nothing";
+            } else if (L.resets == 0) {
+                m4_ok = false;
+                m4_why = "a sample failed but no streak was reset";
+            }
+        }
+        std::printf("M4-RUN: %s require=%s graduated=%d fail=%llu resets=%llu%s%s\n",
+                    m4_ok ? "PASS" : "FAIL",
+                    m4_require.empty() ? "-" : m4_require.c_str(),
+                    m4_ledger.graduated() ? 1 : 0,
+                    (unsigned long long)L.fail, (unsigned long long)L.resets,
+                    m4_why.empty() ? "" : " why=", m4_why.c_str());
+    }
+
     // The M0 verdict, in one line a script can grep.
-    const bool ok = (exit_code == 0) && failed == 0 && mismatch == 0 &&
-                    s.randomx.foreign_calls == 0 && m1_ok;
+    //
+    // A REFUSAL run breaks the M0 line's premise on purpose -- it is engineered
+    // to produce parity failures -- so the M0 gate reads the injection out of
+    // the totals rather than reporting a lost claim it never made.
+    const bool refusal_run = m4_soak && m4_require == "refusal";
+    const bool ok = (exit_code == 0) && (refusal_run || (failed == 0 && mismatch == 0)) &&
+                    s.randomx.foreign_calls == 0 && m1_ok && m4_ok;
     std::printf("M0-VERDICT: %s heights=%zu parity_clean=%llu parity_fail=%llu "
-                "randomx_foreign=%llu\n",
+                "randomx_foreign=%llu%s\n",
                 ok ? "PASS" : "FAIL", tips_seen, (unsigned long long)clean,
                 (unsigned long long)(failed + mismatch),
-                (unsigned long long)s.randomx.foreign_calls);
+                (unsigned long long)s.randomx.foreign_calls,
+                refusal_run ? " (REFUSAL RUN: parity failures are the point)" : "");
 
     node.stop();
     return ok ? 0 : 1;
