@@ -9,11 +9,16 @@
 #                           captured frames. One translation unit that compiles
 #                           every header together, which is also the collision
 #                           fence.
-#   xmr_p2pool_monitor_kat  the monitor's frame, pinned against a golden
-#                           rendered from three fixed read models, plus the
-#                           emitted message-id set re-asserted for the second
-#                           live binary, plus the absence-vs-zero rules (a dead
-#                           chain renders `--`, never a zero), the seven-state
+#   xmr_p2pool_monitor_kat  the monitor's frame, pinned against TWO goldens --
+#                           expanded and collapsed -- rendered from the SAME
+#                           three fixed read models, so a one-line summary that
+#                           stops agreeing with the panel it replaces is a diff.
+#                           Plus every graphics primitive pinned against a
+#                           hand-computed string, the emitted message-id set
+#                           re-asserted for the second live binary, the
+#                           absence-vs-zero rules over every data row INCLUDING
+#                           the widgets (a dead chain renders `--`, never a zero
+#                           and never a bar chart of zeros), the seven-state
 #                           liveness ladder, and the state-file codec round trip.
 #                           It includes NO socket header and makes no syscall, so
 #                           the layout is checked without a network stack -- and

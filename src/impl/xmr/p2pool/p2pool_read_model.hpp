@@ -90,12 +90,55 @@ struct HeightContest {
     std::uint64_t     spread_ms() const noexcept { return last_seen_ms - first_seen_ms; }
 };
 
+// ---------------------------------------------------------------------------
+// THE HISTORY RING -- one row per height the chain ADVANCED to, bounded.
+//
+// The model above answers "what is true now". A trend answers "what has been
+// happening", and nothing in the model could produce one: by_id_ is keyed by
+// id and by_height_ holds arrival instants but not the per-block figures a
+// plot needs. So this ring carries them, and it carries them under three
+// rules that keep it from becoming a second, disagreeing model:
+//
+//   * BOUNDED. kHistoryMax entries, oldest dropped. A monitor left running for
+//     a week must not grow a plot buffer for a week; a widget that cannot fit
+//     on a screen is not worth a byte of memory.
+//   * ADVANCING HEIGHTS ONLY. A sample is appended when a block arrives at a
+//     height ABOVE the last sampled one. A backfilled parent is not appended,
+//     for the same reason cadence_seconds() excludes it: its first_seen_ms is
+//     our fetch time, and plotting it would draw our own parent walk as though
+//     it were the chain's behaviour.
+//   * NO DERIVED FIELD. Everything here is copied off the block. Whether a
+//     sample is inside the live window is decided by the READER against
+//     frontier_height(), not stamped in at insert time -- the frontier is
+//     allowed to rise during the settle window, and a flag written before it
+//     rose would be permanently wrong.
+// ---------------------------------------------------------------------------
+struct TipSample {
+    std::uint64_t at_ms         = 0;   // OUR receive clock, never a wire field
+    std::uint64_t height        = 0;
+    // The block's difficulty, CLAMPED to 64 bits. The exact 128-bit value is on
+    // the tip row and in the state file; this copy exists to be scaled into a
+    // bar, and a plot of a 2^64-wide chain is not a case that exists. The flag
+    // says when the clamp fired, so a widget can decline rather than draw a
+    // flat line it cannot justify.
+    std::uint64_t difficulty    = 0;
+    bool          difficulty_clamped = false;
+    std::size_t   shares        = 0;   // PPLNS payout lines in the coinbase
+    std::uint64_t monero_height = 0;   // the Monero template it was built on
+    bool          uncles        = false;   // this block carried uncles
+};
+
 class ReadModel {
 public:
     // How long after the first observation a later, higher block still counts
     // as "already there" rather than as a live arrival. Several peers answer
     // the opening tip request within a few hundred milliseconds of each other.
     static constexpr std::uint64_t kFrontierSettleMs = 3000;
+
+    // How many height samples the history ring keeps. Wider than any terminal
+    // a widget is drawn into, and small enough that an overnight run holds a
+    // fixed few kilobytes.
+    static constexpr std::size_t kHistoryMax = 256;
 
     explicit ReadModel(Sidechain chain) : chain_(chain), params_(params_of(chain)) {}
 
@@ -140,6 +183,25 @@ public:
         monero_height_high_ = std::max(monero_height_high_, b.monero_height);
         uncles_seen_ += b.uncles.size();
         for (const Hash& u : b.uncles) referenced_uncles_.insert(u);
+
+        // The history ring: advancing heights only, bounded, copied never
+        // derived. See the note on TipSample above for why each of those is a
+        // rule rather than a convenience.
+        if (history_.empty() || b.sidechain_height > history_.back().height) {
+            TipSample s;
+            s.at_ms         = b.first_seen_ms;
+            s.height        = b.sidechain_height;
+            s.difficulty    = b.difficulty.hi ? ~std::uint64_t(0) : b.difficulty.lo;
+            s.difficulty_clamped = b.difficulty.hi != 0;
+            s.shares        = b.share_outputs;
+            s.monero_height = b.monero_height;
+            s.uncles        = !b.uncles.empty();
+            history_.push_back(s);
+            if (history_.size() > kHistoryMax)
+                history_.erase(history_.begin(),
+                               history_.begin()
+                                   + static_cast<std::ptrdiff_t>(history_.size() - kHistoryMax));
+        }
         return true;
     }
 
@@ -274,6 +336,16 @@ public:
         return gaps;
     }
 
+    // The history ring, oldest first. Bounded by kHistoryMax; see TipSample.
+    // Callers inherit the same live-window caveat as everywhere else: a sample
+    // whose height is at or below frontier_height() was fetched, not awaited.
+    const std::vector<TipSample>& tip_history() const noexcept { return history_; }
+
+    // How many DISTINCT heights this model holds. The denominator of the PPLNS
+    // coverage gauge, and not the same number as distinct_blocks(): a contested
+    // height holds two blocks and is one height.
+    std::size_t heights_held() const noexcept { return by_height_.size(); }
+
     // The chain's own parameters, so a display can put an observed number next
     // to the target it is supposed to approach.
     SidechainParams params() const noexcept { return params_; }
@@ -327,6 +399,7 @@ private:
 
     std::map<Hash, ObservedBlock>       by_id_;
     std::vector<Hash>                   order_;
+    std::vector<TipSample>              history_;
     std::map<std::uint64_t, HeightContest> by_height_;
     std::set<std::string>               peers_;
     std::set<std::string>               connected_;

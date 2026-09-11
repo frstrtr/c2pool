@@ -27,11 +27,13 @@
 #                           frames. REGISTERED with add_test and run in both CI
 #                           legs. Offline: the goldens are in the header.
 #   xmr_p2pool_monitor_kat  the deterministic RENDER KAT: three fixed read
-#                           models drawn to a golden frame, plus the emitted
-#                           message-id pin re-asserted for the monitor, the
-#                           absence-vs-zero rules and the state-file codec. Also
-#                           REGISTERED, also offline -- it includes no socket
-#                           header, makes no syscall and needs no terminal.
+#                           models drawn to a golden frame in BOTH panel states
+#                           (expanded and collapsed), every ASCII widget pinned
+#                           on its own, plus the emitted message-id pin
+#                           re-asserted for the monitor, the absence-vs-zero
+#                           rules and the state-file codec. Also REGISTERED,
+#                           also offline -- it includes no socket header, makes
+#                           no syscall and needs no terminal.
 #   xmr_p2pool_persist_kat  the DURABILITY KAT: forks a child, has it save a
 #                           state, kills it with SIGKILL and reads every number
 #                           back; plus the directory lock, the no-HOME refusal
