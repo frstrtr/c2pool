@@ -155,6 +155,19 @@ public:
     // chain index and txpool directly.
     using RefreshPump = std::function<bool(std::string*)>;
 
+    // OPTIONAL SHAPE GATE (M2). Called on a freshly assembled template BEFORE
+    // it is retained, published or given a template_id. Returning false makes
+    // the refresh fail with the gate's reason and leaves the PREVIOUS template
+    // in place, so a shape regression parks the miners on the last good block
+    // instead of handing them one that pays the wrong set.
+    //
+    // It exists because the seam this provider is bound through can be
+    // rebound -- to the daemon, to the native node, later to something else --
+    // and "the assembler is unchanged" is a claim about the code, while what
+    // has to hold is a claim about the BYTES. See
+    // xmr_settlement_coinbase_shape.hpp for the gate the daemon installs.
+    using ShapeGate = std::function<bool(const asm_::AssembledTemplate&, std::string*)>;
+
     // --- C4 seam constructor -------------------------------------------------
     // `source` is whichever arm the ArmResolver picked. The provider does not
     // own it and does not choose it: an arm that stops being ready is the
@@ -187,6 +200,9 @@ public:
         m_src  = daemon;
         m_pump = [daemon](std::string* why) { return daemon->poll(why); };
     }
+
+    // MAIN THREAD, before the first refresh(). Not settable while serving.
+    void set_shape_gate(ShapeGate g) { m_shape_gate = std::move(g); }
 
     XmrSettlementTemplateProvider(const XmrSettlementTemplateProvider&) = delete;
     XmrSettlementTemplateProvider& operator=(const XmrSettlementTemplateProvider&) = delete;
@@ -262,6 +278,13 @@ public:
         m_refreshes.fetch_add(1);
         std::lock_guard<std::mutex> lk(m_mtx);
         m_last_error.clear();
+        // The ARTEFACT the current template was built from. C6's P-TPL seam
+        // compares what was SERVED against what the shadow arm would have said,
+        // and an epoch tag alone cannot prove a served mismatch -- so the miner
+        // data is kept here rather than re-read from the source later, by which
+        // time the arm may have moved on. Kept beside m_cur (not inside the
+        // snapshot) so that by_id()/current() stay cheap to copy.
+        m_cur_miner = md;
         snap.template_id = ++m_id_counter;   // a real tip change => a fresh template + job
         m_changes.fetch_add(1);
         retain(snap);
@@ -343,6 +366,17 @@ public:
 
     std::uint32_t current_id() const { return m_tid.load(std::memory_order_acquire); }
 
+    // The MinerData the CURRENT template was assembled from, or false when no
+    // template has been built. This is the served artefact C6 judges; feeding
+    // the oracle a fresh read of the source instead would compare the shadow
+    // arm against something the miners were never handed.
+    bool last_miner_data(node::MinerData& out) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (!m_cur.valid) return false;
+        out = m_cur_miner;
+        return true;
+    }
+
     // --- C4: which arm is bound, for the status line and the parity oracle ---
     const char* source_name() const { return m_src ? m_src->name() : "none"; }
     native::MinerDataReadiness source_readiness() const {
@@ -422,6 +456,15 @@ private:
         std::string pe;
         if (!tpl->materialize(0, probe, &pe)) { why = "probe materialize: " + pe; return false; }
 
+        // The shape gate, on the assembled bytes, before anything is published.
+        if (m_shape_gate) {
+            std::string gw;
+            if (!m_shape_gate(*tpl, &gw)) {
+                why = "coinbase shape gate REFUSED: " + (gw.empty() ? std::string("no reason given") : gw);
+                return false;
+            }
+        }
+
         snap.tpl              = std::shared_ptr<const asm_::AssembledTemplate>(tpl.release());
         snap.height           = snap.tpl->height();
         snap.difficulty       = md.difficulty.lo;
@@ -444,6 +487,7 @@ private:
     std::unique_ptr<native::IMinerDataSource> m_owned_src;
     native::IMinerDataSource*                 m_src = nullptr;
     RefreshPump                               m_pump;
+    ShapeGate                                 m_shape_gate;
 
     XmrOwedFixture&          m_ledger;
     XmrSettlementConfig      m_scfg;
@@ -451,6 +495,7 @@ private:
 
     mutable std::mutex m_mtx;
     SettlementSnapshot m_cur;
+    node::MinerData    m_cur_miner;                       // what m_cur was built from
     std::map<std::uint32_t, SettlementSnapshot> m_ring;   // retained by id
     std::deque<std::uint32_t> m_order;
     std::uint32_t m_id_counter = 0;

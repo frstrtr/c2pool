@@ -326,6 +326,51 @@ if (BUILD_TESTING)
         add_test(NAME v37_xmr_o2_randomx_kat COMMAND v37_xmr_o2_randomx_kat)
     endif()
 
+    # ------------------------------------------------------------------
+    # M2 — the option-B settlement coinbase, built from the NATIVE arm.
+    #
+    #   v37_xmr_m2_native_settlement_kat
+    #     Runs the thing that actually serves miners: the C4 seam bound to
+    #     NativeMinerDataSource, XmrSettlementTemplateProvider above it, and the
+    #     whole-block assembler under that -- then judges the result by
+    #     RE-PARSING the assembled block's miner_tx (K_fair owed order, exact-sum
+    #     residual sink, owed_digest under the tx_extra 0x03 tag), proves the two
+    #     arms build the same block from the miner_tx onward, and proves the
+    #     native template path never touches the transport.
+    #
+    #     Heaviest of the v37 consumer KATs and deliberately so: it links
+    #     `xmr_template` (the p2pool whole-block template port), compiles the X6
+    #     executor (settle/xmr_coinbase.cpp) and the ed25519 point-check
+    #     registrar, because a settlement coinbase that is not actually derived
+    #     is not the thing M2 claims to have preserved. Both are already on the
+    #     non-sanitizer leg through c2pool-v37-xmr; the sanitizer leg picks them
+    #     up here, which is the point -- the option-B assembler had no ASan/UBSan
+    #     coverage before this target.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_m2_native_settlement_kat
+        v37_xmr_m2_native_settlement_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_m2_native_settlement_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_m2_native_settlement_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    # V37_XMR_HAVE_MONERO_CRYPTO makes the descriptor point check LIVE, so the
+    # payees in the fixture are validated rather than waved through. Link
+    # xmr_template EXACTLY ONCE and never define
+    # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES here (that ODR path is KAT-only
+    # and belongs to the target that does not link the library).
+    target_compile_definitions(v37_xmr_m2_native_settlement_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_m2_native_settlement_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_m2_native_settlement_kat COMMAND v37_xmr_m2_native_settlement_kat)
+
     # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.
     # Proves the gap the Phase-B single-node daemon had: node B accounts node A's
     # shares. Wires the SAME production consumer code the daemon does — the W3

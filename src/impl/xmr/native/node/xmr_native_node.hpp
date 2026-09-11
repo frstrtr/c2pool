@@ -190,6 +190,12 @@ struct NativeNodeConfig {
     std::string              c2pool_commit;        // one of the four graduation keys
 
     TemplateArm              serve_arm = TemplateArm::Native;
+    // Serve from the OTHER arm when the configured one is not ready. ON is the
+    // production posture (a pool that stops serving templates stops paying its
+    // miners). OFF is what makes a native-only claim falsifiable: with no
+    // second answer available, "the template path made no daemon call" cannot
+    // be satisfied by a quiet fallback.
+    bool                     template_fallback = true;
     ArmOrder                 relay_order = ArmOrder::DaemonFirst;   // see the owed ruling
 
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
@@ -306,7 +312,8 @@ public:
         }
 
         tmpl::TemplateArmConfig arm_cfg;
-        arm_cfg.serve = cfg_.serve_arm;
+        arm_cfg.serve    = cfg_.serve_arm;
+        arm_cfg.fallback = cfg_.template_fallback;
         arm_cfg.shadow = (cfg_.serve_arm == TemplateArm::Native)
                              ? (mon_src_ ? std::optional<TemplateArm>(TemplateArm::Monerod)
                                          : std::nullopt)
@@ -469,6 +476,10 @@ public:
     ChainIndex&           index()  noexcept { return index_; }
     RelayedTxPool&        txpool() noexcept { return txpool_; }
     tmpl::ArmResolver*    arms()   noexcept { return arms_.get(); }
+    // The daemon arm as its CONCRETE type: a consumer that resolves to it owes
+    // it the get_miner_data round trip, and poll() is not on the interface.
+    // Null when no daemon endpoint was configured.
+    tmpl::MonerodMinerDataSource* monerod_source() noexcept { return mon_src_.get(); }
     const NativeNodeConfig& config() const noexcept { return cfg_; }
     const NetPair&          nets()   const noexcept { return nets_; }
 

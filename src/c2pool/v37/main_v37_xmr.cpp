@@ -84,10 +84,38 @@
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
 #include "xmr/xmr_o2_settlement_fixture.hpp"  // O-2 option B: XmrSettlementConfig + XmrOwedFixture (proof ledger)
 #include "xmr/xmr_o2_settlement_provider.hpp" // O-2 option B: v37 K_fair settlement template provider + source
+#include "xmr/xmr_settlement_coinbase_shape.hpp"  // M2: the K_fair shape gate, read off the assembled block bytes
+#include "xmr/xmr_native_template_backend.hpp"    // M2: the native-minimal Monero node as the miner-data source
 
 using namespace c2pool::v37n::xmr;
 namespace strat = ::v37::xmr::stratum;
 namespace sub   = c2pool::v37n::xmr::submit;
+namespace node  = ::c2pool::xmr::node;
+
+#if __has_include(<c2pool_build_version.h>)
+#include <c2pool_build_version.h>
+#else
+#define C2POOL_VERSION "unknown"
+#endif
+
+// ---------------------------------------------------------------------------
+// The daemon's Monero network, as the native node's TWO answers to "which
+// network". regtest (monerod --regtest) is the case that makes them separate
+// facts rather than one: FAKECHAIN carries the MAINNET network id and genesis
+// on the wire while running a hard-fork table that is neither. NativeNet is the
+// enum that resolves both, and this is the only place the daemon's own
+// MoneroNetwork is mapped onto it.
+// ---------------------------------------------------------------------------
+static inline ::c2pool::xmr::native::rt::NativeNet native_net_of(MoneroNetwork n) {
+    using NN = ::c2pool::xmr::native::rt::NativeNet;
+    switch (n) {
+        case MoneroNetwork::Mainnet:  return NN::Mainnet;
+        case MoneroNetwork::Testnet:  return NN::Testnet;
+        case MoneroNetwork::Stagenet: return NN::Stagenet;
+        case MoneroNetwork::Regtest:  return NN::Regtest;
+    }
+    return NN::Stagenet;
+}
 
 static std::atomic<bool> g_stop{false};
 static void on_sigint(int) { g_stop.store(true); }
@@ -221,6 +249,20 @@ static inline std::string   snap_extra(const o2::SettlementSnapshot& t) {
 }
 
 // ---------------------------------------------------------------------------
+// Optional per-loop hooks. Option A installs none; option B uses them for the
+// M2 evidence: the parity sample is drained off the serve path (the DASH
+// shadow-compare rule -- a probe never sits in front of a miner) and the
+// template-path RPC delta is reported next to the template counters.
+// ---------------------------------------------------------------------------
+struct ServeHooks {
+    // Called after every provider.refresh(), with its verdict and whether the
+    // template id moved. Never called when the pool is not serving.
+    std::function<void(bool /*refreshed*/, bool /*new_template*/)> after_refresh;
+    // Called from the status cadence, after the standard status line.
+    std::function<void()> status_extra;
+};
+
+// ---------------------------------------------------------------------------
 // serve_and_run — the serve side + main loop + teardown, generic over the
 // template PROVIDER / SNAPSHOT / SOURCE so option A (monerod template) and
 // option B (v37 settlement coinbase) share ONE body. Provider must expose
@@ -237,7 +279,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                          const std::optional<::v37::bytes32>& payee_key, o2::O2RandomXVerifier& rx,
                          bool serving, const char* not_served_reason,
                          Provider& provider, Source& template_source,
-                         sub::LiveSubmitShareSink::CandidateLookup candidate_lookup) {
+                         sub::LiveSubmitShareSink::CandidateLookup candidate_lookup,
+                         ServeHooks hooks = {}) {
     using Snapshot = std::decay_t<decltype(provider.current())>;
 
     sub::LiveBlockSubmitter submitter(transport);   // fresh socket per RPC: safe off-thread
@@ -374,10 +417,13 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         transport.pump_poll();
         node.adapter().ensure_seed_reach();
         if (serving) {
-            if (provider.refresh()) {
+            const bool refreshed = provider.refresh();
+            bool new_template = false;
+            if (refreshed) {
                 const std::uint32_t tid = provider.template_id();
                 if (tid != last_tid) {
                     last_tid = tid;
+                    new_template = true;
                     listener.notify_new_template();
                     const Snapshot t = provider.current();
                     std::printf("template: id=%u height=%llu difficulty=%llu prev=%s… reward=%llu -> "
@@ -394,11 +440,13 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     last_template_err = e;
                 }
             }
+            if (hooks.after_refresh) hooks.after_refresh(refreshed, new_template);
         }
         drain_stratum_log();
         if (cfg.status_every_s &&
             std::chrono::steady_clock::now() - last_status >= std::chrono::seconds(cfg.status_every_s)) {
             status();
+            if (hooks.status_extra) hooks.status_extra();
             last_status = std::chrono::steady_clock::now();
         }
         std::fflush(stdout);
@@ -412,6 +460,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     fc.drain_before_stop();
     node.stop();
     status();
+    if (hooks.status_extra) hooks.status_extra();
     std::printf("stopped. hw_height=%llu\n",
                 static_cast<unsigned long long>(node.hw().hw_height));
     return 0;
@@ -532,7 +581,91 @@ static int run_live(const XmrNodeConfig& cfg) {
                         static_cast<unsigned long long>(cfg.owed_demo_amount));
         }
 
-        o2::XmrSettlementTemplateProvider provider(transport, ledger, scfg, cfg.stratum_share_diff);
+        // ── M2: WHICH miner-data source the assembler is fed from ───────────
+        // Nothing below this block knows the difference. The assembler, the X6
+        // settlement source, the reward/payee fixpoint, the exact-sum residual
+        // sink and the owed_digest in tx_extra 0x03 are the same code either
+        // way; only the seam the numbers arrive through moves.
+        std::unique_ptr<o2::NativeTemplateBackend> native;
+        if (cfg.template_source == TemplateSourceMode::Native) {
+            if (cfg.native_connect.empty()) {
+                std::printf("REFUSED: --xmr-template-source native needs at least one "
+                            "--native-connect <ip:port> levin peer (the embedded node dials "
+                            "only what it is told to)\n");
+                node.stop();
+                return 2;
+            }
+            o2::NativeTemplateConfig ncfg;
+            ncfg.net                  = native_net_of(cfg.network);
+            ncfg.connect              = cfg.native_connect;
+            ncfg.p2p_bind_ip          = cfg.native_p2p_bind_ip;
+            ncfg.boot                 = cfg.native_anchor_path.empty()
+                                            ? ::c2pool::xmr::native::rt::BootMode::Genesis
+                                            : ::c2pool::xmr::native::rt::BootMode::Anchor;
+            ncfg.anchor_path          = cfg.native_anchor_path;
+            ncfg.monerod_rpc_host     = cfg.monerod.rpc_host;   // parity judge + submit arm ONLY
+            ncfg.monerod_rpc_port     = cfg.monerod.rpc_port;
+            ncfg.serve                = ::c2pool::xmr::native::TemplateArm::Native;
+            ncfg.fallback             = cfg.native_template_fallback;
+            ncfg.force_synced         = cfg.native_force_synced;
+            ncfg.allow_unverified_pow = cfg.native_allow_unverified_pow;
+            ncfg.parity               = true;
+            ncfg.parity_ledger_path   = cfg.resolved_settle_db_path() + "/xmr_parity_ledger.json";
+            ncfg.c2pool_commit        = C2POOL_VERSION;
+            ncfg.ready_timeout_s      = cfg.native_ready_timeout_s;
+
+            std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned "
+                        "peer(s)) feeds the option-B assembler; monerod stays the parity judge "
+                        "and the submit arm, and is NOT on the template path\n",
+                        cfg.native_connect.size());
+            native = std::make_unique<o2::NativeTemplateBackend>(std::move(ncfg));
+            std::string nwhy;
+            if (!native->start_and_wait(nwhy, [](const std::string& w) {
+                    std::printf("  native: not ready yet — %s\n", w.c_str());
+                    std::fflush(stdout);
+                })) {
+                std::printf("REFUSED: %s\n", nwhy.c_str());
+                node.stop();
+                return 2;
+            }
+            std::printf("  native: template arm READY, fallback %s\n",
+                        cfg.native_template_fallback
+                            ? "ON (the daemon arm may serve if the native one loses a window)"
+                            : "OFF (native-only: no template is served if the native arm is not ready)");
+        } else {
+            std::printf("template source: MONEROD — one get_miner_data per template refresh\n");
+        }
+
+        std::unique_ptr<o2::XmrSettlementTemplateProvider> provider_owner =
+            native ? std::make_unique<o2::XmrSettlementTemplateProvider>(
+                         native->source(), ledger, scfg, cfg.stratum_share_diff, native->pump())
+                   : std::make_unique<o2::XmrSettlementTemplateProvider>(
+                         transport, ledger, scfg, cfg.stratum_share_diff);
+        o2::XmrSettlementTemplateProvider& provider = *provider_owner;
+
+        // ── the K_fair shape gate, on BOTH arms ─────────────────────────────
+        // Read back off the assembled block bytes, not off the builder's own
+        // bookkeeping, and refused rather than warned: a template whose coinbase
+        // is not the K_fair shape is never given a template_id and never reaches
+        // a miner. Installed for the monerod arm too -- the rebind is what made
+        // the check necessary, but the property it pins was always the one that
+        // mattered.
+        std::uint64_t shape_ok = 0, shape_refused = 0;
+        std::string   last_shape;
+        provider.set_shape_gate(
+            [&](const ::c2pool::xmr::assembly::AssembledTemplate& t, std::string* w) {
+                const o2::KFairCoinbaseShape sh =
+                    o2::inspect_kfair_coinbase(t, ledger.ledger().owed_digest());
+                last_shape = sh.describe();
+                if (!sh.ok) {
+                    ++shape_refused;
+                    if (w) *w = sh.why;
+                    return false;
+                }
+                ++shape_ok;
+                return true;
+            });
+
         o2::SettlementStratumTemplateSource template_source(provider);
         std::printf("coinbase: %s (lane_chain=%u, residual sink %s)\n",
                     to_string(cfg.coinbase), static_cast<unsigned>(cfg.lane_chain),
@@ -542,9 +675,52 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::string w;
             return provider.candidate_by_id(tid, en, out, &w);
         };
-        return serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
-                             "no --residual-sink-spend-hex/--residual-sink-view-hex",
-                             provider, template_source, candidate);
+
+        // ── the M2 evidence, off the serve path ─────────────────────────────
+        ServeHooks hooks;
+        hooks.after_refresh = [&](bool refreshed, bool new_template) {
+            if (!native || !refreshed || !new_template) return;
+            auto* orc = native->oracle();
+            if (!orc) return;
+            // P-TPL: the oracle judges the artefact that WENT OUT, so the miner
+            // data is taken from the provider's record of the served template,
+            // not re-read from the arm (which may already have moved on).
+            node::MinerData served{};
+            if (provider.last_miner_data(served))
+                orc->on_serve(provider.current().epoch, served, provider.current().source_name);
+        };
+        hooks.status_extra = [&]() {
+            if (!last_shape.empty())
+                std::printf("  coinbase: %s (gate ok=%llu refused=%llu)\n", last_shape.c_str(),
+                            static_cast<unsigned long long>(shape_ok),
+                            static_cast<unsigned long long>(shape_refused));
+            if (!native) return;
+            const auto ns = native->node()->status();
+            std::printf("  native: arm=%s resolves=%llu template-path get_miner_data=%llu "
+                        "| verified_frontier=%llu peers=%zu txpool_accepted=%llu "
+                        "| node rpc(parity+submit)=%llu\n",
+                        native->arms()->describe().c_str(),
+                        static_cast<unsigned long long>(native->source().resolves()),
+                        static_cast<unsigned long long>(native->source().daemon_pumps()),
+                        static_cast<unsigned long long>(ns.sync.verified_frontier),
+                        ns.pool.peers_handshaked,
+                        static_cast<unsigned long long>(ns.txpool.accepted),
+                        static_cast<unsigned long long>(ns.rpc_calls));
+            // The parity probe is drained HERE, on the status cadence, so it is
+            // never in front of a miner (the DASH shadow-compare rule).
+            std::string pw;
+            if (!native->poll_shadow(&pw) && !pw.empty())
+                std::printf("  parity: shadow arm not refreshed: %s\n", pw.c_str());
+            for (const auto& r : native->node()->parity_sample())
+                std::printf("  parity: %s\n",
+                            ::c2pool::xmr::native::parity::render_sample(r).c_str());
+        };
+
+        const int rc = serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
+                                     "no --residual-sink-spend-hex/--residual-sink-view-hex",
+                                     provider, template_source, candidate, std::move(hooks));
+        if (native) native->stop();
+        return rc;
     }
 
     // ── option A (default): monerod's own get_block_template ────────────────
@@ -615,6 +791,22 @@ int main(int argc, char** argv) {
         else if (a == "--settle-output-cap") cfg.settle_output_cap =
                      static_cast<std::uint32_t>(std::stoul(next("0")));
         else if (a == "--owed-demo-amount") cfg.owed_demo_amount = std::stoull(next("0"));
+        else if (a == "--xmr-template-source") {
+            const std::string m = next("monerod");
+            cfg.template_source = (m == "native") ? TemplateSourceMode::Native
+                                                  : TemplateSourceMode::Monerod;
+        }
+        else if (a == "--native-connect") cfg.native_connect.push_back(next(""));
+        else if (a == "--native-p2p-bind") cfg.native_p2p_bind_ip = next("");
+        else if (a == "--native-anchor") cfg.native_anchor_path = next("");
+        else if (a == "--native-force-synced") cfg.native_force_synced = true;
+        else if (a == "--native-allow-unverified-pow") cfg.native_allow_unverified_pow = true;
+        else if (a == "--native-template-fallback") {
+            const std::string m = next("on");
+            cfg.native_template_fallback = !(m == "off" || m == "0" || m == "false");
+        }
+        else if (a == "--native-ready-timeout") cfg.native_ready_timeout_s =
+                     static_cast<std::uint32_t>(std::stoul(next("120")));
         else if (a == "--lane-chain") cfg.lane_chain =
                      static_cast<::v37::ChainId>(std::stoul(next("0")));
         else if (a == "--d-conf") cfg.d_conf = std::stoull(next("60"));
@@ -650,7 +842,25 @@ int main(int argc, char** argv) {
                 "  --settle-h-min <pico>        owed-output floor (0 on XMR)\n"
                 "  --settle-output-cap <n>      TOTAL outputs cap (0 = weight-aware default)\n"
                 "  --owed-demo-amount <pico>    seed one K_fair OWED payee into the proof ledger\n"
-                "                               (coinbase carries OWED + residual sink)\n");
+                "                               (coinbase carries OWED + residual sink)\n"
+                " M2 — where option B's miner data comes from (--coinbase v37 only):\n"
+                "  --xmr-template-source <monerod|native>\n"
+                "                               monerod (default): one get_miner_data per refresh.\n"
+                "                               native: the embedded Monero node (levin P2P + chain\n"
+                "                               index + relayed txpool) builds the template and the\n"
+                "                               template path makes NO daemon call. monerod remains\n"
+                "                               the parity judge and the block submit arm.\n"
+                "  --native-connect <ip:port>   pinned levin peer for the embedded node (repeatable,\n"
+                "                               REQUIRED for --xmr-template-source native)\n"
+                "  --native-p2p-bind <ip>       source address for the node's outbound dials\n"
+                "  --native-anchor <path>       trust-anchor bundle (cold start above genesis)\n"
+                "  --native-force-synced        set the publication gate on a private chain (OR-C2-8)\n"
+                "  --native-allow-unverified-pow  a build with no RandomX may connect blocks it did\n"
+                "                               not verify (opt-in, loud, never a default)\n"
+                "  --native-template-fallback <on|off>\n"
+                "                               on (default): serve from monerod when the native arm\n"
+                "                               is not ready. off: native-only, fail-closed.\n"
+                "  --native-ready-timeout <s>   how long to wait for the native arm (default 120)\n");
             return 0;
         }
     }

@@ -875,12 +875,32 @@ target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
 # xmr_template carries the p2pool block-template port + the authored primitive
 # seam bodies (xmr_coin_primitives.cpp). Link it EXACTLY ONCE and NEVER define
 # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES here (that ODR path is KAT-only).
-target_link_libraries(c2pool-v37-xmr PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+# M2 (--xmr-template-source native): the embedded native-minimal Monero node.
+# xmr_native_txpool is the ONE compiled part of src/impl/xmr/native/ (the C3
+# pool and its Bulletproof+ verifier); everything else the node assembles --
+# the levin transport, the chain index, the C4 arms, the C6 oracle -- is
+# header-only and arrives through main_v37_xmr's include of the backend. Boost
+# is header-only asio at the pinned 1.90, so this adds a link edge and an
+# include path, not a new runtime dependency.
+target_link_libraries(c2pool-v37-xmr PRIVATE xmr_template xmr_node xmr_coin
+                                             xmr_native_txpool Threads::Threads)
+if (TARGET Boost::headers)
+    target_link_libraries(c2pool-v37-xmr PRIVATE Boost::headers)
+elseif (TARGET Boost::boost)
+    target_link_libraries(c2pool-v37-xmr PRIVATE Boost::boost)
+elseif (DEFINED Boost_INCLUDE_DIRS)
+    target_include_directories(c2pool-v37-xmr PRIVATE ${Boost_INCLUDE_DIRS})
+endif()
 if (XMR_BUILD_RANDOMX AND TARGET randomx)
     target_link_libraries(c2pool-v37-xmr PRIVATE randomx)
     target_include_directories(c2pool-v37-xmr PRIVATE
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
-    target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_O2_WITH_RANDOMX)
+    # V37_XMR_O2_WITH_RANDOMX: the O-2 submit gate. XMR_NATIVE_NODE_HAVE_RANDOMX:
+    # the embedded node's own PoW gate -- without it the index connects blocks it
+    # never verified and says so, which is a legitimate build leg (the sanitizer
+    # one has no RandomX) and an illegitimate accident.
+    target_compile_definitions(c2pool-v37-xmr PRIVATE
+        V37_XMR_O2_WITH_RANDOMX XMR_NATIVE_NODE_HAVE_RANDOMX=1)
 endif()
 # ── Track A2 / Milestone A-BTC: the live BITCOIN-FAMILY single-node daemon ────
 # c2pool-v37-btc: the single-node DASH-regtest/devnet-capable (LTC testnet4

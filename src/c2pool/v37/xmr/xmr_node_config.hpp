@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <sharechain/v37/v37_lane.hpp>       // ::v37::LaneParams
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
@@ -66,6 +67,21 @@ inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 //     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
 //     without a valid sink the daemon refuses to serve.
 enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
+
+// M2: which miner-data source the option-B assembler is fed from.
+//   Monerod (default): the get_miner_data RPC path -- the arm option B has used
+//     since X9. One round trip per template refresh.
+//   Native: the embedded native-minimal Monero node (levin P2P + chain-state
+//     index + relayed txpool). The template path then makes NO monerod call at
+//     all; the daemon stays configured as the C6 parity judge and as the block
+//     submit arm, both of which are off the template path.
+// Only meaningful with --coinbase v37; option A is monerod's own template by
+// definition and ignores this.
+enum class TemplateSourceMode : std::uint8_t { Monerod = 0, Native = 1 };
+
+inline const char* to_string(TemplateSourceMode m) {
+    return m == TemplateSourceMode::Native ? "native" : "monerod";
+}
 
 inline const char* to_string(CoinbaseMode m) {
     switch (m) {
@@ -185,6 +201,32 @@ struct XmrNodeConfig {
     // The owed payee is a distinct torsion-valid payee derived from the sink
     // material with spend/view swapped (see main). Proof-only; no live ledger yet.
     std::uint64_t   owed_demo_amount = 0;
+
+    // --- M2: the NATIVE template source ------------------------------------
+    // --xmr-template-source monerod|native. See TemplateSourceMode above.
+    TemplateSourceMode template_source = TemplateSourceMode::Monerod;
+    // Pinned levin peers for the embedded node ("ip:port", repeatable). The
+    // native node dials only what it is told to on a private chain.
+    std::vector<std::string> native_connect;
+    // Source address for the node's outbound levin dials. On a loopback regtest
+    // rig this is what keeps monerod's one-connection-per-remote-IP rule from
+    // refusing us before the handshake.
+    std::string     native_p2p_bind_ip;
+    // OR-C2-8: on a private chain with one pinned peer the cohort test cannot
+    // tell "at the tip" from "alone", so the publication gate is set, not
+    // inferred -- and the status line says it was forced.
+    bool            native_force_synced = false;
+    // A build without librandomx cannot check proof of work. Opt-in and loud.
+    bool            native_allow_unverified_pow = false;
+    // Trust-anchor bundle for a cold start above genesis ("" => embedded).
+    std::string     native_anchor_path;
+    // Serve from the OTHER arm when the configured one is not ready. ON is the
+    // production posture; OFF is what makes "the template path made no daemon
+    // call" falsifiable rather than merely asserted.
+    bool            native_template_fallback = true;
+    // How long the daemon waits for the native arm to become ready before it
+    // refuses to start (fail-closed: it never serves a half-built window).
+    std::uint32_t   native_ready_timeout_s = 120;
 
     // --- storage ------------------------------------------------------------
     // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).
