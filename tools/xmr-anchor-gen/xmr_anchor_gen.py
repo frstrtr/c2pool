@@ -303,29 +303,58 @@ def main():
     assert at["height"] == h_a
 
     # already_generated_coins at H_a: the tip value from get_miner_data, minus
-    # the coinbase amount of every block above H_a. `reward` in a block header
-    # IS the coinbase amount (base emission plus fees), which is exactly what
-    # monerod adds into already_generated_coins per block.
+    # the BASE EMISSION of every block above H_a.
+    #
+    # NOT the header `reward`, which is the coinbase amount -- base emission
+    # PLUS the fees the miner swept. monerod does not add that. It does
+    #
+    #     already_generated_coins = base_reward + already_generated_coins;
+    #
+    # (Blockchain::handle_block_to_main_chain), because a fee is existing
+    # supply changing hands, not supply being created; counting it as emission
+    # would inflate the number the tail-emission curve and the template's own
+    # reward calculation are both read off.
+    #
+    # Backing the tip value out with `reward` therefore removes base+fee per
+    # block where only base was ever added, and leaves the anchor SHORT BY THE
+    # FEE TOTAL over the range. That is what shipped in the stagenet bundle,
+    # and the M4 parity soak caught it on its first template sample: every
+    # P-TPL compare differed on already_generated_coins by exactly the daemon's
+    # own fee_amount for those blocks, which -- the field being a sentinel --
+    # revoked the graduation key outright.
     md = rpc.json_rpc("get_miner_data")
     md_tip = int(md["height"]) - 1
     coins_at_md_tip = int(md["already_generated_coins"])
     above = fetch_headers(rpc, h_a + 1, md_tip) if md_tip > h_a else []
-    coins = coins_at_md_tip - sum(x["reward"] for x in above)
-    if coins <= 0:
-        raise SystemExit("already_generated_coins came out non-positive")
 
-    # Independent cross-check of the same subtraction against the daemon's own
-    # coinbase sum over the identical range.
+    emission_above = 0
     if above:
         cs = rpc.json_rpc("get_coinbase_tx_sum",
                           {"height": h_a + 1, "count": md_tip - h_a})
-        s = wide_to_int(cs, "wide_emission_amount", "emission_amount",
-                        "emission_amount_top64") \
-            + wide_to_int(cs, "wide_fee_amount", "fee_amount", "fee_amount_top64")
-        if s != sum(x["reward"] for x in above):
-            raise SystemExit("coinbase cross-check disagrees: %d vs %d"
-                             % (s, sum(x["reward"] for x in above)))
-        print("coinbase cross-check OK over %d blocks" % len(above), file=sys.stderr)
+        emission_above = wide_to_int(cs, "wide_emission_amount", "emission_amount",
+                                     "emission_amount_top64")
+        fees_above = wide_to_int(cs, "wide_fee_amount", "fee_amount",
+                                 "fee_amount_top64")
+
+        # THE CROSS-CHECK THAT CATCHES THIS CLASS, rather than the one that
+        # missed it. The old check asserted emission+fee == sum(reward), which
+        # is a true identity about the two RPCs and says nothing about which of
+        # them belongs in the subtraction -- so it confirmed the wrong quantity
+        # and printed OK. What is actually claimed here is that the headers'
+        # rewards decompose into the daemon's emission and fee totals, and the
+        # quantity used is the emission half, named as such.
+        reward_above = sum(x["reward"] for x in above)
+        if emission_above + fees_above != reward_above:
+            raise SystemExit("coinbase decomposition disagrees: emission %d + fee %d "
+                             "!= sum(reward) %d"
+                             % (emission_above, fees_above, reward_above))
+        print("coinbase decomposition OK over %d blocks: emission=%d fee=%d "
+              "(fee is NOT emitted and is NOT subtracted)"
+              % (len(above), emission_above, fees_above), file=sys.stderr)
+
+    coins = coins_at_md_tip - emission_above
+    if coins <= 0:
+        raise SystemExit("already_generated_coins came out non-positive")
 
     by_height = {x["height"]: x for x in win}
     seeds = []
@@ -372,8 +401,10 @@ def main():
            ANCHOR_LONG_TERM_WEIGHTS),
         "coins     already_generated_coins from get_miner_data at %d minus the"
         % md_tip,
-        "          coinbase of every block above H_a; cross-checked against",
-        "          get_coinbase_tx_sum over the same range.",
+        "          BASE EMISSION of every block above H_a -- get_coinbase_tx_sum's",
+        "          emission_amount, NOT the header `reward`. monerod accumulates",
+        "          base_reward into already_generated_coins; fees are recycled from",
+        "          the existing supply and are never added to it.",
         "note      monerod publishes no RPC for its compiled-in checkpoints;",
         "          `checkpoint` rows are copied by hand at release time and",
         "          this capture carries %d of them." % len(checkpoints),
