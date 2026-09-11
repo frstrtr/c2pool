@@ -82,8 +82,9 @@ peer at once.
 | `tools/p2pool_observer_main.cpp` | the live single-chain harness |
 | `tools/p2pool_monitor_main.cpp` | the live all-in-one monitor: fullscreen TUI, `--snapshot`, `--read` |
 | `test/p2pool_parse_kat.cpp` | the parser KAT, over two real captured frames |
-| `test/p2pool_monitor_kat.cpp` | the render KAT: a golden frame, the emit-set pin, absence-vs-zero, the codec |
+| `test/p2pool_monitor_kat.cpp` | the render KAT: two golden frames, every widget, the emit-set pin, absence-vs-zero, the codec |
 | `test/p2pool_monitor_golden.inc` | that golden frame, one C string per line — readable as a picture |
+| `test/p2pool_monitor_collapsed_golden.inc` | the same fixture with every panel collapsed: three summary rows |
 | `test/p2pool_persist_kat.cpp` | the durability KAT: fork, save, `SIGKILL`, read every number back |
 | `test/gen_p2pool_golden.py` | independent Python reading that generates the golden's expected values |
 
@@ -193,8 +194,44 @@ process, on one screen.
 xmr_p2pool_monitor                          fullscreen, all three chains
 xmr_p2pool_monitor --chains mini,nano       two of them
 xmr_p2pool_monitor --snapshot --seconds 90  one plain-text frame to stdout
+xmr_p2pool_monitor --snapshot --expand none three one-line summaries instead
 xmr_p2pool_monitor --read                   the SAVED state, rendered, dialling nothing
 ```
+
+### Two states per chain, and eight pictures in the open one
+
+Each panel is either **collapsed** — one row that replaces the whole panel — or
+**expanded**: the rows above plus the graphics below. In fullscreen mode the
+keys are `1`..`9` (that chain, in the `--chains` order, which the key row prints
+so nobody has to guess it), `a` / `c` for all and none, `Tab`/`j`/`k` to move the
+focus, `Space` or `Enter` to toggle the focused chain, `?` for a glyph legend,
+and `q` / `r` unchanged. `--expand all|none|LIST` sets the opening state, and is
+what makes `--snapshot` reviewable in either shape from a shell with no terminal.
+
+A summary row can hide **detail** and never a **problem**: it keeps the full
+status phrase (`DOWN 1m35s no peers`), dashes every figure the chain cannot
+support, keeps its `[FROM FILE ... OLD]` marker, and keeps the peer count as a
+real number. The KAT pins the collapsed frame against its own golden, rendered
+from the same three read models as the expanded one, because the failure mode of
+a summary line is that it quietly stops agreeing with what it summarises.
+
+The expanded rows are `trend` (the difficulty series, min..max normalised, with
+the scale printed beside it), `buckets` (the live gaps as a histogram against
+the target), `heatmap` (the same gaps as a four-row column chart), `timeline`
+(one character per height, `*` contested, `|` the frontier), `monero` (the
+template height per recent block), `pplns` (how much of the PPLNS window this
+observer holds — a **coverage** figure about us, never a payout ledger), `peers`
+(four bars) and `recent` (payout lines per block). They draw at two priorities
+below everything else, so a short window sheds pictures first, numbers second,
+and never a chain.
+
+The series behind them come from a bounded ring in `ReadModel` (256 samples, one
+per height the chain **advanced** to, so a backfilled parent is never plotted as
+though it were the chain's own behaviour). The ring is not written to the state
+file: `p2pmon-state/1` records what the monitor knew, not a plot buffer, so a
+restored panel says which widgets it cannot draw rather than drawing a flat line.
+Which panels are open is a **render parameter** for the same reason — a UI
+preference must not leak into the file.
 
 ### One `poll()`, three chains, no threads
 

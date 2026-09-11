@@ -14,7 +14,18 @@
 //   xmr_p2pool_monitor                          full screen, all three chains
 //   xmr_p2pool_monitor --chains mini,nano       two of them
 //   xmr_p2pool_monitor --snapshot --seconds 90  one plain-text frame to stdout
+//   xmr_p2pool_monitor --snapshot --expand none three one-line summaries
 //   xmr_p2pool_monitor --read                   render the SAVED state, no network
+//
+// TWO PANEL STATES, AND A LAYOUT THAT LIVES IN main(). Each chain is drawn
+// either as a full panel with its graphics or as ONE summary row, and which is
+// which is a `tui::Layout` held here beside `cols`/`rows`: it survives every
+// repaint, every save and every SIGWINCH, and it never reaches the frame. That
+// last part is the point -- the state file is built FROM the frame, so a UI
+// preference inside the frame would silently become part of p2pmon-state/1.
+// `--expand all|none|LIST` sets the opening state, which is what lets the
+// HEADLESS mode print either shape: a review over ssh gets the graphics, and a
+// three-line summary of three chains is one `--expand none` away.
 //
 // TWO LIVE MODES, ONE RENDERER, AND A THIRD MODE THAT DIALS NOTHING. The
 // fullscreen mode paints the frame from p2pool_tui.hpp into an alternate screen
@@ -99,6 +110,7 @@ void usage() {
         "  --snapshot           headless: run the window, print ONE plain frame, exit\n"
         "  --read               print the SAVED state and exit; dials nothing\n"
         "  --width N            snapshot width in columns (default 100)\n"
+        "  --expand WHAT        all (default) | none | a comma list of chains\n"
         "  --refresh-ms N       fullscreen repaint interval (default 1000)\n"
         "  --peer CHAIN:HOST:PORT   dial this peer first on that chain (repeatable)\n"
         "  --no-seed CHAIN      that chain uses ONLY --peer, never the DNS seeds\n"
@@ -112,7 +124,12 @@ void usage() {
         "  --persist-ms N       how often the state file is rewritten (default 2000)\n"
         "  --no-persist         run with nothing written to disk\n"
         "\n"
-        "Keys in fullscreen mode: q quit, r redraw.\n";
+        "Keys in fullscreen mode:\n"
+        "  q quit   r redraw   ? key legend\n"
+        "  1..9     collapse/expand that chain, in the --chains order\n"
+        "  a / c    expand all / collapse all\n"
+        "  Tab, j   move the focus on;  k or Shift-Tab, back\n"
+        "  Space, Enter   collapse/expand the focused chain\n";
 }
 
 struct Options {
@@ -126,8 +143,31 @@ struct Options {
     std::string state_dir;
     std::uint64_t persist_ms = 2000;
     bool        seconds_set = false;
+    std::string expand = "all";
     std::vector<std::pair<p2p::Sidechain, std::pair<std::string, std::uint16_t>>> peers;
 };
+
+// THE OPENING LAYOUT, resolved against the CONFIGURED chain order.
+//
+// `--expand` is what makes the headless mode reviewable in either state: a
+// snapshot is the same renderer as the screen, so `--expand none` prints
+// exactly the three one-liners the fullscreen mode collapses to, and CI or an
+// ssh session sees the graphics without a terminal being involved at all.
+tui::Layout layout_of(const std::string& spec, const std::vector<p2p::Sidechain>& chains,
+                      bool& ok) {
+    ok = true;
+    if (spec == "all")  return tui::Layout::all(chains.size(), true);
+    if (spec == "none") return tui::Layout::all(chains.size(), false);
+    tui::Layout l = tui::Layout::all(chains.size(), false);
+    for (const std::string& piece : split(spec, ',')) {
+        if (piece.empty()) continue;
+        p2p::Sidechain c{};
+        if (!parse_chain(piece, c)) { ok = false; return l; }
+        for (std::size_t i = 0; i < chains.size(); ++i)
+            if (chains[i] == c) l.set(i, true);
+    }
+    return l;
+}
 
 // The banner the header row renders, kept in one place so the ON and the OFF
 // cases cannot drift apart.
@@ -180,6 +220,7 @@ int main(int argc, char** argv) {
         else if (a == "--snapshot")     o.snapshot = true;
         else if (a == "--read")         o.read_only = true;
         else if (a == "--width")        o.width = static_cast<std::size_t>(std::stoul(next("--width")));
+        else if (a == "--expand")       o.expand = next("--expand");
         else if (a == "--refresh-ms")   o.mc.refresh_ms = std::stoull(next("--refresh-ms"));
         else if (a == "--redial-ms")    o.mc.redial_after_ms = std::stoull(next("--redial-ms"));
         else if (a == "--seed")         o.mc.seed = std::stoull(next("--seed"));
@@ -209,6 +250,17 @@ int main(int argc, char** argv) {
     const std::string state_dir = o.state_dir.empty() ? p2p::StateStore::default_dir()
                                                       : o.state_dir;
 
+    // The layout lives here, beside cols/rows, for the whole run: it survives
+    // every repaint, every save and every SIGWINCH, and it never reaches the
+    // frame -- see the note at the top of p2pool_tui.hpp on why that boundary
+    // keeps a UI preference out of p2pmon-state/1.
+    bool expand_ok = true;
+    tui::Layout layout = layout_of(o.expand, o.mc.chains, expand_ok);
+    if (!expand_ok) {
+        std::cerr << "--expand wants all, none, or a comma list of main,mini,nano\n";
+        return 2;
+    }
+
     // -----------------------------------------------------------------------
     // READER: the state file, through the live renderer, with no network.
     // -----------------------------------------------------------------------
@@ -229,7 +281,19 @@ int main(int argc, char** argv) {
         // 4-minute-old file rendered "written 0s ago" after a reboot.
         tui::MonitorFrame f = st::frame_of(s, p2p::wall_ms());
         f.persist.dir = store.dir();       // the file we read, named on the banner
-        std::cout << tui::snapshot_text(f, o.width) << std::flush;
+        // The layout is resolved against the chains IN THE FILE, not against
+        // --chains: a state file may have been written by a run watching a
+        // different set, and a positional layout would then open the wrong
+        // panel without saying so.
+        std::vector<p2p::Sidechain> in_file;
+        for (const tui::ChainView& c : f.chains) in_file.push_back(c.chain);
+        bool read_expand_ok = true;
+        const tui::Layout read_layout = layout_of(o.expand, in_file, read_expand_ok);
+        if (!read_expand_ok) {
+            std::cerr << "--expand wants all, none, or a comma list of main,mini,nano\n";
+            return 2;
+        }
+        std::cout << tui::snapshot_text(f, o.width, read_layout) << std::flush;
         return 0;
     }
 
@@ -382,7 +446,7 @@ int main(int argc, char** argv) {
         const tui::MonitorFrame f = capture(p2p::steady_ms(), false, "clean");
         watch.close_all();
         store.close_all();
-        std::cout << tui::snapshot_text(f, o.width) << std::flush;
+        std::cout << tui::snapshot_text(f, o.width, layout) << std::flush;
         if (logf) std::fclose(logf);
         // Non-vacuity, the same rule the observer harness applies: a run that
         // connected to nothing and parsed nothing is a failed run, and must not
@@ -413,9 +477,69 @@ int main(int argc, char** argv) {
         if (rev & POLLIN) {
             char keys[32];
             const ssize_t n = ::read(STDIN_FILENO, keys, sizeof(keys));
+            const std::size_t nch = watch.size();
             for (ssize_t k = 0; k < n; ++k) {
-                if (keys[k] == 'q' || keys[k] == 'Q' || keys[k] == 3 /* ^C */) quit = true;
-                if (keys[k] == 'r' || keys[k] == 'R') next_paint = 0;
+                const unsigned char c = static_cast<unsigned char>(keys[k]);
+
+                // CSI HYGIENE. An arrow key is three bytes -- ESC [ A -- and a
+                // loop that looked at them one at a time would read the `A` as
+                // a command. So an ESC followed by `[` swallows everything
+                // through the FINAL byte (0x40..0x7e) of the sequence, and no
+                // capital letter that can BE a final byte is bound to anything
+                // that changes state. Shift-Tab (ESC [ Z) is the one sequence
+                // this loop acts on, and it acts on it here, whole.
+                if (c == 0x1b && k + 1 < n && keys[k + 1] == '[') {
+                    ssize_t j = k + 2;
+                    while (j < n && !(static_cast<unsigned char>(keys[j]) >= 0x40 &&
+                                      static_cast<unsigned char>(keys[j]) <= 0x7e)) ++j;
+                    if (j < n && keys[j] == 'Z' && nch) {           // Shift-Tab
+                        layout.focus = (layout.focus + nch - 1) % nch;
+                        next_paint = 0;
+                    }
+                    k = j;                      // consumed, whatever it was
+                    continue;
+                }
+
+                if (c == 'q' || c == 'Q' || c == 3 /* ^C */) { quit = true; continue; }
+                if (c == 'r' || c == 'R') { next_paint = 0; continue; }
+                if (c >= '1' && c <= '9') {
+                    const std::size_t idx = static_cast<std::size_t>(c - '1');
+                    if (idx < nch) { layout.toggle(idx); next_paint = 0; }
+                    continue;
+                }
+                if (c == 'a' || c == 'c') {
+                    // Expand-all and collapse-all replace the OPEN SET and
+                    // nothing else. Rebuilding the whole Layout here also reset
+                    // the focus and closed the `?` legend, which a live run
+                    // caught immediately: pressing `a` to see everything is not
+                    // a request to put the caret back on chain one and take the
+                    // key legend away.
+                    const std::size_t keep_focus = layout.focus;
+                    const bool        keep_hints = layout.show_hints;
+                    layout = tui::Layout::all(nch, c == 'a');
+                    layout.focus      = nch ? (keep_focus % nch) : 0;
+                    layout.show_hints = keep_hints;
+                    next_paint = 0;
+                    continue;
+                }
+                if ((c == 0x09 || c == 'j') && nch) {            // Tab / j
+                    layout.focus = (layout.focus + 1) % nch;
+                    next_paint = 0;
+                    continue;
+                }
+                if (c == 'k' && nch) {
+                    layout.focus = (layout.focus + nch - 1) % nch;
+                    next_paint = 0;
+                    continue;
+                }
+                if ((c == ' ' || c == 0x0a || c == 0x0d) && nch) {   // Space / Enter
+                    layout.toggle(layout.focus);
+                    next_paint = 0;
+                    continue;
+                }
+                if (c == '?') { layout.show_hints = !layout.show_hints; next_paint = 0; continue; }
+                // Anything else is ignored on purpose: a monitor that acts on
+                // a key it does not know is a monitor that acts on a paste.
             }
         }
         const std::uint64_t t = p2p::steady_ms();
@@ -431,7 +555,7 @@ int main(int argc, char** argv) {
                               persist_view(store, !o.no_persist, last_save_ms, t, restored,
                                            restored_age_ms, lifetime.sessions,
                                            lifetime.runtime_ms_total + (t - t0)));
-            term.paint(tui::render(f, cols, rows, color));
+            term.paint(tui::render(f, cols, rows, color, layout));
         }
     }
 
@@ -444,6 +568,6 @@ int main(int argc, char** argv) {
     // The alternate screen takes the frame with it when it goes, so the last
     // one is reprinted on the normal screen: a session that ends should leave
     // its numbers behind, not a blank prompt.
-    std::cout << tui::snapshot_text(f, cols) << std::flush;
+    std::cout << tui::snapshot_text(f, cols, layout) << std::flush;
     return 0;
 }

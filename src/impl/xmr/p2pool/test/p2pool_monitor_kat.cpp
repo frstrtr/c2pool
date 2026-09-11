@@ -42,15 +42,24 @@
 //      fixed inputs, so the thresholds and the precedence order (no peers
 //      outranks tip age; STALE outranks a computable cadence) are pinned rather
 //      than described.
+//   6b. THE TWO PANEL STATES AND EVERY WIDGET. The graphics are integer maths
+//      over bounded series, so each primitive is pinned against a
+//      hand-computed string; the collapsed frame is pinned against its OWN
+//      golden rendered from the SAME fixture, which is what keeps a summary
+//      line honest about the panel it replaces; and the dead-chain walk in (5)
+//      covers every widget row, because a bar chart of zeros is a more
+//      convincing lie than the digit 0 is.
 //   7. THE STATE CODEC ROUND-TRIPS. A frame is turned into a MonitorState, that
 //      into JSON, that back into a MonitorState, and every number is compared.
 //      The FILESYSTEM half of persistence -- atomic rename, the lock, the
 //      journal, surviving a kill -- is xmr_p2pool_persist_kat, because it needs
 //      POSIX and this KAT deliberately does not.
 //
-// Run with `--emit-golden` to print the frame the fixture produces; that is how
-// the golden below was generated, and how it is regenerated on purpose.
-// `--show` prints the live fixture and `--show-degraded` the dead-chain one.
+// Run with `--emit-golden` (and `--emit-collapsed-golden`) to print the frames
+// the fixture produces; that is how the goldens below were generated, and how
+// they are regenerated on purpose. `--show` prints the expanded fixture,
+// `--show-collapsed` the one-line-per-chain one, `--show-degraded` the
+// dead-chain one.
 //
 // Offline, STL only: it includes no socket header, exactly like the parser KAT.
 // ---------------------------------------------------------------------------
@@ -116,6 +125,20 @@ std::string panel_of(const std::string& frame, const char* chain) {
         if (o != std::string::npos && o < end) end = o;
     }
     return frame.substr(at, end - at);
+}
+
+// The ONE LINE a collapsed chain draws, cut out by its title. panel_of() above
+// cuts at the NEXT chain's title, which on the last chain of a collapsed frame
+// would swallow the footer; a summary row is a line, so it is cut as one.
+std::string summary_of(const std::string& frame, const char* chain) {
+    const std::string title = std::string(" ") + chain + "  port ";
+    std::size_t at = frame.find(title);
+    if (at == std::string::npos) {
+        at = frame.find(std::string(">") + chain + "  port ");
+        if (at == std::string::npos) return std::string();
+    }
+    const std::size_t eol = frame.find('\n', at);
+    return frame.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,10 +357,20 @@ tui::MonitorFrame build_degraded_frame() {
 }
 
 // ---------------------------------------------------------------------------
-// THE GOLDEN FRAME. Regenerate with `xmr_p2pool_monitor_kat --emit-golden`.
+// THE GOLDEN FRAMES, one per layout. Regenerate with
+// `xmr_p2pool_monitor_kat --emit-golden` and `--emit-collapsed-golden`.
+//
+// TWO goldens over ONE fixture is the point. The collapsed summary and the
+// expanded panel are two renderings of the same numbers, and the failure mode
+// of a summary line is that it quietly stops agreeing with what it summarises.
+// Pinning both, from the same three read models, makes that a diff.
 // ---------------------------------------------------------------------------
 const char* const kGolden[] = {
 #include "p2pool_monitor_golden.inc"
+};
+
+const char* const kCollapsedGolden[] = {
+#include "p2pool_monitor_collapsed_golden.inc"
 };
 
 // ---------------------------------------------------------------------------
@@ -464,6 +497,319 @@ void check_render() {
     bool no_overflow = true;
     for (const std::string& l : narrow) if (l.size() != 60) no_overflow = false;
     check(no_overflow, "a 60-column window produces 60-column lines");
+}
+
+// Defined with the absence-vs-zero checks below; used by both.
+bool has_value_digit(const std::string& line);
+
+// ---------------------------------------------------------------------------
+// 2b) THE GRAPHICS AND THE TWO PANEL STATES.
+//
+// Three claims, in the order they can fail:
+//
+//   * THE PRIMITIVES ARE PINNED. Every widget is integer maths over a bounded
+//     series, and each one is checked against a hand-computed string here
+//     rather than only through the golden -- a golden diff says "the frame
+//     changed", these say WHICH picture changed and how.
+//   * THE TWO STATES ARE ONE RENDERER. Collapsed and expanded are rendered
+//     from the SAME fixture; the collapsed frame is pinned against its own
+//     golden, is deterministic, keeps every chain, and agrees with the panel
+//     it replaces on the numbers both of them show.
+//   * COLLAPSING HIDES DETAIL, NEVER A PROBLEM. On the degraded fixture the
+//     one-liner still carries DOWN, its age, the reason, and `--` for every
+//     figure the chain cannot support.
+// ---------------------------------------------------------------------------
+void check_graphics() {
+    // --- the primitives ---------------------------------------------------
+    check_str(tui::bar_cells(5, 10, 10), "#####-----", "bar: half full");
+    check_str(tui::bar_cells(0, 10, 10), "----------", "bar: zero draws empty");
+    check_str(tui::bar_cells(1, 1000, 10), "#---------",
+              "bar: a non-zero measurement never draws as empty");
+    check_str(tui::bar_cells(99, 10, 4), "####", "bar: clamped at the span");
+    check_str(tui::bar_cells(5, 0, 6), "#-----", "bar: a zero span still shows a non-zero value");
+    check_str(tui::gauge(5, 10, 8), "[####----]", "gauge: brackets and half fill");
+
+    // The histogram buckets are half-target wide, the last one open.
+    const std::vector<std::uint64_t> gaps = {1000, 4900, 5100, 9900, 12000, 17000, 25000, 40000};
+    const std::vector<std::size_t> h = tui::cadence_histogram(gaps, 10000);
+    check_eq(h.size(), tui::kCadenceBuckets, "the histogram has five buckets");
+    check_eq(h[0], std::size_t(2), "two gaps under half the target");
+    check_eq(h[1], std::size_t(2), "two gaps between half and one target");
+    check_eq(h[2], std::size_t(1), "one gap between one and one and a half");
+    check_eq(h[3], std::size_t(1), "one gap between one and a half and two");
+    check_eq(h[4], std::size_t(2), "two gaps past twice the target");
+    check_eq(tui::cadence_histogram(gaps, 0)[4], std::size_t(0),
+             "a chain with no target buckets nothing rather than dividing by zero");
+
+    // Column bars: newest right, the bottom row carries the baseline.
+    const std::vector<std::string> cols3 = tui::column_bars({0, 1, 2, 3}, 3, 3, 8);
+    check_eq(cols3.size(), std::size_t(3), "a three-row column chart has three rows");
+    check_str(cols3[0], "   #", "columns: only the tallest reaches the top row");
+    check_str(cols3[1], "  ##", "columns: the middle row");
+    check_str(cols3[2], "_###", "columns: the baseline shows an empty column");
+    check_str(tui::column_bars({4, 2}, 0, 2, 8)[0], "# ",
+              "columns: a zero span scales against the window maximum");
+    check(tui::column_bars({}, 10, 3, 8).empty(), "columns: nothing in, nothing out");
+    check_str(tui::column_bars({1, 2, 3, 4}, 4, 1, 2)[0], "##",
+              "columns: a narrow window keeps the newest");
+
+    // The trend is min..max normalised, and a flat series draws mid-ramp.
+    check_str(tui::trend_spark({7, 7, 7}, 8), "===", "trend: flat draws flat, mid-ramp");
+    check_str(tui::trend_spark({0, 1, 2, 3, 4, 5, 6}, 8), "_.-=+*#", "trend: the full ramp");
+    check_str(tui::trend_spark({6, 5, 4, 3, 2, 1, 0}, 8), "#*+=-._", "trend: falling");
+    check_str(tui::trend_spark({0, 1, 2, 3}, 2), "_#",
+              "trend: a narrow window keeps the newest and rescales to them");
+    check_str(tui::trend_spark({}, 8), "", "trend: empty in, empty out");
+
+    // The timeline marks the frontier once, between the backfill and the live
+    // window, and flags every contested height.
+    std::vector<tui::HeightMark> marks;
+    for (int i = 0; i < 3; ++i) marks.push_back({100 + std::uint64_t(i), false, false});
+    marks.push_back({103, false, true});
+    marks.push_back({104, true,  true});
+    marks.push_back({105, false, true});
+    check_str(tui::height_timeline(marks, 16), "...|.*.",
+              "timeline: backfill, frontier bar, live window with a contested height");
+    check_str(tui::height_timeline(marks, 2), "*.",
+              "timeline: a window that starts past the frontier draws no bar at all");
+    check_str(tui::height_timeline({}, 8), "", "timeline: empty in, empty out");
+
+    // --- the layout type --------------------------------------------------
+    tui::Layout none;
+    check(none.is_expanded(0) && none.is_expanded(7),
+          "an untouched layout is expanded: the defensive default is the old frame");
+    tui::Layout all = tui::Layout::all(3, false);
+    check(!all.is_expanded(0) && !all.is_expanded(2), "all(false) collapses every chain");
+    check(all.is_expanded(9), "an index past the end is expanded, never a crash");
+    all.set(1, true);
+    check(!all.is_expanded(0) && all.is_expanded(1), "set() opens exactly one chain");
+    all.toggle(1);
+    check(!all.is_expanded(1), "toggle() closes it again");
+
+    // --- the two states, one fixture --------------------------------------
+    const tui::MonitorFrame f = build_frame();
+    const tui::Layout collapsed = tui::Layout::all(f.chains.size(), false);
+    const tui::Layout expanded  = tui::Layout::all(f.chains.size(), true);
+
+    const std::string ctext = tui::snapshot_text(f, kCols, collapsed);
+    const std::string etext = tui::snapshot_text(f, kCols, expanded);
+    check(ctext == tui::snapshot_text(build_frame(), kCols, collapsed),
+          "the collapsed frame renders to the same bytes twice");
+    check_str(etext, tui::snapshot_text(f, kCols), "an explicit all-expanded layout is the default");
+    check(tui::natural_rows(f, kCols, collapsed) < tui::natural_rows(f, kCols, expanded),
+          "collapsing makes the frame shorter");
+
+    // The collapsed frame, line by line against its own golden.
+    {
+        std::vector<std::string> got;
+        std::string cur;
+        for (const char c : ctext) {
+            if (c == '\n') { got.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) got.push_back(cur);
+        const std::size_t want_n = sizeof(kCollapsedGolden) / sizeof(kCollapsedGolden[0]);
+        check_eq(got.size(), want_n, "the collapsed frame has the golden number of lines");
+        for (std::size_t i = 0; i < got.size() && i < want_n; ++i) {
+            ++g_checks;
+            if (got[i] != kCollapsedGolden[i]) {
+                std::printf("FAIL: collapsed line %zu\n  got  |%s|\n  want |%s|\n",
+                            i, got[i].c_str(), kCollapsedGolden[i]);
+                ++g_fail;
+            }
+        }
+    }
+
+    // Exactly one row per chain, and every chain still present. Counted over
+    // the whole frame, so a summary row that also left its panel behind fails
+    // here rather than merely looking odd.
+    for (const char* name : {"MAIN", "MINI", "NANO"}) {
+        const std::string title = std::string(" ") + name + "  port ";
+        std::size_t n = 0;
+        for (std::size_t at = ctext.find(title); at != std::string::npos;
+             at = ctext.find(title, at + 1)) ++n;
+        check_eq(n, std::size_t(1), "a collapsed chain draws exactly one summary row");
+        check(!summary_of(ctext, name).empty(), "the collapsed chain is still on the frame");
+    }
+    {
+        // The collapsed panels are consecutive lines: no panel body, no
+        // trailing blank, between the first summary and the last.
+        const std::size_t first = ctext.find(" MAIN  port ");
+        const std::size_t last  = ctext.find(" NANO  port ");
+        check(first != std::string::npos && last != std::string::npos, "both ends are drawn");
+        std::size_t newlines = 0;
+        for (std::size_t i = first; i < last; ++i) if (ctext[i] == '\n') ++newlines;
+        check_eq(newlines, std::size_t(2),
+                 "three collapsed chains are three consecutive lines");
+    }
+
+    // The summary agrees with the panel it replaces.
+    const std::string cmain = summary_of(ctext, "MAIN");
+    const std::string emain = panel_of(etext, "MAIN");
+    for (const char* fact : {"15200104", "LIVE", "9.33"}) {
+        check(cmain.find(fact) != std::string::npos,
+              "the summary carries the fact the panel carries");
+        check(emain.find(fact) != std::string::npos, "the panel carries it too");
+    }
+    check(cmain.find("blocks 8") != std::string::npos, "the summary carries the block count");
+    check(emain.find("blocks 8") != std::string::npos, "the panel carries the same block count");
+    check(cmain.find("races 1") != std::string::npos, "the summary carries the race count");
+    check(emain.find("contested 1") != std::string::npos,
+          "the panel carries the same race count under its own label");
+
+    // --- the widgets are on the expanded frame ----------------------------
+    for (const char* row : {"   trend ", "   buckets ", "   heatmap ", "   timeline ",
+                            "   monero ", "   pplns ", "   peers ", "   recent "}) {
+        ++g_checks;
+        if (emain.find(row) == std::string::npos) {
+            std::printf("FAIL: the expanded panel is missing its %srow\n", row);
+            ++g_fail;
+        }
+    }
+    check(emain.find("|") != std::string::npos, "the timeline draws its frontier bar");
+    check(emain.find("coverage, not a ledger") != std::string::npos,
+          "the pplns gauge says what it is not");
+    check(etext.find("found") == std::string::npos,
+          "no widget turns the monero template into a found-block claim");
+
+    // The series come from the read model's ring, bounded and live-window aware.
+    check_eq(f.chains[0].diff_series.size(), std::size_t(5),
+             "main's history ring holds one sample per advanced height");
+    check_eq(f.chains[0].marks.size(), std::size_t(7), "main's timeline covers every height held");
+    check_eq(f.chains[0].heights_held, std::size_t(7),
+             "seven heights, eight blocks: the contested height is one height");
+    check_eq(f.chains[0].tip_shares, std::size_t(122), "the gauge reads the tip's payout lines");
+    check_eq(f.chains[0].pplns_window, std::uint64_t(2160), "the gauge denominator is the chain's");
+    std::size_t live_marks = 0;
+    for (const tui::HeightMark& m : f.chains[0].marks) if (m.live) ++live_marks;
+    check_eq(live_marks, std::size_t(4), "four of main's heights are above the frontier");
+
+    // --- geometry, in both states -----------------------------------------
+    tui::Layout mixed = tui::Layout::all(3, false);
+    mixed.set(1, true);
+    for (const tui::Layout& lay : {collapsed, expanded, mixed}) {
+        for (std::size_t cols : {60u, 100u, 140u}) {
+            for (std::size_t rows : {12u, 24u, 60u}) {
+                const std::vector<std::string> plain = tui::render(f, cols, rows, false, lay);
+                check_eq(plain.size(), rows, "render is total in every layout");
+                bool ok = true;
+                for (const std::string& l : plain) if (l.size() != cols) ok = false;
+                check(ok, "every line is exactly cols wide in every layout");
+                const std::vector<std::string> col = tui::render(f, cols, rows, true, lay);
+                bool same = true;
+                for (std::size_t i = 0; i < col.size(); ++i)
+                    if (tui::strip_ansi(col[i]) != plain[i]) same = false;
+                check(same, "colour stays additive in every layout");
+                int titles = 0;
+                for (const std::string& l : plain)
+                    if (l.rfind(" MAIN ", 0) == 0 || l.rfind(" MINI ", 0) == 0
+                        || l.rfind(" NANO ", 0) == 0) ++titles;
+                check_eq(titles, 3, "no layout and no window size loses a chain");
+            }
+        }
+    }
+
+    // SHEDDING ORDER: the pictures go before the numbers. A 12-row window keeps
+    // every chain and carries no widget; a tall one carries them all.
+    const std::vector<std::string> tight = tui::render(f, kCols, 12, false, expanded);
+    bool any_widget = false;
+    for (const std::string& l : tight)
+        if (l.rfind("   buckets", 0) == 0 || l.rfind("   heatmap", 0) == 0
+            || l.rfind("   peers", 0) == 0 || l.rfind("   recent", 0) == 0) any_widget = true;
+    check(!any_widget, "a 12-row window sheds the bar blocks");
+    const std::vector<std::string> tall =
+        tui::render(f, kCols, tui::natural_rows(f, kCols, expanded), false, expanded);
+    std::size_t widget_rows = 0;
+    for (const std::string& l : tall)
+        if (l.rfind("   buckets", 0) == 0 || l.rfind("   heatmap", 0) == 0
+            || l.rfind("   peers", 0) == 0 || l.rfind("   recent", 0) == 0) ++widget_rows;
+    check_eq(widget_rows, std::size_t(12), "a tall window carries all four bar blocks per chain");
+
+    // The read-only claim is a property of the frame, not of a layout.
+    check(ctext.find("emitted ids {0,1,3,6}") != std::string::npos,
+          "a collapsed frame still prints the emitted id set");
+    check(ctext.find("READ-ONLY") != std::string::npos, "a collapsed frame is still read-only");
+
+    // --- collapsing a DEGRADED chain --------------------------------------
+    const tui::MonitorFrame d = build_degraded_frame();
+    const std::string dtext = tui::snapshot_text(d, kCols, tui::Layout::all(3, false));
+    const std::string dnano = summary_of(dtext, "NANO");
+    check(dnano.find("DOWN") != std::string::npos, "a collapsed dead chain still says DOWN");
+    check(dnano.find("1m35s") != std::string::npos, "a collapsed dead chain still says how long");
+    check(dnano.find("no peers") != std::string::npos,
+          "a collapsed dead chain still says what DOWN means");
+    check(dnano.find(tui::kNoData) != std::string::npos, "a collapsed dead chain dashes its figures");
+    check(dnano.find("0 up") != std::string::npos,
+          "a collapsed dead chain keeps its peer count as a number");
+    // THE SAME DIGIT RULE AS THE PANEL, with the same single exception. The
+    // peer count is a reading of our own socket table, so "0 up" is a
+    // measurement and is asserted to be there; everything else on the summary
+    // of a chain that has heard nothing must be `--`.
+    std::string figures = dnano;
+    {
+        const std::size_t up = figures.find(" up");
+        if (up != std::string::npos) {
+            std::size_t b = up;
+            while (b > 0 && figures[b - 1] >= '0' && figures[b - 1] <= '9') --b;
+            figures.erase(b, up + 3 - b);
+        }
+    }
+    ++g_checks;
+    if (has_value_digit(figures)) {
+        std::printf("FAIL: a collapsed dead chain printed a figure: |%s|\n", dnano.c_str());
+        ++g_fail;
+    }
+    const std::string dmini = summary_of(dtext, "MINI");
+    check(dmini.find("STALE") != std::string::npos, "a collapsed frozen chain still says STALE");
+    check(dmini.find("tip frozen") != std::string::npos,
+          "a collapsed frozen chain still says what STALE means");
+    check(dmini.find("14757144") != std::string::npos,
+          "a collapsed frozen chain keeps the last number it knew");
+
+    // --- the interactive affordances are interactive-only -----------------
+    check(etext.find("[-]") == std::string::npos && ctext.find("[+]") == std::string::npos,
+          "a snapshot frame carries no expand markers");
+    check(ctext.rfind(">", 0) == std::string::npos && ctext.find("\n>") == std::string::npos,
+          "no line of a snapshot frame carries a focus caret");
+    tui::MonitorFrame inter = build_frame();
+    inter.interactive = true;
+    tui::Layout focus2 = tui::Layout::all(3, false);
+    focus2.focus = 1;
+    const std::string itext = tui::snapshot_text(inter, kCols, focus2);
+    check(!summary_of(itext, "MINI").empty(), "a focused summary is still found by its title");
+    check(itext.find(">MINI  port 37888") != std::string::npos,
+          "the focused chain is marked in column 0 when interactive");
+    check(itext.find(" MAIN  port 37889") != std::string::npos,
+          "an unfocused chain keeps its leading space");
+    check(itext.find("[+]") != std::string::npos, "a collapsed interactive panel offers [+]");
+    check(itext.find("1 MAIN") != std::string::npos && itext.find("3 NANO") != std::string::npos,
+          "the key row prints the live digit-to-chain mapping");
+    check(itext.find("Tab") != std::string::npos && itext.find("all/none") != std::string::npos,
+          "the key row names the layout keys");
+    // A COLLAPSED PANEL CARRIES THE CLAMPED-AGE MARKER TOO. A restored chain
+    // whose recorded instants sit in the future of the reading clock draws its
+    // ages as `0s+`, and a summary row that dropped the `+` would say "0s old"
+    // about a file whose age nobody measured -- the same lie in a shorter row.
+    {
+        tui::MonitorFrame skewed;
+        tui::ChainView sk = build_frame().chains[0];
+        sk.source       = tui::ChainSource::Restored;
+        sk.clock_ahead  = true;
+        sk.data_age_ms  = 0;
+        skewed.chains.push_back(sk);
+        const std::string stext = tui::snapshot_text(skewed, kCols, tui::Layout::all(1, false));
+        check(stext.find("[FROM FILE 0s+ OLD]") != std::string::npos,
+              "a collapsed restored panel marks a clamped file age");
+        const std::string etext2 = tui::snapshot_text(skewed, kCols, tui::Layout::all(1, true));
+        check(etext2.find("[FROM FILE 0s+ OLD]") != std::string::npos,
+              "and the expanded panel says exactly the same thing");
+    }
+
+    tui::Layout hinted = tui::Layout::all(3, true);
+    hinted.show_hints = true;
+    const std::string htext = tui::snapshot_text(inter, kCols, hinted);
+    check(htext.find("glyphs") != std::string::npos, "? opens a glyph legend");
+    check(htext.find("1..9") != std::string::npos, "the legend states the digit keys");
 }
 
 // ---------------------------------------------------------------------------
@@ -653,10 +999,19 @@ void check_absence_vs_zero() {
         }
         if (!cur.empty()) lines.push_back(cur);
     }
+    // THE WIDGET ROWS ARE IN THIS WALK. Every picture added to the panel is a
+    // new place for a zero to appear on a chain that has measured nothing, and
+    // a bar chart of zeros is a more convincing lie than the digit 0 is. The
+    // `peers` bars are deliberately NOT here: like the net row, they are a
+    // reading of our own socket table, so zero there is a measurement.
     int checked_rows = 0;
     for (const std::string& l : lines) {
         const bool data_row = l.find("   tip ") == 0 || l.find("   cadence ") == 0
-                           || l.find("   pulse ") == 0 || l.find("   races ") == 0;
+                           || l.find("   pulse ") == 0 || l.find("   races ") == 0
+                           || l.find("   trend ") == 0 || l.find("   buckets ") == 0
+                           || l.find("   heatmap ") == 0 || l.find("   timeline ") == 0
+                           || l.find("   monero ") == 0 || l.find("   pplns ") == 0
+                           || l.find("   recent ") == 0;
         if (!data_row) continue;
         ++checked_rows;
         ++g_checks;
@@ -670,7 +1025,7 @@ void check_absence_vs_zero() {
             ++g_fail;
         }
     }
-    check_eq(checked_rows, 4, "four data rows on the dead panel were examined");
+    check_eq(checked_rows, 11, "every data row on the dead panel was examined, widgets included");
     check(nano.find("0 up / 0 sock") != std::string::npos,
           "peer counts stay real numbers: zero peers is a measurement");
 
@@ -999,6 +1354,26 @@ void check_state_codec() {
     check(behind_text.find("584542046d") == std::string::npos,
           "no unsigned wrap ever reaches the screen");
 
+    // THE WIDGETS A STATE FILE CANNOT FEED SAY SO, AND FABRICATE NOTHING.
+    // p2pmon-state/1 carries the totals and the pulse, not the history ring, so
+    // the series-backed rows must decline in words -- a widget that drew its
+    // empty series anyway would put a flat line or a row of zeros on screen in
+    // the same shape a live chain uses, which is the whole failure this
+    // component is built against. The gap-backed widgets DO survive, because
+    // the gaps are in the file, and that is asserted in the same breath.
+    check(restored.find("not the difficulty series") != std::string::npos,
+          "a restored trend says the file does not carry it");
+    check(restored.find("not the height timeline") != std::string::npos,
+          "a restored timeline says the file does not carry it");
+    check(restored.find("not the window coverage") != std::string::npos,
+          "a restored pplns gauge declines rather than printing 0/0");
+    check(restored.find("0/0") == std::string::npos,
+          "no restored widget invents a zero denominator");
+    check(restored.find("not the per-block series") != std::string::npos,
+          "the restored per-block bars say the file does not carry them");
+    check(restored.find("   buckets ") != std::string::npos,
+          "the gap histogram survives a restore, because the gaps are in the file");
+
     // Read back one second later and the same file is a current reading, with
     // the same numbers -- the continuity property, in the renderer.
     const tui::MonitorFrame just_now = st::frame_of(b, meta.written_at_ms + 1000);
@@ -1080,6 +1455,28 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    if (argc > 1 && std::strcmp(argv[1], "--emit-collapsed-golden") == 0) {
+        const std::string frame = tui::snapshot_text(build_frame(), kCols,
+                                                     tui::Layout::all(3, false));
+        std::string cur;
+        for (const char c : frame) {
+            if (c == '\n') {
+                std::string esc;
+                for (const char k : cur) {
+                    if (k == '\\' || k == '"') esc.push_back('\\');
+                    esc.push_back(k);
+                }
+                std::printf("\"%s\",\n", esc.c_str());
+                cur.clear();
+            } else cur.push_back(c);
+        }
+        return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--show-collapsed") == 0) {
+        std::printf("%s", tui::snapshot_text(build_frame(), kCols,
+                                             tui::Layout::all(3, false)).c_str());
+        return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--show") == 0) {
         std::printf("%s", tui::snapshot_text(build_frame(), kCols).c_str());
         return 0;
@@ -1103,6 +1500,7 @@ int main(int argc, char** argv) {
 
     check_emit_set();
     check_render();
+    check_graphics();
     check_aggregation();
     check_honesty();
     check_formatting();
