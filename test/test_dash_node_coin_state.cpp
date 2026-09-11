@@ -589,6 +589,71 @@ TEST(DashNodeCoinState, QcPlanServesDkgWindowHeightAndEmitGateEnforcesIt) {
     EXPECT_FALSE(st.make_embedded_work_inputs().viable());
 }
 
+TEST(DashNodeCoinState, QcPullHookFiresWithNamedQuorumOnUnderivableRefusal) {
+    // #1203: on a qc-plan-underivable refusal the offending quorum IS known
+    // (QcPlanGap::slot_known). This proves the "ask, don't just wait" seam:
+    // the pull hook fires exactly once, targeting the quorum the refusal
+    // named, WITHOUT changing the reward-safe fail-closed outcome; and it
+    // does NOT fire when the gap names no single quorum or when it is unset.
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_commitment_window_fn(
+        [](uint32_t next_h) { return dash::coin::is_dkg_commitment_window(next_h); });
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+
+    const uint256 want_q = raw256(0x7E);
+    auto naming_plan_fn =
+        [want_q](uint32_t, dash::coin::QcPlanGap* gap)
+            -> std::optional<dash::coin::QcBlockPlan> {
+            if (gap) {
+                *gap = dash::coin::QcPlanGap{};
+                gap->stage = dash::coin::QcPlanStage::SlotUnsatisfied;
+                gap->slot_known = true;
+                gap->llmq_type = 4;
+                gap->quorum_index = 0;
+                gap->quorum_hash = want_q;
+                gap->slot_gap = dash::coin::QcSlotGap::NoCommitmentCached;
+            }
+            return std::nullopt;
+        };
+
+    // Hook UNSET (default): the refusal still fails closed, nothing fires.
+    st.set_qc_plan_fn(naming_plan_fn);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable());
+
+    // Hook SET: fires exactly once, targeting the named quorum, and does NOT
+    // change the reward-safe refusal.
+    int pulls = 0;
+    uint256 pulled_q;
+    st.set_qc_pull_fn([&](const dash::coin::QcPlanGap& g) {
+        ++pulls;
+        pulled_q = g.quorum_hash;
+    });
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "the pull hook must not change the fail-closed outcome";
+    EXPECT_EQ(pulls, 1);
+    EXPECT_EQ(pulled_q, want_q)
+        << "the pull must target the quorum the refusal named";
+
+    // A gap with NO single quorum (SlotSetUnderivable) must NOT fire — there
+    // is nothing to ask for.
+    st.set_qc_plan_fn([](uint32_t, dash::coin::QcPlanGap* gap)
+                          -> std::optional<dash::coin::QcBlockPlan> {
+        if (gap) {
+            *gap = dash::coin::QcPlanGap{};
+            gap->stage = dash::coin::QcPlanStage::SlotSetUnderivable;
+        }
+        return std::nullopt;
+    });
+    pulls = 0;
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable());
+    EXPECT_EQ(pulls, 0) << "no named quorum => nothing to pull";
+}
+
 // BLOCKER-2 viability: a stale/absent bestCL fails closed; a fresh one serves.
 TEST(DashNodeCoinState, StaleBestClRefusesEmbedded) {
     NodeCoinState st;
