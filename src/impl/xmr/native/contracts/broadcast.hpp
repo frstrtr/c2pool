@@ -11,10 +11,20 @@
 // C1 -> C5 (D-10): the outbound notify port. C1 implements it and posts to the
 // io thread; C5 owns the retained-block book, not C1.
 //
-// broadcast_notify() returns the number of peers the frame was actually written
+// WHAT THE CALLER PASSES IS THE MESSAGE BODY, NOT A FRAME. The implementation
+// writes the 33-byte levin bucket header around it (LevinLink::send_notify ->
+// make_notify). Passing an already-framed buffer produces a doubly-framed
+// notification that every Monero peer answers with
+//   portable_storage: wrong binary format - signature mismatch
+// and drops -- with the peers-written count still reading perfectly, because
+// the bytes DID reach the socket. C5 shipped exactly that bug until a live
+// monerod said so; the parameter is named `body` here for that reason.
+//
+// broadcast_notify() returns the number of peers the body was actually written
 // to, and it counts ONLY handshaked peers in state_normal. That number is the
 // input to the never-silent-drop rule: a found block that reached zero peers
-// and had no daemon arm is a loud failure, never a shrug.
+// and had no daemon arm is a loud failure, never a shrug. It is a DELIVERY
+// count and never an acceptance: no peer answers an unsolicited notification.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -30,8 +40,9 @@ namespace c2pool::xmr::native {
 
 // Handler installed by C5 to answer a peer asking for the transactions it is
 // missing from a fluffy block we pushed (REQUEST_FLUFFY_MISSING_TX, 2009).
-// Fills `reply_2008` with a complete NOTIFY_NEW_FLUFFY_BLOCK frame and returns
-// true, or returns false to decline.
+// Fills `reply_2008` with the NOTIFY_NEW_FLUFFY_BLOCK message BODY (the caller
+// frames it, same rule as broadcast_notify) and returns true, or returns false
+// to decline.
 using FluffyMissingHandler = std::function<bool(const PeerRef&,
                                                 const Hash&                       block_id,
                                                 std::uint64_t                     height,
@@ -42,14 +53,16 @@ class IBroadcastPort {
 public:
     virtual ~IBroadcastPort() = default;
 
-    // Send to every handshaked peer in state_normal. Returns the count written.
+    // Send to every handshaked peer in state_normal. `body` is the epee message
+    // body; the implementation frames it. Returns the count written.
     virtual std::size_t broadcast_notify(std::uint32_t             cmd,
-                                         std::vector<std::uint8_t> frame) = 0;
+                                         std::vector<std::uint8_t> body) = 0;
 
-    // Send to one peer. False when the peer is gone or not writable.
+    // Send to one peer, same body-not-frame contract. False when the peer is
+    // gone or not writable.
     virtual bool send_notify(const PeerRef&,
                              std::uint32_t             cmd,
-                             std::vector<std::uint8_t> frame) = 0;
+                             std::vector<std::uint8_t> body) = 0;
 
     virtual void set_fluffy_missing_handler(FluffyMissingHandler) = 0;
 

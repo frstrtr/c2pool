@@ -253,10 +253,22 @@ BlockRelayRequest request_for(const BlockFixture& f) {
     return r;
 }
 
-// Decode a frame this component produced, the way a peer would.
-bool decode_frame(const std::vector<std::uint8_t>& frame,
+// Read back what this component produced, the way a peer would.
+//
+// C5 hands the transport a message BODY and the transport frames it
+// (LevinLink::send_notify -> make_notify). So this helper frames the body the
+// way C1 would and then parses the result. That order is deliberate: it is what
+// catches a body that was ALREADY framed, because the re-framed buffer then
+// carries a levin header where the epee storage signature should be and the
+// parse fails. C5 shipped exactly that bug -- broadcast_notify was handed a
+// complete frame -- and every Monero peer answered "portable_storage: wrong
+// binary format - signature mismatch" while the peers-written count read
+// perfectly. A fake port frames nothing, so nothing here could see it.
+bool decode_frame(const std::vector<std::uint8_t>& body,
                   levin::BucketHead&               head,
                   levin::NewBlock&                 msg) {
+    const std::vector<std::uint8_t> frame =
+        levin::make_notify(levin::CMD_NEW_FLUFFY_BLOCK, body);
     levin::HeaderPolicy pol;
     pol.handshaked = true;
     levin::HeaderError herr = levin::HeaderError::None;
@@ -265,6 +277,17 @@ bool decode_frame(const std::vector<std::uint8_t>& frame,
     levin::MessageError merr = levin::MessageError::None;
     return levin::decode_new_fluffy_block(frame.data() + levin::HEADER_SIZE,
                                           static_cast<std::size_t>(head.cb), msg, merr);
+}
+
+// The body C5 produced must START with the epee portable_storage signature
+// (01 11 01 01 | 01 01 02 01 | version), never with a levin bucket header
+// (01 21 01 01 ...). One byte comparison, and it is the whole of the bug.
+bool is_bare_epee_body(const std::vector<std::uint8_t>& body) {
+    if (body.size() < 9) return false;
+    const std::uint8_t want[9] = {0x01, 0x11, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x01};
+    for (int i = 0; i < 9; ++i)
+        if (body[static_cast<std::size_t>(i)] != want[i]) return false;
+    return true;
 }
 
 // ===========================================================================
@@ -334,6 +357,10 @@ void suite_a() {
     levin::NewBlock   msg;
     const bool ok = decode_frame(port.broadcasts[0].bytes, head, msg);
     CHECK(ok, "A3  a peer can read the frame back with the C1a decoder");
+    CHECK(is_bare_epee_body(port.broadcasts[0].bytes),
+          "A3b the port was handed a BARE epee body, not an already-framed 2008 "
+          "(the transport adds the levin header; a doubly-framed notify is a "
+          "signature mismatch at every Monero peer)");
     CHECK(head.command == 2008 && levin::classify(head) == levin::FrameClass::Notify,
           "A4  the levin header says command 2008, class Notify (no answer owed)");
     CHECK(head.return_code == 0 && head.protocol_version == levin::PROTOCOL_VER_1,

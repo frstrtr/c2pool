@@ -97,6 +97,13 @@ struct NativeTemplateConfig {
     // Monerod is the M2 ladder's first rung (serve=monerod / shadow=native).
     native::TemplateArm      serve = native::TemplateArm::Native;
 
+    // M3 (R-ARMORDER): which arm a FOUND block goes out on. DaemonFirst is the
+    // default and is what M0..M2h ran -- though under it the POOL, not this
+    // node, does the submitting (the node's own daemon sink is empty), so C5
+    // is simply not on the path at all. P2pOnly is --arm-order p2p-first: the
+    // block goes out as a levin 2008 and monerod is never asked.
+    native::ArmOrder         relay_order = native::ArmOrder::DaemonFirst;
+
     // Fall back to the other arm when the serving arm is not ready. ON is the
     // production posture; the M2 evidence run turns it OFF so that "no monerod
     // call on the template path" cannot be satisfied by a silent fallback.
@@ -148,6 +155,7 @@ public:
         nc.parity_ledger_path   = cfg_.parity_ledger_path;
         nc.c2pool_commit        = cfg_.c2pool_commit;
         nc.serve_arm            = cfg_.serve;
+        nc.relay_order          = cfg_.relay_order;
         nc.template_fallback    = cfg_.fallback;
         nc.force_synced         = cfg_.force_synced;
         nc.backlog_refresh_s    = cfg_.backlog_refresh_s;

@@ -86,6 +86,8 @@
 #include "xmr/xmr_o2_settlement_provider.hpp" // O-2 option B: v37 K_fair settlement template provider + source
 #include "xmr/xmr_settlement_coinbase_shape.hpp"  // M2: the K_fair shape gate, read off the assembled block bytes
 #include "xmr/xmr_native_template_backend.hpp"    // M2: the native-minimal Monero node as the miner-data source
+#include "xmr/xmr_native_chain_source.hpp"        // M3: the native levin chain as the tip + canonical test
+#include "xmr/xmr_p2p_block_publisher.hpp"        // M3: found block -> levin 2008 (no submit_block)
 
 using namespace c2pool::v37n::xmr;
 namespace strat = ::v37::xmr::stratum;
@@ -172,8 +174,13 @@ static int run_mock_smoke() {
 template <class Provider, class Snapshot>
 class GatedShareSinkT final : public strat::IShareSink {
 public:
+    // `inner` is the PUBLISHER: sub::LiveSubmitShareSink (monerod submit_block)
+    // under --arm-order daemon-first, o2::P2pBlockPublisher (a levin 2008)
+    // under p2p-first. Taken as the INTERFACE rather than the concrete type so
+    // that the exact 128-bit gate in front of it is the same code on both arm
+    // orders -- the one property that must not fork when the publish path does.
     GatedShareSinkT(o2::O2RandomXVerifier& rx, const Provider& provider,
-                    strat::ITemplateSource& source, sub::LiveSubmitShareSink& inner)
+                    strat::ITemplateSource& source, strat::IShareSink& inner)
         : m_rx(rx), m_provider(provider), m_source(source), m_inner(inner) {}
 
     void on_accepted_share(const strat::AcceptedShare& s) override { m_inner.on_accepted_share(s); }
@@ -230,7 +237,7 @@ private:
     o2::O2RandomXVerifier&              m_rx;
     const Provider&                     m_provider;
     strat::ITemplateSource&             m_source;
-    sub::LiveSubmitShareSink&           m_inner;
+    strat::IShareSink&                  m_inner;
     std::atomic<std::uint64_t> m_calls{0}, m_accepted{0}, m_rejected{0}, m_refused{0}, m_stale{0};
     mutable std::mutex m_mtx;
     std::string        m_last;
@@ -260,6 +267,23 @@ struct ServeHooks {
     std::function<void(bool /*refreshed*/, bool /*new_template*/)> after_refresh;
     // Called from the status cadence, after the standard status line.
     std::function<void()> status_extra;
+
+    // M3: THE TIP DRIVER, as one call per loop pass.
+    //
+    // Unset (daemon-first, the default) means the built-in one: pump the
+    // transport's get_miner_data poll and top up the RandomX seed reach, both
+    // of which are monerod round trips. Set (p2p-first) means the caller drives
+    // the tip from the native node's own levin chain instead, and NOTHING in
+    // this loop may touch the daemon -- which is the whole claim, so the built-
+    // in pump is REPLACED here rather than merely skipped at its call site.
+    std::function<void()> pump_tip;
+
+    // M3: the found-block publish arm, when it is not the monerod submitter.
+    // Non-null routes the RandomX-gated winner to C5's levin 2008 relay; null
+    // keeps submit_block. serve_and_run builds the sink over this rather than
+    // taking a built one, because the FOUND queue the sink pushes into is
+    // loop-local -- one queue, one drain, whichever arm filled it.
+    ::c2pool::xmr::native::relay::LevinBlockRelay* p2p_relay = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -285,9 +309,25 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
 
     sub::LiveBlockSubmitter submitter(transport);   // fresh socket per RPC: safe off-thread
     sub::FoundBlockQueue    submit_q;
-    sub::LiveSubmitShareSink live_sink(submitter, submit_q, std::move(candidate_lookup));
-    submitter.enable_network_submit(rx.network_blocks_allowed());   // fail-closed gate
-    GatedShareSinkT<Provider, Snapshot> sink(rx, provider, template_source, live_sink);
+    sub::LiveSubmitShareSink live_sink(submitter, submit_q, candidate_lookup);
+
+    // M3: WHICH arm publishes a found block. The daemon submitter is ARMED only
+    // when it is that arm -- in p2p-first it is constructed (the object is
+    // cheap and opens no socket) and left disabled, so even a mis-wired gate
+    // cannot reach submit_block. Both arms push into the SAME loop-local FOUND
+    // queue, so wire 4 downstream of here is identical on either order.
+    const bool p2p_publish = (hooks.p2p_relay != nullptr);
+    std::unique_ptr<o2::P2pBlockPublisher> publisher;
+    if (p2p_publish) {
+        publisher = std::make_unique<o2::P2pBlockPublisher>(*hooks.p2p_relay, submit_q,
+                                                            candidate_lookup);
+        publisher->enable_network_relay(rx.network_blocks_allowed());   // fail-closed gate
+    }
+    submitter.enable_network_submit(!p2p_publish && rx.network_blocks_allowed());
+    strat::IShareSink& publish_sink =
+        p2p_publish ? static_cast<strat::IShareSink&>(*publisher)
+                    : static_cast<strat::IShareSink&>(live_sink);
+    GatedShareSinkT<Provider, Snapshot> sink(rx, provider, template_source, publish_sink);
 
     o2::StratumListenerOptions lo;
     lo.bind_host = cfg.stratum_bind_host;
@@ -326,10 +366,14 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         provider.last_error().c_str(), to_string(cfg.coinbase));
         }
         listener.start();
-        std::printf("stratum: listening on %s:%u (%s coinbase, share diff %s, network submit %s)\n",
+        std::printf("stratum: listening on %s:%u (%s coinbase, share diff %s, publish arm %s, "
+                    "network submit %s)\n",
                     cfg.stratum_bind_host.c_str(), listener.bound_port(), to_string(cfg.coinbase),
                     cfg.stratum_share_diff ? std::to_string(cfg.stratum_share_diff).c_str() : "network",
-                    submitter.network_submit_enabled() ? "ENABLED" : "DISABLED (fail-closed)");
+                    p2p_publish ? "LEVIN 2008 (p2p-first, no submit_block)"
+                                : "monerod submit_block (daemon-first)",
+                    (p2p_publish || submitter.network_submit_enabled())
+                        ? "ENABLED" : "DISABLED (fail-closed)");
     } else {
         std::printf("stratum: NOT served (%s) — observe-side only\n", not_served_reason);
     }
@@ -337,8 +381,14 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     std::signal(SIGINT, on_sigint);
     std::signal(SIGTERM, on_sigint);
     const std::uint32_t poll_ms = cfg.poll_ms ? cfg.poll_ms : 5000;
-    std::printf("node up. Ctrl-C to stop. (ZMQ push drives the tip; RPC poll fallback every %u ms)\n",
-                poll_ms);
+    if (hooks.pump_tip)
+        std::printf("node up. Ctrl-C to stop. (arm-order %s: the NATIVE levin chain drives the "
+                    "tip; no monerod poll, every %u ms)\n",
+                    to_string(cfg.arm_order), poll_ms);
+    else
+        std::printf("node up. Ctrl-C to stop. (arm-order %s: ZMQ push drives the tip; RPC poll "
+                    "fallback every %u ms)\n",
+                    to_string(cfg.arm_order), poll_ms);
 
     auto bridge_found = [&]() {
         sub::FoundBlockEvent s;
@@ -374,7 +424,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     "orphaned=%llu refused=%llu pending=%zu\n",
                     static_cast<unsigned long long>(node.hw().hw_height),
                     static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
-                    static_cast<unsigned long long>(node.adapter().index().best_height()),
+                    static_cast<unsigned long long>(node.best_height()),
                     t.template_id, static_cast<unsigned long long>(t.height),
                     static_cast<unsigned long long>(t.difficulty),
                     static_cast<unsigned long long>(provider.refreshes()),
@@ -404,8 +454,21 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         std::printf("  %s\n", rx.describe().c_str());
         const std::string g = sink.last();
         if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
-        const std::string se = submitter.last_error();
-        if (!se.empty()) std::printf("  submit: last_error=%s\n", se.c_str());
+        if (p2p_publish) {
+            std::printf("  p2p publish: calls=%llu relayed=%llu peers_written=%llu refused=%llu "
+                        "reached_nobody=%llu stale=%llu\n",
+                        static_cast<unsigned long long>(publisher->calls()),
+                        static_cast<unsigned long long>(publisher->relayed()),
+                        static_cast<unsigned long long>(publisher->peers()),
+                        static_cast<unsigned long long>(publisher->refused()),
+                        static_cast<unsigned long long>(publisher->failed()),
+                        static_cast<unsigned long long>(publisher->stale()));
+            const std::string pe = publisher->last_error();
+            if (!pe.empty()) std::printf("  p2p publish: last=%s\n", pe.c_str());
+        } else {
+            const std::string se = submitter.last_error();
+            if (!se.empty()) std::printf("  submit: last_error=%s\n", se.c_str());
+        }
         std::fflush(stdout);
     };
 
@@ -414,8 +477,15 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     while (!g_stop.load()) {
         bridge_found();
         fc.tick();
-        transport.pump_poll();
-        node.adapter().ensure_seed_reach();
+        // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
+        // p2p-first replaces both with the native chain's own event drain, and
+        // this is the only place either of them is driven -- so "no daemon call
+        // on the find path" is a property of one branch, not of good behaviour.
+        if (hooks.pump_tip) hooks.pump_tip();
+        else {
+            transport.pump_poll();
+            node.adapter().ensure_seed_reach();
+        }
         if (serving) {
             const bool refreshed = provider.refresh();
             bool new_template = false;
@@ -466,17 +536,121 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// M3: build and start the embedded native node.
+//
+// Hoisted out of the option-B branch because the ORDER changed. Under
+// --arm-order p2p-first this node is the tip driver, and XmrNode::bring_up()
+// binds the finalize driver's canonical test at construction -- so the native
+// chain has to exist BEFORE bring_up, not after it. Under daemon-first the
+// order is immaterial and this is the same code M2h ran.
+//
+// Returns null on refusal, with the reason already printed.
+// ---------------------------------------------------------------------------
+static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const XmrNodeConfig& cfg) {
+    if (cfg.native_connect.empty()) {
+        std::printf("REFUSED: the native Monero node needs at least one --native-connect "
+                    "<ip:port> levin peer (it dials only what it is told to)\n");
+        return nullptr;
+    }
+    const bool p2p_first = (cfg.arm_order == ArmOrderMode::P2PFirst);
+
+    o2::NativeTemplateConfig ncfg;
+    ncfg.net                  = native_net_of(cfg.network);
+    ncfg.connect              = cfg.native_connect;
+    ncfg.p2p_bind_ip          = cfg.native_p2p_bind_ip;
+    ncfg.boot                 = cfg.native_anchor_path.empty()
+                                    ? ::c2pool::xmr::native::rt::BootMode::Genesis
+                                    : ::c2pool::xmr::native::rt::BootMode::Anchor;
+    ncfg.anchor_path          = cfg.native_anchor_path;
+    // The daemon endpoint is the C6 PARITY judge, and under daemon-first also
+    // the submit arm. Under p2p-first it is the parity judge and nothing else:
+    // the oracle reads it off the status cadence, which is not the find path.
+    // --no-daemon-rpc withholds it entirely, and then the node has no daemon
+    // arm to make a call with -- the strongest form of the claim, at the cost
+    // of the parity judge.
+    if (!cfg.no_daemon_rpc) {
+        ncfg.monerod_rpc_host = cfg.monerod.rpc_host;
+        ncfg.monerod_rpc_port = cfg.monerod.rpc_port;
+    }
+    ncfg.serve                = ::c2pool::xmr::native::TemplateArm::Native;
+    ncfg.relay_order          = p2p_first ? ::c2pool::xmr::native::ArmOrder::P2pOnly
+                                          : ::c2pool::xmr::native::ArmOrder::DaemonFirst;
+    // p2p-first pins the fallback OFF whatever the flag said: a daemonless find
+    // whose template silently came from the daemon is not a daemonless find,
+    // and the operator should not be able to weaken the claim by accident.
+    ncfg.fallback             = p2p_first ? false : cfg.native_template_fallback;
+    ncfg.force_synced         = cfg.native_force_synced;
+    ncfg.allow_unverified_pow = cfg.native_allow_unverified_pow;
+    ncfg.parity               = true;
+    ncfg.parity_ledger_path   = cfg.resolved_settle_db_path() + "/xmr_parity_ledger.json";
+    ncfg.c2pool_commit        = C2POOL_VERSION;
+    ncfg.ready_timeout_s      = cfg.native_ready_timeout_s;
+    ncfg.backlog_refresh_s    = cfg.native_backlog_refresh_s;
+
+    std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned peer(s)) "
+                "feeds the option-B assembler%s\n",
+                cfg.native_connect.size(),
+                p2p_first ? "; it is ALSO the tip, the canonical test and the block relay "
+                            "(--arm-order p2p-first): monerod is not on the find path"
+                          : "; monerod stays the parity judge and the submit arm, and is NOT "
+                            "on the template path");
+
+    auto native = std::make_unique<o2::NativeTemplateBackend>(std::move(ncfg));
+    std::string why;
+    if (!native->start_and_wait(why, [](const std::string& w) {
+            std::printf("  native: not ready yet — %s\n", w.c_str());
+            std::fflush(stdout);
+        })) {
+        std::printf("REFUSED: %s\n", why.c_str());
+        return nullptr;
+    }
+    std::printf("  native: template arm READY, fallback %s\n",
+                native->config().fallback
+                    ? "ON (the daemon arm may serve if the native one loses a window)"
+                    : "OFF (native-only: no template is served if the native arm is not ready)");
+    return native;
+}
+
 static int run_live(const XmrNodeConfig& cfg) {
-    std::printf("c2pool-v37-xmr: EXPERIMENTAL prototype — network=%s monerod=%s:%u (zmq %u)\n",
+    std::printf("c2pool-v37-xmr: EXPERIMENTAL prototype — network=%s monerod=%s:%u (zmq %u) "
+                "arm-order=%s\n",
                 to_string(cfg.network), cfg.monerod.rpc_host.c_str(),
-                cfg.monerod.rpc_port, cfg.monerod.zmq_port);
+                cfg.monerod.rpc_port, cfg.monerod.zmq_port, to_string(cfg.arm_order));
     if (cfg.network == MoneroNetwork::Mainnet && !cfg.i_understand_mainnet) {
         std::printf("REFUSED: mainnet requires --i-understand-mainnet (prototype safety)\n");
         return 2;
     }
 
+    // ── M3: p2p-first is fail-closed on its own preconditions ───────────────
+    // The rules live in the config header as a pure function, so the thing the
+    // daemon refuses on and the thing the KAT pins are the same code.
+    const bool p2p_first = (cfg.arm_order == ArmOrderMode::P2PFirst);
+    if (const std::string refusal = arm_order_refusal(cfg); !refusal.empty()) {
+        std::printf("REFUSED: %s\n", refusal.c_str());
+        return 2;
+    }
+
+    // The native node comes up FIRST in p2p-first: it is the chain XmrNode's
+    // finalize driver will be bound to, and that binding happens in bring_up().
+    std::unique_ptr<o2::NativeTemplateBackend> native;
+    if (cfg.coinbase == CoinbaseMode::V37Settlement &&
+        cfg.template_source == TemplateSourceMode::Native) {
+        native = start_native_backend(cfg);
+        if (!native) return 2;
+    }
+
     LiveMonerodTransport transport(cfg.monerod);
     XmrNode node(cfg, transport);
+    o2::NativeChainSource chain_src;
+    if (p2p_first) {
+        chain_src = o2::native_chain_source(*native);
+        if (!chain_src) {
+            std::printf("REFUSED: the native node exposed no chain source (internal wiring bug)\n");
+            return 2;
+        }
+        node.set_native_chain_presence(chain_src.is_canonical);
+    }
     try {
         node.bring_up();
     } catch (const std::exception& e) {
@@ -585,57 +759,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         // Nothing below this block knows the difference. The assembler, the X6
         // settlement source, the reward/payee fixpoint, the exact-sum residual
         // sink and the owed_digest in tx_extra 0x03 are the same code either
-        // way; only the seam the numbers arrive through moves.
-        std::unique_ptr<o2::NativeTemplateBackend> native;
-        if (cfg.template_source == TemplateSourceMode::Native) {
-            if (cfg.native_connect.empty()) {
-                std::printf("REFUSED: --xmr-template-source native needs at least one "
-                            "--native-connect <ip:port> levin peer (the embedded node dials "
-                            "only what it is told to)\n");
-                node.stop();
-                return 2;
-            }
-            o2::NativeTemplateConfig ncfg;
-            ncfg.net                  = native_net_of(cfg.network);
-            ncfg.connect              = cfg.native_connect;
-            ncfg.p2p_bind_ip          = cfg.native_p2p_bind_ip;
-            ncfg.boot                 = cfg.native_anchor_path.empty()
-                                            ? ::c2pool::xmr::native::rt::BootMode::Genesis
-                                            : ::c2pool::xmr::native::rt::BootMode::Anchor;
-            ncfg.anchor_path          = cfg.native_anchor_path;
-            ncfg.monerod_rpc_host     = cfg.monerod.rpc_host;   // parity judge + submit arm ONLY
-            ncfg.monerod_rpc_port     = cfg.monerod.rpc_port;
-            ncfg.serve                = ::c2pool::xmr::native::TemplateArm::Native;
-            ncfg.fallback             = cfg.native_template_fallback;
-            ncfg.force_synced         = cfg.native_force_synced;
-            ncfg.allow_unverified_pow = cfg.native_allow_unverified_pow;
-            ncfg.parity               = true;
-            ncfg.parity_ledger_path   = cfg.resolved_settle_db_path() + "/xmr_parity_ledger.json";
-            ncfg.c2pool_commit        = C2POOL_VERSION;
-            ncfg.ready_timeout_s      = cfg.native_ready_timeout_s;
-            ncfg.backlog_refresh_s    = cfg.native_backlog_refresh_s;
-
-            std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned "
-                        "peer(s)) feeds the option-B assembler; monerod stays the parity judge "
-                        "and the submit arm, and is NOT on the template path\n",
-                        cfg.native_connect.size());
-            native = std::make_unique<o2::NativeTemplateBackend>(std::move(ncfg));
-            std::string nwhy;
-            if (!native->start_and_wait(nwhy, [](const std::string& w) {
-                    std::printf("  native: not ready yet — %s\n", w.c_str());
-                    std::fflush(stdout);
-                })) {
-                std::printf("REFUSED: %s\n", nwhy.c_str());
-                node.stop();
-                return 2;
-            }
-            std::printf("  native: template arm READY, fallback %s\n",
-                        cfg.native_template_fallback
-                            ? "ON (the daemon arm may serve if the native one loses a window)"
-                            : "OFF (native-only: no template is served if the native arm is not ready)");
-        } else {
+        // way; only the seam the numbers arrive through moves. `native` was
+        // started above run_live's bring_up (M3: in p2p-first it IS the chain
+        // the finalize driver is bound to, so it cannot be started down here).
+        if (!native)
             std::printf("template source: MONEROD — one get_miner_data per template refresh\n");
-        }
 
         std::unique_ptr<o2::XmrSettlementTemplateProvider> provider_owner =
             native ? std::make_unique<o2::XmrSettlementTemplateProvider>(
@@ -686,8 +814,42 @@ static int run_live(const XmrNodeConfig& cfg) {
             return provider.candidate_by_id(tid, en, out, &w);
         };
 
-        // ── the M2 evidence, off the serve path ─────────────────────────────
+        // ── M3: the daemonless FIND path, assembled ─────────────────────────
+        //
+        // Three things move together or none of them counts: the TIP the
+        // template is built on, the CANONICAL TEST settlement matures against
+        // (installed above, before bring_up), and the ARM a found block leaves
+        // on. All three are the native node's here, and the RPC counters below
+        // are printed next to the claim so it stays falsifiable.
+        // Tip-feed bookkeeping, main-thread-owned: what the native chain told
+        // us, and what we did with it.
+        std::uint64_t tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, tip_best = 0;
+
         ServeHooks hooks;
+        if (p2p_first) {
+            if (!native->node()->block_relay()) {
+                std::printf("REFUSED: the native node built no block relay (internal wiring bug)\n");
+                node.stop();
+                return 2;
+            }
+            hooks.p2p_relay = native->node()->block_relay();
+
+            // THE TIP, from the chain we verified ourselves. Drained here, on
+            // the main thread, at exactly the point in the loop where
+            // pump_poll() used to issue get_miner_data -- one substitution, in
+            // one place, so the RPC that is gone is gone by construction.
+            hooks.pump_tip = [&]() {
+                for (const auto& ev : chain_src.drain()) {
+                    using K = node::MainchainEventKind;
+                    if (ev.kind == K::Orphan) ++tip_orphans;
+                    else {
+                        if (ev.kind == K::Reorg) ++tip_reorgs; else ++tip_extends;
+                        if (ev.block.height > tip_best) tip_best = ev.block.height;
+                    }
+                    node.pump_mainchain_event(ev);
+                }
+            };
+        }
         hooks.after_refresh = [&](bool refreshed, bool new_template) {
             if (!native || !refreshed || !new_template) return;
             auto* orc = native->oracle();
@@ -751,6 +913,39 @@ static int run_live(const XmrNodeConfig& cfg) {
                         node_rpc, poll_rpc, other_rpc,
                         static_cast<unsigned long long>(ns.rpc_failures),
                         static_cast<unsigned long long>(transport.rpc_failures()));
+
+            // ── M3: THE HEADLINE, AND ITS DEFINITION ────────────────────────
+            //
+            // rpc_on_find_path is every monerod round trip made by anything
+            // that decides WHAT WE MINE or WHERE IT GOES: the template's own
+            // daemon resolves, and everything the pool's consumer transport put
+            // on the socket (which is the tip poll, the seed backfill and
+            // submit_block -- all three of them find-path by construction).
+            //
+            // What is deliberately OUTSIDE it: the C6 parity judge, which is
+            // driven from this status cadence and never from a template
+            // refresh or a submit. Printing them together would let a
+            // parity-enabled run look like a failed claim; printing only the
+            // headline would let an auditor's packet capture look like a lie.
+            // So both are printed, and they sum to the wire.
+            const unsigned long long find_rpc =
+                static_cast<unsigned long long>(native->source().daemon_pumps()) +
+                static_cast<unsigned long long>(transport.rpc_calls());
+            std::printf("  arm-order=%s rpc_on_find_path=%llu "
+                        "(template %llu + pool-transport %llu) | off-path parity=%llu\n",
+                        to_string(cfg.arm_order), find_rpc,
+                        static_cast<unsigned long long>(native->source().daemon_pumps()),
+                        static_cast<unsigned long long>(transport.rpc_calls()), node_rpc);
+            if (p2p_first)
+                std::printf("  native tip feed: events=%llu (extend=%llu reorg=%llu orphan=%llu) "
+                            "best=%llu | node.best_height=%llu\n",
+                            static_cast<unsigned long long>(
+                                chain_src.events_seen ? chain_src.events_seen() : 0),
+                            static_cast<unsigned long long>(tip_extends),
+                            static_cast<unsigned long long>(tip_reorgs),
+                            static_cast<unsigned long long>(tip_orphans),
+                            static_cast<unsigned long long>(tip_best),
+                            static_cast<unsigned long long>(node.best_height()));
             if (auto* mon = native->node()->monerod_source())
                 std::printf("  daemon arm: cache age=%llums (limit %llums)%s\n",
                             static_cast<unsigned long long>(mon->age_ms()),
@@ -862,6 +1057,13 @@ int main(int argc, char** argv) {
                      static_cast<std::uint64_t>(std::stoull(next("0")));
         else if (a == "--native-ready-timeout") cfg.native_ready_timeout_s =
                      static_cast<std::uint32_t>(std::stoul(next("120")));
+        // M3 (R-ARMORDER, switchable): daemon-first stays the default.
+        else if (a == "--arm-order") {
+            const std::string m = next("daemon-first");
+            cfg.arm_order = (m == "p2p-first" || m == "p2p" || m == "daemonless")
+                                ? ArmOrderMode::P2PFirst : ArmOrderMode::DaemonFirst;
+        }
+        else if (a == "--no-daemon-rpc") cfg.no_daemon_rpc = true;
         else if (a == "--lane-chain") cfg.lane_chain =
                      static_cast<::v37::ChainId>(std::stoul(next("0")));
         else if (a == "--d-conf") cfg.d_conf = std::stoull(next("60"));
@@ -919,7 +1121,25 @@ int main(int argc, char** argv) {
                 "  --native-backlog-refresh <s> rebuild the template when the POOL moves, at most\n"
                 "                               once per <s> seconds (0 = tip-only, the default:\n"
                 "                               a tip-only arm serves the empty template built at\n"
-                "                               the start of each block interval)\n");
+                "                               the start of each block interval)\n"
+                " M3 — WHICH ARM DRIVES THE FIND PATH (R-ARMORDER, switchable):\n"
+                "  --arm-order <daemon-first|p2p-first>\n"
+                "                               daemon-first (DEFAULT): monerod drives the tip\n"
+                "                               (get_miner_data poll / ZMQ), answers the finalize\n"
+                "                               driver's canonical test, and publishes a found block\n"
+                "                               with submit_block. The bring-up posture.\n"
+                "                               p2p-first: the embedded native node drives all three.\n"
+                "                               Its levin, RandomX-verified chain IS the tip and the\n"
+                "                               canonical test, and a found block goes out as a levin\n"
+                "                               2008 NOTIFY_NEW_FLUFFY_BLOCK. NO monerod call is made\n"
+                "                               on the find path. Requires --coinbase v37 and\n"
+                "                               --xmr-template-source native, and pins the template\n"
+                "                               fallback OFF (a daemonless find cannot have a daemon\n"
+                "                               fallback on it and still be one).\n"
+                "  --no-daemon-rpc              give the embedded node NO monerod RPC endpoint at\n"
+                "                               all. With p2p-first this makes the claim a packet\n"
+                "                               capture can settle in one line, at the cost of the\n"
+                "                               C6 parity judge (its samples become VOID).\n");
             return 0;
         }
     }

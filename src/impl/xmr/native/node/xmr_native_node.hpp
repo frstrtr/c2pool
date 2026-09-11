@@ -49,10 +49,14 @@
 //      count -- because the X9 bring-up's lesson was that "connected and
 //      receiving nothing" must be answerable without a debugger.
 //
-// WHAT IS DELIBERATELY NOT DRIVEN HERE. C5's relay is CONSTRUCTED and its 2009
-// responder is armed, but nothing in M0 calls relay(): a found block comes from
-// the stratum/settlement path, which is M3. C4's arms are constructed and
-// readable; rebinding the option-B settlement provider through them is M2.
+// WHAT M3 CONNECTED. C5's relay was CONSTRUCTED and its 2009 responder armed
+// from M0 on, but nothing called relay(): a found block comes from the
+// stratum/settlement path, which is the consumer's. M3 gave that path two
+// seams here -- block_relay(), so the found block can go out over levin, and
+// drain_mainchain_events(), so the tip this node verified for itself can drive
+// the pool's settlement finality. With both bound and --arm-order p2p-first,
+// the find path makes no monerod call at all. C4's arms became the template
+// source in M2.
 //
 // The txpool IS now driven: M1 added the P-POOL seam (txpool_parity_sample()),
 // the harness injection port (inject_relayed()), and publish_tx_gate_() -- the
@@ -218,7 +222,11 @@ struct NativeNodeConfig {
     // second answer available, "the template path made no daemon call" cannot
     // be satisfied by a quiet fallback.
     bool                     template_fallback = true;
-    ArmOrder                 relay_order = ArmOrder::DaemonFirst;   // see the owed ruling
+    // R-ARMORDER, ruled SWITCHABLE: DaemonFirst stays the default (monerod
+    // validates the block for free before our P2P identity is behind it, which
+    // is what a daemon-assisted bring-up wants); the consumer sets P2pOnly for
+    // --arm-order p2p-first, where the daemon is not consulted at all.
+    ArmOrder                 relay_order = ArmOrder::DaemonFirst;
 
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
@@ -659,6 +667,43 @@ public:
     const NativeNodeConfig& config() const noexcept { return cfg_; }
     const NetPair&          nets()   const noexcept { return nets_; }
 
+    // -----------------------------------------------------------------------
+    // M3: THE DAEMONLESS TIP FEED.
+    //
+    // M0 proved the node follows a live tip; nothing consumed that stream. The
+    // pool's settlement finality did -- but from the OTHER index, the
+    // monerod-mirroring one the X2 adapter fills from get_miner_data. This is
+    // the seam that lets the pool's finalize driver be driven by the chain this
+    // node verified itself.
+    //
+    // WHY A QUEUE AND NOT A CALLBACK. The index flushes its events on the
+    // VERIFY thread, and everything downstream of the finalize driver -- the
+    // W6 settlement store, the OWED ledger, the V37 engine submission -- is
+    // main-thread-owned in this daemon. Handing the verify thread a callback
+    // into that would put consensus bookkeeping behind a lock it has never
+    // taken. So the events are queued here and the main loop drains them, in
+    // arrival order, at exactly the point where it used to call pump_poll().
+    //
+    // The C5 relay's PREFER-OWN submit_to_own_index feeds this same queue for
+    // our OWN found block: we do not wait to hear our block back from a peer.
+    std::vector<node::MainchainEvent> drain_mainchain_events() {
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        std::vector<node::MainchainEvent> out;
+        out.swap(chain_events_);
+        return out;
+    }
+
+    // How many events the feed has produced since start, whether or not anyone
+    // drained them. A tip driver that produced nothing and a consumer that
+    // dropped everything look identical without this.
+    std::uint64_t mainchain_events_seen() const {
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        return chain_events_seen_;
+    }
+
+    // C5, for the consumer that actually found a block. Null before start().
+    relay::LevinBlockRelay* block_relay() noexcept { return block_relay_.get(); }
+
     // Force the publication gate after the fact (the regtest / single-peer case).
     void force_synced(bool v) { index_.force_synced(v); }
 
@@ -790,6 +835,20 @@ private:
     }
 
     void on_mainchain_(const node::MainchainEvent& ev) {
+        // M3: the daemonless tip feed. EVERY event is queued, Orphan included,
+        // because the consumer's settlement driver has a disposition for an
+        // orphan that it has for nothing else -- and it is queued HERE, above
+        // the Orphan early-return, which is exactly why it is not folded into
+        // the tip record below.
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            ++chain_events_seen_;
+            chain_events_.push_back(ev);
+            // Bounded like tips_. A consumer that stopped draining is a bug, and
+            // dropping the OLDEST is the right failure: the newest events are
+            // the ones a finalize cursor still needs.
+            if (chain_events_.size() > 8192) chain_events_.erase(chain_events_.begin());
+        }
         if (ev.kind == node::MainchainEventKind::Orphan) return;
         TipRecord r;
         r.height      = ev.block.height;
@@ -878,6 +937,10 @@ private:
     mutable std::mutex        rec_mu_;
     std::vector<TipRecord>    tips_;
     std::vector<std::string>  log_;
+    // M3 tip feed (see drain_mainchain_events). Same mutex as tips_/log_: these
+    // are all written from the verify thread and read from the consumer's.
+    std::vector<node::MainchainEvent> chain_events_;
+    std::uint64_t                     chain_events_seen_ = 0;
 };
 
 } // namespace c2pool::xmr::native::rt
