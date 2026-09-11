@@ -102,6 +102,7 @@
 #include "impl/xmr/native/p2p/xmr_peer_pool.hpp"
 #include "impl/xmr/native/parity/xmr_parity_oracle.hpp"
 #include "impl/xmr/native/parity/xmr_parity_report.hpp"
+#include "impl/xmr/native/parity/xmr_soak_driver.hpp"
 #include "impl/xmr/native/parity/xmr_txpool_parity.hpp"
 #include "impl/xmr/native/relay/xmr_block_relay.hpp"
 #include "impl/xmr/native/template/xmr_monerod_miner_data.hpp"
@@ -196,6 +197,20 @@ struct NativeNodeConfig {
     bool                     parity           = true;
     std::string              parity_ledger_path;
     std::string              c2pool_commit;        // one of the four graduation keys
+
+    // M4's NEGATIVE CONTROL, disarmed unless a field is named.
+    //
+    // A harness that has never been seen to refuse is not a gate, so the M4
+    // soak can perturb one required EQUALITY field of the NATIVE tip
+    // observation by one unit (or withhold it) and watch the real comparator
+    // fail the sample, the real streak reset, and graduation be refused. It
+    // wraps the native tip observer only while armed; see
+    // parity::PerturbingTipObserver. One consequence is deliberate and is
+    // stated here rather than left to be discovered: while wrapped, the
+    // oracle's dynamic_cast to ChainViewTipObserver no longer resolves, so the
+    // PenaltyZone height class is not claimed during an injection run. An
+    // injection run is a refusal experiment, not a coverage one.
+    parity::TipFaultInjection tip_fault{};
 
     // THE BACKLOG REBUILD TRIGGER, in seconds. 0 -- the default, and what M0
     // through M2 shipped -- means TIP-ONLY: the served template is rebuilt when
@@ -405,8 +420,19 @@ public:
         // --- C6 --------------------------------------------------------------
         if (cfg_.parity) {
             native_tip_ = std::make_unique<parity::ChainViewTipObserver>(index_.view());
+            parity::ITipObserver* native_tip_seam = native_tip_.get();
+            if (cfg_.tip_fault.armed()) {
+                tip_fault_ = std::make_unique<parity::PerturbingTipObserver>(
+                    *native_tip_, cfg_.tip_fault);
+                native_tip_seam = tip_fault_.get();
+                note_("[M4-INJECT] ARMED on the native tip field '" + cfg_.tip_fault.field
+                    + (cfg_.tip_fault.absent ? "' (withhold)" : "' (perturb by one unit)")
+                    + " after " + std::to_string(cfg_.tip_fault.after_samples)
+                    + " observation(s): this run is a REFUSAL EXPERIMENT and its samples "
+                      "are not honest parity evidence");
+            }
             parity::ParityOracle::Deps od;
-            od.native_tip  = native_tip_.get();
+            od.native_tip  = native_tip_seam;
             od.monerod_tip = mon_tip_.get();
             od.served_arm  = arms_->arm(cfg_.serve_arm);
             od.shadow_arm  = arms_->shadow();
@@ -655,6 +681,72 @@ public:
         });
         return out;
     }
+
+    // -----------------------------------------------------------------------
+    // M4: DRIVING THE P-TPL SEAM.
+    //
+    // Nothing in M0..M3 called IParityOracle::on_serve. The tip probe fires by
+    // itself because the index publishes an event at every height; the template
+    // probe only fires when somebody SERVES a template, and in this harness
+    // nobody did -- so a soak run on the existing code would have accumulated a
+    // long P-TIP streak and never once compared a template, which is half of
+    // what the M4 criterion actually asks for.
+    //
+    // This is that caller. Three things about it are deliberate:
+    //
+    //   * THE POSTURE IS STRICT. It resolves arm(serve_arm) directly rather
+    //     than through ArmResolver::serving(), because serving() falls back to
+    //     the other arm when the configured one is not ready. That fallback is
+    //     right in production and fatal to a parity claim: a leg that quietly
+    //     served monerod for an hour is not evidence about the native arm. An
+    //     unready arm therefore yields no sample and says why.
+    //
+    //   * THE ARTEFACT IS CARRIED. on_serve takes the MinerData that would have
+    //     gone out, not an epoch to re-read later, which is what keeps
+    //     SERVED-MISMATCH provable (contracts/parity.hpp says why).
+    //
+    //   * THREADING follows parity_sample(): the daemon round trip happens on
+    //     the CALLER's thread, and the native arm's snapshot -- which reads the
+    //     chain state view the verify thread owns -- happens on the verify
+    //     thread. The oracle's on_serve is enqueue-and-return either way.
+    struct ServeProbe {
+        bool          served = false;
+        std::string   arm;
+        std::uint64_t height = 0;
+        std::size_t   backlog = 0;
+        std::string   why;          // when !served
+    };
+
+    ServeProbe m4_serve_probe() {
+        ServeProbe p;
+        if (!oracle_ || !arms_) { p.why = "no parity oracle on this node"; return p; }
+        if (mon_src_) (void)mon_src_->poll();      // the RPC, on the caller's thread
+        IMinerDataSource* src = arms_->arm(cfg_.serve_arm);
+        if (src == nullptr) {
+            p.why = std::string("configured serving arm '") + to_string(cfg_.serve_arm)
+                  + "' is not present on this node";
+            return p;
+        }
+        p.arm = src->name();
+        verify_loop_.call([&] {
+            const MinerDataReadiness rd = src->readiness();
+            if (!rd.ok()) { p.why = rd.why.empty() ? std::string("arm not ready") : rd.why; return; }
+            std::string why;
+            const std::optional<node::MinerData> md = src->snapshot(&why);
+            if (!md) { p.why = why.empty() ? std::string("arm produced no snapshot") : why; return; }
+            p.height  = md->height;
+            p.backlog = md->tx_backlog.size();
+            p.served  = true;
+            oracle_->on_serve(src->epoch(), *md, src->name());
+        });
+        return p;
+    }
+
+    // The daemon version and nettype, straight from get_info. The M4 ledger's
+    // key names the daemon it was judged against, and "unknown" is not a name.
+    parity::MonerodTipObserver* monerod_tip() noexcept { return mon_tip_.get(); }
+    // Non-null only while the M4 fault injector is armed.
+    parity::PerturbingTipObserver* tip_fault() noexcept { return tip_fault_.get(); }
 
     parity::ParityOracle* oracle() noexcept { return oracle_.get(); }
     ChainIndex&           index()  noexcept { return index_; }
@@ -924,6 +1016,8 @@ private:
     std::unique_ptr<parity::MonerodTxpoolObserver>   mon_pool_;
     parity::TxpoolParityTally                        pool_tally_;
     std::unique_ptr<parity::ChainViewTipObserver>    native_tip_;
+    // M4 negative control; constructed only when cfg_.tip_fault is armed.
+    std::unique_ptr<parity::PerturbingTipObserver>   tip_fault_;
     std::unique_ptr<tmpl::ArmResolver>               arms_;
     std::unique_ptr<relay::LevinBlockRelay>          block_relay_;
     std::unique_ptr<parity::ParityOracle>            oracle_;

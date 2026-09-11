@@ -140,7 +140,15 @@ endif()
 if (BUILD_TESTING AND UNIX)
     add_executable(xmr_native_node node/tools/xmr_native_node_main.cpp)
     target_include_directories(xmr_native_node PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(xmr_native_node PRIVATE xmr_native_txpool)
+    # xmr_node carries the PRODUCTION get_miner_data parser
+    # (MoneroDaemonRpc::body_get_miner_data / parse_miner_data). It became a
+    # link dependency at M4 rather than earlier because nothing in this binary
+    # had ever POLLED the daemon template arm: the M4 soak drives P-TPL, which
+    # means calling MonerodMinerDataSource::poll(), which instantiates that
+    # parse. The alternative -- a second decode path for the daemon arm -- would
+    # make "we match the daemon" a claim about a re-typed struct, which is
+    # exactly what the C4/C6 targets link xmr_node to avoid.
+    target_link_libraries(xmr_native_node PRIVATE xmr_native_txpool xmr_node)
     target_compile_features(xmr_native_node PRIVATE cxx_std_20)
     if (TARGET Boost::headers)
         target_link_libraries(xmr_native_node PRIVATE Boost::headers)
