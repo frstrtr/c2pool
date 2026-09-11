@@ -719,7 +719,7 @@ int main(int argc, char* argv[]) {
     std::string log_level_str;                   // empty = default (trace)
     int         p2p_max_peers        = 30;       // max total P2P peers
     int         p2p_ban_duration     = 300;      // ban duration in seconds
-    long        rss_limit_mb         = 4000;     // abort if RSS exceeds N MB
+    long        rss_limit_mb         = 5000;     // abort if RSS exceeds N MB
     std::string http_cors_origin     = "";       // Access-Control-Allow-Origin (empty = disabled)
     int         payout_window_seconds = 86400;   // PPLNS payout window (24h)
     int         cache_max_shared_hashes = 50000; // de-dup set cap
