@@ -2430,6 +2430,16 @@ nlohmann::json MiningInterface::rest_current_payouts()
             uint8_t p2sh  = m_testnet ?  19 : 16;   // Dash: '7'
             return core::script_to_address(s, "", p2pkh, p2sh);
         }
+        if (m_blockchain == Blockchain::DOGECOIN) {
+            // DOGE version bytes: mainnet 0x1e ('D') / 0x16, testnet 0x71 / 0xc4.
+            // Without this arm a primary-DOGE node falls through to the bool
+            // overload's BTC branch (is_ltc==false) and renders DOGE payouts as
+            // Bitcoin '1...' addresses. Display-only, reward-safe (scripts and
+            // amounts are unchanged; only the human-readable address string is).
+            uint8_t p2pkh = m_testnet ? 0x71 : 0x1e;
+            uint8_t p2sh  = m_testnet ? 0xc4 : 0x16;
+            return core::script_to_address(s, "", p2pkh, p2sh);
+        }
         return core::script_to_address(s, is_ltc, m_testnet);
     };
 
