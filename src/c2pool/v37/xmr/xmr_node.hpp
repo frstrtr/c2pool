@@ -125,6 +125,30 @@ public:
     // p2p-first: adapter() must not be called, and nothing may poll monerod.
     bool daemon_tip_active() const noexcept { return m_adapter != nullptr; }
 
+    // ── c2pool#1551: the ONE chain-observation seam ────────────────────────
+    //
+    // Every block this node's chain tells it about -- a new tip, a reorg tip, an
+    // orphan -- is announced here, whichever arm drives the tip. The accounting
+    // layer above needs it to SEE a same-height race at all, and it has to be
+    // one seam and not two: a prefer-own tiebreak fed by the daemon adapter in
+    // one mode and by the native index in the other would be two policies that
+    // happened to share a name.
+    using ChainObserverFn = std::function<void(std::uint64_t height, const std::string& bid_hex)>;
+    void set_chain_observer(ChainObserverFn fn) { m_chain_observer = std::move(fn); }
+
+    // The canonical test the F1 finalize driver runs at maturity, exposed so the
+    // accounting layer asks the SAME question of the SAME chain. A tiebreak that
+    // consulted a different oracle than the one that finalizes would be a
+    // second, disagreeing consensus -- and the one it disagreed with would be
+    // the one holding the money.
+    bool chain_carries(std::uint64_t height, const std::string& bid_hex) {
+        if (m_adapter) {
+            auto b = m_adapter->index().by_height(height);
+            return b && hex_of(b->id) == bid_hex;
+        }
+        return m_native_presence ? m_native_presence(height, bid_hex) : false;
+    }
+
     // The best height the settlement path is working against, from whichever
     // driver is live. In p2p-first this is the highest height a pumped event
     // carried, which is the same number the finalize cursor chases.
@@ -197,13 +221,7 @@ public:
         m_finalize = std::make_unique<XmrFinalizeDriver>(
             m_ledger, m_hw, *m_store, m_cfg.lane_chain, m_cfg.d_conf,
             m_recovered.finalize_cursor_height, m_recovered.max_event_seq,
-            [this](std::uint64_t h, const std::string& bid) {
-                if (m_adapter) {
-                    auto b = m_adapter->index().by_height(h);
-                    return b && hex_of(b->id) == bid;
-                }
-                return m_native_presence ? m_native_presence(h, bid) : false;
-            });
+            [this](std::uint64_t h, const std::string& bid) { return chain_carries(h, bid); });
 
         if (daemon_tip) {
             m_adapter->set_event_sink(
@@ -290,6 +308,13 @@ private:
     // Route the X2 mainchain event stream into the F1 finalize driver.
     void on_mainchain_event(const c2pool::xmr::node::MainchainEvent& ev) {
         using K = c2pool::xmr::node::MainchainEventKind;
+        // c2pool#1551: announce the block BEFORE settlement moves on it, so a
+        // rival that arrives in the same event is already in the race book when
+        // the finalize driver reaches the height.
+        if (m_chain_observer) {
+            if (ev.kind == K::Orphan) m_chain_observer(ev.block.height, hex_of(ev.orphaned_id));
+            else                      m_chain_observer(ev.block.height, hex_of(ev.block.id));
+        }
         switch (ev.kind) {
             case K::Extend:
             case K::Reorg: {
@@ -333,6 +358,9 @@ private:
     // daemonless posture; an adapter and no predicate is the default one.
     ChainPresenceFn                        m_native_presence;
     std::uint64_t                          m_tip_height = 0;
+
+    // c2pool#1551: installed by the accounting layer (FinalizeConnect).
+    ChainObserverFn                        m_chain_observer;
 
     std::vector<std::string>               m_log;
     bool                                   m_up = false;

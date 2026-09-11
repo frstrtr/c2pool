@@ -210,6 +210,14 @@ public:
         return n;
     }
 
+    // Every candidate the pool is holding, in key order. The accounting layer
+    // above needs this to see a same-height race in the branch where our own
+    // block stays best: the rival never becomes a mainchain event there, so a
+    // consumer fed only by the event stream would report the height uncontested.
+    void for_each(const std::function<void(const AltBlock&)>& fn) const {
+        for (const auto& kv : blocks_) fn(kv.second);
+    }
+
     std::vector<const AltBlock*> children_of(const Hash& prev_id) const {
         std::vector<const AltBlock*> out;
         const auto it = children_.find(key_(prev_id));

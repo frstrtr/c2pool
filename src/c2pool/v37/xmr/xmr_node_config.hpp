@@ -27,6 +27,7 @@
 #include <sharechain/v37/v37_lane.hpp>       // ::v37::LaneParams
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
+#include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
 
 namespace c2pool::v37n::xmr {
 
@@ -167,6 +168,36 @@ struct XmrNodeConfig {
     // MainchainIndex retention below the tip (>= D_conf so a finalizing block is
     // always resident; seed anchors are pinned on top regardless).
     std::uint64_t   index_retain_recent = 720;
+
+    // --- c2pool#1551: the same-height double-block tiebreak -----------------
+    // Two Monero blocks at the same parent height, one of them ours. The policy
+    // sets the LEVERS (what we build on, what we re-announce, what we nominate)
+    // and carries the D_conf the credit gate uses; no setting here can make an
+    // unburied or an orphaned block creditable (xmr_same_height_race.hpp).
+    //
+    // `d_conf` above stays the single source of truth for the burial bar:
+    // same_height_policy() copies it in, so the accounting gate and the F1
+    // finalize driver cannot be configured apart.
+    //   --same-height-tiebreak prefer-own (default) | first-seen
+    //   --same-height-renotify <n>   (0 disables the bounded re-announce)
+    SameHeightTieBreak same_height_tiebreak = SameHeightTieBreak::PreferOwn;
+    std::uint32_t      same_height_renotify = 3;
+    // Per-height verdict journal. "" = race.log next to settle.img; "off" =
+    // none. Two nodes that watched the same race must agree on every height
+    // either of them credited, and a journal is what turns that claim into a
+    // diff an auditor can run.
+    std::string        same_height_journal;
+
+    // The policy as the accounting layer consumes it -- assembled HERE so the
+    // D_conf coupling is structural rather than a convention every call site
+    // has to remember.
+    SameHeightPolicy same_height_policy() const {
+        SameHeightPolicy p;
+        p.tie_break    = same_height_tiebreak;
+        p.d_conf       = d_conf;
+        p.max_renotify = same_height_renotify;
+        return p;
+    }
 
     // --- stratum front-end (X5) --------------------------------------------
     std::string     stratum_bind_host = "127.0.0.1";

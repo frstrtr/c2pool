@@ -254,6 +254,8 @@ struct RelayStats {
     std::uint64_t daemon_rejected      = 0;
     std::uint64_t missing_tx_served    = 0;
     std::uint64_t missing_tx_declined  = 0;
+    // c2pool#1551: bounded prefer-own re-announces on a contested height.
+    std::uint64_t renotified           = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -518,6 +520,50 @@ public:
     std::size_t retained_count() const {
         std::lock_guard<std::mutex> lk(m_mx);
         return m_book.size();
+    }
+
+    // c2pool#1551, lever (2): push a block we already announced ONCE MORE, from
+    // the bytes we retained. A contested height is a relay race, and the block
+    // that reaches more of the network first is the one more of it builds on --
+    // so on a same-height contest the prefer-own gate spends a small, bounded
+    // budget re-announcing our own block.
+    //
+    // It re-frames from the retained body rather than re-running the relay's
+    // acceptance path on purpose: this block was already checked, already
+    // accepted and already ours, and re-deciding it here would be a second
+    // opinion about our own block with nothing new to decide it on. Returns
+    // false when the block is no longer retained (expired, or never ours), so a
+    // caller can tell "pushed" from "had nothing to push" -- which are different
+    // stories and have different fixes.
+    bool renotify(const Hash& block_id, std::size_t* peers_sent = nullptr) {
+        std::vector<std::uint8_t> blob;
+        std::vector<TxBlobEntry>  bodies;
+        std::uint64_t             height = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            const Retained* r = find_locked(block_id);
+            if (!r) return false;
+            blob   = r->block_blob;
+            bodies = r->bodies;
+            height = r->height;
+        }
+        std::vector<std::uint8_t> body;
+        std::string why;
+        if (!build_fluffy_body(blob, bodies, height + 1, body, why)) {
+            say(true, "renotify: could not re-frame block " + hex(block_id) + ": " + why);
+            return false;
+        }
+        const std::size_t n = m_port.broadcast_notify(levin::CMD_NEW_FLUFFY_BLOCK, body);
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            ++m_stats.p2p_frames_written;
+            m_stats.p2p_peers_written += static_cast<std::uint64_t>(n);
+            ++m_stats.renotified;
+        }
+        if (peers_sent) *peers_sent = n;
+        say(false, "renotify: re-announced block " + hex(block_id) + " at h=" +
+                   std::to_string(height) + " to " + std::to_string(n) + " peer(s)");
+        return n > 0;
     }
 
 private:

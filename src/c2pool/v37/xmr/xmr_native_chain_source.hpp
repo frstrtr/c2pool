@@ -73,6 +73,20 @@ struct NativeChainSource {
     // without this, and they have opposite fixes.
     std::function<std::uint64_t()> events_seen;
 
+    // c2pool#1551: the same-height candidates the node HOLDS but has not
+    // adopted. Needed because the branch where our own block stays best
+    // produces no mainchain event for the rival at all: an accounting layer fed
+    // only by `drain` would see that height as uncontested and credit as if we
+    // had run unopposed. Unset in daemon-first (the X2 adapter mirrors monerod's
+    // best chain and keeps no alternatives), which is an honest gap and is why
+    // the field is checkable rather than assumed.
+    struct AltCandidate {
+        std::uint64_t height = 0;
+        std::string   bid_hex;
+        bool          own_mined = false;
+    };
+    std::function<std::vector<AltCandidate>()> alt_candidates;
+
     explicit operator bool() const noexcept {
         return static_cast<bool>(drain) && static_cast<bool>(is_canonical);
     }
@@ -109,6 +123,18 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
     };
 
     src.events_seen = [n] { return n->mainchain_events_seen(); };
+
+    src.alt_candidates = [n] {
+        std::vector<NativeChainSource::AltCandidate> out;
+        for (const auto& a : n->index().alt_tips()) {
+            NativeChainSource::AltCandidate c;
+            c.height    = a.height;
+            c.bid_hex   = chain_id_hex(a.id);
+            c.own_mined = a.own_mined;
+            out.push_back(std::move(c));
+        }
+        return out;
+    };
     return src;
 }
 
