@@ -29,11 +29,44 @@
 //       submit_block returned "OK"; the main loop drains it in tick().
 //       Replaces the WIP FoundEvent/FoundQueue (xmr_o2_serve.hpp:338-358),
 //       which carried only a height.
-//   (2) Amount-honest credit/payout for the option-A (monerod-template) block:
-//       credit == payout == { identity_key(payout XMR_STD ref) : reward }, so
-//       finalW nets to 0 at FINALIZE and the FOUND/FINALIZE audit trail carries
-//       the real amount. Without a payee key the degenerate {}/{} record is
-//       used (the ledger still bumps; the block is recorded as valueless).
+//   (2) R-7 RECONCILIATION (2026-09-10) — the FOUND record books what the
+//       COINBASE ACTUALLY PAID, against the SAME OwedLedger the coinbase drew
+//       EffectiveOwed from (XmrNode::ledger()).
+//         payout := the emitted CoinbaseOutput::Role::Owed set of the block's
+//                   own coinbase, { identity : amount }, carried across the
+//                   listener->main thread boundary in FoundBlockEvent (filled
+//                   at the submit seam from the very snapshot whose bytes were
+//                   submitted). NEVER Role::Fixed / Role::Sink — those keys were
+//                   never credited, so booking them would drive their finalW
+//                   permanently negative. NEVER a re-run of project_w4_owed —
+//                   X6 may legitimately emit fewer rows than W4 proposed.
+//         credit := {} — E_b, the per-key entitlement from the fold over b's
+//                   burial-gated prefix, requires an XMR sharechain emission
+//                   that does NOT exist yet (Track A2 S-1). The empty map is
+//                   the honest value; when S-1 lands it fills
+//                   FoundBlockEvent::credit and nothing else here changes.
+//       This replaces the previous "amount-honest" record credit == payout ==
+//       { --payee-* identity : FULL block reward }. That record was FICTIONAL
+//       under option B: the operator's --payee key is not a payee of the v37
+//       coinbase at all (the coinbase pays the K_fair owed rows plus the
+//       residual sink), and it produced TWO empirically confirmed defects —
+//         (a) effective_owed(payee) = finalW(0) - SUM_pending payout went
+//             NEGATIVE by one full reward per concurrent pending FOUND;
+//         (b) the settlement ledger the coinbase read was a DIFFERENT object
+//             from the node ledger FINALIZE booked into, so it was never
+//             decremented and re-proposed the SAME owed row at its full
+//             EffectiveOwed on EVERY block — a no-double-pay violation of the
+//             whitepaper section 9 / OI-W4-5 credit-at-finality contract.
+//       Under option A (monerod get_block_template, --payout-address) the block
+//       is not a v37 settlement at all and both maps are EMPTY: the ledger still
+//       registers the block, its ledger_seq still bumps, no key is created.
+//       INVARIANTS this restores (w4_settlement.hpp:531-542 / :485-500):
+//         INV-1  effective_owed(k) >= 0 at every step, FOUND and FINALIZE alike;
+//         INV-2  on_block_finalized moves effective_owed(k) by EXACTLY
+//                +credit[k] (it removes the same payout from the pending term
+//                that it subtracts from finalW) — invariant when credit == {},
+//                never decreasing. effective_owed legitimately DROPS at FOUND:
+//                that is the pending-payout deduction the coinbase drew on.
 //   (3) The LATE-FOUND guard: XmrFinalizeDriver::advance_to_tip steps only
 //       heights ABOVE its cursor (:155). A FOUND registered at a height the
 //       cursor already passed would sit pending FOREVER (its payout deducted
@@ -160,7 +193,21 @@ struct FoundBlockEvent {
                                           // compares hex_of(index.by_height(H).id) == bid
     std::string   prev_id_hex;            // template prev_hash (informational; cross-check only)
     std::uint64_t reward_piconero = 0;    // get_block_template.expected_reward (or chain_main.reward)
-    std::optional<::v37::bytes32> payee;  // identity_key of the payout descriptor (payee_identity_key)
+    std::optional<::v37::bytes32> payee;  // identity_key of the --payee-* descriptor.
+                                          // INFORMATIONAL ONLY since R-7: it is the
+                                          // operator's own wallet, NOT a coinbase payee
+                                          // under option B, and is never booked.
+
+    // ── R-7: what the block's coinbase ACTUALLY paid / credited ─────────────
+    // coinbase_owed: the emitted CoinbaseOutput::Role::Owed outputs of THIS
+    //   block, { identity_key : piconero }. Filled at the submit seam from the
+    //   snapshot whose bytes were submitted (submit::BlockCandidate::
+    //   coinbase_owed). EMPTY under option A and for a sink-only block.
+    // credit: E_b, the per-key entitlement over b's burial-gated prefix.
+    //   ALWAYS EMPTY today — there is no XMR sharechain fold yet (Track A2 S-1).
+    //   The field exists so the S-1 landing is a fill, not a re-wiring.
+    Amounts       coinbase_owed;
+    Amounts       credit;
     std::uint32_t template_id = 0;        // stratum bookkeeping (logged only)
     std::uint32_t nonce = 0;
     std::uint32_t extra_nonce = 0;
@@ -220,10 +267,21 @@ class FinalizeConnect {
 public:
     struct PendingRec {
         std::uint64_t height = 0;
-        std::optional<::v37::bytes32> payee;
-        std::uint64_t reward = 0;
+        std::optional<::v37::bytes32> payee;   // informational (see FoundBlockEvent::payee)
+        std::uint64_t reward = 0;              // informational
         std::string   prev_id_hex;
         std::uint64_t found_unix_s = 0;
+        // R-7: the MAPS THAT WERE BOOKED must survive a restart inside the
+        // D_conf window. Before R-7 the sidecar carried only payee+reward and
+        // the re-drive reconstructed a payout from them — so a restart could
+        // re-drive a DIFFERENT payout than the block paid. Persisted since
+        // sidecar schema v2.
+        Amounts       coinbase_owed;           // the booked `payout` term
+        Amounts       credit;                  // the booked `credit` term ({} until S-1)
+        // A v1 (pre-R-7) sidecar line carries no maps. Such a record is
+        // re-driven with EMPTY maps (the fail-safe direction: owed is never
+        // over-decremented) and says so, loudly, once per boot.
+        bool          legacy_v1 = false;
     };
     struct RegisterResult {
         bool        registered = false;
@@ -244,6 +302,8 @@ public:
     struct Stats {
         std::uint64_t registered = 0, refused = 0, late_refused = 0, settled = 0,
                       orphaned = 0, sidecar_write_failures = 0;
+        long long     owed_booked = 0;   // R-7: Σ piconero of owed the FOUNDs extinguish
+        std::uint64_t split_brain_refused = 0;   // payout > effective_owed (INV-1 precheck)
     };
 
     // Construct AFTER node.bring_up() (the finalize driver exists) and AFTER
@@ -319,9 +379,16 @@ public:
             // `pending` == false: the sidecar was written but the crash hit before
             // the FOUND write-ahead -> this IS the registration (monerod had
             // accepted the block before the sidecar was written).
-            Amounts credit = amounts_from(rec.payee, rec.reward, nullptr);
-            Amounts payout = credit;
-            const bool ok = m_node.on_network_block_won(rec.height, id, credit, payout);
+            // R-7: re-drive the SAME maps the original FOUND booked, read back
+            // from the sidecar — never re-derived from payee/reward.
+            if (rec.legacy_v1)
+                say("boot: PRE-R-7 (schema v1) sidecar record " + short_bid(bid) +
+                    " carries no coinbase-owed map; re-driving with EMPTY credit/payout. "
+                    "If the ledger already holds this bid pending (store replay) its booked "
+                    "payout is unchanged (on_block_found is idempotent per bid); otherwise the "
+                    "owed this block paid stays owed and will be paid again by a later block — "
+                    "operator must reconcile by hand");
+            const bool ok = m_node.on_network_block_won(rec.height, id, rec.credit, rec.coinbase_owed);
             if (!ok || !m_node.ledger().is_pending(bid)) {
                 ++rep.stale_dropped;
                 say("boot: sidecar " + short_bid(bid) + " not admitted by the node/ledger; dropped");
@@ -395,9 +462,44 @@ public:
                                   "drain the found queue BEFORE pump_poll / lower --poll-ms");
         }
 
+        // ── R-7: book what the coinbase ACTUALLY paid ───────────────────────
+        // payout := the emitted Role::Owed set (empty under option A / for a
+        //           sink-only block); credit := E_b ({} until Track A2 S-1).
+        // A payout key must be one the ledger CREDITED (w4_settlement.hpp:
+        // 485-500 subtracts the payout term from finalW), so a row whose amount
+        // is <= 0 is dropped rather than booked — a defensive fail-closed, the
+        // emitted set never carries one.
+        Amounts payout;
+        for (const auto& [k, v] : ev.coinbase_owed) if (v > 0) payout[k] = v;
+        Amounts credit;
+        for (const auto& [k, v] : ev.credit) if (v != 0) credit[k] = v;
+
+        // NON-NEGATIVITY PRECHECK (INV-1, fail-closed). propose_coinbase caps
+        // each take at EffectiveOwed, so a well-formed payout can never push a
+        // key negative; a payout that WOULD is proof that the coinbase was built
+        // against a different ledger than this one — exactly the split-brain R-7
+        // closes. Refuse loudly rather than poison the ledger. (The block is
+        // already on-chain either way; refusing costs the v37 record, booking a
+        // negative costs every future K_fair proposal.)
+        for (const auto& [k, v] : payout) {
+            const long long eo = m_node.ledger().effective_owed(k);
+            if (v > eo) {
+                ++m_stats.split_brain_refused;
+                return refuse(r, bid,
+                    "R-7 REFUSED: coinbase pays " + std::to_string(v) + " to key " +
+                    hex_of(k).substr(0, 12) + "… but its effective_owed is only " +
+                    std::to_string(eo) + " — the coinbase was built against a DIFFERENT "
+                    "ledger than the finalize driver writes (split-brain); not booking a "
+                    "negative owed");
+            }
+        }
+
         std::string why_valueless;
-        Amounts credit = amounts_from(ev.payee, ev.reward_piconero, &why_valueless);
-        Amounts payout = credit;
+        if (payout.empty() && credit.empty())
+            why_valueless = ev.coinbase_owed.empty()
+                ? "no K_fair owed outputs in this coinbase (option A, or the whole reward "
+                  "went to the residual sink) and no E_b credit yet (Track A2 S-1 pending)"
+                : "every coinbase owed row was non-positive";
 
         PendingRec rec;
         rec.height = ev.height;
@@ -405,6 +507,8 @@ public:
         rec.reward = ev.reward_piconero;
         rec.prev_id_hex = lower_hex(ev.prev_id_hex);
         rec.found_unix_s = ev.found_unix_s;
+        rec.coinbase_owed = payout;
+        rec.credit = credit;
 
         // write-ahead the sidecar, then the FOUND event (inside on_network_block_won)
         m_pending[bid] = rec;
@@ -428,9 +532,17 @@ public:
             return refuse(r, bid, "ledger did not admit the FOUND (bid already known?)");
         }
         ++m_stats.registered;
+        long long owed_paid = 0;
+        for (const auto& [k, v] : payout) { (void)k; owed_paid += v; }
+        m_stats.owed_booked += owed_paid;
         say("FOUND registered " + short_bid(bid) + " h=" + std::to_string(ev.height) +
-            " reward=" + std::to_string(ev.reward_piconero) + " piconero payee=" +
+            " reward=" + std::to_string(ev.reward_piconero) + " piconero" +
+            " owed_rows=" + std::to_string(payout.size()) +
+            " owed_paid=" + std::to_string(owed_paid) +
+            " credit_rows=" + std::to_string(credit.size()) +
+            " (operator payee=" +
             (ev.payee ? hex_of(*ev.payee).substr(0, 12) + "…" : std::string("-")) +
+            ", informational)" +
             (why_valueless.empty() ? "" : " [VALUELESS record: " + why_valueless + "]") +
             (ev.worker.empty() ? "" : " worker=" + ev.worker) +
             " tid=" + std::to_string(ev.template_id) + " nonce=" + std::to_string(ev.nonce) +
@@ -440,23 +552,25 @@ public:
         return r;
     }
 
-    // credit == payout == { payee : reward } (amount-honest, nets to 0 at
-    // FINALIZE); {} when no payee / zero reward (the degenerate valueless record).
-    static Amounts amounts_from(const std::optional<::v37::bytes32>& payee, std::uint64_t reward,
-                                std::string* why_valueless) {
-        Amounts a;
-        auto because = [&](const char* s) { if (why_valueless) *why_valueless = s; };
-        if (!payee)   { because("no payee identity key (address boundary not decoded)"); return a; }
-        if (reward == 0) { because("zero reward"); return a; }
-        if (reward > static_cast<std::uint64_t>(LLONG_MAX)) { because("reward exceeds long long"); return a; }
-        a[*payee] = static_cast<long long>(reward);
-        return a;
-    }
+    // (R-7, 2026-09-10) The former `amounts_from(payee, reward)` helper — which
+    // synthesised credit == payout == { --payee-* identity : FULL block reward }
+    // — is GONE. It booked a record no coinbase ever paid; see the banner. The
+    // FOUND maps now come from the block's own emitted outputs, carried in
+    // FoundBlockEvent, and option A books the degenerate {}/{} directly.
 
     // ── read seams (main thread) ────────────────────────────────────────────
     const std::map<std::string, PendingRec>& pending()       const { return m_pending; }
     const std::map<std::string, PendingRec>& unrecoverable() const { return m_unrecoverable; }
     const Stats& stats() const { return m_stats; }
+
+    // R-7 acceptance probe: min over effective_owed_all(). Must be >= 0 at every
+    // point of a healthy run, INCLUDING while blocks are pending. 0 on an empty
+    // ledger. This is the number the regtest re-proof records.
+    long long min_effective_owed() const {
+        long long m = 0;
+        for (const auto& [k, v] : m_node.ledger().effective_owed_all()) { (void)k; if (v < m) m = v; }
+        return m;
+    }
 
 private:
     RegisterResult& refuse(RegisterResult& r, const std::string& bid, std::string reason) {
@@ -477,11 +591,21 @@ private:
             const PendingRec&  rec = it->second;
             if (m_node.ledger().is_settled(bid)) {
                 ++t.settled; ++m_stats.settled;
+                // R-7 observability: effective_owed of the keys THIS block paid
+                // (the operator's --payee-* key is not one of them under option
+                // B), plus the ledger-wide minimum. Both must stay >= 0 for the
+                // whole run — that is the acceptance criterion the split-ledger
+                // wiring violated by one full reward per pending FOUND.
+                std::string per_key;
+                for (const auto& [k, v] : rec.coinbase_owed) {
+                    (void)v;
+                    per_key += " effective_owed(" + hex_of(k).substr(0, 12) + "…)=" +
+                               std::to_string(m_node.ledger().effective_owed(k));
+                }
                 say("FINALIZED " + short_bid(bid) + " h=" + std::to_string(rec.height) +
                     " SETTLED at bin_height=" + std::to_string(rec.height + m_cfg.d_conf) +
-                    (rec.payee ? " effective_owed(payee)=" +
-                                 std::to_string(m_node.ledger().effective_owed(*rec.payee))
-                               : std::string("")) +
+                    per_key +
+                    " min_effective_owed=" + std::to_string(min_effective_owed()) +
                     " ledger_seq=" + std::to_string(m_node.ledger().ledger_seq()));
                 it = m_pending.erase(it); changed = true;
             } else if (!m_node.ledger().is_pending(bid)) {
@@ -530,15 +654,55 @@ private:
         return bid.size() > 12 ? bid.substr(0, 12) + "…" : bid;
     }
 
+public:
     // ── sidecar codec: one record per line, space-separated, no escaping needed
-    //    (bids/keys are hex; '-' = absent):
-    //    1 <bid64> <height> <payee64|-> <reward> <prev64|-> <found_unix_s>
+    //    (bids/keys are hex; '-' = absent).
+    //    PUBLIC since R-7 so the self-check can pin the schema-v2 round trip and
+    //    the v1 legacy path directly, without standing up a live node.
+    //
+    //    SCHEMA v2 (R-7, 2026-09-10) — the BOOKED MAPS are persisted, because a
+    //    restart inside the D_conf window must re-drive the SAME payout the block
+    //    paid, not one re-derived from payee/reward:
+    //      2 <bid64> <height> <payee64|-> <reward> <prev64|-> <found_unix_s>
+    //        <n_owed> [<key64>:<amount> ...] <n_credit> [<key64>:<amount> ...]
+    //
+    //    SCHEMA v1 (pre-R-7) is still PARSED, so a node that crashed under the
+    //    old build still finds its pending FOUNDs at boot. A v1 record carries no
+    //    maps: it is flagged legacy_v1 and re-driven with EMPTY credit/payout
+    //    (the fail-safe direction — owed is never over-decremented — and loudly
+    //    reported). v1 is never WRITTEN again.
+    static std::string amounts_field(const Amounts& a) {
+        std::string s = std::to_string(a.size());
+        for (const auto& [k, v] : a) s += " " + hex_of(k) + ":" + std::to_string(v);
+        return s;
+    }
+    static bool parse_amounts_field(std::istringstream& is, Amounts& out) {
+        out.clear();
+        unsigned long long n = 0;
+        if (!(is >> n)) return false;
+        if (n > 100000) return false;              // sanity bound: a coinbase has far fewer outputs
+        for (unsigned long long i = 0; i < n; ++i) {
+            std::string tok;
+            if (!(is >> tok)) return false;
+            const std::size_t colon = tok.find(':');
+            if (colon != 64) return false;         // exactly a 64-hex key then ':'
+            ::v37::bytes32 k{};
+            if (!hash_from_hex(lower_hex(tok.substr(0, 64)), k)) return false;
+            long long v = 0;
+            try { v = std::stoll(tok.substr(colon + 1)); } catch (...) { return false; }
+            out[k] = v;
+        }
+        return true;
+    }
+
     static std::string sidecar_line(const std::string& bid, const PendingRec& r) {
-        std::string s = "1 " + bid + " " + std::to_string(r.height) + " " +
+        std::string s = "2 " + bid + " " + std::to_string(r.height) + " " +
                         (r.payee ? hex_of(*r.payee) : std::string("-")) + " " +
                         std::to_string(r.reward) + " " +
                         (r.prev_id_hex.size() == 64 ? r.prev_id_hex : std::string("-")) + " " +
-                        std::to_string(r.found_unix_s) + "\n";
+                        std::to_string(r.found_unix_s) + " " +
+                        amounts_field(r.coinbase_owed) + " " +
+                        amounts_field(r.credit) + "\n";
         return s;
     }
     static bool parse_sidecar_line(const std::string& line, std::string& bid, PendingRec& r) {
@@ -546,7 +710,7 @@ private:
         std::string ver, payee, prev;
         unsigned long long h = 0, reward = 0, ts = 0;
         if (!(is >> ver >> bid >> h >> payee >> reward >> prev >> ts)) return false;
-        if (ver != "1") return false;
+        if (ver != "1" && ver != "2") return false;
         std::array<std::uint8_t, 32> tmp{};
         bid = lower_hex(bid);
         if (!hash_from_hex(bid, tmp)) return false;
@@ -565,9 +729,18 @@ private:
             if (!hash_from_hex(prev, tmp)) return false;
             r.prev_id_hex = prev;
         }
+        if (ver == "1") {                 // pre-R-7 record: no maps on the wire
+            r.legacy_v1 = true;
+            r.coinbase_owed.clear();
+            r.credit.clear();
+            return true;
+        }
+        if (!parse_amounts_field(is, r.coinbase_owed)) return false;
+        if (!parse_amounts_field(is, r.credit)) return false;
         return true;
     }
 
+private:
     bool sidecar_flush() {
         if (m_o.sidecar_path.empty()) return true;
         std::string body;
@@ -615,10 +788,25 @@ private:
 // ===========================================================================
 // SELF-CHECK — network-free, RandomX-free, against the monerod STUB; the same
 // shape as xmr_node_smoke.hpp so it can run under `--mock-smoke` / the CI
-// smoke target. Proves: queued win -> FOUND (amount-honest) -> restart inside
-// the D_conf window -> sidecar re-drive -> FINALIZE at bin_height = H_b+D_conf
-// -> finalW nets to 0 -> sidecar retired; plus the late-FOUND and malformed
-// refusals, the valueless record, idempotence, and the orphan disposition.
+// smoke target.
+//
+// RE-PINNED for R-7 (2026-09-10). The old FC3/FC10/FC16 asserted the FICTIONAL
+// record (credit == payout == { --payee-* : FULL reward }, effective_owed ==
+// -reward while pending). They ENCODED the defect. They now assert the
+// reconciled contract:
+//   INV-1  effective_owed(k) >= 0 at EVERY step (FOUND and FINALIZE alike);
+//   INV-2  a FINALIZE moves effective_owed(k) by EXACTLY +credit[k] — invariant
+//          when credit == {}, never decreasing. effective_owed legitimately
+//          DROPS at FOUND: that is the pending-payout deduction the coinbase
+//          drew on, and asserting monotonicity across FOUND would be wrong.
+//
+// Proves, end to end: an S-1-shaped credit block arms owed -> a settlement win
+// whose coinbase pays part of that owed -> restart inside the D_conf window ->
+// the schema-v2 sidecar re-drives the SAME payout map (never one re-derived
+// from payee/reward) -> FINALIZE at bin_height = H_b + D_conf extinguishes the
+// owed EXACTLY ONCE -> sidecar retired; plus the split-brain precheck, the
+// late-FOUND / malformed / zero-bid refusals, the valueless (option-A) record,
+// idempotence, the v1 legacy-sidecar path, and the orphan disposition.
 // ===========================================================================
 #include "xmr_node_smoke.hpp"   // smoke::Report, apply_row, blk_id, key_of, test_point_check
 #include "impl/xmr/node/monerod_transport.hpp"   // MockMonerodTransport
@@ -630,7 +818,11 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
     smoke::Report rep;
     const ::v37::ChainId CHAIN = 7;
     const std::uint64_t  D_CONF = 3;
-    const std::uint64_t  REWARD = 600000000000ull;   // 0.6 XMR in piconero
+    const std::uint64_t  REWARD = 600000000000ull;    // 0.6 XMR in piconero (block reward)
+    // The K_fair owed this lane holds, and what two coinbases pay out of it.
+    const long long SEED  = 600000000000ll;           // E_b credit that ARMS the owed
+    const long long TAKE  = 100000000000ll;           // block 5's Role::Owed output
+    const long long TAKE2 =  50000000000ll;           // block 11's (orphaned) output
 
     XmrNodeConfig cfg;
     cfg.network = MoneroNetwork::Stagenet;
@@ -644,8 +836,9 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
     o.out = nullptr;   // silent
 
     const ::v37::bytes32 payee = smoke::key_of(0xC3);
-    const std::string bid5 = hex_of(smoke::blk_id(5));
-    const std::string bid8 = hex_of(smoke::blk_id(8));
+    const std::string bid2  = hex_of(smoke::blk_id(2));
+    const std::string bid5  = hex_of(smoke::blk_id(5));
+    const std::string bid8  = hex_of(smoke::blk_id(8));
     const std::string bid11 = hex_of(smoke::blk_id(11));
     FoundBlockQueue q;
 
@@ -659,31 +852,90 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
             smoke::apply_row(node, h, smoke::blk_id(static_cast<std::uint8_t>(h)),
                              smoke::blk_id(static_cast<std::uint8_t>(h - 1)));
     };
+    // One owed row: { payee : amount }. The SHAPE of an emitted Role::Owed set.
+    auto owed_of = [&](long long amount) {
+        Amounts a;
+        if (amount != 0) a[payee] = amount;
+        return a;
+    };
 
-    // ── phase 1: node A — win at 5, buried 2 (< D_conf), then "crash" ────────
+    // ── phase 1: node A — arm owed, win at 5, bury 2 (< D_conf), then "crash" ─
     {
         MockMonerodTransport mock;
         XmrNode node(cfg, mock, &smoke::test_point_check);
         try { node.bring_up(); } catch (const std::exception& e) {
             rep.add("FC0 bring_up (node A)", false, e.what()); return rep;
         }
-        chain(node, 1, 5);
         FinalizeConnect fc(node, cfg, q, o);
         auto boot = fc.reseed_after_bring_up();
         rep.add("FC1 fresh boot: no sidecar, nothing reseeded",
                 !boot.sidecar_present && boot.reseeded == 0 && boot.reregistered == 0);
 
+        // ── ARM the owed through the DURABLE path (a FOUND carrying an
+        //    S-1-shaped E_b credit and no coinbase owed outputs), so the credit
+        //    is in the settle-store write-ahead log and survives the restart.
+        chain(node, 1, 2);
+        FoundBlockEvent seed_ev;
+        seed_ev.height = 2; seed_ev.block_id_hex = bid2;
+        seed_ev.prev_id_hex = hex_of(smoke::blk_id(1));
+        seed_ev.reward_piconero = REWARD; seed_ev.payee = payee;
+        seed_ev.credit = owed_of(SEED);              // E_b (Track A2 S-1 shape)
+        q.push(seed_ev);
+        auto t = fc.tick();
+        const long long eo_before_credit_finalize = node.ledger().effective_owed(payee);
+        rep.add("FC-A0 a credit-only FOUND registers and leaves effective_owed UNCHANGED "
+                "(credit lands at FINALITY, not at FOUND — OI-W4-5)",
+                t.registered == 1 && node.ledger().is_pending(bid2) &&
+                eo_before_credit_finalize == 0,
+                "eo=" + std::to_string(eo_before_credit_finalize));
+
+        chain(node, 3, 5);                            // hw=5 => bin_height 2 => FINALIZE bid2
+        t = fc.tick();
+        rep.add("FC-A1 INV-2: FINALIZE raised effective_owed by EXACTLY credit[k]",
+                t.settled == 1 && node.ledger().is_settled(bid2) &&
+                node.ledger().effective_owed(payee) == eo_before_credit_finalize + SEED,
+                "eo=" + std::to_string(node.ledger().effective_owed(payee)));
+
+        // ── the settlement win: its coinbase pays TAKE of the armed owed ──────
         FoundBlockEvent ev;
         ev.height = 5; ev.block_id_hex = bid5; ev.prev_id_hex = hex_of(smoke::blk_id(4));
         ev.reward_piconero = REWARD; ev.payee = payee; ev.worker = "rig0"; ev.template_id = 42;
+        ev.coinbase_owed = owed_of(TAKE);             // the EMITTED Role::Owed set
         q.push(ev); q.push(ev);                       // duplicate push (idempotent per bid)
-        auto t = fc.tick();
+        t = fc.tick();
         rep.add("FC2 queued win -> on_network_block_won: ledger pending, idempotent per bid",
                 t.drained == 2 && t.registered == 1 && t.refused == 0 &&
                 fc.pending().size() == 1 && node.ledger().is_pending(bid5),
                 "drained=" + std::to_string(t.drained) + " registered=" + std::to_string(t.registered));
-        rep.add("FC3 amount-honest: effective_owed(payee) == -reward while pending",
-                node.ledger().effective_owed(payee) == -static_cast<long long>(REWARD));
+        rep.add("FC3 R-7 INV-1: effective_owed(payee) == seeded - take and is NON-NEGATIVE "
+                "while the block is pending (never -reward)",
+                node.ledger().effective_owed(payee) == SEED - TAKE &&
+                node.ledger().effective_owed(payee) >= 0 && fc.min_effective_owed() == 0,
+                "eo=" + std::to_string(node.ledger().effective_owed(payee)) +
+                " min=" + std::to_string(fc.min_effective_owed()));
+        rep.add("FC3b the FOUND booked EXACTLY the coinbase-paid owed set",
+                fc.pending().count(bid5) == 1 &&
+                fc.pending().at(bid5).coinbase_owed == owed_of(TAKE) &&
+                fc.pending().at(bid5).credit.empty() &&
+                fc.stats().owed_booked == TAKE);
+
+        // FC3c SPLIT-BRAIN PRECHECK: a coinbase claiming to pay more owed than
+        // this ledger holds is proof it was built against a DIFFERENT ledger.
+        // Refused loudly instead of poisoning effective_owed negative.
+        {
+            FoundBlockEvent over = ev;
+            over.block_id_hex = hex_of(smoke::blk_id(6));
+            over.height = 6;
+            over.coinbase_owed = owed_of(SEED * 4);
+            q.push(over);
+            const auto before = node.ledger().effective_owed(payee);
+            t = fc.tick();
+            rep.add("FC3c split-brain payout (> effective_owed) is REFUSED, ledger untouched",
+                    t.refused == 1 && fc.stats().split_brain_refused == 1 &&
+                    !node.ledger().is_pending(hex_of(smoke::blk_id(6))) &&
+                    node.ledger().effective_owed(payee) == before);
+        }
+
         rep.add("FC4 pending-FOUND sidecar written (write-ahead, 1 record)",
                 count_lines(o.sidecar_path) == 1);
 
@@ -696,6 +948,7 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
 
         // late FOUND: cursor is 7-3=4, a win claimed at h=3 can never be stepped
         FoundBlockEvent late = ev; late.height = 3; late.block_id_hex = hex_of(smoke::blk_id(3));
+        late.coinbase_owed.clear();
         q.push(late);
         t = fc.tick();
         rep.add("FC6 late FOUND (height <= finalize cursor) refused, not poisoned into the ledger",
@@ -724,6 +977,11 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
             rep.add("FC0 bring_up (node B)", false, e.what()); return rep;
         }
         const bool recovered_pending = node.ledger().is_pending(bid5);
+        rep.add("FC8a the store replay restored the ARMED owed and the pending payout "
+                "(effective_owed == seeded - take across the restart)",
+                node.ledger().effective_owed(payee) == SEED - TAKE,
+                "eo=" + std::to_string(node.ledger().effective_owed(payee)));
+
         FinalizeConnect fc(node, cfg, q, o);
         auto boot = fc.reseed_after_bring_up();
         rep.add("FC8 restart: sidecar re-drives the pending FOUND into the fresh driver",
@@ -734,46 +992,322 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         const auto seq_before = node.ledger().ledger_seq();
         rep.add("FC8b re-drive left the ledger untouched (ledger_seq unchanged, still pending)",
                 node.ledger().ledger_seq() == seq_before && node.ledger().is_pending(bid5));
+        // R-7: the SCHEMA-v2 sidecar round-trips the booked payout map BYTE-FOR-
+        // BYTE. Before the schema bump the re-drive rebuilt a payout out of
+        // payee+reward — a DIFFERENT map from the one the block paid.
+        rep.add("FC8c sidecar v2 round-trip: the re-driven payout map is byte-equal to the "
+                "map the block paid (not re-derived from payee/reward)",
+                fc.pending().count(bid5) == 1 &&
+                fc.pending().at(bid5).coinbase_owed.size() == 1 &&
+                fc.pending().at(bid5).coinbase_owed.count(payee) == 1 &&
+                fc.pending().at(bid5).coinbase_owed.at(payee) == TAKE &&
+                !fc.pending().at(bid5).legacy_v1);
 
         chain(node, 5, 8);                            // index rebuilt from 5; hw -> 8 = 5+3
+        const long long eo_before = node.ledger().effective_owed(payee);
         auto t = fc.tick();
         rep.add("FC9 FOUND -> FINALIZE at D_conf burial after restart (bin_height = 5+3 = 8)",
                 t.settled == 1 && node.ledger().is_settled(bid5) && fc.pending().empty(),
                 "settled=" + std::to_string(t.settled));
-        rep.add("FC10 finalW nets to 0 for the payee (credit == payout)",
-                node.ledger().effective_owed(payee) == 0);
+        rep.add("FC10 R-7 INV-2: FINALIZE with credit == {} leaves effective_owed UNCHANGED "
+                "(the take was extinguished exactly ONCE, at FOUND)",
+                node.ledger().effective_owed(payee) == eo_before &&
+                node.ledger().effective_owed(payee) == SEED - TAKE,
+                "eo=" + std::to_string(node.ledger().effective_owed(payee)));
+        rep.add("FC10b INV-1 holds across the whole run: no ledger row is negative",
+                fc.min_effective_owed() == 0);
         rep.add("FC11 sidecar retired after FINALIZE", count_lines(o.sidecar_path) == 0);
         bool logged = false;
         for (const auto& l : node.construction_log())
             if (l.find("SETTLED at bin_height=8") != std::string::npos) logged = true;
         rep.add("FC12 the node logged the FINALIZE step with the per-height bin_height (echoed by tick)", logged);
 
-        // valueless win (no payee decoded) still records the block
+        // OPTION-A / valueless win: monerod's own template pays no v37 owed, so
+        // the record is the degenerate {}/{} — the ledger registers the block and
+        // its ledger_seq bumps, but NO key is created and NO owed moves.
+        const long long eo_pre_a = node.ledger().effective_owed(payee);
+        const std::size_t keys_pre_a = node.ledger().effective_owed_all().size();
         FoundBlockEvent v; v.height = 8; v.block_id_hex = bid8;
         q.push(v);
         t = fc.tick();
-        rep.add("FC13 valueless win (no payee) still registers (degenerate {}/{})",
-                t.registered == 1 && node.ledger().is_pending(bid8));
+        rep.add("FC13 option-A / valueless win registers as the degenerate {}/{} record",
+                t.registered == 1 && node.ledger().is_pending(bid8) &&
+                fc.pending().at(bid8).coinbase_owed.empty() &&
+                fc.pending().at(bid8).credit.empty() &&
+                node.ledger().effective_owed(payee) == eo_pre_a &&
+                node.ledger().effective_owed_all().size() == keys_pre_a);
         chain(node, 9, 11);
         t = fc.tick();
-        rep.add("FC14 valueless win finalizes at 8+3=11", t.settled == 1 && node.ledger().is_settled(bid8));
+        rep.add("FC14 valueless win finalizes at 8+3=11 and moves no owed",
+                t.settled == 1 && node.ledger().is_settled(bid8) &&
+                node.ledger().effective_owed(payee) == eo_pre_a);
 
-        // orphan disposition: win at 11, then a competing 11 wins the chain
-        FoundBlockEvent w; w.height = 11; w.block_id_hex = bid11; w.payee = payee; w.reward_piconero = REWARD;
+        // orphan disposition: win at 11 paying TAKE2, then a competing 11 wins
+        FoundBlockEvent w; w.height = 11; w.block_id_hex = bid11; w.payee = payee;
+        w.reward_piconero = REWARD; w.coinbase_owed = owed_of(TAKE2);
         q.push(w);
         t = fc.tick();
         const bool reg11 = t.registered == 1 && node.ledger().is_pending(bid11);
+        const bool owed_dropped_at_found =
+            node.ledger().effective_owed(payee) == SEED - TAKE - TAKE2;
         smoke::apply_row(node, 11, smoke::blk_id(99), smoke::blk_id(10));   // reorg at 11
         chain(node, 12, 14);                          // bury the competitor: 11+3 = 14
         t = fc.tick();
         // the Orphan event or the canonical predicate at maturity disposed it
         rep.add("FC15 orphaned win leaves the pending set (never SETTLED) and the sidecar",
-                reg11 && !node.ledger().is_pending(bid11) && !node.ledger().is_settled(bid11) &&
+                reg11 && owed_dropped_at_found &&
+                !node.ledger().is_pending(bid11) && !node.ledger().is_settled(bid11) &&
                 fc.pending().empty() && count_lines(o.sidecar_path) == 0 && fc.stats().orphaned == 1,
                 "orphaned=" + std::to_string(fc.stats().orphaned));
-        rep.add("FC16 orphan: payee's effective_owed back to 0 (pure pending removal)",
-                node.ledger().effective_owed(payee) == 0);
+        rep.add("FC16 orphan: the pending payout is returned — effective_owed back to "
+                "seeded - take (pure pending removal, never a clawback)",
+                node.ledger().effective_owed(payee) == SEED - TAKE &&
+                fc.min_effective_owed() == 0,
+                "eo=" + std::to_string(node.ledger().effective_owed(payee)));
         (void)fc.drain_before_stop();
+    }
+
+    // ── phase 3: the sidecar CODEC itself (schema v2 + the v1 legacy path) ────
+    {
+        FinalizeConnect::PendingRec r;
+        r.height = 4242;
+        r.payee = payee;
+        r.reward = REWARD;
+        r.prev_id_hex = hex_of(smoke::blk_id(4));
+        r.found_unix_s = 1700000000ull;
+        r.coinbase_owed[payee] = TAKE;
+        r.coinbase_owed[smoke::key_of(0xA1)] = TAKE2;
+        r.credit[smoke::key_of(0xB2)] = SEED;
+
+        const std::string line = FinalizeConnect::sidecar_line(bid5, r);
+        std::string bid_out;
+        FinalizeConnect::PendingRec back;
+        const bool ok = FinalizeConnect::parse_sidecar_line(line, bid_out, back);
+        rep.add("FC17 sidecar v2 codec round-trips both maps exactly",
+                ok && bid_out == bid5 && back.height == r.height &&
+                back.coinbase_owed == r.coinbase_owed && back.credit == r.credit &&
+                !back.legacy_v1);
+
+        // A pre-R-7 (v1) line still parses, carries no maps, and says so.
+        const std::string v1 = "1 " + bid5 + " 4242 " + hex_of(payee) + " " +
+                               std::to_string(REWARD) + " " + hex_of(smoke::blk_id(4)) +
+                               " 1700000000";
+        FinalizeConnect::PendingRec legacy;
+        std::string legacy_bid;
+        const bool ok1 = FinalizeConnect::parse_sidecar_line(v1, legacy_bid, legacy);
+        rep.add("FC18 a pre-R-7 (schema v1) sidecar line still parses, with EMPTY maps and the "
+                "legacy flag set (fail-safe: owed is never over-decremented)",
+                ok1 && legacy.legacy_v1 && legacy.coinbase_owed.empty() && legacy.credit.empty() &&
+                legacy.height == 4242);
+
+        FinalizeConnect::PendingRec junk;
+        std::string junk_bid;
+        rep.add("FC19 a truncated v2 line is REFUSED (never a half-parsed payout map)",
+                !FinalizeConnect::parse_sidecar_line(
+                    "2 " + bid5 + " 4242 - 0 - 0 2 " + hex_of(payee) + ":1", junk_bid, junk));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // phase 4 — F-1: THE STARTUP OWED SEED ACROSS A RESTART
+    //
+    // WHY PHASES 1-3 MASKED F-1. They arm owed the RIGHT way — a FOUND carrying
+    // an S-1-shaped E_b credit, write-ahead-logged by XmrFinalizeDriver — so the
+    // credit leg replays on restart exactly like the payout leg, and FC8a/FC10b
+    // pass. The LIVE daemon's --owed-demo-amount armed owed a DIFFERENT way:
+    // straight into OwedLedger, bypassing the write-ahead log. No phase covered
+    // that path at all, so no assertion could fail on it. "The R-7 acceptance
+    // probe only checks the fresh-boot path" is exactly this: the restart
+    // assertions existed, but never over the seed the daemon actually used.
+    //
+    // 4a is the NEGATIVE CONTROL: it reproduces the OLD non-durable seed and
+    // REQUIRES the restart to come back NEGATIVE. Without it the non-negative
+    // assertion in 4b could pass vacuously (a run that never really paid out of
+    // the seed would satisfy it), and F-1 could walk back in unnoticed.
+    // 4b is the FIX: the same scenario through seed_owed_durable(), which must
+    // come back NON-NEGATIVE and must apply the seed EXACTLY ONCE.
+    // ═══════════════════════════════════════════════════════════════════════
+    {
+        const long long DEMO = 250000000000ll;      // the seeded owed row
+        const ::v37::bytes32 demo_payee = smoke::key_of(0xD1);
+        auto demo_owed = [&](long long a) { Amounts m; if (a) m[demo_payee] = a; return m; };
+
+        // min over effective_owed_all(), read straight off the ledger — this IS
+        // the acceptance probe (FinalizeConnect::min_effective_owed's rule).
+        auto min_eo = [](XmrNode& n) {
+            long long m = 0;
+            for (const auto& [k, v] : n.ledger().effective_owed_all()) { (void)k; if (v < m) m = v; }
+            return m;
+        };
+
+        // Drive one store dir through: seed -> win whose coinbase pays the WHOLE
+        // seed -> bury past D_conf -> FINALIZE -> destroy the node ("crash").
+        // `durable` picks which seed path is used.
+        auto run_and_crash = [&](const std::string& dir, bool durable) -> bool {
+            XmrNodeConfig c;
+            c.network = MoneroNetwork::Stagenet;
+            c.lane_chain = CHAIN;
+            c.d_conf = D_CONF;
+            c.settle_db_path = dir;
+            std::filesystem::create_directories(dir);
+
+            FinalizeConnectOptions fo;
+            fo.sidecar_path = (std::filesystem::path(dir) / "pfound.tsv").string();
+            fo.out = nullptr;
+
+            MockMonerodTransport mock;
+            XmrNode node(c, mock, &smoke::test_point_check);
+            try { node.bring_up(); } catch (const std::exception&) { return false; }
+
+            if (durable) {
+                // THE FIX: two write-ahead events under the stable seed bid.
+                if (node.finalize_driver().seed_owed_durable(
+                        kOwedDemoSeedBid, demo_owed(DEMO), kOwedDemoSeedBinHeight)
+                    != SeedOwedResult::Applied) return false;
+            } else {
+                // THE OLD PATH, verbatim: straight into the ledger, no WAL.
+                node.ledger().on_block_found("legacy-demo-seed", demo_owed(DEMO), /*payout=*/{});
+                node.ledger().on_block_finalized("legacy-demo-seed", kOwedDemoSeedBinHeight);
+            }
+            if (node.ledger().effective_owed(demo_payee) != DEMO) return false;
+
+            FoundBlockQueue lq;
+            FinalizeConnect lfc(node, c, lq, fo);
+            (void)lfc.reseed_after_bring_up();
+
+            chain(node, 1, 5);
+            FoundBlockEvent w;
+            w.height = 5; w.block_id_hex = bid5; w.prev_id_hex = hex_of(smoke::blk_id(4));
+            w.reward_piconero = REWARD; w.payee = demo_payee;
+            w.coinbase_owed = demo_owed(DEMO);       // the coinbase pays the whole seed
+            lq.push(w);
+            auto tt = lfc.tick();
+            if (tt.registered != 1) return false;
+            chain(node, 6, 8);                       // 5 + D_CONF = 8 => FINALIZE
+            tt = lfc.tick();
+            return tt.settled == 1 && node.ledger().is_settled(bid5);
+        };
+
+        // ── 4a NEGATIVE CONTROL — the pre-fix seed MUST come back negative ───
+        const std::string dir_a = (tmp_root / "f1-legacy-seed").string();
+        const bool ran_a = run_and_crash(dir_a, /*durable=*/false);
+        {
+            XmrNodeConfig c;
+            c.network = MoneroNetwork::Stagenet; c.lane_chain = CHAIN; c.d_conf = D_CONF;
+            c.settle_db_path = dir_a;
+            MockMonerodTransport mock;
+            XmrNode node(c, mock, &smoke::test_point_check);
+            bool up = true;
+            try { node.bring_up(); } catch (const std::exception&) { up = false; }
+            const long long m = up ? min_eo(node) : 0;
+            rep.add("FC20 F-1 NEGATIVE CONTROL: the OLD non-durable seed (written straight into the "
+                    "ledger, never into the write-ahead log) DOES leave a negative effective_owed "
+                    "row across a restart — so FC21's non-negative assertion is not vacuous",
+                    ran_a && up && m == -DEMO,
+                    "min_effective_owed=" + std::to_string(m) + " want=" + std::to_string(-DEMO));
+        }
+
+        // ── 4b THE FIX — durable seed, restart, NON-NEGATIVE, applied ONCE ───
+        const std::string dir_b = (tmp_root / "f1-durable-seed").string();
+        const bool ran_b = run_and_crash(dir_b, /*durable=*/true);
+        {
+            XmrNodeConfig c;
+            c.network = MoneroNetwork::Stagenet; c.lane_chain = CHAIN; c.d_conf = D_CONF;
+            c.settle_db_path = dir_b;
+            MockMonerodTransport mock;
+            XmrNode node(c, mock, &smoke::test_point_check);
+            bool up = true;
+            try { node.bring_up(); } catch (const std::exception&) { up = false; }
+
+            const long long m = up ? min_eo(node) : -1;
+            rep.add("FC21 F-1: after a RESTART against the SAME data-dir, NO effective_owed row is "
+                    "negative (min_effective_owed >= 0) — the seed's credit leg replayed out of the "
+                    "write-ahead log alongside the payout that drew on it",
+                    ran_b && up && m >= 0,
+                    "min_effective_owed=" + std::to_string(m));
+            rep.add("FC21b F-1: the seeded row nets to EXACTLY zero after the restart — credited "
+                    "once, paid once (whitepaper 9 no-double-pay / OI-W4-5)",
+                    up && node.ledger().effective_owed(demo_payee) == 0,
+                    "eo=" + std::to_string(up ? node.ledger().effective_owed(demo_payee) : -1));
+            rep.add("FC21c F-1: the store replay restored the seed as SETTLED (terminal) under its "
+                    "stable bid",
+                    up && node.ledger().is_settled(kOwedDemoSeedBid));
+
+            // Re-passing --owed-demo-amount on the restart must be a NO-OP: no
+            // ledger movement, and no new write-ahead event either.
+            const auto seq_before = up ? node.ledger().ledger_seq() : 0;
+            const auto evt_before = up ? node.finalize_driver().event_seq() : 0;
+            const auto again = up ? node.finalize_driver().seed_owed_durable(
+                                        kOwedDemoSeedBid, demo_owed(DEMO), kOwedDemoSeedBinHeight)
+                                  : SeedOwedResult::Refused;
+            rep.add("FC22 F-1: re-passing the startup seed after a restart is reported "
+                    "already-durable and applies NOTHING — ledger_seq and the write-ahead event "
+                    "sequence both unchanged (applied EXACTLY ONCE per data-dir)",
+                    up && again == SeedOwedResult::AlreadyDurable &&
+                    node.ledger().ledger_seq() == seq_before &&
+                    node.finalize_driver().event_seq() == evt_before &&
+                    min_eo(node) >= 0,
+                    std::string("result=") + to_string(again) +
+                    " seq=" + std::to_string(up ? node.ledger().ledger_seq() : 0) +
+                    "/" + std::to_string(seq_before) +
+                    " evt=" + std::to_string(up ? node.finalize_driver().event_seq() : 0) +
+                    "/" + std::to_string(evt_before));
+
+            // A seed with a DIFFERENT amount is equally refused — one demo seed
+            // per data-dir, ever. (Silently crediting a second amount is the
+            // same double-apply wearing a different number.)
+            const auto other = up ? node.finalize_driver().seed_owed_durable(
+                                        kOwedDemoSeedBid, demo_owed(DEMO * 3), kOwedDemoSeedBinHeight)
+                                  : SeedOwedResult::Refused;
+            rep.add("FC22b F-1: a restart passing a DIFFERENT --owed-demo-amount is also "
+                    "already-durable — the flag is ignored, never credited a second time",
+                    up && other == SeedOwedResult::AlreadyDurable && min_eo(node) >= 0);
+        }
+
+        // ── 4c restart INSIDE the D_conf window (the payout still pending):
+        //    effective_owed must be seed - in-flight payout == 0, never negative.
+        {
+            const std::string dir_c = (tmp_root / "f1-durable-midwindow").string();
+            std::filesystem::create_directories(dir_c);
+            XmrNodeConfig c;
+            c.network = MoneroNetwork::Stagenet; c.lane_chain = CHAIN; c.d_conf = D_CONF;
+            c.settle_db_path = dir_c;
+            FinalizeConnectOptions fo;
+            fo.sidecar_path = (std::filesystem::path(dir_c) / "pfound.tsv").string();
+            fo.out = nullptr;
+            bool armed = false;
+            {
+                MockMonerodTransport mock;
+                XmrNode node(c, mock, &smoke::test_point_check);
+                try { node.bring_up(); } catch (const std::exception&) {}
+                armed = node.finalize_driver().seed_owed_durable(
+                            kOwedDemoSeedBid, demo_owed(DEMO), kOwedDemoSeedBinHeight)
+                        == SeedOwedResult::Applied;
+                FoundBlockQueue lq;
+                FinalizeConnect lfc(node, c, lq, fo);
+                (void)lfc.reseed_after_bring_up();
+                chain(node, 1, 5);
+                FoundBlockEvent w;
+                w.height = 5; w.block_id_hex = bid5; w.prev_id_hex = hex_of(smoke::blk_id(4));
+                w.reward_piconero = REWARD; w.payee = demo_payee;
+                w.coinbase_owed = demo_owed(DEMO);
+                lq.push(w);
+                auto tt = lfc.tick();
+                armed = armed && tt.registered == 1;
+                chain(node, 6, 7);                   // hw = 7 < 5 + 3: still pending
+                tt = lfc.tick();
+                armed = armed && tt.settled == 0 && node.ledger().is_pending(bid5);
+            }
+            MockMonerodTransport mock;
+            XmrNode node(c, mock, &smoke::test_point_check);
+            bool up = true;
+            try { node.bring_up(); } catch (const std::exception&) { up = false; }
+            rep.add("FC23 F-1: a restart INSIDE the D_conf window (the payout still pending) also "
+                    "recovers non-negative — effective_owed == seed - in-flight payout == 0",
+                    armed && up && min_eo(node) >= 0 && node.ledger().is_pending(bid5) &&
+                    node.ledger().effective_owed(demo_payee) == 0,
+                    "min=" + std::to_string(up ? min_eo(node) : -1) +
+                    " eo=" + std::to_string(up ? node.ledger().effective_owed(demo_payee) : -1));
+        }
     }
     return rep;
 }

@@ -101,6 +101,12 @@ struct SettlementSnapshot {
     std::size_t                              n_outputs = 0;
     std::size_t                              n_tx = 0;
     bool                                     valid = false;
+    // The settlement source this template was cut from. RETAINED (it used to be
+    // dropped at the end of assemble()) so the FOUND record can reach
+    // owed_digest() / ledger_seq() / lane_commitment — the §13 state root the
+    // block commits — instead of having to re-derive them from a ledger that
+    // may have moved on. Immutable after build; shared by value with the ring.
+    std::shared_ptr<const XmrOwedSettlementSource> src;
 };
 
 // ---------------------------------------------------------------------------
@@ -218,7 +224,31 @@ public:
         out.prev_id         = snap.prev_id;
         out.expected_reward = snap.reward;
         out.major_version   = snap.major_version;
+        // R-7 (2026-09-10): the K_fair OWED set THESE bytes pay, read from the
+        // EMITTED coinbase outputs of the SAME AssembledTemplate that produced
+        // full_blob. Captured here, at the submit seam, so the FOUND record can
+        // never book a payout belonging to a different (or since-evicted)
+        // template. Role::Fixed / Role::Sink are EXCLUDED: their identities were
+        // never credited into finalW, so booking them would drive those keys
+        // permanently negative (w4_settlement.hpp:485-500).
+        out.coinbase_owed = owed_payout_of(*snap.tpl);
         return true;
+    }
+
+    // { identity : piconero } over the emitted Role::Owed outputs of an
+    // assembled template. Amounts are extra_nonce-INDEPENDENT (the nonce only
+    // enters tx_extra), so one map is authoritative for every share of this
+    // template. Never re-runs project_w4_owed: X6's owed pass may legitimately
+    // emit FEWER rows than W4 proposed (the budget-truncated sub-h_min tail
+    // BREAKs and the sink absorbs it, xmr_coinbase.cpp:135-139, while W4 CARRYs
+    // and keeps scanning, w4_settlement.hpp:586-587), and booking the proposal
+    // would decrement owed for money the residual sink actually swallowed.
+    static submit::OwedPayout owed_payout_of(const asm_::AssembledTemplate& tpl) {
+        submit::OwedPayout m;
+        for (const auto& o : tpl.outputs())
+            if (o.role == x6::CoinbaseOutput::Role::Owed)
+                m[o.identity] += static_cast<long long>(o.amount);
+        return m;
     }
 
     // Fill a stratum job blob for (template_id, extra_nonce). Shared by get_job
@@ -296,6 +326,11 @@ private:
         a.miner   = xmr_md;
         a.mempool = asm_::from_backlog(md.tx_backlog);       // empty on regtest => n_tx == 0
         a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+        // RULED 2026-09-10: re-derive the canonical K_fair set at every reward
+        // the assembler's fixpoint visits, at the RESOLVED weight-aware cap.
+        // Main-thread only — the assembler runs entirely inside this call, and
+        // assemble() is main-thread by the provider's contract.
+        a.reproject_owed = make_reproject_owed(scfg, m_ledger);   // m_ledger outlives the ring
 
         std::string as_why;
         std::unique_ptr<asm_::AssembledTemplate> tpl = asm_::XmrBlockAssembler::build(a, &as_why);
@@ -317,6 +352,7 @@ private:
         std::memcpy(snap.seed_hash.data(), md.seed_hash.data(), strat::HASH_SIZE);
         snap.n_outputs        = snap.tpl->outputs().size();
         snap.n_tx             = snap.tpl->n_tx();
+        snap.src              = std::shared_ptr<const XmrOwedSettlementSource>(src.release());
         snap.valid            = true;
         why.clear();
         return true;

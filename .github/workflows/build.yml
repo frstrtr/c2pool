@@ -181,7 +181,7 @@ jobs:
         # RandomX JIT/asm + intentional unaligned reads do not survive
         # -fsanitize, so the ASAN leg deliberately leaves it OFF. Light mode:
         # the KAT never allocates the 2 GiB dataset (256 MiB cache only).
-        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON -DXMR_BUILD_OPTION_B_KATS=ON
 
       # Boost header-integrity + version gate: a torn/mixed Boost tree or apt-Boost
       # fallback fails HERE (fast, one TU), not deep in the coin build.
@@ -234,6 +234,7 @@ jobs:
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke c2pool-v37-xmr \
                     v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck \
                     xmr_randomx_verify_kat v37_xmr_o2_randomx_kat \
+                    xmr_template_primitives_kat xmr_block_assembly_kat v37_xmr_o2_settlement_kat \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
@@ -601,6 +602,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCOIN_DGB=ON \
             -DC2POOL_GOLDEN_RESOLVED_CONFIG_GATE=OFF \
+            -DXMR_BUILD_OPTION_B_KATS=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g1" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr"
@@ -659,6 +661,7 @@ jobs:
                     v37_xmr_canon_p1_kat \
                     c2pool-v37-btc v37_btc_node_smoke v37_btc_digest_drift_kat f1_finalize_kat_btc \
                     v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck \
+                    xmr_template_primitives_kat xmr_block_assembly_kat v37_xmr_o2_settlement_kat \
                     xmr_primitives_selfcheck xmr_x2_node_kat xmr_receipt_kat xmr_torsion_kat xmr_wire_dos_check xmr_stratum_selftest xmr_provenance_gate \
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.

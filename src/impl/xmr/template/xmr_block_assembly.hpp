@@ -185,6 +185,14 @@ inline std::vector<unsigned char> extra_nonce_bytes(std::uint32_t extra_nonce, s
 // amounts, which is why re-deriving is unnecessary and the template's two-pass
 // flow stays sound.
 //
+// RULED 2026-09-10 (multi-node): when a `reproject_owed` callback is supplied,
+// the OWED ROWS are re-derived from the canonical K_fair rule at every reward
+// the template proposes, BEFORE X6 allocates. The same_set() gate is unchanged
+// and still governs adoption -- a re-projection that changes the SET is
+// refused, the reward is handed back, and the assembler rebuilds at it. So the
+// block's payee set is OwedLedger::propose_coinbase output at the reward the
+// block pays. With no callback the behaviour is byte-identical to before.
+//
 // Call protocol with XmrBlockTemplate::update() (upstream order, pinned to the
 // p2pool commit named in xmr_block_template.hpp):
 //   payees() ... merkle_tree_data() ... split_reward(base + sum(fees))   [1]
@@ -204,11 +212,22 @@ public:
     // Build the snapshot. `in.budget()` is the reward hint. Returns nullptr and
     // fills *why (if given) when X6 refuses (CARROT fence, bad sink/payee ref,
     // fixed > budget, cap too small, derivation failure) -- fail closed.
+    // Re-project the canonical K_fair owed rows at ONE reward and ONE resolved
+    // total-output cap. Supplied by the consumer tree (the option-B provider
+    // binds it to project_w4_owed over the live OwedLedger). EMPTY => the
+    // pre-ruling frozen-rows behaviour, so a caller that does not set it (every
+    // impl-only KAT) is byte-identical to the previous release.
+    using ReprojectOwedFn =
+        std::function<bool(std::uint64_t reward, std::uint32_t output_cap,
+                           std::vector<::v37::xmr::settle::OwedEntry>& out, std::string* why)>;
+
     static std::unique_ptr<X6SettlementSource> build(const CoinbaseInputs& in,
                                                      std::uint64_t subsidy,
-                                                     std::string* why) {
+                                                     std::string* why,
+                                                     ReprojectOwedFn reproject = {}) {
         std::unique_ptr<X6SettlementSource> s(new X6SettlementSource());
         s->m_in = in;
+        s->m_reproject = std::move(reproject);
         s->m_in.extra_nonce = extra_nonce_bytes(0, EXTRA_NONCE_SIZE); // keys/amounts are nonce-independent
         s->m_subsidy = subsidy;
         s->m_cb = ::v37::xmr::settle::build_coinbase(s->m_in);
@@ -256,10 +275,20 @@ public:
         }
         if (reward == m_in.budget()) { fill_amounts(rewards); return true; }
 
-        // A different real reward: accept iff X6's canonical allocation at that
-        // reward pays the SAME ordered payee set; then adopt its amounts.
+        // A different real reward. RULED 2026-09-10: the payee set must be the
+        // canonical K_fair proposal AT THE REWARD THE BLOCK PAYS, so re-project
+        // the owed rows first (when the consumer supplied the hook) and only
+        // then ask X6 to allocate. Accept iff the allocation at that reward pays
+        // the SAME ordered payee set; then adopt its amounts AND its rows.
         CoinbaseInputs probe = m_in;
         set_budget(probe, m_subsidy, reward);
+        if (m_reproject) {
+            std::string w;
+            if (!m_reproject(reward, probe.output_cap, probe.owed, &w)) {
+                m_wanted = reward;
+                return false;   // fail closed: the assembler rebuilds at `reward`
+            }
+        }
         BuildError err = BuildError::None;
         std::vector<CoinbaseOutput> alt = ::v37::xmr::settle::allocate_exact_sum(probe, &err);
         if (alt.empty() || !same_set(alt)) {
@@ -268,6 +297,10 @@ public:
         }
         for (std::size_t i = 0; i < alt.size(); ++i) m_cb.outputs[i].amount = alt[i].amount;
         set_budget(m_in, m_subsidy, reward);
+        // Carry the re-projected rows into the FINAL inputs so the FOUND record
+        // and any peer's ACCEPT re-derivation (coinbase_inputs()) hold the
+        // canonical set for the reward actually paid, not the sizing hint's.
+        if (m_reproject) m_in.owed = std::move(probe.owed);
         m_cb.budget = reward;
         fill_amounts(rewards);
         return true;
@@ -287,8 +320,22 @@ public:
     [[nodiscard]] unsigned split_calls() const { return m_split_calls; }
 
     // The FINAL inputs (budget adopted) and outputs (amounts adopted): what a
-    // peer's canonical_coinbase_matches() must be fed, and the FOUND payout
-    // map {identity : amount} over ALL outputs (owed / fixed / sink).
+    // peer's canonical_coinbase_matches() must be fed.
+    //
+    // R-7 CORRECTION (2026-09-10): an earlier revision of this comment claimed
+    // the FOUND payout map runs over ALL outputs (owed / fixed / sink). That is
+    // WRONG under the W4 contract. OwedLedger's payout term is SUBTRACTED from
+    // finalW at FINALIZE (w4_settlement.hpp:485-500) and is only ever legal for
+    // keys that were CREDITED into finalW — the K_fair owed rows the coinbase
+    // drew EffectiveOwed for. A Fixed or Sink identity was never credited, so
+    // booking it would drive that key's finalW permanently negative. The FOUND
+    // payout map is the Role::Owed SUBSET ONLY; consumers filter on
+    // CoinbaseOutput::Role::Owed (see c2pool/v37/xmr/xmr_o2_finalize_connect.hpp
+    // and main_v37_xmr.cpp's candidate lookup).
+    // And read THIS vector — never a re-run of the W4 projection: X6's owed pass
+    // can legitimately emit FEWER rows than W4 proposed (a budget-truncated
+    // sub-h_min tail BREAKs here and the sink absorbs it, xmr_coinbase.cpp:
+    // 135-139, while W4 CARRYs and keeps scanning, w4_settlement.hpp:586-587).
     [[nodiscard]] const CoinbaseInputs& inputs() const { return m_in; }
     [[nodiscard]] const std::vector<CoinbaseOutput>& outputs() const { return m_cb.outputs; }
     [[nodiscard]] const BuiltCoinbase& built() const { return m_cb; }
@@ -312,6 +359,7 @@ private:
         return true;
     }
 
+    ReprojectOwedFn        m_reproject;   // empty => frozen rows (pre-ruling behaviour)
     mutable CoinbaseInputs m_in;
     mutable BuiltCoinbase  m_cb;
     std::uint64_t          m_subsidy = 0;
@@ -497,6 +545,17 @@ struct AssemblyInputs {
     CoinbaseInputs                settle;
     std::uint32_t                 wire_cap = 2700;   // output cap ceiling when output_cap == 0
     int                           max_passes = 6;    // fixpoint bound (fail closed beyond)
+
+    // RULED 2026-09-10 (multi-node): re-derive the canonical K_fair owed rows at
+    // EVERY reward the fixpoint visits, so the block's payee set is
+    // OwedLedger::propose_coinbase output at the reward the block ACTUALLY pays.
+    // The consumer tree binds this to project_w4_owed over the live ledger; it
+    // is handed `in.output_cap`, i.e. the RESOLVED weight-aware cap, which also
+    // closes the cap disagreement between the W4 proposal (cut at the config's
+    // cap) and X6's allocation (cut at the weight-aware cap).
+    // EMPTY => frozen rows, byte-identical to the pre-ruling assembler; every
+    // impl-only KAT below leaves it empty on purpose.
+    X6SettlementSource::ReprojectOwedFn reproject_owed;
 };
 
 class XmrBlockAssembler {
@@ -534,8 +593,14 @@ public:
         for (int pass = 1; pass <= a.max_passes; ++pass) {
             CoinbaseInputs in = base;
             set_budget(in, subsidy, hint);
+            // RULED: the owed rows are the canonical K_fair proposal AT THIS
+            // reward and at the RESOLVED (weight-aware) cap — fail closed.
+            if (a.reproject_owed &&
+                !a.reproject_owed(hint, in.output_cap, in.owed, &sub))
+                return fail("pass " + std::to_string(pass) + ": reproject_owed refused: " + sub);
 
-            std::unique_ptr<X6SettlementSource> seam = X6SettlementSource::build(in, subsidy, &sub);
+            std::unique_ptr<X6SettlementSource> seam =
+                X6SettlementSource::build(in, subsidy, &sub, a.reproject_owed);
             if (!seam) return fail("pass " + std::to_string(pass) + ": " + sub);
 
             std::unique_ptr<XmrBlockTemplate> tpl(new XmrBlockTemplate(seam.get()));

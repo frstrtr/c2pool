@@ -185,6 +185,13 @@ struct XmrNodeConfig {
     // The owed payee is a distinct torsion-valid payee derived from the sink
     // material with spend/view swapped (see main). Proof-only; no live ledger yet.
     std::uint64_t   owed_demo_amount = 0;
+    // What the coinbase's MM-root leaf (tx_extra 0x03) BINDS, and what seeds the
+    // deterministic tx secret key r. RULED 2026-09-10 (multi-node): the
+    // whitepaper §13 StateCommitment Merkle root ("state-root", the default).
+    // "owed-digest" is the pre-ruling narrower binding and is accepted ONLY
+    // together with --lane-commitment-local-only, for single-pool experiments.
+    std::string     lane_commitment_source = "state-root";
+    bool            lane_commitment_local_only = false;
 
     // --- storage ------------------------------------------------------------
     // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).
