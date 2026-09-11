@@ -451,6 +451,40 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     static_cast<unsigned long long>(fs.orphaned),
                     static_cast<unsigned long long>(fs.refused),
                     fc.pending().size());
+        // c2pool#1551. r7=0 is the claim that matters: it counts settlements the
+        // same-height gate did not authorise, which is the only shape an
+        // orphan-credit or a double-credit can take.
+        {
+            const auto& rs = fc.race().stats();
+            const auto contested = fc.race().contested_heights();
+            std::printf("  same-height: tiebreak=%s D_conf=%llu | own=%llu other=%llu "
+                        "contests=%llu (own-vs-other=%llu, open now=%zu) | credited=%llu "
+                        "refused[orphaned=%llu other-only=%llu] deferred=%llu renotified=%llu "
+                        "| R-7 violations=%llu double-credit blocked=%llu\n",
+                        to_string(cfg.same_height_tiebreak),
+                        static_cast<unsigned long long>(cfg.d_conf),
+                        static_cast<unsigned long long>(rs.own_observed),
+                        static_cast<unsigned long long>(rs.other_observed),
+                        static_cast<unsigned long long>(rs.contests_opened),
+                        static_cast<unsigned long long>(rs.own_vs_other_opened),
+                        contested.size(),
+                        static_cast<unsigned long long>(fs.race_credited),
+                        static_cast<unsigned long long>(fs.race_refused_orphaned),
+                        static_cast<unsigned long long>(fs.race_refused_other_only),
+                        static_cast<unsigned long long>(fs.race_deferred),
+                        static_cast<unsigned long long>(fs.race_renotified),
+                        static_cast<unsigned long long>(fs.r7_violations),
+                        static_cast<unsigned long long>(rs.double_credit_blocked));
+            for (const std::uint64_t h : contested) {
+                const auto* cs = fc.race().candidates_at(h);
+                if (!cs) continue;
+                std::string line;
+                for (const auto& c : *cs)
+                    line += " " + c.bid.substr(0, 12) + (c.own ? "(ours)" : "(theirs)");
+                std::printf("    contested h=%llu:%s\n",
+                            static_cast<unsigned long long>(h), line.c_str());
+            }
+        }
         std::printf("  %s\n", rx.describe().c_str());
         const std::string g = sink.last();
         if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
@@ -587,6 +621,11 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
     ncfg.c2pool_commit        = C2POOL_VERSION;
     ncfg.ready_timeout_s      = cfg.native_ready_timeout_s;
     ncfg.backlog_refresh_s    = cfg.native_backlog_refresh_s;
+    // D-14 lever (1): what the fork choice adopts at EQUAL work at the same
+    // height. Same flag as the accounting tiebreak -- see xmr_same_height_race.hpp.
+    ncfg.fork_tie             = (cfg.same_height_tiebreak == SameHeightTieBreak::PreferOwn)
+                                    ? ::c2pool::xmr::native::TieBreak::PreferOwn
+                                    : ::c2pool::xmr::native::TieBreak::FirstSeen;
 
     std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned peer(s)) "
                 "feeds the option-B assembler%s\n",
@@ -665,7 +704,34 @@ static int run_live(const XmrNodeConfig& cfg) {
     o2::FoundBlockQueue found_q;
     o2::FinalizeConnectOptions fo;
     if (cfg.found_sidecar) fo.sidecar_path = cfg.resolved_settle_db_path() + "/pfound.tsv";
+    // c2pool#1551: the per-height verdict journal. Default it next to the
+    // settle store so that a multi-node run leaves one comparable file per node
+    // without the operator having to ask for it.
+    if (cfg.same_height_journal != "off")
+        fo.race_journal_path = cfg.same_height_journal.empty()
+                                   ? cfg.resolved_settle_db_path() + "/race.log"
+                                   : cfg.same_height_journal;
+    // Lever (2): the bounded prefer-own re-announce. Only the native levin
+    // relay can do it -- under daemon-first the block went out through
+    // monerod's submit_block and re-submitting a block monerod already has is
+    // a no-op, so the lever is simply absent there and the gate says so.
+    if (p2p_first && native && native->node() && native->node()->block_relay()) {
+        auto* relay = native->node()->block_relay();
+        fo.renotify = [relay](std::uint64_t height, const std::string& bid_hex) {
+            (void)height;
+            c2pool::xmr::node::Hash id{};
+            if (!o2::hash_from_hex(bid_hex, id)) return false;
+            std::size_t peers = 0;
+            return relay->renotify(id, &peers);
+        };
+    }
     o2::FinalizeConnect fc(node, cfg, found_q, fo);
+    std::printf("same-height policy: tiebreak=%s D_conf=%llu renotify<=%u journal=%s "
+                "| credit requires burial: YES  orphan-credit: NEVER  double-credit: BLOCKED\n",
+                to_string(cfg.same_height_tiebreak),
+                static_cast<unsigned long long>(cfg.d_conf),
+                cfg.same_height_renotify,
+                fo.race_journal_path.empty() ? "off" : fo.race_journal_path.c_str());
     {
         const auto boot = fc.reseed_after_bring_up();
         std::printf("finalize-connect: sidecar=%s reseeded=%zu reregistered=%zu stale=%zu "
@@ -847,6 +913,17 @@ static int run_live(const XmrNodeConfig& cfg) {
                         if (ev.block.height > tip_best) tip_best = ev.block.height;
                     }
                     node.pump_mainchain_event(ev);
+                }
+                // c2pool#1551: the candidates we HOLD but did not adopt. In the
+                // branch where our own block stays best the rival never becomes
+                // a mainchain event at all, so without this sweep the race book
+                // would report the height uncontested and credit as if we had
+                // run unopposed.
+                if (chain_src.alt_candidates) {
+                    std::vector<o2::FinalizeConnect::AltObservation> alts;
+                    for (const auto& a : chain_src.alt_candidates())
+                        alts.push_back(o2::FinalizeConnect::AltObservation{a.height, a.bid_hex, a.own_mined});
+                    fc.observe_alt_tips(alts);
                 }
             };
         }
@@ -1067,6 +1144,20 @@ int main(int argc, char** argv) {
         else if (a == "--lane-chain") cfg.lane_chain =
                      static_cast<::v37::ChainId>(std::stoul(next("0")));
         else if (a == "--d-conf") cfg.d_conf = std::stoull(next("60"));
+        // c2pool#1551: the same-height double-block tiebreak. One flag drives
+        // BOTH levers -- the fork choice's D-14 build-on rule and the
+        // accounting's nomination -- because two flags could disagree.
+        else if (a == "--same-height-tiebreak") {
+            const std::string m = next("prefer-own");
+            if (!parse_tie_break(m, cfg.same_height_tiebreak)) {
+                std::printf("REFUSED: --same-height-tiebreak takes prefer-own or first-seen, "
+                            "not \"%s\" (refusing rather than picking a side for you)\n", m.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--same-height-renotify") cfg.same_height_renotify =
+                     static_cast<std::uint32_t>(std::stoul(next("3")));
+        else if (a == "--same-height-journal") cfg.same_height_journal = next("");
         else if (a == "--data-dir") cfg.settle_db_path = next("");
         else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
         else if (a == "--randomx") cfg.randomx_enabled = true;
@@ -1078,6 +1169,13 @@ int main(int argc, char** argv) {
                 "  --network <stagenet|testnet|mainnet|regtest>   default stagenet\n"
                 "  --rpc-host <h>  --rpc-port <p>  --zmq-port <p>\n"
                 "  --lane-chain <id>  --d-conf <n>  --poll-ms <ms>  --status-every <s>\n"
+                "  --same-height-tiebreak <prefer-own|first-seen>   same-height race policy\n"
+                "                               (default prefer-own; drives BOTH the D-14 fork\n"
+                "                               choice and the settlement nomination)\n"
+                "  --same-height-renotify <n>   bounded re-announce of our own block on a\n"
+                "                               contested height (default 3; 0 = off)\n"
+                "  --same-height-journal <path|off>   per-height verdict journal\n"
+                "                               (default: race.log next to the settle store)\n"
                 "  --data-dir <path>            override the settlement store dir\n"
                 "  --no-found-sidecar           do not persist pending FOUNDs across restarts\n"
                 "  --i-understand-mainnet       required to settle a mainnet block\n"

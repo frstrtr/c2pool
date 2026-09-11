@@ -128,6 +128,12 @@ struct NativeTemplateConfig {
 
     // How long start_and_wait() gives the node to reach a ready native arm.
     std::uint32_t            ready_timeout_s = 120;
+
+    // D-14 / c2pool#1551: the fork choice's rule at EQUAL cumulative difficulty
+    // at the same height. Driven from the same --same-height-tiebreak flag the
+    // settlement accounting reads, so "what we build on" and "what we nominate"
+    // cannot be configured apart.
+    native::TieBreak         fork_tie = native::TieBreak::PreferOwn;
 };
 
 class NativeTemplateBackend {
@@ -159,6 +165,7 @@ public:
         nc.template_fallback    = cfg_.fallback;
         nc.force_synced         = cfg_.force_synced;
         nc.backlog_refresh_s    = cfg_.backlog_refresh_s;
+        nc.fork_tie             = cfg_.fork_tie;
 
         node_ = std::make_unique<nrt::NativeNode>(std::move(nc));
         if (!node_->start(why)) { node_.reset(); return false; }

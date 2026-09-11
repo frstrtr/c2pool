@@ -228,6 +228,14 @@ struct NativeNodeConfig {
     // --arm-order p2p-first, where the daemon is not consulted at all.
     ArmOrder                 relay_order = ArmOrder::DaemonFirst;
 
+    // D-14, c2pool#1551: what the fork choice does at EQUAL cumulative
+    // difficulty at the same height. PreferOwn adopts our own block (the
+    // default, and the "what we build on" lever of the prefer-own rule);
+    // FirstSeen is monerod's rule and is what a parity run compares against.
+    // The consumer drives this from the SAME --same-height-tiebreak flag the
+    // settlement accounting reads, so the two can never disagree.
+    TieBreak                 fork_tie = TieBreak::PreferOwn;
+
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
     // SyncDriverConfig::probe_only.
@@ -712,6 +720,7 @@ private:
     ChainIndexOptions make_index_options_() const {
         ChainIndexOptions o;
         o.net = nets_.consensus;
+        o.tie = cfg_.fork_tie;          // D-14, driven by --same-height-tiebreak
         return o;
     }
 

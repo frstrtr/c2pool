@@ -627,6 +627,28 @@ public:
     std::uint64_t bans() const { std::lock_guard<std::mutex> lk(mu_); return bans_; }
     std::uint64_t orphans_parked() const { std::lock_guard<std::mutex> lk(mu_); return orphans_; }
     std::size_t   alt_size() const { std::lock_guard<std::mutex> lk(mu_); return alt_.size(); }
+
+    // c2pool#1551: the same-height candidates this node HOLDS but has not
+    // adopted. The settlement accounting above needs them to see a race at all
+    // -- in the branch where our own block stays best, the rival produces no
+    // mainchain event, and an accounting layer fed only by that stream would
+    // credit as if the height had been uncontested.
+    struct AltTip {
+        Hash          id{};
+        Hash          prev_id{};
+        std::uint64_t height    = 0;
+        bool          own_mined = false;
+        bool          resolved  = false;   // difficulty computed on its own branch
+    };
+    std::vector<AltTip> alt_tips() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<AltTip> out;
+        out.reserve(alt_.size());
+        alt_.for_each([&out](const AltBlock& b) {
+            out.push_back(AltTip{b.id, b.prev_id, b.height, b.own_mined, b.resolved});
+        });
+        return out;
+    }
     PowGate&      pow_gate() noexcept { return gate_; }
 
     // Ids the index wants fetched: what a chain entry told us we are missing,
