@@ -7195,7 +7195,15 @@ nlohmann::json MiningInterface::rest_pplns_current()
         if (tip.size() > 16) tip = tip.substr(0, 16);
         out["tip"]          = tip;
         out["window_size"]  = chain_length > 0 ? chain_length : 4320;
-        out["coin"]         = blockchain_short_symbol(m_blockchain);
+        // Label-aware coin symbol: a BCH / NMC / BIP110 node shares the
+        // BITCOIN enum and must report its own coin, not "BTC"
+        // (blockchain_short_symbol is enum-only). node_symbol() resolves the
+        // configured label via the coin registry; keep the enum symbol as the
+        // fallback for an unlabelled node.
+        std::string coin_sym = node_symbol();
+        out["coin"]         = coin_sym.empty()
+                                  ? std::string(blockchain_short_symbol(m_blockchain))
+                                  : coin_sym;
     }
     out["computed_at"]    = static_cast<int64_t>(std::time(nullptr));
     out["schema_version"] = "1.0";
