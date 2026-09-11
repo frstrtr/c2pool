@@ -214,7 +214,9 @@ C2c question; that the SCHEDULE must not be a busy loop is this file's.
   them yet: that is M2.
 * **C3's txpool** is fed from levin and selectable, and its chain-event
   subscription (mined-id drop, key-image eviction, rollback re-admission) is
-  wired; proving per-transaction equality against monerod's own pool is M1.
+  wired. Proving per-transaction equality against monerod's own pool is M1, and
+  the M1 section below is where that happened -- including the wiring gap M0
+  left behind it.
 * **Anchor boot** (`--boot anchor`) is wired and is the production path, but M0
   ran on the genesis path because a fresh regtest chain is younger than the
   anchor format can describe (`generate_anchor` refuses any height below the
@@ -223,6 +225,178 @@ C2c question; that the SCHEDULE must not be a busy loop is this file's.
 
 Each of those is wired to its seam and left unexercised ON PURPOSE, so the
 milestone that owns it has something to prove rather than something to discover.
+
+## M1 — the transaction pool, per transaction, against monerod
+
+M0 proved the node follows a tip. M1 proves the thing a template is actually
+built out of: that for every transaction in both pools, `{id, weight, fee,
+blob_size}` is the same number on both sides — with our side computed by C3
+from bytes that arrived over levin `NOTIFY_NEW_TRANSACTIONS`, and monerod's
+side the daemon's own answer to `get_transaction_pool`. Nothing in our number
+came from the daemon.
+
+### What M1 added
+
+| what | where |
+|---|---|
+| the **P-POOL seam** — per-transaction comparison, set differences as measurements, and the cumulative coverage claim | `parity/xmr_txpool_parity.hpp` |
+| `ProbeKind::Pool` and the frozen `POOL_FIELDS` table, comparator version **1 → 2** | `contracts/parity.hpp`, `parity/xmr_parity_types.hpp` |
+| `RelayedTxPool::facts()` — the whole pool as four numbers per entry, under one lock | `txpool/xmr_relayed_txpool.*` |
+| `NativeNode::txpool_parity_sample()` and the harness injection port `inject_relayed()` | `node/xmr_native_node.hpp` |
+| `publish_tx_gate_()` — **the defect below** | `node/xmr_native_node.hpp` |
+| `--txpool-parity`, `--inject-dir`, the M1 gate flags and the `M1-VERDICT` line | `node/tools/xmr_native_node_main.cpp` |
+| the offline replay KAT and its captured daemon response | `test/xmr_txpool_parity_kat.cpp`, `test/xmr_txpool_parity_golden.hpp` |
+
+### The defect M1 found
+
+**C3's relay gate was never opened.** `RelayedTxPool` refuses every transaction
+with `NotSynced` until somebody tells it the index reached the tip — monerod's
+`is_synchronized()` rule, fail-closed so that a node catching up cannot build a
+template on a pool it could not have populated correctly. M0 wired C2 → C3 for
+BLOCK events and left this seam open: nothing in the tree called
+`set_synced()`, so the gate stayed shut for the life of the process and the
+pool refused every transaction that ever reached it.
+
+It is invisible from every angle M0 looked from. The tip follows. The peer is
+healthy. The status line's `txs=` counts frames coming IN, and they do. The only
+symptom is a pool that stays empty, which on a quiet chain is also what success
+looks like. M1 is the first milestone that asks the pool what it HOLDS, which is
+why M1 is where it surfaced. Fixed by `publish_tx_gate_()`, published from the
+verify thread (which owns the sync state) to the pool thread (which owns the
+gate) on a change only; the status line now carries `txpool: gate=` beside the
+counts, so the shut-gate state can never again look like a quiet chain.
+
+### The run (regtest, 2026-09-11)
+
+Two isolated `monerod 0.18.5.1 --regtest --fixed-difficulty 1` daemons on
+loopback with their own data dirs and ports (42188/42189 and 42288/42289), the
+node dialling from a third loopback address, and a `monero-wallet-rpc` against
+the first daemon as the transaction SOURCE — real wallet transactions, signed
+and relayed the ordinary way, never handed to the node directly.
+
+```bash
+xmr_native_node --net regtest --connect 127.0.0.1:42188 --p2p-bind-ip 127.0.0.3 \
+                --monerod-rpc 127.0.0.1:42189 --force-synced \
+                --txpool-parity --txpool-parity-every 1000 \
+                --m1-min-txs 50 --m1-require-mined-eviction --run-seconds 600
+```
+
+```
+=== M1: txpool parity (P-POOL) ===
+samples        : judged=582 unjudged=14 aligned=471 no-samples=452 (polls=596)
+transactions   : distinct_compared=67 daemon_ids_seen=67 never_compared=0 | pool_max ours=26 theirs=26
+per-tx verdicts: clean=1368 fail=0 served_mismatch=0 void=0
+fields         : compared=4104 equal=4104 differed=0 absent=0
+evictions      : mined=67 key_image_conflict=0
+txpool         : count=0 bytes=0 accepted=67 duplicates=0 rejected=0 evicted(age=0 cap=0)
+dos            : frames_in=45 dropped=4
+M1-VERDICT: PASS txs_compared=67 all_equal=1 fields=4104/4104 mined_evictions=67 never_compared=0
+M0-VERDICT: PASS heights=171 parity_clean=9 parity_fail=0 randomx_foreign=0
+```
+
+Read the numbers that matter:
+
+* **67 distinct transactions, 4104 field comparisons, 0 differences and 0
+  absences.** Three fields per transaction per sample, 1368 per-transaction
+  CLEAN verdicts across 582 judged samples.
+* **`never_compared=0`.** This is the line that stops the seam being vacuous.
+  The intersection is what gets judged and the set differences are measurements,
+  so a probe could report "all clean" over an intersection that was always
+  empty. The tally therefore remembers every id the DAEMON's pool ever held and
+  every id actually compared; `never_compared` is the difference, and it is a
+  gate. Every transaction the daemon ever pooled was compared, field by field.
+* **`aligned=471`.** Samples where the two pools held the same SET of ids, not
+  merely agreeing about their overlap.
+* **`no-samples=452` is not a pass and is not counted as one.** Most of a run is
+  two empty pools between blocks; those samples are judged, contribute nothing,
+  and are reported separately so nobody can read them as agreement.
+* **`mined=67`.** Every transaction left the native pool because the block that
+  mined it connected — four `[M1-EVICT]` lines, one per block, each naming what
+  left and matching the pool's own `evicted_mined` counter. A counter with no id
+  behind it names nothing; an id that vanished with no counter behind it could
+  have gone for size or age. The proof needs both and has both.
+* **`dos: frames_in=45 dropped=4`.** The C1 token buckets fired during the run,
+  on a daemon re-relaying transactions we already held, and the drops cost the
+  parity claim nothing: all 67 ids were still compared. The buckets held.
+
+### The key-image conflict, on purpose
+
+A mined eviction is easy to observe because the chain produces one every block.
+A KEY-IMAGE-CONFLICT eviction — an entry dropped because a block spent its key
+image inside a DIFFERENT transaction — needs a double spend, and a daemon will
+not make one for you. So M1 builds one, out of a transaction a real wallet
+really signed:
+
+1. the wallet builds a transaction with `do_not_relay`, so the daemon never
+   hears about it;
+2. the harness is handed its blob as `<inject-dir>/x.twin` and injects the
+   **key-image twin** — the same bytes with one byte of `tx_extra` flipped,
+   which leaves every key image, every commitment and the range proof untouched
+   while changing the id. The flip is done with C3's own decoder, because only a
+   parse knows where `tx_extra` begins. The twin is admitted; now OUR pool holds
+   the twin and the daemon's pool holds nothing;
+3. the ORIGINAL is handed to the daemon with `send_raw_transaction`, which
+   relays it to us over levin. C3 refuses it as a `KeyImageConflict` with
+   `drop_offense=0` — first-seen-wins, exactly as monerod's
+   `have_tx_keyimges_as_spent` keeps the first and marks the second a no-drop
+   double spend;
+4. the daemon mines a block containing the ORIGINAL. Our pool holds the twin,
+   whose id is nowhere in that block — so it leaves by KEY IMAGE, and the pool
+   accounts for it as `evicted_conflict`, not as mined.
+
+The run, at heights 174 → 175:
+
+```
+[M1-INJECT] conflict.twin: injecting the KEY-IMAGE TWIN of the blob
+            (one tx_extra byte flipped; same key images, new id)
+[M1-INJECT] conflict.twin bytes=2166 verdict=Accepted drop_offense=0
+            id=33a99d6b796fad97776b75697fbec1982a313da3b59a6ca0929e7eb6bd37c8b1
+[M1-EVICT]  h=174->175 left_pool=1 mined=0 conflict=1 ids=33a99d6b796fad97
+
+evictions   : mined=0 key_image_conflict=1
+conflicts   : rejected_key_image=1 (of which injected=0) | injected=1 accepted=1
+scope       : SCENARIO run -- parity coverage is NOT claimed (--m1-min-txs 0);
+              the verdict rests on the required eviction(s)
+M1-VERDICT: PASS conflict_evictions=1 never_compared=1
+```
+
+The daemon's original was `51595e6c…`, which never appears in our pool. Read the
+three lines that make it a proof rather than a story:
+
+* `rejected_key_image=1 (of which injected=0)` — the refusal happened to a
+  transaction that arrived over LEVIN, not to one the harness handed in. That is
+  first-seen-wins working against the network, and it is broken out of the
+  general `rejected` counter precisely so it can be pointed at.
+* `mined=0 conflict=1` — the twin did not leave because it was mined. Its id is
+  nowhere in block 175. It left because that block spent its key image inside a
+  transaction we never held.
+* `left_pool=1` beside `conflict=1` — the set difference and the pool's own
+  accounting agree about the same single entry.
+
+That window is a DELIBERATE divergence: for the length of it the daemon holds an
+id we will never hold. The run declares exactly that in its own arguments,
+`--m1-allow-uncompared 1`, and `--m1-min-txs 0` makes it a SCENARIO run: parity
+coverage is not claimed at all, the verdict rests on `no_disagreement()` plus the
+eviction the run explicitly required, and a scenario that required no eviction
+FAILS rather than passing for free. Every parity run passes zero allowance.
+
+### Coverage, and what this run is not
+
+The plan's M1 exit criterion is 100 % per-transaction equality over **≥10 000**
+relayed transactions on stagenet, plus a ≥720-block
+`already_generated_coins` / `median_weight` streak. This is the REGTEST proof of
+the same claim at two orders of magnitude less volume: the mechanism, the
+comparator, the coverage gate and both evictions, on a chain we control end to
+end. The volume and the streak need stagenet, a host and days, and that is an
+operator call about where the soak runs — the same call M0's P-TIP soak is
+waiting on.
+
+What runs in CI is the OFFLINE REPLAY: a real daemon's `get_transaction_pool`
+answer is checked in, the KAT feeds each entry's `tx_blob` into a real
+`RelayedTxPool` through `IRelayedTxSink`, and the same `compare_txpools` judges
+the two sides. Every native number is recomputed at test time from the
+transaction bytes; every monerod number is one the daemon printed. Perturb a
+weight, a fee or a size and the KAT fails, which is the point.
 
 ## Owed operator calls
 

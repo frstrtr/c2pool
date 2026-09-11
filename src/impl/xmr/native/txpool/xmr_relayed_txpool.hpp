@@ -160,6 +160,28 @@ struct RelayedTx {
     }
 };
 
+// --- what one entry looks like to a parity probe ----------------------------
+// The four numbers monerod's get_transaction_pool reports per transaction, plus
+// the two the daemon has no equivalent of and which are therefore measurements
+// rather than comparisons.
+//
+// This is its own type rather than a read off RelayedTx for one reason:
+// RelayedTx carries the BLOB, and a probe that runs every couple of seconds
+// must not copy the pool's bytes to ask four questions about them. A facts()
+// snapshot is O(entries), not O(pool bytes), and it is taken under the one
+// mutex, so the set it describes is a set the pool actually held at one
+// instant. An id list plus a lookup() per id would describe a pool that never
+// existed -- exactly the kind of artefact a parity claim must not rest on.
+struct TxpoolFact {
+    Hash              id{};
+    std::uint64_t     weight    = 0;
+    std::uint64_t     fee       = 0;
+    std::uint64_t     blob_size = 0;
+    AdmissionEvidence evidence  = AdmissionEvidence::None;
+    std::uint32_t     peers     = 0;
+    std::uint64_t     time_received = 0;
+};
+
 struct TxpoolStats {
     std::uint64_t count            = 0;
     std::uint64_t bytes            = 0;
@@ -173,6 +195,14 @@ struct TxpoolStats {
     std::uint64_t evicted_cap      = 0;
     std::uint64_t evicted_mined    = 0;
     std::uint64_t evicted_conflict = 0;
+    // A relayed transaction refused because a pool entry already owns one of
+    // its key images -- first-seen-wins, monerod's no-drop double spend. It is
+    // broken out of `rejected` because it is the only refusal reason that says
+    // something about the NETWORK rather than about the sender's competence,
+    // and because it is what the M1 key-image-conflict proof has to be able to
+    // point at: the rejection and the eviction are two different events and a
+    // single `rejected` counter cannot tell them apart.
+    std::uint64_t rejected_key_image_conflict = 0;
 };
 
 // --- the pool ----------------------------------------------------------------
@@ -226,6 +256,11 @@ public:
 
     // --- introspection (dashboard, KATs, C6 parity probe) -------------------
     TxpoolStats stats() const;
+    // EVERY entry, whatever the select policy would make of it. A parity probe
+    // must see the pool, not the selection: an entry the policy filters out is
+    // still an entry monerod's pool will report, and comparing only what we
+    // would mine would hide every disagreement about what we hold.
+    std::vector<TxpoolFact> facts() const;
     bool        contains(const Hash& id) const;
     bool        lookup(const Hash& id, RelayedTx& out) const;
     std::size_t size() const;

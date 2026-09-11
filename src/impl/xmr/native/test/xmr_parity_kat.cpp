@@ -359,7 +359,14 @@ void suite_absence() {
 void suite_table() {
     std::printf("== B. the frozen determinism table (comparator v%u) ==\n", COMPARATOR_VERSION);
 
-    CHECK(COMPARATOR_VERSION == 1, "comparator version is 1");
+    // Version 2 since M1 added the P-POOL seam to the table set. This stays an
+    // EXACT number rather than a floor on purpose: its whole job is to make
+    // anyone who edits a table move the ledger key too, so that a clean streak
+    // can never be inherited across a change to what is compared.
+    CHECK(COMPARATOR_VERSION == 2, "comparator version is 2 (P-POOL joined the table set)");
+    CHECK(POOL_SEAM.required_equality_count() == 3,
+          "POOL requires 3 EQUALITY fields (weight, fee, blob_size), got %zu",
+          POOL_SEAM.required_equality_count());
     CHECK(TIP_SEAM.required_equality_count() == 9,
           "TIP requires 9 EQUALITY fields (id, prev_id, cumdiff, difficulty, timestamp, "
           "reward, block_weight, long_term_weight, major_version), got %zu",

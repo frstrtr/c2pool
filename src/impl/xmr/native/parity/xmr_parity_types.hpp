@@ -49,7 +49,12 @@ namespace c2pool::xmr::native::parity {
 // comparison rules: the graduation ledger is keyed on this number precisely so
 // that a new comparator can never inherit an old comparator's clean streak.
 // ---------------------------------------------------------------------------
-inline constexpr std::uint32_t COMPARATOR_VERSION = 1;
+// Version 2 (M1): the P-POOL seam joined the table set. Nothing in the P-TIP,
+// P-TPL or P-SUB tables changed, and the bump is not about them -- it is about
+// the LEDGER KEY. A run graduated by a comparator that never asked what the
+// transaction pool held is not evidence about a comparator that does, so the
+// key moves and every streak starts again.
+inline constexpr std::uint32_t COMPARATOR_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // Regimes -- how a field is judged. Named after the plan's determinism table.
@@ -89,6 +94,7 @@ inline const char* to_string(ProbeKind k) noexcept {
         case ProbeKind::Tip:      return "TIP";
         case ProbeKind::Template: return "TEMPLATE";
         case ProbeKind::Submit:   return "SUBMIT";
+        case ProbeKind::Pool:     return "POOL";
     }
     return "?";
 }
@@ -303,18 +309,58 @@ inline constexpr FieldSpec SUBMIT_FIELDS[] = {
     {"p2p_peers_sent",   Regime::Measurement,  false, false},
 };
 
+// --- P-POOL -----------------------------------------------------------------
+// ONE TRANSACTION, held by both pools, as each side measured it.
+//
+// The alignment key is the transaction id, and it is the reason the other three
+// fields mean anything. A Monero transaction id is the triple hash over the
+// three measured byte spans that make up the whole blob, so two pools that
+// report the same id are holding the same bytes -- which turns "weight, fee and
+// blob_size agree" from three coincidences into three INDEPENDENT DERIVATIONS
+// from one input agreeing. That is the claim M1 exists to make: the native pool
+// does monerod's arithmetic, over the wire, without asking it.
+//
+//   * weight is the one that can actually be got wrong. It is not a length: for
+//     a Bulletproof+ transaction it is the blob size plus a clawback term over
+//     the padded proof size, and it is what the block-weight limit and the fee
+//     are denominated in. A wrong weight is a wrong template.
+//   * fee is read out of the rct base, not out of any field a sender supplies.
+//   * blob_size is the cheap one and is here precisely because it is cheap: a
+//     weight that agrees while the size does not would mean the two sides are
+//     measuring different bytes under the same id, which is the one failure the
+//     id-as-key argument above cannot see by itself.
+//
+// Both weight and fee are SENTINELS: they are what the assembler selects and
+// pays on, so a single disagreement is not a sample to be averaged away, it is
+// a reason to stop trusting the pool.
+//
+// pool_size / peers / evidence are MEASUREMENTS. The set differences do not
+// appear here at all; they belong to the set comparison that produced the
+// sample, not to the transaction.
+inline constexpr FieldSpec POOL_FIELDS[] = {
+    {"tx_id",     Regime::AlignmentKey, false, false},
+    {"weight",    Regime::Equality,     true,  true },
+    {"fee",       Regime::Equality,     true,  true },
+    {"blob_size", Regime::Equality,     true,  false},
+    {"peers",     Regime::Measurement,  false, false},
+    {"evidence",  Regime::Measurement,  false, false},
+};
+
 inline constexpr SeamSpec TIP_SEAM{ProbeKind::Tip, TIP_FIELDS,
                                    sizeof(TIP_FIELDS) / sizeof(TIP_FIELDS[0])};
 inline constexpr SeamSpec TEMPLATE_SEAM{ProbeKind::Template, TEMPLATE_FIELDS,
                                         sizeof(TEMPLATE_FIELDS) / sizeof(TEMPLATE_FIELDS[0])};
 inline constexpr SeamSpec SUBMIT_SEAM{ProbeKind::Submit, SUBMIT_FIELDS,
                                       sizeof(SUBMIT_FIELDS) / sizeof(SUBMIT_FIELDS[0])};
+inline constexpr SeamSpec POOL_SEAM{ProbeKind::Pool, POOL_FIELDS,
+                                    sizeof(POOL_FIELDS) / sizeof(POOL_FIELDS[0])};
 
 inline const SeamSpec& seam_spec(ProbeKind k) {
     switch (k) {
         case ProbeKind::Tip:      return TIP_SEAM;
         case ProbeKind::Template: return TEMPLATE_SEAM;
         case ProbeKind::Submit:   return SUBMIT_SEAM;
+        case ProbeKind::Pool:     return POOL_SEAM;
     }
     return TIP_SEAM;
 }

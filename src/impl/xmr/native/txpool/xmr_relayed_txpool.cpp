@@ -212,6 +212,7 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     for (const Hash& ki : d.rct.key_images) {
         if (ki_owners_.find(ki) != ki_owners_.end()) {
             ++stats_.rejected;
+            ++stats_.rejected_key_image_conflict;
             return verdict(Reason::KeyImageConflict, false, d.id, evidence);
         }
     }
@@ -518,6 +519,24 @@ TxpoolStats RelayedTxPool::stats() const {
     }
     s.pinned_templates = pins_.size();
     return s;
+}
+
+std::vector<TxpoolFact> RelayedTxPool::facts() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<TxpoolFact> out;
+    out.reserve(by_id_.size());
+    for (const auto& [id, e] : by_id_) {
+        TxpoolFact f;
+        f.id            = id;
+        f.weight        = e.weight;
+        f.fee           = e.fee;
+        f.blob_size     = e.blob_size;
+        f.evidence      = e.evidence;
+        f.peers         = e.seen_from_peers();
+        f.time_received = e.time_received;
+        out.push_back(f);
+    }
+    return out;
 }
 
 bool RelayedTxPool::contains(const Hash& id) const {

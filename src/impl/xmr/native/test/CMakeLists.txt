@@ -437,6 +437,40 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_native_parity_kat COMMAND xmr_native_parity_kat)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # M1 / C3 + C6: the P-POOL seam (../parity/xmr_txpool_parity.hpp).
+    #
+    #   xmr_native_txpool_parity_kat -- the OFFLINE REPLAY of the live M1 run.
+    #     A real monerod's /get_transaction_pool answer is checked in
+    #     (xmr_txpool_parity_golden.hpp, captured from the isolated regtest
+    #     rig); the KAT parses it with the same MonerodTxpoolRpc the live probe
+    #     uses, feeds every entry's tx_blob into a real RelayedTxPool through
+    #     IRelayedTxSink, and runs the same compare_txpools over the two sides.
+    #     Every {weight, fee, blob_size} on the native side is recomputed here,
+    #     now, by C3's decoder; every one on the daemon side is a number a real
+    #     daemon printed. It also pins the judgement itself -- a perturbed
+    #     weight, fee or size FAILS, an unanswered required field FAILS rather
+    #     than being skipped, and disjoint pools produce NO samples rather than
+    #     agreement -- plus the coverage tally that makes an uncompared daemon
+    #     id visible, eviction as the probe observes it (mined, and key-image
+    #     conflict), and the C1 DoS buckets absorbing a transaction-relay flood
+    #     without the pool admitting a frame the guard refused.
+    #
+    #     Links `xmr_native_txpool` only: no RandomX, no network, no monerod.
+    #
+    # Same drift-guard rule as every target above: it is added to BOTH
+    # `--target` lists in .github/workflows/build.yml by the change that adds it
+    # here, because a registered-but-unbuilt target reports "***Not Run" and
+    # fails ctest (the #1539 lesson).
+    # ─────────────────────────────────────────────────────────────────────────
+    add_executable(xmr_native_txpool_parity_kat xmr_txpool_parity_kat.cpp)
+    target_include_directories(xmr_native_txpool_parity_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_txpool_parity_kat PRIVATE xmr_native_txpool)
+    target_compile_features(xmr_native_txpool_parity_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_native_txpool_parity_kat COMMAND xmr_native_txpool_parity_kat)
+
     add_executable(xmr_native_template_coinbase_kat
         xmr_native_template_coinbase_kat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../settle/xmr_coinbase.cpp)
