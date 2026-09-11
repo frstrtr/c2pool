@@ -1073,7 +1073,27 @@ jobs:
       run:
         working-directory: web-static/sharechain-explorer
     steps:
+      # Pin to the PR head commit (push-event fallback to github.sha).
+      # The default checkout resolves refs/pull/N/merge asynchronously, so it
+      # can materialize a merge tree neither this PR nor master ever had — the
+      # wrong-tree race behind #1571s 20s web-static aborts. Pinning to
+      # head.sha removes the race: we always build the exact PR head.
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      # For an observability defect the check IS the fix: fail closed if the
+      # checked-out HEAD is ever not the head we asked for.
+      - name: Assert checkout matches expected head SHA (fail closed)
+        working-directory: ${{ github.workspace }}
+        run: |
+          expected='${{ github.event.pull_request.head.sha || github.sha }}'
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error title=Checkout integrity::checked-out HEAD ${actual} != expected head ${expected} — broken/stale merge-ref, not a code defect." >&2
+            exit 1
+          fi
+          echo "checkout verified: HEAD=${actual} matches expected head"
 
       - uses: actions/setup-node@v5
         with:
