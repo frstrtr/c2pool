@@ -76,11 +76,15 @@ peer at once.
 | `p2pool_observer.hpp` | sessions and the poll loop, in three drivable phases |
 | `p2pool_multiwatch.hpp` | three observers through **one** `poll()`, plus the terminal |
 | `p2pool_tui.hpp` | the frame: a pure function from three read models to text |
+| `p2pool_freshness.hpp` | the per-chain staleness clock and the seven liveness words |
+| `p2pool_state.hpp` | the state-file format: frame → JSON → frame, exact |
+| `p2pool_persist.hpp` | the syscalls: atomic save, the directory lock, the journal |
 | `tools/p2pool_observer_main.cpp` | the live single-chain harness |
-| `tools/p2pool_monitor_main.cpp` | the live all-in-one monitor: fullscreen TUI and `--snapshot` |
+| `tools/p2pool_monitor_main.cpp` | the live all-in-one monitor: fullscreen TUI, `--snapshot`, `--read` |
 | `test/p2pool_parse_kat.cpp` | the parser KAT, over two real captured frames |
-| `test/p2pool_monitor_kat.cpp` | the render KAT: a golden frame and the emit-set pin |
+| `test/p2pool_monitor_kat.cpp` | the render KAT: a golden frame, the emit-set pin, absence-vs-zero, the codec |
 | `test/p2pool_monitor_golden.inc` | that golden frame, one C string per line — readable as a picture |
+| `test/p2pool_persist_kat.cpp` | the durability KAT: fork, save, `SIGKILL`, read every number back |
 | `test/gen_p2pool_golden.py` | independent Python reading that generates the golden's expected values |
 
 Everything is header-only STL over two things the repository already has:
@@ -189,6 +193,7 @@ process, on one screen.
 xmr_p2pool_monitor                          fullscreen, all three chains
 xmr_p2pool_monitor --chains mini,nano       two of them
 xmr_p2pool_monitor --snapshot --seconds 90  one plain-text frame to stdout
+xmr_p2pool_monitor --read                   the SAVED state, rendered, dialling nothing
 ```
 
 ### One `poll()`, three chains, no threads
@@ -267,6 +272,107 @@ printing a number, the pulse shows the individual gaps because a mean hides the
 difference between a steady beat and a stall between bursts, and `monero tpl` is
 labelled a template height — deciding that a sidechain block cleared Monero's
 target needs a Monero PoW target this observer does not hold.
+
+### Absence is not zero
+
+A dashboard's worst failure is silent: the source dies, the counter stops, and
+the panel keeps printing the last number — or a zero — in the same font a live
+one uses. `peers 0, blocks 0` on a chain that is fine but that **we** are no
+longer connected to is indistinguishable, on an ordinary dashboard, from "the
+chain is quiet". So zero is reserved here for a measurement that came out zero,
+and every figure carries one of two things beside it:
+
+* a **liveness word and an age** — how long ago the fact was established, or
+* a literal `--`, meaning *we have no basis for a number here*.
+
+`p2pool_freshness.hpp` holds the clock and the seven words the monitor is
+allowed to use. Four of them described the warm-up of a connection and could not
+describe a connection that was healthy and stopped being healthy; three more are
+that case:
+
+| word | what it means | clock |
+|---|---|---|
+| `DARK` | never connected, nothing in flight | since this session started |
+| `DIAL` | sockets in flight, no handshake yet | since this session started |
+| `DOWN` | we **had** peers on this chain and now have none | since the last peer went |
+| `WARM` | handshaken and receiving, fewer than two live heights | since the tip moved |
+| `QUIET` | tip has not moved for longer than variance explains | since the tip moved |
+| `STALE` | tip has not moved for so long the panel is not current | since the tip moved |
+| `LIVE` | handshaken, timing the chain, tip moving | — |
+
+`QUIET` and `STALE` are two thresholds on **one** clock — the last time the tip
+*height increased*. A duplicate, a backfilled parent or a peer-list does not
+touch it, because none of those is evidence that the chain is advancing. The
+thresholds are multiples of the chain's own target block time with a floor,
+because a sidechain arrival is close to Poisson and a fixed 30-second threshold
+would cry wolf several times an hour: at the defaults a 10-second chain goes
+`QUIET` at 60 s and `STALE` at 180 s, a 30-second chain at 120 s and 360 s.
+
+A degraded panel gets a `!` row above its figures saying what stopped and how
+old the rest of the panel is, and the header carries a **coverage** row —
+`2/3 reporting` — beside every three-chain total, because an aggregate over a
+dead source is arithmetically right and editorially false. Dropping the dead
+chain from the sum would hide it; stating the coverage does not.
+
+Peer counts are **not** dashed: `0 up` is a measurement — we looked at our own
+socket table — and it is paired with the word that says what it means. Block
+counts beside it are dashed, because a model holding nothing has not counted
+zero duplicates, it has counted nothing.
+
+### The numbers survive the process
+
+Everything the observer learns lived in memory, which means a six-hour watch
+that is killed at hour five produced nothing at all — and `--snapshot`, the mode
+actually left running overnight, prints its one frame at the *end*. The rare
+observation this component exists to make (a race, a stall, a chain going dark
+at 4am) is exactly the one a session-lifetime memory loses.
+
+So the monitor writes what it knows to `~/p2pmon-state/` on a timer in **both**
+modes and reads it back at start-up:
+
+```
+p2pmon-state.json      the latest complete snapshot — what is read back on start
+p2pmon-history.jsonl   an append-only digest, one line per save, for tailing
+p2pmon-history.jsonl.1 one rotated generation
+.lock                  flock; a second monitor runs with persistence OFF
+```
+
+Four properties carry the design:
+
+* **Never half-written.** A save is: write a temp file in the same directory,
+  `fdatasync`, `rename()` over the real name, `fsync` the directory. Every
+  reader — including the next run — sees either the whole previous state or the
+  whole new one, at every instant. A torn file that parses as *plausible*
+  garbage would be worse than no file, in a component whose entire point is not
+  lying.
+* **Every time is absolute.** "The tip last moved 40 s ago" becomes false while
+  the file sits on disk; "the tip last moved at 1757620000123" stays true, and
+  is turned back into an age against the *current* clock when it is read. That
+  one rule is why a day-old file renders as `STALE` with the age spelled out
+  rather than as a healthy chain.
+* **The file cannot disagree with the screen.** `MonitorState` is built from the
+  same `tui::MonitorFrame` the renderer draws, at the same instant — not from a
+  second pass over the read models.
+* **It degrades, never breaks.** No `HOME`, an unwritable directory, a full
+  disk, another monitor holding the lock: each turns persistence off (or counts
+  an error) and says so on the header row, and the poll loop carries on. There
+  is deliberately **no** `/tmp` fallback: a state file that a reboot deletes is
+  the exact outcome — numbers an operator believes are durable and are not —
+  that the whole feature exists to prevent.
+
+`--read` renders a saved state through the same renderer with no socket opened,
+under a `RESTORED FRAME` banner and a `[FROM FILE 10s OLD]` marker on every
+panel. Exact numbers survive: difficulty and cumulative difficulty are written
+as decimal **strings** and read back through a 128-bit accumulator, because a
+JSON double loses the low bits of a cumulative difficulty and comes back
+plausible. The derived hashrate is written for external readers and recomputed
+on load, so a restored panel and a live one cannot round differently.
+
+`xmr_p2pool_persist_kat` makes the operational claim operationally: it forks a
+child, has it save a state, kills it with **`SIGKILL`** — no unwinding, no
+`atexit`, no flush — and reads every number back in the parent. The absence of
+the `"shutdown":"clean"` marker is how a killed session is recognised on the
+next start.
 
 ### What the live runs found
 

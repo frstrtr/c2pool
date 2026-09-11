@@ -18,7 +18,7 @@
 // a golden embedded below. Any change to a label, a column, a unit or a
 // rounding rule is a diff a reviewer must look at on purpose.
 //
-// Four things are checked, in the order they matter:
+// Seven things are checked, in the order they matter:
 //
 //   1. THE EMIT SET IS STILL {0, 1, 3, 6}. Re-asserted here, independently of
 //      the parser KAT, because this component adds a second binary that dials
@@ -32,9 +32,25 @@
 //   4. THE HONESTY RULES SURVIVE THE DISPLAY: a model holding only backfilled
 //      heights renders "warming", never a cadence figure -- the display must
 //      not launder the artefact the read model refuses to report.
+//   5. ABSENCE IS NOT ZERO. A second fixture holds one LIVE chain, one STALE
+//      chain and one DOWN chain that has never received a block, and the KAT
+//      asserts that the dead chain's panel contains `--` where a live panel
+//      holds a number and contains NO zero-valued figure at all -- because a
+//      zero there is the one rendering that reads as a measurement and is not.
+//      The two live chains are asserted to be unaffected in the same frame.
+//   6. THE LIVENESS LADDER. classify() is driven through all seven states with
+//      fixed inputs, so the thresholds and the precedence order (no peers
+//      outranks tip age; STALE outranks a computable cadence) are pinned rather
+//      than described.
+//   7. THE STATE CODEC ROUND-TRIPS. A frame is turned into a MonitorState, that
+//      into JSON, that back into a MonitorState, and every number is compared.
+//      The FILESYSTEM half of persistence -- atomic rename, the lock, the
+//      journal, surviving a kill -- is xmr_p2pool_persist_kat, because it needs
+//      POSIX and this KAT deliberately does not.
 //
 // Run with `--emit-golden` to print the frame the fixture produces; that is how
 // the golden below was generated, and how it is regenerated on purpose.
+// `--show` prints the live fixture and `--show-degraded` the dead-chain one.
 //
 // Offline, STL only: it includes no socket header, exactly like the parser KAT.
 // ---------------------------------------------------------------------------
@@ -46,12 +62,15 @@
 #include <vector>
 
 #include "impl/xmr/p2pool/p2pool_consensus.hpp"
+#include "impl/xmr/p2pool/p2pool_freshness.hpp"
 #include "impl/xmr/p2pool/p2pool_read_model.hpp"
+#include "impl/xmr/p2pool/p2pool_state.hpp"
 #include "impl/xmr/p2pool/p2pool_tui.hpp"
 #include "impl/xmr/p2pool/p2pool_wire.hpp"
 
 namespace p2p = c2pool::xmr::p2pool;
 namespace tui = c2pool::xmr::p2pool::tui;
+namespace st  = c2pool::xmr::p2pool::state;
 
 namespace {
 
@@ -78,6 +97,25 @@ void check_str(const std::string& got, const std::string& want, const char* what
         std::printf("FAIL: %s\n  got  |%s|\n  want |%s|\n", what, got.c_str(), want.c_str());
         ++g_fail;
     }
+}
+
+// The panel block for one chain, cut out of a rendered frame by its TITLE LINE.
+//
+// The title is matched with its "  port " suffix, not by the chain name alone.
+// The header's coverage row also names all three chains, and matching the bare
+// name cut the panels out of that row instead -- which is the sort of thing a
+// test helper gets wrong silently, so it is worth the extra six characters.
+std::string panel_of(const std::string& frame, const char* chain) {
+    const std::string title = std::string(" ") + chain + "  port ";
+    const std::size_t at = frame.find(title);
+    if (at == std::string::npos) return std::string();
+    std::size_t end = frame.size();
+    for (const char* other : {"MAIN", "MINI", "NANO"}) {
+        if (std::strcmp(other, chain) == 0) continue;
+        const std::size_t o = frame.find(std::string(" ") + other + "  port ", at);
+        if (o != std::string::npos && o < end) end = o;
+    }
+    return frame.substr(at, end - at);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +234,42 @@ tui::EmitCounts mk_emit(std::uint64_t chal, std::uint64_t sol, std::uint64_t bre
 constexpr std::uint64_t kNow  = 1040000;   // the instant every view is taken at
 constexpr std::size_t   kCols = 100;
 
+// A freshness clock, by hand. Every instant is explicit for the same reason
+// every block timestamp above is: the classifier reads no clock, so a fixture
+// that states the instants states the whole input.
+p2p::FreshnessView mk_fresh(bool have_data, bool ever_connected, std::uint64_t started,
+                            std::uint64_t tip_at, std::uint64_t rx_at, std::uint64_t up_since,
+                            std::uint64_t down_since) {
+    p2p::FreshnessView f;
+    f.known          = true;
+    f.have_data      = have_data;
+    f.ever_connected = ever_connected;
+    f.started_at_ms  = started;
+    f.tip_at_ms      = tip_at;
+    f.rx_at_ms       = rx_at;
+    f.up_since_ms    = up_since;
+    f.down_since_ms  = down_since;
+    return f;
+}
+
+// The persistence banner the golden frame carries. Fixed like everything else,
+// so the durability row is pinned by the golden rather than merely present.
+tui::PersistView mk_persist() {
+    tui::PersistView p;
+    p.enabled          = true;
+    p.dir              = "/home/obs/p2pmon-state";
+    p.seq              = 41;
+    p.ever_saved       = true;
+    p.saved_age_ms     = 1000;
+    p.journal_lines    = 41;
+    p.loop_stall_max_ms = 312;
+    p.restored         = true;
+    p.restored_age_ms  = 131000;
+    p.sessions         = 2;
+    p.runtime_ms_total = 3723000;
+    return p;
+}
+
 tui::MonitorFrame build_frame() {
     static const p2p::ReadModel main_m = build_main();
     static const p2p::ReadModel mini_m = build_mini();
@@ -204,9 +278,57 @@ tui::MonitorFrame build_frame() {
     tui::MonitorFrame f;
     f.elapsed_ms  = 185000;      // 00:03:05
     f.interactive = false;
-    f.chains.push_back(tui::view_of(main_m, mk_emit(6, 6, 141, 6), 4, 12, kNow));
-    f.chains.push_back(tui::view_of(mini_m, mk_emit(5, 5, 118, 5), 3,  7, kNow));
-    f.chains.push_back(tui::view_of(nano_m, mk_emit(3, 3,  64, 3), 2,  3, kNow));
+    f.persist     = mk_persist();
+    f.chains.push_back(tui::view_of(main_m, mk_emit(6, 6, 141, 6), 4, 12, kNow,
+                                    mk_fresh(true, true, 995000, 1038000, 1038000, 999000, 0)));
+    f.chains.push_back(tui::view_of(mini_m, mk_emit(5, 5, 118, 5), 3,  7, kNow,
+                                    mk_fresh(true, true, 995000, 1039500, 1039500, 999000, 0)));
+    f.chains.push_back(tui::view_of(nano_m, mk_emit(3, 3,  64, 3), 2,  3, kNow,
+                                    mk_fresh(true, true, 995000, 1036000, 1036000, 999000, 0)));
+    // Continuity, as it looks on a restarted monitor: what the previous session
+    // left, with its age, on its own row.
+    f.chains[0].carried             = true;
+    f.chains[0].carry_written_at_ms = kNow - 131000;
+    f.chains[0].carry_age_ms        = 131000;
+    f.chains[0].carry_tip_height    = 15200091;
+    f.chains[0].carry_tip_id8       = "9a1c4b7e";
+    f.chains[0].lifetime_tip_max    = 15200104;
+    f.chains[0].lifetime_monero_max = 3512003;
+    return f;
+}
+
+// ---------------------------------------------------------------------------
+// THE DEGRADED FIXTURE: one chain LIVE, one STALE, one DOWN with no data.
+//
+// This is the shape a real overnight run takes, and the shape an ordinary
+// dashboard renders as three panels of confident numbers, two of which are
+// hours old and one of which is zeros. The whole of check_absence_vs_zero()
+// below is about this frame.
+// ---------------------------------------------------------------------------
+tui::MonitorFrame build_degraded_frame() {
+    static const p2p::ReadModel main_m = build_main();
+    static const p2p::ReadModel mini_m = build_mini();
+    static const p2p::ReadModel none_m = p2p::ReadModel(p2p::Sidechain::Nano);  // nothing at all
+
+    tui::MonitorFrame f;
+    f.elapsed_ms  = 3725000;     // 01:02:05
+    f.interactive = false;
+    f.persist     = mk_persist();
+
+    // main: healthy, and it must STAY healthy in the same frame as the others.
+    f.chains.push_back(tui::view_of(main_m, mk_emit(6, 6, 141, 6), 4, 12, kNow,
+                                    mk_fresh(true, true, 700000, 1038000, 1038000, 720000, 0)));
+    // mini: peers up, data held, but the tip has not moved for 6m40s. Its
+    // cadence is still computable from the blocks it holds -- and must not be
+    // reported as a current reading.
+    f.chains.push_back(tui::view_of(mini_m, mk_emit(5, 5, 118, 5), 3, 7, kNow,
+                                    mk_fresh(true, true, 700000, kNow - 400000, kNow - 400000,
+                                             720000, 0)));
+    // nano: was connected, lost every peer 1m35s ago, and never received a
+    // single block. Everything about it is an absence.
+    f.chains.push_back(tui::view_of(none_m, tui::EmitCounts{}, 0, 0, kNow,
+                                    mk_fresh(false, true, 700000, 700000, 700000, 0,
+                                             kNow - 95000)));
     return f;
 }
 
@@ -417,11 +539,8 @@ void check_honesty() {
     check(!f.chains[2].cadence_ok, "nano refuses to report a cadence from one sample");
     check_eq(f.chains[2].status, tui::ChainStatus::Warming, "nano shows as warming");
     const std::string frame = tui::snapshot_text(f, kCols);
-    const std::size_t nano_at = frame.find(" NANO ");
-    check(nano_at != std::string::npos, "the nano panel is drawn");
-    const std::size_t nano_end = frame.find(" MAIN ", nano_at) == std::string::npos
-                               ? frame.size() : frame.find(" MAIN ", nano_at);
-    const std::string nano_panel = frame.substr(nano_at, nano_end - nano_at);
+    const std::string nano_panel = panel_of(frame, "NANO");
+    check(!nano_panel.empty(), "the nano panel is drawn");
     check(nano_panel.find("warming") != std::string::npos,
           "the nano panel says warming instead of printing a cadence");
 
@@ -444,14 +563,411 @@ void check_honesty() {
     p2p::ReadModel empty(p2p::Sidechain::Nano);
     const tui::ChainView dark = tui::view_of(empty, tui::EmitCounts{}, 0, 0, kNow);
     check_eq(dark.status, tui::ChainStatus::Dark, "a chain with nothing on it is dark");
+    check(!dark.have_data, "a chain with nothing on it holds no data");
     check_eq(dark.tip_id8, std::string("-"), "a dark chain shows no tip id");
     tui::MonitorFrame df;
     df.chains.push_back(dark);
     const std::string dark_frame = tui::snapshot_text(df, kCols);
     check(dark_frame.find("(nothing received yet)") != std::string::npos,
           "a dark chain says it has received nothing");
-    check(dark_frame.find("(no live gaps yet)") != std::string::npos,
-          "a dark chain draws no pulse it does not have");
+    check(dark_frame.find("nothing to time") != std::string::npos,
+          "a dark chain refuses to time a chain it has not seen");
+    check(dark_frame.find("PERSIST") != std::string::npos ||
+          dark_frame.find("persist  OFF") != std::string::npos,
+          "a frame with no persistence says so rather than staying silent");
+}
+
+// ---------------------------------------------------------------------------
+// 5) ABSENCE IS NOT ZERO -- the whole point of the degraded fixture.
+// ---------------------------------------------------------------------------
+
+// Is there a figure on this line that reads as a measurement? The test is
+// deliberately crude and deliberately strict: any run of digits that is not
+// part of the chain's own identity (its port, its target, an age) would be a
+// number the panel is asserting about a chain it has heard nothing from.
+bool has_value_digit(const std::string& line) {
+    static const char* kIdentity[] = {"port 37889", "port 37888", "port 37890",
+                                      "target 10s", "target 30s"};
+    std::string s = line;
+    for (const char* k : kIdentity) {
+        for (std::size_t at = s.find(k); at != std::string::npos; at = s.find(k))
+            s.erase(at, std::strlen(k));
+    }
+    // Ages are written as 41s / 2m11s / 1h04m / 3d and are the ONE numeric
+    // thing a dead panel is allowed to say, because they measure our own
+    // outage rather than the chain.
+    std::string out;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] >= '0' && s[i] <= '9') {
+            std::size_t j = i;
+            while (j < s.size() && s[j] >= '0' && s[j] <= '9') ++j;
+            const char unit = j < s.size() ? s[j] : ' ';
+            if (unit == 's' || unit == 'm' || unit == 'h' || unit == 'd') { i = j; continue; }
+            out.push_back('#');
+            i = j - 1;
+            continue;
+        }
+    }
+    return !out.empty();
+}
+
+void check_absence_vs_zero() {
+    const tui::MonitorFrame f = build_degraded_frame();
+    check_eq(f.chains.size(), std::size_t(3), "the degraded fixture still has three chains");
+
+    // The three states, from the same classifier the live path uses.
+    check_eq(f.chains[0].status, tui::ChainStatus::Live,  "main is live in the degraded frame");
+    check_eq(f.chains[1].status, tui::ChainStatus::Stale, "mini is stale: tip frozen 6m40s");
+    check_eq(f.chains[2].status, tui::ChainStatus::Down,  "nano is down: peers lost 1m35s ago");
+    check(f.chains[0].have_data,  "main holds data");
+    check(f.chains[1].have_data,  "a stale chain still holds the data it did have");
+    check(!f.chains[2].have_data, "a chain that never received a block holds none");
+
+    // A DOWN chain and a DARK chain are different words for different facts.
+    p2p::FreshnessView never = mk_fresh(false, false, 700000, 700000, 700000, 0, 700000);
+    check_eq(p2p::classify(never, 0, 0, 0, false, 10, kNow), p2p::Liveness::Dark,
+             "never connected is DARK, not DOWN");
+
+    const std::string frame = tui::snapshot_text(f, kCols);
+    const std::string nano  = panel_of(frame, "NANO");
+    const std::string mini  = panel_of(frame, "MINI");
+    const std::string main  = panel_of(frame, "MAIN");
+    check(!nano.empty() && !mini.empty() && !main.empty(), "all three panels are drawn");
+
+    // --- the dead chain ---------------------------------------------------
+    check(nano.find("DOWN") != std::string::npos, "the dead chain is labelled DOWN");
+    check(nano.find("1m35s") != std::string::npos, "the dead chain says how long it has been down");
+    check(nano.find("no peers") != std::string::npos, "the dead chain says what DOWN means");
+    check(nano.find(tui::kNoData) != std::string::npos, "the dead chain renders -- for its figures");
+
+    // THE CENTRAL ASSERTION. Walk the dead panel's data rows and refuse any
+    // digit that is not the chain's identity or an age. A regression that
+    // reinstated the zero-initialised members would land exactly here.
+    std::vector<std::string> lines;
+    {
+        std::string cur;
+        for (const char c : nano) {
+            if (c == '\n') { lines.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) lines.push_back(cur);
+    }
+    int checked_rows = 0;
+    for (const std::string& l : lines) {
+        const bool data_row = l.find("   tip ") == 0 || l.find("   cadence ") == 0
+                           || l.find("   pulse ") == 0 || l.find("   races ") == 0;
+        if (!data_row) continue;
+        ++checked_rows;
+        ++g_checks;
+        if (has_value_digit(l)) {
+            std::printf("FAIL: a dead chain printed a figure: |%s|\n", l.c_str());
+            ++g_fail;
+        }
+        ++g_checks;
+        if (l.find(tui::kNoData) == std::string::npos) {
+            std::printf("FAIL: a dead chain row has no -- marker: |%s|\n", l.c_str());
+            ++g_fail;
+        }
+    }
+    check_eq(checked_rows, 4, "four data rows on the dead panel were examined");
+    check(nano.find("0 up / 0 sock") != std::string::npos,
+          "peer counts stay real numbers: zero peers is a measurement");
+
+    // --- the stale chain --------------------------------------------------
+    check(mini.find("STALE") != std::string::npos, "the frozen chain is labelled STALE");
+    check(mini.find("tip frozen") != std::string::npos, "the frozen chain says what STALE means");
+    check(mini.find("as of 6m40s") != std::string::npos,
+          "the frozen chain dates its tip instead of presenting it as current");
+    check(mini.find("no new height for 6m40s") != std::string::npos,
+          "the frozen chain spells out what has stopped, on its own row");
+    check(mini.find("14757144") != std::string::npos,
+          "a stale chain keeps the last number it knew rather than blanking it");
+
+    // --- the live chain is untouched --------------------------------------
+    check(main.find("LIVE") != std::string::npos, "the live chain is still live");
+    check(main.find("15200104") != std::string::npos, "the live chain still shows its tip");
+    // No `--` on a live panel's DATA rows. Three rows are drawn out of '-'
+    // characters and are graphics rather than figures -- the title rule, the
+    // pulse ramp and the cadence bar's empty cells -- so they are looked past
+    // rather than being a reason to weaken the check on the rows that carry
+    // the actual numbers.
+    for (const char* row : {"   tip ", "   races ", "   net "}) {
+        const std::size_t at = main.find(row);
+        ++g_checks;
+        if (at == std::string::npos) {
+            std::printf("FAIL: the live panel is missing its %srow\n", row);
+            ++g_fail;
+            continue;
+        }
+        const std::size_t eol = main.find('\n', at);
+        const std::string line = main.substr(at, eol - at);
+        if (line.find(tui::kNoData) != std::string::npos) {
+            std::printf("FAIL: a live panel row carries a no-data marker: |%s|\n", line.c_str());
+            ++g_fail;
+        }
+    }
+
+    // --- the aggregates do not launder the gap ----------------------------
+    const tui::MonitorTotals t = tui::totals_of(f.chains);
+    check_eq(t.chains, std::size_t(3), "three chains configured");
+    check_eq(t.chains_live, std::size_t(1), "one chain is live");
+    check_eq(t.chains_reporting, std::size_t(2), "two chains have numbers behind them");
+    check_eq(t.chains_down, std::size_t(1), "one chain has no peers");
+    check_eq(t.chains_stale, std::size_t(1), "one chain has peers and a frozen tip");
+    check(frame.find("2/3 reporting") != std::string::npos,
+          "the header states the coverage of its own totals");
+    check(frame.find("1 down") != std::string::npos, "the header counts the dead chain");
+    check(frame.find("1 stale") != std::string::npos, "the header counts the frozen chain");
+
+    // The renderer stays total on a degraded frame -- a dead source must not
+    // change the geometry any more than it may crash the loop.
+    for (std::size_t cols : {60u, 100u, 140u}) {
+        for (std::size_t rows : {12u, 30u}) {
+            const std::vector<std::string> out = tui::render(f, cols, rows, false);
+            check_eq(out.size(), rows, "a degraded frame renders the rows asked for");
+            bool ok = true;
+            for (const std::string& l : out) if (l.size() != cols) ok = false;
+            check(ok, "a degraded frame renders full-width lines");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6) THE LIVENESS LADDER. All seven states, and the precedence between them.
+// ---------------------------------------------------------------------------
+void check_liveness_ladder() {
+    const std::uint64_t now = 10'000'000;
+    const p2p::FreshnessThresholds th;
+
+    // The bands for a 10 s chain: quiet at 60 s (the floor beats 4x10), stale
+    // at 180 s (the floor beats 12x10).
+    check_eq(th.quiet_ms(10), std::uint64_t(60000),  "a 10 s chain goes quiet at 60 s");
+    check_eq(th.stale_ms(10), std::uint64_t(180000), "a 10 s chain goes stale at 180 s");
+    // ... and for a 30 s chain the multiple beats the floor, as intended.
+    check_eq(th.quiet_ms(30), std::uint64_t(120000), "a 30 s chain goes quiet at 120 s");
+    check_eq(th.stale_ms(30), std::uint64_t(360000), "a 30 s chain goes stale at 360 s");
+
+    auto fresh_at = [&](std::uint64_t tip_age, bool have, bool ever) {
+        return mk_fresh(have, ever, now - 600000, now - tip_age, now - tip_age,
+                        ever ? now - 600000 : 0, 0);
+    };
+
+    check_eq(p2p::classify(fresh_at(1000, true, true), 4, 4, 0, true, 10, now),
+             p2p::Liveness::Live, "peers, data, moving tip, timed -> LIVE");
+    check_eq(p2p::classify(fresh_at(1000, true, true), 4, 4, 0, false, 10, now),
+             p2p::Liveness::Warming, "peers and data but not timed yet -> WARM");
+    check_eq(p2p::classify(fresh_at(1000, false, true), 4, 4, 0, false, 10, now),
+             p2p::Liveness::Warming, "peers but nothing received -> WARM");
+    check_eq(p2p::classify(fresh_at(90000, true, true), 4, 4, 0, true, 10, now),
+             p2p::Liveness::Quiet, "90 s without a height on a 10 s chain -> QUIET");
+    check_eq(p2p::classify(fresh_at(400000, true, true), 4, 4, 0, true, 10, now),
+             p2p::Liveness::Stale, "400 s without a height -> STALE, cadence or not");
+    check_eq(p2p::classify(fresh_at(1000, true, true), 0, 0, 0, true, 10, now),
+             p2p::Liveness::Down, "no peers after having had some -> DOWN");
+    check_eq(p2p::classify(fresh_at(1000, false, false), 0, 2, 3, false, 10, now),
+             p2p::Liveness::Dialling, "sockets in flight, never handshaken -> DIAL");
+    check_eq(p2p::classify(fresh_at(1000, false, false), 0, 0, 0, false, 10, now),
+             p2p::Liveness::Dark, "nothing at all -> DARK");
+
+    // PRECEDENCE, stated as tests because it is the part that is easy to get
+    // subtly wrong: a fresh tip does not rescue a chain with no peers, and a
+    // computable cadence does not rescue a frozen one.
+    check_eq(p2p::classify(fresh_at(0, true, true), 0, 4, 0, true, 10, now),
+             p2p::Liveness::Down, "a tip that moved this instant does not outrank losing the peers");
+    check_eq(p2p::classify(fresh_at(400000, true, true), 4, 4, 0, true, 10, now),
+             p2p::Liveness::Stale, "a computable cadence does not outrank a frozen tip");
+
+    // is_degraded() is what the aggregation counts on.
+    check(!p2p::is_degraded(p2p::Liveness::Live), "LIVE is not degraded");
+    check(!p2p::is_degraded(p2p::Liveness::Warming), "WARM is not degraded");
+    for (const p2p::Liveness s : {p2p::Liveness::Quiet, p2p::Liveness::Stale, p2p::Liveness::Down,
+                                  p2p::Liveness::Dialling, p2p::Liveness::Dark})
+        check(p2p::is_degraded(s), "every other state is degraded");
+
+    // An age computed against a clock that is BEHIND the recorded instant --
+    // which happens the moment a state file is copied between machines -- must
+    // clamp at zero rather than wrap into a 584-million-year age.
+    p2p::FreshnessView future = mk_fresh(true, true, now + 5000, now + 5000, now + 5000,
+                                         now + 5000, 0);
+    check_eq(future.tip_age_ms(now), std::uint64_t(0), "an age never runs backwards");
+}
+
+// ---------------------------------------------------------------------------
+// 7) THE STATE CODEC. Frame -> state -> JSON -> state, number by number.
+// ---------------------------------------------------------------------------
+void check_state_codec() {
+    const tui::MonitorFrame f = build_frame();
+
+    st::SessionMeta meta;
+    meta.written_at_ms = 1757620000123ull;
+    meta.seq  = 42;
+    meta.pid  = 4711;
+    meta.host = "an \"odd\" host\\name";        // the escaping path, on purpose
+    meta.session_id            = "1757619000000-4711";
+    meta.session_started_at_ms = 1757619000000ull;
+    meta.shutdown              = "clean";
+    meta.persist.errors            = 2;
+    meta.persist.last_error        = "write temp: No space left on device";
+    meta.persist.loop_stall_max_ms = 312;
+    meta.lifetime.sessions            = 7;
+    meta.lifetime.first_started_at_ms = 1757000000000ull;
+    meta.lifetime.runtime_ms_total    = 987654321ull;
+
+    const st::MonitorState a = st::state_of(f, meta);
+    const std::string json = st::to_json(a);
+    check(json.size() > 1000 && json.size() < 16000, "one state file is a few KB");
+    check(json.find("\"schema\":\"p2pmon-state/1\"") != std::string::npos,
+          "the file names its schema first");
+    check(json.find("\"emitted_ids\":[0,1,3,6]") != std::string::npos,
+          "the read-only claim is written into the file");
+    check(json.find("an \\\"odd\\\" host\\\\name") != std::string::npos,
+          "strings with quotes and backslashes are escaped");
+    // Non-finite values are not valid JSON. Matched as VALUES (":nan", ":inf")
+    // rather than as substrings: the chain named "nano" contains "nan", and a
+    // check that fires on a chain name is a check nobody will trust.
+    check(json.find(":nan") == std::string::npos && json.find(":inf") == std::string::npos
+          && json.find(":-inf") == std::string::npos,
+          "no non-finite number reaches the file");
+
+    st::MonitorState b;
+    std::string why;
+    check(st::from_json(json, b, why), "the file we just wrote parses");
+    if (!why.empty()) std::printf("      (parse note: %s)\n", why.c_str());
+
+    check_str(b.schema, a.schema, "schema round-trips");
+    check_eq(b.written_at_ms, a.written_at_ms, "written_at_ms round-trips exactly");
+    check_eq(b.seq, a.seq, "seq round-trips");
+    check_eq(b.pid, a.pid, "pid round-trips");
+    check_str(b.host, a.host, "an escaped host string round-trips");
+    check_str(b.session_id, a.session_id, "session id round-trips");
+    check_eq(b.session_started_at_ms, a.session_started_at_ms, "session start round-trips");
+    check_eq(b.elapsed_ms, a.elapsed_ms, "elapsed round-trips");
+    check_str(b.shutdown, a.shutdown, "the clean-shutdown marker round-trips");
+    check_eq(b.emitted_ids.size(), a.emitted_ids.size(), "the emit set round-trips");
+    for (std::size_t i = 0; i < b.emitted_ids.size() && i < a.emitted_ids.size(); ++i)
+        check_eq(b.emitted_ids[i], a.emitted_ids[i], "each emitted id round-trips");
+    check_eq(b.persist.errors, a.persist.errors, "persist error count round-trips");
+    check_str(b.persist.last_error, a.persist.last_error, "the last error text round-trips");
+    check_eq(b.persist.loop_stall_max_ms, a.persist.loop_stall_max_ms,
+             "the worst loop stall round-trips");
+    check_eq(b.lifetime.sessions, a.lifetime.sessions, "the session count round-trips");
+    check_eq(b.lifetime.runtime_ms_total, a.lifetime.runtime_ms_total,
+             "total runtime round-trips");
+    check_eq(b.chains.size(), a.chains.size(), "every chain round-trips");
+
+    for (std::size_t i = 0; i < b.chains.size() && i < a.chains.size(); ++i) {
+        const st::ChainState& x = a.chains[i];
+        const st::ChainState& y = b.chains[i];
+        check_str(y.name, x.name, "chain name round-trips in order");
+        check_eq(y.port, x.port, "port round-trips");
+        check_eq(y.target_s, x.target_s, "target round-trips");
+        check_str(y.liveness, x.liveness, "the status word round-trips");
+        check_eq(y.have_data, x.have_data, "the absence flag round-trips");
+        check_eq(y.ever_connected, x.ever_connected, "ever_connected round-trips");
+        check_eq(y.tip_advanced_at_ms, x.tip_advanced_at_ms, "the staleness clock round-trips");
+        check_eq(y.rx_at_ms, x.rx_at_ms, "the receive clock round-trips");
+        check_eq(y.up_since_ms, x.up_since_ms, "up_since round-trips (null means zero)");
+        check_eq(y.down_since_ms, x.down_since_ms, "down_since round-trips");
+        check_eq(y.tip_height, x.tip_height, "tip height round-trips exactly");
+        check_str(y.tip_id, x.tip_id, "the full 64-hex tip id round-trips");
+        check_str(y.difficulty, x.difficulty, "difficulty round-trips as exact decimal");
+        check_str(y.cumulative_difficulty, x.cumulative_difficulty,
+                  "cumulative difficulty round-trips as exact decimal");
+        check_eq(y.cadence_ok, x.cadence_ok, "the cadence flag round-trips");
+        ++g_checks;
+        if (y.cadence_s != x.cadence_s) {          // %.17g is exact for a double
+            std::printf("FAIL: cadence %.17g != %.17g\n", y.cadence_s, x.cadence_s);
+            ++g_fail;
+        }
+        check_eq(y.cadence_n, x.cadence_n, "the cadence sample count round-trips");
+        check_eq(y.frontier, x.frontier, "the frontier round-trips");
+        check_eq(y.gaps_ms.size(), x.gaps_ms.size(), "the pulse round-trips");
+        for (std::size_t k = 0; k < y.gaps_ms.size() && k < x.gaps_ms.size(); ++k)
+            check_eq(y.gaps_ms[k], x.gaps_ms[k], "each gap round-trips exactly");
+        check_eq(y.contested, x.contested, "contested heights round-trip");
+        check_eq(y.uncles_named, x.uncles_named, "named uncles round-trip");
+        check_eq(y.uncles_resolved, x.uncles_resolved, "resolved uncles round-trip");
+        check_eq(y.monero_tpl_high, x.monero_tpl_high, "the monero template height round-trips");
+        check_eq(y.monero_heights, x.monero_heights, "the monero height count round-trips");
+        check_eq(y.peers_up, x.peers_up, "peers up round-trips");
+        check_eq(y.peers_known, x.peers_known, "known peers round-trip");
+        check_eq(y.gossiped, x.gossiped, "gossiped addresses round-trip");
+        check_eq(y.distinct, x.distinct, "distinct blocks round-trip");
+        check_eq(y.dupes, x.dupes, "duplicates round-trip");
+        check_eq(y.parse_failures, x.parse_failures, "parse failures round-trip");
+        check_eq(y.broadcasts, x.broadcasts, "broadcasts round-trip");
+        for (std::size_t k = 0; k < p2p::kControlMessageCount; ++k) {
+            check_eq(y.out_messages[k], x.out_messages[k], "each emitted counter round-trips");
+            check_eq(y.out_bytes[k], x.out_bytes[k], "each emitted byte count round-trips");
+        }
+        check_eq(y.lifetime.tip_height_max, x.lifetime.tip_height_max,
+                 "the lifetime tip high-water mark round-trips");
+    }
+
+    // A 128-bit cumulative difficulty must survive, which is why it is text:
+    // as a JSON double it would lose its low bits and come back plausible.
+    st::MonitorState big = a;
+    big.chains[0].cumulative_difficulty = "340282366920938463463374607431768211455";
+    big.chains[0].difficulty            = "18446744073709551615";
+    st::MonitorState back;
+    check(st::from_json(st::to_json(big), back, why), "a 128-bit difficulty file parses");
+    check_str(back.chains[0].cumulative_difficulty,
+              "340282366920938463463374607431768211455", "2^128-1 survives the round trip");
+    check_str(back.chains[0].difficulty, "18446744073709551615", "2^64-1 survives the round trip");
+    std::uint64_t hi = 0, lo = 0;
+    check(st::dec_to_u128("18446744073709551615", hi, lo), "2^64-1 parses as a 128-bit value");
+    check_eq(hi, std::uint64_t(0), "2^64-1 has a zero high word");
+    check_eq(lo, std::uint64_t(18446744073709551615ull), "2^64-1 keeps every bit");
+    check(!st::dec_to_u128("1157920892373161954235709850086879078532699846656405640394575840079131296399361",
+                           hi, lo), "an over-wide decimal is refused rather than wrapped");
+    check(!st::dec_to_u128("12x4", hi, lo), "a non-decimal is refused");
+
+    // A foreign or truncated file is a refusal, never a crash and never a
+    // plausible-looking state.
+    st::MonitorState junk;
+    check(!st::from_json("", junk, why), "an empty file is refused");
+    check(!st::from_json("{\"schema\":\"something-else/9\"}", junk, why),
+          "a foreign schema is refused");
+    check(!st::from_json(json.substr(0, json.size() / 2), junk, why),
+          "a truncated file is refused");
+    check(!st::from_json("{\"schema\":\"p2pmon-state/1\"}", junk, why),
+          "a state with no write time is refused");
+
+    // THE READ PATH. A saved state renders through the SAME renderer, and its
+    // age is resolved against the reader's clock: a day later it is STALE.
+    const tui::MonitorFrame day_later = st::frame_of(b, meta.written_at_ms + 86400000ull);
+    check(day_later.from_file, "a restored frame knows it came from a file");
+    check_eq(day_later.chains.size(), std::size_t(3), "a restored frame has every chain");
+    for (const tui::ChainView& c : day_later.chains)
+        check_eq(c.status, tui::ChainStatus::Stale, "a day-old state renders as stale");
+    const std::string restored = tui::snapshot_text(day_later, kCols);
+    check(restored.find("RESTORED FRAME") != std::string::npos,
+          "a restored frame says so at the top");
+    check(restored.find("no network was dialled") != std::string::npos,
+          "a restored frame says it dialled nothing");
+    check(restored.find("FROM FILE 1d OLD") != std::string::npos,
+          "every restored panel carries the age of the file");
+    check(restored.find("15200104") != std::string::npos,
+          "a restored frame carries the numbers that were saved");
+
+    // Read back one second later and the same file is a current reading, with
+    // the same numbers -- the continuity property, in the renderer.
+    const tui::MonitorFrame just_now = st::frame_of(b, meta.written_at_ms + 1000);
+    check_eq(just_now.chains[0].tip_height, f.chains[0].tip_height,
+             "the restored tip height is the saved tip height");
+    check_str(just_now.chains[0].difficulty, f.chains[0].difficulty,
+              "the restored difficulty is the saved difficulty");
+    ++g_checks;
+    if (just_now.chains[0].hashrate != f.chains[0].hashrate) {
+        std::printf("FAIL: restored hashrate %.6Lf != live %.6Lf\n",
+                    just_now.chains[0].hashrate, f.chains[0].hashrate);
+        ++g_fail;
+    }
+    ++g_checks;
+    if (just_now.chains[0].cumulative_d != f.chains[0].cumulative_d) {
+        std::printf("FAIL: restored cumulative differs from live\n");
+        ++g_fail;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,12 +1027,31 @@ int main(int argc, char** argv) {
         std::printf("%s", tui::snapshot_text(build_frame(), kCols).c_str());
         return 0;
     }
+    if (argc > 1 && std::strcmp(argv[1], "--show-degraded") == 0) {
+        std::printf("%s", tui::snapshot_text(build_degraded_frame(), kCols).c_str());
+        return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--show-state") == 0) {
+        st::SessionMeta m;
+        m.written_at_ms = 1757620000123ull;
+        m.seq = 41;
+        m.pid = 4711;
+        m.host = "example";
+        m.session_id = "1757619000000-4711";
+        m.session_started_at_ms = 1757619000000ull;
+        m.lifetime.sessions = 2;
+        std::printf("%s", st::to_json(st::state_of(build_frame(), m)).c_str());
+        return 0;
+    }
 
     check_emit_set();
     check_render();
     check_aggregation();
     check_honesty();
     check_formatting();
+    check_absence_vs_zero();
+    check_liveness_ladder();
+    check_state_codec();
 
     std::printf("checks=%d failures=%d\n", g_checks, g_fail);
     if (g_fail) { std::printf("KAT FAILED\n"); return 1; }

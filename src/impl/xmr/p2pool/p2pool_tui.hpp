@@ -68,6 +68,40 @@
 //     list. If a fifth encoder ever appeared, the footer would start saying so
 //     on screen and the KAT would fail in the same breath.
 //
+// ---------------------------------------------------------------------------
+// ABSENCE IS NOT ZERO, AND IT IS ENFORCED HERE
+// ---------------------------------------------------------------------------
+// The refusals above are about numbers the read model declines to derive. The
+// harder case is a number that does not EXIST because the source is gone, and
+// it is harder because the wrong rendering is so natural: every counter on a
+// panel is zero-initialised, so a chain we have heard nothing from draws itself
+// as a complete set of confident zeros in exactly the shape a live chain uses.
+//
+// So every chain figure on a panel is gated on ChainView::have_data -- the read
+// model actually HOLDING a block, not a counter being non-zero -- and a panel
+// without data prints `--`, two columns that cannot be read as a value. Zero is
+// reserved for a measurement that came out zero. Peer counts are the deliberate
+// exception and are never dashed: "0 up" is a measurement, we looked at our own
+// socket table, and it is paired with the status word that says what it means.
+//
+// Three things carry that rule up to the top of the frame:
+//
+//   * the STATUS WORD, now one of seven (p2pool_freshness.hpp) rather than
+//     four, so DOWN, QUIET and STALE can be said at all, each with the age of
+//     the event it is about;
+//   * a `!` ROW above a degraded panel's figures, at kAlways priority, saying
+//     in a sentence what stopped and how old the rest of the panel is -- a
+//     status word alone makes the reader infer that, and at 4am readers infer
+//     generously;
+//   * a COVERAGE row beside the header totals. Summing three panels when one is
+//     dark gives a figure that is arithmetically right and editorially false;
+//     dropping the dead chain would hide it, so the header states how many
+//     chains are actually behind the numbers, every frame.
+//
+// The PERSISTENCE banner is drawn every frame in both states for the same
+// reason: whether these numbers will survive this process is not something an
+// operator should have to discover by killing it.
+//
 // Header-only, STL only. Deliberately free of POSIX: this file is what the KAT
 // compiles, and the KAT must not need a socket layer to check a layout.
 // ---------------------------------------------------------------------------
@@ -81,6 +115,7 @@
 
 #include "impl/xmr/p2pool/p2pool_block.hpp"
 #include "impl/xmr/p2pool/p2pool_consensus.hpp"
+#include "impl/xmr/p2pool/p2pool_freshness.hpp"
 #include "impl/xmr/p2pool/p2pool_read_model.hpp"
 #include "impl/xmr/p2pool/p2pool_wire.hpp"
 
@@ -320,21 +355,29 @@ struct FeedRow {
     bool          verified  = false;    // sidechain id recomputed and matched
 };
 
-enum class ChainStatus : std::uint8_t {
-    Dark = 0,     // no peers, nothing seen
-    Dialling,     // sockets in flight, no handshake yet
-    Warming,      // handshaken, blocks arriving, not enough live heights to time
-    Live,         // handshaken and timing the chain
-};
+// THE STATUS WORD now comes from p2pool_freshness.hpp, where it grew from four
+// values to seven. The four it had (DARK / DIAL / WARM / LIVE) described the
+// warm-up of a connection and could not say anything about a connection that
+// was healthy and stopped being healthy -- the case a long run actually meets.
+// DOWN, QUIET and STALE are that case. The alias is kept so every call site
+// that says ChainStatus still reads correctly; they are the same type.
+using ChainStatus = Liveness;
 
-inline const char* to_string(ChainStatus s) noexcept {
-    switch (s) {
-        case ChainStatus::Dark:     return "DARK";
-        case ChainStatus::Dialling: return "DIAL";
-        case ChainStatus::Warming:  return "WARM";
-        case ChainStatus::Live:     return "LIVE";
-    }
-    return "?";
+// What a number means when there is no number. Two ASCII columns, so it lines
+// up under a figure and cannot be read as a value -- which is the whole point:
+// `0` is a measurement that came out zero, `--` is the absence of one.
+inline constexpr const char* kNoData = "--";
+
+inline std::string or_dash(bool have, const std::string& s) {
+    return have ? s : std::string(kNoData);
+}
+
+// Where a panel's numbers came from. A frame reconstructed from the state file
+// is not a live reading and never renders as one.
+enum class ChainSource : std::uint8_t { Live = 0, Restored = 1 };
+
+inline const char* to_string(ChainSource s) noexcept {
+    return s == ChainSource::Restored ? "restored" : "live";
 }
 
 struct ChainView {
@@ -343,9 +386,36 @@ struct ChainView {
     std::uint64_t target_s  = 0;
     ChainStatus   status    = ChainStatus::Dark;
 
+    // ---- absence-vs-zero -------------------------------------------------
+    // `have_data` gates EVERY chain figure below. False means the panel prints
+    // `--` rather than the zero-initialised member, and it is false whenever
+    // this monitor holds no sidechain block for the chain: not connected yet,
+    // never connected, connected and told nothing. The read model's own
+    // counters are not consulted for this, because a counter that was never
+    // incremented and a counter that counted nothing are the same integer.
+    bool          have_data      = false;
+    ChainSource   source         = ChainSource::Live;
+    FreshnessView fresh;                  // the absolute instants, for the file
+    std::uint64_t status_age_ms  = 0;     // how long the status word has held
+    bool          status_age_known = false;
+    std::uint64_t tip_age_ms     = 0;     // since the tip HEIGHT last increased
+    std::uint64_t rx_age_ms      = 0;     // since a new distinct block arrived
+    std::uint64_t data_age_ms    = 0;     // Restored only: age of the file read
+
+    // ---- continuity carried across a restart, from the state file --------
+    bool          carried             = false;
+    std::uint64_t carry_written_at_ms = 0;   // wall ms the carried state was saved
+    std::uint64_t carry_age_ms        = 0;   // resolved against the frame's `now`
+    std::uint64_t carry_tip_height    = 0;
+    std::string   carry_tip_id8;
+    std::uint64_t lifetime_tip_max    = 0;   // highest tip ever seen, any session
+    std::uint64_t lifetime_monero_max = 0;
+
     std::uint64_t tip_height = 0;
+    std::string   tip_id;                 // full 64 hex, for the state file
     std::string   tip_id8;
     std::string   difficulty;            // exact decimal
+    std::string   cumulative;            // exact decimal, for the state file
     long double   difficulty_d = 0.0L;
     long double   cumulative_d = 0.0L;
     long double   hashrate     = 0.0L;   // H/s, implied by difficulty / target
@@ -378,15 +448,53 @@ struct ChainView {
     EmitCounts    out;
 };
 
+// ---------------------------------------------------------------------------
+// THE PERSISTENCE BANNER. Everything the frame says about its own durability,
+// resolved to plain data like everything else here, so the header row is a pure
+// function and the KAT can pin it.
+//
+// It is drawn at kAlways priority and it is drawn even when persistence is OFF,
+// with the REASON. A monitor whose numbers die with the session is a different
+// tool from one whose numbers survive a kill, and which of the two is running
+// must not be something the operator has to infer from the absence of a line.
+// ---------------------------------------------------------------------------
+struct PersistView {
+    bool          enabled  = false;
+    std::string   dir;                    // where the files are, when enabled
+    std::string   off_reason;             // why not, when disabled
+    std::uint64_t seq = 0;                // saves in this session
+    std::uint64_t saved_age_ms = 0;       // since the last successful save
+    bool          ever_saved = false;
+    std::size_t   errors = 0;
+    std::string   last_error;
+    std::uint64_t journal_lines = 0;
+    std::uint64_t loop_stall_max_ms = 0;  // worst gap between loop turns
+
+    bool          restored = false;       // a previous state was read at start
+    std::uint64_t restored_age_ms = 0;    // how old that state was
+    std::uint64_t sessions = 1;           // this one included
+    std::uint64_t runtime_ms_total = 0;   // across every session, this one included
+};
+
 struct MonitorFrame {
     std::uint64_t          elapsed_ms = 0;
     bool                   interactive = false;   // draws the key hints
     std::vector<ChainView> chains;
+    PersistView            persist;
+    // True when the whole frame was reconstructed from the state file rather
+    // than from live read models: `--read`. Draws a banner, because a frame
+    // that dialled nothing must not be mistaken for one that did.
+    bool                   from_file = false;
+    std::uint64_t          file_age_ms = 0;
 };
 
 struct MonitorTotals {
     std::size_t   chains = 0;
-    std::size_t   chains_live = 0;
+    std::size_t   chains_live = 0;        // LIVE or WARM: a source we are hearing
+    std::size_t   chains_reporting = 0;   // have_data: a source we have numbers for
+    std::size_t   chains_degraded = 0;    // QUIET / STALE / DOWN / DARK / DIAL
+    std::size_t   chains_down = 0;        // DOWN or DARK: no peers at all
+    std::size_t   chains_stale = 0;       // QUIET or STALE: peers, but nothing moving
     std::size_t   peers_up = 0;
     std::size_t   peers_known = 0;
     std::size_t   blocks = 0;
@@ -398,11 +506,24 @@ struct MonitorTotals {
 
 // The three-chain aggregation, in one place so the KAT can check it against the
 // per-chain numbers rather than against the renderer's arithmetic.
+//
+// AN AGGREGATE OVER A DEAD SOURCE IS THE SECOND HALF OF THE ABSENCE-VS-ZERO
+// PROBLEM. Summing three panels when one of them is dark produces a total that
+// is arithmetically correct and editorially false: "blocks 15" reads as the
+// three-chain figure, and it is a two-chain figure. Nothing here is fixed by
+// dropping the dead chain from the sum -- that hides it. What is carried
+// instead is the COVERAGE: how many of the configured chains actually have
+// numbers behind them, which the header prints beside every total.
 inline MonitorTotals totals_of(const std::vector<ChainView>& chains) {
     MonitorTotals t;
     t.chains = chains.size();
     for (const ChainView& c : chains) {
         if (c.status == ChainStatus::Live || c.status == ChainStatus::Warming) ++t.chains_live;
+        if (c.have_data) ++t.chains_reporting;
+        if (is_degraded(c.status)) ++t.chains_degraded;
+        if (c.status == ChainStatus::Down || c.status == ChainStatus::Dark ||
+            c.status == ChainStatus::Dialling) ++t.chains_down;
+        if (c.status == ChainStatus::Quiet || c.status == ChainStatus::Stale) ++t.chains_stale;
         t.peers_up       += c.peers_up;
         t.peers_known    += c.peers_known;
         t.blocks         += c.distinct;
@@ -421,16 +542,20 @@ inline MonitorTotals totals_of(const std::vector<ChainView>& chains) {
 // frame is possible. Everything else is a straight read of the model.
 // ---------------------------------------------------------------------------
 inline ChainView view_of(const ReadModel& m, const EmitCounts& out, std::size_t sockets,
-                         std::size_t queued, std::uint64_t now_ms, std::size_t feed_rows = 8,
-                         std::size_t pulse_width = 24) {
+                         std::size_t queued, std::uint64_t now_ms,
+                         const FreshnessView& fresh = FreshnessView{},
+                         const FreshnessThresholds& th = FreshnessThresholds{},
+                         std::size_t feed_rows = 8, std::size_t pulse_width = 24) {
     ChainView v;
     v.chain    = m.chain();
     v.port     = default_port(m.chain());
     v.target_s = m.params().target_block_time;
 
     v.tip_height   = m.tip_height();
+    v.tip_id       = m.tip_height() ? hex(m.tip_id()) : std::string();
     v.tip_id8      = m.tip_height() ? hex(m.tip_id()).substr(0, 8) : std::string("-");
     v.difficulty   = m.tip_difficulty().to_string();
+    v.cumulative   = m.tip_cumulative_difficulty().to_string();
     v.difficulty_d = m.tip_difficulty().as_double();
     v.cumulative_d = m.tip_cumulative_difficulty().as_double();
     v.hashrate     = m.implied_hashrate();
@@ -461,10 +586,36 @@ inline ChainView view_of(const ReadModel& m, const EmitCounts& out, std::size_t 
     v.broadcasts     = m.broadcasts_seen();
     v.out            = out;
 
-    if (v.cadence_ok)                     v.status = ChainStatus::Live;
-    else if (v.peers_up > 0)              v.status = ChainStatus::Warming;
-    else if (v.sockets > 0 || v.queued)   v.status = ChainStatus::Dialling;
-    else                                  v.status = ChainStatus::Dark;
+    // ---- absence, freshness, and the status word -------------------------
+    // HAVE_DATA IS THE MODEL HOLDING A BLOCK, not a counter being non-zero.
+    // distinct_blocks() counts ids the model actually stores, so it is zero
+    // exactly when there is nothing to report and non-zero exactly when there
+    // is -- which is what the `--` rendering needs and what no other counter
+    // here can promise.
+    v.have_data = m.distinct_blocks() > 0;
+    v.fresh     = fresh;
+    v.status    = classify(fresh, v.peers_up, v.sockets, v.queued, v.cadence_ok,
+                           v.target_s, now_ms, th);
+    v.tip_age_ms = fresh.tip_age_ms(now_ms);
+    v.rx_age_ms  = fresh.rx_age_ms(now_ms);
+
+    // WHICH CLOCK THE STATUS WORD IS SHOWING. Each word is about a different
+    // event, so each one is timed from that event and not from a single "age"
+    // that would mean something different in every row:
+    //   DOWN            since the last peer went away
+    //   DARK / DIAL     since this chain started being watched (we have never
+    //                   been connected, so there is no outage to time)
+    //   everything else since the tip last moved
+    v.status_age_known = fresh.known;
+    if (!fresh.known) {
+        v.status_age_ms = 0;
+    } else if (v.status == ChainStatus::Down) {
+        v.status_age_ms = fresh.down_ms(now_ms);
+    } else if (v.status == ChainStatus::Dark || v.status == ChainStatus::Dialling) {
+        v.status_age_ms = FreshnessView::age(now_ms, fresh.started_at_ms);
+    } else {
+        v.status_age_ms = v.tip_age_ms;
+    }
 
     // The feed is arrival order, newest first, deduplicated by construction:
     // arrival_order() holds one entry per DISTINCT id.
@@ -511,10 +662,29 @@ inline const char* status_color(ChainStatus s) {
     switch (s) {
         case ChainStatus::Live:     return kGreen;
         case ChainStatus::Warming:  return kYellow;
+        case ChainStatus::Quiet:    return kYellow;
+        case ChainStatus::Stale:    return kRed;
+        case ChainStatus::Down:     return kRed;
         case ChainStatus::Dialling: return kBlue;
         case ChainStatus::Dark:     return kRed;
     }
     return kWhite;
+}
+
+// The status word with the age of the thing it is talking about, and a short
+// sentence for the states a reader should not have to interpret. LIVE says
+// nothing extra: it is the only state that needs no excuse.
+inline std::string status_phrase(const ChainView& v) {
+    std::string s = to_string(v.status);
+    if (v.status_age_known && v.status != ChainStatus::Live)
+        s += " " + fmt_age(v.status_age_ms);
+    switch (v.status) {
+        case ChainStatus::Dark:  s += " never connected"; break;
+        case ChainStatus::Down:  s += " no peers";        break;
+        case ChainStatus::Stale: s += " tip frozen";      break;
+        default: break;
+    }
+    return s;
 }
 
 // Green inside 25% of target, yellow inside 60%, red outside. The chain's own
@@ -533,29 +703,91 @@ inline void label(Line& l, const char* text) {
 }
 
 inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<Row>& rows) {
+    const bool have = v.have_data;
     {   // title
         Line l(cols, color);
         l.put(" ").sgr(kBold).sgr(chain_color(v.chain)).put(upper(to_string(v.chain)));
         l.sgr(kReset).put("  port ").put(std::to_string(v.port));
-        l.put("  ").sgr(status_color(v.status)).put(to_string(v.status)).sgr(kReset);
+        l.put("  ").sgr(status_color(v.status)).put(status_phrase(v)).sgr(kReset);
         l.put("  ").sgr(kDim).put("target ").sgr(kReset).put(std::to_string(v.target_s)).put("s");
+        if (v.source == ChainSource::Restored) {
+            l.put("  ").sgr(kYellow).put("[FROM FILE ").put(fmt_age(v.data_age_ms))
+             .put(" OLD]").sgr(kReset);
+        }
         l.put(" ").sgr(kDim).repeat('-', l.room()).sgr(kReset);
         rows.emplace_back(kAlways, l.take());
     }
+    if (is_degraded(v.status)) {
+        // THE "WHY" ROW. A status word on its own makes the reader guess at
+        // what it implies about the figures underneath, and at 4am a reader
+        // guesses generously. So a degraded panel states, in a sentence, what
+        // is missing and how old the rest of the panel is -- at kAlways
+        // priority, so a short terminal sheds detail rows before it sheds the
+        // reason the detail is not to be trusted.
+        Line l(cols, color);
+        label(l, "!");
+        l.sgr(status_color(v.status)).sgr(kBold).put(to_string(v.status)).sgr(kReset).put("  ");
+        const std::string age = v.status_age_known ? fmt_age(v.status_age_ms) : std::string("?");
+        switch (v.status) {
+            case ChainStatus::Down:
+                l.sgr(kDim).put("no peers for ").sgr(kReset).put(age).sgr(kDim)
+                 .put(have ? " -- the figures below are last known, not current"
+                           : " -- nothing was ever received from this chain");
+                break;
+            case ChainStatus::Dark:
+                l.sgr(kDim).put("never connected, ").sgr(kReset).put(age).sgr(kDim)
+                 .put(" into this session -- nothing below was measured");
+                break;
+            case ChainStatus::Dialling:
+                l.sgr(kDim).put("dialling for ").sgr(kReset).put(age).sgr(kDim)
+                 .put(" -- no handshake yet, nothing below was measured");
+                break;
+            case ChainStatus::Stale:
+                l.sgr(kDim).put("no new height for ").sgr(kReset).put(age);
+                l.sgr(kDim).put(", last rx ").sgr(kReset).put(fmt_age(v.rx_age_ms));
+                l.sgr(kDim).put(" -- the figures below are that old");
+                break;
+            case ChainStatus::Quiet:
+                l.sgr(kDim).put("no new height for ").sgr(kReset).put(age);
+                l.sgr(kDim).put(", last rx ").sgr(kReset).put(fmt_age(v.rx_age_ms));
+                l.sgr(kDim).put(" -- long for this chain, not yet wrong");
+                break;
+            default:
+                break;
+        }
+        rows.emplace_back(kAlways, l.take());
+    }
     {   // tip
+        //
+        // THE `--` ROW. Every figure on this line is gated on have_data, and
+        // all of them together: a chain we hold no block for has no tip height,
+        // no id, no difficulty and no implied hashrate, and printing the
+        // zero-initialised members would put "0" and "0.00 H/s" on screen in
+        // the same shape a live chain uses. The age beside them says when the
+        // numbers were last true, which is the other half of not lying.
         Line l(cols, color);
         label(l, "tip");
-        l.sgr(kBold).put(std::to_string(v.tip_height)).sgr(kReset);
-        l.put(" ").put(v.tip_id8);
-        l.put("  ").sgr(kDim).put("diff ").sgr(kReset).put(fmt_si(v.difficulty_d));
-        l.put("  ").sgr(kDim).put("hash ").sgr(kReset).put(fmt_si(v.hashrate)).put("H/s");
-        l.put("  ").sgr(kDim).put("cum ").sgr(kReset).put(fmt_si(v.cumulative_d));
+        if (!have) l.sgr(kDim);
+        l.sgr(have ? kBold : kDim).put(or_dash(have, std::to_string(v.tip_height))).sgr(kReset);
+        if (!have) l.sgr(kDim);
+        l.put(" ").put(have ? v.tip_id8 : std::string(kNoData));
+        l.put("  ").sgr(kDim).put("diff ").sgr(kReset).put(or_dash(have, fmt_si(v.difficulty_d)));
+        l.put("  ").sgr(kDim).put("hash ").sgr(kReset)
+         .put(have ? fmt_si(v.hashrate) + "H/s" : std::string(kNoData));
+        l.put("  ").sgr(kDim).put("cum ").sgr(kReset).put(or_dash(have, fmt_si(v.cumulative_d)));
+        if (have && v.status_age_known) {
+            l.put("  ").sgr(is_degraded(v.status) ? kRed : kDim).put("as of ")
+             .put(fmt_age(v.tip_age_ms)).sgr(kReset);
+        }
         rows.emplace_back(kAlways, l.take());
     }
     {   // cadence
         Line l(cols, color);
         label(l, "cadence");
-        if (v.cadence_ok) {
+        if (!have) {
+            l.sgr(kDim).put(kNoData).put("  no block held for this chain: nothing to time")
+             .sgr(kReset);
+        } else if (v.cadence_ok) {
             const std::uint64_t obs_ms = static_cast<std::uint64_t>(v.cadence_s * 1000.0 + 0.5);
             l.sgr(cadence_color(v.cadence_s, v.target_s));
             l.put(fmt_fixed(static_cast<long double>(v.cadence_s), 2)).put(" s");
@@ -575,8 +807,9 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
     {   // pulse
         Line l(cols, color);
         label(l, "pulse");
-        const std::string sp = sparkline(v.gaps_ms, v.target_s * 1000ull, 24);
-        if (sp.empty()) l.sgr(kDim).put("(no live gaps yet)");
+        const std::string sp = have ? sparkline(v.gaps_ms, v.target_s * 1000ull, 24) : std::string();
+        if (!have)          l.sgr(kDim).put(kNoData).put("  (no data)").sgr(kReset);
+        else if (sp.empty()) l.sgr(kDim).put("(no live gaps yet)");
         else {
             l.sgr(cadence_color(v.cadence_ok ? v.cadence_s : static_cast<double>(v.target_s),
                                 v.target_s)).put(sp).sgr(kReset);
@@ -588,12 +821,32 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
     {   // races
         Line l(cols, color);
         label(l, "races");
-        l.sgr(kDim).put("contested ").sgr(kReset).put(std::to_string(v.contested));
-        l.sgr(kDim).put("  uncles named ").sgr(kReset).put(std::to_string(v.uncles_named));
-        l.sgr(kDim).put(" resolved ").sgr(kReset).put(std::to_string(v.uncles_resolved));
-        l.sgr(kDim).put("  monero tpl ").sgr(kReset).put(std::to_string(v.monero_high));
-        l.sgr(kDim).put(" over ").sgr(kReset).put(std::to_string(v.monero_heights));
+        l.sgr(kDim).put("contested ").sgr(kReset).put(or_dash(have, std::to_string(v.contested)));
+        l.sgr(kDim).put("  uncles named ").sgr(kReset)
+         .put(or_dash(have, std::to_string(v.uncles_named)));
+        l.sgr(kDim).put(" resolved ").sgr(kReset)
+         .put(or_dash(have, std::to_string(v.uncles_resolved)));
+        l.sgr(kDim).put("  monero tpl ").sgr(kReset)
+         .put(or_dash(have, std::to_string(v.monero_high)));
+        l.sgr(kDim).put(" over ").sgr(kReset).put(or_dash(have, std::to_string(v.monero_heights)));
         l.sgr(kDim).put(" heights");
+        rows.emplace_back(kDetail, l.take());
+    }
+    if (v.carried) {
+        // CONTINUITY. What the last session left in the state file, labelled
+        // with its age and kept on its own row so it can never be mistaken for
+        // a live reading. This row is the visible half of "the numbers survived
+        // the kill": on a restart it is populated before a single packet has
+        // been sent, and on a chain that is down it is the only chain figure on
+        // the panel that is not a `--`.
+        Line l(cols, color);
+        label(l, "carry");
+        l.sgr(kDim).put("prev tip ").sgr(kReset).put(std::to_string(v.carry_tip_height));
+        if (!v.carry_tip_id8.empty()) l.put(" ").sgr(kDim).put(v.carry_tip_id8).sgr(kReset);
+        l.sgr(kDim).put("  saved ").sgr(kReset).put(fmt_age(v.carry_age_ms))
+         .sgr(kDim).put(" ago");
+        l.sgr(kDim).put("  lifetime tip ").sgr(kReset).put(std::to_string(v.lifetime_tip_max));
+        l.sgr(kDim).put("  monero tpl ").sgr(kReset).put(std::to_string(v.lifetime_monero_max));
         rows.emplace_back(kDetail, l.take());
     }
     {   // net
@@ -605,10 +858,15 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
         l.sgr(kDim).put(" known / ").sgr(kReset).put(std::to_string(v.gossiped));
         l.sgr(kDim).put(" gossip / ").sgr(kReset).put(std::to_string(v.queued));
         l.sgr(kDim).put(" queued");
-        l.sgr(kDim).put("  blocks ").sgr(kReset).put(std::to_string(v.distinct));
-        l.sgr(kDim).put(" (dup ").sgr(kReset).put(std::to_string(v.dupes));
-        l.sgr(kDim).put(", bad ").sgr(kReset).put(std::to_string(v.parse_failures));
-        l.sgr(kDim).put(", bc ").sgr(kReset).put(std::to_string(v.broadcasts));
+        // PEER COUNTS ARE NEVER DASHED. "0 up" is a measurement -- we looked at
+        // our own socket table and there were none -- and it is paired with the
+        // status word that says what that means. The BLOCK counts beside them
+        // are dashed, because a model holding nothing has not counted zero
+        // duplicates, it has counted nothing.
+        l.sgr(kDim).put("  blocks ").sgr(kReset).put(or_dash(have, std::to_string(v.distinct)));
+        l.sgr(kDim).put(" (dup ").sgr(kReset).put(or_dash(have, std::to_string(v.dupes)));
+        l.sgr(kDim).put(", bad ").sgr(kReset).put(or_dash(have, std::to_string(v.parse_failures)));
+        l.sgr(kDim).put(", bc ").sgr(kReset).put(or_dash(have, std::to_string(v.broadcasts)));
         l.sgr(kDim).put(")");
         rows.emplace_back(kNetwork, l.take());
     }
@@ -629,7 +887,9 @@ inline void panel(const ChainView& v, std::size_t cols, bool color, std::vector<
         // ARRIVAL order, newest first -- not height order. A backfilled parent
         // arrives after the tip that named it, and showing the order things
         // actually reached us is the point of a feed.
-        if (v.feed.empty()) l.sgr(kDim).put("(nothing received yet)");
+        if (v.feed.empty() && v.source == ChainSource::Restored)
+            l.sgr(kDim).put("(the state file carries totals, not the arrival feed)");
+        else if (v.feed.empty()) l.sgr(kDim).put("(nothing received yet)");
         for (const FeedRow& r : v.feed) {
             // Only start an entry that fits whole: a feed row cut in half looks
             // like a truncated block id, which is exactly the wrong thing for a
@@ -655,13 +915,83 @@ inline void header(const MonitorFrame& f, const MonitorTotals& t, std::size_t co
         l.put(" ").sgr(kBold).put("p2pool monitor").sgr(kReset);
         l.put("  ").sgr(kBold).sgr(kGreen).put("READ-ONLY").sgr(kReset);
         l.put("  ").sgr(kDim).put("chains ").sgr(kReset)
-         .put(std::to_string(t.chains_live)).put("/").put(std::to_string(t.chains));
+         .sgr(t.chains_live == t.chains ? kGreen : kYellow)
+         .put(std::to_string(t.chains_live)).put("/").put(std::to_string(t.chains)).sgr(kReset);
+        if (t.chains_down)  l.put("  ").sgr(kRed).put(std::to_string(t.chains_down))
+                             .put(" down").sgr(kReset);
+        if (t.chains_stale) l.put("  ").sgr(kRed).put(std::to_string(t.chains_stale))
+                             .put(" stale").sgr(kReset);
         l.put("  ").sgr(kDim).put("up ").sgr(kReset).put(fmt_hms(f.elapsed_ms));
         l.put("  ").sgr(kDim).put("peers ").sgr(kReset).put(std::to_string(t.peers_up))
          .put("/").put(std::to_string(t.peers_known));
         l.put("  ").sgr(kDim).put("blocks ").sgr(kReset).put(std::to_string(t.blocks));
         l.put("  ").sgr(kDim).put("races ").sgr(kReset).put(std::to_string(t.contested));
         l.put("  ").sgr(kReset).put(fmt_bytes(t.bytes_out)).sgr(kDim).put(" out");
+        rows.emplace_back(kAlways, l.take());
+    }
+    {
+        // COVERAGE, stated in words on its own row and never inferred.
+        //
+        // The totals above are sums over the CONFIGURED chains, and when one of
+        // them is dark that sum is a smaller-than-it-looks number wearing a
+        // three-chain label. Dropping the dead chain from the total would hide
+        // it; the fix is to print how many chains are actually behind the
+        // figures, every frame, whether or not anything is wrong.
+        Line l(cols, color);
+        l.put(" ").sgr(kDim).put("coverage ").sgr(kReset);
+        l.sgr(t.chains_reporting == t.chains ? kGreen : kYellow)
+         .put(std::to_string(t.chains_reporting)).put("/")
+         .put(std::to_string(t.chains)).sgr(kReset)
+         .sgr(kDim).put(" reporting (the totals above cover those)").sgr(kReset);
+        for (const ChainView& c : f.chains) {
+            if (l.room() < 18) break;
+            l.put("  ").sgr(chain_color(c.chain)).put(upper(to_string(c.chain))).sgr(kReset);
+            l.put(" ").sgr(status_color(c.status)).put(to_string(c.status)).sgr(kReset);
+        }
+        rows.emplace_back(kAlways, l.take());
+    }
+    {
+        // THE DURABILITY BANNER. Drawn every frame, in both states, because
+        // "are these numbers going to survive this process" is not something an
+        // operator should have to discover by killing it.
+        const PersistView& p = f.persist;
+        Line l(cols, color);
+        l.put(" ").sgr(kDim).put("persist  ").sgr(kReset);
+        if (!p.enabled) {
+            l.sgr(kBold).sgr(kRed).put("OFF").sgr(kReset);
+            l.put(" ").sgr(kRed).put(p.off_reason.empty() ? std::string("(no reason given)")
+                                                          : p.off_reason).sgr(kReset);
+            l.sgr(kDim).put("  -- every number here is in-process only and dies with the session");
+        } else {
+            l.sgr(p.errors ? kYellow : kGreen).put("ON").sgr(kReset);
+            // WRITE ERRORS COME FIRST, before the path and the counters. This
+            // row is the one that overflows a narrow terminal, and the field
+            // that must never be the one truncated away is the one saying the
+            // file is not being written.
+            if (p.errors)
+                l.put("  ").sgr(kRed).sgr(kBold).put("ERR ").put(std::to_string(p.errors))
+                 .sgr(kReset).sgr(kRed).put(": ").put(p.last_error).sgr(kReset);
+            l.put(" ").put(p.dir);
+            l.sgr(kDim).put("  seq ").sgr(kReset).put(std::to_string(p.seq));
+            l.sgr(kDim).put(" saved ").sgr(kReset)
+             .put(p.ever_saved ? fmt_age(p.saved_age_ms) + " ago" : std::string("never"));
+            l.sgr(kDim).put("  session ").sgr(kReset).put(std::to_string(p.sessions));
+            if (p.restored)
+                l.sgr(kDim).put(" from ").sgr(kReset).put(fmt_age(p.restored_age_ms))
+                 .sgr(kDim).put("-old state");
+            if (p.loop_stall_max_ms)
+                l.sgr(kDim).put("  stall ").sgr(kReset)
+                 .put(std::to_string(p.loop_stall_max_ms)).sgr(kDim).put(" ms");
+            l.sgr(kDim).put("  total up ").sgr(kReset).put(fmt_hms(p.runtime_ms_total));
+        }
+        rows.emplace_back(kAlways, l.take());
+    }
+    if (f.from_file) {
+        Line l(cols, color);
+        l.put(" ").sgr(kBold).sgr(kYellow).put("RESTORED FRAME").sgr(kReset);
+        l.sgr(kDim).put("  rendered from the state file, written ").sgr(kReset)
+         .put(fmt_age(f.file_age_ms)).sgr(kDim)
+         .put(" ago -- no network was dialled and no number below is current");
         rows.emplace_back(kAlways, l.take());
     }
     {
