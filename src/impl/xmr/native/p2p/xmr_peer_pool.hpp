@@ -166,6 +166,20 @@ public:
         Millis maintenance_tick_ms = 1'000;
         Millis connect_timeout_ms  = levinns::P2P_DEFAULT_CONNECTION_TIMEOUT_MS;
 
+        // Local address to SOURCE-BIND outbound connections to. Empty = let the
+        // OS choose, which is what a single-homed node wants.
+        //
+        // It is here because monerod enforces ONE CONNECTION PER REMOTE IP
+        // ("CONNECTION FROM x REFUSED, too many connections from the same
+        // address", net_node.inl) and does NOT source-bind its own outbound
+        // connections to its p2p bind address. So on a loopback regtest rig the
+        // two daemons' mutual links already occupy each other's 127.0.0.1 slot,
+        // and a third participant that does not choose its own source address is
+        // refused before it can say hello. Same knob, same reason, as the C5
+        // live-push tool's C5_SRC_IP. On a real network it is the multi-homed /
+        // egress-selection control.
+        std::string bind_ip;
+
         // D-3 back-pressure.
         std::size_t max_spans_per_peer = MAX_SPANS_PER_PEER;
         std::size_t max_spans_total    = MAX_SPANS_TOTAL;
@@ -511,6 +525,23 @@ private:
         auto sock = std::make_shared<tcp::socket>(io_);
         auto self = shared_from_this();
         const tcp::endpoint ep(addr, port);
+
+        if (!cfg_.bind_ip.empty()) {
+            boost::system::error_code bec;
+            const auto local = boost::asio::ip::make_address(cfg_.bind_ip, bec);
+            if (!bec) sock->open(ep.protocol(), bec);
+            if (!bec) sock->bind(tcp::endpoint(local, 0), bec);
+            if (bec) {
+                // A source address we cannot bind is a configuration error, and
+                // dialing from the wrong one would silently become a different
+                // peer identity at the far end.
+                store_.on_dial_failed(key, now);
+                ++tel_.dials_failed;
+                tel_.last_close_peer = key;
+                tel_.last_close_why  = "cannot bind source address " + cfg_.bind_ip;
+                return;
+            }
+        }
 
         // A connect timer, because async_connect on a black-holed address can
         // hang for the OS default (minutes) and would hold a dial slot the

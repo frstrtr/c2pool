@@ -116,6 +116,48 @@ if (BUILD_TESTING AND UNIX)
     target_compile_features(xmr_c5_regtest_push PRIVATE cxx_std_20)
 endif()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# M0 (node/): THE ASSEMBLY. The wave-1 components are header-only and each one
+# states a threading contract it does not itself provide; node/ builds the
+# threads, the boot, the sync schedule and the status surface that turn them
+# into a running node, and node/tools/ is the entrypoint that runs it.
+#
+# Same discipline as xmr_c5_regtest_push above: BUILT in both build.yml
+# --target lists so it cannot bit-rot, RUN by nobody in CI (it needs a daemon
+# and a network), and registering no ctest test -- so the #1539 Not-Run rule
+# does not apply to it. What IS registered is test/xmr_native_node_kat, which
+# covers the parts of the assembly that can be judged without a daemon: the
+# queue adapters, the io-thread fence, the boot's derivation of the genesis
+# row, and the sync driver's schedule.
+#
+# Links boost::asio (header-only in the pinned Boost 1.90), a thread library,
+# and xmr_native_txpool (which brings xmr_coin for keccak, the tree hash and
+# the vendored difficulty retarget). It links `randomx` when
+# XMR_BUILD_RANDOMX is on, and defines XMR_NATIVE_NODE_HAVE_RANDOMX so the
+# node compiles the real LightVerifier in; without it the binary still builds
+# (the sanitizer leg has no RandomX) and refuses to call any block verified.
+# ─────────────────────────────────────────────────────────────────────────────
+if (BUILD_TESTING AND UNIX)
+    add_executable(xmr_native_node node/tools/xmr_native_node_main.cpp)
+    target_include_directories(xmr_native_node PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(xmr_native_node PRIVATE xmr_native_txpool)
+    target_compile_features(xmr_native_node PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_node PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_node PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_node PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_node PRIVATE Threads::Threads)
+    endif()
+    if (TARGET randomx)
+        target_link_libraries(xmr_native_node PRIVATE randomx)
+        target_compile_definitions(xmr_native_node PRIVATE XMR_NATIVE_NODE_HAVE_RANDOMX=1)
+    endif()
+endif()
+
 if (BUILD_TESTING)
     add_subdirectory(test)
 endif()

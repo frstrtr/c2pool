@@ -481,4 +481,42 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_native_block_relay_kat COMMAND xmr_native_block_relay_kat)
 
+    # ------------------------------------------------------------------
+    # M0 -- the assembly (../node/).
+    #
+    #   xmr_native_node_kat -- everything about the wire-up that can be judged
+    #   without a daemon: the worker loops and their bounded queues, the
+    #   enqueue-and-return adapters (including the deferred txpool verdict,
+    #   which must not be invented), the RandomX io-thread WITNESS that makes
+    #   the node's foreign-call counter trustworthy, the genesis row derived
+    #   from a real monerod genesis blob against monerod's own published
+    #   numbers for it, the pre-boot advertisement that keeps a peer from
+    #   closing us before the boot fetch lands, and the sync driver schedule.
+    #
+    # Links xmr_coin (block identity: keccak + tree hash) and boost's
+    # header-only multiprecision, which the vendored difficulty retarget types
+    # its difficulty as -- the same LIGHT link as the chain-index KAT. No
+    # RandomX, no sockets, no daemon; the node binary itself is what needs
+    # those, and it is built (never run) by CI as xmr_native_node.
+    add_executable(xmr_native_node_kat xmr_native_node_kat.cpp)
+    target_include_directories(xmr_native_node_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_node_kat PRIVATE xmr_coin)
+    target_compile_features(xmr_native_node_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_node_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_node_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_node_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_node_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_node_kat COMMAND xmr_native_node_kat)
+    # It parks a worker thread on a spin-wait to fill a queue; bounded, but
+    # never let it be unbounded on a loaded runner.
+    set_tests_properties(xmr_native_node_kat PROPERTIES TIMEOUT 120)
+
 endif()
