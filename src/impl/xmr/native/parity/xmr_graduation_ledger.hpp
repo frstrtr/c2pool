@@ -58,17 +58,29 @@
 // beside it so a reader can see both numbers rather than trust one.
 //
 // SCOPE FENCE: src/impl/xmr/ only. No consensus digest, no src/sharechain/v37.
-// Header-only, STL only, no clock of its own -- the caller supplies unix time,
-// so a KAT drives 72 hours in microseconds.
+// Header-only, no clock of its own -- the caller supplies unix time, so a KAT
+// drives 72 hours in microseconds. STL only apart from save(), which reaches
+// for fsync where the platform has one; see the comment there.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
+
+// save() replaces the file by rename, and flushes the replacement to the disk
+// first where the platform offers a way to. That is the ONE non-STL thing in
+// this header, it is confined to save(), and it degrades to "rename only" --
+// still untearable, merely not power-cut-proof -- where the header is absent.
+#if defined(__unix__) || defined(__APPLE__)
+#  include <fcntl.h>
+#  include <unistd.h>
+#  define XMR_M4_LEDGER_HAVE_FSYNC 1
+#endif
 
 // C6's ledger, for `same_key` and `key_string`. The four-part key means exactly
 // what it means there, and a second spelling of "are these the same
@@ -524,12 +536,61 @@ public:
         return true;
     }
 
+    // WRITE ELSEWHERE, THEN RENAME. The ledger is not a log that can lose its
+    // tail: it is the entire artefact of a leg, and by the end of a 72 h posture
+    // it is the only place three days of soaking exist. A truncating in-place
+    // write puts that at the mercy of the instant between `trunc` and the last
+    // byte -- and this file is rewritten every `autosave_every` samples, for
+    // days, under a watchdog whose whole job is to kill and restart the writer.
+    // Landing in that window would not corrupt one sample, it would leave a
+    // half-written file that load() rejects as "not valid JSON" and start the
+    // streak from zero, silently, with no way to tell that from a genuine reset.
+    //
+    // rename(2) within a directory is atomic, so a reader -- the next process,
+    // the watchdog, a human with `cat` -- sees the whole previous ledger or the
+    // whole new one and never a splice of the two. The fsync before it is what
+    // makes that true across a power cut rather than only across a crash.
     bool save(const std::string& path, std::string* why = nullptr) const {
-        std::ofstream f(path, std::ios::binary | std::ios::trunc);
-        if (!f) { if (why) *why = "m4 ledger: cannot open '" + path + "' for writing"; return false; }
-        const std::string t = to_json();
-        f.write(t.data(), static_cast<std::streamsize>(t.size()));
-        if (!f.good()) { if (why) *why = "m4 ledger: write failed on '" + path + "'"; return false; }
+        const std::string tmp = path + ".tmp";
+        const std::string t   = to_json();
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (!f) {
+                if (why) *why = "m4 ledger: cannot open '" + tmp + "' for writing";
+                return false;
+            }
+            f.write(t.data(), static_cast<std::streamsize>(t.size()));
+            f.flush();
+            if (!f.good()) {
+                if (why) *why = "m4 ledger: write failed on '" + tmp + "'";
+                f.close();
+                std::remove(tmp.c_str());
+                return false;
+            }
+        }
+#if defined(XMR_M4_LEDGER_HAVE_FSYNC)
+        // Best effort by design: a platform that cannot fsync still gets the
+        // untearable rename below, which is the property the soak depends on.
+        if (const int fd = ::open(tmp.c_str(), O_RDONLY); fd >= 0) {
+            ::fsync(fd);
+            ::close(fd);
+        }
+#endif
+        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+            if (why) *why = "m4 ledger: cannot rename '" + tmp + "' onto '" + path + "'";
+            std::remove(tmp.c_str());
+            return false;
+        }
+#if defined(XMR_M4_LEDGER_HAVE_FSYNC)
+        // And the directory entry, so the rename itself survives the same cut.
+        const std::size_t slash = path.find_last_of('/');
+        const std::string dir   = (slash == std::string::npos) ? std::string(".")
+                                                               : path.substr(0, slash ? slash : 1);
+        if (const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY); dfd >= 0) {
+            ::fsync(dfd);
+            ::close(dfd);
+        }
+#endif
         return true;
     }
 
