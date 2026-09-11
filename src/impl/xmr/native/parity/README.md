@@ -47,6 +47,14 @@ field must have been genuinely compared a minimum number of times. A field that
 is never comparable therefore **blocks** graduation instead of being invisible to
 it, and the verdict report prints `<== BLOCKER: never compared` next to it.
 
+Coverage is keyed **per seam** (`TIP.difficulty`, `TEMPLATE.difficulty`), not by
+bare field name. Three names — `prev_id`, `major_version`, `difficulty` — are
+required by both tables and mean different things there, so a bare-name key would
+let a long tip run silently satisfy the template seam's floor for fields nobody
+ever compared there. That is the exact vacuity the floor exists to catch, so the
+KAT pins it: 40 tip samples leave every `TEMPLATE.*` field at zero and named as a
+shortfall.
+
 ## Files
 
 | file | what it holds |

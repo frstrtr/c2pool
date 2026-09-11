@@ -406,6 +406,17 @@ void suite_table() {
                         + TEMPLATE_SEAM.required_equality_count()
                         + SUBMIT_SEAM.required_equality_count(),
           "the ledger's coverage list names every required field (%zu)", names.size());
+
+    // And every entry is DISTINCT. prev_id, major_version and difficulty are
+    // required by both the tip table and the template table; if coverage were
+    // keyed by bare name they would collide, and a long tip run would satisfy
+    // the template seam's floor for fields nobody ever compared there.
+    std::vector<std::string> sorted = names;
+    std::sort(sorted.begin(), sorted.end());
+    CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end(),
+          "every coverage key is distinct (seam-qualified)");
+    CHECK(field_key(ProbeKind::Tip, "difficulty") != field_key(ProbeKind::Template, "difficulty"),
+          "TIP.difficulty and TEMPLATE.difficulty are two different claims");
 }
 
 // ===========================================================================
@@ -595,9 +606,9 @@ void suite_tip_derived() {
     for (std::size_t i = 0; i < TIP_SEAM.count; ++i) {
         const FieldSpec& f = TIP_SEAM.fields[i];
         if (f.regime != Regime::Equality || !f.required) continue;
-        auto it = led.fields().find(f.name);
+        auto it = led.fields().find(field_key(ProbeKind::Tip, f.name));
         CHECK(it != led.fields().end() && it->second.compared == clean && it->second.differed == 0,
-              "field %s compared %llu time(s), 0 differences", f.name,
+              "field TIP.%s compared %llu time(s), 0 differences", f.name,
               (unsigned long long)(it == led.fields().end() ? 0 : it->second.compared));
     }
 }
@@ -1112,6 +1123,29 @@ void suite_ledger() {
         CHECK(names_a_field, "and the reason names an uncompared field");
     }
 
+    // --- a tip run must NOT satisfy the template seam's coverage floor ------
+    // The two tables share three field NAMES. Before coverage was seam-keyed,
+    // 58 tip samples made TEMPLATE.difficulty read as fully covered while the
+    // template seam had produced nothing at all.
+    {
+        GraduationLedger led(key, pol);
+        for (int i = 0; i < 40; ++i)
+            led.record(make_sample(ProbeKind::Tip, 800 + i, ParityVerdict::Clean, 9, 9), 8000 + i);
+        for (const char* shared : {"difficulty", "prev_id", "major_version"}) {
+            auto tip_it = led.fields().find(field_key(ProbeKind::Tip, shared));
+            auto tpl_it = led.fields().find(field_key(ProbeKind::Template, shared));
+            CHECK(tip_it != led.fields().end() && tip_it->second.compared == 40,
+                  "TIP.%s was compared 40 times", shared);
+            CHECK(tpl_it == led.fields().end() || tpl_it->second.compared == 0,
+                  "and TEMPLATE.%s is still uncovered: a tip run is not template evidence",
+                  shared);
+        }
+        bool blocks_template = false;
+        for (const std::string& m : led.shortfalls(8100))
+            if (m.find("TEMPLATE.difficulty") != std::string::npos) blocks_template = true;
+        CHECK(blocks_template, "and the uncovered template field is named as a shortfall");
+    }
+
     // --- key hardness -------------------------------------------------------
     {
         GraduationLedger led(key, pol);
@@ -1295,6 +1329,10 @@ void suite_oracle() {
     const std::string report_before = oracle.verdict_report();
     CHECK(report_before.find("NOT GRADUATED") != std::string::npos, "the verdict says so");
     CHECK(report_before.find("TEMPLATE") != std::string::npos, "and names the empty seam");
+    // The deliverable itself, shown rather than only asserted on: this is what
+    // an operator reads to decide whether monerod may be demoted, and it is
+    // worth being able to look at without attaching a debugger.
+    if (g_verbose) std::printf("\n%s\n", report_before.c_str());
 
     // --- feed the other two seams -----------------------------------------
     {
@@ -1364,6 +1402,7 @@ void suite_oracle() {
               "with all three seams green over the window, the ledger graduates");
         CHECK(led.shortfalls(t).empty(), "and lists no shortfall");
         const std::string rep = render_verdict(led, t);
+        if (g_verbose) std::printf("\n%s\n", rep.c_str());
         CHECK(rep.find("GRADUATED") != std::string::npos, "the verdict report says GRADUATED");
         CHECK(rep.find("BLOCKER") == std::string::npos, "with no uncompared field");
 

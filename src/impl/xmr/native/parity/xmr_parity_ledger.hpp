@@ -136,6 +136,19 @@ struct FieldCounters {
     std::uint64_t absent   = 0;
 };
 
+// Coverage is keyed per SEAM, not per bare field name, and that qualification is
+// load-bearing rather than cosmetic. Three names -- prev_id, major_version and
+// difficulty -- are required by BOTH the tip table and the template table, and
+// they mean different things there: the tip's difficulty is the difficulty OF
+// the block that was just connected, the template's is the difficulty of the
+// block being mined ON TOP of it. Keyed by bare name, a long run of tip samples
+// would silently satisfy the template seam's coverage floor for all three, and
+// a template field nobody ever compared would stop reading as a BLOCKER -- which
+// is precisely the vacuity the floor exists to catch.
+inline std::string field_key(ProbeKind k, const std::string& name) {
+    return std::string(to_string(k)) + "." + name;
+}
+
 struct SeamCounters {
     std::uint64_t samples          = 0;   // judged: CLEAN + FAIL + SERVED-MISMATCH
     std::uint64_t clean            = 0;
@@ -328,14 +341,16 @@ public:
         return out;
     }
 
-    // Every required EQUALITY field across the three seams, by name.
+    // Every required EQUALITY field across the three seams, seam-qualified (see
+    // field_key): "TIP.difficulty" and "TEMPLATE.difficulty" are two different
+    // claims and each has to be earned on its own.
     static std::vector<std::string> required_field_names() {
         std::vector<std::string> out;
         const SeamSpec* specs[3] = {&TIP_SEAM, &TEMPLATE_SEAM, &SUBMIT_SEAM};
         for (const SeamSpec* sp : specs)
             for (std::size_t i = 0; i < sp->count; ++i)
                 if (sp->fields[i].regime == Regime::Equality && sp->fields[i].required)
-                    out.push_back(sp->fields[i].name);
+                    out.push_back(field_key(sp->kind, sp->fields[i].name));
         return out;
     }
 
@@ -507,7 +522,8 @@ public:
 private:
     void record_fields_(const SeamResult& r) {
         // Which required fields were named as absent?
-        for (const std::string& n : r.absent_required) ++fields_[n].absent;
+        const ProbeKind kind = r.sample.kind;
+        for (const std::string& n : r.absent_required) ++fields_[field_key(kind, n)].absent;
 
         // Which required fields appear in the diff list (and were not absent)?
         std::vector<std::string> differed;
@@ -522,7 +538,10 @@ private:
         // oracles are required), so it is driven off the counters instead of
         // the table. Everything the sweep compared and did not flag is equal.
         if (r.sample.kind == ProbeKind::Submit) {
-            for (const std::string& n : differed) { ++fields_[n].compared; ++fields_[n].differed; }
+            for (const std::string& n : differed) {
+                FieldCounters& fc = fields_[field_key(kind, n)];
+                ++fc.compared; ++fc.differed;
+            }
             // The oracles that compared cleanly are those compared minus those
             // that differed; name them from the diff-free side of the table.
             std::uint64_t clean_left = (r.equality_compared > r.equality_differed)
@@ -534,7 +553,8 @@ private:
                 for (const std::string& d : differed) if (d == n) named = true;
                 for (const std::string& a : r.absent_required) if (a == n) named = true;
                 if (named) continue;
-                ++fields_[n].compared; ++fields_[n].equal;
+                FieldCounters& fc = fields_[field_key(kind, n)];
+                ++fc.compared; ++fc.equal;
                 --clean_left;
             }
             return;
@@ -549,7 +569,7 @@ private:
             if (r.sample.verdict == ParityVerdict::Void) continue;  // never compared
             bool was_diff = false;
             for (const std::string& d : differed) if (d == f.name) was_diff = true;
-            FieldCounters& fc = fields_[f.name];
+            FieldCounters& fc = fields_[field_key(kind, f.name)];
             ++fc.compared;
             if (was_diff) ++fc.differed; else ++fc.equal;
         }
