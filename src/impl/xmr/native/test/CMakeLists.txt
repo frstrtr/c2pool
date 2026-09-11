@@ -282,6 +282,39 @@ if (BUILD_TESTING)
     add_test(NAME xmr_native_chain_index_kat COMMAND xmr_native_chain_index_kat)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # REORG-FOLLOW: the same index, booted the way a regtest node boots -- ONE
+    # row at height 0 and nothing below it -- following a heavier branch that
+    # forked below its tip, while running.
+    #
+    # A SEPARATE TARGET RATHER THAN MORE CASES IN THE FILE ABOVE, on purpose.
+    # That fixture seeds a full 735-row difficulty window because it replays
+    # stagenet from an anchor, so every fork point it reaches is already
+    # covered and its reorg suite passed while a from-genesis node could not
+    # reorganise at all. The young-chain state is not reachable from that
+    # fixture; it needs its own boot, and keeping the two apart is what stops
+    # the next person from "simplifying" this one onto the anchored seed and
+    # quietly deleting the coverage.
+    #
+    # Same light link (xmr_coin + header-only boost, no RandomX, no daemon) and
+    # the same drift-guard rule: added to BOTH --target lists in
+    # .github/workflows/build.yml by the change that adds it here (#1539).
+    # ─────────────────────────────────────────────────────────────────────────
+    add_executable(xmr_native_reorg_follow_kat xmr_reorg_follow_kat.cpp)
+    target_include_directories(xmr_native_reorg_follow_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_reorg_follow_kat PRIVATE xmr_coin)
+    target_compile_features(xmr_native_reorg_follow_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_reorg_follow_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_reorg_follow_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_reorg_follow_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME xmr_native_reorg_follow_kat COMMAND xmr_native_reorg_follow_kat)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Wave 1 / C1c: the peer manager and DoS (../p2p/chain_seeds.hpp,
     # chain_locator.hpp, xmr_peer_store.hpp, xmr_dial_plan.hpp, xmr_p2p_dos.hpp,
     # xmr_peer_pool.hpp). Four targets: three STL-only, one on boost::asio.
