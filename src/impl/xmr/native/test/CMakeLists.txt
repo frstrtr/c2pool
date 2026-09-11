@@ -405,4 +405,38 @@ if (BUILD_TESTING)
     target_compile_features(xmr_native_template_coinbase_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_template_coinbase_kat COMMAND xmr_native_template_coinbase_kat)
 
+    # ------------------------------------------------------------------
+    # C5 -- the dual-arm found-block relay.
+    #
+    #   xmr_native_block_relay_kat -- the 2008 frame (encoded here, decoded
+    #   back with the C1a codec), the arm orders, the fail-closed RandomX
+    #   gate, the never-silent-drop rule, the partial-block refusal, the 2009
+    #   responder and the redundant-broadcast carrier's admission ladder.
+    #
+    # Links xmr_coin (keccak / tree root, for the block and transaction ids
+    # the relay re-derives before anything goes out) and xmr_node (the
+    # BlockCandidate bridge in xmr_block_relay_submit_bridge.hpp compiles the
+    # existing monerod submit surface). No RandomX -- the gate is an injected
+    # closure precisely so this component builds and tests without it -- and
+    # no sockets: the broadcast port is the contracts fake.
+    add_executable(xmr_native_block_relay_kat xmr_native_block_relay_kat.cpp)
+    target_include_directories(xmr_native_block_relay_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_block_relay_kat PRIVATE xmr_coin xmr_node)
+    target_compile_features(xmr_native_block_relay_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_block_relay_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_block_relay_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_block_relay_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_block_relay_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_block_relay_kat COMMAND xmr_native_block_relay_kat)
+
 endif()
