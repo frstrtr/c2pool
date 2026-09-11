@@ -553,4 +553,46 @@ if (BUILD_TESTING)
     # never let it be unbounded on a loaded runner.
     set_tests_properties(xmr_native_node_kat PROPERTIES TIMEOUT 120)
 
+    # ------------------------------------------------------------------
+    # M2h -- the P-TPL backlog CONSTRAINT, and the two accounting findings
+    # folded with it.
+    #
+    #   xmr_native_backlog_famine_kat -- the blind spot, reproduced and then
+    #   closed. Its centrepiece runs compare_seam TWICE over the SAME pair of
+    #   arm observations (six EQUALITY fields, identical, agreeing) and gets
+    #   CLEAN without the new constraint and FAIL with it, which is the only
+    #   honest way to show that the previous judge could not have caught a
+    #   native arm serving empty templates forever. It then drives the real
+    #   ParityOracle over both behaviours -- pre-restack (native 0, shadow 5:
+    #   must refuse) and post-restack (native carrying the backlog: must stay
+    #   clean, including the propagation-skew and quiet-chain cases that a
+    #   naive gate would false-positive on) -- and covers the arm-attribution
+    #   counter and the daemon arm's cache expiry.
+    #
+    # Links xmr_coin (block identity) and xmr_node (the PRODUCTION
+    # get_miner_data parser, which suite F drives rather than re-implementing)
+    # -- the same LIGHT link as xmr_native_parity_kat. No RandomX, no sockets,
+    # no daemon.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml. A target registered with add_test but never
+    # built reports "***Not Run" and exits 8 -- the #1539 lesson.
+    add_executable(xmr_native_backlog_famine_kat xmr_backlog_famine_kat.cpp)
+    target_include_directories(xmr_native_backlog_famine_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_backlog_famine_kat PRIVATE xmr_coin xmr_node)
+    target_compile_features(xmr_native_backlog_famine_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_backlog_famine_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_backlog_famine_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_backlog_famine_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_backlog_famine_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_backlog_famine_kat COMMAND xmr_native_backlog_famine_kat)
+
 endif()

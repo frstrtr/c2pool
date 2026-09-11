@@ -35,6 +35,22 @@
 // blocks and invokes on_done synchronously, which matches how the merged
 // MonerodAdapter drives it (it posts and consumes the callback inline). The poll
 // pump is driven by the XmrNode's own loop calling pump_poll() on a timer.
+//
+// IT COUNTS ITSELF, AND THAT IS NOT BOOKKEEPING. The native-template milestone
+// makes a claim about RPC traffic -- "the template path made no daemon call" --
+// and prints a number beside it. The number it used to print came from the
+// embedded node's OWN transport (impl/xmr/native/node/xmr_monerod_http.hpp) and
+// counted only the parity and submit round trips. This transport is a second,
+// independent socket to the same daemon, and in the no-libzmq build its
+// pump_poll() issues a get_miner_data on a timer for the whole life of the
+// process -- an order of magnitude more requests than the headline reported.
+//
+// An auditor with tcpdump would therefore have seen ten times the traffic the
+// status line claimed, and the true claim (zero of them are on the TEMPLATE
+// path) would have been buried under an apparent discrepancy that looked like a
+// lie. So every POST through this transport is counted, split by what drove it,
+// and the status line adds the two transports together and shows the split. The
+// headline number is now the one an auditor can reconcile at the wire.
 // ===========================================================================
 #pragma once
 
@@ -44,6 +60,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -103,6 +121,7 @@ public:
         if (it == subs_.end()) return;
         std::string body;
         std::string rpc = R"({"jsonrpc":"2.0","id":"0","method":"get_miner_data"})";
+        ++poll_calls_;   // counted here, not in http_post, so the split is by DRIVER
         if (!http_post("/json_rpc", rpc, body).empty()) return;
         ZmqFrame f;
         f.topic = c2pool::xmr::node::ZMQ_TOPIC_MINER_DATA;
@@ -116,6 +135,20 @@ public:
 
     const c2pool::xmr::node::DaemonEndpoint& endpoint() const { return ep_; }
 
+    // --- the wire counters (see the header note) -----------------------------
+    // Every HTTP POST this transport puts on the socket, whatever drove it.
+    std::uint64_t rpc_calls()      const noexcept { return calls_.load(); }
+    // ...of which: the ZMQ-substitute tip poll, which is the bulk of them in a
+    // build without libzmq and is on nobody's template path.
+    std::uint64_t tip_poll_calls() const noexcept { return poll_calls_.load(); }
+    // ...and everything else the pool asked for: submit_block, the adapter's own
+    // reads, sendrawtransaction.
+    std::uint64_t other_calls()    const noexcept {
+        const std::uint64_t a = calls_.load(), p = poll_calls_.load();
+        return a > p ? (a - p) : 0;
+    }
+    std::uint64_t rpc_failures()   const noexcept { return failures_.load(); }
+
 private:
     static bool json_rpc_method(const std::string& m) {
         // The direct (non-json_rpc) monerod endpoints the adapter may use.
@@ -126,6 +159,13 @@ private:
     // an error string. Connects, sends, reads until the socket closes / content
     // length is met, strips the header, returns the body.
     std::string http_post(const std::string& path, const std::string& body, std::string& out) {
+        ++calls_;
+        const std::string err = http_post_(path, body, out);
+        if (!err.empty()) ++failures_;
+        return err;
+    }
+
+    std::string http_post_(const std::string& path, const std::string& body, std::string& out) {
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return "live-transport: socket() failed";
         sockaddr_in a{};
@@ -201,6 +241,11 @@ private:
 
     c2pool::xmr::node::DaemonEndpoint ep_;
     std::unordered_map<std::string, std::vector<std::function<void(const ZmqFrame&)>>> subs_;
+    // Atomic because the found-block submitter posts from its own thread while
+    // the node loop is pumping; the counters are read on the status cadence.
+    std::atomic<std::uint64_t> calls_{0};
+    std::atomic<std::uint64_t> poll_calls_{0};
+    std::atomic<std::uint64_t> failures_{0};
 #if defined(XMR_NODE_HAVE_ZMQ)
     void open_zmq_sub(const std::string& topic);   // real SUB socket; separate TU
 #endif

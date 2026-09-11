@@ -359,11 +359,13 @@ void suite_absence() {
 void suite_table() {
     std::printf("== B. the frozen determinism table (comparator v%u) ==\n", COMPARATOR_VERSION);
 
-    // Version 2 since M1 added the P-POOL seam to the table set. This stays an
+    // Version 3 since M2h added the native_backlog_famine CONSTRAINT to the
+    // P-TPL table (M1's version 2 was the P-POOL seam joining). This stays an
     // EXACT number rather than a floor on purpose: its whole job is to make
     // anyone who edits a table move the ledger key too, so that a clean streak
     // can never be inherited across a change to what is compared.
-    CHECK(COMPARATOR_VERSION == 2, "comparator version is 2 (P-POOL joined the table set)");
+    CHECK(COMPARATOR_VERSION == 3,
+          "comparator version is 3 (the P-TPL backlog constraint joined the table)");
     CHECK(POOL_SEAM.required_equality_count() == 3,
           "POOL requires 3 EQUALITY fields (weight, fee, blob_size), got %zu",
           POOL_SEAM.required_equality_count());

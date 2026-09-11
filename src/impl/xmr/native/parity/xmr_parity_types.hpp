@@ -54,7 +54,14 @@ namespace c2pool::xmr::native::parity {
 // the LEDGER KEY. A run graduated by a comparator that never asked what the
 // transaction pool held is not evidence about a comparator that does, so the
 // key moves and every streak starts again.
-inline constexpr std::uint32_t COMPARATOR_VERSION = 2;
+//
+// Version 3 (M2h): P-TPL gained the native_backlog_famine CONSTRAINT. This one
+// IS about a table -- a comparator that could report CLEAN while the native arm
+// served an empty template at every height, forever, was reporting agreement
+// over the one property the milestone exists to establish. Every streak earned
+// under version 2 was earned by a judge that could not see that, so it does not
+// carry.
+inline constexpr std::uint32_t COMPARATOR_VERSION = 3;
 
 // ---------------------------------------------------------------------------
 // Regimes -- how a field is judged. Named after the plan's determinism table.
@@ -295,7 +302,18 @@ inline constexpr FieldSpec TEMPLATE_FIELDS[] = {
     {"median_weight",           Regime::Equality,      true,  true },
     {"already_generated_coins", Regime::Equality,      true,  true },
     {"median_timestamp",        Regime::Constraint,    false, false},
+    // The COUNT stays a Measurement: two pools may legitimately differ by a few
+    // transactions at any instant, and an equality gate here would fire on
+    // ordinary propagation skew.
     {"tx_backlog_count",        Regime::Measurement,   false, false},
+    // ...but the FAMINE SHAPE is a Constraint. A native backlog of 0 sustained
+    // across K samples and S seconds while the shadow arm holds transactions is
+    // not skew and is not agreement: it is the native pool failing to ingest,
+    // which is invisible to all six EQUALITY rows above because none of them
+    // has anything to do with the transaction set. Evaluated by
+    // BacklogFamineGuard (xmr_backlog_famine.hpp) and delivered through
+    // CompareOptions::constraints, so a violation FAILS the sample.
+    {"native_backlog_famine",   Regime::Constraint,    false, false},
     {"coinbase_bytes",          Regime::NotComparable, false, false},
 };
 

@@ -59,6 +59,7 @@
 
 #include "impl/xmr/native/contracts/miner_data.hpp"
 #include "impl/xmr/native/contracts/parity.hpp"
+#include "impl/xmr/native/parity/xmr_backlog_famine.hpp"
 #include "impl/xmr/native/parity/xmr_parity_comparator.hpp"
 #include "impl/xmr/native/parity/xmr_parity_ledger.hpp"
 #include "impl/xmr/native/parity/xmr_parity_report.hpp"
@@ -83,6 +84,13 @@ struct ParityOracleConfig {
     // revocation sentinel; the oracle only reports, the operator's policy
     // decides, because "with >= 3 peers" is C1's fact, not C6's).
     std::uint64_t tip_lag_warn_s = 60;
+
+    // P-TPL's CONSTRAINT on the transaction backlog. See xmr_backlog_famine.hpp
+    // for why the count itself stays a Measurement while the famine SHAPE is a
+    // gate. Defaults are the guard's own; an operator with no shadow arm turns
+    // it off rather than being told once per refresh that nothing can be
+    // compared.
+    BacklogFamineConfig backlog_famine{};
 };
 
 class ParityOracle final : public IParityOracle {
@@ -105,6 +113,7 @@ public:
         : deps_(deps),
           ledger_(std::move(key), std::move(policy)),
           cfg_(std::move(cfg)),
+          famine_(cfg_.backlog_famine),
           clock_(std::move(clock)),
           log_(std::move(log)) {
         if (!cfg_.ledger_path.empty()) {
@@ -154,6 +163,13 @@ public:
         submits_.push_back(std::move(s)); // NEVER coalesced
         if (submits_.size() > 256) submits_.pop_front();
     }
+
+    // P-TPL's backlog CONSTRAINT, as a line an operator can read. Exposed
+    // because a gate whose state is invisible until it fires is a gate nobody
+    // trusts: the counters say how much evidence has accumulated, not only
+    // whether the threshold was crossed.
+    std::string     backlog_famine() const { std::lock_guard<std::mutex> lk(mtx_); return famine_.describe(); }
+    bool            backlog_famine_tripped() const { std::lock_guard<std::mutex> lk(mtx_); return famine_.tripped(); }
 
     GraduationState state()    const override { std::lock_guard<std::mutex> lk(mtx_); return ledger_.state(); }
     ParityCoverage  coverage() const override { std::lock_guard<std::mutex> lk(mtx_); return ledger_.coverage(); }
@@ -388,6 +404,32 @@ private:
             opt.constraints.push_back(std::move(c));
         }
 
+        // The CONSTRAINT that closes P-TPL's blind spot. tx_backlog_count is a
+        // Measurement and stays one; what is judged here is the FAMINE SHAPE --
+        // we served nothing while the arm we are judged against held something,
+        // sustained. Fed only on an ALIGNED pair, because a backlog claim
+        // across two different tips compares two different questions; a
+        // misaligned sample is undecidable and neither grows nor clears the
+        // streak. See xmr_backlog_famine.hpp.
+        {
+            BacklogFamineGuard::Input fi;
+            fi.aligned      = served.have && shadow.have
+                           && served.height == shadow.height
+                           && served.prev_id == shadow.prev_id;
+            fi.at_unix      = s.at_unix;
+            fi.native_known = served.have;
+            fi.native_backlog = static_cast<std::uint64_t>(s.served.tx_backlog.size());
+            if (shadow.have) {
+                const Obs& sb = shadow.fields.get("tx_backlog_count");
+                if (sb.present) {
+                    fi.shadow_known   = true;
+                    fi.shadow_backlog = std::strtoull(sb.value.c_str(), nullptr, 10);
+                }
+            }
+            const BacklogFamineGuard::Observation fo = famine_.observe(fi);
+            opt.constraints.push_back(fo.check);
+        }
+
         return compare_seam(TEMPLATE_SEAM, served, shadow, opt);
     }
 
@@ -405,6 +447,7 @@ private:
     mutable std::mutex  mtx_;
     GraduationLedger    ledger_;
     ParityOracleConfig  cfg_;
+    BacklogFamineGuard  famine_{};
     ClockFn             clock_;
     LogSink             log_;
 
