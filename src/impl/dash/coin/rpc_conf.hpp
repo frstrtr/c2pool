@@ -19,6 +19,7 @@
 // guard can exercise the parser without dragging the coin config in.
 // ---------------------------------------------------------------------------
 
+#include <core/host_port.hpp>
 #include <cstdint>
 #include <fstream>
 #include <string>
@@ -87,11 +88,9 @@ inline bool load_rpc_conf(const std::string& path, RpcConf& out)
 inline void apply_endpoint_override(const std::string& hostport, RpcConf& out)
 {
     if (hostport.empty()) return;
-    const auto colon = hostport.rfind(':');
-    if (colon == std::string::npos) { out.host = hostport; return; }
-    out.host = hostport.substr(0, colon);
-    const std::string p = hostport.substr(colon + 1);
-    if (!p.empty()) out.port = static_cast<uint16_t>(std::stoi(p));
+    const auto hp = core::parse_host_port(hostport);
+    out.host = hp.host;
+    if (hp.port) out.port = *hp.port;
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 //
 // See docs/ (frstrtr/the) for the full dissolution plan.
 
+#include <core/host_port.hpp>
 #include "web_server.hpp"
 #include "filesystem.hpp"
 #include "p2p_message_stats.hpp"
@@ -655,11 +656,9 @@ void HttpSession::process_request()
                         std::string ip_q = getQueryParam("ip");
                         port_out = 0;
                         if (!host.empty()) {
-                            auto colon = host.rfind(':');
-                            if (colon != std::string::npos) {
-                                try { port_out = static_cast<uint16_t>(std::stoul(host.substr(colon + 1))); } catch (...) {}
-                                host = host.substr(0, colon);
-                            }
+                            auto hp = core::parse_host_port(host);
+                            host = hp.host;
+                            if (hp.port) port_out = *hp.port;
                         } else {
                             host = ip_q;
                         }
@@ -735,11 +734,9 @@ void HttpSession::process_request()
                         uint16_t port = 0;
                         // Host may be "A.B.C.D:PORT" (combined) OR "A.B.C.D" with separate ?port=
                         if (!host.empty()) {
-                            auto colon = host.rfind(':');
-                            if (colon != std::string::npos) {
-                                try { port = static_cast<uint16_t>(std::stoul(host.substr(colon + 1))); } catch (...) {}
-                                host = host.substr(0, colon);
-                            }
+                            auto hp = core::parse_host_port(host);
+                            host = hp.host;
+                            if (hp.port) port = *hp.port;
                         }
                         std::string port_q = getQueryParam("port");
                         if (!port_q.empty()) {

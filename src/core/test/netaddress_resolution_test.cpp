@@ -155,6 +155,51 @@ TEST_F(ResolvedHostsFixture, DottedQuadRoundTripsThroughUnserialize)
 }
 
 // ---------------------------------------------------------------------------
+// #965 regression: an IPv4-mapped IPv6 address -- what the dual-stack acceptor
+// hands back for an IPv4 peer -- must collapse to its dotted-quad IPv4 form
+// (canonical CNetAddr::SetLegacyIPv6) and serialize byte-identically to a
+// natively-accepted IPv4 peer. Pre-fix the mapped form kept NET_IPV4 with an
+// IPv6-string m_ip; Write_IPV4's colon branch did erase_all(':') +
+// ParseHex("ffff127.0.0.1"), emitting a non-16-byte, unparsable addr field.
+// That corrupted the accepting-side version message, so an inbound IPv4 peer
+// never completed the handshake (bip110_inbound_listener_kat, 7 assertions).
+// ---------------------------------------------------------------------------
+TEST_F(ResolvedHostsFixture, V4MappedIPv6CollapsesToIPv4)
+{
+    const auto mapped = boost::asio::ip::make_address("::ffff:127.0.0.1");
+    ASSERT_TRUE(mapped.is_v6());
+
+    // Raw boost address (the ingestion point the acceptor uses).
+    NetAddress from_addr{mapped};
+    EXPECT_EQ(from_addr.address(), "127.0.0.1")
+        << "v4-mapped IPv6 must collapse to dotted-quad, not stay ::ffff:127.0.0.1";
+    EXPECT_EQ(wire_quad(from_addr), LOOPBACK_QUAD)
+        << "collapsed address must put the same 4 bytes on the wire as native 127.0.0.1";
+
+    // The exact accepted-endpoint path: NetService(tcp::endpoint) -> get_addr().
+    boost::asio::ip::tcp::endpoint ep{mapped, 8333};
+    NetService svc{ep};
+    EXPECT_EQ(svc.address(), "127.0.0.1");
+    EXPECT_EQ(svc.port(), uint16_t{8333});
+    EXPECT_EQ(wire_quad(svc), LOOPBACK_QUAD);
+
+    // Full round-trip: the collapsed NetService serializes and reads back as
+    // plain IPv4 (16 addr bytes + 2 port bytes), same as native loopback.
+    PackStream stream;
+    stream << svc;
+    EXPECT_EQ(stream.get_span().size(), 18u);
+    NetService read;
+    stream >> read;
+    EXPECT_EQ(read.address(), "127.0.0.1");
+    EXPECT_EQ(read.port(), uint16_t{8333});
+
+    // A genuine (non-mapped) IPv6 address is untouched -- still NET_IPV6.
+    const auto real_v6 = boost::asio::ip::make_address("2a00:1450:4001:81b::200e");
+    NetAddress v6{real_v6};
+    EXPECT_EQ(v6.address(), "2a00:1450:4001:81b::200e");
+}
+
+// ---------------------------------------------------------------------------
 // Layer 2: the defect. Both of these fail on the pre-fix serializer.
 // ---------------------------------------------------------------------------
 
