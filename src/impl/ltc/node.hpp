@@ -10,6 +10,7 @@
 #include "head_retention.hpp"        // v36-0.24 convergence: clean_tracker Guard predicate (F2 + #25B)
 #include "share_fetch_failover.hpp"  // v36-0.24 convergence: parent-fetch failover memory (#25C)
 #include "desired_request_pacer.hpp"   // futility backoff for the desired-request drain
+#include "ingest_budget.hpp"            // inbound-share admission bounds + ancestor-walk depth bound
 #include <pool/share_download.hpp>     // shared downloader helpers (build_stops)
 
 #include <core/coin_params.hpp>
@@ -26,6 +27,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <random>
@@ -34,10 +38,95 @@
 namespace ltc
 {
 struct HandleSharesData;
-struct ShareReplyData
+
+/// Identity of the heap object a ShareType variant points at. Ownership on this
+/// path is tracked by POINTER, never by hash: a duplicate share carries the same
+/// hash as the copy the sharechain already owns but is a DIFFERENT allocation,
+/// and freeing by hash would free the chain's object.
+inline const void* share_ptr_id(const ShareType& s)
+{
+    return s.invoke_const([](auto* p) { return static_cast<const void*>(p); });
+}
+
+/// Relinquish ownership of the pointee WITHOUT freeing it — used after the
+/// sharechain has adopted the object, so the batch destructor leaves it alone.
+/// Keeps the variant's alternative index, only nulls the pointer (destroy() on a
+/// null pointer is a no-op).
+inline void share_release(ShareType& s)
+{
+    s.invoke([&s](auto* p) {
+        using share_t = std::remove_pointer_t<decltype(p)>;
+        s = static_cast<share_t*>(nullptr);
+    });
+}
+
+/// Deterministic count of share objects freed as ORPHANS — deserialised shares
+/// that no owner ever adopted. Production code never reads it; it is the oracle
+/// the ownership regression test asserts on, because the ASAN CI leg runs with
+/// ASAN_OPTIONS detect_leaks=0 and LeakSanitizer therefore cannot see the leak
+/// class this fixes.
+inline std::atomic<std::uint64_t>& orphan_share_destroy_counter()
+{
+    static std::atomic<std::uint64_t> n{0};
+    return n;
+}
+
+/// Free a share this container still owns (i.e. the sharechain never took it).
+/// A share_release()d slot holds nullptr and is skipped.
+inline void destroy_orphan_share(ShareType& s)
+{
+    if (share_ptr_id(s) == nullptr) return;
+    s.destroy();
+    orphan_share_destroy_counter().fetch_add(1, std::memory_order_relaxed);
+}
+
+/// OWNING payload of one inbound sharereply.
+///
+/// ltc::ShareType is a std::variant of RAW POINTERS with manual lifetime
+/// (sharechain/share.hpp: `new Args()` in load, freed only by an explicit
+/// destroy()). The only container that ever frees a share is the sharechain
+/// itself (ShareChain::remove / ~ShareChain). Before this type existed, every
+/// deserialised share that was NOT adopted by the tracker was simply lost:
+/// a reply that arrived after its 15 s request timeout, a reply whose request
+/// was cancelled on disconnect, a batch dropped by the pending_adds cap, a
+/// duplicate skipped in phase 2, a share whose phase-1 verification failed.
+/// Those leaks have no erase path at all, which is the unbounded growth behind
+/// the RSS self-abort.
+///
+/// Whoever takes an item out MUST either move it into a container that owns it
+/// or share_release() it after the sharechain adopted it.
+struct OwnedShares
 {
     std::vector<ShareType> m_items;
     std::vector<chain::RawShare> m_raw_items;
+
+    OwnedShares() = default;
+    // Always held through a shared_ptr — never copied, never moved.
+    OwnedShares(const OwnedShares&) = delete;
+    OwnedShares& operator=(const OwnedShares&) = delete;
+    OwnedShares(OwnedShares&&) = delete;
+    OwnedShares& operator=(OwnedShares&&) = delete;
+    ~OwnedShares() { for (auto& s : m_items) destroy_orphan_share(s); }
+};
+
+/// ReplyMatcher response type for a sharereply.
+///
+/// The payload is held by shared_ptr and NOT by value: core/reply_matcher.hpp
+/// copies the response twice on the way to the callback (Matcher::got_response
+/// takes it by value, ResponseWrapper::operator()(T result) takes it by value
+/// again), so a value-type destructor here would double free. A null m_owned is
+/// the normal empty response the matcher synthesises on timeout/cancel.
+struct ShareReplyData
+{
+    std::shared_ptr<OwnedShares> m_owned;
+
+    OwnedShares& owned()
+    {
+        if (!m_owned) m_owned = std::make_shared<OwnedShares>();
+        return *m_owned;
+    }
+    std::size_t size() const { return m_owned ? m_owned->m_items.size() : 0; }
+    bool empty() const { return size() == 0; }
 };
 
 class NodeImpl : public pool::SharechainNode<ltc::Config, ltc::ShareChain, ltc::Peer>
@@ -129,6 +218,39 @@ protected:
     // LOG_WARNING backpressure message (peers re-advertise, so dropped shares
     // are re-requested later).
     static constexpr size_t MAX_PENDING_ADDS = 256;
+
+    // ── Ingest admission bounds (RSS self-abort fix) ──────────────────────
+    // MAX_PENDING_ADDS bounds the number of DEFERRED BATCHES. It does not bound
+    // the size of a batch (one sharereply is up to 1000 shares; one unsolicited
+    // `shares` message is bounded only by the 32 MiB socket cap), and it sits
+    // DOWNSTREAM of the phase-1 verify backlog, which had no bound at all: every
+    // share posted to m_verify_pool stays resident until scrypt gets to it, and
+    // the pool drains ~4 threads * ~20 ms = ~200 shares/s while a single peer can
+    // deliver replies far faster than that.
+    //
+    // MAX_INFLIGHT_SHARES = 8192 is ~40 s of verify-pool backlog, the same order
+    // as THINK_WATCHDOG_SECONDS. More than that means the peer is outrunning what
+    // this node can ever verify. A cold full-depth bootstrap is NOT hurt: it
+    // arrives as sequential <=1000-share replies, each hop waiting on the
+    // previous reply, so it self-paces at network RTT.
+    // MAX_INFLIGHT_BYTES = 128 MiB is 8192 * a generous 16 KB raw share, ~2.5% of
+    // the 5000 MB rss limit, and at most four max-size unsolicited messages.
+    static constexpr std::size_t MAX_INFLIGHT_SHARES = 8192;
+    static constexpr std::size_t MAX_INFLIGHT_BYTES  = 128u * 1024u * 1024u;
+    // Charged for a share whose raw wire bytes were not kept (the legacy
+    // `shares` path constructs HandleSharesData without them), so that path
+    // cannot bypass the byte ceiling by reporting zero.
+    static constexpr std::size_t INGEST_BYTES_FALLBACK_PER_SHARE = 4096;
+    // How far into the deferred queue ONE admission attempt may look, and so
+    // the most batches it may evict. admit_or_evict_oldest() SUMS the
+    // reservation held by at most this many of the oldest entries and evicts
+    // only if that sum covers the shortfall, so this bounds a scan, not a
+    // destroy-and-retry loop: a single inbound message can never walk the whole
+    // queue, and it can never destroy anything at all unless the exchange it is
+    // paying for is fundable. When the shortfall is smaller, fewer go: the scan
+    // stops at the first entry that closes it.
+    static constexpr std::size_t MAX_ADMIT_EVICTIONS = 64;
+    IngestBudget m_ingest_budget{MAX_INFLIGHT_SHARES, MAX_INFLIGHT_BYTES};
     std::atomic<int64_t>  m_think_deadline_ns{0};
     std::atomic<uint64_t> m_think_generation{0};
     std::unique_ptr<boost::asio::steady_timer> m_watchdog_timer;
@@ -342,6 +464,7 @@ public:
         m_context = nullptr;
         m_chain = nullptr;
         m_config = nullptr;
+        wire_chain_hooks();
     }
 
     NodeImpl(boost::asio::io_context* ctx, config_t* config)
@@ -379,13 +502,41 @@ public:
                 flush_verified_to_leveldb();
         };
 
-        // Wire up share removal → LevelDB cleanup (p2pool main.py:269-270)
-        // Buffer removals; clean_tracker() flushes after drop-tails.
-        // Safe on crash: unflushed shares get pruned at next startup by load_persisted_shares().
+        // Wire up share removal → LevelDB cleanup + raw-cache eviction.
+        wire_chain_hooks();
+    }
+
+private:
+    /// Subscribe to ShareChain removal. Called from BOTH constructors so the
+    /// default-ctor (unit-test) path exercises the same invariant.
+    ///
+    /// (a) p2pool main.py:269-270 — buffer removals for the LevelDB delete batch
+    ///     that clean_tracker() flushes after drop-tails. Safe on crash:
+    ///     unflushed shares get pruned at next startup by load_persisted_shares().
+    /// (b) m_raw_share_cache had NO erase path anywhere. It was filled for every
+    ///     distinct valid share ever seen (phase 2, before the dup check) and its
+    ///     only would-be backstop lived in the never-called prune_shares(), so it
+    ///     retained the full wire bytes of every share since boot — including all
+    ///     the pruned challenger/fork shares. Tie its lifetime to chain
+    ///     membership: when the owning chain drops a share, drop its raw bytes.
+    ///     Fires on the compute thread under the exclusive tracker lock (the only
+    ///     callers of chain.remove are think()/clean_tracker under it), and every
+    ///     other toucher of m_raw_share_cache holds that mutex, so this is
+    ///     race-free.
+    ///
+    /// REWARD-SAFE: m_raw_share_cache is a relay convenience (exact bytes as
+    /// received); send_shares and the LevelDB persist path both fall back to
+    /// pack(share) on a miss. A share that is no longer in the chain cannot be
+    /// served or paid anyway.
+    void wire_chain_hooks()
+    {
         m_tracker.chain.on_removed([this](const uint256& hash) {
             m_removal_flush_buf.push_back(hash);
+            m_raw_share_cache.erase(hash);
         });
     }
+
+public:
 
     // INetwork: Pool node does not initiate disconnect — peer connections
     // manage their own lifecycle via close_connection()/error() below.
@@ -402,7 +553,13 @@ public:
 
     // ltc
     void send_version(peer_ptr peer);
-    void processing_shares(HandleSharesData& data, NetService addr);
+    /// Admit + phase-1 verify an inbound batch. Returns false when the
+    /// ingest budget refused it (nothing was posted; the batch is freed).
+    /// Take the ingest reservation for one inbound batch, evicting the OLDEST
+    /// deferred batch and retrying when the budget is full. See node.cpp for
+    /// why the budget on its own starves the newest, tip-extending batches.
+    bool admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, const NetService& addr);
+    bool processing_shares(HandleSharesData& data, NetService addr);
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     /// Direct tracker access — compute-thread-only (already holds exclusive lock)
     /// or startup code (before compute thread exists).
@@ -574,7 +731,9 @@ public:
 
     /// Start downloading shares from a peer, beginning at `target_hash`.
     /// Recursively fetches parents until the chain is connected or CHAIN_LENGTH reached.
-    void download_shares(peer_ptr peer, const uint256& target_hash);
+    /// `walk_depth` is how many shares the recursive ancestor walk that led
+    /// here has already pulled; 0 for a fresh think()-originated request.
+    void download_shares(peer_ptr peer, const uint256& target_hash, std::uint64_t walk_depth = 0);
 
     /// Drain up to DESIRED_REQUEST_BUDGET queued desired-share requests
     /// (m_pending_desired) per pass, reposting the remainder to the io_context
@@ -710,11 +869,21 @@ public:
     /// Callers MUST use shared_lock(try_to_lock) — NEVER blocking lock().
     std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
 
-    /// Unified share retention: single-pass prune of chain + verified + LevelDB.
-    /// Replaces multi-pass trim with work-based dead head detection and
-    /// deferred destruction for verified cascade safety.
-    /// Called from run_think() on the ioc thread.
-    void prune_shares(const uint256& best_share);
+    /// Evict the unbounded per-node caches down to their configured limits.
+    ///
+    /// This is what was left of prune_shares() after its tail-drop loop was
+    /// deleted: that loop duplicated clean_tracker Step 3, and prune_shares had
+    /// NO CALL SITE at all, so the three cache_max_* operator knobs
+    /// (cache_max_shared_hashes / cache_max_known_txs / cache_max_raw_shares)
+    /// were inert and m_shared_share_hashes / m_known_txs grew for the life of
+    /// the process. IO-THREAD ONLY: m_known_txs is written lock-free by
+    /// remember_tx on the io thread (see the thread-discipline note above), so
+    /// evicting from the compute thread would race that insert.
+    void evict_caches_io_phase();
+
+    /// Current ingest reservation (admitted batches not yet destroyed).
+    /// Exposed for the heartbeat line so backpressure is visible on a live node.
+    const IngestBudget& ingest_inflight() const { return m_ingest_budget; }
 
     /// Run the share tracker think() cycle: verifies chains, scores heads,
     /// identifies bad peers, and requests needed shares.
@@ -826,7 +995,11 @@ protected:
     // between chunks. IO-THREAD CONFINED, same discipline as m_downloading_shares
     // above -- never touch off the io thread. Mirrors m_think_needs_continue.
     static constexpr std::size_t DESIRED_REQUEST_BUDGET = 50;
-    std::deque<std::pair<NetService, uint256>> m_pending_desired;
+    // `depth` propagates the ancestor-walk length so the recursion in
+    // download_shares can stop at the pruning zone instead of walking to
+    // genesis (ltc::walk_may_continue). think()-originated entries start at 0.
+    struct DesiredRequest { NetService addr; uint256 hash; std::uint64_t depth{0}; };
+    std::deque<DesiredRequest> m_pending_desired;
 
     // ---- desired-drain RATE cap (the budget above is not one) ----
     // DESIRED_REQUEST_BUDGET bounds the work per PASS, and the continuation was
@@ -966,11 +1139,63 @@ protected:
     std::unordered_map<uint256, chain::RawShare, ShareHasher> m_raw_share_cache;
 };
 
+/// OWNING batch travelling the ingest pipeline: protocol handler -> admission ->
+/// verify pool (phase 1) -> m_pending_adds -> phase 2.
+///
+/// Like OwnedShares, it frees every ShareType still held at destruction. Phase 2
+/// calls share_release() on the items the sharechain ADOPTED, so exactly the
+/// shares that found no owner — verify failures, duplicates, anything the
+/// topological build dropped, and every share in a batch the pending_adds cap
+/// dropped — are destroyed here instead of leaking.
+///
+/// Move-only, with HAND-WRITTEN move operations: a defaulted move would copy the
+/// budget back-pointer into the target and leave it live in the source, so the
+/// moved-from destructor would release the same reservation twice.
 struct HandleSharesData
 {
     std::vector<ShareType> m_items;
     std::vector<chain::RawShare> m_raw_items; // original raw bytes, parallel with m_items
     std::map<uint256, std::vector<coin::MutableTransaction>> m_txs;
+
+    HandleSharesData() = default;
+    HandleSharesData(const HandleSharesData&) = delete;
+    HandleSharesData& operator=(const HandleSharesData&) = delete;
+
+    HandleSharesData(HandleSharesData&& o) noexcept
+        : m_items(std::move(o.m_items)),
+          m_raw_items(std::move(o.m_raw_items)),
+          m_txs(std::move(o.m_txs)),
+          m_budget(o.m_budget),
+          m_admitted_shares(o.m_admitted_shares),
+          m_admitted_bytes(o.m_admitted_bytes)
+    {
+        o.m_items.clear();
+        o.detach_budget();
+    }
+
+    HandleSharesData& operator=(HandleSharesData&& o) noexcept
+    {
+        if (this != &o)
+        {
+            free_owned();
+            release_budget();
+            m_items     = std::move(o.m_items);
+            m_raw_items = std::move(o.m_raw_items);
+            m_txs       = std::move(o.m_txs);
+            m_budget          = o.m_budget;
+            m_admitted_shares = o.m_admitted_shares;
+            m_admitted_bytes  = o.m_admitted_bytes;
+            o.m_items.clear();
+            o.detach_budget();
+        }
+        return *this;
+    }
+
+    ~HandleSharesData()
+    {
+        free_owned();
+        release_budget();
+    }
 
     void add(const ShareType& share, std::vector<coin::MutableTransaction> txs)
     {
@@ -985,6 +1210,39 @@ struct HandleSharesData
         m_items.push_back(share);
         m_raw_items.push_back(raw);
         m_txs[share.hash()] = std::move(txs);
+    }
+
+    /// Record the ingest reservation this batch holds; released by ~this.
+    void attach_budget(IngestBudget* budget, std::size_t shares, std::size_t bytes)
+    {
+        m_budget = budget;
+        m_admitted_shares = shares;
+        m_admitted_bytes = bytes;
+    }
+
+    std::size_t admitted_shares() const { return m_admitted_shares; }
+    std::size_t admitted_bytes()  const { return m_admitted_bytes; }
+
+private:
+    IngestBudget* m_budget{nullptr};
+    std::size_t   m_admitted_shares{0};
+    std::size_t   m_admitted_bytes{0};
+
+    void free_owned()
+    {
+        for (auto& s : m_items) destroy_orphan_share(s);
+        m_items.clear();
+    }
+    void release_budget()
+    {
+        if (m_budget) m_budget->release(m_admitted_shares, m_admitted_bytes);
+        detach_budget();
+    }
+    void detach_budget()
+    {
+        m_budget = nullptr;
+        m_admitted_shares = 0;
+        m_admitted_bytes = 0;
     }
 };
 

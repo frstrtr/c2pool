@@ -177,18 +177,25 @@ void Actual::HANDLER(sharereq)
 
 void Actual::HANDLER(sharereply)
 {
+    // The payload is OWNED from the moment load_share() news it up. Before this,
+    // every share deserialised here was orphaned heap unless the sharechain
+    // adopted it: got_share_reply() swallows std::invalid_argument for a request
+    // that already timed out (15 s) or was cancel()led on disconnect, and that
+    // swallow discarded the whole reply with no free anywhere. A slow peer
+    // therefore leaked every byte it eventually sent.
     ltc::ShareReplyData result;
     if (msg->m_result == ShareReplyResult::good)
     {
-        result.m_items.reserve(msg->m_shares.size());
-        result.m_raw_items.reserve(msg->m_shares.size());
+        auto& owned = result.owned();
+        owned.m_items.reserve(msg->m_shares.size());
+        owned.m_raw_items.reserve(msg->m_shares.size());
         for (auto& rshare : msg->m_shares)
         {
             try
             {
                 auto share = ltc::load_share(rshare, peer->addr());
-                result.m_items.push_back(share);
-                result.m_raw_items.push_back(rshare);
+                owned.m_items.push_back(share);
+                owned.m_raw_items.push_back(rshare);
             }
             catch(const std::exception& e)
             {
@@ -249,7 +256,21 @@ void Actual::HANDLER(remember_tx)
         auto it = m_known_txs.find(tx_hash);
         if (it != m_known_txs.end())
         {
-            peer->m_remembered_txs.insert_or_assign(tx_hash, it->second);
+            // p2pool parity: charge the packed size and drop the peer over cap.
+            // Nothing but this peer's own forget_tx ever erased from the map, so
+            // without the charge one peer could grow it without limit.
+            peer->remember_tx(tx_hash, it->second,
+                              static_cast<std::int64_t>(pack(coin::TX_WITH_WITNESS(it->second)).size()));
+            if (peer->remembered_txs_over_cap())
+            {
+                LOG_WARNING << "[Pool] peer " << peer->addr().to_string()
+                            << " exceeded remembered_txs cap ("
+                            << peer->m_remembered_txs_size << " > "
+                            << ltc::Peer::MAX_REMEMBERED_TXS_SIZE
+                            << " bytes) — disconnecting";
+                close_connection(peer->addr());
+                return;
+            }
         }
         else
         {
@@ -270,7 +291,17 @@ void Actual::HANDLER(remember_tx)
         }
 
         coin::Transaction full_tx(tx);
-        peer->m_remembered_txs.insert_or_assign(tx_hash, full_tx);
+        peer->remember_tx(tx_hash, full_tx, static_cast<std::int64_t>(packed.size()));
+        if (peer->remembered_txs_over_cap())
+        {
+            LOG_WARNING << "[Pool] peer " << peer->addr().to_string()
+                        << " exceeded remembered_txs cap ("
+                        << peer->m_remembered_txs_size << " > "
+                        << ltc::Peer::MAX_REMEMBERED_TXS_SIZE
+                        << " bytes) — disconnecting";
+            close_connection(peer->addr());
+            return;
+        }
 
         if (!m_known_txs.contains(tx_hash))
         {
@@ -284,7 +315,7 @@ void Actual::HANDLER(forget_tx)
 {
     for (auto tx_hash : msg->m_tx_hashes)
     {
-        peer->m_remembered_txs.erase(tx_hash);
+        peer->forget_tx(tx_hash);
     }
 }
 

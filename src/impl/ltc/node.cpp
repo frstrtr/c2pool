@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iomanip>
 #include <random>
+#include <unordered_map>
 #ifndef _WIN32
 #include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
 #endif
@@ -400,12 +401,200 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         return pool::PeerConnectionType::legacy;
 }
 
-void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
+// Take the ingest reservation for one inbound batch, EXCHANGING it for the
+// oldest deferred batches when — and only when — those can actually cover it.
+//
+// WHY THIS EXISTS (convergence, not memory). The admission budget is a second,
+// tighter bound sitting UPSTREAM of MAX_PENDING_ADDS, and on its own it makes
+// the pre-existing drop-OLDEST liveness policy unreachable. Under the wedged
+// think() shape drop-oldest was written for, a handful of large deferred
+// batches is enough to consume the whole MAX_INFLIGHT_SHARES budget: eight
+// sharereplies of 1000 shares reserve 8000 of 8192 while m_pending_adds is at
+// 8 of 256. m_pending_adds therefore never reaches its cap, the drop-OLDEST
+// branch in processing_shares_phase2 never runs, and from that point every NEW
+// batch is refused at admission while the STALE ones keep their reservation
+// until think() finally drains the queue.
+//
+// That is precisely the starvation drop-oldest was added to end. The newest
+// batches carry the tip-extending shares (the incumbent-extending and
+// challenger-backfill shares) that a wedged node needs to converge; the oldest
+// queued batch is the most stale thing in the process.
+//
+// So: when the budget refuses, hand back the reservation of the OLDEST deferred
+// batches and retry. ~HandleSharesData frees those batches' shares AND returns
+// their reservation, which is what makes the retry able to succeed.
+//
+// AN EVICTION IS AN EXCHANGE, NEVER A SACRIFICE. The first cut of this function
+// erased first and asked afterwards: it evicted one batch at a time, retried,
+// and gave up only after MAX_ADMIT_EVICTIONS tries. That is wrong whenever the
+// budget is held by something OTHER than the deferred queue — which is exactly
+// the storm shape the budget was introduced for, because the phase-1 scrypt
+// verify backlog is the biggest holder of the reservation under an ingest
+// storm. In that shape the queue can never free enough, so the loop destroyed
+// up to 64 already-verified batches and then refused ANYWAY: strictly worse
+// than both predecessors (budget-only admission lost just the newest batch;
+// drop-OLDEST was one-for-one and always admitted). It was also weaponisable at
+// 64:1, because proof-of-work is only established in phase 1, i.e. AFTER
+// admission: a peer feeding well-formed but PoW-invalid shares through
+// Actual::HANDLER(shares) pins the budget with its own junk and then destroys
+// up to 64 honest, already-verified batches per subsequent message.
+//
+// So the reservation held by the queue is now SUMMED FIRST, over at most
+// MAX_ADMIT_EVICTIONS entries, and the eviction happens only if free headroom
+// plus that sum covers the deficit. If it does not, we refuse WITHOUT
+// destroying anything: finished work is never spent on a reservation that
+// cannot be granted. And when it does cover, only the MINIMUM number of
+// batches goes — the scan stops at the first entry that closes the deficit, so
+// a small shortfall costs one batch, not the whole bound.
+//
+// BOUNDED, and it cannot spin: the scan visits at most
+// min(MAX_ADMIT_EVICTIONS, m_pending_adds.size()) entries, the erase is a
+// single contiguous range of exactly that many or fewer, and there is at most
+// one retry. A batch too large to fit even an empty budget is refused up front.
+// If neither path yields room we still refuse, exactly as before: the memory
+// bound is never exceeded.
+//
+// ONE summary line per admission attempt, not one per eviction. The degraded
+// mode has to stay visible in the log, the way the pending_adds cap line is,
+// but this runs on the single io thread and the per-eviction line it replaces
+// could emit 64 records — each one formatting a NetService — for a single
+// inbound message.
+//
+// REWARD-SAFE: this only changes WHICH batch is dropped when the node cannot
+// hold both, never whether any share is accepted. Both the evicted batch and a
+// refused batch are re-offered: peers re-advertise their best share, think()
+// recomputes `desired` every cycle, and the ancestor walk re-requests a parent
+// it still lacks. No acceptance decision, PPLNS input, payout value or
+// sharechain semantic depends on this choice.
+//
+// THREAD MODEL: io thread only. processing_shares is reached from the protocol
+// handlers and from the download_shares reply callback, both io-thread, and
+// m_pending_adds is only ever mutated on that same thread (the phase-2 defer
+// and the think() IO-phase drain). No lock is taken here and none is needed.
+// The budget counters are atomic because release() may run on a verify-pool
+// worker, but release only ever LOWERS them, so a concurrent release between
+// the sum below and the retry can only make the retry more likely to succeed.
+bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, const NetService& addr)
+{
+    if (m_ingest_budget.try_admit(n, admit_bytes))
+        return true;
+
+    // Unsatisfiable at any queue depth: evicting for it would only destroy work
+    // that another peer can still use.
+    const bool unsatisfiable = (n > m_ingest_budget.max_shares())
+                            || (admit_bytes > m_ingest_budget.max_bytes());
+
+    const std::size_t pending_before = m_pending_adds.size();
+    std::size_t need_shares      = 0;   // how much the reservation is short by
+    std::size_t need_bytes       = 0;
+    std::size_t freed_shares     = 0;   // what the scanned queue head would return
+    std::size_t freed_bytes      = 0;
+    std::size_t evicted          = 0;
+    bool admitted                = false;
+
+    if (!unsatisfiable)
+    {
+        const std::size_t used_shares = m_ingest_budget.shares();
+        const std::size_t used_bytes  = m_ingest_budget.bytes();
+        need_shares = (used_shares + n > m_ingest_budget.max_shares())
+                    ? (used_shares + n - m_ingest_budget.max_shares()) : 0;
+        need_bytes  = (used_bytes + admit_bytes > m_ingest_budget.max_bytes())
+                    ? (used_bytes + admit_bytes - m_ingest_budget.max_bytes()) : 0;
+
+        // PRE-CHECK. Sum the reservation actually held by the oldest entries,
+        // stopping at the first one that closes the deficit (evict the minimum)
+        // and never looking past MAX_ADMIT_EVICTIONS entries (the bound).
+        const std::size_t horizon = std::min(MAX_ADMIT_EVICTIONS, m_pending_adds.size());
+        std::size_t take = 0;
+        while (take < horizon && (freed_shares < need_shares || freed_bytes < need_bytes))
+        {
+            const auto& batch = *m_pending_adds[take].data;
+            freed_shares += batch.admitted_shares();
+            freed_bytes  += batch.admitted_bytes();
+            ++take;
+        }
+
+        if (freed_shares >= need_shares && freed_bytes >= need_bytes)
+        {
+            // The exchange is fundable: erase exactly `take` entries. Each
+            // ~HandleSharesData frees that batch's shares and releases its
+            // reservation, which is what makes the retry below succeed.
+            m_pending_adds.erase(m_pending_adds.begin(),
+                                 m_pending_adds.begin() + static_cast<std::ptrdiff_t>(take));
+            evicted  = take;
+            admitted = m_ingest_budget.try_admit(n, admit_bytes);
+        }
+    }
+
+    if (admitted)
+    {
+        if (evicted != 0)
+            LOG_WARNING << "[INGEST] BACKPRESSURE: admitted " << n << " shares / "
+                        << admit_bytes << " B from " << addr.to_string()
+                        << " by evicting the " << evicted << " OLDEST of "
+                        << pending_before << " deferred batches (returned "
+                        << freed_shares << " shares / " << freed_bytes
+                        << " B, needed " << need_shares << " / " << need_bytes
+                        << "); inflight=" << m_ingest_budget.shares() << "/"
+                        << m_ingest_budget.max_shares() << " shares, "
+                        << m_ingest_budget.bytes() << "/" << m_ingest_budget.max_bytes()
+                        << " B; think() is behind";
+        return true;
+    }
+
+    LOG_WARNING << "[INGEST] BACKPRESSURE: refusing " << n << " shares / "
+                << admit_bytes << " B from " << addr.to_string()
+                << " (inflight=" << m_ingest_budget.shares() << "/"
+                << m_ingest_budget.max_shares() << " shares, "
+                << m_ingest_budget.bytes() << "/" << m_ingest_budget.max_bytes()
+                << " B, pending=" << m_pending_adds.size()
+                << "); evicted " << evicted << " — "
+                << (unsatisfiable
+                        ? "batch larger than the whole budget"
+                        : "the deferred queue cannot cover the shortfall, so nothing "
+                          "was destroyed for it")
+                << "; verify pool is behind, peer will re-offer";
+    return false;
+}
+
+bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
 {
     // Take ownership immediately so the caller can return/free its local.
     auto data = std::make_shared<HandleSharesData>(std::move(data_ref));
     size_t n = data->m_items.size();
-    if (n == 0) return;
+    if (n == 0) return false;
+
+    // ── ADMISSION (RSS self-abort fix) ────────────────────────────────────
+    // Bound the ingest pipeline BEFORE a single scrypt job is posted. The only
+    // pre-existing bound, MAX_PENDING_ADDS, counts deferred BATCHES and sits
+    // downstream of this point: the phase-1 verify backlog below had no bound at
+    // all, so a peer that replies faster than ~200 shares/s (4 threads * ~20 ms
+    // scrypt) grew resident memory without limit while the batches were still
+    // waiting their turn. The reservation is held by `data` and given back by
+    // ~HandleSharesData, so it spans phase 1, the m_pending_adds queue and
+    // phase 2 — the whole life of the batch.
+    //
+    // A posted scrypt job cannot be un-posted, so the budget is consulted here,
+    // before anything is posted. When it refuses, admit_or_evict_oldest() first
+    // tries to make room by evicting the OLDEST deferred batch, so this bound
+    // keeps the pre-existing drop-OLDEST liveness policy instead of defeating
+    // it; see the comment on that function.
+    //
+    // REWARD-SAFE: refusing a batch is indistinguishable from the peer never
+    // having sent it. Peers re-advertise their best share, think() recomputes
+    // `desired` every cycle, and the ancestor walk re-requests a parent it still
+    // lacks — so nothing refused here is lost accounting state, and no share
+    // acceptance decision, PPLNS input or payout is touched.
+    std::size_t admit_bytes = 0;
+    for (size_t i = 0; i < n; i++)
+    {
+        const std::size_t raw = (i < data->m_raw_items.size())
+            ? data->m_raw_items[i].contents.m_data.size() : 0;
+        admit_bytes += raw ? raw : INGEST_BYTES_FALLBACK_PER_SHARE;
+    }
+    if (!admit_or_evict_oldest(n, admit_bytes, addr))
+        return false;   // `data` dies here: ~HandleSharesData frees every share
+    data->attach_budget(&m_ingest_budget, n, admit_bytes);
 
     // Phase 1 (thread pool, parallel): run share_init_verify() for each share.
     // share_init_verify() does scrypt-1024 (~20ms each) — must NOT block io_context.
@@ -448,6 +637,7 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                 }
             });
     }
+    return true;
 }
 
 void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
@@ -518,6 +708,26 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     std::vector<ShareType> shares = prepare_shares.build_list();
 
     // Step 3: Process sorted shares
+    //
+    // OWNERSHIP (RSS self-abort fix): `data` OWNS every ShareType in m_items
+    // until the sharechain adopts it, and ~HandleSharesData frees whatever is
+    // still held — the verify failures, the duplicates, anything the topological
+    // build above dropped, and (via the pending_adds cap) whole dropped batches.
+    // Before this those objects were simply lost: nothing else referenced them
+    // and no erase path existed.
+    //
+    // The hand-over below is keyed by POINTER IDENTITY, never by hash: the
+    // duplicate branch a few lines down carries the same hash as an object the
+    // chain already owns but is a DIFFERENT allocation, so releasing by hash
+    // would hand the chain's own share to the batch destructor.
+    //
+    // The release happens AT the hand-over, not in a sweep after the loop: a
+    // throw further down (pack(share) can throw) would skip a post-loop sweep
+    // and the destructor would then free memory the sharechain owns.
+    std::unordered_map<const void*, std::size_t> batch_slot;
+    batch_slot.reserve(data.m_items.size());
+    for (std::size_t bi = 0; bi < data.m_items.size(); ++bi)
+        batch_slot.emplace(ltc::share_ptr_id(data.m_items[bi]), bi);
     int32_t new_count = 0;
     int32_t dup_count = 0;
     std::map<uint256, coin::MutableTransaction> all_new_txs;
@@ -569,6 +779,19 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         });
 
         m_tracker.add(share);
+        // Adopted iff the chain now holds THIS allocation under that hash: null
+        // the batch's slot so ~HandleSharesData cannot double-free what
+        // ShareChain::remove()/~ShareChain will free.
+        {
+            const void* adopted_id = ltc::share_ptr_id(share);
+            if (m_chain->contains(share.hash()) &&
+                ltc::share_ptr_id(m_chain->get_share(share.hash())) == adopted_id)
+            {
+                auto slot = batch_slot.find(adopted_id);
+                if (slot != batch_slot.end())
+                    ltc::share_release(data.m_items[slot->second]);
+            }
+        }
 
         // Log fork detection: if this share's prev_hash has other children, it forks
         {
@@ -1261,7 +1484,8 @@ void NodeImpl::readvertise_best_share()
              << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
 }
 
-void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash)
+void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash,
+                               std::uint64_t walk_depth)
 {
     // download_shares(): C++ implementation of the p2pool share-download loop.
     //
@@ -1398,12 +1622,13 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash)
     auto peer_addr_for_log = peer->addr();
 
     request_shares(req_id, peer, hashes, parents, stops,
-        [this, weak_peer, target_hash, peer_addr_for_log, req_id, chosen_key_val](ltc::ShareReplyData reply)
+        [this, weak_peer, target_hash, peer_addr_for_log, req_id, chosen_key_val,
+         walk_depth](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
             m_pending_share_reqs.erase(req_id);
 
-            if (reply.m_items.empty())
+            if (reply.empty())
             {
                 // Empty reply = timeout or this peer had no matching shares.
                 // #25(C): remember the (hash, peer) failure so we fail over to a
@@ -1433,31 +1658,78 @@ void NodeImpl::download_shares(peer_ptr advertiser, const uint256& target_hash)
             }
             m_desired_pacer.record_success(target_hash);
 
-            LOG_INFO << "[Pool] Received " << reply.m_items.size() << " shares for download request";
+            auto& owned = *reply.m_owned;
+            const std::size_t reply_count = owned.m_items.size();
+            LOG_INFO << "[Pool] Received " << reply_count << " shares for download request";
 
-            // Feed into processing pipeline
-            HandleSharesData data;
-            for (size_t idx = 0; idx < reply.m_items.size(); ++idx)
-            {
-                if (idx < reply.m_raw_items.size())
-                    data.add(reply.m_items[idx], {}, reply.m_raw_items[idx]);
-                else
-                    data.add(reply.m_items[idx], {});
-            }
-            processing_shares(data, peer_addr_for_log);
-
-            // Find the oldest share's parent — if unknown, keep fetching
+            // Read the oldest share's parent BEFORE ownership moves out below.
             uint256 oldest_parent;
-            reply.m_items.back().invoke([&](auto* obj) { oldest_parent = obj->m_prev_hash; });
+            owned.m_items.back().invoke([&](auto* obj) { oldest_parent = obj->m_prev_hash; });
 
+            // Feed into processing pipeline. Ownership of the deserialised share
+            // objects MOVES from the reply into the batch here: `data` frees
+            // whatever the sharechain does not adopt, and clearing the reply's
+            // vector (which holds raw pointers and has no destructor of its own)
+            // keeps ~OwnedShares from freeing the same objects a second time.
+            // Before this, a reply that was admitted leaked every duplicate and
+            // every verify failure, and a reply that arrived after its 15 s
+            // timeout — or after cancel() on disconnect — leaked in full.
+            HandleSharesData data;
+            for (size_t idx = 0; idx < owned.m_items.size(); ++idx)
+            {
+                if (idx < owned.m_raw_items.size())
+                    data.add(owned.m_items[idx], {}, owned.m_raw_items[idx]);
+                else
+                    data.add(owned.m_items[idx], {});
+            }
+            owned.m_items.clear();
+            const bool admitted = processing_shares(data, peer_addr_for_log);
+
+            // ── Ancestor-walk bounds (RSS self-abort fix) ────────────────
+            // 1. Do not recurse on a batch the ingest budget REFUSED. The old
+            //    code queued the next hop unconditionally, and because the
+            //    refused batch never reaches the chain, contains(oldest_parent)
+            //    stays false — the walk re-requests the same segment forever
+            //    while think() is busy. That treadmill is what kept the storm
+            //    running long enough to hit the RSS limit.
+            // 2. Stop at the pruning zone. The recursion had no depth bound at
+            //    all: it walked to genesis, fetching shares that clean_tracker
+            //    Step 3 drops as soon as they land, while think() itself already
+            //    refuses to emit `desired` for that zone.
+            // 3. Respect DESIRED_QUEUE_MAX, which the think() path at the IO
+            //    phase enforces but this push bypassed.
+            //
+            // REWARD-SAFE: nothing here changes which shares are accepted. (1)
+            // only declines to ASK for a parent this cycle — think() re-derives
+            // `desired` every 5 s and asks again. (2) stops fetching shares
+            // deeper than 2*chain_length+10 below a head, which are exactly the
+            // shares drop-tails removes; the PPLNS window is chain_length, so
+            // such a share can never enter a payout.
+            if (!admitted)
+                return;
+
+            const std::uint64_t next_depth = walk_depth + reply_count;
             if (!oldest_parent.IsNull() && !m_chain->contains(oldest_parent))
             {
+                if (!ltc::walk_may_continue(
+                        next_depth,
+                        static_cast<std::uint64_t>(m_tracker.m_params->chain_length)))
+                {
+                    LOG_INFO << "[Pool] ancestor walk depth cap: " << next_depth
+                             << " >= " << (2 * m_tracker.m_params->chain_length + 10)
+                             << " for " << oldest_parent.ToString().substr(0,16)
+                             << " — leaving further backfill to think()";
+                    return;
+                }
                 auto locked = weak_peer.lock();
                 if (locked) {
                     // half-2: route the recursive re-request through the budgeted
                     // drain so backward chain-walk fan-out stays bounded on the io
                     // thread (same guard as the IO-phase desired drain).
-                    m_pending_desired.emplace_back(locked->addr(), oldest_parent);
+                    if (m_pending_desired.size() >= DESIRED_QUEUE_MAX)
+                        return;  // recomputed and re-queued next think() cycle
+                    m_pending_desired.push_back(
+                        DesiredRequest{locked->addr(), oldest_parent, next_depth});
                     drain_pending_desired();
                 }
             }
@@ -1486,13 +1758,13 @@ void NodeImpl::drain_pending_desired()
         // its backoff expires; unknown and healthy hashes are always eligible.
         // A skip does NOT consume budget -- it is a map lookup, and the point of
         // the pass is to reach the hashes that can still be served.
-        if (!m_desired_pacer.eligible(entry.second, now))
+        if (!m_desired_pacer.eligible(entry.hash, now))
             continue;
         peer_ptr advertiser;
         for (auto& [nonce, p] : m_peers) {
-            if (p && p->addr() == entry.first) { advertiser = p; break; }
+            if (p && p->addr() == entry.addr) { advertiser = p; break; }
         }
-        download_shares(advertiser, entry.second);
+        download_shares(advertiser, entry.hash, entry.depth);
         ++processed;
     }
     if (!m_pending_desired.empty())
@@ -1752,61 +2024,31 @@ void NodeImpl::start_outbound_connections()
     m_connect_timer->start(30, try_connect_peers);
 }
 
-void NodeImpl::prune_shares(const uint256& /*best_share*/)
+void NodeImpl::evict_caches_io_phase()
 {
-    // Tail-dropping (as in p2pool's clean_tracker):
-    // - Check each tail: if min(height(head) for heads) < 2*CL+10 → skip
-    // - Remove ONE child of qualifying tail per iteration
-    // - Loop up to 1000 times (gradual, not bulk)
-    // - Also cascade removal to verified
-    const auto CL = static_cast<int32_t>(m_tracker.m_params->chain_length);
-    const int32_t min_depth = 2 * CL + 10;
-
-    for (int iter = 0; iter < 1000; ++iter)
-    {
-        // p2pool node.py:382-398: find ONE qualifying tail child to remove
-        uint256 to_remove;
-        bool found = false;
-        auto tails_copy = m_tracker.chain.get_tails();
-        for (auto& [tail_hash, head_hashes] : tails_copy)
-        {
-            // Check min height across ALL heads for this tail
-            int32_t min_height = std::numeric_limits<int32_t>::max();
-            for (auto& hh : head_hashes) {
-                if (!m_tracker.chain.contains(hh)) continue;
-                try {
-                    min_height = std::min(min_height, m_tracker.chain.get_height(hh));
-                } catch (...) { continue; }
-            }
-            if (min_height < min_depth) continue;
-
-            // Find ONE child of this tail (p2pool removes one at a time)
-            auto& rev = m_tracker.chain.get_reverse();
-            auto rev_it = rev.find(tail_hash);
-            if (rev_it != rev.end() && !rev_it->second.empty()) {
-                to_remove = *rev_it->second.begin();
-                found = true;
-                break;  // one per iteration
-            }
-        }
-
-        if (!found) break;
-
-        if (!m_tracker.chain.contains(to_remove)) continue;
-        // p2pool node.py:393 — safety check: parent must be a tail
-        auto* idx = m_tracker.chain.get_index(to_remove);
-        if (!idx) continue;
-        bool parent_is_tail = m_tracker.chain.get_tails().contains(idx->tail);
-        if (!parent_is_tail) {
-            LOG_DEBUG_POOL << "prune skip: parent " << idx->tail.ToString().substr(0,16)
-                           << " not a tail";
-            continue;
-        }
-        if (m_tracker.verified.contains(to_remove))
-            m_tracker.verified.remove(to_remove, /*owns_data=*/false);
-        m_tracker.chain.remove(to_remove);
-    }
-
+    // WAS prune_shares(). That function had NO CALL SITE anywhere in the tree
+    // (git grep prune_shares: definition, declaration, three comments), so the
+    // three cache_max_* operator knobs it implemented were inert and the caches
+    // below grew for the life of the process — m_known_txs holds full
+    // coin::Transaction objects fed straight from peers, m_shared_share_hashes
+    // one uint256 per share ever broadcast.
+    //
+    // Its tail-drop loop is NOT resurrected: it duplicated clean_tracker Step 3
+    // (which IS called, every 5 s) and running both would change pruning cadence.
+    // Only the eviction survives, and it is now actually called — from the
+    // clean_tracker IO-phase.
+    //
+    // IO-THREAD ONLY. m_known_txs is inserted into lock-free by remember_tx on
+    // the io thread (node.hpp thread-discipline note); evicting from the compute
+    // thread under the tracker lock — which is what the dead prune_shares would
+    // have done — races that unlocked insert. Running here removes that race
+    // instead of arming it. m_shared_share_hashes is likewise io-thread-only
+    // (broadcast path).
+    //
+    // REWARD-SAFE: neither container is consensus state. m_shared_share_hashes
+    // is a re-broadcast de-dup set; m_known_txs is the tx-forwarding pool whose
+    // oldest-first bounded eviction shipped as reward-safe in #843 — this only
+    // makes it execute. No share acceptance, PPLNS input or payout reads either.
     // Cache cleanup (kept from original)
     if (m_shared_share_hashes.size() > m_max_shared_hashes)
         m_shared_share_hashes.clear();
@@ -1819,8 +2061,8 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
         core::evict_known_txs_to_cap(m_known_txs, m_known_txs_order, m_max_known_txs);
 
     // /p2p_stats gauges (observe-only): the SEND-side truth behind a peer
-    // dashboard reporting TXPOOL=0 for us. Published here because prune_shares
-    // is the periodic pass that already touches both containers. Relaxed
+    // dashboard reporting TXPOOL=0 for us. Published here because this is the
+    // periodic pass that already touches both containers. Relaxed
     // stores, no lock, no consensus/mint/payout state read or written.
     core::obs::p2p_stats().known_txs_size.store(
         m_known_txs.size(), std::memory_order_relaxed);
@@ -1828,8 +2070,11 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
         static_cast<std::int64_t>(m_known_txs_order.size()), std::memory_order_relaxed);
     core::obs::p2p_stats().known_txs_updated_at.store(
         static_cast<std::int64_t>(core::timestamp()), std::memory_order_relaxed);
-    if (m_raw_share_cache.size() > m_max_raw_shares)
-        m_raw_share_cache.clear();
+    // NOTE: m_raw_share_cache is deliberately NOT touched here. Its primary
+    // eviction is now the ShareChain on_removed hook (node.hpp
+    // wire_chain_hooks), which fires on the COMPUTE thread under the exclusive
+    // tracker lock, as does its size backstop in clean_tracker. Clearing it from
+    // the io thread would race that erase.
 }
 
 // (old phases 5-7 removed — replaced by p2pool-style pruning above)
@@ -2189,7 +2434,8 @@ void NodeImpl::run_think()
                 for (auto& [peer_addr, hash] : result.desired) {
                     if (m_pending_desired.size() >= DESIRED_QUEUE_MAX)
                         break;  // remainder is recomputed and re-queued next cycle
-                    m_pending_desired.emplace_back(peer_addr, hash);
+                    // depth 0: a think()-originated request starts a fresh walk.
+                    m_pending_desired.push_back(DesiredRequest{peer_addr, hash, 0});
                 }
                 drain_pending_desired();
             }
@@ -2397,7 +2643,11 @@ void NodeImpl::heartbeat_log()
 
         shares_line << " [heads=" << m_tracker.chain.get_heads().size()
                     << " v_heads=" << m_tracker.verified.get_heads().size()
-                    << " rss=" << get_rss_mb() << "MB]";
+                    << " rss=" << get_rss_mb() << "MB"
+                    << " ingest=" << m_ingest_budget.shares() << "/" << MAX_INFLIGHT_SHARES
+                    << " sh," << (m_ingest_budget.bytes() >> 20) << "/"
+                    << (MAX_INFLIGHT_BYTES >> 20) << "MB"
+                    << " rawcache=" << m_raw_share_cache.size() << "]";
         LOG_INFO << shares_line.str();
     }
 
@@ -2757,6 +3007,21 @@ void NodeImpl::clean_tracker()
         m_removal_flush_buf.clear();
     }
 
+    // Step 5b: raw-share-cache size backstop (compute thread, exclusive lock).
+    // The per-share erase in the on_removed hook is the primary bound and keeps
+    // this cache proportional to chain membership; this is the belt-and-braces
+    // ceiling for entries whose share never entered the chain at all. Kept on
+    // the compute thread because the hook erases here too — a clear() from the
+    // io thread would race it.
+    // REWARD-SAFE: relay bytes only; send_shares and the LevelDB persist path
+    // both fall back to pack(share) on a cache miss.
+    if (m_raw_share_cache.size() > m_max_raw_shares)
+    {
+        LOG_INFO << "[clean] raw-share cache " << m_raw_share_cache.size()
+                 << " > cap " << m_max_raw_shares << " — clearing (relay bytes only)";
+        m_raw_share_cache.clear();
+    }
+
     // Orphan/fork diagnostics — understand chain topology
     {
         auto& chain = m_tracker.chain;
@@ -2808,6 +3073,9 @@ void NodeImpl::clean_tracker()
       // (handle_get_share, send_shares) are never blocked.
       boost::asio::post(*m_context, [this, clean_best_changed]() {
         disarm_think_watchdog();
+        // Enforce the cache_max_* limits. This is the ONLY call site: the code
+        // that used to do it (prune_shares) was never called at all.
+        evict_caches_io_phase();
         if (clean_best_changed && m_on_best_share_changed) {
             LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
             m_on_best_share_changed();
