@@ -247,6 +247,7 @@ jobs:
                     xmr_native_block_relay_kat xmr_c5_regtest_push \
                     xmr_native_parity_kat xmr_native_txpool_parity_kat \
                     xmr_native_backlog_famine_kat \
+                    xmr_native_m4_soak_kat \
                     xmr_native_node_kat xmr_native_node \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
@@ -690,6 +691,7 @@ jobs:
                     xmr_native_block_relay_kat xmr_c5_regtest_push \
                     xmr_native_parity_kat xmr_native_txpool_parity_kat \
                     xmr_native_backlog_famine_kat \
+                    xmr_native_m4_soak_kat \
                     xmr_native_node_kat xmr_native_node \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \

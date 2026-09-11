@@ -42,6 +42,7 @@
 
 #include "impl/xmr/native/chain/xmr_chain_view.hpp"
 #include "impl/xmr/native/parity/xmr_parity_types.hpp"
+#include "impl/xmr/native/parity/xmr_tip_observer.hpp"
 #include "impl/xmr/node/minijson.hpp"
 #include "impl/xmr/node/monerod_transport.hpp"
 
@@ -305,17 +306,12 @@ inline ArmObservation no_observation(const char* arm, std::string why) {
 }
 
 // ---------------------------------------------------------------------------
-// ITipObserver -- what the oracle pulls a tip from.
-//
-// A tip EVENT says something moved; the oracle then asks both sides what they
-// see. That indirection is what lets one side be an RPC round trip and the
-// other a struct read without either knowing about the other.
+// ITipObserver -- what the oracle pulls a tip from -- now lives in
+// xmr_tip_observer.hpp, included above. It moved so that a DECORATOR of the
+// seam (M4's PerturbingTipObserver) does not have to drag this file's chain-view
+// include, and therefore the whole vendored consensus link, behind one pure
+// virtual function. Every name this header exported, it still exports.
 // ---------------------------------------------------------------------------
-class ITipObserver {
-public:
-    virtual ~ITipObserver() = default;
-    virtual ArmObservation observe() = 0;
-};
 
 // The native side. Cheap: it reads the row the verify thread already built.
 class ChainViewTipObserver final : public ITipObserver {

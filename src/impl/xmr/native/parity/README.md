@@ -118,3 +118,52 @@ CLEAN when that is all the evidence there is.
 read-only capture from a synced daemon (four calls, nothing written) and refuses
 to emit a golden whose parts are not internally consistent. The committed capture
 is monerod 0.18.5.1-release on stagenet at tip 2205017.
+
+## M4: the two-posture soak (`xmr_graduation_ledger.hpp`, `xmr_soak_driver.hpp`)
+
+C6 answers "have the seams agreed?". M4 asks a different question, and it is
+about a **process**:
+
+    serve = monerod / shadow = native   sustained, every sample CLEAN, then
+    serve = native  / shadow = monerod  sustained, every sample CLEAN.
+
+`M4GraduationLedger` records that as **two legs**, each a fragile streak. CLEAN
+accrues it; `FAIL` and `SERVED_MISMATCH` reset it to zero and take the leg's
+qualification away — there is no budget of allowed failures, because the
+criterion is *every* sample. `VOID` neither accrues nor resets, but a **run** of
+VOIDs past `max_void_run` resets anyway: a leg that has stopped producing
+judgeable samples is a probe that stopped firing, not a streak quietly holding.
+`blocks` counts **forward height progress only**, so a reorg contributes nothing
+(the conservative direction). The key is the same four-part one C6 uses and is
+stamped with the *running* `COMPARATOR_VERSION`, so a streak earned under an
+older comparator cannot be inherited across a bump.
+
+`SoakDriver` is the loop around it, and it exists because two things were
+missing rather than merely unwritten:
+
+* **nothing called `on_serve`.** `on_tip` fires by itself (the index publishes an
+  event at every height); the template probe only fires when somebody serves a
+  template, and in the node harness nobody did. A soak on the pre-M4 code would
+  have run up a long P-TIP streak having never compared a template — which is
+  half of what the M4 criterion asks for. The driver pulls a template from the
+  posture's arm on its own cadence and hands it over as the served artefact, and
+  `min_template_clean` is what stops the cheap seam carrying the expensive one.
+* **the posture has to be exact.** `ArmResolver::serving()` falls back to the
+  other arm when the configured one is not ready — correct in production, fatal
+  to a parity claim. The driver resolves `arm(posture)` strictly; an unready arm
+  produces no sample and says so.
+
+`TipFaultInjection` / `PerturbingTipObserver` are the **negative control**:
+harness-only, disarmed unless a field is named, they perturb one required
+EQUALITY field of the native tip observation by one unit (or withhold it) so the
+refusal path is something the harness was *watched* doing. `--m4-require refusal`
+asserts the opposite claim from a normal run: the ledger must NOT graduate, and
+it must have reset a streak on a real FAIL rather than merely failed to
+accumulate one.
+
+Both postures are two runs of `xmr_native_node` against the **same**
+`--m4-ledger` file, which is the shape a 72 h + 72 h stagenet soak has;
+persistence is the mechanism by which a leg survives its own posture flip.
+`SoakThresholds::stagenet_m4()` carries the plan's numbers unscaled (72 h, 720
+blocks per posture); `regtest_mini()` keeps every threshold non-zero at a scale a
+mini-soak can reach in minutes — a scaled rehearsal, never the gate itself.

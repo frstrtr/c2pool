@@ -5,8 +5,10 @@ R"ANCHOR(
 # captured  2026-09-10 19:01Z, daemon tip 2204848, anchor buried 848
 # windows   735 difficulty / 100 short-term / 100000 long-term
 # coins     already_generated_coins from get_miner_data at 2204848 minus the
-#           coinbase of every block above H_a; cross-checked against
-#           get_coinbase_tx_sum over the same range.
+#           BASE EMISSION of every block above H_a -- get_coinbase_tx_sum's
+#           emission_amount, NOT the header `reward`. monerod accumulates
+#           base_reward into already_generated_coins; fees are recycled from
+#           the existing supply and are never added to it.
 # note      monerod publishes no RPC for its compiled-in checkpoints;
 #           `checkpoint` rows are copied by hand at release time and
 #           this capture carries 0 of them.
@@ -18,7 +20,7 @@ prev_id 08034ed1a2196cb678ccb828d88448700a4cb5230d1a00c1e00ef65b9e314e79
 timestamp 1788965550
 major_version 16
 cumulative_difficulty 0 c3772e00db
-already_generated_coins 18163913490712907281
+already_generated_coins 18163913501536847281
 seed 2203648 5bd07b3c898f74aa3923d10f2749c9d4ee7b36461a55948f389e6044acacb321
 diff 1788876380 0 c2cb6d9d38
 diff 1788876664 0 c2cba869a1
@@ -798,5 +800,5 @@ ltw 216879
 ltw 6833x176470
 ltw 300781 298639 298687
 ltw 9327x176470
-digest 6ef031fc7ce4be63aebef4e79d1f270c694edb20c89ebf04a8e8bcda0dc669a8
+digest e159b23d65929cd1642e398448f09ca83e34a8312a98de6fb504647c2ede707c
 )ANCHOR"
