@@ -32,6 +32,13 @@
 #     serves and which shadows. Header-only, derives no consensus value of its
 #     own, and adds only the readiness gate, the epoch/rebuild rule and the
 #     template-layer guards. The assembler above it is not modified at all.
+#   * parity/ (component C6): the monerod-parity oracle, which is the M4 gate.
+#     It runs beside a real daemon and judges three seams -- tip, template,
+#     submit -- against it, keeping a revocable, hard-keyed graduation ledger.
+#     Its one structural rule is that VOID IS NOT AGREEMENT: a comparison that
+#     did not happen can never satisfy a coverage floor, so a probe that quietly
+#     stopped firing blocks the gate instead of reading as calm. Header-only;
+#     see parity/README.md.
 #
 # Everything else here is still header-only: nothing is compiled until a target
 # includes it, and the KATs in test/ are those targets. Two of the C2a KATs link
