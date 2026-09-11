@@ -88,6 +88,50 @@ static nlohmann::json build_p2p_stats_json()
     return out;
 }
 
+// ── /api/tx-inject-status — read-only tx-injection lane status (#157) ───
+//
+// Serialises core::obs::inject_status() (the DASH --embedded-tx-inject lane's
+// flag + inflight-pool snapshot) alongside the tx_inject wire counters already
+// tracked in core::obs::p2p_stats(). Pure reader: relaxed atomic loads only, no
+// lock, no node call — same posture (and same reason for living here rather
+// than behind a MiningInterface accessor) as build_p2p_stats_json().
+//
+// REWARD-SAFE / read-only: this SHOWS lane state; it never arms the flag,
+// submits a tx, or writes config. "wired": false = the lane has never
+// published (flag-OFF build, or a coin with no injection lane). The M3 (#1606,
+// draft) rate-limit / sandbox reject counters render null until that PR lands
+// and wires them.
+static nlohmann::json build_tx_inject_status_json()
+{
+    const auto& s  = obs::inject_status();
+    const auto& ps = obs::p2p_stats();
+
+    const auto updated = s.updated_at.load(std::memory_order_relaxed);
+
+    nlohmann::json out;
+    out["wired"]      = (updated != 0);
+    out["enabled"]    = s.enabled.load(std::memory_order_relaxed);
+    out["updated_at"] = updated;
+    out["pool"] = {
+        {"entries",         s.pool_entries.load(std::memory_order_relaxed)},
+        {"bytes",           s.pool_bytes.load(std::memory_order_relaxed)},
+        {"max_entries",     s.max_entries.load(std::memory_order_relaxed)},
+        {"max_total_bytes", s.max_total_bytes.load(std::memory_order_relaxed)},
+        {"max_tx_bytes",    s.max_tx_bytes.load(std::memory_order_relaxed)}
+    };
+    // M2: tx_inject p2p wire counters (also in /p2p_stats; mirrored here so a
+    // panel reads the whole lane in one request).
+    out["wire"] = {
+        {"tx_inject_in",  ps.get_in(obs::P2PMessage::tx_inject)},
+        {"tx_inject_out", ps.get_out(obs::P2PMessage::tx_inject)}
+    };
+    // M3 (#1606, draft): rate-limiter / sandbox reject counters not wired on
+    // this build. Rendered null (not 0) so "absent" is never read as "zero".
+    out["rate_limit"] = nullptr;
+    out["sandbox"]    = nullptr;
+    return out;
+}
+
 
 // ── Security helpers ───────────────────────────────────────────────────
 // URL-decode percent-encoded strings (%20 → space, etc.)
@@ -439,6 +483,21 @@ void HttpSession::process_request()
             // until the control-token lands with the write path. Exact-match
             // (schema BEFORE the bare path) so the substr dispatch cannot
             // confuse the two. Unwired (no publish / no set_config_fns) => 404.
+            else if (target == "/api/tx-inject-status") {
+                // Read-only tx-injection lane status (#157). Loopback-only,
+                // same posture as /api/config: it reveals whether the injection
+                // lane is armed, which is local-operator information. SHOWS
+                // state only — never arms, submits, or writes config.
+                auto remote_addr = socket_.remote_endpoint().address();
+                if (!remote_addr.is_loopback()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"tx-inject status is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = build_tx_inject_status_json();
+            }
             else if (target == "/api/config" || target == "/api/config/schema") {
                 auto remote_addr = socket_.remote_endpoint().address();
                 if (!remote_addr.is_loopback()) {
