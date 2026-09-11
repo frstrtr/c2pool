@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
+#include <vector>
 #include <cstdint>
 #include <chrono>
 #include <cstdio>
@@ -321,6 +322,35 @@ public:
 
     const auto& get_heads() const { return m_heads; }
     const auto& get_tails() const { return m_tails; }
+
+    // ─── Serializable chain-topology surface (p2pool /web/*heads,*tails parity) ──
+    // Read-only, additive projections of the existing forest maps into a flat,
+    // serializable list of hashes. Used by the /web/heads, /web/tails,
+    // /web/verified_heads, /web/verified_tails transparency endpoints (the same
+    // ShareChain instance is `chain` for the raw sets and `verified` for the
+    // verified sets). These derive purely from m_heads/m_tails — they rename or
+    // remove nothing and touch no selection, weighting, or money path.
+
+    /// Head hashes: the set of chain-tip hashes (keys of m_heads).
+    std::vector<hash_t> head_hashes() const
+    {
+        std::vector<hash_t> out;
+        out.reserve(m_heads.size());
+        for (const auto& kv : m_heads)
+            out.push_back(kv.first);
+        return out;
+    }
+
+    /// Tail hashes: the set of chain-root anchors — the missing-parent hash each
+    /// fork descends from (keys of m_tails).
+    std::vector<hash_t> tail_hashes() const
+    {
+        std::vector<hash_t> out;
+        out.reserve(m_tails.size());
+        for (const auto& kv : m_tails)
+            out.push_back(kv.first);
+        return out;
+    }
     size_t size() const { return m_shares.size(); }
 
     int32_t get_height(const hash_t& hash)
