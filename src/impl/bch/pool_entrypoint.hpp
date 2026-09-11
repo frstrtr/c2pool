@@ -62,6 +62,8 @@
 #include "coin/embedded_daemon.hpp"
 #include "stratum/work_source.hpp"
 #include "config_pool.hpp"      // bch::PoolConfig::get_donation_script
+#include "coin/template_builder.hpp" // bch::coin::get_block_subsidy (display Current Payouts subsidy)
+#include "dashboard_pplns.hpp"  // bch::dashboard::pplns_payouts_current — pool-wide Current Payouts read-model (#1508, read-only)
 #include "config_coin.hpp"      // bch::address_acceptance (#961 cross-lane payout publish)
 #include "coin/cashaddr.hpp"    // bch::coin::cashaddr::register_cashaddr_decoder (#961 CashAddr payout)
 #include "share_check.hpp"      // bch::create_local_share (transitive via node.hpp)
@@ -839,6 +841,63 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 {"head_count", s.head_count},
                 {"pool_hashrate", s.pool_hashrate},
             };
+        });
+
+        // ── Pool-wide "Current Payouts" (#1508 read-model wiring, #939 seam) ─
+        // Lights /current_payouts + /current_merged_payouts (the main dashboard
+        // payout treemap) with the REAL pool-wide PPLNS split — "what would a
+        // block found right now pay?" — computed DIRECTLY from the sharechain
+        // the node already holds, exactly as the stratum coinbase does, via
+        // bch::dashboard::pplns_payouts_current (the mint's own
+        // get_{v35_,}expected_payouts; no payout arithmetic re-implemented).
+        //
+        // Why not MiningInterface's own PPLNS cache: this lane stands up a NULL
+        // IMiningNode web MI, so refresh_work() never fills m_cached_template and
+        // the set_pplns_fn seam above stays inert (the same class of inert wiring
+        // btc/dash document). So compute it here off the live sharechain.
+        //
+        // A7 lock discipline (standing constraint): the whole read runs under a
+        // single node.read_tracker() — shared_lock(try_to_lock) on the IO thread,
+        // skipped on the compute thread — with an honest-empty ({}) fallback when
+        // the compute thread holds the exclusive lock, so the display timer never
+        // blocks and never takes a long-held lock on the payout map. Read-only:
+        // touches no mutable/verified state, sends no wire bytes, builds no
+        // coinbase. Display-only — zero consensus/reward/wire change.
+        mi->set_current_payouts_fn([&node, &daemon, is_testnet]() -> nlohmann::json {
+            // Difficulty-epoch bits + subsidy from the embedded BCH header tip
+            // (its OWN mutex, not the tracker's — read BEFORE the tracker guard).
+            // A cold/absent header follower yields bits==0 -> honest-empty {}.
+            auto tip = daemon.chain().tip();
+            if (!tip) return nlohmann::json::object();
+            const uint32_t block_bits  = tip->header.m_bits;
+            const uint32_t next_height = daemon.chain().height() + 1;
+            const uint64_t subsidy     = bch::coin::get_block_subsidy(next_height);
+
+            // A7: single non-blocking shared read; {} if the compute thread is
+            // mid-think (holding the exclusive lock) rather than block the timer.
+            auto guard = node.read_tracker();
+            if (!guard) return nlohmann::json::object();
+
+            // best_share_hash() reads the tracker's published best head and takes
+            // no lock of its own (set_pplns_fn calls it under a shared_lock too),
+            // so calling it under our guard is safe — no nested shared acquire,
+            // the UB hazard the DASH/btc lanes call out.
+            const uint256 best = node.best_share_hash();
+            if (best.IsNull()) return nlohmann::json::object();
+
+            // Live share version for `best` (v35 flat vs v36 decayed allocator +
+            // the matching donation script), derived inline under the same guard.
+            int ver = 35;
+            if (guard->chain.contains(best)) {
+                guard->chain.get_share(best).invoke(
+                    [&](auto* sh) {
+                        using ST = std::remove_pointer_t<decltype(sh)>;
+                        ver = static_cast<int>(ST::version);
+                    });
+            }
+
+            return bch::dashboard::pplns_payouts_current(
+                *guard, best, ver, block_bits, subsidy, is_testnet);
         });
 
         // ââ Found-block verifier: confirm/orphan a won block vs the chain ââ
