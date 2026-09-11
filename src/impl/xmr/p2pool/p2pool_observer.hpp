@@ -59,6 +59,14 @@
 // POSIX sockets, no asio, no threads: one blocking-free poll() loop. That is
 // deliberate -- this is a telemetry harness, and keeping it dependency-free
 // keeps it honest about what observing actually requires.
+//
+// An Observer is exactly one sidechain: one consensus id, one peer set, one
+// read model, one byte ledger. Watching three sidechains is therefore three
+// Observers rather than one Observer that grew a chain field -- and because
+// three poll() loops would each block the other two, the loop is also offered
+// as three phases (begin_tick / collect / dispatch) a caller can drive from a
+// single poll() over all three chains' sockets. run() is written in terms of
+// those same three calls, so there is one implementation, not two.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -138,6 +146,19 @@ struct ObserverConfig {
     std::uint64_t run_ms           = 300000;
     std::uint64_t seed             = 0;       // 0 => clock-seeded
     bool          verbose          = false;
+    // How long a dialled endpoint stays on the do-not-redial list. 0 means
+    // "never re-dial", which is right for a bounded harness run: inside five
+    // minutes a peer that hung up is unlikely to have become useful again, and
+    // never re-dialling keeps the run's peer set trivially auditable. It is
+    // WRONG for a monitor that runs for hours: peer churn then drains the dial
+    // queue permanently and a live chain's panel goes quiet with no peers left
+    // to try. The monitor sets a few minutes; run() leaves it at 0, so the
+    // harness behaves exactly as before.
+    std::uint64_t redial_after_ms  = 0;
+    // Hard ceiling on the pending dial queue. Gossip supplies addresses far
+    // faster than a handful of sockets can consume them, and with re-dialling
+    // enabled the queue would otherwise grow without bound overnight.
+    std::size_t   max_dial_queue   = 1024;
     // Directory to write any blob that failed to parse. A parser that cannot
     // be shown its own counter-example is a parser nobody can fix, and these
     // bytes came off a live network that will not reproduce them on request.
@@ -286,13 +307,20 @@ private:
 
     void close_fd() { if (fd_ >= 0) { ::close(fd_); fd_ = -1; } }
 
+    // Report once, close idempotently. The report is NOT conditioned on the
+    // session having left State::Closed, because a session starts there: dial
+    // failures inside start() -- a DNS answer with no route, a refused connect
+    // -- used to close silently, which is exactly the failure that is hardest
+    // to diagnose later. A monitor run found a whole sidechain dark with no
+    // line in the log to say why.
     bool fail(const std::string& why, const LogSink& log) {
-        if (state_ != State::Closed) {
+        if (!reported_) {
+            reported_     = true;
             close_reason_ = why;
-            state_ = State::Closed;
-            close_fd();
             if (log) log("peer " + endpoint_ + " closed: " + why);
         }
+        state_ = State::Closed;
+        close_fd();
         return false;
     }
 
@@ -550,6 +578,7 @@ private:
 
     int    fd_ = -1;
     State  state_ = State::Closed;
+    bool   reported_ = false;
     std::string close_reason_;
 
     std::vector<std::uint8_t> rxbuf_;
@@ -609,24 +638,86 @@ public:
         for (const std::string& h : seed_hosts(cfg_.chain)) queue_.push_back({h, port});
     }
 
+    // -----------------------------------------------------------------------
+    // THE LOOP, IN THREE PIECES
+    // -----------------------------------------------------------------------
+    // run() below is the whole event loop for ONE sidechain and is what the
+    // observer harness calls. The monitor watches three sidechains at once and
+    // must not own three event loops -- three poll() calls would each block the
+    // other two for their timeout, and threads are not on the menu. So the loop
+    // is expressed as three phases the CALLER may drive instead:
+    //
+    //     begin_tick()  dial, reap                    (before the poll)
+    //     collect()     append this chain's pollfds    (build the shared set)
+    //     dispatch()    step those sessions, harvest   (after the poll)
+    //
+    // A caller with three Observers appends each one's pollfds to a single
+    // vector, remembers where each chain's range started, calls ::poll() once
+    // and hands each Observer back exactly its own slice. The RANGE IS THE TAG:
+    // no per-fd chain bookkeeping exists, and none can go stale.
+    //
+    // run() is written in terms of the same three calls, so the harness and the
+    // monitor cannot drift apart: there is one implementation of each phase.
+    // -----------------------------------------------------------------------
+
+    // Dial up to max_peers and reap closed sessions. Call before collect().
+    void begin_tick() { open_sessions(); }
+
+    // Append one pollfd per live session, and the matching session pointer.
+    // Both vectors grow by the same count, which is this chain's slice width.
+    void collect(std::vector<pollfd>& pfds, std::vector<PeerSession*>& live) {
+        for (auto& s : sessions_) {
+            if (s->closed()) continue;
+            pollfd p{};
+            p.fd     = s->fd();
+            p.events = s->poll_events();
+            pfds.push_back(p);
+            live.push_back(s.get());
+        }
+    }
+
+    // Step the `n` sessions this chain contributed, then take in any gossiped
+    // addresses. `pfds` and `live` point at THIS chain's slice of the shared
+    // arrays, in the order collect() produced them.
+    void dispatch(const pollfd* pfds, PeerSession* const* live, std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i)
+            live[i]->step(pfds[i].revents, ledger_, sink(), log_, model_);
+        harvest();
+    }
+
+    // Nothing connected and nothing left to dial: this chain has run dry and a
+    // long-lived caller should reseed it rather than watch a dead panel.
+    bool idle() const { return live_sessions() == 0 && queue_.empty(); }
+
+    // Put the DNS seeds back on the dial queue, and CLEAR their cool-off while
+    // doing it. This is only ever called on a chain with no peers and nothing
+    // queued, and such a chain has nothing to lose by trying its bootstrap
+    // again: with no connection there is no peer-list gossip, so the seeds are
+    // the only way back. A chain that is connected keeps the ordinary cool-off.
+    void reseed() {
+        const std::uint16_t port = default_port(cfg_.chain);
+        for (const std::string& h : seed_hosts(cfg_.chain)) {
+            dialled_.erase(h + ":" + std::to_string(port));
+            queue_.push_back({h, port});
+        }
+    }
+
+    void close_all(const char* why) {
+        for (auto& s : sessions_) if (!s->closed()) s->close_now(why, log_);
+    }
+
     // Blocking run for cfg_.run_ms. Returns the number of poll iterations.
     std::uint64_t run() {
         const std::uint64_t t_end = now_ms() + cfg_.run_ms;
         std::uint64_t iterations = 0;
+        std::vector<pollfd> pfds;
+        std::vector<PeerSession*> live;
         while (now_ms() < t_end) {
             ++iterations;
-            open_sessions();
-            std::vector<pollfd> pfds;
-            std::vector<PeerSession*> live;
-            pfds.reserve(sessions_.size());
-            for (auto& s : sessions_) {
-                if (s->closed()) continue;
-                pollfd p{};
-                p.fd = s->fd();
-                p.events = s->poll_events();
-                pfds.push_back(p);
-                live.push_back(s.get());
-            }
+            begin_tick();
+            pfds.clear();
+            live.clear();
+            collect(pfds, live);
             if (pfds.empty()) {
                 if (queue_.empty()) break;          // nothing left to dial
                 ::poll(nullptr, 0, 200);
@@ -634,11 +725,9 @@ public:
             }
             const int rc = ::poll(pfds.data(), pfds.size(), 500);
             if (rc < 0 && errno != EINTR) break;
-            for (std::size_t i = 0; i < live.size(); ++i)
-                live[i]->step(pfds[i].revents, ledger_, sink(), log_, model_);
-            harvest();
+            dispatch(pfds.data(), live.data(), live.size());
         }
-        for (auto& s : sessions_) if (!s->closed()) s->close_now("run finished", log_);
+        close_all("run finished");
         return iterations;
     }
 
@@ -647,6 +736,11 @@ public:
         for (const auto& s : sessions_) if (!s->closed()) ++n;
         return n;
     }
+
+    // How many addresses are waiting to be dialled. A monitor panel shows this
+    // because "no peers and nothing queued" and "no peers but plenty queued"
+    // are different situations and look identical without it.
+    std::size_t pending_dials() const noexcept { return queue_.size(); }
 
 private:
     struct Dial { std::string host; std::uint16_t port; };
@@ -662,16 +756,42 @@ private:
     void ingest(const PoolBlock& pb, const std::vector<std::uint8_t>& blob,
                 const std::string& endpoint);
 
+    // `dialled_` maps an endpoint to the time it may be dialled AGAIN. With
+    // redial_after_ms == 0 that time is never, which is the harness rule.
+    bool may_dial(const std::string& ep, std::uint64_t t) const {
+        const auto it = dialled_.find(ep);
+        return it == dialled_.end() || t >= it->second;
+    }
+
+    // A dial that never got as far as a socket is a different fact from a peer
+    // that talked and then hung up, and it earns a much shorter cool-off. A
+    // live run found the difference the hard way: both of the main sidechain's
+    // DNS seeds failed to resolve in the first second of a monitor run, the
+    // full five-minute cool-off applied, and -- with no peer connected there is
+    // no gossip to supply anything else -- that chain stayed dark for the whole
+    // run while mini and nano were fine.
+    static constexpr std::uint64_t kFailedDialRetryMs = 15000;
+
+    std::uint64_t cool_off_until(std::uint64_t t, bool started) const {
+        if (cfg_.redial_after_ms == 0) return ~0ull;      // never: the harness rule
+        const std::uint64_t d = started
+                ? cfg_.redial_after_ms
+                : std::min<std::uint64_t>(cfg_.redial_after_ms, kFailedDialRetryMs);
+        return t + d;
+    }
+
     void open_sessions() {
+        const std::uint64_t t = now_ms();
         while (live_sessions() < cfg_.max_peers && !queue_.empty()) {
             const Dial d = queue_.front();
             queue_.pop_front();
             const std::string ep = d.host + ":" + std::to_string(d.port);
-            if (dialled_.count(ep)) continue;
-            dialled_.insert(ep);
+            if (!may_dial(ep, t)) continue;
             auto s = std::make_unique<PeerSession>(d.host, d.port, cfg_, consensus_,
                                                    static_cast<std::uint64_t>(rng_()));
-            if (s->start(ledger_, log_)) sessions_.push_back(std::move(s));
+            const bool started = s->start(ledger_, log_);
+            dialled_[ep] = cool_off_until(t, started);
+            if (started) sessions_.push_back(std::move(s));
         }
         // Reap closed sessions so the vector cannot grow without bound on a
         // long run against a churning network.
@@ -685,6 +805,7 @@ private:
     }
 
     void harvest() {
+        const std::uint64_t t = now_ms();
         for (auto& s : sessions_) {
             for (const PeerEntry& p : s->take_discovered()) {
                 if (p.port == 0 || p.port == 0xFFFF) continue;
@@ -692,7 +813,8 @@ private:
                 char buf[INET6_ADDRSTRLEN] = {0};
                 ::inet_ntop(AF_INET, p.addr.data() + 12, buf, sizeof(buf));
                 const std::string ep = std::string(buf) + ":" + std::to_string(p.port);
-                if (dialled_.count(ep)) continue;
+                if (!may_dial(ep, t)) continue;
+                if (queue_.size() >= cfg_.max_dial_queue) continue;
                 queue_.push_back({std::string(buf), p.port});
             }
         }
@@ -708,7 +830,8 @@ private:
 
     std::vector<std::unique_ptr<PeerSession>> sessions_;
     std::deque<Dial>      queue_;
-    std::set<std::string> dialled_;
+    // endpoint -> the time it was last dialled; see may_dial().
+    std::map<std::string, std::uint64_t> dialled_;
 };
 
 // ---------------------------------------------------------------------------
