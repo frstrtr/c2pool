@@ -41,6 +41,8 @@
 #include <impl/dash/coin/tx_inject_pool.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>   // #157 M2: submit_inject gate (relay routes through it)
 #include <impl/dash/tx_inject_relay.hpp>        // #157 M2: ingest_peer_inject relay policy
+#include <impl/dash/coin/inject_sandbox.hpp>    // #157 M3: bounded-work script-verify sandbox
+#include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: node-wide count+byte rate limiter
 #include <impl/dash/coin/good_citizen_defaults.hpp>
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>
 
@@ -722,4 +724,244 @@ TEST(DashTxInject, InjectedTxRidesRegisterTemplateTxs)
     EXPECT_EQ(dash_txid(selected[0].tx), txid)
         << "the accepted inject must be in the served body (rides register_template_txs)";
     EXPECT_EQ(fees, 0u) << "a 0-fee inject contributes 0 to total_fees — reward path unchanged";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #157 M3 — RATE-LIMITING + SANDBOXED SIGNER
+//
+// These KATs drive the two M3 additions that sit IN FRONT of the (unchanged) M1
+// validity gate: the node-wide InjectRateLimiter (count + bytes/window), the
+// per-peer VOLUME cap on PeerInjectGuard, and the bounded-work InjectSandbox on
+// the script-verify surface. RED on master by construction (master has none of
+// these types). Every case proves a DoS bound HOLDS and fails CLOSED by a NAMED
+// cause — and the pre-existing M1/M2 acceptance KATs above double as the
+// regression guard that M3 never blocks or loosens a normal inject.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+using dash::coin::InjectSandbox;
+using dash::coin::InjectRateLimiter;
+using ::bitcoin_family::coin::TxIn;
+using ::bitcoin_family::coin::TxOut;
+
+// A minimal type-0 tx: 1 input (prevout hash = seed), 1 output, tiny scriptSig.
+// Passes the sandbox (small) and the type check; used to exercise the rate
+// limiter without paying for signing (it is rejected post-rate-charge by the
+// validity gate, which is exactly what a flood looks like).
+MutableTransaction minimal_tx(uint8_t seed) {
+    MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 0;
+    TxIn in; in.prevout.hash = prevhash(seed); in.prevout.index = 0;
+    in.sequence = 0xffffffffu;
+    in.scriptSig = to_script({0x51});   // OP_1 — 1 byte, 0 sigops
+    tx.vin.push_back(in);
+    TxOut out; out.value = 1000; tx.vout.push_back(out);
+    return tx;
+}
+
+// A type-0 tx with `n` inputs (each a distinct tiny prevout, tiny scriptSig).
+MutableTransaction tx_with_inputs(std::size_t n) {
+    MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        TxIn in; in.prevout.hash = prevhash(static_cast<uint8_t>(i & 0xff));
+        in.prevout.index = static_cast<uint32_t>(i);
+        in.sequence = 0xffffffffu;
+        in.scriptSig = to_script({0x51});
+        tx.vin.push_back(in);
+    }
+    TxOut out; out.value = 1000; tx.vout.push_back(out);
+    return tx;
+}
+} // namespace
+
+// (M3-1) SANDBOX accepts a normal signed spend untouched — the DoS bounds never
+//        bind on a realistic inject (money-safety: M3 does not block normal txs).
+TEST(DashTxInject, SandboxAcceptsNormalSpend)
+{
+    Key k(0xc1);
+    auto tx = make_signed_spend(k, prevhash(0x31), 100'000);
+    auto r = InjectSandbox::vet(tx);
+    EXPECT_TRUE(r.ok()) << "a normal 1-in/1-out spend must clear every sandbox bound, got "
+                        << r.name();
+}
+
+// (M3-2) SANDBOX bounds the input fan-out (each input = one VerifyScript call
+//        per build). >kMaxInputs fails CLOSED by name.
+TEST(DashTxInject, SandboxRefusesTooManyInputs)
+{
+    auto ok  = tx_with_inputs(InjectSandbox::kMaxInputs);
+    EXPECT_TRUE(InjectSandbox::vet(ok).ok()) << "exactly the cap must pass";
+
+    auto bad = tx_with_inputs(InjectSandbox::kMaxInputs + 1);
+    auto r = InjectSandbox::vet(bad);
+    EXPECT_EQ(r.verdict, InjectSandbox::Verdict::TooManyInputs);
+    EXPECT_STREQ(r.name(), "inject-sandbox-too-many-inputs");
+    EXPECT_EQ(r.value, InjectSandbox::kMaxInputs + 1);
+    EXPECT_EQ(r.threshold, InjectSandbox::kMaxInputs);
+}
+
+// (M3-3) SANDBOX bounds a single scriptSig (interpreter stack/alloc). A scriptSig
+//        above kMaxScriptSigBytes fails CLOSED before the interpreter sees it.
+TEST(DashTxInject, SandboxRefusesOversizeScriptSig)
+{
+    MutableTransaction tx = minimal_tx(0x40);
+    tx.vin[0].scriptSig = to_script(std::vector<uint8_t>(InjectSandbox::kMaxScriptSigBytes + 1, 0x00));
+    auto r = InjectSandbox::vet(tx);
+    EXPECT_EQ(r.verdict, InjectSandbox::Verdict::ScriptSigTooLarge);
+    EXPECT_STREQ(r.name(), "inject-sandbox-scriptsig-too-large");
+    EXPECT_EQ(r.threshold, InjectSandbox::kMaxScriptSigBytes);
+}
+
+// (M3-4) SANDBOX bounds AGGREGATE scriptSig bytes across inputs (each under the
+//        per-script cap, summing past the total). Fails CLOSED by name.
+TEST(DashTxInject, SandboxRefusesTotalScriptSigOverflow)
+{
+    MutableTransaction tx;
+    tx.version = 1; tx.type = 0; tx.locktime = 0;
+    // 12 inputs * 9000 bytes = 108000 > kMaxTotalScriptSigBytes(100000), each
+    // 9000 < kMaxScriptSigBytes(10000) so the per-script cap never binds first.
+    for (int i = 0; i < 12; ++i) {
+        TxIn in; in.prevout.hash = prevhash(static_cast<uint8_t>(i));
+        in.prevout.index = static_cast<uint32_t>(i); in.sequence = 0xffffffffu;
+        in.scriptSig = to_script(std::vector<uint8_t>(9000, 0x00));  // pushes, 0 sigops
+        tx.vin.push_back(in);
+    }
+    TxOut out; out.value = 1000; tx.vout.push_back(out);
+    auto r = InjectSandbox::vet(tx);
+    EXPECT_EQ(r.verdict, InjectSandbox::Verdict::TotalScriptSigTooLarge);
+    EXPECT_STREQ(r.name(), "inject-sandbox-total-scriptsig-too-large");
+    EXPECT_EQ(r.threshold, InjectSandbox::kMaxTotalScriptSigBytes);
+}
+
+// (M3-5) SANDBOX bounds the CHECKSIG work (dashd's own legacy sigop rules). A
+//        scriptSig stuffed with OP_CHECKSIG past kMaxLegacySigOps fails CLOSED.
+TEST(DashTxInject, SandboxRefusesSigOpFlood)
+{
+    MutableTransaction tx = minimal_tx(0x50);
+    // kMaxLegacySigOps+1 OP_CHECKSIG (0xac) bytes: 4001 bytes < per-script cap
+    // and < total cap, so only the sigop bound can trip.
+    tx.vin[0].scriptSig = to_script(std::vector<uint8_t>(InjectSandbox::kMaxLegacySigOps + 1, 0xac));
+    auto r = InjectSandbox::vet(tx);
+    EXPECT_EQ(r.verdict, InjectSandbox::Verdict::TooManySigOps);
+    EXPECT_STREQ(r.name(), "inject-sandbox-too-many-sigops");
+    EXPECT_GT(r.value, static_cast<uint64_t>(InjectSandbox::kMaxLegacySigOps));
+    EXPECT_EQ(r.threshold, InjectSandbox::kMaxLegacySigOps);
+}
+
+// (M3-6) GLOBAL RATE LIMITER — COUNT cap. The (N+1)th event in a window is the
+//        one refused; a refusal mutates nothing (window untouched).
+TEST(DashTxInject, RateLimiterCountCap)
+{
+    InjectRateLimiter rl;
+    const std::time_t t = 10'000;
+    for (std::size_t i = 0; i < InjectRateLimiter::kMaxInjectsPerWindow; ++i)
+        EXPECT_TRUE(rl.try_consume(100, t).ok()) << "under cap must pass at i=" << i;
+
+    auto over = rl.try_consume(100, t);
+    EXPECT_FALSE(over.ok());
+    EXPECT_EQ(over.verdict, InjectRateLimiter::Verdict::CountExceeded);
+    EXPECT_STREQ(over.name(), "inject-rate-limited-count");
+    EXPECT_EQ(rl.count_in_window(), InjectRateLimiter::kMaxInjectsPerWindow)
+        << "a refused attempt must not be recorded";
+}
+
+// (M3-7) GLOBAL RATE LIMITER — BYTE cap. Few large events exhaust the byte
+//        budget while the count cap is untouched; recovers as the window ages.
+TEST(DashTxInject, RateLimiterByteCap)
+{
+    InjectRateLimiter rl;
+    const std::time_t t = 20'000;
+    const uint64_t big = InjectRateLimiter::kMaxBytesPerWindow / 2;   // 2 fit, 3rd overflows
+    EXPECT_TRUE(rl.try_consume(big, t).ok());
+    EXPECT_TRUE(rl.try_consume(big, t).ok());
+    auto over = rl.try_consume(big, t);
+    EXPECT_FALSE(over.ok());
+    EXPECT_EQ(over.verdict, InjectRateLimiter::Verdict::BytesExceeded);
+    EXPECT_STREQ(over.name(), "inject-rate-limited-bytes");
+
+    // After the window rolls forward, the old bytes age out and it recovers.
+    auto later = rl.try_consume(big, t + InjectRateLimiter::kWindowSeconds);
+    EXPECT_TRUE(later.ok()) << "the window must recover once old events expire";
+}
+
+// (M3-8) GLOBAL RATE LIMITER end-to-end through submit_inject: a flood of
+//        distinct injects is throttled at the node-wide count cap, refused BY
+//        NAME, and the limiter counts every ATTEMPT (charged before validity so
+//        an invalid-inject flood is throttled too). Reward path never touched.
+TEST(DashTxInject, SubmitInjectGlobalRateLimitedByName)
+{
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    // The cap is 200 and a uint8 seed only spans 256, but distinct prevout
+    // INDEX keeps each txid unique; drive cap+1 distinct injects in one window.
+    const std::size_t cap = InjectRateLimiter::kMaxInjectsPerWindow;
+    for (std::size_t i = 0; i < cap; ++i) {
+        MutableTransaction tx = minimal_tx(0x01);
+        tx.vin[0].prevout.index = static_cast<uint32_t>(i);   // unique txid
+        auto r = st.submit_inject(tx);
+        // Rejected by the validity gate (no coin), NOT rate-limited — the point
+        // is the attempt was CHARGED against the window without being throttled.
+        EXPECT_NE(r.cause, "inject-rate-limited-count")
+            << "under the cap must not be rate-limited at i=" << i;
+    }
+    EXPECT_EQ(st.inject_rate_count(), cap) << "every attempt is charged before validity";
+
+    MutableTransaction over = minimal_tx(0x01);
+    over.vin[0].prevout.index = static_cast<uint32_t>(cap);
+    auto r = st.submit_inject(over);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.cause, "inject-rate-limited-count")
+        << "the (cap+1)th inject in a window is throttled by name";
+}
+
+// (M3-9) SANDBOX end-to-end through submit_inject: a pathological inject is
+//        refused BY NAME and NEVER enters the pool (never reaches the consensus
+//        interpreter or a template). Proves the bound sits in front of the gate.
+TEST(DashTxInject, SubmitInjectSandboxRefusedByName)
+{
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    auto bad = tx_with_inputs(InjectSandbox::kMaxInputs + 1);
+    auto r = st.submit_inject(bad);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.cause, "inject-sandbox-too-many-inputs");
+    EXPECT_EQ(st.inject_pool_size(), 0u)
+        << "a sandbox-refused inject must never enter the pool";
+}
+
+// (M3-10) PER-PEER VOLUME cap on the relay path: a peer under the per-peer COUNT
+//         cap is still bounded by BYTES/window. Refused as RateLimited by name,
+//         and submit_fn is never called for the throttled frame.
+TEST(DashTxInject, PeerInjectByteVolumeRateLimited)
+{
+    dash::NodeInjectSeen node_seen;
+    dash::PeerInjectGuard peer;
+    const std::uint32_t big =
+        static_cast<std::uint32_t>(dash::PeerInjectGuard::kMaxInjectBytesPerPeerPerWindow / 2);
+
+    int submit_calls = 0;
+    auto stub = [&]() -> dash::InjectSubmitOutcome { ++submit_calls; return {true, "ok"}; };
+
+    // Two big frames (each half the byte budget) fit; the third overflows it —
+    // all well under the 30/window COUNT cap, so only the byte cap can trip.
+    auto v1 = dash::ingest_peer_inject(true, node_seen, peer, prevhash(0x01), big, 7000, stub);
+    EXPECT_EQ(v1.kind, dash::InjectRelayVerdict::Kind::Accepted);
+    auto v2 = dash::ingest_peer_inject(true, node_seen, peer, prevhash(0x02), big, 7000, stub);
+    EXPECT_EQ(v2.kind, dash::InjectRelayVerdict::Kind::Accepted);
+    auto v3 = dash::ingest_peer_inject(true, node_seen, peer, prevhash(0x03), big, 7000, stub);
+    EXPECT_EQ(v3.kind, dash::InjectRelayVerdict::Kind::RateLimited);
+    EXPECT_EQ(v3.cause, "peer-rate-limited-bytes");
+    EXPECT_EQ(submit_calls, 2) << "the byte-throttled frame must not reach submit";
+
+    // The count cap is untouched (only 2 events recorded there).
+    EXPECT_LT(peer.window.size(), dash::PeerInjectGuard::kMaxInjectsPerPeerPerWindow);
+
+    // Recovers once the window rolls past the old byte events.
+    auto later = dash::ingest_peer_inject(true, node_seen, peer, prevhash(0x04), big,
+        7000 + dash::PeerInjectGuard::kWindowSeconds, stub);
+    EXPECT_EQ(later.kind, dash::InjectRelayVerdict::Kind::Accepted)
+        << "the per-peer byte window must recover as old events expire";
 }

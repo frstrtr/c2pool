@@ -23,6 +23,8 @@
 #include <impl/dash/coin/mn_state_machine.hpp>   // MnStateMachine
 #include <impl/dash/coin/mempool.hpp>            // Mempool
 #include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
+#include <impl/dash/coin/inject_sandbox.hpp>     // #157 M3: InjectSandbox (bounded-work script-verify guard)
+#include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: InjectRateLimiter (node-wide count+byte cap)
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
 #include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
@@ -622,12 +624,43 @@ public:
         if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
             r.cause = "inject-type-unsupported"; return r;
         }
+        const uint32_t byte_size =
+            static_cast<uint32_t>(::pack(tx).get_span().size());
+        // #157 M3 — GLOBAL RATE LIMIT (node-wide count + bytes per window). This
+        // is the SINGLE gate both the local loader and the peer path cross, so a
+        // limiter here bounds the total inject work regardless of origin (the
+        // "global" half of per-peer-AND-global). CHARGED ON ATTEMPT, before any
+        // consensus/script work, so an INVALID-inject flood is throttled too.
+        // Reward-safe: a ceiling in front of the validity gate — only refuses.
+        {
+            const std::time_t now = std::time(nullptr);
+            auto rl = m_inject_rate.try_consume(byte_size, now);
+            if (!rl.ok()) {
+                LOG_WARNING << "[MEMPOOL] inject rate-limited cause=" << rl.name()
+                            << " value=" << rl.value << " threshold=" << rl.threshold
+                            << " txid=" << r.txid.GetHex().substr(0, 16);
+                r.cause = rl.name(); return r;
+            }
+        }
+        // #157 M3 — SANDBOX (bounded-work guard on the script-verify surface).
+        // Cheap, chain-state-independent structural bounds run BEFORE the tx can
+        // enter the pool, so a pathological blob never reaches the consensus-exact
+        // interpreter (at admission or at any later build). FAIL-CLOSED: any
+        // breach refuses by name. Reward-safe: a DoS bound in front of the
+        // validity gate — it only refuses, never loosens a check.
+        {
+            auto sb = dash::coin::InjectSandbox::vet(tx);
+            if (!sb.ok()) {
+                LOG_WARNING << "[MEMPOOL] inject sandbox-refused cause=" << sb.name()
+                            << " value=" << sb.value << " threshold=" << sb.threshold
+                            << " txid=" << r.txid.GetHex().substr(0, 16);
+                r.cause = sb.name(); return r;
+            }
+        }
         // Lazily reconcile the pool with the mempool before admitting: forget
         // any tracked inject no longer in the mempool (confirmed / evicted) and
         // reap expired ones, so the caps reflect what is actually live.
         reconcile_inject_pool();
-        const uint32_t byte_size =
-            static_cast<uint32_t>(::pack(tx).get_span().size());
         // DoS caps FIRST (cheap, no consensus work): a full / over-cap pool
         // refuses before the mempool pays for pricing.
         auto pv = m_inject_pool.would_admit(r.txid, byte_size);
@@ -663,6 +696,10 @@ public:
     }
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
+
+    // #157 M3: number of injects the node-wide rate limiter still counts inside
+    // its current window (test/observability accessor; no consensus effect).
+    size_t inject_rate_count() const { return m_inject_rate.count_in_window(); }
 
     /// PINNED LOCAL TX (--pin-local-tx-hex, donation-dust consolidation): an
     /// operator-supplied, externally-signed, zero-fee tx that can only reach
@@ -2016,6 +2053,10 @@ private:
     // m_mempool (Mempool::add_inject priority), not this structure.
     bool                         m_tx_inject_enabled{false};
     dash::coin::TxInjectPool     m_inject_pool;
+    // #157 M3: node-wide inject rate limiter (count + bytes per window). The
+    // "global" half of the per-peer-AND-global DoS caps; the per-peer half is
+    // dash::PeerInjectGuard (tx_inject_relay.hpp), consulted on the peer path.
+    dash::coin::InjectRateLimiter m_inject_rate;
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
     // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs
