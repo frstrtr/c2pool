@@ -348,9 +348,6 @@ inline SeamResult judge_submit(const BlockRelayVerdict& v,
     r.sample.height  = ev.height;
     r.sample.classes = classify(opt.classes);
 
-    ArmObservation ours;   // only used to render ids in diffs
-    ours.height = ev.height;
-
     bool fail = false;
     std::string note;
 
@@ -414,16 +411,21 @@ inline SeamResult judge_submit(const BlockRelayVerdict& v,
     if (v.p2p_peers_sent > 0)
         r.sample.note = "p2p_peers_sent=" + Obs::u64(v.p2p_peers_sent).value + "; ";
 
+    // FAIL is decided BEFORE the "no oracle armed" branch, and the order
+    // matters for exactly one case: a block that reached NOBODY. That is a lost
+    // find on its own evidence -- no acceptance oracle is needed to establish
+    // it, and reporting it as VOID would file a lost block under "nothing to
+    // judge", which is the never-silent-drop rule inverted.
+    if (fail) {
+        r.sample.verdict = ParityVerdict::Fail;
+        r.sample.note += note;
+        return r;
+    }
     if (r.equality_required == 0) {
         r.sample.verdict = ParityVerdict::Void;
         r.sample.note += "no acceptance oracle was armed: relaying to "
                        + Obs::u64(v.p2p_peers_sent).value
                        + " peer(s) is not evidence that anybody accepted the block";
-        return r;
-    }
-    if (fail) {
-        r.sample.verdict = ParityVerdict::Fail;
-        r.sample.note += note;
         return r;
     }
     if (r.equality_compared < r.equality_required) {

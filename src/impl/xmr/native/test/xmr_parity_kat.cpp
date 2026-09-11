@@ -839,6 +839,18 @@ void suite_submit() {
               "a block that reached no arm is a FAIL, not a shrug");
         CHECK(r.sample.note.find("reached no arm") != std::string::npos, "and names the loss");
     }
+    // 9. reached nobody AND no oracle armed: still a FAIL. This is the ordering
+    //    case -- "no acceptance oracle" is VOID, but a lost block does not need
+    //    an oracle to be a lost block, and filing it under "nothing to judge"
+    //    would be the never-silent-drop rule inverted.
+    {
+        SubmitEvidence e; e.height = G6::TIP_HEIGHT;
+        const SeamResult r = judge_submit(verdict(false, false, false, 0), e);
+        CHECK(r.sample.verdict == ParityVerdict::Fail,
+              "a lost block with no oracle armed is still a FAIL, not a VOID");
+        CHECK(r.sample.note.find("reached no arm") != std::string::npos,
+              "and the loss is still named: %s", r.sample.note.c_str());
+    }
 }
 
 // ===========================================================================

@@ -341,6 +341,13 @@ private:
 // `observe()` returns the cache. The split exists for the same reason it does
 // on MonerodMinerDataSource: a network round trip must never sit behind a call
 // the oracle makes on someone else's thread.
+//
+// THREADING, stated because the callbacks below capture by reference: poll() is
+// driven by the owner on ITS thread and the transport delivers these two
+// responses before rpc_post returns, exactly as MonerodMinerDataSource::poll()
+// already assumes for get_miner_data. A transport that deferred the callback
+// past the return would leave those references dangling, so a deferring
+// transport must be given its own pump rather than dropped in here.
 class MonerodTipObserver final : public ITipObserver {
 public:
     explicit MonerodTipObserver(node::IMonerodTransport& tx) : tx_(tx) {}
