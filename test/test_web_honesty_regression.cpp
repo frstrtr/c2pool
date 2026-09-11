@@ -1870,3 +1870,66 @@ TEST(WebStaticMergedGating, LoadingPageSpvRowsAreTopologyDriven) {
     EXPECT_NE(html.find("ci.symbol"), std::string::npos)
         << "the parent SPV row label is not currency_info-driven.";
 }
+
+// ---------------------------------------------------------------------------
+// #921: /global_stats and /local_stats must carry the real V35->V36 crossing
+// summary (v36_active / v36_percentage / v36signaling / v36native). These keys
+// were absent from BOTH aggregate endpoints on two different coin arms
+// (DASH :8097 + :8094) -- a shared-serializer omission, not a per-coin bug.
+// A missing key is not load-dependent, so the fix belongs in the shared
+// web_server serializer. The asserts pin PRESENCE *and* NON-STUB values: a
+// hardcoded 0 would satisfy a presence-only check and silently reproduce the
+// same empty crossing card.
+// ---------------------------------------------------------------------------
+namespace {
+// Mid-cross fixture: 400 shares, 100 already format-latched to V36 (v36native),
+// 250 desiring V36 (=> 150 signaling-but-not-yet-latched), 60% work-weighted.
+json v36_midcross_stats() {
+    json sc;
+    sc["total_shares"]              = 400;
+    sc["chain_height"]              = 400;
+    sc["shares_by_version"]         = {{"35", 300}, {"36", 100}};
+    sc["shares_by_desired_version"] = {{"35", 150}, {"36", 250}};
+    sc["sampling_desired_version"]  = {{"35", 40.0}, {"36", 60.0}};
+    return sc;
+}
+void expect_real_v36_summary(const json& r, const char* endpoint) {
+    ASSERT_TRUE(r.contains("v36_active"))     << endpoint << " dropped v36_active";
+    ASSERT_TRUE(r.contains("v36_percentage")) << endpoint << " dropped v36_percentage";
+    ASSERT_TRUE(r.contains("v36signaling"))   << endpoint << " dropped v36signaling";
+    ASSERT_TRUE(r.contains("v36native"))      << endpoint << " dropped v36native";
+    // NON-STUB: exact counts a hardcoded-0 stub could never produce.
+    EXPECT_EQ(r["v36native"].get<int64_t>(), 100)
+        << endpoint << " v36native not sourced from format-latched share count";
+    EXPECT_EQ(r["v36signaling"].get<int64_t>(), 150)
+        << endpoint << " v36signaling not sourced from desired-version tally";
+    EXPECT_GT(r["v36_percentage"].get<double>(), 0.0)
+        << endpoint << " v36_percentage collapsed to a stub 0";
+    // Node still VOTING (cached share version 35) -> not latched.
+    EXPECT_FALSE(r["v36_active"].get<bool>())
+        << endpoint << " claims a V36 latch while the node still produces V35 shares";
+}
+} // namespace
+
+TEST(WebHonestyRegression, GlobalStatsEmitsRealV36CrossingSummaryNotStub) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_cached_share_version(35);
+    mi.set_sharechain_stats_fn([] { return v36_midcross_stats(); });
+    expect_real_v36_summary(mi.rest_global_stats(), "/global_stats");
+}
+
+TEST(WebHonestyRegression, LocalStatsEmitsRealV36CrossingSummaryNotStub) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_cached_share_version(35);
+    mi.set_sharechain_stats_fn([] { return v36_midcross_stats(); });
+    expect_real_v36_summary(mi.rest_local_stats(), "/local_stats");
+}
+
+TEST(WebHonestyRegression, V36CrossingSummaryLatchesWhenNodeProducesV36) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_cached_share_version(36);   // node has latched to V36
+    mi.set_sharechain_stats_fn([] { return v36_midcross_stats(); });
+    json r = mi.rest_global_stats();
+    EXPECT_TRUE(r["v36_active"].get<bool>())
+        << "/global_stats v36_active must follow the live latch to V36";
+}
