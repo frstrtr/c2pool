@@ -21,19 +21,35 @@
 # a sidechain blob is handed to THOSE parsers rather than to a second copy
 # written here -- which is the whole reason this component is stacked on M3.
 #
-# Two targets, both under BUILD_TESTING:
+# Four targets, all under BUILD_TESTING:
 #
-#   xmr_p2pool_parse_kat   the deterministic parser KAT over two real captured
-#                          frames. REGISTERED with add_test and run in both CI
-#                          legs. Offline: the goldens are in the header.
-#   xmr_p2pool_observer    the live harness. BUILT by CI so it cannot bit-rot,
-#                          RUN by nobody in CI, because running it dials a
-#                          public network. Registers no ctest test, so the
-#                          #1539 Not-Run rule does not apply to it.
+#   xmr_p2pool_parse_kat    the deterministic parser KAT over two real captured
+#                           frames. REGISTERED with add_test and run in both CI
+#                           legs. Offline: the goldens are in the header.
+#   xmr_p2pool_monitor_kat  the deterministic RENDER KAT: three fixed read
+#                           models drawn to a golden frame, plus the emitted
+#                           message-id pin re-asserted for the monitor. Also
+#                           REGISTERED, also offline -- it includes no socket
+#                           header and needs no terminal.
+#   xmr_p2pool_observer     the live single-chain harness. BUILT by CI so it
+#                           cannot bit-rot, RUN by nobody in CI, because running
+#                           it dials a public network. Registers no ctest test,
+#                           so the #1539 Not-Run rule does not apply to it.
+#   xmr_p2pool_monitor      the live all-in-one monitor: all three sidechains in
+#                           ONE poll() loop behind a fullscreen ANSI/termios
+#                           TUI. Same rule as the observer -- BUILT by CI, never
+#                           RUN by it (it dials three public networks and the
+#                           fullscreen mode wants a tty), and it registers no
+#                           ctest test either. What CI runs is the render KAT.
+#
+# THE TUI HAS NO DEPENDENCIES. It is ANSI escapes plus POSIX termios: no
+# ncurses, no boost, no asio, no threads. The renderer itself
+# (p2pool_tui.hpp) is pure STL and deliberately POSIX-free, which is what lets
+# the KAT pin a whole frame without linking a socket layer.
 #
 # DRIFT-GUARD: tools/ci/check_test_target_allowlist.py audits
 # src/impl/<coin>/test/CMakeLists.txt; this tree sits one level deeper
-# (src/impl/xmr/p2pool/test/) and is outside that glob, so BOTH targets are
+# (src/impl/xmr/p2pool/test/) and is outside that glob, so ALL FOUR targets are
 # added to BOTH `--target` lists in .github/workflows/build.yml by hand. A
 # target registered with add_test but never built reports "***Not Run" and
 # exits non-zero -- the #1539 lesson.
@@ -42,11 +58,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 if (BUILD_TESTING AND UNIX)
-    # The live harness. POSIX sockets only: no asio, no threads, no boost.
+    # The live harnesses. POSIX sockets only: no asio, no threads, no boost,
+    # and for the monitor's full-screen mode, no ncurses either.
     add_executable(xmr_p2pool_observer tools/p2pool_observer_main.cpp)
     target_include_directories(xmr_p2pool_observer PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(xmr_p2pool_observer PRIVATE xmr_coin)
     target_compile_features(xmr_p2pool_observer PRIVATE cxx_std_20)
+
+    add_executable(xmr_p2pool_monitor tools/p2pool_monitor_main.cpp)
+    target_include_directories(xmr_p2pool_monitor PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(xmr_p2pool_monitor PRIVATE xmr_coin)
+    target_compile_features(xmr_p2pool_monitor PRIVATE cxx_std_20)
 endif()
 
 if (BUILD_TESTING)

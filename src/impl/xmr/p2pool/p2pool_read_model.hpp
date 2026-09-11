@@ -248,6 +248,36 @@ public:
     const std::map<Hash, ObservedBlock>& blocks() const noexcept { return by_id_; }
     const std::vector<Hash>& arrival_order() const noexcept { return order_; }
 
+    // Per-height arrival record, ordered by height. Exposed for the reason
+    // cadence_seconds() exists at all: one averaged cadence cannot say whether
+    // the chain is beating steadily or arriving in bursts, and a display that
+    // shows the individual gaps says more than the mean does. Callers inherit
+    // the frontier caveat -- a height at or below frontier_height() carries a
+    // FETCH time, not an arrival time.
+    const std::map<std::uint64_t, HeightContest>& heights() const noexcept { return by_height_; }
+
+    // The gaps between consecutive LIVE height arrivals, oldest first, at most
+    // `max` of them (0 = all). Same live-window rule as cadence_seconds():
+    // everything at or below the frontier is excluded, because those heights
+    // were backfilled by our own parent walk and their spacing measures our
+    // fetch rate rather than the chain's block rate.
+    std::vector<std::uint64_t> live_arrival_gaps_ms(std::size_t max) const {
+        std::vector<std::uint64_t> t;
+        if (have_frontier_)
+            for (const auto& kv : by_height_)
+                if (kv.first > frontier_height_) t.push_back(kv.second.first_seen_ms);
+        std::vector<std::uint64_t> gaps;
+        for (std::size_t i = 1; i < t.size(); ++i)
+            gaps.push_back(t[i] >= t[i - 1] ? t[i] - t[i - 1] : 0);
+        if (max && gaps.size() > max)
+            gaps.erase(gaps.begin(), gaps.end() - static_cast<std::ptrdiff_t>(max));
+        return gaps;
+    }
+
+    // The chain's own parameters, so a display can put an observed number next
+    // to the target it is supposed to approach.
+    SidechainParams params() const noexcept { return params_; }
+
     const ObservedBlock* find(const Hash& id) const {
         const auto it = by_id_.find(id);
         return it == by_id_.end() ? nullptr : &it->second;

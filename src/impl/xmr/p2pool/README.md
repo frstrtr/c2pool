@@ -73,14 +73,20 @@ peer at once.
 | `p2pool_handshake.hpp` | challenge/solution keccak and the dial-side proof of work |
 | `p2pool_block.hpp` | the `PoolBlock` parse: Monero template + sidechain record + share set |
 | `p2pool_read_model.hpp` | the accumulator: tip, difficulty, cadence, same-height contests |
-| `p2pool_observer.hpp` | sessions and the poll loop |
-| `tools/p2pool_observer_main.cpp` | the live harness |
-| `test/p2pool_parse_kat.cpp` | the KAT, over two real captured frames |
+| `p2pool_observer.hpp` | sessions and the poll loop, in three drivable phases |
+| `p2pool_multiwatch.hpp` | three observers through **one** `poll()`, plus the terminal |
+| `p2pool_tui.hpp` | the frame: a pure function from three read models to text |
+| `tools/p2pool_observer_main.cpp` | the live single-chain harness |
+| `tools/p2pool_monitor_main.cpp` | the live all-in-one monitor: fullscreen TUI and `--snapshot` |
+| `test/p2pool_parse_kat.cpp` | the parser KAT, over two real captured frames |
+| `test/p2pool_monitor_kat.cpp` | the render KAT: a golden frame and the emit-set pin |
+| `test/p2pool_monitor_golden.inc` | that golden frame, one C string per line — readable as a picture |
 | `test/gen_p2pool_golden.py` | independent Python reading that generates the golden's expected values |
 
 Everything is header-only STL over two things the repository already has:
 `xmr_coin` (the vendored Monero keccak and tree hash) and the native lane's
-consensus headers.
+consensus headers. The TUI adds nothing to that: ANSI escapes and POSIX
+`termios`, no ncurses, no boost, no asio, no threads.
 
 ---
 
@@ -171,6 +177,130 @@ CI **builds** this binary so it cannot bit-rot and **never runs** it, because
 running it dials a public network. It registers no ctest test, so the #1539
 Not-Run rule does not apply to it. What CI runs is `xmr_p2pool_parse_kat`,
 which is offline: both goldens are embedded in the header.
+
+---
+
+## All three sidechains at once
+
+`xmr_p2pool_monitor` watches **main, mini and nano together** in one read-only
+process, on one screen.
+
+```
+xmr_p2pool_monitor                          fullscreen, all three chains
+xmr_p2pool_monitor --chains mini,nano       two of them
+xmr_p2pool_monitor --snapshot --seconds 90  one plain-text frame to stdout
+```
+
+### One `poll()`, three chains, no threads
+
+An `Observer` **is** one sidechain — one consensus id, one peer set, one read
+model, one byte ledger — and that shape is not changed to make three of them
+fit. What cannot be had three times is the event loop: three `::poll()` calls in
+sequence means each blocks the other two for its timeout, and the five-second
+tip-poll rule above starts to slip. Threads would fix the stall and bring a
+mutex around every read model for three sockets' worth of traffic.
+
+So the observer's loop was split into the three phases it already contained, and
+the monitor drives all three chains through **one** `poll()`:
+
+```
+for each chain:  begin_tick()                        dial, reap
+for each chain:  begins[i] = pfds.size(); collect()  append its sockets
+append the tty                                       a keypress wakes the loop
+::poll(pfds, timeout)                                the only blocking call
+for each chain:  dispatch(pfds + begins[i], n_i)     its own slice, only
+```
+
+**The range is the tag.** A chain's sockets occupy a contiguous slice of the
+shared array, so there is no per-fd chain map to build, look up or leave stale,
+and a chain cannot be handed another chain's `revents` — it is handed a pointer
+and a length. `run()` is written in terms of the same three calls, so the
+single-chain harness and the monitor cannot drift apart.
+
+Per-connection timers needed nothing: `next_tip_poll_ms_` already lives inside
+`PeerSession`, so the "< 10 s" rule holds independently on every socket of every
+chain.
+
+One thing did have to change. The observer never re-dials an endpoint, which is
+right for a 300-second harness and wrong for a monitor left running for hours:
+every peer that ever hung up would be excluded permanently, the dial queue would
+drain, and a panel would go quiet while the chain was fine. `redial_after_ms`
+(0 = never, the harness default) and an idle-chain reseed fix that, and the
+queue is capped so gossip cannot grow it without bound overnight.
+
+### The TUI has no dependencies
+
+ANSI escapes and POSIX `termios`: raw mode is four flags, the alternate screen
+and the cursor are two escapes each, the size is `TIOCGWINSZ`, `SIGWINCH` sets a
+flag. No ncurses, no boost, no asio, no threads.
+
+The restore path is installed three ways over, because a monitor that dies in
+raw mode leaves someone with a shell that does not echo: the loop exits on a
+quit flag set by `SIGINT`/`SIGTERM`, the `TerminalUi` destructor restores, and an
+`atexit` hook restores whatever the exit path was.
+
+Everything drawn is printable ASCII — the pulse ramp is `_.-=+*#`, the bars are
+`#`/`-`. The moment a frame holds a multi-byte character, `size()` stops being
+the column count and every alignment becomes a guess.
+
+### The frame is a pure function, so it is pinned
+
+`p2pool_tui.hpp` is deliberately POSIX-free: no socket, no terminal, no clock.
+Ages and uptime are resolved at one instant handed in by the caller. That is
+what lets `xmr_p2pool_monitor_kat` fill three read models with fixed synthetic
+observations at fixed timestamps and compare the **whole frame** against
+`p2pool_monitor_golden.inc`, byte for byte, on every machine and forever. A
+dashboard is the easiest place in a codebase to hide a wrong number, because the
+only thing that would catch it is somebody looking at it.
+
+Colour is additive and nothing else: `strip_ansi(render(color))` equals
+`render(plain)` line for line, which the KAT asserts — so `--snapshot` is the
+same renderer with the escapes off, not a second one that could disagree with
+the screen. The KAT also re-asserts the emitted id set `{0, 1, 3, 6}` for this
+second binary, and the footer of every frame prints that set **as computed from
+the encoder**, so a fifth encoder would start announcing itself on screen in the
+same breath as it failed the test.
+
+The panels inherit the read model's refusals rather than softening them for
+looks: below two live samples the cadence line says `warming` instead of
+printing a number, the pulse shows the individual gaps because a mean hides the
+difference between a steady beat and a stall between bursts, and `monero tpl` is
+labelled a template height — deciding that a sidechain block cleared Monero's
+target needs a Monero PoW target this observer does not hold.
+
+### What the live runs found
+
+**A whole sidechain went dark, and the panel is how it was caught.** On the
+second live run the main chain reported `DARK — 0 up / 0 sock / 0 known / 0
+queued / 0 B sent` for four minutes while mini and nano were fine. That is a
+real bug with three parts, all now fixed:
+
+* both of main's DNS seeds failed inside `start()` in the first second of the
+  run — and `fail()` only logged when the session had already left
+  `State::Closed`, which a session that never connected never does, so the
+  failure was **silent**. It logs now;
+* the failed dial then took the full five-minute cool-off, the same as a peer
+  that had talked and hung up. A dial that never reached a socket is a different
+  fact and now earns a 15-second retry instead;
+* with no peer connected there is no peer-list gossip, so the seeds were the
+  only way back and the chain could not recover on its own. `reseed()` now
+  clears the cool-off on the seed endpoints of a chain that has nothing, and the
+  monitor reseeds a dark chain every 20 seconds.
+
+Two display defects too, both invisible until three real chains were on screen:
+the final snapshot was taken *after* the sockets were closed and so reported
+`4 up / 0 sockets`, and the `net` line overflowed 100 columns once peer counts
+reached three digits, truncating `bcast` mid-word. Both fixed; the golden frame
+pins the layout that replaced them.
+
+The first of those is the argument for the dashboard existing at all: `DARK` next
+to `0 queued` said, on sight, that the chain had nothing left to dial — which is
+a different failure from "peers are refusing us", and the two look identical in
+a log.
+
+CI **builds** the monitor and never runs it — it dials three public networks and
+the fullscreen mode wants a tty — and it registers no ctest test either. What CI
+runs is the render KAT, which is offline.
 
 ---
 
