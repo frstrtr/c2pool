@@ -46,7 +46,7 @@ jobs:
         with:
           lock-file: /tmp/c2pool-build-heavy-leg.lock
           holder-file: /tmp/c2pool-build-heavy-leg.holder
-          slots: "4"
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.

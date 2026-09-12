@@ -123,7 +123,7 @@ jobs:
           WAIT="${HEAVY_LEG_WAIT:-5400}"
           TTL="${HEAVY_LEG_TTL:-14400}"
           SWEEP="${HEAVY_LEG_SWEEP:-1}"
-          SLOTS="${HEAVY_LEG_SLOTS:-4}"
+          SLOTS="${HEAVY_LEG_SLOTS:-3}"
           ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
 
           # Slot files are ${LOCK}.1 .. ${LOCK}.SLOTS; each slot's live holder records a

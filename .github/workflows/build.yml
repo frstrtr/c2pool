@@ -97,7 +97,7 @@ jobs:
         with:
           lock-file: /tmp/c2pool-build-heavy-leg.lock
           holder-file: /tmp/c2pool-build-heavy-leg.holder
-          slots: "4"
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.
@@ -774,7 +774,7 @@ jobs:
         with:
           lock-file: /tmp/c2pool-build-heavy-leg.lock
           holder-file: /tmp/c2pool-build-heavy-leg.holder
-          slots: "4"
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.
@@ -1136,7 +1136,7 @@ jobs:
         with:
           lock-file: /tmp/c2pool-build-heavy-leg.lock
           holder-file: /tmp/c2pool-build-heavy-leg.holder
-          slots: "4"
+          slots: "3"
       - name: Assert head + materialize tree + guard cache path (fail closed)
         working-directory: ${{ github.workspace }}
         run: |
@@ -1790,7 +1790,7 @@ jobs:
         with:
           lock-file: /tmp/c2pool-build-heavy-leg.lock
           holder-file: /tmp/c2pool-build-heavy-leg.holder
-          slots: "4"
+          slots: "3"
       - name: Set per-job Conan home
         run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
 
@@ -1924,7 +1924,7 @@ jobs:
         with:
           lock-file: /tmp/c2pool-build-heavy-leg.lock
           holder-file: /tmp/c2pool-build-heavy-leg.holder
-          slots: "4"
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           if [ "${{ runner.environment }}" = "github-hosted" ]; then
