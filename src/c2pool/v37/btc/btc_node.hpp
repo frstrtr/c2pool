@@ -58,8 +58,10 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -74,12 +76,40 @@
 
 namespace c2pool::v37n::btc {
 
-namespace cb = ::c2pool::v37n::coinbase;
+namespace cb     = ::c2pool::v37n::coinbase;
+namespace settle = ::c2pool::v37n::settle;
 
 // Resolve a canonical OWED key to its payout ScriptRef. In production this is
 // W4's OI-W4-1 identity view (SettlementView::identities); the smoke supplies a
 // P2PKH resolver. Injected so the lifecycle never bakes an identity policy.
 using PayOfFn = std::function<::v37::ScriptRef(const ::v37::bytes32& key)>;
+
+// ── S-1: the E_b fold at a win's lane cut, with its own witness ─────────────
+// One block win folds the ENTITLEMENT E_b (§4.3) out of the lane snapshot the
+// engine has published at that instant, and records the cut it read at. The
+// cut witness is diagnostic — the CONSENSUS quantity is `lane_digest`, the
+// snapshot's canonical lane commitment: two nodes that fold at the same lane
+// digest fold the same E_b, so this is the value the cross-node convergence
+// assertion is made against.
+//
+// NOT the coinbase. `credit` is what the ledger OWES the payees after this
+// block; the coinbase `payout` is the K_fair proposal the block actually
+// broadcast. They are different maps on purpose (§4.4): credit - payout is the
+// carried-forward owed balance, and it is exactly the difference the owed
+// digest commits to. Conflating them nets finalW to zero and leaves the digest
+// at the empty anchor forever — the S-1 defect this fold replaces.
+struct EbCut {
+    Amounts        credit;                   // E_b, canonical-key keyed
+    bool           folded    = false;        // fold_eb returned a value
+    bool           valueless = false;        // folded, but worth nothing (see `refusal`)
+    ::v37::bytes32 lane_digest{};            // ★ the cut witness (consensus commitment)
+    std::uint64_t  lane_version = 0;         // per-lane monotone publication version
+    std::uint64_t  lane_incarnation = 0;     // node-monotone AddLane incarnation (F2/ABA)
+    std::uint64_t  next_pos = 0;             // the prefix P the fold read at
+    std::size_t    unresolved = 0;           // OI-W4-1 broken-invariant counter
+    const char*    source = "none";          // eb_source_name(): live-only / live+carry
+    std::string    refusal;                  // non-empty => the loud reason
+};
 
 // The disposition of a block-winning share the v36 work source handed us.
 struct WonBlockOutcome {
@@ -88,6 +118,18 @@ struct WonBlockOutcome {
     ::v37::bytes32        state_root{};       // §13 root committed in the coinbase
     SubmitResult          submit;            // coin-backend submit disposition
     std::string           bid;               // the block hash we submitted under
+    EbCut                 cut;               // ★ S-1: the E_b fold this win credited
+};
+
+// S-1 refusal counters (diagnostics only — never consensus). A live node that
+// registers wins with no credit is BROKEN, and these are how an operator sees
+// it without reading the log.
+struct S1FoldStats {
+    std::uint64_t folds      = 0;   // wins whose E_b fold produced a credit map
+    std::uint64_t no_view    = 0;   // wins with no published lane snapshot
+    std::uint64_t refused    = 0;   // wins fold_eb REFUSED (geometry not ratified)
+    std::uint64_t valueless  = 0;   // wins registered with an EMPTY credit (reward 0 / empty lane)
+    std::uint64_t unresolved = 0;   // total OI-W4-1 unresolved payout keys seen
 };
 
 class XbtcNode {
@@ -175,6 +217,16 @@ public:
         if (!m_started) return out;
 
         const std::uint64_t reward = m_coin->block_reward(won_height);
+
+        // ── ★ S-1 (live fold-wiring): the ENTITLEMENT this win creates ───────
+        // Fold E_b out of the lane cut the engine has published RIGHT NOW, and
+        // keep the witness of which cut that was. This is the live path that
+        // was missing: before it, the only live FOUND sites handed the ledger a
+        // credit built from the W5 assembly, which a fresh win (confirmations
+        // == 0) WITHHOLDS — so credit was empty, finalW never moved, and
+        // owed_digest stayed at the empty "V37O" anchor forever.
+        out.cut = fold_entitlement_at_cut(reward, bid, won_height);
+
         // R1: the ratified defaults are UNBOUNDED output-count C and byte budget
         // K_max (spec §4.6) — pay every eligible owed balance the reward covers.
         // slot_budget_C == 0 / max_payout_bytes == 0 BOTH mean UNBOUNDED (the two
@@ -205,15 +257,26 @@ public:
 
         // Register the found block with the F1 driver: write-ahead FOUND + enter
         // the merged ledger's pending set, so as the block buries D_conf deep the
-        // height-watch finalizes it IN ORDER (the F1 contract). credit/payout are
-        // the per-key entitlement the block carries (from the assembly).
+        // height-watch finalizes it IN ORDER (the F1 contract).
+        //
+        // ★ S-1: credit and payout are DIFFERENT maps and must stay so.
+        //   credit = E_b, the entitlement this block creates over the lane cut
+        //            above (what the pool now OWES its payees).
+        //   payout = the coinbase outputs this block ACTUALLY BROADCAST — the
+        //            K_fair proposal the buried gate admitted. A fresh win
+        //            (confirmations == 0) emits nothing, so this is EMPTY here
+        //            and the whole entitlement carries forward as owed; that
+        //            carry is precisely what owed_digest commits to.
+        // FINALIZE does finalW += credit; finalW -= payout (Settlement.tla G).
+        // Registering credit == payout nets every block to zero and is the
+        // defect; registering the assembly as the CREDIT loses the entitlement
+        // entirely. Both are replaced here.
         FoundBlock fb;
         fb.bid    = bid;
         fb.height = won_height;
-        for (const auto& o : asm_.outputs) {
-            fb.credit[o.key] = static_cast<long long>(o.amount);
+        fb.credit = out.cut.credit;
+        for (const auto& o : asm_.outputs)
             fb.payout[o.key] = static_cast<long long>(o.amount);
-        }
         m_fin->on_block_found(fb);
 
         // Submit the block to the coin network (ARM A embedded P2P + ARM B
@@ -244,8 +307,103 @@ public:
     std::shared_ptr<const ::v37::LaneSnapshot> lane_snapshot() const {
         return m_engine ? m_engine->snapshot(m_cfg.lane_chain) : nullptr;
     }
+    // S-1 diagnostics: the refusal counters and the cut the last win folded at.
+    const S1FoldStats& s1_stats() const { return m_s1; }
+    const EbCut&       last_cut() const { return m_last_cut; }
 
 private:
+    // ── ★ S-1: fold E_b at the lane cut published NOW ────────────────────────
+    // The ONE credit-path entry point is settle::fold_eb — it does the ratified-
+    // geometry refusal AND the fold in one call (the S8 seam), so a settlement
+    // over a non-ratified geometry cannot reach the ledger through here. strict
+    // == true is the production setting; a HARD refusal is never retried.
+    //
+    // REFUSE LOUD, REGISTER ANYWAY. A real block we mined is a real block: the
+    // FOUND registration must happen even when the fold gives us nothing, or the
+    // block is lost to the F1 driver and the coinbase it paid is never deducted.
+    // So every failure path below stamps the record VALUELESS, screams on
+    // stderr, bumps a counter — and returns an empty credit that is still
+    // registered by the caller.
+    EbCut fold_entitlement_at_cut(std::uint64_t reward, const std::string& bid,
+                                  std::uint64_t won_height) {
+        EbCut c;
+        std::shared_ptr<const ::v37::LaneSnapshot> view =
+            m_engine ? m_engine->snapshot(m_cfg.lane_chain) : nullptr;
+        if (!view) {
+            ++m_s1.no_view;
+            c.valueless = true;
+            c.refusal = "no lane snapshot published for chain " +
+                        std::to_string(static_cast<unsigned long long>(m_cfg.lane_chain));
+            say_s1(bid, won_height, reward, c);
+            m_last_cut = c;
+            return c;
+        }
+        c.lane_digest      = view->digest;
+        c.lane_version     = view->version;
+        c.lane_incarnation = view->incarnation;
+
+        std::optional<settle::EbFold> f = settle::fold_eb(reward, *view, /*strict=*/true);
+        if (!f) {
+            ++m_s1.refused;
+            c.valueless = true;
+            c.next_pos  = view->next_pos;
+            c.refusal   = "fold_eb REFUSED: this lane's geometry is NOT ratified "
+                          "(settle::geometry_is_ratified == false) — the settlement "
+                          "boundary will not credit over it";
+            say_s1(bid, won_height, reward, c);
+            m_last_cut = c;
+            return c;
+        }
+        c.folded     = true;
+        c.next_pos   = f->next_pos;
+        c.unresolved = f->unresolved;
+        c.source     = settle::eb_source_name(f->source);
+        for (const auto& [k, v] : f->credit)
+            c.credit[k] = static_cast<long long>(v);
+        m_s1.unresolved += f->unresolved;
+
+        if (reward == 0) {
+            c.valueless = true;
+            c.refusal   = "reward == 0 at H_b — the coin backend answered "
+                          "fail-closed (cached template height != H_b?); the win is "
+                          "registered VALUELESS and credits nobody";
+        } else if (c.credit.empty()) {
+            c.valueless = true;
+            c.refusal   = "E_b is EMPTY at this cut — the lane has no accounted "
+                          "weight (no shares ingested: is the carrier relay up?); "
+                          "the win is registered VALUELESS and credits nobody";
+        }
+        if (c.valueless) ++m_s1.valueless; else ++m_s1.folds;
+        say_s1(bid, won_height, reward, c);
+        m_last_cut = c;
+        return c;
+    }
+
+    // The cut witness on one line. STL-only (this header links no logger): the
+    // daemon mirrors it through LOG_* from WonBlockOutcome::cut.
+    static void say_s1(const std::string& bid, std::uint64_t h, std::uint64_t reward,
+                       const EbCut& c) {
+        auto hex32 = [](const ::v37::bytes32& d) {
+            static const char* H = "0123456789abcdef";
+            std::string s;
+            for (auto b : d) { s += H[b >> 4]; s += H[b & 15]; }
+            return s;
+        };
+        std::fprintf(c.valueless ? stderr : stdout,
+                     "[v37-s1] %s FOUND %s h=%llu reward=%llu E_b=%zu keys "
+                     "cut{lane_digest=%s version=%llu incarnation=%llu next_pos=%llu "
+                     "source=%s unresolved=%zu}%s%s\n",
+                     c.valueless ? "VALUELESS" : "credit", bid.c_str(),
+                     static_cast<unsigned long long>(h),
+                     static_cast<unsigned long long>(reward), c.credit.size(),
+                     hex32(c.lane_digest).c_str(),
+                     static_cast<unsigned long long>(c.lane_version),
+                     static_cast<unsigned long long>(c.lane_incarnation),
+                     static_cast<unsigned long long>(c.next_pos), c.source,
+                     c.unresolved, c.refusal.empty() ? "" : " — ",
+                     c.refusal.c_str());
+    }
+
     // Placeholder for the v36 reconstruct_won_block(share_hash, coinbase, ...)
     // full-block-hex assembly. Kept out of the lifecycle proper (it needs the
     // known-tx bodies + the coin's block header codec, which live in the v36
@@ -266,6 +424,9 @@ private:
     SettleHW                           m_hw;
     std::unique_ptr<BtcFinalizeDriver> m_fin;
     std::unique_ptr<V37Engine>         m_engine;
+
+    S1FoldStats m_s1;        // S-1 fold counters (diagnostics)
+    EbCut       m_last_cut;  // the cut the last win folded at (diagnostics)
 
     bool m_opened = false;
     bool m_started = false;
