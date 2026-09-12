@@ -1,33 +1,35 @@
 # c2wallet-qt — Design Document
 
-Standalone, air-gapped Qt desktop wallet and transaction constructor for the frstrtr/c2pool ecosystem. Successor to the offline Python signer `tools/c2wallet/c2wallet.py`. Bitcoin-Core-like UI on the key-holding, offline side; the online c2pool embedded daemon performs validation, splice, and broadcast/inject. This is a design; it authorizes no production code.
-
----
-
 ## 1. Goal & Non-Goals
 
-### 1.1 Goal
+### Goal
 
-A network-incapable desktop application that holds keys, imports any Bitcoin-script-family key format, constructs and signs spends of every script/output type (including exotic and historically-bugged ones), converts addresses across coins that share the same key/hash algebra, and hands unsigned/signed artifacts across an air gap to an online c2pool node for validation and broadcast. It is the offline half of a two-process system whose online half already exists (c2pool the validator/broadcaster). It must reach parity with `c2wallet.py` (which signed donation block 2518186) before extending beyond it.
+`c2wallet-qt` is a standalone, air-gapped Qt desktop wallet and transaction constructor for the frstrtr/c2pool ecosystem — the successor to the offline Python signer `tools/c2wallet/c2wallet.py`. It is the **key-holding, offline** side of a two-machine model: it imports keys, constructs and signs transactions, and self-verifies them, while a separate **online c2pool embedded daemon** performs script-verify / UTXO / policy validation and broadcast/injection. A Bitcoin-Core-like UI presents this over one wallet shell.
 
-Concrete goals, mapped to operator requirements:
+The wallet spans **two co-equal, first-class chain families that share almost nothing at the crypto layer**, and the architecture is built around that fact rather than treating one as a bolt-on:
 
-1. **Import any key format** — BIP39 mnemonic (+ passphrase), BIP32 xprv/xpub with arbitrary derivation paths, BIP44/49/84/86 purpose presets, WIF (compressed/uncompressed, per-coin version byte), raw hex privkey, and encrypted keystore files.
-2. **Construct and spend all script/output types** — uncompressed & compressed P2PK, P2PKH, P2SH, P2WPKH, P2WSH, P2SH-wrapped-segwit (both keyhash and scripthash), bare P2MS multisig including the `OP_CHECKMULTISIG` extra-pop dummy, and P2TR key-path and script-path — with correct sighash and scriptSig/witness assembly per type.
-3. **Validate the constructed tx via the online c2pool daemon** (script-verify / UTXO / policy) before signing and before broadcast.
-4. **An air-gapped security model** — the signing build is network-incapable by construction; keys never touch a networked or agent-controlled host; transfer is via public unsigned↔signed artifacts (file / QR / PSBT-like).
-5. **Cross-coin address conversion** — re-encode the same hash160 / witness program / x-only key under a target coin's version byte or bech32 HRP when (and only when) the two coins share the same address algebra; warn or refuse when they do not (BCH CashAddr, or a type with no target equivalent). This is the merged-payout auto-conversion c2pool performed for LTC↔DOGE, closed against the pay-misdirection hole of issue #961.
+- **Family A — Bitcoin-script (secp256k1 / hash160):** BTC, LTC, DOGE, DASH, DGB, BCH, NMC. ECDSA + Schnorr, Bitcoin script, base58check / bech32 / bech32m / CashAddr, BIP32/39/44 HD derivation, PSBT-like unsigned↔signed artifacts.
+- **Family B — Monero / CryptoNote (Ed25519 / RingCT):** a first-class citizen per the operator's MONERO-FIRST beachhead directive, **not deferred**. Dual spend/view keypair, one-time stealth outputs, RingCT + CLSAG + key images, ring/decoy selection, 25-word Monero mnemonic (and optional polyseed), Monero base58, subaddresses and integrated addresses, and Monero's native cold-signing flow.
 
-### 1.2 Non-Goals (first wave)
+The two families are abstracted under one wallet/UI shell but are implemented as fully separate backends. They diverge at the curve (secp256k1 vs Ed25519), the seed scheme (BIP39 vs 25-word/polyseed), the address algebra (hash160 vs stealth one-time keys), and the keypair cardinality (one private key vs a spend+view pair). The family is resolved **before** any format parsing or address handling — it is a design invariant, not a runtime branch deep in the code.
 
-- **Monero / CryptoNote.** Not secp256k1/hash160 script-based; a different signer and a different validation model entirely. Noted as a possible later, separate CryptoNote module — never a coin row in the Bitcoin-script registry.
-- **Being a networked wallet.** UTXO discovery, balance display, fee estimation, mempool/policy probing, and broadcast live on the online side (c2pool, or a networked coordinator build). The signing build performs none of these and links no network stack.
-- **Hot-wallet / always-on custody.** The default posture is amnesiac: secrets live only in locked memory for the duration of a signing ceremony. Encrypted-at-rest persistence is opt-in.
-- **Zero-fee mempool relay.** The donation-consolidation class of tx does not relay (fee==0). The only correct network exit is the pin/own-template path (and, later, tx-inject). No "broadcast via mempool" affordance is offered for a zero-fee tx.
+The operator requirements the design must satisfy:
 
-### 1.3 Coin scope (working default)
+1. Import **any** key format for both families.
+2. Construct and **spend every** script/output type, including exotic and historically-bugged ones (Family A) and RingCT spends (Family B).
+3. Validate the unsigned/constructed transaction via the online c2pool embedded daemon **before** signing/broadcast.
+4. An air-gapped security model with a network-incapable signing build.
+5. **Cross-coin address conversion within Family A** (LTC↔DOGE and the wider secp256k1/hash160 set) with a hard money-misdirection guard (issue #961).
 
-BTC, LTC, DOGE, DASH, DGB, BCH, NMC — one binary serves all via a shared coin registry. Two registry gaps must be filled (see §2.4): NMC has no `address_encoding.hpp` leaf header, and BCH CashAddr needs a standalone codec in the offline build.
+Baseline parity floor: `c2wallet.py` signed DASH donation block **2518186** (1040 inputs → 4 outputs). The successor must strictly **extend, never regress** that: RFC6979 deterministic nonce, self-verify-before-emit, oversize refusal, and seed-never-persisted are non-negotiable inherited behaviours.
+
+### Non-Goals
+
+- **No online validation, broadcast, or key custody on a networked host.** The signer never opens a socket; c2pool never holds a key or signs.
+- **Cross-coin address conversion does not cross the secp256k1↔Ed25519 boundary.** Requirement (5) is Family-A-only. Any attempt to convert a Bitcoin-family address to/from a Monero address is refused at the family layer.
+- **BCH is in scope for construct/spend but excluded from cross-coin conversion** — CashAddr is a different encoding, not a prefix swap; the converter must detect and refuse it.
+- **Monero N/M multisig (MMS) is proposed out of scope for v1** (open decision §7); Bitcoin-family multisig (P2MS/P2SH) is fully in scope.
+- Not a general online wallet, block explorer, or pool control panel — that is the existing `c2pool-qt` application, which is deliberately a separate, network-linked binary.
 
 ---
 
@@ -35,260 +37,310 @@ BTC, LTC, DOGE, DASH, DGB, BCH, NMC — one binary serves all via a shared coin 
 
 ### 2.1 The offline/online split
 
-The system is two processes that never share an address space and are joined only by hand-carried public artifacts.
-
 ```
-┌─ OFFLINE ZONE (network-incapable) ──┐        ┌─ ONLINE ZONE (c2pool node / coordinator) ─┐
-│  c2wallet-qt-sign                    │        │  c2pool embedded daemon + c2pool-qt        │
-│   • key import / HD derivation       │        │   • UTXO discovery, balances, fee estimate │
-│   • tx construction                  │        │   • validate: script-verify / UTXO / policy│
-│   • sign + self-verify each input    │        │   • splice into own block template (pin)   │
-│   • encrypted key store (opt-in)     │        │   • broadcast won block / (later) inject    │
-└──────────────┬───────────────────────┘        └──────────────┬─────────────────────────────┘
-               │  UNSIGNED artifact (c2psbt)  ───────────────────▶  validate-only, holds no keys
-               │                              ◀───────────────────  advisory verdict (named cause)
-               │  SIGNED artifact (raw hex)   ───────────────────▶  pin / inject / broadcast
-        AIR GAP: removable file │ animated QR │ manual hex ; integrity checked by txid
+   OFFLINE — c2wallet-qt-signer (holds keys)          ONLINE — c2pool embedded daemon + companion (no keys)
+   ─────────────────────────────────────────          ──────────────────────────────────────────────────────
+                                       ◀── (1) UNSIGNED / constructed artifact ──   built from live UTXO / chain view
+   import keys, derive, DISPLAY summary,
+   operator CONFIRMS, sign, SELF-VERIFY
+                (2) SIGNED artifact ──▶                                            re-validate (gate), then inject / broadcast
 ```
 
-The load-bearing invariant, confirmed in the c2pool tree: **c2pool never signs and never derives.** There is no `CKey`, no ECDSA/Schnorr signing glue, no HD derivation, no mnemonic anywhere in the C++ tree — c2pool is purely a verifier/splicer/broadcaster. The online node therefore has no write path to funds: it can only append a consensus-valid, fee-zero, non-collateral body tx that survives the merkle cross-check, or fail closed. The entire air-gap threat surface reduces to protecting the seed on the offline side and giving the operator a truthful view of what they are about to sign.
+- **Keys live only inside the offline `c2wallet-qt-signer` build.** That binary is compiled network-incapable (§5). The seed/private keys never touch a networked or agent-controlled host, and never persist in plaintext.
+- **c2pool is verify-only by construction.** Investigation confirmed there is no signing key class anywhere in the tree — no `CKey`, no ECDSA/Schnorr sign, no key-image generation. c2pool operates only on already-signed bytes and re-validates every artifact regardless of origin. It is the script-verify / UTXO / policy authority; it is never a signer.
+- **Two artifacts cross the gap, both public data:** an unsigned/constructed artifact (online→offline) and a signed artifact (offline→online). Transport is file or QR — the same channel the donation ceremony proved.
 
-### 2.2 Where keys live
+### 2.2 The chain-family abstraction
 
-Keys exist only inside `c2wallet-qt-sign`, only in locked, non-dumpable, zeroized memory, only for the duration of a ceremony. Default = amnesiac (nothing persisted; re-import each time). Import channels are interactive masked entry, an externally-created encrypted keystore file, or a QR scanned *into* the offline box — never argv, never env, never a plaintext file the app writes, never a log. Deterministic RFC6979 signing means no RNG in the sign path and no nonce-reuse key-leak class.
+The wallet shell is a thin, family-agnostic UI and orchestration layer over two backends that implement a common wallet interface but share no crypto code:
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │  Qt Widgets shell (MainWindow + sidebar +    │
+                    │  Page* screens, SettingsStore, artifact I/O) │
+                    │  Bitcoin-Core-like UI, family-agnostic       │
+                    └───────────────┬─────────────────────────────┘
+                                    │  IChainFamily (import / scan / construct / sign / verify / export)
+                    ┌───────────────┴───────────────┐
+       ┌────────────▼────────────┐     ┌────────────▼─────────────────┐
+       │  Family A backend        │     │  Family B backend             │
+       │  secp256k1 / Bitcoin     │     │  Ed25519 / CryptoNote         │
+       │  script                  │     │  (Monero)                     │
+       └──────────────────────────┘     └───────────────────────────────┘
+```
+
+The `ImportedSecret` type is opaque, zeroizing, and **family-tagged**; requirement (5) conversion lives entirely inside the Family A backend and is refused at the family boundary as a type-level invariant.
 
 ### 2.3 Module layout
 
-Two binaries share one crypto/coin core through CMake; they never share a process.
+New sibling tree `ui/c2wallet-qt/`, sharing the toolchain with the shipped `ui/c2pool-qt/` app but linking a deliberately minimal, network-incapable set. It reuses c2pool-qt's shell **patterns** (MainWindow + sidebar + `Page*` idiom, `SettingsStore`) and links the node's **Qt-free leaf headers** directly, exactly as c2pool-qt already does via `C2POOL_NODE_SRC = ../../src`.
 
-- **`ui/c2wallet-qt/`** — the offline signer. `Qt6::Core + Qt6::Gui + Qt6::Widgets` only, plus a small vendored QR encoder. **No `Qt6::Network`, no `Qt6::WebEngine*`, no `Qt6::WebChannel`, no `Qt6Keychain`.** A CI symbol-scan gate fails the build if any socket/TLS/DNS symbol resolves in the final link map.
-- **`ui/c2pool-qt/`** (already a full multi-page node control panel) — gains the online-side "validate-and-broadcast/inject" seam. This is where requirement 3's network touchpoint lives, never in the signer.
-- **Shared core** (`c2wallet-core`, a network-free static lib) — codecs, coin registry, HD/key layer, sighash engine, script/witness assembler, cross-coin conversion, artifact serialization. Both binaries link it; only the signer links the private-key half.
+```
+ui/c2wallet-qt/
+  CMakeLists.txt            # Qt6::Core/Gui/Widgets ONLY — NO Network/WebEngine/WebChannel
+  src/
+    shell/                  # MainWindow, sidebar, Page* (Overview, Import, Construct,
+                            #   Convert, Sign/Export, Validate, Settings), SettingsStore
+    family/
+      IChainFamily.hpp      # common backend interface
+      bitcoin/              # Family A backend
+        hdkeys/             # NEW: BIP39/32/44/49/84/86, WIF, raw-hex, keystore import
+        sighash/            # legacy (reuse) + BIP143 + BIP341/342 (NEW)
+        signer/             # NEW: CKey / ECDSA + Schnorr signing, self-verify
+        construct/          # per-type scriptSig / witness assembly, cross-coin convert
+      monero/               # Family B backend
+        seed/               # NEW: 25-word mnemonic, polyseed, key/view import
+        scan/               # output scanning (reuse xmr_derivation) + amount decrypt
+        prover/             # NEW/PORT: CLSAG signer, Bulletproofs+ prover, key images
+        addr/               # NEW: Monero base58, subaddress, integrated address
+    artifact/               # PSBT-like container (A) + monero unsigned/signed_txset (B), QR codec
+    secure/                 # SecureString, mlock, explicit_bzero, seccomp belt
+```
 
-### 2.4 Reuse vs. new (grounded in the reuse inventory)
+### 2.4 Reuse vs new (cited from the reuse inventory)
 
-**Reuse in-tree, link/compile as-is** — all pure crypto/serialization, socket-free, safe for the network-incapable build:
+**Link directly (leaf, Qt-safe — the seam was already carved out for exactly this by the #961 refactor):**
 
-| Need | Reuse |
+| Building block | c2pool source |
 |---|---|
-| base58 / base58check (encode+decode) | `src/btclibs/base58.{h,cpp}` |
-| bech32 + bech32m **decode** | `src/btclibs/bech32.h` |
-| CScript container, all opcodes incl. `OP_CHECKMULTISIG` and BIP342 `OP_CHECKSIGADD`, `GetSigOpCount` | `src/btclibs/script/script.{h,cpp}` |
-| hashes / HMAC-SHA512 (the BIP32/39 primitive) / RIPEMD160 / SHA256(d) | `src/btclibs/crypto/*`, `src/btclibs/hash.*`, `dashscript/crypto/*` |
-| address algebra: `classify_script`, `address_to_hash160`, `hash160_to_merged_script`, `script_to_address`, `register_address_decoder` | `src/core/address_utils.{hpp,cpp}` |
-| #961 cross-coin guard: `CoinAddressAcceptance`, `classify_address_for_coin`→{Own,Foreign,Invalid}, `MergedChainAddr`, `decide_payout_address`→{AcceptOwn,AcceptMerged,Reject} | `src/core/address_utils.hpp` |
-| per-coin version-byte / HRP SSOT (hoisted expressly for "the standalone c2pool-qt payout validator") | `src/impl/<coin>/address_encoding.hpp` |
-| coin/network params | `src/core/coin_params.hpp`, per-coin `params.hpp` |
-| segwit-capable tx model (MutableTransaction with witness, marker/flag serialization) | `src/impl/btc/coin/transaction.{hpp,cpp}` |
-| legacy script-verify + legacy sighash (self-check parity with the online node) | `dashscript/c2pool_scriptcheck.h` (`c2pool_dash_verify_input`, `c2pool_dash_legacy_sighash`, `c2pool_dash_hash160`) |
-| CPubKey / CExtPubKey (public BIP32) | `dashscript/pubkey.{h,cpp}` |
-| secure key memory (mlock allocator + zeroize) | `dashscript/support/{lockedpool.h, allocators/secure.h, cleanse.cpp}` — reuse verbatim |
-| libsecp256k1 (link) | vendored at `dashscript/secp256k1/` (extrakeys/recovery/ellswift headers present) |
-| Qt shell patterns to lift | `ui/c2pool-qt/src/{CoinProfiles,AddressValidator}.hpp` (Qt-Core-only address validator; profile registry) |
-| Python parity target / independent second implementation | `tools/c2wallet/c2wallet.py` |
+| Address encode/decode all Bitcoin-script types (P2PKH/P2SH/P2WPKH/P2WSH/P2TR/P2PK/bare-P2MS) | `src/core/address_utils.{hpp,cpp}`, `src/btclibs/{base58.h,bech32.h}` |
+| Cross-coin conversion + #961 guard (`decide_payout_address`, `classify_address_for_coin`, `CoinAddressAcceptance`, `MergedChainAddr`) | `src/core/address_utils.hpp` |
+| Per-coin address SSOT (version bytes / HRPs), explicitly "shared with c2pool-qt" | `src/impl/{btc,ltc,dash,dgb,bch}/**/address_encoding.hpp`, `src/impl/doge/coin/address_encoding.hpp` |
+| BCH CashAddr codec (the non-convertible boundary) | `src/impl/bch/coin/cashaddr.hpp` |
+| Legacy script interpreter + `SignatureHash` + `CScript` + opcode table (incl. `OP_CHECKMULTISIG`, `OP_CHECKSIGADD`), P2SH/P2MS eval | `src/impl/dash/coin/vendor/dashscript/{script,primitives}/*` — **`SigVersion::BASE` only** |
+| Segwit-aware tx (de)serialization (`TxParams`, witness marker/flag, LTC MWEB) | `src/impl/bitcoin_family/coin/base_transaction.hpp` |
+| `CPubKey` verify / recover / hash160 | `src/impl/dash/coin/vendor/dashscript/pubkey.{h,cpp}` |
+| Hash primitives (sha256/512, ripemd160, hmac_sha512, scrypt) | `src/btclibs/crypto/*` |
+| libsecp256k1 (system-linked; headers incl. `extrakeys`, `recovery`, `schnorrsig`) | `src/impl/dash/coin/vendor/dashscript/secp256k1/` |
+| Monero curve engine: Ed25519 group/scalar ops, Keccak, stealth derivation, RCT ops, verifiers | `src/impl/xmr/coin/vendor/*`, `xmr_derivation.*`, `native/rct/xmr_rct_ops.*`, `xmr_rct_verify.*`, `xmr_bulletproofs_plus.*` |
 
-**Net-new (the real build cost) — port from Bitcoin Core / dashd where a signer already exists, honoring the standing no-workarounds rule; never hand-roll production bignum math:**
+**Build new (nothing in-tree signs; the interpreter is legacy-only; c2pool never spends XMR):**
 
-1. **Private-key/signing layer** — `CKey`-equivalent (ECDSA low-S RFC6979 + Schnorr BIP340), ported from Core `key.{h,cpp}`; pairs 1:1 with the already-vendored `CPubKey`, shares the same secp context, uses `secure_allocator`. Enable the `schnorrsig` (and confirm `extrakeys`) secp modules, which c2pool does not currently use.
-2. **HD derivation** — `CExtKey`/`CExtPubKey` private CKD, BIP39 mnemonic + PBKDF2 + wordlists, BIP44/49/84/86 path parsing. Absent in C++ (only the Python signer has BIP32/39/44, and only path 44).
-3. **Segwit-v0 (BIP143) + Taproot (BIP341/342) sighash and interpreter** — the vendored dashscript engine is `SigVersion::BASE` only (Dash has no segwit). This is the largest crypto gap. Port from Core; btclibs already anticipates it (`IsWitnessProgram`, `OP_CHECKSIGADD`).
-4. **Key-import parsers** — WIF, raw hex, BIP38, Electrum JSON, Core descriptor JSON.
-5. **Per-type scriptSig/witness assembly** (`ProduceSignature`-shape), incl. the CHECKMULTISIG dummy + pubkey-order rule, and tapscript control-block/merkle-tree construction.
-6. **bech32m encode (GAP-1)** — `bech32.h` decode accepts bech32m but `encode_segwit` hardcodes the bech32 checksum constant (`polymod ^ 1`); a taproot/converted-taproot address currently encodes **invalid**. Add the BIP350 constant (`^ 0x2bc830a3` for witver ≥ 1) before the wallet encodes any v1 address.
-7. **NMC address SSOT (GAP-2)** — add an `address_encoding.hpp` leaf (PUBKEY 0x34, P2SH 0x0d, HRP `nc`) so NMC participates in the acceptance/conversion machinery.
-8. **CashAddr codec (GAP-3)** — a standalone BCH CashAddr encode/decode in the offline build (c2pool relies on a runtime-registered decoder; the network-incapable signer must carry its own). BCH also needs the SIGHASH_FORKID BIP143-shape sighash.
-9. **HD coin_type (SLIP-44) + WIF-version table** — the C++ registry lacks both; the Python baseline carries them for four coins. Add alongside `coin_params`.
-10. **Artifact format** — the c2psbt unsigned container and the raw-hex signed output (§5).
+- **Family A:** `CKey` / ECDSA signing (or keep `c2wallet.py`'s audited pure math as the signer core), **BIP143 (segwit v0) sighash + witness serialization**, **BIP341/342 taproot** (Schnorr signing, taptweak, tapleaf/branch, control block, tapscript eval), a **`hdkeys` module** (BIP39 with real checksum + multi-language wordlists, BIP32 CKD, xprv/xpub + SLIP-132, WIF decode, raw-hex, BIP38, descriptor import), and the **PSBT-like artifact**.
+- **Family B:** **CLSAG signer** and **Bulletproofs+ prover** (port from monero-project BSD-3 onto the vendored `crypto-ops.c` / `xmr_rct_ops`), **key-image generation**, **Monero base58**, **25-word mnemonic (+CRC)**, **subaddress / integrated-address** derivation, output-scanning wallet state, and the `unsigned_txset` / `signed_txset` / outputs / key-image containers.
+
+The critical seam: c2pool ported exactly the *verify* half of both families. c2wallet-qt is the **prover/signer** half. The correctness win is that both halves sit on the same vendored math, so the new prover code can be KAT-gated by constructing then verifying against the in-tree verifier.
 
 ---
 
 ## 3. Key-Import Design
 
-Every accepted format resolves to **one internal secret object**; the rest of the wallet consumes only that. Import produces keys — it never decides the address type. Type enumeration happens later in the derivation/scan step, which is what lets a single WIF spend as P2PK **and** P2PKH **and** P2WPKH.
+The importer is a **two-layer dispatcher: crypto family first, then format.** The UI resolves family before it can even validate a string. Type spine:
 
 ```
-ImportedSecret {
-  kind:        SEED | XPRV | XPUB(watch-only) | WIF | RAWHEX | KEYSTORE
-  origin_label:free text (UI only; never persisted with the secret)
-  seed64 | ext_key(CExtKey) | ext_pub(CExtPubKey) | single_key(CKey+compressed) | keybag(vector<CKey>)
-  coin_hint:   from WIF version / xprv magic / keystore field, if any
-  net_hint:    MAINNET | TESTNET
-}
+ImportedSecret            (opaque, zeroizing, family-tagged)
+ ├─ FamilyA_Secret        secp256k1 scalar(s) + compressed flag + optional HD context
+ └─ FamilyB_Secret        {spend_priv, view_priv}  (+ view-only: {spend_pub, view_priv})
+KeyCandidate = (family, privkey|none, pubkey, [address candidates per enabled coin/type])
 ```
 
-### 3.1 Format-by-format
+**Fail-before-secret-entry law (inherited from `c2wallet.py` `sign-batch`):** validate the entire import form — files, paths, target coin — *before* accepting the secret. Every extra secret prompt is a chance to type it into the wrong window.
 
-- **BIP39 mnemonic (+ passphrase).** NFKD-normalize; word count ∈ {12,15,18,21,24}; validate every word against the selected wordlist **and verify the checksum** (the baseline skips this — a mistyped word silently derives a wrong, empty wallet). Ship all official BIP39 wordlists as build-time resources, pinned by SHA256 KAT; auto-detect language, allow override. Seed = `PBKDF2-HMAC-SHA512(mnemonic, "mnemonic"+passphrase, 2048, 64)` on the in-tree HMAC. Passphrase entered twice with a match check; display a non-secret **seed fingerprint** (e.g. first 4 bytes of `hash160(account xpub)`) so the operator can confirm "same wallet as last time." Also **detect and warn** on an Electrum v2 seed (different checksum/KDF) rather than deriving garbage. *Effort: LOW.*
-- **BIP32 xprv / xpub + paths.** Base58Check-decode the 78-byte payload; validate the version magic against a per-coin magic table (BTC `0488ADE4`/`0488B21E`; Ltub/Ltpv; dgub/dgpv; DASH uses BTC magics; **decode SLIP-132 y/z/Y/Z/v/u variants and record the implied script type as a hint, do not reject**). xprv→`CExtKey`; xpub→`CExtPubKey` (watch-only — can build/verify and produce an artifact to sign elsewhere, cannot sign; hardened children greyed out with the reason). Path UI: purpose presets 44'/49'/84'/86' plus 45'/48' multisig and a free `m/…` custom field with `'`/`h` hardened notation; account/change/index scan ranges. *Effort: LOW–MEDIUM.*
-- **WIF.** `DecodeBase58Check`; first byte = version (per-coin table: BTC 0x80, LTC 0xB0, DOGE 0x9E, DASH 0xCC, DGB 0x80, NMC 0xB0, BCH 0x80; testnet 0xEF); trailing `0x01` ⇒ compressed. The compressed flag is authoritative on import (not a guess). Warn on coin mismatch against the preselected coin. *Effort: LOW.*
-- **Raw hex privkey.** 64 hex (tolerate `0x`/whitespace/case); **range-check `1 ≤ k < n`** (the baseline never validates this). No compressed flag exists → ask (default compressed) and surface both address sets so a legacy uncompressed holder is not stranded. *Effort: TRIVIAL.*
-- **Keystore files** — phased: phase-1 = **BIP38** (`6P…`, scrypt N=16384,r=8,p=8 + AES-256; non-EC-multiply mode `0142`), **Electrum wallet JSON** (route seed/xprv/imported-keys into the funnel), **Bitcoin Core descriptor JSON** (parse `wpkh([fp/84h/0h/0h]xprv/0/*)`, extract origin path + key). phase-2 = BIP38 EC-multiply (`0143`), raw `wallet.dat` BDB (recommend instead pointing users at `bitcoin-wallet dump`/`listdescriptors`), generic Ethereum-style JSON keystore. Every encrypted format prompts through the same secure-input widget as the seed.
+### 3.1 Family A formats
 
-### 3.2 Import → key → address candidates
+| Format | Map | Effort | Notes / validation |
+|---|---|---|---|
+| **BIP39 mnemonic (+passphrase)** | words → checksum-verify → PBKDF2-HMAC-SHA512(2048, "mnemonic"+passphrase) → BIP32 master → derive | LOW (port + extend) | Ship all languages (EN mandatory; JP needs NFKD + ideographic-space join). **Add the real BIP39 checksum** — baseline only counts words. Surface the passphrase silent-fork hazard (empty vs wrong both yield a valid but different wallet); show a first-address fingerprint. |
+| **BIP32 xprv / xpub + path** | base58check decode → node; **xpub → watch-only** first-class | LOW–MED | Recognise xprv/xpub **and** SLIP-132 (yprv/zprv/Yprv/Zprv, per-coin analogues); a zpub hints P2WPKH intent. Refuse hardened derivation from an xpub with a clear reason. |
+| **Derivation-path selection** | presets BIP44 (P2PKH) / BIP49 (P2SH-P2WPKH) / BIP84 (P2WPKH) / BIP86 (P2TR) + custom path + account/change/index ranges | LOW–MED | coin_type from SLIP-44; allow forcing (old p2pool keys used coin_type 0 and uncompressed keys — try compressed+uncompressed as baseline does). |
+| **WIF** | base58check → strip per-coin version byte → 32-byte scalar; trailing `0x01` ⇒ compressed | TRIVIAL | Source version bytes from `address_encoding.hpp`, not re-hardcoded. Detect a mismatched version byte and offer in-family conversion, warning it is a distinct on-chain identity per coin. |
+| **Raw hex privkey** | 64 hex → scalar; **range-check `1 ≤ k < N`** | TRIVIAL | New check (baseline never imports raw hex); reject 0 and ≥N. Default compressed, user-toggle; scan both address sets. |
+| **BIP38 encrypted key** | scrypt (vendored) + EC-multiply/non-EC + AES-256 | LOW | Only new dep is AES. CPU-bound by design — show progress. |
+| **Core descriptors (`listdescriptors`)** | parse `wpkh/tr/sh(wsh(multi(...)))` with `[fingerprint/path]` + `/*` | MED | **Recommended primary advanced path** — one descriptor expresses key + script type + derivation + range; maps directly onto the type system, reuses `address_utils`. |
+| **Electrum / wallet.dat / generic JSON keystore** | — | MED–HIGH | **Defer full parse.** v1: import the xprv Electrum shows, or `dumpwallet`/`dumpprivkey` WIFs. |
 
-```
-secret ─derive→ CKey(+compressed)
-        ├─ pubkey_compressed   → hash160 → P2PKH(c), P2WPKH, P2SH-P2WPKH, P2WSH(1-of-1)
-        ├─ pubkey_uncompressed → hash160 → P2PKH(u), bare P2PK      (legacy; never dropped)
-        └─ xonly = pub_c[1:33] → taproot tweak Q = P + int(TapTweak(x))·G → P2TR key-path
-```
+**Address-candidate generation:** one derived secp256k1 privkey → pubkey (compressed **and** uncompressed) → per-type candidate scriptPubKeys: P2PK (both encodings), P2PKH, P2SH-P2WPKH, P2WPKH, P2TR key-path (x-only via `secp256k1_extrakeys`). P2SH/P2WSH/bare-P2MS are script-defined, supplied by the constructor.
 
-P2SH / P2WSH / bare-P2MS rows appear only when the user supplies (or the wallet constructs) the redeem/witness script; import's job there is to prove "this imported key is one of the N pubkeys in that script" and mark it signable. The historically-bugged forms are covered by *always* offering the uncompressed branch and never assuming compressed.
+### 3.2 Family B (Monero) formats — separate engine, none of §3.1 applies
 
-### 3.3 Derivation-scan UX
+Each maps to `(spend_priv, view_priv)` (+ derived `spend_pub`, `view_pub`):
 
-On SEED/xprv import, present a **scan matrix** (per purpose × account range × change ∈ {0,1} × index range × {compressed,uncompressed}), not a single guess. Default scan 0–19 (BIP44 gap-20), one-click extend, gap counter resets on a non-empty index. A first-class **"find address…"** verb (the baseline's `find-key`, generalized) takes a pasted target address and reports the exact derivation path or "not derivable within scanned range" — the money-critical "does this seed actually own this address" check. Because the signer is offline, the "has history / found" column is **empty until an artifact round-trips through the online node**; the UI must say "history unknown offline" and never imply an address is unused. Cross-coin (§4.2) is offered as "show the same keys as coin Y," guarded.
+- **25-word Monero mnemonic** (electrum-style, 1626-word list, 24 words + a CRC32 checksum word): decodes the private spend key; `view_priv = H_s(spend_priv)`. Multiple languages, each with its own autocomplete prefix length. **Build from scratch** (absent from tree); Keccak is reusable.
+- **polyseed** (16-word, birthday + optional passphrase, Argon2): **build if adopted** — open decision.
+- **Raw dual keys** — paste `spend_priv` + `view_priv` (32-byte hex each).
+- **View-only import** — `spend_pub` + `view_priv` (+ primary address): scans/decrypts incoming outputs but **cannot sign**. This is the exact half that maps to the air-gap model (online = view-only, offline = full).
+- **13-word MyMonero** variant — optional.
+- **monerod `.keys` keystore** (ChaCha20 + slow-hash KDF): **defer**; v1 imports mnemonic/keys directly.
 
-### 3.4 Import validation & memory hygiene
+**Address candidates:** standard = base58(`netbyte ‖ spend_pub ‖ view_pub ‖ keccak_checksum[0:4]`); subaddresses (`m = H_s("SubAddr\0" ‖ view_priv ‖ major ‖ minor)`, `K_s^(i,j) = K_s + m·G`, `K_v^(i,j) = view_priv·K_s^(i,j)`, netbyte 42); integrated (standard + 8-byte payment ID, netbyte 19). Monero base58 + subaddress derivation are **new** (absent from the xmr lane).
 
-Sniff format by magic/prefix/length and report "recognized as X" **before** asking for secret material. Checksum everywhere (BIP39 word-checksum, Base58Check, bech32 polymod) with a specific failure reason. Range-check privkeys; validate pubkeys on-curve (`CPubKey::IsFullyValid`). Version/coin mismatch = warn, never silently proceed. **Self-consistency KAT at import time** (parity with the baseline's self-verify ethos): each imported key signs a throwaway digest and verifies it via the independent pubkey path before it is ever offered for a real spend; a key that cannot round-trip its own signature is rejected. Every secret is held in the vendored `LockedPool`/`secure_allocator` and `memory_cleanse`d on drop; secret-input widgets disable clipboard/undo/drag-drop and offer "reveal for N seconds" rather than persistent display.
+### 3.3 Scan UX (Bitcoin-Core-like), air-gap-correct
+
+One mnemonic → hundreds of addresses across {BIP44/49/84/86} × accounts × {external/change} × index range × {compressed/uncompressed}. Default scan: all four purposes, account 0, both chains, index 0–19, gap-limit 20; grouped by script type. **The offline signer can only enumerate candidate addresses — balances come from the online side:** the offline wallet exports its public address set (xpub or address list), the online c2pool node returns which are funded, and that funded set drives which paths get signed. The seed never leaves the offline box. Keep `find-key` parity (prove which path owns an address, both encodings tried) and a custom-path escape hatch for old/nonstandard keys.
 
 ---
 
-## 4. Address / Script Construct + Spend Matrix
+## 4. Construct + Spend Matrix
 
-This is the money-correctness core. Legend: **BASE** = legacy sighash (reuse vendored `SignatureHash`, `SigVersion::BASE`), **V0** = BIP143 (new), **TR/TS** = BIP341/342 (new). Classification/address decode reuses `classify_script`; scriptSig/witness *assembly* is new per type.
+Two tracks. This is the money-correctness core of the whole wallet.
 
-| # | Type | scriptPubKey | Spend: scriptSig / witness | Sighash & scriptCode | Fatal naive errors |
-|---|---|---|---|---|---|
-| 1 | **P2PK** (65B uncompressed / 33B compressed) | `<pubkey> OP_CHECKSIG` | scriptSig `<sig‖hashtype>`; witness empty. Pubkey is in the output, not the scriptSig | BASE; scriptCode = the P2PK spk | compressed↔uncompressed are two different outputs — spend the exact form the UTXO used; missing trailing hashtype; high-S |
-| 2 | **P2PKH** | `OP_DUP OP_HASH160 <h160> OP_EQUALVERIFY OP_CHECKSIG` | scriptSig `<sig‖hashtype> <pubkey>`; witness empty | BASE; scriptCode = spk | wrong pubkey form (changes hash160→address); missing hashtype; high-S. **Fully covered by the baseline** |
-| 3 | **P2SH** | `OP_HASH160 <h160(redeemScript)> OP_EQUAL` | scriptSig `<satisfier…> <redeemScript>` (redeemScript pushed LAST) | BASE; **scriptCode = redeemScript, NOT the P2SH spk** | signing over the P2SH spk; non-identical redeemScript re-serialization |
-| 4 | **P2WPKH** (native v0) | `OP_0 <20B h160(compressed pubkey)>` | scriptSig **EMPTY**; witness `<sig‖hashtype> <compressed pubkey>` | **V0**; scriptCode = implied P2PKH of keyhash; **amount committed** | legacy sighash; **uncompressed pubkey forbidden in v0**; forgetting the amount; any scriptSig bytes |
-| 5 | **P2WSH** (native v0) | `OP_0 <32B SHA256(witnessScript)>` (SHA256, not hash160) | scriptSig EMPTY; witness `<satisfier…> <witnessScript>` | V0; scriptCode = witnessScript; amount committed | using hash160 for the 32B program; legacy sighash |
-| 6 | **P2SH-P2WPKH** (wrapped) | `OP_HASH160 <h160(0x0014<keyhash>)> OP_EQUAL` | scriptSig = push of the 22B redeemScript `0x0014<keyhash>`; witness `<sig‖hashtype> <compressed pubkey>` | V0; scriptCode = implied P2PKH; amount | sig in scriptSig; omitting the redeemScript push; legacy sighash |
-| 7 | **P2SH-P2WSH** (wrapped) | `OP_HASH160 <h160(0x0020<sha256>)> OP_EQUAL` | scriptSig = push `0x0020<sha256>`; witness `<satisfier…> <witnessScript>` | V0; scriptCode = witnessScript; amount | as #6 |
-| 8 | **Bare P2MS** (+ CHECKMULTISIG extra-pop) | `OP_m <pub1…pubn> OP_n OP_CHECKMULTISIG` | scriptSig `OP_0 <sig1>…<sigm>` — **leading `OP_0` is the mandatory dummy** consumed by the off-by-one | BASE (bare/P2SH) or V0 (P2WSH); scriptCode = the multisig script | omitting the dummy → underflow; a **non-empty** dummy → NULLDUMMY-invalid; sigs not in the same order as their pubkeys → fails with valid sigs; n sigs instead of m. **Same pattern is the redeem/witnessScript inside P2SH/P2WSH multisig; interpreter's extra-pop + NULLDUMMY reuse=YES** |
-| 9 | **P2TR key-path** | `OP_1 <32B x-only Q>`, `Q = P + int(tagged("TapTweak", P‖merkle_root))·G` | scriptSig EMPTY; witness = single element: 64B Schnorr sig (SIGHASH_DEFAULT) or 65B (non-default hashtype appended) | **TR**; tagged `"TapSighash"`, commits to **all input amounts and all prevout spks**; Schnorr over the **tweaked** key with even-Y negation | signing the untweaked key; ECDSA instead of Schnorr; skipping even-Y normalization; conflating DEFAULT (0x00, 64B) with ALL (0x01, 65B) |
-| 10 | **P2TR script-path** | `OP_1 <32B Q>` committing a script tree | witness `<tapscript inputs…> <leaf script> <control block>`; control block `= (0xc0‖y-parity) ‖ <32B internal key> ‖ <merkle path 32·k>`; leaf version 0xc0 | **TS** (BIP342); commits to tapleaf hash, key version, last CODESEPARATOR; sigs via `OP_CHECKSIG`/`OP_CHECKSIGADD` — **`OP_CHECKMULTISIG` is disabled in tapscript** | wrong leaf version; wrong control-block parity bit; wrong merkle-path (lexicographic sibling pairing); CHECKMULTISIG in tapscript |
-| 11 | **Legacy ancestors** | bare P2PK/P2MS (rows 1,8); OP_RETURN/nulldata (construct-only, unspendable) | — | **SIGHASH_SINGLE bug**: if `in_idx ≥ n_outputs` the legacy digest is the constant `0x00…01` — to spend you must reproduce the bug, which the vendored `SignatureHash` does | uncompressed keys allowed pre-segwit (1,2,3,8) but **forbidden in any witness program** (block them on 4–10) |
+### 4.1 Track A — Bitcoin-script
 
-**Sighash-type matrix (all rows):** `ALL 0x01` (default) · `NONE 0x02` · `SINGLE 0x03` · `| ANYONECANPAY 0x80`; taproot adds `DEFAULT 0x00` (≡ALL, 64B). Legacy coverage of ALL/NONE/SINGLE/ANYONECANPAY = reuse (vendored `SignatureHash` takes `nHashType`); witness coverage = new with the ported interpreter. **BCH** requires `SIGHASH_FORKID 0x40` **and a BIP143-shape digest for every input** (mandatory replay protection) despite BCH using legacy base58 — this is precisely why the baseline refuses BCH; it is new work (BIP143 shape + forkid), KAT-gated per coin.
+Notation: `<sig>` = DER-ECDSA sig ‖ 1-byte sighash; `<schnorr>` = 64/65-byte BIP340 sig; `H160` = RIPEMD160(SHA256(pubkey)); `H256` = SHA256(script).
 
-**Discipline carried from the baseline (hard):** self-verify every signature with independent math before emit and abort on any mismatch; refuse oversize (the `MAX_TX_BYTES` / block-2517855 lesson — a 152 KB tx is consensus-invalid and takes the block down); RFC6979 determinism; low-S; try compressed and uncompressed; parse-all-before-one-seed-prompt in batch. **Refuse rather than fake:** the baseline refused segwit/BCH; the successor *implements* them with red-on-broken KATs and keeps "refuse if not KAT-proven for this coin+type."
+| Type | scriptPubKey | Spend (scriptSig / witness) | Sighash | The trap |
+|---|---|---|---|---|
+| **P2PK** | `<push 33\|65> <pubkey> OP_CHECKSIG` | scriptSig: `<sig>` (no pubkey — it is in the output) | legacy BASE | The output commits to exact pubkey bytes — an uncompressed-key output MUST be spent citing the 65-byte form. Try both encodings per index (baseline already does). |
+| **P2PKH** | `OP_DUP OP_HASH160 <H160> OP_EQUALVERIFY OP_CHECKSIG` | scriptSig: `<sig> <pubkey>` | legacy BASE | **Parity path** (block 2518186). Wrong pubkey encoding → H160 mismatch. |
+| **P2SH** | `OP_HASH160 <H160(redeemScript)> OP_EQUAL` | scriptSig: `<inner-satisfaction> <push redeemScript>` (redeemScript LAST) | legacy BASE over the **redeemScript** as scriptCode | Classic pitfall: signing over the P2SH SPK instead of the redeemScript; `SCRIPT_VERIFY_P2SH` re-executes the redeemScript. |
+| **Bare P2MS** (the CHECKMULTISIG extra-pop bug) | `OP_m <pk1..pkn> OP_n OP_CHECKMULTISIG` | scriptSig: **`OP_0 <sig1>..<sigM>`** | legacy BASE | The leading `OP_0` is the off-by-one dummy the opcode over-pops. Under `SCRIPT_VERIFY_NULLDUMMY` it MUST be an **empty push**, not `OP_1`. Sigs MUST be in the **same relative order as the pubkeys** (CHECKMULTISIG scans top-down, no backtrack). Non-standard n≤3 relay limit is irrelevant — c2pool injects into its own template. |
+| **P2SH-multisig** | P2SH over the §bare-P2MS redeemScript | `OP_0 <sig1>..<sigM> <push redeemScript>` | legacy over redeemScript | Same dummy + ordering rules. |
+| **P2WPKH** | `OP_0 <H160(compressed pubkey)>` | witness: `<sig> <compressed pubkey>`; scriptSig empty | **BIP143** | **Compressed keys only** (`WITNESS_PUBKEYTYPE`). Legacy sighash here = no amount commitment = invalid + replay exposure. **NEW code.** |
+| **P2WSH** | `OP_0 <SHA256(witnessScript)>` | witness: `<inner-satisfaction> <witnessScript>` | BIP143, scriptCode = witnessScript | Use SHA256 (not hash160) for the program. NEW. |
+| **P2SH-P2WPKH / P2SH-P2WSH** | P2SH where redeemScript = the witness program (`OP_0 <20\|32>`) | scriptSig: one push (the program); witness carries `<sig> <pubkey>` / satisfaction | BIP143 | Sig data goes in the witness, not the scriptSig; forgetting the program push fails. NEW. |
+| **P2TR key-path** | `OP_1 <32 tweaked key Q>`, `Q = P + int(H_tapTweak(P‖merkle_root))·G` | witness: single `<schnorr sig>` (64B for SIGHASH_DEFAULT, 65B with explicit byte) | **BIP341**, `SIGHASH_DEFAULT=0x00` | Must sign with the **tweaked** key `d' = d + tapTweak` (even-Y normalise both P and Q); commits to **all** spent outputs' amounts+SPKs via `sha_amounts`/`sha_scriptpubkeys` — the wallet must collect every prevout, not just the signed one. Needs secp256k1 `schnorrsig`+`extrakeys`. **All NEW.** |
+| **P2TR script-path** | same `OP_1 <32 Q>` | witness: `<tapscript-stack> <tapscript leaf> <control block>` | **BIP342** tapscript | Control block = `(0xc0 \| parity(Q)) ‖ <32 internal P> ‖ <merkle path>`. Leaf sig is Schnorr over the **untweaked** leaf key (no taptweak). `tapleaf_hash` = tagged `TapLeaf`; `TapBranch` folds lexicographically-sorted pairs. Parity bit / sort order / tag are the traps. **All NEW.** |
+| **Nonstandard ancestors** | CLTV/CSV timelocks, hashlocks | generic P2SH/P2WSH; interpreter has `OP_CHECKLOCKTIMEVERIFY`/`OP_CHECKSEQUENCEVERIFY` | as inner type | Allow raw-redeemScript entry. |
+| **OP_RETURN** | `OP_RETURN <data>` | — unspendable | — | Build as output only, never a spend source. |
+
+**Sighash flags:** `SIGHASH_ALL(1)` / `NONE(2)` / `SINGLE(3)`, each `| ANYONECANPAY(0x80)`; taproot adds `SIGHASH_DEFAULT(0x00)`. **The `SIGHASH_SINGLE` bug** (if `in_idx ≥ n_outputs`, legacy sighash returns the constant `0x00…01` digest) must be reproduced for correctness **and warned**. Default everywhere = `SIGHASH_ALL` (baseline). Preserve the self-verify-before-emit and 100 kB oversize refusal for **every** type, not just legacy P2PKH.
+
+**Cross-coin address conversion (requirement 5).** Algebraic fact: every Family-A coin uses the same secp256k1 curve, the same `hash160` for P2PKH/P2WPKH, the same `SHA256(script)` for P2WSH, and the same x-only key for P2TR — so the **payload is byte-identical across coins**; conversion is purely a re-encoding under the target's version byte / HRP **iff the target supports that type**. This is the LTC↔DOGE merged-payout algebra.
+
+Convertibility (SSOT = the per-coin `address_encoding.hpp` leaves):
+
+| Coin | P2PKH ver | P2SH ver | segwit HRP | taproot |
+|---|---|---|---|---|
+| BTC | 0x00 | 0x05 | `bc` | yes |
+| LTC | 0x30 | 0x32 (+legacy 0x05) | `ltc` | yes |
+| DOGE | 0x1e | 0x16 | — | no |
+| DASH | 0x4c | 0x10 | — | no |
+| DGB | 0x1e | 0x3f | `dgb` | yes |
+| BCH | 0x00 (legacy) | 0x05 (legacy) | **CashAddr, not bech32** | no |
+| NMC | 0x34 (needs SSOT leaf) | 0x0d | — | no |
+
+- **P2PKH / P2SH (base58 version-byte swap):** SAFE across BTC↔LTC↔DOGE↔DASH↔DGB↔NMC. Prefer LTC's modern P2SH byte (`0x32`) on re-encode.
+- **P2WPKH / P2WSH (bech32 HRP swap):** SAFE only among BTC↔LTC↔DGB.
+- **P2TR (bech32m HRP swap):** SAFE only among BTC↔LTC↔DGB (taproot-active).
+
+**REFUSE (the #961 guard):** (a) **BCH is never a prefix swap** — CashAddr is a different encoding; transcode through the payload or refuse; BCH has no segwit/taproot equivalent for `bc1…`/`bc1p…`. (b) **Type absent on target** (segwit/taproot → DOGE/DASH/NMC/BCH). (c) **mainnet↔testnet** silent conversion. (d) **source is Foreign/Invalid** to its claimed source coin.
+
+Conversion algorithm (direct lift of `classify_address_for_coin` + `CoinAddressAcceptance` + the `Own/Foreign/Reject` trichotomy of `decide_payout_address`): decode+classify under the source SSOT (must be `Own`), extract `{type, payload}`, capability-gate the target, re-encode under the target SSOT, then **mandatory round-trip proof** — decode the result under the target SSOT and assert it is `Own` and the payload matches. The UI displays **source payload = target payload (hex) side by side** before any convert is accepted; a wrong conversion is a fund misdirection, so a human confirms the hash160/program is unchanged. Gaps to fill: an **NMC SSOT leaf header** (Namecoin chainparams, no segwit) and a **BCH↔base58 transcode helper** on top of `cashaddr.hpp`.
+
+### 4.2 Track B — Monero
+
+**Key model:** dual keypair `(k_s, k_v)`, `K_s=k_s·G`, `K_v=k_v·G` (standard `k_v=H_s(k_s)`). Standard/integrated/subaddress addresses per §3.2. Network bytes carried per-net (main/stage/test) and mismatch refused — the Monero analog of the #961 guard.
+
+**Output scanning (reuse `xmr_derivation`):** for each tx pubkey `R`, `D = 8·k_v·R`; per output `i`, fast-reject via `derive_view_tag(D,i)`; if `derive_public_key(D,i,K_s) == P_i` the output is ours; one-time secret `x_i = H_s(D‖i) + k_s (mod l)` (needs `k_s` → full wallet only); amount decrypted via two Keccak calls + xor; key image `I_i = x_i·H_p(P_i)`. Subaddress scan uses a precomputed spend-key table. **View-only computes everything except the key image** — the reason cold-signing exists.
+
+**Spend construction (the prover — the hard, must-build part):**
+
+1. Input selection over owned unspent outputs.
+2. **Decoy/ring selection** (ring size 16 = 15 decoys) via monerod's gamma distribution — **stays on the ONLINE side**; the unsigned artifact carries the frozen ring members (monero's `unsigned_txset` already does this).
+3. **Pseudo-output + output Pedersen commitments** `C = x·G + a·H`, masks balanced so `Σ C_in(pseudo) − Σ C_out − fee·H = 0` (reuse generators G/H, sc/ge ops).
+4. **Bulletproofs+ range proofs** over output amounts — **PORT the prover** (verifier only in-tree).
+5. **CLSAG signatures** per input (proves knowledge of `x_i` and `I_i = x_i·H_p(P_i)` without revealing the real member) — **PORT** (absent entirely).
+6. **Key images** — build (one line on vendored ops).
+7. **Fee** = size · per-byte-rate · priority; base rate from the online node.
+8. **tx_extra** (tx pubkey(s) `0x01`/`0x04`, encrypted payment-id nonce for integrated/subaddress).
+9. Serialize to CryptoNote blob + tx_hash (reuse `xmr_blob`, keccak midstate).
+
+Crypto sourcing: Ed25519 field/group, Keccak, H_s, H_p, Pedersen generators, multiexp = **reuse**; CLSAG signer + BP+ prover = **port from monero-project BSD-3 onto the vendored ops**; key-image + Monero base58 + mnemonic + subaddress = **new**; ring selection = **online**. Strong correctness harness the Bitcoin side never had: construct → verify with the in-tree `xmr_rct_verify` / `xmr_bulletproofs_plus` verifier → must pass, as a KAT.
+
+**Multisig (MMS):** proposed **out of scope v1** (open decision §7) — it is a large, stateful, multi-round interactive protocol and a frequent bug source; keep the key/CLSAG layer general enough to add it in v2.
 
 ---
 
-## 4A. Cross-Coin Address Conversion (requirement 5)
+## 5. Air-Gap Security Model
 
-All seven target coins are secp256k1 + `hash160 = RIPEMD160(SHA256(·))`, so the hash/program bytes are identical across coins — only the *encoding* differs. Per-coin params come from the in-tree SSOTs (cite, never re-type literals):
+### 5.1 Threat model (both families)
 
-| Coin | P2PKH | P2SH | bech32 HRP | segwit | native format |
-|---|---|---|---|---|---|
-| BTC | 0x00 | 0x05 | `bc` | yes | base58 + bech32/m |
-| LTC | 0x30 | 0x32 **+ legacy 0x05** | `ltc` | yes | base58 + bech32/m |
-| DOGE | 0x1e | 0x16 | — | no | base58 only |
-| DASH | 0x4c | 0x10 | — | no | base58 only |
-| DGB | 0x1e | 0x3f | `dgb` | yes | base58 + bech32/m |
-| NMC | 0x34 | 0x0d | `nc` (GAP-2) | aux | base58 |
-| BCH | 0x00 | 0x05 | — | no | **CashAddr** (distinct) + legacy base58 |
+| Adversary | Mitigation |
+|---|---|
+| Malicious online node / network attacker (sees & can tamper with artifacts) | Signed blob is self-authenticating; offline signer displays every output/amount/address for human confirm before signing; online node **re-validates consensus regardless of origin** — it trusts no signer. |
+| Malware on the online host | Keys never exist online — no key to exfiltrate. Worst case is a DoS on the inject pool (bounded caps) or a tx the operator authorized. |
+| Malware on the offline host | Signing build is **network-incapable** (§5.2); seed never persists plaintext (§5.3); reproducible + hash-pinned binary. |
+| Operator error (wrong coin/address/amount/oversize, #961 misdirection) | Mandatory confirm screen; oversize refusal; cross-coin guard showing derived target address + coin. |
+| Compromised transfer channel (QR cam, USB) | Both sides display a digest + human-readable summary; a swapped artifact changes the summary the operator compares. |
 
-**Convertibility (pure re-encode = swap version byte / HRP; hash/program preserved):**
+### 5.2 Network-incapable build — defense in depth
 
-- **P2PKH ↔ P2PKH — convertible across all seven** (incl. BCH-legacy base58). This is the LTC↔DOGE merged-payout case, exactly what `hash160_to_merged_script` + `decide_payout_address`→`AcceptMerged` already implement.
-- **P2SH ↔ P2SH — convertible across all seven.** **Warn on the LTC/BTC 0x05 collision:** an LTC legacy-P2SH and a BTC P2SH are textually identical (`3…`); the encoding is safe but funds land on whichever chain the tx is broadcast to — surface it, do not silently treat them as "the same address."
-- **P2WPKH / P2WSH (bech32 v0) ↔ only among {BTC, LTC, DGB}.** Swap HRP; witver+program identical. **Refuse to DOGE/DASH/NMC/BCH** (no segwit → no equivalent type).
-- **P2TR (bech32m v1) ↔ only among coins with taproot active** (BTC, LTC, DGB-if-enabled). Gate on the target's witness-v1 support.
+1. **Separate binary, separate target (PRIMARY).** `c2wallet-qt-signer` (offline, key-bearing) links **`Qt6::Core/Gui/Widgets` ONLY — no Qt Network, no WebEngine, no WebChannel, no libcurl, no boost::asio.** A socket call is a **link error**, not a runtime check. This is why c2wallet-qt must be a separate binary from `c2pool-qt`, which hard-requires QtWebEngine (Chromium + a network stack): you cannot embed Chromium and honestly claim network-incapable. An optional `c2wallet-qt-companion` (online, key-free) does QR/file marshalling and talks to c2pool.
+2. **Compile-time no-net CI gate.** `nm c2wallet-qt-signer | grep -E 'connect|socket|bind|getaddrinfo|SSL_'` must be empty (benign libc aside) — a mechanical red-KAT, the binary-level analog of c2pool's reward-safety grep proof.
+3. **Runtime seccomp belt.** On Linux the signer installs a seccomp filter killing the process on `socket(2)`/`connect(2)`, against a dependency that sneaks a socket in. Airplane-mode / no-NIC is the operational rule.
 
-**Unsafe / impossible — refuse (tie to #961):**
+### 5.3 Key custody
 
-- **BCH CashAddr** — same hash160 but a different encoding entirely; a version-byte/HRP swap cannot produce it. Needs the standalone CashAddr codec (GAP-3); base58↔cashaddr is a transcode, not a re-encode.
-- **Segwit/taproot → non-segwit coin** — no equivalent output type. **Never down-convert** a P2WPKH to the P2PKH of the same key: it is a different address the recipient may not treat as theirs and it changes the expected txid.
-- **P2SH-wrapped-segwit → non-segwit coin** — the base58 P2SH re-encodes, but its redeemScript is not a witness program there and degrades to an unspendable script. Refuse.
-- **mainnet ↔ testnet** — never auto-convert across networks; acceptance sets are already network-scoped.
+- **Seed never persisted plaintext.** Ephemeral mode (default, = baseline): entered per-session into a masked, `mlock`-pinned buffer, zeroized immediately after derivation. Encrypted-store mode (opt-in): Argon2id KDF → XChaCha20-Poly1305 AEAD over the seed/xprv, passphrase never stored.
+- **Memory hygiene:** all secrets in zeroizing containers (`explicit_bzero`/`memset_s`/`SecureZeroMemory`), `mlock`ed, RAII-wiped on every exit path including exceptions; core dumps disabled; no secret in argv/env/logs/window titles/recent-files/clipboard. Qt must do this explicitly (long-lived objects) where Python got it free from process teardown. Monero scalars are longer-lived during a multi-input sign — zeroize after each use.
+- **Deterministic signing:** keep RFC6979 (removes the nonce-reuse key-leak class); BIP340 deterministic-nonce for taproot.
+- **Self-verify before emit** (baseline law) — extend to **every** script type and to the Monero prover (run the in-tree RingCT/BP+ verifier + recompute key images offline before writing the signed artifact).
 
-**Conversion algorithm (reusing c2pool):** (1) authenticate source with `classify_address_for_coin(src, SOURCE.acceptance) == Own`; extract `(type, hash/program)`. (2) check target type-support (base58 always; v0 only if `segwit_activation_version != 0` and HRP present; v1 only if taproot). (3) re-encode via `script_to_address(spk, target.hrp, target.p2pkh_ver, target.p2sh_ver)` (base58 = version swap; bech32 = HRP swap; program copied verbatim). (4) **round-trip guard:** decode the produced address and assert identical `(type, hash/program)`; refuse on any mismatch (BCH routes through the CashAddr codec). (5) the same acceptance-set gate that blocks a foreign payout gates conversion — `AcceptOwn`/`AcceptMerged`/`Reject`, the direct wallet analog of the stratum merged-payout auto-conversion, with the #961 misdirection hole closed.
+### 5.4 Transfer format & the c2pool validation seam
 
----
+**Family A — two artifacts, both public:**
 
-## 5. Air-Gap Security Model + c2pool Validation Seam
+- **Unsigned/constructed (online→offline):** a **PSBT-like container** (raw hex superset so the proven path survives) carrying the unsigned tx bytes, per-input `{prevout, scriptPubKey, amount, derivation hint}`, coin id + network version bytes (so the signer selects legacy vs BIP143 vs BIP341 algebra), and optionally c2pool's pre-flight verdict.
+- **Signed (offline→online):** exactly the format c2pool's loaders already consume — **one raw signed tx hex per line** (the `--pin-local-tx-hex` / `--embedded-tx-inject-hex` format, proven at block 2518186). No PSBT-finalization needed online; c2pool takes finished bytes.
 
-### 5.1 Network-incapability (three layers, defence in depth)
+**Transport:** file on removable media (proven), or multi-frame animated QR (sequence index + total + per-frame digest) for a diode gap; the 100 kB oversize ceiling bounds QR frame count. Both sides show `sha256d` digest + a human-readable render for cross-gap comparison.
 
-1. **Separate binary** (`c2wallet-qt-sign`) — the primary, operator-reasonable guarantee ("I only ever run the *sign* binary on the airgapped box").
-2. **Compile-time no-net** — links no Qt Network / sockets / HTTP / DNS. A CI symbol-scan (`nm`/link-map) gate fails the build if any of `socket`, `connect`, `getaddrinfo`, `SSL_*`, `Qt6::Network`, `WebEngine` resolves — the same discipline already used for the hidden-visibility dashscript `.so`.
-3. **Runtime guard** — on start, abort if any socket can be opened; drop network capability where the OS allows (`unshare`/seccomp on Linux, sandbox on macOS). Advisory; the physically-airgapped machine remains the real boundary. This catches "I accidentally ran the sign build on my laptop."
+**The validation seam.** Correction to the task premise: **there is no `POST /api/tx-inject/submit` route** — c2pool's HTTP surface is read-only + loopback-only, and its only POST is inert (503). The real, proven seam is **file-based**, which is better for the air-gap (a file is what crosses the gap anyway). The gate is `NodeCoinState::submit_inject` → `Mempool::add_inject`, cheapest-checks-first, with **named verdicts, no silent drops**: `ok`, `inject-oversize`, `inject-script-check-unarmed`, `inject-already-known`, `inject-already-confirmed`, `inject-unpriceable`, `inject-bip68-unsupported`, `inject-bad-txns-vout-range`. Consensus-exact `VerifyScript` runs under `--embedded-fold-checkscripts` (required armed); authoritative validation runs at template build and **drops** an invalid inject there — it is never mined; the #1218 tx-merkle-root cross-check keeps injection reward-neutral.
 
-This inherits and hardens the baseline's posture ("this script opens no sockets… 'send to a c2pool node' is deliberately a SEPARATE step").
+Contract (transport-agnostic; file today):
 
-### 5.2 Key custody (see also §2.2, §3.4)
+```
+Request:  { "op": "validate" | "submit", "coin": "dash",
+            "tx_hex": "<raw signed tx>", "flags": 0, "expiry_height": 0 }
+Response: { "ok": true|false, "cause": "ok" | "inject-unpriceable" | ..., "txid": "<sha256d>" }
+```
 
-Import offline, never persist plaintext, secrets in mlock'd/`DONTDUMP` pages zeroized after use (reuse `dashscript/support/cleanse`), core dumps disabled, RFC6979 deterministic signing. Opt-in encrypted-at-rest = Argon2id KDF → XChaCha20-Poly1305 / AES-256-GCM (same primitives as BIP38); default = amnesiac.
+One small online-side add is recommended: a **`validate_inject` dry-run** (validate without admit — a `testmempoolaccept` analog) so the wallet can pre-flight *before* the operator signs (requirement 3). No off-host HTTP submit — file/QR is the seam; any HTTP is companion-local, loopback-only, armed-flag-gated. **Caveat:** the online interpreter is `SigVersion::BASE` (legacy) only, so online validation of segwit/taproot inputs needs the same BIP143/341/342 additions on the node side (or a Bitcoin-Core-parity verifier) — a cross-lane dependency to flag.
 
-### 5.3 Threat model (summary)
+**Family B — Monero's native cold-signing flow (maps 1:1):** four public artifacts cross the gap — **outputs export** (online→offline: own outputs, no secrets), **key-image export** (offline→online: `{I_i, sig}`, public, lets the online side mark spent outputs and compute balance), **`unsigned_txset`** (online→offline: destinations + input choices + **frozen decoys/commitments** + fee + tx_extra + change), **`signed_txset`** (offline→online: fully-signed CryptoNote tx). Adopt monero's binary layouts verbatim for interop (a stock `monero-wallet-cli` could even be a fallback counterparty).
 
-Seed exfiltration over network (T1: no sockets), via disk/dump/clipboard (T2: never persisted, mlock+zeroize, output asserted secret-free), a tampered unsigned tx tricking the operator (T3: offline re-derivation + human confirm — see §5.5), a tampered signed blob in transit (T4: signature covers the tx, txid is the integrity check carried out-of-band), supply-chain (T5: reuse audited in-tree crypto, pin/vendor, keep the pure-Python `c2wallet.py` as an independent second implementation), cross-coin misdirection (T6/#961: display decoded hash160/program + target coin before signing), a lying online node (T7: it never signs, so it cannot induce a *theft*; it can only censor, mitigated by multiple broadcast paths + operator txid tracking; validity is advisory), evil-maid (T8: amnesiac default, hardware-token derivation a later extension).
+**Family B online contract (v37 XMR node = counterparty; local ledger task #191/#192; the correct GitHub series is `xmr(native)` #1500–#1612, integrated by #1612 — the brief's "#192 = Monero lane" is a mis-cite, #192 is an NMC storage PR):** the online node exposes (1) a **scan feed** (`get_blocks`/`get_o_indexes` equivalent) for the view-only wallet, (2) a **decoy / output-distribution service** (`get_output_distribution` + `get_outs`) for online ring selection, (3) a **dynamic fee** rate, (4) **relay** via levin `NOTIFY_NEW_TRANSACTIONS` after in-tree RingCT/BP+ verify, and (5) **validation feedback** (accept/reject + reason before relay). Honest limit (per `xmr_rct_verify.hpp`): a daemonless node cannot fully verify CLSAG/double-spend without the chain's spent-set, so the Monero online contract includes a **monerod-parity check** (#1583) as the authoritative leg — mirroring how the Bitcoin daemonless lane keeps `--coin-rpc` as guarded authority until cut. The wallet touches the v37 lane only as a relay/validate/scan client, never the sharechain/settlement code.
 
-### 5.4 What crosses the gap, and the format
+### 5.5 Money-path discipline
 
-**Unsigned artifact — a PSBT-superset ("c2psbt").** The baseline's bare unsigned-hex + single `--address` is too thin for the full matrix: BIP143/BIP341 sighash commit to input amounts and prevout scriptPubKeys, which a bare unsigned tx does not carry. The container carries — global: unsigned tx + coin/network id; **per-input: prevout (txid:vout), prevout scriptPubKey, amount (mandatory), redeemScript (P2SH), witnessScript (P2WSH), sighash type, derivation hint, and for P2TR the internal key / merkle root / leaf scripts**; per-output: scriptPubKey + amount + a "this is my change" derivation proof. BIP174 PSBT is the recommended base encoding.
-
-**Signed artifact — raw signed hex, one tx per line** — byte-identical to what `--pin-local-tx-hex` reads today (multi-line = a split consolidation riding one template). This preserves the live seam with zero online-side change, and is already the right shape (`tx_bytes`) for the future tx-inject `submit`.
-
-**Transport:** removable file (primary), **animated/chunked QR** (UR/BC-UR fountain codes — a 1000-input consolidation is ~150 KB and cannot fit one QR), manual hex (last resort, txid-checked).
-
-### 5.5 Verification on each side (hard rules)
-
-- **Offline, before signing:** independently re-parse the raw unsigned bytes, re-derive every output address + amount + total fee + the change-returns-to-me proof, and **show them**; refuse to sign if implied fee ≠ 0 unless explicitly allowed (the pin path requires fee==0); show the decoded hash160/witness-program per output so a cross-coin misencode is visible.
-- **Offline, after signing:** self-verify every signature with independent math before emit; abort on any mismatch; refuse oversize; assert the emitted artifact contains no secret bytes before writing.
-- **Online, on receipt:** re-hash → txid, operator confirms it equals the txid the offline box displayed, then run the validation gate below.
-
-### 5.6 The validation seam — the exact contract (c2pool never signs)
-
-**The live, mainnet-proven offline→online path is `--pin-local-tx-hex`, not an HTTP API.** (`tx-inject`/`submit_inject` are design-only, unimplemented — the forward-compatible successor.) The pin file is read at node start: one raw signed tx hex per line; all-or-nothing at load; refusals per line for odd hex, parse failure, `tx.type != 0` (special/extra_payload), empty vin/vout. Parked into `NodeCoinState`, re-gated on every template build, **exclusion-only** (a failing pin is excluded with a named cause, never costs a block, auto-retires once mined).
-
-Two distinct validation surfaces the design must not conflate:
-
-**(1) Pin-admission gate — `Mempool::pinned_tx_admissible()` → `PinnedTxGate`**, with the complete named-cause vocabulary the round-trip surfaces verbatim: `ok` · `tx-too-large` · `utxo-view-unset` · `input-missing-or-spent` · `immature-coinbase-input` · `fee-not-zero` · `tip-unknown` · `spends-mn-collateral`. Input/UTXO resolution uses the **embedded UTXO view first, `gettxout` via `--coin-rpc` second** (the off-tip crutch MEMORY tracks for the dashd-cut); fee==0 is **computed, never assumed**; an input neither source resolves is refused.
-
-**(2) Consensus-exact script verify — `ScriptCheckFn` / `c2pool_dash_verify_input()`** — dashcore's own vendored VerifyScript + interpreter + secp256k1, **fail-closed** (returns 0 on any failure → exclude). Flags exposed today: P2SH, DERSIG, NULLDUMMY, CLTV, CSV.
-
-**Requirement-3 pre-sign round-trip (proposed new method, forward-compatible with tx-inject):** a `validate_unsigned_tx` JSON-RPC method on the existing `c2pool-qt`/node web-server table, **reusing the exact same `pin_gate_verdict` value** so the pre-sign advisory can never drift from the template-time gate (the design law already stated in `embedded_gbt.hpp`). It runs, cheapest first: structural + size cap → input resolution → fee/zero-fee → MN-collateral → (if scriptSigs present) per-input `c2pool_dash_verify_input`. Response: `{ ok, at_height, per_input:[{nIn, ok, cause}], fee, cause }`. **Advisory only** — `ok` does not authorize spending; the operator's own review (§5.5) does; this keeps a lying node from inducing a bad signature. Package parent+child together or the child falsely reports `missing-inputs`.
-
-**Handing the signed blob back:** (1) **pin → own block template** (primary for 0-fee/non-standard): `pin_append` respecting the block-size budget, won block broadcast **P2P-primary / `submitblock`-fallback** — how block 2518186 shipped. (2) **future tx-inject** p2p submit — the raw-hex artifact is already the right shape. Zero-fee txs do not relay, so the pin/inject path is the only correct exit — no mempool-broadcast affordance.
-
-### 5.7 Seam gaps to surface
-
-- **Segwit/taproot flags are absent from the DASH `c2pool_scriptcheck` enum** (Dash has no segwit). For BTC/LTC/DGB the online script-verify seam needs WITNESS/TAPROOT flags + BIP143/BIP341 sighash; verify each coin lane exposes a segwit-capable verify before promising online validation of P2WPKH/P2WSH/P2TR. Implement + KAT per coin; do not assume the DASH verifier covers it.
-- **The `validate_unsigned_tx` method does not exist yet.** Recommendation: build it **and** keep an airgap-pure offline self-validation against a locally-linked copy of the same verifier + an operator-supplied UTXO dump; the online round-trip is the optional convenience for UTXO/spentness/policy the offline box cannot know.
+Offline signing moves no money (the blob is inert until armed online). **Arming the online c2pool to include/broadcast is the tap point** — every live submit (pin arm, inject arm, Monero relay) is a money-path → operator tap; the tx-injection feature is default-OFF at every milestone. The dry-run `validate` op is read-only and tap-free.
 
 ---
 
 ## 6. Phased Implementation Plan
 
-Each phase is one shippable **draft PR**, delivered by **qt-steward under the Fable→Opus→Fable workflow** (never one-shot). Any phase whose PR can emit a real signature or move funds is **money-path**: it ships flag/behaviour **default-OFF**, carries red-on-broken KATs, self-verifies every signature before emit, and merges only on an **operator tap**. No self-merge, no force-push delegation, no branch deletes. Reward/money-path PRs need the caller-side lock trace. Parallel phases run in isolated worktrees.
+Each phase is a shippable DRAFT PR delivered by **qt-steward** under the **Fable→Opus→Fable** review discipline (never one-shot), with A-track (Bitcoin-script) and X-track (Monero) interleaved. Any phase that can emit a spendable signature is money-path: caller-side lock trace, operator tap to merge, no subagent self-merge, no delegated force-push. The regression test for a fix folds **into** the fixing PR.
 
-- **M0 — Scaffold + parity floor** *(money-path)*. `ui/c2wallet-qt/` CMake target (Widgets/Gui/Core only), secp256k1 hoisted out of `impl/dash/coin/vendor/` into a shared `third_party/secp256k1` with `schnorrsig`+`extrakeys` on (one copy for node and wallet), reuse-wire codecs + coin registry + secure-memory support, **network-incapability CI gate** (link-map symbol scan). Port `CKey`/`CExtKey` from Core. **Acceptance: reproduce the `c2wallet.py` baseline** — legacy P2PKH BIP44 signing of the donation-consolidation shape, self-verifying every input, block 2518186 as the golden. *Deps: none.*
-- **M1 — Key import + HD** *(no signing; gate = BIP test vectors)*. BIP39 (+checksum, multi-wordlist, passphrase-fingerprint), BIP32/44/49/84/86 xprv + arbitrary paths, WIF, raw hex, phase-1 keystores; compressed **and** uncompressed; derivation-scan matrix + `find-address` verb; import-time self-KAT. *Deps: M0.*
-- **M2 — Address construct / display + cross-coin conversion** *(money-relevant: pay-misdirection, #961/#182)*. All script types classified/displayed; the cross-coin engine reusing `address_acceptance()` — convert within one algebra, **refuse across**; fix bech32m encode (GAP-1), add NMC SSOT (GAP-2), add CashAddr codec (GAP-3). Gate = conversion KATs incl. LTC↔DOGE convertible + LTC↔BCH refused + the LTC/BTC 0x05 warn. *Deps: M0, M1.*
-- **M3 — Legacy + segwit-v0 spend** *(money-path)*. Legacy sighash (reuse) + **BIP143** (new); P2PK (both key forms), P2PKH, P2SH, P2WPKH, P2WSH, P2SH-wrapped-segwit, bare P2MS incl. the CHECKMULTISIG extra-pop dummy + ordering; BCH forkid sighash. Gate = red/green sighash KATs vs known vectors + self-verify. *Deps: M1, M2.*
-- **M4 — Taproot + multisig spend** *(money-path)*. **BIP341/342** key-path AND script-path (control block, merkle tree, tapscript `OP_CHECKSIGADD`), Schnorr signing (BIP340, tweaked key, even-Y); multisig finalization. Gate = taproot KATs; schnorr module proven. *Deps: M3.*
-- **M5 — Air-gap transfer + c2pool validation seam** *(money-path; operator tap to inject)*. c2psbt unsigned artifact (file / animated QR / PSBT), raw-hex signed output matching `--pin-local-tx-hex`; online side (`c2pool-qt`) `validate_unsigned_tx` reusing `pin_gate_verdict` + broadcast/inject; offline self-validation against the linked verifier. **Requirement 3's home; the only network touchpoint — in c2pool-qt, never in c2wallet-qt.** Ties to tx-injection task #157. *Deps: M3 (M4 for taproot validation).*
-- **M6 — Qt UI polish** *(no new money-path)*. Bitcoin-Core-like shell over M1–M5. *Deps: M1–M5.*
+| Phase | Track | Deliverable | Depends on | Money-path gate |
+|---|---|---|---|---|
+| **M0** | shared | New `ui/c2wallet-qt/` tree; Widgets-only CMake; **network-incapable link-guard CI test** (the mechanical proof); MainWindow/sidebar shell reused from c2pool-qt. | — | Low — no keys yet. Gate = the binary provably links no network symbols. |
+| **M1-A** | Bitcoin | `hdkeys`: port BIP39/32/44 + WIF/raw-hex, add BIP49/84/86 + xprv/xpub + SLIP-132 + real BIP39 checksum + BIP38. | M0 | **Money-path (keys in memory)** → full F-O-F + tap. |
+| **M1-X** | Monero | 25-word mnemonic (+CRC, wordlists), dual spend/view import, view-only import, Monero base58, subaddress/integrated derivation. | M0 | **Money-path** → full gate. |
+| **M2-A** | Bitcoin | Wire `address_utils` + per-coin SSOT into a "Convert address" panel; detect-convertible / **WARN-or-refuse (#961)** UX with side-by-side payload display + round-trip proof; add the **NMC SSOT leaf** + BCH transcode helper; construct all output types (encode). | M1-A | Read-only derivation, but the **#961 path is money-relevant** → Fable review required. |
+| **M2-X** | Monero | Output scanning via view key + amount decrypt; view-only "export outputs" artifact; balance/spent state. | M1-X | Read-only → lighter gate. |
+| **M3-A** | Bitcoin | Legacy sighash (parity KAT for block 2518186 folded in), **BIP143** (P2WPKH/P2WSH/P2SH-wrapped), bare-P2MS incl. the CHECKMULTISIG extra-pop; self-verify + oversize per type. | M2-A | **HIGH** money-path. |
+| **M3-X** | Monero | Import outputs → compute key images → export key images; port/build the **CLSAG signer** on the vendored ops; KAT against in-tree verifier. | M2-X | **HIGH** money-path. |
+| **M4-A** | Bitcoin | **BIP341/342** taproot key-path + script-path (schnorrsig/extrakeys, taptweak, control block, tapleaf/branch); multisig scriptWitness assembly. | M3-A | **HIGH** money-path. |
+| **M4-X** | Monero | **Bulletproofs+ prover** port; full RingCT tx construction + serialization; offline self-verify (in-tree BP+/RCT verifier + key-image recompute) before emit — completes Monero's native cold-sign. | M3-X | **HIGH** money-path. |
+| **M5** | both | Air-gap transfer + validation seam: PSBT-like container + QR (A), `unsigned_txset`/`signed_txset`/outputs/key-image containers (B); online c2pool `validate_inject` dry-run wiring; surface `InjectSubmitResult.cause` names in the UI; Monero relay contract. | M3/M4 both | **HIGH** (broadcast/inject arming). Dry-run validate is tap-free. |
+| **M6** | both | Bitcoin-Core-like UI polish: wallet overview, coin-control, tx-builder screens, convert panel, sign/export flow — under one chain-family abstraction. | M5 | Low — no new crypto. |
 
-**Packaging** (a new coin-**agnostic** job — one wallet binary serves all coins, unlike the per-coin node matrix): offline-installable, self-contained bundles that pull nothing at install (Linux AppImage/`linuxdeployqt`, macOS `.dmg` via `macdeployqt` reusing the universal arm64+x86_64 pattern, Windows portable `.zip` via `windeployqt` + optional Inno installer). Reproducible builds with **published checksums and signatures** are first-class here (the trust model is "operator verifies the binary, then moves it to the airgap"), plus the network-incapability link-map gate in CI.
+Dependencies note: M5's Family-A online leg depends on the node-side BIP143/341/342 verifier work (§5.4 caveat); M5's Family-B online leg depends on the v37 XMR node exposing scan/decoy/fee/relay APIs.
 
 ---
 
-## 7. Risks & Open Decisions for the Operator
+## 7. Risks & Open Decisions
 
-### 7.1 Risks
+### Risks
 
-- **Segwit/taproot sighash is the largest net-new crypto surface** and the money-critical one; a BIP143/BIP341 error silently produces invalid or (worse) mis-committed signatures. Mitigation: port from Core, KAT red-on-broken per coin+type, refuse any coin+type not KAT-proven (the baseline's refuse-don't-fake discipline).
-- **Cross-coin misdirection (#961)** — a wrong conversion misdirects funds. Mitigation: authenticate-source + type-support + round-trip guard + the reused acceptance-set gate; display decoded hash160/program before signing.
-- **The `--coin-rpc` second source** in the online pin gate is the dashd-cut crutch MEMORY tracks; the wallet's UTXO discovery should prefer the embedded node's own view where available (c2pool-side concern, not the signer's).
-- **BCH's mandatory forkid + CashAddr** is a distinct code path from every other coin; the baseline refuses BCH precisely here — the successor must implement and prove it, not fake it.
-- **QtWebEngine on an air-gapped host would be exactly the wrong thing** (a ~150–400 MB Chromium attack surface); the separate-binary decision structurally prevents it.
+- **The signer core is entirely new prover code on both tracks.** c2pool is verify-only; nothing in-tree signs, and the legacy interpreter is `SigVersion::BASE`. BIP143/341/342 sighash (A) and CLSAG + Bulletproofs+ prover (B) are the highest-risk, highest-value modules. Mitigation: KAT-gate every type (block-2518186 parity for legacy; construct→in-tree-verify for Monero and for segwit/taproot against a Core-parity verifier).
+- **Sighash is where funds burn.** Each of BIP143 amount commitment, BIP341 all-prevouts commitment, the SIGHASH_SINGLE bug, and the CHECKMULTISIG NULLDUMMY/ordering rules is an independent money-loss vector. Per-scheme KATs are mandatory, not optional.
+- **Cross-coin misdirection (#961).** A wrong conversion silently misdirects funds. Mitigation: reuse the hardened `decide_payout_address` / `classify_address_for_coin` engine verbatim, mandatory round-trip proof, side-by-side payload display, hard family partition.
+- **Air-gap erosion.** A Qt binary can link a socket where the Python baseline could not. Mitigation: the three-layer network-incapable build with a CI link-guard as the mechanical proof.
+- **Online validation blind spot.** The online node cannot fully validate segwit/taproot (A, legacy-only interpreter) or CLSAG/double-spend daemonlessly (B) — both require added verifier work or a parity authority (`--coin-rpc` for A's Core-parity path; monerod-parity #1583 for B).
+- **Node-side dependencies** (BIP143/341/342 verifier; v37 XMR wallet-facing APIs) are outside this tree and must be sequenced with the respective lanes/stewards.
 
-### 7.2 Open decisions
+### Open decisions for the operator
 
-1. **Separate binary vs. c2pool-qt mode** — recommendation: **separate binary** (`ui/c2wallet-qt/`), high confidence; c2pool-qt is network-first by construction (Network + WebEngine + WebChannel + keychain) and cannot also be a network-incapable signer. Confirm.
-2. **Keystore formats for phase-1** — recommended: BIP38 (non-EC-multiply), Electrum JSON, Core descriptor JSON; phase-2: BIP38 EC-multiply, `wallet.dat` BDB (or point users at `bitcoin-wallet dump`), Ethereum-style JSON. Confirm the phase-1 set.
-3. **Electrum-seed (non-BIP39)** — recommended: detect-and-warn in phase-1, full support phase-2. Confirm.
-4. **Watch-only-from-xpub as a first-class phase-1 mode** (build tx + artifact, sign on a different seed-holding box) — high value for the air-gap story. Confirm in scope.
-5. **Encrypted seed vault on the offline box vs. strict ephemeral-only** — recommended: ephemeral default, vault opt-in. Confirm.
-6. **Build `validate_unsigned_tx` online method now, or ship offline-self-validation only** — recommended: both (offline-self-validation is the airgap-pure default; the online round-trip is the optional UTXO/policy convenience). Confirm.
-7. **Transport artifact = BIP174 PSBT superset vs. an extended flat-hex** — recommended: PSBT-superset (the flat-hex path cannot carry the per-input amount/scripts BIP143/BIP341 require); keep the flat legacy-P2PKH hex path for parity with block 2518186. Confirm.
-8. **NMC address SSOT** — must be added (currently a merged-mining backend with no `address_encoding.hpp`); confirm NMC stays in first-wave scope given that gap.
-9. **Monero / CryptoNote** — confirmed **out of first wave**; noted as a later, separate signer + validation model, never a Bitcoin-script coin row.
-10. **secp256k1 hoist** — moving the vendored copy from `impl/dash/coin/vendor/` to a shared location with taproot modules on touches the node build; confirm the node lane can consume the relocated copy (this is an M0 dependency).
+1. **Keystore formats (A):** confirm v1 = BIP38 + Core descriptors, deferring Electrum full-file (offer xprv-paste) and `wallet.dat` BDB parse and generic JSON keystore.
+2. **Separate binary vs c2pool-qt mode:** recommendation is a **separate network-incapable binary** (c2pool-qt hard-requires Chromium/QtWebEngine). Confirm.
+3. **Packaging:** a **new release.yml matrix job** for `c2wallet-qt` producing a signed `.dmg` (macOS universal, same lipo pattern), NSIS/`windeployqt` `setup.exe`, and Linux AppImage/`linuxdeployqt`, all into the existing draft-release + SHA256SUMS shape (CI never publishes). Reproducible + offline-verifiable distribution. The current release pipeline builds coin nodes only — no Qt job exists to inherit. Confirm the packaging targets.
+4. **Monero seed formats:** 25-word Electrum mnemonic is a must-have. **polyseed yes/no? 13-word MyMonero yes/no?**
+5. **Monero view-only:** confirm the online view-only / offline full split ships in v1 (strongly recommended — it *is* the air-gap flow).
+6. **Monero multisig (MMS):** recommendation **defer to v2**. Confirm.
+7. **RingCT prover strategy:** **Path A (port CLSAG + BP+ prover onto the vendored `crypto-ops.c`/`xmr_rct_ops`, self-contained, auditable, KAT'd against the in-tree verifier)** vs **Path B (link monero-project `wallet2`/`libwallet` wholesale — fastest but pulls boost + the whole monero crypto tree and is harder to prove network-incapable)**. Recommendation: **A**.
+8. **Which Monero library to link:** tied to (7) — Path A links only libsodium (already required by the vendored ed25519 ops) plus ported source files; Path B links libwallet.
+9. **Monero artifact format:** adopt monero's `unsigned_txset` / `signed_txset` / outputs / key-image layouts verbatim (interop) vs a c2pool-native container. Recommendation: **verbatim**.
+10. **Monero `.keys` interop:** import monero-wallet `.keys` yes/no; export in monero format vs our own air-gap format only.
+11. **Integrated / long payment IDs:** read+warn only, never generate long (deprecated). Confirm.
+12. **Ring size / consensus params source:** pin live from the online node (ring 16 now) to survive a consensus bump vs hardcode. Recommendation: **live from node**.
