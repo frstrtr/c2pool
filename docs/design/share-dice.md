@@ -44,7 +44,7 @@ a genuinely delicate feature, and none of them are about randomness:
 strictly off-consensus, pot-capped, default-OFF, and testnet/play-money first.
 If the operator is not willing to accept the "trust the pool to pay" model and
 the legal posture, the correct answer is not to ship it. The crux decisions are
-collected in §7.
+collected in §8.
 
 ---
 
@@ -75,7 +75,7 @@ collected in §7.
 
 The house edge is baked into the threshold-vs-multiplier gap (RTP ≈ 0.99, i.e.
 ~1% edge; note tier 1 as written is very slightly player-favorable at 1.0071 and
-tier 9 is heavier at ~2.38% edge — the operator may want to re-tune, see §7).
+tier 9 is heavier at ~2.38% edge — the operator may want to re-tune, see §8).
 
 **We take this table verbatim as the game spec.** What we do *not* take is
 `random.randint(0, 65535)` — that is a local PRNG, not provably-fair. Designing
@@ -455,15 +455,127 @@ it. It must, however, be flagged clearly:
 
 ---
 
-## 7. Crux decisions for the operator
+## 7. Settlement architecture reframe (operator: authentication, coinbase, window compaction)
 
-1. **Sharechain-consensus vs pool-local (settled recommendation: pool-local).**
-   Bets in shares fork the whole network and are rejected (§3.2). The design is a
-   pool-local overlay. Confirm this is acceptable — it is the load-bearing
-   decision, and it dictates the trust model.
-2. **Settlement realization: (A) off-chain from donation holdings vs (B)
-   coinbase-overlay on operator-found blocks.** Recommendation (A): canonical
-   coinbases, honest trust boundary, matches SatoshiDice. Operator picks.
+The operator raised three architecture questions that push the settlement design
+away from the pure pool-local overlay of §3.2 and toward a chain-enforced,
+v37-class consensus feature. This section answers them and supersedes the earlier
+settlement *recommendation* (the provably-fair core of §3.1 and the safety
+invariants of §3.3 are unchanged). The load-bearing takeaway: **authentication (A)
++ coinbase settlement (B1) + persistent balances past the window (C) together make
+the fully trustless share-dice a v37 consensus feature; v36 can support only the
+limited operator-block-only variant (B2) with immediate, non-banked settlement.**
+
+### 7.1 A — Authentication: the payout address IS the identity
+
+There is no separate login and no new credential. In p2pool a miner's identity is
+already their **payout address** — the address paid in the coinbase, which is
+already committed inside that miner's shares. The dice reuses it directly:
+
+- A bet is a message `{tier, amount, bet_id, seed_commitment_ref}` **signed by the
+  private key of the payout address** (ECDSA or Schnorr over the hash of the bet
+  message). The node verifies the signature against the address that is already
+  present in the miner's shares — no enrollment step, no shared secret, no new key
+  material.
+- Reuse the existing `sign_message` primitive from
+  `frstrtr/dash-proposal-collateral` (the same address-ownership-proof pattern
+  used for proposal collateral) rather than inventing a signing format.
+- **Anti-replay:** the signed bet carries `bet_id` plus a per-miner monotonic
+  `nonce`; the node rejects any `(payout_address, nonce)` it has already accepted,
+  and `bet_id` (which already binds the miner's `client_seed`, §3.1) makes each
+  bet unique. A captured bet cannot be replayed against a later round.
+
+This authentication model is identical for both settlement variants below — only
+where the *outcome* is recorded differs.
+
+### 7.2 B — Coinbase settlement (reframes §3.2)
+
+The operator wants the payout to land **in the coinbase**, which closes the trust
+gap that the §3.2 pool-local overlay left open (there, a miner had to trust the
+pool to honor an off-chain log). But the coinbase is built *deterministically by
+every node from the shared sharechain*, so "pay in the coinbase" forces a choice
+between two honest variants. **The pure pool-local ledger of §3.2 was the middle
+ground the operator is now rejecting by requiring coinbase settlement**; it
+remains the weakest option (trust gap) and is only defensible if the dice never
+touches the coinbase at all.
+
+- **B1 — consensus dice (trustless; a protocol upgrade).** Bets, the commit-reveal
+  material, and the resolved rolls are recorded **in the sharechain itself** (a new
+  share field or a new bet-message type carried by shares). Every node then
+  deterministically recomputes *post-dice* PPLNS weights from the same shared
+  data, so **all nodes build the identical coinbase** and the payout is
+  chain-enforced — no trust in the operator at all. This is genuinely trustless
+  and is the correct long-term target. The cost is real: it is a **sharechain
+  protocol upgrade (v37-class)** — it needs an activation gate and adoption by all
+  nodes, exactly the kind of network-wide change §3.2 warned a naive bets-in-shares
+  approach would trigger. The difference from the rejected naive form is that here
+  it is done *deliberately*, as a versioned consensus feature with activation,
+  not as an incompatible unilateral change.
+- **B2 — operator-block-only overlay (v36; limited).** Only blocks the operator's
+  own node finds carry a dice-adjusted coinbase, and **only the operator's own
+  donation slice may move** — never any other miner's consensus-derived payout.
+  Other nodes' behavior, share validation, and every non-operator payout are
+  untouched, so there is **no network fork**. The limitation is coverage: bets only
+  settle in-coinbase on the operator's fraction of found blocks, and only against
+  the operator's own donation funds. This is the most that can be done in the
+  coinbase on v36 without a protocol upgrade.
+
+Relationship to §3.2's option (A)/(B): §3.2(A) was off-chain settlement (trust
+gap, now rejected by requirement B); §3.2(B) is the same idea as **B2** here.
+**B1** is the new trustless target that §3.2 did not offer.
+
+### 7.3 C — Work evaporates after the PPLNS window (v37 compaction)
+
+Share-credit is a **rolling window** (e.g. ~8640 shares, ~3 days on LTC). A share
+stops paying the moment it exits the window, so a dice "balance" denominated in
+raw share-credit **decays** and cannot be banked long-term under v36. Two
+consequences:
+
+1. **v36: dice must settle each round into the IMMEDIATE next coinbase.** Winnings
+   are paid promptly, not banked — a balance left sitting would evaporate as its
+   underlying shares age out of the window. So v36 dice is inherently
+   round-synchronous and short-lived.
+2. **v37: persistent balances are natural.** v37's compacted/persistent work
+   accounting — the **MRR Roundabout** rotating-round chain-replacement — retains
+   credit beyond the raw window, so dice **credit and winnings can be banked past
+   the PPLNS window**. Persistent, bankable dice balances are therefore
+   intrinsically a v37 feature; they cannot be built correctly on the v36 rolling
+   window.
+
+### 7.4 What this means together
+
+- **v37 (target):** A (address-signed bets) + B1 (bets/rolls in the sharechain,
+  identical coinbase on every node) + C (compacted work accounting banks balances)
+  = a **fully trustless, persistent share-dice as a v37 consensus feature**, gated
+  by activation across all nodes.
+- **v36 (what is possible now):** A + B2 + immediate-settle-into-next-coinbase =
+  a **limited** dice: operator-found blocks only, operator donation slice only, no
+  banked balances. No network fork, no protocol upgrade, but partial coverage and
+  round-synchronous.
+- **Unchanged in both:** the **play-money provably-fair core** — the commit-reveal
+  engine (§3.1) and the public verifier (§4) — is identical for every variant.
+  Only the settlement and persistence layer differs. This means the fairness
+  primitive can be shipped and audited on play-money first (§5) regardless of which
+  settlement path the operator ultimately chooses.
+
+---
+
+## 8. Crux decisions for the operator
+
+1. **Where settlement lives — the load-bearing decision (reframed by §7).**
+   Coinbase settlement is what the operator wants; the honest options are:
+   **B1 — consensus dice (v37)** is the trustless target (bets/rolls in the
+   sharechain, identical coinbase on every node, chain-enforced payout) at the
+   cost of a versioned protocol upgrade with activation across all nodes;
+   **B2 — operator-block-only overlay (v36)** is the limited fallback (operator-
+   found blocks only, operator donation slice only, no fork); and the pure
+   **pool-local ledger (§3.2)** is the weakest — it carries the trust gap and only
+   makes sense if the dice never touches the coinbase. Recommendation: B1 as the
+   trustless target, B2 as the v36-only interim.
+2. **v36 now vs v37 target (from §7.3/§7.4).** Persistent, bankable balances need
+   v37 compacted work accounting (MRR Roundabout); v36 can only settle each round
+   into the immediate next coinbase. Decide whether to ship the limited v36 B2 +
+   immediate-settle now, or wait for the trustless v37 B1 + persistent balances.
 3. **Trust model acceptance.** Provably-fair proves the roll, not payment (§2).
    If a chain-enforced guarantee of payment is required, this feature cannot
    provide it without a consensus change — and then it should not ship.
@@ -480,7 +592,7 @@ it. It must, however, be flagged clearly:
 
 ---
 
-## 8. Non-goals
+## 9. Non-goals
 
 This document does not implement, arm, or enable anything. It specifies no field
 encodings, no config-flag names, no wire formats — only the mechanism, the safety
