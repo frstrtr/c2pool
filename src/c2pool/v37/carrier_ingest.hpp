@@ -115,9 +115,23 @@ public:
                 m_engine.submit(::v37::LaneRecord::push(
                     m_chain, p.descriptor, p.w_raw, p.flags));
                 ++m_pushes_forwarded;
+                // The VIEW-LAYER tee (retention_view.hpp and anything else that
+                // only WATCHES). It runs strictly AFTER the engine submit, it is
+                // handed a const push, and it is wrapped so that a throwing
+                // observer cannot unwind through admit(): a view must never be
+                // able to change an admission decision or reject a share.
+                if (m_obs) { try { m_obs(p); } catch (...) {} }
             };
             return m_adm->admit(carrier, receipts, sink);
         };
+    }
+
+    // Attach a read-only observer of the admitted push stream. Optional, absent
+    // by default, and inert when unset — with no observer this class is
+    // byte-for-byte the behaviour it had before.
+    void set_observer(RecordSink obs) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_obs = std::move(obs);
     }
 
     // F2 / W2-F-D: RemoveLane -> AddLane resets the lane-scoped admission state.
@@ -140,6 +154,7 @@ private:
     std::unique_ptr<ReceiptAdmitter> m_adm;
     mutable std::mutex               m_mtx;
     std::uint64_t                    m_pushes_forwarded = 0;
+    RecordSink                       m_obs;              // view-layer tee, may be empty
 };
 
 } // namespace c2pool::v37n
