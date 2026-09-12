@@ -1117,8 +1117,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # For an observability defect the check IS the fix: fail closed if the
-      # checked-out HEAD is ever not the head we asked for.
-      - name: Assert checkout matches expected head SHA (fail closed)
+      # checked-out HEAD is ever not the head we asked for, and force the full
+      # working tree back onto disk before any consumer reads it.
+      - name: Assert head + materialize tree + guard cache path (fail closed)
         working-directory: ${{ github.workspace }}
         run: |
           expected='${{ github.event.pull_request.head.sha || github.sha }}'
@@ -1127,7 +1128,26 @@ jobs:
             echo "::error title=Checkout integrity::checked-out HEAD ${actual} != expected head ${expected} — broken/stale merge-ref, not a code defect." >&2
             exit 1
           fi
-          echo "checkout verified: HEAD=${actual} matches expected head"
+          # The self-hosted workspace is REUSED: prune-runner-workspace strips the
+          # checkout to .git/.github at the prior job's end. actions/checkout then
+          # runs `checkout -f <sha>`, which only rewrites files that DIFFER between
+          # the previously-checked-out commit and this head — so files unchanged
+          # across the two commits (e.g. package-lock.json on a non-web PR) are
+          # left physically absent even though HEAD is correct. setup-node's
+          # cache-dependency-path glob then resolves nothing and dies with an
+          # opaque "Some specified paths were not resolved". reset --hard writes
+          # the ENTIRE target tree to disk, closing that gap deterministically.
+          git reset --hard "$expected"
+          # Regression guard (standing rule: assertion ships in the fixing PR):
+          # the cache-dependency-path MUST exist on disk before setup-node, else
+          # a genuinely moved/removed lockfile turns into the same opaque red.
+          # Fail loudly and legibly instead, and point at the real cause.
+          lock="web-static/sharechain-explorer/package-lock.json"
+          if [ ! -f "$lock" ]; then
+            echo "::error title=cache-dependency-path unresolved::${lock} absent on disk after checkout of ${expected}. The lockfile moved/was removed, or the tree failed to materialize — fix the path or the checkout, NOT the cache step." >&2
+            exit 1
+          fi
+          echo "checkout verified: HEAD=${actual}; ${lock} present on disk"
 
       - uses: actions/setup-node@v5
         with:
