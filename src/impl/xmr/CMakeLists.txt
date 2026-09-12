@@ -55,6 +55,14 @@ if (XMR_BUILD_RANDOMX AND NOT TARGET randomx
     add_subdirectory(third_party/randomx ${CMAKE_CURRENT_BINARY_DIR}/randomx_build)
 endif()
 
+# W0: native-minimal Monero embedded node -- the pinned contracts family, a
+# compiling fake per interface, and the shared consensus primitives. Everything
+# under native/ is HEADER-ONLY, so this subdirectory declares no library; it
+# only adds the three Wave 0 KATs under BUILD_TESTING. The node components
+# themselves (levin P2P, chain index, txpool, template source, relay, parity
+# oracle) land in later waves against these contracts.
+add_subdirectory(native)
+
 if (BUILD_TESTING)
     add_subdirectory(test)
 endif()

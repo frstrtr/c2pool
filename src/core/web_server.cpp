@@ -5686,6 +5686,21 @@ nlohmann::json MiningInterface::rest_config_schema()
     return nlohmann::json{{"error", "config schema endpoint not wired"}};
 }
 
+nlohmann::json MiningInterface::rest_config_apply(const std::string& body)
+{
+    // Slice A (#157): route the POST body through the installed gated-apply fn
+    // (control token + two-phase money nonce + AddressValidator + tripwire).
+    // Unwired => the caller (http_session) never reaches here; it answers 503.
+    if (m_config_apply_fn) {
+        auto j = m_config_apply_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"armed", false},
+        {"error", "config-apply not armed; runtime mutation is operator-gated"},
+        {"http_status", 503}};
+}
+
 nlohmann::json MiningInterface::rest_node_topology()
 {
     // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer
@@ -7205,7 +7220,15 @@ nlohmann::json MiningInterface::rest_pplns_current()
         if (tip.size() > 16) tip = tip.substr(0, 16);
         out["tip"]          = tip;
         out["window_size"]  = chain_length > 0 ? chain_length : 4320;
-        out["coin"]         = blockchain_short_symbol(m_blockchain);
+        // Label-aware coin symbol: a BCH / NMC / BIP110 node shares the
+        // BITCOIN enum and must report its own coin, not "BTC"
+        // (blockchain_short_symbol is enum-only). node_symbol() resolves the
+        // configured label via the coin registry; keep the enum symbol as the
+        // fallback for an unlabelled node.
+        std::string coin_sym = node_symbol();
+        out["coin"]         = coin_sym.empty()
+                                  ? std::string(blockchain_short_symbol(m_blockchain))
+                                  : coin_sym;
     }
     out["computed_at"]    = static_cast<int64_t>(std::time(nullptr));
     out["schema_version"] = "1.0";

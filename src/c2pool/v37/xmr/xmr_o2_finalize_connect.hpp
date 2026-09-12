@@ -102,6 +102,7 @@
 #include "impl/xmr/node/xmr_node_types.hpp"        // c2pool::xmr::node::Hash
 #include "xmr_node.hpp"                            // XmrNode, hex_of, Amounts (via xmr_settle_store.hpp)
 #include "xmr_node_config.hpp"                     // XmrNodeConfig, MoneroNetwork
+#include "xmr_same_height_race.hpp"                // SameHeightRaceLedger (c2pool#1551)
 
 namespace c2pool::v37n::xmr::o2 {
 
@@ -213,6 +214,17 @@ struct FinalizeConnectOptions {
     bool        progress      = true;   // print burial progress whenever hw advances
     std::FILE*  out           = stdout; // nullptr = silent (the self-check uses this)
     std::string tag           = "[v37-xmr-fc]";
+
+    // ── c2pool#1551 ────────────────────────────────────────────────────────
+    // Per-height verdict journal, appended on every verdict TRANSITION. Empty =
+    // no journal. Two nodes that watched the same race must agree on every
+    // height either of them credited; this file is what makes that a diff.
+    std::string race_journal_path;
+
+    // Lever (2): re-announce our nominated block on a contested, unburied
+    // height. Bounded by SameHeightPolicy::max_renotify. Unset = no re-announce
+    // (the observe-side posture, and what the self-check runs).
+    std::function<bool(std::uint64_t height, const std::string& bid_hex)> renotify;
 };
 
 // ── the glue ────────────────────────────────────────────────────────────────
@@ -244,6 +256,12 @@ public:
     struct Stats {
         std::uint64_t registered = 0, refused = 0, late_refused = 0, settled = 0,
                       orphaned = 0, sidecar_write_failures = 0;
+        // c2pool#1551. `r7_violations` is the one that must stay at zero: it
+        // counts settlements the race gate did NOT authorise, which is the only
+        // way a double-credit or an orphan-credit could reach the ledger.
+        std::uint64_t race_credited = 0, race_refused_orphaned = 0,
+                      race_refused_other_only = 0, race_deferred = 0,
+                      race_renotified = 0, r7_violations = 0;
     };
 
     // Construct AFTER node.bring_up() (the finalize driver exists) and AFTER
@@ -252,7 +270,14 @@ public:
     FinalizeConnect(XmrNode& node, const XmrNodeConfig& cfg, FoundBlockQueue& queue,
                     FinalizeConnectOptions opts = {})
         : m_node(node), m_cfg(cfg), m_q(queue), m_o(std::move(opts)),
-          m_log_cursor(node.construction_log().size()) {}
+          m_log_cursor(node.construction_log().size()),
+          m_race(cfg.same_height_policy()) {
+        // c2pool#1551: take the node's single chain-observation seam. Both arm
+        // orders route through it, so the race book sees the same blocks the
+        // finalize driver does, in the same order, in either mode.
+        m_node.set_chain_observer(
+            [this](std::uint64_t h, const std::string& bid) { observe_chain_block(h, bid); });
+    }
 
     FinalizeConnect(const FinalizeConnect&) = delete;
     FinalizeConnect& operator=(const FinalizeConnect&) = delete;
@@ -328,6 +353,7 @@ public:
                 continue;
             }
             m_pending[bid] = rec;
+            m_race.observe_own(rec.height, bid, rec.found_unix_s);
             if (pending) ++rep.reseeded; else ++rep.reregistered;
             say(std::string("boot: ") + (pending ? "re-drove pending FOUND " : "RE-REGISTERED lost FOUND ") +
                 short_bid(bid) + " h=" + std::to_string(rec.height) +
@@ -353,10 +379,56 @@ public:
             else if (!r.registered)            ++t.refused;
         }
         reconcile(t);
+        race_gate(t);                          // c2pool#1551 -- after reconcile, so a
+                                               // credit the driver just took is already
+                                               // recorded when the gate cross-checks it
         echo_node_log();                       // the node's own "win: FOUND ..." lines
         progress();
         return t;
     }
+
+    // ── c2pool#1551: observation ───────────────────────────────────────────
+    // A block the node's chain told us about, at `height`. Ours (it will have
+    // been registered as a FOUND, or will be in a moment -- the race book
+    // promotes either way) or a stranger's. Installed as XmrNode's chain
+    // observer by the constructor; also callable directly by a consumer that
+    // learns of a same-height block from somewhere else.
+    void observe_chain_block(std::uint64_t height, const std::string& bid_hex) {
+        const std::string bid = lower_hex(bid_hex);
+        if (bid.size() != 64) return;
+        if (m_race.holds_own(height, bid)) { m_race.observe_own(height, bid); return; }
+        if (m_pending.count(bid) || m_unrecoverable.count(bid)) {
+            m_race.observe_own(height, bid);     // ours, seen through the chain
+            return;
+        }
+        m_race.observe_other(height, bid);
+    }
+
+    // Candidate blocks the node is HOLDING but has not adopted (the alt pool).
+    // Without them the race book is blind in exactly the branch that matters: if
+    // our own block stays best, the rival never becomes a mainchain event, and
+    // an accounting layer fed only by the event stream would report the height
+    // uncontested and credit as if we had run unopposed.
+    struct AltObservation {
+        std::uint64_t height = 0;
+        std::string   bid_hex;
+        bool          own_mined = false;
+    };
+    std::size_t observe_alt_tips(const std::vector<AltObservation>& alts) {
+        std::size_t n = 0;
+        for (const AltObservation& a : alts) {
+            const std::string bid = lower_hex(a.bid_hex);
+            if (bid.size() != 64 || a.height == 0) continue;
+            if (a.own_mined || m_race.holds_own(a.height, bid) || m_pending.count(bid))
+                n += m_race.observe_own(a.height, bid) ? 1 : 0;
+            else
+                n += m_race.observe_other(a.height, bid) ? 1 : 0;
+        }
+        return n;
+    }
+
+    const SameHeightRaceLedger& race() const noexcept { return m_race; }
+    SameHeightRaceLedger&       race()       noexcept { return m_race; }
 
     // ── shutdown: one last drain so a win that landed after the final tick has
     //    its FOUND written before node.stop(). Order: listener.stop() ->
@@ -428,6 +500,10 @@ public:
             return refuse(r, bid, "ledger did not admit the FOUND (bid already known?)");
         }
         ++m_stats.registered;
+        // c2pool#1551: the block enters the race book at the same instant it
+        // enters the ledger's pending set, so no window exists in which a rival
+        // at the same height could be judged against an empty book.
+        m_race.observe_own(ev.height, bid, ev.found_unix_s);
         say("FOUND registered " + short_bid(bid) + " h=" + std::to_string(ev.height) +
             " reward=" + std::to_string(ev.reward_piconero) + " piconero payee=" +
             (ev.payee ? hex_of(*ev.payee).substr(0, 12) + "…" : std::string("-")) +
@@ -477,6 +553,7 @@ private:
             const PendingRec&  rec = it->second;
             if (m_node.ledger().is_settled(bid)) {
                 ++t.settled; ++m_stats.settled;
+                race_confirm_credit(bid, rec.height);
                 say("FINALIZED " + short_bid(bid) + " h=" + std::to_string(rec.height) +
                     " SETTLED at bin_height=" + std::to_string(rec.height + m_cfg.d_conf) +
                     (rec.payee ? " effective_owed(payee)=" +
@@ -499,6 +576,116 @@ private:
             else ++it;
         }
         if (changed) (void)sidecar_flush();
+    }
+
+    // ── c2pool#1551: THE GATE ──────────────────────────────────────────────
+    // Walk the heights that are actually races, decide each against the SAME
+    // chain the finalize driver asks, journal the transitions, and spend the
+    // bounded re-announce budget on a contested height whose nominee is ours.
+    //
+    // Nothing here credits anything. The credit belongs to the F1 finalize
+    // driver; this gate's job is to have an INDEPENDENT verdict ready so that
+    // race_confirm_credit() can check the driver's answer against it. A gate
+    // that also did the crediting would agree with itself by construction and
+    // would prove nothing.
+    void race_gate(TickReport& t) {
+        (void)t;
+        const std::uint64_t hw = m_node.hw().hw_height;
+        auto canonical = [this](std::uint64_t h, const std::string& b) {
+            return m_node.chain_carries(h, b);
+        };
+
+        for (const std::uint64_t h : m_race.heights_of_interest()) {
+            const RaceDecision d = m_race.decide(h, hw, canonical);
+
+            const auto lv = m_last_verdict.find(h);
+            if (lv == m_last_verdict.end() || lv->second != d.verdict) {
+                m_last_verdict[h] = d.verdict;
+                m_race.account(d);
+                switch (d.verdict) {
+                    case RaceVerdict::DeferUnburied:   ++m_stats.race_deferred; break;
+                    case RaceVerdict::RefuseOrphaned:  ++m_stats.race_refused_orphaned; break;
+                    case RaceVerdict::OtherOnly:       ++m_stats.race_refused_other_only; break;
+                    default: break;
+                }
+                journal_race(d, hw);
+                say("race h=" + std::to_string(h) + " " + to_string(d.verdict) +
+                    " [own=" + std::to_string(d.own_candidates) +
+                    " other=" + std::to_string(d.other_candidates) +
+                    (d.own_vs_other ? " OWN-vs-OTHER" : (d.contested ? " own-vs-own" : "")) +
+                    "] hw=" + std::to_string(hw) + " need=" + std::to_string(d.need_hw) +
+                    " nominated=" + (d.nomination.bid.empty() ? std::string("-")
+                                                              : short_bid(d.nomination.bid)) +
+                    (d.nomination.is_own ? " (ours)" : " (theirs)") +
+                    (d.credit_bid.empty() ? "" : " credit=" + short_bid(d.credit_bid)) +
+                    " :: " + d.nomination.why);
+            }
+
+            // Lever (2). take_renotify() is what enforces the bound: it fires
+            // only on a contested, unburied height whose nominee is ours and is
+            // not already the block the chain carries, and at most
+            // max_renotify times per height.
+            if (m_o.renotify && m_race.take_renotify(h, d, canonical)) {
+                const bool sent = m_o.renotify(h, d.nomination.bid);
+                if (sent) ++m_stats.race_renotified;
+                say(std::string("race h=") + std::to_string(h) + " prefer-own RE-ANNOUNCE " +
+                    short_bid(d.nomination.bid) + (sent ? " pushed" : " NOT pushed (relay declined)"));
+            }
+        }
+
+        // Bound the book. The gate keeps a few D_conf windows of candidates and
+        // a full retention window of credit records -- long enough that any
+        // reorg the index itself could follow still finds its R-7 answer here.
+        const std::uint64_t keep = m_cfg.d_conf * 4 + 64;
+        if (hw > keep) {
+            const std::uint64_t floor = hw - keep;
+            m_race.prune_below(floor, m_cfg.index_retain_recent);
+            for (auto it = m_last_verdict.begin(); it != m_last_verdict.end();) {
+                if (it->first < floor) it = m_last_verdict.erase(it); else break;
+            }
+        }
+    }
+
+    // The finalize driver has just SETTLED `bid`, mined at `height`. The race
+    // gate now has to agree, independently, that this exact block at this exact
+    // height was creditable -- buried D_conf deep, carried by the best chain,
+    // and the FIRST credit at that height. A disagreement is not a warning to
+    // shrug at: a double-credit and an orphan-credit have no other shape.
+    void race_confirm_credit(const std::string& bid, std::uint64_t height) {
+        const std::uint64_t hw = m_node.hw().hw_height;
+        const RaceDecision d = m_race.decide(height, hw,
+            [this](std::uint64_t h, const std::string& b) { return m_node.chain_carries(h, b); });
+
+        const bool authorised = (d.verdict == RaceVerdict::CreditOwn) && (d.credit_bid == bid);
+        const bool first      = authorised && m_race.note_credited(height, bid);
+        if (first) {
+            ++m_stats.race_credited;
+            m_last_verdict[height] = RaceVerdict::AlreadyCredited;
+            RaceDecision rec = d;
+            rec.verdict = RaceVerdict::AlreadyCredited;
+            journal_race(rec, hw);
+            return;
+        }
+        ++m_stats.r7_violations;
+        const std::string* already = m_race.credited_at(height);
+        say("R-7 VIOLATION: the finalize driver SETTLED " + short_bid(bid) + " at h=" +
+            std::to_string(height) + " but the same-height gate says " + to_string(d.verdict) +
+            " (own=" + std::to_string(d.own_candidates) + " other=" + std::to_string(d.other_candidates) +
+            " hw=" + std::to_string(hw) + " need=" + std::to_string(d.need_hw) +
+            (already ? " already-credited=" + short_bid(*already) : std::string()) +
+            "). This is the shape an orphan-credit or a double-credit takes -- "
+            "the settlement store and this height need an operator's eyes.");
+        journal_race(d, hw);
+    }
+
+    void journal_race(const RaceDecision& d, std::uint64_t hw) {
+        if (m_o.race_journal_path.empty()) return;
+        std::ofstream f(m_o.race_journal_path, std::ios::app);
+        if (!f) return;
+        f << static_cast<unsigned long long>(
+                 std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::system_clock::now().time_since_epoch()).count())
+          << ' ' << race_journal_line(d, hw) << '\n';
     }
 
     void progress() {
@@ -608,6 +795,11 @@ private:
     Stats         m_stats;
     std::size_t   m_log_cursor = 0;
     std::uint64_t m_last_hw_printed = ~std::uint64_t{0};
+
+    // c2pool#1551: the race book and the last verdict reported per height (so a
+    // quiet loop stays quiet and the journal records transitions, not ticks).
+    SameHeightRaceLedger                    m_race;
+    std::map<std::uint64_t, RaceVerdict>    m_last_verdict;
 };
 
 } // namespace c2pool::v37n::xmr::o2

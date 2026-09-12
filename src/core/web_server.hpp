@@ -26,6 +26,7 @@
 
 #include <core/log.hpp>
 #include <core/uint256.hpp>
+#include <core/coin_registry.hpp>
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
 #include <core/hashrate_ring.hpp>
@@ -597,6 +598,19 @@ public:
                                       && static_cast<bool>(m_config_schema_fn); }
     nlohmann::json rest_config();          // GET /api/config
     nlohmann::json rest_config_schema();   // GET /api/config/schema
+
+    // Slice A (#157): the LIVE apply path for POST /api/config/apply. Takes the
+    // raw request body and returns a JSON response that carries an
+    // "http_status" hint the HTTP layer maps to the wire status. UNWIRED by
+    // default: no main installs it, so the POST route stays 503 {"armed":false}
+    // (dormant). A main/test that wants the live gated apply installs a fn that
+    // routes through config_endpoint::apply_config (control token + two-phase
+    // money nonce + AddressValidator + tripwire). Never wired in production
+    // without an operator arming the control token.
+    using config_apply_fn_t = std::function<nlohmann::json(const std::string& body)>;
+    void set_config_apply_fn(config_apply_fn_t fn) { m_config_apply_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_config_apply_fn() const { return static_cast<bool>(m_config_apply_fn); }
+    nlohmann::json rest_config_apply(const std::string& body);  // POST /api/config/apply
 
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
@@ -1344,6 +1358,7 @@ private:
     embedded_template_fn_t m_embedded_template_fn;  // /embedded_template last-served snapshot (optional)
     config_json_fn_t m_config_fn;         // GET /api/config — resolved launch config (optional)
     config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
+    config_apply_fn_t m_config_apply_fn;  // POST /api/config/apply — Slice A gated apply (optional; unwired => 503)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;
@@ -1575,17 +1590,21 @@ public:
     // chain has no Blockchain enum entry (BCH / NMC-aux), so topology and
     // node_info never emit a blank symbol. "" only when truly unconfigured.
     std::string node_symbol() const {
+        // Enum-derived symbol for the consensus-supported coins.
+        std::string enum_sym;
         switch (m_blockchain) {
-            case Blockchain::LITECOIN: return "LTC";
-            case Blockchain::BITCOIN:  return "BTC";
-            case Blockchain::DOGECOIN: return "DOGE";
-            case Blockchain::DASH:     return "DASH";
-            case Blockchain::DIGIBYTE: return "DGB";
-            default:                   break;
+            case Blockchain::LITECOIN: enum_sym = "LTC";  break;
+            case Blockchain::BITCOIN:  enum_sym = "BTC";  break;
+            case Blockchain::DOGECOIN: enum_sym = "DOGE"; break;
+            case Blockchain::DASH:     enum_sym = "DASH"; break;
+            case Blockchain::DIGIBYTE: enum_sym = "DGB";  break;
+            default:                                      break;
         }
-        std::string s = m_coin_label;
-        for (auto& ch : s) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
-        return s;
+        // The configured coin label is the runtime truth: BCH / NMC / BIP110
+        // share the BITCOIN enum but must NOT be labelled "BTC". Resolve the
+        // label through the coin registry first, then fall back to the enum
+        // symbol (then the raw uppercased label). "" only when unconfigured.
+        return core::resolve_node_symbol(m_coin_label, enum_sym);
     }
     // Primary chain key for THIS node, derived from its configured blockchain
     // (lowercase symbol). Used as the default chain for explorer / coin-admin

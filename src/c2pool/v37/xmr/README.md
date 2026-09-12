@@ -20,6 +20,7 @@ the merged `V37Engine` / `OwedLedger` / lane executor / X6 coinbase builder.
 | `xmr_settle_store.hpp` | W6 `ISettleStore` seam + `FileSettleStore` + `RecoveryDriver` (fail-closed open) |
 | `xmr_finalize_driver.hpp` | **the F1 finalize driver** — `on_block_finalized` once per coin-height, in order, `bin_height` = the high-water AT THE STEP, never the live tip |
 | `xmr_node.hpp` | `XmrNode` — owns the wiring + donor lifecycle order |
+| `xmr_same_height_race.hpp` | **c2pool#1551** — the same-height double-block refusal, decided prefer-own **within bounds**: the tie-break moves the levers we control (what we build on, what we re-announce, what we nominate) and can never make an unburied or an orphaned block creditable |
 | `xmr_live_transport.hpp` | production `IMonerodTransport` (dependency-free raw-socket RPC; RPC-poll ZMQ fallback) |
 | `xmr_node_smoke.hpp` | shared network-free smoke (monerod stub) |
 | `../main_v37_xmr.cpp` | the `c2pool-v37-xmr` entrypoint |

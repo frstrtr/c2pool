@@ -177,6 +177,20 @@ tools/dash/*
 # tools/ci/ is tracked CI source (the test-target drift guard and the
 # proto-harness driver), not build output.
 !tools/ci/
+# WF-C2b anchor generator -- tracked release source, for the same reason the
+# DASH checkpoint generator above is: the embedded trust anchor
+# (src/impl/xmr/native/anchor/xmr_chain_anchor_stagenet.inc) names this script
+# as its reproduction path, and a trust root nobody can regenerate is a trust
+# root nobody can review.
+!tools/xmr-anchor-gen/
+tools/xmr-anchor-gen/*
+!tools/xmr-anchor-gen/xmr_anchor_gen.py
+# C4 template-parity capture -- tracked source, same reason again: the golden
+# header and its generator both name this script as the capture step, and a
+# golden whose capture leg is not in the tree is a golden nobody can reproduce.
+!tools/xmr-c4-parity/
+tools/xmr-c4-parity/*
+!tools/xmr-c4-parity/capture_miner_data.py
 
 # CMake out-of-source build trees (any name starting with `build-`).
 # Catches build-spv/, build-qt/, build-relwithdebinfo/, etc.

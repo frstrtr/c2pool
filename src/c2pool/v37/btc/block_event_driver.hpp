@@ -224,6 +224,54 @@ public:
         return RegisterResult{true, ""};
     }
 
+    // ── ★ S-1c: FOUND, but the block is a PEER'S. Same write-ahead discipline
+    //    as on_block_found (sidecar -> registration -> pending map), so a
+    //    restart re-drives a peer's pending block exactly like our own: the F1
+    //    driver's FOUND event carries the credit/payout, and reseed_after_open()
+    //    does not care which node mined it. The ONE difference is the node call
+    //    — on_peer_block_won, which folds E_b at the CARRIED cut and never
+    //    submits anything to the coin network.
+    //
+    //    A refusal here is NOT an error to retry: on_peer_block_won refuses only
+    //    in shapes that cannot be repaired by trying again (we cannot reproduce
+    //    the winner's cut, or the block is already buried past our cursor). The
+    //    sidecar is rolled back and the reason is returned for the caller to log.
+    RegisterResult on_peer_block_found(const PeerWin& w) {
+        std::lock_guard<std::mutex> g(m_mu);
+        if (m_pending.count(w.bid)) return RegisterResult{true, ""};
+        if (w.h_b == 0) return RegisterResult{false, "refusing H_b == 0 (unknown height is not a height)"};
+        if (!put_sidecar_locked(w.bid, w.h_b))
+            return RegisterResult{false, "pending-FOUND sidecar write failed (store commit)"};
+        PeerWinOutcome o;
+        try {
+            o = m_node.on_peer_block_won(w);
+        } catch (const std::exception& e) {
+            del_sidecar_locked(w.bid);
+            return RegisterResult{false, std::string("on_peer_block_won threw: ") + e.what()};
+        }
+        if (!o.registered) {
+            del_sidecar_locked(w.bid);
+            return RegisterResult{false, peer_refusal_reason(o)};
+        }
+        if (!m_node.ledger().is_pending(w.bid)) {
+            del_sidecar_locked(w.bid);
+            return RegisterResult{false, "ledger did not admit the peer FOUND (bid already SETTLED?)"};
+        }
+        m_pending[w.bid] = w.h_b;
+        return RegisterResult{true, ""};
+    }
+
+    // The refusal bit, as one line an operator can act on.
+    static std::string peer_refusal_reason(const PeerWinOutcome& o) {
+        if (o.already_known)          return "already ours / already known (idempotent, not a fault)";
+        if (o.refused_payout_emitted) return "winner had already EMITTED a coinbase; its payout map is not on the wire";
+        if (o.refused_too_late)       return "H_b at or below our finalize cursor (descriptor arrived too late)";
+        if (o.cut_digest_mismatch)    return "we published the winner's prefix P with a DIFFERENT lane digest (sharechain divergence)";
+        if (o.cut_miss)               return "the winner's prefix P was never published here (ring evicted / coalesced through)";
+        if (!o.cut.folded)            return "fold_eb REFUSED at the carried cut (geometry not ratified)";
+        return "peer win not registered";
+    }
+
     // ── FINALIZED: the F1 tick. Delegates to XbtcNode::on_tip (one height a
     //    step, never jumps to tip) and retires the sidecar of every finalized
     //    bid. A bid the driver orphaned AT MATURITY inside advance_to_tip

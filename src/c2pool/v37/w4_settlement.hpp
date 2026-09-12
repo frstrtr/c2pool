@@ -39,7 +39,13 @@
 //                              settlement boundary. Its final form (Lane-
 //                              boundary check vs canonical flag) awaits the
 //                              integrator D-B ruling (OI-W4-8); this does NOT
-//                              hard-decide D-B and does not block.
+//                              hard-decide D-B and does not block. EXTENDED
+//                              for V37.1 (S8): the native-ridge dimension set.
+//   (7) S8 / S-1              — the ONE owed commitment, in both directions:
+//                              S8 is the fold that puts value into the ledger,
+//                              S-1 is the template-build emission of
+//                              ledger.owed_digest() of that SAME ledger. The
+//                              emission NEVER recomputes; see §S8 below.
 
 #include <algorithm>
 #include <array>
@@ -58,6 +64,7 @@
 #include <sharechain/v37/v37_fixed.hpp>          // U256, u64
 #include <sharechain/v37/v37_hash.hpp>           // bytes32, sha256d
 #include <c2pool/v37/w4_owed_incremental.hpp>    // R3: DigestMemo, EffectiveOwedIndex
+#include <c2pool/v37/owed_event_log.hpp>         // owed-event MMR: the record log BESIDE owed_digest
 
 namespace c2pool::v37n::settle {
 
@@ -215,6 +222,24 @@ inline std::vector<WeightedPayee> project(const View& v,
 }
 
 // E_b = split(reward, project(view)) as a key→amount map (per-block entitlement).
+//
+// ★★ S8 — THE E_b SINGLE-SOURCE RULE (V37.0 / V37.1). E_b is a pure function
+// of (reward, v.payout, v.identities) and of NOTHING else. This fold does not
+// read v.params, v.next_pos, v.digest or any lane gate, and it must never grow
+// a live-vs-ridge branch of its own. The V37.0/V37.1 choice of WHICH map
+// v.payout carries is made ONCE, at the engine's single view-build site —
+// LaneExecutor's `s->payout = l.payout_map()`, and Lane::payout_map()
+// dispatches on its own nr_active():
+//     gate OFF  →  payout_map_positional()   (live only)          ≡ master
+//     gate ON   →  nr_payout_map()           (live + carry, CARRY-ARITH:
+//                                             two SEPARATELY truncated
+//                                             products summed, never
+//                                             (live+carry).mul_q)
+// — with ND-R11 RULED (the carried ledger is PAID) selecting the live+carry
+// form at the flip. Keeping the decision at that one site is what makes S8 and
+// S-1 auto-consistent: every node at the same cut credits the ledger from the
+// identical map and therefore emits the identical owed_digest. A second branch
+// HERE would be a fork surface, not an optimisation.
 template <class View>
 inline std::map<bytes32, u64> settle_block(u64 reward, const View& v) {
     std::vector<WeightedPayee> payees = project(v);
@@ -223,6 +248,31 @@ inline std::map<bytes32, u64> settle_block(u64 reward, const View& v) {
     for (std::size_t i = 0; i < payees.size(); ++i)
         if (amt[i] > 0) e[payees[i].key] += amt[i];
     return e;
+}
+
+// Which map the view-build site put in v.payout. DIAGNOSTIC ONLY — nothing in
+// the fold, the ledger or the commitment branches on it; it exists so a node
+// can LOG and a KAT can ASSERT which E_b source produced a given credit, and
+// so an operator reading two nodes' logs at one cut can see a mis-set gate
+// instead of inferring it from a diverged digest. It re-derives the lane's own
+// predicate from the view's own frozen fields (Lane::nr_active() is
+// `nr_version == 1 && next_pos > nr_activation_pos && mrr_active()`, and
+// Lane::mrr_active() is `next_pos > mrr.activation_pos`), so it cannot drift
+// from the site it describes.
+enum class EbSource : std::uint8_t { LiveOnly = 0, LiveAndCarry = 1 };
+
+inline const char* eb_source_name(EbSource s) {
+    return s == EbSource::LiveAndCarry ? "live+carry (V37.1 native ridge)"
+                                       : "live-only (V37.0 positional)";
+}
+
+template <class View>
+inline EbSource eb_source_of(const View& v) {
+    const ::v37::LaneParams& p = v.params;
+    const bool mrr_on = v.next_pos > p.mrr.activation_pos;
+    const bool nr_on  = p.nr.nr_version == 1 &&
+                        v.next_pos > p.nr.nr_activation_pos && mrr_on;
+    return nr_on ? EbSource::LiveAndCarry : EbSource::LiveOnly;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -323,14 +373,97 @@ struct SettleHW {
 // form without touching the fold or the ledger.
 // ─────────────────────────────────────────────────────────────────────────
 
+// ★★ S8 (V37.1) — THE NATIVE-RIDGE HALF OF THE PIN, AND WHY IT IS NOT TYPED
+// OUT HERE. Under the native ridge (S12 / ND-R9) the ratified geometry is the
+// per-lane ND-R6 dimension set carried on NrGate and committed in the "NRG1"
+// header sub-block — NOT a tuple this header could restate. A settlement pin
+// that RE-TYPED that table would itself become a fork surface the first time
+// the table moved on one side only. So the pin reconstructs its reference
+// through the lane's OWN single source of truth,
+// ::v37::LaneParams::for_version(1, lane) (which folds nr::for_version(1,
+// lane) and runs nr::check_dims() on the row it returns), and compares. An
+// edit to nr_ladder.hpp therefore moves the lane guard and this pin TOGETHER,
+// bit for bit, by construction.
+//
+// Field coverage is kept honest by a size tripwire rather than by hope: adding
+// a field to NrGate changes sizeof and fails the static_assert below, which
+// names the function that must then be extended.
+static_assert(sizeof(::v37::NrGate) == 104,
+              "S8: NrGate changed shape — extend nr_gate_dims_equal() to cover "
+              "the new field before this pin can be trusted again");
+
+// Every NrGate field EXCEPT nr_activation_pos. The activation POSITION is the
+// operator's economic flip decision (R-5 / V371_ACTIVATION_POS), not part of
+// the ratified GEOMETRY: two nodes on the same ruled dimensions with different
+// positions are a mis-configuration the lane's own co-location guard refuses,
+// and they are not two different geometries.
+inline bool nr_gate_dims_equal(const ::v37::NrGate& a, const ::v37::NrGate& b) {
+    return a.nr_version         == b.nr_version         &&
+           a.fold_cap           == b.fold_cap           &&
+           a.open_horizon_bins  == b.open_horizon_bins  &&
+           a.w_min_bins         == b.w_min_bins         &&
+           a.w_max_bins         == b.w_max_bins         &&
+           a.w_default_bins     == b.w_default_bins     &&
+           a.coverage_blocks    == b.coverage_blocks    &&
+           a.bin_seconds        == b.bin_seconds        &&
+           a.retarget_bins      == b.retarget_bins      &&
+           a.ckpt_bins          == b.ckpt_bins          &&
+           a.n_ctx_bins         == b.n_ctx_bins         &&
+           a.allow_digit_repeat == b.allow_digit_repeat;
+}
+
+// True iff `g` is the ruled ND-R6 dimension set of SOME ruled lane. Reads the
+// table only through the lane's factory — no value is restated here.
+inline bool nr_dims_are_ratified(const ::v37::NrGate& g) {
+    if (g.nr_version != 1) return false;
+    for (const ::v37::LaneKind k : {::v37::LaneKind::BTC, ::v37::LaneKind::LTC,
+                                    ::v37::LaneKind::DASH, ::v37::LaneKind::DOGE}) {
+        const ::v37::NrGate ref = ::v37::LaneParams::for_version(1, k).nr;
+        if (nr_gate_dims_equal(ref, g)) return true;
+    }
+    return false;
+}
+
 inline bool geometry_is_ratified(const ::v37::LaneParams& p) {
-    // Digest-committed geometry tuple (journal_depth excluded — not committed):
-    // the OQ-5 canonical default. Any other geometry is refused at the
-    // settlement boundary until the D-B registry ships (OI-W4-8).
+    // (a) V37.0 — the digest-committed geometry tuple (journal_depth excluded
+    // — not committed): the OQ-5 canonical default. Any other geometry is
+    // refused at the settlement boundary until the D-B registry ships
+    // (OI-W4-8). UNCHANGED, byte for byte: every LaneParams the canon can
+    // construct (v37_0(), v37_1(), for_version(1, lane) on all four ruled
+    // lanes, and the bare default) carries this tuple, so this clause decides
+    // exactly what it decided before S8.
     if (!(p.window == 8640 && p.c0 == 4096 && p.rollup == 8 &&
           p.half_life == 2160))
         return false;
-    return p.level_caps.size() == 1 && p.level_caps[0] == 568;
+    if (!(p.level_caps.size() == 1 && p.level_caps[0] == 568)) return false;
+
+    // (b) V37.1 — the native ridge. Inert unless the ridge is DECLARED, so a
+    // GATE-OFF lane (nr_version 0, every position UINT64_MAX) takes exactly
+    // the pre-S8 decision above and nothing else runs.
+    if (p.nr.nr_version == 0) {
+        // A position without a version is the lane constructor's own refusal;
+        // mirrored here so a hand-built LaneParams cannot slip past the
+        // settlement boundary if it ever reaches one un-constructed.
+        return p.nr.nr_activation_pos == UINT64_MAX;
+    }
+    if (!nr_dims_are_ratified(p.nr)) return false;
+    // ND-R9: the S3 bin-band pyramid is RETIRED; S12 supersedes it. The lane
+    // constructor refuses a finite window gate beside a FINITE ridge gate —
+    // this mirrors that clause with the same guard condition, so the two are
+    // the same predicate and not two nearly-identical ones.
+    if (p.nr.nr_activation_pos != UINT64_MAX &&
+        p.win.win_activation_pos != UINT64_MAX)
+        return false;
+    return true;
+
+    // REQUIRED-OPERATOR-RULING (S8-R2, = spec §5 R-2). Under ND-R3, c0 /
+    // rollup / E are no longer consensus dimensions once the ridge is ACTIVE,
+    // so clause (a) is arguably SUPERSEDED there rather than additional. This
+    // patch takes the strictly CONSERVATIVE reading — (a) always holds, (b)
+    // adds on top — because every LaneParams the canon constructs satisfies
+    // both, so the conservative reading refuses nothing the ruled one admits
+    // TODAY, while the reverse would silently widen the pin. Whether (a) is
+    // dropped under nr_active() is the operator's ruling, not this patch's.
 }
 
 // The assert hook. Returns false (a HARD refusal, never a retry) when the
@@ -341,6 +474,32 @@ template <class View>
 inline bool assert_ratified_geometry(const View& v, bool strict) {
     if (!strict) return true;
     return geometry_is_ratified(v.params);
+}
+
+// ★ S8 — the ONE credit-path entry point. One call does the ratified-geometry
+// refusal AND the E_b fold, so a settlement over a non-ratified geometry
+// cannot reach the ledger by a caller that simply forgot the seam. `source` is
+// the diagnostic stamp of which map the view-build site produced; `next_pos`
+// is the prefix P the fold read at (the cut's own witness). Returns nullopt on
+// the HARD refusal — never a retry, never a partial credit.
+struct EbFold {
+    std::map<bytes32, u64> credit;   // E_b, canonical-key keyed
+    EbSource source = EbSource::LiveOnly;
+    u64      next_pos = 0;           // == P, the burial-gated prefix read
+    std::size_t unresolved = 0;      // OI-W4-1 broken-invariant counter
+};
+
+template <class View>
+inline std::optional<EbFold> fold_eb(u64 reward, const View& v, bool strict = true) {
+    if (!assert_ratified_geometry(v, strict)) return std::nullopt;
+    EbFold f;
+    std::vector<WeightedPayee> payees = project(v, &f.unresolved);
+    std::vector<u64> amt = split_reward(reward, payees);
+    for (std::size_t i = 0; i < payees.size(); ++i)
+        if (amt[i] > 0) f.credit[payees[i].key] += amt[i];
+    f.source = eb_source_of(v);
+    f.next_pos = v.next_pos;
+    return f;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -456,8 +615,11 @@ public:
         for (const auto& [k, v] : payout) if (v != 0) p.payout[k] = v;
         m_eo_index.on_found(p.payout,                 // R3: eo -= payout (fe frozen)
                             [this](const bytes32& k) { return fe_at(k); });
-        m_pending.emplace(bid, std::move(p));
-        bump();
+        auto ins = m_pending.emplace(bid, std::move(p));
+        // The leaf carries the NORMALIZED maps the ledger kept (zero rows
+        // already dropped above), not the raw arguments.
+        bump(owedevent::found_payload(bid, ins.first->second.credit,
+                                      ins.first->second.payout));
     }
 
     // ── RDWR-OQ2 wiring: FOUND(b) with the gated sub-threshold estimator folded
@@ -501,7 +663,9 @@ public:
         m_settled.insert(bid);
         rearm_first_eligible(bin_height);
         prune_finalized_zero_rows();                          // R3: drop 0/unarmed rows
-        bump();
+        // FINALIZE consumes only (bid, bin_height); the amounts came from the
+        // pending row the ledger already held, so the leaf carries no maps.
+        bump(owedevent::finalize_payload(bid, bin_height));
     }
 
     // ── ORPHAN(b): a pure disposition of the pending state, or a priced
@@ -521,7 +685,11 @@ public:
             m_eo_index.on_orphan_pre(it->second.payout,  // R3: eo += payout
                                      [this](const bytes32& k) { return fe_at(k); });
             m_pending.erase(it);   // pre-SETTLED: pure key removal
-            bump();
+            // The settled_payout argument is IGNORED on this branch, so it is
+            // kept out of the leaf too: two nodes whose ledgers are identical
+            // must not commit different roots because one caller passed {} and
+            // the other passed the payout map.
+            bump(owedevent::orphan_pre_payload(bid));
             return;
         }
         if (m_settled.count(bid)) {
@@ -531,7 +699,8 @@ public:
                 m_residual += residual;
                 m_residual_events.push_back({bid, residual});
             }
-            bump();  // surfaced as a ledger event; finalW untouched (terminal)
+            // surfaced as a ledger event; finalW untouched (terminal)
+            bump(owedevent::orphan_settled_payload(bid, settled_payout));
         }
     }
 
@@ -638,10 +807,48 @@ public:
     std::size_t pending_count() const { return m_pending.size(); }
     const Amounts& finalW() const { return m_finalW; }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // ★ THE OWED-EVENT MMR — the append-only authenticated record of this
+    // ledger's HISTORY, beside (never instead of) owed_digest().
+    //
+    // ADDITIVE AND ALWAYS-ON: computing and exposing this root changes no
+    // existing commitment. owed_digest() above is untouched — same body, same
+    // "V37O" tag, same anchors (b4db1ded... empty; 87c5249a... the V37.1
+    // gate-ON ridge cut). The w5 StateCommitment tree only carries this root
+    // when the compile-time gate V37_OWED_EVENT_MMR_COMMIT is 1, which it is
+    // not by default.
+    //
+    // CONVERGENCE BY CONSTRUCTION: bump() is private and is the ONLY way
+    // m_seq advances, and it cannot advance without appending exactly one
+    // leaf. So leaf_count() == ledger_seq() always, the append order is the
+    // mutation order, and two ledgers handed the same events in the same order
+    // append the same leaves and bag the same root — there is no separate
+    // "record the event" step that could be skipped, reordered or duplicated.
+    // (LIVE cross-node convergence additionally requires that both nodes SEE
+    // the same events; for a non-winning peer that is what the S-1c cut
+    // descriptor propagation supplies, and it is out of this module's scope.)
+    // ─────────────────────────────────────────────────────────────────────
+    bytes32 owed_event_mmr_root() const { return m_evlog.root(); }
+    u64 owed_event_leaf_count() const { return m_evlog.leaf_count(); }
+    const ::v37::PeakSet& owed_event_peaks() const { return m_evlog.peaks(); }
+    const owedevent::OwedEventLog& owed_event_log() const { return m_evlog; }
+    // The structural invariant, as a checkable predicate (asserted by the KAT
+    // and by w6 recovery, never assumed).
+    bool owed_event_log_consistent() const {
+        return m_evlog.consistent() && m_evlog.leaf_count() == m_seq;
+    }
+
 private:
     struct Pending { Amounts credit; Amounts payout; };
 
-    void bump() { ++m_seq; }
+    // The ONLY sequence advance. It mints the record-log leaf for the mutation
+    // in the same step, so "one leaf per ledger_seq increment" is not a
+    // convention a future edit can drift away from — there is no bump() that
+    // records nothing.
+    void bump(const std::vector<std::uint8_t>& leaf_payload) {
+        m_evlog.append_payload(leaf_payload);
+        ++m_seq;
+    }
 
     // Re-arm/disarm first_eligible: a key whose EffectiveOwed just went from
     // <=0 to >0 is armed at `bin_height` (its age start); a key back at <=0 is
@@ -698,7 +905,54 @@ private:
     std::vector<std::pair<std::string, long long>> m_residual_events;
     detail::EffectiveOwedIndex m_eo_index;         // R3: incremental EffectiveOwed + ordered view
     mutable detail::DigestMemo m_digest_memo;      // R3: seq-keyed owed_digest memo
+    owedevent::OwedEventLog m_evlog;               // owed-event MMR (additive; see bump())
 };
+
+// ─────────────────────────────────────────────────────────────────────────
+// ★★ S-1 (Track A2) — THE EMISSION SURFACE. S-1 does NOT recompute the owed
+// commitment. It EMITS OwedLedger::owed_digest() of the very ledger object the
+// S8 fold populated — one value, read once, carried to whichever template leg
+// this lane rides:
+//   BTC / DASH : the "V37S" summary leaf of w5_coinbase's StateCommitment,
+//                whose Merkle root is committed in the coinbase at TEMPLATE
+//                time (whitepaper §13), before the block hash is fixed.
+//   XMR        : the merge-mining leaf (0x03 MM tag) via
+//                xmr_o2_settlement_source's lane_commitment_from_owed_digest.
+// Because both legs read the SAME accessor of the SAME object, S8 ≡ S-1 is
+// automatic; the only way to break it is to emit at a DIFFERENT ledger state
+// than the one the cut was taken at. emit_owed_at_cut() is the guard against
+// exactly that: it refuses (nullopt, a hard refusal) unless the ledger still
+// stands at the cut's (chain, ledger_seq, owed_digest). A template built on a
+// refusal is simply not built this tick — never built on a stale commitment.
+// ──────────────────────────────────────────────────────────────────────
+
+struct OwedEmission {
+    ::v37::ChainId chain = 0;
+    u64            ledger_seq = 0;
+    bytes32        owed_digest{};   // == OwedLedger::owed_digest() at ledger_seq
+    bool operator==(const OwedEmission&) const = default;
+};
+
+// The unconditional read — the value S-1 emits. Never recomputes: it is the
+// ledger's own accessor, memoized on the ledger's seq.
+inline OwedEmission emit_owed(const OwedLedger& ledger) {
+    OwedEmission e;
+    e.chain       = ledger.chain();
+    e.ledger_seq  = ledger.ledger_seq();
+    e.owed_digest = ledger.owed_digest();
+    return e;
+}
+
+// The cut-BOUND read — what a template build must use. Refuses unless the
+// ledger is still exactly where the O2 cut token found it.
+inline std::optional<OwedEmission> emit_owed_at_cut(const OwedLedger& ledger,
+                                                    const CutToken& cut) {
+    const OwedEmission e = emit_owed(ledger);
+    if (e.chain != cut.chain) return std::nullopt;
+    if (e.ledger_seq != cut.ledger_seq) return std::nullopt;
+    if (e.owed_digest != cut.owed_digest) return std::nullopt;
+    return e;
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // The O2 consistent-cut read (§6.3), lock-free. Reads the lane leg at the

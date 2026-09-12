@@ -142,6 +142,59 @@ struct U256 {
         return out;
     }
 
+    // ── S4 width-law primitives (v37; float-free, deterministic) ─────
+    // NONE of the two below is used by any decay-table or lane digest path;
+    // they are ADD-ONLY member functions (U256's only data member, `v`, is
+    // untouched), so the golden decay table (d659c801) and the gate-OFF lane
+    // digest (KAT-0, 2479d5b6) are byte-identical with or without them.
+
+    // (*this * m) as the LOW 256 bits — the mul_q limb loop WITHOUT the
+    // >> FRAC_BITS. This is the integer width-law numerator step
+    // (D_net * coverage_blocks, then * W_cur). Any carry out of bit 255 is
+    // dropped: a documented truncation that never fires for parent-chain-scale
+    // difficulty (D_net * coverage_blocks * W_cur stays far below 2^256),
+    // pinned by KAT-TW-INT.
+    U256 mul_small(u64 m) const {
+        U256 out;
+        u128 carry = 0;
+        for (int i = 0; i < 4; ++i) {
+            u128 p = u128(v[i]) * m + carry;
+            out.v[i] = static_cast<u64>(p);
+            carry = p >> 64;
+        }
+        // carry (bits >= 256) intentionally dropped — see truncation note.
+        return out;
+    }
+
+    // floor(*this / divisor), truncating toward zero, returned as u64.
+    // Saturates to UINT64_MAX when the true quotient exceeds 64 bits — a range
+    // the width law then clamps down to w_max_bins, so the saturation is
+    // deterministic and harmless. Schoolbook binary long division: the running
+    // remainder is always < divisor (< 2^128), so `rem << 1` never loses a bit
+    // inside the 256-bit accumulator. divisor == 0 returns 0 (the width-law
+    // caller routes raw_total == 0 to the W_default fail-safe BEFORE calling;
+    // this is a defensive floor, never a silent divide).
+    u64 div_u128_to_u64(u128 divisor) const {
+        if (divisor == 0) return 0;
+        const U256 dv = U256::from_u128(divisor);
+        U256 rem;              // running remainder, always < dv (< 2^128)
+        u64  q  = 0;           // low 64 bits of the quotient
+        bool hi = false;       // set iff a quotient bit at index >= 64 is 1
+        for (int i = 255; i >= 0; --i) {
+            // rem <<= 1 across the four limbs (rem < 2^128 => no loss)
+            rem.v[3] = (rem.v[3] << 1) | (rem.v[2] >> 63);
+            rem.v[2] = (rem.v[2] << 1) | (rem.v[1] >> 63);
+            rem.v[1] = (rem.v[1] << 1) | (rem.v[0] >> 63);
+            rem.v[0] = (rem.v[0] << 1) | ((v[i >> 6] >> (i & 63)) & 1u);
+            if (!(rem < dv)) {          // rem >= dv
+                rem -= dv;
+                if (i < 64) q |= (u64(1) << i);
+                else        hi = true;
+            }
+        }
+        return hi ? ~u64(0) : q;
+    }
+
     std::string hex() const {
         static const char* d = "0123456789abcdef";
         std::string s;

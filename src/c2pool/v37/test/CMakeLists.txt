@@ -326,6 +326,119 @@ if (BUILD_TESTING)
         add_test(NAME v37_xmr_o2_randomx_kat COMMAND v37_xmr_o2_randomx_kat)
     endif()
 
+    # ------------------------------------------------------------------
+    # M2 — the option-B settlement coinbase, built from the NATIVE arm.
+    #
+    #   v37_xmr_m2_native_settlement_kat
+    #     Runs the thing that actually serves miners: the C4 seam bound to
+    #     NativeMinerDataSource, XmrSettlementTemplateProvider above it, and the
+    #     whole-block assembler under that -- then judges the result by
+    #     RE-PARSING the assembled block's miner_tx (K_fair owed order, exact-sum
+    #     residual sink, owed_digest under the tx_extra 0x03 tag), proves the two
+    #     arms build the same block from the miner_tx onward, and proves the
+    #     native template path never touches the transport.
+    #
+    #     Heaviest of the v37 consumer KATs and deliberately so: it links
+    #     `xmr_template` (the p2pool whole-block template port), compiles the X6
+    #     executor (settle/xmr_coinbase.cpp) and the ed25519 point-check
+    #     registrar, because a settlement coinbase that is not actually derived
+    #     is not the thing M2 claims to have preserved. Both are already on the
+    #     non-sanitizer leg through c2pool-v37-xmr; the sanitizer leg picks them
+    #     up here, which is the point -- the option-B assembler had no ASan/UBSan
+    #     coverage before this target.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_m2_native_settlement_kat
+        v37_xmr_m2_native_settlement_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_m2_native_settlement_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_m2_native_settlement_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    # V37_XMR_HAVE_MONERO_CRYPTO makes the descriptor point check LIVE, so the
+    # payees in the fixture are validated rather than waved through. Link
+    # xmr_template EXACTLY ONCE and never define
+    # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES here (that ODR path is KAT-only
+    # and belongs to the target that does not link the library).
+    target_compile_definitions(v37_xmr_m2_native_settlement_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_m2_native_settlement_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_m2_native_settlement_kat COMMAND v37_xmr_m2_native_settlement_kat)
+
+    # ------------------------------------------------------------------
+    # M3 — R-ARMORDER, the switchable FIND path.
+    #
+    #   v37_xmr_m3_arm_order_kat
+    #     Pins BOTH positions of the switch against one counting monerod
+    #     transport. daemon-first must still build the X2 adapter and TOUCH the
+    #     daemon (a zero there would be the default path having broken, not M3
+    #     having worked); p2p-first must build no adapter and make EXACTLY ZERO
+    #     touches across bring-up and a complete FOUND -> SETTLED driven by a
+    #     pumped native chain. It also pins the fail-closed rules: the arm-order
+    #     preconditions as a pure function, bring_up refusing p2p-first with no
+    #     canonical test installed, and the levin publisher refusing to push a
+    #     FOUND event for a block that reached no peer.
+    #
+    #     No sockets, no RandomX, no live daemon -- it links xmr_node for the
+    #     node + X2 adapter and xmr_coin for the keccak and block parsing C5
+    #     needs, and injects a test point-check rather than the ref10 registrar.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_m3_arm_order_kat v37_xmr_m3_arm_order_kat.cpp)
+    target_compile_features(v37_xmr_m3_arm_order_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_m3_arm_order_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_m3_arm_order_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_m3_arm_order_kat COMMAND v37_xmr_m3_arm_order_kat)
+
+    # ------------------------------------------------------------------
+    # c2pool#1551 -- the SAME-HEIGHT double-block refusal, decided prefer-own
+    # within bounds.
+    #
+    #   v37_xmr_prefer_own_race_kat
+    #     Pins the credit table for a height carrying two blocks, one of them
+    #     ours: unburied refuses everybody, buried credits ours ONLY if the
+    #     chain kept it, an orphan of ours credits NOTHING, a stranger's block
+    #     credits NOTHING, and a height credits at most once (R-7).
+    #
+    #     The property that makes the bound real is run, not asserted in prose:
+    #     the same fixture is decided under BOTH tie-break policies and the
+    #     verdicts must be identical while the nominations differ -- so
+    #     prefer-own demonstrably moves the lever and cannot reach the ledger.
+    #
+    #     Suites E and F drive the REAL XmrNode + FinalizeConnect over a pumped
+    #     native chain: E is one node winning, losing and sitting out a fork; F
+    #     is two nodes racing each other at one height, where the winner credits
+    #     once, the loser fabricates nothing, and the fleet-wide credited set has
+    #     exactly one entry. No sockets, no RandomX, no daemon.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_prefer_own_race_kat v37_xmr_prefer_own_race_kat.cpp)
+    target_compile_features(v37_xmr_prefer_own_race_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_prefer_own_race_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_prefer_own_race_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_prefer_own_race_kat COMMAND v37_xmr_prefer_own_race_kat)
+
     # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.
     # Proves the gap the Phase-B single-node daemon had: node B accounts node A's
     # shares. Wires the SAME production consumer code the daemon does — the W3
@@ -392,4 +505,71 @@ if (BUILD_TESTING)
     target_include_directories(v37_w4_owed_incremental_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w4_owed_incremental_test Threads::Threads)
     add_test(NAME v37_w4_owed_incremental_test COMMAND v37_w4_owed_incremental_test)
+
+    # Track A2 / S-1 — LIVE FOLD-WIRING KAT (btc/btc_node.hpp on_block_won ->
+    # settle::fold_eb -> FoundBlock -> the F1 driver -> owed_digest). Pins that
+    # the live DRIVER path, on a FIXED event stream, moves owed_digest OFF the
+    # empty sha256d("V37O") anchor b4db1ded…; that two independent stacks fed
+    # that stream CONVERGE on the same digest; that credit and payout stay
+    # DISTINCT maps; and — the regression pin — that the pre-S-1 "assembly as
+    # credit" shape reproduces the anchor. Also pins that both refuse-LOUD paths
+    # (reward == 0, non-ratified geometry) still REGISTER the block. Stdlib +
+    # Threads (the engine's executor thread), MockCoinBackend + MemSettleStore:
+    # no coin lib, no sockets, no clocks. SAME HOLLOW-GREEN GUARD as the sibling
+    # suites: ALSO listed on BOTH build.yml --target lists (the Linux x86_64 leg
+    # and the ASan+UBSan leg) so CI compiles + RUNS it instead of registering a
+    # NOT_BUILT CTest sentinel (the DGB #137 / #769 / c2pool#1539 unregistered-
+    # KAT class), and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_s1_live_wiring_kat v37_s1_live_wiring_kat.cpp)
+    target_compile_features(v37_s1_live_wiring_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_s1_live_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_s1_live_wiring_kat Threads::Threads)
+    add_test(NAME v37_s1_live_wiring_kat COMMAND v37_s1_live_wiring_kat)
+
+    # Track A2 / S-1c — CROSS-NODE owed_digest CONVERGENCE KAT. S-1 made the
+    # node that MINED a block credit E_b; its PEERS still knew nothing about the
+    # block, so two nodes on the byte-identical carrier stream committed to
+    # DIFFERENT owed ledgers (A non-empty, B at the b4db1ded... anchor) — a
+    # settlement fork. This pins the fix: the winner names its fold in the wire
+    # v0x02 flat cut descriptor (w3_relay.hpp CutDescriptor), the receiver
+    # re-runs settle::fold_eb at THAT prefix through XbtcNode::on_peer_block_won
+    # and drives the EXISTING on_block_found/on_block_finalized API, and both
+    # nodes FINALIZE at the same bin_height on the same owed_digest. Also pins
+    # the defect itself (case 3: no descriptor -> A != B), the CUT RULE being
+    # load-bearing (fold(P) != fold(P+1)), every fail-closed refusal, the
+    # double-drive guard, and the v0x02 wire bytes. Stdlib + Threads (the
+    # engine's executor thread), MockCoinBackend + MemSettleStore: no coin lib,
+    # no sockets, no clocks. SAME HOLLOW-GREEN GUARD as the sibling suites: ALSO
+    # listed on BOTH build.yml --target lists (the Linux x86_64 leg and the
+    # ASan+UBSan leg) so CI compiles + RUNS it instead of registering a NOT_BUILT
+    # CTest sentinel (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class),
+    # and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_s1c_convergence_kat v37_s1c_convergence_kat.cpp)
+    target_compile_features(v37_s1c_convergence_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_s1c_convergence_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_s1c_convergence_kat Threads::Threads)
+    add_test(NAME v37_s1c_convergence_kat COMMAND v37_s1c_convergence_kat)
+
+    # Track A2 / W4-W6 — the OWED-EVENT MMR: an append-only authenticated record
+    # log (src/c2pool/v37/record_log.hpp, instanced by owed_event_log.hpp) built
+    # on the SHIPPED ::v37::Lane MMR statics, maintained inside OwedLedger, made
+    # durable by w6, and committed into the w5 StateCommitment tree only behind a
+    # gate that is OFF by default. The KAT pins, in one binary: the mirrored leaf
+    # rule against a hand-built digest and against w5's own mirror; the
+    # primitive's inclusion + prefix proofs (verified by ::v37::Lane::mmr_verify)
+    # and its fail-closed codec; the record-log goldens over a fixed schedule and
+    # the leaf_count == ledger_seq invariant; convergence by construction (two
+    # independent ledgers, same events, identical root) with a non-vacuous
+    # negative control; a journal + recovery round-trip including a corrupted and
+    # an absent head; and the gate itself — gate OFF reproduces goldens minted on
+    # PRISTINE MASTER byte-for-byte, gate ON produces the pinned new root. It
+    # passes in BOTH build modes (with and without -DV37_OWED_EVENT_MMR_COMMIT=1).
+    # Stdlib + Threads (w4 pulls in v37_engine). SAME HOLLOW-GREEN GUARD as the
+    # sibling suites: ALSO listed on BOTH build.yml --target lists so CI compiles
+    # + runs it, not a NOT_BUILT CTest sentinel.
+    add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)
+    target_compile_features(v37_owed_event_mmr_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_owed_event_mmr_kat Threads::Threads)
+    add_test(NAME v37_owed_event_mmr_kat COMMAND v37_owed_event_mmr_kat)
 endif()
