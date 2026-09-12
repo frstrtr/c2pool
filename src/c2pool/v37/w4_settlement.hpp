@@ -64,6 +64,7 @@
 #include <sharechain/v37/v37_fixed.hpp>          // U256, u64
 #include <sharechain/v37/v37_hash.hpp>           // bytes32, sha256d
 #include <c2pool/v37/w4_owed_incremental.hpp>    // R3: DigestMemo, EffectiveOwedIndex
+#include <c2pool/v37/owed_event_log.hpp>         // owed-event MMR: the record log BESIDE owed_digest
 
 namespace c2pool::v37n::settle {
 
@@ -614,8 +615,11 @@ public:
         for (const auto& [k, v] : payout) if (v != 0) p.payout[k] = v;
         m_eo_index.on_found(p.payout,                 // R3: eo -= payout (fe frozen)
                             [this](const bytes32& k) { return fe_at(k); });
-        m_pending.emplace(bid, std::move(p));
-        bump();
+        auto ins = m_pending.emplace(bid, std::move(p));
+        // The leaf carries the NORMALIZED maps the ledger kept (zero rows
+        // already dropped above), not the raw arguments.
+        bump(owedevent::found_payload(bid, ins.first->second.credit,
+                                      ins.first->second.payout));
     }
 
     // ── RDWR-OQ2 wiring: FOUND(b) with the gated sub-threshold estimator folded
@@ -659,7 +663,9 @@ public:
         m_settled.insert(bid);
         rearm_first_eligible(bin_height);
         prune_finalized_zero_rows();                          // R3: drop 0/unarmed rows
-        bump();
+        // FINALIZE consumes only (bid, bin_height); the amounts came from the
+        // pending row the ledger already held, so the leaf carries no maps.
+        bump(owedevent::finalize_payload(bid, bin_height));
     }
 
     // ── ORPHAN(b): a pure disposition of the pending state, or a priced
@@ -679,7 +685,11 @@ public:
             m_eo_index.on_orphan_pre(it->second.payout,  // R3: eo += payout
                                      [this](const bytes32& k) { return fe_at(k); });
             m_pending.erase(it);   // pre-SETTLED: pure key removal
-            bump();
+            // The settled_payout argument is IGNORED on this branch, so it is
+            // kept out of the leaf too: two nodes whose ledgers are identical
+            // must not commit different roots because one caller passed {} and
+            // the other passed the payout map.
+            bump(owedevent::orphan_pre_payload(bid));
             return;
         }
         if (m_settled.count(bid)) {
@@ -689,7 +699,8 @@ public:
                 m_residual += residual;
                 m_residual_events.push_back({bid, residual});
             }
-            bump();  // surfaced as a ledger event; finalW untouched (terminal)
+            // surfaced as a ledger event; finalW untouched (terminal)
+            bump(owedevent::orphan_settled_payload(bid, settled_payout));
         }
     }
 
@@ -796,10 +807,48 @@ public:
     std::size_t pending_count() const { return m_pending.size(); }
     const Amounts& finalW() const { return m_finalW; }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // ★ THE OWED-EVENT MMR — the append-only authenticated record of this
+    // ledger's HISTORY, beside (never instead of) owed_digest().
+    //
+    // ADDITIVE AND ALWAYS-ON: computing and exposing this root changes no
+    // existing commitment. owed_digest() above is untouched — same body, same
+    // "V37O" tag, same anchors (b4db1ded... empty; 87c5249a... the V37.1
+    // gate-ON ridge cut). The w5 StateCommitment tree only carries this root
+    // when the compile-time gate V37_OWED_EVENT_MMR_COMMIT is 1, which it is
+    // not by default.
+    //
+    // CONVERGENCE BY CONSTRUCTION: bump() is private and is the ONLY way
+    // m_seq advances, and it cannot advance without appending exactly one
+    // leaf. So leaf_count() == ledger_seq() always, the append order is the
+    // mutation order, and two ledgers handed the same events in the same order
+    // append the same leaves and bag the same root — there is no separate
+    // "record the event" step that could be skipped, reordered or duplicated.
+    // (LIVE cross-node convergence additionally requires that both nodes SEE
+    // the same events; for a non-winning peer that is what the S-1c cut
+    // descriptor propagation supplies, and it is out of this module's scope.)
+    // ─────────────────────────────────────────────────────────────────────
+    bytes32 owed_event_mmr_root() const { return m_evlog.root(); }
+    u64 owed_event_leaf_count() const { return m_evlog.leaf_count(); }
+    const ::v37::PeakSet& owed_event_peaks() const { return m_evlog.peaks(); }
+    const owedevent::OwedEventLog& owed_event_log() const { return m_evlog; }
+    // The structural invariant, as a checkable predicate (asserted by the KAT
+    // and by w6 recovery, never assumed).
+    bool owed_event_log_consistent() const {
+        return m_evlog.consistent() && m_evlog.leaf_count() == m_seq;
+    }
+
 private:
     struct Pending { Amounts credit; Amounts payout; };
 
-    void bump() { ++m_seq; }
+    // The ONLY sequence advance. It mints the record-log leaf for the mutation
+    // in the same step, so "one leaf per ledger_seq increment" is not a
+    // convention a future edit can drift away from — there is no bump() that
+    // records nothing.
+    void bump(const std::vector<std::uint8_t>& leaf_payload) {
+        m_evlog.append_payload(leaf_payload);
+        ++m_seq;
+    }
 
     // Re-arm/disarm first_eligible: a key whose EffectiveOwed just went from
     // <=0 to >0 is armed at `bin_height` (its age start); a key back at <=0 is
@@ -856,6 +905,7 @@ private:
     std::vector<std::pair<std::string, long long>> m_residual_events;
     detail::EffectiveOwedIndex m_eo_index;         // R3: incremental EffectiveOwed + ordered view
     mutable detail::DigestMemo m_digest_memo;      // R3: seq-keyed owed_digest memo
+    owedevent::OwedEventLog m_evlog;               // owed-event MMR (additive; see bump())
 };
 
 // ─────────────────────────────────────────────────────────────────────────

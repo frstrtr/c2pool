@@ -38,6 +38,7 @@
 #include <vector>
 
 #include <c2pool/v37/w4_settlement.hpp>          // OwedLedger, CutToken (W4)
+#include <c2pool/v37/record_log.hpp>             // the owed-event MMR commit gate (OFF by default)
 #include <sharechain/v37/v37_descriptor.hpp>     // ScriptRef, ScriptKind
 #include <sharechain/v37/v37_fixed.hpp>          // u64
 #include <sharechain/v37/v37_hash.hpp>           // bytes32, sha256d
@@ -166,15 +167,35 @@ struct AssembledOutput {
 //   [0] summary leaf  "V37S" || chain(u64 LE) || ledger_seq(u64 LE)
 //                          || num_balances(u64 LE) || owed_digest(32)
 //   [1..] balance leaves "V37E" || key(32) || balance(u64 LE), key ASC.
+//   [last, GATED, OFF by default] owed-event MMR leaf
+//                        "V37M" || leaf_count(u64 LE) || owed_event_mmr_root(32)
+//
+// ── THE GATED LEAF (a flag day, held OFF) ────────────────────────────────
+// Appending the "V37M" leaf MOVES root(), which is the value every node
+// commits in its coinbase: it is a consensus activation, not a refactor. So it
+// is guarded by the compile-time gate recordlog::kCommitOwedEventMmrDefault
+// (-DV37_OWED_EVENT_MMR_COMMIT=1), which is 0 unless the operator flips it. With
+// the gate OFF this class is byte-identical to master: the leaf vector, the
+// leaf order, the promote-odd tree and therefore root() are unchanged, and the
+// KAT pins that against goldens minted on pristine master. With the gate ON the
+// leaf is APPENDED LAST, so leaf [0] stays the summary and [1..n] stay the
+// balances — existing balance-proof INDICES do not move, only the root does.
 // ─────────────────────────────────────────────────────────────────────────
 
 class StateCommitment {
 public:
     // Build from W4's ledger. Balances are the FINALIZED partition (finalW),
     // the same rows W4's owed_digest commits — positive rows only, key ASC.
-    StateCommitment(const OwedLedger& ledger, u64 chain)
+    // `commit_owed_event_mmr` defaults to the gate (OFF); the KAT passes it
+    // explicitly to mint and pin the gate-ON golden without a second build.
+    StateCommitment(const OwedLedger& ledger, u64 chain,
+                    bool commit_owed_event_mmr =
+                        ::c2pool::v37n::recordlog::kCommitOwedEventMmrDefault)
         : m_chain(chain), m_ledger_seq(ledger.ledger_seq()),
-          m_owed_digest(ledger.owed_digest()) {
+          m_owed_digest(ledger.owed_digest()),
+          m_owed_event_mmr_root(ledger.owed_event_mmr_root()),
+          m_owed_event_leaf_count(ledger.owed_event_leaf_count()),
+          m_has_mmr_leaf(commit_owed_event_mmr) {
         std::vector<std::pair<bytes32, u64>> rows;
         for (const auto& [k, w] : ledger.finalW())
             if (w > 0) rows.emplace_back(k, static_cast<u64>(w));
@@ -207,6 +228,18 @@ public:
             m_leaves.push_back(leaf_hash(p));
             m_keys.push_back(k);
         }
+        m_balance_end = m_leaves.size();   // one past the last balance leaf
+        // [last] the GATED owed-event MMR leaf. OFF by default -> not appended
+        // -> root() is byte-identical to master.
+        if (m_has_mmr_leaf) {
+            std::vector<std::uint8_t> p;
+            const char tag[4] = {'V', '3', '7', 'M'};
+            p.insert(p.end(), tag, tag + 4);
+            put_u64(p, m_owed_event_leaf_count);
+            p.insert(p.end(), m_owed_event_mmr_root.begin(), m_owed_event_mmr_root.end());
+            m_leaves.push_back(leaf_hash(p));
+            m_keys.push_back(bytes32{});   // the MMR leaf has no balance key
+        }
     }
 
     // The state root committed in the coinbase (whitepaper §13).
@@ -222,12 +255,21 @@ public:
     u64     ledger_seq()  const { return m_ledger_seq; }
     u64     chain()       const { return m_chain; }
 
+    // ★ The owed-event MMR the ledger stood at when this commitment was built.
+    // These are ALWAYS readable (the ledger always maintains the log); whether
+    // the value is COMMITTED in root() is what the gate decides.
+    bytes32 owed_event_mmr_root() const { return m_owed_event_mmr_root; }
+    u64     owed_event_leaf_count() const { return m_owed_event_leaf_count; }
+    bool    commits_owed_event_mmr() const { return m_has_mmr_leaf; }
+
     // Inclusion proof for one balance key. Fills the leaf hash and a
     // Lane::MerkleProof that ::v37::Lane::verify_proof accepts against root().
     // Returns false if the key has no positive finalized balance.
     bool prove(const bytes32& key, bytes32& leaf_out,
                ::v37::Lane::MerkleProof& proof_out) const {
-        for (std::size_t i = 1; i < m_keys.size(); ++i) {  // skip [0] summary
+        // Bounded by m_balance_end so the gated trailing "V37M" leaf (also
+        // keyed with an empty bytes32) can never be returned as a balance.
+        for (std::size_t i = 1; i < m_balance_end; ++i) {  // skip [0] summary
             if (m_keys[i] == key) {
                 leaf_out = m_leaves[i];
                 proof_out = make_proof(m_leaves, static_cast<u64>(i));
@@ -295,6 +337,10 @@ private:
     u64     m_chain = 0;          // S-1: the values committed in leaf [0],
     u64     m_ledger_seq = 0;     // read ONCE at construction so the emission
     bytes32 m_owed_digest{};      // and the accessors cannot disagree
+    bytes32 m_owed_event_mmr_root{};   // the record-log root at the same cut
+    u64     m_owed_event_leaf_count = 0;
+    bool    m_has_mmr_leaf = false;    // gate: is it COMMITTED in root()?
+    std::size_t m_balance_end = 0;     // one past the last balance leaf
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -311,10 +357,11 @@ private:
 // directly is building against "now", which at template time is a race.
 // ─────────────────────────────────────────────────────────────────────────
 inline std::optional<StateCommitment> state_commitment_at_cut(
-    const OwedLedger& ledger, const ::c2pool::v37n::settle::CutToken& cut) {
+    const OwedLedger& ledger, const ::c2pool::v37n::settle::CutToken& cut,
+    bool commit_owed_event_mmr = ::c2pool::v37n::recordlog::kCommitOwedEventMmrDefault) {
     const auto e = ::c2pool::v37n::settle::emit_owed_at_cut(ledger, cut);
     if (!e) return std::nullopt;                       // the ledger moved
-    StateCommitment sc(ledger, static_cast<u64>(cut.chain));
+    StateCommitment sc(ledger, static_cast<u64>(cut.chain), commit_owed_event_mmr);
     // Defence in depth: the object must have committed the cut's value. This
     // can only fire if the ledger mutated BETWEEN the check and the build, in
     // which case emitting would be the fork — so refuse instead.
