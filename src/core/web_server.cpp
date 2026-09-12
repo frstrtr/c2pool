@@ -5686,6 +5686,21 @@ nlohmann::json MiningInterface::rest_config_schema()
     return nlohmann::json{{"error", "config schema endpoint not wired"}};
 }
 
+nlohmann::json MiningInterface::rest_config_apply(const std::string& body)
+{
+    // Slice A (#157): route the POST body through the installed gated-apply fn
+    // (control token + two-phase money nonce + AddressValidator + tripwire).
+    // Unwired => the caller (http_session) never reaches here; it answers 503.
+    if (m_config_apply_fn) {
+        auto j = m_config_apply_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"armed", false},
+        {"error", "config-apply not armed; runtime mutation is operator-gated"},
+        {"http_status", 503}};
+}
+
 nlohmann::json MiningInterface::rest_node_topology()
 {
     // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer
