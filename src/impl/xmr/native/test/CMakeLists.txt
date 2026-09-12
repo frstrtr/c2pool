@@ -659,4 +659,51 @@ if (BUILD_TESTING)
     target_compile_features(xmr_native_m4_soak_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_m4_soak_kat COMMAND xmr_native_m4_soak_kat)
 
+    # ------------------------------------------------------------------
+    # M4 leg 1 -- the P-TPL backlog GATE, and the stall it caused.
+    #
+    #   xmr_native_m4_ptpl_backlog_gate_kat -- the live stagenet sample that
+    #   held the M4 graduation streak at zero for two thousand consecutive
+    #   samples on a healthy node ("tx_backlog_count served=0 shadow=5", seam
+    #   TEMPLATE, one constraint violated) driven through the REAL ParityOracle
+    #   in the REAL posture, and required to come out CLEAN -- with both
+    #   by-design differences still rendered in the diff, so the sample is not
+    #   made clean by hiding anything. It then runs the same stream through the
+    #   M4GraduationLedger and requires the clean streak to climb past the
+    #   stagenet threshold, which is the stall itself expressed as a number.
+    #
+    #   The negative control is the other half and matters as much: one unit in
+    #   each of the six template consensus inputs in turn must still FAIL (or
+    #   VOID, for the alignment key), the sentinels must still revoke, and two
+    #   entirely DISJOINT transaction pools must still be CLEAN, because that
+    #   difference is what the v37 relay rule creates on purpose. M2h is checked
+    #   to be intact in the posture it was written for: a native arm that SERVES
+    #   empty templates while the daemon holds transactions still refuses.
+    #
+    # Links xmr_coin (block identity) and xmr_node (the production get_miner_data
+    # types) -- the same LIGHT link as xmr_native_backlog_famine_kat. No RandomX,
+    # no sockets, no daemon, no clock of its own.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml. A target registered with add_test but never
+    # built reports "***Not Run" and exits 8 -- the #1539 lesson.
+    add_executable(xmr_native_m4_ptpl_backlog_gate_kat xmr_m4_ptpl_backlog_gate_kat.cpp)
+    target_include_directories(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE xmr_coin xmr_node)
+    target_compile_features(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_m4_ptpl_backlog_gate_kat
+             COMMAND xmr_native_m4_ptpl_backlog_gate_kat)
+
 endif()
