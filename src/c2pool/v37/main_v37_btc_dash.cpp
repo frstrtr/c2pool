@@ -186,9 +186,11 @@ static std::string hex32(const ::v37::bytes32& b) {
 
 static void usage() {
     std::printf(
-        "c2pool-v37-btc-dash (EXPERIMENTAL; DASH regtest/devnet ONLY; do not run in production)\n"
-        "  --network regtest|devnet|mainnet   (default regtest; mainnet REFUSED without --i-understand-mainnet)\n"
-        "  --daemon-rpc HOST:PORT             (default 127.0.0.1:19898 — Dash Core REGTEST rpc port)\n"
+        "c2pool-v37-btc-dash (EXPERIMENTAL; DASH regtest/devnet/testnet ONLY; do not run in production)\n"
+        "  --network regtest|devnet|testnet|mainnet\n"
+        "                                     (default regtest; mainnet REFUSED without --i-understand-mainnet)\n"
+        "  --daemon-rpc HOST:PORT             (default 127.0.0.1:19898 — Dash Core REGTEST rpc port;\n"
+        "                                     127.0.0.1:19998 under --network testnet unless given here)\n"
         "  --coin-rpc-auth PATH               dash.conf-style file with rpcuser/rpcpassword (default ~/.dashcore/dash.conf)\n"
         "  --stratum-bind HOST:PORT           (default 127.0.0.1:3032)\n"
         "  --settle-db PATH                   (default ./v37data/dash/<net>/v37_settle_db)\n"
@@ -214,6 +216,7 @@ int main(int argc, char** argv) {
     cfg.network = BtcNetwork::Regtest;
     std::string rpc_hostport = "127.0.0.1:19898";   // S-6: btc_node_config.hpp:87 says 19998 = Dash Core TESTNET;
                                                     // regtest rpc is 19898 (v23.1.7 src/chainparamsbase.cpp:48)
+    bool rpc_hostport_explicit = false;             // --daemon-rpc given? (else the per-network default below)
     std::string auth_path;
     std::string stratum_bind = "127.0.0.1:3032";
     std::string p2p_bind;                 // A2: empty = no inbound carrier bind
@@ -230,10 +233,11 @@ int main(int argc, char** argv) {
             const std::string n = argv[++i];
             if      (n == "regtest") cfg.network = BtcNetwork::Regtest;
             else if (n == "devnet")  cfg.network = BtcNetwork::Devnet;
+            else if (n == "testnet") cfg.network = BtcNetwork::Testnet4;   // DASH has no testnet4; this IS DASH testnet3
             else if (n == "mainnet") cfg.network = BtcNetwork::Mainnet;
             else { usage(); return 2; }
         }
-        else if (!std::strcmp(a, "--daemon-rpc"))                          next(rpc_hostport);
+        else if (!std::strcmp(a, "--daemon-rpc"))                          { next(rpc_hostport); rpc_hostport_explicit = true; }
         else if (!std::strcmp(a, "--coin-rpc-auth"))                       next(auth_path);
         else if (!std::strcmp(a, "--stratum-bind"))                        next(stratum_bind);
         else if (!std::strcmp(a, "--p2p-bind"))                            next(p2p_bind);
@@ -249,6 +253,12 @@ int main(int argc, char** argv) {
         else { usage(); return 2; }
     }
     if (cfg.d_conf == 0 || poll_ms <= 0 || oracle_patience_ms < 0 || carrier_index_patience_ms < 0) { usage(); return 2; }
+    // Per-network RPC default when --daemon-rpc was not given. Dash Core
+    // testnet rpc is 19998, regtest 19898 (v23.1.7 src/chainparamsbase.cpp:
+    // 47-48). NOTE this main never calls btc_node_config.hpp default_endpoint();
+    // the endpoint is this string, then apply_endpoint_override() below.
+    if (!rpc_hostport_explicit && cfg.network == BtcNetwork::Testnet4)
+        rpc_hostport = "127.0.0.1:19998";
     cfg.pow_verify_enabled = true;   // live: the v36 work source verifies X11 itself
     if (cfg.network == BtcNetwork::Mainnet && !cfg.i_understand_mainnet) {
         std::fprintf(stderr, "REFUSED: mainnet without --i-understand-mainnet (HARD SAFETY 4)\n");
@@ -287,9 +297,14 @@ int main(int argc, char** argv) {
     rpc->connect(NetService(conf.host, conf.port), conf.userpass());
 
     DashRpcCoinBackend::Options bopt;
-    bopt.expect_chain    = (cfg.network == BtcNetwork::Regtest) ? "regtest"
-                         : (cfg.network == BtcNetwork::Devnet)  ? "devnet" : "main";
-    bopt.expect_genesis  = (cfg.network == BtcNetwork::Regtest) ? kDashRegtestGenesisHex : "";
+    // Dash Core reports NetworkIDString "test" for -testnet (v23.1.7
+    // src/chainparamsbase.cpp:47, CBaseChainParams::TESTNET). chain_matches()
+    // is exact-match, so Testnet4 must map to "test" and never fall to "main".
+    bopt.expect_chain    = (cfg.network == BtcNetwork::Regtest)  ? "regtest"
+                         : (cfg.network == BtcNetwork::Devnet)   ? "devnet"
+                         : (cfg.network == BtcNetwork::Testnet4) ? "test" : "main";
+    bopt.expect_genesis  = (cfg.network == BtcNetwork::Regtest)  ? kDashRegtestGenesisHex
+                         : (cfg.network == BtcNetwork::Testnet4) ? kDashTestnetGenesisHex : "";
     bopt.oracle_patience = std::chrono::milliseconds(oracle_patience_ms);
     auto backend = std::make_shared<DashRpcCoinBackend>(rpc, bopt);
     if (!backend->wait_ready(std::chrono::seconds(30))) { teardown_io(); return 5; }

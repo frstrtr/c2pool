@@ -128,4 +128,10 @@ if(C2WALLET_QT_BUILD_TESTS)
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_no_network.sh"
                 "$<TARGET_FILE:c2wallet-qt-signer>"
     )
+
+    # ── Family B (Monero) seed/key/address core (M1-X) ──────────────────────
+    # Qt-FREE static lib + KAT executable (c2wallet-monero-seed-test). It links
+    # the vendored Monero crypto directly, not Qt, so the money-correctness KATs
+    # build and run without the signer app. See src/family/monero/CMakeLists.txt.
+    add_subdirectory(src/family/monero)
 endif()
