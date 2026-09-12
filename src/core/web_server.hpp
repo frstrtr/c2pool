@@ -599,6 +599,19 @@ public:
     nlohmann::json rest_config();          // GET /api/config
     nlohmann::json rest_config_schema();   // GET /api/config/schema
 
+    // Slice A (#157): the LIVE apply path for POST /api/config/apply. Takes the
+    // raw request body and returns a JSON response that carries an
+    // "http_status" hint the HTTP layer maps to the wire status. UNWIRED by
+    // default: no main installs it, so the POST route stays 503 {"armed":false}
+    // (dormant). A main/test that wants the live gated apply installs a fn that
+    // routes through config_endpoint::apply_config (control token + two-phase
+    // money nonce + AddressValidator + tripwire). Never wired in production
+    // without an operator arming the control token.
+    using config_apply_fn_t = std::function<nlohmann::json(const std::string& body)>;
+    void set_config_apply_fn(config_apply_fn_t fn) { m_config_apply_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_config_apply_fn() const { return static_cast<bool>(m_config_apply_fn); }
+    nlohmann::json rest_config_apply(const std::string& body);  // POST /api/config/apply
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -1345,6 +1358,7 @@ private:
     embedded_template_fn_t m_embedded_template_fn;  // /embedded_template last-served snapshot (optional)
     config_json_fn_t m_config_fn;         // GET /api/config — resolved launch config (optional)
     config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
+    config_apply_fn_t m_config_apply_fn;  // POST /api/config/apply — Slice A gated apply (optional; unwired => 503)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;

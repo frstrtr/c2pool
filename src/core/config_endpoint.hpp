@@ -143,9 +143,103 @@ public:
     // Register a live setter for a canonical key. (Unused this pass.)
     void register_setter(const std::string& canon, Setter fn);
     bool has(const std::string& canon) const;
+    // Invoke a registered setter; returns false when none is registered.
+    bool invoke(const std::string& canon, const std::string& value) const;
 private:
     std::map<std::string, Setter> setters_;
 };
+
+// ---------------------------------------------------------------------------
+// Slice A (#157): LIVE control-plane apply — dormant -> money-gated.
+//
+// The endpoint stays fail-closed by default: apply_config() answers an
+// unconditional 503 {"armed":false} until an operator registers a per-process
+// control token (set_control_token, surfaced only on loopback at launch). No
+// token => not armed => the M1 dormancy is preserved. Registering the token is
+// the reviewed/operator-tap arming step (NOT done by default anywhere).
+//
+// Two-tier apply (design note §"Slice A"):
+//   * non-money keys  -> control token + schema validation -> applied.
+//   * money-path keys (Mut::MONEY_*) -> the FULL gate: a two-phase money nonce
+//     BOUND TO THE EXACT diff (issue -> confirm), server-side AddressValidator
+//     on any address value, and the M0 tripwire. Any miss => refuse, and the
+//     tripwire fires. Nothing is applied partially (batch atomicity).
+//
+// "Apply" here swaps the process-global published ResolvedConfig snapshot
+// (the reporting mirror behind GET /api/config) atomically and invokes any
+// registered ParamApplier setter. It NEVER touches coinbase/subsidy/PPLNS/
+// payee computation, and it never arms --embedded-tx-inject (Slice B).
+
+// Control token (process-global). Empty until an operator registers one; while
+// empty the apply endpoint is NOT armed and answers 503 {"armed":false}.
+void set_control_token(std::string token);
+bool has_control_token();
+bool check_control_token(const std::string& presented);
+void clear_control_token();  // test helper
+
+// M0 tripwire: fires on any attempt to write a money-path key without a valid
+// confirmed nonce (or with an address that fails validation). Process-global,
+// observable; a KAT pins "money key without confirmed nonce => tripwire".
+struct TripwireState {
+    uint64_t    count = 0;
+    std::string last_reason;
+    std::string last_key;
+};
+TripwireState tripwire_state();
+void reset_tripwire();  // test helper
+
+// Canonical digest of a money-key diff (sorted canon=value; reuses the
+// settings money_digest serialization). The two-phase nonce is bound to THIS.
+std::string money_diff_digest(const std::map<std::string, std::string>& money_changes);
+
+// Phase 1: issue a fresh single-use nonce bound to an exact money diff.
+std::string issue_money_nonce(const std::map<std::string, std::string>& money_changes);
+// Phase 2: the presented nonce must match the one issued for THIS EXACT diff.
+// Consumes the pending nonce on success (single-use). A mismatched diff yields
+// a different digest and therefore never matches.
+bool verify_money_nonce(const std::map<std::string, std::string>& money_changes,
+                        const std::string& presented);
+void clear_money_nonces();  // test helper
+
+// Registry of live setters used by apply (seeded by a main; empty by default,
+// so a bare apply is a snapshot-mirror swap with no runtime money mutation).
+ParamApplier& applier();
+
+// ---- The armed apply entry point -------------------------------------------
+struct ApplyRequest {
+    std::string                        control_token;
+    std::map<std::string, std::string> changes;
+    std::string                        money_nonce;   // empty => issue phase
+};
+
+enum class ApplyStatus {
+    NotArmed,          // no control token registered -> 503 {"armed":false}
+    NotPublished,      // no snapshot published yet
+    RejectNoToken,     // token missing or wrong
+    RejectValidation,  // schema/batch/referee validation failed
+    NeedConfirm,       // money keys present, nonce issued, NOTHING applied
+    RejectMoneyGate,   // nonce miss/mismatch or bad address -> TRIPWIRE fired
+    Applied,           // token ok, validated, (money confirmed) -> applied
+};
+
+const char* apply_status_name(ApplyStatus s);
+
+struct ApplyResponse {
+    ApplyStatus              status = ApplyStatus::NotArmed;
+    int                      http_status = 503;
+    std::string              message;
+    std::string              offending_key;
+    std::string              money_nonce;    // set on NeedConfirm
+    std::vector<std::string> applied_keys;
+    std::vector<std::string> money_keys;     // echoed on NeedConfirm
+    nlohmann::json to_json() const;
+};
+
+// Validate + gate + (on success) apply a batch. Fail-closed at every step.
+ApplyResponse apply_config(const ApplyRequest& req);
+
+// Parse the POST body JSON into an ApplyRequest (tolerant of missing fields).
+ApplyRequest parse_apply_request(const std::string& body);
 
 } // namespace c2pool::config_endpoint
 

@@ -1032,15 +1032,40 @@ void HttpSession::process_request()
             }
         }
         else if (request_.method() == http::verb::post) {
-            // ── Control-plane M1: POST /api/config/apply is INERT this pass.
-            // Runtime mutation is operator-gated: the write path (control-token
-            // + two-phase money nonce + server-side AddressValidator) is NOT
-            // armed, so the only answer is an unconditional 503. Arming this
-            // requires flipping the KAT that pins the 503 — a reviewed change.
-            // (Plan: "the endpoint is never live without the gate.")
+            // ── Control-plane Slice A (#157): POST /api/config/apply is the
+            // LIVE, money-gated write path — but fail-closed by default. It is
+            // loopback-only (same posture as the GET config endpoints), and it
+            // stays an unconditional 503 {"armed":false} UNTIL a main installs
+            // the apply fn AND an operator registers the loopback control token
+            // (config_endpoint::apply_config re-checks the token and answers
+            // 503 {"armed":false} while unset). No main wires it by default, so
+            // production stays dormant; a reviewed operator-tap arming is what
+            // makes it live. The apply fn itself enforces the control token +
+            // two-phase money nonce (bound to the exact diff) + AddressValidator
+            // + M0 tripwire for money-path keys — never a silent default.
             if (std::string(request_.target()) == "/api/config/apply") {
-                response.result(http::status::service_unavailable);
-                response.body() = R"({"armed":false,"error":"config-apply not armed; runtime mutation is operator-gated"})";
+                auto remote_addr = socket_.remote_endpoint().address();
+                if (!remote_addr.is_loopback()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"Config API is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                if (!mining_interface_->has_config_apply_fn()) {
+                    // Dormant: no apply fn installed => preserve the M1 posture.
+                    response.result(http::status::service_unavailable);
+                    response.body() = R"({"armed":false,"error":"config-apply not armed; runtime mutation is operator-gated"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                auto j = mining_interface_->rest_config_apply(request_.body());
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                response.result(static_cast<http::status>(st));
+                response.body() = j.dump();
                 response.prepare_payload();
                 send_response(std::move(response));
                 return;
