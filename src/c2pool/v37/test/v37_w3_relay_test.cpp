@@ -271,9 +271,15 @@ static void test_wr2_rmax() {
     CHECK(dr.carrier.receipts.empty());
     // Hand-set an oversize count byte directly (an adversarial frame) — same reject.
     auto raw = CarrierWire::encode(ok);
-    // count byte sits right after version(1) + carrier-event bytes; recompute:
+    // count byte sits right after version(1) + carrier-event bytes; recompute.
+    // Taken from the v0x01 frame on purpose: a v0x01 frame ENDS at the count
+    // byte, so size-1 is that offset at any wire version (S-1c's v0x02 appends
+    // its cut descriptor as a TRAILER, which is exactly why every v0x01 offset
+    // stays valid — but `encode()` now emits v0x02, so size-1 of THAT would be
+    // the trailer byte).
     Carrier bare; bare.carrier = c;
-    std::size_t count_pos = CarrierWire::encode(bare).size() - /*count byte*/ 1;
+    std::size_t count_pos =
+        CarrierWire::encode_version(bare, W3_WIRE_VERSION_V1).size() - /*count byte*/ 1;
     raw[count_pos] = (std::uint8_t)(W3_R_MAX + 1);
     CHECK(CarrierWire::decode(raw).status == WireStatus::REJECT_RMAX);
 }

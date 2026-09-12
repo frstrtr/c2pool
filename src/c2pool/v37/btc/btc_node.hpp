@@ -109,6 +109,13 @@ struct EbCut {
     std::size_t    unresolved = 0;           // OI-W4-1 broken-invariant counter
     const char*    source = "none";          // eb_source_name(): live-only / live+carry
     std::string    refusal;                  // non-empty => the loud reason
+    // ★ S-1c: the reward THIS fold consumed. E_b is a function of (reward,
+    // payout, identities); a peer must fold with the SAME reward, and the
+    // coin backend cannot be asked for it later (block_reward is fail-closed
+    // on a moved template cache). Recorded here so the value that actually
+    // entered the fold — not a second, possibly different read — is what the
+    // v0x02 cut descriptor carries.
+    std::uint64_t  reward = 0;
 };
 
 // The disposition of a block-winning share the v36 work source handed us.
@@ -130,6 +137,73 @@ struct S1FoldStats {
     std::uint64_t refused    = 0;   // wins fold_eb REFUSED (geometry not ratified)
     std::uint64_t valueless  = 0;   // wins registered with an EMPTY credit (reward 0 / empty lane)
     std::uint64_t unresolved = 0;   // total OI-W4-1 unresolved payout keys seen
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ★ S-1c — A PEER'S BLOCK WIN, as the flat cut descriptor delivers it.
+//
+// THE DEFECT S-1c CLOSES. After S-1, the node that MINED a block credits E_b
+// and its owed_digest leaves the empty anchor. Its peers do not: they account
+// the block-winning carrier as an ordinary share and know nothing of the block,
+// so their finalW never moves. Two peered nodes that have ingested the byte-
+// identical carrier stream therefore emit DIFFERENT owed_digests — A != B —
+// which is a settlement fork, not a cosmetic gap.
+//
+// THE FIX. The winner names its fold on the wire (w3_relay.hpp CutDescriptor,
+// carrier wire v0x02) and every receiver re-runs THE SAME fold against its OWN
+// engine at THE SAME prefix, then drives its OWN ledger through the EXISTING
+// on_block_found / on_block_finalized API. Nothing about the fold, the ledger
+// or the owed commitment is re-implemented here: this is a second CALLER of
+// settle::fold_eb, not a second fold.
+//
+// THE CUT RULE (the whole correctness argument). E_b = fold_eb(reward, view@P)
+// is a pure function of (reward, view.payout, view.identities) at ONE lane
+// prefix P (w4_settlement.hpp S8). A receiver that folded at ITS OWN TIP would
+// fold at a strictly later prefix — its tip already includes the block-winning
+// carrier it just admitted — and would credit a DIFFERENT E_b. So the receiver
+// folds at the winner's (next_pos, spine_digest), read back out of its own ring
+// (V37Engine::settlement_view_by_cut), and REFUSES if it cannot find that exact
+// prefix with that exact commitment. Refusing is the honest failure: it leaves
+// A != B visible and counted, where folding-at-the-wrong-cut would hide a fork
+// behind a plausible number.
+struct PeerWin {
+    std::string    bid;                  // the OwedLedger key (hex, from the wire)
+    std::uint64_t  h_b = 0;              // the block's OWN height (D8)
+    std::uint64_t  cut_next_pos = 0;     // P — the prefix the WINNER folded at
+    ::v37::bytes32 cut_spine_digest{};   // the lane commitment at P
+    std::uint64_t  reward = 0;           // the winner's block_reward(H_b)
+    bool           payout_emitted = false;      // winner's W5 assembly emitted outputs
+    ::v37::bytes32 owed_digest_at_win{};        // VERIFY field (diagnostics only)
+};
+
+struct PeerWinOutcome {
+    bool  registered = false;      // the FOUND entered our ledger + F1 driver
+    EbCut cut;                     // the fold we ran (credit / witness / refusal)
+    // the refusal shapes, each its own bit so an operator never has to guess
+    bool  cut_miss = false;             // P is not a prefix THIS node published
+    bool  cut_digest_mismatch = false;  // P published here with a DIFFERENT digest
+    bool  refused_payout_emitted = false;  // winner already paid a coinbase (unreproducible)
+    bool  refused_too_late = false;        // H_b already below our finalize cursor
+    bool  already_known = false;           // our own win, or a duplicate descriptor
+    // the VERIFY field: did our owed commitment agree with the winner's at the
+    // instant of the win? A `false` here means the two nodes had ALREADY
+    // diverged before this block — the earliest point at which that is visible.
+    bool  owed_at_win_agreed = false;
+    ::v37::bytes32 owed_here_at_receipt{};
+};
+
+// S-1c receive-side counters (diagnostics only — never consensus).
+struct S1PeerStats {
+    std::uint64_t seen        = 0;   // peer block-winner descriptors offered
+    std::uint64_t credited    = 0;   // folded at the carried cut and REGISTERED
+    std::uint64_t valueless   = 0;   // registered with an EMPTY credit (reward 0 / empty lane)
+    std::uint64_t cut_miss    = 0;   // P not published here (ring evicted / coalesced through)
+    std::uint64_t cut_mismatch = 0;  // P published here with a DIFFERENT lane digest (!)
+    std::uint64_t refused_fold = 0;  // fold_eb REFUSED (geometry not ratified)
+    std::uint64_t refused_payout = 0;// winner had already emitted a coinbase
+    std::uint64_t refused_late = 0;  // H_b at or below our finalize cursor
+    std::uint64_t already_known = 0; // our own win, or a duplicate
+    std::uint64_t owed_diverged = 0; // owed_digest_at_win != ours at receipt
 };
 
 class XbtcNode {
@@ -285,6 +359,155 @@ public:
         // non-empty placeholder. Fail-closed: if PoW verify is off, we never
         // reach here (the work source rejected the share as a network block).
         out.submit = m_coin->submit_block(reconstruct_block_hex(bid, asm_));
+        m_last_won = out;   // S-1c: the send side reads `emitted`/`outputs` from here
+        return out;
+    }
+
+    // ── ★ S-1c: on_peer_block_won() — a PEER's block win, from the wire ──────
+    // Credit OUR ledger with the SAME E_b the winner credited, at the SAME lane
+    // prefix, and register the FOUND so OUR height-watch finalizes it at the
+    // SAME bin_height (FinalizeStep::bin_height == H_b + d_conf, and d_conf is
+    // fleet-identical, so equal H_b => equal bin). No submit, no coin-backend
+    // probe, no template read: this path touches the network not at all.
+    //
+    // REFUSE, DO NOT GUESS. Unlike on_block_won (our own block, where the FOUND
+    // must be registered even if the fold gives nothing — the coinbase we paid
+    // still has to be deducted), every failure below REFUSES the registration
+    // outright and says why. A peer's block that we cannot credit correctly is
+    // one we must not credit at all: registering it with a fabricated or empty
+    // credit would put a DIFFERENT number into our finalW than the winner put
+    // into theirs, which is exactly the divergence this path exists to remove.
+    PeerWinOutcome on_peer_block_won(const PeerWin& w) {
+        PeerWinOutcome out;
+        if (!m_started) return out;
+        ++m_s1p.seen;
+
+        out.owed_here_at_receipt = m_ledger->owed_digest();
+        out.owed_at_win_agreed   = (out.owed_here_at_receipt == w.owed_digest_at_win);
+        if (!out.owed_at_win_agreed) {
+            ++m_s1p.owed_diverged;
+            say_s1c(w, "VERIFY MISMATCH: the winner's owed_digest at the win differs from ours "
+                       "at receipt — these two nodes had ALREADY diverged before this block "
+                       "(this is a report, not a refusal: the fold below still runs)");
+        }
+
+        // (a) ours already, or a duplicate descriptor: the ledger is idempotent
+        //     per bid, but say so rather than letting it look like a credit.
+        if (m_ledger->is_pending(w.bid) || m_ledger->is_settled(w.bid)) {
+            ++m_s1p.already_known;
+            out.already_known = true;
+            return out;
+        }
+        // (b) the winner had already broadcast a coinbase. Its payout map is NOT
+        //     on the wire (unbounded), and we cannot reproduce it — fail closed.
+        //     A FRESH win is at depth 0 so the W5 burial gate withholds, which is
+        //     why this is the one shape v0x02 refuses rather than carries.
+        if (w.payout_emitted) {
+            ++m_s1p.refused_payout;
+            out.refused_payout_emitted = true;
+            say_s1c(w, "REFUSED: the winner's coinbase had already EMITTED outputs, and the "
+                       "payout map is not on the wire — we cannot reproduce it, so we credit "
+                       "nothing rather than credit something different");
+            return out;
+        }
+        // (c) too late: H_b is at or below our finalize cursor, so advance_to_tip
+        //     will never step that height again and the FOUND would sit pending
+        //     forever (deducting nothing, finalizing never).
+        if (w.h_b == 0 || w.h_b <= m_fin->cursor_height()) {
+            ++m_s1p.refused_late;
+            out.refused_too_late = true;
+            say_s1c(w, "REFUSED: H_b is at or below our finalize cursor — this block can never "
+                       "be stepped at maturity here (the descriptor arrived after we had already "
+                       "buried past it)");
+            return out;
+        }
+
+        // (d) THE CUT RULE: fold at the WINNER'S prefix, read back from OUR ring.
+        bool mismatch = false;
+        std::shared_ptr<const SettlementView> view =
+            m_engine->settlement_view_by_cut(m_cfg.lane_chain, w.cut_next_pos,
+                                             w.cut_spine_digest, &mismatch);
+        if (!view) {
+            out.cut_miss = !mismatch;
+            out.cut_digest_mismatch = mismatch;
+            if (mismatch) {
+                ++m_s1p.cut_mismatch;
+                say_s1c(w, "REFUSED: we published the winner's prefix P with a DIFFERENT lane "
+                           "digest — the two nodes folded different records into the same prefix. "
+                           "This is a SHARECHAIN divergence, not a settlement one; the owed ledger "
+                           "cannot repair it");
+            } else {
+                ++m_s1p.cut_miss;
+                say_s1c(w, "REFUSED: the winner's prefix P is not a version THIS node published "
+                           "(older than the settlement ring, or the executor coalesced through "
+                           "it) — we will not fold at a neighbouring prefix (O2.3)");
+            }
+            return out;
+        }
+
+        // (e) the fold — settle::fold_eb, the SAME single entry point the winner
+        //     used, over the SAME (reward, payout, identities) triple.
+        EbCut c;
+        c.lane_digest      = view->digest;
+        c.lane_version     = view->version;       // OUR version number for that prefix
+        c.lane_incarnation = view->incarnation;   // OUR incarnation (node-local, never on the wire)
+        std::optional<settle::EbFold> f = settle::fold_eb(w.reward, *view, /*strict=*/true);
+        if (!f) {
+            ++m_s1p.refused_fold;
+            c.valueless = true;
+            c.next_pos  = view->next_pos;
+            c.refusal   = "fold_eb REFUSED at the peer's cut: this lane's geometry is NOT "
+                          "ratified (settle::geometry_is_ratified == false)";
+            out.cut = c;
+            say_s1c(w, c.refusal);
+            return out;
+        }
+        c.folded     = true;
+        c.next_pos   = f->next_pos;
+        c.unresolved = f->unresolved;
+        c.source     = settle::eb_source_name(f->source);
+        for (const auto& [k, v] : f->credit) c.credit[k] = static_cast<long long>(v);
+        m_s1.unresolved += f->unresolved;
+        if (w.reward == 0 || c.credit.empty()) {
+            c.valueless = true;
+            c.refusal   = (w.reward == 0)
+                ? "the winner carried reward == 0 — it registered a VALUELESS win and so do we "
+                  "(both nodes credit nobody, which still CONVERGES)"
+                : "E_b is EMPTY at the carried cut — the lane had no accounted weight at P "
+                  "(both nodes credit nobody, which still CONVERGES)";
+        }
+        out.cut = c;
+
+        // (f) the payout leg. The winner's coinbase outputs are not on the wire;
+        //     payout_emitted == false (checked in (b)) says the winner's W5
+        //     burial gate WITHHELD, so its payout map was EMPTY. We mirror that
+        //     gate exactly — a freshly relayed win is at depth 0 and is not yet
+        //     canonical here — so assemble_if_buried withholds for us too and
+        //     the two payout maps are equal BY CONSTRUCTION, not by luck.
+        cb::CoinbaseBudget budget;
+        budget.slot_budget_C    = 0;   // unbounded (ratified default, mirrors on_block_won)
+        budget.max_payout_bytes = 0;   // unbounded (ratified default)
+        budget.k_floor          = 1;   // byte-denominated no-dust floor
+        cb::BurialGate gate;
+        gate.d_conf        = m_cfg.d_conf;
+        gate.canonical     = false;    // a peer's fresh win is never canonical to us yet
+        gate.confirmations = 0;        // depth 0: the W5 gate withholds
+        auto pay_of = [this](const ::v37::bytes32& k) { return m_pay_of(k); };
+        cb::CoinbaseAssembly asm_ =
+            cb::assemble_if_buried(*m_ledger, w.reward, budget, gate, pay_of);
+
+        FoundBlock fb;
+        fb.bid    = w.bid;
+        fb.height = w.h_b;
+        fb.credit = c.credit;
+        for (const auto& o : asm_.outputs)
+            fb.payout[o.key] = static_cast<long long>(o.amount);
+        m_fin->on_block_found(fb);     // write-ahead FOUND + pending + maturity map
+
+        out.registered = true;
+        if (c.valueless) ++m_s1p.valueless; else ++m_s1p.credited;
+        m_last_peer_cut = c;
+        say_s1c(w, c.refusal.empty() ? "credited" : c.refusal);
         return out;
     }
 
@@ -310,6 +533,10 @@ public:
     // S-1 diagnostics: the refusal counters and the cut the last win folded at.
     const S1FoldStats& s1_stats() const { return m_s1; }
     const EbCut&       last_cut() const { return m_last_cut; }
+    // S-1c diagnostics: the receive-side counters and the last peer cut folded.
+    const WonBlockOutcome& last_won()   const { return m_last_won; }
+    const S1PeerStats& s1c_stats()     const { return m_s1p; }
+    const EbCut&       last_peer_cut() const { return m_last_peer_cut; }
 
 private:
     // ── ★ S-1: fold E_b at the lane cut published NOW ────────────────────────
@@ -327,6 +554,7 @@ private:
     EbCut fold_entitlement_at_cut(std::uint64_t reward, const std::string& bid,
                                   std::uint64_t won_height) {
         EbCut c;
+        c.reward = reward;   // S-1c: the exact value this fold consumed
         std::shared_ptr<const ::v37::LaneSnapshot> view =
             m_engine ? m_engine->snapshot(m_cfg.lane_chain) : nullptr;
         if (!view) {
@@ -404,6 +632,25 @@ private:
                      c.refusal.c_str());
     }
 
+    // The S-1c receive-side line. Same STL-only shape as say_s1: the daemon
+    // mirrors it through LOG_* from the PeerWinOutcome.
+    void say_s1c(const PeerWin& w, const std::string& note) const {
+        auto hex32 = [](const ::v37::bytes32& d) {
+            static const char* H = "0123456789abcdef";
+            std::string s;
+            for (auto b : d) { s += H[b >> 4]; s += H[b & 15]; }
+            return s;
+        };
+        std::fprintf(stdout,
+                     "[v37-s1c] PEER WIN %s h=%llu reward=%llu cut{P=%llu spine=%s} "
+                     "payout_emitted=%d owed_at_win=%s — %s\n",
+                     w.bid.c_str(), static_cast<unsigned long long>(w.h_b),
+                     static_cast<unsigned long long>(w.reward),
+                     static_cast<unsigned long long>(w.cut_next_pos),
+                     hex32(w.cut_spine_digest).c_str(), w.payout_emitted ? 1 : 0,
+                     hex32(w.owed_digest_at_win).c_str(), note.c_str());
+    }
+
     // Placeholder for the v36 reconstruct_won_block(share_hash, coinbase, ...)
     // full-block-hex assembly. Kept out of the lifecycle proper (it needs the
     // known-tx bodies + the coin's block header codec, which live in the v36
@@ -427,6 +674,9 @@ private:
 
     S1FoldStats m_s1;        // S-1 fold counters (diagnostics)
     EbCut       m_last_cut;  // the cut the last win folded at (diagnostics)
+    WonBlockOutcome m_last_won;  // the last OWN win's disposition (diagnostics)
+    S1PeerStats m_s1p;           // S-1c receive-side counters (diagnostics)
+    EbCut       m_last_peer_cut; // the cut the last PEER win folded at (diagnostics)
 
     bool m_opened = false;
     bool m_started = false;
