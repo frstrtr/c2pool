@@ -46,6 +46,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,14 @@ struct NativeChainSource {
     };
     std::function<std::vector<AltCandidate>()> alt_candidates;
 
+    // X2: the INVERSE of is_canonical — at what height does this chain hold
+    // block `id`? The carrier layer keys a share to the mainchain block it was
+    // worked on, and that block's height is what fixes the carrier's bin and its
+    // consensus leading-zero target. Same index, same mutex, same answer as
+    // is_canonical, so the share path and the settlement path cannot drift onto
+    // two different chains.
+    std::function<std::optional<std::uint64_t>(const ::c2pool::xmr::node::Hash&)> height_of;
+
     explicit operator bool() const noexcept {
         return static_cast<bool>(drain) && static_cast<bool>(is_canonical);
     }
@@ -123,6 +132,10 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
     };
 
     src.events_seen = [n] { return n->mainchain_events_seen(); };
+
+    src.height_of = [n](const ::c2pool::xmr::node::Hash& id) {
+        return n->index().height_of(id);
+    };
 
     src.alt_candidates = [n] {
         std::vector<NativeChainSource::AltCandidate> out;

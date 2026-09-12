@@ -174,7 +174,7 @@ public:
     // own it and does not choose it: an arm that stops being ready is the
     // resolver's problem, not the assembler's.
     XmrSettlementTemplateProvider(native::IMinerDataSource& source,
-                                  XmrOwedFixture& ledger_owner,
+                                  IXmrOwedSource& ledger_owner,
                                   XmrSettlementConfig scfg,
                                   std::uint64_t share_diff,
                                   RefreshPump pump = {})
@@ -191,7 +191,7 @@ public:
     // refresh: exactly the one get_miner_data per refresh this constructor
     // always did.
     XmrSettlementTemplateProvider(node::IMonerodTransport& transport,
-                                  XmrOwedFixture& ledger_owner,
+                                  IXmrOwedSource& ledger_owner,
                                   XmrSettlementConfig scfg,
                                   std::uint64_t share_diff)
         : m_owned_src(std::make_unique<ntmpl::MonerodMinerDataSource>(transport)),
@@ -504,7 +504,7 @@ private:
     ShapeGate                                 m_shape_gate;
     bool                                      m_take_mempool_as_given = false;
 
-    XmrOwedFixture&          m_ledger;
+    IXmrOwedSource&          m_ledger;
     XmrSettlementConfig      m_scfg;
     std::uint64_t            m_share_diff;
 

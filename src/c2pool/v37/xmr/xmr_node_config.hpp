@@ -238,6 +238,21 @@ struct XmrNodeConfig {
     // Seconds between the main loop's one-line status reports (0 = never).
     std::uint32_t   status_every_s = 30;
 
+    // --- X2 / S-1c: the carrier-relay p2p layer -----------------------------
+    // The seam that turns accepted miner shares into LANE WEIGHT, and that
+    // carries a block winner's E_b fold to its peers. Both empty = single node:
+    // this node's own shares still reach its own lane (the send queue admits
+    // locally before it floods), but no peer's shares arrive and no peer's
+    // owed_digest can converge with ours.
+    std::string              carrier_p2p_bind;   // "HOST:PORT"; empty = no inbound bind
+    std::vector<std::string> carrier_peers;      // "HOST:PORT", repeatable
+    // Context horizon below the chain tip for a carrier's parent block. An
+    // ancient parent means a small consensus_lz — a carrier that is cheap to
+    // grind and would still be admitted with real weight — so this is a safety
+    // bound, not a cache policy. 0 disables it (for a regtest chain shorter
+    // than the window; never in production).
+    std::uint64_t            carrier_index_horizon = 64;
+
     // --- O-2 OPTION B: the v37 K_fair settlement coinbase -------------------
     // --coinbase monerod (option A, default) | v37 (option B). In v37 mode the
     // block the pool assembles + submits is the settlement coinbase, not
