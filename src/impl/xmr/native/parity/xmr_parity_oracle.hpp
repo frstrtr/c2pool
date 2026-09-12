@@ -406,26 +406,68 @@ private:
 
         // The CONSTRAINT that closes P-TPL's blind spot. tx_backlog_count is a
         // Measurement and stays one; what is judged here is the FAMINE SHAPE --
-        // we served nothing while the arm we are judged against held something,
-        // sustained. Fed only on an ALIGNED pair, because a backlog claim
-        // across two different tips compares two different questions; a
-        // misaligned sample is undecidable and neither grows nor clears the
-        // streak. See xmr_backlog_famine.hpp.
+        // the NATIVE pool holding nothing while the DAEMON holds transactions,
+        // sustained. Fed only on an ALIGNED pair, because a backlog claim across
+        // two different tips compares two different questions; a misaligned
+        // sample is undecidable and neither grows nor clears the streak.
+        //
+        // BY ARM IDENTITY, NOT BY SEAT. This block used to hand the SERVED seat
+        // to `native_backlog` and the SHADOW seat to the daemon count. In the M4
+        // leg that serves from monerod and shadows the native arm those two
+        // seats hold the two arms the other way round, and the result was a
+        // sticky refusal on a healthy node -- the daemon's empty mempool read as
+        // a starving native pool, every P-TPL sample FAILed, and the graduation
+        // streak never left zero. So the arms are now picked out by NAME, and
+        // the claim is fenced to the posture in which it can mean anything: only
+        // the arm the miners are actually served from can serve an empty
+        // template. See xmr_backlog_famine.hpp.
         {
+            const bool served_is_native = (s.arm == std::string(::c2pool::xmr::native::to_string(TemplateArm::Native)));
+            const bool shadow_is_native = shadow.have
+                && shadow.arm == std::string(::c2pool::xmr::native::to_string(TemplateArm::Native));
+
             BacklogFamineGuard::Input fi;
             fi.aligned      = served.have && shadow.have
                            && served.height == shadow.height
                            && served.prev_id == shadow.prev_id;
             fi.at_unix      = s.at_unix;
-            fi.native_known = served.have;
-            fi.native_backlog = static_cast<std::uint64_t>(s.served.tx_backlog.size());
+            fi.native_is_serving_arm = served_is_native;
+
+            // What the SERVED arm holds comes from the artefact that actually
+            // went out, never from a re-read; what the SHADOW arm holds comes
+            // from its own observation. Which of the two is "native" is decided
+            // by the arm's name, above.
+            const std::uint64_t served_backlog =
+                static_cast<std::uint64_t>(s.served.tx_backlog.size());
+            bool          shadow_backlog_known = false;
+            std::uint64_t shadow_backlog       = 0;
             if (shadow.have) {
                 const Obs& sb = shadow.fields.get("tx_backlog_count");
                 if (sb.present) {
-                    fi.shadow_known   = true;
-                    fi.shadow_backlog = std::strtoull(sb.value.c_str(), nullptr, 10);
+                    shadow_backlog_known = true;
+                    shadow_backlog = std::strtoull(sb.value.c_str(), nullptr, 10);
                 }
             }
+
+            if (served_is_native) {
+                fi.native_known   = served.have;
+                fi.native_backlog = served_backlog;
+                fi.daemon_known   = shadow_backlog_known;
+                fi.daemon_backlog = shadow_backlog;
+            } else if (shadow_is_native) {
+                fi.native_known   = shadow_backlog_known;
+                fi.native_backlog = shadow_backlog;
+                fi.daemon_known   = served.have;
+                fi.daemon_backlog = served_backlog;
+            } else {
+                // Neither arm is the native one (a monerod-vs-monerod bring-up
+                // configuration). There is no famine claim to make, and making
+                // one from whichever seat was nearest is exactly the bug above.
+                fi.native_known = false;
+                fi.daemon_known = false;
+                fi.native_is_serving_arm = false;
+            }
+
             const BacklogFamineGuard::Observation fo = famine_.observe(fi);
             opt.constraints.push_back(fo.check);
         }
