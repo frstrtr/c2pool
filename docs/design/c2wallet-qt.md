@@ -28,7 +28,7 @@ Baseline parity floor: `c2wallet.py` signed DASH donation block **2518186** (104
 - **No online validation, broadcast, or key custody on a networked host.** The signer never opens a socket; c2pool never holds a key or signs.
 - **Cross-coin address conversion does not cross the secp256k1↔Ed25519 boundary.** Requirement (5) is Family-A-only. Any attempt to convert a Bitcoin-family address to/from a Monero address is refused at the family layer.
 - **BCH is in scope for construct/spend but excluded from cross-coin conversion** — CashAddr is a different encoding, not a prefix swap; the converter must detect and refuse it.
-- **Monero N/M multisig (MMS) is proposed out of scope for v1** (open decision §7); Bitcoin-family multisig (P2MS/P2SH) is fully in scope.
+- **Monero N/M multisig (MMS) is in scope for v1** (locked 2026-09-12; delivered as the M4-X-MMS phase in §6, sequenced after single-sig RingCT); Bitcoin-family multisig (P2MS/P2SH) is fully in scope.
 - Not a general online wallet, block explorer, or pool control panel — that is the existing `c2pool-qt` application, which is deliberately a separate, network-linked binary.
 
 ---
@@ -237,7 +237,7 @@ Conversion algorithm (direct lift of `classify_address_for_coin` + `CoinAddressA
 
 Crypto sourcing: Ed25519 field/group, Keccak, H_s, H_p, Pedersen generators, multiexp = **reuse**; CLSAG signer + BP+ prover = **port from monero-project BSD-3 onto the vendored ops**; key-image + Monero base58 + mnemonic + subaddress = **new**; ring selection = **online**. Strong correctness harness the Bitcoin side never had: construct → verify with the in-tree `xmr_rct_verify` / `xmr_bulletproofs_plus` verifier → must pass, as a KAT.
 
-**Multisig (MMS):** proposed **out of scope v1** (open decision §7) — it is a large, stateful, multi-round interactive protocol and a frequent bug source; keep the key/CLSAG layer general enough to add it in v2.
+**Multisig (MMS):** **in v1** (locked 2026-09-12) — delivered as the **M4-X-MMS** phase (§6), sequenced after single-sig RingCT (M4-X). It is a large, stateful, multi-round interactive protocol and a frequent bug source, so the key/CLSAG layer is kept general enough to carry the N/M multi-round message flow and partial signing.
 
 ---
 
