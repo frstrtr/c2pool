@@ -173,6 +173,14 @@ Each maps to `(spend_priv, view_priv)` (+ derived `spend_pub`, `view_pub`):
 
 One mnemonic → hundreds of addresses across {BIP44/49/84/86} × accounts × {external/change} × index range × {compressed/uncompressed}. Default scan: all four purposes, account 0, both chains, index 0–19, gap-limit 20; grouped by script type. **The offline signer can only enumerate candidate addresses — balances come from the online side:** the offline wallet exports its public address set (xpub or address list), the online c2pool node returns which are funded, and that funded set drives which paths get signed. The seed never leaves the offline box. Keep `find-key` parity (prove which path owns an address, both encodings tried) and a custom-path escape hatch for old/nonstandard keys.
 
+### 3.4 Key GENERATION (new air-gapped wallets)
+
+Import alone cannot create a fresh air-gapped wallet — the offline signer must also **generate** a new seed on the offline box. Source: the operator's `frstrtr/mnemonic_gen` (operator-owned; relicensed into c2pool AGPL on port).
+
+- **Family A — new BIP39 mnemonic.** Generate a fresh 24-word (or 12/15/18/21-word) BIP39 mnemonic with a real checksum, then run it straight through the §3.1 derivation path. **HARD FLAG:** `mnemonic_gen` is self-labelled "educational / not for real funds" and uses a demo RNG; the port MUST replace it with a **vetted CSPRNG** (`getrandom(2)` / `BCryptGenRandom`) and compute the **real BIP39 checksum** — the demo RNG is never used for entropy that guards funds.
+- **Family B — new Monero seed.** The analog: generate a fresh Monero 25-word mnemonic (and, per the seed-format lock, polyseed) from vetted CSPRNG entropy, feeding the §3.2 spend/view derivation.
+- **Split / shuffle seed backup (port from `mnemonic_gen`).** Split a 24-word mnemonic into two 12-word shares (even/odd index positions) and apply the reversible secure shuffle (PBKDF2 → HMAC-DRBG Fisher-Yates over the wordlist, keyed by password + a 24-word salt mnemonic; `gen.py` / `ungen.py`). Round-trip (gen → ungen recovers the original 24 words from password + salt mnemonic) is a mandatory KAT. Optional **QR / printable annotated-image export** of the seed and shares for paper backup. **See the §7 risk flag** — this is custom cryptography, not SLIP-39, and needs independent review before it guards real seeds.
+
 ---
 
 ## 4. Construct + Spend Matrix
@@ -228,6 +236,20 @@ Convertibility (SSOT = the per-coin `address_encoding.hpp` leaves):
 **REFUSE (the #961 guard):** (a) **BCH is never a prefix swap** — CashAddr is a different encoding; transcode through the payload or refuse; BCH has no segwit/taproot equivalent for `bc1…`/`bc1p…`. (b) **Type absent on target** (segwit/taproot → DOGE/DASH/NMC/BCH). (c) **mainnet↔testnet** silent conversion. (d) **source is Foreign/Invalid** to its claimed source coin.
 
 Conversion algorithm (direct lift of `classify_address_for_coin` + `CoinAddressAcceptance` + the `Own/Foreign/Reject` trichotomy of `decide_payout_address`): decode+classify under the source SSOT (must be `Own`), extract `{type, payload}`, capability-gate the target, re-encode under the target SSOT, then **mandatory round-trip proof** — decode the result under the target SSOT and assert it is `Own` and the payload matches. The UI displays **source payload = target payload (hex) side by side** before any convert is accepted; a wrong conversion is a fund misdirection, so a human confirms the hash160/program is unchanged. Gaps to fill: an **NMC SSOT leaf header** (Namecoin chainparams, no segwit) and a **BCH↔base58 transcode helper** on top of `cashaddr.hpp`.
+
+#### 4.1.1 DASH special transaction: governance-proposal collateral builder
+
+A specialized, first-class DASH-lane feature ported from the operator's `frstrtr/dash-proposal-collateral` (Python, MIT; relicensed into c2pool AGPL on port). It builds and signs the **1-DASH proof-of-burn collateral transaction** a Dash governance proposal requires, entirely offline. It is not a generic spend — it is a fixed OP_RETURN-burn template:
+
+- **Compute the gobject collateral hash byte-exactly** (port `proto_hash.py`): `hashParent` (32 raw LE bytes) ‖ `revision` (int32 LE) ‖ `time` (int64 LE) ‖ `HexStr(vchData)` (compactsize + lowercase-hex ASCII) ‖ null `masternodeOutpoint` (32×00 ‖ `ffffffff`) ‖ dummy `uint8_t{}` ‖ `0xffffffff` ‖ empty `vchSig` (`00`), double-SHA256. Verified byte-exact against Dash Core `governance/common.cpp` `GetHash()` and proven against live mainnet objects.
+- **Assemble the tx** (port `dash_collateral_tx.py`): output 0 = `1.00000000 DASH` → `OP_RETURN <collateral_hash>` (the hash in **internal/reversed** byte order, per `object.cpp` `IsCollateralValid()`); output 1 = change to the funding address. Coins selected largest-first; coinbase outputs younger than 101 confirmations skipped.
+- **Funding-key scan with hard-abort on mismatch:** scan `m/44'/5'/0'/{0,1}/i` for the key whose P2PKH address **equals** the funding address (match double-checked through an independent base58 impl); **hard-abort** if no index matches, if any UTXO scriptPubKey is not P2PKH of the funding address, on wrong network, bad checksum, or `--expected-hash` mismatch.
+- **Security model is already ours:** always-first dry-run summary, SIGHASH_ALL / RFC6979 / DER / low-S, per-signature self-verify before emit, typed `SPEND` confirmation, mnemonic via hidden input (never stored/logged), private-key zeroize. A direct fit for the air-gap model — the only stdout is public data (hash, summary, signed hex).
+- **Port note:** re-implement the byte-exact logic in the C++ DASH modules with **KATs that treat the proven Python as the golden reference** (construct in C++ → compare to the Python reference vectors, which are themselves proven against mainnet).
+
+#### 4.1.2 Message sign / verify
+
+Port `sign_message.py`: sign an arbitrary message with a wallet key and verify a signature, in the Bitcoin/Dash signed-message format (Dash uses the legacy `DarkCoin Signed Message:\n` magic; double-SHA256 over `varstr(magic) ‖ varstr(message)`; 65-byte recoverable compact signature with the compressed-key header offset, low-S enforced). **Self-verify by public-key recovery** — the recovered pubkey must hash to the signing address before the signature is emitted, so a wrong key/derivation cannot produce a bad signature. Used e.g. for DashCentral proposal-ownership claims.
 
 ### 4.2 Track B — Monero
 
@@ -316,11 +338,12 @@ Each phase is a shippable DRAFT PR delivered by **qt-steward** under the **Fable
 | Phase | Track | Deliverable | Depends on | Money-path gate |
 |---|---|---|---|---|
 | **M0** | shared | New `ui/c2wallet-qt/` tree; Widgets-only CMake; **network-incapable link-guard CI test** (the mechanical proof); MainWindow/sidebar shell reused from c2pool-qt. | — | Low — no keys yet. Gate = the binary provably links no network symbols. |
-| **M1-A** | Bitcoin | `hdkeys`: port BIP39/32/44 + WIF/raw-hex, add BIP49/84/86 + xprv/xpub + SLIP-132 + real BIP39 checksum + BIP38 + **Core descriptors**; plus the now-in-scope keystore parsers — **Electrum full-file parser**, **`wallet.dat` (Berkeley DB) parser**, and **generic JSON keystore** (all v1 per the 2026-09-12 lock). | M0 | **Money-path (keys in memory)** → full F-O-F + tap. |
-| **M1-X** | Monero | 25-word mnemonic (+CRC, wordlists), **polyseed (16-word, Argon2)** + **13-word MyMonero** import (alongside the 25-word), dual spend/view import, view-only import, Monero base58, subaddress/integrated derivation. | M0 | **Money-path** → full gate. |
+| **M1-A** | Bitcoin | `hdkeys`: port BIP39/32/44 + WIF/raw-hex, add BIP49/84/86 + xprv/xpub + SLIP-132 + real BIP39 checksum + BIP38 + **Core descriptors**; plus the now-in-scope keystore parsers — **Electrum full-file parser**, **`wallet.dat` (Berkeley DB) parser**, and **generic JSON keystore** (all v1 per the 2026-09-12 lock). Add **key GENERATION** (§3.4): new BIP39 mnemonic from a **vetted CSPRNG** (not the `mnemonic_gen` demo RNG) + real checksum, the **split/shuffle seed backup** (PBKDF2/HMAC-DRBG, gen→ungen round-trip KAT), and **QR/printable export**. | M0 | **Money-path (keys in memory)** → full F-O-F + tap. |
+| **M1-X** | Monero | 25-word mnemonic (+CRC, wordlists), **polyseed (16-word, Argon2)** + **13-word MyMonero** import (alongside the 25-word), dual spend/view import, view-only import, Monero base58, subaddress/integrated derivation; plus **Monero seed GENERATION** (§3.4) — new 25-word + polyseed from vetted CSPRNG. | M0 | **Money-path** → full gate. |
 | **M2-A** | Bitcoin | Wire `address_utils` + per-coin SSOT into a "Convert address" panel; detect-convertible / **WARN-or-refuse (#961)** UX with side-by-side payload display + round-trip proof; add the **NMC SSOT leaf** + BCH transcode helper; construct all output types (encode). | M1-A | Read-only derivation, but the **#961 path is money-relevant** → Fable review required. |
 | **M2-X** | Monero | Output scanning via view key + amount decrypt; view-only "export outputs" artifact; balance/spent state. | M1-X | Read-only → lighter gate. |
 | **M3-A** | Bitcoin | Legacy sighash (parity KAT for block 2518186 folded in **plus a KAT reproducing the LTC+DOGE P2MS-in-P2SH donation spend**), **BIP143** (P2WPKH/P2WSH/P2SH-wrapped), bare-P2MS incl. the CHECKMULTISIG extra-pop; **wrapped/nested construct + spend + multi-party combine** (P2SH / P2WSH / nested P2SH-P2WSH, single-party plus the partial-sign→combine wiring — §4.1); self-verify + oversize per type. | M2-A | **HIGH** money-path. |
+| **M3-A-DASH** | Bitcoin (DASH) | DASH special-tx features (§4.1.1/§4.1.2, ported from `frstrtr/dash-proposal-collateral`): **governance-proposal collateral builder** (byte-exact gobject collateral hash, 1-DASH OP_RETURN burn + change, funding-key scan with hard-abort on mismatch) with a KAT against the proven Python reference; **message sign/verify** (Dash signed-message magic, recover-and-check self-verify). | M3-A | **HIGH** money-path (spends 1 DASH). |
 | **M3-X** | Monero | Import outputs → compute key images → export key images; port/build the **CLSAG signer** on the vendored ops; KAT against in-tree verifier. | M2-X | **HIGH** money-path. |
 | **M4-A** | Bitcoin | **BIP341/342** taproot key-path + script-path (schnorrsig/extrakeys, taptweak, control block, tapleaf/branch); multisig scriptWitness assembly. | M3-A | **HIGH** money-path. |
 | **M4-X** | Monero | **Bulletproofs+ prover** port; full RingCT tx construction + serialization; offline self-verify (in-tree BP+/RCT verifier + key-image recompute) before emit — completes Monero's native cold-sign. | M3-X | **HIGH** money-path. |
@@ -331,6 +354,8 @@ Each phase is a shippable DRAFT PR delivered by **qt-steward** under the **Fable
 Dependencies note: M5's Family-A online leg depends on the node-side BIP143/341/342 verifier work (§5.4 caveat); M5's Family-B online leg depends on the v37 XMR node exposing scan/decoy/fee/relay APIs.
 
 Scope note: per the operator directive of 2026-09-12, v1 scope is deliberately **maximal** — the full keystore-format set (A), all Monero seed schemes, view-only/offline-full split, and Monero multisig all land in v1 rather than being deferred. This is a larger attack/format surface by design and correspondingly more KATs; the extra breadth is accepted in exchange for a single comprehensive v1 rather than a staged rollout.
+
+Provenance note: the seed-generation/split-backup work (M1-A/M1-X) and the DASH special-tx work (M3-A-DASH) are **ports of two operator-owned repos** — `frstrtr/mnemonic_gen` and `frstrtr/dash-proposal-collateral`. Both are the operator's own and both are already offline-signer-shaped, fitting the air-gap model; both are **relicensed into c2pool's AGPL on port**.
 
 ---
 
@@ -346,6 +371,7 @@ Scope note: per the operator directive of 2026-09-12, v1 scope is deliberately *
 - **Air-gap erosion.** A Qt binary can link a socket where the Python baseline could not. Mitigation: the three-layer network-incapable build with a CI link-guard as the mechanical proof.
 - **Online validation blind spot.** The online node cannot fully validate segwit/taproot (A, legacy-only interpreter) or CLSAG/double-spend daemonlessly (B) — both require added verifier work or a parity authority (`--coin-rpc` for A's Core-parity path; monerod-parity #1583 for B).
 - **Node-side dependencies** (BIP143/341/342 verifier; v37 XMR wallet-facing APIs) are outside this tree and must be sequenced with the respective lanes/stewards.
+- **Custom seed split/shuffle is unreviewed cryptography (§3.4).** The `mnemonic_gen` port is **not** SLIP-39 Shamir — it is a bespoke 2-of-2 even/odd split with a PBKDF2/HMAC-DRBG reversible shuffle, and the source repo self-labels "educational, not for real funds." A 2-of-2 split means each recovered 12-word half **narrows the brute-force** of the other, so it is weaker than a threshold scheme. Mitigations: (a) generation entropy must come from a **vetted CSPRNG**, never the demo RNG; (b) the split/shuffle scheme needs an **independent security review before it guards real seeds**; (c) offer **SLIP-39 Shamir** as the standard, reviewed alternative alongside it.
 
 ### Open decisions for the operator
 
