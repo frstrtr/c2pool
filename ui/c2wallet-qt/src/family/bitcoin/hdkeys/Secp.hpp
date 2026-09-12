@@ -41,6 +41,14 @@ public:
     // (33 compressed). false if invalid.
     bool pubkey_tweak_add(std::vector<uint8_t>& pub33, const uint8_t tweak[32]) const;
 
+    // EC point * scalar, compressed serialization (33 bytes). Used by the
+    // Electrum full-file ECIES path: the shared secret is
+    // compress(ephemeral_pubkey * decryption_scalar) hashed with SHA-512.
+    // This is a raw point multiply (secp256k1_ec_pubkey_tweak_mul), NOT the
+    // secp256k1_ecdh module (which hashes the point differently). Empty on
+    // parse/multiply failure.
+    std::vector<uint8_t> ecdh_compressed(const std::vector<uint8_t>& pub, const uint8_t scalar[32]) const;
+
     // BIP341 key-path output key: given an internal seckey, compute the tweaked
     // output x-only key Q.x (32 bytes) where Q = P + H_TapTweak(P.x)*G.
     // Returns empty on failure.
