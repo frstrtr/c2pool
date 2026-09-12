@@ -688,4 +688,82 @@ if (BUILD_TESTING)
     target_include_directories(v37_drops_step2_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_drops_step2_wiring_kat Threads::Threads)
     add_test(NAME v37_drops_step2_wiring_kat COMMAND v37_drops_step2_wiring_kat)
+
+    # ★ DROPS ACTIVATION AT ARITY 1 — the gate-ON owed_digest a DECOUPLED fleet
+    # actually reproduces, minted and pinned BESIDE the arity-2 golden above.
+    #
+    # WHY A SECOND GOLDEN. v37_node_lane_activation.hpp records the operator
+    # ruling DECOUPLE: kActivationArity == 1, so a flipped node's lane geometry
+    # is LaneParams::for_version(1) — the ONE-argument factory, which names no
+    # parent LaneKind and therefore carries NO ridge and NO window dimensions
+    # (mrr / nr / win positions all UINT64_MAX, nr_version and win_version 0).
+    # The activation mint 984c7753... above was composed over for_version(1,
+    # LaneKind) with the ridge ACTIVE at 4096, and the ridge moves the lane's
+    # payout map, hence E_b, hence owed_digest. So 984c7753... is NOT the fleet
+    # value at arity 1. The header says that in prose; this KAT supplies the
+    # number and pins it:
+    #   arity-1 gate-ON owed_digest (identical on all four ratified lanes)
+    #     ae44add291dbe90aec581825a3e60ce8fd7bbc7194bc767e096da12669d8614f
+    #   arity-1 all-lanes fold, sha256d("V37DROPS1" || BTC || LTC || DASH || DOGE)
+    #     50b5d7d109a1ae5429f4be91c54fba62c031449e01509d1ce9295a0a79af8646
+    #
+    # ★ ADD-ONLY. 984c7753... and its fold b03abb1f... are NOT moved, replaced or
+    # re-minted: case A2-UNMOVED re-derives BOTH from this file's own copy of the
+    # schedule and harvest (which is also what proves the copy has not drifted),
+    # and the gate-OFF anchors b4db1ded... / 9cfaf97d... / 87c5249a... are
+    # asserted byte-identical. Neither golden may be edited without the other.
+    #
+    # ALSO PINS:
+    #   - the arity-1 gate-OFF anchor is 9cfaf97d... (the PRE-V37.1 control), not
+    #     87c5249a... — that difference IS the decoupling, and the arms are
+    #     non-vacuous: the same harvest that leaves drops-OFF / harvest-EMPTY /
+    #     K = 2 / J < K at 9cfaf97d... moves the ON arm;
+    #   - W4 RATIFIES the arity-1 geometry, without which the flip would refuse
+    #     every E_b fold and DROPS would be dormant for a second, quieter reason;
+    #   - THREE independent reproductions of the arity-1 value on every lane: the
+    #     engine seam (OwedLedger), an independently shadowed (finalW,
+    #     first_eligible) state hashed by the estimator module's own
+    #     owed_digest(), and a from-spec re-derivation that never calls
+    #     subthreshold_credit();
+    #   - ARITY-COST: the two goldens differ, the E_b half does NOT (both arities
+    #     split the same four rewards), and — measured rather than assumed — the
+    #     estimator's own contribution is NOT arity-invariant either, because the
+    #     ridge moves SUM weight and therefore the price the R1 denomination
+    #     divides by.
+    # Stdlib-only, ~2 s. SAME HOLLOW-GREEN GUARD: ALSO on BOTH build.yml lists.
+    add_executable(v37_drops_arity1_activation_kat v37_drops_arity1_activation_kat.cpp)
+    target_compile_features(v37_drops_arity1_activation_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_drops_arity1_activation_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_drops_arity1_activation_kat Threads::Threads)
+    add_test(NAME v37_drops_arity1_activation_kat COMMAND v37_drops_arity1_activation_kat)
+
+    # ★★ THE LIVE-GEOMETRY LEG — the SAME source compiled a second time so the
+    # mint is read from the node lane FACTORY instead of from a restatement of
+    # it. The default target above names the arity-1 geometry explicitly
+    # (for_version(1)), which is what makes its goldens invariant to the
+    # kActivationArity constant — but it leaves one thing unproved: that
+    # node_lane_params() actually hands a flipped node that geometry. Here case
+    # ARITY1-LIVEGEOM reads node_lane_params(lane) directly, asserts it is
+    # field-for-field for_version(1) with every position OFF on all four lanes
+    # (and that the no-LaneKind XMR arm lands on the same geometry), and DRIVES
+    # THE WHOLE MINT FROM IT. Both targets print the same seven pinned values.
+    #
+    # ★★ THIS IS NOT THE FLIP AND DOES NOT TAKE IT. V37_ACTIVATE_CONSENSUS_V1=1
+    # is scoped PRIVATE to this one TEST EXECUTABLE. No product target, no
+    # default, no cache variable and no build.yml option carries it; the shipped
+    # default in v37_node_lane_activation.hpp stays 0, the default target above
+    # asserts kActivateConsensusV1 == false, and a normal build of c2pool is
+    # byte-identical to master. The consensus flip remains exactly what the
+    # header says it is: the operator's hand, fleet-wide, at a ruled height. This
+    # target exists so that hand knows the number it will land on.
+    add_executable(v37_drops_arity1_activation_kat_livegeom
+                   v37_drops_arity1_activation_kat.cpp)
+    target_compile_features(v37_drops_arity1_activation_kat_livegeom PRIVATE cxx_std_20)
+    target_include_directories(v37_drops_arity1_activation_kat_livegeom
+                               PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(v37_drops_arity1_activation_kat_livegeom
+                               PRIVATE V37_ACTIVATE_CONSENSUS_V1=1)
+    target_link_libraries(v37_drops_arity1_activation_kat_livegeom Threads::Threads)
+    add_test(NAME v37_drops_arity1_activation_kat_livegeom
+             COMMAND v37_drops_arity1_activation_kat_livegeom)
 endif()
