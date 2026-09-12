@@ -43,6 +43,7 @@ set(CMAKE_C_STANDARD 11)
 get_filename_component(C2WALLET_MONERO_NODE_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../src" ABSOLUTE)
 set(XMR_COIN "${C2WALLET_MONERO_NODE_SRC}/impl/xmr/coin")
+set(XMR_RCT  "${C2WALLET_MONERO_NODE_SRC}/impl/xmr/native/rct")
 
 if (NOT EXISTS "${XMR_COIN}/vendor/crypto-ops.c")
     message(FATAL_ERROR
@@ -60,11 +61,13 @@ add_library(c2wallet_monero_xmrvendor STATIC
     ${XMR_COIN}/vendor/crypto-ops.c
     ${XMR_COIN}/vendor/crypto-ops-data.c
     ${XMR_COIN}/xmr_derivation.cpp        # extracted CryptoNote derivation subset
+    ${XMR_RCT}/xmr_rct_ops.cpp            # M3-X: RingCT scalar/point helpers (CLSAG deps)
 )
 target_include_directories(c2wallet_monero_xmrvendor PUBLIC
     ${XMR_COIN}/compat      # MUST be first: <sodium/crypto_verify_32.h>, warnings.h
     ${XMR_COIN}
     ${XMR_COIN}/vendor
+    ${XMR_RCT}              # M3-X: for "xmr_rct_ops.hpp"
 )
 # int-util.h wants _GNU_SOURCE for BYTE_ORDER/mul128 (harmless for the C++ TU).
 target_compile_definitions(c2wallet_monero_xmrvendor PRIVATE _GNU_SOURCE)
@@ -79,6 +82,8 @@ add_library(c2wallet_monero STATIC
     MoneroKey.cpp
     scan/MoneroScanOps.cpp
     scan/MoneroScanner.cpp
+    prover/MoneroClsag.cpp                # M3-X: CLSAG signer + verifier (ported)
+    prover/MoneroKeyImage.cpp             # M3-X: key-image export {I, ring-sig}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../secure/SecureString.cpp
 )
 target_include_directories(c2wallet_monero PUBLIC
@@ -103,3 +108,14 @@ add_executable(c2wallet-monero-scan-test
 target_link_libraries(c2wallet-monero-scan-test PRIVATE c2wallet_monero)
 
 add_test(NAME c2wallet_monero_scan_kat COMMAND c2wallet-monero-scan-test)
+
+# ── Family B (Monero) prover KATs (M3-X): key image + CLSAG signer ───────────
+# Money-path: key-image export {I, ring-sig} and the ported CLSAG signer, gated
+# by a construct->verify round-trip against the ported verifier (there is no
+# in-tree CLSAG verifier) plus tamper-rejection and the view-only split.
+add_executable(c2wallet-monero-prover-test
+    prover/test/monero_prover_test.cpp
+)
+target_link_libraries(c2wallet-monero-prover-test PRIVATE c2wallet_monero)
+
+add_test(NAME c2wallet_monero_prover_kat COMMAND c2wallet-monero-prover-test)
