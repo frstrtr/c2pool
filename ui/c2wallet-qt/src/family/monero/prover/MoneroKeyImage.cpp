@@ -28,6 +28,7 @@
 #include "family/monero/scan/MoneroScanOps.hpp"   // key_derivation, derive_secret_key, generate_key_image
 #include "secure/SecureString.hpp"                // c2w::secure::secure_wipe
 #include "xmr_rct_ops.hpp"                         // hash_to_scalar, hash_to_p3, random, in_main_subgroup
+#include "family/monero/prover/MoneroProverRng.hpp"  // csprng_scalar_nonzero (money-safe prover RNG)
 
 extern "C" {
 #include "vendor/crypto-ops.h"
@@ -69,7 +70,8 @@ bool generate_ring_signature(const Bytes32& prefix_hash, const Bytes32& image,
         std::uint8_t* a = buf.data() + 32 + i * 64;
         std::uint8_t* b = a + 32;
         if (i == sec_index) {
-            k = xr::random_scalar_nonzero();
+            // MONEY-SAFETY: r=k-c*sec is published; a predictable k leaks sec.
+            k = csprng_scalar_nonzero();
             ge_p3 tmp3;
             ge_scalarmult_base(&tmp3, k.data());
             ge_p3_tobytes(a, &tmp3);
@@ -79,8 +81,10 @@ bool generate_ring_signature(const Bytes32& prefix_hash, const Bytes32& image,
             ge_scalarmult(&tmp2, k.data(), &hp);
             ge_tobytes(b, &tmp2);
         } else {
-            const Bytes32 ci = xr::random_scalar_nonzero();
-            const Bytes32 ri = xr::random_scalar_nonzero();
+            // MONEY-SAFETY: decoy c_i/r_i are PUBLISHED in the ring signature;
+            // predictable draws leak the mt19937 state and thus the spend key.
+            const Bytes32 ci = csprng_scalar_nonzero();
+            const Bytes32 ri = csprng_scalar_nonzero();
             ge_p3 pub3;
             if (ge_frombytes_vartime(&pub3, pubs[i].data()) != 0) {
                 c2w::secure::secure_wipe(k.data(), k.size());

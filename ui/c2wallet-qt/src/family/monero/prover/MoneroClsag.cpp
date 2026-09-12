@@ -27,6 +27,7 @@
 
 #include "secure/SecureString.hpp"          // c2w::secure::secure_wipe
 #include "xmr_rct_ops.hpp"                   // c2pool::xmr::native::rct helpers
+#include "family/monero/prover/MoneroProverRng.hpp"  // csprng_scalar_nonzero (money-safe prover RNG)
 
 extern "C" {
 #include "vendor/crypto-ops.h"
@@ -119,7 +120,9 @@ bool clsag_gen(const Bytes32& message,
     ge_p3_tobytes(H.data(), &H_p3);
 
     // clsag_prepare (device_default): a random nonce, and the two images.
-    Bytes32 a = xr::random_scalar_nonzero();
+    // MONEY-SAFETY: aG is published (round hash) and s[l]=a-c*(...) leaks a if
+    // predictable, so a MUST come from the wallet-local CSPRNG, not mt19937.
+    Bytes32 a = csprng_scalar_nonzero();
     Bytes32 aG{}; scalarmult_base(aG, a);
     Bytes32 aH{}; xr::scalarmult_key(aH, H, a);   // aH = a*H
     xr::scalarmult_key(sig.I, H, p);              // I  = p*H
@@ -165,7 +168,9 @@ bool clsag_gen(const Bytes32& message,
     ge_p3 Hi_p3;
 
     while (i != l) {
-        sig.s[i] = xr::random_scalar_nonzero();
+        // MONEY-SAFETY: the decoy scalars s[i] are PUBLISHED in the signature;
+        // a predictable RNG here leaks the mt19937 state and thus the spend key.
+        sig.s[i] = csprng_scalar_nonzero();
         sc_mul(c_p.data(), mu_P.data(), c.data());
         sc_mul(c_c.data(), mu_C.data(), c.data());
 

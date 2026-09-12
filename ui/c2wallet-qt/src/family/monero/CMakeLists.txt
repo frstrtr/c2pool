@@ -82,6 +82,7 @@ add_library(c2wallet_monero STATIC
     MoneroKey.cpp
     scan/MoneroScanOps.cpp
     scan/MoneroScanner.cpp
+    prover/MoneroProverRng.cpp            # M3-X: wallet-local CSPRNG scalar for the prover (money-safety)
     prover/MoneroClsag.cpp                # M3-X: CLSAG signer + verifier (ported)
     prover/MoneroKeyImage.cpp             # M3-X: key-image export {I, ring-sig}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../secure/SecureString.cpp

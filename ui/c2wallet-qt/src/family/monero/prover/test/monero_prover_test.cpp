@@ -300,6 +300,57 @@ void test_clsag_tamper() {
     }
 }
 
+// ── [F] prover randomness is a CSPRNG (money-safety) ─────────────────────────
+// The CLSAG signer and the key-image ring signature publish scalars bound to
+// their secret nonces. Signing the SAME message twice must therefore draw
+// FRESH nonces each time: identical published scalars would prove a broken
+// (deterministic / low-entropy) RNG and leak the spend key. Both signatures
+// must still verify, and the deterministic key image must be unchanged.
+void test_prover_nonce_is_csprng() {
+    std::printf("[F] prover nonces come from a CSPRNG (distinct across signings)\n");
+
+    // CLSAG: two independent signings over identical inputs.
+    const std::size_t n = 11, l = 4;
+    const std::uint64_t amount = 1234567ULL;
+    const Bytes32 p     = scalar_of("c2w-m3x-csprng-onetime-secret");
+    const Bytes32 c_a   = scalar_of("c2w-m3x-csprng-real-mask");
+    const Bytes32 c_out = scalar_of("c2w-m3x-csprng-pseudo-mask");
+    const Bytes32 msg   = mcrypto::keccak256(
+        reinterpret_cast<const std::uint8_t*>("c2w-m3x csprng nonce message"), 28);
+
+    std::vector<prover::CtKey> ring; Bytes32 Cout{};
+    build_ring(n, l, p, amount, c_a, c_out, ring, Cout);
+
+    prover::Clsag s1, s2;
+    check(prover::clsag_prove_simple(msg, ring, p, c_a, c_out, Cout, l, s1), "CLSAG signing #1 succeeds");
+    check(prover::clsag_prove_simple(msg, ring, p, c_a, c_out, Cout, l, s2), "CLSAG signing #2 succeeds");
+    check(prover::clsag_verify(msg, s1, ring, Cout), "CLSAG signing #1 verifies");
+    check(prover::clsag_verify(msg, s2, ring, Cout), "CLSAG signing #2 verifies");
+    // Deterministic key image is identical; random nonces make s[l] (and c1) differ.
+    check(s1.I == s2.I, "key image is deterministic across signings (sig.I unchanged)");
+    check(s1.s[l] != s2.s[l], "real-index scalar s[l] differs across signings (fresh nonce a)");
+    check(s1.c1 != s2.c1, "challenge c1 differs across signings (fresh decoy scalars)");
+    bool any_decoy_diff = false;
+    for (std::size_t i = 0; i < n; ++i)
+        if (i != l && s1.s[i] != s2.s[i]) { any_decoy_diff = true; break; }
+    check(any_decoy_diff, "published decoy scalars s[i] differ across signings (CSPRNG draws)");
+
+    // Key-image ring signature: two exports of the SAME output.
+    MoneroKeys acc = full_account();
+    BuiltOutput b = build_owned_output(acc, "c2w-m3x-csprng-ki-r", 55555ULL, 0);
+    std::vector<ExportedOutput> outs{b.exp};
+    prover::KeyImageExportResult r1 = prover::export_key_images(acc, outs);
+    prover::KeyImageExportResult r2 = prover::export_key_images(acc, outs);
+    check(r1.ok && r2.ok && r1.images.size() == 1 && r2.images.size() == 1, "two key-image exports succeed");
+    if (r1.ok && r2.ok && !r1.images.empty() && !r2.images.empty()) {
+        check(r1.images[0].image == r2.images[0].image, "key image is deterministic across exports");
+        check(r1.images[0].signature != r2.images[0].signature,
+              "key-image ring signature differs across exports (fresh nonces k,c_i,r_i)");
+        check(prover::check_exported_key_image(r1.images[0]) &&
+              prover::check_exported_key_image(r2.images[0]), "both exported ring signatures verify");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -309,6 +360,7 @@ int main() {
     test_view_only_cannot_export();
     test_clsag_roundtrip();
     test_clsag_tamper();
+    test_prover_nonce_is_csprng();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
