@@ -86,7 +86,10 @@ inline CoinDaemonEndpoint default_endpoint(BtcFamilyCoin coin, BtcNetwork net) {
         switch (net) {
             case BtcNetwork::Regtest:  e.rpc_port = 19998; e.p2p_port = 19899; break;
             case BtcNetwork::Devnet:   e.rpc_port = 19998; e.p2p_port = 19899; break;
-            case BtcNetwork::Testnet4: // DASH has no testnet4; fall through to testnet
+            // DASH has no testnet4; --network testnet IS testnet3 (rpc 19998,
+            // p2p 19999). It must NOT share the mainnet arm below: falling
+            // through handed a testnet node the MAINNET endpoint 9998/9999.
+            case BtcNetwork::Testnet4: e.rpc_port = 19998; e.p2p_port = 19999; break;
             case BtcNetwork::Mainnet:  e.rpc_port =  9998; e.p2p_port =  9999; break;
         }
     } else {  // LTC
