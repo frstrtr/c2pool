@@ -633,8 +633,9 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                 std::printf("  carrier inbound: frames=%llu admitted=%llu echo=%llu "
                             "wire_rejected=%llu policy_rejected=%llu admit_rejected=%llu | "
                             "S-1c cut_frames=%llu offered=%llu credited=%llu valueless=%llu "
+                            "recomputed=%llu "
                             "cut_miss=%llu cut_mismatch=%llu refused[fold=%llu payout=%llu "
-                            "late=%llu] known=%llu owed_diverged=%llu\n",
+                            "late=%llu] known=%llu owed_skew=%llu\n",
                             static_cast<unsigned long long>(ib.frames.load()),
                             static_cast<unsigned long long>(ib.admitted.load()),
                             static_cast<unsigned long long>(ib.echo.load()),
@@ -645,13 +646,14 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(ib.cut_offered.load()),
                             static_cast<unsigned long long>(s1p.credited),
                             static_cast<unsigned long long>(s1p.valueless),
+                            static_cast<unsigned long long>(s1p.payout_recomputed),
                             static_cast<unsigned long long>(s1p.cut_miss),
                             static_cast<unsigned long long>(s1p.cut_mismatch),
                             static_cast<unsigned long long>(s1p.refused_fold),
                             static_cast<unsigned long long>(s1p.refused_payout),
                             static_cast<unsigned long long>(s1p.refused_late),
                             static_cast<unsigned long long>(s1p.already_known),
-                            static_cast<unsigned long long>(s1p.owed_diverged));
+                            static_cast<unsigned long long>(s1p.owed_skew));
             } else {
                 std::printf("  lane: NO CARRIER LAYER (--p2p-bind/--peer unset and no pool "
                             "identity): shares do not reach the lane, so E_b folds to {} and "
@@ -681,6 +683,10 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
 
     auto last_status = std::chrono::steady_clock::now();
     std::string last_template_err;
+    // ★ (a): the bound on the descriptor-gap hold above. Four poll intervals is
+    // orders of magnitude more than a loopback relay hop and still ends.
+    unsigned rebuild_holds = 0;
+    constexpr unsigned kMaxRebuildHolds = 2;
     while (!g_stop.load()) {
         bridge_found();
         fc.tick();
@@ -709,13 +715,33 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         // is still in flight hold the rebuild for one iteration. Holding costs a
         // poll interval of template staleness, which the miners absorb; not
         // holding costs real money.
+        //
+        // ★ (a) EXTENDS THIS TO PEER WINS. The same argument covers a block a
+        // PEER mined that we have been told about but have not booked: its
+        // payout is not yet reserved here, so a template built now proposes a
+        // LARGER K_fair set than the winner's did — and since owed_digest
+        // commits only to the finalized half, that difference is invisible to
+        // the receive-side guard and would be booked silently. Draining the
+        // peer queue first is what keeps the two reservation sets equal.
         bridge_found();
-        if (fc.unbooked_found() || submit_q.size()) fc.tick();
-        const bool found_in_flight = (submit_q.size() != 0) || (fc.unbooked_found() != 0);
+        if (fc.unbooked_found() || submit_q.size() || fc.unbooked_peer_wins()) fc.tick();
+        // ★ (a): a height the CHAIN has but whose block-winner descriptor has
+        // not reached us yet. Holding for it is what keeps this node's K_fair
+        // reservation set equal to the winner's; it is BOUNDED so a descriptor
+        // that never comes parks nobody -- after the bound the template is built
+        // and the recompute's reservation witness refuses that height loudly.
+        const std::size_t chain_gap = fc.unbooked_chain_heights();
+        const bool hold_for_gap = (chain_gap != 0) && (rebuild_holds < kMaxRebuildHolds);
+        rebuild_holds = hold_for_gap ? rebuild_holds + 1 : 0;
+        const bool found_in_flight = (submit_q.size() != 0) || (fc.unbooked_found() != 0) ||
+                                     (fc.unbooked_peer_wins() != 0) || hold_for_gap;
         if (found_in_flight)
-            std::printf("  template: rebuild HELD one tick — %zu found block(s) still in flight "
-                        "(a template built now could re-propose what they just paid)\n",
-                        submit_q.size() + fc.unbooked_found());
+            std::printf("  template: rebuild HELD one tick — %zu found block(s)/peer win(s) in "
+                        "flight, %zu chain height(s) with no descriptor yet (a template built now "
+                        "could re-propose what they just paid, or propose over a smaller "
+                        "reservation than the winner's)\n",
+                        submit_q.size() + fc.unbooked_found() + fc.unbooked_peer_wins(),
+                        hold_for_gap ? chain_gap : std::size_t{0});
         if (serving && !found_in_flight) {
             const bool refreshed = provider.refresh();
             bool new_template = false;
@@ -1156,6 +1182,48 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return true;
             });
 
+        // ── ★ canonical_coinbase_matches = (a): the K_fair PEER-RECOMPUTE ─────
+        // Every template this node builds is one K_fair run of
+        // OwedLedger::propose_coinbase over its own owed ledger. Recording the
+        // Owed-role outputs of that template, per height, is what lets a PEER's
+        // settling block be credited here with the SAME deduction the winner
+        // made — the payout map is unbounded and is deliberately not on the
+        // frozen v0x02 carrier wire, so it is reproduced rather than shipped.
+        //
+        // WHY THE RECORD IS TAKEN HERE AND NOWHERE ELSE. K_fair is a pure
+        // function of the ledger STATE, and the two nodes share that state at
+        // exactly one instant per height: both build h when their tip is h-1,
+        // after the finalize of bin h-1 and before the finalize of bin h. This
+        // hook runs immediately after the refresh that produced the template,
+        // with nothing between it and the build that can move finalW, so the
+        // digest stamped beside the map is the one the winner's descriptor will
+        // be compared against.
+        //
+        // ARMED ONLY WHERE IT IS TRUE: --owed-demo-amount builds the coinbase
+        // from a SEPARATE proof fixture, so its owed outputs belong to a ledger
+        // FOUND/FINALIZE never move and must not be deducted from this one. That
+        // is the same condition the R-7 payout leg uses (fo.require_payout).
+        o2::XmrKFairPayoutCache  kfair_cache;
+        o2::XmrRecomputeStats    kfair_stats;
+        const bool kfair_recompute_armed = (cfg.owed_demo_amount == 0);
+        if (kfair_recompute_armed) {
+            fc.set_peer_payout_recompute([&kfair_cache, &kfair_stats, &fc](const o2::XmrPeerWin& w) {
+                return o2::recompute_peer_payout(
+                    kfair_cache, w, kfair_stats,
+                    [&fc](std::uint64_t lo, std::uint64_t hi) {
+                        return fc.known_blocks_in(lo, hi);
+                    });
+            });
+        }
+        std::printf("K_fair peer-recompute: %s (canonical_coinbase_matches = (a): a SETTLING "
+                    "peer block is credited with the payout OUR OWN K_fair run for that height "
+                    "proposed, admitted only when our owed_digest at that build equals the "
+                    "winner's at the win)\n",
+                    kfair_recompute_armed
+                        ? "ARMED"
+                        : "DISARMED (--owed-demo-amount: the coinbase settles the proof fixture, "
+                          "not this ledger)");
+
         o2::SettlementStratumTemplateSource template_source(provider);
         std::printf("coinbase: %s (lane_chain=%u, residual sink %s)\n",
                     to_string(cfg.coinbase), static_cast<unsigned>(cfg.lane_chain),
@@ -1216,6 +1284,36 @@ static int run_live(const XmrNodeConfig& cfg) {
             };
         }
         hooks.after_refresh = [&](bool refreshed, bool new_template) {
+            // ★ (a): record THIS node's K_fair run for the height it just built.
+            // Read off the assembled template's own outputs — the single object
+            // the block bytes would have been built from — with the Fixed and
+            // Sink roles excluded exactly as candidate_by_id() excludes them
+            // (neither is ever credited to a ledger key, so neither may be
+            // deducted from one). Driven on every refresh, not only on a new
+            // template id: observe() is a no-op for a (height, template_id) it
+            // already holds, so the digest is never re-stamped with a later one.
+            if (refreshed && kfair_recompute_armed) {
+                const o2::SettlementSnapshot t = provider.current();
+                if (t.valid && t.tpl && t.height) {
+                    ::c2pool::v37n::settle::OwedLedger::Amounts owed_map;
+                    for (const auto& o : t.tpl->outputs()) {
+                        if (o.role != ::v37::xmr::settle::CoinbaseOutput::Role::Owed) continue;
+                        owed_map[o.identity] += static_cast<long long>(o.amount);
+                    }
+                    // The reservation witness: the finalize cursor now, and how
+                    // many blocks we know of in (cursor, height). K_fair drew on
+                    // EffectiveOwed, which nets exactly those blocks' payouts,
+                    // and owed_digest does not commit to them — so without this
+                    // a receiver that had not yet drained one of the winner's
+                    // descriptors would propose a different map under an equal
+                    // digest and book it silently.
+                    const std::uint64_t cur = node.finalize_driver().cursor_height();
+                    kfair_cache.observe(t.height, snap_reward(t), t.template_id,
+                                        node.ledger().owed_digest(), owed_map,
+                                        cur, fc.known_blocks_in(cur, t.height),
+                                        &kfair_stats);
+                }
+            }
             if (!native || !refreshed || !new_template) return;
             auto* orc = native->oracle();
             if (!orc) return;
@@ -1227,6 +1325,30 @@ static int run_live(const XmrNodeConfig& cfg) {
                 orc->on_serve(provider.current().epoch, served, provider.current().source_name);
         };
         hooks.status_extra = [&]() {
+            // ★ (a): the peer-recompute account. `applied` is the claim — a
+            // settling peer block whose payout this node reproduced and booked.
+            // Every other counter is a REFUSAL, and a refusal means this node's
+            // owed_digest will not converge with that winner's for that block:
+            // they are printed individually so an operator never has to guess
+            // which precondition failed.
+            std::printf("  K_fair peer-recompute: %s cache=%zu heights [%llu..%llu] "
+                        "templates=%llu | asked=%llu APPLIED=%llu | refused[no-record=%llu "
+                        "ambiguous=%llu reward=%llu digest=%llu empty=%llu shape=%llu "
+                        "reservation=%llu]\n",
+                        kfair_recompute_armed ? "armed" : "DISARMED",
+                        kfair_cache.size(),
+                        static_cast<unsigned long long>(kfair_cache.oldest_height()),
+                        static_cast<unsigned long long>(kfair_cache.newest_height()),
+                        static_cast<unsigned long long>(kfair_stats.observed),
+                        static_cast<unsigned long long>(kfair_stats.asked),
+                        static_cast<unsigned long long>(kfair_stats.applied),
+                        static_cast<unsigned long long>(kfair_stats.no_record),
+                        static_cast<unsigned long long>(kfair_stats.ambiguous),
+                        static_cast<unsigned long long>(kfair_stats.reward_mismatch),
+                        static_cast<unsigned long long>(kfair_stats.digest_mismatch),
+                        static_cast<unsigned long long>(kfair_stats.empty_map),
+                        static_cast<unsigned long long>(kfair_stats.bad_shape),
+                        static_cast<unsigned long long>(kfair_stats.reservation));
             if (!last_shape.empty())
                 std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
                             last_selected_tx, last_shape.c_str(),

@@ -71,6 +71,19 @@
 //       on_block_finalized API. Without it a peer accounts the block-winning
 //       carrier as an ordinary share, never credits E_b, and the two nodes
 //       commit to different owed ledgers while both look healthy.
+//   (2c) ★ canonical_coinbase_matches = (a) — A SETTLING PEER WIN. S-1c alone
+//       converges only until the first block whose option-B coinbase actually
+//       PAYS owed: from there the winner deducts a payout map the receiver does
+//       not have (it is unbounded and deliberately off the frozen v0x02 wire),
+//       and the receiver's only honest move was to refuse the block, forking
+//       the ledgers. Under ruling (a) the receiver RECOMPUTES that map from its
+//       OWN K_fair run for the same height — OwedLedger::propose_coinbase, the
+//       same deterministic §4.6 selection the node already performs for its own
+//       template — and books it as the payout leg. The recompute is a pure
+//       lookup in xmr_peer_payout_recompute.hpp, admitted only when our
+//       owed_digest at that build equals the winner's at the win; every other
+//       shape keeps the loud fail-closed refusal. A second CALLER of K_fair,
+//       never a second K_fair.
 //   (3) The LATE-FOUND guard: XmrFinalizeDriver::advance_to_tip steps only
 //       heights ABOVE its cursor (:155). A FOUND registered at a height the
 //       cursor already passed would sit pending FOREVER (its payout deducted
@@ -141,6 +154,7 @@
 #include "impl/xmr/node/xmr_node_types.hpp"        // c2pool::xmr::node::Hash
 #include "xmr_node.hpp"                            // XmrNode, hex_of, Amounts (via xmr_settle_store.hpp)
 #include "xmr_node_config.hpp"                     // XmrNodeConfig, MoneroNetwork
+#include "xmr_peer_payout_recompute.hpp"           // ★ (a) peer-recompute: XmrPeerPayoutOutcome
 #include "xmr_s1_fold.hpp"                         // ★ S-1b: fold_at_tip / fold_at_peer_cut (settle::fold_eb)
 #include "xmr_same_height_race.hpp"                // SameHeightRaceLedger (c2pool#1551)
 
@@ -524,6 +538,7 @@ public:
                 continue;
             }
             m_pending[bid] = rec;
+            note_known(rec.height, bid);
             m_race.observe_own(rec.height, bid, rec.found_unix_s);
             if (pending) ++rep.reseeded; else ++rep.reregistered;
             if (!payout.empty()) ++rep.payout_redriven;
@@ -579,6 +594,63 @@ public:
     // exists to prevent, re-entering through the back door. The serve loop uses
     // it to hold the rebuild for one iteration.
     std::size_t unbooked_found() const { return m_q.size(); }
+
+    // ★ (a): peer wins that have ARRIVED but have not been looked at yet. The
+    // R-7 reason `unbooked_found()` exists applies verbatim to them: a template
+    // built while one is in flight proposes over a reservation set that is
+    // MISSING that block's payout, and a receiver whose reservation set is
+    // smaller than the winner's proposes a different K_fair map. Retries
+    // (attempts > 0) are excluded on purpose — a cut-miss is already waiting on
+    // the engine and must not park the miners for its whole retry budget.
+    std::size_t unbooked_peer_wins() const {
+        std::lock_guard<std::mutex> lk(m_peer_mtx);
+        std::size_t n = 0;
+        for (const PeerPending& p : m_peer_q) if (p.attempts == 0) ++n;
+        return n;
+    }
+
+    // ★ (a): heights in (cursor, tip] for which we know of NO block at all —
+    // i.e. a block the chain has but whose block-winner descriptor has not
+    // reached (or not yet been drained by) this node.
+    //
+    // WHY THIS MUST HOLD THE TEMPLATE REBUILD. K_fair draws on EffectiveOwed,
+    // which nets the payouts of the blocks a node holds PENDING. The winner
+    // books its own block BEFORE it builds the next height (the R-7 hold), so
+    // its reservation set always contains it. A receiver's tip moves from the
+    // CHAIN — a poll away — while the descriptor is a poll plus a relay hop
+    // away, so without this the receiver routinely builds h+1 with the block at
+    // h missing from its reservation, proposes a LARGER K_fair set than the
+    // winner did, and the equal owed_digest (the finalized half only) cannot
+    // tell the difference. The caller holds the rebuild while this is non-zero,
+    // BOUNDED, so a descriptor that never arrives parks nobody: the recompute's
+    // reservation witness then refuses that height, loudly.
+    //
+    // Returns 0 when the window is implausibly wide (initial catch-up), where a
+    // hold would be pointless and every height is unknown by construction.
+    std::size_t unbooked_chain_heights(std::uint64_t max_window = 32) const {
+        const std::uint64_t cursor = m_node.finalize_driver().cursor_height();
+        const std::uint64_t tip    = m_node.best_height();
+        if (tip <= cursor || tip - cursor > max_window) return 0;
+        std::size_t n = 0;
+        for (std::uint64_t h = cursor + 1; h <= tip; ++h)
+            if (!m_known_by_height.count(h)) ++n;
+        return n;
+    }
+
+    // ★ (a): how many blocks this node KNOWS OF with lo < height < hi. Monotone
+    // (a block is never un-learned; an orphan stays known), counted over every
+    // own FOUND and every peer descriptor ever offered — which is exactly the
+    // population that can sit in a K_fair reservation. The recompute witnesses
+    // this at template-build time and re-asks here, so a record built before a
+    // block in its window was known is REFUSED instead of booked.
+    std::size_t known_blocks_in(std::uint64_t lo_exclusive,
+                                std::uint64_t hi_exclusive) const {
+        std::size_t n = 0;
+        for (auto it = m_known_by_height.upper_bound(lo_exclusive);
+             it != m_known_by_height.end() && it->first < hi_exclusive; ++it)
+            n += it->second.size();
+        return n;
+    }
 
     // ★ R-7: the two owed floors, taken on every tick rather than whenever a
     // status line happens to print. See Stats for why they are different claims.
@@ -749,6 +821,7 @@ public:
             return refuse(r, bid, "ledger did not admit the FOUND (bid already known?)");
         }
         ++m_stats.registered;
+        note_known(ev.height, bid);
         // c2pool#1551: the block enters the race book at the same instant it
         // enters the ledger's pending set, so no window exists in which a rival
         // at the same height could be judged against an empty book.
@@ -820,6 +893,18 @@ public:
         std::function<void(const std::string& bid, const PendingRec& rec, const XmrEbCut& cut)>;
     void set_on_registered_found(OnRegisteredFoundFn f) { m_on_registered = std::move(f); }
 
+    // ── ★ canonical_coinbase_matches = (a): the K_fair peer-recompute seam ───
+    // Bound by the daemon ONLY in the mode where it is meaningful: option B with
+    // the coinbase committing to THIS node's own ledger. Unbound (option A, or
+    // --owed-demo-amount, whose coinbase settles a separate proof ledger) leaves
+    // the pre-(a) behaviour exactly as it was — a settling peer win is refused,
+    // loudly. The daemon binds it to xmr_peer_payout_recompute.hpp's pure
+    // decision over its per-height K_fair cache; nothing about the fold, the
+    // ledger or the owed commitment is re-implemented behind it.
+    using PeerPayoutRecomputeFn = std::function<XmrPeerPayoutOutcome(const XmrPeerWin&)>;
+    void set_peer_payout_recompute(PeerPayoutRecomputeFn f) { m_recompute = std::move(f); }
+    bool peer_payout_recompute_armed() const { return static_cast<bool>(m_recompute); }
+
 private:
     // ── ★ S-1c: drain the peer-win queue on the MAIN thread ─────────────────
     //
@@ -842,7 +927,14 @@ private:
             const XmrPeerWin& w = pw.win;
             const std::string bid = lower_hex(w.bid);
             const bool first_look = (pw.attempts == 0);
-            if (first_look) ++m_s1p.seen;
+            if (first_look) {
+                ++m_s1p.seen;
+                // ★ (a): a descriptor is proof the WINNER registered this block,
+                // so it joins the known population whatever we go on to do with
+                // it — including refuse it. The reservation witness counts
+                // blocks that can be reserved, not blocks we credited.
+                note_known(w.h_b, bid);
+            }
 
             // (a) ours, or a duplicate descriptor. The flood echoes our own
             //     block-winning carrier straight back at us; re-driving it would
@@ -860,15 +952,41 @@ private:
                     continue;
                 }
             }
-            // (b) the winner had already broadcast owed outputs. Its payout map
-            //     is not on the wire and we cannot reproduce it: fail closed.
+            // (b) ★ canonical_coinbase_matches = (a) PEER-RECOMPUTE. The winner
+            //     broadcast a SETTLING coinbase: its option-B K_fair outputs paid
+            //     owed balances, and that map is not on the frozen v0x02 wire
+            //     (unbounded by construction). It used to be refused outright,
+            //     which forked the two ledgers from the first settling block.
+            //
+            //     Now it is RECOMPUTED: K_fair is OwedLedger::propose_coinbase,
+            //     deterministic over the ledger state, and THIS node already ran
+            //     it for its OWN option-B template at this very height — at the
+            //     winner's instant, because both nodes build h=H_b when their tip
+            //     is H_b-1. xmr_peer_payout_recompute.hpp hands that map back
+            //     only when our owed_digest at that build EQUALS the winner's at
+            //     the win; every other shape stays the loud fail-closed refusal.
+            Amounts recomputed;
             if (w.payout_emitted) {
-                ++m_s1p.refused_payout;
-                ++t.peer_refused;
-                say("S-1c REFUSED " + short_bid(bid) + ": the winner's coinbase had already "
-                    "EMITTED owed outputs and the payout map is not on the wire — we credit "
-                    "nothing rather than credit something different");
-                continue;
+                if (!m_recompute) {
+                    ++m_s1p.refused_payout;
+                    ++t.peer_refused;
+                    say("S-1c REFUSED " + short_bid(bid) + ": the winner's coinbase had already "
+                        "EMITTED owed outputs and no K_fair recompute is armed on this node "
+                        "(option A, --owed-demo-amount, or no settlement template) — we credit "
+                        "nothing rather than credit something different");
+                    continue;
+                }
+                const XmrPeerPayoutOutcome ro = m_recompute(w);
+                say(describe_recompute(bid, w, ro));
+                if (!ro.ok) {
+                    ++m_s1p.refused_payout;
+                    ++t.peer_refused;
+                    say("S-1c REFUSED " + short_bid(bid) + " h=" + std::to_string(w.h_b) +
+                        ": the winner's settled payout could NOT be reproduced here — our "
+                        "owed_digest will NOT converge with the winner's for this block");
+                    continue;
+                }
+                recomputed = ro.payout;
             }
             // (c) too late: advance_to_tip steps only heights ABOVE the cursor,
             //     so the FOUND would sit pending forever.
@@ -881,18 +999,26 @@ private:
                     ") — this block can never be stepped at maturity here");
                 continue;
             }
-            // (d) the VERIFY field: did our owed commitment agree with the
-            //     winner's at the instant of the win? A mismatch is a REPORT,
-            //     not a refusal — it says the two nodes had ALREADY diverged
-            //     before this block, which is the earliest point that is visible.
+            // (d) the VERIFY field, stated honestly. owed_digest_at_win is the
+            //     winner's §4.5 commitment at ITS win; ours is read HERE, at
+            //     receipt, which is a strictly LATER instant — this node learns
+            //     of H_b from the chain a poll away while the descriptor is a
+            //     poll plus a relay hop away, so its finalize cursor has
+            //     routinely stepped a bin the winner had not. A skew is
+            //     therefore normal and is NOT by itself a divergence; it is a
+            //     REPORT either way, never a refusal. The same-instant
+            //     comparison is the K_fair recompute's, below.
             if (first_look) {
                 const ::v37::bytes32 here = m_node.ledger().owed_digest();
                 if (!(here == w.owed_digest_at_win)) {
-                    ++m_s1p.owed_diverged;
-                    say("S-1c VERIFY MISMATCH on " + short_bid(bid) + ": winner's owed_digest at "
+                    ++m_s1p.owed_skew;
+                    say("S-1c VERIFY SKEW on " + short_bid(bid) + ": winner's owed_digest at "
                         "the win " + hex_of(w.owed_digest_at_win) + " != ours at receipt " +
-                        hex_of(here) + " — these two nodes had ALREADY diverged before this "
-                        "block (a report, not a refusal: the fold below still runs)");
+                        hex_of(here) + " — our receipt instant is LATER than the winner's win "
+                        "instant, so this alone is not a divergence. The same-instant check is "
+                        "the K_fair recompute (our owed_digest at OUR build of h=" +
+                        std::to_string(w.h_b) + " against this field); a real divergence shows "
+                        "up there as refused[payout], and in the per-cursor owed_digest");
                 }
             }
 
@@ -922,7 +1048,13 @@ private:
 
             m_last_peer_cut = f.cut;
             Amounts credit = f.cut.credit;
-            Amounts payout;   // mirrors the own-win leg: EMPTY by construction
+            // ★ (a) peer-recompute: the payout leg. EMPTY for a non-settling win
+            // (the winner's coinbase paid no ledger key, so there is nothing to
+            // deduct and the whole entitlement carries — the pre-(a) shape); the
+            // RECOMPUTED K_fair map for a settling one, so this ledger deducts
+            // exactly what the winner's did at FINALIZE (finalW -= payout) and
+            // the next template here cannot re-propose what that block paid.
+            Amounts payout = recomputed;
 
             c2pool::xmr::node::Hash id{};
             if (!hash_from_hex(bid, id) || c2pool::xmr::node::is_zero(id)) {
@@ -942,9 +1074,16 @@ private:
             rec.cut_next_pos     = w.cut_next_pos;
             rec.cut_spine_digest = w.cut_spine_digest;
             rec.cut_folded       = f.cut.folded;
+            // ★ R-7 / (a): persist the recomputed leg (sidecar v3) for the SAME
+            // reason an own win persists its own — the block is on the chain and
+            // has already paid these keys, so a restart inside the D_conf window
+            // that re-drove it with an empty payout would restore balances the
+            // coinbase already settled and let the next template pay them twice.
+            rec.payout           = payout;
             m_pending[bid] = rec;
             (void)sidecar_flush();
             ++m_stats.registered;
+            if (!payout.empty()) ++m_stats.payout_booked;
             // observe_OWN, deliberately. The same-height book's "own" means "a
             // block THIS LEDGER will credit", not "a block this process mined":
             // it exists to stop an orphan-credit and a double-credit, and after
@@ -954,10 +1093,17 @@ private:
             // and the driver disagreeing about a settlement that is correct.
             m_race.observe_own(w.h_b, bid);
             if (f.cut.valueless) ++m_s1p.valueless; else ++m_s1p.credited;
+            // Counted at REGISTRATION, once per block: a cut-miss retry re-runs
+            // the (pure) recompute, and counting there would report a multiple
+            // of the number of blocks actually settled from a peer.
+            if (w.payout_emitted) ++m_s1p.payout_recomputed;
             ++t.peer_credited;
             say(describe_cut("PEER WIN", bid, w.h_b, f.cut));
             say("S-1c PEER FOUND registered " + short_bid(bid) + " h=" + std::to_string(w.h_b) +
-                " E_b=" + std::to_string(credit.size()) + " keys at the winner's cut P=" +
+                " E_b=" + std::to_string(credit.size()) + " keys payout=" +
+                std::to_string(payout.size()) + " keys/" + std::to_string(amounts_sum(payout)) +
+                " pico" + (w.payout_emitted ? " [RECOMPUTED K_fair]" : "") +
+                " at the winner's cut P=" +
                 std::to_string(w.cut_next_pos) + " (our lane version " +
                 std::to_string(f.cut.lane_version) + ") owed_digest=" +
                 hex_of(m_node.ledger().owed_digest()) + " -> finalizes when hw >= " +
@@ -968,6 +1114,18 @@ private:
             std::lock_guard<std::mutex> lk(m_peer_mtx);
             for (auto& p : keep) m_peer_q.push_back(std::move(p));
         }
+    }
+
+    // ★ (a): the known population, bounded to the heights that can still matter
+    // (anything at or below the finalize cursor is settled or gone and can no
+    // longer sit in a reservation).
+    void note_known(std::uint64_t height, const std::string& bid) {
+        if (height == 0) return;
+        m_known_by_height[height].insert(bid);
+        const std::uint64_t cursor = m_node.finalize_driver().cursor_height();
+        const std::uint64_t keep_from = cursor > kKnownKeepDepth ? cursor - kKnownKeepDepth : 0;
+        while (!m_known_by_height.empty() && m_known_by_height.begin()->first < keep_from)
+            m_known_by_height.erase(m_known_by_height.begin());
     }
 
     RegisterResult& refuse(RegisterResult& r, const std::string& bid, std::string reason) {
@@ -1288,13 +1446,23 @@ private:
     // daemon's default --poll-ms this is a couple of seconds, which covers the
     // engine's MPSC publication latency by orders of magnitude and still ends.
     static constexpr unsigned kPeerCutRetryTicks = 20;
+    // How far below the finalize cursor the known-block map is retained. It only
+    // has to outlive the K_fair cache's own window, and the cache is bounded to
+    // the most recent heights, so a couple of hundred is generous.
+    static constexpr std::uint64_t kKnownKeepDepth = 256;
     struct PeerPending { XmrPeerWin win; unsigned attempts = 0; };
+    // ★ (a): height -> the bids at that height this node has learned of (own
+    // FOUNDs and peer descriptors alike). See known_blocks_in().
+    std::map<std::uint64_t, std::set<std::string>> m_known_by_height;
 
     XmrS1FoldStats m_s1;             // own-win fold counters
     XmrS1PeerStats m_s1p;            // receive-side counters
     XmrEbCut       m_last_cut;       // the cut the last own win folded at
     XmrEbCut       m_last_peer_cut;  // the cut the last peer win folded at
     OnRegisteredFoundFn m_on_registered;
+    // ★ (a) peer-recompute. Main thread only (drain_peer_wins). Unbound => the
+    // pre-(a) fail-closed refusal for a settling peer win.
+    PeerPayoutRecomputeFn m_recompute;
 
     mutable std::mutex       m_peer_mtx;   // guards the two members below
     std::deque<PeerPending>  m_peer_q;     // offered from the carrier reader thread

@@ -599,4 +599,34 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_s1b_x2_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_s1b_x2_kat Threads::Threads)
     add_test(NAME v37_xmr_s1b_x2_kat COMMAND v37_xmr_s1b_x2_kat)
+
+    # * canonical_coinbase_matches = (a) PEER-RECOMPUTE. S-1c converges the two
+    # nodes only until the first block whose option-B coinbase actually SETTLES
+    # owed: from there the winner deducts a payout map at FINALIZE that the
+    # receiver does not have, because the map is unbounded and is deliberately
+    # NOT on the frozen v0x02 carrier wire -- so the receiver refused the block
+    # and the ledgers forked. Under the operator ruling the receiver RECOMPUTES
+    # that map from its OWN K_fair run for the same height (a second CALLER of
+    # OwedLedger::propose_coinbase, never a second K_fair). This KAT pins: the
+    # reproduction is byte-exact and order-exact; four blocks, three of them
+    # SETTLING, keep owed_digest(A) == owed_digest(B) through every settlement
+    # with finalW solvent on both; the pre-(a) defect reproduced in BOTH shapes
+    # (refuse, and credit-with-empty-payout) so the suite goes red if either
+    # returns; no double-pay across the settlement boundary; each fail-closed
+    # guard as its own bit with a non-vacuous positive control; the cut INSTANT
+    # being load-bearing (the same ledger one finalize later proposes a
+    # different map, and the digest guard catches it); the RESERVATION witness
+    # (owed_digest commits to the FINALIZED half only, so two nodes can hold the
+    # same digest and still propose different maps when one has more blocks
+    # reserved -- observed live, refused here); the bounded cache; and the
+    # NON-settling path unmoved. Stdlib + Threads (the engine's executor
+    # thread): no coin lib, no crypto backend, no sockets, no clocks. SAME
+    # HOLLOW-GREEN GUARD as the sibling suites: ALSO listed on BOTH build.yml
+    # --target lists so CI compiles + RUNS it instead of registering a NOT_BUILT
+    # CTest sentinel (the DGB #137 / #769 / c2pool#1539 class).
+    add_executable(v37_xmr_peer_recompute_kat v37_xmr_peer_recompute_kat.cpp)
+    target_compile_features(v37_xmr_peer_recompute_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_peer_recompute_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_peer_recompute_kat Threads::Threads)
+    add_test(NAME v37_xmr_peer_recompute_kat COMMAND v37_xmr_peer_recompute_kat)
 endif()
