@@ -194,6 +194,31 @@ struct XmrCoinbaseContext {
     std::uint64_t         h_min = 0;                  // piconero floor per owed output (dust = 0 on XMR)
     std::uint32_t         output_cap = 0;             // TOTAL outputs cap C (weight_aware_output_cap(...))
 
+    // ── ★ THE SINK FLOOR ────────────────────────────────────────────────────
+    // Piconero withheld from the K_fair OWED selection so the mandated residual
+    // sink always has something to absorb and therefore always EXISTS.
+    //
+    // Why it has to exist at all. X6's allocator emits the sink "iff residual >
+    // 0" (see the COUNT INVARIANCE note in this banner), while the §13 shape
+    // gate mandates EXACTLY ONE sink output. Those two rules agree right up to
+    // the moment owed >= budget — and once a pool has mined a block, owed IS
+    // about one reward and the next budget IS about one reward, so K_fair takes
+    // the whole budget, the sink vanishes, the gate refuses every template, and
+    // the miners are parked on a stale height forever while the chain moves on.
+    // That is not a corner case; it is where a working option-B pool arrives on
+    // its (D_conf + 2)nd block.
+    //
+    // Withholding the floor from the SELECTION — exactly the way Σfixed is
+    // already withheld — resolves it without touching X6: the allocator still
+    // does what it always did with what it is given, and what it is given now
+    // leaves a residual. Nothing is lost to the payees: an owed balance that is
+    // not fully covered CARRIES, which is the K_fair carry rule working as
+    // designed.
+    //
+    // 0 reproduces the pre-fix behaviour exactly (and with it the deadlock), so
+    // it is not the default; see XmrSettlementConfig::sink_min.
+    std::uint64_t         sink_min = 0;
+
     std::uint64_t budget() const { return base_reward + fees; }
 };
 
@@ -252,6 +277,17 @@ public:
         }
         if (source == KFairSource::X6Allocate && !age_of)
             return refuse("refused: KFairSource::X6Allocate needs an AgeOf resolver");
+        // ★ The sink floor is a property of the SELECTION, and under X6Allocate
+        // the selection is X6's, not W4's. Honouring it there would mean
+        // changing allocate_exact_sum's canon, which this seam must not do (see
+        // the COUNT INVARIANCE note). Rather than apply it on one arm and
+        // silently skip it on the other, the combination is refused: a caller
+        // that asks for a guaranteed sink and does not get one would find out
+        // from a parked template on its (D_conf + 2)nd block instead of here.
+        if (source == KFairSource::X6Allocate && ctx.sink_min != 0)
+            return refuse("refused: sink_min > 0 is only honoured by KFairSource::W4Propose "
+                          "(X6Allocate's own allocator decides the set, and forcing a residual "
+                          "there would alter X6's allocation canon — an open KFairSource ruling)");
 
         std::unique_ptr<XmrOwedSettlementSource> s(new XmrOwedSettlementSource());
         s->m_ctx         = ctx;
@@ -292,8 +328,13 @@ public:
                                   std::numeric_limits<unsigned>::max()));
 
         if (source == KFairSource::W4Propose) {
-            // W4 canon picks the set over budget - Σfixed with C = cap - fixed - sink.
-            const std::uint64_t owed_budget = reward_hint - fixed_sum;
+            // W4 canon picks the set over budget - Σfixed - sink_floor, with
+            // C = cap - fixed - sink. The sink floor is withheld here for the
+            // same reason Σfixed is: both are MANDATED outputs that the owed
+            // selection may not spend. See XmrCoinbaseContext::sink_min.
+            const std::uint64_t after_fixed = reward_hint - fixed_sum;
+            const std::uint64_t sink_floor  = std::min(ctx.sink_min, after_fixed);
+            const std::uint64_t owed_budget = after_fixed - sink_floor;
             auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
                 return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
                                                   : std::numeric_limits<std::uint64_t>::max();

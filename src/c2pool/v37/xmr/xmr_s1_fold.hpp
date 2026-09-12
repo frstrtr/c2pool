@@ -49,15 +49,33 @@
 // because crediting a peer's block with a number we invented is precisely the
 // divergence the cut rule exists to prevent.
 //
-// THE PAYOUT LEG (stated, not hidden). On the DASH side `payout` is the W5
-// native coinbase the block actually broadcast, which the burial gate WITHHOLDS
-// at depth 0 — so a fresh win's payout map is empty by construction. On Monero
-// the same depth-0 fact holds for a different reason: the option-A coinbase
-// pays monerod's own --payout-address (never a v37 ledger key), and the
-// option-B K_fair coinbase is assembled BEFORE the block is buried. Either way
-// a freshly found XMR block broadcasts NO settled-owed output keyed to a lane
-// identity, so the payout leg is EMPTY and the whole entitlement carries
-// forward as owed. That carry is exactly what owed_digest commits to.
+// THE PAYOUT LEG — AND THE CLAIM THAT WAS WRONG ABOUT IT. On the DASH side
+// `payout` is the W5 native coinbase the block actually broadcast, which the
+// burial gate WITHHOLDS at depth 0, so a fresh win's payout map is empty by
+// construction. This header used to assert the same of Monero "either way",
+// reasoning that option A pays monerod's own --payout-address (never a v37
+// ledger key) and that option B's K_fair coinbase is assembled BEFORE the block
+// is buried.
+//
+// Half of that is true and half of it is the reverse of the truth. Option A
+// really does settle nothing. Option B's coinbase is not burial-gated at all —
+// it is the K_fair SETTLEMENT coinbase, and paying owed balances is the entire
+// reason it exists. Registering such a win with an empty payout leg leaves
+// every balance it just paid still owed, so the NEXT template proposes them
+// again: a double-pay. It also drives owed up by a whole E_b per block until
+// owed >= budget, at which point K_fair takes the whole reward, the mandated
+// residual sink disappears from the coinbase, the §13 shape gate refuses every
+// template, and the miners are parked on a stale height while the chain moves
+// on and the daemon books duplicate FOUNDs. That is the option-B deadlock.
+//
+// So the leg is per-coinbase, not per-family, and it is booked at the FOUND
+// site (xmr_o2_finalize_connect.hpp) from the owed-role outputs of the very
+// template the block was mined on — the R-7 pattern the merged DASH side uses,
+// where `payout` is what the block ACTUALLY BROADCAST to ledger keys and
+// `credit` stays E_b. The fixed outputs and the residual sink are excluded:
+// neither is ever credited to a ledger key, so neither may be deducted from
+// one. What the coinbase did NOT cover carries forward as owed, and that carry
+// is what owed_digest commits to.
 //
 // SCOPE FENCE: consumer tree, header-only, STL only. No consensus digest is
 // defined here; no fold body, no settle_block arithmetic, no ledger internals.

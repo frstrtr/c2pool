@@ -342,6 +342,22 @@ public:
         out.prev_id         = snap.prev_id;
         out.expected_reward = snap.reward;
         out.major_version   = snap.major_version;
+        // ★ R-7 PAYOUT LEG. What THESE bytes actually pay the owed ledger, read
+        // off the same AssembledTemplate that produced them. Roles Fixed and
+        // Sink are excluded on purpose: a fixed output is a mandated dev/
+        // donation payment and the residual sink is the exact-sum absorber —
+        // neither is ever CREDITED to a ledger key, so deducting either from one
+        // would drive that key's EffectiveOwed down for money it never earned.
+        out.owed_payout.clear();
+        for (const auto& o : snap.tpl->outputs()) {
+            if (o.role != ::v37::xmr::settle::CoinbaseOutput::Role::Owed) continue;
+            out.owed_payout[o.identity] += static_cast<long long>(o.amount);
+        }
+        // KNOWN even when EMPTY: an option-B coinbase built on a settled-out
+        // ledger legitimately pays no owed output, and that is a different fact
+        // from "we could not find out", which is what an unresolved template_id
+        // means. The finalize connect refuses the latter and books the former.
+        out.owed_payout_known = true;
         return true;
     }
 

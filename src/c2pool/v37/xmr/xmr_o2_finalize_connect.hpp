@@ -45,6 +45,25 @@
 //       Refuse-LOUD, register anyway: a block we mined is a real block, so a
 //       no-view / non-ratified-geometry / reward==0 / empty-E_b fold is stamped
 //       VALUELESS, counted and narrated — and still registered.
+//   (2a) ★ R-7 — THE PAYOUT LEG (the option-B deadlock). S-1b registered
+//       `payout = {}` on the premise that a freshly found XMR block broadcasts
+//       no settled-owed output. That is true of option A and FALSE of option B,
+//       whose whole purpose is a coinbase that pays owed balances. Left empty,
+//       the balances the block just paid stay owed, the next template proposes
+//       them AGAIN (double-pay), and owed climbs by a whole E_b per block until
+//       owed >= budget — at which point K_fair takes the entire reward, the
+//       mandated residual sink drops out of the coinbase, the §13 shape gate
+//       (xmr_settlement_coinbase_shape.hpp) refuses EVERY template, the miners
+//       are parked on a stale height and the daemon books duplicate FOUNDs at
+//       it. `payout` is now the block's OWED-ROLE coinbase outputs, carried
+//       from the template snapshot its bytes were built from (fixed + residual
+//       sink excluded — neither is credited to a ledger key, so neither may be
+//       deducted from one) and PERSISTED in the sidecar so a restart re-drives
+//       the same deduction. FINALIZE then does finalW += credit; finalW -=
+//       payout with two DIFFERENT maps, which is the merged DASH R-7 shape
+//       (btc_node.hpp on_block_won). Registering credit == payout nets every
+//       block to zero — the S-1b defect; registering payout == {} strands the
+//       pool — this one.
 //   (2b) ★ S-1c — A PEER'S WIN. offer_peer_win() takes the flat cut descriptor
 //       a peer's block-winning carrier carried (wire v0x02) and re-runs the
 //       SAME fold at the WINNER'S prefix, read back out of OUR own settlement
@@ -167,6 +186,15 @@ struct PayeeKeys {
     bool subaddress = false;                // false = XMR_STD, true = XMR_SUB
 };
 
+// Σ of an amount map, for the one-line human account of a payout leg. Signed,
+// because OwedLedger::Amounts is signed and a negative row is a real (if loud)
+// state this must be able to print rather than wrap.
+inline long long amounts_sum(const Amounts& a) {
+    long long s = 0;
+    for (const auto& [k, v] : a) { (void)k; s += v; }
+    return s;
+}
+
 inline std::optional<::v37::bytes32> payee_identity_key(const PayeeKeys& k) {
     ::v37::ScriptRef ref = k.subaddress ? ::v37::xmr::make_xmr_sub(k.spend, k.view)
                                         : ::v37::xmr::make_xmr_std(k.spend, k.view);
@@ -189,6 +217,26 @@ struct FoundBlockEvent {
     std::string   worker;                 // from the login string (logged only)
     std::string   address;                // raw base58 (logged only — never a ledger key)
     std::uint64_t found_unix_s = 0;       // 0 = stamp at push()
+
+    // ── ★ R-7 PAYOUT LEG: what this block's coinbase ACTUALLY PAID the ledger ─
+    // The OWED-ROLE outputs of the coinbase that was broadcast, {identity_key :
+    // piconero}, EXCLUDING the fixed outputs and the residual sink (neither is
+    // ever credited to a ledger key, so neither may be deducted from one).
+    //
+    // Option A leaves this EMPTY and `payout_known` false: monerod's own
+    // template pays a single output to --payout-address, which is not a v37
+    // ledger identity, so the block settles nothing and the whole entitlement
+    // carries. Option B fills it from the assembled K_fair template it was mined
+    // on — that coinbase pays owed balances DIRECTLY, and a block that paid them
+    // must decrement them or the next template pays the same balances again.
+    //
+    // `payout_known` is the fail-closed discriminator and is NOT the same as
+    // "payout is empty": an option-B win whose template can no longer be
+    // resolved (evicted from the retain ring) has an UNKNOWN payout, and
+    // registering that as an empty one would book a credit for a coinbase that
+    // has already paid it out. Such a win is REFUSED, loudly.
+    Amounts payout;
+    bool    payout_known = false;
 };
 
 class FoundBlockQueue {
@@ -246,6 +294,17 @@ struct FinalizeConnectOptions {
     // height. Bounded by SameHeightPolicy::max_renotify. Unset = no re-announce
     // (the observe-side posture, and what the self-check runs).
     std::function<bool(std::uint64_t height, const std::string& bid_hex)> renotify;
+
+    // ── ★ R-7: is this node serving a coinbase that PAYS THE OWED LEDGER? ────
+    // ON for option B bound to the node's own ledger — every found block's
+    // coinbase settles owed balances, so a FOUND whose payout map cannot be
+    // named is REFUSED rather than booked as "paid nobody".
+    // OFF for option A (monerod's template pays --payout-address, never a
+    // ledger key) and for an option-B run whose template is built from a
+    // SEPARATE proof ledger (--owed-demo-amount): there the coinbase's owed
+    // outputs belong to a different ledger than the one FOUND/FINALIZE move, so
+    // deducting them HERE would settle balances this ledger never credited.
+    bool require_payout = false;
 };
 
 // ── the glue ────────────────────────────────────────────────────────────────
@@ -264,6 +323,13 @@ public:
         std::uint64_t  cut_next_pos = 0;
         ::v37::bytes32 cut_spine_digest{};
         bool           cut_folded = false;
+        // ★ R-7: the payout leg this FOUND was BOOKED with — the owed-role
+        // coinbase outputs the block broadcast. Persisted (sidecar v3) because
+        // a restart must re-drive the SAME deduction: the block is on the chain
+        // and has already paid these keys, and a re-drive that booked an empty
+        // payout would restore balances the coinbase already settled and pay
+        // them a second time.
+        Amounts payout;
     };
     struct RegisterResult {
         bool        registered = false;
@@ -284,6 +350,9 @@ public:
         // the block is registered with an EMPTY credit and this counter is the
         // only honest account of the entitlement that was lost.
         std::size_t eb_irrecoverable = 0;
+        // ★ R-7: sidecar records re-driven WITH a non-empty payout leg. Unlike
+        // E_b, the payout IS recoverable — it was written down, not recomputed.
+        std::size_t payout_redriven = 0;
     };
     struct TickReport {
         std::size_t drained = 0, registered = 0, refused = 0, settled = 0, orphaned = 0;
@@ -299,6 +368,43 @@ public:
         std::uint64_t race_credited = 0, race_refused_orphaned = 0,
                       race_refused_other_only = 0, race_deferred = 0,
                       race_renotified = 0, r7_violations = 0;
+        // ★ R-7 payout leg. `payout_booked` counts wins registered with a
+        // NON-EMPTY payout map (an option-B coinbase that actually settled owed
+        // balances); `payout_unknown` counts option-B wins REFUSED because the
+        // block's owed-role outputs could not be named. A live option-B pool
+        // whose payout_booked stays at 0 while owed grows is NOT settling —
+        // that is the defect this leg closes, visible without reading a log.
+        std::uint64_t payout_booked = 0, payout_unknown = 0;
+        // The RUNNING MINIMUM of EffectiveOwed over every key, sampled on every
+        // tick rather than only when a status line happens to print. It is the
+        // one number that falsifies "no double-pay": EffectiveOwed = finalW -
+        // Σ_pending payout, so it can only go below zero if more was PAID than
+        // was ever OWED. A dip is fail-safe in the moment (a template with
+        // nothing to propose pays the residual sink, and the owed CARRIES) but
+        // it is still a pool paying out money it had not booked as owed, and
+        // sampling it at 20-second status intervals would hide it.
+        long long min_effective_owed = 0;
+        // The RUNNING MINIMUM of the FINALIZED partition, finalW, over every
+        // key. This is the SOLVENCY floor, and it is the one that must never go
+        // below zero.
+        //
+        // The two are different claims and only this one is an error when it
+        // dips. EffectiveOwed = finalW - Σ_pending payout is a RESERVATION:
+        // every in-flight coinbase that MIGHT land has its owed outputs held
+        // back so no later template can propose them again. On a height with
+        // rival own blocks (three were observed on one regtest height, all mined
+        // on the same template) every rival reserves the same proposal, so the
+        // reservation floor legitimately goes negative — "all of the owed is
+        // currently spoken for" — and recovers as the losers are ORPHANED and
+        // their reservations released. Under-proposing for a few blocks is the
+        // safe direction; it delays a payee, it never overpays one.
+        //
+        // finalW moves only at FINALIZE, by credit - payout, and only for the
+        // ONE block per height that the chain actually kept. If it ever went
+        // negative the pool would have finalized more coinbase payouts than
+        // entitlements — money paid that was never owed. That is the real
+        // double-pay, and it has stayed at zero.
+        long long min_final_owed = 0;
     };
 
     // Construct AFTER node.bring_up() (the finalize driver exists) and AFTER
@@ -394,7 +500,13 @@ public:
             // settle or dispose it — and the lost entitlement is counted and
             // named rather than papered over with a plausible figure.
             Amounts credit;   // see above: never re-folded at a foreign cut
-            Amounts payout;
+            // ★ R-7: the payout leg IS reproducible, because it was persisted
+            // (sidecar v3) rather than recomputed. The block is on the chain and
+            // its coinbase has already paid these keys; re-driving it with an
+            // empty payout would restore balances the chain already settled and
+            // let the next template pay them a second time. This is the half of
+            // the record that must survive a restart even when E_b cannot.
+            Amounts payout = rec.payout;
             if (!pending) {
                 ++rep.eb_irrecoverable;
                 say("boot: E_b IRRECOVERABLE for RE-REGISTERED " + short_bid(bid) + " h=" +
@@ -414,8 +526,11 @@ public:
             m_pending[bid] = rec;
             m_race.observe_own(rec.height, bid, rec.found_unix_s);
             if (pending) ++rep.reseeded; else ++rep.reregistered;
+            if (!payout.empty()) ++rep.payout_redriven;
             say(std::string("boot: ") + (pending ? "re-drove pending FOUND " : "RE-REGISTERED lost FOUND ") +
                 short_bid(bid) + " h=" + std::to_string(rec.height) +
+                " payout=" + std::to_string(payout.size()) + " keys/" +
+                std::to_string(amounts_sum(payout)) + " pico" +
                 " (finalizes when hw >= " + std::to_string(rec.height + m_cfg.d_conf) + ")");
         }
         (void)sidecar_flush();
@@ -444,9 +559,38 @@ public:
         race_gate(t);                          // c2pool#1551 -- after reconcile, so a
                                                // credit the driver just took is already
                                                // recorded when the gate cross-checks it
+        sample_min_effective_owed();           // ★ R-7: every tick, not every status line
         echo_node_log();                       // the node's own "win: FOUND ..." lines
         progress();
         return t;
+    }
+
+    // Self-check seam: the sidecar codec, so a KAT can assert that what was
+    // written to disk is what comes back off it (a payout leg that round-trips
+    // only through the object it came from proves nothing about a restart).
+    static bool parse_sidecar_line_for_test(const std::string& line, std::string& bid,
+                                            PendingRec& r) {
+        return parse_sidecar_line(line, bid, r);
+    }
+
+    // Undrained work: a FOUND that has been queued but not yet booked. A
+    // template built while this is non-zero would be proposing balances a block
+    // the pool has ALREADY MINED has already paid — the double-pay this leg
+    // exists to prevent, re-entering through the back door. The serve loop uses
+    // it to hold the rebuild for one iteration.
+    std::size_t unbooked_found() const { return m_q.size(); }
+
+    // ★ R-7: the two owed floors, taken on every tick rather than whenever a
+    // status line happens to print. See Stats for why they are different claims.
+    void sample_min_effective_owed() {
+        for (const auto& [k, v] : m_node.ledger().effective_owed_all()) {
+            (void)k;
+            if (v < m_stats.min_effective_owed) m_stats.min_effective_owed = v;
+        }
+        for (const auto& [k, v] : m_node.ledger().finalW()) {
+            (void)k;
+            if (v < m_stats.min_final_owed) m_stats.min_final_owed = v;
+        }
     }
 
     // ── c2pool#1551: observation ───────────────────────────────────────────
@@ -529,13 +673,39 @@ public:
                                   "drain the found queue BEFORE pump_poll / lower --poll-ms");
         }
 
+        // ── ★ R-7: THE PAYOUT LEG, BEFORE ANYTHING IS BOOKED ────────────────
+        // `payout` is what the coinbase of THIS block ACTUALLY PAID owed keys.
+        // It is a DIFFERENT map from `credit` and must stay so: FINALIZE does
+        // finalW += credit; finalW -= payout (Settlement.tla G), and while the
+        // block is pending EffectiveOwed already reads finalW - Σ_pending payout
+        // (w4_settlement.hpp), so booking it is what stops the NEXT template
+        // from proposing the very balances this block just settled.
+        //
+        // Option A pays a single output to monerod's --payout-address, which is
+        // no v37 identity: nothing is settled, the map is empty, `require_payout`
+        // is off and the whole entitlement carries. Option B's K_fair coinbase
+        // pays owed balances DIRECTLY, so its map is the block's owed-role
+        // outputs (fixed + residual sink excluded — see BlockCandidate).
+        //
+        // FAIL-CLOSED: with `require_payout` on, an UNKNOWN map is refused. An
+        // unknown map is not an empty one; booking it as empty would credit E_b
+        // for a coinbase that has already paid it out, which is the double-pay
+        // this leg exists to prevent.
+        if (m_o.require_payout && !ev.payout_known) {
+            ++m_stats.payout_unknown;
+            return refuse(r, bid, "PAYOUT MAP UNKNOWN for an option-B win (template " +
+                                  std::to_string(ev.template_id) + " could not be resolved to its "
+                                  "owed-role outputs). The K_fair coinbase in this block has "
+                                  "ALREADY paid owed balances; registering it with an empty payout "
+                                  "leg would leave those balances owed and pay them again");
+        }
+
         // ── ★ S-1b: THE FOLD ────────────────────────────────────────────────
         // credit = E_b, folded out of the lane cut the engine has published
-        // RIGHT NOW through settle::fold_eb. payout = {} — see the payout-leg
-        // note at the top of xmr_s1_fold.hpp: a freshly found XMR block
-        // broadcasts no settled-owed output keyed to a lane identity, so the
-        // entitlement carries forward whole and owed_digest commits to it.
-        // Registering credit == payout is the defect this replaces.
+        // RIGHT NOW through settle::fold_eb — what the pool NOW OWES because of
+        // this block. Registering credit == payout nets every block to zero
+        // (the S-1b defect); registering the coinbase as the CREDIT loses the
+        // entitlement. Both are replaced here.
         XmrEbCut cut = fold_at_tip(m_node.engine(), m_cfg.lane_chain,
                                    ev.reward_piconero, m_s1);
         m_last_cut = cut;
@@ -543,7 +713,8 @@ public:
         if (!cut.refusal.empty())
             say("S-1 fold gave " + short_bid(bid) + " NO CREDIT: " + cut.refusal);
         Amounts credit = cut.credit;
-        Amounts payout;   // EMPTY by construction — never `= credit`
+        Amounts payout = ev.payout;   // the R-7 leg — never `= credit`
+        if (!payout.empty()) ++m_stats.payout_booked;
 
         PendingRec rec;
         rec.height = ev.height;
@@ -554,6 +725,7 @@ public:
         rec.cut_next_pos     = cut.next_pos;
         rec.cut_spine_digest = cut.lane_digest;
         rec.cut_folded       = cut.folded;
+        rec.payout           = payout;
 
         // write-ahead the sidecar, then the FOUND event (inside on_network_block_won)
         m_pending[bid] = rec;
@@ -585,6 +757,9 @@ public:
             " reward=" + std::to_string(ev.reward_piconero) + " piconero payee=" +
             (ev.payee ? hex_of(*ev.payee).substr(0, 12) + "…" : std::string("-")) +
             " E_b=" + std::to_string(credit.size()) + " keys" +
+            " payout=" + std::to_string(payout.size()) + " keys/" +
+            std::to_string(amounts_sum(payout)) + " pico" +
+            (ev.payout_known ? "" : " [payout UNKNOWN: option-A coinbase pays no ledger key]") +
             (cut.valueless ? " [VALUELESS record]" : "") +
             (ev.worker.empty() ? "" : " worker=" + ev.worker) +
             " tid=" + std::to_string(ev.template_id) + " nonce=" + std::to_string(ev.nonce) +
@@ -982,18 +1157,26 @@ private:
     //    1 <bid64> <height> <payee64|-> <reward> <prev64|-> <found_unix_s>
     //    2 <bid64> <height> <payee64|-> <reward> <prev64|-> <found_unix_s>
     //      <cut_next_pos> <cut_spine64|-> <folded 0|1>       ★ S-1b
-    // Version 1 is still PARSED (a store written by a pre-S-1b run reseeds), and
-    // reads back with cut_folded == false — which the re-drive reports rather
-    // than silently re-folding at a prefix that is no longer the win's.
+    //    3 ... as 2, then                                    ★ R-7 payout leg
+    //      <n_payout> [<key64> <amount>] * n_payout
+    // Versions 1 and 2 are still PARSED (a store written by an older run
+    // reseeds). A v1 line reads back with cut_folded == false, and v1/v2 lines
+    // read back with an EMPTY payout — which is exactly right for them: they
+    // were written by a build that booked no payout leg, so the ledger they
+    // belong to never deducted one either.
     static std::string sidecar_line(const std::string& bid, const PendingRec& r) {
-        std::string s = "2 " + bid + " " + std::to_string(r.height) + " " +
+        std::string s = "3 " + bid + " " + std::to_string(r.height) + " " +
                         (r.payee ? hex_of(*r.payee) : std::string("-")) + " " +
                         std::to_string(r.reward) + " " +
                         (r.prev_id_hex.size() == 64 ? r.prev_id_hex : std::string("-")) + " " +
                         std::to_string(r.found_unix_s) + " " +
                         std::to_string(r.cut_next_pos) + " " +
                         (r.cut_folded ? hex_of(r.cut_spine_digest) : std::string("-")) + " " +
-                        (r.cut_folded ? "1" : "0") + "\n";
+                        (r.cut_folded ? "1" : "0") + " " +
+                        std::to_string(r.payout.size());
+        for (const auto& [k, v] : r.payout)
+            s += " " + hex_of(k) + " " + std::to_string(v);
+        s += "\n";
         return s;
     }
     static bool parse_sidecar_line(const std::string& line, std::string& bid, PendingRec& r) {
@@ -1001,7 +1184,7 @@ private:
         std::string ver, payee, prev;
         unsigned long long h = 0, reward = 0, ts = 0;
         if (!(is >> ver >> bid >> h >> payee >> reward >> prev >> ts)) return false;
-        if (ver != "1" && ver != "2") return false;
+        if (ver != "1" && ver != "2" && ver != "3") return false;
         std::array<std::uint8_t, 32> tmp{};
         bid = lower_hex(bid);
         if (!hash_from_hex(bid, tmp)) return false;
@@ -1020,7 +1203,7 @@ private:
             if (!hash_from_hex(prev, tmp)) return false;
             r.prev_id_hex = prev;
         }
-        if (ver == "2") {
+        if (ver == "2" || ver == "3") {
             unsigned long long p = 0, folded = 0;
             std::string spine;
             if (!(is >> p >> spine >> folded)) return false;
@@ -1033,6 +1216,23 @@ private:
             } else if (r.cut_folded) {
                 return false;   // "folded" without a commitment is not a cut
             }
+        }
+        if (ver == "3") {
+            // ★ R-7 payout leg. A TRUNCATED or malformed payout list makes the
+            // whole line malformed rather than a record with a short payout:
+            // silently dropping a key here would restore a balance the block
+            // already paid, which is the double-pay this leg exists to stop.
+            unsigned long long n = 0;
+            if (!(is >> n)) return false;
+            for (unsigned long long i = 0; i < n; ++i) {
+                std::string kh;
+                long long amt = 0;
+                if (!(is >> kh >> amt)) return false;
+                ::v37::bytes32 k{};
+                if (!hash_from_hex(lower_hex(kh), k)) return false;
+                r.payout[k] = amt;
+            }
+            if (r.payout.size() != static_cast<std::size_t>(n)) return false;   // duplicate keys
         }
         return true;
     }
@@ -1212,8 +1412,10 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
                 fc.s1_stats().folds == 1,
                 "E_b keys=" + std::to_string(fc.last_cut().credit.size()) +
                 " raw_total=" + std::to_string(fc.last_cut().raw_total));
-        rep.add("FC3b payout is EMPTY, so effective_owed is untouched while pending "
+        rep.add("FC3b this win carried NO payout map (the option-A shape: monerod's coinbase "
+                "pays no ledger key), so effective_owed is untouched while pending "
                 "(the pre-S-1b code deducted the whole reward here)",
+                fc.pending().at(bid5).payout.empty() &&
                 node.ledger().effective_owed(lane_key) == 0 &&
                 node.ledger().effective_owed(payee) == 0);
         rep.add("FC4 pending-FOUND sidecar written (write-ahead, 1 record) and it carries the "
@@ -1335,7 +1537,156 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         rep.add("FC16 orphan: the folded E_b NEVER reached finalW — owed_digest is byte-identical "
                 "to before the win (credit is applied at FINALIZE, not at FOUND)",
                 node.ledger().owed_digest() == owed_before_orphan);
+        rep.add("FC16b ★ R-7: nothing in this leg drove EffectiveOwed OR finalW below zero",
+                fc.stats().min_effective_owed == 0 && fc.stats().min_final_owed == 0,
+                "eff_min=" + std::to_string(fc.stats().min_effective_owed) +
+                " final_min=" + std::to_string(fc.stats().min_final_owed));
         (void)fc.drain_before_stop();
+    }
+
+    // ═══ ★ R-7: THE PAYOUT LEG ═══════════════════════════════════════════════
+    // Everything above drives the option-A shape, where the coinbase pays no
+    // ledger key and the payout map is empty. This section drives the option-B
+    // shape: a coinbase that SETTLED owed balances, which is what made the old
+    // `payout = {}` a deadlock. A fresh store so the ledger starts clean.
+    {
+        XmrNodeConfig c2 = cfg;
+        c2.settle_db_path = (tmp_root / "store_r7").string();
+        std::filesystem::create_directories(c2.settle_db_path);
+        FinalizeConnectOptions o2;
+        o2.sidecar_path  = (std::filesystem::path(c2.settle_db_path) / "pfound.tsv").string();
+        o2.out           = nullptr;
+        o2.require_payout = true;             // the option-B posture
+
+        const std::string bidA = hex_of(smoke::blk_id(5));
+        const std::string bidB = hex_of(smoke::blk_id(9));
+        const std::string bidC = hex_of(smoke::blk_id(13));
+        FoundBlockQueue q2;
+        ::v37::bytes32 sidecar_digest{};
+        long long owed_after_first = 0;
+
+        {
+            MockMonerodTransport mt;
+            XmrNode node(c2, mt);
+            node.bring_up();
+            FinalizeConnect fc(node, c2, q2, o2);
+            (void)fc.reseed_after_bring_up();
+            (void)seed_lane(node, 4096);
+
+            // ── (1) an UNKNOWN payout map is REFUSED, never booked as empty ──
+            FoundBlockEvent bad;
+            bad.height = 5; bad.block_id_hex = bidA; bad.reward_piconero = REWARD;
+            bad.payee = payee; bad.payout_known = false;       // template unresolvable
+            q2.push(bad);
+            auto t2 = fc.tick();
+            rep.add("FC17 ★ R-7: an option-B win whose payout map is UNKNOWN is REFUSED, not "
+                    "booked as 'paid nobody' (booking it would credit E_b for a coinbase that "
+                    "has already paid it out)",
+                    t2.registered == 0 && t2.refused == 1 &&
+                    !node.ledger().is_pending(bidA) && fc.stats().payout_unknown == 1,
+                    "registered=" + std::to_string(t2.registered) +
+                    " unknown=" + std::to_string(fc.stats().payout_unknown));
+
+            // ── (2) the FIRST block, in the real order ───────────────────────
+            // Its coinbase was assembled over an EMPTY ledger, so K_fair had
+            // nothing to propose and the whole reward went to the residual sink:
+            // a KNOWN, EMPTY payout map. That is a different fact from FC17's
+            // unknown one, and the leg has to tell them apart.
+            FoundBlockEvent good = bad;
+            good.payout_known = true;                          // known, and empty
+            q2.push(good);
+            t2 = fc.tick();
+            rep.add("FC18 ★ R-7: a KNOWN but EMPTY payout map registers normally (an option-B "
+                    "coinbase over an empty ledger really does pay only the residual sink) — "
+                    "'unknown' and 'paid nobody' are not the same answer",
+                    t2.registered == 1 && node.ledger().is_pending(bidA) &&
+                    fc.pending().at(bidA).payout.empty() && fc.stats().payout_booked == 0,
+                    "booked=" + std::to_string(fc.stats().payout_booked));
+
+            chain(node, 5, 8);                                 // h=5 canonical, hw = 5 + 3
+            t2 = fc.tick();
+            const long long owed_now = node.ledger().effective_owed(lane_key);
+            rep.add("FC19 ★ S-1b: that block's E_b landed in finalW at FINALIZE — the pool now "
+                    "OWES the lane a reward, which is what the NEXT coinbase will settle",
+                    t2.settled == 1 && owed_now == static_cast<long long>(REWARD),
+                    "eo=" + std::to_string(owed_now));
+
+            // ── (3) the SECOND block: a coinbase that actually SETTLES ───────
+            // Its payout can only ever be what K_fair was allowed to propose,
+            // which is bounded by EffectiveOwed — so a partial settle here.
+            // EffectiveOwed = finalW - Σ_pending payout, so the deduction lands
+            // at FOUND, not at FINALIZE. That is precisely what stops the next
+            // template proposing the balances this coinbase just settled.
+            const long long PAY = 250000000000ll;              // < REWARD: a partial settle
+            (void)seed_lane(node, 4096);
+            FoundBlockEvent settle_ev;
+            settle_ev.height = 9; settle_ev.block_id_hex = bidB;
+            settle_ev.reward_piconero = REWARD; settle_ev.payee = payee;
+            settle_ev.payout_known = true;
+            settle_ev.payout[lane_key] = PAY;
+            q2.push(settle_ev);
+            t2 = fc.tick();
+            rep.add("FC20 ★ R-7: with a NON-EMPTY map the win registers AND books the payout leg",
+                    t2.registered == 1 && node.ledger().is_pending(bidB) &&
+                    fc.stats().payout_booked == 1 &&
+                    fc.pending().at(bidB).payout.size() == 1 &&
+                    fc.pending().at(bidB).payout.at(lane_key) == PAY,
+                    "booked=" + std::to_string(fc.stats().payout_booked));
+            rep.add("FC21 ★ R-7: a FOUND with a booked payout moves EffectiveOwed DOWN by exactly "
+                    "the payout WHILE STILL PENDING (an empty leg leaves it untouched — FC3b — "
+                    "and that is the double-pay: the next template re-proposes the same balance)",
+                    node.ledger().effective_owed(lane_key) == owed_now - PAY,
+                    "eo=" + std::to_string(node.ledger().effective_owed(lane_key)) +
+                    " expected=" + std::to_string(owed_now - PAY));
+
+            // ── (4) sidecar v3 carries the map ───────────────────────────────
+            rep.add("FC22 ★ R-7: the pending-FOUND sidecar persists the payout map (v3), so a "
+                    "restart re-drives the SAME deduction instead of restoring balances the "
+                    "block already paid",
+                    count_lines(o2.sidecar_path) == 1 &&
+                    [&] {
+                        std::ifstream f(o2.sidecar_path);
+                        std::string line; std::getline(f, line);
+                        std::string b; FinalizeConnect::PendingRec r;
+                        return FinalizeConnect::parse_sidecar_line_for_test(line, b, r) &&
+                               b == bidB && r.payout.size() == 1 && r.payout.at(lane_key) == PAY;
+                    }());
+            owed_after_first = owed_now - PAY;
+            sidecar_digest   = node.ledger().owed_digest();
+            rep.add("FC23 ★ R-7: neither floor went below zero across the whole leg — finalW "
+                    "(SOLVENCY: finalized entitlements minus finalized payouts) is the one that "
+                    "must not, and EffectiveOwed (the RESERVATION of in-flight coinbases) did "
+                    "not either here",
+                    fc.stats().min_final_owed == 0 && fc.stats().min_effective_owed == 0 &&
+                    owed_after_first >= 0,
+                    "eff_min=" + std::to_string(fc.stats().min_effective_owed) +
+                    " final_min=" + std::to_string(fc.stats().min_final_owed));
+        }
+
+        // ── (6) RESTART with that second win still pending ──────────────────
+        {
+            MockMonerodTransport mt;
+            XmrNode node(c2, mt);
+            node.bring_up();
+            FinalizeConnect fc(node, c2, q2, o2);
+            const FinalizeConnect::BootReport boot = fc.reseed_after_bring_up();
+            rep.add("FC24 ★ R-7: the restart re-drove the pending FOUND WITH its payout leg, so "
+                    "the deduction survived the crash window (E_b may be irrecoverable; the "
+                    "payout is not, because it was written down rather than recomputed)",
+                    boot.reseeded + boot.reregistered == 1 && boot.payout_redriven == 1 &&
+                    fc.pending().count(bidB) == 1 &&
+                    fc.pending().at(bidB).payout.size() == 1,
+                    "reseeded=" + std::to_string(boot.reseeded) +
+                    " redriven=" + std::to_string(boot.payout_redriven));
+            rep.add("FC25 ★ R-7: and EffectiveOwed after the restart is what it was before it, "
+                    "not the un-deducted balance the block had already paid",
+                    node.ledger().effective_owed(lane_key) == owed_after_first &&
+                    node.ledger().owed_digest() == sidecar_digest,
+                    "eo=" + std::to_string(node.ledger().effective_owed(lane_key)) +
+                    " expected=" + std::to_string(owed_after_first));
+            (void)bidC;
+            (void)fc.drain_before_stop();
+        }
     }
     return rep;
 }

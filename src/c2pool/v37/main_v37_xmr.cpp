@@ -429,8 +429,14 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         fc.set_on_registered_found(
             [stack, &node](const std::string& bid, const o2::FinalizeConnect::PendingRec& rec,
                            const o2::XmrEbCut& cut) {
+                // ★ R-7: tell peers whether this block's coinbase actually paid
+                // owed balances. Under option B it does as soon as the ledger has
+                // something to settle, and a peer that is told otherwise credits
+                // E_b while deducting nothing — a silent divergence. See
+                // XmrCarrierStack::mint_block_winner.
                 (void)stack->mint_block_winner(bid, rec.height, rec.prev_id_hex, cut,
-                                               node.ledger().owed_digest());
+                                               node.ledger().owed_digest(),
+                                               /*payout_emitted=*/!rec.payout.empty());
             });
     }
 
@@ -461,6 +467,12 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             e.extra_nonce     = s.extra_nonce;
             e.worker          = s.worker;
             e.address         = s.address;
+            // ★ R-7 payout leg: the owed-role coinbase outputs THIS block paid,
+            // carried all the way from the template snapshot its bytes were
+            // built from. Option A leaves it unknown-and-empty, which is the
+            // truth there: monerod's coinbase pays no v37 ledger key.
+            e.payout.insert(s.owed_payout.begin(), s.owed_payout.end());
+            e.payout_known = s.owed_payout_known;
             found_q.push(std::move(e));
         }
     };
@@ -561,6 +573,37 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         static_cast<unsigned long long>(fc.last_cut().next_pos),
                         static_cast<unsigned long long>(fc.last_cut().raw_total),
                         fc.last_cut().credit.size(), fc.last_cut().source);
+            // ★ R-7. `payout booked` is the one number that says whether this
+            // pool is SETTLING or merely accruing: an option-B node that keeps
+            // finding blocks with booked=0 while min_eff_owed climbs is paying
+            // its payees in the coinbase and forgetting to deduct it. min
+            // effective-owed is printed beside it because the two are the same
+            // claim from opposite ends — it must never go negative.
+            {
+                const auto fs2 = fc.stats();
+                long long min_eo = 0;
+                bool have = false;
+                for (const auto& [k, v] : node.ledger().effective_owed_all()) {
+                    (void)k;
+                    if (!have || v < min_eo) { min_eo = v; have = true; }
+                }
+                std::printf("  R-7 payout leg: booked=%llu unknown-refused=%llu | owed keys=%zu "
+                            "now=%lld | floors: SOLVENCY(finalW) min=%lld%s  reservation"
+                            "(EffectiveOwed) min=%lld%s\n",
+                            static_cast<unsigned long long>(fs2.payout_booked),
+                            static_cast<unsigned long long>(fs2.payout_unknown),
+                            node.ledger().effective_owed_all().size(),
+                            have ? min_eo : 0LL,
+                            fs2.min_final_owed,
+                            (fs2.min_final_owed < 0)
+                                ? "  <-- NEGATIVE: the pool FINALIZED more payout than "
+                                  "entitlement (a real over-payment)" : " (must be >= 0)",
+                            fs2.min_effective_owed,
+                            (fs2.min_effective_owed < 0)
+                                ? "  (dipped: rival blocks at one height each reserve the same "
+                                  "coinbase proposal; released when the losers are orphaned)"
+                                : "");
+            }
             if (hooks.carrier) {
                 const auto cs = hooks.carrier->send()
                                     ? hooks.carrier->send()->stats()
@@ -650,7 +693,30 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             transport.pump_poll();
             node.adapter().ensure_seed_reach();
         }
-        if (serving) {
+        // ── ★ R-7: NEVER BUILD A TEMPLATE OVER UN-BOOKED FOUNDS ──────────────
+        // The K_fair owed set is drawn from EffectiveOwed, which already nets
+        // the payouts of blocks the ledger holds PENDING. That is what stops
+        // two consecutive templates proposing the same balances — but only if
+        // the previous block's payout has actually been BOOKED by the time the
+        // next template is assembled. A win is submitted on the LISTENER thread
+        // and booked on THIS one, so a block accepted by the daemon while the
+        // loop was past its drain would move the tip, trigger a rebuild, and the
+        // rebuild would propose the balances that block had just paid: a coinbase
+        // paying the same owed twice, which shows up afterwards as EffectiveOwed
+        // going NEGATIVE (observed on regtest before this guard).
+        //
+        // So: drain again HERE, immediately before the rebuild, and if anything
+        // is still in flight hold the rebuild for one iteration. Holding costs a
+        // poll interval of template staleness, which the miners absorb; not
+        // holding costs real money.
+        bridge_found();
+        if (fc.unbooked_found() || submit_q.size()) fc.tick();
+        const bool found_in_flight = (submit_q.size() != 0) || (fc.unbooked_found() != 0);
+        if (found_in_flight)
+            std::printf("  template: rebuild HELD one tick — %zu found block(s) still in flight "
+                        "(a template built now could re-propose what they just paid)\n",
+                        submit_q.size() + fc.unbooked_found());
+        if (serving && !found_in_flight) {
             const bool refreshed = provider.refresh();
             bool new_template = false;
             if (refreshed) {
@@ -864,6 +930,16 @@ static int run_live(const XmrNodeConfig& cfg) {
             return relay->renotify(id, &peers);
         };
     }
+    // ── ★ R-7: does the coinbase this node serves PAY the ledger it settles? ─
+    // Option B bound to the node's own OwedLedger: yes — every found block's
+    // K_fair coinbase settles owed balances, so its payout leg is mandatory and
+    // an unresolvable one is refused rather than booked as "paid nobody".
+    // Option A: no (monerod's template pays --payout-address, not a ledger key).
+    // Option B on the --owed-demo-amount PROOF FIXTURE: also no, and for the
+    // sharper reason that the coinbase's owed outputs belong to a DIFFERENT
+    // ledger than the one FOUND/FINALIZE move, so booking them here would settle
+    // balances this ledger never credited.
+    fo.require_payout = (cfg.coinbase == CoinbaseMode::V37Settlement) && !cfg.owed_demo_amount;
     o2::FinalizeConnect fc(node, cfg, found_q, fo);
     std::printf("same-height policy: tiebreak=%s D_conf=%llu renotify<=%u journal=%s "
                 "| credit requires burial: YES  orphan-credit: NEVER  double-credit: BLOCKED\n",
@@ -978,6 +1054,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         scfg.chain_id   = cfg.lane_chain;
         scfg.h_min      = cfg.settle_h_min;
         scfg.output_cap = cfg.settle_output_cap;
+        scfg.sink_min   = cfg.settle_sink_min;   // ★ keep the mandated sink real
         std::array<std::uint8_t, 32> sink_B{}, sink_A{};
         if (serving) {
             if (!o2::hex32(cfg.residual_sink_spend_hex, sink_B) ||
@@ -1002,6 +1079,14 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::printf("owed-demo: seeded %llu piconero owed to a distinct K_fair payee "
                         "(coinbase will carry OWED + residual sink)\n",
                         static_cast<unsigned long long>(cfg.owed_demo_amount));
+            // ★ R-7: say the split-brain out loud. The coinbase settles the
+            // FIXTURE's owed set, while FOUND/FINALIZE move the NODE's ledger.
+            // The payout leg is therefore NOT booked in this mode (booking it
+            // would deduct, from the node's ledger, balances only the fixture
+            // ever credited), so the demo cannot settle and its owed only grows.
+            std::printf("  WARN owed-demo is a DEMO: the coinbase commits to the FIXTURE ledger, "
+                        "not the one FOUND/FINALIZE move — the R-7 payout leg is NOT booked, so "
+                        "this mode never settles and must not be used to serve real work\n");
         }
 
         // ── ★ S-1b: WHICH OWED LEDGER THE COINBASE COMMITS TO ────────────────
@@ -1322,6 +1407,7 @@ int main(int argc, char** argv) {
         else if (a == "--settle-h-min") cfg.settle_h_min = std::stoull(next("0"));
         else if (a == "--settle-output-cap") cfg.settle_output_cap =
                      static_cast<std::uint32_t>(std::stoul(next("0")));
+        else if (a == "--settle-sink-min") cfg.settle_sink_min = std::stoull(next("1"));
         else if (a == "--owed-demo-amount") cfg.owed_demo_amount = std::stoull(next("0"));
         else if (a == "--xmr-template-source") {
             const std::string m = next("monerod");
@@ -1419,6 +1505,11 @@ int main(int argc, char** argv) {
                 "  --residual-sink-subaddress   the sink keys are a subaddress (D_i, A_main)\n"
                 "  --settle-h-min <pico>        owed-output floor (0 on XMR)\n"
                 "  --settle-output-cap <n>      TOTAL outputs cap (0 = weight-aware default)\n"
+                "  --settle-sink-min <pico>     piconero withheld from the K_fair owed selection\n"
+                "                               so the MANDATED residual sink is always a real\n"
+                "                               output (default 1). 0 lets owed take the whole\n"
+                "                               reward, which drops the sink and makes the §13\n"
+                "                               shape gate refuse every template.\n"
                 "  --owed-demo-amount <pico>    seed one K_fair OWED payee into the proof ledger\n"
                 "                               (coinbase carries OWED + residual sink)\n"
                 " M2 — where option B's miner data comes from (--coinbase v37 only):\n"

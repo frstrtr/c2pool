@@ -270,6 +270,13 @@ struct XmrNodeConfig {
     // The v37 lane parameters (consensus once multi-node; explicit here).
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
+    // ★ Piconero withheld from the K_fair owed selection so the MANDATED
+    // residual sink is always a real output. Without it, the moment owed >=
+    // budget — which is the (D_conf + 2)nd block of any pool that is actually
+    // settling — K_fair takes the whole reward, the sink vanishes, the §13
+    // shape gate refuses EVERY template, and the miners are parked on a stale
+    // height while the chain moves on. 0 restores exactly that behaviour.
+    std::uint64_t   settle_sink_min   = 1;
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
     // the assembled coinbase carries a real K_fair OWED payee alongside the sink
     // (a multi-output settlement coinbase). 0 => empty ledger (sink-only).
