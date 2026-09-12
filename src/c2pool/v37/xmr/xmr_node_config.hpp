@@ -252,6 +252,20 @@ struct XmrNodeConfig {
     // bound, not a cache policy. 0 disables it (for a regtest chain shorter
     // than the window; never in production).
     std::uint64_t            carrier_index_horizon = 64;
+    // ★ R-A (c2pool#1625) — the S-1c cut projector's retained record window.
+    // The engine publishes ONE settlement view per COALESCED executor burst, so
+    // a block winner routinely names a lane prefix this node never published;
+    // the projector replays the retained record log to that exact prefix and the
+    // fold is accepted only at a MATCHING lane digest. This is how many push
+    // records it keeps (0 = the module default, 131072 ~ 13 MiB). Past the
+    // window it saturates and the node falls back to refusing, loudly.
+    std::size_t              cut_projector_log = 0;
+    // ★ R-B (c2pool#1625) — EXTRA floods of each OWN block-winner frame. A
+    // winner descriptor lost on the wire is a permanent settlement hole on the
+    // peer (it never learns the block exists) and the frozen W3-B5 wire has no
+    // request opcode to ask with, so the winner repeats itself a small bounded
+    // number of times. A peer that already took it answers DEDUP. 0 disables.
+    unsigned                 winner_reflood = 2;
 
     // --- O-2 OPTION B: the v37 K_fair settlement coinbase -------------------
     // --coinbase monerod (option A, default) | v37 (option B). In v37 mode the

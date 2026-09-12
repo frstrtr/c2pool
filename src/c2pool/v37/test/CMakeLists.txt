@@ -639,4 +639,36 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_peer_recompute_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_peer_recompute_kat Threads::Threads)
     add_test(NAME v37_xmr_peer_recompute_kat COMMAND v37_xmr_peer_recompute_kat)
+    # ★ R-A / R-B — the TWO S-1c CARRIER-PATH RACES (c2pool#1625). Both predate
+    # the v0x03 K_fair WIRE-CARRY and both sit in the SHARED carrier path, so
+    # they also affect the DROPS v0x03 track. (R-A) V37Engine publishes ONE
+    # settlement view per COALESCED executor burst (kCoalesceBurst), so the exact
+    # lane prefix a block winner names is frequently never published on the peer
+    # and the receive seam read that as a permanent cut_miss — live, the peer's
+    # lane version jumped by more than one on 92 of 102 samples. The prefix is
+    # still well-defined (snapshot content is a pure function of the committed
+    # record prefix), so it is PROJECTED on demand from the retained record log
+    # and accepted ONLY at a MATCHING lane digest — which is why the projection
+    # can turn a refusal into the correct credit but never into a wrong one.
+    # (R-B) a block-winner carrier whose parent is not yet in the receiver's
+    # index is refused by W2 with carrier_status=2 and the old seam threw the cut
+    # descriptor away with the frame: live, A emitted 45 winner carriers and B
+    # offered 44, and the missing one was a PERMANENT fork. It is now parked by
+    # (h_b, bid), re-asked through the I-2 tri-state gate and re-offered, with a
+    # bounded re-announce of our own winner frames beside it. This suite pins:
+    # the shadow replica bit-equal to the engine at EVERY prefix; both pre-fix
+    # behaviours reproduced directly as negative controls; every fail-closed
+    # refusal (wrong digest, prefix ahead of the log, Rewind-disabled); 25
+    # consecutive blocks converging with EVERY fold served by the projection and
+    # no double-pay; and R-B end-to-end on the REAL relay path plus all of its
+    # bounds. Stdlib + Threads (the engine's executor thread): no coin lib, no
+    # crypto backend, no sockets, no clocks that must pass. SAME HOLLOW-GREEN
+    # GUARD as the sibling suites: ALSO listed on BOTH build.yml --target lists
+    # so CI compiles + RUNS it instead of registering a NOT_BUILT CTest sentinel
+    # (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class).
+    add_executable(v37_xmr_s1c_recovery_kat v37_xmr_s1c_recovery_kat.cpp)
+    target_compile_features(v37_xmr_s1c_recovery_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_s1c_recovery_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_s1c_recovery_kat Threads::Threads)
+    add_test(NAME v37_xmr_s1c_recovery_kat COMMAND v37_xmr_s1c_recovery_kat)
 endif()

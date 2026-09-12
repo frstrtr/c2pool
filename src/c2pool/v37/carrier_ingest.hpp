@@ -103,6 +103,22 @@ public:
           m_adm(std::make_unique<ReceiptAdmitter>(
               static_cast<std::uint32_t>(chain), index, tracker, incarnation)) {}
 
+    // ── ★ R-A: the record TEE (c2pool#1625) ──────────────────────────────────
+    // An observer of the exact record stream this bridge forwards, called INSIDE
+    // the same m_mtx step that enqueues into the engine — so a consumer that
+    // needs the engine's committed ORDER (the S-1c cut projector,
+    // xmr_cut_projector.hpp, which replays it into a shadow lane to answer a
+    // peer's named prefix) gets it by construction rather than by luck. It runs
+    // BEFORE the submit so the tee can never observe a record the engine has
+    // already applied; it must not block and must not call back into the engine.
+    // Unset (the default) => not a single instruction on the admit path.
+    using RecordTee = std::function<void(const ::v37::PayoutDescriptor& desc,
+                                         u64 w_raw, std::uint32_t flags)>;
+    void set_record_tee(RecordTee t) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_tee = std::move(t);
+    }
+
     // The callback CarrierRelay is constructed with. Bound to `this`; the
     // CarrierIngest must outlive the CarrierRelay (the daemon owns both for the
     // node lifetime).
@@ -112,6 +128,7 @@ public:
             std::lock_guard<std::mutex> lk(m_mtx);
             RecordSink sink = [this](const EmittedPush& p) {
                 // Fire-and-forget: O1.4 no callback out, no wait on the executor.
+                if (m_tee) m_tee(p.descriptor, p.w_raw, p.flags);
                 m_engine.submit(::v37::LaneRecord::push(
                     m_chain, p.descriptor, p.w_raw, p.flags));
                 ++m_pushes_forwarded;
@@ -139,6 +156,7 @@ private:
     ::v37::ChainId                   m_chain;
     std::unique_ptr<ReceiptAdmitter> m_adm;
     mutable std::mutex               m_mtx;
+    RecordTee                        m_tee;     // R-A: unset => no-op
     std::uint64_t                    m_pushes_forwarded = 0;
 };
 

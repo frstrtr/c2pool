@@ -255,6 +255,17 @@ public:
         // set_inbound lambda; the worker then holds it across the relay call
         // only (never across the resolve RPC or the grind). nullptr = none.
         std::mutex* relay_mutex = nullptr;
+        // ★ R-B (c2pool#1625): the EXACT bytes of an admitted BLOCK-WINNER
+        // frame, handed out once, so the daemon can hold them for a bounded
+        // re-announce (xmr_carrier_defer.hpp XmrWinnerReflood). A block-winner
+        // descriptor lost on the wire is a PERMANENT settlement hole on the peer
+        // — it never learns the block exists — and the frozen W3-B5 wire has no
+        // request opcode for the peer to ask with, so the winner repeats itself
+        // a small bounded number of times instead. Called on the worker thread,
+        // inside emit_now, AFTER the append stands; must not block. Unset (the
+        // default) => not a single instruction on the emit path, and no frame is
+        // ever encoded for it.
+        std::function<void(std::vector<std::uint8_t>&&)> on_winner_frame;
     };
 
     // (warn, line): the daemon binds LOG_WARNING / LOG_INFO; tests may print.
@@ -453,6 +464,11 @@ public:
         if (o.relay.admitted) {
             o.status = EmitOutcome::Status::ADMITTED;
             m_chains.advance(o.identity, o.hash);     // chain forward only on a real append
+            // ★ R-B: hand the winner's own bytes out for the bounded re-announce.
+            // Only for a block win, only once, only when a holder is bound — an
+            // ordinary share is re-earned every few seconds and needs none.
+            if (req.won_block && m_opt.on_winner_frame)
+                m_opt.on_winner_frame(CarrierWire::encode(c));
             const bool used_fb = o.used_fallback, won = req.won_block, cut = o.carried_cut;
             const bool pay = o.carried_payout;
             const bool settling = req.cut && req.cut->payout_emitted;

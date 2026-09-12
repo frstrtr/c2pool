@@ -682,6 +682,58 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(s1p.xcheck_agree),
                             static_cast<unsigned long long>(s1p.xcheck_differ),
                             static_cast<unsigned long long>(s1p.xcheck_absent));
+                // ── ★ R-A / R-B: the two carrier-path races, accounted ───────
+                // R-A `projected` is the headline: every one of these is a block
+                // that WOULD have been refused (the executor coalesced through
+                // the winner's prefix) and was instead folded at the winner's
+                // exact cut with a MATCHING lane digest. `miss` falls through to
+                // the ordinary cut_miss retry; `mismatch` is a real divergence.
+                // R-B `deferred`/`recovered` is a block-winner descriptor that
+                // arrived too early for this node's index and was re-offered
+                // rather than dropped; `lost` is the only remaining silent-ish
+                // hole and it is now counted.
+                {
+                    const auto cp = hooks.carrier->projector()
+                                        ? hooks.carrier->projector()->stats()
+                                        : o2::XmrCutProjectorStats{};
+                    const auto df = hooks.carrier->deferred();
+                    const auto rf = hooks.carrier->reflood();
+                    std::printf("  R-A cut projector: projected=%llu miss=%llu mismatch=%llu | "
+                                "shadow{log=%llu cursor=%llu replayed=%llu rebuilds=%llu "
+                                "cache=%llu}%s%s\n",
+                                static_cast<unsigned long long>(s1p.cut_projected),
+                                static_cast<unsigned long long>(s1p.cut_project_miss),
+                                static_cast<unsigned long long>(s1p.cut_project_mismatch),
+                                static_cast<unsigned long long>(cp.log_size),
+                                static_cast<unsigned long long>(cp.cursor),
+                                static_cast<unsigned long long>(cp.replayed),
+                                static_cast<unsigned long long>(cp.rebuilds),
+                                static_cast<unsigned long long>(cp.cache_hits),
+                                cp.saturated ? "  <-- SATURATED (widen --cut-projector-log)" : "",
+                                cp.disabled ? "  <-- DISABLED (a Rewind/RemoveLane reached the lane)"
+                                            : "");
+                    std::printf("  R-B deferred carriers: parked=%llu re-offered=%llu "
+                                "RECOVERED=%llu waiting=%llu dropped[spent=%llu full=%llu] | "
+                                "inbound cut_deferred=%llu cut_lost=%llu | re-announce "
+                                "held=%llu sent=%llu%s\n",
+                                static_cast<unsigned long long>(df.parked),
+                                static_cast<unsigned long long>(df.re_offered),
+                                static_cast<unsigned long long>(df.readmitted),
+                                static_cast<unsigned long long>(df.waiting),
+                                static_cast<unsigned long long>(df.dropped_spent),
+                                static_cast<unsigned long long>(df.dropped_full),
+                                static_cast<unsigned long long>(ib.cut_deferred.load()),
+                                static_cast<unsigned long long>(ib.cut_lost.load()),
+                                static_cast<unsigned long long>(rf.held),
+                                static_cast<unsigned long long>(rf.sent),
+                                (ib.cut_lost.load() || df.dropped_spent || df.dropped_full)
+                                    ? "  <-- a block-winner descriptor was LOST here: this "
+                                      "node cannot credit that block" : "");
+                    if (hooks.carrier->projector()) {
+                        const std::string n = hooks.carrier->projector()->take_note();
+                        if (!n.empty()) std::printf("  R-A %s\n", n.c_str());
+                    }
+                }
             } else {
                 std::printf("  lane: NO CARRIER LAYER (--p2p-bind/--peer unset and no pool "
                             "identity): shares do not reach the lane, so E_b folds to {} and "
@@ -718,6 +770,16 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     while (!g_stop.load()) {
         bridge_found();
         fc.tick();
+        // ── ★ R-B: re-offer parked block-winner carriers, re-announce our own ──
+        // Driven here, on the main thread, right beside the settlement tick: a
+        // descriptor whose parent has just become resolvable is re-admitted and
+        // offered to fc BEFORE the reconcile below, so it settles on the very
+        // tick it becomes admissible instead of a whole poll later. Costs
+        // nothing when both registers are empty, which is the healthy state.
+        if (hooks.carrier) {
+            const auto pr = hooks.carrier->pump();
+            if (pr.recovered) fc.tick();     // drain what the recovery just offered
+        }
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
         // p2p-first replaces both with the native chain's own event drain, and
         // this is the only place either of them is driven -- so "no daemon call
@@ -1066,6 +1128,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         co.peers         = cfg.carrier_peers;
         co.index_horizon = cfg.carrier_index_horizon;
         co.pool_desc     = pool_desc;
+        co.cut_projector_log = cfg.cut_projector_log;   // ★ R-A
+        co.winner_reflood    = cfg.winner_reflood;      // ★ R-B
         carrier = std::make_unique<o2::XmrCarrierStack>(
             node, cfg.lane_chain, co, [](bool warn, const std::string& l) {
                 std::printf("  %s%s\n", warn ? "WARN " : "", l.c_str());
@@ -1611,6 +1675,12 @@ int main(int argc, char** argv) {
         else if (a == "--peer") cfg.carrier_peers.push_back(next(""));
         else if (a == "--carrier-index-horizon")
             cfg.carrier_index_horizon = std::stoull(next("64"));
+        // ★ R-A / R-B: the two carrier-path race fixes, both bounded and both
+        // tunable so an operator can widen or disable either one.
+        else if (a == "--cut-projector-log")
+            cfg.cut_projector_log = static_cast<std::size_t>(std::stoull(next("131072")));
+        else if (a == "--winner-reflood")
+            cfg.winner_reflood = static_cast<unsigned>(std::stoul(next("2")));
         else if (a == "--data-dir") cfg.settle_db_path = next("");
         else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
         else if (a == "--randomx") cfg.randomx_enabled = true;
@@ -1651,6 +1721,14 @@ int main(int argc, char** argv) {
                 "  --carrier-index-horizon <n>  how far below the chain tip a carrier's parent\n"
                 "                               block may sit (default 64; 0 = no bound, for a\n"
                 "                               regtest chain shorter than the window only)\n"
+                "  --cut-projector-log <n>      S-1c cut projector: push records retained so a\n"
+                "                               winner prefix this node's executor COALESCED\n"
+                "                               through can still be replayed and folded at a\n"
+                "                               matching lane digest (default 131072; past it the\n"
+                "                               projector saturates and the node refuses as before)\n"
+                "  --winner-reflood <n>         EXTRA floods of each own block-winner frame so a\n"
+                "                               single lost descriptor is recoverable (default 2;\n"
+                "                               a peer that already took it answers DEDUP; 0 = off)\n"
                 " option B (X9): the v37 K_fair SETTLEMENT coinbase (not monerod's template):\n"
                 "  --coinbase <monerod|v37>     monerod (default, option A) | v37 (option B)\n"
                 "  --residual-sink-spend-hex <64hex> --residual-sink-view-hex <64hex>\n"

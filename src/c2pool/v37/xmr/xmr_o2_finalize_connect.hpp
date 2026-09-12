@@ -905,6 +905,14 @@ public:
     void set_peer_payout_recompute(PeerPayoutRecomputeFn f) { m_recompute = std::move(f); }
     bool peer_payout_recompute_armed() const { return static_cast<bool>(m_recompute); }
 
+    // ── ★ R-A: the receive-side cut projector (c2pool#1625) ─────────────────
+    // Bound by the carrier stack once the lane is seeded and the record tee is
+    // wired; cleared BEFORE the stack tears the projector down. Unbound leaves
+    // the pre-R-A behaviour exactly as it was: a prefix the executor coalesced
+    // through is a cut_miss and, after the retry budget, a refusal. Not owned.
+    void set_cut_projector(XmrCutProjector* p) { m_projector = p; }
+    XmrCutProjector* cut_projector() const { return m_projector; }
+
 private:
     // ── ★ S-1c: drain the peer-win queue on the MAIN thread ─────────────────
     //
@@ -1119,15 +1127,24 @@ private:
                 }
             }
 
-            // (e) THE CUT RULE: fold at the WINNER'S prefix, out of OUR ring.
+            // (e) THE CUT RULE: fold at the WINNER'S prefix — out of OUR ring
+            //     when we published it, and out of the ★ R-A PROJECTION when
+            //     our own executor coalesced through it. Both answer the SAME
+            //     question (what did the lane commit to at P?) and the
+            //     projection is accepted only at a MATCHING digest, so neither
+            //     can credit at a neighbouring prefix (O2.3).
             XmrPeerFoldOutcome f =
-                fold_at_peer_cut(m_node.engine(), m_cfg.lane_chain, w, m_s1p);
+                fold_at_peer_cut(m_node.engine(), m_cfg.lane_chain, w, m_s1p, true,
+                                 m_projector);
             if (!f.ok) {
                 // A cut MISS can be a race: CarrierIngest's admit is
                 // fire-and-forget into the engine's MPSC mailbox, so the prefix
                 // the winner named may be published here a few milliseconds from
-                // now. Give it a bounded number of ticks, then refuse. A DIGEST
-                // MISMATCH is never a race and is refused immediately.
+                // now — and, with the projector armed, the RECORDS that reach it
+                // may simply not have arrived yet (the projection then says
+                // "beyond tip" and the next tick asks again). Give it a bounded
+                // number of ticks, then refuse. A DIGEST MISMATCH is never a
+                // race and is refused immediately.
                 if (f.cut_miss && pw.attempts + 1 < kPeerCutRetryTicks) {
                     --m_s1p.cut_miss;              // not a verdict yet
                     ++pw.attempts;
@@ -1560,6 +1577,8 @@ private:
     // ★ (a) peer-recompute. Main thread only (drain_peer_wins). Unbound => the
     // pre-(a) fail-closed refusal for a settling peer win.
     PeerPayoutRecomputeFn m_recompute;
+    // ★ R-A: borrowed, never owned; the carrier stack clears it before teardown.
+    XmrCutProjector* m_projector = nullptr;
 
     mutable std::mutex       m_peer_mtx;   // guards the two members below
     std::deque<PeerPending>  m_peer_q;     // offered from the carrier reader thread

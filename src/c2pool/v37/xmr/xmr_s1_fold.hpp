@@ -93,6 +93,8 @@
 #include <sharechain/v37/v37_hash.hpp>      // ::v37::bytes32
 #include <sharechain/v37/v37_roundabout.hpp>
 
+#include "xmr_cut_projector.hpp"            // ★ R-A: project the view at a peer's P
+
 namespace c2pool::v37n::xmr::o2 {
 
 namespace settle = ::c2pool::v37n::settle;
@@ -125,6 +127,13 @@ struct XmrEbCut {
     std::size_t    unresolved = 0;           // OI-W4-1 broken-invariant counter
     const char*    source = "none";          // settle::eb_source_name()
     std::uint64_t  reward = 0;               // the reward THIS fold consumed
+    // ★ R-A (c2pool#1625): this cut was read from the RECEIVE-SIDE PROJECTION
+    // (xmr_cut_projector.hpp) rather than from the engine's own publication
+    // ring, because the executor coalesced through the winner's prefix here.
+    // The credit is identical either way — the projection is accepted ONLY at a
+    // matching lane digest — but an auditor should be able to see which answer
+    // served the fold, so it is stamped rather than inferred.
+    bool           projected = false;
     std::string    refusal;                  // non-empty => the loud reason
 };
 
@@ -204,6 +213,22 @@ struct XmrS1PeerStats {
     std::uint64_t xcheck_agree    = 0;
     std::uint64_t xcheck_differ   = 0;
     std::uint64_t xcheck_absent   = 0;
+    // ★ R-A (c2pool#1625). The engine publishes ONE SettlementView per coalesced
+    // executor burst, so the exact prefix a winner names is frequently never
+    // published here — which the receive seam used to read as a permanent
+    // cut_miss and a permanent refusal. The prefix is still WELL-DEFINED (a
+    // snapshot's content is a pure function of the committed record prefix), so
+    // it is PROJECTED on demand from the retained record log and accepted ONLY
+    // at a matching lane digest. `cut_projected` counts the folds the projection
+    // served; `cut_project_miss` the asks it could not answer (the records have
+    // not arrived yet, or the log no longer reaches back that far) — those fall
+    // through to the ordinary cut_miss retry and refusal, unchanged;
+    // `cut_project_mismatch` is the projection reaching P and committing to a
+    // DIFFERENT digest, which is a sharechain divergence and is refused like the
+    // ring's own mismatch.
+    std::uint64_t cut_projected       = 0;
+    std::uint64_t cut_project_miss    = 0;
+    std::uint64_t cut_project_mismatch = 0;
     std::uint64_t refused_late  = 0;   // H_b at or below our finalize cursor
     std::uint64_t already_known = 0;   // our own win, or a duplicate
     // The VERIFY field, and what it is NOT. owed_digest_at_win is the winner's
@@ -300,30 +325,61 @@ inline XmrEbCut fold_at_tip(V37Engine& engine, ::v37::ChainId chain,
 // ═══════════════════════════════════════════════════════════════════════════
 inline XmrPeerFoldOutcome fold_at_peer_cut(V37Engine& engine, ::v37::ChainId chain,
                                            const XmrPeerWin& w, XmrS1PeerStats& st,
-                                           bool strict = true) {
+                                           bool strict = true,
+                                           XmrCutProjector* projector = nullptr) {
     XmrPeerFoldOutcome out;
     out.cut.reward = w.reward;
 
     bool mismatch = false;
     std::shared_ptr<const SettlementView> view =
         engine.settlement_view_by_cut(chain, w.cut_next_pos, w.cut_spine_digest, &mismatch);
+
+    // ★ R-A: the ring said "never published here". That is NOT the same claim as
+    // "the prefix does not exist": the engine publishes once per COALESCED burst
+    // (v37_engine.hpp kCoalesceBurst), while a snapshot's content is a pure
+    // function of the committed record prefix. So the view at P is projected on
+    // demand from the record log, and — this is the whole safety case — it is
+    // accepted ONLY when the projection's own lane digest equals the one the
+    // winner committed to. A faithful replica therefore turns this refusal into
+    // the correct credit; an unfaithful one cannot turn it into a WRONG credit,
+    // it can only leave the refusal standing.
+    //
+    // A ring DIGEST MISMATCH is not routed here. It means this node published
+    // that prefix under a different commitment, which is a sharechain divergence
+    // the settlement layer must keep reporting loudly, not something to re-ask.
+    std::string project_why;
+    if (!view && !mismatch && projector) {
+        bool pmis = false;
+        view = projector->project(w.cut_next_pos, w.cut_spine_digest, &pmis, &project_why);
+        if (view) {
+            out.cut.projected = true;
+            ++st.cut_projected;
+        } else if (pmis) {
+            mismatch = true;
+            ++st.cut_project_mismatch;
+        } else {
+            ++st.cut_project_miss;
+        }
+    }
+
     if (!view) {
         out.cut_miss = !mismatch;
         out.cut_digest_mismatch = mismatch;
         if (mismatch) {
             ++st.cut_mismatch;
             out.cut.refusal =
-                "REFUSED: we published the winner's prefix P=" +
-                std::to_string(w.cut_next_pos) + " with a DIFFERENT lane digest — the two "
-                "nodes folded different records into the same prefix. This is a SHARECHAIN "
-                "divergence, not a settlement one; the owed ledger cannot repair it";
+                "REFUSED: the winner's prefix P=" + std::to_string(w.cut_next_pos) +
+                " resolves here under a DIFFERENT lane digest — the two nodes folded "
+                "different records into the same prefix. This is a SHARECHAIN divergence, "
+                "not a settlement one; the owed ledger cannot repair it" +
+                (project_why.empty() ? std::string() : " [" + project_why + "]");
         } else {
             ++st.cut_miss;
             out.cut.refusal =
                 "REFUSED: the winner's prefix P=" + std::to_string(w.cut_next_pos) +
-                " is not a version THIS node published (older than the settlement ring, or "
-                "the executor coalesced through it) — we will not fold at a neighbouring "
-                "prefix (O2.3)";
+                " is neither a version THIS node published nor one the record log can be "
+                "replayed to — we will not fold at a neighbouring prefix (O2.3)" +
+                (project_why.empty() ? std::string() : " [" + project_why + "]");
         }
         return out;
     }
@@ -376,7 +432,11 @@ inline std::string describe_cut(const char* what, const std::string& bid,
                     " P=" + std::to_string(c.next_pos) +
                     " raw_total=" + std::to_string(c.raw_total) +
                     " src=" + c.source +
-                    " unresolved=" + std::to_string(c.unresolved) + "}";
+                    " unresolved=" + std::to_string(c.unresolved) + "}" +
+                    (c.projected ? " [PROJECTED at P: the executor coalesced through this "
+                                   "prefix here, so the view was replayed from the record "
+                                   "log and accepted at a MATCHING lane digest]"
+                                 : "");
     if (!c.refusal.empty()) s += " — " + c.refusal;
     return s;
 }
