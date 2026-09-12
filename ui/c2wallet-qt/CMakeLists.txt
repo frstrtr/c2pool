@@ -54,6 +54,30 @@ target_link_libraries(c2wallet-qt-signer PRIVATE
     Qt6::Widgets
 )
 
+# ═══════════════════════════════════════════════════════════════════════════
+# c2wallet-qt-companion — the ONLINE, KEY-FREE companion (#193), design §5.2.
+# The OPPOSITE of the signer: the online side, which MAY link the network. We
+# link Qt6::Network here on purpose — the concrete contrast to the signer's
+# network-incapable link-guard. It still holds NO keys: it links the key-free
+# c2wallet-companion library (which links only the M5-A artifact library, hence
+# only the vendored SHA-256), NEVER the key-bearing signer core. The mechanical
+# proof is ci/check_key_free.sh, registered as a ctest by src/companion.
+# ═══════════════════════════════════════════════════════════════════════════
+find_package(Qt6 6.2 REQUIRED COMPONENTS Network)
+
+# The key-free companion library + its KATs + the key-free guard.
+add_subdirectory(src/companion)
+
+add_executable(c2wallet-qt-companion src/companion/CompanionApp.cpp)
+target_include_directories(c2wallet-qt-companion PRIVATE src)
+target_link_libraries(c2wallet-qt-companion PRIVATE
+    c2wallet-companion
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Network
+)
+
 # ── Network-incapable link-guard as a ctest ────────────────────────────────
 # The same mechanical proof CI runs, available locally: build the target, then
 # `ctest` runs ci/check_no_network.sh over the produced binary. Off by default
@@ -95,7 +119,9 @@ if(C2WALLET_QT_BUILD_TESTS)
     # btclibs SHA-256 for the sha256/sha256d digests. No Qt, no networking;
     # standalone via:
     #   cmake -S ui/c2wallet-qt/src/family/bitcoin/artifact -B build-artifact -DC2WALLET_QT_BUILD_TESTS=ON
-    add_subdirectory(src/family/bitcoin/artifact)
+    if(NOT TARGET c2wallet-artifact)
+        add_subdirectory(src/family/bitcoin/artifact)
+    endif()
 
     add_test(
         NAME no_network_link_guard

@@ -10,7 +10,10 @@ cmake_minimum_required(VERSION 3.21)
 #     reused, never re-implemented (design §2.4 reuse table);
 #   * the system libsecp256k1 (design §2.4: "system-linked; headers incl.
 #     extrakeys"), for EC pubkey derivation, BIP32 tweak-add and the BIP341
-#     key-path taptweak.
+#     key-path taptweak;
+#   * system zlib — needed only by the Electrum full-file importer, whose
+#     storage-encrypted body is a zlib stream (Electrum storage.py). Ubiquitous
+#     and stable; used by nothing else in this module.
 # No Qt, no networking — so it builds and its KATs run without the Qt app, and
 # it inherits the M0 network-incapable property by construction.
 #
@@ -38,6 +41,9 @@ find_library(SECP256K1_LIB NAMES secp256k1)
 if(NOT SECP256K1_LIB)
     message(FATAL_ERROR "libsecp256k1 not found (apt install libsecp256k1-dev)")
 endif()
+
+# ── System zlib (Electrum full-file storage body is a zlib stream) ──────────
+find_package(ZLIB REQUIRED)
 
 # ── Reused c2pool sources (leaf closure only) ───────────────────────────────
 set(REUSED_SOURCES
@@ -74,6 +80,13 @@ set(HDKEYS_SOURCES
     Descriptor.cpp
     Keystore.cpp
     SeedBackup.cpp
+    # M1-A imports (#193), heavy full-file parsers: Electrum wallet files and
+    # Bitcoin Core wallet.dat (Berkeley DB), plus their shared leaf primitives
+    # (AES-CBC/PKCS7 and a dependency-free JSON reader).
+    AesCbc.cpp
+    MiniJson.cpp
+    Electrum.cpp
+    WalletDat.cpp
     ${C2POOL_ROOT}/ui/c2wallet-qt/src/secure/SecureString.cpp
 )
 
@@ -90,7 +103,7 @@ target_include_directories(c2wallet-hdkeys PUBLIC
 # btclibs' base58/hash pull nlohmann/json headers transitively via core_io in
 # some builds; the leaf files we compile here do not, but guard the include if
 # the header tree is present so a full-repo configure is unaffected.
-target_link_libraries(c2wallet-hdkeys PUBLIC ${SECP256K1_LIB})
+target_link_libraries(c2wallet-hdkeys PUBLIC ${SECP256K1_LIB} ZLIB::ZLIB)
 
 # Belt: keep the portable SHA256 path (no USE_ASM) so this tiny module never
 # needs per-file -march juggling; correctness is byte-identical.
@@ -106,4 +119,13 @@ if(C2WALLET_QT_BUILD_TESTS OR _hdkeys_standalone)
     add_executable(c2wallet-imports-test tests/test_imports.cpp)
     target_link_libraries(c2wallet-imports-test PRIVATE c2wallet-hdkeys)
     add_test(NAME imports_kats COMMAND c2wallet-imports-test)
+
+    # M1-A full-file import KATs (Electrum + wallet.dat). Fixtures are checked-in
+    # (produced by tests/gen_fixtures/gen_fixtures.cpp with libdb + OpenSSL, an
+    # implementation independent of the parser under test).
+    add_executable(c2wallet-family-a-wallets-test tests/test_family_a_wallets.cpp)
+    target_link_libraries(c2wallet-family-a-wallets-test PRIVATE c2wallet-hdkeys)
+    target_compile_definitions(c2wallet-family-a-wallets-test PRIVATE
+        C2W_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME family_a_wallets_kats COMMAND c2wallet-family-a-wallets-test)
 endif()
