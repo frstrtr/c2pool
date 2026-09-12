@@ -3,6 +3,7 @@
 
 #include "Bip143.hpp"
 #include "Crypto.hpp"
+#include "Taproot.hpp"
 
 #include <hash.h>
 #include <serialize.h>
@@ -27,6 +28,11 @@ struct VecWriter {
     int GetType() const { return 0; }
     int GetVersion() const { return 0; }
 };
+
+// BIP340 deterministic-nonce auxiliary value. A FIXED input (not an RNG) so the
+// signature is reproducible; §5.3 forbids a custom RNG in the signing path, and
+// the BIP341 published vectors were generated with an all-zero aux.
+static const uint8_t TAPROOT_AUX[32] = {0};
 
 bool CastToBool(const std::vector<unsigned char>& vch) {
     for (size_t i = 0; i < vch.size(); ++i) {
@@ -113,6 +119,14 @@ void Signer::add_output(int64_t value, const CScript& scriptPubKey)
     tx_.vout.push_back(out);
 }
 
+std::vector<SpentOutput> Signer::spent_outputs() const
+{
+    std::vector<SpentOutput> v;
+    v.reserve(prevouts_.size());
+    for (const auto& po : prevouts_) v.push_back({po.spk, po.amount});
+    return v;
+}
+
 uint256 Signer::legacy_sighash(size_t nIn, const CScript& scriptCode, int nHashType)
 {
     if ((nHashType & 0x1f) == SIGHASH_SINGLE && nIn >= tx_.vout.size()) {
@@ -128,6 +142,16 @@ uint256 Signer::bip143_sighash_for(size_t nIn, const CScript& scriptCode,
                                    int64_t amount, int nHashType)
 {
     return bip143_sighash(tx_, (unsigned int)nIn, scriptCode, amount, nHashType);
+}
+
+uint256 Signer::taproot_sighash_keypath(size_t nIn, int nHashType)
+{
+    return taproot_sighash(tx_, spent_outputs(), (unsigned int)nIn, nHashType, /*ext*/0, nullptr);
+}
+
+uint256 Signer::taproot_sighash_scriptpath(size_t nIn, int nHashType, const uint256& tapleaf_h)
+{
+    return taproot_sighash(tx_, spent_outputs(), (unsigned int)nIn, nHashType, /*ext*/1, &tapleaf_h);
 }
 
 Bytes Signer::make_legacy_sig(size_t nIn, const CScript& scriptCode,
@@ -150,6 +174,35 @@ Bytes Signer::make_bip143_sig(size_t nIn, const CScript& scriptCode, int64_t amo
     if (der.empty()) throw std::runtime_error("ECDSA sign failed");
     der.push_back((uint8_t)nHashType);
     return der;
+}
+
+Bytes Signer::make_taproot_keypath_sig(size_t nIn, const secure::SecureBytes& d,
+                                       const uint256* merkle_root, int nHashType)
+{
+    if (d.size() != 32) throw std::runtime_error("private key must be 32 bytes");
+    // taptweak commits to the x-only INTERNAL key P (derived from d).
+    uint8_t p_xonly[32]; int parity = 0;
+    if (!Secp::instance().xonly_pubkey(d.data(), p_xonly, &parity))
+        throw std::runtime_error("taproot: invalid internal key");
+    Bytes p(p_xonly, p_xonly + 32);
+    uint256 tweak = taptweak(p, merkle_root);
+    uint256 h = taproot_sighash_keypath(nIn, nHashType);
+    Bytes sig = Secp::instance().schnorr_sign_tweaked(d.data(), tweak.begin(), h.begin(), TAPROOT_AUX);
+    if (sig.empty()) throw std::runtime_error("taproot key-path Schnorr sign failed");
+    if (nHashType != SIGHASH_DEFAULT) sig.push_back((uint8_t)nHashType);
+    return sig;
+}
+
+Bytes Signer::make_taproot_scriptpath_sig(size_t nIn, const CScript& leaf, uint8_t leafver,
+                                          const secure::SecureBytes& leaf_key, int nHashType)
+{
+    if (leaf_key.size() != 32) throw std::runtime_error("private key must be 32 bytes");
+    uint256 lh = tapleaf_hash(leafver, leaf);
+    uint256 h = taproot_sighash_scriptpath(nIn, nHashType, lh);
+    Bytes sig = Secp::instance().schnorr_sign(leaf_key.data(), h.begin(), TAPROOT_AUX);
+    if (sig.empty()) throw std::runtime_error("taproot script-path Schnorr sign failed");
+    if (nHashType != SIGHASH_DEFAULT) sig.push_back((uint8_t)nHashType);
+    return sig;
 }
 
 void Signer::set_scriptsig(size_t nIn, const CScript& s) { tx_.vin[nIn].scriptSig = s; }
@@ -179,6 +232,15 @@ SelfVerifyResult Signer::verify_input(size_t nIn) const
         return {true, {}};
     }
 
+    // Taproot (BIP341/342): the vendored interpreter is BASE-only, so verify via
+    // the minimal in-module verifier (re-derive sighash + libsecp Schnorr).
+    if (is_p2tr(po.spk)) {
+        std::string e = taproot_verify_input({po.spk, po.amount}, wit, tx_, spent_outputs(),
+                                             (unsigned int)nIn);
+        if (!e.empty()) return {false, e};
+        return {true, {}};
+    }
+
     // Segwit v0: resolve the witness program (native or P2SH-nested).
     CScript program;
     if (is_p2wpkh_program(po.spk) || is_p2wsh_program(po.spk)) {
@@ -196,7 +258,7 @@ SelfVerifyResult Signer::verify_input(size_t nIn) const
             return {false, "P2SH-wrapped segwit: program hash160 mismatch"};
         program = CScript(pushed.begin(), pushed.end());
     } else {
-        return {false, "input has a witness but the scriptPubKey is not a segwit/P2SH program"};
+        return {false, "input has a witness but the scriptPubKey is not a segwit/P2SH/taproot program"};
     }
 
     std::string e = eval_witness_v0(program, wit, tx_, (unsigned int)nIn, po.amount);

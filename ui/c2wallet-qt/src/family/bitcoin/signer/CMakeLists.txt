@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# c2wallet-qt — Family A (Bitcoin-script) SIGNING core, phase M3-A (#193).
+# c2wallet-qt — Family A (Bitcoin-script) SIGNING core, phases M3-A + M4-A (#193).
 # Design docs/design/c2wallet-qt.md §4.1 (spend matrix + "Wrapped & nested
 # scripts") and §5.3 (self-verify-before-emit; RFC6979/low-S/DER; oversize).
 #
@@ -15,16 +15,19 @@ cmake_minimum_required(VERSION 3.21)
 #     SAME leaf closure the in-tree dash_scriptcheck target uses
 #     (src/impl/dash/coin/vendor/dashscript/*), plus its vendored SHA/RIPEMD/
 #     Hash and CPubKey ECDSA-verify;
-#   * the system libsecp256k1 (design §2.4: system-linked) for ECDSA signing;
+#   * the system libsecp256k1 (design §2.4: system-linked) for ECDSA signing AND
+#     BIP340/341/342 Schnorr (schnorrsig + extrakeys — x-only, keypair tweak);
 #   * the M0 secure/SecureString zeroizing containers for the private scalars.
 # NEW code (design §4.1: "NEW code"): the BIP143 v0 sighash + witness
-# (de)serialization + the wrapping / multi-party-combine assembly. Taproot
-# (BIP341/342) is OUT — that is M4-A.
+# (de)serialization + the wrapping / multi-party-combine assembly (M3-A); AND
+# the full BIP341/342 taproot module (Taproot.*) — taptweak, tap-tree merkle
+# folding, control block, bech32m, BIP341 sighash, OP_CHECKSIGADD multisig, and
+# a minimal BIP341/342 verifier for the taproot self-check (M4-A).
 #
 # Standalone use (what CI / a developer runs for just this target):
 #   cmake -S ui/c2wallet-qt/src/family/bitcoin/signer -B build-signer \
 #         -DC2WALLET_QT_BUILD_TESTS=ON
-#   cmake --build build-signer --target c2wallet-signer-test
+#   cmake --build build-signer --target c2wallet-taproot-test
 #   ctest --test-dir build-signer --output-on-failure
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -41,7 +44,7 @@ get_filename_component(C2POOL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../.
 set(C2WALLET_SRC "${C2POOL_ROOT}/ui/c2wallet-qt/src")
 set(DASHSCRIPT "${C2POOL_ROOT}/src/impl/dash/coin/vendor/dashscript")
 
-# ── System libsecp256k1 (ECDSA sign/verify) ────────────────────────────────
+# ── System libsecp256k1 (ECDSA sign/verify + Schnorr sign/verify) ───────────
 find_library(SECP256K1_LIB NAMES secp256k1)
 if(NOT SECP256K1_LIB)
     message(FATAL_ERROR "libsecp256k1 not found (apt install libsecp256k1-dev)")
@@ -73,6 +76,7 @@ set(SIGNER_SOURCES
     Crypto.cpp
     Scripts.cpp
     Bip143.cpp
+    Taproot.cpp
     Signer.cpp
     ${C2WALLET_SRC}/secure/SecureString.cpp
     ${DASHSCRIPT_SOURCES}
@@ -102,10 +106,14 @@ target_compile_definitions(c2wallet-signer PRIVATE
 
 target_link_libraries(c2wallet-signer PUBLIC ${SECP256K1_LIB})
 
-option(C2WALLET_QT_BUILD_TESTS "Build the signer KAT test" OFF)
+option(C2WALLET_QT_BUILD_TESTS "Build the signer KAT tests" OFF)
 if(C2WALLET_QT_BUILD_TESTS OR _signer_standalone)
     enable_testing()
     add_executable(c2wallet-signer-test tests/test_signer.cpp)
     target_link_libraries(c2wallet-signer-test PRIVATE c2wallet-signer)
     add_test(NAME signer_kats COMMAND c2wallet-signer-test)
+
+    add_executable(c2wallet-taproot-test tests/test_taproot.cpp)
+    target_link_libraries(c2wallet-taproot-test PRIVATE c2wallet-signer)
+    add_test(NAME taproot_kats COMMAND c2wallet-taproot-test)
 endif()
