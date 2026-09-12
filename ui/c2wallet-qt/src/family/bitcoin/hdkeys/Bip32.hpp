@@ -28,6 +28,12 @@ struct Bip32Versions {
 
 class HDKey {
 public:
+    // Zeroizes the private scalar and chaincode on every destruction path
+    // (design §5.3): the master node and every short-lived parent/child
+    // built during path derivation must not leave secret material in freed
+    // memory. Defined out-of-line in Bip32.cpp via secure::secure_wipe.
+    ~HDKey();
+
     // I = HMAC-SHA512("Bitcoin seed", seed); master priv=I[0:32], chaincode=I[32:64].
     // nullopt if I[0:32] is not a valid scalar (probability ~2^-127).
     static std::optional<HDKey> from_seed(const uint8_t* seed, size_t seed_len,

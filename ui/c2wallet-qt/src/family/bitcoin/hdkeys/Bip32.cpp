@@ -4,6 +4,8 @@
 #include "Secp.hpp"
 #include "CoinParams.hpp"
 
+#include "../../../secure/SecureString.hpp"
+
 #include <btclibs/crypto/sha256.h>
 #include <btclibs/crypto/ripemd160.h>
 #include <btclibs/crypto/hmac_sha512.h>
@@ -13,6 +15,23 @@
 #include <cstring>
 
 namespace c2w::hdkeys {
+
+namespace {
+// RAII scrub for stack scratch that holds secret material (the HMAC-SHA512
+// output I, and the hardened-CKD data block that embeds ser256(k)). Fires on
+// every return path, success or error.
+struct ScopeWipe {
+    void* p;
+    std::size_t n;
+    ~ScopeWipe() { c2w::secure::secure_wipe(p, n); }
+};
+} // namespace
+
+HDKey::~HDKey()
+{
+    c2w::secure::secure_wipe(privkey_.data(), privkey_.size());
+    c2w::secure::secure_wipe(chaincode_.data(), chaincode_.size());
+}
 
 std::array<uint8_t, 20> hash160(const uint8_t* data, size_t n)
 {
@@ -40,6 +59,7 @@ std::optional<HDKey> HDKey::from_seed(const uint8_t* seed, size_t seed_len, Bip3
     CHMAC_SHA512 h(reinterpret_cast<const uint8_t*>(kKey), std::strlen(kKey));
     h.Write(seed, seed_len);
     h.Finalize(I);
+    ScopeWipe wipe_I{I, sizeof(I)};  // scrub the 64-byte HMAC scratch on exit
 
     HDKey k;
     std::memcpy(k.privkey_.data(), I, 32);
@@ -75,11 +95,13 @@ std::optional<HDKey> HDKey::derive_child(uint32_t index) const
         std::memcpy(data, pubkey_.data(), 33);
     }
     be32(index, data + 33);
+    ScopeWipe wipe_data{data, sizeof(data)};  // hardened path embeds ser256(k)
 
     uint8_t I[64];
     CHMAC_SHA512 h(chaincode_.data(), chaincode_.size());
     h.Write(data, 37);
     h.Finalize(I);
+    ScopeWipe wipe_I{I, sizeof(I)};  // scrub the 64-byte HMAC scratch on exit
 
     HDKey child;
     std::memcpy(child.chaincode_.data(), I + 32, 32);
