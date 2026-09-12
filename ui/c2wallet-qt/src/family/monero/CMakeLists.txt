@@ -89,6 +89,9 @@ add_library(c2wallet_monero STATIC
     prover/MoneroKeyImage.cpp             # M3-X: key-image export {I, ring-sig}
     prover/MoneroBulletproofsPlus.cpp     # M4-X: Bulletproofs+ range-proof PROVER (ported)
     prover/MoneroRingctBuilder.cpp        # M4-X: full RingCT tx assembly + offline self-verify
+    multisig/MoneroMultisig.cpp           # M4-X-MMS: N/M multisig key exchange (EXPERIMENTAL)
+    multisig/MoneroMultisigSign.cpp       # M4-X-MMS: cooperative (partial) CLSAG signer (EXPERIMENTAL)
+    multisig/MoneroMmsMessage.cpp         # M4-X-MMS: MMS round-message import/export (EXPERIMENTAL)
     artifact/MoneroArtifact.cpp        # M5-X: cold-sign artifact marshaling (verbatim monero layouts)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../secure/SecureString.cpp
 )
@@ -139,6 +142,18 @@ target_link_libraries(c2wallet-monero-ringct-test PRIVATE c2wallet_monero)
 
 add_test(NAME c2wallet_monero_ringct_kat COMMAND c2wallet-monero-ringct-test)
 
+# ── Family B (Monero) M4-X-MMS KATs: N/M multisig + cooperative sign ─────────
+# HIGH money-path (multi-party signing), EXPERIMENTAL: N/M multisig key
+# exchange -> shared address (2-of-2, 2-of-3), MMS round-message import/export,
+# and cooperative (partial) CLSAG signing gated by a construct->verify against
+# the UNCHANGED in-tree/M3-X verifier, plus M-1/tamper/withhold rejection and
+# the fresh-nonce (CSPRNG) property.
+add_executable(c2wallet-monero-multisig-test
+    multisig/test/monero_multisig_test.cpp
+)
+target_link_libraries(c2wallet-monero-multisig-test PRIVATE c2wallet_monero)
+
+add_test(NAME c2wallet_monero_multisig_kat COMMAND c2wallet-monero-multisig-test)
 # -- Family B (Monero) M5-X KATs: cold-sign artifact marshaling ---------------
 # The four public artifacts that cross the air gap (design 5.4; Decision 9 =
 # verbatim monero layouts): outputs export, key-image export, unsigned_txset,
