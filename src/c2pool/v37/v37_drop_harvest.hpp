@@ -73,6 +73,10 @@ public:
     // the K the fold will later ask for. A K < 3 harvester is legal to build and
     // will simply never produce a credit (the module's K >= 3 guard refuses it);
     // it is not this class's job to second-guess the gate.
+    // (payee, interval) — the harvester's row key, public so the share-count
+    // producer can enumerate the open rows it must declare an S for.
+    using IntervalKey = std::pair<::v37::bytes32, u64>;
+
     explicit DropHarvester(std::uint32_t K) : m_K(K) {}
 
     std::uint32_t K() const { return m_K; }
@@ -133,6 +137,30 @@ public:
     bool shares_declared(const ::v37::bytes32& payee, u64 interval) const {
         return m_declared.count(Key{payee, interval}) != 0;
     }
+
+    // The (payee, interval) keys currently open, in deterministic order. The
+    // share-count producer (v37_share_counter.hpp) walks these to declare the
+    // in-interval S for every interval that saw raindrops, which is what turns
+    // the fail-closed declare_shares() rule from an API into a live path.
+    std::vector<IntervalKey> open_keys() const {
+        std::vector<IntervalKey> v;
+        v.reserve(m_open.size());
+        for (const auto& [k, rc] : m_open) { (void)rc; v.push_back(k); }
+        return v;
+    }
+
+    // Consume and DISCARD every interval below the frontier without crediting
+    // it. The S-1c peer path needs exactly this: under DROPS-R3 a peer folds the
+    // WINNER'S composed map, so its own harvest must not be credited — but it
+    // MUST still be advanced, or the same intervals would sit open and be folded
+    // into this node's NEXT own win while the winner had already settled them.
+    // Two nodes that consume their harvests at the same frontiers stay in step.
+    std::size_t discard_buried(u64 bury_before) {
+        const std::size_t n = take_buried(bury_before).size();
+        m_discarded += n;
+        return n;
+    }
+    std::uint64_t discarded() const { return m_discarded; }
     std::uint64_t undeclared_withheld() const { return m_undeclared; }
 
     // Release every interval STRICTLY BELOW `bury_before` as W4 harvest rows, in
@@ -174,10 +202,11 @@ public:
         m_observed = 0;
         m_late = 0;
         m_undeclared = 0;
+        m_discarded = 0;
     }
 
 private:
-    using Key = std::pair<::v37::bytes32, u64>;    // ordered: (payee, interval)
+    using Key = IntervalKey;                       // ordered: (payee, interval)
     std::uint32_t m_K;
     std::map<Key, ::c2pool::v37::subthreshold::ReceiptCollector> m_open;
     std::set<Key> m_declared;      // (payee, interval) whose S is KNOWN
@@ -185,6 +214,7 @@ private:
     std::uint64_t m_observed = 0;
     std::uint64_t m_late = 0;
     std::uint64_t m_undeclared = 0;
+    std::uint64_t m_discarded = 0;
 };
 
 } // namespace c2pool::v37n

@@ -52,7 +52,7 @@
 //   blocks at 4000/4097/6000/9000), so the arms of this KAT nest exactly inside
 //   the already-pinned V37.1 goldens. Onto it the mint adds ONE new, fully
 //   specified input: a deterministic harvest of sub-threshold receipts, handed
-//   to the REAL seam OwedLedger::on_block_found_with_estimator().
+//   to the REAL seam OwedLedger::on_block_found_estimator_raw_PRE_RULING().
 //
 //   THE HARVEST IS A SIMULATED HASH STREAM, NOT A HAND-PICKED h_K. Each
 //   harvested payee draws its whole interval of hashes uniformly over the full
@@ -74,8 +74,21 @@
 //   NON-VACUOUS: the identical harvest that leaves them at the anchor moves A3.
 //
 // ★ TWO PRE-ACTIVATION FINDINGS THIS KAT WITNESSES (numbers, not opinions)
-//   DROPS-R1 (DENOMINATION). apply_credit() returns a HASH COUNT (the low-63
-//   fold of Hhat). on_block_found_with_estimator() adds it to base_credit, which
+//   ★ THIS MINT SUPERSEDES d85dff58… (which superseded 34e4b38e…). Three
+//   operator rulings move it:
+//     R1       DENOMINATION — the estimate now goes through the ORDINARY
+//              share -> E_b conversion (the Q62 weight unit a push applies, then
+//              split_reward's own floor(reward * w / SUM w)), so estimated and
+//              real work of equal magnitude land on the same satoshi.
+//     R-SYBIL  EX-ANTE ENROLMENT — only an identity that committed to DROPS
+//              BEFORE the interval is composed, and an enrolled one is composed
+//              ALWAYS, downside included. The selective opt-in has no expression.
+//     R3       the winner's composed map rides wire v0x03 and the S-1c peer
+//              folds THAT, never its own harvest (proved in the sibling
+//              v37_s1c_convergence_kat, case 9).
+//
+//   DROPS-R1 (DENOMINATION), as it stood before the ruling. apply_credit() returns a HASH COUNT (the low-63
+//   fold of Hhat). on_block_found_estimator_raw_PRE_RULING() adds it to base_credit, which
 //   is E_b — a split of the block REWARD in coin units. Hashes are added to
 //   satoshi. Case DROPS-R1 pins the consequence quantitatively: across four
 //   decades of simulated hashrate the credit tracks the HASH COUNT one-for-one
@@ -135,7 +148,8 @@
 #include <c2pool/v37/w4_settlement.hpp>
 #include <c2pool/v37/v37_node_lane_activation.hpp>  // T1 seam
 #include <c2pool/v37/w2_admission.hpp>              // T2 seam
-#include <c2pool/v37/v37_drop_harvest.hpp>          // T2 seam (harvester)
+#include <c2pool/v37/v37_drop_harvest.hpp>
+#include <c2pool/v37/v37_share_counter.hpp>          // T2 seam (harvester)
 #include <c2pool/v37/settle_finalize_driver.hpp>    // T3 seam
 
 namespace settle = ::c2pool::v37n::settle;
@@ -160,16 +174,23 @@ using ::v37::u64;
 // composition and double-counted a share-covered payee (DROPS-R2). A node that
 // carries the replace-not-add fix must NEVER reproduce that value.
 static const char* GOLDEN_DROPS_ON =
-    "d85dff58ce7734e5ff414be29f116fbc257ada5cd87ee3d95e2ffe40f554ff78";
+    "984c7753ab352255933fb63da524b93eecc916b07cc77d94b454213922f719ce";
 // The superseded value, kept ONLY as a negative assertion: the KAT proves the
 // corrected mint is not it.
+// ★ ALSO SUPERSEDED: d85dff58…, the replace-not-add mint. It was composed in
+// RAW HASH COUNTS and with no enrolment question asked, so DROPS-R1
+// (denomination) and R-SYBIL (ex-ante enrolment) both move it. A build that
+// still reproduced it would be crediting hash counts as satoshi and crediting
+// identities that never committed.
+static const char* SUPERSEDED_RAW_UNENROLLED_GOLDEN =
+    "d85dff58ce7734e5ff414be29f116fbc257ada5cd87ee3d95e2ffe40f554ff78";
 static const char* SUPERSEDED_ADDITIVE_GOLDEN =
     "34e4b38e20d2e222622e1faafbe06c3e392d830a0a878b5e16f67bb2157d8a26";
 // The fold of the four gate-ON digests in ratified LaneKind order
 // (BTC, LTC, DASH, DOGE), domain-separated: sha256d("V37DROPS1" || d0..d3).
 // One number an operator can quote for "the activation, all lanes".
 static const char* GOLDEN_DROPS_ON_COMBINED =
-    "3a9d9ad6f9cd9c7f27f12b87df03abcb60ca463d037c60c6f633b6906468b543";
+    "b03abb1f5798ab199febc4977b4af31e624f5aab0d84e41e60310d344586bd19";
 // ── the anchors that MUST NOT move ────────────────────────────────────────
 // V37.1 gate-ON ridge golden (src/c2pool/v37/test/v37_1_ridge_activation_test.cpp).
 static const char* ANCHOR_RIDGE_ON =
@@ -357,6 +378,7 @@ struct Run {
     long long eb_total[N_BLOCKS]  = {0, 0, 0, 0};   // the E_b split of the reward
     std::array<std::uint8_t, 32> shadow{};          // independent second digest
     std::array<std::uint8_t, 32> spec{};            // from-spec third digest
+    bool saturated = false;                         // R1 i64 clamp ever fired
 };
 
 // ── the FROM-SPEC credit rule ─────────────────────────────────────────────
@@ -374,19 +396,29 @@ struct Run {
 static std::map<bytes32, long long> spec_credit(
     const ::v37::SubthresholdGate& g,
     const std::vector<settle::HarvestedReceipt>& harvested,
-    std::map<std::pair<bytes32, u64>, bool>& seen) {
+    std::map<std::pair<bytes32, u64>, bool>& seen,
+    const settle::DropsCompose& ctx) {
     std::map<bytes32, long long> out;
     if (!g.enabled) return out;                       // gate OFF: nothing enters
     if (g.K < 3) return out;                          // K >= 3 (K = 2: infinite variance)
     for (const auto& hr : harvested) {
         const auto& rc = hr.collector;
-        if (rc.near_miss_count() < g.K) continue;     // J < K: no fallback inflation
         const std::pair<bytes32, u64> key{hr.payee, hr.interval};
         if (seen.count(key)) continue;                // straddle dedup
+        // ★ R-SYBIL, written from the ruling text: an identity that did NOT
+        // commit before the interval is not a DROPS participant at all — it
+        // keeps its ordinary S*T path and contributes nothing here.
+        if (!ctx.enrolled(hr.payee, hr.interval)) continue;
+        if (g.mode != 1 && rc.shares() > 0) continue; // EstimateOnly refuses covered
         seen[key] = true;
         sub::u320 e{}, w{};
         if (g.mode == 1) {                            // Combined (the canon rule)
-            e = sub::estimate_combined(rc.shares(), g.K, rc.h_K());
+            // ★ ENROLLED: composed ALWAYS. J < K is no longer a refusal, it is
+            // Hhat == 0 — the enrolled payee's whole share work comes back out
+            // and nothing replaces it. That is the downside enrolment accepts,
+            // and it is what makes the ex-ante choice worth nothing.
+            if (rc.near_miss_count() >= g.K)
+                e = sub::estimate_combined(rc.shares(), g.K, rc.h_K());
             // REPLACE: Hhat_comb covers the WHOLE interval, so the interval's
             // share-derived contribution W_shares = S*T comes back out. Written
             // from the spec's own definition of a share's work, not read off the
@@ -395,15 +427,15 @@ static std::map<bytes32, long long> spec_credit(
                 w = sub::divfloor(sub::coeff_times_2_256(rc.shares()),
                                   sub::promote(rc.target_hash()));
         } else {                                      // EstimateOnly
-            if (rc.shares() > 0) continue;
-            e = sub::estimate_hashes(g.K, rc.h_K());
+            if (rc.near_miss_count() >= g.K) e = sub::estimate_hashes(g.K, rc.h_K());
         }
-        auto fold = [](const sub::u320& x) {
-            long long a = 0;
-            for (int i = 62; i >= 0; --i) a = (a << 1) | (x.bit(i) ? 1 : 0);
-            return a;
-        };
-        const long long amt = fold(e) - fold(w);
+        // ★ R1, written from the ruling text: BOTH sides go through the ORDINARY
+        // share -> E_b conversion floor(reward * work / SUM weight) — which is
+        // split_reward's own expression — and are then subtracted. Converting
+        // each side separately (not the difference) is what keeps this
+        // re-derivation and the seam on the same integer.
+        const long long amt = settle::entitlement_of_work(ctx.price, e)
+                            - settle::entitlement_of_work(ctx.price, w);
         if (amt != 0) out[hr.payee] += amt;
     }
     return out;
@@ -432,6 +464,15 @@ static Run drive(LaneKind lk, bool ridge, unsigned drops, Harvest mode,
     const std::uint32_t K_use = p.subthreshold.K;
 
     Run o;
+    // ★ R-SYBIL — THE EX-ANTE ENROLMENT BOOK, built BEFORE the schedule runs.
+    // Every commitment is made at interval 0 to take effect at interval 1,
+    // strictly earlier than the first interval this schedule harvests (bin 499),
+    // so no identity in this mint is choosing after seeing its own draws. A
+    // payee that is NOT in this book is credited nothing at all by the seam —
+    // case DROPS-ENROL below drives exactly that arm.
+    ::c2pool::v37n::EnrollmentBook enroll;
+    for (unsigned d = 0; d < N_DROPS; ++d) enroll.commit(key_of(DROP_BASE + d), 0, 1);
+    for (unsigned c = 0; c < 2; ++c)      enroll.commit(key_of(COVER_ID[c]), 0, 1);
     ::v37::Lane lane(p);
     auto idv = std::make_shared<FakeIdView>();
     for (MinerId m = 1; m <= N_MINERS; ++m)
@@ -479,11 +520,22 @@ static Run drive(LaneKind lk, bool ridge, unsigned drops, Harvest mode,
 
             const u64 bin = (BLOCK_AT[nb] - 1) / SHARES_PER_BIN;
             const auto hv = harvest_for(bin, mode, K_use);
-            // measure the estimator's own contribution through the real seam
-            const auto est = settle::subthreshold_credit(p, hv);
+            // ★★ THE RULED COMPOSITION CONTEXT — both rulings, at the cut.
+            //   R1       the price is (reward, SUM weight) read from THIS view
+            //            through the SAME project() the fold above ran, so an
+            //            estimated hash and a real hash at this cut are worth
+            //            the same satoshi.
+            //   R-SYBIL  `enroll` is the ex-ante book; a payee not in it is
+            //            credited nothing and keeps its ordinary S*T path.
+            settle::DropsCompose ctx;
+            ctx.price      = settle::work_price_at(REWARD, v);
+            ctx.enrollment = &enroll;
+            bool sat = false;
+            const auto est = settle::subthreshold_credit(p, hv, ctx, &sat);
+            if (sat) o.saturated = true;
             for (const auto& [k, val] : est) { (void)k; o.est_total[nb] += val; }
 
-            ledger.on_block_found_with_estimator(BLOCK_ID[nb], base, {}, p, hv);
+            ledger.on_block_found_with_drops(BLOCK_ID[nb], base, {}, p, hv, ctx);
             ledger.on_block_finalized(BLOCK_ID[nb], bin);
 
             for (const auto& [k, val] : base) sh_final[k] += val;
@@ -500,7 +552,7 @@ static Run drive(LaneKind lk, bool ridge, unsigned drops, Harvest mode,
             }
 
             std::map<std::pair<bytes32, u64>, bool> spec_seen;
-            const auto sp = spec_credit(p.subthreshold, hv, spec_seen);
+            const auto sp = spec_credit(p.subthreshold, hv, spec_seen, ctx);
             if (sp != est) spec_agrees = false;
             for (const auto& [k, val] : base) sp_final[k] += val;
             for (const auto& [k, val] : sp)   sp_final[k] += val;
@@ -642,6 +694,12 @@ int main() {
         check(hex(a3[i].owed) != SUPERSEDED_ADDITIVE_GOLDEN,
               "★ and it is NOT the superseded 34e4b38e… additive mint: a build that "
               "reproduced that value would still be double-counting");
+        check(hex(a3[i].owed) != SUPERSEDED_RAW_UNENROLLED_GOLDEN,
+              "★ nor the superseded d85dff58… raw/un-enrolled mint: a build that "
+              "reproduced THAT value would be crediting hash counts as satoshi and "
+              "paying identities that never enrolled");
+        check(!a3[i].saturated,
+              "the R1 conversion never hit its i64 clamp over the whole mint");
     }
     check(hex32(comb) == GOLDEN_DROPS_ON_COMBINED,
           "the combined all-lanes fold matches its pinned value");
@@ -749,7 +807,7 @@ int main() {
         auto rc = simulate(DROP_BASE, iv, DROP_HASHES[0], K_CANON);
         std::vector<settle::HarvestedReceipt> hv{
             settle::HarvestedReceipt{key_of(DROP_BASE), iv, rc}};
-        const auto credit = settle::subthreshold_credit(p, hv);
+        const auto credit = settle::subthreshold_credit_raw_PRE_RULING(p, hv);
         check(credit.size() == 1, "the seam credits exactly the harvested payee");
         const long long seam = credit.empty() ? -1 : credit.begin()->second;
         const long long cmb  = low63(sub::estimate_combined(rc.shares(), K_CANON, rc.h_K()));
@@ -767,7 +825,7 @@ int main() {
         auto rcS = simulate(COVER_ID[0], iv, COVER_HASHES[0], K_CANON);
         std::vector<settle::HarvestedReceipt> hvS{
             settle::HarvestedReceipt{key_of(COVER_ID[0]), iv, rcS}};
-        const auto creditS = settle::subthreshold_credit(p, hvS);
+        const auto creditS = settle::subthreshold_credit_raw_PRE_RULING(p, hvS);
         const long long seamS = creditS.empty() ? -1 : creditS.begin()->second;
         const long long cmbS  = low63(sub::estimate_combined(rcS.shares(), K_CANON, rcS.h_K()));
         const long long clmS  = low63(sub::broken_clamp_NEVER_CONSENSUS(
@@ -828,7 +886,7 @@ int main() {
                     hv.push_back(settle::HarvestedReceipt{
                         key_of(MinerId(90000 + id)), (u64)id, rc});
                 }
-                const auto credit = settle::subthreshold_credit(p, hv);
+                const auto credit = settle::subthreshold_credit_raw_PRE_RULING(p, hv);
                 for (const auto& [k, v] : credit) { (void)k; cmb += (double)v; }
             }
             const double denom = (double)tr * (double)Hbig;
@@ -865,74 +923,126 @@ int main() {
         std::vector<settle::HarvestedReceipt> next_iv = once;
         next_iv.push_back(settle::HarvestedReceipt{
             key_of(DROP_BASE), 513, simulate(DROP_BASE, 513, DROP_HASHES[0], K_CANON)});
-        const long long v1 = settle::subthreshold_credit(p, once).begin()->second;
-        const long long v2 = settle::subthreshold_credit(p, twice).begin()->second;
-        const long long v3 = settle::subthreshold_credit(p, next_iv).begin()->second;
+        const long long v1 = settle::subthreshold_credit_raw_PRE_RULING(p, once).begin()->second;
+        const long long v2 = settle::subthreshold_credit_raw_PRE_RULING(p, twice).begin()->second;
+        const long long v3 = settle::subthreshold_credit_raw_PRE_RULING(p, next_iv).begin()->second;
         std::printf("   once=%lld  replayed=%lld  two intervals=%lld\n", v1, v2, v3);
         check(v1 == v2, "replaying the SAME (payee, interval) credits it once "
                         "(the straddle dedup holds at the seam)");
         check(v3 > v1, "a DIFFERENT interval for the same payee does credit again");
     }
 
-    // ── DROPS-R1 (FINDING): the estimate is HASHES, E_b is COIN ──────────
-    std::printf("\n-- DROPS-R1 (FINDING): the estimate is a HASH COUNT, E_b is COIN --\n");
+    // ── DROPS-R1 (★ RULED AND CLOSED): the estimate is DENOMINATED ───────
+    // The defect: apply_credit's fold63 returns a HASH COUNT and E_b is a split
+    // of the block REWARD in coin, so the merge dropped hashes into a satoshi
+    // row. Measured by the verify pass at share difficulty 2^40: a 503,350,526
+    // sat entitlement met a 3,299,038,233,853 "credit" — off by ~6553x, with the
+    // SIGN of the error set by the lane's difficulty.
+    //
+    // The ruling: reuse the conversion the ordinary share path already uses.
+    // That conversion is exactly two things, and this section pins both:
+    //   (a) the Q62 UNIT — a push stores w_scaled = w_raw x InvD, so lane
+    //       weights are Q62 work units, not hashes;
+    //   (b) the PRICE — split_reward's own floor(reward * weight / SUM weight).
+    // Put together: entitlement_of_work(price, W) == the E_b row a REAL share of
+    // the same work magnitude gets at the same cut. Nothing else, no new
+    // constant, and no second conversion.
+    std::printf("\n-- DROPS-R1: the estimate is denominated through the SHARE path --\n");
     {
         long long est_all = 0, eb_all = 0;
         for (int b = 0; b < N_BLOCKS; ++b) {
             est_all += a3[0].est_total[b];
             eb_all  += a3[0].eb_total[b];
         }
-        std::printf("   over the pinned schedule: E_b = %lld sat, estimator = %lld "
-                    "(hash counts merged AS sat) = %.4f%% of the reward\n",
+        std::printf("   over the pinned schedule: E_b = %lld sat, DROPS delta = %lld sat "
+                    "= %.4f%% of the reward paid\n",
                     eb_all, est_all,
                     eb_all ? 100.0 * (double)est_all / (double)eb_all : 0.0);
         check(eb_all == (long long)REWARD * N_BLOCKS,
               "E_b pays out exactly the block reward per block (the unit it is in)");
-        check(est_all != 0, "the estimator contributes a measurable amount "
+        check(est_all != 0, "the DROPS delta contributes a measurable amount "
                             "(signed: the REPLACE delta may net either way)");
 
-        // The estimator is UNBIASED but not low-variance: at K = 4 a single
-        // interval's Hhat has a relative standard deviation of 1/sqrt(K-2) ~ 0.71,
-        // so proportionality is a statement about the MEAN and has to be measured
-        // over replicates, not read off one draw. R independent payees per size;
-        // the standard error of the mean ratio is 0.71/sqrt(R) ~ 0.051, and the
-        // window below is ~4 sigma wide.
-        const LaneParams p = LaneParams::for_version(1, LaneKind::BTC);
-        const unsigned R = 192;
-        bool proportional = true;
-        for (std::uint64_t H : {std::uint64_t(512), std::uint64_t(8192),
-                                std::uint64_t(131072)}) {
-            double tot = 0.0;
-            for (unsigned rep = 0; rep < R; ++rep) {
-                const MinerId id = MinerId(77001 + rep);
-                auto rc = simulate(id, 900 + H, H, K_CANON);
-                std::vector<settle::HarvestedReceipt> hv{
-                    settle::HarvestedReceipt{key_of(id), 900 + H, rc}};
-                const auto c = settle::subthreshold_credit(p, hv);
-                // COMPOSED, for the same reason as the sybil case: the seam
-                // returns the REPLACE delta, and what the payee is actually
-                // credited for the interval is W_shares + delta.
-                tot += (double)low63(sub::share_covered_work(rc.shares(),
-                                                             rc.target_hash()));
-                if (!c.empty()) tot += (double)c.begin()->second;
+        // ★ (1) SCALE CORRECTNESS. A composed row of work W and a REAL share row
+        // of the same work W land on the SAME number of satoshi. Built on a view
+        // whose weights ARE work(T) in the lane's own Q62 units, so the claim is
+        // about the production conversion and not about a fixture artefact.
+        sub::u256 hT216;  hT216.w[3] = (1ull << (216 - 192));      // 2^216
+        {   // h_T = 2^216 - 1  (a leading-zero target of 40 bits: T = 2^40)
+            sub::u256 t; t.w[3] = (1ull << (216 - 192));
+            // subtract one, by hand: 2^216 - 1 sets every bit below 216
+            sub::u256 hT{};
+            for (unsigned b = 0; b < 216; ++b) hT.w[b >> 6] |= (1ull << (b & 63));
+            // FOUR near-misses just above the target, the largest of which is the
+            // K-th smallest and therefore h_(K).
+            sub::ReceiptCollector rc(K_CANON, hT);
+            for (int k = 0; k < 4; ++k) {
+                sub::u256 h; h.w[3] = (1ull << (217 - 192)); h.w[0] = (std::uint64_t)k;
+                rc.observe(h);
             }
-            const double mean  = tot / (double)R;
-            const double ratio = mean / (double)H;
-            std::printf("   a payee that performed %-7llu hashes is credited %-12.0f "
-                        "on average over %u intervals  (%.3f x its hash count, "
-                        "%.9f x the block reward)\n",
-                        (unsigned long long)H, mean, R, ratio, mean / (double)REWARD);
-            if (!(ratio > 0.80 && ratio < 1.20)) proportional = false;
+            check(rc.near_miss_count() == K_CANON && rc.shares() == 0,
+                  "R1 fixture: J == K near-misses, S == 0 (nothing to replace)");
+            const sub::u320 hhat = sub::estimate_combined(0, K_CANON, rc.h_K());
+            const long long raw  = low63(hhat);       // the PRE-RULING number
+            check(raw > 0, "R1 fixture: the estimate is non-zero");
+
+            // A lane in which ONE payee's weight is EXACTLY this estimate's work,
+            // in the lane's own Q62 units, and the whole lane is ten times that.
+            const ::v37::u128 wq = ((::v37::u128)raw) << 62;
+            auto idv2 = std::make_shared<FakeIdView>();
+            idv2->m[1] = ::v37::IdentityEntry{key_of(1), ::v37::ScriptRef{}};
+            idv2->m[2] = ::v37::IdentityEntry{key_of(2), ::v37::ScriptRef{}};
+            FakeView v2;
+            v2.payout[1] = ::v37::U256::from_u128(wq);
+            v2.payout[2] = ::v37::U256::from_u128(wq * 9);
+            v2.identities = idv2;
+            const settle::WorkPrice price = settle::work_price_at(REWARD, v2);
+            check(price.valid, "R1: the price is expressible at this cut");
+            const auto f2 = settle::fold_eb(REWARD, v2, /*strict=*/false);
+            check(f2.has_value(), "R1: the fixture folds");
+            const long long eb_x = f2 ? (long long)f2->credit.at(key_of(1)) : -1;
+            bool sat = false;
+            const long long ruled = settle::entitlement_of_work(price, hhat, &sat);
+            std::printf("   equal-work fixture: payee-1 lane weight == the estimate's "
+                        "work\n"
+                        "     E_b(payee-1)                    = %lld sat\n"
+                        "     entitlement_of_work(estimate)   = %lld sat   <- the RULED credit\n"
+                        "     fold63(estimate) (PRE-RULING)   = %lld      <- a HASH COUNT as sat\n"
+                        "     pre-ruling / E_b                = %.1f x\n",
+                        eb_x, ruled, raw, eb_x ? (double)raw / (double)eb_x : 0.0);
+            check(!sat, "R1: no i64 clamp on the equal-work fixture");
+            check(ruled == eb_x,
+                  "★ SCALE-CORRECT: a COMPOSED row of work W is credited EXACTLY the "
+                  "same satoshi as a REAL SHARE row of the same work W at the same "
+                  "cut — which is the whole content of the R1 ruling");
+            check(raw != ruled,
+                  "and it is NOT the pre-ruling number, so the fix is not vacuous");
+            check(eb_x > 0 && (double)raw / (double)eb_x > 1000.0,
+                  "★ THE BLOWUP, MEASURED: the pre-ruling raw hash count is more than "
+                  "three orders of magnitude off the entitlement it was being added to "
+                  "(the verify pass measured 503,350,526 sat vs 3,299,038,233,853)");
+            // and it is a genuine proportionality, not one point: double the work,
+            // double the credit.
+            sub::u320 twice = hhat;
+            {   // twice = hhat + hhat, limb-wise with carry
+                ::v37::u128 c2 = 0;
+                for (int li = 0; li < 5; ++li) {
+                    ::v37::u128 t2 = (::v37::u128)hhat.w[(std::size_t)li] * 2 + c2;
+                    twice.w[(std::size_t)li] = (std::uint64_t)t2;
+                    c2 = t2 >> 64;
+                }
+            }
+            const long long ruled2 = settle::entitlement_of_work(price, twice);
+            check(ruled2 == 2 * ruled,
+                  "R1: the conversion is exactly linear in the work (2W -> 2 x the "
+                  "entitlement), so it cannot be a coincidence of one fixture");
+            // gate-OFF / no-price safety: an unusable price credits NOTHING rather
+            // than guessing a scale.
+            settle::WorkPrice none;
+            check(settle::entitlement_of_work(none, hhat) == 0,
+                  "★ an invalid price credits ZERO — the seam never invents a scale");
         }
-        check(proportional,
-              "the credit tracks the HASH COUNT one-for-one across two and a half "
-              "orders of magnitude and is independent of the block reward: the merge "
-              "adds hashes to satoshi. A hashes-to-entitlement conversion is OWED "
-              "before activation (DROPS-R1)");
-        std::printf("   => extrapolating: an interval in which a payee performs 5e9 "
-                    "hashes (a ~10 MH/s device for ~8 minutes) is credited more than "
-                    "the entire %llu-sat block reward.\n",
-                    (unsigned long long)REWARD);
+        (void)hT216;
     }
 
     // ── DROPS-REPLACE (★ the fix): the estimate REPLACES, never ADDS ─────
@@ -948,7 +1058,7 @@ int main() {
         check(rcS.shares() > 0, "the covered fixture really does carry shares (S > 0)");
         std::vector<settle::HarvestedReceipt> hv{
             settle::HarvestedReceipt{key_of(COVER_ID[0]), iv, rcS}};
-        const auto delta_map = settle::subthreshold_credit(p, hv);
+        const auto delta_map = settle::subthreshold_credit_raw_PRE_RULING(p, hv);
         check(delta_map.size() == 1, "the seam returns exactly one row for one payee");
         const long long delta = delta_map.begin()->second;
         const long long est  = low63(sub::estimate_combined(rcS.shares(), K_CANON,
@@ -1022,7 +1132,7 @@ int main() {
         auto rcU = simulate(DROP_BASE, iv, DROP_HASHES[0], K_CANON);
         std::vector<settle::HarvestedReceipt> hu{
             settle::HarvestedReceipt{key_of(DROP_BASE), iv, rcU}};
-        const long long du = settle::subthreshold_credit(p, hu).begin()->second;
+        const long long du = settle::subthreshold_credit_raw_PRE_RULING(p, hu).begin()->second;
         const long long eu = low63(sub::estimate_combined(rcU.shares(), K_CANON,
                                                           rcU.h_K()));
         check(rcU.shares() == 0, "the drop fixture really is UNCOVERED (S == 0)");
@@ -1050,7 +1160,7 @@ int main() {
             if (!rc.has_K()) continue;
             std::vector<settle::HarvestedReceipt> hv{
                 settle::HarvestedReceipt{key_of(id), (u64)t, rc}};
-            const auto c = settle::subthreshold_credit(p, hv);
+            const auto c = settle::subthreshold_credit_raw_PRE_RULING(p, hv);
             const long long delta = c.empty() ? 0 : c.begin()->second;
             const long long wsh = low63(sub::share_covered_work(rc.shares(), hT));
             composed += (double)(wsh + delta);        // E_b part + REPLACE delta
@@ -1311,8 +1421,8 @@ int main() {
         base[key_of(1)] = 1000;
 
         // the composition helper is the single source of the composed map
-        const auto composed = settle::compose_credit_replace(p, base, hv);
-        const auto delta    = settle::subthreshold_credit(p, hv);
+        const auto composed = settle::compose_credit_replace_raw_PRE_RULING(p, base, hv);
+        const auto delta    = settle::subthreshold_credit_raw_PRE_RULING(p, hv);
         check(composed.size() == base.size() + delta.size(),
               "T3: the composed map is E_b plus the harvested payees");
         check(composed.at(key_of(1)) == 1000,
@@ -1322,7 +1432,7 @@ int main() {
 
         // GATE OFF => the helper returns base_credit ITSELF, byte for byte.
         const LaneParams off{};
-        const auto none = settle::compose_credit_replace(off, base, hv);
+        const auto none = settle::compose_credit_replace_raw_PRE_RULING(off, base, hv);
         check(none == base,
               "★ T3 gate OFF: compose_credit_replace returns base_credit itself — "
               "the seam is inert on a default node, which is why wiring it moves "
@@ -1330,7 +1440,7 @@ int main() {
 
         // the driver seam agrees with the ledger seam
         settle::OwedLedger l1(7), l2(7);
-        l1.on_block_found_with_estimator("b", base, {}, p, hv);
+        l1.on_block_found_estimator_raw_PRE_RULING("b", base, {}, p, hv);
         l2.on_block_found("b", composed, {});
         // finalize at the bin the F1 driver would stamp: found_height + D_conf.
         l1.on_block_finalized("b", iv + 2);
@@ -1339,17 +1449,79 @@ int main() {
               "T3: on_block_found_with_estimator == on_block_found(composed) — one "
               "composition, no second merge hiding anywhere");
 
-        // and the FinalizeDriver carries it end to end
+        // ★ and the FinalizeDriver carries the RULED composition end to end.
+        // The context is mandatory here: a candidate with a harvest but no price
+        // and no enrolment book composes NOTHING, which is the fail-closed shape
+        // and is asserted separately below.
+        ::c2pool::v37n::EnrollmentBook enroll_t3;
+        enroll_t3.commit(key_of(DROP_BASE + 1), 0, 1);
+        auto idv_t3 = std::make_shared<FakeIdView>();
+        idv_t3->m[1] = ::v37::IdentityEntry{key_of(1), ::v37::ScriptRef{}};
+        FakeView v_t3;
+        v_t3.payout[1] = ::v37::U256::from_u128(((::v37::u128)1000000) << 62);
+        v_t3.identities = idv_t3;
+        settle::DropsCompose ctx_t3;
+        ctx_t3.price      = settle::work_price_at(REWARD, v_t3);
+        ctx_t3.enrollment = &enroll_t3;
+
+        settle::OwedLedger lr(7);
+        lr.on_block_found_with_drops("b", base, {}, p, hv, ctx_t3);
+        lr.on_block_finalized("b", iv + 2);
+
         settle::OwedLedger l3(7);
         settle::SettleHW hw3{};
         settle::FinalizeDriver drv(l3, hw3, 7, 2);
         settle::FinalizeCandidate c;
         c.bid = "b"; c.found_height = iv; c.credit = base; c.params = p; c.harvested = hv;
+        c.drops = ctx_t3;
         drv.register_found(c);
         drv.advance_to(iv + 2);
-        check(l3.owed_digest() == l1.owed_digest(),
+        check(l3.owed_digest() == lr.owed_digest(),
               "T3: FinalizeDriver::register_found composes the same ledger as the "
-              "direct seam — the driver is wired, not decorative");
+              "RULED seam — the driver is wired, not decorative");
+        check(!lr.owed_digest().empty() && l3.owed_digest() != l1.owed_digest(),
+              "and the RULED composition is NOT the pre-ruling one (non-vacuous)");
+
+        // ★ R3: the CARRIED-DELTA path folds a map that was composed elsewhere,
+        // and lands on the same ledger as composing it here. This is the peer
+        // path's arithmetic, isolated from the node and the wire.
+        {
+            const auto delta_r = settle::subthreshold_credit(p, hv, ctx_t3);
+            settle::OwedLedger lc(7);
+            lc.on_block_found_with_carried_drops("b", base, {}, delta_r);
+            lc.on_block_finalized("b", iv + 2);
+            check(lc.owed_digest() == lr.owed_digest(),
+                  "★ R3: folding the WINNER'S composed map reproduces the winner's "
+                  "own ledger exactly — which is why a peer may take it verbatim");
+            settle::OwedLedger ld(7);
+            settle::SettleHW hwd{};
+            settle::FinalizeDriver drvd(ld, hwd, 7, 2);
+            settle::FinalizeCandidate cd;
+            cd.bid = "b"; cd.found_height = iv; cd.credit = base;
+            cd.has_carried_drops = true; cd.carried_drops = delta_r;
+            drvd.register_found(cd);
+            drvd.advance_to(iv + 2);
+            check(ld.owed_digest() == lr.owed_digest(),
+                  "R3: and the driver's carried-delta branch does the same");
+        }
+
+        // ★ FAIL-CLOSED: a harvest with NO context composes NOTHING.
+        {
+            settle::OwedLedger lz(7);
+            settle::FinalizeCandidate cz;
+            settle::SettleHW hwz{};
+            settle::FinalizeDriver drvz(lz, hwz, 7, 2);
+            cz.bid = "b"; cz.found_height = iv; cz.credit = base;
+            cz.params = p; cz.harvested = hv;          // no price, no enrolment book
+            drvz.register_found(cz);
+            drvz.advance_to(iv + 2);
+            settle::OwedLedger lb(7);
+            lb.on_block_found("b", base, {});
+            lb.on_block_finalized("b", iv + 2);
+            check(lz.owed_digest() == lb.owed_digest(),
+                  "★ a harvest with no price and no enrolment book credits NOTHING — "
+                  "the seam fails closed rather than guessing either ruling");
+        }
 
         // inert by default through the driver too
         settle::OwedLedger l4(7), l5(7);
@@ -1362,6 +1534,300 @@ int main() {
         check(l4.owed_digest() == l5.owed_digest(),
               "★ T3 default: a FinalizeCandidate with no harvest settles exactly "
               "the master ledger");
+    }
+
+    // ── DROPS-ENROL (★ R-SYBIL): the SELECTIVE opt-in is CLOSED ──────────
+    // THE ATTACK. The replace delta Hhat_comb - W_shares is SIGNED and correct,
+    // but a payee that can decide PER INTERVAL, after the draw, whether to take
+    // it keeps only the upside. Splitting hashrate multiplies the number of
+    // independent draws, so the gain RISES with the identity count: the verify
+    // pass measured 1.02 / 1.08 / 1.30 / 1.84 / 1.96x at n = 1 / 4 / 20 / 200 /
+    // 2000 against an unconditional ~0.93..0.97x that is FLAT in n.
+    //
+    // THE RULING. Participation is committed EX ANTE, once, digest-bound, for an
+    // interval strictly later than the one the commitment is made in. Enrolled
+    // means composed ALWAYS — including J < K (Hhat == 0) and including a
+    // NEGATIVE delta. Not enrolled means DROPS does not apply at all.
+    //
+    // WHAT THIS SECTION PROVES. The selective curve is computed here from the
+    // estimator arithmetic DIRECTLY, because it has no expression in the
+    // codebase to drive it through — and the curve the SHIPPED SEAM produces,
+    // with the same draws and the same identities, is the unconditional one:
+    // flat in n, and strictly below the selective curve at every split.
+    std::printf("\n-- DROPS-ENROL: ex-ante enrolment flattens the selective curve --\n");
+    {
+        const LaneParams p = LaneParams::for_version(1, LaneKind::BTC);
+        // ★ THE TARGET MATTERS, AND IT IS CHOSEN TO BE REALISTIC, NOT KIND.
+        // T = 256 (h_T = 2^248 - 1): at a 2000-way split each identity lands
+        // about ONE share per interval, which is the regime a real small miner is
+        // in and the regime in which the per-interval estimate has the variance a
+        // selective attacker feeds on. At the mint's much harder target a 2000-way
+        // split leaves almost every identity with S == 0 and nothing to replace,
+        // and at a much weaker one the censoring at h_T damps the variance away —
+        // both would understate the attack. This is the honest middle.
+        sub::u256 hT;
+        for (unsigned b = 0; b < 248; ++b) hT.w[b >> 6] |= (1ull << (b & 63));
+        const std::uint64_t H_TOTAL = 512000;          // hashes the attacker owns
+        const u64 IV = 4242;
+
+        // ONE price for every arm, so the arms are comparable: the denominator is
+        // the attacker's own work in the lane's Q62 units, i.e. it owns the lane.
+        settle::WorkPrice price;
+        price.reward     = REWARD;
+        price.sum_weight = ::v37::U256::from_u128(((::v37::u128)H_TOTAL) << 62);
+        price.valid      = true;
+        sub::u320 h_true{};
+        h_true.w[0] = H_TOTAL;
+        const long long ent_true = settle::entitlement_of_work(price, h_true);
+        check(ent_true > 0, "ENROL: the true-work entitlement is expressible");
+
+        const unsigned NS = 5;
+        const unsigned NN[NS] = {1, 4, 20, 200, 2000};
+        double sel_r[NS] = {0, 0, 0, 0, 0}, enr_r[NS] = {0, 0, 0, 0, 0},
+               off_r[NS] = {0, 0, 0, 0, 0};
+        bool downside_taken = false;
+        std::printf("   n        per-identity   SELECTIVE (opt in iff Hhat > S*T)   "
+                    "ENROLLED (the shipped seam)   NOT ENROLLED\n");
+        for (unsigned si = 0; si < NS; ++si) {
+            const unsigned n   = NN[si];
+            const std::uint64_t per = H_TOTAL / n;
+            ::c2pool::v37n::EnrollmentBook book;
+            std::vector<settle::HarvestedReceipt> hv;
+            hv.reserve(n);
+            long long sel = 0, cov_sum = 0;
+            std::size_t would_opt_out = 0;
+            std::map<bytes32, long long> cov_of;
+            for (unsigned k = 0; k < n; ++k) {
+                const MinerId id = MinerId(900001 + k);
+                sub::ReceiptCollector rc(K_CANON, hT);
+                Rng r(0xE47011EEull ^ (std::uint64_t(k) * 0x9E3779B97F4A7C15ull) ^
+                      (std::uint64_t(n) * 0xBF58476D1CE4E5B9ull));
+                for (std::uint64_t h = 0; h < per; ++h) rc.observe(r.hash());
+                const sub::u320 est = rc.has_K()
+                    ? sub::estimate_combined(rc.shares(), K_CANON, rc.h_K())
+                    : sub::u320{};
+                const sub::u320 cov = sub::share_covered_work(rc.shares(),
+                                                              rc.target_hash());
+                const long long e_est = settle::entitlement_of_work(price, est);
+                const long long e_cov = settle::entitlement_of_work(price, cov);
+                // the SELECTIVE rule, computed straight off the arithmetic — it
+                // has no code path to be driven through, which is the point
+                sel     += (e_est > e_cov) ? e_est : e_cov;
+                if (e_est <= e_cov) ++would_opt_out;
+                cov_sum += e_cov;
+                cov_of[key_of(id)] = e_cov;
+                // EX ANTE: committed at interval 0, effective at 1, and the
+                // harvest is interval 4242 — the commitment cannot see the draw.
+                book.commit(key_of(id), 0, 1);
+                hv.push_back(settle::HarvestedReceipt{key_of(id), IV, rc});
+            }
+            // the SHIPPED seam, all enrolled
+            settle::DropsCompose ctx_on;
+            ctx_on.price = price;
+            ctx_on.enrollment = &book;
+            const auto d_on = settle::subthreshold_credit(p, hv, ctx_on);
+            long long enr = cov_sum;
+            for (const auto& [k, v] : d_on) {
+                enr += v;
+                if (v < 0 && cov_of.count(k)) downside_taken = true;
+            }
+            // the SHIPPED seam, NOBODY enrolled
+            settle::DropsCompose ctx_off;
+            ctx_off.price = price;            // no book at all
+            const auto d_off = settle::subthreshold_credit(p, hv, ctx_off);
+            check(d_off.empty(),
+                  "★ a NON-ENROLLED identity is credited NOTHING: DROPS does not "
+                  "apply to it, so it keeps its ordinary S*T entitlement whole");
+            long long off = cov_sum;
+            for (const auto& [k, v] : d_off) { (void)k; off += v; }
+
+            sel_r[si] = (double)sel / (double)ent_true;
+            enr_r[si] = (double)enr / (double)ent_true;
+            off_r[si] = (double)off / (double)ent_true;
+            std::printf("   %-8u %-14llu %-35.4f %-29.4f %.4f   (%zu/%u would have "
+                        "opted OUT)\n",
+                        n, (unsigned long long)per, sel_r[si], enr_r[si], off_r[si],
+                        would_opt_out, n);
+        }
+        check(downside_taken,
+              "★ the enrolled arm really does carry NEGATIVE rows: the identities a "
+              "selective attacker would have opted out of are composed anyway");
+        // the attack was real...
+        check(sel_r[NS - 1] > sel_r[0] + 0.15,
+              "the SELECTIVE curve RISES with the identity count — splitting buys a "
+              "real gain, so this is not a straw man");
+        check(sel_r[NS - 1] > 1.15,
+              "and at a 2000-way split it recovers well over 1.15x the work performed");
+        // ...and enrolment flattens it
+        double lo = enr_r[0], hi = enr_r[0];
+        for (unsigned si = 0; si < NS; ++si) {
+            if (enr_r[si] < lo) lo = enr_r[si];
+            if (enr_r[si] > hi) hi = enr_r[si];
+            check(enr_r[si] > 0.80 && enr_r[si] < 1.15,
+                  "★ ENROLLED: the shipped curve sits on the unconditional value at "
+                  "EVERY split — no gain from splitting");
+            check(enr_r[si] < sel_r[si] + 1e-9,
+                  "★ and it is never above the selective curve: the choice the "
+                  "attack needs is not expressible");
+        }
+        std::printf("   enrolled curve span over n = 1..2000: %.4f .. %.4f "
+                    "(selective span %.4f .. %.4f)\n", lo, hi, sel_r[0], sel_r[NS - 1]);
+        check(hi - lo < 0.15,
+              "★ FLAT IN n: the enrolled curve's whole span across a 2000x split is "
+              "smaller than the gain the selective rule buys — the sybil surface the "
+              "signed delta opened is CLOSED");
+        check(sel_r[NS - 1] - enr_r[NS - 1] > 0.15,
+              "★ and at the worst split the two rules are far apart, so the KAT goes "
+              "red the moment a per-interval choice is reintroduced");
+
+        // ── the EX-ANTE rule itself, at the only entry point ──────────────
+        {
+            ::c2pool::v37n::EnrollmentBook b;
+            const bytes32 who = key_of(123456);
+            check(!b.commit(who, /*now=*/100, /*effective_from=*/100),
+                  "★ 'enrol me starting now' is REFUSED: that is the choice made "
+                  "after the draw");
+            check(!b.commit(who, /*now=*/100, /*effective_from=*/99),
+                  "★ and back-dating is refused too");
+            check(b.refused() == 2 && b.size() == 0, "both refusals are counted");
+            check(b.commit(who, /*now=*/100, /*effective_from=*/101),
+                  "a commitment for a STRICTLY LATER interval is accepted");
+            check(!b.enrolled(who, 100) && b.enrolled(who, 101) && b.enrolled(who, 4242),
+                  "and it binds from that interval onwards, never before");
+            check(!b.enrolled(key_of(7654321), 4242),
+                  "an identity that never committed is never enrolled");
+            const ::v37::bytes32 d1 = b.book_digest();
+            ::c2pool::v37n::EnrollmentBook b2;
+            b2.commit(who, 100, 101);
+            check(b2.book_digest() == d1,
+                  "the book digest is a pure function of the commitments (two nodes "
+                  "told the same things agree)");
+            b2.commit(key_of(999), 100, 101);
+            check(!(b2.book_digest() == d1),
+                  "and it moves when the set does — the witness is not vacuous");
+            check(!(::c2pool::v37n::empty_enrollment_digest() == d1),
+                  "the empty-book digest is distinct from a populated one");
+            check(b.find(who) != nullptr &&
+                  b.find(who)->commit ==
+                      ::c2pool::v37n::enrollment_commit(who, 101),
+                  "the record carries the domain-separated commitment it was made under");
+        }
+    }
+
+    // ── DROPS-PRODUCER: declare_shares is DRIVEN, not just declared ──────
+    // The verify pass's finding: declare_shares(payee, interval, S, lz) is
+    // mandatory and fail-closed, and had NO producer in the tree — IShareTracker
+    // exposes has_prev_own/record_share and nothing counts per (payee, bin). So
+    // on a live node every harvested interval was withheld and DROPS, though
+    // reachable, could never credit. ShareCountBook is that producer, fed from
+    // the W2 emit stream (the carrier and every ACCEPTED receipt), which is where
+    // W2 already accounts a share.
+    std::printf("\n-- DROPS-PRODUCER: a real per-(payee, interval) share counter --\n");
+    {
+        using ::c2pool::v37n::ShareCountBook;
+        using ::c2pool::v37n::DropHarvester;
+        using ::c2pool::v37n::EmittedPush;
+        const unsigned CLZ = 8;
+        const u64 BIN = 300;
+        const bytes32 A = key_of(5101), B = key_of(5102), C = key_of(5103);
+
+        ShareCountBook book;
+        check(book.count(A, BIN) == 0 && !book.armed(),
+              "an unarmed book knows nothing and says so");
+        // an UNARMED book drops pushes rather than pretending to have seen them
+        EmittedPush e{}; e.identity = A; e.origin_bin = BIN;
+        book.on_push(e);
+        check(book.unarmed_dropped() == 1 && book.count(A, BIN) == 0,
+              "★ an unarmed book counts NOTHING: 'not attached yet' is not 'zero'");
+
+        book.arm(BIN);
+        for (int i = 0; i < 5; ++i) book.on_push(e);        // A: 5 shares in BIN
+        EmittedPush e2{}; e2.identity = B; e2.origin_bin = BIN;
+        for (int i = 0; i < 2; ++i) book.on_push(e2);       // B: 2 shares in BIN
+        EmittedPush e3{}; e3.identity = A; e3.origin_bin = BIN - 1;
+        book.on_push(e3);                                   // BEFORE the arm point
+        check(book.count(A, BIN) == 5 && book.count(B, BIN) == 2,
+              "the producer counts one share per EmittedPush, keyed (payee, origin_bin)");
+        check(book.pre_arm_dropped() == 1 && book.count(A, BIN - 1) == 0,
+              "★ and it refuses to speak for an interval older than its arm point");
+        check(!book.covers(BIN - 1) && book.covers(BIN),
+              "covers() is the fail-closed frontier");
+
+        // the tee: the engine sink still sees every push, in order, unchanged
+        {
+            ShareCountBook t;
+            t.arm(0);
+            std::vector<std::uint64_t> seen;
+            auto sink = t.tee([&](const EmittedPush& p) { seen.push_back(p.pos); });
+            EmittedPush x{}; x.identity = C;
+            for (std::uint64_t i = 0; i < 4; ++i) { x.pos = i; x.origin_bin = 7; sink(x); }
+            check(seen.size() == 4 && seen[0] == 0 && seen[3] == 3,
+                  "tee() forwards every push to the engine sink, in order");
+            check(t.count(C, 7) == 4, "and counts them on the way past");
+        }
+
+        // ── the whole producer -> harvester -> credit chain ───────────────
+        DropHarvester h(K_CANON);
+        ::c2pool::v37n::HarvestedDrop d{};
+        d.interval = BIN; d.consensus_lz = CLZ;
+        for (int who = 0; who < 2; ++who) {
+            d.payee = who ? B : A;
+            for (int i = 0; i < 8; ++i) {
+                const int seed = i + 100 * who;
+                d.hash = ::v37::sha256d(reinterpret_cast<const std::uint8_t*>(&seed),
+                                        sizeof seed);
+                h.observe(d);
+            }
+        }
+        check(h.open_keys().size() == 2, "the harvester holds both payees' intervals");
+        ::c2pool::v37n::EnrollmentBook enr;
+        enr.commit(A, 0, 1);
+        enr.commit(C, 0, 1);                 // C: enrolled, shares but NO raindrops
+        EmittedPush e4{}; e4.identity = C; e4.origin_bin = BIN;
+        for (int i = 0; i < 3; ++i) book.on_push(e4);
+        const std::uint64_t cA = book.count(A, BIN), cB = book.count(B, BIN),
+                            cC = book.count(C, BIN);
+        const std::size_t declared =
+            book.declare_into(h, BIN + 1, [](u64) { return CLZ; }, &enr);
+        check(declared == 3,
+              "★ declare_into declares BOTH harvested intervals AND synthesises the "
+              "enrolled payee that had shares but no raindrops");
+        check(h.shares_declared(A, BIN) && h.shares_declared(B, BIN) &&
+              h.shares_declared(C, BIN),
+              "every one of them is now DECLARED, so none is withheld");
+        auto rows = h.take_buried(BIN + 1);
+        check(rows.size() == 3 && h.undeclared_withheld() == 0,
+              "and all three are released with an explicit S");
+        std::size_t sA = 0;
+        for (const auto& r : rows) if (r.payee == A) sA = (std::size_t)r.collector.shares();
+        check(sA == 5, "the released interval carries the S the PRODUCER counted");
+        std::printf("   producer: A=%llu shares, B=%llu, C=%llu (C had no raindrops "
+                    "and is enrolled, so its interval is composed anyway)\n",
+                    (unsigned long long)cA, (unsigned long long)cB,
+                    (unsigned long long)cC);
+        check(cA == 5 && cB == 2 && cC == 3, "the counts are the ones fed in");
+        check(book.rows() == 0,
+              "and declare_into FORGETS the settled rows, so the index does not grow "
+              "without bound");
+
+        // FAIL-CLOSED, end to end: an interval the book does not cover is
+        // withheld by the harvester, exactly as before the producer existed.
+        {
+            DropHarvester h2(K_CANON);
+            ShareCountBook late;
+            late.arm(BIN + 10);                     // attached far too late
+            ::c2pool::v37n::HarvestedDrop d2{};
+            d2.payee = A; d2.interval = BIN; d2.consensus_lz = CLZ;
+            for (int i = 0; i < 8; ++i) {
+                d2.hash = ::v37::sha256d(reinterpret_cast<const std::uint8_t*>(&i),
+                                         sizeof i);
+                h2.observe(d2);
+            }
+            late.declare_into(h2, BIN + 1, [](u64) { return CLZ; }, &enr);
+            check(!h2.shares_declared(A, BIN), "an uncovered interval is NOT declared");
+            check(h2.take_buried(BIN + 1).empty() && h2.undeclared_withheld() == 1,
+                  "★ and the harvester withholds it — 'unknown' still credits nothing");
+        }
     }
 
     std::printf("\n== v37_drops_activation_kat: %ld checks, %ld failures -> %s\n",

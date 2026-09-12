@@ -351,6 +351,12 @@ int main(int argc, char** argv) {
         std::uint64_t      reward = 0;
         bool               payout_emitted = false;
         ::v37::bytes32     owed_at_win{};
+        // ★ DROPS-R3: the composed DROPS credit map this win credited itself
+        // with, ready to ride the v0x03 trailer. Taken from the SAME EbCut the
+        // node composed, so what we broadcast and what we credited are the same
+        // bytes and cannot drift.
+        std::map<::v37::bytes32, long long> drops_delta;
+        ::v37::bytes32     enrollment_digest{};
     } last_own_win;
     // Every bid THIS node registered as its OWN win. The double-drive guard:
     // the winner must never re-drive its own block through the peer path (the
@@ -537,6 +543,12 @@ int main(int argc, char** argv) {
                     w.reward             = o.cut->reward;
                     w.payout_emitted     = o.cut->payout_emitted;
                     w.owed_digest_at_win = o.cut->owed_digest_at_win;
+                    // ★ DROPS-R3: fold the WINNER'S map, never our own harvest.
+                    if (o.drops) {
+                        w.has_drops = true;
+                        for (const auto& [k, v] : o.drops->credit) w.drops_credit[k] = v;
+                        w.enrollment_digest = o.drops->enrollment_digest;
+                    }
 
                     bool mine = false;                     // the DOUBLE-DRIVE guard
                     { std::lock_guard<std::mutex> lk(own_wins_mtx); mine = own_wins.count(w.bid) != 0; }
@@ -704,6 +716,8 @@ int main(int argc, char** argv) {
                     last_own_win.reward         = cut.reward;
                     last_own_win.payout_emitted = node.last_won().emitted;
                     last_own_win.owed_at_win    = node.ledger().owed_digest();
+                    last_own_win.drops_delta    = cut.drops_delta;          // ★ R3
+                    last_own_win.enrollment_digest = cut.enrollment_digest;  // ★ R-SYBIL
                 } else {
                     // Our OWN fold refused (no published lane view / geometry not
                     // ratified), so we credited NOTHING. Carrying a descriptor
@@ -770,6 +784,18 @@ int main(int argc, char** argv) {
                             d.payout_emitted     = last_own_win.payout_emitted;
                             d.owed_digest_at_win = last_own_win.owed_at_win;
                             req->cut = d;
+                            // ★ DROPS-R3: the composed credit map rides with the
+                            // cut. STRICTLY ASCENDING by payee (the std::map is
+                            // already in that order) — the decoder rejects any
+                            // other order, so the encoding of a map is unique.
+                            if (!last_own_win.drops_delta.empty()) {
+                                DropsCredit dc;
+                                dc.credit.reserve(last_own_win.drops_delta.size());
+                                for (const auto& [k, v] : last_own_win.drops_delta)
+                                    dc.credit.emplace_back(k, v);
+                                dc.enrollment_digest = last_own_win.enrollment_digest;
+                                req->drops = std::move(dc);
+                            }
                         } else {
                             LOG_ERROR << "[v37-dash] S-1c: block id " << bidh
                                       << " is not 64 hex chars — no cut descriptor carried";

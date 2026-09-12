@@ -89,6 +89,20 @@ struct FinalizeCandidate {
     // driver stays identical to master for every existing caller.
     ::v37::LaneParams              params{};
     std::vector<HarvestedReceipt>  harvested{};
+    // ── ★ DROPS-R1 + R-SYBIL: the composition context ────────────────────
+    // `drops.price` is the (reward, SUM weight) pair AT THIS CUT that turns
+    // hashes into the same coin unit E_b is in; `drops.enrollment` is the
+    // ex-ante book that decides whose interval may be composed at all. Both
+    // default inert (invalid price credits 0, null book enrols nobody).
+    DropsCompose                   drops{};
+    // ── ★ DROPS-R3: fold the WINNER'S composed map instead of a harvest ──
+    // Set on BOTH live paths. On a peer win it is the map read off the v0x03
+    // wire trailer (the peer never saw the winner's raindrops and cannot
+    // recompute them). On an OWN win the node composes its delta ONCE, credits
+    // that map and broadcasts that same map, so what the winner told the fleet
+    // and what the winner credited itself are the same bytes by construction.
+    bool                           has_carried_drops = false;
+    OwedLedger::Amounts            carried_drops{};
 };
 
 // ===========================================================================
@@ -143,7 +157,10 @@ public:
         // or empty harvest => it returns c.credit itself, so this line is the
         // old line on every existing path.
         m_ledger.on_block_found(
-            c.bid, compose_credit_replace(c.params, c.credit, c.harvested),
+            c.bid,
+            c.has_carried_drops
+                ? compose_credit_from_delta(c.credit, c.carried_drops)
+                : compose_credit_replace(c.params, c.credit, c.harvested, c.drops),
             c.payout);
         const std::uint64_t fin_h = c.found_height + m_dconf;
         m_by_finalize_height[fin_h].push_back(c.bid);      // sorted map → in-order

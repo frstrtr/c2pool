@@ -71,6 +71,12 @@ struct FoundBlock {
     // to `credit` byte for byte and this driver is identical to master.
     ::v37::LaneParams                     params{};
     std::vector<settle::HarvestedReceipt> harvested{};
+    // ★ DROPS-R1 + R-SYBIL: how work becomes coin at this cut, and who is
+    // enrolled. ★ DROPS-R3: the composed delta map to fold as-is — the winner's
+    // own on an own win, the one read off the v0x03 wire on a peer win.
+    settle::DropsCompose                  drops{};
+    bool                                  has_carried_drops = false;
+    Amounts                               carried_drops{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -114,7 +120,10 @@ public:
     void on_block_found(const FoundBlock& b) {
         if (m_found.count(b.bid)) return;
         const Amounts credit =
-            settle::compose_credit_replace(b.params, b.credit, b.harvested);
+            b.has_carried_drops
+                ? settle::compose_credit_from_delta(b.credit, b.carried_drops)
+                : settle::compose_credit_replace(b.params, b.credit, b.harvested,
+                                                 b.drops);
         SettleEvent ev;
         ev.kind = SettleEvKind::Found;
         ev.bid = b.bid;

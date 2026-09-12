@@ -15,16 +15,17 @@
   },
   "owed_digest_gate_off_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
   "owed_digest_master_style_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
-  "owed_digest_gate_on_hex": "2a7dc41dcc231ce8a81f93801b495d65d6841e8067f58e48894985c9ebd8e692",
+  "owed_digest_gate_on_hex": "2a84c4f58629ad4c39ca258ff9516cf08300b0c2b46cbd7d4332020deeb5f395",
   "lane_digest_hex": "37756e9fa59be4aa30acfa6a18b0e1c131c9601cfceec802f19133a1ecde1a50",
   "c_credit_dec": "374999",
-  "d_credit_dec": "624999",
-  "note_s_coefficient": "D/C == 624999/374999 == 5/3 == (2+K-1)/(0+K-1) with K=4: the (S+K-1) coefficient of the combined estimator, a direct witness that S enters the ACTIVE rule.",
+  "d_credit_dec": "-3074457345617633603",
+  "note_s_coefficient": "DROPS-R2 (REPLACE, never ADD) re-minted this. The (S+K-1) coefficient is a property of the ESTIMATE: estimate_combined(2)/estimate_combined(0) == 624999/374999 == 5/3 == (2+K-1)/(0+K-1) with K=4. The CREDIT is estimate - W_shares, so C (S=0, nothing to replace) is credited 374999 while D (S=2) is credited 624999 - 3074457345618258602 == -3074457345617633603. The enormous W_shares term is an artefact of this fixture's h_T = 3 (an absurd share target chosen so the broken clamp folds to a legible number), which makes one share \"worth\" 2^256/3 hashes; it is not a property of the rule. The OwedLedger is signed by construction (w4 4.4 forward repair, unclamped), and a one-sided max(0, delta) would be exactly the sybil surface the clamp had.",
   "invariants": {
     "shipped_default_is_v371": true,
     "gate_off_equals_master_and_prior_v370_golden": true,
     "gate_on_differs_from_off": true,
     "active_rule_is_combined_not_clamp": true,
+    "composition_is_replace_not_add": true,
     "lane_digest_version_invariant": true
   }
 }

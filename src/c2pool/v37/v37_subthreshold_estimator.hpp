@@ -283,10 +283,15 @@ inline u320 share_covered_work(std::uint64_t S, const u256& h_T) {
 // BOTH sides (estimate and share work) and a caller re-deriving the rule from
 // the specification must fold them the same way to land on the same digest.
 //
-// ★ DROPS-R1 (DENOMINATION) IS STILL OPEN. The unit here is the raw HASH COUNT,
-// and E_b is a split of the block REWARD in coin units. The REPLACE ruling fixes
-// the DOUBLE COUNT (DROPS-R2); it does not invent a hashes->entitlement
-// conversion, which is a separate operator ruling. Nothing below guesses one.
+// ★ DROPS-R1 (DENOMINATION) IS NOW RULED AND CLOSED — BUT NOT HERE. The unit of
+// this fold is the raw HASH COUNT, which is the right unit for the estimator's
+// own arithmetic and the WRONG unit for an E_b row (a split of the block reward
+// in coin). The ruling is "reuse the normal share -> E_b conversion", and that
+// conversion lives where the reward and the weight sum live: w4_settlement.hpp
+// WorkPrice / entitlement_of_work(). The shipped seam denominates BOTH sides
+// (estimate and share work) through it and never calls fold63() at all; this
+// fold survives for the module's own KAT and for the PRE-RULING reference
+// apply_credit() below. Do not reach for it from a credit path.
 inline long long fold63(const u320& e) {
     long long a = 0;
     for (int i = 62; i >= 0; --i) a = (a << 1) | (e.bit(i) ? 1 : 0);
@@ -388,7 +393,73 @@ struct DedupKey {
     }
 };
 
-// apply_credit: the ONLY entry point that turns receipts into OwedLedger credit.
+// ── the shared arithmetic core of the credit rule ─────────────────────────
+// The two quantities a harvested interval contributes, both as HASH COUNTS and
+// both out of the SAME ReceiptCollector in the SAME call:
+//   est      Hhat — the estimate of the interval's work. ZERO when J < K.
+//   covered  W_shares = S*T — the work the payee's in-interval shares already
+//            earned, which the E_b row has already paid for.
+// The composition is always est - covered, in whatever unit the caller
+// denominates the two sides (w4_settlement.hpp WorkPrice: the shipped seam puts
+// BOTH through the ordinary share -> E_b conversion, so the credit is COIN).
+//
+// ★★ R-SYBIL — EX-ANTE ENROLMENT, AND WHY IT IS A PARAMETER OF THIS FUNCTION.
+// `enrolled` is the payee's ex-ante, digest-bound commitment for THIS interval,
+// made strictly before it (v37_drops_enrollment.hpp). It is the ONLY
+// participation switch in the codebase:
+//   enrolled == false  ->  NOT credited at all. The payee keeps its ordinary
+//                          S*T path untouched; DROPS simply does not apply to
+//                          it. This is not "credited zero" — nothing is
+//                          replaced and nothing is removed.
+//   enrolled == true   ->  ALWAYS credited: including when J < K (est == 0, so
+//                          the interval's whole share work comes back out), and
+//                          including when est < covered (a NEGATIVE delta). The
+//                          enrolled payee takes the downside.
+// Because the choice is made before the draw and cannot be revisited, its
+// expected value is the unconditional one — E[Hhat_comb - W_shares] == 0 by the
+// exact unbiasedness of Hhat — flat in the number of identities. The SELECTIVE
+// rule ("opt in for this interval iff Hhat > S*T"), which measures 1.02x at one
+// identity and 1.96x at two thousand, is not a policy this function declines to
+// implement: there is no per-interval switch anywhere for it to be written
+// through.
+struct IntervalWork {
+    bool credited = false;   // this interval contributes a delta at all
+    u320 est{};              // Hhat      (0 when J < K)
+    u320 covered{};          // W_shares = S*T
+};
+
+inline IntervalWork interval_work(const SubthresholdParams& p, const DedupKey& key,
+                                  const ReceiptCollector& rc,
+                                  std::map<DedupKey, bool>& already_seen,
+                                  bool enrolled) {
+    IntervalWork w;
+    if (!p.enabled) return w;                     // ★ gate OFF: nothing enters
+    if (!k_guard_ok(p.K)) return w;               // K >= 3 guard
+    if (already_seen.count(key)) return w;        // straddle dedup, per (payee,seq)
+    if (!enrolled) return w;                      // ★ R-SYBIL: DROPS never applies
+    if (p.mode == CreditMode::EstimateOnly) {
+        // EstimateOnly refuses a COVERED interval outright: there is nothing to
+        // replace and no second estimate to credit beside the shares. The canon
+        // lane gate is mode = 1 (Combined); this arm survives for mode-0
+        // fixtures and for the module KAT.
+        if (rc.shares() > 0) return w;
+        already_seen[key] = true;
+        w.credited = true;
+        if (rc.has_K()) w.est = estimate_hashes(p.K, rc.h_K());
+        return w;
+    }
+    already_seen[key] = true;                     // Combined (sybil-neutral)
+    w.credited = true;
+    if (rc.has_K()) w.est = estimate_combined(rc.shares(), p.K, rc.h_K());
+    w.covered = share_covered_work(rc.shares(), rc.target_hash());
+    return w;
+}
+
+// apply_credit: the PRE-RULING raw-hash-count entry point. It is the shape the
+// merged module shipped and the shape its own KAT pins; it is NOT the shipped
+// credit path any more (R1 denomination and R-SYBIL enrolment both live at the
+// w4 seam, which calls interval_work() directly). Retained, unchanged in
+// behaviour, as the reference the estimator's arithmetic is measured against.
 //   Gate OFF  => returns {} (empty). No key touched, no digest byte changes.
 //   Gate ON   => returns the per-payee REPLACE DELTA, deduped per (payee, seq).
 //                Never emits the broken clamp, never the broken add.
@@ -421,18 +492,17 @@ inline std::map<std::array<std::uint8_t, 32>, long long> apply_credit(
     //   EstimateOnly : refuse a covered interval outright (S > 0 keeps only E_b).
     //   Combined     : credit Hhat_comb, the TOTAL interval work, and REPLACE the
     //                  share-derived part W_shares = S*T that E_b already paid.
-    u320 est{}, covered{};
-    if (p.mode == CreditMode::EstimateOnly) {
-        if (rc.shares() > 0) return delta;        // shares account for it
-        est = estimate_hashes(p.K, rc.h_K());
-        // covered stays 0: by the branch above S == 0, so there is nothing to
-        // replace. EstimateOnly and Combined agree exactly on an uncovered
-        // interval, which is the participation case DROPS exists for.
-    } else {                                      // Combined (sybil-neutral)
-        est     = estimate_combined(rc.shares(), p.K, rc.h_K());
-        covered = share_covered_work(rc.shares(), rc.target_hash());
-    }
-    already_seen[key] = true;
+    // ★ ONE ARITHMETIC CORE. This PRE-RULING reference and the shipped, RULED
+    // seam both go through interval_work(), so the two can never drift on what
+    // "the estimate" and "the share work" are. What differs is only what the
+    // caller does with them: this one folds raw HASH COUNTS and asks no
+    // enrolment question, while the shipped seam denominates both sides through
+    // the ordinary share -> E_b conversion (R1) and refuses a NON-ENROLLED payee
+    // outright (R-SYBIL).
+    const IntervalWork w =
+        interval_work(p, key, rc, already_seen, /*enrolled=*/true);
+    if (!w.credited) return delta;
+    const u320 est = w.est, covered = w.covered;
     // OwedLedger credit is i64 hashes-of-work. Fold BOTH sides the same
     // deterministic way and return the difference: the REPLACE delta. Folding
     // each side separately (rather than the difference) is what keeps the

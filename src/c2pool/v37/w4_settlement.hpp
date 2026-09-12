@@ -58,7 +58,8 @@
 #include <vector>
 
 #include <c2pool/v37/v37_engine.hpp>          // V37Engine, SettlementView
-#include <c2pool/v37/v37_subthreshold_estimator.hpp>  // RDWR-OQ2 DROPS estimator (merged, gated)
+#include <c2pool/v37/v37_subthreshold_estimator.hpp>
+#include <c2pool/v37/v37_drops_enrollment.hpp>   // ★ R-SYBIL: the ex-ante enrolment book  // RDWR-OQ2 DROPS estimator (merged, gated)
 #include <sharechain/v37/v37_lane_executor.hpp>  // LaneSnapshot, IdentityView
 #include <sharechain/v37/v37_descriptor.hpp>     // ScriptRef, ScriptKind
 #include <sharechain/v37/v37_fixed.hpp>          // U256, u64
@@ -567,6 +568,15 @@ inline subthreshold::SubthresholdParams to_subthreshold_params(
     return sp;
 }
 
+// ★ PRE-RULING REFERENCE, NEVER THE SHIPPED CREDIT PATH. This is the raw
+// HASH-COUNT delta with no enrolment question asked — the shape the seam had
+// before DROPS-R1 (denomination) and R-SYBIL (ex-ante enrolment) were ruled. It
+// stays because several merged KATs measure the estimator's sybil-neutrality
+// through it and their goldens are minted on it. The SHIPPED path is
+// subthreshold_credit(params, harvested, ctx) further down: it denominates both
+// sides through the ordinary share -> E_b conversion and credits ONLY enrolled
+// identities. Do not call this one from a node.
+//
 // The gated estimator REPLACE DELTA for a set of harvested intervals. GATE OFF
 // => EMPTY map (nothing merged; on_block_found stays byte-identical to master).
 // GATE ON => the per-(payee,interval)-deduped, sybil-neutral REPLACE delta
@@ -578,7 +588,7 @@ inline subthreshold::SubthresholdParams to_subthreshold_params(
 // what performs the REPLACEMENT. Do not clamp, do not drop negatives, and do not
 // use it on its own as "the estimator's credit" — compose_credit_replace() below
 // is the supported way to turn it into a credit map.
-inline std::map<bytes32, long long> subthreshold_credit(
+inline std::map<bytes32, long long> subthreshold_credit_raw_PRE_RULING(
     const ::v37::LaneParams& params,
     const std::vector<HarvestedReceipt>& harvested) {
     std::map<bytes32, long long> credit;
@@ -618,15 +628,266 @@ inline std::map<bytes32, long long> subthreshold_credit(
 // GATE OFF (default) => the delta map is empty and this returns `base_credit`
 // itself, byte for byte. USE THIS, not a hand-rolled merge, at every fold site:
 // a second merge written somewhere else is how the double count came back.
-inline std::map<bytes32, long long> compose_credit_replace(
+inline std::map<bytes32, long long> compose_credit_replace_raw_PRE_RULING(
     const ::v37::LaneParams& params,
     const std::map<bytes32, long long>& base_credit,
     const std::vector<HarvestedReceipt>& harvested) {
-    const auto delta = subthreshold_credit(params, harvested);
+    const auto delta = subthreshold_credit_raw_PRE_RULING(params, harvested);
     if (delta.empty()) return base_credit;          // ★ gate OFF / nothing eligible
     std::map<bytes32, long long> out = base_credit;
     for (const auto& [k, v] : delta) out[k] += v;   // E_b - W_shares + Hhat
     return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ★★ DROPS-R1 (DENOMINATION) — RULED: REUSE THE NORMAL share -> E_b CONVERSION.
+//
+// THE DEFECT. The pre-ruling delta above is a HASH COUNT (fold63 of Hhat). E_b
+// is a split of the block REWARD in coin units. Merging the two 1:1 dropped a
+// raw hash count into a satoshi row: on the verify pass's fixture a 503,350,526
+// sat entitlement met a 3,299,038,233,853 "credit" at share difficulty 2^40 — a
+// factor of ~6553 in the wrong denomination, with the SIGN of the error set by
+// the lane's difficulty, so it is not even a consistent bias.
+//
+// THE RULING. Do not invent a constant. The ordinary share path ALREADY turns
+// work into an E_b row, in exactly one expression, split_reward():
+//
+//     E_b(p) = floor( reward * weight(p) / SUM weight )
+//
+// and on a live node weight(p) IS a hash count — the lane's payout weight is
+// built from work(T) = 2^lz (w2_receipt.hpp work_of_lz), the same quantity the
+// estimator produces. So the hashes -> satoshi conversion at a cut is the pair
+// (reward, SUM weight) the fold has already read, and nothing else. WorkPrice is
+// that pair, taken at the SAME cut through the SAME project() call the fold
+// uses; entitlement_of_work() is split_reward's own floor(reward * w / SUM) with
+// a wider numerator. Estimated work and real work of equal magnitude therefore
+// map to the SAME number of satoshi. That is the whole content of R1, and it is
+// a reuse, not a new spec constant.
+//
+// ★ WHAT IS NOT CLAIMED (stated here rather than quietly corrected). The lane's
+// weights are DECAYED payout weights and a harvested interval is BURIED, so a
+// buried interval's undecayed estimate is priced against a partly-decayed
+// denominator. That residual is a second-order property of the ruled
+// conversion, not a second conversion; it is called out in the PR body.
+// ═══════════════════════════════════════════════════════════════════════════
+struct WorkPrice {
+    u64  reward = 0;       // the block reward this cut splits
+    U256 sum_weight{};     // SUM weight over the projected payees AT THE CUT
+    bool valid = false;    // false => no conversion expressible (no weight at P)
+};
+
+// Build the price from the SAME view the fold reads, through the SAME project().
+template <class View>
+inline WorkPrice work_price_at(u64 reward, const View& v) {
+    WorkPrice wp;
+    wp.reward = reward;
+    for (const auto& p : project(v)) wp.sum_weight += p.weight;
+    wp.valid = !wp.sum_weight.is_zero();
+    return wp;
+}
+
+// ★ THE Q-SCALE — THE OTHER HALF OF THE REUSE, AND THE EASY ONE TO MISS.
+// A push does not put a payee's raw work into the lane; it puts
+//     w_scaled = w_raw x InvD[age]          (v37_lane.hpp SCORING, Q62)
+// so the lane's payout weights — and therefore SUM weight in a WorkPrice — are
+// in Q62 WORK UNITS, not in hashes. Reusing "the normal share -> E_b
+// conversion" therefore means putting the estimate through the SAME scaling
+// before pricing it. Skipping it is the quiet half of the denomination defect:
+// it does not blow the credit up, it FLOORS EVERY COMPOSED CREDIT TO ZERO
+// (2^62 is ~4.6e18, so reward * hashes / SUM weight underflows to 0) — a "fix"
+// that would have looked perfectly harmless in a digest.
+//
+// ★ WHAT IS REUSED, AND WHAT IS NOT. The Q62 UNIT is reused exactly. The AGE
+// factor InvD[age] is NOT: the estimate is priced as work AT THE CUT
+// (InvD == 1.0), while the buried interval's real shares carry their own
+// lambda^k. The residual is therefore bounded by the decay over the burial
+// depth, it is in the direction of crediting an estimate slightly RICHER than a
+// same-aged real share, and it is stated in the PR body rather than quietly
+// corrected here — folding a decay lookup into this seam would be a second
+// conversion, which is exactly what the ruling said not to invent.
+inline constexpr unsigned kWeightQBits = ::v37::FRAC_BITS;   // 62
+
+namespace wide {
+
+// The numerator of the R1 conversion as a 576-bit little-endian value (9 x u64):
+//     (work << kWeightQBits) * reward
+// work is a u320 (5 limbs) and reward a u64, so the product is at most 384 bits
+// and the Q-shift takes it to at most 446; 9 limbs leaves head-room for the
+// shift to be applied AFTER the multiply without a second carry pass.
+inline std::array<u64, 9> work_numerator(const subthreshold::u320& work, u64 reward) {
+    std::array<u64, 9> r{0, 0, 0, 0, 0, 0, 0, 0, 0};
+    ::v37::u128 carry = 0;
+    for (int i = 0; i < 5; ++i) {
+        ::v37::u128 p = ::v37::u128(work.w[static_cast<std::size_t>(i)]) * reward + carry;
+        r[static_cast<std::size_t>(i)] = static_cast<u64>(p);
+        carry = p >> 64;
+    }
+    r[5] = static_cast<u64>(carry);
+    constexpr unsigned sft = kWeightQBits;
+    static_assert(sft > 0 && sft < 64, "the Q-shift must be a single-limb shift");
+    for (int i = 8; i > 0; --i)
+        r[static_cast<std::size_t>(i)] =
+            (r[static_cast<std::size_t>(i)] << sft) |
+            (r[static_cast<std::size_t>(i - 1)] >> (64 - sft));
+    r[0] = r[0] << sft;
+    return r;
+}
+inline void shl1_9(std::array<u64, 9>& x) {
+    u64 carry = 0;
+    for (int i = 0; i < 9; ++i) {
+        u64 nc = x[static_cast<std::size_t>(i)] >> 63;
+        x[static_cast<std::size_t>(i)] = (x[static_cast<std::size_t>(i)] << 1) | carry;
+        carry = nc;
+    }
+}
+inline bool ge_u256_9(const std::array<u64, 9>& rem, const U256& den) {
+    for (int i = 8; i >= 4; --i) if (rem[static_cast<std::size_t>(i)]) return true;
+    for (int i = 3; i >= 0; --i)
+        if (rem[static_cast<std::size_t>(i)] != den.v[static_cast<std::size_t>(i)])
+            return rem[static_cast<std::size_t>(i)] > den.v[static_cast<std::size_t>(i)];
+    return true;   // equal
+}
+inline void sub_u256_9(std::array<u64, 9>& rem, const U256& den) {
+    ::v37::u128 borrow = 0;
+    for (int i = 0; i < 9; ++i) {
+        u64 d = (i < 4) ? den.v[static_cast<std::size_t>(i)] : 0;
+        ::v37::u128 diff = ::v37::u128(rem[static_cast<std::size_t>(i)]) - d - borrow;
+        rem[static_cast<std::size_t>(i)] = static_cast<u64>(diff);
+        borrow = (diff >> 64) ? 1 : 0;
+    }
+}
+// floor(num / den), clamped into [0, INT64_MAX]. Bit for bit the same long
+// division wide::divmod() already runs for split_reward, just wider.
+// `saturated` reports the clamp: it does not fire on a live cut (a payee's work
+// is bounded by the weight sum, so the quotient is bounded by the reward), and
+// the KAT asserts it stays false across the whole mint.
+inline long long divfloor_clamped_576(const std::array<u64, 9>& num, const U256& den,
+                                      bool* saturated) {
+    if (saturated) *saturated = false;
+    if (den.is_zero()) return 0;
+    constexpr unsigned __int128 kI64Max = (unsigned __int128)9223372036854775807ull;
+    std::array<u64, 9> rem{0, 0, 0, 0, 0, 0, 0, 0, 0};
+    unsigned __int128 q = 0;
+    bool sat = false;
+    for (int bit = 575; bit >= 0; --bit) {
+        shl1_9(rem);
+        rem[0] |= (num[static_cast<std::size_t>(bit / 64)] >> (bit % 64)) & 1ull;
+        q <<= 1;
+        if (ge_u256_9(rem, den)) { sub_u256_9(rem, den); q |= 1; }
+        if (q > kI64Max) { sat = true; q = kI64Max; }
+    }
+    if (saturated) *saturated = sat;
+    return static_cast<long long>(q);
+}
+
+}  // namespace wide
+
+// The R1 conversion: a hash count at this cut -> the entitlement (coin) the
+// ordinary share path would have produced for the SAME magnitude of work:
+//     floor( reward * (work << Q) / SUM weight )
+// which is split_reward()'s own floor(reward * weight / SUM weight) with the
+// estimate put into lane-weight units first. Nothing else, and no new constant.
+inline long long entitlement_of_work(const WorkPrice& price,
+                                     const subthreshold::u320& work,
+                                     bool* saturated = nullptr) {
+    if (saturated) *saturated = false;
+    if (!price.valid || price.reward == 0) return 0;
+    return wide::divfloor_clamped_576(wide::work_numerator(work, price.reward),
+                                      price.sum_weight, saturated);
+}
+
+// The inverse view, for a KAT or an operator that wants to read a lane weight
+// back as hashes: weight >> Q. Diagnostic only; nothing on the credit path
+// calls it (the credit path never leaves weight units).
+inline u64 hashes_of_weight_lo(const U256& weight) {
+    constexpr unsigned sft = kWeightQBits;
+    // (weight >> 62), low limb only: 62 is a single-limb shift, so limb 0 takes
+    // the top (64 - 62) bits of limb 0 and the bottom 62 bits of limb 1.
+    return (weight.v[0] >> sft) | (weight.v[1] << (64 - sft));
+}
+
+// ★★ THE COMPOSITION CONTEXT. Both operator rulings that a composition cannot be
+// correct without, in one value that every call site must supply:
+//   price       R1  — how work becomes coin AT THIS CUT.
+//   enrollment  R-SYBIL — who may be composed at all, decided ex ante.
+// There is deliberately NO default constructor shortcut on the seam: a caller
+// that has neither gets an invalid price (credits 0) and a null book (nobody
+// enrolled, so nothing is credited), which is the fail-closed shape. What it
+// never gets is the pre-ruling raw-hash-count, everybody-in behaviour.
+struct DropsCompose {
+    WorkPrice price{};
+    const ::c2pool::v37n::EnrollmentBook* enrollment = nullptr;   // null => nobody
+    bool enrolled(const bytes32& payee, u64 interval) const {
+        return enrollment != nullptr && enrollment->enrolled(payee, interval);
+    }
+    ::v37::bytes32 enrollment_digest() const {
+        return enrollment ? enrollment->book_digest()
+                          : ::c2pool::v37n::empty_enrollment_digest();
+    }
+};
+
+// ★ THE SHIPPED DELTA. Gate OFF => EMPTY. Gate ON => for every harvested
+// (payee, interval) whose payee is ENROLLED at that interval, the DENOMINATED
+// replace delta
+//     entitlement_of_work(price, Hhat_comb) - entitlement_of_work(price, W_shares)
+// deduped per (payee, interval). A non-enrolled payee contributes NOTHING — not
+// a zero row, nothing — and keeps its ordinary S*T entitlement intact.
+//
+// Both sides are denominated SEPARATELY and then subtracted, the same shape the
+// pre-ruling fold used, so a from-spec re-derivation lands on the same integer.
+inline std::map<bytes32, long long> subthreshold_credit(
+    const ::v37::LaneParams& params,
+    const std::vector<HarvestedReceipt>& harvested,
+    const DropsCompose& ctx,
+    bool* saturated = nullptr) {
+    std::map<bytes32, long long> credit;
+    if (saturated) *saturated = false;
+    const subthreshold::SubthresholdParams sp = to_subthreshold_params(params);
+    if (!sp.enabled) return credit;                 // ★ GATE OFF: nothing enters
+    std::map<subthreshold::DedupKey, bool> already_seen;
+    for (const auto& hr : harvested) {
+        subthreshold::DedupKey key;
+        key.payee = hr.payee;
+        key.seq   = hr.interval;
+        const subthreshold::IntervalWork w =
+            subthreshold::interval_work(sp, key, hr.collector, already_seen,
+                                        ctx.enrolled(hr.payee, hr.interval));
+        if (!w.credited) continue;
+        bool s1 = false, s2 = false;
+        const long long amt = entitlement_of_work(ctx.price, w.est, &s1)
+                            - entitlement_of_work(ctx.price, w.covered, &s2);
+        if (saturated && (s1 || s2)) *saturated = true;
+        if (amt != 0) credit[hr.payee] += amt;      // may be NEGATIVE: not clamped
+    }
+    return credit;
+}
+
+// Add an already-composed DROPS delta map to an E_b map. This is the ONE place
+// a delta becomes a credit, and it is shared by both settlement paths:
+//   own win    the delta this node composed from its OWN harvest;
+//   peer win   the delta the WINNER composed, read off the v0x03 wire trailer
+//              (operator ruling R3 — the peer folds the RECEIVED map, because a
+//              raindrop is a node-local observation the peer never saw and so
+//              cannot recompute).
+inline std::map<bytes32, long long> compose_credit_from_delta(
+    const std::map<bytes32, long long>& base_credit,
+    const std::map<bytes32, long long>& delta) {
+    if (delta.empty()) return base_credit;          // byte for byte the base map
+    std::map<bytes32, long long> out = base_credit;
+    for (const auto& [k, v] : delta) out[k] += v;   // E_b - W_shares + Hhat
+    return out;
+}
+
+// ★★ THE SHIPPED COMPOSITION — REPLACE, NEVER ADD, DENOMINATED, ENROLLED-ONLY.
+// GATE OFF (default) => the delta map is empty and this returns `base_credit`
+// itself, byte for byte. USE THIS, not a hand-rolled merge, at every fold site.
+inline std::map<bytes32, long long> compose_credit_replace(
+    const ::v37::LaneParams& params,
+    const std::map<bytes32, long long>& base_credit,
+    const std::vector<HarvestedReceipt>& harvested,
+    const DropsCompose& ctx) {
+    return compose_credit_from_delta(base_credit,
+                                     subthreshold_credit(params, harvested, ctx));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -679,12 +940,36 @@ public:
     // estimate; a SHARE-COVERED worker is credited Hhat_comb INSTEAD of its S*T,
     // never on top of it. This is the single call site of the estimator in the
     // fold, and compose_credit_replace is the single composition.
-    void on_block_found_with_estimator(
+    void on_block_found_estimator_raw_PRE_RULING(
         const std::string& bid, const Amounts& base_credit, const Amounts& payout,
         const ::v37::LaneParams& params,
         const std::vector<HarvestedReceipt>& harvested) {
         on_block_found(bid,
-                       compose_credit_replace(params, base_credit, harvested),
+                       compose_credit_replace_raw_PRE_RULING(params, base_credit,
+                                                             harvested),
+                       payout);
+    }
+
+    // ★ THE SHIPPED SEAM. Same shape, with the two rulings the pre-ruling form
+    // is missing: `ctx.price` denominates the estimate into the SAME units as
+    // E_b (R1) and `ctx.enrollment` decides, ex ante, whose interval may be
+    // composed at all (R-SYBIL). GATE OFF => forwards base_credit unchanged.
+    void on_block_found_with_drops(
+        const std::string& bid, const Amounts& base_credit, const Amounts& payout,
+        const ::v37::LaneParams& params,
+        const std::vector<HarvestedReceipt>& harvested,
+        const DropsCompose& ctx) {
+        on_block_found(bid,
+                       compose_credit_replace(params, base_credit, harvested, ctx),
+                       payout);
+    }
+
+    // ★ THE CARRIED-DELTA SEAM (R3). The winner's composed DROPS map, folded as
+    // it was received. No harvest, no estimator call: the map IS the estimate.
+    void on_block_found_with_carried_drops(
+        const std::string& bid, const Amounts& base_credit, const Amounts& payout,
+        const Amounts& carried_delta) {
+        on_block_found(bid, compose_credit_from_delta(base_credit, carried_delta),
                        payout);
     }
 

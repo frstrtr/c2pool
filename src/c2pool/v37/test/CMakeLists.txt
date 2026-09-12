@@ -618,8 +618,23 @@ if (BUILD_TESTING)
     #       ridge coupling the flip carries), T2 the W2 sub-target harvest
     #       (measurement only: no push, no lane work, bindings still enforced),
     #       T3 the estimate-into-fold point;
-    #   (f) DROPS-R1 (the estimate is a HASH COUNT merged into a COIN-denominated
-    #       E_b), which remains OPEN and is witnessed, not fixed.
+    #   (f) DROPS-R1 (DENOMINATION), now RULED AND CLOSED: the estimate is put
+    #       through the ORDINARY share -> E_b conversion — the Q62 weight unit a
+    #       push applies plus split_reward's own floor(reward * w / SUM w) — so a
+    #       COMPOSED row of work W is credited the SAME satoshi as a REAL SHARE
+    #       row of work W at the same cut (asserted to the satoshi), and the
+    #       ~3299x pre-ruling blowup is measured and gone;
+    #   (g) R-SYBIL (EX-ANTE ENROLMENT): the selective "opt in for this interval
+    #       iff Hhat > S*T" rule measured across a 1 / 4 / 20 / 200 / 2000-way
+    #       split beside the SHIPPED seam on the same draws — the selective curve
+    #       reaches 1.32x while the shipped curve stays flat at ~0.92..1.02x,
+    #       never above it, with NEGATIVE rows composed for exactly the intervals
+    #       a selective attacker would have opted out of; plus the ex-ante rule at
+    #       its only entry point (enrol-from-now and back-dating both REFUSED);
+    #   (h) the SHARE-COUNT PRODUCER: ShareCountBook fed from the W2 emit stream,
+    #       its arm-point fail-closed frontier, and the enrolled-payee row it
+    #       synthesises so a withheld raindrop cannot dodge a bad interval;
+    #   (i) DROPS-R3: the carried-delta fold reproduces the winner's own ledger.
     # Stdlib-only, ~2 s. SAME HOLLOW-GREEN GUARD: ALSO on BOTH build.yml lists.
     add_executable(v37_drops_activation_kat v37_drops_activation_kat.cpp)
     target_compile_features(v37_drops_activation_kat PRIVATE cxx_std_20)
