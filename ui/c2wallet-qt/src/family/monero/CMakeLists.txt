@@ -77,6 +77,8 @@ add_library(c2wallet_monero STATIC
     addr/MoneroBase58.cpp
     addr/MoneroAddress.cpp
     MoneroKey.cpp
+    scan/MoneroScanOps.cpp
+    scan/MoneroScanner.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../secure/SecureString.cpp
 )
 target_include_directories(c2wallet_monero PUBLIC
@@ -91,3 +93,13 @@ add_executable(c2wallet-monero-seed-test
 target_link_libraries(c2wallet-monero-seed-test PRIVATE c2wallet_monero)
 
 add_test(NAME c2wallet_monero_seed_kat COMMAND c2wallet-monero-seed-test)
+
+# ── Family B (Monero) output-scanning KATs (M2-X) ────────────────────────────
+# Read-only wallet scan: ownership test, amount decrypt, subaddress table, the
+# view-only/full-wallet key-image split. Same Qt-free lib, a second ctest.
+add_executable(c2wallet-monero-scan-test
+    scan/test/monero_scan_test.cpp
+)
+target_link_libraries(c2wallet-monero-scan-test PRIVATE c2wallet_monero)
+
+add_test(NAME c2wallet_monero_scan_kat COMMAND c2wallet-monero-scan-test)
