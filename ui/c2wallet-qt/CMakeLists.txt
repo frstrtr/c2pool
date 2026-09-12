@@ -71,6 +71,14 @@ if(C2WALLET_QT_BUILD_TESTS)
     #   cmake -S ui/c2wallet-qt/src/family/bitcoin/hdkeys -B build-hdkeys -DC2WALLET_QT_BUILD_TESTS=ON
     add_subdirectory(src/family/bitcoin/hdkeys)
 
+    # M2-A: the Qt-free cross-coin address CONVERT + CONSTRUCT core
+    # (family/bitcoin/construct) — the #961-guarded converter and the
+    # script-defined output-type encoders. Reuses the #961 engine
+    # (core/address_utils) and the BCH CashAddr codec; links the hdkeys library
+    # above for the shared btclibs closure. No Qt, no networking; standalone via:
+    #   cmake -S ui/c2wallet-qt/src/family/bitcoin/construct -B build-convert -DC2WALLET_QT_BUILD_TESTS=ON
+    add_subdirectory(src/family/bitcoin/construct)
+
     add_test(
         NAME no_network_link_guard
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_no_network.sh"
