@@ -304,22 +304,27 @@ Each phase is a shippable DRAFT PR delivered by **qt-steward** under the **Fable
 | Phase | Track | Deliverable | Depends on | Money-path gate |
 |---|---|---|---|---|
 | **M0** | shared | New `ui/c2wallet-qt/` tree; Widgets-only CMake; **network-incapable link-guard CI test** (the mechanical proof); MainWindow/sidebar shell reused from c2pool-qt. | — | Low — no keys yet. Gate = the binary provably links no network symbols. |
-| **M1-A** | Bitcoin | `hdkeys`: port BIP39/32/44 + WIF/raw-hex, add BIP49/84/86 + xprv/xpub + SLIP-132 + real BIP39 checksum + BIP38. | M0 | **Money-path (keys in memory)** → full F-O-F + tap. |
-| **M1-X** | Monero | 25-word mnemonic (+CRC, wordlists), dual spend/view import, view-only import, Monero base58, subaddress/integrated derivation. | M0 | **Money-path** → full gate. |
+| **M1-A** | Bitcoin | `hdkeys`: port BIP39/32/44 + WIF/raw-hex, add BIP49/84/86 + xprv/xpub + SLIP-132 + real BIP39 checksum + BIP38 + **Core descriptors**; plus the now-in-scope keystore parsers — **Electrum full-file parser**, **`wallet.dat` (Berkeley DB) parser**, and **generic JSON keystore** (all v1 per the 2026-09-12 lock). | M0 | **Money-path (keys in memory)** → full F-O-F + tap. |
+| **M1-X** | Monero | 25-word mnemonic (+CRC, wordlists), **polyseed (16-word, Argon2)** + **13-word MyMonero** import (alongside the 25-word), dual spend/view import, view-only import, Monero base58, subaddress/integrated derivation. | M0 | **Money-path** → full gate. |
 | **M2-A** | Bitcoin | Wire `address_utils` + per-coin SSOT into a "Convert address" panel; detect-convertible / **WARN-or-refuse (#961)** UX with side-by-side payload display + round-trip proof; add the **NMC SSOT leaf** + BCH transcode helper; construct all output types (encode). | M1-A | Read-only derivation, but the **#961 path is money-relevant** → Fable review required. |
 | **M2-X** | Monero | Output scanning via view key + amount decrypt; view-only "export outputs" artifact; balance/spent state. | M1-X | Read-only → lighter gate. |
 | **M3-A** | Bitcoin | Legacy sighash (parity KAT for block 2518186 folded in), **BIP143** (P2WPKH/P2WSH/P2SH-wrapped), bare-P2MS incl. the CHECKMULTISIG extra-pop; self-verify + oversize per type. | M2-A | **HIGH** money-path. |
 | **M3-X** | Monero | Import outputs → compute key images → export key images; port/build the **CLSAG signer** on the vendored ops; KAT against in-tree verifier. | M2-X | **HIGH** money-path. |
 | **M4-A** | Bitcoin | **BIP341/342** taproot key-path + script-path (schnorrsig/extrakeys, taptweak, control block, tapleaf/branch); multisig scriptWitness assembly. | M3-A | **HIGH** money-path. |
 | **M4-X** | Monero | **Bulletproofs+ prover** port; full RingCT tx construction + serialization; offline self-verify (in-tree BP+/RCT verifier + key-image recompute) before emit — completes Monero's native cold-sign. | M3-X | **HIGH** money-path. |
+| **M4-X-MMS** | Monero | **Monero multisig (MMS)** — now in v1 per the 2026-09-12 lock. The N/M multi-round MMS message flow: key-exchange rounds, per-round MMS message import/export, and partial (cooperative) signing over the RingCT prover. A large, stateful, interactive protocol; sequenced **after** single-sig RingCT (M4-X) is working. | M4-X | **HIGH** money-path (multi-party signing). |
 | **M5** | both | Air-gap transfer + validation seam: PSBT-like container + QR (A), `unsigned_txset`/`signed_txset`/outputs/key-image containers (B); online c2pool `validate_inject` dry-run wiring; surface `InjectSubmitResult.cause` names in the UI; Monero relay contract. | M3/M4 both | **HIGH** (broadcast/inject arming). Dry-run validate is tap-free. |
 | **M6** | both | Bitcoin-Core-like UI polish: wallet overview, coin-control, tx-builder screens, convert panel, sign/export flow — under one chain-family abstraction. | M5 | Low — no new crypto. |
 
 Dependencies note: M5's Family-A online leg depends on the node-side BIP143/341/342 verifier work (§5.4 caveat); M5's Family-B online leg depends on the v37 XMR node exposing scan/decoy/fee/relay APIs.
 
+Scope note: per the operator directive of 2026-09-12, v1 scope is deliberately **maximal** — the full keystore-format set (A), all Monero seed schemes, view-only/offline-full split, and Monero multisig all land in v1 rather than being deferred. This is a larger attack/format surface by design and correspondingly more KATs; the extra breadth is accepted in exchange for a single comprehensive v1 rather than a staged rollout.
+
 ---
 
 ## 7. Risks & Open Decisions
+
+**Decisions locked 2026-09-12:** the operator locked decisions 1, 4, 5, 6, 7, and 8 (see below); decisions 2, 3, 9, 10, 11, and 12 remain open.
 
 ### Risks
 
@@ -332,14 +337,14 @@ Dependencies note: M5's Family-A online leg depends on the node-side BIP143/341/
 
 ### Open decisions for the operator
 
-1. **Keystore formats (A):** confirm v1 = BIP38 + Core descriptors, deferring Electrum full-file (offer xprv-paste) and `wallet.dat` BDB parse and generic JSON keystore.
+1. **Keystore formats (A):** **LOCKED 2026-09-12 = ALL IN v1** — Core descriptors + BIP38 + Electrum full-file parse + `wallet.dat` (Berkeley DB) parse + generic JSON keystore. The operator overrode the recommendation to defer Electrum full-file and `wallet.dat`; all five land in v1.
 2. **Separate binary vs c2pool-qt mode:** recommendation is a **separate network-incapable binary** (c2pool-qt hard-requires Chromium/QtWebEngine). Confirm.
 3. **Packaging:** a **new release.yml matrix job** for `c2wallet-qt` producing a signed `.dmg` (macOS universal, same lipo pattern), NSIS/`windeployqt` `setup.exe`, and Linux AppImage/`linuxdeployqt`, all into the existing draft-release + SHA256SUMS shape (CI never publishes). Reproducible + offline-verifiable distribution. The current release pipeline builds coin nodes only — no Qt job exists to inherit. Confirm the packaging targets.
-4. **Monero seed formats:** 25-word Electrum mnemonic is a must-have. **polyseed yes/no? 13-word MyMonero yes/no?**
-5. **Monero view-only:** confirm the online view-only / offline full split ships in v1 (strongly recommended — it *is* the air-gap flow).
-6. **Monero multisig (MMS):** recommendation **defer to v2**. Confirm.
-7. **RingCT prover strategy:** **Path A (port CLSAG + BP+ prover onto the vendored `crypto-ops.c`/`xmr_rct_ops`, self-contained, auditable, KAT'd against the in-tree verifier)** vs **Path B (link monero-project `wallet2`/`libwallet` wholesale — fastest but pulls boost + the whole monero crypto tree and is harder to prove network-incapable)**. Recommendation: **A**.
-8. **Which Monero library to link:** tied to (7) — Path A links only libsodium (already required by the vendored ed25519 ops) plus ported source files; Path B links libwallet.
+4. **Monero seed formats:** **LOCKED 2026-09-12 = ALL IN v1** — 25-word Electrum mnemonic (mandatory) + polyseed (16-word) + 13-word MyMonero.
+5. **Monero view-only:** **LOCKED 2026-09-12 = IN v1** — the online view-only / offline full split ships in v1 (it *is* the air-gap flow).
+6. **Monero multisig (MMS):** **LOCKED 2026-09-12 = IN v1** — the operator overrode the "defer to v2" recommendation; MMS ships in v1.
+7. **RingCT prover strategy:** **LOCKED 2026-09-12 = Path A** — port the CLSAG signer + Bulletproofs+ prover onto the vendored `crypto-ops.c` / `xmr_rct_ops`; links only libsodium plus ported BSD-3 source; KAT-gated against the in-tree verifier; provably network-incapable. (Path B — linking monero-project `wallet2`/`libwallet` wholesale — was rejected: it pulls boost + the whole monero crypto tree and is harder to prove network-incapable.)
+8. **Which Monero library to link:** **LOCKED 2026-09-12 = Path A libs** (follows decision 7) — links only libsodium (already required by the vendored ed25519 ops) plus the ported source files; no libwallet.
 9. **Monero artifact format:** adopt monero's `unsigned_txset` / `signed_txset` / outputs / key-image layouts verbatim (interop) vs a c2pool-native container. Recommendation: **verbatim**.
 10. **Monero `.keys` interop:** import monero-wallet `.keys` yes/no; export in monero format vs our own air-gap format only.
 11. **Integrated / long payment IDs:** read+warn only, never generate long (deprecated). Confirm.
