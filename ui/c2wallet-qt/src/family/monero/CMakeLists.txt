@@ -89,6 +89,7 @@ add_library(c2wallet_monero STATIC
     prover/MoneroKeyImage.cpp             # M3-X: key-image export {I, ring-sig}
     prover/MoneroBulletproofsPlus.cpp     # M4-X: Bulletproofs+ range-proof PROVER (ported)
     prover/MoneroRingctBuilder.cpp        # M4-X: full RingCT tx assembly + offline self-verify
+    artifact/MoneroArtifact.cpp        # M5-X: cold-sign artifact marshaling (verbatim monero layouts)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../secure/SecureString.cpp
 )
 target_include_directories(c2wallet_monero PUBLIC
@@ -137,3 +138,16 @@ add_executable(c2wallet-monero-ringct-test
 target_link_libraries(c2wallet-monero-ringct-test PRIVATE c2wallet_monero)
 
 add_test(NAME c2wallet_monero_ringct_kat COMMAND c2wallet-monero-ringct-test)
+
+# -- Family B (Monero) M5-X KATs: cold-sign artifact marshaling ---------------
+# The four public artifacts that cross the air gap (design 5.4; Decision 9 =
+# verbatim monero layouts): outputs export, key-image export, unsigned_txset,
+# signed_txset. Round-trip each; an unsigned_txset carrying a frozen ring drives
+# the M4-X assembler to a SELF-VERIFYING signed_txset; the online-facing exports
+# carry no spend secret (byte scan); a flipped byte is detected at parse.
+add_executable(c2wallet-monero-artifact-test
+    artifact/test/monero_artifact_test.cpp
+)
+target_link_libraries(c2wallet-monero-artifact-test PRIVATE c2wallet_monero)
+
+add_test(NAME c2wallet_monero_artifact_kat COMMAND c2wallet-monero-artifact-test)
