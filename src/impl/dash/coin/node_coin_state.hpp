@@ -879,6 +879,23 @@ public:
         };
     }
 
+    /// #1203 — "ask, don't just wait". When a height fails closed with
+    /// cause=qc-plan-underivable the offending quorum's identity is KNOWN
+    /// (QcPlanGap::slot_known, the SlotUnsatisfied stage). dashd relays
+    /// quorum commitments by inventory ONLY, so a node that missed the inv
+    /// has no path to that commitment and the refusal tail runs to ~10 min
+    /// (issue #1203). This hook is invoked at the refusal site WITH that gap
+    /// so a targeted re-request (a getqrinfo for the named quorum) can be
+    /// issued to shorten the tail. It NEVER mints a null commitment and NEVER
+    /// changes what is served — the refusal is still reward-safe and still
+    /// fails closed to the dashd arm. Fired only when the gap names a single
+    /// quorum; the SlotSetUnderivable / Unreported stages have nothing to ask
+    /// for. UNSET (default) => byte-identical to today: the refusal simply
+    /// waits for the next inventory relay.
+    void set_qc_pull_fn(std::function<void(const QcPlanGap&)> fn) {
+        m_qc_pull_fn = std::move(fn);
+    }
+
     /// PoSe no-op proof for one REAL (non-null) type-6 commitment — the
     /// enforcement of the #1083 landmine comment at the inclusion site
     /// (embedded_gbt.hpp). dashd's verifier PoSe-punishes every member a
@@ -1151,9 +1168,13 @@ public:
         if (m_qc_plan_fn) {
             QcPlanGap qc_gap;
             qc_plan = m_qc_plan_fn(next_h, &qc_gap);
-            if (!qc_plan)   // underivable — fail closed, NAMING what was missing
+            if (!qc_plan) {  // underivable — fail closed, NAMING what was missing
+                // #1203: ASK for the named quorum rather than only waiting for
+                // the next inventory relay (unset hook => unchanged wait).
+                if (m_qc_pull_fn && qc_gap.slot_known) m_qc_pull_fn(qc_gap);
                 return reject("emit-qc-plan-underivable", qc_gap.describe(),
                               "derivable-qc-plan@h=" + std::to_string(next_h));
+            }
             // Collect the type-6 payloads actually in the template.
             std::vector<std::vector<unsigned char>> got;
             for (const auto& tx : w.m_txs)
@@ -1470,6 +1491,9 @@ public:
         if (m_qc_plan_fn && m_populated) {
             qc_plan = m_qc_plan_fn(m_prev_height + 1, &qc_gap);
             qc_ok = qc_plan.has_value();
+            // #1203: ASK for the named quorum on the underivable refusal
+            // instead of only waiting for the next inventory relay.
+            if (!qc_ok && m_qc_pull_fn && qc_gap.slot_known) m_qc_pull_fn(qc_gap);
         }
         // Resolve the superblock disposition ONCE (fail-closed unless the
         // daemonless provider is trigger-confident) and thread the schedule.
@@ -2049,6 +2073,12 @@ private:
     // E1: serve DKG windows daemonlessly. The QcPlanGap out-param is how a
     // refusal learns WHICH quorum it lacked (see set_qc_plan_fn).
     std::function<std::optional<QcBlockPlan>(uint32_t, QcPlanGap*)> m_qc_plan_fn;
+    // #1203: "ask, don't just wait". Invoked at a qc-plan-underivable refusal
+    // with the named-quorum gap so a targeted re-request (getqrinfo for the
+    // quorum the refusal named) can shorten the ~10-min inventory-only tail.
+    // Fired only when the gap names a single quorum (slot_known); UNSET
+    // (default) => the refusal simply waits for the next relay, byte-identical.
+    std::function<void(const QcPlanGap&)> m_qc_pull_fn;
     // PoSe no-op proof for a REAL commitment (emit-qc-real-pose-unfolded gate);
     // unset => capability absent => every non-null commitment refused.
     std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
