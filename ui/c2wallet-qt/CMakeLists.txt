@@ -87,6 +87,16 @@ if(C2WALLET_QT_BUILD_TESTS)
     #   cmake -S ui/c2wallet-qt/src/family/bitcoin/signer -B build-signer -DC2WALLET_QT_BUILD_TESTS=ON
     add_subdirectory(src/family/bitcoin/signer)
 
+    # M5-A: the Qt-free Family-A AIR-GAP TRANSFER ARTIFACTS
+    # (family/bitcoin/artifact) — the PSBT-like unsigned container
+    # (online->offline), the c2pool-loader signed container (offline->online,
+    # one raw hex per line), the multi-frame QR codec, and the validate-seam
+    # contract. It MARSHALS bytes (does not sign); reuses only the vendored
+    # btclibs SHA-256 for the sha256/sha256d digests. No Qt, no networking;
+    # standalone via:
+    #   cmake -S ui/c2wallet-qt/src/family/bitcoin/artifact -B build-artifact -DC2WALLET_QT_BUILD_TESTS=ON
+    add_subdirectory(src/family/bitcoin/artifact)
+
     add_test(
         NAME no_network_link_guard
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_no_network.sh"
