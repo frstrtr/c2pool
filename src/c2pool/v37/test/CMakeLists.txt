@@ -505,4 +505,27 @@ if (BUILD_TESTING)
     target_include_directories(v37_w4_owed_incremental_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w4_owed_incremental_test Threads::Threads)
     add_test(NAME v37_w4_owed_incremental_test COMMAND v37_w4_owed_incremental_test)
+
+    # Track A2 / W4-W6 — the OWED-EVENT MMR: an append-only authenticated record
+    # log (src/c2pool/v37/record_log.hpp, instanced by owed_event_log.hpp) built
+    # on the SHIPPED ::v37::Lane MMR statics, maintained inside OwedLedger, made
+    # durable by w6, and committed into the w5 StateCommitment tree only behind a
+    # gate that is OFF by default. The KAT pins, in one binary: the mirrored leaf
+    # rule against a hand-built digest and against w5's own mirror; the
+    # primitive's inclusion + prefix proofs (verified by ::v37::Lane::mmr_verify)
+    # and its fail-closed codec; the record-log goldens over a fixed schedule and
+    # the leaf_count == ledger_seq invariant; convergence by construction (two
+    # independent ledgers, same events, identical root) with a non-vacuous
+    # negative control; a journal + recovery round-trip including a corrupted and
+    # an absent head; and the gate itself — gate OFF reproduces goldens minted on
+    # PRISTINE MASTER byte-for-byte, gate ON produces the pinned new root. It
+    # passes in BOTH build modes (with and without -DV37_OWED_EVENT_MMR_COMMIT=1).
+    # Stdlib + Threads (w4 pulls in v37_engine). SAME HOLLOW-GREEN GUARD as the
+    # sibling suites: ALSO listed on BOTH build.yml --target lists so CI compiles
+    # + runs it, not a NOT_BUILT CTest sentinel.
+    add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)
+    target_compile_features(v37_owed_event_mmr_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_owed_event_mmr_kat Threads::Threads)
+    add_test(NAME v37_owed_event_mmr_kat COMMAND v37_owed_event_mmr_kat)
 endif()
