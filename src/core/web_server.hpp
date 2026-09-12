@@ -612,6 +612,21 @@ public:
     bool has_config_apply_fn() const { return static_cast<bool>(m_config_apply_fn); }
     nlohmann::json rest_config_apply(const std::string& body);  // POST /api/config/apply
 
+    // Slice B (#157): POST /api/tx-inject/submit -- hand a raw consensus tx to
+    // the armed M1 inject gate (NodeCoinState::submit_inject). Wrapped in
+    // thread_safe_wrap so the submit runs on the node io_context (the same
+    // strand the node runs on), never on the WEB thread -- submit_inject /
+    // m_inject_pool are IO-thread-confined (no locks). UNWIRED by default: no
+    // main installs it, so the POST route stays 503 {"armed":false}. When
+    // wired, submit_inject itself refuses ("inject-disabled") while the
+    // --embedded-tx-inject arm is OFF, so a disarmed node never injects. It
+    // NEVER touches coinbase/subsidy/PPLNS/payee -- an inject is an ordinary
+    // block-body tx (a 0-fee inject adds 0 to fees).
+    using tx_inject_submit_fn_t = std::function<nlohmann::json(const std::string& body)>;
+    void set_tx_inject_submit_fn(tx_inject_submit_fn_t fn) { m_tx_inject_submit_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_tx_inject_submit_fn() const { return static_cast<bool>(m_tx_inject_submit_fn); }
+    nlohmann::json rest_tx_inject_submit(const std::string& body);  // POST /api/tx-inject/submit
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -1359,6 +1374,7 @@ private:
     config_json_fn_t m_config_fn;         // GET /api/config — resolved launch config (optional)
     config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
     config_apply_fn_t m_config_apply_fn;  // POST /api/config/apply — Slice A gated apply (optional; unwired => 503)
+    tx_inject_submit_fn_t m_tx_inject_submit_fn;  // POST /api/tx-inject/submit — Slice B raw-tx submit (optional; unwired => 503)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;

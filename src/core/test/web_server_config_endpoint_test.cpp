@@ -359,3 +359,83 @@ TEST(ConfigEndpointHttp, CoinGenericDgb) {
     EXPECT_FALSE(j["keys"].contains("embedded.tx_serve_own_set"))
         << "DGB config must not carry DASH-only embedded keys";
 }
+
+// ── Slice B (#157): tx-injection ARM is a MONEY-path config write ──────────
+// Observed by a static so the process-global ParamApplier setter never holds a
+// dangling stack reference after the test returns.
+static bool s_tx_inject_setter_saw = false;
+
+// Reclassification present-check: embedded.tx_inject must now report as a
+// money-path key (Mut::MONEY_LIVE) over GET /api/config, so a qt/operator sees
+// that arming it demands the full money gate — not a plain RESTART write.
+TEST(ConfigEndpointHttp, SliceBTxInjectIsMoneyClassified) {
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    net::io_context ioc;
+    auto ws = make_wired_server(ioc);
+
+    int status = 0;
+    auto body = do_request(ws->bound_port(), http::verb::get, "/api/config", status);
+    EXPECT_EQ(status, 200) << body;
+    auto j = nlohmann::json::parse(body);
+    ASSERT_TRUE(j["keys"].contains("embedded.tx_inject")) << body;
+    EXPECT_TRUE(j["keys"]["embedded.tx_inject"].value("money", false))
+        << "the tx-injection arm must be money-classified (Slice B)";
+    EXPECT_EQ(j["keys"]["embedded.tx_inject"].value("mutability", std::string()),
+              "money_live");
+}
+
+// The arm routed THROUGH apply_config: a change to embedded.tx_inject without a
+// nonce issues a confirm (money gate, nothing applied, no tripwire); presenting
+// the matching nonce applies it AND invokes the registered runtime arm setter.
+// This is exactly the path the QT arm/disarm uses (Slice A gate reused, no
+// second write path).
+TEST(ConfigEndpointHttp, SliceBTxInjectArmGoesThroughMoneyGateAndFiresSetter) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-arm");
+    // Register the runtime arm setter (main_dash registers the real one that
+    // flips node_coin_state + the p2p sink; here we prove apply invokes it).
+    s_tx_inject_setter_saw = false;
+    ce::applier().register_setter(
+        "embedded.tx_inject",
+        [](const std::string& v) {
+            s_tx_inject_setter_saw = (v == "true" || v == "1" || v == "on");
+            return true;
+        });
+
+    net::io_context ioc;
+    auto ws = make_apply_server(ioc);
+
+    // Phase 1: no nonce -> confirm issued, nothing applied, wire not tripped.
+    int status = 0;
+    nlohmann::json issue = {{"control_token", "tok-arm"},
+                            {"changes", {{"embedded.tx_inject", "true"}}}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                           status, issue.dump());
+    EXPECT_EQ(status, 200) << body;
+    auto j = nlohmann::json::parse(body);
+    EXPECT_TRUE(j.value("need_confirm", false)) << body;
+    EXPECT_FALSE(j.value("applied", true));
+    const std::string nonce = j.value("money_nonce", std::string());
+    ASSERT_FALSE(nonce.empty());
+    EXPECT_EQ(ce::tripwire_state().count, 0u);
+    EXPECT_FALSE(s_tx_inject_setter_saw)
+        << "a phase-1 confirmation request must not fire the arm setter";
+
+    // Phase 2: matching nonce -> applied + setter fired.
+    nlohmann::json confirm = {{"control_token", "tok-arm"},
+                              {"money_nonce", nonce},
+                              {"changes", {{"embedded.tx_inject", "true"}}}};
+    body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                      status, confirm.dump());
+    EXPECT_EQ(status, 200) << body;
+    j = nlohmann::json::parse(body);
+    EXPECT_TRUE(j.value("applied", false)) << body;
+    EXPECT_TRUE(s_tx_inject_setter_saw)
+        << "a confirmed money-gated apply must fire the runtime arm setter";
+
+    // The reporting mirror now shows the arm ON.
+    auto cfg = nlohmann::json::parse(
+        do_request(ws->bound_port(), http::verb::get, "/api/config", status));
+    EXPECT_EQ(cfg["keys"]["embedded.tx_inject"].value("value", std::string()), "true");
+}
