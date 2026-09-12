@@ -528,4 +528,29 @@ if (BUILD_TESTING)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_owed_event_mmr_kat Threads::Threads)
     add_test(NAME v37_owed_event_mmr_kat COMMAND v37_owed_event_mmr_kat)
+
+    # RECORD/MESSAGE RETENTION TIERS - the ruled 2+1 model (WINDOW / PINNED /
+    # HASH), entirely VIEW-LAYER and NON-CONSENSUS: src/c2pool/v37/
+    # retention_view.hpp (the tiers, the TTL, the linear-rent pricing and the
+    # two TM-OQ prerequisites) on top of src/c2pool/v37/retention_log.hpp (a
+    # SECOND record_log.hpp instance with its own V37R domain tag, kept well
+    # clear of the owed-event log's leaf_count == ledger_seq bijection). The
+    # KAT pins, in one binary: the leaf encoding and the log root against
+    # absolute goldens; the ratified TTL clamp law, its lattice-rounded expiry
+    # and its fold-riding GC; the PINNED horizon and its reset-not-chain
+    # renewal; HASH permanence with the body dropped; the linear-rent byte
+    # bound WITH a non-vacuous negative control and an end-to-end griefing
+    # simulation; TM-OQ1 (withhold-to-depress reproduced against the literal
+    # EMA rule and closed by the exogenous anchor) and TM-OQ2 (per-epoch
+    # randomness); and the non-consensus wall - owed_digest, the w5
+    # StateCommitment, the owed-event MMR and W2 admission all provably
+    # unmoved, including a throwing observer driven through the real
+    # CarrierIngest. Stdlib + Threads (it drives a live V37Engine). SAME
+    # HOLLOW-GREEN GUARD as the sibling suites: ALSO listed on BOTH build.yml
+    # --target lists so CI compiles + runs it, not a NOT_BUILT CTest sentinel.
+    add_executable(v37_retention_tiers_kat v37_retention_tiers_kat.cpp)
+    target_compile_features(v37_retention_tiers_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_retention_tiers_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_retention_tiers_kat Threads::Threads)
+    add_test(NAME v37_retention_tiers_kat COMMAND v37_retention_tiers_kat)
 endif()
