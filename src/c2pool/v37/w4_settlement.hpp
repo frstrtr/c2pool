@@ -529,10 +529,17 @@ inline std::optional<EbFold> fold_eb(u64 reward, const View& v, bool strict = tr
 // OUT-of-interval, BURIED data and never jumps to tip. Dedup is per (payee,
 // interval): a given (payee, interval) yields at most one estimator credit no
 // matter how many carriers replay the stream (the module's DedupKey/straddle
-// rule). No-double-count: in EstimateOnly the module credits the estimate ONLY
-// where the worker's shares do not already account for its work (S == 0 in the
-// interval); a share-covered worker is credited by its shares (E_b), never the
-// estimate.
+// rule).
+//
+// ★ NO-DOUBLE-COUNT (DROPS-R2, operator-ruled: REPLACE, never ADD). The canon
+// rule is mode = 1, COMBINED, which estimates a worker's TOTAL interval work —
+// the S shares included. It is therefore composed by REPLACEMENT: the estimate
+// stands in for the interval's share-derived contribution W_shares = S*T rather
+// than being added to it. subthreshold_credit() returns the REPLACE DELTA
+// Hhat_comb - W_shares and compose_credit_replace() is the only composition. In
+// mode = 0, EstimateOnly, a covered interval (S > 0) is refused outright and the
+// worker keeps only its E_b. Both modes credit exactly ONE unbiased estimate of
+// the interval per (payee, interval); neither can pay for the same share twice.
 // ─────────────────────────────────────────────────────────────────────────
 
 namespace subthreshold = ::c2pool::v37::subthreshold;
@@ -560,11 +567,17 @@ inline subthreshold::SubthresholdParams to_subthreshold_params(
     return sp;
 }
 
-// The gated estimator credit delta for a set of harvested intervals. GATE OFF =>
-// EMPTY map (nothing merged; on_block_found stays byte-identical to master).
-// GATE ON => the additive, per-(payee,interval)-deduped, sybil-neutral estimator
-// credit. Never emits the broken clamp (the module refuses it structurally).
+// The gated estimator REPLACE DELTA for a set of harvested intervals. GATE OFF
+// => EMPTY map (nothing merged; on_block_found stays byte-identical to master).
+// GATE ON => the per-(payee,interval)-deduped, sybil-neutral REPLACE delta
+//            Hhat_comb - W_shares (see the module preamble). Never the broken
+//            clamp, never the broken add: the module refuses both structurally.
 // Shape == OwedLedger::Amounts (std::map<bytes32, long long>, the E_b shape).
+//
+// ★ VALUES MAY BE NEGATIVE. This is a DELTA, not a credit: adding it to E_b is
+// what performs the REPLACEMENT. Do not clamp, do not drop negatives, and do not
+// use it on its own as "the estimator's credit" — compose_credit_replace() below
+// is the supported way to turn it into a credit map.
 inline std::map<bytes32, long long> subthreshold_credit(
     const ::v37::LaneParams& params,
     const std::vector<HarvestedReceipt>& harvested) {
@@ -581,9 +594,39 @@ inline std::map<bytes32, long long> subthreshold_credit(
         const auto delta =
             subthreshold::apply_credit(sp, key, hr.collector, already_seen);
         for (const auto& [payee, amt] : delta)
-            if (amt != 0) credit[payee] += amt;     // bytes32-keyed, add-only
+            if (amt != 0) credit[payee] += amt;     // bytes32-keyed, signed delta
     }
     return credit;
+}
+
+// ★★ THE COMPOSITION — REPLACE, NEVER ADD (DROPS-R2, operator-ruled shape (b)).
+//
+// The ONE supported way to turn E_b plus a harvest into the credit map the
+// OwedLedger folds. For every harvested (payee, interval) the estimator's
+// TOTAL-interval-work figure REPLACES the interval's share-derived contribution:
+//
+//     credit(p) = E_b(p) + SUM_i [ Hhat_comb(p,i) - W_shares(p,i) ]
+//
+// and NEVER  E_b(p) + SUM_i Hhat_comb(p,i), which pays a share-covered worker
+// for its shares twice and measures 1.92..2.01x the work performed.
+//
+// The "+=" below is not the additive rule: subthreshold_credit() returns the
+// REPLACE DELTA (Hhat - W_shares), and the module cannot emit Hhat without the
+// matching -W_shares, so there is no reachable code path that adds an estimate
+// on top of an intact E_b row. Adding a delta IS the replacement.
+//
+// GATE OFF (default) => the delta map is empty and this returns `base_credit`
+// itself, byte for byte. USE THIS, not a hand-rolled merge, at every fold site:
+// a second merge written somewhere else is how the double count came back.
+inline std::map<bytes32, long long> compose_credit_replace(
+    const ::v37::LaneParams& params,
+    const std::map<bytes32, long long>& base_credit,
+    const std::vector<HarvestedReceipt>& harvested) {
+    const auto delta = subthreshold_credit(params, harvested);
+    if (delta.empty()) return base_credit;          // ★ gate OFF / nothing eligible
+    std::map<bytes32, long long> out = base_credit;
+    for (const auto& [k, v] : delta) out[k] += v;   // E_b - W_shares + Hhat
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -629,22 +672,20 @@ public:
     // tip). GATE OFF (default) => subthreshold_credit() returns {} and this
     // forwards `base_credit` UNCHANGED to on_block_found() — byte-identical to
     // master (the estimator credit is add-only and materialises only when ON).
-    // GATE ON => the corrected sybil-neutral estimate is added to the credit for
-    // the UNCOVERED (S==0) workers whose near-misses reached J>=K, deduped per
-    // (payee, interval); a share-covered worker keeps ONLY its E_b (no double
-    // count). This is the single call site of the estimator in the fold.
+    // GATE ON => for every harvested (payee, interval) with J >= K, the corrected
+    // sybil-neutral Hhat_comb REPLACES that interval's share-derived contribution
+    // to E_b (compose_credit_replace above), deduped per (payee, interval). An
+    // UNCOVERED worker (S == 0) has nothing to replace and is credited the whole
+    // estimate; a SHARE-COVERED worker is credited Hhat_comb INSTEAD of its S*T,
+    // never on top of it. This is the single call site of the estimator in the
+    // fold, and compose_credit_replace is the single composition.
     void on_block_found_with_estimator(
         const std::string& bid, const Amounts& base_credit, const Amounts& payout,
         const ::v37::LaneParams& params,
         const std::vector<HarvestedReceipt>& harvested) {
-        const Amounts est = subthreshold_credit(params, harvested);
-        if (est.empty()) {                       // ★ GATE OFF (or nothing eligible):
-            on_block_found(bid, base_credit, payout);  // identical to master path
-            return;
-        }
-        Amounts credit = base_credit;            // GATE ON: add-only merge
-        for (const auto& [k, v] : est) credit[k] += v;
-        on_block_found(bid, credit, payout);
+        on_block_found(bid,
+                       compose_credit_replace(params, base_credit, harvested),
+                       payout);
     }
 
     // ── FINALIZE(b): b is canonical AND buried >= D_conf on its own chain AND

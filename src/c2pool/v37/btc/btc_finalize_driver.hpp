@@ -65,6 +65,12 @@ struct FoundBlock {
     Amounts       credit;       // per-key entitlement E_b at b's burial-gated prefix
     Amounts       payout;       // the coinbase outputs broadcast in b (K_fair)
     bool          canonical = true;
+    // ── ★ DROPS T3 ───────────────────────────────────────────────────────
+    // The lane's gate and the BURIED sub-threshold harvest this cut settles.
+    // Both default INERT (gate OFF, empty harvest) => on_block_found() composes
+    // to `credit` byte for byte and this driver is identical to master.
+    ::v37::LaneParams                     params{};
+    std::vector<settle::HarvestedReceipt> harvested{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -94,15 +100,28 @@ public:
     // Register a settlement-carrying block we just found. Write-ahead the FOUND
     // event (durable BEFORE the block is announced, W6 §5.2), enter the merged
     // ledger's pending set, and remember it for maturity. Idempotent per bid.
+    //
+    // ★ DROPS T3 — COMPOSE ONCE, HERE, AND PERSIST THE COMPOSED MAP.
+    // The sub-threshold estimate is folded into the credit BEFORE the FOUND
+    // event is written, so the write-ahead log carries the COMPOSED credit. A
+    // restart replays that map verbatim (RecoveryDriver / btc_settle_store /
+    // w6_persistence all replay ev.credit), which means the replay paths need NO
+    // edit and CANNOT re-derive a different ledger: the composition is read
+    // back, never recomputed against a harvest the node no longer holds. Writing
+    // the bare E_b here and composing later is the shape that would desync a
+    // restarted node, and it is deliberately not what happens.
+    // Gate OFF / empty harvest => compose_credit_replace returns b.credit.
     void on_block_found(const FoundBlock& b) {
         if (m_found.count(b.bid)) return;
+        const Amounts credit =
+            settle::compose_credit_replace(b.params, b.credit, b.harvested);
         SettleEvent ev;
         ev.kind = SettleEvKind::Found;
         ev.bid = b.bid;
-        ev.credit = b.credit;
+        ev.credit = credit;
         ev.payout = b.payout;
         write_event(ev);
-        m_ledger.on_block_found(b.bid, b.credit, b.payout);
+        m_ledger.on_block_found(b.bid, credit, b.payout);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
     }

@@ -28,6 +28,7 @@
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
 #include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
+#include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
 
 namespace c2pool::v37n::xmr {
 
@@ -153,9 +154,13 @@ struct XmrNodeConfig {
     // is issued for exactly this chain at start (single-node, single lane).
     ::v37::ChainId  lane_chain = 0;
 
-    // The digest-committed lane geometry. Defaults to the OQ-5 ratified default
-    // (LaneParams{}), the only geometry W4's geometry_is_ratified() admits.
-    ::v37::LaneParams lane_params{};
+    // The digest-committed lane geometry. ★ T1 seam, XMR arm: XMR has NO
+    // ratified LaneKind row (nr_ladder.hpp declares BTC/LTC/DASH/DOGE only), so
+    // it takes node_lane_params_no_kind() — the OQ-5 ratified default
+    // (LaneParams{}) today, and, if the build takes the V37.1 activation, the
+    // consensus version WITHOUT ridge dimensions. An XMR ridge row is a canon
+    // edit (ND-R6) with non-derivable constants: an operator ruling, not a port.
+    ::v37::LaneParams lane_params = ::c2pool::v37n::node_lane_params_no_kind();
 
     // --- settlement finality (F1 driver) ------------------------------------
     // D_conf: blocks a found (coinbase-carrying) Monero block must be buried on

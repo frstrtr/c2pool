@@ -27,6 +27,7 @@
 
 #include <sharechain/v37/v37_lane.hpp>       // ::v37::LaneParams
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
+#include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params()
 
 namespace c2pool::v37n::btc {
 
@@ -127,9 +128,14 @@ struct BtcNodeConfig {
     // lane). Distinct kind-space from the XMR lane — this is the NATIVE canon.
     ::v37::ChainId  lane_chain = 0;
 
-    // The digest-committed lane geometry. Defaults to the OQ-5 ratified default
-    // (LaneParams{}), the only geometry W4's geometry_is_ratified() admits.
-    ::v37::LaneParams lane_params{};
+    // The digest-committed lane geometry. ★ T1 seam: single-sourced through
+    // node_lane_params() (v37_node_lane_activation.hpp), which returns the OQ-5
+    // ratified default (LaneParams{}) — the only geometry W4's
+    // geometry_is_ratified() admits today — unless the build takes the V37.1
+    // consensus activation, a fleet flag day that opens DROPS *and*, at the
+    // default arity, the V37.1 native ridge. Default build: identical to master.
+    ::v37::LaneParams lane_params =
+        ::c2pool::v37n::node_lane_params(::v37::LaneKind::BTC);
 
     // --- settlement finality (F1 driver) ------------------------------------
     // D_conf: blocks a found (coinbase-carrying) BTC-family block must be buried

@@ -72,6 +72,7 @@
 #include <c2pool/v37/btc/btc_settle_store.hpp>
 #include <c2pool/v37/btc/btc_finalize_driver.hpp>
 #include <c2pool/v37/btc/btc_coin_backend.hpp>
+#include <c2pool/v37/v37_drop_harvest.hpp>      // ★ DROPS T3: DropHarvester
 #include <sharechain/v37/v37_roundabout.hpp>    // ::v37::LaneRecord, LaneParams
 
 namespace c2pool::v37n::btc {
@@ -351,6 +352,11 @@ public:
         fb.credit = out.cut.credit;
         for (const auto& o : asm_.outputs)
             fb.payout[o.key] = static_cast<long long>(o.amount);
+        // ★ DROPS T3 (own win). The lane's gate and the BURIED harvest ride with
+        // the FOUND; the driver composes REPLACE-not-ADD and persists the
+        // composed credit. Gate OFF or no harvester attached => both inert.
+        fb.params    = m_cfg.lane_params;
+        fb.harvested = buried_harvest(won_height);
         m_fin->on_block_found(fb);
 
         // Submit the block to the coin network (ARM A embedded P2P + ARM B
@@ -502,6 +508,22 @@ public:
         fb.credit = c.credit;
         for (const auto& o : asm_.outputs)
             fb.payout[o.key] = static_cast<long long>(o.amount);
+        // ★ DROPS T3 (S-1c PEER win). A peer's block settles OUR ledger too, and
+        // the raindrops we measured are OURS — we saw them on our own wire, in
+        // our own W2 admitter, bound to our own carriers. So the same buried
+        // harvest is folded here, at the CARRIED cut, exactly as on an own win.
+        // Folding on own wins only would make a node's owed ledger depend on
+        // which node won the block, which is precisely the divergence S-1c
+        // exists to prevent.
+        //
+        // ★ AND THIS IS A KNOWN DIVERGENCE SURFACE, STATED PLAINLY: two nodes
+        // observe DIFFERENT raindrop sets, so they compose DIFFERENT credit for
+        // the same peer win. It does not desync them today because the winner's
+        // FOUND event carries the credit map on the wire and each node folds
+        // what it received — but if the harvest is ever made consensus-visible,
+        // WHOSE harvest counts is an open ruling (see the PR's DROPS-R3).
+        fb.params    = m_cfg.lane_params;
+        fb.harvested = buried_harvest(w.h_b);
         m_fin->on_block_found(fb);     // write-ahead FOUND + pending + maturity map
 
         out.registered = true;
@@ -538,7 +560,38 @@ public:
     const S1PeerStats& s1c_stats()     const { return m_s1p; }
     const EbCut&       last_peer_cut() const { return m_last_peer_cut; }
 
+    // ── ★ DROPS T3: attach the node-local sub-threshold harvest ──────────────
+    // `h` is the DropHarvester the W2 admitter's DropSink feeds
+    // (v37_drop_harvest.hpp). NOT attached by default: with no harvester every
+    // FOUND carries an empty harvest, compose_credit_replace() returns E_b
+    // unchanged, and the node settles exactly as master does. Attach it only on
+    // a node whose lane_params carry the SubthresholdGate ON — a harvest folded
+    // into a gated-off settlement credits nothing and only costs memory.
+    //
+    // The node does not own the harvester's lifetime; the caller that owns the
+    // admitter owns it, because that is who feeds it.
+    void set_drop_harvester(DropHarvester* h) { m_drops = h; }
+    DropHarvester* drop_harvester() const { return m_drops; }
+    // How many harvest rows the last FOUND folded (diagnostic; 0 when detached).
+    std::size_t last_harvest_rows() const { return m_last_harvest_rows; }
+
 private:
+    // ── ★ DROPS T3: the buried harvest for a win at coin height H_b ──────────
+    // F1: only intervals strictly BELOW the burial frontier may be shown to the
+    // estimator, and take_buried() consumes them so the same interval can never
+    // be folded into two blocks. The frontier is the same D_conf the finalize
+    // driver gates on: an interval is eligible once it is as buried as the block
+    // that would settle it. A node with no harvester attached returns {} and the
+    // whole seam is inert.
+    std::vector<settle::HarvestedReceipt> buried_harvest(std::uint64_t won_height) {
+        if (!m_drops) { m_last_harvest_rows = 0; return {}; }
+        const std::uint64_t frontier =
+            won_height > m_cfg.d_conf ? won_height - m_cfg.d_conf : 0;
+        auto rows = m_drops->take_buried(frontier);
+        m_last_harvest_rows = rows.size();
+        return rows;
+    }
+
     // ── ★ S-1: fold E_b at the lane cut published NOW ────────────────────────
     // The ONE credit-path entry point is settle::fold_eb — it does the ratified-
     // geometry refusal AND the fold in one call (the S8 seam), so a settlement
@@ -671,6 +724,9 @@ private:
     SettleHW                           m_hw;
     std::unique_ptr<BtcFinalizeDriver> m_fin;
     std::unique_ptr<V37Engine>         m_engine;
+    // ★ DROPS T3: non-owning, DEFAULT NULL => the whole seam is inert.
+    DropHarvester*                     m_drops = nullptr;
+    std::size_t                        m_last_harvest_rows = 0;
 
     S1FoldStats m_s1;        // S-1 fold counters (diagnostics)
     EbCut       m_last_cut;  // the cut the last win folded at (diagnostics)

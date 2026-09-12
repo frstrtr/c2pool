@@ -72,10 +72,20 @@
 #include <c2pool/v37/w6_persistence.hpp>
 #endif
 
+#include <c2pool/v37/v37_node_lane_activation.hpp>   // T1: node_lane_params()
+
 using c2pool::v37n::V37Engine;
 
-// ── the ratified OQ-5 default lane geometry (LaneParams{} == the defaults) ──
-static ::v37::LaneParams genesis_params() { return ::v37::LaneParams{}; }
+// ── the node's lane geometry, single-sourced (★ T1 seam) ───────────────────
+// Default build: node_lane_params() returns ::v37::LaneParams{}, the ratified
+// OQ-5 default, so this shell's genesis digest is byte-identical to master. A
+// build that takes the V37.1 consensus activation gets DROPS and (at the default
+// arity) the V37.1 native ridge here — see v37_node_lane_activation.hpp for the
+// coupling and the flag-day warning. This is the BTC-family shell, so it names
+// the BTC LaneKind.
+static ::v37::LaneParams genesis_params() {
+    return ::c2pool::v37n::node_lane_params(::v37::LaneKind::BTC);
+}
 
 static std::string hex32(const ::v37::bytes32& b) {
     static const char* k = "0123456789abcdef";

@@ -54,6 +54,14 @@ struct FoundBlock {
     Amounts       credit;       // per-key entitlement E_b at b's burial-gated prefix
     Amounts       payout;       // the coinbase outputs broadcast in b (K_fair)
     bool          canonical = true;
+    // ── ★ DROPS T3 (XMR arm) ─────────────────────────────────────────────
+    // Same shape as the BTC-family driver: the lane's gate plus the BURIED
+    // sub-threshold harvest this cut settles. Both default INERT. The XMR lane
+    // can only carry the NO-LaneKind gate (no ratified ridge row — see
+    // v37_node_lane_activation.hpp); that is a fact about the RIDGE, not about
+    // DROPS, whose gate is lane-independent.
+    ::v37::LaneParams                     params{};
+    std::vector<settle::HarvestedReceipt> harvested{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -80,15 +88,22 @@ public:
     // Register a settlement-carrying block we just found. Write-ahead the FOUND
     // event (durable BEFORE the block is announced, W6 §5.2), enter the merged
     // ledger's pending set, and remember it for maturity. Idempotent per bid.
+    //
+    // ★ DROPS T3 — COMPOSE ONCE, HERE, AND PERSIST THE COMPOSED MAP (same rule
+    // as the BTC-family driver): the FOUND event carries the COMPOSED credit, so
+    // a restart replays it verbatim and no replay path re-derives the estimate
+    // against a harvest the node no longer holds.
     void on_block_found(const FoundBlock& b) {
         if (m_found.count(b.bid)) return;
+        const Amounts credit =
+            settle::compose_credit_replace(b.params, b.credit, b.harvested);
         SettleEvent ev;
         ev.kind = SettleEvKind::Found;
         ev.bid = b.bid;
-        ev.credit = b.credit;
+        ev.credit = credit;
         ev.payout = b.payout;
         write_event(ev);
-        m_ledger.on_block_found(b.bid, b.credit, b.payout);
+        m_ledger.on_block_found(b.bid, credit, b.payout);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
     }

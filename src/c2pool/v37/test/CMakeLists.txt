@@ -572,4 +572,58 @@ if (BUILD_TESTING)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_owed_event_mmr_kat Threads::Threads)
     add_test(NAME v37_owed_event_mmr_kat COMMAND v37_owed_event_mmr_kat)
+
+    # V37.1 (Shape A) NATIVE-RIDGE ACTIVATION REGRESSION KAT. It landed with the
+    # activation commit but carries NO add_executable at all, and the CI
+    # drift-guard tools/ci/check_test_target_allowlist.py audits TARGETS against
+    # the build.yml allowlist, not SOURCES — so it never saw the file, and the
+    # 87c5249a... ridge golden (the anchor every later consensus golden, the
+    # DROPS mint below included, is built on top of) has been UNENFORCED in CI
+    # since the flip. Registered here. It drives the pinned 9000-push activation
+    # schedule through the REAL Lane and OwedLedger on all four ratified lanes and
+    # pins the gate-ON owed_digest, the gate-OFF control, the empty-ledger anchor,
+    # the per-lane ridge SHAPE, the ND-R10 record-only migration cell, and that
+    # the golden does not ride the one ND-R6 number (nr.coverage_blocks) that is
+    # still OWED. Stdlib-only. SAME HOLLOW-GREEN GUARD as the sibling suites: ALSO
+    # listed on BOTH build.yml --target lists (the Linux x86_64 leg and the
+    # ASan+UBSan leg) so CI compiles + RUNS it instead of registering a NOT_BUILT
+    # CTest sentinel (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class).
+    add_executable(v37_1_ridge_activation_test v37_1_ridge_activation_test.cpp)
+    target_compile_features(v37_1_ridge_activation_test PRIVATE cxx_std_20)
+    target_include_directories(v37_1_ridge_activation_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_1_ridge_activation_test Threads::Threads)
+    add_test(NAME v37_1_ridge_activation_test COMMAND v37_1_ridge_activation_test)
+
+    # RDWR-OQ2 DROPS ACTIVATION — the gate-ON owed_digest MINT over the CORRECTED
+    # replace-not-add composition, its regression KAT, and the conformance pins
+    # for the three consumer seams that make DROPS reachable on a live node.
+    # Drives the byte-identical V37.1 activation schedule through the REAL Lane,
+    # fold_eb and OwedLedger on all four ratified lanes, adding one new fully
+    # specified input: a simulated sub-threshold hash stream handed to the REAL
+    # seam OwedLedger::on_block_found_with_estimator(). Pins:
+    #   (a) the canon already declares the gate ON for every lane under the
+    #       corrected sybil-neutral Hhat_comb;
+    #   (b) the gate-OFF anchors b4db1ded... / 9cfaf97d... / 87c5249a... are
+    #       byte-identical with the harvest PRESENT and the gate off, and stay
+    #       there under the K >= 3 and J >= K refusals (non-vacuous: the SAME
+    #       harvest moves the ON arm);
+    #   (c) the NEW gate-ON golden d85dff58... per lane and its all-lanes fold,
+    #       reproduced THREE ways — the engine seam, an independently shadowed
+    #       ledger state, and a from-spec re-derivation that never calls the
+    #       seam — and asserted NOT to be the superseded additive mint 34e4b38e...;
+    #   (d) NO DOUBLE COUNT: the composed credit is ~1.0x the work performed
+    #       where the REJECTED additive composition is ~1.9x on the same draws,
+    #       and a 2000-identity sybil split gains nothing;
+    #   (e) the three consumer seams — T1 the node lane factory (and the V37.1
+    #       ridge coupling the flip carries), T2 the W2 sub-target harvest
+    #       (measurement only: no push, no lane work, bindings still enforced),
+    #       T3 the estimate-into-fold point;
+    #   (f) DROPS-R1 (the estimate is a HASH COUNT merged into a COIN-denominated
+    #       E_b), which remains OPEN and is witnessed, not fixed.
+    # Stdlib-only, ~2 s. SAME HOLLOW-GREEN GUARD: ALSO on BOTH build.yml lists.
+    add_executable(v37_drops_activation_kat v37_drops_activation_kat.cpp)
+    target_compile_features(v37_drops_activation_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_drops_activation_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_drops_activation_kat Threads::Threads)
+    add_test(NAME v37_drops_activation_kat COMMAND v37_drops_activation_kat)
 endif()

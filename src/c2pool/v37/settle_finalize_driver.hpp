@@ -81,6 +81,14 @@ struct FinalizeCandidate {
     std::uint64_t        found_height{}; // coin height at which the pool found it
     OwedLedger::Amounts  credit;         // E_b at the burial-gated prefix
     OwedLedger::Amounts  payout;         // coinbase outputs broadcast in the block
+    // ── ★ DROPS T3: the sub-threshold harvest this cut settles ───────────
+    // `params` carries the lane's SubthresholdGate; `harvested` carries the
+    // BURIED, out-of-interval near-miss evidence (DropHarvester::take_buried()).
+    // BOTH DEFAULT INERT: LaneParams{} has the gate OFF and the harvest is
+    // empty, so register_found() composes to `credit` byte for byte and this
+    // driver stays identical to master for every existing caller.
+    ::v37::LaneParams              params{};
+    std::vector<HarvestedReceipt>  harvested{};
 };
 
 // ===========================================================================
@@ -129,7 +137,14 @@ public:
     // via OwedLedger::on_block_found). finalize_height = found_height + D_conf is
     // the coin height at which b first becomes buried >= D_conf.
     void register_found(const FinalizeCandidate& c) {
-        m_ledger.on_block_found(c.bid, c.credit, c.payout);
+        // ★ DROPS T3. compose_credit_replace() is the ONE composition: for each
+        // harvested (payee, interval) the estimator's total-interval-work figure
+        // REPLACES that interval's share-derived contribution to E_b. Gate OFF
+        // or empty harvest => it returns c.credit itself, so this line is the
+        // old line on every existing path.
+        m_ledger.on_block_found(
+            c.bid, compose_credit_replace(c.params, c.credit, c.harvested),
+            c.payout);
         const std::uint64_t fin_h = c.found_height + m_dconf;
         m_by_finalize_height[fin_h].push_back(c.bid);      // sorted map → in-order
         m_found_height[c.bid] = c.found_height;
