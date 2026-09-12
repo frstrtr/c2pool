@@ -7,12 +7,19 @@
 // ---------------------------------------------------------------------------
 #include "MoneroMnemonic.hpp"
 
+#include "secure/SecureString.hpp"
+
 #include <array>
 #include <cctype>
 #include <sstream>
 #include <unordered_map>
 
 namespace c2wallet::monero {
+
+MnemonicDecode::~MnemonicDecode()
+{
+    c2w::secure::secure_wipe(key.data(), key.size());
+}
 
 namespace {
 

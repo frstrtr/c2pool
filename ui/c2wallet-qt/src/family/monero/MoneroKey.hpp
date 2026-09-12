@@ -34,6 +34,11 @@ struct MoneroKeys {
     Bytes32 view_pub{};
 
     bool can_sign() const { return has_spend_priv; }
+
+    // Zeroize the private scalars on every destruction path (design 5.3):
+    // spend_priv and view_priv (incl. the view-only view_priv) must not be
+    // left in freed memory. Defined out-of-line via secure::secure_wipe.
+    ~MoneroKeys();
 };
 
 struct KeyImportResult {

@@ -77,6 +77,7 @@ add_library(c2wallet_monero STATIC
     addr/MoneroBase58.cpp
     addr/MoneroAddress.cpp
     MoneroKey.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../secure/SecureString.cpp
 )
 target_include_directories(c2wallet_monero PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../..     # ui/c2wallet-qt/src  (for "family/..","secure/..")

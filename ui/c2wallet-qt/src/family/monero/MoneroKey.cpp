@@ -9,6 +9,8 @@
 
 #include "seed/MoneroMnemonic.hpp"
 
+#include "secure/SecureString.hpp"
+
 #include <cctype>
 
 #if defined(__linux__)
@@ -17,6 +19,22 @@
 #endif
 
 namespace c2wallet::monero {
+
+namespace {
+// RAII scrub for stack scratch holding secret material (CSPRNG entropy and
+// the reduced spend seed). Fires on every return path, success or error.
+struct ScopeWipe {
+    void* p;
+    std::size_t n;
+    ~ScopeWipe() { c2w::secure::secure_wipe(p, n); }
+};
+} // namespace
+
+MoneroKeys::~MoneroKeys()
+{
+    c2w::secure::secure_wipe(spend_priv.data(), spend_priv.size());
+    c2w::secure::secure_wipe(view_priv.data(), view_priv.size());
+}
 
 bool hex_to_bytes32(const std::string& hex, Bytes32& out)
 {
@@ -151,6 +169,7 @@ MoneroAddress primary_address(const MoneroKeys& k, Network net)
 bool generate_wallet(GeneratedWallet& out, std::string& err)
 {
     Bytes32 entropy{};
+    ScopeWipe wipe_entropy{entropy.data(), entropy.size()};
 #if defined(__linux__)
     // Vetted CSPRNG (design §3.4 HARD FLAG): getrandom(2), never a demo RNG.
     std::size_t got = 0;
@@ -172,6 +191,7 @@ bool generate_wallet(GeneratedWallet& out, std::string& err)
     // Reduce entropy mod l to a valid ed25519 scalar (NOT a truncation), so the
     // spend key round-trips through the mnemonic unchanged.
     Bytes32 spend_seed = mcrypto::reduce32(entropy);
+    ScopeWipe wipe_spend_seed{spend_seed.data(), spend_seed.size()};
 
     KeyImportResult ki = keys_from_spend_key(spend_seed);
     if (!ki.ok) {

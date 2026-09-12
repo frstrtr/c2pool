@@ -35,6 +35,10 @@ struct MnemonicDecode {
     Bytes32         key{};            // 32-byte private spend key material
     const Wordlist* language{nullptr};
     bool            had_checksum{false};
+
+    // Zeroize the decoded 32-byte spend key on destruction (design 5.3).
+    // Defined out-of-line via secure::secure_wipe.
+    ~MnemonicDecode();
 };
 
 // Decode a Monero 25-word (or 24-word, checksum-less) mnemonic to its 32-byte
