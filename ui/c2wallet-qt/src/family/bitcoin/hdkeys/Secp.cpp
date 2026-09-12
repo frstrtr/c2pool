@@ -85,6 +85,11 @@ bool Secp::seckey_tweak_add(uint8_t sk[32], const uint8_t tweak[32]) const
     return secp256k1_ec_seckey_tweak_add(p_->ctx, sk, tweak) == 1;
 }
 
+bool Secp::seckey_tweak_mul(uint8_t sk[32], const uint8_t factor[32]) const
+{
+    return secp256k1_ec_seckey_tweak_mul(p_->ctx, sk, factor) == 1;
+}
+
 bool Secp::pubkey_tweak_add(std::vector<uint8_t>& pub33, const uint8_t tweak[32]) const
 {
     secp256k1_pubkey pk;
@@ -95,6 +100,18 @@ bool Secp::pubkey_tweak_add(std::vector<uint8_t>& pub33, const uint8_t tweak[32]
     secp256k1_ec_pubkey_serialize(p_->ctx, pub33.data(), &len, &pk, SECP256K1_EC_COMPRESSED);
     pub33.resize(len);
     return true;
+}
+
+std::vector<uint8_t> Secp::ecdh_compressed(const std::vector<uint8_t>& pub, const uint8_t scalar[32]) const
+{
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_parse(p_->ctx, &pk, pub.data(), pub.size())) return {};
+    if (!secp256k1_ec_pubkey_tweak_mul(p_->ctx, &pk, scalar)) return {};
+    std::vector<uint8_t> out(33);
+    size_t len = 33;
+    secp256k1_ec_pubkey_serialize(p_->ctx, out.data(), &len, &pk, SECP256K1_EC_COMPRESSED);
+    out.resize(len);
+    return out;
 }
 
 std::vector<uint8_t> Secp::xonly_serialize(const std::vector<uint8_t>& pub) const
