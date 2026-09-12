@@ -7,6 +7,11 @@ the licenses named below, it may be incomplete or imprecise, and it should be
 reviewed by qualified counsel before being relied upon. Nothing here creates a
 warranty, waiver, or contract.
 
+**Governing entity & law.** The project is stewarded by **Technocore Inc, a
+Delaware (USA) corporation**. The applicable legal framework for this document is
+**Delaware state law and U.S. federal law**; it does not address or invoke the
+law of any other jurisdiction.
+
 ---
 
 ## 1. Disclaimer of Warranty / Limitation of Liability (AS IS)
@@ -71,16 +76,16 @@ transparent, and defensive, not covert.
 ## 3. Explicit Warning on Unauthorized Deployment
 
 **Deploying c2pool on, or mining with, computing hardware WITHOUT the informed
-consent of that hardware's lawful owner or operator is illegal.** Such conduct
-may constitute a serious criminal offense, including but not limited to:
+consent of that hardware's lawful owner or operator is illegal.** Under the U.S.
+federal and Delaware law that governs this project, such conduct may constitute a
+serious criminal offense, including but not limited to:
 
-- **United States** — the Computer Fraud and Abuse Act, **18 U.S.C. § 1030**
-  (unauthorized access to, and unauthorized use of, protected computers).
-- **Russian Federation** — Уголовный кодекс РФ, **ст. 272** (неправомерный доступ
-  к компьютерной информации) and **ст. 273** (создание, использование и
-  распространение вредоносных компьютерных программ).
-- **Equivalents in other jurisdictions** (e.g. computer-misuse and unauthorized-
-  access statutes worldwide).
+- **U.S. federal** — the Computer Fraud and Abuse Act, **18 U.S.C. § 1030**
+  (unauthorized access to, and exceeding authorized access on, protected
+  computers).
+- **Delaware** — the Computer Crimes statute, **11 Del. C. § 932** (Unauthorized
+  access), together with the related **§§ 931–941** "Computer Related Offenses"
+  subchapter as applicable.
 
 The authors **categorically condemn and prohibit** any unauthorized, covert, or
 non-consensual deployment of this software — including "cryptojacking" and any
