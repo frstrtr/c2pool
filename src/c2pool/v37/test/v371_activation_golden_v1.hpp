@@ -30,11 +30,11 @@
 // hollow.
 #include <cstdint>
 namespace c2pool::v37n::settle::v371_golden {
-inline constexpr const char* STAMP = "cffdfd30991c8856d1d114aa050bf0ea955705ebfb23a7b019569cbd227a10bd";
+inline constexpr const char* STAMP = "d434f23b30a63d860692cc030e53ab2368183d19a9c559279235bc58480f2442";
 inline constexpr const char* JSON_FILE = "v371_activation_golden_v1.json";
 inline constexpr const char* OWED_DIGEST_GATE_OFF_HEX = "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae";
-inline constexpr const char* OWED_DIGEST_GATE_ON_HEX  = "2a7dc41dcc231ce8a81f93801b495d65d6841e8067f58e48894985c9ebd8e692";
+inline constexpr const char* OWED_DIGEST_GATE_ON_HEX  = "2a84c4f58629ad4c39ca258ff9516cf08300b0c2b46cbd7d4332020deeb5f395";
 inline constexpr const char* LANE_DIGEST_HEX          = "37756e9fa59be4aa30acfa6a18b0e1c131c9601cfceec802f19133a1ecde1a50";
 inline constexpr const char* C_CREDIT_DEC = "374999";
-inline constexpr const char* D_CREDIT_DEC = "624999";
+inline constexpr const char* D_CREDIT_DEC = "-3074457345617633603";
 }  // namespace

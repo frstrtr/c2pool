@@ -131,6 +131,11 @@ int main() {
             std::printf("REGEN v0x02 golden %s (%zu bytes):\n%s\n", f.name, b.size(),
                         to_hex(b).c_str());
         }
+        for (const auto& f : wire_freeze::frozen_fixtures_v3()) {
+            const auto b = CarrierWire::encode_version(f.carrier, f.version);
+            std::printf("REGEN v0x03 golden %s (%zu bytes):\n%s\n", f.name, b.size(),
+                        to_hex(b).c_str());
+        }
         return 0;
     }
 
@@ -142,12 +147,16 @@ int main() {
     // (2) Version tag is the first byte; the v0x01 frame carries 0x01, and this
     //     build's DEFAULT encode() carries the current frozen version 0x02.
     CHECK(!bytes.empty() && bytes[0] == 0x01);
-    CHECK(W3_WIRE_VERSION == 0x02 && W3_WIRE_VERSION_V1 == 0x01 && W3_WIRE_VERSION_V2 == 0x02);
+    CHECK(W3_WIRE_VERSION == 0x03 && W3_WIRE_VERSION_V1 == 0x01 &&
+          W3_WIRE_VERSION_V2 == 0x02 && W3_WIRE_VERSION_V3 == 0x03);
     {
         const auto now = CarrierWire::encode(c);
         CHECK(!now.empty() && now[0] == W3_WIRE_VERSION);
-        // v0x02 without a descriptor == the v0x01 frame + version bump + 1 byte.
-        CHECK(now.size() == bytes.size() + 1 && now.back() == 0x00);
+        // v0x03 with nothing to say == the v0x01 frame + version bump + 2 bytes
+        // (one absent cut descriptor, one absent DROPS credit map).
+        CHECK(now.size() == bytes.size() + 2 && now.back() == 0x00);
+        const auto v2 = CarrierWire::encode_version(c, 0x02);
+        CHECK(v2.size() == bytes.size() + 1 && v2.back() == 0x00);
     }
 
     // (3) Round trip: decode(encode(c)) reconstructs the carrier + receipt and
@@ -185,6 +194,8 @@ int main() {
         // S-1c: the v0x02 goldens are non-empty (an unfilled golden would make
         // the selfcheck's "encode == golden" check vacuously comparable to "").
         for (const auto& f : wire_freeze::frozen_fixtures_v2())
+            CHECK(std::string(f.golden_hex).size() >= 2);
+        for (const auto& f : wire_freeze::frozen_fixtures_v3())
             CHECK(std::string(f.golden_hex).size() >= 2);
     }
 

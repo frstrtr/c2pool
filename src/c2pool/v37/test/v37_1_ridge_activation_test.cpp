@@ -255,7 +255,7 @@ static Run drive(LaneKind lk, bool flip, u64 cov_override = 0, bool strict = tru
             if (!f) { o.refused = true; return o; }
             settle::OwedLedger::Amounts credit;
             for (const auto& [k, val] : f->credit) credit[k] = (long long)val;
-            ledger.on_block_found_with_estimator(BLOCK_ID[nb], credit, {}, p, {});
+            ledger.on_block_found_estimator_raw_PRE_RULING(BLOCK_ID[nb], credit, {}, p, {});
             ledger.on_block_finalized(BLOCK_ID[nb], (BLOCK_AT[nb] - 1) / SHARES_PER_BIN);
             o.credit[nb] = credit;
             o.source[nb] = f->source;

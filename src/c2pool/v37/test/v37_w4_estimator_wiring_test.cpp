@@ -155,7 +155,7 @@ static ScheduleOut run_schedule_wired(const LaneParams& params) {
     std::vector<S::HarvestedReceipt> harvested;
     harvested.push_back(S::HarvestedReceipt{C, /*interval=*/100, uncovered_collector(params.subthreshold.K)});
     harvested.push_back(S::HarvestedReceipt{A, /*interval=*/100, covered_collector(params.subthreshold.K, 5)});
-    ledger.on_block_found_with_estimator("blk1", base_credit, payout, params, harvested);
+    ledger.on_block_found_estimator_raw_PRE_RULING("blk1", base_credit, payout, params, harvested);
     ledger.on_block_finalized("blk1", /*bin_height=*/100);
     ScheduleOut o;
     o.owed = ledger.owed_digest();
@@ -308,21 +308,31 @@ int main(int argc, char** argv) {
 
     // -- Case 6: sybil-neutrality survives the wiring -------------------
     // Reproduces the module KAT's sim E5b but routes EVERY estimate through the
-    // W4 seam subthreshold_credit(). One miner H=20*T split into n identities;
-    // the broken clamp inflates (>1.3x @ 2000-split) while the sybil-neutral
-    // Combined path stays neutral. clamp is NOT reachable through the seam.
+    // W4 seam subthreshold_credit_raw_PRE_RULING(). One miner H=20*T split into n identities.
+    //
+    // ★ MEASURED ON THE COMPOSED CREDIT, NOT ON THE DELTA. subthreshold_credit_raw_PRE_RULING()
+    // returns the REPLACE delta Hhat_comb - W_shares, which is ~0 for a fully
+    // covered payee and says nothing on its own. What a payee is actually paid
+    // is  E_b + delta, and in work units the interval's E_b contribution IS
+    // W_shares = S*T — so the composed credit is W_shares + delta. Three rules
+    // are driven side by side against the same true work:
+    //   composed : the SHIPPED rule, W_shares + (Hhat_comb - W_shares) -> ~1.0
+    //   add      : the REJECTED rule, W_shares + Hhat_comb             -> ~1.9
+    //   clamp    : the REJECTED rule, max(S*T, Hhat)                   -> 1.9 @ 2000-split
+    // and the sybil test is that `composed` is FLAT in n.
     {
         const std::uint64_t Tdiff = 4096;
         sub::u256 hT; hT.w[3] = (1ULL << (244 - 192));  // h_T = 2^244 (approx 2^256/4096)
         const std::uint64_t Hbig = 20 * Tdiff;          // 81920
         const std::uint32_t K = 4;
-        std::string d; double clamp_2000 = 0, comb_2000 = 0;
+        std::string d;
+        double clamp_2000 = 0, comp_2000 = 0, comp_1 = 0, add_1 = 0;
         for (std::uint64_t n : {1ull, 20ull, 2000ull}) {
             std::uint64_t h = Hbig / n;
             int tr = (int)std::min<std::uint64_t>(200, std::max<std::uint64_t>(30, 3000 / n));
-            double clamp = 0, comb = 0;
+            double clamp = 0, composed = 0, added = 0;
             for (int t = 0; t < tr; ++t) {
-                double c = 0, cm = 0;
+                double c = 0, cp = 0, ad = 0;
                 for (std::uint64_t id = 0; id < n; ++id) {
                     SplitMix64 rng(0xC0FFEEull + n * 1315423911ull + (std::uint64_t)t * 2654435761ull + id);
                     sub::ReceiptCollector rc(K, hT);
@@ -336,28 +346,43 @@ int main(int argc, char** argv) {
                     sub::u256 hK = kth_smallest(band, K);
                     // clamp: the broken reference (never reachable via the seam).
                     c += u320_to_double(sub::broken_clamp_NEVER_CONSENSUS(Sc, K, hK, hT));
-                    // comb: the ACTUAL wiring, Combined mode, via subthreshold_credit.
+                    // add: the OTHER broken reference — the pre-ruling additive
+                    // merge E_b + Hhat_comb (also never reachable via the seam).
+                    ad += (double)sub::broken_add_NEVER_CONSENSUS(Sc, K, hK, hT);
+                    // composed: the ACTUAL wiring. The interval's E_b part is
+                    // W_shares; the seam supplies the REPLACE delta on top.
                     LaneParams pc; pc.subthreshold.enabled = true; pc.subthreshold.K = K;
                     pc.subthreshold.mode = 1;  // Combined (sybil-neutral)
                     bytes32 payee = keyfill((std::uint8_t)(0x10 + id));
                     std::vector<S::HarvestedReceipt> hv1;
                     hv1.push_back(S::HarvestedReceipt{payee, /*interval=*/(std::uint64_t)id, rc});
-                    auto credit = S::subthreshold_credit(pc, hv1);
-                    for (auto& [k, v] : credit) { (void)k; cm += (double)v; }
+                    auto credit = S::subthreshold_credit_raw_PRE_RULING(pc, hv1);
+                    double delta = 0;
+                    for (auto& [k, v] : credit) { (void)k; delta += (double)v; }
+                    cp += (double)sub::fold63(sub::share_covered_work(Sc, hT)) + delta;
                 }
-                clamp += c; comb += cm;
+                clamp += c; composed += cp; added += ad;
             }
             double denom = (double)tr * (double)Hbig;
-            double cr = clamp / denom, cor = comb / denom;
-            char buf[160];
-            std::snprintf(buf, sizeof buf, " n=%llu clamp=%.3f comb=%.3f",
-                          (unsigned long long)n, cr, cor);
+            double cr = clamp / denom, cpr = composed / denom, adr = added / denom;
+            char buf[192];
+            std::snprintf(buf, sizeof buf, " n=%llu composed=%.3f add=%.3f clamp=%.3f",
+                          (unsigned long long)n, cpr, adr, cr);
             d += buf;
-            if (n == 2000) { clamp_2000 = cr; comb_2000 = cor; }
+            if (n == 2000) { clamp_2000 = cr; comp_2000 = cpr; }
+            if (n == 1)    { comp_1 = cpr; add_1 = adr; }
         }
-        bool ok = (clamp_2000 > 1.3) && (comb_2000 <= 1.05) && (clamp_2000 > comb_2000);
-        d += ok ? "  => seam sybil-neutral, clamp rejected" : "  => UNEXPECTED";
-        check(ok, "6 sybil-neutral via seam (clamp rejected)", d);
+        // (a) NO DOUBLE COUNT: undivided, the shipped rule pays ~1x the work and
+        //     the rejected additive rule pays ~1.9x on the SAME fixture.
+        bool no_double = (comp_1 <= 1.10) && (add_1 >= 1.80);
+        // (b) SYBIL: a 2000-way split collects no more than an undivided miner.
+        bool sybil_ok = (comp_2000 <= 1.05) && (comp_2000 <= comp_1 + 0.10);
+        // (c) the clamp witness is still live.
+        bool clamp_rejected = (clamp_2000 > 1.3) && (clamp_2000 > comp_2000);
+        bool ok = no_double && sybil_ok && clamp_rejected;
+        d += ok ? "  => composed ~1x (no double count), flat in n, add+clamp rejected"
+                : "  => UNEXPECTED";
+        check(ok, "6 sybil-neutral + no-double-count via seam", d);
     }
 
     // -- Case 7: unbiasedness survives the wiring -----------------------
@@ -383,7 +408,7 @@ int main(int argc, char** argv) {
                 bytes32 payee = keyfill((std::uint8_t)(0x40 + ki));
                 std::vector<S::HarvestedReceipt> hv;
                 hv.push_back(S::HarvestedReceipt{payee, (std::uint64_t)t, rc});
-                auto credit = S::subthreshold_credit(pk, hv);
+                auto credit = S::subthreshold_credit_raw_PRE_RULING(pk, hv);
                 double amt = credit.empty() ? 0.0 : (double)credit.begin()->second;
                 ratios[(std::size_t)ki].push_back(amt / (double)H);
             }
