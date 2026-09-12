@@ -50,4 +50,23 @@ inline const CoinDescriptor* coin_descriptor(const std::string& symbol_uc)
     return nullptr;
 }
 
+// Resolve THIS node's short coin symbol. The configured coin label is the
+// runtime truth for every lane: a BCH / NMC / BIP110 node shares the BITCOIN
+// consensus enum yet must report its OWN symbol, never a fabricated "BTC".
+// Prefer the label's registry symbol; fall back to the enum-derived symbol,
+// then the raw uppercased label. Returns "" only when both are empty (truly
+// unconfigured), so callers surface "unknown" rather than a wrong coin.
+inline std::string resolve_node_symbol(const std::string& coin_label,
+                                       const std::string& enum_symbol)
+{
+    std::string uc = coin_label;
+    for (auto& ch : uc)
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+    if (const CoinDescriptor* d = coin_descriptor(uc))
+        return d->symbol;
+    if (!enum_symbol.empty())
+        return enum_symbol;
+    return uc;
+}
+
 }  // namespace core

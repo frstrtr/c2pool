@@ -26,6 +26,7 @@
 
 #include <core/log.hpp>
 #include <core/uint256.hpp>
+#include <core/coin_registry.hpp>
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
 #include <core/hashrate_ring.hpp>
@@ -1575,17 +1576,21 @@ public:
     // chain has no Blockchain enum entry (BCH / NMC-aux), so topology and
     // node_info never emit a blank symbol. "" only when truly unconfigured.
     std::string node_symbol() const {
+        // Enum-derived symbol for the consensus-supported coins.
+        std::string enum_sym;
         switch (m_blockchain) {
-            case Blockchain::LITECOIN: return "LTC";
-            case Blockchain::BITCOIN:  return "BTC";
-            case Blockchain::DOGECOIN: return "DOGE";
-            case Blockchain::DASH:     return "DASH";
-            case Blockchain::DIGIBYTE: return "DGB";
-            default:                   break;
+            case Blockchain::LITECOIN: enum_sym = "LTC";  break;
+            case Blockchain::BITCOIN:  enum_sym = "BTC";  break;
+            case Blockchain::DOGECOIN: enum_sym = "DOGE"; break;
+            case Blockchain::DASH:     enum_sym = "DASH"; break;
+            case Blockchain::DIGIBYTE: enum_sym = "DGB";  break;
+            default:                                      break;
         }
-        std::string s = m_coin_label;
-        for (auto& ch : s) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
-        return s;
+        // The configured coin label is the runtime truth: BCH / NMC / BIP110
+        // share the BITCOIN enum but must NOT be labelled "BTC". Resolve the
+        // label through the coin registry first, then fall back to the enum
+        // symbol (then the raw uppercased label). "" only when unconfigured.
+        return core::resolve_node_symbol(m_coin_label, enum_sym);
     }
     // Primary chain key for THIS node, derived from its configured blockchain
     // (lowercase symbol). Used as the default chain for explorer / coin-admin
