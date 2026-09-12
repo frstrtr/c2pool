@@ -61,7 +61,16 @@ namespace c2pool::xmr::native::parity {
 // over the one property the milestone exists to establish. Every streak earned
 // under version 2 was earned by a judge that could not see that, so it does not
 // carry.
-inline constexpr std::uint32_t COMPARATOR_VERSION = 3;
+//
+// Version 4 (M4 leg 1): the famine CONSTRAINT is now decided by ARM IDENTITY and
+// fenced to the SERVING arm, and P-TPL records the selected transaction set as
+// an explicit NotComparable row. Version 3's judge was fed BY SEAT: in the leg
+// that serves from monerod and shadows the native arm it read the daemon's empty
+// mempool as a starving native pool, FAILed every template sample on a healthy
+// node, and held the M4 graduation streak at zero. The same inversion hid a REAL
+// native famine in that same leg. A streak earned under a judge that could do
+// either of those is not evidence about this one, so it does not carry.
+inline constexpr std::uint32_t COMPARATOR_VERSION = 4;
 
 // ---------------------------------------------------------------------------
 // Regimes -- how a field is judged. Named after the plan's determinism table.
@@ -302,17 +311,35 @@ inline constexpr FieldSpec TEMPLATE_FIELDS[] = {
     {"median_weight",           Regime::Equality,      true,  true },
     {"already_generated_coins", Regime::Equality,      true,  true },
     {"median_timestamp",        Regime::Constraint,    false, false},
-    // The COUNT stays a Measurement: two pools may legitimately differ by a few
-    // transactions at any instant, and an equality gate here would fire on
-    // ordinary propagation skew.
+    // The COUNT stays a Measurement, and after the M4 leg-1 stall it is worth
+    // saying WHY in more than one clause, because the two numbers are not the
+    // same quantity and never were. monerod's is the mempool it offers a
+    // template builder in get_miner_data.tx_backlog. The native arm's is the
+    // SELECTABLE SET of its own relayed pool, admitted under the v37 relay rule
+    // -- structural checks plus range-proof and commitment evidence, with no
+    // key-image double-spend test, which is a deliberately DIFFERENT admission
+    // rule from the daemon's. The two sides therefore hold different
+    // transactions by construction, not by accident, and an equality gate here
+    // would fire on that design decision as well as on ordinary propagation
+    // skew. It is rendered in the diff so an operator can see the delta; it is
+    // never scored.
     {"tx_backlog_count",        Regime::Measurement,   false, false},
-    // ...but the FAMINE SHAPE is a Constraint. A native backlog of 0 sustained
-    // across K samples and S seconds while the shadow arm holds transactions is
-    // not skew and is not agreement: it is the native pool failing to ingest,
-    // which is invisible to all six EQUALITY rows above because none of them
-    // has anything to do with the transaction set. Evaluated by
-    // BacklogFamineGuard (xmr_backlog_famine.hpp) and delivered through
-    // CompareOptions::constraints, so a violation FAILS the sample.
+    // The SELECTED SET itself, as a count plus an order-independent digest of
+    // the transaction ids. NotComparable for the reason directly above: this row
+    // exists so the by-design difference is VISIBLE and RECORDED, and so that
+    // nobody re-adds it -- or a transaction merkle root computed from it -- as an
+    // EQUALITY, which would re-create the same false divergence in a form that
+    // looks more rigorous.
+    {"selected_tx_set",         Regime::NotComparable, false, false},
+    // ...but the FAMINE SHAPE is a Constraint. A NATIVE backlog of 0 sustained
+    // across K samples and S seconds while the DAEMON holds transactions is not
+    // skew and is not agreement: it is the native pool failing to ingest, which
+    // is invisible to all six EQUALITY rows above because none of them has
+    // anything to do with the transaction set. Evaluated by BacklogFamineGuard
+    // (xmr_backlog_famine.hpp) and delivered through CompareOptions::constraints,
+    // so a violation FAILS the sample -- but only in the posture where the
+    // native arm is the one SERVING, because only then can an empty native pool
+    // cost a miner anything. The arms are identified BY NAME, never by seat.
     {"native_backlog_famine",   Regime::Constraint,    false, false},
     {"coinbase_bytes",          Regime::NotComparable, false, false},
 };
