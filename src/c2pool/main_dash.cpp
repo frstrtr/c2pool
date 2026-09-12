@@ -1379,11 +1379,32 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // ── Control-plane M1 (SAFE): install the READ-ONLY config endpoints.
         // The lambdas read the immutable snapshot published in main() (before
         // run_node) at request time, so install order is irrelevant. No node
-        // state is touched. POST /api/config/apply stays inert (503) in
-        // http_session.cpp — runtime mutation is operator-gated, not armed.
+        // state is touched. POST /api/config/apply is WIRED just below (Slice
+        // A/B) but stays fail-closed: it answers 503 {"armed":false} until an
+        // operator registers a loopback control token (none is registered here),
+        // and money-path keys additionally require the two-phase money nonce.
         mi->set_config_fns(
             []() { return c2pool::config_endpoint::resolved_config_json(); },
             []() { return c2pool::config_endpoint::catalog_schema_json(); });
+
+        // #157 Slice A/B: wire the LIVE gated-apply path for POST
+        // /api/config/apply. This installs the plumbing ONLY -- the endpoint
+        // stays fail-closed: config_endpoint::apply_config() answers 503
+        // {"armed":false} until an operator registers a loopback control token
+        // (nothing here registers one). Money-path keys (Mut::MONEY_*, which now
+        // includes embedded.tx_inject -- the tx-injection arm) additionally
+        // require the two-phase money nonce bound to the exact diff + the M0
+        // tripwire. The lambda is capture-free (apply_config is process-global);
+        // the runtime setter that actually flips node state is registered on the
+        // ParamApplier next to the node_coin_state arm (Slice B, below).
+        mi->set_config_apply_fn(
+            [](const std::string& body) -> nlohmann::json {
+                auto req  = c2pool::config_endpoint::parse_apply_request(body);
+                auto resp = c2pool::config_endpoint::apply_config(req);
+                auto j    = resp.to_json();
+                j["http_status"] = resp.http_status;   // http_session maps to wire status
+                return j;
+            });
 
         // ── Peer-info liveness: serialize the HTTP-cache rebuild onto the
         // io_context thread (main_ltc.cpp parity). Once the io_context is wired,
@@ -2748,32 +2769,110 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // transaction, which is exactly the case that costs a whole block.
     node_coin_state.set_serve_mempool_txs(embedded_serve_mempool_txs);
     // #157 (--embedded-tx-inject): arm the opt-in miner/user tx-injection lane.
-    // Default OFF; the actual local submits happen after the mempool + the
-    // consensus-exact script check are wired (see --embedded-tx-inject-hex).
-    node_coin_state.set_tx_inject_enabled(embedded_tx_inject);
-    // #157 M2 (peer tx-injection over the sharechain p2p): install the sink the
-    // tx_inject HANDLER routes a peer's tx through. It MUST target THIS
-    // node_coin_state (the armed one) — NodeImpl::m_coin_state is a different
-    // object that main_dash never arms, so a handler calling m_coin_state would
-    // fail-closed forever. Flag OFF ⇒ a NULL sink ⇒ the handler ignores every
-    // tx_inject (belt), and submit_inject would refuse anyway (suspenders).
+    // Slice B routes the ARM through TWO places that MUST move together, so a
+    // runtime arm (via POST /api/config/apply -> the ParamApplier setter below)
+    // behaves exactly like a startup arm:
+    //   (1) node_coin_state.set_tx_inject_enabled() -- the M1 submit gate; and
+    //   (2) p2p_node.set_tx_inject_sink() -- the sink the peer tx_inject HANDLER
+    //       routes a peer tx through. It MUST target THIS node_coin_state (the
+    //       armed one); NodeImpl::m_coin_state is a different object main_dash
+    //       never arms, so a handler calling it would fail-closed forever. If a
+    //       runtime arm flipped only (1) and not (2), peer tx_inject frames
+    //       would be SILENTLY ignored (Fable review, Edit 1). So arm/disarm is a
+    //       single closure that always moves both, and disarm clears the sink.
     // node_coin_state and p2p_node both live in run_node scope; node_coin_state
     // (declared later) is destroyed first, but only AFTER ioc.run() returns, so
     // no dispatch can reach a dangling ref. Reward-safe: transport only.
+    auto arm_tx_inject = [&node_coin_state, &p2p_node](bool on) {
+        node_coin_state.set_tx_inject_enabled(on);
+        if (on) {
+            p2p_node.set_tx_inject_sink(
+                [&node_coin_state](const dash::coin::MutableTransaction& tx,
+                                   uint32_t flags, int32_t expiry_height) {
+                    return node_coin_state.submit_inject(tx, flags, expiry_height);
+                });
+        } else {
+            p2p_node.set_tx_inject_sink(nullptr);   // disarm clears the sink too
+        }
+    };
+    arm_tx_inject(embedded_tx_inject);
     if (embedded_tx_inject) {
-        p2p_node.set_tx_inject_sink(
-            [&node_coin_state](const dash::coin::MutableTransaction& tx,
-                               uint32_t flags, int32_t expiry_height) {
-                return node_coin_state.submit_inject(tx, flags, expiry_height);
-            });
         std::cout << "[run] embedded-tx-inject ARMED (#157): miner/user tx-injection "
-                     "ON — submitted txs ride the block with priority through the "
+                     "ON -- submitted txs ride the block with priority through the "
                      "SAME validity gate; reward path byte-unchanged. Requires "
                      "--embedded-fold-checkscripts + the served-body posture. M2 "
                      "peer tx_inject transport is live (first-see fan-out, "
                      "per-peer DoS guard).\n";
-    } else {
-        p2p_node.set_tx_inject_sink(nullptr);   // explicit: feature dormant
+    }
+
+    // #157 Slice B: register the runtime ARM setter on the process-global
+    // ParamApplier. embedded.tx_inject is a MONEY-path key (param_catalog.inc),
+    // so apply_config admits a change to it ONLY behind the loopback control
+    // token + the two-phase money nonce (bound to the exact diff) + the M0
+    // tripwire, then invokes THIS setter to flip the runtime arm (both the M1
+    // gate AND the p2p sink, via arm_tx_inject). The setter runs on the node
+    // io_context (apply_config is dispatched there by thread_safe_wrap), so the
+    // IO-confined arm/sink state is mutated only on the strand the node runs on.
+    // Reward path untouched: arming only changes WHICH consensus-valid body txs
+    // may be offered, never the coinbase/subsidy/PPLNS/payee computation.
+    c2pool::config_endpoint::applier().register_setter(
+        "embedded.tx_inject",
+        [arm_tx_inject](const std::string& value) -> bool {
+            std::string v;
+            for (char c : value) v.push_back(static_cast<char>(std::tolower(
+                static_cast<unsigned char>(c))));
+            const bool on = (v == "true" || v == "1" || v == "on" || v == "yes");
+            arm_tx_inject(on);
+            return true;
+        });
+
+    // #157 Slice B: POST /api/tx-inject/submit -- loopback-only raw-tx submit to
+    // the armed M1 gate. thread_safe_wrap posts this onto the node io_context
+    // (Fable review, Edit 2: submit_inject / m_inject_pool are IO-thread-confined
+    // and lock-free, so the submit MUST NOT run on the WEB thread). submit_inject
+    // itself refuses ("inject-disabled") while the arm is OFF, so a disarmed node
+    // never injects. It does NOT modify the submit_inject validity gate -- it
+    // only calls it. Reward-safe: an inject is an ordinary block-body tx.
+    if (web_server) {
+        web_server->get_mining_interface()->set_tx_inject_submit_fn(
+            [&node_coin_state](const std::string& body) -> nlohmann::json {
+                nlohmann::json req = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+                if (!req.is_object() || !req.contains("raw_tx") || !req["raw_tx"].is_string())
+                    return nlohmann::json{{"ok", false}, {"cause", "missing raw_tx hex"},
+                                          {"http_status", 400}};
+                std::string hex = req["raw_tx"].get<std::string>();
+                hex.erase(std::remove_if(hex.begin(), hex.end(),
+                              [](unsigned char c) { return std::isspace(c); }), hex.end());
+                if (hex.empty() || hex.size() % 2 != 0)
+                    return nlohmann::json{{"ok", false}, {"cause", "raw_tx must be even-length hex"},
+                                          {"http_status", 400}};
+                uint32_t flags  = 0;
+                int32_t  expiry = 0;
+                if (req.contains("flags") && req["flags"].is_number_unsigned())
+                    flags = req["flags"].get<uint32_t>();
+                if (req.contains("expiry_height") && req["expiry_height"].is_number_integer())
+                    expiry = req["expiry_height"].get<int32_t>();
+                dash::coin::MutableTransaction tx;
+                try {
+                    auto raw = ParseHex(hex);
+                    PackStream ps(raw);
+                    ps >> tx;
+                } catch (const std::exception& e) {
+                    return nlohmann::json{{"ok", false},
+                                          {"cause", std::string("tx parse failed: ") + e.what()},
+                                          {"http_status", 400}};
+                }
+                auto r = node_coin_state.submit_inject(tx, flags, expiry);
+                // inject-disabled (arm OFF) -> 409; other named refusals -> 422.
+                const int http = r.ok ? 200 : (r.cause == "inject-disabled" ? 409 : 422);
+                return nlohmann::json{
+                    {"ok",          r.ok},
+                    {"cause",       r.cause},
+                    {"txid",        r.txid.GetHex()},
+                    {"armed",       node_coin_state.tx_inject_enabled()},
+                    {"http_status", http},
+                };
+            });
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
     // dashd's miner refuses any not-yet-islocked tx with vins younger than 10

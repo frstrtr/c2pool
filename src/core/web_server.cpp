@@ -5701,6 +5701,23 @@ nlohmann::json MiningInterface::rest_config_apply(const std::string& body)
         {"http_status", 503}};
 }
 
+nlohmann::json MiningInterface::rest_tx_inject_submit(const std::string& body)
+{
+    // Slice B (#157): route the POST body through the installed submit fn, which
+    // (in main_dash) deserializes the raw tx and calls the armed
+    // NodeCoinState::submit_inject on the node io_context (via thread_safe_wrap,
+    // so the IO-confined inject state is never touched from the WEB thread).
+    // Unwired => the caller (http_session) answers 503 before reaching here.
+    if (m_tx_inject_submit_fn) {
+        auto j = m_tx_inject_submit_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"armed", false},
+        {"error", "tx-inject submit not wired"},
+        {"http_status", 503}};
+}
+
 nlohmann::json MiningInterface::rest_node_topology()
 {
     // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer

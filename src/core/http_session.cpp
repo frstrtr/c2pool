@@ -1070,6 +1070,43 @@ void HttpSession::process_request()
                 send_response(std::move(response));
                 return;
             }
+
+            // ── Control-plane Slice B (#157): POST /api/tx-inject/submit ──────
+            // Hand a raw consensus tx to the armed M1 inject gate. Loopback-only
+            // (same posture as /api/config/apply). Fail-closed: a 503
+            // {"armed":false} until a main installs the submit fn, and even then
+            // NodeCoinState::submit_inject refuses ("inject-disabled") while the
+            // --embedded-tx-inject arm is OFF. The submit fn marshals onto the
+            // node io_context (thread_safe_wrap) so the IO-confined inject state
+            // is never touched from the WEB thread. Reward path untouched: an
+            // inject is an ordinary block-body tx.
+            if (std::string(request_.target()) == "/api/tx-inject/submit") {
+                auto remote_addr = socket_.remote_endpoint().address();
+                if (!remote_addr.is_loopback()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"tx-inject API is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                if (!mining_interface_->has_tx_inject_submit_fn()) {
+                    // Dormant: no submit fn installed => feature not wired.
+                    response.result(http::status::service_unavailable);
+                    response.body() = R"({"armed":false,"error":"tx-inject submit not wired"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                auto j = mining_interface_->rest_tx_inject_submit(request_.body());
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                response.result(static_cast<http::status>(st));
+                response.body() = j.dump();
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
             // Handle JSON-RPC POST request.
             // Accept both 1.0 and 2.0 — upgrade 1.0 to 2.0 for the library.
             std::string request_body = request_.body();
