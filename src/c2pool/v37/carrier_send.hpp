@@ -103,6 +103,14 @@ struct OwnWinRequest {
     std::vector<std::uint8_t> payout_script;    // the miner's output script (empty = no identity)
     bool won_block = false;                     // #889: this solve was ALSO a coin block
     std::string tag;                            // bookkeeping only; clamped on submit
+    // ★ X2 (Monero family): a payout identity that is NOT an output script.
+    // descriptor_of_payout_script() below canonicalizes BITCOIN-FAMILY script
+    // bytes, and a Monero payout has no output script of any kind — its identity
+    // is the XMR_STD/XMR_SUB (spend, view) key pair (v37_descriptor_xmr.hpp).
+    // When this is set it is honoured FIRST, ahead of payout_script, so the XMR
+    // daemon can mint a carrier under a real Monero identity. UNSET (the DASH
+    // path and every existing caller) leaves emit_now byte-identical.
+    std::optional<::v37::PayoutDescriptor> descriptor;
     // ★ S-1c: the flat cut descriptor this BLOCK win carries to its peers (wire
     // v0x02). Set only when won_block is true and the daemon could name the win
     // — the daemon's SubmitBlockFn has already registered the block and folded
@@ -343,8 +351,21 @@ public:
     EmitOutcome emit_now(const OwnWinRequest& req) {
         EmitOutcome o;
 
-        // 1. identity: the miner's own script; a block win may fall back.
-        std::optional<::v37::PayoutDescriptor> desc = descriptor_of_payout_script(req.payout_script);
+        // 1. identity. An EXPLICIT descriptor wins: it is the only way a family
+        //    whose payout is not an output script (Monero — X2) can name an
+        //    identity at all, and a caller that supplied one is not guessing.
+        //    Otherwise the Bitcoin-family path is unchanged: canonicalize the
+        //    miner's own script; a block win may fall back to the pool's.
+        std::optional<::v37::PayoutDescriptor> desc =
+            req.descriptor ? req.descriptor : descriptor_of_payout_script(req.payout_script);
+        if (desc && !desc->valid()) {
+            // A descriptor the canon rejects must never become a lane identity.
+            // For an XMR ref this is the fail-closed answer when no ed25519
+            // point-check / XMR validator backend is installed, and it is a
+            // REFUSAL rather than a fallback: crediting the pool's own key for a
+            // payout we could not validate is worse than crediting nobody.
+            desc.reset();
+        }
         if (!desc && req.won_block && m_opt.fallback_desc) {
             desc = m_opt.fallback_desc;
             o.used_fallback = true;

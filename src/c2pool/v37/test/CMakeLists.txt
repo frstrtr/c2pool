@@ -572,4 +572,31 @@ if (BUILD_TESTING)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_owed_event_mmr_kat Threads::Threads)
     add_test(NAME v37_owed_event_mmr_kat COMMAND v37_owed_event_mmr_kat)
+
+    # X2 + S-1b — MONERO LIVE SETTLEMENT KAT. Two defects, one suite. (X2) the
+    # XMR stratum path only COUNTED an accepted share, so the Monero lane stood
+    # at raw_total=0 with an empty identity set and E_b folded to {} forever.
+    # (S-1b) xmr_o2_finalize_connect.hpp registered every win as
+    # credit == payout == {payee:reward}, so FINALIZE netted finalW to zero and
+    # owed_digest — which is also the option-B tx_extra 0x03 merge-mining leaf —
+    # never left the empty sha256d("V37O") anchor b4db1ded…. This pins the fix on
+    # a FIXED record stream: an empty lane folds {} and says so; lane work ->
+    # fold_at_tip -> FOUND(credit=E_b, payout={}) -> FINALIZE moves owed_digest
+    # off the anchor and carries the whole reward; a peer folding at the WINNER'S
+    # cut converges on the byte-identical digest; and BOTH defects are reproduced
+    # directly (credit==payout returns to the anchor; no cut descriptor leaves
+    # A != B) so the suite goes red if either regresses. Also pins the CUT RULE
+    # being load-bearing, each fail-closed refusal as its own bit, the X2 sink
+    # wiring, and the XMR no-byte-reversal parent rule. Stdlib + Threads (the
+    # engine's executor thread): no coin lib, no crypto backend, no sockets, no
+    # clocks. SAME HOLLOW-GREEN GUARD as the sibling suites: ALSO listed on BOTH
+    # build.yml --target lists (the Linux x86_64 leg and the ASan+UBSan leg) so
+    # CI compiles + RUNS it instead of registering a NOT_BUILT CTest sentinel
+    # (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class), and audited by
+    # the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_xmr_s1b_x2_kat v37_xmr_s1b_x2_kat.cpp)
+    target_compile_features(v37_xmr_s1b_x2_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_s1b_x2_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_s1b_x2_kat Threads::Threads)
+    add_test(NAME v37_xmr_s1b_x2_kat COMMAND v37_xmr_s1b_x2_kat)
 endif()

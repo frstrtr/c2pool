@@ -82,6 +82,8 @@
 #include "xmr/xmr_live_submit.hpp"           // O-2 wire 3: block-blob assembly + submit_block
 #include "xmr/xmr_stratum_listener.hpp"      // O-2 wire 1: POSIX stratum listener (ITransport)
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
+#include "xmr/xmr_carrier_share_sink.hpp"    // X2: accepted share -> carrier -> LANE WEIGHT
+#include "xmr/xmr_carrier_stack.hpp"         // X2/S-1c: relay + ingest + send + peers
 #include "xmr/xmr_o2_settlement_fixture.hpp"  // O-2 option B: XmrSettlementConfig + XmrOwedFixture (proof ledger)
 #include "xmr/xmr_o2_settlement_provider.hpp" // O-2 option B: v37 K_fair settlement template provider + source
 #include "xmr/xmr_settlement_coinbase_shape.hpp"  // M2: the K_fair shape gate, read off the assembled block bytes
@@ -284,6 +286,17 @@ struct ServeHooks {
     // taking a built one, because the FOUND queue the sink pushes into is
     // loop-local -- one queue, one drain, whichever arm filled it.
     ::c2pool::xmr::native::relay::LevinBlockRelay* p2p_relay = nullptr;
+
+    // ★ X2 / S-1c: the carrier layer. Non-null puts every accepted share into
+    // the LANE (XmrLaneShareSink, wrapped around the exact network gate) and
+    // mints the block-winning carrier that NAMES this node's fold to its peers.
+    // Null leaves the serve path byte-identical to the pre-X2 daemon: a lane
+    // that accrues nothing and an E_b that folds to {} forever.
+    o2::XmrCarrierStack* carrier = nullptr;
+    // The ONE pool-level payout identity every own share is minted under (V1 —
+    // there is no base58 address decoder in this tree, so per-miner identity is
+    // a follow-on). Unset => the lane share-push declines and says so.
+    std::optional<::v37::PayoutDescriptor> carrier_desc;
 };
 
 // ---------------------------------------------------------------------------
@@ -329,10 +342,36 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     : static_cast<strat::IShareSink&>(live_sink);
     GatedShareSinkT<Provider, Snapshot> sink(rx, provider, template_source, publish_sink);
 
+    // ── ★ X2: the LANE SHARE-PUSH, wrapped AROUND the exact network gate ─────
+    // Order is listener -> lane sink -> gate -> publisher. Putting the push
+    // outside the gate keeps the 128-bit network-block decision byte-identical
+    // to the pre-X2 daemon while making every ACCEPTED share (already PoW- and
+    // target-checked by the X5 server) real lane weight. Inside the gate it
+    // would have coupled two decisions that have nothing to do with each other:
+    // a share the exact rule would refuse to SUBMIT is still real WORK.
+    std::unique_ptr<o2::XmrLaneShareSink> lane_sink;
+    if (hooks.carrier && hooks.carrier->send()) {
+        lane_sink = std::make_unique<o2::XmrLaneShareSink>(
+            sink, *hooks.carrier->send(),
+            [&provider](std::uint32_t tid, node::Hash& prev) {
+                Snapshot t;
+                if (!provider.by_id(tid, t)) return false;
+                prev = t.prev_id;
+                return true;
+            },
+            hooks.carrier_desc);
+        lane_sink->set_log([](bool warn, const std::string& l) {
+            std::printf("  %s%s\n", warn ? "WARN " : "", l.c_str());
+        });
+    }
+    strat::IShareSink& listener_sink =
+        lane_sink ? static_cast<strat::IShareSink&>(*lane_sink)
+                  : static_cast<strat::IShareSink&>(sink);
+
     o2::StratumListenerOptions lo;
     lo.bind_host = cfg.stratum_bind_host;
     lo.bind_port = cfg.stratum_bind_port;
-    o2::StratumListener listener(template_source, rx, sink, lo);
+    o2::StratumListener listener(template_source, rx, listener_sink, lo);
     // Seed prefetch on the LISTENER thread, before jobs are pushed (Argon2d
     // cache init never lands inside a miner's submit).
     listener.set_template_hook([&](const strat::TemplateJob& peek) { rx.on_template(peek); });
@@ -376,6 +415,23 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         ? "ENABLED" : "DISABLED (fail-closed)");
     } else {
         std::printf("stratum: NOT served (%s) — observe-side only\n", not_served_reason);
+    }
+
+    // ── ★ S-1c SEND SIDE: mint the BLOCK-WINNING carrier once the fold exists ─
+    // On the DASH side this rides the stratum thread, because submit_fn folds
+    // and mint_solved_share fires microseconds later on that same thread. Here
+    // the block is published from the LISTENER thread and the fold happens on
+    // the MAIN thread in fc.tick(), so the carrier is minted from this hook —
+    // after the fold, never before. That ordering is the whole point: a
+    // descriptor minted before the fold would name a cut that does not exist.
+    if (hooks.carrier) {
+        o2::XmrCarrierStack* stack = hooks.carrier;
+        fc.set_on_registered_found(
+            [stack, &node](const std::string& bid, const o2::FinalizeConnect::PendingRec& rec,
+                           const o2::XmrEbCut& cut) {
+                (void)stack->mint_block_winner(bid, rec.height, rec.prev_id_hex, cut,
+                                               node.ledger().owed_digest());
+            });
     }
 
     std::signal(SIGINT, on_sigint);
@@ -485,6 +541,80 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(h), line.c_str());
             }
         }
+        // ── ★ X2 / S-1b / S-1c: the settlement headline ─────────────────────
+        // owed_digest is the claim. If it still reads the empty sha256d("V37O")
+        // anchor after a FOUND has matured, the fold credited nobody — and the
+        // three counters beside it say which link is broken: no lane weight (X2
+        // is not pushing), a refused fold (S-1b), or no peer cut (S-1c).
+        {
+            const auto s1 = fc.s1_stats();
+            const auto s1p = fc.s1c_stats();
+            std::printf("  settlement: owed_digest=%s | S-1b folds=%llu valueless=%llu "
+                        "refused=%llu no_view=%llu unresolved=%llu | last cut{P=%llu "
+                        "raw_total=%llu E_b=%zu keys src=%s}\n",
+                        o2::s1_hex32(fc.owed_digest()).c_str(),
+                        static_cast<unsigned long long>(s1.folds),
+                        static_cast<unsigned long long>(s1.valueless),
+                        static_cast<unsigned long long>(s1.refused),
+                        static_cast<unsigned long long>(s1.no_view),
+                        static_cast<unsigned long long>(s1.unresolved),
+                        static_cast<unsigned long long>(fc.last_cut().next_pos),
+                        static_cast<unsigned long long>(fc.last_cut().raw_total),
+                        fc.last_cut().credit.size(), fc.last_cut().source);
+            if (hooks.carrier) {
+                const auto cs = hooks.carrier->send()
+                                    ? hooks.carrier->send()->stats()
+                                    : ::c2pool::v37n::CarrierSendStats{};
+                const auto& ib = hooks.carrier->inbound();
+                const auto ls = lane_sink ? lane_sink->stats() : o2::XmrLaneShareStats{};
+                auto snap = node.engine().snapshot(cfg.lane_chain);
+                std::printf("  lane: raw_total=%llu identities=%zu version=%llu | X2 shares=%llu "
+                            "pushed=%llu no_template=%llu no_identity=%llu shed=%llu | send "
+                            "admitted=%llu rejected=%llu unresolved_parent=%llu block_winners=%llu "
+                            "cut_carried=%llu relayed=%llu deferred=%llu\n",
+                            snap ? static_cast<unsigned long long>(snap->raw_total) : 0ull,
+                            snap && snap->identities ? snap->identities->size() : 0u,
+                            snap ? static_cast<unsigned long long>(snap->version) : 0ull,
+                            static_cast<unsigned long long>(ls.shares),
+                            static_cast<unsigned long long>(ls.pushed),
+                            static_cast<unsigned long long>(ls.no_template),
+                            static_cast<unsigned long long>(ls.no_identity),
+                            static_cast<unsigned long long>(ls.shed),
+                            static_cast<unsigned long long>(cs.admitted),
+                            static_cast<unsigned long long>(cs.rejected),
+                            static_cast<unsigned long long>(cs.unresolved_parent),
+                            static_cast<unsigned long long>(cs.block_winners),
+                            static_cast<unsigned long long>(cs.cut_carried),
+                            static_cast<unsigned long long>(cs.relayed),
+                            static_cast<unsigned long long>(cs.deferred_relay));
+                std::printf("  carrier inbound: frames=%llu admitted=%llu echo=%llu "
+                            "wire_rejected=%llu policy_rejected=%llu admit_rejected=%llu | "
+                            "S-1c cut_frames=%llu offered=%llu credited=%llu valueless=%llu "
+                            "cut_miss=%llu cut_mismatch=%llu refused[fold=%llu payout=%llu "
+                            "late=%llu] known=%llu owed_diverged=%llu\n",
+                            static_cast<unsigned long long>(ib.frames.load()),
+                            static_cast<unsigned long long>(ib.admitted.load()),
+                            static_cast<unsigned long long>(ib.echo.load()),
+                            static_cast<unsigned long long>(ib.wire_rejected.load()),
+                            static_cast<unsigned long long>(ib.policy_rejected.load()),
+                            static_cast<unsigned long long>(ib.admit_rejected.load()),
+                            static_cast<unsigned long long>(ib.cut_frames.load()),
+                            static_cast<unsigned long long>(ib.cut_offered.load()),
+                            static_cast<unsigned long long>(s1p.credited),
+                            static_cast<unsigned long long>(s1p.valueless),
+                            static_cast<unsigned long long>(s1p.cut_miss),
+                            static_cast<unsigned long long>(s1p.cut_mismatch),
+                            static_cast<unsigned long long>(s1p.refused_fold),
+                            static_cast<unsigned long long>(s1p.refused_payout),
+                            static_cast<unsigned long long>(s1p.refused_late),
+                            static_cast<unsigned long long>(s1p.already_known),
+                            static_cast<unsigned long long>(s1p.owed_diverged));
+            } else {
+                std::printf("  lane: NO CARRIER LAYER (--p2p-bind/--peer unset and no pool "
+                            "identity): shares do not reach the lane, so E_b folds to {} and "
+                            "owed_digest can never leave the empty anchor\n");
+            }
+        }
         std::printf("  %s\n", rx.describe().c_str());
         const std::string g = sink.last();
         if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
@@ -562,6 +692,10 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     drain_stratum_log();
     bridge_found();
     fc.drain_before_stop();
+    // The carrier layer comes down BEFORE the engine: its send worker and its
+    // per-peer reader threads both submit into V37Engine, and V37Engine::stop()
+    // drains-and-joins on the promise that nothing can still be producing.
+    if (hooks.carrier) hooks.carrier->stop();
     node.stop();
     status();
     if (hooks.status_extra) hooks.status_extra();
@@ -689,6 +823,11 @@ static int run_live(const XmrNodeConfig& cfg) {
             return 2;
         }
         node.set_native_chain_presence(chain_src.is_canonical);
+        // X2: the same native index answers "at what height is block X", which
+        // is what places a carrier's parent. Installed here, beside the presence
+        // test, so the share path and the settlement path cannot end up on two
+        // different chains.
+        node.set_native_chain_height(chain_src.height_of);
     }
     try {
         node.bring_up();
@@ -742,7 +881,12 @@ static int run_live(const XmrNodeConfig& cfg) {
     }
 
     // ── payee identity key (the address boundary's OUTPUT) ───────────────────
+    // ★ X2: the SAME keys are also the pool's carrier payout DESCRIPTOR. They
+    // have to be the same object: the lane credits E_b to identity_key(desc),
+    // and the FOUND/FINALIZE record is keyed by identity_key of these keys, so
+    // deriving them twice from two places is how those two keys would drift.
     std::optional<::v37::bytes32> payee_key;
+    std::optional<::v37::PayoutDescriptor> pool_desc;
     if (!cfg.payee_spend_key_hex.empty() || !cfg.payee_view_key_hex.empty()) {
         o2::PayeeKeys pk;
         if (!o2::hash_from_hex(cfg.payee_spend_key_hex, pk.spend) ||
@@ -759,11 +903,50 @@ static int run_live(const XmrNodeConfig& cfg) {
             node.stop();
             return 2;
         }
-        std::printf("payee: identity_key=%s… (amount-honest FOUND/FINALIZE records)\n",
+        ::v37::PayoutDescriptor d;
+        d.pay = pk.subaddress ? ::v37::xmr::make_xmr_sub(pk.spend, pk.view)
+                              : ::v37::xmr::make_xmr_std(pk.spend, pk.view);
+        if (!d.valid()) {
+            std::printf("REFUSED: the payee descriptor does not validate under the installed "
+                        "XMR canon validator — it could never be a lane identity, so the lane "
+                        "would accrue nothing\n");
+            node.stop();
+            return 2;
+        }
+        pool_desc = d;
+        std::printf("payee: identity_key=%s… (FOUND/FINALIZE records AND the X2 carrier "
+                    "identity — one key, not two)\n",
                     hex_of(*payee_key).substr(0, 16).c_str());
     } else {
-        std::printf("payee: no --payee-spend-hex/--payee-view-hex -> FOUND records are valueless "
-                    "{}/{} (the ledger still registers the block)\n");
+        std::printf("payee: no --payee-spend-hex/--payee-view-hex -> no lane payout identity: "
+                    "shares cannot be pushed, E_b folds to {} and owed_digest can never leave "
+                    "the empty anchor\n");
+    }
+
+    // ── ★ X2 / S-1c: stand the carrier layer up ─────────────────────────────
+    // AFTER bring_up (the engine runs and the lane is seeded, so the AddLane
+    // incarnation is readable) and BEFORE the listener starts. It is built
+    // whenever there is an identity to mint under: a single node still needs it
+    // for its OWN shares to reach its OWN lane (the send queue admits locally
+    // before it floods), and --p2p-bind/--peer are what add a second node.
+    std::unique_ptr<o2::XmrCarrierStack> carrier;
+    if (pool_desc) {
+        o2::XmrCarrierStack::Options co;
+        co.p2p_bind      = cfg.carrier_p2p_bind;
+        co.peers         = cfg.carrier_peers;
+        co.index_horizon = cfg.carrier_index_horizon;
+        co.pool_desc     = pool_desc;
+        carrier = std::make_unique<o2::XmrCarrierStack>(
+            node, cfg.lane_chain, co, [](bool warn, const std::string& l) {
+                std::printf("  %s%s\n", warn ? "WARN " : "", l.c_str());
+            });
+        if (const std::string why = carrier->start(fc); !why.empty()) {
+            std::printf("REFUSED: %s\n", why.c_str());
+            node.stop();
+            return 11;
+        }
+    } else {
+        std::printf("carrier: NOT built (no payout identity) — the lane will accrue no work\n");
     }
 
     // ── wire 2: RandomX runtime verify (init on main, BEFORE the listener) ───
@@ -813,13 +996,31 @@ static int run_live(const XmrNodeConfig& cfg) {
         // distinct K_fair OWED payee (the sink material with spend/view swapped —
         // still two valid ed25519 points, a different identity) so the assembled
         // coinbase carries an OWED output alongside the sink (multi-output proof).
-        o2::XmrOwedFixture ledger(cfg.lane_chain);
+        o2::XmrOwedFixture fixture(cfg.lane_chain);
         if (serving && cfg.owed_demo_amount) {
-            ledger.seed_owed_std(sink_A, sink_B, cfg.owed_demo_amount);
+            fixture.seed_owed_std(sink_A, sink_B, cfg.owed_demo_amount);
             std::printf("owed-demo: seeded %llu piconero owed to a distinct K_fair payee "
                         "(coinbase will carry OWED + residual sink)\n",
                         static_cast<unsigned long long>(cfg.owed_demo_amount));
         }
+
+        // ── ★ S-1b: WHICH OWED LEDGER THE COINBASE COMMITS TO ────────────────
+        // The option-B coinbase proposes K_fair over an OwedLedger and writes
+        // that ledger's owed_digest into tx_extra 0x03 as the merge-mining leaf.
+        // Before S-1b the only honest choice was the PROOF FIXTURE, because the
+        // node's real ledger netted every block to zero and its digest was the
+        // constant empty anchor — committing to it would have been committing to
+        // nothing. Now that the fold is live the coinbase commits to the REAL
+        // ledger, and the one case that still wants the fixture is the one that
+        // asks for it by name: --owed-demo-amount.
+        o2::XmrLiveOwedSource live(node.ledger());
+        if (pool_desc) live.learn(*pool_desc);
+        o2::IXmrOwedSource& ledger =
+            cfg.owed_demo_amount ? static_cast<o2::IXmrOwedSource&>(fixture)
+                                 : static_cast<o2::IXmrOwedSource&>(live);
+        std::printf("owed source: %s (tx_extra 0x03 MM leaf commits ITS owed_digest; known "
+                    "payout identities=%zu)\n",
+                    ledger.owed_source_name(), live.known_identities());
 
         // ── M2: WHICH miner-data source the assembler is fed from ───────────
         // Nothing below this block knows the difference. The assembler, the X6
@@ -892,6 +1093,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::uint64_t tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, tip_best = 0;
 
         ServeHooks hooks;
+        hooks.carrier      = carrier.get();
+        hooks.carrier_desc = pool_desc;
         if (p2p_first) {
             if (!native->node()->block_relay()) {
                 std::printf("REFUSED: the native node built no block relay (internal wiring bug)\n");
@@ -1070,8 +1273,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         out.reserved_size   = 0;
         return true;
     };
+    ServeHooks hooks_a;
+    hooks_a.carrier      = carrier.get();
+    hooks_a.carrier_desc = pool_desc;
     return serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
-                         "no --payout-address", provider, template_source, candidate);
+                         "no --payout-address", provider, template_source, candidate,
+                         std::move(hooks_a));
 }
 
 int main(int argc, char** argv) {
@@ -1158,6 +1365,12 @@ int main(int argc, char** argv) {
         else if (a == "--same-height-renotify") cfg.same_height_renotify =
                      static_cast<std::uint32_t>(std::stoul(next("3")));
         else if (a == "--same-height-journal") cfg.same_height_journal = next("");
+        // ★ X2 / S-1c: the carrier-relay p2p layer (mirrors --p2p-bind/--peer on
+        // the DASH daemon; same wire, same policy gate, same frozen frames).
+        else if (a == "--p2p-bind") cfg.carrier_p2p_bind = next("");
+        else if (a == "--peer") cfg.carrier_peers.push_back(next(""));
+        else if (a == "--carrier-index-horizon")
+            cfg.carrier_index_horizon = std::stoull(next("64"));
         else if (a == "--data-dir") cfg.settle_db_path = next("");
         else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
         else if (a == "--randomx") cfg.randomx_enabled = true;
@@ -1187,7 +1400,17 @@ int main(int argc, char** argv) {
                 "  --share-diff <n>             share (lane) difficulty; 0 = network (solo)\n"
                 "  --template-reserve <n>       get_block_template reserve_size (default 0)\n"
                 "  --payee-spend-hex <64hex> --payee-view-hex <64hex> [--payee-subaddress]\n"
-                "                               payout address keys -> amount-honest FOUND records\n"
+                "                               payout address keys. These are BOTH the ledger\n"
+                "                               key the FOUND/FINALIZE records use AND the v37\n"
+                "                               payout identity every accepted share is minted\n"
+                "                               under (X2). Without them the lane accrues no\n"
+                "                               work and owed_digest stays at the empty anchor.\n"
+                " X2 / S-1c — the carrier-relay p2p layer (shares -> lane, fold -> peers):\n"
+                "  --p2p-bind <HOST:PORT>       carrier-relay listen address (empty = no bind)\n"
+                "  --peer <HOST:PORT>           dial a carrier-relay peer (repeatable)\n"
+                "  --carrier-index-horizon <n>  how far below the chain tip a carrier's parent\n"
+                "                               block may sit (default 64; 0 = no bound, for a\n"
+                "                               regtest chain shorter than the window only)\n"
                 " option B (X9): the v37 K_fair SETTLEMENT coinbase (not monerod's template):\n"
                 "  --coinbase <monerod|v37>     monerod (default, option A) | v37 (option B)\n"
                 "  --residual-sink-spend-hex <64hex> --residual-sink-view-hex <64hex>\n"

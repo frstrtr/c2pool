@@ -29,11 +29,29 @@
 //       submit_block returned "OK"; the main loop drains it in tick().
 //       Replaces the WIP FoundEvent/FoundQueue (xmr_o2_serve.hpp:338-358),
 //       which carried only a height.
-//   (2) Amount-honest credit/payout for the option-A (monerod-template) block:
-//       credit == payout == { identity_key(payout XMR_STD ref) : reward }, so
-//       finalW nets to 0 at FINALIZE and the FOUND/FINALIZE audit trail carries
-//       the real amount. Without a payee key the degenerate {}/{} record is
-//       used (the ledger still bumps; the block is recorded as valueless).
+//   (2) ★ S-1b — THE E_b FOLD. This step USED to register
+//         credit == payout == { identity_key(payout ref) : reward },
+//       which made FINALIZE do finalW += credit; finalW -= payout and net
+//       EXACTLY to zero: owed_digest never left the empty sha256d("V37O")
+//       anchor b4db1ded… and the option-B tx_extra 0x03 merge-mining leaf was a
+//       constant. It now folds the real ENTITLEMENT out of the lane cut the
+//       engine has published — settle::fold_eb (xmr_s1_fold.hpp), the SAME
+//       single credit-path entry point XbtcNode::on_block_won uses — and
+//       registers credit = E_b with an EMPTY payout, because a freshly found
+//       Monero block broadcasts no settled-owed output keyed to a lane identity
+//       (option A pays monerod's own --payout-address; option B's K_fair
+//       coinbase is assembled before burial). The whole entitlement therefore
+//       carries forward as owed, and that carry is what owed_digest commits to.
+//       Refuse-LOUD, register anyway: a block we mined is a real block, so a
+//       no-view / non-ratified-geometry / reward==0 / empty-E_b fold is stamped
+//       VALUELESS, counted and narrated — and still registered.
+//   (2b) ★ S-1c — A PEER'S WIN. offer_peer_win() takes the flat cut descriptor
+//       a peer's block-winning carrier carried (wire v0x02) and re-runs the
+//       SAME fold at the WINNER'S prefix, read back out of OUR own settlement
+//       ring, then drives OUR ledger through the EXISTING on_block_found /
+//       on_block_finalized API. Without it a peer accounts the block-winning
+//       carrier as an ordinary share, never credits E_b, and the two nodes
+//       commit to different owed ledgers while both look healthy.
 //   (3) The LATE-FOUND guard: XmrFinalizeDriver::advance_to_tip steps only
 //       heights ABOVE its cursor (:155). A FOUND registered at a height the
 //       cursor already passed would sit pending FOREVER (its payout deducted
@@ -87,9 +105,11 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -102,6 +122,7 @@
 #include "impl/xmr/node/xmr_node_types.hpp"        // c2pool::xmr::node::Hash
 #include "xmr_node.hpp"                            // XmrNode, hex_of, Amounts (via xmr_settle_store.hpp)
 #include "xmr_node_config.hpp"                     // XmrNodeConfig, MoneroNetwork
+#include "xmr_s1_fold.hpp"                         // ★ S-1b: fold_at_tip / fold_at_peer_cut (settle::fold_eb)
 #include "xmr_same_height_race.hpp"                // SameHeightRaceLedger (c2pool#1551)
 
 namespace c2pool::v37n::xmr::o2 {
@@ -236,11 +257,19 @@ public:
         std::uint64_t reward = 0;
         std::string   prev_id_hex;
         std::uint64_t found_unix_s = 0;
+        // ★ S-1b: the CUT this win's E_b fold read at. Persisted (sidecar v2) so
+        // a restart inside the D_conf window re-drives the FOUND at the SAME
+        // prefix rather than re-folding at whatever the lane has become since —
+        // which would credit a different E_b for the same block.
+        std::uint64_t  cut_next_pos = 0;
+        ::v37::bytes32 cut_spine_digest{};
+        bool           cut_folded = false;
     };
     struct RegisterResult {
         bool        registered = false;
         bool        duplicate  = false;   // already pending here (idempotent)
         std::string reason;               // set when !registered
+        XmrEbCut    cut;                  // ★ S-1b: the fold this win credited
     };
     struct BootReport {
         bool        sidecar_present = false;
@@ -249,9 +278,17 @@ public:
         std::size_t stale_dropped = 0;   // already SETTLED / already stepped past
         std::size_t unrecoverable = 0;   // ledger-pending but height <= cursor: will never be stepped
         std::size_t malformed     = 0;
+        // ★ S-1b: sidecar records RE-REGISTERED after a crash that lost the FOUND
+        // write-ahead. Their E_b cannot be reproduced — the fresh engine has an
+        // empty settlement ring, so the winner's prefix P is not retained — so
+        // the block is registered with an EMPTY credit and this counter is the
+        // only honest account of the entitlement that was lost.
+        std::size_t eb_irrecoverable = 0;
     };
     struct TickReport {
         std::size_t drained = 0, registered = 0, refused = 0, settled = 0, orphaned = 0;
+        // ★ S-1c
+        std::size_t peer_drained = 0, peer_credited = 0, peer_refused = 0, peer_deferred = 0;
     };
     struct Stats {
         std::uint64_t registered = 0, refused = 0, late_refused = 0, settled = 0,
@@ -344,8 +381,30 @@ public:
             // `pending` == false: the sidecar was written but the crash hit before
             // the FOUND write-ahead -> this IS the registration (monerod had
             // accepted the block before the sidecar was written).
-            Amounts credit = amounts_from(rec.payee, rec.reward, nullptr);
-            Amounts payout = credit;
+            //
+            // ★ S-1b: the credit passed here is IGNORED in the `pending` case —
+            // OwedLedger::on_block_found is idempotent per bid and the ledger
+            // already holds the E_b the original fold produced (RecoveryDriver
+            // replayed the FOUND from the store). In the `!pending` case it is
+            // NOT ignored, and it cannot be reproduced: this process has a fresh
+            // engine whose settlement ring does not retain the winner's prefix P,
+            // and folding at the current (empty) lane instead would credit a
+            // DIFFERENT number for the same block. So the block is registered
+            // with an EMPTY credit — its record exists, the F1 driver can still
+            // settle or dispose it — and the lost entitlement is counted and
+            // named rather than papered over with a plausible figure.
+            Amounts credit;   // see above: never re-folded at a foreign cut
+            Amounts payout;
+            if (!pending) {
+                ++rep.eb_irrecoverable;
+                say("boot: E_b IRRECOVERABLE for RE-REGISTERED " + short_bid(bid) + " h=" +
+                    std::to_string(rec.height) + " (cut P=" + std::to_string(rec.cut_next_pos) +
+                    (rec.cut_folded ? " spine=" + hex_of(rec.cut_spine_digest)
+                                    : " [sidecar v1: no cut recorded]") +
+                    ") — this process's settlement ring does not retain that prefix, so the "
+                    "block is registered with an EMPTY credit: its entitlement is LOST and the "
+                    "owed ledger is short by exactly that block's E_b");
+            }
             const bool ok = m_node.on_network_block_won(rec.height, id, credit, payout);
             if (!ok || !m_node.ledger().is_pending(bid)) {
                 ++rep.stale_dropped;
@@ -378,6 +437,9 @@ public:
             if (r.registered && !r.duplicate) ++t.registered;
             else if (!r.registered)            ++t.refused;
         }
+        drain_peer_wins(t);                    // ★ S-1c, BEFORE reconcile so a peer
+                                               // FOUND registered this tick can still
+                                               // be settled by it at maturity
         reconcile(t);
         race_gate(t);                          // c2pool#1551 -- after reconcile, so a
                                                // credit the driver just took is already
@@ -467,9 +529,21 @@ public:
                                   "drain the found queue BEFORE pump_poll / lower --poll-ms");
         }
 
-        std::string why_valueless;
-        Amounts credit = amounts_from(ev.payee, ev.reward_piconero, &why_valueless);
-        Amounts payout = credit;
+        // ── ★ S-1b: THE FOLD ────────────────────────────────────────────────
+        // credit = E_b, folded out of the lane cut the engine has published
+        // RIGHT NOW through settle::fold_eb. payout = {} — see the payout-leg
+        // note at the top of xmr_s1_fold.hpp: a freshly found XMR block
+        // broadcasts no settled-owed output keyed to a lane identity, so the
+        // entitlement carries forward whole and owed_digest commits to it.
+        // Registering credit == payout is the defect this replaces.
+        XmrEbCut cut = fold_at_tip(m_node.engine(), m_cfg.lane_chain,
+                                   ev.reward_piconero, m_s1);
+        m_last_cut = cut;
+        say(describe_cut("FOUND", bid, ev.height, cut));
+        if (!cut.refusal.empty())
+            say("S-1 fold gave " + short_bid(bid) + " NO CREDIT: " + cut.refusal);
+        Amounts credit = cut.credit;
+        Amounts payout;   // EMPTY by construction — never `= credit`
 
         PendingRec rec;
         rec.height = ev.height;
@@ -477,6 +551,9 @@ public:
         rec.reward = ev.reward_piconero;
         rec.prev_id_hex = lower_hex(ev.prev_id_hex);
         rec.found_unix_s = ev.found_unix_s;
+        rec.cut_next_pos     = cut.next_pos;
+        rec.cut_spine_digest = cut.lane_digest;
+        rec.cut_folded       = cut.folded;
 
         // write-ahead the sidecar, then the FOUND event (inside on_network_block_won)
         m_pending[bid] = rec;
@@ -507,34 +584,217 @@ public:
         say("FOUND registered " + short_bid(bid) + " h=" + std::to_string(ev.height) +
             " reward=" + std::to_string(ev.reward_piconero) + " piconero payee=" +
             (ev.payee ? hex_of(*ev.payee).substr(0, 12) + "…" : std::string("-")) +
-            (why_valueless.empty() ? "" : " [VALUELESS record: " + why_valueless + "]") +
+            " E_b=" + std::to_string(credit.size()) + " keys" +
+            (cut.valueless ? " [VALUELESS record]" : "") +
             (ev.worker.empty() ? "" : " worker=" + ev.worker) +
             " tid=" + std::to_string(ev.template_id) + " nonce=" + std::to_string(ev.nonce) +
+            " owed_digest=" + hex_of(m_node.ledger().owed_digest()) +
             " -> finalizes when hw >= " + std::to_string(ev.height + m_cfg.d_conf) +
             " (D_conf=" + std::to_string(m_cfg.d_conf) + ")");
         r.registered = true;
+        r.cut = cut;
+        note_own_win(bid);                       // S-1c: the double-drive guard
+        if (m_on_registered) m_on_registered(bid, rec, cut);
         return r;
     }
 
-    // credit == payout == { payee : reward } (amount-honest, nets to 0 at
-    // FINALIZE); {} when no payee / zero reward (the degenerate valueless record).
-    static Amounts amounts_from(const std::optional<::v37::bytes32>& payee, std::uint64_t reward,
-                                std::string* why_valueless) {
-        Amounts a;
-        auto because = [&](const char* s) { if (why_valueless) *why_valueless = s; };
-        if (!payee)   { because("no payee identity key (address boundary not decoded)"); return a; }
-        if (reward == 0) { because("zero reward"); return a; }
-        if (reward > static_cast<std::uint64_t>(LLONG_MAX)) { because("reward exceeds long long"); return a; }
-        a[*payee] = static_cast<long long>(reward);
-        return a;
+    // ── ★ S-1c: a PEER's block win, offered from ANY thread ─────────────────
+    //
+    // The carrier reader thread learns of a peer's win when an ADMITTED carrier
+    // carries a v0x02 cut descriptor. FinalizeConnect, the node, the driver and
+    // the ledger are all MAIN-THREAD-ONLY, so the win is queued here and drained
+    // in tick(). That queue is also what gives the CUT-MISS retry its shape:
+    // CarrierIngest's admit is fire-and-forget into the engine's MPSC mailbox,
+    // so the winner's prefix P may not be published HERE for a few milliseconds
+    // after the carrier that produced it was admitted. A bounded number of ticks
+    // is spent waiting for that publication before the win is refused — and the
+    // refusal still happens, because an executor that COALESCED through P never
+    // publishes it at all and no amount of waiting will conjure it.
+    void offer_peer_win(const XmrPeerWin& w) {
+        if (w.bid.size() != 64 || w.h_b == 0) return;
+        std::lock_guard<std::mutex> lk(m_peer_mtx);
+        m_peer_q.push_back(PeerPending{w, 0});
+    }
+
+    // Our own wins, by bid: a descriptor for a block WE mined comes back on the
+    // flood and must never be re-driven (we credited it at the win). Registered
+    // automatically for every own FOUND; exposed so the daemon can also mark a
+    // win it registered by some other route.
+    void note_own_win(const std::string& bid) {
+        std::lock_guard<std::mutex> lk(m_peer_mtx);
+        m_own_wins.insert(lower_hex(bid));
     }
 
     // ── read seams (main thread) ────────────────────────────────────────────
     const std::map<std::string, PendingRec>& pending()       const { return m_pending; }
     const std::map<std::string, PendingRec>& unrecoverable() const { return m_unrecoverable; }
     const Stats& stats() const { return m_stats; }
+    // ★ S-1b/S-1c diagnostics: the fold counters and the last cuts folded at.
+    const XmrS1FoldStats& s1_stats()      const { return m_s1; }
+    const XmrS1PeerStats& s1c_stats()     const { return m_s1p; }
+    const XmrEbCut&       last_cut()      const { return m_last_cut; }
+    const XmrEbCut&       last_peer_cut() const { return m_last_peer_cut; }
+    ::v37::bytes32        owed_digest()   const { return m_node.ledger().owed_digest(); }
+
+    // Called on the MAIN thread right after an own FOUND is registered, with the
+    // cut its fold read at. The daemon binds this to mint the BLOCK-WINNING
+    // carrier that NAMES this fold to its peers (wire v0x02). It is a callback
+    // rather than a return value because the win arrives asynchronously, on the
+    // found queue, and the carrier must not be minted before the fold exists.
+    using OnRegisteredFoundFn =
+        std::function<void(const std::string& bid, const PendingRec& rec, const XmrEbCut& cut)>;
+    void set_on_registered_found(OnRegisteredFoundFn f) { m_on_registered = std::move(f); }
 
 private:
+    // ── ★ S-1c: drain the peer-win queue on the MAIN thread ─────────────────
+    //
+    // REFUSE, DO NOT GUESS. Unlike an own win — where the FOUND must be
+    // registered even if the fold gives nothing, because the block is real and
+    // the F1 driver has to be able to settle or dispose it — every failure here
+    // refuses the registration outright and says why. Crediting a peer's block
+    // with a number we invented is exactly the divergence this path exists to
+    // remove.
+    void drain_peer_wins(TickReport& t) {
+        std::deque<PeerPending> batch;
+        {
+            std::lock_guard<std::mutex> lk(m_peer_mtx);
+            batch.swap(m_peer_q);
+        }
+        t.peer_drained = batch.size();
+        std::deque<PeerPending> keep;
+
+        for (PeerPending& pw : batch) {
+            const XmrPeerWin& w = pw.win;
+            const std::string bid = lower_hex(w.bid);
+            const bool first_look = (pw.attempts == 0);
+            if (first_look) ++m_s1p.seen;
+
+            // (a) ours, or a duplicate descriptor. The flood echoes our own
+            //     block-winning carrier straight back at us; re-driving it would
+            //     double-register a block we credited at the win.
+            {
+                bool mine = false;
+                { std::lock_guard<std::mutex> lk(m_peer_mtx); mine = m_own_wins.count(bid) != 0; }
+                if (mine || m_pending.count(bid) || m_node.ledger().is_pending(bid) ||
+                    m_node.ledger().is_settled(bid)) {
+                    if (first_look) {
+                        ++m_s1p.already_known;
+                        say("S-1c: descriptor for a block we already hold (" + short_bid(bid) +
+                            (mine ? ", OUR OWN win" : "") + ") — not re-driven");
+                    }
+                    continue;
+                }
+            }
+            // (b) the winner had already broadcast owed outputs. Its payout map
+            //     is not on the wire and we cannot reproduce it: fail closed.
+            if (w.payout_emitted) {
+                ++m_s1p.refused_payout;
+                ++t.peer_refused;
+                say("S-1c REFUSED " + short_bid(bid) + ": the winner's coinbase had already "
+                    "EMITTED owed outputs and the payout map is not on the wire — we credit "
+                    "nothing rather than credit something different");
+                continue;
+            }
+            // (c) too late: advance_to_tip steps only heights ABOVE the cursor,
+            //     so the FOUND would sit pending forever.
+            const std::uint64_t cursor = m_node.finalize_driver().cursor_height();
+            if (w.h_b <= cursor) {
+                ++m_s1p.refused_late;
+                ++t.peer_refused;
+                say("S-1c REFUSED " + short_bid(bid) + ": H_b=" + std::to_string(w.h_b) +
+                    " is at or below our finalize cursor (" + std::to_string(cursor) +
+                    ") — this block can never be stepped at maturity here");
+                continue;
+            }
+            // (d) the VERIFY field: did our owed commitment agree with the
+            //     winner's at the instant of the win? A mismatch is a REPORT,
+            //     not a refusal — it says the two nodes had ALREADY diverged
+            //     before this block, which is the earliest point that is visible.
+            if (first_look) {
+                const ::v37::bytes32 here = m_node.ledger().owed_digest();
+                if (!(here == w.owed_digest_at_win)) {
+                    ++m_s1p.owed_diverged;
+                    say("S-1c VERIFY MISMATCH on " + short_bid(bid) + ": winner's owed_digest at "
+                        "the win " + hex_of(w.owed_digest_at_win) + " != ours at receipt " +
+                        hex_of(here) + " — these two nodes had ALREADY diverged before this "
+                        "block (a report, not a refusal: the fold below still runs)");
+                }
+            }
+
+            // (e) THE CUT RULE: fold at the WINNER'S prefix, out of OUR ring.
+            XmrPeerFoldOutcome f =
+                fold_at_peer_cut(m_node.engine(), m_cfg.lane_chain, w, m_s1p);
+            if (!f.ok) {
+                // A cut MISS can be a race: CarrierIngest's admit is
+                // fire-and-forget into the engine's MPSC mailbox, so the prefix
+                // the winner named may be published here a few milliseconds from
+                // now. Give it a bounded number of ticks, then refuse. A DIGEST
+                // MISMATCH is never a race and is refused immediately.
+                if (f.cut_miss && pw.attempts + 1 < kPeerCutRetryTicks) {
+                    --m_s1p.cut_miss;              // not a verdict yet
+                    ++pw.attempts;
+                    ++t.peer_deferred;
+                    keep.push_back(pw);
+                    continue;
+                }
+                ++t.peer_refused;
+                m_last_peer_cut = f.cut;
+                say("S-1c REFUSED " + short_bid(bid) + " h=" + std::to_string(w.h_b) + ": " +
+                    f.cut.refusal + " — our owed_digest will NOT converge with the winner's "
+                    "for this block");
+                continue;
+            }
+
+            m_last_peer_cut = f.cut;
+            Amounts credit = f.cut.credit;
+            Amounts payout;   // mirrors the own-win leg: EMPTY by construction
+
+            c2pool::xmr::node::Hash id{};
+            if (!hash_from_hex(bid, id) || c2pool::xmr::node::is_zero(id)) {
+                ++t.peer_refused;
+                say("S-1c REFUSED " + short_bid(bid) + ": malformed block id on the wire");
+                continue;
+            }
+            if (!m_node.on_network_block_won(w.h_b, id, credit, payout) ||
+                !m_node.ledger().is_pending(bid)) {
+                ++t.peer_refused;
+                say("S-1c REFUSED " + short_bid(bid) + ": the node/ledger did not admit the FOUND");
+                continue;
+            }
+            PendingRec rec;
+            rec.height           = w.h_b;
+            rec.reward           = w.reward;
+            rec.cut_next_pos     = w.cut_next_pos;
+            rec.cut_spine_digest = w.cut_spine_digest;
+            rec.cut_folded       = f.cut.folded;
+            m_pending[bid] = rec;
+            (void)sidecar_flush();
+            ++m_stats.registered;
+            // observe_OWN, deliberately. The same-height book's "own" means "a
+            // block THIS LEDGER will credit", not "a block this process mined":
+            // it exists to stop an orphan-credit and a double-credit, and after
+            // S-1c a peer's block is credited here exactly as our own is. Filing
+            // it as "other" would make the gate declare an R-7 violation against
+            // the finalize driver every time a peer's block matured — the gate
+            // and the driver disagreeing about a settlement that is correct.
+            m_race.observe_own(w.h_b, bid);
+            if (f.cut.valueless) ++m_s1p.valueless; else ++m_s1p.credited;
+            ++t.peer_credited;
+            say(describe_cut("PEER WIN", bid, w.h_b, f.cut));
+            say("S-1c PEER FOUND registered " + short_bid(bid) + " h=" + std::to_string(w.h_b) +
+                " E_b=" + std::to_string(credit.size()) + " keys at the winner's cut P=" +
+                std::to_string(w.cut_next_pos) + " (our lane version " +
+                std::to_string(f.cut.lane_version) + ") owed_digest=" +
+                hex_of(m_node.ledger().owed_digest()) + " -> finalizes when hw >= " +
+                std::to_string(w.h_b + m_cfg.d_conf));
+        }
+
+        if (!keep.empty()) {
+            std::lock_guard<std::mutex> lk(m_peer_mtx);
+            for (auto& p : keep) m_peer_q.push_back(std::move(p));
+        }
+    }
+
     RegisterResult& refuse(RegisterResult& r, const std::string& bid, std::string reason) {
         ++m_stats.refused;
         r.registered = false;
@@ -720,12 +980,20 @@ private:
     // ── sidecar codec: one record per line, space-separated, no escaping needed
     //    (bids/keys are hex; '-' = absent):
     //    1 <bid64> <height> <payee64|-> <reward> <prev64|-> <found_unix_s>
+    //    2 <bid64> <height> <payee64|-> <reward> <prev64|-> <found_unix_s>
+    //      <cut_next_pos> <cut_spine64|-> <folded 0|1>       ★ S-1b
+    // Version 1 is still PARSED (a store written by a pre-S-1b run reseeds), and
+    // reads back with cut_folded == false — which the re-drive reports rather
+    // than silently re-folding at a prefix that is no longer the win's.
     static std::string sidecar_line(const std::string& bid, const PendingRec& r) {
-        std::string s = "1 " + bid + " " + std::to_string(r.height) + " " +
+        std::string s = "2 " + bid + " " + std::to_string(r.height) + " " +
                         (r.payee ? hex_of(*r.payee) : std::string("-")) + " " +
                         std::to_string(r.reward) + " " +
                         (r.prev_id_hex.size() == 64 ? r.prev_id_hex : std::string("-")) + " " +
-                        std::to_string(r.found_unix_s) + "\n";
+                        std::to_string(r.found_unix_s) + " " +
+                        std::to_string(r.cut_next_pos) + " " +
+                        (r.cut_folded ? hex_of(r.cut_spine_digest) : std::string("-")) + " " +
+                        (r.cut_folded ? "1" : "0") + "\n";
         return s;
     }
     static bool parse_sidecar_line(const std::string& line, std::string& bid, PendingRec& r) {
@@ -733,7 +1001,7 @@ private:
         std::string ver, payee, prev;
         unsigned long long h = 0, reward = 0, ts = 0;
         if (!(is >> ver >> bid >> h >> payee >> reward >> prev >> ts)) return false;
-        if (ver != "1") return false;
+        if (ver != "1" && ver != "2") return false;
         std::array<std::uint8_t, 32> tmp{};
         bid = lower_hex(bid);
         if (!hash_from_hex(bid, tmp)) return false;
@@ -751,6 +1019,20 @@ private:
             prev = lower_hex(prev);
             if (!hash_from_hex(prev, tmp)) return false;
             r.prev_id_hex = prev;
+        }
+        if (ver == "2") {
+            unsigned long long p = 0, folded = 0;
+            std::string spine;
+            if (!(is >> p >> spine >> folded)) return false;
+            r.cut_next_pos = p;
+            r.cut_folded   = (folded != 0);
+            if (spine != "-") {
+                ::v37::bytes32 d{};
+                if (!hash_from_hex(lower_hex(spine), d)) return false;
+                r.cut_spine_digest = d;
+            } else if (r.cut_folded) {
+                return false;   // "folded" without a commitment is not a cut
+            }
         }
         return true;
     }
@@ -800,6 +1082,23 @@ private:
     // quiet loop stays quiet and the journal records transitions, not ticks).
     SameHeightRaceLedger                    m_race;
     std::map<std::uint64_t, RaceVerdict>    m_last_verdict;
+
+    // ── ★ S-1b / S-1c state ────────────────────────────────────────────────
+    // How many ticks a cut MISS is given before it becomes a refusal. At the
+    // daemon's default --poll-ms this is a couple of seconds, which covers the
+    // engine's MPSC publication latency by orders of magnitude and still ends.
+    static constexpr unsigned kPeerCutRetryTicks = 20;
+    struct PeerPending { XmrPeerWin win; unsigned attempts = 0; };
+
+    XmrS1FoldStats m_s1;             // own-win fold counters
+    XmrS1PeerStats m_s1p;            // receive-side counters
+    XmrEbCut       m_last_cut;       // the cut the last own win folded at
+    XmrEbCut       m_last_peer_cut;  // the cut the last peer win folded at
+    OnRegisteredFoundFn m_on_registered;
+
+    mutable std::mutex       m_peer_mtx;   // guards the two members below
+    std::deque<PeerPending>  m_peer_q;     // offered from the carrier reader thread
+    std::set<std::string>    m_own_wins;   // the double-drive guard
 };
 
 } // namespace c2pool::v37n::xmr::o2
@@ -807,10 +1106,12 @@ private:
 // ===========================================================================
 // SELF-CHECK — network-free, RandomX-free, against the monerod STUB; the same
 // shape as xmr_node_smoke.hpp so it can run under `--mock-smoke` / the CI
-// smoke target. Proves: queued win -> FOUND (amount-honest) -> restart inside
-// the D_conf window -> sidecar re-drive -> FINALIZE at bin_height = H_b+D_conf
-// -> finalW nets to 0 -> sidecar retired; plus the late-FOUND and malformed
-// refusals, the valueless record, idempotence, and the orphan disposition.
+// smoke target. Proves: lane work pushed -> queued win -> FOUND credits the
+// FOLDED E_b -> restart inside the D_conf window -> sidecar re-drive -> FINALIZE
+// at bin_height = H_b+D_conf -> ★ owed_digest LEAVES the empty anchor and
+// effective_owed carries the whole entitlement -> sidecar retired; plus the
+// late-FOUND and malformed refusals, the EMPTY-lane refusal (the X2 tripwire),
+// idempotence, and the orphan disposition.
 // ===========================================================================
 #include "xmr_node_smoke.hpp"   // smoke::Report, apply_row, blk_id, key_of, test_point_check
 #include "impl/xmr/node/monerod_transport.hpp"   // MockMonerodTransport
@@ -852,6 +1153,30 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
                              smoke::blk_id(static_cast<std::uint8_t>(h - 1)));
     };
 
+    // ── ★ X2 stand-in: put WORK in the lane ─────────────────────────────────
+    // The daemon gets here through XmrLaneShareSink -> CarrierSendQueue ->
+    // CarrierRelay -> CarrierIngest, which ends in exactly this call —
+    // V37Engine::submit(LaneRecord::push(...)), the ONE producer seam. The smoke
+    // drives that seam directly so it stays network-free and crypto-free while
+    // still folding over a lane that has real weight. A P2PKH descriptor is used
+    // rather than an XMR one precisely so this check needs no ed25519 backend;
+    // the identity KIND is irrelevant to the fold, which reads weights and keys.
+    ::v37::PayoutDescriptor lane_desc;
+    {
+        ::v37::ScriptRef r;
+        r.kind = ::v37::ScriptKind::P2PKH;
+        r.payload.assign(20, 0x5A);
+        lane_desc.pay = r;
+    }
+    const ::v37::bytes32 lane_key = lane_desc.identity_key();
+    auto seed_lane = [&](XmrNode& node, std::uint64_t w) {
+        return node.engine()
+            .submit_tracked(::v37::LaneRecord::push(CHAIN, lane_desc, w, 0))
+            .get()
+            .applied();
+    };
+    const ::v37::bytes32 empty_anchor = OwedLedger(CHAIN).owed_digest();
+
     // ── phase 1: node A — win at 5, buried 2 (< D_conf), then "crash" ────────
     {
         MockMonerodTransport mock;
@@ -865,6 +1190,10 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         rep.add("FC1 fresh boot: no sidecar, nothing reseeded",
                 !boot.sidecar_present && boot.reseeded == 0 && boot.reregistered == 0);
 
+        // X2: put real work in the lane (what the share sink does live).
+        const bool seeded = seed_lane(node, 1000) && seed_lane(node, 3000);
+        rep.add("FC1d lane accrued work through the ONE producer seam (X2 stand-in)", seeded);
+
         FoundBlockEvent ev;
         ev.height = 5; ev.block_id_hex = bid5; ev.prev_id_hex = hex_of(smoke::blk_id(4));
         ev.reward_piconero = REWARD; ev.payee = payee; ev.worker = "rig0"; ev.template_id = 42;
@@ -874,10 +1203,24 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
                 t.drained == 2 && t.registered == 1 && t.refused == 0 &&
                 fc.pending().size() == 1 && node.ledger().is_pending(bid5),
                 "drained=" + std::to_string(t.drained) + " registered=" + std::to_string(t.registered));
-        rep.add("FC3 amount-honest: effective_owed(payee) == -reward while pending",
-                node.ledger().effective_owed(payee) == -static_cast<long long>(REWARD));
-        rep.add("FC4 pending-FOUND sidecar written (write-ahead, 1 record)",
-                count_lines(o.sidecar_path) == 1);
+        rep.add("FC3 ★ S-1b: the win credited the FOLDED E_b (non-empty, lane-keyed) and did "
+                "NOT net credit against payout",
+                fc.last_cut().folded && !fc.last_cut().valueless &&
+                fc.last_cut().credit.size() == 1 &&
+                fc.last_cut().credit.count(lane_key) == 1 &&
+                fc.last_cut().credit.at(lane_key) == static_cast<long long>(REWARD) &&
+                fc.s1_stats().folds == 1,
+                "E_b keys=" + std::to_string(fc.last_cut().credit.size()) +
+                " raw_total=" + std::to_string(fc.last_cut().raw_total));
+        rep.add("FC3b payout is EMPTY, so effective_owed is untouched while pending "
+                "(the pre-S-1b code deducted the whole reward here)",
+                node.ledger().effective_owed(lane_key) == 0 &&
+                node.ledger().effective_owed(payee) == 0);
+        rep.add("FC4 pending-FOUND sidecar written (write-ahead, 1 record) and it carries the "
+                "CUT (v2), so a re-drive cannot re-fold at a foreign prefix",
+                count_lines(o.sidecar_path) == 1 && fc.pending().count(bid5) &&
+                fc.pending().at(bid5).cut_folded &&
+                fc.pending().at(bid5).cut_spine_digest == fc.last_cut().lane_digest);
 
         chain(node, 6, 7);                            // hw=7 < 5+3
         t = fc.tick();
@@ -932,29 +1275,55 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         rep.add("FC9 FOUND -> FINALIZE at D_conf burial after restart (bin_height = 5+3 = 8)",
                 t.settled == 1 && node.ledger().is_settled(bid5) && fc.pending().empty(),
                 "settled=" + std::to_string(t.settled));
-        rep.add("FC10 finalW nets to 0 for the payee (credit == payout)",
-                node.ledger().effective_owed(payee) == 0);
+        // ★★ THE S-1b CLAIM. Pre-S-1b this read `effective_owed == 0` because
+        // credit and payout were the same map and FINALIZE netted them to zero.
+        rep.add("FC10 ★ S-1b: FINALIZE carried the whole entitlement into finalW — the pool "
+                "now OWES its lane payee the block reward (pre-S-1b this netted to 0)",
+                node.ledger().effective_owed(lane_key) == static_cast<long long>(REWARD),
+                "effective_owed(lane_key)=" +
+                    std::to_string(node.ledger().effective_owed(lane_key)));
+        rep.add("FC10b ★ S-1b: owed_digest LEFT the empty sha256d(\"V37O\") anchor",
+                !(node.ledger().owed_digest() == empty_anchor),
+                "owed=" + hex_of(node.ledger().owed_digest()) +
+                    " anchor=" + hex_of(empty_anchor));
         rep.add("FC11 sidecar retired after FINALIZE", count_lines(o.sidecar_path) == 0);
         bool logged = false;
         for (const auto& l : node.construction_log())
             if (l.find("SETTLED at bin_height=8") != std::string::npos) logged = true;
         rep.add("FC12 the node logged the FINALIZE step with the per-height bin_height (echoed by tick)", logged);
 
-        // valueless win (no payee decoded) still records the block
+        // ── ★ S-1b tripwire: a win over an EMPTY lane refuses LOUDLY ────────
+        // This process's engine is fresh, so its lane carries no work yet: the
+        // exact shape the pre-X2 daemon was in permanently. The win must still
+        // be REGISTERED (a block we mined is a real block) but stamped VALUELESS
+        // with a reason that names the cause, rather than booking a plausible
+        // number.
+        const ::v37::bytes32 owed_before_dry = node.ledger().owed_digest();
         FoundBlockEvent v; v.height = 8; v.block_id_hex = bid8;
+        v.reward_piconero = REWARD; v.payee = payee;
         q.push(v);
         t = fc.tick();
-        rep.add("FC13 valueless win (no payee) still registers (degenerate {}/{})",
-                t.registered == 1 && node.ledger().is_pending(bid8));
+        rep.add("FC13 ★ EMPTY lane: the win REGISTERS but is VALUELESS and says why "
+                "(E_b is EMPTY — no share reached the lane)",
+                t.registered == 1 && node.ledger().is_pending(bid8) &&
+                fc.last_cut().valueless && fc.last_cut().credit.empty() &&
+                fc.last_cut().refusal.find("E_b is EMPTY") != std::string::npos,
+                "refusal=" + fc.last_cut().refusal);
         chain(node, 9, 11);
         t = fc.tick();
-        rep.add("FC14 valueless win finalizes at 8+3=11", t.settled == 1 && node.ledger().is_settled(bid8));
+        rep.add("FC14 the valueless win finalizes at 8+3=11 and moves owed_digest NOT AT ALL "
+                "(crediting nobody is a real answer, not a silent one)",
+                t.settled == 1 && node.ledger().is_settled(bid8) &&
+                node.ledger().owed_digest() == owed_before_dry);
 
-        // orphan disposition: win at 11, then a competing 11 wins the chain
+        // orphan disposition: work in the lane, win at 11, competing 11 wins
+        (void)seed_lane(node, 4096);
+        const ::v37::bytes32 owed_before_orphan = node.ledger().owed_digest();
         FoundBlockEvent w; w.height = 11; w.block_id_hex = bid11; w.payee = payee; w.reward_piconero = REWARD;
         q.push(w);
         t = fc.tick();
-        const bool reg11 = t.registered == 1 && node.ledger().is_pending(bid11);
+        const bool reg11 = t.registered == 1 && node.ledger().is_pending(bid11) &&
+                           !fc.last_cut().credit.empty();
         smoke::apply_row(node, 11, smoke::blk_id(99), smoke::blk_id(10));   // reorg at 11
         chain(node, 12, 14);                          // bury the competitor: 11+3 = 14
         t = fc.tick();
@@ -963,8 +1332,9 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
                 reg11 && !node.ledger().is_pending(bid11) && !node.ledger().is_settled(bid11) &&
                 fc.pending().empty() && count_lines(o.sidecar_path) == 0 && fc.stats().orphaned == 1,
                 "orphaned=" + std::to_string(fc.stats().orphaned));
-        rep.add("FC16 orphan: payee's effective_owed back to 0 (pure pending removal)",
-                node.ledger().effective_owed(payee) == 0);
+        rep.add("FC16 orphan: the folded E_b NEVER reached finalW — owed_digest is byte-identical "
+                "to before the win (credit is applied at FINALIZE, not at FOUND)",
+                node.ledger().owed_digest() == owed_before_orphan);
         (void)fc.drain_before_stop();
     }
     return rep;
