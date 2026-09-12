@@ -77,6 +77,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -146,6 +147,14 @@ inline bool patch_u32_le(std::vector<std::uint8_t>& blob, std::size_t off, std::
     return true;
 }
 
+// The OWED-ROLE outputs a v37 settlement (option-B) coinbase actually pays:
+// {v37 identity_key : piconero}. Structurally identical to
+// OwedLedger::Amounts (std::map<bytes32, long long>), spelled out here so the
+// submit path does not pull the settlement ledger header in for one typedef.
+// The FIXED outputs and the RESIDUAL SINK are deliberately NOT in it: neither
+// is ever credited to a ledger key, so neither may be deducted from one.
+using OwedPayout = std::map<std::array<std::uint8_t, 32>, long long>;
+
 // ===========================================================================
 // BlockCandidate — what the template layer hands the submitter for ONE
 // (template_id, extra_nonce). Option A fills it straight from get_block_template
@@ -181,6 +190,15 @@ struct BlockCandidate {
     Hash          prev_id{};                  // template prev_hash (zero = unknown)
     std::uint64_t expected_reward = 0;        // piconero (get_block_template.expected_reward)
     std::uint8_t  major_version = 0;          // template major_version (diagnostic)
+
+    // ── ★ R-7 PAYOUT LEG ────────────────────────────────────────────────────
+    // The OWED-ROLE coinbase outputs these exact bytes pay, {identity : pico},
+    // resolved from the SAME template snapshot that produced full_blob — never
+    // re-read from the provider later, when the retain ring may have rotated.
+    // Option A leaves `owed_payout_known` false: monerod's template pays one
+    // output to --payout-address, which is not a v37 ledger identity.
+    OwedPayout owed_payout;
+    bool       owed_payout_known = false;
 };
 
 // Validate a candidate BEFORE any bytes are touched. Returns "" when sane.
@@ -548,6 +566,11 @@ struct FoundBlockEvent {
     double        rpc_ms = 0.0;
     std::chrono::steady_clock::time_point at{};
 
+    // ★ R-7 payout leg, carried straight off the BlockCandidate these bytes
+    // were built from (see BlockCandidate::owed_payout).
+    OwedPayout owed_payout;
+    bool       owed_payout_known = false;
+
     std::string block_id_hex() const { return mj::hash_to_hex(block_id); }
 };
 
@@ -647,6 +670,13 @@ public:
         ev.header_check = o.header_check;
         ev.rpc_ms       = o.rpc_ms;
         ev.at           = std::chrono::steady_clock::now();
+        // ★ R-7: the payout leg travels WITH the block, off the very candidate
+        // whose bytes were submitted — not re-read from the provider a tick
+        // later, by which time the retain ring may have rotated the template
+        // away and an "empty" answer would be indistinguishable from "it paid
+        // nobody".
+        ev.owed_payout       = c.owed_payout;
+        ev.owed_payout_known = c.owed_payout_known;
         m_found.push(std::move(ev));
         set_error({});
     }

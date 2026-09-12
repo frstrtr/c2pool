@@ -186,9 +186,24 @@ public:
     // crediting nothing is what they will do — which is the SAME number we
     // credited, so the two nodes still converge. That is said out loud rather
     // than left to inference.
+    //
+    // ★ R-7. `payout_emitted` says whether THIS block's coinbase actually paid
+    // owed balances. Under option A it never does (monerod's template pays
+    // --payout-address, no v37 identity) and under option B it does whenever the
+    // ledger had owed to settle. It used to be hardcoded false, which was a
+    // statement about DASH's burial-gated W5 coinbase, not about this one: a
+    // peer that reads `false` credits E_b and deducts nothing, while the winner
+    // deducted a real payout — the two ledgers then diverge silently, which is
+    // the one failure mode S-1c exists to remove. Told the truth, the peer's
+    // existing fail-closed rule refuses the block LOUDLY instead (the payout map
+    // is not on the frozen v0x02 wire and cannot be reproduced from it). Peer-
+    // side reproduction of a K_fair payout is the open `canonical_coinbase_
+    // matches` ACCEPT-gate ruling (xmr_o2_settlement_provider.hpp banner), not
+    // something this path may invent.
     bool mint_block_winner(const std::string& bid_hex, std::uint64_t h_b,
                            const std::string& prev_id_hex, const XmrEbCut& cut,
-                           const ::v37::bytes32& owed_at_win) {
+                           const ::v37::bytes32& owed_at_win,
+                           bool payout_emitted = false) {
         if (!m_send) return false;
         ::c2pool::xmr::node::Hash prev{};
         if (!parse_hex32(prev_id_hex, prev)) {
@@ -213,7 +228,7 @@ public:
                 d.cut_next_pos       = cut.next_pos;
                 d.cut_spine_digest   = cut.lane_digest;
                 d.reward             = cut.reward;
-                d.payout_emitted     = false;   // the payout leg is EMPTY here by construction
+                d.payout_emitted     = payout_emitted;   // ★ R-7: the truth, not a constant
                 d.owed_digest_at_win = owed_at_win;
                 req.cut = d;
             }

@@ -152,6 +152,13 @@ struct XmrSettlementConfig {
     // --- the mandated residual sink (REQUIRED; torsion-checked at build) ---
     ::v37::ScriptRef residual_sink;                    // XMR_STD/XMR_SUB, 64-B payload
     ::v37::bytes32   residual_sink_identity{};         // its ledger identity_key (payout-map key)
+    // Piconero withheld from the K_fair owed selection so the sink is always a
+    // REAL output. 1 is the smallest value that keeps the §13 shape gate's
+    // "exactly one sink" mandate true once owed >= budget — which is where a
+    // working pool arrives on its (D_conf + 2)nd block. 0 restores the old
+    // behaviour, deadlock included, and is therefore not the default.
+    // See XmrCoinbaseContext::sink_min for the full account.
+    std::uint64_t    sink_min = 1;
 
     // --- mandated fixed outputs (dev / donation / finder), usually empty ---
     std::vector<x6::FixedOutput> fixed;
@@ -302,6 +309,7 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.residual_sink_identity = cfg.residual_sink_identity;
     ctx.fixed                  = cfg.fixed;
     ctx.h_min                  = cfg.h_min;
+    ctx.sink_min               = cfg.sink_min;
     ctx.output_cap             = cfg.resolved_output_cap();
     if (why) why->clear();
     return ctx;
@@ -565,6 +573,26 @@ inline bool run(std::string* why = nullptr) {
         if (!::v37::xmr::is_xmr_kind(po(key).kind))    return fail("S6: resolver lost the seeded ref");
         ::v37::bytes32 miss{}; miss[0] = 0xEE;
         if (::v37::xmr::is_xmr_kind(po(miss).kind))    return fail("S6: resolver invented a ref (must be RAW/carry)");
+    }
+    // (S7) ★ THE SINK FLOOR. sink_min is what keeps the MANDATED residual sink a
+    //      real output once owed >= budget, which is where any pool that is
+    //      actually settling arrives on its (D_conf + 2)nd block. It defaults to
+    //      1 because 0 reproduces the option-B deadlock exactly: K_fair takes
+    //      the whole reward, X6 emits no sink (it emits one iff residual > 0),
+    //      and the §13 shape gate then refuses EVERY template.
+    {
+        XmrSettlementConfig d;
+        if (d.sink_min == 0)
+            return fail("S7: sink_min defaults to 0 — that is the deadlock, not a default");
+        XmrOwedFixture fx(7);
+        XmrParentContext parent;
+        parent.height = 100; parent.base_reward = 600000000000ULL; parent.fees = 0;
+        std::string w;
+        auto ctx = make_xmr_coinbase_context(cfg, parent, fx.ledger(), &w);
+        if (!ctx) return fail("S7: context build refused: " + w);
+        if (ctx->sink_min != cfg.sink_min)
+            return fail("S7: sink_min not carried into the coinbase context (the withholding "
+                        "happens there, so a dropped field is a silently reintroduced deadlock)");
     }
     if (why) why->clear();
     return true;
