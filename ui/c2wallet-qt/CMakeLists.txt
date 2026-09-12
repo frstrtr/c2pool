@@ -64,6 +64,13 @@ option(C2WALLET_QT_BUILD_TESTS
 
 if(C2WALLET_QT_BUILD_TESTS)
     enable_testing()
+
+    # M1-A: the Qt-free Bitcoin-script HD-key core and its published-vector KATs
+    # (family/bitcoin/hdkeys). It links no Qt and no networking, so it can also be
+    # built and tested standalone:
+    #   cmake -S ui/c2wallet-qt/src/family/bitcoin/hdkeys -B build-hdkeys -DC2WALLET_QT_BUILD_TESTS=ON
+    add_subdirectory(src/family/bitcoin/hdkeys)
+
     add_test(
         NAME no_network_link_guard
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_no_network.sh"
