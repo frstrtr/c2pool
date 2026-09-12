@@ -26,6 +26,8 @@
 // build uses the real ::v37::sha256d.
 // ─────────────────────────────────────────────────────────────────────────
 
+#include <algorithm>      // std::sort (owed_digest below); g++-15 no longer
+                          // pulls it in transitively via <set>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -58,6 +60,56 @@ inline bytes32 sha256d(const std::vector<std::uint8_t>& v) {
     for (int i = 0; i < 8; ++i) out[16 + i] = std::uint8_t(((a ^ b) >> (8 * i)) & 0xff);
     for (int i = 0; i < 8; ++i) out[24 + i] = std::uint8_t(((a + b) >> (8 * i)) & 0xff);
     return out;
+}
+
+// ── MMR double for the owed-event record log ──────────────────────────────
+// Mirrors ::v37::PeakSet + the binary-counter append + peak bagging of
+// v37_lane.hpp. The PRODUCTION ledger does NOT contain this code: it calls the
+// shipped ::v37::Lane statics through c2pool/v37/record_log.hpp. This double
+// exists for the same reason sha256d above does — the stdlib self-check builds
+// single-TU with plain g++ and must not pull in the consensus tree (and cannot,
+// since this file already binds a non-crypto ::v37::sha256d, which would clash
+// with the real one). Every W6 claim over it is an EQUALITY across replay of
+// the same events, so a faithful structure over a deterministic digest is
+// sufficient; the real root is pinned by the production KAT instead.
+struct PeakSet {
+    std::vector<bytes32> peaks;
+    u64 leaf_count = 0;
+    bool operator==(const PeakSet&) const = default;
+};
+inline bytes32 shim_leaf_hash(const std::vector<std::uint8_t>& payload) {
+    std::vector<std::uint8_t> b;
+    b.reserve(payload.size() + 1);
+    b.push_back(0x00);
+    b.insert(b.end(), payload.begin(), payload.end());
+    return sha256d(b);
+}
+inline bytes32 shim_interior_hash(const bytes32& l, const bytes32& r) {
+    std::vector<std::uint8_t> b;
+    b.reserve(65);
+    b.push_back(0x01);
+    b.insert(b.end(), l.begin(), l.end());
+    b.insert(b.end(), r.begin(), r.end());
+    return sha256d(b);
+}
+inline void shim_mmr_append(PeakSet& ps, const bytes32& leaf) {
+    bytes32 h = leaf;
+    u64 n = ps.leaf_count;
+    while (n & 1) {
+        h = shim_interior_hash(ps.peaks.back(), h);
+        ps.peaks.pop_back();
+        n >>= 1;
+    }
+    ps.peaks.push_back(h);
+    ps.leaf_count += 1;
+}
+inline bytes32 shim_mmr_bag(const std::vector<bytes32>& peaks) {
+    bytes32 r{};
+    if (peaks.empty()) return r;
+    r = peaks.back();
+    for (std::size_t i = peaks.size() - 1; i-- > 0;)
+        r = shim_interior_hash(peaks[i], r);
+    return r;
 }
 
 } // namespace v37
@@ -127,6 +179,47 @@ struct SettleHW {
     }
 };
 
+// ── the owed-event leaf rule, mirroring c2pool/v37/owed_event_log.hpp ─────
+// Same tag, same field order, same normalization; the digest underneath is the
+// shim's deterministic stand-in (see the note on ::v37::sha256d above).
+namespace shimleaf {
+using ::v37::bytes32;
+using ::v37::u64;
+using Amounts = std::map<bytes32, long long>;
+enum EvKind : std::uint8_t { EV_FOUND = 1, EV_FINALIZE = 2, EV_ORPHAN = 3 };
+inline void put_u32(std::vector<std::uint8_t>& b, std::uint32_t x) {
+    for (int i = 0; i < 4; ++i) b.push_back(std::uint8_t((x >> (8 * i)) & 0xff));
+}
+inline void put_u64(std::vector<std::uint8_t>& b, u64 x) {
+    for (int i = 0; i < 8; ++i) b.push_back(std::uint8_t((x >> (8 * i)) & 0xff));
+}
+inline void put_amap(std::vector<std::uint8_t>& b, const Amounts& m) {
+    std::uint32_t n = 0;
+    for (const auto& [k, v] : m) { (void)k; if (v != 0) ++n; }
+    put_u32(b, n);
+    for (const auto& [k, v] : m) {
+        if (v == 0) continue;
+        b.insert(b.end(), k.begin(), k.end());
+        put_u64(b, static_cast<u64>(v));
+    }
+}
+inline std::vector<std::uint8_t> payload(std::uint8_t evkind, const std::string& bid,
+                                         u64 bin_height, const Amounts& credit,
+                                         const Amounts& payout, const Amounts& settled) {
+    std::vector<std::uint8_t> p;
+    const char tag[4] = {'V', '3', '7', 'L'};
+    p.insert(p.end(), tag, tag + 4);
+    p.push_back(evkind);
+    put_u32(p, static_cast<std::uint32_t>(bid.size()));
+    p.insert(p.end(), bid.begin(), bid.end());
+    put_u64(p, bin_height);
+    put_amap(p, credit);
+    put_amap(p, payout);
+    put_amap(p, settled);
+    return p;
+}
+} // namespace shimleaf
+
 // ── OwedLedger — mutators + getters W6 calls, VERBATIM from :352-546 ──────
 class OwedLedger {
 public:
@@ -143,8 +236,9 @@ public:
         Pending p;
         for (const auto& [k, v] : credit) if (v != 0) p.credit[k] = v;
         for (const auto& [k, v] : payout) if (v != 0) p.payout[k] = v;
-        m_pending.emplace(bid, std::move(p));
-        bump();
+        auto ins = m_pending.emplace(bid, std::move(p));
+        bump(shimleaf::payload(shimleaf::EV_FOUND, bid, 0,
+                               ins.first->second.credit, ins.first->second.payout, {}));
     }
     void on_block_finalized(const std::string& bid, u64 bin_height) {
         auto it = m_pending.find(bid);
@@ -154,13 +248,13 @@ public:
         m_pending.erase(it);
         m_settled.insert(bid);
         rearm_first_eligible(bin_height);
-        bump();
+        bump(shimleaf::payload(shimleaf::EV_FINALIZE, bid, bin_height, {}, {}, {}));
     }
     void on_block_orphaned(const std::string& bid, const Amounts& settled_payout) {
         auto it = m_pending.find(bid);
         if (it != m_pending.end()) {
             m_pending.erase(it);
-            bump();
+            bump(shimleaf::payload(shimleaf::EV_ORPHAN, bid, 0, {}, {}, {}));
             return;
         }
         if (m_settled.count(bid)) {
@@ -170,7 +264,7 @@ public:
                 m_residual += residual;
                 m_residual_events.push_back({bid, residual});
             }
-            bump();
+            bump(shimleaf::payload(shimleaf::EV_ORPHAN, bid, 0, {}, {}, settled_payout));
         }
     }
     long long effective_owed(const bytes32& k) const {
@@ -224,9 +318,20 @@ public:
     std::size_t pending_count() const { return m_pending.size(); }
     const Amounts& finalW() const { return m_finalW; }
 
+    // ── owed-event record log surface W6 calls (mirrors the real ledger) ──
+    bytes32 owed_event_mmr_root() const { return ::v37::shim_mmr_bag(m_evpeaks.peaks); }
+    u64 owed_event_leaf_count() const { return m_evpeaks.leaf_count; }
+    const ::v37::PeakSet& owed_event_peaks() const { return m_evpeaks; }
+    bool owed_event_log_consistent() const { return m_evpeaks.leaf_count == m_seq; }
+
 private:
     struct Pending { Amounts credit; Amounts payout; };
-    void bump() { ++m_seq; }
+    // Same shape as the real ledger: the ONLY seq advance, and it cannot
+    // advance without minting exactly one record-log leaf.
+    void bump(const std::vector<std::uint8_t>& leaf_payload) {
+        ::v37::shim_mmr_append(m_evpeaks, ::v37::shim_leaf_hash(leaf_payload));
+        ++m_seq;
+    }
     void rearm_first_eligible(u64 bin_height) {
         for (const auto& [k, e] : effective_owed_all()) {
             if (e > 0) {
@@ -244,6 +349,7 @@ private:
     Amounts m_finalW;
     long long m_residual = 0;
     std::vector<std::pair<std::string, long long>> m_residual_events;
+    ::v37::PeakSet m_evpeaks;                 // owed-event record log (double)
 };
 
 } // namespace c2pool::v37n::settle

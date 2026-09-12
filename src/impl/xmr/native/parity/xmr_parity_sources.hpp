@@ -37,6 +37,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -274,12 +275,38 @@ inline ArmObservation native_tip_observation(const ChainRow& row) {
     return o;
 }
 
+// An ORDER-INDEPENDENT digest of a selected transaction set: the XOR-fold of the
+// leading eight bytes of every transaction id, rendered hex, and never a gate.
+//
+// Order-independent on purpose. Two arms that hold the same transactions will
+// order them by their own selection policy, and a digest that changed with the
+// order would report a difference that means nothing. What this DOES distinguish
+// is set membership, which is the thing an operator wants to see when a diff
+// says one arm holds five transactions and the other holds none.
+inline std::string tx_set_digest(const std::vector<node::TxBacklogEntry>& txs) {
+    std::uint64_t acc = 0;
+    for (const node::TxBacklogEntry& e : txs) {
+        std::uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<std::uint64_t>(e.id[i]);
+        acc ^= v;
+    }
+    char b[64];
+    std::snprintf(b, sizeof(b), "n=%llu xor64=%016llx",
+                  static_cast<unsigned long long>(txs.size()),
+                  static_cast<unsigned long long>(acc));
+    return b;
+}
+
 // A template, from the MinerData an arm produced.
 //
 // median_timestamp: monerod's get_miner_data does not return it, so a zero here
 // means "this arm does not report the field", not "the median is zero". It is a
 // CONSTRAINT in the table for exactly that reason, and it is left ABSENT rather
 // than rendered as 0 so nothing can ever compare two absences and call it equal.
+//
+// selected_tx_set: NotComparable, and present so that the by-design difference
+// between the two pools' admission rules is visible in the report instead of
+// being inferred from a bare count. See TEMPLATE_FIELDS.
 inline ArmObservation template_observation(const char* arm, const node::MinerData& md) {
     ArmObservation o;
     o.arm     = arm;
@@ -295,6 +322,7 @@ inline ArmObservation template_observation(const char* arm, const node::MinerDat
     o.fields.set("median_timestamp",
                  md.median_timestamp != 0 ? Obs::u64(md.median_timestamp) : Obs::absent());
     o.fields.set("tx_backlog_count", Obs::u64(static_cast<std::uint64_t>(md.tx_backlog.size())));
+    o.fields.set("selected_tx_set",  Obs::text(tx_set_digest(md.tx_backlog)));
     return o;
 }
 

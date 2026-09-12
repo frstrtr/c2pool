@@ -213,6 +213,13 @@ inline bool chain_matches(const std::string& expect, const std::string& chain) {
 inline constexpr const char* kDashRegtestGenesisHex =
     "000008ca1832a4baf228eb1553c03d3a2c8e02399550dd6ea8d65cec3ef23d2e";
 
+// Dash Core v23.1.7 TESTNET (testnet3) genesis (src/chainparams.cpp:487).
+// Pinned by wait_ready() when main sets --network testnet: the chain tag
+// "test" alone cannot tell two testnet daemons apart, the genesis can.
+// Verify on the host with `dash-cli -testnet getblockhash 0`.
+inline constexpr const char* kDashTestnetGenesisHex =
+    "00000bafbc94add76cb75e2ec92894837288a481e5c005f6563d91623bf8bc2c";
+
 // Thrown by is_canonical() ONLY after Options::oracle_patience of continuous
 // transport failure (see the file header on why this is safe).
 struct OracleUnavailable : std::runtime_error {

@@ -31,16 +31,44 @@
 // next to is not a detector.
 //
 // SO THE COUNT STAYS A MEASUREMENT AND THE FAMINE BECOMES A CONSTRAINT. The
-// distinction that makes this safe is the SHADOW's count, not ours:
+// distinction that makes this safe is the DAEMON's count, not ours:
 //
-//     native backlog == 0  AND  shadow backlog > 0,  SUSTAINED
+//     native backlog == 0  AND  daemon backlog > 0,  SUSTAINED
 //
 // Neither half alone is evidence of anything. A native backlog of 0 on a quiet
-// chain is correct. A shadow backlog of 8 while we hold 6 is propagation skew.
+// chain is correct. A daemon backlog of 8 while we hold 6 is propagation skew.
 // The conjunction, held across K consecutive decidable samples AND across at
 // least S seconds of wall clock, is the one shape that cannot be explained by
 // skew: transactions demonstrably exist on the network, the daemon sitting on
 // the same wire is holding them, and we are holding none of them.
+//
+// TWO WORDS THAT COST A SOAK, AND THE RULE THAT REPLACES THEM. The inputs below
+// used to be spelled `native_backlog` and `shadow_backlog`, and the oracle fed
+// them BY SEAT -- the served arm into the first, the shadow arm into the second.
+// In the M4 leg that SERVES FROM MONEROD and shadows the native arm, those two
+// seats hold the two arms the other way round, so the DAEMON's empty mempool
+// arrived as "native_backlog=0" while the NATIVE pool's five relayed
+// transactions arrived as "shadow_backlog=5". Every sample read Starved, the
+// guard tripped after six of them, the refusal is sticky -- and the M4
+// graduation streak sat at zero for two thousand consecutive samples on a node
+// that was healthy. The mirror consequence was worse than the stall: a REAL
+// native famine in that leg read as Fed, so in the posture where the daemon
+// serves, the constraint could not have detected the regression it was added for.
+//
+//     THE RULE: these are ARM IDENTITIES, never seats. `native_backlog` is what
+//     the arm named "native" holds and `daemon_backlog` is what the arm named
+//     "monerod" holds, whichever of the two happens to be serving. The field
+//     names below say so, so that a future caller cannot re-make the mistake by
+//     filling in the argument that is nearest to hand.
+//
+// AND THE CLAIM IS SCOPED TO THE SERVING ARM. The sentence this guard exists to
+// refuse is "every template WE SERVE is empty of fee revenue". That is a claim
+// about the arm the miners are actually served from. While the native arm is
+// only shadowing, an empty native pool costs no miner a piconero and must not
+// reset a graduation streak -- so `native_is_serving_arm` decides whether an
+// observation GATES or merely ACCRUES as advisory evidence. Advisory samples are
+// still classified and still counted, so the status line shows the shape
+// building up; they simply never travel out as a failed CONSTRAINT.
 //
 // TWO BOUNDS, NOT ONE, and the second is not redundant. Samples are driven by
 // template refreshes, which can burst: six refreshes inside one second all
@@ -96,15 +124,15 @@ struct BacklogFamineConfig {
 enum class BacklogSampleClass : std::uint8_t {
     Undecidable = 0,   // misaligned, or one of the two arms did not answer
     Fed,               // the native pool held something: the famine shape is absent
-    ShadowEmpty,       // the shadow held nothing either: agreement, not famine
-    Starved,           // native 0, shadow > 0: one unit of famine evidence
+    DaemonEmpty,       // the daemon held nothing either: agreement, not famine
+    Starved,           // native 0, daemon > 0: one unit of famine evidence
 };
 
 inline const char* to_string(BacklogSampleClass c) noexcept {
     switch (c) {
         case BacklogSampleClass::Undecidable: return "undecidable";
         case BacklogSampleClass::Fed:         return "fed";
-        case BacklogSampleClass::ShadowEmpty: return "shadow-empty";
+        case BacklogSampleClass::DaemonEmpty: return "daemon-empty";
         case BacklogSampleClass::Starved:     return "starved";
     }
     return "?";
@@ -113,10 +141,18 @@ inline const char* to_string(BacklogSampleClass c) noexcept {
 class BacklogFamineGuard {
 public:
     struct Input {
+        // BY ARM IDENTITY, NEVER BY SEAT. `native_*` is the arm named "native"
+        // and `daemon_*` is the arm named "monerod", whichever of them served
+        // this template. See the seat/identity note in the header.
         bool          native_known   = false;
         std::uint64_t native_backlog = 0;
-        bool          shadow_known   = false;
-        std::uint64_t shadow_backlog = 0;
+        bool          daemon_known   = false;
+        std::uint64_t daemon_backlog = 0;
+        // Is the NATIVE arm the one the miners are served from right now? Only
+        // then can an empty native pool cost anything, and only then may this
+        // observation gate. Defaults true so that a caller which forgets it gets
+        // the conservative (gating) behaviour rather than a silently dead guard.
+        bool          native_is_serving_arm = true;
         // The two arms are on the same (height, prev_id). A famine claim across
         // different tips would be comparing two different questions.
         bool          aligned        = false;
@@ -129,6 +165,9 @@ public:
         std::size_t        streak       = 0;
         std::uint64_t      elapsed_s    = 0;
         bool               tripped      = false;
+        // The native arm was not serving, so this sample was recorded but did
+        // not gate. `check` is a PASS carrying the shape as a detail string.
+        bool               advisory     = false;
         NamedCheck         check;        // ready to push into CompareOptions
     };
 
@@ -144,7 +183,30 @@ public:
             return out;
         }
 
-        const bool decidable = in.aligned && in.native_known && in.shadow_known;
+        const bool decidable = in.aligned && in.native_known && in.daemon_known;
+
+        // THE POSTURE FENCE. While the native arm is only shadowing, an empty
+        // native pool costs no miner anything: the templates that went out were
+        // built by the daemon, from the daemon's own mempool. Recording the
+        // shape is still worth doing -- it is how an operator watches the native
+        // pool fill before flipping the posture -- but it may not FAIL a sample,
+        // because a failed sample resets the M4 graduation streak, and resetting
+        // a streak over a pool nobody is serving from is the stall this fence
+        // exists to prevent. A Fed sample still clears a stale refusal: evidence
+        // that the native pool is ingesting is evidence whichever seat it is in.
+        if (!in.native_is_serving_arm) {
+            ++advisory_;
+            out.advisory  = true;
+            out.cls       = decidable ? classify_(in) : BacklogSampleClass::Undecidable;
+            out.elapsed_s = elapsed_(in.at_unix);
+            if (out.cls == BacklogSampleClass::Fed) clear_();
+            if (out.cls == BacklogSampleClass::Starved) ++advisory_starved_;
+            out.streak  = streak_;
+            out.tripped = tripped_;
+            out.check   = pass_(advisory_detail_(in, out.cls));
+            return out;
+        }
+
         if (!decidable) {
             ++undecidable_;
             out.cls       = BacklogSampleClass::Undecidable;
@@ -164,19 +226,19 @@ public:
             out.check = pass_("native pool holds " + u64_(in.native_backlog) + " tx");
             return out;
         }
-        if (in.shadow_backlog == 0) {
+        if (in.daemon_backlog == 0) {
             clear_();
-            ++shadow_empty_;
-            out.cls   = BacklogSampleClass::ShadowEmpty;
+            ++daemon_empty_;
+            out.cls   = BacklogSampleClass::DaemonEmpty;
             out.check = pass_("both pools empty: agreement, not famine");
             return out;
         }
 
-        // native == 0, shadow > 0.
+        // native == 0, daemon > 0.
         ++starved_;
         if (streak_ == 0) first_starved_unix_ = in.at_unix;
         ++streak_;
-        last_shadow_backlog_ = in.shadow_backlog;
+        last_daemon_backlog_ = in.daemon_backlog;
 
         out.cls       = BacklogSampleClass::Starved;
         out.streak    = streak_;
@@ -200,15 +262,23 @@ public:
     std::size_t   streak()      const noexcept { return streak_; }
     std::uint64_t starved()     const noexcept { return starved_; }
     std::uint64_t fed()         const noexcept { return fed_; }
-    std::uint64_t shadow_empty() const noexcept { return shadow_empty_; }
+    std::uint64_t daemon_empty() const noexcept { return daemon_empty_; }
     std::uint64_t undecidable() const noexcept { return undecidable_; }
+    // Samples seen while the native arm was NOT serving: recorded, never gating.
+    std::uint64_t advisory()         const noexcept { return advisory_; }
+    std::uint64_t advisory_starved() const noexcept { return advisory_starved_; }
 
     std::string describe() const {
-        return std::string(tripped_ ? "REFUSING" : "ok")
+        std::string s = std::string(tripped_ ? "REFUSING" : "ok")
              + " streak=" + u64_(static_cast<std::uint64_t>(streak_)) + "/" + u64_(static_cast<std::uint64_t>(cfg_.consecutive))
              + " starved=" + u64_(starved_) + " fed=" + u64_(fed_)
-             + " shadow-empty=" + u64_(shadow_empty_)
+             + " daemon-empty=" + u64_(daemon_empty_)
              + " undecidable=" + u64_(undecidable_);
+        // Printed only when there is something to print, so the ordinary
+        // serve-native line does not grow two zeroes it never uses.
+        if (advisory_ != 0)
+            s += " advisory=" + u64_(advisory_) + "(starved " + u64_(advisory_starved_) + ")";
+        return s;
     }
 
 private:
@@ -223,11 +293,37 @@ private:
         return at > first_starved_unix_ ? (at - first_starved_unix_) : 0;
     }
 
+    static BacklogSampleClass classify_(const Input& in) noexcept {
+        if (in.native_backlog > 0)  return BacklogSampleClass::Fed;
+        if (in.daemon_backlog == 0) return BacklogSampleClass::DaemonEmpty;
+        return BacklogSampleClass::Starved;
+    }
+
+    std::string advisory_detail_(const Input& in, BacklogSampleClass cls) const {
+        std::string s = "advisory (the native arm is not serving templates): ";
+        switch (cls) {
+            case BacklogSampleClass::Fed:
+                s += "native pool holds " + u64_(in.native_backlog) + " tx";
+                break;
+            case BacklogSampleClass::DaemonEmpty:
+                s += "both pools empty";
+                break;
+            case BacklogSampleClass::Starved:
+                s += "native pool empty while the daemon holds "
+                   + u64_(in.daemon_backlog) + " tx";
+                break;
+            case BacklogSampleClass::Undecidable:
+                s += "no comparable backlog pair this sample";
+                break;
+        }
+        return s + "; not gating, nothing is served from the native pool";
+    }
+
     void clear_() noexcept {
         streak_ = 0;
         tripped_ = false;
         first_starved_unix_ = 0;
-        last_shadow_backlog_ = 0;
+        last_daemon_backlog_ = 0;
     }
 
     NamedCheck pass_(std::string detail) const {
@@ -239,7 +335,7 @@ private:
     }
 
     std::string progress_(const Observation& o) const {
-        return "native backlog 0 while shadow holds " + u64_(last_shadow_backlog_)
+        return "native backlog 0 while the daemon holds " + u64_(last_daemon_backlog_)
              + "; " + u64_(static_cast<std::uint64_t>(o.streak)) + "/" + u64_(static_cast<std::uint64_t>(cfg_.consecutive))
              + " samples, " + u64_(o.elapsed_s) + "/" + u64_(cfg_.sustained_s) + "s";
     }
@@ -249,8 +345,8 @@ private:
         c.name = kBacklogFamineCheck;
         c.ok   = false;
         c.detail = "native template backlog has been 0 for " + u64_(static_cast<std::uint64_t>(o.streak))
-                 + " consecutive samples (" + u64_(o.elapsed_s) + "s) while the shadow arm "
-                 + "held " + u64_(last_shadow_backlog_)
+                 + " consecutive samples (" + u64_(o.elapsed_s) + "s) while the daemon arm "
+                 + "held " + u64_(last_daemon_backlog_)
                  + " transaction(s): the native pool is not ingesting relayed transactions, "
                    "so every template served is empty of fee revenue";
         if (dead_clock) c.detail += " [no clock supplied: count bound only]";
@@ -261,11 +357,13 @@ private:
     std::size_t   streak_              = 0;
     bool          tripped_             = false;
     std::uint64_t first_starved_unix_  = 0;
-    std::uint64_t last_shadow_backlog_ = 0;
+    std::uint64_t last_daemon_backlog_ = 0;
     std::uint64_t starved_             = 0;
     std::uint64_t fed_                 = 0;
-    std::uint64_t shadow_empty_        = 0;
+    std::uint64_t daemon_empty_        = 0;
     std::uint64_t undecidable_         = 0;
+    std::uint64_t advisory_            = 0;
+    std::uint64_t advisory_starved_    = 0;
 };
 
 } // namespace c2pool::xmr::native::parity
