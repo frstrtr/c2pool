@@ -158,10 +158,28 @@ struct XmrS1PeerStats {
     std::uint64_t cut_miss      = 0;   // P not published here (ring evicted / coalesced through)
     std::uint64_t cut_mismatch  = 0;   // P published here with a DIFFERENT lane digest (!)
     std::uint64_t refused_fold  = 0;   // fold_eb REFUSED (geometry not ratified)
-    std::uint64_t refused_payout = 0;  // winner had already emitted an owed coinbase
+    std::uint64_t refused_payout = 0;  // winner emitted owed outputs we could NOT reproduce
+    // ★ canonical_coinbase_matches = (a) peer-recompute. A settling peer win —
+    // one whose option-B coinbase actually paid owed balances — is no longer
+    // refused outright: the payout leg is RECOMPUTED from this node's own K_fair
+    // run for that height (xmr_peer_payout_recompute.hpp) and booked, so the
+    // peer deducts exactly what the winner deducted. `payout_recomputed` counts
+    // the ones that reproduced; `refused_payout` above now counts only the ones
+    // that could NOT, which stay fail-closed.
+    std::uint64_t payout_recomputed = 0;
     std::uint64_t refused_late  = 0;   // H_b at or below our finalize cursor
     std::uint64_t already_known = 0;   // our own win, or a duplicate
-    std::uint64_t owed_diverged = 0;   // owed_digest_at_win != ours at receipt
+    // The VERIFY field, and what it is NOT. owed_digest_at_win is the winner's
+    // §4.5 commitment at the instant of ITS win; ours is read at RECEIPT, which
+    // is a strictly LATER instant — a receiver learns of H_b from the chain a
+    // poll away while the descriptor is a poll plus a relay hop away, so its
+    // finalize cursor has routinely stepped a bin the winner had not. A skew
+    // here is therefore NORMAL on a live rig and is not by itself a divergence.
+    // The SAME-INSTANT comparison is the K_fair recompute's, which pins our
+    // owed_digest AT OUR BUILD of that height against this very field
+    // (xmr_peer_payout_recompute.hpp); a real divergence surfaces there as
+    // refused[payout], and in the per-cursor owed_digest an auditor diffs.
+    std::uint64_t owed_skew = 0;       // owed_digest_at_win != ours at receipt
 };
 
 // Why a peer fold was refused, each its own bit so an operator never guesses.
