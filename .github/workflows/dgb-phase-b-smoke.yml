@@ -34,6 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "4"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.

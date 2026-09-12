@@ -118,12 +118,12 @@ jobs:
           #      orphan, is by definition dead.
           # HEAVY_LEG_* env overrides exist ONLY for the honesty-gate test
           # (.github/actions/heavy-leg-lock/test.sh); production uses the defaults.
-          LOCK="${HEAVY_LEG_LOCK:-/tmp/c2pool-heavy-leg.lock}"
-          HOLDERFILE="${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}"
+          LOCK="${HEAVY_LEG_LOCK:-/tmp/c2pool-build-heavy-leg.lock}"
+          HOLDERFILE="${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-build-heavy-leg.holder}"
           WAIT="${HEAVY_LEG_WAIT:-5400}"
           TTL="${HEAVY_LEG_TTL:-14400}"
           SWEEP="${HEAVY_LEG_SWEEP:-1}"
-          SLOTS="${HEAVY_LEG_SLOTS:-2}"
+          SLOTS="${HEAVY_LEG_SLOTS:-4}"
           ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
 
           # Slot files are ${LOCK}.1 .. ${LOCK}.SLOTS; each slot's live holder records a
@@ -443,7 +443,7 @@ jobs:
           if [ -n "$H" ]; then
             kill "$H" 2>/dev/null || true
             # drop whichever per-slot marker this holder owns
-            for MF in "${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-heavy-leg.holder}".*; do
+            for MF in "${HEAVY_LEG_HOLDERFILE:-/tmp/c2pool-build-heavy-leg.holder}".*; do
               [ -f "$MF" ] || continue
               read -r _mh _ < "$MF" 2>/dev/null || true
               [ "${_mh:-}" = "$H" ] && rm -f "$MF" || true
