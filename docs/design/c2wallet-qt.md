@@ -267,7 +267,7 @@ Crypto sourcing: Ed25519 field/group, Keccak, H_s, H_p, Pedersen generators, mul
 
 ### 5.2 Network-incapable build — defense in depth
 
-1. **Separate binary, separate target (PRIMARY).** `c2wallet-qt-signer` (offline, key-bearing) links **`Qt6::Core/Gui/Widgets` ONLY — no Qt Network, no WebEngine, no WebChannel, no libcurl, no boost::asio.** A socket call is a **link error**, not a runtime check. This is why c2wallet-qt must be a separate binary from `c2pool-qt`, which hard-requires QtWebEngine (Chromium + a network stack): you cannot embed Chromium and honestly claim network-incapable. An optional `c2wallet-qt-companion` (online, key-free) does QR/file marshalling and talks to c2pool.
+1. **Separate binary, separate target (PRIMARY).** `c2wallet-qt-signer` (offline, key-bearing) links **`Qt6::Core/Gui/Widgets` ONLY — no Qt Network, no WebEngine, no WebChannel, no libcurl, no boost::asio.** A socket call is a **link error**, not a runtime check. This is why c2wallet-qt must be a separate binary from `c2pool-qt`, which hard-requires QtWebEngine (Chromium + a network stack): you cannot embed Chromium and honestly claim network-incapable. The `c2wallet-qt-companion` (online, key-free) does QR/file marshalling and talks to c2pool — it **ships in v1** alongside the signer (decision 2, locked 2026-09-12).
 2. **Compile-time no-net CI gate.** `nm c2wallet-qt-signer | grep -E 'connect|socket|bind|getaddrinfo|SSL_'` must be empty (benign libc aside) — a mechanical red-KAT, the binary-level analog of c2pool's reward-safety grep proof.
 3. **Runtime seccomp belt.** On Linux the signer installs a seccomp filter killing the process on `socket(2)`/`connect(2)`, against a dependency that sneaks a socket in. Airplane-mode / no-NIC is the operational rule.
 
@@ -336,7 +336,7 @@ Scope note: per the operator directive of 2026-09-12, v1 scope is deliberately *
 
 ## 7. Risks & Open Decisions
 
-**Decisions locked 2026-09-12:** the operator locked decisions 1, 4, 5, 6, 7, and 8 (see below); decisions 2, 3, 9, 10, 11, and 12 remain open.
+**Decisions locked 2026-09-12:** the operator has now locked **all 12** decisions (see below) — none remain open. The remaining six (2, 3, 9, 10, 11, 12) were each locked to the recommended option.
 
 ### Risks
 
@@ -350,14 +350,14 @@ Scope note: per the operator directive of 2026-09-12, v1 scope is deliberately *
 ### Open decisions for the operator
 
 1. **Keystore formats (A):** **LOCKED 2026-09-12 = ALL IN v1** — Core descriptors + BIP38 + Electrum full-file parse + `wallet.dat` (Berkeley DB) parse + generic JSON keystore. The operator overrode the recommendation to defer Electrum full-file and `wallet.dat`; all five land in v1.
-2. **Separate binary vs c2pool-qt mode:** recommendation is a **separate network-incapable binary** (c2pool-qt hard-requires Chromium/QtWebEngine). Confirm.
-3. **Packaging:** a **new release.yml matrix job** for `c2wallet-qt` producing a signed `.dmg` (macOS universal, same lipo pattern), NSIS/`windeployqt` `setup.exe`, and Linux AppImage/`linuxdeployqt`, all into the existing draft-release + SHA256SUMS shape (CI never publishes). Reproducible + offline-verifiable distribution. The current release pipeline builds coin nodes only — no Qt job exists to inherit. Confirm the packaging targets.
+2. **Separate binary vs c2pool-qt mode:** **LOCKED 2026-09-12 = separate signer + online companion** — a **separate network-incapable binary** `c2wallet-qt-signer` (holds keys) PLUS a separate key-free `c2wallet-qt-companion` (online) that pulls data from c2pool and does QR/file marshalling. Both ship in v1 (c2pool-qt hard-requires Chromium/QtWebEngine, so it cannot be the signer).
+3. **Packaging:** **LOCKED 2026-09-12 = new release.yml matrix job for all three OS now** — a **new release.yml matrix job** for `c2wallet-qt` producing a signed `.dmg` (macOS universal, same lipo pattern), NSIS/`windeployqt` `setup.exe`, and Linux AppImage/`linuxdeployqt`, all into the existing draft-release + SHA256SUMS shape (CI never publishes; reproducible + offline-verifiable). The current release pipeline builds coin nodes only — no Qt job exists to inherit, so the matrix job is added from scratch.
 4. **Monero seed formats:** **LOCKED 2026-09-12 = ALL IN v1** — 25-word Electrum mnemonic (mandatory) + polyseed (16-word) + 13-word MyMonero.
 5. **Monero view-only:** **LOCKED 2026-09-12 = IN v1** — the online view-only / offline full split ships in v1 (it *is* the air-gap flow).
 6. **Monero multisig (MMS):** **LOCKED 2026-09-12 = IN v1** — the operator overrode the "defer to v2" recommendation; MMS ships in v1.
 7. **RingCT prover strategy:** **LOCKED 2026-09-12 = Path A** — port the CLSAG signer + Bulletproofs+ prover onto the vendored `crypto-ops.c` / `xmr_rct_ops`; links only libsodium plus ported BSD-3 source; KAT-gated against the in-tree verifier; provably network-incapable. (Path B — linking monero-project `wallet2`/`libwallet` wholesale — was rejected: it pulls boost + the whole monero crypto tree and is harder to prove network-incapable.)
 8. **Which Monero library to link:** **LOCKED 2026-09-12 = Path A libs** (follows decision 7) — links only libsodium (already required by the vendored ed25519 ops) plus the ported source files; no libwallet.
-9. **Monero artifact format:** adopt monero's `unsigned_txset` / `signed_txset` / outputs / key-image layouts verbatim (interop) vs a c2pool-native container. Recommendation: **verbatim**.
-10. **Monero `.keys` interop:** import monero-wallet `.keys` yes/no; export in monero format vs our own air-gap format only.
-11. **Integrated / long payment IDs:** read+warn only, never generate long (deprecated). Confirm.
-12. **Ring size / consensus params source:** pin live from the online node (ring 16 now) to survive a consensus bump vs hardcode. Recommendation: **live from node**.
+9. **Monero artifact format:** **LOCKED 2026-09-12 = verbatim monero layouts** — adopt monero's `unsigned_txset` / `signed_txset` / outputs / key-image layouts verbatim for interop (a stock `monero-wallet-cli` can serve as a fallback counterparty), not a c2pool-native container.
+10. **Monero `.keys` interop:** **LOCKED 2026-09-12 = yes, both ways** — import AND export monero-wallet `.keys` (in addition to our own air-gap format).
+11. **Integrated / long payment IDs:** **LOCKED 2026-09-12 = read + warn only** — never generate long/deprecated payment IDs.
+12. **Ring size / consensus params source:** **LOCKED 2026-09-12 = live from the online node** — pull ring size / consensus params live (ring 16 now) so a consensus bump is survived without a rebuild, rather than hardcoding.
