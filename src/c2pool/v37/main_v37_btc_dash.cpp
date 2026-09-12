@@ -168,6 +168,7 @@
 #include <c2pool/v37/carrier_send.hpp>                // CarrierSendQueue (A2 send-side: own stratum wins -> carriers, off the hot path)
 #include <c2pool/v37/w3_relay.hpp>                    // CarrierRelay
 #include <c2pool/v37/w3_wire_freeze.hpp>              // W3-B5 freeze: boot selfcheck + relay policy gate
+#include <c2pool/v37/v37_drops_wiring.hpp>            // ★ DROPS Step 2: DropsWiring, make_drops_wiring
 
 namespace io = boost::asio;
 using namespace c2pool::v37n::btc;
@@ -182,6 +183,25 @@ static std::string hex32(const ::v37::bytes32& b) {
     s.reserve(64);
     for (const auto x : b) { s.push_back(kHex[x >> 4]); s.push_back(kHex[x & 0x0f]); }
     return s;
+}
+
+// A 64-hex payout IDENTITY KEY -> bytes32. Strict: exactly 64 hex characters,
+// nothing else. Used ONLY by --drops-enrol; a malformed value is refused and
+// named rather than silently enrolling a zero key.
+static bool parse_identity_hex(const std::string& h, ::v37::bytes32& out) {
+    if (h.size() != 64) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < 32; ++i) {
+        const int hi = nib(h[2 * i]), lo = nib(h[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return true;
 }
 
 static void usage() {
@@ -206,6 +226,9 @@ static void usage() {
         "                                     peers' carriers account\n"
         "  --carrier-index-horizon N          live index: reject carriers keyed further than N blocks behind the tip (default 64)\n"
         "  --carrier-index-patience-ms N      live index: bounded retry budget while dashd answers Unknown (default 2000)\n"
+        "  --drops-enrol HEX64                ★ DROPS: enrol this 64-hex payout identity as a DROPS participant,\n"
+        "                                     EX ANTE, at the CHAIN TIP bin, effective from tip+1 (repeatable).\n"
+        "                                     Inert unless this build took V37_ACTIVATE_CONSENSUS_V1\n"
         "  --i-understand-mainnet             loud mainnet opt-in (HARD SAFETY 4)\n");
 }
 
@@ -221,6 +244,7 @@ int main(int argc, char** argv) {
     std::string stratum_bind = "127.0.0.1:3032";
     std::string p2p_bind;                 // A2: empty = no inbound carrier bind
     std::vector<std::string> peers;       // A2: --peer HOST:PORT, repeatable
+    std::vector<std::string> drops_enrol; // ★ DROPS: --drops-enrol HEX64, repeatable
     std::optional<std::uint64_t> synthetic_index_tip;   // A2: --carrier-synthetic-index N (KAT model)
     std::uint64_t carrier_index_horizon = 64;           // A2 step-b: LiveMainchainIndex::Options::horizon
     long          carrier_index_patience_ms = 2000;     // A2 step-b: LiveMainchainIndex::Options::unknown_patience
@@ -242,6 +266,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--stratum-bind"))                        next(stratum_bind);
         else if (!std::strcmp(a, "--p2p-bind"))                            next(p2p_bind);
         else if (!std::strcmp(a, "--peer") && i + 1 < argc)                peers.emplace_back(argv[++i]);
+        else if (!std::strcmp(a, "--drops-enrol") && i + 1 < argc)         drops_enrol.emplace_back(argv[++i]);
         else if (!std::strcmp(a, "--carrier-synthetic-index") && i + 1 < argc) synthetic_index_tip = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(a, "--carrier-index-horizon") && i + 1 < argc)     carrier_index_horizon = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(a, "--carrier-index-patience-ms") && i + 1 < argc) carrier_index_patience_ms = std::atol(argv[++i]);
@@ -376,6 +401,109 @@ int main(int argc, char** argv) {
                  << " unrecoverable=" << boot.unrecoverable;   // A8 compares this triple with the stop: line
     }
 
+    // ══ ★ DROPS STEP 2 — THE LIVE WIRING (flip-gated; DORMANT by default) ══
+    //
+    // WHAT WAS MISSING. The DROPS package landed four consumer seams and a
+    // verified gate-ON mint, and this shell called NONE of them: it constructed
+    // no DropHarvester, no EnrollmentBook and no ShareCountBook, and never
+    // called set_drop_harvest / set_drop_harvester / set_pre_harvest /
+    // set_enrollment_book. A node that took the operator flip would therefore
+    // have been gate-ON and DORMANT — converging with its peers and crediting
+    // NOBODY, for ever, because no raindrop is harvested, no share count is
+    // declared, and every harvested interval is withheld by the fail-closed
+    // rule. These are the four calls.
+    //
+    // ★★ THE CLOCK IS THE TIP, AND IT IS NOT NEGOTIABLE HERE.
+    // EnrollmentBook::commit() enforces "effective strictly later than now", but
+    // `now` is the CALLER'S. A shell that passed a STALE now — the obvious
+    // mistake being the BURIAL FRONTIER, the other interval number this file
+    // handles, which lags the tip by d_conf — would let a payee enrol for
+    // intervals it has ALREADY DRAWN, which is the selective-enrolment attack
+    // R-SYBIL closed, worth 1.32x at a 2000-way split. So this shell does not
+    // have that argument to get wrong: DropsWiring keeps the book private and
+    // its only enrolment entry point, enroll_at_tip(payee), TAKES NO INTERVAL AT
+    // ALL. The frontier reaches declare_into through a different door and can
+    // never reach commit().
+    //
+    // ORDER MATTERS AND IS DELIBERATE. Every enrolment is made HERE — after the
+    // engine is up so the tip is real, and BEFORE the carrier relay listens and
+    // BEFORE the stratum server binds. The book is therefore frozen for the
+    // whole life of every reader (the stratum win thread and the carrier reader
+    // threads), which is why the read path needs no lock of its own.
+    //
+    // GATE OFF (the shipped default): make_drops_wiring() returns nullopt, this
+    // block constructs nothing, attaches nothing and arms nothing; the W2
+    // admitter, the E_b fold and the OWED ledger are the ones master ships.
+    auto drops = ::c2pool::v37n::make_drops_wiring(cfg.lane_params);
+    if (drops) {
+        // Prime the ex-ante clock from the SAME backend tip the height-watch
+        // polls, before anything is enrolled or armed.
+        try {
+            if (const auto t = backend->try_best_tip()) drops->observe_tip(t->height);
+        } catch (const ChainMismatch& e) {
+            LOG_ERROR << "[v37-dash] DROPS: chain mismatch priming the tip: " << e.what()
+                      << " (the height-watch owns exit 9)";
+        }
+        const auto now_bin = drops->now_interval();
+        if (!now_bin) {
+            // No tip, no clock. Refusing is the only honest answer: enrolling at
+            // a made-up interval 0 would back-date every commitment to genesis,
+            // which is the stale-now failure with extra steps.
+            LOG_ERROR << "[v37-dash] DROPS: no chain tip yet — NOT enrolling and NOT arming "
+                         "the share-count book (the ex-ante clock is the TIP; there is no "
+                         "safe substitute). Every harvested interval will be WITHHELD.";
+        } else {
+            for (const auto& h : drops_enrol) {
+                ::v37::bytes32 payee{};
+                if (!parse_identity_hex(h, payee)) {
+                    LOG_ERROR << "[v37-dash] --drops-enrol " << h
+                              << " is not 64 hex characters — ignored, NOT enrolled";
+                    continue;
+                }
+                switch (drops->enroll_at_tip(payee)) {
+                    case ::c2pool::v37n::EnrollOutcome::Enrolled:
+                        LOG_INFO << "[v37-dash] DROPS enrolled " << hex32(payee).substr(0, 16)
+                                 << "… ex ante at tip bin " << *now_bin
+                                 << ", effective from " << (*now_bin + 1);
+                        break;
+                    case ::c2pool::v37n::EnrollOutcome::AlreadyEnrolled:
+                        LOG_INFO << "[v37-dash] DROPS " << hex32(payee).substr(0, 16)
+                                 << "… was already enrolled; the FIRST commitment stands";
+                        break;
+                    case ::c2pool::v37n::EnrollOutcome::TipUnknown:
+                        LOG_ERROR << "[v37-dash] DROPS: tip vanished mid-enrolment — "
+                                  << hex32(payee).substr(0, 16) << "… NOT enrolled";
+                        break;
+                }
+            }
+            // The share-count producer speaks only for intervals at or after the
+            // bin it was armed at; everything earlier stays UNKNOWN and is
+            // therefore withheld, which is the fail-closed error and not a bug.
+            drops->arm_at_tip();
+            LOG_INFO << "[v37-dash] DROPS share-count book armed at tip bin " << *now_bin;
+        }
+        // ★ THE THREE NODE-SIDE SEAMS. The fourth (the W2 harvest sink) and the
+        // emit-stream tee are attached to the carrier ingest below, because that
+        // is where the admitter lives.
+        node.set_drop_harvester(&drops->harvester());
+        node.set_enrollment_book(&drops->enrollment());
+        node.set_pre_harvest(drops->pre_harvest());
+        LOG_WARNING << "[v37-dash] ★ DROPS ACTIVE (V37_ACTIVATE_CONSENSUS_V1, arity "
+                    << ::c2pool::v37n::kActivationArity << ", K="
+                    << cfg.lane_params.subthreshold.K << "): this node composes the "
+                       "sub-threshold REPLACE delta into every block it settles. This is "
+                       "a CONSENSUS ACTIVATION — a node without it will not agree on "
+                       "owed_digest once a credit moves.";
+        if (drops_enrol.empty())
+            LOG_WARNING << "[v37-dash] DROPS: gate ON but NOBODY is enrolled (--drops-enrol) "
+                        << "— every composition credits zero. That is the correct fail-closed "
+                           "shape, not a fault: enrolment is ex ante and opt-in.";
+    } else {
+        LOG_INFO << "[v37-dash] DROPS: DORMANT (no consensus activation in this build) — "
+                    "no harvester, no enrolment book, no share-count tee; W2 classifies a "
+                    "sub-target receipt as REJECT_R1_TARGET exactly as master does";
+    }
+
     // ── A2 CONSUMER: the carrier-relay p2p layer (cross-node share ingestion) ─
     // The gap the Phase-B single-node run proved: no --peer, no cross-node
     // ingestion. This stands up the W3 carrier relay on a real socket transport
@@ -490,6 +618,24 @@ int main(int argc, char** argv) {
         }
         carrier_ingest = std::make_unique<CarrierIngest>(
             node.engine(), cfg.lane_chain, *carrier_index, *carrier_tracker, incarnation);
+        // ── ★ DROPS Step 2: the two seams that live on the ADMITTER ─────────
+        //   (1) the sub-target harvest: a receipt mined against a strictly
+        //       weaker target than its bin's consensus target stops being
+        //       REJECT_R1_TARGET and becomes a RAINDROP, admitted for
+        //       MEASUREMENT ONLY (no push, no lane work, every binding check
+        //       still enforced) and handed to the harvester;
+        //   (2) the SHARE-COUNT PRODUCER, teed onto the W2 emit stream. Every
+        //       EmittedPush is one share at (identity, origin_bin) — the same F1
+        //       bin the harvester keys its intervals on — so declare_shares()
+        //       gets a real S instead of the "unknown" it fails closed on. The
+        //       engine still receives every push, in order, unchanged.
+        // Without (2), (1) credits nothing: every harvested interval is withheld.
+        if (drops) {
+            carrier_ingest->set_drop_harvest(true, drops->drop_sink());
+            carrier_ingest->set_sink_filter(drops->sink_filter());
+            LOG_INFO << "[v37-dash] ★ DROPS: W2 sub-target harvest ARMED and the "
+                        "share-count producer teed onto the emit stream";
+        }
         carrier_net   = std::make_unique<CarrierPeerNode>();
         carrier_relay = std::make_unique<CarrierRelay>(carrier_ingest->fn(), *carrier_net);
         // W3-B5 F-1/F-2 POLICY GATE on every inbound frame (post-decode, pre-admit).
@@ -574,7 +720,17 @@ int main(int argc, char** argv) {
                                 break;
                             std::this_thread::sleep_for(std::chrono::milliseconds(50));
                         }
-                        const auto reg = bed.on_peer_block_found(w);
+                        // ★ DROPS: same lock, same reason — on a peer win the
+                        // node DISCARDS our own buried harvest at the winner's
+                        // frontier (nothing of ours is credited on someone
+                        // else's block, but the frontier must still move), and
+                        // that discard happens after the hook returns.
+                        BlockEventDriver::RegisterResult reg;
+                        {
+                            std::unique_lock<std::recursive_mutex> wl;
+                            if (drops) wl = drops->win_lock();
+                            reg = bed.on_peer_block_found(w);
+                        }
                         if (reg.registered) {
                             carrier_inbound.cut_credited.fetch_add(1, std::memory_order_relaxed);
                             const auto& pc = node.last_peer_cut();
@@ -631,6 +787,16 @@ int main(int argc, char** argv) {
         }
         LOG_INFO << "[v37-dash] A2 carrier-relay up: peers=" << carrier_net->n_peers();
     }
+    // ★ DROPS, stated rather than inferred: the W2 admitter lives INSIDE the
+    // carrier-ingest bridge, and that bridge only exists when this node peers.
+    // Without --p2p-bind / --peer there is no admission path at all, so no
+    // raindrop can be harvested and no share can be counted — the gate is on and
+    // there is simply nothing for it to compose. Say so at boot instead of
+    // leaving an operator to infer it from a stop line of zeroes.
+    if (drops && !carrier_ingest)
+        LOG_WARNING << "[v37-dash] DROPS: gate ON but this node has NO carrier relay "
+                       "(no --p2p-bind / --peer) — there is no W2 admission path, so NO "
+                       "raindrop can be harvested and every composition credits zero";
 
     // ── 2f: stratum front-end on the v36 DASH work source ────────────────────
     dash::coin::NodeCoinState coin_state;   // EMPTY on purpose: no embedded arm; dashd is the template source
@@ -661,6 +827,29 @@ int main(int argc, char** argv) {
             BlockEventDriver::RegisterResult reg;
             std::uint64_t reg_h = 0;
             auto try_register = [&](std::uint64_t h, std::uint64_t conf) {
+                // ★ DROPS: hold the harvest lock across the WHOLE registration.
+                // XbtcNode calls the pre-harvest hook and then take_buried()
+                // ITSELF, after the hook returns, so locking inside the hook
+                // would leave the release unguarded against the carrier reader
+                // threads that are feeding raindrops and share counts in.
+                // Recursive, because the hook re-enters on this same thread.
+                //
+                // WHAT THIS COSTS, SAID OUT LOUD. A carrier reader that is
+                // mid-admit blocks on this lock for the duration of ONE block
+                // registration — the E_b fold, the composition and the W6
+                // write-ahead, milliseconds of CPU and one disk write. The
+                // node's own submitblock is NOT inside it (the backend refuses
+                // XbtcNode's placeholder hex without touching the network, and
+                // the real bytes go out below, unlocked). The one pathological
+                // case is S-8: with dashd unreachable, the win-time
+                // is_canonical() probe spins oracle_patience inside this window,
+                // so carrier ingestion stalls for up to --oracle-patience-ms on
+                // a block win against a dead daemon. That is a node which is
+                // already settling nothing, and correctness-by-construction is
+                // worth more here than a shaved millisecond — but it is a real
+                // cost and it is not hidden.
+                std::unique_lock<std::recursive_mutex> wl;
+                if (drops) wl = drops->win_lock();
                 reg = bed.on_block_found(bidh, h, conf);
                 if (reg.registered) reg_h = h;
                 else LOG_ERROR << "[v37-dash] register " << bidh << " @" << h << " failed: " << reg.reason;
@@ -841,6 +1030,10 @@ int main(int argc, char** argv) {
             break;
         }
         if (tip && live_index) live_index->observe_tip(tip->height);   // A2: the reader thread never asks getblockchaininfo
+        // ★ DROPS: the EX-ANTE CLOCK, from the SAME tip, in the same place. This
+        // is the only writer of now_interval, and it writes the chain tip and
+        // nothing else — never the burial frontier, which lags it by d_conf.
+        if (tip && drops) drops->observe_tip(tip->height);
         if (tip && tip->hash != last_hash) {
             try {
                 // D11: a lowered tip, or a previous tip that left the active chain,
@@ -951,6 +1144,29 @@ int main(int argc, char** argv) {
                  << " refused_payout=" << s1c.refused_payout << " refused_late=" << s1c.refused_late
                  << " already_known=" << s1c.already_known
                  << " owed_diverged=" << s1c.owed_diverged << "}";
+    }
+    if (drops) {
+        const auto ds = drops->stats();
+        LOG_INFO << "[v37-dash] DROPS stop: enrolled=" << ds.enrolled
+                 << " tip_bin=" << (drops->now_interval() ? *drops->now_interval() : 0)
+                 << " raindrops=" << ds.harvested << " late=" << ds.late
+                 << " shares_counted=" << ds.shares_seen << " declared=" << ds.declared
+                 // ★ withheld > 0 is the wiring going to waste: intervals were
+                 // harvested but their share count was never declared, so they
+                 // were dropped rather than credited as if the payee held no
+                 // shares. It is the conservative error AND the one an operator
+                 // must be able to see.
+                 << " withheld=" << ds.withheld << " discarded_on_peer_win=" << ds.discarded
+                 << " open_intervals=" << ds.open
+                 << " enrollment_digest=" << hex32(drops->enrollment().book_digest());
+        // DETACH BEFORE THE BUNDLE DIES. XbtcNode holds RAW pointers into the
+        // wiring plus a std::function that captures it, and `node` is declared
+        // ABOVE `drops`, so the node outlives the bundle at scope exit. Nothing
+        // in the node's implicit destructor dereferences them today — this is
+        // the line that keeps that true if one ever does.
+        node.set_drop_harvester(nullptr);
+        node.set_enrollment_book(nullptr);
+        node.set_pre_harvest({});
     }
     teardown_io();
     const auto st = backend->stats();

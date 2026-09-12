@@ -1236,8 +1236,20 @@ int main() {
               "the 1-argument factory is the ONLY way to take DROPS without the "
               "ridge (it names no parent LaneKind, so it carries no dimensions) — "
               "and it is what the XMR lane must use, ND-R6 being unruled");
-        check(::c2pool::v37n::kActivationArity == 2,
-              "the recorded arity for the flip is 2 (DROPS + ridge together)");
+        // ★ RULED: DECOUPLE. The recorded arity is 1 — the flip opens DROPS and
+        // NOTHING else. Pinned here as a value, not as a preference, because it
+        // is what a live node's geometry is built from: at arity 1 a shipped
+        // node runs for_version(1) (DROPS on, ridge OFF), so the fleet's
+        // owed_digest is NOT the GOLDEN_DROPS_ON value this KAT mints over
+        // for_version(1, LaneKind). That golden pins the CANON ACTIVATION
+        // SCHEDULE and the composition rule — which is what it is for — and the
+        // assertions above are written against the two-argument geometry
+        // explicitly, so they are invariant to this constant. Changing the arity
+        // is a separate operator ruling and a separate flag day; this check is
+        // what makes such a change impossible to take by accident.
+        check(::c2pool::v37n::kActivationArity == 1,
+              "★ the recorded arity for the flip is 1 (DROPS ALONE; the V37.1 "
+              "ridge stays a separately ruled flag day)");
     }
 
     // ── DROPS-T2: the W2 sub-target harvest ──────────────────────────────

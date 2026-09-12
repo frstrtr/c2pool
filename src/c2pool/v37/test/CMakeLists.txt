@@ -641,4 +641,51 @@ if (BUILD_TESTING)
     target_include_directories(v37_drops_activation_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_drops_activation_kat Threads::Threads)
     add_test(NAME v37_drops_activation_kat COMMAND v37_drops_activation_kat)
+
+    # DROPS STEP 2 — THE LIVE-SHELL WIRING. The package above shipped four
+    # consumer seams and a verified gate-ON mint that NO LIVE SHELL CALLED: the
+    # BTC/DASH main constructed no DropHarvester / EnrollmentBook /
+    # ShareCountBook and never called set_drop_harvest / set_drop_harvester /
+    # set_pre_harvest / set_enrollment_book, and the XMR node had no T3 hook at
+    # all — so after the operator flip every node would have been gate-ON and
+    # DORMANT. This KAT drives v37_drops_wiring.hpp, the object those shells now
+    # call, and pins:
+    #   W-ARITY    the RULED arity 1 (DECOUPLE: DROPS alone, the V37.1 ridge left
+    #              to its own flag day) AND that W4 RATIFIES the geometry arity 1
+    #              builds — without which the flip would refuse every E_b fold and
+    #              DROPS would be dormant for a second, quieter reason;
+    #   W-DORMANT  gate OFF is master byte for byte: make_drops_wiring() is
+    #              nullopt on a default build whatever the geometry, and a fold
+    #              handed a FULL harvest, a valid price and a populated enrolment
+    #              book under LaneParams{} lands on the SAME owed_digest as a fold
+    #              handed nothing (non-vacuous: the same harvest under the gate-ON
+    #              geometry moves it);
+    #   W-TIP      now_interval comes from the chain TIP, is monotone across a
+    #              reorg, is UNKNOWN (and enrolment REFUSED) before the first tip,
+    #              and records committed_at == tip / effective_from == tip + 1;
+    #   W-STALE    ★ the residual the package left open. The ex-ante rule is
+    #              enforced only by the caller-supplied now_interval, so a shell
+    #              passing a STALE now (the burial frontier, which lags the tip by
+    #              D_conf) re-opens the selective-enrolment attack. Pinned
+    #              STRUCTURALLY by static_assert on the member signatures —
+    #              enroll_at_tip(payee) takes NO interval and the book is
+    #              const-only, so the stale call does not compile — and then
+    #              MEASURED on real draws (unconditional 0.92x vs selective
+    #              1.18x), with the shipped tip-sourced book composing exactly
+    #              NOTHING for every already-drawn interval;
+    #   W-E2E      the whole path on the REAL objects: the REAL W2 admitter
+    #              harvesting raindrops through the wiring's DropSink, the REAL
+    #              ShareCountBook teed onto the REAL emit stream, declare_into at
+    #              the burial frontier, take_buried, subthreshold_credit under the
+    #              REAL price and REAL ex-ante book, OwedLedger fold, owed_digest
+    #              MOVES — over the four payee shapes a live lane produces
+    #              (drop-only, covered, enrolled-but-silent, not enrolled);
+    #   W-LOCK     a liveness + counter smoke over the wiring's lock, since Step 2
+    #              is what first makes these objects reachable from three threads.
+    # Stdlib-only, ~1 s. SAME HOLLOW-GREEN GUARD: ALSO on BOTH build.yml lists.
+    add_executable(v37_drops_step2_wiring_kat v37_drops_step2_wiring_kat.cpp)
+    target_compile_features(v37_drops_step2_wiring_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_drops_step2_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_drops_step2_wiring_kat Threads::Threads)
+    add_test(NAME v37_drops_step2_wiring_kat COMMAND v37_drops_step2_wiring_kat)
 endif()

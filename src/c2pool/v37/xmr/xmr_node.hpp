@@ -41,6 +41,8 @@
 #include <core/filesystem.hpp>                       // core::filesystem::config_path
 #include <c2pool/v37/v37_engine.hpp>                 // V37Engine (merged)
 #include <c2pool/v37/w4_settlement.hpp>              // OwedLedger, SettleHW (merged)
+#include <c2pool/v37/v37_drop_harvest.hpp>           // ★ DROPS T3: DropHarvester
+#include <c2pool/v37/v37_drops_enrollment.hpp>       // ★ R-SYBIL: EnrollmentBook
 #include <sharechain/v37/v37_descriptor_xmr.hpp>     // point_check_backend, xmr_ref_valid
 #include <sharechain/v37/v37_roundabout.hpp>
 
@@ -272,12 +274,70 @@ public:
         fb.height = monero_height;
         fb.credit = credit;
         fb.payout = payout;
+        // ── ★ DROPS T3 (XMR arm) — the hook the BTC/DASH shell already has ──
+        // Parity, not a second mechanism: the XMR finalize driver composes the
+        // very same compose_credit_replace() the BTC-family driver does, so all
+        // it was ever missing was a FoundBlock that carried the lane gate, the
+        // buried harvest and the composition context. Without these four lines
+        // an XMR node could take the flip, be gate-ON, and still credit nobody
+        // for ever — the dormancy this PR exists to remove, in the one shell it
+        // had not been removed from.
+        //
+        // EVERY PIECE DEFAULTS INERT. No harvester attached => buried_harvest()
+        // returns {} and the composition returns fb.credit byte for byte. No
+        // enrolment book => nobody is enrolled => nothing is composed even with
+        // a full harvest. No price function => WorkPrice{}.valid == false =>
+        // entitlement_of_work() returns 0 on BOTH sides of the replace. So a
+        // default XMR node settles exactly as master does, and the seams below
+        // are what an XMR shell calls once it has a DropsWiring to hand them.
+        fb.params = m_cfg.lane_params;
+        {
+            ::c2pool::v37n::settle::DropsCompose dctx;
+            // ★ DROPS-R1: how work becomes coin AT THIS CUT. The XMR arm has no
+            // in-node fold to read a price off (credit arrives ready-made from
+            // the X6 coinbase path), so the price is a supplied seam. Absent, it
+            // is INVALID, which credits zero rather than crediting hash counts
+            // as atomic units — the R1 blowup, refused by default.
+            if (m_drops_price) dctx.price = m_drops_price();
+            dctx.enrollment = m_enroll;     // ★ R-SYBIL: null => nobody enrolled
+            fb.drops = dctx;
+            fb.harvested = buried_harvest(monero_height);
+        }
         m_finalize->on_block_found(fb);
         log("win: FOUND block " + fb.bid.substr(0, 12) + "… at height " +
             std::to_string(monero_height) + " registered (awaiting D_conf=" +
             std::to_string(m_cfg.d_conf) + ")");
         return true;
     }
+
+    // ── ★ DROPS T3 seams (XMR arm) — the BTC/DASH set, verbatim ──────────
+    //
+    // NOT attached by default, and that default is the safe one on every seam:
+    // no harvester => empty harvest; no book => nobody enrolled; no price =>
+    // zero on both sides of the replace. The node owns none of these lifetimes;
+    // the shell that owns the W2 admitter owns them, because that is who feeds
+    // them (v37_drops_wiring.hpp bundles all three and sources the enrolment
+    // clock from the chain TIP, which is the property the seams themselves
+    // cannot enforce).
+    void set_drop_harvester(::c2pool::v37n::DropHarvester* h) { m_drops = h; }
+    ::c2pool::v37n::DropHarvester* drop_harvester() const { return m_drops; }
+
+    void set_enrollment_book(const ::c2pool::v37n::EnrollmentBook* b) { m_enroll = b; }
+    const ::c2pool::v37n::EnrollmentBook* enrollment_book() const { return m_enroll; }
+
+    // Called with the BURIAL FRONTIER immediately before the harvest is taken,
+    // so the share-count producer can declare every interval's S before the
+    // fail-closed release rule withholds it. Wire it to
+    // DropsWiring::pre_harvest().
+    using PreHarvestFn = std::function<void(std::uint64_t bury_before)>;
+    void set_pre_harvest(PreHarvestFn f) { m_pre_harvest = std::move(f); }
+
+    // ★ DROPS-R1: the (reward, SUM weight) pair at the cut this win settles.
+    using DropsPriceFn = std::function<::c2pool::v37n::settle::WorkPrice()>;
+    void set_drops_price_fn(DropsPriceFn f) { m_drops_price = std::move(f); }
+
+    // How many harvest rows the last FOUND folded (diagnostic; 0 when detached).
+    std::size_t last_harvest_rows() const { return m_last_harvest_rows; }
 
     // ── accessors (for the smoke / a dashboard) ────────────────────────────
     OwedLedger&        ledger()            { return m_ledger; }
@@ -290,6 +350,23 @@ public:
     const RecoveredState& recovered() const { return m_recovered; }
 
 private:
+    // ── ★ DROPS T3: the buried harvest for a win at Monero height H_b ──────
+    // F1: only intervals strictly BELOW the burial frontier may be shown to the
+    // estimator, and take_buried() consumes them so the same interval can never
+    // be folded into two blocks. The frontier is the same D_conf the finalize
+    // driver gates on. Identical to the BTC-family body (btc_node.hpp), because
+    // the F1 contract is the same contract.
+    std::vector<::c2pool::v37n::settle::HarvestedReceipt> buried_harvest(
+        std::uint64_t won_height) {
+        if (!m_drops) { m_last_harvest_rows = 0; return {}; }
+        const std::uint64_t frontier =
+            won_height > m_cfg.d_conf ? won_height - m_cfg.d_conf : 0;
+        if (m_pre_harvest) m_pre_harvest(frontier);   // ★ declare S before release
+        auto rows = m_drops->take_buried(frontier);
+        m_last_harvest_rows = rows.size();
+        return rows;
+    }
+
     // Install the ed25519 point-check backend (which is ALSO what makes the P-1
     // XMR descriptor validator live: xmr_ref_valid() fails closed with no
     // backend). Under V37_XMR_HAVE_MONERO_CRYPTO the ref10 registrar TU has
@@ -338,6 +415,13 @@ private:
     }
 
     void log(const std::string& s) { m_log.push_back(s); }
+
+    // ★ DROPS T3 (XMR arm): all four detached by default — see the seams above.
+    ::c2pool::v37n::DropHarvester*         m_drops  = nullptr;
+    const ::c2pool::v37n::EnrollmentBook*  m_enroll = nullptr;
+    PreHarvestFn                           m_pre_harvest{};
+    DropsPriceFn                           m_drops_price{};
+    std::size_t                            m_last_harvest_rows = 0;
 
     XmrNodeConfig                          m_cfg;
     c2pool::xmr::node::IMonerodTransport&  m_transport;

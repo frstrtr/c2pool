@@ -33,10 +33,26 @@
 //        dimensions; v37_lane.hpp states it stays byte-identical to
 //        for_version(0) on the lane digest)
 //   An operator who wants only one of the two must therefore choose the ARITY,
-//   and that choice is recorded below as kActivationArity. Nothing here picks
-//   it: the default is the arity that activates both, because the V37.1 ridge
-//   flip is itself a ruled, already-minted activation (golden 87c5249a) and
-//   splitting the fleet across two flag days is worse than one.
+//   and that choice is recorded below as kActivationArity.
+//
+//   ★★ RULED: DECOUPLE. kActivationArity is 1 — the flip activates DROPS AND
+//   NOTHING ELSE. The earlier default was 2, on the reasoning that one flag day
+//   beats two; the operator ruling reverses it, and the reason belongs next to
+//   the constant. DROPS and the V37.1 ridge answer to DIFFERENT evidence: DROPS
+//   is a payout-composition change whose live behaviour depends on an enrolment
+//   set that exists on no fleet yet, while the ridge is a lane-geometry change
+//   already minted at golden 87c5249a and wholly independent of who is enrolled.
+//   Binding them means a fleet that has to roll one back rolls back both. At
+//   arity 1 the ridge flip stays available as its own, separately ruled flag day.
+//
+//   WHAT THIS COSTS, STATED PLAINLY. The DROPS activation mint 984c7753 was
+//   composed over `for_version(1, LaneKind)`, i.e. with the ridge ON. At arity 1
+//   a live node's geometry is `for_version(1)` — DROPS on, ridge OFF — so the
+//   fleet's owed_digest over that same schedule is NOT 984c7753. That golden
+//   pins the CANON ACTIVATION SCHEDULE and the composition rule, which is what
+//   it exists for; it is not the arity-1 fleet value, and this header does not
+//   pretend it is. Whichever arity is taken, every node must take the SAME one —
+//   that is what makes it a flag day.
 //
 // ★★ XMR HAS NO RATIFIED LaneKind
 //   nr_ladder.hpp declares `enum class LaneKind { BTC, LTC, DASH, DOGE }`. There
@@ -64,9 +80,9 @@ inline constexpr bool kActivateConsensusV1 = (V37_ACTIVATE_CONSENSUS_V1 != 0);
 
 // Which factory arity the flip uses when it is taken. 2 == for_version(v, lane):
 // DROPS ON and the V37.1 native ridge ON (P = 4096). 1 == for_version(v): DROPS
-// ON, ridge OFF. See the coupling note above; changing this is a second, equally
-// deliberate ruling.
-inline constexpr int kActivationArity = 2;
+// ON, ridge OFF. ★ RULED 1 (DECOUPLE) — see the coupling note above; changing
+// it is a second, equally deliberate ruling and a second flag day.
+inline constexpr int kActivationArity = 1;
 
 // The lane geometry a live node on a RATIFIED LaneKind builds.
 //   OFF (default) => ::v37::LaneParams{}, the OQ-5 ratified V37.0 default and
