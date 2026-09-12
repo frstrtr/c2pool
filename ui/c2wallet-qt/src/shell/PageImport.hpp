@@ -16,10 +16,14 @@
 //     * 25-word (or 24-word) Monero mnemonic -> {spend,view} keys -> primary
 //       address + a few subaddresses
 //
-// All secret material stays in the zeroizing SecureBytes / MoneroKeys the
-// libraries return; this page only renders the resulting PUBLIC addresses.
+// Secret handling: the input QLineEdits are cleared after each action, and the
+// intermediate std::string carrying the secret is securely wiped as it leaves
+// scope. The library key material stays in the zeroizing SecureBytes / MoneroKeys
+// the libraries return; this page only renders the resulting PUBLIC addresses.
 
 #include <QWidget>
+
+#include <string>
 
 class QComboBox;
 class QLineEdit;
@@ -39,11 +43,13 @@ private slots:
     void onImport();
 
 private:
-    void deriveFamilyA_bip39();
-    void deriveFamilyA_wif();
-    void deriveFamilyA_rawhex();
-    void deriveFamilyA_extkey();
-    void deriveFamilyB_monero();
+    // The secret is read once in onImport(), wiped there, and passed in by
+    // const-ref so no method re-reads plaintext from the widget.
+    void deriveFamilyA_bip39(const std::string& mnemonic, const std::string& passphrase);
+    void deriveFamilyA_wif(const std::string& wif);
+    void deriveFamilyA_rawhex(const std::string& hex);
+    void deriveFamilyA_extkey(const std::string& ext);
+    void deriveFamilyB_monero(const std::string& phrase);
 
     QComboBox*      formatCombo_{nullptr};
     QComboBox*      coinCombo_{nullptr};

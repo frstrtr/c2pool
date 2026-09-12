@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Family A (Bitcoin-script) — c2wallet-hdkeys
@@ -31,10 +32,26 @@
 #include "family/monero/addr/MoneroAddress.hpp"
 #include "family/monero/seed/MoneroMnemonic.hpp"
 
+// Zeroizing helper for the intermediate plaintext std::string.
+#include "secure/SecureString.hpp"
+
 namespace hk = c2w::hdkeys;
 namespace xm = c2wallet::monero;
 
 namespace {
+
+// RAII holder that securely wipes a plaintext secret std::string when it leaves
+// scope (design §5.3). Used for the transient string that must be handed to the
+// library import functions (which take std::string), so the plaintext does not
+// linger on the heap after the derivation completes.
+struct ScopedSecret {
+    std::string s;
+    explicit ScopedSecret(std::string v) : s(std::move(v)) {}
+    ~ScopedSecret() { if (!s.empty()) c2w::secure::secure_wipe(&s[0], s.size()); }
+    ScopedSecret(const ScopedSecret&) = delete;
+    ScopedSecret& operator=(const ScopedSecret&) = delete;
+    const std::string& str() const { return s; }
+};
 
 QString hint_label(hk::ScriptHint h)
 {
@@ -71,8 +88,9 @@ PageImport::PageImport(QWidget* parent) : QWidget(parent)
 
     auto* sub = new QLabel(
         QStringLiteral("Import a key and view its derived PUBLIC addresses. "
-                       "Read-only (slice 1) — no signing. Secrets are held in "
-                       "zeroizing buffers and never displayed."),
+                       "Read-only (slice 1) — no signing. Secrets are cleared "
+                       "after use and never displayed; library key material is "
+                       "held in zeroizing buffers."),
         this);
     sub->setWordWrap(true);
     v->addWidget(sub);
@@ -144,18 +162,27 @@ void PageImport::onFormatChanged()
 void PageImport::onImport()
 {
     output_->clear();
+
+    // Read each secret ONCE into a zeroizing holder; the library import calls
+    // receive it by const-ref and the plaintext is wiped when these leave scope.
+    ScopedSecret secret(secretEdit_->text().trimmed().toStdString());
+    ScopedSecret pass(passphraseEdit_->text().toStdString());
+
     switch (formatCombo_->currentIndex()) {
-        case 0: deriveFamilyA_bip39();  break;
-        case 1: deriveFamilyA_wif();    break;
-        case 2: deriveFamilyA_rawhex(); break;
-        case 3: deriveFamilyA_extkey(); break;
-        case 4: deriveFamilyB_monero(); break;
+        case 0: deriveFamilyA_bip39(secret.str(), pass.str()); break;
+        case 1: deriveFamilyA_wif(secret.str());    break;
+        case 2: deriveFamilyA_rawhex(secret.str()); break;
+        case 3: deriveFamilyA_extkey(secret.str()); break;
+        case 4: deriveFamilyB_monero(secret.str()); break;
     }
+
+    // Do not let the plaintext linger in the widgets after we are done with it.
+    secretEdit_->clear();
+    passphraseEdit_->clear();
 }
 
-void PageImport::deriveFamilyA_bip39()
+void PageImport::deriveFamilyA_bip39(const std::string& mnemonic, const std::string& passphrase)
 {
-    const std::string mnemonic = secretEdit_->text().trimmed().toStdString();
     if (mnemonic.empty()) { output_->appendPlainText(QStringLiteral("Enter a mnemonic.")); return; }
 
     hk::Bip39Error e = hk::Bip39::validate(mnemonic, hk::Language::English);
@@ -168,8 +195,7 @@ void PageImport::deriveFamilyA_bip39()
     const hk::CoinParams* coin = hk::coin_by_ticker(ticker);
     if (!coin) { output_->appendPlainText(QStringLiteral("Unknown coin.")); return; }
 
-    c2w::secure::SecureBytes seed =
-        hk::Bip39::to_seed(mnemonic, passphraseEdit_->text().toStdString());
+    c2w::secure::SecureBytes seed = hk::Bip39::to_seed(mnemonic, passphrase);
 
     output_->appendPlainText(QString("BIP39 mnemonic OK (checksum verified).  Coin: %1")
                                  .arg(QString::fromLatin1(coin->ticker)));
@@ -207,9 +233,8 @@ void PageImport::deriveFamilyA_bip39()
     }
 }
 
-void PageImport::deriveFamilyA_wif()
+void PageImport::deriveFamilyA_wif(const std::string& wif)
 {
-    const std::string wif = secretEdit_->text().trimmed().toStdString();
     hk::WifDecode d = hk::decode_wif(wif);
     if (!d.ok) { output_->appendPlainText(QString("Invalid WIF: %1").arg(QString::fromStdString(d.error))); return; }
 
@@ -229,9 +254,8 @@ void PageImport::deriveFamilyA_wif()
     for (const auto& c : cands) output_->appendPlainText(candidate_line(c));
 }
 
-void PageImport::deriveFamilyA_rawhex()
+void PageImport::deriveFamilyA_rawhex(const std::string& hex)
 {
-    const std::string hex = secretEdit_->text().trimmed().toStdString();
     hk::RawHexDecode d = hk::decode_raw_hex(hex, compressedCheck_->isChecked());
     if (!d.ok) { output_->appendPlainText(QString("Invalid raw key: %1").arg(QString::fromStdString(d.error))); return; }
 
@@ -246,9 +270,8 @@ void PageImport::deriveFamilyA_rawhex()
     for (const auto& c : cands) output_->appendPlainText(candidate_line(c));
 }
 
-void PageImport::deriveFamilyA_extkey()
+void PageImport::deriveFamilyA_extkey(const std::string& ext)
 {
-    const std::string ext = secretEdit_->text().trimmed().toStdString();
     auto node = hk::HDKey::parse(ext);
     if (!node) { output_->appendPlainText(QStringLiteral("Unrecognised or invalid extended key (bad prefix/checksum/length).")); return; }
 
@@ -290,9 +313,8 @@ void PageImport::deriveFamilyA_extkey()
     }
 }
 
-void PageImport::deriveFamilyB_monero()
+void PageImport::deriveFamilyB_monero(const std::string& phrase)
 {
-    const std::string phrase = secretEdit_->text().trimmed().toStdString();
     if (phrase.empty()) { output_->appendPlainText(QStringLiteral("Enter a 25-word Monero seed.")); return; }
 
     xm::KeyImportResult r = xm::keys_from_mnemonic(phrase);

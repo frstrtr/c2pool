@@ -14,13 +14,32 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "family/monero/MoneroKey.hpp"
 #include "family/monero/addr/MoneroAddress.hpp"
 #include "family/monero/scan/MoneroScanner.hpp"
 
+#include "secure/SecureString.hpp"
+
 namespace xm = c2wallet::monero;
+
+namespace {
+
+// RAII holder that securely wipes a plaintext secret std::string when it leaves
+// scope (design §5.3): the transient string handed to the Monero import calls
+// (which take std::string) must not linger on the heap after key load.
+struct ScopedSecret {
+    std::string s;
+    explicit ScopedSecret(std::string v) : s(std::move(v)) {}
+    ~ScopedSecret() { if (!s.empty()) c2w::secure::secure_wipe(&s[0], s.size()); }
+    ScopedSecret(const ScopedSecret&) = delete;
+    ScopedSecret& operator=(const ScopedSecret&) = delete;
+    const std::string& str() const { return s; }
+};
+
+}  // namespace
 
 PageScan::PageScan(QWidget* parent) : QWidget(parent)
 {
@@ -63,7 +82,7 @@ PageScan::PageScan(QWidget* parent) : QWidget(parent)
     auto* fullBtn = new QPushButton(QStringLiteral("Load full wallet from seed"), keyBox);
     kbv->addWidget(fullBtn);
 
-    statusLabel_ = new QLabel(QStringLiteral("No account loaded."), keyBox);
+    statusLabel_ = new QLabel(QStringLiteral("No account loaded. Secret inputs are cleared after use."), keyBox);
     statusLabel_->setWordWrap(true);
     kbv->addWidget(statusLabel_);
     v->addWidget(keyBox);
@@ -105,9 +124,10 @@ PageScan::~PageScan() = default;
 void PageScan::onLoadViewOnly()
 {
     scanner_.reset();
-    const std::string sp = spendPubEdit_->text().trimmed().toStdString();
-    const std::string vp = viewPrivEdit_->text().trimmed().toStdString();
-    xm::KeyImportResult r = xm::keys_view_only(sp, vp);
+    const std::string sp = spendPubEdit_->text().trimmed().toStdString();     // public — not secret
+    ScopedSecret vp(viewPrivEdit_->text().trimmed().toStdString());           // secret — wiped on scope exit
+    xm::KeyImportResult r = xm::keys_view_only(sp, vp.str());
+    viewPrivEdit_->clear();                                                   // do not let plaintext linger
     if (!r.ok) {
         statusLabel_->setText(QString("View-only load FAILED: %1").arg(QString::fromStdString(r.error)));
         return;
@@ -123,8 +143,9 @@ void PageScan::onLoadViewOnly()
 void PageScan::onLoadFull()
 {
     scanner_.reset();
-    const std::string phrase = mnemonicEdit_->text().trimmed().toStdString();
-    xm::KeyImportResult r = xm::keys_from_mnemonic(phrase);
+    ScopedSecret phrase(mnemonicEdit_->text().trimmed().toStdString());       // secret — wiped on scope exit
+    xm::KeyImportResult r = xm::keys_from_mnemonic(phrase.str());
+    mnemonicEdit_->clear();                                                   // do not let plaintext linger
     if (!r.ok) {
         statusLabel_->setText(QString("Full seed load FAILED: %1").arg(QString::fromStdString(r.error)));
         return;

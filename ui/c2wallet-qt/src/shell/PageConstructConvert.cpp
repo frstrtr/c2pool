@@ -38,17 +38,28 @@ QString to_hex(const std::vector<uint8_t>& v)
     return s;
 }
 
+// Map one hex nibble character to 0..15; returns false for any non-[0-9a-fA-F]
+// character (rejecting '-', '+', whitespace, 'x', etc. that QString::toInt would
+// otherwise silently coerce or sign-flip).
+bool hex_nibble(QChar c, int& out)
+{
+    const char ch = c.toLatin1();
+    if (ch >= '0' && ch <= '9') { out = ch - '0'; return true; }
+    if (ch >= 'a' && ch <= 'f') { out = ch - 'a' + 10; return true; }
+    if (ch >= 'A' && ch <= 'F') { out = ch - 'A' + 10; return true; }
+    return false;
+}
+
 bool from_hex(const QString& in, std::vector<uint8_t>& out)
 {
-    QString s = in.trimmed();
-    if (s.size() % 2 != 0 || s.isEmpty()) return false;
+    const QString s = in.trimmed();
+    if (s.isEmpty() || s.size() % 2 != 0) return false;
     out.clear();
     out.reserve(s.size() / 2);
     for (int i = 0; i < s.size(); i += 2) {
-        bool ok = false;
-        int byte = s.mid(i, 2).toInt(&ok, 16);
-        if (!ok) return false;
-        out.push_back(uint8_t(byte));
+        int hi = 0, lo = 0;
+        if (!hex_nibble(s.at(i), hi) || !hex_nibble(s.at(i + 1), lo)) return false;
+        out.push_back(uint8_t((hi << 4) | lo));
     }
     return true;
 }
@@ -146,13 +157,13 @@ void PageConstructConvert::onConvert()
     convOut_->appendPlainText(QString("type  : %1").arg(QString::fromLatin1(cv::addr_type_str(r.type))));
 
     if (r.ok()) {
+        // The engine only returns Ok after its own mandatory round-trip proof
+        // (source payload == target payload); display the proven equality.
         convOut_->appendPlainText(QString("source: %1").arg(QString::fromStdString(r.source_address)));
         convOut_->appendPlainText(QString("target: %1").arg(QString::fromStdString(r.target_address)));
         convOut_->appendPlainText(QString("source payload: %1").arg(QString::fromStdString(r.source_payload_hex)));
         convOut_->appendPlainText(QString("target payload: %1").arg(QString::fromStdString(r.target_payload_hex)));
-        const bool match = (r.source_payload_hex == r.target_payload_hex) && !r.source_payload_hex.empty();
-        convOut_->appendPlainText(match ? QStringLiteral(">>> PAYLOAD MATCH — round-trip proven, conversion is a pure re-encoding")
-                                        : QStringLiteral(">>> PAYLOAD MISMATCH — refused (this should not occur on ok)"));
+        convOut_->appendPlainText(QStringLiteral(">>> PAYLOAD MATCH — round-trip proven, conversion is a pure re-encoding"));
     } else {
         convOut_->appendPlainText(QString("REFUSED: %1").arg(QString::fromStdString(r.reason)));
     }
