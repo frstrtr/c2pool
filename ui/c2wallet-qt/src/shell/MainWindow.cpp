@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "shell/MainWindow.hpp"
 
+#include "shell/PageConstructConvert.hpp"
+#include "shell/PageImport.hpp"
+#include "shell/PageScan.hpp"
+
 #include <QFont>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -10,59 +14,58 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
-namespace {
-
-// The sidebar sections for the signer shell, in Bitcoin-Core-like order.
-// M0 wires them as empty placeholders only.
-struct Section {
-    const char* name;
-    const char* note;
-};
-
-const Section kSections[] = {
-    {"Wallets",
-     "Import keys and enumerate candidate addresses (Family A: secp256k1; "
-     "Family B: Monero). Arrives in phases M1-A / M1-X."},
-    {"Construct",
-     "Build unsigned transactions and spend every script/output type. "
-     "Arrives in phases M2-A / M3-A / M4-A and M4-X."},
-    {"Sign",
-     "Confirm, sign, and self-verify offline before emitting the signed "
-     "artifact. Arrives in phases M3 / M4."},
-    {"Convert",
-     "Cross-coin address conversion within Family A, with the #961 "
-     "money-misdirection guard. Arrives in phase M2-A."},
-    {"Settings",
-     "Wallet preferences and the encrypted-store / ephemeral-seed modes. "
-     "Arrives alongside key custody in M1."},
-};
-
-}  // namespace
-
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
     setWindowTitle("c2wallet-qt (signer) — offline / network-incapable");
-    resize(1100, 720);
+    resize(1100, 760);
 
-    // ── Central area: sidebar nav + stacked placeholder pages ──────────────
+    // ── Central area: sidebar nav + stacked pages ─────────────────────────
     auto* central = new QWidget(this);
     auto* layout = new QHBoxLayout(central);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
 
     navList_ = new QListWidget(central);
-    navList_->setFixedWidth(180);
+    navList_->setFixedWidth(200);
     layout->addWidget(navList_);
 
     stack_ = new QStackedWidget(central);
     layout->addWidget(stack_, 1);
 
-    for (const auto& s : kSections) {
-        navList_->addItem(QString::fromLatin1(s.name));
-        stack_->addWidget(makePlaceholderPage(QString::fromLatin1(s.name),
-                                              QString::fromLatin1(s.note)));
-    }
+    // Functional (slice 1) screens — wired to the merged offline libraries.
+    navList_->addItem(QStringLiteral("Import / Load Key"));
+    stack_->addWidget(new PageImport(stack_));
+
+    navList_->addItem(QStringLiteral("Construct + Convert"));
+    stack_->addWidget(new PageConstructConvert(stack_));
+
+    navList_->addItem(QStringLiteral("Scan (Monero view-only)"));
+    stack_->addWidget(new PageScan(stack_));
+
+    // Slice-2 (pending review) stubs — visible but not implemented here. No
+    // money-path signing UX lands in slice 1.
+    navList_->addItem(QStringLiteral("Sign & Self-Verify"));
+    stack_->addWidget(makeStubPage(
+        QStringLiteral("Sign & Self-Verify"),
+        QStringLiteral("Confirm every output/amount/address, sign offline, and "
+                       "self-verify before emitting the signed artifact "
+                       "(RFC6979 / BIP340). Wires the merged signer + Monero "
+                       "prover libraries.")));
+
+    navList_->addItem(QStringLiteral("Build Transaction"));
+    stack_->addWidget(makeStubPage(
+        QStringLiteral("Build Transaction"),
+        QStringLiteral("Coin-control and the unsigned transaction builder for "
+                       "every script/output type (Family A) and RingCT spends "
+                       "(Family B).")));
+
+    navList_->addItem(QStringLiteral("Air-Gap Transfer"));
+    stack_->addWidget(makeStubPage(
+        QStringLiteral("Air-Gap Transfer"),
+        QStringLiteral("PSBT-like / unsigned_txset import and signed-artifact "
+                       "export over file or multi-frame QR, plus the c2pool "
+                       "validate-seam dry-run.")));
 
     connect(navList_, &QListWidget::currentRowChanged,
             stack_, &QStackedWidget::setCurrentIndex);
@@ -78,8 +81,7 @@ MainWindow::MainWindow(QWidget* parent)
     statusBar()->addWidget(offline);
 }
 
-QWidget* MainWindow::makePlaceholderPage(const QString& title,
-                                         const QString& note)
+QWidget* MainWindow::makeStubPage(const QString& title, const QString& note)
 {
     auto* page = new QWidget(stack_);
     auto* v = new QVBoxLayout(page);
@@ -94,13 +96,18 @@ QWidget* MainWindow::makePlaceholderPage(const QString& title,
     heading->setFont(f);
     v->addWidget(heading);
 
+    auto* badge = new QLabel(QStringLiteral("slice 2 — pending review"), page);
+    QFont bf = badge->font();
+    bf.setBold(true);
+    badge->setFont(bf);
+    badge->setStyleSheet(QStringLiteral(
+        "color: #7a4a00; background: #ffe8b3; border: 1px solid #d9a520; "
+        "border-radius: 4px; padding: 3px 8px;"));
+    v->addWidget(badge, 0, Qt::AlignLeft);
+
     auto* body = new QLabel(note, page);
     body->setWordWrap(true);
     v->addWidget(body);
-
-    auto* stub = new QLabel(QStringLiteral("Not implemented in M0."), page);
-    stub->setEnabled(false);
-    v->addWidget(stub);
 
     return page;
 }
