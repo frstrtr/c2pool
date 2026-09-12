@@ -13,10 +13,10 @@ class QStackedWidget;
 // of ui/c2pool-qt/ (MainWindow + sidebar + stacked pages) WITHOUT reusing any
 // of its networked dependencies — this window links only Qt Widgets/Gui/Core.
 //
-// M0 delivers an empty skeleton: the sidebar sections (Wallets / Construct /
-// Sign / Convert / Settings) are present as placeholders with no functionality
-// behind them. Real pages, key import, construction and signing land in later
-// phases (see docs/design/c2wallet-qt.md §6).
+// M6 SLICE 1 wires the read/construct flows against the merged offline
+// libraries: Import/Load key, Construct+Convert, and Scan (Monero view-only).
+// The signing / tx-build / air-gap-transfer screens are visible stubs labelled
+// "slice 2 — pending review" — no money-path signing UX in this slice.
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -24,9 +24,8 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
 
 private:
-    // Build one placeholder page for a sidebar section. M0 has no real screens
-    // yet; each section shows its name and a short "not implemented in M0" note.
-    QWidget* makePlaceholderPage(const QString& title, const QString& note);
+    // Build a visible stub page for a slice-2 (pending-review) section.
+    QWidget* makeStubPage(const QString& title, const QString& note);
 
     QListWidget*    navList_{nullptr};
     QStackedWidget* stack_{nullptr};
