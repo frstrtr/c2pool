@@ -952,41 +952,138 @@ private:
                     continue;
                 }
             }
-            // (b) ★ canonical_coinbase_matches = (a) PEER-RECOMPUTE. The winner
-            //     broadcast a SETTLING coinbase: its option-B K_fair outputs paid
-            //     owed balances, and that map is not on the frozen v0x02 wire
-            //     (unbounded by construction). It used to be refused outright,
-            //     which forked the two ledgers from the first settling block.
+            // (b0) c2pool#1627's DROPS credit map rode the same v0x03 frame and
+            //      this build has no DROPS ledger leg to apply it with. Crediting
+            //      E_b while dropping a credit the winner applied is exactly the
+            //      divergence the sections exist to close, so the block is
+            //      refused, loudly, rather than half-accounted. (Reconciled at
+            //      the wire-integration merge — see w3_relay.hpp's banner.)
+            if (w.drops_carried) {
+                ++m_s1p.refused_payout;
+                ++t.peer_refused;
+                say("S-1c REFUSED " + short_bid(bid) + " h=" + std::to_string(w.h_b) +
+                    ": the carrier brought a v0x03 DROPS credit map (c2pool#1627) and this "
+                    "build has no DROPS ledger leg to fold it with — crediting E_b while "
+                    "ignoring a credit the winner applied would fork the two ledgers");
+                continue;
+            }
+            // (b) ★★ WIRE-CARRY (c2pool#1625). The winner broadcast a SETTLING
+            //     coinbase: its option-B K_fair outputs paid owed balances, so at
+            //     FINALIZE the winner does finalW -= payout and a peer that
+            //     deducts nothing has forked from that block on.
             //
-            //     Now it is RECOMPUTED: K_fair is OwedLedger::propose_coinbase,
-            //     deterministic over the ledger state, and THIS node already ran
-            //     it for its OWN option-B template at this very height — at the
-            //     winner's instant, because both nodes build h=H_b when their tip
-            //     is H_b-1. xmr_peer_payout_recompute.hpp hands that map back
-            //     only when our owed_digest at that build EQUALS the winner's at
-            //     the win; every other shape stays the loud fail-closed refusal.
-            Amounts recomputed;
+            //     WHAT THIS REPLACES, AND WHY. The first answer was to RECOMPUTE
+            //     the map — K_fair is OwedLedger::propose_coinbase, deterministic
+            //     over ledger state, and this node runs it for its own template
+            //     at the same height. It converged BYTE-EQUAL for the first four
+            //     settling blocks of a 2-node regtest and forked terminally at
+            //     the fifth, refusing every settling block after it. The maps are
+            //     byte-exact where the two states match; the defect is that
+            //     nothing makes them match. Two daemons sample their ledgers on
+            //     independent clocks, so "both nodes build h=H_b when their tip is
+            //     H_b-1" is a tendency, not an invariant, and the first skew is
+            //     unrecoverable: the guards correctly refuse, the peer books
+            //     nothing, and the ledgers never rejoin.
+            //
+            //     So the map is CARRIED instead. The winner knows it exactly —
+            //     it is the Owed-role output set of the template it mined, the
+            //     very map its own ledger booked (PendingRec::payout) — and puts
+            //     it on the v0x03 trailer. Here it is FOLDED VERBATIM: no
+            //     recompute, no template build to compare against, no
+            //     same-instant requirement anywhere. The two-clock dependency is
+            //     gone, which is why this converges THROUGH every settling block
+            //     instead of until the first skew.
+            //
+            //     FAIL-CLOSED, and only on the things that stay wrong under
+            //     retry: a missing section (the winner could not tell us), a row
+            //     the ledger cannot key, or a total the frame's own reward cannot
+            //     cover. A TIMING SKEW IS NEVER A REFUSAL HERE — that is the
+            //     whole point of the switch.
+            Amounts carried;
             if (w.payout_emitted) {
-                if (!m_recompute) {
+                if (!w.payout_carried) {
                     ++m_s1p.refused_payout;
-                    ++t.peer_refused;
-                    say("S-1c REFUSED " + short_bid(bid) + ": the winner's coinbase had already "
-                        "EMITTED owed outputs and no K_fair recompute is armed on this node "
-                        "(option A, --owed-demo-amount, or no settlement template) — we credit "
-                        "nothing rather than credit something different");
-                    continue;
-                }
-                const XmrPeerPayoutOutcome ro = m_recompute(w);
-                say(describe_recompute(bid, w, ro));
-                if (!ro.ok) {
-                    ++m_s1p.refused_payout;
+                    ++m_s1p.payout_absent;
                     ++t.peer_refused;
                     say("S-1c REFUSED " + short_bid(bid) + " h=" + std::to_string(w.h_b) +
-                        ": the winner's settled payout could NOT be reproduced here — our "
-                        "owed_digest will NOT converge with the winner's for this block");
+                        ": the winner's descriptor says its coinbase SETTLED owed balances but "
+                        "carried no v0x03 K_fair section (a pre-v0x03 peer, or a winner that "
+                        "could not state its own map) — we credit nothing rather than credit "
+                        "something different");
                     continue;
                 }
-                recomputed = ro.payout;
+                // Shape, re-asked at the fold. The codec already enforced the
+                // wire rules (bounded, strictly ascending, every amount > 0,
+                // Sum <= reward); this is the LEDGER's half of the same question,
+                // and it is asked here so a map that cannot be booked is refused
+                // before anything is registered rather than after.
+                std::uint64_t sum = 0;
+                bool shape_ok = !w.payout.empty();
+                for (const auto& [k, v] : w.payout) {
+                    (void)k;
+                    // Ordered so the accumulator can never wrap: each row is
+                    // compared to the budget before it is added, so `reward - sum`
+                    // is the remaining budget and is never a borrow.
+                    if (v <= 0) { shape_ok = false; break; }
+                    const std::uint64_t amt = static_cast<std::uint64_t>(v);
+                    if (amt > w.reward || sum > w.reward - amt) { shape_ok = false; break; }
+                    sum += amt;
+                }
+                if (!shape_ok) {
+                    ++m_s1p.refused_payout;
+                    ++m_s1p.payout_shape;
+                    ++t.peer_refused;
+                    say("S-1c REFUSED " + short_bid(bid) + " h=" + std::to_string(w.h_b) +
+                        ": the carried K_fair map is not a bookable shape (" +
+                        std::to_string(w.payout.size()) + " row(s), Sum=" + std::to_string(sum) +
+                        " against reward " + std::to_string(w.reward) + ")");
+                    continue;
+                }
+                carried = w.payout;
+                if (first_look) {
+                    say("S-1c WIRE-CARRY " + short_bid(bid) + " h=" + std::to_string(w.h_b) +
+                        ": folding the WINNER'S K_fair map, " + std::to_string(carried.size()) +
+                        " owed key(s)/" + std::to_string(sum) + " pico of reward " +
+                        std::to_string(w.reward) + " — no recompute, no same-instant requirement");
+                }
+                // The old recompute, demoted to a NON-AUTHORITATIVE cross-check.
+                // It can only ever say "our own K_fair run for this height agreed
+                // with the winner's"; a disagreement is a diagnostic about the
+                // two template clocks, NOT a reason to refuse a map the winner
+                // already spent. Nothing below reads its verdict.
+                if (m_recompute && first_look) {
+                    const XmrPeerPayoutOutcome ro = m_recompute(w);
+                    if (!ro.ok) {
+                        ++m_s1p.xcheck_absent;
+                        say("S-1c xcheck [" + std::string(ro.code) + "] " + short_bid(bid) +
+                            ": the local recompute had no comparable map (" + ro.refusal +
+                            ") — NOT a refusal; the carried map stands");
+                    } else if (ro.payout == carried) {
+                        ++m_s1p.xcheck_agree;
+                        say("S-1c xcheck AGREE " + short_bid(bid) + " h=" +
+                            std::to_string(w.h_b) + ": our own K_fair run produced the SAME map");
+                    } else {
+                        ++m_s1p.xcheck_differ;
+                        say("S-1c xcheck DIFFER " + short_bid(bid) + " h=" +
+                            std::to_string(w.h_b) + ": our own K_fair run proposed " +
+                            std::to_string(ro.payout.size()) + " key(s)/" +
+                            std::to_string(ro.sum) + " pico where the winner paid " +
+                            std::to_string(carried.size()) + " key(s)/" + std::to_string(sum) +
+                            " pico — the two template clocks were apart at this height. This is "
+                            "EXACTLY the skew the recompute path could not survive and is NOT a "
+                            "refusal: the winner's map is what its coinbase spent");
+                    }
+                }
+            } else if (w.payout_carried) {
+                // A map on a descriptor that denies settling. The codec refuses
+                // this shape outright, so reaching it means the wire and this
+                // consumer disagree about the frozen rule — refuse, loudly.
+                ++m_s1p.refused_payout;
+                ++m_s1p.payout_shape;
+                ++t.peer_refused;
+                say("S-1c REFUSED " + short_bid(bid) + ": a K_fair map arrived on a descriptor "
+                    "whose payout_emitted is 0 — the frame contradicts itself");
+                continue;
             }
             // (c) too late: advance_to_tip steps only heights ABOVE the cursor,
             //     so the FOUND would sit pending forever.
@@ -1048,13 +1145,13 @@ private:
 
             m_last_peer_cut = f.cut;
             Amounts credit = f.cut.credit;
-            // ★ (a) peer-recompute: the payout leg. EMPTY for a non-settling win
-            // (the winner's coinbase paid no ledger key, so there is nothing to
-            // deduct and the whole entitlement carries — the pre-(a) shape); the
-            // RECOMPUTED K_fair map for a settling one, so this ledger deducts
+            // ★★ WIRE-CARRY: the payout leg. EMPTY for a non-settling win (the
+            // winner's coinbase paid no ledger key, so there is nothing to deduct
+            // and the whole entitlement carries); the winner's OWN K_fair map,
+            // off the v0x03 trailer, for a settling one — so this ledger deducts
             // exactly what the winner's did at FINALIZE (finalW -= payout) and
             // the next template here cannot re-propose what that block paid.
-            Amounts payout = recomputed;
+            Amounts payout = carried;
 
             c2pool::xmr::node::Hash id{};
             if (!hash_from_hex(bid, id) || c2pool::xmr::node::is_zero(id)) {
@@ -1093,16 +1190,16 @@ private:
             // and the driver disagreeing about a settlement that is correct.
             m_race.observe_own(w.h_b, bid);
             if (f.cut.valueless) ++m_s1p.valueless; else ++m_s1p.credited;
-            // Counted at REGISTRATION, once per block: a cut-miss retry re-runs
-            // the (pure) recompute, and counting there would report a multiple
-            // of the number of blocks actually settled from a peer.
-            if (w.payout_emitted) ++m_s1p.payout_recomputed;
+            // Counted at REGISTRATION, once per block: a cut-miss retry re-drives
+            // the (pure) fold, and counting there would report a multiple of the
+            // number of blocks actually settled from a peer.
+            if (w.payout_emitted) ++m_s1p.payout_carried;
             ++t.peer_credited;
             say(describe_cut("PEER WIN", bid, w.h_b, f.cut));
             say("S-1c PEER FOUND registered " + short_bid(bid) + " h=" + std::to_string(w.h_b) +
                 " E_b=" + std::to_string(credit.size()) + " keys payout=" +
                 std::to_string(payout.size()) + " keys/" + std::to_string(amounts_sum(payout)) +
-                " pico" + (w.payout_emitted ? " [RECOMPUTED K_fair]" : "") +
+                " pico" + (w.payout_emitted ? " [WIRE-CARRIED K_fair]" : "") +
                 " at the winner's cut P=" +
                 std::to_string(w.cut_next_pos) + " (our lane version " +
                 std::to_string(f.cut.lane_version) + ") owed_digest=" +

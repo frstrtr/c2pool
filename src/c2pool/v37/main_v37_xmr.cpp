@@ -434,9 +434,17 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                 // something to settle, and a peer that is told otherwise credits
                 // E_b while deducting nothing — a silent divergence. See
                 // XmrCarrierStack::mint_block_winner.
+                // ★★ WIRE-CARRY: `rec.payout` IS the K_fair owed-deduction map
+                // this block's coinbase paid — the Owed-role outputs carried all
+                // the way from the template snapshot its bytes were built from,
+                // and the very map this node's own ledger just booked. Sending
+                // that same object is what makes "received map == the winner's
+                // actual coinbase owed-set" true by construction rather than by
+                // a comparison that could drift.
                 (void)stack->mint_block_winner(bid, rec.height, rec.prev_id_hex, cut,
                                                node.ledger().owed_digest(),
-                                               /*payout_emitted=*/!rec.payout.empty());
+                                               /*payout_emitted=*/!rec.payout.empty(),
+                                               rec.payout);
             });
     }
 
@@ -630,10 +638,14 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(cs.cut_carried),
                             static_cast<unsigned long long>(cs.relayed),
                             static_cast<unsigned long long>(cs.deferred_relay));
+                std::printf("  carrier send (v0x03 section 2): K_fair maps carried=%llu "
+                            "settling-wins-without-one=%llu\n",
+                            static_cast<unsigned long long>(cs.payout_carried),
+                            static_cast<unsigned long long>(cs.payout_missing));
                 std::printf("  carrier inbound: frames=%llu admitted=%llu echo=%llu "
                             "wire_rejected=%llu policy_rejected=%llu admit_rejected=%llu | "
                             "S-1c cut_frames=%llu offered=%llu credited=%llu valueless=%llu "
-                            "recomputed=%llu "
+                            "wire-carried=%llu "
                             "cut_miss=%llu cut_mismatch=%llu refused[fold=%llu payout=%llu "
                             "late=%llu] known=%llu owed_skew=%llu\n",
                             static_cast<unsigned long long>(ib.frames.load()),
@@ -646,7 +658,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(ib.cut_offered.load()),
                             static_cast<unsigned long long>(s1p.credited),
                             static_cast<unsigned long long>(s1p.valueless),
-                            static_cast<unsigned long long>(s1p.payout_recomputed),
+                            static_cast<unsigned long long>(s1p.payout_carried),
                             static_cast<unsigned long long>(s1p.cut_miss),
                             static_cast<unsigned long long>(s1p.cut_mismatch),
                             static_cast<unsigned long long>(s1p.refused_fold),
@@ -654,6 +666,22 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(s1p.refused_late),
                             static_cast<unsigned long long>(s1p.already_known),
                             static_cast<unsigned long long>(s1p.owed_skew));
+                // ★★ THE WIRE-CARRY ACCOUNT. `carried` is the claim — a settling
+                // peer block whose K_fair deduction map arrived on the wire and
+                // was folded verbatim. `absent`/`shape` are the two fail-closed
+                // refusals that remain; NEITHER of them is a timing skew, which
+                // is the property that separates this from the recompute path.
+                // xcheck is diagnostics only: `differ` says the two template
+                // clocks were apart at that height and the fold went ahead
+                // anyway, which is exactly what the recompute could not do.
+                std::printf("  WIRE-CARRY (v0x03 K_fair): carried=%llu refused[absent=%llu "
+                            "shape=%llu] | local xcheck agree=%llu differ=%llu no-map=%llu\n",
+                            static_cast<unsigned long long>(s1p.payout_carried),
+                            static_cast<unsigned long long>(s1p.payout_absent),
+                            static_cast<unsigned long long>(s1p.payout_shape),
+                            static_cast<unsigned long long>(s1p.xcheck_agree),
+                            static_cast<unsigned long long>(s1p.xcheck_differ),
+                            static_cast<unsigned long long>(s1p.xcheck_absent));
             } else {
                 std::printf("  lane: NO CARRIER LAYER (--p2p-bind/--peer unset and no pool "
                             "identity): shares do not reach the lane, so E_b folds to {} and "
@@ -1182,13 +1210,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return true;
             });
 
-        // ── ★ canonical_coinbase_matches = (a): the K_fair PEER-RECOMPUTE ─────
-        // Every template this node builds is one K_fair run of
-        // OwedLedger::propose_coinbase over its own owed ledger. Recording the
-        // Owed-role outputs of that template, per height, is what lets a PEER's
-        // settling block be credited here with the SAME deduction the winner
-        // made — the payout map is unbounded and is deliberately not on the
-        // frozen v0x02 carrier wire, so it is reproduced rather than shipped.
+        // ── ★★ the K_fair recompute, DEMOTED TO A LOCAL CROSS-CHECK ──────────
+        // A settling peer block is now credited with the map the WINNER CARRIED
+        // on the v0x03 trailer (w3_relay.hpp KfairPayout), folded verbatim. This
+        // recompute — the node's own K_fair run for the same height — is kept
+        // only to answer, as diagnostics, whether the two template clocks
+        // happened to agree at that height. Nothing refuses on its verdict: it
+        // could not reproduce the winner's state reliably, which is precisely
+        // why the map is carried instead. Leaving it armed costs one pure lookup
+        // per settling peer block and turns the old failure mode into a number
+        // an auditor can watch (WIRE-CARRY xcheck differ).
         //
         // WHY THE RECORD IS TAKEN HERE AND NOWHERE ELSE. K_fair is a pure
         // function of the ledger STATE, and the two nodes share that state at
@@ -1215,14 +1246,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                     });
             });
         }
-        std::printf("K_fair peer-recompute: %s (canonical_coinbase_matches = (a): a SETTLING "
-                    "peer block is credited with the payout OUR OWN K_fair run for that height "
-                    "proposed, admitted only when our owed_digest at that build equals the "
-                    "winner's at the win)\n",
+        std::printf("K_fair settlement: WIRE-CARRY (wire v0x03 section 2) — a SETTLING peer "
+                    "block is credited with the owed-deduction map the WINNER carried, folded "
+                    "verbatim, with no recompute and no same-instant requirement. Local "
+                    "cross-check: %s (diagnostics only; it never refuses a carried map)\n",
                     kfair_recompute_armed
                         ? "ARMED"
                         : "DISARMED (--owed-demo-amount: the coinbase settles the proof fixture, "
                           "not this ledger)");
+        std::printf("carrier wire: %s\n", ::c2pool::v37n::wire_freeze::flag_day_id());
 
         o2::SettlementStratumTemplateSource template_source(provider);
         std::printf("coinbase: %s (lane_chain=%u, residual sink %s)\n",

@@ -120,6 +120,14 @@ struct OwnWinRequest {
     // then accounts the SHARE and credits NOTHING for the block — visible as a
     // convergence miss on the receiving side, never a silent divergence.
     std::optional<CutDescriptor> cut;
+    // ★★ WIRE-CARRY (wire v0x03 section 2, c2pool#1625): the block's own K_fair
+    // owed-DEDUCTION map, so a peer folds what this node's coinbase actually
+    // paid instead of recomputing it from a ledger state it cannot match on
+    // demand. Set only alongside `cut`, and only when cut->payout_emitted is
+    // true; the codec refuses every other shape rather than picking between two
+    // statements about the same block. UNSET leaves the frame byte-identical to
+    // the v0x02-era block-winner carrier plus its two zero section bytes.
+    std::optional<KfairPayout> payout;
 };
 
 // Build a request from the raw stratum solve fields. `header` is the 80-byte
@@ -195,6 +203,8 @@ struct CarrierSendStats {
     std::uint64_t rejected = 0;           // minted but W2 rejected (dedup / target / chain)
     std::uint64_t block_winners = 0;      // of admitted: went through append_block_winner
     std::uint64_t cut_carried = 0;        // S-1c: block wins that carried a v0x02 cut descriptor
+    std::uint64_t payout_carried = 0;     // ★★ v0x03: block wins that carried a K_fair map
+    std::uint64_t payout_missing = 0;     // settling wins that went out WITHOUT one
     std::uint64_t cut_missing = 0;        // S-1c: block wins emitted WITHOUT one (peers credit nothing)
     std::uint64_t relayed = 0;            // reached >= 1 peer
     std::uint64_t deferred_relay = 0;     // admitted but 0 peers (DEFER, never dropped)
@@ -345,6 +355,7 @@ public:
         unsigned lz_bits = 0;
         bool used_fallback = false;
         bool carried_cut = false;            // S-1c: a v0x02 cut descriptor rode out
+        bool carried_payout = false;         // ★★ v0x03 section 2 rode out with it
         CarrierRelay::Outcome relay;         // valid iff ADMITTED/REJECTED
     };
 
@@ -413,6 +424,23 @@ public:
         if (req.won_block && req.cut) {
             c.cut = req.cut;
             o.carried_cut = true;
+            // ★★ v0x03 section 2. Guarded by the SAME predicate the codec uses,
+            // so a request that would make encode() return an empty vector is
+            // caught here — where it can be logged against a named block —
+            // rather than surfacing as a mute relay failure.
+            if (req.payout && req.cut->payout_emitted &&
+                CarrierWire::payout_encodable(*req.payout, req.cut->reward)) {
+                c.payout = req.payout;
+                o.carried_payout = true;
+            } else if (req.payout) {
+                log(true, "[carrier-send] BLOCK WIN " + req.tag + ": the K_fair payout map is "
+                          "not wire-expressible against this descriptor (payout_emitted=" +
+                          std::string(req.cut->payout_emitted ? "1" : "0") + ", reward=" +
+                          std::to_string(req.cut->reward) + ", rows=" +
+                          std::to_string(req.payout->pay.size()) + ") — section 2 is OMITTED and "
+                          "every peer will fail-closed on this block rather than fold a map we "
+                          "could not state exactly");
+            }
         }
         // W3-G1: a block-winning carrier is appended UNCONDITIONALLY (no relay
         // dedup, no backpressure gate); an ordinary share takes the local path.
@@ -426,10 +454,17 @@ public:
             o.status = EmitOutcome::Status::ADMITTED;
             m_chains.advance(o.identity, o.hash);     // chain forward only on a real append
             const bool used_fb = o.used_fallback, won = req.won_block, cut = o.carried_cut;
+            const bool pay = o.carried_payout;
+            const bool settling = req.cut && req.cut->payout_emitted;
             const auto reached = o.relay.peers_reached;
             bump([&](CarrierSendStats& s) {
                 ++s.admitted;
-                if (won) { ++s.block_winners; if (cut) ++s.cut_carried; else ++s.cut_missing; }
+                if (won) {
+                    ++s.block_winners;
+                    if (cut) ++s.cut_carried; else ++s.cut_missing;
+                    if (pay) ++s.payout_carried;
+                    else if (settling) ++s.payout_missing;
+                }
                 if (used_fb) ++s.fallback_identity;
                 if (reached) { ++s.relayed; s.peers_reached_total += reached; }
                 else ++s.deferred_relay;
@@ -443,7 +478,13 @@ public:
                        (req.won_block ? (o.carried_cut
                             ? " [S-1c cut P=" + std::to_string(req.cut->cut_next_pos) +
                               " H_b=" + std::to_string(req.cut->h_b) +
-                              " reward=" + std::to_string(req.cut->reward) + "]"
+                              " reward=" + std::to_string(req.cut->reward) +
+                              (o.carried_payout
+                                   ? " | WIRE-CARRY K_fair " +
+                                         std::to_string(c.payout->pay.size()) + " row(s)"
+                                   : (req.cut->payout_emitted
+                                          ? " | NO K_fair section: peers fail-closed"
+                                          : " | no settlement")) + "]"
                             : " [S-1c NO CUT DESCRIPTOR: peers credit nothing for this block]")
                           : ""));
             if (req.won_block && !o.carried_cut)

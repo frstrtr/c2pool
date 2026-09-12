@@ -105,12 +105,14 @@ public:
                    "frozen golden; refusing to peer\n" + sc.log;
         say(false, "[v37-xmr-carrier] wire-freeze selfcheck OK [" +
                        std::string(wire_freeze::layout_id()) + " | " +
-                       std::string(wire_freeze::layout_id_v2()) + "] " +
+                       std::string(wire_freeze::layout_id_v2()) + " | " +
+                       std::string(wire_freeze::layout_id_v3()) + "] " +
                        std::to_string(sc.checks) + " checks; tag cap=" +
                        std::to_string(wire_freeze::kTagMaxBytes));
         say(true, "[v37-xmr-carrier] " + std::string(wire_freeze::flag_day_id()) +
-                      " — this build EMITS v0x02 and ACCEPTS {v0x01,v0x02}; a v0x01-only peer "
-                      "will REJECT our frames (expected at the flag day)");
+                      " — a peer that does not speak this build's wire version will REJECT "
+                      "our frames outright (expected at the flag day; loud, never a silently "
+                      "half-read settlement trailer)");
 
         auto snap = m_node.engine().snapshot(m_chain);
         const std::uint64_t incarnation = snap ? snap->incarnation : 1;
@@ -200,10 +202,16 @@ public:
     // side reproduction of a K_fair payout is the open `canonical_coinbase_
     // matches` ACCEPT-gate ruling (xmr_o2_settlement_provider.hpp banner), not
     // something this path may invent.
+    // `payout` is the block's OWN K_fair owed-deduction map — the Owed-role
+    // coinbase outputs this block actually paid, exactly as the ledger booked
+    // them (FinalizeConnect::PendingRec::payout). It rides the v0x03 trailer so
+    // a peer FOLDS it instead of recomputing it; `payout_emitted` stays the
+    // truth about whether there was anything to carry.
     bool mint_block_winner(const std::string& bid_hex, std::uint64_t h_b,
                            const std::string& prev_id_hex, const XmrEbCut& cut,
                            const ::v37::bytes32& owed_at_win,
-                           bool payout_emitted = false) {
+                           bool payout_emitted = false,
+                           const settle::OwedLedger::Amounts& payout = {}) {
         if (!m_send) return false;
         ::c2pool::xmr::node::Hash prev{};
         if (!parse_hex32(prev_id_hex, prev)) {
@@ -231,6 +239,31 @@ public:
                 d.payout_emitted     = payout_emitted;   // ★ R-7: the truth, not a constant
                 d.owed_digest_at_win = owed_at_win;
                 req.cut = d;
+                // ★★ WIRE-CARRY: the v0x03 section 2 map. Built ONLY when the
+                // coinbase actually settled, and only from rows the wire can
+                // express (strictly positive, inside the reward). A row the wire
+                // would refuse is not silently dropped — the whole map is left
+                // off and payout_emitted alone tells the peer to fail closed,
+                // which is the loud outcome, not the lossy one.
+                if (payout_emitted && !payout.empty()) {
+                    KfairPayout k;
+                    k.pay.reserve(payout.size());
+                    bool sane = true;
+                    for (const auto& [id, amt] : payout) {
+                        if (amt <= 0) { sane = false; break; }
+                        k.pay.emplace_back(id, static_cast<std::uint64_t>(amt));
+                    }
+                    if (sane && CarrierWire::payout_encodable(k, cut.reward)) {
+                        req.payout = std::move(k);
+                    } else {
+                        say(true, "[v37-xmr-carrier] WIRE-CARRY: our own K_fair map for " +
+                                  bid_hex + " is not wire-expressible (" +
+                                  std::to_string(payout.size()) + " row(s) against reward " +
+                                  std::to_string(cut.reward) + ") — the block-winner carrier "
+                                  "goes out WITHOUT section 2, so every peer fail-closes on it "
+                                  "instead of folding a map we could not state exactly");
+                    }
+                }
             }
         } else {
             say(true, "[v37-xmr-carrier] S-1c: no cut descriptor for " + bid_hex +
@@ -298,6 +331,21 @@ private:
         w.reward             = o.cut->reward;
         w.payout_emitted     = o.cut->payout_emitted;
         w.owed_digest_at_win = o.cut->owed_digest_at_win;
+        // ★★ WIRE-CARRY: hand the winner's K_fair deduction map straight through.
+        // The codec has already enforced its shape (bounded, strictly ascending,
+        // every amount positive, Sum inside this frame's own reward), so what
+        // arrives here is foldable or the frame never decoded at all.
+        if (o.payout) {
+            w.payout_carried = true;
+            for (const auto& [id, amt] : o.payout->pay)
+                w.payout[id] = static_cast<long long>(amt);
+        }
+        // c2pool#1627's section 1 rides the same frame. This build has no DROPS
+        // ledger leg, so a credit map it cannot apply must NOT be silently
+        // dropped: the peer path refuses the block outright (see
+        // xmr_o2_finalize_connect.hpp drain_peer_wins), and the flag is carried
+        // here so that refusal can name the reason.
+        w.drops_carried = o.drops.has_value();
         fc.offer_peer_win(w);      // thread-safe; drained on the main thread
         m_in.cut_offered.fetch_add(1, std::memory_order_relaxed);
     }

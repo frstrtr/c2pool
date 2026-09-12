@@ -600,6 +600,16 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_s1b_x2_kat Threads::Threads)
     add_test(NAME v37_xmr_s1b_x2_kat COMMAND v37_xmr_s1b_x2_kat)
 
+    # ★★ WIRE-CARRY of the K_fair owed-deduction map (carrier wire v0x03
+    # section 2): the switch from peer-RECOMPUTE to carrying the winner's own
+    # map, and the SUSTAINED convergence through >= 20 consecutive settling
+    # blocks that it buys. Stdlib-only; Threads for the engine's executor.
+    add_executable(v37_xmr_wirecarry_kat v37_xmr_wirecarry_kat.cpp)
+    target_compile_features(v37_xmr_wirecarry_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_wirecarry_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_wirecarry_kat Threads::Threads)
+    add_test(NAME v37_xmr_wirecarry_kat COMMAND v37_xmr_wirecarry_kat)
+
     # * canonical_coinbase_matches = (a) PEER-RECOMPUTE. S-1c converges the two
     # nodes only until the first block whose option-B coinbase actually SETTLES
     # owed: from there the winner deducts a payout map at FINALIZE that the

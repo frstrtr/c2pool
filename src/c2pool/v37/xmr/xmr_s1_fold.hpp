@@ -148,6 +148,26 @@ struct XmrPeerWin {
     std::uint64_t  reward = 0;           // the reward the winner's fold consumed
     bool           payout_emitted = false;      // winner's coinbase emitted owed outputs
     ::v37::bytes32 owed_digest_at_win{};        // VERIFY field (diagnostics only)
+    // ★★ WIRE-CARRY (wire v0x03 section 2, c2pool#1625). The winner's OWN K_fair
+    // owed-deduction map: {owed identity -> piconero its coinbase paid that
+    // identity}, taken from the Owed-role outputs of the template it mined
+    // (Fixed and residual-Sink outputs are not ledger keys and never enter it).
+    // This REPLACES the peer-side recompute: the receiver folds what the winner
+    // sent instead of re-deriving it from a ledger state it can only match by
+    // luck, so there is no same-instant requirement left anywhere on this path.
+    //
+    // `payout_carried` is the presence bit, kept separate from `payout.empty()`
+    // on purpose. An EMPTY carried map and NO carried map are different claims:
+    // the first says "my coinbase settled nothing", the second says "I could not
+    // tell you", and only the first may be folded. A pre-v0x03 winner, and a
+    // v0x03 winner whose descriptor carried no section, both land here as false.
+    bool payout_carried = false;
+    settle::OwedLedger::Amounts payout;
+    // v0x03 section 1 (c2pool#1627) rode the same frame. This build has no DROPS
+    // ledger leg, so a set flag is a REFUSAL, never an ignored field: crediting
+    // E_b while dropping a credit map the winner applied is the divergence both
+    // sections exist to close.
+    bool drops_carried = false;
 };
 
 // Receive-side counters (diagnostics only — never consensus).
@@ -158,15 +178,32 @@ struct XmrS1PeerStats {
     std::uint64_t cut_miss      = 0;   // P not published here (ring evicted / coalesced through)
     std::uint64_t cut_mismatch  = 0;   // P published here with a DIFFERENT lane digest (!)
     std::uint64_t refused_fold  = 0;   // fold_eb REFUSED (geometry not ratified)
-    std::uint64_t refused_payout = 0;  // winner emitted owed outputs we could NOT reproduce
-    // ★ canonical_coinbase_matches = (a) peer-recompute. A settling peer win —
-    // one whose option-B coinbase actually paid owed balances — is no longer
-    // refused outright: the payout leg is RECOMPUTED from this node's own K_fair
-    // run for that height (xmr_peer_payout_recompute.hpp) and booked, so the
-    // peer deducts exactly what the winner deducted. `payout_recomputed` counts
-    // the ones that reproduced; `refused_payout` above now counts only the ones
-    // that could NOT, which stay fail-closed.
-    std::uint64_t payout_recomputed = 0;
+    std::uint64_t refused_payout = 0;  // winner emitted owed outputs we could NOT fold
+    // ★★ WIRE-CARRY (c2pool#1625). A settling peer win — one whose option-B
+    // coinbase actually paid owed balances — is no longer refused outright, and
+    // is no longer RECOMPUTED either: the winner's own K_fair deduction map
+    // rides the v0x03 trailer and is folded verbatim, so the peer deducts
+    // exactly what the winner deducted with no same-instant requirement between
+    // the two nodes. `payout_carried` counts the settling peer blocks REGISTERED
+    // that way (once per block, at registration, never per retry);
+    // `refused_payout` above counts only the ones that could NOT be folded,
+    // which stay fail-closed. `payout_absent` is the fail-closed half: the
+    // descriptor said the coinbase settled, but no section came with it (a
+    // pre-v0x03 peer, or a winner that could not name its own map) — refused,
+    // never guessed. `payout_shape` counts a carried map this node would not
+    // fold (a row the ledger cannot key, or a total the frame's own reward
+    // cannot cover).
+    std::uint64_t payout_carried  = 0;
+    std::uint64_t payout_absent   = 0;
+    std::uint64_t payout_shape    = 0;
+    // The non-authoritative LOCAL CROSS-CHECK, kept because it is now free
+    // diagnostics rather than the mechanism: when the old K_fair recompute is
+    // armed AND produced a map for this height, does it agree with the one the
+    // winner sent? Disagreement is REPORTED and never refuses — the whole point
+    // of the switch is that the recompute's agreement is not required.
+    std::uint64_t xcheck_agree    = 0;
+    std::uint64_t xcheck_differ   = 0;
+    std::uint64_t xcheck_absent   = 0;
     std::uint64_t refused_late  = 0;   // H_b at or below our finalize cursor
     std::uint64_t already_known = 0;   // our own win, or a duplicate
     // The VERIFY field, and what it is NOT. owed_digest_at_win is the winner's

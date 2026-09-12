@@ -63,6 +63,7 @@
 // for the engine's single executor thread. Registered with add_test AND in BOTH
 // build.yml --target lists (the #1539 / #769 hollow-green rule).
 // ===========================================================================
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -481,12 +482,22 @@ int main() {
     {
         Carrier bare = wire_freeze::fixture_a();
         const auto v1 = CarrierWire::encode_version(bare, 0x01);
-        const auto v2 = CarrierWire::encode(bare);
+        const auto v2 = CarrierWire::encode_version(bare, 0x02);
         check(v2.size() == v1.size() + 1 && v2[0] == 0x02 && v2.back() == 0x00,
               "8a won_block = 0 costs exactly one byte over the frozen v0x01 frame");
+        // v0x03 (c2pool#1625 WIRE-CARRY) appends a SECTIONED trailer after the
+        // cut: one present byte for the DROPS credit map (c2pool#1627) and one
+        // for the K_fair payout map. A carrier with nothing to say therefore
+        // pays two more bytes than the v0x02 frame, and the v0x02 bytes below it
+        // are UNMOVED — which is what the next two checks assert.
+        const auto v3 = CarrierWire::encode(bare);
+        check(v3.size() == v2.size() + 2 && v3[0] == 0x03 &&
+              v3[v3.size() - 2] == 0x00 && v3.back() == 0x00 &&
+              std::equal(v2.begin() + 1, v2.end(), v3.begin() + 1),
+              "8a2 v0x03 costs exactly two more bytes and moves no v0x02 byte");
         Carrier withcut = bare;
         withcut.cut = descriptor_of_win(kWonBid, 1, EbCut{}, false, ::v37::bytes32{});
-        const auto vc = CarrierWire::encode(withcut);
+        const auto vc = CarrierWire::encode_version(withcut, 0x02);
         check(vc.size() == v1.size() + wire_freeze::kCutDescBytesPresent,
               "8b a full descriptor costs exactly 122 bytes");
         check(CarrierWire::encode_version(withcut, 0x01).empty(),
