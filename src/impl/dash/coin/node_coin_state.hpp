@@ -605,6 +605,13 @@ public:
         uint256     txid;
     };
 
+    /// #157 M3 — where an inject entered from. Selects which node-wide rate
+    /// budget it draws on: a peer-origin inject charges the aggregate-PEER
+    /// limiter, a local operator inject the LOCAL limiter. Because the budgets
+    /// are separate, a peer flood exhausts only the peer budget and can NEVER
+    /// starve the operator's own inject. Default Local (the hex-loader path).
+    enum class InjectOrigin : uint8_t { Local, Peer };
+
     /// Submit a raw transaction for injection. Cheapest-checks-first gate
     /// (design §4.3): feature-enabled → DoS caps (pool full / total bytes / per-
     /// tx size, TxInjectPool) → mempool admission (Mempool::add_inject: size,
@@ -615,7 +622,8 @@ public:
     /// design's wire fields (carried for M2/M3). io-thread only.
     InjectSubmitResult submit_inject(const MutableTransaction& tx,
                                      uint32_t flags = 0,
-                                     int32_t expiry_height = 0) {
+                                     int32_t expiry_height = 0,
+                                     InjectOrigin origin = InjectOrigin::Local) {
         InjectSubmitResult r;
         r.txid = dash::coin::dash_txid(tx);
         if (!m_tx_inject_enabled) { r.cause = "inject-disabled"; return r; }
@@ -626,18 +634,39 @@ public:
         }
         const uint32_t byte_size =
             static_cast<uint32_t>(::pack(tx).get_span().size());
-        // #157 M3 — GLOBAL RATE LIMIT (node-wide count + bytes per window). This
-        // is the SINGLE gate both the local loader and the peer path cross, so a
-        // limiter here bounds the total inject work regardless of origin (the
-        // "global" half of per-peer-AND-global). CHARGED ON ATTEMPT, before any
-        // consensus/script work, so an INVALID-inject flood is throttled too.
-        // Reward-safe: a ceiling in front of the validity gate — only refuses.
+        // #157 M3 — PER-TX SIZE CAP, CHARGED-FREE. Refuse an oversize blob HERE,
+        // before the rate limiter is charged and before the sandbox runs, so an
+        // oversize-blob flood cannot drain the node-wide byte-window (8 MB/min)
+        // and starve legitimate injects — 3 peers each pushing one ~2.9 MB junk
+        // frame would otherwise empty the shared byte budget on attempts that get
+        // rejected anyway. TxInjectPool::would_admit re-checks this exact cap, so
+        // hoisting it changes NO accept decision: an oversize inject was always
+        // refused; it now refuses EARLIER, by the SAME named cause. Every CHARGED
+        // attempt is therefore <= kMaxInjectTxBytes and the count cap dominates.
+        // Reward-safe: an earlier refusal only — never loosens a check.
+        if (byte_size > dash::coin::TxInjectPool::kMaxInjectTxBytes) {
+            r.cause = dash::coin::TxInjectPool::admit_name(
+                          dash::coin::TxInjectPool::Admit::TooLarge);
+            return r;
+        }
+        // #157 M3 — RATE LIMIT (node-wide count + bytes per window), CHARGED ON
+        // ATTEMPT before any consensus/script work so an INVALID-inject flood is
+        // throttled too. The budget is SPLIT BY ORIGIN: a peer-origin inject
+        // draws on the aggregate-PEER limiter, a local operator inject on the
+        // LOCAL limiter. This is the invariant a single shared limiter could not
+        // give — a peer flood (7 peers @30/min, or a few @3 MB, or a per-peer
+        // guard reset on reconnect) exhausts ONLY the peer budget and can NEVER
+        // starve the operator's own inject. Reward-safe: a ceiling in front of
+        // the validity gate — only refuses.
         {
+            dash::coin::InjectRateLimiter& limiter =
+                (origin == InjectOrigin::Peer) ? m_inject_rate_peer : m_inject_rate;
             const std::time_t now = std::time(nullptr);
-            auto rl = m_inject_rate.try_consume(byte_size, now);
+            auto rl = limiter.try_consume(byte_size, now);
             if (!rl.ok()) {
                 LOG_WARNING << "[MEMPOOL] inject rate-limited cause=" << rl.name()
                             << " value=" << rl.value << " threshold=" << rl.threshold
+                            << " origin=" << (origin == InjectOrigin::Peer ? "peer" : "local")
                             << " txid=" << r.txid.GetHex().substr(0, 16);
                 r.cause = rl.name(); return r;
             }
@@ -697,9 +726,14 @@ public:
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
 
-    // #157 M3: number of injects the node-wide rate limiter still counts inside
-    // its current window (test/observability accessor; no consensus effect).
+    // #157 M3: number of injects the LOCAL rate limiter still counts inside its
+    // current window (test/observability accessor; no consensus effect).
     size_t inject_rate_count() const { return m_inject_rate.count_in_window(); }
+    // #157 M3: same, for the aggregate-PEER rate limiter.
+    size_t inject_rate_count_peer() const { return m_inject_rate_peer.count_in_window(); }
+    // #157 M3: bytes the LOCAL rate limiter still counts in its window — proves
+    // an oversize blob was refused BEFORE the byte-window was charged.
+    uint64_t inject_rate_bytes() const { return m_inject_rate.bytes_in_window; }
 
     /// PINNED LOCAL TX (--pin-local-tx-hex, donation-dust consolidation): an
     /// operator-supplied, externally-signed, zero-fee tx that can only reach
@@ -2053,10 +2087,15 @@ private:
     // m_mempool (Mempool::add_inject priority), not this structure.
     bool                         m_tx_inject_enabled{false};
     dash::coin::TxInjectPool     m_inject_pool;
-    // #157 M3: node-wide inject rate limiter (count + bytes per window). The
-    // "global" half of the per-peer-AND-global DoS caps; the per-peer half is
-    // dash::PeerInjectGuard (tx_inject_relay.hpp), consulted on the peer path.
+    // #157 M3: LOCAL-operator inject rate limiter (count + bytes per window).
+    // The local half of the origin-split node-wide budget.
     dash::coin::InjectRateLimiter m_inject_rate;
+    // #157 M3: SEPARATE aggregate-PEER inject rate limiter. Same caps as the
+    // local limiter but a distinct budget (Scope::Peers, distinct named causes),
+    // so a peer flood exhausts only THIS budget and never starves a local
+    // inject. The per-peer half remains dash::PeerInjectGuard (tx_inject_relay.hpp).
+    dash::coin::InjectRateLimiter m_inject_rate_peer{
+        dash::coin::InjectRateLimiter::Scope::Peers};
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
     // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs

@@ -57,6 +57,18 @@ struct InjectRateLimiter {
     static constexpr uint64_t    kMaxBytesPerWindow   = 8u * 1024u * 1024u;
     static constexpr std::time_t kWindowSeconds       = 60;
 
+    // #157 M3 — BUDGET SPLIT. A node runs TWO of these: a LOCAL-operator budget
+    // and a SEPARATE aggregate-PEER budget, so a peer flood exhausts only the
+    // peer budget and can NEVER starve the operator's own inject. Both use the
+    // same caps; `scope` only selects the NAMED cause each reports, so a
+    // peer-budget refusal is told apart from a local one in logs/tests. The
+    // accounting is byte-identical between scopes.
+    enum class Scope : uint8_t { Local, Peers };
+    Scope scope{Scope::Local};
+
+    InjectRateLimiter() = default;
+    explicit InjectRateLimiter(Scope s) : scope(s) {}
+
     // Named outcome so the caller logs cause/value/threshold in the repo's
     // convention (DEF3 — no silent drops).
     enum class Verdict : uint8_t {
@@ -64,6 +76,7 @@ struct InjectRateLimiter {
         CountExceeded,   // count budget full for this window
         BytesExceeded,   // byte budget would overflow for this window
     };
+    // Canonical (LOCAL-scope) names.
     static const char* verdict_name(Verdict v) {
         switch (v) {
             case Verdict::Ok:            return "ok";
@@ -72,12 +85,27 @@ struct InjectRateLimiter {
         }
         return "inject-rate-limited-unknown";
     }
+    // Scope-aware name: the LOCAL budget keeps the canonical names; the
+    // aggregate-PEER budget reports DISTINCT names so observability separates a
+    // peer-budget refusal from a local one (DEF3 — every refusal named).
+    const char* scoped_name(Verdict v) const {
+        if (scope == Scope::Peers) {
+            switch (v) {
+                case Verdict::Ok:            return "ok";
+                case Verdict::CountExceeded: return "inject-rate-limited-peers-count";
+                case Verdict::BytesExceeded: return "inject-rate-limited-peers-bytes";
+            }
+            return "inject-rate-limited-peers-unknown";
+        }
+        return verdict_name(v);
+    }
     struct Result {
         Verdict  verdict{Verdict::Ok};
         uint64_t value{0};       // observed count-in-window or bytes-in-window
         uint64_t threshold{0};   // the cap it would breach
+        const char* cause_name{"ok"};  // scope-resolved name, set by try_consume
         bool ok() const { return verdict == Verdict::Ok; }
-        const char* name() const { return verdict_name(verdict); }
+        const char* name() const { return cause_name; }
     };
 
     std::deque<std::time_t> ts;      // event timestamps inside the window
@@ -102,11 +130,13 @@ struct InjectRateLimiter {
         if (ts.size() >= kMaxInjectsPerWindow) {
             r.verdict = Verdict::CountExceeded;
             r.value = ts.size(); r.threshold = kMaxInjectsPerWindow;
+            r.cause_name = scoped_name(r.verdict);
             return r;
         }
         if (bytes_in_window + byte_size > kMaxBytesPerWindow) {
             r.verdict = Verdict::BytesExceeded;
             r.value = bytes_in_window + byte_size; r.threshold = kMaxBytesPerWindow;
+            r.cause_name = scoped_name(r.verdict);
             return r;
         }
         ts.push_back(now);

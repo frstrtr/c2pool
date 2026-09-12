@@ -965,3 +965,81 @@ TEST(DashTxInject, PeerInjectByteVolumeRateLimited)
     EXPECT_EQ(later.kind, dash::InjectRelayVerdict::Kind::Accepted)
         << "the per-peer byte window must recover as old events expire";
 }
+
+// (M3-11) DoS — SIZE CAP BEFORE THE RATE CHARGE. An oversize inject is refused
+//         by the named oversize cause BEFORE the node-wide rate limiter is
+//         charged, so an oversize-blob flood cannot drain the shared byte-window
+//         (8 MB/min) and starve legitimate injects. Regression guard for the
+//         charge-then-reject ordering bug: a big junk frame must cost the window
+//         NOTHING. Reward path never reached.
+TEST(DashTxInject, OversizeInjectRefusedBeforeRateCharge)
+{
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    // A serialized tx whose size exceeds the per-tx cap (scriptPubKey alone).
+    MutableTransaction big = minimal_tx(0x60);
+    big.vout[0].scriptPubKey =
+        to_script(std::vector<uint8_t>(TxInjectPool::kMaxInjectTxBytes + 64, 0x51));
+    ASSERT_GT(::pack(big).get_span().size(), TxInjectPool::kMaxInjectTxBytes)
+        << "the crafted tx must actually exceed the per-tx byte cap";
+
+    auto r = st.submit_inject(big);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.cause, "inject-pool-oversize")
+        << "an oversize inject must be refused by the named oversize cause";
+
+    // THE FIX: the oversize attempt consumed NEITHER the count NOR the byte
+    // window — it was rejected strictly before the rate limiter was charged.
+    EXPECT_EQ(st.inject_rate_count(), 0u)
+        << "an oversize blob must not be charged to the node-wide count window";
+    EXPECT_EQ(st.inject_rate_bytes(), 0u)
+        << "an oversize blob must not drain the node-wide byte window";
+}
+
+// (M3-12) DoS — LOCAL-vs-PEER BUDGET SPLIT. A peer flood that exhausts the
+//         aggregate-PEER rate budget CANNOT starve the local operator's own
+//         inject: the two origins draw on SEPARATE node-wide budgets. Peer-origin
+//         attempts are throttled by their own named cause, while a local inject
+//         still passes the rate gate. Regression guard for the shared-budget
+//         starvation the split fixes. Reward path never touched.
+TEST(DashTxInject, PeerFloodDoesNotStarveLocalInject)
+{
+    using Origin = NodeCoinState::InjectOrigin;
+    UTXOViewCache utxo(nullptr);           // empty view: injects fail post-charge
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    const std::size_t cap = InjectRateLimiter::kMaxInjectsPerWindow;
+    // Exhaust the PEER count budget with `cap` distinct peer-origin attempts
+    // (each rejected on the empty view AFTER being charged — a flood's shape).
+    for (std::size_t i = 0; i < cap; ++i) {
+        MutableTransaction tx = minimal_tx(0x01);
+        tx.vin[0].prevout.index = static_cast<uint32_t>(i);   // unique txid
+        auto r = st.submit_inject(tx, 0, 0, Origin::Peer);
+        EXPECT_NE(r.cause, "inject-rate-limited-peers-count")
+            << "under the peer cap must not be rate-limited at i=" << i;
+    }
+    EXPECT_EQ(st.inject_rate_count_peer(), cap)
+        << "every peer attempt is charged to the PEER budget";
+
+    // The (cap+1)th PEER inject is throttled on the PEER budget, by its own name.
+    {
+        MutableTransaction over = minimal_tx(0x01);
+        over.vin[0].prevout.index = static_cast<uint32_t>(cap);
+        auto r = st.submit_inject(over, 0, 0, Origin::Peer);
+        EXPECT_FALSE(r.ok);
+        EXPECT_EQ(r.cause, "inject-rate-limited-peers-count")
+            << "the (cap+1)th PEER inject is throttled on the peer budget by name";
+    }
+
+    // INVARIANT: the peer flood did NOT touch the LOCAL budget. A local inject
+    // still passes the rate gate — it fails later on the empty view, NOT on the
+    // rate limiter (never 'inject-rate-limited-*').
+    MutableTransaction local = minimal_tx(0x02);
+    auto rl = st.submit_inject(local, 0, 0, Origin::Local);
+    EXPECT_FALSE(rl.ok) << "empty view: the local inject is unpriceable, not accepted";
+    EXPECT_EQ(rl.cause, "inject-unpriceable")
+        << "a local inject must clear the rate gate despite the peer flood";
+    EXPECT_EQ(st.inject_rate_count(), 1u)
+        << "only the single local attempt is charged to the LOCAL budget";
+}
