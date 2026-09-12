@@ -21,7 +21,12 @@ The operator requirements the design must satisfy:
 4. An air-gapped security model with a network-incapable signing build.
 5. **Cross-coin address conversion within Family A** (LTC↔DOGE and the wider secp256k1/hash160 set) with a hard money-misdirection guard (issue #961).
 
-Baseline parity floor: `c2wallet.py` signed DASH donation block **2518186** (1040 inputs → 4 outputs). The successor must strictly **extend, never regress** that: RFC6979 deterministic nonce, self-verify-before-emit, oversize refusal, and seed-never-persisted are non-negotiable inherited behaviours.
+Baseline parity floor — **two** proven precedents the successor must strictly **extend, never regress**:
+
+1. The DASH donation block **2518186** (1040 inputs → 4 outputs, P2PKH) signed by `c2wallet.py`.
+2. The **LTC+DOGE donation** — a **bare-P2MS wrapped in P2SH** (P2SH-multisig) spend, the reference for the wrapped/nested script path (§4.1) and the cross-coin merged-payout algebra.
+
+RFC6979 deterministic nonce, self-verify-before-emit, oversize refusal, and seed-never-persisted are non-negotiable inherited behaviours across both.
 
 ### Non-Goals
 
@@ -193,6 +198,13 @@ Notation: `<sig>` = DER-ECDSA sig ‖ 1-byte sighash; `<schnorr>` = 64/65-byte B
 | **Nonstandard ancestors** | CLTV/CSV timelocks, hashlocks | generic P2SH/P2WSH; interpreter has `OP_CHECKLOCKTIMEVERIFY`/`OP_CHECKSEQUENCEVERIFY` | as inner type | Allow raw-redeemScript entry. |
 | **OP_RETURN** | `OP_RETURN <data>` | — unspendable | — | Build as output only, never a spend source. |
 
+**Wrapped & nested scripts (first-class).** Wrapping is not a side case handled only by the P2SH/P2WSH table rows — it is a first-class capability spanning **construct + spend + manipulate**, because it is the exact pattern of the LTC+DOGE donation (a bare-P2MS wrapped in P2SH). The wallet treats an arbitrary inner script as the primitive and derives every wrapping of it.
+
+- **Address CREATION from an arbitrary inner script.** Given any redeemScript — especially bare-P2MS (`OP_m <pks> OP_n OP_CHECKMULTISIG`), but equally arbitrary scripts, CLTV/CSV timelocks, or hashlocks — the wallet computes the receive addresses without needing to spend yet: the **P2SH address** = `base58check(version ‖ hash160(redeemScript))`, the **P2WSH address** = `bech32(SHA256(witnessScript))`, and the **nested P2SH-P2WSH address** = `base58check(version ‖ hash160(OP_0 ‖ SHA256(witnessScript)))`. The operator can build the wrapped ADDRESS to receive into, save the inner script, and spend it later.
+- **SPEND a wrapped output.** P2SH → scriptSig = `<inner-satisfaction> <push redeemScript>` (redeemScript pushed **last**); sighash is legacy BASE over the **redeemScript as scriptCode**; `SCRIPT_VERIFY_P2SH` re-executes the redeemScript. P2WSH → witness = `<inner items> <witnessScript>`; **BIP143** sighash with `scriptCode = witnessScript` (SHA256, not hash160, for the program). Nested **P2SH-P2WSH** → scriptSig carries the single witness-program push (`OP_0 <32-byte SHA256(witnessScript)>`), and the witness stack carries the satisfaction. When the inner script is **bare-P2MS**, the inner satisfaction follows the CHECKMULTISIG rules: leading `OP_0` dummy as an **empty push** under `SCRIPT_VERIFY_NULLDUMMY`, and signatures in the **same relative order as the pubkeys**.
+- **MANIPULATE (multi-party partial-sign + combine).** A wrapped multisig input is signed cooperatively: each cosigner partial-signs the input independently against the shared redeemScript/witnessScript, and the wallet **combines** the collected partial signatures into the final `OP_0 <sig1>..<sigM>` scriptSig (P2SH) or witness (P2WSH), preserving pubkey order. This is the PSBT-style combine on the A-track and is how a P2MS-in-P2SH is cooperatively spent — the LTC+DOGE donation pattern.
+- **Reuse vs new.** P2SH/P2WSH address encode comes from `address_utils`, and the P2SH/P2WSH re-execution is the vendored interpreter (both already in-tree); the wrapping **assembly** — deriving the three wrapped addresses from one inner script, and building/combining the layered scriptSig/witness — is new constructor code.
+
 **Sighash flags:** `SIGHASH_ALL(1)` / `NONE(2)` / `SINGLE(3)`, each `| ANYONECANPAY(0x80)`; taproot adds `SIGHASH_DEFAULT(0x00)`. **The `SIGHASH_SINGLE` bug** (if `in_idx ≥ n_outputs`, legacy sighash returns the constant `0x00…01` digest) must be reproduced for correctness **and warned**. Default everywhere = `SIGHASH_ALL` (baseline). Preserve the self-verify-before-emit and 100 kB oversize refusal for **every** type, not just legacy P2PKH.
 
 **Cross-coin address conversion (requirement 5).** Algebraic fact: every Family-A coin uses the same secp256k1 curve, the same `hash160` for P2PKH/P2WPKH, the same `SHA256(script)` for P2WSH, and the same x-only key for P2TR — so the **payload is byte-identical across coins**; conversion is purely a re-encoding under the target's version byte / HRP **iff the target supports that type**. This is the LTC↔DOGE merged-payout algebra.
@@ -308,7 +320,7 @@ Each phase is a shippable DRAFT PR delivered by **qt-steward** under the **Fable
 | **M1-X** | Monero | 25-word mnemonic (+CRC, wordlists), **polyseed (16-word, Argon2)** + **13-word MyMonero** import (alongside the 25-word), dual spend/view import, view-only import, Monero base58, subaddress/integrated derivation. | M0 | **Money-path** → full gate. |
 | **M2-A** | Bitcoin | Wire `address_utils` + per-coin SSOT into a "Convert address" panel; detect-convertible / **WARN-or-refuse (#961)** UX with side-by-side payload display + round-trip proof; add the **NMC SSOT leaf** + BCH transcode helper; construct all output types (encode). | M1-A | Read-only derivation, but the **#961 path is money-relevant** → Fable review required. |
 | **M2-X** | Monero | Output scanning via view key + amount decrypt; view-only "export outputs" artifact; balance/spent state. | M1-X | Read-only → lighter gate. |
-| **M3-A** | Bitcoin | Legacy sighash (parity KAT for block 2518186 folded in), **BIP143** (P2WPKH/P2WSH/P2SH-wrapped), bare-P2MS incl. the CHECKMULTISIG extra-pop; self-verify + oversize per type. | M2-A | **HIGH** money-path. |
+| **M3-A** | Bitcoin | Legacy sighash (parity KAT for block 2518186 folded in **plus a KAT reproducing the LTC+DOGE P2MS-in-P2SH donation spend**), **BIP143** (P2WPKH/P2WSH/P2SH-wrapped), bare-P2MS incl. the CHECKMULTISIG extra-pop; **wrapped/nested construct + spend + multi-party combine** (P2SH / P2WSH / nested P2SH-P2WSH, single-party plus the partial-sign→combine wiring — §4.1); self-verify + oversize per type. | M2-A | **HIGH** money-path. |
 | **M3-X** | Monero | Import outputs → compute key images → export key images; port/build the **CLSAG signer** on the vendored ops; KAT against in-tree verifier. | M2-X | **HIGH** money-path. |
 | **M4-A** | Bitcoin | **BIP341/342** taproot key-path + script-path (schnorrsig/extrakeys, taptweak, control block, tapleaf/branch); multisig scriptWitness assembly. | M3-A | **HIGH** money-path. |
 | **M4-X** | Monero | **Bulletproofs+ prover** port; full RingCT tx construction + serialization; offline self-verify (in-tree BP+/RCT verifier + key-image recompute) before emit — completes Monero's native cold-sign. | M3-X | **HIGH** money-path. |
