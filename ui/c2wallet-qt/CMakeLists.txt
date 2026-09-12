@@ -79,6 +79,14 @@ if(C2WALLET_QT_BUILD_TESTS)
     #   cmake -S ui/c2wallet-qt/src/family/bitcoin/construct -B build-convert -DC2WALLET_QT_BUILD_TESTS=ON
     add_subdirectory(src/family/bitcoin/construct)
 
+    # M3-A: the Qt-free Bitcoin-script SIGNING core (family/bitcoin/signer)
+    # — legacy (SigVersion::BASE) + BIP143 segwit-v0 + wrapped/nested +
+    # multi-party combine, self-verify-before-emit. Reuses the vendored
+    # dashscript interpreter + system libsecp256k1; no Qt, no networking.
+    # Standalone via:
+    #   cmake -S ui/c2wallet-qt/src/family/bitcoin/signer -B build-signer -DC2WALLET_QT_BUILD_TESTS=ON
+    add_subdirectory(src/family/bitcoin/signer)
+
     add_test(
         NAME no_network_link_guard
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_no_network.sh"
