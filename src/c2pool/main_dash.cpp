@@ -2764,7 +2764,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         p2p_node.set_tx_inject_sink(
             [&node_coin_state](const dash::coin::MutableTransaction& tx,
                                uint32_t flags, int32_t expiry_height) {
-                return node_coin_state.submit_inject(tx, flags, expiry_height);
+                // #157 M3: peer-origin — charge the aggregate-PEER rate budget so
+                // a peer flood cannot starve the local operator's own inject.
+                return node_coin_state.submit_inject(
+                    tx, flags, expiry_height,
+                    dash::coin::NodeCoinState::InjectOrigin::Peer);
             });
         std::cout << "[run] embedded-tx-inject ARMED (#157): miner/user tx-injection "
                      "ON — submitted txs ride the block with priority through the "
