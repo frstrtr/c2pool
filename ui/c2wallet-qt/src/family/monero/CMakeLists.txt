@@ -62,6 +62,8 @@ add_library(c2wallet_monero_xmrvendor STATIC
     ${XMR_COIN}/vendor/crypto-ops-data.c
     ${XMR_COIN}/xmr_derivation.cpp        # extracted CryptoNote derivation subset
     ${XMR_RCT}/xmr_rct_ops.cpp            # M3-X: RingCT scalar/point helpers (CLSAG deps)
+    ${XMR_RCT}/xmr_multiexp.cpp           # M4-X: Straus multi-scalar mult (BP+ prover + verifier)
+    ${XMR_RCT}/xmr_bulletproofs_plus.cpp  # M4-X: in-tree BP+ VERIFIER (the construct->verify oracle)
 )
 target_include_directories(c2wallet_monero_xmrvendor PUBLIC
     ${XMR_COIN}/compat      # MUST be first: <sodium/crypto_verify_32.h>, warnings.h
@@ -85,6 +87,8 @@ add_library(c2wallet_monero STATIC
     prover/MoneroProverRng.cpp            # M3-X: wallet-local CSPRNG scalar for the prover (money-safety)
     prover/MoneroClsag.cpp                # M3-X: CLSAG signer + verifier (ported)
     prover/MoneroKeyImage.cpp             # M3-X: key-image export {I, ring-sig}
+    prover/MoneroBulletproofsPlus.cpp     # M4-X: Bulletproofs+ range-proof PROVER (ported)
+    prover/MoneroRingctBuilder.cpp        # M4-X: full RingCT tx assembly + offline self-verify
     ${CMAKE_CURRENT_SOURCE_DIR}/../../secure/SecureString.cpp
 )
 target_include_directories(c2wallet_monero PUBLIC
@@ -120,3 +124,16 @@ add_executable(c2wallet-monero-prover-test
 target_link_libraries(c2wallet-monero-prover-test PRIVATE c2wallet_monero)
 
 add_test(NAME c2wallet_monero_prover_kat COMMAND c2wallet-monero-prover-test)
+
+# ── Family B (Monero) M4-X KATs: Bulletproofs+ prover + full RingCT assembly ──
+# HIGH money-path: the range-proof PROVER gated by construct -> INDEPENDENT
+# in-tree BP+ verify (a separate construct, stronger than CLSAG's), full RingCT
+# transaction assembly (commitments, balanced masks, ecdh, CLSAG per input, key
+# images, fee, tx_extra, blob + tx_hash), and the offline self-verify-before-emit
+# that refuses an unbalanced or non-verifying tx.
+add_executable(c2wallet-monero-ringct-test
+    prover/test/monero_ringct_test.cpp
+)
+target_link_libraries(c2wallet-monero-ringct-test PRIVATE c2wallet_monero)
+
+add_test(NAME c2wallet_monero_ringct_kat COMMAND c2wallet-monero-ringct-test)
