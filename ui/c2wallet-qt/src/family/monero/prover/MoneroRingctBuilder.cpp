@@ -217,6 +217,9 @@ AssembleResult assemble_ringct_tx(const std::vector<SpendInput>& inputs_in,
         out_amounts[j] = d.amount;
         out_masks[j]   = scanops::commitment_mask(amount_key);
         tx.output_commitments.push_back(commit(d.amount, out_masks[j]));
+        // view tag = first byte of H("view_tag" || D || varint(j)) -- the same
+        // tag a recipient recomputes from D=8*k_v*R during scan (scanops::view_tag).
+        tx.output_view_tags.push_back(scanops::view_tag(D, j));
         wipe(D);
     }
 
@@ -304,10 +307,8 @@ AssembleResult assemble_ringct_tx(const std::vector<SpendInput>& inputs_in,
         put_varint(prefix, 0);                       // amount (0 for RingCT)
         prefix.push_back(TXOUT_TO_TAGGED_KEY);
         put_key(prefix, tx.output_pubkeys[j]);
-        // view tag = first byte of H("view_tag" || D || j): recompute is online;
-        // for the blob we carry the low byte of the ecdh masked amount as a
-        // deterministic placeholder tag (view-tag exactness is an M5/interop item).
-        prefix.push_back(tx.ecdh_amounts[j][0]);
+        // Monero-faithful view tag (M5-X: closes the M4-X-flagged placeholder).
+        prefix.push_back(tx.output_view_tags[j]);
     }
     put_varint(prefix, extra.size());
     prefix.insert(prefix.end(), extra.begin(), extra.end());

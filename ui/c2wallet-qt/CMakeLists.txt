@@ -64,6 +64,39 @@ option(C2WALLET_QT_BUILD_TESTS
 
 if(C2WALLET_QT_BUILD_TESTS)
     enable_testing()
+
+    # M1-A: the Qt-free Bitcoin-script HD-key core and its published-vector KATs
+    # (family/bitcoin/hdkeys). It links no Qt and no networking, so it can also be
+    # built and tested standalone:
+    #   cmake -S ui/c2wallet-qt/src/family/bitcoin/hdkeys -B build-hdkeys -DC2WALLET_QT_BUILD_TESTS=ON
+    add_subdirectory(src/family/bitcoin/hdkeys)
+
+    # M2-A: the Qt-free cross-coin address CONVERT + CONSTRUCT core
+    # (family/bitcoin/construct) — the #961-guarded converter and the
+    # script-defined output-type encoders. Reuses the #961 engine
+    # (core/address_utils) and the BCH CashAddr codec; links the hdkeys library
+    # above for the shared btclibs closure. No Qt, no networking; standalone via:
+    #   cmake -S ui/c2wallet-qt/src/family/bitcoin/construct -B build-convert -DC2WALLET_QT_BUILD_TESTS=ON
+    add_subdirectory(src/family/bitcoin/construct)
+
+    # M3-A: the Qt-free Bitcoin-script SIGNING core (family/bitcoin/signer)
+    # — legacy (SigVersion::BASE) + BIP143 segwit-v0 + wrapped/nested +
+    # multi-party combine, self-verify-before-emit. Reuses the vendored
+    # dashscript interpreter + system libsecp256k1; no Qt, no networking.
+    # Standalone via:
+    #   cmake -S ui/c2wallet-qt/src/family/bitcoin/signer -B build-signer -DC2WALLET_QT_BUILD_TESTS=ON
+    add_subdirectory(src/family/bitcoin/signer)
+
+    # M5-A: the Qt-free Family-A AIR-GAP TRANSFER ARTIFACTS
+    # (family/bitcoin/artifact) — the PSBT-like unsigned container
+    # (online->offline), the c2pool-loader signed container (offline->online,
+    # one raw hex per line), the multi-frame QR codec, and the validate-seam
+    # contract. It MARSHALS bytes (does not sign); reuses only the vendored
+    # btclibs SHA-256 for the sha256/sha256d digests. No Qt, no networking;
+    # standalone via:
+    #   cmake -S ui/c2wallet-qt/src/family/bitcoin/artifact -B build-artifact -DC2WALLET_QT_BUILD_TESTS=ON
+    add_subdirectory(src/family/bitcoin/artifact)
+
     add_test(
         NAME no_network_link_guard
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_no_network.sh"

@@ -98,6 +98,7 @@ struct RingctTx {
     Bytes32                               message{};          // pre-MLSAG hash (CLSAG message)
     Bytes32                               tx_pubkey{};        // R (tx_extra 0x01)
     std::vector<Bytes32>                  output_pubkeys{};   // P_out_j
+    std::vector<std::uint8_t>             output_view_tags{};  // HF15+ view tag per output (blob byte)
     std::vector<Bytes32>                  output_commitments{};// C_out_j = z_out*G + a_out*H
     std::vector<std::array<std::uint8_t,8>> ecdh_amounts{};   // masked 8-byte amounts
     std::vector<Bytes32>                  pseudo_outs{};       // Cout_i (per input)

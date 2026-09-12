@@ -107,14 +107,14 @@ static node::MinerData miner_data(std::uint64_t height, std::size_t n_tx) {
     return md;
 }
 
-static BacklogFamineGuard::Input starved_at(std::uint64_t t, std::uint64_t shadow_n = 5) {
+static BacklogFamineGuard::Input starved_at(std::uint64_t t, std::uint64_t daemon_n = 5) {
     BacklogFamineGuard::Input in;
     in.aligned        = true;
     in.at_unix        = t;
     in.native_known   = true;
     in.native_backlog = 0;
-    in.shadow_known   = true;
-    in.shadow_backlog = shadow_n;
+    in.daemon_known   = true;
+    in.daemon_backlog = daemon_n;
     return in;
 }
 
@@ -145,7 +145,7 @@ static void suite_guard() {
         BacklogFamineGuard g(cfg);
         BacklogFamineGuard::Input in = starved_at(1000, 0);
         const auto o = g.observe(in);
-        CHECK(o.cls == BacklogSampleClass::ShadowEmpty, "A2 class: got %s", to_string(o.cls));
+        CHECK(o.cls == BacklogSampleClass::DaemonEmpty, "A2 class: got %s", to_string(o.cls));
         CHECK(o.check.ok, "A2 both-empty must pass");
         CHECK(g.streak() == 0, "A2 streak must stay 0");
     }
@@ -202,7 +202,7 @@ static void suite_guard() {
         CHECK(o.cls == BacklogSampleClass::Undecidable, "A6 misaligned must be undecidable");
         CHECK(g.streak() == 2, "A6 streak must survive an undecidable sample, got %zu", g.streak());
         BacklogFamineGuard::Input noshadow = starved_at(1040);
-        noshadow.shadow_known = false;
+        noshadow.daemon_known = false;
         CHECK(g.observe(noshadow).cls == BacklogSampleClass::Undecidable,
               "A6 an unanswering shadow must be undecidable");
         CHECK(g.streak() == 2, "A6 streak must survive an unanswered shadow");

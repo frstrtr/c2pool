@@ -164,12 +164,14 @@ static P::PoolSnapshot native_snapshot(const RelayedTxPool& pool) {
 // 1: the seam table
 // ---------------------------------------------------------------------------
 static void test_seam_table() {
-    // 3 since M2h added the native_backlog_famine CONSTRAINT to P-TPL. The pin
-    // is EXACT, not a floor: its job is to make anyone who edits a table move
-    // the ledger key with it, so a clean streak can never be inherited across a
-    // change to what is judged.
-    check(P::COMPARATOR_VERSION == 3,
-          "the comparator version was bumped when the P-TPL backlog constraint joined");
+    // 4 since the M4 leg-1 fix re-decided the native_backlog_famine CONSTRAINT
+    // by ARM IDENTITY and fenced it to the serving arm (3 was that constraint
+    // joining P-TPL at M2h). The pin is EXACT, not a floor: its job is to make
+    // anyone who edits a table move the ledger key with it, so a clean streak
+    // can never be inherited across a change to what is judged.
+    check(P::COMPARATOR_VERSION == 4,
+          "the comparator version was bumped when the P-TPL famine constraint "
+          "stopped being judged by seat");
     check(&P::seam_spec(ProbeKind::Pool) == &P::POOL_SEAM,
           "seam_spec() knows about ProbeKind::Pool");
     checkf(P::POOL_SEAM.required_equality_count() == 3,
