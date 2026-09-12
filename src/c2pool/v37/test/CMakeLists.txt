@@ -505,4 +505,24 @@ if (BUILD_TESTING)
     target_include_directories(v37_w4_owed_incremental_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w4_owed_incremental_test Threads::Threads)
     add_test(NAME v37_w4_owed_incremental_test COMMAND v37_w4_owed_incremental_test)
+
+    # Track A2 / S-1 — LIVE FOLD-WIRING KAT (btc/btc_node.hpp on_block_won ->
+    # settle::fold_eb -> FoundBlock -> the F1 driver -> owed_digest). Pins that
+    # the live DRIVER path, on a FIXED event stream, moves owed_digest OFF the
+    # empty sha256d("V37O") anchor b4db1ded…; that two independent stacks fed
+    # that stream CONVERGE on the same digest; that credit and payout stay
+    # DISTINCT maps; and — the regression pin — that the pre-S-1 "assembly as
+    # credit" shape reproduces the anchor. Also pins that both refuse-LOUD paths
+    # (reward == 0, non-ratified geometry) still REGISTER the block. Stdlib +
+    # Threads (the engine's executor thread), MockCoinBackend + MemSettleStore:
+    # no coin lib, no sockets, no clocks. SAME HOLLOW-GREEN GUARD as the sibling
+    # suites: ALSO listed on BOTH build.yml --target lists (the Linux x86_64 leg
+    # and the ASan+UBSan leg) so CI compiles + RUNS it instead of registering a
+    # NOT_BUILT CTest sentinel (the DGB #137 / #769 / c2pool#1539 unregistered-
+    # KAT class), and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_s1_live_wiring_kat v37_s1_live_wiring_kat.cpp)
+    target_compile_features(v37_s1_live_wiring_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_s1_live_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_s1_live_wiring_kat Threads::Threads)
+    add_test(NAME v37_s1_live_wiring_kat COMMAND v37_s1_live_wiring_kat)
 endif()

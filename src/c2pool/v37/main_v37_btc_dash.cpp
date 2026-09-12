@@ -522,8 +522,25 @@ int main(int argc, char** argv) {
                 LOG_ERROR << "[v37-dash] UNREGISTERED block " << bidh << " accepted=" << r.accepted
                           << " — never registered at the template height (" << wd_height
                           << ") and never at 0; operator: re-register by hand once H_b is known";
-            else
-                LOG_INFO << "[v37-dash] FOUND " << bidh << " h=" << reg_h << " accepted=" << r.accepted;
+            else {
+                // ★ S-1: the cut this win folded E_b at, and where the OWED
+                // commitment stands after it. owed_digest still reading the
+                // empty anchor b4db1ded… after a FOUND means the fold credited
+                // nobody — the S1 line above says why (VALUELESS / REFUSED).
+                const auto& cut = node.last_cut();
+                const auto& s1  = node.s1_stats();
+                LOG_INFO << "[v37-dash] FOUND " << bidh << " h=" << reg_h << " accepted=" << r.accepted
+                         << " E_b=" << cut.credit.size() << " keys"
+                         << (cut.valueless ? " [VALUELESS]" : "")
+                         << " cut{lane_digest=" << hex32(cut.lane_digest)
+                         << " v=" << cut.lane_version << " inc=" << cut.lane_incarnation
+                         << " next_pos=" << cut.next_pos << " src=" << cut.source << "}"
+                         << " owed_digest=" << hex32(node.ledger().owed_digest())
+                         << " s1{folds=" << s1.folds << " valueless=" << s1.valueless
+                         << " refused=" << s1.refused << " no_view=" << s1.no_view << "}";
+                if (!cut.refusal.empty())
+                    LOG_ERROR << "[v37-dash] S-1 fold gave " << bidh << " NO CREDIT: " << cut.refusal;
+            }
 
             // A2 SEND-SIDE: NOT here. The won block is ALSO a share: the v36 work source
             // calls mint_solved_share(won_block=true) right after this returns
@@ -659,7 +676,13 @@ int main(int argc, char** argv) {
         if (const auto s = node.lane_snapshot()) {
             LOG_INFO << "[v37-dash] lane stop: raw_total=" << static_cast<unsigned long long>(s->raw_total)
                      << " next_pos=" << s->next_pos
-                     << " identities=" << (s->identities ? s->identities->size() : 0);
+                     << " identities=" << (s->identities ? s->identities->size() : 0)
+                     // ★ S-1: the lane digest is the CUT WITNESS the E_b fold reads at.
+                     // Two peered nodes that have ingested the same carriers publish the
+                     // SAME digest here — that identity is the precondition for two nodes
+                     // folding the same E_b, and so for a convergent owed_digest.
+                     << " lane_digest=" << hex32(s->digest)
+                     << " version=" << s->version << " incarnation=" << s->incarnation;
             if (s->identities)
                 for (const auto& [mid, ent] : s->identities->entries()) {
                     const auto it = s->payout.find(mid);
@@ -670,10 +693,17 @@ int main(int argc, char** argv) {
     }
     {
         std::lock_guard<std::mutex> g(bed.mutex());
+        const auto& s1 = node.s1_stats();
         node.stop();
         LOG_INFO << "[v37-dash] stop: ledger_seq=" << node.ledger().ledger_seq()
                  << " pending=" << bed.pending_count_locked()
-                 << " owed_digest=" << hex32(node.ledger().owed_digest());   // A8 compares with the next boot: line
+                 << " owed_digest=" << hex32(node.ledger().owed_digest())     // A8 compares with the next boot: line
+                 // ★ S-1: how the E_b folds went. folds=0 with wins registered,
+                 // or an owed_digest still at b4db1ded… after a FOUND, is the
+                 // settlement emission being DEAD — the thing S-1 exists to fix.
+                 << " s1{folds=" << s1.folds << " valueless=" << s1.valueless
+                 << " refused=" << s1.refused << " no_view=" << s1.no_view
+                 << " unresolved=" << s1.unresolved << "}";
     }
     teardown_io();
     const auto st = backend->stats();
