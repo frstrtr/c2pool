@@ -45,6 +45,8 @@ set(REUSED_SOURCES
     ${C2POOL_SRC}/btclibs/crypto/sha512.cpp
     ${C2POOL_SRC}/btclibs/crypto/ripemd160.cpp
     ${C2POOL_SRC}/btclibs/crypto/hmac_sha512.cpp
+    ${C2POOL_SRC}/btclibs/crypto/hmac_sha256.cpp
+    ${C2POOL_SRC}/btclibs/crypto/scrypt.cpp
     ${C2POOL_SRC}/btclibs/base58.cpp
     ${C2POOL_SRC}/btclibs/hash.cpp
     ${C2POOL_SRC}/btclibs/uint256.cpp
@@ -63,6 +65,15 @@ set(HDKEYS_SOURCES
     Derivation.cpp
     Address.cpp
     KeyImport.cpp
+    # M1-A imports (#193): BIP38 + Core descriptors + generic JSON keystore +
+    # experimental split/shuffle seed backup, plus their leaf primitives
+    # (self-contained AES-256, general-parameter scrypt).
+    Aes256.cpp
+    Scrypt.cpp
+    Bip38.cpp
+    Descriptor.cpp
+    Keystore.cpp
+    SeedBackup.cpp
     ${C2POOL_ROOT}/ui/c2wallet-qt/src/secure/SecureString.cpp
 )
 
@@ -90,4 +101,9 @@ if(C2WALLET_QT_BUILD_TESTS OR _hdkeys_standalone)
     add_executable(c2wallet-hdkeys-test tests/test_hdkeys.cpp)
     target_link_libraries(c2wallet-hdkeys-test PRIVATE c2wallet-hdkeys)
     add_test(NAME hdkeys_kats COMMAND c2wallet-hdkeys-test)
+
+    # M1-A imports KATs (BIP38 / descriptors / keystore / split-shuffle backup).
+    add_executable(c2wallet-imports-test tests/test_imports.cpp)
+    target_link_libraries(c2wallet-imports-test PRIVATE c2wallet-hdkeys)
+    add_test(NAME imports_kats COMMAND c2wallet-imports-test)
 endif()

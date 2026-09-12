@@ -32,6 +32,11 @@ public:
     // false if the result is invalid (tweak >= N or sum == 0) => caller skips index.
     bool seckey_tweak_add(uint8_t sk[32], const uint8_t tweak[32]) const;
 
+    // Scalar multiply: sk = (sk * factor) mod N. In place on sk32. Used by the
+    // BIP38 EC-multiply mode (privkey = passfactor * factorb mod N). false if
+    // the result is invalid.
+    bool seckey_tweak_mul(uint8_t sk[32], const uint8_t factor[32]) const;
+
     // BIP32 public CKD: child_pub = parent_pub + tweak*G. In/out serialized pub
     // (33 compressed). false if invalid.
     bool pubkey_tweak_add(std::vector<uint8_t>& pub33, const uint8_t tweak[32]) const;

@@ -85,6 +85,11 @@ bool Secp::seckey_tweak_add(uint8_t sk[32], const uint8_t tweak[32]) const
     return secp256k1_ec_seckey_tweak_add(p_->ctx, sk, tweak) == 1;
 }
 
+bool Secp::seckey_tweak_mul(uint8_t sk[32], const uint8_t factor[32]) const
+{
+    return secp256k1_ec_seckey_tweak_mul(p_->ctx, sk, factor) == 1;
+}
+
 bool Secp::pubkey_tweak_add(std::vector<uint8_t>& pub33, const uint8_t tweak[32]) const
 {
     secp256k1_pubkey pk;
