@@ -39,6 +39,16 @@
 // as native-only), and a daemon arm whose cache expires (so `have_` alone can
 // no longer mean READY after the daemon died).
 //
+// SUITE G IS THE OTHER POSTURE, and it is the one the M4 stagenet soak actually
+// runs first: serve = monerod, shadow = native. The version-3 oracle read its
+// "native" count off the SERVED seat and its "daemon" count off the SHADOW
+// seat, so in this posture the daemon's empty mempool was judged as a native
+// famine: every P-TPL sample on a healthy, ingesting node came out FAIL (2,000
+// of them, 13 hours, the graduation streak reset on each), and -- the mirror --
+// a real native famine would have read as fed. G1 reproduces the live shape
+// (daemon 0, native 5) and requires CLEAN; G2 is the mirror and requires the
+// refusal to still fire from the shadow seat. Both fail on the version-3 rule.
+//
 // SCOPE FENCE: src/impl/xmr/ only. No consensus digest, no src/sharechain/v37.
 // ---------------------------------------------------------------------------
 #include <cstdio>
@@ -107,14 +117,14 @@ static node::MinerData miner_data(std::uint64_t height, std::size_t n_tx) {
     return md;
 }
 
-static BacklogFamineGuard::Input starved_at(std::uint64_t t, std::uint64_t shadow_n = 5) {
+static BacklogFamineGuard::Input starved_at(std::uint64_t t, std::uint64_t daemon_n = 5) {
     BacklogFamineGuard::Input in;
     in.aligned        = true;
     in.at_unix        = t;
     in.native_known   = true;
     in.native_backlog = 0;
-    in.shadow_known   = true;
-    in.shadow_backlog = shadow_n;
+    in.daemon_known   = true;
+    in.daemon_backlog = daemon_n;
     return in;
 }
 
@@ -145,7 +155,7 @@ static void suite_guard() {
         BacklogFamineGuard g(cfg);
         BacklogFamineGuard::Input in = starved_at(1000, 0);
         const auto o = g.observe(in);
-        CHECK(o.cls == BacklogSampleClass::ShadowEmpty, "A2 class: got %s", to_string(o.cls));
+        CHECK(o.cls == BacklogSampleClass::DaemonEmpty, "A2 class: got %s", to_string(o.cls));
         CHECK(o.check.ok, "A2 both-empty must pass");
         CHECK(g.streak() == 0, "A2 streak must stay 0");
     }
@@ -201,11 +211,11 @@ static void suite_guard() {
         const auto o = g.observe(mis);
         CHECK(o.cls == BacklogSampleClass::Undecidable, "A6 misaligned must be undecidable");
         CHECK(g.streak() == 2, "A6 streak must survive an undecidable sample, got %zu", g.streak());
-        BacklogFamineGuard::Input noshadow = starved_at(1040);
-        noshadow.shadow_known = false;
-        CHECK(g.observe(noshadow).cls == BacklogSampleClass::Undecidable,
-              "A6 an unanswering shadow must be undecidable");
-        CHECK(g.streak() == 2, "A6 streak must survive an unanswered shadow");
+        BacklogFamineGuard::Input nodaemon = starved_at(1040);
+        nodaemon.daemon_known = false;
+        CHECK(g.observe(nodaemon).cls == BacklogSampleClass::Undecidable,
+              "A6 an unanswering daemon arm must be undecidable");
+        CHECK(g.streak() == 2, "A6 streak must survive an unanswered daemon arm");
         CHECK(g.undecidable() == 2, "A6 undecidable count: got %llu",
               static_cast<unsigned long long>(g.undecidable()));
         // The streak still completes across the gap.
@@ -346,8 +356,9 @@ static void suite_verdict() {
         CHECK(TEMPLATE_SEAM.required_equality_count() == 6,
               "B4 the constraint must not have changed the EQUALITY count: %zu",
               TEMPLATE_SEAM.required_equality_count());
-        CHECK(COMPARATOR_VERSION >= 3,
-              "B4 a new gate must move the ledger key: COMPARATOR_VERSION=%u",
+        CHECK(COMPARATOR_VERSION >= 4,
+              "B4 a new gate (v3) and a re-oriented rule (v4) must each move the ledger key: "
+              "COMPARATOR_VERSION=%u",
               static_cast<unsigned>(COMPARATOR_VERSION));
     }
 }
@@ -387,15 +398,24 @@ private:
 };
 
 // Drive N serve samples through a real ParityOracle and return the verdicts.
-static std::vector<ParityVerdict> drive(bool guard_enabled,
-                                        std::size_t native_backlog,
-                                        std::size_t shadow_backlog,
-                                        int samples) {
+// The SEATS are parameters: `served_arm` is the name the serving arm reports
+// itself under, `shadow_arm` the shadow's. The two backlog counts are the
+// SEATS' counts, so a posture is spelled by naming the seats.
+struct DriveResult {
+    std::vector<ParityVerdict> verdicts;
+    std::string                last_famine_detail;   // the constraint's detail on the last sample
+    bool                       famine_tripped = false;
+};
+
+static DriveResult drive_seats(bool guard_enabled,
+                               const char* served_arm, std::size_t served_backlog,
+                               const char* shadow_arm, std::size_t shadow_backlog,
+                               int samples) {
     node::MinerData shadow_md = miner_data(100, shadow_backlog);
-    FixedArm shadow_arm("monerod", shadow_md);
+    FixedArm shadow(shadow_arm, shadow_md);
 
     ParityOracle::Deps deps;
-    deps.shadow_arm = &shadow_arm;
+    deps.shadow_arm = &shadow;
 
     ParityOracleConfig cfg;
     cfg.backlog_famine.enabled     = guard_enabled;
@@ -409,18 +429,39 @@ static std::vector<ParityVerdict> drive(bool guard_enabled,
     std::uint64_t clock = 1000;
     ParityOracle orc(deps, key, policy, cfg, [&clock] { return clock; });
 
-    std::vector<ParityVerdict> out;
+    DriveResult out;
     for (int i = 0; i < samples; ++i) {
-        const node::MinerData served = miner_data(100, native_backlog);
+        const node::MinerData served = miner_data(100, served_backlog);
         MinerDataEpoch ep;
         ep.height  = served.height;
         ep.prev_id = served.prev_id;
-        orc.on_serve(ep, served, "native");
-        for (const SeamResult& r : orc.drain())
-            if (r.sample.kind == ProbeKind::Template) out.push_back(r.sample.verdict);
+        orc.on_serve(ep, served, served_arm);
+        for (const SeamResult& r : orc.drain()) {
+            if (r.sample.kind != ProbeKind::Template) continue;
+            out.verdicts.push_back(r.sample.verdict);
+            out.last_famine_detail.clear();
+            for (const auto& d : r.sample.fields)
+                if (d.field == kBacklogFamineCheck) out.last_famine_detail = d.served;
+        }
         clock += 20;
     }
+    out.famine_tripped = orc.backlog_famine_tripped();
     return out;
+}
+
+// The serve-native posture, as suites C and D have always spelled it.
+static std::vector<ParityVerdict> drive(bool guard_enabled,
+                                        std::size_t native_backlog,
+                                        std::size_t shadow_backlog,
+                                        int samples) {
+    return drive_seats(guard_enabled, "native", native_backlog, "monerod", shadow_backlog, samples)
+        .verdicts;
+}
+
+static std::size_t count_of(const std::vector<ParityVerdict>& v, ParityVerdict want) {
+    std::size_t n = 0;
+    for (ParityVerdict x : v) if (x == want) ++n;
+    return n;
 }
 
 } // namespace
@@ -500,6 +541,145 @@ static void suite_new_behaviour() {
         std::size_t clean = 0;
         for (ParityVerdict x : v) if (x == ParityVerdict::Clean) ++clean;
         CHECK(clean == v.size(), "D3 a quiet chain must stay CLEAN: %zu/%zu", clean, v.size());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SUITE G -- the OTHER posture: serve = monerod, shadow = native (M4 leg 1).
+//
+// Every scenario here is the same guard, the same table, the same two arms as
+// suites C and D -- with the seats swapped, which is exactly what --serve-arm
+// monerod does. Nothing about the famine question changes when the seats do;
+// the version-3 rule was answering a different question in this posture.
+// ---------------------------------------------------------------------------
+static void suite_other_posture() {
+    head("G. ParityOracle in the serve-monerod posture (the M4 leg-1 seat order)");
+
+    // G1. THE LIVE STAGENET SHAPE, reproduced: the daemon's mempool is empty
+    // (get_miner_data.tx_backlog absent), the native pool -- the shadow in this
+    // posture -- holds five relayed transactions the daemon does not. A native
+    // pool that HOLDS transactions is fed, not starved, whichever seat it is
+    // in. Under the version-3 rule this run went FAIL from the third sample on
+    // and stayed there; it must be CLEAN throughout.
+    {
+        const DriveResult r = drive_seats(/*guard_enabled=*/true,
+                                          "monerod", /*daemon=*/0,
+                                          "native",  /*native=*/5, 20);
+        CHECK(r.verdicts.size() == 20, "G1 expected 20 template samples, got %zu", r.verdicts.size());
+        const std::size_t clean = count_of(r.verdicts, ParityVerdict::Clean);
+        CHECK(clean == r.verdicts.size(),
+              "G1 daemon 0 / native 5 with monerod serving must be CLEAN for all %zu samples, got %zu "
+              "(the seat-swap false famine)",
+              r.verdicts.size(), clean);
+        CHECK(!r.famine_tripped, "G1 the guard must not have tripped");
+    }
+
+    // G2. THE MIRROR: a real famine, seen from the shadow seat. The daemon
+    // (serving) holds transactions, the native pool (shadow) holds nothing,
+    // sustained. Under the version-3 rule this read as FED -- the served seat's
+    // count was non-zero -- so leg 1 could not have caught the regression the
+    // constraint exists for. It must refuse, and it must say which arm is
+    // starved without claiming the native arm served anything.
+    {
+        const DriveResult r = drive_seats(/*guard_enabled=*/true,
+                                          "monerod", /*daemon=*/5,
+                                          "native",  /*native=*/0, 8);
+        CHECK(r.verdicts.size() == 8, "G2 expected 8 template samples, got %zu", r.verdicts.size());
+        CHECK(count_of(r.verdicts, ParityVerdict::Fail) > 0,
+              "G2 a sustained empty NATIVE pool must be refused from the shadow seat too");
+        CHECK(!r.verdicts.empty() && r.verdicts.back() == ParityVerdict::Fail,
+              "G2 the run must end in refusal, got %s",
+              r.verdicts.empty() ? "nothing" : to_string(r.verdicts.back()));
+        CHECK(count_of(r.verdicts, ParityVerdict::Clean) <= 3,
+              "G2 at most the pre-threshold samples may be clean, got %zu",
+              count_of(r.verdicts, ParityVerdict::Clean));
+        CHECK(r.famine_tripped, "G2 the guard must be tripped at the end of the run");
+        CHECK(r.last_famine_detail.find("not ingesting") != std::string::npos,
+              "G2 the detail must name the defect: %s", r.last_famine_detail.c_str());
+        CHECK(r.last_famine_detail.find("shadow in this posture") != std::string::npos,
+              "G2 the detail must say the native arm is the shadow, not that it served: %s",
+              r.last_famine_detail.c_str());
+        CHECK(r.last_famine_detail.find("every template served is empty") == std::string::npos,
+              "G2 the detail must not claim the native arm served anything: %s",
+              r.last_famine_detail.c_str());
+    }
+
+    // G3. A quiet chain in this posture is agreement, exactly as in D3.
+    {
+        const DriveResult r = drive_seats(true, "monerod", 0, "native", 0, 20);
+        CHECK(count_of(r.verdicts, ParityVerdict::Clean) == r.verdicts.size() && r.verdicts.size() == 20,
+              "G3 both empty must stay CLEAN: %zu/%zu",
+              count_of(r.verdicts, ParityVerdict::Clean), r.verdicts.size());
+    }
+
+    // G4. Propagation skew in this posture: the daemon holds 50, the native
+    // pool holds 1. Fed is fed.
+    {
+        const DriveResult r = drive_seats(true, "monerod", 50, "native", 1, 20);
+        CHECK(count_of(r.verdicts, ParityVerdict::Clean) == r.verdicts.size() && r.verdicts.size() == 20,
+              "G4 native 1 / daemon 50 must NOT be a refusal: %zu/%zu clean",
+              count_of(r.verdicts, ParityVerdict::Clean), r.verdicts.size());
+    }
+
+    // G5. The same two shapes in the serve-native posture still judge as
+    // suites C and D require -- the re-orientation must not have moved leg 2.
+    {
+        const auto fed     = drive(true, /*native=*/5, /*daemon=*/0, 20);
+        const auto starved = drive(true, /*native=*/0, /*daemon=*/5, 8);
+        CHECK(count_of(fed, ParityVerdict::Clean) == 20,
+              "G5 native 5 / daemon 0 with native serving must be CLEAN: %zu/20",
+              count_of(fed, ParityVerdict::Clean));
+        CHECK(!starved.empty() && starved.back() == ParityVerdict::Fail,
+              "G5 native 0 / daemon 5 with native serving must still be refused");
+    }
+
+    // G6. Arm identity is resolved by NAME, and a pair the oracle cannot tell
+    // apart is undecidable: it neither refuses nor manufactures evidence. Two
+    // arms that both call themselves "native", and an arm with a name the
+    // guard does not know, must leave the six-field verdict alone.
+    {
+        const DriveResult twins = drive_seats(true, "native", 0, "native", 5, 8);
+        CHECK(count_of(twins.verdicts, ParityVerdict::Clean) == twins.verdicts.size(),
+              "G6 two native-named arms: undecidable, must not refuse (%zu/%zu clean)",
+              count_of(twins.verdicts, ParityVerdict::Clean), twins.verdicts.size());
+        CHECK(!twins.famine_tripped, "G6 two native-named arms must not trip the guard");
+
+        const DriveResult unknown = drive_seats(true, "monerod", 5, "replay", 0, 8);
+        CHECK(count_of(unknown.verdicts, ParityVerdict::Clean) == unknown.verdicts.size(),
+              "G6 an unknown shadow arm name: undecidable, must not refuse (%zu/%zu clean)",
+              count_of(unknown.verdicts, ParityVerdict::Clean), unknown.verdicts.size());
+        CHECK(!unknown.famine_tripped, "G6 an unknown arm name must not trip the guard");
+
+        CHECK(is_native_arm_name("native") && !is_native_arm_name("monerod")
+              && !is_native_arm_name("shadow") && !is_native_arm_name("none")
+              && !is_native_arm_name(nullptr),
+              "G6 is_native_arm_name");
+        CHECK(is_daemon_arm_name("monerod") && is_daemon_arm_name("monerod (fallback from native)")
+              && !is_daemon_arm_name("native") && !is_daemon_arm_name("mon")
+              && !is_daemon_arm_name(nullptr),
+              "G6 is_daemon_arm_name");
+    }
+
+    // G7. A refusal earned in one posture is cleared by a fed sample in the
+    // other: the guard's state is about the native pool, not about the seat.
+    {
+        BacklogFamineConfig cfg;
+        cfg.consecutive = 2;
+        cfg.sustained_s = 10;
+        BacklogFamineGuard g(cfg);
+        BacklogFamineGuard::Input shadow_starved = starved_at(1000);
+        shadow_starved.native_serving = false;
+        g.observe(shadow_starved);
+        shadow_starved.at_unix = 1020;
+        const auto tripped = g.observe(shadow_starved);
+        CHECK(g.tripped() && !tripped.check.ok, "G7 precondition: tripped from the shadow seat");
+        CHECK(tripped.check.detail.find("shadow in this posture") != std::string::npos,
+              "G7 the shadow-seat wording: %s", tripped.check.detail.c_str());
+        BacklogFamineGuard::Input fed = starved_at(1040);
+        fed.native_backlog = 2;
+        fed.native_serving = true;
+        CHECK(g.observe(fed).check.ok && !g.tripped(),
+              "G7 a fed native pool clears the refusal whichever seat it now sits in");
     }
 }
 
@@ -673,6 +853,7 @@ int main(int argc, char** argv) {
     suite_verdict();
     suite_old_behaviour();
     suite_new_behaviour();
+    suite_other_posture();
     suite_served_by();
     suite_staleness();
 

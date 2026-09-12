@@ -406,31 +406,54 @@ private:
 
         // The CONSTRAINT that closes P-TPL's blind spot. tx_backlog_count is a
         // Measurement and stays one; what is judged here is the FAMINE SHAPE --
-        // we served nothing while the arm we are judged against held something,
+        // the NATIVE pool held nothing while the DAEMON held something,
         // sustained. Fed only on an ALIGNED pair, because a backlog claim
         // across two different tips compares two different questions; a
         // misaligned sample is undecidable and neither grows nor clears the
         // streak. See xmr_backlog_famine.hpp.
+        //
+        // THE TWO COUNTS ARE RESOLVED BY ARM IDENTITY, NOT BY SEAT. Which arm
+        // served and which is the shadow is the posture's choice; the guard's
+        // question is about the native pool whichever seat it sits in. Reading
+        // "native" off the served seat is right only in the serve-native
+        // posture -- in M4's leg 1 (serve = monerod, shadow = native) it turned
+        // the daemon's empty mempool into a native famine and refused every
+        // template a healthy node produced. A pair whose identities cannot be
+        // told apart by name is undecidable, never guessed.
         {
+            const ArmObservation* native_obs = nullptr;
+            const ArmObservation* daemon_obs = nullptr;
+            if (is_native_arm_name(served.arm.c_str()))      native_obs = &served;
+            else if (is_daemon_arm_name(served.arm.c_str())) daemon_obs = &served;
+            if (is_native_arm_name(shadow.arm.c_str()))      { if (!native_obs) native_obs = &shadow; }
+            else if (is_daemon_arm_name(shadow.arm.c_str())) { if (!daemon_obs) daemon_obs = &shadow; }
+
             BacklogFamineGuard::Input fi;
-            fi.aligned      = served.have && shadow.have
-                           && served.height == shadow.height
-                           && served.prev_id == shadow.prev_id;
-            fi.at_unix      = s.at_unix;
-            fi.native_known = served.have;
-            fi.native_backlog = static_cast<std::uint64_t>(s.served.tx_backlog.size());
-            if (shadow.have) {
-                const Obs& sb = shadow.fields.get("tx_backlog_count");
-                if (sb.present) {
-                    fi.shadow_known   = true;
-                    fi.shadow_backlog = std::strtoull(sb.value.c_str(), nullptr, 10);
-                }
-            }
+            fi.aligned        = served.have && shadow.have
+                             && served.height == shadow.height
+                             && served.prev_id == shadow.prev_id;
+            fi.at_unix        = s.at_unix;
+            fi.native_serving = (native_obs == &served);
+            read_backlog_(native_obs, fi.native_known, fi.native_backlog);
+            read_backlog_(daemon_obs, fi.daemon_known, fi.daemon_backlog);
             const BacklogFamineGuard::Observation fo = famine_.observe(fi);
             opt.constraints.push_back(fo.check);
         }
 
         return compare_seam(TEMPLATE_SEAM, served, shadow, opt);
+    }
+
+    // One arm's tx_backlog_count, as the observation rendered it (which is
+    // md.tx_backlog.size() on both arms -- see template_observation). An arm
+    // that did not answer, or whose identity was not resolved, stays unknown.
+    static void read_backlog_(const ArmObservation* o, bool& known, std::uint64_t& count) {
+        known = false;
+        count = 0;
+        if (o == nullptr || !o->have) return;
+        const Obs& b = o->fields.get("tx_backlog_count");
+        if (!b.present) return;
+        known = true;
+        count = std::strtoull(b.value.c_str(), nullptr, 10);
     }
 
     // --- P-SUB ---------------------------------------------------------------

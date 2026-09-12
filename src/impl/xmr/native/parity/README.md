@@ -84,6 +84,30 @@ the backlog moved in between, and `SERVED_MISMATCH` — the verdict that catches
 serving something *neither* arm would have produced — would become unprovable.
 The serving arm is still cross-checked, but only while its epoch has not moved.
 
+## The P-TPL backlog: a measurement and a constraint, judged by arm
+
+`tx_backlog_count` is a **measurement** and never scores: the two arms hold two
+different transaction sets by construction. The daemon's number is its own
+mempool as `get_miner_data.tx_backlog` offers it to a template builder; the
+native number is what our pool would select, admitted under the v37 relay rule.
+They differ on ordinary propagation skew, and the native pool may hold
+transactions the daemon has dropped. An equality gate here would refuse a
+healthy node.
+
+The **famine shape** is a constraint (`native_backlog_famine`,
+`xmr_backlog_famine.hpp`): the *native* pool holds nothing while the *daemon*
+holds something, sustained across K samples and S seconds. That is the one
+shape skew cannot explain, and it is the regression the M2h restack was for.
+
+The two counts are the **arms'** own, resolved by arm name, in whichever seat
+(served / shadow) the posture puts them. This is comparator version 4. Version 3
+read "native" off the served seat and "daemon" off the shadow seat, which is the
+same thing only when the native arm serves; in M4's leg 1 (serve = monerod,
+shadow = native) the daemon's empty mempool was judged as a native famine, every
+P-TPL sample on a healthy node came out FAIL, the leg's streak never left zero,
+and — the mirror — a real native famine in that posture would have read as fed.
+A pair whose arm identities cannot be resolved is undecidable, never guessed.
+
 ## Graduation
 
 The ledger is hard-keyed to `{c2pool_commit, comparator_version, monerod_version,
