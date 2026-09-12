@@ -51,6 +51,59 @@
 // the SYNTHETIC RDWR PoW envelope, not a real DASH block-header PoW. The freeze
 // pins the CONTAINER; the field SEMANTICS widen when real share format lands.
 //
+// ── S-1c CARRIER-WIRE v0x02: THE FLAT CUT DESCRIPTOR (2026-09-12) ────────────
+// v0x02 is the sanctioned version bump of the F-5 policy (w3_wire_freeze.hpp
+// "VERSION POLICY"): v0x01 is NOT re-packed — its bytes stay byte-identical and
+// its goldens stay green — and v0x02 appends ONE trailer after the last receipt,
+// so every v0x01 offset and every v0x01 size-model function remains valid over
+// the v0x02 prefix. The decoder DUAL-ACCEPTS {0x01, 0x02} for the upgrade
+// window; the encoder emits the CURRENT W3_WIRE_VERSION.
+//
+//   frame_v2 := u8      version (= 0x02)
+//               event   carrier                      (v0x01 event, unchanged)
+//               u8      receipt_count                (unchanged)
+//               event   receipt[receipt_count]       (unchanged)
+//               cutdesc trailer                      @ v0x01 frame_size(c)
+//   cutdesc  := u8  won_block                  (0 | 1; anything else REJECT_BAD_CUT)
+//               if won_block == 1:
+//                 b32 bid                      (hex(bid) IS the OwedLedger key)
+//                 u64 h_b                      (H_b, the block's OWN height)
+//                 u64 cut_next_pos             (P — the prefix the winner folded at)
+//                 b32 cut_spine_digest         (LaneSnapshot::digest at P)
+//                 u64 reward                   (the winner's block_reward(H_b))
+//                 u8  payout_emitted           (0 | 1; 1 => receiver fail-closed)
+//                 b32 owed_digest_at_win       (VERIFY field, never consensus)
+//
+// WHY THESE FIELDS AND NO OTHERS (S-1c cross-node convergence, the CUT RULE).
+// A receiver must credit its OWN ledger with the SAME E_b the winner credited.
+// E_b = fold_eb(reward, view@P) is a pure function of (reward, view.payout,
+// view.identities) at ONE lane prefix P (w4_settlement.hpp S8), so the wire must
+// pin BOTH arguments:
+//   * `reward` — DashRpcCoinBackend::block_reward(h) answers fail-closed 0 when
+//     its cached template height != h, and the receiver's height-watch has
+//     already refreshed the template to H_b+1 by the time the carrier lands. A
+//     receiver that asked its own backend would fold reward 0 => a VALUELESS
+//     credit => A != B. Carrying it makes the credit a pure function of the wire.
+//   * `cut_next_pos` + `cut_spine_digest` — the receiver must fold at the
+//     WINNER'S cut, not at its own tip at receipt time (its tip already includes
+//     this very carrier). (chain, next_pos, spine_digest) is the ONLY
+//     cross-node-comparable cut key (w4_settlement.hpp CutToken :938-939, w6
+//     PrefixResolver); CutToken::incarnation and LaneSnapshot::version are
+//     NODE-LOCAL (executor-minted / publication-count) and are deliberately NOT
+//     on the wire.
+//   * `payout_emitted` — the winner's coinbase outputs are NOT on the wire (they
+//     are an unbounded map). A FRESH win is at depth 0, so the W5 burial gate
+//     withholds and the payout map is EMPTY on BOTH sides by construction; this
+//     flag lets the receiver REFUSE fail-closed in the one shape it could not
+//     reproduce (a winner that registered an already-buried block).
+//   * `owed_digest_at_win` — diagnostics only: the winner's owed_digest at the
+//     instant of the win. A receiver whose own digest differs at that moment has
+//     ALREADY diverged upstream; logging it names the divergence at the first
+//     block instead of at the audit.
+// A peak / MMR leaf is deliberately NOT on this wire: a receiver must APPEND the
+// identical leaf itself, never insert a peer's peak. The owed-event MMR is a
+// separate, un-nodded track; v0x02 converges the EXISTING flat owed_digest.
+//
 // ── the v36 transport this layer REUSES (cite, never reinvent) ──────────────
 // W3 adds ZERO new transport. A carrier is an extended share body, not a new
 // message type; it rides the existing shares/sharereq/sharereply verbs and the
@@ -76,6 +129,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -85,20 +139,79 @@
 
 namespace c2pool::v37n {
 
-// W3 wire version tag. 0x01 is the W3-B5 FROZEN carrier-wire layout (see the
-// byte-map in this file's header and the golden byte-KAT). A later wire change
-// is a visible bump of this tag, never a silent re-pack of 0x01.
-constexpr std::uint8_t W3_WIRE_VERSION = 0x01;
+// W3 wire version tags. 0x01 is the W3-B5 FROZEN carrier-wire layout (see the
+// byte-map in this file's header and the golden byte-KAT). 0x02 is the S-1c
+// bump: the v0x01 body VERBATIM plus the flat cut-descriptor trailer. A wire
+// change is always a visible bump of this tag, never a silent re-pack.
+constexpr std::uint8_t W3_WIRE_VERSION_V1 = 0x01;   // frozen; bytes never move
+constexpr std::uint8_t W3_WIRE_VERSION_V2 = 0x02;   // frozen; v1 body + trailer
+
+// The version this build EMITS. Decode dual-accepts {V1, V2} for the upgrade
+// window (F-5); a v0x01-only peer rejects a v0x02 frame outright at decode —
+// the flag day is LOUD, never a silently half-relayed descriptor.
+constexpr std::uint8_t W3_WIRE_VERSION = W3_WIRE_VERSION_V2;
 
 // R_MAX is the W2-layer consensus bound (share-format §7); W3 enforces it at
 // DECODE, before any push (spec §2.3 / WT-1). Named through W2 so there is one
 // definition, never a second copy that could drift.
 constexpr std::uint32_t W3_R_MAX = W2_R_MAX;
 
+// ── S-1c: the flat cut descriptor a BLOCK-WINNING carrier carries (v0x02) ───
+// Everything a peer needs to credit its OWN OwedLedger with the SAME E_b the
+// winner credited, and nothing else. Consensus-relevant fields: bid, h_b,
+// cut_next_pos, cut_spine_digest, reward (they determine the credit and the
+// finalize bin). Diagnostic: owed_digest_at_win. Fail-closed: payout_emitted.
+// NEVER on this wire: incarnation / lane version (node-local), the payout map
+// (unbounded), any MMR peak (a receiver appends its own leaf, never a peak).
+struct CutDescriptor {
+    bytes32       bid{};                  // hex(bid) IS the OwedLedger key
+    std::uint64_t h_b = 0;                // the block's OWN height (D8)
+    std::uint64_t cut_next_pos = 0;       // P — the prefix the winner folded at
+    bytes32       cut_spine_digest{};     // LaneSnapshot::digest at P
+    std::uint64_t reward = 0;             // the winner's block_reward(H_b)
+    bool          payout_emitted = false; // winner's W5 assembly emitted outputs
+    bytes32       owed_digest_at_win{};   // VERIFY field (diagnostics, never consensus)
+    bool operator==(const CutDescriptor&) const = default;
+};
+
+// bid as the ledger key: a pure lowercase-hex codec over the 32 raw bytes, so
+// string -> bytes -> string is EXACT and carries no endianness question (the
+// daemon's bid is uint256::GetHex(), 64 hex chars, and that string — not any
+// re-ordered form of it — is what OwedLedger keys on).
+inline std::string cut_bid_hex(const bytes32& b) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(64);
+    for (std::uint8_t x : b) { s.push_back(kHex[x >> 4]); s.push_back(kHex[x & 0x0f]); }
+    return s;
+}
+// nullopt unless `hex` is exactly 64 lowercase/uppercase hex chars.
+inline std::optional<bytes32> cut_bid_bytes(const std::string& hex) {
+    if (hex.size() != 64) return std::nullopt;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    bytes32 b{};
+    for (int i = 0; i < 32; ++i) {
+        const int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return std::nullopt;
+        b[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return b;
+}
+
 // ── a carrier = ordinary share + 0..R_MAX receipts (spec §2.1) ──────────────
 struct Carrier {
     WorkEvent carrier;                 // the ordinary V37 share (advances clock)
     std::vector<WorkEvent> receipts;   // ref-protected payload, order-free
+    // S-1c (wire v0x02): set iff this carrier is ALSO a coin block winner. A
+    // v0x01 frame decodes to nullopt; a v0x02 frame with won_block == 0 also
+    // decodes to nullopt — the two are indistinguishable to every consumer
+    // above the codec, which is exactly the upgrade-window property we want.
+    std::optional<CutDescriptor> cut;
 };
 
 // ── decode dispositions ─────────────────────────────────────────────────────
@@ -111,6 +224,10 @@ enum class WireStatus {
     REJECT_POLICY,            // W3-B5 frozen-wire policy (w3_wire_freeze.hpp):
                               // tag cap (F-1) / V37.0 descriptor validity (F-2)
                               // on the CARRIER; applied post-decode, pre-admit
+    REJECT_BAD_CUT,           // S-1c v0x02: won_block byte outside {0,1}, or the
+                              // payout_emitted byte outside {0,1} — a malformed
+                              // trailer is NEVER admitted (it would otherwise
+                              // credit a peer's ledger off a guessed cut)
 };
 
 // Why a single receipt was dropped at decode (carrier still stands, §2.4/WT-2).
@@ -137,15 +254,29 @@ struct DecodeResult {
 // ═══════════════════════════════════════════════════════════════════════════
 class CarrierWire {
 public:
+    // Emit at the build's CURRENT wire version (W3_WIRE_VERSION).
     static std::vector<std::uint8_t> encode(const Carrier& c) {
+        return encode_version(c, W3_WIRE_VERSION);
+    }
+
+    // Emit at an EXPLICIT version. This is the seam the byte freeze pins: the
+    // v0x01 goldens are re-run through encode_version(c, 0x01) and must stay
+    // byte-identical forever, while encode_version(c, 0x02) appends the S-1c
+    // trailer to the SAME v0x01 body. An unknown version, or a v0x01 request
+    // for a carrier that HAS a cut descriptor (v0x01 cannot express one — a
+    // silent drop would lose a peer's block credit), returns an EMPTY vector.
+    static std::vector<std::uint8_t> encode_version(const Carrier& c, std::uint8_t ver) {
         std::vector<std::uint8_t> b;
-        b.push_back(W3_WIRE_VERSION);
+        if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2) return b;
+        if (ver == W3_WIRE_VERSION_V1 && c.cut.has_value()) return b;
+        b.push_back(ver);
         put_event(b, c.carrier);
         // receipt_count is a single byte; R_MAX=4 fits trivially. Encoders never
         // emit > R_MAX (the emitter is bounded); a decoder that SEES > R_MAX
         // rejects the whole carrier (§2.3, WT-1).
         b.push_back(static_cast<std::uint8_t>(c.receipts.size()));
         for (const WorkEvent& r : c.receipts) put_event(b, r);
+        if (ver == W3_WIRE_VERSION_V2) put_cutdesc(b, c.cut);
         return b;
     }
 
@@ -164,7 +295,11 @@ public:
         std::size_t p = 0;
         std::uint8_t ver = 0;
         if (!get_u8(b, p, ver)) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
-        if (ver != W3_WIRE_VERSION) { out.status = WireStatus::REJECT_BAD_VERSION; return out; }
+        // F-5 dual-accept for the S-1c upgrade window: {0x01, 0x02}.
+        if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2) {
+            out.status = WireStatus::REJECT_BAD_VERSION;
+            return out;
+        }
 
         WorkEvent carrier;
         if (!get_event(b, p, carrier)) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
@@ -180,6 +315,15 @@ public:
             if (!get_event(b, p, r)) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
             receipts.push_back(std::move(r));
         }
+        // (1b) S-1c v0x02 trailer. A malformed trailer is a HARD reject: the
+        // whole point of the descriptor is that a receiver credits its ledger at
+        // the winner's cut, so a frame whose cut cannot be read is never admitted
+        // (never "admit the share and drop the cut" — that is the divergence).
+        std::optional<CutDescriptor> cut;
+        if (ver == W3_WIRE_VERSION_V2) {
+            const WireStatus cs = get_cutdesc(b, p, cut);
+            if (cs != WireStatus::OK) { out.status = cs; return out; }
+        }
         // Trailing bytes are a malformed frame (we consumed a fixed structure).
         if (p != b.size()) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
 
@@ -190,6 +334,7 @@ public:
         }
         // (2b) per-receipt identity binding — drop the offender, carrier stands.
         out.carrier.carrier = std::move(carrier);
+        out.carrier.cut = std::move(cut);
         for (WorkEvent& r : receipts) {
             if (!identity_bound(r)) {
                 out.dropped.emplace_back(r.tag, ReceiptWireDrop::MISBOUND_IDENTITY);
@@ -251,6 +396,40 @@ private:
         put_desc(b, e.descriptor);
         put_str(b, e.tag);   // local bookkeeping (NOT in preimage); carried so a
                              // round-trip is exact, never covered by PoW/consensus.
+    }
+
+    // ── S-1c v0x02 trailer codec ────────────────────────────────────────────
+    static void put_cutdesc(std::vector<std::uint8_t>& b,
+                            const std::optional<CutDescriptor>& c) {
+        if (!c) { put_u8(b, 0); return; }           // won_block = 0: ONE byte
+        put_u8(b, 1);
+        put_bytes32(b, c->bid);
+        put_u64(b, c->h_b);
+        put_u64(b, c->cut_next_pos);
+        put_bytes32(b, c->cut_spine_digest);
+        put_u64(b, c->reward);
+        put_u8(b, c->payout_emitted ? 1 : 0);
+        put_bytes32(b, c->owed_digest_at_win);
+    }
+    static WireStatus get_cutdesc(const std::vector<std::uint8_t>& b, std::size_t& p,
+                                  std::optional<CutDescriptor>& out) {
+        std::uint8_t won = 0;
+        if (!get_u8(b, p, won)) return WireStatus::REJECT_TRUNCATED;
+        if (won == 0) { out.reset(); return WireStatus::OK; }
+        if (won != 1) return WireStatus::REJECT_BAD_CUT;   // not a boolean
+        CutDescriptor c;
+        std::uint8_t pe = 0;
+        if (!get_bytes32(b, p, c.bid))              return WireStatus::REJECT_TRUNCATED;
+        if (!get_u64(b, p, c.h_b))                  return WireStatus::REJECT_TRUNCATED;
+        if (!get_u64(b, p, c.cut_next_pos))         return WireStatus::REJECT_TRUNCATED;
+        if (!get_bytes32(b, p, c.cut_spine_digest)) return WireStatus::REJECT_TRUNCATED;
+        if (!get_u64(b, p, c.reward))               return WireStatus::REJECT_TRUNCATED;
+        if (!get_u8(b, p, pe))                      return WireStatus::REJECT_TRUNCATED;
+        if (pe > 1) return WireStatus::REJECT_BAD_CUT;     // not a boolean
+        if (!get_bytes32(b, p, c.owed_digest_at_win)) return WireStatus::REJECT_TRUNCATED;
+        c.payout_emitted = (pe == 1);
+        out = c;
+        return WireStatus::OK;
     }
 
     static bool get_u8(const std::vector<std::uint8_t>& b, std::size_t& p, std::uint8_t& v) {
@@ -382,8 +561,11 @@ struct CarrierBloatStats {
         std::size_t n = c.receipts.size();
         if (n <= W3_R_MAX) ++receipt_count_hist[n];
         carrier_body_bytes += whole_frame.size();
-        // receipt-only bytes = whole frame - (version + carrier + count) prefix.
-        Carrier bare; bare.carrier = c.carrier;
+        // receipt-only bytes = whole frame - (version + carrier + count [+ the
+        // S-1c v0x02 trailer]) prefix. The bare frame carries the SAME cut so
+        // the subtraction isolates the receipts and never charges a block
+        // winner's 122-byte descriptor to receipt bloat.
+        Carrier bare; bare.carrier = c.carrier; bare.cut = c.cut;
         receipt_payload_bytes +=
             whole_frame.size() - CarrierWire::encode(bare).size();
     }
@@ -483,6 +665,13 @@ public:
         bool relayed = false;                // re-broadcast onward
         std::size_t peers_reached = 0;
         std::vector<std::pair<std::string, ReceiptWireDrop>> wire_dropped;
+        // S-1c: the v0x02 cut descriptor this frame carried, surfaced so the
+        // daemon's inbound seam can drive its OWN settlement at the winner's cut
+        // WITHOUT decoding the frame a second time. Valid iff wire == OK; set
+        // only for a BLOCK-WINNING carrier (nullopt for every share and for
+        // every v0x01 frame). The relay itself does nothing with it — routing
+        // settlement is the daemon's job, not the relay's (§1.2, O1).
+        std::optional<CutDescriptor> cut;
     };
 
     // ── inbound (peer -> us), spec §3.2 ─────────────────────────────────────
@@ -494,11 +683,12 @@ public:
         DecodeResult dr = CarrierWire::decode(frame);
         o.wire = dr.status;
         o.wire_dropped = dr.dropped;
-        if (!dr.ok()) return o;                 // malformed / R_MAX / carrier unbound
+        if (!dr.ok()) return o;                 // malformed / R_MAX / carrier unbound / bad cut
         if (m_policy && !m_policy(dr.carrier)) {   // W3-B5 policy (tag cap / desc validity)
             o.wire = WireStatus::REJECT_POLICY;
             return o;
         }
+        o.cut = dr.carrier.cut;                 // S-1c: surfaced for the daemon's settlement seam
 
         bool novel_to_relay = !m_seen.seen(dr.carrier.carrier.hash());
         m_stats.observe_received(!novel_to_relay);
@@ -526,6 +716,7 @@ public:
         std::lock_guard<std::mutex> lk(m_mtx);
         Outcome o;
         o.wire = WireStatus::OK;
+        o.cut = c.cut;
         o.admission = m_admit(c.carrier, c.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);
         if (o.admitted) m_stats.observe_accepted(re_encode(c), c);
@@ -551,6 +742,7 @@ public:
         std::lock_guard<std::mutex> lk(m_mtx);
         Outcome o;
         o.wire = WireStatus::OK;
+        o.cut = c.cut;
         // Unconditional append: no m_seen check, no backpressure gate.
         o.admission = m_admit(c.carrier, c.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);

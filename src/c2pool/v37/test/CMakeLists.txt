@@ -505,4 +505,48 @@ if (BUILD_TESTING)
     target_include_directories(v37_w4_owed_incremental_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_w4_owed_incremental_test Threads::Threads)
     add_test(NAME v37_w4_owed_incremental_test COMMAND v37_w4_owed_incremental_test)
+
+    # Track A2 / S-1 — LIVE FOLD-WIRING KAT (btc/btc_node.hpp on_block_won ->
+    # settle::fold_eb -> FoundBlock -> the F1 driver -> owed_digest). Pins that
+    # the live DRIVER path, on a FIXED event stream, moves owed_digest OFF the
+    # empty sha256d("V37O") anchor b4db1ded…; that two independent stacks fed
+    # that stream CONVERGE on the same digest; that credit and payout stay
+    # DISTINCT maps; and — the regression pin — that the pre-S-1 "assembly as
+    # credit" shape reproduces the anchor. Also pins that both refuse-LOUD paths
+    # (reward == 0, non-ratified geometry) still REGISTER the block. Stdlib +
+    # Threads (the engine's executor thread), MockCoinBackend + MemSettleStore:
+    # no coin lib, no sockets, no clocks. SAME HOLLOW-GREEN GUARD as the sibling
+    # suites: ALSO listed on BOTH build.yml --target lists (the Linux x86_64 leg
+    # and the ASan+UBSan leg) so CI compiles + RUNS it instead of registering a
+    # NOT_BUILT CTest sentinel (the DGB #137 / #769 / c2pool#1539 unregistered-
+    # KAT class), and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_s1_live_wiring_kat v37_s1_live_wiring_kat.cpp)
+    target_compile_features(v37_s1_live_wiring_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_s1_live_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_s1_live_wiring_kat Threads::Threads)
+    add_test(NAME v37_s1_live_wiring_kat COMMAND v37_s1_live_wiring_kat)
+
+    # Track A2 / S-1c — CROSS-NODE owed_digest CONVERGENCE KAT. S-1 made the
+    # node that MINED a block credit E_b; its PEERS still knew nothing about the
+    # block, so two nodes on the byte-identical carrier stream committed to
+    # DIFFERENT owed ledgers (A non-empty, B at the b4db1ded... anchor) — a
+    # settlement fork. This pins the fix: the winner names its fold in the wire
+    # v0x02 flat cut descriptor (w3_relay.hpp CutDescriptor), the receiver
+    # re-runs settle::fold_eb at THAT prefix through XbtcNode::on_peer_block_won
+    # and drives the EXISTING on_block_found/on_block_finalized API, and both
+    # nodes FINALIZE at the same bin_height on the same owed_digest. Also pins
+    # the defect itself (case 3: no descriptor -> A != B), the CUT RULE being
+    # load-bearing (fold(P) != fold(P+1)), every fail-closed refusal, the
+    # double-drive guard, and the v0x02 wire bytes. Stdlib + Threads (the
+    # engine's executor thread), MockCoinBackend + MemSettleStore: no coin lib,
+    # no sockets, no clocks. SAME HOLLOW-GREEN GUARD as the sibling suites: ALSO
+    # listed on BOTH build.yml --target lists (the Linux x86_64 leg and the
+    # ASan+UBSan leg) so CI compiles + RUNS it instead of registering a NOT_BUILT
+    # CTest sentinel (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class),
+    # and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_s1c_convergence_kat v37_s1c_convergence_kat.cpp)
+    target_compile_features(v37_s1c_convergence_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_s1c_convergence_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_s1c_convergence_kat Threads::Threads)
+    add_test(NAME v37_s1c_convergence_kat COMMAND v37_s1c_convergence_kat)
 endif()

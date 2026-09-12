@@ -201,6 +201,49 @@ public:
         return nullptr;
     }
 
+    // ── ★ S-1c reader seam (any thread): read-at-a PEER'S cut ────────────────
+    // settlement_view_at() above is keyed on (incarnation, version), and BOTH of
+    // those are NODE-LOCAL: incarnation is executor-minted (F2), and version is
+    // this node's per-lane PUBLICATION count — which depends on how the executor
+    // happened to coalesce bursts (kCoalesceBurst), so two nodes that folded the
+    // identical record prefix can carry different version numbers for it. Neither
+    // can address a cut a PEER names.
+    //
+    // (chain, next_pos, digest) can: next_pos is the record PREFIX LENGTH (the
+    // consensus clock) and digest is the lane's committed commitment at that
+    // prefix — the same pair w4's CutToken calls (next_pos, spine_digest) and the
+    // only cut key that is comparable across nodes. This returns the retained
+    // projection at exactly that prefix AND that commitment, or nullptr.
+    //
+    // nullptr is a HARD miss, never a licence to fold at a neighbouring prefix
+    // (O2.3): the caller MUST refuse the credit rather than fold at the wrong
+    // cut. The two honest causes are (a) the prefix is older than the ring, and
+    // (b) this node never PUBLISHED that exact prefix because the executor
+    // coalesced through it — both are convergence misses the caller must count
+    // and say out loud. A digest mismatch at a matching next_pos is worse than a
+    // miss: it means the two nodes folded DIFFERENT records into the same prefix,
+    // so it is reported separately via `digest_mismatch`.
+    std::shared_ptr<const SettlementView> settlement_view_by_cut(
+        ::v37::ChainId c, std::uint64_t next_pos,
+        const ::v37::bytes32& spine_digest,
+        bool* digest_mismatch = nullptr) const {
+        if (digest_mismatch) *digest_mismatch = false;
+        std::lock_guard<std::mutex> lk(m_ring_mtx);
+        auto it = m_rings.find(c);
+        if (it == m_rings.end()) return nullptr;
+        bool saw_pos = false;
+        // Newest first: a prefix can be published more than once only across a
+        // rewind, and the most recent publication at that prefix is the live one.
+        for (auto r = it->second.rbegin(); r != it->second.rend(); ++r) {
+            const auto& sv = *r;
+            if (sv->next_pos != next_pos) continue;
+            saw_pos = true;
+            if (sv->digest == spine_digest) return sv;
+        }
+        if (digest_mismatch) *digest_mismatch = saw_pos;
+        return nullptr;
+    }
+
 private:
     struct Command {
         ::v37::LaneRecord rec;

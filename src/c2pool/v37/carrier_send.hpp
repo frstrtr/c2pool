@@ -103,6 +103,15 @@ struct OwnWinRequest {
     std::vector<std::uint8_t> payout_script;    // the miner's output script (empty = no identity)
     bool won_block = false;                     // #889: this solve was ALSO a coin block
     std::string tag;                            // bookkeeping only; clamped on submit
+    // ★ S-1c: the flat cut descriptor this BLOCK win carries to its peers (wire
+    // v0x02). Set only when won_block is true and the daemon could name the win
+    // — the daemon's SubmitBlockFn has already registered the block and folded
+    // E_b by the time the H-SHARE seam fires (work_source.cpp:2845 then :2885,
+    // same stratum thread), so it can hand the fold's OWN cut down here. When
+    // it is unset the frame still goes out, just without a descriptor: a peer
+    // then accounts the SHARE and credits NOTHING for the block — visible as a
+    // convergence miss on the receiving side, never a silent divergence.
+    std::optional<CutDescriptor> cut;
 };
 
 // Build a request from the raw stratum solve fields. `header` is the 80-byte
@@ -177,6 +186,8 @@ struct CarrierSendStats {
     std::uint64_t admitted = 0;           // locally accounted own carriers
     std::uint64_t rejected = 0;           // minted but W2 rejected (dedup / target / chain)
     std::uint64_t block_winners = 0;      // of admitted: went through append_block_winner
+    std::uint64_t cut_carried = 0;        // S-1c: block wins that carried a v0x02 cut descriptor
+    std::uint64_t cut_missing = 0;        // S-1c: block wins emitted WITHOUT one (peers credit nothing)
     std::uint64_t relayed = 0;            // reached >= 1 peer
     std::uint64_t deferred_relay = 0;     // admitted but 0 peers (DEFER, never dropped)
     std::uint64_t peers_reached_total = 0;
@@ -325,6 +336,7 @@ public:
         std::optional<u64> parent_height;    // set whenever the resolve succeeded
         unsigned lz_bits = 0;
         bool used_fallback = false;
+        bool carried_cut = false;            // S-1c: a v0x02 cut descriptor rode out
         CarrierRelay::Outcome relay;         // valid iff ADMITTED/REJECTED
     };
 
@@ -374,6 +386,13 @@ public:
         o.hash = ev->hash();
         Carrier c;
         c.carrier = std::move(*ev);
+        // ★ S-1c: a BLOCK win rides wire v0x02 with its cut descriptor, so a
+        // peer credits its OWN ledger with the SAME E_b at the SAME prefix P.
+        // A share never carries one (the trailer costs it a single zero byte).
+        if (req.won_block && req.cut) {
+            c.cut = req.cut;
+            o.carried_cut = true;
+        }
         // W3-G1: a block-winning carrier is appended UNCONDITIONALLY (no relay
         // dedup, no backpressure gate); an ordinary share takes the local path.
         {
@@ -385,11 +404,11 @@ public:
         if (o.relay.admitted) {
             o.status = EmitOutcome::Status::ADMITTED;
             m_chains.advance(o.identity, o.hash);     // chain forward only on a real append
-            const bool used_fb = o.used_fallback, won = req.won_block;
+            const bool used_fb = o.used_fallback, won = req.won_block, cut = o.carried_cut;
             const auto reached = o.relay.peers_reached;
             bump([&](CarrierSendStats& s) {
                 ++s.admitted;
-                if (won) ++s.block_winners;
+                if (won) { ++s.block_winners; if (cut) ++s.cut_carried; else ++s.cut_missing; }
                 if (used_fb) ++s.fallback_identity;
                 if (reached) { ++s.relayed; s.peers_reached_total += reached; }
                 else ++s.deferred_relay;
@@ -399,7 +418,17 @@ public:
                        " lz=" + std::to_string(o.lz_bits) +
                        " peers_reached=" + std::to_string(o.relay.peers_reached) +
                        (o.relay.peers_reached ? "" : " (relay DEFERRED: no peer)") +
-                       (o.used_fallback ? " [fallback identity]" : ""));
+                       (o.used_fallback ? " [fallback identity]" : "") +
+                       (req.won_block ? (o.carried_cut
+                            ? " [S-1c cut P=" + std::to_string(req.cut->cut_next_pos) +
+                              " H_b=" + std::to_string(req.cut->h_b) +
+                              " reward=" + std::to_string(req.cut->reward) + "]"
+                            : " [S-1c NO CUT DESCRIPTOR: peers credit nothing for this block]")
+                          : ""));
+            if (req.won_block && !o.carried_cut)
+                log(true, "[carrier-send] BLOCK WIN " + req.tag + " went out WITHOUT an S-1c cut "
+                          "descriptor: every peer will account the share and credit NO E_b for the "
+                          "block, so their owed_digest will NOT converge with ours");
         } else {
             o.status = EmitOutcome::Status::REJECTED;
             bump([](CarrierSendStats& s) { ++s.rejected; });

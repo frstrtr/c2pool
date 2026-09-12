@@ -115,21 +115,40 @@ static bool events_equal(const WorkEvent& a, const WorkEvent& b) {
 
 int main() {
     const Carrier c = frozen_carrier();
-    const std::vector<std::uint8_t> bytes = CarrierWire::encode(c);
+    // S-1c: this build EMITS v0x02, so the v0x01 golden is taken through the
+    // EXPLICIT version seam. That is the freeze WORKING, not the freeze broken:
+    // the v0x01 bytes below are byte-for-byte what they were on 2026-09-07.
+    const std::vector<std::uint8_t> bytes = CarrierWire::encode_version(c, 0x01);
     const std::string hex = to_hex(bytes);
 
     if (std::getenv("V37_W3_FREEZE_REGEN")) {
-        std::printf("REGEN golden (%zu bytes):\n%s\n", bytes.size(), hex.c_str());
+        std::printf("REGEN v0x01 golden (%zu bytes):\n%s\n", bytes.size(), hex.c_str());
+        // S-1c: the v0x02 fixture goldens (D = no descriptor, E = full cut,
+        // F = payout_emitted) so an INTENTIONAL, version-bumped wire change can
+        // re-pin all of them from one run.
+        for (const auto& f : wire_freeze::frozen_fixtures_v2()) {
+            const auto b = CarrierWire::encode_version(f.carrier, f.version);
+            std::printf("REGEN v0x02 golden %s (%zu bytes):\n%s\n", f.name, b.size(),
+                        to_hex(b).c_str());
+        }
         return 0;
     }
 
-    // (1) Byte freeze: the wire bytes are EXACTLY the pinned golden.
+    // (1) Byte freeze: the v0x01 wire bytes are EXACTLY the pinned golden.
     CHECK(hex == kGoldenHex);
     if (hex != kGoldenHex)
         std::printf("  got   : %s\n  golden: %s\n", hex.c_str(), kGoldenHex);
 
-    // (2) Version tag is the first byte and equals the frozen 0x01.
-    CHECK(!bytes.empty() && bytes[0] == W3_WIRE_VERSION && W3_WIRE_VERSION == 0x01);
+    // (2) Version tag is the first byte; the v0x01 frame carries 0x01, and this
+    //     build's DEFAULT encode() carries the current frozen version 0x02.
+    CHECK(!bytes.empty() && bytes[0] == 0x01);
+    CHECK(W3_WIRE_VERSION == 0x02 && W3_WIRE_VERSION_V1 == 0x01 && W3_WIRE_VERSION_V2 == 0x02);
+    {
+        const auto now = CarrierWire::encode(c);
+        CHECK(!now.empty() && now[0] == W3_WIRE_VERSION);
+        // v0x02 without a descriptor == the v0x01 frame + version bump + 1 byte.
+        CHECK(now.size() == bytes.size() + 1 && now.back() == 0x00);
+    }
 
     // (3) Round trip: decode(encode(c)) reconstructs the carrier + receipt and
     //     returns OK (identity binding holds), losing nothing.
@@ -142,7 +161,7 @@ int main() {
         CHECK(events_equal(dr.carrier.receipts[0], c.receipts[0]));
 
     // (4) Re-encoding the decoded carrier is byte-identical (no drift on relay).
-    CHECK(CarrierWire::encode(dr.carrier) == bytes);
+    CHECK(CarrierWire::encode_version(dr.carrier, 0x01) == bytes);
 
     // (5) Transport framing ceiling is frozen (carrier_net.hpp length prefix).
     CHECK(kMaxCarrierFrame == (1u << 20));
@@ -157,10 +176,16 @@ int main() {
         const wire_freeze::SelfCheck sc = wire_freeze::selfcheck();
         if (!sc.ok()) std::printf("%s", sc.log.c_str());
         CHECK(sc.ok());
-        std::printf("wire-freeze selfcheck [%s]: %u checks, %u failures\n",
-                    wire_freeze::layout_id(), sc.checks, sc.failures);
+        std::printf("wire-freeze selfcheck [%s | %s]: %u checks, %u failures\n",
+                    wire_freeze::layout_id(), wire_freeze::layout_id_v2(),
+                    sc.checks, sc.failures);
+        std::printf("wire-freeze flag day: %s\n", wire_freeze::flag_day_id());
         // The golden this file pins IS fixture A's golden — one source of truth.
         CHECK(std::string(kGoldenHex) == wire_freeze::kGoldenHexA);
+        // S-1c: the v0x02 goldens are non-empty (an unfilled golden would make
+        // the selfcheck's "encode == golden" check vacuously comparable to "").
+        for (const auto& f : wire_freeze::frozen_fixtures_v2())
+            CHECK(std::string(f.golden_hex).size() >= 2);
     }
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
