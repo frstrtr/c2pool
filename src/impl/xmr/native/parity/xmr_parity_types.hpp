@@ -61,7 +61,16 @@ namespace c2pool::xmr::native::parity {
 // over the one property the milestone exists to establish. Every streak earned
 // under version 2 was earned by a judge that could not see that, so it does not
 // carry.
-inline constexpr std::uint32_t COMPARATOR_VERSION = 3;
+//
+// Version 4 (M4 leg 1): the famine constraint is fed by ARM IDENTITY, not by
+// seat. Version 3 read its "native" count off whichever arm SERVED and its
+// "daemon" count off whichever arm was the SHADOW, which coincide only in the
+// serve-native posture. In the serve-monerod posture the daemon's empty
+// mempool was judged as a native famine (every P-TPL sample FAIL on a healthy
+// node) and a real native famine would have been judged as fed. The table is
+// unchanged; the RULE that evaluates its one Constraint row is, so a streak
+// earned under version 3 in either posture is not evidence about this judge.
+inline constexpr std::uint32_t COMPARATOR_VERSION = 4;
 
 // ---------------------------------------------------------------------------
 // Regimes -- how a field is judged. Named after the plan's determinism table.
@@ -306,13 +315,14 @@ inline constexpr FieldSpec TEMPLATE_FIELDS[] = {
     // transactions at any instant, and an equality gate here would fire on
     // ordinary propagation skew.
     {"tx_backlog_count",        Regime::Measurement,   false, false},
-    // ...but the FAMINE SHAPE is a Constraint. A native backlog of 0 sustained
-    // across K samples and S seconds while the shadow arm holds transactions is
+    // ...but the FAMINE SHAPE is a Constraint. A NATIVE backlog of 0 sustained
+    // across K samples and S seconds while the DAEMON arm holds transactions is
     // not skew and is not agreement: it is the native pool failing to ingest,
     // which is invisible to all six EQUALITY rows above because none of them
-    // has anything to do with the transaction set. Evaluated by
-    // BacklogFamineGuard (xmr_backlog_famine.hpp) and delivered through
-    // CompareOptions::constraints, so a violation FAILS the sample.
+    // has anything to do with the transaction set. The two counts are the
+    // arms' own, in whichever seat (served / shadow) the posture puts them.
+    // Evaluated by BacklogFamineGuard (xmr_backlog_famine.hpp) and delivered
+    // through CompareOptions::constraints, so a violation FAILS the sample.
     {"native_backlog_famine",   Regime::Constraint,    false, false},
     {"coinbase_bytes",          Regime::NotComparable, false, false},
 };
