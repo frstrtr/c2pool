@@ -263,4 +263,40 @@ inline P2PMessageStats& p2p_stats()
     return stats;
 }
 
+// ── #157 tx-inject status — read-only observability ──────────────────────────
+//
+// Process-global snapshot of the DASH miner/user tx-injection lane
+// (--embedded-tx-inject, default OFF), published by the ARMED
+// dash::coin::NodeCoinState (main_dash's standalone instance) and read by the
+// loopback-only /api/tx-inject-status endpoint. Same one-node-per-process
+// rationale as p2p_stats(): a process-global is exactly per-node scope, so no
+// node -> web-server plumbing is needed.
+//
+// REWARD-SAFE / read-only: every member is a plain flag/counter. Nothing here
+// changes what lands in a block, arms a flag, or writes config — it only
+// MIRRORS state the node already owns so a panel can DISPLAY it.
+// `updated_at == 0` means the lane has never published (flag-OFF build, or a
+// coin with no injection lane) — the endpoint reports "wired": false.
+//
+// The M3 (#1606, draft) rate-limiter / sandbox reject counters are NOT part of
+// this struct: they live on the rate-limiter's own named counters and slot into
+// the endpoint JSON when #1606 lands. Until then the endpoint renders them null.
+struct InjectStatus
+{
+    std::atomic<bool>          enabled{false};        // --embedded-tx-inject armed?
+    std::atomic<std::uint64_t> pool_entries{0};       // inflight tracked injects
+    std::atomic<std::uint64_t> pool_bytes{0};         // cumulative tracked bytes
+    std::atomic<std::uint64_t> max_entries{0};        // TxInjectPool entry cap (0 = unpublished)
+    std::atomic<std::uint64_t> max_total_bytes{0};    // TxInjectPool cumulative byte cap
+    std::atomic<std::uint64_t> max_tx_bytes{0};       // per-tx size cap
+    std::atomic<std::int64_t>  updated_at{0};         // unix seconds, 0 = never published
+};
+
+/// Process-wide instance. Same rationale as p2p_stats() above.
+inline InjectStatus& inject_status()
+{
+    static InjectStatus s;
+    return s;
+}
+
 } // namespace core::obs
