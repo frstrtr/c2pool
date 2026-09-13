@@ -92,6 +92,12 @@ jobs:
       # so concurrent jobs can never tear each other's ~/.conan2 (root cause of the
       # 1.90.0 torn-header flakes). RUNNER_TEMP is only valid at step scope, so
       # export it via $GITHUB_ENV -- a job-level `env: runner.temp` fails to parse.
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.
@@ -765,6 +771,12 @@ jobs:
       # self-hosted host never tear each other's cache (root of the boost
       # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
       # fails to parse.
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.
@@ -1121,6 +1133,12 @@ jobs:
       # For an observability defect the check IS the fix: fail closed if the
       # checked-out HEAD is ever not the head we asked for, and force the full
       # working tree back onto disk before any consumer reads it.
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Assert head + materialize tree + guard cache path (fail closed)
         working-directory: ${{ github.workspace }}
         run: |
@@ -1769,6 +1787,12 @@ jobs:
       # self-hosted host never tear each other's cache (root of the boost
       # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
       # fails to parse.
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Set per-job Conan home
         run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
 
@@ -1897,6 +1921,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           if [ "${{ runner.environment }}" = "github-hosted" ]; then
