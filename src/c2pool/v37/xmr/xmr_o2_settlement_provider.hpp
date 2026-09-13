@@ -173,7 +173,7 @@ public:
     // own it and does not choose it: an arm that stops being ready is the
     // resolver's problem, not the assembler's.
     XmrSettlementTemplateProvider(native::IMinerDataSource& source,
-                                  XmrOwedFixture& ledger_owner,
+                                  IXmrOwedSource& ledger_owner,
                                   XmrSettlementConfig scfg,
                                   std::uint64_t share_diff,
                                   RefreshPump pump = {})
@@ -190,7 +190,7 @@ public:
     // refresh: exactly the one get_miner_data per refresh this constructor
     // always did.
     XmrSettlementTemplateProvider(node::IMonerodTransport& transport,
-                                  XmrOwedFixture& ledger_owner,
+                                  IXmrOwedSource& ledger_owner,
                                   XmrSettlementConfig scfg,
                                   std::uint64_t share_diff)
         : m_owned_src(std::make_unique<ntmpl::MonerodMinerDataSource>(transport)),
@@ -342,6 +342,22 @@ public:
         out.prev_id         = snap.prev_id;
         out.expected_reward = snap.reward;
         out.major_version   = snap.major_version;
+        // ★ R-7 PAYOUT LEG. What THESE bytes actually pay the owed ledger, read
+        // off the same AssembledTemplate that produced them. Roles Fixed and
+        // Sink are excluded on purpose: a fixed output is a mandated dev/
+        // donation payment and the residual sink is the exact-sum absorber —
+        // neither is ever CREDITED to a ledger key, so deducting either from one
+        // would drive that key's EffectiveOwed down for money it never earned.
+        out.owed_payout.clear();
+        for (const auto& o : snap.tpl->outputs()) {
+            if (o.role != ::v37::xmr::settle::CoinbaseOutput::Role::Owed) continue;
+            out.owed_payout[o.identity] += static_cast<long long>(o.amount);
+        }
+        // KNOWN even when EMPTY: an option-B coinbase built on a settled-out
+        // ledger legitimately pays no owed output, and that is a different fact
+        // from "we could not find out", which is what an unresolved template_id
+        // means. The finalize connect refuses the latter and books the former.
+        out.owed_payout_known = true;
         return true;
     }
 
@@ -489,7 +505,7 @@ private:
     RefreshPump                               m_pump;
     ShapeGate                                 m_shape_gate;
 
-    XmrOwedFixture&          m_ledger;
+    IXmrOwedSource&          m_ledger;
     XmrSettlementConfig      m_scfg;
     std::uint64_t            m_share_diff;
 

@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -112,6 +113,31 @@ public:
     // without it rather than starting into a window where the answer is wrong.
     using ChainPresenceFn = std::function<bool(std::uint64_t height, const std::string& bid_hex)>;
     void set_native_chain_presence(ChainPresenceFn fn) { m_native_presence = std::move(fn); }
+
+    // ── X2: "at what height does this chain hold block X" ───────────────────
+    //
+    // The carrier layer needs the INVERSE of chain_carries(): a share is keyed
+    // to the mainchain block it was worked on, and that block's HEIGHT fixes the
+    // carrier's bin and its consensus leading-zero target. Same two-arm shape,
+    // and deliberately the same object, so the send side and the receive side
+    // resolve a parent against ONE chain rather than two that agree by habit.
+    //
+    // Daemon-first answers from the X2 adapter's MainchainIndex; p2p-first from
+    // the native levin index, installed here before bring_up() exactly as the
+    // presence test is. Unset in p2p-first means "no parent ever resolves",
+    // which stops carriers rather than inventing a height for them.
+    using ChainHeightFn =
+        std::function<std::optional<std::uint64_t>(const c2pool::xmr::node::Hash& id)>;
+    void set_native_chain_height(ChainHeightFn fn) { m_native_height = std::move(fn); }
+
+    std::optional<std::uint64_t> chain_height_of(const c2pool::xmr::node::Hash& id) const {
+        if (m_adapter) {
+            auto b = m_adapter->index().by_hash(id);
+            if (!b) return std::nullopt;
+            return b->height;
+        }
+        return m_native_height ? m_native_height(id) : std::nullopt;
+    }
 
     // Feed ONE mainchain event from the native index. Same body the adapter's
     // event sink runs, called from the consumer's main loop instead of from a
@@ -357,6 +383,7 @@ private:
     // M3: the p2p-first tip driver. Null adapter + this predicate is the
     // daemonless posture; an adapter and no predicate is the default one.
     ChainPresenceFn                        m_native_presence;
+    ChainHeightFn                          m_native_height;   // X2: parent resolve, p2p-first arm
     std::uint64_t                          m_tip_height = 0;
 
     // c2pool#1551: installed by the accounting layer (FinalizeConnect).

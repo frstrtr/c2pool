@@ -238,6 +238,35 @@ struct XmrNodeConfig {
     // Seconds between the main loop's one-line status reports (0 = never).
     std::uint32_t   status_every_s = 30;
 
+    // --- X2 / S-1c: the carrier-relay p2p layer -----------------------------
+    // The seam that turns accepted miner shares into LANE WEIGHT, and that
+    // carries a block winner's E_b fold to its peers. Both empty = single node:
+    // this node's own shares still reach its own lane (the send queue admits
+    // locally before it floods), but no peer's shares arrive and no peer's
+    // owed_digest can converge with ours.
+    std::string              carrier_p2p_bind;   // "HOST:PORT"; empty = no inbound bind
+    std::vector<std::string> carrier_peers;      // "HOST:PORT", repeatable
+    // Context horizon below the chain tip for a carrier's parent block. An
+    // ancient parent means a small consensus_lz — a carrier that is cheap to
+    // grind and would still be admitted with real weight — so this is a safety
+    // bound, not a cache policy. 0 disables it (for a regtest chain shorter
+    // than the window; never in production).
+    std::uint64_t            carrier_index_horizon = 64;
+    // ★ R-A (c2pool#1625) — the S-1c cut projector's retained record window.
+    // The engine publishes ONE settlement view per COALESCED executor burst, so
+    // a block winner routinely names a lane prefix this node never published;
+    // the projector replays the retained record log to that exact prefix and the
+    // fold is accepted only at a MATCHING lane digest. This is how many push
+    // records it keeps (0 = the module default, 131072 ~ 13 MiB). Past the
+    // window it saturates and the node falls back to refusing, loudly.
+    std::size_t              cut_projector_log = 0;
+    // ★ R-B (c2pool#1625) — EXTRA floods of each OWN block-winner frame. A
+    // winner descriptor lost on the wire is a permanent settlement hole on the
+    // peer (it never learns the block exists) and the frozen W3-B5 wire has no
+    // request opcode to ask with, so the winner repeats itself a small bounded
+    // number of times. A peer that already took it answers DEDUP. 0 disables.
+    unsigned                 winner_reflood = 2;
+
     // --- O-2 OPTION B: the v37 K_fair settlement coinbase -------------------
     // --coinbase monerod (option A, default) | v37 (option B). In v37 mode the
     // block the pool assembles + submits is the settlement coinbase, not
@@ -255,6 +284,13 @@ struct XmrNodeConfig {
     // The v37 lane parameters (consensus once multi-node; explicit here).
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
+    // ★ Piconero withheld from the K_fair owed selection so the MANDATED
+    // residual sink is always a real output. Without it, the moment owed >=
+    // budget — which is the (D_conf + 2)nd block of any pool that is actually
+    // settling — K_fair takes the whole reward, the sink vanishes, the §13
+    // shape gate refuses EVERY template, and the miners are parked on a stale
+    // height while the chain moves on. 0 restores exactly that behaviour.
+    std::uint64_t   settle_sink_min   = 1;
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
     // the assembled coinbase carries a real K_fair OWED payee alongside the sink
     // (a multi-output settlement coinbase). 0 => empty ledger (sink-only).

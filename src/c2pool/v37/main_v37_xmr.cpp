@@ -82,6 +82,8 @@
 #include "xmr/xmr_live_submit.hpp"           // O-2 wire 3: block-blob assembly + submit_block
 #include "xmr/xmr_stratum_listener.hpp"      // O-2 wire 1: POSIX stratum listener (ITransport)
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
+#include "xmr/xmr_carrier_share_sink.hpp"    // X2: accepted share -> carrier -> LANE WEIGHT
+#include "xmr/xmr_carrier_stack.hpp"         // X2/S-1c: relay + ingest + send + peers
 #include "xmr/xmr_o2_settlement_fixture.hpp"  // O-2 option B: XmrSettlementConfig + XmrOwedFixture (proof ledger)
 #include "xmr/xmr_o2_settlement_provider.hpp" // O-2 option B: v37 K_fair settlement template provider + source
 #include "xmr/xmr_settlement_coinbase_shape.hpp"  // M2: the K_fair shape gate, read off the assembled block bytes
@@ -284,6 +286,17 @@ struct ServeHooks {
     // taking a built one, because the FOUND queue the sink pushes into is
     // loop-local -- one queue, one drain, whichever arm filled it.
     ::c2pool::xmr::native::relay::LevinBlockRelay* p2p_relay = nullptr;
+
+    // ★ X2 / S-1c: the carrier layer. Non-null puts every accepted share into
+    // the LANE (XmrLaneShareSink, wrapped around the exact network gate) and
+    // mints the block-winning carrier that NAMES this node's fold to its peers.
+    // Null leaves the serve path byte-identical to the pre-X2 daemon: a lane
+    // that accrues nothing and an E_b that folds to {} forever.
+    o2::XmrCarrierStack* carrier = nullptr;
+    // The ONE pool-level payout identity every own share is minted under (V1 —
+    // there is no base58 address decoder in this tree, so per-miner identity is
+    // a follow-on). Unset => the lane share-push declines and says so.
+    std::optional<::v37::PayoutDescriptor> carrier_desc;
 };
 
 // ---------------------------------------------------------------------------
@@ -329,10 +342,36 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     : static_cast<strat::IShareSink&>(live_sink);
     GatedShareSinkT<Provider, Snapshot> sink(rx, provider, template_source, publish_sink);
 
+    // ── ★ X2: the LANE SHARE-PUSH, wrapped AROUND the exact network gate ─────
+    // Order is listener -> lane sink -> gate -> publisher. Putting the push
+    // outside the gate keeps the 128-bit network-block decision byte-identical
+    // to the pre-X2 daemon while making every ACCEPTED share (already PoW- and
+    // target-checked by the X5 server) real lane weight. Inside the gate it
+    // would have coupled two decisions that have nothing to do with each other:
+    // a share the exact rule would refuse to SUBMIT is still real WORK.
+    std::unique_ptr<o2::XmrLaneShareSink> lane_sink;
+    if (hooks.carrier && hooks.carrier->send()) {
+        lane_sink = std::make_unique<o2::XmrLaneShareSink>(
+            sink, *hooks.carrier->send(),
+            [&provider](std::uint32_t tid, node::Hash& prev) {
+                Snapshot t;
+                if (!provider.by_id(tid, t)) return false;
+                prev = t.prev_id;
+                return true;
+            },
+            hooks.carrier_desc);
+        lane_sink->set_log([](bool warn, const std::string& l) {
+            std::printf("  %s%s\n", warn ? "WARN " : "", l.c_str());
+        });
+    }
+    strat::IShareSink& listener_sink =
+        lane_sink ? static_cast<strat::IShareSink&>(*lane_sink)
+                  : static_cast<strat::IShareSink&>(sink);
+
     o2::StratumListenerOptions lo;
     lo.bind_host = cfg.stratum_bind_host;
     lo.bind_port = cfg.stratum_bind_port;
-    o2::StratumListener listener(template_source, rx, sink, lo);
+    o2::StratumListener listener(template_source, rx, listener_sink, lo);
     // Seed prefetch on the LISTENER thread, before jobs are pushed (Argon2d
     // cache init never lands inside a miner's submit).
     listener.set_template_hook([&](const strat::TemplateJob& peek) { rx.on_template(peek); });
@@ -378,6 +417,37 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         std::printf("stratum: NOT served (%s) — observe-side only\n", not_served_reason);
     }
 
+    // ── ★ S-1c SEND SIDE: mint the BLOCK-WINNING carrier once the fold exists ─
+    // On the DASH side this rides the stratum thread, because submit_fn folds
+    // and mint_solved_share fires microseconds later on that same thread. Here
+    // the block is published from the LISTENER thread and the fold happens on
+    // the MAIN thread in fc.tick(), so the carrier is minted from this hook —
+    // after the fold, never before. That ordering is the whole point: a
+    // descriptor minted before the fold would name a cut that does not exist.
+    if (hooks.carrier) {
+        o2::XmrCarrierStack* stack = hooks.carrier;
+        fc.set_on_registered_found(
+            [stack, &node](const std::string& bid, const o2::FinalizeConnect::PendingRec& rec,
+                           const o2::XmrEbCut& cut) {
+                // ★ R-7: tell peers whether this block's coinbase actually paid
+                // owed balances. Under option B it does as soon as the ledger has
+                // something to settle, and a peer that is told otherwise credits
+                // E_b while deducting nothing — a silent divergence. See
+                // XmrCarrierStack::mint_block_winner.
+                // ★★ WIRE-CARRY: `rec.payout` IS the K_fair owed-deduction map
+                // this block's coinbase paid — the Owed-role outputs carried all
+                // the way from the template snapshot its bytes were built from,
+                // and the very map this node's own ledger just booked. Sending
+                // that same object is what makes "received map == the winner's
+                // actual coinbase owed-set" true by construction rather than by
+                // a comparison that could drift.
+                (void)stack->mint_block_winner(bid, rec.height, rec.prev_id_hex, cut,
+                                               node.ledger().owed_digest(),
+                                               /*payout_emitted=*/!rec.payout.empty(),
+                                               rec.payout);
+            });
+    }
+
     std::signal(SIGINT, on_sigint);
     std::signal(SIGTERM, on_sigint);
     const std::uint32_t poll_ms = cfg.poll_ms ? cfg.poll_ms : 5000;
@@ -405,6 +475,12 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             e.extra_nonce     = s.extra_nonce;
             e.worker          = s.worker;
             e.address         = s.address;
+            // ★ R-7 payout leg: the owed-role coinbase outputs THIS block paid,
+            // carried all the way from the template snapshot its bytes were
+            // built from. Option A leaves it unknown-and-empty, which is the
+            // truth there: monerod's coinbase pays no v37 ledger key.
+            e.payout.insert(s.owed_payout.begin(), s.owed_payout.end());
+            e.payout_known = s.owed_payout_known;
             found_q.push(std::move(e));
         }
     };
@@ -485,6 +561,185 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(h), line.c_str());
             }
         }
+        // ── ★ X2 / S-1b / S-1c: the settlement headline ─────────────────────
+        // owed_digest is the claim. If it still reads the empty sha256d("V37O")
+        // anchor after a FOUND has matured, the fold credited nobody — and the
+        // three counters beside it say which link is broken: no lane weight (X2
+        // is not pushing), a refused fold (S-1b), or no peer cut (S-1c).
+        {
+            const auto s1 = fc.s1_stats();
+            const auto s1p = fc.s1c_stats();
+            std::printf("  settlement: owed_digest=%s | S-1b folds=%llu valueless=%llu "
+                        "refused=%llu no_view=%llu unresolved=%llu | last cut{P=%llu "
+                        "raw_total=%llu E_b=%zu keys src=%s}\n",
+                        o2::s1_hex32(fc.owed_digest()).c_str(),
+                        static_cast<unsigned long long>(s1.folds),
+                        static_cast<unsigned long long>(s1.valueless),
+                        static_cast<unsigned long long>(s1.refused),
+                        static_cast<unsigned long long>(s1.no_view),
+                        static_cast<unsigned long long>(s1.unresolved),
+                        static_cast<unsigned long long>(fc.last_cut().next_pos),
+                        static_cast<unsigned long long>(fc.last_cut().raw_total),
+                        fc.last_cut().credit.size(), fc.last_cut().source);
+            // ★ R-7. `payout booked` is the one number that says whether this
+            // pool is SETTLING or merely accruing: an option-B node that keeps
+            // finding blocks with booked=0 while min_eff_owed climbs is paying
+            // its payees in the coinbase and forgetting to deduct it. min
+            // effective-owed is printed beside it because the two are the same
+            // claim from opposite ends — it must never go negative.
+            {
+                const auto fs2 = fc.stats();
+                long long min_eo = 0;
+                bool have = false;
+                for (const auto& [k, v] : node.ledger().effective_owed_all()) {
+                    (void)k;
+                    if (!have || v < min_eo) { min_eo = v; have = true; }
+                }
+                std::printf("  R-7 payout leg: booked=%llu unknown-refused=%llu | owed keys=%zu "
+                            "now=%lld | floors: SOLVENCY(finalW) min=%lld%s  reservation"
+                            "(EffectiveOwed) min=%lld%s\n",
+                            static_cast<unsigned long long>(fs2.payout_booked),
+                            static_cast<unsigned long long>(fs2.payout_unknown),
+                            node.ledger().effective_owed_all().size(),
+                            have ? min_eo : 0LL,
+                            fs2.min_final_owed,
+                            (fs2.min_final_owed < 0)
+                                ? "  <-- NEGATIVE: the pool FINALIZED more payout than "
+                                  "entitlement (a real over-payment)" : " (must be >= 0)",
+                            fs2.min_effective_owed,
+                            (fs2.min_effective_owed < 0)
+                                ? "  (dipped: rival blocks at one height each reserve the same "
+                                  "coinbase proposal; released when the losers are orphaned)"
+                                : "");
+            }
+            if (hooks.carrier) {
+                const auto cs = hooks.carrier->send()
+                                    ? hooks.carrier->send()->stats()
+                                    : ::c2pool::v37n::CarrierSendStats{};
+                const auto& ib = hooks.carrier->inbound();
+                const auto ls = lane_sink ? lane_sink->stats() : o2::XmrLaneShareStats{};
+                auto snap = node.engine().snapshot(cfg.lane_chain);
+                std::printf("  lane: raw_total=%llu identities=%zu version=%llu | X2 shares=%llu "
+                            "pushed=%llu no_template=%llu no_identity=%llu shed=%llu | send "
+                            "admitted=%llu rejected=%llu unresolved_parent=%llu block_winners=%llu "
+                            "cut_carried=%llu relayed=%llu deferred=%llu\n",
+                            snap ? static_cast<unsigned long long>(snap->raw_total) : 0ull,
+                            snap && snap->identities ? snap->identities->size() : 0u,
+                            snap ? static_cast<unsigned long long>(snap->version) : 0ull,
+                            static_cast<unsigned long long>(ls.shares),
+                            static_cast<unsigned long long>(ls.pushed),
+                            static_cast<unsigned long long>(ls.no_template),
+                            static_cast<unsigned long long>(ls.no_identity),
+                            static_cast<unsigned long long>(ls.shed),
+                            static_cast<unsigned long long>(cs.admitted),
+                            static_cast<unsigned long long>(cs.rejected),
+                            static_cast<unsigned long long>(cs.unresolved_parent),
+                            static_cast<unsigned long long>(cs.block_winners),
+                            static_cast<unsigned long long>(cs.cut_carried),
+                            static_cast<unsigned long long>(cs.relayed),
+                            static_cast<unsigned long long>(cs.deferred_relay));
+                std::printf("  carrier send (v0x03 section 2): K_fair maps carried=%llu "
+                            "settling-wins-without-one=%llu\n",
+                            static_cast<unsigned long long>(cs.payout_carried),
+                            static_cast<unsigned long long>(cs.payout_missing));
+                std::printf("  carrier inbound: frames=%llu admitted=%llu echo=%llu "
+                            "wire_rejected=%llu policy_rejected=%llu admit_rejected=%llu | "
+                            "S-1c cut_frames=%llu offered=%llu credited=%llu valueless=%llu "
+                            "wire-carried=%llu "
+                            "cut_miss=%llu cut_mismatch=%llu refused[fold=%llu payout=%llu "
+                            "late=%llu] known=%llu owed_skew=%llu\n",
+                            static_cast<unsigned long long>(ib.frames.load()),
+                            static_cast<unsigned long long>(ib.admitted.load()),
+                            static_cast<unsigned long long>(ib.echo.load()),
+                            static_cast<unsigned long long>(ib.wire_rejected.load()),
+                            static_cast<unsigned long long>(ib.policy_rejected.load()),
+                            static_cast<unsigned long long>(ib.admit_rejected.load()),
+                            static_cast<unsigned long long>(ib.cut_frames.load()),
+                            static_cast<unsigned long long>(ib.cut_offered.load()),
+                            static_cast<unsigned long long>(s1p.credited),
+                            static_cast<unsigned long long>(s1p.valueless),
+                            static_cast<unsigned long long>(s1p.payout_carried),
+                            static_cast<unsigned long long>(s1p.cut_miss),
+                            static_cast<unsigned long long>(s1p.cut_mismatch),
+                            static_cast<unsigned long long>(s1p.refused_fold),
+                            static_cast<unsigned long long>(s1p.refused_payout),
+                            static_cast<unsigned long long>(s1p.refused_late),
+                            static_cast<unsigned long long>(s1p.already_known),
+                            static_cast<unsigned long long>(s1p.owed_skew));
+                // ★★ THE WIRE-CARRY ACCOUNT. `carried` is the claim — a settling
+                // peer block whose K_fair deduction map arrived on the wire and
+                // was folded verbatim. `absent`/`shape` are the two fail-closed
+                // refusals that remain; NEITHER of them is a timing skew, which
+                // is the property that separates this from the recompute path.
+                // xcheck is diagnostics only: `differ` says the two template
+                // clocks were apart at that height and the fold went ahead
+                // anyway, which is exactly what the recompute could not do.
+                std::printf("  WIRE-CARRY (v0x03 K_fair): carried=%llu refused[absent=%llu "
+                            "shape=%llu] | local xcheck agree=%llu differ=%llu no-map=%llu\n",
+                            static_cast<unsigned long long>(s1p.payout_carried),
+                            static_cast<unsigned long long>(s1p.payout_absent),
+                            static_cast<unsigned long long>(s1p.payout_shape),
+                            static_cast<unsigned long long>(s1p.xcheck_agree),
+                            static_cast<unsigned long long>(s1p.xcheck_differ),
+                            static_cast<unsigned long long>(s1p.xcheck_absent));
+                // ── ★ R-A / R-B: the two carrier-path races, accounted ───────
+                // R-A `projected` is the headline: every one of these is a block
+                // that WOULD have been refused (the executor coalesced through
+                // the winner's prefix) and was instead folded at the winner's
+                // exact cut with a MATCHING lane digest. `miss` falls through to
+                // the ordinary cut_miss retry; `mismatch` is a real divergence.
+                // R-B `deferred`/`recovered` is a block-winner descriptor that
+                // arrived too early for this node's index and was re-offered
+                // rather than dropped; `lost` is the only remaining silent-ish
+                // hole and it is now counted.
+                {
+                    const auto cp = hooks.carrier->projector()
+                                        ? hooks.carrier->projector()->stats()
+                                        : o2::XmrCutProjectorStats{};
+                    const auto df = hooks.carrier->deferred();
+                    const auto rf = hooks.carrier->reflood();
+                    std::printf("  R-A cut projector: projected=%llu miss=%llu mismatch=%llu | "
+                                "shadow{log=%llu cursor=%llu replayed=%llu rebuilds=%llu "
+                                "cache=%llu}%s%s\n",
+                                static_cast<unsigned long long>(s1p.cut_projected),
+                                static_cast<unsigned long long>(s1p.cut_project_miss),
+                                static_cast<unsigned long long>(s1p.cut_project_mismatch),
+                                static_cast<unsigned long long>(cp.log_size),
+                                static_cast<unsigned long long>(cp.cursor),
+                                static_cast<unsigned long long>(cp.replayed),
+                                static_cast<unsigned long long>(cp.rebuilds),
+                                static_cast<unsigned long long>(cp.cache_hits),
+                                cp.saturated ? "  <-- SATURATED (widen --cut-projector-log)" : "",
+                                cp.disabled ? "  <-- DISABLED (a Rewind/RemoveLane reached the lane)"
+                                            : "");
+                    std::printf("  R-B deferred carriers: parked=%llu re-offered=%llu "
+                                "RECOVERED=%llu waiting=%llu dropped[spent=%llu full=%llu] | "
+                                "inbound cut_deferred=%llu cut_lost=%llu | re-announce "
+                                "held=%llu sent=%llu%s\n",
+                                static_cast<unsigned long long>(df.parked),
+                                static_cast<unsigned long long>(df.re_offered),
+                                static_cast<unsigned long long>(df.readmitted),
+                                static_cast<unsigned long long>(df.waiting),
+                                static_cast<unsigned long long>(df.dropped_spent),
+                                static_cast<unsigned long long>(df.dropped_full),
+                                static_cast<unsigned long long>(ib.cut_deferred.load()),
+                                static_cast<unsigned long long>(ib.cut_lost.load()),
+                                static_cast<unsigned long long>(rf.held),
+                                static_cast<unsigned long long>(rf.sent),
+                                (ib.cut_lost.load() || df.dropped_spent || df.dropped_full)
+                                    ? "  <-- a block-winner descriptor was LOST here: this "
+                                      "node cannot credit that block" : "");
+                    if (hooks.carrier->projector()) {
+                        const std::string n = hooks.carrier->projector()->take_note();
+                        if (!n.empty()) std::printf("  R-A %s\n", n.c_str());
+                    }
+                }
+            } else {
+                std::printf("  lane: NO CARRIER LAYER (--p2p-bind/--peer unset and no pool "
+                            "identity): shares do not reach the lane, so E_b folds to {} and "
+                            "owed_digest can never leave the empty anchor\n");
+            }
+        }
         std::printf("  %s\n", rx.describe().c_str());
         const std::string g = sink.last();
         if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
@@ -508,9 +763,23 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
 
     auto last_status = std::chrono::steady_clock::now();
     std::string last_template_err;
+    // ★ (a): the bound on the descriptor-gap hold above. Four poll intervals is
+    // orders of magnitude more than a loopback relay hop and still ends.
+    unsigned rebuild_holds = 0;
+    constexpr unsigned kMaxRebuildHolds = 2;
     while (!g_stop.load()) {
         bridge_found();
         fc.tick();
+        // ── ★ R-B: re-offer parked block-winner carriers, re-announce our own ──
+        // Driven here, on the main thread, right beside the settlement tick: a
+        // descriptor whose parent has just become resolvable is re-admitted and
+        // offered to fc BEFORE the reconcile below, so it settles on the very
+        // tick it becomes admissible instead of a whole poll later. Costs
+        // nothing when both registers are empty, which is the healthy state.
+        if (hooks.carrier) {
+            const auto pr = hooks.carrier->pump();
+            if (pr.recovered) fc.tick();     // drain what the recovery just offered
+        }
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
         // p2p-first replaces both with the native chain's own event drain, and
         // this is the only place either of them is driven -- so "no daemon call
@@ -520,7 +789,50 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             transport.pump_poll();
             node.adapter().ensure_seed_reach();
         }
-        if (serving) {
+        // ── ★ R-7: NEVER BUILD A TEMPLATE OVER UN-BOOKED FOUNDS ──────────────
+        // The K_fair owed set is drawn from EffectiveOwed, which already nets
+        // the payouts of blocks the ledger holds PENDING. That is what stops
+        // two consecutive templates proposing the same balances — but only if
+        // the previous block's payout has actually been BOOKED by the time the
+        // next template is assembled. A win is submitted on the LISTENER thread
+        // and booked on THIS one, so a block accepted by the daemon while the
+        // loop was past its drain would move the tip, trigger a rebuild, and the
+        // rebuild would propose the balances that block had just paid: a coinbase
+        // paying the same owed twice, which shows up afterwards as EffectiveOwed
+        // going NEGATIVE (observed on regtest before this guard).
+        //
+        // So: drain again HERE, immediately before the rebuild, and if anything
+        // is still in flight hold the rebuild for one iteration. Holding costs a
+        // poll interval of template staleness, which the miners absorb; not
+        // holding costs real money.
+        //
+        // ★ (a) EXTENDS THIS TO PEER WINS. The same argument covers a block a
+        // PEER mined that we have been told about but have not booked: its
+        // payout is not yet reserved here, so a template built now proposes a
+        // LARGER K_fair set than the winner's did — and since owed_digest
+        // commits only to the finalized half, that difference is invisible to
+        // the receive-side guard and would be booked silently. Draining the
+        // peer queue first is what keeps the two reservation sets equal.
+        bridge_found();
+        if (fc.unbooked_found() || submit_q.size() || fc.unbooked_peer_wins()) fc.tick();
+        // ★ (a): a height the CHAIN has but whose block-winner descriptor has
+        // not reached us yet. Holding for it is what keeps this node's K_fair
+        // reservation set equal to the winner's; it is BOUNDED so a descriptor
+        // that never comes parks nobody -- after the bound the template is built
+        // and the recompute's reservation witness refuses that height loudly.
+        const std::size_t chain_gap = fc.unbooked_chain_heights();
+        const bool hold_for_gap = (chain_gap != 0) && (rebuild_holds < kMaxRebuildHolds);
+        rebuild_holds = hold_for_gap ? rebuild_holds + 1 : 0;
+        const bool found_in_flight = (submit_q.size() != 0) || (fc.unbooked_found() != 0) ||
+                                     (fc.unbooked_peer_wins() != 0) || hold_for_gap;
+        if (found_in_flight)
+            std::printf("  template: rebuild HELD one tick — %zu found block(s)/peer win(s) in "
+                        "flight, %zu chain height(s) with no descriptor yet (a template built now "
+                        "could re-propose what they just paid, or propose over a smaller "
+                        "reservation than the winner's)\n",
+                        submit_q.size() + fc.unbooked_found() + fc.unbooked_peer_wins(),
+                        hold_for_gap ? chain_gap : std::size_t{0});
+        if (serving && !found_in_flight) {
             const bool refreshed = provider.refresh();
             bool new_template = false;
             if (refreshed) {
@@ -562,6 +874,10 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     drain_stratum_log();
     bridge_found();
     fc.drain_before_stop();
+    // The carrier layer comes down BEFORE the engine: its send worker and its
+    // per-peer reader threads both submit into V37Engine, and V37Engine::stop()
+    // drains-and-joins on the promise that nothing can still be producing.
+    if (hooks.carrier) hooks.carrier->stop();
     node.stop();
     status();
     if (hooks.status_extra) hooks.status_extra();
@@ -689,6 +1005,11 @@ static int run_live(const XmrNodeConfig& cfg) {
             return 2;
         }
         node.set_native_chain_presence(chain_src.is_canonical);
+        // X2: the same native index answers "at what height is block X", which
+        // is what places a carrier's parent. Installed here, beside the presence
+        // test, so the share path and the settlement path cannot end up on two
+        // different chains.
+        node.set_native_chain_height(chain_src.height_of);
     }
     try {
         node.bring_up();
@@ -725,6 +1046,16 @@ static int run_live(const XmrNodeConfig& cfg) {
             return relay->renotify(id, &peers);
         };
     }
+    // ── ★ R-7: does the coinbase this node serves PAY the ledger it settles? ─
+    // Option B bound to the node's own OwedLedger: yes — every found block's
+    // K_fair coinbase settles owed balances, so its payout leg is mandatory and
+    // an unresolvable one is refused rather than booked as "paid nobody".
+    // Option A: no (monerod's template pays --payout-address, not a ledger key).
+    // Option B on the --owed-demo-amount PROOF FIXTURE: also no, and for the
+    // sharper reason that the coinbase's owed outputs belong to a DIFFERENT
+    // ledger than the one FOUND/FINALIZE move, so booking them here would settle
+    // balances this ledger never credited.
+    fo.require_payout = (cfg.coinbase == CoinbaseMode::V37Settlement) && !cfg.owed_demo_amount;
     o2::FinalizeConnect fc(node, cfg, found_q, fo);
     std::printf("same-height policy: tiebreak=%s D_conf=%llu renotify<=%u journal=%s "
                 "| credit requires burial: YES  orphan-credit: NEVER  double-credit: BLOCKED\n",
@@ -742,7 +1073,12 @@ static int run_live(const XmrNodeConfig& cfg) {
     }
 
     // ── payee identity key (the address boundary's OUTPUT) ───────────────────
+    // ★ X2: the SAME keys are also the pool's carrier payout DESCRIPTOR. They
+    // have to be the same object: the lane credits E_b to identity_key(desc),
+    // and the FOUND/FINALIZE record is keyed by identity_key of these keys, so
+    // deriving them twice from two places is how those two keys would drift.
     std::optional<::v37::bytes32> payee_key;
+    std::optional<::v37::PayoutDescriptor> pool_desc;
     if (!cfg.payee_spend_key_hex.empty() || !cfg.payee_view_key_hex.empty()) {
         o2::PayeeKeys pk;
         if (!o2::hash_from_hex(cfg.payee_spend_key_hex, pk.spend) ||
@@ -759,11 +1095,52 @@ static int run_live(const XmrNodeConfig& cfg) {
             node.stop();
             return 2;
         }
-        std::printf("payee: identity_key=%s… (amount-honest FOUND/FINALIZE records)\n",
+        ::v37::PayoutDescriptor d;
+        d.pay = pk.subaddress ? ::v37::xmr::make_xmr_sub(pk.spend, pk.view)
+                              : ::v37::xmr::make_xmr_std(pk.spend, pk.view);
+        if (!d.valid()) {
+            std::printf("REFUSED: the payee descriptor does not validate under the installed "
+                        "XMR canon validator — it could never be a lane identity, so the lane "
+                        "would accrue nothing\n");
+            node.stop();
+            return 2;
+        }
+        pool_desc = d;
+        std::printf("payee: identity_key=%s… (FOUND/FINALIZE records AND the X2 carrier "
+                    "identity — one key, not two)\n",
                     hex_of(*payee_key).substr(0, 16).c_str());
     } else {
-        std::printf("payee: no --payee-spend-hex/--payee-view-hex -> FOUND records are valueless "
-                    "{}/{} (the ledger still registers the block)\n");
+        std::printf("payee: no --payee-spend-hex/--payee-view-hex -> no lane payout identity: "
+                    "shares cannot be pushed, E_b folds to {} and owed_digest can never leave "
+                    "the empty anchor\n");
+    }
+
+    // ── ★ X2 / S-1c: stand the carrier layer up ─────────────────────────────
+    // AFTER bring_up (the engine runs and the lane is seeded, so the AddLane
+    // incarnation is readable) and BEFORE the listener starts. It is built
+    // whenever there is an identity to mint under: a single node still needs it
+    // for its OWN shares to reach its OWN lane (the send queue admits locally
+    // before it floods), and --p2p-bind/--peer are what add a second node.
+    std::unique_ptr<o2::XmrCarrierStack> carrier;
+    if (pool_desc) {
+        o2::XmrCarrierStack::Options co;
+        co.p2p_bind      = cfg.carrier_p2p_bind;
+        co.peers         = cfg.carrier_peers;
+        co.index_horizon = cfg.carrier_index_horizon;
+        co.pool_desc     = pool_desc;
+        co.cut_projector_log = cfg.cut_projector_log;   // ★ R-A
+        co.winner_reflood    = cfg.winner_reflood;      // ★ R-B
+        carrier = std::make_unique<o2::XmrCarrierStack>(
+            node, cfg.lane_chain, co, [](bool warn, const std::string& l) {
+                std::printf("  %s%s\n", warn ? "WARN " : "", l.c_str());
+            });
+        if (const std::string why = carrier->start(fc); !why.empty()) {
+            std::printf("REFUSED: %s\n", why.c_str());
+            node.stop();
+            return 11;
+        }
+    } else {
+        std::printf("carrier: NOT built (no payout identity) — the lane will accrue no work\n");
     }
 
     // ── wire 2: RandomX runtime verify (init on main, BEFORE the listener) ───
@@ -795,6 +1172,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         scfg.chain_id   = cfg.lane_chain;
         scfg.h_min      = cfg.settle_h_min;
         scfg.output_cap = cfg.settle_output_cap;
+        scfg.sink_min   = cfg.settle_sink_min;   // ★ keep the mandated sink real
         std::array<std::uint8_t, 32> sink_B{}, sink_A{};
         if (serving) {
             if (!o2::hex32(cfg.residual_sink_spend_hex, sink_B) ||
@@ -813,13 +1191,39 @@ static int run_live(const XmrNodeConfig& cfg) {
         // distinct K_fair OWED payee (the sink material with spend/view swapped —
         // still two valid ed25519 points, a different identity) so the assembled
         // coinbase carries an OWED output alongside the sink (multi-output proof).
-        o2::XmrOwedFixture ledger(cfg.lane_chain);
+        o2::XmrOwedFixture fixture(cfg.lane_chain);
         if (serving && cfg.owed_demo_amount) {
-            ledger.seed_owed_std(sink_A, sink_B, cfg.owed_demo_amount);
+            fixture.seed_owed_std(sink_A, sink_B, cfg.owed_demo_amount);
             std::printf("owed-demo: seeded %llu piconero owed to a distinct K_fair payee "
                         "(coinbase will carry OWED + residual sink)\n",
                         static_cast<unsigned long long>(cfg.owed_demo_amount));
+            // ★ R-7: say the split-brain out loud. The coinbase settles the
+            // FIXTURE's owed set, while FOUND/FINALIZE move the NODE's ledger.
+            // The payout leg is therefore NOT booked in this mode (booking it
+            // would deduct, from the node's ledger, balances only the fixture
+            // ever credited), so the demo cannot settle and its owed only grows.
+            std::printf("  WARN owed-demo is a DEMO: the coinbase commits to the FIXTURE ledger, "
+                        "not the one FOUND/FINALIZE move — the R-7 payout leg is NOT booked, so "
+                        "this mode never settles and must not be used to serve real work\n");
         }
+
+        // ── ★ S-1b: WHICH OWED LEDGER THE COINBASE COMMITS TO ────────────────
+        // The option-B coinbase proposes K_fair over an OwedLedger and writes
+        // that ledger's owed_digest into tx_extra 0x03 as the merge-mining leaf.
+        // Before S-1b the only honest choice was the PROOF FIXTURE, because the
+        // node's real ledger netted every block to zero and its digest was the
+        // constant empty anchor — committing to it would have been committing to
+        // nothing. Now that the fold is live the coinbase commits to the REAL
+        // ledger, and the one case that still wants the fixture is the one that
+        // asks for it by name: --owed-demo-amount.
+        o2::XmrLiveOwedSource live(node.ledger());
+        if (pool_desc) live.learn(*pool_desc);
+        o2::IXmrOwedSource& ledger =
+            cfg.owed_demo_amount ? static_cast<o2::IXmrOwedSource&>(fixture)
+                                 : static_cast<o2::IXmrOwedSource&>(live);
+        std::printf("owed source: %s (tx_extra 0x03 MM leaf commits ITS owed_digest; known "
+                    "payout identities=%zu)\n",
+                    ledger.owed_source_name(), live.known_identities());
 
         // ── M2: WHICH miner-data source the assembler is fed from ───────────
         // Nothing below this block knows the difference. The assembler, the X6
@@ -870,6 +1274,52 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return true;
             });
 
+        // ── ★★ the K_fair recompute, DEMOTED TO A LOCAL CROSS-CHECK ──────────
+        // A settling peer block is now credited with the map the WINNER CARRIED
+        // on the v0x03 trailer (w3_relay.hpp KfairPayout), folded verbatim. This
+        // recompute — the node's own K_fair run for the same height — is kept
+        // only to answer, as diagnostics, whether the two template clocks
+        // happened to agree at that height. Nothing refuses on its verdict: it
+        // could not reproduce the winner's state reliably, which is precisely
+        // why the map is carried instead. Leaving it armed costs one pure lookup
+        // per settling peer block and turns the old failure mode into a number
+        // an auditor can watch (WIRE-CARRY xcheck differ).
+        //
+        // WHY THE RECORD IS TAKEN HERE AND NOWHERE ELSE. K_fair is a pure
+        // function of the ledger STATE, and the two nodes share that state at
+        // exactly one instant per height: both build h when their tip is h-1,
+        // after the finalize of bin h-1 and before the finalize of bin h. This
+        // hook runs immediately after the refresh that produced the template,
+        // with nothing between it and the build that can move finalW, so the
+        // digest stamped beside the map is the one the winner's descriptor will
+        // be compared against.
+        //
+        // ARMED ONLY WHERE IT IS TRUE: --owed-demo-amount builds the coinbase
+        // from a SEPARATE proof fixture, so its owed outputs belong to a ledger
+        // FOUND/FINALIZE never move and must not be deducted from this one. That
+        // is the same condition the R-7 payout leg uses (fo.require_payout).
+        o2::XmrKFairPayoutCache  kfair_cache;
+        o2::XmrRecomputeStats    kfair_stats;
+        const bool kfair_recompute_armed = (cfg.owed_demo_amount == 0);
+        if (kfair_recompute_armed) {
+            fc.set_peer_payout_recompute([&kfair_cache, &kfair_stats, &fc](const o2::XmrPeerWin& w) {
+                return o2::recompute_peer_payout(
+                    kfair_cache, w, kfair_stats,
+                    [&fc](std::uint64_t lo, std::uint64_t hi) {
+                        return fc.known_blocks_in(lo, hi);
+                    });
+            });
+        }
+        std::printf("K_fair settlement: WIRE-CARRY (wire v0x03 section 2) — a SETTLING peer "
+                    "block is credited with the owed-deduction map the WINNER carried, folded "
+                    "verbatim, with no recompute and no same-instant requirement. Local "
+                    "cross-check: %s (diagnostics only; it never refuses a carried map)\n",
+                    kfair_recompute_armed
+                        ? "ARMED"
+                        : "DISARMED (--owed-demo-amount: the coinbase settles the proof fixture, "
+                          "not this ledger)");
+        std::printf("carrier wire: %s\n", ::c2pool::v37n::wire_freeze::flag_day_id());
+
         o2::SettlementStratumTemplateSource template_source(provider);
         std::printf("coinbase: %s (lane_chain=%u, residual sink %s)\n",
                     to_string(cfg.coinbase), static_cast<unsigned>(cfg.lane_chain),
@@ -892,6 +1342,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::uint64_t tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, tip_best = 0;
 
         ServeHooks hooks;
+        hooks.carrier      = carrier.get();
+        hooks.carrier_desc = pool_desc;
         if (p2p_first) {
             if (!native->node()->block_relay()) {
                 std::printf("REFUSED: the native node built no block relay (internal wiring bug)\n");
@@ -928,6 +1380,36 @@ static int run_live(const XmrNodeConfig& cfg) {
             };
         }
         hooks.after_refresh = [&](bool refreshed, bool new_template) {
+            // ★ (a): record THIS node's K_fair run for the height it just built.
+            // Read off the assembled template's own outputs — the single object
+            // the block bytes would have been built from — with the Fixed and
+            // Sink roles excluded exactly as candidate_by_id() excludes them
+            // (neither is ever credited to a ledger key, so neither may be
+            // deducted from one). Driven on every refresh, not only on a new
+            // template id: observe() is a no-op for a (height, template_id) it
+            // already holds, so the digest is never re-stamped with a later one.
+            if (refreshed && kfair_recompute_armed) {
+                const o2::SettlementSnapshot t = provider.current();
+                if (t.valid && t.tpl && t.height) {
+                    ::c2pool::v37n::settle::OwedLedger::Amounts owed_map;
+                    for (const auto& o : t.tpl->outputs()) {
+                        if (o.role != ::v37::xmr::settle::CoinbaseOutput::Role::Owed) continue;
+                        owed_map[o.identity] += static_cast<long long>(o.amount);
+                    }
+                    // The reservation witness: the finalize cursor now, and how
+                    // many blocks we know of in (cursor, height). K_fair drew on
+                    // EffectiveOwed, which nets exactly those blocks' payouts,
+                    // and owed_digest does not commit to them — so without this
+                    // a receiver that had not yet drained one of the winner's
+                    // descriptors would propose a different map under an equal
+                    // digest and book it silently.
+                    const std::uint64_t cur = node.finalize_driver().cursor_height();
+                    kfair_cache.observe(t.height, snap_reward(t), t.template_id,
+                                        node.ledger().owed_digest(), owed_map,
+                                        cur, fc.known_blocks_in(cur, t.height),
+                                        &kfair_stats);
+                }
+            }
             if (!native || !refreshed || !new_template) return;
             auto* orc = native->oracle();
             if (!orc) return;
@@ -939,6 +1421,30 @@ static int run_live(const XmrNodeConfig& cfg) {
                 orc->on_serve(provider.current().epoch, served, provider.current().source_name);
         };
         hooks.status_extra = [&]() {
+            // ★ (a): the peer-recompute account. `applied` is the claim — a
+            // settling peer block whose payout this node reproduced and booked.
+            // Every other counter is a REFUSAL, and a refusal means this node's
+            // owed_digest will not converge with that winner's for that block:
+            // they are printed individually so an operator never has to guess
+            // which precondition failed.
+            std::printf("  K_fair peer-recompute: %s cache=%zu heights [%llu..%llu] "
+                        "templates=%llu | asked=%llu APPLIED=%llu | refused[no-record=%llu "
+                        "ambiguous=%llu reward=%llu digest=%llu empty=%llu shape=%llu "
+                        "reservation=%llu]\n",
+                        kfair_recompute_armed ? "armed" : "DISARMED",
+                        kfair_cache.size(),
+                        static_cast<unsigned long long>(kfair_cache.oldest_height()),
+                        static_cast<unsigned long long>(kfair_cache.newest_height()),
+                        static_cast<unsigned long long>(kfair_stats.observed),
+                        static_cast<unsigned long long>(kfair_stats.asked),
+                        static_cast<unsigned long long>(kfair_stats.applied),
+                        static_cast<unsigned long long>(kfair_stats.no_record),
+                        static_cast<unsigned long long>(kfair_stats.ambiguous),
+                        static_cast<unsigned long long>(kfair_stats.reward_mismatch),
+                        static_cast<unsigned long long>(kfair_stats.digest_mismatch),
+                        static_cast<unsigned long long>(kfair_stats.empty_map),
+                        static_cast<unsigned long long>(kfair_stats.bad_shape),
+                        static_cast<unsigned long long>(kfair_stats.reservation));
             if (!last_shape.empty())
                 std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
                             last_selected_tx, last_shape.c_str(),
@@ -1070,8 +1576,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         out.reserved_size   = 0;
         return true;
     };
+    ServeHooks hooks_a;
+    hooks_a.carrier      = carrier.get();
+    hooks_a.carrier_desc = pool_desc;
     return serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
-                         "no --payout-address", provider, template_source, candidate);
+                         "no --payout-address", provider, template_source, candidate,
+                         std::move(hooks_a));
 }
 
 int main(int argc, char** argv) {
@@ -1115,6 +1625,7 @@ int main(int argc, char** argv) {
         else if (a == "--settle-h-min") cfg.settle_h_min = std::stoull(next("0"));
         else if (a == "--settle-output-cap") cfg.settle_output_cap =
                      static_cast<std::uint32_t>(std::stoul(next("0")));
+        else if (a == "--settle-sink-min") cfg.settle_sink_min = std::stoull(next("1"));
         else if (a == "--owed-demo-amount") cfg.owed_demo_amount = std::stoull(next("0"));
         else if (a == "--xmr-template-source") {
             const std::string m = next("monerod");
@@ -1158,6 +1669,18 @@ int main(int argc, char** argv) {
         else if (a == "--same-height-renotify") cfg.same_height_renotify =
                      static_cast<std::uint32_t>(std::stoul(next("3")));
         else if (a == "--same-height-journal") cfg.same_height_journal = next("");
+        // ★ X2 / S-1c: the carrier-relay p2p layer (mirrors --p2p-bind/--peer on
+        // the DASH daemon; same wire, same policy gate, same frozen frames).
+        else if (a == "--p2p-bind") cfg.carrier_p2p_bind = next("");
+        else if (a == "--peer") cfg.carrier_peers.push_back(next(""));
+        else if (a == "--carrier-index-horizon")
+            cfg.carrier_index_horizon = std::stoull(next("64"));
+        // ★ R-A / R-B: the two carrier-path race fixes, both bounded and both
+        // tunable so an operator can widen or disable either one.
+        else if (a == "--cut-projector-log")
+            cfg.cut_projector_log = static_cast<std::size_t>(std::stoull(next("131072")));
+        else if (a == "--winner-reflood")
+            cfg.winner_reflood = static_cast<unsigned>(std::stoul(next("2")));
         else if (a == "--data-dir") cfg.settle_db_path = next("");
         else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
         else if (a == "--randomx") cfg.randomx_enabled = true;
@@ -1187,7 +1710,25 @@ int main(int argc, char** argv) {
                 "  --share-diff <n>             share (lane) difficulty; 0 = network (solo)\n"
                 "  --template-reserve <n>       get_block_template reserve_size (default 0)\n"
                 "  --payee-spend-hex <64hex> --payee-view-hex <64hex> [--payee-subaddress]\n"
-                "                               payout address keys -> amount-honest FOUND records\n"
+                "                               payout address keys. These are BOTH the ledger\n"
+                "                               key the FOUND/FINALIZE records use AND the v37\n"
+                "                               payout identity every accepted share is minted\n"
+                "                               under (X2). Without them the lane accrues no\n"
+                "                               work and owed_digest stays at the empty anchor.\n"
+                " X2 / S-1c — the carrier-relay p2p layer (shares -> lane, fold -> peers):\n"
+                "  --p2p-bind <HOST:PORT>       carrier-relay listen address (empty = no bind)\n"
+                "  --peer <HOST:PORT>           dial a carrier-relay peer (repeatable)\n"
+                "  --carrier-index-horizon <n>  how far below the chain tip a carrier's parent\n"
+                "                               block may sit (default 64; 0 = no bound, for a\n"
+                "                               regtest chain shorter than the window only)\n"
+                "  --cut-projector-log <n>      S-1c cut projector: push records retained so a\n"
+                "                               winner prefix this node's executor COALESCED\n"
+                "                               through can still be replayed and folded at a\n"
+                "                               matching lane digest (default 131072; past it the\n"
+                "                               projector saturates and the node refuses as before)\n"
+                "  --winner-reflood <n>         EXTRA floods of each own block-winner frame so a\n"
+                "                               single lost descriptor is recoverable (default 2;\n"
+                "                               a peer that already took it answers DEDUP; 0 = off)\n"
                 " option B (X9): the v37 K_fair SETTLEMENT coinbase (not monerod's template):\n"
                 "  --coinbase <monerod|v37>     monerod (default, option A) | v37 (option B)\n"
                 "  --residual-sink-spend-hex <64hex> --residual-sink-view-hex <64hex>\n"
@@ -1196,6 +1737,11 @@ int main(int argc, char** argv) {
                 "  --residual-sink-subaddress   the sink keys are a subaddress (D_i, A_main)\n"
                 "  --settle-h-min <pico>        owed-output floor (0 on XMR)\n"
                 "  --settle-output-cap <n>      TOTAL outputs cap (0 = weight-aware default)\n"
+                "  --settle-sink-min <pico>     piconero withheld from the K_fair owed selection\n"
+                "                               so the MANDATED residual sink is always a real\n"
+                "                               output (default 1). 0 lets owed take the whole\n"
+                "                               reward, which drops the sink and makes the §13\n"
+                "                               shape gate refuse every template.\n"
                 "  --owed-demo-amount <pico>    seed one K_fair OWED payee into the proof ledger\n"
                 "                               (coinbase carries OWED + residual sink)\n"
                 " M2 — where option B's miner data comes from (--coinbase v37 only):\n"

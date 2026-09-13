@@ -103,6 +103,14 @@ struct OwnWinRequest {
     std::vector<std::uint8_t> payout_script;    // the miner's output script (empty = no identity)
     bool won_block = false;                     // #889: this solve was ALSO a coin block
     std::string tag;                            // bookkeeping only; clamped on submit
+    // ★ X2 (Monero family): a payout identity that is NOT an output script.
+    // descriptor_of_payout_script() below canonicalizes BITCOIN-FAMILY script
+    // bytes, and a Monero payout has no output script of any kind — its identity
+    // is the XMR_STD/XMR_SUB (spend, view) key pair (v37_descriptor_xmr.hpp).
+    // When this is set it is honoured FIRST, ahead of payout_script, so the XMR
+    // daemon can mint a carrier under a real Monero identity. UNSET (the DASH
+    // path and every existing caller) leaves emit_now byte-identical.
+    std::optional<::v37::PayoutDescriptor> descriptor;
     // ★ S-1c: the flat cut descriptor this BLOCK win carries to its peers (wire
     // v0x02). Set only when won_block is true and the daemon could name the win
     // — the daemon's SubmitBlockFn has already registered the block and folded
@@ -112,6 +120,14 @@ struct OwnWinRequest {
     // then accounts the SHARE and credits NOTHING for the block — visible as a
     // convergence miss on the receiving side, never a silent divergence.
     std::optional<CutDescriptor> cut;
+    // ★★ WIRE-CARRY (wire v0x03 section 2, c2pool#1625): the block's own K_fair
+    // owed-DEDUCTION map, so a peer folds what this node's coinbase actually
+    // paid instead of recomputing it from a ledger state it cannot match on
+    // demand. Set only alongside `cut`, and only when cut->payout_emitted is
+    // true; the codec refuses every other shape rather than picking between two
+    // statements about the same block. UNSET leaves the frame byte-identical to
+    // the v0x02-era block-winner carrier plus its two zero section bytes.
+    std::optional<KfairPayout> payout;
 };
 
 // Build a request from the raw stratum solve fields. `header` is the 80-byte
@@ -187,6 +203,8 @@ struct CarrierSendStats {
     std::uint64_t rejected = 0;           // minted but W2 rejected (dedup / target / chain)
     std::uint64_t block_winners = 0;      // of admitted: went through append_block_winner
     std::uint64_t cut_carried = 0;        // S-1c: block wins that carried a v0x02 cut descriptor
+    std::uint64_t payout_carried = 0;     // ★★ v0x03: block wins that carried a K_fair map
+    std::uint64_t payout_missing = 0;     // settling wins that went out WITHOUT one
     std::uint64_t cut_missing = 0;        // S-1c: block wins emitted WITHOUT one (peers credit nothing)
     std::uint64_t relayed = 0;            // reached >= 1 peer
     std::uint64_t deferred_relay = 0;     // admitted but 0 peers (DEFER, never dropped)
@@ -237,6 +255,17 @@ public:
         // set_inbound lambda; the worker then holds it across the relay call
         // only (never across the resolve RPC or the grind). nullptr = none.
         std::mutex* relay_mutex = nullptr;
+        // ★ R-B (c2pool#1625): the EXACT bytes of an admitted BLOCK-WINNER
+        // frame, handed out once, so the daemon can hold them for a bounded
+        // re-announce (xmr_carrier_defer.hpp XmrWinnerReflood). A block-winner
+        // descriptor lost on the wire is a PERMANENT settlement hole on the peer
+        // — it never learns the block exists — and the frozen W3-B5 wire has no
+        // request opcode for the peer to ask with, so the winner repeats itself
+        // a small bounded number of times instead. Called on the worker thread,
+        // inside emit_now, AFTER the append stands; must not block. Unset (the
+        // default) => not a single instruction on the emit path, and no frame is
+        // ever encoded for it.
+        std::function<void(std::vector<std::uint8_t>&&)> on_winner_frame;
     };
 
     // (warn, line): the daemon binds LOG_WARNING / LOG_INFO; tests may print.
@@ -337,14 +366,28 @@ public:
         unsigned lz_bits = 0;
         bool used_fallback = false;
         bool carried_cut = false;            // S-1c: a v0x02 cut descriptor rode out
+        bool carried_payout = false;         // ★★ v0x03 section 2 rode out with it
         CarrierRelay::Outcome relay;         // valid iff ADMITTED/REJECTED
     };
 
     EmitOutcome emit_now(const OwnWinRequest& req) {
         EmitOutcome o;
 
-        // 1. identity: the miner's own script; a block win may fall back.
-        std::optional<::v37::PayoutDescriptor> desc = descriptor_of_payout_script(req.payout_script);
+        // 1. identity. An EXPLICIT descriptor wins: it is the only way a family
+        //    whose payout is not an output script (Monero — X2) can name an
+        //    identity at all, and a caller that supplied one is not guessing.
+        //    Otherwise the Bitcoin-family path is unchanged: canonicalize the
+        //    miner's own script; a block win may fall back to the pool's.
+        std::optional<::v37::PayoutDescriptor> desc =
+            req.descriptor ? req.descriptor : descriptor_of_payout_script(req.payout_script);
+        if (desc && !desc->valid()) {
+            // A descriptor the canon rejects must never become a lane identity.
+            // For an XMR ref this is the fail-closed answer when no ed25519
+            // point-check / XMR validator backend is installed, and it is a
+            // REFUSAL rather than a fallback: crediting the pool's own key for a
+            // payout we could not validate is worse than crediting nobody.
+            desc.reset();
+        }
         if (!desc && req.won_block && m_opt.fallback_desc) {
             desc = m_opt.fallback_desc;
             o.used_fallback = true;
@@ -392,6 +435,23 @@ public:
         if (req.won_block && req.cut) {
             c.cut = req.cut;
             o.carried_cut = true;
+            // ★★ v0x03 section 2. Guarded by the SAME predicate the codec uses,
+            // so a request that would make encode() return an empty vector is
+            // caught here — where it can be logged against a named block —
+            // rather than surfacing as a mute relay failure.
+            if (req.payout && req.cut->payout_emitted &&
+                CarrierWire::payout_encodable(*req.payout, req.cut->reward)) {
+                c.payout = req.payout;
+                o.carried_payout = true;
+            } else if (req.payout) {
+                log(true, "[carrier-send] BLOCK WIN " + req.tag + ": the K_fair payout map is "
+                          "not wire-expressible against this descriptor (payout_emitted=" +
+                          std::string(req.cut->payout_emitted ? "1" : "0") + ", reward=" +
+                          std::to_string(req.cut->reward) + ", rows=" +
+                          std::to_string(req.payout->pay.size()) + ") — section 2 is OMITTED and "
+                          "every peer will fail-closed on this block rather than fold a map we "
+                          "could not state exactly");
+            }
         }
         // W3-G1: a block-winning carrier is appended UNCONDITIONALLY (no relay
         // dedup, no backpressure gate); an ordinary share takes the local path.
@@ -404,11 +464,23 @@ public:
         if (o.relay.admitted) {
             o.status = EmitOutcome::Status::ADMITTED;
             m_chains.advance(o.identity, o.hash);     // chain forward only on a real append
+            // ★ R-B: hand the winner's own bytes out for the bounded re-announce.
+            // Only for a block win, only once, only when a holder is bound — an
+            // ordinary share is re-earned every few seconds and needs none.
+            if (req.won_block && m_opt.on_winner_frame)
+                m_opt.on_winner_frame(CarrierWire::encode(c));
             const bool used_fb = o.used_fallback, won = req.won_block, cut = o.carried_cut;
+            const bool pay = o.carried_payout;
+            const bool settling = req.cut && req.cut->payout_emitted;
             const auto reached = o.relay.peers_reached;
             bump([&](CarrierSendStats& s) {
                 ++s.admitted;
-                if (won) { ++s.block_winners; if (cut) ++s.cut_carried; else ++s.cut_missing; }
+                if (won) {
+                    ++s.block_winners;
+                    if (cut) ++s.cut_carried; else ++s.cut_missing;
+                    if (pay) ++s.payout_carried;
+                    else if (settling) ++s.payout_missing;
+                }
                 if (used_fb) ++s.fallback_identity;
                 if (reached) { ++s.relayed; s.peers_reached_total += reached; }
                 else ++s.deferred_relay;
@@ -422,7 +494,13 @@ public:
                        (req.won_block ? (o.carried_cut
                             ? " [S-1c cut P=" + std::to_string(req.cut->cut_next_pos) +
                               " H_b=" + std::to_string(req.cut->h_b) +
-                              " reward=" + std::to_string(req.cut->reward) + "]"
+                              " reward=" + std::to_string(req.cut->reward) +
+                              (o.carried_payout
+                                   ? " | WIRE-CARRY K_fair " +
+                                         std::to_string(c.payout->pay.size()) + " row(s)"
+                                   : (req.cut->payout_emitted
+                                          ? " | NO K_fair section: peers fail-closed"
+                                          : " | no settlement")) + "]"
                             : " [S-1c NO CUT DESCRIPTOR: peers credit nothing for this block]")
                           : ""));
             if (req.won_block && !o.carried_cut)

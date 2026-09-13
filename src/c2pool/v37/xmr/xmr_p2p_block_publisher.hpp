@@ -153,6 +153,10 @@ public:
         ev.header_check = sub::HeaderCheck::NotRun;   // no daemon confirmed it
         ev.rpc_ms       = 0.0;                        // and none was called
         ev.at           = std::chrono::steady_clock::now();
+        // ★ R-7 payout leg: identical to the daemon arm's — the owed-role
+        // outputs of the coinbase in the bytes that just went out on levin.
+        ev.owed_payout       = c.owed_payout;
+        ev.owed_payout_known = c.owed_payout_known;
         m_found.push(std::move(ev));
         set_error({});
     }
