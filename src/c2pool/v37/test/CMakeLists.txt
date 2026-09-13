@@ -671,4 +671,33 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_s1c_recovery_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_s1c_recovery_kat Threads::Threads)
     add_test(NAME v37_xmr_s1c_recovery_kat COMMAND v37_xmr_s1c_recovery_kat)
+    # ★ S-1b — THE first_eligible ARMING RULE, as a FROM-SPEC SHADOW. owed_digest
+    # commits "V37O" || per finalW row key || i64 finalW || u64 first_eligible, and
+    # the shipped rearm arms a key at the bin its EffectiveOwed (finalW minus the
+    # PENDING payouts) first goes positive. The pending set is deliberately NOT
+    # synchronised across nodes — tolerating that relay-hop skew is why the v0x03
+    # wire-carry exists — so two honest nodes handed the SAME finalize stream arm
+    # the same key at DIFFERENT bins, and because arming is sticky their digests
+    # then differ FOREVER at byte-identical balances. Observed live on the 2-node
+    # XMR rig. This suite implements the owed ledger FROM SPEC (its own sha256d,
+    # its own state machine, its own preimage) and carries BOTH arming rules side
+    # by side, so it can mint the ruling's values WITHOUT touching the consensus
+    # fold body — applying the rule in w4_settlement.hpp is a consensus activation
+    # and the operator's hand. It pins: the from-spec hash against the b4db1ded...
+    # empty anchor (UNCHANGED under both rules — no rows, so no fe column); the
+    # OLD rule reproducing every published owed-event-MMR golden byte-for-byte
+    # (owed_digest, ledger_seq, StateCommitment root gate-OFF and gate-ON) which is
+    # what makes the model an ORACLE; the re-mint under the ruling; the shape
+    # invariance that leaves the V37.1 ridge and both DROPS activation mints
+    # unmoved; the live 2-node fork reproduced from the rig's own captured event
+    # stream and CLOSED by the ruling; and randomised cross-node determinism with
+    # a non-vacuous negative control. Stdlib only: no engine, no coin backend, no
+    # sockets, no clocks, no threads. SAME HOLLOW-GREEN GUARD as the sibling
+    # suites: ALSO listed on BOTH build.yml --target lists so CI compiles + RUNS
+    # it instead of registering a NOT_BUILT CTest sentinel (the DGB #137 / #769 /
+    # c2pool#1539 unregistered-KAT class).
+    add_executable(v37_s1b_arming_kat v37_s1b_arming_kat.cpp)
+    target_compile_features(v37_s1b_arming_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_s1b_arming_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME v37_s1b_arming_kat COMMAND v37_s1b_arming_kat)
 endif()
