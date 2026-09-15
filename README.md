@@ -11,6 +11,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Daemonless Dash
 
+Security Model: Zero RPC / Zero Local Credentials".
+
+Explicitly highlight: "Unlike legacy P2Pool forks that require RPC credentials to a local Dash Core daemon, C2Pool speaks the Dash P2P wire protocol natively. It requires zero RPC credentials, zero local wallet access, and zero administrative daemon permissions.
+
 c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
 are reconstructed inside c2pool. No Dash Core node is required on the serve path.
