@@ -94,6 +94,7 @@
 
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
+#include "impl/xmr/native/node/xmr_anchor_confirm.hpp"
 #include "impl/xmr/native/node/xmr_chain_boot.hpp"
 #include "impl/xmr/native/node/xmr_monerod_http.hpp"
 #include "impl/xmr/native/node/xmr_sync_driver.hpp"
@@ -182,6 +183,15 @@ struct NativeNodeConfig {
     BootMode                 boot = BootMode::Genesis;
     std::string              anchor_path;          // BootMode::Anchor; "" = embedded
 
+    // GATE 4's bound. An anchor is confirmed against the live network before
+    // this node serves anything, and that confirm is not allowed to be
+    // unbounded: at most `peers` distinct handshaked peers are asked, each gets
+    // `per_peer_ms`, and the whole gate expires after `timeout_ms` -- as a
+    // REFUSAL, never as a shrug. Defaults are in the struct; the node tool and
+    // the pool consumer expose them so an operator on a slow link can widen the
+    // window without being able to turn the gate off.
+    AnchorConfirmConfig      anchor_confirm{};
+
     // A build without librandomx cannot check proof of work: the gate answers
     // Skipped, and the index connects blocks it never verified. That is a
     // legitimate thing to want (a build leg that cannot link RandomX, a
@@ -254,6 +264,14 @@ struct NativeNodeConfig {
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
     // SyncDriverConfig::probe_only.
+    //
+    // ONE EXCEPTION, added with gate 4 and named here rather than discovered:
+    // on `boot == Anchor` a probe DOES request exactly one block -- the anchor
+    // itself -- because the network confirm is not optional. Making the probe
+    // the one mode that skips gate 4 would put a "trust this anchor without
+    // asking" switch on the command line, which is the hole the gate exists to
+    // close. It is still read-only in the sense the probe means: one 2003 out,
+    // one 2004 in, nothing relayed, nothing served.
     bool                     probe_only = false;
 
     std::uint64_t            driver_tick_ms = 500;
@@ -342,6 +360,12 @@ public:
             // vector is a degraded-but-honest boot rather than a wrong one.
             if (!boot_.boot_from_anchor(cfg_.anchor_path, nets_.consensus, {}, why))
                 return false;
+            // Gates 1..3 passed. Gate 4 -- the network confirm -- is now ARMED
+            // and is settled further down, after the peer pool has peers to ask.
+            // Until it settles, ChainBoot forwards nothing and serves nothing,
+            // and this function does not return true.
+            note_(std::string("[GATE-4] ") + anchor_boot_duty());
+            note_(boot_.anchor_confirm().log_line());
         }
 
         index_.set_clock([] { return unix_seconds_(); });
@@ -485,6 +509,20 @@ public:
 
         pool_->start();
         for (const std::string& key : cfg_.connect) pool_->dial_now(key);
+
+        // --- GATE 4: the anchor, confirmed by the network, before we serve ----
+        //
+        // It runs HERE and not earlier because it needs handshaked peers, and
+        // HERE and not later because the sync driver (armed on the next line)
+        // is the thing that would start building on an unconfirmed root. It is
+        // the last gate between a loaded bundle and a running node, and it is
+        // fail-closed in both directions: a mismatch refuses, and so does an
+        // exhausted peer set or an expired deadline.
+        if (cfg_.boot == BootMode::Anchor && !run_anchor_confirm_(why)) {
+            stop();
+            return false;
+        }
+
         arm_tick_();
         return true;
     }
@@ -904,6 +942,61 @@ private:
         using namespace std::chrono;
         return static_cast<std::uint64_t>(
             duration_cast<milliseconds>(steady_clock::now() - epoch_).count());
+    }
+
+    // -----------------------------------------------------------------------
+    // GATE 4, driven.
+    //
+    // load_anchor()'s three gates judged the bundle against itself; this one
+    // asks the network. The driver issues NOTIFY_REQUEST_GET_OBJECTS for
+    // bundle.id to one handshaked peer at a time, ChainBoot::on_objects hands
+    // the answering blob to AnchorNetworkConfirm, and the confirm recomputes
+    // the id from those bytes (never taking the peer's word) and reads the
+    // block's own height out of its coinbase.
+    //
+    // WHICH THREAD. IChainFetcher's contract puts request_objects on the C2
+    // verify thread, and ChainBoot::on_objects already runs there, so the whole
+    // gate is driven from that thread via verify_loop_.call() -- while THIS
+    // function blocks on the consumer's thread, which is exactly what "refuse
+    // to start" has to mean: start() has not returned, so nothing above the
+    // node has a running node to serve from.
+    //
+    // The wait is bounded by AnchorConfirmDriver itself (peers, per-peer turn,
+    // wall deadline), so this loop cannot outlive cfg_.anchor_confirm.timeout_ms
+    // even if every peer is silent, and every exit sets `why`.
+    // -----------------------------------------------------------------------
+    bool run_anchor_confirm_(std::string& why) {
+        AnchorConfirmDriver drv(*pool_, boot_.anchor_confirm(), cfg_.anchor_confirm,
+                                [this] { return now_ms_(); });
+        note_("[GATE-4] confirming the anchor against the network: up to "
+              + std::to_string(cfg_.anchor_confirm.peers) + " peer(s), "
+              + std::to_string(cfg_.anchor_confirm.per_peer_ms) + " ms each, "
+              + std::to_string(cfg_.anchor_confirm.timeout_ms) + " ms in total");
+
+        for (;;) {
+            AnchorConfirmState st = AnchorConfirmState::Pending;
+            verify_loop_.call([&] { st = drv.poll(); });
+            if (st == AnchorConfirmState::Confirmed) {
+                note_(boot_.anchor_confirm().log_line());
+                return true;
+            }
+            if (st == AnchorConfirmState::Refused) {
+                const AnchorNetworkConfirm::Stats s = boot_.anchor_confirm().stats();
+                why = "anchor REFUSED by the network confirm (gate 4): " + s.why;
+                note_(boot_.anchor_confirm().log_line());
+                note_("[GATE-4] REFUSING TO START. " + why);
+                return false;
+            }
+            if (st == AnchorConfirmState::Disarmed) {
+                // Unreachable on this path (boot == Anchor armed it), and a
+                // silent true here would be the one way this gate could be
+                // skipped, so it is a refusal rather than a pass.
+                why = "the anchor confirm was never armed; refusing to start";
+                note_("[GATE-4] REFUSING TO START. " + why);
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 
     // ON THE VERIFY THREAD.

@@ -127,6 +127,9 @@ void usage() {
         "  --seeds                                    also use the network's seed nodes\n"
         "  --boot <genesis|anchor>                    where the index's history starts\n"
         "  --anchor-path <file>                       anchor boot from a .inc (default: embedded)\n"
+        "  --anchor-confirm-peers <n>                 gate 4: peers to ask (default 4)\n"
+        "  --anchor-confirm-timeout-ms <ms>           gate 4: whole-gate deadline (default 60000)\n"
+        "  --anchor-confirm-peer-ms <ms>              gate 4: one peer's turn (default 12000)\n"
         "  --monerod-rpc <host:port>                  the parity/backup arm (read-only)\n"
         "  --no-parity                                construct no parity oracle\n"
         "  --parity-ledger <file>                     persist the graduation ledger\n"
@@ -277,6 +280,18 @@ int main(int argc, char** argv) {
             else { std::cerr << "unknown boot mode\n"; return 2; }
         }
         else if (a == "--anchor-path")   cfg.anchor_path = next("--anchor-path");
+        // GATE 4's bound. Widening it is an operator's right on a slow link;
+        // turning it off is not offered, because an unconfirmed anchor is the
+        // one thing this gate exists to stop a node from serving.
+        else if (a == "--anchor-confirm-peers")
+            cfg.anchor_confirm.peers = static_cast<std::size_t>(
+                std::strtoull(next("--anchor-confirm-peers").c_str(), nullptr, 10));
+        else if (a == "--anchor-confirm-timeout-ms")
+            cfg.anchor_confirm.timeout_ms =
+                std::strtoull(next("--anchor-confirm-timeout-ms").c_str(), nullptr, 10);
+        else if (a == "--anchor-confirm-peer-ms")
+            cfg.anchor_confirm.per_peer_ms =
+                std::strtoull(next("--anchor-confirm-peer-ms").c_str(), nullptr, 10);
         else if (a == "--monerod-rpc") {
             if (!split_host_port(next("--monerod-rpc"), cfg.monerod_rpc_host,
                                  cfg.monerod_rpc_port)) {
@@ -396,6 +411,12 @@ int main(int argc, char** argv) {
                 native::to_string(node.nets().consensus), rt::to_string(cfg.boot),
                 cfg.connect.size(), cfg.parity ? 1 : 0, cfg.probe_only ? 1 : 0);
     if (!node.start(why)) {
+        // LOUD. The anchor network confirm (gate 4) refuses here, and its
+        // reasoning is in the node's own log rather than in `why` alone, so the
+        // log is drained to stderr before the exit code -- a refusal that leaves
+        // the operator guessing which gate fired is a refusal that gets worked
+        // around.
+        for (const std::string& line : node.take_log()) std::cerr << line << "\n";
         std::cerr << "[node] start refused: " << why << "\n";
         return 1;
     }
@@ -731,6 +752,19 @@ int main(int argc, char** argv) {
                 (unsigned long long)s.boot.blobs_inspected,
                 (unsigned long long)s.boot.refusals,
                 (unsigned long long)s.boot.dropped_preboot, s.boot.why.c_str());
+    if (s.boot.anchor.state != rt::AnchorConfirmState::Disarmed) {
+        std::printf("anchor-gate4   : %s height=%llu id=%s asked=%llu spent=%llu blobs=%llu "
+                    "foreign=%llu dropped_unconfirmed=%llu (%s)\n",
+                    rt::to_string(s.boot.anchor.state),
+                    (unsigned long long)s.boot.anchor.height,
+                    hex(s.boot.anchor.id).c_str(),
+                    (unsigned long long)s.boot.anchor.peers_asked,
+                    (unsigned long long)s.boot.anchor.peers_spent,
+                    (unsigned long long)s.boot.anchor.blobs_seen,
+                    (unsigned long long)s.boot.anchor.foreign,
+                    (unsigned long long)s.boot.dropped_unconfirmed,
+                    s.boot.anchor.why.c_str());
+    }
     if (s.boot.last_entry.have) {
         std::printf("chain-entry    : start=%llu total=%llu ids=%zu first=%s last=%s "
                     "first_block=%d/%zu bytes\n",

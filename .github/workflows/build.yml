@@ -243,7 +243,7 @@ jobs:
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
                     xmr_native_block_id_kat xmr_native_consensus_state_kat \
-                    xmr_native_anchor_self_check_kat xmr_native_chain_index_kat \
+                    xmr_native_anchor_self_check_kat xmr_native_anchor_gate4_kat xmr_native_chain_index_kat \
                     xmr_native_reorg_follow_kat \
                     xmr_levin_socket_kat xmr_levin_link_kat \
                     xmr_native_rct_verify_kat xmr_native_txpool_kat \
@@ -688,7 +688,7 @@ jobs:
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
                     xmr_native_block_id_kat xmr_native_consensus_state_kat \
-                    xmr_native_anchor_self_check_kat xmr_native_chain_index_kat \
+                    xmr_native_anchor_self_check_kat xmr_native_anchor_gate4_kat xmr_native_chain_index_kat \
                     xmr_native_reorg_follow_kat \
                     xmr_levin_socket_kat xmr_levin_link_kat \
                     xmr_native_rct_verify_kat xmr_native_txpool_kat \

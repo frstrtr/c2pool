@@ -155,6 +155,46 @@ if (BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_native_anchor_self_check_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_anchor_self_check_kat COMMAND xmr_native_anchor_self_check_kat)
+
+    #    GATE 4 (xmr_native_anchor_gate4_kat): the anchor CONFIRMED AGAINST THE
+    #    NETWORK before the node serves. The self-check KAT above proves gates
+    #    1..3, all of which judge a bundle against ITSELF; this one proves the
+    #    fourth, which is the only one that can catch a bundle that is
+    #    internally perfect and names a block that is not on this network.
+    #
+    #    Its four cases are the wiring's refusals: a matching bundle confirms
+    #    and only then is the node ready to serve; a tampered id and a tampered
+    #    height are both REFUSED; and an exhausted peer set or an expired
+    #    deadline is a refusal too, never silent trust. A mock levin
+    #    GET_OBJECTS peer (the contracts FakeFetcher plus blobs this file
+    #    builds and round-trips through the production parser) keeps all of it
+    #    deterministic -- no daemon, no sockets.
+    #
+    #    Links xmr_coin (block identity: keccak + tree hash) and boost's
+    #    header-only multiprecision (the chain index's difficulty type): the
+    #    same LIGHT link as xmr_native_node_kat. It writes small temporary .inc
+    #    bundles into the working directory and removes them again.
+    #
+    #    Registered in BOTH `--target` lists in .github/workflows/build.yml by
+    #    the change that adds it here: a registered-but-unbuilt target reports
+    #    "***Not Run" and fails ctest (the #1539 lesson).
+    add_executable(xmr_native_anchor_gate4_kat xmr_anchor_gate4_kat.cpp)
+    target_include_directories(xmr_native_anchor_gate4_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_anchor_gate4_kat PRIVATE xmr_coin)
+    target_compile_features(xmr_native_anchor_gate4_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_anchor_gate4_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_anchor_gate4_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_anchor_gate4_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_anchor_gate4_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_anchor_gate4_kat COMMAND xmr_native_anchor_gate4_kat)
     # ─────────────────────────────────────────────────────────────────────────
     # Wave 1 / C3: the relayed txpool (../txpool/) and the non-input consensus
     # it admits on (../rct/).
