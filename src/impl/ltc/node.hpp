@@ -1212,6 +1212,40 @@ struct HandleSharesData
         m_txs[share.hash()] = std::move(txs);
     }
 
+    /// Per-share ingest backpressure (issue #1599): destroy the OLDEST `k`
+    /// shares of this batch and hand back exactly their reservation (k shares /
+    /// `bytes` bytes), leaving the rest of the batch — and the rest of its
+    /// reservation — untouched. This lets a batch fund an admission by
+    /// surrendering the MINIMUM instead of its whole reservation. `bytes` is the
+    /// admission byte-cost of those k oldest shares, computed by the caller
+    /// exactly as admission computed it, so the surviving reservation still
+    /// matches the surviving shares.
+    void evict_oldest(std::size_t k, std::size_t bytes)
+    {
+        if (k == 0) return;
+        if (k > m_items.size()) k = m_items.size();
+        for (std::size_t i = 0; i < k; ++i)
+        {
+            m_txs.erase(m_items[i].hash());
+            destroy_orphan_share(m_items[i]);
+        }
+        m_items.erase(m_items.begin(),
+                      m_items.begin() + static_cast<std::ptrdiff_t>(k));
+        if (k <= m_raw_items.size())
+            m_raw_items.erase(m_raw_items.begin(),
+                              m_raw_items.begin() + static_cast<std::ptrdiff_t>(k));
+        else
+            m_raw_items.clear();
+        // Shrink the held reservation and release exactly that much, so ~this
+        // never releases it a second time. Clamp so the counters can never go
+        // negative even if the caller's byte figure disagrees with the stored one.
+        const std::size_t give_shares = (k < m_admitted_shares) ? k : m_admitted_shares;
+        const std::size_t give_bytes  = (bytes < m_admitted_bytes) ? bytes : m_admitted_bytes;
+        if (m_budget) m_budget->release(give_shares, give_bytes);
+        m_admitted_shares -= give_shares;
+        m_admitted_bytes  -= give_bytes;
+    }
+
     /// Record the ingest reservation this batch holds; released by ~this.
     void attach_budget(IngestBudget* budget, std::size_t shares, std::size_t bytes)
     {

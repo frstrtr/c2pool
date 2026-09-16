@@ -489,7 +489,9 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
     std::size_t need_bytes       = 0;
     std::size_t freed_shares     = 0;   // what the scanned queue head would return
     std::size_t freed_bytes      = 0;
-    std::size_t evicted          = 0;
+    std::size_t evicted          = 0;   // OLDEST shares evicted (per-share, #1599)
+    std::size_t full_batches     = 0;   // leading batches consumed WHOLE
+    std::size_t partial_take     = 0;   // oldest shares trimmed off the boundary batch
     bool admitted                = false;
 
     if (!unsatisfiable)
@@ -501,27 +503,63 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
         need_bytes  = (used_bytes + admit_bytes > m_ingest_budget.max_bytes())
                     ? (used_bytes + admit_bytes - m_ingest_budget.max_bytes()) : 0;
 
-        // PRE-CHECK. Sum the reservation actually held by the oldest entries,
-        // stopping at the first one that closes the deficit (evict the minimum)
-        // and never looking past MAX_ADMIT_EVICTIONS entries (the bound).
+        // PRE-CHECK (no mutation). PER-SHARE granularity (#1599): walk the
+        // OLDEST shares one at a time, across deferred batches from the front,
+        // summing the reservation they hold and stopping at the FIRST share that
+        // closes BOTH deficits. That frees the true MINIMUM instead of rounding
+        // a small shortfall up to a whole batch. The batch scan is still bounded
+        // to MAX_ADMIT_EVICTIONS entries, so one admission attempt can never
+        // walk more of the queue than that.
+        std::size_t partial_bytes = 0;   // reservation the trimmed prefix returns
         const std::size_t horizon = std::min(MAX_ADMIT_EVICTIONS, m_pending_adds.size());
-        std::size_t take = 0;
-        while (take < horizon && (freed_shares < need_shares || freed_bytes < need_bytes))
+        bool covered = false;
+        for (std::size_t b = 0; b < horizon && !covered; ++b)
         {
-            const auto& batch = *m_pending_adds[take].data;
-            freed_shares += batch.admitted_shares();
-            freed_bytes  += batch.admitted_bytes();
-            ++take;
+            const auto& batch = *m_pending_adds[b].data;
+            const std::size_t items = batch.m_items.size();
+            std::size_t batch_bytes = 0;   // bytes freed so far WITHIN this batch
+            for (std::size_t i = 0; i < items; ++i)
+            {
+                // Per-share admission byte-cost, computed exactly as
+                // processing_shares() computed it, so the reservation released
+                // here matches what was reserved.
+                const std::size_t raw = (i < batch.m_raw_items.size())
+                    ? batch.m_raw_items[i].contents.m_data.size() : 0;
+                const std::size_t sb = raw ? raw : INGEST_BYTES_FALLBACK_PER_SHARE;
+                freed_shares += 1;
+                freed_bytes  += sb;
+                batch_bytes  += sb;
+                if (freed_shares >= need_shares && freed_bytes >= need_bytes)
+                {
+                    if (i + 1 == items) { full_batches = b + 1; partial_take = 0; }
+                    else                { full_batches  = b;
+                                          partial_take  = i + 1;
+                                          partial_bytes = batch_bytes; }
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered)
+                full_batches = b + 1;   // this whole batch is needed; keep walking
         }
 
-        if (freed_shares >= need_shares && freed_bytes >= need_bytes)
+        if (covered)
         {
-            // The exchange is fundable: erase exactly `take` entries. Each
-            // ~HandleSharesData frees that batch's shares and releases its
-            // reservation, which is what makes the retry below succeed.
-            m_pending_adds.erase(m_pending_adds.begin(),
-                                 m_pending_adds.begin() + static_cast<std::ptrdiff_t>(take));
-            evicted  = take;
+            // EXCHANGE, NEVER SACRIFICE. The oldest-share prefix summed above
+            // covers the shortfall in BOTH dimensions, so committing it and
+            // retrying is guaranteed to admit; on every other path nothing is
+            // touched. Erase the leading WHOLE batches (each ~HandleSharesData
+            // releases that batch's full reservation), then trim only the oldest
+            // `partial_take` shares off the new front batch — the boundary batch
+            // survives with the rest of its shares and its remaining reservation.
+            // Total released == freed_shares / freed_bytes >= the shortfall, and
+            // never more than the incoming admission is about to consume.
+            if (full_batches > 0)
+                m_pending_adds.erase(m_pending_adds.begin(),
+                                     m_pending_adds.begin() + static_cast<std::ptrdiff_t>(full_batches));
+            if (partial_take > 0)
+                m_pending_adds.front().data->evict_oldest(partial_take, partial_bytes);
+            evicted  = freed_shares;
             admitted = m_ingest_budget.try_admit(n, admit_bytes);
         }
     }
@@ -531,7 +569,9 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
         if (evicted != 0)
             LOG_WARNING << "[INGEST] BACKPRESSURE: admitted " << n << " shares / "
                         << admit_bytes << " B from " << addr.to_string()
-                        << " by evicting the " << evicted << " OLDEST of "
+                        << " by evicting the " << evicted << " OLDEST shares ("
+                        << full_batches << " whole batch(es)"
+                        << (partial_take ? " + partial trim" : "") << ") of "
                         << pending_before << " deferred batches (returned "
                         << freed_shares << " shares / " << freed_bytes
                         << " B, needed " << need_shares << " / " << need_bytes
