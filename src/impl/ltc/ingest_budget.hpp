@@ -65,7 +65,10 @@ namespace ltc
 /// the rolling-back caller itself, and release() only ever decrements amounts a
 /// successful admit reserved, so neither counter can go negative. The per-peer
 /// map is additionally guarded by m_peer_mtx because release_for_peer() may run
-/// off the io thread concurrently with an io-thread admit.
+/// off the io thread concurrently with an io-thread admit. try_admit_for_peer()
+/// holds m_peer_mtx across its whole reserve-and-maybe-rollback sequence so its
+/// m_peer mutations never race a concurrent release; m_peer_mtx is a leaf lock
+/// (no other lock is taken while it is held), so this is deadlock-free.
 class IngestBudget
 {
 public:
@@ -119,35 +122,50 @@ public:
     {
         const std::size_t pps = per_peer_max_shares();
         const std::size_t ppb = per_peer_max_bytes();
+        // Hold m_peer_mtx across the WHOLE sequence — the per-peer check and
+        // increment, the global reserve + overflow test, AND the rollback — so
+        // the per-peer increment and its possible rollback are ATOMIC with
+        // respect to concurrent release_for_peer() calls, which may run on
+        // verify-pool worker threads and mutate the SAME m_peer entry. The
+        // earlier version released the mutex before the GlobalFull rollback and
+        // then called peer_release_locked() unlocked — a data race on m_peer.
+        //
+        // DEADLOCK-FREE: m_peer_mtx is a LEAF lock. Nothing reached while it is
+        // held ever acquires another lock — the global counters are lock-free
+        // std::atomics, and peer_release_locked() only touches m_peer. No other
+        // code path takes m_peer_mtx and then a second lock, so no lock-ordering
+        // cycle exists. Holding the mutex across the atomic reserve is also
+        // CORRECT: a concurrent release only ever LOWERS the global counters, so
+        // it can never make this overflow test wrongly admit (shares_after is
+        // read from THIS call's own fetch_add, not a re-load).
+        std::lock_guard<std::mutex> g(m_peer_mtx);
+        auto& e = m_peer[peer];
+        // Refuse a peer that ALREADY holds its fair-share slice in EITHER
+        // dimension. This is deliberately a "current usage" check, not a
+        // "current + n" check: a peer's FIRST batch always gets in, so a
+        // legitimate large single message is never throttled by the per-peer
+        // cap (a single admitted batch is bounded by the p2p wire/socket
+        // message cap regardless, and the GLOBAL ceiling below is still the
+        // hard memory bound). What the cap stops is a peer ACCUMULATING many
+        // batches to crowd others out: once its inflight reaches its slice it
+        // is frozen out until it drains, leaving headroom for other peers.
+        if (e.shares >= pps || e.bytes >= ppb)
         {
-            std::lock_guard<std::mutex> g(m_peer_mtx);
-            auto& e = m_peer[peer];
-            // Refuse a peer that ALREADY holds its fair-share slice in EITHER
-            // dimension. This is deliberately a "current usage" check, not a
-            // "current + n" check: a peer's FIRST batch always gets in, so a
-            // legitimate large single message is never throttled by the per-peer
-            // cap (a single admitted batch is bounded by the p2p wire/socket
-            // message cap regardless, and the GLOBAL ceiling below is still the
-            // hard memory bound). What the cap stops is a peer ACCUMULATING many
-            // batches to crowd others out: once its inflight reaches its slice it
-            // is frozen out until it drains, leaving headroom for other peers.
-            if (e.shares >= pps || e.bytes >= ppb)
-            {
-                if (e.shares == 0 && e.bytes == 0) m_peer.erase(peer);
-                return AdmitResult::PeerCapped;   // no counter mutated
-            }
-            e.shares += n;
-            e.bytes  += b;
+            if (e.shares == 0 && e.bytes == 0) m_peer.erase(peer);
+            return AdmitResult::PeerCapped;   // no counter mutated
         }
+        e.shares += n;
+        e.bytes  += b;
+
         // Per-peer room granted; now enforce the global ceiling exactly as the
-        // global-only path does. On overflow, roll BOTH back.
+        // global-only path does. On overflow, roll BOTH back (still under lock).
         const std::size_t shares_after = m_shares.fetch_add(n, std::memory_order_acq_rel) + n;
         const std::size_t bytes_after  = m_bytes.fetch_add(b, std::memory_order_acq_rel) + b;
         if (shares_after <= m_max_shares && bytes_after <= m_max_bytes)
             return AdmitResult::Admitted;
         m_shares.fetch_sub(n, std::memory_order_acq_rel);
         m_bytes.fetch_sub(b, std::memory_order_acq_rel);
-        peer_release_locked(n, b, peer);
+        peer_release_locked(n, b, peer);   // m_peer_mtx held: contract satisfied
         return AdmitResult::GlobalFull;
     }
 

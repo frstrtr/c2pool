@@ -563,13 +563,19 @@ public:
     bool processing_shares(HandleSharesData& data, NetService addr);
 
     // ── #1601 invalid-PoW peer misbehavior scoring ───────────────────────
-    // Decaying per-peer score charged ONLY for genuine cryptographic PoW
+    // Decaying misbehavior score charged ONLY for genuine cryptographic PoW
     // failures (SharePoWTargetMiss from share_init_verify). io-thread only, same
-    // discipline as m_ban_list. When a peer crosses the threshold this reuses
-    // the EXISTING m_ban_list + m_ban_duration + close_connection machinery.
-    ltc::PeerMisbehaviorScorer<NetService> m_pow_misbehavior;
-    // Charge one invalid-PoW share against `addr`; ban+disconnect past threshold.
+    // discipline as m_ban_list. KEYED BY IP (not IP:ephemeral-port) so the score
+    // ACCUMULATES across reconnects — a flooder cannot reset it by redialing from
+    // a new source port. When a peer crosses the threshold this reuses the
+    // EXISTING m_ip_ban_list + m_ban_duration + close_connection machinery (the
+    // IP-only ban list, so is_banned() also catches the reconnect). The map is
+    // bounded by prune() (run_think, every think cycle) plus clear() on ban.
+    ltc::PeerMisbehaviorScorer<std::string> m_pow_misbehavior;
+    // Charge one invalid-PoW share against `addr` (scored by IP); ban+disconnect
+    // past threshold. Drop decayed scorer entries each think cycle.
     void note_invalid_pow_share(NetService addr);
+    void prune_pow_misbehavior();
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     /// Direct tracker access — compute-thread-only (already holds exclusive lock)
     /// or startup code (before compute thread exists).

@@ -46,6 +46,20 @@ struct SharePoWTargetMiss : std::invalid_argument
     using std::invalid_argument::invalid_argument;
 };
 
+// Catch-site CLASSIFICATION for #1601, shared by the production ingest catch
+// (NodeImpl::processing_shares phase 1) and its KAT so both agree on exactly one
+// rule: a caught verify exception scores the sending peer for invalid-PoW
+// misbehaviour IFF it is a genuine cryptographic PoW-target miss. Every other
+// verify failure — a structural std::invalid_argument (bad coinbase size,
+// over-long merkle, zero/too-easy target) or any other std::exception — returns
+// false and is NOT scored. Centralising it here means a regression that
+// broadened the rule (e.g. scoring every std::exception) would flip this
+// predicate and fail the classification KAT.
+inline bool is_scorable_invalid_pow(const std::exception& e)
+{
+    return dynamic_cast<const SharePoWTargetMiss*>(&e) != nullptr;
+}
+
 // P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
 // Used for witness commitment: SHA256d(wtxid_merkle_root || P2POOL_WITNESS_NONCE)
 static const unsigned char P2POOL_WITNESS_NONCE[32] = {

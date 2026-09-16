@@ -638,26 +638,47 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
 // thread (the verify-pool worker posts here), the same discipline m_ban_list
 // follows. Whitelisted peers are exempt (parity with is_banned's bypass): a
 // permanent dial target must never be disconnected by scoring. Only a SUSTAINED
-// flood that outruns the score's time-decay reaches BAN_THRESHOLD, at which
-// point we reuse the EXISTING ban-list + duration + close_connection path.
+// flood that outruns the score's time-decay reaches BAN_THRESHOLD.
+//
+// KEYED BY IP, BANNED BY IP: the score is accumulated per source IP (not
+// IP:ephemeral-port) so a flooder cannot reset it by redialing from a new port,
+// and the ban is written to m_ip_ban_list (IP-only) so is_banned() rejects the
+// reconnect regardless of its new source port. (The pre-existing run_think
+// auto-ban path, which bans specific IP:port peers, is left unchanged.) A
+// residual evasion via IPv6 /64 source rotation remains — shared with that
+// existing auto-ban and out of scope here — but prune() keeps the scorer map
+// bounded even under identity cycling, so it is not a memory-DoS vector.
 void NodeImpl::note_invalid_pow_share(NetService addr)
 {
     if (is_whitelisted(addr))
         return;
+    const std::string ip = addr.address();   // IP only — survives a reconnect
     const double now_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (!m_pow_misbehavior.note_invalid_pow(addr, now_s))
+    if (!m_pow_misbehavior.note_invalid_pow(ip, now_s))
         return;   // still below threshold — no action; the score keeps decaying
-    LOG_WARNING << "[MISBEHAVIOR] peer " << addr.to_string()
+    LOG_WARNING << "[MISBEHAVIOR] peer IP " << ip
                 << " crossed the invalid-PoW misbehavior threshold ("
-                << ltc::PeerMisbehaviorScorer<NetService>::BAN_THRESHOLD
+                << ltc::PeerMisbehaviorScorer<std::string>::BAN_THRESHOLD
                 << " invalid-PoW shares within a "
-                << ltc::PeerMisbehaviorScorer<NetService>::HALFLIFE_SECONDS
-                << "s half-life) — banning for " << m_ban_duration.count()
+                << ltc::PeerMisbehaviorScorer<std::string>::HALFLIFE_SECONDS
+                << "s half-life) — IP-banning for " << m_ban_duration.count()
                 << "s and disconnecting";
-    m_ban_list[addr] = std::chrono::steady_clock::now() + m_ban_duration;
-    m_pow_misbehavior.clear(addr);
+    m_ip_ban_list[ip] = std::chrono::steady_clock::now() + m_ban_duration;
+    m_pow_misbehavior.clear(ip);
     close_connection(addr);
+}
+
+// #1601: drop scorer entries that have decayed to ~0 so the map cannot grow one
+// permanent entry per distinct offending IP (identity-cycling memory DoS). Runs
+// on the io thread each think cycle, alongside the other periodic prunes, and
+// MUST use the same steady_clock timebase as note_invalid_pow_share() so the
+// decay math is consistent (std::time() would be a different epoch).
+void NodeImpl::prune_pow_misbehavior()
+{
+    const double now_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    m_pow_misbehavior.prune(now_s);
 }
 
 bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
@@ -724,28 +745,24 @@ bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                             obj->m_pow_hash = g_last_pow_hash;
                         });
                     }
-                    catch (const SharePoWTargetMiss&)
+                    catch (const std::exception& ex)
                     {
-                        // #1601: GENUINE cryptographic PoW failure — the share's
-                        // hash does not meet its own claimed target. This is the
-                        // only failure that scores the peer. Leave hash null (as
-                        // before) so phase 2 still skips the share, and marshal
-                        // the misbehavior note to the io thread (m_pow_misbehavior
-                        // and m_ban_list are io-thread-only), skipping the
-                        // db-load pseudo-peer (port 0) which is never a network
-                        // peer. Stale/duplicate/orphan/losing shares do NOT throw
-                        // this type, so they are never counted here.
-                        if (addr.port() != 0)
+                        // Verify failure: leave hash null (phase 2 skips this
+                        // share), exactly as before. #1601: score the sending
+                        // peer ONLY when this is a genuine cryptographic PoW
+                        // target miss, as classified by the single shared
+                        // predicate ltc::is_scorable_invalid_pow() (which the
+                        // classification KAT pins). Structural rejects (bad
+                        // coinbase, over-long merkle, zero/too-easy target) and
+                        // every honest later drop (stale/duplicate/orphan/losing,
+                        // which never throw here at all) are NOT scored. Marshal
+                        // the note to the io thread (m_pow_misbehavior/ban lists
+                        // are io-thread-only); skip the db-load pseudo-peer
+                        // (port 0), which is never a network peer.
+                        if (addr.port() != 0 && ltc::is_scorable_invalid_pow(ex))
                             boost::asio::post(*m_context, [this, addr]() {
                                 note_invalid_pow_share(addr);
                             });
-                    }
-                    catch (const std::exception&)
-                    {
-                        // Structural/other verify failure (bad coinbase size,
-                        // over-long merkle, zero/too-easy target): leave hash
-                        // null — phase 2 will skip this share. NOT scored:
-                        // #1601 counts only genuine PoW-target misses.
                     }
                 }
                 // When all verifications are done, schedule phase 2 on io_context
@@ -2536,6 +2553,9 @@ void NodeImpl::run_think()
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.prune(static_cast<double>(std::time(nullptr)));
             }
+            // #1601: drop invalid-PoW scorer entries that have decayed to ~0, so
+            // the misbehavior map stays bounded even under identity cycling.
+            prune_pow_misbehavior();
             // Keep the peer-key snapshot fresh for clean_tracker's parent_abandoned.
             refresh_peer_keys_snapshot();
 

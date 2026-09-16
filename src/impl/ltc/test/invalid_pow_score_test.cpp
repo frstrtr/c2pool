@@ -24,6 +24,7 @@
 #include <string>
 
 #include <impl/ltc/misbehavior.hpp>
+#include <impl/ltc/share_check.hpp>   // is_scorable_invalid_pow, SharePoWTargetMiss
 
 namespace {
 
@@ -127,6 +128,51 @@ TEST(LtcInvalidPowScore, PeersAreScoredIndependentlyAndClearResets)
     s.clear("A");
     EXPECT_EQ(s.score("A", 0.0), 0.0);
     EXPECT_FALSE(s.note_invalid_pow("A", 0.0));
+}
+
+
+// ── 8. CATCH-SITE CLASSIFICATION — only a genuine PoW-target miss scores ─────
+// Pins the SAME predicate the production ingest catch uses
+// (ltc::is_scorable_invalid_pow): a SharePoWTargetMiss scores the peer, a
+// structural std::invalid_argument (and any other std::exception) does NOT. A
+// regression that broadened the rule — e.g. scoring every std::exception — would
+// flip these expectations and fail here.
+TEST(LtcInvalidPowScore, OnlyGenuinePowTargetMissIsClassifiedScorable)
+{
+    // The dedicated type IS-A std::invalid_argument (so pre-existing broad
+    // `catch (std::invalid_argument&)` / `catch (std::exception&)` verify-failure
+    // handlers keep treating it as a failure) yet is distinguishable from a plain
+    // structural reject.
+    const ltc::SharePoWTargetMiss pow_miss("share PoW hash does not meet target");
+    EXPECT_TRUE(dynamic_cast<const std::invalid_argument*>(&pow_miss) != nullptr);
+
+    EXPECT_TRUE(ltc::is_scorable_invalid_pow(pow_miss));
+
+    const std::invalid_argument structural("bad coinbase size");
+    EXPECT_FALSE(ltc::is_scorable_invalid_pow(structural));   // structural -> not scored
+    const std::runtime_error other("some other failure");
+    EXPECT_FALSE(ltc::is_scorable_invalid_pow(other));        // anything else -> not scored
+
+    // Drive the exact production dispatch (throw -> catch(std::exception&) ->
+    // predicate gate -> note) and assert only the PoW miss moves the score.
+    Scorer s;
+    // Generic on the CONCRETE type so `throw thrown` re-throws the real derived
+    // exception (no slicing to std::exception), faithfully reproducing the
+    // production path: a share_init_verify throw travels through
+    // catch (const std::exception&) and is then gated by the predicate.
+    Scorer* sp = &s;
+    auto feed = [sp](auto&& thrown, const std::string& ip) {
+        try { throw thrown; }
+        catch (const std::exception& e) {
+            if (ltc::is_scorable_invalid_pow(e)) sp->note_invalid_pow(ip, 0.0);
+        }
+    };
+    feed(structural, "peerX");
+    feed(other,      "peerX");
+    EXPECT_EQ(s.score("peerX", 0.0), 0.0);           // structural/other never scored
+    EXPECT_EQ(s.tracked_peers(), 0u);
+    feed(pow_miss, "peerX");
+    EXPECT_GT(s.score("peerX", 0.0), 0.0);           // the PoW miss did score
 }
 
 }  // namespace
