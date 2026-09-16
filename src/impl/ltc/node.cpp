@@ -518,6 +518,12 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
             const auto& batch = *m_pending_adds[b].data;
             const std::size_t items = batch.m_items.size();
             std::size_t batch_bytes = 0;   // bytes freed so far WITHIN this batch
+            // This inner walk is bounded by TOTAL inflight shares
+            // (<= MAX_INFLIGHT_SHARES = 8192): every queued share holds a
+            // reservation, so all deferred batches together hold at most that
+            // many. The scan is therefore O(shares scanned), not O(n^2), even as
+            // it crosses batch boundaries — MAX_ADMIT_EVICTIONS bounds the batch
+            // count, this bounds the shares.
             for (std::size_t i = 0; i < items; ++i)
             {
                 // Per-share admission byte-cost, computed exactly as
