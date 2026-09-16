@@ -11,6 +11,7 @@
 #include "share_fetch_failover.hpp"  // v36-0.24 convergence: parent-fetch failover memory (#25C)
 #include "desired_request_pacer.hpp"   // futility backoff for the desired-request drain
 #include "ingest_budget.hpp"            // inbound-share admission bounds + ancestor-walk depth bound
+#include "misbehavior.hpp"              // #1601 per-peer invalid-PoW misbehavior scoring
 #include <pool/share_download.hpp>     // shared downloader helpers (build_stops)
 
 #include <core/coin_params.hpp>
@@ -560,6 +561,15 @@ public:
     /// why the budget on its own starves the newest, tip-extending batches.
     bool admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, const NetService& addr);
     bool processing_shares(HandleSharesData& data, NetService addr);
+
+    // ── #1601 invalid-PoW peer misbehavior scoring ───────────────────────
+    // Decaying per-peer score charged ONLY for genuine cryptographic PoW
+    // failures (SharePoWTargetMiss from share_init_verify). io-thread only, same
+    // discipline as m_ban_list. When a peer crosses the threshold this reuses
+    // the EXISTING m_ban_list + m_ban_duration + close_connection machinery.
+    ltc::PeerMisbehaviorScorer<NetService> m_pow_misbehavior;
+    // Charge one invalid-PoW share against `addr`; ban+disconnect past threshold.
+    void note_invalid_pow_share(NetService addr);
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     /// Direct tracker access — compute-thread-only (already holds exclusive lock)
     /// or startup code (before compute thread exists).
@@ -1167,7 +1177,8 @@ struct HandleSharesData
           m_txs(std::move(o.m_txs)),
           m_budget(o.m_budget),
           m_admitted_shares(o.m_admitted_shares),
-          m_admitted_bytes(o.m_admitted_bytes)
+          m_admitted_bytes(o.m_admitted_bytes),
+          m_peer_key(std::move(o.m_peer_key))
     {
         o.m_items.clear();
         o.detach_budget();
@@ -1185,6 +1196,7 @@ struct HandleSharesData
             m_budget          = o.m_budget;
             m_admitted_shares = o.m_admitted_shares;
             m_admitted_bytes  = o.m_admitted_bytes;
+            m_peer_key        = std::move(o.m_peer_key);
             o.m_items.clear();
             o.detach_budget();
         }
@@ -1241,17 +1253,20 @@ struct HandleSharesData
         // negative even if the caller's byte figure disagrees with the stored one.
         const std::size_t give_shares = (k < m_admitted_shares) ? k : m_admitted_shares;
         const std::size_t give_bytes  = (bytes < m_admitted_bytes) ? bytes : m_admitted_bytes;
-        if (m_budget) m_budget->release(give_shares, give_bytes);
+        if (m_budget) m_budget->release_for_peer(give_shares, give_bytes, m_peer_key);
         m_admitted_shares -= give_shares;
         m_admitted_bytes  -= give_bytes;
     }
 
     /// Record the ingest reservation this batch holds; released by ~this.
-    void attach_budget(IngestBudget* budget, std::size_t shares, std::size_t bytes)
+    /// `peer_key` (#1600) is the source peer's per-peer accounting key.
+    void attach_budget(IngestBudget* budget, std::size_t shares, std::size_t bytes,
+                       std::string peer_key = std::string())
     {
         m_budget = budget;
         m_admitted_shares = shares;
         m_admitted_bytes = bytes;
+        m_peer_key = std::move(peer_key);
     }
 
     std::size_t admitted_shares() const { return m_admitted_shares; }
@@ -1261,6 +1276,9 @@ private:
     IngestBudget* m_budget{nullptr};
     std::size_t   m_admitted_shares{0};
     std::size_t   m_admitted_bytes{0};
+    // #1600: source-peer key (NetService::to_string) so release()/evict return
+    // this batch's reservation to the SAME peer's per-peer counters it charged.
+    std::string   m_peer_key;
 
     void free_owned()
     {
@@ -1269,7 +1287,7 @@ private:
     }
     void release_budget()
     {
-        if (m_budget) m_budget->release(m_admitted_shares, m_admitted_bytes);
+        if (m_budget) m_budget->release_for_peer(m_admitted_shares, m_admitted_bytes, m_peer_key);
         detach_budget();
     }
     void detach_budget()
@@ -1277,6 +1295,7 @@ private:
         m_budget = nullptr;
         m_admitted_shares = 0;
         m_admitted_bytes = 0;
+        m_peer_key.clear();
     }
 };
 

@@ -32,6 +32,20 @@
 namespace ltc
 {
 
+// Thrown by share_init_verify() ONLY when a share's proof-of-work hash does not
+// meet its own claimed target -- i.e. a genuine CRYPTOGRAPHIC PoW failure, as
+// distinct from every structural reject (bad coinbase size, over-long merkle
+// branch, zero/too-easy target) which throws a plain std::invalid_argument.
+// The ingest path (issue #1601) catches THIS type specifically to score the
+// sending peer for invalid-PoW misbehaviour, and lets all other failures pass
+// unscored so honest stale/duplicate/orphan/losing shares are never penalised.
+// Derives from std::invalid_argument so existing catch(std::exception&) /
+// catch(std::invalid_argument&) sites keep treating it as a verify failure.
+struct SharePoWTargetMiss : std::invalid_argument
+{
+    using std::invalid_argument::invalid_argument;
+};
+
 // P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
 // Used for witness commitment: SHA256d(wtxid_merkle_root || P2POOL_WITNESS_NONCE)
 static const unsigned char P2POOL_WITNESS_NONCE[32] = {
@@ -746,7 +760,7 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
             LOG_TRACE << "PoW below share target: bits=" << share.m_bits
                       << " target=" << target.GetHex().substr(0,32)
                       << " pow_hash=" << pow_hash.GetHex().substr(0,32);
-            throw std::invalid_argument("share PoW hash does not meet target");
+            throw SharePoWTargetMiss("share PoW hash does not meet target");
         }
 
         // Block detection: check if share's scrypt hash also meets the BLOCK target.
