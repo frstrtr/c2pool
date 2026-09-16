@@ -104,6 +104,70 @@
 // identical leaf itself, never insert a peer's peak. The owed-event MMR is a
 // separate, un-nodded track; v0x02 converges the EXISTING flat owed_digest.
 //
+// ── ★★ CARRIER-WIRE v0x03: THE SECTIONED TRAILER (2026-09-13) ───────────────
+//
+// WHY A THIRD VERSION AT ALL. v0x02 shipped with an explicit hole: "the payout
+// map is NOT on this wire (it is an unbounded map)". Two independent consumers
+// then discovered that the SAME hole is the only thing standing between them and
+// cross-node convergence, for two DIFFERENT maps:
+//   * the DROPS credit map (c2pool#1627) — a raindrop is a node-local
+//     observation, so a peer cannot recompute what the winner credited;
+//   * the K_fair owed-DEDUCTION map (c2pool#1625, this branch) — a peer CAN in
+//     principle recompute it (propose_coinbase is deterministic), but only from
+//     the EXACT ledger state the winner held at template build, and the two-clock
+//     daemon loop cannot guarantee that instant. The recompute converged for a
+//     handful of settling blocks on a 2-node regtest and then forked terminally.
+// Both are answered the same way: THE WINNER'S VIEW IS AUTHORITATIVE, carried on
+// the wire, folded verbatim by the peer, with no same-instant requirement at all.
+//
+// THE LAYOUT. v0x03 is the v0x02 frame VERBATIM plus a SECTIONED trailer: a
+// fixed-order list of optional sections, each introduced by its own present
+// byte, appended AFTER the v0x02 cut descriptor. Every v0x01 and v0x02 offset
+// therefore stays valid over the v0x03 prefix, exactly as v0x02 kept v0x01's.
+//
+//   frame_v3 := u8      version (= 0x03)
+//               event   carrier                      (v0x01 event, unchanged)
+//               u8      receipt_count                (unchanged)
+//               event   receipt[receipt_count]       (unchanged)
+//               cutdesc trailer                      (v0x02 trailer, unchanged)
+//               drops   section 1                    (c2pool#1627 credit map)
+//               payout  section 2                    (this branch, K_fair)
+//   drops    := u8 present ; if 1:
+//                 u16 count                  (<= W3_DROPS_MAX_ENTRIES)
+//                 count x { b32 payee ; i64 credit }   STRICTLY ASCENDING payee
+//                 b32 enrollment_digest
+//   payout   := u8 present ; if 1:
+//                 u16 count                  (<= W3_PAYOUT_MAX_ENTRIES)
+//                 count x { b32 identity ; u64 amount } STRICTLY ASCENDING identity
+//
+// ★ WIRE-INTEGRATION POINT (the two DRAFTs reconcile HERE). c2pool#1627 defined
+// v0x03 as the v0x02 frame plus the DROPS trailer ALONE, positionally, with no
+// section after it. This branch keeps that section BYTE-FOR-BYTE in position 1
+// (its codec below is #1627's, unchanged) and appends the K_fair payout section
+// after it. The merged layout is therefore the union above, and the ONLY work at
+// merge is re-pinning #1627's v0x03 goldens, which each gain exactly ONE trailing
+// zero byte (the absent payout section). No field moves, no field widens, no
+// section is re-ordered, and v0x01/v0x02 are untouched by either branch. Until
+// that merge, a #1627 build and a #1625 build are each other's REJECT_TRUNCATED
+// — loudly, which is the correct flag-day behaviour and never a silent half-read.
+//
+// WHY SECTIONS AND NOT A TLV. Each section is optional and self-delimiting from
+// its own present byte, and the order is fixed, so a decoder that knows both
+// sections needs no length prefix to find the end of either. A TLV (tag + length
+// + skip-unknown) buys forward compatibility for a decoder meeting a section it
+// has never heard of — but settlement data is exactly the thing a node must NOT
+// skip: silently ignoring a credit or a deduction it cannot parse is the fork.
+// So an unknown shape stays a whole-frame rejection at a VISIBLE version bump,
+// and the extra tag/length bytes buy nothing. If the operator later wants
+// skip-unknown semantics, that is a v0x04 with its own goldens.
+//
+// WHY THE PAYOUT MAP IS BOUNDED HERE AND WAS "UNBOUNDED" IN v0x02. The v0x02
+// banner called the payout map unbounded because a ledger may owe any number of
+// keys. What rides this wire is not the ledger: it is ONE BLOCK'S COINBASE
+// outputs, which K_fair already caps at the template's output budget. The wire
+// cap (W3_PAYOUT_MAX_ENTRIES) is the belt to that braces: a frame claiming more
+// rows than any coinbase could carry is rejected whole, never truncated.
+//
 // ── the v36 transport this layer REUSES (cite, never reinvent) ──────────────
 // W3 adds ZERO new transport. A carrier is an extended share body, not a new
 // message type; it rides the existing shares/sharereq/sharereply verbs and the
@@ -144,12 +208,30 @@ namespace c2pool::v37n {
 // bump: the v0x01 body VERBATIM plus the flat cut-descriptor trailer. A wire
 // change is always a visible bump of this tag, never a silent re-pack.
 constexpr std::uint8_t W3_WIRE_VERSION_V1 = 0x01;   // frozen; bytes never move
-constexpr std::uint8_t W3_WIRE_VERSION_V2 = 0x02;   // frozen; v1 body + trailer
+constexpr std::uint8_t W3_WIRE_VERSION_V2 = 0x02;   // frozen; v1 body + cut trailer
+constexpr std::uint8_t W3_WIRE_VERSION_V3 = 0x03;   // frozen; v2 frame + sectioned trailer
 
-// The version this build EMITS. Decode dual-accepts {V1, V2} for the upgrade
-// window (F-5); a v0x01-only peer rejects a v0x02 frame outright at decode —
+// The version this build EMITS. Decode multi-accepts {V1, V2, V3} for the
+// upgrade window (F-5); an older peer rejects a newer frame outright at decode —
 // the flag day is LOUD, never a silently half-relayed descriptor.
-constexpr std::uint8_t W3_WIRE_VERSION = W3_WIRE_VERSION_V2;
+constexpr std::uint8_t W3_WIRE_VERSION = W3_WIRE_VERSION_V3;
+
+// ★★ v0x03 section 1 (c2pool#1627 DROPS-R3): the bound on the composed credit
+// map a winner may carry. The map is the ONE part of a DROPS settlement a
+// receiver cannot recompute (a raindrop is a node-local observation the peer
+// never saw), so it has to ride the wire — and anything that rides an un-PoW'd
+// frame needs a ceiling. 4096 payees at 40 bytes each is 160 KiB, comfortably
+// inside the 1 MiB transport frame and far above any plausible payee count at
+// one cut. A frame claiming more is rejected whole; it is never truncated (a
+// truncated credit map is a silent fork).
+constexpr std::uint16_t W3_DROPS_MAX_ENTRIES = 4096;
+
+// ★★ v0x03 section 2 (this branch): the bound on the K_fair owed-DEDUCTION map.
+// This is one block's coinbase owed-role outputs, which K_fair has already
+// capped at the template's output budget, so the wire cap is a second fence
+// rather than the first one. Same shape and same reason as the DROPS cap: 4096
+// rows at 40 bytes is 160 KiB, and a frame claiming more is rejected WHOLE.
+constexpr std::uint16_t W3_PAYOUT_MAX_ENTRIES = 4096;
 
 // R_MAX is the W2-layer consensus bound (share-format §7); W3 enforces it at
 // DECODE, before any push (spec §2.3 / WT-1). Named through W2 so there is one
@@ -203,6 +285,71 @@ inline std::optional<bytes32> cut_bid_bytes(const std::string& hex) {
     return b;
 }
 
+// ── ★★ v0x03 section 1 (c2pool#1627 DROPS-R3): the winner's COMPOSED CREDIT MAP
+//
+// Carried here VERBATIM from c2pool#1627 so the two v0x03 sections coexist in one
+// layout (see the WIRE-INTEGRATION POINT in this file's banner). A raindrop is a
+// below-target work event one node happened to see on its own wire: two nodes
+// observe DIFFERENT raindrop sets by construction, so recompute is not available
+// to a peer the way it is for a canonical coinbase, and the WINNER'S composed
+// delta is authoritative. `enrollment_digest` is the R-SYBIL witness: the
+// winner's ex-ante enrolment book digest at the cut, diagnostic only, so that a
+// divergent enrolment set is VISIBLE at the first block rather than inferable
+// from a bad number later.
+//
+// THIS BRANCH NEVER POPULATES IT. c2pool#1625 has no DROPS ledger leg, so it
+// always encodes the section ABSENT (one zero byte) and FAIL-CLOSES on an
+// inbound frame that sets it — see xmr_o2_finalize_connect.hpp. Carrying the
+// type and its codec is what makes the two drafts a byte-level union at merge
+// instead of a re-pack.
+struct DropsCredit {
+    // (payee, composed delta). STRICTLY ASCENDING by payee on the wire, so the
+    // encoding of a given map is unique and a duplicate key is a decode reject
+    // rather than an ambiguous fold.
+    std::vector<std::pair<bytes32, long long>> credit;
+    bytes32 enrollment_digest{};      // winner's EnrollmentBook::book_digest()
+    bool operator==(const DropsCredit&) const = default;
+};
+
+// ── ★★ v0x03 section 2 (c2pool#1625): the winner's K_fair OWED-DEDUCTION MAP ──
+//
+// THE DEFECT IT CLOSES. Under option B the winner's coinbase PAYS owed balances
+// directly, so at FINALIZE it does finalW -= payout. v0x02 carried no payout, so
+// a peer credited E_b and deducted nothing: from the first SETTLING block the
+// two ledgers forked. The first answer was RECOMPUTE — K_fair is
+// OwedLedger::propose_coinbase, deterministic over ledger state, and the peer
+// runs it for its own template at the same height. It converged byte-equal for
+// ~4 settling blocks on a 2-node regtest and then forked terminally on the first
+// state skew, with no recovery: the two nodes' template clocks are independent
+// and nothing makes them sample the ledger at the same instant.
+//
+// THE RULING. Carry the map instead. The winner already knows
+// {owed-identity -> amount its coinbase paid that identity} from its OWN K_fair
+// run (the Owed-role outputs of the template it mined; Fixed and residual-Sink
+// outputs are NOT ledger keys and are excluded at the source). It puts that map
+// here, and the peer FOLDS IT — no recompute, no template build to compare
+// against, no same-instant requirement. The two-clock dependency is gone.
+//
+// WHAT IS AND IS NOT PINNED, said out loud. This is the winner's assertion about
+// its own coinbase, and a peer cannot verify it against the chain from this frame
+// alone (that would need the coinbase outputs and the identity->address
+// resolution). What the receiver CAN enforce, and does, is fail-closed shape:
+// bounded rows, strictly ascending keys, every amount strictly positive, and
+// Σ amount <= the reward the SAME descriptor carries (w3_wire_freeze.hpp
+// encodable() / the decode path below). A winner that lies about its map
+// mis-states its own entitlement and is caught by the audit that already diffs
+// owed_digest per cursor; a winner that lies BEYOND the reward cannot get the
+// frame decoded at all. Verifying the map against the on-chain coinbase is the
+// named next fence and is deliberately NOT invented here.
+struct KfairPayout {
+    // (owed identity, piconero this block's coinbase paid it). STRICTLY
+    // ASCENDING by identity on the wire — same reason as the DROPS map: the
+    // encoding of a given map is unique, and a duplicate key is a decode reject
+    // rather than a fold that depends on decode order.
+    std::vector<std::pair<bytes32, std::uint64_t>> pay;
+    bool operator==(const KfairPayout&) const = default;
+};
+
 // ── a carrier = ordinary share + 0..R_MAX receipts (spec §2.1) ──────────────
 struct Carrier {
     WorkEvent carrier;                 // the ordinary V37 share (advances clock)
@@ -212,6 +359,15 @@ struct Carrier {
     // decodes to nullopt — the two are indistinguishable to every consumer
     // above the codec, which is exactly the upgrade-window property we want.
     std::optional<CutDescriptor> cut;
+    // v0x03 section 1 (c2pool#1627). Only ever set together with `cut`; a credit
+    // map without a cut names no settlement and decode rejects that shape.
+    std::optional<DropsCredit> drops;
+    // v0x03 section 2 (c2pool#1625). Same rule: only ever set together with
+    // `cut`. A v0x01/v0x02 frame decodes both to nullopt, and so does a v0x03
+    // frame whose section present bytes are 0 — again indistinguishable above
+    // the codec, so a fleet with nothing to say pays exactly two extra bytes per
+    // frame and changes nothing else.
+    std::optional<KfairPayout> payout;
 };
 
 // ── decode dispositions ─────────────────────────────────────────────────────
@@ -228,6 +384,18 @@ enum class WireStatus {
                               // payout_emitted byte outside {0,1} — a malformed
                               // trailer is NEVER admitted (it would otherwise
                               // credit a peer's ledger off a guessed cut)
+    REJECT_BAD_DROPS,         // v0x03 section 1 (c2pool#1627): present byte outside
+                              // {0,1}, an entry count above W3_DROPS_MAX_ENTRIES,
+                              // payees not strictly ascending, or a credit map
+                              // carried with NO cut descriptor
+    REJECT_BAD_PAYOUT,        // v0x03 section 2 (c2pool#1625): present byte outside
+                              // {0,1}, an entry count above W3_PAYOUT_MAX_ENTRIES,
+                              // identities not strictly ascending, a zero amount,
+                              // Σ amount ABOVE the reward the same descriptor
+                              // carries (out-of-budget), or a payout map carried
+                              // with NO cut descriptor. Same rule as the cut and
+                              // the credit map: reject the frame WHOLE, never
+                              // fold a partially-read deduction
 };
 
 // Why a single receipt was dropped at decode (carrier still stands, §2.4/WT-2).
@@ -267,8 +435,26 @@ public:
     // silent drop would lose a peer's block credit), returns an EMPTY vector.
     static std::vector<std::uint8_t> encode_version(const Carrier& c, std::uint8_t ver) {
         std::vector<std::uint8_t> b;
-        if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2) return b;
+        if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2 &&
+            ver != W3_WIRE_VERSION_V3) return b;
         if (ver == W3_WIRE_VERSION_V1 && c.cut.has_value()) return b;
+        // A version below v0x03 cannot express either section. Silently dropping
+        // one would relay a block-winner descriptor whose settlement the receiver
+        // then has to invent — the exact divergence v0x03 removes — so the
+        // encoder REFUSES instead of emitting a lossy frame.
+        if (ver != W3_WIRE_VERSION_V3 && (c.drops.has_value() || c.payout.has_value()))
+            return b;
+        // A section with no cut names no settlement; refuse to encode it.
+        if ((c.drops.has_value() || c.payout.has_value()) && !c.cut.has_value()) return b;
+        if (c.drops.has_value() &&
+            c.drops->credit.size() > static_cast<std::size_t>(W3_DROPS_MAX_ENTRIES))
+            return b;
+        // A payout map whose own descriptor says the coinbase emitted NOTHING is
+        // self-contradictory: the receiver would deduct what the winner just told
+        // it was never paid. Refuse the shape rather than pick a winner between
+        // the two statements.
+        if (c.payout.has_value() && !c.cut->payout_emitted) return b;
+        if (c.payout.has_value() && !payout_encodable(*c.payout, c.cut->reward)) return b;
         b.push_back(ver);
         put_event(b, c.carrier);
         // receipt_count is a single byte; R_MAX=4 fits trivially. Encoders never
@@ -276,8 +462,34 @@ public:
         // rejects the whole carrier (§2.3, WT-1).
         b.push_back(static_cast<std::uint8_t>(c.receipts.size()));
         for (const WorkEvent& r : c.receipts) put_event(b, r);
-        if (ver == W3_WIRE_VERSION_V2) put_cutdesc(b, c.cut);
+        if (ver == W3_WIRE_VERSION_V2 || ver == W3_WIRE_VERSION_V3) put_cutdesc(b, c.cut);
+        if (ver == W3_WIRE_VERSION_V3) { put_drops(b, c.drops); put_payout(b, c.payout); }
         return b;
+    }
+
+    // The v0x03 payout section's SHAPE rule, isolated so the encoder, the decoder
+    // and the freeze's encodable() all ask exactly one question. `reward` is the
+    // budget the SAME cut descriptor carries.
+    //   * bounded rows              — a frame cannot claim more than any coinbase
+    //                                 could carry;
+    //   * strictly ascending keys   — one encoding per map, no ambiguous fold;
+    //   * every amount > 0          — a zero row is a no-op the ledger drops, so
+    //                                 it would make two encodings of one map;
+    //   * Σ amount <= reward        — a block cannot pay out more than it minted.
+    static bool payout_encodable(const KfairPayout& p, std::uint64_t reward) {
+        if (p.pay.size() > static_cast<std::size_t>(W3_PAYOUT_MAX_ENTRIES)) return false;
+        std::uint64_t sum = 0;
+        for (std::size_t i = 0; i < p.pay.size(); ++i) {
+            const std::uint64_t amt = p.pay[i].second;
+            if (amt == 0) return false;
+            if (i > 0 && !(p.pay[i - 1].first < p.pay[i].first)) return false;
+            // Budget, in the one order that cannot overflow: `amt` is compared to
+            // the budget first, so `reward - amt` below never wraps.
+            if (amt > reward) return false;
+            if (sum > reward - amt) return false;
+            sum += amt;
+        }
+        return true;
     }
 
     // Decode + enforce the two decode-time consensus/anti-forgery rules:
@@ -295,8 +507,9 @@ public:
         std::size_t p = 0;
         std::uint8_t ver = 0;
         if (!get_u8(b, p, ver)) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
-        // F-5 dual-accept for the S-1c upgrade window: {0x01, 0x02}.
-        if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2) {
+        // F-5 multi-accept for the upgrade window: {0x01, 0x02, 0x03}.
+        if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2 &&
+            ver != W3_WIRE_VERSION_V3) {
             out.status = WireStatus::REJECT_BAD_VERSION;
             return out;
         }
@@ -320,9 +533,30 @@ public:
         // the winner's cut, so a frame whose cut cannot be read is never admitted
         // (never "admit the share and drop the cut" — that is the divergence).
         std::optional<CutDescriptor> cut;
-        if (ver == W3_WIRE_VERSION_V2) {
+        if (ver == W3_WIRE_VERSION_V2 || ver == W3_WIRE_VERSION_V3) {
             const WireStatus cs = get_cutdesc(b, p, cut);
             if (cs != WireStatus::OK) { out.status = cs; return out; }
+        }
+        // (1c) v0x03 SECTIONED trailer, in its frozen order. Same hard-reject
+        // rule as the cut for both sections: the whole point of each map is that
+        // a receiver moves its ledger by the WINNER'S numbers, so a frame whose
+        // section cannot be read is never admitted, and a section with no cut to
+        // attach to is malformed.
+        std::optional<DropsCredit> drops;
+        std::optional<KfairPayout> payout;
+        if (ver == W3_WIRE_VERSION_V3) {
+            const WireStatus ds = get_drops(b, p, drops);
+            if (ds != WireStatus::OK) { out.status = ds; return out; }
+            if (drops.has_value() && !cut.has_value()) {
+                out.status = WireStatus::REJECT_BAD_DROPS;
+                return out;
+            }
+            const WireStatus ps = get_payout(b, p, cut ? cut->reward : 0, payout);
+            if (ps != WireStatus::OK) { out.status = ps; return out; }
+            if (payout.has_value() && (!cut.has_value() || !cut->payout_emitted)) {
+                out.status = WireStatus::REJECT_BAD_PAYOUT;
+                return out;
+            }
         }
         // Trailing bytes are a malformed frame (we consumed a fixed structure).
         if (p != b.size()) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
@@ -335,6 +569,8 @@ public:
         // (2b) per-receipt identity binding — drop the offender, carrier stands.
         out.carrier.carrier = std::move(carrier);
         out.carrier.cut = std::move(cut);
+        out.carrier.drops = std::move(drops);
+        out.carrier.payout = std::move(payout);
         for (WorkEvent& r : receipts) {
             if (!identity_bound(r)) {
                 out.dropped.emplace_back(r.tag, ReceiptWireDrop::MISBOUND_IDENTITY);
@@ -429,6 +665,97 @@ private:
         if (!get_bytes32(b, p, c.owed_digest_at_win)) return WireStatus::REJECT_TRUNCATED;
         c.payout_emitted = (pe == 1);
         out = c;
+        return WireStatus::OK;
+    }
+
+    // ── v0x03 section 1 codec (c2pool#1627 DROPS-R3; carried VERBATIM) ──────
+    //   u8   present                     (0 => ONE byte and nothing else)
+    //   u16  entry_count                 (<= W3_DROPS_MAX_ENTRIES)
+    //   entry_count x { bytes32 payee ; u64 credit (two's-complement i64, LE) }
+    //   bytes32 enrollment_digest
+    static void put_drops(std::vector<std::uint8_t>& b,
+                          const std::optional<DropsCredit>& d) {
+        if (!d) { put_u8(b, 0); return; }           // absent: ONE byte
+        put_u8(b, 1);
+        put_u16(b, static_cast<std::uint16_t>(d->credit.size()));
+        for (const auto& [payee, amt] : d->credit) {
+            put_bytes32(b, payee);
+            put_u64(b, static_cast<std::uint64_t>(amt));   // two's complement
+        }
+        put_bytes32(b, d->enrollment_digest);
+    }
+    static WireStatus get_drops(const std::vector<std::uint8_t>& b, std::size_t& p,
+                                std::optional<DropsCredit>& out) {
+        std::uint8_t present = 0;
+        if (!get_u8(b, p, present)) return WireStatus::REJECT_TRUNCATED;
+        if (present == 0) { out.reset(); return WireStatus::OK; }
+        if (present != 1) return WireStatus::REJECT_BAD_DROPS;   // not a boolean
+        std::uint16_t n = 0;
+        if (!get_u16(b, p, n)) return WireStatus::REJECT_TRUNCATED;
+        if (n > W3_DROPS_MAX_ENTRIES) return WireStatus::REJECT_BAD_DROPS;
+        DropsCredit d;
+        d.credit.reserve(n);
+        bytes32 prev{};
+        for (std::uint16_t i = 0; i < n; ++i) {
+            bytes32 payee{};
+            std::uint64_t bits = 0;
+            if (!get_bytes32(b, p, payee)) return WireStatus::REJECT_TRUNCATED;
+            if (!get_u64(b, p, bits))      return WireStatus::REJECT_TRUNCATED;
+            // STRICTLY ascending: a duplicate or unordered key would make the
+            // fold depend on decode order, which is a fork surface, not a taste.
+            if (i > 0 && !(prev < payee)) return WireStatus::REJECT_BAD_DROPS;
+            prev = payee;
+            d.credit.emplace_back(payee, static_cast<long long>(bits));
+        }
+        if (!get_bytes32(b, p, d.enrollment_digest)) return WireStatus::REJECT_TRUNCATED;
+        out = std::move(d);
+        return WireStatus::OK;
+    }
+
+    // ── ★★ v0x03 section 2 codec (c2pool#1625): the K_fair owed-deduction map ─
+    //   u8   present                     (0 => ONE byte and nothing else)
+    //   u16  entry_count                 (<= W3_PAYOUT_MAX_ENTRIES)
+    //   entry_count x { bytes32 identity ; u64 amount (piconero, LE) }
+    //
+    // `reward` is the budget the SAME frame's cut descriptor carries, and the
+    // decoder enforces Σ amount <= reward HERE rather than leaving it to the
+    // consumer: a frame that claims a block paid out more than it minted is
+    // malformed on its face, and letting it through to be refused later would
+    // mean every consumer has to remember to refuse it. 0 when there is no cut,
+    // in which case the section is a REJECT anyway (it names no settlement).
+    static void put_payout(std::vector<std::uint8_t>& b,
+                           const std::optional<KfairPayout>& k) {
+        if (!k) { put_u8(b, 0); return; }           // absent: ONE byte
+        put_u8(b, 1);
+        put_u16(b, static_cast<std::uint16_t>(k->pay.size()));
+        for (const auto& [identity, amt] : k->pay) {
+            put_bytes32(b, identity);
+            put_u64(b, amt);
+        }
+    }
+    static WireStatus get_payout(const std::vector<std::uint8_t>& b, std::size_t& p,
+                                 std::uint64_t reward, std::optional<KfairPayout>& out) {
+        std::uint8_t present = 0;
+        if (!get_u8(b, p, present)) return WireStatus::REJECT_TRUNCATED;
+        if (present == 0) { out.reset(); return WireStatus::OK; }
+        if (present != 1) return WireStatus::REJECT_BAD_PAYOUT;  // not a boolean
+        std::uint16_t n = 0;
+        if (!get_u16(b, p, n)) return WireStatus::REJECT_TRUNCATED;
+        if (n > W3_PAYOUT_MAX_ENTRIES) return WireStatus::REJECT_BAD_PAYOUT;
+        KfairPayout k;
+        k.pay.reserve(n);
+        for (std::uint16_t i = 0; i < n; ++i) {
+            bytes32 identity{};
+            std::uint64_t amt = 0;
+            if (!get_bytes32(b, p, identity)) return WireStatus::REJECT_TRUNCATED;
+            if (!get_u64(b, p, amt))          return WireStatus::REJECT_TRUNCATED;
+            k.pay.emplace_back(identity, amt);
+        }
+        // One shape rule for encode and decode alike (ordering, positivity,
+        // budget), so a frame this build would refuse to emit is also one it
+        // refuses to fold.
+        if (!payout_encodable(k, reward)) return WireStatus::REJECT_BAD_PAYOUT;
+        out = std::move(k);
         return WireStatus::OK;
     }
 
@@ -566,6 +893,7 @@ struct CarrierBloatStats {
         // the subtraction isolates the receipts and never charges a block
         // winner's 122-byte descriptor to receipt bloat.
         Carrier bare; bare.carrier = c.carrier; bare.cut = c.cut;
+        bare.drops = c.drops; bare.payout = c.payout;
         receipt_payload_bytes +=
             whole_frame.size() - CarrierWire::encode(bare).size();
     }
@@ -672,6 +1000,17 @@ public:
         // every v0x01 frame). The relay itself does nothing with it — routing
         // settlement is the daemon's job, not the relay's (§1.2, O1).
         std::optional<CutDescriptor> cut;
+        // v0x03 section 1 (c2pool#1627): the composed DROPS credit map the SAME
+        // frame carried, surfaced beside the cut for exactly the same reason.
+        std::optional<DropsCredit> drops;
+        // ★★ v0x03 section 2 (c2pool#1625): the winner's K_fair owed-DEDUCTION
+        // map. This is what the S-1c peer path FOLDS — it replaces the peer-side
+        // recompute entirely, so a settling peer block no longer depends on the
+        // two nodes sampling their ledgers at the same instant. nullopt for every
+        // share, every pre-v0x03 frame, and every winner whose coinbase settled
+        // nothing (which folds as an empty deduction and still converges,
+        // because that winner deducted nothing either).
+        std::optional<KfairPayout> payout;
     };
 
     // ── inbound (peer -> us), spec §3.2 ─────────────────────────────────────
@@ -689,6 +1028,8 @@ public:
             return o;
         }
         o.cut = dr.carrier.cut;                 // S-1c: surfaced for the daemon's settlement seam
+        o.drops = dr.carrier.drops;             // v0x03 section 1 (c2pool#1627)
+        o.payout = dr.carrier.payout;           // ★★ v0x03 section 2 (c2pool#1625)
 
         bool novel_to_relay = !m_seen.seen(dr.carrier.carrier.hash());
         m_stats.observe_received(!novel_to_relay);
@@ -717,6 +1058,8 @@ public:
         Outcome o;
         o.wire = WireStatus::OK;
         o.cut = c.cut;
+        o.drops = c.drops;
+        o.payout = c.payout;
         o.admission = m_admit(c.carrier, c.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);
         if (o.admitted) m_stats.observe_accepted(re_encode(c), c);
@@ -743,6 +1086,8 @@ public:
         Outcome o;
         o.wire = WireStatus::OK;
         o.cut = c.cut;
+        o.drops = c.drops;
+        o.payout = c.payout;
         // Unconditional append: no m_seen check, no backpressure gate.
         o.admission = m_admit(c.carrier, c.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);

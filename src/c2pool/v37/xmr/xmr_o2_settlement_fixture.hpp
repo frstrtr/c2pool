@@ -152,6 +152,13 @@ struct XmrSettlementConfig {
     // --- the mandated residual sink (REQUIRED; torsion-checked at build) ---
     ::v37::ScriptRef residual_sink;                    // XMR_STD/XMR_SUB, 64-B payload
     ::v37::bytes32   residual_sink_identity{};         // its ledger identity_key (payout-map key)
+    // Piconero withheld from the K_fair owed selection so the sink is always a
+    // REAL output. 1 is the smallest value that keeps the §13 shape gate's
+    // "exactly one sink" mandate true once owed >= budget — which is where a
+    // working pool arrives on its (D_conf + 2)nd block. 0 restores the old
+    // behaviour, deadlock included, and is therefore not the default.
+    // See XmrCoinbaseContext::sink_min for the full account.
+    std::uint64_t    sink_min = 1;
 
     // --- mandated fixed outputs (dev / donation / finder), usually empty ---
     std::vector<x6::FixedOutput> fixed;
@@ -302,6 +309,7 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.residual_sink_identity = cfg.residual_sink_identity;
     ctx.fixed                  = cfg.fixed;
     ctx.h_min                  = cfg.h_min;
+    ctx.sink_min               = cfg.sink_min;
     ctx.output_cap             = cfg.resolved_output_cap();
     if (why) why->clear();
     return ctx;
@@ -353,6 +361,78 @@ inline x6::CoinbaseInputs assembly_settle_inputs(const XmrOwedSettlementSource& 
 }
 
 // ===========================================================================
+// ★ S-1b — WHICH OWED LEDGER THE COINBASE IS BUILT FROM.
+//
+// The option-B coinbase reads TWO things off an OwedLedger: the K_fair payout
+// proposal, and owed_digest(), which is serialised into tx_extra 0x03 as the
+// merge-mining leaf. Until S-1b there was only one ledger to read — the
+// deterministic PROOF FIXTURE below — because the live XMR node credited
+// nothing (credit == payout netted every block to zero), so its owed_digest was
+// the constant empty anchor b4db1ded… and committing to it would have been
+// committing to nothing.
+//
+// With S-1b the node's REAL OwedLedger moves, so the coinbase can and should
+// commit to it. This interface is the seam: the provider is bound to whichever
+// ledger the daemon chose, and the choice is printed rather than implied. The
+// fixture stays for the demo/proof path (--owed-demo-amount) and for a node
+// with no payout identity, where there is no real ledger to speak of.
+// ===========================================================================
+class IXmrOwedSource {
+public:
+    virtual ~IXmrOwedSource() = default;
+    // The ledger the coinbase proposes over and whose owed_digest is committed.
+    virtual const OwedLedger& ledger() const = 0;
+    // identity_key -> payout ScriptRef. A key this cannot resolve must map to a
+    // ref that is never PAID and is CARRIED by W4's canon rule — never to a
+    // plausible-looking substitute.
+    virtual PayOfFn pay_of() const = 0;
+    // For the log line: which ledger is this.
+    virtual const char* owed_source_name() const = 0;
+};
+
+// ---------------------------------------------------------------------------
+// XmrLiveOwedSource — the node's REAL OwedLedger, with the pool's own payout
+// descriptor as the resolver.
+//
+// HONEST BOUNDARY. V1 credits every share to ONE pool-level identity (there is
+// no base58 address decoder in this tree), so one mapping is all that is needed
+// today. `learn()` exists because that will stop being true the moment per-miner
+// identity lands: the resolver is a map from the start rather than a special
+// case that would have to be rewritten.
+// ---------------------------------------------------------------------------
+class XmrLiveOwedSource final : public IXmrOwedSource {
+public:
+    explicit XmrLiveOwedSource(const OwedLedger& ledger) : m_ledger(ledger) {}
+
+    // Teach the resolver one identity -> payout ref mapping.
+    void learn(const ::v37::PayoutDescriptor& d) {
+        m_paymap[d.identity_key()] = d.pay;
+    }
+
+    const OwedLedger& ledger() const override { return m_ledger; }
+    PayOfFn pay_of() const override {
+        return [this](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+            auto it = m_paymap.find(k);
+            if (it != m_paymap.end()) return it->second;
+            // Unknown key: a RAW sentinel with an empty payload. W4's canon rule
+            // never PAYS it and CARRIES the balance forward deterministically,
+            // which is the fail-closed answer — the alternative would be paying
+            // real money to a guess.
+            ::v37::ScriptRef raw;
+            raw.kind = ::v37::ScriptKind::RAW;
+            raw.payload.clear();
+            return raw;
+        };
+    }
+    const char* owed_source_name() const override { return "LIVE node OwedLedger"; }
+    std::size_t known_identities() const { return m_paymap.size(); }
+
+private:
+    const OwedLedger& m_ledger;
+    std::map<::v37::bytes32, ::v37::ScriptRef> m_paymap;
+};
+
+// ===========================================================================
 // XmrOwedFixture — the deterministic proof ledger (survey item E). The X9
 // observe-side daemon has no live XMR OwedLedger yet, so the FOUND->FINALIZE
 // proof is driven from a hand-built one:
@@ -368,7 +448,7 @@ inline x6::CoinbaseInputs assembly_settle_inputs(const XmrOwedSettlementSource& 
 // It also carries the payout resolver (identity_key -> ScriptRef) the source's
 // pay_of needs. Everything is deterministic in the seeds' insertion order.
 // ===========================================================================
-class XmrOwedFixture {
+class XmrOwedFixture final : public IXmrOwedSource {
 public:
     explicit XmrOwedFixture(::v37::ChainId chain) : m_ledger(chain) {}
 
@@ -395,7 +475,7 @@ public:
 
     // The pay_of resolver bound to this fixture. A key with no learned ref maps
     // to a RAW sentinel — never paid, CARRIED by W4's canon rule (deterministic).
-    PayOfFn pay_of() const {
+    PayOfFn pay_of() const override {
         return [this](const ::v37::bytes32& k) -> ::v37::ScriptRef {
             auto it = m_paymap.find(k);
             if (it != m_paymap.end()) return it->second;
@@ -404,8 +484,9 @@ public:
         };
     }
 
-    const OwedLedger& ledger() const { return m_ledger; }
+    const OwedLedger& ledger() const override { return m_ledger; }
     OwedLedger&       ledger()       { return m_ledger; }
+    const char* owed_source_name() const override { return "PROOF FIXTURE (not the node ledger)"; }
     std::size_t       seeded() const { return m_paymap.size(); }
 
 private:
@@ -492,6 +573,26 @@ inline bool run(std::string* why = nullptr) {
         if (!::v37::xmr::is_xmr_kind(po(key).kind))    return fail("S6: resolver lost the seeded ref");
         ::v37::bytes32 miss{}; miss[0] = 0xEE;
         if (::v37::xmr::is_xmr_kind(po(miss).kind))    return fail("S6: resolver invented a ref (must be RAW/carry)");
+    }
+    // (S7) ★ THE SINK FLOOR. sink_min is what keeps the MANDATED residual sink a
+    //      real output once owed >= budget, which is where any pool that is
+    //      actually settling arrives on its (D_conf + 2)nd block. It defaults to
+    //      1 because 0 reproduces the option-B deadlock exactly: K_fair takes
+    //      the whole reward, X6 emits no sink (it emits one iff residual > 0),
+    //      and the §13 shape gate then refuses EVERY template.
+    {
+        XmrSettlementConfig d;
+        if (d.sink_min == 0)
+            return fail("S7: sink_min defaults to 0 — that is the deadlock, not a default");
+        XmrOwedFixture fx(7);
+        XmrParentContext parent;
+        parent.height = 100; parent.base_reward = 600000000000ULL; parent.fees = 0;
+        std::string w;
+        auto ctx = make_xmr_coinbase_context(cfg, parent, fx.ledger(), &w);
+        if (!ctx) return fail("S7: context build refused: " + w);
+        if (ctx->sink_min != cfg.sink_min)
+            return fail("S7: sink_min not carried into the coinbase context (the withholding "
+                        "happens there, so a dropped field is a silently reintroduced deadlock)");
     }
     if (why) why->clear();
     return true;

@@ -544,8 +544,30 @@ static void suite_e(const std::filesystem::path& root) {
 
         r.found(H, OURS, REWARD, PAYEE);
         check(r.node->ledger().is_pending(OURS), "E1a our block is pending in the ledger");
-        check(r.node->ledger().effective_owed(PAYEE) == -static_cast<long long>(REWARD),
-              "E1b amount-honest while pending");
+        // ★ S-1b + ★ R-7. This used to assert effective_owed == -REWARD, which
+        // was an artefact of the S-1b defect: the win was registered with
+        // credit == payout == {payee:reward}, so the PAYOUT leg deducted the
+        // whole reward from EffectiveOwed the instant the block was found — for
+        // a coinbase that had paid that payee nothing.
+        //
+        // ZERO is the right answer HERE, and the reason matters, because the
+        // S-1b commit gave the wrong one ("a freshly found XMR block broadcasts
+        // no settled-owed output"). That is true of option A only. An option-B
+        // K_fair coinbase DOES pay owed balances, and a FOUND that books such a
+        // payout moves EffectiveOwed DOWN by exactly it, immediately, while the
+        // block is still pending — which is the whole mechanism that stops the
+        // next template re-proposing what this block just paid (pinned in the
+        // finalize-connect self-check, FC20/FC21).
+        //
+        // This rig drives FinalizeConnect with an event that carries NO payout
+        // map — the option-A shape — so nothing is deducted. It also drives it
+        // with no lane work, so the credit leg folds to {} as well; the fold's
+        // own behaviour is pinned next door in v37_xmr_s1b_x2_kat.
+        check(r.node->ledger().effective_owed(PAYEE) == 0,
+              "E1b a FOUND carrying NO payout map does not move EffectiveOwed: credit is applied "
+              "at FINALIZE, and this block paid no owed output (an option-B win that DID pay one "
+              "deducts it here — see FC21)",
+              "eo=" + std::to_string(r.node->ledger().effective_owed(PAYEE)));
 
         // The rival exists -- held in the alt pool, never adopted. This is the
         // branch an event-stream-only accounting layer is blind in.
@@ -565,7 +587,9 @@ static void suite_e(const std::filesystem::path& root) {
 
         r.walk(H + 1, H + D);
         check(r.node->ledger().is_settled(OURS), "E1g at h + D_conf the driver SETTLES our block");
-        check(r.node->ledger().effective_owed(PAYEE) == 0, "E1h finalW nets to 0");
+        check(r.node->ledger().effective_owed(PAYEE) == 0,
+              "E1h this rig's lane is empty, so the folded E_b is {} and FINALIZE credits nobody "
+              "(the non-empty case is v37_xmr_s1b_x2_kat's)");
         check(r.fc->stats().race_credited == 1 && r.fc->stats().r7_violations == 0,
               "E1i the gate independently authorised that credit (R-7 violations = 0)",
               "credited=" + std::to_string(r.fc->stats().race_credited) +

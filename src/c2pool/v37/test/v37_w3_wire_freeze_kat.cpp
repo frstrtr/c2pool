@@ -18,6 +18,7 @@
 //
 // stdlib-only, no threads (unlike the multi-node socket test).
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -131,6 +132,13 @@ int main() {
             std::printf("REGEN v0x02 golden %s (%zu bytes):\n%s\n", f.name, b.size(),
                         to_hex(b).c_str());
         }
+        // v0x03: the sectioned-trailer fixtures (P = nothing to say, Q = cut +
+        // DROPS + K_fair, R = cut + K_fair only, the shape c2pool#1625 emits).
+        for (const auto& f : wire_freeze::frozen_fixtures_v3()) {
+            const auto b = CarrierWire::encode_version(f.carrier, f.version);
+            std::printf("REGEN v0x03 golden %s (%zu bytes):\n%s\n", f.name, b.size(),
+                        to_hex(b).c_str());
+        }
         return 0;
     }
 
@@ -140,14 +148,21 @@ int main() {
         std::printf("  got   : %s\n  golden: %s\n", hex.c_str(), kGoldenHex);
 
     // (2) Version tag is the first byte; the v0x01 frame carries 0x01, and this
-    //     build's DEFAULT encode() carries the current frozen version 0x02.
+    //     build's DEFAULT encode() carries the current frozen version 0x03.
     CHECK(!bytes.empty() && bytes[0] == 0x01);
-    CHECK(W3_WIRE_VERSION == 0x02 && W3_WIRE_VERSION_V1 == 0x01 && W3_WIRE_VERSION_V2 == 0x02);
+    CHECK(W3_WIRE_VERSION == 0x03 && W3_WIRE_VERSION_V1 == 0x01 &&
+          W3_WIRE_VERSION_V2 == 0x02 && W3_WIRE_VERSION_V3 == 0x03);
     {
         const auto now = CarrierWire::encode(c);
         CHECK(!now.empty() && now[0] == W3_WIRE_VERSION);
-        // v0x02 without a descriptor == the v0x01 frame + version bump + 1 byte.
-        CHECK(now.size() == bytes.size() + 1 && now.back() == 0x00);
+        // v0x02 without a descriptor == the v0x01 frame + version bump + 1 byte
+        // (the absent cut). v0x03 adds one present byte per trailer section, so
+        // a carrier with nothing to say costs exactly THREE bytes over v0x01 —
+        // and every v0x01 body byte is still where it was.
+        const auto v2 = CarrierWire::encode_version(c, W3_WIRE_VERSION_V2);
+        CHECK(v2.size() == bytes.size() + 1 && v2.back() == 0x00);
+        CHECK(now.size() == bytes.size() + 3 && now.back() == 0x00);
+        CHECK(std::equal(bytes.begin() + 1, bytes.end(), now.begin() + 1));
     }
 
     // (3) Round trip: decode(encode(c)) reconstructs the carrier + receipt and

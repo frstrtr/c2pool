@@ -572,4 +572,132 @@ if (BUILD_TESTING)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_owed_event_mmr_kat Threads::Threads)
     add_test(NAME v37_owed_event_mmr_kat COMMAND v37_owed_event_mmr_kat)
+
+    # X2 + S-1b — MONERO LIVE SETTLEMENT KAT. Two defects, one suite. (X2) the
+    # XMR stratum path only COUNTED an accepted share, so the Monero lane stood
+    # at raw_total=0 with an empty identity set and E_b folded to {} forever.
+    # (S-1b) xmr_o2_finalize_connect.hpp registered every win as
+    # credit == payout == {payee:reward}, so FINALIZE netted finalW to zero and
+    # owed_digest — which is also the option-B tx_extra 0x03 merge-mining leaf —
+    # never left the empty sha256d("V37O") anchor b4db1ded…. This pins the fix on
+    # a FIXED record stream: an empty lane folds {} and says so; lane work ->
+    # fold_at_tip -> FOUND(credit=E_b, payout={}) -> FINALIZE moves owed_digest
+    # off the anchor and carries the whole reward; a peer folding at the WINNER'S
+    # cut converges on the byte-identical digest; and BOTH defects are reproduced
+    # directly (credit==payout returns to the anchor; no cut descriptor leaves
+    # A != B) so the suite goes red if either regresses. Also pins the CUT RULE
+    # being load-bearing, each fail-closed refusal as its own bit, the X2 sink
+    # wiring, and the XMR no-byte-reversal parent rule. Stdlib + Threads (the
+    # engine's executor thread): no coin lib, no crypto backend, no sockets, no
+    # clocks. SAME HOLLOW-GREEN GUARD as the sibling suites: ALSO listed on BOTH
+    # build.yml --target lists (the Linux x86_64 leg and the ASan+UBSan leg) so
+    # CI compiles + RUNS it instead of registering a NOT_BUILT CTest sentinel
+    # (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class), and audited by
+    # the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_xmr_s1b_x2_kat v37_xmr_s1b_x2_kat.cpp)
+    target_compile_features(v37_xmr_s1b_x2_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_s1b_x2_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_s1b_x2_kat Threads::Threads)
+    add_test(NAME v37_xmr_s1b_x2_kat COMMAND v37_xmr_s1b_x2_kat)
+
+    # ★★ WIRE-CARRY of the K_fair owed-deduction map (carrier wire v0x03
+    # section 2): the switch from peer-RECOMPUTE to carrying the winner's own
+    # map, and the SUSTAINED convergence through >= 20 consecutive settling
+    # blocks that it buys. Stdlib-only; Threads for the engine's executor.
+    add_executable(v37_xmr_wirecarry_kat v37_xmr_wirecarry_kat.cpp)
+    target_compile_features(v37_xmr_wirecarry_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_wirecarry_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_wirecarry_kat Threads::Threads)
+    add_test(NAME v37_xmr_wirecarry_kat COMMAND v37_xmr_wirecarry_kat)
+
+    # * canonical_coinbase_matches = (a) PEER-RECOMPUTE. S-1c converges the two
+    # nodes only until the first block whose option-B coinbase actually SETTLES
+    # owed: from there the winner deducts a payout map at FINALIZE that the
+    # receiver does not have, because the map is unbounded and is deliberately
+    # NOT on the frozen v0x02 carrier wire -- so the receiver refused the block
+    # and the ledgers forked. Under the operator ruling the receiver RECOMPUTES
+    # that map from its OWN K_fair run for the same height (a second CALLER of
+    # OwedLedger::propose_coinbase, never a second K_fair). This KAT pins: the
+    # reproduction is byte-exact and order-exact; four blocks, three of them
+    # SETTLING, keep owed_digest(A) == owed_digest(B) through every settlement
+    # with finalW solvent on both; the pre-(a) defect reproduced in BOTH shapes
+    # (refuse, and credit-with-empty-payout) so the suite goes red if either
+    # returns; no double-pay across the settlement boundary; each fail-closed
+    # guard as its own bit with a non-vacuous positive control; the cut INSTANT
+    # being load-bearing (the same ledger one finalize later proposes a
+    # different map, and the digest guard catches it); the RESERVATION witness
+    # (owed_digest commits to the FINALIZED half only, so two nodes can hold the
+    # same digest and still propose different maps when one has more blocks
+    # reserved -- observed live, refused here); the bounded cache; and the
+    # NON-settling path unmoved. Stdlib + Threads (the engine's executor
+    # thread): no coin lib, no crypto backend, no sockets, no clocks. SAME
+    # HOLLOW-GREEN GUARD as the sibling suites: ALSO listed on BOTH build.yml
+    # --target lists so CI compiles + RUNS it instead of registering a NOT_BUILT
+    # CTest sentinel (the DGB #137 / #769 / c2pool#1539 class).
+    add_executable(v37_xmr_peer_recompute_kat v37_xmr_peer_recompute_kat.cpp)
+    target_compile_features(v37_xmr_peer_recompute_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_peer_recompute_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_peer_recompute_kat Threads::Threads)
+    add_test(NAME v37_xmr_peer_recompute_kat COMMAND v37_xmr_peer_recompute_kat)
+    # ★ R-A / R-B — the TWO S-1c CARRIER-PATH RACES (c2pool#1625). Both predate
+    # the v0x03 K_fair WIRE-CARRY and both sit in the SHARED carrier path, so
+    # they also affect the DROPS v0x03 track. (R-A) V37Engine publishes ONE
+    # settlement view per COALESCED executor burst (kCoalesceBurst), so the exact
+    # lane prefix a block winner names is frequently never published on the peer
+    # and the receive seam read that as a permanent cut_miss — live, the peer's
+    # lane version jumped by more than one on 92 of 102 samples. The prefix is
+    # still well-defined (snapshot content is a pure function of the committed
+    # record prefix), so it is PROJECTED on demand from the retained record log
+    # and accepted ONLY at a MATCHING lane digest — which is why the projection
+    # can turn a refusal into the correct credit but never into a wrong one.
+    # (R-B) a block-winner carrier whose parent is not yet in the receiver's
+    # index is refused by W2 with carrier_status=2 and the old seam threw the cut
+    # descriptor away with the frame: live, A emitted 45 winner carriers and B
+    # offered 44, and the missing one was a PERMANENT fork. It is now parked by
+    # (h_b, bid), re-asked through the I-2 tri-state gate and re-offered, with a
+    # bounded re-announce of our own winner frames beside it. This suite pins:
+    # the shadow replica bit-equal to the engine at EVERY prefix; both pre-fix
+    # behaviours reproduced directly as negative controls; every fail-closed
+    # refusal (wrong digest, prefix ahead of the log, Rewind-disabled); 25
+    # consecutive blocks converging with EVERY fold served by the projection and
+    # no double-pay; and R-B end-to-end on the REAL relay path plus all of its
+    # bounds. Stdlib + Threads (the engine's executor thread): no coin lib, no
+    # crypto backend, no sockets, no clocks that must pass. SAME HOLLOW-GREEN
+    # GUARD as the sibling suites: ALSO listed on BOTH build.yml --target lists
+    # so CI compiles + RUNS it instead of registering a NOT_BUILT CTest sentinel
+    # (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class).
+    add_executable(v37_xmr_s1c_recovery_kat v37_xmr_s1c_recovery_kat.cpp)
+    target_compile_features(v37_xmr_s1c_recovery_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_s1c_recovery_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_s1c_recovery_kat Threads::Threads)
+    add_test(NAME v37_xmr_s1c_recovery_kat COMMAND v37_xmr_s1c_recovery_kat)
+    # ★ S-1b — THE first_eligible ARMING RULE, as a FROM-SPEC SHADOW. owed_digest
+    # commits "V37O" || per finalW row key || i64 finalW || u64 first_eligible, and
+    # the shipped rearm arms a key at the bin its EffectiveOwed (finalW minus the
+    # PENDING payouts) first goes positive. The pending set is deliberately NOT
+    # synchronised across nodes — tolerating that relay-hop skew is why the v0x03
+    # wire-carry exists — so two honest nodes handed the SAME finalize stream arm
+    # the same key at DIFFERENT bins, and because arming is sticky their digests
+    # then differ FOREVER at byte-identical balances. Observed live on the 2-node
+    # XMR rig. This suite implements the owed ledger FROM SPEC (its own sha256d,
+    # its own state machine, its own preimage) and carries BOTH arming rules side
+    # by side, so it can mint the ruling's values WITHOUT touching the consensus
+    # fold body — applying the rule in w4_settlement.hpp is a consensus activation
+    # and the operator's hand. It pins: the from-spec hash against the b4db1ded...
+    # empty anchor (UNCHANGED under both rules — no rows, so no fe column); the
+    # OLD rule reproducing every published owed-event-MMR golden byte-for-byte
+    # (owed_digest, ledger_seq, StateCommitment root gate-OFF and gate-ON) which is
+    # what makes the model an ORACLE; the re-mint under the ruling; the shape
+    # invariance that leaves the V37.1 ridge and both DROPS activation mints
+    # unmoved; the live 2-node fork reproduced from the rig's own captured event
+    # stream and CLOSED by the ruling; and randomised cross-node determinism with
+    # a non-vacuous negative control. Stdlib only: no engine, no coin backend, no
+    # sockets, no clocks, no threads. SAME HOLLOW-GREEN GUARD as the sibling
+    # suites: ALSO listed on BOTH build.yml --target lists so CI compiles + RUNS
+    # it instead of registering a NOT_BUILT CTest sentinel (the DGB #137 / #769 /
+    # c2pool#1539 unregistered-KAT class).
+    add_executable(v37_s1b_arming_kat v37_s1b_arming_kat.cpp)
+    target_compile_features(v37_s1b_arming_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_s1b_arming_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME v37_s1b_arming_kat COMMAND v37_s1b_arming_kat)
 endif()
