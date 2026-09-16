@@ -437,6 +437,7 @@ public:
         pc.link.handshake.our_peer_id = cfg_.peer_id ? cfg_.peer_id : random_peer_id_();
         pc.manual_peers           = cfg_.connect;
         pc.bind_ip                = cfg_.p2p_bind_ip;
+        pc.use_seeds              = cfg_.use_seeds;
         if (cfg_.probe_only) {
             // A READ-ONLY probe dials exactly what it was told to dial. The
             // pool learns addresses from the handshake peerlist and the plan
@@ -444,12 +445,26 @@ public:
             // quietly open connections to strangers on the public network --
             // observed once against stagenet, where the probe dialed a peer it
             // had just learned from the daemon it was probing.
-            pc.dial.target_outbound      = cfg_.connect.size();
-            pc.dial.max_outbound         = cfg_.connect.size();
-            pc.dial.max_concurrent_dials = cfg_.connect.size();
-            pc.use_seeds                 = false;
+            //
+            // "What it was told to dial" is the PINNED peers plus, when the
+            // operator asked for --seeds, the network's own seed set: a probe
+            // is exactly how an operator checks that a mainnet bootstrap will
+            // reach anybody at all, and sizing the budget by connect.size()
+            // alone made `--seeds` with no --connect a silent no-op -- zero
+            // dials, zero handshakes, and a verdict that read as "mainnet is
+            // unreachable" rather than "this probe never dialled". The seed
+            // allowance is small and fixed so the plan still cannot wander off
+            // into peerlist strangers.
+            //
+            // The `use_seeds` assignment above is deliberately BEFORE this
+            // block: it used to be after, which silently overwrote the probe's
+            // own `pc.use_seeds = false` and made that line dead.
+            const std::size_t budget =
+                cfg_.connect.size() + (cfg_.use_seeds ? kProbeSeedDialBudget : 0);
+            pc.dial.target_outbound      = budget;
+            pc.dial.max_outbound         = budget;
+            pc.dial.max_concurrent_dials = budget;
         }
-        pc.use_seeds              = cfg_.use_seeds;
 
         p2p::XmrPeerPool::Deps pd;
         pd.serving = &boot_;       // io-thread reads; the state_normal obligation
@@ -1157,6 +1172,7 @@ private:
     // its addresses are simply not used this round; the cancel is hygiene, not
     // correctness. A cold start must not be able to hang on a broken resolver.
     // -----------------------------------------------------------------------
+    static constexpr std::size_t   kProbeSeedDialBudget = 4;
     static constexpr std::uint64_t kDnsSeedResolveMs   = 8000;
     static constexpr std::size_t   kDnsSeedMaxPerHost  = 32;
 

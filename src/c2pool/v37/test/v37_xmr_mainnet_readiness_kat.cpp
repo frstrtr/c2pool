@@ -445,6 +445,59 @@ void suite_c_seeds() {
                   && port == 18080,
               "C4: a made peer key does not split back");
     }
+
+    // C5 -- the table the seed round SELECTS. C1/C2 pin what each network
+    // ships and B2 pins that --network mainnet reaches the node as
+    // NativeNet::Mainnet; neither says which table a NativeNet::Mainnet node
+    // actually reads. resolve_nets() is that link, and the half that matters is
+    // `wire` (the levin net), NOT `consensus`: NativeNode passes nets_.wire to
+    // dns_seeds(), and the peer pool it builds seeds its store from
+    // ip_seeds(cfg_.net), which is the same wire net. Without this check a
+    // mainnet pool could have been seeded off a test network table with every
+    // other check in this file still green.
+    //
+    // The comparisons are whole-vector and length-guarded on purpose: a check
+    // that reads .front() of a table this very check suspects of being empty
+    // would crash instead of failing, and a KAT that segfaults on a red says
+    // nothing about what broke.
+    {
+        const auto mainnet_sel = rt::resolve_nets(rt::NativeNet::Mainnet).wire;
+        check(mainnet_sel == p2p::XmrNet::Mainnet,
+              "C5: --net mainnet does not select the mainnet seed table");
+
+        const std::vector<p2p::DnsSeed> sel_dns  = p2p::dns_seeds(mainnet_sel);
+        const std::vector<p2p::DnsSeed> main_dns = p2p::dns_seeds(p2p::XmrNet::Mainnet);
+        check(sel_dns.size() == 4,
+              "C5: the table --net mainnet selects has " + std::to_string(sel_dns.size())
+                  + " DNS seeds, expected the mainnet 4");
+        bool dns_same = (sel_dns.size() == main_dns.size());
+        for (std::size_t i = 0; dns_same && i < sel_dns.size(); ++i)
+            dns_same = (sel_dns[i].host == main_dns[i].host && sel_dns[i].port == main_dns[i].port);
+        check(dns_same, "C5: the selected DNS seed table is not the mainnet one");
+
+        const std::vector<p2p::IpSeed> sel_ip  = p2p::ip_seeds(mainnet_sel);
+        const std::vector<p2p::IpSeed> main_ip = p2p::ip_seeds(p2p::XmrNet::Mainnet);
+        bool ip_same = (sel_ip.size() == main_ip.size());
+        for (std::size_t i = 0; ip_same && i < sel_ip.size(); ++i)
+            ip_same = (sel_ip[i].ip == main_ip[i].ip && sel_ip[i].port == main_ip[i].port);
+        check(ip_same, "C5: the selected IP seed table is not the mainnet one");
+
+        // The two public test networks select their own (DNS-seedless) tables.
+        check(p2p::dns_seeds(rt::resolve_nets(rt::NativeNet::Stagenet).wire).empty(),
+              "C5: stagenet selects a DNS seed table");
+        check(p2p::dns_seeds(rt::resolve_nets(rt::NativeNet::Testnet).wire).empty(),
+              "C5: testnet selects a DNS seed table");
+
+        // REGTEST shares the MAINNET wire net (same genesis id), so a regtest
+        // rig that asked for seeds would dial the PUBLIC mainnet seed hosts.
+        // That is the standing reason --seeds is opt-in and OFF by default
+        // (A1), and it is pinned here so the default cannot be flipped without
+        // this check failing.
+        check(rt::resolve_nets(rt::NativeNet::Regtest).wire == p2p::XmrNet::Mainnet,
+              "C5: the regtest wire net changed -- re-check the seed default");
+        check(!base_config().native_use_seeds,
+              "C5: seeds are no longer opt-in, and regtest would dial mainnet seeds");
+    }
 }
 
 // =============================================================================
