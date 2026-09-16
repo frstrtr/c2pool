@@ -663,10 +663,16 @@ add_executable(test_config_endpoint
     test_config_endpoint.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/config_endpoint.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/settings_file.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../core/param_catalog.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/param_catalog.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/address_validator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/log.cpp)
 target_include_directories(test_config_endpoint PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core)
-target_link_libraries(test_config_endpoint PRIVATE nlohmann_json::nlohmann_json)
+# address_validator.cpp -> DecodeBase58Check (btclibs) + <core/log.hpp> category
+# LOG_* (core/log.cpp Logger::m_categories + Boost.Log). This target does not link
+# core (web_server/stratum SCC tangle), so carry btclibs + Boost.Log explicitly.
+target_link_libraries(test_config_endpoint PRIVATE nlohmann_json::nlohmann_json
+    btclibs Boost::log Boost::log_setup)
 add_test(NAME test_config_endpoint COMMAND test_config_endpoint)
 
 # ---- Control-plane M0b: GOLDEN no-file==today resolved-config gate + the
