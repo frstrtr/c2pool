@@ -130,6 +130,10 @@ void usage() {
         "  --anchor-confirm-peers <n>                 gate 4: peers to ask (default 4)\n"
         "  --anchor-confirm-timeout-ms <ms>           gate 4: whole-gate deadline (default 60000)\n"
         "  --anchor-confirm-peer-ms <ms>              gate 4: one peer's turn (default 12000)\n"
+        "  --snapshot-path <file>                     persist the chain index here and resume\n"
+        "                                             from it instead of re-walking the chain\n"
+        "  --snapshot-every <s>                       periodic save cadence (default 300;\n"
+        "                                             0 = only on a clean stop)\n"
         "  --monerod-rpc <host:port>                  the parity/backup arm (read-only)\n"
         "  --no-parity                                construct no parity oracle\n"
         "  --parity-ledger <file>                     persist the graduation ledger\n"
@@ -292,6 +296,14 @@ int main(int argc, char** argv) {
         else if (a == "--anchor-confirm-peer-ms")
             cfg.anchor_confirm.per_peer_ms =
                 std::strtoull(next("--anchor-confirm-peer-ms").c_str(), nullptr, 10);
+        // THE RESUME FILE. Read after gate 4 settles and written on a clean
+        // stop, so a restart does not re-walk the chain from the anchor. Never
+        // a second trust root: node/xmr_chain_snapshot_store.hpp binds the
+        // image to the anchor identity the network just vouched for, and any
+        // mismatch falls back to the anchor boot rather than to a weaker check.
+        else if (a == "--snapshot-path")  cfg.snapshot_path = next("--snapshot-path");
+        else if (a == "--snapshot-every")
+            cfg.snapshot_every_s = std::strtoull(next("--snapshot-every").c_str(), nullptr, 10);
         else if (a == "--monerod-rpc") {
             if (!split_host_port(next("--monerod-rpc"), cfg.monerod_rpc_host,
                                  cfg.monerod_rpc_port)) {
