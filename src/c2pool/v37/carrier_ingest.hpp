@@ -101,7 +101,18 @@ public:
                   u64 incarnation)
         : m_engine(engine), m_chain(chain),
           m_adm(std::make_unique<ReceiptAdmitter>(
-              static_cast<std::uint32_t>(chain), index, tracker, incarnation)) {}
+              static_cast<std::uint32_t>(chain), index, tracker, incarnation)) {
+        // The ENGINE SINK: the one terminal every accepted push reaches. Built
+        // once, here, so that installing a filter over it (below) costs nothing
+        // per admission and so that what the filter wraps is a stable object.
+        m_engine_sink = [this](const EmittedPush& p) {
+            // Fire-and-forget: O1.4 no callback out, no wait on the executor.
+            m_engine.submit(::v37::LaneRecord::push(
+                m_chain, p.descriptor, p.w_raw, p.flags));
+            ++m_pushes_forwarded;
+        };
+        m_sink = m_engine_sink;
+    }
 
     // The callback CarrierRelay is constructed with. Bound to `this`; the
     // CarrierIngest must outlive the CarrierRelay (the daemon owns both for the
@@ -110,14 +121,47 @@ public:
         return [this](const WorkEvent& carrier,
                       const std::vector<WorkEvent>& receipts) {
             std::lock_guard<std::mutex> lk(m_mtx);
-            RecordSink sink = [this](const EmittedPush& p) {
-                // Fire-and-forget: O1.4 no callback out, no wait on the executor.
-                m_engine.submit(::v37::LaneRecord::push(
-                    m_chain, p.descriptor, p.w_raw, p.flags));
-                ++m_pushes_forwarded;
-            };
-            return m_adm->admit(carrier, receipts, sink);
+            return m_adm->admit(carrier, receipts, m_sink);
         };
+    }
+
+    // ── ★ DROPS Step 2: the two consumer seams that make DROPS reachable ────
+    //
+    // The whole DROPS package hung off a W2 ReceiptAdmitter that NOTHING in a
+    // live shell could reach: the admitter is private to this bridge, so
+    // set_drop_harvest() had no caller and the emit stream had no tee. These two
+    // methods are that reach, and nothing more. BOTH ARE INERT UNLESS CALLED:
+    // with neither one used this class admits and forwards exactly as before,
+    // which is why a default (gate-OFF) build is byte-identical to master.
+    //
+    // set_drop_harvest ARMS the admitter's sub-target reclassification and sends
+    // every raindrop to `sink`. Arm it ONLY on a lane whose SubthresholdGate is
+    // ON — harvesting for a gated-off settlement credits nothing and costs
+    // memory (w2_admission.hpp says the same at the seam itself).
+    void set_drop_harvest(bool enabled, DropSink sink) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_adm->set_drop_harvest(enabled, std::move(sink));
+    }
+    bool drop_harvest_enabled() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_adm->drop_harvest_enabled();
+    }
+    std::uint64_t drops_harvested() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_adm->drops_harvested();
+    }
+
+    // set_sink_filter WRAPS the engine sink. The filter is applied ONCE, here,
+    // to the stable engine sink, and the wrapped sink is what every admission
+    // uses — so the ordering guarantee the RecordSink contract rests on (pushes
+    // reach the engine in emission order) is untouched, and the wrapper costs no
+    // allocation per admit. The DROPS use is ShareCountBook::tee, which counts
+    // one share per EmittedPush at (identity, origin_bin) and forwards
+    // unchanged; passing an empty filter restores the bare engine sink.
+    using SinkFilter = std::function<RecordSink(RecordSink)>;
+    void set_sink_filter(SinkFilter f) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_sink = f ? f(m_engine_sink) : m_engine_sink;
     }
 
     // F2 / W2-F-D: RemoveLane -> AddLane resets the lane-scoped admission state.
@@ -140,6 +184,8 @@ private:
     std::unique_ptr<ReceiptAdmitter> m_adm;
     mutable std::mutex               m_mtx;
     std::uint64_t                    m_pushes_forwarded = 0;
+    RecordSink                       m_engine_sink;   // the terminal
+    RecordSink                       m_sink;          // filter(m_engine_sink)
 };
 
 } // namespace c2pool::v37n

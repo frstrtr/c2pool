@@ -72,6 +72,8 @@
 #include <c2pool/v37/btc/btc_settle_store.hpp>
 #include <c2pool/v37/btc/btc_finalize_driver.hpp>
 #include <c2pool/v37/btc/btc_coin_backend.hpp>
+#include <c2pool/v37/v37_drop_harvest.hpp>      // ★ DROPS T3: DropHarvester
+#include <c2pool/v37/v37_drops_enrollment.hpp>  // ★ R-SYBIL: EnrollmentBook
 #include <sharechain/v37/v37_roundabout.hpp>    // ::v37::LaneRecord, LaneParams
 
 namespace c2pool::v37n::btc {
@@ -116,6 +118,17 @@ struct EbCut {
     // entered the fold — not a second, possibly different read — is what the
     // v0x02 cut descriptor carries.
     std::uint64_t  reward = 0;
+    // ── ★ DROPS-R1: the conversion this cut prices work at ────────────────
+    // (reward, SUM weight) read through the SAME project() call the fold ran, so
+    // an estimated hash and a real hash at this cut are worth the same satoshi.
+    settle::WorkPrice price{};
+    // ── ★ DROPS-R3: the COMPOSED DROPS delta map at this cut ──────────────
+    // On an OWN win: composed once, here, from our buried harvest — credited to
+    // our own ledger AND put on the v0x03 wire, so the two are the same bytes.
+    // On a PEER win: the map read off the wire, folded exactly as received.
+    Amounts        drops_delta;
+    ::v37::bytes32 enrollment_digest{};   // R-SYBIL witness at the cut
+    bool           drops_saturated = false;  // R1 clamp fired (never on a live cut)
 };
 
 // The disposition of a block-winning share the v36 work source handed us.
@@ -174,6 +187,15 @@ struct PeerWin {
     std::uint64_t  reward = 0;           // the winner's block_reward(H_b)
     bool           payout_emitted = false;      // winner's W5 assembly emitted outputs
     ::v37::bytes32 owed_digest_at_win{};        // VERIFY field (diagnostics only)
+    // ── ★ DROPS-R3: the WINNER'S composed DROPS credit map, off wire v0x03 ──
+    // `has_drops` false means the winner carried no map at all — a DROPS-dormant
+    // winner — and an EMPTY map is exactly what it credited itself, so folding
+    // nothing here converges with it. A raindrop is a node-local observation, so
+    // this map is the one part of the settlement a receiver cannot recompute:
+    // it is taken as the winner told it, and the local harvest plays no part.
+    bool                              has_drops = false;
+    std::map<::v37::bytes32, long long> drops_credit;
+    ::v37::bytes32                    enrollment_digest{};   // winner's book digest
 };
 
 struct PeerWinOutcome {
@@ -190,6 +212,11 @@ struct PeerWinOutcome {
     // diverged before this block — the earliest point at which that is visible.
     bool  owed_at_win_agreed = false;
     ::v37::bytes32 owed_here_at_receipt{};
+    // ★ DROPS-R3 diagnostics: how many rows of the WINNER'S map we folded, and
+    // how many of OUR OWN buried harvest rows we consumed and threw away so the
+    // two nodes' harvesters stay at the same frontier.
+    std::size_t drops_carried_rows = 0;
+    std::size_t drops_local_discarded = 0;
 };
 
 // S-1c receive-side counters (diagnostics only — never consensus).
@@ -351,6 +378,31 @@ public:
         fb.credit = out.cut.credit;
         for (const auto& o : asm_.outputs)
             fb.payout[o.key] = static_cast<long long>(o.amount);
+        // ★ DROPS T3 (own win), now composed EXACTLY ONCE, here.
+        //
+        // The node builds the DROPS delta map itself instead of handing the
+        // driver a harvest to compose later, for one reason: under DROPS-R3 the
+        // winner also BROADCASTS that map, and the map it broadcasts and the map
+        // it credits itself must be the same bytes. Composing in two places
+        // would make that a hope; composing once makes it a fact.
+        //   R1  dctx.price denominates BOTH sides of the replace through the
+        //       ordinary share -> E_b conversion this very fold just read.
+        //   R-SYBIL  dctx.enrollment credits only identities that committed to
+        //       DROPS before the interval; everyone else keeps its S*T path.
+        settle::DropsCompose dctx;
+        dctx.price      = out.cut.price;
+        dctx.enrollment = m_enroll;
+        const auto harvest = buried_harvest(won_height);
+        bool drops_sat = false;
+        out.cut.drops_delta =
+            settle::subthreshold_credit(m_cfg.lane_params, harvest, dctx, &drops_sat);
+        out.cut.drops_saturated   = drops_sat;
+        out.cut.enrollment_digest = dctx.enrollment_digest();
+        m_last_cut = out.cut;          // so last_cut() and last_won().cut agree
+        fb.params            = m_cfg.lane_params;
+        fb.drops             = dctx;
+        fb.has_carried_drops = true;            // the map above IS the map
+        fb.carried_drops     = out.cut.drops_delta;
         m_fin->on_block_found(fb);
 
         // Submit the block to the coin network (ARM A embedded P2P + ARM B
@@ -466,6 +518,7 @@ public:
         c.next_pos   = f->next_pos;
         c.unresolved = f->unresolved;
         c.source     = settle::eb_source_name(f->source);
+        c.price      = settle::work_price_at(w.reward, *view);   // ★ R1
         for (const auto& [k, v] : f->credit) c.credit[k] = static_cast<long long>(v);
         m_s1.unresolved += f->unresolved;
         if (w.reward == 0 || c.credit.empty()) {
@@ -502,6 +555,38 @@ public:
         fb.credit = c.credit;
         for (const auto& o : asm_.outputs)
             fb.payout[o.key] = static_cast<long long>(o.amount);
+        // ★★ DROPS-R3 (S-1c PEER win) — RULED, AND THIS IS THE FIX.
+        //
+        // THE DEFECT. This path used to add THIS node's buried harvest to the
+        // locally re-folded E_b. E_b is recomputable (it is a pure function of
+        // reward, payout and identities, all of which the peer holds) — but a
+        // RAINDROP IS NOT. It is a below-target work event one node happened to
+        // see on its own wire; two nodes observe different sets by construction.
+        // So with harvesters attached, two nodes credited DIFFERENT numbers for
+        // the SAME peer win and their owed_digests parted at the first block.
+        // That is the S-1c fork wearing a new hat, and unlike the canonical
+        // coinbase case there is no recompute available: the evidence never
+        // reached the peer.
+        //
+        // THE RULE. THE WINNER'S VIEW IS AUTHORITATIVE. We fold the map the
+        // winner composed and put on the wire, verbatim — never our own harvest,
+        // which has no standing on someone else's block. An absent map (a
+        // DROPS-dormant winner) folds as EMPTY, which is exactly what that
+        // winner credited itself, so the two still converge.
+        //
+        // AND WE STILL ADVANCE OUR OWN HARVESTER. The local buried rows are
+        // consumed and DISCARDED at the same frontier. If they were left open
+        // they would be folded into THIS node's next own win, for intervals the
+        // fleet had already settled — the same divergence, one block later.
+        fb.params            = m_cfg.lane_params;
+        out.drops_local_discarded = discard_local_harvest(w.h_b);
+        fb.has_carried_drops = true;
+        for (const auto& [k, v] : w.drops_credit)
+            if (v != 0) fb.carried_drops[k] += v;
+        out.drops_carried_rows = fb.carried_drops.size();
+        c.drops_delta          = fb.carried_drops;
+        c.enrollment_digest    = w.enrollment_digest;
+        out.cut                = c;    // re-publish the cut with the carried map
         m_fin->on_block_found(fb);     // write-ahead FOUND + pending + maturity map
 
         out.registered = true;
@@ -538,7 +623,68 @@ public:
     const S1PeerStats& s1c_stats()     const { return m_s1p; }
     const EbCut&       last_peer_cut() const { return m_last_peer_cut; }
 
+    // ── ★ DROPS T3: attach the node-local sub-threshold harvest ──────────────
+    // `h` is the DropHarvester the W2 admitter's DropSink feeds
+    // (v37_drop_harvest.hpp). NOT attached by default: with no harvester every
+    // FOUND carries an empty harvest, compose_credit_replace() returns E_b
+    // unchanged, and the node settles exactly as master does. Attach it only on
+    // a node whose lane_params carry the SubthresholdGate ON — a harvest folded
+    // into a gated-off settlement credits nothing and only costs memory.
+    //
+    // The node does not own the harvester's lifetime; the caller that owns the
+    // admitter owns it, because that is who feeds it.
+    void set_drop_harvester(DropHarvester* h) { m_drops = h; }
+    DropHarvester* drop_harvester() const { return m_drops; }
+
+    // ── ★ R-SYBIL: attach the EX-ANTE ENROLMENT BOOK ─────────────────────
+    // NOT attached by default, and that default is the safe one: with no book,
+    // NOBODY is enrolled, so the composition credits nothing at all and the node
+    // settles exactly as master does even with the gate on and a full harvest.
+    // The node does not own the book's lifetime.
+    void set_enrollment_book(const EnrollmentBook* b) { m_enroll = b; }
+    const EnrollmentBook* enrollment_book() const { return m_enroll; }
+
+    // ── ★ the SHARE-COUNT DECLARE hook ───────────────────────────────────
+    // Called with the burial frontier immediately BEFORE the harvest is taken
+    // (and before it is discarded on a peer win, so two nodes prune their
+    // counters at the same frontiers). The owner of the admitter wires this to
+    // ShareCountBook::declare_into(harvester, frontier, lz_of, enrollment) —
+    // which is what makes DropHarvester's fail-closed declare_shares() rule a
+    // live path instead of an API nobody drives.
+    using PreHarvestFn = std::function<void(std::uint64_t bury_before)>;
+    void set_pre_harvest(PreHarvestFn f) { m_pre_harvest = std::move(f); }
+    // How many harvest rows the last FOUND folded (diagnostic; 0 when detached).
+    std::size_t last_harvest_rows() const { return m_last_harvest_rows; }
+
 private:
+    // ── ★ DROPS T3: the buried harvest for a win at coin height H_b ──────────
+    // F1: only intervals strictly BELOW the burial frontier may be shown to the
+    // estimator, and take_buried() consumes them so the same interval can never
+    // be folded into two blocks. The frontier is the same D_conf the finalize
+    // driver gates on: an interval is eligible once it is as buried as the block
+    // that would settle it. A node with no harvester attached returns {} and the
+    // whole seam is inert.
+    std::vector<settle::HarvestedReceipt> buried_harvest(std::uint64_t won_height) {
+        if (!m_drops) { m_last_harvest_rows = 0; return {}; }
+        const std::uint64_t frontier =
+            won_height > m_cfg.d_conf ? won_height - m_cfg.d_conf : 0;
+        if (m_pre_harvest) m_pre_harvest(frontier);   // ★ declare S before release
+        auto rows = m_drops->take_buried(frontier);
+        m_last_harvest_rows = rows.size();
+        return rows;
+    }
+
+    // ★ DROPS-R3: consume our own buried harvest on a PEER win and throw it
+    // away. Nothing of ours is credited on someone else's block, but the
+    // frontier must still move or those intervals would be credited later, on
+    // our own next win, for a cut the fleet has already settled.
+    std::size_t discard_local_harvest(std::uint64_t h_b) {
+        if (!m_drops) return 0;
+        const std::uint64_t frontier = h_b > m_cfg.d_conf ? h_b - m_cfg.d_conf : 0;
+        if (m_pre_harvest) m_pre_harvest(frontier);
+        return m_drops->discard_buried(frontier);
+    }
+
     // ── ★ S-1: fold E_b at the lane cut published NOW ────────────────────────
     // The ONE credit-path entry point is settle::fold_eb — it does the ratified-
     // geometry refusal AND the fold in one call (the S8 seam), so a settlement
@@ -586,6 +732,9 @@ private:
         c.next_pos   = f->next_pos;
         c.unresolved = f->unresolved;
         c.source     = settle::eb_source_name(f->source);
+        // ★ DROPS-R1: the conversion this cut prices work at, read through the
+        // SAME project() the fold just ran — (reward, SUM weight), nothing new.
+        c.price      = settle::work_price_at(reward, *view);
         for (const auto& [k, v] : f->credit)
             c.credit[k] = static_cast<long long>(v);
         m_s1.unresolved += f->unresolved;
@@ -671,6 +820,11 @@ private:
     SettleHW                           m_hw;
     std::unique_ptr<BtcFinalizeDriver> m_fin;
     std::unique_ptr<V37Engine>         m_engine;
+    // ★ DROPS T3: non-owning, DEFAULT NULL => the whole seam is inert.
+    DropHarvester*                     m_drops = nullptr;
+    const EnrollmentBook*              m_enroll = nullptr;
+    PreHarvestFn                       m_pre_harvest{};
+    std::size_t                        m_last_harvest_rows = 0;
 
     S1FoldStats m_s1;        // S-1 fold counters (diagnostics)
     EbCut       m_last_cut;  // the cut the last win folded at (diagnostics)

@@ -112,6 +112,13 @@ struct OwnWinRequest {
     // then accounts the SHARE and credits NOTHING for the block — visible as a
     // convergence miss on the receiving side, never a silent divergence.
     std::optional<CutDescriptor> cut;
+    // ★ DROPS-R3: the winner's COMPOSED DROPS credit map (wire v0x03). Set only
+    // together with `cut`. It is the one part of the settlement a receiver
+    // cannot recompute — a raindrop is a node-local observation the peer never
+    // saw — so the winner names it here or the peers credit no DROPS at all
+    // (which still converges, because a winner that carries no map credited
+    // none itself).
+    std::optional<DropsCredit> drops;
 };
 
 // Build a request from the raw stratum solve fields. `header` is the 80-byte
@@ -392,6 +399,8 @@ public:
         if (req.won_block && req.cut) {
             c.cut = req.cut;
             o.carried_cut = true;
+            // DROPS-R3: the credit map rides with the cut, never without one.
+            if (req.drops) c.drops = req.drops;
         }
         // W3-G1: a block-winning carrier is appended UNCONDITIONALLY (no relay
         // dedup, no backpressure gate); an ordinary share takes the local path.

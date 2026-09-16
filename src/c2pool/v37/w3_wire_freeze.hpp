@@ -166,21 +166,25 @@ namespace c2pool::v37n::wire_freeze {
 // ═══════════════════════════════════════════════════════════════════════════
 constexpr std::uint8_t  kFrozenVersion   = 0x01;   // W3-B5 frozen 2026-09-07
 constexpr std::uint8_t  kFrozenVersionV2 = 0x02;   // S-1c  frozen 2026-09-12
+constexpr std::uint8_t  kFrozenVersionV3 = 0x03;   // DROPS-R3 frozen 2026-09-12
 constexpr std::uint32_t kFrozenRMax      = 4;
 static_assert(kFrozenVersion == W3_WIRE_VERSION_V1,
               "W3-B5: the v0x01 frozen wire version tag is 0x01 and never moves");
 static_assert(kFrozenVersionV2 == W3_WIRE_VERSION_V2,
               "S-1c: the v0x02 frozen wire version tag is 0x02");
-static_assert(kFrozenVersionV2 == W3_WIRE_VERSION,
-              "S-1c: this build EMITS the current frozen version (0x02); a wire "
-              "change is a VISIBLE bump with new goldens, never a re-pack");
+static_assert(kFrozenVersionV3 == W3_WIRE_VERSION_V3,
+              "DROPS-R3: the v0x03 frozen wire version tag is 0x03");
+static_assert(kFrozenVersionV3 == W3_WIRE_VERSION,
+              "DROPS-R3: this build EMITS the current frozen version (0x03); a "
+              "wire change is a VISIBLE bump with new goldens, never a re-pack");
 static_assert(kFrozenRMax == W3_R_MAX,
               "W3-B5: receipt_count bound is frozen at 4 (== W2_R_MAX)");
 
-// Version acceptance set (F-5). {0x01, 0x02} for the S-1c upgrade window: a
-// v0x01 peer's frames are still decoded and accounted; 0x01 retires only when
-// the operator says so, and its goldens stay green until then.
-inline constexpr std::uint8_t kAcceptedVersions[] = { kFrozenVersion, kFrozenVersionV2 };
+// Version acceptance set (F-5). {0x01, 0x02, 0x03} for the DROPS-R3 upgrade
+// window: an older peer's frames are still decoded and accounted; a version
+// retires only when the operator says so, and its goldens stay green until then.
+inline constexpr std::uint8_t kAcceptedVersions[] = { kFrozenVersion, kFrozenVersionV2,
+                                                      kFrozenVersionV3 };
 inline bool version_accepted(std::uint8_t v) {
     for (std::uint8_t a : kAcceptedVersions) if (a == v) return true;
     return false;
@@ -250,6 +254,18 @@ constexpr std::size_t kOffCutOwedAtWin    = kOffCutPayoutEmit + kPayoutEmittedBy
 constexpr std::size_t kCutDescBytesAbsent = kWonBlockBytes;                       // 1
 constexpr std::size_t kCutDescBytesPresent = kOffCutOwedAtWin + kHashBytes;       // 122
 static_assert(kCutDescBytesPresent == 122, "frozen v0x02 cut descriptor is 122 bytes");
+
+// ── ★ DROPS-R3 v0x03 credit-map trailer widths (inside the trailer) ─────────
+// present(1) [ count(2) + count x (payee 32 + credit 8) + enrollment_digest(32) ]
+constexpr std::size_t kDropsPresentBytes = 1;
+constexpr std::size_t kDropsCountBytes   = 2;
+constexpr std::size_t kDropsCreditBytes  = 8;
+constexpr std::size_t kDropsEntryBytes   = kHashBytes + kDropsCreditBytes;        // 40
+constexpr std::size_t kDropsBytesAbsent  = kDropsPresentBytes;                    // 1
+static_assert(kDropsEntryBytes == 40, "frozen v0x03 credit-map entry is 40 bytes");
+inline std::size_t drops_bytes_present(std::size_t n) {
+    return kDropsPresentBytes + kDropsCountBytes + n * kDropsEntryBytes + kHashBytes;
+}
 static_assert(kOffCutHb == 33 && kOffCutNextPos == 41 && kOffCutSpineDigest == 49 &&
               kOffCutReward == 81 && kOffCutPayoutEmit == 89 && kOffCutOwedAtWin == 90,
               "frozen v0x02 cut-descriptor offsets");
@@ -260,12 +276,14 @@ static_assert(kOffCutHb == 33 && kOffCutNextPos == 41 && kOffCutSpineDigest == 4
 // it would be a re-pack claim about v0x01, which S-1c does not make.
 inline const char* layout_id()    { return "w3-carrier-wire/v0x01/frozen-2026-09-07"; }
 inline const char* layout_id_v2() { return "w3-carrier-wire/v0x02/frozen-2026-09-12"; }
+inline const char* layout_id_v3() { return "w3-carrier-wire/v0x03/frozen-2026-09-12"; }
 // The FLAG-DAY MARKER: what this build emits, and what it accepts. A v0x01-only
 // peer REJECTS every frame this build sends (REJECT_BAD_VERSION at its decode)
 // — the flag day is loud on purpose, so a mixed fleet cannot silently strip a
 // block-winner cut descriptor at a v0x01 hop.
 inline const char* flag_day_id() {
-    return "w3-carrier-wire/flag-day/s1c-2026-09-12: emit=v0x02 accept={v0x01,v0x02}";
+    return "w3-carrier-wire/flag-day/drops-r3-2026-09-12: emit=v0x03 "
+           "accept={v0x01,v0x02,v0x03}";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -302,14 +320,32 @@ inline std::size_t cutdesc_size(const Carrier& c) {
 inline std::size_t frame_size_v2(const Carrier& c) {
     return frame_size(c) + cutdesc_size(c);
 }
+// DROPS-R3: the credit-map trailer's own size, and the whole v0x03 frame. The
+// v0x03 frame is the v0x02 frame VERBATIM plus this trailer, so every v0x01 and
+// v0x02 offset above stays valid over the v0x03 prefix.
+inline std::size_t drops_size(const Carrier& c) {
+    return c.drops.has_value() ? drops_bytes_present(c.drops->credit.size())
+                               : kDropsBytesAbsent;
+}
+inline std::size_t frame_size_v3(const Carrier& c) {
+    return frame_size_v2(c) + drops_size(c);
+}
+// Frame offset of the v0x03 credit-map trailer's first byte (== the v0x02 frame
+// size, which is the whole point of putting it at the END).
+inline std::size_t drops_offset(const Carrier& c) { return frame_size_v2(c); }
 // Frame offset of the v0x02 cut-descriptor trailer's first byte (== the v0x01
 // frame size, which is the whole point of putting it at the END).
 inline std::size_t cutdesc_offset(const Carrier& c) { return frame_size(c); }
 // Size at an explicit version (0 for a combination the layout cannot express:
 // an unknown version, or v0x01 asked to carry a cut descriptor).
 inline std::size_t frame_size_at(const Carrier& c, std::uint8_t ver) {
-    if (ver == kFrozenVersionV2) return frame_size_v2(c);
-    if (ver == kFrozenVersion)   return c.cut.has_value() ? 0 : frame_size(c);
+    // A credit map with no cut names no settlement: the encoder refuses it at
+    // EVERY version, so the model says 0 bytes there too.
+    if (c.drops.has_value() && !c.cut.has_value()) return 0;
+    if (ver == kFrozenVersionV3) return frame_size_v3(c);
+    if (ver == kFrozenVersionV2) return c.drops.has_value() ? 0 : frame_size_v2(c);
+    if (ver == kFrozenVersion)
+        return (c.cut.has_value() || c.drops.has_value()) ? 0 : frame_size(c);
     return 0;
 }
 inline std::size_t transport_size(const Carrier& c) {
@@ -317,6 +353,9 @@ inline std::size_t transport_size(const Carrier& c) {
 }
 inline std::size_t transport_size_v2(const Carrier& c) {
     return kTransportLenBytes + frame_size_v2(c);
+}
+inline std::size_t transport_size_v3(const Carrier& c) {
+    return kTransportLenBytes + frame_size_v3(c);
 }
 // Frame offset of the receipt_count byte.
 inline std::size_t receipt_count_offset(const Carrier& c) {
@@ -363,12 +402,25 @@ inline bool encodable(const Carrier& c, std::string* why = nullptr) {
 // descriptor; encode_version(c, 0x01) refuses (empty vector) rather than
 // silently dropping it, and this is the caller-side form of that refusal.
 inline bool encodable_at(const Carrier& c, std::uint8_t ver, std::string* why = nullptr) {
-    if (ver != kFrozenVersion && ver != kFrozenVersionV2) {
+    if (ver != kFrozenVersion && ver != kFrozenVersionV2 && ver != kFrozenVersionV3) {
         if (why) *why = "unknown wire version";
         return false;
     }
     if (ver == kFrozenVersion && c.cut.has_value()) {
         if (why) *why = "v0x01 cannot express a cut descriptor (S-1c needs v0x02)";
+        return false;
+    }
+    if (ver != kFrozenVersionV3 && c.drops.has_value()) {
+        if (why) *why = "only v0x03 can express a DROPS credit map (DROPS-R3)";
+        return false;
+    }
+    if (c.drops.has_value() && !c.cut.has_value()) {
+        if (why) *why = "a DROPS credit map with no cut descriptor names no settlement";
+        return false;
+    }
+    if (c.drops.has_value() &&
+        c.drops->credit.size() > static_cast<std::size_t>(W3_DROPS_MAX_ENTRIES)) {
+        if (why) *why = "DROPS credit map over W3_DROPS_MAX_ENTRIES";
         return false;
     }
     return encodable(c, why);
@@ -543,7 +595,8 @@ inline bool carriers_equal(const Carrier& a, const Carrier& b) {
     if (!events_equal(a.carrier, b.carrier) || a.receipts.size() != b.receipts.size()) return false;
     for (std::size_t i = 0; i < a.receipts.size(); ++i)
         if (!events_equal(a.receipts[i], b.receipts[i])) return false;
-    return a.cut == b.cut;   // S-1c: the trailer is part of carrier identity
+    // S-1c / DROPS-R3: both trailers are part of carrier identity.
+    return a.cut == b.cut && a.drops == b.drops;
 }
 // A legible S-1c cut descriptor for the v0x02 fixtures.
 inline CutDescriptor cut(std::uint8_t bid_base, u64 h_b, u64 p, std::uint8_t spine_base,
@@ -557,6 +610,19 @@ inline CutDescriptor cut(std::uint8_t bid_base, u64 h_b, u64 p, std::uint8_t spi
     c.payout_emitted     = payout_emitted;
     c.owed_digest_at_win = pat(owed_base);
     return c;
+}
+// A legible DROPS-R3 credit map for the v0x03 fixtures: three payees in the
+// STRICTLY ASCENDING order the wire requires, one NEGATIVE delta (the replace
+// composition is signed, so the two's-complement path must be pinned too), and
+// an enrolment-book digest that is distinguishable from every other pattern.
+inline DropsCredit drops(std::uint8_t a, std::uint8_t b, std::uint8_t c,
+                         std::uint8_t enrol_base) {
+    DropsCredit d;
+    d.credit.emplace_back(pat(a), 1);
+    d.credit.emplace_back(pat(b), -4200000000LL);
+    d.credit.emplace_back(pat(c), 9007199254740993LL);
+    d.enrollment_digest = pat(enrol_base);
+    return d;
 }
 } // namespace detail
 
@@ -684,6 +750,35 @@ inline Carrier fixture_f() {
 inline const char* kGoldenHexF =
     "0201000000fd2e83fe009e7e6c791745176f53719653bc35f5705564e912d4af2413cce77d404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f000000000000000000000000000000000000000000000000000000000000000008000000efcdab89674523010014111111111111111111111111111111111111111100000000000100630101000000fd2e83fe009e7e6c791745176f53719653bc35f5705564e912d4af2413cce77d606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f08000000dec0ad0bcefaedfe0014111111111111111111111111111111111111111100000000000200723001f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f01000000000000000000000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000000000000000001b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3";   // filled by the v0x02 freeze KAT's generator
 
+// ══ DROPS-R3 wire v0x03 fixtures ═══════════════════════════════════════════
+// ── Fixture G: the v0x03 NOTHING-TO-SAY shape (no cut, no credit map). ─────
+//   Body byte-for-byte fixture A; the ONLY differences from kGoldenHexA are the
+//   version byte (01 -> 03) and TWO trailing zeros — one for the absent cut, one
+//   for the absent credit map. This is the shape every ordinary share carrier
+//   takes on the DROPS wire, so its golden is the one that pins "v0x03 costs
+//   exactly one more byte than v0x02 when there is nothing to say".
+inline Carrier fixture_g() {
+    Carrier c = fixture_a();
+    c.cut.reset();
+    c.drops.reset();
+    return c;
+}
+inline const char* kGoldenHexG =
+    "0301000000fd2e83fe009e7e6c791745176f53719653bc35f5705564e912d4af2413cce77d404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f000000000000000000000000000000000000000000000000000000000000000008000000efcdab89674523010014111111111111111111111111111111111111111100000000000100630101000000fd2e83fe009e7e6c791745176f53719653bc35f5705564e912d4af2413cce77d606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f08000000dec0ad0bcefaedfe001411111111111111111111111111111111111111110000000000020072300000";
+
+// ── Fixture H: the v0x03 FULL shape — cut descriptor + credit map. ────────
+//   Body + cut byte-for-byte fixture E, plus a three-entry credit map with a
+//   negative row and a row above 2^53 (so no float can round-trip it) and a
+//   distinguishable enrolment digest. Pins every offset of the new trailer.
+inline Carrier fixture_h() {
+    using namespace detail;
+    Carrier c = fixture_e();
+    c.drops = drops(/*a=*/0x11, /*b=*/0x22, /*c=*/0x33, /*enrol_base=*/0xe7);
+    return c;
+}
+inline const char* kGoldenHexH =
+    "0305000000ea52ca7f1548684e30d336d8c18cf7e8fedf091cd5b9afca93d2c5474cdb9883808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf090000008877665544332211ff20b697e503a530429f57e4a197f7aa0f37c38aaaa803f29839ab49062f345daea40001002a0000000214333333333333333333333333333333333333333306006a04deadbeef4000422e636172726965722e7461672d61742d6361703a78787878787878787878787878787878787878787878787878787878787878787878787878787878787878040500000025ef7da35aa62fb1efe73c82e13ed86c288ed5478b011d68de38a3ae69a1f7fcc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f0800000001000000000000000114444444444444444444444444444444444444444400000000000200723005000000f2af3b63ad987b888cf4ad86ed5c06ba8611fdc9185c42c35cc46c06fe301eaed0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeefc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf0900000000000000010000000320555555555555555555555555555555555555555555555555555555555555555500000000000000050000005a983a97b2df748e4a13849701c7e34b7b3b2586cc02fc9ac4afcdae87503dc5e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2008000000ffffffffffffffff0420666666666666666666666666666666666666666666666666666666666666666600000000000200723205000000776eeba67324756c82881f4daa5e439605cdff0c6f65ef283cc99c5f4313c234f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20210800000000000000000000800014777777777777777777777777777777777777777700020001000000001488888888888888888888888888888888888888880700000003209999999999999999999999999999999999999999999999999999999999999999000002007233010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f203713030000000000d204000000000000202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f00f2052a0100000000c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e20103001112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30010000000000000022232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40410016a905ffffffff333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5051520100000000002000e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff00010203040506";
+
 // The v0x01 freeze set — UNCHANGED (these goldens never move while 0x01 is
 // accepted; S-1c does not re-pack them, it only stops being the only wire).
 inline std::vector<FrozenFixture> frozen_fixtures() {
@@ -699,6 +794,13 @@ inline std::vector<FrozenFixture> frozen_fixtures_v2() {
         {"D.v2.no-descriptor",  fixture_d(), kGoldenHexD, Policy::OK, kFrozenVersionV2},
         {"E.v2.full-cut",       fixture_e(), kGoldenHexE, Policy::OK, kFrozenVersionV2},
         {"F.v2.payout-emitted", fixture_f(), kGoldenHexF, Policy::OK, kFrozenVersionV2},
+    };
+}
+// The v0x03 freeze set (DROPS-R3).
+inline std::vector<FrozenFixture> frozen_fixtures_v3() {
+    return {
+        {"G.v3.nothing-to-say", fixture_g(), kGoldenHexG, Policy::OK, kFrozenVersionV3},
+        {"H.v3.cut+credit-map", fixture_h(), kGoldenHexH, Policy::OK, kFrozenVersionV3},
     };
 }
 
@@ -761,25 +863,32 @@ inline SelfCheck selfcheck() {
 
     // Global pins.
     chk(kFrozenVersion == 0x01, "v0x01 wire version tag frozen at 0x01");
-    chk(kFrozenVersionV2 == 0x02 && W3_WIRE_VERSION == 0x02,
-        "S-1c: this build EMITS wire v0x02");
+    chk(kFrozenVersionV2 == 0x02 && kFrozenVersionV3 == 0x03 && W3_WIRE_VERSION == 0x03,
+        "DROPS-R3: this build EMITS wire v0x03");
     chk(kFrozenRMax == 4 && W3_R_MAX == 4, "R_MAX frozen at 4");
-    chk(version_accepted(0x01) && version_accepted(0x02) &&
-        !version_accepted(0x00) && !version_accepted(0x03) && !version_accepted(0xff),
-        "accepted version set is exactly {0x01, 0x02} (F-5 dual-accept window)");
+    chk(version_accepted(0x01) && version_accepted(0x02) && version_accepted(0x03) &&
+        !version_accepted(0x00) && !version_accepted(0x04) && !version_accepted(0xff),
+        "accepted version set is exactly {0x01, 0x02, 0x03} (F-5 accept window)");
     chk(kTransportMaxFrame == (1u << 20), "transport ceiling frozen at 1 MiB");
     chk(std::string(layout_id()) == "w3-carrier-wire/v0x01/frozen-2026-09-07",
         "v0x01 layout id UNCHANGED by the S-1c bump");
     chk(std::string(layout_id_v2()) == "w3-carrier-wire/v0x02/frozen-2026-09-12",
         "v0x02 layout id pinned");
+    chk(std::string(layout_id_v3()) == "w3-carrier-wire/v0x03/frozen-2026-09-12",
+        "v0x03 layout id pinned");
     chk(kCutDescBytesPresent == 122 && kCutDescBytesAbsent == 1,
         "cut descriptor is 122 bytes present / 1 byte absent");
+    chk(kDropsEntryBytes == 40 && kDropsBytesAbsent == 1 &&
+            drops_bytes_present(0) == 35 && drops_bytes_present(3) == 155,
+        "DROPS credit-map trailer: 1 byte absent, 35 + 40n present");
 
     // ── the per-fixture body, run over BOTH frozen version sets ─────────────
     auto run_fixture = [&](const FrozenFixture& f) {
         const std::string who = std::string("fixture ") + f.name;
         const Carrier& c = f.carrier;
-        const bool v2 = (f.version == kFrozenVersionV2);
+        // Both v0x02 and v0x03 carry the cut trailer; v0x03 adds the credit map.
+        const bool v2 = (f.version == kFrozenVersionV2 || f.version == kFrozenVersionV3);
+        const bool v3 = (f.version == kFrozenVersionV3);
         chk(encodable_at(c, f.version), who + ": encodable at its frozen version");
 
         // (1) golden bytes, through the EXPLICIT version seam
@@ -791,7 +900,9 @@ inline SelfCheck selfcheck() {
         // (2) independent size/offset model agrees with the codec
         chk(bytes.size() == frame_size_at(c, f.version), who + ": size == frame_size model");
         chk(kTransportLenBytes + bytes.size() ==
-                (v2 ? transport_size_v2(c) : transport_size(c)), who + ": transport_size model");
+                (v3 ? transport_size_v3(c)
+                    : (v2 ? transport_size_v2(c) : transport_size(c))),
+            who + ": transport_size model");
         chk(!bytes.empty() && bytes[kOffVersion] == f.version, who + ": version byte @0");
         chk(peek_version(bytes) == std::optional<std::uint8_t>(f.version), who + ": peek_version");
         const std::size_t rc_off = receipt_count_offset(c);
@@ -809,7 +920,8 @@ inline SelfCheck selfcheck() {
         //      it is already pinned above.
         if (v2) {
             const std::size_t t = cutdesc_offset(c);
-            chk(bytes.size() == t + cutdesc_size(c), who + ": trailer ends at frame end");
+            chk(bytes.size() == t + cutdesc_size(c) + (v3 ? drops_size(c) : 0),
+                who + ": trailer ends at frame end");
             if (chk(t < bytes.size(), who + ": trailer in range")) {
                 chk(bytes[t + kOffWonBlock] == (c.cut.has_value() ? 1 : 0),
                     who + ": won_block byte @ trailer+0");
@@ -861,9 +973,9 @@ inline SelfCheck selfcheck() {
         { auto t = bytes; t.push_back(0x00);
           chk(CarrierWire::decode(t).status == WireStatus::REJECT_TRUNCATED, who + ": trailing byte rejected"); }
 
-        // (9) version policy: 0x00 / 0x03 / 0xff -> REJECT_BAD_VERSION (0x02 is
-        //     an ACCEPTED version now, so it is no longer a rejection probe)
-        for (std::uint8_t v : {std::uint8_t(0x00), std::uint8_t(0x03), std::uint8_t(0xff)}) {
+        // (9) version policy: 0x00 / 0x04 / 0xff -> REJECT_BAD_VERSION (0x02 and
+        //     0x03 are ACCEPTED versions now, so neither is a rejection probe)
+        for (std::uint8_t v : {std::uint8_t(0x00), std::uint8_t(0x04), std::uint8_t(0xff)}) {
             auto t = bytes; t[kOffVersion] = v;
             chk(CarrierWire::decode(t).status == WireStatus::REJECT_BAD_VERSION,
                 who + ": version 0x" + to_hex({v}) + " rejected");
@@ -908,6 +1020,78 @@ inline SelfCheck selfcheck() {
 
     for (const FrozenFixture& f : frozen_fixtures())    run_fixture(f);
     for (const FrozenFixture& f : frozen_fixtures_v2()) run_fixture(f);
+    for (const FrozenFixture& f : frozen_fixtures_v3()) run_fixture(f);
+
+    // ── DROPS-R3 v0x03 byte pins + the decode refusals ──────────────────────
+    {
+        const Carrier& h = fixture_h();
+        const auto b = CarrierWire::encode_version(h, kFrozenVersionV3);
+        const std::size_t t = drops_offset(h);
+        chk(b.size() == t + drops_bytes_present(3), "H: credit-map trailer size");
+        if (chk(t + 3 <= b.size(), "H: credit-map trailer in range")) {
+            chk(b[t] == 1, "H: drops present byte @ trailer+0");
+            chk(le_u32(b, t + 1) % 65536u ==
+                    static_cast<std::uint32_t>(h.drops->credit.size()),
+                "H: entry count u16 LE @ trailer+1");
+            chk(b32_at(b, t + 3) == h.drops->credit[0].first, "H: payee[0] @ trailer+3");
+            chk(le_u64(b, t + 35) == static_cast<std::uint64_t>(h.drops->credit[0].second),
+                "H: credit[0] u64 two's complement LE @ trailer+35");
+            chk(le_u64(b, t + 3 + kDropsEntryBytes + kHashBytes) ==
+                    static_cast<std::uint64_t>(h.drops->credit[1].second),
+                "H: the NEGATIVE credit row round-trips as two's complement");
+            chk(b32_at(b, t + drops_bytes_present(3) - kHashBytes) ==
+                    h.drops->enrollment_digest,
+                "H: enrolment digest is the LAST 32 bytes of the frame");
+        }
+        const DecodeResult dr = CarrierWire::decode(b);
+        chk(dr.status == WireStatus::OK && dr.carrier.drops.has_value() &&
+                *dr.carrier.drops == *h.drops,
+            "H: the credit map decodes back EXACTLY, negative row included");
+
+        // the refusals, one bit each
+        auto b_bad = b;  b_bad[t] = 0x7f;
+        chk(CarrierWire::decode(b_bad).status == WireStatus::REJECT_BAD_DROPS,
+            "drops present byte outside {0,1} -> REJECT_BAD_DROPS");
+        auto b_big = b;  b_big[t + 1] = 0xff; b_big[t + 2] = 0xff;
+        chk(CarrierWire::decode(b_big).status != WireStatus::OK,
+            "an entry count above the cap is never accepted");
+        {   // payees out of order: swap entry 0 and entry 1's payees
+            auto b_ord = b;
+            for (std::size_t i = 0; i < kHashBytes; ++i)
+                std::swap(b_ord[t + 3 + i], b_ord[t + 3 + kDropsEntryBytes + i]);
+            chk(CarrierWire::decode(b_ord).status == WireStatus::REJECT_BAD_DROPS,
+                "payees not strictly ascending -> REJECT_BAD_DROPS (no ambiguous fold)");
+        }
+        {   // a credit map with NO cut descriptor: refused at encode AND decode
+            Carrier nocut = fixture_a();
+            nocut.cut.reset();
+            nocut.drops = detail::drops(0x11, 0x22, 0x33, 0xe7);
+            chk(CarrierWire::encode_version(nocut, kFrozenVersionV3).empty(),
+                "a credit map with no cut is not encodable at any version");
+            // hand-build the same shape and prove decode refuses it too
+            Carrier bare = fixture_a();
+            bare.cut.reset();
+            auto raw = CarrierWire::encode_version(bare, kFrozenVersionV3);
+            raw.pop_back();                                   // drop drops_present=0
+            std::vector<std::uint8_t> map_bytes;
+            {
+                Carrier tmp = fixture_h();
+                const auto full = CarrierWire::encode_version(tmp, kFrozenVersionV3);
+                const std::size_t off = drops_offset(tmp);
+                map_bytes.assign(full.begin() + static_cast<long>(off), full.end());
+            }
+            raw.insert(raw.end(), map_bytes.begin(), map_bytes.end());
+            chk(CarrierWire::decode(raw).status == WireStatus::REJECT_BAD_DROPS,
+                "a decoded credit map with no cut descriptor -> REJECT_BAD_DROPS");
+        }
+        // v0x02 cannot express a credit map, and says so instead of dropping it
+        chk(CarrierWire::encode_version(h, kFrozenVersionV2).empty(),
+            "v0x02 refuses a DROPS credit map (never silently dropped)");
+        chk(CarrierWire::encode_version(h, kFrozenVersion).empty(),
+            "v0x01 refuses it too");
+        chk(!encodable_at(h, kFrozenVersionV2) && encodable_at(h, kFrozenVersionV3),
+            "encodable_at: v0x02 no / v0x03 yes for a credit-map carrier");
+    }
 
     // ── S-1c cross-version pins ─────────────────────────────────────────────
     {
@@ -931,10 +1115,23 @@ inline SelfCheck selfcheck() {
             "v0x01 refuses a cut descriptor (never silently dropped)");
         chk(!encodable_at(w, kFrozenVersion) && encodable_at(w, kFrozenVersionV2),
             "encodable_at: v0x01 no / v0x02 yes for a block-winner carrier");
-        chk(CarrierWire::encode_version(w, 0x03).empty(), "unknown version encodes nothing");
+        chk(CarrierWire::encode_version(w, 0x04).empty(), "unknown version encodes nothing");
+        // (ii-b) DROPS-R3: a v0x03 frame with NOTHING to say is the v0x02 frame
+        //        with the version byte bumped and ONE zero byte appended — the
+        //        same no-re-pack claim, one version further on.
+        for (const FrozenFixture& f : frozen_fixtures()) {
+            const Carrier& c = f.carrier;
+            const auto v2b = CarrierWire::encode_version(c, kFrozenVersionV2);
+            const auto v3b = CarrierWire::encode_version(c, kFrozenVersionV3);
+            const std::string who = std::string("cross-v3 ") + f.name;
+            if (!chk(v3b.size() == v2b.size() + 1, who + ": v0x03 costs exactly one byte")) continue;
+            chk(v3b[0] == kFrozenVersionV3 && v2b[0] == kFrozenVersionV2, who + ": version bytes");
+            chk(std::equal(v2b.begin() + 1, v2b.end(), v3b.begin() + 1), who + ": body byte-identical");
+            chk(v3b.back() == 0x00, who + ": drops trailer = 0");
+        }
         // (iii) the default encode() emits the CURRENT version.
-        chk(CarrierWire::encode(fixture_a()) == CarrierWire::encode_version(fixture_a(), kFrozenVersionV2),
-            "encode() == encode_version(., 0x02)");
+        chk(CarrierWire::encode(fixture_a()) == CarrierWire::encode_version(fixture_a(), kFrozenVersionV3),
+            "encode() == encode_version(., 0x03)");
         // (iv) bid <-> hex is an exact round trip, and only 64 hex chars parse.
         const bytes32 bid = detail::pat(0x5a);
         chk(cut_bid_bytes(cut_bid_hex(bid)) == std::optional<bytes32>(bid),
