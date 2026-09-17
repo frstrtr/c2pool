@@ -299,11 +299,14 @@ struct InjectStatus
     // Cumulative refusal tallies, incremented on the submit_inject rate-limit
     // branch by SCOPE (which budget) + VERDICT (count vs bytes). A refused
     // attempt mutates nothing else, so a tally is the only trace it leaves.
+    // These tallies are cumulative for the process lifetime and are not reset
+    // on disarm/re-arm.
     std::atomic<std::uint64_t> rl_local_count_refused{0};   // Local budget, count cap tripped
     std::atomic<std::uint64_t> rl_local_bytes_refused{0};   // Local budget, byte cap tripped
     std::atomic<std::uint64_t> rl_peer_count_refused{0};    // Peer budget, count cap tripped
     std::atomic<std::uint64_t> rl_peer_bytes_refused{0};    // Peer budget, byte cap tripped
-    // Live window occupancy, mirrored on each publish (accept / reconcile / arm).
+    // Occupancy as of updated_at (mirror is refreshed on arm/accept/reconcile,
+    // not on every refusal or on wall-clock aging) — not a live read of the window.
     std::atomic<std::uint64_t> rl_local_in_window{0};       // Local injects in the window
     std::atomic<std::uint64_t> rl_peer_in_window{0};        // Peer injects in the window
     std::atomic<std::uint64_t> rl_local_bytes_in_window{0}; // Local bytes in the window

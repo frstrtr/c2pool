@@ -99,9 +99,10 @@ static nlohmann::json build_p2p_stats_json()
 //
 // REWARD-SAFE / read-only: this SHOWS lane state; it never arms the flag,
 // submits a tx, or writes config. "wired": false = the lane has never
-// published (flag-OFF build, or a coin with no injection lane). The M3 (#1606,
-// draft) rate-limit / sandbox reject counters render null until that PR lands
-// and wires them.
+// published (flag-OFF build, or a coin with no injection lane). The M3
+// rate-limit / sandbox reject counters render as objects once the status has
+// been published (updated_at != 0); while the lane has never published they
+// render null (never 0-as-"unknown").
 static nlohmann::json build_tx_inject_status_json()
 {
     const auto& s  = obs::inject_status();
