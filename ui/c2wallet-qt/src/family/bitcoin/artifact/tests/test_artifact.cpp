@@ -385,6 +385,46 @@ int main() {
         std::string nperr;
         auto noDigest = UnsignedContainer::from_hex(to_hex(nod), nperr);
         CHECK(noDigest.has_value(), "GAP-3 backward-compat: a container without R_DIGEST still parses");
+
+        // digest-is-last: a record appended AFTER a verified R_DIGEST refuses,
+        // so nothing can hide past the verified range (probe-confirmed hole).
+        {
+            Bytes inj = *bytes;                        // valid container ending in R_DIGEST
+            inj.push_back(0x04);                       // a 2nd R_UTX record...
+            inj.push_back(0x05);                       // ...len 5...
+            for (uint8_t k = 1; k <= 5; ++k) inj.push_back(k);
+            std::string ierr;
+            auto bad2 = UnsignedContainer::from_hex(to_hex(inj), ierr);
+            CHECK(!bad2.has_value(), "GAP-3: a 2nd R_UTX appended AFTER R_DIGEST is refused");
+            CHECK(ierr.find("after the integrity digest") != std::string::npos,
+                  "GAP-3: the refusal names the digest-must-be-last rule");
+        }
+        {
+            Bytes inj2 = *bytes; inj2.push_back(0x77); inj2.push_back(0x00); // any trailing record
+            std::string ierr2;
+            CHECK(!UnsignedContainer::from_hex(to_hex(inj2), ierr2).has_value(),
+                  "GAP-3: even an unknown record after R_DIGEST is refused");
+        }
+        // has_digest is true only when the digest is genuinely present + last.
+        {
+            std::string herr;
+            auto withD = UnsignedContainer::from_hex(hex, herr);
+            CHECK(withD && withD->has_digest, "GAP-3: has_digest true for a digest-terminated container");
+            Bytes nod2 = *bytes; nod2.resize(nod2.size() - 34);
+            auto noD = UnsignedContainer::from_hex(to_hex(nod2), herr);
+            CHECK(noD && !noD->has_digest, "GAP-3: has_digest false when no digest present");
+        }
+        // duplicate singleton record (two R_COIN) is a parse error, not a silent
+        // overwrite. Hand-built: magic|ver|R_COIN"ltc"|R_COIN"btc"|R_UTX(1).
+        {
+            Bytes bb = {'C','2','W','U',0x01,
+                        0x01,0x03,'l','t','c',
+                        0x01,0x03,'b','t','c',
+                        0x04,0x01,0x00};
+            std::string derr;
+            CHECK(!UnsignedContainer::from_hex(to_hex(bb), derr).has_value(),
+                  "GAP-3: a duplicate singleton (two R_COIN) is refused");
+        }
     }
 
     // ── 22. GAP-4 R_INPUT_SCRIPT: a P2SH/P2WSH script round-trips + is consumable ─
@@ -392,6 +432,10 @@ int main() {
         UnsignedContainer c;
         c.coin = "ltc";
         c.unsigned_tx = B("0100000000");
+        // two inputs so the GAP-4 index validation (index < inputs.size()) is
+        // satisfied for the R_INPUT_SCRIPT records on inputs 0 and 1.
+        { UnsignedInput a; a.prevout_index = 0; a.script_pubkey = B("51"); a.amount = 1; c.inputs.push_back(a); }
+        { UnsignedInput b1; b1.prevout_index = 1; b1.script_pubkey = B("51"); b1.amount = 1; c.inputs.push_back(b1); }
         // a P2WSH 2-of-3 witnessScript on input 0
         InputScript w;
         w.input_index = 0; w.kind = InputScriptKind::Witness;
@@ -429,6 +473,28 @@ int main() {
         spk.insert(spk.end(), prog.begin(), prog.end());
         CHECK(spk.size() == 34 && spk[0] == 0x00 && spk[1] == 0x20,
               "GAP-4: P2WSH program = sha256(witnessScript) binds the carried script to the input");
+
+        // out-of-range input index refuses at parse.
+        {
+            UnsignedContainer bad; bad.coin = "ltc"; bad.unsigned_tx = B("0100000000");
+            InputScript x; x.input_index = 9; x.kind = InputScriptKind::Redeem; x.script = B("51");
+            bad.input_scripts = {x};
+            std::string e; auto he = bad.to_hex(e); std::string pe;
+            CHECK(!he.empty() && !UnsignedContainer::from_hex(he, pe).has_value(),
+                  "GAP-4: an out-of-range input-script index is refused");
+        }
+        // duplicate (input_index, kind) input-script refuses at parse.
+        {
+            UnsignedContainer d; d.coin = "ltc"; d.unsigned_tx = B("0100000000");
+            UnsignedInput in0; in0.prevout_index = 0; in0.script_pubkey = B("51"); in0.amount = 1;
+            d.inputs.push_back(in0);
+            InputScript a; a.input_index = 0; a.kind = InputScriptKind::Witness; a.script = B("51");
+            InputScript b2; b2.input_index = 0; b2.kind = InputScriptKind::Witness; b2.script = B("52");
+            d.input_scripts = {a, b2};
+            std::string e; auto he = d.to_hex(e); std::string pe;
+            CHECK(!he.empty() && !UnsignedContainer::from_hex(he, pe).has_value(),
+                  "GAP-4: a duplicate (input,kind) input-script is refused");
+        }
     }
 
     // ── 23. Unsigned <-> signed confusion refused in BOTH directions ──────────

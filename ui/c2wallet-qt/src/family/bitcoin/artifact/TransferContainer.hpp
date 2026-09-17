@@ -23,11 +23,18 @@
 // container and simply skips the new record types):
 //
 //   * GAP-3 R_DIGEST (0x06): a sha256 over ALL preceding container bytes,
-//     appended by to_hex() and, WHEN PRESENT, verified by from_hex() (which
-//     REFUSES on mismatch). It closes the 2a "a mutated output value is only
-//     caught by the human eye" hole: a single flipped byte anywhere in the
-//     container now fails the parse. Old parsers skip record 0x06 (forward-
-//     compat), so this does NOT break already-merged 2a consumers.
+//     appended LAST by to_hex() and, WHEN PRESENT, verified by from_hex()
+//     (which REFUSES on mismatch). from_hex ALSO enforces that the digest is
+//     the LAST record -- any record or byte after it REFUSES the parse -- and
+//     rejects a duplicate singleton record (R_COIN/R_NETVER/R_ALGEBRA/R_UTX/
+//     R_VERDICT). So the guarantee is exact: a digest that verifies is the last
+//     record, hence it covers every meaningful byte -- no bytes can hide past
+//     it and no field can be silently overwritten by a later duplicate. It
+//     closes the 2a "a mutated output value is only caught by the human eye"
+//     hole: a single flipped byte anywhere now fails the parse. Old parsers
+//     skip record 0x06 (forward-compat), so this does NOT break already-merged
+//     2a consumers; a container carrying no digest still parses, with the
+//     parsed `has_digest` flag left false so the UI can say so.
 //   * GAP-4 R_INPUT_SCRIPT (0x11): carries the P2SH/P2WSH redeem/witness (or
 //     tapleaf) script the offline Sign tab needs for script inputs — e.g. the
 //     LTC+DOGE P2MS-in-P2SH donation pattern — so the operator no longer has to
@@ -91,6 +98,11 @@ struct UnsignedContainer {
     std::vector<UnsignedInput> inputs;
     std::vector<InputScript>   input_scripts;     // GAP-4 (slice-2c); may be empty
     std::string                preflight_verdict; // optional c2pool pre-flight verdict
+
+    // GAP-3 (slice-2c) parse metadata: set true by from_hex() ONLY when an
+    // R_DIGEST record was present, verified, AND the last record. NOT part of
+    // container identity, so it is excluded from operator==.
+    bool                       has_digest = false;
 
     // Serialize to the hex artifact. Empty string if the encoded artifact would
     // exceed MAX_TRANSFER_BYTES (oversize refusal); `err` set in that case.

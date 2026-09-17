@@ -386,6 +386,11 @@ void PageSign::onParse()
     if (sg::coin_is_bch(oc->coin))
         head = QStringLiteral("<div style='color:#fff;background:#b00020;font-weight:bold;padding:4px'>"
                               "BCH artifact — signing needs SIGHASH_FORKID, not in slice-2a. This tx cannot be signed here.</div>");
+    // GAP-3 (slice-2c): show the same container-integrity rung the Air-Gap page
+    // shows, so an operator pasting straight into Sign sees it too.
+    head += oc->has_digest
+        ? QStringLiteral("<div style='color:#0a6'>&#10003; GAP-3 R_DIGEST present + verified — container integrity checked at parse.</div>")
+        : QStringLiteral("<div style='color:#8a5a00'>&#9888; no GAP-3 R_DIGEST (older 2a container) — compare the unsigned txid by eye across the gap.</div>");
     cardLabel_->setText(head + render_card(view, coin_, cp, /*ownFlags*/{}, /*bound*/false, int(oc->algebra)));
 
     parsedOk_ = true;

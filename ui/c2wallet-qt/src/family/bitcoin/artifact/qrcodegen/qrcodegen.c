@@ -2,6 +2,8 @@
 // this header) from  nayuki/QR-Code-generator  c/qrcodegen.c
 //   upstream : https://www.nayuki.io/page/qr-code-generator-library
 //              https://github.com/nayuki/QR-Code-generator
+//   commit   : 3c6d0b3cefb4e049dc337e82237c9644399716a8 (upstream master; the c/ sources
+//              are not tagged at a numbered release)
 //   license  : MIT  (Copyright (c) Project Nayuki) -- full text preserved in
 //              the original file header immediately following.
 //   why here : the c2wallet-qt offline air-gap QR EXPORT layer (GAP-8) needs a

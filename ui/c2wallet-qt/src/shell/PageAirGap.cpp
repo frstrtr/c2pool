@@ -351,10 +351,9 @@ void PageAirGap::onDecode()
                                                  .arg(QString::fromStdString(err).toHtmlEscaped()));
                 return;
             }
-            // GAP-3 presence probe: to_hex appends [0x06][0x20][32]; detect it.
-            Bytes cb;
-            const bool haveDigest = from_hex_q(hex, cb) && cb.size() >= 34 &&
-                                    cb[cb.size() - 34] == 0x06 && cb[cb.size() - 33] == 0x20;
+            // GAP-3 presence: the parser sets has_digest only when a digest
+            // was present, verified, AND the last record - no fragile tail probe.
+            const bool haveDigest = oc->has_digest;
             payload_ = Bytes(hex.toUtf8().begin(), hex.toUtf8().end());
 
             ladder += QStringLiteral("&#10003; container magic C2WU + version + TLV bounds OK<br>");
