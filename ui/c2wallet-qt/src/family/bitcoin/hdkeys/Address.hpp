@@ -46,4 +46,15 @@ std::string encode_p2sh(uint8_t version, const std::array<uint8_t, 20>& h160);
 std::string encode_segwit_v(const std::string& hrp, int witver,
                             const std::vector<uint8_t>& prog, bool bech32m);
 
+// GAP-9 — classify a scriptPubKey by its byte template and encode the receive
+// address under `coin` (for the confirm cards on the Build/Sign screens). The
+// SPK is the selector (threat-model T-13). `address` is empty for types that
+// have no address form (P2PK, bare-multisig, OP_RETURN) or when the coin lacks
+// the segwit HRP a witness type needs; `type` still names the shape.
+struct SpkAddress {
+    std::string type;      // "P2PKH","P2SH","P2WPKH","P2WSH","P2TR","P2PK","bare-multisig","OP_RETURN","Unknown"
+    std::string address;   // encoded address, or "" when no address form / no HRP
+};
+SpkAddress spk_to_address(const std::vector<uint8_t>& spk, const CoinParams& coin);
+
 } // namespace c2w::hdkeys

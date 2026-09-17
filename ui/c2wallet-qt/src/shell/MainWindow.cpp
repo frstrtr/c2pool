@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "shell/MainWindow.hpp"
 
+#include "shell/PageBuildTx.hpp"
 #include "shell/PageConstructConvert.hpp"
 #include "shell/PageImport.hpp"
 #include "shell/PageScan.hpp"
+#include "shell/PageSign.hpp"
 
 #include <QFont>
 #include <QHBoxLayout>
@@ -43,29 +45,22 @@ MainWindow::MainWindow(QWidget* parent)
     navList_->addItem(QStringLiteral("Scan (Monero view-only)"));
     stack_->addWidget(new PageScan(stack_));
 
-    // Slice-2 (pending review) stubs — visible but not implemented here. No
-    // money-path signing UX lands in slice 1.
-    navList_->addItem(QStringLiteral("Sign & Self-Verify"));
-    stack_->addWidget(makeStubPage(
-        QStringLiteral("Sign & Self-Verify"),
-        QStringLiteral("Confirm every output/amount/address, sign offline, and "
-                       "self-verify before emitting the signed artifact "
-                       "(RFC6979 / BIP340). Wires the merged signer + Monero "
-                       "prover libraries.")));
-
+    // Slice-2a (Family A) — the key-free constructor and the offline signer are
+    // now WIRED to the merged signer facade + artifact libraries. RingCT (Family
+    // B) build/sign and multi-frame-QR air-gap transfer remain slice-2b/2c.
     navList_->addItem(QStringLiteral("Build Transaction"));
-    stack_->addWidget(makeStubPage(
-        QStringLiteral("Build Transaction"),
-        QStringLiteral("Coin-control and the unsigned transaction builder for "
-                       "every script/output type (Family A) and RingCT spends "
-                       "(Family B).")));
+    stack_->addWidget(new PageBuildTx(stack_));
+
+    navList_->addItem(QStringLiteral("Sign & Self-Verify"));
+    stack_->addWidget(new PageSign(stack_));
 
     navList_->addItem(QStringLiteral("Air-Gap Transfer"));
     stack_->addWidget(makeStubPage(
         QStringLiteral("Air-Gap Transfer"),
-        QStringLiteral("PSBT-like / unsigned_txset import and signed-artifact "
-                       "export over file or multi-frame QR, plus the c2pool "
-                       "validate-seam dry-run.")));
+        QStringLiteral("File/paste transfer of the unsigned and signed artifacts "
+                       "is available inline on the Build Transaction and Sign & "
+                       "Self-Verify screens (slice-2a). Multi-frame animated QR "
+                       "and the c2pool validate-seam dry-run land in slice-2c.")));
 
     connect(navList_, &QListWidget::currentRowChanged,
             stack_, &QStackedWidget::setCurrentIndex);

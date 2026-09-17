@@ -32,26 +32,14 @@
 #include "family/monero/addr/MoneroAddress.hpp"
 #include "family/monero/seed/MoneroMnemonic.hpp"
 
-// Zeroizing helper for the intermediate plaintext std::string.
-#include "secure/SecureString.hpp"
+// Zeroizing helper for the intermediate plaintext std::string (GAP-7: the RAII
+// holder now lives in shell/ScopedSecret.hpp, shared with PageScan / PageSign).
+#include "shell/ScopedSecret.hpp"
 
 namespace hk = c2w::hdkeys;
 namespace xm = c2wallet::monero;
 
 namespace {
-
-// RAII holder that securely wipes a plaintext secret std::string when it leaves
-// scope (design §5.3). Used for the transient string that must be handed to the
-// library import functions (which take std::string), so the plaintext does not
-// linger on the heap after the derivation completes.
-struct ScopedSecret {
-    std::string s;
-    explicit ScopedSecret(std::string v) : s(std::move(v)) {}
-    ~ScopedSecret() { if (!s.empty()) c2w::secure::secure_wipe(&s[0], s.size()); }
-    ScopedSecret(const ScopedSecret&) = delete;
-    ScopedSecret& operator=(const ScopedSecret&) = delete;
-    const std::string& str() const { return s; }
-};
 
 QString hint_label(hk::ScriptHint h)
 {

@@ -9,6 +9,8 @@
 #include <btclibs/bech32.h>
 #include <btclibs/span.h>
 
+#include <algorithm>
+
 namespace c2w::hdkeys {
 
 std::string encode_p2pkh(uint8_t version, const std::array<uint8_t, 20>& h160)
@@ -144,6 +146,37 @@ std::vector<AddressCandidate> address_candidates_from_seckey(const uint8_t sk[32
     // P2TR is produced inside address_candidates() via the x-only taptweak; the
     // from-seckey and from-xonly output keys are identical for key-path spends.
     return address_candidates(comp, coin);
+}
+
+SpkAddress spk_to_address(const std::vector<uint8_t>& s, const CoinParams& coin)
+{
+    const size_t n = s.size();
+    const bool has_segwit = coin.bech32_hrp && coin.bech32_hrp[0] != '\0';
+    const std::string hrp = has_segwit ? std::string(coin.bech32_hrp) : std::string();
+
+    auto arr20 = [&](size_t off) {
+        std::array<uint8_t, 20> h{};
+        std::copy(s.begin() + off, s.begin() + off + 20, h.begin());
+        return h;
+    };
+
+    if (n == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac)
+        return {"P2PKH", encode_p2pkh(coin.p2pkh_version, arr20(3))};
+    if (n == 23 && s[0] == 0xa9 && s[1] == 0x14 && s[22] == 0x87)
+        return {"P2SH", encode_p2sh(coin.p2sh_version, arr20(2))};
+    if (n == 22 && s[0] == 0x00 && s[1] == 0x14)
+        return {"P2WPKH", has_segwit ? encode_segwit_v(hrp, 0, {s.begin() + 2, s.begin() + 22}, false) : std::string()};
+    if (n == 34 && s[0] == 0x00 && s[1] == 0x20)
+        return {"P2WSH", has_segwit ? encode_segwit_v(hrp, 0, {s.begin() + 2, s.begin() + 34}, false) : std::string()};
+    if (n == 34 && s[0] == 0x51 && s[1] == 0x20)
+        return {"P2TR", has_segwit ? encode_segwit_v(hrp, 1, {s.begin() + 2, s.begin() + 34}, true) : std::string()};
+    if ((n == 35 && s[0] == 0x21 && s[34] == 0xac) || (n == 67 && s[0] == 0x41 && s[66] == 0xac))
+        return {"P2PK", std::string()};
+    if (n >= 1 && s[0] == 0x6a)
+        return {"OP_RETURN", std::string()};
+    if (n >= 4 && s.back() == 0xae && s[0] >= 0x51 && s[0] <= 0x60)
+        return {"bare-multisig", std::string()};
+    return {"Unknown", std::string()};
 }
 
 } // namespace c2w::hdkeys
