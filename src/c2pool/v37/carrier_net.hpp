@@ -23,6 +23,53 @@
 // huge alloc). Framing is deliberately trivial: W3 owns the carrier semantics,
 // this owns only "one frame in, one frame out" over a stream socket.
 //
+// ── ★ THE FIRST-BYTE NAMESPACE (Stage 1 supply, frozen here) ────────────────
+// The framing carries NO type byte: frame[0] has always been the CarrierWire
+// version (0x01 / 0x02 live). That byte is now split, permanently:
+//
+//      0x01 .. 0x7f   CarrierWire VERSIONS   (carrier bodies -> handle_inbound)
+//      0x80 .. 0xff   CONTROL OPCODES        (repair channel -> the control fn)
+//
+// reader_loop() DEMUXES on frame[0] >= kCtrlOpcodeBase BEFORE handle_inbound, so
+// a control frame never reaches CarrierWire::decode on a repair-aware node. The
+// opcodes are NOT wire versions: they are absent from w3_wire_freeze.hpp's
+// kAcceptedVersions, they move no frozen v0x01 / v0x02 golden, and they carry no
+// consensus whatsoever. carrier_supply.hpp defines the frames themselves.
+//
+// BACKWARD TOLERANCE, BOTH DIRECTIONS — why this split deploys piecemeal:
+//   * an OLD peer (built before this) has no demux, so a 0x8x frame goes
+//     straight into CarrierWire::decode, which answers REJECT_BAD_VERSION. That
+//     is a VERDICT, not an error: handle_inbound returns it, the reader loop
+//     does not break, and the SOCKET STAYS UP. reader_loop breaks only on a
+//     short read or an over-long length prefix — never on a decode verdict.
+//   * a REPAIR-AWARE peer that meets an opcode it does not implement counts it
+//     (SupplyServeStats::unknown_opcode) and ignores it — likewise never a drop.
+// Neither side needs a flag day, and neither side can be disconnected by a
+// control frame it does not understand.
+//
+// ── ★ PEER IDENTITY + TARGETED SEND ────────────────────────────────────────
+// The repair channel is a CONVERSATION with one peer, so flood-only broadcast()
+// is not enough. Every established connection now carries a PeerId — a monotone
+// counter, FRESH on every connection, never reused after a drop — and send_to()
+// addresses exactly that connection. Because the id dies with the connection,
+// all per-peer state anyone keys on it (token buckets, outstanding requests) is
+// flap-safe by construction: a peer that reconnects gets a NEW id and a NEW
+// budget, and can neither inherit nor poison the state of any other peer.
+//
+// ── ★ SO_SNDTIMEO + DROP-SLOW-PEER (closing c2pool#1655 Defect-B) ───────────
+// c2pool#1655 gave each connection its own write lock, so one peer that stopped
+// reading no longer stalled the flood to the others. It did NOT bound the write
+// itself: send_all() blocks as long as the kernel makes it. Broadcast could
+// tolerate that (the frames are small and the peer set is served in parallel);
+// the SERVE path cannot — a GETFRAMES answer is up to kCtrlMaxReplyBytes and a
+// peer can request one and then never read, pinning a reader thread forever.
+// Every connection therefore gets SO_SNDTIMEO (default 10 s). A write that
+// times out mid-frame leaves that stream DESYNCED — half a frame is on it — so
+// the peer is dropped HARD: shutdown(SHUT_RDWR) so its reader thread unwinds,
+// then removed from the peer set. That is the only correct move; leaving a
+// half-written frame on a live socket would feed a truncated body into the
+// peer's decoder.
+//
 // DUPLEX: every established connection — whether we accepted it or dialed it —
 // is a full peer: it is added to the broadcast set AND gets a reader thread, so
 // carriers flow both directions over one socket (node A's win reaches node B,
@@ -38,9 +85,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <sys/time.h>
+
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <map>
 #include <memory>
@@ -59,6 +110,14 @@ namespace c2pool::v37n {
 // under 64 KiB. Sized well above that so a legitimate frame is never clipped.
 constexpr std::uint32_t kMaxCarrierFrame = 1u << 20;   // 1 MiB hard ceiling
 
+// ── the first-byte namespace split (see the header note) ────────────────────
+// frame[0] < kCtrlOpcodeBase  => a CarrierWire body  (0x01..0x7f are versions)
+// frame[0] >= kCtrlOpcodeBase => a control opcode    (carrier_supply.hpp)
+// This constant lives here, not in carrier_supply.hpp, so the demux needs no
+// dependency on the repair layer: a build with no supply service still routes
+// correctly (and, with no control handler bound, ignores-and-counts).
+constexpr std::uint8_t kCtrlOpcodeBase = 0x80;
+
 // ── the peer transport ──────────────────────────────────────────────────────
 class CarrierPeerNode final : public ICarrierTransport {
 public:
@@ -71,6 +130,25 @@ public:
     // and MUST NOT call back into this node (it runs on the accept loop).
     using PeerConnectFn = std::function<void()>;
 
+    // ── ★ peer identity ─────────────────────────────────────────────────────
+    // A monotone handle for ONE connection. Fresh on every connect, NEVER
+    // reused after a drop, so per-peer state keyed on it dies with the socket
+    // (the flap-safety property the repair channel relies on). 0 is "no peer".
+    using PeerId = std::uint64_t;
+
+    // A control frame (frame[0] >= kCtrlOpcodeBase), demuxed BEFORE any
+    // CarrierWire decode, tagged with the connection it arrived on. Bind it to
+    // the repair layer (carrier_supply.hpp SupplyService + SupplyRequester).
+    // UNBOUND is a valid configuration: the frame is ignored and counted, and
+    // the peer is NEVER dropped for it.
+    using ControlFn = std::function<void(PeerId, const std::vector<std::uint8_t>&)>;
+
+    // Connection lifecycle with the id, so a listener can release the
+    // per-peer state it keeps (token bucket, outstanding request). Fired on the
+    // accept/dial thread for `true`, on the reader thread for `false`, with NO
+    // transport lock held; it MUST be O(1) and MUST NOT call back into us.
+    using PeerEventFn = std::function<void(PeerId, bool /*connected*/)>;
+
     CarrierPeerNode() = default;
     ~CarrierPeerNode() override { stop(); }
 
@@ -79,6 +157,57 @@ public:
 
     void set_inbound(InboundFn f) { m_inbound = std::move(f); }
     void set_on_peer_connect(PeerConnectFn f) { m_on_connect = std::move(f); }
+    void set_control(ControlFn f) { m_control = std::move(f); }
+    void set_on_peer_event(PeerEventFn f) { m_on_peer_event = std::move(f); }
+
+    // Bound write time per connection (SO_SNDTIMEO). Applied to connections
+    // established AFTER the call. 0 restores "block indefinitely" (the
+    // pre-c2pool#1655 behaviour); the default is 10 s. See the header note.
+    void set_send_timeout(std::chrono::milliseconds t) {
+        m_send_timeout_ms.store(static_cast<long>(t.count()));
+    }
+
+    // Control frames seen with NO control handler bound: ignored, counted, peer
+    // kept. This is the "unknown opcode never drops the peer" counter for a
+    // node built with the demux but without the repair layer.
+    std::uint64_t ctrl_frames_ignored() const { return m_ctrl_ignored.load(); }
+    std::uint64_t ctrl_frames_routed() const { return m_ctrl_routed.load(); }
+    std::uint64_t peers_dropped_slow() const { return m_slow_drops.load(); }
+
+    // ── ★ targeted send (the repair channel's reply path) ───────────────────
+    // Write ONE frame to ONE connection. Returns false if the peer is gone or
+    // the write failed/timed out (in which case the peer has been dropped HARD,
+    // because a timed-out write leaves the stream desynced). Takes only that
+    // connection's own write lock, so it can never stall another peer.
+    bool send_to(PeerId id, const std::vector<std::uint8_t>& frame) {
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_id_fd.find(id);
+            if (it == m_id_fd.end()) return false;
+            fd = it->second;
+        }
+        std::uint8_t lenbuf[4];
+        const std::uint32_t len = static_cast<std::uint32_t>(frame.size());
+        for (int i = 0; i < 4; ++i) lenbuf[i] = static_cast<std::uint8_t>(len >> (8 * i));
+        std::shared_ptr<std::mutex> wl = write_lock(fd);
+        {
+            std::lock_guard<std::mutex> wlk(*wl);
+            if (send_all(fd, lenbuf, 4) && (len == 0 || send_all(fd, frame.data(), len)))
+                return true;
+        }
+        drop_peer(fd, /*hard=*/true);
+        return false;
+    }
+
+    // The id of the connection a fd belongs to (test/diagnostic helper).
+    std::vector<PeerId> peer_ids() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        std::vector<PeerId> v;
+        v.reserve(m_id_fd.size());
+        for (const auto& [id, fd] : m_id_fd) { (void)fd; v.push_back(id); }
+        return v;
+    }
 
     // Bind + listen on host:port. port==0 selects an ephemeral port, readable
     // afterward via listen_port() (the multi-node test binds 0 and dials the
@@ -175,7 +304,10 @@ public:
             else
                 dead.push_back(fd);
         }
-        for (int fd : dead) drop_peer(fd);
+        // HARD drop: with SO_SNDTIMEO armed, a failed send_all may be a TIMEOUT
+        // that left a partial frame on the stream. A desynced connection must
+        // not be left live — the peer would decode a truncated body.
+        for (int fd : dead) drop_peer(fd, /*hard=*/true);
         return reached;
     }
 
@@ -200,7 +332,9 @@ public:
         m_readers.clear();
         { std::lock_guard<std::mutex> lk(m_mtx);
           for (int fd : m_peers) ::close(fd);
-          m_peers.clear(); }
+          m_peers.clear();
+          m_fd_id.clear();
+          m_id_fd.clear(); }
         // A blocked writer may still hold a shared_ptr to one of these; the
         // map drops its own reference and the mutex dies with the last holder.
         { std::lock_guard<std::mutex> lk(m_wl_mtx); m_write_locks.clear(); }
@@ -222,12 +356,27 @@ private:
     void add_established(int fd) {
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        // ★ BOUND THE WRITE (c2pool#1655 Defect-B). Without this a peer that
+        // stops reading pins whichever thread is writing to it for as long as
+        // it likes; with the repair channel serving multi-frame replies on the
+        // reader thread, that is a per-peer denial of service on us.
+        const long tmo = m_send_timeout_ms.load();
+        if (tmo > 0) {
+            timeval tv{};
+            tv.tv_sec = static_cast<time_t>(tmo / 1000);
+            tv.tv_usec = static_cast<suseconds_t>((tmo % 1000) * 1000);
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
         bool established = false;
+        PeerId pid = 0;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             if (!m_running.load()) { ::close(fd); return; }   // stopping: never orphan a reader
+            pid = ++m_next_peer_id;
             m_peers.push_back(fd);
-            m_readers.emplace_back([this, fd] { reader_loop(fd); });
+            m_fd_id[fd] = pid;
+            m_id_fd[pid] = fd;
+            m_readers.emplace_back([this, fd, pid] { reader_loop(fd, pid); });
             established = true;
         }
         if (established) {
@@ -237,10 +386,12 @@ private:
             // under the lock would invert the order (relay -> transport).
             PeerConnectFn cb = m_on_connect;
             if (cb) cb();
+            PeerEventFn ev = m_on_peer_event;
+            if (ev) ev(pid, true);
         }
     }
 
-    void reader_loop(int fd) {
+    void reader_loop(int fd, PeerId pid) {
         for (;;) {
             std::uint8_t lenbuf[4];
             if (!recv_all(fd, lenbuf, 4)) break;
@@ -249,6 +400,17 @@ private:
             if (len > kMaxCarrierFrame) break;                 // protocol error -> drop
             std::vector<std::uint8_t> frame(len);
             if (len && !recv_all(fd, frame.data(), len)) break;
+            // ── ★ CONTROL DEMUX, BEFORE handle_inbound ──────────────────────
+            // frame[0] >= 0x80 is the repair channel, not a carrier body. It
+            // never reaches CarrierWire::decode here. With no handler bound the
+            // frame is IGNORED and COUNTED — the socket stays up either way, so
+            // an opcode we do not implement can never cost us a peer.
+            if (!frame.empty() && frame[0] >= kCtrlOpcodeBase) {
+                ControlFn cf = m_control;
+                if (cf) { m_ctrl_routed.fetch_add(1); cf(pid, frame); }
+                else    { m_ctrl_ignored.fetch_add(1); }
+                continue;
+            }
             // -> CarrierRelay::handle_inbound. ONE reader thread PER PEER calls
             // this concurrently; CarrierRelay serializes its handlers under its
             // own mutex (w3_relay.hpp THREADING), so the handler needs no lock
@@ -259,14 +421,30 @@ private:
         drop_peer(fd);
     }
 
-    void drop_peer(int fd) {
+    // `hard` => the stream is unusable (a timed-out write left half a frame on
+    // it), so shut the socket down: the peer's reader thread unwinds instead of
+    // sitting in recv() on a connection nobody will ever write to again.
+    void drop_peer(int fd, bool hard = false) {
+        PeerId pid = 0;
+        bool had = false;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             for (auto it = m_peers.begin(); it != m_peers.end(); ++it)
-                if (*it == fd) { m_peers.erase(it); break; }
+                if (*it == fd) { m_peers.erase(it); had = true; break; }
+            auto fit = m_fd_id.find(fd);
+            if (fit != m_fd_id.end()) {
+                pid = fit->second;
+                m_id_fd.erase(pid);
+                m_fd_id.erase(fit);
+            }
             // The fd is closed by stop() (join order) or here once fully removed;
             // closing once is enough — mark by removing from the set above.
         }
+        if (hard) {
+            if (had) m_slow_drops.fetch_add(1);
+            ::shutdown(fd, SHUT_RDWR);
+        }
+        if (pid) { PeerEventFn ev = m_on_peer_event; if (ev) ev(pid, false); }
         // Drop the map's reference to this connection's write lock so the table
         // stays bounded by the LIVE peer count. A writer blocked on the socket
         // right now still holds its own shared_ptr, so the mutex it is waiting
@@ -313,6 +491,15 @@ private:
 
     InboundFn                 m_inbound;
     PeerConnectFn             m_on_connect;
+    ControlFn                 m_control;        // frame[0] >= 0x80 (repair channel)
+    PeerEventFn               m_on_peer_event;  // (PeerId, connected)
+    std::atomic<std::uint64_t> m_ctrl_routed{0};
+    std::atomic<std::uint64_t> m_ctrl_ignored{0};
+    std::atomic<std::uint64_t> m_slow_drops{0};
+    // SO_SNDTIMEO, ms. 10 s by default: long enough that no healthy peer ever
+    // trips it, short enough that a peer which stopped reading cannot pin one
+    // of our threads indefinitely. 0 => block forever (pre-Stage-1 behaviour).
+    std::atomic<long>         m_send_timeout_ms{10000};
     int                       m_listen_fd = -1;
     std::uint16_t             m_listen_port = 0;
     // The node is "running" for its whole lifetime (construction -> stop()),
@@ -326,6 +513,12 @@ private:
     mutable std::mutex        m_wl_mtx;       // guards m_write_locks ONLY
     std::map<int, std::shared_ptr<std::mutex>> m_write_locks;   // fd -> its write lock
     std::vector<int>          m_peers;
+    // ★ peer identity. Ids are never reused, so per-peer state keyed on a
+    // PeerId dies with the connection — the flap-safety property the repair
+    // channel depends on. Both maps are guarded by m_mtx.
+    PeerId                    m_next_peer_id = 0;
+    std::map<int, PeerId>     m_fd_id;
+    std::map<PeerId, int>     m_id_fd;
 };
 
 } // namespace c2pool::v37n

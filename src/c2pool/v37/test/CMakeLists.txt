@@ -588,6 +588,36 @@ if (BUILD_TESTING)
     target_link_libraries(v37_carrier_relay_robustness_kat Threads::Threads)
     add_test(NAME v37_carrier_relay_robustness_kat COMMAND v37_carrier_relay_robustness_kat)
 
+    # Track A2 / STAGE 1 SUPPLY - the unified bounded FrameVault (ONE store of
+    # verbatim carrier frames, indexed by lane POSITION and by carrier hash,
+    # retained to the lane WINDOW horizon, with the c2pool#1655 re-offer riding
+    # it as a shallow recent sub-view) plus the >= 0x80 CONTROL OPCODE channel
+    # (GETORDER-at-cut / ORDER / GETFRAMES / FRAMES) demuxed in carrier_net.hpp
+    # BEFORE handle_inbound. It pins: the (chain, pos) -> carrier-hash index that
+    # exists nowhere else in the tree; a serve -> fetch -> verify round-trip over
+    # real sockets returning the exact ordered ids and the exact bytes; a LYING
+    # peer (right id, wrong bytes) fail-closed on the recomputed hash; a MISSING
+    # id fail-closed; a silent peer bounded by request_timeout; the vault entry /
+    # byte / window-horizon caps and the per-peer token bucket; a flapping peer
+    # that cannot evict another peer's retained bytes; and backward tolerance in
+    # BOTH directions - an OLD peer (the verbatim pre-Stage-1 reader loop,
+    # reproduced over a raw socket) meets an opcode, answers REJECT_BAD_VERSION,
+    # KEEPS the socket and admits the very next carrier. It also proves ZERO
+    # consensus movement: the opcodes are absent from kAcceptedVersions, the
+    # frozen v0x01 / v0x02 encodings are byte-identical, and a full round-trip
+    # moves neither lane digest nor owed_digest. SUPPLY ONLY - nothing here
+    # admits a fetched frame or folds (that is Stage 2). stdlib + POSIX sockets
+    # + Threads. SAME HOLLOW-GREEN GUARD as the sibling suites: ALSO listed on
+    # BOTH build.yml --target lists (the Linux x86_64 leg and the ASan+UBSan leg)
+    # so CI compiles + RUNS it instead of registering a NOT_BUILT CTest sentinel
+    # (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class), and audited by
+    # the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_convergence_supply_kat v37_convergence_supply_kat.cpp)
+    target_compile_features(v37_convergence_supply_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_convergence_supply_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_convergence_supply_kat Threads::Threads)
+    add_test(NAME v37_convergence_supply_kat COMMAND v37_convergence_supply_kat)
+
     add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)
     target_compile_features(v37_owed_event_mmr_kat PRIVATE cxx_std_20)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
