@@ -70,12 +70,41 @@
 //
 //   FRAMES    (0x83) := ctrl_hdr
 //                       u32 chain_id
+//                       u8  status              (CtrlFramesStatus)
+//                       u16 cursor              (requested ids CONSUMED, from 0)
+//                       u16 n_unservable
+//                       b32 id x n_unservable   (each ALONE over the ceiling)
 //                       u16 n_frames
 //                       { b32 id ; u32 len ; len bytes } x n_frames
 //
 // An id the server does not hold is simply ABSENT from FRAMES. The server never
 // substitutes, pads or fabricates; the requester treats absence as a
-// fail-closed outcome for the whole response.
+// fail-closed outcome for the PREFIX the answer claims to cover.
+//
+// ── THE CEILING, AND WHY FRAMES CARRIES A CURSOR ────────────────────────────
+// carrier_net.hpp refuses any frame longer than kMaxCarrierFrame (1 MiB) by
+// BREAKING the socket — it cannot do otherwise, because the length prefix is
+// how it finds the next frame boundary. So an over-long reply does not merely
+// fail: it costs the HONEST server the HONEST peer that asked. Every reply this
+// channel emits is therefore bounded BELOW that ceiling by construction
+// (kCtrlMaxReplyBytes, derived from it below and pinned by static_assert), and
+// a fetch too big for one reply is COMPLETED by continuation rather than by
+// enlarging the reply:
+//
+//   * the server serves whole frames in the order asked until the byte budget
+//     is spent, then answers TRUNCATED with the `cursor` it served through;
+//   * the requester verifies that prefix exactly as before and automatically
+//     re-asks from the cursor, until the ask is exhausted;
+//   * a frame that ALONE exceeds the budget can never be delivered by any
+//     chunking, so it is named in `unservable` and the cursor steps PAST it.
+//     That is an EXPLICIT answer, distinct from a missing id — never a silent
+//     stall, and never a peer drop.
+//
+// Progress is monotone: a TRUNCATED reply always has cursor >= 1 (the byte
+// budget can only bind after at least one frame is in, and an un-servable or
+// absent id advances the cursor by itself), so the continuation loop always
+// terminates. A peer claiming truncation at cursor 0 is answering nonsense and
+// is failed as MALFORMED — the one shape that could otherwise spin forever.
 //
 // ── WHAT THE REQUESTER VERIFIES, AND WHY IT IS FAIL-CLOSED ──────────────────
 // For every (id, bytes) pair a peer returns:
@@ -105,7 +134,12 @@
 //     answer a question we did not ask.
 //   * BOUNDED ANSWERS. kCtrlMaxIdsPerOrder / kCtrlMaxIdsPerFetch /
 //     kCtrlMaxReplyBytes cap every reply, and the asker's own max_ids can only
-//     LOWER them, never raise them.
+//     LOWER them, never raise them. Every one of those caps is ALSO clamped to
+//     the transport ceiling on the serve path, so a mis-set option cannot make
+//     us emit a frame that would drop the peer we are answering.
+//   * BOUNDED CONTINUATION. A truncated reply is re-asked at most
+//     max_continuations times, and every round consumes at least one requested
+//     id, so a fetch cannot be made to loop.
 //   * BOUNDED PEER TABLES. Both sides keep at most max_peer_slots entries and
 //     evict the least-recently-used, so peer churn cannot grow memory.
 //   * FLAP SAFETY. All per-peer state here is keyed by the transport's PeerId,
@@ -152,7 +186,54 @@ constexpr std::size_t  kCtrlHeaderSize = 6;     // opcode + version + u32 reques
 // Hard answer bounds. An asker may request LESS; it can never request more.
 constexpr std::uint32_t kCtrlMaxIdsPerOrder  = 4096;
 constexpr std::uint16_t kCtrlMaxIdsPerFetch  = 64;
-constexpr std::size_t   kCtrlMaxReplyBytes   = 4u << 20;   // 4 MiB
+
+// ── THE REPLY CEILING (derived from the transport, never chosen) ────────────
+// kCtrlMaxReplyBytes is the budget for the FRAME PAYLOAD BYTES in one FRAMES
+// reply. It is NOT a round number picked by hand: it is the transport's own
+// 1 MiB ceiling MINUS everything else that reply can possibly carry, so the
+// ENCODED frame is under the ceiling for every shape the encoder can produce.
+// (Before this it was 4 MiB — four times the ceiling — so a perfectly honest
+// 20 x 64 KiB answer encoded to 1,311,452 bytes and the requester's reader loop
+// broke the socket on the length prefix. That is the bug this derivation ends.)
+constexpr std::size_t kCtrlReplyCeiling   = static_cast<std::size_t>(kMaxCarrierFrame);
+// FRAMES fixed part: ctrl_hdr(6) + chain(4) + status(1) + cursor(2)
+//                    + n_unservable(2) + n_frames(2)
+constexpr std::size_t kCtrlFramesFixedBytes = kCtrlHeaderSize + 4 + 1 + 2 + 2 + 2;
+constexpr std::size_t kCtrlIdBytes          = 32;          // one b32 id
+constexpr std::size_t kCtrlFrameEntryBytes  = 32 + 4;      // b32 id + u32 len  (36 B)
+// Slack held back on purpose, so a future field added to this reply cannot
+// silently eat into the payload budget and re-open the defect.
+constexpr std::size_t kCtrlReplyMargin      = 4096;
+// Worst case per reply: every requested id un-servable AND every requested id
+// answered. Both lists are capped at kCtrlMaxIdsPerFetch, so reserving both is
+// strictly more than any single reply can use.
+constexpr std::size_t kCtrlFramesReserved =
+      kCtrlFramesFixedBytes
+    + static_cast<std::size_t>(kCtrlMaxIdsPerFetch) * kCtrlFrameEntryBytes
+    + static_cast<std::size_t>(kCtrlMaxIdsPerFetch) * kCtrlIdBytes
+    + kCtrlReplyMargin;
+constexpr std::size_t kCtrlMaxReplyBytes = kCtrlReplyCeiling - kCtrlFramesReserved;
+
+// ORDER's own bound, for the same reason. It has always fitted (4096 x 40 B =
+// 160 KiB), but nothing PINNED that, so a future bump of kCtrlMaxIdsPerOrder
+// could have walked it over the ceiling in silence. Now it cannot compile.
+constexpr std::size_t kCtrlOrderFixedBytes =
+      kCtrlHeaderSize + 4 + 8 + 8 + 8 + 1 + 1 + 32 + 4;
+constexpr std::size_t kCtrlOrderEntryBytes = 8 + 32;       // u64 pos + b32 id
+
+static_assert(kCtrlFramesReserved < kCtrlReplyCeiling,
+              "FRAMES overhead alone must fit under the transport ceiling");
+static_assert(kCtrlFramesFixedBytes
+                  + static_cast<std::size_t>(kCtrlMaxIdsPerFetch) * kCtrlFrameEntryBytes
+                  + static_cast<std::size_t>(kCtrlMaxIdsPerFetch) * kCtrlIdBytes
+                  + kCtrlMaxReplyBytes
+              <= kCtrlReplyCeiling - kCtrlReplyMargin,
+              "a full FRAMES reply must encode strictly under kMaxCarrierFrame");
+static_assert(kCtrlOrderFixedBytes
+                  + static_cast<std::size_t>(kCtrlMaxIdsPerOrder) * kCtrlOrderEntryBytes
+                  + kCtrlReplyMargin
+              <= kCtrlReplyCeiling,
+              "a full ORDER reply must encode strictly under kMaxCarrierFrame");
 
 enum class CtrlOrderStatus : std::uint8_t {
     OK            = 0,
@@ -188,9 +269,22 @@ struct CtrlGetFrames {
     std::vector<bytes32> ids;
 };
 
+// How much of the ask this reply covers.
+enum class CtrlFramesStatus : std::uint8_t {
+    COMPLETE  = 0,   // cursor == the number of ids asked for: nothing is left
+    TRUNCATED = 1,   // served through `cursor`; ask again from there
+};
+
 struct CtrlFrames {
-    std::uint32_t request_id = 0;
-    std::uint32_t chain = 0;
+    std::uint32_t    request_id = 0;
+    std::uint32_t    chain = 0;
+    CtrlFramesStatus status = CtrlFramesStatus::COMPLETE;
+    // Requested ids consumed, counting from the front of the ASK: served,
+    // absent and un-servable ids all advance it.
+    std::uint16_t    cursor = 0;
+    // Held, but the frame alone is over the ceiling — an explicit answer, not
+    // an absence. Always inside ids[0, cursor).
+    std::vector<bytes32> unservable;
     std::vector<std::pair<bytes32, std::vector<std::uint8_t>>> frames;
 };
 
@@ -236,8 +330,13 @@ public:
     }
     static std::vector<std::uint8_t> encode(const CtrlFrames& m) {
         std::vector<std::uint8_t> b;
+        b.reserve(encoded_size(m));
         hdr(b, CTRL_FRAMES, m.request_id);
         u32(b, m.chain);
+        b.push_back(static_cast<std::uint8_t>(m.status));
+        u16(b, m.cursor);
+        u16(b, static_cast<std::uint16_t>(m.unservable.size()));
+        for (const bytes32& id : m.unservable) b32(b, id);
         u16(b, static_cast<std::uint16_t>(m.frames.size()));
         for (const auto& [id, f] : m.frames) {
             b32(b, id);
@@ -245,6 +344,21 @@ public:
             b.insert(b.end(), f.begin(), f.end());
         }
         return b;
+    }
+
+    // Exactly what encode() will produce, without producing it. The serve path
+    // checks this against the transport ceiling BEFORE it ever builds a frame,
+    // so an over-long reply is impossible rather than merely improbable.
+    static std::size_t encoded_size(const CtrlFrames& m) {
+        std::size_t n = kCtrlFramesFixedBytes + m.unservable.size() * kCtrlIdBytes;
+        for (const auto& [id, f] : m.frames) {
+            (void)id;
+            n += kCtrlFrameEntryBytes + f.size();
+        }
+        return n;
+    }
+    static std::size_t encoded_size(const CtrlOrder& m) {
+        return kCtrlOrderFixedBytes + m.ids.size() * kCtrlOrderEntryBytes;
     }
 
     // ── decode (every one is total: a malformed frame is `false`, never UB) ──
@@ -298,8 +412,23 @@ public:
     static bool decode(const std::vector<std::uint8_t>& b, CtrlFrames& m) {
         std::size_t p = 0;
         if (!rd_hdr(b, p, CTRL_FRAMES, m.request_id)) return false;
-        std::uint16_t n = 0;
-        if (!(g32(b, p, m.chain) && g16(b, p, n))) return false;
+        std::uint8_t st = 0;
+        std::uint16_t nu = 0, n = 0;
+        if (!(g32(b, p, m.chain) && g8(b, p, st) && g16(b, p, m.cursor) &&
+              g16(b, p, nu)))
+            return false;
+        if (st > static_cast<std::uint8_t>(CtrlFramesStatus::TRUNCATED)) return false;
+        if (nu > kCtrlMaxIdsPerFetch) return false;      // hard bound, before ANY alloc
+        if (m.cursor > kCtrlMaxIdsPerFetch) return false;
+        m.status = static_cast<CtrlFramesStatus>(st);
+        m.unservable.clear();
+        m.unservable.reserve(nu);
+        for (std::uint16_t i = 0; i < nu; ++i) {
+            bytes32 id{};
+            if (!g32b(b, p, id)) return false;
+            m.unservable.push_back(id);
+        }
+        if (!g16(b, p, n)) return false;
         if (n > kCtrlMaxIdsPerFetch) return false;
         m.frames.clear();
         m.frames.reserve(n);
@@ -387,9 +516,31 @@ struct SupplyServeOptions {
     double        refill_per_sec     = 2.0;
     std::uint32_t max_ids_per_order  = kCtrlMaxIdsPerOrder;
     std::uint16_t max_ids_per_fetch  = kCtrlMaxIdsPerFetch;
+    // Payload budget for ONE FRAMES reply. Every use of it is CLAMPED to
+    // kCtrlMaxReplyBytes on the serve path (see clamped_reply_budget), so
+    // raising it here cannot make us emit a frame the transport would refuse —
+    // the option can only ever make replies SMALLER, which costs another
+    // continuation round and nothing else.
     std::size_t   max_reply_bytes    = kCtrlMaxReplyBytes;
     std::size_t   max_peer_slots     = 256;    // LRU-bounded peer table
 };
+
+// The three serve-side bounds, each clamped to what the transport can carry.
+// Read them through these, never from the options directly.
+inline std::size_t clamped_reply_budget(const SupplyServeOptions& o) {
+    return std::min<std::size_t>(o.max_reply_bytes ? o.max_reply_bytes
+                                                   : kCtrlMaxReplyBytes,
+                                 kCtrlMaxReplyBytes);
+}
+// At least 1: a zero frame cap would consume no id and stall the continuation.
+inline std::size_t clamped_frames_per_reply(const SupplyServeOptions& o) {
+    return std::max<std::size_t>(
+        1, std::min<std::size_t>(o.max_ids_per_fetch, kCtrlMaxIdsPerFetch));
+}
+inline std::size_t clamped_ids_per_order(const SupplyServeOptions& o) {
+    return std::max<std::size_t>(
+        1, std::min<std::size_t>(o.max_ids_per_order, kCtrlMaxIdsPerOrder));
+}
 
 struct SupplyServeStats {
     std::uint64_t requests        = 0;   // control frames routed here
@@ -403,6 +554,12 @@ struct SupplyServeStats {
     std::uint64_t disabled_drop   = 0;
     std::uint64_t send_failed     = 0;
     std::uint64_t peers_evicted   = 0;   // LRU eviction of the peer table
+    std::uint64_t frames_truncated = 0;  // ★ replies cut at the budget (cursor sent)
+    std::uint64_t frames_unservable = 0; // ★ ids whose frame ALONE is over the ceiling
+    std::uint64_t reply_oversize  = 0;   // ★ a reply that would have breached the
+                                         //   transport ceiling: NEVER sent. Zero by
+                                         //   construction; counted so a regression
+                                         //   shows up as a number, not a dropped peer.
 };
 
 class SupplyService {
@@ -469,8 +626,9 @@ public:
         if (op == CTRL_GETORDER) {
             CtrlGetOrder q;
             if (!CtrlWire::decode(frame, q)) { bump_malformed(); return; }
-            const std::size_t want = std::min<std::size_t>(
-                q.max_ids ? q.max_ids : opt.max_ids_per_order, opt.max_ids_per_order);
+            const std::size_t cap = clamped_ids_per_order(opt);
+            const std::size_t want =
+                std::min<std::size_t>(q.max_ids ? q.max_ids : cap, cap);
             const VaultOrder vo = m_vault.serve_order(q.chain, q.a, q.p, want);
             CtrlOrder r;
             r.request_id = q.request_id;
@@ -493,18 +651,47 @@ public:
         } else {
             CtrlGetFrames q;
             if (!CtrlWire::decode(frame, q)) { bump_malformed(); return; }
+            // ★ THE CEILING, ENFORCED WHERE THE BYTES ARE CHOSEN. Both bounds
+            // are the CLAMPED ones, so however the options are set the reply is
+            // built to fit under kMaxCarrierFrame.
             std::vector<std::pair<bytes32, std::vector<std::uint8_t>>> out;
-            m_vault.serve_frames(q.ids, opt.max_ids_per_fetch, opt.max_reply_bytes, out);
+            const VaultServeChunk ch = m_vault.serve_frames_chunk(
+                q.ids, clamped_frames_per_reply(opt), clamped_reply_budget(opt), out);
             CtrlFrames r;
             r.request_id = q.request_id;
             r.chain = q.chain;
+            r.status = ch.truncated ? CtrlFramesStatus::TRUNCATED
+                                    : CtrlFramesStatus::COMPLETE;
+            r.cursor = static_cast<std::uint16_t>(
+                std::min<std::size_t>(ch.cursor, kCtrlMaxIdsPerFetch));
+            r.unservable = ch.unservable;
             r.frames = std::move(out);
             std::size_t nb = 0;
             for (const auto& [id, f] : r.frames) { (void)id; nb += f.size(); }
+            // Belt AND braces: the derivation above makes this unreachable, so
+            // if it ever fires the derivation broke. Refuse to send rather than
+            // hand the honest peer a frame its reader loop must break on.
+            const std::size_t sz = CtrlWire::encoded_size(r);
+            if (sz > kCtrlReplyCeiling) {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                ++m_stats.reply_oversize;
+                return;
+            }
             reply = CtrlWire::encode(r);
             std::lock_guard<std::mutex> lk(m_mtx);
             ++m_stats.frames_served;
             m_stats.bytes_served += nb;
+            if (ch.truncated) ++m_stats.frames_truncated;
+            m_stats.frames_unservable += ch.unservable.size();
+        }
+
+        // The ORDER path's own ceiling check. Also unreachable (the
+        // static_assert on kCtrlMaxIdsPerOrder pins it at compile time), and
+        // also counted rather than assumed.
+        if (reply.size() > kCtrlReplyCeiling) {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            ++m_stats.reply_oversize;
+            return;
         }
 
         // Sent with NO lock of ours held: a slow peer stalls only its own
@@ -593,12 +780,21 @@ enum class SupplyFailure : std::uint8_t {
     DUPLICATE_ID,     // the same id twice in one answer
     UNDECODABLE_FRAME,// the served bytes are not a valid CarrierWire frame
     SERVER_REFUSED,   // ORDER came back with a non-OK status
+    UNSERVABLE_ID,    // ★ the server HOLDS it, but the frame alone is over the
+                      //   transport ceiling: it can never be delivered here.
+                      //   DISTINCT from MISSING_ID, and never a stall.
+    CONTINUATION_LIMIT,// a truncated fetch needed more rounds than allowed
 };
 
 struct SupplyFetchOptions {
     std::chrono::milliseconds request_timeout{5000};
     std::uint16_t             max_ids_per_fetch = kCtrlMaxIdsPerFetch;
     std::size_t               max_peer_slots    = 256;
+    // How many follow-up GETFRAMES one fetch may issue when the server answers
+    // TRUNCATED. Every round consumes at least one requested id and a fetch
+    // asks at most kCtrlMaxIdsPerFetch ids, so the default can never bind in
+    // practice; it exists so a peer that answers nonsense still terminates.
+    std::uint32_t             max_continuations = 128;
 };
 
 struct SupplyFetchStats {
@@ -617,6 +813,11 @@ struct SupplyFetchStats {
     std::uint64_t malformed        = 0;
     std::uint64_t server_refused   = 0;
     std::uint64_t send_failed      = 0;
+    std::uint64_t truncated_replies = 0;  // ★ answers that covered only a prefix
+    std::uint64_t continuations     = 0;  // ★ follow-up GETFRAMES we issued
+    std::uint64_t fetches_completed = 0;  // ★ asks driven through to the last id
+    std::uint64_t unservable_id     = 0;  // ★ ids the server named un-servable
+    std::uint64_t continuation_limit = 0; // ★ a fetch stopped by max_continuations
 };
 
 // A frame that PASSED verification: the bytes, and the decoded carrier, with
@@ -636,6 +837,11 @@ public:
     using OrderFn  = std::function<void(PeerId, const CtrlOrder&)>;
     using FramesFn = std::function<void(PeerId, const std::vector<VerifiedFrame>&)>;
     using FailFn   = std::function<void(PeerId, SupplyFailure)>;
+    // Ids the server holds but cannot put on this channel (each frame alone is
+    // over the transport ceiling). Delivered ALONGSIDE the verified frames of
+    // the same answer, so a caller learns exactly which ids to obtain another
+    // way instead of waiting for bytes that will never come.
+    using UnservableFn = std::function<void(PeerId, const std::vector<bytes32>&)>;
 
     explicit SupplyRequester(SendFn send) : m_send(std::move(send)) {}
 
@@ -651,6 +857,9 @@ public:
     void set_on_order(OrderFn f)   { std::lock_guard<std::mutex> lk(m_mtx); m_on_order = std::move(f); }
     void set_on_frames(FramesFn f) { std::lock_guard<std::mutex> lk(m_mtx); m_on_frames = std::move(f); }
     void set_on_fail(FailFn f)     { std::lock_guard<std::mutex> lk(m_mtx); m_on_fail = std::move(f); }
+    void set_on_unservable(UnservableFn f) {
+        std::lock_guard<std::mutex> lk(m_mtx); m_on_unservable = std::move(f);
+    }
 
     bool busy(PeerId p) const {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -693,6 +902,12 @@ public:
     }
 
     // ── ask: the bytes for these ids ────────────────────────────────────────
+    // The ASK is bounded by max_ids_per_fetch; the ANSWER is bounded by the
+    // transport ceiling, which is a different bound entirely. When the server
+    // cannot fit the whole ask in one reply it says so with a cursor, and this
+    // class re-asks from there until the ask is exhausted — the caller sees the
+    // same verified-bytes callback, one invocation per verified chunk, and does
+    // not have to know the fetch was split.
     bool request_frames(PeerId peer, std::uint32_t chain, std::vector<bytes32> ids) {
         CtrlGetFrames q;
         {
@@ -700,15 +915,11 @@ public:
             if (ids.empty() || ids.size() > m_opt.max_ids_per_fetch) return false;
             if (m_out.count(peer)) { ++m_stats.refused_busy; return false; }
             evict_lru_locked();
-            q.request_id = ++m_next_rid;
-            q.chain = chain;
-            q.ids = ids;
             Outstanding o;
-            o.request_id = q.request_id;
-            o.expect = CTRL_FRAMES;
-            o.deadline = Clock::now() + m_opt.request_timeout;
-            o.want = std::move(ids);
-            m_out.emplace(peer, std::move(o));
+            o.chain = chain;
+            o.ids = std::move(ids);
+            o.from = 0;
+            arm_frames_locked(peer, o, q);
             ++m_stats.frames_requested;
         }
         return dispatch(peer, CtrlWire::encode(q));
@@ -746,24 +957,59 @@ public:
 
         CtrlFrames r;
         if (!CtrlWire::decode(frame, r)) { fail(peer, SupplyFailure::MALFORMED, true); return; }
-        std::vector<bytes32> want;
-        if (!claim(peer, CTRL_FRAMES, r.request_id, &want)) {
+        Outstanding o;
+        if (!claim_frames(peer, r.request_id, o)) {
             fail(peer, SupplyFailure::UNSOLICITED, false);
             return;
         }
 
-        // ── VERIFICATION. Fail-closed on the FIRST problem; nothing is handed
-        // on unless EVERY requested id came back and EVERY frame's recomputed
-        // carrier hash equals the id we asked for.
+        // ── WHAT THE ANSWER IS ALLOWED TO CLAIM ─────────────────────────────
+        // The chunk we asked for is ids[from, to). `cursor` is how much of THAT
+        // the answer covers. Three shapes are nonsense and are refused before
+        // any verification, because each of them would either hide a missing id
+        // or spin the continuation loop:
+        //   * a cursor past the chunk we asked for;
+        //   * COMPLETE that does not cover the whole chunk;
+        //   * TRUNCATED at cursor 0 — no progress, so re-asking would repeat
+        //     forever. The serve side cannot produce it (an absent or
+        //     un-servable id advances the cursor by itself, and the byte budget
+        //     can only bind once a frame is already in), so a peer that sends it
+        //     is misbehaving, not merely constrained.
+        const std::size_t chunk = o.to - o.from;
+        const bool truncated = (r.status == CtrlFramesStatus::TRUNCATED);
+        if (r.cursor > chunk ||
+            (!truncated && r.cursor != chunk) ||
+            (truncated && r.cursor == 0)) {
+            fail(peer, SupplyFailure::MALFORMED, false);
+            return;
+        }
+        const std::vector<bytes32> covered(o.ids.begin() + static_cast<std::ptrdiff_t>(o.from),
+                                           o.ids.begin() + static_cast<std::ptrdiff_t>(o.from + r.cursor));
+
+        // ── VERIFICATION. Fail-closed on the FIRST problem, over the prefix the
+        // answer CLAIMS to cover: nothing is handed on unless every id in that
+        // prefix was either delivered-and-verified or named un-servable, and
+        // every delivered frame's recomputed carrier hash equals the id we asked
+        // for. Truncation narrows WHAT is claimed; it never softens the check.
         std::map<bytes32, std::size_t> seen;
+        for (const bytes32& id : r.unservable) {
+            if (!seen.emplace(id, 1).second) {
+                fail(peer, SupplyFailure::DUPLICATE_ID, false, /*dup=*/true);
+                return;
+            }
+            if (std::find(covered.begin(), covered.end(), id) == covered.end()) {
+                fail(peer, SupplyFailure::UNSOLICITED, false);
+                return;                                   // an id we never asked for
+            }
+        }
         std::vector<VerifiedFrame> verified;
         verified.reserve(r.frames.size());
         for (const auto& [id, bytes] : r.frames) {
             if (!seen.emplace(id, 0).second) {
                 fail(peer, SupplyFailure::DUPLICATE_ID, false, /*dup=*/true);
-                return;
+                return;                     // twice, or served AND called un-servable
             }
-            if (std::find(want.begin(), want.end(), id) == want.end()) {
+            if (std::find(covered.begin(), covered.end(), id) == covered.end()) {
                 fail(peer, SupplyFailure::UNSOLICITED, false);
                 return;                                   // an id we never asked for
             }
@@ -785,7 +1031,7 @@ public:
             v.carrier = dr.carrier;
             verified.push_back(std::move(v));
         }
-        for (const bytes32& id : want) {
+        for (const bytes32& id : covered) {
             if (!seen.count(id)) {
                 fail(peer, SupplyFailure::MISSING_ID, false, false, false, false,
                      /*missing=*/true);
@@ -794,13 +1040,62 @@ public:
         }
 
         FramesFn cb;
+        UnservableFn ucb;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            ++m_stats.frames_ok;
-            m_stats.frames_verified += verified.size();
+            if (!verified.empty()) {
+                ++m_stats.frames_ok;
+                m_stats.frames_verified += verified.size();
+            }
+            if (truncated) ++m_stats.truncated_replies;
+            m_stats.unservable_id += r.unservable.size();
             cb = m_on_frames;
+            ucb = m_on_unservable;
         }
-        if (cb) cb(peer, verified);
+        if (cb && !verified.empty()) cb(peer, verified);
+        // ★ THE EXPLICIT UN-SERVABLE ANSWER. Reported through BOTH the ids
+        // callback (so a caller knows exactly which ones) and the failure
+        // callback (so a caller that only watches failures still sees it). It
+        // is not a stall and it is not a drop: the fetch carries on.
+        if (!r.unservable.empty()) {
+            if (ucb) ucb(peer, r.unservable);
+            fail(peer, SupplyFailure::UNSERVABLE_ID, false);
+        }
+
+        if (!truncated) {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            ++m_stats.fetches_completed;
+            return;
+        }
+
+        // ── CONTINUE. Re-ask from the cursor, on the same peer, with a fresh
+        // deadline. The slot was released by claim_frames, so this re-arms it.
+        CtrlGetFrames q;
+        bool stopped = false;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (o.rounds + 1 > m_opt.max_continuations) {
+                ++m_stats.continuation_limit;
+                stopped = true;
+            } else if (m_out.count(peer)) {
+                // Something else claimed this peer's one slot while we verified.
+                // Do not fight it: the caller can re-ask the remainder itself.
+                ++m_stats.refused_busy;
+                stopped = true;
+            } else {
+                o.from += r.cursor;
+                o.rounds += 1;
+                arm_frames_locked(peer, o, q);
+                ++m_stats.continuations;
+            }
+        }
+        if (stopped) {
+            // Not continuing: say so explicitly rather than leaving the caller
+            // waiting for bytes that are not coming.
+            fail(peer, SupplyFailure::CONTINUATION_LIMIT, false);
+            return;
+        }
+        (void)dispatch(peer, CtrlWire::encode(q));
     }
 
     // Expire outstanding requests whose deadline has passed. Drive it from the
@@ -832,8 +1127,35 @@ private:
         std::uint32_t        request_id = 0;
         std::uint8_t         expect = 0;
         Clock::time_point    deadline{};
-        std::vector<bytes32> want;      // GETFRAMES only
+        // GETFRAMES only. `ids` is the WHOLE ask; [from, to) is the chunk this
+        // request covers. A truncated answer moves `from` forward by the cursor
+        // it served through and re-arms — so the ask itself never changes, and
+        // the remainder is always exactly ids[from, to).
+        std::vector<bytes32> ids;
+        std::uint32_t        chain = 0;
+        std::size_t          from = 0;
+        std::size_t          to = 0;
+        std::uint32_t        rounds = 0;   // continuations spent on this fetch
     };
+
+    // Arm (or re-arm) the one outstanding GETFRAMES slot for `peer` over
+    // o.ids[o.from, end) and build the request that goes with it. Caller holds
+    // m_mtx; the send happens outside the lock.
+    void arm_frames_locked(PeerId peer, Outstanding o, CtrlGetFrames& q) {
+        const std::size_t end =
+            std::min<std::size_t>(o.ids.size(),
+                                  o.from + std::min<std::size_t>(m_opt.max_ids_per_fetch,
+                                                                 kCtrlMaxIdsPerFetch));
+        o.to = end;
+        o.request_id = ++m_next_rid;
+        o.expect = CTRL_FRAMES;
+        o.deadline = Clock::now() + m_opt.request_timeout;
+        q.request_id = o.request_id;
+        q.chain = o.chain;
+        q.ids.assign(o.ids.begin() + static_cast<std::ptrdiff_t>(o.from),
+                     o.ids.begin() + static_cast<std::ptrdiff_t>(o.to));
+        m_out.insert_or_assign(peer, std::move(o));
+    }
 
     bool dispatch(PeerId peer, const std::vector<std::uint8_t>& frame) {
         SendFn s;
@@ -848,13 +1170,23 @@ private:
     // Consume the outstanding slot iff it matches (opcode, request_id). One
     // outstanding request per peer means an answer can only ever satisfy the
     // question actually asked.
-    bool claim(PeerId peer, std::uint8_t op, std::uint32_t rid,
-               std::vector<bytes32>* want_out = nullptr) {
+    bool claim(PeerId peer, std::uint8_t op, std::uint32_t rid) {
         std::lock_guard<std::mutex> lk(m_mtx);
         auto it = m_out.find(peer);
         if (it == m_out.end()) return false;
         if (it->second.expect != op || it->second.request_id != rid) return false;
-        if (want_out) *want_out = std::move(it->second.want);
+        m_out.erase(it);
+        return true;
+    }
+    // Same, but hands back the whole fetch state so the answer can be checked
+    // against the chunk it belongs to and, if truncated, continued.
+    bool claim_frames(PeerId peer, std::uint32_t rid, Outstanding& out) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto it = m_out.find(peer);
+        if (it == m_out.end()) return false;
+        if (it->second.expect != CTRL_FRAMES || it->second.request_id != rid)
+            return false;
+        out = std::move(it->second);
         m_out.erase(it);
         return true;
     }
@@ -899,6 +1231,7 @@ private:
     OrderFn                       m_on_order;
     FramesFn                      m_on_frames;
     FailFn                        m_on_fail;
+    UnservableFn                  m_on_unservable;
 };
 
 } // namespace c2pool::v37n

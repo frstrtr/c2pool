@@ -102,6 +102,8 @@ struct FrameVaultStats {
     std::uint64_t frame_queries     = 0;
     std::uint64_t frames_served     = 0;
     std::uint64_t frames_missing    = 0;   // an id asked for that we do not hold
+    std::uint64_t frames_unservable = 0;   // held, but the frame ALONE exceeds the budget
+    std::uint64_t frames_truncated  = 0;   // a query cut short by the byte/frame budget
 };
 
 // One ordered id the position index resolved: the lane position the carrier
@@ -131,6 +133,26 @@ struct VaultOrder {
     std::uint64_t             p_served = 0;
     std::uint64_t             lowest_retained = 0;   // diagnostics for the requester
     std::vector<VaultOrderId> ids;
+};
+
+// The answer to "the bytes for these ids", served in BYTE ORDER under a byte
+// budget the caller supplies. A budgeted answer is NOT a failure: it is a
+// PREFIX of the ask plus the cursor to resume from, which is what lets a fetch
+// larger than one transport frame still COMPLETE (carrier_supply.hpp drives the
+// continuation).
+struct VaultServeChunk {
+    // How many of the REQUESTED ids this answer consumed, counting from the
+    // front: served, absent and un-servable ids all advance it. The caller
+    // resumes at ids[cursor]. `cursor == ids.size()` means the whole ask was
+    // consumed.
+    std::size_t          cursor = 0;
+    // true => cursor < ids.size(): the budget bound before the ask ran out.
+    bool                 truncated = false;
+    // Ids we DO hold whose frame ALONE exceeds the byte budget, so no chunking
+    // can ever deliver them on this channel. They are reported EXPLICITLY (they
+    // are not "missing", and they must not stall the fetch). Always a subset of
+    // ids[0, cursor).
+    std::vector<bytes32> unservable;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -264,24 +286,69 @@ public:
     // the order asked, stopping at `max_frames` or `max_bytes`. Ids we do not
     // hold are simply absent — the REQUESTER treats a missing id as a
     // fail-closed outcome (carrier_supply.hpp); the server never fabricates.
-    std::size_t serve_frames(const std::vector<bytes32>& ids,
-                             std::size_t max_frames, std::size_t max_bytes,
-                             std::vector<std::pair<bytes32, std::vector<std::uint8_t>>>& out) const {
+    //
+    // ── WHY THIS REPORTS A CURSOR, AND WHY THE TWO BUDGET OUTCOMES DIFFER ────
+    // The byte budget is NOT advisory: carrier_net.hpp refuses any frame over
+    // kMaxCarrierFrame by BREAKING the socket, so a reply that overruns it
+    // costs the honest server the honest peer. Stopping silently at the budget
+    // was therefore safe but sterile — the caller could not tell "that is all"
+    // from "there is more", and a fetch bigger than one frame could never
+    // finish. Two distinct outcomes are now reported instead:
+    //
+    //   TRUNCATED    the next frame did not fit in what is LEFT of the budget.
+    //                Some earlier frame is already in `out`, so the cursor has
+    //                advanced by at least one and the caller resumes there.
+    //   UN-SERVABLE  the frame ALONE exceeds the WHOLE budget. No chunking can
+    //                ever deliver it, so it is named explicitly and the cursor
+    //                steps PAST it. Never a silent stall, never a peer drop.
+    //
+    // That split is what makes progress monotone: every call consumes at least
+    // one requested id unless `max_frames` is zero, so a continuation loop
+    // driven by the cursor always terminates.
+    VaultServeChunk serve_frames_chunk(const std::vector<bytes32>& ids,
+                                       std::size_t max_frames, std::size_t max_bytes,
+                                       std::vector<std::pair<bytes32, std::vector<std::uint8_t>>>& out) const {
         std::lock_guard<std::mutex> lk(m_mtx);
         ++m_stats.frame_queries;
         out.clear();
-        if (!m_opt.enabled) return 0;
-        std::size_t acc = 0;
-        for (const bytes32& id : ids) {
-            if (out.size() >= max_frames) break;
-            auto it = m_by_hash.find(id);
-            const Entry* e = (it == m_by_hash.end()) ? nullptr : entry_locked(it->second);
-            if (!e) { ++m_stats.frames_missing; continue; }
-            if (acc + e->frame.size() > max_bytes) break;
-            acc += e->frame.size();
-            out.emplace_back(id, e->frame);
-            ++m_stats.frames_served;
+        VaultServeChunk r;
+        if (!m_opt.enabled) {
+            // A disabled vault holds nothing: every id is simply absent, and the
+            // ask is fully consumed (the requester fail-closes on MISSING_ID).
+            r.cursor = ids.size();
+            return r;
         }
+        std::size_t acc = 0;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (out.size() >= max_frames) { r.truncated = true; break; }
+            auto it = m_by_hash.find(ids[i]);
+            const Entry* e = (it == m_by_hash.end()) ? nullptr : entry_locked(it->second);
+            if (!e) { ++m_stats.frames_missing; r.cursor = i + 1; continue; }
+            if (e->frame.size() > max_bytes) {
+                // Alone over the whole budget: unreachable by any chunking.
+                ++m_stats.frames_unservable;
+                r.unservable.push_back(ids[i]);
+                r.cursor = i + 1;
+                continue;
+            }
+            if (acc + e->frame.size() > max_bytes) { r.truncated = true; break; }
+            acc += e->frame.size();
+            out.emplace_back(ids[i], e->frame);
+            ++m_stats.frames_served;
+            r.cursor = i + 1;
+        }
+        if (r.cursor >= ids.size()) r.truncated = false;   // nothing left to resume
+        if (r.truncated) ++m_stats.frames_truncated;
+        return r;
+    }
+
+    // Count-only form, kept for callers that serve a set they already know fits
+    // (the KAT's direct vault reads). It is the chunked serve with the cursor
+    // discarded — one implementation, not two.
+    std::size_t serve_frames(const std::vector<bytes32>& ids,
+                             std::size_t max_frames, std::size_t max_bytes,
+                             std::vector<std::pair<bytes32, std::vector<std::uint8_t>>>& out) const {
+        (void)serve_frames_chunk(ids, max_frames, max_bytes, out);
         return out.size();
     }
 

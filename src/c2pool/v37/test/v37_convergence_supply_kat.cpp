@@ -35,6 +35,14 @@
 //         pre-Stage-1 reader loop, reproduced here over a raw socket) that
 //         receives a >= 0x80 opcode answers REJECT_BAD_VERSION, KEEPS the
 //         socket, and goes on to admit the very next carrier frame.
+//   CS-9  THE TRANSPORT CEILING: the reply budget is DERIVED from
+//         kMaxCarrierFrame, so no FRAMES or ORDER reply can be built over it; a
+//         fetch whose frames do not fit in one reply COMPLETES by chunking with
+//         the honest server KEPT (this is the case that used to take n_peers
+//         1 -> 0); a frame that ALONE exceeds the ceiling comes back as an
+//         explicit un-servable status, not as a missing id and not as a stall;
+//         and a peer answering "truncated, served nothing" cannot make the
+//         continuation loop.
 //   CS-8  ZERO CONSENSUS MOVEMENT: the opcodes are not in kAcceptedVersions,
 //         CarrierWire rejects every one of them, the frozen v0x01 / v0x02
 //         goldens are byte-identical, and a full serve/fetch round-trip moves
@@ -111,6 +119,32 @@ static PayoutDescriptor mk_desc(std::uint8_t fill) {
 }
 static PayoutDescriptor ALICE_DESC() { return mk_desc(0x11); }
 
+// A LARGE but entirely canon-valid descriptor: the F-2 aux slot takes up to
+// 0xffff refs (u16 count), each encoding to 26 bytes on the W3 wire
+// (u32 chain_id + kind + len + 20-byte P2PKH payload). It is the ordinary way a
+// carrier frame gets big — no malformation, no oversize hack — and it is why a
+// FRAMES reply can overrun the transport ceiling on perfectly honest traffic.
+// The PoW preimage does NOT cover the descriptor (w2_receipt.hpp WorkEvent:
+// chain_id, identity, prev_block_hash, prev_own_share, lz_bits, nonce only), so
+// mining one of these costs exactly what mining a small one costs.
+static PayoutDescriptor big_desc(std::size_t n_aux, std::uint8_t fill) {
+    PayoutDescriptor d = mk_desc(fill);
+    d.aux.clear();
+    d.aux.reserve(n_aux);
+    for (std::size_t i = 0; i < n_aux; ++i) {
+        std::vector<std::uint8_t> s = {0x76, 0xa9, 0x14};
+        for (int k = 0; k < 20; ++k)
+            s.push_back(static_cast<std::uint8_t>((i >> (8 * (k % 4))) ^ (k * 7 + fill)));
+        s.push_back(0x88);
+        s.push_back(0xac);
+        ::v37::AuxEntry e;
+        e.chain_id = static_cast<std::uint32_t>(i + 1);   // strictly increasing
+        e.ref = ::v37::canonicalize_script(s);
+        d.aux.push_back(e);
+    }
+    return d;
+}
+
 // Real sha256d grind so the event clears its own bits (identity == the
 // descriptor's key, so the W3-MUST binding holds).
 static WorkEvent mine(ChainId chain_id, const PayoutDescriptor& desc,
@@ -169,6 +203,12 @@ struct Node {
     // What the requester's verified-frames callback last delivered.
     std::mutex last_mtx;
     std::vector<VerifiedFrame> last_frames;
+    // EVERY verified frame this node was handed, across all chunks of a fetch.
+    // A fetch too big for one transport frame arrives as several verified
+    // answers, so "did the whole fetch complete?" is a question about this, not
+    // about the last callback.
+    std::vector<VerifiedFrame> all_frames;
+    std::vector<bytes32> unservable_ids;
     std::optional<CtrlOrder> last_order;
     std::vector<SupplyFailure> failures;
 
@@ -210,6 +250,12 @@ struct Node {
                                     const std::vector<VerifiedFrame>& v) {
             std::lock_guard<std::mutex> lk(last_mtx);
             last_frames = v;
+            all_frames.insert(all_frames.end(), v.begin(), v.end());
+        });
+        fetch->set_on_unservable([this](CarrierPeerNode::PeerId,
+                                        const std::vector<bytes32>& ids) {
+            std::lock_guard<std::mutex> lk(last_mtx);
+            unservable_ids.insert(unservable_ids.end(), ids.begin(), ids.end());
         });
         fetch->set_on_fail([this](CarrierPeerNode::PeerId, SupplyFailure f) {
             std::lock_guard<std::mutex> lk(last_mtx);
@@ -239,6 +285,8 @@ struct Node {
     std::uint64_t pushes() const { return ingest->pushes_forwarded(); }
 
     std::size_t n_frames() { std::lock_guard<std::mutex> lk(last_mtx); return last_frames.size(); }
+    std::size_t n_all_frames() { std::lock_guard<std::mutex> lk(last_mtx); return all_frames.size(); }
+    std::size_t n_unservable() { std::lock_guard<std::mutex> lk(last_mtx); return unservable_ids.size(); }
     std::size_t n_failures() { std::lock_guard<std::mutex> lk(last_mtx); return failures.size(); }
     bool saw_failure(SupplyFailure f) {
         std::lock_guard<std::mutex> lk(last_mtx);
@@ -247,12 +295,13 @@ struct Node {
     }
 };
 
-// Mine + admit `n` carriers locally on `node`, returning them in lane order.
-static std::vector<WorkEvent> fill_lane(Node& node, int n, const char* tag) {
+// Mine + admit `n` carriers locally on `node` under `desc`, in lane order.
+static std::vector<WorkEvent> fill_lane_desc(Node& node, int n, const char* tag,
+                                             const PayoutDescriptor& desc) {
     std::vector<WorkEvent> out;
     bytes32 prev = W2_GENESIS_PREV_OWN;
     for (int i = 0; i < n; ++i) {
-        const WorkEvent s = mine(CHAIN, ALICE_DESC(), 100, prev, tag,
+        const WorkEvent s = mine(CHAIN, desc, 100, prev, tag,
                                  static_cast<u64>(i + 1));
         prev = s.hash();
         Carrier c; c.carrier = s;
@@ -262,6 +311,9 @@ static std::vector<WorkEvent> fill_lane(Node& node, int n, const char* tag) {
     }
     (void)wait_until([&] { return node.next_pos() == static_cast<u64>(n); });
     return out;
+}
+static std::vector<WorkEvent> fill_lane(Node& node, int n, const char* tag) {
+    return fill_lane_desc(node, n, tag, ALICE_DESC());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -442,6 +494,11 @@ static void test_cs3_lying_peer_fail_closed() {
             CtrlFrames r;
             r.request_id = q.request_id;
             r.chain = q.chain;
+            // A well-formed COMPLETE answer covering the whole ask — the lie is
+            // in the BYTES, not in the framing, so the hash binding is what has
+            // to catch it.
+            r.status = CtrlFramesStatus::COMPLETE;
+            r.cursor = static_cast<std::uint16_t>(q.ids.size());
             // ★ THE LIE: id[0] is s1's hash, the bytes are s2's frame.
             r.frames.emplace_back(q.ids[0], CarrierWire::encode(c2));
             r.frames.emplace_back(q.ids[1], CarrierWire::encode(c2));
@@ -971,6 +1028,290 @@ static void test_cs8_zero_consensus_movement() {
     CHECK(B.n_frames() == 3);                     // the bytes ARE here, unapplied
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CS-9 — THE TRANSPORT CEILING. Before this, kCtrlMaxReplyBytes was 4 MiB while
+// carrier_net.hpp refuses anything over kMaxCarrierFrame = 1 MiB by BREAKING
+// the socket. Measured on c2pool#1656 head f1286d18: a 20 x 64 KiB FRAMES reply
+// encodes to 1,311,452 bytes, and sending it took the honest requester's
+// n_peers from 1 to 0 — the honest server was hard-dropped for answering the
+// question it was asked. A 10 x 64 KiB reply (655,732 B) was delivered fine, so
+// the failure was purely the size.
+//
+// This pins the fix, in three parts:
+//   (a) ARITHMETIC — the budget is DERIVED from the transport ceiling, and the
+//       largest reply the encoder can build still fits under it.
+//   (b) CONTINUATION — a fetch whose frames do not fit in one reply now
+//       COMPLETES, by chunking, with the honest server KEPT.
+//   (c) UN-SERVABLE — a single frame that ALONE exceeds the ceiling comes back
+//       as an explicit status, distinct from a missing id, with no stall and no
+//       peer drop.
+// ═══════════════════════════════════════════════════════════════════════════
+static void test_cs9_reply_ceiling_and_continuation() {
+    std::printf("-- CS-9 reply ceiling + chunked continuation + un-servable id\n");
+
+    // ── (a) THE ARITHMETIC. The budget is below the transport ceiling, and the
+    //        WORST-CASE reply — every id un-servable AND a full payload — still
+    //        encodes under it.
+    CHECK(kCtrlMaxReplyBytes < static_cast<std::size_t>(kMaxCarrierFrame));
+    CHECK(kCtrlFramesReserved + kCtrlMaxReplyBytes <= static_cast<std::size_t>(kMaxCarrierFrame));
+    {
+        CtrlFrames worst;
+        worst.request_id = 1;
+        worst.chain = CHAIN;
+        worst.status = CtrlFramesStatus::TRUNCATED;
+        worst.cursor = kCtrlMaxIdsPerFetch;
+        const std::size_t each = kCtrlMaxReplyBytes / kCtrlMaxIdsPerFetch;
+        for (std::size_t i = 0; i < kCtrlMaxIdsPerFetch; ++i) {
+            bytes32 id{};
+            id[0] = static_cast<std::uint8_t>(i);
+            id[1] = 0x5a;
+            worst.unservable.push_back(id);
+            bytes32 fid{};
+            fid[0] = static_cast<std::uint8_t>(i);
+            fid[1] = 0xa5;
+            worst.frames.emplace_back(fid, std::vector<std::uint8_t>(each, 0xcd));
+        }
+        const std::vector<std::uint8_t> enc = CtrlWire::encode(worst);
+        CHECK(CtrlWire::encoded_size(worst) == enc.size());       // the prediction is exact
+        CHECK(enc.size() <= static_cast<std::size_t>(kMaxCarrierFrame));   // ★ never over the ceiling
+        CtrlFrames back;
+        CHECK(CtrlWire::decode(enc, back));                        // and it round-trips
+        CHECK(back.status == CtrlFramesStatus::TRUNCATED);
+        CHECK(back.cursor == kCtrlMaxIdsPerFetch);
+        CHECK(back.unservable.size() == kCtrlMaxIdsPerFetch);
+        CHECK(back.frames.size() == kCtrlMaxIdsPerFetch);
+    }
+    {
+        CtrlOrder worst;                                           // ORDER too
+        worst.request_id = 2;
+        worst.chain = CHAIN;
+        worst.ids.resize(kCtrlMaxIdsPerOrder);
+        for (std::size_t i = 0; i < worst.ids.size(); ++i) worst.ids[i].pos = i;
+        const std::vector<std::uint8_t> enc = CtrlWire::encode(worst);
+        CHECK(CtrlWire::encoded_size(worst) == enc.size());
+        CHECK(enc.size() <= static_cast<std::size_t>(kMaxCarrierFrame));
+    }
+    {
+        // An option set above the ceiling is CLAMPED, not honoured: the old
+        // 4 MiB value cannot be restored through the options struct.
+        SupplyServeOptions o;
+        o.max_reply_bytes = 4u << 20;
+        CHECK(clamped_reply_budget(o) == kCtrlMaxReplyBytes);
+        o.max_ids_per_fetch = 4096;
+        CHECK(clamped_frames_per_reply(o) == kCtrlMaxIdsPerFetch);
+        o.max_ids_per_fetch = 0;                                   // and never zero
+        CHECK(clamped_frames_per_reply(o) == 1);
+    }
+
+    // ── (b) THE CONTINUATION. 20 carriers whose frames are ~64 KiB each: their
+    //        bytes total MORE than the whole transport ceiling, so they cannot
+    //        be one reply. The fetch must still complete, and the server must
+    //        still be there afterwards.
+    {
+        Node A(110), B(110);
+        const PayoutDescriptor big = big_desc(2520, 0x33);
+        const std::vector<WorkEvent> mined = fill_lane_desc(A, 20, "cs9b", big);
+        CHECK(mined.size() == 20);
+
+        std::size_t total_bytes = 0;
+        std::vector<bytes32> ids;
+        for (const WorkEvent& s : mined) {
+            Carrier c; c.carrier = s;
+            total_bytes += CarrierWire::encode(c).size();
+            ids.push_back(s.hash());
+        }
+        // ★ THE PRECONDITION OF THE BUG: one reply carrying all of these would
+        //   be over the ceiling, which is exactly what used to drop the peer.
+        CHECK(total_bytes > static_cast<std::size_t>(kMaxCarrierFrame));
+        CHECK(ids.size() <= kCtrlMaxIdsPerFetch);   // ONE ask, not pre-split by us
+
+        CHECK(A.net->listen("127.0.0.1", 0));
+        CHECK(B.net->add_peer("127.0.0.1", A.net->listen_port()));
+        CHECK(wait_until([&] { return B.net->n_peers() == 1 && A.net->n_peers() == 1; }));
+        const auto pl = B.net->peer_ids();
+        CHECK(!pl.empty());
+        if (!pl.empty()) {
+            CHECK(B.fetch->request_frames(pl.front(), CHAIN, ids));
+            // ★ IT COMPLETES. Not "the first chunk arrives" — all 20.
+            CHECK(wait_until([&] { return B.n_all_frames() == 20; }, 20000));
+            CHECK(B.n_all_frames() == 20);
+            CHECK(B.fetch->stats().frames_verified == 20);
+            CHECK(B.fetch->stats().fetches_completed == 1);
+            CHECK(B.fetch->stats().truncated_replies >= 1);  // it really was split
+            CHECK(B.fetch->stats().continuations >= 1);
+            CHECK(B.fetch->stats().continuation_limit == 0);
+            CHECK(B.fetch->stats().missing_id == 0);
+            CHECK(B.fetch->stats().hash_mismatch == 0);
+            CHECK(B.fetch->stats().unservable_id == 0);
+            CHECK(B.n_failures() == 0);
+            CHECK(!B.fetch->busy(pl.front()));               // no slot left pinned
+
+            // Every byte is the exact retained frame, id-bound as always.
+            {
+                std::lock_guard<std::mutex> lk(B.last_mtx);
+                std::size_t matched = 0;
+                for (const WorkEvent& s : mined) {
+                    Carrier c; c.carrier = s;
+                    const std::vector<std::uint8_t> want = CarrierWire::encode(c);
+                    for (const VerifiedFrame& v : B.all_frames)
+                        if (v.id == s.hash() && v.frame == want &&
+                            v.carrier.carrier.hash() == v.id) { ++matched; break; }
+                }
+                CHECK(matched == 20);
+            }
+
+            // ★ THE REGRESSION ASSERTION: the honest server is STILL CONNECTED.
+            //   This is the check that fails on head f1286d18 (n_peers 1 -> 0).
+            CHECK(B.net->n_peers() == 1);
+            CHECK(A.net->n_peers() == 1);
+            CHECK(A.serve->stats().frames_truncated >= 1);
+            CHECK(A.serve->stats().reply_oversize == 0);     // never even built one
+            CHECK(A.net->sends_refused_oversize() == 0);     // and never refused one
+            CHECK(A.relay->vault().stats().frames_truncated >= 1);
+        }
+        // Supplying is still not applying.
+        CHECK(B.next_pos() == 0);
+        CHECK(B.raw_total() == 0);
+        CHECK(B.pushes() == 0);
+    }
+
+    // ── (c) THE UN-SERVABLE FRAME. One retained frame is alone over the
+    //        budget: no chunking can ever deliver it. It must be NAMED, not
+    //        silently dropped (which would read as MISSING_ID and stall the
+    //        caller forever) and not fatal to the peer.
+    {
+        Node A(110), B(110);
+        const std::vector<WorkEvent> mined = fill_lane(A, 1, "cs9c");
+        CHECK(mined.size() == 1);
+
+        // A frame the vault will hold but the channel can never carry.
+        bytes32 huge_id{};
+        huge_id[0] = 0xde; huge_id[1] = 0xad; huge_id[31] = 0x01;
+        const std::vector<std::uint8_t> huge(kCtrlMaxReplyBytes + 1, 0x7e);
+        CHECK(A.relay->vault().insert(CHAIN, huge_id, FrameVault::kNoPos, 1, huge).has_value());
+        CHECK(A.relay->vault().holds(huge_id));
+
+        CHECK(A.net->listen("127.0.0.1", 0));
+        CHECK(B.net->add_peer("127.0.0.1", A.net->listen_port()));
+        CHECK(wait_until([&] { return B.net->n_peers() == 1 && A.net->n_peers() == 1; }));
+        const auto pl = B.net->peer_ids();
+        CHECK(!pl.empty());
+        if (!pl.empty()) {
+            CHECK(B.fetch->request_frames(pl.front(), CHAIN, {mined[0].hash(), huge_id}));
+            CHECK(wait_until([&] { return B.n_unservable() == 1; }));
+            // ★ EXPLICIT, and DISTINCT from a missing id.
+            CHECK(B.saw_failure(SupplyFailure::UNSERVABLE_ID));
+            CHECK(!B.saw_failure(SupplyFailure::MISSING_ID));
+            CHECK(B.fetch->stats().unservable_id == 1);
+            CHECK(B.fetch->stats().missing_id == 0);
+            {
+                std::lock_guard<std::mutex> lk(B.last_mtx);
+                CHECK(B.unservable_ids.size() == 1);
+                if (!B.unservable_ids.empty()) CHECK(B.unservable_ids[0] == huge_id);
+            }
+            // The servable half of the same ask still arrived, verified.
+            CHECK(B.n_all_frames() == 1);
+            CHECK(B.fetch->stats().frames_verified == 1);
+            // Not a stall: the fetch is finished and the slot is free.
+            CHECK(B.fetch->stats().fetches_completed == 1);
+            CHECK(!B.fetch->busy(pl.front()));
+            CHECK(B.saw_failure(SupplyFailure::TIMEOUT) == false);
+            // ★ And not a drop, on either side.
+            CHECK(B.net->n_peers() == 1);
+            CHECK(A.net->n_peers() == 1);
+            CHECK(A.serve->stats().frames_unservable == 1);
+            CHECK(A.serve->stats().reply_oversize == 0);
+            CHECK(A.relay->vault().stats().frames_unservable == 1);
+        }
+    }
+
+    // ── (d) A PEER THAT ANSWERS NONSENSE cannot spin the continuation. The one
+    //        answer that could loop forever is "TRUNCATED, and I consumed
+    //        nothing": re-asking would repeat the same question for ever. It is
+    //        refused as MALFORMED, so the fetch stops after exactly ONE request.
+    {
+        Node B(110);
+        std::atomic<bool> done{false};
+        std::atomic<std::uint16_t> port{0};
+        std::atomic<int> requests{0};
+        std::thread stuck([&] {
+            const int ls = ::socket(AF_INET, SOCK_STREAM, 0);
+            int one = 1;
+            ::setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            ::bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+            socklen_t alen = sizeof(a);
+            ::getsockname(ls, reinterpret_cast<sockaddr*>(&a), &alen);
+            port.store(ntohs(a.sin_port));
+            ::listen(ls, 4);
+            const int cs = ::accept(ls, nullptr, nullptr);
+            if (cs < 0) { ::close(ls); done.store(true); return; }
+            while (!done.load()) {
+                std::uint8_t lb[4];
+                std::size_t off = 0;
+                bool ok = true;
+                while (off < 4) {
+                    ssize_t k = ::recv(cs, lb + off, 4 - off, 0);
+                    if (k <= 0) { ok = false; break; }
+                    off += static_cast<std::size_t>(k);
+                }
+                if (!ok) break;
+                std::uint32_t len = 0;
+                for (int i = 0; i < 4; ++i) len |= static_cast<std::uint32_t>(lb[i]) << (8 * i);
+                std::vector<std::uint8_t> req(len);
+                off = 0;
+                while (off < len) {
+                    ssize_t k = ::recv(cs, req.data() + off, len - off, 0);
+                    if (k <= 0) { ok = false; break; }
+                    off += static_cast<std::size_t>(k);
+                }
+                if (!ok) break;
+                CtrlGetFrames q;
+                if (!CtrlWire::decode(req, q)) continue;
+                requests.fetch_add(1);
+                CtrlFrames r;
+                r.request_id = q.request_id;
+                r.chain = q.chain;
+                r.status = CtrlFramesStatus::TRUNCATED;   // ★ "there is more"...
+                r.cursor = 0;                             // ★ ...but I served none
+                const std::vector<std::uint8_t> out = CtrlWire::encode(r);
+                std::uint8_t ob[4];
+                const std::uint32_t ol = static_cast<std::uint32_t>(out.size());
+                for (int i = 0; i < 4; ++i) ob[i] = static_cast<std::uint8_t>(ol >> (8 * i));
+                ::send(cs, ob, 4, MSG_NOSIGNAL);
+                ::send(cs, out.data(), out.size(), MSG_NOSIGNAL);
+            }
+            ::close(cs);
+            ::close(ls);
+        });
+        CHECK(wait_until([&] { return port.load() != 0; }));
+        CHECK(B.net->add_peer("127.0.0.1", port.load()));
+        CHECK(wait_until([&] { return !B.net->peer_ids().empty(); }));
+        const auto pl = B.net->peer_ids();
+        if (!pl.empty()) {
+            std::vector<bytes32> ids;
+            for (int i = 0; i < 3; ++i) {
+                bytes32 h{};
+                h[0] = static_cast<std::uint8_t>(i);
+                ids.push_back(h);
+            }
+            CHECK(B.fetch->request_frames(pl.front(), CHAIN, ids));
+            CHECK(wait_until([&] { return B.n_failures() > 0; }));
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            CHECK(B.saw_failure(SupplyFailure::MALFORMED));
+            CHECK(requests.load() == 1);                      // ★ asked ONCE, not forever
+            CHECK(B.fetch->stats().continuations == 0);
+            CHECK(!B.fetch->busy(pl.front()));
+            CHECK(B.net->n_peers() == 1);                     // and still not a drop
+        }
+        done.store(true);
+        B.net->stop();
+        stuck.join();
+    }
+}
+
 int main() {
     std::printf("== v37 convergence-supply KAT (Stage 1: FrameVault + serve/fetch/verify) ==\n");
     test_cs1_vault_unified();
@@ -981,6 +1322,7 @@ int main() {
     test_cs6_flap_cannot_evict();
     test_cs7_old_peer_keeps_socket();
     test_cs8_zero_consensus_movement();
+    test_cs9_reply_ceiling_and_continuation();
     std::printf("== checks=%d failures=%d ==\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -173,13 +173,27 @@ public:
     std::uint64_t ctrl_frames_ignored() const { return m_ctrl_ignored.load(); }
     std::uint64_t ctrl_frames_routed() const { return m_ctrl_routed.load(); }
     std::uint64_t peers_dropped_slow() const { return m_slow_drops.load(); }
+    // Targeted sends refused because the frame was over kMaxCarrierFrame. The
+    // receiver's reader loop MUST break on such a frame (the length prefix is
+    // how it finds the next boundary), so writing one would cost us an honest
+    // peer. Zero on every honest path — carrier_supply.hpp sizes every reply
+    // under the ceiling by construction — and counted so a regression surfaces
+    // here instead of as a mysterious disconnect.
+    std::uint64_t sends_refused_oversize() const { return m_oversize_refused.load(); }
 
     // ── ★ targeted send (the repair channel's reply path) ───────────────────
-    // Write ONE frame to ONE connection. Returns false if the peer is gone or
-    // the write failed/timed out (in which case the peer has been dropped HARD,
-    // because a timed-out write leaves the stream desynced). Takes only that
-    // connection's own write lock, so it can never stall another peer.
+    // Write ONE frame to ONE connection. Returns false if the peer is gone, the
+    // frame is over the ceiling, or the write failed/timed out (in which case
+    // the peer has been dropped HARD, because a timed-out write leaves the
+    // stream desynced). Takes only that connection's own write lock, so it can
+    // never stall another peer.
     bool send_to(PeerId id, const std::vector<std::uint8_t>& frame) {
+        if (frame.size() > kMaxCarrierFrame) {
+            // NOT a peer drop and NOT a silent success: a refusal the caller
+            // sees, counted here. The connection is untouched.
+            m_oversize_refused.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         int fd = -1;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
@@ -496,6 +510,7 @@ private:
     std::atomic<std::uint64_t> m_ctrl_routed{0};
     std::atomic<std::uint64_t> m_ctrl_ignored{0};
     std::atomic<std::uint64_t> m_slow_drops{0};
+    std::atomic<std::uint64_t> m_oversize_refused{0};
     // SO_SNDTIMEO, ms. 10 s by default: long enough that no healthy peer ever
     // trips it, short enough that a peer which stopped reading cannot pin one
     // of our threads indefinitely. 0 => block forever (pre-Stage-1 behaviour).
