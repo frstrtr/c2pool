@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(c2wallet_qt LANGUAGES CXX)
+project(c2wallet_qt LANGUAGES C CXX)  # C enabled for the embedded nayuki qrcodegen.c (GAP-8)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # c2wallet-qt — the AIR-GAPPED, network-incapable signer (design PR #1621,
@@ -81,6 +81,7 @@ add_executable(c2wallet-qt-signer
     src/shell/PageSign.cpp
     src/shell/PageBuildTxMonero.cpp
     src/shell/PageSignMonero.cpp
+    src/shell/PageAirGap.cpp
 )
 
 # The wired pages include the C++20 hdkeys/convert public headers; build the

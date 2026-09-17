@@ -24,6 +24,15 @@ namespace c2w::artifact {
 //          prevout_txid(32) | index(4 LE) | amount(8 LE, two's-complement) |
 //          spk_len(varint) | spk | hint_len(varint) | hint(utf8)
 //
+//   0x06 R_DIGEST          (32 bytes): sha256 over EVERY preceding container
+//                            byte (magic..last record); appended last by
+//                            to_hex, verified-and-refused-on-mismatch by
+//                            from_hex when present (GAP-3).
+//   0x11 R_INPUT_SCRIPT     (repeatable): input_index(varint) | kind(1;
+//                            0=redeem,1=witness,2=tapleaf) | slen(varint) |
+//                            script  — the P2SH/P2WSH script the signer needs
+//                            (GAP-4). Skipped by old parsers (additive).
+//
 // Unknown record types are skipped on parse (forward-compat). A raw-hex
 // superset: the whole thing is a hex string carrying the unsigned tx verbatim.
 
@@ -36,7 +45,9 @@ enum : uint8_t {
     R_ALGEBRA = 0x03,
     R_UTX     = 0x04,
     R_VERDICT = 0x05,
+    R_DIGEST  = 0x06,   // GAP-3 (slice-2c): sha256 over all preceding bytes
     R_INPUT   = 0x10,
+    R_INPUT_SCRIPT = 0x11, // GAP-4 (slice-2c): redeem/witness/tapleaf script
 };
 
 static void put_varint(Bytes& b, uint64_t v) {
@@ -134,6 +145,24 @@ std::string UnsignedContainer::to_hex(std::string& err) const {
         put_record(b, R_INPUT, rec.data(), rec.size());
     }
 
+    // GAP-4: input-script records (redeem/witness/tapleaf), additive.
+    for (const auto& is : input_scripts) {
+        Bytes rec;
+        put_varint(rec, is.input_index);
+        rec.push_back(static_cast<uint8_t>(is.kind));
+        put_varint(rec, is.script.size());
+        rec.insert(rec.end(), is.script.begin(), is.script.end());
+        put_record(b, R_INPUT_SCRIPT, rec.data(), rec.size());
+    }
+
+    // GAP-3: append a sha256 over EVERY preceding container byte. A single
+    // flipped byte anywhere before it now fails from_hex() rather than relying
+    // on the human eye (the 2a mutated-output hole). Must be the LAST record.
+    {
+        Hash32 h = sha256(b.data(), b.size());
+        put_record(b, R_DIGEST, h.data(), h.size());
+    }
+
     if (b.size() > MAX_TRANSFER_BYTES) {
         err = "unsigned container exceeds the 100 kB oversize ceiling";
         return {};
@@ -157,7 +186,9 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
     UnsignedContainer c;
     size_t p = 5;
     bool saw_utx = false;
+    bool saw_coin = false, saw_netver = false, saw_algebra = false, saw_verdict = false;
     while (p < b.size()) {
+        const size_t rec_start = p;   // index of this record's type byte
         uint8_t type = b[p++];
         uint64_t len = 0;
         if (!get_varint(b, p, len)) { err = "truncated record length"; return std::nullopt; }
@@ -166,22 +197,31 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
 
         switch (type) {
             case R_COIN:
+                if (saw_coin) { err = "duplicate coin record"; return std::nullopt; }
+                saw_coin = true;
                 c.coin.assign(reinterpret_cast<const char*>(payload), len);
                 break;
             case R_NETVER:
+                if (saw_netver) { err = "duplicate network_version record"; return std::nullopt; }
+                saw_netver = true;
                 if (len != 4) { err = "network_version record not 4 bytes"; return std::nullopt; }
                 c.network_version = get_u32le(payload);
                 break;
             case R_ALGEBRA:
+                if (saw_algebra) { err = "duplicate algebra record"; return std::nullopt; }
+                saw_algebra = true;
                 if (len != 1) { err = "algebra record not 1 byte"; return std::nullopt; }
                 if (payload[0] > 2) { err = "unknown sighash algebra tag"; return std::nullopt; }
                 c.algebra = static_cast<SighashAlgebra>(payload[0]);
                 break;
             case R_UTX:
-                c.unsigned_tx.assign(payload, payload + len);
+                if (saw_utx) { err = "duplicate unsigned-tx record"; return std::nullopt; }
                 saw_utx = true;
+                c.unsigned_tx.assign(payload, payload + len);
                 break;
             case R_VERDICT:
+                if (saw_verdict) { err = "duplicate preflight-verdict record"; return std::nullopt; }
+                saw_verdict = true;
                 c.preflight_verdict.assign(reinterpret_cast<const char*>(payload), len);
                 break;
             case R_INPUT: {
@@ -204,6 +244,44 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
                 c.inputs.push_back(std::move(in));
                 break;
             }
+            case R_DIGEST: {
+                // GAP-3: verify the integrity digest over all preceding bytes,
+                // AND require it be the LAST record (so nothing can hide past
+                // the verified range). p+len is one-past this record's payload.
+                if (len != 32) { err = "digest record not 32 bytes"; return std::nullopt; }
+                Hash32 want{};
+                std::memcpy(want.data(), payload, 32);
+                Hash32 got = sha256(b.data(), rec_start);
+                if (got != want) {
+                    err = "integrity digest mismatch (container corrupted or tampered)";
+                    return std::nullopt;
+                }
+                if (p + len != b.size()) {
+                    err = "record(s) present after the integrity digest (digest must be last)";
+                    return std::nullopt;
+                }
+                c.has_digest = true;
+                break;
+            }
+            case R_INPUT_SCRIPT: {
+                // GAP-4: input_index(varint) | kind(1) | slen(varint) | script.
+                size_t q = p;
+                const size_t rec_end = p + len;
+                uint64_t idx = 0;
+                if (!get_varint(b, q, idx)) { err = "input-script index truncated"; return std::nullopt; }
+                if (q >= rec_end) { err = "input-script kind missing"; return std::nullopt; }
+                uint8_t kind = b[q++];
+                if (kind > 2) { err = "unknown input-script kind"; return std::nullopt; }
+                uint64_t slen = 0;
+                if (!get_varint(b, q, slen)) { err = "input-script length truncated"; return std::nullopt; }
+                if (q + slen > rec_end) { err = "input-script overruns record"; return std::nullopt; }
+                InputScript is;
+                is.input_index = idx;
+                is.kind = static_cast<InputScriptKind>(kind);
+                is.script.assign(b.data() + q, b.data() + q + slen);
+                c.input_scripts.push_back(std::move(is));
+                break;
+            }
             default:
                 // Unknown record type: skip for forward-compat.
                 break;
@@ -211,6 +289,23 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
         p += len;
     }
     if (!saw_utx) { err = "missing unsigned tx record"; return std::nullopt; }
+
+    // GAP-4: validate carried input-scripts against the parsed inputs, and
+    // reject duplicate (input_index, kind) records (order-independent).
+    for (size_t i = 0; i < c.input_scripts.size(); ++i) {
+        const auto& is = c.input_scripts[i];
+        if (is.input_index >= c.inputs.size()) {
+            err = "input-script references an out-of-range input index";
+            return std::nullopt;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (c.input_scripts[j].input_index == is.input_index &&
+                c.input_scripts[j].kind == is.kind) {
+                err = "duplicate input-script for the same (input, kind)";
+                return std::nullopt;
+            }
+        }
+    }
     return c;
 }
 
@@ -222,13 +317,25 @@ bool operator==(const UnsignedInput& a, const UnsignedInput& b) {
            a.derivation_hint == b.derivation_hint;
 }
 
+bool operator==(const InputScript& a, const InputScript& b) {
+    return a.input_index == b.input_index && a.kind == b.kind && a.script == b.script;
+}
+
 bool operator==(const UnsignedContainer& a, const UnsignedContainer& b) {
     return a.coin == b.coin &&
            a.network_version == b.network_version &&
            a.algebra == b.algebra &&
            a.unsigned_tx == b.unsigned_tx &&
            a.preflight_verdict == b.preflight_verdict &&
-           a.inputs == b.inputs;
+           a.inputs == b.inputs &&
+           a.input_scripts == b.input_scripts;
+}
+
+std::optional<Bytes> UnsignedContainer::script_for_input(uint64_t input_index,
+                                                         InputScriptKind kind) const {
+    for (const auto& is : input_scripts)
+        if (is.input_index == input_index && is.kind == kind) return is.script;
+    return std::nullopt;
 }
 
 // ── Signed container: the c2pool loader format ──────────────────────────────

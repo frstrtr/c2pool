@@ -386,6 +386,11 @@ void PageSign::onParse()
     if (sg::coin_is_bch(oc->coin))
         head = QStringLiteral("<div style='color:#fff;background:#b00020;font-weight:bold;padding:4px'>"
                               "BCH artifact — signing needs SIGHASH_FORKID, not in slice-2a. This tx cannot be signed here.</div>");
+    // GAP-3 (slice-2c): show the same container-integrity rung the Air-Gap page
+    // shows, so an operator pasting straight into Sign sees it too.
+    head += oc->has_digest
+        ? QStringLiteral("<div style='color:#0a6'>&#10003; GAP-3 R_DIGEST present + verified — container integrity checked at parse.</div>")
+        : QStringLiteral("<div style='color:#8a5a00'>&#9888; no GAP-3 R_DIGEST (older 2a container) — compare the unsigned txid by eye across the gap.</div>");
     cardLabel_->setText(head + render_card(view, coin_, cp, /*ownFlags*/{}, /*bound*/false, int(oc->algebra)));
 
     parsedOk_ = true;
@@ -450,7 +455,20 @@ void PageSign::onBindPreview()
         for (size_t i = 0; i < view.inputs.size(); ++i) {
             const auto& in = view.inputs[i];
             const QString spkhex = QString::fromStdString(in.spk_hex);
-            if (kl.script.empty()) {
+            // GAP-4 (slice-2c): when the key line carries no explicit '#script',
+            // fall back to a redeem/witness script the UNSIGNED CONTAINER carries
+            // in-band (R_INPUT_SCRIPT), so a P2SH/P2WSH input can be signed
+            // without the operator re-pasting the shared script.
+            Bytes eff = kl.script;
+            bool eff_from_container = false;
+            if (eff.empty()) {
+                if (in.type == sg::SpkType::P2SH) {
+                    if (auto sc = oc->script_for_input(i, art::InputScriptKind::Redeem)) { eff = *sc; eff_from_container = true; }
+                } else if (in.type == sg::SpkType::P2WSH) {
+                    if (auto sc = oc->script_for_input(i, art::InputScriptKind::Witness)) { eff = *sc; eff_from_container = true; }
+                }
+            }
+            if (eff.empty()) {
                 for (const auto& c : cands) {
                     if (c.script_hex.empty()) continue;
                     if (QString::fromStdString(c.script_hex) != spkhex) continue;
@@ -463,19 +481,20 @@ void PageSign::onBindPreview()
             } else {
                 bool matched = false;
                 if (in.type == sg::SpkType::P2SH) {
-                    ct::BuiltAddress ba = ct::build_p2sh(cp->p2sh_version, kl.script);
+                    ct::BuiltAddress ba = ct::build_p2sh(cp->p2sh_version, eff);
                     if (ba.ok() && hexq(Bytes(ba.script.begin(), ba.script.end())) == spkhex) matched = true;
                 } else if (in.type == sg::SpkType::P2WSH) {
                     const std::string hrp = cp->bech32_hrp ? cp->bech32_hrp : "";
                     if (!hrp.empty()) {
-                        ct::BuiltAddress ba = ct::build_p2wsh(hrp, kl.script);
+                        ct::BuiltAddress ba = ct::build_p2wsh(hrp, eff);
                         if (ba.ok() && hexq(Bytes(ba.script.begin(), ba.script.end())) == spkhex) matched = true;
                     }
                 }
                 if (matched) {
-                    keys.push_back({i, kl.sk.copy(), kl.comp, kl.script});
+                    keys.push_back({i, kl.sk.copy(), kl.comp, eff});
                     input_keyed[i] = true;
-                    bindingLog << QString("input #%1 ← multisig cosigner").arg(int(i));
+                    bindingLog << QString("input #%1 ← multisig cosigner%2").arg(int(i))
+                                  .arg(eff_from_container ? QStringLiteral(" (script from container GAP-4)") : QString());
                 }
             }
         }

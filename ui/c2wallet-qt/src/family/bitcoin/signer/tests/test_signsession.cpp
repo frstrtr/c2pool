@@ -395,12 +395,54 @@ static void test_new_guards() {
     CHECK(sign::coin_is_bch("BCH") && sign::coin_is_bch("bch-t") && !sign::coin_is_bch("BTC"), "coin_is_bch");
 }
 
+// GAP-4 (slice-2c) regression: a WRONG externally-supplied redeem/witness
+// script (its hash != the input's SPK program) must REFUSE. slice-2c makes this
+// script an online-supplied, cross-gap input (R_INPUT_SCRIPT), so the refusal
+// test belongs here rather than in the artifact library's self-built vectors.
+static void test_gap4_wrong_script() {
+    std::printf("[GAP-4] wrong redeem/witness script (hash != SPK) refused\n");
+    auto ska = SK(SK_A), skb = SK(SK_B), skc = SK(SK_C);
+    auto skd = SK("0000000000000000000000000000000000000000000000000000000000000004");
+    Bytes pka = PUB(ska, true), pkb = PUB(skb, true), pkc = PUB(skc, true), pkd = PUB(skd, true);
+
+    CScript real  = sgn::p2ms(2, {pka, pkb, pkc});
+    CScript wrong = sgn::p2ms(2, {pka, pkb, pkd});   // different member => different hash
+    Bytes wrongb = SB(wrong), realb = SB(real);
+
+    // P2SH input whose redeemScript HASH160 != the supplied wrong script.
+    { art::UnsignedContainer c = make_container(sgn::p2sh(real), 100000, 99000);
+      std::vector<KeyForInput> ks;
+      ks.push_back({0, ska.copy(), pka, wrongb});
+      ks.push_back({0, skb.copy(), pkb, wrongb});
+      SignOptions opt; auto o = sign::sign_and_verify(c, std::move(ks), opt);
+      CHECK(!o.ok, "GAP-4: wrong P2SH redeemScript (hash160 != SPK) refused"); }
+
+    // P2WSH input whose SHA256(witnessScript) != the program in the SPK.
+    { art::UnsignedContainer c = make_container(sgn::p2wsh(real), 100000, 99000);
+      std::vector<KeyForInput> ks;
+      ks.push_back({0, ska.copy(), pka, wrongb});
+      ks.push_back({0, skc.copy(), pkc, wrongb});
+      SignOptions opt; auto o = sign::sign_and_verify(c, std::move(ks), opt);
+      CHECK(!o.ok, "GAP-4: wrong P2WSH witnessScript (sha256 != program) refused"); }
+
+    // Control: the CORRECT witnessScript still signs — so the refusals above are
+    // the hash-binding, not a blanket refusal.
+    { art::UnsignedContainer c = make_container(sgn::p2wsh(real), 100000, 99000);
+      std::vector<KeyForInput> ks;
+      ks.push_back({0, ska.copy(), pka, realb});
+      ks.push_back({0, skc.copy(), pkc, realb});
+      SignOptions opt; auto o = sign::sign_and_verify(c, std::move(ks), opt);
+      CHECK(o.ok, "GAP-4 control: the correct P2WSH witnessScript still signs");
+      if (!o.ok) std::printf("    (%s)\n", o.error.c_str()); }
+}
+
 int main() {
     std::printf("== c2wallet-qt M6 slice-2a SignSession + Amount KATs ==\n");
     test_types();
     test_parse_refusals();
     test_balance_gates();
     test_new_guards();
+    test_gap4_wrong_script();
     test_tamper_and_wrongkey();
     test_determinism();
     test_amount();

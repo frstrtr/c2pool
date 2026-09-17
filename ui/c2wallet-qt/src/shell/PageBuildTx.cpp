@@ -135,6 +135,19 @@ PageBuildTx::PageBuildTx(QWidget* parent) : QWidget(parent)
     inv->addWidget(inputsEdit_);
     v->addWidget(inBox);
 
+    // GAP-4 (slice-2c): optional in-band redeem/witness scripts, carried
+    // as R_INPUT_SCRIPT so the offline Sign tab can spend a P2SH/P2WSH
+    // input without the operator re-pasting the shared script.
+    auto* scrBox = new QGroupBox(QStringLiteral("Input scripts (GAP-4, optional) - one per line:  inputIndex:kind:scriptHex   (kind = redeem | witness)"), this);
+    auto* scrv = new QVBoxLayout(scrBox);
+    inputScriptsEdit_ = new QPlainTextEdit(scrBox);
+    inputScriptsEdit_->setPlaceholderText(QStringLiteral(
+        "e.g.  0:witness:5221<pub1>21<pub2>21<pub3>53ae   (a P2WSH 2-of-3 witnessScript)"));
+    inputScriptsEdit_->setFont(QFont(QStringLiteral("monospace")));
+    inputScriptsEdit_->setMaximumHeight(70);
+    scrv->addWidget(inputScriptsEdit_);
+    v->addWidget(scrBox);
+
     auto* outBox = new QGroupBox(QStringLiteral("Outputs — one per line:  address:amount[:change[:path]]   or   op_return:datahex"), this);
     auto* outv = new QVBoxLayout(outBox);
     outputsEdit_ = new QPlainTextEdit(outBox);
@@ -377,6 +390,37 @@ void PageBuildTx::onAssemble()
         ui.amount = i.amount;
         ui.derivation_hint = i.hint;
         c.inputs.push_back(std::move(ui));
+    }
+
+    // GAP-4: fold any optional in-band redeem/witness scripts into the
+    // container (additive; the per-input record 0x10 is untouched).
+    {
+        const QStringList sl = inputScriptsEdit_->toPlainText().split('\n', Qt::SkipEmptyParts);
+        for (const QString& sraw : sl) {
+            const QString ln = sraw.trimmed();
+            if (ln.isEmpty()) continue;
+            const QStringList sf = ln.split(':');
+            if (sf.size() < 3) { output_->appendPlainText(QString("Refused: input-script needs index:kind:scriptHex - got '%1'").arg(ln)); return; }
+            bool oki = false; qulonglong idx = sf[0].trimmed().toULongLong(&oki);
+            if (!oki || idx >= c.inputs.size()) { output_->appendPlainText(QStringLiteral("Refused: input-script index out of range")); return; }
+            const QString kindStr = sf[1].trimmed().toLower();
+            art::InputScriptKind kind;
+            if (kindStr == QStringLiteral("redeem")) kind = art::InputScriptKind::Redeem;
+            else if (kindStr == QStringLiteral("witness")) kind = art::InputScriptKind::Witness;
+            else if (kindStr == QStringLiteral("tapleaf")) kind = art::InputScriptKind::Tapleaf;
+            else { output_->appendPlainText(QString("Refused: unknown input-script kind '%1' (redeem|witness|tapleaf)").arg(kindStr)); return; }
+            Bytes sbytes;
+            if (!from_hex(sf.mid(2).join(':').trimmed(), sbytes) || sbytes.empty()) { output_->appendPlainText(QStringLiteral("Refused: input-script hex invalid/empty")); return; }
+            // Give the operator feedback BEFORE the air-gap crossing: the kind
+            // must match the input's SPK type, and tapleaf is unsupported (the
+            // slice-2a signer has no taproot-script path).
+            const c2w::sign::SpkType st = c2w::sign::classify_spk(c.inputs[idx].script_pubkey);
+            if (kind == art::InputScriptKind::Tapleaf) { output_->appendPlainText(QStringLiteral("Refused: tapleaf input-script kind is unsupported (no taproot-script signer)")); return; }
+            if (kind == art::InputScriptKind::Redeem && st != c2w::sign::SpkType::P2SH) { output_->appendPlainText(QStringLiteral("Refused: a redeem script is only valid on a P2SH input")); return; }
+            if (kind == art::InputScriptKind::Witness && st != c2w::sign::SpkType::P2WSH) { output_->appendPlainText(QStringLiteral("Refused: a witness script is only valid on a P2WSH input")); return; }
+            art::InputScript is; is.input_index = static_cast<uint64_t>(idx); is.kind = kind; is.script = sbytes;
+            c.input_scripts.push_back(std::move(is));
+        }
     }
 
     std::string aerr;

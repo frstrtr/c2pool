@@ -41,6 +41,7 @@ private slots:
 private:
     QComboBox*      coinCombo_{nullptr};
     QPlainTextEdit* inputsEdit_{nullptr};
+    QPlainTextEdit* inputScriptsEdit_{nullptr};  // GAP-4 (slice-2c): optional redeem/witness scripts
     QPlainTextEdit* outputsEdit_{nullptr};
     QCheckBox*      confirmHighFee_{nullptr};
     QLabel*         summaryLabel_{nullptr};
