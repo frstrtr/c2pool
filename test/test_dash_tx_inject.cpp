@@ -1043,3 +1043,58 @@ TEST(DashTxInject, PeerFloodDoesNotStarveLocalInject)
     EXPECT_EQ(st.inject_rate_count(), 1u)
         << "only the single local attempt is charged to the LOCAL budget";
 }
+
+
+// ── Slice B (#157): the arm closure's PEER sink charges the PEER budget ──────
+// Regression guard for the Slice-B re-land conflict resolution. main_dash's
+// arm_tx_inject installs the p2p tx_inject sink as a closure that calls
+// submit_inject with InjectOrigin::Peer. The stale orphan branch installed it
+// with the DEFAULT origin (Local), which would re-merge the peer budget into
+// the operator's local one and undo M3's anti-starvation split. This KAT builds
+// the EXACT sink-closure shape main_dash installs and floods through IT (not a
+// bare submit_inject with an explicit origin), proving the peer path charges the
+// PEER budget and leaves the LOCAL budget untouched.
+TEST(DashTxInject, SliceBArmSinkChargesPeerBudgetNotLocal)
+{
+    using Origin = NodeCoinState::InjectOrigin;
+    UTXOViewCache utxo(nullptr);            // empty view: injects fail post-charge
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    // The peer sink EXACTLY as main_dash's arm_tx_inject installs it.
+    auto peer_sink = [&st](const MutableTransaction& tx, uint32_t flags,
+                           int32_t expiry_height) {
+        return st.submit_inject(tx, flags, expiry_height, Origin::Peer);
+    };
+
+    const std::size_t cap = InjectRateLimiter::kMaxInjectsPerWindow;
+    for (std::size_t i = 0; i < cap; ++i) {
+        MutableTransaction tx = minimal_tx(0x01);
+        tx.vin[0].prevout.index = static_cast<uint32_t>(i);   // unique txid
+        auto r = peer_sink(tx, 0, 0);
+        EXPECT_NE(r.cause, "inject-rate-limited-peers-count")
+            << "under the peer cap the sink must not be rate-limited at i=" << i;
+    }
+    EXPECT_EQ(st.inject_rate_count_peer(), cap)
+        << "the peer sink must charge every attempt to the PEER budget";
+    EXPECT_EQ(st.inject_rate_count(), 0u)
+        << "the peer sink must NOT touch the LOCAL budget";
+
+    // The (cap+1)th through the sink is throttled on the PEER budget by name.
+    {
+        MutableTransaction over = minimal_tx(0x01);
+        over.vin[0].prevout.index = static_cast<uint32_t>(cap);
+        auto r = peer_sink(over, 0, 0);
+        EXPECT_FALSE(r.ok);
+        EXPECT_EQ(r.cause, "inject-rate-limited-peers-count");
+    }
+
+    // A LOCAL operator inject still clears the rate gate despite the peer flood
+    // (fails later on the empty view, never on the rate limiter).
+    MutableTransaction local = minimal_tx(0x02);
+    auto rl = st.submit_inject(local, 0, 0, Origin::Local);
+    EXPECT_FALSE(rl.ok);
+    EXPECT_EQ(rl.cause, "inject-unpriceable")
+        << "a local inject must clear the rate gate despite a peer flood";
+    EXPECT_EQ(st.inject_rate_count(), 1u)
+        << "only the single local attempt is charged to the LOCAL budget";
+}

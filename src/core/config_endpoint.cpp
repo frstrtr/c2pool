@@ -328,6 +328,7 @@ const char* batch_verdict_name(BatchVerdict v) {
         case BatchVerdict::RejectPairRequired:  return "pair_required";
         case BatchVerdict::RejectRefereeDisarm: return "referee_disarm";
         case BatchVerdict::RejectValidator:     return "validator";
+        case BatchVerdict::RejectRestartUnsupported: return "restart_unsupported";
     }
     return "?";
 }
@@ -369,6 +370,17 @@ BatchResult validate_apply_batch(const std::map<std::string, std::string>& chang
         else                               r.live_keys.push_back(canon);
         (void)value;
     }
+
+    // Design F1: RESTART-class keys are partitioned but there is NO restart-
+    // aware applier yet. Applying one like a LIVE key would swap the reporting
+    // mirror while the running process keeps the OLD value -- a mirror-vs-runtime
+    // lie. REFUSE the whole batch by a named cause until a restart-aware applier
+    // exists. (embedded.tx_inject is MONEY_LIVE, so it takes the money-nonce
+    // path, NOT this one; this closes the hole for every OTHER RESTART key.)
+    if (!r.restart_keys.empty())
+        return reject(BatchVerdict::RejectRestartUnsupported, r.restart_keys.front(),
+                      "restart-class key cannot be applied at runtime (no restart-"
+                      "aware applier); change it in config and restart the node");
 
     // Pass 2: pair-required — a pair(path,hex) half must arrive with its
     // partner, unless the partner is already set in the current resolution.

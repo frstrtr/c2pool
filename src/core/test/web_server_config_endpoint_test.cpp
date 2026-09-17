@@ -15,11 +15,18 @@
 // the coin field + mask-applicable keys track the published coin.
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cctype>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <boost/asio/connect.hpp>
+#include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/core.hpp>
@@ -106,6 +113,24 @@ std::unique_ptr<core::WebServer> make_apply_server(net::io_context& ioc) {
         j["http_status"] = resp.http_status;
         return j;
     });
+    ws->start();
+    return ws;
+}
+
+// Slice B (#157): stand up a server whose POST /api/tx-inject/submit is WIRED to
+// a caller-supplied submit fn (the same seam main_dash uses via
+// set_tx_inject_submit_fn). An UNWIRED server (make_wired_server) stays 503
+// {"armed":false} on this route — the fail-closed dormant posture.
+std::unique_ptr<core::WebServer> make_submit_server(
+        net::io_context& ioc,
+        std::function<nlohmann::json(const std::string&)> submit_fn) {
+    auto ws = std::make_unique<core::WebServer>(ioc, "127.0.0.1", 0, false);
+    ws->set_stratum_port(0);
+    auto* mi = ws->get_mining_interface();
+    mi->set_config_fns(
+        []() { return ce::resolved_config_json(); },
+        []() { return ce::catalog_schema_json(); });
+    mi->set_tx_inject_submit_fn(std::move(submit_fn));
     ws->start();
     return ws;
 }
@@ -201,8 +226,11 @@ TEST(ConfigEndpointHttp, PostApplyNonMoneyAppliesWithToken) {
     auto ws = make_apply_server(ioc);
 
     int status = 0;
+    // web.external_ip is a LIVE (non-money) key: it applies at runtime. (web.port
+    // is RESTART-class and is now refused by the design-F1 restart guard, so it
+    // is no longer a valid "live apply" example -- see PostApplyRefusesRestartClassKey.)
     nlohmann::json req = {{"control_token", "tok-abc"},
-                          {"changes", {{"web.port", "9091"}}}};
+                          {"changes", {{"web.external_ip", "1.2.3.4"}}}};
     auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
                            status, req.dump());
     EXPECT_EQ(status, 200) << body;
@@ -212,7 +240,7 @@ TEST(ConfigEndpointHttp, PostApplyNonMoneyAppliesWithToken) {
     // The mirror behind GET /api/config now reports the applied value.
     auto cfg = nlohmann::json::parse(
         do_request(ws->bound_port(), http::verb::get, "/api/config", status));
-    EXPECT_EQ(cfg["keys"]["web.port"].value("value", std::string()), "9091");
+    EXPECT_EQ(cfg["keys"]["web.external_ip"].value("value", std::string()), "1.2.3.4");
     // apply_armed flips true once the token is registered.
     EXPECT_TRUE(cfg.value("apply_armed", false));
 }
@@ -358,4 +386,427 @@ TEST(ConfigEndpointHttp, CoinGenericDgb) {
     // A DASH-only embedded lever must NOT appear under the DGB mask.
     EXPECT_FALSE(j["keys"].contains("embedded.tx_serve_own_set"))
         << "DGB config must not carry DASH-only embedded keys";
+}
+
+// ── Slice B (#157): tx-injection ARM is a MONEY-path config write ──────────
+// Observed by a static so the process-global ParamApplier setter never holds a
+// dangling stack reference after the test returns.
+static bool s_tx_inject_setter_saw = false;
+
+// Reclassification present-check: embedded.tx_inject must now report as a
+// money-path key (Mut::MONEY_LIVE) over GET /api/config, so a qt/operator sees
+// that arming it demands the full money gate — not a plain RESTART write.
+TEST(ConfigEndpointHttp, SliceBTxInjectIsMoneyClassified) {
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    net::io_context ioc;
+    auto ws = make_wired_server(ioc);
+
+    int status = 0;
+    auto body = do_request(ws->bound_port(), http::verb::get, "/api/config", status);
+    EXPECT_EQ(status, 200) << body;
+    auto j = nlohmann::json::parse(body);
+    ASSERT_TRUE(j["keys"].contains("embedded.tx_inject")) << body;
+    EXPECT_TRUE(j["keys"]["embedded.tx_inject"].value("money", false))
+        << "the tx-injection arm must be money-classified (Slice B)";
+    EXPECT_EQ(j["keys"]["embedded.tx_inject"].value("mutability", std::string()),
+              "money_live");
+}
+
+// The arm routed THROUGH apply_config: a change to embedded.tx_inject without a
+// nonce issues a confirm (money gate, nothing applied, no tripwire); presenting
+// the matching nonce applies it AND invokes the registered runtime arm setter.
+// This is exactly the path the QT arm/disarm uses (Slice A gate reused, no
+// second write path).
+TEST(ConfigEndpointHttp, SliceBTxInjectArmGoesThroughMoneyGateAndFiresSetter) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-arm");
+    // Register the runtime arm setter (main_dash registers the real one that
+    // flips node_coin_state + the p2p sink; here we prove apply invokes it).
+    s_tx_inject_setter_saw = false;
+    ce::applier().register_setter(
+        "embedded.tx_inject",
+        [](const std::string& v) {
+            s_tx_inject_setter_saw = (v == "true" || v == "1" || v == "on");
+            return true;
+        });
+
+    net::io_context ioc;
+    auto ws = make_apply_server(ioc);
+
+    // Phase 1: no nonce -> confirm issued, nothing applied, wire not tripped.
+    int status = 0;
+    nlohmann::json issue = {{"control_token", "tok-arm"},
+                            {"changes", {{"embedded.tx_inject", "true"}}}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                           status, issue.dump());
+    EXPECT_EQ(status, 200) << body;
+    auto j = nlohmann::json::parse(body);
+    EXPECT_TRUE(j.value("need_confirm", false)) << body;
+    EXPECT_FALSE(j.value("applied", true));
+    const std::string nonce = j.value("money_nonce", std::string());
+    ASSERT_FALSE(nonce.empty());
+    EXPECT_EQ(ce::tripwire_state().count, 0u);
+    EXPECT_FALSE(s_tx_inject_setter_saw)
+        << "a phase-1 confirmation request must not fire the arm setter";
+
+    // Phase 2: matching nonce -> applied + setter fired.
+    nlohmann::json confirm = {{"control_token", "tok-arm"},
+                              {"money_nonce", nonce},
+                              {"changes", {{"embedded.tx_inject", "true"}}}};
+    body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                      status, confirm.dump());
+    EXPECT_EQ(status, 200) << body;
+    j = nlohmann::json::parse(body);
+    EXPECT_TRUE(j.value("applied", false)) << body;
+    EXPECT_TRUE(s_tx_inject_setter_saw)
+        << "a confirmed money-gated apply must fire the runtime arm setter";
+
+    // The reporting mirror now shows the arm ON.
+    auto cfg = nlohmann::json::parse(
+        do_request(ws->bound_port(), http::verb::get, "/api/config", status));
+    EXPECT_EQ(cfg["keys"]["embedded.tx_inject"].value("value", std::string()), "true");
+}
+
+// ── Slice B (#157): POST /api/tx-inject/submit — raw-tx submit route ────────
+// A main that never installs the submit fn keeps the route INERT: http_session
+// answers 503 {"armed":false} (has_tx_inject_submit_fn() gate). This is the
+// fail-closed dormant posture every production main starts in.
+TEST(ConfigEndpointHttp, SliceBTxInjectSubmitDormantWhenUnwired) {
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    net::io_context ioc;
+    auto ws = make_wired_server(ioc);   // config read fns only; NO submit fn
+
+    int status = 0;
+    nlohmann::json body_j = {{"raw_tx", "00"}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/submit",
+                           status, body_j.dump());
+    EXPECT_EQ(status, 503) << "an unwired submit endpoint must be inert";
+    auto j = nlohmann::json::parse(body);
+    EXPECT_FALSE(j.value("armed", true)) << "the submit route must report armed:false";
+    EXPECT_NE(j.value("error", std::string()).find("not wired"), std::string::npos) << body;
+}
+
+// The wired submit route, end to end through the REAL http_session dispatch.
+//
+// NOTE ON SCOPE: core_test does not link the dash node library, so a real
+// NodeCoinState / submit_inject cannot be constructed here — the arm gate
+// itself (submit_inject returns "inject-disabled" whenever embedded.tx_inject
+// is OFF, which is the default) is pinned at the node layer. This test double
+// mirrors main_dash's submit-fn HTTP contract so the CORE-owned pieces are
+// exercised for real: the /api/tx-inject/submit route match, verbatim body
+// pass-through into rest_tx_inject_submit, and http_session's http_status
+// mapping (+ erase from the emitted body) for the two money-safety causes —
+// a malformed/non-hex raw-tx (400, not a crash, not a silent accept) and a
+// well-formed tx on a DISARMED node (409 inject-disabled, fail-closed).
+TEST(ConfigEndpointHttp, SliceBTxInjectSubmitRouteMapsDisarmedAndBadHex) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-map");   // the submit route now gates on the token
+
+    std::string seen_body;
+    auto submit_double = [&seen_body](const std::string& body) -> nlohmann::json {
+        seen_body = body;
+        auto req = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+        if (!req.is_object() || !req.contains("raw_tx") || !req["raw_tx"].is_string())
+            return nlohmann::json{{"ok", false}, {"cause", "missing raw_tx hex"},
+                                  {"http_status", 400}};
+        const std::string hex = req["raw_tx"].get<std::string>();
+        const bool even_hex = !hex.empty() && (hex.size() % 2 == 0) &&
+            std::all_of(hex.begin(), hex.end(),
+                        [](unsigned char c) { return std::isxdigit(c) != 0; });
+        if (!even_hex)
+            return nlohmann::json{{"ok", false}, {"cause", "raw_tx must be even-length hex"},
+                                  {"http_status", 400}};
+        // Well-formed hex, but the tx-inject arm is OFF by default
+        // (embedded.tx_inject default false) => submit_inject refuses.
+        return nlohmann::json{{"ok", false}, {"cause", "inject-disabled"},
+                              {"armed", false}, {"http_status", 409}};
+    };
+
+    net::io_context ioc;
+    auto ws = make_submit_server(ioc, submit_double);
+
+    // (a) malformed / non-hex raw_tx => 400 (bad request), never a silent accept.
+    int status = 0;
+    nlohmann::json bad = {{"control_token", "tok-map"}, {"raw_tx", "zz"}};  // non-hex chars
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/submit",
+                           status, bad.dump());
+    EXPECT_EQ(status, 400) << body;
+    auto j = nlohmann::json::parse(body);
+    EXPECT_FALSE(j.value("ok", true));
+    EXPECT_FALSE(j.contains("http_status"))
+        << "http_session must strip the transport http_status from the body";
+    EXPECT_EQ(seen_body, bad.dump())
+        << "the raw POST body must reach the submit fn verbatim";
+
+    // (b) well-formed hex on a DISARMED node => 409 inject-disabled (fail-closed).
+    nlohmann::json ok_hex = {{"control_token", "tok-map"}, {"raw_tx", "0100000000"}};
+    body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/submit",
+                      status, ok_hex.dump());
+    EXPECT_EQ(status, 409) << body;
+    j = nlohmann::json::parse(body);
+    EXPECT_EQ(j.value("cause", std::string()), "inject-disabled");
+    EXPECT_FALSE(j.value("armed", true)) << "a disarmed submit must not report armed";
+    ce::clear_control_token();
+}
+
+// Money gate, ADDRESS-key branch (config_endpoint.cpp:668-686). The existing
+// money KATs only ever drive a PCT key; an ADDR_COIN money key with an INVALID
+// address must, once the two-phase nonce confirms, be rejected by the
+// server-side AddressValidator with RejectMoneyGate (409) and the M0 tripwire
+// must fire — proving a bad payout/owner address can never be applied.
+TEST(ConfigEndpointHttp, SliceBMoneyGateRejectsInvalidAddressAndTripsWire) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-addr");
+    net::io_context ioc;
+    auto ws = make_apply_server(ioc);
+
+    const std::string bad_addr = "not-a-valid-dash-address";
+
+    // Phase 1: no nonce -> confirm issued, nothing applied, wire NOT tripped
+    // (a bad address passes the cheap schema pass; validity is a money-gate
+    // check applied only AFTER the nonce confirms).
+    int status = 0;
+    nlohmann::json issue = {{"control_token", "tok-addr"},
+                            {"changes", {{"money.node_owner_address", bad_addr}}}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                           status, issue.dump());
+    EXPECT_EQ(status, 200) << body;
+    auto j = nlohmann::json::parse(body);
+    EXPECT_TRUE(j.value("need_confirm", false)) << body;
+    const std::string nonce = j.value("money_nonce", std::string());
+    ASSERT_FALSE(nonce.empty());
+    EXPECT_EQ(ce::tripwire_state().count, 0u);
+
+    // Phase 2: matching nonce -> the AddressValidator rejects the bad address.
+    nlohmann::json confirm = {{"control_token", "tok-addr"},
+                              {"money_nonce", nonce},
+                              {"changes", {{"money.node_owner_address", bad_addr}}}};
+    body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                      status, confirm.dump());
+    EXPECT_EQ(status, 409) << body;
+    j = nlohmann::json::parse(body);
+    EXPECT_EQ(j.value("status", std::string()), "money_gate");
+    EXPECT_EQ(j.value("offending_key", std::string()), "money.node_owner_address");
+    EXPECT_GE(ce::tripwire_state().count, 1u)
+        << "an invalid money-path address must trip the M0 wire";
+    EXPECT_EQ(ce::tripwire_state().last_key, "money.node_owner_address");
+
+    // Nothing applied: the address key stays empty in the reporting mirror.
+    auto cfg = nlohmann::json::parse(
+        do_request(ws->bound_port(), http::verb::get, "/api/config", status));
+    EXPECT_EQ(cfg["keys"]["money.node_owner_address"].value("value", std::string()), "");
+}
+
+// Nonce single-use / replay: a confirmed money nonce is CONSUMED on a
+// successful apply. Re-presenting the SAME nonce for the SAME diff a second
+// time must be REFUSED (the pending nonce is gone) with money_gate (409) + a
+// tripwire fire — proving the two-phase nonce cannot be replayed.
+TEST(ConfigEndpointHttp, SliceBMoneyNonceIsSingleUseReplayRefused) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-replay");
+    net::io_context ioc;
+    auto ws = make_apply_server(ioc);
+
+    // Phase 1: issue a nonce bound to fee=0.5.
+    int status = 0;
+    nlohmann::json issue = {{"control_token", "tok-replay"},
+                            {"changes", {{"money.node_owner_fee_pct", "0.5"}}}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                           status, issue.dump());
+    auto j = nlohmann::json::parse(body);
+    const std::string nonce = j.value("money_nonce", std::string());
+    ASSERT_FALSE(nonce.empty());
+
+    // Phase 2: confirm -> applied. This CONSUMES the nonce (single-use).
+    nlohmann::json confirm = {{"control_token", "tok-replay"},
+                              {"money_nonce", nonce},
+                              {"changes", {{"money.node_owner_fee_pct", "0.5"}}}};
+    body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                      status, confirm.dump());
+    EXPECT_EQ(status, 200) << body;
+    j = nlohmann::json::parse(body);
+    EXPECT_TRUE(j.value("applied", false)) << body;
+    const uint64_t trip_after_apply = ce::tripwire_state().count;
+    EXPECT_EQ(trip_after_apply, 0u) << "a sanctioned confirm must not trip the wire";
+
+    // Phase 3 (REPLAY): re-present the SAME now-consumed nonce for the SAME
+    // diff -> refused, since the pending nonce was erased on first use.
+    body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                      status, confirm.dump());
+    EXPECT_EQ(status, 409) << body;
+    j = nlohmann::json::parse(body);
+    EXPECT_EQ(j.value("status", std::string()), "money_gate");
+    EXPECT_GT(ce::tripwire_state().count, trip_after_apply)
+        << "a consumed nonce must not confirm a second time (single-use)";
+}
+
+
+// ── Slice B (#157): POST /api/tx-inject/submit control-token gate ───────────
+// Once the lane is armed, the submit route must NOT let just any local process
+// spend the operator's reserved inject rate-budget: the request body carries
+// the SAME loopback control token that arms the money gate. Fail-closed — 403
+// while no token is registered (default) and 403 on any mismatch; only the
+// exact token reaches the (wired) submit fn.
+TEST(ConfigEndpointHttp, SliceBSubmitRequiresControlToken) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+
+    int calls = 0;
+    auto submit_double = [&calls](const std::string&) -> nlohmann::json {
+        ++calls;
+        return nlohmann::json{{"ok", true}, {"cause", "ok"}, {"http_status", 200}};
+    };
+    net::io_context ioc;
+    auto ws = make_submit_server(ioc, submit_double);
+
+    // (a) NO token registered at all => any submit is refused 403, fn untouched.
+    int status = 0;
+    nlohmann::json b = {{"raw_tx", "0100000000"}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/submit",
+                           status, b.dump());
+    EXPECT_EQ(status, 403) << body;
+    EXPECT_EQ(calls, 0) << "a token-less submit must never reach the submit fn";
+
+    // Arm a token; a WRONG token is still 403 and still never reaches the fn.
+    ce::set_control_token("tok-submit");
+    nlohmann::json wrong = {{"control_token", "nope"}, {"raw_tx", "0100000000"}};
+    body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/submit",
+                      status, wrong.dump());
+    EXPECT_EQ(status, 403) << body;
+    EXPECT_EQ(calls, 0) << "a wrong-token submit must never reach the submit fn";
+
+    // The EXACT token reaches the fn.
+    nlohmann::json good = {{"control_token", "tok-submit"}, {"raw_tx", "0100000000"}};
+    body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/submit",
+                      status, good.dump());
+    EXPECT_EQ(status, 200) << body;
+    EXPECT_EQ(calls, 1) << "the correct token must reach the wired submit fn exactly once";
+    ce::clear_control_token();
+}
+
+// The submit fn is installed through thread_safe_wrap, so it must execute on the
+// node producer io_context thread (submit_inject / m_inject_pool are IO-thread-
+// confined and lock-free), NEVER on the web thread. Drive a real HTTP request
+// and assert the thread id the fn records equals the producer io_context thread.
+TEST(ConfigEndpointHttp, SliceBSubmitRunsOnProducerThread) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-thr");
+
+    net::io_context ioc;
+    net::io_context producer;
+    auto guard = net::make_work_guard(producer);
+
+    auto ws = std::make_unique<core::WebServer>(ioc, "127.0.0.1", 0, false);
+    ws->set_stratum_port(0);
+    auto* mi = ws->get_mining_interface();
+    mi->set_config_fns([]() { return ce::resolved_config_json(); },
+                       []() { return ce::catalog_schema_json(); });
+
+    std::promise<std::thread::id> ready;
+    std::thread producer_thread([&]() {
+        // set_io_context stamps m_main_thread_id = THIS (producer) thread, so a
+        // call arriving on the web thread is dispatched here. Called before
+        // ws->start() (main waits on `ready`), honoring the wiring order.
+        mi->set_io_context(&producer);
+        ready.set_value(std::this_thread::get_id());
+        producer.run();
+    });
+    const std::thread::id producer_tid = ready.get_future().get();
+
+    std::atomic<bool> saw{false};
+    std::thread::id fn_tid{};
+    mi->set_tx_inject_submit_fn([&](const std::string&) -> nlohmann::json {
+        fn_tid = std::this_thread::get_id();
+        saw.store(true);
+        return nlohmann::json{{"ok", true}, {"cause", "ok"}, {"http_status", 200}};
+    });
+    ASSERT_TRUE(mi->has_io_context());
+    ws->start();
+
+    int status = 0;
+    nlohmann::json b = {{"control_token", "tok-thr"}, {"raw_tx", "0100000000"}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/submit",
+                           status, b.dump());
+    EXPECT_EQ(status, 200) << body;
+    ASSERT_TRUE(saw.load()) << "the submit fn must have run";
+    EXPECT_EQ(fn_tid, producer_tid)
+        << "the submit fn must run on the node producer io_context thread, not the web thread";
+
+    guard.reset();
+    producer.stop();
+    if (producer_thread.joinable()) producer_thread.join();
+    ce::clear_control_token();
+}
+
+// A wedged producer io_context (nobody servicing it) must degrade the submit to
+// a 5xx within the thread_safe_wrap dispatch timeout (~10s), NEVER hang the web
+// thread past the liveness watchdog. We point set_io_context at an io_context we
+// deliberately never run, then time the request.
+TEST(ConfigEndpointHttp, SliceBSubmitTimeoutIs5xxNotHang) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-to");
+
+    net::io_context ioc;
+    net::io_context producer;   // NEVER run: the posted submit task is never serviced
+
+    auto ws = std::make_unique<core::WebServer>(ioc, "127.0.0.1", 0, false);
+    ws->set_stratum_port(0);
+    auto* mi = ws->get_mining_interface();
+    mi->set_config_fns([]() { return ce::resolved_config_json(); },
+                       []() { return ce::catalog_schema_json(); });
+    // set_io_context on THIS (test) thread => m_main_thread_id = test thread, so
+    // the web-thread call is dispatched to `producer` (which never runs).
+    mi->set_io_context(&producer);
+    mi->set_tx_inject_submit_fn([](const std::string&) -> nlohmann::json {
+        return nlohmann::json{{"ok", true}, {"http_status", 200}};   // never reached
+    });
+    ws->start();
+
+    int status = 0;
+    nlohmann::json b = {{"control_token", "tok-to"}, {"raw_tx", "0100000000"}};
+    const auto t0 = std::chrono::steady_clock::now();
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/submit",
+                           status, b.dump());
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    EXPECT_GE(status, 500) << body;
+    EXPECT_LT(status, 600) << body;
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 12)
+        << "a wedged producer must degrade to 5xx within the dispatch timeout, not hang";
+    ce::clear_control_token();
+}
+
+// Design F1: a RESTART-class key is partitioned but has no runtime applier, so
+// applying it like a LIVE key would swap the reporting mirror while the running
+// process keeps the OLD value (a mirror-vs-runtime lie). The apply path must
+// REFUSE a RESTART-class key by a named cause. (embedded.tx_inject is now
+// MONEY_LIVE and takes the money-nonce path instead; embedded.fold_checkscripts
+// is a plain RESTART key that exercises this refusal.)
+TEST(ConfigEndpointHttp, PostApplyRefusesRestartClassKey) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-restart");
+    net::io_context ioc;
+    auto ws = make_apply_server(ioc);
+
+    int status = 0;
+    nlohmann::json apply = {{"control_token", "tok-restart"},
+                            {"changes", {{"embedded.fold_checkscripts", "true"}}}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                           status, apply.dump());
+    EXPECT_EQ(status, 400) << body;
+    auto j = nlohmann::json::parse(body);
+    EXPECT_EQ(j.value("status", std::string()), "validation");
+    EXPECT_EQ(j.value("offending_key", std::string()), "embedded.fold_checkscripts");
+    EXPECT_NE(j.value("error", std::string()).find("restart-class"), std::string::npos) << body;
+
+    // Nothing applied: no money nonce was ever issued, wire not tripped.
+    EXPECT_EQ(ce::tripwire_state().count, 0u);
+    ce::clear_control_token();
 }

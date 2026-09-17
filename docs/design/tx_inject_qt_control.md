@@ -5,6 +5,37 @@ they change the money path and/or arm a feature, so they are **not implemented**
 in this PR and require an explicit operator tap on wake. This PR ships slice (0)
 only — a read-only status surface.
 
+## Update (2026-09) — what has since landed on master
+
+The sequencing below has largely happened; this section is the authoritative
+current state, the design that follows is retained for rationale:
+
+- **M3 (#1606) is MERGED and INLINE.** The rate limiter + bounded-work sandbox
+  live directly inside `NodeCoinState::submit_inject` (`inject_rate_limiter.hpp`
+  + `inject_sandbox.hpp`). submit_inject now carries an `InjectOrigin{Local,Peer}`
+  parameter that selects a SPLIT rate budget: a peer flood exhausts only the peer
+  budget and can never starve the operator's own local inject.
+- **Slice A (#1616) is MERGED.** `POST /api/config/apply` is the live, fail-closed,
+  money-gated write path (loopback control token + two-phase money nonce bound to
+  the exact diff + M0 tripwire). Dormant until an operator registers a token.
+- **Slice B is RE-LANDED onto master (this PR)**, M3-origin-correct:
+  - `embedded.tx_inject` is reclassified `RESTART -> MONEY_LIVE`, so arming it
+    runs the full two-phase money-nonce gate through the SAME apply path.
+  - The runtime arm setter flips BOTH the M1 submit gate AND the p2p tx_inject
+    sink together; the peer sink installs with `InjectOrigin::Peer` (M3 split
+    preserved); disarm clears the sink.
+  - `POST /api/tx-inject/submit` (loopback-only) hands a raw consensus tx to
+    `submit_inject` with `InjectOrigin::Local` (the operator's own reserved
+    budget). It is installed through `thread_safe_wrap`, so it runs on the node
+    io_context strand, never the web thread; a wedged strand degrades to a 5xx.
+  - **`control_token` is now REQUIRED on the submit body** (checked via the same
+    `check_control_token()`; 403 on miss), so once armed no other local process
+    can spend the operator's inject rate-budget. `raw_tx` must be even-length hex.
+  - The apply path now **REFUSES RESTART-class keys** by a named cause
+    (`restart_unsupported`) until a restart-aware applier exists — closing a
+    mirror-vs-runtime hole (a RESTART key had been partitioned but never consulted).
+
+
 ## Background — what exists today
 
 Node-side tx-inject runtime (DASH only, flag `--embedded-tx-inject`, **default

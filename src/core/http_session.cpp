@@ -16,6 +16,7 @@
 
 #include <core/host_port.hpp>
 #include "web_server.hpp"
+#include "config_endpoint.hpp"   // #157 Slice B: check_control_token() on the submit route
 #include "filesystem.hpp"
 #include "p2p_message_stats.hpp"
 
@@ -1120,6 +1121,64 @@ void HttpSession::process_request()
                     return;
                 }
                 auto j = mining_interface_->rest_config_apply(request_.body());
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                response.result(static_cast<http::status>(st));
+                response.body() = j.dump();
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
+
+            // ── Control-plane Slice B (#157): POST /api/tx-inject/submit ──────
+            // Hand a raw consensus tx to the armed M1 inject gate. Loopback-only
+            // (same posture as /api/config/apply). Fail-closed: a 503
+            // {"armed":false} until a main installs the submit fn, and even then
+            // NodeCoinState::submit_inject refuses ("inject-disabled") while the
+            // --embedded-tx-inject arm is OFF. The submit fn marshals onto the
+            // node io_context (thread_safe_wrap) so the IO-confined inject state
+            // is never touched from the WEB thread. Reward path untouched: an
+            // inject is an ordinary block-body tx.
+            if (std::string(request_.target()) == "/api/tx-inject/submit") {
+                auto remote_addr = socket_.remote_endpoint().address();
+                if (!remote_addr.is_loopback()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"tx-inject API is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                if (!mining_interface_->has_tx_inject_submit_fn()) {
+                    // Dormant: no submit fn installed => feature not wired.
+                    response.result(http::status::service_unavailable);
+                    response.body() = R"({"armed":false,"error":"tx-inject submit not wired"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                // #157 Slice B: the submit body MUST carry the loopback control
+                // token (the SAME token that arms the money gate). Even loopback-
+                // only, this stops any other local process from spending the
+                // operator's own reserved inject rate-budget once the lane is
+                // armed. check_control_token() is fail-closed: 403 while no token
+                // is registered (the default), and 403 on any mismatch.
+                {
+                    std::string presented;
+                    auto body_j = nlohmann::json::parse(request_.body(), nullptr,
+                                                        /*allow_exceptions=*/false);
+                    if (body_j.is_object() && body_j.contains("control_token") &&
+                        body_j["control_token"].is_string())
+                        presented = body_j["control_token"].get<std::string>();
+                    if (!c2pool::config_endpoint::check_control_token(presented)) {
+                        response.result(http::status::forbidden);
+                        response.body() = R"({"ok":false,"cause":"missing or invalid control token"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                }
+                auto j = mining_interface_->rest_tx_inject_submit(request_.body());
                 int st = j.is_object() ? j.value("http_status", 200) : 200;
                 if (st < 100 || st > 599) st = 200;
                 if (j.is_object()) j.erase("http_status");

@@ -103,6 +103,7 @@ enum class BatchVerdict {
     RejectPairRequired,   // a pair(path,hex) half arrived without its partner
     RejectRefereeDisarm,  // serving ON while the self-validation referee is OFF
     RejectValidator,      // a per-key catalog validator rejected the value
+    RejectRestartUnsupported, // RESTART key has no runtime applier yet (design F1)
 };
 
 const char* batch_verdict_name(BatchVerdict v);
