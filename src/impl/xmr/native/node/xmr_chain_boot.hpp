@@ -261,6 +261,55 @@ public:
         return true;
     }
 
+    // ── RESUME: the third way a trust root arrives, and the reason it is HERE
+    // rather than at the index.
+    //
+    // A snapshot already contains the trust root -- it is the whole chain from
+    // the base the previous session booted on up to the frontier it reached --
+    // so a node that loads one is not owed a genesis seed. Loading it straight
+    // into the index left that fact where nobody could see it: this class kept
+    // `booted_ == false`, so the FIRST inbound blob went to try_seed_(), which
+    // seeds row zero with `ChainIndex::seed_direct` -- and seed_direct RESETS
+    // the index. The resumed chain was wiped to height 0 and re-walked from
+    // genesis, with every proof of work below the old frontier re-run. Observed
+    // exactly that way: "RESUMED at 600" and then "[tip] height=1..600" with
+    // "randomx hashes=601 verified=600" in the same run.
+    //
+    // Routing the load through the boot closes it structurally rather than by
+    // ordering: on_objects() and on_chain_entry() test booted() FIRST, so once
+    // this returns true try_seed_() is unreachable, the serving half forwards
+    // to the index (advertising the resumed tip instead of height 1), and the
+    // sync driver's booted predicate flips, so it asks for the next block
+    // rather than for genesis.
+    //
+    // GATE 4 IS NOT WEAKENED, and the check is repeated here rather than
+    // trusted to the caller's line order: an anchor that has been installed and
+    // NOT yet confirmed refuses the resume, because fast-forwarding along a
+    // chain the network has not vouched for is the work the gate exists to
+    // refuse. On the genesis path the confirm is Disarmed -- therefore ready()
+    // -- so nothing changes; on the anchor path this only ever runs after the
+    // confirm settled, and if it somehow does not, it fails closed.
+    //
+    // On ANY failure (a corrupt, foreign or otherwise unloadable image) the
+    // index is left as it was and `booted_` is untouched, so the caller falls
+    // back to the ordinary boot path: the genesis seed, or the anchor the
+    // network just confirmed.
+    bool resume_from_snapshot(const std::vector<std::uint8_t>& image, std::string& why) {
+        why.clear();
+        if (booted() && !confirm_.ready()) {
+            why = "refusing to resume over an unconfirmed anchor";
+            return false;
+        }
+        if (!index_.load_snapshot(image, why)) return false;
+        const auto t = index_.tip();
+        std::lock_guard<std::mutex> lk(mu_);
+        booted_       = true;
+        stats_.booted = true;
+        stats_.why    = "resumed from snapshot at height "
+                      + std::to_string(t ? t->height : 0) + "; no genesis seed owed";
+        return true;
+    }
+
     bool booted() const {
         std::lock_guard<std::mutex> lk(mu_);
         return booted_;
@@ -431,6 +480,19 @@ private:
 
     bool try_seed_(const std::vector<std::uint8_t>& blob) {
         if (blob.empty()) return false;
+        // BELT, not the fix. seed_direct() RESETS the index, so seeding row zero
+        // into an index that already holds rows destroys them. On the real
+        // pre-boot path the index is empty and this is never taken; it is here
+        // so that any future caller that reaches the seed with a populated
+        // index is refused instead of being quietly destructive. The guard is
+        // deliberately NOT in ChainIndex::seed_direct: the KATs and the parity
+        // replay re-seed a populated index on purpose.
+        if (index_.tip().has_value()) {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++stats_.refusals;
+            stats_.why = "refusing to seed genesis over an index that already holds rows";
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lk(mu_);
             ++stats_.blobs_inspected;

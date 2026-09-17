@@ -580,8 +580,13 @@ public:
         // not reached and `snap_armed_` stays false, so the refused session
         // also cannot WRITE a snapshot over a good one.
         //
-        // Every failure below is the same failure -- carry on from the anchor --
-        // which is why none of them returns false.
+        // On a GENESIS boot the same line is what discharges the boot: the image
+        // IS the trust root, so load_snapshot_() goes through ChainBoot and the
+        // node never reaches the line below owed a genesis seed it would later
+        // pay by resetting the very index it just resumed.
+        //
+        // Every failure below is the same failure -- carry on from the anchor,
+        // or from the genesis seed -- which is why none of them returns false.
         if (!cfg_.snapshot_path.empty()) {
             load_snapshot_();
             snap_armed_ = true;
@@ -1287,12 +1292,24 @@ private:
                 + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
             return;
         }
-        // On the verify thread, which owns block application: an inbound blob
-        // may already be in flight by now, and a load that raced one would
-        // reset the index underneath it.
+        // Through the BOOT, not straight into the index, and on the verify
+        // thread, which owns block application.
+        //
+        // The thread hop was always needed: an inbound blob may already be in
+        // flight by now, and a load that raced one would reset the index
+        // underneath it. Going through ChainBoot is the other half, and it is
+        // the one a live genesis-boot run found missing. A snapshot carries its
+        // own trust root, but loading it at the index left ChainBoot still
+        // owed a genesis seed, so the first inbound blob after this line ran
+        // try_seed_() -> seed_direct() -> reset: the resumed chain was wiped to
+        // height 0 and re-walked, PoW and all. resume_from_snapshot() installs
+        // the image AND records that the boot is discharged, in that order, on
+        // this thread -- so there is no window in which an inbound blob can
+        // find a loaded index with an un-booted gate in front of it. It re-
+        // checks gate 4 itself and refuses over an unconfirmed anchor.
         bool ok = false;
         std::string load_why;
-        verify_loop_.call([&] { ok = index_.load_snapshot(image, load_why); });
+        verify_loop_.call([&] { ok = boot_.resume_from_snapshot(image, load_why); });
         if (!ok) {
             note_("[snapshot] REFUSED: " + load_why + "; starting from the "
                 + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));

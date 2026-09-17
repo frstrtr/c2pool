@@ -727,6 +727,62 @@ if (BUILD_TESTING)
     # DRIFT-GUARD: also listed in BOTH `--target` lists in
     # .github/workflows/build.yml. A target registered with add_test but never
     # built reports "***Not Run" and exits 8 -- the #1539 lesson.
+    # ------------------------------------------------------------------
+    # RESUME WITHOUT RE-IBD (../node/xmr_chain_boot.hpp + the node's
+    # load_snapshot_ ordering).
+    #
+    #   xmr_native_snapshot_resume_kat -- a snapshot carries its own trust root,
+    #   and the boot has to know it. Loading the image straight into the index
+    #   left ChainBoot still owed a genesis seed, so the first inbound blob ran
+    #   try_seed_() -> seed_direct() -> RESET: a live regtest node logged
+    #   "RESUMED at height 600", wiped itself to height 0 and re-walked the
+    #   chain, re-running every proof of work on the way. This target pins the
+    #   fix (the load runs THROUGH ChainBoot, which records that the boot is
+    #   discharged) with a model verifier's hash counter as the measurement, and
+    #   keeps the control in the same file: the old wiring must still be visibly
+    #   broken. It also pins the ORDER against gate 4 -- a resume over an
+    #   unconfirmed anchor is refused -- the fail-closed fallbacks (absent,
+    #   corrupt, foreign, different anchor), and the two claims that can only be
+    #   made about the whole assembly: a genesis boot comes up AT the snapshot's
+    #   frontier and not owed a seed, and a gate-4 REFUSAL arms no saver, proven
+    #   by the good file on disk being byte-identical after the refused start.
+    #
+    # This is the ONLY test target that builds the whole NativeNode, so it links
+    # what the node binary links -- xmr_native_txpool (which brings xmr_coin)
+    # and xmr_node (the production get_miner_data parser the parity arm
+    # instantiates) plus header-only boost and a thread library. It does NOT
+    # link randomx and does not define XMR_NATIVE_NODE_HAVE_RANDOMX: the node it
+    # starts dials no peer, contacts no daemon and connects no block, so the
+    # null PoW source is the honest one and the PoW counting happens at the
+    # index, where a model verifier stands in. It writes small temporary files
+    # into the working directory and removes them again; ctest runs it inside
+    # the build tree with no arguments.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml. A target registered with add_test but never
+    # built reports "***Not Run" and exits 8 -- the #1539 lesson.
+    add_executable(xmr_native_snapshot_resume_kat xmr_snapshot_resume_kat.cpp)
+    target_include_directories(xmr_native_snapshot_resume_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_snapshot_resume_kat PRIVATE xmr_native_txpool xmr_node)
+    target_compile_features(xmr_native_snapshot_resume_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_snapshot_resume_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_snapshot_resume_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_snapshot_resume_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_snapshot_resume_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_snapshot_resume_kat COMMAND xmr_native_snapshot_resume_kat)
+    # It starts and stops the node four times, one of them waiting out a
+    # half-second gate-4 deadline. Bounded, but never let it be unbounded on a
+    # loaded runner.
+    set_tests_properties(xmr_native_snapshot_resume_kat PROPERTIES TIMEOUT 300)
+
     add_executable(xmr_native_m4_ptpl_backlog_gate_kat xmr_m4_ptpl_backlog_gate_kat.cpp)
     target_include_directories(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src
