@@ -626,7 +626,11 @@ if (BUILD_TESTING)
     #     Stage-1 supply channel and gated on the winner's own cut_spine_digest,
     #     lets the S3 re-drive fold E_b at that exact prefix so the two
     #     owed_digests become BYTE-EQUAL across the settling block, and
-    # (c) that a repair which cannot verify still REFUSES and moves owed by zero.
+    # (c) that a repair which cannot verify still REFUSES and moves owed by zero,
+    #     and (d, CA-9) that a SECOND distinct refused win armed while a repair is
+    #     in flight against the ONE peer that can serve it neither orphans nor
+    #     zombies that repair: the live job keeps its peer binding, the second cut
+    #     is QUEUED and re-armed when the peer falls free, and BOTH blocks credit.
     # Consumer tree only: settle::fold_eb and OwedLedger::owed_digest() are
     # untouched and no frozen wire golden moves. stdlib + POSIX sockets +
     # Threads. SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed on BOTH

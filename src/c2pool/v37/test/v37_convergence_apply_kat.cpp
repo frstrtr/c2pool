@@ -57,6 +57,11 @@
 //         anchor is unmoved, and a full repair round-trip changes neither the
 //         winner's lane digest nor the winner's owed_digest.
 //   CA-8  the first_eligible ARMING question, measured rather than assumed.
+//   CA-9  ★ THE LIVENESS DEFECT: two DISTINCT refused peer wins while a repair
+//         is in flight against the ONE peer that can serve them. The in-flight
+//         job keeps its peer binding, the second cut is QUEUED (never coalesced
+//         into the live job, never a silent zombie), it is re-armed the moment
+//         the peer falls free, and BOTH blocks credit — owed(A) == owed(B).
 //
 // Stdlib + POSIX sockets + Threads, the self-harness shape of its siblings in
 // this directory. CONSUMER TREE ONLY: no file under src/sharechain/v37 is
@@ -67,6 +72,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -118,6 +124,9 @@ static const int     N_SHARE = 9;     // the fixed stream length
 static const int     DROP_AT = 4;     // the share B loses
 static const char*   kWonBid =
     "00000000000000000a1b2c3d4e5f60718293a4b5c6d7e8f900112233445566aa";
+// CA-9's SECOND win by the same peer, at a LATER prefix of the same lane.
+static const char*   kWonBid2 =
+    "00000000000000000b2c3d4e5f60718293a4b5c6d7e8f9001122334455667bb0";
 
 // ── the fixed carrier stream ────────────────────────────────────────────────
 static PayoutDescriptor mk_desc(std::uint8_t fill) {
@@ -194,6 +203,26 @@ static bool wait_until(F f, int timeout_ms = 8000) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// A HAND-PUMPED CONTROL CHANNEL (CA-9 only).
+//
+// CA-2..CA-5 run the supply channel over real sockets, which is the right shape
+// for "does the repair work". CA-9 asks a LIVENESS question instead — "what
+// happens to a repair that is genuinely IN FLIGHT when a second cut is armed
+// against the same peer" — and that needs the in-flight window held open on
+// purpose. So CA-9 replaces ONLY the SendFn the supply halves were bound to:
+// control frames go into a queue and are delivered when the test says so. Both
+// nodes, both directions, the same real SupplyService / SupplyRequester /
+// RepairDriver objects; nothing about the mechanism is stubbed, only the wire's
+// timing is ours.
+// ═══════════════════════════════════════════════════════════════════════════
+struct ManualBus {
+    std::mutex mtx;
+    std::vector<std::vector<std::uint8_t>> to_a;   // frames B emitted, for A
+    std::vector<std::vector<std::uint8_t>> to_b;   // frames A emitted, for B
+    static const CarrierPeerNode::PeerId PID = 1;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ONE NODE — assembled exactly as main_v37_btc_dash.cpp assembles it: the
 // XbtcNode lifecycle, the carrier relay over a real socket, the Stage-1 supply
 // SERVE + FETCH halves on the one control demux, and (Stage 2) the repair
@@ -217,7 +246,9 @@ struct Node {
     std::mutex                          redrive_mtx;
     std::vector<std::string>            redriven;     // bids the S3 path re-entered
 
-    Node(std::shared_ptr<MockCoinBackend> c, const LaneParams& p) : coin(std::move(c)), params(p) {
+    Node(std::shared_ptr<MockCoinBackend> c, const LaneParams& p,
+         ManualBus* bus = nullptr, bool is_a = false)
+        : coin(std::move(c)), params(p) {
         BtcNodeConfig cfg;
         cfg.lane_chain  = CH;
         cfg.lane_params = p;
@@ -243,8 +274,20 @@ struct Node {
         // #1655: the re-offer must not re-push what W2 already accounted.
         relay->set_reoffer_dedup_probe([this](const bytes32& h) { return relay->seen().seen(h); });
 
-        auto send = [this](CarrierPeerNode::PeerId pid,
-                           const std::vector<std::uint8_t>& f) { return net->send_to(pid, f); };
+        // The ONE substitution CA-9 makes: where the control frames go. Every
+        // other wire in this constructor is the production one.
+        std::function<bool(CarrierPeerNode::PeerId, const std::vector<std::uint8_t>&)> send;
+        if (bus) {
+            send = [bus, is_a](CarrierPeerNode::PeerId,
+                               const std::vector<std::uint8_t>& f) {
+                std::lock_guard<std::mutex> lk(bus->mtx);
+                (is_a ? bus->to_b : bus->to_a).push_back(f);
+                return true;
+            };
+        } else {
+            send = [this](CarrierPeerNode::PeerId pid,
+                          const std::vector<std::uint8_t>& f) { return net->send_to(pid, f); };
+        }
         serve = std::make_unique<SupplyService>(relay->vault(), send);
         fetch = std::make_unique<SupplyRequester>(send);
         // The server's claimed commitment at a prefix. Under ruling A it is an
@@ -295,6 +338,31 @@ struct Node {
     bytes32 owed() const { return node->ledger().owed_digest(); }
     std::size_t redrive_count() { std::lock_guard<std::mutex> lk(redrive_mtx); return redriven.size(); }
 };
+
+// Deliver whatever the two nodes have queued for each other, both directions,
+// until the wire falls quiet. Everything the repair driver does downstream of a
+// reply — the next GETFRAMES, the replay, the S3 re-drive, the release of a
+// queued cut — happens INSIDE this call, on this thread, exactly as it happens
+// inside the transport reader loop in production.
+static void pump(ManualBus& bus, Node& A, Node& B, int rounds = 64) {
+    for (int r = 0; r < rounds; ++r) {
+        std::vector<std::vector<std::uint8_t>> ta, tb;
+        {
+            std::lock_guard<std::mutex> lk(bus.mtx);
+            ta.swap(bus.to_a);
+            tb.swap(bus.to_b);
+        }
+        if (ta.empty() && tb.empty()) return;
+        for (const auto& f : ta) {
+            A.serve->on_control(ManualBus::PID, f);
+            A.fetch->on_control(ManualBus::PID, f);
+        }
+        for (const auto& f : tb) {
+            B.serve->on_control(ManualBus::PID, f);
+            B.fetch->on_control(ManualBus::PID, f);
+        }
+    }
+}
 
 // The v0x02 descriptor the WINNER puts on the wire, put through a REAL frame so
 // every case exercises the codec, not a struct copy.
@@ -652,6 +720,141 @@ int main() {
         check(c2.ps.refused_payout == 0,
               "CA-8b no descriptor on this path carried an emitted coinbase "
               "(payout maps are empty on both sides BY CONSTRUCTION)");
+    }
+
+    // ── CA-9 ★ TWO REFUSED WINS, ONE SERVING PEER ───────────────────────────
+    // THE LIVENESS DEFECT. The supply channel allows ONE outstanding request per
+    // peer, and on the 2-node shape the peer whose wins we refuse is the ONLY
+    // peer that can serve the repair. So "a second distinct cut is armed while a
+    // repair is in flight against that peer" is the ordinary case.
+    //
+    // It used to destroy the first repair. arm() wrote m_by_peer[peer] BEFORE
+    // asking; the second ask came back refused_busy; the finish() that followed
+    // erased m_by_peer BY BARE PEER ID. The live job's ORDER reply then had
+    // nowhere to land, the job sat in m_jobs forever, and every later arm of
+    // that cut COALESCED into the dead job — permanently unrepairable, with no
+    // refusal logged and owed_digest forked for good. Fail-closed, and fatal to
+    // convergence.
+    //
+    // Here: A commits to TWO prefixes and wins a block at each. B lost one share
+    // and matches NEITHER (cut_mismatch at the first, cut_miss at the second),
+    // so both wins are refused and both are armed back-to-back against the one
+    // peer, with the first fetch deliberately held in flight.
+    std::printf("-- CA-9 a second cut armed while a repair is in flight on the only peer\n");
+    {
+        ManualBus bus;
+        auto coin = std::make_shared<MockCoinBackend>();
+        Node A(coin, ratified, &bus, /*is_a=*/true);
+        Node B(coin, ratified, &bus, /*is_a=*/false);
+        const Stream& s = stream();
+        {   // this case makes ~4 serve requests; the default burst is 8, and a
+            // throttle here would be a harness artefact, not a finding.
+            SupplyServeOptions so;
+            so.burst = 64.0;
+            A.serve->set_options(so);
+        }
+
+        // (a) A's FIRST prefix. B loses DROP_AT, so its prefix-P1 bytes differ.
+        const int P1 = 6;
+        static_assert(DROP_AT < 6 && 6 < N_SHARE, "P1 must split the stream after the drop");
+        for (int i = 0; i < P1; ++i) { A.feed(s.frame[i]); if (i != DROP_AT) B.feed(s.frame[i]); }
+        (void)wait_until([&] { return A.next_pos() == static_cast<u64>(P1); });
+        coin->append_block("g0");
+        const u64     h1    = coin->append_block(kWonBid);
+        const bytes32 owed1 = A.owed();
+        const WonBlockOutcome won1 = A.node->on_block_won(kWonBid, h1, /*confirmations=*/0);
+
+        // (b) A's SECOND prefix, and a second win at it. Block 1 is still
+        //     PENDING (unburied), so neither descriptor carries a coinbase.
+        for (int i = P1; i < N_SHARE; ++i) { A.feed(s.frame[i]); if (i != DROP_AT) B.feed(s.frame[i]); }
+        (void)wait_until([&] { return A.next_pos() == static_cast<u64>(N_SHARE); });
+        (void)wait_until([&] { return B.next_pos() == static_cast<u64>(N_SHARE - 1); });
+        const u64     h2    = coin->append_block(kWonBid2);
+        const bytes32 owed2 = A.owed();
+        const WonBlockOutcome won2 = A.node->on_block_won(kWonBid2, h2, /*confirmations=*/0);
+
+        check(won1.cut.next_pos == static_cast<u64>(P1) &&
+                  won2.cut.next_pos == static_cast<u64>(N_SHARE) &&
+                  won1.cut.lane_digest != won2.cut.lane_digest,
+              "CA-9a the two wins name two DISTINCT cuts of the same lane");
+        check(!won1.emitted && !won2.emitted,
+              "CA-9b neither win emitted a coinbase (both blocks are still unburied)");
+
+        // (c) both descriptors refused on B — one of each refusal bit.
+        const PeerWin w1 = peer_win_of(kWonBid,  h1, won1.cut, won1.emitted, owed1);
+        const PeerWin w2 = peer_win_of(kWonBid2, h2, won2.cut, won2.emitted, owed2);
+        const BlockEventDriver::RegisterResult g1 = B.bed->on_peer_block_found(w1);
+        const BlockEventDriver::RegisterResult g2 = B.bed->on_peer_block_found(w2);
+        const S1PeerStats ps0 = B.node->s1c_stats();
+        check(!g1.registered && !g2.registered && ps0.repair_wanted >= 2,
+              "CA-9c both peer wins are REFUSED here and both are flagged REPAIRABLE");
+        check(ps0.cut_mismatch >= 1 && ps0.cut_miss >= 1,
+              "CA-9d one refusal is cut_digest_mismatch, the other is cut_miss");
+
+        // (d) ★ THE TRIGGER: arm both, back to back, against the one peer. The
+        //     first fetch is sitting unread in the bus, so it is genuinely in
+        //     flight when the second arm lands.
+        const bool armed1 = B.repair->arm(ManualBus::PID, w1.bid, w1.cut_next_pos,
+                                          w1.cut_spine_digest);
+        const bool armed2 = B.repair->arm(ManualBus::PID, w2.bid, w2.cut_next_pos,
+                                          w2.cut_spine_digest);
+        const RepairStats mid = B.repair->stats();
+        check(armed1 && !armed2,
+              "CA-9e the first arm starts a fetch; the second does not start one");
+        // in_flight() alone does NOT catch the defect — a zombie is still
+        // counted in flight. What the invariant is about is the BINDING: the
+        // live job must still be reachable from its peer when the reply lands.
+        check(B.repair->in_flight() == 1 && B.repair->bindings() == 1,
+              "CA-9f ★ THE INVARIANT: the in-flight honest job is still there AND still "
+              "holds its peer binding after the second arm");
+        check(mid.armed == 1 && mid.deferred == 1,
+              "CA-9g ★ the second cut is QUEUED behind the busy peer, not started");
+        check(mid.coalesced == 0 && mid.refused == 0 && mid.repaired == 0 &&
+                  mid.fetch_failed == 0,
+              "CA-9h ★ and it was NOT coalesced into the live job, and nothing was refused");
+        check(B.repair->deferred() == 1,
+              "CA-9i the queued cut is remembered by key, so it stays re-armable");
+
+        // (e) release the wire. The first repair completes and re-drives; its
+        //     completion frees the peer and releases the queued cut, which then
+        //     fetches, replays and re-drives in turn — all inside this call.
+        pump(bus, A, B);
+        const RepairStats rs = B.repair->stats();
+        check(rs.resumed == 1 && rs.armed == 2,
+              "CA-9j the queued cut was re-armed exactly once, when the peer fell free");
+        check(B.repair->in_flight() == 0 && B.repair->deferred() == 0,
+              "CA-9k ★ NO ZOMBIE: no job and no queue entry survives the round");
+        check(rs.repaired == 2 && rs.refused == 0 && rs.order_failed == 0 &&
+                  rs.fetch_failed == 0,
+              "CA-9l ★ BOTH cuts replayed to the winner's OWN digest and were accepted");
+        check(B.repair->verified_view(CH, w1.cut_next_pos, w1.cut_spine_digest) != nullptr &&
+                  B.repair->verified_view(CH, w2.cut_next_pos, w2.cut_spine_digest) != nullptr,
+              "CA-9m a verified projection is cached for EACH cut (neither was orphaned)");
+        check(B.redrive_count() == 2,
+              "CA-9n both one-shot refused wins were re-driven by S3");
+        check((B.node->ledger().is_pending(w1.bid) || B.node->ledger().is_settled(w1.bid)) &&
+                  (B.node->ledger().is_pending(w2.bid) || B.node->ledger().is_settled(w2.bid)),
+              "CA-9o both blocks are registered on B after the re-drive");
+        const S1PeerStats ps1 = B.node->s1c_stats();
+        check(ps1.repair_hit == 2 && ps1.credited == 2,
+              "CA-9p the re-driven arms read the repaired views and CREDITED both");
+
+        // (f) ★ CONVERGENCE. Bury both blocks and compare the commitments.
+        for (int i = 0; i <= static_cast<int>(D_CONF); ++i)
+            coin->append_block("f" + std::to_string(i));
+        int a_fin = 0, b_fin = 0;
+        for (const auto& st : A.bed->on_tip(coin->best_tip()))
+            if (st.bid == kWonBid || st.bid == kWonBid2) ++a_fin;
+        for (const auto& st : B.bed->on_tip(coin->best_tip()))
+            if (st.bid == kWonBid || st.bid == kWonBid2) ++b_fin;
+        check(a_fin == 2 && b_fin == 2,
+              "CA-9q both blocks finalize on BOTH nodes at H_b + d_conf");
+        check(A.owed() == B.owed() && hex32(B.owed()) != kEmptyAnchor,
+              "CA-9r ★ owed_digest(A) == owed_digest(B), BYTE-EQUAL, over TWO settled blocks "
+              "that were both armed against one busy peer");
+        // The winner is the control: serving two repairs moved nothing of its own.
+        check(A.lane() == won2.cut.lane_digest,
+              "CA-9s the server's own lane digest is untouched by serving both repairs");
     }
 
     std::printf("== %d checks, %d failures ==\n", g_checks, g_fails);

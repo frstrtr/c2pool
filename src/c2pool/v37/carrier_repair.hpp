@@ -87,6 +87,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -526,6 +527,36 @@ inline RepairResult replay_to_cut(const RepairInput& in, const IMainchainIndex& 
 // One repair in flight per (chain, P, spine). A second arm for the same cut
 // while one is running is a no-op, so a flood of re-offers of the same winner
 // carrier cannot multiply the work.
+//
+// ── ★ ONE SERVING PEER, TWO CUTS: THE LIVENESS RULE ────────────────────────
+// The supply channel allows exactly ONE outstanding request per peer
+// (SupplyRequester::request_order returns false / refused_busy otherwise), and
+// on the 2-node shape there IS only one peer — the very peer whose wins we are
+// refusing. So "a second distinct cut arrives while a repair is in flight
+// against the only peer that can serve it" is the ORDINARY case, not a corner.
+//
+// The rule this driver enforces for that case:
+//
+//   an in-flight repair job NEVER loses its peer binding because another cut
+//   was armed or finished.
+//
+// Two writes used to break it, and both are fixed here:
+//
+//   (1) arm() bound m_by_peer[peer] BEFORE asking. A second arm k2 therefore
+//       overwrote the binding of the live job k1 before its own ask was even
+//       refused;
+//   (2) finish() erased m_by_peer BY BARE PEER ID. finish(k2) — reached
+//       immediately, because the ask was refused_busy — then erased the
+//       binding outright. k1's ORDER reply had nowhere to land, k1 stayed in
+//       m_jobs forever, and every later arm of that cut COALESCED into the
+//       dead job: permanently unrepairable, silently, with no refusal logged.
+//
+// Now: a second cut whose only peer is already serving is QUEUED (m_deferred)
+// without touching m_by_peer and without creating a job, the binding is written
+// only after request_order() actually accepted, and finish() erases only the
+// binding that is still ITS OWN. A queued cut is re-armed the moment the peer
+// falls free, and — because nothing recorded it as in flight — it also stays
+// re-armable by a later S3 re-offer.
 // ═══════════════════════════════════════════════════════════════════════════
 struct RepairStats {
     std::uint64_t armed          = 0;   // repairs started
@@ -538,6 +569,10 @@ struct RepairStats {
     std::uint64_t redriven       = 0;   // S3 re-drives issued
     std::uint64_t frames_fetched = 0;
     std::uint64_t unservable     = 0;   // ids the server holds but cannot send
+    // ── the one-serving-peer queue ──────────────────────────────────────────
+    std::uint64_t deferred       = 0;   // ★ cuts QUEUED because their only peer was serving
+    std::uint64_t resumed        = 0;   // ★ queued cuts re-armed once the peer fell free
+    std::uint64_t deferred_drop  = 0;   // queue full, or its peer went away: cleanly refused
 };
 
 // The key a repair is addressed by: exactly the cut the winner named.
@@ -550,6 +585,11 @@ struct RepairKey {
         if (pos != o.pos) return pos < o.pos;
         return spine < o.spine;
     }
+    // Identity, so a binding can be erased by WHOSE it is rather than by peer.
+    bool operator==(const RepairKey& o) const {
+        return chain == o.chain && pos == o.pos && spine == o.spine;
+    }
+    bool operator!=(const RepairKey& o) const { return !(*this == o); }
 };
 
 class RepairDriver {
@@ -587,19 +627,47 @@ public:
 
     // ── arm a repair for a refused peer win ─────────────────────────────────
     // Returns true iff a fetch was actually started. Safe to call on every
-    // refusal: a cut already cached or already in flight is coalesced.
+    // refusal: a cut already cached or already in flight is coalesced, and a cut
+    // whose only peer is busy serving another repair is QUEUED, never merged
+    // into somebody else's job.
     bool arm(PeerId peer, const std::string& bid, std::uint64_t pos,
              const ::v37::bytes32& spine) {
         const RepairKey k{m_chain, pos, spine};
+        // Read the transport's own per-peer slot BEFORE taking our lock, so we
+        // never hold m_mtx across the requester's mutex.
+        const bool channel_busy = m_fetch.busy(peer);
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_done.count(k) || m_jobs.count(k)) { ++m_stats.coalesced; return false; }
+
+            // ── ★ THE QUEUE, NOT THE OVERWRITE ──────────────────────────────
+            // This peer is already serving a live repair (ours, per m_by_peer,
+            // or the channel's, per the requester's outstanding slot). Touching
+            // m_by_peer here is precisely the write that used to orphan that
+            // repair, so we touch NOTHING: no binding, no job, no coalesce.
+            // The cut is remembered as PENDING and re-armed by drain_deferred()
+            // the moment the peer falls free; if the queue is full it is simply
+            // refused, and a later S3 re-offer arms it cleanly because no state
+            // says it is in flight.
+            auto pit = m_by_peer.find(peer);
+            const bool we_are_serving =
+                (pit != m_by_peer.end() && m_jobs.count(pit->second) != 0);
+            if (we_are_serving || channel_busy) {
+                if (m_deferred.count(k) || m_deferred.size() < kMaxDeferred) {
+                    m_deferred[k] = Deferred{peer, bid};
+                    ++m_stats.deferred;
+                } else {
+                    ++m_stats.deferred_drop;
+                }
+                return false;
+            }
+
             Job j;
             j.key  = k;
             j.bid  = bid;
             j.peer = peer;
             m_jobs.emplace(k, std::move(j));
-            m_by_peer[peer] = k;
+            m_deferred.erase(k);                   // it is live now, not queued
             ++m_stats.armed;
         }
         // Ask for the winner's order over [0, P). `spine` is the commitment we
@@ -610,7 +678,33 @@ public:
             finish(k, RepairResult{});             // refused locally: fail closed
             return false;
         }
+        // ── ★ BIND ONLY NOW ─────────────────────────────────────────────────
+        // The binding is written only once the ask was ACCEPTED and dispatched.
+        // A locally refused ask therefore never inserts a binding, and the
+        // finish() it triggers never erases one (finish erases by job identity).
+        // The answer cannot beat us to this line: request_order() dispatches on
+        // THIS thread and the reply is delivered later by the transport reader
+        // loop, which is the same thread that drove this arm.
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_jobs.count(k)) m_by_peer[peer] = k;
+        }
         return true;
+    }
+
+    // How many cuts are queued behind a busy peer. Diagnostics only.
+    std::size_t deferred() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_deferred.size();
+    }
+    // How many peers currently hold a repair binding. This is the number the
+    // liveness invariant is ABOUT: an in-flight job must still be reachable
+    // from its peer when the reply lands, so a job whose binding was erased by
+    // somebody else's arm shows up here as a missing binding, not merely as a
+    // job that happens to be counted by in_flight().
+    std::size_t bindings() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_by_peer.size();
     }
 
     // ── SupplyRequester callbacks ───────────────────────────────────────────
@@ -717,6 +811,18 @@ public:
         RepairKey k;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
+            // A cut queued behind THIS peer can never run: the only node that
+            // offered to serve it is gone. Drop it (counted) rather than leave a
+            // queue entry aimed at a dead peer; a reconnecting peer's re-offer
+            // arms it again from scratch.
+            for (auto it = m_deferred.begin(); it != m_deferred.end();) {
+                if (it->second.peer == peer) {
+                    it = m_deferred.erase(it);
+                    ++m_stats.deferred_drop;
+                } else {
+                    ++it;
+                }
+            }
             auto pit = m_by_peer.find(peer);
             if (pit == m_by_peer.end()) return;
             k = pit->second;
@@ -726,6 +832,14 @@ public:
     }
 
 private:
+    // A cut we want repaired, waiting for its only serving peer to fall free.
+    // It is NOT a job: it holds no binding and no fetch state, so it can never
+    // be mistaken for something in flight and never swallows a later re-offer.
+    struct Deferred {
+        PeerId      peer = 0;
+        std::string bid;
+    };
+
     struct Job {
         RepairKey                   key;
         std::string                 bid;
@@ -793,7 +907,8 @@ private:
 
     // The single completion point. Records the outcome, drops the job, and then
     // — with no lock held — fires the S3 RE-DRIVE so the one-shot refused peer
-    // win is retried now that a verified view may exist.
+    // win is retried now that a verified view may exist, and releases whatever
+    // was queued behind the peer this job was using.
     void finish(const RepairKey& k, const RepairResult& r) {
         std::string bid;
         RedriveFn cb;
@@ -803,7 +918,15 @@ private:
             auto jit = m_jobs.find(k);
             if (jit == m_jobs.end()) return;
             bid = jit->second.bid;
-            m_by_peer.erase(jit->second.peer);
+            // ── ★ ERASE OUR OWN BINDING, AND ONLY OUR OWN ───────────────────
+            // An erase by bare peer id drops whatever binding that peer holds
+            // NOW, which need not be this job's: that is how a second, locally
+            // refused arm used to orphan a live repair. Keyed by job identity,
+            // a finishing job can only ever release itself — and a job that
+            // never got as far as binding (request_order refused) releases
+            // nothing at all.
+            auto pit = m_by_peer.find(jit->second.peer);
+            if (pit != m_by_peer.end() && pit->second == k) m_by_peer.erase(pit);
             m_jobs.erase(jit);
             if (r.ok()) { m_done[k] = r.view; ++m_stats.repaired; }
             else        { ++m_stats.refused; }
@@ -817,7 +940,62 @@ private:
                     (r.ok() ? "REPAIRED" : "REFUSED") + " (" +
                     repair_outcome_name(r.outcome) + ")");
         if (cb) cb(bid, r);
+        drain_deferred();
     }
+
+    // ── ★ THE QUEUE DRAIN ───────────────────────────────────────────────────
+    // Re-arm the cuts that were queued because their only peer was busy. Runs
+    // with NO lock held (arm() takes its own), is bounded, is re-entrancy
+    // guarded — arm() can call finish(), which calls back in here — and never
+    // retries the same key twice in one pass, so a cut that immediately re-
+    // defers cannot spin. Anything still queued when this returns is picked up
+    // by the next completion, or by a later S3 re-offer.
+    void drain_deferred() {
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_draining) return;
+            m_draining = true;
+        }
+        std::set<RepairKey> tried;
+        for (std::size_t round = 0; round < kMaxDrainRounds; ++round) {
+            RepairKey k{};
+            Deferred  d;
+            bool      have = false;
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                for (auto it = m_deferred.begin(); it != m_deferred.end();) {
+                    if (tried.count(it->first)) { ++it; continue; }
+                    // It landed some other way (cached, or armed directly).
+                    if (m_done.count(it->first) || m_jobs.count(it->first)) {
+                        it = m_deferred.erase(it);
+                        continue;
+                    }
+                    auto pit = m_by_peer.find(it->second.peer);
+                    if (pit != m_by_peer.end() && m_jobs.count(pit->second)) {
+                        ++it;                       // its peer is still serving
+                        continue;
+                    }
+                    k = it->first;
+                    d = it->second;
+                    it = m_deferred.erase(it);
+                    have = true;
+                    ++m_stats.resumed;
+                    break;
+                }
+            }
+            if (!have) break;
+            tried.insert(k);
+            (void)arm(d.peer, d.bid, k.pos, k.spine);
+        }
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_draining = false;
+    }
+
+    // The queue is a liveness aid, not a buffer: a small bound keeps a peer
+    // that floods us with distinct cuts from growing it without limit. An
+    // over-the-bound cut is refused cleanly and stays re-armable.
+    static constexpr std::size_t kMaxDeferred    = 64;
+    static constexpr std::size_t kMaxDrainRounds = kMaxDeferred + 1;
 
     mutable std::mutex          m_mtx;
     SupplyRequester&            m_fetch;
@@ -829,6 +1007,8 @@ private:
     RepairStats                 m_stats;
     std::map<RepairKey, Job>    m_jobs;
     std::map<PeerId, RepairKey> m_by_peer;
+    std::map<RepairKey, Deferred> m_deferred;   // cuts waiting on a busy peer
+    bool                        m_draining = false;
     std::map<RepairKey, std::shared_ptr<const SettlementView>> m_done;
 };
 
