@@ -126,10 +126,52 @@ static nlohmann::json build_tx_inject_status_json()
         {"tx_inject_in",  ps.get_in(obs::P2PMessage::tx_inject)},
         {"tx_inject_out", ps.get_out(obs::P2PMessage::tx_inject)}
     };
-    // M3 (#1606, draft): rate-limiter / sandbox reject counters not wired on
-    // this build. Rendered null (not 0) so "absent" is never read as "zero".
-    out["rate_limit"] = nullptr;
-    out["sandbox"]    = nullptr;
+    // M3 (#1606, Slice 2): rate-limiter / sandbox counters + caps, mirrored from
+    // core::obs::inject_status() (stored by NodeCoinState::submit_inject /
+    // publish_inject_status). Rendered ONLY when the lane has published at least
+    // once (wired); while dormant (updated_at == 0) both stay null (not 0) so
+    // "never wired" is never read as "zero refusals". Relaxed loads, no lock.
+    if (updated != 0) {
+        out["rate_limit"] = {
+            {"local", {
+                {"count_refused",   s.rl_local_count_refused.load(std::memory_order_relaxed)},
+                {"bytes_refused",   s.rl_local_bytes_refused.load(std::memory_order_relaxed)},
+                {"in_window",       s.rl_local_in_window.load(std::memory_order_relaxed)},
+                {"bytes_in_window", s.rl_local_bytes_in_window.load(std::memory_order_relaxed)}
+            }},
+            {"peers", {
+                {"count_refused",   s.rl_peer_count_refused.load(std::memory_order_relaxed)},
+                {"bytes_refused",   s.rl_peer_bytes_refused.load(std::memory_order_relaxed)},
+                {"in_window",       s.rl_peer_in_window.load(std::memory_order_relaxed)},
+                {"bytes_in_window", s.rl_peer_bytes_in_window.load(std::memory_order_relaxed)}
+            }},
+            {"caps", {
+                {"max_per_window",       s.rl_max_per_window.load(std::memory_order_relaxed)},
+                {"max_bytes_per_window", s.rl_max_bytes_per_window.load(std::memory_order_relaxed)},
+                {"window_sec",           s.rl_window_sec.load(std::memory_order_relaxed)}
+            }}
+        };
+        out["sandbox"] = {
+            {"refused", {
+                {"total",           s.sb_refused_total.load(std::memory_order_relaxed)},
+                {"inputs",          s.sb_refused_inputs.load(std::memory_order_relaxed)},
+                {"outputs",         s.sb_refused_outputs.load(std::memory_order_relaxed)},
+                {"scriptsig",       s.sb_refused_scriptsig.load(std::memory_order_relaxed)},
+                {"total_scriptsig", s.sb_refused_total_scriptsig.load(std::memory_order_relaxed)},
+                {"sigops",          s.sb_refused_sigops.load(std::memory_order_relaxed)}
+            }},
+            {"caps", {
+                {"max_inputs",          s.sb_max_inputs.load(std::memory_order_relaxed)},
+                {"max_outputs",         s.sb_max_outputs.load(std::memory_order_relaxed)},
+                {"max_scriptsig",       s.sb_max_scriptsig.load(std::memory_order_relaxed)},
+                {"max_total_scriptsig", s.sb_max_total_scriptsig.load(std::memory_order_relaxed)},
+                {"max_sigops",          s.sb_max_sigops.load(std::memory_order_relaxed)}
+            }}
+        };
+    } else {
+        out["rate_limit"] = nullptr;
+        out["sandbox"]    = nullptr;
+    }
     return out;
 }
 

@@ -667,6 +667,18 @@ public:
             const std::time_t now = std::time(nullptr);
             auto rl = limiter.try_consume(byte_size, now);
             if (!rl.ok()) {
+                // #157 M3 status (Slice 2): tally the refusal by SCOPE + VERDICT.
+                // Read-only observability store; does NOT change the refusal below.
+                auto& obs = core::obs::inject_status();
+                const bool by_count =
+                    (rl.verdict == dash::coin::InjectRateLimiter::Verdict::CountExceeded);
+                if (origin == InjectOrigin::Peer) {
+                    (by_count ? obs.rl_peer_count_refused : obs.rl_peer_bytes_refused)
+                        .fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    (by_count ? obs.rl_local_count_refused : obs.rl_local_bytes_refused)
+                        .fetch_add(1, std::memory_order_relaxed);
+                }
                 LOG_WARNING << "[MEMPOOL] inject rate-limited cause=" << rl.name()
                             << " value=" << rl.value << " threshold=" << rl.threshold
                             << " origin=" << (origin == InjectOrigin::Peer ? "peer" : "local")
@@ -683,6 +695,24 @@ public:
         {
             auto sb = dash::coin::InjectSandbox::vet(tx);
             if (!sb.ok()) {
+                // #157 M3 status (Slice 2): tally the refusal by VERDICT (which
+                // bound tripped) plus a running total. Read-only observability
+                // store; does NOT change the refusal below or the accept-set.
+                auto& obs = core::obs::inject_status();
+                obs.sb_refused_total.fetch_add(1, std::memory_order_relaxed);
+                switch (sb.verdict) {
+                    case dash::coin::InjectSandbox::Verdict::TooManyInputs:
+                        obs.sb_refused_inputs.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::TooManyOutputs:
+                        obs.sb_refused_outputs.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::ScriptSigTooLarge:
+                        obs.sb_refused_scriptsig.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::TotalScriptSigTooLarge:
+                        obs.sb_refused_total_scriptsig.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::TooManySigOps:
+                        obs.sb_refused_sigops.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::Ok: break;
+                }
                 LOG_WARNING << "[MEMPOOL] inject sandbox-refused cause=" << sb.name()
                             << " value=" << sb.value << " threshold=" << sb.threshold
                             << " txid=" << r.txid.GetHex().substr(0, 16);
@@ -746,6 +776,23 @@ public:
         s.max_entries.store(TxInjectPool::INJECT_POOL_MAX_ENTRIES, std::memory_order_relaxed);
         s.max_total_bytes.store(TxInjectPool::kMaxInjectTotalBytes, std::memory_order_relaxed);
         s.max_tx_bytes.store(TxInjectPool::kMaxInjectTxBytes, std::memory_order_relaxed);
+        // #157 M3 status (Slice 2): mirror the rate-limiter window occupancy and
+        // the (constant) caps for both budgets. Refusal tallies are NOT touched
+        // here — they are cumulative and stored at the refusal site in
+        // submit_inject; publish only refreshes the live window + cap view.
+        s.rl_local_in_window.store(m_inject_rate.count_in_window(), std::memory_order_relaxed);
+        s.rl_peer_in_window.store(m_inject_rate_peer.count_in_window(), std::memory_order_relaxed);
+        s.rl_local_bytes_in_window.store(m_inject_rate.bytes_in_window, std::memory_order_relaxed);
+        s.rl_peer_bytes_in_window.store(m_inject_rate_peer.bytes_in_window, std::memory_order_relaxed);
+        s.rl_max_per_window.store(dash::coin::InjectRateLimiter::kMaxInjectsPerWindow, std::memory_order_relaxed);
+        s.rl_max_bytes_per_window.store(dash::coin::InjectRateLimiter::kMaxBytesPerWindow, std::memory_order_relaxed);
+        s.rl_window_sec.store(static_cast<std::uint64_t>(dash::coin::InjectRateLimiter::kWindowSeconds), std::memory_order_relaxed);
+        // #157 M3 status (Slice 2): sandbox bounds (constants).
+        s.sb_max_inputs.store(dash::coin::InjectSandbox::kMaxInputs, std::memory_order_relaxed);
+        s.sb_max_outputs.store(dash::coin::InjectSandbox::kMaxOutputs, std::memory_order_relaxed);
+        s.sb_max_scriptsig.store(dash::coin::InjectSandbox::kMaxScriptSigBytes, std::memory_order_relaxed);
+        s.sb_max_total_scriptsig.store(dash::coin::InjectSandbox::kMaxTotalScriptSigBytes, std::memory_order_relaxed);
+        s.sb_max_sigops.store(dash::coin::InjectSandbox::kMaxLegacySigOps, std::memory_order_relaxed);
         s.updated_at.store(static_cast<std::int64_t>(std::time(nullptr)), std::memory_order_relaxed);
     }
     // #157 M3: number of injects the LOCAL rate limiter still counts inside its
