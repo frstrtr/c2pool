@@ -225,6 +225,14 @@ static void test_tamper_and_wrongkey() {
       SignOptions opt; auto o = sign::sign_and_verify(c, std::move(ks), opt);
       CHECK(!o.ok, "K5: wrong key refused before signing (binding)"); }
 
+    // K4: FLIP SPK → binding refuses. Correct key (pk A), but the input SPK is
+    // tampered to pk B's P2PKH; the key no longer funds the input → refuse.
+    { std::vector<KeyForInput> ks; ks.push_back({0, ska.copy(), pka, {}});
+      art::UnsignedContainer c = make_container(sgn::p2pkh(pka), 100000, 99000);
+      c.inputs[0].script_pubkey = SB(sgn::p2pkh(pkb));   // flip the SPK
+      SignOptions opt; auto o = sign::sign_and_verify(c, std::move(ks), opt);
+      CHECK(!o.ok, "K4: flipped input SPK → key<->input binding refuses"); }
+
     // K4: BIP143 amount tamper detected by the Signer's self-verify. Sign a
     // P2WPKH input for amount X, then re-verify the same witness against amount
     // X+1 → the v0 digest changes → verify_input fails.
@@ -291,11 +299,108 @@ static void test_amount() {
     CHECK(!parse_amount("99999999999", 8).ok, "reject int64 overflow");
 }
 
+// A container with a caller-chosen number of inputs (same spk/amount) and a
+// caller-chosen output value — for the MoneyRange / overflow / zero-output KATs.
+static art::UnsignedContainer make_container_n(const CScript& spk, int64_t amount, int n_inputs,
+                                               bool with_output, int64_t outval) {
+    sgn::Signer sg(2, 0);
+    std::vector<uint256> prevs;
+    for (int k = 0; k < n_inputs; ++k) {
+        uint256 p = mkprev(uint8_t(0x30 + k)); prevs.push_back(p);
+        sg.add_input(p, 0, amount, spk, 0xffffffffu);
+    }
+    if (with_output) sg.add_output(outval, dummy_out());
+    art::UnsignedContainer c;
+    c.coin = "btc"; c.algebra = art::SighashAlgebra::Legacy; c.unsigned_tx = sg.serialize(false);
+    for (int k = 0; k < n_inputs; ++k) {
+        art::UnsignedInput in;
+        std::memcpy(in.prevout_txid.data(), prevs[k].begin(), 32);
+        in.prevout_index = 0; in.script_pubkey = SB(spk); in.amount = amount;
+        c.inputs.push_back(in);
+    }
+    return c;
+}
+
+// ── Review round-2 guards: MoneyRange, overflow, BCH, P2SH-P2WSH, missing key,
+//    trailing bytes, absurd-fee-on-sign, multisig cosigner membership, per-coin
+//    absurd ceiling. ───────────────────────────────────────────────────────────
+static void test_new_guards() {
+    std::printf("[guards] MoneyRange / overflow / BCH / P2SH-P2WSH / missing-key / trailing / per-coin fee\n");
+    auto ska = SK(SK_A), skb = SK(SK_B), skc = SK(SK_C);
+    Bytes pka = PUB(ska, true), pkb = PUB(skb, true), pkc = PUB(skc, true);
+    auto skd = SK("0000000000000000000000000000000000000000000000000000000000000004");
+    Bytes pkd = PUB(skd, true);
+
+    // trailing bytes after tx → parse refuse.
+    { art::UnsignedContainer c = make_container(sgn::p2pkh(pka), 100000, 99000);
+      c.unsigned_tx.push_back(0x00);
+      CHECK(!sign::parse_unsigned(c).ok, "trailing bytes after tx refused"); }
+
+    // zero-output tx → parse + sign refuse.
+    { art::UnsignedContainer c = make_container_n(sgn::p2pkh(pka), 100000, 1, /*with_output*/false, 0);
+      CHECK(!sign::parse_unsigned(c).ok, "zero-output tx refused (parse)");
+      std::vector<KeyForInput> ks; ks.push_back({0, ska.copy(), pka, {}});
+      SignOptions opt; CHECK(!sign::sign_and_verify(c, std::move(ks), opt).ok, "zero-output tx refused (sign)"); }
+
+    // negative output value → parse refuse.
+    { art::UnsignedContainer c = make_container(sgn::p2pkh(pka), 100000, -1);
+      CHECK(!sign::parse_unsigned(c).ok, "negative output value refused"); }
+
+    // checked-sum: two INT64_MAX inputs must REFUSE (not wrap sum_in to a small
+    // number). Regression for the TOTAL-DEBIT-shows-0 bug.
+    { const int64_t MAXV = 9223372036854775807LL;
+      art::UnsignedContainer c = make_container_n(sgn::p2pkh(pka), MAXV, 2, true, 1000);
+      sign::TxView v = sign::parse_unsigned(c);
+      CHECK(!v.ok, "input-amount-sum overflow refused (no wrap)"); }
+
+    // missing key for an input → sign refuse.
+    { art::UnsignedContainer c = make_container(sgn::p2pkh(pka), 100000, 99000);
+      std::vector<KeyForInput> ks; // empty
+      SignOptions opt; CHECK(!sign::sign_and_verify(c, std::move(ks), opt).ok, "missing signing key refused"); }
+
+    // BCH container → sign refuse (SIGHASH_FORKID not in slice-2a).
+    { art::UnsignedContainer c = make_container(sgn::p2pkh(pka), 100000, 99000); c.coin = "BCH";
+      std::vector<KeyForInput> ks; ks.push_back({0, ska.copy(), pka, {}});
+      SignOptions opt; auto o = sign::sign_and_verify(c, std::move(ks), opt);
+      CHECK(!o.ok, "BCH signing refused (needs SIGHASH_FORKID)"); }
+
+    // P2SH-P2WSH → sign refuse (not in slice-2a).
+    { CScript prog = sgn::p2wsh(sgn::p2pk(pka));        // OP_0 <sha256(ws)>
+      Bytes progb = SB(prog);
+      art::UnsignedContainer c = make_container(sgn::p2sh(prog), 100000, 99000);
+      std::vector<KeyForInput> ks; ks.push_back({0, ska.copy(), pka, progb});
+      SignOptions opt; auto o = sign::sign_and_verify(c, std::move(ks), opt);
+      CHECK(!o.ok, "P2SH-P2WSH refused (not in slice-2a)"); }
+
+    // multisig cosigner NOT in script → sign refuse (item 8).
+    { CScript ms = sgn::p2ms(2, {pka, pkb, pkc}); Bytes msb = SB(ms);
+      art::UnsignedContainer c = make_container(sgn::p2sh(ms), 100000, 99000);
+      std::vector<KeyForInput> ks;
+      ks.push_back({0, ska.copy(), pka, msb});
+      ks.push_back({0, skd.copy(), pkd, msb});          // pk D is not a member
+      SignOptions opt; auto o = sign::sign_and_verify(c, std::move(ks), opt);
+      CHECK(!o.ok, "multisig cosigner-not-in-script refused"); }
+
+    // absurd-fee gate ON SIGN honours the (per-coin) ceiling.
+    { art::UnsignedContainer c = make_container(sgn::p2pkh(pka), 100000000, 1000);
+      std::vector<KeyForInput> ks; ks.push_back({0, ska.copy(), pka, {}});
+      SignOptions opt; opt.absurd_fee_sats = sign::default_absurd_fee_sats("BTC");
+      CHECK(!sign::sign_and_verify(c, std::move(ks), opt).ok, "absurd-fee gate on sign (BTC ceiling)"); }
+
+    // per-coin absurd ceilings.
+    CHECK(sign::default_absurd_fee_sats("BTC") == 10'000'000, "absurd(BTC)=0.1");
+    CHECK(sign::default_absurd_fee_sats("DOGE") == 100'000'000'000LL, "absurd(DOGE)=1000");
+    CHECK(sign::default_absurd_fee_sats("doge-t") == 100'000'000'000LL, "absurd(doge-t) testnet-stripped");
+    CHECK(sign::default_absurd_fee_sats("ZZZ") == 10'000'000, "absurd(unknown)=BTC baseline");
+    CHECK(sign::coin_is_bch("BCH") && sign::coin_is_bch("bch-t") && !sign::coin_is_bch("BTC"), "coin_is_bch");
+}
+
 int main() {
     std::printf("== c2wallet-qt M6 slice-2a SignSession + Amount KATs ==\n");
     test_types();
     test_parse_refusals();
     test_balance_gates();
+    test_new_guards();
     test_tamper_and_wrongkey();
     test_determinism();
     test_amount();

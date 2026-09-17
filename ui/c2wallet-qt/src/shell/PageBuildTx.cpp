@@ -256,7 +256,9 @@ static bool parse_form(const QString& coin, const QString& inText, const QString
         if (f.size() >= 3 && f[2].trimmed().compare("change", Qt::CaseInsensitive) == 0) {
             bo.is_change = true;
             QString path = f.size() >= 4 ? f.mid(3).join(':').trimmed() : QString("(path not given)");
-            bo.label = QString("OWN change (%1)").arg(path);
+            // "declared" — the container carries no change flag, so the offline
+            // signer cannot verify this claim; it re-derives OWN from the keys.
+            bo.label = QString("declared change, UNVERIFIED (%1)").arg(path);
         } else {
             bo.label = QStringLiteral("EXTERNAL");
         }
@@ -291,7 +293,7 @@ void PageBuildTx::onRecalc()
         if (o.is_change) has_change = true;
         if (!o.is_opreturn && o.value < kDustSats) has_dust = true;
     }
-    const bool absurd = fee > c2w::sign::kAbsurdFeeSats;
+    const bool absurd = fee > c2w::sign::default_absurd_fee_sats(coin.toStdString());
 
     QString html;
     html += QString("Inputs: %1 &nbsp; sum_in = %2<br>").arg(int(ins.size())).arg(both_units(sum_in, coin));

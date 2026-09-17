@@ -88,8 +88,9 @@ struct KeyForInput {
 };
 
 struct SignOptions {
-    int  sighash = 0x01;                 // SIGHASH_ALL default (baseline)
-    bool absurd_fee_confirmed = false;   // must be true to sign a fee > kAbsurdFeeSats
+    int     sighash = 0x01;               // SIGHASH_ALL default (baseline)
+    bool    absurd_fee_confirmed = false; // must be true to sign a fee > absurd_fee_sats
+    int64_t absurd_fee_sats = 10'000'000; // T-4 ceiling; default 0.1 unit (see default_absurd_fee_sats)
 };
 
 struct SignOutcome {
@@ -102,8 +103,19 @@ struct SignOutcome {
 };
 
 // A fee strictly greater than this (0.1 whole unit at 8 decimals) is refused
-// unless SignOptions::absurd_fee_confirmed (threat-model T-4).
+// unless SignOptions::absurd_fee_confirmed (threat-model T-4). This is the BTC
+// baseline; per-coin ceilings come from default_absurd_fee_sats (a flat 0.1
+// unit would trip on every normal DOGE / DGB transaction, whose unit is cheap).
 inline constexpr int64_t kAbsurdFeeSats = 10'000'000;
+
+// Per-coin absurd-fee ceiling (satoshis). Ticker is matched case-insensitively;
+// a "-t" testnet suffix is ignored. Unknown coins fall back to kAbsurdFeeSats.
+int64_t default_absurd_fee_sats(const std::string& coin);
+
+// True when `coin` is BCH (mainnet or testnet). BCH needs SIGHASH_FORKID, which
+// slice-2a does not implement — signing a BCH tx with the legacy/BIP143 algebra
+// would be invalid on BCH yet REPLAYABLE on BTC for a pre-fork UTXO.
+bool coin_is_bch(const std::string& coin);
 
 // Sign every input for which a key was supplied, then MANDATORY finalize
 // self-verify (per-input VerifyScript / BIP143 / BIP341) before emit (T-5),

@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -173,7 +175,39 @@ bool is_witness_v0_prog(const Bytes& s) {
 
 bool bytes_eq(const uint8_t* a, const uint8_t* b, size_t n) { return std::memcmp(a, b, n) == 0; }
 
+// Checked int64 addition (item 5): false on overflow so a corrupt/hostile amount
+// field cannot wrap the aggregate (INT64_MAX inputs must not sum to 0).
+inline bool add_checked(int64_t a, int64_t b, int64_t& out) {
+    return !__builtin_add_overflow(a, b, &out);
+}
+
+std::string lower_ascii(std::string s) {
+    for (char& c : s) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    return s;
+}
+
 } // namespace
+
+int64_t default_absurd_fee_sats(const std::string& coin) {
+    // Strip a "-t"/"-test" testnet suffix and lowercase.
+    std::string t = lower_ascii(coin);
+    const size_t dash = t.find('-');
+    if (dash != std::string::npos) t = t.substr(0, dash);
+    // Ceilings in satoshis (8 decimals). Cheap-unit coins get a higher bar so a
+    // normal fee never trips the guard; expensive-unit coins a tight one.
+    if (t == "btc" || t == "bch") return 10'000'000;        // 0.1
+    if (t == "ltc" || t == "dash") return 100'000'000;      // 1
+    if (t == "nmc") return 1'000'000'000;                   // 10
+    if (t == "doge" || t == "dgb") return 100'000'000'000;  // 1000
+    return kAbsurdFeeSats;                                   // unknown -> BTC baseline
+}
+
+bool coin_is_bch(const std::string& coin) {
+    std::string t = lower_ascii(coin);
+    const size_t dash = t.find('-');
+    if (dash != std::string::npos) t = t.substr(0, dash);
+    return t == "bch";
+}
 
 const char* spk_type_str(SpkType t) {
     switch (t) {
@@ -208,6 +242,8 @@ TxView parse_unsigned(const c2w::artifact::UnsignedContainer& c) {
     sgn::Signer sg(tx.version, tx.locktime);
     if (!build_signer(tx, c, sg, v.error)) return v;
 
+    if (tx.vout.empty()) { v.error = "tx has no outputs"; return v; }
+
     v.version = tx.version;
     v.locktime = tx.locktime;
     v.serialized_size = c.unsigned_tx.size();
@@ -216,19 +252,22 @@ TxView parse_unsigned(const c2w::artifact::UnsignedContainer& c) {
         iv.script_pubkey = c.inputs[i].script_pubkey;
         iv.type = classify_spk(iv.script_pubkey);
         iv.amount = c.inputs[i].amount;
+        if (iv.amount < 0) { v.error = "input " + std::to_string(i) + " amount is negative"; return v; }
         iv.prevout_txid_display = reversed_hex(tx.vin[i].txid.data(), 32);
         iv.prevout_index = tx.vin[i].index;
         iv.derivation_hint = c.inputs[i].derivation_hint;
         iv.spk_hex = hex_of(iv.script_pubkey);
-        v.sum_in += iv.amount;
+        if (!add_checked(v.sum_in, iv.amount, v.sum_in)) { v.error = "sum of input amounts overflows int64"; return v; }
         v.inputs.push_back(std::move(iv));
     }
-    for (const auto& o : tx.vout) {
+    for (size_t i = 0; i < tx.vout.size(); ++i) {
+        const auto& o = tx.vout[i];
         OutputView ov;
         ov.value = o.value;
+        if (ov.value < 0) { v.error = "output " + std::to_string(i) + " value is negative"; return v; }
         ov.script_pubkey = o.spk;
         ov.spk_hex = hex_of(o.spk);
-        v.sum_out += ov.value;
+        if (!add_checked(v.sum_out, ov.value, v.sum_out)) { v.error = "sum of output values overflows int64"; return v; }
         v.outputs.push_back(std::move(ov));
     }
     v.fee = v.sum_in - v.sum_out;
@@ -241,6 +280,12 @@ SignOutcome sign_and_verify(const c2w::artifact::UnsignedContainer& c,
                             const SignOptions& opt) {
     SignOutcome out;
 
+    // ── BCH refuse (item 6): no SIGHASH_FORKID in slice-2a; a BCH tx signed with
+    //    the legacy/BIP143 algebra is invalid on BCH yet REPLAYABLE on BTC. ─────
+    if (coin_is_bch(c.coin)) {
+        out.error = "refuse: BCH signing needs SIGHASH_FORKID — not in slice-2a"; return out;
+    }
+
     RawTx tx;
     if (!parse_raw_tx(c.unsigned_tx, tx, out.error)) return out;
     if (!cross_check(tx, c, out.error)) return out;
@@ -248,15 +293,23 @@ SignOutcome sign_and_verify(const c2w::artifact::UnsignedContainer& c,
     sgn::Signer sg(tx.version, tx.locktime);
     if (!build_signer(tx, c, sg, out.error)) return out;
 
-    // ── balance / absurd-fee / oversize gates (T-4) ─────────────────────────
+    // ── MoneyRange + balance / absurd-fee gates (items 4/5, T-4) ────────────
+    if (tx.vout.empty()) { out.error = "refuse: tx has no outputs"; return out; }
     int64_t sum_in = 0, sum_out = 0;
-    for (const auto& in : c.inputs) sum_in += in.amount;
-    for (const auto& o : tx.vout) sum_out += o.value;
+    for (const auto& in : c.inputs) {
+        if (in.amount < 0) { out.error = "refuse: a negative input amount"; return out; }
+        if (!add_checked(sum_in, in.amount, sum_in)) { out.error = "refuse: input amount sum overflows int64"; return out; }
+    }
+    for (const auto& o : tx.vout) {
+        if (o.value < 0) { out.error = "refuse: a negative output value"; return out; }
+        if (!add_checked(sum_out, o.value, sum_out)) { out.error = "refuse: output value sum overflows int64"; return out; }
+    }
     const int64_t fee = sum_in - sum_out;
     if (fee < 0) { out.error = "refuse: unbalanced (sum_in - sum_out < 0)"; return out; }
-    if (fee > kAbsurdFeeSats && !opt.absurd_fee_confirmed) {
+    const int64_t absurd = opt.absurd_fee_sats > 0 ? opt.absurd_fee_sats : kAbsurdFeeSats;
+    if (fee > absurd && !opt.absurd_fee_confirmed) {
         out.error = "refuse: absurd fee " + std::to_string(fee) +
-                    " sat exceeds " + std::to_string(kAbsurdFeeSats) +
+                    " sat exceeds " + std::to_string(absurd) +
                     " sat; set absurd_fee_confirmed to override";
         return out;
     }
@@ -265,6 +318,22 @@ SignOutcome sign_and_verify(const c2w::artifact::UnsignedContainer& c,
     std::map<size_t, std::vector<size_t>> by_input;
     for (size_t k = 0; k < keys.size(); ++k) by_input[keys[k].index].push_back(k);
 
+    // item 8: pick the pubkey ENCODING (compressed or uncompressed) that the
+    // multisig script actually lists for this key, deriving both from the scalar.
+    // Empty result = the key is not a member of the script → a named refusal.
+    auto script_member_pub = [](const secure::SecureBytes& sk, const std::vector<Bytes>& pks) -> Bytes {
+        auto& secp = sgn::Secp::instance();
+        Bytes comp = secp.pubkey_create(sk.data(), true);
+        for (const auto& p : pks) if (p == comp) return comp;
+        Bytes uncomp = secp.pubkey_create(sk.data(), false);
+        for (const auto& p : pks) if (p == uncomp) return uncomp;
+        return {};
+    };
+
+    // item 7a: any make_*_sig can throw (std::runtime_error) — a Qt slot must
+    // never let it escape (→ std::terminate, no secret wipe). Turn it into a
+    // refusal; the moved-in keys are still wiped on return.
+    try {
     for (size_t i = 0; i < tx.vin.size(); ++i) {
         const Bytes& spk = c.inputs[i].script_pubkey;
         const SpkType t = classify_spk(spk);
@@ -328,8 +397,10 @@ SignOutcome sign_and_verify(const c2w::artifact::UnsignedContainer& c,
                     std::vector<Bytes> pks = multisig_pubkeys(redeem);
                     std::vector<std::pair<Bytes, Bytes>> partials;
                     for (size_t ki : kidx) {
+                        Bytes mpub = script_member_pub(keys[ki].sk, pks);
+                        if (mpub.empty()) { out.error = "refuse: cosigner pubkey not in script for input " + std::to_string(i); return out; }
                         Bytes sig = sg.make_legacy_sig(i, cscript(redeem), keys[ki].sk, opt.sighash);
-                        partials.emplace_back(keys[ki].pub, sig);
+                        partials.emplace_back(mpub, sig);
                     }
                     std::vector<Bytes> ordered = sgn::Signer::order_multisig_sigs(pks, partials);
                     CScript redeem_cs = cscript(redeem);
@@ -355,8 +426,10 @@ SignOutcome sign_and_verify(const c2w::artifact::UnsignedContainer& c,
                     std::vector<Bytes> pks = multisig_pubkeys(ws);
                     std::vector<std::pair<Bytes, Bytes>> partials;
                     for (size_t ki : kidx) {
+                        Bytes mpub = script_member_pub(keys[ki].sk, pks);
+                        if (mpub.empty()) { out.error = "refuse: cosigner pubkey not in script for input " + std::to_string(i); return out; }
                         Bytes sig = sg.make_bip143_sig(i, cscript(ws), amount, keys[ki].sk, opt.sighash);
-                        partials.emplace_back(keys[ki].pub, sig);
+                        partials.emplace_back(mpub, sig);
                     }
                     std::vector<Bytes> ordered = sgn::Signer::order_multisig_sigs(pks, partials);
                     sg.set_witness(i, sgn::Signer::multisig_witness(ordered, cscript(ws)));
@@ -379,6 +452,13 @@ SignOutcome sign_and_verify(const c2w::artifact::UnsignedContainer& c,
             default:
                 out.error = "refuse: input " + std::to_string(i) + " has an unsupported scriptPubKey type"; return out;
         }
+    }
+    } catch (const std::exception& e) {
+        out.error = std::string("refuse: signing raised an exception: ") + e.what();
+        return out;
+    } catch (...) {
+        out.error = "refuse: signing raised an unknown exception";
+        return out;
     }
 
     // ── MANDATORY finalize self-verify (T-5) + oversize refusal ─────────────
