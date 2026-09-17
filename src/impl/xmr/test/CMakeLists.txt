@@ -125,6 +125,32 @@ if (BUILD_TESTING)
     target_compile_features(xmr_coinbase_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_coinbase_kat COMMAND xmr_coinbase_kat)
 
+    # 6b2) X6b CARROT / FCMP++ VERSION-GATE KAT. Defends two properties that pull
+    #      in opposite directions:
+    #      (A) adding the version gate moved NO byte of the pre-CARROT coinbase --
+    #          a complete v16 (today's mainnet fork) coinbase is pinned field by
+    #          field (r, R, every P_i, every view tag, the merge-mining root,
+    #          tx_extra, the serialized prefix, both hashes) against goldens
+    #          captured from the pre-gate tree; and
+    #      (B) the CARROT arm STILL FAILS CLOSED -- every major_version 17..255 is
+    #          refused with BuildError::CarrotFence and emits no output, no key and
+    #          no prefix, because upstream monero-project has not merged CARROT,
+    #          has not tagged the fork and publishes no coinbase-enote reference
+    #          vectors, so there is nothing to conform to and nothing to pin (see
+    #          ../settle/xmr_carrot.hpp and docs/xmr-lane/carrot-coinbase-seam.md).
+    #      Payout targets are the OFFICIAL monero-project tests/crypto/tests.txt
+    #      consensus points. Compiles the settle TU and links xmr_coin for the REAL
+    #      vendored ed25519 (ge_*) + keccak; the CARROT seam is header-only. NO
+    #      RandomX, monerod, libsodium or boost -- runs in the ordinary lane on
+    #      BOTH build.yml legs.
+    add_executable(xmr_carrot_gate_kat
+        xmr_carrot_gate_kat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp)
+    target_link_libraries(xmr_carrot_gate_kat PRIVATE xmr_coin)
+    target_include_directories(xmr_carrot_gate_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(xmr_carrot_gate_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_carrot_gate_kat COMMAND xmr_carrot_gate_kat)
+
     # 6c) X8 END-TO-END integration KAT. Stitches the whole XMR-lane path the
     #     per-slice KATs each cover only in isolation: block-template context feeds
     #     the coinbase inputs; the settle leg (../settle/xmr_coinbase.cpp) builds

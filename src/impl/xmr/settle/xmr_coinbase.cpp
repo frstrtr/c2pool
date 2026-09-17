@@ -276,11 +276,16 @@ std::vector<unsigned char> assemble_tx_extra(const PublicKey& R,
 }
 
 // ---------------------------------------------------------------------------
-BuiltCoinbase build_coinbase(const CoinbaseInputs& in) {
+// PRE-CARROT arm. Body BYTE-UNCHANGED from before the version gate: this wave
+// renamed the function and added the dispatcher below it, and touched nothing
+// between the fence check and the final `return out`. Pinned by
+// test/xmr_carrot_gate_kat.cpp against goldens captured from the pre-gate tree.
+BuiltCoinbase build_coinbase_precarrot(const CoinbaseInputs& in) {
     BuiltCoinbase out;
     out.budget = in.budget();
 
-    // ---- FENCE FIRST ----
+    // ---- FENCE FIRST ---- (re-checked here, not only at the dispatcher, so a
+    // direct call can never reach the pre-CARROT recipe with a CARROT block)
     if (!::v37::xmr::xmr_precarrot_ok(in.monero_major_version)) {
         out.error = BuildError::CarrotFence;
         out.detail = to_string(out.error);
@@ -370,6 +375,56 @@ BuiltCoinbase build_coinbase(const CoinbaseInputs& in) {
 
     out.ok = true;
     out.error = BuildError::None;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// CARROT / FCMP++ arm -- SCAFFOLD, FAIL-CLOSED.
+//
+// This is where a conformant CARROT coinbase would be built. It is not built.
+// The refusal is identical in kind to the flat fence this replaced
+// (BuildError::CarrotFence, no outputs, no keys, no prefix), so every existing
+// caller and KAT sees exactly the behaviour it saw before the gate; the only
+// change is that `detail` now names the seam instead of only the fence.
+//
+// Lifting this requires ALL of:
+//   (1) monero-project/monero tags a release that pins the CARROT fork;
+//   (2) reference vectors for a CARROT COINBASE enote exist and are pinned in a
+//       KAT (none are published today -- gap G7 in xmr_carrot.hpp);
+//   (3) the v37 deterministic-anchor ruling (gap step 2) is made by the
+//       operator, since monerod's random anchor is not available to a pool;
+//   (4) an operator ruling lifting the descriptor fence
+//       XMR_PRECARROT_MAX_MAJOR_VERSION, which is CANON and is not touched here.
+BuiltCoinbase build_coinbase_carrot(const CoinbaseInputs& in) {
+    BuiltCoinbase out;
+    out.budget = in.budget();
+
+    // Belt and braces: the scaffold must be unreachable-by-construction, so
+    // assert the invariant the whole fence rests on rather than trusting the
+    // dispatcher alone.
+    static_assert(!carrot::conformant(),
+                  "the CARROT arm is a scaffold; it must not claim conformance");
+
+    out.ok = false;
+    out.error = BuildError::CarrotFence;
+    out.detail = std::string(to_string(out.error)) + "; " + carrot::seam_status();
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// VERSION GATE. One boundary, two arms, no third path: the switch is exhaustive
+// over CoinbaseRegime and the trailing refusal catches a value outside it.
+BuiltCoinbase build_coinbase(const CoinbaseInputs& in) {
+    switch (coinbase_regime(in.monero_major_version)) {
+        case CoinbaseRegime::PreCarrot: return build_coinbase_precarrot(in);
+        case CoinbaseRegime::Carrot:    return build_coinbase_carrot(in);
+    }
+    // Unreachable for any std::uint8_t. Fail closed anyway -- a coinbase builder
+    // that falls off the end must never return a half-built transaction.
+    BuiltCoinbase out;
+    out.budget = in.budget();
+    out.error = BuildError::CarrotFence;
+    out.detail = std::string(to_string(out.error)) + "; unknown coinbase regime";
     return out;
 }
 
