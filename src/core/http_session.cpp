@@ -1178,7 +1178,31 @@ void HttpSession::process_request()
                         return;
                     }
                 }
-                auto j = mining_interface_->rest_tx_inject_submit(request_.body());
+                // #157 Slice B (timeout-after-5xx money-safety): the
+                // submit fn marshals onto the node io_context via thread_safe_wrap,
+                // which ABANDONS the wait after PRODUCER_DISPATCH_TIMEOUT (~10s)
+                // and throws -- but the task it POSTED still runs submit_inject
+                // when the strand recovers. So a timed-out submit MAY yet be
+                // accepted: the operator must NOT blindly resubmit. Answer the
+                // scoped 504 with that guidance in the body (rather than the
+                // generic 500 catch below, which says nothing about it). A
+                // resubmit is in any case a no-op -- NodeCoinState::submit_inject
+                // -> Mempool::add_inject refuses a duplicate txid by name
+                // ("inject-already-known") -- but say so on the wire so a human /
+                // qt does not read the 5xx as "definitely not accepted". This is
+                // scoped to THIS route only; the shared thread_safe_wrap timeout
+                // behaviour is unchanged for every other caller.
+                nlohmann::json j;
+                try {
+                    j = mining_interface_->rest_tx_inject_submit(request_.body());
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[tx-inject] submit dispatch failed: " << e.what();
+                    response.result(http::status::gateway_timeout);   // 504
+                    response.body() = R"j({"ok":false,"timed_out":true,"cause":"submit dispatch timed out; the tx MAY still have been accepted on the node strand -- do NOT blindly resubmit. A resubmit of the same tx is a no-op: the inject dedup gate refuses a duplicate txid as inject-already-known."})j";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
                 int st = j.is_object() ? j.value("http_status", 200) : 200;
                 if (st < 100 || st > 599) st = 200;
                 if (j.is_object()) j.erase("http_status");

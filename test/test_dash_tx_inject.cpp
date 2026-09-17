@@ -1060,11 +1060,11 @@ TEST(DashTxInject, SliceBArmSinkChargesPeerBudgetNotLocal)
     UTXOViewCache utxo(nullptr);            // empty view: injects fail post-charge
     NodeCoinState st; arm_ncs(st, utxo);
 
-    // The peer sink EXACTLY as main_dash's arm_tx_inject installs it.
-    auto peer_sink = [&st](const MutableTransaction& tx, uint32_t flags,
-                           int32_t expiry_height) {
-        return st.submit_inject(tx, flags, expiry_height, Origin::Peer);
-    };
+    // The peer sink EXACTLY as main_dash's arm_tx_inject installs it -- built
+    // through the SAME shared helper, so if main_dash's sink ever drops the
+    // Origin::Peer arg (re-merging the budgets) this KAT builds the regressed
+    // shape too and fails, instead of exercising a divergent test-local copy.
+    auto peer_sink = dash::coin::make_peer_inject_sink(st);
 
     const std::size_t cap = InjectRateLimiter::kMaxInjectsPerWindow;
     for (std::size_t i = 0; i < cap; ++i) {

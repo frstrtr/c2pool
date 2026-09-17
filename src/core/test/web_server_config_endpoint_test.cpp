@@ -222,13 +222,19 @@ TEST(ConfigEndpointHttp, PostApplyNonMoneyAppliesWithToken) {
     reset_apply_state();
     ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
     ce::set_control_token("tok-abc");
+    // web.external_ip is a LIVE (non-money) key. After the runtime-setter
+    // precondition (money-mirror-lie guard), a key applies at runtime ONLY when
+    // a registered ParamApplier setter can actually enact it -- a mirror swap
+    // with no setter is refused. Register a live setter so this exercises a
+    // genuine non-money live apply (a main that wants runtime web.external_ip
+    // would register the analogous real setter). (web.port is RESTART-class and
+    // is refused by the design-F1 restart guard -- see PostApplyRefusesRestartClassKey.)
+    ce::applier().register_setter("web.external_ip",
+                                  [](const std::string&) { return true; });
     net::io_context ioc;
     auto ws = make_apply_server(ioc);
 
     int status = 0;
-    // web.external_ip is a LIVE (non-money) key: it applies at runtime. (web.port
-    // is RESTART-class and is now refused by the design-F1 restart guard, so it
-    // is no longer a valid "live apply" example -- see PostApplyRefusesRestartClassKey.)
     nlohmann::json req = {{"control_token", "tok-abc"},
                           {"changes", {{"web.external_ip", "1.2.3.4"}}}};
     auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
@@ -286,12 +292,19 @@ TEST(ConfigEndpointHttp, PostApplyMoneyWithoutNonceIssuesConfirmAndAppliesNothin
     reset_apply_state();
     ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
     ce::set_control_token("tok-abc");
+    // Drive a money key that IS runtime-appliable (embedded.tx_inject has a
+    // registered setter). A money key with NO setter (e.g. money.node_owner_fee_pct)
+    // is now refused by the runtime-setter precondition BEFORE a confirm nonce
+    // could ever be issued -- see PostApplyRefusesKeyWithNoRuntimeSetter -- so it
+    // can no longer stand in for "money write issues a confirm".
+    ce::applier().register_setter("embedded.tx_inject",
+                                  [](const std::string&) { return true; });
     net::io_context ioc;
     auto ws = make_apply_server(ioc);
 
     int status = 0;
     nlohmann::json req = {{"control_token", "tok-abc"},
-                          {"changes", {{"money.node_owner_fee_pct", "0.5"}}}};
+                          {"changes", {{"embedded.tx_inject", "true"}}}};
     auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
                            status, req.dump());
     EXPECT_EQ(status, 200) << body;
@@ -302,11 +315,11 @@ TEST(ConfigEndpointHttp, PostApplyMoneyWithoutNonceIssuesConfirmAndAppliesNothin
     EXPECT_EQ(ce::tripwire_state().count, 0u)
         << "a phase-1 confirmation request must not trip the money wire";
 
-    // The mirror is unchanged (the money key was never applied: a seeded-but-
-    // unset compiled default reports an empty value).
+    // The mirror is unchanged (the arm was never applied: a seeded-but-unset
+    // compiled default reports an empty value, exactly like any other unset key).
     auto cfg = nlohmann::json::parse(
         do_request(ws->bound_port(), http::verb::get, "/api/config", status));
-    EXPECT_EQ(cfg["keys"]["money.node_owner_fee_pct"].value("value", std::string()), "");
+    EXPECT_EQ(cfg["keys"]["embedded.tx_inject"].value("value", std::string()), "");
 }
 
 // The two-phase nonce is BOUND TO THE EXACT diff: a nonce issued for one diff
@@ -316,24 +329,28 @@ TEST(ConfigEndpointHttp, PostApplyMoneyTwoPhaseNonceMustMatchDiff) {
     reset_apply_state();
     ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
     ce::set_control_token("tok-abc");
+    // Diff-binding on a runtime-appliable money key (embedded.tx_inject has a
+    // setter). The two distinct diffs are the arm ON ("true") vs OFF ("false").
+    ce::applier().register_setter("embedded.tx_inject",
+                                  [](const std::string&) { return true; });
     net::io_context ioc;
     auto ws = make_apply_server(ioc);
 
-    // Phase 1: issue a nonce bound to fee=0.5.
+    // Phase 1: issue a nonce bound to arm=true.
     int status = 0;
     nlohmann::json issue = {{"control_token", "tok-abc"},
-                            {"changes", {{"money.node_owner_fee_pct", "0.5"}}}};
+                            {"changes", {{"embedded.tx_inject", "true"}}}};
     auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
                            status, issue.dump());
     auto j = nlohmann::json::parse(body);
     const std::string nonce = j.value("money_nonce", std::string());
     ASSERT_FALSE(nonce.empty());
 
-    // Phase 2a: present the nonce against a DIFFERENT diff (fee=0.7) -> refuse
+    // Phase 2a: present the nonce against a DIFFERENT diff (arm=false) -> refuse
     // + tripwire fires. No apply.
     nlohmann::json wrong = {{"control_token", "tok-abc"},
                             {"money_nonce", nonce},
-                            {"changes", {{"money.node_owner_fee_pct", "0.7"}}}};
+                            {"changes", {{"embedded.tx_inject", "false"}}}};
     body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
                       status, wrong.dump());
     EXPECT_EQ(status, 409) << body;
@@ -342,10 +359,10 @@ TEST(ConfigEndpointHttp, PostApplyMoneyTwoPhaseNonceMustMatchDiff) {
     EXPECT_GE(ce::tripwire_state().count, 1u)
         << "a diff-mismatched nonce must trip the money wire";
 
-    // Phase 2b: present the nonce against the ORIGINAL diff (fee=0.5) -> applied.
+    // Phase 2b: present the nonce against the ORIGINAL diff (arm=true) -> applied.
     nlohmann::json confirm = {{"control_token", "tok-abc"},
                               {"money_nonce", nonce},
-                              {"changes", {{"money.node_owner_fee_pct", "0.5"}}}};
+                              {"changes", {{"embedded.tx_inject", "true"}}}};
     body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
                       status, confirm.dump());
     EXPECT_EQ(status, 200) << body;
@@ -354,7 +371,7 @@ TEST(ConfigEndpointHttp, PostApplyMoneyTwoPhaseNonceMustMatchDiff) {
 
     auto cfg = nlohmann::json::parse(
         do_request(ws->bound_port(), http::verb::get, "/api/config", status));
-    EXPECT_EQ(cfg["keys"]["money.node_owner_fee_pct"].value("value", std::string()), "0.5");
+    EXPECT_EQ(cfg["keys"]["embedded.tx_inject"].value("value", std::string()), "true");
 }
 
 TEST(ConfigEndpointHttp, UnwiredInterfaceReturns404) {
@@ -560,6 +577,13 @@ TEST(ConfigEndpointHttp, SliceBMoneyGateRejectsInvalidAddressAndTripsWire) {
     reset_apply_state();
     ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
     ce::set_control_token("tok-addr");
+    // Register a setter for the address key so the apply reaches the money-gate
+    // ADDRESS branch (the subject of this KAT). The runtime-setter precondition
+    // runs before the money gate and would otherwise refuse a no-setter key; the
+    // server-side AddressValidator (step 4) still rejects the bad address before
+    // the setter is ever invoked, so the branch under test is exercised for real.
+    ce::applier().register_setter("money.node_owner_address",
+                                  [](const std::string&) { return true; });
     net::io_context ioc;
     auto ws = make_apply_server(ioc);
 
@@ -608,13 +632,17 @@ TEST(ConfigEndpointHttp, SliceBMoneyNonceIsSingleUseReplayRefused) {
     reset_apply_state();
     ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
     ce::set_control_token("tok-replay");
+    // Single-use / replay proven on a runtime-appliable money key (the arm has
+    // a setter; a no-setter money key is refused before a nonce can issue).
+    ce::applier().register_setter("embedded.tx_inject",
+                                  [](const std::string&) { return true; });
     net::io_context ioc;
     auto ws = make_apply_server(ioc);
 
-    // Phase 1: issue a nonce bound to fee=0.5.
+    // Phase 1: issue a nonce bound to arm=true.
     int status = 0;
     nlohmann::json issue = {{"control_token", "tok-replay"},
-                            {"changes", {{"money.node_owner_fee_pct", "0.5"}}}};
+                            {"changes", {{"embedded.tx_inject", "true"}}}};
     auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
                            status, issue.dump());
     auto j = nlohmann::json::parse(body);
@@ -624,7 +652,7 @@ TEST(ConfigEndpointHttp, SliceBMoneyNonceIsSingleUseReplayRefused) {
     // Phase 2: confirm -> applied. This CONSUMES the nonce (single-use).
     nlohmann::json confirm = {{"control_token", "tok-replay"},
                               {"money_nonce", nonce},
-                              {"changes", {{"money.node_owner_fee_pct", "0.5"}}}};
+                              {"changes", {{"embedded.tx_inject", "true"}}}};
     body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
                       status, confirm.dump());
     EXPECT_EQ(status, 200) << body;
@@ -807,6 +835,46 @@ TEST(ConfigEndpointHttp, PostApplyRefusesRestartClassKey) {
     EXPECT_NE(j.value("error", std::string()).find("restart-class"), std::string::npos) << body;
 
     // Nothing applied: no money nonce was ever issued, wire not tripped.
+    EXPECT_EQ(ce::tripwire_state().count, 0u);
+    ce::clear_control_token();
+}
+
+// Money-mirror-lie guard: a MONEY-class key with NO registered runtime setter
+// (money.node_owner_fee_pct is MONEY_RESTART and no main wires a setter for it)
+// must be REFUSED by the runtime-setter precondition -- BEFORE a confirm nonce
+// is issued -- so the reporting mirror can never advertise a fee the coinbase
+// never adopts. The money key partitions past the plain RESTART refusal, so this
+// precondition (not that partition) is what closes the hole for it.
+TEST(ConfigEndpointHttp, PostApplyRefusesKeyWithNoRuntimeSetter) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    ce::set_control_token("tok-nosetter");
+    // Deliberately register NO setter for money.node_owner_fee_pct.
+    net::io_context ioc;
+    auto ws = make_apply_server(ioc);
+
+    // Even presenting a (bogus) nonce cannot get past the precondition: the key
+    // is refused before the money gate, and no nonce was ever issued for it.
+    int status = 0;
+    nlohmann::json apply = {{"control_token", "tok-nosetter"},
+                            {"money_nonce", "deadbeef"},
+                            {"changes", {{"money.node_owner_fee_pct", "0.5"}}}};
+    auto body = do_request(ws->bound_port(), http::verb::post, "/api/config/apply",
+                           status, apply.dump());
+    EXPECT_EQ(status, 400) << body;
+    auto j = nlohmann::json::parse(body);
+    EXPECT_EQ(j.value("status", std::string()), "no_runtime_setter");
+    EXPECT_EQ(j.value("offending_key", std::string()), "money.node_owner_fee_pct");
+    EXPECT_FALSE(j.value("applied", true));
+    EXPECT_FALSE(j.value("need_confirm", false))
+        << "a no-setter key must never even issue a confirm nonce";
+
+    // The mirror was NOT swapped: the fee key stays at its empty compiled default.
+    auto cfg = nlohmann::json::parse(
+        do_request(ws->bound_port(), http::verb::get, "/api/config", status));
+    EXPECT_EQ(cfg["keys"]["money.node_owner_fee_pct"].value("value", std::string()), "");
+    // And the money wire never fired (this is a precondition refusal, not a
+    // money-path write attempt without a nonce).
     EXPECT_EQ(ce::tripwire_state().count, 0u);
     ce::clear_control_token();
 }

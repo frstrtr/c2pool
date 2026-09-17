@@ -2786,16 +2786,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     auto arm_tx_inject = [&node_coin_state, &p2p_node](bool on) {
         node_coin_state.set_tx_inject_enabled(on);
         if (on) {
+            // #157 M3: peer-origin sink -- charges the aggregate-PEER rate budget
+            // so a peer flood can never starve the operator's own local inject
+            // (M3 anti-starvation split preserved). Built through the SHARED
+            // make_peer_inject_sink helper so the KAT guards this exact shape --
+            // a dropped Peer origin arg fails the test, not just review.
             p2p_node.set_tx_inject_sink(
-                [&node_coin_state](const dash::coin::MutableTransaction& tx,
-                                   uint32_t flags, int32_t expiry_height) {
-                    // #157 M3: peer-origin -- charge the aggregate-PEER rate
-                    // budget so a peer flood can never starve the operator's
-                    // own local inject (M3 anti-starvation split preserved).
-                    return node_coin_state.submit_inject(
-                        tx, flags, expiry_height,
-                        dash::coin::NodeCoinState::InjectOrigin::Peer);
-                });
+                dash::coin::make_peer_inject_sink(node_coin_state));
         } else {
             p2p_node.set_tx_inject_sink(nullptr);   // disarm clears the sink too
         }
@@ -2855,9 +2852,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // #157 Slice B (brief item 6): the submit fn marshals onto the node
         // io_context via thread_safe_wrap, so set_io_context() MUST already have
         // run -- it does, at web-server standup above, before web_server->start().
-        assert(web_server->get_mining_interface()->has_io_context() &&
-               "set_io_context must precede web_server->start() so tx-inject "
-               "submit can marshal onto the node strand");
+        // HARD runtime check (NOT assert): were the io_context ever unwired when
+        // the submit fn installs, thread_safe_wrap would run submit_inject INLINE
+        // on the web thread -> a data race on the IO-confined m_inject_pool. Fail
+        // loudly in release too rather than silently racing under NDEBUG.
+        if (!web_server->get_mining_interface()->has_io_context())
+            throw std::runtime_error(
+                "tx-inject submit fn installed before io_context wired: "
+                "set_io_context() must precede web_server->start() so the submit "
+                "marshals onto the node strand and never races m_inject_pool");
         web_server->get_mining_interface()->set_tx_inject_submit_fn(
             [&node_coin_state](const std::string& body) -> nlohmann::json {
                 nlohmann::json req = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);

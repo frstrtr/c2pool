@@ -2222,5 +2222,25 @@ private:
     bool     m_populated{false};
 };
 
+// #157 M3 (Slice B): build the PEER-origin inject sink EXACTLY as main_dash's
+// arm_tx_inject installs it -- a closure that routes an inbound peer tx through
+// submit_inject charging the aggregate-PEER rate budget (InjectOrigin::Peer),
+// never the operator's LOCAL budget (the M3 anti-starvation split: a peer flood
+// exhausts only the peer budget and can NEVER starve the operator's own local
+// inject). main_dash's arm AND the KAT both build the sink through THIS single
+// helper, so a regression that drops the Peer origin arg (re-merging the two
+// budgets into one) is caught by the KAT rather than sailing through green.
+// Reward-safe: transport + a txid + submit_inject; no coinbase/subsidy/PPLNS/
+// payee/won-block state is touched.
+inline std::function<NodeCoinState::InjectSubmitResult(
+        const MutableTransaction&, uint32_t, int32_t)>
+make_peer_inject_sink(NodeCoinState& st) {
+    return [&st](const MutableTransaction& tx, uint32_t flags,
+                 int32_t expiry_height) {
+        return st.submit_inject(tx, flags, expiry_height,
+                                NodeCoinState::InjectOrigin::Peer);
+    };
+}
+
 } // namespace coin
 } // namespace dash

@@ -31,9 +31,38 @@ current state, the design that follows is retained for rationale:
   - **`control_token` is now REQUIRED on the submit body** (checked via the same
     `check_control_token()`; 403 on miss), so once armed no other local process
     can spend the operator's inject rate-budget. `raw_tx` must be even-length hex.
-  - The apply path now **REFUSES RESTART-class keys** by a named cause
-    (`restart_unsupported`) until a restart-aware applier exists — closing a
-    mirror-vs-runtime hole (a RESTART key had been partitioned but never consulted).
+  - **Submit timeout is idempotent-safe.** The submit fn marshals onto the node
+    strand via `thread_safe_wrap`, which abandons the wait after
+    `PRODUCER_DISPATCH_TIMEOUT` (~10s) and throws — but the task it posted still
+    runs `submit_inject` when the strand recovers. The `/api/tx-inject/submit`
+    route therefore answers a **scoped 504** whose body states the tx *may still
+    have been accepted — do not blindly resubmit*. A resubmit is in any case a
+    no-op: `submit_inject → Mempool::add_inject` refuses a duplicate txid by name
+    (`inject-already-known`). This is scoped to the submit route; the shared
+    `thread_safe_wrap` timeout behaviour is unchanged for every other caller.
+  - **Runtime disarm does NOT evict already-admitted injects.** `arm_tx_inject(false)`
+    (a money-gated `embedded.tx_inject=false` apply) flips the M1 submit gate OFF
+    and clears the p2p sink, so **no NEW injects** are admitted — but injects
+    already in `m_inject_pool` ride until they expire or are evicted by the normal
+    reconcile path; disarm does not flush the pool. For immediate removal of
+    in-flight injects, restart the node without the flag.
+  - The apply path now **REFUSES any key it cannot actually enact at runtime**,
+    closing the mirror-vs-runtime lie (a key applied with no live setter would
+    swap the reporting mirror behind `GET /api/config` while the running process
+    keeps the OLD value). Two guards, in order:
+    - `validate_apply_batch` refuses **plain RESTART-class keys** by a named
+      cause (`restart_unsupported`) until a restart-aware applier exists.
+    - `apply_config` then refuses **any key with no registered runtime setter**
+      (`no_runtime_setter`, HTTP 400), REGARDLESS of money/restart/live class and
+      BEFORE any money nonce is issued. This is what closes the hole for
+      **money-class** keys: `validate_apply_batch` partitions `is_money()` into
+      `money_keys` *before* the RESTART refusal, so a `MONEY_RESTART` key
+      (`money.node_owner_fee_pct` / `_address` / `_script`) or a
+      `MONEY_LIVE`-without-setter key (`global.payout_window`) would otherwise
+      reach the mirror swap with no setter. In this build `main_dash` registers a
+      setter only for `embedded.tx_inject`, so it alone is runtime-appliable (it
+      still runs the full two-phase money-nonce gate); every other key must be
+      changed in the config file + a restart.
 
 
 ## Background — what exists today

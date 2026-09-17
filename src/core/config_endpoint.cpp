@@ -376,7 +376,10 @@ BatchResult validate_apply_batch(const std::map<std::string, std::string>& chang
     // mirror while the running process keeps the OLD value -- a mirror-vs-runtime
     // lie. REFUSE the whole batch by a named cause until a restart-aware applier
     // exists. (embedded.tx_inject is MONEY_LIVE, so it takes the money-nonce
-    // path, NOT this one; this closes the hole for every OTHER RESTART key.)
+    // path, NOT this one. This refuses PLAIN RESTART keys here; the general
+    // mirror-vs-runtime hole -- ANY key with no registered runtime setter,
+    // including money-class keys that skip this partition -- is closed by the
+    // runtime-setter precondition in apply_config().)
     if (!r.restart_keys.empty())
         return reject(BatchVerdict::RejectRestartUnsupported, r.restart_keys.front(),
                       "restart-class key cannot be applied at runtime (no restart-"
@@ -543,6 +546,7 @@ const char* apply_status_name(ApplyStatus s) {
         case ApplyStatus::NotPublished:     return "not_published";
         case ApplyStatus::RejectNoToken:    return "no_token";
         case ApplyStatus::RejectValidation: return "validation";
+        case ApplyStatus::RejectNoRuntimeSetter: return "no_runtime_setter";
         case ApplyStatus::NeedConfirm:      return "need_confirm";
         case ApplyStatus::RejectMoneyGate:  return "money_gate";
         case ApplyStatus::Applied:          return "applied";
@@ -644,6 +648,36 @@ ApplyResponse apply_config(const ApplyRequest& req) {
         out.message = batch.message;
         out.offending_key = batch.offending_key;
         return out;
+    }
+
+    // 3b) RUNTIME-SETTER PRECONDITION (money-mirror-lie guard). A key is
+    //     "applied" only if a registered ParamApplier setter actually enacts it
+    //     on the running node. Without a setter, step 5 would swap the reporting
+    //     mirror behind GET /api/config while the process keeps the OLD value --
+    //     a mirror-vs-runtime lie. This is EXACTLY the hole money-class keys slip
+    //     through: validate_apply_batch partitions is_money() into money_keys
+    //     BEFORE the RESTART refusal, so a MONEY_RESTART key (money.node_owner_*
+    //     fee/address/script) or a MONEY_LIVE-without-setter key (e.g.
+    //     global.payout_window) would otherwise reach the mirror swap with no
+    //     runtime setter and report a new fee/payee the coinbase never adopts.
+    //     REFUSE ANY key with no registered runtime setter here, REGARDLESS of
+    //     money/restart/live class, and BEFORE a money nonce is ever issued -- a
+    //     key that cannot be enacted at runtime must never be reported applied.
+    //     In this build main_dash registers a setter only for embedded.tx_inject,
+    //     so it alone is runtime-appliable; it still takes the full money-nonce
+    //     path below (has() is true for it). A key whose runtime mutation is not
+    //     yet wired belongs in the config file + a restart.
+    for (const auto& [canon, value] : req.changes) {
+        if (!applier().has(canon)) {
+            out.status = ApplyStatus::RejectNoRuntimeSetter;
+            out.http_status = 400;
+            out.offending_key = canon;
+            out.message = "key has no registered runtime setter; it cannot be "
+                          "applied at runtime (change it in the config file and "
+                          "restart the node)";
+            return out;
+        }
+        (void)value;
     }
 
     // 4) MONEY-PATH GATE (two-phase nonce + AddressValidator + tripwire).
