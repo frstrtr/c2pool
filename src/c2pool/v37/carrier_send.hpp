@@ -190,6 +190,7 @@ struct CarrierSendStats {
     std::uint64_t cut_missing = 0;        // S-1c: block wins emitted WITHOUT one (peers credit nothing)
     std::uint64_t relayed = 0;            // reached >= 1 peer
     std::uint64_t deferred_relay = 0;     // admitted but 0 peers (DEFER, never dropped)
+    std::uint64_t reoffered = 0;          // frames this worker put back on the wire
     std::uint64_t peers_reached_total = 0;
 };
 
@@ -237,6 +238,20 @@ public:
         // set_inbound lambda; the worker then holds it across the relay call
         // only (never across the resolve RPC or the grind). nullptr = none.
         std::mutex* relay_mutex = nullptr;
+        // ★ CARRIER RE-OFFER TICK (w3_relay.hpp §CARRIER RE-OFFER). The worker
+        // already owns a thread that is idle between wins, so it is the natural
+        // driver for the relay's bounded re-offer sweep: every time the queue
+        // wait times out, it calls CarrierRelay::reoffer_tick() once. The relay
+        // does its own rate-limiting (min_interval / min_forced_interval) and
+        // its own bounding (max_per_sweep), so this interval only sets how often
+        // it is ASKED. 0 disables the driver entirely — the relay then re-offers
+        // nothing unless some other timer calls reoffer_tick().
+        //
+        // This is what makes the DEFER counted just below (deferred_relay) a
+        // RECOVERABLE event instead of a silent loss: a carrier that reached no
+        // peer is re-sent when a peer comes back, and the receiver's W2 dedup
+        // window refuses it if it already has it (REJECT_DEDUP, zero pushes).
+        std::chrono::milliseconds reoffer_tick_interval{1000};
     };
 
     // (warn, line): the daemon binds LOG_WARNING / LOG_INFO; tests may print.
@@ -476,7 +491,19 @@ private:
             OwnWinRequest req;
             {
                 std::unique_lock<std::mutex> lk(m_q_mtx);
-                m_q_cv.wait(lk, [&] { return m_stopped || !m_q.empty(); });
+                if (m_opt.reoffer_tick_interval.count() > 0) {
+                    // Timed wait so the idle worker can drive the relay's
+                    // bounded re-offer sweep. A timeout with an empty queue is
+                    // NOT a work item: unlock, tick, and come back round.
+                    if (!m_q_cv.wait_for(lk, m_opt.reoffer_tick_interval,
+                                         [&] { return m_stopped || !m_q.empty(); })) {
+                        lk.unlock();
+                        drive_reoffer();
+                        continue;
+                    }
+                } else {
+                    m_q_cv.wait(lk, [&] { return m_stopped || !m_q.empty(); });
+                }
                 if (m_stopped) {
                     // Drain only block winners (bounded work, W3-G1-shaped);
                     // shares are abandoned by stop() and counted there.
@@ -505,6 +532,21 @@ private:
                 m_busy = false;
             }
             m_idle_cv.notify_all();
+        }
+    }
+
+    // One bounded re-offer sweep, under the same relay_mutex discipline the
+    // emit path uses (never held across an RPC or a grind). Never throws out.
+    void drive_reoffer() {
+        try {
+            std::unique_lock<std::mutex> rl;
+            if (m_opt.relay_mutex) rl = std::unique_lock<std::mutex>(*m_opt.relay_mutex);
+            const std::size_t n = m_relay.reoffer_tick();
+            if (n) bump([n](CarrierSendStats& s) { s.reoffered += n; });
+        } catch (const std::exception& e) {
+            log(true, std::string("[carrier-send] re-offer tick threw: ") + e.what());
+        } catch (...) {
+            log(true, "[carrier-send] re-offer tick threw (non-std)");
         }
     }
 

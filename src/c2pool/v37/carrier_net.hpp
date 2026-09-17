@@ -42,9 +42,12 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "w3_relay.hpp"   // ICarrierTransport
@@ -61,6 +64,12 @@ class CarrierPeerNode final : public ICarrierTransport {
 public:
     // Received-frame handler: bind to [relay](const auto& f){ relay.handle_inbound(f); }.
     using InboundFn = std::function<void(const std::vector<std::uint8_t>&)>;
+    // Fired once per ESTABLISHED connection (accepted or dialled), on the
+    // accepting/dialling thread, with NO transport lock held. Bind it to
+    // CarrierRelay::note_peer_connected() so a (re)connecting peer arms the
+    // bounded carrier re-offer sweep (w3_relay.hpp §RE-OFFER). It MUST be O(1)
+    // and MUST NOT call back into this node (it runs on the accept loop).
+    using PeerConnectFn = std::function<void()>;
 
     CarrierPeerNode() = default;
     ~CarrierPeerNode() override { stop(); }
@@ -69,6 +78,7 @@ public:
     CarrierPeerNode& operator=(const CarrierPeerNode&) = delete;
 
     void set_inbound(InboundFn f) { m_inbound = std::move(f); }
+    void set_on_peer_connect(PeerConnectFn f) { m_on_connect = std::move(f); }
 
     // Bind + listen on host:port. port==0 selects an ephemeral port, readable
     // afterward via listen_port() (the multi-node test binds 0 and dials the
@@ -116,6 +126,24 @@ public:
     // whole frame. 0 => DEFER (w3_relay.hpp §"the transport seam": the relay
     // leaves the append standing and retries later — a block-winner is never
     // dropped for want of a peer).
+    //
+    // ★ PER-DESCRIPTOR WRITE LOCKS (head-of-line fix). Each connection has its
+    // OWN write mutex (m_write_locks, keyed by fd), held across [length prefix +
+    // body] so two writers can never interleave a frame on ONE socket, while a
+    // peer that has stopped reading — and therefore holds its own lock for the
+    // whole of a large blocking write — no longer blocks writes to any OTHER
+    // peer. Before this, a single shared m_write_mtx guarded every send_all, so
+    // one slow reader stalled the flood to the entire peer set (and, because the
+    // relay drives broadcast() under its own mutex, stalled the relay with it).
+    //
+    // TWO PASSES for the same reason WITHIN one call: pass 1 takes only the
+    // locks that are free right now (try_lock) and serves those peers
+    // immediately; pass 2 blocks on whatever is left. So a peer whose lock is
+    // held by another in-flight write is served LAST instead of delaying every
+    // peer behind it. Cross-peer frame ORDER was never guaranteed here (two
+    // concurrent broadcasts already interleave across the peer loop) — the
+    // guarantee this class makes, and keeps, is PER-CONNECTION: frames arrive
+    // whole and in the order they were written on that connection.
     std::size_t broadcast(const std::vector<std::uint8_t>& frame) override {
         std::uint8_t lenbuf[4];
         const std::uint32_t len = static_cast<std::uint32_t>(frame.size());
@@ -126,8 +154,22 @@ public:
 
         std::size_t reached = 0;
         std::vector<int> dead;
+        std::vector<std::pair<int, std::shared_ptr<std::mutex>>> deferred;
+        deferred.reserve(targets.size());
+
+        // pass 1 — every peer whose write lock is free right now.
         for (int fd : targets) {
-            std::lock_guard<std::mutex> wlk(*write_lock(fd));
+            std::shared_ptr<std::mutex> wl = write_lock(fd);
+            std::unique_lock<std::mutex> wlk(*wl, std::try_to_lock);
+            if (!wlk.owns_lock()) { deferred.emplace_back(fd, std::move(wl)); continue; }
+            if (send_all(fd, lenbuf, 4) && (len == 0 || send_all(fd, frame.data(), len)))
+                ++reached;
+            else
+                dead.push_back(fd);
+        }
+        // pass 2 — the peers that were busy; blocking, one connection at a time.
+        for (auto& [fd, wl] : deferred) {
+            std::lock_guard<std::mutex> wlk(*wl);
             if (send_all(fd, lenbuf, 4) && (len == 0 || send_all(fd, frame.data(), len)))
                 ++reached;
             else
@@ -159,6 +201,9 @@ public:
         { std::lock_guard<std::mutex> lk(m_mtx);
           for (int fd : m_peers) ::close(fd);
           m_peers.clear(); }
+        // A blocked writer may still hold a shared_ptr to one of these; the
+        // map drops its own reference and the mutex dies with the last holder.
+        { std::lock_guard<std::mutex> lk(m_wl_mtx); m_write_locks.clear(); }
     }
 
 private:
@@ -177,10 +222,22 @@ private:
     void add_established(int fd) {
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        std::lock_guard<std::mutex> lk(m_mtx);
-        if (!m_running.load()) { ::close(fd); return; }   // stopping: never orphan a reader
-        m_peers.push_back(fd);
-        m_readers.emplace_back([this, fd] { reader_loop(fd); });
+        bool established = false;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (!m_running.load()) { ::close(fd); return; }   // stopping: never orphan a reader
+            m_peers.push_back(fd);
+            m_readers.emplace_back([this, fd] { reader_loop(fd); });
+            established = true;
+        }
+        if (established) {
+            (void)write_lock(fd);               // fresh lock for a fresh connection
+            // OUTSIDE m_mtx on purpose: the callback arms the relay's re-offer
+            // sweep, and the relay's own broadcast path takes m_mtx — firing it
+            // under the lock would invert the order (relay -> transport).
+            PeerConnectFn cb = m_on_connect;
+            if (cb) cb();
+        }
     }
 
     void reader_loop(int fd) {
@@ -203,18 +260,35 @@ private:
     }
 
     void drop_peer(int fd) {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        for (auto it = m_peers.begin(); it != m_peers.end(); ++it)
-            if (*it == fd) { m_peers.erase(it); break; }
-        // The fd is closed by stop() (join order) or here once fully removed;
-        // closing once is enough — mark by removing from the set above.
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            for (auto it = m_peers.begin(); it != m_peers.end(); ++it)
+                if (*it == fd) { m_peers.erase(it); break; }
+            // The fd is closed by stop() (join order) or here once fully removed;
+            // closing once is enough — mark by removing from the set above.
+        }
+        // Drop the map's reference to this connection's write lock so the table
+        // stays bounded by the LIVE peer count. A writer blocked on the socket
+        // right now still holds its own shared_ptr, so the mutex it is waiting
+        // on stays alive until it returns. The fd itself is not closed before
+        // stop() (unchanged behaviour), so it cannot be handed to a new
+        // connection while an old lock object is still in flight.
+        std::lock_guard<std::mutex> lk(m_wl_mtx);
+        m_write_locks.erase(fd);
     }
 
-    // One write lock per fd so two broadcasters never interleave a frame's
-    // length prefix and body on the same socket. A small fixed pool keyed by fd
-    // is unnecessary here — a single shared write mutex is simplest and correct
-    // (broadcasts are infrequent, per-frame). Return the shared lock.
-    std::mutex* write_lock(int /*fd*/) { return &m_write_mtx; }
+    // One write lock PER DESCRIPTOR: held across a frame's length prefix AND
+    // body, so two writers never interleave on one socket, and a peer that
+    // stopped reading blocks only its own connection. Created on connect,
+    // dropped on disconnect, created on demand if a broadcast races a connect.
+    std::shared_ptr<std::mutex> write_lock(int fd) {
+        std::lock_guard<std::mutex> lk(m_wl_mtx);
+        auto it = m_write_locks.find(fd);
+        if (it != m_write_locks.end()) return it->second;
+        auto m = std::make_shared<std::mutex>();
+        m_write_locks.emplace(fd, m);
+        return m;
+    }
 
     static bool send_all(int fd, const void* buf, std::size_t n) {
         const std::uint8_t* p = static_cast<const std::uint8_t*>(buf);
@@ -238,6 +312,7 @@ private:
     }
 
     InboundFn                 m_inbound;
+    PeerConnectFn             m_on_connect;
     int                       m_listen_fd = -1;
     std::uint16_t             m_listen_port = 0;
     // The node is "running" for its whole lifetime (construction -> stop()),
@@ -248,7 +323,8 @@ private:
     std::thread               m_accept_thread;
     std::vector<std::thread>  m_readers;
     mutable std::mutex        m_mtx;          // guards m_peers / m_readers
-    std::mutex                m_write_mtx;    // serializes frame writes
+    mutable std::mutex        m_wl_mtx;       // guards m_write_locks ONLY
+    std::map<int, std::shared_ptr<std::mutex>> m_write_locks;   // fd -> its write lock
     std::vector<int>          m_peers;
 };
 

@@ -567,6 +567,27 @@ if (BUILD_TESTING)
     # Stdlib + Threads (w4 pulls in v37_engine). SAME HOLLOW-GREEN GUARD as the
     # sibling suites: ALSO listed on BOTH build.yml --target lists so CI compiles
     # + runs it, not a NOT_BUILT CTest sentinel.
+    # Track A2 CONSUMER-tree relay ROBUSTNESS — the bounded carrier RE-OFFER
+    # (a carrier that reached no peer is re-offered when a peer (re)connects, and
+    # is admitted EXACTLY ONCE because W2's dedup window refuses the duplicate:
+    # REJECT_DEDUP, zero pushes, next_pos / raw_total / lane digest / owed_digest
+    # byte-identical) and the PER-DESCRIPTOR write lock in carrier_net.hpp (a peer
+    # that stopped reading no longer stalls the send to every other peer, and
+    # concurrent writers never interleave a frame on one connection). Both halves
+    # are DELIVERY-side: no PoW, no descriptor, no lane order, no digest, and no
+    # wire-version change. It also pins the horizon bound that keeps a re-offer
+    # inside the W2 dedup window — the only way a re-offer could ever become a
+    # second credit. stdlib + POSIX sockets + Threads. SAME HOLLOW-GREEN GUARD as
+    # the sibling suites: ALSO listed on BOTH build.yml --target lists (the Linux
+    # x86_64 leg and the ASan+UBSan leg) so CI compiles + RUNS it instead of
+    # registering a NOT_BUILT CTest sentinel (the DGB #137 / #769 / c2pool#1539
+    # unregistered-KAT class), and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_carrier_relay_robustness_kat v37_carrier_relay_robustness_kat.cpp)
+    target_compile_features(v37_carrier_relay_robustness_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_carrier_relay_robustness_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_carrier_relay_robustness_kat Threads::Threads)
+    add_test(NAME v37_carrier_relay_robustness_kat COMMAND v37_carrier_relay_robustness_kat)
+
     add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)
     target_compile_features(v37_owed_event_mmr_kat PRIVATE cxx_std_20)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
