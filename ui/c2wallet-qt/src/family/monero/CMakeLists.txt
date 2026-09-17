@@ -93,6 +93,7 @@ add_library(c2wallet_monero STATIC
     multisig/MoneroMultisigSign.cpp       # M4-X-MMS: cooperative (partial) CLSAG signer (EXPERIMENTAL)
     multisig/MoneroMmsMessage.cpp         # M4-X-MMS: MMS round-message import/export (EXPERIMENTAL)
     artifact/MoneroArtifact.cpp        # M5-X: cold-sign artifact marshaling (verbatim monero layouts)
+    compose/MoneroSpendGate.cpp        # M6-2b: Qt-free money-decision gate for the Build/Sign pages
     ${CMAKE_CURRENT_SOURCE_DIR}/../../secure/SecureString.cpp
 )
 target_include_directories(c2wallet_monero PUBLIC
@@ -166,3 +167,19 @@ add_executable(c2wallet-monero-artifact-test
 target_link_libraries(c2wallet-monero-artifact-test PRIVATE c2wallet_monero)
 
 add_test(NAME c2wallet_monero_artifact_kat COMMAND c2wallet-monero-artifact-test)
+
+# -- Family B (Monero) M6-2b KATs: the Build/Sign page money-gate --------------
+# K7 drives the Qt-free compose gate + the artifact/prover facade the pages call,
+# end-to-end with a FIXTURE ring: outputs-export -> unsigned_txset -> parse ->
+# sources_to_spend_inputs -> assemble_ringct_tx -> self_verify_tx_public +
+# self_verify_key_images -> produce_signed_txset -> parse_signed_txset equality;
+# and the refusals the pages enforce (wrong wallet, view-only, net-mismatch dest,
+# unbalanced, flipped byte in the unsigned/signed blob). K8(B) asserts the GAP-6
+# secret zeroization (SpendInput.one_time_sec == 0 after the page-side wipe, and
+# the SpendInput destructor scrubs its storage). Qt-free: no Qt widgets needed.
+add_executable(c2wallet-monero-spendgate-test
+    compose/test/monero_spendgate_test.cpp
+)
+target_link_libraries(c2wallet-monero-spendgate-test PRIVATE c2wallet_monero)
+
+add_test(NAME c2wallet_monero_spendgate_kat COMMAND c2wallet-monero-spendgate-test)

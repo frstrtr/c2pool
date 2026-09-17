@@ -79,6 +79,18 @@ struct SpendInput {
     std::vector<CtKey> ring;             // ring members (dest,mask): decoys + the real one
     std::size_t        real_index{0};    // position of the owned member in `ring`
     std::vector<std::uint64_t> ring_global_indices; // absolute output indices, for the blob (optional)
+
+    // GAP-6 (design §5.3 key custody, T-8): zeroize the one-time spend secret
+    // x_i on EVERY destruction path -- the page vector, the assembler's internal
+    // working copies, and any exception unwind -- mirroring MoneroKeys::~MoneroKeys.
+    // Defined out-of-line via secure::secure_wipe (kept out of this header so the
+    // header stays dependency-light). Declaring it suppresses the implicit move
+    // ops; the class is used by copy/value everywhere (no aggregate init), so
+    // that is behaviour-preserving.
+    SpendInput() = default;
+    SpendInput(const SpendInput&) = default;
+    SpendInput& operator=(const SpendInput&) = default;
+    ~SpendInput();
 };
 
 // One destination. Standard/subaddress recipient public keys + amount.

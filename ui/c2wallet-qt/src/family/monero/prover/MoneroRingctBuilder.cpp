@@ -113,6 +113,14 @@ std::vector<unsigned char> build_tx_extra(const Bytes32& R,
 
 } // namespace
 
+// GAP-6 (T-8): scrub the one-time spend secret x_i AND the real input's blinding
+// factor z_in (amount_mask — it identifies the real ring member) on every
+// destruction path.
+SpendInput::~SpendInput() {
+    c2w::secure::secure_wipe(one_time_sec.data(), one_time_sec.size());
+    c2w::secure::secure_wipe(amount_mask.data(), amount_mask.size());
+}
+
 std::uint64_t compute_fee(std::size_t tx_weight, std::uint64_t per_byte_rate,
                           std::uint32_t priority) noexcept {
     static const std::uint64_t mult[] = {1, 5, 25, 1000};

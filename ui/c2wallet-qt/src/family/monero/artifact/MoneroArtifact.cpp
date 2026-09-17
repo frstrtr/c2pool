@@ -33,6 +33,7 @@
 #include <cstring>
 
 #include "family/monero/scan/MoneroScanOps.hpp"   // key_derivation, derive_secret_key
+#include "secure/SecureString.hpp"                 // c2w::secure::secure_wipe
 
 namespace c2wallet::monero::artifact {
 
@@ -329,6 +330,7 @@ bool sources_to_spend_inputs(const UnsignedTxSet& u, const MoneroKeys& keys,
         }
         prover::SpendInput in;
         in.one_time_sec       = scanops::derive_secret_key(D, s.real_output_in_tx_index, keys.spend_priv);
+        c2w::secure::secure_wipe(D.data(), D.size());   // transient shared secret 8*k_v*R
         in.amount             = s.amount;
         in.amount_mask        = s.mask;
         in.ring               = s.ring;
