@@ -323,6 +323,31 @@ struct XmrNodeConfig {
     bool            randomx_enabled = false;
     bool            randomx_large_pages = false;
 
+    // --- in-process RandomX CPU miner (--mine) ------------------------------
+    // OFF BY DEFAULT, and that is a hard property, not a preference: every
+    // existing deployment of this daemon must keep behaving exactly as it did,
+    // and a node that starts eating cores because it was launched is a bad
+    // neighbour to its own event loop. --mine [threads] turns it on.
+    //
+    // The miner is an ADDITIVE worker (src/impl/xmr/pow/xmr_cpu_miner.hpp). It
+    // produces nothing the node does not already validate: a hit re-enters
+    // through the SAME (template_id, nonce, extra_nonce) triple a stratum
+    // client would submit, and the exact 128-bit RandomX gate in front of the
+    // publish arm makes the same decision it makes for an external miner.
+    bool            mine_enabled = false;
+    // 0 = auto: half of hardware_concurrency (one thread per physical core on a
+    // 2-way SMT box). RandomX gains little from SMT siblings.
+    unsigned        mine_threads = 0;
+    // --mine-fast: RANDOMX_FLAG_FULL_MEM + a ~2080 MiB dataset. Opt-in, because
+    // the allocation and the multi-second init are not something a node should
+    // do behind its operator's back. Default is LIGHT (256 MiB cache).
+    bool            mine_fast = false;
+    // Huge pages are ASKED FOR by default and fall back to 4 KiB pages silently
+    // when the host has none configured (--mine-no-huge-pages forces 4 KiB).
+    bool            mine_large_pages = true;
+    // One worker pinned per CPU, physical cores first (--mine-no-affinity off).
+    bool            mine_pin = true;
+
     // Resolve the on-disk settlement-store directory (settle_db_path override or
     // config_path()/<net>/v37_settle_db). Declared here, defined in xmr_node.hpp
     // to keep this header free of <filesystem>/core includes for cheap inclusion.

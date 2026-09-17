@@ -38,9 +38,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <optional>
 
 #include "randomx.h"  // vendored BSD-3, third_party/randomx/randomx.h
+#include "randomx_init_lock.hpp"  // process-wide serialisation of RandomX cache init
 
 namespace c2pool::xmr {
 
@@ -239,7 +241,16 @@ public:
     bool rekey(const SeedHash& k) {
         if (!cache_) return false;
         if (keyed_ && k == key_) return true;
-        randomx_init_cache(cache_, k.data(), k.size());
+        {
+            // Argon2d cache initialisation is serialised PROCESS-WIDE: the
+            // in-process CPU miner (xmr_cpu_miner.hpp) keys its own cache from
+            // another thread, and two concurrent randomx_init_cache() calls
+            // killed a live regtest node with SIGFPE inside randomx_reciprocal().
+            // See randomx_init_lock.hpp. Nothing on the verify hot path takes
+            // this lock -- a cache is re-keyed once per ~2048-block epoch.
+            std::lock_guard<std::mutex> lk(c2pool::xmr::randomx_init_mutex());
+            randomx_init_cache(cache_, k.data(), k.size());
+        }
         key_ = k; keyed_ = true;
         return true;
     }
