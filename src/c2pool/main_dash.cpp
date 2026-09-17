@@ -493,6 +493,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-fold-checkscripts]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
+        << "           [--control-plane-token-file FILE]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -11108,6 +11109,7 @@ int main(int argc, char** argv)
     // be an explicit operator decision. Reward path is byte-unchanged.
     bool embedded_tx_inject = false;
     std::string embedded_tx_inject_hex_path;   // --embedded-tx-inject-hex FILE (local M1 submit)
+    std::string control_token_file_path;       // --control-plane-token-file FILE (#157 Slice 3 arming seam; DORMANT)
     // #107 PHASE 2 (--embedded-accrue-asset-locks): type-8 asset-lock accrual.
     // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): body membership and the
     // CbTx creditPool accrual are the SAME bit (embedded_gbt.hpp allow_locks ==
@@ -11393,6 +11395,8 @@ int main(int argc, char** argv)
             embedded_tx_inject = true;   // #157: opt-in miner/user tx-injection (default OFF)
         else if (std::strcmp(argv[i], "--embedded-tx-inject-hex") == 0 && i + 1 < argc)
             embedded_tx_inject_hex_path = argv[++i];   // #157 local M1 submit file
+        else if (std::strcmp(argv[i], "--control-plane-token-file") == 0 && i + 1 < argc)
+            control_token_file_path = argv[++i];       // #157 Slice 3: control-plane apply token file (DORMANT arming seam)
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
@@ -11622,6 +11626,40 @@ int main(int argc, char** argv)
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        // #157 Slice 3: control-plane apply token file. A settings-file value is
+        // honored (CLI wins) exactly like the overlays above; because the row is
+        // money-class it already passed the money-ack gate to reach here.
+        if (rc.file_set("control.token_file") && control_token_file_path.empty())
+            control_token_file_path = rc.get_string("control.token_file").value_or(control_token_file_path);
+
+        // ── #157 Slice 3: DORMANT control-plane arming seam ──────────────────
+        // If (and ONLY if) an operator points --control-plane-token-file at a
+        // 0600 owner-only file holding a 32-128 char token, load it and register
+        // it via config_endpoint::set_control_token(). This is the SOLE
+        // production caller that arms POST /api/config[/apply]; absent, the
+        // endpoint stays fail-closed (503 armed:false) exactly as on master.
+        // Fail-closed on any problem: an invalid/unsafe file arms NOTHING and
+        // warns by name (PATH logged, token NEVER logged). Arming the token is
+        // still only half the money path — MONEY_LIVE keys (embedded.tx_inject)
+        // additionally require the two-phase money-nonce + AddressValidator + M0
+        // tripwire inside apply_config(); this seam does not weaken any of that.
+        if (!control_token_file_path.empty()) {
+            std::string why;
+            auto tok = c2pool::config_endpoint::load_control_token_file(
+                control_token_file_path, &why);
+            if (tok) {
+                c2pool::config_endpoint::set_control_token(*tok);
+                LOG_WARNING << "[#157] control-plane apply armed via token file "
+                            << control_token_file_path
+                            << " (POST /api/config/apply is now reachable on "
+                               "loopback with this token; money-key arming still "
+                               "requires the two-phase money-nonce gate)";
+            } else {
+                LOG_WARNING << "[#157] control-plane token file refused ("
+                            << why << ") path=" << control_token_file_path
+                            << " -- NOT arming; config-apply stays fail-closed";
+            }
+        }
     }
 
     // ── FULL-HISTORY REPLAY W3: --replay-utxo-* standalone utility ──────────

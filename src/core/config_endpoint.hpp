@@ -33,6 +33,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -176,6 +177,21 @@ void set_control_token(std::string token);
 bool has_control_token();
 bool check_control_token(const std::string& presented);
 void clear_control_token();  // test helper
+
+// Slice 3 (#157): load a control token from a launch-seam file (--control-plane-
+// token-file). PURE + testable: no globals touched, no logging. Returns the
+// token ONLY when every safety precondition holds, else std::nullopt and (when
+// `reason` is non-null) a by-name refusal cause the CALLER logs alongside the
+// PATH (this function NEVER logs and NEVER echoes the token). Preconditions:
+//   * `path` names a regular file (not a dir/symlink-to-dir/fifo/device);
+//   * mode bits are EXACTLY 0600 (no group/other bits, no setuid/exec);
+//   * the file is owned by the current effective uid;
+//   * after trimming surrounding ASCII whitespace the token is 32..128 chars
+//     with no interior whitespace and only printable (non-control) bytes.
+// A refusal arms NOTHING — the endpoint stays fail-closed. The caller must NOT
+// call set_control_token() on nullopt.
+std::optional<std::string> load_control_token_file(const std::string& path,
+                                                   std::string* reason = nullptr);
 
 // M0 tripwire: fires on any attempt to write a money-path key without a valid
 // confirmed nonce (or with an address that fails validation). Process-global,
