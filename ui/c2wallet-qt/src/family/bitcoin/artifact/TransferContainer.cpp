@@ -186,6 +186,7 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
     UnsignedContainer c;
     size_t p = 5;
     bool saw_utx = false;
+    bool saw_coin = false, saw_netver = false, saw_algebra = false, saw_verdict = false;
     while (p < b.size()) {
         const size_t rec_start = p;   // index of this record's type byte
         uint8_t type = b[p++];
@@ -196,22 +197,31 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
 
         switch (type) {
             case R_COIN:
+                if (saw_coin) { err = "duplicate coin record"; return std::nullopt; }
+                saw_coin = true;
                 c.coin.assign(reinterpret_cast<const char*>(payload), len);
                 break;
             case R_NETVER:
+                if (saw_netver) { err = "duplicate network_version record"; return std::nullopt; }
+                saw_netver = true;
                 if (len != 4) { err = "network_version record not 4 bytes"; return std::nullopt; }
                 c.network_version = get_u32le(payload);
                 break;
             case R_ALGEBRA:
+                if (saw_algebra) { err = "duplicate algebra record"; return std::nullopt; }
+                saw_algebra = true;
                 if (len != 1) { err = "algebra record not 1 byte"; return std::nullopt; }
                 if (payload[0] > 2) { err = "unknown sighash algebra tag"; return std::nullopt; }
                 c.algebra = static_cast<SighashAlgebra>(payload[0]);
                 break;
             case R_UTX:
-                c.unsigned_tx.assign(payload, payload + len);
+                if (saw_utx) { err = "duplicate unsigned-tx record"; return std::nullopt; }
                 saw_utx = true;
+                c.unsigned_tx.assign(payload, payload + len);
                 break;
             case R_VERDICT:
+                if (saw_verdict) { err = "duplicate preflight-verdict record"; return std::nullopt; }
+                saw_verdict = true;
                 c.preflight_verdict.assign(reinterpret_cast<const char*>(payload), len);
                 break;
             case R_INPUT: {
@@ -235,7 +245,9 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
                 break;
             }
             case R_DIGEST: {
-                // GAP-3: verify the integrity digest over all preceding bytes.
+                // GAP-3: verify the integrity digest over all preceding bytes,
+                // AND require it be the LAST record (so nothing can hide past
+                // the verified range). p+len is one-past this record's payload.
                 if (len != 32) { err = "digest record not 32 bytes"; return std::nullopt; }
                 Hash32 want{};
                 std::memcpy(want.data(), payload, 32);
@@ -244,6 +256,11 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
                     err = "integrity digest mismatch (container corrupted or tampered)";
                     return std::nullopt;
                 }
+                if (p + len != b.size()) {
+                    err = "record(s) present after the integrity digest (digest must be last)";
+                    return std::nullopt;
+                }
+                c.has_digest = true;
                 break;
             }
             case R_INPUT_SCRIPT: {
@@ -272,6 +289,23 @@ std::optional<UnsignedContainer> UnsignedContainer::from_hex(const std::string& 
         p += len;
     }
     if (!saw_utx) { err = "missing unsigned tx record"; return std::nullopt; }
+
+    // GAP-4: validate carried input-scripts against the parsed inputs, and
+    // reject duplicate (input_index, kind) records (order-independent).
+    for (size_t i = 0; i < c.input_scripts.size(); ++i) {
+        const auto& is = c.input_scripts[i];
+        if (is.input_index >= c.inputs.size()) {
+            err = "input-script references an out-of-range input index";
+            return std::nullopt;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (c.input_scripts[j].input_index == is.input_index &&
+                c.input_scripts[j].kind == is.kind) {
+                err = "duplicate input-script for the same (input, kind)";
+                return std::nullopt;
+            }
+        }
+    }
     return c;
 }
 

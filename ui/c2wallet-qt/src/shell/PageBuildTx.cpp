@@ -411,6 +411,13 @@ void PageBuildTx::onAssemble()
             else { output_->appendPlainText(QString("Refused: unknown input-script kind '%1' (redeem|witness|tapleaf)").arg(kindStr)); return; }
             Bytes sbytes;
             if (!from_hex(sf.mid(2).join(':').trimmed(), sbytes) || sbytes.empty()) { output_->appendPlainText(QStringLiteral("Refused: input-script hex invalid/empty")); return; }
+            // Give the operator feedback BEFORE the air-gap crossing: the kind
+            // must match the input's SPK type, and tapleaf is unsupported (the
+            // slice-2a signer has no taproot-script path).
+            const c2w::sign::SpkType st = c2w::sign::classify_spk(c.inputs[idx].script_pubkey);
+            if (kind == art::InputScriptKind::Tapleaf) { output_->appendPlainText(QStringLiteral("Refused: tapleaf input-script kind is unsupported (no taproot-script signer)")); return; }
+            if (kind == art::InputScriptKind::Redeem && st != c2w::sign::SpkType::P2SH) { output_->appendPlainText(QStringLiteral("Refused: a redeem script is only valid on a P2SH input")); return; }
+            if (kind == art::InputScriptKind::Witness && st != c2w::sign::SpkType::P2WSH) { output_->appendPlainText(QStringLiteral("Refused: a witness script is only valid on a P2WSH input")); return; }
             art::InputScript is; is.input_index = static_cast<uint64_t>(idx); is.kind = kind; is.script = sbytes;
             c.input_scripts.push_back(std::move(is));
         }
