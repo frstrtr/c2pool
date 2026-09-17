@@ -476,8 +476,38 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
 // the sum below and the retry can only make the retry more likely to succeed.
 bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, const NetService& addr)
 {
-    if (m_ingest_budget.try_admit(n, admit_bytes))
-        return true;
+    // #1600: per-peer fair-share admission. Admitted => done. PeerCapped => THIS
+    // peer ALREADY holds its fair-share slice of the global budget (its first
+    // batch always gets in, so a legitimate single large message is never
+    // throttled; it is frozen out only once it has reached its slice), while
+    // other peers may still have work queued — evicting their already-verified
+    // batches to subsidise one peer's monopoly is exactly the 64:1 weaponisation
+    // the eviction path warns about, so we refuse WITHOUT destroying anything.
+    // GlobalFull => the shared ceiling is the
+    // binding constraint (this peer is under its slice); fall through to the
+    // OLDEST-share eviction path, which is peer-blind by design because the
+    // shared ceiling is a whole-node memory bound. The peer's per-peer counters
+    // were rolled back on a GlobalFull, so the retry after eviction still admits.
+    const std::string peer_key = addr.to_string();
+    switch (m_ingest_budget.try_admit_for_peer(n, admit_bytes, peer_key))
+    {
+        case IngestBudget::AdmitResult::Admitted:
+            return true;
+        case IngestBudget::AdmitResult::PeerCapped:
+            LOG_WARNING << "[INGEST] PER-PEER CAP: refusing " << n << " shares / "
+                        << admit_bytes << " B from " << addr.to_string()
+                        << " — peer already holds its fair-share slice ("
+                        << m_ingest_budget.peer_shares(peer_key) << "/"
+                        << m_ingest_budget.per_peer_max_shares() << " shares, "
+                        << m_ingest_budget.peer_bytes(peer_key) << "/"
+                        << m_ingest_budget.per_peer_max_bytes()
+                        << " B); NOT evicting other peers' work for one peer; "
+                           "global inflight=" << m_ingest_budget.shares() << "/"
+                        << m_ingest_budget.max_shares() << " shares; peer will re-offer";
+            return false;
+        case IngestBudget::AdmitResult::GlobalFull:
+            break;   // fall through to the OLDEST-share eviction path below
+    }
 
     // Unsatisfiable at any queue depth: evicting for it would only destroy work
     // that another peer can still use.
@@ -566,7 +596,8 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
             if (partial_take > 0)
                 m_pending_adds.front().data->evict_oldest(partial_take, partial_bytes);
             evicted  = freed_shares;
-            admitted = m_ingest_budget.try_admit(n, admit_bytes);
+            admitted = (m_ingest_budget.try_admit_for_peer(n, admit_bytes, peer_key)
+                        == IngestBudget::AdmitResult::Admitted);
         }
     }
 
@@ -601,6 +632,53 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
                           "was destroyed for it")
                 << "; verify pool is behind, peer will re-offer";
     return false;
+}
+
+// #1601: charge one genuine invalid-PoW share against `addr`. Runs on the io
+// thread (the verify-pool worker posts here), the same discipline m_ban_list
+// follows. Whitelisted peers are exempt (parity with is_banned's bypass): a
+// permanent dial target must never be disconnected by scoring. Only a SUSTAINED
+// flood that outruns the score's time-decay reaches BAN_THRESHOLD.
+//
+// KEYED BY IP, BANNED BY IP: the score is accumulated per source IP (not
+// IP:ephemeral-port) so a flooder cannot reset it by redialing from a new port,
+// and the ban is written to m_ip_ban_list (IP-only) so is_banned() rejects the
+// reconnect regardless of its new source port. (The pre-existing run_think
+// auto-ban path, which bans specific IP:port peers, is left unchanged.) A
+// residual evasion via IPv6 /64 source rotation remains — shared with that
+// existing auto-ban and out of scope here — but prune() keeps the scorer map
+// bounded even under identity cycling, so it is not a memory-DoS vector.
+void NodeImpl::note_invalid_pow_share(NetService addr)
+{
+    if (is_whitelisted(addr))
+        return;
+    const std::string ip = addr.address();   // IP only — survives a reconnect
+    const double now_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (!m_pow_misbehavior.note_invalid_pow(ip, now_s))
+        return;   // still below threshold — no action; the score keeps decaying
+    LOG_WARNING << "[MISBEHAVIOR] peer IP " << ip
+                << " crossed the invalid-PoW misbehavior threshold ("
+                << ltc::PeerMisbehaviorScorer<std::string>::BAN_THRESHOLD
+                << " invalid-PoW shares within a "
+                << ltc::PeerMisbehaviorScorer<std::string>::HALFLIFE_SECONDS
+                << "s half-life) — IP-banning for " << m_ban_duration.count()
+                << "s and disconnecting";
+    m_ip_ban_list[ip] = std::chrono::steady_clock::now() + m_ban_duration;
+    m_pow_misbehavior.clear(ip);
+    close_connection(addr);
+}
+
+// #1601: drop scorer entries that have decayed to ~0 so the map cannot grow one
+// permanent entry per distinct offending IP (identity-cycling memory DoS). Runs
+// on the io thread each think cycle, alongside the other periodic prunes, and
+// MUST use the same steady_clock timebase as note_invalid_pow_share() so the
+// decay math is consistent (std::time() would be a different epoch).
+void NodeImpl::prune_pow_misbehavior()
+{
+    const double now_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    m_pow_misbehavior.prune(now_s);
 }
 
 bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
@@ -640,7 +718,7 @@ bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
     }
     if (!admit_or_evict_oldest(n, admit_bytes, addr))
         return false;   // `data` dies here: ~HandleSharesData frees every share
-    data->attach_budget(&m_ingest_budget, n, admit_bytes);
+    data->attach_budget(&m_ingest_budget, n, admit_bytes, addr.to_string());
 
     // Phase 1 (thread pool, parallel): run share_init_verify() for each share.
     // share_init_verify() does scrypt-1024 (~20ms each) — must NOT block io_context.
@@ -667,9 +745,24 @@ bool NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                             obj->m_pow_hash = g_last_pow_hash;
                         });
                     }
-                    catch (const std::exception&)
+                    catch (const std::exception& ex)
                     {
-                        // leave hash null — phase 2 will skip this share
+                        // Verify failure: leave hash null (phase 2 skips this
+                        // share), exactly as before. #1601: score the sending
+                        // peer ONLY when this is a genuine cryptographic PoW
+                        // target miss, as classified by the single shared
+                        // predicate ltc::is_scorable_invalid_pow() (which the
+                        // classification KAT pins). Structural rejects (bad
+                        // coinbase, over-long merkle, zero/too-easy target) and
+                        // every honest later drop (stale/duplicate/orphan/losing,
+                        // which never throw here at all) are NOT scored. Marshal
+                        // the note to the io thread (m_pow_misbehavior/ban lists
+                        // are io-thread-only); skip the db-load pseudo-peer
+                        // (port 0), which is never a network peer.
+                        if (addr.port() != 0 && ltc::is_scorable_invalid_pow(ex))
+                            boost::asio::post(*m_context, [this, addr]() {
+                                note_invalid_pow_share(addr);
+                            });
                     }
                 }
                 // When all verifications are done, schedule phase 2 on io_context
@@ -2460,6 +2553,9 @@ void NodeImpl::run_think()
                 std::lock_guard<std::mutex> g(m_fetch_failover_mtx);
                 m_fetch_failures.prune(static_cast<double>(std::time(nullptr)));
             }
+            // #1601: drop invalid-PoW scorer entries that have decayed to ~0, so
+            // the misbehavior map stays bounded even under identity cycling.
+            prune_pow_misbehavior();
             // Keep the peer-key snapshot fresh for clean_tracker's parent_abandoned.
             refresh_peer_keys_snapshot();
 
