@@ -79,6 +79,8 @@ add_executable(c2wallet-qt-signer
     src/shell/PageScan.cpp
     src/shell/PageBuildTx.cpp
     src/shell/PageSign.cpp
+    src/shell/PageBuildTxMonero.cpp
+    src/shell/PageSignMonero.cpp
 )
 
 # The wired pages include the C++20 hdkeys/convert public headers; build the

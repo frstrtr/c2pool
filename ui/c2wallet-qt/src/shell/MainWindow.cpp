@@ -2,10 +2,12 @@
 #include "shell/MainWindow.hpp"
 
 #include "shell/PageBuildTx.hpp"
+#include "shell/PageBuildTxMonero.hpp"
 #include "shell/PageConstructConvert.hpp"
 #include "shell/PageImport.hpp"
 #include "shell/PageScan.hpp"
 #include "shell/PageSign.hpp"
+#include "shell/PageSignMonero.hpp"
 
 #include <QFont>
 #include <QHBoxLayout>
@@ -53,6 +55,19 @@ MainWindow::MainWindow(QWidget* parent)
 
     navList_->addItem(QStringLiteral("Sign & Self-Verify"));
     stack_->addWidget(new PageSign(stack_));
+
+    // Slice-2b (Family B — Monero / RingCT). The key-free composer and the
+    // offline signer are WIRED to the merged Monero libraries (seed/key/address,
+    // scan, prover, artifact) + the Qt-free compose money-gate. Real-funds use
+    // is still blocked upstream (online ring/decoy selection + the v37 XMR seam
+    // are unwired, and the artifact envelope is not monero-wallet-cli byte-parity)
+    // — see the design G10 note; the sign path itself is complete + KAT-covered
+    // with fixture rings.
+    navList_->addItem(QStringLiteral("Build Transaction (Monero)"));
+    stack_->addWidget(new PageBuildTxMonero(stack_));
+
+    navList_->addItem(QStringLiteral("Sign & Self-Verify (Monero)"));
+    stack_->addWidget(new PageSignMonero(stack_));
 
     navList_->addItem(QStringLiteral("Air-Gap Transfer"));
     stack_->addWidget(makeStubPage(
