@@ -227,8 +227,9 @@ TEST(ConfigEndpointHttp, PostApplyNonMoneyAppliesWithToken) {
     // a registered ParamApplier setter can actually enact it -- a mirror swap
     // with no setter is refused. Register a live setter so this exercises a
     // genuine non-money live apply (a main that wants runtime web.external_ip
-    // would register the analogous real setter). (web.port is RESTART-class and
-    // is refused by the design-F1 restart guard -- see PostApplyRefusesRestartClassKey.)
+    // would register the analogous real setter). (web.port is RESTART-class with
+    // no setter and is refused by the runtime-setter precondition -- see
+    // PostApplyRefusesRestartClassKey.)
     ce::applier().register_setter("web.external_ip",
                                   [](const std::string&) { return true; });
     net::io_context ioc;
@@ -810,12 +811,16 @@ TEST(ConfigEndpointHttp, SliceBSubmitTimeoutIs5xxNotHang) {
     ce::clear_control_token();
 }
 
-// Design F1: a RESTART-class key is partitioned but has no runtime applier, so
-// applying it like a LIVE key would swap the reporting mirror while the running
-// process keeps the OLD value (a mirror-vs-runtime lie). The apply path must
-// REFUSE a RESTART-class key by a named cause. (embedded.tx_inject is now
+// A RESTART-class key has no registered runtime applier, so applying it like a
+// LIVE key would swap the reporting mirror while the running process keeps the
+// OLD value (a mirror-vs-runtime lie). The apply path must REFUSE it by a named
+// cause. validate_apply_batch is a pure oracle that partitions but does NOT
+// refuse RESTART keys; the refusal is the runtime-setter precondition in
+// apply_config() (block 3b) -- strictly more general (it also catches
+// MONEY_RESTART keys that skip the RESTART partition). embedded.tx_inject is now
 // MONEY_LIVE and takes the money-nonce path instead; embedded.fold_checkscripts
-// is a plain RESTART key that exercises this refusal.)
+// is a plain RESTART key with no setter that exercises this refusal, and must be
+// rejected as no_runtime_setter (mirror not swapped, tripwire 0).
 TEST(ConfigEndpointHttp, PostApplyRefusesRestartClassKey) {
     reset_apply_state();
     ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
@@ -830,9 +835,9 @@ TEST(ConfigEndpointHttp, PostApplyRefusesRestartClassKey) {
                            status, apply.dump());
     EXPECT_EQ(status, 400) << body;
     auto j = nlohmann::json::parse(body);
-    EXPECT_EQ(j.value("status", std::string()), "validation");
+    EXPECT_EQ(j.value("status", std::string()), "no_runtime_setter");
     EXPECT_EQ(j.value("offending_key", std::string()), "embedded.fold_checkscripts");
-    EXPECT_NE(j.value("error", std::string()).find("restart-class"), std::string::npos) << body;
+    EXPECT_NE(j.value("error", std::string()).find("runtime setter"), std::string::npos) << body;
 
     // Nothing applied: no money nonce was ever issued, wire not tripped.
     EXPECT_EQ(ce::tripwire_state().count, 0u);
