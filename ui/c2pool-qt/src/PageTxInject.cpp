@@ -107,6 +107,17 @@ void PageTxInject::buildUi()
     tokenStatusLabel_ = new QLabel(tr("No token verified."));
     tokenStatusLabel_->setWordWrap(true);
     tokenLayout->addWidget(tokenStatusLabel_);
+#ifndef C2POOL_QT_USE_KEYCHAIN
+    // Honest disclosure: without the keychain build option a saved token lands
+    // in plaintext QSettings on disk (see SettingsStore::writeSecret).
+    auto* secretNote = new QLabel(tr(
+        "Note: this build has no OS keychain (C2POOL_QT_USE_KEYCHAIN unset); an "
+        "accepted token is stored in plaintext QSettings on disk. Clear the "
+        "field to stop persisting it."), tokenGroup);
+    secretNote->setWordWrap(true);
+    secretNote->setStyleSheet("color:#888;");
+    tokenLayout->addWidget(secretNote);
+#endif
     layout->addWidget(tokenGroup);
 
     // ── 3a) Arm/disarm ────────────────────────────────────────────────────
@@ -214,8 +225,6 @@ void PageTxInject::probeToken()
         tokenStatusLabel_->setText(tr("Enter a token first."));
         return;
     }
-    // Persist as a secret (excluded from settings export).
-    settings_->writeSecret(kSecretKey, controlToken_, [](bool) {});
 
     // Side-effect-free probe: apply with an EMPTY changes object. The node
     // answers 400 "no changes" once the token passes (token accepted, nothing
@@ -231,6 +240,9 @@ void PageTxInject::probeToken()
             const QString err = o.value("error").toString();
             if (status == 400) {
                 tokenAccepted_ = true;
+                // Persist only AFTER the node accepts the token, so a rejected
+                // token is never written to the secret store.
+                settings_->writeSecret(kSecretKey, controlToken_, [](bool) {});
                 tokenStatusLabel_->setText(
                     tr("Token accepted (endpoint armed). You may arm/submit."));
             } else if (status == 403) {
@@ -263,6 +275,10 @@ void PageTxInject::startArm(bool enable)
     }
     controlToken_ = tokenEdit_->text().trimmed();
 
+    // Hold the control section for the whole flow (re-enabled in every exit
+    // path below) so a double-click cannot re-issue the nonce mid-confirm.
+    setArmFlowBusy(true);
+
     // Phase 1 — issue. begin() returns the diff-only request (no nonce).
     c2pool_qt::TxInjectArmFlow::Request issue = armFlow_.begin(
         controlToken_.toStdString(), enable);
@@ -285,10 +301,14 @@ void PageTxInject::startArm(bool enable)
             if (!armFlow_.on_issue_response(resp, &confirm)) {
                 armStatusLabel_->setText(tr("Refused: %1")
                     .arg(QString::fromStdString(armFlow_.last_error())));
+                setArmFlowBusy(false);
                 return;
             }
 
-            // Server-echoed diff for the modal (money_keys the node bound).
+            // The diff shown is the change THIS client REQUESTED (the local
+            // `changes` map), not a value echoed back by the server. Labelled
+            // honestly; the nonce is bound to the server's own digest of the
+            // diff, so a mismatch is caught server-side at confirm regardless.
             QString diffText;
             for (auto it = changes.begin(); it != changes.end(); ++it)
                 diffText += QString("  %1 -> %2\n")
@@ -297,11 +317,11 @@ void PageTxInject::startArm(bool enable)
             const QString explain = tr(
                 "Arming changes which consensus-valid transactions can enter the "
                 "blocks THIS node mines. It does NOT change payouts, fees, or who "
-                "gets paid.\n\nServer-echoed change:\n%1").arg(diffText);
+                "gets paid.\n\nRequested change:\n%1").arg(diffText);
             const auto btn = QMessageBox::warning(
                 this, enable ? tr("Confirm ARM") : tr("Confirm DISARM"),
                 explain, QMessageBox::Ok | QMessageBox::Cancel);
-            if (btn != QMessageBox::Ok) { armFlow_.reset(); armStatusLabel_->setText(tr("Cancelled.")); return; }
+            if (btn != QMessageBox::Ok) { armFlow_.reset(); armStatusLabel_->setText(tr("Cancelled.")); setArmFlowBusy(false); return; }
 
             const QString want = enable ? "ARM" : "DISARM";
             bool ok = false;
@@ -312,6 +332,7 @@ void PageTxInject::startArm(bool enable)
             if (!ok || typed.trimmed().toUpper() != want) {
                 armFlow_.reset();
                 armStatusLabel_->setText(tr("Confirmation text did not match — aborted."));
+                setArmFlowBusy(false);
                 return;
             }
 
@@ -335,14 +356,17 @@ void PageTxInject::startArm(bool enable)
                             .arg(QString::fromStdString(armFlow_.last_error())));
                     // The badge flips only when the NODE's `enabled` flips — so
                     // re-poll status rather than trusting the flow.
+                    setArmFlowBusy(false);
                     refresh(api_);
                 },
                 [this](const QString& msg) {
                     armStatusLabel_->setText(tr("Confirm failed: %1").arg(msg));
+                    setArmFlowBusy(false);
                 });
         },
         [this](const QString& msg) {
             armStatusLabel_->setText(tr("Arm request failed: %1").arg(msg));
+            setArmFlowBusy(false);
         });
 }
 
@@ -482,11 +506,24 @@ void PageTxInject::refresh(ApiClient* api)
 
 void PageTxInject::updateEnablement()
 {
-    armBtn_->setEnabled(tokenAccepted_);
-    disarmBtn_->setEnabled(tokenAccepted_);
+    // While a two-phase arm flow (or its confirm modal) is in flight, hold the
+    // whole control section: a second click must not re-enter startArm() and let
+    // the server re-issue a nonce that 409s the pending confirm AND trips M0.
+    const bool idle = !armFlowBusy_;
+    armBtn_->setEnabled(tokenAccepted_ && idle);
+    disarmBtn_->setEnabled(tokenAccepted_ && idle);
+    probeBtn_->setEnabled(idle);
+    loadFileBtn_->setEnabled(idle);
+    tokenEdit_->setEnabled(idle);
     // Decode is a pure client-side preview — always available.
     decodeBtn_->setEnabled(true);
-    submitBtn_->setEnabled(tokenAccepted_ && nodeEnabled_);
+    submitBtn_->setEnabled(tokenAccepted_ && nodeEnabled_ && idle);
     if (!tokenAccepted_)
         armStatusLabel_->setText(tr("Requires a verified token."));
+}
+
+void PageTxInject::setArmFlowBusy(bool busy)
+{
+    armFlowBusy_ = busy;
+    updateEnablement();
 }

@@ -53,6 +53,7 @@ private:
     void submitRawTx();
     void decodePreview();
     void updateEnablement();    // enable/disable controls from token + node state
+    void setArmFlowBusy(bool busy); // hold controls while a two-phase arm flow runs
     void renderStatus(const QJsonObject& obj);
     void applyControlTokenToBody(QJsonObject& body) const;
 
@@ -66,6 +67,7 @@ private:
     bool     tokenAccepted_ = false;
     bool     nodeEnabled_   = false;
     bool     nodeWired_     = false;
+    bool     armFlowBusy_   = false;   // an arm/disarm modal or request is in flight
 
     // Top-level DASH gate.
     QLabel*  dashOnlyLabel_ = nullptr;

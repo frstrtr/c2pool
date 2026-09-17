@@ -274,6 +274,40 @@ int main() {
             auto t = ce::load_control_token_file(dir, &why);
             check(!t.has_value(), "directory refused (not a regular file)");
         }
+        // 5b) a symlink to a valid 0600 file -> refused (S1 proof: the fd-based
+        //     validator opens with O_NOFOLLOW and validates the fstat of the
+        //     open fd, so a final-component symlink can never be followed and
+        //     the lstat->open-by-path TOCTOU is closed). Needs no privilege.
+        {
+            std::string target = dir + "/symtarget";
+            std::string link   = dir + "/symlink";
+            write_file(target, good_token + "\n", 0600);
+            ::unlink(link.c_str());
+            check(::symlink(target.c_str(), link.c_str()) == 0,
+                  "symlink KAT: created a symlink pointing at a valid 0600 file");
+            std::string why;
+            auto t = ce::load_control_token_file(link, &why);
+            check(!t.has_value(),
+                  "symlink to a valid 0600 file refused (O_NOFOLLOW, no TOCTOU)");
+        }
+        // 5c) mode 0700 (owner-exec bit) -> refused (mode must be exactly 0600).
+        {
+            std::string p = dir + "/mode700";
+            write_file(p, good_token + "\n", 0700);
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "0700 file refused (exec bit; mode must be 0600)");
+        }
+        // 5d) 0600 + setuid bit (04600) -> refused. The `& 07777 == 0600` check
+        //     rejects ANY setuid/setgid/sticky bit, not only group/other.
+        {
+            std::string p = dir + "/setuid";
+            write_file(p, good_token + "\n", 0600);
+            ::chmod(p.c_str(), S_ISUID | 0600);   // 04600
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "0600+setuid (04600) file refused (07777 != 0600)");
+        }
         // 6) wrong owner -> refused. Only exercisable as root (chown needs
         //    privilege); otherwise skipped honestly (never faked green).
         if (::geteuid() == 0) {
@@ -294,7 +328,8 @@ int main() {
 
         // Cleanup (best-effort).
         for (const char* n : {"/valid","/mode644","/mode640","/empty","/short",
-                              "/long","/ws","/otheruid"})
+                              "/long","/ws","/otheruid","/symtarget","/symlink",
+                              "/mode700","/setuid"})
             ::unlink((dir + n).c_str());
         ::rmdir(dir.c_str());
     }
