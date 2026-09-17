@@ -140,13 +140,19 @@ struct MinerOptions {
     // After a NETWORK-target hit, stop hashing THAT template: a second winning
     // nonce on the same template is a second block at the same height, i.e. we
     // race ourselves and orphan one of our own wins. (Observed on the regtest
-    // rig: 7 of 20 registered finds were same-height duplicates from a template
+    // rig: 35 of 89 registered finds were same-height duplicates from a template
     // the workers kept grinding after the first hit.) Normal service resumes on
-    // the next template. The timeout is the ANTI-STALL: if no new template
-    // arrives — a submit that never landed, a tip that never moved — the
-    // workers go back to the same job rather than idling forever. 0 disables
-    // the suppression entirely.
-    unsigned resume_after_find_ms = 30000;
+    // the next template.
+    //
+    // The timeout is the ANTI-STALL, and it is deliberately SHORT. A regtest run
+    // with a 30 s window stalled outright: the 12th find was refused by the
+    // daemon, so the tip never moved, the template never changed, and the miner
+    // spent the rest of the run parked on work nobody was going to replace. The
+    // suppression must therefore be worth much less than a block interval, not
+    // more: at ~2 s it still covers the burst right after a find (which is where
+    // the duplicates come from) while a chain that stops advancing costs two
+    // seconds, not a run. 0 disables the suppression entirely.
+    unsigned resume_after_find_ms = 2000;
 };
 
 // ---------------------------------------------------------------------------
