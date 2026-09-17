@@ -126,7 +126,10 @@
 // transport in the KAT is a test binding of the SAME seam.
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -613,6 +616,80 @@ struct ICarrierTransport {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// CARRIER RE-OFFER (missed-record recovery) — NETWORK DELIVERY ONLY.
+//
+// THE DEFECT IT CLOSES. do_broadcast() is the ONLY place a carrier leaves this
+// node, and its result is a COUNT: how many peers took the frame. A count of 0
+// (no peer connected at that instant) or a short count (a peer that had just
+// dropped) was reported to the caller and then forgotten — handle_local()/
+// append_block_winner() had already marked the carrier in RelaySeenSet, so it
+// was never re-sent, and carrier_send.hpp only COUNTED the miss
+// (CarrierSendStats::deferred_relay). A peer that was down for one second
+// therefore never learned about that carrier at all. That is a DELIVERY bug,
+// not a protocol one: the bytes were built, frozen and correct, they just never
+// reached a socket.
+//
+// THE FIX. Every frame do_broadcast() puts on the wire is ALSO kept, verbatim,
+// in a small bounded buffer. A sweep re-sends buffered frames:
+//   * on a PERIODIC tick — only entries that under-delivered (reached < peers),
+//     i.e. the DEFER case, until they reach the whole peer set;
+//   * on a FORCED tick — armed by note_peer_connected() when a peer (re)connects
+//     (bind CarrierPeerNode::set_on_peer_connect); then EVERY buffered entry is
+//     eligible, because the new peer has seen none of them.
+// The bytes re-sent are the SAME bytes (the stored frame, never a re-encode),
+// so a re-offer cannot drift from the frozen v0x01 wire.
+//
+// WHY THIS IS NOT CONSENSUS, AND CANNOT DOUBLE-COUNT. A re-offer is a duplicate
+// frame, and a duplicate frame is exactly what W2 already refuses: the receiving
+// node decodes it, ReceiptAdmitter::admit() finds the carrier hash in its
+// DedupWindow and returns CarrierStatus::REJECT_DEDUP — ZERO EmittedPush, no
+// LaneRecord::push, no lane position, no digest movement (w2_admission.hpp
+// §"a replayed carrier is not re-credited"). The receiver's own RelaySeenSet
+// then suppresses any onward amplification. Credit-once is W2's invariant; this
+// layer only re-attempts DELIVERY of bytes W2 will judge exactly once.
+//
+// ★ THE HORIZON BOUND IS THE SAFETY PROPERTY. W2's dedup window is finite —
+// W2_DEDUP_RETENTION = W2_N_CTX + 2 = 4 bins, pruned on clock advance. A carrier
+// re-offered AFTER the receiver pruned its hash would NOT hit REJECT_DEDUP and
+// WOULD be credited a second time. So retention here must stay strictly inside
+// that horizon, and it does, three ways:
+//   (1) max_age — a wall-clock cap (default 60 s). Four bins is 4 min on the
+//       fastest supported chain (DOGE, 1 min/bin), 10 min on DASH/LTC, 40 min on
+//       BTC; 60 s is inside every one of them by a wide margin.
+//   (2) max_attempts — an entry is dropped after a fixed number of re-offers.
+//   (3) dedup_probe (optional, exact) — bind it to the node's OWN admission
+//       window (ReceiptAdmitter::window().contains(h)); when our window has
+//       already pruned the carrier, the entry is dropped unconditionally.
+// Memory is bounded independently by max_entries AND max_bytes (FIFO eviction).
+// ═══════════════════════════════════════════════════════════════════════════
+struct CarrierReofferOptions {
+    bool        enabled       = true;
+    std::size_t max_entries   = 256;          // FIFO cap on buffered carriers
+    std::size_t max_bytes     = 4u << 20;     // FIFO cap on buffered bytes (4 MiB)
+    std::size_t max_per_sweep = 32;           // bounded work per sweep
+    unsigned    max_attempts  = 4;            // per-entry re-offer cap
+    std::chrono::milliseconds max_age{60000};           // << W2 dedup horizon
+    std::chrono::milliseconds min_interval{15000};      // periodic rate limit
+    std::chrono::milliseconds min_forced_interval{1000};// (re)connect rate limit
+};
+
+// Diagnostics only — never a digest leaf, never consensus (same standing as
+// CarrierBloatStats). Kept in its own struct so the bloat hook's fields, which
+// the BM-2 measurements read, keep their existing meaning.
+struct CarrierReofferStats {
+    std::uint64_t buffered         = 0;   // frames entered into the buffer
+    std::uint64_t refreshed        = 0;   // re-broadcast of a frame already buffered
+    std::uint64_t evicted_capacity = 0;   // dropped: entry / byte cap
+    std::uint64_t expired_age      = 0;   // dropped: past the re-offer horizon
+    std::uint64_t expired_window   = 0;   // dropped: dedup probe says it is pruned
+    std::uint64_t exhausted        = 0;   // dropped: attempt cap
+    std::uint64_t sweeps           = 0;
+    std::uint64_t sweeps_skipped   = 0;   // rate-limited or nothing to offer to
+    std::uint64_t frames_reoffered = 0;
+    std::uint64_t bytes_reoffered  = 0;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // CarrierRelay — the flood-fill + admission-routing orchestrator.
 //
 // The append is ALWAYS via the W2 admission callback (into the W0 V37Engine
@@ -657,6 +734,99 @@ public:
     // stats()/seen() are unlocked accessors for single-threaded KAT reads.
     CarrierBloatStats& stats() { return m_stats; }
     RelaySeenSet& seen() { return m_seen; }
+
+    // ── carrier re-offer (see §CARRIER RE-OFFER above) ──────────────────────
+    // Configuration + the two triggers. All of it is delivery-side bookkeeping:
+    // nothing here can append, credit, or move a digest.
+    void set_reoffer_options(const CarrierReofferOptions& o) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_reoffer_opt = o;
+        if (!o.enabled) { m_reoffer.clear(); m_reoffer_bytes = 0; return; }
+        while (!m_reoffer.empty() &&
+               (m_reoffer.size() > m_reoffer_opt.max_entries ||
+                m_reoffer_bytes > m_reoffer_opt.max_bytes)) {
+            ++m_reoffer_stats.evicted_capacity;
+            erase_reoffer(m_reoffer.begin());
+        }
+    }
+    CarrierReofferOptions reoffer_options() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_reoffer_opt;
+    }
+    CarrierReofferStats reoffer_stats() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_reoffer_stats;
+    }
+    std::size_t reoffer_pending() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_reoffer.size();
+    }
+    std::size_t reoffer_bytes() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_reoffer_bytes;
+    }
+    // EXACT horizon probe (optional): bind to the node's own admission window,
+    // e.g. [&adm](const bytes32& h){ return adm.window().contains(h); }. An
+    // entry our own W2 window has already pruned is dropped instead of being
+    // re-offered — the one thing that could turn a re-offer into a re-credit.
+    void set_reoffer_dedup_probe(std::function<bool(const bytes32&)> p) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_reoffer_probe = std::move(p);
+    }
+
+    // A peer (re)connected: ARM a forced sweep. O(1), lock-free, safe to call
+    // from CarrierPeerNode's accept thread (it must NOT do the sweep itself —
+    // that would run a flood on the accept loop and invert the relay/transport
+    // lock order). The work happens on the next reoffer_tick().
+    void note_peer_connected() { m_reoffer_forced.store(true); }
+
+    // Run one bounded, rate-limited sweep. Returns the number of frames put
+    // back on the wire. Driven by the send-side worker's idle tick
+    // (carrier_send.hpp Options::reoffer_tick_interval) or by any daemon timer.
+    std::size_t reoffer_tick() {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        const bool forced = m_reoffer_forced.exchange(false);
+        if (!m_reoffer_opt.enabled) return 0;
+        const Clock::time_point now = Clock::now();
+        prune_reoffer(now);
+        if (m_reoffer.empty()) return 0;
+        const auto gap = forced ? m_reoffer_opt.min_forced_interval
+                                : m_reoffer_opt.min_interval;
+        if (m_last_sweep != Clock::time_point{} && now - m_last_sweep < gap) {
+            ++m_reoffer_stats.sweeps_skipped;
+            if (forced) m_reoffer_forced.store(true);   // keep the request alive
+            return 0;
+        }
+        const std::size_t np = m_transport.n_peers();
+        if (np == 0) {                                  // nobody to offer to
+            ++m_reoffer_stats.sweeps_skipped;
+            if (forced) m_reoffer_forced.store(true);
+            return 0;
+        }
+        m_last_sweep = now;
+        ++m_reoffer_stats.sweeps;
+        std::size_t sent = 0;
+        for (auto it = m_reoffer.begin();
+             it != m_reoffer.end() && sent < m_reoffer_opt.max_per_sweep; ) {
+            // A periodic sweep re-offers only what under-delivered; a forced one
+            // (a peer just joined) re-offers everything still inside the horizon.
+            if (!forced && !it->under_delivered) { ++it; continue; }
+            const std::size_t reached = m_transport.broadcast(it->frame);
+            ++it->attempts;
+            ++sent;
+            ++m_reoffer_stats.frames_reoffered;
+            m_reoffer_stats.bytes_reoffered += it->frame.size();
+            m_stats.observe_sent(it->frame.size(), reached ? reached : np);
+            if (reached >= np) it->under_delivered = false;
+            if (it->attempts >= m_reoffer_opt.max_attempts) {
+                ++m_reoffer_stats.exhausted;
+                it = erase_reoffer(it);
+            } else {
+                ++it;
+            }
+        }
+        return sent;
+    }
 
     struct Outcome {
         WireStatus wire = WireStatus::OK;
@@ -763,7 +933,82 @@ private:
         std::size_t np = m_transport.n_peers();
         std::size_t reached = m_transport.broadcast(frame);
         m_stats.observe_sent(frame.size(), reached ? reached : np);
+        // Keep the EXACT bytes for a bounded re-offer. `under_delivered` records
+        // the DEFER case (0 peers, or a peer that dropped mid-flood) so a
+        // periodic sweep can finish the job without re-flooding what already
+        // landed everywhere.
+        buffer_for_reoffer(c.carrier.hash(), std::move(frame), reached < np || np == 0);
         return reached;
+    }
+
+    // ── re-offer buffer internals (all under m_mtx) ─────────────────────────
+    using Clock = std::chrono::steady_clock;
+    struct ReofferEntry {
+        bytes32                   hash{};
+        std::vector<std::uint8_t> frame;
+        Clock::time_point         at{};
+        unsigned                  attempts = 0;
+        bool                      under_delivered = false;
+    };
+
+    std::deque<ReofferEntry>::iterator erase_reoffer(std::deque<ReofferEntry>::iterator it) {
+        m_reoffer_bytes -= it->frame.size();
+        return m_reoffer.erase(it);
+    }
+
+    // FIFO eviction down to the entry AND byte caps, leaving room for `incoming`.
+    void trim_reoffer_to_capacity(std::size_t incoming) {
+        while (!m_reoffer.empty() &&
+               (m_reoffer.size() + 1 > m_reoffer_opt.max_entries ||
+                m_reoffer_bytes + incoming > m_reoffer_opt.max_bytes)) {
+            ++m_reoffer_stats.evicted_capacity;
+            erase_reoffer(m_reoffer.begin());
+        }
+    }
+
+    // Drop everything that may no longer be covered by the receivers' W2 dedup
+    // window (the double-credit hazard) — by age, and exactly by probe.
+    void prune_reoffer(Clock::time_point now) {
+        for (auto it = m_reoffer.begin(); it != m_reoffer.end(); ) {
+            if (now - it->at >= m_reoffer_opt.max_age) {
+                ++m_reoffer_stats.expired_age;
+                it = erase_reoffer(it);
+            } else if (m_reoffer_probe && !m_reoffer_probe(it->hash)) {
+                ++m_reoffer_stats.expired_window;
+                it = erase_reoffer(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void buffer_for_reoffer(const bytes32& h, std::vector<std::uint8_t>&& frame,
+                            bool under_delivered) {
+        if (!m_reoffer_opt.enabled) return;
+        if (frame.size() > m_reoffer_opt.max_bytes) return;   // never bufferable
+        const Clock::time_point now = Clock::now();
+        prune_reoffer(now);
+        for (auto& e : m_reoffer) {                            // already held?
+            if (e.hash == h) {
+                e.at = now;
+                e.attempts = 0;
+                e.under_delivered = e.under_delivered || under_delivered;
+                ++m_reoffer_stats.refreshed;
+                return;
+            }
+        }
+        trim_reoffer_to_capacity(frame.size());
+        if (m_reoffer.size() + 1 > m_reoffer_opt.max_entries ||
+            m_reoffer_bytes + frame.size() > m_reoffer_opt.max_bytes)
+            return;                                            // cannot fit: drop
+        ReofferEntry e;
+        e.hash = h;
+        e.at = now;
+        e.under_delivered = under_delivered;
+        m_reoffer_bytes += frame.size();
+        e.frame = std::move(frame);
+        m_reoffer.push_back(std::move(e));
+        ++m_reoffer_stats.buffered;
     }
 
     AdmitFn m_admit;
@@ -772,6 +1017,15 @@ private:
     mutable std::mutex m_mtx;    // serializes the three public handlers (see THREADING)
     RelaySeenSet m_seen;
     CarrierBloatStats m_stats;
+
+    // re-offer state (delivery only; never consensus)
+    CarrierReofferOptions            m_reoffer_opt{};
+    CarrierReofferStats              m_reoffer_stats{};
+    std::deque<ReofferEntry>         m_reoffer;
+    std::size_t                      m_reoffer_bytes = 0;
+    Clock::time_point                m_last_sweep{};
+    std::atomic<bool>                m_reoffer_forced{false};
+    std::function<bool(const bytes32&)> m_reoffer_probe;
 };
 
 } // namespace c2pool::v37n
