@@ -117,18 +117,44 @@ bool balance_ok(const std::vector<artifact::UnsignedTxSource>& sources,
 Ownership classify_dest(const prover::TxDestination& d, const MoneroKeys& keys,
                         const SubaddressTable& subs)
 {
+    // Primary / standard account (0,0): K_v = k_v * G == keys.view_pub. Both
+    // keys bound.
     if (d.spend_pub == keys.spend_pub && d.view_pub == keys.view_pub)
-        return Ownership::Own;                       // primary address / standard change
+        return Ownership::Own;
+    // A subaddress (i,j) we derived: the spend-pub is in our table AND its view
+    // key satisfies K_v^(i,j) == k_v * K_s^(i,j) (the same relation
+    // derive_subaddress uses). BINDING SPEND-PUB ALONE burns a swapped-view-key
+    // change output; require the view relation too.
     SubaddressTable::Entry e;
-    if (subs.lookup(d.spend_pub, e))
-        return Ownership::Own;                       // a change subaddress we own
+    if (subs.lookup(d.spend_pub, e)) {
+        Bytes32 expect_view{};
+        if (mcrypto::point_scalarmult(keys.view_priv, d.spend_pub, expect_view)
+            && expect_view == d.view_pub)
+            return Ownership::Own;
+    }
     return Ownership::External;
+}
+
+bool dest_supported(bool is_subaddress, bool has_payment_id, std::string& reason)
+{
+    if (is_subaddress) {
+        reason = "subaddress outputs need per-output tx keys — not supported by this signer yet";
+        return false;
+    }
+    if (has_payment_id) {
+        reason = "integrated / payment-id outputs need the pid encrypted under the tx key — "
+                 "not supported by this signer yet";
+        return false;
+    }
+    return true;
 }
 
 void wipe_spend_inputs(std::vector<prover::SpendInput>& v)
 {
-    for (auto& si : v)
+    for (auto& si : v) {
         c2w::secure::secure_wipe(si.one_time_sec.data(), si.one_time_sec.size());
+        c2w::secure::secure_wipe(si.amount_mask.data(), si.amount_mask.size());
+    }
 }
 
 } // namespace c2wallet::monero::compose

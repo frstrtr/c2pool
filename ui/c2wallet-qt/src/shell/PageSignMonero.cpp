@@ -28,6 +28,7 @@
 #include "family/monero/prover/MoneroRingctBuilder.hpp"    // assemble/self_verify
 #include "family/monero/artifact/MoneroArtifact.hpp"       // UnsignedTxSet, SignedTxSet
 #include "family/monero/compose/MoneroSpendGate.hpp"       // the Qt-free money gate
+#include "secure/SecureString.hpp"                          // c2w::secure::secure_wipe
 
 namespace xm  = c2wallet::monero;
 namespace art = c2wallet::monero::artifact;
@@ -95,10 +96,12 @@ QString dest_address(const pv::TxDestination& d, xm::Network net) {
 QString render_card(const art::UnsignedTxSet& u, xm::Network net,
                     const std::vector<char>& ownFlags, bool bound, const QString& digestHex)
 {
+    // Overflow-SAFE balance: a set whose sums wrap 2^64 must never be shown as
+    // "balanced" (the assembler would refuse to emit, but the operator would
+    // already have typed SPEND on a card that lied). cg::balance_ok returns
+    // false on any wrap and fills the running sums.
     std::uint64_t sum_in = 0, sum_out = 0;
-    for (const auto& s : u.sources) sum_in += s.amount;
-    for (const auto& d : u.dests)   sum_out += d.amount;
-    const bool balanced = (sum_in == sum_out + u.fee);
+    const bool balanced = cg::balance_ok(u.sources, u.dests, u.fee, sum_in, sum_out);
 
     QString html;
     html += QString("<b>Monero unsigned_txset</b> &nbsp; keccak256 = %1<br>").arg(digestHex.left(24) + "…");
@@ -197,6 +200,7 @@ PageSignMonero::PageSignMonero(QWidget* parent) : QWidget(parent), st_(std::make
         "A view-only key set is REFUSED. The widget is wiped the instant it is read at Bind."));
     keysEdit_->setFont(QFont(QStringLiteral("monospace")));
     keysEdit_->setMaximumHeight(72);
+    keysEdit_->setUndoRedoEnabled(false);   // T-8: no undo stack retaining the secret text
     v->addWidget(keysEdit_);
     bindBtn_ = new QPushButton(QStringLiteral("2) Bind keys + preview OWN/EXTERNAL"), this);
     v->addWidget(bindBtn_);
@@ -344,26 +348,48 @@ void PageSignMonero::onBindPreview()
     if (!art::parse_unsigned_txset(blob, u, derr)) { output_->appendPlainText(QString("Artifact re-parse failed: %1").arg(QString::fromStdString(derr))); return; }
     st_->u = u;
 
+    // Payability gate (mirrors Build): this signer cannot pay a subaddress (no
+    // per-output additional tx key) or an integrated/payment-id output. tx_extra
+    // here is the FROZEN nonce body the online side carried; a non-empty one is a
+    // payment id this signer cannot re-encrypt under the internally-generated tx
+    // secret r, so refuse it rather than misdirect the deposit.
+    for (const auto& d : st_->u.dests) {
+        std::string preason;
+        if (!cg::dest_supported(d.is_subaddress, /*has_payment_id*/false, preason)) {
+            output_->appendPlainText(QString("Refused: destination %1").arg(QString::fromStdString(preason)));
+            return;
+        }
+    }
+    if (!st_->u.tx_extra.empty()) {
+        output_->appendPlainText(QStringLiteral(
+            "Refused: this unsigned_txset carries a tx_extra nonce (payment id) that this signer "
+            "cannot re-encrypt under the tx key r — not supported yet."));
+        return;
+    }
+
     // Derive the key set from the chosen secret form.
     xm::KeyImportResult kr;
     if (secretType_->currentIndex() == 0) {
         kr = xm::keys_from_mnemonic(keytext.str());
     } else {
         // dual hex: two 64-hex tokens, separated by space / colon / newline.
+        // t/spend/view are heap copies of the PRIVATE spend+view hex — wipe them
+        // before they leave scope (T-8); do not rely on std::string teardown.
+        std::string t = keytext.str();
+        for (char& c : t) if (c == ':' || c == '\n' || c == '\r' || c == '\t') c = ' ';
         std::string spend, view;
-        {
-            std::string t = keytext.str();
-            for (char& c : t) if (c == ':' || c == '\n' || c == '\r' || c == '\t') c = ' ';
-            std::size_t p = 0;
-            auto next = [&](std::string& out) {
-                while (p < t.size() && t[p] == ' ') ++p;
-                std::size_t s = p;
-                while (p < t.size() && t[p] != ' ') ++p;
-                out = t.substr(s, p - s);
-            };
-            next(spend); next(view);
-        }
+        std::size_t p = 0;
+        auto next = [&](std::string& out) {
+            while (p < t.size() && t[p] == ' ') ++p;
+            std::size_t s = p;
+            while (p < t.size() && t[p] != ' ') ++p;
+            out = t.substr(s, p - s);
+        };
+        next(spend); next(view);
         kr = xm::keys_from_dual_hex(spend, view);
+        if (!t.empty())     c2w::secure::secure_wipe(&t[0], t.size());
+        if (!spend.empty()) c2w::secure::secure_wipe(&spend[0], spend.size());
+        if (!view.empty())  c2w::secure::secure_wipe(&view[0], view.size());
     }
     if (!kr.ok) { output_->appendPlainText(QString("Refused: key import failed: %1").arg(QString::fromStdString(kr.error))); return; }
     if (!kr.keys.can_sign()) { output_->appendPlainText(QStringLiteral("Refused: this is a VIEW-ONLY key set — it cannot sign (T-6).")); return; }

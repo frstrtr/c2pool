@@ -83,12 +83,30 @@ bool balance_ok(const std::vector<artifact::UnsignedTxSource>& sources,
                 std::uint64_t fee,
                 std::uint64_t& sum_in, std::uint64_t& sum_out);
 
-// OWN/EXTERNAL verdict for one destination (T-3). OWN iff it pays the wallet's
-// primary (spend_pub,view_pub) or a spend-pub in the precomputed subaddress
-// table; otherwise EXTERNAL (leaves the wallet).
+// OWN/EXTERNAL verdict for one destination (T-3). OWN binds BOTH keys: for the
+// primary account (0,0) it is (spend_pub,view_pub) == the wallet's; for a
+// subaddress (i,j) the spend-pub must be in the precomputed table AND satisfy
+// K_v^(i,j) == k_v * K_s^(i,j). Binding spend-pub ALONE is a fund-loss hole: a
+// compromised online host could swap the change dest's view key for a garbage
+// point, the card would show "OWN — change returns to you", the operator would
+// sign, and the change would be BURNED (the owner's scanner computes
+// D = k_v*R != r*A, so nobody can spend it). Self-verify cannot catch that (the
+// tx is cryptographically valid) — this two-key gate is the only defence.
 enum class Ownership { Own, External };
 Ownership classify_dest(const prover::TxDestination& d, const MoneroKeys& keys,
                         const SubaddressTable& subs);
+
+// Payability gate: this signer supports only STANDARD-address destinations.
+//   * A SUBADDRESS destination needs a per-output additional tx key (tx_extra
+//     0x04); the RingCT assembler does not emit one, so a subaddress output
+//     would be UNSPENDABLE (burned). Refused until that is implemented.
+//   * An INTEGRATED / payment-id destination needs its 8-byte pid encrypted
+//     under the tx secret key r; the assembler generates r internally and never
+//     re-encrypts, so the pid would be wrong/absent and an exchange deposit
+//     would not be credited. Refused until pid-encryption-with-r exists.
+// Returns false + a named `reason` for such a destination — enforced at Build
+// (per decoded address) and at Sign (per parsed dest / non-empty tx_extra).
+bool dest_supported(bool is_subaddress, bool has_payment_id, std::string& reason);
 
 // GAP-6 (T-8): explicitly scrub every spend secret x_i. Called on every path
 // AFTER the secrets have been consumed (sign / self-verify), belt-and-braces

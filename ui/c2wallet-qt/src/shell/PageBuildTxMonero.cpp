@@ -217,12 +217,18 @@ static bool parse_form(xm::Network net, const QString& srcHex, const QString& de
         if (f.size() < 2) { err = QString("destination needs address:amount — got '%1'").arg(ln); return false; }
         cg::DecodedDest dd; std::string derr;
         if (!cg::decode_dest(f[0].trimmed().toStdString(), net, dd, derr)) { err = QString("destination %1").arg(QString::fromStdString(derr)); return false; }
+        // Only standard-address destinations are payable by this signer (a
+        // subaddress needs a per-output tx key; an integrated pid needs
+        // re-encryption under r). Refuse the rest with a named reason.
+        std::string preason;
+        if (!cg::dest_supported(dd.dest.is_subaddress, dd.has_payment_id, preason)) {
+            err = QString("destination %1").arg(QString::fromStdString(preason));
+            return false;
+        }
         std::uint64_t amt = 0; std::string aerr;
         if (!cg::parse_xmr(f[1].trimmed().toStdString(), amt, aerr)) { err = QString("destination amount: %1").arg(QString::fromStdString(aerr)); return false; }
         if (amt == 0) { err = "destination amount is zero"; return false; }
         dd.dest.amount = amt;
-        if (dd.has_payment_id)
-            warns << "an INTEGRATED destination carries a payment id (read + carried in tx_extra by the online side; not generated here)";
         u.dests.push_back(dd.dest);
     }
     if (u.dests.empty()) { err = "no destinations"; return false; }

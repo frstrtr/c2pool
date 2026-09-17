@@ -176,11 +176,32 @@ void test_ownership() {
     pv::TxDestination ext = recipient("c2w-2b-ext", 1);
     check(cg::classify_dest(ext, w, subs) == cg::Ownership::External, "a foreign destination is EXTERNAL");
 
+    // BLOCKER regression: OWN must bind BOTH keys. A dest carrying our real
+    // spend pub but a FOREIGN view key (a change-key swap by a compromised host)
+    // must be EXTERNAL — a spend-pub-only classifier wrongly called it OWN and
+    // the change would be burned.
+    pv::TxDestination spoof;
+    spoof.spend_pub = w.spend_pub;                          // our real K_s
+    spoof.view_pub  = recipient("c2w-2b-foreign-view", 1).spend_pub;  // a foreign point
+    spoof.amount    = 1;
+    check(cg::classify_dest(spoof, w, subs) == cg::Ownership::External,
+          "owned spend_pub + FOREIGN view_pub => EXTERNAL (two-key OWN binding)");
+
+    // A genuine subaddress we own still classifies OWN (defense-in-depth two-key
+    // match) — but it is REFUSED as NOT-PAYABLE by this signer (no per-output tx
+    // key), so the pages never let it through to signing.
     SubaddressResult sr = derive_subaddress(w.view_priv, w.spend_pub, 1, 5, Network::Mainnet);
     check(sr.ok, "derive_subaddress (1,5) ok");
     pv::TxDestination subchg;
     subchg.spend_pub = sr.sub_spend_pub; subchg.view_pub = sr.sub_view_pub; subchg.is_subaddress = true; subchg.amount = 1;
-    check(cg::classify_dest(subchg, w, subs) == cg::Ownership::Own, "a change SUBADDRESS we own is OWN");
+    check(cg::classify_dest(subchg, w, subs) == cg::Ownership::Own, "classifier: a genuine change SUBADDRESS two-key match is OWN");
+    std::string sub_r, pid_r, std_r;
+    const bool sub_ok = cg::dest_supported(/*is_subaddress*/true, /*has_payment_id*/false, sub_r);
+    const bool pid_ok = cg::dest_supported(/*is_subaddress*/false, /*has_payment_id*/true, pid_r);
+    const bool std_ok = cg::dest_supported(/*is_subaddress*/false, /*has_payment_id*/false, std_r);
+    check(!sub_ok, std::string("a SUBADDRESS destination is refused NOT-PAYABLE (") + sub_r + ")");
+    check(!pid_ok, std::string("an INTEGRATED/payment-id destination is refused NOT-PAYABLE (") + pid_r + ")");
+    check(std_ok,  "a STANDARD destination is supported (payable)");
 }
 
 // ── K7: end-to-end cold-sign + refusals, through the facade ──────────────────
