@@ -540,23 +540,39 @@ inline RepairResult replay_to_cut(const RepairInput& in, const IMainchainIndex& 
 //   an in-flight repair job NEVER loses its peer binding because another cut
 //   was armed or finished.
 //
-// Two writes used to break it, and both are fixed here:
+// Two writes used to break it:
 //
-//   (1) arm() bound m_by_peer[peer] BEFORE asking. A second arm k2 therefore
-//       overwrote the binding of the live job k1 before its own ask was even
-//       refused;
+//   (1) a second arm k2 OVERWROTE the binding of the live job k1 before its own
+//       ask was even refused;
 //   (2) finish() erased m_by_peer BY BARE PEER ID. finish(k2) — reached
 //       immediately, because the ask was refused_busy — then erased the
 //       binding outright. k1's ORDER reply had nowhere to land, k1 stayed in
 //       m_jobs forever, and every later arm of that cut COALESCED into the
 //       dead job: permanently unrepairable, silently, with no refusal logged.
 //
-// Now: a second cut whose only peer is already serving is QUEUED (m_deferred)
-// without touching m_by_peer and without creating a job, the binding is written
-// only after request_order() actually accepted, and finish() erases only the
-// binding that is still ITS OWN. A queued cut is re-armed the moment the peer
-// falls free, and — because nothing recorded it as in flight — it also stays
+// Both are fixed by the QUEUE and the IDENTITY-GUARDED ERASE: a second cut
+// whose only peer is already serving is QUEUED (m_deferred) without touching
+// m_by_peer and without creating a job, and finish() erases only the binding
+// that is still ITS OWN. A queued cut is re-armed the moment the peer falls
+// free, and — because nothing recorded it as in flight — it also stays
 // re-armable by a later S3 re-offer.
+//
+// ── ★ AND THE BINDING IS WRITTEN BEFORE THE ASK, NOT AFTER ─────────────────
+// A first cut at (1) moved the binding to AFTER request_order() returned, on
+// the argument that "the reply is delivered later, by the same thread". That
+// argument does not hold: arm() is reached from the block-event path, from
+// drain_deferred() on a COMPLETING repair, and from the daemon's S3 re-drive,
+// none of which is the transport reader thread. Binding after the ask left a
+// window in which an ORDER reply for THIS job lands while m_by_peer still
+// holds nothing — on_order() finds no binding, DROPS the reply, and the job
+// sits in m_jobs with no reply ever coming. The same zombie, entered from the
+// other side, and one an ablation reproduces deterministically.
+//
+// So the binding is written INSIDE the arm's critical section, before the ask
+// goes out. That is safe precisely because the other two rules are kept:
+// the queue gate has already returned for any peer that is serving, so this
+// write can never land on a live job's binding; and finish() erases by job
+// identity, so a locally refused ask rolls back exactly its own binding.
 // ═══════════════════════════════════════════════════════════════════════════
 struct RepairStats {
     std::uint64_t armed          = 0;   // repairs started
@@ -669,25 +685,30 @@ public:
             m_jobs.emplace(k, std::move(j));
             m_deferred.erase(k);                   // it is live now, not queued
             ++m_stats.armed;
+            // ── ★ BIND BEFORE THE ASK ───────────────────────────────────────
+            // The answer is delivered by the transport READER thread, which is
+            // NOT in general the thread that armed. Binding after the ask
+            // returned therefore left a cross-thread window in which the reply
+            // beat the bind and on_order() dropped it — a zombie job with no
+            // reply ever coming. Writing the binding here closes that window,
+            // and cannot orphan anybody: the queue gate above has already
+            // returned for every peer that is serving, so the only binding
+            // this line can replace is a dead one.
+            m_by_peer[peer] = k;
         }
         // Ask for the winner's order over [0, P). `spine` is the commitment we
         // are asking the server to stand behind; the REPLAY, not either side's
         // claim, is what decides whether it holds.
         if (!m_fetch.request_order(peer, m_chain, 0, pos, spine)) {
             bump_fetch_failed();
+            // ── ★ THE ROLLBACK ──────────────────────────────────────────────
+            // The ask never went out, so nothing will ever answer it. finish()
+            // drops the job and — BY JOB IDENTITY — the binding written above,
+            // which is exactly the rollback this needs: the peer is left as it
+            // was before this arm, no other job's binding is touched, and
+            // whatever was queued behind the peer drains.
             finish(k, RepairResult{});             // refused locally: fail closed
             return false;
-        }
-        // ── ★ BIND ONLY NOW ─────────────────────────────────────────────────
-        // The binding is written only once the ask was ACCEPTED and dispatched.
-        // A locally refused ask therefore never inserts a binding, and the
-        // finish() it triggers never erases one (finish erases by job identity).
-        // The answer cannot beat us to this line: request_order() dispatches on
-        // THIS thread and the reply is delivered later by the transport reader
-        // loop, which is the same thread that drove this arm.
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            if (m_jobs.count(k)) m_by_peer[peer] = k;
         }
         return true;
     }

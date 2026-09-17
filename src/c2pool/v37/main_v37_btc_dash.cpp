@@ -588,6 +588,32 @@ int main(int argc, char** argv) {
             supply_fetch->set_on_fail([&](CarrierPeerNode::PeerId pid, SupplyFailure f) {
                 repair_driver->on_fail(pid, f);
             });
+            // ── ★ THE TIMEOUT DRIVE ─────────────────────────────────────────
+            // SupplyRequester gives every outstanding request a deadline, but a
+            // deadline only bites if somebody READS it: tick() is what turns
+            // "this peer never answered" into a failure. Nothing in this daemon
+            // used to call it, so a repair whose reply never arrived stayed in
+            // flight forever — fail-closed (owed never moved) but PERMANENTLY,
+            // silently, and with every cut queued behind that peer stuck behind
+            // it. Driving tick() closes that: the slot expires, on_fail reaches
+            // RepairDriver::finish(), the repair is counted REFUSED, and
+            // drain_deferred() releases the queue.
+            //
+            // The CarrierSendQueue worker is already idle between own wins and
+            // already wakes on a timer to drive the relay's re-offer sweep, so
+            // the same cadence carries this: no new thread, and carrier_send->
+            // stop() joins that worker before anything the hook touches is torn
+            // down.
+            if (carrier_send) {
+                carrier_send->set_idle_tick([&] {
+                    if (!supply_fetch) return;
+                    const std::size_t n = supply_fetch->tick();
+                    if (n)
+                        LOG_WARNING << "[v37-dash] supply fetch: " << n
+                                    << " outstanding request(s) timed out — the repair fails"
+                                       " closed and whatever was queued behind that peer drains";
+                });
+            }
             carrier_net->set_control([&](CarrierPeerNode::PeerId pid,
                                          const std::vector<std::uint8_t>& f) {
                 supply_serve->on_control(pid, f);
@@ -1060,6 +1086,16 @@ int main(int argc, char** argv) {
                          << " order_failed=" << rp.order_failed
                          << " fetch_failed=" << rp.fetch_failed
                          << " unservable=" << rp.unservable
+                         // ── the one-serving-peer QUEUE, as an operator reads it ──
+                         // deferred/resumed are the ordinary 2-node traffic; a
+                         // non-zero deferred_drop or a non-empty queue_depth at
+                         // stop is a cut this node wanted repaired and never got.
+                         << " | queue{deferred=" << rp.deferred
+                         << " resumed=" << rp.resumed
+                         << " deferred_drop=" << rp.deferred_drop
+                         << " queue_depth=" << repair_driver->deferred()
+                         << " in_flight=" << repair_driver->in_flight()
+                         << " bindings=" << repair_driver->bindings() << "}"
                          << " | arm{repair_wanted=" << node.s1c_stats().repair_wanted
                          << " repair_hit=" << node.s1c_stats().repair_hit
                          << " repair_missing=" << node.s1c_stats().repair_missing

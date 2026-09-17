@@ -62,6 +62,19 @@
 //         job keeps its peer binding, the second cut is QUEUED (never coalesced
 //         into the live job, never a silent zombie), it is re-armed the moment
 //         the peer falls free, and BOTH blocks credit — owed(A) == owed(B).
+//   CA-10 ★ THE CROSS-THREAD WINDOW: the ORDER reply is delivered while
+//         request_order() is still on the stack — i.e. BEFORE the arm could
+//         have bound the peer if it bound after dispatching. The reply is still
+//         credited: the repair completes, the S3 re-drive registers the block,
+//         and no job and no binding is left behind. (arm() binds m_by_peer
+//         BEFORE the ask for exactly this reason; binding after left the reply
+//         with nowhere to land and the job in m_jobs forever.)
+//   CA-11 ★ THE UN-DRIVEN TIMEOUT: a repair whose reply NEVER arrives. Nothing
+//         moves until SupplyRequester::tick() is driven — which is what the
+//         daemon now does on the carrier_send idle cadence — and then the slot
+//         expires, on_fail reaches finish(), the repair is REFUSED (never a
+//         permanent zombie), and the cut queued behind that peer DRAINS. Both
+//         nodes' owed_digest is unmoved: failing closed still fails closed.
 //
 // Stdlib + POSIX sockets + Threads, the self-harness shape of its siblings in
 // this directory. CONSUMER TREE ONLY: no file under src/sharechain/v37 is
@@ -246,8 +259,10 @@ struct Node {
     std::mutex                          redrive_mtx;
     std::vector<std::string>            redriven;     // bids the S3 path re-entered
 
+    using CtlSend = std::function<bool(CarrierPeerNode::PeerId,
+                                       const std::vector<std::uint8_t>&)>;
     Node(std::shared_ptr<MockCoinBackend> c, const LaneParams& p,
-         ManualBus* bus = nullptr, bool is_a = false)
+         ManualBus* bus = nullptr, bool is_a = false, CtlSend override_send = nullptr)
         : coin(std::move(c)), params(p) {
         BtcNodeConfig cfg;
         cfg.lane_chain  = CH;
@@ -277,7 +292,11 @@ struct Node {
         // The ONE substitution CA-9 makes: where the control frames go. Every
         // other wire in this constructor is the production one.
         std::function<bool(CarrierPeerNode::PeerId, const std::vector<std::uint8_t>&)> send;
-        if (bus) {
+        if (override_send) {
+            // CA-10 only: a SYNCHRONOUS loopback, so a reply is delivered from
+            // inside the very request_order() call that asked for it.
+            send = std::move(override_send);
+        } else if (bus) {
             send = [bus, is_a](CarrierPeerNode::PeerId,
                                const std::vector<std::uint8_t>& f) {
                 std::lock_guard<std::mutex> lk(bus->mtx);
@@ -855,6 +874,209 @@ int main() {
         // The winner is the control: serving two repairs moved nothing of its own.
         check(A.lane() == won2.cut.lane_digest,
               "CA-9s the server's own lane digest is untouched by serving both repairs");
+    }
+
+    // ── CA-10 ★ THE REPLY BEATS THE BIND ────────────────────────────────────
+    // arm() has to write m_by_peer[peer] at SOME point around the ask. Writing
+    // it AFTER request_order() returned looks safe only if the reply can never
+    // land first — and that argument depends on the answer arriving on the same
+    // thread that armed, which is false: arm() is reached from the block-event
+    // path, from drain_deferred() on a completing repair, and from the S3
+    // re-drive, none of which is the transport reader thread.
+    //
+    // This case collapses that window to its extreme and makes it deterministic:
+    // the control SendFn delivers each frame into the other node IMMEDIATELY, so
+    // the whole ORDER / GETFRAMES round trip happens INSIDE B's request_order()
+    // call, before arm() has returned. With the binding written after the ask,
+    // on_order() finds NO binding for the peer, DROPS the reply, and the job
+    // stays in m_jobs with nothing left to answer it: a silent zombie, and the
+    // cut permanently unrepairable. With the binding written BEFORE the ask —
+    // which is what ships — the reply lands on its job and the repair completes.
+    std::printf("-- CA-10 the ORDER reply is delivered before arm() returns\n");
+    {
+        auto coin = std::make_shared<MockCoinBackend>();
+        Node* pA = nullptr;
+        Node* pB = nullptr;
+        const CarrierPeerNode::PeerId PID = ManualBus::PID;
+        // A's control frames go straight into B, and B's straight into A. No
+        // queue, no second thread: delivery is a nested call.
+        auto into_b = [&](CarrierPeerNode::PeerId,
+                          const std::vector<std::uint8_t>& f) {
+            if (!pB) return false;
+            pB->serve->on_control(PID, f);
+            pB->fetch->on_control(PID, f);
+            return true;
+        };
+        auto into_a = [&](CarrierPeerNode::PeerId,
+                          const std::vector<std::uint8_t>& f) {
+            if (!pA) return false;
+            pA->serve->on_control(PID, f);
+            pA->fetch->on_control(PID, f);
+            return true;
+        };
+        Node A(coin, ratified, nullptr, /*is_a=*/true,  into_b);
+        Node B(coin, ratified, nullptr, /*is_a=*/false, into_a);
+        pA = &A;
+        pB = &B;
+        {   // the serve side must not throttle: a throttle here would be a
+            // harness artefact, not a finding.
+            SupplyServeOptions so;
+            so.burst = 64.0;
+            A.serve->set_options(so);
+        }
+
+        const Stream& s = stream();
+        for (int i = 0; i < N_SHARE; ++i) {
+            A.feed(s.frame[i]);
+            if (i != DROP_AT) B.feed(s.frame[i]);      // B loses one share
+        }
+        (void)wait_until([&] { return A.next_pos() == static_cast<u64>(N_SHARE); });
+        (void)wait_until([&] { return B.next_pos() == static_cast<u64>(N_SHARE - 1); });
+
+        coin->append_block("g0");
+        const u64     win_h       = coin->append_block(kWonBid);
+        const bytes32 owed_at_win = A.owed();
+        const WonBlockOutcome won = A.node->on_block_won(kWonBid, win_h, /*confirmations=*/0);
+        const bytes32 lane_a_before = A.lane();
+        const bytes32 owed_a_before = A.owed();
+
+        const PeerWin w = peer_win_of(kWonBid, win_h, won.cut, won.emitted, owed_at_win);
+        const BlockEventDriver::RegisterResult g = B.bed->on_peer_block_found(w);
+        check(!g.registered && B.node->s1c_stats().repair_wanted >= 1,
+              "CA-10a the peer win is REFUSED at the cut and flagged REPAIRABLE");
+
+        // ★ THE TRIGGER. Everything — ORDER, GETFRAMES, the replay, the S3
+        //   re-drive — runs to completion inside this one call.
+        const bool armed = B.repair->arm(PID, w.bid, w.cut_next_pos, w.cut_spine_digest);
+        const RepairStats rs = B.repair->stats();
+        check(armed, "CA-10b the arm dispatched a fetch");
+        check(rs.armed == 1 && rs.repaired == 1 && rs.refused == 0 &&
+                  rs.order_failed == 0 && rs.fetch_failed == 0,
+              "CA-10c ★ the reply that landed INSIDE request_order() was CREDITED: the "
+              "repair replayed to the winner's own digest");
+        check(B.repair->in_flight() == 0 && B.repair->bindings() == 0 &&
+                  B.repair->deferred() == 0,
+              "CA-10d ★ NO ZOMBIE: no job, no binding and no queue entry survives the arm");
+        check(B.repair->verified_view(CH, w.cut_next_pos, w.cut_spine_digest) != nullptr,
+              "CA-10e a verified projection is cached for the cut");
+        check(B.redrive_count() == 1,
+              "CA-10f the S3 re-drive fired once, from inside the completing arm");
+        check(B.node->ledger().is_pending(w.bid) || B.node->ledger().is_settled(w.bid),
+              "CA-10g the block is registered on B after the re-drive");
+        check(B.node->s1c_stats().repair_hit == 1 && B.node->s1c_stats().credited == 1,
+              "CA-10h the re-driven arm read the repaired view and CREDITED");
+
+        // Convergence, and the winner as the control.
+        for (int i = 0; i <= static_cast<int>(D_CONF); ++i)
+            coin->append_block("f" + std::to_string(i));
+        bool a_fin = false, b_fin = false;
+        for (const auto& st : A.bed->on_tip(coin->best_tip())) if (st.bid == kWonBid) a_fin = true;
+        for (const auto& st : B.bed->on_tip(coin->best_tip())) if (st.bid == kWonBid) b_fin = true;
+        check(a_fin && b_fin && A.owed() == B.owed() && hex32(B.owed()) != kEmptyAnchor,
+              "CA-10i ★ owed_digest(A) == owed_digest(B), BYTE-EQUAL, over a reply that beat "
+              "the bind");
+        check(A.lane() == lane_a_before && owed_a_before == owed_at_win,
+              "CA-10j serving the repair moved nothing of the winner's own");
+    }
+
+    // ── CA-11 ★ THE REPAIR NOBODY ANSWERS ───────────────────────────────────
+    // A request that gets no reply at all. SupplyRequester stamps a deadline on
+    // every outstanding slot, but a deadline nobody reads is not a timeout:
+    // until tick() is DRIVEN the repair sits in flight forever, and the cut
+    // queued behind that peer sits behind it forever. Fail-closed — owed never
+    // moves — but permanently and silently, which is exactly the shape of a
+    // zombie. The daemon now drives tick() on the carrier_send idle cadence;
+    // this case drives it by hand, with the clock pushed past the deadline.
+    std::printf("-- CA-11 a repair whose reply never arrives is timed out, not stranded\n");
+    {
+        ManualBus bus;                      // frames go in here and are NEVER pumped
+        auto coin = std::make_shared<MockCoinBackend>();
+        Node A(coin, ratified, &bus, /*is_a=*/true);
+        Node B(coin, ratified, &bus, /*is_a=*/false);
+        const Stream& s = stream();
+
+        // Two distinct prefixes and a win at each, exactly as CA-9 builds them,
+        // so there IS a second cut to strand behind the first.
+        const int P1 = 6;
+        for (int i = 0; i < P1; ++i) { A.feed(s.frame[i]); if (i != DROP_AT) B.feed(s.frame[i]); }
+        (void)wait_until([&] { return A.next_pos() == static_cast<u64>(P1); });
+        coin->append_block("g0");
+        const u64     h1    = coin->append_block(kWonBid);
+        const bytes32 owed1 = A.owed();
+        const WonBlockOutcome won1 = A.node->on_block_won(kWonBid, h1, /*confirmations=*/0);
+        for (int i = P1; i < N_SHARE; ++i) { A.feed(s.frame[i]); if (i != DROP_AT) B.feed(s.frame[i]); }
+        (void)wait_until([&] { return A.next_pos() == static_cast<u64>(N_SHARE); });
+        (void)wait_until([&] { return B.next_pos() == static_cast<u64>(N_SHARE - 1); });
+        const u64     h2    = coin->append_block(kWonBid2);
+        const bytes32 owed2 = A.owed();
+        const WonBlockOutcome won2 = A.node->on_block_won(kWonBid2, h2, /*confirmations=*/0);
+
+        const PeerWin w1 = peer_win_of(kWonBid,  h1, won1.cut, won1.emitted, owed1);
+        const PeerWin w2 = peer_win_of(kWonBid2, h2, won2.cut, won2.emitted, owed2);
+        (void)B.bed->on_peer_block_found(w1);
+        (void)B.bed->on_peer_block_found(w2);
+        const bytes32 owed_b_before = B.owed();
+
+        const bool armed1 = B.repair->arm(ManualBus::PID, w1.bid, w1.cut_next_pos,
+                                          w1.cut_spine_digest);
+        const bool armed2 = B.repair->arm(ManualBus::PID, w2.bid, w2.cut_next_pos,
+                                          w2.cut_spine_digest);
+        check(armed1 && !armed2 && B.repair->in_flight() == 1 &&
+                  B.repair->bindings() == 1 && B.repair->deferred() == 1,
+              "CA-11a one repair is in flight and holds its binding; the second cut is QUEUED");
+
+        // (a) NOTHING happens on its own. A tick BEFORE the deadline expires
+        //     nothing, which is what makes the next step a timeout rather than
+        //     an unconditional sweep.
+        const std::size_t early = B.fetch->tick(std::chrono::steady_clock::now());
+        check(early == 0 && B.repair->in_flight() == 1 && B.repair->deferred() == 1 &&
+                  B.fetch->stats().timeouts == 0,
+              "CA-11b before the deadline nothing expires — and with NOTHING driving tick() "
+              "this is the state a stranded repair stays in forever");
+
+        // (b) ★ THE DRIVE. Past the deadline the slot expires, on_fail reaches
+        //     RepairDriver::finish(), and finish() drains the queue — so the
+        //     SECOND cut is re-armed by the very failure of the first.
+        const std::size_t late1 =
+            B.fetch->tick(std::chrono::steady_clock::now() + std::chrono::hours(1));
+        const RepairStats t1 = B.repair->stats();
+        check(late1 == 1 && B.fetch->stats().timeouts == 1,
+              "CA-11c tick() expired the outstanding request (the peer never answered)");
+        check(t1.refused == 1 && t1.fetch_failed == 1,
+              "CA-11d the stranded repair is counted REFUSED, not left in flight");
+        check(t1.resumed == 1 && t1.armed == 2 && B.repair->deferred() == 0 &&
+                  B.repair->in_flight() == 1,
+              "CA-11e ★ the cut QUEUED behind the dead repair was released and re-armed");
+
+        // (c) the resumed repair is asking the same silent peer. One more tick
+        //     past its deadline and the driver is completely clean.
+        const std::size_t late2 =
+            B.fetch->tick(std::chrono::steady_clock::now() + std::chrono::hours(2));
+        const RepairStats t2 = B.repair->stats();
+        check(late2 == 1 && t2.refused == 2,
+              "CA-11f the resumed repair times out in its turn");
+        check(B.repair->in_flight() == 0 && B.repair->bindings() == 0 &&
+                  B.repair->deferred() == 0,
+              "CA-11g ★ NO PERMANENT ZOMBIE: no job, no binding and no queue entry is left");
+
+        // (d) and the cut stays RE-ARMABLE: a timeout refuses, it does not
+        //     poison the key the way a dead coalescing job did.
+        const bool rearm = B.repair->arm(ManualBus::PID, w1.bid, w1.cut_next_pos,
+                                         w1.cut_spine_digest);
+        check(rearm && B.repair->stats().armed == 3,
+              "CA-11h a timed-out cut is armed again cleanly by a later S3 re-offer");
+        (void)B.fetch->tick(std::chrono::steady_clock::now() + std::chrono::hours(3));
+
+        // (e) ZERO CONSENSUS: failing closed stays closed. Neither node credited
+        //     anything, and B's owed_digest did not move by one byte.
+        check(B.owed() == owed_b_before,
+              "CA-11i owed_digest(B) is unmoved by three timed-out repairs (fail closed)");
+        check(B.node->s1c_stats().credited == 0 &&
+                  !B.node->ledger().is_pending(w1.bid) &&
+                  !B.node->ledger().is_settled(w1.bid),
+              "CA-11j nothing was credited on a repair that never verified");
+        check(A.lane() == won2.cut.lane_digest,
+              "CA-11k the winner's own lane digest is untouched throughout");
     }
 
     std::printf("== %d checks, %d failures ==\n", g_checks, g_fails);

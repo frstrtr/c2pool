@@ -275,6 +275,24 @@ public:
         m_log = std::move(f);
     }
 
+    // ── ★ THE DAEMON'S IDLE HOOK ────────────────────────────────────────────
+    // A second periodic callback driven on the SAME idle cadence as the relay's
+    // re-offer sweep (Options::reoffer_tick_interval). The daemon binds
+    // SupplyRequester::tick() here, which is what turns "the peer never
+    // answered" into a FAILURE: without it an outstanding repair fetch has a
+    // deadline nobody ever reads, so the repair never completes and every cut
+    // queued behind that peer never drains.
+    //
+    // It is called with NO relay mutex held — the supply channel is driven from
+    // the transport reader thread in production and takes no relay lock — and
+    // never on the emit path. It never runs after stop() has joined the worker.
+    // With reoffer_tick_interval == 0 the worker has no idle wakeup at all and
+    // this hook is never called; the daemon must then drive tick() itself.
+    void set_idle_tick(std::function<void()> f) {
+        std::lock_guard<std::mutex> lk(m_idle_mtx);
+        m_idle_tick = std::move(f);
+    }
+
     // Spawn the worker. Idempotent. Items submitted before start() stay queued.
     void start() {
         std::lock_guard<std::mutex> lk(m_q_mtx);
@@ -499,6 +517,7 @@ private:
                                          [&] { return m_stopped || !m_q.empty(); })) {
                         lk.unlock();
                         drive_reoffer();
+                        drive_idle_tick();
                         continue;
                     }
                 } else {
@@ -550,6 +569,22 @@ private:
         }
     }
 
+    // The daemon's periodic hook (SupplyRequester::tick()), on the re-offer
+    // cadence but OUTSIDE the relay mutex, and never allowed to throw out of
+    // the worker loop.
+    void drive_idle_tick() {
+        std::function<void()> f;
+        { std::lock_guard<std::mutex> lk(m_idle_mtx); f = m_idle_tick; }
+        if (!f) return;
+        try {
+            f();
+        } catch (const std::exception& e) {
+            log(true, std::string("[carrier-send] idle tick threw: ") + e.what());
+        } catch (...) {
+            log(true, "[carrier-send] idle tick threw (non-std)");
+        }
+    }
+
     bool stopping() const {
         std::lock_guard<std::mutex> lk(m_q_mtx);
         return m_stopped;
@@ -581,6 +616,8 @@ private:
     bool                     m_stopped = false;
     bool                     m_busy = false;
     std::thread              m_worker;
+    mutable std::mutex       m_idle_mtx;
+    std::function<void()>    m_idle_tick;      // daemon hook on the idle cadence
 
     // emission
     std::mutex               m_emit_mtx;
