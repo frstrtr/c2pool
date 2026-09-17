@@ -57,6 +57,19 @@ endif()
 if(NOT TARGET c2wallet_monero)
     add_subdirectory(src/family/monero)
 endif()
+# M6 slice-2a: the Family-A signer core (whose std-only SignSession facade GAP-1
+# is the sole bridge across the dashscript/btclibs header trees) and the M5-A
+# air-gap artifact library are now linked into the signer app so the Build
+# Transaction / Sign & Self-Verify screens drive the REAL signing code. Both are
+# Qt-free and network-free (the signer needs only system libsecp256k1), so the
+# ci/check_no_network.sh link-guard stays green. Guarded so the
+# -DC2WALLET_QT_BUILD_TESTS path below does not double-add.
+if(NOT TARGET c2wallet-signer)
+    add_subdirectory(src/family/bitcoin/signer)
+endif()
+if(NOT TARGET c2wallet-artifact)
+    add_subdirectory(src/family/bitcoin/artifact)
+endif()
 
 add_executable(c2wallet-qt-signer
     src/main.cpp
@@ -64,6 +77,8 @@ add_executable(c2wallet-qt-signer
     src/shell/PageImport.cpp
     src/shell/PageConstructConvert.cpp
     src/shell/PageScan.cpp
+    src/shell/PageBuildTx.cpp
+    src/shell/PageSign.cpp
 )
 
 # The wired pages include the C++20 hdkeys/convert public headers; build the
@@ -86,6 +101,8 @@ target_link_libraries(c2wallet-qt-signer PRIVATE
     c2wallet-hdkeys
     c2wallet-convert
     c2wallet_monero
+    c2wallet-signer
+    c2wallet-artifact
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -147,7 +164,9 @@ if(C2WALLET_QT_BUILD_TESTS)
     # dashscript interpreter + system libsecp256k1; no Qt, no networking.
     # Standalone via:
     #   cmake -S ui/c2wallet-qt/src/family/bitcoin/signer -B build-signer -DC2WALLET_QT_BUILD_TESTS=ON
-    add_subdirectory(src/family/bitcoin/signer)
+    if(NOT TARGET c2wallet-signer)
+        add_subdirectory(src/family/bitcoin/signer)
+    endif()
 
     # M5-A: the Qt-free Family-A AIR-GAP TRANSFER ARTIFACTS
     # (family/bitcoin/artifact) — the PSBT-like unsigned container

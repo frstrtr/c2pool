@@ -78,6 +78,7 @@ set(SIGNER_SOURCES
     Bip143.cpp
     Taproot.cpp
     Signer.cpp
+    SignSession.cpp
     ${C2WALLET_SRC}/secure/SecureString.cpp
     ${DASHSCRIPT_SOURCES}
 )
@@ -116,4 +117,13 @@ if(C2WALLET_QT_BUILD_TESTS OR _signer_standalone)
     add_executable(c2wallet-taproot-test tests/test_taproot.cpp)
     target_link_libraries(c2wallet-taproot-test PRIVATE c2wallet-signer)
     add_test(NAME taproot_kats COMMAND c2wallet-taproot-test)
+
+    # M6 slice-2a: the SignSession facade (GAP-1) + Amount (GAP-5) KATs. Links
+    # ONLY c2wallet-signer (dashscript closure) — UnsignedContainer is used
+    # header-only, so the btclibs include tree never enters this dashscript TU
+    # (the two-lib separation the c2wallet-dash lane proved). SignedContainer /
+    # crossgap_txid are KAT'd in the artifact library's own test.
+    add_executable(c2wallet-signsession-test tests/test_signsession.cpp)
+    target_link_libraries(c2wallet-signsession-test PRIVATE c2wallet-signer)
+    add_test(NAME signsession_kats COMMAND c2wallet-signsession-test)
 endif()
