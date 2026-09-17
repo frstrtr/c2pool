@@ -618,6 +618,25 @@ if (BUILD_TESTING)
     target_link_libraries(v37_convergence_supply_kat Threads::Threads)
     add_test(NAME v37_convergence_supply_kat COMMAND v37_convergence_supply_kat)
 
+    # ── Track A2 / Stage 2 APPLY: the repair at the cut-miss arm ────────────
+    # v37_convergence_apply_kat stands up TWO in-process nodes on a real socket
+    # transport, drops ONE of the winner's shares on the second node, and proves
+    # (a) the pre-Stage-2 DEFECT (cut_miss -> REFUSED -> owed(A) != owed(B)),
+    # (b) that a REPLAY of the winner's own ordered records, fetched over the
+    #     Stage-1 supply channel and gated on the winner's own cut_spine_digest,
+    #     lets the S3 re-drive fold E_b at that exact prefix so the two
+    #     owed_digests become BYTE-EQUAL across the settling block, and
+    # (c) that a repair which cannot verify still REFUSES and moves owed by zero.
+    # Consumer tree only: settle::fold_eb and OwedLedger::owed_digest() are
+    # untouched and no frozen wire golden moves. stdlib + POSIX sockets +
+    # Threads. SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed on BOTH
+    # build.yml --target lists so CI compiles AND runs it.
+    add_executable(v37_convergence_apply_kat v37_convergence_apply_kat.cpp)
+    target_compile_features(v37_convergence_apply_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_convergence_apply_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_convergence_apply_kat Threads::Threads)
+    add_test(NAME v37_convergence_apply_kat COMMAND v37_convergence_apply_kat)
+
     add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)
     target_compile_features(v37_owed_event_mmr_kat PRIVATE cxx_std_20)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)

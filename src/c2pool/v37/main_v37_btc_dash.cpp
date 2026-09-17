@@ -165,6 +165,8 @@
 #include <c2pool/v37/carrier_ingest.hpp>              // CarrierIngest, MemShareTracker
 #include <c2pool/v37/carrier_index.hpp>               // LiveMainchainIndex / SyntheticMainchainIndex (A2 step-b real index)
 #include <c2pool/v37/carrier_net.hpp>                 // CarrierPeerNode (ICarrierTransport over sockets)
+#include <c2pool/v37/carrier_repair.hpp>              // ★ Stage 2 APPLY: RepairDriver, FrameVaultChainReader, replay_to_cut
+#include <c2pool/v37/carrier_supply.hpp>              // Stage 1 SUPPLY: SupplyService (serve) + SupplyRequester (fetch)
 #include <c2pool/v37/carrier_send.hpp>                // CarrierSendQueue (A2 send-side: own stratum wins -> carriers, off the hot path)
 #include <c2pool/v37/w3_relay.hpp>                    // CarrierRelay
 #include <c2pool/v37/w3_wire_freeze.hpp>              // W3-B5 freeze: boot selfcheck + relay policy gate
@@ -404,6 +406,18 @@ int main(int argc, char** argv) {
     std::unique_ptr<CarrierPeerNode>        carrier_net;
     std::unique_ptr<CarrierRelay>           carrier_relay;
     std::unique_ptr<CarrierSendQueue>       carrier_send;   // declared AFTER carrier_index/carrier_relay: destroyed FIRST (it references both)
+    // ── Stage 1 SUPPLY + ★ Stage 2 APPLY ────────────────────────────────────
+    // Declared AFTER carrier_relay / carrier_index (they reference both) so the
+    // destruction order is repair -> fetch/serve -> relay -> index, i.e. nothing
+    // can be serving or replaying while the structures under it are torn down.
+    std::unique_ptr<SupplyService>          supply_serve;   // answers GETORDER / GETFRAMES out of the FrameVault
+    std::unique_ptr<SupplyRequester>        supply_fetch;   // asks for them, hash-verified, fail-closed
+    std::shared_ptr<DescriptorTable>        replay_desc_tbl;
+    std::unique_ptr<FrameVaultChainReader>  replay_reader;  // persist::ISharechainReader over our OWN vault
+    std::unique_ptr<RepairStore>            replay_store;   // the w6 record families the replay reads
+    std::unique_ptr<persist::ReplayDriver>  replay_driver;  // the w6 §5 slow path, bound to both
+    std::unique_ptr<RepairDriver>           repair_driver;  // ★ the repair at the cut-miss arm
+    std::atomic<std::uint64_t>              repair_armed{0}, repair_arm_failed{0};
     // Inbound telemetry (never consensus): what the peer path did with each
     // frame. Atomic: one reader thread per peer drives set_inbound.
     struct InboundStats {
@@ -499,6 +513,120 @@ int main(int argc, char** argv) {
             carrier_send->set_log([](bool warn, const std::string& line) { if (warn) LOG_WARNING << line; else LOG_INFO << line; });
             carrier_send->start();
         }
+        // ═══════════════════════════════════════════════════════════════════
+        // ★ STAGE 1 SUPPLY + STAGE 2 APPLY — the repair channel, stood up here.
+        //
+        // Before this the daemon instantiated NEITHER half of the supply channel:
+        // the FrameVault retained bytes nobody could ask for, and a node that had
+        // fallen behind could not even NAME the carriers it was missing. Now:
+        //
+        //   SERVE   SupplyService answers a peer's GETORDER ("your ordered
+        //           carrier ids for [a, P)") and GETFRAMES ("the bytes for these
+        //           ids") out of the FrameVault, under a per-peer token bucket
+        //           and the transport's own reply ceiling. It never admits and
+        //           never appends — serving a frame is byte-for-byte the same act
+        //           as broadcasting it.
+        //   FETCH   SupplyRequester asks for them, verifies hash(bytes) == the id
+        //           it asked for, and fails CLOSED on a lie, a gap or a timeout.
+        //   REPAIR  RepairDriver turns a refused peer-block cut into a fetch, a
+        //           replay into a SCRATCH engine through the w6 slow path, and —
+        //           only when the replayed digest equals the winner's own
+        //           cut_spine_digest — a VERIFIED SettlementView that
+        //           XbtcNode's cut-miss arm folds E_b over. A repair that cannot
+        //           verify refuses exactly as the arm refused before Stage 2.
+        //
+        // Both halves land on the ONE control demux (frame[0] >= 0x80); each
+        // ignores what is not its own, and an old peer with no demux at all
+        // answers REJECT_BAD_VERSION and keeps the socket (Stage-1 CS-7).
+        {
+            auto send_ctl = [&](CarrierPeerNode::PeerId pid,
+                                const std::vector<std::uint8_t>& f) {
+                return carrier_net->send_to(pid, f);
+            };
+            supply_serve = std::make_unique<SupplyService>(carrier_relay->vault(), send_ctl);
+            supply_fetch = std::make_unique<SupplyRequester>(send_ctl);
+            // Our own committed commitment at a prefix. Under ruling A this is an
+            // ASSERTION on the wire; the asker's REPLAY is what checks it.
+            supply_serve->set_spine_probe(
+                [&](std::uint32_t, std::uint64_t pos) -> std::optional<::v37::bytes32> {
+                    auto s = node.engine().snapshot(cfg.lane_chain);
+                    if (s && s->next_pos == pos) return s->digest;
+                    return std::nullopt;
+                });
+
+            // The w6 §5 slow path over our OWN retained order: the same reader +
+            // driver the repair uses, bound here to the LIVE vault so the local
+            // self-audit below ("does my own retained order reproduce my own
+            // committed digest?") runs the identical code as a peer repair.
+            replay_desc_tbl = std::make_shared<DescriptorTable>();
+            replay_reader   = std::make_unique<FrameVaultChainReader>(
+                carrier_relay->vault(), static_cast<std::uint32_t>(cfg.lane_chain), replay_desc_tbl);
+            replay_store    = std::make_unique<RepairStore>();
+            replay_driver   = std::make_unique<persist::ReplayDriver>(*replay_store, *replay_reader);
+
+            repair_driver = std::make_unique<RepairDriver>(
+                *supply_fetch, *carrier_index, static_cast<std::uint32_t>(cfg.lane_chain),
+                cfg.lane_params);
+            repair_driver->set_log([](bool warn, const std::string& line) {
+                if (warn) LOG_WARNING << line; else LOG_INFO << line;
+            });
+            supply_fetch->set_on_order([&](CarrierPeerNode::PeerId pid, const CtrlOrder& o) {
+                repair_driver->on_order(pid, o);
+            });
+            supply_fetch->set_on_frames([&](CarrierPeerNode::PeerId pid,
+                                            const std::vector<VerifiedFrame>& v) {
+                repair_driver->on_frames(pid, v);
+            });
+            // #1656: ids the server HOLDS but cannot put on this channel. For a
+            // replay that is fatal (we need every carrier of the prefix), so it
+            // is named and the repair refuses rather than waiting for bytes that
+            // are never coming.
+            supply_fetch->set_on_unservable([&](CarrierPeerNode::PeerId pid,
+                                                const std::vector<::v37::bytes32>& ids) {
+                repair_driver->on_unservable(pid, ids);
+            });
+            supply_fetch->set_on_fail([&](CarrierPeerNode::PeerId pid, SupplyFailure f) {
+                repair_driver->on_fail(pid, f);
+            });
+            carrier_net->set_control([&](CarrierPeerNode::PeerId pid,
+                                         const std::vector<std::uint8_t>& f) {
+                supply_serve->on_control(pid, f);
+                supply_fetch->on_control(pid, f);
+            });
+            // #1655: a (re)connecting peer arms the re-offer sweep, and the
+            // re-offer must not re-push what W2 has already accounted.
+            carrier_net->set_on_peer_connect([&] { carrier_relay->note_peer_connected(); });
+            carrier_relay->set_reoffer_dedup_probe(
+                [&](const ::v37::bytes32& h) { return carrier_relay->seen().seen(h); });
+            carrier_net->set_on_peer_event([&](CarrierPeerNode::PeerId pid, bool up) {
+                if (up) return;
+                supply_serve->forget_peer(pid);
+                supply_fetch->forget_peer(pid);
+                repair_driver->forget_peer(pid);
+            });
+
+            // ★ the cut-miss arm's repair source: a NON-BLOCKING read of what a
+            // completed replay has already PROVEN at exactly (prefix, commitment).
+            node.set_repair_source([&](::v37::ChainId c, std::uint64_t pos,
+                                       const ::v37::bytes32& spine) {
+                return repair_driver->verified_view(static_cast<std::uint32_t>(c), pos, spine);
+            });
+            // ★ S3 RE-DRIVE: a finished repair retries the one-shot peer win.
+            repair_driver->set_redrive([&](const std::string& bid, const RepairResult& r) {
+                const auto reg = bed.redrive_peer_block_found(bid);
+                if (reg.registered)
+                    LOG_INFO << "[v37-dash] S-1c/S3 RE-DRIVE credited peer block " << bid
+                             << " after a verified repair (" << r.carriers << " carriers, P="
+                             << r.pushes << ") owed_digest=" << hex32(node.ledger().owed_digest());
+                else
+                    LOG_WARNING << "[v37-dash] S-1c/S3 RE-DRIVE of " << bid
+                                << " still REFUSED: " << reg.reason
+                                << " — repair outcome was " << repair_outcome_name(r.outcome);
+            });
+            LOG_INFO << "[v37-dash] carrier SUPPLY channel up (serve+fetch) and the Stage-2 "
+                        "REPAIR driver armed at the S-1c cut-miss arm";
+        }
+
         carrier_net->set_inbound([&](const std::vector<std::uint8_t>& f) {
             // decode + W3-B5 policy + W2 admit + account + relay (CarrierRelay
             // serializes; one reader thread per peer lands here).
@@ -578,8 +706,40 @@ int main(int argc, char** argv) {
                             carrier_inbound.cut_refused.fetch_add(1, std::memory_order_relaxed);
                             LOG_ERROR << "[v37-dash] S-1c REFUSED peer block " << w.bid << " h=" << w.h_b
                                       << " cut{P=" << w.cut_next_pos << " spine=" << hex32(w.cut_spine_digest)
-                                      << "}: " << reg.reason
-                                      << " — our owed_digest will NOT converge with the winner's for this block";
+                                      << "}: " << reg.reason;
+                            // ── ★ STAGE 2: ARM THE REPAIR ────────────────────
+                            // A cut_miss / cut_mismatch says "my order at P is
+                            // not the winner's", and that question is settled by
+                            // REPLAYING the winner's own ordered records — not by
+                            // the owed ledger and not by waiting. Ask a peer for
+                            // the order over [0, P) and the bytes behind it; if
+                            // the replay lands on the winner's own commitment the
+                            // S3 re-drive above credits this very block, and if
+                            // it does not, the refusal stands exactly as it is.
+                            //
+                            // ANY connected peer can serve the prefix (it is the
+                            // sharechain's order, not one node's opinion), so we
+                            // ask the first that accepts the request.
+                            bool armed = false;
+                            if (repair_driver) {
+                                for (const auto pid : carrier_net->peer_ids()) {
+                                    if (repair_driver->arm(pid, w.bid, w.cut_next_pos,
+                                                           w.cut_spine_digest)) {
+                                        armed = true;
+                                        repair_armed.fetch_add(1, std::memory_order_relaxed);
+                                        LOG_INFO << "[v37-dash] S-1c REPAIR armed for " << w.bid
+                                                 << " at P=" << w.cut_next_pos << " via peer " << pid;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!armed) {
+                                repair_arm_failed.fetch_add(1, std::memory_order_relaxed);
+                                LOG_ERROR << "[v37-dash] S-1c no repair could be armed for " << w.bid
+                                          << " (no peer accepted the request, or the cut is already "
+                                          << "in flight) — our owed_digest will NOT converge with the "
+                                          << "winner's for this block";
+                            }
                         }
                     }
                 }
@@ -872,6 +1032,64 @@ int main(int argc, char** argv) {
                      << " credited=" << carrier_inbound.cut_credited.load()
                      << " refused=" << carrier_inbound.cut_refused.load()
                      << " own_echo=" << carrier_inbound.cut_own.load() << "}";
+            // ★ STAGE 1 SUPPLY + STAGE 2 APPLY, at stop.
+            if (supply_serve && supply_fetch && repair_driver) {
+                const SupplyServeStats sv = supply_serve->stats();
+                const SupplyFetchStats fs = supply_fetch->stats();
+                const RepairStats      rp = repair_driver->stats();
+                LOG_INFO << "[v37-dash] supply stop: serve{order=" << sv.order_served
+                         << " order_ids=" << sv.order_ids << " frames=" << sv.frames_served
+                         << " bytes=" << sv.bytes_served << " throttled=" << sv.throttled
+                         << " truncated=" << sv.frames_truncated
+                         << " unservable=" << sv.frames_unservable << "}"
+                         << " fetch{orders=" << fs.orders_ok << " frames=" << fs.frames_verified
+                         << " hash_mismatch=" << fs.hash_mismatch << " missing=" << fs.missing_id
+                         << " timeouts=" << fs.timeouts << "}";
+                // ★ THE CONVERGENCE LINE an operator reads: how many peer-block
+                // cuts this node could not fold at, how many a REPLAY repaired,
+                // and how many stayed refused (each of those is one block whose
+                // owed_digest this node does NOT share with the winner).
+                LOG_INFO << "[v37-dash] repair stop: armed=" << rp.armed
+                         << " arm_failed=" << repair_arm_failed.load()
+                         << " coalesced=" << rp.coalesced
+                         << " replayed=" << rp.replayed
+                         << " REPAIRED=" << rp.repaired
+                         << " REFUSED=" << rp.refused
+                         << " redrives=" << rp.redriven
+                         << " frames_fetched=" << rp.frames_fetched
+                         << " order_failed=" << rp.order_failed
+                         << " fetch_failed=" << rp.fetch_failed
+                         << " unservable=" << rp.unservable
+                         << " | arm{repair_wanted=" << node.s1c_stats().repair_wanted
+                         << " repair_hit=" << node.s1c_stats().repair_hit
+                         << " repair_missing=" << node.s1c_stats().repair_missing
+                         << " cut_miss=" << node.s1c_stats().cut_miss
+                         << " cut_mismatch=" << node.s1c_stats().cut_mismatch << "}"
+                         << " held_for_redrive=" << bed.repairable_held();
+                // ── the REPAIR HORIZON this node can serve a peer from ────────
+                // The w6 §5.2 backward walk, driven through the FrameVault-backed
+                // ISharechainReader: how far back our retained order still
+                // reaches. A peer whose cut is older than this cannot be repaired
+                // by us, and that is the number that says so.
+                if (replay_driver && replay_reader) {
+                    const FrameVault& v = carrier_relay->vault();
+                    const std::uint64_t lo = v.lowest_position(), hi = v.highest_position();
+                    std::size_t walk = 0;
+                    const VaultOrder ends = replay_reader->order(lo, hi + 1, kCtrlMaxIdsPerOrder);
+                    if (ends.status == VaultOrderStatus::OK && !ends.ids.empty()) {
+                        const auto fwd = replay_driver->walk_lane_forward(
+                            ends.ids.back().id, ends.ids.front().id,
+                            persist::ReplayDriver::walk_ceiling(0, hi + 1));
+                        walk = fwd ? fwd->size() : 0;
+                    }
+                    LOG_INFO << "[v37-dash] repair horizon: vault entries=" << v.size()
+                             << " bytes=" << v.bytes()
+                             << " positions[" << lo << ".." << hi << "]"
+                             << " lane_walk=" << walk << " carriers"
+                             << " (a peer cut below position " << lo
+                             << " cannot be repaired from this node)";
+                }
+            }
         }
         if (live_index) {
             const auto ist = live_index->stats();
