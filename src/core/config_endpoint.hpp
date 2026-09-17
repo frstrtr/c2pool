@@ -217,6 +217,9 @@ enum class ApplyStatus {
     NotPublished,      // no snapshot published yet
     RejectNoToken,     // token missing or wrong
     RejectValidation,  // schema/batch/referee validation failed
+    RejectNoRuntimeSetter, // key has no registered runtime setter -> cannot be
+                           // enacted at runtime, so it must NEVER be reported
+                           // applied (money-mirror-lie guard; any class)
     NeedConfirm,       // money keys present, nonce issued, NOTHING applied
     RejectMoneyGate,   // nonce miss/mismatch or bad address -> TRIPWIRE fired
     Applied,           // token ok, validated, (money confirmed) -> applied

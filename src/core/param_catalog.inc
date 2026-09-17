@@ -548,7 +548,7 @@ C2P_PARAM("embedded.fold_live_expect", Embedded, HEX, RESTART, C_DASH, LIT, "", 
 C2P_PARAM("embedded.fold_checkscripts", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "consensus-exact input-script check")
   C2P_ALIAS("embedded.fold_checkscripts", BIN_DASH, "--embedded-fold-checkscripts", FLAG)
 
-C2P_PARAM("embedded.tx_inject", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "#157 miner/user tx-injection (opt-in, default OFF, reward-neutral)")
+C2P_PARAM("embedded.tx_inject", Embedded, BOOL, MONEY_LIVE, C_DASH, LIT, "false", NONE, "#157 miner/user tx-injection arm (opt-in, default OFF, reward-neutral; MONEY-path: arming changes mined-block body -> the full two-phase money-nonce + M0 tripwire gate, Slice B)")
   C2P_ALIAS("embedded.tx_inject", BIN_DASH, "--embedded-tx-inject", FLAG)
 
 C2P_PARAM("embedded.tx_inject_hex", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "#157 local tx-inject submit file (raw tx hex per line)")

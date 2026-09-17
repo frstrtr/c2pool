@@ -5,6 +5,66 @@ they change the money path and/or arm a feature, so they are **not implemented**
 in this PR and require an explicit operator tap on wake. This PR ships slice (0)
 only — a read-only status surface.
 
+## Update (2026-09) — what has since landed on master
+
+The sequencing below has largely happened; this section is the authoritative
+current state, the design that follows is retained for rationale:
+
+- **M3 (#1606) is MERGED and INLINE.** The rate limiter + bounded-work sandbox
+  live directly inside `NodeCoinState::submit_inject` (`inject_rate_limiter.hpp`
+  + `inject_sandbox.hpp`). submit_inject now carries an `InjectOrigin{Local,Peer}`
+  parameter that selects a SPLIT rate budget: a peer flood exhausts only the peer
+  budget and can never starve the operator's own local inject.
+- **Slice A (#1616) is MERGED.** `POST /api/config/apply` is the live, fail-closed,
+  money-gated write path (loopback control token + two-phase money nonce bound to
+  the exact diff + M0 tripwire). Dormant until an operator registers a token.
+- **Slice B is RE-LANDED onto master (this PR)**, M3-origin-correct:
+  - `embedded.tx_inject` is reclassified `RESTART -> MONEY_LIVE`, so arming it
+    runs the full two-phase money-nonce gate through the SAME apply path.
+  - The runtime arm setter flips BOTH the M1 submit gate AND the p2p tx_inject
+    sink together; the peer sink installs with `InjectOrigin::Peer` (M3 split
+    preserved); disarm clears the sink.
+  - `POST /api/tx-inject/submit` (loopback-only) hands a raw consensus tx to
+    `submit_inject` with `InjectOrigin::Local` (the operator's own reserved
+    budget). It is installed through `thread_safe_wrap`, so it runs on the node
+    io_context strand, never the web thread; a wedged strand degrades to a 5xx.
+  - **`control_token` is now REQUIRED on the submit body** (checked via the same
+    `check_control_token()`; 403 on miss), so once armed no other local process
+    can spend the operator's inject rate-budget. `raw_tx` must be even-length hex.
+  - **Submit timeout is idempotent-safe.** The submit fn marshals onto the node
+    strand via `thread_safe_wrap`, which abandons the wait after
+    `PRODUCER_DISPATCH_TIMEOUT` (~10s) and throws — but the task it posted still
+    runs `submit_inject` when the strand recovers. The `/api/tx-inject/submit`
+    route therefore answers a **scoped 504** whose body states the tx *may still
+    have been accepted — do not blindly resubmit*. A resubmit is in any case a
+    no-op: `submit_inject → Mempool::add_inject` refuses a duplicate txid by name
+    (`inject-already-known`). This is scoped to the submit route; the shared
+    `thread_safe_wrap` timeout behaviour is unchanged for every other caller.
+  - **Runtime disarm does NOT evict already-admitted injects.** `arm_tx_inject(false)`
+    (a money-gated `embedded.tx_inject=false` apply) flips the M1 submit gate OFF
+    and clears the p2p sink, so **no NEW injects** are admitted — but injects
+    already in `m_inject_pool` ride until they expire or are evicted by the normal
+    reconcile path; disarm does not flush the pool. For immediate removal of
+    in-flight injects, restart the node without the flag.
+  - The apply path now **REFUSES any key it cannot actually enact at runtime**,
+    closing the mirror-vs-runtime lie (a key applied with no live setter would
+    swap the reporting mirror behind `GET /api/config` while the running process
+    keeps the OLD value). Two guards, in order:
+    - `validate_apply_batch` refuses **plain RESTART-class keys** by a named
+      cause (`restart_unsupported`) until a restart-aware applier exists.
+    - `apply_config` then refuses **any key with no registered runtime setter**
+      (`no_runtime_setter`, HTTP 400), REGARDLESS of money/restart/live class and
+      BEFORE any money nonce is issued. This is what closes the hole for
+      **money-class** keys: `validate_apply_batch` partitions `is_money()` into
+      `money_keys` *before* the RESTART refusal, so a `MONEY_RESTART` key
+      (`money.node_owner_fee_pct` / `_address` / `_script`) or a
+      `MONEY_LIVE`-without-setter key (`global.payout_window`) would otherwise
+      reach the mirror swap with no setter. In this build `main_dash` registers a
+      setter only for `embedded.tx_inject`, so it alone is runtime-appliable (it
+      still runs the full two-phase money-nonce gate); every other key must be
+      changed in the config file + a restart.
+
+
 ## Background — what exists today
 
 Node-side tx-inject runtime (DASH only, flag `--embedded-tx-inject`, **default
