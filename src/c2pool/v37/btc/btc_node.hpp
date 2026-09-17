@@ -182,6 +182,15 @@ struct PeerWinOutcome {
     // the refusal shapes, each its own bit so an operator never has to guess
     bool  cut_miss = false;             // P is not a prefix THIS node published
     bool  cut_digest_mismatch = false;  // P published here with a DIFFERENT digest
+    // ★ Stage 2 (APPLY): the fold ran over a REPAIRED view — a projection the
+    // repair driver replayed from the winner's own ordered records and proved
+    // against the winner's own cut_spine_digest, because OUR ring had no view at
+    // P. Diagnostic: the credit is byte-identical to the ring-served one by
+    // construction (same prefix, same commitment, same fold_eb).
+    bool  repaired = false;
+    // The repair was WANTED here (one of the two cut bits was set). Says
+    // "this refusal is the repairable kind", whether or not a repair existed.
+    bool  repair_wanted = false;
     bool  refused_payout_emitted = false;  // winner already paid a coinbase (unreproducible)
     bool  refused_too_late = false;        // H_b already below our finalize cursor
     bool  already_known = false;           // our own win, or a duplicate descriptor
@@ -204,6 +213,10 @@ struct S1PeerStats {
     std::uint64_t refused_late = 0;  // H_b at or below our finalize cursor
     std::uint64_t already_known = 0; // our own win, or a duplicate
     std::uint64_t owed_diverged = 0; // owed_digest_at_win != ours at receipt
+    // ★ Stage 2 (APPLY) — the repair at this arm.
+    std::uint64_t repair_wanted  = 0; // refusals of the repairable kind (either cut bit)
+    std::uint64_t repair_hit     = 0; // a VERIFIED repaired view was available and used
+    std::uint64_t repair_missing = 0; // no verified view: refused exactly as before
 };
 
 class XbtcNode {
@@ -430,19 +443,60 @@ public:
         if (!view) {
             out.cut_miss = !mismatch;
             out.cut_digest_mismatch = mismatch;
-            if (mismatch) {
-                ++m_s1p.cut_mismatch;
-                say_s1c(w, "REFUSED: we published the winner's prefix P with a DIFFERENT lane "
-                           "digest — the two nodes folded different records into the same prefix. "
-                           "This is a SHARECHAIN divergence, not a settlement one; the owed ledger "
-                           "cannot repair it");
-            } else {
-                ++m_s1p.cut_miss;
-                say_s1c(w, "REFUSED: the winner's prefix P is not a version THIS node published "
-                           "(older than the settlement ring, or the executor coalesced through "
-                           "it) — we will not fold at a neighbouring prefix (O2.3)");
+            out.repair_wanted = true;
+            ++m_s1p.repair_wanted;
+            // ── ★ STAGE 2 (APPLY): THE REPAIR AT THIS ARM ────────────────────
+            // Under ruling A (node-local order + winner-cut authority) BOTH bits
+            // above are the same repairable condition: "my local order at P is
+            // not the winner's". A dropped share SHORTENS our lane (P was never
+            // published here -> cut_miss); a different local multiset publishes P
+            // with other bytes (cut_digest_mismatch). Neither is repairable by
+            // the owed ledger — but both are repairable by REPLAYING the winner's
+            // own ordered records to P and checking the result against the
+            // winner's own commitment.
+            //
+            // m_repair is that check and nothing more. It returns a projection
+            // ONLY when a completed replay reached (cut_next_pos,
+            // cut_spine_digest) byte-exactly, so the two equalities below are
+            // belt-and-braces over a gate the repair driver has already applied.
+            // Whatever it hands back, the fold underneath is unchanged: E_b =
+            // settle::fold_eb(reward, view) at the winner's prefix, same single
+            // entry point, same strictness. The repair changes WHICH view the
+            // fold reads — never the fold, never the ledger, never when
+            // on_block_finalized fires.
+            if (m_repair) {
+                std::shared_ptr<const SettlementView> rv =
+                    m_repair(m_cfg.lane_chain, w.cut_next_pos, w.cut_spine_digest);
+                if (rv && rv->next_pos == w.cut_next_pos &&
+                    rv->digest == w.cut_spine_digest) {
+                    view = std::move(rv);
+                    out.repaired = true;
+                    ++m_s1p.repair_hit;
+                    say_s1c(w, "REPAIRED: our ring had no view at the winner's prefix P, but a "
+                               "replay of the winner's own ordered records reached P with the "
+                               "winner's own commitment — folding there, at that exact cut");
+                }
             }
-            return out;
+            if (!view) {
+                // Unrepaired: REFUSE and count EXACTLY as before Stage 2. We
+                // never fold at a neighbouring prefix (O2.3), and a repair that
+                // could not verify is the same as no repair at all.
+                ++m_s1p.repair_missing;
+                if (mismatch) {
+                    ++m_s1p.cut_mismatch;
+                    say_s1c(w, "REFUSED: we published the winner's prefix P with a DIFFERENT lane "
+                               "digest — the two nodes folded different records into the same prefix. "
+                               "The owed ledger cannot repair that; a replay of the winner's ordered "
+                               "records can, and has not (yet) verified");
+                } else {
+                    ++m_s1p.cut_miss;
+                    say_s1c(w, "REFUSED: the winner's prefix P is not a version THIS node published "
+                               "(older than the settlement ring, the executor coalesced through it, "
+                               "or we dropped a share the winner admitted) — we will not fold at a "
+                               "neighbouring prefix (O2.3); a repair, if one verifies, re-drives this");
+                }
+                return out;
+            }
         }
 
         // (e) the fold — settle::fold_eb, the SAME single entry point the winner
@@ -510,6 +564,22 @@ public:
         say_s1c(w, c.refusal.empty() ? "credited" : c.refusal);
         return out;
     }
+
+    // ── ★ Stage 2 (APPLY): the REPAIR SOURCE seam ───────────────────────────
+    // A pure, NON-BLOCKING lookup: "is there a projection at exactly this
+    // (chain, prefix, commitment) that a replay has already PROVEN?" Bound by
+    // the daemon to RepairDriver::verified_view (carrier_repair.hpp); unbound in
+    // every build that does not run a supply channel, in which case the cut-miss
+    // arm behaves byte-for-byte as it did before Stage 2.
+    //
+    // It must never block: the arm runs on the transport reader thread, and the
+    // block-winner descriptor races the D_conf deadline (refused_too_late). The
+    // async fetch/replay happens elsewhere; this only reads its result, and the
+    // S3 re-drive is what retries the one-shot refused win once it lands.
+    using RepairSourceFn = std::function<std::shared_ptr<const SettlementView>(
+        ::v37::ChainId chain, std::uint64_t next_pos, const ::v37::bytes32& spine)>;
+    void set_repair_source(RepairSourceFn f) { m_repair = std::move(f); }
+    bool has_repair_source() const { return static_cast<bool>(m_repair); }
 
     // A reorg dropped a block we found — dispose via the F1 driver (O3.5).
     void on_block_orphaned(const std::string& bid) {
@@ -677,6 +747,7 @@ private:
     WonBlockOutcome m_last_won;  // the last OWN win's disposition (diagnostics)
     S1PeerStats m_s1p;           // S-1c receive-side counters (diagnostics)
     EbCut       m_last_peer_cut; // the cut the last PEER win folded at (diagnostics)
+    RepairSourceFn m_repair;     // ★ Stage 2: verified-replay projection lookup
 
     bool m_opened = false;
     bool m_started = false;

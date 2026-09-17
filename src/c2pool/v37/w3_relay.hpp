@@ -137,6 +137,7 @@
 #include <string>
 #include <vector>
 
+#include "frame_vault.hpp"    // the unified bounded frame store (pos + hash indices)
 #include "w2_admission.hpp"   // ReceiptAdmitter, WorkEvent, W2_R_MAX, ...
 #include "w2_receipt.hpp"
 
@@ -661,6 +662,29 @@ struct ICarrierTransport {
 //       window (ReceiptAdmitter::window().contains(h)); when our window has
 //       already pruned the carrier, the entry is dropped unconditionally.
 // Memory is bounded independently by max_entries AND max_bytes (FIFO eviction).
+//
+// ── ★ STAGE 1 SUPPLY: THE RE-OFFER IS NOW A SUB-VIEW OF THE FRAME VAULT ────
+// The bytes themselves no longer live here. CarrierRelay owns ONE FrameVault
+// (frame_vault.hpp): one bounded store of verbatim CarrierWire frames, indexed
+// BY LANE POSITION and BY CARRIER HASH, retained back to the lane WINDOW
+// horizon (W, default 8640 positions) so a peer can be served an ordered prefix
+// [a, P). The re-offer keeps exactly the policy described above, but as a
+// SHALLOW RECENT SUB-VIEW over that store: a deque of SLOT references with the
+// re-offer's own (much tighter) entry / byte / age / attempt bounds. Every
+// CarrierReofferOptions field keeps its meaning and every re-offer counter keeps
+// its meaning; what changed is that the frame is stored ONCE, and that retiring
+// a carrier from the re-offer no longer throws its bytes away.
+//
+// ★ AND THAT IS THE FLAP-SAFETY PROPERTY. Before, `max_attempts` ERASED the
+// entry: a peer that connected and dropped repeatedly armed forced sweep after
+// forced sweep, burned every buffered entry's attempt budget, and DELETED the
+// only retained copy of carriers a different, well-behaved peer still needed.
+// Now the attempt cap retires a carrier from the SUB-VIEW only; its bytes stay
+// in the vault under the vault's own bounds. A flapping peer can no longer
+// evict another peer's entries — it can only exhaust its own re-offers.
+// The vault is written ONLY by our own admissions and our own broadcasts; a
+// peer cannot insert into it at all, so no peer can push another peer's bytes
+// out by volume either.
 // ═══════════════════════════════════════════════════════════════════════════
 struct CarrierReofferOptions {
     bool        enabled       = true;
@@ -774,6 +798,23 @@ public:
         m_reoffer_probe = std::move(p);
     }
 
+    // ── ★ the FRAME VAULT (Stage 1 supply) ──────────────────────────────────
+    // The one bounded store of verbatim carrier frames, indexed by lane
+    // POSITION and by carrier HASH. Exposed so the repair channel
+    // (carrier_supply.hpp SupplyService) can SERVE an ordered prefix and a
+    // bounded id set out of it WITHOUT taking the relay mutex: FrameVault is
+    // self-synchronizing and is always a leaf in the lock order.
+    //
+    // Nothing on this reference can admit, append, credit or fold. Handing a
+    // peer a frame out of it is byte-for-byte the same act as broadcasting that
+    // frame, and the receiver judges it exactly once through its own W2
+    // DedupWindow.
+    FrameVault& vault() { return m_vault; }
+    const FrameVault& vault() const { return m_vault; }
+    void set_vault_options(const FrameVaultOptions& o) { m_vault.set_options(o); }
+    FrameVaultOptions vault_options() const { return m_vault.options(); }
+    FrameVaultStats vault_stats() const { return m_vault.stats(); }
+
     // A peer (re)connected: ARM a forced sweep. O(1), lock-free, safe to call
     // from CarrierPeerNode's accept thread (it must NOT do the sweep itself —
     // that would run a flood on the accept loop and invert the relay/transport
@@ -811,14 +852,27 @@ public:
             // A periodic sweep re-offers only what under-delivered; a forced one
             // (a peer just joined) re-offers everything still inside the horizon.
             if (!forced && !it->under_delivered) { ++it; continue; }
-            const std::size_t reached = m_transport.broadcast(it->frame);
+            // The bytes live in the vault, once. A slot the vault has since
+            // evicted (or reused for a different carrier) simply leaves the
+            // sub-view — never a re-encode, so a re-offer can never drift from
+            // the frozen wire.
+            auto frame = m_vault.frame_at(it->slot, it->hash);
+            if (!frame) {
+                ++m_reoffer_stats.evicted_capacity;
+                it = erase_reoffer(it);
+                continue;
+            }
+            const std::size_t reached = m_transport.broadcast(*frame);
             ++it->attempts;
             ++sent;
             ++m_reoffer_stats.frames_reoffered;
-            m_reoffer_stats.bytes_reoffered += it->frame.size();
-            m_stats.observe_sent(it->frame.size(), reached ? reached : np);
+            m_reoffer_stats.bytes_reoffered += frame->size();
+            m_stats.observe_sent(frame->size(), reached ? reached : np);
             if (reached >= np) it->under_delivered = false;
             if (it->attempts >= m_reoffer_opt.max_attempts) {
+                // ★ FLAP SAFETY: retire from the SUB-VIEW only. The frame stays
+                // in the vault under the vault's own bounds, so a peer that
+                // flaps cannot delete bytes another peer still needs.
                 ++m_reoffer_stats.exhausted;
                 it = erase_reoffer(it);
             } else {
@@ -867,15 +921,25 @@ public:
         // W2's own window is the authority on credit-once.
         o.admission = m_admit(dr.carrier.carrier, dr.carrier.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);
-        if (o.admitted) m_stats.observe_accepted(re_encode(dr.carrier), dr.carrier);
-
-        // Relay onward only if novel to the relay layer (flood-fill dedup, §5.2).
-        // We re-encode the CLEANED carrier so a mis-bound receipt dropped at
-        // decode is never amplified onto the network.
-        if (novel_to_relay && o.admitted) {
-            m_seen.mark_and_test(dr.carrier.carrier.hash());
-            o.peers_reached = do_broadcast(dr.carrier);
-            o.relayed = o.peers_reached > 0;
+        if (o.admitted) {
+            // The CLEANED re-encode, computed ONCE and reused for the bloat
+            // accounting, the vault and the broadcast: a mis-bound receipt
+            // dropped at decode is never amplified onto the network, and never
+            // retained for supply either.
+            const std::vector<std::uint8_t> frame = re_encode(dr.carrier);
+            m_stats.observe_accepted(frame, dr.carrier);
+            // ★ Stage 1 supply: retain the exact bytes AND the (chain, position)
+            // -> carrier-hash row. This happens on EVERY admitted carrier, not
+            // only the ones we go on to broadcast — an inbound carrier the relay
+            // layer has already seen still occupies a lane position and still
+            // has to be servable.
+            vault_admit(dr.carrier.carrier, o.admission, frame);
+            // Relay onward only if novel to the relay layer (flood-fill dedup, §5.2).
+            if (novel_to_relay) {
+                m_seen.mark_and_test(dr.carrier.carrier.hash());
+                o.peers_reached = do_broadcast(dr.carrier.carrier, frame);
+                o.relayed = o.peers_reached > 0;
+            }
         }
         return o;
     }
@@ -889,10 +953,14 @@ public:
         o.cut = c.cut;
         o.admission = m_admit(c.carrier, c.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);
-        if (o.admitted) m_stats.observe_accepted(re_encode(c), c);
-        if (o.admitted && m_seen.mark_and_test(c.carrier.hash())) {
-            o.peers_reached = do_broadcast(c);
-            o.relayed = o.peers_reached > 0;
+        if (o.admitted) {
+            const std::vector<std::uint8_t> frame = re_encode(c);
+            m_stats.observe_accepted(frame, c);
+            vault_admit(c.carrier, o.admission, frame);   // ★ Stage 1 supply
+            if (m_seen.mark_and_test(c.carrier.hash())) {
+                o.peers_reached = do_broadcast(c.carrier, frame);
+                o.relayed = o.peers_reached > 0;
+            }
         }
         return o;
     }
@@ -916,10 +984,14 @@ public:
         // Unconditional append: no m_seen check, no backpressure gate.
         o.admission = m_admit(c.carrier, c.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);
-        if (o.admitted) m_stats.observe_accepted(re_encode(c), c);
+        std::vector<std::uint8_t> frame = re_encode(c);
+        if (o.admitted) {
+            m_stats.observe_accepted(frame, c);
+            vault_admit(c.carrier, o.admission, frame);   // ★ Stage 1 supply
+        }
         // Relay is best-effort and may defer; append already stands.
         m_seen.mark_and_test(c.carrier.hash());
-        o.peers_reached = do_broadcast(c);
+        o.peers_reached = do_broadcast(c.carrier, frame);
         o.relayed = o.peers_reached > 0;
         return o;
     }
@@ -928,31 +1000,53 @@ private:
     std::vector<std::uint8_t> re_encode(const Carrier& c) const {
         return CarrierWire::encode(c);
     }
-    std::size_t do_broadcast(const Carrier& c) {
-        std::vector<std::uint8_t> frame = CarrierWire::encode(c);
+
+    // ★ Stage 1 supply: retain the carrier's exact frame AND the lane position
+    // its first push landed at. EmittedPush::pos is the carrier ARRIVAL position
+    // (w2_admission.hpp §4.4); a carrier with k accepted receipts occupies
+    // [pos, pos + 1 + k). This is the (chain, pos) -> carrier-hash row that
+    // exists NOWHERE ELSE in the tree — L0Slot, LaneRecord::Push, LaneSnapshot
+    // and SettlementView all carry no hash.
+    void vault_admit(const WorkEvent& carrier, const ReceiptAdmitter::Result& r,
+                     const std::vector<std::uint8_t>& frame) {
+        const std::uint64_t pos =
+            r.pushes.empty() ? FrameVault::kNoPos : r.pushes.front().pos;
+        m_vault.insert(carrier.chain_id, carrier.hash(), pos,
+                       static_cast<std::uint32_t>(r.pushes.size()), frame);
+    }
+
+    std::size_t do_broadcast(const WorkEvent& carrier,
+                             const std::vector<std::uint8_t>& frame) {
         std::size_t np = m_transport.n_peers();
         std::size_t reached = m_transport.broadcast(frame);
         m_stats.observe_sent(frame.size(), reached ? reached : np);
         // Keep the EXACT bytes for a bounded re-offer. `under_delivered` records
         // the DEFER case (0 peers, or a peer that dropped mid-flood) so a
         // periodic sweep can finish the job without re-flooding what already
-        // landed everywhere.
-        buffer_for_reoffer(c.carrier.hash(), std::move(frame), reached < np || np == 0);
+        // landed everywhere. The bytes go to the VAULT (once); the re-offer
+        // holds a slot reference under its own, much tighter bounds. A frame we
+        // broadcast without admitting (the block-winner path) is retained
+        // hash-only — no lane position to record.
+        buffer_for_reoffer(carrier.chain_id, carrier.hash(), frame,
+                           reached < np || np == 0);
         return reached;
     }
 
-    // ── re-offer buffer internals (all under m_mtx) ─────────────────────────
+    // ── re-offer sub-view internals (all under m_mtx) ───────────────────────
+    // A SLOT reference into the vault plus the re-offer's own policy state. The
+    // frame itself is NOT duplicated here.
     using Clock = std::chrono::steady_clock;
-    struct ReofferEntry {
-        bytes32                   hash{};
-        std::vector<std::uint8_t> frame;
-        Clock::time_point         at{};
-        unsigned                  attempts = 0;
-        bool                      under_delivered = false;
+    struct ReofferRef {
+        bytes32           hash{};
+        std::uint64_t     slot = 0;
+        std::size_t       nbytes = 0;      // for the sub-view's own byte cap
+        Clock::time_point at{};
+        unsigned          attempts = 0;
+        bool              under_delivered = false;
     };
 
-    std::deque<ReofferEntry>::iterator erase_reoffer(std::deque<ReofferEntry>::iterator it) {
-        m_reoffer_bytes -= it->frame.size();
+    std::deque<ReofferRef>::iterator erase_reoffer(std::deque<ReofferRef>::iterator it) {
+        m_reoffer_bytes -= it->nbytes;
         return m_reoffer.erase(it);
     }
 
@@ -982,7 +1076,8 @@ private:
         }
     }
 
-    void buffer_for_reoffer(const bytes32& h, std::vector<std::uint8_t>&& frame,
+    void buffer_for_reoffer(std::uint32_t chain, const bytes32& h,
+                            const std::vector<std::uint8_t>& frame,
                             bool under_delivered) {
         if (!m_reoffer_opt.enabled) return;
         if (frame.size() > m_reoffer_opt.max_bytes) return;   // never bufferable
@@ -1001,13 +1096,19 @@ private:
         if (m_reoffer.size() + 1 > m_reoffer_opt.max_entries ||
             m_reoffer_bytes + frame.size() > m_reoffer_opt.max_bytes)
             return;                                            // cannot fit: drop
-        ReofferEntry e;
+        // Store the bytes ONCE, in the vault. A carrier admitted here already
+        // has a row (with its lane position); this is an idempotent refresh for
+        // it, and the only insert for a frame we broadcast without admitting.
+        auto slot = m_vault.insert(chain, h, FrameVault::kNoPos, 0, frame, now);
+        if (!slot) return;                                     // vault refused it
+        ReofferRef e;
         e.hash = h;
+        e.slot = *slot;
+        e.nbytes = frame.size();
         e.at = now;
         e.under_delivered = under_delivered;
-        m_reoffer_bytes += frame.size();
-        e.frame = std::move(frame);
-        m_reoffer.push_back(std::move(e));
+        m_reoffer_bytes += e.nbytes;
+        m_reoffer.push_back(e);
         ++m_reoffer_stats.buffered;
     }
 
@@ -1018,10 +1119,16 @@ private:
     RelaySeenSet m_seen;
     CarrierBloatStats m_stats;
 
-    // re-offer state (delivery only; never consensus)
+    // ★ the ONE bounded frame store (Stage 1 supply). Self-synchronizing and a
+    // leaf in the lock order, so the repair channel can serve from it without
+    // ever taking m_mtx. Written only by our own admissions / broadcasts.
+    FrameVault                       m_vault;
+
+    // re-offer state (delivery only; never consensus) — a SHALLOW SUB-VIEW of
+    // m_vault: slot references plus the re-offer's own tighter bounds.
     CarrierReofferOptions            m_reoffer_opt{};
     CarrierReofferStats              m_reoffer_stats{};
-    std::deque<ReofferEntry>         m_reoffer;
+    std::deque<ReofferRef>           m_reoffer;
     std::size_t                      m_reoffer_bytes = 0;
     Clock::time_point                m_last_sweep{};
     std::atomic<bool>                m_reoffer_forced{false};

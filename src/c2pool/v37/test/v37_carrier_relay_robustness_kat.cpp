@@ -533,6 +533,15 @@ static void test_rr4_slow_peer_does_not_stall_others() {
 // ═══════════════════════════════════════════════════════════════════════════
 // RR-5 — per-connection frame integrity: concurrent writers never interleave a
 // frame's length prefix or body on ONE socket.
+//
+// TAG RANGE (Stage 1 supply): the synthetic frames below are identified by
+// their repeated first byte, and that byte must stay INSIDE the CarrierWire
+// body range 0x01..0x7f. carrier_net.hpp now demuxes frame[0] >= 0x80 to the
+// repair-control channel BEFORE handle_inbound, so a synthetic tag of 0x80 or
+// above would be routed to the control handler and never reach set_inbound at
+// all. That is the namespace split working, not a transport regression; the
+// property RR-5 pins (whole, un-interleaved frames on one connection) is
+// unaffected and is exercised identically with a body-range tag.
 // ═══════════════════════════════════════════════════════════════════════════
 static void test_rr5_no_frame_interleaving() {
     std::printf("-- RR-5 concurrent writers never interleave a frame\n");
@@ -541,6 +550,9 @@ static void test_rr5_no_frame_interleaving() {
 
     constexpr int kThreads = 4;
     constexpr int kEach = 60;
+    constexpr std::uint8_t kTagBase = 0x40;      // body range; see the note above
+    static_assert(kTagBase + kThreads <= 0x80,
+                  "RR-5 tags must stay below the control-opcode base (0x80)");
     std::atomic<int> received{0};
     std::atomic<int> corrupt{0};
     CarrierPeerNode R;
@@ -548,7 +560,7 @@ static void test_rr5_no_frame_interleaving() {
         ++received;
         if (f.empty()) { ++corrupt; return; }
         const std::uint8_t tag = f[0];
-        if (tag < 0xA0 || tag >= 0xA0 + kThreads) { ++corrupt; return; }
+        if (tag < kTagBase || tag >= kTagBase + kThreads) { ++corrupt; return; }
         for (std::uint8_t b : f) if (b != tag) { ++corrupt; return; }
     });
     CHECK(R.add_peer("127.0.0.1", S.listen_port()));
@@ -560,7 +572,7 @@ static void test_rr5_no_frame_interleaving() {
             for (int i = 0; i < kEach; ++i) {
                 const std::size_t len = 128 + static_cast<std::size_t>(t) * 4096 +
                                         static_cast<std::size_t>(i % 11) * 97;
-                const std::vector<std::uint8_t> f(len, static_cast<std::uint8_t>(0xA0 + t));
+                const std::vector<std::uint8_t> f(len, static_cast<std::uint8_t>(kTagBase + t));
                 (void)S.broadcast(f);
             }
         });
