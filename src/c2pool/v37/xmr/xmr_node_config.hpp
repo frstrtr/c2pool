@@ -310,6 +310,32 @@ struct XmrNodeConfig {
     // VOID, which is the honest cost and is exactly why this is not the default.
     bool            no_daemon_rpc = false;
 
+    // --- the SOLO (fully self-contained, peerless) configuration ------------
+    //
+    // --native-solo. p2p-first already removes the daemon from the find path;
+    // this removes the NETWORK from it as well. One process, its own chain from
+    // the locally assembled genesis block, its own template, its own hashing
+    // (--mine), its own find, its own finalize -- with nothing else running on
+    // the machine and nothing on the wire.
+    //
+    // It is a STRICT EXTENSION of p2p-first and turns three things on together,
+    // because any one of them without the others is a broken configuration
+    // rather than a weaker one:
+    //   (1) zero --native-connect peers becomes legal (and the genesis blob is
+    //       assembled locally: BootMode::LocalGenesis, since there is nobody to
+    //       ask for it);
+    //   (2) the node is force-synced -- "synced" is defined against a peer
+    //       cohort and there is no cohort, so without this the template arm's
+    //       readiness gate never opens;
+    //   (3) a found block that reached no peer but that our OWN chain index
+    //       accepted is booked as found (P2pBlockPublisher::enable_solo_own_index).
+    //
+    // WHAT IT COSTS, stated rather than hidden: a solo find is attested by our
+    // own index and by nothing else. That is the correct and only available
+    // claim on a private chain -- we ARE the network there -- and it is why
+    // this mode refuses mainnet outright below.
+    bool            native_solo = false;
+
     // --- storage ------------------------------------------------------------
     // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).
     // Set to override the settlement-store directory (tests set a temp dir).
@@ -374,9 +400,42 @@ inline std::string arm_order_refusal(const XmrNodeConfig& c) {
     if (c.template_source != TemplateSourceMode::Native)
         return "--arm-order p2p-first requires --xmr-template-source native: a find path whose "
                "template came from get_miner_data is not daemonless";
-    if (c.native_connect.empty())
+    if (c.native_connect.empty() && !c.native_solo)
         return "--arm-order p2p-first requires at least one --native-connect <ip:port> levin peer: "
-               "with no peer there is no chain to find on and nowhere to relay a found block";
+               "with no peer there is no chain to find on and nowhere to relay a found block "
+               "(--native-solo is the deliberate exception: a private chain of our own, with no "
+               "network to relay to)";
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// --native-solo's OWN preconditions, kept as a pure function for the same
+// reason arm_order_refusal() is: the thing the daemon refuses on and the thing
+// the KAT pins must be one piece of code.
+//
+// Solo is fail-closed on its network. A node that mines a chain nobody else
+// has, and books the proceeds on the strength of its own index alone, is a
+// correct regtest rig and a catastrophic mainnet one -- and on testnet or
+// stagenet it would silently fork away from the real chain at the genesis
+// block, which is a confusing way to waste a day rather than a danger. So the
+// mode is regtest-only, by refusal and not by documentation.
+// ---------------------------------------------------------------------------
+inline std::string solo_refusal(const XmrNodeConfig& c) {
+    if (!c.native_solo) return {};
+    if (c.arm_order != ArmOrderMode::P2PFirst)
+        return "--native-solo requires --arm-order p2p-first: a solo node has no daemon to fall "
+               "back to, so the daemon-first find path has nothing to be first";
+    if (c.network != MoneroNetwork::Regtest)
+        return "--native-solo is regtest-only: a peerless node builds a chain of its own from the "
+               "genesis block, which on a real network is a private fork nobody else will ever "
+               "see and whose blocks are worth nothing";
+    if (!c.native_connect.empty())
+        return "--native-solo takes no --native-connect peers: 'solo' and 'dial these peers' are "
+               "two different runs, and silently ignoring one of them would make the evidence "
+               "unreadable";
+    if (!c.native_anchor_path.empty())
+        return "--native-solo boots from the locally assembled genesis block, so --native-anchor "
+               "has nothing to do: pick one trust root";
     return {};
 }
 

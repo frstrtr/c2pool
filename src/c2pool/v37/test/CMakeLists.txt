@@ -405,6 +405,41 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_m3_arm_order_kat COMMAND v37_xmr_m3_arm_order_kat)
 
     # ------------------------------------------------------------------
+    # --native-solo -- the FULLY self-contained (peerless, daemonless) find.
+    #
+    #   v37_xmr_daemonless_selfmine_kat
+    #     M3 removed the daemon from the find path but not the NETWORK: the
+    #     genesis blob was asked for over levin, and a found block was booked
+    #     only once a peer had received it. This pins the two seams that remove
+    #     the last peer -- the locally assembled genesis blob (checked by the
+    #     SAME id gate the wire path uses, against monerod's own captured bytes)
+    #     and the publisher's opt-in own-index booking -- together with every
+    #     place they must still refuse: a flipped nonce byte, a foreign genesis,
+    #     an index that said no, a disabled RandomX gate, and solo on any
+    #     network but regtest.
+    #
+    #     The load-bearing NEGATIVE is that solo OFF is unchanged: zero peers
+    #     still books nothing, whatever our own index did. Without that case,
+    #     turning solo on would be indistinguishable from removing the gate.
+    #
+    #     No sockets, no daemon, no RandomX, no threads.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_daemonless_selfmine_kat v37_xmr_daemonless_selfmine_kat.cpp)
+    target_compile_features(v37_xmr_daemonless_selfmine_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_daemonless_selfmine_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_daemonless_selfmine_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_daemonless_selfmine_kat COMMAND v37_xmr_daemonless_selfmine_kat)
+
+    # ------------------------------------------------------------------
     # c2pool#1551 -- the SAME-HEIGHT double-block refusal, decided prefer-own
     # within bounds.
     #

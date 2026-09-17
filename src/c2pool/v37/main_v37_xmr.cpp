@@ -333,6 +333,10 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         publisher = std::make_unique<o2::P2pBlockPublisher>(*hooks.p2p_relay, submit_q,
                                                             candidate_lookup);
         publisher->enable_network_relay(rx.network_blocks_allowed());   // fail-closed gate
+        // SOLO: a peerless node has no peer receipt to wait for, so the block
+        // is booked on our own index's acceptance instead -- opt-in, counted
+        // apart from relayed(), and refused everywhere else.
+        publisher->enable_solo_own_index(cfg.native_solo);
     }
     submitter.enable_network_submit(!p2p_publish && rx.network_blocks_allowed());
     strat::IShareSink& publish_sink =
@@ -626,13 +630,15 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
         if (p2p_publish) {
             std::printf("  p2p publish: calls=%llu relayed=%llu peers_written=%llu refused=%llu "
-                        "reached_nobody=%llu stale=%llu\n",
+                        "reached_nobody=%llu stale=%llu | solo_own_index=%s landed=%llu\n",
                         static_cast<unsigned long long>(publisher->calls()),
                         static_cast<unsigned long long>(publisher->relayed()),
                         static_cast<unsigned long long>(publisher->peers()),
                         static_cast<unsigned long long>(publisher->refused()),
                         static_cast<unsigned long long>(publisher->failed()),
-                        static_cast<unsigned long long>(publisher->stale()));
+                        static_cast<unsigned long long>(publisher->stale()),
+                        publisher->solo_own_index_enabled() ? "ON" : "off",
+                        static_cast<unsigned long long>(publisher->solo_landed()));
             const std::string pe = publisher->last_error();
             if (!pe.empty()) std::printf("  p2p publish: last=%s\n", pe.c_str());
         } else {
@@ -722,7 +728,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
 // Returns null on refusal, with the reason already printed.
 // ---------------------------------------------------------------------------
 static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const XmrNodeConfig& cfg) {
-    if (cfg.native_connect.empty()) {
+    if (cfg.native_connect.empty() && !cfg.native_solo) {
         std::printf("REFUSED: the native Monero node needs at least one --native-connect "
                     "<ip:port> levin peer (it dials only what it is told to)\n");
         return nullptr;
@@ -733,9 +739,13 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
     ncfg.net                  = native_net_of(cfg.network);
     ncfg.connect              = cfg.native_connect;
     ncfg.p2p_bind_ip          = cfg.native_p2p_bind_ip;
-    ncfg.boot                 = cfg.native_anchor_path.empty()
-                                    ? ::c2pool::xmr::native::rt::BootMode::Genesis
-                                    : ::c2pool::xmr::native::rt::BootMode::Anchor;
+    // THE TRUST ROOT. Solo has no peer to ask for the genesis blob, so it
+    // assembles the blob locally and feeds it to the same id-checking gate.
+    ncfg.boot                 = cfg.native_solo
+                                    ? ::c2pool::xmr::native::rt::BootMode::LocalGenesis
+                                    : (cfg.native_anchor_path.empty()
+                                           ? ::c2pool::xmr::native::rt::BootMode::Genesis
+                                           : ::c2pool::xmr::native::rt::BootMode::Anchor);
     ncfg.anchor_path          = cfg.native_anchor_path;
     // The daemon endpoint is the C6 PARITY judge, and under daemon-first also
     // the submit arm. Under p2p-first it is the parity judge and nothing else:
@@ -743,7 +753,10 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
     // --no-daemon-rpc withholds it entirely, and then the node has no daemon
     // arm to make a call with -- the strongest form of the claim, at the cost
     // of the parity judge.
-    if (!cfg.no_daemon_rpc) {
+    // Solo implies it: there is no daemon to configure an endpoint for, and
+    // leaving one wired would have the C6 parity judge dial a dead port every
+    // status tick and print failures that mean nothing.
+    if (!cfg.no_daemon_rpc && !cfg.native_solo) {
         ncfg.monerod_rpc_host = cfg.monerod.rpc_host;
         ncfg.monerod_rpc_port = cfg.monerod.rpc_port;
     }
@@ -754,7 +767,12 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
     // whose template silently came from the daemon is not a daemonless find,
     // and the operator should not be able to weaken the claim by accident.
     ncfg.fallback             = p2p_first ? false : cfg.native_template_fallback;
-    ncfg.force_synced         = cfg.native_force_synced;
+    // "synced" is defined against a PEER COHORT. A solo node has no cohort, so
+    // the flag is not an operator convenience there but the only way the
+    // readiness gate can ever open -- and asking the operator to remember a
+    // second flag that has exactly one correct value would only invite a
+    // confusing failure.
+    ncfg.force_synced         = cfg.native_force_synced || cfg.native_solo;
     ncfg.allow_unverified_pow = cfg.native_allow_unverified_pow;
     ncfg.parity               = true;
     ncfg.parity_ledger_path   = cfg.resolved_settle_db_path() + "/xmr_parity_ledger.json";
@@ -767,13 +785,18 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
                                     ? ::c2pool::xmr::native::TieBreak::PreferOwn
                                     : ::c2pool::xmr::native::TieBreak::FirstSeen;
 
-    std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned peer(s)) "
-                "feeds the option-B assembler%s\n",
-                cfg.native_connect.size(),
-                p2p_first ? "; it is ALSO the tip, the canonical test and the block relay "
-                            "(--arm-order p2p-first): monerod is not on the find path"
-                          : "; monerod stays the parity judge and the submit arm, and is NOT "
-                            "on the template path");
+    if (cfg.native_solo)
+        std::printf("template source: NATIVE, SOLO — no peers, no daemon, no anchor: the chain "
+                    "starts at the locally assembled genesis block (id-checked against the "
+                    "pinned one) and every block after it is one this process mined itself\n");
+    else
+        std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned peer(s)) "
+                    "feeds the option-B assembler%s\n",
+                    cfg.native_connect.size(),
+                    p2p_first ? "; it is ALSO the tip, the canonical test and the block relay "
+                                "(--arm-order p2p-first): monerod is not on the find path"
+                              : "; monerod stays the parity judge and the submit arm, and is NOT "
+                                "on the template path");
 
     auto native = std::make_unique<o2::NativeTemplateBackend>(std::move(ncfg));
     std::string why;
@@ -792,10 +815,19 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
 }
 
 static int run_live(const XmrNodeConfig& cfg) {
-    std::printf("c2pool-v37-xmr: EXPERIMENTAL prototype — network=%s monerod=%s:%u (zmq %u) "
-                "arm-order=%s\n",
-                to_string(cfg.network), cfg.monerod.rpc_host.c_str(),
-                cfg.monerod.rpc_port, cfg.monerod.zmq_port, to_string(cfg.arm_order));
+    // The banner names the daemon it will talk to. Under --native-solo there is
+    // none -- no endpoint is wired anywhere (start_native_backend() withholds
+    // it) -- so printing the default 18081 there would advertise a connection
+    // the process never makes, which is exactly the claim this mode is about.
+    if (cfg.native_solo)
+        std::printf("c2pool-v37-xmr: EXPERIMENTAL prototype — network=%s monerod=NONE (--native-solo: "
+                    "no daemon endpoint is configured) arm-order=%s\n",
+                    to_string(cfg.network), to_string(cfg.arm_order));
+    else
+        std::printf("c2pool-v37-xmr: EXPERIMENTAL prototype — network=%s monerod=%s:%u (zmq %u) "
+                    "arm-order=%s\n",
+                    to_string(cfg.network), cfg.monerod.rpc_host.c_str(),
+                    cfg.monerod.rpc_port, cfg.monerod.zmq_port, to_string(cfg.arm_order));
     if (cfg.network == MoneroNetwork::Mainnet && !cfg.i_understand_mainnet) {
         std::printf("REFUSED: mainnet requires --i-understand-mainnet (prototype safety)\n");
         return 2;
@@ -806,6 +838,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     // daemon refuses on and the thing the KAT pins are the same code.
     const bool p2p_first = (cfg.arm_order == ArmOrderMode::P2PFirst);
     if (const std::string refusal = arm_order_refusal(cfg); !refusal.empty()) {
+        std::printf("REFUSED: %s\n", refusal.c_str());
+        return 2;
+    }
+    if (const std::string refusal = solo_refusal(cfg); !refusal.empty()) {
         std::printf("REFUSED: %s\n", refusal.c_str());
         return 2;
     }
@@ -1265,6 +1301,9 @@ int main(int argc, char** argv) {
         else if (a == "--native-p2p-bind") cfg.native_p2p_bind_ip = next("");
         else if (a == "--native-anchor") cfg.native_anchor_path = next("");
         else if (a == "--native-force-synced") cfg.native_force_synced = true;
+        // The fully self-contained (peerless, daemonless) run. See
+        // solo_refusal() in xmr_node_config.hpp for what it refuses and why.
+        else if (a == "--native-solo") cfg.native_solo = true;
         else if (a == "--native-allow-unverified-pow") cfg.native_allow_unverified_pow = true;
         else if (a == "--native-template-fallback") {
             const std::string m = next("on");
@@ -1374,6 +1413,15 @@ int main(int argc, char** argv) {
                 "  --native-p2p-bind <ip>       source address for the node's outbound dials\n"
                 "  --native-anchor <path>       trust-anchor bundle (cold start above genesis)\n"
                 "  --native-force-synced        set the publication gate on a private chain (OR-C2-8)\n"
+                "  --native-solo                FULLY SELF-CONTAINED (regtest only): no peers, no\n"
+                "                               daemon, no anchor. The chain starts at the locally\n"
+                "                               assembled genesis block (id-checked against the\n"
+                "                               pinned one), the template is ours, and with --mine\n"
+                "                               the hashing is ours too -- one process, nothing on\n"
+                "                               the wire. Requires --arm-order p2p-first; implies\n"
+                "                               --no-daemon-rpc and the private-chain sync gate. A\n"
+                "                               found block is booked on OUR OWN index accepting it\n"
+                "                               (a weaker claim than a peer receipt; counted apart).\n"
                 "  --native-allow-unverified-pow  a build with no RandomX may connect blocks it did\n"
                 "                               not verify (opt-in, loud, never a default)\n"
                 "  --native-template-fallback <on|off>\n"
