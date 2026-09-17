@@ -17,6 +17,21 @@
 //     already consume — ONE raw signed tx hex PER LINE (the --pin-local-tx-hex
 //     / --embedded-tx-inject-hex format proven at block 2518186). No PSBT
 //     finalization online; c2pool takes finished bytes.
+//
+// M6 slice-2c additions (backward-compatible, additive records only — the 2a
+// records 0x01..0x10 are byte-for-byte unchanged, so a 2a parser reads a 2c
+// container and simply skips the new record types):
+//
+//   * GAP-3 R_DIGEST (0x06): a sha256 over ALL preceding container bytes,
+//     appended by to_hex() and, WHEN PRESENT, verified by from_hex() (which
+//     REFUSES on mismatch). It closes the 2a "a mutated output value is only
+//     caught by the human eye" hole: a single flipped byte anywhere in the
+//     container now fails the parse. Old parsers skip record 0x06 (forward-
+//     compat), so this does NOT break already-merged 2a consumers.
+//   * GAP-4 R_INPUT_SCRIPT (0x11): carries the P2SH/P2WSH redeem/witness (or
+//     tapleaf) script the offline Sign tab needs for script inputs — e.g. the
+//     LTC+DOGE P2MS-in-P2SH donation pattern — so the operator no longer has to
+//     paste it by hand. Additive; the 2a per-input record (0x10) is unchanged.
 
 #include "Digest.hpp"
 
@@ -50,6 +65,21 @@ struct UnsignedInput {
     std::string derivation_hint;      // e.g. "m/84'/0'/0'/0/0"; may be empty
 };
 
+// GAP-4 (slice-2c): the redeem / witness / tapleaf script an input needs to be
+// signed, carried in-band so the offline signer does not depend on the operator
+// pasting it. `kind` selects which script slot it fills.
+enum class InputScriptKind : uint8_t {
+    Redeem  = 0, // P2SH redeemScript
+    Witness = 1, // P2WSH witnessScript
+    Tapleaf = 2, // taproot leaf script (reserved; slice-2a signer is not taproot-script)
+};
+
+struct InputScript {
+    uint64_t        input_index = 0; // index into UnsignedContainer::inputs
+    InputScriptKind kind = InputScriptKind::Redeem;
+    Bytes           script;          // the redeem/witness/tapleaf script bytes
+};
+
 // PSBT-like container: a binary, typed-record blob (magic + version + TLV
 // records) that is then hex-encoded, so the whole artifact is one raw-hex
 // string that EMBEDS the unsigned tx bytes verbatim — a "raw-hex superset".
@@ -59,14 +89,16 @@ struct UnsignedContainer {
     SighashAlgebra             algebra = SighashAlgebra::Legacy;
     Bytes                      unsigned_tx;       // raw unsigned tx bytes
     std::vector<UnsignedInput> inputs;
+    std::vector<InputScript>   input_scripts;     // GAP-4 (slice-2c); may be empty
     std::string                preflight_verdict; // optional c2pool pre-flight verdict
 
     // Serialize to the hex artifact. Empty string if the encoded artifact would
     // exceed MAX_TRANSFER_BYTES (oversize refusal); `err` set in that case.
+    // Appends the GAP-3 R_DIGEST record last.
     std::string to_hex(std::string& err) const;
 
     // Parse an artifact produced by to_hex(). std::nullopt + `err` on any
-    // malformed / truncated / bad-magic input.
+    // malformed / truncated / bad-magic input, or on a GAP-3 R_DIGEST mismatch.
     static std::optional<UnsignedContainer> from_hex(const std::string& hex, std::string& err);
 
     // sha256d of the unsigned tx bytes, rendered as a display txid — the
@@ -74,9 +106,14 @@ struct UnsignedContainer {
     std::string unsigned_txid_display() const {
         return sha256d_display(unsigned_tx);
     }
+
+    // GAP-4: the script carried for `input_index` with `kind`, or nullopt if
+    // none is present. The offline Sign path uses this for script inputs.
+    std::optional<Bytes> script_for_input(uint64_t input_index, InputScriptKind kind) const;
 };
 
 bool operator==(const UnsignedInput& a, const UnsignedInput& b);
+bool operator==(const InputScript& a, const InputScript& b);
 bool operator==(const UnsignedContainer& a, const UnsignedContainer& b);
 
 // Signed container (offline -> online): the c2pool loader format verbatim.

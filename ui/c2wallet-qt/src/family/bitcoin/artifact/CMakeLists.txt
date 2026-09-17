@@ -53,6 +53,9 @@ set(ARTIFACT_SOURCES
     TransferContainer.cpp
     QrTransport.cpp
     ValidateSeam.cpp
+    TxIntrospect.cpp             # slice-2c: unsigned<->signed confusion guard
+    QrRender.cpp                 # slice-2c: GAP-8 QR bitmap layer (nayuki qrcodegen)
+    qrcodegen/qrcodegen.c        # embedded MIT single-file QR encoder (C)
 )
 
 add_library(c2wallet-artifact STATIC ${ARTIFACT_SOURCES} ${REUSED_SOURCES})

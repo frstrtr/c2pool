@@ -2,6 +2,7 @@
 #include "shell/MainWindow.hpp"
 
 #include "shell/PageBuildTx.hpp"
+#include "shell/PageAirGap.hpp"
 #include "shell/PageBuildTxMonero.hpp"
 #include "shell/PageConstructConvert.hpp"
 #include "shell/PageImport.hpp"
@@ -69,13 +70,13 @@ MainWindow::MainWindow(QWidget* parent)
     navList_->addItem(QStringLiteral("Sign & Self-Verify (Monero)"));
     stack_->addWidget(new PageSignMonero(stack_));
 
+    // Slice-2c: the Air-Gap Transfer screen is now WIRED - file + multi-frame
+    // animated QR (GAP-8) transport of the unsigned/signed artifacts in both
+    // families, with the corruption ladder (GAP-3 R_DIGEST / Monero keccak
+    // footer) and the unsigned<->signed confusion guard. It links only the
+    // Qt-free artifact + Monero libraries, so the link-guard stays green.
     navList_->addItem(QStringLiteral("Air-Gap Transfer"));
-    stack_->addWidget(makeStubPage(
-        QStringLiteral("Air-Gap Transfer"),
-        QStringLiteral("File/paste transfer of the unsigned and signed artifacts "
-                       "is available inline on the Build Transaction and Sign & "
-                       "Self-Verify screens (slice-2a). Multi-frame animated QR "
-                       "and the c2pool validate-seam dry-run land in slice-2c.")));
+    stack_->addWidget(new PageAirGap(stack_));
 
     connect(navList_, &QListWidget::currentRowChanged,
             stack_, &QStackedWidget::setCurrentIndex);

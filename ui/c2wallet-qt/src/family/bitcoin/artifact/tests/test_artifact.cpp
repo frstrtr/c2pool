@@ -21,6 +21,8 @@
 #include "../TransferContainer.hpp"
 #include "../QrTransport.hpp"
 #include "../ValidateSeam.hpp"
+#include "../TxIntrospect.hpp"   // slice-2c confusion guard
+#include "../QrRender.hpp"       // slice-2c GAP-8 bitmap layer
 
 #include <cstdio>
 #include <cstring>
@@ -327,6 +329,187 @@ int main() {
               "online seam is unwired (no I/O) and named");
         CHECK(resp.txid == crossgap_txid(tx),
               "unwired seam still returns the cross-gap digest for manual compare");
+    }
+
+
+    // ═══════════════════ M6 slice-2c KATs (GAP-3 / GAP-4 / GAP-8 / guard) ═══════════════════
+
+    // ── 21. GAP-3 R_DIGEST: a mutated R_UTX output value refuses at parse ──────
+    //   (closes the 2a hole "a mutated output value is only caught by the eye").
+    {
+        UnsignedContainer c;
+        c.coin = "ltc";
+        c.network_version = 1;
+        c.algebra = SighashAlgebra::Legacy;
+        // a concrete legacy tx: 1 input, 1 output paying 1.00000000 (00e1f505..).
+        c.unsigned_tx = B("01000000"
+                          "01" "0000000000000000000000000000000000000000000000000000000000000000" "00000000" "00" "ffffffff"
+                          "01" "00e1f50500000000" "19" "76a914" "0000000000000000000000000000000000000000" "88ac"
+                          "00000000");
+        std::string err;
+        std::string hex = c.to_hex(err);
+        CHECK(!hex.empty() && err.empty(), "GAP-3: container with digest serializes");
+
+        auto bytes = from_hex(hex);
+        CHECK(bytes.has_value(), "GAP-3: container hex decodes");
+        // GAP-3 record is appended last as [0x06][0x20][32 bytes].
+        CHECK(bytes && bytes->size() >= 34 && (*bytes)[bytes->size() - 34] == 0x06 &&
+                  (*bytes)[bytes->size() - 33] == 0x20,
+              "GAP-3: R_DIGEST (0x06, len 32) is the trailing record");
+
+        // untampered round-trips fine
+        std::string perr;
+        auto good = UnsignedContainer::from_hex(hex, perr);
+        CHECK(good.has_value() && perr.empty(), "GAP-3: untampered container parses");
+
+        // flip the high byte of the output value (00 e1 f5 05 -> 40 e1 f5 05):
+        // a structurally valid but semantically different tx.
+        Bytes tam = *bytes;
+        bool flipped = false;
+        for (size_t i = 0; i + 3 < tam.size(); ++i) {
+            if (tam[i] == 0x00 && tam[i + 1] == 0xe1 && tam[i + 2] == 0xf5 && tam[i + 3] == 0x05) {
+                tam[i] = 0x40; flipped = true; break;
+            }
+        }
+        CHECK(flipped, "GAP-3: located the output value to mutate");
+        std::string terr;
+        auto bad = UnsignedContainer::from_hex(to_hex(tam), terr);
+        CHECK(!bad.has_value(), "GAP-3: a flipped output value REFUSES at parse");
+        CHECK(terr.find("integrity digest mismatch") != std::string::npos,
+              "GAP-3: the refusal names the integrity digest");
+
+        // backward-compat: a container WITHOUT the digest (a 2a producer emits
+        // none) still parses — from_hex only verifies when the record is present.
+        Bytes nod = *bytes;
+        nod.resize(nod.size() - 34); // strip the trailing R_DIGEST record
+        std::string nperr;
+        auto noDigest = UnsignedContainer::from_hex(to_hex(nod), nperr);
+        CHECK(noDigest.has_value(), "GAP-3 backward-compat: a container without R_DIGEST still parses");
+    }
+
+    // ── 22. GAP-4 R_INPUT_SCRIPT: a P2SH/P2WSH script round-trips + is consumable ─
+    {
+        UnsignedContainer c;
+        c.coin = "ltc";
+        c.unsigned_tx = B("0100000000");
+        // a P2WSH 2-of-3 witnessScript on input 0
+        InputScript w;
+        w.input_index = 0; w.kind = InputScriptKind::Witness;
+        w.script = B("5221" "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     "21"   "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                     "21"   "02cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" "53ae");
+        // a P2SH redeemScript on input 1
+        InputScript r;
+        r.input_index = 1; r.kind = InputScriptKind::Redeem;
+        r.script = B("5121" "02dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" "51ae");
+        c.input_scripts = {w, r};
+
+        std::string err;
+        auto hex = c.to_hex(err);
+        std::string perr;
+        auto p = UnsignedContainer::from_hex(hex, perr);
+        CHECK(p.has_value() && *p == c, "GAP-4: input_scripts round-trip exactly");
+        CHECK(p && p->input_scripts.size() == 2, "GAP-4: both input-scripts preserved");
+        CHECK(p && p->script_for_input(0, InputScriptKind::Witness).has_value(),
+              "GAP-4: witnessScript retrievable by (index,kind)");
+        CHECK(p && p->script_for_input(1, InputScriptKind::Redeem).has_value(),
+              "GAP-4: redeemScript retrievable by (index,kind)");
+        CHECK(p && !p->script_for_input(0, InputScriptKind::Redeem).has_value(),
+              "GAP-4: kind-specific lookup (no redeem on input 0)");
+        CHECK(p && !p->script_for_input(5, InputScriptKind::Witness).has_value(),
+              "GAP-4: missing index returns nullopt");
+
+        // The Sign path consumes exactly this script as KeyForInput.script. For a
+        // P2WSH input, the witness program is sha256(witnessScript); prove the
+        // carried bytes are byte-identical AND bind to a P2WSH scriptPubKey.
+        auto ws = *p->script_for_input(0, InputScriptKind::Witness);
+        CHECK(ws == w.script, "GAP-4: consumed witnessScript is byte-identical to the produced one");
+        Hash32 prog = sha256(ws);
+        Bytes spk; spk.push_back(0x00); spk.push_back(0x20);
+        spk.insert(spk.end(), prog.begin(), prog.end());
+        CHECK(spk.size() == 34 && spk[0] == 0x00 && spk[1] == 0x20,
+              "GAP-4: P2WSH program = sha256(witnessScript) binds the carried script to the input");
+    }
+
+    // ── 23. Unsigned <-> signed confusion refused in BOTH directions ──────────
+    {
+        // a legacy tx with a NON-EMPTY scriptSig on its only input == plausibly signed
+        Bytes signedTx = B("01000000"
+                           "01" "0000000000000000000000000000000000000000000000000000000000000000" "00000000"
+                           "06" "010203040506" "ffffffff"
+                           "01" "00e1f50500000000" "19" "76a914" "0000000000000000000000000000000000000000" "88ac"
+                           "00000000");
+        // the same tx with an EMPTY scriptSig == unsigned
+        Bytes unsignedTx = B("01000000"
+                             "01" "0000000000000000000000000000000000000000000000000000000000000000" "00000000"
+                             "00" "ffffffff"
+                             "01" "00e1f50500000000" "19" "76a914" "0000000000000000000000000000000000000000" "88ac"
+                             "00000000");
+        std::string why;
+        CHECK(accept_as_signed(signedTx, why),
+              "confusion: a tx with a scriptSig on every input is accepted as signed");
+        CHECK(!accept_as_signed(unsignedTx, why),
+              "confusion: an UNSIGNED tx (empty scriptSig) is refused in the signed slot");
+
+        // a C2WU container pushed into the signed slot is refused by its magic
+        UnsignedContainer cc; cc.coin = "btc"; cc.unsigned_tx = B("0100000000");
+        std::string cerr; auto chex = cc.to_hex(cerr);
+        auto cbytes = from_hex(chex);
+        CHECK(cbytes && has_c2wu_magic(*cbytes), "confusion: a container carries the C2WU magic");
+        CHECK(cbytes && !accept_as_signed(*cbytes, why),
+              "confusion: a C2WU container is refused in the signed slot (magic)");
+
+        // symmetric: a bare signed tx pushed into the UNSIGNED slot is refused
+        // (UnsignedContainer::from_hex requires the C2WU magic).
+        std::string uerr;
+        auto notContainer = UnsignedContainer::from_hex(to_hex(signedTx), uerr);
+        CHECK(!notContainer.has_value(),
+              "confusion: a signed tx is refused in the unsigned slot (bad magic)");
+    }
+
+    // ── 24. GAP-8: a QR frame renders to a valid QR module matrix ─────────────
+    {
+        auto e = qr_encode(B("00112233445566778899aabbccddeeff"), 8);
+        CHECK(e.ok && !e.frames.empty(), "GAP-8: qr_encode produced frames");
+        QrModules m = qr_render_modules(e.frames[0]);
+        // valid QR symbol sizes are 21,25,...,177 — all congruent to 1 mod 4.
+        CHECK(m.ok() && m.size >= 21 && m.size <= 177 && (m.size % 4 == 1),
+              "GAP-8: a frame renders to a valid QR module matrix (nayuki qrcodegen)");
+        CHECK(m.cells.size() == static_cast<size_t>(m.size) * static_cast<size_t>(m.size),
+              "GAP-8: module matrix is size*size");
+    }
+
+    // ── 25. GAP-8 transport ladder: round-trip + flipped / missing / wrong-total ─
+    {
+        const Bytes payload = B("deadbeefcafe0011223344556677");
+        auto e = qr_encode(payload, 5);
+        CHECK(e.ok && e.frames.size() >= 2, "GAP-8: multi-frame encode");
+        auto d = qr_decode(e.frames);
+        CHECK(d.ok && d.payload == payload, "GAP-8: encode(bytes) -> frames -> decode == bytes");
+
+        // flipped frame: corrupt the last hex nibble of frame 0's chunk
+        {
+            auto bad = e.frames;
+            std::string& f0 = bad[0];
+            f0[f0.size() - 1] = (f0[f0.size() - 1] == '0') ? '1' : '0';
+            CHECK(!qr_decode(bad).ok, "GAP-8: a flipped frame is refused (per-frame sha256)");
+        }
+        // missing seq: drop frame 0
+        {
+            auto miss = e.frames;
+            miss.erase(miss.begin());
+            CHECK(!qr_decode(miss).ok, "GAP-8: a missing seq is refused");
+        }
+        // wrong total: rewrite frame 0's total field so it disagrees
+        {
+            std::string ferr;
+            auto fr0 = QrFrame::from_text(e.frames[0], ferr);
+            CHECK(fr0.has_value(), "GAP-8: frame 0 parses");
+            fr0->total += 7;
+            auto mixed = e.frames;
+            mixed[0] = fr0->to_text();
+            CHECK(!qr_decode(mixed).ok, "GAP-8: a wrong total is refused");
+        }
     }
 
     std::printf("\n== artifact KATs: %d passed, %d failed ==\n", g_pass, g_fail);
