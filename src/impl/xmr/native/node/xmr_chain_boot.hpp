@@ -51,6 +51,27 @@
 // unbounded pre-boot backlog is the same unbounded allocation the queue caps
 // exist to prevent.
 //
+// GATE 4 (anchor path only): INSTALLED IS NOT TRUSTED. load_anchor() runs three
+// gates that judge the bundle against ITSELF, and says in its own banner that
+// the fourth -- fetch the block at bundle.height from peers and refuse to start
+// unless it hashes to bundle.id -- is the CALLER's, because it is the only one
+// that can catch a bundle which is internally perfect and names a block that is
+// not on this network. boot_from_anchor() below therefore does two things where
+// it used to do one: it installs the bundle in the index AND it arms
+// AnchorNetworkConfirm (node/xmr_anchor_confirm.hpp) with the height and id the
+// bundle pinned.
+//
+// While that gate is PENDING this class is transparent to nothing. Every
+// inbound blob is offered to the confirm and then DROPPED rather than forwarded
+// -- a node that connected blocks onto an unconfirmed trust root would be doing
+// exactly the work gate 4 exists to refuse -- and the serving reads that would
+// hand a block or a chain splice to a peer answer with nothing. The one read
+// that stays truthful and live is our_sync_data(): a levin handshake is a
+// PRECONDITION of the very fetch this gate needs, so advertising the anchor tip
+// we really did install is both honest and necessary. NativeNode::start() does
+// not return true until the confirm settles, so nothing above this class --
+// stratum, templates, settlement -- is ever offered an unconfirmed chain.
+//
 // SCOPE FENCE (standing XMR-lane rule): everything under src/impl/xmr/. No
 // consensus digest, no src/sharechain/v37.
 //
@@ -68,6 +89,7 @@
 
 #include "impl/xmr/native/anchor/xmr_anchor_load.hpp"
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
+#include "impl/xmr/native/node/xmr_anchor_confirm.hpp"
 #include "impl/xmr/native/consensus/xmr_block_id.hpp"
 #include "impl/xmr/native/consensus/xmr_block_parse.hpp"
 #include "impl/xmr/native/consensus/xmr_hf_table.hpp"
@@ -204,22 +226,87 @@ public:
         std::uint64_t chain_entries    = 0;
         std::string   why;                    // the last refusal, or the boot's own note
         ChainEntryNote last_entry{};
+        // GATE 4. Disarmed on the genesis path; Pending/Confirmed/Refused on the
+        // anchor path. `dropped_unconfirmed` is counted apart from
+        // `dropped_preboot` because the two mean different things: one is "we do
+        // not have a trust root yet", the other is "we have one and have not yet
+        // been allowed to believe it".
+        AnchorNetworkConfirm::Stats anchor{};
+        std::uint64_t dropped_unconfirmed = 0;
     };
 
     ChainBoot(ChainIndex& index, BootMode mode, Hash genesis_id, XmrNet net)
         : index_(index), mode_(mode), genesis_id_(genesis_id), net_(net) {}
 
-    // The anchor path boots before the network is touched at all.
+    // The anchor path boots before the network is touched at all -- and is NOT
+    // trusted when it returns. Gates 1..3 run inside load_anchor(); gate 4 is
+    // ARMED here and settled later, against peers, by AnchorConfirmDriver.
+    // Returning true means "installed and now owed a network confirm", which is
+    // why serving_ready() and not booted() is what the serving half consults.
     bool boot_from_anchor(const std::string& path_or_empty, XmrNet net,
                           const std::vector<std::uint64_t>& timestamps_60,
                           std::string& why) {
         AnchorBundle b;
         if (!load_anchor(path_or_empty, net, b, why)) return false;
         if (!index_.boot_from_anchor(b, timestamps_60, why)) return false;
+        // Armed BEFORE booted_ is published: on_objects() reads booted() first,
+        // and a blob that arrived in between must find the gate already up
+        // rather than a booted node with no gate at all.
+        confirm_.arm(b);
         std::lock_guard<std::mutex> lk(mu_);
         booted_ = true;
         stats_.booted = true;
-        stats_.why = "anchor at height " + std::to_string(b.height);
+        stats_.why = "anchor at height " + std::to_string(b.height)
+                   + " installed; " + anchor_boot_duty();
+        return true;
+    }
+
+    // ── RESUME: the third way a trust root arrives, and the reason it is HERE
+    // rather than at the index.
+    //
+    // A snapshot already contains the trust root -- it is the whole chain from
+    // the base the previous session booted on up to the frontier it reached --
+    // so a node that loads one is not owed a genesis seed. Loading it straight
+    // into the index left that fact where nobody could see it: this class kept
+    // `booted_ == false`, so the FIRST inbound blob went to try_seed_(), which
+    // seeds row zero with `ChainIndex::seed_direct` -- and seed_direct RESETS
+    // the index. The resumed chain was wiped to height 0 and re-walked from
+    // genesis, with every proof of work below the old frontier re-run. Observed
+    // exactly that way: "RESUMED at 600" and then "[tip] height=1..600" with
+    // "randomx hashes=601 verified=600" in the same run.
+    //
+    // Routing the load through the boot closes it structurally rather than by
+    // ordering: on_objects() and on_chain_entry() test booted() FIRST, so once
+    // this returns true try_seed_() is unreachable, the serving half forwards
+    // to the index (advertising the resumed tip instead of height 1), and the
+    // sync driver's booted predicate flips, so it asks for the next block
+    // rather than for genesis.
+    //
+    // GATE 4 IS NOT WEAKENED, and the check is repeated here rather than
+    // trusted to the caller's line order: an anchor that has been installed and
+    // NOT yet confirmed refuses the resume, because fast-forwarding along a
+    // chain the network has not vouched for is the work the gate exists to
+    // refuse. On the genesis path the confirm is Disarmed -- therefore ready()
+    // -- so nothing changes; on the anchor path this only ever runs after the
+    // confirm settled, and if it somehow does not, it fails closed.
+    //
+    // On ANY failure (a corrupt, foreign or otherwise unloadable image) the
+    // index is left as it was and `booted_` is untouched, so the caller falls
+    // back to the ordinary boot path: the genesis seed, or the anchor the
+    // network just confirmed.
+    bool resume_from_snapshot(const std::vector<std::uint8_t>& image, std::string& why) {
+        why.clear();
+        if (booted() && !confirm_.ready()) {
+            why = "refusing to resume over an unconfirmed anchor";
+            return false;
+        }
+        if (!index_.load_snapshot(image, why)) return false;
+        const auto t = index_.tip();
+        std::lock_guard<std::mutex> lk(mu_);
+        booted_       = true;
+        stats_.booted = true;
+        stats_.why    = "resumed from snapshot at height "
+                      + std::to_string(t ? t->height : 0) + "; no genesis seed owed";
         return true;
     }
 
@@ -228,9 +315,24 @@ public:
         return booted_;
     }
 
+    // GATE 4, the question the rest of this class asks before it does anything
+    // on a peer's behalf: is there a trust root AND has the network agreed to
+    // it? On the genesis path the confirm is Disarmed and ready() is true, so
+    // this is exactly booted() and nothing changes.
+    bool serving_ready() const { return booted() && confirm_.ready(); }
+
+    // The gate itself, for the driver that asks peers and for the status line.
+    AnchorNetworkConfirm&       anchor_confirm()       noexcept { return confirm_; }
+    const AnchorNetworkConfirm& anchor_confirm() const noexcept { return confirm_; }
+
     Stats stats() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return stats_;
+        Stats out;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            out = stats_;
+        }
+        out.anchor = confirm_.stats();
+        return out;
     }
 
     // The one id the genesis path is waiting for; the sync driver asks for it.
@@ -258,11 +360,33 @@ public:
                 return;
             }
         }
+        // GATE 4. This is the ONLY path the anchor block can arrive on, so the
+        // offer happens before any forwarding decision -- and the answer is
+        // dropped either way while the gate is unsettled, because a block
+        // connected onto an unconfirmed anchor is work done on a chain we have
+        // not yet earned the right to believe in.
+        if (!confirm_.ready()) {
+            const Hash wanted = confirm_.wanted();
+            for (const BlockEntry& b : blocks) {
+                if (confirm_.offer_blob(b.block_blob)) break;
+            }
+            for (const Hash& m : missed) {
+                if (m == wanted) { confirm_.note_missed(p.addr); break; }
+            }
+            if (!confirm_.ready()) {
+                drop_unconfirmed_("objects while the anchor is unconfirmed");
+                return;
+            }
+        }
         index_.on_objects(p, std::move(blocks), std::move(missed), peer_height);
     }
 
     void on_chain_entry(const PeerRef& p, ChainEntry&& e) override {
         note_entry_(e);
+        if (booted() && !confirm_.ready()) {
+            drop_unconfirmed_("chain entry while the anchor is unconfirmed");
+            return;
+        }
         if (!booted()) {
             // monerod puts the blob of the block at `start_height` in
             // `first_block`, so a locator that terminates at genesis gets the
@@ -281,6 +405,16 @@ public:
     void on_new_block(const PeerRef& p, BlockEntry&& block, std::uint64_t peer_height,
                       bool fluffy) override {
         if (!booted()) { drop_("pre-boot block push"); return; }
+        if (!confirm_.ready()) {
+            // A push is not an answer to our fetch, but it is still a block off
+            // this network, and if it happens to BE the anchor it settles the
+            // gate just as well.
+            (void)confirm_.offer_blob(block.block_blob);
+            if (!confirm_.ready()) {
+                drop_unconfirmed_("block push while the anchor is unconfirmed");
+                return;
+            }
+        }
         index_.on_new_block(p, std::move(block), peer_height, fluffy);
     }
 
@@ -308,6 +442,13 @@ public:
     }
 
     std::optional<ChainEntry> find_supplement(const std::vector<Hash>& peer_locator) const override {
+        // GATE 4: we do not splice a peer onto a chain we have not been allowed
+        // to believe in yet. The cost is stated honestly: monerod closes a
+        // connection it can find no common block with, so an UNCONFIRMABLE
+        // anchor loses peers here. That is the correct direction of failure --
+        // the anchor that peers can serve is the one they already have at our
+        // advertised top_id, and for it this branch is never taken.
+        if (booted() && !confirm_.ready()) return std::nullopt;
         if (booted()) return index_.find_supplement(peer_locator);
         for (const Hash& id : peer_locator) {
             if (id != genesis_id_) continue;
@@ -324,13 +465,34 @@ public:
     // We know the genesis ID before we hold its BYTES, and serving a block we
     // cannot produce is worse than reporting it missed.
     std::optional<BlockEntry> get_block_entry(const Hash& id, bool prune) const override {
-        if (booted()) return index_.get_block_entry(id, prune);
+        // GATE 4: serving a block is the most literal reading of "before it
+        // serves", so it is the first thing the unconfirmed state withholds.
+        if (booted() && confirm_.ready()) return index_.get_block_entry(id, prune);
         return std::nullopt;
     }
 
 private:
+    void drop_unconfirmed_(const char* what) {
+        std::lock_guard<std::mutex> lk(mu_);
+        ++stats_.dropped_unconfirmed;
+        stats_.why = what;
+    }
+
     bool try_seed_(const std::vector<std::uint8_t>& blob) {
         if (blob.empty()) return false;
+        // BELT, not the fix. seed_direct() RESETS the index, so seeding row zero
+        // into an index that already holds rows destroys them. On the real
+        // pre-boot path the index is empty and this is never taken; it is here
+        // so that any future caller that reaches the seed with a populated
+        // index is refused instead of being quietly destructive. The guard is
+        // deliberately NOT in ChainIndex::seed_direct: the KATs and the parity
+        // replay re-seed a populated index on purpose.
+        if (index_.tip().has_value()) {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++stats_.refusals;
+            stats_.why = "refusing to seed genesis over an index that already holds rows";
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lk(mu_);
             ++stats_.blobs_inspected;
@@ -377,13 +539,17 @@ private:
         stats_.why = what;
     }
 
-    ChainIndex&        index_;
-    BootMode           mode_;
-    Hash               genesis_id_;
-    XmrNet             net_;
-    mutable std::mutex mu_;
-    bool               booted_ = false;
-    Stats              stats_{};
+    ChainIndex&           index_;
+    BootMode              mode_;
+    Hash                  genesis_id_;
+    XmrNet                net_;
+    // GATE 4. Internally locked (it is fed on the verify thread and read from
+    // the consumer's), and Disarmed -- therefore ready() -- unless
+    // boot_from_anchor() armed it.
+    AnchorNetworkConfirm  confirm_{};
+    mutable std::mutex    mu_;
+    bool                  booted_ = false;
+    Stats                 stats_{};
 };
 
 } // namespace c2pool::xmr::native::rt

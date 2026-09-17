@@ -108,16 +108,10 @@ namespace node  = ::c2pool::xmr::node;
 // enum that resolves both, and this is the only place the daemon's own
 // MoneroNetwork is mapped onto it.
 // ---------------------------------------------------------------------------
-static inline ::c2pool::xmr::native::rt::NativeNet native_net_of(MoneroNetwork n) {
-    using NN = ::c2pool::xmr::native::rt::NativeNet;
-    switch (n) {
-        case MoneroNetwork::Mainnet:  return NN::Mainnet;
-        case MoneroNetwork::Testnet:  return NN::Testnet;
-        case MoneroNetwork::Stagenet: return NN::Stagenet;
-        case MoneroNetwork::Regtest:  return NN::Regtest;
-    }
-    return NN::Stagenet;
-}
+// It now lives in xmr/xmr_native_template_backend.hpp, beside
+// native_template_config_of() -- the one function that turns an XmrNodeConfig
+// into the embedded node's configuration -- so that the mapping and its only
+// caller cannot drift apart. Named here because this is where a reader looks.
 
 static std::atomic<bool> g_stop{false};
 static void on_sigint(int) { g_stop.store(true); }
@@ -582,58 +576,53 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
 // Returns null on refusal, with the reason already printed.
 // ---------------------------------------------------------------------------
 static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const XmrNodeConfig& cfg) {
-    if (cfg.native_connect.empty()) {
-        std::printf("REFUSED: the native Monero node needs at least one --native-connect "
-                    "<ip:port> levin peer (it dials only what it is told to)\n");
+    // An address source is required and either kind will do. Before --seeds was
+    // forwarded, --native-connect was the ONLY one, which is why this refusal
+    // named it alone; a mainnet operator who asked for seeds and nothing else
+    // got this message and no way to act on it.
+    if (cfg.native_connect.empty() && !cfg.native_use_seeds) {
+        std::printf("REFUSED: the native Monero node needs an address source -- at least one "
+                    "--native-connect <ip:port> levin peer, or --native-seeds to bootstrap "
+                    "from the network's own seed set (it dials only what it is told to)\n");
         return nullptr;
     }
     const bool p2p_first = (cfg.arm_order == ArmOrderMode::P2PFirst);
 
-    o2::NativeTemplateConfig ncfg;
-    ncfg.net                  = native_net_of(cfg.network);
-    ncfg.connect              = cfg.native_connect;
-    ncfg.p2p_bind_ip          = cfg.native_p2p_bind_ip;
-    ncfg.boot                 = cfg.native_anchor_path.empty()
-                                    ? ::c2pool::xmr::native::rt::BootMode::Genesis
-                                    : ::c2pool::xmr::native::rt::BootMode::Anchor;
-    ncfg.anchor_path          = cfg.native_anchor_path;
-    // The daemon endpoint is the C6 PARITY judge, and under daemon-first also
-    // the submit arm. Under p2p-first it is the parity judge and nothing else:
-    // the oracle reads it off the status cadence, which is not the find path.
-    // --no-daemon-rpc withholds it entirely, and then the node has no daemon
-    // arm to make a call with -- the strongest form of the claim, at the cost
-    // of the parity judge.
-    if (!cfg.no_daemon_rpc) {
-        ncfg.monerod_rpc_host = cfg.monerod.rpc_host;
-        ncfg.monerod_rpc_port = cfg.monerod.rpc_port;
-    }
-    ncfg.serve                = ::c2pool::xmr::native::TemplateArm::Native;
-    ncfg.relay_order          = p2p_first ? ::c2pool::xmr::native::ArmOrder::P2pOnly
-                                          : ::c2pool::xmr::native::ArmOrder::DaemonFirst;
-    // p2p-first pins the fallback OFF whatever the flag said: a daemonless find
-    // whose template silently came from the daemon is not a daemonless find,
-    // and the operator should not be able to weaken the claim by accident.
-    ncfg.fallback             = p2p_first ? false : cfg.native_template_fallback;
-    ncfg.force_synced         = cfg.native_force_synced;
-    ncfg.allow_unverified_pow = cfg.native_allow_unverified_pow;
-    ncfg.parity               = true;
-    ncfg.parity_ledger_path   = cfg.resolved_settle_db_path() + "/xmr_parity_ledger.json";
-    ncfg.c2pool_commit        = C2POOL_VERSION;
-    ncfg.ready_timeout_s      = cfg.native_ready_timeout_s;
-    ncfg.backlog_refresh_s    = cfg.native_backlog_refresh_s;
-    // D-14 lever (1): what the fork choice adopts at EQUAL work at the same
-    // height. Same flag as the accounting tiebreak -- see xmr_same_height_race.hpp.
-    ncfg.fork_tie             = (cfg.same_height_tiebreak == SameHeightTieBreak::PreferOwn)
-                                    ? ::c2pool::xmr::native::TieBreak::PreferOwn
-                                    : ::c2pool::xmr::native::TieBreak::FirstSeen;
+    // THE FORWARD, in one call. Everything derivable from the configuration
+    // value is derived there, so a knob cannot be parsed here and dropped on
+    // the way to the node -- which is what happened to the gate 4 window and to
+    // --seeds. The two fields below are the ones that are NOT a function of the
+    // config value: a path through config_path(), and a build macro.
+    o2::NativeTemplateConfig ncfg = o2::native_template_config_of(cfg);
+    ncfg.parity_ledger_path       = cfg.resolved_settle_db_path() + "/xmr_parity_ledger.json";
+    ncfg.c2pool_commit            = C2POOL_VERSION;
 
-    std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned peer(s)) "
+    std::printf("template source: NATIVE — the embedded Monero node (levin, %zu pinned peer(s)%s) "
                 "feeds the option-B assembler%s\n",
                 cfg.native_connect.size(),
+                cfg.native_use_seeds ? " + network seeds" : "",
                 p2p_first ? "; it is ALSO the tip, the canonical test and the block relay "
                             "(--arm-order p2p-first): monerod is not on the find path"
                           : "; monerod stays the parity judge and the submit arm, and is NOT "
                             "on the template path");
+    if (ncfg.boot == ::c2pool::xmr::native::rt::BootMode::Anchor) {
+        // GATE 4 is not optional and has no off switch, so the operator is told
+        // what window it will run in rather than left to infer it from a
+        // refusal. Widening it is the only thing these three flags can do.
+        std::printf("  gate 4 (anchor network confirm): up to %u peer(s), %llu ms each, "
+                    "%llu ms in total — the anchor is fetched from live peers and re-hashed "
+                    "before this node serves anything\n",
+                    static_cast<unsigned>(ncfg.anchor_confirm.peers),
+                    (unsigned long long)ncfg.anchor_confirm.per_peer_ms,
+                    (unsigned long long)ncfg.anchor_confirm.timeout_ms);
+    }
+    if (!ncfg.snapshot_path.empty()) {
+        std::printf("  chain snapshot: %s (save every %llus, and on a clean stop) — a restart "
+                    "resumes there instead of re-walking from the anchor; an absent, corrupt "
+                    "or foreign snapshot falls back to the anchor boot\n",
+                    ncfg.snapshot_path.c_str(),
+                    (unsigned long long)ncfg.snapshot_every_s);
+    }
 
     auto native = std::make_unique<o2::NativeTemplateBackend>(std::move(ncfg));
     std::string why;
@@ -642,12 +631,23 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
             std::fflush(stdout);
         })) {
         std::printf("REFUSED: %s\n", why.c_str());
+        // A refused start is where gate 4's verdict lives, so the node's own log
+        // is drained here rather than lost with the node. Two sources because
+        // there are two shapes of refusal: start() failing (the node is already
+        // gone, and the backend kept its log) and the readiness wait expiring
+        // (the node is still there).
+        for (const std::string& l : native->start_log())
+            std::fprintf(stderr, "  node: %s\n", l.c_str());
+        if (auto* n = native->node()) for (const std::string& l : n->take_log())
+            std::fprintf(stderr, "  node: %s\n", l.c_str());
         return nullptr;
     }
     std::printf("  native: template arm READY, fallback %s\n",
                 native->config().fallback
                     ? "ON (the daemon arm may serve if the native one loses a window)"
                     : "OFF (native-only: no template is served if the native arm is not ready)");
+    if (auto* n = native->node()) for (const std::string& l : n->take_log())
+        std::printf("  node: %s\n", l.c_str());
     return native;
 }
 
@@ -1083,6 +1083,16 @@ int main(int argc, char** argv) {
         auto next = [&](const char* def) -> std::string {
             return (i + 1 < argc) ? argv[++i] : def;
         };
+        // The embedded node's flags first, from the ONE function that owns
+        // them (xmr_node_config.hpp). Keeping them here as a dozen more `else
+        // if` arms is how --seeds and the gate 4 window came to be parsed
+        // nowhere and forwarded nowhere; a single owner is what a KAT can call.
+        {
+            std::string ferr;
+            const int used = apply_native_node_flag(cfg, argc, argv, i, ferr);
+            if (used < 0) { std::printf("REFUSED: %s\n", ferr.c_str()); return 2; }
+            if (used > 0) { i += used - 1; continue; }
+        }
         if (a == "--mock-smoke" || a == "--selftest") mock_smoke = true;
         else if (a == "--network")  cfg.network = parse_net(next("stagenet"));
         else if (a == "--rpc-host") cfg.monerod.rpc_host = next("127.0.0.1");
@@ -1121,19 +1131,6 @@ int main(int argc, char** argv) {
             cfg.template_source = (m == "native") ? TemplateSourceMode::Native
                                                   : TemplateSourceMode::Monerod;
         }
-        else if (a == "--native-connect") cfg.native_connect.push_back(next(""));
-        else if (a == "--native-p2p-bind") cfg.native_p2p_bind_ip = next("");
-        else if (a == "--native-anchor") cfg.native_anchor_path = next("");
-        else if (a == "--native-force-synced") cfg.native_force_synced = true;
-        else if (a == "--native-allow-unverified-pow") cfg.native_allow_unverified_pow = true;
-        else if (a == "--native-template-fallback") {
-            const std::string m = next("on");
-            cfg.native_template_fallback = !(m == "off" || m == "0" || m == "false");
-        }
-        else if (a == "--native-backlog-refresh") cfg.native_backlog_refresh_s =
-                     static_cast<std::uint64_t>(std::stoull(next("0")));
-        else if (a == "--native-ready-timeout") cfg.native_ready_timeout_s =
-                     static_cast<std::uint32_t>(std::stoul(next("120")));
         // M3 (R-ARMORDER, switchable): daemon-first stays the default.
         else if (a == "--arm-order") {
             const std::string m = next("daemon-first");
@@ -1205,10 +1202,35 @@ int main(int argc, char** argv) {
                 "                               index + relayed txpool) builds the template and the\n"
                 "                               template path makes NO daemon call. monerod remains\n"
                 "                               the parity judge and the block submit arm.\n"
-                "  --native-connect <ip:port>   pinned levin peer for the embedded node (repeatable,\n"
-                "                               REQUIRED for --xmr-template-source native)\n"
+                "  --native-connect <ip:port>   pinned levin peer for the embedded node (repeatable;\n"
+                "                               one of this or --native-seeds is REQUIRED for\n"
+                "                               --xmr-template-source native)\n"
+                "  --native-seeds               bootstrap from the network's own seed set instead of\n"
+                "                               (or as well as) pinned peers. MAINNET: four DNS seed\n"
+                "                               hosts + six compiled-in IP seeds. testnet/stagenet\n"
+                "                               have no DNS seeds (monerod lists them for mainnet\n"
+                "                               only) and use their five IP seeds. Also spelled\n"
+                "                               --seeds, matching the xmr_native_node tool.\n"
                 "  --native-p2p-bind <ip>       source address for the node's outbound dials\n"
                 "  --native-anchor <path>       trust-anchor bundle (cold start above genesis)\n"
+                "  --anchor-confirm-peers <n>   GATE 4: distinct peers to ask before the anchor is\n"
+                "                               refused by exhaustion (default 4, minimum 1)\n"
+                "  --anchor-confirm-peer-ms <ms>  GATE 4: one peer's turn (default 12000)\n"
+                "  --anchor-confirm-timeout-ms <ms>\n"
+                "                               GATE 4: the whole gate's wall deadline (default\n"
+                "                               60000). These three WIDEN the window on a slow link.\n"
+                "                               There is no flag that turns the gate off: the block\n"
+                "                               the anchor pins is always fetched from live peers and\n"
+                "                               re-hashed before this node serves anything.\n"
+                "  --native-snapshot-path <file>\n"
+                "                               persist the chain index here so a restart resumes\n"
+                "                               instead of re-walking from the anchor. Read only\n"
+                "                               AFTER gate 4 confirms, and bound to that anchor's\n"
+                "                               identity: an absent, corrupt, foreign-network or\n"
+                "                               differently-anchored file falls back to the anchor\n"
+                "                               boot. Default: no persistence.\n"
+                "  --native-snapshot-every <s>  periodic save cadence (default 300; 0 = only on a\n"
+                "                               clean stop)\n"
                 "  --native-force-synced        set the publication gate on a private chain (OR-C2-8)\n"
                 "  --native-allow-unverified-pow  a build with no RandomX may connect blocks it did\n"
                 "                               not verify (opt-in, loud, never a default)\n"

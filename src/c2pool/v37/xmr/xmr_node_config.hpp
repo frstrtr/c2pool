@@ -21,6 +21,8 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -280,6 +282,42 @@ struct XmrNodeConfig {
     bool            native_allow_unverified_pow = false;
     // Trust-anchor bundle for a cold start above genesis ("" => embedded).
     std::string     native_anchor_path;
+    // GATE 4 (the anchor's NETWORK confirm) and its bound. The embedded node
+    // refuses to start until the block the bundle pins has been fetched from
+    // live peers and re-hashed to the pinned id -- at most `peers` distinct
+    // handshaked peers are asked, each gets `peer_ms`, and the whole gate
+    // expires after `timeout_ms` AS A REFUSAL.
+    //
+    // These three widen the window for an operator on a slow or heavily
+    // filtered link. The standalone xmr_native_node tool has exposed them since
+    // the gate landed and the pool binary did not, which left a mainnet
+    // operator whose only reachable peer takes fifteen seconds to answer with
+    // no way to say so -- and a refusal that looks like a broken build. There
+    // is deliberately NO knob here that turns the gate off.
+    //
+    // The defaults are AnchorConfirmConfig's own; the mainnet-readiness KAT
+    // pins the two sets equal so they cannot drift apart silently.
+    std::uint32_t   anchor_confirm_peers      = 4;
+    std::uint64_t   anchor_confirm_timeout_ms = 60000;
+    std::uint64_t   anchor_confirm_peer_ms    = 12000;
+    // --native-seeds (alias --seeds): let the embedded node bootstrap from the
+    // network's own seed sets instead of only from pinned --native-connect
+    // peers. On MAINNET that is four DNS seed hosts (monerod guards them with
+    // `if (m_nettype == MAINNET)`, and so does p2p::dns_seeds) plus six
+    // compiled-in IP seeds; testnet and stagenet correctly have no DNS seeds
+    // and fall through to five IP seeds each. OFF by default -- a private or
+    // regtest rig must dial only what it was told to.
+    bool            native_use_seeds = false;
+    // Where the embedded node's chain-index snapshot lives. Empty (the default)
+    // = no persistence, and a restart re-walks the chain from the anchor. When
+    // set, the image is read after gate 4 confirms and written on a clean stop
+    // and on a cadence. It is NOT a second trust root: the file is bound to the
+    // anchor identity the network vouched for, and any mismatch -- absent,
+    // corrupt, foreign network, different anchor -- falls back to the anchor
+    // boot rather than to a weaker check.
+    std::string     native_snapshot_path;
+    // Seconds between periodic saves. 0 = only on a clean stop.
+    std::uint64_t   native_snapshot_every_s = 300;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
     // production posture; OFF is what makes "the template path made no daemon
     // call" falsifiable rather than merely asserted.
@@ -349,10 +387,112 @@ inline std::string arm_order_refusal(const XmrNodeConfig& c) {
     if (c.template_source != TemplateSourceMode::Native)
         return "--arm-order p2p-first requires --xmr-template-source native: a find path whose "
                "template came from get_miner_data is not daemonless";
-    if (c.native_connect.empty())
-        return "--arm-order p2p-first requires at least one --native-connect <ip:port> levin peer: "
-               "with no peer there is no chain to find on and nowhere to relay a found block";
+    if (c.native_connect.empty() && !c.native_use_seeds)
+        return "--arm-order p2p-first requires at least one --native-connect <ip:port> levin peer "
+               "or --native-seeds: with no address source there is no chain to find on and "
+               "nowhere to relay a found block";
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// The embedded node's operator flags, parsed as a PURE function of an argv
+// slice.
+//
+// It lives here rather than inside main's parse loop for the same reason
+// arm_order_refusal() does: the thing the daemon does with a flag and the thing
+// a KAT pins have to be the same code. Everything the native backend is
+// configured by is in one place, so a new node knob cannot become a flag the
+// pool binary quietly fails to forward -- which is exactly how the gate 4
+// confirm knobs came to exist on the standalone tool and nowhere else.
+//
+// Returns the number of argv tokens consumed (1 or 2), 0 when `argv[i]` is not
+// one of these flags, and -1 with `err` set when one of them is malformed. The
+// caller advances i by (returned - 1) and continues.
+// ---------------------------------------------------------------------------
+inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const* argv,
+                                  int i, std::string& err) {
+    const std::string a = argv[i];
+    const bool have_value = (i + 1 < argc);
+    const std::string v = have_value ? argv[i + 1] : std::string();
+
+    // A value flag with nothing after it is an ERROR, not a silent default: an
+    // operator who typed `--native-snapshot-path` last on the line meant a path.
+    auto need = [&](std::uint64_t& out) -> int {
+        if (!have_value) { err = a + " wants a value"; return -1; }
+        try {
+            out = std::stoull(v);
+        } catch (const std::exception&) {
+            err = a + " wants a number, got '" + v + "'";
+            return -1;
+        }
+        return 2;
+    };
+
+    if (a == "--native-connect") {
+        if (!have_value || v.empty()) { err = "--native-connect wants <ip:port>"; return -1; }
+        c.native_connect.push_back(v);
+        return 2;
+    }
+    if (a == "--native-p2p-bind") {
+        if (!have_value) { err = "--native-p2p-bind wants <ip>"; return -1; }
+        c.native_p2p_bind_ip = v;
+        return 2;
+    }
+    if (a == "--native-anchor") {
+        if (!have_value) { err = "--native-anchor wants <path>"; return -1; }
+        c.native_anchor_path = v;
+        return 2;
+    }
+    if (a == "--native-force-synced")          { c.native_force_synced = true; return 1; }
+    if (a == "--native-allow-unverified-pow")  { c.native_allow_unverified_pow = true; return 1; }
+    if (a == "--native-seeds" || a == "--seeds") { c.native_use_seeds = true; return 1; }
+    if (a == "--native-snapshot-path") {
+        if (!have_value || v.empty()) { err = "--native-snapshot-path wants <file>"; return -1; }
+        c.native_snapshot_path = v;
+        return 2;
+    }
+    if (a == "--native-snapshot-every")  return need(c.native_snapshot_every_s);
+    if (a == "--native-backlog-refresh") return need(c.native_backlog_refresh_s);
+    if (a == "--anchor-confirm-peers") {
+        std::uint64_t n = 0;
+        const int used = need(n);
+        if (used < 0) return used;
+        if (n == 0) { err = "--anchor-confirm-peers must be at least 1: gate 4 asking nobody "
+                            "would be the switch that turns it off"; return -1; }
+        c.anchor_confirm_peers = static_cast<std::uint32_t>(n);
+        return used;
+    }
+    if (a == "--anchor-confirm-timeout-ms") {
+        const int used = need(c.anchor_confirm_timeout_ms);
+        if (used < 0) return used;
+        if (c.anchor_confirm_timeout_ms == 0) {
+            err = "--anchor-confirm-timeout-ms must be at least 1";
+            return -1;
+        }
+        return used;
+    }
+    if (a == "--anchor-confirm-peer-ms") {
+        const int used = need(c.anchor_confirm_peer_ms);
+        if (used < 0) return used;
+        if (c.anchor_confirm_peer_ms == 0) {
+            err = "--anchor-confirm-peer-ms must be at least 1";
+            return -1;
+        }
+        return used;
+    }
+    if (a == "--native-ready-timeout") {
+        std::uint64_t n = 0;
+        const int used = need(n);
+        if (used < 0) return used;
+        c.native_ready_timeout_s = static_cast<std::uint32_t>(n);
+        return used;
+    }
+    if (a == "--native-template-fallback") {
+        if (!have_value) { err = "--native-template-fallback wants on|off"; return -1; }
+        c.native_template_fallback = !(v == "off" || v == "0" || v == "false");
+        return 2;
+    }
+    return 0;
 }
 
 } // namespace c2pool::v37n::xmr
