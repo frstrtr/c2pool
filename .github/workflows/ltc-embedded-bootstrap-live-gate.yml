@@ -22,6 +22,12 @@ on:
       - 'src/core/dns_seeder.hpp'
       - '.github/workflows/ltc-embedded-bootstrap-live-gate.yml'
   workflow_dispatch:
+  schedule:
+    # Standing daily check of the live LTC bootstrap path (real DNS seeds
+    # + real P2P egress) so master cannot drift to stale-green between the
+    # narrow path-triggered PR runs. GTEST_SKIP still fires (named+logged)
+    # if egress is blocked, so a schedule can never fake a green.
+    - cron: "17 6 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
