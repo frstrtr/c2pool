@@ -297,6 +297,25 @@ if (BUILD_TESTING)
         # --engine runs suites (A) RandomX vectors + (C) the real block 3,000,000
         # end-to-end verify; suite (B) arithmetic runs always.
         add_test(NAME xmr_randomx_verify_kat COMMAND xmr_randomx_verify_kat --engine)
+
+        # 10b) cpu-miner: the in-process RandomX CPU miner (../pow/xmr_cpu_miner.hpp).
+        #      Header-only, ORIGINAL c2pool code over the PUBLIC librandomx C API
+        #      (BSD-3) -- no xmrig / p2pool / monerod source is involved. The KAT
+        #      mines at an easy lane target in LIGHT mode and re-computes every
+        #      reported hash through the production LightVerifier, which is the
+        #      property that matters: the miner is a client of librandomx, not a
+        #      second implementation of it. Same RandomX gate as (10) -- a 256 MiB
+        #      cache for the miner plus the verifier's two, JIT/asm -- so it lives
+        #      inside XMR_BUILD_RANDOMX and is NOT built on the sanitizer leg.
+        add_executable(xmr_cpu_miner_kat
+            ${CMAKE_CURRENT_SOURCE_DIR}/xmr_cpu_miner_kat.cpp)
+        find_package(Threads REQUIRED)
+        target_link_libraries(xmr_cpu_miner_kat PRIVATE randomx Threads::Threads)
+        target_include_directories(xmr_cpu_miner_kat PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../pow
+            ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx)
+        target_compile_features(xmr_cpu_miner_kat PRIVATE cxx_std_20)
+        add_test(NAME xmr_cpu_miner_kat COMMAND xmr_cpu_miner_kat)
     endif()
 
     # =========================================================================

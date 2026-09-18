@@ -61,6 +61,7 @@
 // submit "Couldn't check PoW" and never promotes a block (fail-closed).
 // ===========================================================================
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -89,9 +90,19 @@
 #include "xmr/xmr_native_chain_source.hpp"        // M3: the native levin chain as the tip + canonical test
 #include "xmr/xmr_p2p_block_publisher.hpp"        // M3: found block -> levin 2008 (no submit_block)
 
+// The in-process RandomX CPU miner (--mine). Header-only, and only compilable
+// when librandomx is in the build -- so it is gated on exactly the macro that
+// says so. Without it --mine is REFUSED with a reason, never silently ignored.
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+#include "impl/xmr/pow/xmr_cpu_miner.hpp"     // --mine: in-process RandomX CPU miner (BSD-3 librandomx client)
+#endif
+
 using namespace c2pool::v37n::xmr;
 namespace strat = ::v37::xmr::stratum;
 namespace sub   = c2pool::v37n::xmr::submit;
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+namespace mine = ::c2pool::xmr::miner;
+#endif
 namespace node  = ::c2pool::xmr::node;
 
 #if __has_include(<c2pool_build_version.h>)
@@ -378,6 +389,122 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         std::printf("stratum: NOT served (%s) — observe-side only\n", not_served_reason);
     }
 
+    // ── --mine: the in-process RandomX CPU miner ────────────────────────────
+    //
+    // THE POINT: one process that builds its own template, hashes it, finds the
+    // block and books the payout -- no external miner, no stratum hop. It is
+    // wired here, inside serve_and_run, so BOTH template arms (option A's
+    // monerod template and option B's v37 K_fair settlement coinbase) and BOTH
+    // publish arms (submit_block / levin 2008) get it from one body.
+    //
+    // Everything that has consequences stays on the MAIN thread: the template
+    // pull, the RandomX seed prefetch, and the hand-off of a hit into `sink`
+    // (the exact 128-bit gate). Worker threads only hash. That is why no
+    // locking discipline changes anywhere else in this file.
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+    std::unique_ptr<mine::CpuMiner> cpu_miner;
+    std::uint32_t mine_extra_nonce = 0;
+    std::uint32_t mine_job_tid = 0;
+    std::uint64_t mine_pushed = 0, mine_blocks = 0, mine_shares = 0;
+    std::string   mine_last_error;
+    if (cfg.mine_enabled) {
+        if (!serving) {
+            std::printf("--mine: REFUSED — this node serves no template (%s), so there is "
+                        "nothing to mine on\n", not_served_reason);
+        } else if (!rx.network_blocks_allowed()) {
+            // Fail-closed, and for the same reason the submit path is: a block
+            // this build could not verify would be refused at the gate anyway,
+            // so burning cores to produce one would be theatre.
+            std::printf("--mine: REFUSED — RandomX is %s; a found block could not be verified "
+                        "and would never be published (fail-closed)\n",
+                        o2::O2RandomXVerifier::to_string(rx.mode()));
+        } else {
+            mine::MinerOptions mo;
+            mo.threads     = cfg.mine_threads;
+            mo.fast_mode   = cfg.mine_fast;
+            mo.large_pages = cfg.mine_large_pages;
+            mo.pin_threads = cfg.mine_pin;
+            cpu_miner = std::make_unique<mine::CpuMiner>(mo);
+            // The internal miner takes the TOP extra_nonce slot; the listener
+            // hands stratum clients its own counter from 0 upwards, so the two
+            // never collide on the same per-client blob.
+            const std::uint32_t n = template_source.max_extra_nonces();
+            mine_extra_nonce = n ? (n - 1) : 0;
+            std::printf("cpu-miner: ENABLED threads=%u mode=%s huge-pages=%s affinity=%s "
+                        "extra_nonce=%u (in-process; no external miner)\n",
+                        cpu_miner->threads_wanted(),
+                        cfg.mine_fast ? "FAST (dataset, ~2080 MiB)" : "LIGHT (cache, ~256 MiB)",
+                        cfg.mine_large_pages ? "requested" : "off",
+                        cfg.mine_pin ? "on" : "off", mine_extra_nonce);
+        }
+    }
+#else
+    if (cfg.mine_enabled)
+        std::printf("--mine: REFUSED — this build has no RandomX (configure with "
+                    "-DXMR_BUILD_RANDOMX=ON)\n");
+#endif
+
+    // One call per loop pass: (1) keep the miner on the CURRENT template,
+    // (2) drain what it found into the node's own share/block-found path.
+    auto pump_miner = [&]() {
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+        if (!cpu_miner) return;
+        strat::TemplateJob tj;
+        if (template_source.get_job(mine_extra_nonce, tj) && tj.template_id != mine_job_tid) {
+            // Seed residency BEFORE any hit can arrive: the Argon2d init is the
+            // caller's job (verifier invariant I2), and doing it here keeps it
+            // off both the submit path and the miner's hot loop.
+            rx.on_template(tj);
+            mine::MinerJob mj;
+            mj.blob           = tj.blob;
+            mj.nonce_offset   = tj.nonce_offset;
+            mj.template_id    = tj.template_id;
+            mj.extra_nonce    = mine_extra_nonce;
+            mj.height         = tj.height;
+            mj.network_target = tj.mainchain_target;
+            mj.lane_target    = tj.lane_target;
+            std::copy(tj.seed_hash.begin(), tj.seed_hash.end(), mj.seed_hash.begin());
+            std::string why;
+            if (cpu_miner->set_job(mj, &why)) {
+                mine_job_tid = tj.template_id;
+                ++mine_pushed;
+            } else if (why != mine_last_error) {
+                mine_last_error = why;
+                std::printf("  [cpu-miner] job refused: %s\n", why.c_str());
+            }
+        }
+        mine::MinerHit h;
+        while (cpu_miner->pop_hit(h)) {
+            // SAME ORDER as xmr_stratum.cpp handle_submit: the network block
+            // first (so the FoundBlockEvent exists), then the accepted share
+            // (which annotates it with worker/address).
+            if (h.network) {
+                ++mine_blocks;
+                std::printf("  [cpu-miner] NETWORK BLOCK candidate tid=%u nonce=%u "
+                            "extra_nonce=%u h=%llu pow=%s\n",
+                            h.template_id, h.nonce, h.extra_nonce,
+                            static_cast<unsigned long long>(h.height),
+                            sub::to_hex(h.pow_hash.data(), h.pow_hash.size()).c_str());
+                sink.submit_network_block(h.template_id, h.nonce, h.extra_nonce);
+            }
+            if (h.share || h.network) {
+                ++mine_shares;
+                strat::AcceptedShare acc;
+                acc.template_id      = h.template_id;
+                acc.extra_nonce      = h.extra_nonce;
+                acc.nonce            = h.nonce;
+                acc.pow_hash         = h.pow_hash;
+                acc.achieved_target  = h.achieved_target;
+                acc.height           = h.height;
+                acc.is_network_block = h.network;
+                acc.worker           = "cpu-miner";
+                acc.address          = cfg.payout_address;
+                sink.on_accepted_share(acc);
+            }
+        }
+#endif
+    };
+
     std::signal(SIGINT, on_sigint);
     std::signal(SIGTERM, on_sigint);
     const std::uint32_t poll_ms = cfg.poll_ms ? cfg.poll_ms : 5000;
@@ -485,6 +612,15 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(h), line.c_str());
             }
         }
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+        if (cpu_miner)
+            std::printf("  %s | jobs_pushed=%llu blocks=%llu shares=%llu | %s\n",
+                        cpu_miner->describe().c_str(),
+                        static_cast<unsigned long long>(mine_pushed),
+                        static_cast<unsigned long long>(mine_blocks),
+                        static_cast<unsigned long long>(mine_shares),
+                        cpu_miner->pinning_note().c_str());
+#endif
         std::printf("  %s\n", rx.describe().c_str());
         const std::string g = sink.last();
         if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
@@ -509,6 +645,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     auto last_status = std::chrono::steady_clock::now();
     std::string last_template_err;
     while (!g_stop.load()) {
+        pump_miner();       // --mine: hits first, so a find is bridged the same pass
         bridge_found();
         fc.tick();
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
@@ -558,6 +695,9 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     }
 
     std::printf("\nstopping…\n");
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+    if (cpu_miner) { cpu_miner->stop(); pump_miner(); }   // drain anything already found
+#endif
     listener.stop();
     drain_stratum_log();
     bridge_found();
@@ -1162,6 +1302,19 @@ int main(int argc, char** argv) {
         else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
         else if (a == "--randomx") cfg.randomx_enabled = true;
         else if (a == "--randomx-large-pages") cfg.randomx_large_pages = true;
+        else if (a == "--mine") {
+            cfg.mine_enabled = true;
+            // The thread count is OPTIONAL and must not swallow the next flag.
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                cfg.mine_threads = static_cast<unsigned>(std::stoul(next("0")));
+        }
+        else if (a == "--mine-threads") {
+            cfg.mine_enabled = true;
+            cfg.mine_threads = static_cast<unsigned>(std::stoul(next("0")));
+        }
+        else if (a == "--mine-fast") { cfg.mine_enabled = true; cfg.mine_fast = true; }
+        else if (a == "--mine-no-huge-pages") cfg.mine_large_pages = false;
+        else if (a == "--mine-no-affinity") cfg.mine_pin = false;
         else if (a == "--help" || a == "-h") {
             std::printf(
                 "c2pool-v37-xmr (EXPERIMENTAL prototype; stagenet default)\n"
@@ -1181,6 +1334,17 @@ int main(int argc, char** argv) {
                 "  --i-understand-mainnet       required to settle a mainnet block\n"
                 "  --randomx                    enable heavy RandomX verify (needs XMR_BUILD_RANDOMX)\n"
                 "  --randomx-large-pages        RandomX cache in huge pages\n"
+                " in-process CPU miner (OPTIONAL, OFF by default; CPU only, no GPU):\n"
+                "  --mine [threads]             mine the node's OWN template in-process with the\n"
+                "                               vendored RandomX library. 0/absent = auto (half of\n"
+                "                               hardware_concurrency). Needs --randomx and a served\n"
+                "                               template; refused, loudly, without either.\n"
+                "  --mine-threads <n>           same, with an explicit thread count\n"
+                "  --mine-fast                  FAST mode: RANDOMX_FLAG_FULL_MEM + a ~2080 MiB\n"
+                "                               dataset (default is LIGHT, a 256 MiB cache)\n"
+                "  --mine-no-huge-pages         do not ask for RANDOMX_FLAG_LARGE_PAGES (huge pages\n"
+                "                               are requested by default and fall back silently)\n"
+                "  --mine-no-affinity           do not pin miner threads to CPUs\n"
                 " serve side (X9 O-2; the stratum port is served only with a payout address):\n"
                 "  --payout-address <addr>      get_block_template wallet address (network-prefixed)\n"
                 "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
