@@ -803,7 +803,19 @@ int main() {
 
         // (b) A's SECOND prefix, and a second win at it. Block 1 is still
         //     PENDING (unburied), so neither descriptor carries a coinbase.
-        for (int i = P1; i < N_SHARE; ++i) { A.feed(s.frame[i]); if (i != DROP_AT) B.feed(s.frame[i]); }
+        // Feed the winner's prefix-P1 boundary frame FIRST and let B PUBLISH it,
+        // so B RETAINS a ring snapshot at exactly next_pos==P1. B dropped DROP_AT,
+        // so its multiset at P1 differs from A's and the winner's first cut reads
+        // back as a cut_digest_mismatch. Without this fence the executor may
+        // coalesce frame P1 into a later burst; the ring then holds NO retained
+        // view at next_pos==P1 (settlement_view_by_cut sees saw_pos==false) and the
+        // first refusal COLLAPSES to cut_miss -- the CA-9d flip (both refusals miss).
+        // The mismatch/miss split is diagnostic only (both are repair_wanted and
+        // take the identical repair path), but CA-9d asserts it, so the setup must
+        // materialise the divergent-published-prefix deterministically.
+        A.feed(s.frame[P1]); B.feed(s.frame[P1]);
+        (void)wait_until([&] { return B.next_pos() == static_cast<u64>(P1); });
+        for (int i = P1 + 1; i < N_SHARE; ++i) { A.feed(s.frame[i]); if (i != DROP_AT) B.feed(s.frame[i]); }
         (void)wait_until([&] { return A.next_pos() == static_cast<u64>(N_SHARE); });
         (void)wait_until([&] { return B.next_pos() == static_cast<u64>(N_SHARE - 1); });
         const u64     h2    = coin->append_block(kWonBid2);
