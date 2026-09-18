@@ -373,6 +373,15 @@ struct XmrNodeConfig {
     bool            mine_large_pages = true;
     // One worker pinned per CPU, physical cores first (--mine-no-affinity off).
     bool            mine_pin = true;
+    // --mine-msr: the per-microarchitecture MSR tuning ("randomx_boost"), worth
+    // roughly 5-15 % on the parts it covers. DEFAULT OFF and deliberately hard
+    // to switch on by accident: it needs root, it writes model-specific
+    // registers that are MACHINE-WIDE and outlive this process, and it only
+    // knows a handful of families. Without it, and on every path where it
+    // declines (not root, no msr module, unknown CPU), the node prints one line
+    // and mines exactly as before. See src/impl/xmr/pow/xmr_msr_boost.hpp for
+    // the register-value provenance and the restore-on-exit contract.
+    bool            mine_msr = false;
 
     // Resolve the on-disk settlement-store directory (settle_db_path override or
     // config_path()/<net>/v37_settle_db). Declared here, defined in xmr_node.hpp

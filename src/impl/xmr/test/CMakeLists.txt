@@ -316,7 +316,47 @@ if (BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx)
         target_compile_features(xmr_cpu_miner_kat PRIVATE cxx_std_20)
         add_test(NAME xmr_cpu_miner_kat COMMAND xmr_cpu_miner_kat)
+
+        # 10c) fast-mode: --mine-fast (RANDOMX_FLAG_FULL_MEM + the ~2080 MiB
+        #      dataset) must produce the SAME hash as the light path for a fixed
+        #      input. Kept OUT of xmr_cpu_miner_kat deliberately: that one is a
+        #      256 MiB test that finishes in seconds, while this one allocates
+        #      ~2080 MiB and spends seconds building the dataset, so a host that
+        #      cannot afford it can drop this target without losing the light
+        #      coverage. The KAT degrades honestly -- if randomx_alloc_dataset()
+        #      returns null it prints SKIP and says in as many words that the
+        #      fast path was not exercised, rather than passing silently.
+        #      Non-sanitizer leg only, same as every other RandomX target.
+        add_executable(xmr_fast_mode_kat
+            ${CMAKE_CURRENT_SOURCE_DIR}/xmr_fast_mode_kat.cpp)
+        target_link_libraries(xmr_fast_mode_kat PRIVATE randomx Threads::Threads)
+        target_include_directories(xmr_fast_mode_kat PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../pow
+            ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx)
+        target_compile_features(xmr_fast_mode_kat PRIVATE cxx_std_20)
+        add_test(NAME xmr_fast_mode_kat COMMAND xmr_fast_mode_kat)
+        # The dataset build dominates the runtime: give it room on a slow,
+        # shared runner rather than flaking on the default 1500 s ctest timeout.
+        set_tests_properties(xmr_fast_mode_kat PROPERTIES TIMEOUT 1800)
     endif()
+
+    # =========================================================================
+    # 11) msr-boost: the opt-in, root-gated MSR tuning (../pow/xmr_msr_boost.hpp).
+    #     OUTSIDE the XMR_BUILD_RANDOMX gate on purpose -- it links nothing, needs
+    #     no cache and no dataset, and the property it pins is a NEGATIVE: every
+    #     path that is not "an operator, as root, asked for this by name" writes
+    #     zero registers. That makes it cheap enough for BOTH build.yml legs, the
+    #     sanitizer one included, which is where a stray write would show up
+    #     loudest. The KAT never calls a path that could write an MSR, even if the
+    #     runner happens to be root -- it uses the dry-run door for anything that
+    #     would otherwise reach a device.
+    # =========================================================================
+    add_executable(xmr_msr_boost_kat
+        ${CMAKE_CURRENT_SOURCE_DIR}/xmr_msr_boost_kat.cpp)
+    target_include_directories(xmr_msr_boost_kat PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../pow)
+    target_compile_features(xmr_msr_boost_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_msr_boost_kat COMMAND xmr_msr_boost_kat)
 
     # =========================================================================
     # X9 OPTION B — whole-block settlement coinbase (consumer-tree; no consensus

@@ -97,6 +97,11 @@
 #include "impl/xmr/pow/xmr_cpu_miner.hpp"     // --mine: in-process RandomX CPU miner (BSD-3 librandomx client)
 #endif
 
+// --mine-msr: the opt-in, root-gated MSR tuning. UNGATED by RandomX on purpose
+// -- it links nothing and touches nothing unless asked, so the flag can be
+// parsed, reported and refused identically in a build that has no librandomx.
+#include "impl/xmr/pow/xmr_msr_boost.hpp"
+
 using namespace c2pool::v37n::xmr;
 namespace strat = ::v37::xmr::stratum;
 namespace sub   = c2pool::v37n::xmr::submit;
@@ -405,6 +410,13 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     // pull, the RandomX seed prefetch, and the hand-off of a hit into `sink`
     // (the exact 128-bit gate). Worker threads only hash. That is why no
     // locking discipline changes anywhere else in this file.
+    // --mine-msr. Declared HERE, at serve_and_run scope, so its destructor --
+    // which puts every register it changed back -- runs on every ordinary exit
+    // from this function. It is constructed disabled-by-default and only ever
+    // becomes live inside the branch below where the miner itself starts: MSR
+    // tuning with no miner running would be a machine-wide change bought for
+    // nothing.
+    std::unique_ptr<c2pool::xmr::msr::MsrBoost> msr_boost;
 #if defined(V37_XMR_O2_WITH_RANDOMX)
     std::unique_ptr<mine::CpuMiner> cpu_miner;
     std::uint32_t mine_extra_nonce = 0;
@@ -440,6 +452,18 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         cfg.mine_fast ? "FAST (dataset, ~2080 MiB)" : "LIGHT (cache, ~256 MiB)",
                         cfg.mine_large_pages ? "requested" : "off",
                         cfg.mine_pin ? "on" : "off", mine_extra_nonce);
+
+            // The miner is real, so the MSR tuning is now worth its cost. One
+            // attempt, one line, and the destructor (serve_and_run scope) puts
+            // the registers back. Every decline is a printed NO-OP: not root,
+            // no msr module, unknown family -- the node mines on regardless.
+            c2pool::xmr::msr::Options mopt;
+            mopt.enabled = cfg.mine_msr;
+            msr_boost = std::make_unique<c2pool::xmr::msr::MsrBoost>(mopt);
+            if (cfg.mine_msr) {
+                msr_boost->apply();
+                std::printf("%s\n", msr_boost->describe().c_str());
+            }
         }
     }
 #else
@@ -447,6 +471,13 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         std::printf("--mine: REFUSED — this build has no RandomX (configure with "
                     "-DXMR_BUILD_RANDOMX=ON)\n");
 #endif
+    // --mine-msr without a running miner is an operator mistake worth naming
+    // rather than ignoring: it would change machine-wide CPU state to speed up
+    // hashing that is not happening.
+    if (cfg.mine_msr && !msr_boost)
+        std::printf("--mine-msr: REFUSED — no in-process miner is running "
+                    "(--mine / --mine-fast), so there is nothing to tune for; "
+                    "no register was touched\n");
 
     // One call per loop pass: (1) keep the miner on the CURRENT template,
     // (2) drain what it found into the node's own share/block-found path.
@@ -1352,6 +1383,7 @@ int main(int argc, char** argv) {
             cfg.mine_threads = static_cast<unsigned>(std::stoul(next("0")));
         }
         else if (a == "--mine-fast") { cfg.mine_enabled = true; cfg.mine_fast = true; }
+        else if (a == "--mine-msr") cfg.mine_msr = true;
         else if (a == "--mine-no-huge-pages") cfg.mine_large_pages = false;
         else if (a == "--mine-no-affinity") cfg.mine_pin = false;
         else if (a == "--help" || a == "-h") {
@@ -1381,6 +1413,13 @@ int main(int argc, char** argv) {
                 "  --mine-threads <n>           same, with an explicit thread count\n"
                 "  --mine-fast                  FAST mode: RANDOMX_FLAG_FULL_MEM + a ~2080 MiB\n"
                 "                               dataset (default is LIGHT, a 256 MiB cache)\n"
+                "  --mine-msr                   opt-in MSR tuning (\"randomx_boost\"): disable the\n"
+                "                               hardware prefetcher / set the documented per-family\n"
+                "                               registers, worth ~5-15%% on the parts it covers.\n"
+                "                               OFF by default. Needs ROOT and the msr kernel module;\n"
+                "                               without either, or on an unknown CPU family, it prints\n"
+                "                               one NO-OP line and changes nothing. The registers are\n"
+                "                               MACHINE-WIDE and are restored on a clean exit.\n"
                 "  --mine-no-huge-pages         do not ask for RANDOMX_FLAG_LARGE_PAGES (huge pages\n"
                 "                               are requested by default and fall back silently)\n"
                 "  --mine-no-affinity           do not pin miner threads to CPUs\n"
