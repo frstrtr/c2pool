@@ -366,6 +366,35 @@ int main()
               "BCH catalog has no message-blob alias (message field disabled)");
     }
 
+    // 11) ★ #157 Slice 3 — the Launch page must NEVER emit the tx-inject arming
+    //     flags. --embedded-tx-inject is a real DASH catalog alias (so the
+    //     every-flag-in-catalog gate would NOT catch it), and
+    //     --control-plane-token-file arms the runtime control plane. Arming is an
+    //     operator-gated runtime action on the dedicated Tx-Inject control page,
+    //     never a launch-form checkbox — so no PerCoinParams combination may put
+    //     either flag on argv.
+    {
+        // A maximal DASH param set: attach on, embedded on, money set — the shape
+        // most likely to accidentally sprout an extra embedded flag.
+        PerCoinParams p = dashDefault();
+        p.externalDaemonRpc = true;
+        p.confPath = "/x/dash.conf";
+        p.embeddedP2p = true;
+        p.embeddedP2pPeers = {"127.0.0.1:9999"};
+        p.embeddedMainnet = true;
+        p.giveAuthor = 0.5; p.giveAuthorSet = true;
+        const auto argv = build_percoin_argv(p);
+        check(!contains(argv, "--embedded-tx-inject"),
+              "Launch argv never carries --embedded-tx-inject (arming is not a launch flag)");
+        check(!contains(argv, "--control-plane-token-file"),
+              "Launch argv never carries --control-plane-token-file (control-plane token is not a launch flag)");
+        // And the DASH default (bare --run) obviously carries neither.
+        const auto argv0 = build_percoin_argv(dashDefault());
+        check(!contains(argv0, "--embedded-tx-inject")
+                  && !contains(argv0, "--control-plane-token-file"),
+              "DASH default argv carries neither tx-inject arming flag");
+    }
+
     std::printf(failures == 0 ? "ALL PASS\n" : "FAILURES: %d\n", failures);
     return failures == 0 ? 0 : 1;
 }

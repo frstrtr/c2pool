@@ -62,6 +62,19 @@ C2P_PARAM("meta.ack_money_settings", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, L
   C2P_ALIAS("meta.ack_money_settings", BIN_DGB, "--ack-money-settings", FLAG)
   C2P_ALIAS("meta.ack_money_settings", BIN_BCH, "--ack-money-settings", FLAG)
 
+// Control-plane apply token file (#157 Slice 3). DORMANT launch seam: pointing
+// this at a 0600 owner-only file whose contents are a 32-128 char token loads
+// that token via config_endpoint::set_control_token() at startup, which is the
+// ONLY production caller that arms POST /api/config[/apply]. Absent (the
+// default) => no token => the apply endpoint stays fail-closed (503 armed:false)
+// exactly as on master. MONEY_RESTART: it is money-adjacent (it is what makes
+// runtime money-key arming reachable at all), so setting it from a settings
+// file requires the money-ack ceremony; changing it needs a restart. It is
+// never a runtime-appliable key (no ParamApplier setter), so the apply path's
+// runtime-setter precondition refuses any attempt to set it over HTTP.
+C2P_PARAM("control.token_file", Gate, PATH, MONEY_RESTART, C_DASH, LIT, "", NONE, "control-plane apply token file (0600, owner-only, 32-128 char token; DORMANT, arms POST /api/config/apply when present)")
+  C2P_ALIAS("control.token_file", BIN_DASH, "--control-plane-token-file", VALUE)
+
 C2P_PARAM("meta.run", Meta, BOOL, RESTART, C_DASH|C_DGB, LIT, "false", NONE, "run the node")
   C2P_ALIAS("meta.run", BIN_DASH, "--run", FLAG)
   C2P_ALIAS("meta.run", BIN_DGB, "--run", FLAG)

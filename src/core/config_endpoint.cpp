@@ -8,8 +8,28 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <mutex>
-#include <random>
+#include <optional>
+#include <string>
+
+#include <errno.h>
+#ifndef _WIN32
+#include <fcntl.h>        // open(2) + O_NOFOLLOW/O_CLOEXEC/O_NOCTTY
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>       // lstat/fstat/read/close/geteuid — POSIX only
+#endif
+#if defined(__linux__)
+#include <sys/random.h>   // getrandom(2)
+#endif
+#ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>       // BCryptGenRandom (system CSPRNG)
+#pragma comment(lib, "bcrypt")
+#endif
 
 #include "address_validator.hpp"
 
@@ -427,15 +447,55 @@ bool ParamApplier::invoke(const std::string& canon, const std::string& value) co
 // ---------------------------------------------------------------------------
 namespace {
 
-// A random 128-bit hex token/nonce from a per-thread PRNG seeded off the OS
-// entropy source. Not a secret store — a loopback-only unguessable handle.
+// Fill `buf` with `len` bytes from the OS CSPRNG. Primary source is getrandom(2)
+// (blocking until the pool is seeded, EINTR-retried); the fallback is a blocking
+// read of /dev/urandom. A single-draw std::random_device / mt19937_64 is NOT a
+// CSPRNG (a review flagged it on the money-nonce path): its 64-bit seed and
+// recoverable state make an issued nonce potentially predictable, which would
+// weaken the two-phase money gate. This routine returns only kernel CSPRNG
+// bytes, or aborts the draw (its callers hand back a value that will never
+// verify, keeping the gate fail-closed) — it never silently degrades to a PRNG.
+bool os_random_bytes(unsigned char* buf, size_t len) {
+#if defined(_WIN32)
+    // Windows: the system-preferred CSPRNG. On failure return false, so the
+    // caller hands back an empty nonce and the money gate stays fail-closed —
+    // identical posture to the POSIX draw, never a silent PRNG degrade.
+    NTSTATUS s = ::BCryptGenRandom(nullptr, buf, static_cast<ULONG>(len),
+                                   BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return s == 0;   // STATUS_SUCCESS
+#else
+#if defined(__linux__)
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = ::getrandom(buf + off, len - off, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;   // retry
+            break;                          // fall through to /dev/urandom
+        }
+        off += static_cast<size_t>(n);
+    }
+    if (off == len) return true;
+#endif
+    // Fallback: blocking read of /dev/urandom (also a kernel CSPRNG).
+    std::ifstream ur("/dev/urandom", std::ios::binary);
+    if (!ur) return false;
+    ur.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(len));
+    return static_cast<size_t>(ur.gcount()) == len;
+#endif
+}
+
+// A random 128-bit hex token/nonce backed by the OS CSPRNG (getrandom(2), with a
+// /dev/urandom fallback). If the CSPRNG is unavailable the returned handle is the
+// empty string, which can never match a client-presented value — a nonce that
+// never verifies keeps the money gate fail-closed rather than issuing a weak,
+// guessable one.
 std::string random_hex_128() {
-    static thread_local std::mt19937_64 rng(std::random_device{}());
-    uint64_t a = rng(), b = rng();
+    unsigned char b[16];
+    if (!os_random_bytes(b, sizeof(b)))
+        return std::string();   // empty => verify_money_nonce() can never match
     char buf[33];
-    std::snprintf(buf, sizeof(buf), "%016llx%016llx",
-                  static_cast<unsigned long long>(a),
-                  static_cast<unsigned long long>(b));
+    for (int i = 0; i < 16; ++i)
+        std::snprintf(buf + i * 2, 3, "%02x", static_cast<unsigned>(b[i]));
     return std::string(buf, 32);
 }
 
@@ -467,6 +527,105 @@ bool check_control_token(const std::string& presented) {
 void clear_control_token() {
     std::lock_guard<std::mutex> lk(g_mu);
     g_control_token.clear();
+}
+
+std::optional<std::string> load_control_token_file(const std::string& path,
+                                                   std::string* reason) {
+    auto refuse = [&](std::string why) -> std::optional<std::string> {
+        if (reason) *reason = std::move(why);
+        return std::nullopt;   // arm NOTHING
+    };
+    if (path.empty())
+        return refuse("empty path");
+
+#if defined(_WIN32)
+    // The launch seam relies on POSIX file semantics (O_NOFOLLOW, fstat mode
+    // bits, owner==euid). There is no equivalent guarantee here, so refuse by
+    // name and arm nothing — fail-closed, identical security posture.
+    (void)path;
+    return refuse("token-file seam unsupported on this platform");
+#else
+    // Open the file ONCE and validate the resulting fd — never re-resolve the
+    // path. A name-based lstat() then open-by-path is a TOCTOU: a symlink
+    // swapped in between the two can redirect the open at someone else's
+    // secret. O_NOFOLLOW makes a final-component symlink fail with ELOOP;
+    // O_CLOEXEC / O_NOCTTY are hygiene. Every check below runs on `fd`.
+    int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY);
+    if (fd < 0) {
+        if (errno == ELOOP)
+            return refuse("path is a symlink; refusing (provide a real regular file)");
+        return refuse(std::string("cannot open file (") +
+                      std::strerror(errno) + ")");
+    }
+    // Guarantee the fd is closed on every exit path below.
+    auto refuse_fd = [&](std::string why) -> std::optional<std::string> {
+        ::close(fd);
+        return refuse(std::move(why));
+    };
+
+    struct stat st{};
+    if (::fstat(fd, &st) != 0)
+        return refuse_fd(std::string("cannot stat file (") +
+                         std::strerror(errno) + ")");
+    if (!S_ISREG(st.st_mode))
+        return refuse_fd("path is not a regular file");
+
+    // Mode EXACTLY 0600 — no group/other bits, no setuid/setgid/exec.
+    const mode_t perm = st.st_mode & 07777;
+    if (perm != 0600) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%04o", static_cast<unsigned>(perm));
+        return refuse_fd(std::string("mode must be exactly 0600, found 0") + buf);
+    }
+
+    // Owner must be the current effective uid.
+    if (st.st_uid != ::geteuid())
+        return refuse_fd("file is not owned by the current (effective) user");
+
+    // Bounded size (a token file is tiny; refuse anything absurd before reading).
+    if (st.st_size > 4096)
+        return refuse_fd("token file is implausibly large (>4096 bytes)");
+
+    // Read from the SAME fd — no second path resolution.
+    std::string raw;
+    {
+        char rbuf[512];
+        for (;;) {
+            ssize_t n = ::read(fd, rbuf, sizeof(rbuf));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return refuse_fd(std::string("cannot read file (") +
+                                 std::strerror(errno) + ")");
+            }
+            if (n == 0) break;
+            raw.append(rbuf, static_cast<size_t>(n));
+            if (raw.size() > 4096)   // grew past the bound between fstat and read
+                return refuse_fd("token file is implausibly large (>4096 bytes)");
+        }
+    }
+    ::close(fd);
+
+    // Trim surrounding ASCII whitespace (a trailing newline is expected).
+    auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+               c == '\v' || c == '\f';
+    };
+    size_t b = 0, e = raw.size();
+    while (b < e && is_ws(static_cast<unsigned char>(raw[b])))  ++b;
+    while (e > b && is_ws(static_cast<unsigned char>(raw[e - 1]))) --e;
+    std::string token = raw.substr(b, e - b);
+
+    // Length 32..128, no interior whitespace, printable (non-control) only.
+    if (token.size() < 32 || token.size() > 128)
+        return refuse("token length must be 32-128 chars after trimming");
+    for (unsigned char c : token) {
+        if (is_ws(c))
+            return refuse("token contains interior whitespace");
+        if (c < 0x21 || c > 0x7e)
+            return refuse("token contains a non-printable/non-ASCII character");
+    }
+    return token;   // never logged by this function
+#endif  // _WIN32
 }
 
 TripwireState tripwire_state() {
