@@ -37,11 +37,12 @@
 //         key for key. A refused win moves owed_digest by zero bytes.
 //   SK-B  CONVERGENCE AT MATCHED CUTS: any two nodes holding the SAME settled
 //         block set hold the SAME owed_digest, byte for byte.
-//   SK-B2 AGREEMENT, finely sampled: for every block a PAIR of nodes BOTH
-//         settled, the E_b map each put into its own ledger is identical key
-//         for key. Whole settled SETS match rarely once coverage drops, so SK-B
-//         alone is a thin sample; this one runs thousands of times per soak and
-//         is the earliest sight of a real divergence.
+//   SK-B2 AGREEMENT (a consistency check, NOT the convergence gate): for every
+//         block a PAIR of nodes BOTH settled, the E_b map each put into its own
+//         ledger is identical key for key — counted ONCE per (pair, block).
+//         It is implied by SK-A (credit_map is only ever written on a path that
+//         already asserted equality against the winner's map), which is why the
+//         convergence GATE is SK-B's owed_digest comparison and not this.
 //   SK-C  NO ZOMBIE: at every quiescence checkpoint — the wire drained and the
 //         requester's tick() driven past its deadlines, which is what the
 //         daemon does on the carrier_send idle cadence — no RepairDriver holds
@@ -78,8 +79,27 @@
 //   SOAK_VAULT_HORIZON FrameVaultOptions::horizon_positions, 0 = shipped
 //   SOAK_VAULT_ENTRIES FrameVaultOptions::max_entries, 0 = shipped
 //   SOAK_CHECK_EVERY   rounds per quiescence checkpoint           (default 20)
-//   SOAK_STRICT        1 = a divergence at a matched cut is a FAILURE
+//   SOAK_STRICT        a divergence at a matched cut is FATAL     (default 1)
+//   SOAK_MIN_REPAIR_PCT  % of REPAIRABLE pairs that must be repaired (default 90)
+//   SOAK_QUIESCE_MS    virtual ms one quiescence may spend        (default 180000)
+//   SOAK_ARM_WINNER    1 = name the winner FIRST in the candidate list (probe)
 //   SOAK_VERBOSE       1 = per-win trace
+//
+// ── WHAT THE GATE IS, AND WHY IT IS ONE (the c2pool#1668 review, H-1..H-4) ──
+// The first cut of this soak measured honestly and gated badly:
+//   H-1 SK-3 was `credited_first_pass + repaired > 0` — satisfied by first-pass
+//       credits alone, so deleting the repair arm left the soak green. It is
+//       now SK-3a/b/c/d: cut-misses must exist, a repair must actually credit,
+//       and the REPAIRABLE pairs must be covered to SOAK_MIN_REPAIR_PCT.
+//   H-2 max_pos_repaired counted first-pass credits, so SK-A1 false-failed a
+//       lossless run. It now counts only credits that appeared AFTER the repair
+//       channel ran, and SK-A1 is the RETENTION pin (never a suffix repair)
+//       rather than the token-budget pin the F-1 fix retired.
+//   H-3 SK-B2 was cumulative (the same pair-block re-counted at every
+//       checkpoint — that is where "79 753 samples" came from) and tautological
+//       with SK-A. It is de-duplicated and demoted to a consistency check.
+//   H-4 the owed_digest comparison was non-fatal unless SOAK_STRICT=1. It is
+//       fatal by default, and SK-7a fails a run in which it was never sampled.
 //
 // Stdlib + Threads only, the self-harness shape of its siblings in this
 // directory.
@@ -142,6 +162,32 @@ static const char* kEmptyAnchor =
 static const ChainId CH     = 7;
 static const u64     D_CONF = 3;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// THE VIRTUAL CLOCK — the second substitution this file makes, and the reason
+// it can measure the serve-side budget at all.
+//
+// SupplyService's per-peer token bucket refills in REAL seconds, and
+// SupplyRequester's timeouts and (since the F-1 fix) its throttle backoff run
+// on the same clock. A soak compresses hours of block production into seconds
+// of wall time, so on the real clock the bucket is permanently empty, every
+// measured refusal is a harness artefact, and a backoff that waits 250 ms of
+// real time would make the run take days.
+//
+// So both halves of the supply channel are driven from ONE monotone virtual
+// clock that the harness advances explicitly — 50 ms at a time while a repair
+// is waiting on a budget or a backoff. That is not a fudge: it is the honest
+// model of the thing being measured, because the quantity that matters is
+// exactly "how many virtual SECONDS of serve budget does one repair consume",
+// and the report states it (REPAIR TIME below) so it can be compared against a
+// real block interval rather than hidden.
+static std::atomic<long long> g_vnanos{0};
+static std::chrono::steady_clock::time_point vnow() {
+    return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(g_vnanos.load()));
+}
+static void vadvance(std::chrono::nanoseconds d) {
+    g_vnanos.fetch_add(static_cast<long long>(d.count()));
+}
+
 // ── knobs ──────────────────────────────────────────────────────────────────
 static long   env_long(const char* k, long d) {
     const char* v = std::getenv(k);
@@ -169,11 +215,20 @@ struct SoakCfg {
     std::uint64_t vault_horizon = 0;     // 0 => shipped default
     std::size_t   vault_entries = 0;     // 0 => shipped default
     long          check_every = 20;
-    bool          strict      = false;
+    bool          strict      = true;    // ★ a divergence at a matched cut is FATAL
     bool          verbose     = false;
-    bool          arm_winner  = false;   // harness policy probe: ask the WINNER
+    bool          arm_winner  = false;   // harness policy probe: name the WINNER first
     bool          bucket_reset = true;   // model the idle time BETWEEN real blocks
     long          progress    = 200;     // rounds between progress lines
+    // ★ the gate: what share of the REPAIRABLE (peer, win) pairs must actually
+    // be credited. A pair is repairable when, at arm time, some connected
+    // candidate BOTH held the winner's cut and still retained lane position 0.
+    long          min_repair_pct = 90;
+    // How much VIRTUAL time one quiescence may spend letting the serve-side
+    // budget refill and the backoff schedule run, before the request is
+    // declared dead and expired. 180 s at the shipped burst/refill covers a
+    // repair of ~8600 carriers, which is the vault horizon (F-3) anyway.
+    long          quiesce_ms  = 180000;
 
     static SoakCfg from_env() {
         SoakCfg c;
@@ -191,7 +246,9 @@ struct SoakCfg {
         c.vault_horizon = (std::uint64_t)env_long("SOAK_VAULT_HORIZON", 0);
         c.vault_entries = (std::size_t)env_long("SOAK_VAULT_ENTRIES", 0);
         c.check_every   = env_long("SOAK_CHECK_EVERY", c.check_every);
-        c.strict        = env_long("SOAK_STRICT", 0) != 0;
+        c.strict        = env_long("SOAK_STRICT", 1) != 0;
+        c.min_repair_pct= env_long("SOAK_MIN_REPAIR_PCT", c.min_repair_pct);
+        c.quiesce_ms    = env_long("SOAK_QUIESCE_MS", c.quiesce_ms);
         c.verbose       = env_long("SOAK_VERBOSE", 0) != 0;
         c.arm_winner    = env_long("SOAK_ARM_WINNER", 0) != 0;
         c.bucket_reset  = env_long("SOAK_BUCKET_RESET", 1) != 0;
@@ -383,10 +440,17 @@ struct Node {
             serve->set_options(so);
         }
         fetch = std::make_unique<SupplyRequester>(send);
+        // Both halves on the harness's virtual clock (see vnow() above).
+        serve->set_clock(&vnow);
+        fetch->set_clock(&vnow);
         serve->set_spine_probe([this](std::uint32_t, u64 pos) -> std::optional<bytes32> {
             auto s = node->engine().snapshot(CH);
             if (s && s->next_pos == pos) return s->digest;
             return std::nullopt;
+        });
+        // ★ the cut probe the daemon binds: "did I publish exactly this cut?"
+        serve->set_cut_probe([this](std::uint32_t, u64 pos, const bytes32& spine) {
+            return node->engine().settlement_view_by_cut(CH, pos, spine) != nullptr;
         });
         repair = std::make_unique<RepairDriver>(*fetch, *index,
                                                 static_cast<std::uint32_t>(CH), p);
@@ -467,6 +531,19 @@ struct Metrics {
     std::uint64_t refused_first_pass = 0, armed = 0, arm_failed = 0;
     std::uint64_t armed_at_winner = 0, armed_at_other = 0;
     std::uint64_t coverage_ok = 0, coverage_miss = 0;   // per (peer, win) pair
+    // ── ★ the REPAIR gate's own numbers (H-1) ───────────────────────────────
+    // repairable   : at arm time SOME connected candidate held the winner's cut
+    //                AND still retained lane position 0 — i.e. a whole-prefix
+    //                replay was physically possible for this pair.
+    // repaired_pair: the block appeared in this node's ledger only AFTER the
+    //                repair channel ran (never on the first pass).
+    std::uint64_t repairable_pairs = 0, repairable_credited = 0;
+    std::uint64_t repaired_pairs = 0;          // credited after quiesce, any pair
+    std::uint64_t credited_unrepairable = 0;   // ★ must stay 0: a suffix repair
+    // why a pair was NOT repairable — the honest decomposition of the misses
+    std::uint64_t miss_winner_unreachable = 0; // the link to the winner was down
+    std::uint64_t miss_no_holder = 0;          // reachable, but nobody held the cut
+    std::uint64_t miss_horizon = 0;            // a holder, but its vault lost position 0
     std::uint64_t repaired = 0, repair_refused = 0, redrives = 0;
     std::uint64_t forced_ticks = 0, tick_timeouts = 0;
     std::uint64_t matched_cuts = 0, matched_equal = 0, divergences = 0;
@@ -474,9 +551,16 @@ struct Metrics {
     // the finely-sampled half of SK-B: every block a PAIR of nodes both settled
     std::uint64_t common_blocks = 0, common_equal = 0, common_disagreed = 0;
     // liveness bounds, measured
-    u64 max_pos_repaired = 0;
+    // ★ H-2: max_pos_repaired counts ONLY prefixes a REPLAY credited. It used
+    // to be bumped on first-pass credits too, which made it a measure of how
+    // far the lane got rather than of how far a repair reached — and made the
+    // SK-A1 pin false-fail on a lossless run where no repair ever ran.
+    u64 max_pos_repaired   = 0;
+    u64 max_pos_first_pass = 0;
     u64 min_pos_refused  = ~u64(0);
     u64 max_pos_refused  = 0;
+    // ★ the price of a repair, in the units the serve budget is denominated in
+    long long max_repair_ms = 0, total_repair_ms = 0;
     // boundedness, measured
     std::size_t max_vault_entries = 0, max_vault_bytes = 0;
     std::size_t max_deferred = 0, max_held = 0, max_in_flight = 0, max_bindings = 0;
@@ -487,6 +571,11 @@ struct Metrics {
     std::uint64_t serve_throttled = 0, order_failed = 0, fetch_failed = 0;
     std::uint64_t req_timeouts = 0, req_refused_busy = 0, deferred_drop = 0;
     std::uint64_t below_horizon_orders = 0;
+    // ★ F-1 / F-2 / F-4, as counters
+    std::uint64_t serve_throttled_replied = 0, throttle_retries = 0;
+    std::uint64_t throttle_exhausted = 0, peer_retried = 0, spine_refused = 0;
+    std::uint64_t candidates_out = 0;
+    std::uint64_t by_outcome[kRepairOutcomeCount] = {};
     std::uint64_t coalesced = 0, deferred_total = 0, resumed = 0, unservable = 0;
     std::uint64_t refused_late = 0, refused_payout = 0, owed_diverged = 0;
     std::string   first_break;      // the first SAFETY break, verbatim
@@ -553,6 +642,7 @@ int main() {
 
     Metrics M;
     M.rss_kb_start = rss_kb();
+    g_vnanos.store(std::chrono::steady_clock::now().time_since_epoch().count());
     LaneParams ratified{};                       // the OQ-5 ratified default (gate-OFF)
     std::mt19937_64 rng(cfg.seed);
     auto chance = [&rng](double p) {
@@ -619,20 +709,47 @@ int main() {
     // ── quiesce: drain the wire, then DRIVE tick() the way the daemon drives
     //    it on the carrier_send idle cadence. A request nobody answered (the
     //    server throttled it away, the peer went) only ever dies here.
-    auto vclock = std::chrono::steady_clock::now();
-    auto quiesce = [&]() {
-        for (int spin = 0; spin < 8; ++spin) {
+    // ── quiesce: drain the wire, and ADVANCE VIRTUAL TIME in small steps while
+    //    anything is still in flight, so the serve-side token bucket refills and
+    //    the requester's bounded throttle backoff actually fires — which is what
+    //    happens on a real node between two real blocks. Only when the virtual
+    //    budget is spent is a still-outstanding request declared dead and
+    //    expired, which is the harness's old behaviour and still the only way a
+    //    genuinely unanswered request dies.
+    //
+    //    Returns the virtual milliseconds this quiescence consumed: the price of
+    //    the repairs it ran, in the units the serve budget is denominated in.
+    const auto kStep = std::chrono::milliseconds(50);
+    auto quiesce = [&]() -> long long {
+        long long spent_ms = 0;
+        bool in_flight = false;
+        for (;;) {
             pump();
-            bool in_flight = false;
+            in_flight = false;
             for (auto& n : N) if (n->repair->in_flight() != 0) in_flight = true;
-            if (!in_flight) return;
-            // Nothing is on the wire and something is still in flight: its reply
-            // is never coming. Push the requester's clock past its deadline.
-            vclock += std::chrono::seconds(30);
-            ++M.forced_ticks;
-            for (auto& n : N) M.tick_timeouts += n->fetch->tick(vclock);
+            if (!in_flight) break;
+            if (spent_ms >= cfg.quiesce_ms) break;
+            vadvance(kStep);
+            spent_ms += kStep.count();
+            for (auto& n : N) M.tick_timeouts += n->fetch->tick(vnow());
+        }
+        if (in_flight) {
+            // The virtual budget is gone and something is STILL in flight: its
+            // reply is not coming. Push every deadline past, twice, so both a
+            // waiting request and the failure it turns into are drained.
+            for (int spin = 0; spin < 4 && in_flight; ++spin) {
+                vadvance(std::chrono::seconds(30));
+                ++M.forced_ticks;
+                for (auto& n : N) M.tick_timeouts += n->fetch->tick(vnow());
+                pump();
+                in_flight = false;
+                for (auto& n : N) if (n->repair->in_flight() != 0) in_flight = true;
+            }
         }
         pump();
+        M.max_repair_ms = std::max(M.max_repair_ms, spent_ms);
+        M.total_repair_ms += spent_ms;
+        return spent_ms;
     };
 
     // ── the SAFETY assertions, evaluated inline so the first break is exact ──
@@ -640,6 +757,8 @@ int main() {
         if (M.first_break.empty()) { M.first_break = what; M.first_break_round = round; }
     };
 
+    // (pair of node indices, bid) already compared — H-3's de-duplication
+    std::set<std::pair<std::pair<int, int>, std::string>> seen_pair;
     std::uint64_t bid_counter = 0x5000;
     std::uint64_t salt = 1;
     long filler = 0;
@@ -741,6 +860,9 @@ int main() {
             N[w]->credit_map[bid] = won.cut.credit;
 
             const PeerWin pw = peer_win_of(bid, h, won.cut, won.emitted, owed_at_win);
+            // node index -> was a whole-prefix repair PHYSICALLY possible for
+            // this (peer, win) pair at the moment it was armed
+            std::map<int, bool> repairable_by_node;
             if (cfg.verbose)
                 std::printf("   [r%ld] win by n%d bid=%s P=%llu credit=%lld keys=%zu\n",
                             round, w, bid.substr(0, 12).c_str(),
@@ -755,6 +877,8 @@ int main() {
                 const BlockEventDriver::RegisterResult r = N[i]->bed->on_peer_block_found(pw);
                 if (r.registered) {
                     ++M.credited_first_pass;
+                    M.max_pos_first_pass =
+                        std::max<u64>(M.max_pos_first_pass, pw.cut_next_pos);
                     const EbCut& pc = N[i]->node->last_peer_cut();
                     // ★ SK-A: the fold ran at the WINNER'S prefix with the
                     //   WINNER'S commitment, and produced the WINNER'S E_b.
@@ -777,17 +901,16 @@ int main() {
                                               std::to_string(i) + ", bid " + bid + ")");
                         safety_broken = true;
                     }
-                    // Arm the repair the way main_v37_btc_dash.cpp arms it: walk
-                    // the connected peers in the transport's own (arbitrary)
-                    // order and take the FIRST that accepts the request. The
-                    // order is shuffled here so the result is not an artefact of
-                    // this harness always asking node index 0 first.
+                    // ★ F-2: arm the repair the way main_v37_btc_dash.cpp arms
+                    // it NOW — hand the driver the whole connected set as an
+                    // ORDERED CANDIDATE LIST and let it walk. The order is
+                    // SHUFFLED so the measurement is not an artefact of this
+                    // harness always naming the winner (or node 0) first: the
+                    // daemon cannot identify the winner's peer id, so neither
+                    // does the default run.
                     //
-                    // SOAK_ARM_WINNER=1 runs the OTHER policy — ask the peer that
-                    // announced the win — as a controlled probe, because under
-                    // ruling A the ordered prefix is NODE-LOCAL: a peer that
-                    // dropped the same share holds a different order and its
-                    // honest answer replays to a different digest.
+                    // SOAK_ARM_WINNER=1 puts the winner FIRST as a controlled
+                    // probe of what perfect winner identification would buy.
                     std::vector<int> cand;
                     for (int j = 0; j < cfg.nodes; ++j)
                         if (j != i && mesh.link_up(i, j)) cand.push_back(j);
@@ -796,15 +919,45 @@ int main() {
                         auto it = std::find(cand.begin(), cand.end(), w);
                         if (it != cand.end()) { cand.erase(it); cand.insert(cand.begin(), w); }
                     }
-                    bool armed = false;
+                    // ── ★ WAS THIS PAIR REPAIRABLE AT ALL (H-1's denominator)?
+                    // A whole-prefix replay needs a candidate that BOTH holds
+                    // the winner's own cut (its lane agrees at P, so its honest
+                    // order replays to the winner's digest) AND still retains
+                    // lane position 0 in its vault (F-3's horizon). Anything
+                    // else is a refusal the repair machinery cannot be blamed
+                    // for, and it does not belong in the gate's denominator.
+                    bool repairable = false, any_holder = false;
                     for (int j : cand) {
-                        if (N[i]->repair->arm(Mesh::pid_of(j), pw.bid, pw.cut_next_pos,
-                                              pw.cut_spine_digest)) {
-                            armed = true;
-                            ++M.armed;
-                            if (j == w) ++M.armed_at_winner; else ++M.armed_at_other;
+                        const bool holds_cut =
+                            N[j]->node->engine().settlement_view_by_cut(
+                                CH, pw.cut_next_pos, pw.cut_spine_digest) != nullptr;
+                        if (!holds_cut) continue;
+                        any_holder = true;
+                        if (N[j]->relay->vault().lowest_position() == 0) {
+                            repairable = true;
                             break;
                         }
+                    }
+                    if (repairable) {
+                        ++M.repairable_pairs;
+                    } else if (any_holder) {
+                        ++M.miss_horizon;          // ★ F-3, exactly
+                    } else if (std::find(cand.begin(), cand.end(), w) == cand.end()) {
+                        ++M.miss_winner_unreachable;
+                    } else {
+                        ++M.miss_no_holder;
+                    }
+                    repairable_by_node[i] = repairable;
+
+                    std::vector<CarrierPeerNode::PeerId> pids;
+                    for (int j : cand) pids.push_back(Mesh::pid_of(j));
+                    bool armed = false;
+                    if (!pids.empty() &&
+                        N[i]->repair->arm_candidates(pids, pw.bid, pw.cut_next_pos,
+                                                     pw.cut_spine_digest)) {
+                        armed = true;
+                        ++M.armed;
+                        if (cand.front() == w) ++M.armed_at_winner; else ++M.armed_at_other;
                     }
                     if (!armed) ++M.arm_failed;
                 }
@@ -813,7 +966,7 @@ int main() {
             if (safety_broken) break;
 
             // (3b) run the repair channel to completion.
-            quiesce();
+            (void)quiesce();
 
             // (3c) whatever the repair produced, it is either the winner's own
             //      fold or nothing at all. Re-check every node.
@@ -842,6 +995,20 @@ int main() {
                     for (const auto& [k, v] : pc.credit) { (void)k; s += v; }
                     N[i]->credit_of[bid] = s;
                     N[i]->credit_map[bid] = pc.credit;
+                    // ★ THIS is a repair credit: it did not exist before the
+                    // channel ran. H-2: only these move max_pos_repaired.
+                    ++M.repaired_pairs;
+                    M.max_pos_repaired = std::max<u64>(M.max_pos_repaired, pw.cut_next_pos);
+                    auto rit = repairable_by_node.find(i);
+                    if (rit != repairable_by_node.end() && rit->second) {
+                        ++M.repairable_credited;
+                    } else {
+                        // ★ SK-A1's replacement pin: a repair credited a cut
+                        // that NO candidate could serve whole. Either the
+                        // harness's repairable predicate is wrong or a SUFFIX
+                        // was replayed — the second would be a safety bug.
+                        ++M.credited_unrepairable;
+                    }
                 }
             }
             if (safety_broken) break;
@@ -853,7 +1020,6 @@ int main() {
                                  N[i]->node->ledger().is_settled(bid);
                 if (reg) {
                     ++M.coverage_ok;
-                    M.max_pos_repaired = std::max<u64>(M.max_pos_repaired, pw.cut_next_pos);
                 } else {
                     ++M.coverage_miss;
                     M.min_pos_refused = std::min<u64>(M.min_pos_refused, pw.cut_next_pos);
@@ -910,7 +1076,7 @@ int main() {
 
         // (6) the CHECKPOINT: quiesce, then SK-B and SK-C.
         if (round % cfg.check_every == 0) {
-            quiesce();
+            (void)quiesce();
             for (int i = 0; i < cfg.nodes; ++i) {
                 // SK-C no zombie
                 if (N[i]->repair->in_flight() != 0 || N[i]->repair->bindings() != 0 ||
@@ -924,15 +1090,19 @@ int main() {
                 }
             }
             if (safety_broken) break;
-            // ── SK-B2 the FINELY SAMPLED half of convergence ─────────────────
-            // A whole settled SET matches rarely once coverage drops, so the
-            // set-level comparison below is a thin sample. This one is not: for
-            // every block a PAIR of nodes BOTH settled, the E_b map each of them
-            // put into its own ledger must be identical, key for key. Two
-            // ledgers that agree on every block they share and are built by the
-            // same fold cannot disagree on owed_digest over that shared set — so
-            // a break here is the earliest possible sight of a real divergence,
-            // thousands of samples per run instead of a handful.
+            // ── SK-B2, DEMOTED TO A REPORT LINE (H-3) ────────────────────────
+            // This used to be a GATE, and it was tautological: credit_map is
+            // written only on the paths where SK-A has ALREADY asserted
+            // `pc.credit == won.cut.credit` against the winner's own map, so
+            // every entry equals the winner's by construction and a pair can
+            // only differ if SK-A already broke. It also re-walked the whole
+            // cumulative settled set at every checkpoint, counting the same
+            // pair-block thousands of times and calling each pass a "sample" —
+            // which is where the 79 753 in the c2pool#1668 PR body came from.
+            // It is kept as a CHEAP CONSISTENCY CHECK, counted ONCE per
+            // (pair, block) and never again, and the real cross-node property
+            // is SK-B below: owed_digest byte-equality, which is computed by
+            // the LEDGER's own fold and is not implied by SK-A at all.
             for (int i = 0; i < cfg.nodes && !safety_broken; ++i)
                 for (int j = i + 1; j < cfg.nodes && !safety_broken; ++j) {
                     const Node& a = *N[i];
@@ -944,6 +1114,9 @@ int main() {
                         auto ia = small.credit_map.find(bid);
                         auto ib = big.credit_map.find(bid);
                         if (ia == small.credit_map.end() || ib == big.credit_map.end()) continue;
+                        // ★ H-3: ONCE per (pair, block), ever.
+                        if (!seen_pair.insert(std::make_pair(std::make_pair(i, j), bid)).second)
+                            continue;
                         ++M.common_blocks;
                         if (ia->second == ib->second) ++M.common_equal;
                         else {
@@ -1001,12 +1174,12 @@ int main() {
 
     // ── the final drain + the last checkpoint ────────────────────────────────
     mute();
-    quiesce();
+    (void)quiesce();
     for (int k = 0; k <= (int)D_CONF + 2; ++k) coin->append_block("z" + std::to_string(k));
     for (int i = 0; i < cfg.nodes; ++i)
         for (const auto& st : N[i]->bed->on_tip(coin->best_tip()))
             N[i]->settled.insert(st.bid);
-    quiesce();
+    (void)quiesce();
     unmute();
 
     // gather the cause histogram
@@ -1016,6 +1189,15 @@ int main() {
         const RepairStats      rs = N[i]->repair->stats();
         const S1PeerStats      ps = N[i]->node->s1c_stats();
         M.serve_throttled += ss.throttled;
+        M.serve_throttled_replied += ss.throttled_replied;
+        M.throttle_retries   += fs.throttle_retries;
+        M.throttle_exhausted += fs.throttle_exhausted;
+        M.peer_retried    += rs.peer_retried;
+        M.spine_refused   += rs.spine_refused;
+        M.candidates_out  += rs.candidates_out;
+        M.below_horizon_orders += rs.order_below_horizon;
+        for (std::size_t x = 0; x < kRepairOutcomeCount; ++x)
+            M.by_outcome[x] += rs.by_outcome[x];
         M.req_timeouts    += fs.timeouts;
         M.req_refused_busy+= fs.refused_busy;
         M.repaired        += rs.repaired;
@@ -1047,17 +1229,24 @@ int main() {
                 (unsigned long long)M.wins, (unsigned long long)M.peer_offers,
                 (unsigned long long)M.credited_first_pass,
                 (unsigned long long)M.refused_first_pass);
-    std::printf("   repair    : armed=%llu (at_winner=%llu at_other_peer=%llu) "
+    std::printf("   repair    : armed=%llu (first candidate was the winner=%llu, "
+                "another peer=%llu) "
                 "arm_failed=%llu REPAIRED=%llu refused=%llu redrives=%llu\n",
                 (unsigned long long)M.armed, (unsigned long long)M.armed_at_winner,
                 (unsigned long long)M.armed_at_other, (unsigned long long)M.arm_failed,
                 (unsigned long long)M.repaired, (unsigned long long)M.repair_refused,
                 (unsigned long long)M.redrives);
     {
-        const long long replay_refused =
-            (long long)M.repair_refused - (long long)M.fetch_failed - (long long)M.order_failed;
+        // ★ from the OUTCOME HISTOGRAM, not from a subtraction. The old line
+        // derived "replay-digest" as refused - fetch_failed - order_failed,
+        // which went NEGATIVE the moment order_failed started counting (F-4):
+        // order_failed counts per-CANDIDATE order refusals while `refused`
+        // counts per-JOB finishes, and one job can now refuse several
+        // candidates' orders before it gives up.
+        const unsigned long long replay_refused =
+            (unsigned long long)M.by_outcome[(std::size_t)RepairOutcome::DIGEST_MISMATCH];
         std::printf("   COVERAGE  : (peer,win) pairs credited=%llu of %llu (%.1f%%) | "
-                    "refusals: transport=%llu order=%llu replay-digest=%lld\n",
+                    "refusals: transport=%llu order=%llu replay-digest=%llu\n",
                     (unsigned long long)M.coverage_ok,
                     (unsigned long long)(M.coverage_ok + M.coverage_miss),
                     (M.coverage_ok + M.coverage_miss)
@@ -1066,12 +1255,30 @@ int main() {
                     (unsigned long long)M.fetch_failed, (unsigned long long)M.order_failed,
                     replay_refused);
     }
-    std::printf("   causes    : serve_throttled=%llu req_timeouts=%llu order_failed=%llu "
-                "fetch_failed=%llu refused_busy=%llu deferred_drop=%llu\n",
-                (unsigned long long)M.serve_throttled, (unsigned long long)M.req_timeouts,
-                (unsigned long long)M.order_failed, (unsigned long long)M.fetch_failed,
+    std::printf("   causes    : serve_throttled=%llu (answered=%llu) req_timeouts=%llu "
+                "order_failed=%llu (below_horizon=%llu) fetch_failed=%llu refused_busy=%llu "
+                "deferred_drop=%llu\n",
+                (unsigned long long)M.serve_throttled,
+                (unsigned long long)M.serve_throttled_replied,
+                (unsigned long long)M.req_timeouts,
+                (unsigned long long)M.order_failed,
+                (unsigned long long)M.below_horizon_orders,
+                (unsigned long long)M.fetch_failed,
                 (unsigned long long)M.req_refused_busy,
                 (unsigned long long)M.deferred_drop);
+    std::printf("   F-1 fix   : throttle retries=%llu exhausted=%llu  |  F-2 fix: "
+                "candidate retries=%llu spine_refused=%llu exhausted=%llu\n",
+                (unsigned long long)M.throttle_retries,
+                (unsigned long long)M.throttle_exhausted,
+                (unsigned long long)M.peer_retried,
+                (unsigned long long)M.spine_refused,
+                (unsigned long long)M.candidates_out);
+    std::printf("   OUTCOMES  :");
+    for (std::size_t x = 0; x < kRepairOutcomeCount; ++x)
+        if (M.by_outcome[x])
+            std::printf(" %s=%llu", repair_outcome_name(static_cast<RepairOutcome>(x)),
+                        (unsigned long long)M.by_outcome[x]);
+    std::printf("\n");
     std::printf("   queue     : coalesced=%llu deferred=%llu resumed=%llu deferred_drop=%llu "
                 "unservable=%llu\n",
                 (unsigned long long)M.coalesced, (unsigned long long)M.deferred_total,
@@ -1084,19 +1291,50 @@ int main() {
         (M.min_pos_refused == ~u64(0))
             ? std::string("none")
             : std::to_string((unsigned long long)M.min_pos_refused);
-    std::printf("   LIVENESS  : largest prefix P a repair CREDITED = %llu ; "
-                "smallest P refused = %s ; largest P refused = %llu\n",
-                (unsigned long long)M.max_pos_repaired, min_ref.c_str(),
+    std::printf("   LIVENESS  : largest prefix P a REPAIR credited = %llu ; largest P "
+                "credited on the FIRST pass = %llu ; smallest P refused = %s ; "
+                "largest P refused = %llu\n",
+                (unsigned long long)M.max_pos_repaired,
+                (unsigned long long)M.max_pos_first_pass, min_ref.c_str(),
                 (unsigned long long)M.max_pos_refused);
-    // ── the derived transport bound, stated so the measurement can be checked
-    //    against arithmetic rather than believed. ONE repair over [0, P) costs
-    //    ceil(P / kCtrlMaxIdsPerOrder) GETORDER + ceil(P / kCtrlMaxIdsPerFetch)
-    //    GETFRAMES requests, issued back to back (each is sent from the callback
-    //    of the previous reply), and SupplyService spends ONE token per request
-    //    from a bucket that starts at `burst` and refills in real seconds. So a
-    //    repair can only finish while
-    //        ceil(P/4096) + ceil(P/64) <= burst
-    //    which for the shipped burst of 8 is P <= 448.
+    std::printf("   REPAIR    : repairable (peer,win) pairs=%llu of which CREDITED=%llu "
+                "(%.1f%%) ; repairs that credited=%llu ; credited-but-unrepairable=%llu\n",
+                (unsigned long long)M.repairable_pairs,
+                (unsigned long long)M.repairable_credited,
+                M.repairable_pairs
+                    ? 100.0 * (double)M.repairable_credited / (double)M.repairable_pairs
+                    : 0.0,
+                (unsigned long long)M.repaired_pairs,
+                (unsigned long long)M.credited_unrepairable);
+    std::printf("   NOT-REPAIRABLE: winner unreachable=%llu ; reachable but no peer held "
+                "the winner's cut=%llu ; a holder, but its vault had evicted lane "
+                "position 0 (F-3)=%llu\n",
+                (unsigned long long)M.miss_winner_unreachable,
+                (unsigned long long)M.miss_no_holder,
+                (unsigned long long)M.miss_horizon);
+    // ★ THE PRICE OF A REPAIR, in the units the serve budget is denominated in.
+    // A repair over [0, P) costs ceil(P/4096) GETORDER + ceil(P/64) GETFRAMES
+    // requests; the first `burst` are free and the rest arrive at
+    // refill_per_sec, so the wall time one repair needs is roughly
+    //     (ceil(P/4096) + ceil(P/64) - burst) / refill   seconds.
+    // With the F-1 fix that is a DELAY, not a ceiling — the request is answered
+    // THROTTLED and re-sent instead of dropped — so the number to watch is no
+    // longer "the largest P a repair can afford" but "how long the largest one
+    // took", against the chain's block interval.
+    std::printf("   REPAIR TIME: virtual seconds one quiescence spent, max=%.1f s "
+                "total=%.1f s (serve burst=%.0f refill=%.1f/s; a repair over P needs "
+                "~(P/%u + P/%u - burst)/refill s)\n",
+                (double)M.max_repair_ms / 1000.0, (double)M.total_repair_ms / 1000.0,
+                cfg.burst > 0.0 ? cfg.burst : 8.0,
+                cfg.refill > 0.0 ? cfg.refill : 2.0,
+                (unsigned)kCtrlMaxIdsPerOrder, (unsigned)kCtrlMaxIdsPerFetch);
+    // ── the OLD transport ceiling, kept only so a regression is legible. Before
+    //    F-1 a request that ran out of tokens was DROPPED with no reply, so one
+    //    repair could never cover more than
+    //        ceil(P/4096) + ceil(P/64) <= burst   =>   P <= 448 at burst 8,
+    //    and the measured max credited prefix sat right underneath it (441).
+    //    With the throttle answered and the ask re-sent, that ceiling is gone:
+    //    the same repair now costs TIME (see REPAIR TIME above), not coverage.
     const double burst_used = cfg.burst > 0.0 ? cfg.burst : 8.0;
     u64 p_bound = 0;
     for (u64 p = 64; p <= (u64)1 << 22; p += 64) {
@@ -1105,11 +1343,13 @@ int main() {
         if (need > burst_used) break;
         p_bound = p;
     }
-    std::printf("   TRANSPORT : serve burst=%.0f tok, %u ids/ORDER, %u ids/GETFRAMES "
-                "=> ONE repair can cover at most P=%llu carriers; measured max "
-                "credited P=%llu\n",
-                burst_used, (unsigned)kCtrlMaxIdsPerOrder, (unsigned)kCtrlMaxIdsPerFetch,
-                (unsigned long long)p_bound, (unsigned long long)M.max_pos_repaired);
+    std::printf("   TRANSPORT : the PRE-F-1 one-burst ceiling was P<=%llu (burst=%.0f, "
+                "%u ids/ORDER, %u ids/GETFRAMES); measured max REPAIRED P=%llu %s\n",
+                (unsigned long long)p_bound, burst_used,
+                (unsigned)kCtrlMaxIdsPerOrder, (unsigned)kCtrlMaxIdsPerFetch,
+                (unsigned long long)M.max_pos_repaired,
+                M.max_pos_repaired > p_bound ? "(PAST the old ceiling: F-1 is live)"
+                                             : "(at or under the old ceiling)");
     std::printf("   BOUNDS    : vault entries<=%zu bytes<=%zu | deferred<=%zu held<=%zu "
                 "in_flight<=%zu bindings<=%zu | verified-view cache<=%zu\n",
                 M.max_vault_entries, M.max_vault_bytes, M.max_deferred, M.max_held,
@@ -1175,8 +1415,43 @@ int main() {
 
     // SK-A/SK-B/SK-C/SK-D/SK-E, restated as end-state checks so a green run
     // says so in one line each.
-    check(M.credited_first_pass + M.repaired > 0,
-          "SK-3 the repair mechanism is ALIVE on this schedule (something credited)");
+    // ── ★ SK-3, THE REPAIR GATE (H-1) ───────────────────────────────────────
+    // The old SK-3 was `credited_first_pass + repaired > 0`, which first-pass
+    // credits satisfy on their own: `repair->arm()` could be deleted outright
+    // and the soak stayed green. It proved nothing. These three do:
+    //   3a the schedule really produced cut-misses (otherwise there was nothing
+    //      for a repair to do and the rest of the gate is vacuous);
+    //   3b the repair machinery actually ran and credited something — this is
+    //      the one that FAILS the moment arm() is stubbed out;
+    //   3c of the pairs a whole-prefix repair was PHYSICALLY possible for, at
+    //      least SOAK_MIN_REPAIR_PCT% were credited.
+    // A LOSSLESS schedule has no cut-miss to close, so the repair gate would be
+    // vacuous — and demanding repairs of it is exactly the H-2 false-fail. It
+    // gets the complementary property instead, which is just as strong for the
+    // run it describes: with nothing dropped, every peer win must be credited on
+    // the FIRST pass.
+    const bool lossy = (cfg.p_drop > 0.0 || cfg.p_delay > 0.0 || cfg.p_flap > 0.0);
+    if (!lossy) {
+        check(M.refused_first_pass == 0 && M.coverage_miss == 0,
+              "SK-3 (lossless schedule) every peer win was credited on the FIRST pass — "
+              "there is no cut-miss for a repair to close");
+    } else {
+        check(M.refused_first_pass > 0,
+              "SK-3a the schedule produced real cut-misses (there was work for the repair)");
+        check(M.repaired > 0 && M.repaired_pairs > 0,
+              "SK-3b ★ THE REPAIR RAN AND CREDITED: replays completed and blocks entered "
+              "ledgers that had refused them on the first pass");
+        const bool enough =
+            M.repairable_pairs > 0 &&
+            M.repairable_credited * 100 >=
+                static_cast<std::uint64_t>(cfg.min_repair_pct) * M.repairable_pairs;
+        check(enough,
+              "SK-3c ★ COVERAGE: of the (peer, win) pairs some connected candidate could "
+              "have served whole, at least SOAK_MIN_REPAIR_PCT% were repaired");
+        check(M.spine_refused + M.peer_retried > 0 || cfg.nodes < 3,
+              "SK-3d ★ the CANDIDATE WALK is exercised: at least one repair moved past a "
+              "peer that could not serve the winner's cut");
+    }
     {
         bool zombie = false;
         for (int i = 0; i < cfg.nodes; ++i)
@@ -1211,18 +1486,32 @@ int main() {
               "SK-6 ★ NO DOUBLE CREDIT: every node's Σ finalW is exactly the sum of "
               "the credits it registered for the blocks it settled");
     }
-    // ★ THE MEASURED TRANSPORT BOUND, pinned. This is a REGRESSION pin, not a
-    // pass/fail on the bound's value: a repair may never credit a prefix bigger
-    // than the serve-side token budget can pay for, and if a later change makes
-    // one possible the pin simply stops being tight (the check still passes).
-    check(M.max_pos_repaired <= p_bound || p_bound == 0,
-          "SK-A1 every repair that CREDITED was inside the serve-side request "
-          "budget the transport constants allow (measured <= derived bound)");
-    check(M.common_disagreed == 0 && M.common_blocks > 0,
-          "SK-B2 ★ AGREEMENT: every block two nodes BOTH settled was settled with the "
-          "SAME E_b map, key for key");
+    // ★ SK-A1, RE-DERIVED (H-2). The old pin was `max_pos_repaired <= p_bound`,
+    // the serve-side TOKEN bound — which (a) counted first-pass credits, so a
+    // lossless run with P > 448 false-failed it although no repair had run, and
+    // (b) stops being a law at all now that a throttled request is re-sent
+    // rather than dropped. The honest pin in its place is the RETENTION one,
+    // and it is the property that actually matters for safety: a repair must
+    // never credit a cut that no candidate could serve WHOLE, because the lane
+    // digest at P is a fold over [0, P) and a suffix replay would be a
+    // wrong-prefix fold. It stays tight until F-3 lands.
+    check(M.credited_unrepairable == 0,
+          "SK-A1 ★ NEVER A SUFFIX REPAIR: every repair that credited had a candidate "
+          "that held the winner's cut AND still retained lane position 0");
+    check(M.common_disagreed == 0,
+          "SK-B2 AGREEMENT (consistency, once per pair-block): no block two nodes both "
+          "settled was settled with different E_b maps");
+    // ★ SK-7 is now FATAL BY DEFAULT (H-4) and NON-VACUOUS. owed_digest equality
+    // is the one cross-node property SK-A does not already imply: it is computed
+    // by the LEDGER's own fold over its own entries, not by comparing harness
+    // bookkeeping. `matched_cuts > 0` is the non-vacuity half — a run in which
+    // no two nodes ever held the same settled set never sampled it at all.
+    check(M.matched_cuts > 0,
+          "SK-7a the owed_digest comparison was actually SAMPLED (some pair of nodes "
+          "held the same settled set at a checkpoint)");
     check(M.divergences == 0 || !cfg.strict,
-          "SK-7 ★ CONVERGENCE at matched cuts (SOAK_STRICT makes a divergence fatal)");
+          "SK-7 ★★ CONVERGENCE: at every matched cut the two nodes' owed_digest was "
+          "BYTE-EQUAL (fatal by default; SOAK_STRICT=0 downgrades it to a report)");
     if (M.divergences != 0)
         std::printf("  NOTE: %llu of %llu matched cuts DIVERGED — see the LIVENESS line "
                     "above for the prefix at which repairs stopped completing.\n",
