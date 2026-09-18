@@ -345,8 +345,15 @@ struct Node {
         });
         // ★ Stage 2 / S3: a finished repair re-drives the one-shot refused win.
         repair->set_redrive([this](const std::string& bid, const RepairResult&) {
-            { std::lock_guard<std::mutex> lk(redrive_mtx); redriven.push_back(bid); }
+            // Register the re-driven win FIRST, then record the re-drive. finish()
+            // drops in_flight() and bumps repaired/refused UNDER ITS LOCK, then
+            // invokes this callback with the lock released. Recording the re-drive
+            // only after redrive_peer_block_found() has returned makes
+            // redrive_count() a COMPLETION signal the harness can wait on — closing
+            // the sampling race where in_flight()==0 was observed before the ledger
+            // had registered the re-driven win.
             (void)bed->redrive_peer_block_found(bid);
+            { std::lock_guard<std::mutex> lk(redrive_mtx); redriven.push_back(bid); }
         });
     }
     ~Node() { if (net) net->stop(); if (node) node->stop(); }
@@ -495,7 +502,18 @@ static RunOut run_pair(const LaneParams& params, bool late, bool do_repair,
             const RepairStats rs = B.repair->stats();
             return rs.repaired + rs.refused > 0;
         });
-        (void)wait_until([&] { return B.repair->in_flight() == 0; });
+        // Drain not just the fetch (in_flight()==0) but the S3 re-drive that
+        // finish() fires AFTER releasing its lock: redrive_count() is bumped only
+        // once redrive_peer_block_found() has returned, so this is the point at
+        // which final_registered / repair_hit / owed are all settled. Every
+        // do_repair arm arms exactly one repair, and finish() calls the re-drive
+        // callback on every terminal outcome (verified OR refused), so the count
+        // reaches 1 on all paths. A re-drive that genuinely never lands still
+        // times out here and REDs — this removes a sample-too-early race, not a
+        // defect.
+        (void)wait_until([&] {
+            return B.repair->in_flight() == 0 && B.redrive_count() >= 1;
+        });
     }
     r.rs = B.repair->stats();
     r.ps = B.node->s1c_stats();
