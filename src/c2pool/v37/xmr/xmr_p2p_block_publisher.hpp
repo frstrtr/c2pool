@@ -87,6 +87,31 @@ public:
     void enable_network_relay(bool on) { m_enabled.store(on); }
     bool network_relay_enabled() const { return m_enabled.load(); }
 
+    // SOLO MODE (--native-solo), OFF by default.
+    //
+    // The success condition below is reached_network(): at least one peer took
+    // the frame. On a solo node there are no peers and no daemon BY
+    // CONSTRUCTION, so that condition can never be met, and a real, valid,
+    // RandomX-gated block would be dropped on the floor -- the node would mine
+    // its own chain forever and book nothing.
+    //
+    // With this on, a block that reached nobody but that OUR OWN CHAIN INDEX
+    // accepted (RelayConfig::submit_to_own_index, the D-14 PREFER-OWN push)
+    // still enters the settlement ledger as found. That is a genuinely weaker
+    // claim than monerod's "OK" or a peer's receipt, and it is counted and
+    // labelled separately everywhere so it cannot be read as the stronger one:
+    // solo_landed() is its own counter, and the FoundBlockEvent carries
+    // HeaderCheck::NotRun exactly as the relayed path does.
+    //
+    // It is sound for the case it is for: on a private chain WE are the
+    // network, the index validated the block on the way in (parse, id, PoW at
+    // the template's difficulty, connect checks), and the canonical test that
+    // settlement matures against is that same index -- so a block the index did
+    // not take never finalizes, solo or not. It is not sound anywhere else,
+    // which is why it is a flag and not a fallback.
+    void enable_solo_own_index(bool on) { m_solo.store(on); }
+    bool solo_own_index_enabled() const { return m_solo.load(); }
+
     void on_accepted_share(const strat::AcceptedShare& s) override {
         m_accepted.fetch_add(1);
         if (s.is_network_block)
@@ -130,14 +155,23 @@ public:
         const ::c2pool::xmr::native::BlockRelayVerdict v =
             bridge.relay(c, nonce, extra_nonce, /*pow_accepted=*/true);
 
+        bool solo_landing = false;
         if (!v.reached_network()) {
-            m_failed.fetch_add(1);
-            set_error("relay: block reached NO peer: " +
-                      (v.why.empty() ? std::string("(no reason given)") : v.why));
-            return;
+            // The solo opt-in, and ONLY it, rescues a block nobody received.
+            if (!(m_solo.load() && v.landed_own_chain())) {
+                m_failed.fetch_add(1);
+                set_error("relay: block reached NO peer: " +
+                          (v.why.empty() ? std::string("(no reason given)") : v.why));
+                return;
+            }
+            solo_landing = true;
+            m_solo_landed.fetch_add(1);
+            set_error("relay: SOLO — block reached no peer and no daemon; our own chain index "
+                      "accepted it (this is a weaker claim than a peer receipt, and is only "
+                      "honoured because --native-solo was asked for)");
         }
 
-        m_relayed.fetch_add(1);
+        if (!solo_landing) m_relayed.fetch_add(1);
         m_peers.fetch_add(static_cast<std::uint64_t>(v.p2p_peers_sent));
 
         sub::FoundBlockEvent ev;
@@ -154,12 +188,17 @@ public:
         ev.rpc_ms       = 0.0;                        // and none was called
         ev.at           = std::chrono::steady_clock::now();
         m_found.push(std::move(ev));
-        set_error({});
+        // A solo landing keeps its explanation: clearing it here would leave the
+        // status line claiming a clean relay for a block that reached nobody.
+        if (!solo_landing) set_error({});
     }
 
     // --- diagnostics ---------------------------------------------------------
     std::uint64_t calls()    const { return m_calls.load(); }
     std::uint64_t relayed()  const { return m_relayed.load(); }
+    // Blocks booked on the strength of our own chain index alone (solo mode).
+    // Kept OUT of relayed() so the two can never be added up by accident.
+    std::uint64_t solo_landed() const { return m_solo_landed.load(); }
     std::uint64_t peers()    const { return m_peers.load(); }
     std::uint64_t refused()  const { return m_refused.load(); }
     std::uint64_t failed()   const { return m_failed.load(); }
@@ -180,8 +219,10 @@ private:
     sub::FoundBlockQueue&    m_found;
     CandidateLookup          m_lookup;
     std::atomic<bool>        m_enabled{false};
+    std::atomic<bool>        m_solo{false};
     std::atomic<std::uint64_t> m_calls{0}, m_relayed{0}, m_peers{0},
-                               m_refused{0}, m_failed{0}, m_stale{0};
+                               m_refused{0}, m_failed{0}, m_stale{0},
+                               m_solo_landed{0};
     std::atomic<std::size_t>   m_accepted{0};
     mutable std::mutex         m_mtx;
     std::string                m_last_error;

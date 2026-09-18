@@ -95,6 +95,7 @@
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
 #include "impl/xmr/native/node/xmr_chain_boot.hpp"
+#include "impl/xmr/native/node/xmr_genesis_blob.hpp"
 #include "impl/xmr/native/node/xmr_monerod_http.hpp"
 #include "impl/xmr/native/node/xmr_sync_driver.hpp"
 #include "impl/xmr/native/node/xmr_worker_loops.hpp"
@@ -336,6 +337,15 @@ public:
         if (!init_pow_(why)) return false;
 
         // --- the trust root, when it does not come off the wire ---------------
+        // The SOLO trust root: assembled here, checked by the same gate the
+        // levin path uses. A node with no peers cannot ask for the genesis
+        // blob, and without row 0 the index has no tip, no difficulty window
+        // and therefore no template -- so this is the one thing that has to
+        // happen before a peerless node can do anything at all.
+        if (cfg_.boot == BootMode::LocalGenesis) {
+            if (!boot_.boot_from_local_genesis(local_genesis_blob(nets_.wire), why))
+                return false;
+        }
         if (cfg_.boot == BootMode::Anchor) {
             // The 60 timestamps are not in the bundle by its own contract; the
             // state treats a short window as "no median", which is why an empty

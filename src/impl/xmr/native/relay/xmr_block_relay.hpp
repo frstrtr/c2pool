@@ -424,14 +424,22 @@ public:
         retain(v.block_id, height, req.block_blob, pb.tx_hashes, bodies);
 
         // --- 7. our own tip (PREFER-OWN) -----------------------------------
+        // The verdict now REPORTS this outcome (own_index_attempted /
+        // own_index_accepted) instead of only logging the refusal. It does not
+        // change reached_network(), which stays a statement about the wire; it
+        // gives a solo caller a fact it previously had no way to read.
         if (m_cfg.submit_to_own_index && m_chain) {
+            v.own_index_attempted = true;
             BlockEntry be;
             be.block_blob = req.block_blob;
             be.txs        = bodies;
             be.pruned     = false;
             std::string why;
-            if (!m_chain->submit_own_block(be, why))
+            if (m_chain->submit_own_block(be, why)) {
+                v.own_index_accepted = true;
+            } else {
                 say(false, "own index refused our block " + hex(v.block_id) + ": " + why);
+            }
         }
 
         // --- 8. never a silent drop ----------------------------------------
@@ -444,6 +452,9 @@ public:
                     " reached NO peer and no accepting daemon";
             if (!p2p_why.empty()) v.why += " (" + p2p_why + ")";
             if (!daemon_wired)    v.why += " (no daemon arm configured)";
+            if (v.own_index_accepted)
+                v.why += " (it IS on our own chain index; only a solo caller may treat that as"
+                         " success)";
             say(true, "RELAY FAILED: " + v.why);
         } else {
             if (!p2p_why.empty())

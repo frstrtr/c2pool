@@ -81,9 +81,25 @@ struct BlockRelayVerdict {
     // Filled when reached_network() is false, so the failure is never silent.
     std::string   why;
 
+    // OUR OWN CHAIN, which is not the network and must never be confused with
+    // it. RelayConfig::submit_to_own_index hands the block to the local index
+    // (D-14 PREFER-OWN) after the arms have fired; these two record whether
+    // that was attempted and whether the index took it. They are reported
+    // SEPARATELY from reached_network() on purpose: a block only we hold is a
+    // weaker fact than a block a peer received, and the one configuration in
+    // which it is nevertheless the WHOLE fact -- a solo node with no peers and
+    // no daemon, mining its own private chain -- has to say so out loud rather
+    // than borrow the wire's word for it.
+    bool          own_index_attempted = false;
+    bool          own_index_accepted  = false;
+
     bool reached_network() const noexcept {
         return p2p_peers_sent > 0 || daemon_accepted;
     }
+
+    // The solo condition. NOT a synonym for reached_network(), and never used
+    // in its place: a caller that accepts this has opted in explicitly.
+    bool landed_own_chain() const noexcept { return own_index_accepted; }
 };
 
 class IBlockRelay {

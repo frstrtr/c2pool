@@ -80,12 +80,17 @@ namespace c2pool::xmr::native::rt {
 enum class BootMode : std::uint8_t {
     Genesis = 0,   // seed row 0 from the genesis blob, fetched over levin
     Anchor,        // seed from a loaded, self-checked AnchorBundle
+    // The SOLO path: the same row 0, through the same gate, with the blob
+    // assembled locally (xmr_genesis_blob.hpp) instead of asked for. A node
+    // with no peer has nobody to ask; the id check is identical either way.
+    LocalGenesis,
 };
 
 inline const char* to_string(BootMode m) noexcept {
     switch (m) {
-        case BootMode::Genesis: return "genesis";
-        case BootMode::Anchor:  return "anchor";
+        case BootMode::Genesis:      return "genesis";
+        case BootMode::Anchor:       return "anchor";
+        case BootMode::LocalGenesis: return "local-genesis";
     }
     return "?";
 }
@@ -210,6 +215,32 @@ public:
         : index_(index), mode_(mode), genesis_id_(genesis_id), net_(net) {}
 
     // The anchor path boots before the network is touched at all.
+    // The SOLO boot. `blob` is whatever the caller believes the genesis block
+    // of this network to be -- normally rt::local_genesis_blob(). It is fed to
+    // the SAME try_seed_() the levin path feeds, so the id is recomputed from
+    // the bytes and compared against the pinned genesis id, and a wrong blob is
+    // a refusal rather than a chain of somebody's choosing. Nothing about this
+    // path trusts the caller more than the wire path trusts a peer; it only
+    // removes the need for there to BE a peer.
+    bool boot_from_local_genesis(const std::vector<std::uint8_t>& blob, std::string& why) {
+        why.clear();
+        if (booted()) return true;
+        if (blob.empty()) {
+            why = "no local genesis blob for this network (malformed literal)";
+            return false;
+        }
+        if (!try_seed_(blob)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            why = stats_.why.empty()
+                      ? std::string("the local genesis blob is not this network's genesis block")
+                      : stats_.why;
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        stats_.why = "genesis row seeded from the locally assembled blob (no peer asked)";
+        return true;
+    }
+
     bool boot_from_anchor(const std::string& path_or_empty, XmrNet net,
                           const std::vector<std::uint64_t>& timestamps_60,
                           std::string& why) {
