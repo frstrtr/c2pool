@@ -408,6 +408,18 @@ jobs:
           TTL="${HEAVY_LEG_TTL:-14400}"
           SWEEP="${HEAVY_LEG_SWEEP:-1}"
           SLOTS="${HEAVY_LEG_SLOTS:-2}"
+          # Host-memory-aware clamp: never run more concurrent heavy legs than the
+          # runner RAM can hold (~20 GB budgeted per ASan/CodeQL leg). On the
+          # 62 GB VM905 build host this is a NO-OP (2 kept, since 62/20 >= 2); on a
+          # 31 GB runner (e.g. .198, 0 swap) it clamps to 1 so two heavy legs cannot
+          # co-OOM the box. The HEAVY_LEG_SLOTS test override still wins (clamp skipped).
+          if [ -z "${HEAVY_LEG_SLOTS:-}" ]; then
+            _mem_gb=$(( $(awk "/^MemTotal:/{print \$2}" /proc/meminfo) / 1024 / 1024 ))
+            _mem_cap=$(( _mem_gb / 20 ))
+            [ "$_mem_cap" -lt 1 ] && _mem_cap=1
+            [ "$SLOTS" -gt "$_mem_cap" ] && SLOTS="$_mem_cap"
+            echo "heavy-leg: host RAM ${_mem_gb}G -> memory cap ${_mem_cap} slot(s); using SLOTS=$SLOTS"
+          fi
           ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
 
           # Slot files are ${LOCK}.1 .. ${LOCK}.SLOTS; each slot's live holder records a
