@@ -623,8 +623,18 @@ int main() {
     {
         const RunOut c4 = run_pair(ratified, /*late=*/false, /*do_repair=*/true,
                                    /*corrupt_spine=*/true);
-        check(c4.rs.replayed == 1 && c4.rs.repaired == 0 && c4.rs.refused == 1,
-              "CA-4a the replay ran and did NOT reach the named commitment");
+        // ★ With the candidate walk (F-2) this refusal happens EARLIER and more
+        // cheaply. The server's ORDER answer asserts its own lane digest at P;
+        // that assertion is not the commitment we asked it to stand behind, so
+        // the repair refuses without fetching one frame or running a replay.
+        // The property CA-4 exists for is unchanged and is asserted by the
+        // lines below (nothing registered, owed unmoved, the S3 re-drive still
+        // refuses); what changed is that the driver no longer pays for a whole
+        // prefix fetch to learn what the server had already told it.
+        check(c4.rs.replayed == 0 && c4.rs.repaired == 0 && c4.rs.refused == 1 &&
+                  c4.rs.spine_refused == 1 && c4.rs.frames_fetched == 0,
+              "CA-4a the serving peer asserted a DIFFERENT digest at P, so the "
+              "repair refused before any fetch or replay");
         check(!c4.final_registered,
               "CA-4b ★ the peer block is NOT registered — no fold at a neighbouring prefix");
         check(c4.ps.repair_hit == 0 && c4.ps.repair_missing >= 1,
