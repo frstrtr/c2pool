@@ -297,6 +297,14 @@ struct XmrNodeConfig {
     // absorbed by the retained-epoch job ring.
     std::uint64_t   native_backlog_refresh_s = 3;
 
+    // #1680 lever. Cap on outstanding solicited-reply DoS credits (DosConfig::
+    // max_solicited_credits). Default 8 = fix #1 armed: a NEW_FLUFFY_BLOCK (2008)
+    // that answers our own REQUEST_FLUFFY_MISSING_TX (2009) spends a credit
+    // instead of a block token. Set 0 to DISABLE fix #1 (pre-#1680 behaviour)
+    // while leaving fix #2 -- the GET_OBJECTS fallback for a stranded park -- in
+    // place; the live fix-2 proof leans on this.
+    std::uint32_t   native_dos_solicited_credits = 8;
+
     // --no-good-citizen: disable the good-citizen take-mempool-as-given path on
     // the native arm (the CONTROL switch for the live proof -- reproduces the
     // old coinbase-only-with-a-full-pool failure). Default false = good-citizen

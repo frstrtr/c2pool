@@ -137,6 +137,8 @@ void usage() {
         "  --run-seconds <n>                          hard stop (default 120)\n"
         "  --status-every <ms>                        status line cadence (default 2000)\n"
         "  --force-synced                             set the publication gate (regtest)\n"
+        "  --native-dos-solicited-credits <n>         cap on solicited fluffy-reply DoS credits\n"
+        "                                             (default 8; 0 disables #1680 fix-1)\n"
         "  --probe-only                               handshake + one chain request, then exit\n"
         "  --allow-unverified-pow                     start even though this build cannot\n"
         "                                             check proof of work (no librandomx)\n"
@@ -183,6 +185,7 @@ void print_status(const rt::NodeStatus& s) {
         "alt=%llu orphans=%llu reorgs=%llu | "
         "peers=%zu/%zu silent=%zu | in: blocks=%llu chains=%llu objs=%llu txs=%llu | "
         "drv: chain=%llu boot=%llu refetch=%llu timeouts=%llu target=%s | "
+        "dos: dropped=%llu fluffy_req=%llu credited=%llu body_refetch=%llu | "
         "q: verify=%zu/%llu pool=%zu/%llu refused=%llu | "
         "rx: mode=%d hashes=%llu rekeys=%llu foreign=%llu | rpc=%llu | tmpl=%s | "
         "txpool: gate=%d n=%llu acc=%llu rej=%llu\n",
@@ -197,6 +200,10 @@ void print_status(const rt::NodeStatus& s) {
         (unsigned long long)s.driver.chain_requests, (unsigned long long)s.driver.boot_requests,
         (unsigned long long)s.driver.refetch_requests,
         (unsigned long long)s.driver.chain_timeouts, s.driver.target.c_str(),
+        (unsigned long long)s.pool.frames_dropped_dos,
+        (unsigned long long)s.pool.fluffy_requests_out,
+        (unsigned long long)s.pool.frames_credited_fluffy,
+        (unsigned long long)s.driver.bodies_refetch_requests,
         s.verify_queue.depth, (unsigned long long)s.verify_queue.executed,
         s.pool_queue.depth, (unsigned long long)s.pool_queue.executed,
         (unsigned long long)(s.verify_queue.refused + s.inbound.refused),
@@ -300,6 +307,9 @@ int main(int argc, char** argv) {
             else if (v == "p2p-only") cfg.relay_order = native::ArmOrder::P2pOnly;
             else { std::cerr << "unknown relay order\n"; return 2; }
         }
+        else if (a == "--native-dos-solicited-credits")
+            cfg.dos_solicited_credits = static_cast<std::uint32_t>(
+                std::strtoull(next("--native-dos-solicited-credits").c_str(), nullptr, 10));
         else if (a == "--follow-to")     follow_to    = std::strtoull(next("--follow-to").c_str(), nullptr, 10);
         else if (a == "--run-seconds")   run_seconds  = std::strtoull(next("--run-seconds").c_str(), nullptr, 10);
         else if (a == "--status-every")  status_every = std::strtoull(next("--status-every").c_str(), nullptr, 10);

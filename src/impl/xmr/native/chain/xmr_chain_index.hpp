@@ -677,6 +677,27 @@ public:
         return out;
     }
 
+    // #1680: fluffy blocks parked WITH a body blob but WITHOUT their
+    // transactions (bodies_missing). have_body_locked_() reports these as
+    // "have body" (they hold the bodiless blob), so refetch_wanted() omits them;
+    // and on_chain_entry skips any id already in alt_. Nothing in the ordinary
+    // paths ever re-asks for one, so a missing-tx reply lost to the DoS bucket
+    // (or a disconnect) would strand the park forever and freeze the node one
+    // block behind. This is a DELIBERATELY SEPARATE list from refetch_wanted():
+    // the driver gives it its own grace timer and re-asks via GET_OBJECTS, so an
+    // honest in-flight 2009 reply is not raced by a duplicate whole-block fetch
+    // on every non-empty block (which would double inbound block bytes on
+    // mainnet, where every non-empty fluffy block parks once). The park is
+    // erased on connect, so this list empties itself.
+    std::vector<Hash> bodies_wanted() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<Hash> out;
+        alt_.for_each([&out](const AltBlock& b) {
+            if (b.bodies_missing) out.push_back(b.id);
+        });
+        return out;
+    }
+
     // The state view, for consumers that need the consensus numbers themselves
     // (the parity oracle compares them field by field). Read-only by intent.
     const ChainStateView& view() const noexcept { return view_; }
@@ -918,6 +939,7 @@ private:
                 b.adoptable      = false;   // no bodies, so nothing is judgeable yet
                 b.entry          = std::move(entry);
                 b.has_entry      = true;
+                b.bodies_missing = true;     // #1680: driver re-asks if the reply is lost
                 b.first_seen_seq = ++seq_;
                 if (peer) b.source = *peer;
                 alt_.insert(std::move(b));
@@ -1266,7 +1288,12 @@ private:
         // we are leaving (so a failure can be undone, and so the old branch can
         // be adopted again if it later wins).
         for (const AltBlock& b : branch) {
-            if (!b.has_entry) {
+            // A bodiless fluffy park (#1680) has has_entry set -- it holds the
+            // block blob -- but no transactions, so it cannot be connected as
+            // part of an adopted branch. Treat it as missing bodies (which it
+            // is): refuse the reorg rather than try to connect a txless block,
+            // and remember it so the ordinary refetch path re-asks too.
+            if (!b.has_entry || b.bodies_missing) {
                 journal_.refuse(rec, ReorgRefusal::MissingBodies,
                                 "a candidate block's body is not available");
                 remember_refetch_(b.id);

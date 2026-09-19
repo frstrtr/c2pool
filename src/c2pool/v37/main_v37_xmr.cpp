@@ -810,6 +810,7 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
     ncfg.c2pool_commit        = C2POOL_VERSION;
     ncfg.ready_timeout_s      = cfg.native_ready_timeout_s;
     ncfg.backlog_refresh_s    = cfg.native_backlog_refresh_s;
+    ncfg.dos_solicited_credits = cfg.native_dos_solicited_credits;  // #1680 lever
     // D-14 lever (1): what the fork choice adopts at EQUAL work at the same
     // height. Same flag as the accounting tiebreak -- see xmr_same_height_race.hpp.
     ncfg.fork_tie             = (cfg.same_height_tiebreak == SameHeightTieBreak::PreferOwn)
@@ -1204,6 +1205,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                         ns.citizen_pool_n, ns.citizen_chosen_n,
                         static_cast<unsigned long long>(ns.good_citizen_violations));
 
+            // #1680 observability: the block-DoS bucket accounting for the
+            // solicited fluffy missing-tx (2009) reply. dropped = frames the DoS
+            // buckets dropped; fluffy_req = 2009s we sent (each mints a credit);
+            // credited = 2008 replies that spent a credit instead of a block
+            // token; body_refetch = whole-block GET_OBJECTS fallbacks the driver
+            // fired for a stranded bodiless fluffy park. A healthy fixed node
+            // keeps dropped at 0 and credited climbing with fluffy_req.
+            std::printf("  dos: dropped=%llu fluffy_req=%llu credited=%llu body_refetch=%llu\n",
+                        static_cast<unsigned long long>(ns.pool.frames_dropped_dos),
+                        static_cast<unsigned long long>(ns.pool.fluffy_requests_out),
+                        static_cast<unsigned long long>(ns.pool.frames_credited_fluffy),
+                        static_cast<unsigned long long>(ns.driver.bodies_refetch_requests));
+
             // THE WIRE LINE. Two independent sockets reach the same daemon: the
             // embedded node's own transport (parity judge + submit arm) and the
             // pool's consumer transport, whose no-libzmq tip poll is the bulk of
@@ -1368,6 +1382,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--native-backlog-refresh") cfg.native_backlog_refresh_s =
                      static_cast<std::uint64_t>(std::stoull(next("0")));
+        else if (a == "--native-dos-solicited-credits") cfg.native_dos_solicited_credits =
+                     static_cast<std::uint32_t>(std::stoull(next("8")));  // #1680 lever
         else if (a == "--no-good-citizen") cfg.no_good_citizen = true;
         else if (a == "--native-ready-timeout") cfg.native_ready_timeout_s =
                      static_cast<std::uint32_t>(std::stoul(next("120")));
