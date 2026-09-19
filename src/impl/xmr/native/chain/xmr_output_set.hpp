@@ -416,14 +416,22 @@ public:
     // form) committed by a format-2 anchor, so a daemonless node booting from
     // that anchor can RESOLVE + CLSAG-verify rings whose members are BELOW the
     // anchor's numbering base, and reject a below-base double-spend. Legal only
-    // on an EMPTY set (at boot, before any block feeds), and the snapshot is
-    // ACCEPTED only when it re-derives to the roots the anchor committed: the
-    // anchor's committed roots -- not the blob -- are the trust. Fails closed on
-    // any mismatch, leaving the set empty (pre-anchor rings stay unresolved).
+    // on an EMPTY set (at boot, before any block feeds).
     //
-    // The snapshot's peaks are RE-DERIVED from its leaves inside deserialize()
-    // (the record-log rule), then the re-derived roots and counts are checked
-    // against the bundle before a single record is adopted.
+    // WHAT THE ANCHOR AUTHENTICATES, STATED PRECISELY. The snapshot's peaks are
+    // RE-DERIVED from its leaves inside deserialize() (the record-log rule), and
+    // this checks the re-derived output/spent ROOTS, the two LEAF COUNTS, the
+    // TIP, and the FRONTIER against the bundle -- so the snapshot's authenticated
+    // LEAF STRUCTURE is bound to the anchor and any corruption that reaches a
+    // leaf (bulk/random damage always does) fails closed, leaving the set empty.
+    // The serialize() form (inherited from the input-consensus pass) stores the
+    // resolve table and the flat spent set SEPARATELY from the leaves and carries
+    // no per-block block_id, so a surgical edit that changes only those tables
+    // while leaving every leaf intact is NOT caught here: the operator-supplied
+    // snapshot is a TRUSTED input whose structure the anchor verifies, not an
+    // untrusted blob made trustless by the roots alone. The fully trustless path
+    // -- a peer walking blocks 1..H_a and re-deriving the tables to the same
+    // roots -- is the documented O-backfill follow-on (node/xmr_sync_driver).
     bool seed_from_snapshot(const std::string& blob, const AnchorBundle& b, std::string& why) {
         std::lock_guard<std::mutex> lk(mu_);
         if (!outputs_.empty() || tip_height_ != 0 || out_peaks_.leaf_count != 0
