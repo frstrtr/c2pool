@@ -65,6 +65,10 @@ public:
         reset_tables_();
         state_.seed_from_anchor(b, timestamps_60);
         for (const auto& s : b.seed_ids) seed_ids_[s.first] = s.second;
+        // The output numbering base: the anchor's global amount-0 output count.
+        // Zero when the anchor carries none (format-1 bundle) -- see the output
+        // set's fail-closed rule (a ring below the base is RingUnresolved).
+        rct_output_counter_ = b.rct_output_count;
         index_tip_();
     }
 
@@ -114,8 +118,22 @@ public:
         outcome.ok  = true;
         outcome.row = row;
 
+        // Global amount-0 output numbering (single authority). The block's first
+        // output takes the current counter; the counter then advances by the
+        // block's total amount-0 outputs -- the v2 coinbase's outputs plus every
+        // v2 body's outputs. Recorded per block so disconnect rolls it back
+        // exactly. A v1 coinbase contributes none.
+        const std::uint64_t n_coinbase =
+            (ev.input.coinbase.version >= 2)
+                ? static_cast<std::uint64_t>(ev.input.coinbase.outputs.size()) : 0;
+        const std::uint64_t n_block_out = n_coinbase
+                                        + static_cast<std::uint64_t>(ev.outputs.size());
+        const std::uint64_t first_output_index = rct_output_counter_;
+        rct_output_counter_ += n_block_out;
+        out_counts_.push_back(n_block_out);
+
         emit_extend_(row);
-        emit_txs_connected_(row, ev);
+        emit_txs_connected_(row, ev, first_output_index);
         return outcome;
     }
 
@@ -131,6 +149,15 @@ public:
         if (!state_.disconnect(undos_.back())) return false;
         undos_.pop_back();
         unindex_row_(leaving);
+
+        // Roll the output numbering back by exactly what this block added, so a
+        // reorg re-numbers the replacement branch from the same base (D-15's
+        // rule for the seed anchors, applied to the output counter).
+        if (!out_counts_.empty()) {
+            const std::uint64_t n = out_counts_.back();
+            out_counts_.pop_back();
+            rct_output_counter_ = (rct_output_counter_ >= n) ? rct_output_counter_ - n : 0;
+        }
 
         node::MainchainEvent ev;
         ev.kind        = node::MainchainEventKind::Orphan;
@@ -265,6 +292,11 @@ public:
 
     void set_cohort_height(std::uint64_t h) noexcept { cohort_height_ = h; }
 
+    // The global amount-0 output count at the tip: the number the NEXT block's
+    // first output will take, and the base the output set numbers from after a
+    // boot. Seeded from the anchor's rct_output_count, 0 on a genesis chain.
+    std::uint64_t rct_output_count() const noexcept { return rct_output_counter_; }
+
 private:
     using Key = std::string;   // 32 raw bytes; std::array has no hash by default
 
@@ -278,6 +310,8 @@ private:
         seed_ids_.clear();
         own_ids_.clear();
         undos_.clear();
+        out_counts_.clear();
+        rct_output_counter_ = 0;
         reorgs_ = 0;
         deepest_reorg_ = 0;
         pow_verified_count_ = 0;
@@ -352,7 +386,8 @@ private:
         emit_(ev);
     }
 
-    void emit_txs_connected_(const ChainRow& row, const EvaluatedBlock& ev) const {
+    void emit_txs_connected_(const ChainRow& row, const EvaluatedBlock& ev,
+                             std::uint64_t first_output_index) const {
         if (tx_sinks_.empty()) return;
         BlockTxEvent t;
         t.kind     = BlockTxEvent::Kind::Connected;
@@ -360,6 +395,15 @@ private:
         t.block_id = row.id;
         t.tx_hashes = ev.input.parsed.tx_hashes;
         t.key_images = ev.key_images;
+        // Output capture feed. The coinbase's (amount, pubkey) pairs ride raw so
+        // the output set can synthesise their commitments with rct::zero_commit;
+        // the non-coinbase records already carry their commitments. Only a v2
+        // coinbase contributes to the amount-0 table.
+        if (ev.input.coinbase.version >= 2)
+            t.coinbase_amount_pubkeys = ev.input.coinbase.outputs;
+        t.coinbase_unlock_time  = ev.input.coinbase.unlock_time;
+        t.outputs               = ev.outputs;
+        t.first_output_index    = first_output_index;
         emit_txs_(t);
     }
 
@@ -369,6 +413,11 @@ private:
     std::map<std::uint64_t, Hash>   seed_ids_;
     std::set<Key>                   own_ids_;
     std::vector<ConnectUndo>        undos_;
+    // Global amount-0 output numbering. The counter is the frontier; out_counts_
+    // records how many outputs each connected block added so disconnect rolls it
+    // back exactly (parallel to undos_).
+    std::uint64_t                   rct_output_counter_ = 0;
+    std::vector<std::uint64_t>      out_counts_;
     std::vector<EventSink>          sinks_;
     std::vector<TxEventSink>        tx_sinks_;
 
