@@ -87,6 +87,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "impl/xmr/native/contracts/outputs.hpp"
 #include "impl/xmr/native/contracts/txpool.hpp"
 #include "impl/xmr/native/contracts/types.hpp"
 #include "xmr_tx_decode.hpp"
@@ -134,6 +135,20 @@ struct TxpoolConfig {
     // with it off no entry ever gains NonInputConsensus evidence, so the
     // default policy selects nothing. Fail-closed by construction.
     bool verify_non_input_consensus = true;
+
+    // The INPUT-consensus leg (CLSAG ring signatures + global double-spend +
+    // unlock/age). Runs only when a ring source has been wired
+    // (set_input_consensus_sources); with no source the leg is skipped and no
+    // entry gains InputConsensus evidence -- the pre-input-consensus behaviour,
+    // unchanged. Turn OFF only in tests that must admit without resolving rings.
+    bool verify_input_consensus = true;
+
+    // CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE: a ring member must be at least this
+    // many blocks old, measured against the block we would mine (tip + 1).
+    std::uint64_t spendable_age = 10;
+    // CRYPTONOTE_MAX_BLOCK_NUMBER: an unlock_time below this is a height, above
+    // it is a timestamp.
+    std::uint64_t max_block_number = 500000000;
 };
 
 // --- one pool entry ----------------------------------------------------------
@@ -203,6 +218,22 @@ struct TxpoolStats {
     // point at: the rejection and the eviction are two different events and a
     // single `rejected` counter cannot tell them apart.
     std::uint64_t rejected_key_image_conflict = 0;
+
+    // Input-consensus refusals, broken out so the CCS/parity story can point at
+    // each one. rejected_ring_sig: a CLSAG did not verify over its ring members
+    // (a forged or malformed ring signature) -- a drop offence, also counted in
+    // `rejected`. rejected_key_image_spent: a key image already spent ON THE
+    // CHAIN (the GLOBAL double-spend, distinct from the pool-local
+    // rejected_key_image_conflict) -- no drop. unresolved_ring: a ring member
+    // was below the anchor / beyond the frontier, so input consensus could not
+    // be reached and the entry keeps only its non-input evidence (not a
+    // rejection -- fail-closed happens at the select policy). rejected_member_
+    // locked: a ring member was not yet unlocked or younger than the spendable
+    // age -- no drop.
+    std::uint64_t rejected_ring_sig        = 0;
+    std::uint64_t rejected_key_image_spent = 0;
+    std::uint64_t unresolved_ring          = 0;
+    std::uint64_t rejected_member_locked   = 0;
 };
 
 // --- the pool ----------------------------------------------------------------
@@ -251,6 +282,16 @@ public:
     void set_synced(bool synced);
     bool synced() const;
 
+    // Wire the two chain-derived views the INPUT-consensus step needs: the ring
+    // member source (resolve absolute offsets -> (dest, mask)) and the on-chain
+    // spent-key-image view (the GLOBAL double-spend oracle). Both are typically
+    // one object (chain/xmr_output_set.hpp ChainOutputSet). Passing nullptrs (or
+    // never calling this) leaves the input-consensus leg dormant: no entry gains
+    // InputConsensus evidence and admission is exactly the pre-input behaviour.
+    // The pointers are borrowed and must outlive the pool.
+    void set_input_consensus_sources(const IRingMemberSource* ring_src,
+                                     const ISpentKeyImageView* spent_view);
+
     // Age eviction pass. Called on a tick; on_relayed also runs it.
     std::size_t expire_old();
 
@@ -292,6 +333,14 @@ private:
     std::uint64_t backlog_version_ = 0;
     bool          synced_          = false;
     TxpoolStats   stats_{};
+
+    // Input-consensus wiring (borrowed; null until set_input_consensus_sources).
+    const IRingMemberSource*  ring_src_   = nullptr;
+    const ISpentKeyImageView* spent_view_ = nullptr;
+    // The height of the last connected block, i.e. the tip. A transaction is
+    // judged against the block we would mine next, tip_height_ + 1, for the
+    // spendable-age and unlock-time rules. Set in on_block_connected.
+    std::uint64_t             tip_height_ = 0;
 };
 
 } // namespace c2pool::xmr::native

@@ -32,6 +32,7 @@
 
 #include "impl/xmr/native/consensus/xmr_tx_weight.hpp"
 #include "impl/xmr/native/contracts/types.hpp"
+#include "impl/xmr/native/rct/xmr_clsag_verify.hpp"
 #include "impl/xmr/native/rct/xmr_rct_verify.hpp"
 
 namespace c2pool::xmr::native {
@@ -54,6 +55,16 @@ struct DecodedTx {
     Hash           id{};           // the v2 triple hash
 
     rct::RctNonInput rct;          // what verify_non_input_consensus consumes
+
+    // Input-consensus raw material -- everything verify_clsag and the ring
+    // resolver need, decoded from the same bytes. Filled for every
+    // BulletproofPlus transaction that decodes; the txpool's input-consensus
+    // step consumes it (and the ring MEMBERS it resolves from the chain).
+    std::vector<rct::Clsag>                 clsags;       // one per input
+    std::vector<std::vector<std::uint64_t>> key_offsets;  // relative, per input
+    std::vector<rct::Key>                   out_pubkeys;  // one per output
+    rct::Key h_prefix{};   // Keccak of the prefix span (monerod rv.message)
+    rct::Key h_base{};     // Keccak of the rct base span
 
     // Byte spans within the blob, all measured.
     std::size_t prefix_size   = 0;
