@@ -187,7 +187,9 @@ if (BUILD_TESTING)
     # ─────────────────────────────────────────────────────────────────────────
     foreach(_c3_kat
             xmr_native_rct_verify_kat
-            xmr_native_txpool_kat)
+            xmr_native_txpool_kat
+            xmr_native_clsag_verify_kat
+            xmr_native_output_set_kat)
         # The sources are named after the component, not the target prefix.
         string(REPLACE "xmr_native_" "xmr_" _c3_src ${_c3_kat})
         add_executable(${_c3_kat} ${_c3_src}.cpp)
