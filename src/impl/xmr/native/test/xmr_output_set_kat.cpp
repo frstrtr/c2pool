@@ -54,6 +54,8 @@
 #include "impl/xmr/native/txpool/xmr_tx_decode.hpp"
 #include "xmr_input_consensus_golden.hpp"
 
+#include "c2pool/v37/record_log.hpp"   // MMR-root parity cross-check
+
 using namespace c2pool::xmr::native;
 namespace R = c2pool::xmr::native::rct;
 namespace T = c2pool::xmr::native::test;
@@ -185,6 +187,120 @@ static void test_output_set() {
     check(s.on_block_connected(connected(5, 0, {}, {hash_byte(0xc3)})),
           "connect key-image-only block");
     check(s.is_spent(hash_byte(0xc3)) && s.frontier() == 1000, "spent-only advance");
+}
+
+// ---------------------------------------------------------------------------
+// PART A2: the AUTHENTICATED (MRR-Merkle/MMR) output + spent logs.
+//   * coinbase commitment synthesis (zeroCommit) + global ordering,
+//   * root parity against a c2pool::v37 RecordLog on the SET's OWN leaves,
+//   * membership proof verifies through the shipped lane verifier, flip fails,
+//   * reorg restores both roots BIT-EXACT,
+//   * serialize/deserialize round-trip with root re-derivation.
+// ---------------------------------------------------------------------------
+static BlockTxEvent cb_connected(std::uint64_t height, std::uint64_t first_idx,
+                                 std::vector<std::pair<std::uint64_t, Hash>> cb,
+                                 std::vector<OutputRecord> outs,
+                                 std::vector<Hash> kis) {
+    BlockTxEvent e;
+    e.kind                    = BlockTxEvent::Kind::Connected;
+    e.height                  = height;
+    e.first_output_index      = first_idx;
+    e.coinbase_amount_pubkeys = std::move(cb);
+    e.coinbase_unlock_time    = height + 60;
+    e.outputs                 = std::move(outs);
+    e.key_images              = std::move(kis);
+    return e;
+}
+
+static void test_output_mmr() {
+    ChainOutputSet s(/*first_output_index=*/0);
+
+    // Block 1: a v2 coinbase paying 5 (idx 0), then one non-coinbase output
+    // (idx 1). The coinbase commitment must be zeroCommit(5); ordering coinbase
+    // FIRST. One key image spent.
+    const Hash cb_pk = hash_byte(0x11);
+    check(s.on_block_connected(
+              cb_connected(1, 0, {{5, cb_pk}}, {rec(2, 1)}, {hash_byte(0xd1)})),
+          "connect block 1 (coinbase + 1 out)");
+    check(s.output_count() == 2 && s.frontier() == 2, "coinbase-first numbering");
+
+    std::vector<OutputRecord> got;
+    check(s.resolve(0, {0}, got) && got.size() == 1, "resolve coinbase output 0");
+    check(got[0].pubkey == cb_pk, "coinbase output pubkey");
+    check(got[0].commitment == R::zero_commit(5), "coinbase commitment == zeroCommit(5)");
+    check(R::zero_commit(0) == R::generator_G(), "zeroCommit(0) == G");
+
+    // Block 2: coinbase paying 5 (idx 2), no other outputs, one key image.
+    check(s.on_block_connected(cb_connected(2, 2, {{5, hash_byte(0x22)}}, {}, {hash_byte(0xd2)})),
+          "connect block 2");
+    check(s.frontier() == 3, "frontier after block 2");
+
+    const auto root_out_2 = s.output_root();
+    const auto root_ki_2  = s.spent_root();
+    check(s.output_leaf_count() == 2 && s.spent_leaf_count() == 2, "two leaves each");
+
+    // Root parity: append the SET's OWN leaf hashes into a RecordLog and the
+    // bagged roots must be byte-identical -- ONE MMR (the shipped lane's).
+    {
+        c2pool::v37n::recordlog::RecordLog rl_out, rl_ki;
+        for (std::uint64_t i = 0; i < s.output_leaf_count(); ++i) {
+            ChainOutputSet::bytes32 leaf{}; ::v37::Lane::MmrProof pr;
+            check(s.prove_output_leaf(i, leaf, pr), "prove output leaf");
+            check(ChainOutputSet::verify(s.output_root(), leaf, pr), "output proof verifies");
+            rl_out.append_leaf(leaf);
+        }
+        for (std::uint64_t i = 0; i < s.spent_leaf_count(); ++i) {
+            ChainOutputSet::bytes32 leaf{}; ::v37::Lane::MmrProof pr;
+            check(s.prove_spent_leaf(i, leaf, pr), "prove spent leaf");
+            check(ChainOutputSet::verify(s.spent_root(), leaf, pr), "spent proof verifies");
+            rl_ki.append_leaf(leaf);
+        }
+        check(rl_out.root() == root_out_2, "output root == RecordLog root (same leaves)");
+        check(rl_ki.root() == root_ki_2, "spent root == RecordLog root (same leaves)");
+    }
+
+    // A flipped leaf byte breaks the proof.
+    {
+        ChainOutputSet::bytes32 leaf{}; ::v37::Lane::MmrProof pr;
+        check(s.prove_output_leaf(0, leaf, pr), "prove leaf 0");
+        leaf[0] ^= 0x01;
+        check(!ChainOutputSet::verify(s.output_root(), leaf, pr), "flipped leaf fails");
+    }
+
+    // Serialize / deserialize: roots, frontier and spent view survive, and the
+    // peaks are re-derived from the leaves on load.
+    {
+        const std::string blob = s.serialize();
+        auto back = ChainOutputSet::deserialize(blob);
+        check(back != nullptr, "deserialize round-trips");
+        if (back) {
+            check(back->output_root() == root_out_2, "restored output root");
+            check(back->spent_root()  == root_ki_2,  "restored spent root");
+            check(back->frontier() == 3, "restored frontier");
+            check(back->is_spent(hash_byte(0xd1)) && back->is_spent(hash_byte(0xd2)),
+                  "restored spent set");
+            std::vector<OutputRecord> g2;
+            check(back->resolve(0, {0}, g2) && g2[0].commitment == R::zero_commit(5),
+                  "restored coinbase commitment");
+        }
+        check(ChainOutputSet::deserialize(blob + "x") == nullptr, "trailing garbage rejected");
+    }
+
+    // Reorg: disconnect block 2, both roots must be BIT-EXACT what they were
+    // after block 1 (the lane's reorg rule, applied to the output set).
+    ChainOutputSet a(0);
+    a.on_block_connected(cb_connected(1, 0, {{5, cb_pk}}, {rec(2, 1)}, {hash_byte(0xd1)}));
+    const auto root_out_1 = a.output_root();
+    const auto root_ki_1  = a.spent_root();
+    a.on_block_connected(cb_connected(2, 2, {{5, hash_byte(0x22)}}, {}, {hash_byte(0xd2)}));
+    BlockTxEvent d2; d2.kind = BlockTxEvent::Kind::Disconnected; d2.height = 2;
+    check(a.on_block_disconnected(d2), "disconnect block 2");
+    check(a.output_root() == root_out_1, "output root restored bit-exact after reorg");
+    check(a.spent_root()  == root_ki_1,  "spent root restored bit-exact after reorg");
+    check(a.frontier() == 2 && !a.is_spent(hash_byte(0xd2)), "reorg rolled back state");
+
+    // The set digest is stable and non-zero once populated.
+    check(!(s.set_digest() == ChainOutputSet::bytes32{}), "set digest non-zero");
 }
 
 // ---------------------------------------------------------------------------
@@ -378,9 +494,67 @@ static void test_admission() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PART C: the SELECT-POLICY seam -- a resolvable ring is selectable (good
+// citizen), an unresolved ring is NOT selectable by default (the SPV fix), and
+// an explicit Include policy restores the pre-input-consensus behaviour.
+// ---------------------------------------------------------------------------
+static void test_select_policy() {
+    DecodedTx d;
+    const T::GoldenTx* gtx = first_decodable(d);
+    checkf(gtx != nullptr, "no decodable golden tx for select-policy tests");
+    if (!gtx) return;
+    std::vector<std::uint8_t> blob = from_hex(gtx->full_hex);
+
+    // (A) A RESOLVABLE ring (InputConsensus granted at admission) is SELECTABLE.
+    {
+        RelayedTxPool pool;
+        FakeRingSource src = source_for(*gtx, d, /*rotate=*/false);
+        pool.set_input_consensus_sources(&src, &src);
+        arm(pool);
+        pool.on_relayed(peer(), {blob}, true);
+        auto sel = pool.selectable_backlog();
+        checkf(sel.size() == 1, "resolvable tx is selectable (good citizen), got %zu",
+               sel.size());
+        check(pool.stats().excluded_unresolved == 0, "nothing excluded when ring resolves");
+    }
+
+    // (B) An UNRESOLVED ring is NOT selectable under the default Exclude, and the
+    //     exclusion is counted. THIS is the load-bearing close of the SPV
+    //     critique: a tx whose ring we cannot verify is never mined.
+    {
+        RelayedTxPool pool;
+        FakeRingSource src; src.fail_all = true;
+        pool.set_input_consensus_sources(&src, &src);
+        arm(pool);
+        pool.on_relayed(peer(), {blob}, true);      // admitted, ring_unresolved
+        auto sel = pool.selectable_backlog();        // default policy = Exclude
+        checkf(sel.empty(), "unresolved tx NOT selectable by default, got %zu", sel.size());
+        check(pool.stats().excluded_unresolved >= 1, "excluded_unresolved counted");
+    }
+
+    // (C) Under an explicit Include policy the same unresolved tx IS selectable
+    //     (mainnet pre-O-backfill behaviour -- operator ruling R2).
+    {
+        RelayedTxPool pool;
+        FakeRingSource src; src.fail_all = true;
+        pool.set_input_consensus_sources(&src, &src);
+        arm(pool);
+        pool.on_relayed(peer(), {blob}, true);
+        TxpoolSelectPolicy incl;
+        incl.required         = AdmissionEvidence::Structural;
+        incl.min_peers        = 1;
+        incl.unresolved_rings = UnresolvedRingPolicy::Include;
+        auto sel = pool.selectable_backlog(incl);
+        checkf(sel.size() == 1, "Include policy admits unresolved tx, got %zu", sel.size());
+    }
+}
+
 int main() {
     test_output_set();
+    test_output_mmr();
     test_admission();
+    test_select_policy();
 
     if (g_fail == 0) {
         std::fprintf(stderr, "output-set + admission KAT: ALL %d checks passed\n",
