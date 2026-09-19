@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>c2pool: a Monero pool with no operator that pays for small work</title>
+<meta name="description" content="A Monero mining pool with no operator: it runs without a Monero daemon while still validating what it mines, pays for below-target work, and takes no fee. CCS community-feedback draft.">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://frstrtr.github.io/c2pool/ccs-monero-proposal.html">
+<meta property="og:type" content="article">
+<meta property="og:title" content="c2pool: a Monero pool with no operator that pays for small work">
+<meta property="og:description" content="A Monero mining pool with no operator: runs without a Monero daemon while still validating what it mines, pays for below-target work, takes no fee. CCS community-feedback draft.">
+<meta property="og:url" content="https://frstrtr.github.io/c2pool/ccs-monero-proposal.html">
+<meta name="twitter:card" content="summary">
+<style>
+  body{font-family:Georgia,'Times New Roman',serif;max-width:760px;margin:2.5em auto;padding:0 1.2em;
+       color:#1a1a1a;line-height:1.6;font-size:17px;background:#fff;}
+  h1{font-size:1.6em;text-align:center;line-height:1.3;margin:0 0 .2em;font-weight:600;}
+  .byline{text-align:center;color:#555;margin:0 0 2em;font-size:.95em;}
+  h2{font-size:1.15em;margin:1.8em 0 .5em;font-weight:600;border-bottom:1px solid #e3e3e3;padding-bottom:.2em;}
+  p{margin:0 0 1em;text-align:justify;}
+  ol,ul{margin:0 0 1em;padding-left:1.4em;}
+  li{margin:0 0 .7em;text-align:justify;}
+  .note{font-style:italic;background:#faf8fc;border-left:3px solid #6c4f9c;padding:.9em 1.1em;margin:0 0 2em;font-size:.96em;}
+  code{font-family:'SF Mono',Consolas,monospace;font-size:.88em;background:#f4f1f8;padding:.05em .3em;border-radius:3px;}
+  strong{font-weight:600;}
+  a{color:#6c4f9c;}
+  @media print{body{font-size:12pt;max-width:none;}}
+</style></head><body>
+<h1>c2pool: a Monero pool with no operator that pays for small work</h1>
+<p class="byline">Community feedback draft &mdash; 2026-09-19</p>
+
+<p class="note">This is an idea posted for the Monero community to read and critique before a formal CCS merge request. Amount, author, date and the Team section are placeholders the author sets on submission. Where a thing runs only on a test network, it says so.<br><br>
+<strong>Ask (placeholder):</strong> one milestone &mdash; mainnet bring-up of the daemonless pool &mdash; one payout, ~25&nbsp;XMR (priced in fiat on submission day, not copied from an older proposal). &nbsp;<strong>Licence:</strong> AGPL-3.0; it also includes GPL-3.0-only code from p2pool (see Licence). &nbsp;<strong>Code:</strong> &lt;REPO_URL&gt; &nbsp;<strong>Design paper:</strong> <a href="https://frstrtr.github.io/c2pool/">frstrtr.github.io/c2pool</a></p>
+
+<h2>Summary</h2>
+<p>Monero mining is concentrated in a few pools. A miner points its hashrate at a pool and trusts the operator with it. A pool that holds enough hashrate can reorder or withhold transactions, and it decides how that hashrate votes on the network.</p>
+<p>p2pool answered this by removing the operator. Removing the operator cost it three things: it runs a full Monero daemon and a second daemon beside it, it pays nothing for a share below the pool target, and it penalises a block that arrives second. c2pool is a pool with no operator that removes those three costs and keeps the rest of what p2pool does. With no operator there is no pool fee and no vote cast on the miners' behalf.</p>
+<p>This proposal funds the first step: bringing the pool up on Monero mainnet, so that a miner connects, a block is found, and the finder is paid. Paying below-target work and a long parity soak with an outside review are later, separate proposals.</p>
+
+<h2>The problem</h2>
+<p>The pools that exist serve the small miner worst. A share-counting sidechain pays only shares at the pool difficulty. A miner below that difficulty spends power and is paid nothing. It then joins a large custodial pool, which pays it but concentrates hashrate under one operator, or it runs p2pool and waits a long time between paid shares.</p>
+<p>Running a p2pool node also means running a full Monero daemon beside it. An operator is also a single point to pressure or to shut down. Removing the operator removes that point.</p>
+
+<h2>What it does</h2>
+<ol>
+<li><strong>It runs without a Monero daemon and stays a validating node, not a light client.</strong> The node follows the Monero chain over the coin's own network and checks each block's proof of work itself. It also checks the transactions it puts in a block: the ring signatures (CLSAG), the amount commitments and range proofs (Bulletproofs+), and whether a key image was already spent. It checks these against a record of chain outputs it builds itself and keeps in an authenticated Merkle structure, so a forged ring or a double spend is refused rather than mined. This is the part that separates a real pool node from SPV mining, and it is verified against monerod: for the same transaction bytes, the node's accept-or-reject matches the daemon's. The one honest boundary is that a node started from a cold anchor must load the record of outputs that predate the anchor; that load path is the piece being finished now (see Status).</li>
+<li><strong>It rebuilds the transaction pool itself and always fills the block.</strong> The node reconstructs the pending transaction pool from the network's own relay, so its templates carry fee-paying transactions rather than empty blocks. When the pool holds valid transactions the block is never left empty; an empty block would drive miners away and waste block space. It relays the transactions and blocks it receives, so it carries traffic for the network and not only for itself.</li>
+<li><strong>It pays for small work.</strong> The node does not discard a share below the pool target. It keeps the share as a work receipt, estimates the hashrate behind a miner's receipts without bias, and credits that work. A phone earns for the work it does; small amounts accumulate until they are large enough to pay out. The design calls this Work Receipts and sets it out in a separate paper.</li>
+<li><strong>It does not penalise a block that arrives second.</strong> The node credits work by when it was done, not by whether it arrived first. A well-connected miner gains no advantage over a slow one.</li>
+<li><strong>A checker verifies the payout rule.</strong> The rule fixes who is owed what and the order the coinbase pays them, written as a formal specification and verified by machine, so anyone can audit the accounting without trusting the author.</li>
+<li><strong>The pool program can mine by itself.</strong> It carries an optional built-in processor miner, off by default, so a small miner runs one program that joins the pool and mines with nothing else to install. It uses the same proof-of-work code the node checks with, and no graphics cards, because Monero's proof of work favours ordinary processors.</li>
+</ol>
+<p>The coinbase pays by one rule, oldest owed first, run the same way on every node, so every node computes the same payout from the same ledger. There is no operator to take a cut and no operator key to steal.</p>
+
+<h2>Positioning against p2pool</h2>
+<p>This shares p2pool's goal; it does not claim its scale. All of p2pool is a small share of network hashrate, and most of its miners sit on its smallest sidechains earning tiny, high-variance amounts. Those are the miners Work Receipts is for. The argument for c2pool is the number of small participants it can pay and the smoothness of their payout, not a hashrate figure.</p>
+
+<h2>Track record</h2>
+<p>c2pool did not start with Monero. Its previous engine runs Litecoin and Dash pools in production, so the pool and its no-operator model are proven on live networks. This proposal funds the next engine, which redesigns the payout accounting, and Monero is its first lane. That next engine has already run on a live public Dash testnet, where two independent nodes reached the same payout state and the testnet chain-locked the blocks they found. The Monero lane on top of it is experimental, and this proposal treats it that way.</p>
+
+<h2>Status</h2>
+<p>What runs today, honestly separated by where it runs:</p>
+<ul>
+<li>On a private regtest, the daemonless node finds and finalizes a Monero block with no daemon call on the find, template and finalize path, and one process (node plus built-in miner) mines and settles blocks with no outside miner.</li>
+<li>Transaction validation &mdash; CLSAG ring signatures, amount balance and range proofs, and double-spend checks against the authenticated output record &mdash; is enforced on the live binary on regtest: a forged-ring transaction is not mined, a genuine one is mined and monerod accepts the block, a double spend is refused. It is checked against a real monerod, and that check is committed as a reproducible test.</li>
+<li>The always-fill-the-block behaviour and a peer-to-peer robustness fix are in the main branch.</li>
+<li>The node follows the live Monero stagenet and checks proof of work itself.</li>
+</ul>
+<p>Three things are not done: the mainnet run itself; loading the pre-anchor output record from the start anchor so a mainnet node validates rings from its cold start (in progress); and below-target crediting live on mainnet with a long parity soak and outside review before anyone points real hashrate at the pool. This proposal funds the first. The mainnet bring-up cold-starts from a small anchor whose cost depends on the anchor's age, not the chain's length, checks that anchor against several live mainnet peers, and refuses to start on a mismatch.</p>
+
+<h2>Milestone</h2>
+<p>One milestone, one payout. The node runs against Monero mainnet with no daemon: it follows the tip, checks proof of work itself, validates and includes transactions, finds and submits a block, and pays the finder. It delivers a running mainnet pool a miner can connect to, and a short report giving the block heights found and the finder's payout. Estimated at roughly six to eight weeks; the funds are earned on completion. If the work is not delivered within a stated window (for example three months from funding), the proposal lapses and the funds return, per CCS practice.</p>
+
+<h2>What comes after</h2>
+<p>Each will be its own proposal, judged on work delivered: pay below-target work on mainnet; and run a long parity soak next to monerod on mainnet with an outside review of the payout accounting, both before anyone points real hashrate at the pool.</p>
+
+<h2>Why fund this</h2>
+<p>It pays the small miner, and it lets a pool node run without a second daemon while still validating what it mines. It takes no fee and gives no operator a vote. It shares p2pool's goal instead of competing with it, and it is open and auditable.</p>
+
+<h2>Development support</h2>
+<p>The project takes part in Anthropic's Claude for Open Source Program, which gives open-source maintainers free use of Anthropic's Claude models for six months. This covers tooling only. It is not a cash grant and it does not fund the milestone.</p>
+
+<h2>Team</h2>
+<p>&lt;FILL IN: who you are, what you have shipped, and a link. Short and factual.&gt;</p>
+
+<h2>Licence</h2>
+<p>The licence is the AGPL-3.0, a strong copyleft: anyone who distributes it, or runs a modified version as a network service, must make the source available. The block-template assembler is GPL-3.0-only code carried over from p2pool; it combines with the AGPL-3.0 project under section&nbsp;13 of the AGPL-3.0, and this is documented in the tree. The Monero verification code the node vendors is BSD-3-Clause, from the Monero project itself. So the pool and anything built from it stay open and auditable, and any miner can check what the pool it joins actually runs.</p>
+
+</body></html>
