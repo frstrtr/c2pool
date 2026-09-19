@@ -270,7 +270,12 @@ public:
         served_epoch_.height      = md.height;
         served_epoch_.prev_id     = md.prev_id;
         served_epoch_.backlog_seq = admit_backlog_locked_(pool_seq, md.height, md.prev_id);
-        served_pool_seq_          = pool_seq;
+        // Advance served_pool_seq_ only to the version actually ADMITTED, not the
+        // version we polled: a rate-limited poll admits nothing, and setting this to
+        // the polled pool_seq would make the next epoch() see seq == served_pool_seq_
+        // and report the OLD backlog_seq forever, swallowing a tx that arrived inside
+        // the refresh window until the pool changed AGAIN or the tip moved (R-CIT-2).
+        served_pool_seq_          = served_epoch_.backlog_seq;
         pin_bodies_locked_(md);
         ++snapshots_;
         last_refusal_ = NativeRefusal::None;

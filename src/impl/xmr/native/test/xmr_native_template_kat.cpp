@@ -1293,6 +1293,135 @@ void suite_good_citizen() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Suite PW -- provider-poll-in-window regression (R-CIT-2).
+//
+// The live template provider polls snapshot() every ~1 s AND drives its rebuild
+// decision off epoch(). Before the fix, snapshot() advanced served_pool_seq_ to
+// the POLLED pool version even when the refresh rate-limiter admitted nothing.
+// A tx arriving inside the refresh window was then swallowed: the very next
+// epoch() saw seq == served_pool_seq_ and reported the OLD backlog_seq forever,
+// so the provider never rebuilt and the block was mined EMPTY while the pool
+// held valid admitted txs (live symptom: h=282, "good-citizen: on pool=2
+// chosen=2" alongside "coinbase: n_tx=0" for the whole interval; the template
+// only rebuilt on the next tip move). The fix advances served_pool_seq_ only to
+// the version actually ADMITTED, so a rate-limited poll leaves the pending pool
+// change visible to the next epoch() once the window elapses.
+//
+// The pivotal check in each subcase -- epoch() advances once the window elapses
+// -- FAILS on the pre-fix head and PASSES after the one-line fix, so the suite
+// is non-vacuous: it exists only because the defect existed. Note that
+// snapshot() always assembles from the CURRENT pool, so the harm is not in the
+// bytes a forced snapshot would carry; it is that epoch() -- the provider's
+// rebuild trigger -- never moves, so the provider never CALLS snapshot() and the
+// arrival sits unserved for the whole block interval.
+// ---------------------------------------------------------------------------
+void suite_provider_poll_in_window() {
+    std::printf("== PW. provider poll-in-window: a quiet-moment tx is never swallowed (R-CIT-2) ==\n");
+
+    auto make_chain = [](fakes::FakeChain& chain) {
+        chain.state.synced = true;
+        node::ChainMainBlock tip;
+        tip.height = 4000; tip.id = synthetic_id(4000);
+        tip.timestamp = 1700000000; tip.difficulty = u128_of(1000000, 0);
+        chain.rows.push_back(tip);
+        TemplateInputs t;
+        t.major_version = 16; t.minor_version = 16;
+        t.height = 4001; t.prev_id = tip.id; t.seed_hash = synthetic_id(9);
+        t.difficulty = u128_of(1000000, 0);
+        t.median_weight = 300000; t.block_weight_limit = 600000;
+        t.already_generated_coins = 18000000000000000000ull;
+        t.median_timestamp = 1699999000; t.synced = true;
+        chain.inputs = t;
+    };
+
+    // --- (a) a SINGLE tx arriving at a quiet moment (no tip move) ------------
+    {
+        fakes::FakeChain chain; make_chain(chain);
+        fakes::FakeTxpool pool;                       // starts EMPTY (a quiet pool)
+        tmpl::NativeTemplatePolicy pol;
+        pol.backlog_refresh_s = 3;                    // the good-citizen cadence
+        tmpl::NativeMinerDataSource src(chain, pool, pol, &pool);
+
+        src.set_now(1000);
+        std::string why;
+        auto md0 = src.snapshot(&why);
+        CHECK(md0.has_value() && md0->tx_backlog.empty(),
+              "PW/a t=1000 genuinely empty pool => empty template (n=%zu)",
+              md0 ? md0->tx_backlog.size() : 0);
+        const MinerDataEpoch e0 = src.epoch();
+
+        // A single tx arrives at t=1001; the tip does not move.
+        src.set_now(1001);
+        pool.add(synthetic_id(91), 2000, 30000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+
+        // THE LIVE PROVIDER PATTERN: it polls snapshot() every second. These
+        // mid-interval polls must NOT swallow the pending pool change.
+        (void)src.snapshot(&why);                     // t=1001 poll (admit rate-limited)
+        CHECK(src.epoch() == e0, "PW/a t=1001 inside the refresh window: no rebuild yet");
+        src.set_now(1002);
+        (void)src.snapshot(&why);                     // t=1002 poll (still rate-limited)
+        CHECK(src.epoch() == e0, "PW/a t=1002 inside the refresh window: still no rebuild");
+
+        // The window elapses. epoch() MUST now advance -- THIS is the check that
+        // FAILS on the pre-fix head (served_pool_seq_ had swallowed the seq).
+        src.set_now(1004);
+        const MinerDataEpoch e1 = src.epoch();
+        CHECK(!(e1 == e0),
+              "PW/a t=1004 window elapsed => epoch ADVANCES (the quiet-moment tx is not swallowed)");
+        CHECK(e1.height == e0.height && e1.prev_id == e0.prev_id,
+              "PW/a ...on the SAME tip: it is the backlog sequence that moved");
+
+        // The provider rebuilds: the tx is served, and stays served.
+        auto md1 = src.snapshot(&why);
+        CHECK(md1.has_value() && md1->tx_backlog.size() == 1,
+              "PW/a the quiet-moment tx ENTERS the served template within the interval (n=%zu)",
+              md1 ? md1->tx_backlog.size() : 0);
+        src.set_now(1030);
+        (void)src.epoch();
+        auto md2 = src.snapshot(&why);
+        CHECK(md2.has_value() && md2->tx_backlog.size() == 1,
+              "PW/a t=1030 the tx is STILL served (n=%zu)", md2 ? md2->tx_backlog.size() : 0);
+        CHECK(src.good_citizen_violations() == 0, "PW/a good_citizen_violations == 0");
+    }
+
+    // --- (b) TWO txs at a quiet moment (the live h=282 shape: pool=2) --------
+    {
+        fakes::FakeChain chain; make_chain(chain);
+        fakes::FakeTxpool pool;
+        tmpl::NativeTemplatePolicy pol;
+        pol.backlog_refresh_s = 3;
+        tmpl::NativeMinerDataSource src(chain, pool, pol, &pool);
+
+        src.set_now(2000);
+        std::string why;
+        (void)src.snapshot(&why);
+        const MinerDataEpoch e0 = src.epoch();
+
+        // Two txs arrive during the same quiet window; the tip does not move.
+        src.set_now(2001);
+        pool.add(synthetic_id(92), 2000, 30000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+        pool.add(synthetic_id(93), 2000, 31000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+        (void)src.snapshot(&why);                     // provider poll inside the window
+        src.set_now(2002);
+        (void)src.snapshot(&why);                     // provider poll inside the window
+        CHECK(src.epoch() == e0, "PW/b inside the refresh window: no rebuild yet (pool=2)");
+
+        src.set_now(2004);
+        const MinerDataEpoch e1 = src.epoch();
+        CHECK(!(e1 == e0),
+              "PW/b t=2004 window elapsed => epoch ADVANCES (the pool=2 arrival is not swallowed)");
+        auto md1 = src.snapshot(&why);
+        CHECK(md1.has_value() && md1->tx_backlog.size() == 2,
+              "PW/b both quiet-moment txs are MINED -- never an empty block over a non-empty pool (n=%zu)",
+              md1 ? md1->tx_backlog.size() : 0);
+        CHECK(src.last_pool_n() == 2 && src.last_chosen_n() == 2,
+              "PW/b sensors: pool=2 chosen=2 (the status line becomes n_tx=2, not n_tx=0)");
+        CHECK(src.good_citizen_violations() == 0, "PW/b good_citizen_violations == 0");
+    }
+}
+
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1326,6 +1455,7 @@ int main(int argc, char** argv) {
     suite_pin_same_tip();
     suite_daemon_arm_rebuild_identity();
     suite_good_citizen();
+    suite_provider_poll_in_window();
 
     std::printf("=== %d checks, %d failed ===\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
