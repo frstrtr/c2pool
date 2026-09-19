@@ -43,8 +43,14 @@ RctVerifyStatus verify_non_input_consensus(RctNonInput& in) {
     // A key image outside the prime-order subgroup is a forgery vector that
     // needs no chain state to detect, so it belongs here rather than with the
     // spent-set check the pool cannot do.
+    // monerod (core::check_tx_inputs_keyimages_domain) rejects the identity
+    // point BEFORE the subgroup/order check: l*I == I, so the identity key
+    // image passes in_main_subgroup (upstream toPointCheckOrder) and would
+    // otherwise be admitted. Reject it explicitly, in monerod's order, so our
+    // accept/reject verdict matches the daemon's.
     for (const Key& ki : in.key_images)
-        if (!in_main_subgroup(ki)) return RctVerifyStatus::KeyImageDomain;
+        if (ki == identity() || !in_main_subgroup(ki))
+            return RctVerifyStatus::KeyImageDomain;
 
     // --- commitment balance --------------------------------------------------
     // sum(pseudoOuts) == sum(outPk) + fee*H. The fee is plaintext, so this one
