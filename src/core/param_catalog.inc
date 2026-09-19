@@ -678,5 +678,8 @@ C2P_PARAM("utility.dump_mn_checkpoint", Meta, STRING, RESTART, C_DASH, LIT, "", 
 C2P_PARAM("utility.max_nonce", Meta, INT64, RESTART, C_DASH, LIT, "4294967295", NONE, "mine-block max nonce")
   C2P_ALIAS("utility.max_nonce", BIN_DASH, "--max-nonce", VALUE)
 
+C2P_PARAM("bls.allow_stub", Gate, BOOL, RESTART, C_DASH, LIT, "false", NONE, "knowingly run a bls=stub (BLS-dark) build in a BLS-relying config")
+  C2P_ALIAS("bls.allow_stub", BIN_DASH, "--allow-stub-bls", FLAG)
+
 #undef C2P_PARAM
 #undef C2P_ALIAS
