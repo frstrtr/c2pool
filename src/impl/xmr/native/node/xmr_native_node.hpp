@@ -213,23 +213,27 @@ struct NativeNodeConfig {
     // injection run is a refusal experiment, not a coverage one.
     parity::TipFaultInjection tip_fault{};
 
-    // THE BACKLOG REBUILD TRIGGER, in seconds. 0 -- the default, and what M0
-    // through M2 shipped -- means TIP-ONLY: the served template is rebuilt when
-    // the parent tip moves and at no other time.
+    // THE BACKLOG REBUILD TRIGGER, in seconds. Non-zero (the default now, 3 s)
+    // means the served template is rebuilt when the native POOL moves, not only
+    // when the parent tip moves, at most once per this many seconds. 0 is the
+    // legacy TIP-ONLY posture (what M0 through M2 shipped).
     //
-    // That default is byte-stable for miners already grinding a job, and it is
-    // also why a native arm collects almost no fees. A block CONSUMES the pool,
-    // so at the instant of the tip move the pool is empty; everything that
-    // arrives during the block interval waits for the NEXT tip move, by which
-    // time somebody else has mined it. The template served for the whole
-    // interval is the empty one built at its start.
+    // Tip-only is byte-stable for miners already grinding a job, but it is also
+    // why a native arm collects almost no fees, and it violates the good-citizen
+    // hard rule: a block CONSUMES the pool, so at the instant of the tip move the
+    // pool is empty; everything that arrives during the block interval would wait
+    // for the NEXT tip move, by which time somebody else has mined it. The
+    // template served for the whole interval would be the empty one built at its
+    // start. The good-citizen rule requires that txs arriving mid-interval enter
+    // the served template, so the default is on.
     //
     // A non-zero value admits the pool's backlog_version as a second rebuild
     // trigger, RATE-LIMITED to at most one admission per this many seconds --
     // which is the same bargain monerod's own get_block_template callers strike.
-    // The cost is real and is why it is opt-in: a rebuild restamps the header
-    // timestamp under miners mid-grind and shortens the retained job ring.
-    std::uint64_t            backlog_refresh_s = 0;
+    // The cost is a rebuild that restamps the header timestamp under miners
+    // mid-grind and shortens the retained job ring; the retained-epoch ring
+    // absorbs it (in-flight jobs keep resolving from older generations).
+    std::uint64_t            backlog_refresh_s = 3;
 
     TemplateArm              serve_arm = TemplateArm::Native;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
@@ -305,6 +309,13 @@ struct NodeStatus {
     std::string                  template_arm;
     std::string                  io_threads;
     std::string                  verify_thread;
+    // GOOD-CITIZEN sensors from the native miner-data source: the backlog the
+    // selector was offered, what it chose (== what the served template carries),
+    // and the invariant tripwire (a non-empty pool that yielded an empty
+    // selection -- must stay 0).
+    std::size_t                  citizen_pool_n = 0;
+    std::size_t                  citizen_chosen_n = 0;
+    std::uint64_t                good_citizen_violations = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -534,6 +545,9 @@ public:
         verify_loop_.call([this, &s] { if (driver_) s.driver = driver_->stats(); });
         s.io_threads   = thread_id_string_(io_thread_id_);
         s.verify_thread = thread_id_string_(verify_loop_.thread_id());
+        s.citizen_pool_n          = native_src_.last_pool_n();
+        s.citizen_chosen_n        = native_src_.last_chosen_n();
+        s.good_citizen_violations = native_src_.good_citizen_violations();
         return s;
     }
 
@@ -837,6 +851,11 @@ private:
         // the peer floor is off; it is a flag rather than a refusal anyway.
         p.min_peers = 0;
         p.backlog_refresh_s = cfg_.backlog_refresh_s;
+        // GOOD-CITIZEN: the served arm always builds from the good-citizen
+        // selection over the admitted backlog (operator hard rule). The default
+        // is on; nothing on the node config turns it off (that is a KAT/shadow
+        // knob), so the live path always honours the rule.
+        p.good_citizen = true;
         return p;
     }
 
@@ -904,6 +923,14 @@ private:
             verify_loop_.post([this, now] {
                                   if (driver_) driver_->tick(now);
                                   publish_tx_gate_();
+                                  // GOOD-CITIZEN: feed the wall clock (unix
+                                  // seconds) to the miner-data source so the
+                                  // backlog-refresh rate limit is actually
+                                  // honoured on the live node -- without a
+                                  // set_now caller the "at most once per
+                                  // backlog_refresh_s" clause is inert and the
+                                  // cadence collapses to the provider poll.
+                                  native_src_.set_now(unix_seconds_());
                               },
                               /*control=*/true);
             arm_tick_();

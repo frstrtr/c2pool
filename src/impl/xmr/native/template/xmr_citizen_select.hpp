@@ -69,6 +69,16 @@ struct CitizenPolicy {
 
     // monerod CRYPTONOTE_COINBASE_BLOB_RESERVED_SIZE: weight reserved for the
     // coinbase when sizing the block against the median / ceiling.
+    //
+    // NOTE: 600 is monerod's reserve for a 2-output coinbase. A v37 K_fair
+    // coinbase can carry up to wire_cap (~2700) payees (~116 KB), so this
+    // selector may over-admit by that much in the penalty zone. The AUTHORITATIVE
+    // coinbase-aware trim lives on the AGPL side (XmrBlockAssembler::build under
+    // take_mempool_as_given), which trims the fee-rate tail against the REAL
+    // coinbase weight so the block never crosses 2*median (get_block_reward
+    // would return 0 and the block would be refused). Raising this value here
+    // would only make the selector more conservative; it is not load-bearing for
+    // the never-empty guarantee.
     std::uint64_t coinbase_reserved = 600;
 };
 

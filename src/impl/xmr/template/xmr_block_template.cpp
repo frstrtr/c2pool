@@ -27,6 +27,15 @@
 //   Keccak-midstate opening, and the tree_hash main branch is unchanged from
 //   upstream; only p2pool's SideChain calls were rerouted to IXmrSettlementSource
 //   and the sidechain-id / aux-slot machinery was removed.
+//
+//   c2pool modification (2026-09, GPLv3 s.5(a) notice): update() and
+//   select_mempool_transactions() gained a `take_mempool_as_given` parameter.
+//   When set, the AGPL good-citizen selector on the c2pool side has already
+//   chosen the FINAL transaction set, so this file bypasses the p2pool 5-second
+//   mempool age gate and the penalty-zone greedy re-selection and mines the
+//   given set verbatim (only the 128 KB carrier-size safeguard still applies).
+//   No p2pool code was copied out of this file; the knob's VALUE originates on
+//   the AGPL side, this file merely honours it. Default false = upstream path.
 // =============================================================================
 
 #include "xmr_block_template.hpp"
@@ -151,14 +160,17 @@ void XmrBlockTemplate::shuffle_tx_order()
 // select_mempool_transactions  (upstream, with p2pool sidechain serialisation
 // replaced by a conservative fixed template-overhead estimate).
 // ---------------------------------------------------------------------------
-void XmrBlockTemplate::select_mempool_transactions(const std::vector<XmrTxMempoolData>& mempool)
+void XmrBlockTemplate::select_mempool_transactions(const std::vector<XmrTxMempoolData>& mempool, bool take_as_given)
 {
     m_mempoolTxs.clear();
 
     const uint64_t cur_time = seconds_since_epoch();
     for (const XmrTxMempoolData& tx : mempool) {
-        // take only txs seen >= 5 s ago, or high-fee txs immediately
-        if ((cur_time > tx.time_received + 5) || (tx.fee >= HIGH_FEE_VALUE)) {
+        // GOOD-CITIZEN (c2pool): take_as_given means the AGPL good-citizen
+        // selector already chose this FINAL set -- include every tx verbatim,
+        // no age gate, no high-fee bypass. Otherwise upstream p2pool rule:
+        // take only txs seen >= 5 s ago, or high-fee txs immediately.
+        if (take_as_given || (cur_time > tx.time_received + 5) || (tx.fee >= HIGH_FEE_VALUE)) {
             m_mempoolTxs.emplace_back(tx);
         }
     }
@@ -438,7 +450,7 @@ uint32_t XmrBlockTemplate::get_hashing_blob_nolock(uint32_t extra_nonce, uint8_t
 // ---------------------------------------------------------------------------
 // update  (upstream orchestration; SideChain calls -> IXmrSettlementSource).
 // ---------------------------------------------------------------------------
-void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxMempoolData>& mempool)
+void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxMempoolData>& mempool, bool take_as_given)
 {
     if (data.major_version > HARDFORK_SUPPORTED_VERSION) {
         return; // unknown fork: refuse to build, pin HARDFORK_SUPPORTED_VERSION per fork
@@ -485,7 +497,7 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
     m_merkleTreeDataSize = 0;
     writeVarint(m_merkleTreeData, [this](uint8_t) { ++m_merkleTreeDataSize; });
 
-    select_mempool_transactions(mempool);
+    select_mempool_transactions(mempool, take_as_given);
 
     const uint64_t base_reward = get_base_reward(data.already_generated_coins);
 
@@ -514,11 +526,16 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
     m_mempoolTxsOrder.resize(m_mempoolTxs.size());
     for (size_t i = 0; i < m_mempoolTxs.size(); ++i) m_mempoolTxsOrder[i] = static_cast<int>(i);
 
-    if (total_tx_weight + miner_tx_weight <= data.median_weight) {
-        // below the penalty zone: take everything
+    if (take_as_given || total_tx_weight + miner_tx_weight <= data.median_weight) {
+        // Below the penalty zone: take everything. GOOD-CITIZEN (c2pool): under
+        // take_as_given the AGPL selector has already chosen the FINAL set and
+        // capped it below the consensus ceiling, so this branch mines it
+        // verbatim EVEN when it reaches the penalty zone -- no greedy re-drop.
         final_fees = 0;
         final_weight = miner_tx_weight;
-        shuffle_tx_order();
+        // Keep selector order deterministic (== block order) under take_as_given
+        // so the served/mined set is KAT-comparable; monerod accepts any order.
+        if (!take_as_given) shuffle_tx_order();
 
         m_numTransactionHashes = m_mempoolTxsOrder.size();
         m_transactionHashes.assign(HASH_SIZE, 0);
@@ -530,7 +547,12 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
             final_fees += tx.fee;
             final_weight += tx.weight;
         }
-        final_reward = base_reward + final_fees;
+        // get_block_reward == base_reward + final_fees below the median, and
+        // applies the correct penalty above it (0 above 2*median, which the
+        // AGPL coinbase-aware trim in XmrBlockAssembler::build guarantees we
+        // never reach). Under the pure sub-median case this is identical to the
+        // upstream `base_reward + final_fees`.
+        final_reward = get_block_reward(base_reward, data.median_weight, final_fees, final_weight);
     }
     else {
         // penalty zone: greedy fee-per-byte pick with 100-deep replacement,

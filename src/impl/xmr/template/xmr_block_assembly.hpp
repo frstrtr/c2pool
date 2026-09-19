@@ -497,6 +497,15 @@ struct AssemblyInputs {
     CoinbaseInputs                settle;
     std::uint32_t                 wire_cap = 2700;   // output cap ceiling when output_cap == 0
     int                           max_passes = 6;    // fixpoint bound (fail closed beyond)
+
+    // GOOD-CITIZEN (native arm). When true, `mempool` is the FINAL set the AGPL
+    // good-citizen selector already chose: the template mines it VERBATIM (no
+    // p2pool 5-s age gate, no penalty-zone greedy re-select). This file still
+    // enforces a coinbase-aware hard trim so the block never crosses 2*median
+    // (which would zero the reward and refuse the block) -- the trim only ever
+    // pops from the fee-rate TAIL and never the first entry, so a non-empty
+    // selection always yields a non-empty block (good-citizen invariant D).
+    bool                          take_mempool_as_given = false;
 };
 
 class XmrBlockAssembler {
@@ -517,13 +526,56 @@ public:
                         " > HARDFORK_SUPPORTED_VERSION " + std::to_string(HARDFORK_SUPPORTED_VERSION));
 
         const std::uint64_t subsidy = xmr_base_reward(a.miner.already_generated_coins);
-        std::uint64_t fees_all = 0, weight_all = 0;
-        for (const auto& t : a.mempool) { fees_all += t.fee; weight_all += t.weight; }
 
         CoinbaseInputs base = a.settle;
         base.monero_major_version = a.miner.major_version;
         base.height  = a.miner.height;
         base.prev_id = to_hash256(a.miner.prev_id);
+
+        // GOOD-CITIZEN coinbase-aware trim (native arm). The good-citizen
+        // selector sized its set against a 600 B coinbase reserve, but a v37
+        // K_fair coinbase with many payees is far larger. Two independent limits
+        // can EMPTY the block if the tx set is heavy, and this trim defends both
+        // by capping tx weight from the fee-rate TAIL (never the first entry, so
+        // a non-empty pool always yields a non-empty block -- invariant D):
+        //   (1) get_block_reward returns 0 above 2*median_raw (block too big) --
+        //       the template refuses and serves the previous/empty template;
+        //   (2) weight_aware_output_cap shrinks the payee set as tx weight grows;
+        //       if it collapses below the coinbase's REQUIRED outputs (fixed +
+        //       sink) the assembler refuses (see K6'). The trim reserves cb_ub
+        //       against the zone so the cap keeps >= required outputs.
+        // Budget uses the RAW median (matching the template's own penalty math,
+        // which does not clamp) intersected with the weight_aware zone.
+        std::vector<XmrTxMempoolData> trimmed;
+        const std::vector<XmrTxMempoolData>* mp = &a.mempool;
+        if (a.take_mempool_as_given && !a.mempool.empty()) {
+            constexpr std::uint64_t ZONE_MIN = 300000;   // CRYPTONOTE reward zone
+            const std::uint64_t median = a.miner.median_weight;
+            const std::uint64_t zone   = median < ZONE_MIN ? ZONE_MIN : median;   // weight_aware floor
+            // required coinbase outputs (upper bound): owed + fixed + sink,
+            // capped at wire_cap. Reserve enough that weight_aware_output_cap
+            // keeps room for them AND the block stays reward-positive.
+            const std::uint64_t req_outputs =
+                std::min<std::uint64_t>(a.settle.owed.size() + a.settle.fixed.size() + 1, a.wire_cap);
+            const std::uint64_t cb_ub = 128 + req_outputs * ::v37::xmr::settle::XMR_OUTPUT_SIZE_BYTES;
+            // reward-positive ceiling (2*median_raw) intersected with the
+            // penalty-free zone that weight_aware_output_cap caps payees against.
+            const std::uint64_t eff_ceiling = std::min<std::uint64_t>(median ? 2 * median : ZONE_MIN, zone);
+            const std::uint64_t budget = eff_ceiling > cb_ub ? eff_ceiling - cb_ub : 0;
+            std::uint64_t wsum = 0;
+            trimmed.reserve(a.mempool.size());
+            for (const auto& t : a.mempool) {
+                if (trimmed.empty()) { trimmed.push_back(t); wsum += t.weight; continue; }  // R-CIT-1: first always
+                if (wsum + t.weight > budget) break;   // fee-rate desc => drop the tail
+                trimmed.push_back(t); wsum += t.weight;
+            }
+            mp = &trimmed;
+        }
+        const std::vector<XmrTxMempoolData>& mempool = *mp;
+
+        std::uint64_t fees_all = 0, weight_all = 0;
+        for (const auto& t : mempool) { fees_all += t.fee; weight_all += t.weight; }
+
         if (base.output_cap == 0)
             base.output_cap = ::v37::xmr::settle::weight_aware_output_cap(a.miner.median_weight, weight_all, a.wire_cap);
 
@@ -540,7 +592,7 @@ public:
 
             std::unique_ptr<XmrBlockTemplate> tpl(new XmrBlockTemplate(seam.get()));
             seam->begin_update();
-            tpl->update(a.miner, a.mempool);
+            tpl->update(a.miner, mempool, a.take_mempool_as_given);
 
             const bool ok = tpl->last_updated() != 0 && tpl->get_height() == a.miner.height && tpl->get_reward() != 0;
             if (ok) {
@@ -880,6 +932,86 @@ inline bool selfcheck(std::string& log) {
         AssemblyInputs c; c.miner = miner(1, 300000, 0); c.settle = lane_ctx(); c.settle.output_cap = 1;
         ::v37::xmr::settle::FixedOutput f; f.pay = std_ref(); f.amount = 1; f.identity = id_of(0x77); c.settle.fixed.push_back(f);
         C(XmrBlockAssembler::build(c, &why) == nullptr, "K6' output_cap too small for fixed + sink refused: " + why);
+    }
+
+    // ---- K7: GOOD-CITIZEN take_mempool_as_given (native arm) ------------------
+    // The operator hard rule: a mined block ALWAYS carries the pool's valid txs
+    // when the pool has any. take_mempool_as_given bypasses the p2pool 5-s age
+    // gate and the penalty-zone greedy re-selection so the selected set is mined
+    // verbatim, capped only by the coinbase-aware trim (never empties the block).
+    {
+        // K7a: median 3000, 10 txs of 500 B / 1e9 fee = 5000 B, under 2*median
+        // (6000). take_mempool_as_given mines ALL 10; the greedy control keeps
+        // only the ~6 penalty-free ones (proves the knob is load-bearing -- this
+        // is the "187 -> 5" reproduction the prior FOF found).
+        auto mk = [](std::uint64_t median, bool take) {
+            AssemblyInputs a; a.miner = miner(3000000, median, 18000000000000000000ull); a.settle = lane_ctx();
+            ::v37::xmr::settle::OwedEntry A; A.pay = std_ref(); A.owed = 1000000000ull; A.first_eligible = 1; A.identity = id_of(0x41);
+            a.settle.owed = {A};
+            a.take_mempool_as_given = take;
+            return a;
+        };
+        {
+            AssemblyInputs a = mk(3000, true);
+            a.mempool = txs(10, 500, 1000000000ull);
+            std::string why; auto t = XmrBlockAssembler::build(a, &why);
+            if (C(t != nullptr, "K7a build (take_mempool_as_given, 10 txs) " + why)) {
+                C(t->n_tx() == 10, "K7a good-citizen mines ALL 10 txs verbatim (got " + std::to_string(t->n_tx()) + ")");
+                C(t->reward() != 0, "K7a reward != 0 (block not refused)");
+                for (std::uint32_t en : {0u, 3u}) check_template(C, *t, en, "K7a");
+            }
+        }
+        {
+            // control: same set, good-citizen OFF -> the greedy drops into the
+            // penalty-free zone (fewer than 10). Proves take_mempool_as_given is
+            // what puts the dropped txs back.
+            AssemblyInputs a = mk(3000, false);
+            a.mempool = txs(10, 500, 1000000000ull);
+            std::string why; auto t = XmrBlockAssembler::build(a, &why);
+            if (C(t != nullptr, "K7b control build (good-citizen OFF) " + why))
+                C(t->n_tx() < 10 && t->n_tx() >= 1, "K7b greedy control keeps fewer than 10 (got " + std::to_string(t->n_tx()) + ")");
+        }
+        {
+            // K7c: empty pool -> empty block (empty IFF pool empty).
+            AssemblyInputs a = mk(3000, true);   // no mempool
+            std::string why; auto t = XmrBlockAssembler::build(a, &why);
+            if (C(t != nullptr, "K7c build (empty pool) " + why))
+                C(t->n_tx() == 0, "K7c empty pool => coinbase-only (n_tx == 0)");
+        }
+        {
+            // K7d: coinbase-aware trim. 20 txs of 500 B = 10000 B > 2*median
+            // (6000): without the trim get_block_reward would return 0 and the
+            // block would be refused (emptied). The trim drops the fee-rate tail
+            // so the block is reward-positive, the first tx always survives.
+            AssemblyInputs a = mk(3000, true);
+            a.mempool = txs(20, 500, 1000000000ull);
+            std::string why; auto t = XmrBlockAssembler::build(a, &why);
+            if (C(t != nullptr, "K7d build (heavy pool, coinbase-aware trim) " + why)) {
+                C(t->n_tx() >= 1 && t->n_tx() < 20, "K7d trim keeps 1..19 txs, never empty (got " + std::to_string(t->n_tx()) + ")");
+                C(t->reward() != 0, "K7d reward != 0 (trim kept the block reward-positive, not refused)");
+            }
+        }
+        {
+            // K7e: age-gate negation. One RECENT (< 5 s old) low-fee tx. With the
+            // good-citizen path OFF the p2pool 5-s age gate drops it and the block
+            // is coinbase-only (exactly the failure the task describes); ON, it is
+            // mined.
+            std::vector<XmrTxMempoolData> recent(1);
+            recent[0].id = hash_of(0x90); recent[0].weight = 500; recent[0].fee = 1000;  // << HIGH_FEE_VALUE
+            recent[0].time_received = seconds_since_epoch();                              // just now
+            {
+                AssemblyInputs a = mk(3000, true); a.mempool = recent;
+                std::string why; auto t = XmrBlockAssembler::build(a, &why);
+                if (C(t != nullptr, "K7e build (recent low-fee tx, good-citizen ON) " + why))
+                    C(t->n_tx() == 1, "K7e recent low-fee tx is MINED under good-citizen (age gate bypassed)");
+            }
+            {
+                AssemblyInputs a = mk(3000, false); a.mempool = recent;
+                std::string why; auto t = XmrBlockAssembler::build(a, &why);
+                if (C(t != nullptr, "K7e control build (good-citizen OFF) " + why))
+                    C(t->n_tx() == 0, "K7e control: the 5-s age gate drops the recent low-fee tx (coinbase-only)");
+            }
+        }
     }
 
     log += "summary: " + std::to_string(C.pass) + " passed, " + std::to_string(C.fail) + " failed\n";

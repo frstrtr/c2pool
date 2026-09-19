@@ -1179,6 +1179,120 @@ bool load_parity_json(const std::string& path, ParityExpectation& exp) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Suite GC -- GOOD-CITIZEN selection wiring (operator hard rule).
+//
+//   (i)   a populated pool => a NON-EMPTY served template whose backlog IS the
+//         select_good_citizen() selection, id-for-id, and whose bodies pin.
+//   (i')  good_citizen == false serves the RAW selectable backlog (shadow arm /
+//         regression), proving the selector is what the default now runs.
+//   (ii)  a tx arriving mid-interval enters the served template after the
+//         backlog-refresh window elapses (fees that arrive during a block).
+//   (D)   good_citizen_violations() stays 0: a non-empty pool never yields an
+//         empty selection.
+// ---------------------------------------------------------------------------
+void suite_good_citizen() {
+    std::printf("== GC. good-citizen selection wiring ==\n");
+
+    fakes::FakeChain chain;
+    chain.state.synced = true;
+    node::ChainMainBlock tip;
+    tip.height = 3000; tip.id = synthetic_id(3000);
+    tip.timestamp = 1700000000; tip.difficulty = u128_of(1000000, 0);
+    chain.rows.push_back(tip);
+    TemplateInputs t;
+    t.major_version = 16; t.minor_version = 16;
+    t.height = 3001; t.prev_id = tip.id; t.seed_hash = synthetic_id(9);
+    t.difficulty = u128_of(1000000, 0);
+    t.median_weight = 300000; t.block_weight_limit = 600000;
+    t.already_generated_coins = 18000000000000000000ull;
+    t.median_timestamp = 1699999000; t.synced = true;
+    chain.inputs = t;
+
+    // (i) populated pool => non-empty template == select_good_citizen().chosen
+    {
+        fakes::FakeTxpool pool;
+        for (unsigned i = 0; i < 5; ++i)
+            pool.add(synthetic_id(60 + i), 2000, 30000 + i, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+
+        tmpl::NativeMinerDataSource src(chain, pool, {}, &pool);   // default policy => good_citizen ON
+        std::string why;
+        const auto md = src.snapshot(&why);
+        CHECK(md.has_value(), "GC snapshot with a populated pool (%s)", why.c_str());
+        if (!md) return;
+        CHECK(!md->tx_backlog.empty(), "good citizen: a populated pool yields a NON-EMPTY template (n=%zu)",
+              md->tx_backlog.size());
+
+        const auto raw    = pool.selectable_backlog();
+        const auto chosen = ::c2pool::xmr::native::select_good_citizen(
+                                raw, t.median_weight, t.already_generated_coins, t.major_version).chosen;
+        CHECK(md->tx_backlog.size() == chosen.size(),
+              "served backlog size == select_good_citizen().chosen (%zu vs %zu)",
+              md->tx_backlog.size(), chosen.size());
+        bool id_for_id = md->tx_backlog.size() == chosen.size();
+        for (std::size_t i = 0; id_for_id && i < chosen.size(); ++i)
+            id_for_id = md->tx_backlog[i].id == chosen[i].id;
+        CHECK(id_for_id, "served backlog == select_good_citizen().chosen id-for-id");
+
+        bool bodies_ok = true;
+        for (const auto& e : md->tx_backlog) bodies_ok = bodies_ok && (src.tx_body(e.id) != nullptr);
+        CHECK(bodies_ok, "every chosen tx has a resolvable body (C5 can relay the block)");
+        CHECK(pool.pins.size() == 1, "exactly one pin generation held");
+        CHECK(src.good_citizen_violations() == 0, "good_citizen_violations == 0 (invariant D)");
+        CHECK(src.last_pool_n() == 5 && src.last_chosen_n() == md->tx_backlog.size(),
+              "sensors: pool=%zu chosen=%zu", src.last_pool_n(), src.last_chosen_n());
+    }
+
+    // (i') good_citizen == false => the raw selectable backlog (shadow arm)
+    {
+        fakes::FakeTxpool pool;
+        for (unsigned i = 0; i < 5; ++i)
+            pool.add(synthetic_id(70 + i), 2000, 30000 + i, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+        tmpl::NativeTemplatePolicy pol;
+        pol.good_citizen = false;
+        tmpl::NativeMinerDataSource src(chain, pool, pol);
+        std::string why;
+        const auto md = src.snapshot(&why);
+        CHECK(md.has_value() && md->tx_backlog.size() == pool.selectable_backlog().size(),
+              "good_citizen=false serves the raw selectable backlog (%zu)",
+              md ? md->tx_backlog.size() : 0);
+    }
+
+    // (ii) a tx arriving mid-interval enters the served template after refresh
+    {
+        fakes::FakeChain c2;
+        c2.state.synced = true;
+        c2.rows.push_back(tip);
+        c2.inputs = t;
+        fakes::FakeTxpool p2;
+        p2.add(synthetic_id(80), 2000, 30000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+
+        tmpl::NativeTemplatePolicy pol;
+        pol.backlog_refresh_s = 3;      // good-citizen default cadence
+        tmpl::NativeMinerDataSource src(c2, p2, pol, &p2);
+        src.set_now(1000);
+        std::string why;
+        auto md0 = src.snapshot(&why);
+        CHECK(md0.has_value() && md0->tx_backlog.size() == 1, "GC/ii initial served backlog = 1");
+        const MinerDataEpoch e0 = src.epoch();
+
+        // a new tx arrives DURING the interval
+        src.set_now(1001);
+        p2.add(synthetic_id(81), 2000, 40000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+        CHECK(src.epoch() == e0, "GC/ii inside the refresh window: no new epoch yet");
+
+        // the window elapses => the arrival is admitted and served
+        src.set_now(1000 + 3);
+        const MinerDataEpoch e1 = src.epoch();
+        CHECK(!(e1 == e0), "GC/ii window elapsed => a new epoch (the arrival triggers a rebuild)");
+        auto md1 = src.snapshot(&why);
+        CHECK(md1.has_value() && md1->tx_backlog.size() == 2,
+              "GC/ii the mid-interval tx ENTERS the served template (n=%zu)",
+              md1 ? md1->tx_backlog.size() : 0);
+        CHECK(src.good_citizen_violations() == 0, "GC/ii good_citizen_violations == 0");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1211,6 +1325,7 @@ int main(int argc, char** argv) {
     suite_body_id_alignment();
     suite_pin_same_tip();
     suite_daemon_arm_rebuild_identity();
+    suite_good_citizen();
 
     std::printf("=== %d checks, %d failed ===\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

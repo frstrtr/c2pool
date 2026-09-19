@@ -114,10 +114,10 @@ struct NativeTemplateConfig {
     bool                     force_synced = false;
 
     // Rebuild the served template when the POOL moves, not only when the tip
-    // does, at most once per this many seconds. 0 = tip-only, which is what
-    // shipped and is byte-identical to it. See NativeNodeConfig for why a
-    // tip-only native arm collects almost no fees.
-    std::uint64_t            backlog_refresh_s = 0;
+    // does, at most once per this many seconds. Default 3 s (good-citizen: txs
+    // arriving mid-interval must reach the served template). 0 = legacy tip-only.
+    // See NativeNodeConfig for why a tip-only native arm collects almost no fees.
+    std::uint64_t            backlog_refresh_s = 3;
 
     // A build without librandomx cannot check proof of work. Opt-in, loud.
     bool                     allow_unverified_pow = false;

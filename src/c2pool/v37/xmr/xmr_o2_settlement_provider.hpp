@@ -97,6 +97,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -203,6 +204,12 @@ public:
 
     // MAIN THREAD, before the first refresh(). Not settable while serving.
     void set_shape_gate(ShapeGate g) { m_shape_gate = std::move(g); }
+
+    // MAIN THREAD, before the first refresh(). GOOD-CITIZEN: feed the selector's
+    // chosen tx set into the block VERBATIM (bypass the p2pool 5-s age gate and
+    // the penalty-zone greedy). Applied ONLY when the answering arm is the
+    // native one -- the daemon arm keeps its exact byte-identical legacy path.
+    void set_take_mempool_as_given(bool on) { m_take_mempool_as_given = on; }
 
     XmrSettlementTemplateProvider(const XmrSettlementTemplateProvider&) = delete;
     XmrSettlementTemplateProvider& operator=(const XmrSettlementTemplateProvider&) = delete;
@@ -446,6 +453,13 @@ private:
         a.miner   = xmr_md;
         a.mempool = asm_::from_backlog(md.tx_backlog);       // empty on regtest => n_tx == 0
         a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+        // GOOD-CITIZEN: mine the (already good-citizen-selected) set VERBATIM,
+        // but only when the NATIVE arm answered. name() reports the arm that
+        // actually served this snapshot (the resolved source can fall back to
+        // "monerod" per refresh), so the daemon arm keeps its byte-identical
+        // legacy 5-s-gate path.
+        a.take_mempool_as_given =
+            m_take_mempool_as_given && std::string_view(m_src->name()) == "native";
 
         std::string as_why;
         std::unique_ptr<asm_::AssembledTemplate> tpl = asm_::XmrBlockAssembler::build(a, &as_why);
@@ -488,6 +502,7 @@ private:
     native::IMinerDataSource*                 m_src = nullptr;
     RefreshPump                               m_pump;
     ShapeGate                                 m_shape_gate;
+    bool                                      m_take_mempool_as_given = false;
 
     XmrOwedFixture&          m_ledger;
     XmrSettlementConfig      m_scfg;

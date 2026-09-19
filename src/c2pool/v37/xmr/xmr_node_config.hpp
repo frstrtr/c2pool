@@ -288,13 +288,20 @@ struct XmrNodeConfig {
     // refuses to start (fail-closed: it never serves a half-built window).
     std::uint32_t   native_ready_timeout_s = 120;
     // Rebuild the served template when the native POOL moves, not only when the
-    // parent tip does, at most once per this many seconds. 0 (the default, and
-    // what M0..M2 shipped) is TIP-ONLY. A block consumes the pool, so a
-    // tip-only arm serves the empty template built at the start of every block
-    // interval and collects almost none of the fees that arrive during it. The
-    // cost of turning it on is a restamped header under miners mid-grind, which
-    // is why the default does not move.
-    std::uint64_t   native_backlog_refresh_s = 0;
+    // parent tip does, at most once per this many seconds. Default 3 s. 0 is the
+    // legacy TIP-ONLY posture (what M0..M2 shipped). A block consumes the pool,
+    // so a tip-only arm serves the empty template built at the start of every
+    // block interval and collects almost none of the fees that arrive during it,
+    // which violates the good-citizen hard rule; hence the default is on. The
+    // cost of turning it on is a restamped header under miners mid-grind,
+    // absorbed by the retained-epoch job ring.
+    std::uint64_t   native_backlog_refresh_s = 3;
+
+    // --no-good-citizen: disable the good-citizen take-mempool-as-given path on
+    // the native arm (the CONTROL switch for the live proof -- reproduces the
+    // old coinbase-only-with-a-full-pool failure). Default false = good-citizen
+    // ON. Never affects the daemon arm.
+    bool            no_good_citizen = false;
 
     // --- M3: the arm order on the FIND path ---------------------------------
     // --arm-order daemon-first (default) | p2p-first. See ArmOrderMode above.

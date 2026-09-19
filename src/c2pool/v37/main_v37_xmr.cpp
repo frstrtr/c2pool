@@ -1077,6 +1077,23 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return true;
             });
 
+        // ── GOOD-CITIZEN take-mempool-as-given (native arm only) ────────────
+        // The operator hard rule: a mined block ALWAYS carries the pool's valid
+        // txs (empty coinbase-only ONLY when the pool is genuinely empty). ON by
+        // default for the native arm; --no-good-citizen is the CONTROL switch
+        // for the live proof (reproduces the old coinbase-only-with-full-pool
+        // failure). The daemon arm is never affected (provider gates on the
+        // answering arm's name()).
+        if (native && !cfg.no_good_citizen) {
+            provider.set_take_mempool_as_given(true);
+            std::printf("good-citizen: ON (native arm mines the selected mempool set verbatim; "
+                        "backlog-refresh %llus)\n",
+                        static_cast<unsigned long long>(cfg.native_backlog_refresh_s));
+        } else if (native) {
+            std::printf("good-citizen: OFF (--no-good-citizen: native arm uses the p2pool 5-s "
+                        "age gate; CONTROL run)\n");
+        }
+
         o2::SettlementStratumTemplateSource template_source(provider);
         std::printf("coinbase: %s (lane_chain=%u, residual sink %s)\n",
                     to_string(cfg.coinbase), static_cast<unsigned>(cfg.lane_chain),
@@ -1177,6 +1194,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                         ns.pool.peers_handshaked,
                         static_cast<unsigned long long>(ns.txpool.accepted),
                         served_backlog_n, last_selected_tx);
+
+            // GOOD-CITIZEN headline: the pool the selector was offered, what it
+            // chose, and the invariant tripwire. violations MUST stay 0 (a
+            // non-empty pool that produced an empty selection). "gc=on/off"
+            // records whether the take-mempool-as-given path is active.
+            std::printf("  good-citizen: %s pool=%zu chosen=%zu violations=%llu\n",
+                        (native && !cfg.no_good_citizen) ? "on" : "off",
+                        ns.citizen_pool_n, ns.citizen_chosen_n,
+                        static_cast<unsigned long long>(ns.good_citizen_violations));
 
             // THE WIRE LINE. Two independent sockets reach the same daemon: the
             // embedded node's own transport (parity judge + submit arm) and the
@@ -1342,6 +1368,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--native-backlog-refresh") cfg.native_backlog_refresh_s =
                      static_cast<std::uint64_t>(std::stoull(next("0")));
+        else if (a == "--no-good-citizen") cfg.no_good_citizen = true;
         else if (a == "--native-ready-timeout") cfg.native_ready_timeout_s =
                      static_cast<std::uint32_t>(std::stoul(next("120")));
         // M3 (R-ARMORDER, switchable): daemon-first stays the default.
@@ -1468,9 +1495,12 @@ int main(int argc, char** argv) {
                 "                               is not ready. off: native-only, fail-closed.\n"
                 "  --native-ready-timeout <s>   how long to wait for the native arm (default 120)\n"
                 "  --native-backlog-refresh <s> rebuild the template when the POOL moves, at most\n"
-                "                               once per <s> seconds (0 = tip-only, the default:\n"
-                "                               a tip-only arm serves the empty template built at\n"
-                "                               the start of each block interval)\n"
+                "                               once per <s> seconds (default 3; 0 = legacy tip-only,\n"
+                "                               which serves the empty template built at the start\n"
+                "                               of each block interval and collects almost no fees)\n"
+                "  --no-good-citizen            disable the good-citizen path on the native arm: use\n"
+                "                               the p2pool 5-s age gate instead of mining the\n"
+                "                               selected mempool set verbatim (CONTROL / debug)\n"
                 " M3 — WHICH ARM DRIVES THE FIND PATH (R-ARMORDER, switchable):\n"
                 "  --arm-order <daemon-first|p2p-first>\n"
                 "                               daemon-first (DEFAULT): monerod drives the tip\n"
