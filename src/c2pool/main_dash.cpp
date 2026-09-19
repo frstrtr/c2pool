@@ -11237,7 +11237,12 @@ int main(int argc, char** argv)
     std::string embedded_utxo_fold_expect;    // --embedded-utxo-fold-expect HEX
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
-            std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
+            // Name the BLS backend on the version line (issue #1671): a stub
+            // (BLS-dark) binary is otherwise indistinguishable here, and this is
+            // the surface operators and scripts read. bls= is the last token so
+            // an inventory can match it with `--version | grep -oE 'bls=[a-z]+'`.
+            std::cout << "c2pool-dash " << C2POOL_VERSION
+                      << " bls=" << dash::coin::vendor::bls_backend_name() << "\n";
             return 0;
         }
         else if (std::strcmp(argv[i], "--help") == 0)    want_help = true;
