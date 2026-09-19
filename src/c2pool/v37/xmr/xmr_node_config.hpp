@@ -303,6 +303,21 @@ struct XmrNodeConfig {
     // ON. Never affects the daemon arm.
     bool            no_good_citizen = false;
 
+    // --- OPERATOR TX-INJECTION (2026-09-19 ruling) --------------------------
+    // --native-inject: ARM the operator-inject path (default OFF, money-live,
+    // mirrors Dash --embedded-tx-inject). When on, operator-submitted signed
+    // txs are placed FIRST at highest priority in the served template (mined
+    // even at 0 fee), with first claim on the block-weight cap.
+    bool            native_inject = false;
+    // --native-inject-dir <dir>: poll <dir>/*.hex (one signed raw tx hex each),
+    // routing each through submit_operator_inject and renaming it .done.
+    std::string     native_inject_dir;
+    // --native-inject-hex <file>: one signed raw tx hex per line, loaded once at
+    // startup (all-or-nothing), mirrors Dash --embedded-tx-inject-hex.
+    std::string     native_inject_hex;
+    // TTL (blocks) for an inject submitted with no explicit expiry.
+    std::uint64_t   native_inject_ttl_blocks = 720;
+
     // --- M3: the arm order on the FIND path ---------------------------------
     // --arm-order daemon-first (default) | p2p-first. See ArmOrderMode above.
     // p2p-first is fail-closed on its preconditions: it REFUSES to start unless

@@ -69,6 +69,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -300,6 +303,13 @@ struct ServeHooks {
     // taking a built one, because the FOUND queue the sink pushes into is
     // loop-local -- one queue, one drain, whichever arm filled it.
     ::c2pool::xmr::native::relay::LevinBlockRelay* p2p_relay = nullptr;
+
+    // OPERATOR TX-INJECTION scanner, one call per loop pass (throttled inside).
+    // Set by main() when --native-inject --native-inject-dir is armed; it polls
+    // the inject dir and routes each *.hex through submit_operator_inject. Unset
+    // = no inject dir, and the served template is byte-identical to the plain
+    // good-citizen path.
+    std::function<void()> inject_pump;
 };
 
 // ---------------------------------------------------------------------------
@@ -683,6 +693,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     std::string last_template_err;
     while (!g_stop.load()) {
         pump_miner();       // --mine: hits first, so a find is bridged the same pass
+        if (hooks.inject_pump) hooks.inject_pump();  // --native-inject-dir scan
         bridge_found();
         fc.tick();
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
@@ -810,6 +821,9 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
     ncfg.c2pool_commit        = C2POOL_VERSION;
     ncfg.ready_timeout_s      = cfg.native_ready_timeout_s;
     ncfg.backlog_refresh_s    = cfg.native_backlog_refresh_s;
+    // OPERATOR TX-INJECTION: arm the gate on the native node (default OFF).
+    ncfg.operator_inject            = cfg.native_inject;
+    ncfg.operator_inject_ttl_blocks = cfg.native_inject_ttl_blocks;
     // D-14 lever (1): what the fork choice adopts at EQUAL work at the same
     // height. Same flag as the accounting tiebreak -- see xmr_same_height_race.hpp.
     ncfg.fork_tie             = (cfg.same_height_tiebreak == SameHeightTieBreak::PreferOwn)
@@ -1274,6 +1288,89 @@ static int run_live(const XmrNodeConfig& cfg) {
                             ::c2pool::xmr::native::parity::render_sample(r).c_str());
         };
 
+        // ── OPERATOR TX-INJECTION: the CLI path that exercises the gate ──────
+        // --native-inject-hex loads once at startup; --native-inject-dir polls
+        // the dir each loop pass and routes every *.hex through the SAME gate.
+        // Both call NativeNode::submit_operator_inject with default flags
+        // (PriorityRequest) and default expiry (tip + ttl), so the served
+        // template offers the tx FIRST, mined even at 0 fee, up to the cap.
+        if (cfg.native_inject && native && native->node()) {
+            auto* inode = native->node();
+            auto hex_to_bytes = [](const std::string& hs, std::vector<std::uint8_t>& out) -> bool {
+                std::string s; s.reserve(hs.size());
+                for (char c : hs) { if (c==' '||c=='\n'||c=='\r'||c=='\t') continue; s.push_back(c); }
+                if (s.size() % 2 != 0) return false;
+                auto nib = [](char c)->int {
+                    if (c>='0'&&c<='9') return c-'0';
+                    if (c>='a'&&c<='f') return c-'a'+10;
+                    if (c>='A'&&c<='F') return c-'A'+10;
+                    return -1; };
+                out.clear(); out.reserve(s.size()/2);
+                for (std::size_t i=0;i<s.size();i+=2){ int hi=nib(s[i]),lo=nib(s[i+1]);
+                    if(hi<0||lo<0) return false; out.push_back(static_cast<std::uint8_t>((hi<<4)|lo)); }
+                return true;
+            };
+            auto submit_one = [inode](std::vector<std::uint8_t> blob, const std::string& src) {
+                auto r = inode->submit_operator_inject(std::move(blob));
+                std::printf("[native-inject] %s: cause=%s ok=%d pool=%zu\n",
+                            src.c_str(), r.cause.c_str(), r.ok ? 1 : 0, inode->inject_pool_size());
+                std::fflush(stdout);
+            };
+            if (!cfg.native_inject_hex.empty()) {
+                std::ifstream f(cfg.native_inject_hex);
+                if (!f) {
+                    std::printf("[native-inject] --native-inject-hex: cannot open %s\n",
+                                cfg.native_inject_hex.c_str());
+                } else {
+                    std::vector<std::vector<std::uint8_t>> blobs; std::string line; bool ok = true;
+                    while (std::getline(f, line)) {
+                        if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+                        std::vector<std::uint8_t> b;
+                        if (!hex_to_bytes(line, b)) { ok = false; break; }
+                        blobs.push_back(std::move(b));
+                    }
+                    if (!ok) std::printf("[native-inject] --native-inject-hex: a line is not hex; "
+                                         "loaded nothing (all-or-nothing)\n");
+                    else for (auto& b : blobs) submit_one(std::move(b), "hex-file");
+                }
+            }
+            if (!cfg.native_inject_dir.empty()) {
+                const std::string dir = cfg.native_inject_dir;
+                auto last = std::make_shared<std::chrono::steady_clock::time_point>(
+                    std::chrono::steady_clock::now() - std::chrono::seconds(1));
+                hooks.inject_pump = [dir, hex_to_bytes, submit_one, last]() {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - *last < std::chrono::milliseconds(250)) return;
+                    *last = now;
+                    std::error_code ec;
+                    if (!std::filesystem::exists(dir, ec)) return;
+                    std::vector<std::filesystem::path> hits;
+                    for (auto& de : std::filesystem::directory_iterator(dir, ec)) {
+                        if (ec) break;
+                        if (de.path().extension() == ".hex") hits.push_back(de.path());
+                    }
+                    std::sort(hits.begin(), hits.end());
+                    for (auto& p : hits) {
+                        std::ifstream in(p, std::ios::binary);
+                        std::string hs((std::istreambuf_iterator<char>(in)),
+                                       std::istreambuf_iterator<char>());
+                        in.close();
+                        // Rename FIRST: a blob that crashes the decoder must not
+                        // be re-fed every tick forever (harness rule).
+                        std::filesystem::path done = p; done += ".done";
+                        std::filesystem::rename(p, done, ec);
+                        std::vector<std::uint8_t> blob;
+                        if (!hex_to_bytes(hs, blob)) {
+                            std::printf("[native-inject] %s: not hex\n",
+                                        p.filename().string().c_str());
+                            continue;
+                        }
+                        submit_one(std::move(blob), p.filename().string());
+                    }
+                };
+            }
+        }
+
         const int rc = serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
                                      "no --residual-sink-spend-hex/--residual-sink-view-hex",
                                      provider, template_source, candidate, std::move(hooks));
@@ -1369,6 +1466,12 @@ int main(int argc, char** argv) {
         else if (a == "--native-backlog-refresh") cfg.native_backlog_refresh_s =
                      static_cast<std::uint64_t>(std::stoull(next("0")));
         else if (a == "--no-good-citizen") cfg.no_good_citizen = true;
+        // OPERATOR TX-INJECTION (2026-09-19 ruling).
+        else if (a == "--native-inject") cfg.native_inject = true;
+        else if (a == "--native-inject-dir")  cfg.native_inject_dir = next("");
+        else if (a == "--native-inject-hex")  cfg.native_inject_hex = next("");
+        else if (a == "--native-inject-ttl-blocks") cfg.native_inject_ttl_blocks =
+                     static_cast<std::uint64_t>(std::stoull(next("720")));
         else if (a == "--native-ready-timeout") cfg.native_ready_timeout_s =
                      static_cast<std::uint32_t>(std::stoul(next("120")));
         // M3 (R-ARMORDER, switchable): daemon-first stays the default.
@@ -1501,6 +1604,21 @@ int main(int argc, char** argv) {
                 "  --no-good-citizen            disable the good-citizen path on the native arm: use\n"
                 "                               the p2pool 5-s age gate instead of mining the\n"
                 "                               selected mempool set verbatim (CONTROL / debug)\n"
+                " OPERATOR TX-INJECTION (2026-09-19 ruling; native arm only):\n"
+                "  --native-inject              ARM operator tx-injection (default OFF). Injected\n"
+                "                               txs are placed FIRST at highest priority in the\n"
+                "                               served template (mined even at 0 fee), with first\n"
+                "                               claim on the block-weight cap; the good-citizen\n"
+                "                               take-all tail fills the rest, never overfilling\n"
+                "                               SUPPORTED ARM for a 0-FEE inject is p2p-first: it\n"
+                "                               is always mined there. Under --arm-order daemon-\n"
+                "                               first a 0-fee inject is REFUSED BY NAME at submit\n"
+                "                               (monerod would reject the block); see --arm-order\n"
+                "  --native-inject-dir <dir>    poll <dir>/*.hex (one signed raw tx hex each) and\n"
+                "                               route each through the inject gate; renames to .done\n"
+                "  --native-inject-hex <file>   load one signed raw tx hex per line at startup\n"
+                "                               (all-or-nothing), then inject each\n"
+                "  --native-inject-ttl-blocks <n> TTL for an inject with no explicit expiry (720)\n"
                 " M3 — WHICH ARM DRIVES THE FIND PATH (R-ARMORDER, switchable):\n"
                 "  --arm-order <daemon-first|p2p-first>\n"
                 "                               daemon-first (DEFAULT): monerod drives the tip\n"
