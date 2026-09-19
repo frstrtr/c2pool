@@ -56,17 +56,36 @@
 //        P_i        = H_s(D_i || i) * G + B_i             (one-time key)
 //        view_tag_i = H("view_tag" || D_i || i)[0]        (since HF15)
 //        txout_to_tagged_key{ key = P_i, view_tag }       (output type)
-//   -- is the PRE-CARROT Monero recipe. FCMP++/CARROT is expected to rewrite
-//   address/key derivation (the view-tag scheme, the one-time-key formula, and
-//   possibly the output type). Whether it changes COINBASE derivation is [?]
-//   (scoping OQ-X10) and MUST NOT be guessed here. Therefore every entry point
-//   that produces output keys is GUARDED on the Monero hard-fork major_version
-//   (build_coinbase / derive_tx_secret_key / derive_output). A block whose
-//   major_version exceeds W5_PRECARROT_MAX_MAJOR_VERSION returns ok=false with
-//   a CARROT_FENCE error -- it does NOT silently build a possibly-wrong
-//   coinbase. When Monero pins CARROT in a release, add a NEW derivation path
-//   keyed on the new major_version; do not edit the pre-CARROT path in place.
-//   `monero/master` hardforks.cpp tops at v16 as of 2026-09-05.
+//   -- is the PRE-CARROT Monero recipe. FCMP++/CARROT rewrites address/key
+//   derivation (the view-tag scheme, the one-time-key formula, the output
+//   type), so the recipe above would produce an INVALID, UNSPENDABLE coinbase
+//   under CARROT. Every entry point that produces output keys is therefore
+//   GUARDED on the Monero hard-fork major_version (build_coinbase /
+//   derive_tx_secret_key / derive_output).
+//
+//   VERSION GATE (this wave). build_coinbase() no longer holds one body behind
+//   a fence; it DISPATCHES on the regime:
+//
+//       major_version <= W5_PRECARROT_MAX_MAJOR_VERSION (16)
+//           -> build_coinbase_precarrot()  -- the recipe above, BYTE-UNCHANGED.
+//              Pinned by test/xmr_carrot_gate_kat.cpp against goldens captured
+//              from the pre-gate tree, so this wave cannot have moved a byte.
+//
+//       major_version >= W5_CARROT_MIN_MAJOR_VERSION (17)
+//           -> build_coinbase_carrot()     -- the CARROT arm.
+//
+//   The CARROT arm is a SCAFFOLD and STILL FAILS CLOSED. It returns
+//   BuildError::CarrotFence, exactly as the flat fence did, because
+//   monero-project/monero master tops at v16, no CARROT/FCMP++ release is
+//   tagged, and no coinbase-enote reference vectors are published -- so no
+//   conformant derivation can be written or pinned. The derivation seam, the
+//   transcribed constants and the explicit gap list live in xmr_carrot.hpp and
+//   docs/xmr-lane/carrot-coinbase-seam.md. Do NOT lift the fence on a guess:
+//   an approximately-right coinbase burns the block reward to keys nobody can
+//   spend.
+//
+//   `monero/master` hardforks.cpp tops at { 16, 2689608 }; re-verified
+//   2026-09-17.
 // ===========================================================================
 #pragma once
 
@@ -83,6 +102,9 @@
 
 // --- PayoutDescriptor canon + the XMR kind extension (descriptor-kinds leg) --
 #include "sharechain/v37/v37_descriptor_xmr.hpp" // v37::xmr::XMR_STD/XMR_SUB, fences
+
+// --- the CARROT / FCMP++ regime seam (SCAFFOLD, fail-closed) ---------------
+#include "impl/xmr/settle/xmr_carrot.hpp"
 
 // The coin-layer surface W5 depends on is declared in the leg headers included
 // above: r*G (the tx pubkey R = r*G) is xmr::coin::secret_key_to_public_key in
@@ -108,7 +130,25 @@ using ::xmr::coin::ViewTag;
 
 // FCMP++/CARROT fence key. Pins the derivation recipe to pre-CARROT Monero.
 inline constexpr std::uint8_t W5_PRECARROT_MAX_MAJOR_VERSION =
-    ::v37::xmr::XMR_PRECARROT_MAX_MAJOR_VERSION;  // 16 (mainnet v16, 2026-09-05)
+    ::v37::xmr::XMR_PRECARROT_MAX_MAJOR_VERSION;  // 16 (mainnet v16, 2026-09-17)
+
+// First major_version in the CARROT / FCMP++ regime. Derived from the fence, so
+// the two can never disagree: there is exactly one boundary.
+inline constexpr std::uint8_t W5_CARROT_MIN_MAJOR_VERSION =
+    static_cast<std::uint8_t>(W5_PRECARROT_MAX_MAJOR_VERSION + 1);  // 17
+
+// Which coinbase-output derivation regime a Monero major_version falls in.
+enum class CoinbaseRegime : std::uint8_t {
+    PreCarrot = 0,   // R = r*G / P_i = H_s(8 r A || i) G + B_i / 1-byte view tag
+    Carrot    = 1,   // CARROT + FCMP++ (scaffold; refuses -- see xmr_carrot.hpp)
+};
+
+// Total and exhaustive: every u8 lands in exactly one regime.
+inline constexpr CoinbaseRegime coinbase_regime(std::uint8_t monero_major_version) {
+    return ::v37::xmr::xmr_precarrot_ok(monero_major_version)
+               ? CoinbaseRegime::PreCarrot
+               : CoinbaseRegime::Carrot;
+}
 
 // Coinbase maturity => D_conf floor. unlock_time = height + 60 blocks (2 h).
 // (monero-project CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW; scoping §2.1.)
@@ -280,7 +320,24 @@ std::vector<unsigned char> assemble_tx_extra(const PublicKey& R,
                                              const Hash256& mm_root);
 
 // ---------------------------------------------------------------------------
-// Build the whole canonical coinbase from consensus inputs. FENCED.
+// The PRE-CARROT arm: the derivation described in the header banner, unchanged
+// from before the version gate existed. Re-checks the fence itself, so calling
+// it directly with a CARROT-regime major_version still refuses.
+// ---------------------------------------------------------------------------
+BuiltCoinbase build_coinbase_precarrot(const CoinbaseInputs& in);
+
+// ---------------------------------------------------------------------------
+// The CARROT / FCMP++ arm. SCAFFOLD: always returns ok=false with
+// BuildError::CarrotFence and a detail naming the seam. It will keep doing so
+// until carrot::DERIVATION_IMPLEMENTED is flipped, which requires a tagged
+// upstream release, pinned reference vectors and an operator ruling.
+// ---------------------------------------------------------------------------
+BuiltCoinbase build_coinbase_carrot(const CoinbaseInputs& in);
+
+// ---------------------------------------------------------------------------
+// Build the whole canonical coinbase from consensus inputs. VERSION-GATED:
+// dispatches on coinbase_regime(in.monero_major_version) to the arm above.
+// Fail-closed in both directions -- an unknown regime refuses.
 // ---------------------------------------------------------------------------
 BuiltCoinbase build_coinbase(const CoinbaseInputs& in);
 
