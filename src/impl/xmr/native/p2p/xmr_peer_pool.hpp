@@ -121,6 +121,8 @@ struct PoolTelemetry {
 
     std::uint64_t frames_in     = 0;
     std::uint64_t frames_dropped_dos = 0;
+    std::uint64_t fluffy_requests_out    = 0;   // 2009s we sent (credits minted)
+    std::uint64_t frames_credited_fluffy = 0;   // 2008 replies that spent a credit
     std::uint64_t blocks_in     = 0;
     std::uint64_t txs_in        = 0;
     std::uint64_t chain_entries_in = 0;
@@ -308,6 +310,11 @@ public:
             // 2009 is answered with a 2008 NOTIFICATION, not a matched response,
             // so it needs no FIFO record and no expect latch.
             p->link->send_notify(levinns::CMD_REQUEST_FLUFFY_MISSING_TX, body);
+            // Mint a solicited-reply credit so the 2008 that answers this 2009
+            // is not charged to the peer's block DoS bucket (fixes #1680).
+            // Same io thread as on_frame, so no locking change.
+            p->dos.note_fluffy_solicited(self->now_ms());
+            ++self->tel_.fluffy_requests_out;
         });
         return true;
     }
@@ -670,7 +677,9 @@ private:
         }
 
         DosFault fault = DosFault::None;
+        const std::uint64_t credits_before = p->dos.solicited_credits_used();
         const DosAction act = p->dos.on_frame(h.command, n, units, now, fault);
+        if (p->dos.solicited_credits_used() != credits_before) ++tel_.frames_credited_fluffy;
         if (act != DosAction::Accept) {
             ++tel_.frames_dropped_dos;
             apply_action(key, act, fault, "inbound budget");

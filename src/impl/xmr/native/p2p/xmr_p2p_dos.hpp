@@ -26,6 +26,25 @@
 //     and a completed hash below target is a 24 h ban on its own -- the only
 //     fault in the table that reaches the threshold in one step, because an
 //     unmet target on a finished hash is incontrovertible.
+//
+//     BUT NOTE THE TWO-TOKEN REALITY (fixes #1680). monerod answers our own
+//     REQUEST_FLUFFY_MISSING_TX (2009) with the SAME 2008 command it uses for an
+//     unsolicited push -- same command, same flags, no request id (levin has
+//     none). A non-empty block therefore costs TWO block tokens per honest
+//     block: one for the bodiless push, one for the solicited reply that fills
+//     in the txs we asked for. At a fast cadence (regtest, or any burst) that
+//     drains the 8-token bucket in four blocks, and the DROPPED 2008 was the
+//     solicited reply -- so the bodiless block is parked forever and the node
+//     stalls one behind. A solicited reply is NOT a DoS vector: it exists only
+//     because we already spent a serve token asking for it, for a push that
+//     already passed this very bucket. So we mint a short-lived, single-use
+//     CREDIT beside this peer's guard the instant we send it a 2009
+//     (note_fluffy_solicited); the next 2008 spends that credit instead of a
+//     block token. A peer cannot mint credits; the worst it can do is burn one
+//     credit on an unsolicited push instead of the reply -- an amplification of
+//     at most 2x the block budget, expiring in solicited_reply_ttl_ms. Genuine
+//     unsolicited floods (no outstanding 2009) still hit the block bucket
+//     exactly as before.
 //   * NOTIFY_NEW_TRANSACTIONS (2002). Counted in TRANSACTIONS, not frames: a
 //     peer that batches 500 txs into one frame has spent 500 tokens, which is
 //     what a frame-counting bucket would have missed entirely.
@@ -75,6 +94,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <string>
 
 #include "impl/xmr/native/contracts/types.hpp"
@@ -232,6 +252,18 @@ struct DosConfig {
     double block_capacity = 8.0;
     double block_refill   = 0.1;
 
+    // Solicited-reply credits (fixes #1680). We mint one credit when we send a
+    // peer a REQUEST_FLUFFY_MISSING_TX (2009); the next NEW_FLUFFY_BLOCK (2008)
+    // from that peer spends the credit instead of a block token, because the
+    // reply we asked for is not a push and must not drain the flood bucket. A
+    // credit is single-use and expires after the TTL so a lost reply cannot
+    // hoard budget. max_solicited_credits caps how many can be outstanding, so a
+    // burst of 2009s cannot mint unbounded amplification. Set the cap to 0 to
+    // disable the credit path entirely (the pre-#1680 behaviour), which the
+    // live fix-2 proof leans on.
+    Millis        solicited_reply_ttl_ms = 30'000;
+    std::uint32_t max_solicited_credits  = 8;
+
     // Transactions (2002), counted per TRANSACTION.
     double tx_capacity = 512.0;
     double tx_refill   = 64.0;
@@ -286,8 +318,14 @@ public:
             return exhausted(fault_out, now);
 
         switch (cmd) {
-            case levin::CMD_NEW_BLOCK:
             case levin::CMD_NEW_FLUFFY_BLOCK:
+                // A 2008 that answers our own outstanding 2009 is a solicited
+                // reply, not a push: spend a credit if one is available and do
+                // NOT charge the block bucket (fixes #1680). A 2001 (NEW_BLOCK)
+                // is never solicited this way, so it falls straight through.
+                if (take_solicited_credit_(now)) break;
+                [[fallthrough]];
+            case levin::CMD_NEW_BLOCK:
                 if (!bucket_take(blocks_, 1.0, t)) return exhausted(fault_out, now);
                 break;
             case levin::CMD_NEW_TRANSACTIONS:
@@ -322,11 +360,27 @@ public:
         return DosAction::Drop;
     }
 
+    // -----------------------------------------------------------------------
+    // Mint a solicited-reply credit. Called on the io thread the instant we put
+    // a REQUEST_FLUFFY_MISSING_TX (2009) on the wire to this peer, so the 2008
+    // reply that answers it does not spend a block token (fixes #1680). The
+    // credit queue is bounded by cfg_.max_solicited_credits: a burst of 2009s
+    // cannot mint unbounded budget; the oldest credit is dropped past the cap.
+    // -----------------------------------------------------------------------
+    void note_fluffy_solicited(Millis now) {
+        if (cfg_.max_solicited_credits == 0) return;
+        prune_expired_credits_(now);
+        credits_.push_back(now);
+        while (credits_.size() > cfg_.max_solicited_credits) credits_.pop_front();
+    }
+
     // --- observation --------------------------------------------------------
     std::uint32_t score() const noexcept { return score_; }
     std::uint64_t faults() const noexcept { return faults_; }
     std::uint64_t accepted() const noexcept { return accepted_; }
     std::uint32_t exhaustions() const noexcept { return exhaustions_; }
+    std::uint64_t solicited_credits_used() const noexcept { return credits_used_; }
+    std::size_t   solicited_credits_open() const noexcept { return credits_.size(); }
 
     double bytes_level(Millis now)  { return bytes_.level(ms_to_ns(now)); }
     double blocks_level(Millis now) { return blocks_.level(ms_to_ns(now)); }
@@ -334,6 +388,23 @@ public:
     double serves_level(Millis now) { return serves_.level(ms_to_ns(now)); }
 
 private:
+    // Drop every credit older than the TTL. Credits are pushed in clock order
+    // (now only advances), so expired ones are always a prefix of the queue.
+    void prune_expired_credits_(Millis now) {
+        while (!credits_.empty() && now - credits_.front() > cfg_.solicited_reply_ttl_ms)
+            credits_.pop_front();
+    }
+
+    // Spend one live credit if any remains. Single-use: a credit consumed here
+    // cannot be spent by a second frame.
+    bool take_solicited_credit_(Millis now) {
+        prune_expired_credits_(now);
+        if (credits_.empty()) return false;
+        credits_.pop_front();
+        ++credits_used_;
+        return true;
+    }
+
     DosAction exhausted(DosFault& fault_out, Millis now) {
         fault_out = DosFault::BucketExhausted;
         ++exhaustions_;
@@ -361,6 +432,12 @@ private:
     std::uint64_t faults_ = 0;
     std::uint64_t accepted_ = 0;
     Millis        last_fault_ms_ = 0;
+
+    // Outstanding solicited-reply credits, one per 2009 we sent this peer, each
+    // stamped with the ms it was minted (for TTL expiry). Bounded by
+    // cfg_.max_solicited_credits.
+    std::deque<Millis> credits_;
+    std::uint64_t      credits_used_ = 0;
 };
 
 } // namespace c2pool::xmr::native::p2p

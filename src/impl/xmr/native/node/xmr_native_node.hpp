@@ -288,6 +288,13 @@ struct NativeNodeConfig {
     // blocks. A finite default is required precisely because a pinned inject
     // bypasses C3's age eviction.
     std::uint64_t            operator_inject_ttl_blocks = 720;
+    // #1680 lever. Cap on outstanding solicited-reply DoS credits (DosConfig::
+    // max_solicited_credits). Default 8 = fix #1 armed: a 2008 answering our own
+    // 2009 spends a credit instead of a block token. Set to 0 to DISABLE fix #1
+    // (the pre-#1680 behaviour) while leaving fix #2 -- the GET_OBJECTS fallback
+    // for a stranded park -- in place, which is exactly what the live fix-2 leg
+    // needs to show a dropped missing-tx reply self-heals on its own.
+    std::uint32_t            dos_solicited_credits = 8;
 };
 
 // One line per tip the node adopted: the M0 evidence record.
@@ -448,6 +455,7 @@ public:
         pc.link.handshake.our_peer_id = cfg_.peer_id ? cfg_.peer_id : random_peer_id_();
         pc.manual_peers           = cfg_.connect;
         pc.bind_ip                = cfg_.p2p_bind_ip;
+        pc.dos.max_solicited_credits = cfg_.dos_solicited_credits;   // #1680 lever
         if (cfg_.probe_only) {
             // A READ-ONLY probe dials exactly what it was told to dial. The
             // pool learns addresses from the handshake peerlist and the plan
@@ -517,7 +525,9 @@ public:
         driver_ = std::make_unique<SyncDriver>(
             *pool_, boot_, index_, p2p::genesis_id(nets_.wire),
             [this] { return boot_.booted(); },
-            [this] { return index_.refetch_wanted(); }, dcfg);
+            [this] { return index_.refetch_wanted(); },
+            [this] { return index_.bodies_wanted(); },   // #1680: stranded fluffy parks
+            dcfg);
 
         // --- threads ----------------------------------------------------------
         running_ = true;
