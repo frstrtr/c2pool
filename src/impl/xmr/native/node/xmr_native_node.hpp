@@ -391,6 +391,13 @@ public:
         // numbers from 0 and is complete; on an anchor boot it numbers from the
         // anchor's rct_output_count and the honest below-anchor gap applies (a
         // ring reaching below the anchor is RingUnresolved, never mis-admitted).
+        //
+        // Seed the numbering base from whatever boot resolved before any block
+        // feeds the set (a no-op reseat on the empty set): 0 on genesis /
+        // local-genesis, the anchor's rct_output_count on an anchor boot (the
+        // chain view carries it through seed_from_anchor). Leaf 0 must be
+        // numbered from the right base or every post-anchor ring is misnumbered.
+        outputs_.reset_base(index_.view().rct_output_count());
         txpool_.set_input_consensus_sources(&outputs_, &outputs_);
 
         index_.subscribe_txs([this](const BlockTxEvent& ev) {
