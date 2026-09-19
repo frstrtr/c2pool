@@ -596,9 +596,11 @@ def main():
 
     rpc = Rpc(args.rpc)
     info = rpc.plain("/get_info")
-    if info.get("nettype") != args.net:
-        raise SystemExit("daemon is %s, --net says %s"
-                         % (info.get("nettype"), args.net))
+    # monerod reports its regtest network as "fakechain"; treat it as regtest.
+    daemon_net = info.get("nettype")
+    if not (daemon_net == args.net
+            or (args.net == "regtest" and daemon_net == "fakechain")):
+        raise SystemExit("daemon is %s, --net says %s" % (daemon_net, args.net))
     if not info.get("synchronized"):
         print("WARNING: daemon reports synchronized=false", file=sys.stderr)
     tip = int(info["height"]) - 1
