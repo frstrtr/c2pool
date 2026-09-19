@@ -140,6 +140,14 @@ struct NativeTemplateConfig {
     // settlement accounting reads, so "what we build on" and "what we nominate"
     // cannot be configured apart.
     native::TieBreak         fork_tie = native::TieBreak::PreferOwn;
+
+    // OPERATOR TX-INJECTION (2026-09-19 ruling), default OFF. When on, the node
+    // accepts operator-submitted signed txs through submit_operator_inject() and
+    // places them FIRST at highest priority in the served template (mined even
+    // at 0 fee), bounded by the block-weight cap; the good-citizen take-all tail
+    // fills the rest. See NativeNodeConfig::operator_inject.
+    bool                     operator_inject = false;
+    std::uint64_t            operator_inject_ttl_blocks = 720;
 };
 
 class NativeTemplateBackend {
@@ -173,6 +181,8 @@ public:
         nc.backlog_refresh_s    = cfg_.backlog_refresh_s;
         nc.dos_solicited_credits = cfg_.dos_solicited_credits;   // #1680 lever
         nc.fork_tie             = cfg_.fork_tie;
+        nc.operator_inject            = cfg_.operator_inject;
+        nc.operator_inject_ttl_blocks = cfg_.operator_inject_ttl_blocks;
 
         node_ = std::make_unique<nrt::NativeNode>(std::move(nc));
         if (!node_->start(why)) { node_.reset(); return false; }
