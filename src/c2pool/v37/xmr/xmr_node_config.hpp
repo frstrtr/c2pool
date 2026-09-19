@@ -280,6 +280,11 @@ struct XmrNodeConfig {
     bool            native_allow_unverified_pow = false;
     // Trust-anchor bundle for a cold start above genesis ("" => embedded).
     std::string     native_anchor_path;
+    // Format-2 O-backfill: an output-set snapshot (ChainOutputSet::serialize()
+    // form) re-derived to a format-2 anchor's committed output/spent roots, so a
+    // node booting that anchor resolves pre-anchor (below-base) rings. Requires
+    // --native-anchor to name a format-2 bundle. Rejected under --native-solo.
+    std::string     native_output_set_path;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
     // production posture; OFF is what makes "the template path made no daemon
     // call" falsifiable rather than merely asserted.
@@ -475,6 +480,9 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
     if (!c.native_anchor_path.empty())
         return "--native-solo boots from the locally assembled genesis block, so --native-anchor "
                "has nothing to do: pick one trust root";
+    if (!c.native_output_set_path.empty())
+        return "--native-solo boots from genesis and builds the output set from block 0, so "
+               "--native-output-set (an anchor-committed snapshot) has nothing to seed against";
     return {};
 }
 

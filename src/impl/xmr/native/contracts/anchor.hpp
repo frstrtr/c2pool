@@ -40,6 +40,7 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -69,6 +70,33 @@ inline constexpr std::size_t ANCHOR_LONG_TERM_WEIGHTS = 100000;
 // [H_a - (SEEDHASH_EPOCH_BLOCKS + SEEDHASH_EPOCH_LAG), H_a].
 inline constexpr std::size_t ANCHOR_MAX_SEED_IDS = 2;
 
+// --- window lengths a bundle at H_a must carry (young-chain aware) -----------
+// The three windows are EXACT, not maxima -- but "exact" is height-relative. A
+// node booted from its genesis holds one window row per block it has seen: the
+// genesis seed puts one row in each window (chain_boot try_seed_) and every
+// connect pushes one more, so at height H_a it holds min(W, H_a + 1) rows,
+// genesis (height 0) included. On mainnet/stagenet H_a is far past every
+// window, so this is exactly the pinned 735 / 100 / 100000 and a full bundle is
+// unchanged; on a YOUNG chain (regtest, or the first blocks of any net) the
+// windows have not filled and the anchor must carry precisely what the node
+// accumulated -- otherwise a from-genesis node and an anchor-booted node would
+// disagree about the next difficulty and the next median. The lengths are
+// checked here, in parse_anchor_inc(), and in the generator against these
+// same three values, and pinned by a from-genesis state-parity KAT.
+struct AnchorWindowLengths {
+    std::size_t difficulty = 0;
+    std::size_t short_term = 0;
+    std::size_t long_term  = 0;
+};
+inline AnchorWindowLengths anchor_expected_rows(std::uint64_t h_a) noexcept {
+    const std::uint64_t avail = h_a + 1;   // blocks 0..H_a, genesis included
+    AnchorWindowLengths w;
+    w.difficulty = static_cast<std::size_t>(std::min<std::uint64_t>(ANCHOR_DIFFICULTY_WINDOW, avail));
+    w.short_term = static_cast<std::size_t>(std::min<std::uint64_t>(ANCHOR_SHORT_TERM_WEIGHTS, avail));
+    w.long_term  = static_cast<std::size_t>(std::min<std::uint64_t>(ANCHOR_LONG_TERM_WEIGHTS, avail));
+    return w;
+}
+
 // --- the bundle --------------------------------------------------------------
 // Parsed from xmr_chain_anchor_<net>.inc (generated, digest-committed). Field
 // order is the file's order, so a reader can follow one against the other.
@@ -94,6 +122,30 @@ struct AnchorBundle {
     // (get_output_distribution amounts=[0] cumulative at H_a). Added in the
     // input-consensus pass so a later re-mint is not needed.
     std::uint64_t rct_output_count = 0;
+
+    // --- format-2: committed output-set / spent-set roots (OPERATOR SEAM) ----
+    // Present ONLY in a format-2 bundle (has_output_set() true). When present, a
+    // daemonless node booting from this anchor can seed the historical amount-0
+    // output set and the spent-key-image set (from an operator-supplied snapshot
+    // re-derived to these roots) and therefore RESOLVE + CLSAG-verify a ring
+    // whose members are BELOW the anchor's numbering base, and reject a
+    // below-base double-spend. Absent (all zero) in a format-1 bundle, which the
+    // writer emits BYTE-IDENTICAL to today, so a format-1 anchor keeps loading
+    // and its pre-anchor rings stay RingUnresolved (fail-closed). The roots are
+    // the SHIPPED v37 lane MMR roots the chain/xmr_output_set.hpp logs already
+    // produce -- one leaf per Monero block over the genesis..H_a walk -- so a
+    // seeded snapshot's roots must equal these or the load fails closed. The
+    // authenticated coverage is: leaf 0 is block output_set_base_height (1 on a
+    // from-genesis walk), one output leaf and one spent leaf per block up to and
+    // including H_a, so output_set_leaves == spent_set_leaves == the block count.
+    std::uint64_t output_set_base_height = 0;   // Monero height of leaf 0 (1 from genesis)
+    std::uint64_t output_set_leaves      = 0;   // 0 == "no set committed" (format-1)
+    std::array<std::uint8_t, 32> output_set_root{};
+    std::uint64_t spent_set_leaves       = 0;
+    std::array<std::uint8_t, 32> spent_set_root{};
+
+    // True when this bundle carries a committed output/spent set (format 2).
+    bool has_output_set() const noexcept { return output_set_leaves != 0; }
 
     // RandomX seeds for the first post-anchor epoch(s): (epoch height, key block
     // id), at most ANCHOR_MAX_SEED_IDS, each height a multiple of
@@ -127,6 +179,7 @@ enum class AnchorStatus : std::uint8_t {
     VersionMismatch,     // major_version disagrees with the hard-fork table at H_a
     Fenced,              // the anchor sits at a fork this build does not implement
     CheckpointBelow,     // a copied checkpoint sits below H_a
+    OutputSetShape,      // a format-2 committed set's counts/roots are inconsistent
 };
 
 inline const char* to_string(AnchorStatus s) noexcept {
@@ -139,6 +192,7 @@ inline const char* to_string(AnchorStatus s) noexcept {
         case AnchorStatus::VersionMismatch: return "VersionMismatch";
         case AnchorStatus::Fenced:          return "Fenced";
         case AnchorStatus::CheckpointBelow: return "CheckpointBelow";
+        case AnchorStatus::OutputSetShape:  return "OutputSetShape";
     }
     return "?";
 }
@@ -158,16 +212,18 @@ inline AnchorStatus anchor_self_check(const AnchorBundle& b, XmrNet net, std::st
             + to_string(net) + "'";
         return AnchorStatus::NetworkMismatch;
     }
-    if (b.difficulty_window.size() != ANCHOR_DIFFICULTY_WINDOW
-        || b.short_term_weights.size() != ANCHOR_SHORT_TERM_WEIGHTS
-        || b.long_term_weights.size() != ANCHOR_LONG_TERM_WEIGHTS) {
+    const AnchorWindowLengths need = anchor_expected_rows(b.height);
+    if (b.difficulty_window.size() != need.difficulty
+        || b.short_term_weights.size() != need.short_term
+        || b.long_term_weights.size() != need.long_term) {
         why = "anchor window lengths are "
             + std::to_string(b.difficulty_window.size()) + "/"
             + std::to_string(b.short_term_weights.size()) + "/"
             + std::to_string(b.long_term_weights.size()) + ", required "
-            + std::to_string(ANCHOR_DIFFICULTY_WINDOW) + "/"
-            + std::to_string(ANCHOR_SHORT_TERM_WEIGHTS) + "/"
-            + std::to_string(ANCHOR_LONG_TERM_WEIGHTS);
+            + std::to_string(need.difficulty) + "/"
+            + std::to_string(need.short_term) + "/"
+            + std::to_string(need.long_term) + " at height "
+            + std::to_string(b.height);
         return AnchorStatus::WindowSize;
     }
     if (b.seed_ids.empty() || b.seed_ids.size() > ANCHOR_MAX_SEED_IDS) {
@@ -206,6 +262,46 @@ inline AnchorStatus anchor_self_check(const AnchorBundle& b, XmrNet net, std::st
             + " is below the " + std::to_string(required) + " the hard-fork table "
             + "requires at height " + std::to_string(b.height);
         return AnchorStatus::VersionMismatch;
+    }
+    // Format-2 committed-set shape. When a set is committed, its counts must be
+    // internally consistent with a genesis..H_a walk: one leaf per block
+    // (heights output_set_base_height..H_a inclusive), the two logs the same
+    // length, and a non-zero output frontier. When no set is committed (format
+    // 1) every one of the six format-2 fields must be zero -- a stray root with
+    // no leaves, or a leaf count with a zero root, is a malformed bundle, not a
+    // format-1 one.
+    if (b.has_output_set()) {
+        if (b.output_set_base_height > b.height) {
+            why = "anchor output-set base height " + std::to_string(b.output_set_base_height)
+                + " is above the anchor height " + std::to_string(b.height);
+            return AnchorStatus::OutputSetShape;
+        }
+        const std::uint64_t expect_leaves = b.height + 1 - b.output_set_base_height;
+        if (b.output_set_leaves != expect_leaves) {
+            why = "anchor output-set carries " + std::to_string(b.output_set_leaves)
+                + " leaves, expected " + std::to_string(expect_leaves)
+                + " (one per block " + std::to_string(b.output_set_base_height)
+                + ".." + std::to_string(b.height) + ")";
+            return AnchorStatus::OutputSetShape;
+        }
+        if (b.spent_set_leaves != b.output_set_leaves) {
+            why = "anchor spent-set carries " + std::to_string(b.spent_set_leaves)
+                + " leaves, output-set carries " + std::to_string(b.output_set_leaves)
+                + " (one of each per block)";
+            return AnchorStatus::OutputSetShape;
+        }
+        if (b.rct_output_count == 0) {
+            why = "anchor commits an output set but rct_output_count is zero";
+            return AnchorStatus::OutputSetShape;
+        }
+    } else {
+        if (b.rct_output_count != 0 || b.output_set_base_height != 0
+            || b.output_set_leaves != 0 || b.spent_set_leaves != 0
+            || b.output_set_root != std::array<std::uint8_t, 32>{}
+            || b.spent_set_root != std::array<std::uint8_t, 32>{}) {
+            why = "anchor carries partial output-set fields without a committed set";
+            return AnchorStatus::OutputSetShape;
+        }
     }
     why.clear();
     return AnchorStatus::Ok;

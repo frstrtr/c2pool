@@ -251,7 +251,15 @@ public:
         booted_ = true;
         stats_.booted = true;
         stats_.why = "anchor at height " + std::to_string(b.height);
+        anchor_ = b;   // kept so the node can seed the output set from format-2 roots
         return true;
+    }
+
+    // The bundle the node booted from, or nullptr when it did not anchor-boot.
+    // Read on the start path only, after boot_from_anchor() returned true.
+    const AnchorBundle* anchor() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return anchor_ ? &*anchor_ : nullptr;
     }
 
     bool booted() const {
@@ -415,6 +423,7 @@ private:
     mutable std::mutex mu_;
     bool               booted_ = false;
     Stats              stats_{};
+    std::optional<AnchorBundle> anchor_;   // kept after an anchor boot (format-2 roots)
 };
 
 } // namespace c2pool::xmr::native::rt
