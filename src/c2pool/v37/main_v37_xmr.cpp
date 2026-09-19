@@ -778,6 +778,7 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
                                            ? ::c2pool::xmr::native::rt::BootMode::Genesis
                                            : ::c2pool::xmr::native::rt::BootMode::Anchor);
     ncfg.anchor_path          = cfg.native_anchor_path;
+    ncfg.output_set_path      = cfg.native_output_set_path;   // format-2 O-backfill
     // The daemon endpoint is the C6 PARITY judge, and under daemon-first also
     // the submit arm. Under p2p-first it is the parity judge and nothing else:
     // the oracle reads it off the status cadence, which is not the find path.
@@ -1371,6 +1372,7 @@ int main(int argc, char** argv) {
         else if (a == "--native-connect") cfg.native_connect.push_back(next(""));
         else if (a == "--native-p2p-bind") cfg.native_p2p_bind_ip = next("");
         else if (a == "--native-anchor") cfg.native_anchor_path = next("");
+        else if (a == "--native-output-set") cfg.native_output_set_path = next("");
         else if (a == "--native-force-synced") cfg.native_force_synced = true;
         // The fully self-contained (peerless, daemonless) run. See
         // solo_refusal() in xmr_node_config.hpp for what it refuses and why.
@@ -1494,6 +1496,8 @@ int main(int argc, char** argv) {
                 "                               REQUIRED for --xmr-template-source native)\n"
                 "  --native-p2p-bind <ip>       source address for the node's outbound dials\n"
                 "  --native-anchor <path>       trust-anchor bundle (cold start above genesis)\n"
+                "  --native-output-set <path>   format-2 output-set snapshot: seed the historical\n"
+                "                               set so pre-anchor (below-base) rings resolve\n"
                 "  --native-force-synced        set the publication gate on a private chain (OR-C2-8)\n"
                 "  --native-solo                FULLY SELF-CONTAINED (regtest only): no peers, no\n"
                 "                               daemon, no anchor. The chain starts at the locally\n"

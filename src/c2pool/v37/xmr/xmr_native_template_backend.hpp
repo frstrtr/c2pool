@@ -88,6 +88,7 @@ struct NativeTemplateConfig {
 
     nrt::BootMode            boot = nrt::BootMode::Genesis;
     std::string              anchor_path;
+    std::string              output_set_path;   // format-2 O-backfill snapshot
 
     // The PARITY / SUBMIT daemon. Not the template path; see the banner.
     std::string              monerod_rpc_host;
@@ -160,6 +161,7 @@ public:
         nc.use_seeds            = cfg_.use_seeds;
         nc.boot                 = cfg_.boot;
         nc.anchor_path          = cfg_.anchor_path;
+        nc.output_set_path      = cfg_.output_set_path;
         nc.allow_unverified_pow = cfg_.allow_unverified_pow;
         nc.monerod_rpc_host     = cfg_.monerod_rpc_host;
         nc.monerod_rpc_port     = cfg_.monerod_rpc_port;

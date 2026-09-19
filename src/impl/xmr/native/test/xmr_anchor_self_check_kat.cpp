@@ -196,7 +196,30 @@ static bool same_bundle(const AnchorBundle& a, const AnchorBundle& b) {
         && a.short_term_weights == b.short_term_weights
         && a.long_term_weights == b.long_term_weights
         && a.monerod_checkpoints == b.monerod_checkpoints
+        && a.rct_output_count == b.rct_output_count
+        && a.output_set_base_height == b.output_set_base_height
+        && a.output_set_leaves == b.output_set_leaves
+        && a.output_set_root == b.output_set_root
+        && a.spent_set_leaves == b.spent_set_leaves
+        && a.spent_set_root == b.spent_set_root
         && a.digest == b.digest;
+}
+
+// The valid synthetic bundle, extended into a well-formed FORMAT-2 bundle: the
+// same block and windows, plus a committed output/spent set whose SHAPE is
+// consistent with a from-genesis walk (leaf 0 is block 1, one leaf per block up
+// to H_a). The roots are model values -- anchor_self_check judges the shape, not
+// the data; the snapshot loader (xmr_output_set_kat) judges the roots.
+static AnchorBundle make_valid_fmt2_bundle() {
+    AnchorBundle b = make_valid_bundle();
+    b.output_set_base_height = 1;
+    b.output_set_leaves      = b.height + 1 - b.output_set_base_height;  // == b.height
+    b.spent_set_leaves       = b.output_set_leaves;
+    b.rct_output_count       = 3 * b.height + 7;   // any non-zero frontier
+    b.output_set_root        = model_hash(0xAA, 0x70);
+    b.spent_set_root         = model_hash(0xBB, 0x71);
+    b.digest                 = anchor_digest(b);
+    return b;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,8 +290,12 @@ static void test_codec_refusals() {
     expect_parse("R\"ANCHOR(\n)ANCHOR\"\n", AnchorParse::Empty, "a bundle with no body");
     expect_parse(sub_once(ok, "format 1\n", ""), AnchorParse::BadFormat,
                  "a key before the format line");
-    expect_parse(sub_once(ok, "format 1", "format 2"), AnchorParse::BadFormat,
+    expect_parse(sub_once(ok, "format 1", "format 3"), AnchorParse::BadFormat,
                  "a format version this build does not read");
+    // format 2 IS read, but a bundle that declares it without carrying the six
+    // committed-set keys is missing them -- a different, more specific failure.
+    expect_parse(sub_once(ok, "format 1", "format 2"), AnchorParse::MissingKey,
+                 "format 2 declared but no committed-set keys present");
     expect_parse(sub_once(ok, "network stagenet", "netwrok stagenet"), AnchorParse::UnknownKey,
                  "a keyword the reader does not implement");
     expect_parse(sub_once(ok, "height 2204000", "height 2204000\nheight 2204000"),
@@ -333,13 +360,17 @@ static void test_codec_refusals() {
 // ---------------------------------------------------------------------------
 // 3) the judgement: every AnchorStatus is reachable
 // ---------------------------------------------------------------------------
-static void expect_status(AnchorBundle b, AnchorStatus want, const char* what) {
+static void expect_status_net(AnchorBundle b, XmrNet net, AnchorStatus want, const char* what) {
     std::string why;
-    const AnchorStatus got = anchor_self_check(b, XmrNet::Stagenet, why);
+    const AnchorStatus got = anchor_self_check(b, net, why);
     checkf(got == want, "%s: expected %s, got %s (%s)", what, to_string(want),
            to_string(got), why.c_str());
     if (want == AnchorStatus::Ok) checkf(why.empty(), "%s: a pass says nothing", what);
     else checkf(!why.empty(), "%s: a refusal always says why", what);
+}
+
+static void expect_status(AnchorBundle b, AnchorStatus want, const char* what) {
+    expect_status_net(std::move(b), XmrNet::Stagenet, want, what);
 }
 
 static void test_self_check() {
@@ -406,6 +437,152 @@ static void test_self_check() {
     {
         AnchorBundle b = base; b.major_version = 250;
         expect_status(b, AnchorStatus::Fenced, "a wildly future fork reads as fenced");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3b) format 2: the committed output-set roots, and format-1 byte-identity
+// ---------------------------------------------------------------------------
+static void test_format2() {
+    // A format-1 bundle is written byte-for-byte as before: `format 1`, and NOT
+    // one of the six format-2 lines. This is the byte-identity guarantee.
+    {
+        const AnchorBundle f1 = make_valid_bundle();
+        const std::string t1 = write_anchor_inc(f1, "format-1 control");
+        check(t1.find("\nformat 1\n") != std::string::npos, "a format-1 bundle writes `format 1`");
+        check(t1.find("rct_output_count") == std::string::npos
+                  && t1.find("output_set_root") == std::string::npos
+                  && t1.find("spent_set_root") == std::string::npos
+                  && t1.find("output_set_base_height") == std::string::npos
+                  && t1.find("output_set_leaves") == std::string::npos
+                  && t1.find("spent_set_leaves") == std::string::npos,
+              "a format-1 bundle carries none of the six format-2 lines");
+    }
+
+    // A format-2 bundle round-trips with every field, and declares `format 2`.
+    const AnchorBundle f2 = make_valid_fmt2_bundle();
+    const std::string t2 = write_anchor_inc(f2, "format-2 bundle");
+    check(t2.find("\nformat 2\n") != std::string::npos, "a format-2 bundle writes `format 2`");
+    check(t2.find("\nrct_output_count ") != std::string::npos
+              && t2.find("\noutput_set_base_height ") != std::string::npos
+              && t2.find("\noutput_set_leaves ") != std::string::npos
+              && t2.find("\noutput_set_root ") != std::string::npos
+              && t2.find("\nspent_set_leaves ") != std::string::npos
+              && t2.find("\nspent_set_root ") != std::string::npos,
+          "a format-2 bundle carries all six committed-set lines");
+    {
+        AnchorBundle got;
+        std::string why;
+        const AnchorParse p = parse_anchor_inc(t2, got, why);
+        checkf(p == AnchorParse::Ok, "a format-2 bundle parses: %s (%s)", to_string(p), why.c_str());
+        check(same_bundle(f2, got), "every format-2 field survives write -> parse");
+        check(got.has_output_set(), "the parsed format-2 bundle reports a committed set");
+    }
+
+    // format-1 files must REFUSE a format-2-only key (a set field on a format-1
+    // line is not a format-1 bundle -- it is malformed).
+    expect_parse(sub_once(t2, "format 2", "format 1"), AnchorParse::BadFormat,
+                 "a committed-set key under a format-1 line");
+    // A format-2 file missing one committed-set key is MissingKey (the
+    // committed-set gate fires before the digest is even compared), not a
+    // silently-truncated format-1 bundle.
+    expect_parse(sub_once(t2, std::string("spent_set_root ")
+                              + anchor_codec::to_hex(f2.spent_set_root) + "\n", ""),
+                 AnchorParse::MissingKey, "a format-2 file missing spent_set_root");
+    expect_parse(sub_once(t2, std::string("output_set_root ")
+                              + anchor_codec::to_hex(f2.output_set_root) + "\n", ""),
+                 AnchorParse::MissingKey, "a format-2 file missing output_set_root");
+
+    // The self-check judges SHAPE. A valid format-2 bundle passes; each way of
+    // making the shape inconsistent reaches OutputSetShape.
+    expect_status(f2, AnchorStatus::Ok, "a well-formed format-2 bundle");
+    {
+        AnchorBundle b = f2; b.output_set_leaves += 1; b.digest = anchor_digest(b);
+        expect_status(b, AnchorStatus::OutputSetShape, "output leaves not one-per-block");
+    }
+    {
+        AnchorBundle b = f2; b.spent_set_leaves = f2.output_set_leaves - 1; b.digest = anchor_digest(b);
+        expect_status(b, AnchorStatus::OutputSetShape, "spent leaves != output leaves");
+    }
+    {
+        AnchorBundle b = f2; b.output_set_base_height = b.height + 1;
+        b.output_set_leaves = 0;  // keep has_output_set()? no -- set leaves so it still commits
+        b.output_set_leaves = 5;  b.digest = anchor_digest(b);
+        expect_status(b, AnchorStatus::OutputSetShape, "output-set base above the anchor height");
+    }
+    {
+        AnchorBundle b = f2; b.rct_output_count = 0; b.digest = anchor_digest(b);
+        expect_status(b, AnchorStatus::OutputSetShape, "a committed set with rct_output_count 0");
+    }
+    {
+        // Partial fields with no committed set (leaves == 0 so has_output_set()
+        // is false, but a stray root is set): a malformed near-format-1 bundle.
+        AnchorBundle b = make_valid_bundle();
+        b.output_set_root = model_hash(9, 0x72);   // leaves stay 0
+        b.digest = anchor_digest(b);
+        expect_status(b, AnchorStatus::OutputSetShape, "a stray root with no committed set");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3c) young-chain windows: a bundle below the full window lengths
+// ---------------------------------------------------------------------------
+static AnchorBundle make_young_bundle(std::uint64_t height) {
+    const AnchorWindowLengths need = anchor_expected_rows(height);
+    AnchorBundle b;
+    b.network       = "regtest";
+    b.height        = height;
+    b.id            = model_hash(height, 0x10);
+    b.prev_id       = model_hash(height - 1, 0x10);
+    b.timestamp     = 1700000000ull + height * 120ull;
+    b.major_version = hf_version_for_height(XmrNet::Regtest, height);
+    b.cumulative_difficulty = U128{0, height + 1};
+
+    const std::uint64_t seed_h = rx_seedheight(height + 1);
+    b.seed_ids.emplace_back(seed_h, model_hash(seed_h, 0x20));
+
+    U128 cd{0, 1};
+    for (std::size_t i = 0; i < need.difficulty; ++i) {
+        b.difficulty_window.emplace_back(1700000000ull + i * 120ull, cd);
+        cd = u128_add(cd, U128{0, 1});
+    }
+    for (std::size_t i = 0; i < need.short_term; ++i) b.short_term_weights.push_back(300 + (i % 7));
+    for (std::size_t i = 0; i < need.long_term;  ++i) b.long_term_weights.push_back(300);
+    b.digest = anchor_digest(b);
+    return b;
+}
+
+static void test_young_chain() {
+    // anchor_expected_rows math at the boundaries.
+    check(anchor_expected_rows(0).difficulty == 1
+              && anchor_expected_rows(0).short_term == 1
+              && anchor_expected_rows(0).long_term == 1,
+          "at genesis every window holds exactly one row");
+    check(anchor_expected_rows(260).difficulty == 261
+              && anchor_expected_rows(260).short_term == 100
+              && anchor_expected_rows(260).long_term == 261,
+          "at height 260 the windows are 261/100/261 (short-term already full)");
+    check(anchor_expected_rows(2204000).difficulty == ANCHOR_DIFFICULTY_WINDOW
+              && anchor_expected_rows(2204000).short_term == ANCHOR_SHORT_TERM_WEIGHTS
+              && anchor_expected_rows(2204000).long_term == ANCHOR_LONG_TERM_WEIGHTS,
+          "a mature height carries the full 735/100/100000 windows");
+
+    // A young-chain bundle parses and passes self-check with its short windows.
+    const AnchorBundle y = make_young_bundle(260);
+    AnchorBundle got;
+    std::string why;
+    checkf(parse_anchor_inc(write_anchor_inc(y, "young regtest"), got, why) == AnchorParse::Ok,
+           "a young-chain bundle parses: %s", why.c_str());
+    check(same_bundle(y, got), "a young-chain bundle round-trips");
+    std::string sc;
+    checkf(anchor_self_check(y, XmrNet::Regtest, sc) == AnchorStatus::Ok,
+           "a young-chain bundle passes self-check: %s", sc.c_str());
+
+    // A young-chain bundle one row short in any window is WindowSize.
+    {
+        AnchorBundle b = y; b.short_term_weights.pop_back(); b.digest = anchor_digest(b);
+        expect_status_net(b, XmrNet::Regtest, AnchorStatus::WindowSize,
+                          "a young short-term window short by one");
     }
 }
 
@@ -695,6 +872,8 @@ int main() {
     test_codec_round_trip();
     test_codec_refusals();
     test_self_check();
+    test_format2();
+    test_young_chain();
     test_load_anchor();
     test_generate_anchor();
     test_embedded_stagenet();

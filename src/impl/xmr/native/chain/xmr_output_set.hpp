@@ -73,6 +73,7 @@
 #include <sharechain/v37/v37_fixed.hpp>   // ::v37::u64
 #include <sharechain/v37/v37_lane.hpp>    // ::v37::PeakSet, ::v37::Lane MMR statics
 
+#include "impl/xmr/native/contracts/anchor.hpp"
 #include "impl/xmr/native/contracts/outputs.hpp"
 #include "impl/xmr/native/contracts/types.hpp"
 #include "impl/xmr/native/rct/xmr_rct_ops.hpp"               // rct::zero_commit
@@ -408,6 +409,101 @@ public:
         }
         if (o != v.size()) return nullptr;   // trailing garbage
         return set;
+    }
+
+    // --- format-2 anchor seed (O-backfill) ----------------------------------
+    // Seed the historical set from an operator-supplied snapshot (serialize()
+    // form) committed by a format-2 anchor, so a daemonless node booting from
+    // that anchor can RESOLVE + CLSAG-verify rings whose members are BELOW the
+    // anchor's numbering base, and reject a below-base double-spend. Legal only
+    // on an EMPTY set (at boot, before any block feeds), and the snapshot is
+    // ACCEPTED only when it re-derives to the roots the anchor committed: the
+    // anchor's committed roots -- not the blob -- are the trust. Fails closed on
+    // any mismatch, leaving the set empty (pre-anchor rings stay unresolved).
+    //
+    // The snapshot's peaks are RE-DERIVED from its leaves inside deserialize()
+    // (the record-log rule), then the re-derived roots and counts are checked
+    // against the bundle before a single record is adopted.
+    bool seed_from_snapshot(const std::string& blob, const AnchorBundle& b, std::string& why) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!outputs_.empty() || tip_height_ != 0 || out_peaks_.leaf_count != 0
+            || !spent_.empty()) {
+            why = "output set is not empty; seed the anchor snapshot before any block connects";
+            return false;
+        }
+        if (!b.has_output_set()) {
+            why = "anchor bundle carries no committed output set to seed against";
+            return false;
+        }
+        std::unique_ptr<ChainOutputSet> t = deserialize(blob);
+        if (!t) { why = "output-set snapshot does not deserialize"; return false; }
+
+        // Every committed quantity must match the re-derived snapshot exactly.
+        if (t->tip_height_ != b.height) {
+            why = "snapshot tip height " + std::to_string(t->tip_height_)
+                + " != anchor height " + std::to_string(b.height);
+            return false;
+        }
+        if (t->tip_id_ != b.id) { why = "snapshot tip id != anchor id"; return false; }
+        if (t->base_ + t->outputs_.size() != b.rct_output_count) {
+            why = "snapshot frontier " + std::to_string(t->base_ + t->outputs_.size())
+                + " != anchor rct_output_count " + std::to_string(b.rct_output_count);
+            return false;
+        }
+        if (t->out_peaks_.leaf_count != b.output_set_leaves) {
+            why = "snapshot output-leaf count " + std::to_string(t->out_peaks_.leaf_count)
+                + " != anchor output_set_leaves " + std::to_string(b.output_set_leaves);
+            return false;
+        }
+        if (::v37::Lane::mmr_bag(t->out_peaks_.peaks) != b.output_set_root) {
+            why = "snapshot output-set root does not match the anchor's committed root";
+            return false;
+        }
+        if (t->ki_peaks_.leaf_count != b.spent_set_leaves) {
+            why = "snapshot spent-leaf count " + std::to_string(t->ki_peaks_.leaf_count)
+                + " != anchor spent_set_leaves " + std::to_string(b.spent_set_leaves);
+            return false;
+        }
+        if (::v37::Lane::mmr_bag(t->ki_peaks_.peaks) != b.spent_set_root) {
+            why = "snapshot spent-set root does not match the anchor's committed root";
+            return false;
+        }
+
+        // Adopt the re-derived, root-checked state. The numbering base becomes
+        // the snapshot's (0 on a from-genesis walk), so below-base offsets now
+        // satisfy off >= base_ in resolve() and CLSAG runs. undo_ stays empty:
+        // pre-anchor blocks are below the reorg floor and are never disconnected.
+        base_           = t->base_;
+        outputs_        = std::move(t->outputs_);
+        spent_          = std::move(t->spent_);
+        out_peaks_      = t->out_peaks_;
+        out_leaves_     = std::move(t->out_leaves_);
+        out_leaf_first_ = std::move(t->out_leaf_first_);
+        ki_peaks_       = t->ki_peaks_;
+        ki_leaves_      = std::move(t->ki_leaves_);
+        tip_height_     = t->tip_height_;
+        tip_id_         = t->tip_id_;
+        why.clear();
+        return true;
+    }
+
+    // Membership check for a single global output index against the seeded root:
+    // resolves the covering leaf, proves it, and verifies the proof against
+    // output_root(). Exposed for the KAT's below-base membership assertion.
+    bool verify_member(std::uint64_t global_index) const {
+        bytes32 leaf{};
+        ::v37::Lane::MmrProof proof;
+        bytes32 root;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            // Only an index actually inside the set is a member; prove_output
+            // returns the covering leaf and does not itself bound the far end.
+            if (global_index < base_ || global_index >= base_ + outputs_.size())
+                return false;
+            root = ::v37::Lane::mmr_bag(out_peaks_.peaks);
+        }
+        if (!prove_output(global_index, leaf, proof)) return false;
+        return ::v37::Lane::mmr_verify(root, leaf, proof);
     }
 
     // --- introspection (KATs, dashboard) ------------------------------------

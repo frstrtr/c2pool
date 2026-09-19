@@ -127,6 +127,8 @@ void usage() {
         "  --seeds                                    also use the network's seed nodes\n"
         "  --boot <genesis|anchor>                    where the index's history starts\n"
         "  --anchor-path <file>                       anchor boot from a .inc (default: embedded)\n"
+        "  --output-set <file>                        format-2 output-set snapshot: seed the\n"
+        "                                             historical set so pre-anchor rings resolve\n"
         "  --monerod-rpc <host:port>                  the parity/backup arm (read-only)\n"
         "  --no-parity                                construct no parity oracle\n"
         "  --parity-ledger <file>                     persist the graduation ledger\n"
@@ -284,6 +286,7 @@ int main(int argc, char** argv) {
             else { std::cerr << "unknown boot mode\n"; return 2; }
         }
         else if (a == "--anchor-path")   cfg.anchor_path = next("--anchor-path");
+        else if (a == "--output-set")    cfg.output_set_path = next("--output-set");
         else if (a == "--monerod-rpc") {
             if (!split_host_port(next("--monerod-rpc"), cfg.monerod_rpc_host,
                                  cfg.monerod_rpc_port)) {
