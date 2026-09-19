@@ -525,6 +525,29 @@ if (BUILD_TESTING)
     target_compile_features(xmr_native_citizen_select_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_citizen_select_kat COMMAND xmr_native_citizen_select_kat)
 
+    # OPERATOR TX-INJECTION (2026-09-19 ruling). Two PURE header-only KATs over
+    # src/impl/xmr/native/inject/* (mirror of the Dash inject subsystem):
+    #   inject_select_kat -- inject-first, fill-to-cap, never overfill, 0-fee
+    #     always included, zero-inject byte-equal to select_good_citizen;
+    #   inject_pool_kat   -- pool caps/duplicate/expiry/order, rate limiter
+    #     count/bytes/scope, sandbox bounds -- all named.
+    # Added to BOTH build.yml --target lists (the #1539 Not-Run rule).
+    add_executable(xmr_native_inject_select_kat xmr_native_inject_select_kat.cpp)
+    target_include_directories(xmr_native_inject_select_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_inject_select_kat PRIVATE xmr_coin xmr_node)
+    target_compile_features(xmr_native_inject_select_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_native_inject_select_kat COMMAND xmr_native_inject_select_kat)
+
+    add_executable(xmr_native_inject_pool_kat xmr_native_inject_pool_kat.cpp)
+    target_include_directories(xmr_native_inject_pool_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_inject_pool_kat PRIVATE xmr_coin xmr_node)
+    target_compile_features(xmr_native_inject_pool_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_native_inject_pool_kat COMMAND xmr_native_inject_pool_kat)
+
     # ------------------------------------------------------------------
     # C5 -- the dual-arm found-block relay.
     #

@@ -102,6 +102,8 @@
 #include "impl/xmr/native/contracts/miner_data.hpp"
 #include "impl/xmr/native/contracts/txpool.hpp"
 #include "impl/xmr/native/template/xmr_citizen_select.hpp"  // good-citizen selection
+#include "impl/xmr/native/inject/xmr_inject_select.hpp"      // operator-inject-first selection
+#include "impl/xmr/native/inject/xmr_operator_inject_pool.hpp" // OperatorInjectPool (inject view)
 
 namespace c2pool::xmr::native::tmpl {
 
@@ -246,10 +248,31 @@ public:
         // selector preserves the pool's fee-rate order in the penalty-free zone,
         // so the common case is identical to the raw set. good_citizen == false
         // serves the raw set (shadow arm / raw-set regression).
+        //
+        // OPERATOR INJECT (2026-09-19 ruling): when an OperatorInjectPool is
+        // wired in, the served template is built by select_inject_first: the
+        // operator's injected txs are placed FIRST at highest priority (mined
+        // even at 0 fee), get first claim on the block-weight cap, and the
+        // good-citizen take-all tail fills the rest UP TO the same cap, never
+        // overfilling. With no injects present this is BYTE-EQUAL to
+        // select_good_citizen (proved by xmr_native_inject_select_kat (e)), so
+        // the good-citizen path is untouched when nobody injects.
+        std::size_t inject_n = 0, inject_dropped = 0;
+        const OperatorInjectPool* injects = injects_;   // set once at wiring time
         if (policy_.good_citizen) {
-            md.tx_backlog = ::c2pool::xmr::native::select_good_citizen(
-                                pool_set, ti->median_weight, ti->already_generated_coins,
-                                ti->major_version, policy_.citizen).chosen;
+            if (injects != nullptr) {
+                auto sel = ::c2pool::xmr::native::select_inject_first(
+                                injects->ordered(pool_set), pool_set,
+                                ti->median_weight, ti->already_generated_coins,
+                                ti->major_version, policy_.citizen);
+                inject_n       = sel.inject_n;
+                inject_dropped = sel.inject_dropped_by_cap;
+                md.tx_backlog  = std::move(sel.chosen);
+            } else {
+                md.tx_backlog = ::c2pool::xmr::native::select_good_citizen(
+                                    pool_set, ti->median_weight, ti->already_generated_coins,
+                                    ti->major_version, policy_.citizen).chosen;
+            }
         } else {
             md.tx_backlog = std::move(pool_set);
         }
@@ -263,6 +286,8 @@ public:
         // be impossible under R-CIT-1; it is the invariant-D tripwire).
         last_pool_n_   = pool_n;
         last_chosen_n_ = chosen_n;
+        last_inject_n_          = inject_n;
+        last_inject_dropped_    = inject_dropped;
         if (pool_n != 0 && chosen_n == 0) ++good_citizen_violations_;
         // Admit the pool's sequence under the refresh policy, then FREEZE it:
         // everything the provider compares against must be the number that was
@@ -339,6 +364,18 @@ public:
     std::size_t   last_pool_n()             const { std::lock_guard<std::mutex> lk(mtx_); return last_pool_n_; }
     std::size_t   last_chosen_n()           const { std::lock_guard<std::mutex> lk(mtx_); return last_chosen_n_; }
     std::uint64_t good_citizen_violations() const { std::lock_guard<std::mutex> lk(mtx_); return good_citizen_violations_; }
+
+    // Operator-inject sensors: how many injects the last served template placed
+    // at the front, and how many were dropped by the block-weight cap (named
+    // inject_dropped_by_cap in the selector). Read by the node status line/KATs.
+    std::size_t   last_inject_n()           const { std::lock_guard<std::mutex> lk(mtx_); return last_inject_n_; }
+    std::size_t   last_inject_dropped()     const { std::lock_guard<std::mutex> lk(mtx_); return last_inject_dropped_; }
+
+    // Wire the operator-inject pool. Called ONCE at node construction/start,
+    // before the first template is served (mirrors how the Dash node hands its
+    // TxInjectPool to the template builder). nullptr = injects disabled, and the
+    // served template is then byte-identical to the plain good-citizen path.
+    void set_operator_injects(const OperatorInjectPool* p) { injects_ = p; }
 
     NativeRefusal        last_refusal() const { std::lock_guard<std::mutex> lk(mtx_); return last_refusal_; }
     std::uint64_t        snapshots()    const { std::lock_guard<std::mutex> lk(mtx_); return snapshots_; }
@@ -577,7 +614,10 @@ private:
     mutable std::uint64_t          snapshots_ = 0, refusals_ = 0, missing_bodies_ = 0;
     mutable std::uint64_t          body_source_violations_ = 0;
     mutable std::size_t            last_pool_n_ = 0, last_chosen_n_ = 0;
+    mutable std::size_t            last_inject_n_ = 0, last_inject_dropped_ = 0;
     mutable std::uint64_t          good_citizen_violations_ = 0;
+    // The operator-inject ledger/order source, wired at start (nullptr = off).
+    const OperatorInjectPool*      injects_ = nullptr;
     mutable NativeRefusal          last_refusal_ = NativeRefusal::None;
 };
 
