@@ -111,6 +111,10 @@
 #include "impl/xmr/native/template/xmr_native_miner_data.hpp"
 #include "impl/xmr/native/template/xmr_template_arm.hpp"
 #include "impl/xmr/native/txpool/xmr_relayed_txpool.hpp"
+#include "impl/xmr/native/txpool/xmr_tx_decode.hpp"           // decode_relayed_tx, DecodedTx
+#include "impl/xmr/native/inject/xmr_operator_inject_pool.hpp"  // OperatorInjectPool (M-inject)
+#include "impl/xmr/native/inject/xmr_inject_rate_limiter.hpp"   // InjectRateLimiter
+#include "impl/xmr/native/inject/xmr_inject_sandbox.hpp"        // InjectSandbox
 
 #if defined(XMR_NATIVE_NODE_HAVE_RANDOMX)
 #include "impl/xmr/pow/randomx_verify.hpp"
@@ -271,6 +275,20 @@ struct NativeNodeConfig {
     // rather than inferred -- and the status line says it was forced.
     bool                     force_synced = false;
 
+    // OPERATOR TX-INJECTION (2026-09-19 ruling), default OFF -- arming mirrors
+    // Dash's --embedded-tx-inject. When on, submit_operator_inject() admits an
+    // operator's ALREADY-SIGNED tx into the C3 pool AND records it in the
+    // OperatorInjectPool, so the served template places it FIRST at highest
+    // priority (mined even at 0 fee) with first claim on the block-weight cap,
+    // and the good-citizen take-all tail fills the rest up to the cap. OFF makes
+    // the served template byte-identical to the plain good-citizen path.
+    bool                     operator_inject = false;
+    // Default TTL (in blocks) applied to an inject submitted with expiry_height
+    // == 0, so a pinned 0-fee inject cannot outlive the operator's intent: it is
+    // dropped (and unpinned) once the tip passes tip_at_submit + this many
+    // blocks. A finite default is required precisely because a pinned inject
+    // bypasses C3's age eviction.
+    std::uint64_t            operator_inject_ttl_blocks = 720;
     // #1680 lever. Cap on outstanding solicited-reply DoS credits (DosConfig::
     // max_solicited_credits). Default 8 = fix #1 armed: a 2008 answering our own
     // 2009 spends a credit instead of a block token. Set to 0 to DISABLE fix #1
@@ -417,8 +435,23 @@ public:
                     outputs_.on_block_disconnected(ev);
                     txpool_.on_block_disconnected(ev);
                 }
+                // OPERATOR INJECT upkeep on a connected block: an inject that was
+                // mined leaves C3 (so it would silently stop being offered), but
+                // its ledger entry and pin must go too. Forget the mined ids,
+                // reap anything the new tip aged out, and refresh the C3 pin to
+                // the surviving set (pin() replaces, so this also unpins).
+                if (cfg_.operator_inject && ev.kind == BlockTxEvent::Kind::Connected) {
+                    for (const Hash& h : ev.tx_hashes) op_injects_.forget(h);
+                    op_injects_.reap_expired(ev.height);
+                    txpool_.pin(operator_pin_key_(), op_injects_.live_ids());
+                }
             });
         });
+
+        // OPERATOR INJECT: hand the served template the inject ledger/order
+        // source (nullptr keeps the served template byte-identical to the plain
+        // good-citizen path). Wired ONCE here, before any template is served.
+        native_src_.set_operator_injects(cfg_.operator_inject ? &op_injects_ : nullptr);
 
         verify_loop_.start();
         pool_loop_.start();
@@ -755,6 +788,127 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // OPERATOR TX-INJECTION -- the production gate (mirrors Dash submit_inject).
+    //
+    // Unlike inject_relayed (a raw harness feed straight into C3), this is the
+    // full operator path: it arms behind --native-inject, throttles, sandboxes,
+    // and -- the point of the whole subsystem -- records the accepted inject in
+    // the OperatorInjectPool AND PINS it in C3, so the served template offers it
+    // FIRST at highest priority (mined even at 0 fee) with first claim on the
+    // block-weight cap. It never signs, never mutates the blob, and touches no
+    // coinbase / settlement state (reward-neutral by construction).
+    //
+    // ORDER (the Dash contract, ported): enabled? -> oversize refused
+    // charged-free (before the limiter) -> rate limiter by origin (charged on
+    // attempt) -> decode + sandbox (bounded work, before the heavy BP+ verify)
+    // -> reconcile expiry vs tip -> would_admit (cheap ledger gate) -> C3
+    // on_relayed -> map the verdict -> admit into the ledger -> pin in C3. A
+    // Duplicate from C3 (the network already relayed it) is ACCEPTED with cause
+    // ok-already-in-pool, because for XMR priority lives in SELECTION, not in a
+    // mempool fee-delta -- there is nothing to refuse. NotSynced refuses, as
+    // monerod ignores relayed txs off the tip.
+    enum class InjectOrigin : std::uint8_t { Local, Peers };
+    struct InjectSubmitResult {
+        bool        ok    = false;
+        std::string cause = "ok";   // named verdict (Dash DEF3 discipline)
+        Hash        id{};
+    };
+
+    InjectSubmitResult submit_operator_inject(std::vector<std::uint8_t> blob,
+                                              std::uint32_t flags = InjectFlags::PriorityRequest,
+                                              std::uint64_t expiry_height = 0,
+                                              InjectOrigin  origin = InjectOrigin::Local) {
+        std::lock_guard<std::mutex> gate(inject_gate_mu_);
+        InjectSubmitResult r;
+
+        // 1) enabled?
+        if (!cfg_.operator_inject) { r.cause = "inject-disabled"; return r; }
+
+        // 2) oversize refused charged-free, BEFORE the limiter is charged.
+        const std::uint64_t blob_size = blob.size();
+        if (blob_size == 0) { r.cause = "inject-empty"; return r; }
+        if (blob_size > OperatorInjectPool::kMaxInjectTxBytes) {
+            r.cause = "inject-pool-oversize"; return r;
+        }
+
+        // 3) rate limiter by origin, charged on the ATTEMPT (DoS placement).
+        const std::time_t now = static_cast<std::time_t>(unix_seconds_());
+        InjectRateLimiter& lim =
+            (origin == InjectOrigin::Peers) ? inject_lim_peers_ : inject_lim_local_;
+        auto rl = lim.try_consume(blob_size, now);
+        if (!rl.ok()) { r.cause = rl.name(); return r; }
+
+        // 4) decode + sandbox (bounded work before the heavy BP+ verify in C3).
+        DecodedTx d;
+        if (decode_relayed_tx(blob, d) != TxDecodeStatus::Ok) {
+            r.cause = "inject-decode-failed"; return r;
+        }
+        auto sb = InjectSandbox::vet(d.w);
+        if (!sb.ok()) { r.cause = sb.name(); return r; }
+        r.id = d.id;
+
+        // 4b) DAEMON-FIRST NAMED-REFUSAL. Under the daemon-first arm the found
+        //     block is submitted to monerod, which rejects a 0-fee/un-relayable
+        //     tx ("Block not accepted"); refuse it HERE, by name, before it can
+        //     pin. The p2p-first arm is the supported home for a 0-fee inject:
+        //     its native submit always mines it (proven).
+        if (const char* dfr = OperatorInjectPool::daemon_first_refusal(
+                /*daemon_first_arm  */ cfg_.relay_order != ArmOrder::P2pOnly,
+                /*monerod_configured*/ !cfg_.monerod_rpc_host.empty() && cfg_.monerod_rpc_port != 0,
+                /*fee               */ d.w.fee);
+            dfr[0] != '\0') {
+            r.cause = dfr;
+            note_(std::string("[INJECT] refused: ") + dfr
+                + " -- a 0-fee operator inject is un-relayable under --arm-order "
+                  "daemon-first; run --arm-order p2p-first, where the native submit "
+                  "always mines it");
+            return r;
+        }
+
+        // 5) reconcile: reap injects the tip has aged out, then default a FINITE
+        //    expiry so a pinned 0-fee inject cannot live forever.
+        std::uint64_t tip = 0;
+        if (auto t = index_.tip()) tip = t->height;
+        op_injects_.reap_expired(tip);
+        if (expiry_height == 0) expiry_height = tip + cfg_.operator_inject_ttl_blocks;
+
+        // 6) would_admit (cheap ledger gate). A Duplicate in the ledger is fine
+        //    -- re-submitting an already-tracked inject is a no-op accept.
+        auto wa = op_injects_.would_admit(d.id, blob_size);
+        if (wa != OperatorInjectPool::Admit::Ok &&
+            wa != OperatorInjectPool::Admit::Duplicate) {
+            r.cause = OperatorInjectPool::admit_name(wa); return r;
+        }
+
+        // 7) into C3 (the body/includability + key-image-conflict authority).
+        TxRelayVerdict v = inject_relayed(std::move(blob), OPERATOR_PEER_ID, /*fluff*/true);
+        using Reason = TxRelayVerdict::Reason;
+        if (v.reason == Reason::NotSynced) { r.cause = "inject-c3-NotSynced"; return r; }
+        if (v.reason != Reason::Accepted && v.reason != Reason::Duplicate) {
+            r.cause = std::string("inject-c3-") + to_string(v.reason); return r;
+        }
+
+        // 8) record in the inject ledger (idempotent on a ledger Duplicate).
+        op_injects_.admit(d.id, flags, expiry_height, blob_size, d.w.weight, d.w.fee,
+                          static_cast<std::uint64_t>(now));
+
+        // 9) PIN the whole live inject set in C3 under a reserved key, so a
+        //    0-fee inject survives cap/age eviction between submit and snapshot.
+        //    pin() replaces the set, so re-pinning live_ids() also unpins any id
+        //    reap dropped in step 5.
+        txpool_.pin(operator_pin_key_(), op_injects_.live_ids());
+
+        r.ok    = true;
+        r.cause = (v.reason == Reason::Duplicate) ? "ok-already-in-pool" : "ok";
+        return r;
+    }
+
+    // Read-only inject sensors for the status line / tests.
+    std::size_t inject_pool_size()      const { return op_injects_.size(); }
+    std::size_t inject_last_placed()    const { return native_src_.last_inject_n(); }
+    std::size_t inject_last_dropped()   const { return native_src_.last_inject_dropped(); }
+
+    // -----------------------------------------------------------------------
     // M4: DRIVING THE P-TPL SEAM.
     //
     // Nothing in M0..M3 called IParityOracle::on_serve. The tip probe fires by
@@ -954,6 +1108,14 @@ private:
             duration_cast<seconds>(system_clock::now().time_since_epoch()).count());
     }
 
+    // A synthetic peer id for operator-injected txs, in the same 0xC200_00xx
+    // block the harness inject uses, so the C3 relay attributes them distinctly.
+    static constexpr std::uint64_t OPERATOR_PEER_ID = 0xC2000002ull;
+    // The reserved C3 pin key under which the whole live operator-inject set is
+    // pinned (distinct from the per-generation template pins the miner-data
+    // source uses; those key on a template id, this one is a fixed sentinel).
+    static Hash operator_pin_key_() { Hash k{}; k.fill(0xC2); return k; }
+
     void arm_tick_() {
         if (!running_) return;
         tick_.expires_after(std::chrono::milliseconds(cfg_.driver_tick_ms));
@@ -1092,6 +1254,16 @@ private:
     RelayedTxPool  txpool_;
     TxSinkLoop     tx_sink_;
     tmpl::NativeMinerDataSource native_src_;
+
+    // OPERATOR TX-INJECTION state (default-constructed; wired in start() only
+    // when cfg_.operator_inject). op_injects_ is the DoS/expiry/order ledger
+    // (its own mutex); the two rate limiters keep the operator's Local budget
+    // separate from a Peers budget (reserved -- no XMR sharechain inject
+    // transport exists yet); inject_gate_mu_ serialises the multi-step gate.
+    OperatorInjectPool op_injects_;
+    InjectRateLimiter  inject_lim_local_{InjectRateLimiter::Scope::Local};
+    InjectRateLimiter  inject_lim_peers_{InjectRateLimiter::Scope::Peers};
+    std::mutex         inject_gate_mu_;
 
     boost::asio::io_context    io_;
     boost::asio::steady_timer  tick_;

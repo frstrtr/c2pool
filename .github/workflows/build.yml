@@ -256,6 +256,7 @@ jobs:
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
                     xmr_native_citizen_select_kat \
+                    xmr_native_inject_select_kat xmr_native_inject_pool_kat \
                     xmr_native_block_relay_kat xmr_c5_regtest_push \
                     xmr_native_parity_kat xmr_native_txpool_parity_kat \
                     xmr_native_backlog_famine_kat \
@@ -716,6 +717,7 @@ jobs:
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
                     xmr_native_citizen_select_kat \
+                    xmr_native_inject_select_kat xmr_native_inject_pool_kat \
                     xmr_native_block_relay_kat xmr_c5_regtest_push \
                     xmr_native_parity_kat xmr_native_txpool_parity_kat \
                     xmr_native_backlog_famine_kat \
