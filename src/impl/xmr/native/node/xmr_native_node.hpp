@@ -93,6 +93,7 @@
 #include <boost/asio.hpp>
 
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
+#include "impl/xmr/native/chain/xmr_output_set.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
 #include "impl/xmr/native/node/xmr_chain_boot.hpp"
 #include "impl/xmr/native/node/xmr_genesis_blob.hpp"
@@ -357,6 +358,7 @@ public:
           index_(make_index_options_(), pow_witness_or_null_()),
           boot_(index_, cfg_.boot, p2p::genesis_id(nets_.wire), nets_.consensus),
           inbound_(verify_loop_, boot_),
+          outputs_(/*first_output_index=*/0),
           txpool_(make_txpool_config_()),
           tx_sink_(pool_loop_, txpool_),
           native_src_(index_, txpool_, make_template_policy_(), &txpool_),
@@ -399,13 +401,40 @@ public:
         // after releasing its own lock), which is what makes the native
         // observation the oracle takes later safe to read.
         index_.subscribe([this](const node::MainchainEvent& ev) { on_mainchain_(ev); });
+
+        // The txpool's INPUT-consensus step resolves rings and rejects on-chain
+        // double-spends against `outputs_`. Wire it before the block stream can
+        // feed anything, so the very first connected block's key images land in
+        // the spent set the pool consults. On a genesis / regtest chain the set
+        // numbers from 0 and is complete; on an anchor boot it numbers from the
+        // anchor's rct_output_count and the honest below-anchor gap applies (a
+        // ring reaching below the anchor is RingUnresolved, never mis-admitted).
+        //
+        // Seed the numbering base from whatever boot resolved before any block
+        // feeds the set (a no-op reseat on the empty set): 0 on genesis /
+        // local-genesis, the anchor's rct_output_count on an anchor boot (the
+        // chain view carries it through seed_from_anchor). Leaf 0 must be
+        // numbered from the right base or every post-anchor ring is misnumbered.
+        outputs_.reset_base(index_.view().rct_output_count());
+        txpool_.set_input_consensus_sources(&outputs_, &outputs_);
+
         index_.subscribe_txs([this](const BlockTxEvent& ev) {
             // C2 -> C3: drop mined ids, evict key-image conflicts, re-admit on a
             // rollback. Posted to the pool thread for the same reason the relay
             // path is: it re-decodes bodies.
             pool_loop_.post([this, ev] {
-                if (ev.kind == BlockTxEvent::Kind::Connected) txpool_.on_block_connected(ev);
-                else                                          txpool_.on_block_disconnected(ev);
+                // Feed the output set FIRST: the spent-key-image set must reflect
+                // this block before the pool judges (or re-admits) anything
+                // against it. on_block_connected also carries the block's RCT
+                // outputs when the producer captured them (below-anchor history
+                // excepted); with none captured it still advances key images.
+                if (ev.kind == BlockTxEvent::Kind::Connected) {
+                    outputs_.on_block_connected(ev);
+                    txpool_.on_block_connected(ev);
+                } else {
+                    outputs_.on_block_disconnected(ev);
+                    txpool_.on_block_disconnected(ev);
+                }
                 // OPERATOR INJECT upkeep on a connected block: an inject that was
                 // mined leaves C3 (so it would silently stop being offered), but
                 // its ledger entry and pin must go too. Forget the mined ids,
@@ -1217,6 +1246,11 @@ private:
     ChainIndex     index_;
     ChainBoot      boot_;
     VerifyInbound  inbound_;
+    // The global output set / on-chain spent-key-image view the txpool's
+    // input-consensus step resolves rings and double-spends against. Fed from
+    // the same connected-block stream as the pool. Declared BEFORE txpool_ so
+    // it outlives it (the pool borrows a pointer to it). See start().
+    ChainOutputSet outputs_;
     RelayedTxPool  txpool_;
     TxSinkLoop     tx_sink_;
     tmpl::NativeMinerDataSource native_src_;

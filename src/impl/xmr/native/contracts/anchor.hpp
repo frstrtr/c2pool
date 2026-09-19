@@ -85,6 +85,16 @@ struct AnchorBundle {
     U128          cumulative_difficulty{};
     std::uint64_t already_generated_coins = 0;
 
+    // Global amount-0 RCT output count at H_a (the number of RCT outputs the
+    // chain had created up to and including the anchor block). This is the
+    // `first_output_index` the output set numbers the first post-anchor block
+    // from, so a mainnet ring whose members are all above the anchor is
+    // resolvable from connected blocks alone. 0 for a regtest anchor at
+    // genesis. Filled by the anchor generator from the operator's own monerod
+    // (get_output_distribution amounts=[0] cumulative at H_a). Added in the
+    // input-consensus pass so a later re-mint is not needed.
+    std::uint64_t rct_output_count = 0;
+
     // RandomX seeds for the first post-anchor epoch(s): (epoch height, key block
     // id), at most ANCHOR_MAX_SEED_IDS, each height a multiple of
     // SEEDHASH_EPOCH_BLOCKS.

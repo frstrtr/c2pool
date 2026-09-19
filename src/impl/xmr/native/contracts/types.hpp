@@ -197,6 +197,19 @@ struct TemplateInputs {
     }
 };
 
+// --- global output record ----------------------------------------------------
+// One global RCT output, in monerod's amount-0 output-table order. `height` and
+// `unlock_time` decide the spend-time / spendable-age rules; `pubkey`/
+// `commitment` are a ring member's (dest, mask). Defined here (not in
+// outputs.hpp) because BlockTxEvent carries a vector of them; the interfaces
+// that consume it live in contracts/outputs.hpp.
+struct OutputRecord {
+    Hash          pubkey{};       // one-time output public key (dest)
+    Hash          commitment{};   // amount commitment C (mask)
+    std::uint64_t unlock_time = 0;
+    std::uint64_t height      = 0;   // block height the output was created in
+};
+
 // --- per-block transaction events -------------------------------------------
 // Emitted by C2 alongside MainchainEvent; consumed by C3 (drop mined ids, evict
 // key-image conflicts, return disconnected bodies to the pool).
@@ -220,6 +233,33 @@ struct BlockTxEvent {
 
     std::vector<std::vector<std::uint8_t>> tx_blobs;  // Disconnected, BEST EFFORT
     bool tx_blobs_complete = false;                   // see the note above
+
+    // INPUT-consensus feed (Connected only). `first_output_index` is the global
+    // amount-0 RCT output count BEFORE this block -- the global index the block's
+    // FIRST output takes (the v2 coinbase's output 0), 0 on a regtest chain from
+    // genesis, the anchor's rct_output_count for the first post-anchor block.
+    //
+    // The outputs are split by producer so the CHAIN layer stays free of the
+    // ring-ct curve arithmetic (chain_view / block_eval link no rct):
+    //
+    //   * `coinbase_amount_pubkeys` -- the version-2 coinbase's (public amount,
+    //     one-time key) pairs, in output order, EMPTY for a version-1 coinbase
+    //     (whose outputs never enter the amount-0 table). The output set turns
+    //     each public amount into the stored commitment via rct::zero_commit,
+    //     which is where the curve code lives; these are GLOBALLY FIRST.
+    //   * `coinbase_unlock_time` -- the coinbase's unlock_time (height + 60),
+    //     inherited by each coinbase output as its spendable bound.
+    //   * `outputs` -- every NON-coinbase RCT output, in block/tx order, with its
+    //     commitment already resolved from the tx's outPk (no curve code needed),
+    //     GLOBALLY AFTER the coinbase outputs.
+    //
+    // So the set's global order is coinbase_amount_pubkeys ++ outputs, numbered
+    // from first_output_index. All empty/zero when the producer did not capture
+    // (a fluffy announce with no bodies, or capture disabled).
+    std::vector<std::pair<std::uint64_t, Hash>> coinbase_amount_pubkeys;
+    std::uint64_t                               coinbase_unlock_time = 0;
+    std::vector<OutputRecord>                   outputs;
+    std::uint64_t                               first_output_index = 0;
 };
 
 // --- index / sync telemetry --------------------------------------------------

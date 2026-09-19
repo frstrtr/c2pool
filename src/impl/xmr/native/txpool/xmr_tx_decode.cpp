@@ -42,8 +42,11 @@ TxDecodeStatus decode_relayed_tx(const std::uint8_t* data, std::size_t size, Dec
     out = DecodedTx{};
 
     // 1) Weight, sizes, ring sizes, key images and fee: the shared Wave-0
-    //    consensus parser, not a second opinion.
-    out.parse = parse_tx_full(data, size, out.w);
+    //    consensus parser, not a second opinion. `capture=true` also collects
+    //    the ring key-offsets and the output public keys the input-consensus
+    //    step needs -- the relay path pays for them, the chain-sync path does
+    //    not.
+    out.parse = parse_tx_full(data, size, out.w, /*capture=*/true);
     if (out.parse != TxParseStatus::Ok) {
         return out.parse == TxParseStatus::UnsupportedRctType
                        ? TxDecodeStatus::UnsupportedRctType
@@ -111,17 +114,23 @@ TxDecodeStatus decode_relayed_tx(const std::uint8_t* data, std::size_t size, Dec
 
     if (n_l != n_r || n_l < 6) return TxDecodeStatus::ProofShape;
 
-    // CLSAG per input: s[ring], c1, D. The signatures themselves are INPUT
-    // consensus (they are checked against the ring members, which need the
-    // chain) so they are walked over, not decoded -- but they must be exactly
-    // as long as the ring sizes in the prefix say, or the pseudo-outputs that
-    // follow are not where we think they are.
+    // CLSAG per input: s[ring], c1, D. These ARE input consensus -- they are
+    // checked against the ring members, which need the chain -- so this decodes
+    // them (it no longer walks over them) into out.clsags for the txpool's
+    // input-consensus step. They must be exactly as long as the ring sizes in
+    // the prefix say, or the pseudo-outputs that follow are not where we think.
     if (out.w.ring_sizes.size() != n_in) return TxDecodeStatus::PrunableMalformed;
+    out.clsags.resize(n_in);
     for (std::size_t i = 0; i < n_in; ++i) {
         const std::uint64_t ring = out.w.ring_sizes[i];
         if (ring == 0 || ring > TX_MAX_RING) return TxDecodeStatus::PrunableMalformed;
-        if (!r.skip(static_cast<std::size_t>(32 * ring))) return TxDecodeStatus::PrunableMalformed;
-        if (!r.skip(64)) return TxDecodeStatus::PrunableMalformed;   // c1 and D
+        rct::Clsag& cl = out.clsags[i];
+        cl.s.resize(static_cast<std::size_t>(ring));
+        for (auto& sc : cl.s)
+            if (!r.read_key(sc)) return TxDecodeStatus::PrunableMalformed;
+        if (!r.read_key(cl.c1)) return TxDecodeStatus::PrunableMalformed;
+        if (!r.read_key(cl.D))  return TxDecodeStatus::PrunableMalformed;
+        cl.I = out.rct.key_images[i];   // the key image is carried in the prefix
     }
 
     out.rct.pseudoOuts.resize(n_in);
@@ -141,6 +150,14 @@ TxDecodeStatus decode_relayed_tx(const std::uint8_t* data, std::size_t size, Dec
     std::memcpy(triple + 32, h_base.data(), 32);
     std::memcpy(triple + 64, h_prunable.data(), 32);
     out.id = keccak_of(triple, sizeof(triple));
+
+    // 5) Input-consensus raw material. h_prefix and h_base are the first two of
+    //    monerod's get_pre_mlsag_hash inputs (rv.message and H(rct base)); the
+    //    ring offsets and output keys came from the capturing parse in step 1.
+    out.h_prefix     = h_prefix;
+    out.h_base       = h_base;
+    out.key_offsets  = std::move(out.w.key_offsets);
+    out.out_pubkeys.assign(out.w.out_pubkeys.begin(), out.w.out_pubkeys.end());
 
     return TxDecodeStatus::Ok;
 }
