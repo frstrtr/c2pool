@@ -645,7 +645,8 @@ void test_sync_driver_probe_is_one_question() {
     rt::SyncDriverConfig cfg;
     cfg.probe_only = true;
     rt::SyncDriver probe(fetcher, chain, chain, native::p2p::STAGENET_GENESIS,
-                         [] { return false; }, [] { return std::vector<Hash>{}; }, cfg);
+                         [] { return false; }, [] { return std::vector<Hash>{}; },
+                         [] { return std::vector<Hash>{}; }, cfg);
     for (int i = 0; i < 20; ++i) probe.tick(1000 + 100 * i);
 
     kat::check(fetcher.chain_requests.size() == 1,

@@ -93,6 +93,16 @@ struct SyncDriverConfig {
     // the SCHEDULE must not be a busy loop is this file's.
     std::uint64_t refetch_reask_ms          = 15'000;
 
+    // #1680: how long a bodiless fluffy park (ChainIndex::bodies_wanted) may sit
+    // before the driver re-asks for the whole block via GET_OBJECTS. A park is
+    // created the instant we send its announcer a REQUEST_FLUFFY_MISSING_TX
+    // (2009); this grace lets that reply arrive normally before we fall back.
+    // 5 s is ten driver ticks at driver_tick_ms=500 -- generous for a LAN reply,
+    // short enough that a reply lost to the DoS bucket or a disconnect self-heals
+    // long before the next found share submits at a taken height. Re-asked every
+    // timeout until the block connects (which erases the park).
+    std::uint64_t fluffy_reply_timeout_ms   = 5'000;
+
     // READ-ONLY PROBE. Ask one NOTIFY_REQUEST_CHAIN from a genesis-terminated
     // locator, record the answer, and never ask for a block. This is what a
     // live probe against somebody else's synced daemon is allowed to do: a
@@ -109,6 +119,7 @@ public:
         std::uint64_t chain_requests   = 0;
         std::uint64_t chain_timeouts   = 0;
         std::uint64_t refetch_requests = 0;
+        std::uint64_t bodies_refetch_requests = 0;   // #1680: whole-block fallback for a stranded fluffy park
         std::uint64_t no_peer_ticks    = 0;
         std::uint64_t our_height       = 0;
         std::uint64_t best_peer_height = 0;
@@ -125,6 +136,7 @@ public:
 
     SyncDriver(IChainFetcher& fetcher, IChainServing& serving, IChainView& view,
                Hash genesis_id, BootedFn booted, RefetchFn refetch,
+               RefetchFn bodies = {},
                SyncDriverConfig cfg = {})
         : fetcher_(fetcher),
           serving_(serving),
@@ -132,6 +144,7 @@ public:
           genesis_id_(genesis_id),
           booted_(std::move(booted)),
           refetch_(std::move(refetch)),
+          bodies_(std::move(bodies)),
           cfg_(cfg) {}
 
     // One pass. MUST be called on the verify thread: it reads the index and
@@ -218,6 +231,47 @@ public:
             if (asked_.size() > 4096) asked_.clear();
         }
 
+        // --- the stranded fluffy parks (#1680) -------------------------------
+        // A block announced fluffy and parked WITH a body blob but WITHOUT its
+        // transactions is invisible to refetch_wanted() (have_body_locked_ sees
+        // the blob) and to on_chain_entry (skips ids in alt_). If the missing-tx
+        // reply we asked for is lost -- dropped by the block DoS bucket, or by a
+        // disconnect -- nothing re-asks and the node freezes one block behind.
+        // We give each park a grace window (its own in-flight 2009 gets to
+        // answer) and then re-ask for the WHOLE block via GET_OBJECTS, which
+        // works from any peer and rides the existing span machinery. Kept as a
+        // list separate from refetch above so a healthy fluffy reply is never
+        // raced by a duplicate whole-block fetch.
+        const std::vector<Hash> parks = bodies_ ? bodies_() : std::vector<Hash>{};
+        if (!parks.empty()) {
+            std::vector<Hash> ask;
+            for (const Hash& id : parks) {
+                if (ask.size() >= cfg_.refetch_batch) break;
+                const std::string key(reinterpret_cast<const char*>(id.data()), id.size());
+                const auto it = bodies_seen_.find(key);
+                if (it == bodies_seen_.end()) {   // first sighting: let the 2009 reply land
+                    bodies_seen_[key] = now_ms;
+                    continue;
+                }
+                if (now_ms - it->second < cfg_.fluffy_reply_timeout_ms) continue;
+                it->second = now_ms;              // re-ask every timeout until it connects
+                ask.push_back(id);
+            }
+            if (!ask.empty() && fetcher_.request_objects(peer, std::move(ask), /*prune=*/true))
+                ++stats_.bodies_refetch_requests;
+            // Forget parks that have connected (no longer in the wanted list), so
+            // the book does not grow without bound.
+            if (bodies_seen_.size() > parks.size() + 256) {
+                std::map<std::string, std::uint64_t> live;
+                for (const Hash& id : parks)
+                    live[std::string(reinterpret_cast<const char*>(id.data()), id.size())] =
+                        bodies_seen_[std::string(reinterpret_cast<const char*>(id.data()), id.size())];
+                bodies_seen_.swap(live);
+            }
+        } else if (!bodies_seen_.empty()) {
+            bodies_seen_.clear();
+        }
+
         // --- the chain ask ---------------------------------------------------
         // `current_height` is monerod's own spelling: one PAST the peer's tip.
         // So "the peer is ahead of us" is current_height > our_tip + 1.
@@ -263,9 +317,11 @@ private:
     Hash           genesis_id_;
     BootedFn       booted_;
     RefetchFn      refetch_;
+    RefetchFn      bodies_;      // #1680: bodiless fluffy parks; {} disables the fallback
     SyncDriverConfig cfg_;
 
     std::map<std::string, std::uint64_t> asked_;   // refetch id -> when we last asked
+    std::map<std::string, std::uint64_t> bodies_seen_;  // #1680: park id -> when first noticed / last re-asked
     bool          was_booted_        = false;
     bool          probe_sent_        = false;
     bool          in_flight_         = false;

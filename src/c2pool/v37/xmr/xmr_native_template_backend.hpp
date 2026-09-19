@@ -119,6 +119,12 @@ struct NativeTemplateConfig {
     // See NativeNodeConfig for why a tip-only native arm collects almost no fees.
     std::uint64_t            backlog_refresh_s = 3;
 
+    // #1680 lever. Cap on outstanding solicited-reply DoS credits, handed to
+    // NativeNodeConfig::dos_solicited_credits (which sets DosConfig::
+    // max_solicited_credits). Default 8 = fix #1 armed; 0 disables the credit
+    // path (pre-#1680 behaviour), which the live fix-2 proof leans on.
+    std::uint32_t            dos_solicited_credits = 8;
+
     // A build without librandomx cannot check proof of work. Opt-in, loud.
     bool                     allow_unverified_pow = false;
 
@@ -165,6 +171,7 @@ public:
         nc.template_fallback    = cfg_.fallback;
         nc.force_synced         = cfg_.force_synced;
         nc.backlog_refresh_s    = cfg_.backlog_refresh_s;
+        nc.dos_solicited_credits = cfg_.dos_solicited_credits;   // #1680 lever
         nc.fork_tie             = cfg_.fork_tie;
 
         node_ = std::make_unique<nrt::NativeNode>(std::move(nc));

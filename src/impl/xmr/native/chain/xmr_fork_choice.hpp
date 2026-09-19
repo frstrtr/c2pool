@@ -119,6 +119,15 @@ struct AltBlock {
     BlockEntry entry{};
     bool       has_entry = false;
 
+    // A fluffy block whose body we do not yet have: has_entry is TRUE (it holds
+    // the bodiless block blob) but the transactions are still missing, so it
+    // cannot connect. We asked its announcer for the missing txs (a 2009); if
+    // that reply is lost -- e.g. dropped by the block DoS bucket, #1680 -- the
+    // park would otherwise strand forever, because on_chain_entry skips ids we
+    // already hold and refetch_wanted() filters by has_entry. The sync driver
+    // watches for this flag and re-asks via GET_OBJECTS after a grace period.
+    bool       bodies_missing = false;
+
     // Who gave it to us, so a branch that turns out to be consensus-invalid can
     // be charged to the connection that proposed it rather than to whoever
     // happened to be talking when the switch was attempted.
