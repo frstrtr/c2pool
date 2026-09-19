@@ -11817,6 +11817,15 @@ int main(int argc, char** argv)
                       << (stratum_port + 1) << "\n";
             web_port = static_cast<uint16_t>(stratum_port + 1);
         }
+        // ── DAEMONLESS POSTURE (single source of truth) ──
+        // No dashd arm requested (--coin-rpc / --coin-rpc-auth / --submit-block
+        // all absent) => the embedded builder is the only template source.
+        // Computed ONCE here and read by BOTH the good-citizen resolver below
+        // and the BLS-stub refuse-to-start gate before run_node — never
+        // recomputed, so the two consumers can never silently diverge.
+        const bool daemonless_posture = rpc_endpoint.empty()
+                                     && rpc_conf_path.empty()
+                                     && submit_hex.empty();
         // ── GOOD-CITIZEN DEFAULT: daemonless nodes SERVE THE FULL MEMPOOL ──
         // The operator-declared posture decides: with no dashd arm requested
         // (--coin-rpc / --coin-rpc-auth / --submit-block all absent) the
@@ -11829,9 +11838,6 @@ int main(int argc, char** argv)
         // armed TOGETHER, never apart); dashd-armed => byte-identical to the
         // requested flags. --<flag>=false is the explicit opt-out either way.
         {
-            const bool daemonless_posture = rpc_endpoint.empty()
-                                         && rpc_conf_path.empty()
-                                         && submit_hex.empty();
             const dash::coin::TxServeResolution txr =
                 dash::coin::resolve_good_citizen_tx_serve(
                     daemonless_posture,
@@ -11911,9 +11917,6 @@ int main(int argc, char** argv)
         // the good-citizen resolver above may have armed them in daemonless mode)
         // and on the pure daemonless_posture — before run_node opens any store.
         {
-            const bool daemonless_posture = rpc_endpoint.empty()
-                                         && rpc_conf_path.empty()
-                                         && submit_hex.empty();
             const bool bls_claim_config = daemonless_posture
                 || embedded_null_arm || embedded_superblock
                 || embedded_ingest_isdlock || embedded_accrue_asset_unlocks;
