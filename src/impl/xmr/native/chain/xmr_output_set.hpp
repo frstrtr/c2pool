@@ -32,13 +32,26 @@
 // the historical output/spent set instead of being blind to pre-anchor outputs.
 //
 // COVERAGE, stated honestly. `first_output_index` is the anchor's
-// rct_output_count (0 on a regtest chain from genesis). A ring member BELOW that
-// index was created before the anchor and is NOT in this set: resolve() returns
-// false for it and the pool fails closed (RingUnresolved). So this is COMPLETE
-// input consensus for a regtest-from-genesis chain and for any mainnet ring
-// whose members are all above the anchor; the pre-anchor history (mainnet
-// O-backfill) is loaded from an anchor-committed snapshot -- a seam, not yet
-// wired.
+// rct_output_count. On a chain the node followed from genesis (regtest, or a
+// from-genesis walk) it is 0 and the set is COMPLETE: every amount-0 output ever
+// created is in it, numbered from 0. On a FORMAT-2 anchor boot it is the real
+// count at H_a: a ring member below it is pre-anchor, resolve() returns false,
+// and the pool fails closed (RingUnresolved) unless the format-2 snapshot has
+// been seeded (seed_from_snapshot), which backfills the below-base history so
+// those members resolve.
+//
+// A FORMAT-1 anchor carries NO rct_output_count -- anchor_self_check forces all
+// six format-2 fields to zero, so the count is 0 even though the chain's real
+// count at H_a is not. The node therefore CANNOT number from the real base: a
+// base of 0 would misnumber every post-anchor output, and an HONEST ring whose
+// real member sits below the (unknown) real base would resolve to the WRONG
+// post-anchor output and be scored a forged ring -- RingSigFail, a DROP OFFENCE
+// against an honest peer. So a format-1 boot DISABLES resolution outright
+// (disable_resolution(), wired in xmr_native_node.hpp): resolve() returns false
+// for every ring, all rings stay RingUnresolved (fail-closed), and no honest
+// peer is ever mis-scored. The spent-key-image view is unaffected. The pre-anchor
+// history is loaded from a format-2 anchor-committed snapshot -- the O-backfill
+// seam.
 //
 // COINBASE COMMITMENTS. A version-2 coinbase output has a PUBLIC amount and
 // carries no outPk, so monerod stores rct::zeroCommit(amount) as its commitment.
@@ -107,12 +120,33 @@ public:
         return true;
     }
 
+    // Disable ring resolution outright: resolve() then returns false for EVERY
+    // ring, so the pool leaves them all RingUnresolved (fail-closed). Called on a
+    // FORMAT-1 anchor boot, where the bundle carries no rct_output_count so the
+    // real numbering base is unknown -- resolving anything from base=0 would
+    // misnumber an honest ring below the real base and RingSigFail it (a drop
+    // offence against an honest peer). The spent-key-image view (is_spent) is
+    // unaffected, and the from-genesis / format-2 paths never call this and keep
+    // resolving. Idempotent.
+    void disable_resolution() {
+        std::lock_guard<std::mutex> lk(mu_);
+        resolution_enabled_ = false;
+    }
+    bool resolution_enabled() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return resolution_enabled_;
+    }
+
     // --- IRingMemberSource --------------------------------------------------
     bool resolve(std::uint64_t amount,
                  const std::vector<std::uint64_t>& absolute_offsets,
                  std::vector<OutputRecord>&        out) const override {
         if (amount != 0) return false;
         std::lock_guard<std::mutex> lk(mu_);
+        // Format-1 anchor boot: the numbering base is unknown, so resolution is
+        // disabled and every ring is left RingUnresolved (fail-closed) rather
+        // than mis-resolved to a wrong post-anchor output.
+        if (!resolution_enabled_) return false;
         out.clear();
         out.reserve(absolute_offsets.size());
         for (std::uint64_t off : absolute_offsets) {
@@ -586,6 +620,9 @@ private:
 
     mutable std::mutex               mu_;
     std::uint64_t                    base_ = 0;   // first_output_index
+    // False only after disable_resolution() -- a FORMAT-1 anchor boot, where the
+    // real numbering base is unknown. resolve() then fails closed for every ring.
+    bool                             resolution_enabled_ = true;
     std::vector<OutputRecord>        outputs_;    // random-access resolve table
     std::unordered_set<Hash, HashHasher> spent_;  // random-access spent oracle
 

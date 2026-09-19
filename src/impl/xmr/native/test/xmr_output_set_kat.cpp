@@ -734,6 +734,112 @@ static void test_selftest_pin() {
            "PART E: spent root pinned to the Python generator (%s)", ki_root.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// PART F: FORMAT-1 anchor boot fail-closed. A format-1 AnchorBundle carries no
+// rct_output_count (anchor_self_check forces the six format-2 fields to zero), so
+// a node that seeds from it numbers post-anchor outputs from base=0. On the real
+// chain the honest ring's member sits BELOW the real (unknown) base; from base=0
+// that offset collides with a POST-anchor output, so WITHOUT a guard resolve()
+// returns the WRONG member and the CLSAG over it fails -- an honest ring is
+// RingSigFail'd and its peer scored a drop offender. The fix disables ring
+// resolution on a format-1 boot: resolve() returns false for every ring, so all
+// rings are RingUnresolved (fail-closed) and no honest peer is ever mis-scored.
+// A from-genesis / format-2 node (resolution enabled) keeps resolving and still
+// RingSigFails a genuinely forged ring -- the no-regression half.
+// ---------------------------------------------------------------------------
+static void test_format1_anchor_boot() {
+    using Reason = TxRelayVerdict::Reason;
+
+    // --- resolve()-level: the misnumbering the fix closes, and the guard. ---
+    {
+        // A format-1-booted node: base 0, five POST-anchor outputs connected
+        // (global indices 0..4). On the real chain the honest ring's member at
+        // global index 2 is a PRE-anchor output -- NOT one of these -- but with
+        // base=0 it collides with post-anchor output #2.
+        ChainOutputSet fmt1(/*first_output_index=*/0);   // format-1: base forced 0
+        for (std::uint64_t h = 1; h <= 5; ++h)
+            check(fmt1.on_block_connected(connected(
+                      h, fmt1.frontier(),
+                      {rec(static_cast<std::uint8_t>(0x60 + h), h)}, {})),
+                  "PART F: connect post-anchor block");
+        check(fmt1.frontier() == 5, "PART F: five post-anchor outputs, base 0");
+
+        std::vector<OutputRecord> got;
+        check(fmt1.resolution_enabled(), "PART F: resolution enabled by default");
+        // The bug in the raw structure: an honest below-base offset MIS-resolves
+        // to a post-anchor member (which is what would then be RingSigFail'd).
+        // Global index 2 is the output of block h=3 (pubkey 0x60+3), a POST-anchor
+        // output -- NOT the honest ring's real pre-anchor member.
+        check(fmt1.resolve(0, {2}, got) && got.size() == 1
+                  && got[0].pubkey == hash_byte(0x63),
+              "PART F: without the guard a below-base offset mis-resolves (the bug)");
+
+        // The FIX: a format-1 boot disables resolution -> every ring unresolved.
+        fmt1.disable_resolution();
+        check(!fmt1.resolution_enabled(), "PART F: resolution disabled after the fix");
+        check(!fmt1.resolve(0, {2}, got),
+              "PART F: honest below-base ring is RingUnresolved (not mis-resolved)");
+        check(!fmt1.resolve(0, {4}, got),
+              "PART F: an in-range post-anchor offset is also left unresolved (fail-closed)");
+
+        // Disabling resolution must NOT touch the spent-key-image view.
+        ChainOutputSet fmt1b(0);
+        fmt1b.disable_resolution();
+        check(fmt1b.on_block_connected(connected(1, 0, {}, {hash_byte(0xF7)})),
+              "PART F: a block still feeds the spent set with resolution disabled");
+        check(fmt1b.is_spent(hash_byte(0xF7)),
+              "PART F: is_spent still works when resolution is disabled");
+    }
+
+    // --- admission-level, driven with a REAL golden tx ----------------------
+    DecodedTx d;
+    const T::GoldenTx* gtx = first_decodable(d);
+    checkf(gtx != nullptr, "PART F: no decodable golden tx");
+    if (!gtx) return;
+    std::vector<std::uint8_t> blob = from_hex(gtx->full_hex);
+
+    // (a) FORMAT-1 boot: the real ChainOutputSet with resolution disabled is the
+    //     ring source. The honest golden tx's rings do NOT resolve, so the tx is
+    //     RingUnresolved -- admitted WITHOUT InputConsensus, NO RingSigFail, NO
+    //     drop offence. The honest peer is never scored.
+    {
+        ChainOutputSet fmt1(0);
+        fmt1.disable_resolution();          // the format-1 boot posture
+        RelayedTxPool pool;
+        pool.set_input_consensus_sources(&fmt1, &fmt1);
+        arm(pool);
+        auto v = pool.on_relayed(peer(), {blob}, true);
+        checkf(v.size() == 1 && v[0].reason == Reason::Accepted,
+               "PART F (a): format-1 honest ring Accepted (non-input only), got %s",
+               v.empty() ? "none" : to_string(v[0].reason));
+        if (!v.empty()) {
+            check(!has(v[0].evidence, AdmissionEvidence::InputConsensus),
+                  "PART F (a): InputConsensus NOT granted on a format-1 boot");
+            check(!v[0].drop_offense,
+                  "PART F (a): NO drop offence on a format-1 honest ring");
+        }
+        check(pool.stats().unresolved_ring == 1, "PART F (a): counted RingUnresolved");
+        check(pool.stats().rejected_ring_sig == 0, "PART F (a): NOTHING RingSigFail'd");
+    }
+
+    // (b) NO REGRESSION: a from-genesis / format-2 node (resolution enabled) that
+    //     resolves a ring to the WRONG members still RingSigFails it (a drop).
+    {
+        RelayedTxPool pool;
+        FakeRingSource src = source_for(*gtx, d, /*rotate=*/true);   // forged ring
+        pool.set_input_consensus_sources(&src, &src);
+        arm(pool);
+        auto v = pool.on_relayed(peer(), {blob}, true);
+        checkf(v.size() == 1 && v[0].reason == Reason::RingSigFail,
+               "PART F (b): forged ring still RingSigFail, got %s",
+               v.empty() ? "none" : to_string(v[0].reason));
+        if (!v.empty())
+            check(v[0].drop_offense, "PART F (b): a forged ring IS a drop offence");
+        check(pool.stats().rejected_ring_sig == 1,
+              "PART F (b): ring-sig counter incremented (no regression)");
+    }
+}
+
 int main() {
     test_output_set();
     test_output_mmr();
@@ -741,6 +847,7 @@ int main() {
     test_selftest_pin();
     test_admission();
     test_select_policy();
+    test_format1_anchor_boot();
 
     if (g_fail == 0) {
         std::fprintf(stderr, "output-set + admission KAT: ALL %d checks passed\n",
