@@ -201,6 +201,36 @@ if (BUILD_TESTING)
         add_test(NAME ${_c3_kat} COMMAND ${_c3_kat})
     endforeach()
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # C3 companion: the committed monerod-side input-consensus PARITY harness
+    # (monerod_parity_harness.py). NOT a compiled KAT and NOT part of ordinary
+    # CI: it needs a LIVE regtest monerod + monero-wallet-rpc, so it is gated
+    # behind XMR_BUILD_MONEROD_PARITY (default OFF) and, even when built, exits
+    # 77 (ctest SKIP) when no daemon is reachable. It is therefore deliberately
+    # NOT added to the build.yml --target lists -- there is no binary to build,
+    # and a live-daemon test must never red a unit-test runner. It proves the
+    # OTHER half of the parity the C3 KATs make offline: that a real monerod
+    # reaches the same accept/reject verdict on the same bytes (genuine accepted,
+    # CLSAG-mutant and double-spend twin rejected) and accepts a block carrying
+    # the tx our good-citizen selector would mine.
+    # ─────────────────────────────────────────────────────────────────────────
+    option(XMR_BUILD_MONEROD_PARITY
+        "Run the live monerod-side input-consensus parity harness (needs a regtest monerod + monero-wallet-rpc)"
+        OFF)
+    if (XMR_BUILD_MONEROD_PARITY)
+        find_program(XMR_PARITY_PYTHON NAMES python3 python)
+        if (NOT XMR_PARITY_PYTHON)
+            message(FATAL_ERROR "XMR_BUILD_MONEROD_PARITY=ON but no python3 interpreter was found")
+        endif()
+        add_test(NAME xmr_native_monerod_parity
+                 COMMAND ${XMR_PARITY_PYTHON}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/monerod_parity_harness.py)
+        set_tests_properties(xmr_native_monerod_parity PROPERTIES
+            SKIP_RETURN_CODE 77
+            LABELS "live;monerod;parity"
+            TIMEOUT 900)
+    endif()
+
     # -----------------------------------------------------------------------
     # Wave 1, component C1b: the levin TRANSPORT (../p2p/levin_socket.hpp,
     # levin_invoke_queue.hpp, xmr_handshake.hpp, xmr_levin_link.hpp). Two
