@@ -77,8 +77,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -183,6 +186,11 @@ struct NativeNodeConfig {
 
     BootMode                 boot = BootMode::Genesis;
     std::string              anchor_path;          // BootMode::Anchor; "" = embedded
+    // Format-2 O-backfill: a ChainOutputSet::serialize() snapshot re-derived to
+    // the anchor's committed output/spent roots. When set (and the anchor is a
+    // format-2 bundle) the node seeds the historical set so pre-anchor rings
+    // resolve; empty leaves pre-anchor rings RingUnresolved (today's behaviour).
+    std::string              output_set_path;
 
     // A build without librandomx cannot check proof of work: the gate answers
     // Skipped, and the index connects blocks it never verified. That is a
@@ -388,9 +396,12 @@ public:
         // double-spends against `outputs_`. Wire it before the block stream can
         // feed anything, so the very first connected block's key images land in
         // the spent set the pool consults. On a genesis / regtest chain the set
-        // numbers from 0 and is complete; on an anchor boot it numbers from the
-        // anchor's rct_output_count and the honest below-anchor gap applies (a
-        // ring reaching below the anchor is RingUnresolved, never mis-admitted).
+        // numbers from 0 and is complete. On a FORMAT-2 anchor boot it numbers
+        // from the anchor's real rct_output_count and the honest below-anchor gap
+        // applies (a ring reaching below the anchor is RingUnresolved, never
+        // mis-admitted). On a FORMAT-1 anchor boot the bundle carries no
+        // rct_output_count, so the real base is unknown and resolution is disabled
+        // below (all rings RingUnresolved) rather than mis-numbered from 0.
         //
         // Seed the numbering base from whatever boot resolved before any block
         // feeds the set (a no-op reseat on the empty set): 0 on genesis /
@@ -398,6 +409,68 @@ public:
         // chain view carries it through seed_from_anchor). Leaf 0 must be
         // numbered from the right base or every post-anchor ring is misnumbered.
         outputs_.reset_base(index_.view().rct_output_count());
+
+        // Format-2 O-backfill (ruling R1): when the operator supplies an
+        // output-set snapshot AND the node anchor-booted from a format-2 bundle,
+        // seed the historical amount-0 output set and the spent-key-image set so
+        // a ring reaching BELOW the anchor's numbering base resolves + CLSAG
+        // runs, and a below-base double-spend is caught. The snapshot is trusted
+        // only insofar as it re-derives to the roots the anchor committed
+        // (ChainOutputSet::seed_from_snapshot fails closed otherwise). Wired
+        // BEFORE the block stream, exactly like reset_base above.
+        {
+            const AnchorBundle* ab = boot_.anchor();
+            if (!cfg_.output_set_path.empty()) {
+                if (!ab || !ab->has_output_set()) {
+                    why = "--native-output-set was given but the node did not boot from a "
+                          "format-2 anchor (nothing to verify the snapshot against)";
+                    return false;
+                }
+                std::ifstream f(cfg_.output_set_path, std::ios::binary);
+                if (!f) {
+                    why = "cannot open output-set snapshot '" + cfg_.output_set_path + "'";
+                    return false;
+                }
+                const std::string blob((std::istreambuf_iterator<char>(f)),
+                                       std::istreambuf_iterator<char>());
+                std::string seed_why;
+                if (!outputs_.seed_from_snapshot(blob, *ab, seed_why)) {
+                    why = "output-set snapshot rejected: " + seed_why;
+                    return false;
+                }
+                const std::string line =
+                    "[output-set] seeded from format-2 anchor snapshot: base="
+                    + std::to_string(outputs_.first_output_index()) + " frontier="
+                    + std::to_string(outputs_.frontier()) + " outputs="
+                    + std::to_string(outputs_.output_count()) + " spent="
+                    + std::to_string(outputs_.spent_count())
+                    + " -- pre-anchor rings now RESOLVE";
+                note_(line);
+                std::fprintf(stderr, "%s\n", line.c_str());
+            } else if (ab && ab->has_output_set()) {
+                const std::string line =
+                    "[output-set] format-2 anchor loaded WITHOUT --native-output-set: "
+                    "pre-anchor rings remain RingUnresolved until O-backfill";
+                note_(line);
+                std::fprintf(stderr, "%s\n", line.c_str());
+            } else if (cfg_.boot == BootMode::Anchor) {
+                // FORMAT-1 anchor (no committed set, so no rct_output_count): the
+                // real output numbering base is UNKNOWN. Numbering post-anchor
+                // outputs from base=0 would misnumber an honest ring reaching
+                // below the real base -- it would resolve to the WRONG post-anchor
+                // output and be scored a forged ring (RingSigFail, a drop offence
+                // against an honest peer). Fail closed: disable ring resolution so
+                // every ring is RingUnresolved and no honest peer is mis-scored.
+                // (The spent-key-image view still advances from connected blocks.)
+                outputs_.disable_resolution();
+                const std::string line =
+                    "[output-set] format-1 anchor (no committed set): ring resolution "
+                    "DISABLED -- all rings RingUnresolved (fail-closed) until O-backfill";
+                note_(line);
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
+        }
+
         txpool_.set_input_consensus_sources(&outputs_, &outputs_);
 
         index_.subscribe_txs([this](const BlockTxEvent& ev) {

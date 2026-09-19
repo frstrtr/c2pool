@@ -550,11 +550,304 @@ static void test_select_policy() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PART D: format-2 O-BACKFILL -- seed the historical set from an anchor-committed
+// snapshot so a ring reaching BELOW the anchor's numbering base RESOLVES, its
+// membership proves against the committed root, and a below-base double-spend is
+// caught. Composes with PART B: PART B proves that ONCE an offset resolves to the
+// authentic member the CLSAG verifies (Accepted+InputConsensus) and a WRONG
+// member is RingSigFail; PART D proves the seed is what makes a below-base offset
+// resolve to that authentic member in the first place, and does so only when the
+// snapshot re-derives to the roots the anchor committed (fail-closed otherwise).
+// ---------------------------------------------------------------------------
+static BlockTxEvent blk(std::uint64_t height, std::uint64_t first_idx, const Hash& id,
+                        std::vector<std::pair<std::uint64_t, Hash>> cb,
+                        std::vector<OutputRecord> outs, std::vector<Hash> kis) {
+    BlockTxEvent e;
+    e.kind                    = BlockTxEvent::Kind::Connected;
+    e.height                  = height;
+    e.first_output_index      = first_idx;
+    e.block_id                = id;
+    e.coinbase_amount_pubkeys = std::move(cb);
+    e.coinbase_unlock_time    = height + 60;
+    e.outputs                 = std::move(outs);
+    e.key_images              = std::move(kis);
+    return e;
+}
+
+static AnchorBundle bundle_for(const ChainOutputSet& set, std::uint64_t height,
+                               const Hash& tip_id) {
+    AnchorBundle b;
+    b.network                = "regtest";
+    b.height                 = height;
+    b.id                     = tip_id;
+    b.rct_output_count       = set.frontier();
+    b.output_set_base_height = 1;
+    b.output_set_leaves      = set.output_leaf_count();
+    b.output_set_root        = set.output_root();
+    b.spent_set_leaves       = set.spent_leaf_count();
+    b.spent_set_root         = set.spent_root();
+    return b;
+}
+
+static void test_format2_seed() {
+    // Build a from-genesis set: blocks 1..H, each a v2 coinbase; block 3 also
+    // carries one non-coinbase output (the future "below-base ring member") and
+    // spends one key image (the future "below-base double-spend"). All of this is
+    // BELOW the anchor at height H.
+    const std::uint64_t H = 8;
+    const Hash member_pk = hash_byte(0x51);
+    const Hash spent_ki_below = hash_byte(0xE1);
+    OutputRecord member = rec(0x51, /*height=*/3);   // pubkey 0x51, commitment 0x51^0xff
+    std::uint64_t member_index = 0;
+    Hash tip_id{};
+
+    ChainOutputSet built(0);
+    for (std::uint64_t h = 1; h <= H; ++h) {
+        const Hash bid = hash_byte(static_cast<std::uint8_t>(0x90 + h));
+        const std::uint64_t before = built.frontier();
+        std::vector<std::pair<std::uint64_t, Hash>> cb = {{7, hash_byte(static_cast<std::uint8_t>(0x40 + h))}};
+        std::vector<OutputRecord> outs;
+        std::vector<Hash> kis;
+        if (h == 3) { outs.push_back(member); kis.push_back(spent_ki_below);
+                      member_index = before + 1; }   // coinbase is `before`, member next
+        check(built.on_block_connected(blk(h, before, bid, cb, outs, kis)),
+              "PART D: connect pre-anchor block");
+        tip_id = bid;
+    }
+    const std::uint64_t F = built.frontier();          // == rct_output_count
+    check(member_index != 0 && member_index < F, "PART D: member is a below-anchor index");
+
+    const std::string snapshot = built.serialize();
+    const AnchorBundle bnd = bundle_for(built, H, tip_id);
+    check(bnd.has_output_set(), "PART D: the anchor commits a set");
+
+    // (0) WITHOUT the seed (format-1 behaviour): base == rct_output_count, empty
+    //     set -> a below-base offset is UNRESOLVED and the spent view is blind.
+    {
+        ChainOutputSet node(0);
+        check(node.reset_base(F), "PART D: reset base to rct_output_count");
+        std::vector<OutputRecord> got;
+        check(!node.resolve(0, {member_index}, got), "PART D: below-base UNRESOLVED before seed");
+        check(!node.is_spent(spent_ki_below), "PART D: below-base key image invisible before seed");
+    }
+
+    // (1) WITH the seed: the below-base ring member RESOLVES to the AUTHENTIC
+    //     record, its membership PROVES against the committed root, and the
+    //     below-base key image is SPENT.
+    {
+        ChainOutputSet node(0);
+        check(node.reset_base(F), "PART D: reset base before seed");
+        std::string why;
+        checkf(node.seed_from_snapshot(snapshot, bnd, why),
+               "PART D: seed_from_snapshot accepts a matching snapshot: %s", why.c_str());
+        check(node.first_output_index() == 0 && node.frontier() == F,
+              "PART D: seeded base is 0 and frontier == rct_output_count");
+
+        std::vector<OutputRecord> got;
+        check(node.resolve(0, {member_index}, got) && got.size() == 1,
+              "PART D (a): below-base ring member RESOLVES after seed");
+        check(got.size() == 1 && got[0].pubkey == member_pk
+                  && got[0].commitment == member.commitment,
+              "PART D (a): resolves to the AUTHENTIC member (so a wrong member is RingSigFail, PART B)");
+        check(node.verify_member(member_index),
+              "PART D (a): membership proof verifies against the committed output root");
+        check(!node.verify_member(F + 100), "PART D: an index beyond the frontier does not prove");
+
+        check(node.is_spent(spent_ki_below),
+              "PART D (c): below-base key image is SPENT from the seeded set (double-spend caught)");
+        check(!node.is_spent(hash_byte(0xEE)), "PART D: an unseen key image is not spent");
+    }
+
+    // (2) FAIL-CLOSED. The anchor's committed roots -- not the blob -- are the
+    //     trust, so every mismatch is refused and leaves the set empty.
+    auto rejects = [&](const AnchorBundle& b, const std::string& blob, const char* what) {
+        ChainOutputSet node(0);
+        (void)node.reset_base(b.rct_output_count);
+        std::string why;
+        const bool ok = node.seed_from_snapshot(blob, b, why);
+        checkf(!ok, "PART D fail-closed: %s is rejected", what);
+        checkf(!ok && !why.empty(), "PART D fail-closed: %s says why", what);
+        std::vector<OutputRecord> got;
+        check(!node.resolve(0, {member_index}, got),
+              "PART D fail-closed: a rejected seed leaves the set unresolved");
+    };
+    { AnchorBundle b = bnd; b.output_set_root[0] ^= 0x01; rejects(b, snapshot, "a flipped output root"); }
+    { AnchorBundle b = bnd; b.spent_set_root[0] ^= 0x01;  rejects(b, snapshot, "a flipped spent root"); }
+    { AnchorBundle b = bnd; b.rct_output_count += 1;      rejects(b, snapshot, "a wrong rct_output_count"); }
+    { AnchorBundle b = bnd; b.output_set_leaves += 1;     rejects(b, snapshot, "a wrong output leaf count"); }
+    { AnchorBundle b = bnd; b.id = hash_byte(0x01);       rejects(b, snapshot, "a wrong tip id"); }
+    { AnchorBundle b = bnd; b.height += 1;                rejects(b, snapshot, "a wrong tip height"); }
+    rejects(bnd, snapshot + "x", "a truncated/padded snapshot");
+    // A format-1 bundle (no committed set) cannot be seeded against.
+    { AnchorBundle b; b.height = H; b.id = tip_id; check(!b.has_output_set(), "PART D: format-1 has no set");
+      ChainOutputSet node(0); std::string why;
+      check(!node.seed_from_snapshot(snapshot, b, why), "PART D: refuse to seed against a format-1 anchor"); }
+
+    // (3) Seeding is boot-only: a non-empty set refuses a seed.
+    {
+        ChainOutputSet node(0);
+        node.on_block_connected(blk(1, 0, hash_byte(0x91), {{7, hash_byte(0x41)}}, {}, {}));
+        std::string why;
+        check(!node.seed_from_snapshot(snapshot, bnd, why), "PART D: a non-empty set refuses a seed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PART E: the cross-language pin. Builds a fixed synthetic two-block set (no
+// coinbase, so every commitment is explicit and no ed25519 is needed on either
+// side) and asserts its roots equal the values the Python generator's --selftest
+// computes with its ported MMR + leaf encoding. A drift between the two
+// implementations of the leaf/MMR discipline is a RED test here.
+// ---------------------------------------------------------------------------
+static OutputRecord rec_full(std::uint8_t pk, std::uint8_t cm,
+                             std::uint64_t unlock, std::uint64_t height) {
+    OutputRecord o;
+    o.pubkey      = hash_byte(pk);
+    o.commitment  = hash_byte(cm);
+    o.unlock_time = unlock;
+    o.height      = height;
+    return o;
+}
+static std::string hex32(const ChainOutputSet::bytes32& h) {
+    static const char* d = "0123456789abcdef";
+    std::string s; s.reserve(64);
+    for (std::uint8_t b : h) { s.push_back(d[b >> 4]); s.push_back(d[b & 0xf]); }
+    return s;
+}
+// The pinned roots, equal to tools/xmr-anchor-gen/xmr_anchor_gen.py --selftest.
+static const char* PIN_OUTPUT_ROOT = "4f8d4835a2788d17bdb6c06048a9fa12395f9b0945993553703db8a4e929d293";
+static const char* PIN_SPENT_ROOT  = "0fd7d87a83a87e7ccae7bb5bc8a6418f4dbf3f187c2bf29d3f1156426ce2af33";
+static void test_selftest_pin() {
+    ChainOutputSet s(0);
+    s.on_block_connected(blk(1, 0, hash_byte(0x91), {},
+        {rec_full(0x33, 0x44, 0, 1), rec_full(0x35, 0x46, 5, 1)}, {hash_byte(0xAA)}));
+    s.on_block_connected(blk(2, 2, hash_byte(0x92), {},
+        {rec_full(0x55, 0x66, 62, 2)}, {hash_byte(0xBB), hash_byte(0x0C)}));
+    const std::string out_root = hex32(s.output_root());
+    const std::string ki_root  = hex32(s.spent_root());
+    std::fprintf(stderr, "PART E output_root %s\n", out_root.c_str());
+    std::fprintf(stderr, "PART E spent_root  %s\n", ki_root.c_str());
+    checkf(out_root == PIN_OUTPUT_ROOT,
+           "PART E: output root pinned to the Python generator (%s)", out_root.c_str());
+    checkf(ki_root == PIN_SPENT_ROOT,
+           "PART E: spent root pinned to the Python generator (%s)", ki_root.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// PART F: FORMAT-1 anchor boot fail-closed. A format-1 AnchorBundle carries no
+// rct_output_count (anchor_self_check forces the six format-2 fields to zero), so
+// a node that seeds from it numbers post-anchor outputs from base=0. On the real
+// chain the honest ring's member sits BELOW the real (unknown) base; from base=0
+// that offset collides with a POST-anchor output, so WITHOUT a guard resolve()
+// returns the WRONG member and the CLSAG over it fails -- an honest ring is
+// RingSigFail'd and its peer scored a drop offender. The fix disables ring
+// resolution on a format-1 boot: resolve() returns false for every ring, so all
+// rings are RingUnresolved (fail-closed) and no honest peer is ever mis-scored.
+// A from-genesis / format-2 node (resolution enabled) keeps resolving and still
+// RingSigFails a genuinely forged ring -- the no-regression half.
+// ---------------------------------------------------------------------------
+static void test_format1_anchor_boot() {
+    using Reason = TxRelayVerdict::Reason;
+
+    // --- resolve()-level: the misnumbering the fix closes, and the guard. ---
+    {
+        // A format-1-booted node: base 0, five POST-anchor outputs connected
+        // (global indices 0..4). On the real chain the honest ring's member at
+        // global index 2 is a PRE-anchor output -- NOT one of these -- but with
+        // base=0 it collides with post-anchor output #2.
+        ChainOutputSet fmt1(/*first_output_index=*/0);   // format-1: base forced 0
+        for (std::uint64_t h = 1; h <= 5; ++h)
+            check(fmt1.on_block_connected(connected(
+                      h, fmt1.frontier(),
+                      {rec(static_cast<std::uint8_t>(0x60 + h), h)}, {})),
+                  "PART F: connect post-anchor block");
+        check(fmt1.frontier() == 5, "PART F: five post-anchor outputs, base 0");
+
+        std::vector<OutputRecord> got;
+        check(fmt1.resolution_enabled(), "PART F: resolution enabled by default");
+        // The bug in the raw structure: an honest below-base offset MIS-resolves
+        // to a post-anchor member (which is what would then be RingSigFail'd).
+        // Global index 2 is the output of block h=3 (pubkey 0x60+3), a POST-anchor
+        // output -- NOT the honest ring's real pre-anchor member.
+        check(fmt1.resolve(0, {2}, got) && got.size() == 1
+                  && got[0].pubkey == hash_byte(0x63),
+              "PART F: without the guard a below-base offset mis-resolves (the bug)");
+
+        // The FIX: a format-1 boot disables resolution -> every ring unresolved.
+        fmt1.disable_resolution();
+        check(!fmt1.resolution_enabled(), "PART F: resolution disabled after the fix");
+        check(!fmt1.resolve(0, {2}, got),
+              "PART F: honest below-base ring is RingUnresolved (not mis-resolved)");
+        check(!fmt1.resolve(0, {4}, got),
+              "PART F: an in-range post-anchor offset is also left unresolved (fail-closed)");
+
+        // Disabling resolution must NOT touch the spent-key-image view.
+        ChainOutputSet fmt1b(0);
+        fmt1b.disable_resolution();
+        check(fmt1b.on_block_connected(connected(1, 0, {}, {hash_byte(0xF7)})),
+              "PART F: a block still feeds the spent set with resolution disabled");
+        check(fmt1b.is_spent(hash_byte(0xF7)),
+              "PART F: is_spent still works when resolution is disabled");
+    }
+
+    // --- admission-level, driven with a REAL golden tx ----------------------
+    DecodedTx d;
+    const T::GoldenTx* gtx = first_decodable(d);
+    checkf(gtx != nullptr, "PART F: no decodable golden tx");
+    if (!gtx) return;
+    std::vector<std::uint8_t> blob = from_hex(gtx->full_hex);
+
+    // (a) FORMAT-1 boot: the real ChainOutputSet with resolution disabled is the
+    //     ring source. The honest golden tx's rings do NOT resolve, so the tx is
+    //     RingUnresolved -- admitted WITHOUT InputConsensus, NO RingSigFail, NO
+    //     drop offence. The honest peer is never scored.
+    {
+        ChainOutputSet fmt1(0);
+        fmt1.disable_resolution();          // the format-1 boot posture
+        RelayedTxPool pool;
+        pool.set_input_consensus_sources(&fmt1, &fmt1);
+        arm(pool);
+        auto v = pool.on_relayed(peer(), {blob}, true);
+        checkf(v.size() == 1 && v[0].reason == Reason::Accepted,
+               "PART F (a): format-1 honest ring Accepted (non-input only), got %s",
+               v.empty() ? "none" : to_string(v[0].reason));
+        if (!v.empty()) {
+            check(!has(v[0].evidence, AdmissionEvidence::InputConsensus),
+                  "PART F (a): InputConsensus NOT granted on a format-1 boot");
+            check(!v[0].drop_offense,
+                  "PART F (a): NO drop offence on a format-1 honest ring");
+        }
+        check(pool.stats().unresolved_ring == 1, "PART F (a): counted RingUnresolved");
+        check(pool.stats().rejected_ring_sig == 0, "PART F (a): NOTHING RingSigFail'd");
+    }
+
+    // (b) NO REGRESSION: a from-genesis / format-2 node (resolution enabled) that
+    //     resolves a ring to the WRONG members still RingSigFails it (a drop).
+    {
+        RelayedTxPool pool;
+        FakeRingSource src = source_for(*gtx, d, /*rotate=*/true);   // forged ring
+        pool.set_input_consensus_sources(&src, &src);
+        arm(pool);
+        auto v = pool.on_relayed(peer(), {blob}, true);
+        checkf(v.size() == 1 && v[0].reason == Reason::RingSigFail,
+               "PART F (b): forged ring still RingSigFail, got %s",
+               v.empty() ? "none" : to_string(v[0].reason));
+        if (!v.empty())
+            check(v[0].drop_offense, "PART F (b): a forged ring IS a drop offence");
+        check(pool.stats().rejected_ring_sig == 1,
+              "PART F (b): ring-sig counter incremented (no regression)");
+    }
+}
+
 int main() {
     test_output_set();
     test_output_mmr();
+    test_format2_seed();
+    test_selftest_pin();
     test_admission();
     test_select_policy();
+    test_format1_anchor_boot();
 
     if (g_fail == 0) {
         std::fprintf(stderr, "output-set + admission KAT: ALL %d checks passed\n",
