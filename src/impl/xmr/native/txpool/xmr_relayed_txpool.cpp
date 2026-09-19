@@ -197,6 +197,10 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     //    proofs, key-image domain. This is what makes a bad-VALUE transaction a
     //    rejection rather than a block the network throws away.
     AdmissionEvidence evidence = AdmissionEvidence::Structural;
+    // Set when the input-consensus leg could not resolve the ring (a member
+    // below the anchor / beyond the frontier). Persisted onto the pool entry so
+    // the select policy can exclude it -- the load-bearing half of the SPV fix.
+    bool ring_unresolved = false;
     if (cfg_.verify_non_input_consensus) {
         const rct::RctVerifyStatus vs = rct::verify_non_input_consensus(d.rct);
         if (vs != rct::RctVerifyStatus::Ok) {
@@ -309,9 +313,10 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
 
         if (unresolved) {
             // Fail-closed, but as a good citizen: the entry keeps its non-input
-            // evidence and never gains InputConsensus, so the select policy (if
-            // it requires InputConsensus) will not mine it, while a policy that
-            // does not can still relay it. No drop, no rejection counter.
+            // evidence and never gains InputConsensus, so the select policy
+            // (Exclude by default) will not mine it, while an Include policy can
+            // still relay it. No drop, no rejection counter.
+            ring_unresolved = true;
             ++stats_.unresolved_ring;
         } else {
             // 3) The ring signatures. One message per transaction (the pre-MLSAG
@@ -364,6 +369,7 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     e.peers.insert(from.peer_id);
     e.seen_fluff = fluff;
     e.evidence   = evidence;
+    e.ring_unresolved = ring_unresolved;
 
     insert_locked(std::move(e));
     ++stats_.accepted;
@@ -496,6 +502,17 @@ std::vector<node::TxBacklogEntry> RelayedTxPool::snapshot_locked(
 
     for (const auto& [id, e] : by_id_) {
         (void)id;
+        // The load-bearing exclusion: a ring we could not resolve carries no
+        // InputConsensus evidence, so under the default Exclude policy it is
+        // never selectable/mined -- a forged-ring tx (rejected outright when the
+        // ring resolves, unresolved when it does not) can never reach a block.
+        // Counted so an empty-because-unverifiable block is distinguishable from
+        // an empty pool. A resolvable honest ring is verified at admission and
+        // is never ring_unresolved, so good-citizen selection is preserved.
+        if (e.ring_unresolved && p.unresolved_rings == UnresolvedRingPolicy::Exclude) {
+            ++stats_.excluded_unresolved;
+            continue;
+        }
         if (!covers(e.evidence, p.required)) continue;
         if (e.seen_from_peers() < p.min_peers) continue;
         if (!e.seen_fluff && !p.allow_stem) continue;
@@ -677,6 +694,7 @@ std::vector<TxpoolFact> RelayedTxPool::facts() const {
         f.evidence      = e.evidence;
         f.peers         = e.seen_from_peers();
         f.time_received = e.time_received;
+        f.ring_unresolved = e.ring_unresolved;
         out.push_back(f);
     }
     return out;
