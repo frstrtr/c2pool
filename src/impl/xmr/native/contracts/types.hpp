@@ -197,6 +197,19 @@ struct TemplateInputs {
     }
 };
 
+// --- global output record ----------------------------------------------------
+// One global RCT output, in monerod's amount-0 output-table order. `height` and
+// `unlock_time` decide the spend-time / spendable-age rules; `pubkey`/
+// `commitment` are a ring member's (dest, mask). Defined here (not in
+// outputs.hpp) because BlockTxEvent carries a vector of them; the interfaces
+// that consume it live in contracts/outputs.hpp.
+struct OutputRecord {
+    Hash          pubkey{};       // one-time output public key (dest)
+    Hash          commitment{};   // amount commitment C (mask)
+    std::uint64_t unlock_time = 0;
+    std::uint64_t height      = 0;   // block height the output was created in
+};
+
 // --- per-block transaction events -------------------------------------------
 // Emitted by C2 alongside MainchainEvent; consumed by C3 (drop mined ids, evict
 // key-image conflicts, return disconnected bodies to the pool).
@@ -220,6 +233,16 @@ struct BlockTxEvent {
 
     std::vector<std::vector<std::uint8_t>> tx_blobs;  // Disconnected, BEST EFFORT
     bool tx_blobs_complete = false;                   // see the note above
+
+    // INPUT-consensus feed (Connected only). The block's RCT outputs in
+    // monerod's GLOBAL-INDEX order -- coinbase output(s) first, then each
+    // non-coinbase tx's outputs in block order -- so a downstream output set can
+    // number them from `first_output_index`. `first_output_index` is the global
+    // amount-0 RCT output count BEFORE this block (0 on a regtest chain synced
+    // from genesis; the anchor's rct_output_count for the first post-anchor
+    // block). Empty/zero when the producer did not capture outputs.
+    std::vector<OutputRecord> outputs;
+    std::uint64_t             first_output_index = 0;
 };
 
 // --- index / sync telemetry --------------------------------------------------

@@ -55,6 +55,16 @@ enum class AdmissionEvidence : std::uint8_t {
     // daemon is armed, unobtainable once the daemon is demoted (M5), which is
     // exactly why it cannot be a rung on a ladder with the other three.
     DaemonConfirmed   = 1u << 3,
+    // INPUT consensus passed: every CLSAG ring signature verified against ring
+    // members resolved from the connected chain, and no key image is already
+    // spent on that chain, and every member is unlocked and old enough. This is
+    // the leg that needs the global output set (contracts/outputs.hpp
+    // IRingMemberSource / ISpentKeyImageView); it turns a non-input-only "bad
+    // value is rejected" into a full "a forged-ring or on-chain-double-spent
+    // transaction is rejected". Obtainable only where the ring source's window
+    // covers the ring (regtest-from-genesis, a mainnet ring above the anchor,
+    // or a daemon-assisted get_outs).
+    InputConsensus    = 1u << 4,
 };
 
 inline constexpr AdmissionEvidence operator|(AdmissionEvidence a, AdmissionEvidence b) noexcept {
@@ -100,6 +110,17 @@ struct TxRelayVerdict {
         ProofFail,
         PoolFull,
         NotSynced,
+        // INPUT-consensus refusals (need the resolved ring / chain spent set).
+        RingSigFail,       // a CLSAG did not verify over its ring members
+                           //   (monerod m_invalid_input) -- a drop offence.
+        KeyImageSpent,     // a key image is already spent ON THE CHAIN
+                           //   (monerod m_double_spend vs the chain) -- no drop,
+                           //   distinct from the pool-local KeyImageConflict.
+        RingUnresolved,    // a ring member is not in our output set and no
+                           //   daemon was asked -- fail-closed, never admitted
+                           //   with InputConsensus. No drop.
+        RingMemberLocked,  // a ring member is not yet unlocked / younger than
+                           //   the spendable age. No drop.
     };
 
     Reason reason = Reason::Accepted;
@@ -127,6 +148,10 @@ inline const char* to_string(TxRelayVerdict::Reason r) noexcept {
         case TxRelayVerdict::Reason::ProofFail:        return "ProofFail";
         case TxRelayVerdict::Reason::PoolFull:         return "PoolFull";
         case TxRelayVerdict::Reason::NotSynced:        return "NotSynced";
+        case TxRelayVerdict::Reason::RingSigFail:      return "RingSigFail";
+        case TxRelayVerdict::Reason::KeyImageSpent:    return "KeyImageSpent";
+        case TxRelayVerdict::Reason::RingUnresolved:   return "RingUnresolved";
+        case TxRelayVerdict::Reason::RingMemberLocked: return "RingMemberLocked";
     }
     return "?";
 }
