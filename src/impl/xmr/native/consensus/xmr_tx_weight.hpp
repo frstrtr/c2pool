@@ -156,8 +156,13 @@ struct TxWeightInfo {
     // key-offsets and the output public keys to resolve the ring and to number
     // the output set; the pruned chain-sync weight path never asks, so it
     // allocates nothing.
-    std::vector<std::vector<std::uint64_t>> key_offsets;  // relative, per input
-    std::vector<KeyImage>                   out_pubkeys;  // one per output
+    std::vector<std::vector<std::uint64_t>> key_offsets;    // relative, per input
+    std::vector<KeyImage>                   out_pubkeys;    // one per output
+    // Amount commitments (outPk masks) captured from the rct BASE, one per
+    // output, in output order -- the (mask) half of a ring member's CtKey. The
+    // pruned-sync weight path never asks for these; the input-consensus relay
+    // decoder and the producer output-capture path do (`capture`).
+    std::vector<KeyImage>                   out_commitments;  // one per output (rct base)
 
     std::size_t   extra_size = 0;
     std::uint8_t  rct_type   = RCT_TYPE_NULL;
@@ -367,7 +372,7 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
 }
 
 // type, txnFee, [pseudoOuts for RCTTypeSimple], ecdhInfo[], outPk[].
-inline TxParseStatus parse_rct_base(BlobReader& r, TxWeightInfo& info) {
+inline TxParseStatus parse_rct_base(BlobReader& r, TxWeightInfo& info, bool capture = false) {
     BlobReader::DepthGuard g(r);
     if (!g.entered()) return TxParseStatus::Malformed;
 
@@ -394,8 +399,21 @@ inline TxParseStatus parse_rct_base(BlobReader& r, TxWeightInfo& info) {
              || info.rct_type == RCT_TYPE_BULLETPROOF_PLUS) ? 8u : 64u;
     if (!r.skip(ecdh * info.n_outputs)) return TxParseStatus::Truncated;
 
-    // outPk: one commitment mask per output.
-    if (!r.skip(32 * info.n_outputs)) return TxParseStatus::Truncated;
+    // outPk: one commitment mask per output. When capturing, copy each 32-byte
+    // mask (the (C) half of a ring member's CtKey) rather than skip it; this is
+    // exactly what monerod stores as output_data_t.commitment for a non-coinbase
+    // RCT output, so a ring numbered against it verifies its CLSAG unchanged.
+    if (capture) {
+        if (info.out_commitments.capacity() < info.n_outputs)
+            info.out_commitments.reserve(info.n_outputs);
+        for (std::size_t i = 0; i < info.n_outputs; ++i) {
+            KeyImage c{};
+            if (!r.read_key(c)) return TxParseStatus::Truncated;
+            info.out_commitments.push_back(c);
+        }
+    } else {
+        if (!r.skip(32 * info.n_outputs)) return TxParseStatus::Truncated;
+    }
 
     info.rct_base_size = r.offset() - begin;
     return TxParseStatus::Ok;
@@ -416,15 +434,15 @@ inline void finish(TxWeightInfo& info) {
 // GET_OBJECTS with prune=true) and RECONSTRUCT the prunable length, so the
 // weight is known without ever seeing the ring signatures.
 inline TxParseStatus parse_tx_pruned(const std::uint8_t* data, std::size_t size,
-                                     TxWeightInfo& info) {
+                                     TxWeightInfo& info, bool capture = false) {
     info = TxWeightInfo{};
     BlobReader r(data, size);
 
-    TxParseStatus st = detail::parse_tx_prefix(r, info);
+    TxParseStatus st = detail::parse_tx_prefix(r, info, capture);
     if (st != TxParseStatus::Ok) return st;
 
     if (info.version >= 2) {
-        st = detail::parse_rct_base(r, info);
+        st = detail::parse_rct_base(r, info, capture);
         if (st != TxParseStatus::Ok) return st;
     }
 
@@ -448,8 +466,8 @@ inline TxParseStatus parse_tx_pruned(const std::uint8_t* data, std::size_t size,
 }
 
 inline TxParseStatus parse_tx_pruned(const std::vector<std::uint8_t>& blob,
-                                     TxWeightInfo& info) {
-    return parse_tx_pruned(blob.data(), blob.size(), info);
+                                     TxWeightInfo& info, bool capture = false) {
+    return parse_tx_pruned(blob.data(), blob.size(), info, capture);
 }
 
 // Parse a FULL transaction blob. The prunable part is MEASURED (everything the
@@ -467,7 +485,7 @@ inline TxParseStatus parse_tx_full(const std::uint8_t* data, std::size_t size,
     if (st != TxParseStatus::Ok) return st;
 
     if (info.version >= 2) {
-        st = detail::parse_rct_base(r, info);
+        st = detail::parse_rct_base(r, info, capture);
         if (st != TxParseStatus::Ok) return st;
 
         if (info.rct_type != RCT_TYPE_NULL
