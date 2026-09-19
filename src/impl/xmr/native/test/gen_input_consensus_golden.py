@@ -40,7 +40,12 @@ def _post(url, path, body_obj):
                 return json.loads(r.read())
         except Exception as e:            # noqa: BLE001 -- retry any transport error
             last = e
-    raise last
+    # Always raise a concrete Exception instance: `last` is Optional and CodeQL
+    # (py/illegal-raise) cannot prove the loop assigned it, so re-wrap rather
+    # than `raise last` (which would raise None on the unreachable empty-loop
+    # path). RuntimeError chains the last transport error for the operator.
+    raise RuntimeError(
+        "POST %s%s failed after 5 attempts: %r" % (url, path, last)) from last
 
 def rpc_json(url, method, params):
     return _post(url, "/json_rpc",
