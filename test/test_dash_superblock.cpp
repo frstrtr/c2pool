@@ -1131,3 +1131,105 @@ TEST(DashSuperblock, DesyncCheckDoesNotFireOffSuperblockHeights) {
     EXPECT_EQ(m.gov_store().trigger_count(), 1u) << "no pruning off-cycle";
     EXPECT_TRUE(m.superblock_schedule(SBH).has_value());
 }
+
+// ── MAINNET live superblock 2542248 — DERIVATION KAT (not comparison) ────────
+// Observed from dashd v230107 (winning trigger 0db58cd0, AbsoluteYesCount 3134):
+// 15 payees, total 6810.00000000 DASH = 681000000000 duffs, mixed P2PKH+P2SH,
+// repeated addresses, order-sensitive. This test proves c2pool DERIVES the
+// superblock from state: (1) the scriptPubKeys from the addresses (byte-exact vs
+// dashd validateaddress), (2) WHICH trigger wins by weighted-yes tally, and it is
+// falsifiable — flipping the tally changes the selected winner.
+TEST(DashSuperblock, MainnetSuperblock2542248DerivedAndSelected) {
+    const std::string addrs =
+        "XogmURyyvkE8DXdhZGUd1qgYwgvwZ8WCxR|XjRx5Xj9G4kE4gvLT6GQKmvWMrtGPtUjkS|"
+        "XoLMVTXpDWvLe4yKcj989nZ2vddE2zJQ6q|XjdnZBUedF4q8EzgWWAGsZrHteEgEUybbo|"
+        "XotUg4YUzzRNhXhC4tvg72d8guh2Sg6WJJ|XeACkWmBosZSxPYNH8YTfQurKXuGNGv9B8|"
+        "Xebhp13RsUPU8sqzAPiurHUh1kGCJ7zabs|7mUyau75ATy1c6LoZeG3D57jKBkR4iHJkE|"
+        "Xx1DY36sQjrmvRTPw7kyTZ9Xg9dyVp3h7C|XjRx5Xj9G4kE4gvLT6GQKmvWMrtGPtUjkS|"
+        "Xhf1d5nmRreWC3YkvQXWswFbPdpGyU6rRB|XvQMESjyfJEW2hsSXNRvbXwBVizZgdNXkw|"
+        "7mUyau75ATy1c6LoZeG3D57jKBkR4iHJkE|XykqpKJsXDCENcqXpm8iAeAwbHqNoezQ3C|"
+        "XogmURyyvkE8DXdhZGUd1qgYwgvwZ8WCxR";
+    const std::string amts =
+        "200.00000000|530.00000000|60.00000000|100.00000000|200.00000000|"
+        "60.00000000|200.00000000|4832.00000000|45.00000000|200.00000000|"
+        "1.00000000|32.00000000|200.00000000|100.00000000|50.00000000";
+    std::string props;
+    for (int i = 0; i < 15; ++i) props += (i ? "|" : "") + std::string(kPropHash);
+
+    // (1) DERIVE scripts+amounts from the trigger (mainnet => testnet=false).
+    auto trig = parse_superblock_trigger(
+        trigger_json(2542248, addrs, amts, props), hash_of(0xDB58), /*testnet=*/false);
+    ASSERT_TRUE(trig.has_value());
+    EXPECT_EQ(trig->event_block_height, 2542248);
+    ASSERT_EQ(trig->payments.size(), 15u);
+    const char* exp_script[15] = {
+        "76a9148e95ff1957118b3209f4b40b8e63f5bc42edd5bb88ac",  // XogmU  200
+        "76a9145fe81b4ddaafdffbd6f70cdb7464b9567e15301d88ac",  // XjRx5  530
+        "76a9148ab9a867903e835e86d0e4f417d968c5c78fa7ba88ac",  // XoLMV   60
+        "76a914622526095b3f27d9b8f7a6f975956d9a63586a9c88ac",  // XjdnZ  100
+        "76a91490ccf6eb1b5c26c28b6cd5640d4c97e4b89db3aa88ac",  // XotUg  200
+        "76a914261511ed18435168874a24bb32768fc7d77a14bb88ac",  // XeACk   60
+        "76a9142ae7ba2caf2a0578aa1b4ee9431dcaac2c56805388ac",  // Xebhp  200
+        "a914d13bc5c4b8ca8073d08e12baf57690d3eebc6f7987",      // 7mUya P2SH 4832
+        "76a914e9d43ee3ac25faf34f1776f1d1e23e6ea28543ac88ac",  // Xx1DY   45
+        "76a9145fe81b4ddaafdffbd6f70cdb7464b9567e15301d88ac",  // XjRx5  200 (repeat)
+        "76a9144c7038928ca5ad481a348a4dc74270026f82568c88ac",  // Xhf1d    1
+        "76a914d843fc6fdfd071c2fab8b94dcd8143cec67dcb1788ac",  // XvQME   32
+        "a914d13bc5c4b8ca8073d08e12baf57690d3eebc6f7987",      // 7mUya P2SH 200 (repeat)
+        "76a914fd0c8b1b8361a389bdcd96359fb84d64bf480f0088ac",  // Xykqp  100
+        "76a9148e95ff1957118b3209f4b40b8e63f5bc42edd5bb88ac",  // XogmU   50 (repeat)
+    };
+    const int64_t exp_amount[15] = {
+        20000000000LL, 53000000000LL, 6000000000LL, 10000000000LL, 20000000000LL,
+        6000000000LL, 20000000000LL, 483200000000LL, 4500000000LL, 20000000000LL,
+        100000000LL, 3200000000LL, 20000000000LL, 10000000000LL, 5000000000LL,
+    };
+    auto hx = [](const char* h) {
+        auto nyb = [](char c) { return (c <= '9') ? (c - '0') : ((c | 0x20) - 'a' + 10); };
+        std::vector<uint8_t> v;
+        for (size_t i = 0; h[i] && h[i + 1]; i += 2)
+            v.push_back(static_cast<uint8_t>((nyb(h[i]) << 4) | nyb(h[i + 1])));
+        return v;
+    };
+    for (size_t i = 0; i < 15; ++i) {
+        EXPECT_EQ(trig->payments[i].script, hx(exp_script[i])) << "payee " << i;
+        EXPECT_EQ(trig->payments[i].amount, exp_amount[i]) << "payee " << i;
+    }
+    EXPECT_EQ(trig->total_amount(), 681000000000LL);  // 6810.0 DASH
+
+    // (2) DERIVE the winning trigger by weighted-yes tally: the real trigger beats
+    //     a synthetic competitor at the SAME height with FEWER yes votes.
+    auto other = parse_superblock_trigger(
+        trigger_json(2542248, "XjRx5Xj9G4kE4gvLT6GQKmvWMrtGPtUjkS", "1.00000000", kPropHash),
+        hash_of(0x4553), /*testnet=*/false);
+    ASSERT_TRUE(other.has_value());
+    GovernanceStore store;
+    store.set_funding_threshold(2);
+    store.set_vote_weight_fn(weight_all_regular);
+    ASSERT_TRUE(store.add_trigger(*trig));
+    ASSERT_TRUE(store.add_trigger(*other));
+    for (int i = 0; i < 9; ++i)
+        store.add_verified_funding_vote(hash_of(0xDB58), "mn-real-" + std::to_string(i), VOTE_OUTCOME_YES, i);
+    for (int i = 0; i < 3; ++i)
+        store.add_verified_funding_vote(hash_of(0x4553), "mn-other-" + std::to_string(i), VOTE_OUTCOME_YES, i);
+    auto best = store.get_best_superblock(2542248);
+    ASSERT_TRUE(best.has_value());
+    EXPECT_EQ(best->object_hash, hash_of(0xDB58));       // selected the REAL winner
+    EXPECT_EQ(best->payments.size(), 15u);
+    EXPECT_EQ(best->total_amount(), 681000000000LL);
+
+    // (4) FALSIFIABILITY: flip the tally so the competitor wins -> selection changes.
+    //     Proves (2) tests derivation, not a hardcoded answer.
+    GovernanceStore flip;
+    flip.set_funding_threshold(2);
+    flip.set_vote_weight_fn(weight_all_regular);
+    ASSERT_TRUE(flip.add_trigger(*trig));
+    ASSERT_TRUE(flip.add_trigger(*other));
+    for (int i = 0; i < 2; ++i)
+        flip.add_verified_funding_vote(hash_of(0xDB58), "r" + std::to_string(i), VOTE_OUTCOME_YES, i);
+    for (int i = 0; i < 9; ++i)
+        flip.add_verified_funding_vote(hash_of(0x4553), "o" + std::to_string(i), VOTE_OUTCOME_YES, i);
+    auto flipbest = flip.get_best_superblock(2542248);
+    ASSERT_TRUE(flipbest.has_value());
+    EXPECT_EQ(flipbest->object_hash, hash_of(0x4553));   // winner changed with the tally
+}
