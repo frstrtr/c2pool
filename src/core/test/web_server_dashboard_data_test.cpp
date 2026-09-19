@@ -1314,3 +1314,104 @@ TEST(NodeInfoRuntimeEndpoint, ExternalIpAndP2pPortSurfaced) {
     EXPECT_EQ(after.value("external_ip", std::string{}), "158.220.92.171");
     EXPECT_EQ(after.value("p2p_port", -1), 9337);
 }
+
+// ── #940 D-EMB.940: coin-P2P dial-failure visibility ────────────────────────
+//
+// The root daemonless-DASH blocker: when the embedded coin arm cannot dial ANY
+// Dash peer, the node used to look healthy with an empty state -- dial failure
+// dead-ended in the peer scorer and reached NO status surface. These KATs pin
+// the three-way distinction the fix introduces on /local_stats and /v36_status:
+//   * dial_failing (0 reachable peers + dial failures)  -> LOUD banner, ALWAYS
+//     on (even with no work update, i.e. m_last_work_update_time == 0 -- the
+//     exact fresh-node state the old tip-stall gate could never catch);
+//   * connected    (>=1 handshaked peer, view may be empty) -> NO banner;
+//   * idle         (no dials attempted yet)                 -> NO banner.
+// Silent degradation to zero is no longer possible.
+namespace {
+bool has_warning_substr(const nlohmann::json& stats, const std::string& needle)
+{
+    if (!stats.contains("warnings") || !stats["warnings"].is_array()) return false;
+    for (const auto& w : stats["warnings"])
+        if (w.is_string() && w.get<std::string>().find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+void wire_coin_p2p(MiningInterface& mi, const std::string& state,
+                   bool reachable, int connected, uint64_t dial_failures)
+{
+    mi.set_coin_sync_status_fn([=]() {
+        nlohmann::json s = nlohmann::json::object();
+        s["peers"] = nlohmann::json::array();
+        s["connected_peers"] = connected;
+        s["coin_p2p"] = {
+            {"state", state},
+            {"network_reachable", reachable},
+            {"connected_peers", connected},
+            {"handshaked_peers", reachable ? connected : 0},
+            {"dialing", 0},
+            {"dial_failures", dial_failures},
+            {"last_dial_failed_unix", dial_failures > 0 ? 1758056400 : 0},
+            {"last_dial_ok_unix", reachable ? 1758056400 : 0},
+        };
+        return s;
+    });
+}
+} // namespace
+
+TEST(CoinP2pDialVisibility, DialFailingSurfacesWithoutAnyWorkUpdate) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    // NO work update / template is wired: m_last_work_update_time stays 0, the
+    // state the old tip-stall-gated warning could never surface.
+    wire_coin_p2p(mi, "dial_failing", /*reachable=*/false,
+                  /*connected=*/0, /*dial_failures=*/7);
+
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("coin_p2p"));
+    EXPECT_EQ(stats["coin_p2p"].value("state", std::string{}), "dial_failing");
+    EXPECT_EQ(stats["coin_p2p"].value("connected_peers", -1), 0);
+    EXPECT_EQ(stats["coin_p2p"].value("dial_failures", -1), 7);
+    EXPECT_FALSE(stats["coin_p2p"].value("network_reachable", true));
+    EXPECT_TRUE(has_warning_substr(stats, "DIAL FAILING"))
+        << "dial failure must be a LOUD, always-on banner";
+}
+
+TEST(CoinP2pDialVisibility, ConnectedButEmptyIsDistinctAndSilent) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_coin_p2p(mi, "connected", /*reachable=*/true,
+                  /*connected=*/3, /*dial_failures=*/0);
+
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("coin_p2p"));
+    EXPECT_EQ(stats["coin_p2p"].value("state", std::string{}), "connected");
+    EXPECT_TRUE(stats["coin_p2p"].value("network_reachable", false));
+    // connected-but-empty is NOT a dial failure -> no banner. This is the
+    // distinction #940 acceptance requires.
+    EXPECT_FALSE(has_warning_substr(stats, "DIAL FAILING"));
+}
+
+TEST(CoinP2pDialVisibility, IdleNeverDialedIsDistinctAndSilent) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_coin_p2p(mi, "idle", /*reachable=*/false,
+                  /*connected=*/0, /*dial_failures=*/0);
+
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("coin_p2p"));
+    EXPECT_EQ(stats["coin_p2p"].value("state", std::string{}), "idle");
+    // No dials attempted -> no failure -> no banner (distinct from dial_failing).
+    EXPECT_FALSE(has_warning_substr(stats, "DIAL FAILING"));
+}
+
+TEST(CoinP2pDialVisibility, V36StatusCarriesDialState) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_coin_p2p(mi, "dial_failing", /*reachable=*/false,
+                  /*connected=*/0, /*dial_failures=*/4);
+
+    auto v36 = mi.rest_v36_status();
+    ASSERT_TRUE(v36.contains("coin_p2p"));
+    EXPECT_EQ(v36["coin_p2p"].value("state", std::string{}), "dial_failing");
+    EXPECT_EQ(v36["coin_p2p"].value("dial_failures", -1), 4);
+}
