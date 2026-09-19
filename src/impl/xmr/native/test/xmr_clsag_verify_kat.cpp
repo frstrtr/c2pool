@@ -37,10 +37,20 @@
 //   -> BadKeyImage; a ring one member short -> ShapeMismatch. Without this half
 //   the positive half would pass against a verifier that returned Ok always.
 //
-// A real monerod rejects the same forged transactions (m_invalid_input); the
-// generator's --replay path documents how to reproduce that verdict against any
-// restricted public v0.18 node. What is committed here is our verifier's own
-// verdict on real signatures and on mutations of them, third-party checkable.
+// A real monerod rejects the same forged transactions (m_invalid_input). There
+// is NO generator flag for that: gen_input_consensus_golden.py takes only
+// --blocks / --height / --max-txs and emits the resolved-ring goldens this KAT
+// checks our verifier against (an earlier version of this comment named a
+// "--replay path" that never existed -- corrected here). Monerod's OWN rejection
+// of the same forged bytes is reproduced out of band by POSTing each mutated
+// blob to a node's /send_raw_transaction with do_not_relay=true and observing
+// status=Failed with invalid_input=true (and double_spend=true for a mutant of
+// an already-mined tx). That procedure, and the from-genesis regtest
+// submit_block parity it belongs to, is what the input-consensus regtest rig
+// drives; committing a cleaned in-tree, option-gated port of it (loud SKIP
+// without a daemon) is tracked as a follow-up. What is committed HERE is only
+// our verifier's own verdict on real signatures and on mutations of them,
+// third-party checkable against any monerod by regenerating the goldens.
 // ---------------------------------------------------------------------------
 
 #include <cstdarg>
