@@ -396,9 +396,12 @@ public:
         // double-spends against `outputs_`. Wire it before the block stream can
         // feed anything, so the very first connected block's key images land in
         // the spent set the pool consults. On a genesis / regtest chain the set
-        // numbers from 0 and is complete; on an anchor boot it numbers from the
-        // anchor's rct_output_count and the honest below-anchor gap applies (a
-        // ring reaching below the anchor is RingUnresolved, never mis-admitted).
+        // numbers from 0 and is complete. On a FORMAT-2 anchor boot it numbers
+        // from the anchor's real rct_output_count and the honest below-anchor gap
+        // applies (a ring reaching below the anchor is RingUnresolved, never
+        // mis-admitted). On a FORMAT-1 anchor boot the bundle carries no
+        // rct_output_count, so the real base is unknown and resolution is disabled
+        // below (all rings RingUnresolved) rather than mis-numbered from 0.
         //
         // Seed the numbering base from whatever boot resolved before any block
         // feeds the set (a no-op reseat on the empty set): 0 on genesis /
@@ -448,6 +451,21 @@ public:
                 const std::string line =
                     "[output-set] format-2 anchor loaded WITHOUT --native-output-set: "
                     "pre-anchor rings remain RingUnresolved until O-backfill";
+                note_(line);
+                std::fprintf(stderr, "%s\n", line.c_str());
+            } else if (cfg_.boot == BootMode::Anchor) {
+                // FORMAT-1 anchor (no committed set, so no rct_output_count): the
+                // real output numbering base is UNKNOWN. Numbering post-anchor
+                // outputs from base=0 would misnumber an honest ring reaching
+                // below the real base -- it would resolve to the WRONG post-anchor
+                // output and be scored a forged ring (RingSigFail, a drop offence
+                // against an honest peer). Fail closed: disable ring resolution so
+                // every ring is RingUnresolved and no honest peer is mis-scored.
+                // (The spent-key-image view still advances from connected blocks.)
+                outputs_.disable_resolution();
+                const std::string line =
+                    "[output-set] format-1 anchor (no committed set): ring resolution "
+                    "DISABLED -- all rings RingUnresolved (fail-closed) until O-backfill";
                 note_(line);
                 std::fprintf(stderr, "%s\n", line.c_str());
             }

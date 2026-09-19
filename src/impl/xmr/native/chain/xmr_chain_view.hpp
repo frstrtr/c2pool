@@ -66,8 +66,15 @@ public:
         state_.seed_from_anchor(b, timestamps_60);
         for (const auto& s : b.seed_ids) seed_ids_[s.first] = s.second;
         // The output numbering base: the anchor's global amount-0 output count.
-        // Zero when the anchor carries none (format-1 bundle) -- see the output
-        // set's fail-closed rule (a ring below the base is RingUnresolved).
+        // A FORMAT-2 bundle carries the real count, and the output set fails a
+        // ring below that base closed (RingUnresolved). A FORMAT-1 bundle carries
+        // none, so this is 0 -- but the chain's real count at H_a is not, and
+        // numbering post-anchor outputs from 0 would MISNUMBER an honest ring
+        // reaching below the real base. The node cannot number from 0 safely, so
+        // it disables ring resolution entirely on a format-1 boot
+        // (ChainOutputSet::disable_resolution, wired in xmr_native_node.hpp) --
+        // every ring stays RingUnresolved, fail-closed, and no honest peer is
+        // scored an offender.
         rct_output_counter_ = b.rct_output_count;
         index_tip_();
     }
