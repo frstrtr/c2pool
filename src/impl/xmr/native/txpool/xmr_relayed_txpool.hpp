@@ -169,6 +169,10 @@ struct RelayedTx {
     bool seen_fluff  = false;          // any sighting outside the stem phase
 
     AdmissionEvidence evidence = AdmissionEvidence::None;
+    // The ring could not be resolved against the output set at admission (a
+    // member below the anchor / beyond the frontier), so no InputConsensus
+    // evidence was obtainable. The select policy excludes these by default.
+    bool ring_unresolved = false;
 
     std::uint32_t seen_from_peers() const noexcept {
         return static_cast<std::uint32_t>(peers.size());
@@ -195,6 +199,7 @@ struct TxpoolFact {
     AdmissionEvidence evidence  = AdmissionEvidence::None;
     std::uint32_t     peers     = 0;
     std::uint64_t     time_received = 0;
+    bool              ring_unresolved = false;
 };
 
 struct TxpoolStats {
@@ -234,6 +239,13 @@ struct TxpoolStats {
     std::uint64_t rejected_key_image_spent = 0;
     std::uint64_t unresolved_ring          = 0;
     std::uint64_t rejected_member_locked   = 0;
+
+    // Entries a snapshot LEFT OUT because their ring was unresolved and the
+    // select policy is Exclude (the default). This distinguishes "the block was
+    // empty because the pool was empty" from "the block was empty because every
+    // pooled tx had an unverifiable ring" -- the sensor the SPV-mining critique
+    // is closed against: on a covered node it stays 0 while blocks fill.
+    std::uint64_t excluded_unresolved      = 0;
 };
 
 // --- the pool ----------------------------------------------------------------
@@ -332,7 +344,9 @@ private:
     std::uint64_t pool_bytes_      = 0;
     std::uint64_t backlog_version_ = 0;
     bool          synced_          = false;
-    TxpoolStats   stats_{};
+    // Mutable: snapshot_locked() is a const measurement but records the
+    // excluded_unresolved sensor (the count it left out for policy reasons).
+    mutable TxpoolStats stats_{};
 
     // Input-consensus wiring (borrowed; null until set_input_consensus_sources).
     const IRingMemberSource*  ring_src_   = nullptr;
