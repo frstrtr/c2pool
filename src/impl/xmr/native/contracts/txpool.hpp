@@ -194,6 +194,23 @@ public:
 // collides with the chain or with another pool entry is never selectable, at
 // any policy.
 // ---------------------------------------------------------------------------
+// What to do with a pool entry whose ring is UNRESOLVED -- a member below the
+// output set's anchor / beyond its frontier, so input consensus (CLSAG + not-
+// spent) could not be run on it and the entry carries no InputConsensus
+// evidence. A RESOLVABLE ring is never in this state: it was either verified
+// (InputConsensus granted) or REJECTED at admission (RingSigFail / KeyImageSpent
+// / RingMemberLocked, never pooled). So "require InputConsensus when the ring
+// resolves" is exactly "exclude the ring-unresolved from selection".
+//
+//   * Exclude (default, the recommended daemonless rule): NEVER mine a ring we
+//     could not verify. On a regtest-from-genesis / fully-covered node every
+//     honest ring resolves, so blocks stay non-empty (good-citizen preserved)
+//     and only forged / unverifiable rings are dropped.
+//   * Include: mine an unresolved ring on its non-input evidence -- the pre-
+//     input-consensus behaviour, which a mainnet node pre-O-backfill needs to
+//     produce non-empty blocks at all. This is the OPERATOR ruling owed (R2).
+enum class UnresolvedRingPolicy : std::uint8_t { Exclude = 0, Include = 1 };
+
 struct TxpoolSelectPolicy {
     // Every flag here must be present on an entry for it to be selectable.
     // Defaults to the daemonless recommendation of ruling R-VAL.
@@ -205,10 +222,14 @@ struct TxpoolSelectPolicy {
     // a stem transaction has not been publicly fluffed and mining it leaks the
     // path back to its origin.
     bool allow_stem = false;
+    // Ring-unresolved entries: excluded by default so a forged-ring or
+    // otherwise-unverifiable transaction is never selectable/mined.
+    UnresolvedRingPolicy unresolved_rings = UnresolvedRingPolicy::Exclude;
 
     friend bool operator==(const TxpoolSelectPolicy& a, const TxpoolSelectPolicy& b) noexcept {
         return a.required == b.required && a.min_peers == b.min_peers
-            && a.allow_stem == b.allow_stem;
+            && a.allow_stem == b.allow_stem
+            && a.unresolved_rings == b.unresolved_rings;
     }
     friend bool operator!=(const TxpoolSelectPolicy& a, const TxpoolSelectPolicy& b) noexcept {
         return !(a == b);

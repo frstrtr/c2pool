@@ -234,15 +234,32 @@ struct BlockTxEvent {
     std::vector<std::vector<std::uint8_t>> tx_blobs;  // Disconnected, BEST EFFORT
     bool tx_blobs_complete = false;                   // see the note above
 
-    // INPUT-consensus feed (Connected only). The block's RCT outputs in
-    // monerod's GLOBAL-INDEX order -- coinbase output(s) first, then each
-    // non-coinbase tx's outputs in block order -- so a downstream output set can
-    // number them from `first_output_index`. `first_output_index` is the global
-    // amount-0 RCT output count BEFORE this block (0 on a regtest chain synced
-    // from genesis; the anchor's rct_output_count for the first post-anchor
-    // block). Empty/zero when the producer did not capture outputs.
-    std::vector<OutputRecord> outputs;
-    std::uint64_t             first_output_index = 0;
+    // INPUT-consensus feed (Connected only). `first_output_index` is the global
+    // amount-0 RCT output count BEFORE this block -- the global index the block's
+    // FIRST output takes (the v2 coinbase's output 0), 0 on a regtest chain from
+    // genesis, the anchor's rct_output_count for the first post-anchor block.
+    //
+    // The outputs are split by producer so the CHAIN layer stays free of the
+    // ring-ct curve arithmetic (chain_view / block_eval link no rct):
+    //
+    //   * `coinbase_amount_pubkeys` -- the version-2 coinbase's (public amount,
+    //     one-time key) pairs, in output order, EMPTY for a version-1 coinbase
+    //     (whose outputs never enter the amount-0 table). The output set turns
+    //     each public amount into the stored commitment via rct::zero_commit,
+    //     which is where the curve code lives; these are GLOBALLY FIRST.
+    //   * `coinbase_unlock_time` -- the coinbase's unlock_time (height + 60),
+    //     inherited by each coinbase output as its spendable bound.
+    //   * `outputs` -- every NON-coinbase RCT output, in block/tx order, with its
+    //     commitment already resolved from the tx's outPk (no curve code needed),
+    //     GLOBALLY AFTER the coinbase outputs.
+    //
+    // So the set's global order is coinbase_amount_pubkeys ++ outputs, numbered
+    // from first_output_index. All empty/zero when the producer did not capture
+    // (a fluffy announce with no bodies, or capture disabled).
+    std::vector<std::pair<std::uint64_t, Hash>> coinbase_amount_pubkeys;
+    std::uint64_t                               coinbase_unlock_time = 0;
+    std::vector<OutputRecord>                   outputs;
+    std::uint64_t                               first_output_index = 0;
 };
 
 // --- index / sync telemetry --------------------------------------------------
