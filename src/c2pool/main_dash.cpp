@@ -11065,6 +11065,7 @@ int main(int argc, char** argv)
     // UNCHANGED. Explicit opt-out: --embedded-superblock=false.
     bool embedded_superblock = false;
     bool embedded_superblock_off = false;      // --embedded-superblock=false
+    bool allow_stub_bls = false;               // --allow-stub-bls (#1671): run a bls=stub build knowingly in a BLS-relying config
     bool embedded_govsync = false;             // --embedded-govsync: OBSERVE-ONLY arm of the governance sourcing lane (inv 17/18 pull + store populate); default OFF; does NOT arm serving (that is --embedded-superblock)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
@@ -11299,6 +11300,8 @@ int main(int argc, char** argv)
             embedded_superblock = true;
         else if (std::strcmp(argv[i], "--embedded-superblock=false") == 0)
             embedded_superblock_off = true;         // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--allow-stub-bls") == 0)
+            allow_stub_bls = true;                  // #1671: run bls=stub knowingly (see the refuse-to-start gate before run_node)
         else if (std::strcmp(argv[i], "--embedded-govsync") == 0)
             embedded_govsync = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
@@ -11896,6 +11899,47 @@ int main(int argc, char** argv)
                              " templates will serve with no serve-time"
                              " cross-check. Not a supported production"
                              " configuration.\n";
+        }
+        // #1671: refuse to start a bls=stub (BLS-dark) binary in any config that
+        // RELIES on BLS verification — the daemonless cut (no dashd fallback to
+        // fall closed to), or an explicit opt-in to a BLS-consuming arm. Such a
+        // node cannot verify quorum commitments / ChainLocks / isdlocks /
+        // governance votes / asset-unlocks; running it BLS-dark and then citing
+        // it for verification is exactly the defect this issue closes. rpc-armed
+        // mode is NOT refused (there the stub fails closed to dashd, and only the
+        // loud identity surfaces apply). Evaluated on the FINALISED flags (after
+        // the good-citizen resolver above may have armed them in daemonless mode)
+        // and on the pure daemonless_posture — before run_node opens any store.
+        {
+            const bool daemonless_posture = rpc_endpoint.empty()
+                                         && rpc_conf_path.empty()
+                                         && submit_hex.empty();
+            const bool bls_claim_config = daemonless_posture
+                || embedded_null_arm || embedded_superblock
+                || embedded_ingest_isdlock || embedded_accrue_asset_unlocks;
+            if (bls_claim_config
+                && !dash::coin::vendor::bls_backend_available()
+                && !allow_stub_bls) {
+                std::cout
+                    << "[BLS-STUB] refusing to start: this c2pool-dash was built"
+                       " WITHOUT dashbls (bls=stub) and the requested configuration"
+                       " (" << (daemonless_posture      ? "daemonless cut"
+                               : embedded_null_arm       ? "--embedded-null-arm"
+                               : embedded_superblock     ? "--embedded-superblock"
+                               : embedded_ingest_isdlock ? "--embedded-ingest-isdlock"
+                               :                           "--embedded-accrue-asset-unlocks")
+                    << ") relies on BLS verification this build cannot perform."
+                       " Rebuild with -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=<prefix>"
+                       " (scripts/build_dashbls.sh), or pass --allow-stub-bls to run"
+                       " it knowingly (never in production).\n";
+                return 2;
+            }
+            if (!dash::coin::vendor::bls_backend_available() && allow_stub_bls)
+                std::cout
+                    << "[BLS-STUB] running BLS-dark by --allow-stub-bls: quorum /"
+                       " ChainLock / isdlock / govvote / asset-unlock verification"
+                       " is INERT (fail-closed). Do not cite this node for"
+                       " verification, reward-parity or won-block-validity claims.\n";
         }
         return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
                         stratum_host, stratum_port, web_host, web_port,
