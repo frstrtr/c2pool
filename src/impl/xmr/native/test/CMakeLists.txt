@@ -514,6 +514,17 @@ if (BUILD_TESTING)
     target_compile_features(xmr_native_template_coinbase_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_template_coinbase_kat COMMAND xmr_native_template_coinbase_kat)
 
+    # Good-citizen template selection (xmr_citizen_select.hpp): proves the block
+    # is never empty/under-filled while the pool holds valid txs. Header-only
+    # (get_block_reward + node types); added to BOTH build.yml --target lists.
+    add_executable(xmr_native_citizen_select_kat xmr_citizen_select_kat.cpp)
+    target_include_directories(xmr_native_citizen_select_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_citizen_select_kat PRIVATE xmr_coin xmr_node)
+    target_compile_features(xmr_native_citizen_select_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_native_citizen_select_kat COMMAND xmr_native_citizen_select_kat)
+
     # ------------------------------------------------------------------
     # C5 -- the dual-arm found-block relay.
     #

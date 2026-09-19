@@ -101,6 +101,7 @@
 #include "impl/xmr/native/contracts/chain_index.hpp"
 #include "impl/xmr/native/contracts/miner_data.hpp"
 #include "impl/xmr/native/contracts/txpool.hpp"
+#include "impl/xmr/native/template/xmr_citizen_select.hpp"  // good-citizen selection
 
 namespace c2pool::xmr::native::tmpl {
 
@@ -131,6 +132,15 @@ struct NativeTemplatePolicy {
     // arm's rule, which is the only way a template diff means anything.
     bool               use_explicit_select = false;
     TxpoolSelectPolicy select{};
+
+    // GOOD-CITIZEN (operator hard rule). When true, the served template is
+    // built from select_good_citizen() over the admitted backlog instead of the
+    // raw pool selection: the block always carries valid txs when the pool has
+    // any (empty IFF the pool is empty). Default true -- this is the live-path
+    // posture. false yields the raw selectable_backlog() (the shadow arm and the
+    // existing template regression suites, which compare against the raw set).
+    bool               good_citizen = true;
+    ::c2pool::xmr::native::CitizenPolicy citizen{};
 };
 
 // Why a snapshot was refused, in the order the checks run.
@@ -225,20 +235,47 @@ public:
         // to_miner_data() deliberately leaves tx_backlog empty: the chain state
         // and the transaction set come from two different components, and the
         // conversion above stays a pure function of chain state (D-7/D-11).
-        md.tx_backlog = policy_.use_explicit_select
+        std::vector<node::TxBacklogEntry> pool_set = policy_.use_explicit_select
                             ? pool_.selectable_backlog(policy_.select)
                             : pool_.selectable_backlog();
+        const std::size_t pool_n = pool_set.size();
+
+        // GOOD-CITIZEN (operator hard rule): the live template is built from the
+        // good-citizen selection over the admitted backlog, which always carries
+        // valid txs when the pool has any (R-CIT-1: empty IFF pool empty). The
+        // selector preserves the pool's fee-rate order in the penalty-free zone,
+        // so the common case is identical to the raw set. good_citizen == false
+        // serves the raw set (shadow arm / raw-set regression).
+        if (policy_.good_citizen) {
+            md.tx_backlog = ::c2pool::xmr::native::select_good_citizen(
+                                pool_set, ti->median_weight, ti->already_generated_coins,
+                                ti->major_version, policy_.citizen).chosen;
+        } else {
+            md.tx_backlog = std::move(pool_set);
+        }
+        const std::size_t chosen_n = md.tx_backlog.size();
 
         const std::uint64_t pool_seq = pool_.backlog_version();
 
         std::lock_guard<std::mutex> lk(mtx_);
+        // Good-citizen sensors: last pool/chosen counts, and a violation counter
+        // that trips if a non-empty pool ever produced an empty selection (must
+        // be impossible under R-CIT-1; it is the invariant-D tripwire).
+        last_pool_n_   = pool_n;
+        last_chosen_n_ = chosen_n;
+        if (pool_n != 0 && chosen_n == 0) ++good_citizen_violations_;
         // Admit the pool's sequence under the refresh policy, then FREEZE it:
         // everything the provider compares against must be the number that was
         // actually served, not a number that moved after the bytes were built.
         served_epoch_.height      = md.height;
         served_epoch_.prev_id     = md.prev_id;
         served_epoch_.backlog_seq = admit_backlog_locked_(pool_seq, md.height, md.prev_id);
-        served_pool_seq_          = pool_seq;
+        // Advance served_pool_seq_ only to the version actually ADMITTED, not the
+        // version we polled: a rate-limited poll admits nothing, and setting this to
+        // the polled pool_seq would make the next epoch() see seq == served_pool_seq_
+        // and report the OLD backlog_seq forever, swallowing a tx that arrived inside
+        // the refresh window until the pool changed AGAIN or the tip moved (R-CIT-2).
+        served_pool_seq_          = served_epoch_.backlog_seq;
         pin_bodies_locked_(md);
         ++snapshots_;
         last_refusal_ = NativeRefusal::None;
@@ -293,6 +330,15 @@ public:
     // bodies rather than misfiled ones.
     std::uint64_t missing_bodies()         const { std::lock_guard<std::mutex> lk(mtx_); return missing_bodies_; }
     std::uint64_t body_source_violations() const { std::lock_guard<std::mutex> lk(mtx_); return body_source_violations_; }
+
+    // Good-citizen sensors (read by the node status line and KATs). last_pool_n
+    // is the admitted backlog offered to the selector; last_chosen_n is what the
+    // selector chose (== what the served template carries). good_citizen_
+    // violations counts snapshots where a non-empty pool yielded an empty
+    // selection -- impossible under R-CIT-1, so a non-zero value is a bug.
+    std::size_t   last_pool_n()             const { std::lock_guard<std::mutex> lk(mtx_); return last_pool_n_; }
+    std::size_t   last_chosen_n()           const { std::lock_guard<std::mutex> lk(mtx_); return last_chosen_n_; }
+    std::uint64_t good_citizen_violations() const { std::lock_guard<std::mutex> lk(mtx_); return good_citizen_violations_; }
 
     NativeRefusal        last_refusal() const { std::lock_guard<std::mutex> lk(mtx_); return last_refusal_; }
     std::uint64_t        snapshots()    const { std::lock_guard<std::mutex> lk(mtx_); return snapshots_; }
@@ -530,6 +576,8 @@ private:
     mutable std::uint64_t          now_   = 0;
     mutable std::uint64_t          snapshots_ = 0, refusals_ = 0, missing_bodies_ = 0;
     mutable std::uint64_t          body_source_violations_ = 0;
+    mutable std::size_t            last_pool_n_ = 0, last_chosen_n_ = 0;
+    mutable std::uint64_t          good_citizen_violations_ = 0;
     mutable NativeRefusal          last_refusal_ = NativeRefusal::None;
 };
 
