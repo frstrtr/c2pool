@@ -225,6 +225,9 @@ struct FinalizeConnectOptions {
     // height. Bounded by SameHeightPolicy::max_renotify. Unset = no re-announce
     // (the observe-side posture, and what the self-check runs).
     std::function<bool(std::uint64_t height, const std::string& bid_hex)> renotify;
+    //  COINBASE AUTHORITY: (height, bid) -> credit/payout read from the block's on-chain
+    // coinbase. false + why. why starting with "not-lane:" = a stranger's block (ignored).
+    std::function<bool(std::uint64_t, const std::string&, Amounts&, Amounts&, std::string&)> book_from_chain;
 };
 
 // ── the glue ────────────────────────────────────────────────────────────────
@@ -277,6 +280,8 @@ public:
         // finalize driver does, in the same order, in either mode.
         m_node.set_chain_observer(
             [this](std::uint64_t h, const std::string& bid) { observe_chain_block(h, bid); });
+        m_node.set_chain_extend_observer(
+            [this](std::uint64_t h, const std::string& bid) { book_chain_block(h, bid); });   // 
     }
 
     FinalizeConnect(const FinalizeConnect&) = delete;
@@ -370,6 +375,11 @@ public:
     TickReport tick() {
         TickReport t;
         echo_node_log();                       // finalize: / win: lines since the last tick
+        if (!m_retry.empty()) {                //  fix 4: retry transient chain-fetch failures
+            auto again = m_retry; m_retry.clear();
+            for (const auto& [bid, h] : again)
+                if (m_node.chain_carries(h, bid)) book_chain_block(h, bid);   // still canonical -> try again; else drop (an orphan)
+        }
 
         std::vector<FoundBlockEvent> evs;
         t.drained = m_q.drain(evs);
@@ -435,6 +445,46 @@ public:
     //    fc.drain_before_stop() -> node.stop().
     TickReport drain_before_stop() { return tick(); }
 
+    //  a block joined the best chain at h. If it is a LANE block (its coinbase carries our
+    // 0x03 tag and maps under deterministic r), book it FOUND with the ON-CHAIN amounts — whoever
+    // mined it. Provisional (pending) until D_conf burial; an Orphan event disposes it (pre-SETTLED
+    // pure removal), a later block on the new chain is booked the same way at ITS burial.
+    void book_chain_block(std::uint64_t h, const std::string& bid_hex) {
+        if (!m_o.book_from_chain) return;
+        const std::string bid = lower_hex(bid_hex);
+        if (bid.size() != 64 || h == 0) return;
+        //  fix 2: dedup on CURRENT ledger state, not on "ever seen" -- an orphaned block that
+        // becomes canonical again (branch flip-flop) must be re-booked.
+        if (m_pending.count(bid) || m_unrecoverable.count(bid)) return;
+        if (m_node.ledger().is_settled(bid) || m_node.ledger().is_pending(bid)) return;
+        if (m_chain_seen.count(bid)) return;   //  fix 3b: memo of NON-booked outcomes only (not-lane / late / refused)
+        if (m_chain_booked_once.count(bid)) say("cba: chain block " + short_bid(bid) + " h=" + std::to_string(h) + " is canonical AGAIN after an orphan -> re-booking");
+        const std::uint64_t cursor = m_node.finalize_driver().cursor_height();
+        if (h <= cursor) { m_chain_seen[bid] = true; say("cba: chain block " + short_bid(bid) + " h=" + std::to_string(h) + " is at/below the finalize cursor " + std::to_string(cursor) + " — LATE, not booked (would pend forever)"); return; }
+        Amounts credit, payout; std::string why;
+        if (!m_o.book_from_chain(h, bid, credit, payout, why)) {
+            if (why.rfind("get_block", 0) == 0 || why.find("does not parse") != std::string::npos) {   //  fix 4: transient
+                if (++m_retry_n[bid] <= 200) { m_retry[bid] = h; say("cba: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " fetch failed (" + why + ") -> RETRY #" + std::to_string(m_retry_n[bid])); return; }
+            }
+            m_chain_seen[bid] = true;
+            if (why.rfind("not-lane:", 0) == 0) return;   // a stranger's block: nothing to book
+            ++m_stats.refused;
+            say("cba: REFUSED chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + ": " + why);
+            return;
+        }
+        c2pool::xmr::node::Hash id{}; (void)hash_from_hex(bid, id);
+        PendingRec rec; rec.height = h; rec.reward = 0; for (const auto& [k, v] : payout) { (void)k; rec.reward += static_cast<std::uint64_t>(v); }
+        m_pending[bid] = rec; (void)sidecar_flush();
+        if (!m_node.on_network_block_won(h, id, credit, payout) || !m_node.ledger().is_pending(bid)) {
+            m_pending.erase(bid); (void)sidecar_flush();
+            say("cba: node/ledger did not admit chain lane block " + short_bid(bid)); return;
+        }
+        ++m_stats.registered; ++m_cba_chain_booked; m_chain_booked_once[bid] = true; m_retry.erase(bid);
+        m_race.observe_own(h, bid);   // a LANE block is 'own' for the race book (multi-node: own == lane)
+        say("cba: CHAIN FOUND booked " + short_bid(bid) + " h=" + std::to_string(h) + " payout_keys=" + std::to_string(payout.size()) + " total=" + std::to_string(rec.reward) + " -> finalizes when hw >= " + std::to_string(h + m_cfg.d_conf));
+    }
+    std::uint64_t cba_chain_booked() const { return m_cba_chain_booked; }
+
     // ── the FOUND path (also usable directly on the main thread, e.g. by a
     //    --replay-found operator tool). Idempotent per bid. Never throws.
     RegisterResult register_found(const FoundBlockEvent& ev) {
@@ -470,6 +520,15 @@ public:
         std::string why_valueless;
         Amounts credit = amounts_from(ev.payee, ev.reward_piconero, &why_valueless);
         Amounts payout = credit;
+        if (m_o.book_from_chain) {   //  (part 2): an OWN win is NOT booked on submit-OK — monerod also says OK
+            // for an ALTERNATIVE block. It is booked by book_chain_block when OUR chain view carries it: the
+            // single booking path for every lane block, so every node holds the same pending set.
+            m_race.observe_own(ev.height, bid, ev.found_unix_s);
+            say("own win " + short_bid(bid) + " h=" + std::to_string(ev.height) +
+                " submitted OK -> booking DEFERRED to the chain view (coinbase authority)");
+            r.registered = true; r.duplicate = true; r.reason = "deferred-to-chain";
+            return r;
+        }
 
         PendingRec rec;
         rec.height = ev.height;
@@ -791,6 +850,11 @@ private:
     FinalizeConnectOptions m_o;
 
     std::map<std::string, PendingRec> m_pending;        // bid -> rec, mirrors the sidecar
+    std::map<std::string, bool>       m_chain_seen;     //  bids classified not-lane / late / refused (never re-attempted)
+    std::map<std::string, bool>       m_chain_booked_once;   //  bids booked at least once (re-bookable after an orphan)
+    std::map<std::string, std::uint64_t> m_retry;            //  fix 4: bid -> height, transient fetch failures to retry
+    std::map<std::string, int>        m_retry_n;
+    std::uint64_t                     m_cba_chain_booked = 0;
     std::map<std::string, PendingRec> m_unrecoverable;  // kept in the sidecar so the boot warning repeats
     Stats         m_stats;
     std::size_t   m_log_cursor = 0;

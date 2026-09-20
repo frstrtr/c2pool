@@ -81,7 +81,18 @@ public:
     // event (durable BEFORE the block is announced, W6 §5.2), enter the merged
     // ledger's pending set, and remember it for maturity. Idempotent per bid.
     void on_block_found(const FoundBlock& b) {
-        if (m_found.count(b.bid)) return;
+        //  fix 2: a record left non-canonical by an ORPHAN may be re-FOUND when the block
+        // becomes canonical again (branch flip-flop). The OwedLedger already admits it (the
+        // pre-SETTLED orphan was a pure pending removal); only this per-bid idempotency stood in the way.
+        if (auto it = m_found.find(b.bid); it != m_found.end()) {
+            if (it->second.canonical || m_ledger.is_settled(b.bid) || m_ledger.is_pending(b.bid)) return;
+            SettleEvent ev;
+            ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = b.credit; ev.payout = b.payout;
+            write_event(ev);
+            m_ledger.on_block_found(b.bid, b.credit, b.payout);
+            it->second.credit = b.credit; it->second.payout = b.payout; it->second.canonical = true;
+            return;   // m_by_height already lists it
+        }
         SettleEvent ev;
         ev.kind = SettleEvKind::Found;
         ev.bid = b.bid;

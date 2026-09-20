@@ -135,6 +135,8 @@ public:
     // happened to share a name.
     using ChainObserverFn = std::function<void(std::uint64_t height, const std::string& bid_hex)>;
     void set_chain_observer(ChainObserverFn fn) { m_chain_observer = std::move(fn); }
+    //  fed ONLY for Extend/Reorg (a block joined the best chain), never for Orphan.
+    void set_chain_extend_observer(ChainObserverFn fn) { m_cba_extend_observer = std::move(fn); }
 
     // The canonical test the F1 finalize driver runs at maturity, exposed so the
     // accounting layer asks the SAME question of the SAME chain. A tiebreak that
@@ -311,6 +313,8 @@ private:
         // c2pool#1551: announce the block BEFORE settlement moves on it, so a
         // rival that arrives in the same event is already in the race book when
         // the finalize driver reaches the height.
+        if (m_cba_extend_observer && ev.kind != K::Orphan)
+            m_cba_extend_observer(ev.block.height, hex_of(ev.block.id));   //  book BEFORE the race book + BEFORE advance
         if (m_chain_observer) {
             if (ev.kind == K::Orphan) m_chain_observer(ev.block.height, hex_of(ev.orphaned_id));
             else                      m_chain_observer(ev.block.height, hex_of(ev.block.id));
@@ -361,6 +365,7 @@ private:
 
     // c2pool#1551: installed by the accounting layer (FinalizeConnect).
     ChainObserverFn                        m_chain_observer;
+    ChainObserverFn                        m_cba_extend_observer;   // 
 
     std::vector<std::string>               m_log;
     bool                                   m_up = false;

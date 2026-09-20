@@ -164,6 +164,7 @@ public:
                 orph.orphaned_id = it->second.id;
                 emit(orph);
                 by_hash_.erase(it->second.id);
+                by_height_.erase(it);   //  fix 5: the orphaned row must not survive as a stale mirror row
                 ++depth;
             }
             if (h == 0) break; // guard unsigned underflow

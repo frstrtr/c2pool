@@ -86,6 +86,9 @@
 #include "xmr/xmr_live_submit.hpp"           // O-2 wire 3: block-blob assembly + submit_block
 #include "xmr/xmr_stratum_listener.hpp"      // O-2 wire 1: POSIX stratum listener (ITransport)
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
+#include "xmr/xmr_coinbase_authority.hpp"  //  coinbase-authority booking
+#include "impl/xmr/node/minijson.hpp"
+#include <deque>
 #include "xmr/xmr_o2_settlement_fixture.hpp"  // O-2 option B: XmrSettlementConfig + XmrOwedFixture (proof ledger)
 #include "xmr/xmr_o2_settlement_provider.hpp" // O-2 option B: v37 K_fair settlement template provider + source
 #include "xmr/xmr_settlement_coinbase_shape.hpp"  // M2: the K_fair shape gate, read off the assembled block bytes
@@ -304,6 +307,7 @@ struct ServeHooks {
     // = no inject dir, and the served template is byte-identical to the plain
     // good-citizen path.
     std::function<void()> inject_pump;
+    std::function<void()> cba_tick;   //  per-loop digest ring + log
 };
 
 // ---------------------------------------------------------------------------
@@ -690,6 +694,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         if (hooks.inject_pump) hooks.inject_pump();  // --native-inject-dir scan
         bridge_found();
         fc.tick();
+        if (hooks.cba_tick) hooks.cba_tick();   // 
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
         // p2p-first replaces both with the native chain's own event drain, and
         // this is the only place either of them is driven -- so "no daemon call
@@ -933,6 +938,64 @@ static int run_live(const XmrNodeConfig& cfg) {
             return relay->renotify(id, &peers);
         };
     }
+    //  state (lifetimes: all outlive serve_and_run; the pointers are set in the option-B branch)
+    o2::XmrOwedFixture*            cba_fx   = nullptr;
+    const o2::XmrSettlementConfig* cba_scfg = nullptr;
+    std::deque<::v37::bytes32>     cba_ring;                 // this node's owed_digest history (newest at back)
+    std::optional<::v37::bytes32>  cba_payee;
+    unsigned long long             cba_lane_root_unknown = 0;   // counted alarm: 03-root matched no candidate
+    std::optional<::v37::ScriptRef> cba_payee_ref;
+    std::uint64_t cba_fetches = 0, cba_booked = 0, cba_not_lane = 0, cba_refused = 0;
+    auto cba_ring_push = [&]() {
+        const ::v37::bytes32 d = node.ledger().owed_digest();
+        if (cba_ring.empty() || !(cba_ring.back() == d)) {
+            cba_ring.push_back(d); if (cba_ring.size() > 4096) cba_ring.pop_front();
+            std::printf("cba-digest: cursor=%llu hw=%llu ledger_seq=%llu owed_digest=%s\n",
+                        static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
+                        static_cast<unsigned long long>(node.hw().hw_height),
+                        static_cast<unsigned long long>(node.ledger().ledger_seq()), hex_of(d).c_str());
+            std::fflush(stdout);
+        }
+    };
+    fo.book_from_chain = [&](std::uint64_t h, const std::string& bid, Amounts& credit, Amounts& payout, std::string& why) -> bool {
+        if (!cba_fx || !cba_scfg) { why = "not-lane: no v37 settlement ledger bound (option A)"; return false; }
+        cba_ring_push();
+        ++cba_fetches;
+        std::string body, err;
+        transport.rpc_post(c2pool::xmr::node::MoneroDaemonRpc::body_get_block(0, bid),
+                           [&](const c2pool::xmr::node::RpcResponse& r) { if (!r.ok()) err = r.error; else body.assign(r.body.begin(), r.body.end()); });
+        if (!err.empty()) { why = "get_block(" + bid.substr(0, 12) + "): " + err; ++cba_refused; return false; }
+        c2pool::xmr::node::minijson::Value v;
+        if (!c2pool::xmr::node::minijson::parse(body, v)) { why = "get_block: JSON parse failed"; ++cba_refused; return false; }
+        const std::string blob_hex = v["result"]["blob"].as_string();
+        std::vector<std::uint8_t> blob;
+        if (blob_hex.empty() || !sub::from_hex(blob_hex, blob)) { why = "get_block: no/invalid result.blob"; ++cba_refused; return false; }
+        std::vector<::v37::bytes32> cands; cands.push_back(node.ledger().owed_digest());
+        for (auto it = cba_ring.rbegin(); it != cba_ring.rend(); ++it) if (!(*it == cands.front())) cands.push_back(*it);
+        std::vector<::v37::bytes32> keys;
+        for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
+        for (const auto& k : cba_fx->keys()) keys.push_back(k);
+        const auto bk = c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
+                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
+        if (!bk.ok) {
+            why = bk.why; if (bk.is_lane) ++cba_refused; else ++cba_not_lane;
+            if (!bk.is_lane && why.find("03 root matches none") != std::string::npos) {   // lane_root_unknown: a 03-tagged block whose root matches no candidate digest = a loud, counted alarm
+                ++cba_lane_root_unknown;
+                std::printf("cba-ALARM lane_root_unknown: h=%llu bid=%s carries a 03 21 00 tag whose root is UNKNOWN to this ledger (%s)\n",
+                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), why.c_str());
+            }
+            return false;
+        }
+        if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); ++cba_refused; return false; }
+        payout = bk.payout; credit = bk.payout;   // P1 multi-payee: credit == payout (amount-honest, N owed keys, sink/fixed excluded per D1); nets at FINALIZE; owed_digest = pure fn of the on-chain coinbase (no node-local E_b)
+        ++cba_booked;
+        std::string pm; for (const auto& [k, amt] : payout) pm += hex_of(k).substr(0, 8) + "=" + std::to_string(amt) + " ";
+        std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu of %zu) total=%llu outputs=%zu payout{ %s}\n",
+                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
+                    bk.digest_index, cands.size(), static_cast<unsigned long long>(bk.total), bk.n_outputs, pm.c_str());
+        std::fflush(stdout);
+        return true;
+    };
     o2::FinalizeConnect fc(node, cfg, found_q, fo);
     std::printf("same-height policy: tiebreak=%s D_conf=%llu renotify<=%u journal=%s "
                 "| credit requires burial: YES  orphan-credit: NEVER  double-credit: BLOCKED\n",
@@ -961,6 +1024,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         pk.subaddress = cfg.payee_subaddress;
         payee_key = o2::payee_identity_key(pk);
+        cba_payee = payee_key;   // 
+        cba_payee_ref = pk.subaddress ? ::v37::xmr::make_xmr_sub(pk.spend, pk.view) : ::v37::xmr::make_xmr_std(pk.spend, pk.view);
         if (!payee_key) {
             std::printf("REFUSED: payee keys do not validate as an XMR payout descriptor "
                         "(ed25519 point check) — no ledger key\n");
@@ -1021,12 +1086,35 @@ static int run_live(const XmrNodeConfig& cfg) {
         // distinct K_fair OWED payee (the sink material with spend/view swapped —
         // still two valid ed25519 points, a different identity) so the assembled
         // coinbase carries an OWED output alongside the sink (multi-output proof).
-        o2::XmrOwedFixture ledger(cfg.lane_chain);
+        o2::XmrOwedFixture ledger(node.ledger());   //  ONE ledger — K_fair is built over the ledger FOUND/FINALIZE mutate
+        cba_fx = &ledger; cba_scfg = &scfg;
+        if (cba_payee_ref) ledger.learn_ref(*cba_payee_ref);
+        std::printf("cba: coinbase-authority booking ARMED (lane_chain=%u, payee %s, sink identity %s…)\n", cfg.lane_chain,
+                    cba_payee ? "learned" : "none", hex_of(scfg.residual_sink_identity).substr(0, 12).c_str());
         if (serving && cfg.owed_demo_amount) {
-            ledger.seed_owed_std(sink_A, sink_B, cfg.owed_demo_amount);
-            std::printf("owed-demo: seeded %llu piconero owed to a distinct K_fair payee "
-                        "(coinbase will carry OWED + residual sink)\n",
-                        static_cast<unsigned long long>(cfg.owed_demo_amount));
+            // P1 MULTI-PAYEE proof: seed >=3 DISTINCT owed keys, identical on both nodes.
+            // Each (spend,view) is a valid ed25519 point s*G from a fixed domain hash, so
+            // both nodes derive the same identities; derive_output needs only the pubkeys.
+            const int nkeys = static_cast<int>([]{ const char* e = std::getenv("V37_OWED_KEYS"); return e ? std::atoi(e) : 3; }());
+            for (int ki = 0; ki < nkeys; ++ki) {
+                std::string ds = "v37-owed-spend#" + std::to_string(ki);
+                std::string dv = "v37-owed-view#"  + std::to_string(ki);
+                ::xmr::coin::EcScalar es{}, ev{};
+                ::xmr::coin::hash_to_scalar(ds.data(), ds.size(), es);
+                ::xmr::coin::hash_to_scalar(dv.data(), dv.size(), ev);
+                ::xmr::coin::SecretKey ss{}, sv{};
+                std::memcpy(ss.data(), es.data(), 32); std::memcpy(sv.data(), ev.data(), 32);
+                ::xmr::coin::PublicKey PB{}, PA{};
+                if (!::xmr::coin::secret_key_to_public_key(ss, PB) ||
+                    !::xmr::coin::secret_key_to_public_key(sv, PA)) {
+                    std::printf("owed-demo: key%d point-gen FAILED\n", ki); continue; }
+                std::array<std::uint8_t,32> B{}, A{};
+                std::memcpy(B.data(), PB.data(), 32); std::memcpy(A.data(), PA.data(), 32);
+                const std::uint64_t amt = cfg.owed_demo_amount * static_cast<std::uint64_t>(ki + 1);
+                ::v37::bytes32 kid = ledger.seed_owed_std(B, A, amt);
+                std::printf("owed-demo: seeded key%d id=%s... amount=%llu piconero (distinct K_fair payee)\n",
+                            ki, hex_of(kid).substr(0,12).c_str(), static_cast<unsigned long long>(amt));
+            }
         }
 
         // ── M2: WHICH miner-data source the assembler is fed from ───────────
@@ -1117,6 +1205,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::uint64_t tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, tip_best = 0;
 
         ServeHooks hooks;
+        hooks.cba_tick = [&]() { cba_ring_push(); };   // 
         if (p2p_first) {
             if (!native->node()->block_relay()) {
                 std::printf("REFUSED: the native node built no block relay (internal wiring bug)\n");

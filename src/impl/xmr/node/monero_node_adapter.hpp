@@ -104,12 +104,40 @@ public:
             tip.height  = md.height - 1;
             tip.id      = md.prev_id;
             // prev_id intentionally zero (unknown parent on this feed).
-            index_.apply(tip);
+            reconcile_then_apply(tip);   //  fix: see reconcile_then_apply()
         }
 
         // (d) keep seed reach satisfied.
         ensure_seed_reach();
     }
+
+    //  fix (adversarial re-verify 2026-09-20): the miner_data feed has no parent id, so a
+    // same-height swap seen only through its CHILD was a clean extend (no Orphan; stale mirror row;
+    // chain_carries() said the loser was canonical; F1 finalized it). Reconcile the mirror against
+    // the daemon whenever the tip moves: walk down from tip-1 while the mirror disagrees with the
+    // daemon's header, apply the replacements oldest-first (apply()'s reorg branch emits
+    // Orphan(loser) + Reorg(winner)), then the tip.
+    void reconcile_then_apply(const ChainMainBlock& tip) {
+        if (index_.empty() || tip.id == index_.best_id()) { index_.apply(tip); return; }
+        std::vector<ChainMainBlock> repl;
+        std::uint64_t h = tip.height;
+        const std::uint64_t best = index_.best_height();
+        while (h > 0 && repl.size() < 64) {
+            const std::uint64_t ph = h - 1;
+            auto mirror = index_.by_height(ph);
+            if (ph > best) mirror.reset();                        //  fix 5: never trust a row above the tip
+            if (ph <= best && !mirror) break;                     // below the retained window
+            std::optional<ChainMainBlock> d;
+            rpc_.get_block_header_by_height(ph, [&](std::optional<ChainMainBlock> b, const std::string&) { d = b; });
+            if (!d) { ++reconcile_aborted_; return; }             // fix: header fetch failed -> ABORT the whole reconcile, apply NOTHING, retry next poll (never apply a partial replacement list)
+            if (mirror && mirror->id == d->id) break;             // agreement from here down
+            repl.push_back(*d); h = ph;                           //  fix 3: gap rows (ph > best) are filled too
+        }
+        for (auto it = repl.rbegin(); it != repl.rend(); ++it) { ++reconciled_; index_.apply(*it); }
+        index_.apply(tip);
+    }
+    std::uint64_t reconciled() const noexcept { return reconciled_; }
+    std::uint64_t reconcile_aborted() const noexcept { return reconcile_aborted_; }
 
     void on_txpool_add(std::vector<TxBacklogEntry> txs) {
         for (auto& t : txs) index_.add_backlog_tx(t);
@@ -155,6 +183,8 @@ private:
     MoneroDaemonRpc rpc_;
     ZmqSubscriber   zmq_;
     MainchainIndex  index_;
+    std::uint64_t   reconciled_ = 0;   //  fix: replacement rows applied by reconcile_then_apply
+    std::uint64_t   reconcile_aborted_ = 0;   // reconcile walks aborted on a header-fetch failure (retried next poll)
     std::optional<MinerData> latest_miner_data_;
     std::unordered_set<std::uint64_t> seed_reqs_inflight_;
 };
