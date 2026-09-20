@@ -418,8 +418,6 @@ static SustainReport run_sustained(std::size_t rounds, bool with_projector) {
         w.cut_spine_digest = cut.lane_digest;
         w.reward = REWARD;
         w.payout_emitted = settling;
-        w.payout_carried = settling;
-        w.payout = payout_a;                  // the v0x03 WIRE-CARRY, unchanged
 
         const xo::XmrPeerFoldOutcome f = xo::fold_at_peer_cut(
             B.engine, CHAIN, w, rep.ps, true, with_projector ? &proj : nullptr);
