@@ -393,6 +393,43 @@ public:
     // template has been built. This is the served artefact C6 judges; feeding
     // the oracle a fresh read of the source instead would compare the shadow
     // arm against something the miners were never handed.
+    // ── RECON Phase-1: reconstruct the K_fair owed map over a SCRATCH ledger ──
+    // The SAME settlement source the served template uses
+    // (build_settlement_source -> OwedLedger::propose_coinbase), run over the
+    // reconstructed scratch state at the winner's budget. Returns the owed map
+    // AND the source, so the RECON verifier can rebuild the canonical coinbase
+    // (src->inputs_at) and byte-compare it to the winner's on-chain one. This is
+    // the byte-identical caller path to the served template; no consensus body
+    // is touched and owed_digest()/fold_eb are not called here.
+    bool recon_owed_map(const settle::OwedLedger& scratch, std::uint64_t reward_hint,
+                        settle::OwedLedger::Amounts& out,
+                        std::unique_ptr<XmrOwedSettlementSource>& src_out,
+                        std::string& why) const {
+        node::MinerData md;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (!m_cur.valid) { why = "no served template yet"; return false; }
+            md = m_cur_miner;
+        }
+        XmrSettlementConfig scfg = m_scfg;
+        scfg.monero_major_version = md.major_version;
+        scfg.chain_id             = scratch.chain();
+        ::c2pool::xmr::difficulty_type lane_t; lane_t.lo = md.difficulty.lo; lane_t.hi = md.difficulty.hi;
+        ::c2pool::xmr::XmrMinerData xmr_md = asm_::from_miner_data(md, lane_t);
+        const std::uint64_t base_reward = asm_::xmr_base_reward(md.already_generated_coins);
+        std::uint64_t fees = 0;
+        for (const auto& t : md.tx_backlog) fees += t.fee;
+        XmrParentContext parent = XmrParentContext::from_miner(xmr_md, base_reward, fees);
+        std::unique_ptr<XmrOwedSettlementSource> src = build_settlement_source(
+            scfg, parent, scratch, m_ledger.pay_of(), reward_hint, &why);
+        if (!src) return false;
+        out.clear();
+        for (const auto& e : src->inputs().owed)
+            out[e.identity] += static_cast<long long>(e.owed);
+        src_out = std::move(src);
+        return true;
+    }
+
     bool last_miner_data(node::MinerData& out) const {
         std::lock_guard<std::mutex> lk(m_mtx);
         if (!m_cur.valid) return false;

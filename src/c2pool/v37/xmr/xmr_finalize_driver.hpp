@@ -68,6 +68,14 @@ public:
     // `is_canonical(height, bid)` returns true iff the best chain still carries
     // block `bid` at `height` (the MainchainIndex answers this from by_height()).
     using CanonicalFn = std::function<bool(std::uint64_t height, const std::string& bid)>;
+    // ★ RECON Phase-1 (operator-ruled): a hook called ATOMICALLY inside the
+    // finalize step, once per touched height, BEFORE the next height steps —
+    // the exact point the owed-ledger snapshot ring must sample (a poll-tick
+    // snapshot would lose intermediate cursors of a multi-height advance).
+    // Null default => not one instruction on the finalize path. Consumer-tree
+    // (no consensus digest), but it lives on the finalize step, so it ships
+    // behind this null default and the wiring is called out to the operator.
+    using StepHook = std::function<void(std::uint64_t cursor, const OwedLedger&)>;
 
     XmrFinalizeDriver(OwedLedger& ledger, SettleHW& hw, ISettleStore& store,
                       ::v37::ChainId chain, std::uint64_t d_conf,
@@ -184,6 +192,7 @@ public:
             }
             m_cursor_h = h;
             if (touched) persist_cursor();
+            if (touched && m_step_hook) m_step_hook(h, m_ledger);   // ★ RECON snapshot point
         }
         if (m_cursor_h != cursor_before) persist_cursor();
         persist_hw();
@@ -191,6 +200,7 @@ public:
     }
 
     std::uint64_t cursor_height() const { return m_cursor_h; }
+    void set_step_hook(StepHook h) { m_step_hook = std::move(h); }
     std::uint64_t event_seq()     const { return m_seq; }
 
 private:
@@ -221,6 +231,7 @@ private:
     std::uint64_t  m_cursor_h;   // highest coin height already processed for burial
     std::uint64_t  m_seq;        // write-ahead event sequence
     CanonicalFn    m_is_canonical;
+    StepHook       m_step_hook;   // ★ RECON Phase-1 (null default)
 
     std::map<std::string, FoundBlock>              m_found;      // bid -> block
     std::map<std::uint64_t, std::vector<std::string>> m_by_height; // mined height -> bids

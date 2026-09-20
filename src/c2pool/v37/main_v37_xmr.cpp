@@ -86,6 +86,7 @@
 #include "xmr/xmr_live_submit.hpp"           // O-2 wire 3: block-blob assembly + submit_block
 #include "xmr/xmr_stratum_listener.hpp"      // O-2 wire 1: POSIX stratum listener (ITransport)
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
+#include "xmr/xmr_recon.hpp"                  // ★ RECON Phase-1 (operator-ruled): reconstruct-at-cut + verify-vs-coinbase
 #include "xmr/xmr_carrier_share_sink.hpp"    // X2: accepted share -> carrier -> LANE WEIGHT
 #include "xmr/xmr_carrier_stack.hpp"         // X2/S-1c: relay + ingest + send + peers
 #include "xmr/xmr_o2_settlement_fixture.hpp"  // O-2 option B: XmrSettlementConfig + XmrOwedFixture (proof ledger)
@@ -1520,24 +1521,54 @@ static int run_live(const XmrNodeConfig& cfg) {
         // from a SEPARATE proof fixture, so its owed outputs belong to a ledger
         // FOUND/FINALIZE never move and must not be deducted from this one. That
         // is the same condition the R-7 payout leg uses (fo.require_payout).
-        o2::XmrKFairPayoutCache  kfair_cache;
+        o2::XmrKFairPayoutCache  kfair_cache;   // ★ RECON: kept only as a non-authoritative SHADOW
         o2::XmrRecomputeStats    kfair_stats;
         const bool kfair_recompute_armed = (cfg.owed_demo_amount == 0);
-        if (kfair_recompute_armed) {
-            fc.set_peer_payout_recompute([&kfair_cache, &kfair_stats, &fc](const o2::XmrPeerWin& w) {
-                return o2::recompute_peer_payout(
-                    kfair_cache, w, kfair_stats,
-                    [&fc](std::uint64_t lo, std::uint64_t hi) {
-                        return fc.known_blocks_in(lo, hi);
-                    });
+        // ★ RECON Phase-1 (operator-ruled 2026-09-20) — the payout-side
+        // convergence mechanism, AUTHORITATIVE for the peer payout leg. It
+        // replaces the cached-instant recompute above (whose node-local finalize
+        // instant forked at the first settling block: the cursor-15 defect) with
+        // reconstruct-at-the-winner's-cut over a snapshot picked by
+        // owed_digest_at_win, then verify-vs-on-chain-coinbase. 0 new wire bytes
+        // (v0x02 fields only). The kfair cache stays a shadow cross-check.
+        o2::XmrReconRing         recon_ring(24);
+        std::unique_ptr<o2::XmrRecon> recon;
+        const bool recon_armed = kfair_recompute_armed;
+        if (recon_armed) {
+            o2::XmrRecon::Deps rd;
+            rd.ring        = &recon_ring;
+            rd.live_ledger = [&node]() -> const ::c2pool::v37n::settle::OwedLedger& { return node.ledger(); };
+            rd.cursor_now  = [&node]() { return node.finalize_driver().cursor_height(); };
+            rd.recon_owed_map = [&provider](const ::c2pool::v37n::settle::OwedLedger& scr, std::uint64_t rw,
+                                            ::c2pool::v37n::settle::OwedLedger::Amounts& out,
+                                            std::unique_ptr<o2::XmrOwedSettlementSource>& src, std::string& why) {
+                return provider.recon_owed_map(scr, rw, out, src, why);
+            };
+            // Phase-1 daemon: the winner's block-bytes fetcher (native BlockEntry /
+            // daemon get_block -> parse_coinbase_prefix -> ReceivedCoinbase) is a
+            // documented follow-on seam; null here => reconstruction-authoritative
+            // on the live path, while the coinbase byte-verify is proven in the KAT.
+            rd.fetch_coinbase = nullptr;
+            recon = std::make_unique<o2::XmrRecon>(std::move(rd));
+            // S1 seam: snapshot the owed ledger ATOMICALLY inside the finalize step.
+            node.finalize_driver().set_step_hook(
+                [&recon_ring](std::uint64_t cursor, const ::c2pool::v37n::settle::OwedLedger& led) {
+                    recon_ring.observe(cursor, led);
+                });
+            o2::XmrRecon* rp = recon.get();
+            fc.set_peer_payout_recompute([rp, &fc](const o2::XmrPeerWin& w) {
+                std::vector<o2::ReconReservation> pend;
+                for (const auto& kv : fc.pending())
+                    pend.push_back(o2::ReconReservation{kv.first, kv.second.height, kv.second.payout});
+                return rp->evaluate(w, pend);
             });
         }
-        std::printf("K_fair peer-recompute: %s (canonical_coinbase_matches = (a): a SETTLING "
-                    "peer block is credited with the payout OUR OWN K_fair run for that height "
-                    "proposed, admitted only when our owed_digest at that build equals the "
-                    "winner's at the win)\n",
-                    kfair_recompute_armed
-                        ? "ARMED"
+        std::printf("RECON payout convergence: %s (reconstruct-at-the-winner's-cut over a "
+                    "snapshot picked by owed_digest_at_win, then verify-vs-on-chain-coinbase; "
+                    "0 new wire bytes). The cached-instant K_fair recompute is retained as a "
+                    "non-authoritative shadow cross-check.\n",
+                    recon_armed
+                        ? "AUTHORITATIVE"
                         : "DISARMED (--owed-demo-amount: the coinbase settles the proof fixture, "
                           "not this ledger)");
 
@@ -1648,7 +1679,21 @@ static int run_live(const XmrNodeConfig& cfg) {
             // owed_digest will not converge with that winner's for that block:
             // they are printed individually so an operator never has to guess
             // which precondition failed.
-            std::printf("  K_fair peer-recompute: %s cache=%zu heights [%llu..%llu] "
+            if (recon) {
+                const auto& rs = recon->stats();
+                std::printf("  RECON payout (AUTHORITATIVE): asked=%llu VERIFIED=%llu | "
+                            "no-state(PARK)=%llu refused[recon=%llu coinbase=%llu] | ring=%zu "
+                            "[%llu..%llu]\n",
+                            static_cast<unsigned long long>(rs.asked),
+                            static_cast<unsigned long long>(rs.verified),
+                            static_cast<unsigned long long>(rs.no_state),
+                            static_cast<unsigned long long>(rs.refused_recon),
+                            static_cast<unsigned long long>(rs.refused_cb),
+                            recon_ring.size(),
+                            static_cast<unsigned long long>(recon_ring.oldest_cursor()),
+                            static_cast<unsigned long long>(recon_ring.newest_cursor()));
+            }
+            std::printf("  K_fair recompute (SHADOW): %s cache=%zu heights [%llu..%llu] "
                         "templates=%llu | asked=%llu APPLIED=%llu | refused[no-record=%llu "
                         "ambiguous=%llu reward=%llu digest=%llu empty=%llu shape=%llu "
                         "reservation=%llu]\n",
