@@ -74,6 +74,7 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -98,7 +99,9 @@
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/chain/xmr_output_set.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
+#include "impl/xmr/native/node/xmr_anchor_confirm.hpp"
 #include "impl/xmr/native/node/xmr_chain_boot.hpp"
+#include "impl/xmr/native/node/xmr_chain_snapshot_store.hpp"
 #include "impl/xmr/native/node/xmr_genesis_blob.hpp"
 #include "impl/xmr/native/node/xmr_monerod_http.hpp"
 #include "impl/xmr/native/node/xmr_sync_driver.hpp"
@@ -196,6 +199,33 @@ struct NativeNodeConfig {
     // resolve; empty leaves pre-anchor rings RingUnresolved (today's behaviour).
     std::string              output_set_path;
 
+    // GATE 4's bound. An anchor is confirmed against the live network before
+    // this node serves anything, and that confirm is not allowed to be
+    // unbounded: at most `peers` distinct handshaked peers are asked, each gets
+    // `per_peer_ms`, and the whole gate expires after `timeout_ms` -- as a
+    // REFUSAL, never as a shrug. Defaults are in the struct; the node tool and
+    // the pool consumer expose them so an operator on a slow link can widen the
+    // window without being able to turn the gate off.
+    AnchorConfirmConfig      anchor_confirm{};
+
+    // ── RESUME WITHOUT RE-IBD ────────────────────────────────────────────────
+    // Where the chain index's snapshot lives. Empty (the default, and what
+    // every run before this shipped) means no persistence: a restart re-walks
+    // the chain from the anchor, which is minutes on a fresh bundle and hours
+    // of somebody else's bandwidth on a pool that has been up for a month.
+    //
+    // When set, the file is READ after gate 4 has confirmed the anchor and
+    // WRITTEN on a clean stop and every `snapshot_every_s`. It is not a second
+    // trust root: node/xmr_chain_snapshot_store.hpp binds the image to the
+    // anchor identity the network just vouched for, and any failure -- absent,
+    // corrupt, foreign network, different anchor -- falls back to the anchor
+    // boot rather than to a weaker check. See that header for why the binding
+    // is an envelope rather than a flag.
+    std::string              snapshot_path;
+    // Periodic save cadence in seconds. 0 = only on a clean stop, which loses
+    // the session's progress to a kill -9; 300 is the shipped compromise.
+    std::uint64_t            snapshot_every_s = 300;
+
     // A build without librandomx cannot check proof of work: the gate answers
     // Skipped, and the index connects blocks it never verified. That is a
     // legitimate thing to want (a build leg that cannot link RandomX, a
@@ -272,6 +302,14 @@ struct NativeNodeConfig {
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
     // SyncDriverConfig::probe_only.
+    //
+    // ONE EXCEPTION, added with gate 4 and named here rather than discovered:
+    // on `boot == Anchor` a probe DOES request exactly one block -- the anchor
+    // itself -- because the network confirm is not optional. Making the probe
+    // the one mode that skips gate 4 would put a "trust this anchor without
+    // asking" switch on the command line, which is the hole the gate exists to
+    // close. It is still read-only in the sense the probe means: one 2003 out,
+    // one 2004 in, nothing relayed, nothing served.
     bool                     probe_only = false;
 
     std::uint64_t            driver_tick_ms = 500;
@@ -399,6 +437,12 @@ public:
             // vector is a degraded-but-honest boot rather than a wrong one.
             if (!boot_.boot_from_anchor(cfg_.anchor_path, nets_.consensus, {}, why))
                 return false;
+            // Gates 1..3 passed. Gate 4 -- the network confirm -- is now ARMED
+            // and is settled further down, after the peer pool has peers to ask.
+            // Until it settles, ChainBoot forwards nothing and serves nothing,
+            // and this function does not return true.
+            note_(std::string("[GATE-4] ") + anchor_boot_duty());
+            note_(boot_.anchor_confirm().log_line());
         }
 
         index_.set_clock([] { return unix_seconds_(); });
@@ -558,6 +602,7 @@ public:
         pc.manual_peers           = cfg_.connect;
         pc.bind_ip                = cfg_.p2p_bind_ip;
         pc.dos.max_solicited_credits = cfg_.dos_solicited_credits;   // #1680 lever
+        pc.use_seeds              = cfg_.use_seeds;
         if (cfg_.probe_only) {
             // A READ-ONLY probe dials exactly what it was told to dial. The
             // pool learns addresses from the handshake peerlist and the plan
@@ -565,12 +610,26 @@ public:
             // quietly open connections to strangers on the public network --
             // observed once against stagenet, where the probe dialed a peer it
             // had just learned from the daemon it was probing.
-            pc.dial.target_outbound      = cfg_.connect.size();
-            pc.dial.max_outbound         = cfg_.connect.size();
-            pc.dial.max_concurrent_dials = cfg_.connect.size();
-            pc.use_seeds                 = false;
+            //
+            // "What it was told to dial" is the PINNED peers plus, when the
+            // operator asked for --seeds, the network's own seed set: a probe
+            // is exactly how an operator checks that a mainnet bootstrap will
+            // reach anybody at all, and sizing the budget by connect.size()
+            // alone made `--seeds` with no --connect a silent no-op -- zero
+            // dials, zero handshakes, and a verdict that read as "mainnet is
+            // unreachable" rather than "this probe never dialled". The seed
+            // allowance is small and fixed so the plan still cannot wander off
+            // into peerlist strangers.
+            //
+            // The `use_seeds` assignment above is deliberately BEFORE this
+            // block: it used to be after, which silently overwrote the probe's
+            // own `pc.use_seeds = false` and made that line dead.
+            const std::size_t budget =
+                cfg_.connect.size() + (cfg_.use_seeds ? kProbeSeedDialBudget : 0);
+            pc.dial.target_outbound      = budget;
+            pc.dial.max_outbound         = budget;
+            pc.dial.max_concurrent_dials = budget;
         }
-        pc.use_seeds              = cfg_.use_seeds;
 
         p2p::XmrPeerPool::Deps pd;
         pd.serving = &boot_;       // io-thread reads; the state_normal obligation
@@ -652,12 +711,67 @@ public:
 
         pool_->start();
         for (const std::string& key : cfg_.connect) pool_->dial_now(key);
+
+        // --- the cold-start address set --------------------------------------
+        // p2p/xmr_peer_store.hpp's seed_from_tables() plants the compiled-in IP
+        // seeds on the dial plan's own schedule, and that is all `--seeds` has
+        // ever done: p2p::dns_seeds() existed, was pinned by the locator KAT,
+        // and was called by nothing. On MAINNET that is the difference between
+        // six fixed addresses -- shared by every c2pool node on earth, and the
+        // obvious set to block -- and the live A-records monerod itself
+        // bootstraps from. Resolved HERE, before gate 4, because the gate needs
+        // handshaked peers to ask and a mainnet node with no --native-connect
+        // has none until this runs.
+        if (cfg_.use_seeds) seed_from_dns_();
+
+        // --- GATE 4: the anchor, confirmed by the network, before we serve ----
+        //
+        // It runs HERE and not earlier because it needs handshaked peers, and
+        // HERE and not later because the sync driver (armed on the next line)
+        // is the thing that would start building on an unconfirmed root. It is
+        // the last gate between a loaded bundle and a running node, and it is
+        // fail-closed in both directions: a mismatch refuses, and so does an
+        // exhausted peer set or an expired deadline.
+        if (cfg_.boot == BootMode::Anchor && !run_anchor_confirm_(why)) {
+            stop();
+            return false;
+        }
+
+        // --- RESUME, strictly downstream of gate 4 ----------------------------
+        // The snapshot is loaded HERE and nowhere earlier: on an anchor boot the
+        // line above has just had the anchor confirmed by live peers, and the
+        // envelope this reads is keyed to THAT anchor's height and id. A
+        // snapshot can therefore only fast-forward the node along a chain whose
+        // root the network vouched for moments ago; it can never stand in for
+        // the confirm. If gate 4 refused, the return above means this line is
+        // not reached and `snap_armed_` stays false, so the refused session
+        // also cannot WRITE a snapshot over a good one.
+        //
+        // On a GENESIS boot the same line is what discharges the boot: the image
+        // IS the trust root, so load_snapshot_() goes through ChainBoot and the
+        // node never reaches the line below owed a genesis seed it would later
+        // pay by resetting the very index it just resumed.
+        //
+        // Every failure below is the same failure -- carry on from the anchor,
+        // or from the genesis seed -- which is why none of them returns false.
+        if (!cfg_.snapshot_path.empty()) {
+            load_snapshot_();
+            snap_armed_ = true;
+            snap_loop_.start();
+            snap_next_ms_ = now_ms_() + cfg_.snapshot_every_s * 1000;
+        }
+
         arm_tick_();
         return true;
     }
 
     void stop() {
         if (!running_.exchange(false)) return;
+        // A CLEAN stop is the one moment the on-disk image can be made exactly
+        // current, so it is taken before anything is torn down. Armed only
+        // after gate 4 settled (see start()), so a refused start never writes.
+        if (snap_armed_ && !cfg_.snapshot_path.empty()) save_snapshot_("clean stop");
+        snap_loop_.stop();
         tick_.cancel();
         if (pool_) pool_->stop();
         if (guard_) guard_->reset();
@@ -1208,6 +1322,14 @@ private:
                                   native_src_.set_now(unix_seconds_());
                               },
                               /*control=*/true);
+            // The periodic save. Posted to its OWN loop, never run here: the
+            // serialization takes the index lock and the write touches a disk,
+            // and neither belongs on the io thread that is servicing sockets or
+            // on the verify thread that is connecting blocks.
+            if (snap_armed_ && cfg_.snapshot_every_s != 0 && now >= snap_next_ms_) {
+                snap_next_ms_ = now + cfg_.snapshot_every_s * 1000;
+                snap_loop_.post([this] { save_snapshot_("periodic"); });
+            }
             arm_tick_();
         });
     }
@@ -1216,6 +1338,61 @@ private:
         using namespace std::chrono;
         return static_cast<std::uint64_t>(
             duration_cast<milliseconds>(steady_clock::now() - epoch_).count());
+    }
+
+    // -----------------------------------------------------------------------
+    // GATE 4, driven.
+    //
+    // load_anchor()'s three gates judged the bundle against itself; this one
+    // asks the network. The driver issues NOTIFY_REQUEST_GET_OBJECTS for
+    // bundle.id to one handshaked peer at a time, ChainBoot::on_objects hands
+    // the answering blob to AnchorNetworkConfirm, and the confirm recomputes
+    // the id from those bytes (never taking the peer's word) and reads the
+    // block's own height out of its coinbase.
+    //
+    // WHICH THREAD. IChainFetcher's contract puts request_objects on the C2
+    // verify thread, and ChainBoot::on_objects already runs there, so the whole
+    // gate is driven from that thread via verify_loop_.call() -- while THIS
+    // function blocks on the consumer's thread, which is exactly what "refuse
+    // to start" has to mean: start() has not returned, so nothing above the
+    // node has a running node to serve from.
+    //
+    // The wait is bounded by AnchorConfirmDriver itself (peers, per-peer turn,
+    // wall deadline), so this loop cannot outlive cfg_.anchor_confirm.timeout_ms
+    // even if every peer is silent, and every exit sets `why`.
+    // -----------------------------------------------------------------------
+    bool run_anchor_confirm_(std::string& why) {
+        AnchorConfirmDriver drv(*pool_, boot_.anchor_confirm(), cfg_.anchor_confirm,
+                                [this] { return now_ms_(); });
+        note_("[GATE-4] confirming the anchor against the network: up to "
+              + std::to_string(cfg_.anchor_confirm.peers) + " peer(s), "
+              + std::to_string(cfg_.anchor_confirm.per_peer_ms) + " ms each, "
+              + std::to_string(cfg_.anchor_confirm.timeout_ms) + " ms in total");
+
+        for (;;) {
+            AnchorConfirmState st = AnchorConfirmState::Pending;
+            verify_loop_.call([&] { st = drv.poll(); });
+            if (st == AnchorConfirmState::Confirmed) {
+                note_(boot_.anchor_confirm().log_line());
+                return true;
+            }
+            if (st == AnchorConfirmState::Refused) {
+                const AnchorNetworkConfirm::Stats s = boot_.anchor_confirm().stats();
+                why = "anchor REFUSED by the network confirm (gate 4): " + s.why;
+                note_(boot_.anchor_confirm().log_line());
+                note_("[GATE-4] REFUSING TO START. " + why);
+                return false;
+            }
+            if (st == AnchorConfirmState::Disarmed) {
+                // Unreachable on this path (boot == Anchor armed it), and a
+                // silent true here would be the one way this gate could be
+                // skipped, so it is a refusal rather than a pass.
+                why = "the anchor confirm was never armed; refusing to start";
+                note_("[GATE-4] REFUSING TO START. " + why);
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 
     // ON THE VERIFY THREAD.
@@ -1297,6 +1474,213 @@ private:
         publish_tx_gate_();
     }
 
+    // -----------------------------------------------------------------------
+    // The DNS seed round, bounded.
+    //
+    // monerod's net_node.h lists four A-record hosts and guards them with
+    // `if (m_nettype == MAINNET)`; p2p::dns_seeds() reproduces that guard, so
+    // the two test networks correctly answer with nothing here and keep their
+    // compiled-in IP seeds. Only IPv4 results are taken because the levin peer
+    // key everywhere in C1c is a dotted quad, and an IPv6 literal would be
+    // parsed as a hostname by split_peer_key and silently never dialed.
+    //
+    // The wait is bounded. A resolver handler that lands after the deadline is
+    // harmless (it writes to shared state the handler owns a reference to) and
+    // its addresses are simply not used this round; the cancel is hygiene, not
+    // correctness. A cold start must not be able to hang on a broken resolver.
+    // -----------------------------------------------------------------------
+    static constexpr std::size_t   kProbeSeedDialBudget = 4;
+    static constexpr std::uint64_t kDnsSeedResolveMs   = 8000;
+    static constexpr std::size_t   kDnsSeedMaxPerHost  = 32;
+
+    void seed_from_dns_() {
+        const std::vector<p2p::DnsSeed> seeds = p2p::dns_seeds(nets_.wire);
+        if (seeds.empty()) {
+            note_("[seeds] this network has no DNS seeds (monerod lists them for MAINNET "
+                  "only); the compiled-in IP seeds are the cold-start set");
+            return;
+        }
+
+        struct Round {
+            std::mutex               mu;
+            std::vector<std::string> keys;
+            std::size_t              outstanding = 0;
+            bool                     signalled   = false;
+            std::promise<void>       done;
+        };
+        auto round = std::make_shared<Round>();
+        round->outstanding = seeds.size();
+        auto fut = round->done.get_future();
+        auto res = std::make_shared<boost::asio::ip::tcp::resolver>(io_);
+
+        for (const p2p::DnsSeed& s : seeds) {
+            res->async_resolve(
+                s.host, std::to_string(s.port),
+                [round, res, port = s.port](const boost::system::error_code& ec,
+                                            boost::asio::ip::tcp::resolver::results_type r) {
+                    std::lock_guard<std::mutex> lk(round->mu);
+                    if (!ec) {
+                        std::size_t taken = 0;
+                        for (const auto& e : r) {
+                            if (taken >= kDnsSeedMaxPerHost) break;
+                            const auto a = e.endpoint().address();
+                            if (!a.is_v4()) continue;
+                            round->keys.push_back(
+                                p2p::make_peer_key(a.to_v4().to_string(), port));
+                            ++taken;
+                        }
+                    }
+                    if (round->outstanding > 0) --round->outstanding;
+                    if (round->outstanding == 0 && !round->signalled) {
+                        round->signalled = true;
+                        round->done.set_value();
+                    }
+                });
+        }
+
+        (void)fut.wait_for(std::chrono::milliseconds(kDnsSeedResolveMs));
+        boost::asio::post(io_, [res] { boost::system::error_code ig; res->cancel(); (void)ig; });
+
+        std::vector<std::string> keys;
+        {
+            std::lock_guard<std::mutex> lk(round->mu);
+            keys = round->keys;
+        }
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        if (keys.empty()) {
+            note_("[seeds] " + std::to_string(seeds.size())
+                + " DNS seed host(s) resolved to no usable IPv4 address in "
+                + std::to_string(kDnsSeedResolveMs) + " ms; falling back to the IP seeds");
+            return;
+        }
+
+        // The store is the io thread's, so the addresses are planted there. The
+        // dial plan picks them up on its own next round rather than being
+        // forced: its netgroup caps and rotation are the eclipse guard, and a
+        // seed round is exactly when they matter most.
+        boost::asio::post(io_, [this, keys] {
+            if (!pool_) return;
+            const auto now = pool_->now_ms();
+            for (const std::string& k : keys)
+                (void)pool_->store().add(k, p2p::PeerSource::DnsSeed, now);
+        });
+        note_("[seeds] " + std::to_string(keys.size()) + " address(es) from "
+            + std::to_string(seeds.size()) + " mainnet DNS seed host(s), planted as DnsSeed");
+    }
+
+    // -----------------------------------------------------------------------
+    // The resume file. Both halves key the envelope on the SAME identity: on an
+    // anchor boot, the height and id gate 4 just confirmed against live peers;
+    // on a genesis boot, height 0 and this network's genesis id. A node can
+    // therefore never read an image written by a node on another network, or
+    // one pinned to a different anchor bundle.
+    // -----------------------------------------------------------------------
+    SnapshotKey snapshot_key_() const {
+        SnapshotKey k;
+        k.net = static_cast<std::uint64_t>(nets_.consensus);
+        if (cfg_.boot == BootMode::Anchor) {
+            const AnchorNetworkConfirm::Stats s = boot_.anchor_confirm().stats();
+            k.anchor_height = s.height;
+            k.anchor_id     = s.id;
+        } else {
+            k.anchor_height = 0;
+            k.anchor_id     = p2p::genesis_id(nets_.wire);
+        }
+        return k;
+    }
+
+    void load_snapshot_() {
+        std::vector<std::uint8_t> file;
+        std::string why;
+        // The v1 snapshot image restores the chain INDEX but not outputs_ (the
+        // global output-set / spent-key-image view). When an output-set was
+        // seeded (--native-output-set), that set is numbered from the anchor's
+        // base and CANNOT be re-seated to a resumed (higher) tip, so resume and
+        // an output-set backfill are mutually exclusive: keep the freshly seeded
+        // set and boot from the confirmed anchor rather than run a mis-numbered
+        // one. (A future snapshot v2 that persists outputs_ lifts this.)
+        if (outputs_.output_count() > 0) {
+            note_("[snapshot] resume skipped: an output-set was seeded "
+                  "(--native-output-set) and pins outputs_ to the anchor base; "
+                  "booting from the confirmed anchor");
+            return;
+        }
+        if (!read_snapshot_file(cfg_.snapshot_path, file, why)) {
+            note_("[snapshot] no resume (" + why + "); starting from the "
+                + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
+            return;
+        }
+        std::vector<std::uint8_t> image;
+        if (!decode_snapshot_envelope(file, snapshot_key_(), image, why)) {
+            note_("[snapshot] REFUSED: " + why + "; starting from the "
+                + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
+            return;
+        }
+        // Through the BOOT, not straight into the index, and on the verify
+        // thread, which owns block application.
+        //
+        // The thread hop was always needed: an inbound blob may already be in
+        // flight by now, and a load that raced one would reset the index
+        // underneath it. Going through ChainBoot is the other half, and it is
+        // the one a live genesis-boot run found missing. A snapshot carries its
+        // own trust root, but loading it at the index left ChainBoot still
+        // owed a genesis seed, so the first inbound blob after this line ran
+        // try_seed_() -> seed_direct() -> reset: the resumed chain was wiped to
+        // height 0 and re-walked, PoW and all. resume_from_snapshot() installs
+        // the image AND records that the boot is discharged, in that order, on
+        // this thread -- so there is no window in which an inbound blob can
+        // find a loaded index with an un-booted gate in front of it. It re-
+        // checks gate 4 itself and refuses over an unconfirmed anchor.
+        bool ok = false;
+        std::string load_why;
+        verify_loop_.call([&] { ok = boot_.resume_from_snapshot(image, load_why); });
+        if (!ok) {
+            note_("[snapshot] REFUSED: " + load_why + "; starting from the "
+                + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
+            return;
+        }
+        // outputs_ (the output-set / spent-key-image view) is NOT in the v1
+        // image, so reconcile it fail-closed: re-seat its numbering base to the
+        // resumed tip -- legal here because no live block has connected yet and
+        // the output-set combination was excluded above, so the set is empty --
+        // and DISABLE ring resolution. The outputs below the resume point are
+        // not in this image; a ring reaching below it must be RingUnresolved
+        // (fail-closed) rather than mis-resolved and an honest peer mis-scored.
+        // The spent-key-image view therefore tracks from the resume point
+        // forward, and post-resume blocks number from the right base. A future
+        // snapshot v2 that persists outputs_ restores full below-resume
+        // resolution; until then this is the honest posture for a resumed node.
+        verify_loop_.call([&] {
+            outputs_.reset_base(index_.view().rct_output_count());
+            outputs_.disable_resolution();
+        });
+        const SyncState st = index_.sync_state();
+        note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
+            + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
+            + " bytes); no re-IBD from the anchor -- ring resolution disabled "
+              "(spent-set tracks from the resume point; v1 image carries no output set)");
+    }
+
+    // Called on snap_loop_ (periodic) or on the caller's thread (clean stop).
+    // save_snapshot() takes the index's own lock, so neither needs a hop.
+    void save_snapshot_(const char* occasion) {
+        std::vector<std::uint8_t> image;
+        std::string why;
+        if (!index_.save_snapshot(image, why)) {
+            note_(std::string("[snapshot] not written (") + occasion + "): " + why);
+            return;
+        }
+        const std::vector<std::uint8_t> file =
+            encode_snapshot_envelope(snapshot_key_(), image);
+        if (!write_snapshot_file(cfg_.snapshot_path, file, why)) {
+            note_(std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            return;
+        }
+        note_(std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
+            + cfg_.snapshot_path + " (" + occasion + ")");
+    }
+
     void note_(const std::string& line) {
         std::lock_guard<std::mutex> lk(rec_mu_);
         log_.push_back(line);
@@ -1316,6 +1700,11 @@ private:
 
     WorkerLoop     verify_loop_;
     WorkerLoop     pool_loop_;
+    // Started only when a snapshot path is configured. A third loop rather than
+    // a hop onto one of the two above: a save serializes the index and writes a
+    // file, and neither the socket thread nor the block-application thread
+    // should ever wait on a disk.
+    WorkerLoop     snap_loop_{"snapshot", 8};
     ChainIndex     index_;
     ChainBoot      boot_;
     VerifyInbound  inbound_;
@@ -1360,6 +1749,11 @@ private:
     std::unique_ptr<SyncDriver>                      driver_;
 
     std::atomic<bool>                     running_{false};
+    // Set only once gate 4 has settled Confirmed (or the genesis boot needed no
+    // gate). Until then no snapshot is read and, more importantly, none is
+    // WRITTEN: a start that gate 4 refused must not overwrite a good image.
+    std::atomic<bool>                     snap_armed_{false};
+    std::atomic<std::uint64_t>            snap_next_ms_{0};
     // The last value published to C3's relay gate; see publish_tx_gate_().
     std::atomic<bool>                     tx_gate_{false};
     std::chrono::steady_clock::time_point epoch_ = std::chrono::steady_clock::now();

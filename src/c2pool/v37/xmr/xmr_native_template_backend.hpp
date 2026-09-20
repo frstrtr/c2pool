@@ -69,6 +69,7 @@
 
 #include "impl/xmr/native/node/xmr_native_node.hpp"
 #include "impl/xmr/native/template/xmr_resolved_miner_data.hpp"
+#include "xmr_node_config.hpp"
 
 namespace c2pool::v37n::xmr::o2 {
 
@@ -89,6 +90,20 @@ struct NativeTemplateConfig {
     nrt::BootMode            boot = nrt::BootMode::Genesis;
     std::string              anchor_path;
     std::string              output_set_path;   // format-2 O-backfill snapshot
+
+    // GATE 4's bound, forwarded verbatim. The pool binary sets it from
+    // --anchor-confirm-peers / --anchor-confirm-peer-ms /
+    // --anchor-confirm-timeout-ms; the defaults here are the node's own, so a
+    // consumer that names none of them gets exactly the behaviour that shipped.
+    // There is no field that disarms the gate, by construction.
+    nrt::AnchorConfirmConfig anchor_confirm{};
+
+    // The chain-index resume file. Empty = no persistence (a restart re-walks
+    // from the anchor). See node/xmr_chain_snapshot_store.hpp for why the image
+    // is bound to the anchor identity gate 4 confirmed rather than trusted on
+    // its own.
+    std::string              snapshot_path;
+    std::uint64_t            snapshot_every_s = 300;
 
     // The PARITY / SUBMIT daemon. Not the template path; see the banner.
     std::string              monerod_rpc_host;
@@ -151,6 +166,105 @@ struct NativeTemplateConfig {
     std::uint64_t            operator_inject_ttl_blocks = 720;
 };
 
+// ---------------------------------------------------------------------------
+// XmrNodeConfig -> NativeTemplateConfig, as a PURE function.
+//
+// This is the FORWARD, and it is a function for the same reason
+// arm_order_refusal() is: every knob the pool binary parses has to arrive at
+// the node, and the only way to keep that honest is for a test to be able to
+// call the real derivation rather than a copy of it. The three gate 4 knobs
+// and --native-seeds both went missing here before this existed -- the fields
+// were parsed into XmrNodeConfig, the struct below had no home for them, and
+// nothing anywhere said so.
+//
+// It deliberately does NOT start anything, print anything, or decide whether
+// the configuration is coherent; main's start_native_backend() does the first
+// two and arm_order_refusal() the third.
+// ---------------------------------------------------------------------------
+inline nrt::NativeNet native_net_of(MoneroNetwork n) {
+    switch (n) {
+        case MoneroNetwork::Mainnet:  return nrt::NativeNet::Mainnet;
+        case MoneroNetwork::Testnet:  return nrt::NativeNet::Testnet;
+        case MoneroNetwork::Stagenet: return nrt::NativeNet::Stagenet;
+        case MoneroNetwork::Regtest:  return nrt::NativeNet::Regtest;
+    }
+    return nrt::NativeNet::Stagenet;
+}
+
+inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) {
+    const bool p2p_first = (cfg.arm_order == ArmOrderMode::P2PFirst);
+
+    NativeTemplateConfig n;
+    n.net         = native_net_of(cfg.network);
+    n.connect     = cfg.native_connect;
+    n.p2p_bind_ip = cfg.native_p2p_bind_ip;
+    n.use_seeds   = cfg.native_use_seeds;
+    // THE TRUST ROOT. Solo has no peer to ask for the genesis blob, so it
+    // assembles the blob locally and feeds it to the same id-checking gate;
+    // otherwise an anchor path selects Anchor and its absence selects Genesis.
+    n.boot        = cfg.native_solo
+                        ? nrt::BootMode::LocalGenesis
+                        : (cfg.native_anchor_path.empty() ? nrt::BootMode::Genesis
+                                                          : nrt::BootMode::Anchor);
+    n.anchor_path = cfg.native_anchor_path;
+    n.output_set_path = cfg.native_output_set_path;   // format-2 O-backfill
+
+    // GATE 4's window, widened only. `sane()` is what AnchorConfirmDriver
+    // requires; the flag parser already refuses a zero, and this is the second
+    // guard so a programmatic caller cannot disarm the gate by building a
+    // config with zeros in it.
+    n.anchor_confirm.peers       = cfg.anchor_confirm_peers ? cfg.anchor_confirm_peers : 1;
+    n.anchor_confirm.timeout_ms  = cfg.anchor_confirm_timeout_ms ? cfg.anchor_confirm_timeout_ms
+                                                                 : 1;
+    n.anchor_confirm.per_peer_ms = cfg.anchor_confirm_peer_ms ? cfg.anchor_confirm_peer_ms : 1;
+
+    n.snapshot_path    = cfg.native_snapshot_path;
+    n.snapshot_every_s = cfg.native_snapshot_every_s;
+
+    // The daemon endpoint is the C6 PARITY judge, and under daemon-first also
+    // the submit arm. Under p2p-first it is the parity judge and nothing else:
+    // the oracle reads it off the status cadence, which is not the find path.
+    // --no-daemon-rpc withholds it entirely, and then the node has no daemon
+    // arm to make a call with -- the strongest form of the claim, at the cost
+    // of the parity judge.
+    // Solo implies no daemon: there is no endpoint to configure, and leaving one
+    // wired would have the C6 parity judge dial a dead port every status tick.
+    if (!cfg.no_daemon_rpc && !cfg.native_solo) {
+        n.monerod_rpc_host = cfg.monerod.rpc_host;
+        n.monerod_rpc_port = cfg.monerod.rpc_port;
+    }
+    n.serve       = native::TemplateArm::Native;
+    n.relay_order = p2p_first ? native::ArmOrder::P2pOnly : native::ArmOrder::DaemonFirst;
+    // p2p-first pins the fallback OFF whatever the flag said: a daemonless find
+    // whose template silently came from the daemon is not a daemonless find,
+    // and the operator should not be able to weaken the claim by accident.
+    n.fallback             = p2p_first ? false : cfg.native_template_fallback;
+    // "synced" is defined against a PEER COHORT. A solo node has no cohort, so
+    // the flag is not an operator convenience there but the only way the
+    // readiness gate can ever open.
+    n.force_synced         = cfg.native_force_synced || cfg.native_solo;
+    n.allow_unverified_pow = cfg.native_allow_unverified_pow;
+    n.parity               = true;
+    // parity_ledger_path and c2pool_commit are NOT set here: the first resolves
+    // through config_path() and the second is a build macro, and neither is a
+    // function of the configuration VALUE. main fills them in, which is also
+    // what keeps this function linkable from a test that has no core config.
+    n.ready_timeout_s      = cfg.native_ready_timeout_s;
+    n.backlog_refresh_s    = cfg.native_backlog_refresh_s;
+    // D-14 lever (1): what the fork choice adopts at EQUAL work at the same
+    // height. Same flag as the accounting tiebreak -- see xmr_same_height_race.hpp.
+    n.fork_tie = (cfg.same_height_tiebreak == SameHeightTieBreak::PreferOwn)
+                     ? native::TieBreak::PreferOwn
+                     : native::TieBreak::FirstSeen;
+    // #1680 lever, and OPERATOR TX-INJECTION (default OFF): forwarded here so a
+    // consumer that builds its config through this function -- main and the
+    // mainnet-readiness KAT -- does not silently drop them on the way to the node.
+    n.dos_solicited_credits        = cfg.native_dos_solicited_credits;
+    n.operator_inject              = cfg.native_inject;
+    n.operator_inject_ttl_blocks   = cfg.native_inject_ttl_blocks;
+    return n;
+}
+
 class NativeTemplateBackend {
 public:
     explicit NativeTemplateBackend(NativeTemplateConfig cfg) : cfg_(std::move(cfg)) {}
@@ -170,6 +284,9 @@ public:
         nc.boot                 = cfg_.boot;
         nc.anchor_path          = cfg_.anchor_path;
         nc.output_set_path      = cfg_.output_set_path;
+        nc.anchor_confirm       = cfg_.anchor_confirm;
+        nc.snapshot_path        = cfg_.snapshot_path;
+        nc.snapshot_every_s     = cfg_.snapshot_every_s;
         nc.allow_unverified_pow = cfg_.allow_unverified_pow;
         nc.monerod_rpc_host     = cfg_.monerod_rpc_host;
         nc.monerod_rpc_port     = cfg_.monerod_rpc_port;
@@ -187,7 +304,15 @@ public:
         nc.operator_inject_ttl_blocks = cfg_.operator_inject_ttl_blocks;
 
         node_ = std::make_unique<nrt::NativeNode>(std::move(nc));
-        if (!node_->start(why)) { node_.reset(); return false; }
+        if (!node_->start(why)) {
+            // The node is about to be destroyed and its log with it -- and that
+            // log is where gate 4 wrote WHICH gate fired and what the peers
+            // said. `why` carries one line; an operator staring at a refused
+            // mainnet start needs the rest, so it is taken before the reset.
+            start_log_ = node_->take_log();
+            node_.reset();
+            return false;
+        }
 
         ntmpl::ArmResolver* arms = node_->arms();
         if (!arms) { why = "native node built no template arms"; stop(); return false; }
@@ -266,11 +391,17 @@ public:
 
     const NativeTemplateConfig& config() const noexcept { return cfg_; }
 
+    // The node's log lines from a start that REFUSED, kept after the node
+    // itself is gone. Empty on a successful start (the node still owns its log
+    // then, and node()->take_log() is the live drain).
+    const std::vector<std::string>& start_log() const noexcept { return start_log_; }
+
 private:
     NativeTemplateConfig                             cfg_;
     std::unique_ptr<nrt::NativeNode>                 node_;
     ntmpl::ArmResolver*                              arms_ = nullptr;
     std::unique_ptr<ntmpl::ResolvedMinerDataSource>  resolved_;
+    std::vector<std::string>                         start_log_;
 };
 
 } // namespace c2pool::v37n::xmr::o2
