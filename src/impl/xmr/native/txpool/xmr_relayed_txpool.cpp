@@ -197,6 +197,10 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     //    proofs, key-image domain. This is what makes a bad-VALUE transaction a
     //    rejection rather than a block the network throws away.
     AdmissionEvidence evidence = AdmissionEvidence::Structural;
+    // Set when the input-consensus leg could not resolve the ring (a member
+    // below the anchor / beyond the frontier). Persisted onto the pool entry so
+    // the select policy can exclude it -- the load-bearing half of the SPV fix.
+    bool ring_unresolved = false;
     if (cfg_.verify_non_input_consensus) {
         const rct::RctVerifyStatus vs = rct::verify_non_input_consensus(d.rct);
         if (vs != rct::RctVerifyStatus::Ok) {
@@ -204,6 +208,132 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
             return verdict(Reason::ProofFail, true, d.id, evidence);
         }
         evidence |= AdmissionEvidence::NonInputConsensus;
+    }
+
+    // 5b) INPUT CONSENSUS -- the CLSAG ring signature over the resolved ring
+    //     members, and the GLOBAL (on-chain) double-spend check. This is what
+    //     turns "a bad-value transaction is rejected" into "a forged-ring or an
+    //     on-chain-double-spent transaction is rejected". It runs only when a
+    //     ring source is wired; without one the leg is dormant (fail-closed at
+    //     the select policy, exactly as with non-input verification off).
+    //
+    //     Order follows monerod Blockchain::check_tx_inputs: the on-chain spent
+    //     check (m_db->has_key_image) comes BEFORE check_tx_input, unlock/age is
+    //     inside check_tx_input, and the CLSAG is verified last. A member below
+    //     the anchor / beyond our frontier is RingUnresolved: we keep the entry
+    //     on its non-input evidence and let the select policy decide, so a
+    //     mainnet node whose rings reach past its output set stays a good
+    //     citizen instead of dropping every peer.
+    if (cfg_.verify_input_consensus && ring_src_ != nullptr && spent_view_ != nullptr &&
+        !d.clsags.empty()) {
+        const std::size_t n_in = d.rct.key_images.size();
+        if (d.clsags.size() != n_in || d.key_offsets.size() != n_in ||
+            d.rct.pseudoOuts.size() != n_in || d.rct.bpp.empty()) {
+            // A shape the decoder should never hand us; refuse structurally
+            // rather than index out of bounds.
+            ++stats_.rejected;
+            return verdict(Reason::Structural, true, d.id, evidence);
+        }
+
+        // 1) GLOBAL double-spend: any key image already spent on the chain.
+        //    monerod's m_double_spend against the chain -- a no-drop refusal,
+        //    distinct from the pool-local KeyImageConflict below.
+        for (const Hash& ki : d.rct.key_images) {
+            if (spent_view_->is_spent(ki)) {
+                ++stats_.rejected;
+                ++stats_.rejected_key_image_spent;
+                return verdict(Reason::KeyImageSpent, false, d.id, evidence);
+            }
+        }
+
+        // 2) Resolve every ring from the chain output set, checking each
+        //    member's unlock / spendable age against the block we would mine.
+        const std::uint64_t next_height = tip_height_ + 1;
+        std::vector<std::vector<rct::CtKey>> rings(n_in);
+        bool unresolved = false;
+        for (std::size_t i = 0; i < n_in && !unresolved; ++i) {
+            const std::vector<std::uint64_t>& rel = d.key_offsets[i];
+            if (rel.empty()) {
+                ++stats_.rejected;
+                return verdict(Reason::Structural, true, d.id, evidence);
+            }
+            // Relative -> absolute (monerod relative_output_offsets_to_absolute):
+            // absolute[0]=rel[0], absolute[k]=absolute[k-1]+rel[k]. A zero delta
+            // past the first entry references the same output twice -- monerod's
+            // check_tx_inputs_ring_members_diff rejects it as a structural fault.
+            std::vector<std::uint64_t> abs;
+            abs.reserve(rel.size());
+            std::uint64_t acc = 0;
+            for (std::size_t k = 0; k < rel.size(); ++k) {
+                if (k > 0 && rel[k] == 0) {
+                    ++stats_.rejected;
+                    return verdict(Reason::Structural, true, d.id, evidence);
+                }
+                acc += rel[k];
+                abs.push_back(acc);
+            }
+
+            std::vector<OutputRecord> members;
+            if (!ring_src_->resolve(/*amount=*/0, abs, members) ||
+                members.size() != abs.size()) {
+                unresolved = true;
+                break;
+            }
+
+            for (const OutputRecord& m : members) {
+                // Spendable age: the output must be at least spendable_age blocks
+                // deep relative to the block we would mine (monerod
+                // DEFAULT_TX_SPENDABLE_AGE via is_tx_spendtime_unlocked).
+                if (m.height + cfg_.spendable_age > next_height) {
+                    ++stats_.rejected;
+                    ++stats_.rejected_member_locked;
+                    return verdict(Reason::RingMemberLocked, false, d.id, evidence);
+                }
+                // Per-output unlock_time: below MAX_BLOCK_NUMBER it is a height,
+                // otherwise a UNIX timestamp. For the timestamp case we take the
+                // conservative side (refuse unless already elapsed against our
+                // clock) -- documented as a deviation, never an over-admission.
+                if (m.unlock_time != 0) {
+                    const bool locked =
+                        (m.unlock_time < cfg_.max_block_number)
+                            ? (m.unlock_time > next_height)
+                            : (m.unlock_time > now());
+                    if (locked) {
+                        ++stats_.rejected;
+                        ++stats_.rejected_member_locked;
+                        return verdict(Reason::RingMemberLocked, false, d.id, evidence);
+                    }
+                }
+            }
+
+            rings[i].reserve(members.size());
+            for (const OutputRecord& m : members)
+                rings[i].push_back(rct::CtKey{m.pubkey, m.commitment});
+        }
+
+        if (unresolved) {
+            // Fail-closed, but as a good citizen: the entry keeps its non-input
+            // evidence and never gains InputConsensus, so the select policy
+            // (Exclude by default) will not mine it, while an Include policy can
+            // still relay it. No drop, no rejection counter.
+            ring_unresolved = true;
+            ++stats_.unresolved_ring;
+        } else {
+            // 3) The ring signatures. One message per transaction (the pre-MLSAG
+            //    hash), then verRctCLSAGSimple over each input's ring. A failure
+            //    is monerod's m_invalid_input -- a drop offence.
+            const rct::Key msg =
+                rct::clsag_message(d.h_prefix, d.h_base, d.rct.bpp[0]);
+            for (std::size_t i = 0; i < n_in; ++i) {
+                if (rct::verify_clsag(msg, d.clsags[i], rings[i],
+                                      d.rct.pseudoOuts[i]) != rct::ClsagStatus::Ok) {
+                    ++stats_.rejected;
+                    ++stats_.rejected_ring_sig;
+                    return verdict(Reason::RingSigFail, true, d.id, evidence);
+                }
+            }
+            evidence |= AdmissionEvidence::InputConsensus;
+        }
     }
 
     // 6) Key-image conflict against the pool. First-seen wins (see the header):
@@ -239,6 +369,7 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     e.peers.insert(from.peer_id);
     e.seen_fluff = fluff;
     e.evidence   = evidence;
+    e.ring_unresolved = ring_unresolved;
 
     insert_locked(std::move(e));
     ++stats_.accepted;
@@ -371,6 +502,17 @@ std::vector<node::TxBacklogEntry> RelayedTxPool::snapshot_locked(
 
     for (const auto& [id, e] : by_id_) {
         (void)id;
+        // The load-bearing exclusion: a ring we could not resolve carries no
+        // InputConsensus evidence, so under the default Exclude policy it is
+        // never selectable/mined -- a forged-ring tx (rejected outright when the
+        // ring resolves, unresolved when it does not) can never reach a block.
+        // Counted so an empty-because-unverifiable block is distinguishable from
+        // an empty pool. A resolvable honest ring is verified at admission and
+        // is never ring_unresolved, so good-citizen selection is preserved.
+        if (e.ring_unresolved && p.unresolved_rings == UnresolvedRingPolicy::Exclude) {
+            ++stats_.excluded_unresolved;
+            continue;
+        }
         if (!covers(e.evidence, p.required)) continue;
         if (e.seen_from_peers() < p.min_peers) continue;
         if (!e.seen_fluff && !p.allow_stem) continue;
@@ -461,6 +603,11 @@ void RelayedTxPool::unpin(const Hash& template_id) {
 void RelayedTxPool::on_block_connected(const BlockTxEvent& ev) {
     std::lock_guard<std::mutex> lk(mu_);
 
+    // The tip advanced: the block we would mine next is ev.height + 1, and that
+    // is the height the input-consensus spendable-age / unlock rules judge a
+    // ring member against.
+    tip_height_ = ev.height;
+
     for (const Hash& id : ev.tx_hashes) {
         if (by_id_.find(id) == by_id_.end()) continue;
         erase_locked(id);
@@ -480,6 +627,12 @@ void RelayedTxPool::on_block_connected(const BlockTxEvent& ev) {
 }
 
 void RelayedTxPool::on_block_disconnected(const BlockTxEvent& ev) {
+    // The disconnected block is no longer the tip; the new tip is one lower.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ev.height > 0) tip_height_ = ev.height - 1;
+    }
+
     // Bodies returned by the index are BEST EFFORT and carry no authority
     // (contracts/types.hpp must-fix d), so they go back through the SAME
     // admission path as anything off the wire: decoded again, verified again.
@@ -497,6 +650,13 @@ void RelayedTxPool::on_block_disconnected(const BlockTxEvent& ev) {
 void RelayedTxPool::set_synced(bool synced) {
     std::lock_guard<std::mutex> lk(mu_);
     synced_ = synced;
+}
+
+void RelayedTxPool::set_input_consensus_sources(const IRingMemberSource* ring_src,
+                                                const ISpentKeyImageView* spent_view) {
+    std::lock_guard<std::mutex> lk(mu_);
+    ring_src_   = ring_src;
+    spent_view_ = spent_view;
 }
 
 bool RelayedTxPool::synced() const {
@@ -534,6 +694,7 @@ std::vector<TxpoolFact> RelayedTxPool::facts() const {
         f.evidence      = e.evidence;
         f.peers         = e.seen_from_peers();
         f.time_received = e.time_received;
+        f.ring_unresolved = e.ring_unresolved;
         out.push_back(f);
     }
     return out;

@@ -118,6 +118,16 @@ bool in_main_subgroup(const Key& P) noexcept;
 // A 64-bit amount as a scalar (little-endian in the low 8 bytes). Upstream d2h.
 Key amount_to_scalar(std::uint64_t amount) noexcept;
 
+// The "zero" Pedersen commitment for a cleartext amount: C = 1*G + amount*H,
+// upstream rct::zeroCommit(amount) = addKeys(G, scalarmultH(d2h(amount))). This
+// is the commitment monerod stores in the amount-0 global output table for a
+// v2 COINBASE output, whose amount is public: the miner_tx carries no outPk, so
+// a downstream output set must synthesise the ring member's commitment from the
+// cleartext vout amount exactly this way, or a ring spending a coinbase output
+// would be numbered with the wrong commitment and every honest CLSAG over it
+// would fail. zeroCommit(0) == G, which the KAT pins.
+Key zero_commit(std::uint64_t amount) noexcept;
+
 // --- randomness --------------------------------------------------------------
 // A nonzero random scalar, used ONLY as the per-proof weight in the batched
 // verification identity. It is not a secret and it is not consensus: any
