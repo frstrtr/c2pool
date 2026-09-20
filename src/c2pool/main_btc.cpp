@@ -1624,6 +1624,16 @@ int main(int argc, char* argv[])
     auto p2p_node = std::make_shared<btc::Node>(&ioc, &config);
     p2p_node->set_lifetime(p2p_node);
     assert(p2p_node->lifetime_armed() && "BTC sharechain node dial/accept lifetime failed to arm");
+    // VERSTR: advertise a lane-labeled sub_version so third-party operators on
+    // the live public sharechain can distinguish the btc lane from ltc/dgb (was
+    // the generic "/c2pool:0.1/" default). C2POOL_VERSION is the build-time
+    // git-describe string from the header wired onto this c2pool-* target;
+    // guarded so a header-less build keeps the default rather than advertising
+    // "c2pool-btc/" with an empty version. make_subversion caps at 512 bytes
+    // (canonical p2p.py:154).
+#ifdef C2POOL_VERSION
+    p2p_node->set_software_version(btc::make_subversion("btc", C2POOL_VERSION));
+#endif
     p2p_node->set_target_outbound_peers(
         sharechain_addnodes.empty()
             ? 4

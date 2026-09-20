@@ -31,9 +31,29 @@
 #include <set>
 #include <nlohmann/json.hpp>
 
+#include <string_view>
+
 namespace btc
 {
 struct HandleSharesData;
+
+// VERSTR (P2P sub_version) composition -- pure, header-only so the KAT in
+// btc_share_test can drive it with real types. Canonical p2pool-dash caps
+// sub_version at 512 bytes (p2p.py:154); we cap here too, so an over-long
+// build-version string can never corrupt the version handshake. main_btc
+// composes the live string as make_subversion("btc", C2POOL_VERSION) and
+// feeds it to set_software_version(); the previous generic "/c2pool:0.1/"
+// default gave third-party operators on the live sharechain no way to tell
+// the btc lane from ltc/dgb.
+inline std::string make_subversion(std::string_view lane, std::string_view version)
+{
+    std::string s = "c2pool-";
+    s += lane;
+    s += '/';
+    s += version;
+    if (s.size() > 512) s.resize(512);   // p2p.py:154 sub_version[:512]
+    return s;
+}
 struct ShareReplyData
 {
     std::vector<ShareType> m_items;
