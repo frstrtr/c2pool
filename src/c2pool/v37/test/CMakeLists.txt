@@ -770,6 +770,34 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_s1c_recovery_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_s1c_recovery_kat Threads::Threads)
     add_test(NAME v37_xmr_s1c_recovery_kat COMMAND v37_xmr_s1c_recovery_kat)
+    # RECON Phase-1 (operator-ruled 2026-09-20) -- the payout-side convergence
+    # mechanism, exercised through the PRODUCTION XmrReconRing + XmrRecon::evaluate.
+    # Proves: CONTROL (recompute-at-receipt) FORKS at the first settling block (the
+    # cursor-15 defect); RECON converges owed_digest BYTE-EQUAL through every
+    # settling block with 0 new wire bytes and its final digest == the winner's-map
+    # ORACLE; a win it cannot reconstruct is PARKED then REFUSED (fail-closed, never
+    # a different map) and the fetch/repair loop re-converges; a non-fleet-identical
+    # K_fair cap is REFUSED loudly. Stdlib + Threads (the engine executor thread):
+    # no coin lib, no crypto backend, no sockets. SAME HOLLOW-GREEN GUARD as the
+    # sibling suites: ALSO listed on BOTH build.yml --target lists so CI compiles +
+    # RUNS it instead of a NOT_BUILT sentinel (the c2pool#1539 unregistered class).
+    add_executable(v37_xmr_recon_kat
+        v37_xmr_recon_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_recon_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_recon_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    # RECON's verify leg (xmr_recon_verify.hpp) rebuilds the canonical W5-XMR
+    # coinbase via x6::build_coinbase / canonical_coinbase_matches, so the coin
+    # library (settle/xmr_coinbase.cpp + the ed25519 point check) is linked --
+    # the SAME real-crypto path the node runs on its own template pre-publish,
+    # here run against the peer's block. NOT a sha256d stand-in.
+    target_compile_definitions(v37_xmr_recon_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_recon_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_recon_kat COMMAND v37_xmr_recon_kat)
     # ★ S-1b — THE first_eligible ARMING RULE, as a FROM-SPEC SHADOW. owed_digest
     # commits "V37O" || per finalW row key || i64 finalW || u64 first_eligible, and
     # the shipped rearm arms a key at the bin its EffectiveOwed (finalW minus the
