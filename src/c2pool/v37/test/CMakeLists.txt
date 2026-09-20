@@ -474,6 +474,67 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_prefer_own_race_kat PRIVATE xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_prefer_own_race_kat COMMAND v37_xmr_prefer_own_race_kat)
 
+    # ------------------------------------------------------------------
+    # MAINNET READINESS -- the pool binary's own native-node plumbing.
+    #
+    #   v37_xmr_mainnet_readiness_kat
+    #     Three knobs the embedded node has always had were unreachable from
+    #     c2pool-v37-xmr, each in the same way: the node field existed, the
+    #     standalone xmr_native_node tool exposed it, and the pool binary's argv
+    #     loop had no arm for it -- so the flag was not a flag and the default
+    #     happened instead. This KAT pins the PARSE and the FORWARD as the one
+    #     code path the daemon actually runs on:
+    #
+    #       A  apply_native_node_flag(): the three gate 4 window flags,
+    #          --native-seeds/--seeds and the snapshot pair parse; absent flags
+    #          leave the node's own defaults; a malformed one (no value, not a
+    #          number, or a zero that would disarm gate 4) REFUSES.
+    #       B  native_template_config_of(): every parsed knob arrives in
+    #          NativeTemplateConfig, the defaults are equal to
+    #          AnchorConfirmConfig's own so the two sets cannot drift, and NO
+    #          configuration -- including a hand-zeroed one built in code --
+    #          forwards a confirm config that is not sane().
+    #       C  the mainnet seed sets: four DNS seed hosts on 18080 (monerod
+    #          guards them with `if MAINNET`, and so do we), the two test
+    #          networks correctly with none, and --seeds accepted as an address
+    #          source for the p2p-first precondition.
+    #       D  the snapshot's DISK half (node/xmr_chain_snapshot_store.hpp):
+    #          save -> envelope -> temp+rename write -> read -> decode -> load
+    #          round-trips an index to the same tip, frontier and template
+    #          inputs, and every corruption -- short, tampered, truncated,
+    #          foreign network, foreign anchor, wrong magic, wrong version,
+    #          lying length -- is REFUSED so the node stays on its anchor boot.
+    #       E  gate 4 is STILL fail-closed through that config: a tampered
+    #          anchor id cannot be confirmed by the genuine block, the forwarded
+    #          peer bound is the bound that is enforced, and the deadline
+    #          refuses. There is no flag that turns the gate off.
+    #
+    #     The index codec itself is xmr_native_chain_index_kat's and gate 4's
+    #     blob-level judgement is xmr_native_anchor_gate4_kat's; this file is
+    #     about the wiring between them and the pool binary. No sockets, no
+    #     daemon, no RandomX.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_mainnet_readiness_kat v37_xmr_mainnet_readiness_kat.cpp)
+    target_compile_features(v37_xmr_mainnet_readiness_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_mainnet_readiness_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_mainnet_readiness_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    if (TARGET Boost::headers)
+        target_link_libraries(v37_xmr_mainnet_readiness_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(v37_xmr_mainnet_readiness_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(v37_xmr_mainnet_readiness_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME v37_xmr_mainnet_readiness_kat COMMAND v37_xmr_mainnet_readiness_kat)
+
     # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.
     # Proves the gap the Phase-B single-node daemon had: node B accounts node A's
     # shares. Wires the SAME production consumer code the daemon does — the W3
