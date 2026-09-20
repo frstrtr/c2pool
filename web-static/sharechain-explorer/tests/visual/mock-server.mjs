@@ -6,7 +6,7 @@
 // Usage: node tests/visual/mock-server.mjs [port=18082]
 
 import { createServer } from 'node:http';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { extname, join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,7 +14,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '../../../../');            // c2pool repo root
 const STATIC_ROOT = resolve(ROOT, 'web-static');
 const FIXTURES = join(HERE, 'fixtures');
+// Pass 0 (CI default via run.sh) to bind an OS-assigned ephemeral port
+// so concurrent runs on the same host never collide (EADDRINUSE). The
+// literal 18082 is only a manual-dev fallback when no port arg is given;
+// run.sh always passes an explicit port so CI never binds it.
 const PORT = Number(process.argv[2] ?? 18082);
+const PORTFILE = process.argv[3];   // optional: file to publish the bound port
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -112,5 +117,10 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`mock c2pool listening on http://127.0.0.1:${PORT}`);
+  // Read back the ACTUAL bound port (may differ from PORT when PORT=0)
+  // and publish it so the orchestrator threads it into health-poll and
+  // capture instead of assuming a fixed port.
+  const boundPort = server.address().port;
+  if (PORTFILE) writeFileSync(PORTFILE, String(boundPort));
+  console.log(`mock c2pool listening on http://127.0.0.1:${boundPort}`);
 });
