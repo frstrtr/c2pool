@@ -6894,6 +6894,18 @@ nlohmann::json MiningInterface::rest_v36_status()
         {"v36_shares", v36_shares},
         {"v36_percentage", v36_pct}
     };
+
+    // #940 D-EMB.940: surface coin-P2P dial-reachability in /v36_status too, so
+    // the V36 diagnostic distinguishes a node that cannot dial ANY peer from one
+    // that connected but holds empty state. Same verbatim pass-through as
+    // rest_version_signaling()/rest_local_stats(); harmless for coins that do
+    // not emit it.
+    if (m_coin_sync_status_fn) {
+        auto ss = m_coin_sync_status_fn();
+        if (ss.is_object() && ss.contains("coin_p2p") && ss["coin_p2p"].is_object())
+            result["coin_p2p"] = ss["coin_p2p"];
+    }
+
     return result;
 }
 
