@@ -32,13 +32,26 @@
 // the historical output/spent set instead of being blind to pre-anchor outputs.
 //
 // COVERAGE, stated honestly. `first_output_index` is the anchor's
-// rct_output_count (0 on a regtest chain from genesis). A ring member BELOW that
-// index was created before the anchor and is NOT in this set: resolve() returns
-// false for it and the pool fails closed (RingUnresolved). So this is COMPLETE
-// input consensus for a regtest-from-genesis chain and for any mainnet ring
-// whose members are all above the anchor; the pre-anchor history (mainnet
-// O-backfill) is loaded from an anchor-committed snapshot -- a seam, not yet
-// wired.
+// rct_output_count. On a chain the node followed from genesis (regtest, or a
+// from-genesis walk) it is 0 and the set is COMPLETE: every amount-0 output ever
+// created is in it, numbered from 0. On a FORMAT-2 anchor boot it is the real
+// count at H_a: a ring member below it is pre-anchor, resolve() returns false,
+// and the pool fails closed (RingUnresolved) unless the format-2 snapshot has
+// been seeded (seed_from_snapshot), which backfills the below-base history so
+// those members resolve.
+//
+// A FORMAT-1 anchor carries NO rct_output_count -- anchor_self_check forces all
+// six format-2 fields to zero, so the count is 0 even though the chain's real
+// count at H_a is not. The node therefore CANNOT number from the real base: a
+// base of 0 would misnumber every post-anchor output, and an HONEST ring whose
+// real member sits below the (unknown) real base would resolve to the WRONG
+// post-anchor output and be scored a forged ring -- RingSigFail, a DROP OFFENCE
+// against an honest peer. So a format-1 boot DISABLES resolution outright
+// (disable_resolution(), wired in xmr_native_node.hpp): resolve() returns false
+// for every ring, all rings stay RingUnresolved (fail-closed), and no honest
+// peer is ever mis-scored. The spent-key-image view is unaffected. The pre-anchor
+// history is loaded from a format-2 anchor-committed snapshot -- the O-backfill
+// seam.
 //
 // COINBASE COMMITMENTS. A version-2 coinbase output has a PUBLIC amount and
 // carries no outPk, so monerod stores rct::zeroCommit(amount) as its commitment.
@@ -73,6 +86,7 @@
 #include <sharechain/v37/v37_fixed.hpp>   // ::v37::u64
 #include <sharechain/v37/v37_lane.hpp>    // ::v37::PeakSet, ::v37::Lane MMR statics
 
+#include "impl/xmr/native/contracts/anchor.hpp"
 #include "impl/xmr/native/contracts/outputs.hpp"
 #include "impl/xmr/native/contracts/types.hpp"
 #include "impl/xmr/native/rct/xmr_rct_ops.hpp"               // rct::zero_commit
@@ -106,12 +120,33 @@ public:
         return true;
     }
 
+    // Disable ring resolution outright: resolve() then returns false for EVERY
+    // ring, so the pool leaves them all RingUnresolved (fail-closed). Called on a
+    // FORMAT-1 anchor boot, where the bundle carries no rct_output_count so the
+    // real numbering base is unknown -- resolving anything from base=0 would
+    // misnumber an honest ring below the real base and RingSigFail it (a drop
+    // offence against an honest peer). The spent-key-image view (is_spent) is
+    // unaffected, and the from-genesis / format-2 paths never call this and keep
+    // resolving. Idempotent.
+    void disable_resolution() {
+        std::lock_guard<std::mutex> lk(mu_);
+        resolution_enabled_ = false;
+    }
+    bool resolution_enabled() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return resolution_enabled_;
+    }
+
     // --- IRingMemberSource --------------------------------------------------
     bool resolve(std::uint64_t amount,
                  const std::vector<std::uint64_t>& absolute_offsets,
                  std::vector<OutputRecord>&        out) const override {
         if (amount != 0) return false;
         std::lock_guard<std::mutex> lk(mu_);
+        // Format-1 anchor boot: the numbering base is unknown, so resolution is
+        // disabled and every ring is left RingUnresolved (fail-closed) rather
+        // than mis-resolved to a wrong post-anchor output.
+        if (!resolution_enabled_) return false;
         out.clear();
         out.reserve(absolute_offsets.size());
         for (std::uint64_t off : absolute_offsets) {
@@ -410,6 +445,109 @@ public:
         return set;
     }
 
+    // --- format-2 anchor seed (O-backfill) ----------------------------------
+    // Seed the historical set from an operator-supplied snapshot (serialize()
+    // form) committed by a format-2 anchor, so a daemonless node booting from
+    // that anchor can RESOLVE + CLSAG-verify rings whose members are BELOW the
+    // anchor's numbering base, and reject a below-base double-spend. Legal only
+    // on an EMPTY set (at boot, before any block feeds).
+    //
+    // WHAT THE ANCHOR AUTHENTICATES, STATED PRECISELY. The snapshot's peaks are
+    // RE-DERIVED from its leaves inside deserialize() (the record-log rule), and
+    // this checks the re-derived output/spent ROOTS, the two LEAF COUNTS, the
+    // TIP, and the FRONTIER against the bundle -- so the snapshot's authenticated
+    // LEAF STRUCTURE is bound to the anchor and any corruption that reaches a
+    // leaf (bulk/random damage always does) fails closed, leaving the set empty.
+    // The serialize() form (inherited from the input-consensus pass) stores the
+    // resolve table and the flat spent set SEPARATELY from the leaves and carries
+    // no per-block block_id, so a surgical edit that changes only those tables
+    // while leaving every leaf intact is NOT caught here: the operator-supplied
+    // snapshot is a TRUSTED input whose structure the anchor verifies, not an
+    // untrusted blob made trustless by the roots alone. The fully trustless path
+    // -- a peer walking blocks 1..H_a and re-deriving the tables to the same
+    // roots -- is the documented O-backfill follow-on (node/xmr_sync_driver).
+    bool seed_from_snapshot(const std::string& blob, const AnchorBundle& b, std::string& why) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!outputs_.empty() || tip_height_ != 0 || out_peaks_.leaf_count != 0
+            || !spent_.empty()) {
+            why = "output set is not empty; seed the anchor snapshot before any block connects";
+            return false;
+        }
+        if (!b.has_output_set()) {
+            why = "anchor bundle carries no committed output set to seed against";
+            return false;
+        }
+        std::unique_ptr<ChainOutputSet> t = deserialize(blob);
+        if (!t) { why = "output-set snapshot does not deserialize"; return false; }
+
+        // Every committed quantity must match the re-derived snapshot exactly.
+        if (t->tip_height_ != b.height) {
+            why = "snapshot tip height " + std::to_string(t->tip_height_)
+                + " != anchor height " + std::to_string(b.height);
+            return false;
+        }
+        if (t->tip_id_ != b.id) { why = "snapshot tip id != anchor id"; return false; }
+        if (t->base_ + t->outputs_.size() != b.rct_output_count) {
+            why = "snapshot frontier " + std::to_string(t->base_ + t->outputs_.size())
+                + " != anchor rct_output_count " + std::to_string(b.rct_output_count);
+            return false;
+        }
+        if (t->out_peaks_.leaf_count != b.output_set_leaves) {
+            why = "snapshot output-leaf count " + std::to_string(t->out_peaks_.leaf_count)
+                + " != anchor output_set_leaves " + std::to_string(b.output_set_leaves);
+            return false;
+        }
+        if (::v37::Lane::mmr_bag(t->out_peaks_.peaks) != b.output_set_root) {
+            why = "snapshot output-set root does not match the anchor's committed root";
+            return false;
+        }
+        if (t->ki_peaks_.leaf_count != b.spent_set_leaves) {
+            why = "snapshot spent-leaf count " + std::to_string(t->ki_peaks_.leaf_count)
+                + " != anchor spent_set_leaves " + std::to_string(b.spent_set_leaves);
+            return false;
+        }
+        if (::v37::Lane::mmr_bag(t->ki_peaks_.peaks) != b.spent_set_root) {
+            why = "snapshot spent-set root does not match the anchor's committed root";
+            return false;
+        }
+
+        // Adopt the re-derived, root-checked state. The numbering base becomes
+        // the snapshot's (0 on a from-genesis walk), so below-base offsets now
+        // satisfy off >= base_ in resolve() and CLSAG runs. undo_ stays empty:
+        // pre-anchor blocks are below the reorg floor and are never disconnected.
+        base_           = t->base_;
+        outputs_        = std::move(t->outputs_);
+        spent_          = std::move(t->spent_);
+        out_peaks_      = t->out_peaks_;
+        out_leaves_     = std::move(t->out_leaves_);
+        out_leaf_first_ = std::move(t->out_leaf_first_);
+        ki_peaks_       = t->ki_peaks_;
+        ki_leaves_      = std::move(t->ki_leaves_);
+        tip_height_     = t->tip_height_;
+        tip_id_         = t->tip_id_;
+        why.clear();
+        return true;
+    }
+
+    // Membership check for a single global output index against the seeded root:
+    // resolves the covering leaf, proves it, and verifies the proof against
+    // output_root(). Exposed for the KAT's below-base membership assertion.
+    bool verify_member(std::uint64_t global_index) const {
+        bytes32 leaf{};
+        ::v37::Lane::MmrProof proof;
+        bytes32 root;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            // Only an index actually inside the set is a member; prove_output
+            // returns the covering leaf and does not itself bound the far end.
+            if (global_index < base_ || global_index >= base_ + outputs_.size())
+                return false;
+            root = ::v37::Lane::mmr_bag(out_peaks_.peaks);
+        }
+        if (!prove_output(global_index, leaf, proof)) return false;
+        return ::v37::Lane::mmr_verify(root, leaf, proof);
+    }
+
     // --- introspection (KATs, dashboard) ------------------------------------
     std::uint64_t first_output_index() const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -482,6 +620,9 @@ private:
 
     mutable std::mutex               mu_;
     std::uint64_t                    base_ = 0;   // first_output_index
+    // False only after disable_resolution() -- a FORMAT-1 anchor boot, where the
+    // real numbering base is unknown. resolve() then fails closed for every ring.
+    bool                             resolution_enabled_ = true;
     std::vector<OutputRecord>        outputs_;    // random-access resolve table
     std::unordered_set<Hash, HashHasher> spent_;  // random-access spent oracle
 

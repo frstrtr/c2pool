@@ -65,9 +65,20 @@
 
 namespace c2pool::xmr::native {
 
-// The only format version this build reads. A bump means a reader change, so a
-// newer file is REFUSED rather than parsed on a guess.
-inline constexpr std::uint32_t ANCHOR_INC_FORMAT_VERSION = 1;
+// The HIGHEST format version this build reads. A newer file is REFUSED rather
+// than parsed on a guess. Version 1 is the original bundle; version 2 APPENDS
+// the committed output-set / spent-set roots (contracts/anchor.hpp
+// has_output_set), and is emitted only when a set is present -- a bundle
+// without one is written byte-identically to a version-1 file.
+inline constexpr std::uint32_t ANCHOR_INC_FORMAT_VERSION = 2;
+
+// The on-disk format a bundle serialises as: 2 when it carries a committed
+// output set, 1 otherwise. This is the PRESENCE RULE that keeps every existing
+// format-1 `.inc` byte-for-byte unchanged -- the six format-2 lines appear only
+// alongside a set, and the `format` line and digest follow suit.
+inline std::uint32_t anchor_inc_format_of(const AnchorBundle& b) noexcept {
+    return b.has_output_set() ? 2u : 1u;
+}
 
 inline constexpr const char* ANCHOR_INC_FRAME_OPEN  = "R\"ANCHOR(";
 inline constexpr const char* ANCHOR_INC_FRAME_CLOSE = ")ANCHOR\"";
@@ -287,7 +298,7 @@ inline std::string anchor_body_text(const AnchorBundle& b) {
     std::string s;
     s.reserve(4096 + b.long_term_weights.size() * 4);
 
-    s += "format " + std::to_string(ANCHOR_INC_FORMAT_VERSION) + "\n";
+    s += "format " + std::to_string(anchor_inc_format_of(b)) + "\n";
     s += "network " + b.network + "\n";
     s += "height " + std::to_string(b.height) + "\n";
     s += "id " + to_hex(b.id) + "\n";
@@ -296,6 +307,18 @@ inline std::string anchor_body_text(const AnchorBundle& b) {
     s += "major_version " + std::to_string(static_cast<unsigned>(b.major_version)) + "\n";
     s += "cumulative_difficulty " + u128_text(b.cumulative_difficulty) + "\n";
     s += "already_generated_coins " + std::to_string(b.already_generated_coins) + "\n";
+
+    // Format-2 committed set: emitted ONLY when a set is present, so a format-1
+    // bundle produces exactly the bytes above and nothing here. Order matters --
+    // the reader and the Python capture tool mirror it exactly.
+    if (b.has_output_set()) {
+        s += "rct_output_count " + std::to_string(b.rct_output_count) + "\n";
+        s += "output_set_base_height " + std::to_string(b.output_set_base_height) + "\n";
+        s += "output_set_leaves " + std::to_string(b.output_set_leaves) + "\n";
+        s += "output_set_root " + to_hex(b.output_set_root) + "\n";
+        s += "spent_set_leaves " + std::to_string(b.spent_set_leaves) + "\n";
+        s += "spent_set_root " + to_hex(b.spent_set_root) + "\n";
+    }
 
     for (const auto& sd : b.seed_ids)
         s += "seed " + std::to_string(sd.first) + " " + to_hex(sd.second) + "\n";
@@ -364,6 +387,10 @@ inline AnchorParse parse_anchor_inc(const std::string& text, AnchorBundle& out, 
     bool have_format = false, have_network = false, have_height = false;
     bool have_id = false, have_prev = false, have_ts = false, have_ver = false;
     bool have_cumdiff = false, have_coins = false;
+    std::uint32_t fmt = 0;   // 1 or 2, set by the `format` line
+    // Format-2 once-only keys (all six present together or none at all).
+    bool have_rct_count = false, have_os_base = false, have_os_leaves = false;
+    bool have_os_root = false, have_ss_leaves = false, have_ss_root = false;
     std::array<std::uint8_t, 32> file_digest{};
     bool have_digest = false;
 
@@ -408,9 +435,10 @@ inline AnchorParse parse_anchor_inc(const std::string& text, AnchorBundle& out, 
             if (have_format) return fail(AnchorParse::DuplicateKey, "format repeated");
             std::uint64_t v = 0;
             if (t.size() != 2 || !parse_u64(t[1], v)) return fail(AnchorParse::BadFormat, "format takes one number");
-            if (v != ANCHOR_INC_FORMAT_VERSION)
-                return fail(AnchorParse::BadFormat, "format " + t[1] + " is not the "
-                            + std::to_string(ANCHOR_INC_FORMAT_VERSION) + " this build reads");
+            if (v != 1 && v != ANCHOR_INC_FORMAT_VERSION)
+                return fail(AnchorParse::BadFormat, "format " + t[1] + " is not 1 or "
+                            + std::to_string(ANCHOR_INC_FORMAT_VERSION) + ", which is all this build reads");
+            fmt = static_cast<std::uint32_t>(v);
             have_format = true;
         } else if (!have_format) {
             return fail(AnchorParse::BadFormat, "'" + key + "' before the format line");
@@ -452,6 +480,48 @@ inline AnchorParse parse_anchor_inc(const std::string& text, AnchorBundle& out, 
             if (t.size() != 2 || !parse_u64(t[1], out.already_generated_coins))
                 return fail(AnchorParse::BadField, "already_generated_coins");
             have_coins = true;
+        } else if (key == "rct_output_count") {
+            if (fmt == 1) return fail(AnchorParse::BadFormat, "rct_output_count requires format 2");
+            if (have_rct_count) return fail(AnchorParse::DuplicateKey, "rct_output_count repeated");
+            if (t.size() != 2 || !parse_u64(t[1], out.rct_output_count))
+                return fail(AnchorParse::BadField, "rct_output_count");
+            have_rct_count = true;
+        } else if (key == "output_set_base_height") {
+            if (fmt == 1) return fail(AnchorParse::BadFormat, "output_set_base_height requires format 2");
+            if (have_os_base) return fail(AnchorParse::DuplicateKey, "output_set_base_height repeated");
+            if (t.size() != 2 || !parse_u64(t[1], out.output_set_base_height))
+                return fail(AnchorParse::BadField, "output_set_base_height");
+            have_os_base = true;
+        } else if (key == "output_set_leaves") {
+            if (fmt == 1) return fail(AnchorParse::BadFormat, "output_set_leaves requires format 2");
+            if (have_os_leaves) return fail(AnchorParse::DuplicateKey, "output_set_leaves repeated");
+            if (t.size() != 2 || !parse_u64(t[1], out.output_set_leaves))
+                return fail(AnchorParse::BadField, "output_set_leaves");
+            if (out.output_set_leaves == 0)
+                return fail(AnchorParse::BadField, "output_set_leaves is zero in a format-2 bundle");
+            have_os_leaves = true;
+        } else if (key == "output_set_root") {
+            if (fmt == 1) return fail(AnchorParse::BadFormat, "output_set_root requires format 2");
+            if (have_os_root) return fail(AnchorParse::DuplicateKey, "output_set_root repeated");
+            Hash h{};
+            if (t.size() != 2 || !parse_hash(t[1], h))
+                return fail(AnchorParse::BadField, "output_set_root takes one 64-hex value");
+            out.output_set_root = h;
+            have_os_root = true;
+        } else if (key == "spent_set_leaves") {
+            if (fmt == 1) return fail(AnchorParse::BadFormat, "spent_set_leaves requires format 2");
+            if (have_ss_leaves) return fail(AnchorParse::DuplicateKey, "spent_set_leaves repeated");
+            if (t.size() != 2 || !parse_u64(t[1], out.spent_set_leaves))
+                return fail(AnchorParse::BadField, "spent_set_leaves");
+            have_ss_leaves = true;
+        } else if (key == "spent_set_root") {
+            if (fmt == 1) return fail(AnchorParse::BadFormat, "spent_set_root requires format 2");
+            if (have_ss_root) return fail(AnchorParse::DuplicateKey, "spent_set_root repeated");
+            Hash h{};
+            if (t.size() != 2 || !parse_hash(t[1], h))
+                return fail(AnchorParse::BadField, "spent_set_root takes one 64-hex value");
+            out.spent_set_root = h;
+            have_ss_root = true;
         } else if (key == "seed") {
             if (out.seed_ids.size() >= ANCHOR_MAX_SEED_IDS)
                 return fail(AnchorParse::BadField, "more than "
@@ -496,21 +566,33 @@ inline AnchorParse parse_anchor_inc(const std::string& text, AnchorBundle& out, 
               "timestamp/major_version/cumulative_difficulty/already_generated_coins)";
         return AnchorParse::MissingKey;
     }
+    // A format-2 bundle carries all six committed-set keys or it is malformed --
+    // a partial set is not a format-1 bundle and must not be read as one.
+    if (fmt == 2 && !(have_rct_count && have_os_base && have_os_leaves
+                      && have_os_root && have_ss_leaves && have_ss_root)) {
+        why = "format-2 anchor .inc is missing a committed-set key (rct_output_count/"
+              "output_set_base_height/output_set_leaves/output_set_root/"
+              "spent_set_leaves/spent_set_root)";
+        return AnchorParse::MissingKey;
+    }
     if (!have_digest) { why = "anchor .inc has no digest line"; return AnchorParse::DigestPlace; }
 
     // Window lengths are checked here as well as in anchor_self_check: the parser
     // needs the counts to bound its own allocations, and a short window is a file
-    // defect, so it is reported as one.
-    if (out.difficulty_window.size() != ANCHOR_DIFFICULTY_WINDOW
-        || out.short_term_weights.size() != ANCHOR_SHORT_TERM_WEIGHTS
-        || out.long_term_weights.size() != ANCHOR_LONG_TERM_WEIGHTS) {
+    // defect, so it is reported as one. The expected lengths are height-relative
+    // (young-chain aware) -- see contracts/anchor.hpp anchor_expected_rows.
+    const AnchorWindowLengths need = anchor_expected_rows(out.height);
+    if (out.difficulty_window.size() != need.difficulty
+        || out.short_term_weights.size() != need.short_term
+        || out.long_term_weights.size() != need.long_term) {
         why = "anchor .inc window lengths are "
             + std::to_string(out.difficulty_window.size()) + "/"
             + std::to_string(out.short_term_weights.size()) + "/"
             + std::to_string(out.long_term_weights.size()) + ", required "
-            + std::to_string(ANCHOR_DIFFICULTY_WINDOW) + "/"
-            + std::to_string(ANCHOR_SHORT_TERM_WEIGHTS) + "/"
-            + std::to_string(ANCHOR_LONG_TERM_WEIGHTS);
+            + std::to_string(need.difficulty) + "/"
+            + std::to_string(need.short_term) + "/"
+            + std::to_string(need.long_term) + " at height "
+            + std::to_string(out.height);
         return AnchorParse::BadField;
     }
 
