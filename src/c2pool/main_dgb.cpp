@@ -257,7 +257,13 @@ int run_node(const core::CoinParams& params, bool testnet,
              // (pool P2P) peer(s) to pin. When non-empty, seeds ONLY these into
              // m_bootstrap_addrs (public defaults suppressed); empty falls back to
              // DEFAULT_BOOTSTRAP_HOSTS. Contabo DGB revival lever. Mirrors BCH.
-             const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes = {})
+             const std::vector<std::pair<std::string, uint16_t>>& sharechain_addnodes = {},
+             // Parent coin-daemon P2P dial port ported from the LTC seam
+             // (main_ltc.cpp coind_p2p_port / --coind-p2p-port). -1 (unset) keeps the
+             // historical behavior of dialing --coin-daemon own :PORT; >0 makes this
+             // the authoritative P2P dial port so --coin-daemon may carry the RPC
+             // :PORT while the embedded coin-P2P still reaches the real parent P2P port.
+             int coind_p2p_port = -1)
 {
     io::io_context ioc;
 
@@ -1207,8 +1213,12 @@ int run_node(const core::CoinParams& params, bool testnet,
         config.coin()->m_p2p.prefix = coin_magic;
         const auto colon = coin_daemon.rfind(':');
         const std::string host = coin_daemon.substr(0, colon);
-        const uint16_t port =
-            static_cast<uint16_t>(std::stoi(coin_daemon.substr(colon + 1)));
+        // LTC seam (main_ltc.cpp coind_p2p_port): an explicit --coind-p2p-port (>0)
+        // is the authoritative P2P dial port, so --coin-daemon may carry the RPC :PORT
+        // (the VM115 14022-vs-18444 mismatch) while we still dial the real P2P port.
+        const uint16_t port = coind_p2p_port > 0
+            ? static_cast<uint16_t>(coind_p2p_port)
+            : static_cast<uint16_t>(std::stoi(coin_daemon.substr(colon + 1)));
         const NetService target(host, port);
         config.coin()->m_p2p.address = target;
 
@@ -1938,8 +1948,7 @@ int run_node(const core::CoinParams& params, bool testnet,
         if (stratum_server->start()) {
             std::cout << "[DGB] stratum listening on " << stratum_addr << ":"
                       << stratum_port
-                      << " (work source: DGBWorkSource 4a skeleton — Scrypt-only;"
-                      << " work-gen/share-validation land in 4b/4c)" << std::endl;
+                      << " (work source: DGBWorkSource — Scrypt-only)" << std::endl;
         } else {
             std::cout << "[DGB] stratum FAILED to bind " << stratum_addr << ":"
                       << stratum_port << " — stratum disabled" << std::endl;
@@ -2733,6 +2742,7 @@ int main(int argc, char** argv)
     uint16_t    http_port = 0;              // 0 disables dashboard; --http sets it (H-STATS.944)
     uint16_t    sharechain_port = 0;        // 0 = default P2P_PORT (5024); --sharechain-port overrides (opt-in isolation)
     std::string coin_daemon;                // --coin-daemon HOST:PORT (embedded P2P producer target)
+    int         coind_p2p_port = -1;        // --coind-p2p-port PORT (LTC seam); -1=use --coin-daemon :PORT, >0 overrides P2P dial port
     std::vector<std::byte> coin_magic;      // --coin-magic HEX (network pchMessageStart)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
@@ -2838,6 +2848,9 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--coin-daemon") == 0 && i + 1 < argc) {
             coin_daemon = argv[++i];               // embedded coin-daemon P2P endpoint
+        }
+        else if (std::strcmp(argv[i], "--coind-p2p-port") == 0 && i + 1 < argc) {
+            coind_p2p_port = std::stoi(argv[++i]); // parent coin P2P dial port (LTC seam; overrides --coin-daemon :PORT)
         }
         else if (std::strcmp(argv[i], "--coin-magic") == 0 && i + 1 < argc) {
             coin_magic = ParseHexBytes(argv[++i]); // network magic (pchMessageStart)
@@ -3003,7 +3016,8 @@ int main(int argc, char** argv)
                         merged_chain_specs, doge_p2p_address, doge_p2p_port,
                         embedded_doge,
                         serve_mempool_txs, serve_mempool_txs_off,
-                        sharechain_addnodes);
+                        sharechain_addnodes,
+                        coind_p2p_port);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
