@@ -509,7 +509,8 @@ private:
 
         for (const std::string& key : d.dial) begin_dial(key);
 
-        elect(live, now);
+        // publish_snapshot() now elects from the current peer set; no separate
+        // elect() here (the `live`/`now` planning inputs above are unchanged).
         publish_snapshot();
     }
 
@@ -1079,10 +1080,23 @@ private:
     }
 
     void publish_snapshot() {
+        const Millis now = now_ms();
+
+        // Elect from the very peer set this snapshot is about to publish, so
+        // tel_.primary is always consistent with tel_.peers_handshaked. Electing
+        // only on the maintenance tick left a window -- up to maintenance_tick_ms
+        // wide -- in which a just-handshaked peer was already visible through
+        // peer_count()/peers_handshaked while tel_.primary still held the stale
+        // pre-handshake value. That is the gap the peer-pool KAT read after
+        // peer_count()==1 (and the ~1s window in which a block-relay decision
+        // keyed on `primary` would briefly see none right after the sole peer
+        // handshakes). elect() is idempotent, so the maintenance-tick call site
+        // no longer has to elect separately.
+        elect(live_view(), now);
+
         std::vector<std::pair<PeerRef, PeerSyncData>> snap;
         std::map<std::uint32_t, std::size_t> groups;
         std::size_t handshaked = 0, dialing = 0, silent = 0;
-        const Millis now = now_ms();
         for (const auto& [key, p] : peers_) {
             if (p.handshaked) {
                 ++handshaked;

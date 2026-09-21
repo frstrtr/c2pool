@@ -404,6 +404,54 @@ void test_dial_handshake_and_learn() {
 }
 
 // -----------------------------------------------------------------------
+// Regression: primary must be elected in the SAME snapshot that first reveals
+// the handshaked peer, WITHOUT waiting for a maintenance tick.
+//
+// This pins the publish-ordering race that reddened this KAT on master. The
+// pool used to elect the primary ONLY on the maintenance tick, while
+// on_handshaked() published the snapshot (peer_count()/peers_handshaked) the
+// moment the handshake completed -- leaving a window, up to maintenance_tick_ms
+// wide, where a handshaked peer was visible but tel_.primary was still the
+// stale pre-handshake "". test_dial_handshake_and_learn read primary right
+// after peer_count()==1 and so occasionally landed in that gap (more often
+// under ASan/UBSan, where scheduling stretches the interval).
+//
+// Here the maintenance tick is set so far out that it NEVER fires during the
+// test: the initial dial is fired by start()'s one-shot maintain(), so the
+// peer still comes up, but the ONLY path that can elect the primary is the
+// handshake-completion publish. Pre-fix, primary stayed empty here forever --
+// a deterministic failure. Post-fix (election folded into publish_snapshot),
+// it names the sole peer the instant the handshake lands.
+void test_primary_elected_without_maintenance_tick() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    cfg.maintenance_tick_ms = 3'600'000;   // no tick will fire during the test
+
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg,
+                                        {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }),
+               "the sole peer handshakes (initial dial comes from start(), not the tick)");
+
+    // The instant peer_count()==1 is visible, primary must already name it --
+    // no extra pump, no maintenance tick. This is the exact assertion that flaked.
+    const p2p::PoolTelemetry t = rig.pool->telemetry();
+    kat::check(t.peers_handshaked == 1, "the snapshot shows the handshaked peer");
+    kat::check(t.primary == daemon.key(),
+               "primary is elected atomically with peer_count, without a maintenance tick");
+    kat::check(!(t.peers_handshaked >= 1 && t.primary.empty()),
+               "no published snapshot shows handshaked>=1 with an empty primary");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
 void test_object_chunking_and_span_reassembly() {
     Rig rig;
     seed_chain(rig.chain);
@@ -835,6 +883,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--live") == 0) return run_live(argv[i + 1]);
 
     test_dial_handshake_and_learn();
+    test_primary_elected_without_maintenance_tick();
     test_object_chunking_and_span_reassembly();
     test_request_chain_forces_genesis_terminus();
     test_serving_obligation();
