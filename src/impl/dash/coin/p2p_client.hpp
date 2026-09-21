@@ -1039,6 +1039,12 @@ private:
 
     int64_t m_last_status_log{0};
     uint64_t m_sessions_started{0};
+    // #940 D-EMB.940 dial-reachability observability. io_context-thread writes
+    // (connect_failed / attach_peer), benign racy reads from the web hook --
+    // same measurement posture as m_sessions_started above.
+    uint64_t m_dial_failures{0};
+    int64_t  m_last_dial_failed_unix{0};
+    int64_t  m_last_dial_ok_unix{0};
     uint64_t m_sessions_lost{0};
     // Keepalive tallies of sessions already torn down. Folded into the
     // pool-wide pings_sent()/pongs_matched() so a reaped peer's evidence is not
@@ -1265,6 +1271,11 @@ public:
     // the failure for scoring, so no dial is issued here (no retry-storm).
     void connect_failed(const NetService& addr) override
     {
+        // #940 D-EMB.940: count the dead dial so node state / the dashboard can
+        // SEE the failure -- m_on_dial_failed only feeds the scorer, which is
+        // not observable anywhere. Wall-clock stamp lets the UI show recency.
+        ++m_dial_failures;
+        m_last_dial_failed_unix = wall_unix_now();
         LOG_DEBUG_COIND << "[" << m_chain_label << "] dial failed to "
                         << addr.to_string() << " — feeding peer scorer";
         if (m_on_dial_failed)
@@ -1359,6 +1370,15 @@ public:
         return out;
     }
     uint64_t sessions_started() const { return m_sessions_started; }
+    // #940 D-EMB.940 dial-reachability reads (see members).
+    uint64_t dial_failures() const { return m_dial_failures; }
+    int64_t last_dial_failed_unix() const { return m_last_dial_failed_unix; }
+    int64_t last_dial_ok_unix() const { return m_last_dial_ok_unix; }
+    static int64_t wall_unix_now()
+    {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
     uint64_t sessions_lost() const { return m_sessions_lost; }
     const InvDedup& inv_dedup() const { return m_inv_dedup; }
     /// Both dedup bounds are configurable (capacity floored at 1, TTL > 0).
@@ -2873,6 +2893,7 @@ private:
         m_pool.push_back(std::move(session));
         m_dialing.erase(key);
         ++m_sessions_started;
+        m_last_dial_ok_unix = wall_unix_now();   // #940: last successful dial
 
         LOG_INFO << "[" << m_chain_label << "] connected to " << key
                  << " — sending version (proto " << PROTOCOL_VERSION

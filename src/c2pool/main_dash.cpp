@@ -5098,6 +5098,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     s["header_height"] = hh;
                     s["target_height"] = th;
                     s["peers"] = std::move(peers);
+                    // #940 D-EMB.940: dial-reachability block. Distinguishes
+                    // connected (>=1 handshaked peer -- empty view = just
+                    // started), dial_failing (0 reachable + dial failures = the
+                    // embedded arm cannot reach the Dash network), and idle (no
+                    // dials attempted). Derived DASH-side so core/web_server
+                    // stays coin-agnostic; core passes s["coin_p2p"] through.
+                    {
+                        const int connected  = cp ? static_cast<int>(cp->connected_peer_count()) : 0;
+                        const int handshaked = cp ? static_cast<int>(cp->handshaked_peer_count()) : 0;
+                        const int dialing    = cp ? static_cast<int>(cp->dialing_count()) : 0;
+                        const uint64_t failures = cp ? cp->dial_failures() : 0;
+                        const bool reachable = handshaked > 0;
+                        std::string state;
+                        if (!cp)                               state = "disabled";
+                        else if (reachable)                    state = "connected";
+                        else if (failures > 0)                 state = "dial_failing";
+                        else if (connected > 0 || dialing > 0) state = "connecting";
+                        else                                   state = "idle";
+                        s["coin_p2p"] = {
+                            {"state", state},
+                            {"network_reachable", reachable},
+                            {"connected_peers", connected},
+                            {"handshaked_peers", handshaked},
+                            {"dialing", dialing},
+                            {"dial_failures", failures},
+                            {"last_dial_failed_unix", cp ? cp->last_dial_failed_unix() : (int64_t)0},
+                            {"last_dial_ok_unix", cp ? cp->last_dial_ok_unix() : (int64_t)0},
+                        };
+                        // Satisfy rest_local_stats's existing numeric
+                        // connected_peers check (it already looks for this key).
+                        s["connected_peers"] = connected;
+                    }
                     return s;
                 });
         }
