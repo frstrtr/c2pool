@@ -4217,20 +4217,33 @@
                     .text(function(b) { return '...' + b.hash.substr(-8); });
                 tr.append('td')
                     .attr('class', function(b) {
-                        if (b.luck_method === 'first_block') return 'status-pending';  // First block - no luck calc
+                        // #1138: honor the full backend luck_method taxonomy. 'relayed'
+                        // (peer-learned, no local timing) and 'netdiff_unavailable' (header
+                        // never synced) are NOT this pool's pending first block -- render
+                        // them neutral so relay rows stop masquerading as our own blocks.
+                        if (b.luck_method === 'relayed' || b.luck_method === 'netdiff_unavailable') return '';
+                        if (b.luck_method === 'first_block') return 'status-pending';  // genuine first block - no luck calc
                         if (!b.luck) return '';
                         if (b.luck >= 100) return 'status-confirmed';
                         if (b.luck >= 75) return 'status-pending';
                         return 'status-orphaned';
                     })
                     .text(function(b) {
-                        if (b.luck_method === 'first_block') return '1st';  // First block indicator
+                        // #1138: distinct glyphs per method so only a GENUINE first block
+                        // reads '1st'; relay-learned and header-unavailable rows are honest.
+                        if (b.luck_method === 'relayed') return '↗';   // relay-learned from a peer
+                        if (b.luck_method === 'netdiff_unavailable') return 'n/a';
+                        if (b.luck_method === 'first_block') return '1st';  // genuine first block indicator
                         if (b.luck === undefined || b.luck === null) return '-';
                         // Show decimal for very small luck values
                         if (b.luck < 1) return d3.format('.2f')(b.luck) + '%';
                         return b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck) + '%';
                     })
                     .attr('title', function(b) {
+                        if (b.luck_method === 'relayed')
+                            return 'Relayed from a peer over P2P -- this node has no local timing, so no luck is computed here';
+                        if (b.luck_method === 'netdiff_unavailable')
+                            return 'Luck unavailable -- the block header was never synced, so network difficulty at find time is unknown';
                         if (b.luck_method === 'first_block') {
                             var tip = 'First block - no previous block for luck calculation';
                             if (b.expected_time) tip += '\nExpected time was: ' + format_dt(b.expected_time);
@@ -4315,17 +4328,20 @@
                     .attr('class', function(b) {
                         if (b.status === 'confirmed') return 'status-confirmed';
                         if (b.status === 'orphaned') return 'status-orphaned';
+                        if (b.luck_method === 'relayed') return '';  // #1138: relay rows are not OUR pending blocks
                         return 'status-pending';
                     })
                     .attr('style', 'text-align: center; font-size: 18px;')
                     .attr('title', function(b) {
                         if (b.status === 'confirmed') return 'Confirmed';
                         if (b.status === 'orphaned') return 'Orphaned';
+                        if (b.luck_method === 'relayed') return 'Relayed from a peer -- this node does not track its confirmations';
                         return 'Pending';
                     })
                     .text(function(b) {
                         if (b.status === 'confirmed') return '✓';
                         if (b.status === 'orphaned') return '✗';
+                        if (b.luck_method === 'relayed') return '↗';  // #1138: relay-learned, not our pending block
                         return '⏳';
                     });
                     
