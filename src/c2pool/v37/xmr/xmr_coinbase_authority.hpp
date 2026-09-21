@@ -30,6 +30,7 @@
 #include "impl/xmr/native/consensus/xmr_block_parse.hpp"    // parse_block
 #include "impl/xmr/settle/xmr_coinbase.hpp"                 // derive_tx_secret_key / derive_output / mm_commitment_root
 #include "impl/xmr/template/xmr_block_assembly.hpp"         // parse_coinbase_prefix
+#include "xmr_credit_cut.hpp"                               // recon(A+B credit): the on-chain credit cut
 
 namespace c2pool::v37n::xmr::authority {
 
@@ -45,6 +46,9 @@ struct CoinbaseBooking {
     std::size_t   digest_index = 0;     // which candidate matched (0 = newest)
     ::v37::bytes32 lane_commitment{};
     std::map<::v37::bytes32, long long> payout;   // identity -> piconero, the on-chain truth
+    // recon(A+B credit): the ON-CHAIN CREDIT CUT (0x02 tail), if the coinbase carries one.
+    bool           has_credit_cut = false;
+    credit::CreditCut credit_cut;
 };
 
 // candidates: newest first. keys: every identity this node can resolve via pay_of.
@@ -89,6 +93,7 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     }
     if (!matched) { b.why = "not-lane: 03 root matches none of " + std::to_string(candidates.size()) + " candidate digests (other lane, or this node's ledger history does not contain the winner's build digest)"; return b; }
     b.is_lane = true;
+    if (const auto cc = credit::parse_from_tx_extra(got.tx_extra)) { b.has_credit_cut = true; b.credit_cut = *cc; }   // recon(A+B credit)
 
     // --- r and R ---
     set_::CoinbaseInputs in;
