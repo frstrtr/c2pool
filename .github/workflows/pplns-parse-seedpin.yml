@@ -41,6 +41,30 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Materialize tree + guard cache path (fail closed)
+        working-directory: ${{ github.workspace }}
+        run: |
+          # Reused self-hosted workspace: prune-runner-workspace strips the
+          # checkout to .git/.github at the prior job's end. actions/checkout
+          # then runs `checkout -f <sha>`, which only rewrites files that
+          # DIFFER between the previously-checked-out commit and this head, so
+          # a lockfile unchanged across the two commits is left physically
+          # absent even though HEAD is correct. setup-node's
+          # cache-dependency-path glob then resolves nothing and dies with an
+          # opaque "Some specified paths were not resolved". reset --hard
+          # writes the ENTIRE target tree to disk, closing that gap
+          # deterministically. (Mirrors build.yml's Web-static verify guard.)
+          git reset --hard HEAD
+          # Regression guard (standing rule: assertion ships in the fixing PR):
+          # the cache-dependency-path MUST exist on disk before setup-node, or
+          # a genuinely moved/removed lockfile turns into the same opaque red.
+          lock="web-static/sharechain-explorer/package-lock.json"
+          if [ ! -f "$lock" ]; then
+            echo "::error title=cache-dependency-path unresolved::${lock} absent on disk after checkout. The lockfile moved/was removed, or the tree failed to materialize — fix the path or the checkout, NOT the cache step." >&2
+            exit 1
+          fi
+          echo "checkout verified: ${lock} present on disk"
+
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
