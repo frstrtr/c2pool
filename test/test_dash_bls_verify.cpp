@@ -135,8 +135,14 @@ TEST(DashBlsVerify, MakeVerifierNullProviderFailsClosed)
 // verify — fails HERE, at test time, before it can be shipped or used to back a
 // verification claim.
 // Named in the DashBlsVerify suite so the linux-dash-bls job's
-// `ctest -R 'DashBlsVerify|...'` runs it on the REAL build too (it already runs
-// in every stub build via the full ctest sweep).
+// `ctest -R 'DashBlsVerify|...'` runs it on the REAL build. NOTE: the
+// test_dash_bls_verify executable is CMake-gated to C2POOL_DASH_BLS=ON
+// (test/CMakeLists.txt), so TODAY this assertion runs ONLY in the linux-dash-bls
+// job — NOT in the default stub build nor the stub ASan leg. To also exercise
+// the #else (stub) arm at test time, the executable must be hoisted out of the
+// `if(C2POOL_DASH_BLS)` block (its source and linked libs already build in the
+// stub configuration); until then the stub self-report is covered only by the
+// behavioural CI script scripts/ci/dash_bls_stub_honesty.sh.
 TEST(DashBlsVerify, SelfReportIsTruthful)
 {
     const std::string name = bls_backend_name();

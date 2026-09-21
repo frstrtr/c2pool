@@ -278,8 +278,9 @@ jobs:
 
       # #1671: the default (BLS-OFF/stub) c2pool-dash must be HONEST about being
       # BLS-dark — `--version` says bls=stub, and it REFUSES a BLS-relying config
-      # (--embedded-null-arm) naming the --allow-stub-bls exit command, flipping
-      # to a loud BLS-dark self-ID under that override. The script self-classifies
+      # (--run --embedded-null-arm; the refuse-to-start gate lives on the --run
+      # dispatch) naming the --allow-stub-bls exit command, flipping to a loud
+      # BLS-dark self-ID under that override. The script self-classifies
       # from the artefact, so it validates whichever backend this build produced;
       # the real-BLS side is covered by the linux-dash-bls job.
       - name: BLS honesty — stub binary refuses BLS-relying configs (#1671)
@@ -2040,8 +2041,9 @@ jobs:
 
       # LEG 2b (#1671): the RUNTIME surfaces are honest — `--version` self-report
       # agrees with the linked backend, and this REAL binary does NOT refuse a
-      # BLS-relying config (the refuse-to-start gate must be transparent on a
-      # capable build). Complements the artefact leg above with behaviour. The
+      # BLS-relying config (--run --embedded-null-arm; the refuse-to-start gate
+      # lives on the --run dispatch and must be transparent on a capable build).
+      # Complements the artefact leg above with behaviour. The
       # stub side of the same script runs in the main `linux` job.
       - name: BLS honesty — real binary (self-report + no false refusal)
         run: bash scripts/ci/dash_bls_stub_honesty.sh build_dash_bls/src/c2pool/c2pool-dash

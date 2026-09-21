@@ -53,6 +53,20 @@ else
 fi
 note "artefact ground truth: bls=$truth (dashbls ciphersuite $( [ -n "$cs_hits" ] && echo present || echo absent ))"
 
+# The self-report token domain is {dashbls,stub}; the artefact label domain is
+# {real,stub}. Map the artefact ground truth to the EXPECTED self-report token so
+# the two vocabularies are compared through a bijection (real<->dashbls,
+# stub<->stub) — never token-against-label, which would brand every honest real
+# binary a liar (real != dashbls). The binary's own token stays 'dashbls': it
+# names the linked library, and the GTEST SelfReportIsTruthful, --help, the
+# param catalog row and the [init] banner all use it. So the SCRIPT maps the two
+# domains, not the binary.
+if [ "$truth" = "real" ]; then
+    expect_report="dashbls"
+else
+    expect_report="stub"
+fi
+
 # ── 1. Self-report: parse the last token of `--version` ───────────────────────
 ver_out="$("$BIN" --version 2>&1 || true)"
 # Extract the value of the `bls=` token, wherever it sits on the line.
@@ -66,27 +80,57 @@ else
         dashbls|stub) : ;;
         *) bad "self-report names an unrecognised backend '$reported' (expected dashbls|stub)";;
     esac
-    if [ "$reported" = "$truth" ]; then
-        note "ok   self-report AGREES with the artefact ($reported)"
+    if [ "$reported" = "$expect_report" ]; then
+        note "ok   self-report AGREES with the artefact (bls=$truth => '$expect_report')"
         proved="${proved} self-report-agrees"
     else
-        bad "self-report ('$reported') CONTRADICTS the artefact ('$truth') — a lying --version."
+        bad "self-report ('$reported') CONTRADICTS the artefact (bls=$truth => expected '$expect_report') — a lying --version."
     fi
 fi
 
 # ── 2. Refuse-to-start behaviour ──────────────────────────────────────────────
 REFUSE_MARK='[BLS-STUB] refusing to start'
 ALLOW_MARK='[BLS-STUB] running BLS-dark by --allow-stub-bls'
-# --embedded-null-arm is a BLS-relying arm, so it trips the gate independent of
-# the daemonless-posture inference. timeout guards the real-binary / override
-# paths, which proceed into run_node instead of exiting.
-run_claim() { timeout 20s "$BIN" --embedded-mainnet --embedded-null-arm "$@" 2>&1 || true; }
+GOODCITIZEN_MARK='[run] good-citizen default (daemonless posture)'
+SELFTEST_MARK='[selftest]'
+# The refuse-to-start gate AND the loud --allow-stub-bls self-ID both live on the
+# --run dispatch path (main_dash.cpp): they are evaluated after the good-citizen
+# resolver arms the daemonless levers and immediately before run_node opens any
+# store. So the invocation MUST pass --run — without it, main falls through to
+# run_selftest() and the gate is never evaluated (the exact defect that let this
+# check read green on a stub that never refused). --embedded-null-arm is one of
+# the BLS-relying arms the gate keys on, and with no --coin-rpc the posture is
+# also daemonless, so BOTH terms of bls_claim_config are true. A private
+# --data-dir keeps the 20 s run_node window (real binary, and stub under
+# --allow-stub-bls, both proceed past the gate into run_node) off ~/.c2pool on
+# the runner; the markers are printed BEFORE run_node, so a later bind/port
+# failure inside run_node cannot mask them.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+run_claim() { timeout 20s "$BIN" --run --data-dir "$WORK" --embedded-mainnet --embedded-null-arm "$@" 2>&1; }
+
+# Fall-through detector, applied to EVERY captured output. A binary that never
+# enters the --run dispatch prints the run_selftest banner ('[selftest] ...',
+# main_dash.cpp). Seeing it means the gate site was never reached, so any pass
+# here would be vacuous — a hard FAIL on every branch. This turns the defect that
+# hid here (never entering the run path) into a caught error, and defends against
+# a future gate relocation off the run path or a script that drops --run again.
+check_ran_the_gate() {
+    case "$1" in
+        *"$SELFTEST_MARK"*)
+            bad "binary took the selftest path: the --run dispatch (where the BLS gate lives) was never entered — this observation would prove nothing" ;;
+    esac
+}
 
 if [ "$truth" = "stub" ]; then
-    # 2a. Refuses without the override, naming itself and the exit command.
+    # 2a. Refuses without the override, naming itself and the exit command. The
+    # rc MUST come from the SAME process whose output we judge, so capture both
+    # from one invocation.
+    set +e
     out_refuse="$(run_claim)"
-    rc_refuse=0
-    timeout 20s "$BIN" --embedded-mainnet --embedded-null-arm >/dev/null 2>&1 || rc_refuse=$?
+    rc_refuse=$?
+    set -e
+    check_ran_the_gate "$out_refuse"
     case "$out_refuse" in
         *"$REFUSE_MARK"*)
             note "ok   stub binary refuses --embedded-null-arm (marker present)"
@@ -103,8 +147,13 @@ if [ "$truth" = "stub" ]; then
             note "     (a stub that neither links BLS nor refuses is the #1671 defect; this is a hard fail, not a skip)"
             ;;
     esac
-    # 2b. With the override it must NOT refuse — it runs BLS-dark, loudly.
+    # 2b. With the override it must NOT refuse — it runs BLS-dark, loudly. The
+    # ALLOW_MARK is printed before run_node.
+    set +e
     out_allow="$(run_claim --allow-stub-bls)"
+    rc_allow=$?
+    set -e
+    check_ran_the_gate "$out_allow"
     case "$out_allow" in
         *"$REFUSE_MARK"*) bad "--allow-stub-bls did not suppress the refusal" ;;
         *"$ALLOW_MARK"*)
@@ -113,12 +162,30 @@ if [ "$truth" = "stub" ]; then
         *) bad "--allow-stub-bls produced neither the refusal nor the loud self-ID marker (surface changed?)" ;;
     esac
 else
-    # Real binary: the gate must be transparent (bls_backend_available()==true).
+    # Real binary: the gate must be transparent (bls_backend_available()==true) —
+    # it must NOT refuse, AND it must demonstrably reach the gate site. Absence of
+    # the refusal marker ALONE is no longer a pass: a binary that exits early (the
+    # selftest path, or a crash before the gate) would falsely read as 'does not
+    # refuse'. Require positive evidence the run path was entered — either timeout
+    # killed a live run_node (rc==124), or the pre-gate good-citizen line printed.
+    set +e
     out_real="$(run_claim)"
+    rc_real=$?
+    set -e
+    check_ran_the_gate "$out_real"
+    reached_gate=0
+    [ "$rc_real" -eq 124 ] && reached_gate=1
+    case "$out_real" in *"$GOODCITIZEN_MARK"*) reached_gate=1 ;; esac
     case "$out_real" in
-        *"$REFUSE_MARK"*) bad "real (dashbls-linked) binary REFUSED a BLS-relying config — the gate misfires on a capable build." ;;
-        *) note "ok   real binary does not refuse --embedded-null-arm"
-           proved="${proved} real-does-not-refuse" ;;
+        *"$REFUSE_MARK"*)
+            bad "real (dashbls-linked) binary REFUSED a BLS-relying config — the gate misfires on a capable build." ;;
+        *)
+            if [ "$reached_gate" -eq 1 ]; then
+                note "ok   real binary reached the gate and did NOT refuse --embedded-null-arm"
+                proved="${proved} real-does-not-refuse"
+            else
+                bad "real binary did not refuse, but produced no evidence it reached the gate (neither a timeout-killed run nor the pre-gate good-citizen line) — a vacuous non-observation, not a pass."
+            fi ;;
     esac
 fi
 
