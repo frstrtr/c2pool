@@ -372,6 +372,38 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_m2_native_settlement_kat COMMAND v37_xmr_m2_native_settlement_kat)
 
     # ------------------------------------------------------------------
+    # R1 -- the on-chain credit cut (armed coinbase shape).
+    #
+    #   v37_xmr_credit_cut_kat
+    #     The consumer-tree KAT xmr_block_assembly.hpp names: static_asserts the
+    #     impl-tree parse bound CREDIT_CUT_TAIL_BYTES against credit::kTailBytes,
+    #     pins the 44-byte "V37C"|P|spine tail format, and builds the ARMED and
+    #     the UNARMED settlement coinbase from ONE fixture (monerod arm over the
+    #     captured C4 get_miner_data, no backlog => deterministic bytes): +44
+    #     exactly, one-byte 0x02 varint, r/R + 0x03 root + every vout byte-
+    #     identical, the cut reads back through the coinbase-authority decoder,
+    #     the K_fair shape gate accepts both, the per-extra_nonce patch never
+    #     touches the tail -- and the two miner_tx prefixes against a FROZEN
+    #     golden (the R1 coinbase-shape golden bump, operator-approved
+    #     2026-09-21; regenerate with V37_XMR_CREDIT_CUT_KAT_PRINT=1).
+    #     Same link shape + the same HOLLOW-GREEN GUARD as M2 above (listed in
+    #     BOTH build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_credit_cut_kat
+        v37_xmr_credit_cut_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_credit_cut_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_credit_cut_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_credit_cut_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_credit_cut_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_credit_cut_kat COMMAND v37_xmr_credit_cut_kat)
+
+    # ------------------------------------------------------------------
     # M3 — R-ARMORDER, the switchable FIND path.
     #
     #   v37_xmr_m3_arm_order_kat

@@ -91,7 +91,13 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
             b.lane_commitment = candidates[i]; b.digest_index = i; matched = true; break;
         }
     }
-    if (!matched) { b.why = "not-lane: 03 root matches none of " + std::to_string(candidates.size()) + " candidate digests (other lane, or this node's ledger history does not contain the winner's build digest)"; return b; }
+    // R5: a 03-21-00 tail whose root matches NO candidate is NOT "not-lane" (a
+    // stranger's block, memoized and never re-attempted). It is "lane-root-unknown":
+    // another lane, or OUR ring does not (yet) hold the ledger state the winner built
+    // on -- a receiver one ledger event behind the winner sees exactly this and must
+    // RETRY as its ring advances (FinalizeConnect keeps it in the bounded retry set,
+    // which also holds the R4 finalize gate); it must never be memoize-dropped.
+    if (!matched) { b.why = "lane-root-unknown: 03 root matches none of " + std::to_string(candidates.size()) + " candidate digests (other lane, or this node's ledger history does not (yet) contain the winner's build digest -- retried as the ring advances)"; return b; }
     b.is_lane = true;
     if (const auto cc = credit::parse_from_tx_extra(got.tx_extra)) { b.has_credit_cut = true; b.credit_cut = *cc; }   // recon(A+B credit)
 

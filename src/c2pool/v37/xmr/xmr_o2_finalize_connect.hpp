@@ -91,6 +91,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -231,7 +232,10 @@ struct FinalizeConnectOptions {
     std::function<bool(std::uint64_t, const std::string&, Amounts&, Amounts&, std::string&)> book_from_chain;
     // recon(A+B credit): our OWN win was submitted OK and its booking deferred to the
     // chain — the moment the S-1c v0x02 cut descriptor (the FAST PATH) leaves.
-    std::function<void(std::uint64_t height, const std::string& bid_hex)> on_own_win_deferred;
+    // (template_id, extra_nonce) name the candidate we SUBMITTED, so the recompute
+    // cross-check can fetch our own assembled bytes back off the provider ring.
+    std::function<void(std::uint64_t height, const std::string& bid_hex,
+                       std::uint32_t template_id, std::uint32_t extra_nonce)> on_own_win_deferred;
 };
 
 // ── the glue ────────────────────────────────────────────────────────────────
@@ -274,7 +278,27 @@ public:
         // mismatch); `booking_stall_timeout` counts booking-pending lane blocks
         // that exhausted their retry bound while still canonical (the LOUD
         // release that replaces the old silent LATE fork).
+        //
+        // `late_unbooked` covers BOTH sub-classes of "FINALIZE already consumed a
+        // high-water >= h without this block in the pending set":
+        //   (a) h <= cursor            : unbookable, dropped (the original alarm);
+        //   (b) cursor < h <= cursor+D : bookable, but FINALIZE(cursor) already ran
+        //                                at hw = cursor + D_conf and read the pending
+        //                                set without it -> the two nodes' ledgers
+        //                                have diverged at that finalize (the
+        //                                cursor-31 R4-bound fork class). Counted in
+        //                                `late_booked_post_finalize` as well. The
+        //                                old gate bound (hh <= h) let (b) through
+        //                                silently: the alarm read 0 on a real fork.
         std::uint64_t late_unbooked = 0, booking_stall_timeout = 0;
+        std::uint64_t late_booked_post_finalize = 0;
+        // R5: lane blocks whose 03 root matched no candidate digest, kept in the
+        // retry set (never memoized) and re-decoded as the candidate ring advances;
+        // `lane_root_unknown_resolved` = later booked; `lane_root_unknown_terminal`
+        // = exhausted the retry bound still unknown (LOUD; a real other-lane block
+        // or a ring that never reached the winner's state).
+        std::uint64_t lane_root_unknown_retries = 0, lane_root_unknown_resolved = 0,
+                      lane_root_unknown_terminal = 0;
     };
 
     // Construct AFTER node.bring_up() (the finalize driver exists) and AFTER
@@ -495,13 +519,38 @@ public:
                 "this height needs an operator's eyes (credit divergence risk)");
             return;
         }
+        // R4-bound alarm (sub-class (b), the cursor-31 fork class): the finalize
+        // cursor ADVANCED while this block was awaiting booking (first seen at
+        // cursor c0, now at cursor > c0) and one of those steps ran at hw = h' +
+        // D_conf >= h -- so the OwedLedger read the WHOLE pending set WITHOUT this
+        // block while a node that booked it in time had it in. That is exactly what
+        // the booking_gate bound (hh <= h + D_conf) forbids; it can fire only after
+        // a bounded-stall release or a boot cursor mismatch. Still booked (the
+        // driver will step h), but LOUDLY: it must read 0 in a converged run.
+        // (Not "h <= cursor + D_conf" alone: after a pop the regrown blocks sit
+        // within D_conf above a cursor that stepped BEFORE they existed -- no
+        // finalize ever read a pending set they should have been in.)
+        auto fc_it = m_first_cursor.find(bid);
+        if (fc_it == m_first_cursor.end()) fc_it = m_first_cursor.emplace(bid, cursor).first;
+        const bool late_post_finalize = (cursor > fc_it->second) && (h <= cursor + m_cfg.d_conf);
         Amounts credit, payout; std::string why;
         if (!m_o.book_from_chain(h, bid, credit, payout, why)) {
+            const bool root_unknown = (why.rfind("lane-root-unknown:", 0) == 0);   // R5
             if (why.rfind("get_block", 0) == 0 || why.find("does not parse") != std::string::npos ||
-                why.rfind("cut-pending:", 0) == 0) {   //  fix 4: transient (recon(A+B credit): + receiver's lane not yet at P)
-                if (++m_retry_n[bid] <= 600) { m_retry[bid] = h; say("cba: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " fetch failed (" + why + ") -> RETRY #" + std::to_string(m_retry_n[bid])); return; }
+                why.rfind("cut-pending:", 0) == 0 || root_unknown) {   //  fix 4: transient (recon(A+B credit): + receiver's lane not yet at P; R5: + ring not yet at the winner's state)
+                if (++m_retry_n[bid] <= 600) {
+                    m_retry[bid] = h;
+                    if (root_unknown) {
+                        ++m_stats.lane_root_unknown_retries; m_root_unknown_bids.insert(bid);
+                        if (m_retry_n[bid] == 1 || m_retry_n[bid] % 50 == 0)
+                            say("cba: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " lane-root-unknown (" + why + ") -> kept, RETRY #" + std::to_string(m_retry_n[bid]) + " as the candidate ring advances (holds the R4 gate)");
+                    } else {
+                        say("cba: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " fetch failed (" + why + ") -> RETRY #" + std::to_string(m_retry_n[bid]));
+                    }
+                    return;
+                }
             }
-            m_chain_seen[bid] = true;
+            m_chain_seen[bid] = true; m_first_cursor.erase(bid);
             if (why.rfind("not-lane:", 0) == 0) return;   // a stranger's block: nothing to book
             if (why.rfind("cut-pending:", 0) == 0) {      // R4: the receiver's lane never reached P within the retry bound
                 ++m_stats.booking_stall_timeout;
@@ -509,9 +558,28 @@ public:
                     std::to_string(h) + " exhausted its booking retry bound still cut-pending (" + why +
                     ") — releasing the finalize gate; credit for this height may diverge");
             }
+            if (root_unknown) {                           // R5: the ring never reached the winner's state within the bound
+                ++m_stats.booking_stall_timeout; ++m_stats.lane_root_unknown_terminal;
+                say("cba-ALARM booking_stall_timeout(lane_root_unknown): chain lane block " + short_bid(bid) + " h=" +
+                    std::to_string(h) + " exhausted its retry bound with its 03 root still matching no candidate digest (" + why +
+                    ") — releasing the finalize gate; another lane's block, or this ledger never passed through the winner's state (credit divergence risk)");
+            }
             ++m_stats.refused;
             say("cba: REFUSED chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + ": " + why);
             return;
+        }
+        if (m_root_unknown_bids.erase(bid)) {   // R5: a lane-root-unknown block resolved once the ring caught up
+            ++m_stats.lane_root_unknown_resolved;
+            say("cba: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " lane-root-unknown RESOLVED after " +
+                std::to_string(m_retry_n[bid]) + " retries (the candidate ring reached the winner's ledger state)");
+        }
+        if (late_post_finalize) {
+            ++m_stats.late_unbooked; ++m_stats.late_booked_post_finalize;
+            say("cba-ALARM late_unbooked(post-finalize): chain lane block " + short_bid(bid) + " h=" + std::to_string(h) +
+                " is being booked with the finalize cursor at " + std::to_string(cursor) + " (hw already reached " +
+                std::to_string(cursor + m_cfg.d_conf) + " >= h): FINALIZE(" + std::to_string(cursor) +
+                ") read the pending set WITHOUT this block — this node's ledger has diverged from a node that booked it in time "
+                "(R4 gate released by a stall timeout, or a boot cursor mismatch); booking it anyway, operator's eyes needed");
         }
         c2pool::xmr::node::Hash id{}; (void)hash_from_hex(bid, id);
         PendingRec rec; rec.height = h; rec.reward = 0; for (const auto& [k, v] : payout) { (void)k; rec.reward += static_cast<std::uint64_t>(v); }
@@ -520,7 +588,7 @@ public:
             m_pending.erase(bid); (void)sidecar_flush();
             say("cba: node/ledger did not admit chain lane block " + short_bid(bid)); return;
         }
-        ++m_stats.registered; ++m_cba_chain_booked; m_chain_booked_once[bid] = true; m_retry.erase(bid);
+        ++m_stats.registered; ++m_cba_chain_booked; m_chain_booked_once[bid] = true; m_retry.erase(bid); m_first_cursor.erase(bid);
         m_race.observe_own(h, bid);   // a LANE block is 'own' for the race book (multi-node: own == lane)
         say("cba: CHAIN FOUND booked " + short_bid(bid) + " h=" + std::to_string(h) + " payout_keys=" + std::to_string(payout.size()) + " total=" + std::to_string(rec.reward) + " -> finalizes when hw >= " + std::to_string(h + m_cfg.d_conf));
     }
@@ -567,7 +635,7 @@ public:
             m_race.observe_own(ev.height, bid, ev.found_unix_s);
             say("own win " + short_bid(bid) + " h=" + std::to_string(ev.height) +
                 " submitted OK -> booking DEFERRED to the chain view (coinbase authority)");
-            if (m_o.on_own_win_deferred) m_o.on_own_win_deferred(ev.height, bid);   // recon(A+B credit): v0x02 fast path leaves here
+            if (m_o.on_own_win_deferred) m_o.on_own_win_deferred(ev.height, bid, ev.template_id, ev.extra_nonce);   // recon(A+B credit): v0x02 fast path leaves here (+ recompute capture)
             r.registered = true; r.duplicate = true; r.reason = "deferred-to-chain";
             return r;
         }
@@ -643,9 +711,19 @@ private:
     // a booking_stall_timeout alarm), so the gate always releases; it is never an
     // unbounded stall. This is what makes booking land BEFORE FINALIZE, so
     // rearm_first_eligible sees the same pending set on every node.
+    //
+    // BOUND (the cursor-31 fork fix): FINALIZE(h) runs at high-water hw = h + D_conf
+    // and OwedLedger::on_block_finalized -> rearm_first_eligible reads the WHOLE
+    // pending set (every booked lane block, whatever its height), so a canonical
+    // booking-pending lane block ANYWHERE at height <= hw must hold the cursor,
+    // not only one at height <= h. With the old bound (hh <= h) a cut-pending lane
+    // block in (h, h+D_conf] let FINALIZE(h) run on one node with that block booked
+    // and on the other without it: two pending sets, two ledgers, a permanent
+    // owed_digest fork (seen at cursor 31 in the recon-final rig).
     bool booking_gate(std::uint64_t h) {
+        const std::uint64_t hw = h + m_cfg.d_conf;
         for (const auto& [bid, hh] : m_retry)
-            if (hh <= h && m_node.chain_carries(hh, bid)) return false;
+            if (hh <= hw && m_node.chain_carries(hh, bid)) return false;
         return true;
     }
 
@@ -909,6 +987,8 @@ private:
     std::map<std::string, bool>       m_chain_booked_once;   //  bids booked at least once (re-bookable after an orphan)
     std::map<std::string, std::uint64_t> m_retry;            //  fix 4: bid -> height, transient fetch failures to retry
     std::map<std::string, int>        m_retry_n;
+    std::set<std::string>             m_root_unknown_bids;   //  R5: bids currently retrying as lane-root-unknown
+    std::map<std::string, std::uint64_t> m_first_cursor;     //  R4 alarm: finalize cursor when a chain lane block was first seen
     std::uint64_t                     m_cba_chain_booked = 0;
     std::map<std::string, PendingRec> m_unrecoverable;  // kept in the sidecar so the boot warning repeats
     Stats         m_stats;

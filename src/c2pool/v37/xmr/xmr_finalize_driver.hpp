@@ -83,6 +83,18 @@ public:
     void set_booking_gate(BookingGateFn g) { m_gate = std::move(g); }
     std::uint64_t booking_stalls() const { return m_stalled; }
 
+    // R5 (per-ledger-event candidate ring): fired synchronously right AFTER
+    // every OwedLedger mutation this driver performs (FOUND / ORPHAN / FINALIZE
+    // -- the only live callers), i.e. once per ledger_seq increment. A consumer
+    // that must hold EVERY committed owed_digest state (the coinbase-authority
+    // candidate ring: a peer's 0x03 root is the owed_digest of some ledger state
+    // the winner passed through) samples here, not per tick -- a tick that
+    // applies several seqs at once (book h47 + finalize h44) would otherwise
+    // skip the intermediate state, memoize the peer's block as not-lane and
+    // fork the settled set for good (the h=48 fork class). Unset => nothing.
+    using LedgerEventFn = std::function<void()>;
+    void set_ledger_event_observer(LedgerEventFn f) { m_on_ledger_event = std::move(f); }
+
     XmrFinalizeDriver(OwedLedger& ledger, SettleHW& hw, ISettleStore& store,
                       ::v37::ChainId chain, std::uint64_t d_conf,
                       std::uint64_t recovered_cursor_height,
@@ -104,6 +116,7 @@ public:
             ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = b.credit; ev.payout = b.payout;
             write_event(ev);
             m_ledger.on_block_found(b.bid, b.credit, b.payout);
+            ledger_event();   // R5
             it->second.credit = b.credit; it->second.payout = b.payout; it->second.canonical = true;
             return;   // m_by_height already lists it
         }
@@ -116,6 +129,7 @@ public:
         m_ledger.on_block_found(b.bid, b.credit, b.payout);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
+        ledger_event();   // R5
     }
 
     // A block left the best chain (MainchainEvent Orphan / a Reorg that dropped
@@ -131,6 +145,7 @@ public:
         write_event(ev);
         m_ledger.on_block_orphaned(bid, payout);
         if (it != m_found.end()) it->second.canonical = false;
+        ledger_event();   // R5
     }
 
     // ── THE F1 DRIVER ──────────────────────────────────────────────────────
@@ -209,6 +224,7 @@ public:
                     ev.bin_height = bin_height;
                     write_event(ev);
                     m_ledger.on_block_finalized(bid, bin_height);
+                    ledger_event();   // R5
                     steps.push_back(FinalizeStep{bid, h, bin_height});
                     touched = true;
                 }
@@ -237,6 +253,7 @@ private:
         b->put(store_codec::k_cursor(m_chain), v);
         b->commit_sync();
     }
+    void ledger_event() { if (m_on_ledger_event) m_on_ledger_event(); }   // R5
     void persist_hw() {
         m_hw.ledger_seq = m_ledger.ledger_seq();
         auto b = m_store.batch();
@@ -254,6 +271,7 @@ private:
     CanonicalFn    m_is_canonical;
     BookingGateFn  m_gate;                       // R4: chain-ordered booking gate
     std::uint64_t  m_stalled = 0;                // R4: times the gate held the cursor
+    LedgerEventFn  m_on_ledger_event;            // R5: per-ledger-event observer (candidate ring)
 
     std::map<std::string, FoundBlock>              m_found;      // bid -> block
     std::map<std::uint64_t, std::vector<std::string>> m_by_height; // mined height -> bids

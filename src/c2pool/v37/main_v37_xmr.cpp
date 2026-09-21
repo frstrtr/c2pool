@@ -657,6 +657,19 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         static_cast<unsigned long long>(fs.race_renotified),
                         static_cast<unsigned long long>(fs.r7_violations),
                         static_cast<unsigned long long>(rs.double_credit_blocked));
+            // R4/R5 booking-order alarms. late_unbooked (both sub-classes) and
+            // stall_timeout MUST read 0 in a converged run; root_unknown retries
+            // are normal (a receiver one ledger event behind the winner), terminal
+            // must be 0.
+            std::printf("  r4/r5: late_unbooked=%llu (post_finalize=%llu) stall_timeout=%llu gate_stalls=%llu "
+                        "| lane_root_unknown retries=%llu resolved=%llu terminal=%llu\n",
+                        static_cast<unsigned long long>(fs.late_unbooked),
+                        static_cast<unsigned long long>(fs.late_booked_post_finalize),
+                        static_cast<unsigned long long>(fs.booking_stall_timeout),
+                        static_cast<unsigned long long>(node.finalize_driver().booking_stalls()),
+                        static_cast<unsigned long long>(fs.lane_root_unknown_retries),
+                        static_cast<unsigned long long>(fs.lane_root_unknown_resolved),
+                        static_cast<unsigned long long>(fs.lane_root_unknown_terminal));
             for (const std::uint64_t h : contested) {
                 const auto* cs = fc.race().candidates_at(h);
                 if (!cs) continue;
@@ -968,7 +981,16 @@ static int run_live(const XmrNodeConfig& cfg) {
     const o2::XmrSettlementConfig* cba_scfg = nullptr;
     std::deque<::v37::bytes32>     cba_ring;                 // this node's owed_digest history (newest at back)
     std::optional<::v37::bytes32>  cba_payee;
-    unsigned long long             cba_lane_root_unknown = 0;   // counted alarm: 03-root matched no candidate
+    unsigned long long             cba_lane_root_unknown = 0;   // counted alarm: 03-root matched no candidate (distinct bids)
+    std::set<std::string>          cba_root_unknown_seen;       // R5: alarm once per bid; the retries are FinalizeConnect's
+    // RECOMPUTE CROSS-CHECK (own wins): the bytes WE assembled and submitted
+    // (candidate full_blob off the provider ring, captured at submit-OK) vs the
+    // block the CHAIN carries (get_block, the authority). recompute = sanity,
+    // on-chain coinbase = authority: on a mismatch we ALARM and still book the
+    // on-chain coinbase. Peer blocks have no local recompute (no template).
+    std::function<bool(std::uint32_t, std::uint32_t, sub::BlockCandidate&)> own_candidate_lookup;
+    std::map<std::string, std::vector<std::uint8_t>> own_recompute;   // bid -> our submitted full_blob
+    std::uint64_t recompute_captured = 0, recompute_unavailable = 0, recompute_ok = 0, recompute_mismatch = 0;
     std::optional<::v37::ScriptRef> cba_payee_ref;
     std::uint64_t cba_fetches = 0, cba_booked = 0, cba_not_lane = 0, cba_refused = 0;
     auto cba_ring_push = [&]() {
@@ -1002,8 +1024,21 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> feed_log;
     std::map<std::string, std::shared_ptr<const c2pool::v37n::SettlementView>> replay_cache;   // "P:spinehex" -> verified view (whole booking window)
     auto amounts_str = [&](const Amounts& m) { std::string s; for (const auto& [k, a] : m) s += hex_of(k).substr(0, 8) + "=" + std::to_string(a) + " "; return s; };
+    // decode one block blob's coinbase under coinbase authority against OUR candidate ring
+    // (R5: the ring is fed per ledger event, so every owed_digest state this ledger passed
+    // through is a candidate -- newest first, the live digest at index 0)
+    auto decode_blob = [&](const std::vector<std::uint8_t>& blob) -> c2pool::v37n::xmr::authority::CoinbaseBooking {
+        std::vector<::v37::bytes32> cands; cands.push_back(node.ledger().owed_digest());
+        for (auto it = cba_ring.rbegin(); it != cba_ring.rend(); ++it) if (!(*it == cands.front())) cands.push_back(*it);
+        std::vector<::v37::bytes32> keys;
+        for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
+        for (const auto& k : cba_fx->keys()) keys.push_back(k);
+        return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
+                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
+    };
     // fetch + decode one block's coinbase under coinbase authority (shared by the chain path and the fast path)
-    auto fetch_decode = [&](const std::string& bid, c2pool::v37n::xmr::authority::CoinbaseBooking& bk, std::string& why) -> bool {
+    auto fetch_decode = [&](const std::string& bid, c2pool::v37n::xmr::authority::CoinbaseBooking& bk, std::string& why,
+                            std::vector<std::uint8_t>* blob_out = nullptr) -> bool {
         std::string body, err;
         transport.rpc_post(c2pool::xmr::node::MoneroDaemonRpc::body_get_block(0, bid),
                            [&](const c2pool::xmr::node::RpcResponse& r) { if (!r.ok()) err = r.error; else body.assign(r.body.begin(), r.body.end()); });
@@ -1013,13 +1048,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         const std::string blob_hex = v["result"]["blob"].as_string();
         std::vector<std::uint8_t> blob;
         if (blob_hex.empty() || !sub::from_hex(blob_hex, blob)) { why = "get_block: no/invalid result.blob"; return false; }
-        std::vector<::v37::bytes32> cands; cands.push_back(node.ledger().owed_digest());
-        for (auto it = cba_ring.rbegin(); it != cba_ring.rend(); ++it) if (!(*it == cands.front())) cands.push_back(*it);
-        std::vector<::v37::bytes32> keys;
-        for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
-        for (const auto& k : cba_fx->keys()) keys.push_back(k);
-        bk = c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
-                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
+        if (blob_out) *blob_out = blob;
+        bk = decode_blob(blob);
         if (!bk.ok) why = bk.why;
         return bk.ok;
     };
@@ -1094,17 +1124,49 @@ static int run_live(const XmrNodeConfig& cfg) {
         cba_ring_push();
         ++cba_fetches;
         c2pool::v37n::xmr::authority::CoinbaseBooking bk;
-        if (!fetch_decode(bid, bk, why) && !bk.is_lane && bk.why.empty()) { ++cba_refused; return false; }
+        std::vector<std::uint8_t> chain_blob;
+        if (!fetch_decode(bid, bk, why, &chain_blob) && !bk.is_lane && bk.why.empty()) { ++cba_refused; return false; }
         if (!bk.ok) {
-            why = bk.why; if (bk.is_lane) ++cba_refused; else ++cba_not_lane;
-            if (!bk.is_lane && why.find("03 root matches none") != std::string::npos) {   // lane_root_unknown: a 03-tagged block whose root matches no candidate digest = a loud, counted alarm
-                ++cba_lane_root_unknown;
-                std::printf("cba-ALARM lane_root_unknown: h=%llu bid=%s carries a 03 21 00 tag whose root is UNKNOWN to this ledger (%s)\n",
-                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), why.c_str());
+            why = bk.why;
+            if (why.rfind("lane-root-unknown:", 0) == 0) {   // R5: NOT not-lane; FinalizeConnect keeps + retries it as the ring advances
+                if (cba_root_unknown_seen.insert(bid).second) {
+                    ++cba_lane_root_unknown;
+                    std::printf("cba-ALARM lane_root_unknown: h=%llu bid=%s carries a 03 21 00 tag whose root is UNKNOWN to this ledger yet (%s) -- kept, retried per ledger event\n",
+                                static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), why.c_str());
+                }
+                return false;
             }
+            if (bk.is_lane) ++cba_refused; else ++cba_not_lane;
             return false;
         }
         if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); ++cba_refused; return false; }
+        // RECOMPUTE CROSS-CHECK (own win): our submitted bytes vs the chain's. Sanity only --
+        // the chain decode above stays the authority whatever this says.
+        if (auto rit = own_recompute.find(bid); rit != own_recompute.end()) {
+            namespace cons = ::c2pool::xmr::native;
+            std::string mism;
+            cons::ParsedBlock pa, pb;
+            const auto sa = cons::parse_block(rit->second.data(), rit->second.size(), pa);
+            const auto sb = cons::parse_block(chain_blob.data(), chain_blob.size(), pb);
+            const bool pa_ok = (sa == cons::BlockParseStatus::Ok || sa == cons::BlockParseStatus::TxCountMismatch);
+            const bool pb_ok = (sb == cons::BlockParseStatus::Ok || sb == cons::BlockParseStatus::TxCountMismatch);
+            if (!pa_ok || !pb_ok) mism = "one side does not parse";
+            else if (pa.miner_tx_size != pb.miner_tx_size ||
+                     std::memcmp(rit->second.data() + pa.miner_tx_offset, chain_blob.data() + pb.miner_tx_offset, pa.miner_tx_size) != 0)
+                mism = "miner_tx BYTES differ (ours " + std::to_string(pa.miner_tx_size) + "B vs chain " + std::to_string(pb.miner_tx_size) + "B)";
+            else {
+                const auto rk = decode_blob(rit->second);
+                if (!rk.ok) mism = "our own bytes do not decode under coinbase authority: " + rk.why;
+                else if (rk.payout != bk.payout || rk.total != bk.total || !(rk.lane_commitment == bk.lane_commitment) ||
+                         rk.has_credit_cut != bk.has_credit_cut || !(rk.credit_cut == bk.credit_cut))
+                    mism = "decoded maps differ (payout/total/lane_commitment/credit_cut)";
+            }
+            if (mism.empty()) { ++recompute_ok; std::printf("cba-recompute: own win h=%llu bid=%s… our submitted miner_tx == on-chain miner_tx (%zu B) and decodes identically; booking the on-chain coinbase\n",
+                                                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), (std::size_t)pb.miner_tx_size); }
+            else { ++recompute_mismatch; std::printf("cba-ALARM recompute_mismatch: own win h=%llu bid=%s… %s -- the ON-CHAIN coinbase is the authority, booking it as read from the block\n",
+                                                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), mism.c_str()); }
+            own_recompute.erase(rit);
+        }
         payout = bk.payout;   // the PAYOUT side: proven coinbase authority (deterministic r), unchanged
         // recon(A+B credit): the CREDIT side. AUTHORITY = the on-chain credit cut (B); FAST PATH = the v0x02 descriptor (A),
         // used only when it AGREES with the chain; on mismatch the chain wins; unreconstructable => fail-closed.
@@ -1137,7 +1199,14 @@ static int run_live(const XmrNodeConfig& cfg) {
         return true;
     };
     // (A) THE FAST PATH, send side: our own win leaves as a REAL S-1c v0x02 frame (CarrierWire::encode, 122-byte trailer).
-    fo.on_own_win_deferred = [&](std::uint64_t h, const std::string& bid) {
+    fo.on_own_win_deferred = [&](std::uint64_t h, const std::string& bid, std::uint32_t tid, std::uint32_t en) {
+        // recompute capture: the bytes we assembled for (tid, en), off the provider ring
+        if (cba_fx && own_candidate_lookup) {
+            sub::BlockCandidate c;
+            if (own_candidate_lookup(tid, en, c) && !c.full_blob.empty()) { own_recompute[bid] = c.full_blob; ++recompute_captured; }
+            else { ++recompute_unavailable; std::printf("cba-recompute: own win h=%llu bid=%s… template %u gone from the ring -> no local recompute (chain decode is the authority anyway)\n",
+                                                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), tid); }
+        }
         if (g_wire_out.empty() || !cba_fx) return;
         c2pool::v37n::xmr::authority::CoinbaseBooking bk; std::string why;
         if (!fetch_decode(bid, bk, why) || !bk.has_credit_cut) { std::printf("ab-wire-tx: own win %s… not encodable (%s)\n", bid.substr(0,12).c_str(), why.c_str()); return; }
@@ -1225,6 +1294,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
     };
     o2::FinalizeConnect fc(node, cfg, found_q, fo);
+    // R5: the candidate ring is fed PER LEDGER EVENT (every FOUND/ORPHAN/FINALIZE the driver
+    // applies), not per tick: a tick that applies several seqs at once (book h47 + finalize
+    // h44) skipped the intermediate owed_digest, and a peer block committed to exactly that
+    // state was memoized not-lane -> the h=48 SETTLED fork. Every state is now present.
+    node.finalize_driver().set_ledger_event_observer([&]() { cba_ring_push(); });
     std::printf("same-height policy: tiebreak=%s D_conf=%llu renotify<=%u journal=%s "
                 "| credit requires burial: YES  orphan-credit: NEVER  double-credit: BLOCKED\n",
                 to_string(cfg.same_height_tiebreak),
@@ -1427,6 +1501,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::string w;
             return provider.candidate_by_id(tid, en, out, &w);
         };
+        own_candidate_lookup = candidate;   // recompute cross-check: our own submitted bytes
 
         // ── M3: the daemonless FIND path, assembled ─────────────────────────
         //
@@ -1496,6 +1571,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cut_ok, (unsigned long long)cut_pending, (unsigned long long)cut_miss, (unsigned long long)cut_repaired, (unsigned long long)cut_mismatch, (unsigned long long)cut_absent, (unsigned long long)cut_fold_refused,
                             (unsigned long long)wire_tx, (unsigned long long)wire_rx, (unsigned long long)wire_prefold, (unsigned long long)wire_pending, (unsigned long long)wire_hit, (unsigned long long)wire_mismatch, (unsigned long long)wire_diverged,
                             last_credit_line.c_str());
+                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu root_unknown_bids=%llu ring=%zu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu\n",
+                            (unsigned long long)cba_fetches, (unsigned long long)cba_booked, (unsigned long long)cba_not_lane, (unsigned long long)cba_refused,
+                            cba_lane_root_unknown, cba_ring.size(),
+                            (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch);
             }
             if (!last_shape.empty())
                 std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
