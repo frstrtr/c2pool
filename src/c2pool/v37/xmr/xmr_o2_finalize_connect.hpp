@@ -589,6 +589,7 @@ public:
         // R6 divergence cap: the lane is HALTED. Nothing is booked, nothing is
         // retried; count it so the status line shows the halt is biting.
         if (m_diverged) {
+            m_chain_seen[bid] = true;   // counted ONCE per block (the adapter may re-announce a canonical block on later polls)
             if (++m_stats.divergence_dropped == 1 || m_stats.divergence_dropped % 50 == 0)
                 say("cba-ALARM DIVERGED: chain block " + short_bid(bid) + " h=" + std::to_string(h) +
                     " NOT booked -- this lane's settlement is halted (divergence cap); dropped=" +
@@ -945,7 +946,7 @@ private:
             "ACTION: settlement on this lane is HALTED (finalize cursor frozen at " + std::to_string(cursor) + ", no chain block is booked, no retry runs); "
             "stop the node and re-seed its settlement store from a converged peer. This alarm is terminal for the process.";
         say(banner);
-        if (m_o.out) { std::fprintf(stderr, "%s %s\n", m_o.tag.c_str(), banner.c_str()); std::fflush(stderr); }
+        if (m_o.out) { std::fprintf(stderr, "%s [stderr copy] %s\n", m_o.tag.c_str(), banner.c_str()); std::fflush(stderr); }
         m_retry.clear(); m_deferred.clear(); m_root_unknown_bids.clear();
     }
 

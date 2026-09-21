@@ -85,7 +85,38 @@ reachable on purpose (verify RUN1: `pop_blocks 3 == D_conf` reproduced it).
 Reorgs of depth `< D_conf` are inside the contract: the popped blocks were
 still pending, ORPHAN removes them, the regrown blocks are booked and finalized
 in chain order, and both nodes converge (verify RUN2: four pops of 1–2 with
-`D_conf = 3`, 44 distinct digests identical, credit maps identical).
+`D_conf = 3`, 44 distinct digests identical, credit maps identical; recon-two
+run a: the same with R6; run c3: three `pop_blocks 3 == D_conf` on the strong
+daemon with the daemons P2P-connected also converged — 73 digests identical —
+because the weak side had not buried the popped blocks before the regrown
+branch overtook).
+
+### 3.1 The general class: a FINALIZE window the other node never had
+
+The precise condition is broader than "a SETTLED block was dropped".
+`rearm_first_eligible` reads `eo(k) = finalW(k) − Σ pending payouts(k)`, so
+the **payouts of every block pending in the window `(h, h + D_conf]`** enter
+the sign test that arms / disarms `first_eligible` at FINALIZE(h). Two nodes
+diverge permanently whenever one of them ran FINALIZE(h) with a block in that
+window that the other **never books** — not merely books later (R6 handles
+"later"). Ways that happens:
+
+* a reorg of depth `>= D_conf` that drops a SETTLED block (§3);
+* a **network partition** during which one daemon carried blocks the other
+  never received before they were reorged away (recon-two run c4: daemons
+  disconnected for 150 s, `pop_blocks 3` on the strong side; node A had
+  FINALIZED 16 with pending `{17, 18, 19}` of which 19 never reached B — B can
+  neither reproduce that state nor book A's regrown 17 (its `03` root is the
+  post-FINALIZE(16) digest), so the R4 gate holds B at cursor 15 for good);
+* by the same mechanism, a **same-height race** whose losing block sat in one
+  node's pending window at FINALIZE(h) and never propagated to the other (not
+  observed in any recon run — `same-height races: 0` — but natural on mainnet;
+  the c2pool#1551 race gate protects the *credit*, not the pending-window
+  sign test). Open item, routed to the operator.
+
+Whatever the trigger, the shape afterwards is the same: every subsequent
+peer lane block is `lane-root-unknown` here, the gate holds, the cursor
+freezes — and §4 is what bounds it.
 
 ## 4. The divergence cap (R6 detector) — loud and bounded, never a silent stall
 
@@ -145,12 +176,31 @@ verify rigs):
   `pop_blocks` of 1–2 with `D_conf = 3` alternating between the daemons;
 * **(b) normal receiver lag, no pops:** `LAGB=30000` (30 s > the block
   interval), no `pop_blocks` at all — the RUN3 shape;
-* **(c) the boundary:** `pop_blocks 3 == D_conf` on one daemon → the node must
-  ALARM + CAP, not stall.
+* **(c) the boundary:** `driver_c4.sh` — partition the daemons
+  (`out_peers`/`in_peers` = 0 on both, 150 s; `set_bans` is unusable: banning
+  127.0.0.1 also refuses the nodes' own RPC), `pop_blocks 3 == D_conf` on the
+  strong side, reconnect → the diverged node must ALARM + CAP, not stall. A
+  plain `pop_blocks 3` with the daemons connected (`driver_c3.sh`) converged
+  three times out of three — the boundary needs a block the other side never
+  saw.
 
 Checks: distinct `owed_digest` SEQUENCE A vs B identical; FINALIZED and booked
 lists identical; per-bid credit maps identical; `digcursor.py` (first cursor
-whose last digest differs = the fork point; SETTLED sets); `pendset.py` (the
-pending set at every FINALIZE(h) on each node — the R6 invariant is "zero
-differing pending sets"); `r4/r5:` alarms 0; `r6:` `DIVERGED=0` for (a)/(b),
-`DIVERGED=1 alarms=1` on the popped side for (c).
+whose last digest differs = the fork point; SETTLED sets); `pendset2.py` (the
+AUTHORITATIVE pending set at every FINALIZE(h), from the `cba-finalize:` line
+FinalizeConnect prints inside the driver's walk — the R6 invariant is "zero
+differing pending sets"; the older log-order reconstruction `pendset.py` shows
+spurious diffs because several events print per tick); `r4/r5:` alarms 0;
+`r6:` `DIVERGED=0` for (a)/(b), `DIVERGED=1 alarms=1` on the diverged side for
+(c), with `lane_root_unknown terminal=0` (the cap fired before any 600-retry
+bound was spent) and the cursor frozen. Before stopping, quiesce (miners off,
+both cursors at `hw − D_conf`, `waiting_now=0`) so a lagging node's digest
+sequence is compared complete rather than as a truncated prefix.
+
+Results (recon-two, D_conf = 3, 4 payees, real E_b, binary rebuilt from the
+committed tree): (a) 48 distinct digests EQUAL, FINALIZED 47 EQUAL, credit maps
+equal on all 50 common bids, 0/47 differing pending sets; (b) 37 distinct
+digests EQUAL, FINALIZED 36 EQUAL, BOOKED 39 EQUAL, credit maps EQUAL, 0/36
+differing pending sets, B deferred 14 bookings (the fix working), R4/R5 alarms
+0, DIVERGED 0 on both; (c) B: `DIVERGED=1 alarms=1`, cursor frozen at 15, lag
+grew to 18 with no further retries, `terminal=0`; A unaffected.
