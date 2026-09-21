@@ -78,6 +78,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -228,6 +229,9 @@ struct FinalizeConnectOptions {
     //  COINBASE AUTHORITY: (height, bid) -> credit/payout read from the block's on-chain
     // coinbase. false + why. why starting with "not-lane:" = a stranger's block (ignored).
     std::function<bool(std::uint64_t, const std::string&, Amounts&, Amounts&, std::string&)> book_from_chain;
+    // recon(A+B credit): our OWN win was submitted OK and its booking deferred to the
+    // chain — the moment the S-1c v0x02 cut descriptor (the FAST PATH) leaves.
+    std::function<void(std::uint64_t height, const std::string& bid_hex)> on_own_win_deferred;
 };
 
 // ── the glue ────────────────────────────────────────────────────────────────
@@ -265,6 +269,12 @@ public:
         std::uint64_t race_credited = 0, race_refused_orphaned = 0,
                       race_refused_other_only = 0, race_deferred = 0,
                       race_renotified = 0, r7_violations = 0;
+        // R4 (chain-ordered booking). `late_unbooked` must stay 0 with the gate
+        // armed (it fires only after a bounded-stall release or a boot cursor
+        // mismatch); `booking_stall_timeout` counts booking-pending lane blocks
+        // that exhausted their retry bound while still canonical (the LOUD
+        // release that replaces the old silent LATE fork).
+        std::uint64_t late_unbooked = 0, booking_stall_timeout = 0;
     };
 
     // Construct AFTER node.bring_up() (the finalize driver exists) and AFTER
@@ -281,7 +291,13 @@ public:
         m_node.set_chain_observer(
             [this](std::uint64_t h, const std::string& bid) { observe_chain_block(h, bid); });
         m_node.set_chain_extend_observer(
-            [this](std::uint64_t h, const std::string& bid) { book_chain_block(h, bid); });   // 
+            [this](std::uint64_t h, const std::string& bid) { book_chain_block(h, bid); });   //
+        // R4: chain-ordered booking gate. The finalize cursor may not step onto
+        // a coin-height that still carries a canonical, booking-pending lane
+        // block (one in the retry set): booking must land BEFORE FINALIZE so
+        // rearm_first_eligible sees the same pending set on every node.
+        m_node.finalize_driver().set_booking_gate(
+            [this](std::uint64_t h) { return booking_gate(h); });
     }
 
     FinalizeConnect(const FinalizeConnect&) = delete;
@@ -376,8 +392,14 @@ public:
         TickReport t;
         echo_node_log();                       // finalize: / win: lines since the last tick
         if (!m_retry.empty()) {                //  fix 4: retry transient chain-fetch failures
-            auto again = m_retry; m_retry.clear();
-            for (const auto& [bid, h] : again)
+            // R4: retry in CHAIN ORDER (ascending height), so booking lands
+            // oldest-first and deterministically across nodes — the same order
+            // FINALIZE will consume them in.
+            std::vector<std::pair<std::uint64_t, std::string>> again;   // (height, bid)
+            for (const auto& [bid, h] : m_retry) again.emplace_back(h, bid);
+            std::sort(again.begin(), again.end());
+            m_retry.clear();
+            for (const auto& [h, bid] : again)
                 if (m_node.chain_carries(h, bid)) book_chain_block(h, bid);   // still canonical -> try again; else drop (an orphan)
         }
 
@@ -460,14 +482,33 @@ public:
         if (m_chain_seen.count(bid)) return;   //  fix 3b: memo of NON-booked outcomes only (not-lane / late / refused)
         if (m_chain_booked_once.count(bid)) say("cba: chain block " + short_bid(bid) + " h=" + std::to_string(h) + " is canonical AGAIN after an orphan -> re-booking");
         const std::uint64_t cursor = m_node.finalize_driver().cursor_height();
-        if (h <= cursor) { m_chain_seen[bid] = true; say("cba: chain block " + short_bid(bid) + " h=" + std::to_string(h) + " is at/below the finalize cursor " + std::to_string(cursor) + " — LATE, not booked (would pend forever)"); return; }
+        if (h <= cursor) {
+            // R4: with the booking gate armed the cursor cannot step past a
+            // canonical unbooked lane block, so this is no longer a SILENT fork.
+            // It can fire only after a bounded-stall release or a boot cursor
+            // mismatch — a LOUD alarm, never a quiet drop.
+            m_chain_seen[bid] = true; ++m_stats.late_unbooked;
+            say("cba-ALARM late_unbooked: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) +
+                " is at/below the finalize cursor " + std::to_string(cursor) +
+                " — its credit can no longer be booked (would pend forever). With R4 this means a "
+                "booking-stall timeout released the gate or the cursor was recovered ahead of it; "
+                "this height needs an operator's eyes (credit divergence risk)");
+            return;
+        }
         Amounts credit, payout; std::string why;
         if (!m_o.book_from_chain(h, bid, credit, payout, why)) {
-            if (why.rfind("get_block", 0) == 0 || why.find("does not parse") != std::string::npos) {   //  fix 4: transient
-                if (++m_retry_n[bid] <= 200) { m_retry[bid] = h; say("cba: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " fetch failed (" + why + ") -> RETRY #" + std::to_string(m_retry_n[bid])); return; }
+            if (why.rfind("get_block", 0) == 0 || why.find("does not parse") != std::string::npos ||
+                why.rfind("cut-pending:", 0) == 0) {   //  fix 4: transient (recon(A+B credit): + receiver's lane not yet at P)
+                if (++m_retry_n[bid] <= 600) { m_retry[bid] = h; say("cba: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " fetch failed (" + why + ") -> RETRY #" + std::to_string(m_retry_n[bid])); return; }
             }
             m_chain_seen[bid] = true;
             if (why.rfind("not-lane:", 0) == 0) return;   // a stranger's block: nothing to book
+            if (why.rfind("cut-pending:", 0) == 0) {      // R4: the receiver's lane never reached P within the retry bound
+                ++m_stats.booking_stall_timeout;
+                say("cba-ALARM booking_stall_timeout: chain lane block " + short_bid(bid) + " h=" +
+                    std::to_string(h) + " exhausted its booking retry bound still cut-pending (" + why +
+                    ") — releasing the finalize gate; credit for this height may diverge");
+            }
             ++m_stats.refused;
             say("cba: REFUSED chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + ": " + why);
             return;
@@ -526,6 +567,7 @@ public:
             m_race.observe_own(ev.height, bid, ev.found_unix_s);
             say("own win " + short_bid(bid) + " h=" + std::to_string(ev.height) +
                 " submitted OK -> booking DEFERRED to the chain view (coinbase authority)");
+            if (m_o.on_own_win_deferred) m_o.on_own_win_deferred(ev.height, bid);   // recon(A+B credit): v0x02 fast path leaves here
             r.registered = true; r.duplicate = true; r.reason = "deferred-to-chain";
             return r;
         }
@@ -594,6 +636,19 @@ public:
     const Stats& stats() const { return m_stats; }
 
 private:
+    // R4: the booking gate the finalize driver consults before stepping onto a
+    // coin-height. false => STALL: a still-canonical lane block at height <= h is
+    // booking-pending (in the retry set). Bounded by the retry cap in
+    // book_chain_block — once a bid exhausts its retries it leaves m_retry (with
+    // a booking_stall_timeout alarm), so the gate always releases; it is never an
+    // unbounded stall. This is what makes booking land BEFORE FINALIZE, so
+    // rearm_first_eligible sees the same pending set on every node.
+    bool booking_gate(std::uint64_t h) {
+        for (const auto& [bid, hh] : m_retry)
+            if (hh <= h && m_node.chain_carries(hh, bid)) return false;
+        return true;
+    }
+
     RegisterResult& refuse(RegisterResult& r, const std::string& bid, std::string reason) {
         ++m_stats.refused;
         r.registered = false;

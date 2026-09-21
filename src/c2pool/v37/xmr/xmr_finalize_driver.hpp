@@ -69,6 +69,20 @@ public:
     // block `bid` at `height` (the MainchainIndex answers this from by_height()).
     using CanonicalFn = std::function<bool(std::uint64_t height, const std::string& bid)>;
 
+    // R4 (operator-approved 2026-09-21): the CHAIN-ORDERED BOOKING gate. Returns
+    // true iff the finalize cursor may step ONTO coin-height `h` — i.e. there is
+    // NO canonical lane block at height <= h whose credit is still pending
+    // (booking in flight: cut-pending / cut-miss replay). The gate is installed
+    // by FinalizeConnect, which owns the booking state; it is a BOUNDED stall
+    // (FinalizeConnect releases with a LOUD alarm on timeout). Unset => no gate,
+    // the pre-R4 behaviour. This removes the silent "h<=cursor -> LATE, not
+    // booked" fork: the cursor can no longer advance past a canonical lane block
+    // that has not yet been booked into the ledger, so rearm_first_eligible sees
+    // the SAME pending set on every node.
+    using BookingGateFn = std::function<bool(std::uint64_t h)>;
+    void set_booking_gate(BookingGateFn g) { m_gate = std::move(g); }
+    std::uint64_t booking_stalls() const { return m_stalled; }
+
     XmrFinalizeDriver(OwedLedger& ledger, SettleHW& hw, ISettleStore& store,
                       ::v37::ChainId chain, std::uint64_t d_conf,
                       std::uint64_t recovered_cursor_height,
@@ -164,6 +178,12 @@ public:
         // canonical guards) so a stale cursor after a crash is harmless.
         const std::uint64_t cursor_before = m_cursor_h;
         for (std::uint64_t h = m_cursor_h + 1; h <= frontier; ++h) {
+            // R4: chain-ordered booking. Do NOT step onto a coin-height that
+            // still carries a canonical lane block whose credit is unbooked
+            // (booking in flight). Hold the cursor at h-1 and break; the next
+            // advance restarts here once FinalizeConnect has booked it (or, on a
+            // bounded-stall timeout, FinalizeConnect releases the gate LOUDLY).
+            if (m_gate && !m_gate(h)) { ++m_stalled; break; }
             const std::uint64_t bin_height = h + m_d_conf;   // high-water at this step
             bool touched = false;                            // a found block was disposed at h
 
@@ -232,6 +252,8 @@ private:
     std::uint64_t  m_cursor_h;   // highest coin height already processed for burial
     std::uint64_t  m_seq;        // write-ahead event sequence
     CanonicalFn    m_is_canonical;
+    BookingGateFn  m_gate;                       // R4: chain-ordered booking gate
+    std::uint64_t  m_stalled = 0;                // R4: times the gate held the cursor
 
     std::map<std::string, FoundBlock>              m_found;      // bid -> block
     std::map<std::uint64_t, std::vector<std::string>> m_by_height; // mined height -> bids
