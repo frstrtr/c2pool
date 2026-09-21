@@ -149,6 +149,11 @@ static std::string   g_credit_feed;            // --credit-feed FILE: the shared
 static std::uint64_t g_credit_feed_lag_ms = 0; // --credit-feed-lag-ms N: this node ingests receipts N ms late (receiver-behind)
 static std::string   g_wire_out, g_wire_in;    // --wire-out DIR / --wire-in DIR: S-1c v0x02 frames (the FAST PATH stand-in)
 static long long     g_credit_mutate = 0;      // --credit-mutate N: +N piconero on one E_b row (the amount-sensitivity falsifier)
+// R6 knobs (all networks). See xmr/xmr_o2_finalize_connect.hpp (R6) + docs/xmr-lane/finality-boundary.md.
+static bool          g_no_book_deferral = false;         // --no-book-deferral: A/B escape hatch (reintroduces the lagging-receiver fork)
+static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
+static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
+static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
 
 static MoneroNetwork parse_net(const std::string& s) {
     if (s == "mainnet")  return MoneroNetwork::Mainnet;
@@ -670,6 +675,28 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         static_cast<unsigned long long>(fs.lane_root_unknown_retries),
                         static_cast<unsigned long long>(fs.lane_root_unknown_resolved),
                         static_cast<unsigned long long>(fs.lane_root_unknown_terminal));
+            // R6: two-sided chain-ordered booking + the divergence cap. deferred
+            // is normal on a lagging node (it is the fix working); DIVERGED must
+            // be 0 in a converged run and 1 -- loud, once -- past the finality
+            // boundary (a reorg of depth >= D_conf; docs/xmr-lane/finality-boundary.md).
+            {
+                const std::uint64_t hw_now = node.hw().hw_height, cur = node.finalize_driver().cursor_height();
+                const std::uint64_t fr = hw_now >= cfg.d_conf ? hw_now - cfg.d_conf : 0;
+                const auto& fo_ = fc.options();
+                std::printf("  r6: booking deferred=%llu attempted_after_deferral=%llu waiting_now=%zu | divergence: lag=%llu (max %llu) "
+                            "cap=%llu heights/%llu ticks ticks_over=%llu DIVERGED=%llu alarms=%llu dropped=%llu\n",
+                            static_cast<unsigned long long>(fs.booking_deferred),
+                            static_cast<unsigned long long>(fs.booked_after_deferral),
+                            fc.deferred_now(),
+                            static_cast<unsigned long long>(fr > cur ? fr - cur : 0),
+                            static_cast<unsigned long long>(fs.divergence_lag_max),
+                            static_cast<unsigned long long>(fo_.divergence_cap_heights ? fo_.divergence_cap_heights : 2 * cfg.d_conf),
+                            static_cast<unsigned long long>(fo_.divergence_cap_ticks),
+                            static_cast<unsigned long long>(fs.divergence_ticks),
+                            static_cast<unsigned long long>(fs.diverged),
+                            static_cast<unsigned long long>(fs.divergence_alarms),
+                            static_cast<unsigned long long>(fs.divergence_dropped));
+            }
             for (const std::uint64_t h : contested) {
                 const auto* cs = fc.race().candidates_at(h);
                 if (!cs) continue;
@@ -955,6 +982,17 @@ static int run_live(const XmrNodeConfig& cfg) {
     o2::FoundBlockQueue found_q;
     o2::FinalizeConnectOptions fo;
     if (cfg.found_sidecar) fo.sidecar_path = cfg.resolved_settle_db_path() + "/pfound.tsv";
+    // R6: two-sided chain-ordered booking (ON) + the divergence cap.
+    fo.book_deferral           = !g_no_book_deferral;
+    fo.divergence_cap_heights  = g_divergence_cap_heights;
+    fo.divergence_cap_ticks    = g_divergence_cap_ticks;
+    fo.divergence_cap_terminal = g_divergence_cap_terminal;
+    std::printf("r6: book_deferral=%s divergence cap: heights=%llu (0 = 2*D_conf = %llu) ticks=%llu terminal=%llu\n",
+                fo.book_deferral ? "ON" : "OFF (pre-R6 booking order; lagging receiver forks)",
+                static_cast<unsigned long long>(fo.divergence_cap_heights),
+                static_cast<unsigned long long>(2 * cfg.d_conf),
+                static_cast<unsigned long long>(fo.divergence_cap_ticks),
+                static_cast<unsigned long long>(fo.divergence_cap_terminal));
     // c2pool#1551: the per-height verdict journal. Default it next to the
     // settle store so that a multi-node run leaves one comparable file per node
     // without the operator having to ask for it.
@@ -1874,6 +1912,10 @@ int main(int argc, char** argv) {
         else if (a == "--wire-out")           g_wire_out = next("");
         else if (a == "--wire-in")            g_wire_in = next("");
         else if (a == "--credit-mutate")      g_credit_mutate = std::stoll(next("0"));
+        else if (a == "--no-book-deferral")        g_no_book_deferral = true;
+        else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = std::stoull(next("0"));
+        else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = std::stoull(next("20"));
+        else if (a == "--divergence-cap-terminal") g_divergence_cap_terminal = std::stoull(next("2"));
         else if (a == "--xmr-template-source") {
             const std::string m = next("monerod");
             cfg.template_source = (m == "native") ? TemplateSourceMode::Native
@@ -1946,6 +1988,15 @@ int main(int argc, char** argv) {
                 "  --network <stagenet|testnet|mainnet|regtest>   default stagenet\n"
                 "  --rpc-host <h>  --rpc-port <p>  --zmq-port <p>\n"
                 "  --lane-chain <id>  --d-conf <n>  --poll-ms <ms>  --status-every <s>\n"
+                "  --divergence-cap-heights <n> R6 divergence cap: finalize cursor may trail the buried\n"
+                "                               frontier by at most n heights while a lane block is\n"
+                "                               lane-root-unknown (default 0 = 2*D_conf) ...\n"
+                "  --divergence-cap-ticks <n>   ... for at most n consecutive ticks (default 20) before\n"
+                "                               the lane is declared DIVERGED (loud, terminal, halted)\n"
+                "  --divergence-cap-terminal <n> also DIVERGED after n exhausted root-unknown retry\n"
+                "                               bounds (default 2; 0 = off)\n"
+                "  --no-book-deferral           A/B escape hatch: book chain blocks as they arrive\n"
+                "                               (pre-R6; a lagging receiver then FORKS owed_digest)\n"
                 "  --same-height-tiebreak <prefer-own|first-seen>   same-height race policy\n"
                 "                               (default prefer-own; drives BOTH the D-14 fork\n"
                 "                               choice and the settlement nomination)\n"

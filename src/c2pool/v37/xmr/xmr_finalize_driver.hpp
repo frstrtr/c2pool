@@ -95,6 +95,14 @@ public:
     using LedgerEventFn = std::function<void()>;
     void set_ledger_event_observer(LedgerEventFn f) { m_on_ledger_event = std::move(f); }
 
+    // R6 evidence seam: fired synchronously right BEFORE each FINALIZE (bid,
+    // coin height h, bin_height = h + D_conf) -- the exact moment
+    // OwedLedger::on_block_finalized reads the pending set. FinalizeConnect
+    // prints the authoritative pending set there (cba-finalize:), which is what
+    // the two-node convergence check diffs. Pure observer; unset => nothing.
+    using FinalizeStepFn = std::function<void(const std::string& bid, std::uint64_t h, std::uint64_t bin_height)>;
+    void set_finalize_observer(FinalizeStepFn f) { m_on_finalize = std::move(f); }
+
     XmrFinalizeDriver(OwedLedger& ledger, SettleHW& hw, ISettleStore& store,
                       ::v37::ChainId chain, std::uint64_t d_conf,
                       std::uint64_t recovered_cursor_height,
@@ -223,6 +231,7 @@ public:
                     ev.bid = bid;
                     ev.bin_height = bin_height;
                     write_event(ev);
+                    if (m_on_finalize) m_on_finalize(bid, h, bin_height);   // R6 evidence: the pending set read here
                     m_ledger.on_block_finalized(bid, bin_height);
                     ledger_event();   // R5
                     steps.push_back(FinalizeStep{bid, h, bin_height});
@@ -272,6 +281,7 @@ private:
     BookingGateFn  m_gate;                       // R4: chain-ordered booking gate
     std::uint64_t  m_stalled = 0;                // R4: times the gate held the cursor
     LedgerEventFn  m_on_ledger_event;            // R5: per-ledger-event observer (candidate ring)
+    FinalizeStepFn m_on_finalize;                // R6: pre-FINALIZE observer (pending-set evidence)
 
     std::map<std::string, FoundBlock>              m_found;      // bid -> block
     std::map<std::uint64_t, std::vector<std::string>> m_by_height; // mined height -> bids

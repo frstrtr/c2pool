@@ -291,6 +291,25 @@ public:
     const std::vector<std::string>& construction_log() const { return m_log; }
     const RecoveredState& recovered() const { return m_recovered; }
 
+    // R6 (two-sided chain-ordered booking): re-run the F1 finalize walk against
+    // the CURRENT persisted high-water without a new chain event. FinalizeConnect
+    // calls this after it has booked a DEFERRED lane block (one that arrived at a
+    // height above cursor + 1 + D_conf and was held back until the cursor reached
+    // it), so the cursor can step onto the next height in the same tick instead
+    // of waiting for the next Extend. Same per-height bin_height, same in-order
+    // stepping, same booking gate: advance_to_tip is idempotent at an unchanged
+    // high-water (O5.5 admits an equal height; the walk resumes at cursor + 1).
+    std::vector<FinalizeStep> readvance_settlement() {
+        std::vector<FinalizeStep> steps;
+        if (!m_finalize || m_hw.hw_height == 0) return steps;
+        steps = m_finalize->advance_to_tip(m_hw.hw_height, m_hw.hw_tip);
+        for (const auto& s : steps)
+            log("finalize: block " + s.bid.substr(0, 12) + "… (mined h=" +
+                std::to_string(s.coin_height) + ") SETTLED at bin_height=" +
+                std::to_string(s.bin_height) + " (re-advance after deferred booking)");
+        return steps;
+    }
+
 private:
     // Install the ed25519 point-check backend (which is ALSO what makes the P-1
     // XMR descriptor validator live: xmr_ref_valid() fails closed with no
