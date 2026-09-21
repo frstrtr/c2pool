@@ -118,7 +118,11 @@ public:
     // daemon's header, apply the replacements oldest-first (apply()'s reorg branch emits
     // Orphan(loser) + Reorg(winner)), then the tip.
     void reconcile_then_apply(const ChainMainBlock& tip) {
-        if (index_.empty() || tip.id == index_.best_id()) { index_.apply(tip); return; }
+        // ctest#933 (xmr_x2_node_kat §[4]): a seed-anchor row fills by_height_ WITHOUT
+        // setting best_id_, so empty() is false while best_id() is all-zero. Without the
+        // is_zero guard the FIRST real tip enters the reconcile walk (header fetch below the
+        // tip -> can ABORT) instead of a direct apply. Direct-apply the first tip.
+        if (index_.empty() || is_zero(index_.best_id()) || tip.id == index_.best_id()) { index_.apply(tip); return; }
         std::vector<ChainMainBlock> repl;
         std::uint64_t h = tip.height;
         const std::uint64_t best = index_.best_height();
