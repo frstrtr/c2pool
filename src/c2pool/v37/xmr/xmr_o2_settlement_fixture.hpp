@@ -161,6 +161,10 @@ struct XmrSettlementConfig {
     LaneCommitmentSource lc_source = LaneCommitmentSource::OwedDigest;
     ::v37::bytes32       lane_commitment_explicit{};   // used iff lc_source == Explicit
 
+    // recon(A+B credit): where the template reads the receipt-lane cut it commits
+    // on-chain (P, spine_digest) — the node's engine snapshot. Unset => no tail.
+    std::function<bool(std::uint64_t& next_pos, ::v37::bytes32& spine)> credit_cut_source;
+
     // ---- sink constructors (payout-target bytes, never address strings) ----
     // Set the sink from raw 32-byte key material; also fills residual_sink_identity.
     void set_residual_sink_std(const std::array<std::uint8_t, 32>& spend_B,
@@ -303,6 +307,8 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.fixed                  = cfg.fixed;
     ctx.h_min                  = cfg.h_min;
     ctx.output_cap             = cfg.resolved_output_cap();
+    if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
+        ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
     if (why) why->clear();
     return ctx;
 }
@@ -371,6 +377,10 @@ inline x6::CoinbaseInputs assembly_settle_inputs(const XmrOwedSettlementSource& 
 class XmrOwedFixture {
 public:
     explicit XmrOwedFixture(::v37::ChainId chain) : m_ledger(chain) {}
+    //  wrap the NODE's live OwedLedger (FOUND/FINALIZE/ORPHAN land there).
+    explicit XmrOwedFixture(OwedLedger& ext) : m_ledger(ext.chain()), m_ext(&ext) {}
+    void learn_ref(const ::v37::ScriptRef& pay) { m_paymap[::v37::xmr::xmr_identity_key(pay)] = pay; }
+    std::vector<::v37::bytes32> keys() const { std::vector<::v37::bytes32> v; for (const auto& [k, r] : m_paymap) { (void)r; v.push_back(k); } return v; }
 
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key
     // is the canon identity_key(pay); the resolver learns pay for that key.
@@ -381,8 +391,8 @@ public:
         m_paymap[key] = pay;
         const std::string bid = "fixture-seed-" + std::to_string(m_next_bid++);
         OwedLedger::Amounts credit; credit[key] = static_cast<long long>(amount);
-        m_ledger.on_block_found(bid, credit, /*payout=*/{});
-        m_ledger.on_block_finalized(bid, /*bin_height=*/m_next_age++);
+        ledger().on_block_found(bid, credit, /*payout=*/{});
+        ledger().on_block_finalized(bid, /*bin_height=*/m_next_age++);
         return key;
     }
 
@@ -404,12 +414,13 @@ public:
         };
     }
 
-    const OwedLedger& ledger() const { return m_ledger; }
-    OwedLedger&       ledger()       { return m_ledger; }
+    const OwedLedger& ledger() const { return m_ext ? *m_ext : m_ledger; }
+    OwedLedger&       ledger()       { return m_ext ? *m_ext : m_ledger; }
     std::size_t       seeded() const { return m_paymap.size(); }
 
 private:
     OwedLedger                            m_ledger;
+    OwedLedger*                           m_ext = nullptr;   // 
     std::map<::v37::bytes32, ::v37::ScriptRef> m_paymap;
     std::uint64_t                         m_next_bid = 0;
     std::uint64_t                         m_next_age = 1;   // 0 reserved / unarmed

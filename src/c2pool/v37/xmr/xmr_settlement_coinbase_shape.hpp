@@ -60,6 +60,7 @@
 
 #include "impl/xmr/settle/xmr_coinbase.hpp"          // CoinbaseInputs / canonical_coinbase_matches / mm_commitment_root
 #include "impl/xmr/template/xmr_block_assembly.hpp"  // AssembledTemplate / BlockBytes / parse_coinbase_prefix
+#include "xmr_credit_cut.hpp"                        // recon(A+B credit): extra_nonce_field
 
 namespace c2pool::v37n::xmr::o2 {
 
@@ -158,6 +159,9 @@ inline KFairCoinbaseShape inspect_kfair_coinbase(const asm_::AssembledTemplate& 
               + " != template height " + std::to_string(tpl.height());
         return s;
     }
+    // recon(A+B credit): the 0x02 payload now carries the credit-cut tail after the
+    // padded nonce; the ACCEPT rebuild must use the payload AS ASSEMBLED.
+    if (const auto nf = ::c2pool::v37n::xmr::credit::extra_nonce_field(got.tx_extra)) ref.extra_nonce = *nf;
     if (used != b.miner_tx_size - 1) {   // the trailing rct_type byte is not prefix
         s.why = "miner_tx prefix length " + std::to_string(used)
               + " != miner_tx size - 1 (" + std::to_string(b.miner_tx_size - 1) + ")";
@@ -227,17 +231,23 @@ inline KFairCoinbaseShape inspect_kfair_coinbase(const asm_::AssembledTemplate& 
             case set_::CoinbaseOutput::Role::Sink:  ++s.n_sink;  break;
         }
     }
-    if (s.n_sink != 1) {
-        s.why = "residual sink outputs = " + std::to_string(s.n_sink) + " (exactly one is mandated)";
+    if (s.n_sink > 1) {
+        s.why = "residual sink outputs = " + std::to_string(s.n_sink) + " (at most one)";
         return s;
     }
-    if (outs.back().role != set_::CoinbaseOutput::Role::Sink) {
-        s.why = "the residual sink is not the last output";
-        return s;
-    }
-    if (!(outs.back().identity == ref.residual_sink_identity)) {
-        s.why = "the last output is not the configured residual sink identity";
-        return s;
+    // recon(A+B credit) (F4, consensus-adjacent seam = operator-hand): n_sink == 0 is the W5 §2 STEADY STATE
+    // (budget <= Σ eligible owed => residual == 0 => no sink; exact-sum already enforced above). With
+    // REAL E_b credit the owed set absorbs the whole budget from the first finalize on, so master's
+    // "exactly one" refused every template and stalled both miners at h=5 (run1-stall-archive).
+    if (s.n_sink == 1) {
+        if (outs.back().role != set_::CoinbaseOutput::Role::Sink) {
+            s.why = "the residual sink is not the last output";
+            return s;
+        }
+        if (!(outs.back().identity == ref.residual_sink_identity)) {
+            s.why = "the last output is not the configured residual sink identity";
+            return s;
+        }
     }
     s.kfair_order = true;
     s.sink_last   = true;

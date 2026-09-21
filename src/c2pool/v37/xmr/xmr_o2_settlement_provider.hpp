@@ -453,6 +453,7 @@ private:
         a.miner   = xmr_md;
         a.mempool = asm_::from_backlog(md.tx_backlog);       // empty on regtest => n_tx == 0
         a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+        a.extra_nonce_tail = src->extra_nonce_tail();   // recon(A+B credit): the on-chain credit cut (0x02 tail)
         // GOOD-CITIZEN: mine the (already good-citizen-selected) set VERBATIM,
         // but only when the NATIVE arm answered. name() reports the arm that
         // actually served this snapshot (the resolved source can fall back to

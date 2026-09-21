@@ -273,11 +273,17 @@ int XmrBlockTemplate::create_miner_tx(const XmrMinerData& data,
     if (corrected_extra_nonce_size > EXTRA_NONCE_MAX_SIZE) {
         return -3;  // caller re-solves the reward with a smaller budget (see update())
     }
-    writeVarint(corrected_extra_nonce_size, m_minerTxExtra);
+    // recon(A+B credit): the on-chain credit cut rides as a constant-size TAIL of the
+    // 0x02 payload (after the worker nonce + weight padding): the weight
+    // invariance trick above is untouched and the per-extra_nonce patch (first
+    // EXTRA_NONCE_SIZE bytes only) never touches it.
+    const std::vector<uint8_t> nonce_tail = m_settle->extra_nonce_tail();
+    writeVarint(corrected_extra_nonce_size + nonce_tail.size(), m_minerTxExtra);
 
     uint64_t extraNonceOffsetInMinerTx = m_minerTxExtra.size();
     m_minerTxExtra.insert(m_minerTxExtra.end(), corrected_extra_nonce_size, 0);
-    m_extraNonceSize = static_cast<uint32_t>(corrected_extra_nonce_size);
+    m_minerTxExtra.insert(m_minerTxExtra.end(), nonce_tail.begin(), nonce_tail.end());
+    m_extraNonceSize = static_cast<uint32_t>(corrected_extra_nonce_size + nonce_tail.size());
 
     // 0x03 : merge-mining tag. v37 commitment (owed_digest/info_digest) rides
     // here as the single MM-tree leaf (root == leaf for a 1-leaf tree).

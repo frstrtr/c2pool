@@ -86,6 +86,14 @@
 #include "xmr/xmr_live_submit.hpp"           // O-2 wire 3: block-blob assembly + submit_block
 #include "xmr/xmr_stratum_listener.hpp"      // O-2 wire 1: POSIX stratum listener (ITransport)
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
+#include "xmr/xmr_coinbase_authority.hpp"  //  coinbase-authority booking
+#include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
+#include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
+#include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
+#include "impl/xmr/node/minijson.hpp"
+#include <deque>
+#include <set>
+#include <sstream>
 #include "xmr/xmr_o2_settlement_fixture.hpp"  // O-2 option B: XmrSettlementConfig + XmrOwedFixture (proof ledger)
 #include "xmr/xmr_o2_settlement_provider.hpp" // O-2 option B: v37 K_fair settlement template provider + source
 #include "xmr/xmr_settlement_coinbase_shape.hpp"  // M2: the K_fair shape gate, read off the assembled block bytes
@@ -108,6 +116,7 @@
 using namespace c2pool::v37n::xmr;
 namespace strat = ::v37::xmr::stratum;
 namespace sub   = c2pool::v37n::xmr::submit;
+namespace settle = ::c2pool::v37n::settle;   // recon(A+B credit): fold_eb at the on-chain cut
 #if defined(V37_XMR_O2_WITH_RANDOMX)
 namespace mine = ::c2pool::xmr::miner;
 #endif
@@ -134,6 +143,17 @@ namespace node  = ::c2pool::xmr::node;
 
 static std::atomic<bool> g_stop{false};
 static void on_sigint(int) { g_stop.store(true); }
+
+// recon(A+B credit) knobs (regtest-only; parsed in main). See xmr/xmr_credit_cut.hpp.
+static std::string   g_credit_feed;            // --credit-feed FILE: the shared receipt stream (carrier-relay stand-in)
+static std::uint64_t g_credit_feed_lag_ms = 0; // --credit-feed-lag-ms N: this node ingests receipts N ms late (receiver-behind)
+static std::string   g_wire_out, g_wire_in;    // --wire-out DIR / --wire-in DIR: S-1c v0x02 frames (the FAST PATH stand-in)
+static long long     g_credit_mutate = 0;      // --credit-mutate N: +N piconero on one E_b row (the amount-sensitivity falsifier)
+// R6 knobs (all networks). See xmr/xmr_o2_finalize_connect.hpp (R6) + docs/xmr-lane/finality-boundary.md.
+static bool          g_no_book_deferral = false;         // --no-book-deferral: A/B escape hatch (reintroduces the lagging-receiver fork)
+static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
+static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
+static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
 
 static MoneroNetwork parse_net(const std::string& s) {
     if (s == "mainnet")  return MoneroNetwork::Mainnet;
@@ -304,6 +324,7 @@ struct ServeHooks {
     // = no inject dir, and the served template is byte-identical to the plain
     // good-citizen path.
     std::function<void()> inject_pump;
+    std::function<void()> cba_tick;   //  per-loop digest ring + log
 };
 
 // ---------------------------------------------------------------------------
@@ -641,6 +662,41 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         static_cast<unsigned long long>(fs.race_renotified),
                         static_cast<unsigned long long>(fs.r7_violations),
                         static_cast<unsigned long long>(rs.double_credit_blocked));
+            // R4/R5 booking-order alarms. late_unbooked (both sub-classes) and
+            // stall_timeout MUST read 0 in a converged run; root_unknown retries
+            // are normal (a receiver one ledger event behind the winner), terminal
+            // must be 0.
+            std::printf("  r4/r5: late_unbooked=%llu (post_finalize=%llu) stall_timeout=%llu gate_stalls=%llu "
+                        "| lane_root_unknown retries=%llu resolved=%llu terminal=%llu\n",
+                        static_cast<unsigned long long>(fs.late_unbooked),
+                        static_cast<unsigned long long>(fs.late_booked_post_finalize),
+                        static_cast<unsigned long long>(fs.booking_stall_timeout),
+                        static_cast<unsigned long long>(node.finalize_driver().booking_stalls()),
+                        static_cast<unsigned long long>(fs.lane_root_unknown_retries),
+                        static_cast<unsigned long long>(fs.lane_root_unknown_resolved),
+                        static_cast<unsigned long long>(fs.lane_root_unknown_terminal));
+            // R6: two-sided chain-ordered booking + the divergence cap. deferred
+            // is normal on a lagging node (it is the fix working); DIVERGED must
+            // be 0 in a converged run and 1 -- loud, once -- past the finality
+            // boundary (a reorg of depth >= D_conf; docs/xmr-lane/finality-boundary.md).
+            {
+                const std::uint64_t hw_now = node.hw().hw_height, cur = node.finalize_driver().cursor_height();
+                const std::uint64_t fr = hw_now >= cfg.d_conf ? hw_now - cfg.d_conf : 0;
+                const auto& fo_ = fc.options();
+                std::printf("  r6: booking deferred=%llu attempted_after_deferral=%llu waiting_now=%zu | divergence: lag=%llu (max %llu) "
+                            "cap=%llu heights/%llu ticks ticks_over=%llu DIVERGED=%llu alarms=%llu dropped=%llu\n",
+                            static_cast<unsigned long long>(fs.booking_deferred),
+                            static_cast<unsigned long long>(fs.booked_after_deferral),
+                            fc.deferred_now(),
+                            static_cast<unsigned long long>(fr > cur ? fr - cur : 0),
+                            static_cast<unsigned long long>(fs.divergence_lag_max),
+                            static_cast<unsigned long long>(fo_.divergence_cap_heights ? fo_.divergence_cap_heights : 2 * cfg.d_conf),
+                            static_cast<unsigned long long>(fo_.divergence_cap_ticks),
+                            static_cast<unsigned long long>(fs.divergence_ticks),
+                            static_cast<unsigned long long>(fs.diverged),
+                            static_cast<unsigned long long>(fs.divergence_alarms),
+                            static_cast<unsigned long long>(fs.divergence_dropped));
+            }
             for (const std::uint64_t h : contested) {
                 const auto* cs = fc.race().candidates_at(h);
                 if (!cs) continue;
@@ -690,6 +746,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         if (hooks.inject_pump) hooks.inject_pump();  // --native-inject-dir scan
         bridge_found();
         fc.tick();
+        if (hooks.cba_tick) hooks.cba_tick();   // 
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
         // p2p-first replaces both with the native chain's own event drain, and
         // this is the only place either of them is driven -- so "no daemon call
@@ -847,6 +904,19 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
 }
 
 static int run_live(const XmrNodeConfig& cfg) {
+    // REGTEST-ONLY rig knobs (the receipt-feed carrier stand-in, the v0x02
+    // fast-path file relay, and the amount-sensitivity falsifier) are fenced OFF
+    // on mainnet: they simulate the not-yet-landed S-1 carrier relay and must
+    // never drive a real settlement. The on-chain credit cut itself (the 44-byte
+    // 0x02 tail, R1) is operator-approved for all networks and stays armed.
+    if (cfg.network == MoneroNetwork::Mainnet &&
+        (!g_credit_feed.empty() || !g_wire_out.empty() || !g_wire_in.empty() ||
+         g_credit_feed_lag_ms != 0 || g_credit_mutate != 0)) {
+        std::printf("NOTICE: --credit-feed/--wire-out/--wire-in/--credit-feed-lag-ms/--credit-mutate "
+                    "are REGTEST-ONLY carrier-relay stand-ins; IGNORED on mainnet (fenced OFF)\n");
+        g_credit_feed.clear(); g_wire_out.clear(); g_wire_in.clear();
+        g_credit_feed_lag_ms = 0; g_credit_mutate = 0;
+    }
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -912,6 +982,17 @@ static int run_live(const XmrNodeConfig& cfg) {
     o2::FoundBlockQueue found_q;
     o2::FinalizeConnectOptions fo;
     if (cfg.found_sidecar) fo.sidecar_path = cfg.resolved_settle_db_path() + "/pfound.tsv";
+    // R6: two-sided chain-ordered booking (ON) + the divergence cap.
+    fo.book_deferral           = !g_no_book_deferral;
+    fo.divergence_cap_heights  = g_divergence_cap_heights;
+    fo.divergence_cap_ticks    = g_divergence_cap_ticks;
+    fo.divergence_cap_terminal = g_divergence_cap_terminal;
+    std::printf("r6: book_deferral=%s divergence cap: heights=%llu (0 = 2*D_conf = %llu) ticks=%llu terminal=%llu\n",
+                fo.book_deferral ? "ON" : "OFF (pre-R6 booking order; lagging receiver forks)",
+                static_cast<unsigned long long>(fo.divergence_cap_heights),
+                static_cast<unsigned long long>(2 * cfg.d_conf),
+                static_cast<unsigned long long>(fo.divergence_cap_ticks),
+                static_cast<unsigned long long>(fo.divergence_cap_terminal));
     // c2pool#1551: the per-height verdict journal. Default it next to the
     // settle store so that a multi-node run leaves one comparable file per node
     // without the operator having to ask for it.
@@ -933,7 +1014,329 @@ static int run_live(const XmrNodeConfig& cfg) {
             return relay->renotify(id, &peers);
         };
     }
+    //  state (lifetimes: all outlive serve_and_run; the pointers are set in the option-B branch)
+    o2::XmrOwedFixture*            cba_fx   = nullptr;
+    const o2::XmrSettlementConfig* cba_scfg = nullptr;
+    std::deque<::v37::bytes32>     cba_ring;                 // this node's owed_digest history (newest at back)
+    std::optional<::v37::bytes32>  cba_payee;
+    unsigned long long             cba_lane_root_unknown = 0;   // counted alarm: 03-root matched no candidate (distinct bids)
+    std::set<std::string>          cba_root_unknown_seen;       // R5: alarm once per bid; the retries are FinalizeConnect's
+    // RECOMPUTE CROSS-CHECK (own wins): the bytes WE assembled and submitted
+    // (candidate full_blob off the provider ring, captured at submit-OK) vs the
+    // block the CHAIN carries (get_block, the authority). recompute = sanity,
+    // on-chain coinbase = authority: on a mismatch we ALARM and still book the
+    // on-chain coinbase. Peer blocks have no local recompute (no template).
+    std::function<bool(std::uint32_t, std::uint32_t, sub::BlockCandidate&)> own_candidate_lookup;
+    std::map<std::string, std::vector<std::uint8_t>> own_recompute;   // bid -> our submitted full_blob
+    std::uint64_t recompute_captured = 0, recompute_unavailable = 0, recompute_ok = 0, recompute_mismatch = 0;
+    std::optional<::v37::ScriptRef> cba_payee_ref;
+    std::uint64_t cba_fetches = 0, cba_booked = 0, cba_not_lane = 0, cba_refused = 0;
+    auto cba_ring_push = [&]() {
+        const ::v37::bytes32 d = node.ledger().owed_digest();
+        if (cba_ring.empty() || !(cba_ring.back() == d)) {
+            cba_ring.push_back(d); if (cba_ring.size() > 4096) cba_ring.pop_front();
+            std::printf("cba-digest: cursor=%llu hw=%llu ledger_seq=%llu owed_digest=%s\n",
+                        static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
+                        static_cast<unsigned long long>(node.hw().hw_height),
+                        static_cast<unsigned long long>(node.ledger().ledger_seq()), hex_of(d).c_str());
+            std::fflush(stdout);
+        }
+    };
+    // recon(A+B credit) state ──────────────────────────────────────────────────────────
+    std::vector<::v37::ScriptRef> feed_refs;   // XMR_STD refs of the seeded owed keys (the receipt descriptors)
+    std::uint64_t feed_off = 0, feed_pushed = 0, feed_rejected = 0;
+    std::deque<std::pair<std::chrono::steady_clock::time_point, std::string>> feed_lagq;
+    struct WireCache { c2pool::v37n::CutDescriptor d; bool prefolded = false; Amounts credit; };
+    std::map<std::string, WireCache> wire_cache;   // bid -> the v0x02 descriptor (+ its early fold)
+    std::set<std::string> wire_seen;
+    std::uint64_t wire_tx = 0, wire_rx = 0, wire_prefold = 0, wire_pending = 0, wire_hit = 0, wire_mismatch = 0, wire_diverged = 0;
+    std::uint64_t cut_ok = 0, cut_pending = 0, cut_miss = 0, cut_mismatch = 0, cut_absent = 0, cut_fold_refused = 0;
+    std::uint64_t cut_repaired = 0;   // R3: cut-misses reconstructed by W4 replay-to-prefix
+    std::string   last_credit_line;
+    // R3 state: the ordered, DERIVABLE receipt-push log for this lane (the same
+    // records, in the same order, every node folds). It is what lets a receiver
+    // whose 128-deep ring evicted prefix P reconstruct the view at P by replay:
+    // this node ingested every push (feed is deterministic + shared), so a
+    // cut-MISS here is a PUBLICATION miss, not a missing-record miss. Also
+    // written durably to <data-dir>/lane<chain>.pushes and reloaded at boot.
+    std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> feed_log;
+    std::map<std::string, std::shared_ptr<const c2pool::v37n::SettlementView>> replay_cache;   // "P:spinehex" -> verified view (whole booking window)
+    auto amounts_str = [&](const Amounts& m) { std::string s; for (const auto& [k, a] : m) s += hex_of(k).substr(0, 8) + "=" + std::to_string(a) + " "; return s; };
+    // decode one block blob's coinbase under coinbase authority against OUR candidate ring
+    // (R5: the ring is fed per ledger event, so every owed_digest state this ledger passed
+    // through is a candidate -- newest first, the live digest at index 0)
+    auto decode_blob = [&](const std::vector<std::uint8_t>& blob) -> c2pool::v37n::xmr::authority::CoinbaseBooking {
+        std::vector<::v37::bytes32> cands; cands.push_back(node.ledger().owed_digest());
+        for (auto it = cba_ring.rbegin(); it != cba_ring.rend(); ++it) if (!(*it == cands.front())) cands.push_back(*it);
+        std::vector<::v37::bytes32> keys;
+        for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
+        for (const auto& k : cba_fx->keys()) keys.push_back(k);
+        return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
+                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
+    };
+    // fetch + decode one block's coinbase under coinbase authority (shared by the chain path and the fast path)
+    auto fetch_decode = [&](const std::string& bid, c2pool::v37n::xmr::authority::CoinbaseBooking& bk, std::string& why,
+                            std::vector<std::uint8_t>* blob_out = nullptr) -> bool {
+        std::string body, err;
+        transport.rpc_post(c2pool::xmr::node::MoneroDaemonRpc::body_get_block(0, bid),
+                           [&](const c2pool::xmr::node::RpcResponse& r) { if (!r.ok()) err = r.error; else body.assign(r.body.begin(), r.body.end()); });
+        if (!err.empty()) { why = "get_block(" + bid.substr(0, 12) + "): " + err; return false; }
+        c2pool::xmr::node::minijson::Value v;
+        if (!c2pool::xmr::node::minijson::parse(body, v)) { why = "get_block: JSON parse failed"; return false; }
+        const std::string blob_hex = v["result"]["blob"].as_string();
+        std::vector<std::uint8_t> blob;
+        if (blob_hex.empty() || !sub::from_hex(blob_hex, blob)) { why = "get_block: no/invalid result.blob"; return false; }
+        if (blob_out) *blob_out = blob;
+        bk = decode_blob(blob);
+        if (!bk.ok) why = bk.why;
+        return bk.ok;
+    };
+    // R3: MANDATORY W4 replay-to-prefix. Reconstruct the SettlementView at a
+    // block-committed cut (P, spine) that our live 128-deep ring no longer holds
+    // (P-age exceeded the ring, or the executor coalesced through the prefix).
+    // This node ingested every receipt push (feed_log), so replay the first P of
+    // them through a SCRATCH engine that publishes EVERY prefix (one submit +
+    // wait per record), then read the view at exactly (P, spine). Digest-gated:
+    // a reachable-but-different digest is a REAL fork (fail-closed cut_mismatch),
+    // never a fold at a neighbouring prefix (O2.3). Cached for the booking
+    // window. When the real S-1 carrier relay lands, swap the source to
+    // FrameVaultChainReader + replay_to_cut (carrier_repair.hpp) — same gate,
+    // same fold.
+    auto replay_view = [&](std::uint64_t P, const ::v37::bytes32& spine, std::string& why)
+            -> std::shared_ptr<const c2pool::v37n::SettlementView> {
+        const std::string key = std::to_string(P) + ":" + hex_of(spine);
+        if (auto it = replay_cache.find(key); it != replay_cache.end()) return it->second;
+        if (feed_log.size() < P) {   // we have not ingested P records yet: retry (the feed catches up)
+            ++cut_pending; why = "cut-pending: replay log has " + std::to_string(feed_log.size()) +
+                                 " records < P=" + std::to_string(P) + " (receiver behind the winner's cut; retry)";
+            return nullptr;
+        }
+        c2pool::v37n::V37Engine scratch;   // ring depth is irrelevant: P is the tip after exactly P replays
+        scratch.start();
+        scratch.submit_tracked(::v37::LaneRecord::add_lane(cfg.lane_chain, cfg.lane_params)).get();
+        for (std::uint64_t i = 0; i < P; ++i) {
+            ::v37::PayoutDescriptor d; d.pay = feed_log[i].first;
+            scratch.submit_tracked(::v37::LaneRecord::push(cfg.lane_chain, d, feed_log[i].second, 0)).get();
+        }
+        bool mism2 = false;
+        auto rv = scratch.settlement_view_by_cut(cfg.lane_chain, P, spine, &mism2);
+        scratch.stop();
+        if (!rv) {
+            if (mism2) { ++cut_mismatch; why = "credit-cut MISMATCH after replay: prefix P=" + std::to_string(P) +
+                                              " reconstructs a DIFFERENT lane digest (fail-closed: a real fork, not an eviction)"; }
+            else       { ++cut_pending;  why = "cut-pending: replay reached P=" + std::to_string(P) +
+                                              " but published no matching cut (retry)"; }
+            return nullptr;
+        }
+        replay_cache[key] = rv; ++cut_repaired;
+        std::printf("cut-repair: reconstructed view at P=%llu spine=%s… by replaying %llu receipt pushes (ring-evicted prefix)\n",
+                    (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), (unsigned long long)P);
+        std::fflush(stdout);
+        return rv;
+    };
+    // (B) THE AUTHORITY: fold E_b at the ON-CHAIN cut, read back from OUR OWN ring. Never at a neighbouring prefix.
+    auto fold_at_cut = [&](std::uint64_t reward, const c2pool::v37n::xmr::credit::CreditCut& cc, Amounts& credit, std::string& why) -> bool {
+        bool mism = false;
+        auto view = node.engine().settlement_view_by_cut(cfg.lane_chain, cc.next_pos, cc.spine_digest, &mism);
+        if (!view) {
+            auto tip = node.engine().snapshot(cfg.lane_chain);
+            const std::uint64_t tp = tip ? tip->next_pos : 0;
+            if (mism) { ++cut_mismatch; why = "credit-cut MISMATCH: we published P=" + std::to_string(cc.next_pos) + " with a DIFFERENT lane digest (fail-closed: different records in the same prefix)"; return false; }
+            if (tp < cc.next_pos) { ++cut_pending; why = "cut-pending: our lane tip " + std::to_string(tp) + " < P=" + std::to_string(cc.next_pos) + " (receiver behind the winner's cut; retry)"; return false; }
+            // R3: the live ring evicted this prefix (P-age > ring, or coalesced
+            // through it). Reconstruct it by replay-to-prefix instead of failing
+            // terminally — this is the fix that stops the reorg fork.
+            ++cut_miss;
+            view = replay_view(cc.next_pos, cc.spine_digest, why);
+            if (!view) return false;   // replay_view set why: cut-pending (retry) or cut-mismatch (fail-closed)
+        }
+        std::optional<settle::EbFold> f = settle::fold_eb(reward, *view, /*strict=*/true);
+        if (!f) { ++cut_fold_refused; why = "fold_eb REFUSED at the on-chain cut (geometry not ratified)"; return false; }
+        credit.clear();
+        for (const auto& [k, v] : f->credit) credit[k] = static_cast<long long>(v);
+        if (g_credit_mutate && !credit.empty()) credit.begin()->second += g_credit_mutate;   // the falsifier: a 1-piconero lie must show in owed_digest
+        return true;
+    };
+    fo.book_from_chain = [&](std::uint64_t h, const std::string& bid, Amounts& credit, Amounts& payout, std::string& why) -> bool {
+        if (!cba_fx || !cba_scfg) { why = "not-lane: no v37 settlement ledger bound (option A)"; return false; }
+        cba_ring_push();
+        ++cba_fetches;
+        c2pool::v37n::xmr::authority::CoinbaseBooking bk;
+        std::vector<std::uint8_t> chain_blob;
+        if (!fetch_decode(bid, bk, why, &chain_blob) && !bk.is_lane && bk.why.empty()) { ++cba_refused; return false; }
+        if (!bk.ok) {
+            why = bk.why;
+            if (why.rfind("lane-root-unknown:", 0) == 0) {   // R5: NOT not-lane; FinalizeConnect keeps + retries it as the ring advances
+                if (cba_root_unknown_seen.insert(bid).second) {
+                    ++cba_lane_root_unknown;
+                    std::printf("cba-ALARM lane_root_unknown: h=%llu bid=%s carries a 03 21 00 tag whose root is UNKNOWN to this ledger yet (%s) -- kept, retried per ledger event\n",
+                                static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), why.c_str());
+                }
+                return false;
+            }
+            if (bk.is_lane) ++cba_refused; else ++cba_not_lane;
+            return false;
+        }
+        if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); ++cba_refused; return false; }
+        // RECOMPUTE CROSS-CHECK (own win): our submitted bytes vs the chain's. Sanity only --
+        // the chain decode above stays the authority whatever this says.
+        if (auto rit = own_recompute.find(bid); rit != own_recompute.end()) {
+            namespace cons = ::c2pool::xmr::native;
+            std::string mism;
+            cons::ParsedBlock pa, pb;
+            const auto sa = cons::parse_block(rit->second.data(), rit->second.size(), pa);
+            const auto sb = cons::parse_block(chain_blob.data(), chain_blob.size(), pb);
+            const bool pa_ok = (sa == cons::BlockParseStatus::Ok || sa == cons::BlockParseStatus::TxCountMismatch);
+            const bool pb_ok = (sb == cons::BlockParseStatus::Ok || sb == cons::BlockParseStatus::TxCountMismatch);
+            if (!pa_ok || !pb_ok) mism = "one side does not parse";
+            else if (pa.miner_tx_size != pb.miner_tx_size ||
+                     std::memcmp(rit->second.data() + pa.miner_tx_offset, chain_blob.data() + pb.miner_tx_offset, pa.miner_tx_size) != 0)
+                mism = "miner_tx BYTES differ (ours " + std::to_string(pa.miner_tx_size) + "B vs chain " + std::to_string(pb.miner_tx_size) + "B)";
+            else {
+                const auto rk = decode_blob(rit->second);
+                if (!rk.ok) mism = "our own bytes do not decode under coinbase authority: " + rk.why;
+                else if (rk.payout != bk.payout || rk.total != bk.total || !(rk.lane_commitment == bk.lane_commitment) ||
+                         rk.has_credit_cut != bk.has_credit_cut || !(rk.credit_cut == bk.credit_cut))
+                    mism = "decoded maps differ (payout/total/lane_commitment/credit_cut)";
+            }
+            if (mism.empty()) { ++recompute_ok; std::printf("cba-recompute: own win h=%llu bid=%s… our submitted miner_tx == on-chain miner_tx (%zu B) and decodes identically; booking the on-chain coinbase\n",
+                                                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), (std::size_t)pb.miner_tx_size); }
+            else { ++recompute_mismatch; std::printf("cba-ALARM recompute_mismatch: own win h=%llu bid=%s… %s -- the ON-CHAIN coinbase is the authority, booking it as read from the block\n",
+                                                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), mism.c_str()); }
+            own_recompute.erase(rit);
+        }
+        payout = bk.payout;   // the PAYOUT side: proven coinbase authority (deterministic r), unchanged
+        // recon(A+B credit): the CREDIT side. AUTHORITY = the on-chain credit cut (B); FAST PATH = the v0x02 descriptor (A),
+        // used only when it AGREES with the chain; on mismatch the chain wins; unreconstructable => fail-closed.
+        if (!bk.has_credit_cut) { ++cut_absent; why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; ++cba_refused; return false; }
+        const char* credit_src = "chain";
+        if (auto wit = wire_cache.find(bid); wit != wire_cache.end()) {
+            const auto& d = wit->second.d;
+            const bool agree = d.cut_next_pos == bk.credit_cut.next_pos && d.cut_spine_digest == bk.credit_cut.spine_digest &&
+                               d.reward == bk.total && d.h_b == h && d.owed_digest_at_win == bk.lane_commitment;
+            if (!agree) { ++wire_mismatch; std::printf("ab-RECONCILE: wire descriptor for %s… DISAGREES with the on-chain commitment (wire P=%llu chain P=%llu) -> the CHAIN is the authority\n", bid.substr(0,12).c_str(), (unsigned long long)d.cut_next_pos, (unsigned long long)bk.credit_cut.next_pos); }
+            else if (wit->second.prefolded) { credit = wit->second.credit; ++wire_hit; credit_src = "wire-prefold(agreed)"; }
+        }
+        if (credit_src[0] == 'c') {
+            if (!fold_at_cut(bk.total, bk.credit_cut, credit, why)) { if (why.rfind("cut-pending:", 0) != 0) ++cba_refused; return false; }
+        } else {
+            // belt-and-braces: the fast path must equal the authority fold whenever the authority is available NOW
+            Amounts chk; std::string w2;
+            if (fold_at_cut(bk.total, bk.credit_cut, chk, w2) && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
+        }
+        ++cut_ok;
+        ++cba_booked;
+        last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " src=" + credit_src + " credit{ " + amounts_str(credit) + "}";
+        std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu payout{ %s}\n",
+                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
+                    bk.digest_index, static_cast<unsigned long long>(bk.total), bk.n_outputs, amounts_str(payout).c_str());
+        std::printf("ab-credit: h=%llu bid=%s… P=%llu spine=%s… reward=%llu src=%s credit{ %s}\n",
+                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), (unsigned long long)bk.credit_cut.next_pos,
+                    hex_of(bk.credit_cut.spine_digest).substr(0, 12).c_str(), (unsigned long long)bk.total, credit_src, amounts_str(credit).c_str());
+        std::fflush(stdout);
+        return true;
+    };
+    // (A) THE FAST PATH, send side: our own win leaves as a REAL S-1c v0x02 frame (CarrierWire::encode, 122-byte trailer).
+    fo.on_own_win_deferred = [&](std::uint64_t h, const std::string& bid, std::uint32_t tid, std::uint32_t en) {
+        // recompute capture: the bytes we assembled for (tid, en), off the provider ring
+        if (cba_fx && own_candidate_lookup) {
+            sub::BlockCandidate c;
+            if (own_candidate_lookup(tid, en, c) && !c.full_blob.empty()) { own_recompute[bid] = c.full_blob; ++recompute_captured; }
+            else { ++recompute_unavailable; std::printf("cba-recompute: own win h=%llu bid=%s… template %u gone from the ring -> no local recompute (chain decode is the authority anyway)\n",
+                                                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), tid); }
+        }
+        if (g_wire_out.empty() || !cba_fx) return;
+        c2pool::v37n::xmr::authority::CoinbaseBooking bk; std::string why;
+        if (!fetch_decode(bid, bk, why) || !bk.has_credit_cut) { std::printf("ab-wire-tx: own win %s… not encodable (%s)\n", bid.substr(0,12).c_str(), why.c_str()); return; }
+        c2pool::v37n::Carrier c = c2pool::v37n::wire_freeze::fixture_a();
+        c2pool::v37n::CutDescriptor d;
+        d.bid = *c2pool::v37n::cut_bid_bytes(bid); d.h_b = h; d.cut_next_pos = bk.credit_cut.next_pos; d.cut_spine_digest = bk.credit_cut.spine_digest;
+        d.reward = bk.total; d.payout_emitted = true; d.owed_digest_at_win = bk.lane_commitment;
+        c.cut = d;
+        const std::vector<std::uint8_t> frame = c2pool::v37n::CarrierWire::encode(c);
+        std::error_code ec; std::filesystem::create_directories(g_wire_out, ec);
+        std::ofstream o(g_wire_out + "/" + bid + ".v2.tmp"); for (std::uint8_t b : frame) o << "0123456789abcdef"[b >> 4] << "0123456789abcdef"[b & 15]; o.close();
+        std::filesystem::rename(g_wire_out + "/" + bid + ".v2.tmp", g_wire_out + "/" + bid + ".v2", ec);
+        ++wire_tx;
+        std::printf("ab-wire-tx: own win h=%llu bid=%s… -> v0x02 frame %zu bytes (trailer 122) P=%llu\n", (unsigned long long)h, bid.substr(0,12).c_str(), frame.size(), (unsigned long long)d.cut_next_pos);
+    };
+    // (A) THE FAST PATH, receive side: decode the peer's v0x02 frame, VERIFY, and PRE-FOLD E_b at the carried cut NOW
+    // (while P is fresh in our ring). Nothing enters the ledger from the wire: the chain path consumes the pre-fold
+    // only if the on-chain commitment agrees with it.
+    auto wire_pump = [&]() {
+        if (g_wire_in.empty()) return;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(g_wire_in, ec)) {
+            const std::string p = e.path().string();
+            if (p.size() < 3 || p.compare(p.size() - 3, 3, ".v2") != 0 || wire_seen.count(p)) continue;
+            wire_seen.insert(p);
+            std::ifstream in(p); std::string hx((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            std::vector<std::uint8_t> frame; if (!sub::from_hex(hx, frame)) continue;
+            const auto dr = c2pool::v37n::CarrierWire::decode(frame);
+            if (!dr.ok() || !dr.carrier.cut) { std::printf("ab-wire-rx: %s does not decode as a v0x02 block-winner frame\n", p.c_str()); continue; }
+            ++wire_rx;
+            const auto& d = *dr.carrier.cut;
+            const std::string bid = c2pool::v37n::cut_bid_hex(d.bid);
+            WireCache wc; wc.d = d;
+            bool known = false; for (const auto& x : cba_ring) if (x == d.owed_digest_at_win) { known = true; break; }
+            if (!known) ++wire_diverged;
+            c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = d.cut_next_pos; cc.spine_digest = d.cut_spine_digest;
+            std::string why;
+            if (fold_at_cut(d.reward, cc, wc.credit, why)) { wc.prefolded = true; ++wire_prefold; } else ++wire_pending;
+            wire_cache[bid] = wc;
+            std::printf("ab-wire-rx: peer win h=%llu bid=%s… P=%llu reward=%llu owed_at_win %s | prefold=%s%s\n",
+                        (unsigned long long)d.h_b, bid.substr(0,12).c_str(), (unsigned long long)d.cut_next_pos, (unsigned long long)d.reward,
+                        known ? "KNOWN-to-our-ledger-history" : "UNKNOWN(diverged-or-not-yet)", wc.prefolded ? "yes" : "no", wc.prefolded ? "" : (" (" + why + ")").c_str());
+        }
+    };
+    // THE RECEIPT FEED (the carrier-relay stand-in): a shared append-only file "idx weight" per line; every node
+    // pushes the SAME records in the SAME order (submit_tracked+get: one record per burst => every prefix published).
+    auto feed_push_line = [&](const std::string& ln) {
+        unsigned idx = 0; unsigned long long w = 0;
+        if (std::sscanf(ln.c_str(), "%u %llu", &idx, &w) != 2 || idx >= feed_refs.size() || w == 0) return;
+        ::v37::PayoutDescriptor d; d.pay = feed_refs[idx];
+        const auto res = node.engine().submit_tracked(::v37::LaneRecord::push(cfg.lane_chain, d, w, 0)).get();
+        if (res.applied()) {
+            ++feed_pushed;
+            // R3: record the applied push, in order, for replay-to-prefix. This
+            // node ingested every push, so feed_log[0..P-1] reconstructs any
+            // ring-evicted prefix P. (Durable-log reload across a restart is a
+            // stated follow-on; the fork the proof exercises is mid-run.)
+            feed_log.emplace_back(feed_refs[idx], static_cast<std::uint64_t>(w));
+        } else ++feed_rejected;
+        if (feed_pushed <= 3 || feed_pushed % 100 == 0 || !res.applied()) {
+            auto s = node.engine().snapshot(cfg.lane_chain);
+            std::printf("credit-feed: pushed=%llu rejected=%llu lane next_pos=%llu digest=%s…\n", (unsigned long long)feed_pushed, (unsigned long long)feed_rejected,
+                        s ? (unsigned long long)s->next_pos : 0ULL, s ? hex_of(s->digest).substr(0, 12).c_str() : "-");
+        }
+    };
+    auto feed_pump = [&]() {
+        if (g_credit_feed.empty() || feed_refs.empty()) return;
+        std::ifstream in(g_credit_feed, std::ios::binary);
+        if (in) {
+            in.seekg(static_cast<std::streamoff>(feed_off));
+            std::string chunk((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            std::size_t start = 0;
+            for (;;) {
+                const std::size_t nl = chunk.find('\n', start);
+                if (nl == std::string::npos) break;
+                const std::string line = chunk.substr(start, nl - start);
+                start = nl + 1;
+                if (g_credit_feed_lag_ms) feed_lagq.emplace_back(std::chrono::steady_clock::now(), line); else feed_push_line(line);
+            }
+            feed_off += start;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        while (!feed_lagq.empty() && std::chrono::duration_cast<std::chrono::milliseconds>(now - feed_lagq.front().first).count() >= static_cast<long long>(g_credit_feed_lag_ms)) {
+            feed_push_line(feed_lagq.front().second); feed_lagq.pop_front();
+        }
+    };
     o2::FinalizeConnect fc(node, cfg, found_q, fo);
+    // R5: the candidate ring is fed PER LEDGER EVENT (every FOUND/ORPHAN/FINALIZE the driver
+    // applies), not per tick: a tick that applies several seqs at once (book h47 + finalize
+    // h44) skipped the intermediate owed_digest, and a peer block committed to exactly that
+    // state was memoized not-lane -> the h=48 SETTLED fork. Every state is now present.
+    node.finalize_driver().set_ledger_event_observer([&]() { cba_ring_push(); });
     std::printf("same-height policy: tiebreak=%s D_conf=%llu renotify<=%u journal=%s "
                 "| credit requires burial: YES  orphan-credit: NEVER  double-credit: BLOCKED\n",
                 to_string(cfg.same_height_tiebreak),
@@ -961,6 +1364,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         pk.subaddress = cfg.payee_subaddress;
         payee_key = o2::payee_identity_key(pk);
+        cba_payee = payee_key;   // 
+        cba_payee_ref = pk.subaddress ? ::v37::xmr::make_xmr_sub(pk.spend, pk.view) : ::v37::xmr::make_xmr_std(pk.spend, pk.view);
         if (!payee_key) {
             std::printf("REFUSED: payee keys do not validate as an XMR payout descriptor "
                         "(ed25519 point check) — no ledger key\n");
@@ -1021,12 +1426,42 @@ static int run_live(const XmrNodeConfig& cfg) {
         // distinct K_fair OWED payee (the sink material with spend/view swapped —
         // still two valid ed25519 points, a different identity) so the assembled
         // coinbase carries an OWED output alongside the sink (multi-output proof).
-        o2::XmrOwedFixture ledger(cfg.lane_chain);
+        o2::XmrOwedFixture ledger(node.ledger());   //  ONE ledger — K_fair is built over the ledger FOUND/FINALIZE mutate
+        cba_fx = &ledger; cba_scfg = &scfg;
+        // recon(A+B credit): the template commits THIS node's receipt-lane cut (P, spine) on-chain (0x02 tail)
+        scfg.credit_cut_source = [&](std::uint64_t& P, ::v37::bytes32& dg) -> bool {
+            auto s = node.engine().snapshot(cfg.lane_chain); if (!s) return false; P = s->next_pos; dg = s->digest; return true; };
+        std::printf("ab: on-chain credit cut ARMED (0x02 tail V37C|P|spine); feed=%s lag=%llums wire-out=%s wire-in=%s mutate=%lld\n",
+                    g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
+                    g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
+        if (cba_payee_ref) ledger.learn_ref(*cba_payee_ref);
+        std::printf("cba: coinbase-authority booking ARMED (lane_chain=%u, payee %s, sink identity %s…)\n", cfg.lane_chain,
+                    cba_payee ? "learned" : "none", hex_of(scfg.residual_sink_identity).substr(0, 12).c_str());
         if (serving && cfg.owed_demo_amount) {
-            ledger.seed_owed_std(sink_A, sink_B, cfg.owed_demo_amount);
-            std::printf("owed-demo: seeded %llu piconero owed to a distinct K_fair payee "
-                        "(coinbase will carry OWED + residual sink)\n",
-                        static_cast<unsigned long long>(cfg.owed_demo_amount));
+            // P1 MULTI-PAYEE proof: seed >=3 DISTINCT owed keys, identical on both nodes.
+            // Each (spend,view) is a valid ed25519 point s*G from a fixed domain hash, so
+            // both nodes derive the same identities; derive_output needs only the pubkeys.
+            const int nkeys = static_cast<int>([]{ const char* e = std::getenv("V37_OWED_KEYS"); return e ? std::atoi(e) : 3; }());
+            for (int ki = 0; ki < nkeys; ++ki) {
+                std::string ds = "v37-owed-spend#" + std::to_string(ki);
+                std::string dv = "v37-owed-view#"  + std::to_string(ki);
+                ::xmr::coin::EcScalar es{}, ev{};
+                ::xmr::coin::hash_to_scalar(ds.data(), ds.size(), es);
+                ::xmr::coin::hash_to_scalar(dv.data(), dv.size(), ev);
+                ::xmr::coin::SecretKey ss{}, sv{};
+                std::memcpy(ss.data(), es.data(), 32); std::memcpy(sv.data(), ev.data(), 32);
+                ::xmr::coin::PublicKey PB{}, PA{};
+                if (!::xmr::coin::secret_key_to_public_key(ss, PB) ||
+                    !::xmr::coin::secret_key_to_public_key(sv, PA)) {
+                    std::printf("owed-demo: key%d point-gen FAILED\n", ki); continue; }
+                std::array<std::uint8_t,32> B{}, A{};
+                std::memcpy(B.data(), PB.data(), 32); std::memcpy(A.data(), PA.data(), 32);
+                const std::uint64_t amt = cfg.owed_demo_amount * static_cast<std::uint64_t>(ki + 1);
+                ::v37::bytes32 kid = ledger.seed_owed_std(B, A, amt);
+                feed_refs.push_back(::v37::xmr::make_xmr_std(B, A));   // recon(A+B credit): receipt identity == owed key
+                std::printf("owed-demo: seeded key%d id=%s... amount=%llu piconero (distinct K_fair payee)\n",
+                            ki, hex_of(kid).substr(0,12).c_str(), static_cast<unsigned long long>(amt));
+            }
         }
 
         // ── M2: WHICH miner-data source the assembler is fed from ───────────
@@ -1104,6 +1539,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::string w;
             return provider.candidate_by_id(tid, en, out, &w);
         };
+        own_candidate_lookup = candidate;   // recompute cross-check: our own submitted bytes
 
         // ── M3: the daemonless FIND path, assembled ─────────────────────────
         //
@@ -1117,6 +1553,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::uint64_t tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, tip_best = 0;
 
         ServeHooks hooks;
+        hooks.cba_tick = [&]() { cba_ring_push(); feed_pump(); wire_pump(); };   // recon(A+B credit): + receipt feed + v0x02 fast path
         if (p2p_first) {
             if (!native->node()->block_relay()) {
                 std::printf("REFUSED: the native node built no block relay (internal wiring bug)\n");
@@ -1164,6 +1601,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                 orc->on_serve(provider.current().epoch, served, provider.current().source_name);
         };
         hooks.status_extra = [&]() {
+            {   // recon(A+B credit)
+                auto s = node.engine().snapshot(cfg.lane_chain);
+                std::printf("  ab-credit: feed pushed=%llu rejected=%llu lagq=%zu lane next_pos=%llu digest=%s… | cut ok=%llu pending=%llu miss=%llu repaired=%llu mismatch=%llu absent=%llu fold-refused=%llu | wire tx=%llu rx=%llu prefold=%llu pending=%llu hit=%llu mismatch=%llu owed-unknown=%llu | last %s\n",
+                            (unsigned long long)feed_pushed, (unsigned long long)feed_rejected, feed_lagq.size(),
+                            s ? (unsigned long long)s->next_pos : 0ULL, s ? hex_of(s->digest).substr(0, 12).c_str() : "-",
+                            (unsigned long long)cut_ok, (unsigned long long)cut_pending, (unsigned long long)cut_miss, (unsigned long long)cut_repaired, (unsigned long long)cut_mismatch, (unsigned long long)cut_absent, (unsigned long long)cut_fold_refused,
+                            (unsigned long long)wire_tx, (unsigned long long)wire_rx, (unsigned long long)wire_prefold, (unsigned long long)wire_pending, (unsigned long long)wire_hit, (unsigned long long)wire_mismatch, (unsigned long long)wire_diverged,
+                            last_credit_line.c_str());
+                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu root_unknown_bids=%llu ring=%zu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu\n",
+                            (unsigned long long)cba_fetches, (unsigned long long)cba_booked, (unsigned long long)cba_not_lane, (unsigned long long)cba_refused,
+                            cba_lane_root_unknown, cba_ring.size(),
+                            (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch);
+            }
             if (!last_shape.empty())
                 std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
                             last_selected_tx, last_shape.c_str(),
@@ -1456,6 +1906,16 @@ int main(int argc, char** argv) {
         else if (a == "--settle-output-cap") cfg.settle_output_cap =
                      static_cast<std::uint32_t>(std::stoul(next("0")));
         else if (a == "--owed-demo-amount") cfg.owed_demo_amount = std::stoull(next("0"));
+        // recon(A+B credit) knobs
+        else if (a == "--credit-feed")        g_credit_feed = next("");
+        else if (a == "--credit-feed-lag-ms") g_credit_feed_lag_ms = std::stoull(next("0"));
+        else if (a == "--wire-out")           g_wire_out = next("");
+        else if (a == "--wire-in")            g_wire_in = next("");
+        else if (a == "--credit-mutate")      g_credit_mutate = std::stoll(next("0"));
+        else if (a == "--no-book-deferral")        g_no_book_deferral = true;
+        else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = std::stoull(next("0"));
+        else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = std::stoull(next("20"));
+        else if (a == "--divergence-cap-terminal") g_divergence_cap_terminal = std::stoull(next("2"));
         else if (a == "--xmr-template-source") {
             const std::string m = next("monerod");
             cfg.template_source = (m == "native") ? TemplateSourceMode::Native
@@ -1528,6 +1988,15 @@ int main(int argc, char** argv) {
                 "  --network <stagenet|testnet|mainnet|regtest>   default stagenet\n"
                 "  --rpc-host <h>  --rpc-port <p>  --zmq-port <p>\n"
                 "  --lane-chain <id>  --d-conf <n>  --poll-ms <ms>  --status-every <s>\n"
+                "  --divergence-cap-heights <n> R6 divergence cap: finalize cursor may trail the buried\n"
+                "                               frontier by at most n heights while a lane block is\n"
+                "                               lane-root-unknown (default 0 = 2*D_conf) ...\n"
+                "  --divergence-cap-ticks <n>   ... for at most n consecutive ticks (default 20) before\n"
+                "                               the lane is declared DIVERGED (loud, terminal, halted)\n"
+                "  --divergence-cap-terminal <n> also DIVERGED after n exhausted root-unknown retry\n"
+                "                               bounds (default 2; 0 = off)\n"
+                "  --no-book-deferral           A/B escape hatch: book chain blocks as they arrive\n"
+                "                               (pre-R6; a lagging receiver then FORKS owed_digest)\n"
                 "  --same-height-tiebreak <prefer-own|first-seen>   same-height race policy\n"
                 "                               (default prefer-own; drives BOTH the D-14 fork\n"
                 "                               choice and the settlement nomination)\n"
