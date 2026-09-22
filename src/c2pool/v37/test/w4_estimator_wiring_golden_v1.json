@@ -12,9 +12,9 @@
     ],
     "bin_height": 100
   },
-  "owed_digest_gate_off_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
-  "owed_digest_master_style_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
-  "owed_digest_gate_on_hex": "56caec4cff671eed36d53e11140f0a0de44f35e98900df3010cdd296ea5a0f58",
+  "owed_digest_gate_off_hex": "6c85fd89bb1218ce6e25b607f6cbf19ada17abaab26f62dddfeec4846712e071",
+  "owed_digest_master_style_hex": "6c85fd89bb1218ce6e25b607f6cbf19ada17abaab26f62dddfeec4846712e071",
+  "owed_digest_gate_on_hex": "d851241bad15520e7323d1862fe270c2094c92d9a04e20678dc3117dd0d8df90",
   "lane_digest_hex": "37756e9fa59be4aa30acfa6a18b0e1c131c9601cfceec802f19133a1ecde1a50",
   "uncovered_credit_low63_dec": "874999",
   "invariants": {

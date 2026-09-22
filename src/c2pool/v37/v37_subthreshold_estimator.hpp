@@ -389,7 +389,7 @@ inline std::vector<std::uint8_t> serialize_receipt_carrier(
 
 // --------------------------------------------------------------------------- //
 //  Compact SHA-256 / sha256d — used ONLY to reproduce the w4_settlement
-//  owed_digest shape ("V37O" || key || i64 finalW || u64 first_eligible) so the
+//  owed_digest shape ("V37Q" || key || i64 finalW || u64 first_eligible) so the
 //  KAT can prove gate-off byte-identity of the consensus commitment, and to hash
 //  the receipt/share body (below) for the same gate-off proof on that digest.
 // --------------------------------------------------------------------------- //
@@ -460,11 +460,11 @@ inline std::array<std::uint8_t, 32> sha256d(const std::vector<std::uint8_t>& msg
 
 // Faithful re-implementation of w4_settlement.hpp OwedLedger::owed_digest():
 //   domain-separated sha256d, sorted by key (32-byte), zero rows skipped:
-//   "V37O" || key || i64 finalW (LE) || u64 first_eligible (LE).
+//   "V37Q" || key || i64 finalW (LE) || u64 first_eligible (LE).
 inline std::array<std::uint8_t, 32> owed_digest(
     const std::map<std::array<std::uint8_t, 32>, long long>& finalW,
     const std::map<std::array<std::uint8_t, 32>, std::uint64_t>& first_eligible) {
-    std::vector<std::uint8_t> pre = {'V', '3', '7', 'O'};
+    std::vector<std::uint8_t> pre = {'V', '3', '7', 'Q'};   // R-A: match owed_digest V37Q
     for (const auto& [k, w] : finalW) {  // std::map iterates sorted by key
         if (w == 0) continue;
         pre.insert(pre.end(), k.begin(), k.end());

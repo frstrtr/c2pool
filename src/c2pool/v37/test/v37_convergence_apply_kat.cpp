@@ -126,10 +126,10 @@ static std::string hex32(const bytes32& d) {
     return s;
 }
 
-// The empty-fold anchor sha256d("V37O") — what owed_digest() returns before any
+// The empty-fold anchor sha256d("V37Q") — what owed_digest() returns before any
 // block finalizes. The fingerprint of "this node credited nothing".
 static const char* kEmptyAnchor =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 
 static const ChainId CH      = 7;
 static const u64     D_CONF  = 3;
@@ -728,7 +728,7 @@ int main() {
               "(a fresh win withholds the coinbase; the credit rides FINALIZE)");
         settle::OwedLedger fresh(CH);
         check(hex32(fresh.owed_digest()) == kEmptyAnchor,
-              "CA-7d the empty-fold anchor sha256d(\"V37O\") is unmoved");
+              "CA-7d the empty-fold anchor sha256d(\"V37Q\") is unmoved");
         check(c2.cut_a.credit == c2.cut_b.credit,
               "CA-7e the repaired fold is the SAME fold: settle::fold_eb over the same view");
     }
