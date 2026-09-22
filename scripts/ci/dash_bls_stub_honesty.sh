@@ -68,11 +68,17 @@ else
 fi
 
 # ── 1. Self-report: parse the last token of `--version` ───────────────────────
-ver_out="$("$BIN" --version 2>&1 || true)"
+# `--version` is a pure query on this binary (prints and returns before any
+# network), but wrap it in `timeout` regardless: an old or regressed binary that
+# opens the network on `--version` instead of returning would otherwise hang
+# this whole CI step (observed live on a pre-#1671 build). A timeout kill leaves
+# ver_out empty, which the missing-token branch below reports as a hard fail —
+# fast, not a hung job.
+ver_out="$(timeout 20s "$BIN" --version 2>&1 || true)"
 # Extract the value of the `bls=` token, wherever it sits on the line.
 reported="$(printf '%s\n' "$ver_out" | sed -n 's/.*[[:space:]]bls=\([A-Za-z0-9_]*\).*/\1/p' | head -n1)"
 if [ -z "$reported" ]; then
-    bad "\`--version\` printed no \`bls=<backend>\` token — the self-report surface is gone or renamed."
+    bad "\`--version\` printed no \`bls=<backend>\` token — the self-report surface is gone or renamed, or --version did not return within 20s."
     note "     got: $(printf '%s' "$ver_out" | head -n1)"
 else
     note "self-report: --version says bls=$reported"
