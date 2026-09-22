@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   guard:
-    runs-on: [self-hosted, c2pool-build]
+    runs-on: [self-hosted, Linux, X64, c2pool-build]
     steps:
       - uses: actions/checkout@v4
       - name: Selftest (falsifiability) -- guard must go red on an unmasked timer
