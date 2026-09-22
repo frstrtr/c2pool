@@ -1,0 +1,14 @@
+[Unit]
+Description=c2pool self-hosted runner active-but-offline (zombie-listener) tripwire
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Bridge VM only: needs each host systemd truth (GitHub API cannot see it,
+# a gh-hosted runner cannot reach it). Issues only `systemctl is-active`
+# over SSH -> zero build load on any runner host, safe during a P0 soak.
+ExecStart=/home/ubuntu/Github/c2pool-ci-steward/scripts/runner_health_tripwire.sh
+# A FIRE (exit 1) is surfaced by the wrapper/mail step; nonzero is expected
+# signal, not a unit fault.
+SuccessExitStatus=0 1
