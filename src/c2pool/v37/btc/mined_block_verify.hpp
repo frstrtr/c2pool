@@ -31,8 +31,20 @@
 //   verify_peer_win()         the verdict for one carried descriptor.
 //   own_mined_reward()        the winner's own miner slice, read from the block
 //                             BYTES it just mined (never the cached template
-//                             value), using the template only for the payment
-//                             total at the same (height, parent).
+//                             value): sum(outputs) - the outputs that pay the
+//                             template's masternode/burn PAYEE SCRIPTS, with the
+//                             AMOUNTS read from the mined outputs themselves.
+//
+// WHY PAYEE SCRIPTS, NOT THE TEMPLATE'S PAYMENT TOTAL (soak round 899). The
+// masternode + platform-burn amounts are a fixed share of (subsidy + FEES OF
+// THE MINED BLOCK). The stratum work source builds its coinbase from its OWN
+// getblocktemplate; the backend's cached template, fetched separately, can hold
+// a different fee set at the same (height, parent). Subtracting the cached
+// template's payment total then misstates the slice by the masternode share of
+// the fee difference (round 899: winner 59525746, dashd-derived 59526072, a
+// 326-duff gap on 434 duffs of fees) and every peer refuses the claim. The
+// payee IDENTITIES (scripts) are the same in both templates; only the amounts
+// move with fees — so match scripts and read amounts from the mined bytes.
 //
 // WHAT "MINER SLICE" MEANS HERE. Every DASH coinbase pays, besides the pool:
 // the masternode payee, the platform credit-pool burn (an OP_RETURN output, on
@@ -71,6 +83,8 @@ struct CoinbaseOutputs {
     std::uint64_t total = 0;       // sum of every tx[0] vout value (duffs)
     std::size_t   n_out = 0;
     std::string   error;           // set when !ok
+    struct Out { std::uint64_t value = 0; std::vector<std::uint8_t> script; };
+    std::vector<Out> outs;         // every tx[0] output, in order
 };
 
 namespace mbv_detail {
@@ -156,7 +170,13 @@ inline CoinbaseOutputs parse_coinbase_outputs(const std::uint8_t* blk, std::size
         if (out.total + v > kDashMaxMoney) return fail("coinbase output sum above MAX_MONEY");
         out.total += v;
         std::uint64_t pk = 0;
-        if (!r.compact(pk) || !r.take(static_cast<std::size_t>(pk))) return fail("short coinbase: scriptPubKey");
+        if (!r.compact(pk)) return fail("short coinbase: scriptPubKey");
+        const std::size_t at = r.i;
+        if (!r.take(static_cast<std::size_t>(pk))) return fail("short coinbase: scriptPubKey");
+        CoinbaseOutputs::Out o;
+        o.value = v;
+        o.script.assign(blk + at, blk + at + static_cast<std::size_t>(pk));
+        out.outs.push_back(std::move(o));
     }
     out.n_out = static_cast<std::size_t>(nout);
     out.ok = true;
@@ -251,11 +271,34 @@ inline WinVerdict verify_peer_win(const MinedBlockFacts& f, std::uint64_t h_b,
     return WinVerdict::Ok;
 }
 
+// The non-miner part of a mined coinbase: each template payee script is
+// matched to ONE mined output with that exact script (first unmatched, in
+// output order), and that output's MINED amount is counted. nullopt when a
+// payee script has no output (the block does not pay a required payee — dashd
+// would have rejected it; never guess).
+inline std::optional<std::uint64_t> non_miner_amount(
+        const CoinbaseOutputs& cb, const std::vector<std::vector<std::uint8_t>>& payee_scripts) {
+    std::vector<bool> used(cb.outs.size(), false);
+    std::uint64_t sum = 0;
+    for (const auto& ps : payee_scripts) {
+        bool found = false;
+        for (std::size_t k = 0; k < cb.outs.size(); ++k) {
+            if (used[k] || cb.outs[k].script != ps) continue;
+            used[k] = true;
+            sum += cb.outs[k].value;
+            found = true;
+            break;
+        }
+        if (!found) return std::nullopt;
+    }
+    return sum;
+}
+
 // ── the winner's OWN miner slice, from the bytes it mined ───────────────────
-// `tmpl_height`/`tmpl_prev` identify the template whose `tmpl_payments`
-// (masternode + platform burn + superblock) is used; it must be the template at
-// exactly (H_b, parent of the mined header), or the answer is nullopt
-// (unverified -> the caller registers the win VALUELESS, loudly).
+// `tmpl_height`/`tmpl_prev` identify the template whose PAYEE SCRIPTS
+// (masternode + platform burn [+ superblock]) are matched; it must be the
+// template at exactly (H_b, parent of the mined header), or the answer is
+// nullopt (unverified -> the caller registers the win VALUELESS, loudly).
 struct OwnMinedReward {
     std::optional<std::uint64_t> reward;   // the value the own fold consumes
     std::uint64_t coinbase_total = 0;
@@ -264,7 +307,8 @@ struct OwnMinedReward {
 inline OwnMinedReward own_mined_reward(const std::vector<std::uint8_t>& block,
                                        std::uint64_t h_b, const std::string& parent_display_hex,
                                        std::uint64_t tmpl_height, const std::string& tmpl_prev,
-                                       std::uint64_t tmpl_payments, bool superblock_height) {
+                                       const std::vector<std::vector<std::uint8_t>>& payee_scripts,
+                                       bool payees_ok, bool superblock_height) {
     OwnMinedReward o;
     const CoinbaseOutputs cb = parse_coinbase_outputs(block);
     if (!cb.ok) { o.note = "mined coinbase unparseable: " + cb.error; return o; }
@@ -280,8 +324,17 @@ inline OwnMinedReward own_mined_reward(const std::vector<std::uint8_t>& block,
                  "payment total from (template h=" + std::to_string(tmpl_height) + ")";
         return o;
     }
-    o.reward = miner_slice_of(cb.total, tmpl_payments);
-    if (!o.reward) o.note = "template payments exceed the mined coinbase outputs";
+    if (!payees_ok) {
+        o.note = "the template's payee list could not be decoded to scripts";
+        return o;
+    }
+    const std::optional<std::uint64_t> nm = non_miner_amount(cb, payee_scripts);
+    if (!nm) {
+        o.note = "a template payee script has no output in the mined coinbase";
+        return o;
+    }
+    o.reward = miner_slice_of(cb.total, *nm);
+    if (!o.reward) o.note = "payee outputs exceed the mined coinbase outputs";
     return o;
 }
 
