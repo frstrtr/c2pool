@@ -74,8 +74,8 @@ TEST(FactoryConnectFailedUaf, UnmanagedNodeFreedMidDialIsNotDereferenced)
     // Deliberately NO fac.set_lifetime(...): reproduce the unmanaged lane.
 
     // .invalid always fails to resolve -> the resolve-failure feedback branch.
-    fac.connect(core::NetService(std::string("host.does.not.exist.invalid"),
-                                 std::string("9999")));
+    fac.connect(::NetService(std::string("host.does.not.exist.invalid"),
+                             std::string("9999")));
 
     // Free the owning node while the async resolve is still pending -- the
     // teardown/redial race. m_node is now a dangling, non-null pointer.
