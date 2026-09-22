@@ -32,6 +32,16 @@ the ~5–6 kH/s nominal for a 5800H (thermal/power-limited laptop) **and** a res
 the CPU. A dedicated, idle, desktop-class rig may show the documented gain — that was not tested
 here.
 
+**Why this test is not representative (cache architecture):** the MSR mod's gain comes from
+disabling hardware prefetchers, whose effect on RandomX depends on the memory/cache subsystem.
+The 5800H has a small 16 MB L3 and is a thermal/power-limited laptop part; a large-cache desktop
+chip — e.g. a Ryzen 9950X3D with 3D V-Cache (128 MB+ L3) — has a materially different cache/memory
+behaviour, where the prefetcher-disable benefit is expected to differ (plausibly larger). **So this
+5800H measurement does not provide relevant information about MSR-boost on representative
+big-cache desktop hardware.** To actually characterise the MSR-boost for our target audience,
+re-run this exact gated A/B on an idle desktop-class big-cache rig (X3D or similar); the ~0 % here
+should NOT be generalised to those chips.
+
 ## Method — the four things that go wrong (learn from them before re-measuring)
 1. **xmrig block-buffers stdout to a plain file** → 0-byte logs. Run it under a pty:
    `script -qec "sudo xmrig …" arm.log` so the periodic `miner speed …` lines flush live.
