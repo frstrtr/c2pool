@@ -146,10 +146,24 @@ public:
     bool chain_carries(std::uint64_t height, const std::string& bid_hex) {
         if (m_adapter) {
             auto b = m_adapter->index().by_height(height);
+            if (!b || is_zero_id(b->id)) {
+                // Restart-liveness fix: initial_sync() seeds only the TIP row, so after a
+                // restart every height below the tip is absent from the mirror. An absent
+                // row is NOT evidence the block left the chain -- answering false here
+                // ORPHANED the node's own canonical pending blocks at maturity (the exact
+                // false answer the comment above warns about). Fill the row from the
+                // daemon once (synchronous settled-header fetch, never moves the tip).
+                b = m_adapter->ensure_row(height);
+                log(std::string("chain_carries: mirror row h=") + std::to_string(height) +
+                    (b ? " was absent -> backfilled from the daemon (restart-liveness)"
+                       : " absent and the daemon header fetch failed -> status-quo answer (not carried)"));
+            }
             return b && hex_of(b->id) == bid_hex;
         }
         return m_native_presence ? m_native_presence(height, bid_hex) : false;
     }
+
+    static bool is_zero_id(const c2pool::xmr::node::Hash& h) { for (auto c : h) if (c) return false; return true; }
 
     // The best height the settlement path is working against, from whichever
     // driver is live. In p2p-first this is the highest height a pumped event
