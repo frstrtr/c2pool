@@ -576,7 +576,12 @@ public:
         // --- the daemon arm (parity / backup only) ---------------------------
         if (!cfg_.monerod_rpc_host.empty() && cfg_.monerod_rpc_port != 0) {
             rpc_    = std::make_unique<MonerodHttp>(cfg_.monerod_rpc_host, cfg_.monerod_rpc_port);
-            mon_src_ = std::make_unique<tmpl::MonerodMinerDataSource>(*rpc_);
+            // Same good-citizen backlog-refresh policy as the native arm, so a
+            // fallback onto the daemon arm does not fall back onto tip-only
+            // (coinbase-only-with-a-full-pool) templates.
+            tmpl::MonerodArmConfig mon_cfg;
+            mon_cfg.backlog_refresh_s = cfg_.backlog_refresh_s;
+            mon_src_ = std::make_unique<tmpl::MonerodMinerDataSource>(*rpc_, mon_cfg);
             mon_tip_ = std::make_unique<parity::MonerodTipObserver>(*rpc_);
             // M1's P-POOL arm. Constructed whenever a daemon endpoint is, so
             // that "the probe was never armed" is impossible to confuse with

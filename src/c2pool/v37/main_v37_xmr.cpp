@@ -1474,11 +1474,17 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!native)
             std::printf("template source: MONEROD — one get_miner_data per template refresh\n");
 
+        // GOOD-CITIZEN on the daemon arm: rebuild when the tx set monerod
+        // OFFERS moves under an unchanged tip (rate-limited), not only when the
+        // tip does. --no-good-citizen = legacy tip-only (CONTROL run).
+        ::c2pool::xmr::native::tmpl::MonerodArmConfig daemon_arm_cfg;
+        daemon_arm_cfg.backlog_refresh_s = cfg.no_good_citizen ? 0 : cfg.native_backlog_refresh_s;
+
         std::unique_ptr<o2::XmrSettlementTemplateProvider> provider_owner =
             native ? std::make_unique<o2::XmrSettlementTemplateProvider>(
                          native->source(), ledger, scfg, cfg.stratum_share_diff, native->pump())
                    : std::make_unique<o2::XmrSettlementTemplateProvider>(
-                         transport, ledger, scfg, cfg.stratum_share_diff);
+                         transport, ledger, scfg, cfg.stratum_share_diff, daemon_arm_cfg);
         o2::XmrSettlementTemplateProvider& provider = *provider_owner;
 
         // ── the K_fair shape gate, on BOTH arms ─────────────────────────────
@@ -1513,13 +1519,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return true;
             });
 
-        // ── GOOD-CITIZEN take-mempool-as-given (native arm only) ────────────
+        // ── GOOD-CITIZEN ────────────────────────────────────────────────────
         // The operator hard rule: a mined block ALWAYS carries the pool's valid
         // txs (empty coinbase-only ONLY when the pool is genuinely empty). ON by
-        // default for the native arm; --no-good-citizen is the CONTROL switch
-        // for the live proof (reproduces the old coinbase-only-with-full-pool
-        // failure). The daemon arm is never affected (provider gates on the
-        // answering arm's name()).
+        // default on both arms; --no-good-citizen is the CONTROL switch for the
+        // live proof (reproduces the old coinbase-only-with-full-pool failure).
+        //   native arm  take-mempool-as-given (provider gates on the answering
+        //               arm's name()) + pool-change rebuild (backlog_refresh_s).
+        //   daemon arm  offered-backlog-change rebuild (daemon_arm_cfg above);
+        //               the p2pool 5-s age gate stays (time_received is 0 from
+        //               get_miner_data, so it admits everything monerod offers).
         if (native && !cfg.no_good_citizen) {
             provider.set_take_mempool_as_given(true);
             std::printf("good-citizen: ON (native arm mines the selected mempool set verbatim; "
@@ -1528,6 +1537,13 @@ static int run_live(const XmrNodeConfig& cfg) {
         } else if (native) {
             std::printf("good-citizen: OFF (--no-good-citizen: native arm uses the p2pool 5-s "
                         "age gate; CONTROL run)\n");
+        } else if (!cfg.no_good_citizen) {
+            std::printf("good-citizen: ON (daemon arm rebuilds the template when the offered "
+                        "get_miner_data backlog moves, at most every %llus)\n",
+                        static_cast<unsigned long long>(cfg.native_backlog_refresh_s));
+        } else {
+            std::printf("good-citizen: OFF (--no-good-citizen: daemon arm rebuilds on tip moves "
+                        "only; CONTROL run)\n");
         }
 
         o2::SettlementStratumTemplateSource template_source(provider);
@@ -1619,7 +1635,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                             last_selected_tx, last_shape.c_str(),
                             static_cast<unsigned long long>(shape_ok),
                             static_cast<unsigned long long>(shape_refused));
-            if (!native) return;
+            if (!native) {
+                // GOOD-CITIZEN headline for the daemon arm: what monerod offered
+                // on the last poll, what the served template selected, and how
+                // many times the offered set moved the epoch under an unchanged
+                // tip (each one is a rebuild that would have been a coinbase-only
+                // block under the legacy tip-only rule).
+                if (const auto* d = provider.owned_daemon_arm())
+                    std::printf("  good-citizen: %s offered=%zu selected=%zu backlog-admits=%llu\n",
+                                cfg.no_good_citizen ? "off" : "on",
+                                d->last_backlog_n(), last_selected_tx,
+                                static_cast<unsigned long long>(d->backlog_admits()));
+                return;
+            }
             const auto ns = native->node()->status();
             // The backlog the native arm OFFERED for the template that actually
             // went out -- not the pool right now, because the number an auditor
@@ -2099,12 +2127,16 @@ int main(int argc, char** argv) {
                 "                               is not ready. off: native-only, fail-closed.\n"
                 "  --native-ready-timeout <s>   how long to wait for the native arm (default 120)\n"
                 "  --native-backlog-refresh <s> rebuild the template when the POOL moves, at most\n"
-                "                               once per <s> seconds (default 3; 0 = legacy tip-only,\n"
+                "  --backlog-refresh <s>        once per <s> seconds (default 3; 0 = legacy tip-only,\n"
                 "                               which serves the empty template built at the start\n"
-                "                               of each block interval and collects almost no fees)\n"
-                "  --no-good-citizen            disable the good-citizen path on the native arm: use\n"
-                "                               the p2pool 5-s age gate instead of mining the\n"
-                "                               selected mempool set verbatim (CONTROL / debug)\n"
+                "                               of each block interval and collects almost no fees).\n"
+                "                               BOTH arms: native keys on its pool version, the\n"
+                "                               daemon arm on the offered get_miner_data backlog.\n"
+                "  --no-good-citizen            disable the good-citizen path (CONTROL / debug):\n"
+                "                               native arm uses the p2pool 5-s age gate instead of\n"
+                "                               mining the selected mempool set verbatim; daemon\n"
+                "                               arm rebuilds on tip moves only (coinbase-only\n"
+                "                               blocks while the pool fills -- the 09-21 breach)\n"
                 " OPERATOR TX-INJECTION (2026-09-19 ruling; native arm only):\n"
                 "  --native-inject              ARM operator tx-injection (default OFF). Injected\n"
                 "                               txs are placed FIRST at highest priority in the\n"
