@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the runner active-but-offline tripwire every 10 min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
