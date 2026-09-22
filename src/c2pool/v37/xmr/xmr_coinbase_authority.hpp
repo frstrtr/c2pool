@@ -22,6 +22,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sharechain/v37/v37_descriptor_xmr.hpp>
@@ -31,6 +32,7 @@
 #include "impl/xmr/settle/xmr_coinbase.hpp"                 // derive_tx_secret_key / derive_output / mm_commitment_root
 #include "impl/xmr/template/xmr_block_assembly.hpp"         // parse_coinbase_prefix
 #include "xmr_credit_cut.hpp"                               // recon(A+B credit): the on-chain credit cut
+#include "xmr_fee_model.hpp"                                // fee model: donation marker rule (REFUSE-IF-ABSENT)
 
 namespace c2pool::v37n::xmr::authority {
 
@@ -46,6 +48,11 @@ struct CoinbaseBooking {
     std::size_t   digest_index = 0;     // which candidate matched (0 = newest)
     ::v37::bytes32 lane_commitment{};
     std::map<::v37::bytes32, long long> payout;   // identity -> piconero, the on-chain truth
+    // fee model: the per-vout identity + amount (canonical order), so the
+    // donation-marker rule (xmr_fee_model.hpp apply_donation_rule) can locate
+    // the marker / sink tail and re-book the donation's owed outputs.
+    std::vector<::v37::bytes32> out_identity;
+    std::vector<std::uint64_t>  out_amount;
     // recon(A+B credit): the ON-CHAIN CREDIT CUT (0x02 tail), if the coinbase carries one.
     bool           has_credit_cut = false;
     credit::CreditCut credit_cut;
@@ -127,14 +134,41 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
             ::xmr::coin::PublicKey P; ::xmr::coin::ViewTag vt;
             if (!set_::derive_output(r, ref, i, P, vt)) continue;
             if (P == got.keys[i] && vt.tag == got.view_tags[i].tag) {
+                b.out_identity.push_back(id); b.out_amount.push_back(got.amounts[i]);
                 if (id == sink_identity) b.sink_total += static_cast<long long>(got.amounts[i]); // D1: never deduct the sink from a ledger key
                 else b.payout[id] += static_cast<long long>(got.amounts[i]);
                 found = true; break;
             }
         }
-        if (!found) { b.why = "output " + std::to_string(i) + " maps to no known payee (fail-closed)"; b.payout.clear(); return b; }
+        if (!found) { b.why = "output " + std::to_string(i) + " maps to no known payee (fail-closed)"; b.payout.clear(); b.out_identity.clear(); b.out_amount.clear(); return b; }
     }
     b.ok = true;
+    return b;
+}
+
+// ---------------------------------------------------------------------------
+// fee model (xmr_fee_model.hpp): the every-node REFUSE-IF-ABSENT booking rule.
+// The residual sink IS the donation address, so every vout to it was tallied
+// as coverage above; this locates the mandatory 1-piconero marker at the
+// canonical tail (refusing the coinbase when it is absent) and re-books the
+// donation's pre-marker outputs (give-author credit) as owed deductions.
+// ---------------------------------------------------------------------------
+template <class PayOf>
+inline CoinbaseBooking decode_lane_coinbase_fee(const std::vector<std::uint8_t>& blob,
+                                                std::uint32_t chain_id,
+                                                const std::vector<::v37::bytes32>& candidates,
+                                                const std::vector<::v37::bytes32>& keys,
+                                                PayOf&& pay_of) {
+    namespace fee = ::c2pool::v37n::xmr::fee;
+    CoinbaseBooking b = decode_lane_coinbase(blob, chain_id, candidates, keys, fee::donation_ref(),
+                                             fee::donation_identity(), std::forward<PayOf>(pay_of));
+    if (!b.ok) return b;
+    std::string w;
+    if (!fee::apply_donation_rule(b.out_identity, b.out_amount, fee::donation_identity(), b.payout, b.sink_total, &w)) {
+        b.ok = false;
+        b.why = "donation-refused: " + w + " (the lane coinbase must carry the mandatory donation output)";
+        b.payout.clear();
+    }
     return b;
 }
 

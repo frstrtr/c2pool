@@ -153,7 +153,7 @@ struct XmrSettlementConfig {
     ::v37::ScriptRef residual_sink;                    // XMR_STD/XMR_SUB, 64-B payload
     ::v37::bytes32   residual_sink_identity{};         // its ledger identity_key (payout-map key)
 
-    // --- mandated fixed outputs (dev / donation / finder), usually empty ---
+    // --- mandated fixed outputs: the 1-piconero protocol donation marker (fee model, xmr_fee_model.hpp; V36 has NO finder output) ---
     std::vector<x6::FixedOutput> fixed;
 
     // --- rulings (operator-tap DRAFT once multi-node; explicit flags here) ---

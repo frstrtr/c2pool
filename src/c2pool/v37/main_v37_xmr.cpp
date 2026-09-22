@@ -63,6 +63,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -88,6 +89,10 @@
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
 #include "xmr/xmr_coinbase_authority.hpp"  //  coinbase-authority booking
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
+#include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
+#include <fcntl.h>
+#include <random>
+#include <unistd.h>
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
 #include "impl/xmr/node/minijson.hpp"
@@ -154,6 +159,16 @@ static bool          g_no_book_deferral = false;         // --no-book-deferral: 
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
 static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
 static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
+// fee model (xmr/xmr_fee_model.hpp). ALL node-local mint policy: they change
+// only the receipts THIS node mints, never how any receipt is folded. The
+// donation output itself has NO knob (compiled-in consensus constant).
+static bool          g_mint_receipts = false;            // --mint-receipts: mint a receipt per accepted share into --credit-feed
+static double        g_give_author_pct = 0.0;            // --give-author-pct P: the u16 this node's receipts carry (default 0)
+static double        g_owner_fee_pct = 0.0;              // --node-owner-fee-pct P: probability (%) a minted receipt pays the owner
+static std::string   g_owner_address;                    // --node-owner-address ADDR: the owner's standard address
+// The mint hook, installed in main() once the feed + policy are resolved;
+// called on the LISTENER thread from GatedShareSinkT::on_accepted_share.
+static std::function<void(const strat::AcceptedShare&)> g_receipt_mint;
 
 static MoneroNetwork parse_net(const std::string& s) {
     if (s == "mainnet")  return MoneroNetwork::Mainnet;
@@ -216,7 +231,10 @@ public:
                     strat::ITemplateSource& source, strat::IShareSink& inner)
         : m_rx(rx), m_provider(provider), m_source(source), m_inner(inner) {}
 
-    void on_accepted_share(const strat::AcceptedShare& s) override { m_inner.on_accepted_share(s); }
+    void on_accepted_share(const strat::AcceptedShare& s) override {
+        if (g_receipt_mint) g_receipt_mint(s);   // fee model: the XMR receipt MINT site (owner roll + give-author u16)
+        m_inner.on_accepted_share(s);
+    }
 
     void submit_network_block(std::uint32_t template_id, std::uint32_t nonce,
                               std::uint32_t extra_nonce) override {
@@ -1071,8 +1089,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::vector<::v37::bytes32> keys;
         for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
         for (const auto& k : cba_fx->keys()) keys.push_back(k);
-        return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
-                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
+        // fee model: the residual sink IS the donation address, and a lane coinbase without the
+        // mandatory donation marker is REFUSED here (every node, own wins included).
+        return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, cba_fx->pay_of());
     };
     // fetch + decode one block's coinbase under coinbase authority (shared by the chain path and the fast path)
     auto fetch_decode = [&](const std::string& bid, c2pool::v37n::xmr::authority::CoinbaseBooking& bk, std::string& why,
@@ -1291,7 +1310,32 @@ static int run_live(const XmrNodeConfig& cfg) {
     };
     // THE RECEIPT FEED (the carrier-relay stand-in): a shared append-only file "idx weight" per line; every node
     // pushes the SAME records in the SAME order (submit_tracked+get: one record per burst => every prefix published).
+    std::uint64_t fee_receipts = 0, fee_give_author_pushes = 0, fee_bad_receipts = 0;
     auto feed_push_line = [&](const std::string& ln) {
+        // fee model: a MINTED receipt line ("R1 kind payee w d", xmr_fee_model.hpp). The payee
+        // rides in the receipt (owner-fee substitution already applied at mint) and d is the
+        // minting node's give-author u16. EVERY node folds it identically: one receipt ->
+        // (miner, w - floor(w*d/65535)) [+ (donation, floor(w*d/65535)) iff > 0], in that order.
+        if (ln.rfind("R1 ", 0) == 0) {
+            const auto r = c2pool::v37n::xmr::fee::parse_receipt_line(ln);
+            if (!r || !::v37::xmr::xmr_ref_valid(r->payee) || !cba_fx) { ++fee_bad_receipts; ++feed_rejected; return; }
+            cba_fx->learn_ref(r->payee);   // pay_of resolves the receipt's payee on every node (coinbase authority + K_fair)
+            ++fee_receipts;
+            for (const auto& [ref, w] : c2pool::v37n::xmr::fee::receipt_pushes(*r)) {
+                ::v37::PayoutDescriptor d; d.pay = ref;
+                const auto res = node.engine().submit_tracked(::v37::LaneRecord::push(cfg.lane_chain, d, w, 0)).get();
+                if (res.applied()) { ++feed_pushed; feed_log.emplace_back(ref, w); if (!(ref == r->payee)) ++fee_give_author_pushes; }
+                else ++feed_rejected;
+            }
+            if (fee_receipts <= 3 || fee_receipts % 100 == 0) {
+                auto sn = node.engine().snapshot(cfg.lane_chain);
+                std::printf("credit-feed: receipt#%llu payee=%s… w=%llu d=%u pushed=%llu give-author-pushes=%llu lane next_pos=%llu digest=%s…\n",
+                            (unsigned long long)fee_receipts, hex_of(::v37::xmr::xmr_identity_key(r->payee)).substr(0, 12).c_str(),
+                            (unsigned long long)r->w, (unsigned)r->d, (unsigned long long)feed_pushed, (unsigned long long)fee_give_author_pushes,
+                            sn ? (unsigned long long)sn->next_pos : 0ULL, sn ? hex_of(sn->digest).substr(0, 12).c_str() : "-");
+            }
+            return;
+        }
         unsigned idx = 0; unsigned long long w = 0;
         if (std::sscanf(ln.c_str(), "%u %llu", &idx, &w) != 2 || idx >= feed_refs.size() || w == 0) return;
         ::v37::PayoutDescriptor d; d.pay = feed_refs[idx];
@@ -1311,7 +1355,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
     };
     auto feed_pump = [&]() {
-        if (g_credit_feed.empty() || feed_refs.empty()) return;
+        if (g_credit_feed.empty() || !cba_fx) return;   // fee model: minted R1 receipts need no seeded feed_refs
         std::ifstream in(g_credit_feed, std::ios::binary);
         if (in) {
             in.seekg(static_cast<std::streamoff>(feed_off));
@@ -1400,25 +1444,91 @@ static int run_live(const XmrNodeConfig& cfg) {
     // to PR #1534; option B (v37 settlement coinbase) drives the SAME listener /
     // RandomX gate / live submitter / finalize-connect through serve_and_run.
     if (cfg.coinbase == CoinbaseMode::V37Settlement) {
-        // fail-closed: v37 mode serves only with a torsion-valid residual sink.
-        const bool serving =
-            !cfg.residual_sink_spend_hex.empty() && !cfg.residual_sink_view_hex.empty();
-
+        // fee model (xmr/xmr_fee_model.hpp): the residual sink IS the protocol donation
+        // address and the 1-piconero donation marker is a mandated fixed output, both from
+        // compiled-in constants -- no node can omit or redirect them (the old per-node
+        // --residual-sink-* knobs are gone). fail-closed: the constant must torsion-check.
+        namespace fee = ::c2pool::v37n::xmr::fee;
         o2::XmrSettlementConfig scfg;
         scfg.chain_id   = cfg.lane_chain;
         scfg.h_min      = cfg.settle_h_min;
         scfg.output_cap = cfg.settle_output_cap;
-        std::array<std::uint8_t, 32> sink_B{}, sink_A{};
-        if (serving) {
-            if (!o2::hex32(cfg.residual_sink_spend_hex, sink_B) ||
-                !o2::hex32(cfg.residual_sink_view_hex, sink_A) ||
-                !scfg.set_residual_sink_hex(cfg.residual_sink_spend_hex, cfg.residual_sink_view_hex,
-                                            cfg.residual_sink_subaddress)) {
-                std::printf("REFUSED: --residual-sink-spend-hex/--residual-sink-view-hex must both be "
-                            "64 hex chars (the XMR wallet the exact-sum residual is paid to)\n");
+        scfg.residual_sink          = fee::donation_ref();
+        scfg.residual_sink_identity = fee::donation_identity();
+        scfg.fixed                  = {fee::donation_marker()};
+        if (!::v37::xmr::xmr_ref_valid(scfg.residual_sink)) {
+            std::printf("REFUSED: the compiled-in donation address does not torsion-check as an XMR "
+                        "payout ref (ed25519 point-check backend missing?)\n");
+            node.stop();
+            return 2;
+        }
+        const bool serving = true;
+        std::printf("fee-model: donation=%s… (identity %s…) marker=%llu piconero MANDATORY + exact-sum residual sink "
+                    "-> donation | give-author %.4f%% (u16=%u, rides this node's receipts) | node-owner fee %.4f%% -> %s | "
+                    "finder bonus: NONE | receipt mint %s\n",
+                    std::string(fee::kDonationAddress).substr(0, 12).c_str(), hex_of(fee::donation_identity()).substr(0, 12).c_str(),
+                    static_cast<unsigned long long>(fee::kDonationDustPico), g_give_author_pct,
+                    (unsigned)fee::give_author_u16(g_give_author_pct), g_owner_fee_pct,
+                    g_owner_address.empty() ? "-" : g_owner_address.substr(0, 12).c_str(),
+                    g_mint_receipts ? "ON (accepted share -> R1 receipt)" : "off");
+
+        // fee model: the RECEIPT MINT. One accepted share -> one R1 receipt appended (O_APPEND,
+        // one write per line) to the shared --credit-feed that every node folds in file order.
+        // The node-owner roll substitutes the receipt's PAYEE here, at mint (v36 work.py), and
+        // the receipt carries THIS node's give-author u16; nothing is decided after FOUND.
+        std::optional<::v37::ScriptRef> owner_ref;
+        const std::uint32_t owner_bp = fee::pct_to_bp(g_owner_fee_pct);
+        if (!g_owner_address.empty()) {
+            const fee::DecodedAddress da = fee::decode_xmr_address(g_owner_address);
+            if (!da.ok || da.subaddress || !::v37::xmr::xmr_ref_valid(da.ref())) {
+                std::printf("REFUSED: --node-owner-address is not a valid standard Monero address (%s)\n",
+                            da.ok ? (da.subaddress ? "subaddress not supported as a payee" : "point check failed") : da.why.c_str());
                 node.stop();
                 return 2;
             }
+            owner_ref = da.ref();
+        }
+        if (owner_bp && !owner_ref) {
+            std::printf("REFUSED: --node-owner-fee-pct > 0 needs --node-owner-address\n");
+            node.stop();
+            return 2;
+        }
+        if (g_mint_receipts && g_credit_feed.empty()) {
+            std::printf("REFUSED: --mint-receipts needs --credit-feed (the receipt stream every node folds)\n");
+            node.stop();
+            return 2;
+        }
+        std::mutex         mint_mu;
+        std::mt19937_64    mint_rng{std::random_device{}()};
+        std::atomic<std::uint64_t> mint_n{0}, mint_owner{0}, mint_unattributable{0};
+        const std::uint16_t mint_d = fee::give_author_u16(g_give_author_pct);
+        const std::uint64_t mint_w = cfg.stratum_share_diff ? cfg.stratum_share_diff : 1;
+        if (g_mint_receipts) {
+            g_receipt_mint = [&, owner_ref, owner_bp, mint_d, mint_w](const strat::AcceptedShare& sh) {
+                const fee::DecodedAddress da = fee::decode_xmr_address(sh.address);
+                if (!da.ok || da.subaddress || !::v37::xmr::xmr_ref_valid(da.ref())) {
+                    if (mint_unattributable.fetch_add(1) < 3)
+                        std::printf("receipt-mint: share from '%s' NOT minted (%s)\n", sh.address.substr(0, 16).c_str(),
+                                    da.ok ? "subaddress/point-check" : da.why.c_str());
+                    return;
+                }
+                std::uint64_t roll = 0;
+                { std::lock_guard<std::mutex> lk(mint_mu); roll = mint_rng(); }
+                const fee::MintedReceipt r = fee::mint_receipt(da.ref(), owner_ref, owner_bp, mint_d, mint_w, roll);
+                const std::string line = fee::encode_receipt_line(r);
+                const int fd = ::open(g_credit_feed.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644);
+                if (fd < 0) return;
+                const ssize_t wr = ::write(fd, line.data(), line.size());
+                ::close(fd);
+                if (wr != static_cast<ssize_t>(line.size())) return;
+                const std::uint64_t n = mint_n.fetch_add(1) + 1;
+                const std::uint64_t o = r.owner_substituted ? mint_owner.fetch_add(1) + 1 : mint_owner.load();
+                if (n <= 3 || r.owner_substituted || n % 50 == 0)
+                    std::printf("receipt-mint: n=%llu payee=%s… (%s) w=%llu d=%u owner_hits=%llu (%.2f%%)\n",
+                                (unsigned long long)n, hex_of(::v37::xmr::xmr_identity_key(r.payee)).substr(0, 12).c_str(),
+                                r.owner_substituted ? "OWNER-FEE substituted at mint" : "miner",
+                                (unsigned long long)r.w, (unsigned)r.d, (unsigned long long)o, 100.0 * double(o) / double(n));
+            };
         }
 
         // The proof ledger (no live S-1 emission yet). Empty => the whole reward
@@ -1435,6 +1545,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
         if (cba_payee_ref) ledger.learn_ref(*cba_payee_ref);
+        ledger.learn_ref(fee::donation_ref());   // fee model: give-author credit is paid as an ordinary owed output to the donation
         std::printf("cba: coinbase-authority booking ARMED (lane_chain=%u, payee %s, sink identity %s…)\n", cfg.lane_chain,
                     cba_payee ? "learned" : "none", hex_of(scfg.residual_sink_identity).substr(0, 12).c_str());
         if (serving && cfg.owed_demo_amount) {
@@ -1496,6 +1607,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // mattered.
         std::uint64_t shape_ok = 0, shape_refused = 0;
         std::string   last_shape;
+        std::string   last_fee_tpl_key;   // fee model: one fee-tpl line per (height, parent, owed_digest, EffectiveOwed) state
         // n_tx of the block the gate judged -- the SELECTED count, which is not
         // the same number as the backlog the arm OFFERED. The assembler applies
         // monerod's own 5-second age gate (xmr_block_template.cpp), so a
@@ -1514,6 +1626,53 @@ static int run_live(const XmrNodeConfig& cfg) {
                     ++shape_refused;
                     if (w) *w = sh.why;
                     return false;
+                }
+                // fee model: the serve-side REFUSE-IF-ABSENT property. The canonical coinbase
+                // (already byte-matched against the parsed block above) must end in the
+                // 1-piconero donation marker [+ the donation residual sink].
+                const fee::MarkerLocation dm = fee::inspect_donation_marker(t.outputs(), fee::donation_identity());
+                if (!dm.ok) {
+                    ++shape_refused;
+                    last_shape += " | " + dm.why;
+                    if (w) *w = dm.why;
+                    return false;
+                }
+                // fee model evidence: a digest of the payout vector (amount + one-time key per vout,
+                // canonical order) -- equal on two nodes at the same input state (key below) iff
+                // they built byte-identical coinbase outputs, whatever their give-author %.
+                {
+                    std::vector<std::uint8_t> pv;
+                    for (const auto& o : t.outputs()) {
+                        for (int b = 0; b < 8; ++b) pv.push_back(static_cast<std::uint8_t>(o.amount >> (8 * b)));
+                        pv.insert(pv.end(), o.one_time_key.data(), o.one_time_key.data() + 32);
+                    }
+                    const auto od = ::xmr::coin::keccak256(pv.data(), pv.size());
+                    std::uint64_t don_total = 0, sum = 0;
+                    for (const auto& o : t.outputs()) { sum += o.amount; if (o.identity == fee::donation_identity()) don_total += o.amount; }
+                    // the full input state the outputs are a function of: height, parent, the
+                    // owed_digest (finalized partition) AND the pending-netted EffectiveOwed map
+                    // (a pending payout moves the owed set without moving owed_digest).
+                    std::vector<std::uint8_t> eb;
+                    for (const auto& [k, v] : ledger.ledger().effective_owed_all()) {
+                        eb.insert(eb.end(), k.begin(), k.end());
+                        for (int b = 0; b < 8; ++b) eb.push_back(static_cast<std::uint8_t>(static_cast<unsigned long long>(v) >> (8 * b)));
+                    }
+                    const auto eoh = ::xmr::coin::keccak256(eb.data(), eb.size());
+                    const std::string prev12 = sub::to_hex(t.prev_id().data(), t.prev_id().size()).substr(0, 12);
+                    std::string key = std::to_string(t.height()) + ":" + prev12 + ":" + hex_of(ledger.ledger().owed_digest()).substr(0, 12) +
+                                      ":" + sub::to_hex(eoh.data(), eoh.size()).substr(0, 12);
+                    if (key != last_fee_tpl_key) {
+                        last_fee_tpl_key = key;
+                        std::printf("fee-tpl: h=%llu prev=%s owed_digest=%s… eo=%s outs=%zu outputs_digest=%s donation_marker=%llu@%zu sink=%s donation_total=%llu sum=%llu reward=%llu exact_sum=%s\n",
+                                    static_cast<unsigned long long>(t.height()), prev12.c_str(), hex_of(ledger.ledger().owed_digest()).substr(0, 12).c_str(),
+                                    sub::to_hex(eoh.data(), eoh.size()).substr(0, 12).c_str(),
+                                    t.outputs().size(), sub::to_hex(od.data(), od.size()).substr(0, 16).c_str(),
+                                    static_cast<unsigned long long>(t.outputs()[dm.marker].amount), dm.marker,
+                                    dm.has_sink ? std::to_string(t.outputs().back().amount).c_str() : "none",
+                                    static_cast<unsigned long long>(don_total), static_cast<unsigned long long>(sum),
+                                    static_cast<unsigned long long>(t.reward()), sum == t.reward() ? "YES" : "NO");
+                        std::fflush(stdout);
+                    }
                 }
                 ++shape_ok;
                 return true;
@@ -1850,8 +2009,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
 
         const int rc = serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
-                                     "no --residual-sink-spend-hex/--residual-sink-view-hex",
+                                     "the compiled-in donation sink did not validate",
                                      provider, template_source, candidate, std::move(hooks));
+        g_receipt_mint = nullptr;   // fee model: the listener is gone; drop the hook before its captures die
         if (native) native->stop();
         return rc;
     }
@@ -1927,9 +2087,20 @@ int main(int argc, char** argv) {
             cfg.coinbase = (m == "v37" || m == "settlement" || m == "v37-settlement")
                                ? CoinbaseMode::V37Settlement : CoinbaseMode::MonerodTemplate;
         }
-        else if (a == "--residual-sink-spend-hex") cfg.residual_sink_spend_hex = next("");
-        else if (a == "--residual-sink-view-hex")  cfg.residual_sink_view_hex = next("");
-        else if (a == "--residual-sink-subaddress") cfg.residual_sink_subaddress = true;
+        // fee model: the per-node residual-sink knobs are DELETED -- the exact-sum residual is
+        // the protocol donation output (a compiled-in consensus constant). Refused loudly so an
+        // old launch line cannot silently run with a different sink than its peers.
+        else if (a == "--residual-sink-spend-hex" || a == "--residual-sink-view-hex" ||
+                 a == "--residual-sink-subaddress") {
+            std::printf("REFUSED: %s was removed -- the residual sink is the mandatory protocol donation "
+                        "output (xmr_fee_model.hpp), not a per-node setting\n", a.c_str());
+            return 2;
+        }
+        // fee model: node-local receipt-mint policy (see xmr/xmr_fee_model.hpp)
+        else if (a == "--mint-receipts")      g_mint_receipts = true;
+        else if (a == "--give-author-pct")    g_give_author_pct = std::stod(next("0"));
+        else if (a == "--node-owner-fee-pct") g_owner_fee_pct = std::stod(next("0"));
+        else if (a == "--node-owner-address") g_owner_address = next("");
         else if (a == "--settle-h-min") cfg.settle_h_min = std::stoull(next("0"));
         else if (a == "--settle-output-cap") cfg.settle_output_cap =
                      static_cast<std::uint32_t>(std::stoul(next("0")));
@@ -2064,10 +2235,15 @@ int main(int argc, char** argv) {
                 "                               payout address keys -> amount-honest FOUND records\n"
                 " option B (X9): the v37 K_fair SETTLEMENT coinbase (not monerod's template):\n"
                 "  --coinbase <monerod|v37>     monerod (default, option A) | v37 (option B)\n"
-                "  --residual-sink-spend-hex <64hex> --residual-sink-view-hex <64hex>\n"
-                "                               REQUIRED for v37 mode: the XMR wallet the exact-sum\n"
-                "                               residual is paid to (torsion-checked at build)\n"
-                "  --residual-sink-subaddress   the sink keys are a subaddress (D_i, A_main)\n"
+                "                               the coinbase ALWAYS carries the 1-piconero protocol\n"
+                "                               donation output, and the exact-sum residual goes to\n"
+                "                               the same donation address (compiled-in; no knob)\n"
+                "  --mint-receipts              mint one receipt per accepted share into --credit-feed\n"
+                "  --give-author-pct <p>        give-author %% carried as a u16 in the receipts THIS\n"
+                "                               node mints (default 0; folded identically everywhere)\n"
+                "  --node-owner-fee-pct <p>     probability %% that a minted receipt pays the node\n"
+                "                               owner instead of the miner (default 0)\n"
+                "  --node-owner-address <addr>  the node owner's standard address (owner fee payee)\n"
                 "  --settle-h-min <pico>        owed-output floor (0 on XMR)\n"
                 "  --settle-output-cap <n>      TOTAL outputs cap (0 = weight-aware default)\n"
                 "  --owed-demo-amount <pico>    seed one K_fair OWED payee into the proof ledger\n"

@@ -66,9 +66,10 @@ inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 //   V37Settlement (option B): a v37-BUILT Monero block whose miner_tx is the
 //     K_fair settlement coinbase (oldest-owed-first EffectiveOwed payees ++
 //     mandated fixed outputs ++ exact-sum residual sink), assembled from
-//     get_miner_data over the W4 OwedLedger. Requires a torsion-valid residual
-//     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
-//     without a valid sink the daemon refuses to serve.
+//     get_miner_data over the W4 OwedLedger. The mandated fixed output is the
+//     1-piconero protocol donation marker and the residual sink IS the protocol
+//     donation address (xmr_fee_model.hpp, compiled-in -- no per-node knob).
+//     Fail-closed: if the constant does not torsion-check the daemon refuses.
 enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
 
 // M2: which miner-data source the option-B assembler is fed from.
@@ -247,13 +248,8 @@ struct XmrNodeConfig {
     // the coinbase bytes (it may stay empty; the serve port opens when the
     // residual sink is set, mirroring option A's payout_address gate).
     CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
-    // The mandated residual sink (REQUIRED for v37 mode): the raw public spend
-    // (B) + view (A) keys, 64 hex each, of the XMR wallet the exact-sum residual
-    // is paid to. Torsion-checked at build; the daemon REFUSES v37 mode without
-    // a valid sink. --residual-sink-subaddress builds an XMR_SUB (D_i, A_main).
-    std::string     residual_sink_spend_hex;
-    std::string     residual_sink_view_hex;
-    bool            residual_sink_subaddress = false;
+    // (fee model) The residual sink is no longer a per-node setting: it is the
+    // protocol donation address (xmr_fee_model.hpp), the same on every node.
     // The v37 lane parameters (consensus once multi-node; explicit here).
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default

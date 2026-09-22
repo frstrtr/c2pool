@@ -404,6 +404,35 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_credit_cut_kat COMMAND v37_xmr_credit_cut_kat)
 
     # ------------------------------------------------------------------
+    # The v36 fee model on the XMR lane (xmr/xmr_fee_model.hpp).
+    #
+    #   v37_xmr_fee_model_kat
+    #     The donation address (CN base58 + keccak checksum) == the pinned
+    #     (B, A) constants; give-author as a receipt-carried u16 folded by an
+    #     exact two-push weight split (two nodes with different give-author %
+    #     fold a shared stream identically -> byte-identical miner_tx); the
+    #     node-owner fee as identity substitution at receipt mint; the
+    #     MANDATORY 1-piconero donation marker + donation residual sink on real
+    #     assembled blocks (C4 capture), exact-sum, and REFUSE-IF-ABSENT on both
+    #     the serve property and the receive-side booking. No finder output.
+    #     Same link shape + HOLLOW-GREEN GUARD as the credit-cut KAT above
+    #     (listed in BOTH build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_fee_model_kat
+        v37_xmr_fee_model_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_fee_model_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_fee_model_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_fee_model_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_fee_model_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_fee_model_kat COMMAND v37_xmr_fee_model_kat)
+
+    # ------------------------------------------------------------------
     # M3 — R-ARMORDER, the switchable FIND path.
     #
     #   v37_xmr_m3_arm_order_kat

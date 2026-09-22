@@ -191,7 +191,7 @@ struct XmrCoinbaseContext {
     // --- lane parameters (consensus once tapped; explicit flags until then) ---
     ::v37::ScriptRef      residual_sink;              // mandated absorber, XMR ref (REQUIRED, torsion-checked)
     ::v37::bytes32        residual_sink_identity{};   // its ledger identity_key (payout-map key)
-    std::vector<x6::FixedOutput> fixed;               // mandated dev/donation/finder outputs (optional)
+    std::vector<x6::FixedOutput> fixed;               // mandated fixed outputs: the protocol donation marker (fee model; NO finder output)
     std::uint64_t         h_min = 0;                  // piconero floor per owed output (dust = 0 on XMR)
     std::uint32_t         output_cap = 0;             // TOTAL outputs cap C (weight_aware_output_cap(...))
 
