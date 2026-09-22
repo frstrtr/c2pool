@@ -1,0 +1,38 @@
+name: apt-daily-masked-guard
+
+# Fails if apt-daily*.timer is UNMASKED on a CI host. The 09-22 masking
+# stops apt-daily from bouncing a self-hosted runner mid-build (unmasked
+# timer -> apt-daily.service -> package ops -> runner restart -> steps=0
+# drop). Runs ON the self-hosted fleet on purpose: it must read the real
+# host systemd state. Sampled hourly + on any edit to the guard itself.
+# One run lands on one host, so fleet coverage is sampled over the hourly
+# schedule, not simultaneous -- a per-host matrix is a later follow-up.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      selftest:
+        description: "Run only the falsifiability selftest"
+        default: "false"
+  pull_request:
+    paths:
+      - ".github/workflows/apt-daily-masked-guard.yml"
+      - "scripts/apt_daily_masked_guard.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: [self-hosted, c2pool-build]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Selftest (falsifiability) -- guard must go red on an unmasked timer
+        shell: bash
+        run: bash scripts/apt_daily_masked_guard.sh --selftest
+      - name: Assert apt-daily timers masked on this CI host
+        if: ${{ github.event.inputs.selftest != 'true' }}
+        shell: bash
+        run: bash scripts/apt_daily_masked_guard.sh
