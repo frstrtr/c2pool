@@ -121,8 +121,10 @@
 //      btc_node_config.hpp `settlement_armed`.
 //   3  THE REWARD IS VERIFIED AT FOLD TIME. Own win: the fold consumes the
 //      miner slice of the coinbase THIS node mined (parsed from the block bytes
-//      submit_fn is handed; masternode/burn total from the template at the same
-//      (height, parent)), never the cached GBT miner_value. Peer win: before
+//      submit_fn is handed; the template at the same (height, parent) names the
+//      masternode/burn PAYEE SCRIPTS, the amounts are the mined outputs'), never
+//      the cached GBT miner_value; after an accepted submit a self-check asks
+//      dashd the peers' question and counts own_postcheck_{ok,mismatch}. Peer win: before
 //      the fold, dashd must have the block on the best chain at the carried
 //      H_b, and the carried reward must equal sum(coinbase vout) - masternode
 //      payments(bid) (mined_block_verify.hpp). Anything else is REFUSED and
@@ -479,6 +481,8 @@ int main(int argc, char** argv) {
     // this set is the third, EXPLICIT layer, and the one that reads as intent).
     std::mutex           own_wins_mtx;
     std::set<std::string> own_wins;
+    // ★ T1-prep step 3: the post-submit self-check of our own folded reward.
+    std::atomic<std::uint64_t> own_postcheck_ok{0}, own_postcheck_mismatch{0};
 
     if (!node.start()) { std::fprintf(stderr, "start() failed (engine/AddLane)\n"); teardown_io(); return 7; }
     {
@@ -960,14 +964,16 @@ int main(int argc, char** argv) {
                 else LOG_ERROR << "[v37-dash] register " << bidh << " @" << h << " failed: " << reg.reason;
             };
             // ★ T1-prep step 3: the reward the own fold consumes = the miner slice
-            // of the coinbase in `b` (the bytes we are about to submit), with the
-            // masternode/burn total from the template at the SAME (height, parent).
+            // of the coinbase in `b` (the bytes we are about to submit): the outputs
+            // paying the template's masternode/burn payee SCRIPTS (template at the
+            // SAME (height, parent)) are subtracted at their MINED amounts.
             // Offered for exactly this bid; on_block_won consumes it or, absent,
             // registers the win VALUELESS (never the cached GBT value).
             auto offer_mined = [&](std::uint64_t h) {
                 const bool sb = is_superblock_height(h, backend->superblock_cycle(), backend->superblock_start());
                 const MinerTemplate t = backend->template_for(static_cast<std::uint32_t>(h));
-                const OwnMinedReward m = own_mined_reward(b, h, parent, t.height, t.prev_hash, t.payments, sb);
+                const OwnMinedReward m = own_mined_reward(b, h, parent, t.height, t.prev_hash,
+                                                          t.payee_scripts, t.payees_ok, sb);
                 node.offer_mined_reward(bidh, m.reward, sb, m.note);
                 if (!m.reward)
                     LOG_ERROR << "[v37-dash] own win " << bidh << " @" << h << ": MINED reward unreadable ("
@@ -996,6 +1002,24 @@ int main(int argc, char** argv) {
                 // nobody — the S1 line above says why (VALUELESS / REFUSED).
                 const auto& cut = node.last_cut();
                 const auto& s1  = node.s1_stats();
+                // ★ T1-prep step 3 SELF-CHECK: once dashd accepted our block, ask
+                // it the SAME question every peer will ask (sum(coinbase) -
+                // masternode payments) and compare with what our fold consumed.
+                // A mismatch here is a block whose credit every verifying peer
+                // will refuse — counted and logged, never silent.
+                if (r.accepted && cut.reward != 0) {
+                    const MinedBlockFacts self = backend->mined_block_facts(bidh);
+                    if (self.miner_slice && *self.miner_slice == cut.reward) {
+                        own_postcheck_ok.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        own_postcheck_mismatch.fetch_add(1, std::memory_order_relaxed);
+                        LOG_ERROR << "[v37-dash] OWN-WIN SELF-CHECK " << bidh << ": our fold consumed reward="
+                                  << cut.reward << " but dashd says the mined miner slice is "
+                                  << (self.miner_slice ? std::to_string(*self.miner_slice) : std::string("?"))
+                                  << (self.note.empty() ? "" : " (" + self.note + ")")
+                                  << " — verifying peers will REFUSE this block's credit";
+                    }
+                }
                 LOG_INFO << "[v37-dash] FOUND " << bidh << " h=" << reg_h << " accepted=" << r.accepted
                          << " E_b=" << cut.credit.size() << " keys"
                          << (cut.valueless ? " [VALUELESS]" : "")
@@ -1326,7 +1350,9 @@ int main(int argc, char** argv) {
                  << " own_mined=" << node.own_reward_stats().mined
                  << " own_cached_disagreed=" << node.own_reward_stats().cached_disagreed
                  << " own_unverified=" << node.own_reward_stats().unverified
-                 << " own_superblock=" << node.own_reward_stats().superblock << "}"
+                 << " own_superblock=" << node.own_reward_stats().superblock
+                 << " own_postcheck_ok=" << own_postcheck_ok.load()
+                 << " own_postcheck_mismatch=" << own_postcheck_mismatch.load() << "}"
                  << " settlement=" << (cfg.settlement_armed ? "on" : "off");
     }
     teardown_io();

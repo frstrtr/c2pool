@@ -153,6 +153,8 @@
 #include <c2pool/v37/btc/btc_coin_backend.hpp>   // ICoinBackend, CoinTip, SubmitResult
 #include <c2pool/v37/btc/block_event_driver.hpp> // Canon (the tri-state the driver consumes)
 #include <c2pool/v37/btc/mined_block_verify.hpp> // T1-prep step 3: MinedBlockFacts, parse_coinbase_outputs_hex
+#include <core/address_utils.hpp>                // core::address_to_script_for_coin (payee address -> script)
+#include <impl/dash/address_encoding.hpp>        // dash::address_acceptance
 
 namespace c2pool::v37n::btc {
 
@@ -240,6 +242,12 @@ struct MinerTemplate {
     std::string   prev_hash;                 // display hex
     std::uint64_t coinbase_value = 0;        // dashd "coinbasevalue": subsidy + fees (duffs)
     std::uint64_t payments       = 0;        // Σ masternode[] + superblock[] + payload burn
+    // ★ T1-prep step 3: the payee SCRIPTS of those payments (one per entry, in
+    // template order). Identities are fixed at (height, parent); the amounts
+    // move with the fee set, so the own-win miner slice matches these scripts
+    // against the MINED coinbase and reads the mined amounts.
+    std::vector<std::vector<std::uint8_t>> payee_scripts;
+    bool          payees_ok      = false;    // every payee decoded to a script
     std::chrono::steady_clock::time_point fetched_at{};
     // MINER-spendable: what W5 may distribute across K_fair outputs + miner.
     std::uint64_t miner_value() const {
@@ -483,6 +491,21 @@ public:
             t.prev_hash      = w.m_previous_block.GetHex();
             t.coinbase_value = w.m_coinbase_value;
             t.payments       = w.m_payment_amount;
+            t.payees_ok      = true;
+            {
+                const auto acc = dash::address_acceptance(/*testnet=*/m_opt.expect_chain != "main", /*regtest=*/false);
+                for (const auto& pp : w.m_packed_payments) {
+                    std::vector<std::uint8_t> spk;
+                    if (!pp.payee.empty() && pp.payee[0] == '!') {
+                        spk = hex_bytes(pp.payee.substr(1));
+                    } else {
+                        const auto s = core::address_to_script_for_coin(pp.payee, acc);
+                        spk.assign(s.begin(), s.end());
+                    }
+                    if (spk.empty()) t.payees_ok = false;
+                    t.payee_scripts.push_back(std::move(spk));
+                }
+            }
             t.fetched_at     = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> g(m_mu);
             m_tmpl = t;
@@ -634,6 +657,19 @@ public:
     }
 
 private:
+    // "6a" -> {0x6a}; empty on malformed hex (the caller marks payees_ok=false).
+    static std::vector<std::uint8_t> hex_bytes(const std::string& h) {
+        std::vector<std::uint8_t> b;
+        if (h.empty() || h.size() % 2) return b;
+        b.reserve(h.size() / 2);
+        for (std::size_t i = 0; i < h.size(); i += 2) {
+            const int hi = mbv_detail::nib(h[i]), lo = mbv_detail::nib(h[i + 1]);
+            if (hi < 0 || lo < 0) return {};
+            b.push_back(static_cast<std::uint8_t>((hi << 4) | lo));
+        }
+        return b;
+    }
+
     void note_transport_fail(const char* what, const char* why) {
         std::lock_guard<std::mutex> g(m_mu);
         if ((++m_transport_failures % 20) == 1)     // rate-limited

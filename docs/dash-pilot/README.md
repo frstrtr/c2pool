@@ -20,7 +20,12 @@ settlement arm (`c2pool-v37-btc-dash`).
    track (seam note in `btc_node_config.hpp`).
 3. **The reward is verified at fold time** (`btc/mined_block_verify.hpp`).
    * Own fold: it reads the miner slice of the coinbase this node **mined**,
-     never the cached GBT value.
+     never the cached GBT value. The template at the same (height, parent)
+     only names the masternode and burn payee scripts. Their amounts are read
+     from the mined outputs, because those amounts scale with the block's
+     fees (see "Soak finding, round 899" below). After an accepted submit, a
+     self-check asks dashd the same question the peers ask
+     (`own_postcheck_ok/mismatch`).
    * Peer fold: dashd must have the block on the best chain at `H_b`, and the
      reward must equal `sum(coinbase vout) - masternode payments(bid)`.
    * At superblock-cycle heights the block is VALUELESS on every node,
@@ -66,3 +71,25 @@ settlement arm (`c2pool-v37-btc-dash`).
   The v36 `c2pool-dash` keeps `connect()` unchanged.
 * **Harness:** `supervise.sh` now runs with `ulimit -c unlimited` and keeps a
   node's log on a boot failure (`evidence/bootfail-*.log`).
+
+## Soak finding, round 899 (first binary e9d2aefc, fixed in the follow-up commit)
+
+* **What happened:** the first T1-prep binary computed the own-win slice as
+  `sum(mined coinbase) - template.payments`. In round 899, nodeB mined block
+  `000000247da2…ea5f` (h=1558847) and folded 59525746. NodeA asked dashd and
+  got `sum(vout) - masternode payments = 59526072`. NodeA refused the claim
+  (`reward_mismatch=1`), credited nothing, and counted it.
+* **Why:** the masternode and platform-burn amounts are a fixed share of
+  (subsidy + fees of the mined block). The stratum work source mined a block
+  from its own GBT, with no fee-paying transactions. The backend's cached GBT
+  at the same (height, parent) held 434 duffs of fees, so its payment total
+  was 326 duffs higher.
+* **Fix:** match the template's payee scripts to the mined outputs and
+  subtract the mined amounts (`non_miner_amount`), and add the post-submit
+  self-check. The KAT pins it (`4b`).
+* **Did the ledgers diverge?** No. The block was still pending when both
+  nodes stopped, and a pending FOUND does not enter `owed_digest`, so the
+  digests stayed equal. The refusal is permanent on the peer, though. If the
+  winner had later finalized its credit, the owed_digest check would have
+  caught the divergence. The strict verdict stayed green on that round, but
+  the `s1v` counters named the fault.

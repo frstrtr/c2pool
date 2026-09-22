@@ -24,8 +24,11 @@
 //      prevout, odd / non-hex input, an above-MAX_MONEY output)
 //   3  the verdict table: honest, forged reward, unknown block, not active,
 //      wrong height, daemon unavailable, superblock non-zero, VALUELESS claim
-//   4  own_mined_reward: the slice from the MINED bytes; refused on a template
-//      at another (height, parent); VALUELESS at a superblock-cycle height
+//   4  own_mined_reward: the slice from the MINED bytes with the template's
+//      payee SCRIPTS matched (amounts from the mined outputs — the soak
+//      round-899 fee-skew regression); refused on a template at another
+//      (height, parent), a missing payee, an undecodable payee list;
+//      VALUELESS at a superblock-cycle height
 //   5  ★ accept-honest: A mines (MINED reward), B verifies + folds, both bury,
 //      owed_digest(A) == owed_digest(B), non-empty
 //   6  ★ reject-forged-reward: a descriptor claiming more than the mined slice
@@ -262,19 +265,40 @@ int main() {
               "3l superblock-cycle heights (testnet cycle 24 from 4200; cycle 0 = none)");
     }
 
-    // ── 4. own_mined_reward ─────────────────────────────────────────────────
+    // ── 4. own_mined_reward (payee SCRIPTS matched, amounts from the MINED bytes)
     {
-        const auto m = own_mined_reward(blk, 1558817, kParent1558817, 1558817, kParent1558817, kMnPay1558817, false);
+        // block 1558817's template payees: the platform burn (OP_RETURN "6a")
+        // and the masternode payee yVXD… — identities only; the amounts come
+        // from the mined outputs.
+        const std::vector<std::vector<std::uint8_t>> payees = {
+            {0x6a}, unhex("76a914a50fda9b0221aee1c59ba905f5427a59977f81a888ac")};
+        const auto m = own_mined_reward(blk, 1558817, kParent1558817, 1558817, kParent1558817, payees, true, false);
         check(m.reward && *m.reward == kSlice1558817 && m.coinbase_total == kTotal1558817,
-              "4a own slice from the MINED bytes == 59526072");
-        const auto h2 = own_mined_reward(blk, 1558817, kParent1558817, 1558818, kParent1558817, kMnPay1558817, false);
-        check(!h2.reward, "4b a template at another height is refused (nullopt -> VALUELESS)");
-        const auto p2 = own_mined_reward(blk, 1558817, kParent1558817, 1558817, std::string(64, '0'), kMnPay1558817, false);
-        check(!p2.reward, "4c a template on another parent is refused");
-        const auto s2 = own_mined_reward(blk, 1558800, kParent1558817, 1558817, kParent1558817, kMnPay1558817, true);
-        check(s2.reward && *s2.reward == 0, "4d a superblock-cycle height is VALUELESS by rule");
-        const auto ov = own_mined_reward(blk, 1558817, kParent1558817, 1558817, kParent1558817, kTotal1558817 + 1, false);
-        check(!ov.reward, "4e payments above the coinbase total are refused");
+              "4a own slice from the MINED bytes == 59526072 == the dashd-derived slice");
+        const CoinbaseOutputs cb = parse_coinbase_outputs(blk);
+        const auto nm = non_miner_amount(cb, payees);
+        check(nm && *nm == kMnPay1558817,
+              "4b ★ matched payee outputs sum to exactly `masternode payments`.amount (178578214) — "
+              "the soak round-899 regression: a template with a different FEE set (other payment "
+              "AMOUNTS, same payee SCRIPTS) can no longer skew the own slice");
+        const auto h2 = own_mined_reward(blk, 1558817, kParent1558817, 1558818, kParent1558817, payees, true, false);
+        check(!h2.reward, "4c a template at another height is refused (nullopt -> VALUELESS)");
+        const auto p2 = own_mined_reward(blk, 1558817, kParent1558817, 1558817, std::string(64, '0'), payees, true, false);
+        check(!p2.reward, "4d a template on another parent is refused");
+        const auto s2 = own_mined_reward(blk, 1558800, kParent1558817, 1558817, kParent1558817, payees, true, true);
+        check(s2.reward && *s2.reward == 0, "4e a superblock-cycle height is VALUELESS by rule");
+        std::vector<std::vector<std::uint8_t>> missing = payees;
+        missing.push_back(unhex("76a914000000000000000000000000000000000000000088ac"));
+        check(!own_mined_reward(blk, 1558817, kParent1558817, 1558817, kParent1558817, missing, true, false).reward,
+              "4f a template payee with no mined output is refused (the block does not pay it)");
+        check(!own_mined_reward(blk, 1558817, kParent1558817, 1558817, kParent1558817, payees, false, false).reward,
+              "4g an undecodable payee list is refused");
+        const std::vector<std::vector<std::uint8_t>> twice = {{0x6a}, {0x6a}};
+        check(!non_miner_amount(cb, twice),
+              "4h each payee consumes ONE output: a second \"6a\" payee finds no second \"6a\" output "
+              "(the 0-value OP_RETURN 6a28… is a different script)");
+        check(cb.outs.size() == 5 && cb.outs[0].value == 59526071ULL && cb.outs[3].value == 1ULL,
+              "4i per-output values: miner 59526071, donation 1 duff");
     }
 
     // ── 5. ★ accept-honest ──────────────────────────────────────────────────
