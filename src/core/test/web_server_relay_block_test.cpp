@@ -109,6 +109,65 @@ TEST(RelayBlockHonesty, LocallyFoundBlockKeepsRealTiming) {
     EXPECT_EQ(blk["luck_method"].get<std::string>(), "first_block");
 }
 
+
+// NETDIFF-UNAVAILABLE: a locally-found block that is NOT the pool's first --
+// it has a same-chain predecessor, so time_to_find is a real positive number
+// -- but whose network_difficulty was never captured at find time, so no luck
+// could ever be computed. This is the third taxonomy branch (#1138), distinct
+// from "first_block": collapsing it into "first_block" made the UI tooltip
+// claim this was the pool's first block, false for any row after the first.
+// The distinguishing wire fact is a PRESENT time_to_find with a null luck and
+// a null network_difficulty. FAILS WITHOUT THE FIX: the old else-branch
+// labelled this row "first_block".
+TEST(RelayBlockHonesty, NetdiffUnavailableBlockIsLabelledDistinctFromFirst) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+
+    // Predecessor on the SAME chain, recorded first -> gives the target a real
+    // time_to_find. Its own label is immaterial to this test.
+    const std::string prev =
+        "3333333333333333333333333333333333333333333333333333333333333333";
+    mi.record_found_block(/*height=*/900010, uint256S(prev), /*ts=*/1750000000,
+                          /*chain=*/"LTC",
+                          /*miner=*/"LhPrevExample", /*share_hash=*/"cafe01");
+
+    // Target: found locally (real miner + share), a later ts so time_to_find>0,
+    // but network_difficulty left 0 with no fallback source wired -> luck cannot
+    // be computed. No fabricated 0; luck_method must read "netdiff_unavailable".
+    const std::string h =
+        "4444444444444444444444444444444444444444444444444444444444444444";
+    mi.record_found_block(/*height=*/900011, uint256S(h), /*ts=*/1750000300,
+                          /*chain=*/"LTC",
+                          /*miner=*/"LhTargetExample", /*share_hash=*/"cafe02");
+
+    auto blk = find_block(mi.rest_recent_blocks(), h);
+    ASSERT_TRUE(blk.is_object()) << "netdiff-unavailable block must be recorded";
+
+    ASSERT_TRUE(blk.contains("found_locally"));
+    EXPECT_TRUE(blk["found_locally"].get<bool>())
+        << "a block with a real local share/miner was found by this node";
+
+    EXPECT_EQ(blk["luck_method"].get<std::string>(), "netdiff_unavailable")
+        << "a non-first local block with no captured network difficulty must "
+           "not be mislabelled 'first_block' -- its luck was uncomputable, not "
+           "never-attempted";
+
+    // Distinguishing wire fact vs first_block: a REAL same-chain predecessor
+    // gap exists...
+    ASSERT_TRUE(blk["time_to_find"].is_number())
+        << "a block with a same-chain predecessor has a real time_to_find";
+    EXPECT_GT(blk["time_to_find"].get<double>(), 0.0);
+
+    // ...but the input that turns a gap into luck was never measured, so every
+    // luck-derived field stays honest-absent null, never a fabricated 0.
+    EXPECT_TRUE(blk["network_difficulty"].is_null())
+        << "network_difficulty was never captured -- the reason luck is absent";
+    EXPECT_TRUE(blk["luck"].is_null())
+        << "luck is uncomputable without network difficulty -- null, not 0";
+    EXPECT_TRUE(blk["expected_time"].is_null())
+        << "expected_time needs network difficulty -- honest-absent null";
+}
+
 // ─── actual_hash_difficulty: quality of the found hash (#1137) ───────────────
 //
 // = diff1 / block_hash (p2pool-dash web.py:1754). The dashboard reads it 12x
