@@ -45,6 +45,15 @@ struct CoinbaseBooking {
     long long     sink_total = 0;       // D1: sink amount is NOT a ledger deduction
     std::size_t   digest_index = 0;     // which candidate matched (0 = newest)
     ::v37::bytes32 lane_commitment{};
+    // R-C majority-shaped halt: the raw on-chain 0x03 root, set as soon as the
+    // 03-21-00 tail is read -- BEFORE the candidate match. On a lane-root-unknown
+    // block (no candidate matched, so lane_commitment is empty) this is the only
+    // stable builder/ledger-state fingerprint available (the payout identities are
+    // undecodable without the matched lane_commitment). The receiver uses distinct
+    // on-chain roots across a consecutive-unmatched run as the "distinct payees"
+    // proxy so a single stuck/forked builder cannot halt the honest majority.
+    ::xmr::coin::Hash256 onchain_root{};
+    bool           has_onchain_root = false;
     std::map<::v37::bytes32, long long> payout;   // identity -> piconero, the on-chain truth
     // recon(A+B credit): the ON-CHAIN CREDIT CUT (0x02 tail), if the coinbase carries one.
     bool           has_credit_cut = false;
@@ -85,6 +94,7 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     const unsigned char* tag = got.tx_extra.data() + got.tx_extra.size() - 35;
     if (tag[0] != 0x03 || tag[1] != 0x21 || tag[2] != 0x00) { b.why = "not-lane: no 03 21 00 tail"; return b; }
     ::xmr::coin::Hash256 root; std::memcpy(root.data(), tag + 3, 32);
+    b.onchain_root = root; b.has_onchain_root = true;   // R-C: fingerprint available even when no candidate matches
     bool matched = false;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         if (set_::mm_commitment_root(chain_id, candidates[i]) == root) {

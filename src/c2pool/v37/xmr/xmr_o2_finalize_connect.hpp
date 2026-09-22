@@ -280,6 +280,22 @@ struct FinalizeConnectOptions {
     std::uint64_t divergence_cap_heights  = 0;
     std::uint64_t divergence_cap_ticks    = 20;
     std::uint64_t divergence_cap_terminal = 2;
+
+    // ── R-C MAJORITY-SHAPED HALT ────────────────────────────────────────────
+    // A SYNCED receiver must not self-halt on a single unmatched lane block (main
+    // reclassifies those "lane-root-refused:"): one forked/malicious builder must
+    // not be able to stop the honest majority with one block. A refused block is
+    // REFUSED-not-credited (loud alarm, gate released) and fed into a run; the
+    // terminal DIVERGENCE trips only when BOTH:
+    //   * refuse_run_consecutive refused lane blocks arrive with NO honest lane
+    //     block booked in between (a booked block resets the run), AND
+    //   * they commit >= refuse_run_distinct_roots DISTINCT on-chain 0x03 roots
+    //     (the "distinct payees" proxy -- payout identity is undecodable under an
+    //     unknown root; distinct roots = >= 2 independent block-productions past
+    //     our settled state, not one stuck builder replaying a single root).
+    // M = 3 / distinct = 2 are consumer constants (documented; no consensus).
+    std::size_t   refuse_run_consecutive    = 3;   // M: consecutive refused frontier lane blocks to declare a decided divergence
+    std::size_t   refuse_run_distinct_roots = 2;   // >= this many distinct on-chain roots in the run (the "distinct payees" proxy)
 };
 
 // ── the glue ────────────────────────────────────────────────────────────────
@@ -362,6 +378,12 @@ public:
         // finality-boundary.md.
         std::uint64_t diverged = 0, divergence_alarms = 0, divergence_dropped = 0,
                       divergence_lag_max = 0, divergence_ticks = 0;
+        // R-C MAJORITY-SHAPED HALT. `refused_not_credited` = SYNCED-but-unmatched
+        // lane blocks refused-not-credited (loud alarm, gate released, NOT a halt);
+        // `refuse_run_max` = the longest consecutive refused run observed;
+        // `majority_diverged` flips to 1 iff the run reached M consecutive with >= 2
+        // distinct roots (the only path that halts a synced receiver now).
+        std::uint64_t refused_not_credited = 0, refuse_run_max = 0, majority_diverged = 0;
     };
 
     // Construct AFTER node.bring_up() (the finalize driver exists) and AFTER
@@ -646,6 +668,20 @@ public:
         const bool late_post_finalize = (cursor > fc_it->second) && (h <= cursor + m_cfg.d_conf);
         Amounts credit, payout; std::string why;
         if (!m_o.book_from_chain(h, bid, credit, payout, why)) {
+            // R-C MAJORITY-SHAPED HALT. main reclassifies a SYNCED receiver's
+            // unmatched-root block "lane-root-unknown:" -> "lane-root-refused:<roothex>:".
+            // Such a block is REFUSED-not-credited (loud alarm, the R4 gate is RELEASED
+            // for this height so the cursor is not held hostage) and NEVER by itself a
+            // halt: one forked/malicious builder committing a single unreproducible root
+            // cannot stop the honest majority. Only a SUSTAINED divergence -- M
+            // CONSECUTIVE refused lane blocks (no honest lane block booked in between to
+            // reset the run) committing >= 2 DISTINCT on-chain roots (the "distinct
+            // payees" proxy: payout identity is undecodable under an unknown root) --
+            // is a decided self/lane divergence and trips the terminal halt. A lone
+            // forker's block is refused (run=1) and the next honest block books and
+            // RESETS the run; only when I myself (or the whole majority past me) have
+            // diverged does every frontier block stay unmatched and the run reach M.
+            if (why.rfind("lane-root-refused:", 0) == 0) { note_refused_frontier(h, bid, why); return; }
             const bool root_unknown = (why.rfind("lane-root-unknown:", 0) == 0);   // R5
             if (why.rfind("get_block", 0) == 0 || why.find("does not parse") != std::string::npos ||
                 why.rfind("cut-pending:", 0) == 0 || root_unknown) {   //  fix 4: transient (recon(A+B credit): + receiver's lane not yet at P; R5: + ring not yet at the winner's state)
@@ -701,6 +737,14 @@ public:
             say("cba: node/ledger did not admit chain lane block " + short_bid(bid)); return;
         }
         ++m_stats.registered; ++m_cba_chain_booked; m_chain_booked_once[bid] = true; m_retry.erase(bid); m_first_cursor.erase(bid);
+        // R-C: an honest lane block booked -> the divergence run is broken. A lone
+        // forker's refused block can never accumulate to M because the very next
+        // honest block clears the run here.
+        if (m_refuse_run_len) {
+            say("cba: majority-shaped run RESET by a booked lane block " + short_bid(bid) + " h=" + std::to_string(h) +
+                " (was " + std::to_string(m_refuse_run_len) + " consecutive refused)");
+            m_refuse_run_len = 0; m_refuse_run_last.clear(); m_refuse_run_roots.clear();
+        }
         m_race.observe_own(h, bid);   // a LANE block is 'own' for the race book (multi-node: own == lane)
         say("cba: CHAIN FOUND booked " + short_bid(bid) + " h=" + std::to_string(h) + " payout_keys=" + std::to_string(payout.size()) + " total=" + std::to_string(rec.reward) + " -> finalizes when hw >= " + std::to_string(h + m_cfg.d_conf));
     }
@@ -899,6 +943,75 @@ private:
             else { m_root_unknown_bids.erase(bid); m_first_cursor.erase(bid); }
         }
         return reached;
+    }
+
+    // ── R-C MAJORITY-SHAPED HALT ────────────────────────────────────────────
+    // A SYNCED receiver's unmatched-root lane block (main tagged it
+    // "lane-root-refused:<roothex>:"). REFUSE-not-credit it -- do NOT book it,
+    // do NOT hold the finalize gate for it (release the R4 gate so the cursor is
+    // never held hostage by one participant), raise a LOUD alarm -- and feed the
+    // divergence run. Trip the terminal halt ONLY when the run is both long
+    // enough (M consecutive, unbroken by any booked lane block) AND wide enough
+    // (>= 2 distinct on-chain roots, the "distinct payees" proxy). A single
+    // block, or a lone builder replaying a single root, never halts the majority.
+    void note_refused_frontier(std::uint64_t h, const std::string& bid, const std::string& why) {
+        // parse "lane-root-refused:<roothex>:<rest>"
+        std::string roothex;
+        {
+            const std::size_t p0 = std::string("lane-root-refused:").size();
+            const std::size_t p1 = why.find(':', p0);
+            roothex = (p1 == std::string::npos) ? why.substr(p0) : why.substr(p0, p1 - p0);
+        }
+        // release the gate for this height (decided, not transient): never book,
+        // never retry, never hold. Its credit is refused -- the ruled trade-off
+        // (refuse one block's credit + alarm) over halting the whole network.
+        m_retry.erase(bid); m_retry_n.erase(bid); m_deferred.erase(bid);
+        m_root_unknown_bids.erase(bid); m_first_cursor.erase(bid);
+        m_chain_seen[bid] = true;
+        ++m_stats.refused_not_credited;
+        // count this bid into the run only if it is not already the last one counted
+        // (book_chain_block can be re-entered for the same bid across ticks)
+        if (m_refuse_run_last != bid) {
+            ++m_refuse_run_len;
+            m_refuse_run_last = bid;
+            if (m_refuse_run_roots.size() < m_o.refuse_run_distinct_roots + 4) m_refuse_run_roots.insert(roothex);   // bounded: only need to know it reached the distinct threshold
+            if (m_refuse_run_len > m_stats.refuse_run_max) m_stats.refuse_run_max = m_refuse_run_len;
+        }
+        say("cba-ALARM lane-root-refused: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) +
+            " root=" + roothex.substr(0, 12) + " is SYNCED-but-unmatched -> REFUSED (not credited), gate released. "
+            "Majority-shaped run: " + std::to_string(m_refuse_run_len) + " consecutive / " +
+            std::to_string(m_refuse_run_roots.size()) + " distinct root(s) [halt at " +
+            std::to_string(m_o.refuse_run_consecutive) + " consecutive & " +
+            std::to_string(m_o.refuse_run_distinct_roots) + " distinct]. One block never halts; an honest booked block resets the run.");
+        if (m_refuse_run_len >= m_o.refuse_run_consecutive &&
+            m_refuse_run_roots.size() >= m_o.refuse_run_distinct_roots) {
+            m_stats.majority_diverged = 1;
+            trip_divergence("SUSTAINED majority-shaped divergence: " + std::to_string(m_refuse_run_len) +
+                " consecutive SYNCED-but-unmatched lane blocks committing " + std::to_string(m_refuse_run_roots.size()) +
+                " distinct on-chain roots this node cannot reproduce (M=" + std::to_string(m_o.refuse_run_consecutive) +
+                ", distinct>=" + std::to_string(m_o.refuse_run_distinct_roots) + "); the honest set advanced past our settled state");
+        }
+    }
+
+    // R-C: declare a DECIDED, TERMINAL divergence (the majority-shaped path).
+    // Terminal: the finalize gate holds for good (cursor frozen), booking and
+    // retries stop (drain_bookings/book_chain_block drop on m_diverged), and main
+    // suspends lane template production + withdraws the stratum job on diverged().
+    void trip_divergence(const std::string& why) {
+        if (m_diverged) return;
+        m_diverged = true; m_stats.diverged = 1; ++m_stats.divergence_alarms;
+        const std::uint64_t cursor = m_node.finalize_driver().cursor_height();
+        const std::string banner =
+            "cba-ALARM DIVERGENCE (TERMINAL, majority-shaped): " + why +
+            " -- this node's settlement ledger has DIVERGED from the lane. Finalize cursor FROZEN at " +
+            std::to_string(cursor) + "; lane template production is suspended and the stratum job withdrawn "
+            "(a halted ledger must not commit stale owed_digest roots into new blocks, nor serve a stale-root "
+            "job); credit for refused blocks was HELD-out, never silently skip-credited into the ledger. "
+            "Recovery: W6 snapshot resync from a converged peer at a named cursor (docs/xmr-lane/finality-boundary.md), then restart.";
+        say(banner);
+        if (m_o.out) { std::fprintf(stderr, "%s [stderr copy] %s\n", m_o.tag.c_str(), banner.c_str()); std::fflush(stderr); }
+        m_retry.clear(); m_deferred.clear(); m_root_unknown_bids.clear();
+        m_refuse_run_len = 0; m_refuse_run_last.clear(); m_refuse_run_roots.clear();
     }
 
     // R6 DIVERGENCE CAP -- the finality-boundary detector. A reorg of depth >=
@@ -1213,6 +1326,9 @@ private:
     std::set<std::string>             m_root_unknown_bids;   //  R5: bids currently retrying as lane-root-unknown
     std::map<std::string, std::uint64_t> m_first_cursor;     //  R4 alarm: finalize cursor when a chain lane block was first seen
     std::map<std::string, std::uint64_t> m_deferred;         //  R6: bid -> height, chain blocks above cursor+1+D_conf awaiting the cursor
+    std::size_t                       m_refuse_run_len = 0;  //  R-C: length of the current consecutive SYNCED-but-unmatched refused run (reset on any booked lane block). O(1) memory (not a bid vector) so a never-halting single-root run cannot grow unbounded.
+    std::string                       m_refuse_run_last;     //  R-C: last bid counted into the run (dedup across re-entry)
+    std::set<std::string>             m_refuse_run_roots;    //  R-C: distinct on-chain roots in the current run (the "distinct payees" proxy). Bounded: the halt fires at >= 2, and a genuine single-root run stays size 1.
     bool                              m_diverged = false;    //  R6: divergence cap tripped (terminal; the gate holds for good)
     std::uint64_t                     m_cba_chain_booked = 0;
     std::map<std::string, PendingRec> m_unrecoverable;  // kept in the sidecar so the boot warning repeats
@@ -1499,6 +1615,80 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
                 fc.stats().divergence_dropped == 4 && fc.stats().lane_root_unknown_retries == retries_at_halt &&
                 node.finalize_driver().cursor_height() == 1 && fc.stats().divergence_alarms == 1,
                 "dropped=" + std::to_string(fc.stats().divergence_dropped) + " cursor=" + std::to_string(node.finalize_driver().cursor_height()));
+        (void)fc.drain_before_stop();
+    }
+
+    // ── phase 5: R-C MAJORITY-SHAPED HALT ───────────────────────────────────
+    // A SYNCED receiver's unmatched-root lane block ("lane-root-refused:") is
+    // REFUSED-not-credited (gate RELEASED so the cursor is NOT held hostage) and
+    // NEVER by itself a halt. Only M consecutive refused blocks committing >= 2
+    // DISTINCT roots trips the terminal divergence. This is the fix for the
+    // network-halt liveness class: one forked/malicious builder must not stop the
+    // honest majority with a single block.
+    auto roothex_of = [](std::uint64_t h) {   // a distinct 64-hex root per height
+        static const char* hx = "0123456789abcdef";
+        std::string s(64, '0');
+        for (int i = 0; i < 16; ++i) { s[63 - i] = hx[(h >> (4 * i)) & 0xF]; }
+        return s;
+    };
+    // 5A: distinct roots -> after M=3 consecutive with >= 2 distinct, HALT at the
+    // 3rd; refused-not-credited, gate released (cursor advanced past the refused
+    // heights), one terminal alarm, majority_diverged=1.
+    {
+        XmrNodeConfig c5 = cfg;
+        c5.settle_db_path = (tmp_root / "store-rc-distinct").string();
+        std::filesystem::create_directories(c5.settle_db_path);
+        FinalizeConnectOptions o5; o5.out = nullptr;
+        o5.sidecar_path = (std::filesystem::path(c5.settle_db_path) / "pfound.tsv").string();
+        MockMonerodTransport mock;
+        XmrNode node(c5, mock, &smoke::test_point_check);
+        try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC19 bring_up (node RC-A)", false, e.what()); return rep; }
+        o5.book_from_chain = [&](std::uint64_t h, const std::string&, Amounts&, Amounts&, std::string& why) {
+            if (h >= 5) { why = "lane-root-refused:" + roothex_of(h) + ": synced-but-unmatched (test)"; return false; }
+            why = "not-lane: test"; return false;
+        };
+        FoundBlockQueue q5; FinalizeConnect fc(node, c5, q5, o5);
+        chain(node, 1, 4); (void)fc.tick();
+        chain(node, 5, 20);
+        for (int i = 0; i < 25; ++i) (void)fc.tick();
+        rep.add("FC19a single/second refused block does NOT halt; the 3rd consecutive with >=2 distinct roots DOES: majority_diverged=1, exactly M=3 refused-not-credited, one terminal alarm",
+                fc.stats().majority_diverged == 1 && fc.diverged() && fc.stats().diverged == 1 &&
+                fc.stats().refused_not_credited == 3 && fc.stats().refuse_run_max == 3 && fc.stats().divergence_alarms == 1,
+                "refused_not_credited=" + std::to_string(fc.stats().refused_not_credited) + " run_max=" + std::to_string(fc.stats().refuse_run_max) +
+                " majority_diverged=" + std::to_string(fc.stats().majority_diverged) + " diverged=" + std::to_string(fc.stats().diverged));
+        rep.add("FC19b the refuse path RELEASED the finalize gate (the cursor walked past the refused heights, never frozen at 1 the way an unresolved root-unknown block freezes it)",
+                node.finalize_driver().cursor_height() > 1,
+                "cursor=" + std::to_string(node.finalize_driver().cursor_height()));
+        (void)fc.drain_before_stop();
+    }
+    // 5B: ONE root repeated forever (a single stuck/forked builder) -> the run
+    // grows but distinct stays 1 -> NEVER halts. This is the "distinct payees"
+    // guard: a lone participant cannot halt the honest majority however many
+    // blocks it emits. The run length is an O(1) counter, so it cannot grow the
+    // node's memory without bound.
+    {
+        XmrNodeConfig c6 = cfg;
+        c6.settle_db_path = (tmp_root / "store-rc-onefork").string();
+        std::filesystem::create_directories(c6.settle_db_path);
+        FinalizeConnectOptions o6; o6.out = nullptr;
+        o6.sidecar_path = (std::filesystem::path(c6.settle_db_path) / "pfound.tsv").string();
+        MockMonerodTransport mock;
+        XmrNode node(c6, mock, &smoke::test_point_check);
+        try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC19 bring_up (node RC-B)", false, e.what()); return rep; }
+        const std::string one_root = roothex_of(0xDEAD);
+        o6.book_from_chain = [&](std::uint64_t h, const std::string&, Amounts&, Amounts&, std::string& why) {
+            if (h >= 5) { why = "lane-root-refused:" + one_root + ": one stuck builder (test)"; return false; }
+            why = "not-lane: test"; return false;
+        };
+        FoundBlockQueue q6; FinalizeConnect fc(node, c6, q6, o6);
+        chain(node, 1, 4); (void)fc.tick();
+        chain(node, 5, 20);
+        for (int i = 0; i < 25; ++i) (void)fc.tick();
+        rep.add("FC19c one root repeated (a lone forker) NEVER halts the majority: many refused-not-credited, run grew past M, but distinct==1 -> majority_diverged=0, NOT diverged",
+                fc.stats().majority_diverged == 0 && !fc.diverged() && fc.stats().diverged == 0 &&
+                fc.stats().refused_not_credited >= 5 && fc.stats().refuse_run_max >= 5,
+                "refused_not_credited=" + std::to_string(fc.stats().refused_not_credited) + " run_max=" + std::to_string(fc.stats().refuse_run_max) +
+                " majority_diverged=" + std::to_string(fc.stats().majority_diverged) + " diverged=" + std::to_string(fc.stats().diverged));
         (void)fc.drain_before_stop();
     }
     return rep;

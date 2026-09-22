@@ -242,6 +242,17 @@ public:
 
     bool running() const { return m_running.load(std::memory_order_acquire); }
 
+    // R-C (defect 4): WITHDRAW the lane job + refuse new shares. Set when the
+    // settlement ledger DIVERGED (terminal) or the builder lag-gate suspended
+    // lane production: a diverged/lagging node must not keep serving a stale-root
+    // job (template refresh stops but the outstanding job would otherwise linger,
+    // and its shares be accepted -> bounded stale-root submit exposure). Refuses
+    // "submit" for the lane while set; the node's non-lane function stays alive.
+    // Any thread. One-way in practice for divergence (terminal); the lag-gate may
+    // clear it once the finalize cursor catches up.
+    void set_lane_suspended(bool v) { m_lane_suspended.store(v, std::memory_order_release); }
+    bool lane_suspended() const { return m_lane_suspended.load(std::memory_order_acquire); }
+
     // The port actually bound (differs from options only when 0 was asked for).
     std::uint16_t bound_port() const { return m_bound_port.load(std::memory_order_acquire); }
     const StratumListenerOptions& options() const { return m_opts; }
@@ -674,6 +685,17 @@ private:
                 send_line(cid, strat::StratumDialect::build_error(req_id, "Unauthenticated"));
                 return;
             }
+            // R-C (defect 4): the lane job is WITHDRAWN (settlement diverged, or the
+            // builder lag-gate suspended production). Refuse the share rather than
+            // serve a stale-root job -- a diverged ledger must not accept a share
+            // that would submit a block committing a stale owed_digest root.
+            if (m_lane_suspended.load(std::memory_order_acquire)) {
+                m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
+                send_line(cid, strat::StratumDialect::build_error(req_id,
+                    "lane suspended (settlement diverged / builder lag): share refused, job withdrawn"));
+                log("client " + std::to_string(cid) + " submit REFUSED: lane suspended (job withdrawn)");
+                return;
+            }
             strat::SubmitFields f;
             f.rpc_id = params["id"].as_string();
             f.job_id = params["job_id"].as_string();
@@ -804,6 +826,7 @@ private:
     std::atomic<bool>        m_stop{false};
     std::atomic<bool>        m_running{false};
     std::atomic<bool>        m_template_dirty{false};
+    std::atomic<bool>        m_lane_suspended{false};   // R-C (defect 4): lane job withdrawn, shares refused
     std::thread              m_thread;
 
     std::map<std::uint64_t, Client> m_clients;   // listener thread only

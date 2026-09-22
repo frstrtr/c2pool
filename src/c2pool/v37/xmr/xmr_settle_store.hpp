@@ -311,7 +311,12 @@ public:
     // Rebuild `ledger` and return the recovered high-water / cursor. `ok` is set
     // false ONLY on a torn store (F2). A fresh store recovers cleanly with
     // recovered=false and an empty ledger.
-    RecoveredState recover(OwedLedger& ledger, bool& ok) {
+    // R-B(i) follow-up: `after_event` (optional) is invoked after EVERY replayed
+    // ledger event so the caller can rebuild the canonical owed_digest history
+    // (the RECON candidate ring) at boot -- post R-A each state is D(c), a pure
+    // function of the settled prefix, so the replayed history IS the ring.
+    RecoveredState recover(OwedLedger& ledger, bool& ok,
+                           const std::function<void(const OwedLedger&)>& after_event = {}) {
         ok = true;
         RecoveredState st;
         try {
@@ -342,6 +347,7 @@ public:
                         case SettleEvKind::Orphan:
                             ledger.on_block_orphaned(e.bid, e.payout); break;
                     }
+                    if (after_event) after_event(ledger);
                     return true;
                 });
             if (st.max_event_seq) st.recovered = true;
