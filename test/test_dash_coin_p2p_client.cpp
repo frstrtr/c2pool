@@ -874,16 +874,19 @@ TEST(DashCoinP2PHeadOfLine, tagged_front_rehomes_to_fastest_on_first_stall_pool_
     rig.use_fake_clock();
 
     // Four archival peers. Attach order fixes the round-robin: A is the initial
-    // carrier; B is the demonstrated FAST deliverer; C, D are spares.
+    // carrier and B is the round-robin NEXT pick (the rotation skips the last
+    // carrier A); D is the demonstrated FAST deliverer; C is a spare. Fastest
+    // != round-robin-next on purpose: a blind rotation lands the front on B, so
+    // the carrier checks below can only pass through the rank-driven re-home.
     hol_add_handshaked_peer(rig, "10.0.0.1", 9999, /*NODE_NETWORK*/1, 3000000);
     hol_add_handshaked_peer(rig, "10.0.0.2", 9999, 1, 3000000);
     hol_add_handshaked_peer(rig, "10.0.0.3", 9999, 1, 3000000);
     hol_add_handshaked_peer(rig, "10.0.0.4", 9999, 1, 3000000);
-    const std::string A = "10.0.0.1:9999", B = "10.0.0.2:9999";
+    const std::string A = "10.0.0.1:9999", B = "10.0.0.2:9999", D = "10.0.0.4:9999";
     ASSERT_EQ(rig.client.handshaked_peer_keys().size(), 4u);
 
-    // dashd PeerTally.blocks: B is the fastest deliverer.
-    rig.client.bump_peer_delivered_for_test(B, 100);
+    // dashd PeerTally.blocks: D is the fastest deliverer.
+    rig.client.bump_peer_delivered_for_test(D, 100);
 
     const uint256 front = uint256(0xF00Dull);
     ASSERT_TRUE(rig.client.request_head_of_line_for_test(front));
@@ -894,11 +897,13 @@ TEST(DashCoinP2PHeadOfLine, tagged_front_rehomes_to_fastest_on_first_stall_pool_
     rig.fake_now += 3;   // > BODY_STALL_TIMEOUT_INIT (2s): first stall
     rig.client.service_pending_bodies_for_test(rig.fake_now);
 
-    // The front block re-homes to the FASTEST deliverer (B), not round-robin.
+    // The front block re-homes to the FASTEST deliverer (D), not round-robin (B).
     EXPECT_EQ(rig.client.hol_rehomes(), 1u);
-    EXPECT_EQ(rig.client.hol_last_rehome_target(), B)
+    EXPECT_EQ(rig.client.hol_last_rehome_target(), D)
         << "HOL re-home must pick the highest PeerTally.blocks peer";
-    EXPECT_EQ(rig.client.pending_body_last_peer_for_test(front), B);
+    EXPECT_EQ(rig.client.pending_body_last_peer_for_test(front), D)
+        << "re-request target must be the fastest deliverer D, not the"
+           " round-robin next " << B;
     // A willing-but-slow carrier is NOT dropped on the first stall — the pool
     // keeps its parallelism (dashd disconnects only a genuinely-starved window).
     EXPECT_EQ(rig.client.hol_disconnects(), 0u);
