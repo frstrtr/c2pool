@@ -25,10 +25,10 @@
 // hollow.
 #include <cstdint>
 namespace c2pool::v37n::settle::wiring_golden {
-inline constexpr const char* STAMP = "ff19a742898a54d0e298b0ab288dbd0343e96f6476e14b2d63e81db6f07b133b";
+inline constexpr const char* STAMP = "499171937535ce48894f96cd139069ea3f23d1b3c8f713989e4c347db05e3d45";
 inline constexpr const char* JSON_FILE = "w4_estimator_wiring_golden_v1.json";
-inline constexpr const char* OWED_DIGEST_GATE_OFF_HEX = "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae";
-inline constexpr const char* OWED_DIGEST_GATE_ON_HEX  = "56caec4cff671eed36d53e11140f0a0de44f35e98900df3010cdd296ea5a0f58";
+inline constexpr const char* OWED_DIGEST_GATE_OFF_HEX = "6c85fd89bb1218ce6e25b607f6cbf19ada17abaab26f62dddfeec4846712e071";
+inline constexpr const char* OWED_DIGEST_GATE_ON_HEX  = "d851241bad15520e7323d1862fe270c2094c92d9a04e20678dc3117dd0d8df90";
 inline constexpr const char* LANE_DIGEST_HEX          = "37756e9fa59be4aa30acfa6a18b0e1c131c9601cfceec802f19133a1ecde1a50";
 inline constexpr const char* UNCOVERED_CREDIT_LOW63_DEC = "874999";
 }  // namespace

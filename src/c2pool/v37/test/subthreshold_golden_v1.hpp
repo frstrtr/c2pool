@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string>
 namespace c2pool::v37::subthreshold::golden {
-inline constexpr const char* STAMP = "75d62c1e56253922e39482d64dd21c38e53bf0e6cd631d2a5607ae7c8f9bbee7";
+inline constexpr const char* STAMP = "6634ba0b40c6f1127938c053eeea499939c5e2e32ace8514988c06bbfe0f4a29";
 inline constexpr const char* JSON_FILE = "subthreshold_estimator_golden_v1.json";
 struct EstRow { unsigned K; const char* h_K_hex; const char* Hhat_dec; };
 inline const EstRow ESTIMATE[] = {
@@ -44,6 +44,6 @@ struct ClampRef { unsigned K; unsigned long long S; const char* h_K_hex; const c
                   const char* clamp_broken_dec; const char* combined_dec; const char* estimate_dec; };
 inline const ClampRef CLAMP_NEG = {4, 500000ULL, "0000431bde82d7b634dad31fcd24e160d887ebf22c01e68a0d349be8ff327aa6", "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54", "1000000000000", "125000749999", "749999"};
 inline constexpr const char* PAYEEB_CREDIT_LOW63_DEC = "874999";
-inline constexpr const char* OWED_DIGEST_GATE_OFF_HEX = "fc97e47d65f86cb1b36f064dc82b1af1884b233f4a67e5613e2dc465e1177670";
-inline constexpr const char* OWED_DIGEST_GATE_ON_HEX  = "7e0efdb1f2a1eecf41d328ee31f24a3f00b9214f044643992be15cef1fcdec8a";
+inline constexpr const char* OWED_DIGEST_GATE_OFF_HEX = "8bbcd5bda9d5b167d2ddddfdea379ee858464b43313763744cdb704a1ec54c00";
+inline constexpr const char* OWED_DIGEST_GATE_ON_HEX  = "86c9c810203c0bf605b007ecafc1d32bb9f61752b9338ac7e743402e464bc7c4";
 }  // namespace

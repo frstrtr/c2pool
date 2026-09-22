@@ -766,7 +766,9 @@ public:
 
     // The §4.5 OWED commitment over the FINALIZED partition only (pending keys
     // are re-derivable from the spine + FOUND set). Domain-separated sha256d,
-    // sorted by key: "V37O" || key || i64 finalW || u64 first_eligible.
+    // sorted by key: "V37Q" || key || i64 finalW || u64 first_eligible.
+    // (R-A: tag bumped V37O->V37Q when fe became finalized-only; the "over the
+    //  FINALIZED partition only" contract below is now literally enforced.)
     bytes32 owed_digest() const {
         // R3: memoized on m_seq. owed_digest is a pure function of ledger state
         // and m_seq bumps on every mutation, so a hit at an equal seq is the
@@ -777,7 +779,7 @@ public:
         // std::sort used — so the removed sort reordered nothing; `pre` is
         // built byte-for-byte identically.
         std::vector<std::uint8_t> pre;
-        const char tag[4] = {'V', '3', '7', 'O'};
+        const char tag[4] = {'V', '3', '7', 'Q'};   // R-A: bumped V37O->V37Q; fe is now finalized-only
         pre.insert(pre.end(), tag, tag + 4);
         for (const auto& [k, w] : m_finalW) {
             if (w == 0) continue;  // zero rows carry no commitment weight
@@ -812,9 +814,11 @@ public:
     // ledger's HISTORY, beside (never instead of) owed_digest().
     //
     // ADDITIVE AND ALWAYS-ON: computing and exposing this root changes no
-    // existing commitment. owed_digest() above is untouched — same body, same
-    // "V37O" tag, same anchors (b4db1ded... empty; 87c5249a... the V37.1
-    // gate-ON ridge cut). The w5 StateCommitment tree only carries this root
+    // existing commitment. owed_digest() above is the record's peer, not part of
+    // it: adding this MMR root leaves owed_digest's body untouched. (R-A did
+    // rebake owed_digest's own value — it bumped the tag to "V37Q" and made fe
+    // finalized-only — but that is a change to owed_digest itself, orthogonal to
+    // this MMR.) The w5 StateCommitment tree only carries this MMR root
     // when the compile-time gate V37_OWED_EVENT_MMR_COMMIT is 1, which it is
     // not by default.
     //
@@ -854,19 +858,32 @@ private:
     // <=0 to >0 is armed at `bin_height` (its age start); a key back at <=0 is
     // disarmed. Monotone bin_height (the coin high-water) is the K_fair clock.
     void rearm_first_eligible(u64 bin_height) {
-        // R3: arm/disarm over every key the index tracks. That key set is the
-        // shipped (finalW ∪ pending-payout) union PLUS only keys whose eo ≤ 0
-        // and which carry no fe (disarm is a no-op on them, since fe(k) is set
-        // only when eo>0 and fe implies a finalW row that keeps k in the union),
-        // so the resulting m_first_eligible map is identical to iterating
-        // effective_owed_all() (oracle KAT v37_w4_owed_incremental_test).
-        m_eo_index.for_each_eo([&](const bytes32& k, long long e) {
-            if (e > 0) {
+        // R-A (P0 lane_commitment race-fork fix, RECON #1697): arm/disarm
+        // first_eligible on the FINALIZED weight finalW(k) ALONE — NOT the
+        // pending-netted EffectiveOwed(k) = finalW − Σ_pending payout. fe feeds
+        // owed_digest() (§4.5), whose own contract (see owed_digest below) is
+        // "over the FINALIZED partition only"; reading pending here was the sole
+        // leak that let two nodes with identical SETTLED prefixes but different
+        // in-flight pending sets commit different digests — the RECON
+        // lane_commitment fork. Arming on finalW alone makes fe, and therefore
+        // owed_digest(), a pure function of the buried/settled prefix.
+        //
+        // m_eo_index STILL serves propose_coinbase()'s value+order (it holds the
+        // eo>0 positive view, ordered by fe_at), so the payout path is unchanged
+        // and there is no double-pay: eo>0 ⇒ finalW>eo>0, so every eligible key
+        // still has an fe; only the fe TIMESTAMP can move earlier (to when finalW
+        // first went positive), which is the more-correct oldest-owed clock.
+        //
+        // Iterate m_finalW: every armed key has a finalW row (fe is set only for
+        // a finalW>0 key, and prune_finalized_zero_rows never drops an armed row,
+        // so fe-keys ⊆ finalW-keys — the iteration covers every disarm too).
+        for (const auto& [k, w] : m_finalW) {
+            if (w > 0) {
                 if (!m_first_eligible.count(k)) m_first_eligible[k] = bin_height;
             } else {
                 m_first_eligible.erase(k);
             }
-        });
+        }
         // Re-establish the ordered positive view from the just-updated fe.
         m_eo_index.rebuild_order([this](const bytes32& k) { return fe_at(k); });
     }
