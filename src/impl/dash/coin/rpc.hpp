@@ -163,6 +163,21 @@ public:
     ~NodeRPC();
 
     void connect(NetService address, std::string userpass);
+    /// SYNCHRONOUS first connect, for a caller that drives Send() from its own
+    /// thread right away (c2pool-v37-btc-dash). The async connect() above runs
+    /// async_resolve -> async_connect -> check() on the io thread and, on
+    /// failure, m_stream.close() — while a Send() on the caller thread may be
+    /// sync_reconnect()ing the SAME m_stream under m_rpc_mutex. Two threads
+    /// then open/close one socket concurrently: the degraded shape is a closed
+    /// live socket ("Transport endpoint is already connected" -> ×N "Bad file
+    /// descriptor"), the tight shape a SIGSEGV in epoll_reactor::
+    /// register_descriptor (the v37 testnet soak's round-523 crash). This
+    /// variant sets the same request/auth state, connects under m_rpc_mutex on
+    /// the caller thread, and never schedules async socket work, so every
+    /// later socket operation is a Send() under the one mutex. Returns false if
+    /// the first connect failed; Send() then retries via sync_reconnect() with
+    /// its bounded backoff.
+    bool connect_sync(NetService address, std::string userpass);
     void reconnect();
     void sync_reconnect();
     /// Register the reconnect-churn observer (see m_on_reconnect). Call once
@@ -242,6 +257,15 @@ public:
     nlohmann::json getblockheader(uint256 header, bool verbose = true);
     // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
     nlohmann::json getblock(uint256 blockhash, int verbosity = 1);
+    // `masternode payments <blockhash> 1`: dashd's own record of the
+    // masternode (+ platform credit-pool burn) payments block `blockhash`
+    // carried — the non-miner part of its coinbase outside superblocks. Used by
+    // the v37 btc-dash arm to verify a carried block reward against the MINED
+    // coinbase. Transport / RPC errors propagate (the caller treats them as
+    // "could not verify", never as a pass).
+    nlohmann::json masternode_payments(const uint256& blockhash);
+    // getgovernanceinfo: {superblockcycle, lastsuperblock, nextsuperblock, ...}.
+    nlohmann::json getgovernanceinfo();
     // E2c (#738): `protx list registered true` -- the full REGISTERED
     // deterministic-MN set at the current tip in the DETAILED shape
     // (state.payoutAddress + lastPaidHeight + registeredHeight + PoSe

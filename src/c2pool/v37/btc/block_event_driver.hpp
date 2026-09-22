@@ -342,6 +342,9 @@ public:
     // The refusal bit, as one line an operator can act on.
     static std::string peer_refusal_reason(const PeerWinOutcome& o) {
         if (o.already_known)          return "already ours / already known (idempotent, not a fault)";
+        if (o.refused_unverified)
+            return std::string("descriptor did not verify against the coin daemon (") +
+                   win_verdict_name(o.verify_verdict) + ")";
         if (o.refused_payout_emitted) return "winner had already EMITTED a coinbase; its payout map is not on the wire";
         if (o.refused_too_late)       return "H_b at or below our finalize cursor (descriptor arrived too late)";
         if (o.cut_digest_mismatch)    return "we published the winner's prefix P with a DIFFERENT lane digest (sharechain divergence)";

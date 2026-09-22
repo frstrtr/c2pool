@@ -152,6 +152,7 @@
 
 #include <c2pool/v37/btc/btc_coin_backend.hpp>   // ICoinBackend, CoinTip, SubmitResult
 #include <c2pool/v37/btc/block_event_driver.hpp> // Canon (the tri-state the driver consumes)
+#include <c2pool/v37/btc/mined_block_verify.hpp> // T1-prep step 3: MinedBlockFacts, parse_coinbase_outputs_hex
 
 namespace c2pool::v37n::btc {
 
@@ -279,6 +280,12 @@ public:
         // kDashRegtestGenesisHex. (A -devnet=<name> has its own genesis; leave
         // empty there or pin the devnet's own.)
         std::string               expect_genesis;
+        // ★ T1-prep step 3: the superblock schedule (Dash Core chainparams
+        // nSuperblockCycle / nSuperblockStartBlock). At a superblock-cycle
+        // height the treasury payments are not reconstructible after the fact,
+        // so a block there is registered VALUELESS on every node. 0 = none.
+        std::uint64_t             superblock_cycle = 0;
+        std::uint64_t             superblock_start = 0;
     };
 
     // (two constructors rather than `Options opt = {}`: a defaulted argument of a
@@ -498,6 +505,87 @@ public:
         std::lock_guard<std::mutex> g(m_mu);
         return m_tmpl;
     }
+
+    // ── ★ T1-prep step 3: what dashd says about one block id ────────────────
+    // Known? On the active chain? At what height? And the MINED miner slice =
+    // sum(coinbase vout of getblock <bid> 0) - `masternode payments <bid> 1`
+    // .amount. Never throws: a transport failure leaves state Unknown or
+    // miner_slice nullopt, which the verifier REFUSES (never a pass).
+    MinedBlockFacts mined_block_facts(const std::string& bid) noexcept {
+        MinedBlockFacts f;
+        const HeaderProbe p = probe_header(bid);
+        switch (p.state) {
+            case HeaderProbe::State::Missing: f.state = MinedBlockFacts::State::Missing; return f;
+            case HeaderProbe::State::Unknown: f.state = MinedBlockFacts::State::Unknown; return f;
+            case HeaderProbe::State::Have:    break;
+        }
+        f.state             = MinedBlockFacts::State::Have;
+        f.height            = p.height;
+        f.on_active_chain   = p.on_active_chain();
+        f.superblock_height = is_superblock_height(p.height, m_opt.superblock_cycle, m_opt.superblock_start);
+        if (!f.on_active_chain || f.superblock_height) return f;   // the verdict needs no slice
+        std::uint64_t total = 0;
+        try {
+            const nlohmann::json raw = m_rpc->getblock(uint256S(bid), /*verbosity=*/0);
+            if (!raw.is_string()) { f.note = "getblock <bid> 0 answered no hex"; return f; }
+            const CoinbaseOutputs cb = parse_coinbase_outputs_hex(raw.get<std::string>());
+            if (!cb.ok) { f.note = "mined coinbase unparseable: " + cb.error; return f; }
+            total = cb.total;
+        } catch (const std::exception& e) {
+            note_transport_fail("getblock", e.what());
+            f.note = std::string("getblock failed: ") + e.what();
+            return f;
+        }
+        std::uint64_t mn = 0;
+        try {
+            const nlohmann::json mp = m_rpc->masternode_payments(uint256S(bid));
+            if (!mp.is_array() || mp.empty() || !mp[0].is_object() ||
+                mp[0].value("blockhash", std::string()) != bid || !mp[0].contains("amount")) {
+                f.note = "masternode payments <bid> answered no entry for this block";
+                return f;
+            }
+            const long long a = mp[0]["amount"].get<long long>();
+            if (a < 0) { f.note = "masternode payments amount < 0"; return f; }
+            mn = static_cast<std::uint64_t>(a);
+        } catch (const std::exception& e) {
+            note_transport_fail("masternode payments", e.what());
+            f.note = std::string("masternode payments failed: ") + e.what();
+            return f;
+        }
+        f.miner_slice = miner_slice_of(total, mn);
+        if (!f.miner_slice) f.note = "masternode payments exceed the coinbase outputs";
+        return f;
+    }
+
+    // The same, with a BOUNDED wait while dashd does not (yet) have the block:
+    // a peer's descriptor can outrun the block's propagation to OUR dashd.
+    // Missing/Unknown are retried until `patience`, then returned as they are.
+    MinedBlockFacts mined_block_facts_wait(const std::string& bid,
+                                           std::chrono::milliseconds patience,
+                                           std::chrono::milliseconds step = std::chrono::milliseconds(250)) {
+        const auto deadline = std::chrono::steady_clock::now() + patience;
+        for (;;) {
+            MinedBlockFacts f = mined_block_facts(bid);
+            if (f.state == MinedBlockFacts::State::Have) return f;
+            if (std::chrono::steady_clock::now() >= deadline) return f;
+            std::this_thread::sleep_for(step);
+        }
+    }
+
+    // Boot cross-check of the pinned superblock schedule against dashd.
+    // Returns the daemon's cycle (0 when it could not be asked).
+    std::uint64_t daemon_superblock_cycle() noexcept {
+        try {
+            const nlohmann::json g = m_rpc->getgovernanceinfo();
+            if (g.is_object() && g.contains("superblockcycle"))
+                return g["superblockcycle"].get<std::uint64_t>();
+        } catch (const std::exception& e) {
+            note_transport_fail("getgovernanceinfo", e.what());
+        }
+        return 0;
+    }
+    std::uint64_t superblock_cycle() const { return m_opt.superblock_cycle; }
+    std::uint64_t superblock_start() const { return m_opt.superblock_start; }
 
     // ── (4) submit ───────────────────────────────────────────────────────────
     SubmitResult submit_block(const std::string& block_hex) override {

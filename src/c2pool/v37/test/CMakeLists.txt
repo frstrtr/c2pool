@@ -678,6 +678,22 @@ if (BUILD_TESTING)
     target_link_libraries(v37_s1c_convergence_kat Threads::Threads)
     add_test(NAME v37_s1c_convergence_kat COMMAND v37_s1c_convergence_kat)
 
+    # Dash T1-prep step 3 — REWARD VERIFICATION KAT (btc/mined_block_verify.hpp
+    # + XbtcNode mined-reward mode / require_verified_peer_wins). Pins the
+    # coinbase parser on a REAL DASH testnet block (h=1558817: sum(vout) -
+    # masternode payments == the carried reward), the verdict table, and the
+    # three node-level shapes: accept-honest (A == B), reject-forged-reward and
+    # reject-unknown-block (refused, counted, nothing credited), plus the own
+    # fold consuming the MINED value (never the cached template) and the
+    # verification-OFF default staying the pre-step-3 behaviour. Stdlib +
+    # Threads, MockCoinBackend + MemSettleStore. SAME HOLLOW-GREEN GUARD: ALSO
+    # listed on BOTH build.yml --target lists.
+    add_executable(v37_t1_reward_verify_kat v37_t1_reward_verify_kat.cpp)
+    target_compile_features(v37_t1_reward_verify_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_t1_reward_verify_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_t1_reward_verify_kat Threads::Threads)
+    add_test(NAME v37_t1_reward_verify_kat COMMAND v37_t1_reward_verify_kat)
+
     # Track A2 / W4-W6 — the OWED-EVENT MMR: an append-only authenticated record
     # log (src/c2pool/v37/record_log.hpp, instanced by owed_event_log.hpp) built
     # on the SHIPPED ::v37::Lane MMR statics, maintained inside OwedLedger, made
