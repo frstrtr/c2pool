@@ -178,7 +178,12 @@ public:
         {
             RecoveryDriver rec(*m_store, m_cfg.lane_chain);
             bool ok = false;
-            m_recovered = rec.recover(m_ledger, ok);
+            m_boot_digests.clear();
+            m_boot_digests.push_back(m_ledger.owed_digest());   // the empty anchor / anchor-boot state
+            m_recovered = rec.recover(m_ledger, ok, [this](const OwedLedger& l) {
+                const ::v37::bytes32 d = l.owed_digest();
+                if (!(m_boot_digests.back() == d)) m_boot_digests.push_back(d);   // R-B(i) follow-up: canonical D(c) history
+            });
             if (!ok)
                 throw std::runtime_error(
                     "XmrNode: settlement store is torn (F2 fail-closed) — refusing to start");
@@ -290,6 +295,12 @@ public:
     const ::v37::bytes32& seed_digest() const { return m_seed_digest; }
     const std::vector<std::string>& construction_log() const { return m_log; }
     const RecoveredState& recovered() const { return m_recovered; }
+    // R-B(i) follow-up: every distinct owed_digest state the replayed store passed
+    // through, oldest first (ends at the live digest). Seeds the RECON candidate ring
+    // so a RESUMED node matches peer roots against its full canonical history (the
+    // fix for a resumed node starting with a 1-entry ring -> first peer block
+    // root-unknown forever).
+    const std::vector<::v37::bytes32>& boot_digest_history() const { return m_boot_digests; }
 
     // R6 (two-sided chain-ordered booking): re-run the F1 finalize walk against
     // the CURRENT persisted high-water without a new chain event. FinalizeConnect
@@ -370,6 +381,7 @@ private:
     OwedLedger                             m_ledger;
     SettleHW                               m_hw;
     RecoveredState                         m_recovered;
+    std::vector<::v37::bytes32>            m_boot_digests;   // R-B(i) follow-up: canonical owed_digest history from boot replay
 
     V37Engine                              m_engine;
     ::v37::bytes32                         m_seed_digest{};

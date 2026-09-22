@@ -696,6 +696,16 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(fs.diverged),
                             static_cast<unsigned long long>(fs.divergence_alarms),
                             static_cast<unsigned long long>(fs.divergence_dropped));
+                // R-C majority-shaped halt: refused-not-credited (must be 0 in a
+                // converged run), the longest consecutive refused run, and whether a
+                // decided majority-shaped divergence tripped. lane_suspended reflects
+                // the stratum withdraw (defect 4) / builder lag-gate (defect 3b).
+                std::printf("  r-c: refused_not_credited=%llu refuse_run_max=%llu majority_diverged=%llu | lane_suspended=%s (job %s)\n",
+                            static_cast<unsigned long long>(fs.refused_not_credited),
+                            static_cast<unsigned long long>(fs.refuse_run_max),
+                            static_cast<unsigned long long>(fs.majority_diverged),
+                            listener.lane_suspended() ? "YES" : "no",
+                            listener.lane_suspended() ? "WITHDRAWN, shares refused" : "served");
             }
             for (const std::uint64_t h : contested) {
                 const auto* cs = fc.race().candidates_at(h);
@@ -741,6 +751,16 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
 
     auto last_status = std::chrono::steady_clock::now();
     std::string last_template_err;
+    // R-C (defects 3b + 4): the lane-suspend state. A node must NOT produce a lane
+    // template / commit a lane_commitment while its OWN finalize cursor lags its tip
+    // beyond a safe window (else it emits a stale-root block peers must refuse), and
+    // it must WITHDRAW the stratum job + refuse shares once the ledger has DIVERGED
+    // (terminal). The lag-gate clears when the cursor catches up; divergence does not.
+    // Safe window = 2 * D_conf (matches the divergence-cap slack): normal finalize lag
+    // is ~D_conf, and booking defers up to 1 + D_conf, so 2*D_conf never trips in a
+    // converged run but bounds a builder that has fallen genuinely behind.
+    const std::uint64_t kLaneLagWindow = 2 * cfg.d_conf;
+    bool lane_suspend_prev = false;
     while (!g_stop.load()) {
         pump_miner();       // --mine: hits first, so a find is bridged the same pass
         if (hooks.inject_pump) hooks.inject_pump();  // --native-inject-dir scan
@@ -757,7 +777,36 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             node.adapter().ensure_seed_reach();
         }
         if (serving) {
-            const bool refreshed = provider.refresh();
+            // R-C builder lag-gate + withdraw-on-diverged. tip = the high-water the
+            // node has observed; cursor = the finalize cursor. If the cursor lags the
+            // tip beyond the safe window we must not build (a stale-root block), and
+            // if the ledger has DIVERGED we suspend for good.
+            const std::uint64_t tip    = node.hw().hw_height;
+            const std::uint64_t cursor = node.finalize_driver().cursor_height();
+            const std::uint64_t lane_lag = tip > cursor ? tip - cursor : 0;
+            const bool diverged     = fc.diverged();
+            const bool lag_suspend  = lane_lag > kLaneLagWindow;
+            const bool lane_suspend = diverged || lag_suspend;
+            listener.set_lane_suspended(lane_suspend);   // defect 4: withdraw job + refuse shares
+            if (lane_suspend && !lane_suspend_prev) {
+                std::printf("cba-ALARM: lane template production SUSPENDED + stratum job WITHDRAWN -- %s "
+                            "(tip=%llu cursor=%llu lag=%llu window=%llu). The node stays alive (chain follow, "
+                            "settlement observe, peer relay); it will not emit a block committing a stale/diverged "
+                            "owed_digest root, nor accept a share for the withdrawn job.%s\n",
+                            diverged ? "settlement ledger DIVERGED (terminal)" : "builder finalize cursor lags its tip beyond the safe window",
+                            static_cast<unsigned long long>(tip), static_cast<unsigned long long>(cursor),
+                            static_cast<unsigned long long>(lane_lag), static_cast<unsigned long long>(kLaneLagWindow),
+                            diverged ? " Recovery: W6 resync from a converged peer, then restart." : " Auto-resumes when the cursor catches up.");
+                std::fflush(stdout);
+            } else if (!lane_suspend && lane_suspend_prev) {
+                std::printf("cba: lane template production RESUMED -- builder cursor caught up (tip=%llu cursor=%llu lag=%llu <= window=%llu)\n",
+                            static_cast<unsigned long long>(tip), static_cast<unsigned long long>(cursor),
+                            static_cast<unsigned long long>(lane_lag), static_cast<unsigned long long>(kLaneLagWindow));
+                std::fflush(stdout);
+            }
+            lane_suspend_prev = lane_suspend;
+
+            const bool refreshed = lane_suspend ? false : provider.refresh();
             bool new_template = false;
             if (refreshed) {
                 const std::uint32_t tid = provider.template_id();
@@ -773,7 +822,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                                 hex_of(t.prev_id).substr(0, 12).c_str(),
                                 static_cast<unsigned long long>(snap_reward(t)));
                 }
-            } else {
+            } else if (!lane_suspend) {
                 const std::string e = provider.last_error();
                 if (e != last_template_err) {
                     std::printf("template: refresh failed: %s\n", e.c_str());
@@ -1042,6 +1091,16 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::fflush(stdout);
         }
     };
+    // R-B(i) follow-up: seed the ring from the boot replay so a RESUMED node holds its
+    // FULL canonical history (post R-A every state is D(c)); without this a restart
+    // left a 1-entry ring, and any peer root >= 1 cursor behind could never match while
+    // the R4 gate (held by that very block) kept the ring from growing -> permanent hold.
+    // decode_blob (below) already matches against the WHOLE ring, so a stale-but-canonical
+    // root every converged peer also passed through matches here (defect 2: a K-window
+    // turned an honest stale root into a network-wide halt).
+    for (const auto& d : node.boot_digest_history()) { cba_ring.push_back(d); if (cba_ring.size() > 4096) cba_ring.pop_front(); }
+    std::printf("cba-ring: seeded %zu canonical owed_digest state(s) from the boot replay\n", cba_ring.size());
+    const bool cba_ring_seeded = node.recovered().recovered && node.boot_digest_history().size() > 1;
     // recon(A+B credit) state ──────────────────────────────────────────────────────────
     std::vector<::v37::ScriptRef> feed_refs;   // XMR_STD refs of the seeded owed keys (the receipt descriptors)
     std::uint64_t feed_off = 0, feed_pushed = 0, feed_rejected = 0;
@@ -1167,9 +1226,41 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!bk.ok) {
             why = bk.why;
             if (why.rfind("lane-root-unknown:", 0) == 0) {   // R5: NOT not-lane; FinalizeConnect keeps + retries it as the ring advances
+                // R-C decidability. The R6 deferral gate guarantees our cursor >=
+                // H_b-1-D_conf (the builder's cut) at book time. If we are SYNCED to
+                // that cut and our FULL canonical history ring (seeded from the boot
+                // replay, matched whole in decode_blob) STILL holds no digest whose
+                // mm_root equals the block's on-chain 0x03 root, this is NOT catch-up
+                // lag -- the block was built on a ledger state this node never passed
+                // through. Reclassify to "lane-root-refused:<roothex>:" so
+                // FinalizeConnect REFUSES-not-credits it (loud alarm, gate released,
+                // NOT a halt) and feeds the majority-shaped divergence run. A single
+                // such block never halts; only M consecutive from >= 2 distinct roots
+                // (the "distinct payees" proxy -- payout identity is undecodable under
+                // an unknown root) is a decided divergence. During boot warm-up the
+                // ring is short and un-seeded: stay transient (lane-root-unknown).
+                static constexpr std::size_t kReconWarmupK = 4;   // R-C: warm-up depth below which an unseeded ring is not yet decidable
+                const std::uint64_t bcut = (h >= 1 + cfg.d_conf) ? h - 1 - cfg.d_conf : 0;
+                const std::uint64_t cur  = node.finalize_driver().cursor_height();
+                const bool decidable = (cur >= bcut) && (cba_ring_seeded || cba_ring.size() > kReconWarmupK);
+                if (decidable && bk.has_onchain_root) {
+                    static const char* hx = "0123456789abcdef";
+                    std::string roothex; roothex.reserve(64);
+                    const unsigned char* rp = reinterpret_cast<const unsigned char*>(bk.onchain_root.data());
+                    for (std::size_t i = 0; i < 32; ++i) { roothex.push_back(hx[rp[i] >> 4]); roothex.push_back(hx[rp[i] & 15]); }
+                    why = "lane-root-refused:" + roothex + ":" + why.substr(std::string("lane-root-unknown:").size());
+                    if (cba_root_unknown_seen.insert(bid).second) {
+                        ++cba_lane_root_unknown;
+                        std::printf("cba-ALARM lane_root_refused: h=%llu bid=%s SYNCED (cursor=%llu >= builder cut=%llu) but the on-chain 03 root %s matches NO digest in our %zu-state canonical history -- REFUSED (not credited), majority-shaped run fed (never a single-block halt)\n",
+                                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(),
+                                    static_cast<unsigned long long>(cur), static_cast<unsigned long long>(bcut),
+                                    roothex.substr(0, 12).c_str(), cba_ring.size());
+                    }
+                    return false;
+                }
                 if (cba_root_unknown_seen.insert(bid).second) {
                     ++cba_lane_root_unknown;
-                    std::printf("cba-ALARM lane_root_unknown: h=%llu bid=%s carries a 03 21 00 tag whose root is UNKNOWN to this ledger yet (%s) -- kept, retried per ledger event\n",
+                    std::printf("cba-ALARM lane_root_unknown: h=%llu bid=%s carries a 03 21 00 tag whose root is UNKNOWN to this ledger yet (%s) -- kept, retried per ledger event (not yet synced/warmed: transient)\n",
                                 static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), why.c_str());
                 }
                 return false;
