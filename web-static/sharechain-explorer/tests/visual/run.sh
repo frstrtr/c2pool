@@ -5,7 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PORT="${PORT:-18082}"
+# 0 = OS-assigned ephemeral port (read back after bind) so concurrent
+# runs on the same self-hosted host never collide on a fixed port.
+PORT="${PORT:-0}"
 THRESHOLD="${THRESHOLD:-0.025}"
 # Bounded health-poll budget before puppeteer is allowed to navigate.
 # The mock server can bind slowly on a CPU-starved self-hosted runner
@@ -14,17 +16,39 @@ THRESHOLD="${THRESHOLD:-0.025}"
 # flake wrongly surfaced as a page/pixel assertion failure. 60s covers
 # cold-start jitter without masking a genuinely-hung server.
 READY_TIMEOUT="${READY_TIMEOUT:-60}"
-HEALTH_URL="http://127.0.0.1:${PORT}/sharechain/tip"
 
 mkdir -p out
 
 echo "[1/4] generating fixtures"
 node fixtures/generate.mjs
 
-echo "[2/4] starting mock server on :$PORT"
-node mock-server.mjs "$PORT" >out/mock-server.log 2>&1 &
+echo "[2/4] starting mock server (requested port :$PORT; 0 = ephemeral)"
+PORTFILE="out/mock.port"
+rm -f "$PORTFILE"
+node mock-server.mjs "$PORT" "$PORTFILE" >out/mock-server.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+
+# The server publishes its OS-assigned port to $PORTFILE once bound.
+# Wait (bounded) for that readback before deriving the health URL, so
+# nothing downstream assumes a fixed port.
+for _ in $(seq 1 120); do
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "::error::INFRA (not a page regression): mock server pid $SERVER_PID exited before publishing its bound port" >&2
+    tail -n 40 out/mock-server.log >&2 || true
+    exit 3
+  fi
+  [ -s "$PORTFILE" ] && break
+  sleep 0.25
+done
+if [ ! -s "$PORTFILE" ]; then
+  echo "::error::INFRA (not a page regression): mock server never published a bound port to $PORTFILE" >&2
+  tail -n 40 out/mock-server.log >&2 || true
+  exit 3
+fi
+BOUND_PORT="$(cat "$PORTFILE")"
+HEALTH_URL="http://127.0.0.1:${BOUND_PORT}/sharechain/tip"
+echo "mock server bound on ephemeral port :$BOUND_PORT"
 
 # Health-poll until the server answers, bounded by READY_TIMEOUT, and
 # GATE the navigate on the result. If the port never comes up we fail
@@ -55,7 +79,7 @@ if [ "$ready" -ne 1 ]; then
 fi
 
 echo "[3/4] capturing screenshots"
-node capture.mjs "$PORT"
+node capture.mjs "$BOUND_PORT"
 
 echo "[4/4] diffing"
 node diff.mjs "$THRESHOLD"
