@@ -99,6 +99,16 @@
 
 namespace c2pool::xmr::assembly {
 
+// R1 (operator-approved 2026-09-21): the on-chain credit cut rides as a
+// constant-size TAIL of the coinbase 0x02 extra-nonce payload, after the
+// per-worker nonce + weight padding. The byte format lives in the consumer
+// tree at c2pool/v37/xmr/xmr_credit_cut.hpp (credit::kTailBytes == 44); this
+// impl-tree constant mirrors it so the parse bound is named, not a literal.
+// A static_assert(CREDIT_CUT_TAIL_BYTES == credit::kTailBytes) lives in the
+// consumer-tree KAT v37_xmr_credit_cut_kat (which may include both headers;
+// the impl tree must not include the consumer tree).
+inline constexpr std::size_t CREDIT_CUT_TAIL_BYTES = 44;  // 4 magic + 8 u64 P + 32 spine
+
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
 using ::v37::xmr::settle::CoinbaseInputs;
@@ -294,8 +304,13 @@ public:
     [[nodiscard]] const BuiltCoinbase& built() const { return m_cb; }
     [[nodiscard]] std::uint64_t subsidy() const { return m_subsidy; }
 
+    // recon(A+B credit): the on-chain credit cut tail the template appends to the 0x02 payload.
+    void set_extra_nonce_tail(std::vector<std::uint8_t> t) { m_tail = std::move(t); }
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override { return m_tail; }
+
 private:
     X6SettlementSource() = default;
+    std::vector<std::uint8_t> m_tail;   // recon(A+B credit)
 
     void fill_amounts(std::vector<std::uint64_t>& rewards) const {
         rewards.resize(m_cb.outputs.size());
@@ -506,6 +521,9 @@ struct AssemblyInputs {
     // pops from the fee-rate TAIL and never the first entry, so a non-empty
     // selection always yields a non-empty block (good-citizen invariant D).
     bool                          take_mempool_as_given = false;
+    // recon(A+B credit): bytes appended to the 0x02 payload after the padded worker
+    // nonce (the on-chain credit cut). Empty => byte-identical templates.
+    std::vector<std::uint8_t>     extra_nonce_tail;
 };
 
 class XmrBlockAssembler {
@@ -589,6 +607,7 @@ public:
 
             std::unique_ptr<X6SettlementSource> seam = X6SettlementSource::build(in, subsidy, &sub);
             if (!seam) return fail("pass " + std::to_string(pass) + ": " + sub);
+            seam->set_extra_nonce_tail(a.extra_nonce_tail);   // recon(A+B credit)
 
             std::unique_ptr<XmrBlockTemplate> tpl(new XmrBlockTemplate(seam.get()));
             seam->begin_update();
@@ -660,7 +679,7 @@ private:
             return false;
         }
         rec.m_extra_nonce_size = full[eo - 1];
-        if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE || rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE) {
+        if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE || rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }

@@ -135,6 +135,8 @@ public:
     // happened to share a name.
     using ChainObserverFn = std::function<void(std::uint64_t height, const std::string& bid_hex)>;
     void set_chain_observer(ChainObserverFn fn) { m_chain_observer = std::move(fn); }
+    //  fed ONLY for Extend/Reorg (a block joined the best chain), never for Orphan.
+    void set_chain_extend_observer(ChainObserverFn fn) { m_cba_extend_observer = std::move(fn); }
 
     // The canonical test the F1 finalize driver runs at maturity, exposed so the
     // accounting layer asks the SAME question of the SAME chain. A tiebreak that
@@ -289,6 +291,25 @@ public:
     const std::vector<std::string>& construction_log() const { return m_log; }
     const RecoveredState& recovered() const { return m_recovered; }
 
+    // R6 (two-sided chain-ordered booking): re-run the F1 finalize walk against
+    // the CURRENT persisted high-water without a new chain event. FinalizeConnect
+    // calls this after it has booked a DEFERRED lane block (one that arrived at a
+    // height above cursor + 1 + D_conf and was held back until the cursor reached
+    // it), so the cursor can step onto the next height in the same tick instead
+    // of waiting for the next Extend. Same per-height bin_height, same in-order
+    // stepping, same booking gate: advance_to_tip is idempotent at an unchanged
+    // high-water (O5.5 admits an equal height; the walk resumes at cursor + 1).
+    std::vector<FinalizeStep> readvance_settlement() {
+        std::vector<FinalizeStep> steps;
+        if (!m_finalize || m_hw.hw_height == 0) return steps;
+        steps = m_finalize->advance_to_tip(m_hw.hw_height, m_hw.hw_tip);
+        for (const auto& s : steps)
+            log("finalize: block " + s.bid.substr(0, 12) + "… (mined h=" +
+                std::to_string(s.coin_height) + ") SETTLED at bin_height=" +
+                std::to_string(s.bin_height) + " (re-advance after deferred booking)");
+        return steps;
+    }
+
 private:
     // Install the ed25519 point-check backend (which is ALSO what makes the P-1
     // XMR descriptor validator live: xmr_ref_valid() fails closed with no
@@ -311,6 +332,8 @@ private:
         // c2pool#1551: announce the block BEFORE settlement moves on it, so a
         // rival that arrives in the same event is already in the race book when
         // the finalize driver reaches the height.
+        if (m_cba_extend_observer && ev.kind != K::Orphan)
+            m_cba_extend_observer(ev.block.height, hex_of(ev.block.id));   //  book BEFORE the race book + BEFORE advance
         if (m_chain_observer) {
             if (ev.kind == K::Orphan) m_chain_observer(ev.block.height, hex_of(ev.orphaned_id));
             else                      m_chain_observer(ev.block.height, hex_of(ev.block.id));
@@ -361,6 +384,7 @@ private:
 
     // c2pool#1551: installed by the accounting layer (FinalizeConnect).
     ChainObserverFn                        m_chain_observer;
+    ChainObserverFn                        m_cba_extend_observer;   // 
 
     std::vector<std::string>               m_log;
     bool                                   m_up = false;

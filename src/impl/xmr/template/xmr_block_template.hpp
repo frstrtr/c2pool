@@ -170,6 +170,12 @@ public:
     // Foundation: a 1-leaf tree (encodes n_chains=1). A later leg widens this
     // to re-admit Tari-style aux mining without touching the builder.
     [[nodiscard]] virtual uint64_t merkle_tree_data() const = 0;
+
+    // recon(A+B credit): bytes appended to the 0x02 extra-nonce payload AFTER the
+    // per-worker nonce + weight padding (the ON-CHAIN CREDIT CUT, see
+    // c2pool/v37/xmr/xmr_credit_cut.hpp). Default empty => the template bytes
+    // are byte-identical for every implementer that does not override.
+    [[nodiscard]] virtual std::vector<uint8_t> extra_nonce_tail() const { return {}; }
 };
 
 // ===========================================================================

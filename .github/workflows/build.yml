@@ -265,6 +265,7 @@ jobs:
                     xmr_native_node_kat xmr_native_node \
                     xmr_native_snapshot_resume_kat \
                     v37_xmr_m2_native_settlement_kat \
+                    v37_xmr_credit_cut_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
                     v37_xmr_daemonless_selfmine_kat \
                     v37_xmr_mainnet_readiness_kat \
@@ -730,6 +731,7 @@ jobs:
                     xmr_native_node_kat xmr_native_node \
                     xmr_native_snapshot_resume_kat \
                     v37_xmr_m2_native_settlement_kat \
+                    v37_xmr_credit_cut_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
                     v37_xmr_daemonless_selfmine_kat \
                     xmr_msr_boost_kat \
@@ -1208,8 +1210,44 @@ jobs:
           # (Node 20 requires the shell to pre-expand the quoted glob,
           # which fails on CI's bash + JSON-quoted package.json script).
           node-version: '22'
-          cache: npm
-          cache-dependency-path: web-static/sharechain-explorer/package-lock.json
+          # setup-node's built-in `cache: npm` is deliberately NOT used. It runs
+          # @actions/glob over cache-dependency-path, which canonicalizes the
+          # lockfile to this runner's _work realpath
+          # (/mnt/ci/runners/heavy-1/...) and then rejects it as "not under
+          # GITHUB_WORKSPACE" because GITHUB_WORKSPACE is the un-canonicalized
+          # symlink path (/home/user0/actions-runner-heavy-1/_work/...). The file
+          # IS present (guard above passes); the realpath-vs-symlink prefix
+          # compare is what fails (run 35620528834; H-A path-root mismatch). A
+          # `run:` step follows the symlink transparently, so we cache npm
+          # explicitly below with a shell-hashed key — immune on every runner.
+          # (Durable infra fix: re-point the runner workDir to its realpath so no
+          # symlink exists; operator-owned, tracked separately.)
+
+      - name: Compute npm cache key (symlink-safe; no @actions/glob)
+        working-directory: ${{ github.workspace }}
+        id: npmcache
+        run: |
+          lock="web-static/sharechain-explorer/package-lock.json"
+          # Regression guard (standing rule: assertion ships in the fixing PR).
+          # Hash the lockfile via the shell — exactly the path setup-node's
+          # @actions/glob choked on. If a future runner reintroduces a
+          # workspace-root mismatch this step still succeeds (shell follows the
+          # symlink), proving the fix is topology-independent; a genuinely
+          # absent/moved lockfile fails loudly here instead of as an opaque red.
+          if [ ! -f "$lock" ]; then
+            echo "::error title=cache-dependency-path unresolved::${lock} absent on disk. Fix the path or the checkout, NOT the cache step." >&2
+            exit 1
+          fi
+          h="$(sha256sum "$lock" | cut -d' ' -f1)"
+          echo "key=npm-web-static-${h}" >> "$GITHUB_OUTPUT"
+          echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+          echo "npm cache key npm-web-static-${h}; lockfile hashed via shell (symlink-safe)"
+
+      - uses: actions/cache@v5
+        with:
+          path: ${{ steps.npmcache.outputs.dir }}
+          key: ${{ steps.npmcache.outputs.key }}
+          restore-keys: npm-web-static-
 
       - name: Install dependencies
         run: npm ci

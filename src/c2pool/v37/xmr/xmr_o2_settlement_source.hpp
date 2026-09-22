@@ -107,6 +107,7 @@
 #include <sharechain/v37/v37_descriptor.hpp>        // ScriptRef, ScriptKind (read-only canon)
 #include <sharechain/v37/v37_descriptor_xmr.hpp>    // xmr_ref_valid, is_xmr_kind, xmr_precarrot_ok
 #include <sharechain/v37/v37_hash.hpp>              // bytes32
+#include <c2pool/v37/xmr/xmr_credit_cut.hpp>         // recon(A+B credit): the on-chain credit cut tail
 
 #include "impl/xmr/coin/xmr_crypto_types.hpp"       // Bytes32, PublicKey, SecretKey, Hash256
 #include "impl/xmr/settle/xmr_coinbase.hpp"         // X6: CoinbaseInputs, build_coinbase, allocate_exact_sum, ...
@@ -193,6 +194,11 @@ struct XmrCoinbaseContext {
     std::vector<x6::FixedOutput> fixed;               // mandated dev/donation/finder outputs (optional)
     std::uint64_t         h_min = 0;                  // piconero floor per owed output (dust = 0 on XMR)
     std::uint32_t         output_cap = 0;             // TOTAL outputs cap C (weight_aware_output_cap(...))
+
+    // recon(A+B credit): the ON-CHAIN CREDIT CUT — the lane prefix P (+ its digest) the
+    // winner folds E_b at. Carried as the 0x02 tail (xmr_credit_cut.hpp).
+    bool                  has_credit_cut = false;
+    credit::CreditCut     credit_cut;
 
     std::uint64_t budget() const { return base_reward + fees; }
 };
@@ -405,6 +411,11 @@ public:
     // depth 0 => the template emits [0x03][1+32][varint(0)][root], byte-equal
     // to X6 assemble_tx_extra's { varint(33) || 0x00 || root }.
     [[nodiscard]] std::uint64_t merkle_tree_data() const override { return 0; }
+
+    // recon(A+B credit): the credit cut as the 0x02 tail (empty when the ctx has none).
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
+        return m_ctx.has_credit_cut ? credit::encode_tail(m_ctx.credit_cut) : std::vector<std::uint8_t>{};
+    }
 
     // =====================================================================
     // Value accessors (provider ring / FOUND record / KATs / ACCEPT check)
