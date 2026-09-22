@@ -383,6 +383,9 @@ if (BUILD_TESTING AND GTest_FOUND)
     # solo_payouts_test.cpp: --solo pays each miner to its login's own script
     # (P2SH, P2WPKH, P2WSH, P2TR; never P2PKH of a script hash, never the zero
     # key) and the outputs add up to the subsidy. Same folding rule.
+    # fill_budget_kat_test.cpp: G2 fill-budget token bucket (underfill ramp, port
+    # of p2pool-merged-v36 fillbudget.py) -- grant() is a pure read, settle() the
+    # one debit, floor = legacy 50 kB in every state. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -418,6 +421,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_utxo_lane_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
+        fill_budget_kat_test.cpp
         found_block_peer_txid_test.cpp
         found_block_verify_test.cpp
         head_retention_test.cpp
