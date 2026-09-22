@@ -102,6 +102,36 @@
 //        catches the throw and main retries after the submit, so nothing is lost;
 //        the one-liner `gate.canonical = false` at win time removes the spin.
 //
+// ★ T1-PREP (Dash pilot, steps 1-3 + the round-523 fix) ---------------------------
+//   1  POOL IDENTITY FAILS CLOSED. --pool-payout-address ADDR is REQUIRED and
+//      must decode, under the SAME acceptance set the stratum payout door uses
+//      (dash::address_acceptance), to a P2PKH/P2SH script of THIS network. It
+//      replaces the fixed 0xB0… placeholder that used to stand in as the
+//      block-win-without-identity fallback. Missing / foreign / malformed ->
+//      exit 2 before dashd is dialed.
+//   2  --settlement off|on, default OFF. OFF is the only mode this build runs:
+//      the W5 emission stays withheld exactly as before (assemble_if_buried at
+//      depth 0; payout_emitted=0 on the wire), so OFF is byte-identical to the
+//      pre-flag binary on the wire, in the ledger and in the coinbase. ON is
+//      REFUSED (exit 2): peers refuse any payout_emitted=1 descriptor
+//      (btc_node.hpp (b)), so emission needs the v0x03 payout-set wire first
+//      (docs/dash-pilot/05-arming-finality-and-v0x03.md). POOL-ID SEAM: there
+//      is deliberately NO pool/consensus-id flag here — that belongs to the
+//      roundabout S1 lane_tag track (LaneParams / W3_WIRE_VERSION); see
+//      btc_node_config.hpp `settlement_armed`.
+//   3  THE REWARD IS VERIFIED AT FOLD TIME. Own win: the fold consumes the
+//      miner slice of the coinbase THIS node mined (parsed from the block bytes
+//      submit_fn is handed; masternode/burn total from the template at the same
+//      (height, parent)), never the cached GBT miner_value. Peer win: before
+//      the fold, dashd must have the block on the best chain at the carried
+//      H_b, and the carried reward must equal sum(coinbase vout) - masternode
+//      payments(bid) (mined_block_verify.hpp). Anything else is REFUSED and
+//      counted on the stop line (s1v{…}); never silently credited.
+//   R523 dashd RPC is connected SYNCHRONOUSLY (NodeRPC::connect_sync) before
+//      wait_ready(): the async connect() raced the main thread's first Send()
+//      on the same socket (SIGSEGV in epoll_reactor::register_descriptor,
+//      soak round 523; the degraded shape was a closed live socket at boot).
+//
 // EXIT CODES: 2 usage · 3 mainnet fence · 4 creds unresolved · 5 dashd not
 // ready / chain or genesis fence at start · 6 store refused (torn image, F2) or
 // open() refused · 7 start() · 8 stratum bind · 9 FATAL chain mismatch while running
@@ -141,6 +171,7 @@
 #include <boost/asio.hpp>
 #include <util/strencodings.h>                        // HexStr (btclibs; the same include rpc.cpp uses)
 
+#include <core/address_utils.hpp>                   // core::address_to_script_for_coin (T1-prep step 1)
 #include <core/log.hpp>
 #include <core/netaddress.hpp>                        // NetService
 #include <core/stratum_server.hpp>                    // core::StratumServer
@@ -208,7 +239,13 @@ static void usage() {
         "                                     peers' carriers account\n"
         "  --carrier-index-horizon N          live index: reject carriers keyed further than N blocks behind the tip (default 64)\n"
         "  --carrier-index-patience-ms N      live index: bounded retry budget while dashd answers Unknown (default 2000)\n"
-        "  --i-understand-mainnet             loud mainnet opt-in (HARD SAFETY 4)\n");
+        "  --i-understand-mainnet             loud mainnet opt-in (HARD SAFETY 4)\n"
+        "  --pool-payout-address ADDR         REQUIRED: the pool's own payout address on THIS network (P2PKH/P2SH;\n"
+        "                                     testnet/regtest y…/8…, mainnet X…/7…). Refused when missing or foreign\n"
+        "  --settlement off|on                W5 payout emission gate (default off). off = ledger-only, byte-identical\n"
+        "                                     to the pre-flag build; on is REFUSED until the v0x03 payout-set wire lands\n"
+        "  --verify-patience-ms N             peer block-winner verification: how long to wait for OUR dashd to learn a\n"
+        "                                     peer's block before refusing it as unknown (default 5000)\n");
 }
 
 int main(int argc, char** argv) {
@@ -228,6 +265,9 @@ int main(int argc, char** argv) {
     long          carrier_index_patience_ms = 2000;     // A2 step-b: LiveMainchainIndex::Options::unknown_patience
     int  poll_ms = 500;
     long oracle_patience_ms = 30000;
+    std::string pool_payout_address;                    // T1-prep step 1: REQUIRED
+    std::string settlement_mode = "off";                // T1-prep step 2: off (default) | on (refused)
+    long verify_patience_ms = 5000;                     // T1-prep step 3: peer-block wait on OUR dashd
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         auto next = [&](std::string& out) { if (i + 1 < argc) out = argv[++i]; };
@@ -252,8 +292,12 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--poll-ms") && i + 1 < argc)             poll_ms = std::atoi(argv[++i]);
         else if (!std::strcmp(a, "--oracle-patience-ms") && i + 1 < argc)  oracle_patience_ms = std::atol(argv[++i]);
         else if (!std::strcmp(a, "--i-understand-mainnet"))                cfg.i_understand_mainnet = true;
+        else if (!std::strcmp(a, "--pool-payout-address") && i + 1 < argc) pool_payout_address = argv[++i];
+        else if (!std::strcmp(a, "--settlement") && i + 1 < argc)          settlement_mode = argv[++i];
+        else if (!std::strcmp(a, "--verify-patience-ms") && i + 1 < argc)  verify_patience_ms = std::atol(argv[++i]);
         else { usage(); return 2; }
     }
+    if (verify_patience_ms < 0) { usage(); return 2; }
     if (cfg.d_conf == 0 || poll_ms <= 0 || oracle_patience_ms < 0 || carrier_index_patience_ms < 0) { usage(); return 2; }
     // Per-network RPC default when --daemon-rpc was not given. Dash Core
     // testnet rpc is 19998, regtest 19898 (v23.1.7 src/chainparamsbase.cpp:
@@ -265,6 +309,48 @@ int main(int argc, char** argv) {
     if (cfg.network == BtcNetwork::Mainnet && !cfg.i_understand_mainnet) {
         std::fprintf(stderr, "REFUSED: mainnet without --i-understand-mainnet (HARD SAFETY 4)\n");
         return 3;   // XbtcNode::open() would refuse too (btc_node.hpp:105); refuse BEFORE dialing dashd
+    }
+
+    // ── ★ T1-prep step 2: the settlement gate (default OFF) ──────────────────
+    if (settlement_mode == "off") {
+        cfg.settlement_armed = false;
+    } else if (settlement_mode == "on") {
+        std::fprintf(stderr,
+            "REFUSED: --settlement on is not available in this build. Peers refuse any block-winner\n"
+            "descriptor with payout_emitted=1 (its payout set is not on the v0x02 wire), so emitting\n"
+            "W5 payouts now would fork every peer's owed ledger. Needs the v0x03 payout-set wire +\n"
+            "residual rule + arming-finality rulings (docs/dash-pilot/04-*, 05-*).\n");
+        return 2;
+    } else {
+        std::fprintf(stderr, "REFUSED: --settlement must be 'off' or 'on' (got '%s')\n", settlement_mode.c_str());
+        usage();
+        return 2;
+    }
+
+    // ── ★ T1-prep step 1: POOL IDENTITY FAILS CLOSED ─────────────────────────
+    // Decoded under the SAME acceptance set the stratum payout door uses
+    // (#961: DASH regtest reuses the testnet version bytes). A foreign-network,
+    // bech32, or malformed address decodes to an EMPTY script and is refused.
+    ::v37::PayoutDescriptor pool_desc;
+    {
+        if (pool_payout_address.empty()) {
+            std::fprintf(stderr,
+                "REFUSED: --pool-payout-address is required (the pool's own payout identity; there is no\n"
+                "placeholder fallback any more)\n");
+            usage();
+            return 2;
+        }
+        const auto acc = dash::address_acceptance(/*testnet=*/cfg.network != BtcNetwork::Mainnet, /*regtest=*/false);
+        const std::vector<unsigned char> spk = core::address_to_script_for_coin(pool_payout_address, acc);
+        const ::v37::ScriptRef ref = ::v37::canonicalize_script(std::vector<std::uint8_t>(spk.begin(), spk.end()));
+        if (spk.empty() || (ref.kind != ::v37::ScriptKind::P2PKH && ref.kind != ::v37::ScriptKind::P2SH)) {
+            std::fprintf(stderr,
+                "REFUSED: --pool-payout-address '%s' is not a valid P2PKH/P2SH DASH address for --network %s\n",
+                pool_payout_address.c_str(),
+                cfg.network == BtcNetwork::Mainnet ? "mainnet" : "testnet/devnet/regtest");
+            return 2;
+        }
+        pool_desc.pay = ref;
     }
 
     // ── dashd creds: NEVER on argv (rpc_conf.hpp:9-13) ───────────────────────
@@ -296,7 +382,12 @@ int main(int argc, char** argv) {
     // so a regtest daemon passes. The REAL fence is the backend's (below).
     auto rpc = std::make_shared<dash::coin::NodeRPC>(&ioc, /*coin=*/nullptr,
                                                      /*testnet=*/cfg.network != BtcNetwork::Mainnet);
-    rpc->connect(NetService(conf.host, conf.port), conf.userpass());
+    // ★ R523: SYNCHRONOUS first connect. The async connect() raced wait_ready()'s
+    // first Send() on the same socket (see NodeRPC::connect_sync). A failed
+    // connect here is not fatal: wait_ready() below retries through Send()'s
+    // bounded sync_reconnect and refuses (exit 5) after 30 s.
+    if (!rpc->connect_sync(NetService(conf.host, conf.port), conf.userpass()))
+        LOG_WARNING << "[v37-dash] dashd first connect failed — wait_ready() keeps retrying";
 
     DashRpcCoinBackend::Options bopt;
     // Dash Core reports NetworkIDString "test" for -testnet (v23.1.7
@@ -308,8 +399,29 @@ int main(int argc, char** argv) {
     bopt.expect_genesis  = (cfg.network == BtcNetwork::Regtest)  ? kDashRegtestGenesisHex
                          : (cfg.network == BtcNetwork::Testnet4) ? kDashTestnetGenesisHex : "";
     bopt.oracle_patience = std::chrono::milliseconds(oracle_patience_ms);
+    // ★ T1-prep step 3: the superblock schedule (Dash Core v23 chainparams
+    // nSuperblockCycle / nSuperblockStartBlock), cross-checked against
+    // getgovernanceinfo.superblockcycle below.
+    switch (cfg.network) {
+        case BtcNetwork::Mainnet:  bopt.superblock_cycle = 16616; bopt.superblock_start = 614820; break;
+        case BtcNetwork::Testnet4: bopt.superblock_cycle = 24;    bopt.superblock_start = 4200;   break;
+        case BtcNetwork::Devnet:   bopt.superblock_cycle = 24;    bopt.superblock_start = 4200;   break;
+        default:                   bopt.superblock_cycle = 10;    bopt.superblock_start = 1500;   break;   // regtest
+    }
     auto backend = std::make_shared<DashRpcCoinBackend>(rpc, bopt);
     if (!backend->wait_ready(std::chrono::seconds(30))) { teardown_io(); return 5; }
+    {
+        const std::uint64_t dcyc = backend->daemon_superblock_cycle();
+        if (dcyc != 0 && dcyc != bopt.superblock_cycle) {
+            LOG_ERROR << "[v37-dash] REFUSED: dashd getgovernanceinfo.superblockcycle=" << dcyc
+                      << " != the pinned " << bopt.superblock_cycle << " for this network";
+            teardown_io();
+            return 5;
+        }
+        LOG_INFO << "[v37-dash] superblock schedule: cycle=" << bopt.superblock_cycle
+                 << " start=" << bopt.superblock_start
+                 << (dcyc ? " (matches dashd getgovernanceinfo)" : " (dashd did not answer getgovernanceinfo)");
+    }
     backend->refresh_template();   // warm the cache so block_reward answers at once
 
     // ── the v37 node: store (D12) → open() (F2) → ★ reseed → start() ─────────
@@ -325,6 +437,12 @@ int main(int argc, char** argv) {
     ISettleStore& store_ref = *store;   // the node owns it from here; lifetime == node's
     XbtcNode node(cfg, std::move(store), backend, p2pkh_pay_of());
     if (!node.open()) { std::fprintf(stderr, "open() refused (torn store or mainnet fence)\n"); teardown_io(); return 6; }
+    // ★ T1-prep step 3: fold only MINED rewards, and verify every peer's claim.
+    node.set_mined_reward_mode(true);
+    node.set_require_verified_peer_wins(true);
+    LOG_INFO << "[v37-dash] settlement=" << (cfg.settlement_armed ? "ON" : "OFF")
+             << " (W5 emission withheld; ledger-only) pool_payout=" << pool_payout_address
+             << " reward_source=mined-coinbase peer_verify=on(patience_ms=" << verify_patience_ms << ")";
 
     BlockEventDriver bed(node, store_ref, cfg.lane_chain);
     BlockEventDriver::BootReport boot;
@@ -433,13 +551,8 @@ int main(int argc, char** argv) {
     // the miner's OWN identity (canonicalize_script(payout_script)); a share
     // without one is declined, not credited to the pool. identity ==
     // descriptor.identity_key() (W3-MUST holds on wire).
-    ::v37::PayoutDescriptor pool_desc;
-    {
-        ::v37::ScriptRef r;
-        r.kind = ::v37::ScriptKind::P2PKH;
-        r.payload.assign(20, 0xB0);            // fixed pool-payout placeholder
-        pool_desc.pay = r;
-    }
+    // (pool_desc: the --pool-payout-address identity, decoded + validated at the
+    // top of main — T1-prep step 1; the old fixed 0xB0 placeholder is gone.)
     if (!p2p_bind.empty() || !peers.empty()) {
         // W3-B5 BOOT SELF-CHECK: the byte-KAT body (goldens A/B/C, size model,
         // decode rules, policy pins) runs BEFORE any listen/dial. A build whose
@@ -716,6 +829,13 @@ int main(int argc, char** argv) {
                                 break;
                             std::this_thread::sleep_for(std::chrono::milliseconds(50));
                         }
+                        // ★ T1-prep step 3: ask OUR dashd about the claimed
+                        // block BEFORE the fold (bounded wait: the descriptor
+                        // can outrun the block's propagation to our daemon).
+                        // Fetched here, off the driver lock; XbtcNode refuses
+                        // the fold unless these facts verify the claim.
+                        w.facts = backend->mined_block_facts_wait(
+                            w.bid, std::chrono::milliseconds(verify_patience_ms));
                         const auto reg = bed.on_peer_block_found(w);
                         if (reg.registered) {
                             carrier_inbound.cut_credited.fetch_add(1, std::memory_order_relaxed);
@@ -839,13 +959,30 @@ int main(int argc, char** argv) {
                 if (reg.registered) reg_h = h;
                 else LOG_ERROR << "[v37-dash] register " << bidh << " @" << h << " failed: " << reg.reason;
             };
-            if (hb) try_register(*hb, 0);                                              // FOUND durable BEFORE announce
+            // ★ T1-prep step 3: the reward the own fold consumes = the miner slice
+            // of the coinbase in `b` (the bytes we are about to submit), with the
+            // masternode/burn total from the template at the SAME (height, parent).
+            // Offered for exactly this bid; on_block_won consumes it or, absent,
+            // registers the win VALUELESS (never the cached GBT value).
+            auto offer_mined = [&](std::uint64_t h) {
+                const bool sb = is_superblock_height(h, backend->superblock_cycle(), backend->superblock_start());
+                const MinerTemplate t = backend->template_for(static_cast<std::uint32_t>(h));
+                const OwnMinedReward m = own_mined_reward(b, h, parent, t.height, t.prev_hash, t.payments, sb);
+                node.offer_mined_reward(bidh, m.reward, sb, m.note);
+                if (!m.reward)
+                    LOG_ERROR << "[v37-dash] own win " << bidh << " @" << h << ": MINED reward unreadable ("
+                              << m.note << ") — registered VALUELESS";
+                else if (sb)
+                    LOG_WARNING << "[v37-dash] own win " << bidh << " @" << h << " is a superblock-cycle height: "
+                                << "registered VALUELESS on every node (" << m.note << ")";
+            };
+            if (hb) { offer_mined(*hb); try_register(*hb, 0); }                        // FOUND durable BEFORE announce
 
             const SubmitResult r = backend->submit_block(hex);
             if (!r.accepted) LOG_ERROR << "[v37-dash] block " << bidh << " NOT accepted: " << r.reason;
 
             if (!reg.registered && r.accepted) {                                       // fallback: dashd now has it
-                if (const auto h = backend->height_of(bidh)) try_register(*h, 1);
+                if (const auto h = backend->height_of(bidh)) { offer_mined(*h); try_register(*h, 1); }
                 else LOG_ERROR << "[v37-dash] accepted block " << bidh << " has no header on dashd yet";
             }
             if (!reg.registered)
@@ -1178,7 +1315,19 @@ int main(int argc, char** argv) {
                  << " cut_mismatch=" << s1c.cut_mismatch << " refused_fold=" << s1c.refused_fold
                  << " refused_payout=" << s1c.refused_payout << " refused_late=" << s1c.refused_late
                  << " already_known=" << s1c.already_known
-                 << " owed_diverged=" << s1c.owed_diverged << "}";
+                 << " owed_diverged=" << s1c.owed_diverged << "}"
+                 // ★ T1-prep step 3: the reward-verification ledger, both sides.
+                 // harvest.py gates the round verdict on the refusal counters.
+                 << " s1v{verified=" << s1c.verified << " unknown_block=" << s1c.unknown_block
+                 << " not_active=" << s1c.not_active << " height_mismatch=" << s1c.height_mismatch
+                 << " reward_mismatch=" << s1c.reward_mismatch
+                 << " superblock_nonzero=" << s1c.superblock_nonzero
+                 << " verify_unavailable=" << s1c.verify_unavailable
+                 << " own_mined=" << node.own_reward_stats().mined
+                 << " own_cached_disagreed=" << node.own_reward_stats().cached_disagreed
+                 << " own_unverified=" << node.own_reward_stats().unverified
+                 << " own_superblock=" << node.own_reward_stats().superblock << "}"
+                 << " settlement=" << (cfg.settlement_armed ? "on" : "off");
     }
     teardown_io();
     const auto st = backend->stats();

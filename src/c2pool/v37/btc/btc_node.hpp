@@ -72,6 +72,7 @@
 #include <c2pool/v37/btc/btc_settle_store.hpp>
 #include <c2pool/v37/btc/btc_finalize_driver.hpp>
 #include <c2pool/v37/btc/btc_coin_backend.hpp>
+#include <c2pool/v37/btc/mined_block_verify.hpp>   // T1-prep step 3: MinedBlockFacts, verify_peer_win
 #include <sharechain/v37/v37_roundabout.hpp>    // ::v37::LaneRecord, LaneParams
 
 namespace c2pool::v37n::btc {
@@ -174,6 +175,10 @@ struct PeerWin {
     std::uint64_t  reward = 0;           // the winner's block_reward(H_b)
     bool           payout_emitted = false;      // winner's W5 assembly emitted outputs
     ::v37::bytes32 owed_digest_at_win{};        // VERIFY field (diagnostics only)
+    // ★ T1-prep step 3: what OUR coin daemon says about `bid`, fetched by the
+    // caller (off the driver lock, with its own bounded wait) BEFORE the fold.
+    // Never on the wire. Required when XbtcNode::require_verified_peer_wins().
+    std::optional<MinedBlockFacts> facts;
 };
 
 struct PeerWinOutcome {
@@ -194,6 +199,12 @@ struct PeerWinOutcome {
     bool  refused_payout_emitted = false;  // winner already paid a coinbase (unreproducible)
     bool  refused_too_late = false;        // H_b already below our finalize cursor
     bool  already_known = false;           // our own win, or a duplicate descriptor
+    // ★ T1-prep step 3: the descriptor did not verify against the coin daemon
+    // (unknown block / not on the best chain / wrong height / forged reward /
+    // superblock claim / daemon unavailable). Terminal: nothing is credited.
+    bool  refused_unverified = false;
+    WinVerdict verify_verdict = WinVerdict::Ok;
+    std::optional<std::uint64_t> verify_expected;   // the MINED miner slice, when computed
     // the VERIFY field: did our owed commitment agree with the winner's at the
     // instant of the win? A `false` here means the two nodes had ALREADY
     // diverged before this block — the earliest point at which that is visible.
@@ -217,6 +228,22 @@ struct S1PeerStats {
     std::uint64_t repair_wanted  = 0; // refusals of the repairable kind (either cut bit)
     std::uint64_t repair_hit     = 0; // a VERIFIED repaired view was available and used
     std::uint64_t repair_missing = 0; // no verified view: refused exactly as before
+    // ★ T1-prep step 3 — the descriptor verified against the coin daemon.
+    std::uint64_t verified        = 0; // bid on the best chain at H_b, reward == mined slice (or 0)
+    std::uint64_t unknown_block   = 0; // dashd never had the block
+    std::uint64_t not_active      = 0; // dashd has it, not on the best chain
+    std::uint64_t height_mismatch = 0; // on the best chain at a different height
+    std::uint64_t reward_mismatch = 0; // carried reward != mined coinbase miner slice
+    std::uint64_t superblock_nonzero = 0; // non-zero reward claimed at a superblock height
+    std::uint64_t verify_unavailable = 0; // dashd could not be asked / no facts attached
+};
+
+// ★ T1-prep step 3 — the OWN-win reward source counters (diagnostics only).
+struct OwnRewardStats {
+    std::uint64_t mined            = 0; // own folds that consumed the MINED coinbase miner slice
+    std::uint64_t cached_disagreed = 0; // ...where the cached GBT miner_value said something else
+    std::uint64_t unverified       = 0; // no mined value could be read: registered VALUELESS
+    std::uint64_t superblock       = 0; // superblock-cycle height: registered VALUELESS by rule
 };
 
 class XbtcNode {
@@ -303,7 +330,41 @@ public:
         out.bid = bid;
         if (!m_started) return out;
 
-        const std::uint64_t reward = m_coin->block_reward(won_height);
+        std::uint64_t reward = m_coin->block_reward(won_height);
+
+        // ── ★ T1-prep step 3: the MINED reward, not the cached template ─────
+        // With mined-reward mode on (the btc-dash daemon), the reward the fold
+        // consumes is the miner slice of the coinbase this node actually mined,
+        // handed over by the submit seam via offer_mined_reward() just before
+        // it registers the block. The cached getblocktemplate value above is
+        // kept only as a diagnostic cross-check. No mined value for THIS bid ->
+        // the win is registered VALUELESS (reward 0), loudly: a block we mined
+        // is still a block we must register, but never at a guessed value.
+        if (m_mined_mode) {
+            const std::uint64_t cached = reward;
+            if (m_mined_bid == bid && m_mined_reward) {
+                reward = *m_mined_reward;
+                if (m_mined_superblock) ++m_own.superblock; else ++m_own.mined;
+                if (!m_mined_superblock && cached != reward) {
+                    ++m_own.cached_disagreed;
+                    std::fprintf(stderr, "[v37-s1] OWN WIN %s: cached template miner_value=%llu "
+                                 "!= MINED coinbase miner slice=%llu — folding the MINED value\n",
+                                 bid.c_str(), static_cast<unsigned long long>(cached),
+                                 static_cast<unsigned long long>(reward));
+                }
+            } else {
+                reward = 0;
+                ++m_own.unverified;
+                std::fprintf(stderr, "[v37-s1] OWN WIN %s: no MINED reward for this block (%s) — "
+                             "registering VALUELESS, never at the cached value %llu\n",
+                             bid.c_str(), m_mined_bid == bid ? m_mined_note.c_str() : "no hand-off",
+                             static_cast<unsigned long long>(cached));
+            }
+            m_mined_bid.clear();
+            m_mined_reward.reset();
+            m_mined_superblock = false;
+            m_mined_note.clear();
+        }
 
         // ── ★ S-1 (live fold-wiring): the ENTITLEMENT this win creates ───────
         // Fold E_b out of the lane cut the engine has published RIGHT NOW, and
@@ -410,6 +471,41 @@ public:
             ++m_s1p.already_known;
             out.already_known = true;
             return out;
+        }
+        // (a2) ★ T1-prep step 3: VERIFY THE DESCRIPTOR AGAINST THE COIN DAEMON.
+        //     The block must exist, sit on the best chain at the carried H_b, and
+        //     the carried reward must equal the MINED coinbase miner slice (or be
+        //     0, a VALUELESS claim that credits nobody). Anything else is refused
+        //     and counted: a descriptor is a CLAIM, and the fold below turns a
+        //     claim into owed balances on this node.
+        if (m_require_verified) {
+            WinVerdict v = WinVerdict::Unverified;
+            if (w.facts) v = verify_peer_win(*w.facts, w.h_b, w.reward, &out.verify_expected);
+            out.verify_verdict = v;
+            if (v != WinVerdict::Ok) {
+                out.refused_unverified = true;
+                switch (v) {
+                    case WinVerdict::UnknownBlock:      ++m_s1p.unknown_block; break;
+                    case WinVerdict::NotActive:         ++m_s1p.not_active; break;
+                    case WinVerdict::HeightMismatch:    ++m_s1p.height_mismatch; break;
+                    case WinVerdict::RewardMismatch:    ++m_s1p.reward_mismatch; break;
+                    case WinVerdict::SuperblockNonzero: ++m_s1p.superblock_nonzero; break;
+                    default:                            ++m_s1p.verify_unavailable; break;
+                }
+                std::string why = std::string("REFUSED (") + win_verdict_name(v) +
+                                  "): the descriptor did not verify against our coin daemon";
+                if (w.facts && w.facts->state == MinedBlockFacts::State::Have)
+                    why += " [daemon: h=" + std::to_string(w.facts->height) +
+                           (w.facts->on_active_chain ? " active" : " NOT-active") +
+                           " mined_slice=" +
+                           (w.facts->miner_slice ? std::to_string(*w.facts->miner_slice)
+                                                 : std::string("?")) + "]";
+                if (w.facts && !w.facts->note.empty()) why += " (" + w.facts->note + ")";
+                why += " — nothing credited";
+                say_s1c(w, why);
+                return out;
+            }
+            ++m_s1p.verified;
         }
         // (b) the winner had already broadcast a coinbase. Its payout map is NOT
         //     on the wire (unbounded), and we cannot reproduce it — fail closed.
@@ -608,6 +704,27 @@ public:
     const S1PeerStats& s1c_stats()     const { return m_s1p; }
     const EbCut&       last_peer_cut() const { return m_last_peer_cut; }
 
+    // ── ★ T1-prep step 3 seams ──────────────────────────────────────────────
+    // Mined-reward mode: the own fold consumes only a reward offered for that
+    // exact bid (else VALUELESS). Off by default: every other caller (the
+    // Threads-only c2pool-v37-btc, the smokes, the KATs) keeps block_reward().
+    void set_mined_reward_mode(bool on) { m_mined_mode = on; }
+    bool mined_reward_mode() const { return m_mined_mode; }
+    // One-slot hand-off, consumed by the NEXT on_block_won for `bid`. nullopt =
+    // "could not read the mined value" (the win registers VALUELESS, `note` says why).
+    void offer_mined_reward(const std::string& bid, std::optional<std::uint64_t> reward,
+                            bool superblock_height, std::string note = {}) {
+        m_mined_bid        = bid;
+        m_mined_reward     = reward;
+        m_mined_superblock = superblock_height;
+        m_mined_note       = std::move(note);
+    }
+    const OwnRewardStats& own_reward_stats() const { return m_own; }
+    // Peer-win verification: when on, a PeerWin without verifying facts is
+    // refused (WinVerdict::Unverified). Off by default (KAT/smoke callers).
+    void set_require_verified_peer_wins(bool on) { m_require_verified = on; }
+    bool require_verified_peer_wins() const { return m_require_verified; }
+
 private:
     // ── ★ S-1: fold E_b at the lane cut published NOW ────────────────────────
     // The ONE credit-path entry point is settle::fold_eb — it does the ratified-
@@ -748,6 +865,15 @@ private:
     S1PeerStats m_s1p;           // S-1c receive-side counters (diagnostics)
     EbCut       m_last_peer_cut; // the cut the last PEER win folded at (diagnostics)
     RepairSourceFn m_repair;     // ★ Stage 2: verified-replay projection lookup
+
+    // ★ T1-prep step 3
+    bool                         m_mined_mode = false;
+    std::string                  m_mined_bid;
+    std::optional<std::uint64_t> m_mined_reward;
+    bool                         m_mined_superblock = false;
+    std::string                  m_mined_note;
+    OwnRewardStats               m_own;
+    bool                         m_require_verified = false;
 
     bool m_opened = false;
     bool m_started = false;
