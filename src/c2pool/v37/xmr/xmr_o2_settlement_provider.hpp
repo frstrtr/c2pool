@@ -76,13 +76,13 @@
 //     template built through it makes NO daemon call at all.
 //
 // The two constructors below are the only difference a caller sees. The legacy
-// (IMonerodTransport&) one behaves exactly as before: it OWNS a
-// MonerodMinerDataSource and pumps it once per refresh, which is the same one
-// RPC per refresh the old body did, and it rebuilds on exactly the same
-// condition — the parent tip moved. The daemon arm reports no backlog sequence
-// (it is frozen at 0), so the epoch term added below cannot make the production
-// path rebuild on anything the old path ignored. The native arm's backlog
-// sequence is ADDITIVE and opt-in, off by default. The (IMinerDataSource&) one takes whichever
+// (IMonerodTransport&) one OWNS a MonerodMinerDataSource and pumps it once per
+// refresh, which is the same one RPC per refresh the old body did. It rebuilds
+// when the parent tip moved (the pre-seam rule) AND -- good-citizen, since
+// 2026-09-22 -- when the tx set monerod OFFERS in get_miner_data.tx_backlog
+// moved under an unchanged tip, rate-limited to one admission per
+// MonerodArmConfig::backlog_refresh_s (default 3 s; 0 = legacy tip-only). The
+// native arm runs the same policy. The (IMinerDataSource&) one takes whichever
 // arm the ArmResolver picked, plus an optional pump for arms that need one --
 // the native arm does not, which is why its refresh costs no I/O at all.
 // ===========================================================================
@@ -189,18 +189,25 @@ public:
     //
     // Owns a MonerodMinerDataSource over `transport` and pumps it once per
     // refresh: exactly the one get_miner_data per refresh this constructor
-    // always did.
+    // always did. `daemon_cfg` carries the good-citizen backlog-refresh policy
+    // (and the readiness bound) for that owned arm.
     XmrSettlementTemplateProvider(node::IMonerodTransport& transport,
                                   XmrOwedFixture& ledger_owner,
                                   XmrSettlementConfig scfg,
-                                  std::uint64_t share_diff)
-        : m_owned_src(std::make_unique<ntmpl::MonerodMinerDataSource>(transport)),
+                                  std::uint64_t share_diff,
+                                  ntmpl::MonerodArmConfig daemon_cfg = {})
+        : m_owned_src(std::make_unique<ntmpl::MonerodMinerDataSource>(transport, daemon_cfg)),
           m_ledger(ledger_owner), m_scfg(std::move(scfg)),
           m_share_diff(share_diff) {
         auto* daemon = static_cast<ntmpl::MonerodMinerDataSource*>(m_owned_src.get());
+        m_owned_daemon = daemon;
         m_src  = daemon;
         m_pump = [daemon](std::string* why) { return daemon->poll(why); };
     }
+
+    // The daemon arm this provider OWNS (legacy constructor), for the status
+    // line's good-citizen counters; nullptr when the arm came from a resolver.
+    const ntmpl::MonerodMinerDataSource* owned_daemon_arm() const noexcept { return m_owned_daemon; }
 
     // MAIN THREAD, before the first refresh(). Not settable while serving.
     void set_shape_gate(ShapeGate g) { m_shape_gate = std::move(g); }
@@ -249,23 +256,19 @@ public:
         // re-hash — "Low diff"). Only reassemble when the epoch moves.
         //
         // The epoch is (height, prev_id, backlog_seq). The first two ARE the old
-        // tip rule, character for character. The third is C4's addition and is
-        // an OPT-IN trigger that no arm reports unless it was configured to:
+        // tip rule, character for character. The third is the good-citizen
+        // term: BOTH arms advance it when the offered tx set moved under an
+        // unchanged tip, rate-limited to one admission per backlog_refresh_s
+        // (default 3 s on both; 0 = legacy tip-only, in which case the conjunct
+        // below is 0 == 0 on every refresh and the decision is exactly the
+        // pre-seam one). An admission is a NEW JOB (new template id), never
+        // the same job restamped: between admissions the sequence is frozen,
+        // so miners grind byte-stable bytes for the whole window and their
+        // in-flight shares keep resolving from the retained template ring.
         //
-        //   monerod arm  backlog_seq is frozen at 0 (xmr_monerod_miner_data.hpp).
-        //                The conjunct below is 0 == 0 on every refresh, so THE
-        //                DEFAULT/PRODUCTION PATH TAKES EXACTLY THE DECISION IT
-        //                TOOK BEFORE THE SEAM EXISTED — a rebuild when, and only
-        //                when, the parent tip moves.
-        //   native arm   backlog_seq is frozen for the life of a tip under the
-        //                default tip-only policy (backlog_refresh_s == 0), and
-        //                moves under an unchanged tip only when an operator sets
-        //                a non-zero refresh interval, which is a NEW JOB by
-        //                explicit configuration rather than a silent restamp.
-        //
-        // Anything else would restamp the header timestamp under miners who are
-        // already grinding the current bytes, and their in-flight shares would
-        // miss on re-hash.
+        //   monerod arm  xmr_monerod_miner_data.hpp -- fingerprint of the ids
+        //                monerod offers in get_miner_data.tx_backlog.
+        //   native arm   xmr_native_miner_data.hpp  -- the pool's backlog_version.
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_cur.valid && m_cur.height == md.height && m_cur.prev_id == md_prev
@@ -500,6 +503,7 @@ private:
     // constructor, which owns the daemon arm it built; m_src always points at
     // the arm in use, owned here or not.
     std::unique_ptr<native::IMinerDataSource> m_owned_src;
+    const ntmpl::MonerodMinerDataSource*      m_owned_daemon = nullptr;   // == m_owned_src when legacy-constructed
     native::IMinerDataSource*                 m_src = nullptr;
     RefreshPump                               m_pump;
     ShapeGate                                 m_shape_gate;

@@ -31,13 +31,37 @@
 // native arm needs no pump, which is exactly the difference the seam exists to
 // hide from the assembler.
 //
-// THE REBUILD RULE IS THE OLD ONE, UNCHANGED. epoch() reports (height, prev_id)
-// and a backlog_seq that is FROZEN AT ZERO, so a consumer comparing epochs takes
-// exactly the decision the pre-seam code took: rebuild when the parent tip
-// moves, never because the daemon's txpool grew. Nothing this arm can observe
-// about the transaction set may become a new rebuild trigger -- that would
-// restamp the header timestamp under miners already grinding the current bytes.
-// The native arm's backlog sequence is ADDITIVE and opt-in; see its header.
+// THE REBUILD RULE (good-citizen, 2026-09-22). epoch() reports (height,
+// prev_id, backlog_seq). The tip term is the pre-seam rule, character for
+// character: a tip move is always a rebuild. The backlog term is the SAME
+// rate-limited policy the native arm runs (xmr_native_miner_data.hpp): when the
+// set of transactions monerod OFFERS in get_miner_data.tx_backlog differs from
+// the set the served template was built from, and at least
+// `backlog_refresh_s` have elapsed since the last admission, the sequence
+// advances and the provider rebuilds. The admitted set is FROZEN in between,
+// so miners grind byte-stable bytes for the whole window and a rebuild is a
+// NEW JOB (new template id), never the same job restamped.
+//
+// WHY this arm no longer freezes backlog_seq at 0. It used to (R-C4-3), on the
+// argument that a size-derived sequence would restamp headers at the poll
+// cadence. The frozen rule had a consequence the argument did not weigh: the
+// template is built at the instant the parent tip moves, which is the instant
+// the pool is emptiest (the block that just landed swept it), and it is then
+// served UNCHANGED for the whole block interval while transactions arrive. On
+// the 3-node regtest soak of 2026-09-21 that produced five coinbase-only blocks
+// (h=122,132,137,139,145) mined off a template with n_tx=0 while the winner's
+// own daemon offered 3-5 transactions for the preceding 20-75 s -- a breach of
+// the operator hard rule that a c2pool block ALWAYS carries the available
+// transactions (coinbase-only ONLY when the pool is truly empty). The cure is
+// the native arm's bargain, not the size rule: change-triggered, rate-limited,
+// frozen between admissions. `backlog_refresh_s = 0` keeps the legacy tip-only
+// behaviour exactly (a CONTROL setting; the K-C4-1 identity KAT pins it).
+//
+// WHAT the sequence keys on. An order-independent fingerprint of the offered
+// tx ids (monerod hands the backlog fee-sorted; the same set in another order
+// is not a new job). Not the size: a set that changed at constant size (one tx
+// mined, one arrived) IS a new job. A fingerprint collision costs at most one
+// missed admission until the set moves again; it can never cause a restamp.
 //
 // READINESS. The daemon is the authority on its own readiness: a get_miner_data
 // that parsed and validated sets every flag, and a transport error or a refusal
@@ -83,9 +107,15 @@
 
 namespace c2pool::xmr::native::tmpl {
 
-// How long a filled cache stays a readiness claim. See the header comment.
+// How long a filled cache stays a readiness claim, and how often the offered
+// backlog may move the epoch under an unchanged tip. See the header comment.
 struct MonerodArmConfig {
     std::uint64_t max_age_ms = 120000;   // one Monero target block interval; 0 = no bound
+    // Good-citizen backlog admission: rebuild when the OFFERED tx set moved, at
+    // most once per this many seconds. Same default and semantics as the native
+    // arm's NativeTemplatePolicy::backlog_refresh_s. 0 = legacy tip-only rebuild
+    // (CONTROL / the K-C4-1 byte-identity pin).
+    std::uint64_t backlog_refresh_s = 3;
 };
 
 class MonerodMinerDataSource final : public IMinerDataSource {
@@ -132,10 +162,33 @@ public:
             return false;
         }
 
+        const std::uint64_t fp  = backlog_fingerprint_(md);
+        const std::uint64_t now = now_ms_();
+
         std::lock_guard<std::mutex> lk(mtx_);
+        // GOOD-CITIZEN backlog admission (see the header). A tip move re-opens
+        // the backlog unconditionally -- the next template is a new job anyway,
+        // so the set it is built from is simply the set on offer now. Under an
+        // unchanged tip the offered set is admitted only when it differs from
+        // the set the served template was built from AND the refresh window has
+        // elapsed; between admissions the sequence (and so the epoch) is frozen.
+        const bool tip_moved = !have_ || md.height != cached_.height
+                            || !(md.prev_id == cached_.prev_id);
+        if (tip_moved) {
+            admitted_fp_    = fp;
+            last_admit_ms_  = now;
+        } else if (cfg_.backlog_refresh_s != 0 && fp != admitted_fp_
+                   && (last_admit_ms_ == 0 || now - last_admit_ms_ >= cfg_.backlog_refresh_s * 1000)) {
+            admitted_fp_    = fp;
+            last_admit_ms_  = now;
+            ++backlog_seq_;
+            ++backlog_admits_;
+        }
+        last_backlog_n_ = md.tx_backlog.size();
+
         cached_    = std::move(md);
         have_      = true;
-        filled_ms_ = now_ms_();
+        filled_ms_ = now;
         last_error_.clear();
         ++polls_;
         if (why) why->clear();
@@ -166,23 +219,13 @@ public:
         if (!have_) return e;
         e.height  = cached_.height;
         e.prev_id = cached_.prev_id;
-        // backlog_seq stays 0: THIS ARM REPORTS NO BACKLOG SEQUENCE.
-        //
-        // backlog_seq is an OPT-IN rebuild trigger. A consumer rebuilds when the
-        // epoch moves, so any number reported here that moves under an unchanged
-        // tip is a new rebuild trigger -- and this arm's rule is the one that
-        // serves real miners today, which is (height, prev_id) and nothing else.
-        // Reporting the backlog SIZE would have made every daemon txpool change
-        // force a reassemble at the poll cadence, restamping the header timestamp
-        // under miners who are already grinding those bytes ("Low diff") and
-        // churning the retained template ring down to seconds of job history.
-        // The daemon arm is the pre-seam path wrapped, and the pre-seam path
-        // rebuilt on tip moves only; a frozen 0 keeps that rule EXACTLY.
-        //
-        // The native arm is additive: it may report a sequence, and only under
-        // an explicit non-zero backlog_refresh_s policy (see
-        // xmr_native_miner_data.hpp), which is opt-in and off by default.
-        e.backlog_seq = 0;
+        // The ADMITTED backlog sequence: advanced in poll() only when the
+        // offered tx set moved under an unchanged tip and the refresh window
+        // allowed it (see the header). Frozen at 0 for the life of the process
+        // when backlog_refresh_s == 0 (legacy tip-only rebuild). It is never
+        // the backlog SIZE: a size-derived sequence would reassemble at the poll
+        // cadence and restamp the header under miners mid-grind ("Low diff").
+        e.backlog_seq = backlog_seq_;
         return e;
     }
 
@@ -224,7 +267,28 @@ public:
     std::uint64_t polls()      const { std::lock_guard<std::mutex> lk(mtx_); return polls_; }
     std::uint64_t failures()   const { std::lock_guard<std::mutex> lk(mtx_); return failures_; }
 
+    // Good-citizen observability for the status line: how many times the
+    // offered backlog moved the epoch under an unchanged tip, and how many
+    // transactions the daemon offered on the last poll.
+    std::uint64_t backlog_admits() const { std::lock_guard<std::mutex> lk(mtx_); return backlog_admits_; }
+    std::size_t   last_backlog_n() const { std::lock_guard<std::mutex> lk(mtx_); return last_backlog_n_; }
+
 private:
+    // Order-independent fingerprint of the offered tx-id set (FNV-1a per id,
+    // summed). See "WHAT the sequence keys on" in the header.
+    static std::uint64_t backlog_fingerprint_(const node::MinerData& md) {
+        std::uint64_t fp = 0x9e3779b97f4a7c15ull ^ static_cast<std::uint64_t>(md.tx_backlog.size());
+        for (const auto& e : md.tx_backlog) {
+            std::uint64_t h = 0xcbf29ce484222325ull;
+            for (const auto c : e.id) {
+                h ^= static_cast<unsigned char>(c);
+                h *= 0x100000001b3ull;
+            }
+            fp += h;
+        }
+        return fp;
+    }
+
     std::uint64_t now_ms_() const {
         if (clock_) return clock_();
         return static_cast<std::uint64_t>(
@@ -265,6 +329,13 @@ private:
     std::uint64_t      filled_ms_ = 0;
     std::string        last_error_;
     std::uint64_t      polls_ = 0, failures_ = 0;
+
+    // Good-citizen backlog admission state (guarded by mtx_).
+    std::uint64_t      backlog_seq_     = 0;   // what epoch() reports
+    std::uint64_t      admitted_fp_     = 0;   // fingerprint of the set the served template was built from
+    std::uint64_t      last_admit_ms_   = 0;   // clock at the last admission / tip re-open
+    std::uint64_t      backlog_admits_  = 0;   // admissions under an unchanged tip (observability)
+    std::size_t        last_backlog_n_  = 0;   // offered backlog size on the last poll
 };
 
 } // namespace c2pool::xmr::native::tmpl

@@ -330,11 +330,15 @@ struct XmrNodeConfig {
     // How long the daemon waits for the native arm to become ready before it
     // refuses to start (fail-closed: it never serves a half-built window).
     std::uint32_t   native_ready_timeout_s = 120;
-    // Rebuild the served template when the native POOL moves, not only when the
-    // parent tip does, at most once per this many seconds. Default 3 s. 0 is the
-    // legacy TIP-ONLY posture (what M0..M2 shipped). A block consumes the pool,
-    // so a tip-only arm serves the empty template built at the start of every
-    // block interval and collects almost none of the fees that arrive during it,
+    // Rebuild the served template when the POOL moves, not only when the parent
+    // tip does, at most once per this many seconds. Applies to BOTH template
+    // arms: the native arm keys on its pool's backlog_version, the daemon
+    // (monerod get_miner_data) arm on the fingerprint of the offered tx_backlog
+    // (--backlog-refresh is the arm-neutral spelling of --native-backlog-refresh).
+    // Default 3 s. 0 is the legacy TIP-ONLY posture (what M0..M2 shipped, and
+    // what the daemon arm ran until 2026-09-22). A block consumes the pool, so a
+    // tip-only arm serves the empty template built at the start of every block
+    // interval and collects almost none of the fees that arrive during it,
     // which violates the good-citizen hard rule; hence the default is on. The
     // cost of turning it on is a restamped header under miners mid-grind,
     // absorbed by the retained-epoch job ring.
@@ -348,10 +352,10 @@ struct XmrNodeConfig {
     // place; the live fix-2 proof leans on this.
     std::uint32_t   native_dos_solicited_credits = 8;
 
-    // --no-good-citizen: disable the good-citizen take-mempool-as-given path on
-    // the native arm (the CONTROL switch for the live proof -- reproduces the
-    // old coinbase-only-with-a-full-pool failure). Default false = good-citizen
-    // ON. Never affects the daemon arm.
+    // --no-good-citizen: disable the good-citizen path (the CONTROL switch for
+    // the live proof -- reproduces the old coinbase-only-with-a-full-pool
+    // failure). Native arm: no take-mempool-as-given. Daemon arm: legacy
+    // tip-only rebuild (backlog_refresh_s forced to 0). Default false = ON.
     bool            no_good_citizen = false;
 
     // --- OPERATOR TX-INJECTION (2026-09-19 ruling) --------------------------
@@ -586,7 +590,8 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
         return 2;
     }
     if (a == "--native-snapshot-every")  return need(c.native_snapshot_every_s);
-    if (a == "--native-backlog-refresh") return need(c.native_backlog_refresh_s);
+    if (a == "--native-backlog-refresh" || a == "--backlog-refresh")
+        return need(c.native_backlog_refresh_s);
     if (a == "--anchor-confirm-peers") {
         std::uint64_t n = 0;
         const int used = need(n);
