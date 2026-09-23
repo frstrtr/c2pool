@@ -780,7 +780,7 @@ class RecFile:
     def __init__(self, path, rec):
         self.path = path
         self.rec = rec
-        self.fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        self.fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         size = os.fstat(self.fd).st_size
         if size % rec:
             raise RuntimeError("%s: size %d is not a multiple of %d" % (path, size, rec))
@@ -980,14 +980,20 @@ def _gb(x):
 
 
 def _fsync_dir(d):
+    # Make a preceding os.replace() durable across a crash. Some filesystems
+    # (and platforms) cannot open or fsync a directory; that is not fatal for
+    # the walk, but it weakens crash durability, so say so instead of hiding it.
     try:
         fd = os.open(d, os.O_RDONLY)
-    except OSError:
+    except OSError as e:
+        print("  warning: cannot open %s to fsync it (%s); a crash right now may "
+              "lose the last checkpoint rename" % (d, e), file=sys.stderr)
         return
     try:
         os.fsync(fd)
-    except OSError:
-        pass
+    except OSError as e:
+        print("  warning: fsync of directory %s failed (%s); a crash right now may "
+              "lose the last checkpoint rename" % (d, e), file=sys.stderr)
     finally:
         os.close(fd)
 
