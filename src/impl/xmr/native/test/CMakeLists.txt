@@ -849,6 +849,39 @@ if (BUILD_TESTING)
     # loaded runner.
     set_tests_properties(xmr_native_snapshot_resume_kat PROPERTIES TIMEOUT 300)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #   xmr_native_neartip_stall_kat -- an anchor-booted node (FORMAT-2 bundle,
+    #   output set seeded from the committed snapshot) that catches up across a
+    #   gap wider than its row window must reach the network tip whatever is
+    #   pushed at it while it is behind. Pins the mainnet format-2 dry-run
+    #   freeze (h=3768570, fluffy_req=0): a bodiless push parked before its
+    #   parent connected was resolved WITHOUT bodies_missing and never asked
+    #   for again; and AltPool::erase_key_() dropped a held parent's children
+    #   edges so its parked child was never drained. Both halves are RED on
+    #   master 481c76af. Links what the output set needs (xmr_native_txpool ->
+    #   xmr_coin for rct::zero_commit); no RandomX, no sockets.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml (the #1539 lesson).
+    add_executable(xmr_native_neartip_stall_kat xmr_neartip_stall_kat.cpp)
+    target_include_directories(xmr_native_neartip_stall_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_neartip_stall_kat PRIVATE xmr_native_txpool)
+    target_compile_features(xmr_native_neartip_stall_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_neartip_stall_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_neartip_stall_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_neartip_stall_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_neartip_stall_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_neartip_stall_kat COMMAND xmr_native_neartip_stall_kat)
+    set_tests_properties(xmr_native_neartip_stall_kat PROPERTIES TIMEOUT 300)
+
     add_executable(xmr_native_m4_ptpl_backlog_gate_kat xmr_m4_ptpl_backlog_gate_kat.cpp)
     target_include_directories(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src

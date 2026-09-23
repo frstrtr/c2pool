@@ -317,7 +317,16 @@ private:
             if (ch->second.empty()) children_.erase(ch);
         }
         blocks_.erase(it);
-        children_.erase(k);
+        // The erased block's OWN children list is kept. It is keyed by id, not
+        // owned by the entry: the usual reason a block leaves the pool is that it
+        // just CONNECTED (or was evicted and may come back), and its parked
+        // children are exactly what resolve_descendants_locked_() and
+        // connect_parked_children_locked_() must find next. Dropping the list
+        // here stranded them -- a parent held in the pool before it connected
+        // took its children's edges with it, and the tip stopped one block below
+        // them until eviction happened to clear the pool. Each child removes
+        // itself from the list when it is erased, and an empty list is dropped,
+        // so the map stays bounded by the pool.
         return true;
     }
 

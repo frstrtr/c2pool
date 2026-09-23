@@ -46,6 +46,9 @@
 //   J. MIRROR         -- the long-term weight mirror equals the consensus
 //                        state's own window at every height (what makes a
 //                        snapshot below the tip exact).
+//   K. NEAR-TIP       -- a bodiless push resolved when its parent connects is
+//                        listed for a bodies fetch and is not peeled by a failed
+//                        switch; a held parent keeps its children's edges.
 //
 // The blocks are built here, byte by byte, in monerod's block format: that is
 // what lets the test drive REAL stagenet header values (timestamps, versions,
@@ -1240,7 +1243,120 @@ static void test_hints_are_ignored() {
 }
 
 // =============================================================================
+// K. near-tip stall (mainnet format-2 dry run, h=3768570): the unit-level pins.
+//    The end-to-end reproduction (format-2 anchor boot, output set seeded, gap
+//    wider than the row window, real bodies) is xmr_neartip_stall_kat.
+// =============================================================================
+// Like make_block, but the block COMMITS to `ntx` transaction ids while the
+// entry carries no bodies: exactly what a NOTIFY_NEW_FLUFFY_BLOCK push looks
+// like to the index (evaluate_block reports bodies_complete == false).
+static BlockEntry make_bodiless_block(std::uint8_t major, std::uint8_t minor,
+                                      std::uint64_t timestamp, const Hash& prev,
+                                      std::uint32_t nonce, std::uint64_t height,
+                                      std::uint64_t reward, std::uint8_t salt,
+                                      std::size_t ntx) {
+    BlockEntry e = make_block(major, minor, timestamp, prev, nonce, height, reward, salt);
+    e.block_blob.pop_back();                 // make_block ends with the n_tx varint 0
+    put_varint(e.block_blob, ntx);
+    for (std::size_t t = 0; t < ntx; ++t)
+        for (int i = 0; i < 32; ++i)
+            e.block_blob.push_back(static_cast<std::uint8_t>(0x80 + i + 7 * t + salt));
+    return e;
+}
+
+static bool has_id(const std::vector<Hash>& v, const Hash& id) {
+    for (const Hash& x : v) if (x == id) return true;
+    return false;
+}
+
+// K1. A bodiless push parked before its parent connects is resolved when the
+// parent lands. It must then be listed by bodies_wanted() (on master it was
+// not, and nothing else re-asks for it), a further push onto it must be kept
+// rather than peeled off by a failed switch, and nobody is charged for bytes
+// WE do not have.
+static void test_k1_bodiless_park_after_parent_connects() {
+    Fixture f(6);
+    const PeerRef pr = peer(9);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = f.idx->view().state().expected_base_reward();
+
+    BlockEntry A = f.sibling(tip, h, /*salt=*/1, reward);
+    const Hash a_id = id_of(A);
+    const G::GoldenHeader& hb = header_at(h + 1);
+    BlockEntry B = make_bodiless_block(hb.major_version, hb.minor_version, hb.timestamp,
+                                       a_id, 77, h + 1, reward, /*salt=*/2, /*ntx=*/1);
+    const Hash b_id = id_of(B);
+    const G::GoldenHeader& hc = header_at(h + 2);
+    BlockEntry C = make_bodiless_block(hc.major_version, hc.minor_version, hc.timestamp,
+                                       b_id, 78, h + 2, reward, /*salt=*/3, /*ntx=*/1);
+    const Hash c_id = id_of(C);
+
+    OfferResult r = f.idx->offer_block(&pr, B, false);
+    checkf(r.outcome == OfferOutcome::ParkedOrphan, "k1: push B was %s", to_string(r.outcome));
+    checkf(!has_id(f.idx->bodies_wanted(), b_id),
+           "k1: an orphan whose parent is unknown is not listed (no fetches for unverified pushes)");
+    r = f.idx->offer_block(&pr, C, false);
+    checkf(r.outcome == OfferOutcome::ParkedOrphan, "k1: push C was %s", to_string(r.outcome));
+
+    r = f.idx->offer_block(&pr, A, false);
+    checkf(r.outcome == OfferOutcome::Connected, "k1: parent was %s (%s)",
+           to_string(r.outcome), r.why.c_str());
+    checkf(f.idx->tip()->height == h, "k1: tip is %llu, expected %llu",
+           (unsigned long long)f.idx->tip()->height, (unsigned long long)h);
+    const std::vector<Hash> bw = f.idx->bodies_wanted();
+    checkf(has_id(bw, b_id), "k1: bodies_wanted() omits the resolved bodiless park B");
+    checkf(has_id(bw, c_id), "k1: bodies_wanted() omits the resolved bodiless park C");
+    checkf(f.idx->have_block(b_id) && f.idx->have_block(c_id),
+           "k1: after the parent connected B held=%d C held=%d (expected 1/1)",
+           f.idx->have_block(b_id) ? 1 : 0, f.idx->have_block(c_id) ? 1 : 0);
+
+    // C is pushed again: kept, not peeled; the tip does not move through a
+    // bodiless branch; and the pusher is not charged.
+    r = f.idx->offer_block(&pr, C, false);
+    checkf(f.idx->have_block(b_id) && f.idx->have_block(c_id),
+           "k1: a re-push peeled the bodiless branch (B=%d C=%d)",
+           f.idx->have_block(b_id) ? 1 : 0, f.idx->have_block(c_id) ? 1 : 0);
+    checkf(f.idx->tip()->height == h, "k1: tip moved to %llu through a bodiless branch",
+           (unsigned long long)f.idx->tip()->height);
+    checkf(f.fetcher.penalties.empty(), "k1: %zu peer penalties for our missing bodies",
+           f.fetcher.penalties.size());
+}
+
+// K2. A parent that sat in the pool before it connected (held: the verifier
+// was down) must not take its parked children's edges with it when it leaves
+// the pool on connect: the child is drained onto the new tip.
+static void test_k2_held_parent_keeps_children_edges() {
+    Fixture f(6);
+    const PeerRef pr = peer(9);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = f.idx->view().state().expected_base_reward();
+
+    BlockEntry A = f.sibling(tip, h, /*salt=*/1, reward);
+    const Hash a_id = id_of(A);
+    BlockEntry B = f.sibling(a_id, h + 1, /*salt=*/2, reward);
+    const Hash b_id = id_of(B);
+
+    OfferResult r = f.idx->offer_block(&pr, B, false);
+    checkf(r.outcome == OfferOutcome::ParkedOrphan, "k2: B was %s", to_string(r.outcome));
+    f.mv.set_down(true);
+    r = f.idx->offer_block(&pr, A, false);
+    checkf(r.outcome == OfferOutcome::StoredAsAlt, "k2: held parent was %s (%s)",
+           to_string(r.outcome), r.why.c_str());
+    f.mv.set_down(false);
+    r = f.idx->offer_block(&pr, A, false);
+    checkf(r.outcome == OfferOutcome::Connected, "k2: parent retry was %s (%s)",
+           to_string(r.outcome), r.why.c_str());
+    checkf(f.idx->tip()->height == h + 1 && f.idx->tip()->id == b_id,
+           "k2: tip is %llu, expected %llu: the parked child was not drained",
+           (unsigned long long)f.idx->tip()->height, (unsigned long long)(h + 1));
+}
+
+// =============================================================================
 int main() {
+    test_k1_bodiless_park_after_parent_connects();
+    test_k2_held_parent_keeps_children_edges();
     test_wire_validation();
     test_row_store();
     test_pow_gate();

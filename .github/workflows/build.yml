@@ -265,7 +265,7 @@ jobs:
                     xmr_native_m4_soak_kat \
                     xmr_native_m4_ptpl_backlog_gate_kat \
                     xmr_native_node_kat xmr_native_node \
-                    xmr_native_snapshot_resume_kat \
+                    xmr_native_snapshot_resume_kat xmr_native_neartip_stall_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
@@ -743,7 +743,7 @@ jobs:
                     xmr_native_m4_soak_kat \
                     xmr_native_m4_ptpl_backlog_gate_kat \
                     xmr_native_node_kat xmr_native_node \
-                    xmr_native_snapshot_resume_kat \
+                    xmr_native_snapshot_resume_kat xmr_native_neartip_stall_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
