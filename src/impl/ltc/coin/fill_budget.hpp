@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -130,6 +131,39 @@ private:
     double tokens_ = 0.0;
     double last_refill_ = 0.0;
     int64_t shares_since_reset_ = 0;
+};
+
+// Template-side consumer of a grant: the new-tx break of p2pool-merged-v36
+// data.py _get_txset_artifacts(), verbatim. Walks candidates in selection
+// order and admits a tx only while spent + size <= budget; the FIRST refusal
+// closes the gate (break, never skip-ahead), so the admitted set is a prefix
+// of the selector output and parents-before-children order survives the cut.
+// No budget (nullopt) == pre-G2 v36 (unlimited). On v34+ shares every
+// template tx is new-to-window (no tx-hash refs), so every admitted byte
+// counts; spent() is the amount to settle() when the share is found.
+class NewTxBudgetGate {
+public:
+    explicit NewTxBudgetGate(std::optional<int64_t> budget = std::nullopt)
+        : budget_(budget) {}
+
+    bool admit(uint64_t tx_bytes) {
+        if (closed_)
+            return false;
+        if (budget_ && static_cast<int64_t>(spent_ + tx_bytes) > *budget_) {
+            closed_ = true;
+            return false;
+        }
+        spent_ += tx_bytes;
+        return true;
+    }
+
+    uint64_t spent() const { return spent_; }
+    bool truncated() const { return closed_; }
+
+private:
+    std::optional<int64_t> budget_;
+    uint64_t spent_ = 0;
+    bool closed_ = false;
 };
 
 // Registry + rider wiring ("DOGE rides litecoin"): aux buckets reset on the
