@@ -16,6 +16,7 @@
 #include <functional>
 #include "header_chain.hpp"
 #include "mempool.hpp"
+#include "fill_budget.hpp"
 #include "mweb_builder.hpp"
 #include "mweb_ext_import.hpp"
 #include "rpc_data.hpp"
@@ -289,6 +290,11 @@ public:
     /// txs, the selection) stays within the chain's limit, and an extension
     /// whose imports alone would pass it falls back
     /// (imported-sigops-over-limit).
+    /// new_tx_budget: G2 fill-budget grant (FillBudget::grant(), frozen per
+    /// work event by the caller). nullopt = unlimited, byte-identical to the
+    /// pre-G2 template. When set, selection stops at the first tx that would
+    /// push committed bytes past the grant (NewTxBudgetGate) and
+    /// coinbasevalue drops the fees of the cut tail.
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
@@ -298,7 +304,8 @@ public:
         std::optional<rpc::WorkData>* refused = nullptr,
         bool               template_tx_check_strict = true,
         int64_t            coinbase_sigop_cost = COINBASE_SIGOP_RESERVE,
-        mweb_ext::MwebExtSource* mweb_ext = nullptr)
+        mweb_ext::MwebExtSource* mweb_ext = nullptr,
+        std::optional<int64_t> new_tx_budget = std::nullopt)
     {
         if (mweb_ext && !mweb_ext->enabled())
             mweb_ext = nullptr;
@@ -527,12 +534,6 @@ public:
               }}, &seed)
             : std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{};
 
-        // coinbasevalue = block reward + included transaction fees
-        // Matches litecoind's getblocktemplate coinbasevalue field.
-        uint64_t coinbasevalue = subsidy + total_fees;
-        if (ext)
-            coinbasevalue += static_cast<uint64_t>(ext->txs_fee() + ext->fee_hogex());
-
         nlohmann::json         tx_array = nlohmann::json::array();
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
@@ -553,14 +554,20 @@ public:
             }
         }
 
+        NewTxBudgetGate budget_gate(new_tx_budget);
+        uint64_t included_fees  = 0;  // known fees of the admitted prefix
         uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
         if (ext)
             for (const auto& t : ext->txs)
                 selected_bytes += t.hex.size() / 2;  // litecoind's txs fill it too
         for (const auto& stx : selected_txs) {
-            uint256     txid     = compute_txid(stx.tx);
             auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
+            if (!budget_gate.admit(packed.get_span().size()))
+                break;
+            uint256     txid     = compute_txid(stx.tx);
             selected_bytes += packed.get_span().size();
+            if (stx.fee_known)
+                included_fees += stx.fee;
             std::string hex_data = HexStr(packed.get_span());
             // wtxid for the witness merkle tree (litecoind GetWitnessHash)
             uint256     wtxid    = compute_wtxid(stx.tx);
@@ -582,6 +589,16 @@ public:
             tx_hashes.push_back(txid);
         }
 
+        // coinbasevalue = block reward + included transaction fees
+        // Matches litecoind's getblocktemplate coinbasevalue field. Without a
+        // budget cut the admitted set is the whole selection and total_fees
+        // is used unchanged (byte-identical pre-G2 path).
+        const uint64_t fees = budget_gate.truncated() ? included_fees : total_fees;
+        uint64_t coinbasevalue = subsidy + fees;
+        // litecoind's MWEB extension (imported whole, outside the G2 gate)
+        if (ext)
+            coinbasevalue += static_cast<uint64_t>(ext->txs_fee() + ext->fee_hogex());
+
         // ── Underfill guard ────────────────────────────────────────────────
         // Do not silently treat a near-empty template as healthy when the
         // mempool held fee-paying backlog that should have filled it. We cannot
@@ -597,11 +614,12 @@ public:
                                   && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
             if (near_empty && has_backlog) {
                 LOG_WARNING << "[EMB-LTC] TemplateBuilder UNDERFILL: selected "
-                            << selected_txs.size() << " tx / " << selected_bytes
+                            << tx_hashes.size() << " tx / " << selected_bytes
                             << "B into template while mempool holds " << pool.size()
                             << " tx / " << mempool_bytes << "B (" << mempool_fees
                             << " sat fees) — near-empty block on a non-empty "
-                            << "mempool; template-fill regression, gates cutover.";
+                            << "mempool; template-fill regression, gates cutover."
+                            << (budget_gate.truncated() ? " (G2 fill-budget cut)" : "");
             }
         }
 
@@ -735,7 +753,7 @@ public:
                 ext_outcome.detail = *refusal;
             }
             auto without = build_template(chain, pool, is_testnet, mweb_tracker, max_weight, refused,
-                                          template_tx_check_strict, coinbase_sigop_cost, nullptr);
+                                          template_tx_check_strict, coinbase_sigop_cost, nullptr, new_tx_budget);
             if (!without)
                 ext_outcome.reason = std::string(mweb_ext::kOwnCheckPrefix)
                                    + ext_outcome.reason.substr(std::string(mweb_ext::kMergedCheckPrefix).size());
@@ -771,9 +789,11 @@ public:
                  << " version=0x" << std::hex << block_version << std::dec
                  << " prev=" << tip.block_hash.GetHex().substr(0, 16) << "..."
                  << " bits=" << bits_to_hex(next_bits)
-                 << " subsidy=" << subsidy << " fees=" << total_fees
+                 << " subsidy=" << subsidy << " fees=" << fees
                  << " coinbasevalue=" << coinbasevalue << " sat"
                  << " txs=" << data["transactions"].size()
+                 << " newtx_bytes=" << budget_gate.spent()
+                 << (budget_gate.truncated() ? " (G2 budget cut)" : "")
                  << " mweb=" << (has_mweb ? "yes" : "no")
                  << (ext ? " mweb_ext=litecoind" : "")
                  << " tip_ts=" << tip.header.m_timestamp

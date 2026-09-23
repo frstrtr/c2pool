@@ -16,6 +16,7 @@
 using ltc::coin::FillBudget;
 using ltc::coin::FillBudgetBook;
 using ltc::coin::LEGACY_NEWTX_CAP;
+using ltc::coin::NewTxBudgetGate;
 
 namespace {
 
@@ -104,4 +105,68 @@ TEST(FillBudgetKat, RiderResetsWithParent) {
     book.on_block_reset("ltc", c());
     EXPECT_EQ(doge.shares_since_reset(), 0);
     EXPECT_EQ(doge.tokens(), 250000.0);
+}
+
+// ── Template-side gate (TemplateBuilder::build_template new_tx_budget) ──
+
+// Admit sizes through a gate the way build_template does (break on the
+// first refusal); returns the admitted prefix.
+static std::vector<uint64_t> gate_prefix(NewTxBudgetGate& g,
+                                         const std::vector<uint64_t>& sizes) {
+    std::vector<uint64_t> out;
+    for (auto s : sizes) { if (!g.admit(s)) break; out.push_back(s); }
+    return out;
+}
+
+// KAT-7: no budget == pre-G2 v36: every candidate admitted, never truncated.
+TEST(FillBudgetKat, GateUnlimitedAdmitsAll) {
+    NewTxBudgetGate g;
+    const std::vector<uint64_t> sizes = {400000, 300000, 900000, 250};
+    EXPECT_EQ(gate_prefix(g, sizes), sizes);
+    EXPECT_FALSE(g.truncated());
+    EXPECT_EQ(g.spent(), 1600250u);
+}
+
+// KAT-8: data.py break semantics: stop at the FIRST overflow, never
+// skip ahead to a smaller tx that would still fit (keeps the admitted set a
+// prefix -> parents-before-children order holds). Exact fit is admitted.
+TEST(FillBudgetKat, GateBreaksNoSkipAhead) {
+    NewTxBudgetGate g(50000);
+    EXPECT_EQ(gate_prefix(g, {20000, 30000, 1, 100}),
+              (std::vector<uint64_t>{20000, 30000}));   // 50000 == budget: fits
+    EXPECT_TRUE(g.truncated());
+    EXPECT_EQ(g.spent(), 50000u);
+    EXPECT_FALSE(g.admit(1));                           // closed stays closed
+}
+
+// KAT-9: the grant bounds the committed new bytes end-to-end: across the
+// KAT-1 saturated window, every template's admitted bytes <= that share's
+// grant, and settle(spent) feeds the next grant.
+TEST(FillBudgetKat, GateBoundsSpendByGrant) {
+    FakeClock c; auto b = ltc_bucket(c);
+    b.on_block_reset();
+    const std::vector<uint64_t> mempool(200, 4000);     // 800 kB backlog, 4 kB txs
+    for (int i = 0; i < 10; ++i) {
+        c.advance(15);
+        const int64_t grant = b.grant();
+        NewTxBudgetGate g(grant);
+        gate_prefix(g, mempool);
+        EXPECT_LE(static_cast<int64_t>(g.spent()), grant) << "share " << i;
+        EXPECT_GT(static_cast<int64_t>(g.spent()), grant - 4000) << "share " << i;
+        b.settle(static_cast<double>(g.spent()));
+    }
+}
+
+// KAT-10: a single tx larger than the grant yields an empty admitted set
+// (data.py: break on the first tx), and settle(0) still advances the ramp.
+TEST(FillBudgetKat, GateOversizeHeadTxAdmitsNothing) {
+    FakeClock c; auto b = ltc_bucket(c);
+    b.on_block_reset();
+    c.advance(15);
+    NewTxBudgetGate g(b.grant());                       // 50000 (ramp start)
+    EXPECT_TRUE(gate_prefix(g, {60000, 100}).empty());
+    b.settle(static_cast<double>(g.spent()));
+    EXPECT_EQ(b.shares_since_reset(), 1);
+    c.advance(15);
+    EXPECT_EQ(b.grant(), 100000);
 }
