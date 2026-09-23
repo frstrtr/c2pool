@@ -185,6 +185,11 @@ public:
         // D-3 back-pressure.
         std::size_t max_spans_per_peer = MAX_SPANS_PER_PEER;
         std::size_t max_spans_total    = MAX_SPANS_TOTAL;
+
+        // How long a handshaked link may go without a relay frame before
+        // broadcast skips it and telemetry counts it silent (design 2.3: two
+        // block intervals). Measured on each link's own clock.
+        Millis relay_silent_window_ms = 240'000;
     };
 
     struct Deps {
@@ -988,7 +993,11 @@ private:
             // the observable proxy is whether it has ever relayed to us on this
             // connection. A peer that holds us in state_synchronizing sends no
             // relay traffic, which is exactly what relay_silent() measures.
-            if (p.link->liveness().relay_silent(now_ms())) continue;
+            // Asked of the LINK, on the link's own clock: the liveness stamps
+            // are link-epoch milliseconds, and comparing them with the pool's
+            // now_ms() made every link opened >= 240 s after the pool started
+            // permanently "silent" -- broadcast then reached nobody.
+            if (p.link->relay_silent(cfg_.relay_silent_window_ms)) continue;
             if (p.link->send_notify(cmd, frame)) ++written;
         }
         ++tel_.broadcasts;
@@ -1102,7 +1111,7 @@ private:
                 ++handshaked;
                 snap.emplace_back(p.ref, p.sync);
                 ++groups[p.netgroup];
-                if (p.link && p.link->liveness().relay_silent(now)) ++silent;
+                if (p.link && p.link->relay_silent(cfg_.relay_silent_window_ms)) ++silent;
             } else {
                 ++dialing;
             }

@@ -748,6 +748,52 @@ void test_push_traffic_and_broadcast() {
 }
 
 // -----------------------------------------------------------------------
+// relay_silent is measured on ONE clock. The link stamps its liveness with its
+// own now_ms(), whose origin is the link's construction; the pool used to
+// compare those stamps against ITS now_ms(), whose origin is the pool's. So a
+// link opened more than the silence window after the pool started was always
+// "silent": broadcast skipped it and telemetry counted it -- on mainnet that
+// was silent=8 of 8 after a few hours, and a daemonless found block would have
+// reached nobody. Scaled down: a 2 s window, and the link opened 4 s after the
+// pool, which relays to us and is then broadcast to within the window.
+void test_broadcast_reaches_a_link_opened_late() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.relay_silent_window_ms = 2'000;
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    rig.pump(4'000);                                   // the pool's clock runs ahead
+    rig.pool->dial_now(daemon.key());
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "late: peer up");
+
+    daemon.push_fluffy_block(hash_of_byte(0x78), 2'204'102);
+    kat::check(rig.wait_for([&] { return !rig.chain.new_block_calls.empty(); }),
+               "late: the peer relayed a block to us");
+
+    std::vector<std::uint8_t> frame(16, 0xcd);
+    std::size_t       written = 0;
+    std::atomic<bool> done{false};
+    std::thread caller([&] {
+        written = rig.pool->broadcast_notify(levin::CMD_NEW_FLUFFY_BLOCK, frame);
+        done.store(true);
+    });
+    rig.wait_for([&] { return done.load(); }, 3000);
+    caller.join();
+    kat::checkf(written == 1,
+                "late: a link opened after the pool's silence window, that has just relayed "
+                "to us, is NOT relay-silent -- broadcast reaches it (%zu)", written);
+    rig.pump(100);                                     // one maintenance tick
+    const std::size_t silent = rig.pool->telemetry().relay_silent_peers;
+    kat::checkf(silent == 0, "late: telemetry does not count it silent (%zu)", silent);
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
 void test_broadcast_with_no_peers_is_zero() {
     // The never-silent-drop rule: a found block that reached nobody must report
     // zero loudly, not shrug.
@@ -951,6 +997,7 @@ int main(int argc, char** argv) {
     test_serving_obligation();
     test_serving_no_common_block_closes();
     test_push_traffic_and_broadcast();
+    test_broadcast_reaches_a_link_opened_late();
     test_broadcast_with_no_peers_is_zero();
     test_refill_across_several_daemons();
     test_unreachable_address_backs_off();
