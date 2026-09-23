@@ -136,6 +136,10 @@ struct PoolTelemetry {
     std::uint64_t broadcasts      = 0;
     std::uint64_t broadcast_peers = 0;
 
+    // Links closed because a 2003/2006 went unanswered past
+    // NON_RESPONSIVE_PEER_KICK_TIME; their spans are released by the close.
+    std::uint64_t request_kicks   = 0;
+
     // Per-command inbound tally and the last close reason. These are the two
     // numbers that answer "I am connected and receiving nothing, why?" without
     // a debugger -- the exact question the X9 stagenet bring-up could not
@@ -1079,6 +1083,7 @@ private:
 
         const bool was_handshaked = p.handshaked;
         const PeerRef ref = p.ref;
+        if (p.link && p.link->request_kicked()) ++tel_.request_kicks;
         tel_.last_close_peer = key;
         tel_.last_close_why  = why;
         if (p.link) p.link->stop(why);

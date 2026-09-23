@@ -572,6 +572,56 @@ void test_span_caps_refuse_visibly() {
 }
 
 // -----------------------------------------------------------------------
+// A PEER THAT NEVER ANSWERS GET_OBJECTS GIVES ITS SPAN BACK AT
+// NON_RESPONSIVE_PEER_KICK_TIME, not at the 240 s IDLE_PEER_KICK_TIME.
+// Hardening verify, mainnet catch-up: such peers held span slots for four
+// minutes each. Real deadline (20 s, the production default), one span slot
+// per peer so the slot coming back is directly observable.
+void test_unanswered_get_objects_releases_span() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+    daemon.answer_objects = false;
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    cfg.max_spans_per_peer = 1;
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "kick: peer up");
+
+    native::PeerRef ref;
+    ref.addr = daemon.key();
+    std::vector<Hash> ids;
+    for (int i = 0; i < 10; ++i) ids.push_back(hash_of_byte(static_cast<std::uint8_t>(0x20 + i)));
+    kat::check(rig.pool->request_objects(ref, ids, true), "kick: the span is accepted");
+    kat::check(rig.wait_for([&] {
+                   return daemon.count(levin::CMD_REQUEST_GET_OBJECTS) >= 1; }),
+               "kick: the 2003 reached the peer");
+    kat::check(!rig.pool->request_objects(ref, ids, true),
+               "kick: while it is unanswered the peer's only span slot is taken");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool kicked = rig.wait_for([&] {
+        return rig.pool->telemetry().last_close_why.find("NON_RESPONSIVE_PEER_KICK_TIME")
+               != std::string::npos; }, 26'000);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    kat::checkf(kicked, "kick: the silent peer is dropped at NON_RESPONSIVE_PEER_KICK_TIME "
+                        "(%.1f s after the request)", secs);
+    kat::checkf(secs < 24.0, "kick: well before IDLE_PEER_KICK_TIME (%.1f s)", secs);
+    kat::check(rig.chain.objects_calls.empty(), "kick: no span was fabricated");
+    kat::check(!rig.chain.peer_gone_calls.empty(),
+               "kick: the index is told the peer is gone (it re-plans the span)");
+    // The slot came back: a reservation against that key succeeds again. (The
+    // peer itself is gone, so the io thread hands this one back at once.)
+    kat::check(rig.pool->request_objects(ref, ids, true),
+               "kick: the kicked peer's span slot was released");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
 // THE POST-ANCHOR CATCH-UP STALL (mainnet, 2026-09-23), on loopback.
 //
 // A node booted from a mainnet anchor ~2.6 K blocks behind asked for 100-block
@@ -1046,6 +1096,7 @@ int main(int argc, char** argv) {
     test_object_chunking_and_span_reassembly();
     test_dense_mainnet_span_is_accepted_not_banned();
     test_span_caps_refuse_visibly();
+    test_unanswered_get_objects_releases_span();
     test_request_chain_forces_genesis_terminus();
     test_serving_obligation();
     test_serving_no_common_block_closes();

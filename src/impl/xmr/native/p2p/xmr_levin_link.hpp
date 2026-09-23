@@ -145,6 +145,11 @@ struct LinkConfig {
     Millis timed_sync_interval_ms  = P2P_DEFAULT_HANDSHAKE_INTERVAL_MS;
     Millis timed_sync_jitter_ms    = TIMED_SYNC_JITTER_MS;
     Millis peer_timeout_ms         = PEER_TIMEOUT_MS;
+    // monerod's NON_RESPONSIVE_PEER_KICK_TIME: a 2003 / 2006 still unanswered
+    // this long after we sent it closes the connection. Without it a peer that
+    // never answers a GET_OBJECTS holds the span (and its slot in the pool's
+    // D-3 budget) until IDLE_PEER_KICK_TIME, 240 s later.
+    Millis request_kick_ms         = NON_RESPONSIVE_PEER_KICK_MS;
 
     // How often deadlines are scanned. Everything here is measured in tens of
     // seconds, so a one-second tick costs nothing and keeps the timer logic to
@@ -288,6 +293,8 @@ public:
     }
     std::uint64_t timed_syncs_sent()     const noexcept { return timed_syncs_sent_; }
     std::uint64_t timed_syncs_answered() const noexcept { return timed_syncs_answered_; }
+    // True when the NON_RESPONSIVE_PEER_KICK_TIME rule closed this link.
+    bool          request_kicked() const noexcept { return request_kicked_; }
     LinkClose     close_reason()  const noexcept { return close_reason_; }
     const std::string& close_why() const noexcept { return close_why_; }
     std::shared_ptr<LevinSocket> socket() const noexcept { return socket_; }
@@ -611,6 +618,17 @@ private:
             fail(LinkClose::PeerUnresponsive, "no inbound bytes inside the peer timeout");
             return;
         }
+        if (expect_.kick_due(now, cfg_.request_kick_ms)) {
+            // monerod's own two-stage rule (kick_idle_peers): an outstanding
+            // 2003/2006 past the short deadline drops the peer, so the pool
+            // releases its spans and re-plans a dial now, not 240 s from now.
+            request_kicked_ = true;
+            fail(LinkClose::PeerUnresponsive,
+                 std::string("no ") + command_name(expect_.expected())
+                 + " inside NON_RESPONSIVE_PEER_KICK_TIME ("
+                 + std::to_string(cfg_.request_kick_ms) + " ms)");
+            return;
+        }
         if (expect_.idle_drop_due(now)) {
             fail(LinkClose::PeerUnresponsive,
                  std::string("no ") + command_name(expect_.expected())
@@ -670,6 +688,7 @@ private:
     std::uint64_t timed_syncs_answered_ = 0;
 
     bool        closed_       = false;
+    bool        request_kicked_ = false;
     LinkClose   close_reason_ = LinkClose::None;
     std::string close_why_;
 };
