@@ -774,4 +774,12 @@ if (BUILD_TESTING)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_owed_event_mmr_kat Threads::Threads)
     add_test(NAME v37_owed_event_mmr_kat COMMAND v37_owed_event_mmr_kat)
+
+    # V37 roundabout split S1-S5 (NEW standalone modules under
+    # src/c2pool/v37/roundabout/): their KATs live beside the headers and are
+    # pulled in here with an explicit binary dir, so src/c2pool/CMakeLists.txt
+    # stays untouched. SAME HOLLOW-GREEN GUARD: every v37_rb_* target is ALSO on
+    # BOTH build.yml --target lists.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/roundabout/test
+                     ${CMAKE_CURRENT_BINARY_DIR}/roundabout)
 endif()
