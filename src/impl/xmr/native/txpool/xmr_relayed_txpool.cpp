@@ -193,6 +193,19 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
         return verdict(Reason::Duplicate, false, d.id, e.evidence);
     }
 
+    // 4b) Already MINED? (#1686) A transaction relayed to us moments before a
+    //     block confirms it can arrive AFTER that block connected, when the
+    //     connect-time eviction has already run. Admitting it would put a
+    //     confirmed transaction into every template from here on, and every
+    //     block built on one is rejected. monerod asks the same question at the
+    //     same point (have_tx on the chain, right after the pool) and answers
+    //     it quietly: a late relay is not the peer's fault.
+    if (mined_id_locked(d.id)) {
+        ++stats_.rejected;
+        ++stats_.rejected_already_mined;
+        return verdict(Reason::AlreadyMined, false, d.id);
+    }
+
     // 5) NON-INPUT CONSENSUS -- the R-VAL heavy leg. Commitment balance, range
     //    proofs, key-image domain. This is what makes a bad-VALUE transaction a
     //    rejection rather than a block the network throws away.
@@ -208,6 +221,17 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
             return verdict(Reason::ProofFail, true, d.id, evidence);
         }
         evidence |= AdmissionEvidence::NonInputConsensus;
+    }
+
+    // 5a) A key image a recently connected block spent (#1686): the other half
+    //     of the late-arrival race, for a transaction whose id differs from the
+    //     mined one. Answered from the pool's own record, so it holds whether
+    //     or not the input-consensus leg below is armed; the verdict is the one
+    //     that leg gives for an on-chain spend.
+    if (mined_key_image_locked(d.rct.key_images)) {
+        ++stats_.rejected;
+        ++stats_.rejected_key_image_spent;
+        return verdict(Reason::KeyImageSpent, false, d.id, evidence);
     }
 
     // 5b) INPUT CONSENSUS -- the CLSAG ring signature over the resolved ring
@@ -501,7 +525,14 @@ std::vector<node::TxBacklogEntry> RelayedTxPool::snapshot_locked(
     keep.reserve(by_id_.size());
 
     for (const auto& [id, e] : by_id_) {
-        (void)id;
+        // The freshness re-check (#1686): never offer what a connected block
+        // already confirmed or double-spent. Admission refuses such an entry
+        // and the connect evicts it, so this never fires; excluded_mined is the
+        // tripwire that says so.
+        if (mined_id_locked(id) || mined_key_image_locked(e.key_images)) {
+            ++stats_.excluded_mined;
+            continue;
+        }
         // The load-bearing exclusion: a ring we could not resolve carries no
         // InputConsensus evidence, so under the default Exclude policy it is
         // never selectable/mined -- a forged-ring tx (rejected outright when the
@@ -624,13 +655,20 @@ void RelayedTxPool::on_block_connected(const BlockTxEvent& ev) {
         erase_locked(victim);
         ++stats_.evicted_conflict;
     }
+
+    // Remember what this block confirmed: the eviction above only reaches what
+    // the pool held at this instant, and a relay can still be in flight.
+    record_mined_locked(ev);
 }
 
 void RelayedTxPool::on_block_disconnected(const BlockTxEvent& ev) {
     // The disconnected block is no longer the tip; the new tip is one lower.
+    // Its transactions are unconfirmed again, so its record goes BEFORE the
+    // re-admission below, or the rollback would refuse its own bodies.
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (ev.height > 0) tip_height_ = ev.height - 1;
+        forget_mined_locked(ev);
     }
 
     // Bodies returned by the index are BEST EFFORT and carry no authority
@@ -645,6 +683,68 @@ void RelayedTxPool::on_block_disconnected(const BlockTxEvent& ev) {
     std::vector<std::vector<std::uint8_t>> blobs = ev.tx_blobs;
     // A transaction that was in a block was, by definition, publicly fluffed.
     on_relayed(self, std::move(blobs), /*dandelionpp_fluff=*/true);
+}
+
+// ---------------------------------------------------------------------------
+// The recently-mined record (#1686)
+// ---------------------------------------------------------------------------
+void RelayedTxPool::record_mined_locked(const BlockTxEvent& ev) {
+    if (cfg_.recent_mined_depth == 0) return;
+
+    // A block with nothing but a coinbase confirms nothing the pool could hold.
+    if (!ev.tx_hashes.empty() || !ev.key_images.empty()) {
+        MinedBlock b;
+        b.height     = ev.height;
+        b.block_id   = ev.block_id;
+        b.tx_hashes  = ev.tx_hashes;
+        b.key_images = ev.key_images;
+        for (const Hash& id : b.tx_hashes) ++mined_ids_[id];
+        for (const Hash& ki : b.key_images) ++mined_key_images_[ki];
+        recent_mined_.push_back(std::move(b));
+    }
+
+    // Keep the blocks within recent_mined_depth of the new tip. The deque is
+    // in connect order and a rollback removes from the tail, so the oldest is
+    // at the front; the size cap bounds the record even if a rollback never
+    // arrived for a block that left the chain.
+    while (!recent_mined_.empty() &&
+           (recent_mined_.front().height + cfg_.recent_mined_depth <= ev.height ||
+            recent_mined_.size() > cfg_.recent_mined_depth))
+        drop_mined_locked(recent_mined_.begin());
+}
+
+void RelayedTxPool::forget_mined_locked(const BlockTxEvent& ev) {
+    // Newest first: a rollback leaves from the tip.
+    for (auto it = recent_mined_.end(); it != recent_mined_.begin();) {
+        --it;
+        if (it->height == ev.height && it->block_id == ev.block_id) {
+            drop_mined_locked(it);
+            return;
+        }
+    }
+}
+
+void RelayedTxPool::drop_mined_locked(std::deque<MinedBlock>::iterator it) {
+    for (const Hash& id : it->tx_hashes) {
+        auto m = mined_ids_.find(id);
+        if (m != mined_ids_.end() && --m->second == 0) mined_ids_.erase(m);
+    }
+    for (const Hash& ki : it->key_images) {
+        auto m = mined_key_images_.find(ki);
+        if (m != mined_key_images_.end() && --m->second == 0) mined_key_images_.erase(m);
+    }
+    recent_mined_.erase(it);
+}
+
+bool RelayedTxPool::mined_id_locked(const Hash& id) const {
+    return mined_ids_.find(id) != mined_ids_.end();
+}
+
+bool RelayedTxPool::mined_key_image_locked(const std::vector<Hash>& key_images) const {
+    if (mined_key_images_.empty()) return false;
+    for (const Hash& ki : key_images)
+        if (mined_key_images_.find(ki) != mined_key_images_.end()) return true;
+    return false;
 }
 
 void RelayedTxPool::set_synced(bool synced) {

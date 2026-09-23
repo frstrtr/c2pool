@@ -121,6 +121,10 @@ struct TxRelayVerdict {
                            //   with InputConsensus. No drop.
         RingMemberLocked,  // a ring member is not yet unlocked / younger than
                            //   the spendable age. No drop.
+        AlreadyMined,      // a block we already connected confirmed this id
+                           //   (monerod: "already have transaction in
+                           //   blockchain") -- a late relay, not an offence.
+                           //   No drop. (#1686)
     };
 
     Reason reason = Reason::Accepted;
@@ -152,6 +156,7 @@ inline const char* to_string(TxRelayVerdict::Reason r) noexcept {
         case TxRelayVerdict::Reason::KeyImageSpent:    return "KeyImageSpent";
         case TxRelayVerdict::Reason::RingUnresolved:   return "RingUnresolved";
         case TxRelayVerdict::Reason::RingMemberLocked: return "RingMemberLocked";
+        case TxRelayVerdict::Reason::AlreadyMined:     return "AlreadyMined";
     }
     return "?";
 }

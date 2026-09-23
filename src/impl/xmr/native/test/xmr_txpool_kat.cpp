@@ -28,7 +28,8 @@
 //      copy of a real transaction with one byte changed in tx_extra keeps every
 //      key image and still passes non-input consensus, so first-seen-wins is
 //      what stops it from evicting the original from our template;
-//   7. mined removal and chain-side key-image eviction;
+//   7. mined removal and chain-side key-image eviction, and the late relay of a
+//      transaction whose block already connected (#1686);
 //   8. eviction under the cap and under age, and the pin that outranks both;
 //   9. the body surfaces C2 and C5 read.
 // ---------------------------------------------------------------------------
@@ -429,6 +430,7 @@ static void test_chain_events() {
     BlockTxEvent mined;
     mined.kind   = BlockTxEvent::Kind::Connected;
     mined.height = 2204800;
+    mined.block_id[0] = 0xB0;
     mined.tx_hashes.push_back(id_of(txs[0]));
 
     const std::uint64_t before = pool.backlog_version();
@@ -442,6 +444,7 @@ static void test_chain_events() {
     BlockTxEvent other_spend;
     other_spend.kind       = BlockTxEvent::Kind::Connected;
     other_spend.height     = 2204801;
+    other_spend.block_id[0] = 0xB1;
     other_spend.key_images = key_images_of(txs[1]);
     check(!other_spend.key_images.empty(), "the block event carries key images");
     pool.on_block_connected(other_spend);
@@ -454,14 +457,139 @@ static void test_chain_events() {
 
     // A rolled-back block hands bodies back BEST EFFORT; they go through the
     // whole admission path again, so a body that no longer verifies is simply
-    // not re-admitted.
+    // not re-admitted. The event names the block by height and id, as the
+    // chain view's disconnect_tip does.
     BlockTxEvent rolled_back;
-    rolled_back.kind = BlockTxEvent::Kind::Disconnected;
+    rolled_back.kind     = BlockTxEvent::Kind::Disconnected;
+    rolled_back.height   = mined.height;
+    rolled_back.block_id = mined.block_id;
     rolled_back.tx_hashes.push_back(id_of(txs[0]));
     rolled_back.tx_blobs.push_back(txs[0]);
     pool.on_block_disconnected(rolled_back);
     check(pool.contains(id_of(txs[0])),
           "a rolled-back transaction returns to the pool through admission");
+}
+
+// ---------------------------------------------------------------------------
+// 7b: relay-then-mine, the late arrival of a confirmed transaction (#1686)
+// ---------------------------------------------------------------------------
+// The order the stagenet soak hit: a transaction is relayed to monerod and to
+// us, monerod mines it ~0.8 s later, and the block reaches us BEFORE the relay
+// does. on_block_connected has nothing to evict at that point, so without a
+// record of what the block confirmed the late relay is admitted, and every
+// template after it carries a confirmed transaction the network rejects. The
+// pool here has no input-consensus sources wired, which is exactly the posture
+// in which the on-chain spent check is dormant.
+static void test_relay_after_mine() {
+    const auto txs = corpus();
+    if (txs.size() < 2) return;
+
+    const Hash t_id = id_of(txs[0]);
+    BlockTxEvent block;
+    block.kind        = BlockTxEvent::Kind::Connected;
+    block.height      = 2204900;
+    block.block_id[0] = 0xC0;
+    block.tx_hashes.push_back(t_id);
+    block.key_images  = key_images_of(txs[0]);
+    check(!block.key_images.empty(), "the confirming block carries the key images");
+
+    SYNCED_POOL(pool);
+    check(relay_one(pool, peer(1), txs[1]).reason == TxRelayVerdict::Reason::Accepted,
+          "an unrelated transaction is held");
+    pool.on_block_connected(block);
+    check(pool.size() == 1, "the connect had nothing of the mined transaction to evict");
+
+    // The late relay: the confirmed transaction arrives after its block.
+    const auto late = relay_one(pool, peer(2), txs[0]);
+    checkf(late.reason == TxRelayVerdict::Reason::AlreadyMined,
+           "a transaction relayed after its block connected is refused as already mined (%s)",
+           to_string(late.reason));
+    check(!late.drop_offense, "a late relay is not the peer's fault");
+    check(!pool.contains(t_id), "and it is not held");
+
+    // The next template: what C4 reads is the snapshot.
+    const auto backlog = pool.selectable_backlog();
+    bool carries_t = false;
+    for (const auto& b : backlog) carries_t = carries_t || b.id == t_id;
+    check(!carries_t, "the next template excludes the confirmed transaction");
+    check(backlog.size() == 1 && backlog[0].id == id_of(txs[1]),
+          "and still offers the unconfirmed one");
+
+    // Same key images, different id: the twin of the mined transaction is an
+    // on-chain double spend, no drop, even with the input-consensus leg dormant.
+    DecodedTx probe;
+    decode_relayed_tx(txs[0], probe);
+    std::vector<std::uint8_t> twin = txs[0];
+    twin[probe.prefix_size - probe.w.extra_size] ^= 0x01;
+    const auto tv = relay_one(pool, peer(3), twin);
+    checkf(tv.reason == TxRelayVerdict::Reason::KeyImageSpent,
+           "a twin spending the mined key images is refused as spent (%s)",
+           to_string(tv.reason));
+    check(!tv.drop_offense, "as a no-drop double spend");
+
+    const TxpoolStats s = pool.stats();
+    check(s.rejected_already_mined == 1, "the late relay is counted");
+    check(s.rejected_key_image_spent == 1, "the twin is counted as an on-chain spend");
+    check(s.excluded_mined == 0,
+          "and the snapshot tripwire never fired: nothing confirmed was ever held");
+
+    // A rollback makes the transaction unconfirmed again: the record for that
+    // block goes, and the body re-enters through admission.
+    BlockTxEvent rolled_back;
+    rolled_back.kind     = BlockTxEvent::Kind::Disconnected;
+    rolled_back.height   = block.height;
+    rolled_back.block_id = block.block_id;
+    rolled_back.tx_hashes.push_back(t_id);
+    rolled_back.tx_blobs.push_back(txs[0]);
+    pool.on_block_disconnected(rolled_back);
+    check(pool.contains(t_id), "a rolled-back confirmed transaction is admitted again");
+
+    // Mined again on the other branch: evicted, and a second late relay is
+    // refused again.
+    BlockTxEvent remined = block;
+    remined.block_id[0] = 0xC1;
+    pool.on_block_connected(remined);
+    check(!pool.contains(t_id), "mined on the other branch, it leaves the pool");
+    check(relay_one(pool, peer(4), txs[0]).reason == TxRelayVerdict::Reason::AlreadyMined,
+          "and a late relay after the re-mine is refused");
+
+    // A rollback of a block the record never held changes nothing.
+    BlockTxEvent stranger;
+    stranger.kind        = BlockTxEvent::Kind::Disconnected;
+    stranger.height      = block.height;
+    stranger.block_id[0] = 0xEE;
+    pool.on_block_disconnected(stranger);
+    check(relay_one(pool, peer(5), txs[0]).reason == TxRelayVerdict::Reason::AlreadyMined,
+          "a rollback of some other block does not forget this one");
+
+    // The record is bounded by recent_mined_depth blocks.
+    TxpoolConfig shallow;
+    shallow.recent_mined_depth = 2;
+    SYNCED_POOL(bounded, shallow);
+    bounded.on_block_connected(block);
+    check(relay_one(bounded, peer(1), txs[0]).reason == TxRelayVerdict::Reason::AlreadyMined,
+          "within the depth the late relay is refused");
+    BlockTxEvent next;
+    next.kind   = BlockTxEvent::Kind::Connected;
+    next.height = block.height + 1;
+    next.block_id[0] = 0xC2;
+    bounded.on_block_connected(next);
+    check(relay_one(bounded, peer(1), txs[0]).reason == TxRelayVerdict::Reason::AlreadyMined,
+          "one block later it is still refused");
+    next.height      = block.height + 2;
+    next.block_id[0] = 0xC3;
+    bounded.on_block_connected(next);
+    check(relay_one(bounded, peer(1), txs[0]).reason == TxRelayVerdict::Reason::Accepted,
+          "past the depth the record has let it go (the spent view, when wired, is the "
+          "long-range answer)");
+
+    // Depth 0 turns the record off: the pre-#1686 behaviour, byte for byte.
+    TxpoolConfig off;
+    off.recent_mined_depth = 0;
+    SYNCED_POOL(unrecorded, off);
+    unrecorded.on_block_connected(block);
+    check(relay_one(unrecorded, peer(1), txs[0]).reason == TxRelayVerdict::Reason::Accepted,
+          "with the record off, the late relay is admitted as before");
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +698,7 @@ int main() {
     test_sightings();
     test_key_image_conflict();
     test_chain_events();
+    test_relay_after_mine();
     test_eviction_and_bodies();
     std::printf("xmr_txpool_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

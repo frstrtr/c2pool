@@ -149,6 +149,17 @@ struct TxpoolConfig {
     // CRYPTONOTE_MAX_BLOCK_NUMBER: an unlock_time below this is a height, above
     // it is a timestamp.
     std::uint64_t max_block_number = 500000000;
+
+    // How many connected blocks' tx ids and key images the pool remembers on its
+    // own (#1686). A transaction relayed to us shortly before a block confirms
+    // it can arrive AFTER that block connected; on_block_connected has already
+    // run, so nothing evicts it, and every template after that carries a
+    // confirmed transaction the network rejects. The record refuses such a
+    // late arrival at admission and keeps it out of every snapshot. It does not
+    // depend on the input-consensus leg: the spent view is dormant without a
+    // wired source and drops a whole block's key images on an output-numbering
+    // gap. One day of blocks at the 120 s target. 0 disables the record.
+    std::uint64_t recent_mined_depth = 720;
 };
 
 // --- one pool entry ----------------------------------------------------------
@@ -246,6 +257,18 @@ struct TxpoolStats {
     // pooled tx had an unverifiable ring" -- the sensor the SPV-mining critique
     // is closed against: on a covered node it stays 0 while blocks fill.
     std::uint64_t excluded_unresolved      = 0;
+
+    // #1686, the late arrival of a transaction a connected block already
+    // confirmed. rejected_already_mined: its id is in a recently connected
+    // block -- no drop (monerod ignores "already have transaction in
+    // blockchain"), also counted in `rejected`. A different transaction
+    // spending a key image such a block spent is a KeyImageSpent refusal and
+    // is counted in rejected_key_image_spent. excluded_mined: entries a
+    // snapshot LEFT OUT because a recently connected block confirmed them or
+    // spent one of their key images. The admission gate and the connect-time
+    // eviction keep it at 0; it is the tripwire that says so.
+    std::uint64_t rejected_already_mined   = 0;
+    std::uint64_t excluded_mined           = 0;
 };
 
 // --- the pool ----------------------------------------------------------------
@@ -283,9 +306,12 @@ public:
 
     // --- C2 -> C3 chain context ---------------------------------------------
     // Connected: drop every mined id, then evict any entry sharing a key image
-    // with the block (the common double-spend race, resolved without history).
-    // Disconnected: re-admit the bodies the index still had, best effort, and
-    // never trust them for validity -- they are re-decoded and re-verified.
+    // with the block (the common double-spend race, resolved without history),
+    // and remember both for recent_mined_depth blocks so a LATE relay of the
+    // same transaction is refused rather than admitted (#1686).
+    // Disconnected: forget that block's record, then re-admit the bodies the
+    // index still had, best effort, and never trust them for validity -- they
+    // are re-decoded and re-verified.
     void on_block_connected(const BlockTxEvent& ev);
     void on_block_disconnected(const BlockTxEvent& ev);
 
@@ -331,6 +357,22 @@ private:
     std::vector<node::TxBacklogEntry> snapshot_locked(const TxpoolSelectPolicy& p) const;
     std::uint64_t now() const;
 
+    // The recently-mined record (#1686). One entry per connected block, in
+    // connect order; the two maps count how many live entries name an id / a
+    // key image, so a reorg that mines the same transaction again on the other
+    // branch never under-counts.
+    struct MinedBlock {
+        std::uint64_t     height = 0;
+        Hash              block_id{};
+        std::vector<Hash> tx_hashes;
+        std::vector<Hash> key_images;
+    };
+    void record_mined_locked(const BlockTxEvent& ev);
+    void forget_mined_locked(const BlockTxEvent& ev);
+    void drop_mined_locked(std::deque<MinedBlock>::iterator it);
+    bool mined_id_locked(const Hash& id) const;
+    bool mined_key_image_locked(const std::vector<Hash>& key_images) const;
+
     mutable std::mutex mu_;
     TxpoolConfig       cfg_;
     ClockFn            clock_;
@@ -355,6 +397,10 @@ private:
     // judged against the block we would mine next, tip_height_ + 1, for the
     // spendable-age and unlock-time rules. Set in on_block_connected.
     std::uint64_t             tip_height_ = 0;
+
+    std::deque<MinedBlock>                                 recent_mined_;
+    std::unordered_map<Hash, std::uint32_t, HashHasher>    mined_ids_;
+    std::unordered_map<Hash, std::uint32_t, HashHasher>    mined_key_images_;
 };
 
 } // namespace c2pool::xmr::native
