@@ -143,6 +143,42 @@ public:
     std::uint64_t reconciled() const noexcept { return reconciled_; }
     std::uint64_t reconcile_aborted() const noexcept { return reconcile_aborted_; }
 
+    // Restart-liveness fix (adversarial re-verify 2026-09-22): the F1 finalize driver's
+    // canonical test (XmrNode::chain_carries) answers from THIS mirror, and
+    // initial_sync() seeds ONLY the tip row. After a clean restart every row below the
+    // tip is absent, and an absent row read as "not canonical" -> the driver ORPHANED the
+    // node's own pending, perfectly canonical blocks at maturity (undoing settled
+    // payouts; the owed_digest diverged; the majority-shaped halt then fired correctly
+    // on a self-inflicted divergence). Fill ONE settled header synchronously from the
+    // daemon (same synchronous header round-trip reconcile_then_apply() already relies
+    // on). Never moves the tip, never emits an event; refuses to fetch above the tip
+    // (fix 5: never trust a row above the tip). Returns the row now resident, if any.
+    std::optional<ChainMainBlock> ensure_row(std::uint64_t height) {
+        bool fetch_failed = false;
+        return ensure_row(height, fetch_failed);
+    }
+    // R-C rework-2 (O3.5 false-orphan fix): the same backfill, but it tells the
+    // caller WHY no row came back. `fetch_failed` = the daemon header round-trip
+    // itself failed (transport error / unparseable body) -- that is "UNKNOWN",
+    // never evidence the block left the chain; the caller must HOLD rather than
+    // orphan. An empty index also reports fetch_failed (nothing to compare
+    // against yet). A height above the tip is answered absent with
+    // fetch_failed == false (fix 5: never trust a row above the tip; the chain
+    // genuinely does not carry anything there right now).
+    std::optional<ChainMainBlock> ensure_row(std::uint64_t height, bool& fetch_failed) {
+        fetch_failed = false;
+        if (auto r = index_.by_height(height); r && !is_zero(r->id)) return r;
+        if (index_.empty()) { fetch_failed = true; return std::nullopt; }
+        if (height > index_.best_height()) return std::nullopt;
+        std::optional<ChainMainBlock> d;
+        rpc_.get_block_header_by_height(height, [&](std::optional<ChainMainBlock> b, const std::string&) { d = b; });
+        if (!d) { ++row_backfill_failed_; fetch_failed = true; return std::nullopt; }
+        index_.backfill(*d); ++row_backfilled_;
+        return d;
+    }
+    std::uint64_t row_backfilled()      const noexcept { return row_backfilled_; }
+    std::uint64_t row_backfill_failed() const noexcept { return row_backfill_failed_; }
+
     void on_txpool_add(std::vector<TxBacklogEntry> txs) {
         for (auto& t : txs) index_.add_backlog_tx(t);
     }
@@ -189,6 +225,8 @@ private:
     MainchainIndex  index_;
     std::uint64_t   reconciled_ = 0;   //  fix: replacement rows applied by reconcile_then_apply
     std::uint64_t   reconcile_aborted_ = 0;   // reconcile walks aborted on a header-fetch failure (retried next poll)
+    std::uint64_t   row_backfilled_ = 0;      // restart-liveness: mirror rows filled on demand by ensure_row()
+    std::uint64_t   row_backfill_failed_ = 0; // restart-liveness: ensure_row() header fetches that failed (answer stayed absent)
     std::optional<MinerData> latest_miner_data_;
     std::unordered_set<std::uint64_t> seed_reqs_inflight_;
 };

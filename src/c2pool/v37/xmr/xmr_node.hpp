@@ -143,13 +143,112 @@ public:
     // consulted a different oracle than the one that finalizes would be a
     // second, disagreeing consensus -- and the one it disagreed with would be
     // the one holding the money.
+    // Two-valued view (race book / diagnostics): true iff the chain POSITIVELY
+    // carries bid at height. An UNKNOWN answer reads false here, so callers that
+    // must not act on "unknown" (the finalize walk, the booking gate, the
+    // deferred-drop) use chain_carries3() instead.
     bool chain_carries(std::uint64_t height, const std::string& bid_hex) {
+        return chain_carries3(height, bid_hex) == Carry::Yes;
+    }
+
+    // R-C rework-2 (O3.5 false-orphan fix): the TRI-STATE canonical answer.
+    //   Yes     -- the mirror (or a fresh daemon header) carries bid at height;
+    //   No      -- the mirror/daemon carries a DIFFERENT block there, or height is
+    //              above the tip (the chain genuinely does not carry it now);
+    //   Unknown -- the row is absent AND the daemon header fetch FAILED (or the
+    //              mirror is still empty). Never evidence the block left the
+    //              chain: the finalize walk HOLDS on it (xmr_finalize_driver.hpp
+    //              set_carry_probe), the booking gate keeps holding, a deferred
+    //              block is kept -- never a false orphan.
+    using Carry = XmrFinalizeDriver::Carry;
+    Carry chain_carries3(std::uint64_t height, const std::string& bid_hex) {
         if (m_adapter) {
             auto b = m_adapter->index().by_height(height);
-            return b && hex_of(b->id) == bid_hex;
+            bool fetch_failed = false;
+            if (!b || is_zero_id(b->id)) {
+                // Restart-liveness fix: initial_sync() seeds only the TIP row, so after a
+                // restart every height below the tip is absent from the mirror. An absent
+                // row is NOT evidence the block left the chain. Fill the row from the
+                // daemon once (synchronous settled-header fetch, never moves the tip).
+                b = m_adapter->ensure_row(height, fetch_failed);
+                log(std::string("chain_carries: mirror row h=") + std::to_string(height) +
+                    (b ? " was absent -> backfilled from the daemon (restart-liveness)"
+                       : fetch_failed ? " absent and the daemon header fetch FAILED -> UNKNOWN (hold, never a false orphan)"
+                                      : " absent (above the tip) -> not carried"));
+                if (!b && fetch_failed) { ++m_carry_unknown; return Carry::Unknown; }
+            }
+            return (b && hex_of(b->id) == bid_hex) ? Carry::Yes : Carry::No;
         }
-        return m_native_presence ? m_native_presence(height, bid_hex) : false;
+        return (m_native_presence && m_native_presence(height, bid_hex)) ? Carry::Yes : Carry::No;
     }
+    std::uint64_t carry_unknown_answers() const { return m_carry_unknown; }
+
+    // ── R-C rework-2 (F2): the chain-GAP RE-DRIVE ───────────────────────────
+    // Extend is the ONLY booking trigger (the extend observer -> FinalizeConnect::
+    // book_chain_block). Lane blocks mined while this node was DOWN, or across a
+    // ZMQ gap wider than the adapter's 64-row reconcile walk, never produced an
+    // Extend here (initial_sync direct-applies only the tip; MainchainIndex::apply
+    // sets resync_needed_ on a forward gap and nothing consumes it), so they were
+    // NEVER booked -- and the cursor then stepped past them (late_unbooked, the
+    // credit lost). With the re-drive enabled the node tracks the highest height
+    // whose Extend reached the installed extend observer (the SCAN height) and
+    //   * on every Extend/Reorg at H > scan + 1 re-drives every interior height
+    //     (scan, H) ascending through the SAME observers (header per height from
+    //     the mirror or one synchronous daemon fetch -- ensure_row);
+    //   * holds the finalize walk (a node-side booking gate) at any h with
+    //     h + D_conf > scan: an unscanned height may carry a lane block the synced
+    //     node had booked before FINALIZE(h) ran;
+    //   * on a RESUMED store starts the scan at the recovered finalize cursor, so
+    //     the boot tip (applied by initial_sync BEFORE the consumer installed its
+    //     observers) and every height the node missed while down are re-driven by
+    //     redrive_gap_to_tip() -- FinalizeConnect calls it from
+    //     reseed_after_bring_up(). Deferred-but-unbooked blocks that died with the
+    //     previous process (R6 m_deferred is in-memory) are recovered the same way.
+    // Dedup is FinalizeConnect's (pending / settled / memoized bids are skipped).
+    // A header-fetch failure stops the re-drive at that height (scan stays below
+    // it, the gate keeps holding) and the next event/tick retries. A gap wider
+    // than the mirror retention is truncated LOUDLY (counted). daemon-first only
+    // (the native index pumps every block it connects).
+    // Call BEFORE bring_up().
+    void enable_gap_redrive(bool on = true) { m_gap_redrive = on; }
+    bool gap_redrive_enabled() const noexcept { return m_gap_redrive; }
+    std::uint64_t scan_height() const noexcept { return m_scan_h; }
+    struct GapStats {
+        std::uint64_t redriven_heights = 0, redrive_calls = 0, fetch_failed = 0,
+                      truncated = 0, truncated_heights = 0, gate_holds = 0;
+    };
+    const GapStats& gap_stats() const noexcept { return m_gap; }
+
+    // Re-drive (scan, best] now (the boot path; also safe to call every tick).
+    // Returns the number of heights delivered. Advances settlement afterwards so
+    // the held walk resumes (the consumer's booking gate governs from here).
+    std::size_t redrive_gap_to_tip() {
+        if (!m_gap_redrive || !m_adapter || !m_cba_extend_observer) return 0;
+        const std::uint64_t best = m_adapter->index().best_height();
+        if (m_adapter->index().empty() || best == 0) return 0;
+        if (m_scan_h == 0) { m_scan_h = best; return 0; }   // fresh store: nothing precedes us
+        if (best <= m_scan_h) return 0;
+        const std::size_t n = redrive_range(m_scan_h + 1, best);
+        if (n && m_finalize && m_hw.hw_height) (void)readvance_settlement();
+        return n;
+    }
+
+    // Seed a SETTLED owed amount THROUGH the event log (F1). See
+    // XmrFinalizeDriver::seed_settled. Returns false when the store already holds
+    // it (resumed store) or before bring_up().
+    bool seed_settled_owed(const std::string& bid, const Amounts& credit, std::uint64_t bin_height) {
+        if (!m_finalize) return false;
+        const bool fresh = m_finalize->seed_settled(bid, credit, bin_height);
+        log(std::string("seed: ") + bid + (fresh ? " FOUND+FINALIZE written through the event log"
+                                                 : " already in the replayed store (resumed) -> not re-applied"));
+        return fresh;
+    }
+
+    // The consumer's booking gate (FinalizeConnect R4/R6). The node composes it
+    // with its own gap gate; install through here, not on the driver directly.
+    void set_booking_gate(XmrFinalizeDriver::BookingGateFn g) { m_consumer_gate = std::move(g); }
+
+    static bool is_zero_id(const c2pool::xmr::node::Hash& h) { for (auto c : h) if (c) return false; return true; }
 
     // The best height the settlement path is working against, from whichever
     // driver is live. In p2p-first this is the highest height a pumped event
@@ -178,7 +277,23 @@ public:
         {
             RecoveryDriver rec(*m_store, m_cfg.lane_chain);
             bool ok = false;
-            m_recovered = rec.recover(m_ledger, ok);
+            m_boot_digests.clear(); m_boot_since.clear();
+            m_boot_digests.push_back(m_ledger.owed_digest());   // the empty anchor / anchor-boot state
+            m_boot_since.push_back(0);
+            // R-C rework-3 (D7): pair every replayed digest state with the coin
+            // height it became current at (Finalize: bin_height - D_conf; the
+            // formula XmrFinalizeDriver::since_of_bin applies live).
+            std::uint64_t since = 0;
+            m_recovered = rec.recover(m_ledger, ok, {}, [this, &since](const OwedLedger& l, const SettleEvent& e) {
+                if (e.kind == SettleEvKind::Finalize)
+                    since = e.bin_height >= m_cfg.d_conf ? e.bin_height - m_cfg.d_conf : 0;
+                const ::v37::bytes32 d = l.owed_digest();
+                if (!(m_boot_digests.back() == d)) {   // R-B(i) follow-up: canonical D(c) history
+                    m_boot_digests.push_back(d);
+                    m_boot_since.push_back(since);
+                }
+            });
+            m_boot_last_since = since;
             if (!ok)
                 throw std::runtime_error(
                     "XmrNode: settlement store is torn (F2 fail-closed) — refusing to start");
@@ -224,6 +339,23 @@ public:
             m_ledger, m_hw, *m_store, m_cfg.lane_chain, m_cfg.d_conf,
             m_recovered.finalize_cursor_height, m_recovered.max_event_seq,
             [this](std::uint64_t h, const std::string& bid) { return chain_carries(h, bid); });
+        m_finalize->set_digest_since(m_boot_last_since);   // R-C rework-3 (D7): continue the replayed since-height
+        // R-C rework-2: tri-state carry (Unknown holds, never a false orphan) and
+        // the composed booking gate (node gap gate AND the consumer's R4/R6 gate).
+        m_finalize->set_carry_probe(
+            [this](std::uint64_t h, const std::string& bid) { return chain_carries3(h, bid); });
+        m_finalize->set_booking_gate([this](std::uint64_t h) {
+            if (!gap_gate(h)) return false;
+            return m_consumer_gate ? m_consumer_gate(h) : true;
+        });
+        // F2: a RESUMED store's scan starts at the recovered finalize cursor --
+        // every height above it must be (re-)driven through the extend observer
+        // before the walk may step there.
+        m_scan_h = (m_gap_redrive && daemon_tip && m_recovered.recovered)
+                       ? m_recovered.finalize_cursor_height : 0;
+        if (m_scan_h)
+            log("gap-redrive: armed; scan starts at the recovered finalize cursor " + std::to_string(m_scan_h) +
+                " (every canonical height above it is re-driven through the booking observer before FINALIZE)");
 
         if (daemon_tip) {
             m_adapter->set_event_sink(
@@ -290,6 +422,15 @@ public:
     const ::v37::bytes32& seed_digest() const { return m_seed_digest; }
     const std::vector<std::string>& construction_log() const { return m_log; }
     const RecoveredState& recovered() const { return m_recovered; }
+    // R-B(i) follow-up: every distinct owed_digest state the replayed store passed
+    // through, oldest first (ends at the live digest). Seeds the RECON candidate ring
+    // so a RESUMED node matches peer roots against its full canonical history (the
+    // fix for a resumed node starting with a 1-entry ring -> first peer block
+    // root-unknown forever).
+    const std::vector<::v37::bytes32>& boot_digest_history() const { return m_boot_digests; }
+    // R-C rework-3 (D7): parallel to boot_digest_history(): the coin height at
+    // which each replayed state became current (the RECON root-age bound).
+    const std::vector<std::uint64_t>&  boot_digest_since() const { return m_boot_since; }
 
     // R6 (two-sided chain-ordered booking): re-run the F1 finalize walk against
     // the CURRENT persisted high-water without a new chain event. FinalizeConnect
@@ -327,13 +468,71 @@ private:
     }
 
     // Route the X2 mainchain event stream into the F1 finalize driver.
+    // F2 node-side gate: never step onto h while a height <= h + D_conf has not
+    // been driven through the booking observer yet (scan below it).
+    bool gap_gate(std::uint64_t h) {
+        if (!m_gap_redrive || m_scan_h == 0) return true;
+        if (h + m_cfg.d_conf <= m_scan_h) return true;
+        ++m_gap.gate_holds;
+        return false;
+    }
+
+    // Deliver heights [lo, hi] ascending through the extend + chain observers.
+    // Stops at the first header-fetch failure (scan stays below it). Returns the
+    // number of heights delivered; m_scan_h advances to the last delivered one.
+    std::size_t redrive_range(std::uint64_t lo, std::uint64_t hi) {
+        if (lo > hi || !m_adapter) return 0;
+        ++m_gap.redrive_calls;
+        const std::uint64_t cap = m_cfg.index_retain_recent ? static_cast<std::uint64_t>(m_cfg.index_retain_recent) : 720;
+        if (hi - lo + 1 > cap) {
+            const std::uint64_t skip = (hi - lo + 1) - cap;
+            ++m_gap.truncated; m_gap.truncated_heights += skip;
+            log("gap-redrive ALARM: gap [" + std::to_string(lo) + ", " + std::to_string(hi) + "] is " +
+                std::to_string(hi - lo + 1) + " heights, wider than the mirror retention " + std::to_string(cap) +
+                " -> TRUNCATED: the lowest " + std::to_string(skip) + " height(s) are NOT re-driven (their lane blocks, if any, "
+                "stay unbooked: late_unbooked/credit divergence risk; W6 resync territory)");
+            lo += skip;
+            m_scan_h = lo - 1;
+        }
+        std::size_t n = 0;
+        for (std::uint64_t h = lo; h <= hi; ++h) {
+            bool fetch_failed = false;
+            auto row = m_adapter->ensure_row(h, fetch_failed);
+            if (!row || is_zero_id(row->id)) {
+                ++m_gap.fetch_failed;
+                log("gap-redrive: header h=" + std::to_string(h) + (fetch_failed ? " fetch FAILED" : " absent") +
+                    " -> re-drive stops at " + std::to_string(h - 1) + " (retried next event/tick; the finalize walk holds)");
+                break;
+            }
+            const std::string bid = hex_of(row->id);
+            if (m_cba_extend_observer) m_cba_extend_observer(h, bid);
+            if (m_chain_observer) m_chain_observer(h, bid);
+            m_scan_h = h; ++n; ++m_gap.redriven_heights;
+        }
+        if (n) log("gap-redrive: re-drove " + std::to_string(n) + " height(s) [" + std::to_string(lo) + ".." +
+                   std::to_string(lo + n - 1) + "] through the booking observer");
+        return n;
+    }
+
     void on_mainchain_event(const c2pool::xmr::node::MainchainEvent& ev) {
         using K = c2pool::xmr::node::MainchainEventKind;
+        // F2: re-drive the interior of a forward gap BEFORE the tip event (so
+        // chain order is preserved), and track the scan height. Before the
+        // consumer's observer is installed (bring_up's initial_sync) nothing is
+        // delivered and the scan does not move: redrive_gap_to_tip() covers it.
+        if (m_gap_redrive && m_adapter && m_cba_extend_observer && ev.kind != K::Orphan) {
+            const std::uint64_t H = ev.block.height;
+            if (m_scan_h != 0 && H > m_scan_h + 1) (void)redrive_range(m_scan_h + 1, H - 1);
+        }
         // c2pool#1551: announce the block BEFORE settlement moves on it, so a
         // rival that arrives in the same event is already in the race book when
         // the finalize driver reaches the height.
-        if (m_cba_extend_observer && ev.kind != K::Orphan)
+        if (m_cba_extend_observer && ev.kind != K::Orphan) {
             m_cba_extend_observer(ev.block.height, hex_of(ev.block.id));   //  book BEFORE the race book + BEFORE advance
+            // scan moves only across a CONTIGUOUS delivery: a gap whose re-drive
+            // stopped on a fetch failure keeps the scan (and so the gate) below it.
+            if (m_gap_redrive && (m_scan_h == 0 || ev.block.height <= m_scan_h + 1)) m_scan_h = ev.block.height;
+        }
         if (m_chain_observer) {
             if (ev.kind == K::Orphan) m_chain_observer(ev.block.height, hex_of(ev.orphaned_id));
             else                      m_chain_observer(ev.block.height, hex_of(ev.block.id));
@@ -370,6 +569,9 @@ private:
     OwedLedger                             m_ledger;
     SettleHW                               m_hw;
     RecoveredState                         m_recovered;
+    std::vector<::v37::bytes32>            m_boot_digests;   // R-B(i) follow-up: canonical owed_digest history from boot replay
+    std::vector<std::uint64_t>             m_boot_since;     // R-C rework-3 (D7): since-height per boot digest
+    std::uint64_t                          m_boot_last_since = 0;
 
     V37Engine                              m_engine;
     ::v37::bytes32                         m_seed_digest{};
@@ -385,6 +587,13 @@ private:
     // c2pool#1551: installed by the accounting layer (FinalizeConnect).
     ChainObserverFn                        m_chain_observer;
     ChainObserverFn                        m_cba_extend_observer;   // 
+
+    // R-C rework-2
+    XmrFinalizeDriver::BookingGateFn       m_consumer_gate;          // FinalizeConnect's R4/R6 gate
+    bool                                   m_gap_redrive = false;    // F2 re-drive armed (daemon-first)
+    std::uint64_t                          m_scan_h = 0;             // F2: highest height delivered to the extend observer (0 = unset)
+    GapStats                               m_gap;
+    std::uint64_t                          m_carry_unknown = 0;      // tri-state: Unknown answers given
 
     std::vector<std::string>               m_log;
     bool                                   m_up = false;

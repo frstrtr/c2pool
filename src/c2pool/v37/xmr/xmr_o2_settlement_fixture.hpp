@@ -391,10 +391,27 @@ public:
         m_paymap[key] = pay;
         const std::string bid = "fixture-seed-" + std::to_string(m_next_bid++);
         OwedLedger::Amounts credit; credit[key] = static_cast<long long>(amount);
+        const std::uint64_t age = m_next_age++;
+        if (m_seed_sink) {
+            // R-C rework-2 (F1): the seed goes THROUGH the node's write-ahead event
+            // log (FOUND + FINALIZE, each firing the ledger-event observer), so a
+            // restarted node's replayed digest history contains it. The sink is
+            // idempotent on a resumed store (the replay already applied it).
+            m_last_seed_fresh = m_seed_sink(bid, credit, age);
+            return key;
+        }
         ledger().on_block_found(bid, credit, /*payout=*/{});
-        ledger().on_block_finalized(bid, /*bin_height=*/m_next_age++);
+        ledger().on_block_finalized(bid, /*bin_height=*/age);
+        m_last_seed_fresh = true;
         return key;
     }
+    // R-C rework-2 (F1): route seeds through the node's event log (XmrNode::
+    // seed_settled_owed). Without it seed_owed mutates the ledger OUTSIDE the
+    // log -- invisible to RecoveryDriver, the restart-liveness root cause.
+    using SeedSink = std::function<bool(const std::string& bid, const OwedLedger::Amounts& credit,
+                                        std::uint64_t bin_height)>;
+    void set_seed_sink(SeedSink s) { m_seed_sink = std::move(s); }
+    bool last_seed_fresh() const { return m_last_seed_fresh; }
 
     // Convenience: seed from raw key material.
     ::v37::bytes32 seed_owed_std(const std::array<std::uint8_t, 32>& spend_B,
@@ -424,6 +441,8 @@ private:
     std::map<::v37::bytes32, ::v37::ScriptRef> m_paymap;
     std::uint64_t                         m_next_bid = 0;
     std::uint64_t                         m_next_age = 1;   // 0 reserved / unarmed
+    SeedSink                              m_seed_sink;       // R-C rework-2 (F1)
+    bool                                  m_last_seed_fresh = true;
 };
 
 // ===========================================================================
