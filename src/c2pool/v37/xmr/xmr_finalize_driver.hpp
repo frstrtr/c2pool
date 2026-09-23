@@ -103,6 +103,44 @@ public:
     using FinalizeStepFn = std::function<void(const std::string& bid, std::uint64_t h, std::uint64_t bin_height)>;
     void set_finalize_observer(FinalizeStepFn f) { m_on_finalize = std::move(f); }
 
+    // R-C rework-2 (O3.5 false-orphan fix): the TRI-STATE canonical probe. The
+    // bool CanonicalFn has no third value, so a header-fetch failure used to be
+    // answered "not carried" and the block ORPHANED at maturity (a false orphan
+    // of a perfectly canonical block -> owed_digest fork). When this probe is
+    // installed it REPLACES the bool test in the maturity walk: Yes -> finalize,
+    // No -> orphan, Unknown -> HOLD the walk at h-1 (nothing at h is mutated;
+    // the next advance retries). Unset => the bool CanonicalFn, as before.
+    enum class Carry : int { No = 0, Yes = 1, Unknown = 2 };
+    using CarryFn = std::function<Carry(std::uint64_t height, const std::string& bid)>;
+    void set_carry_probe(CarryFn f) { m_carry = std::move(f); }
+    std::uint64_t carry_unknown_holds() const { return m_carry_unknown; }
+
+    // R-C rework-2 (F1 restart-liveness root cause): a SETTLED seed (demo /
+    // fixture owed) routed THROUGH the write-ahead event log, exactly like a
+    // chain block: FOUND(bid, credit, {}) then FINALIZE(bid, bin_height), each
+    // durable before the ledger mutation and each firing the ledger-event
+    // observer (the RECON candidate ring). A seed that bypasses the log (the old
+    // XmrOwedFixture::seed_owed) is invisible to RecoveryDriver, so the replayed
+    // boot_digest_history() of a restarted node never contains the states it
+    // lived through -> a peer block committing a pre-restart state is refused.
+    // Idempotent: a bid the ledger already knows (a resumed store that replayed
+    // this very seed) is a no-op and returns false.
+    bool seed_settled(const std::string& bid, const Amounts& credit, std::uint64_t bin_height) {
+        if (m_ledger.is_settled(bid) || m_ledger.is_pending(bid)) return false;
+        SettleEvent fe;
+        fe.kind = SettleEvKind::Found; fe.bid = bid; fe.credit = credit;
+        write_event(fe);
+        m_ledger.on_block_found(bid, credit, /*payout=*/{});
+        ledger_event();
+        SettleEvent fz;
+        fz.kind = SettleEvKind::Finalize; fz.bid = bid; fz.bin_height = bin_height;
+        write_event(fz);
+        m_ledger.on_block_finalized(bid, bin_height);
+        ledger_event();
+        persist_hw();
+        return true;
+    }
+
     XmrFinalizeDriver(OwedLedger& ledger, SettleHW& hw, ISettleStore& store,
                       ::v37::ChainId chain, std::uint64_t d_conf,
                       std::uint64_t recovered_cursor_height,
@@ -211,12 +249,27 @@ public:
             bool touched = false;                            // a found block was disposed at h
 
             auto bit = m_by_height.find(h);
+            // R-C rework-2: tri-state pre-pass. If ANY live found block at h has an
+            // UNKNOWN carry answer (header fetch failed), hold the walk at h-1
+            // BEFORE mutating anything at h -- never a false orphan.
+            if (bit != m_by_height.end() && m_carry) {
+                bool unknown = false;
+                for (const std::string& bid : bit->second) {
+                    auto fit = m_found.find(bid);
+                    if (fit == m_found.end() || !fit->second.canonical) continue;
+                    if (!m_ledger.is_pending(bid)) continue;
+                    if (m_carry(h, bid) == Carry::Unknown) { unknown = true; break; }
+                }
+                if (unknown) { ++m_carry_unknown; ++m_stalled; break; }
+            }
             if (bit != m_by_height.end()) {
                 for (const std::string& bid : bit->second) {
                     auto fit = m_found.find(bid);
                     if (fit == m_found.end()) continue;
                     if (!fit->second.canonical) continue;             // already orphaned
-                    if (m_is_canonical && !m_is_canonical(h, bid)) {  // orphaned at maturity
+                    const bool carried = m_carry ? (m_carry(h, bid) == Carry::Yes)
+                                                 : (!m_is_canonical || m_is_canonical(h, bid));
+                    if (!carried) {                                   // orphaned at maturity
                         on_block_orphaned(bid);
                         touched = true;
                         continue;
@@ -282,6 +335,8 @@ private:
     std::uint64_t  m_stalled = 0;                // R4: times the gate held the cursor
     LedgerEventFn  m_on_ledger_event;            // R5: per-ledger-event observer (candidate ring)
     FinalizeStepFn m_on_finalize;                // R6: pre-FINALIZE observer (pending-set evidence)
+    CarryFn        m_carry;                      // R-C rework-2: tri-state canonical probe (Unknown -> hold)
+    std::uint64_t  m_carry_unknown = 0;          // R-C rework-2: walks held on an Unknown carry answer
 
     std::map<std::string, FoundBlock>              m_found;      // bid -> block
     std::map<std::uint64_t, std::vector<std::string>> m_by_height; // mined height -> bids

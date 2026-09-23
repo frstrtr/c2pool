@@ -154,11 +154,25 @@ public:
     // on). Never moves the tip, never emits an event; refuses to fetch above the tip
     // (fix 5: never trust a row above the tip). Returns the row now resident, if any.
     std::optional<ChainMainBlock> ensure_row(std::uint64_t height) {
+        bool fetch_failed = false;
+        return ensure_row(height, fetch_failed);
+    }
+    // R-C rework-2 (O3.5 false-orphan fix): the same backfill, but it tells the
+    // caller WHY no row came back. `fetch_failed` = the daemon header round-trip
+    // itself failed (transport error / unparseable body) -- that is "UNKNOWN",
+    // never evidence the block left the chain; the caller must HOLD rather than
+    // orphan. An empty index also reports fetch_failed (nothing to compare
+    // against yet). A height above the tip is answered absent with
+    // fetch_failed == false (fix 5: never trust a row above the tip; the chain
+    // genuinely does not carry anything there right now).
+    std::optional<ChainMainBlock> ensure_row(std::uint64_t height, bool& fetch_failed) {
+        fetch_failed = false;
         if (auto r = index_.by_height(height); r && !is_zero(r->id)) return r;
-        if (index_.empty() || height > index_.best_height()) return std::nullopt;
+        if (index_.empty()) { fetch_failed = true; return std::nullopt; }
+        if (height > index_.best_height()) return std::nullopt;
         std::optional<ChainMainBlock> d;
         rpc_.get_block_header_by_height(height, [&](std::optional<ChainMainBlock> b, const std::string&) { d = b; });
-        if (!d) { ++row_backfill_failed_; return std::nullopt; }   // caller keeps the status-quo answer (absent)
+        if (!d) { ++row_backfill_failed_; fetch_failed = true; return std::nullopt; }
         index_.backfill(*d); ++row_backfilled_;
         return d;
     }

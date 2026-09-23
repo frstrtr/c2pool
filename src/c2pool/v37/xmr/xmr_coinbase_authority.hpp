@@ -55,6 +55,14 @@ struct CoinbaseBooking {
     ::xmr::coin::Hash256 onchain_root{};
     bool           has_onchain_root = false;
     std::map<::v37::bytes32, long long> payout;   // identity -> piconero, the on-chain truth
+    // R-C rework-2 (F-MONEY, M2): when an output maps to NO known payee the block
+    // stays fail-closed for booking (ok == false, unchanged), but the MAPPED
+    // outputs are kept in `payout` (flag payout_partial) and the unmapped sum is
+    // reported, so a refusing node can still debit what it CAN attribute and
+    // put the rest in node-local suspense. Before, payout was cleared.
+    bool           payout_partial = false;
+    std::uint64_t  unmapped_total = 0;
+    std::size_t    unmapped_outputs = 0;
     // recon(A+B credit): the ON-CHAIN CREDIT CUT (0x02 tail), if the coinbase carries one.
     bool           has_credit_cut = false;
     credit::CreditCut credit_cut;
@@ -142,8 +150,12 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
                 found = true; break;
             }
         }
-        if (!found) { b.why = "output " + std::to_string(i) + " maps to no known payee (fail-closed)"; b.payout.clear(); return b; }
+        if (!found) {
+            ++b.unmapped_outputs; b.unmapped_total += got.amounts[i];
+            if (b.why.empty()) b.why = "output " + std::to_string(i) + " maps to no known payee (fail-closed)";
+        }
     }
+    if (b.unmapped_outputs) { b.payout_partial = true; return b; }   // fail-closed for booking; mapped part kept for the debit
     b.ok = true;
     return b;
 }

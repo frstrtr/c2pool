@@ -154,6 +154,8 @@ static bool          g_no_book_deferral = false;         // --no-book-deferral: 
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
 static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
 static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
+static std::uint64_t g_cba_attributed_by_wire = 0;       // R-C rework-2: root-unknown payouts attributed via the v0x02 wire descriptor
+static bool g_lane_suspended_now = false;                  // R-C rework-2: main-thread view of the lane-suspend state (pump_miner reads it)
 
 static MoneroNetwork parse_net(const std::string& s) {
     if (s == "mainnet")  return MoneroNetwork::Mainnet;
@@ -509,6 +511,11 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     auto pump_miner = [&]() {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
         if (!cpu_miner) return;
+        if (g_lane_suspended_now) {   // R-C rework-2: suspended -> no job, and no hit is ever submitted
+            mine::MinerHit dropped;
+            while (cpu_miner->pop_hit(dropped)) {}
+            return;
+        }
         strat::TemplateJob tj;
         if (template_source.get_job(mine_extra_nonce, tj) && tj.template_id != mine_job_tid) {
             // Seed residency BEFORE any hit can arrive: the Argon2d init is the
@@ -598,6 +605,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     auto drain_stratum_log = [&]() {
         for (const auto& l : listener.drain_log()) std::printf("  [stratum] %s\n", l.c_str());
     };
+    std::uint64_t suspend_lag_n = 0, suspend_isolated_n = 0, suspend_held_n = 0, resume_n = 0;
     auto status = [&]() {
         const auto ls = listener.stats();
         const auto fs = fc.stats();
@@ -684,7 +692,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                 const std::uint64_t fr = hw_now >= cfg.d_conf ? hw_now - cfg.d_conf : 0;
                 const auto& fo_ = fc.options();
                 std::printf("  r6: booking deferred=%llu attempted_after_deferral=%llu waiting_now=%zu | divergence: lag=%llu (max %llu) "
-                            "cap=%llu heights/%llu ticks ticks_over=%llu DIVERGED=%llu alarms=%llu dropped=%llu\n",
+                            "cap=%llu heights/%llu ticks ticks_over=%llu ISOLATED=%llu alarms=%llu dropped=%llu\n",
                             static_cast<unsigned long long>(fs.booking_deferred),
                             static_cast<unsigned long long>(fs.booked_after_deferral),
                             fc.deferred_now(),
@@ -696,16 +704,43 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(fs.diverged),
                             static_cast<unsigned long long>(fs.divergence_alarms),
                             static_cast<unsigned long long>(fs.divergence_dropped));
-                // R-C majority-shaped halt: refused-not-credited (must be 0 in a
-                // converged run), the longest consecutive refused run, and whether a
-                // decided majority-shaped divergence tripped. lane_suspended reflects
-                // the stratum withdraw (defect 4) / builder lag-gate (defect 3b).
-                std::printf("  r-c: refused_not_credited=%llu refuse_run_max=%llu majority_diverged=%llu | lane_suspended=%s (job %s)\n",
+                // R-C rework-2: the lineage vote (CONVERGED/CONTESTED/ISOLATED; never a
+                // halt on refused blocks alone), debit-on-refuse + suspense (money
+                // conservation of refused blocks), HELD (never dropped) + HELD-LAG,
+                // the F2 gap re-drive, and the split lane-suspend counters.
+                const auto ls2 = listener.stats();
+                std::printf("  r-c: refused_not_credited=%llu vote=%s (window %llu/%llu refused, %llu unattributed; votes me=%llu counter=%llu; "
+                            "contested_entered=%llu isolated_entered=%llu exited=%llu lineages=%llu)\n",
                             static_cast<unsigned long long>(fs.refused_not_credited),
-                            static_cast<unsigned long long>(fs.refuse_run_max),
-                            static_cast<unsigned long long>(fs.majority_diverged),
+                            o2::FinalizeConnect::vote_state_name(fc.vote_state()),
+                            static_cast<unsigned long long>(fs.obs_refused), static_cast<unsigned long long>(fs.obs_n),
+                            static_cast<unsigned long long>(fs.obs_unattributed),
+                            static_cast<unsigned long long>(fs.votes_me), static_cast<unsigned long long>(fs.votes_counter),
+                            static_cast<unsigned long long>(fs.contested_entered), static_cast<unsigned long long>(fs.isolated_entered),
+                            static_cast<unsigned long long>(fs.isolated_exited), static_cast<unsigned long long>(fs.counter_lineages));
+                std::printf("  money: refused_debited=%llu pico=%llu | suspense refused_unattributed=%llu pico=%llu | attributed_by_wire=%llu\n",
+                            static_cast<unsigned long long>(fs.refused_debited), static_cast<unsigned long long>(fs.refused_debited_pico),
+                            static_cast<unsigned long long>(fs.refused_unattributed), static_cast<unsigned long long>(fs.refused_unattributed_pico),
+                            static_cast<unsigned long long>(g_cba_attributed_by_wire));
+                const auto& gs = node.gap_stats();
+                std::printf("  hold: held_now=%llu entered=%llu resolved=%llu | held_lag=%llu (entered %llu cleared %llu) | carry_unknown=%llu walk_holds=%llu "
+                            "| gap-redrive scan=%llu heights=%llu calls=%llu fetch_failed=%llu truncated=%llu gate_holds=%llu\n",
+                            static_cast<unsigned long long>(fs.held_now), static_cast<unsigned long long>(fs.held_entered),
+                            static_cast<unsigned long long>(fs.held_resolved), static_cast<unsigned long long>(fs.held_lag),
+                            static_cast<unsigned long long>(fs.held_lag_entered), static_cast<unsigned long long>(fs.held_lag_cleared),
+                            static_cast<unsigned long long>(node.carry_unknown_answers()),
+                            static_cast<unsigned long long>(node.finalize_driver().carry_unknown_holds()),
+                            static_cast<unsigned long long>(node.scan_height()), static_cast<unsigned long long>(gs.redriven_heights),
+                            static_cast<unsigned long long>(gs.redrive_calls), static_cast<unsigned long long>(gs.fetch_failed),
+                            static_cast<unsigned long long>(gs.truncated), static_cast<unsigned long long>(gs.gate_holds));
+                std::printf("  suspend: lane_suspended=%s (job %s) | suspend lag=%llu isolated=%llu held=%llu resume=%llu | "
+                            "stratum edges=%llu disconnects=%llu sink_refused=%llu\n",
                             listener.lane_suspended() ? "YES" : "no",
-                            listener.lane_suspended() ? "WITHDRAWN, shares refused" : "served");
+                            listener.lane_suspended() ? "WITHDRAWN, sessions dropped, logins parked" : "served",
+                            static_cast<unsigned long long>(suspend_lag_n), static_cast<unsigned long long>(suspend_isolated_n),
+                            static_cast<unsigned long long>(suspend_held_n), static_cast<unsigned long long>(resume_n),
+                            static_cast<unsigned long long>(ls2.suspend_edges), static_cast<unsigned long long>(ls2.suspend_disconnects),
+                            static_cast<unsigned long long>(ls2.suspended_sink_refused));
             }
             for (const std::uint64_t h : contested) {
                 const auto* cs = fc.race().candidates_at(h);
@@ -751,21 +786,78 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
 
     auto last_status = std::chrono::steady_clock::now();
     std::string last_template_err;
-    // R-C (defects 3b + 4): the lane-suspend state. A node must NOT produce a lane
-    // template / commit a lane_commitment while its OWN finalize cursor lags its tip
-    // beyond a safe window (else it emits a stale-root block peers must refuse), and
-    // it must WITHDRAW the stratum job + refuse shares once the ledger has DIVERGED
-    // (terminal). The lag-gate clears when the cursor catches up; divergence does not.
-    // Safe window = 2 * D_conf (matches the divergence-cap slack): normal finalize lag
-    // is ~D_conf, and booking defers up to 1 + D_conf, so 2*D_conf never trips in a
-    // converged run but bounds a builder that has fallen genuinely behind.
-    const std::uint64_t kLaneLagWindow = 2 * cfg.d_conf;
-    bool lane_suspend_prev = false;
+    // R-C rework-2: THE LANE-SUSPEND STATE, one place, three causes, split counters.
+    //   lag      -- ONE lag definition everywhere (the R6 one, frontier-based):
+    //               lag = (hw - D_conf) - cursor. Suspend at lag > 2*D_conf, RESUME
+    //               at lag <= D_conf (hysteresis). The old gate used tip - cursor
+    //               (a D_conf offset against R6), which never auto-resumed in
+    //               the verify rig (RESUMED=0).
+    //   isolated -- the lineage vote: a VERIFIED counter-lineage outvotes us
+    //               (FinalizeConnect ISOLATED; non-terminal).
+    //   held     -- HELD-LAG (an undecided lane block holds the cursor past the cap).
+    // The ISOLATED edge is ALSO applied synchronously from inside fc.tick() through
+    // the isolation hook (no share/hit can slip between the decision and the
+    // suspension); the lag/held causes are re-evaluated right after fc.tick().
+    const std::uint64_t kLaneLagSuspend = 2 * cfg.d_conf, kLaneLagResume = cfg.d_conf;
+    bool lane_suspend_prev = false, lag_suspended = false;
+    auto miner_suspend = [&]() {
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+        if (cpu_miner) {
+            cpu_miner->stop();                       // workers halted, job invalidated
+            mine::MinerHit dropped; std::size_t n = 0;
+            while (cpu_miner->pop_hit(dropped)) ++n;  // a hit on the withdrawn job is never submitted
+            mine_job_tid = 0;                        // resume re-pushes the (fresh) template
+            std::printf("  [cpu-miner] STOPPED on lane suspend (%zu queued hit(s) discarded)\n", n);
+        }
+#endif
+    };
+    auto apply_suspension = [&]() -> bool {
+        if (!serving) return false;
+        const std::uint64_t hw_now = node.hw().hw_height;
+        const std::uint64_t cursor = node.finalize_driver().cursor_height();
+        const std::uint64_t frontier = hw_now >= cfg.d_conf ? hw_now - cfg.d_conf : 0;
+        const std::uint64_t lag = frontier > cursor ? frontier - cursor : 0;
+        if (!lag_suspended && lag > kLaneLagSuspend) lag_suspended = true;
+        else if (lag_suspended && lag <= kLaneLagResume) lag_suspended = false;
+        const bool isolated = fc.isolated(), held = fc.held_lag();
+        const bool lane_suspend = isolated || held || lag_suspended;
+        listener.set_lane_suspended(lane_suspend);   // edge-triggered inside (disconnect + park)
+        g_lane_suspended_now = lane_suspend;
+        if (lane_suspend && !lane_suspend_prev) {
+            if (isolated) ++suspend_isolated_n; else if (held) ++suspend_held_n; else ++suspend_lag_n;
+            miner_suspend();
+            std::printf("cba-ALARM: lane template production SUSPENDED + stratum job WITHDRAWN (sessions dropped, logins parked) "
+                        "+ in-process miner stopped -- cause=%s (hw=%llu frontier=%llu cursor=%llu lag=%llu suspend>%llu resume<=%llu). "
+                        "The node stays alive (chain follow, settlement, booking, peer relay); it will not emit a block committing a "
+                        "stale/minority owed_digest root.%s\n",
+                        isolated ? "ISOLATED (a verified counter-lineage outvotes this node)" : held ? "HELD-LAG (an undecided lane block holds the cursor)" : "LAG (finalize cursor behind the buried frontier)",
+                        static_cast<unsigned long long>(hw_now), static_cast<unsigned long long>(frontier),
+                        static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(lag),
+                        static_cast<unsigned long long>(kLaneLagSuspend), static_cast<unsigned long long>(kLaneLagResume),
+                        isolated ? " Exit: W6 verified adoption + restart, or the vote flips." : " Auto-resumes when the cause clears.");
+            std::fflush(stdout);
+        } else if (!lane_suspend && lane_suspend_prev) {
+            ++resume_n;
+            std::printf("cba: lane template production RESUMED -- all suspend causes cleared (lag=%llu <= %llu, not isolated, no held-lag); "
+                        "parked logins will be served the fresh template\n",
+                        static_cast<unsigned long long>(lag), static_cast<unsigned long long>(kLaneLagResume));
+            std::fflush(stdout);
+        }
+        lane_suspend_prev = lane_suspend;
+        return lane_suspend;
+    };
+    fc.set_isolation_hook([&](bool on, const std::string&) {
+        if (!on || !serving) return;
+        listener.set_lane_suspended(true);   // synchronous: before fc.tick() returns
+        g_lane_suspended_now = true;
+        miner_suspend();
+    });
     while (!g_stop.load()) {
         pump_miner();       // --mine: hits first, so a find is bridged the same pass
         if (hooks.inject_pump) hooks.inject_pump();  // --native-inject-dir scan
         bridge_found();
         fc.tick();
+        const bool lane_suspend = apply_suspension();   // right after the tick that may have decided it
         if (hooks.cba_tick) hooks.cba_tick();   // 
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
         // p2p-first replaces both with the native chain's own event drain, and
@@ -777,34 +869,6 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             node.adapter().ensure_seed_reach();
         }
         if (serving) {
-            // R-C builder lag-gate + withdraw-on-diverged. tip = the high-water the
-            // node has observed; cursor = the finalize cursor. If the cursor lags the
-            // tip beyond the safe window we must not build (a stale-root block), and
-            // if the ledger has DIVERGED we suspend for good.
-            const std::uint64_t tip    = node.hw().hw_height;
-            const std::uint64_t cursor = node.finalize_driver().cursor_height();
-            const std::uint64_t lane_lag = tip > cursor ? tip - cursor : 0;
-            const bool diverged     = fc.diverged();
-            const bool lag_suspend  = lane_lag > kLaneLagWindow;
-            const bool lane_suspend = diverged || lag_suspend;
-            listener.set_lane_suspended(lane_suspend);   // defect 4: withdraw job + refuse shares
-            if (lane_suspend && !lane_suspend_prev) {
-                std::printf("cba-ALARM: lane template production SUSPENDED + stratum job WITHDRAWN -- %s "
-                            "(tip=%llu cursor=%llu lag=%llu window=%llu). The node stays alive (chain follow, "
-                            "settlement observe, peer relay); it will not emit a block committing a stale/diverged "
-                            "owed_digest root, nor accept a share for the withdrawn job.%s\n",
-                            diverged ? "settlement ledger DIVERGED (terminal)" : "builder finalize cursor lags its tip beyond the safe window",
-                            static_cast<unsigned long long>(tip), static_cast<unsigned long long>(cursor),
-                            static_cast<unsigned long long>(lane_lag), static_cast<unsigned long long>(kLaneLagWindow),
-                            diverged ? " Recovery: W6 resync from a converged peer, then restart." : " Auto-resumes when the cursor catches up.");
-                std::fflush(stdout);
-            } else if (!lane_suspend && lane_suspend_prev) {
-                std::printf("cba: lane template production RESUMED -- builder cursor caught up (tip=%llu cursor=%llu lag=%llu <= window=%llu)\n",
-                            static_cast<unsigned long long>(tip), static_cast<unsigned long long>(cursor),
-                            static_cast<unsigned long long>(lane_lag), static_cast<unsigned long long>(kLaneLagWindow));
-                std::fflush(stdout);
-            }
-            lane_suspend_prev = lane_suspend;
 
             const bool refreshed = lane_suspend ? false : provider.refresh();
             bool new_template = false;
@@ -842,6 +906,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
     }
 
+    fc.set_isolation_hook({});   // R-C rework-2: the hook captures loop-scope state; detach before teardown
     std::printf("\nstopping…\n");
 #if defined(V37_XMR_O2_WITH_RANDOMX)
     if (cpu_miner) { cpu_miner->stop(); pump_miner(); }   // drain anything already found
@@ -1017,6 +1082,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         node.set_native_chain_presence(chain_src.is_canonical);
     }
+    // R-C rework-2 (F2): daemon-first re-drives every chain gap (downtime / a ZMQ
+    // gap wider than the reconcile walk) through the booking path.
+    if (!p2p_first) node.enable_gap_redrive(true);
     try {
         node.bring_up();
     } catch (const std::exception& e) {
@@ -1080,6 +1148,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::uint64_t recompute_captured = 0, recompute_unavailable = 0, recompute_ok = 0, recompute_mismatch = 0;
     std::optional<::v37::ScriptRef> cba_payee_ref;
     std::uint64_t cba_fetches = 0, cba_booked = 0, cba_not_lane = 0, cba_refused = 0;
+
     auto cba_ring_push = [&]() {
         const ::v37::bytes32 d = node.ledger().owed_digest();
         if (cba_ring.empty() || !(cba_ring.back() == d)) {
@@ -1216,45 +1285,81 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (g_credit_mutate && !credit.empty()) credit.begin()->second += g_credit_mutate;   // the falsifier: a 1-piconero lie must show in owed_digest
         return true;
     };
-    fo.book_from_chain = [&](std::uint64_t h, const std::string& bid, Amounts& credit, Amounts& payout, std::string& why) -> bool {
-        if (!cba_fx || !cba_scfg) { why = "not-lane: no v37 settlement ledger bound (option A)"; return false; }
+    // R-C rework-2 (F-MONEY): the RICH booking callback. Same authority as before
+    // for the CREDIT side (fail-closed); in addition, on every refusal it reports
+    // the block's on-chain PAYOUT map whenever it is attributable (so the refusing
+    // node DEBITS it -- debit-on-refuse) and the owed value it cannot attribute
+    // (node-local suspense). Payout attribution is SELF-AUTHENTICATING (r*G == R,
+    // then every output must map), so ANY lane_commitment candidate is safe for
+    // attribution even when it is useless for credit -- a root-unknown block is
+    // attributed with the v0x02 wire descriptor's owed_digest_at_win when one
+    // arrived for it (M3 source (b)).
+    auto root_hex32 = [](const auto& r) {
+        static const char* hx = "0123456789abcdef";
+        std::string o; o.reserve(64);
+        const unsigned char* rp = reinterpret_cast<const unsigned char*>(r.data());
+        for (std::size_t i = 0; i < 32; ++i) { o.push_back(hx[rp[i] >> 4]); o.push_back(hx[rp[i] & 15]); }
+        return o;
+    };
+    fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
+        Amounts& credit = out.credit; Amounts& payout = out.payout; std::string& why = out.why;
+        if (!cba_fx || !cba_scfg) {
+            // option B not bound yet (boot window) -> TRANSIENT, never memoized not-lane;
+            // option A never binds -> a stranger's block for this node.
+            if (cfg.coinbase == CoinbaseMode::V37Settlement) { why = "cut-pending: settlement ledger not bound yet (boot)"; return false; }
+            why = "not-lane: no v37 settlement ledger bound (option A)"; return false;
+        }
         cba_ring_push();
         ++cba_fetches;
         c2pool::v37n::xmr::authority::CoinbaseBooking bk;
         std::vector<std::uint8_t> chain_blob;
         if (!fetch_decode(bid, bk, why, &chain_blob) && !bk.is_lane && bk.why.empty()) { ++cba_refused; return false; }
+        out.total_pico = bk.total;
+        if (bk.has_onchain_root) out.onchain_root_hex = root_hex32(bk.onchain_root);
         if (!bk.ok) {
             why = bk.why;
             if (why.rfind("lane-root-unknown:", 0) == 0) {   // R5: NOT not-lane; FinalizeConnect keeps + retries it as the ring advances
                 // R-C decidability. The R6 deferral gate guarantees our cursor >=
                 // H_b-1-D_conf (the builder's cut) at book time. If we are SYNCED to
                 // that cut and our FULL canonical history ring (seeded from the boot
-                // replay, matched whole in decode_blob) STILL holds no digest whose
-                // mm_root equals the block's on-chain 0x03 root, this is NOT catch-up
-                // lag -- the block was built on a ledger state this node never passed
-                // through. Reclassify to "lane-root-refused:<roothex>:" so
-                // FinalizeConnect REFUSES-not-credits it (loud alarm, gate released,
-                // NOT a halt) and feeds the majority-shaped divergence run. A single
-                // such block never halts; only M consecutive from >= 2 distinct roots
-                // (the "distinct payees" proxy -- payout identity is undecodable under
-                // an unknown root) is a decided divergence. During boot warm-up the
-                // ring is short and un-seeded: stay transient (lane-root-unknown).
+                // replay -- which, with the F1 fix, contains every state this node
+                // lived through) STILL holds no digest whose mm_root equals the
+                // block's on-chain 0x03 root, this is NOT catch-up lag. Reclassify to
+                // "lane-root-refused:<roothex>:" so FinalizeConnect REFUSES-not-credits
+                // it (loud alarm, gate released), DEBITS its payout when attributable,
+                // and records ONE lineage-vote observation (never a halt by itself).
+                // During boot warm-up the ring is short and un-seeded: stay transient.
                 static constexpr std::size_t kReconWarmupK = 4;   // R-C: warm-up depth below which an unseeded ring is not yet decidable
                 const std::uint64_t bcut = (h >= 1 + cfg.d_conf) ? h - 1 - cfg.d_conf : 0;
                 const std::uint64_t cur  = node.finalize_driver().cursor_height();
                 const bool decidable = (cur >= bcut) && (cba_ring_seeded || cba_ring.size() > kReconWarmupK);
                 if (decidable && bk.has_onchain_root) {
-                    static const char* hx = "0123456789abcdef";
-                    std::string roothex; roothex.reserve(64);
-                    const unsigned char* rp = reinterpret_cast<const unsigned char*>(bk.onchain_root.data());
-                    for (std::size_t i = 0; i < 32; ++i) { roothex.push_back(hx[rp[i] >> 4]); roothex.push_back(hx[rp[i] & 15]); }
+                    const std::string roothex = root_hex32(bk.onchain_root);
                     why = "lane-root-refused:" + roothex + ":" + why.substr(std::string("lane-root-unknown:").size());
+                    // M3(b): attribution-only decode with the wire descriptor's lane_commitment.
+                    out.unattributed_pico = bk.total;   // default: the whole reward (incl. sink -- no r, no sink split)
+                    if (auto wit = wire_cache.find(bid); wit != wire_cache.end()) {
+                        std::vector<::v37::bytes32> cands{wit->second.d.owed_digest_at_win};
+                        std::vector<::v37::bytes32> keys;
+                        for (const auto& k : cba_fx->keys()) keys.push_back(k);
+                        const auto ab = c2pool::v37n::xmr::authority::decode_lane_coinbase(chain_blob, cfg.lane_chain, cands, keys,
+                                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
+                        if (ab.ok || ab.payout_partial) {
+                            payout = ab.payout; out.payout_decoded = true; out.unattributed_pico = ab.unmapped_total;
+                            ++g_cba_attributed_by_wire;
+                            std::printf("cba-attrib: h=%llu bid=%s… root-unknown block's PAYOUT attributed via the wire descriptor's lane_commitment "
+                                        "(r*G==R verified; %zu payee(s), unmapped=%llu) -- credit still REFUSED\n",
+                                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), payout.size(),
+                                        static_cast<unsigned long long>(ab.unmapped_total));
+                        }
+                    }
                     if (cba_root_unknown_seen.insert(bid).second) {
                         ++cba_lane_root_unknown;
-                        std::printf("cba-ALARM lane_root_refused: h=%llu bid=%s SYNCED (cursor=%llu >= builder cut=%llu) but the on-chain 03 root %s matches NO digest in our %zu-state canonical history -- REFUSED (not credited), majority-shaped run fed (never a single-block halt)\n",
+                        std::printf("cba-ALARM lane_root_refused: h=%llu bid=%s SYNCED (cursor=%llu >= builder cut=%llu) but the on-chain 03 root %s matches NO digest in our %zu-state canonical history -- REFUSED (not credited), payout %s, one lineage-vote observation (never a single-block halt)\n",
                                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(),
                                     static_cast<unsigned long long>(cur), static_cast<unsigned long long>(bcut),
-                                    roothex.substr(0, 12).c_str(), cba_ring.size());
+                                    roothex.substr(0, 12).c_str(), cba_ring.size(),
+                                    out.payout_decoded ? "DEBITED (attributed)" : "-> suspense (unattributable)");
                     }
                     return false;
                 }
@@ -1265,9 +1370,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                 }
                 return false;
             }
-            if (bk.is_lane) ++cba_refused; else ++cba_not_lane;
+            if (bk.is_lane) {
+                ++cba_refused;
+                // matched root but fail-closed on an output (unmapped payee): the
+                // mapped part is debited, the unmapped sum goes to suspense.
+                if (bk.payout_partial) { payout = bk.payout; out.payout_decoded = true; out.unattributed_pico = bk.unmapped_total; }
+            } else ++cba_not_lane;
             return false;
         }
+        // from here the payout side is fully decoded (proven coinbase authority, deterministic r)
+        payout = bk.payout; out.payout_decoded = true;
         if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); ++cba_refused; return false; }
         // RECOMPUTE CROSS-CHECK (own win): our submitted bytes vs the chain's. Sanity only --
         // the chain decode above stays the authority whatever this says.
@@ -1296,7 +1408,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                                                      static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), mism.c_str()); }
             own_recompute.erase(rit);
         }
-        payout = bk.payout;   // the PAYOUT side: proven coinbase authority (deterministic r), unchanged
+        // (the PAYOUT side was set above: proven coinbase authority, deterministic r)
         // recon(A+B credit): the CREDIT side. AUTHORITY = the on-chain credit cut (B); FAST PATH = the v0x02 descriptor (A),
         // used only when it AGREES with the chain; on mismatch the chain wins; unreconstructable => fail-closed.
         if (!bk.has_credit_cut) { ++cut_absent; why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; ++cba_refused; return false; }
@@ -1519,6 +1631,13 @@ static int run_live(const XmrNodeConfig& cfg) {
         // coinbase carries an OWED output alongside the sink (multi-output proof).
         o2::XmrOwedFixture ledger(node.ledger());   //  ONE ledger — K_fair is built over the ledger FOUND/FINALIZE mutate
         cba_fx = &ledger; cba_scfg = &scfg;
+        // R-C rework-2 (F1): every seed goes through the node's write-ahead event
+        // log (FOUND + FINALIZE), so a restarted node's replayed boot digest history
+        // (the RECON ring seed) contains the states it lived through; on a resumed
+        // store the seed is already in the log and is NOT re-applied.
+        ledger.set_seed_sink([&](const std::string& bid, const Amounts& credit, std::uint64_t bin) {
+            return node.seed_settled_owed(bid, credit, bin);
+        });
         // recon(A+B credit): the template commits THIS node's receipt-lane cut (P, spine) on-chain (0x02 tail)
         scfg.credit_cut_source = [&](std::uint64_t& P, ::v37::bytes32& dg) -> bool {
             auto s = node.engine().snapshot(cfg.lane_chain); if (!s) return false; P = s->next_pos; dg = s->digest; return true; };
@@ -1550,8 +1669,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                 const std::uint64_t amt = cfg.owed_demo_amount * static_cast<std::uint64_t>(ki + 1);
                 ::v37::bytes32 kid = ledger.seed_owed_std(B, A, amt);
                 feed_refs.push_back(::v37::xmr::make_xmr_std(B, A));   // recon(A+B credit): receipt identity == owed key
-                std::printf("owed-demo: seeded key%d id=%s... amount=%llu piconero (distinct K_fair payee)\n",
-                            ki, hex_of(kid).substr(0,12).c_str(), static_cast<unsigned long long>(amt));
+                std::printf("owed-demo: seeded key%d id=%s... amount=%llu piconero (distinct K_fair payee) [%s]\n",
+                            ki, hex_of(kid).substr(0,12).c_str(), static_cast<unsigned long long>(amt),
+                            ledger.last_seed_fresh() ? "written through the event log" : "already in the resumed store's log -- not re-applied");
             }
         }
 

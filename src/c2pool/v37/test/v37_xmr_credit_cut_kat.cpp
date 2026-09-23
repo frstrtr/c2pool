@@ -320,6 +320,27 @@ void suite_armed_vs_unarmed(std::string& unarmed_hex, std::string& armed_hex) {
         CHECK(bk_a.payout == bk_u.payout && bk_a.total == bk_u.total && bk_a.lane_commitment == bk_u.lane_commitment,
               "payout map / total / lane_commitment identical armed vs unarmed (%zu payees, %llu piconero)",
               bk_a.payout.size(), static_cast<unsigned long long>(bk_a.total));
+        // R-C rework-2 (F-MONEY M2): an output mapping to NO known payee keeps the
+        // block fail-closed for booking, but the decoder now reports the mapped
+        // part + the unmapped sum instead of clearing the payout map (so a refusing
+        // node can debit what it can attribute). Keep ONLY the last paid key in the
+        // payee registry (the fixture aliases STD/SUB refs over the same keys, so
+        // dropping one key is not enough): every other owed output is unmapped.
+        if (bk_a.payout.size() >= 2) {
+            const ::v37::bytes32 kept = bk_a.payout.rbegin()->first;
+            const ::v37::bytes32 dropped = bk_a.payout.begin()->first;
+            std::vector<::v37::bytes32> keys_minus{kept};
+            const auto bk_p = auth::decode_lane_coinbase(a.bytes.full_blob, LANE_CHAIN, cands, keys_minus,
+                                                         a.lane.scfg.residual_sink, a.lane.scfg.residual_sink_identity, a.lane.ledger.pay_of());
+            std::map<::v37::bytes32, long long> expect; expect[kept] = bk_a.payout.at(kept);
+            long long dropped_amt = 0; for (const auto& [k, v] : bk_a.payout) if (!(k == kept)) dropped_amt += v;
+            (void)dropped;
+            CHECK(!bk_p.ok && bk_p.payout_partial && bk_p.unmapped_outputs >= 1 &&
+                  bk_p.unmapped_total == static_cast<std::uint64_t>(dropped_amt) && bk_p.payout == expect &&
+                  bk_p.sink_total == bk_a.sink_total,
+                  "unmapped payee: fail-closed (ok=0) but PARTIAL payout kept (%zu of %zu keys) + unmapped_total=%llu == the unregistered keys' %lld",
+                  bk_p.payout.size(), bk_a.payout.size(), static_cast<unsigned long long>(bk_p.unmapped_total), dropped_amt);
+        }
     }
 
     // --- the K_fair shape gate ACCEPTs both -------------------------------------
