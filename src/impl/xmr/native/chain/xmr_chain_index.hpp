@@ -307,6 +307,13 @@ public:
         return r;
     }
 
+    // The monerod checkpoints fencing reorgs, as boot_from_anchor() installs
+    // them from the bundle. Exposed for rigs that seed without a bundle.
+    void set_monerod_checkpoints(std::vector<std::pair<std::uint64_t, Hash>> cps) {
+        std::lock_guard<std::mutex> lk(mu_);
+        checkpoints_ = std::move(cps);
+    }
+
     // --- IChainIndexInbound ---------------------------------------------------------
     void on_peer_sync_data(const PeerRef& p, const PeerSyncData& d) override {
         {
@@ -1347,7 +1354,17 @@ private:
             ++chain_refusals_;
             return false;
         }
+        // monerod's rule (checkpoints::is_alternative_block_allowed): only the
+        // highest checkpoint at or below the chain's HEIGHT (block count, i.e.
+        // tip + 1) fences alternatives, and it fences blocks at or below it --
+        // a branch whose first block sits at fork_height + 1 is allowed iff
+        // that checkpoint < fork_height + 1. A checkpoint ABOVE our chain says
+        // nothing yet about a fork beneath it; comparing against every
+        // checkpoint refused every reorg, a one-block sibling race at the tip
+        // included, whenever a bundle carried one above the anchor (which
+        // checkpoints_at_or_above() keeps by construction).
         for (const auto& cp : checkpoints_) {
+            if (cp.first > best.height + 1) continue;   // not reached yet
             if (fork_height < cp.first) {
                 journal_.refuse(rec, ReorgRefusal::BelowCheckpoint,
                                 "the fork point is below the pinned checkpoint at "
