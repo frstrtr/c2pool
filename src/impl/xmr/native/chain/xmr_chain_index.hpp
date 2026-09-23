@@ -325,7 +325,7 @@ public:
                 const std::uint8_t want =
                     hf_version_for_height(opts_.net, d.current_height - 1);
                 if (d.top_version != 0 && d.top_version < want) {
-                    peers_.erase(p.peer_id);
+                    peers_.erase(peer_key_(p));
                     penalize_locked_(&p, PeerFault::VersionMismatch,
                                      "advertised top_version " + std::to_string(d.top_version)
                                      + " is below the " + std::to_string(want)
@@ -334,7 +334,7 @@ public:
                     return;
                 }
             }
-            peers_[p.peer_id] = d;
+            peers_[peer_key_(p)] = d;
             update_synced_locked_();
         }
         flush_events_();
@@ -405,7 +405,7 @@ public:
     void on_peer_gone(const PeerRef& p) override {
         {
             std::lock_guard<std::mutex> lk(mu_);
-            peers_.erase(p.peer_id);
+            peers_.erase(peer_key_(p));
             update_synced_locked_();
         }
         flush_events_();
@@ -1647,14 +1647,35 @@ private:
         return b;
     }
 
+    // One vote per CONNECTION. The levin peer_id is the remote's own claim and
+    // is not unique (anonymity-network peers all send 0), so keying the cohort
+    // by it collapsed honest peers into one vote -- and let on_peer_gone for
+    // one of them erase the others'.
+    static std::string peer_key_(const PeerRef& p) {
+        return p.addr.empty() ? "#" + std::to_string(p.peer_id) : p.addr;
+    }
+
     std::uint64_t cohort_height_locked_() const {
         // The cohort is the peers that agree with the heaviest claim. We take
         // the MEDIAN of their advertised heights rather than the maximum, so one
         // peer shouting a huge height cannot hold `synced` false forever.
+        //
+        // Only PLAUSIBLE votes count: a peer advertising a height below our own
+        // verified chain (current_height is one past its tip) is behind us and
+        // says nothing about whether WE are synced. A fresh-from-genesis
+        // monerod advertises ~1, and such peers are a normal fraction of the
+        // dialable population: with them in the median, a stale node reported
+        // synced=1 and served templates 30+ blocks behind the network. If
+        // every peer is level with or behind us, we are at the cohort's tip.
         if (peers_.empty()) return cohort_max_;
+        const std::uint64_t frontier = view_.verified_frontier();
+        const std::uint64_t anchor   = view_.anchor_height();
+        const std::uint64_t level    = (frontier > anchor ? frontier : anchor) + 1;
         std::vector<std::uint64_t> hs;
         hs.reserve(peers_.size());
-        for (const auto& kv : peers_) hs.push_back(kv.second.current_height);
+        for (const auto& kv : peers_)
+            if (kv.second.current_height >= level) hs.push_back(kv.second.current_height);
+        if (hs.empty()) return level;
         std::sort(hs.begin(), hs.end());
         return hs[hs.size() / 2];
     }
@@ -2212,7 +2233,7 @@ private:
     std::deque<std::uint64_t>                   lt_mirror_;
     std::deque<std::pair<bool, std::uint64_t>>  lt_undo_;
 
-    std::map<std::uint64_t, PeerSyncData> peers_;
+    std::map<std::string, PeerSyncData> peers_;   // keyed by peer_key_()
     std::vector<Hash> wanted_;
     std::vector<Hash> refetch_;
 

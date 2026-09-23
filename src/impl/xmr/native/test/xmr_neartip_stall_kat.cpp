@@ -621,10 +621,110 @@ void test_held_parent_drains_child() {
                 (unsigned long long)rig.out_failed);
 }
 
+// ===========================================================================
+// C. the cohort: peers behind us are not votes, and a connection is one vote
+// ===========================================================================
+// The mainnet dry run went from `h=3768570/3768586 synced=0` to
+// `h=3768570/1 synced=1` on the next status line and served templates for
+// hours at a tip 30-150 blocks stale: fresh-from-genesis monerods (they
+// advertise current_height ~1) had dragged the cohort MEDIAN down to 1.
+void say(Rig& rig, const PeerRef& p, std::uint64_t current_height) {
+    PeerSyncData d;
+    d.current_height        = current_height;
+    d.top_id                = rig.net.empty() ? rig.anchor_id : rig.net.back().id;
+    d.top_version           = 16;
+    d.cumulative_difficulty = U128{0, 1};
+    d.support_flags         = 1;
+    rig.boot->on_peer_sync_data(p, d);
+}
+
+void test_cohort_ignores_peers_behind_us() {
+    Rig rig;
+    if (!rig.ok) return;
+    const std::uint64_t G = kAnchorHeight + 200;
+    for (std::uint64_t k = 0; k < 200; ++k) rig.grow(false);
+    for (std::uint64_t h = kAnchorHeight + 1; h <= G; h += 100)
+        rig.deliver_span(h, std::min(G, h + 99));
+    rig.advertise();
+    kat::checkf(rig.tip_height() == G, "C: caught up to %llu", (unsigned long long)G);
+    kat::check(rig.idx->sync_state().synced, "C: level with the honest cohort: synced");
+
+    // The network moves 30 blocks on; the honest peers say so.
+    for (int k = 0; k < 30; ++k) rig.grow(false);
+    rig.advertise();
+    kat::check(!rig.idx->sync_state().synced, "C: 30 behind the honest cohort: NOT synced");
+
+    // Three fresh-from-genesis peers connect.
+    const PeerRef f1 = peer("203.0.113.1:18080", 0x0f01);
+    const PeerRef f2 = peer("203.0.113.2:18080", 0x0f02);
+    const PeerRef f3 = peer("203.0.113.3:18080", 0x0f03);
+    say(rig, f1, 1);
+    say(rig, f2, 1);
+    say(rig, f3, 1);
+    const native::SyncState s1 = rig.idx->sync_state();
+    kat::checkf(!s1.synced,
+                "C: three peers advertising height 1 do not make a stale node synced "
+                "(cohort %llu, tip %llu; on master the median fell to 1)",
+                (unsigned long long)s1.cohort_height, (unsigned long long)rig.tip_height());
+    kat::checkf(s1.cohort_height == rig.net_top() + 1, "C: the cohort is the honest %llu (got %llu)",
+                (unsigned long long)(rig.net_top() + 1), (unsigned long long)s1.cohort_height);
+
+    // Three honest anonymity-network peers, all with levin peer_id 0, at the
+    // network tip: three connections, three votes. Keyed by peer_id they were
+    // one vote, and a single fresh peer could tie them.
+    rig.boot->on_peer_gone(rig.pa);
+    rig.boot->on_peer_gone(rig.pb);
+    const PeerRef z1 = peer("198.51.100.11:18080", 0);
+    const PeerRef z2 = peer("198.51.100.12:18080", 0);
+    const PeerRef z3 = peer("198.51.100.13:18080", 0);
+    say(rig, z1, rig.net_top() + 1);
+    say(rig, z2, rig.net_top() + 1);
+    say(rig, z3, rig.net_top() + 1);
+    // A peer a little ahead of us but behind the network is still plausible.
+    const PeerRef s = peer("198.51.100.20:18080", 0x5555);
+    const PeerRef t = peer("198.51.100.21:18080", 0x5556);
+    say(rig, s, G + 2);
+    say(rig, t, G + 2);
+    kat::checkf(rig.idx->sync_state().cohort_height == rig.net_top() + 1,
+                "C: three peer_id-0 peers are three votes (cohort %llu, expected %llu)",
+                (unsigned long long)rig.idx->sync_state().cohort_height,
+                (unsigned long long)(rig.net_top() + 1));
+    // One of them leaving takes one vote, not all three.
+    rig.boot->on_peer_gone(z1);
+    kat::checkf(rig.idx->sync_state().cohort_height == rig.net_top() + 1,
+                "C: one peer_id-0 peer leaving does not erase the others (cohort %llu)",
+                (unsigned long long)rig.idx->sync_state().cohort_height);
+
+    // Catch up: synced again, and the fresh peers do not stop it.
+    for (std::uint64_t h = G + 1; h <= rig.net_top(); h += 100)
+        rig.deliver_span(h, std::min(rig.net_top(), h + 99));
+    kat::checkf(rig.tip_height() == rig.net_top(), "C: caught up again (tip %llu)",
+                (unsigned long long)rig.tip_height());
+    kat::check(rig.idx->sync_state().synced, "C: level with the network: synced");
+
+    // A liar shouting a huge height is one vote among the plausible ones: it
+    // cannot hold us unsynced while two honest peers are level with us.
+    const PeerRef liar = peer("192.0.2.66:18080", 0x6666);
+    say(rig, liar, 999'999'999);
+    kat::check(rig.idx->sync_state().synced, "C: one liar cannot hold us unsynced");
+
+    // Every peer behind or level: nothing says we are behind.
+    rig.boot->on_peer_gone(liar);
+    rig.boot->on_peer_gone(z2);
+    rig.boot->on_peer_gone(z3);
+    rig.boot->on_peer_gone(s);
+    rig.boot->on_peer_gone(t);
+    const native::SyncState s2 = rig.idx->sync_state();
+    kat::checkf(s2.synced && s2.cohort_height == rig.tip_height() + 1,
+                "C: only peers behind us left: synced, cohort = our tip + 1 (cohort %llu)",
+                (unsigned long long)s2.cohort_height);
+}
+
 } // namespace
 
 int main() {
     test_strand_after_gap();
     test_held_parent_drains_child();
+    test_cohort_ignores_peers_behind_us();
     return kat::report("xmr_neartip_stall_kat");
 }
