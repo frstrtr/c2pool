@@ -40,6 +40,7 @@
 #include <impl/dash/messages.hpp>
 
 #include <core/factory.hpp>
+#include <core/filesystem.hpp>
 #include <core/netaddress.hpp>
 #include <core/pack.hpp>
 #include <core/packet.hpp>
@@ -52,12 +53,15 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <unistd.h>
 
 namespace {
 
@@ -223,9 +227,38 @@ const Frame* find_frame(const std::vector<Frame>& frames, std::string_view comma
     return nullptr;
 }
 
+// Points core::filesystem::config_path() at a per-process temp dir for the
+// lifetime of a ProbeLegacy. Legacy's default-constructed AddrStore otherwise
+// reads and writes the REAL ~/.c2pool/addrs.json, so a record persisted by one
+// run is already present in the next and the routable case's "store must not
+// already carry this record" precondition fails on every run after the first.
+// Master hid this only because AddrStore dropped a one-entry book on reload
+// (#1719). It must be a VIRTUAL base listed first: NodeImpl (which owns the
+// AddrStore) is a virtual base of Legacy via pool::Protocol, and virtual bases
+// are built before any non-virtual base, so a plain base would run too late.
+struct IsolatedDataDir
+{
+    std::filesystem::path prev = core::filesystem::data_dir_override();
+    std::filesystem::path dir = std::filesystem::temp_directory_path()
+        / ("c2pool-dash-addrme-" + std::to_string(::getpid()));
+
+    IsolatedDataDir()
+    {
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        core::filesystem::set_data_dir(dir);
+    }
+    ~IsolatedDataDir()
+    {
+        core::filesystem::set_data_dir(prev);
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
 // Exposes the protected AddrStore so the loopback-pollution assertion can look
 // at what the handler actually recorded.
-class ProbeLegacy : public dash::Legacy
+class ProbeLegacy : private virtual IsolatedDataDir, public dash::Legacy
 {
 public:
     using dash::Legacy::Legacy;
