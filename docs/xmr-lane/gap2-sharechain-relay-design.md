@@ -511,3 +511,35 @@ start). The stand-ins stay for the existing KATs/rigs.
   gives node-local order + winner authority. Convergence of `owed_digest` is
   preserved by the fold-at-cut + repair gate, exactly as Ruling A states; the
   LIVE lane digests may differ across nodes and that is by design.
+
+## 11. Stage-1 implementation notes (as built on this branch)
+
+Files: `src/c2pool/v37/xmr/relay/{xmr_relay_wire,xmr_receipt_mint,xmr_relay_node,xmr_receipt_ingest,xmr_address}.hpp`;
+additive seams in `carrier_net.hpp` (pid-tagged inbound, `add_peer_id`, `disconnect`), `carrier_supply.hpp`
+(`IdOfFrameFn`), `impl/xmr/stratum/xmr_stratum.hpp` + `xmr_stratum_listener.hpp` (`seed_extra_nonce`), and the
+daemon wiring in `main_v37_xmr.cpp` (flags, mint hook, FB_BLOCK_WON, `relay_view` = SEAM-5). Rig scripts:
+`docs/xmr-lane/gap2-rig/`.
+
+Deviations from §3-§6, each found by the rig:
+
+* **Per-node extra_nonce base.** Three nodes with the same tip, the same owed ledger and a stratum
+  extra_nonce counter that starts at 0 hand their miners byte-identical blobs; the miners duplicate work and
+  the same receipt id gets minted with different payees on different nodes -- F1's silent fork, observed
+  (run 1: `repair-rejected` climbing, cursor stalled). Stage 1 seeds each node's counter from a random base in
+  `[2^24, 2^31)` (not consensus: the pool chooses those 4 bytes). SEAM-1 (`rbind`) removes the cause for good.
+* **Receipt context by RPC, once per tip.** A restarted or lagging node must resolve peers' receipts on blocks
+  its in-memory index never held; the daemon arm now notes the last 128 headers
+  (`get_block_headers_range`) + the cached RandomX seed block into the relay ChainView on every new tip.
+* **`--relay-bind none` is the only mode today's template can serve.** Receipts are PoW-verified (opening ->
+  tree_root -> RandomX >= share_diff) and dedup-keyed on the blob; the payee/give-author are carried, not
+  PoW-bound. The relay is therefore REFUSED on mainnet until SEAM-1. `rbind` verification is implemented and
+  KAT-pinned against a SEAM-1-layout coinbase.
+* **`--relay-test-partition-seconds S`** (rig only): SIGUSR1 drops every relay link for S seconds while the
+  node keeps mining; the reconnect exercises re-offer, GETORDER/GETFRAMES backfill and the winner-order repair.
+
+Finding outside GAP-2 (in code this branch does not touch; it runs at boot before the relay starts; NOT yet
+reproduced on a stand-in build): restarting a node after the chain advanced past its persisted
+`hw_height` boots with `UNRECOVERABLE PENDING` (the finalize cursor steps past sidecar-pending FOUNDs before
+`reseed_after_bring_up` runs), after which the node stays `lane-root-unknown` for every later lane block.
+Reproduced twice with the relay (runs 2 and 3); the relay itself reloaded the durable log, backfilled and
+repaired. Owner: the finalize-connect boot order, not this branch.

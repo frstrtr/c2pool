@@ -150,6 +150,8 @@ namespace node  = ::c2pool::xmr::node;
 // caller cannot drift apart. Named here because this is where a reader looks.
 
 static std::atomic<bool> g_stop{false};
+static std::atomic<bool> g_relay_partition_req{false};   // GAP-2 rig: SIGUSR1 -> relay partition
+static void on_sigusr1(int) { g_relay_partition_req.store(true); }
 static void on_sigint(int) { g_stop.store(true); }
 
 // recon(A+B credit) knobs (regtest-only; parsed in main). See xmr/xmr_credit_cut.hpp.
@@ -178,6 +180,7 @@ static std::uint32_t g_relay_grace_ms = 4000;           // --relay-bin-grace-ms 
 static std::size_t   g_relay_vault_entries = 0, g_relay_vault_bytes = 0;   // --relay-vault-entries/-bytes (0 = default)
 static std::uint64_t g_relay_vault_horizon = 0;         // --relay-vault-horizon (0 = default 8640)
 static bool          g_no_relay_serve = false;          // --no-relay-serve
+static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 static std::string   g_relay_bind = "none";             // --relay-bind none|rbind (rbind needs SEAM-1 in the template)
 static bool relay_enabled() { return !g_relay_listen.empty() || !g_relay_peers.empty(); }
 static bool split_hostport(const std::string& s, std::string& host, std::uint16_t& port) {
@@ -1283,7 +1286,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             return nullptr;
         }
         replay_cache[key] = rv; ++cut_repaired; ++relay_cut_repaired;
-        std::printf("relay-repair: reconstructed view at P=%llu spine=%s… from the winner-side order (%zu receipts, all RandomX-verified here)\n",
+        std::printf("relay-repair: reconstructed view at P=%llu spine=%s… from the winner-side order (%zu receipts, every one admitted here: RandomX-verified, or our own)\n",
                     (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), ids.size());
         std::fflush(stdout);
         return rv;
@@ -1868,6 +1871,10 @@ static int run_live(const XmrNodeConfig& cfg) {
             });
             std::string why;
             if (!relay_node->start(why)) { std::printf("REFUSED: %s\n", why.c_str()); node.stop(); return 2; }
+            if (g_relay_partition_s) {   // test-only knob, never on mainnet (the relay is refused there)
+                std::signal(SIGUSR1, on_sigusr1);
+                std::printf("relay: TEST knob armed: SIGUSR1 partitions the relay for %u s\n", g_relay_partition_s);
+            }
             {
                 auto s = node.engine().snapshot(cfg.lane_chain);
                 std::printf("relay: GAP-2 receipt relay UP listen=%s:%u peers=%zu bind=%s order=%s(L=%llu grace=%ums) share_diff=%llu "
@@ -1982,6 +1989,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                     { std::lock_guard<std::mutex> lk(relay_log_mtx); ls.swap(relay_log_q); }
                     for (const auto& l : ls) std::printf("  [relay] %s\n", l.c_str());
                 }
+                if (g_relay_partition_req.exchange(false) && g_relay_partition_s)
+                    relay_node->partition_for(std::chrono::seconds(g_relay_partition_s));
                 for (auto& a : relay_node->drain_admitted()) relay_ingest->on_admitted(std::move(a));
                 relay_ingest->tick(provider.current().height);
                 for (const auto& [bw, pid] : relay_node->drain_block_won()) relay_on_cut(bw, pid);
@@ -2403,6 +2412,7 @@ int main(int argc, char** argv) {
         else if (a == "--relay-vault-bytes")        g_relay_vault_bytes = static_cast<std::size_t>(std::stoull(next("0")));
         else if (a == "--relay-vault-horizon")      g_relay_vault_horizon = std::stoull(next("0"));
         else if (a == "--no-relay-serve")           g_no_relay_serve = true;
+        else if (a == "--relay-test-partition-seconds") g_relay_partition_s = static_cast<std::uint32_t>(std::stoul(next("0")));
         else if (a == "--relay-bind")               g_relay_bind = next("none");
         else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = std::stoull(next("0"));
         else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = std::stoull(next("20"));

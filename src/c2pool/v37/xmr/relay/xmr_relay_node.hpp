@@ -460,6 +460,19 @@ public:
     void drop_peer(PeerId p) { m_net.disconnect(p); }
     // Test hook: stop redialing (and drop) every dial target.
     void set_dialing(bool on) { m_dialing = on; }
+    // Rig hook (SIGUSR1 in the daemon): a NETWORK PARTITION of `secs` seconds --
+    // every relay connection is dropped, inbound connections are refused and
+    // nothing is dialed until it ends; then the node redials and backfills.
+    // The node keeps mining/minting meanwhile, so its lane order diverges and
+    // the reconnect exercises re-offer + GETORDER/GETFRAMES + the repair.
+    void partition_for(std::chrono::seconds secs) {
+        m_partition_until.store(Clock::now().time_since_epoch().count() +
+                                std::chrono::duration_cast<Clock::duration>(secs).count());
+        m_partitioned = true;
+        m_dialing = false;
+        for (PeerId p : m_net.peer_ids()) m_net.disconnect(p);
+        log("relay: PARTITION for " + std::to_string(secs.count()) + " s (all relay links dropped)");
+    }
 
 private:
     // ── state ───────────────────────────────────────────────────────────────
@@ -521,6 +534,7 @@ private:
 
     // ── transport callbacks ─────────────────────────────────────────────────
     void on_peer_event(PeerId p, bool up) {
+        if (up && m_partitioned.load()) { m_net.disconnect(p); return; }   // rig partition: refuse
         if (up) {
             bool over = false;
             {
@@ -1038,6 +1052,11 @@ private:
                         stale.push_back(p);
             }
             for (PeerId p : stale) { m_st.hello_timeout++; m_net.disconnect(p); }
+            if (m_partitioned.load() && Clock::now().time_since_epoch().count() >= m_partition_until.load()) {
+                m_partitioned = false;
+                m_dialing = true;
+                log("relay: partition over -- redialing");
+            }
             // dial / redial with backoff
             if (m_dialing.load()) {
                 std::vector<std::size_t> due;
@@ -1135,6 +1154,8 @@ private:
     std::vector<Target> m_targets;
     std::vector<PeerId> m_to_drop;
     std::atomic<bool> m_dialing{true};
+    std::atomic<bool> m_partitioned{false};
+    std::atomic<Clock::rep> m_partition_until{0};
 
     std::mutex m_jmtx;                 // supply jobs
     std::map<PeerId, std::deque<Job>> m_jobs;
