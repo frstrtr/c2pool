@@ -156,6 +156,13 @@ public:
     CarrierPeerNode& operator=(const CarrierPeerNode&) = delete;
 
     void set_inbound(InboundFn f) { m_inbound = std::move(f); }
+    // GAP-2 (the Family-B receipt relay, xmr/relay/): the same inbound path,
+    // TAGGED with the connection the frame arrived on, so a handler can keep
+    // per-peer state (HELLO gate, DoS budget, flood-except-source). When bound
+    // it takes precedence over set_inbound; unbound, the reader loop is
+    // byte-for-byte the pre-GAP-2 one.
+    using InboundFromFn = std::function<void(PeerId, const std::vector<std::uint8_t>&)>;
+    void set_inbound_from(InboundFromFn f) { m_inbound_from = std::move(f); }
     void set_on_peer_connect(PeerConnectFn f) { m_on_connect = std::move(f); }
     void set_control(ControlFn f) { m_control = std::move(f); }
     void set_on_peer_event(PeerEventFn f) { m_on_peer_event = std::move(f); }
@@ -248,6 +255,37 @@ public:
     }
 
     std::uint16_t listen_port() const { return m_listen_port; }
+
+    // GAP-2: dial and return the new connection's PeerId (0 = the dial failed).
+    // Same semantics as add_peer(); the id lets a caller keep per-target state
+    // (the relay's redial-with-backoff). PeerEventFn(id, true) has already fired
+    // by the time this returns.
+    PeerId add_peer_id(const std::string& host, std::uint16_t port) {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { ::close(fd); return 0; }
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) { ::close(fd); return 0; }
+        return add_established(fd);
+    }
+
+    // GAP-2: drop ONE connection on purpose (a protocol refusal: HELLO
+    // mismatch, a ban, over the peer cap). The reader unwinds and
+    // PeerEventFn(id, false) fires. Not counted as a slow-peer drop. No-op for an
+    // id that is already gone. Must not be called with a lock held that the
+    // PeerEventFn handler takes (it may fire synchronously from here).
+    void disconnect(PeerId id) {
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_id_fd.find(id);
+            if (it == m_id_fd.end()) return;
+            fd = it->second;
+        }
+        drop_peer(fd, /*hard=*/true, /*slow=*/false);
+    }
 
     // Dial a peer (the --peer path). Returns true if the connection was
     // established and added as a full duplex peer. Safe to call before or after
@@ -367,7 +405,7 @@ private:
         }
     }
 
-    void add_established(int fd) {
+    PeerId add_established(int fd) {
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         // ★ BOUND THE WRITE (c2pool#1655 Defect-B). Without this a peer that
@@ -385,7 +423,7 @@ private:
         PeerId pid = 0;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (!m_running.load()) { ::close(fd); return; }   // stopping: never orphan a reader
+            if (!m_running.load()) { ::close(fd); return 0; }   // stopping: never orphan a reader
             pid = ++m_next_peer_id;
             m_peers.push_back(fd);
             m_fd_id[fd] = pid;
@@ -403,6 +441,7 @@ private:
             PeerEventFn ev = m_on_peer_event;
             if (ev) ev(pid, true);
         }
+        return established ? pid : 0;
     }
 
     void reader_loop(int fd, PeerId pid) {
@@ -430,7 +469,8 @@ private:
             // own mutex (w3_relay.hpp THREADING), so the handler needs no lock
             // of its own. A slow admit (the live index's bounded Unknown retry,
             // carrier_index.hpp) stalls only this peer's reader.
-            if (m_inbound) m_inbound(frame);
+            if (m_inbound_from) m_inbound_from(pid, frame);
+            else if (m_inbound) m_inbound(frame);
         }
         drop_peer(fd);
     }
@@ -438,7 +478,7 @@ private:
     // `hard` => the stream is unusable (a timed-out write left half a frame on
     // it), so shut the socket down: the peer's reader thread unwinds instead of
     // sitting in recv() on a connection nobody will ever write to again.
-    void drop_peer(int fd, bool hard = false) {
+    void drop_peer(int fd, bool hard = false, bool slow = true) {
         PeerId pid = 0;
         bool had = false;
         {
@@ -455,7 +495,7 @@ private:
             // closing once is enough — mark by removing from the set above.
         }
         if (hard) {
-            if (had) m_slow_drops.fetch_add(1);
+            if (had && slow) m_slow_drops.fetch_add(1);
             ::shutdown(fd, SHUT_RDWR);
         }
         if (pid) { PeerEventFn ev = m_on_peer_event; if (ev) ev(pid, false); }
@@ -504,6 +544,7 @@ private:
     }
 
     InboundFn                 m_inbound;
+    InboundFromFn             m_inbound_from;   // GAP-2: pid-tagged inbound (precedence when bound)
     PeerConnectFn             m_on_connect;
     ControlFn                 m_control;        // frame[0] >= 0x80 (repair channel)
     PeerEventFn               m_on_peer_event;  // (PeerId, connected)

@@ -55,9 +55,13 @@ public:
     using config_t = ConfigType;
 
 protected:
-    boost::asio::io_context* m_context;
-    config_t* m_config; // todo: init
-    ShareChainType* m_chain; // todo: init
+    // Default member initializers: the rig-free BaseNode() ctor below sets
+    // none of these, and derived nodes branch on `!m_context` to detect the
+    // no-io_context (KAT/standalone) case -- an indeterminate pointer there
+    // reads as non-null whenever the storage was dirty.
+    boost::asio::io_context* m_context = nullptr;
+    config_t* m_config = nullptr;
+    ShareChainType* m_chain = nullptr;
     core::AddrStore m_addrs;
 
     uint64_t m_nonce; // node_id todo: init

@@ -148,6 +148,10 @@ public:
           m_tap(*this, sink),
           m_server(templates, verifier, m_tap, *this) {}
 
+    // GAP-2: a node-chosen extra_nonce base (see XmrStratumServer::seed_extra_nonce).
+    // Call before start().
+    void seed_extra_nonce(std::uint32_t base) { m_server.seed_extra_nonce(base); }
+
     ~StratumListener() override { stop(); }
 
     StratumListener(const StratumListener&) = delete;

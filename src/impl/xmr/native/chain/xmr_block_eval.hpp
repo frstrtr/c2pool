@@ -172,7 +172,8 @@ inline EvalStatus evaluate_block(const BlockEntry& entry, EvaluatedBlock& out,
         // amount-0 global table, in output order, right after this block's
         // coinbase outputs. The commitment is the outPk mask the rct base
         // carried (no curve code); the height is the block's own height, the
-        // unlock_time the tx's. A version-1 body (none on a modern chain)
+        // unlock_time the tx's. A version-1 body (still seen on mainnet when
+        // it spends unmixable pre-RingCT outputs) carries clear amounts and
         // creates no amount-0 outputs. out_pubkeys / out_commitments were
         // captured only because evaluate_block asked (capture=true).
         if (et.info.version >= 2

@@ -875,10 +875,13 @@ add_executable(c2pool-v37-xmr
     v37/main_v37_xmr.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
-    ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp
+    # GAP-2 (xmr/relay/): the receipt opening/verify bodies the relay mints and checks with.
+    ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp)
 c2pool_wire_version(c2pool-v37-xmr)
 target_include_directories(c2pool-v37-xmr PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt   # GAP-2: impl/xmr/wire/xmr_carrier_wire.hpp includes "xmr_receipt.hpp"
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
 target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)

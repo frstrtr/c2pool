@@ -860,6 +860,16 @@ public:
     void set_on_unservable(UnservableFn f) {
         std::lock_guard<std::mutex> lk(m_mtx); m_on_unservable = std::move(f);
     }
+    // GAP-2 SEAM (IdOfFrameFn): how the id of a served frame is recomputed from
+    // its BYTES. Unset (the default, every Family-A caller) = the CarrierWire
+    // path below, unchanged. The Family-B receipt relay binds it to
+    // "decode fb_receipt -> keccak256(hashing_blob)" so a served receipt is
+    // held to the same bytes-to-id binding a carrier is; nullopt = undecodable.
+    // VerifiedFrame::carrier stays default-constructed on this path.
+    using IdOfFrameFn = std::function<std::optional<bytes32>(const std::vector<std::uint8_t>&)>;
+    void set_id_of_frame(IdOfFrameFn f) {
+        std::lock_guard<std::mutex> lk(m_mtx); m_id_of_frame = std::move(f);
+    }
 
     bool busy(PeerId p) const {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -1002,6 +1012,8 @@ public:
                 return;                                   // an id we never asked for
             }
         }
+        IdOfFrameFn id_of_frame;   // GAP-2 seam, copied out under the lock
+        { std::lock_guard<std::mutex> lk(m_mtx); id_of_frame = m_id_of_frame; }
         std::vector<VerifiedFrame> verified;
         verified.reserve(r.frames.size());
         for (const auto& [id, bytes] : r.frames) {
@@ -1012,6 +1024,22 @@ public:
             if (std::find(covered.begin(), covered.end(), id) == covered.end()) {
                 fail(peer, SupplyFailure::UNSOLICITED, false);
                 return;                                   // an id we never asked for
+            }
+            if (id_of_frame) {   // GAP-2: a non-CarrierWire frame family (see set_id_of_frame)
+                const std::optional<bytes32> got = id_of_frame(bytes);
+                if (!got) {
+                    fail(peer, SupplyFailure::UNDECODABLE_FRAME, false, false, /*undec=*/true);
+                    return;
+                }
+                if (!(*got == id)) {
+                    fail(peer, SupplyFailure::HASH_MISMATCH, false, false, false, /*hash=*/true);
+                    return;
+                }
+                VerifiedFrame v;
+                v.id = id;
+                v.frame = bytes;
+                verified.push_back(std::move(v));
+                continue;
             }
             const DecodeResult dr = CarrierWire::decode(bytes);
             if (!dr.ok()) {
@@ -1232,6 +1260,7 @@ private:
     FramesFn                      m_on_frames;
     FailFn                        m_on_fail;
     UnservableFn                  m_on_unservable;
+    IdOfFrameFn                   m_id_of_frame;   // GAP-2 seam; empty = CarrierWire
 };
 
 } // namespace c2pool::v37n
