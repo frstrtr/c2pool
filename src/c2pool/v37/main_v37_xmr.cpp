@@ -1763,6 +1763,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::function<void(const strat::AcceptedShare&)> relay_on_share;
         std::function<void()> relay_tick;
         std::uint64_t relay_index_best = 0;
+        std::map<std::uint64_t, node::Hash> relay_hdr_by_height;   // GAP-2: height -> block id (header cache)
         if (relay_enabled()) {
             if (!serving) {
                 std::printf("REFUSED: the receipt relay needs a served template (--residual-sink-spend-hex/--residual-sink-view-hex)\n");
@@ -1940,20 +1941,40 @@ static int run_live(const XmrNodeConfig& cfg) {
                         relay_chain.set_tip(t.height);
                     }
                 }
-                if (!p2p_first) {   // the daemon arm's index: every recent block a peer may have built on
-                    const auto& idx = node.adapter().index();
-                    const std::uint64_t best = idx.best_height();
+                if (!p2p_first && !cfg.no_daemon_rpc) {
+                    // The daemon arm: once per new tip, ONE get_block_headers_range over the
+                    // last 128 blocks (+ the RandomX seed block, cached) so a peer receipt built
+                    // on any recent block -- including the blocks this node missed while it was
+                    // down -- resolves to (bin, seed) on the verify thread without an RPC there.
+                    const std::uint64_t best = node.adapter().index().best_height();
                     if (best && best != relay_index_best) {
                         relay_index_best = best;
-                        for (std::uint64_t hh = best > 256 ? best - 256 : 0; hh <= best; ++hh) {
-                            const auto b = idx.by_height(hh);
-                            if (!b) continue;
-                            const auto sd = idx.seed_hash_for_height(hh + 1);
-                            if (!sd) continue;
+                        auto rpc_headers = [&](const std::string& body, bool range) {
+                            std::vector<node::ChainMainBlock> out;
+                            transport.rpc_post(body, [&](const node::RpcResponse& r) {
+                                if (!r.ok()) return;
+                                if (range) { if (auto v = node::MoneroDaemonRpc::parse_block_headers_range(r.body)) out = *v; }
+                                else if (auto b = node::MoneroDaemonRpc::parse_block_header(r.body)) out.push_back(*b);
+                            });
+                            return out;
+                        };
+                        const std::uint64_t lo = best > 128 ? best - 128 : 0;
+                        const auto hdrs = rpc_headers(node::MoneroDaemonRpc::body_get_block_headers_range(lo, best), true);
+                        for (const auto& b : hdrs) relay_hdr_by_height[b.height] = b.id;
+                        for (const auto& b : hdrs) {
+                            const std::uint64_t sh = node::rx_seed_height(b.height + 1);
+                            auto sit = relay_hdr_by_height.find(sh);
+                            if (sit == relay_hdr_by_height.end()) {
+                                for (const auto& s : rpc_headers(node::MoneroDaemonRpc::body_get_block_header_by_height(sh), false))
+                                    relay_hdr_by_height[s.height] = s.id;
+                                sit = relay_hdr_by_height.find(sh);
+                                if (sit == relay_hdr_by_height.end()) continue;
+                            }
                             ::v37::bytes32 prev{}, seed{};
-                            std::memcpy(prev.data(), b->id.data(), 32); std::memcpy(seed.data(), sd->data(), 32);
-                            relay_chain.note(prev, hh + 1, seed);
+                            std::memcpy(prev.data(), b.id.data(), 32); std::memcpy(seed.data(), sit->second.data(), 32);
+                            relay_chain.note(prev, b.height + 1, seed);
                         }
+                        while (relay_hdr_by_height.size() > 4096) relay_hdr_by_height.erase(relay_hdr_by_height.begin());
                     }
                 }
                 {
