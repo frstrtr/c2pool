@@ -88,6 +88,10 @@ public:
     // Scripted behaviour.
     bool answer_chain   = true;
     bool answer_objects = true;
+    // Pruned bodies per block in a 2004 answer (0: header-only blocks, the
+    // shape the older tests use). Non-zero reproduces a real mainnet span.
+    std::size_t txs_per_block = 0;
+    std::size_t tx_blob_bytes = 0;
     std::vector<levin::PeerlistEntry> peerlist;
     native::PeerSyncData sync = default_sync();
 
@@ -259,6 +263,10 @@ private:
                 native::BlockEntry b;
                 b.block_blob.assign(32, id[0]);
                 b.pruned = m.prune;
+                for (std::size_t t = 0; t < txs_per_block; ++t)
+                    b.txs.push_back(native::TxBlobEntry{
+                        std::vector<std::uint8_t>(tx_blob_bytes, static_cast<std::uint8_t>(t)),
+                        hash_of_byte(static_cast<std::uint8_t>(t)), true});
                 r.blocks.push_back(std::move(b));
             }
             std::vector<std::uint8_t> out;
@@ -506,6 +514,59 @@ void test_object_chunking_and_span_reassembly() {
     std::vector<Hash> huge(native::MAX_SPAN_IDS + 1, hash_of_byte(0x77));
     kat::check(!rig.pool->request_objects(ref, huge, true),
                "a span over MAX_SPAN_IDS is refused");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
+// THE POST-ANCHOR CATCH-UP STALL (mainnet, 2026-09-23), on loopback.
+//
+// A node booted from a mainnet anchor ~2.6 K blocks behind asked for 100-block
+// pruned spans; every honest answer (1.4-2.0 MB, ~20-60 tx/block) overflowed
+// the generic epee budget of the 2004 decoder, was refused as a malformed
+// body, and the peer that served it was BANNED -- one peer per 20 s chain
+// timeout, until the pool was empty and the index had not moved off the
+// anchor. Here one stand-in serves exactly that shape: the span must arrive
+// whole and the peer must still be connected and unbanned afterwards.
+void test_dense_mainnet_span_is_accepted_not_banned() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+    daemon.txs_per_block = 40;     // mainnet-typical density
+    daemon.tx_blob_bytes = 400;    // a small pruned CLSAG/BP+ body
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }),
+               "peer up before the dense span");
+
+    std::vector<Hash> ids;
+    for (int i = 0; i < static_cast<int>(native::MAX_OBJECT_REQUEST_IDS); ++i)
+        ids.push_back(hash_of_byte(static_cast<std::uint8_t>(i)));
+    native::PeerRef ref;
+    ref.addr = daemon.key();
+    kat::check(rig.pool->request_objects(ref, ids, /*prune=*/true),
+               "the 100-block span is accepted for fetch");
+
+    const bool done = rig.wait_for([&] { return !rig.chain.objects_calls.empty(); }, 6000);
+    kat::check(done, "a dense honest 2004 reaches the index");
+    if (!rig.chain.objects_calls.empty()) {
+        std::size_t n_tx = 0;
+        for (const native::BlockEntry& b : rig.chain.objects_calls[0].blocks) n_tx += b.txs.size();
+        kat::checkf(rig.chain.objects_calls[0].blocks.size() == ids.size() && n_tx == ids.size() * 40,
+                    "the whole span arrives (%zu blocks, %zu bodies)",
+                    rig.chain.objects_calls[0].blocks.size(), n_tx);
+    }
+
+    rig.pump(200);
+    const p2p::PoolTelemetry t = rig.pool->telemetry();
+    kat::checkf(t.bans == 0, "the peer that served an honest span is not banned (bans=%llu, last close: %s)",
+                static_cast<unsigned long long>(t.bans), t.last_close_why.c_str());
+    kat::checkf(rig.pool->peer_count() == 1, "and it is still connected (%zu peers)",
+                rig.pool->peer_count());
 
     rig.pool->stop();
     rig.pump(100);
@@ -885,6 +946,7 @@ int main(int argc, char** argv) {
     test_dial_handshake_and_learn();
     test_primary_elected_without_maintenance_tick();
     test_object_chunking_and_span_reassembly();
+    test_dense_mainnet_span_is_accepted_not_banned();
     test_request_chain_forces_genesis_terminus();
     test_serving_obligation();
     test_serving_no_common_block_closes();
