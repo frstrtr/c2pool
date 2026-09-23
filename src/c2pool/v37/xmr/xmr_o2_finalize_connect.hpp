@@ -334,9 +334,10 @@ struct FinalizeConnectOptions {
     //   CONTESTED  refused fraction >= contest with >= vote_obs_min observations
     //              and no VERIFIED counter-lineage outvoting us. LOUD (state
     //              alarm + per-block alarm), keeps refusing-not-crediting
-    //              (payout -> node-local liability); rework-3 interim default:
-    //              lane template production SUSPENDED (contested_suspends,
-    //              below) until CONVERGED. Never halts the node:
+    //              (payout -> node-local liability) and KEEPS BUILDING (ruled
+    //              default: contested_suspends=false). With contested_suspends
+    //              =true (operator opt-in) lane template production is
+    //              SUSPENDED until CONVERGED. Never halts the node:
     //              without a verifiable counter-lineage refusals are
     //              indistinguishable from outsider tags.
     //   ISOLATED   a VERIFIED counter-lineage L' (register_counter_lineage --
@@ -356,8 +357,8 @@ struct FinalizeConnectOptions {
     std::size_t   vote_exit_hold   = 16;   // attributed blocks below iso before ISOLATED -> CONTESTED
     std::uint64_t vote_stale_s     = 48 * 3600;   // observations older than this are dropped (0 = never)
 
-    // ── R-C rework-3: INTERIM DEFAULTS (operator rulings pending) ───────────
-    // (b) REFUSE-SIDE MONEY IS NODE-LOCAL. A refused lane block's on-chain
+    // ── R-C rework-3: RULED DEFAULTS ────────────────────────────────────────
+    // (b) REFUSE-SIDE MONEY IS NODE-LOCAL (operator ruling: (b)). A refused lane block's on-chain
     // reward is recorded in a node-local LIABILITY ledger (per payee when the
     // payout decodes from the on-chain bytes + this node's own ring alone, else
     // the whole reward), with a loud alarm and counters. It NEVER mutates eo /
@@ -372,15 +373,17 @@ struct FinalizeConnectOptions {
     //   (c) a consensus carrier for refuse events through the GAP-2 relay.
     enum class RefuseMoney : int { NodeLocalLiability = 0 };
     RefuseMoney   refuse_money       = RefuseMoney::NodeLocalLiability;
-    // CONTESTED -> suspend lane template production (loud; auto-resume when the
-    // vote returns to CONVERGED) instead of building on a possibly split ledger.
-    // Fired synchronously through the contested hook (set_contested_hook) inside
-    // the tick that decided it. LIVENESS NOTE (r-c-rework-3.md §3): outsider 03
-    // tags or a >= 1/3 forker can hold every honest node CONTESTED; while all
-    // honest builders are suspended the window only refills with the attacker's
-    // blocks, so the exit is the forker stopping, vote_stale_s ageing the window
-    // out, or an operator (--contested-suspend off).
-    bool          contested_suspends = true;
+    // CONTESTED -> suspend lane template production. OPERATOR RULING: default
+    // OFF. CONTESTED is a loud alarm (cba-ALARM CONTESTED + contested_entered)
+    // and the node KEEPS BUILDING. Evidence (r-c-rework-3.md §3): under a
+    // 64-height forker + 60 s wire skew the honest owed_digests stayed
+    // byte-equal at every shared cursor, while contested-suspend DEADLOCKED the
+    // honest lane once the forker stopped (all honest builders suspended, the
+    // window could only refill with blocks nobody was building). true = the
+    // operator opt-in (--contested-suspend on): the contested hook
+    // (set_contested_hook) fires synchronously inside the tick that decided it
+    // and auto-releases when the vote returns to CONVERGED.
+    bool          contested_suspends = false;
     // D3: the vote's observation window survives a restart (<sidecar>.obs,
     // append-only, compacted). Needs sidecar_path.
     bool          persist_vote_obs   = true;
@@ -408,7 +411,7 @@ public:
         char          kind = 'a';
         Amounts       credit, payout;
     };
-    // R-C rework-3 (interim (b)): the NODE-LOCAL LIABILITY record of one refused
+    // R-C rework-3 (ruled (b)): the NODE-LOCAL LIABILITY record of one refused
     // lane block. `payout` = the per-payee part decoded from the on-chain bytes
     // alone (this node's own ring; never a wire descriptor), `unattributed_pico`
     // = what could not be attributed (root unknown -> the whole reward incl. the
@@ -500,7 +503,7 @@ public:
         // R-C: `refused_not_credited` = SYNCED-but-unmatched lane blocks refused-
         // not-credited (loud alarm, gate released, NEVER a halt by itself).
         std::uint64_t refused_not_credited = 0;
-        // R-C rework-3 (interim (b)): the NODE-LOCAL LIABILITY of refused lane
+        // R-C rework-3 (ruled (b)): the NODE-LOCAL LIABILITY of refused lane
         // blocks. `liability_blocks` refused blocks recorded; `_attributed_pico`
         // the per-payee part (on-chain bytes only), `_unattributed_pico` the rest
         // (whole reward when the root is unknown), `liability_pico` their sum --
@@ -722,7 +725,7 @@ public:
                 " attributed to " + std::to_string(m_stats.liability_payees) + " payee(s), " +
                 std::to_string(m_stats.liability_unattributed_pico) + " unattributed) that this node's owed ledger does NOT "
                 "net out: owed(k) is over-stated by up to this much, so a later K_fair coinbase may pay those payees again. "
-                "NODE-LOCAL by design (interim (b)): the ledger never moves on a refusal, so honest refusers stay identical. "
+                "NODE-LOCAL by design (ruled (b)): the ledger never moves on a refusal, so honest refusers stay identical. "
                 "Fix = consensus carrier ((a) in-band lane_commitment preimage / (c) GAP-2 relay), operator's hand.");
         }
 
@@ -1062,8 +1065,8 @@ public:
     // the tick that decided it, so no share/hit can slip between the decision
     // and the suspension). Called with (true, why) on entry, (false, why) on exit.
     void set_isolation_hook(std::function<void(bool, const std::string&)> f) { m_iso_hook = std::move(f); }
-    // R-C rework-3: the CONTESTED edge hook (interim default: CONTESTED suspends
-    // lane template production). (true, why) when the vote enters CONTESTED,
+    // R-C rework-3: the CONTESTED edge hook (opt-in, --contested-suspend on:
+    // CONTESTED suspends lane template production; default off). (true, why) when the vote enters CONTESTED,
     // (false, why) when it leaves it -- synchronously, inside the tick that
     // decided it. Only fired when options().contested_suspends.
     void set_contested_hook(std::function<void(bool, const std::string&)> f) { m_contested_hook = std::move(f); }
@@ -1096,7 +1099,7 @@ private:
         return ok;
     }
 
-    // R-C rework-3 (interim (b)): the payout side of a REFUSED lane block. The
+    // R-C rework-3 (ruled (b)): the payout side of a REFUSED lane block. The
     // block paid its coinbase on-chain whatever this node thinks of its credit;
     // that value is recorded as NODE-LOCAL LIABILITY and NOTHING ELSE. No FOUND,
     // no debit, no eo/finalW/owed_digest mutation: whether this node could
@@ -1465,7 +1468,7 @@ private:
                                   std::to_string(unattr) + " unattributed), vote me=" + std::to_string(am) +
                                   " counter=" + std::to_string(ap) + " (k_min " + std::to_string(m_o.vote_k_min) + ", iso " +
                                   std::to_string(m_o.vote_iso_num) + "/" + std::to_string(m_o.vote_iso_den) + ")";
-        // R-C rework-3: CONTESTED -> lane-suspend edge (interim default), fired
+        // R-C rework-3: CONTESTED -> lane-suspend edge (opt-in; default off), fired
         // synchronously before this tick returns. Leaving CONTESTED (to CONVERGED,
         // or to ISOLATED -- whose own hook then holds the suspension) releases it.
         const bool was_c = (prev == VoteState::Contested), now_c = (m_vote == VoteState::Contested);
@@ -1479,9 +1482,10 @@ private:
             ++m_stats.contested_entered;
             say("cba-ALARM CONTESTED: " + tally + " -- " +
                 (m_o.contested_suspends
-                     ? std::string("lane template production SUSPENDED (cause=contested; interim default, --contested-suspend) "
+                     ? std::string("lane template production SUSPENDED (cause=contested; operator opt-in --contested-suspend on) "
                                    "until the vote returns to CONVERGED; booking and refusing-not-crediting continue")
-                     : std::string("contested-suspend OFF: this node keeps building")) +
+                     : std::string("contested-suspend off (default): this node KEEPS BUILDING; booking and "
+                                   "refusing-not-crediting continue")) +
                 ". Refused blocks without a VERIFIED counter-lineage are indistinguishable from outsider tags: never a "
                 "halt. Operator: compare peers' owed_digest; W6 verified resync supplies the evidence.");
         } else if (m_vote == VoteState::Converged && prev == VoteState::Contested) {
@@ -2641,11 +2645,12 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         XmrNode node(c13, mock, &smoke::test_point_check);
         try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC27 bring_up (restart)", false, e.what()); return rep; }
         FinalizeConnectOptions o = opts_for(c13); o.book_from_chain_ex = cb13; o.persist_vote_obs = persisted != 0;
+        o.contested_suspends = true;   // opt-in (default is off, FC28d): pins that a RESTORED CONTESTED re-arms the suspension at boot
         FoundBlockQueue q; FinalizeConnect fc(node, c13, q, o);
         int hook_on = 0; fc.set_contested_hook([&](bool on, const std::string&) { if (on) ++hook_on; });
         (void)fc.reseed_after_bring_up();
         if (persisted)
-            rep.add("FC27 D3: after a restart the lineage-vote window is RESTORED from <sidecar>.obs -- CONTESTED (8/8 refused) straight out of the boot, not re-warmed from zero",
+            rep.add("FC27 D3: after a restart the lineage-vote window is RESTORED from <sidecar>.obs -- CONTESTED (8/8 refused) straight out of the boot, not re-warmed from zero (with --contested-suspend on, the restored CONTESTED re-fires the suspend hook)",
                     st_before == FinalizeConnect::VoteState::Contested && n_before == 8 &&
                     fc.vote_state() == FinalizeConnect::VoteState::Contested && fc.stats().obs_n == 8 &&
                     fc.stats().obs_restored == 8 && hook_on == 1,
@@ -2660,7 +2665,10 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         (void)fc.drain_before_stop();
     }
 
-    // ── phase 12: CONTESTED -> lane suspend (interim default), auto-resume ──
+    // ── phase 12: CONTESTED -> lane suspend (opt-in), auto-resume ───────────
+    // FC28d pins the RULED default: suspension is OFF unless an operator asks.
+    rep.add("FC28d contested_suspends defaults to false (operator ruling: CONTESTED = loud alarm + counters, keep building; --contested-suspend on opts in)",
+            FinalizeConnectOptions{}.contested_suspends == false);
     // 6 refused frontier blocks -> CONTESTED: the contested hook fires ONCE,
     // synchronously inside that tick. Then honest (booked) blocks until the
     // refused fraction over the 24-block window drops below 1/3 -> CONVERGED:
@@ -2689,7 +2697,7 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
                     "on=" + std::to_string(on) + "@" + std::to_string(on_at) + " off=" + std::to_string(off) + "@" + std::to_string(off_at) +
                     " cursor=" + std::to_string(node.finalize_driver().cursor_height()));
         else
-            rep.add("FC28n --contested-suspend off: the vote still goes CONTESTED -> CONVERGED but the hook never fires (the rework-2 keep-building posture)",
+            rep.add("FC28n --contested-suspend off (the default): the vote still goes CONTESTED -> CONVERGED (loud, counted) but the hook never fires (keep building)",
                     on == 0 && off == 0 && fc.stats().contested_entered == 1, "on=" + std::to_string(on));
         (void)fc.drain_before_stop();
     }

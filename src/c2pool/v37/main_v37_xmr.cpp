@@ -166,8 +166,8 @@ static bool          g_no_book_deferral = false;         // --no-book-deferral: 
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
 static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
 static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
-// R-C rework-3 interim defaults (operator rulings pending; docs/xmr-lane/r-c-rework-3.md).
-static bool          g_contested_suspend = true;         // --contested-suspend on|off: CONTESTED suspends lane production
+// R-C rework-3 ruled defaults (docs/xmr-lane/r-c-rework-3.md).
+static bool          g_contested_suspend = false;        // --contested-suspend on|off (default off): CONTESTED suspends lane production
 static std::uint64_t g_recon_max_root_age = ~std::uint64_t{0};   // --recon-max-root-age N (default kReconMaxRootAgeDconf*D_conf; 0 = unbounded)
 static bool g_lane_suspended_now = false;                  // R-C rework-2: main-thread view of the lane-suspend state (pump_miner reads it)
 // GAP-2 relay knobs (design §6). All default OFF: with neither --relay-listen nor
@@ -861,8 +861,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     //   isolated -- the lineage vote: a VERIFIED counter-lineage outvotes us
     //               (FinalizeConnect ISOLATED; non-terminal).
     //   held     -- HELD-LAG (an undecided lane block holds the cursor past the cap).
-    //   contested -- R-C rework-3 interim default (--contested-suspend on): the
-    //               lineage vote is CONTESTED; auto-resumes when it is CONVERGED.
+    //   contested -- R-C rework-3 operator opt-in (--contested-suspend on; default
+    //               off): the lineage vote is CONTESTED; auto-resumes when CONVERGED.
     // The ISOLATED and CONTESTED edges are ALSO applied synchronously from inside
     // fc.tick() through their hooks; every cause is re-evaluated (and COUNTED on
     // its own rising edge -- D5) right after fc.tick() by LaneSuspendState.
@@ -892,7 +892,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         auto cause_text = [](unsigned c) -> std::string {
             std::string t;
             if (c & LS::kIsolated)  t += " ISOLATED (a verified counter-lineage outvotes this node);";
-            if (c & LS::kContested) t += " CONTESTED (>= 1/3 of the recent frontier lane blocks refused; interim default --contested-suspend on);";
+            if (c & LS::kContested) t += " CONTESTED (>= 1/3 of the recent frontier lane blocks refused; operator opt-in --contested-suspend on);";
             if (c & LS::kHeld)      t += " HELD-LAG (an undecided lane block holds the cursor);";
             if (c & LS::kLag)       t += " LAG (finalize cursor behind the buried frontier);";
             return t;
@@ -934,7 +934,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         g_lane_suspended_now = true;
         miner_suspend();
     });
-    // R-C rework-3: CONTESTED suspends synchronously too (interim default); the
+    // R-C rework-3: CONTESTED suspends synchronously too (operator opt-in; default off); the
     // release is left to apply_suspension (another cause may still hold the lane).
     fc.set_contested_hook([&](bool on, const std::string&) {
         if (!on || !serving) return;
@@ -1224,7 +1224,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     fo.divergence_cap_heights  = g_divergence_cap_heights;
     fo.divergence_cap_ticks    = g_divergence_cap_ticks;
     fo.divergence_cap_terminal = g_divergence_cap_terminal;
-    fo.contested_suspends      = g_contested_suspend;   // R-C rework-3 interim default ON
+    fo.contested_suspends      = g_contested_suspend;   // R-C rework-3 ruled default OFF (opt-in)
     std::printf("r-c rework-3: refuse-side money = NODE-LOCAL LIABILITY (never a ledger mutation) | contested-suspend=%s | "
                 "vote window persisted=%s\n", fo.contested_suspends ? "ON" : "off", fo.persist_vote_obs ? "yes" : "no");
     std::printf("r6: book_deferral=%s divergence cap: heights=%llu (0 = 2*D_conf = %llu) ticks=%llu terminal=%llu\n",
@@ -2784,8 +2784,9 @@ int main(int argc, char** argv) {
                 "                               the lane is declared DIVERGED (loud, terminal, halted)\n"
                 "  --divergence-cap-terminal <n> also DIVERGED after n exhausted root-unknown retry\n"
                 "                               bounds (default 2; 0 = off)\n"
-                "  --contested-suspend <on|off> R-C rework-3 interim default ON: a CONTESTED lineage vote\n"
-                "                               suspends lane template production until CONVERGED\n"
+                "  --contested-suspend <on|off> default off: a CONTESTED lineage vote is a loud alarm +\n"
+                "                               counters and the node keeps building; on = suspend lane\n"
+                "                               template production until CONVERGED (operator opt-in)\n"
                 "  --recon-max-root-age <n>     R-C rework-3 (D7): never credit a matched historical root\n"
                 "                               older than n heights from the block's builder cut\n"
                 "                               (default 4*D_conf; 0 = unbounded, the rework-2 behaviour)\n"

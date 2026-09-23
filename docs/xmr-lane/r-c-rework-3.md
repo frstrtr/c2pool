@@ -2,8 +2,9 @@
 
 This is the design record for the third rework of the XMR lane's R-C
 ("refused lane block") handling. It answers the NO-SHIP verify of rework-2
-(findings D1 to D7) and applies the interim defaults the operator set while
-the consensus rulings are pending. Every change is in the consumer tree
+(findings D1 to D7) and applies the defaults the operator has now ruled on:
+refuse-side money is (b), node-local liability, and CONTESTED suspension is
+OFF by default (§3). Every change is in the consumer tree
 (`src/c2pool/v37/xmr/`, `src/c2pool/v37/main_v37_xmr.cpp`,
 `src/c2pool/v37/test/`). Nothing touches the settlement canon
 (`w4_settlement.hpp`, the owed_digest fold) and no digest tag is bumped.
@@ -25,7 +26,7 @@ covers the F1 seeds through the event log, the F2 gap re-drive, the HOLD cap
 (a held block is never dropped), `--mine` stopping on suspend, the stratum
 disconnect with parked logins, and lag-suspend auto-resume.
 
-## 2. Refuse-side money is node-local (interim default (b))
+## 2. Refuse-side money is node-local (ruled: (b))
 
 **Rule.** When a lane block is refused, its on-chain reward goes to a
 **node-local LIABILITY** ledger. It never goes to eo, finalW or owed_digest.
@@ -83,12 +84,30 @@ again. It is now a counted, alarmed, per-payee number rather than a fork.
 
 KATs: FC20a-e, FC21, FC22/FC22b.
 
-## 3. CONTESTED suspends lane production (interim default)
+## 3. CONTESTED: loud alarm, keep building (ruled default OFF)
 
-`FinalizeConnectOptions::contested_suspends` defaults to true. The flag is
-`--contested-suspend on|off`. When the lineage vote enters CONTESTED (at
-least 1/3 of the last 24 frontier lane blocks refused, with at least 6
-observations), the contested hook fires **synchronously inside that tick**.
+**Ruling.** `FinalizeConnectOptions::contested_suspends` defaults to
+**false**, and `--contested-suspend` defaults to `off`. When the lineage vote
+enters CONTESTED (at least 1/3 of the last 24 frontier lane blocks refused,
+with at least 6 observations), the node raises the `cba-ALARM CONTESTED`
+alarm, counts the event (`contested_entered`), keeps refusing without
+crediting (the payout goes to the node-local liability, §2), and **keeps
+building**. KATs: FC28d (the default), FC28n (off: the vote goes CONTESTED
+then CONVERGED and the hook never fires).
+
+**Evidence behind the ruling** (the rework-3 verify, contested phase:
+`~/rc3-verify-rig`, P6 and P6d; §7 covers the other phases). Honest nodes A, B
+and C had byte-equal owed_digest at all 195 shared cursors, under a
+64-height forker and 60 s of wire skew. With suspension on, the honest lane
+DEADLOCKED once the forker stopped: every honest builder was suspended, so
+nothing refilled the observation window with honest blocks. It resumed only
+after a manual restart with `--contested-suspend off`. Suspension protected
+nothing the ledger needed, because refusal is ledger-neutral (§2), and it
+cost liveness.
+
+**Opt-in (`--contested-suspend on`).** The flag is kept so an operator can
+turn suspension back on. With it on, the contested hook fires
+**synchronously inside the tick** that enters CONTESTED.
 main then withdraws the stratum job, stops the in-process miner and
 refreshes no template. `LaneSuspendState` carries the `contested` cause. The
 hook fires (false) when the vote leaves CONTESTED, and the lane auto-resumes
@@ -96,20 +115,18 @@ once every cause (lag, isolated, held, contested) is clear. Booking and
 refusing-not-crediting continue, so the vote stays live.
 KATs: FC28 / FC28n, LS10.
 
-**Liveness note: operator attention required.** Outsider `03 21 00` tags or
-a forker with at least 1/3 of the lane hashrate can drive every honest node
-CONTESTED. While all honest builders are suspended, the observation window
+**Liveness note (opt-in only).** Outsider `03 21 00` tags or a forker with at
+least 1/3 of the lane hashrate can drive every honest node CONTESTED. While all honest builders are suspended, the observation window
 refills only with the attacker's blocks, so it stays CONTESTED. The exits
 are:
 * the forker stops;
 * `vote_stale_s` (48 h) ages the window out;
 * an operator sets `--contested-suspend off`.
 
-This is the trade the interim ruling makes: no building on a possibly split
-ledger, at the price of an externally triggerable production pause. It is
-never a halt of the node, which keeps following the chain, settling and
-booking. The rework-2 posture (keep building while CONTESTED) is the `off`
-value.
+The opt-in trades liveness for not building on a possibly split ledger: any
+outsider can trigger a production pause. It never halts the node, which
+keeps following the chain, settling and booking. The default (`off`) is the
+rework-2 posture: keep building while CONTESTED.
 
 ## 4. The verify fixes
 
@@ -236,7 +253,7 @@ the only value.
   Rework-3 guarantees that refusal is ledger-neutral. It does not make every
   refusal decision timing-free.
 * **The liability is real money.** See D2 and §5.
-* **The contested-suspend liveness hazard.** See §3.
+* **The contested-suspend liveness hazard.** Opt-in only since the ruling; see §3.
 * **ISOLATED.** It still needs the W6 verified-resync verifier; no production
   caller of `register_counter_lineage` exists yet. See rework-2 §3 and §7.
 

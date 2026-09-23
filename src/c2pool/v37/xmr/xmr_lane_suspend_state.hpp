@@ -14,7 +14,7 @@
 //              (hysteresis; the ONE lag definition, rework-2);
 //   isolated   the lineage vote: a VERIFIED counter-lineage outvotes us;
 //   held       HELD-LAG: an undecided lane block holds the cursor past the cap;
-//   contested  R-C rework-3 interim default: the lineage vote is CONTESTED
+//   contested  R-C rework-3 operator opt-in (--contested-suspend on; default off): the lineage vote is CONTESTED
 //              (>= 1/3 of the recent frontier lane blocks refused) -- suspend
 //              template production instead of building on a possibly split
 //              ledger; auto-resumes when the vote returns to CONVERGED.
