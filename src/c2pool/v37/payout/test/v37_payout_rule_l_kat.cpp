@@ -189,6 +189,15 @@ int main() {
         ok(outs(r) == PV{{1, 600}, {2, 399}} && r.donation == 1 && r.T == 999,
            "B2 P1 FIFO: T = min(B, top2) = 999; a full, b partial 399");
     }
+    // h_slot must be a CEILING: R = 1001, M*s = 2 -> ceil 501 (floor would be 500)
+    {
+        L::Params P; P.M = 1; P.h_min_dust = 1;
+        In in; in.R = 1001; in.D_min = 1; in.slots = 2;
+        in.rows = {row(1, 500, 1), row(2, 700, 2)};
+        auto r = L::compute(P, in);
+        ok(r.h_slot == 501 && r.eligible == 1,
+           "B1c h_slot = ceil(1001/2) = 501 excludes eo 500 (a floor would admit it)");
+    }
     // skip + P2 top-up
     L::Params P50; P50.M = 50; P50.h_min_dust = 1;
     {
