@@ -109,6 +109,63 @@ void NodeRPC::connect(NetService address, std::string userpass)
         });
 }
 
+bool NodeRPC::connect_sync(NetService address, std::string userpass)
+{
+    // Same request/auth state as connect(), built on the caller thread.
+    m_address = address;
+    m_userpass = userpass;
+
+    m_auth = std::make_unique<RPCAuthData>();
+    m_http_request = {http::verb::post, "/", 11};
+
+    m_auth->host = address.to_string();
+    m_http_request.set(http::field::host, m_auth->host);
+
+    m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    m_http_request.set(http::field::content_type, "application/json");
+    m_http_request.set(http::field::connection, "keep-alive");
+
+    std::string encoded_login2;
+    encoded_login2.resize(boost::beast::detail::base64::encoded_size(userpass.size()));
+    const auto result = boost::beast::detail::base64::encode(&encoded_login2[0], userpass.data(), userpass.size());
+    encoded_login2.resize(result);
+    m_auth->authorization = "Basic " + encoded_login2;
+
+    m_http_request.set(http::field::authorization, m_auth->authorization);
+
+    // Connect under the Send() mutex, on THIS thread. No async op is ever
+    // scheduled on m_stream, so the io thread never touches this socket.
+    {
+        std::lock_guard<std::mutex> _rpc_lock(m_rpc_mutex);
+        beast::error_code ec;
+        auto results = m_resolver.resolve(m_address.address(), m_address.port_str(), ec);
+        if (ec) {
+            LOG_WARNING << "CoindRPC connect_sync resolve failed: " << ec.message()
+                        << " (Send() retries via sync_reconnect)";
+            return false;
+        }
+        m_stream.connect(*results.begin(), ec);
+        if (ec) {
+            LOG_WARNING << "CoindRPC connect_sync connect failed: " << ec.message()
+                        << " (Send() retries via sync_reconnect)";
+            return false;
+        }
+        apply_socket_timeouts();
+    }
+    try {
+        if (!check()) {
+            LOG_ERROR << "CoindRPC connect_sync: check() refused the daemon";
+            return false;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR << "CoindRPC connect_sync: check() threw: " << e.what();
+        return false;
+    }
+    m_connected = true;
+    LOG_INFO << "...CoindRPC connected (sync)!";
+    return true;
+}
+
 NodeRPC::~NodeRPC()
 {
     beast::error_code ec;
@@ -694,6 +751,16 @@ nlohmann::json NodeRPC::gettxout(const uint256& txid, uint32_t n)
 nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
 {
     return CallAPIMethod("getblock", {blockhash, verbosity});
+}
+
+nlohmann::json NodeRPC::masternode_payments(const uint256& blockhash)
+{
+    return CallAPIMethod("masternode", {"payments", blockhash.GetHex(), 1});
+}
+
+nlohmann::json NodeRPC::getgovernanceinfo()
+{
+    return CallAPIMethod("getgovernanceinfo", {});
 }
 
 // E2c (#738): the MN-set seed fetch. `protx list registered true` returns

@@ -161,6 +161,21 @@ struct BtcNodeConfig {
     // (fail-closed — no unverified block is ever submitted to the coin daemon).
     bool            pow_verify_enabled = false;
 
+    // --- ★ T1-prep step 2: the settlement gate ------------------------------
+    // Explicit, default OFF. OFF = the W5 payout emission stays WITHHELD
+    // exactly as it always has on this arm (assemble_if_buried at depth 0,
+    // payout_emitted=0 on the wire): the ledger accrues owed balances and pays
+    // nobody. main_v37_btc_dash.cpp REFUSES `--settlement on` until the v0x03
+    // payout-set wire lands (peers refuse payout_emitted=1 today).
+    //
+    // POOL-ID SEAM (deliberately NOT here). A pool/consensus id — so nodes
+    // whose LaneParams differ reject each other explicitly instead of diverging
+    // silently (p2pool's IDENTIFIER/PREFIX split) — belongs to the roundabout
+    // S1 lane_tag track: it must be committed under the lane digest (LaneParams,
+    // sharechain canon) and carried in the wire version (w3_relay.hpp
+    // W3_WIRE_VERSION_V1/V2), not invented as a node-local flag.
+    bool            settlement_armed = false;
+
     // Resolve the on-disk settlement-store directory (settle_db_path override or
     // config_path()/<coin>/<net>/v37_settle_db).
     std::string resolved_settle_db_path() const {
