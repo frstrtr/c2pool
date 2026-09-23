@@ -136,7 +136,11 @@ inline u64 h_min(ScriptKind k, u64 k_floor) { return k_floor * output_size(k); }
 //                    STOPS at the first output that would exceed K_max; every
 //                    remaining balance carries forward (strict oldest-first
 //                    priority — never a younger output jumping an older one).
-//   k_floor        — the per-byte floor coefficient k for h_min.
+//   k_floor        — the per-byte floor coefficient k for h_min. CONSENSUS:
+//                    it decides which balances the canonical coinbase emits,
+//                    so callers take it from the lane's digest-committed
+//                    ::v37::LaneParams::k_floor (STEP-0 hotfix; Family A runs
+//                    f_ref = 10), never from a node-local literal or flag.
 // ─────────────────────────────────────────────────────────────────────────
 
 struct CoinbaseBudget {
