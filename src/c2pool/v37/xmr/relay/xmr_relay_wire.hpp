@@ -21,6 +21,9 @@
 //         0x40 FB_HELLO      the pool/consensus-id gate, first frame both ways
 //         0x41 FB_RECEIPTS   1..8 PoW-carrying receipts (flood / re-offer)
 //         0x42 FB_BLOCK_WON  the block-winner cut descriptor (fast path A)
+//         0x43 FB_GETCTX     repair: ask for the Monero block a receipt was mined on
+//         0x44 FB_CTX        the answer: that block's full blob (or "unknown here")
+//       (a pre-0x43 node counts 0x43/0x44 as fb_unknown and KEEPS the socket)
 //     0x80..0x83   carrier_supply.hpp GETORDER/ORDER/GETFRAMES/FRAMES (reused)
 //
 // Every integer is little-endian, every decoder is TOTAL and BOUNDED (a bad
@@ -86,6 +89,8 @@ inline constexpr u8  FB_NS_LAST   = 0x4f;
 inline constexpr u8  FB_HELLO     = 0x40;
 inline constexpr u8  FB_RECEIPTS  = 0x41;
 inline constexpr u8  FB_BLOCK_WON = 0x42;
+inline constexpr u8  FB_GETCTX    = 0x43;
+inline constexpr u8  FB_CTX       = 0x44;
 inline constexpr u8  kFbVersion   = 0x01;
 inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
@@ -107,6 +112,9 @@ inline constexpr std::size_t kFbReceiptsHeader      = 1 + 1 + 4 + 1;
 inline constexpr std::size_t kFbMaxFrame            = kFbReceiptsHeader + kFbMaxReceiptsPerFrame * kFbReceiptMaxBytes;
 inline constexpr std::size_t kHelloBytes            = 1 + 1 + 4 + 1 + 4 + 32 + 8 + 8 + 2 + 8 + 32 + 1;   // 102
 inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
+inline constexpr std::size_t kCtxMaxIds             = 8;                 // ids per FB_GETCTX
+inline constexpr std::size_t kCtxMaxBlob            = 512 * 1024;        // one Monero block blob (header | miner_tx | tx hashes)
+inline constexpr std::size_t kCtxHeader             = 1 + 1 + 4 + 32 + 4; // op ver chain id len
 
 // The work one receipt contributes to the lane (LaneRecord::push w). Every
 // receipt is admitted at EXACTLY the lane share difficulty (R-1, HELLO-pinned),
@@ -381,6 +389,64 @@ inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string*
     if (p[0] > 1) return bad("block_won: payout_emitted not 0/1");
     b.payout_emitted = p[0] != 0; p += 1;
     b.owed_digest_at_win = le::getb(p);
+    return true;
+}
+
+// ── FB_GETCTX (0x43) / FB_CTX (0x44): a receipt's Monero context ────────────
+// A receipt is verified against the block it was mined on (prev_id -> bin
+// height + RandomX seed). A receipt mined on a block this node never saw -- an
+// ORPHANED sibling its own monerod never received (Monero does not relay
+// alternative blocks) -- cannot be resolved from the local chain view, so a
+// relay repair that needs it would wait forever. The repairing node asks its
+// peers for that block: GETCTX carries the ids, CTX carries ONE block's full
+// blob (header | miner_tx | varint n | n tx hashes, exactly monerod's
+// block_to_blob). The receiver never trusts the answer: verify_block_ctx()
+// recomputes the block id from the bytes, reads the height from the coinbase
+// txin_gen and requires the parent to be a block it already knows AT that
+// height (a parent-linked, recent context; the seed then comes from its own
+// chain, never from the peer).
+//   GETCTX : u8 0x43 ; u8 ver ; u32 chain_id ; u8 n (1..8) ; n x id(32)
+//   CTX    : u8 0x44 ; u8 ver ; u32 chain_id ; id(32) ; u32 len (0 = unknown here, <= 512 KiB) ; len bytes
+inline std::vector<u8> encode_getctx(u32 chain_id, const std::vector<bytes32>& ids) {
+    if (ids.empty() || ids.size() > kCtxMaxIds) return {};
+    std::vector<u8> f; f.reserve(7 + 32 * ids.size());
+    f.push_back(FB_GETCTX); f.push_back(kFbVersion); le::put32(f, chain_id);
+    f.push_back(static_cast<u8>(ids.size()));
+    for (const auto& id : ids) le::putb(f, id);
+    return f;
+}
+inline bool decode_getctx(const std::vector<u8>& f, u32& chain_id, std::vector<bytes32>& ids, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() < 7) return bad("getctx: short");
+    if (f[0] != FB_GETCTX) return bad("getctx: wrong opcode");
+    if (f[1] != kFbVersion) return bad("getctx: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    const std::size_t n = f[6];
+    if (n == 0 || n > kCtxMaxIds) return bad("getctx: n out of range (1..8)");
+    if (f.size() != 7 + 32 * n) return bad("getctx: wrong length");
+    ids.clear();
+    for (std::size_t i = 0; i < n; ++i) ids.push_back(le::getb(f.data() + 7 + 32 * i));
+    return true;
+}
+inline std::vector<u8> encode_ctx(u32 chain_id, const bytes32& id, const std::vector<u8>& blob) {
+    if (blob.size() > kCtxMaxBlob) return {};
+    std::vector<u8> f; f.reserve(kCtxHeader + blob.size());
+    f.push_back(FB_CTX); f.push_back(kFbVersion); le::put32(f, chain_id); le::putb(f, id);
+    le::put32(f, static_cast<u32>(blob.size()));
+    f.insert(f.end(), blob.begin(), blob.end());
+    return f;
+}
+inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std::vector<u8>& blob, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() < kCtxHeader) return bad("ctx: short");
+    if (f[0] != FB_CTX) return bad("ctx: wrong opcode");
+    if (f[1] != kFbVersion) return bad("ctx: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    id = le::getb(f.data() + 6);
+    const std::size_t len = le::get32(f.data() + 38);
+    if (len > kCtxMaxBlob) return bad("ctx: blob over 512 KiB");
+    if (f.size() != kCtxHeader + len) return bad("ctx: wrong length");
+    blob.assign(f.begin() + static_cast<std::ptrdiff_t>(kCtxHeader), f.end());
     return true;
 }
 
