@@ -8,15 +8,16 @@
 // code is touched and no consensus surface is mutated.
 //
 // WHAT IT PINS — the canonical 60%-by-WORK version-switch ACCEPT gate that BCH
-// enforces inline in bch::check_share (src/impl/bch/share_check.hpp:1774-1775):
+// enforces in bch::check_share via bch::version_switch_underweight
+// (src/impl/bch/version_switch_gate.hpp):
 //
-//     if (new_ver_weight * uint32_t(100) < total_weight * uint32_t(60))
-//         throw std::invalid_argument("switch without enough hash power upgraded");
+//     new_ver_weight < (total_weight * 60) / 100    // oracle: sum*60//100
+//         -> throw "switch without enough hash power upgraded"
 //
-// The expected side below is a VERBATIM replica of that live tail-guard, the
-// same non-circular localisation btc/DGB use (the guard stays inline in
-// check_share; no lifted SSOT). A silent drift of the live 60%-by-WORK boundary
-// fails here.
+// The expected side below is a VERBATIM replica of that live predicate, the
+// same non-circular localisation btc/DGB use. A silent drift of the live
+// 60%-by-WORK boundary fails here. The floored-threshold rounding boundary
+// itself is pinned against the live header by version_switch_floor_kat_test.
 //
 // LOAD-BEARING #288/#326 PROPERTY: the gate is work-WEIGHTED, not a flat
 // head-count. #326 dropped the pre-v36 95%-flat-count punish for exactly this
@@ -43,14 +44,14 @@
 
 namespace {
 
-// Verbatim replica of the LIVE inline tail-guard in bch::check_share.
+// Verbatim replica of the LIVE predicate bch::version_switch_underweight.
 // accept_boundary == true  <=>  an upgrade boundary share (share_ver ==
 // parent_ver + 1) is ACCEPTED, i.e. it is NOT the case that the desiring weight
-// is below 60% of the window's total weight.
+// is below floor(60% of the window's total weight).
 bool accept_boundary(const uint288& new_ver_weight, const uint288& total_weight)
 {
-    return !((new_ver_weight * static_cast<uint32_t>(100)) <
-             (total_weight   * static_cast<uint32_t>(60)));
+    return !(new_ver_weight <
+             (total_weight * static_cast<uint32_t>(60)) / uint288(100));
 }
 
 // The PRE-v36 flat head-count activation predicate (>= 95% by COUNT). Retained
