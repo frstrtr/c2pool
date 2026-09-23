@@ -319,14 +319,14 @@ public:
         // slot_budget_C == 0 / max_payout_bytes == 0 BOTH mean UNBOUNDED (the two
         // caps are symmetric and honored in OwedLedger::propose_coinbase / the W5
         // assemble byte loop), NOT "emit nothing". k_floor > 0 ARMS the byte-
-        // denominated no-dust floor (coinbase-prioritization Rule 0):
-        // h_min(P2PKH) = 34 sat, so no sub-floor dust output is ever emitted (a
-        // below-floor balance carries forward, owed unchanged). All three caps
-        // are consensus-fixed and identical fleet-wide (shipped defaults).
-        cb::CoinbaseBudget budget;
-        budget.slot_budget_C    = 0;   // unbounded output-count C (ratified default)
-        budget.max_payout_bytes = 0;   // unbounded byte budget K_max (ratified default)
-        budget.k_floor          = 1;   // real byte floor -> h_min > 0 (no dust emitted)
+        // denominated no-dust floor (coinbase-prioritization Rule 0); the
+        // Family-A lane runs k_floor = f_ref = 10: h_min(P2WPKH) = 310 sat,
+        // h_min(P2PKH) = 340 sat, so no sub-floor dust output is ever emitted
+        // (a below-floor balance carries forward, owed unchanged). All three
+        // caps are consensus: C and K_max are fixed here, and k_floor is READ
+        // FROM THE LANE PARAMS (digest-committed), never a node-code literal —
+        // see coinbase_budget().
+        const cb::CoinbaseBudget budget = coinbase_budget();
 
         auto pay_of = [this](const ::v37::bytes32& k) { return m_pay_of(k); };
 
@@ -538,10 +538,7 @@ public:
         //     gate exactly — a freshly relayed win is at depth 0 and is not yet
         //     canonical here — so assemble_if_buried withholds for us too and
         //     the two payout maps are equal BY CONSTRUCTION, not by luck.
-        cb::CoinbaseBudget budget;
-        budget.slot_budget_C    = 0;   // unbounded (ratified default, mirrors on_block_won)
-        budget.max_payout_bytes = 0;   // unbounded (ratified default)
-        budget.k_floor          = 1;   // byte-denominated no-dust floor
+        const cb::CoinbaseBudget budget = coinbase_budget();   // SAME budget as on_block_won
         cb::BurialGate gate;
         gate.d_conf        = m_cfg.d_conf;
         gate.canonical     = false;    // a peer's fresh win is never canonical to us yet
@@ -597,6 +594,23 @@ public:
     V37Engine&        engine()        { return *m_engine; }
     BtcFinalizeDriver& finalizer()    { return *m_fin; }
     const BtcNodeConfig& config() const { return m_cfg; }
+
+    // ── STEP-0 hotfix: the ONE coinbase budget both coinbase sites use ──────
+    // (on_block_won and on_peer_block_won). The no-dust floor k_floor decides
+    // the canonical coinbase (h_min = k_floor * output_size(kind)), so it is
+    // consensus: it is read from the lane's LaneParams, which commit it in the
+    // lane digest ("KFL1", v37_lane.hpp). It used to be the literal 1 in this
+    // file — node-local, uncommitted — so two nodes that disagreed on it built
+    // different coinbases from the same ledger with nothing on the wire to say
+    // so. Now a disagreement is a lane-digest mismatch at every cut, which the
+    // S-1c cut rule REFUSES by name (cut_digest_mismatch).
+    cb::CoinbaseBudget coinbase_budget() const {
+        cb::CoinbaseBudget b;
+        b.slot_budget_C    = 0;                          // unbounded output-count C (ratified default)
+        b.max_payout_bytes = 0;                          // unbounded byte budget K_max (ratified default)
+        b.k_floor          = m_cfg.lane_params.k_floor;  // digest-committed no-dust floor
+        return b;
+    }
     std::shared_ptr<const ::v37::LaneSnapshot> lane_snapshot() const {
         return m_engine ? m_engine->snapshot(m_cfg.lane_chain) : nullptr;
     }

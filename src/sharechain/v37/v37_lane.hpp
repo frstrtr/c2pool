@@ -399,6 +399,41 @@ struct FeeModelGate {
     }
 };
 
+// ── K_FLOOR: the coinbase no-dust floor coefficient (STEP-0 hotfix) ────────
+// W5 (src/c2pool/v37/w5_coinbase.hpp) emits an owed balance as a coinbase
+// output only when it clears h_min(kind) = k_floor * output_size(kind); below
+// the floor the balance CARRIES. W4's K_fair selection (propose_coinbase)
+// applies that floor, so k_floor decides WHICH outputs the canonical coinbase
+// carries, hence the payout map every node deducts at FOUND/FINALIZE, hence the
+// owed_digest that commits to it. It is consensus, not node policy. Before this
+// field it was a literal set by node code (btc_node.hpp), and two builds or
+// configs that disagreed on it built different canonical coinbases from the
+// same ledger: a SILENT owed_digest fork (same class as the #1697 P0).
+//
+// Here it is a per-lane LaneParams constant and it is DIGEST-COMMITTED:
+// build_leaves() appends the "KFL1" sub-block (u64 k_floor) to the V37H header
+// leaf, right after the geometry tuple, whenever k_floor != K_FLOOR_NONE. Two
+// nodes with different k_floor therefore publish different lane digests at
+// EVERY prefix, and a peer win whose cut digest does not match ours is REFUSED
+// explicitly at the S-1c cut rule (btc_node.hpp on_peer_block_won:
+// cut_digest_mismatch) instead of being credited under a different floor. The
+// roundabout lane tag (rb_lane_tag.hpp geometry_leaf) mirrors the same bytes,
+// and the XMR relay HELLO lane_params_digest folds the field as well.
+//
+// NEUTRAL AT ZERO. k_floor == K_FLOOR_NONE ("no byte floor") appends nothing,
+// so every lane built from the bare LaneParams{} keeps its lane digest
+// byte-identical: every canon golden, the refimpl parity vectors, and the XMR
+// lane (Monero has no dust rule, dust = 0; the XMR floor is the absolute
+// piconero XmrSettlementConfig::h_min, and XMR books the winner's ON-CHAIN
+// coinbase rather than a rebuild, see xmr_node_config.hpp). The BTC-family
+// lanes (Family A: BTC / DASH / LTC / DOGE) run K_FLOOR_F_REF = 10 (f_ref, sat
+// per output byte): h_min(P2WPKH) = 310 sat, h_min(P2PKH) = 340 sat, set by
+// LaneParams::family_a() and BtcNodeConfig::lane_params. A pre-hotfix Family-A
+// build (implicit k_floor = 1, no KFL1 block) and a post-hotfix one differ in
+// the lane digest, so they too refuse each other explicitly.
+inline constexpr std::uint64_t K_FLOOR_NONE  = 0;    // no byte floor (digest-neutral)
+inline constexpr std::uint64_t K_FLOOR_F_REF = 10;   // Family-A f_ref (sat / output byte)
+
 struct LaneParams {
     u64 window = 8640;          // W   (OQ-5 default)
     u64 c0 = 4096;              // C0, power of two; also E (epoch length)
@@ -423,9 +458,23 @@ struct LaneParams {
     // ADD-ONLY, digest-neutral by construction (see FeeModelGate): the v36
     // fee model on the XMR lane, default OFF => master-identical.
     FeeModelGate fee{};
+    // STEP-0 hotfix: the coinbase no-dust floor coefficient (see K_FLOOR_NONE
+    // above). h_min(kind) = k_floor * output_size(kind). DIGEST-COMMITTED when
+    // non-zero ("KFL1" in the V37H header leaf); 0 = no floor, digest-neutral.
+    u64 k_floor = K_FLOOR_NONE;
 
     u64 epoch_len() const { return c0; }
     std::size_t levels() const { return 1 + level_caps.size(); }
+
+    // The Family-A (BTC-family parent) lane: the V37.0 base geometry and gates
+    // of the bare default, with the byte floor at f_ref. BtcNodeConfig's
+    // default; a node that builds its lane any other way still commits its own
+    // k_floor in the lane digest, so a mismatch is refused, never forked.
+    static LaneParams family_a() {
+        LaneParams p;
+        p.k_floor = K_FLOOR_F_REF;
+        return p;
+    }
 
     // ── Named consensus versions (ADD-ONLY). The digested geometry is IDENTICAL
     // across every version — only the non-digested `subthreshold` gate differs —
@@ -2898,6 +2947,16 @@ private:
             append_u64(h, m_p.half_life);
             append_u64(h, static_cast<u64>(m_p.level_caps.size()));
             for (u64 c : m_p.level_caps) append_u64(h, c);
+            if (m_p.k_floor != K_FLOOR_NONE) {
+                // STEP-0 hotfix: the coinbase no-dust floor decides the
+                // canonical coinbase, so it is consensus and is committed
+                // beside the geometry. Appended ONLY when non-zero, so a
+                // k_floor-0 lane (the bare default, XMR, every canon golden)
+                // serializes exactly the pre-hotfix bytes. rb_lane_tag.hpp's
+                // geometry_leaf mirrors this block byte for byte.
+                append_bytes(h, "KFL1", 4);
+                append_u64(h, m_p.k_floor);
+            }
             append_u64(h, m_B);
             append_u64(h, m_next_pos);
             append_u64(h, static_cast<u64>(m_acc.size()));

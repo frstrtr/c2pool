@@ -305,6 +305,17 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_o2_finalize_connect_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_o2_finalize_connect_selfcheck PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_o2_finalize_connect_selfcheck COMMAND v37_xmr_o2_finalize_connect_selfcheck)
+    # v37_xmr_lane_suspend_selfcheck (R-C rework-2): the stratum side of LANE
+    # SUSPEND over a loopback socket -- the suspend EDGE withdraws the job
+    # (sessions dropped), a login while suspended is PARKED, the resume edge
+    # serves it. Stub template source + verifier: no RandomX, no monerod.
+    add_executable(v37_xmr_lane_suspend_selfcheck
+        v37_xmr_lane_suspend_selfcheck.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_lane_suspend_selfcheck PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_lane_suspend_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_lane_suspend_selfcheck PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_lane_suspend_selfcheck COMMAND v37_xmr_lane_suspend_selfcheck)
     # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
@@ -776,6 +787,22 @@ if (BUILD_TESTING)
     target_link_libraries(v37_s1c_convergence_kat Threads::Threads)
     add_test(NAME v37_s1c_convergence_kat COMMAND v37_s1c_convergence_kat)
 
+    # STEP-0 hotfix -- k_floor is a LaneParam (src/sharechain/v37/v37_lane.hpp
+    # LaneParams::k_floor). The W5 no-dust floor decides the canonical coinbase,
+    # so it is consensus: it used to be a node-code literal in btc_node.hpp (a
+    # silent owed_digest fork vector). The KAT pins: the constants (f_ref = 10,
+    # neutral 0), the digest-neutral-at-zero lane digest against the PRE-hotfix
+    # golden, the KFL1 commitment in the lane digest and the roundabout lane
+    # tag, the explicit S-1c refusal (cut_digest_mismatch) of a peer on another
+    # floor, identical coinbases on the same floor, and the floor being
+    # load-bearing over one ledger. Stdlib + Threads, MockCoinBackend +
+    # MemSettleStore. ALSO on BOTH build.yml --target lists (hollow-green rule).
+    add_executable(v37_kfloor_laneparam_kat v37_kfloor_laneparam_kat.cpp)
+    target_compile_features(v37_kfloor_laneparam_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_kfloor_laneparam_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_kfloor_laneparam_kat Threads::Threads)
+    add_test(NAME v37_kfloor_laneparam_kat COMMAND v37_kfloor_laneparam_kat)
+
     # Track A2 / W4-W6 — the OWED-EVENT MMR: an append-only authenticated record
     # log (src/c2pool/v37/record_log.hpp, instanced by owed_event_log.hpp) built
     # on the SHIPPED ::v37::Lane MMR statics, maintained inside OwedLedger, made
@@ -880,4 +907,17 @@ if (BUILD_TESTING)
     # BOTH build.yml --target lists.
     add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/roundabout/test
                      ${CMAKE_CURRENT_BINARY_DIR}/roundabout)
+
+    # V37 payout economics (NEW standalone modules under src/c2pool/v37/payout/):
+    # KATs beside the headers, pulled in with an explicit binary dir. SAME
+    # HOLLOW-GREEN GUARD: every v37_payout_* target is ALSO on BOTH build.yml
+    # --target lists.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/payout/test
+                     ${CMAKE_CURRENT_BINARY_DIR}/payout)
+
+    # V37 payout economics — CarriageGate + FeeFloorGate KAT (its own test dir
+    # beside the header, src/c2pool/v37/payout/carriage.hpp). SAME HOLLOW-GREEN
+    # GUARD: v37_payout_carriage_kat is ALSO on BOTH build.yml --target lists.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/payout/carriage/test
+                     ${CMAKE_CURRENT_BINARY_DIR}/payout_carriage)
 endif()

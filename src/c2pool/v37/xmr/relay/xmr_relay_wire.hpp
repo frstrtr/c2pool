@@ -415,6 +415,15 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
     le::put64(b, p.nr.w_default_bins); le::put64(b, p.nr.coverage_blocks); le::put64(b, p.nr.bin_seconds);
     le::put64(b, p.nr.retarget_bins); le::put64(b, p.nr.ckpt_bins); le::put64(b, p.nr.n_ctx_bins);
     b.push_back(p.nr.allow_digit_repeat ? 1 : 0);
+    // STEP-0 hotfix: the coinbase no-dust floor (LaneParams::k_floor). Appended
+    // ONLY when non-zero, exactly as the canon lane header's KFL1 block, so the
+    // XMR lane (k_floor 0: Monero has no dust rule, its floor is the absolute
+    // piconero settle_h_min) keeps the pinned golden and HELLO-compatibility
+    // with pre-hotfix peers, while any node that sets a floor is refused here.
+    if (p.k_floor != ::v37::K_FLOOR_NONE) {
+        b.insert(b.end(), {'K', 'F', 'L', '1'});
+        le::put64(b, p.k_floor);
+    }
     // relay-level consensus pins
     le::put64(b, share_diff);
     b.push_back(static_cast<u8>(bind));

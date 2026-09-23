@@ -260,6 +260,21 @@ struct XmrNodeConfig {
     std::string     residual_sink_view_hex;
     bool            residual_sink_subaddress = false;
     // The v37 lane parameters (consensus once multi-node; explicit here).
+    //
+    // STEP-0 k_floor hotfix — why the XMR floor is NOT moved into LaneParams
+    // (unlike Family A, where btc_node.hpp's coinbase_budget() now reads the
+    // digest-committed LaneParams::k_floor): the XMR lane settles under
+    // COINBASE AUTHORITY (xmr_coinbase_authority.hpp, RECON ruling "read from
+    // block"). Every node books the winner's ON-CHAIN coinbase — payout =
+    // CoinbaseBooking::payout decoded from the block — and never deducts a
+    // locally rebuilt coinbase, so a node running a different settle_h_min
+    // (or settle_output_cap) mines a different but VALID coinbase that every
+    // peer books identically; the K_fair recompute is a cross-check alarm only.
+    // A differing floor therefore cannot fork owed_digest here. The XMR lane
+    // keeps LaneParams::k_floor = 0 (Monero has no dust rule; the lane digest,
+    // the lane tag and the relay HELLO lane_params_digest stay byte-identical).
+    // If XMR ever settles by rebuild instead of by reading the block, this
+    // floor must move into LaneParams exactly as Family A's did.
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so

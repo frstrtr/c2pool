@@ -48,12 +48,29 @@ struct CoinbaseBooking {
     long long     sink_total = 0;       // D1: sink amount is NOT a ledger deduction
     std::size_t   digest_index = 0;     // which candidate matched (0 = newest)
     ::v37::bytes32 lane_commitment{};
+    // R-C majority-shaped halt: the raw on-chain 0x03 root, set as soon as the
+    // 03-21-00 tail is read -- BEFORE the candidate match. On a lane-root-unknown
+    // block (no candidate matched, so lane_commitment is empty) this is the only
+    // stable builder/ledger-state fingerprint available (the payout identities are
+    // undecodable without the matched lane_commitment). The receiver uses distinct
+    // on-chain roots across a consecutive-unmatched run as the "distinct payees"
+    // proxy so a single stuck/forked builder cannot halt the honest majority.
+    ::xmr::coin::Hash256 onchain_root{};
+    bool           has_onchain_root = false;
     std::map<::v37::bytes32, long long> payout;   // identity -> piconero, the on-chain truth
     // fee model: the per-vout identity + amount (canonical order), so the
     // donation-marker rule (xmr_fee_model.hpp apply_donation_rule) can locate
     // the marker / sink tail and re-book the donation's owed outputs.
     std::vector<::v37::bytes32> out_identity;
     std::vector<std::uint64_t>  out_amount;
+    // R-C rework-2 (F-MONEY, M2): when an output maps to NO known payee the block
+    // stays fail-closed for booking (ok == false, unchanged), but the MAPPED
+    // outputs are kept in `payout` (flag payout_partial) and the unmapped sum is
+    // reported, so a refusing node can still debit what it CAN attribute and
+    // put the rest in node-local suspense. Before, payout was cleared.
+    bool           payout_partial = false;
+    std::uint64_t  unmapped_total = 0;
+    std::size_t    unmapped_outputs = 0;
     // recon(A+B credit): the ON-CHAIN CREDIT CUT (0x02 tail), if the coinbase carries one.
     bool           has_credit_cut = false;
     credit::CreditCut credit_cut;
@@ -96,6 +113,7 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     const unsigned char* tag = got.tx_extra.data() + got.tx_extra.size() - 35;
     if (tag[0] != 0x03 || tag[1] != 0x21 || tag[2] != 0x00) { b.why = "not-lane: no 03 21 00 tail"; return b; }
     ::xmr::coin::Hash256 root; std::memcpy(root.data(), tag + 3, 32);
+    b.onchain_root = root; b.has_onchain_root = true;   // R-C: fingerprint available even when no candidate matches
     bool matched = false;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         if (set_::mm_commitment_root(chain_id, candidates[i]) == root) {
@@ -145,8 +163,12 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
                 found = true; break;
             }
         }
-        if (!found) { b.why = "output " + std::to_string(i) + " maps to no known payee (fail-closed)"; b.payout.clear(); b.out_identity.clear(); b.out_amount.clear(); return b; }
+        if (!found) {
+            ++b.unmapped_outputs; b.unmapped_total += got.amounts[i];
+            if (b.why.empty()) b.why = "output " + std::to_string(i) + " maps to no known payee (fail-closed)";
+        }
     }
+    if (b.unmapped_outputs) { b.payout_partial = true; return b; }   // fail-closed for booking; mapped part kept for the debit
     b.ok = true;
     return b;
 }
