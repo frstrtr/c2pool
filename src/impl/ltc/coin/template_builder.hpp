@@ -17,6 +17,7 @@
 #include "header_chain.hpp"
 #include "mempool.hpp"
 #include "fill_budget.hpp"
+#include "fill_budget_runtime.hpp"
 #include "mweb_builder.hpp"
 #include "rpc_data.hpp"
 #include "transaction.hpp"
@@ -366,7 +367,9 @@ public:
                  << " synced=" << chain.is_synced();
         auto t1 = std::chrono::steady_clock::now();
         auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-        return rpc::WorkData{std::move(data), std::move(tx_objects), std::move(tx_hashes), latency_ms};
+        rpc::WorkData wd{std::move(data), std::move(tx_objects), std::move(tx_hashes), latency_ms};
+        wd.m_newtx_bytes = budget_gate.spent();
+        return wd;
     }
 
 };
@@ -397,13 +400,34 @@ public:
                      << m_chain.height() << ")";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
         }
-        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet, m_mweb_tracker);
+        // G2: one grant per work event (one getwork() == one refresh_work()),
+        // after the lazy block reset when the parent tip moved.
+        std::optional<int64_t> grant;
+        if (auto tip = m_chain.tip())
+            grant = m_fill_budget.begin_work(tip->block_hash);
+        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet, m_mweb_tracker, grant);
         if (!result) {
             LOG_WARNING << "[EMB-LTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
         }
+        m_fill_budget.record(result->m_hashes, result->m_newtx_bytes);
         return *result;
     }
+
+    /// G2 settle: a local share was FOUND on the job whose coinbase merkle
+    /// branch is `branch` (ShareCreationParams::merkle_branches). The one
+    /// debit; also advances the ramp. Call for DOA/orphan shares too.
+    ParentFillBudget::Settled settle_found_share(const std::vector<uint256>& branch) {
+        auto s = m_fill_budget.settle_found(branch);
+        LOG_INFO << "[EMB-LTC] G2 settle: " << s.bytes << "B"
+                 << (s.matched ? "" : " (template not recent, held grant)")
+                 << " cap=" << m_fill_budget.current_cap()
+                 << " ramp=" << m_fill_budget.shares_since_reset()
+                 << " tokens=" << static_cast<int64_t>(m_fill_budget.tokens());
+        return s;
+    }
+
+    const ParentFillBudget& fill_budget() const { return m_fill_budget; }
 
     /// Block relay in embedded mode is handled by CoinBroadcaster via
     /// MiningInterface::on_block_relay, not through this interface.
@@ -449,6 +473,7 @@ private:
     std::function<bool()> m_utxo_ready;  // coinbase maturity gate
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
+    ParentFillBudget m_fill_budget = ParentFillBudget::ltc();  // G2 LTC bucket
 };
 
 } // namespace coin
