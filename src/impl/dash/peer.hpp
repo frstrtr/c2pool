@@ -42,6 +42,15 @@ struct Peer
     std::set<uint256> m_remote_txs;                       // hashes the remote peer has advertised
     std::map<uint256, coin::Transaction> m_remembered_txs; // full txs keyed by hash
 
+    // #950: hashes WE seeded this peer with as its STANDING remembered set
+    // (send_standing_remember, canonical p2p.py:283). send_shares keeps these
+    // OUT of its transient remember/forget bracket, as canonical does with
+    // mining_txs (p2p.py:377): re-remembering one makes a canonical peer
+    // disconnect (p2p.py:474-477) and forgetting one erases the seed
+    // (p2p.py:493-497). Per peer, not node-wide, because the seed is a capped
+    // snapshot of m_known_txs taken at this peer's handshake.
+    std::set<uint256> m_standing_remembered;
+
     // Send side of the tx-pool advertisement: our reconstruction of what this
     // peer believes WE hold, so each sweep can emit only the delta as
     // have_tx / losing_tx. Mirror image of m_remote_txs above (what the peer
