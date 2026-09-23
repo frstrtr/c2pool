@@ -277,12 +277,23 @@ public:
         {
             RecoveryDriver rec(*m_store, m_cfg.lane_chain);
             bool ok = false;
-            m_boot_digests.clear();
+            m_boot_digests.clear(); m_boot_since.clear();
             m_boot_digests.push_back(m_ledger.owed_digest());   // the empty anchor / anchor-boot state
-            m_recovered = rec.recover(m_ledger, ok, [this](const OwedLedger& l) {
+            m_boot_since.push_back(0);
+            // R-C rework-3 (D7): pair every replayed digest state with the coin
+            // height it became current at (Finalize: bin_height - D_conf; the
+            // formula XmrFinalizeDriver::since_of_bin applies live).
+            std::uint64_t since = 0;
+            m_recovered = rec.recover(m_ledger, ok, {}, [this, &since](const OwedLedger& l, const SettleEvent& e) {
+                if (e.kind == SettleEvKind::Finalize)
+                    since = e.bin_height >= m_cfg.d_conf ? e.bin_height - m_cfg.d_conf : 0;
                 const ::v37::bytes32 d = l.owed_digest();
-                if (!(m_boot_digests.back() == d)) m_boot_digests.push_back(d);   // R-B(i) follow-up: canonical D(c) history
+                if (!(m_boot_digests.back() == d)) {   // R-B(i) follow-up: canonical D(c) history
+                    m_boot_digests.push_back(d);
+                    m_boot_since.push_back(since);
+                }
             });
+            m_boot_last_since = since;
             if (!ok)
                 throw std::runtime_error(
                     "XmrNode: settlement store is torn (F2 fail-closed) — refusing to start");
@@ -328,6 +339,7 @@ public:
             m_ledger, m_hw, *m_store, m_cfg.lane_chain, m_cfg.d_conf,
             m_recovered.finalize_cursor_height, m_recovered.max_event_seq,
             [this](std::uint64_t h, const std::string& bid) { return chain_carries(h, bid); });
+        m_finalize->set_digest_since(m_boot_last_since);   // R-C rework-3 (D7): continue the replayed since-height
         // R-C rework-2: tri-state carry (Unknown holds, never a false orphan) and
         // the composed booking gate (node gap gate AND the consumer's R4/R6 gate).
         m_finalize->set_carry_probe(
@@ -416,6 +428,9 @@ public:
     // fix for a resumed node starting with a 1-entry ring -> first peer block
     // root-unknown forever).
     const std::vector<::v37::bytes32>& boot_digest_history() const { return m_boot_digests; }
+    // R-C rework-3 (D7): parallel to boot_digest_history(): the coin height at
+    // which each replayed state became current (the RECON root-age bound).
+    const std::vector<std::uint64_t>&  boot_digest_since() const { return m_boot_since; }
 
     // R6 (two-sided chain-ordered booking): re-run the F1 finalize walk against
     // the CURRENT persisted high-water without a new chain event. FinalizeConnect
@@ -555,6 +570,8 @@ private:
     SettleHW                               m_hw;
     RecoveredState                         m_recovered;
     std::vector<::v37::bytes32>            m_boot_digests;   // R-B(i) follow-up: canonical owed_digest history from boot replay
+    std::vector<std::uint64_t>             m_boot_since;     // R-C rework-3 (D7): since-height per boot digest
+    std::uint64_t                          m_boot_last_since = 0;
 
     V37Engine                              m_engine;
     ::v37::bytes32                         m_seed_digest{};

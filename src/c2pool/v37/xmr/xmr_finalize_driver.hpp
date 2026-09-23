@@ -135,10 +135,27 @@ public:
         SettleEvent fz;
         fz.kind = SettleEvKind::Finalize; fz.bid = bid; fz.bin_height = bin_height;
         write_event(fz);
+        m_last_since = since_of_bin(bin_height);   // R-C rework-3 (D7): the same formula the boot replay uses
         m_ledger.on_block_finalized(bid, bin_height);
         ledger_event();
         persist_hw();
         return true;
+    }
+
+    // R-C rework-3 (D7, the RECON root-age bound): the coin height at which the
+    // CURRENT owed_digest state became current. Post R-A the digest is D(c), a
+    // function of the settled prefix, so it only changes at a FINALIZE (or a
+    // seed): FINALIZE of the block mined at h (bin_height = h + D_conf) makes
+    // D(h) current at height h. Updated right BEFORE the ledger mutation, so the
+    // ledger-event observer (the candidate ring) reads the height of the state it
+    // is sampling. The boot replay derives the SAME value from the Finalize
+    // event's recorded bin_height (XmrNode::boot_digest_since), so a restarted
+    // node's ring carries identical (digest, since) pairs. ORPHAN/FOUND never
+    // move it (they do not change D(c)).
+    std::uint64_t digest_since() const { return m_last_since; }
+    void set_digest_since(std::uint64_t h) { m_last_since = h; }   // boot: the replayed value
+    std::uint64_t since_of_bin(std::uint64_t bin_height) const {
+        return bin_height >= m_d_conf ? bin_height - m_d_conf : 0;
     }
 
     XmrFinalizeDriver(OwedLedger& ledger, SettleHW& hw, ISettleStore& store,
@@ -285,6 +302,7 @@ public:
                     ev.bin_height = bin_height;
                     write_event(ev);
                     if (m_on_finalize) m_on_finalize(bid, h, bin_height);   // R6 evidence: the pending set read here
+                    m_last_since = since_of_bin(bin_height);                  // R-C rework-3 (D7): == h
                     m_ledger.on_block_finalized(bid, bin_height);
                     ledger_event();   // R5
                     steps.push_back(FinalizeStep{bid, h, bin_height});
@@ -337,6 +355,7 @@ private:
     FinalizeStepFn m_on_finalize;                // R6: pre-FINALIZE observer (pending-set evidence)
     CarryFn        m_carry;                      // R-C rework-2: tri-state canonical probe (Unknown -> hold)
     std::uint64_t  m_carry_unknown = 0;          // R-C rework-2: walks held on an Unknown carry answer
+    std::uint64_t  m_last_since = 0;             // R-C rework-3 (D7): coin height the current digest became current
 
     std::map<std::string, FoundBlock>              m_found;      // bid -> block
     std::map<std::uint64_t, std::vector<std::string>> m_by_height; // mined height -> bids

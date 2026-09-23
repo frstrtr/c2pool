@@ -1,5 +1,12 @@
 # XMR lane R-C rework-2: money path, halt rule, restart liveness
 
+> **Superseded in part by [r-c-rework-3.md](r-c-rework-3.md).** The
+> debit-on-refuse money path (§2 M1, M3(b), M4 `d` records) was withdrawn
+> after the rework-2 verify showed it forked honest refusers (D1). A refused
+> block's value is now node-local LIABILITY and never a ledger mutation.
+> CONTESTED now suspends lane production by default (§3). The observation
+> window is now persisted.
+
 This is the design record for the second rework of the XMR lane's R-C
 ("refused lane block") handling. It covers what the branch implements, the
 invariants it keeps, and the items left as design with their exact seams.

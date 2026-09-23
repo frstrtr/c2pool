@@ -133,6 +133,9 @@ struct StratumListenerStats {
     // shares / network blocks refused at the sink because the lane was suspended
     // between their validation and their hand-off (the trip->suspend race).
     std::uint64_t suspend_edges = 0, suspend_disconnects = 0, suspended_sink_refused = 0;
+    // R-C rework-3 (D4): job pushes / first-job logins refused by the suspend
+    // GATE (the flag re-checked under the gate lock right before the push).
+    std::uint64_t suspended_push_refused = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -265,8 +268,26 @@ public:
     // withdrawn; xmrig reconnects) and answers parked logins "No job available".
     // While suspended a login is PARKED (as if no template existed) and getjob is
     // refused. The resume edge re-signals the template so parked logins are served.
+    //
+    // R-C rework-3 (D4, the one-pass suspend edge): the flag is flipped UNDER THE
+    // SUSPEND GATE (m_gate_mtx), and every lane-job push (getjob, the template
+    // push, the first job a login hands out) and every share / network-block
+    // hand-off re-checks the flag under the same lock right before it happens.
+    // So when set_lane_suspended(true) RETURNS, no job can be pushed and no share
+    // can be accepted any more -- an in-flight hand-off either completed before
+    // the flip (and is logged before the "gate closed" line) or sees the flag.
+    // rework-2 only checked at the top of the template push: a seed-prefetch hook
+    // running while the flag flipped still pushed the job afterwards (verify D4:
+    // job push + share accepted after the suspend).
     void set_lane_suspended(bool v) {
-        const bool was = m_lane_suspended.exchange(v, std::memory_order_acq_rel);
+        if (m_lane_suspended.load(std::memory_order_acquire) == v) return;   // not an edge (only main flips it)
+        bool was = false;
+        {
+            std::lock_guard<std::mutex> g(m_gate_mtx);
+            was = m_lane_suspended.exchange(v, std::memory_order_acq_rel);
+            if (v && !was) log("lane SUSPEND: gate closed -- no job push and no share hand-off after this line");
+            if (!v && was) log("lane RESUME: gate open");
+        }
         if (v && !was) {
             m_stats.suspend_edges.fetch_add(1, std::memory_order_relaxed);
             m_suspend_kick.store(true, std::memory_order_release);
@@ -308,6 +329,7 @@ public:
         s.suspend_edges          = m_stats.suspend_edges.load(std::memory_order_relaxed);
         s.suspend_disconnects    = m_stats.suspend_disconnects.load(std::memory_order_relaxed);
         s.suspended_sink_refused = m_stats.suspended_sink_refused.load(std::memory_order_relaxed);
+        s.suspended_push_refused = m_stats.suspended_push_refused.load(std::memory_order_relaxed);
         return s;
     }
 
@@ -378,7 +400,8 @@ private:
         std::atomic<std::uint64_t> connections{0}, active{0}, closed{0}, logins{0},
             parked_logins{0}, submits{0}, accepted_shares{0}, network_blocks{0},
             rejected_submits{0}, job_pushes{0}, template_signals{0}, malformed{0},
-            suspend_edges{0}, suspend_disconnects{0}, suspended_sink_refused{0};
+            suspend_edges{0}, suspend_disconnects{0}, suspended_sink_refused{0},
+            suspended_push_refused{0};
     };
 
     // Forwarding IShareSink: counts + logs, then hands everything to the
@@ -389,6 +412,7 @@ private:
         SinkTap(StratumListener& owner, strat::IShareSink& inner)
             : m_owner(owner), m_inner(inner) {}
         void on_accepted_share(const strat::AcceptedShare& s) override {
+            std::lock_guard<std::mutex> g(m_owner.m_gate_mtx);   // R-C rework-3 (D4): check + hand-off are atomic w.r.t. the flip
             if (m_owner.m_lane_suspended.load(std::memory_order_acquire)) {   // R-C rework-2: suspended between validation and hand-off
                 m_owner.m_stats.suspended_sink_refused.fetch_add(1, std::memory_order_relaxed);
                 m_owner.log("share for template=" + std::to_string(s.template_id) + " DROPPED at hand-off: lane suspended");
@@ -404,6 +428,7 @@ private:
         }
         void submit_network_block(std::uint32_t template_id, std::uint32_t nonce,
                                   std::uint32_t extra_nonce) override {
+            std::lock_guard<std::mutex> g(m_owner.m_gate_mtx);   // R-C rework-3 (D4)
             if (m_owner.m_lane_suspended.load(std::memory_order_acquire)) {   // R-C rework-2: never submit a withdrawn-job block
                 m_owner.m_stats.suspended_sink_refused.fetch_add(1, std::memory_order_relaxed);
                 m_owner.log("NETWORK BLOCK candidate template=" + std::to_string(template_id) +
@@ -775,8 +800,7 @@ private:
                 return;
             }
             send_line(cid, strat::StratumDialect::build_status_ok(req_id));
-            m_server.broadcast_job(s);
-            m_stats.job_pushes.fetch_add(1, std::memory_order_relaxed);
+            if (push_job(s)) m_stats.job_pushes.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
@@ -788,7 +812,21 @@ private:
         Client* c = live(cid);
         if (!c) return;
         strat::XmrStratumSession& s = *c->session;
-        if (!m_server.handle_login(s, req_id, login)) {
+        bool ok = false;
+        {
+            // R-C rework-3 (D4): the first job a login hands out is a job push --
+            // re-check under the suspend gate; a login that lost the race is
+            // PARKED again (served on the resume edge), never handed the job.
+            std::lock_guard<std::mutex> g(m_gate_mtx);
+            if (m_lane_suspended.load(std::memory_order_acquire)) {
+                c->parked = ParkedLogin{req_id, login, agent, std::chrono::steady_clock::now()};
+                m_stats.suspended_push_refused.fetch_add(1, std::memory_order_relaxed);
+                log("client " + std::to_string(cid) + " login RE-PARKED: lane suspended at the gate (no job handed out)");
+                return;
+            }
+            ok = m_server.handle_login(s, req_id, login);
+        }
+        if (!ok) {
             close_client(cid, "login refused by server");
             return;
         }
@@ -875,12 +913,25 @@ private:
         for (std::uint64_t cid : already) {
             Client* c = live(cid);
             if (!c) continue;
-            m_server.broadcast_job(*c->session);
-            ++pushed;
+            if (push_job(*c->session)) ++pushed;   // R-C rework-3 (D4): gated per push
         }
         m_stats.job_pushes.fetch_add(pushed, std::memory_order_relaxed);
         log("template " + std::to_string(peek.template_id) + " height=" + std::to_string(peek.height) +
             " -> job pushed to " + std::to_string(pushed) + " session(s)");
+    }
+
+    // R-C rework-3 (D4): ONE lane-job push, gated: the suspend flag is re-checked
+    // under m_gate_mtx right before the push (set_lane_suspended flips it under
+    // the same lock). The template push can run a seed-prefetch hook for seconds
+    // between its entry check and the pushes -- the rework-2 window.
+    bool push_job(strat::XmrStratumSession& s) {
+        std::lock_guard<std::mutex> g(m_gate_mtx);
+        if (m_lane_suspended.load(std::memory_order_acquire)) {
+            m_stats.suspended_push_refused.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        m_server.broadcast_job(s);
+        return true;
     }
 
     // ── members (declaration order == construction order; m_tap before m_server)
@@ -898,6 +949,7 @@ private:
     std::atomic<bool>        m_template_dirty{false};
     std::atomic<bool>        m_lane_suspended{false};   // R-C (defect 4): lane job withdrawn, shares refused
     std::atomic<bool>        m_suspend_kick{false};     // R-C rework-2: suspend edge pending on the listener thread
+    std::mutex               m_gate_mtx;                // R-C rework-3 (D4): the suspend gate (flip vs push/hand-off)
     std::thread              m_thread;
 
     std::map<std::uint64_t, Client> m_clients;   // listener thread only

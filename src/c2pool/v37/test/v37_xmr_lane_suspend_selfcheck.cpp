@@ -17,6 +17,14 @@
 //   LS3  repeated set_lane_suspended(true) calls are not new edges;
 //   LS4  a login while suspended is PARKED (no job handed out);
 //   LS6  the RESUME edge serves the parked login a fresh job.
+// R-C rework-3:
+//   LS8  (D4) a template push whose seed-prefetch hook is running when the
+//        lane suspends pushes NO job afterwards (rework-2 pushed it);
+//   LS9  (D4) set_lane_suspended(true) does not return while a share hand-off
+//        is in flight, and no share is handed off after it returns;
+//   LS10 (D5 + contested) the lane-suspend state machine counts every cause on
+//        its own rising edge (HELD-LAG during a LAG suspension is counted),
+//        CONTESTED suspends and auto-resumes only when every cause is clear.
 // Stub template source + stub verifier (no RandomX). Port 5771 (loopback;
 // falls back to an ephemeral port if taken).
 // Nonzero exit on any failure.
@@ -33,6 +41,11 @@
 #include <thread>
 #include <vector>
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+
+#include "c2pool/v37/xmr/xmr_lane_suspend_state.hpp"
 #include "c2pool/v37/xmr/xmr_stratum_listener.hpp"
 
 namespace strat = ::v37::xmr::stratum;
@@ -91,6 +104,46 @@ std::string read_line(int fd, int timeout_ms) {
 }
 const char* kLogin = R"({"id":1,"jsonrpc":"2.0","method":"login","params":{"login":"4TESTADDRESS.w1","pass":"x","agent":"selfcheck/1"}})";
 
+// A one-shot latch: wait() blocks until open().
+struct Latch {
+    std::mutex m; std::condition_variable cv; bool is_open = false;
+    void open() { { std::lock_guard<std::mutex> g(m); is_open = true; } cv.notify_all(); }
+    void wait() { std::unique_lock<std::mutex> g(m); cv.wait(g, [&] { return is_open; }); }
+};
+// Templates whose lane target (2) differs from the mainchain target (1), so a
+// verifier that meets only target 2 produces SHARES, never network blocks.
+struct ShareTemplates final : strat::ITemplateSource {
+    bool get_job(std::uint32_t extra_nonce, strat::TemplateJob& out) override {
+        out.blob.assign(76, 0); out.blob[0] = 16; out.blob[70] = static_cast<std::uint8_t>(extra_nonce);
+        out.template_id = 9; out.height = 100; out.mainchain_target = 1; out.lane_target = 2;
+        out.monero_major_version = 16; return true;
+    }
+    bool rebuild_blob(std::uint32_t, std::uint32_t en, strat::TemplateJob& out) override { return get_job(en, out); }
+    std::uint32_t max_extra_nonces() const override { return 16; }
+};
+struct ShareVerifier final : strat::IPowVerifier {
+    bool randomx_hash(const std::uint8_t*, std::size_t, std::uint64_t, const std::array<std::uint8_t, strat::HASH_SIZE>&,
+                      std::array<std::uint8_t, strat::HASH_SIZE>& out, bool) override { out.fill(0x01); return true; }
+    bool meets_target(const std::array<std::uint8_t, strat::HASH_SIZE>&, std::uint64_t t) const override { return t == 2; }
+};
+// The inner sink of LS9: the first share blocks inside the hand-off until released.
+struct BlockingSink final : strat::IShareSink {
+    std::atomic<int> shares{0}, blocks{0};
+    Latch entered, release;
+    void on_accepted_share(const strat::AcceptedShare&) override {
+        if (shares.load() == 0) { entered.open(); release.wait(); }
+        ++shares;
+    }
+    void submit_network_block(std::uint32_t, std::uint32_t, std::uint32_t) override { ++blocks; }
+};
+std::string job_id_of(const std::string& line) {
+    const std::string k = "\"job_id\":\"";
+    const std::size_t p = line.find(k);
+    if (p == std::string::npos) return "";
+    const std::size_t b = p + k.size(), e = line.find('"', b);
+    return e == std::string::npos ? "" : line.substr(b, e - b);
+}
+
 } // namespace
 
 int main() {
@@ -144,6 +197,88 @@ int main() {
 
     L.stop();
     check("LS7 no share / block reached the sink during the exercise", sink.shares == 0 && sink.blocks == 0);
+
+    // ── LS8 (D4): the template-push window ─────────────────────────────────
+    {
+        StubTemplates t8; StubVerifier v8; CountingSink s8;
+        c2pool::v37n::xmr::o2::StratumListenerOptions o8 = lo; o8.bind_port = 0;
+        c2pool::v37n::xmr::o2::StratumListener L8(t8, v8, s8, o8);
+        Latch hook_in, hook_go; std::atomic<int> hook_calls{0};
+        L8.set_template_hook([&](const strat::TemplateJob&) {
+            if (hook_calls.fetch_add(1) == 1) { hook_in.open(); hook_go.wait(); }   // block the 2nd push (the 1st serves the login)
+        });
+        if (std::string e = L8.bind(); !e.empty()) { check("LS8 bind", false, e); return 1; }
+        L8.notify_new_template(); L8.start();
+        const int c = connect_to(L8.bound_port());
+        send_line(c, kLogin);
+        const std::string first = read_line(c, 3000);
+        const auto pushes0 = L8.stats().job_pushes;
+        L8.notify_new_template();          // the listener enters the hook and blocks there
+        hook_in.wait();
+        L8.set_lane_suspended(true);       // returns at once: the hook does not hold the gate
+        hook_go.open();                    // the template push resumes AFTER the flip
+        std::string got, l;
+        while ((l = read_line(c, 2000)) != "<EOF>" && !l.empty()) got += l;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto s8s = L8.stats();
+        check("LS8 D4: a template push whose seed-prefetch hook straddles the suspend flip pushes NO job afterwards (gate re-checked per push); the session sees only the disconnect",
+              first.find("\"job\"") != std::string::npos && got.find("\"job\"") == std::string::npos &&
+              s8s.job_pushes == pushes0 && s8s.suspended_push_refused >= 1,
+              "after-flip read='" + got.substr(0, 60) + "' pushes " + std::to_string(pushes0) + "->" + std::to_string(s8s.job_pushes) +
+              " gate_refused=" + std::to_string(s8s.suspended_push_refused));
+        ::close(c);
+        L8.stop();
+    }
+
+    // ── LS9 (D4): the share hand-off window ────────────────────────────────
+    {
+        ShareTemplates t9; ShareVerifier v9; BlockingSink s9;
+        c2pool::v37n::xmr::o2::StratumListenerOptions o9 = lo; o9.bind_port = 0;
+        c2pool::v37n::xmr::o2::StratumListener L9(t9, v9, s9, o9);
+        if (std::string e = L9.bind(); !e.empty()) { check("LS9 bind", false, e); return 1; }
+        L9.notify_new_template(); L9.start();
+        const int c = connect_to(L9.bound_port());
+        send_line(c, kLogin);
+        const std::string first = read_line(c, 3000);
+        const std::string jid = job_id_of(first);
+        send_line(c, std::string(R"({"id":2,"jsonrpc":"2.0","method":"submit","params":{"id":"1","job_id":")") + jid +
+                     R"(","nonce":"01000000","result":")" + std::string(64, '0') + R"("}})");
+        s9.entered.wait();                 // the share is INSIDE the hand-off (validated, not yet accepted)
+        std::atomic<bool> returned{false}; int shares_at_return = -1;
+        std::thread flipper([&] { L9.set_lane_suspended(true); shares_at_return = s9.shares.load(); returned.store(true); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        const bool blocked_while_in_flight = !returned.load();
+        s9.release.open();
+        flipper.join();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const int shares_final = s9.shares.load();
+        check("LS9 D4: set_lane_suspended(true) does NOT return while a share hand-off is in flight (serialized by the suspend gate); the in-flight share completed BEFORE the flip returned and nothing was handed off after it",
+              !jid.empty() && blocked_while_in_flight && shares_at_return == 1 && shares_final == 1 && s9.blocks.load() == 0,
+              "jid=" + jid + " blocked=" + std::to_string(blocked_while_in_flight) + " shares@return=" + std::to_string(shares_at_return) +
+              " final=" + std::to_string(shares_final));
+        ::close(c);
+        L9.stop();
+    }
+
+    // ── LS10 (D5 + contested): the lane-suspend state machine ──────────────
+    {
+        using S = c2pool::v37n::xmr::LaneSuspendState;
+        S st(3);                                    // D_conf 3: suspend at lag > 6, resume at lag <= 3
+        auto e1 = st.update(7, false, false, false);   // LAG trips
+        auto e2 = st.update(9, false, true, false);    // HELD-LAG fires while already lag-suspended (the rework-2 D5 miss)
+        auto e3 = st.update(2, false, true, false);    // lag clears, held still holds the lane
+        auto e4 = st.update(0, false, false, false);   // held clears -> RESUME
+        auto e5 = st.update(0, false, false, true);    // CONTESTED -> suspend
+        auto e6 = st.update(8, false, false, true);    // lag joins the contested suspension
+        auto e7 = st.update(0, false, false, false);   // vote CONVERGED + lag cleared -> auto-RESUME
+        check("LS10 D5: every cause counted on ITS OWN rising edge -- HELD-LAG during a LAG suspension is cause=held (rework-2 never counted it); CONTESTED suspends and the lane auto-resumes only when every cause (lag, held, contested) is clear",
+              e1.suspend_edge && e1.causes == S::kLag && !e2.suspend_edge && (e2.added & S::kHeld) && st.n_held == 1 &&
+              !e3.resume_edge && e3.causes == S::kHeld && e4.resume_edge && e5.suspend_edge && e5.causes == S::kContested &&
+              (e6.added & S::kLag) && !e6.suspend_edge && e7.resume_edge && st.n_lag == 2 && st.n_contested == 1 &&
+              st.n_resume == 2 && st.n_suspend == 2 && S::names(e6.causes) == "lag+contested",
+              "n lag/held/contested/resume/suspend=" + std::to_string(st.n_lag) + "/" + std::to_string(st.n_held) + "/" +
+              std::to_string(st.n_contested) + "/" + std::to_string(st.n_resume) + "/" + std::to_string(st.n_suspend));
+    }
     std::printf("== %s (%d/%d passed) ==\n", fails ? "FAIL" : "OK", n - fails, n);
     return fails ? 1 : 0;
 }

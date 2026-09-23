@@ -97,9 +97,9 @@
 //   / HELD lane block for divergence_cap_ticks consecutive ticks.
 //
 // R-C REWORK-2 (docs/xmr-lane/r-c-rework-2.md):
-//   * debit-on-refuse -- a refused lane block's on-chain payout is booked as a
-//     DEBIT-ONLY FOUND ({} / payout) at its chain-ordered point, or put in the
-//     node-local suspense when unattributable (F-MONEY);
+//   * (rework-3 replaces rework-2's debit-on-refuse, which forked honest
+//     refusers) a refused lane block's on-chain payout is NODE-LOCAL LIABILITY
+//     -- never a ledger mutation (docs/xmr-lane/r-c-rework-3.md);
 //   * HELD -- a transient failure past retry_bound is held, never dropped;
 //   * the LINEAGE VOTE (CONVERGED / CONTESTED / ISOLATED) replaces the M=3 /
 //     2-distinct-roots run: refused blocks alone never halt; ISOLATED needs a
@@ -294,7 +294,8 @@ struct FinalizeConnectOptions {
     std::uint64_t divergence_cap_ticks    = 20;
     std::uint64_t divergence_cap_terminal = 2;
 
-    // ── R-C rework-2: the RICH booking callback (debit-on-refuse) ───────────
+    // ── R-C rework-2: the RICH booking callback (rework-3: the payout of a
+    //    refused block feeds the node-local LIABILITY, never the ledger) ─────
     // Same contract as book_from_chain, plus what the money path needs when the
     // CREDIT side is refused: the block's on-chain PAYOUT map (sink excluded) when
     // it is decodable, and the owed-output amount that could NOT be attributed to
@@ -332,8 +333,10 @@ struct FinalizeConnectOptions {
     //              blocks < contest (num/den). Normal.
     //   CONTESTED  refused fraction >= contest with >= vote_obs_min observations
     //              and no VERIFIED counter-lineage outvoting us. LOUD (state
-    //              alarm + per-block alarm), keeps building, keeps refusing-not-
-    //              crediting (payout side debited: debit-on-refuse). Never halts:
+    //              alarm + per-block alarm), keeps refusing-not-crediting
+    //              (payout -> node-local liability); rework-3 interim default:
+    //              lane template production SUSPENDED (contested_suspends,
+    //              below) until CONVERGED. Never halts the node:
     //              without a verifiable counter-lineage refusals are
     //              indistinguishable from outsider tags.
     //   ISOLATED   a VERIFIED counter-lineage L' (register_counter_lineage --
@@ -352,6 +355,35 @@ struct FinalizeConnectOptions {
     std::uint32_t vote_iso_num     = 2, vote_iso_den = 3;
     std::size_t   vote_exit_hold   = 16;   // attributed blocks below iso before ISOLATED -> CONTESTED
     std::uint64_t vote_stale_s     = 48 * 3600;   // observations older than this are dropped (0 = never)
+
+    // ── R-C rework-3: INTERIM DEFAULTS (operator rulings pending) ───────────
+    // (b) REFUSE-SIDE MONEY IS NODE-LOCAL. A refused lane block's on-chain
+    // reward is recorded in a node-local LIABILITY ledger (per payee when the
+    // payout decodes from the on-chain bytes + this node's own ring alone, else
+    // the whole reward), with a loud alarm and counters. It NEVER mutates eo /
+    // finalW / owed_digest: two honest nodes that refuse the same block stay
+    // byte-identical whatever they knew about it and whenever they knew it
+    // (rework-2's debit-on-refuse was attribution-dependent, attribution was
+    // wire-timing-dependent, and three honest nodes ended on three digests).
+    // The only value; the long-term fixes are consensus-side
+    // (docs/xmr-lane/r-c-rework-3.md §5):
+    //   (a) the lane_commitment preimage in-band in the coinbase (every node
+    //       derives r for every lane block; "refused" stops being a money event);
+    //   (c) a consensus carrier for refuse events through the GAP-2 relay.
+    enum class RefuseMoney : int { NodeLocalLiability = 0 };
+    RefuseMoney   refuse_money       = RefuseMoney::NodeLocalLiability;
+    // CONTESTED -> suspend lane template production (loud; auto-resume when the
+    // vote returns to CONVERGED) instead of building on a possibly split ledger.
+    // Fired synchronously through the contested hook (set_contested_hook) inside
+    // the tick that decided it. LIVENESS NOTE (r-c-rework-3.md §3): outsider 03
+    // tags or a >= 1/3 forker can hold every honest node CONTESTED; while all
+    // honest builders are suspended the window only refills with the attacker's
+    // blocks, so the exit is the forker stopping, vote_stale_s ageing the window
+    // out, or an operator (--contested-suspend off).
+    bool          contested_suspends = true;
+    // D3: the vote's observation window survives a restart (<sidecar>.obs,
+    // append-only, compacted). Needs sidecar_path.
+    bool          persist_vote_obs   = true;
 };
 
 // ── the glue ────────────────────────────────────────────────────────────────
@@ -369,17 +401,29 @@ public:
         // booking and for a debit-only one).
         //   'a' option-A own win  (credit == payout == {payee: reward})
         //   'c' coinbase-authority CREDITED booking (credit, payout as booked)
-        //   'd' DEBIT-ONLY booking of a refused block (credit = {}, payout)
+        //   'd' DEBIT-ONLY booking of a refused block (credit = {}, payout) --
+        //       rework-2 LEGACY: rework-3 never writes one (refuse-side money is
+        //       node-local); a v2 sidecar that still carries one is re-driven as
+        //       it was booked (the ledger already holds it from the replay)
         char          kind = 'a';
         Amounts       credit, payout;
     };
-    // R-C rework-2 (M2): on-chain owed value this node could NOT attribute to a
-    // key (root unknown -> whole reward; unmapped outputs -> their sum; a late
-    // block the cursor already passed). Node-local SUSPENSE, never a ledger key.
-    struct SuspenseRec {
+    // R-C rework-3 (interim (b)): the NODE-LOCAL LIABILITY record of one refused
+    // lane block. `payout` = the per-payee part decoded from the on-chain bytes
+    // alone (this node's own ring; never a wire descriptor), `unattributed_pico`
+    // = what could not be attributed (root unknown -> the whole reward incl. the
+    // sink; unmapped outputs -> their sum). Persisted in <sidecar>.liability,
+    // reloaded at boot. NEVER a ledger key, never an eo/finalW/owed_digest input.
+    struct LiabilityRec {
         std::uint64_t height = 0;
         std::string   bid, root_hex, why;
-        std::uint64_t amount_pico = 0;
+        Amounts       payout;                 // attributed per payee (on-chain bytes only)
+        std::uint64_t unattributed_pico = 0;
+        std::uint64_t total_pico = 0;         // the block's coinbase total (0 = unknown)
+        std::uint64_t attributed_pico() const {
+            std::uint64_t a = 0; for (const auto& [k, v] : payout) { (void)k; if (v > 0) a += static_cast<std::uint64_t>(v); }
+            return a;
+        }
     };
     enum class VoteState : int { Converged = 0, Contested = 1, Isolated = 2 };
     static const char* vote_state_name(VoteState s) {
@@ -456,16 +500,16 @@ public:
         // R-C: `refused_not_credited` = SYNCED-but-unmatched lane blocks refused-
         // not-credited (loud alarm, gate released, NEVER a halt by itself).
         std::uint64_t refused_not_credited = 0;
-        // R-C rework-2 (F-MONEY, debit-on-refuse). A refused lane block's on-chain
-        // payout HAPPENED; the node books it as a DEBIT-ONLY FOUND ({} / payout)
-        // at the same chain-ordered point a credited booking would land, so
-        // eo(k) drops at once and finalW(k) -= payout at FINALIZE -- the next
-        // K_fair coinbase never pays those payees again. `refused_debited(_pico)`
-        // counts those; `refused_unattributed(_pico)` is the node-local SUSPENSE
-        // (payout not attributable: root unknown / unmapped outputs / late).
-        std::uint64_t refused_debited = 0, refused_debited_pico = 0,
-                      refused_unattributed = 0, refused_unattributed_pico = 0,
-                      suspense_alarms = 0;
+        // R-C rework-3 (interim (b)): the NODE-LOCAL LIABILITY of refused lane
+        // blocks. `liability_blocks` refused blocks recorded; `_attributed_pico`
+        // the per-payee part (on-chain bytes only), `_unattributed_pico` the rest
+        // (whole reward when the root is unknown), `liability_pico` their sum --
+        // the over-statement of owed(k) this node carries until a consensus
+        // carrier ((a)/(c)) exists. `ledger_mutations_on_refuse` MUST read 0.
+        // `legacy_debit_records` = rework-2 'd' sidecar records re-driven at boot.
+        std::uint64_t liability_blocks = 0, liability_pico = 0, liability_attributed_pico = 0,
+                      liability_unattributed_pico = 0, liability_alarms = 0, liability_payees = 0,
+                      ledger_mutations_on_refuse = 0, legacy_debit_records = 0;
         // R-C rework-2 (HOLD cap): transient failures past retry_bound are HELD
         // (never dropped). held_now = currently held bids.
         std::uint64_t held_entered = 0, held_resolved = 0, held_alarms = 0, held_now = 0;
@@ -477,6 +521,10 @@ public:
         std::uint64_t vote_state = 0, contested_entered = 0, isolated_entered = 0, isolated_exited = 0,
                       obs_n = 0, obs_refused = 0, obs_unattributed = 0,
                       votes_me = 0, votes_counter = 0, counter_lineages = 0;
+        // R-C rework-3: CONTESTED -> lane suspend (hook edges), and D3: the vote's
+        // observation window restored from <sidecar>.obs at boot.
+        std::uint64_t contested_suspend_edges = 0, contested_resume_edges = 0,
+                      obs_restored = 0, obs_persist_failures = 0;
     };
 
     // Construct AFTER node.bring_up() (the finalize driver exists) and AFTER
@@ -517,7 +565,8 @@ public:
     //    (so the driver's maps are rebuilt before any Extend can step past H_b).
     BootReport reseed_after_bring_up() {
         BootReport rep = reseed_sidecar();
-        load_suspense();
+        load_liability();
+        load_obs();   // R-C rework-3 (D3): the vote window survives a restart
         // R-C rework-2 (F2): the boot GAP RE-DRIVE (every canonical height between
         // the recovered finalize cursor and the tip -- the boot tip initial_sync
         // applied before our observers existed, every lane block mined while this
@@ -607,6 +656,11 @@ private:
             }
             m_pending[bid] = rec;
             if (rec.kind == 'c') m_chain_booked_once[bid] = true;
+            if (rec.kind == 'd') {
+                ++m_stats.legacy_debit_records;
+                say("boot: LEGACY rework-2 debit-only record " + short_bid(bid) + " re-driven as booked (the ledger already "
+                    "holds it from the replay); rework-3 never writes one -- refuse-side money is node-local liability");
+            }
             if (rec.kind != 'd') m_race.observe_own(rec.height, bid, rec.found_unix_s);   // a debit is not an own/credited block
             if (pending) ++rep.reseeded; else ++rep.reregistered;
             say(std::string("boot: ") + (pending ? "re-drove pending FOUND " : "RE-REGISTERED lost FOUND ") +
@@ -661,12 +715,15 @@ public:
         }
         divergence_check();
         evaluate_vote();
-        if (!m_suspense.empty() && (m_tick % 50 == 1)) {
-            ++m_stats.suspense_alarms;
-            say("cba-ALARM suspense: " + std::to_string(m_stats.refused_unattributed) + " refused lane block(s) carry " +
-                std::to_string(m_stats.refused_unattributed_pico) + " piconero of on-chain value this node cannot attribute "
-                "to a payee (root unknown / unmapped outputs / late). NOT in the ledger (node-local knowledge, never an "
-                "owed key); attributable once the block's lane_commitment is known (wire descriptor / peer / v37.1 in-band preimage)");
+        if (!m_liability.empty() && (m_tick % 50 == 1)) {
+            ++m_stats.liability_alarms;
+            say("cba-ALARM LIABILITY: " + std::to_string(m_stats.liability_blocks) + " refused lane block(s) paid " +
+                std::to_string(m_stats.liability_pico) + " piconero on-chain (" + std::to_string(m_stats.liability_attributed_pico) +
+                " attributed to " + std::to_string(m_stats.liability_payees) + " payee(s), " +
+                std::to_string(m_stats.liability_unattributed_pico) + " unattributed) that this node's owed ledger does NOT "
+                "net out: owed(k) is over-stated by up to this much, so a later K_fair coinbase may pay those payees again. "
+                "NODE-LOCAL by design (interim (b)): the ledger never moves on a refusal, so honest refusers stay identical. "
+                "Fix = consensus carrier ((a) in-band lane_commitment preimage / (c) GAP-2 relay), operator's hand.");
         }
 
         std::vector<FoundBlockEvent> evs;
@@ -805,7 +862,7 @@ public:
             // R-C: main reclassifies a SYNCED receiver's unmatched-root block
             // "lane-root-unknown:" -> "lane-root-refused:<roothex>:". REFUSED-not-
             // credited (loud alarm, the R4 gate RELEASED for this height), its
-            // on-chain payout DEBITED (rework-2, F-MONEY) or put in suspense, and
+            // on-chain payout recorded as NODE-LOCAL LIABILITY (rework-3 (b)), and
             // one OBSERVATION for the lineage vote -- never by itself a halt.
             if (why.rfind("lane-root-refused:", 0) == 0) { note_refused_frontier(h, bid, bk); return; }
             const bool root_unknown = (why.rfind("lane-root-unknown:", 0) == 0);   // R5
@@ -840,7 +897,7 @@ public:
                 ++m_stats.booking_stall_timeout;
                 say("cba-ALARM booking_stall_timeout: chain lane block " + short_bid(bid) + " h=" +
                     std::to_string(h) + " exhausted its booking retry bound still cut-pending (" + why +
-                    ") — releasing the finalize gate; credit for this height is REFUSED (payout side debited)");
+                    ") — releasing the finalize gate; credit for this height is REFUSED (payout -> node-local LIABILITY)");
             }
             m_root_unknown_bids.erase(bid);
             ++m_stats.refused;
@@ -997,13 +1054,20 @@ public:
     bool        held_lag()     const { return m_held_lag; }
     VoteState   vote_state()   const { return m_vote; }
     const std::map<std::string, std::uint64_t>& held() const { return m_held; }
-    const std::vector<SuspenseRec>& suspense() const { return m_suspense; }
+    const std::vector<LiabilityRec>& liability() const { return m_liability; }
+    const std::map<::v37::bytes32, long long>& liability_by_payee() const { return m_liability_by_payee; }
 
     // R-C rework-2: the ISOLATED edge hook (main: suspend lane production, stop
     // the in-process miner, withdraw the stratum job -- synchronously, inside
     // the tick that decided it, so no share/hit can slip between the decision
     // and the suspension). Called with (true, why) on entry, (false, why) on exit.
     void set_isolation_hook(std::function<void(bool, const std::string&)> f) { m_iso_hook = std::move(f); }
+    // R-C rework-3: the CONTESTED edge hook (interim default: CONTESTED suspends
+    // lane template production). (true, why) when the vote enters CONTESTED,
+    // (false, why) when it leaves it -- synchronously, inside the tick that
+    // decided it. Only fired when options().contested_suspends.
+    void set_contested_hook(std::function<void(bool, const std::string&)> f) { m_contested_hook = std::move(f); }
+    bool contested() const { return m_vote == VoteState::Contested; }
 
     // R-C rework-2: register a VERIFIED counter-lineage L' (the set of 0x03
     // roots its verified snapshot can produce, and the height of its fork point
@@ -1032,80 +1096,105 @@ private:
         return ok;
     }
 
-    // R-C rework-2 (F-MONEY): the payout side of a REFUSED lane block. The
-    // block paid its coinbase on-chain whatever this node thinks of its credit.
-    //   M1: payout decodable -> a DEBIT-ONLY FOUND ({} / payout) at this block's
-    //       chain-ordered booking point (we are inside book_chain_block, past the
-    //       R6 deferral, so this IS that point). eo(k) -= payout now; FINALIZE at
-    //       h + D_conf applies finalW(k) -= payout (a negative finalW is the
-    //       canon's §4.4 over-credit netted forward, never a clawback).
-    //   M2: the unattributable part -> node-local SUSPENSE (never a ledger key:
-    //       whether we hold a lane_commitment is node-local KNOWLEDGE and must not
-    //       fork owed_digest between two honest refusers).
+    // R-C rework-3 (interim (b)): the payout side of a REFUSED lane block. The
+    // block paid its coinbase on-chain whatever this node thinks of its credit;
+    // that value is recorded as NODE-LOCAL LIABILITY and NOTHING ELSE. No FOUND,
+    // no debit, no eo/finalW/owed_digest mutation: whether this node could
+    // attribute the payout (and when it learned enough to) is node-local
+    // knowledge -- rework-2 turned it into a ledger input and forked three honest
+    // refusers (verify D1). The ledger_seq guard below makes that a counted,
+    // loud invariant rather than a comment.
     void refuse_money(std::uint64_t h, const std::string& bid, const FinalizeConnectOptions::ChainBooking& bk,
                       const std::string& why) {
-        if (bk.payout_decoded && !bk.payout.empty()) book_debit_only(h, bid, bk.payout, why);
-        if (bk.unattributed_pico) add_suspense(h, bid, bk.onchain_root_hex, bk.unattributed_pico, why);
-    }
-
-    void book_debit_only(std::uint64_t h, const std::string& bid, const Amounts& payout, const std::string& why) {
-        if (m_pending.count(bid) || m_node.ledger().is_pending(bid) || m_node.ledger().is_settled(bid)) return;
-        c2pool::xmr::node::Hash id{}; (void)hash_from_hex(bid, id);
-        PendingRec rec; rec.height = h; rec.kind = 'd'; rec.payout = payout;
-        std::uint64_t sum = 0; for (const auto& [k, v] : payout) { (void)k; if (v > 0) sum += static_cast<std::uint64_t>(v); }
-        rec.reward = sum;
-        m_pending[bid] = rec; (void)sidecar_flush();
-        if (!m_node.on_network_block_won(h, id, /*credit=*/{}, payout) || !m_node.ledger().is_pending(bid)) {
-            m_pending.erase(bid); (void)sidecar_flush();
-            say("cba-ALARM debit: node/ledger did not admit the DEBIT-ONLY booking of refused block " + short_bid(bid) +
-                " -- its on-chain payout " + std::to_string(sum) + " stays UNRECORDED");
-            add_suspense(h, bid, "", sum, "debit-not-admitted: " + why);
-            return;
+        const std::uint64_t seq0 = m_node.ledger().ledger_seq();
+        const ::v37::bytes32 dg0 = m_node.ledger().owed_digest();
+        LiabilityRec r;
+        r.height = h; r.bid = bid; r.root_hex = lower_hex(bk.onchain_root_hex); r.total_pico = bk.total_pico;
+        if (bk.payout_decoded) {
+            for (const auto& [k, v] : bk.payout) if (v > 0) r.payout[k] = v;
+            r.unattributed_pico = bk.unattributed_pico;
+        } else {
+            r.unattributed_pico = bk.unattributed_pico ? bk.unattributed_pico : bk.total_pico;
         }
-        // m_chain_seen keeps it from being re-attempted as a credit; the ledger
-        // pending/settled state keeps it from being re-debited.
-        ++m_stats.refused_debited; m_stats.refused_debited_pico += sum;
-        std::string pm; for (const auto& [k, v] : payout) pm += " " + hex_of(k).substr(0, 8) + "=" + std::to_string(v);
-        say("cba-debit: h=" + std::to_string(h) + " bid=" + short_bid(bid) + " REFUSED-credit block DEBITED payout{" + pm +
-            " } total=" + std::to_string(sum) + " -> eo(k) -= payout now, finalW(k) -= payout at hw >= " +
-            std::to_string(h + m_cfg.d_conf) + " (the next K_fair coinbase never pays these again) [" + why.substr(0, 40) + "]");
+        add_liability(r, why, /*persist=*/true);
+        if (m_node.ledger().ledger_seq() != seq0 || !(m_node.ledger().owed_digest() == dg0)) {
+            ++m_stats.ledger_mutations_on_refuse;
+            say("cba-ALARM INVARIANT: the refuse path of " + short_bid(bid) + " mutated the owed ledger (ledger_seq " +
+                std::to_string(seq0) + " -> " + std::to_string(m_node.ledger().ledger_seq()) + ") -- must never happen");
+        }
     }
 
-    void add_suspense(std::uint64_t h, const std::string& bid, const std::string& root_hex, std::uint64_t amount,
-                      const std::string& why) {
-        for (const auto& s : m_suspense) if (s.bid == bid) return;   // once per block
-        SuspenseRec r; r.height = h; r.bid = bid; r.root_hex = root_hex; r.amount_pico = amount; r.why = why.substr(0, 60);
+    void add_liability(const LiabilityRec& r0, const std::string& why, bool persist) {
+        for (const auto& x : m_liability) if (x.bid == r0.bid) return;   // once per block
+        LiabilityRec r = r0;
+        r.why = why.substr(0, 60);
         for (char& c : r.why) if (c == ' ' || c == '\t' || c == '\n') c = '_';
         if (r.why.empty()) r.why = "-";
-        m_suspense.push_back(r);
-        ++m_stats.refused_unattributed; m_stats.refused_unattributed_pico += amount;
-        if (!m_o.sidecar_path.empty()) {
-            std::ofstream f(m_o.sidecar_path + ".suspense", std::ios::app);
-            if (f) f << "1 " << r.bid << ' ' << r.height << ' ' << (r.root_hex.empty() ? "-" : r.root_hex) << ' '
-                     << r.amount_pico << ' ' << r.why << '\n';
+        if (r.payout.empty() && r.unattributed_pico == 0) {
+            // Either the payout decoded COMPLETELY and pays no ledger key (the whole
+            // reward went to the residual sink: no owed over-statement), or the
+            // block's total is unknown. Neither is a liability.
+            say("cba: refused block " + short_bid(r.bid) + " h=" + std::to_string(r.height) +
+                (r.total_pico ? " pays no owed key (payout fully decoded; the reward went to the residual sink) -- no liability"
+                              : " carries no decodable on-chain value (total unknown) -- nothing to record as liability"));
+            return;
         }
-        say("cba-ALARM suspense: h=" + std::to_string(h) + " bid=" + short_bid(bid) + " " + std::to_string(amount) +
-            " piconero of on-chain value NOT attributable to a payee (" + why.substr(0, 60) +
-            ") -> node-local suspense (total " + std::to_string(m_stats.refused_unattributed_pico) + ")");
+        m_liability.push_back(r);
+        ++m_stats.liability_blocks;
+        const std::uint64_t att = r.attributed_pico();
+        m_stats.liability_attributed_pico += att;
+        m_stats.liability_unattributed_pico += r.unattributed_pico;
+        m_stats.liability_pico += att + r.unattributed_pico;
+        for (const auto& [k, v] : r.payout) m_liability_by_payee[k] += v;
+        m_stats.liability_payees = m_liability_by_payee.size();
+        if (persist && !m_o.sidecar_path.empty()) {
+            std::ofstream f(m_o.sidecar_path + ".liability", std::ios::app);
+            if (f) f << "2 " << r.bid << ' ' << r.height << ' ' << (r.root_hex.empty() ? "-" : r.root_hex) << ' '
+                     << r.total_pico << ' ' << r.unattributed_pico << ' ' << map_str(r.payout) << ' ' << r.why << '\n';
+        }
+        if (!persist) return;
+        std::string pm;
+        for (const auto& [k, v] : r.payout) pm += " " + hex_of(k).substr(0, 8) + "=" + std::to_string(v);
+        say("cba-ALARM LIABILITY: h=" + std::to_string(r.height) + " bid=" + short_bid(r.bid) + " refused lane block paid " +
+            std::to_string(att + r.unattributed_pico) + " piconero on-chain -> NODE-LOCAL liability (attributed{" + pm +
+            " } unattributed=" + std::to_string(r.unattributed_pico) + ") [" + why.substr(0, 60) + "]. The owed ledger is "
+            "NOT touched (eo/finalW/owed_digest unchanged): honest refusers stay byte-identical. Totals: blocks=" +
+            std::to_string(m_stats.liability_blocks) + " pico=" + std::to_string(m_stats.liability_pico));
     }
 
-    void load_suspense() {
+    // Reload the liability tally (v2 lines) plus the rework-2 suspense file (v1:
+    // unattributed only), so a restart keeps the count and the alarm.
+    void load_liability() {
         if (m_o.sidecar_path.empty()) return;
-        std::ifstream in(m_o.sidecar_path + ".suspense");
-        std::string line;
-        while (std::getline(in, line)) {
-            std::istringstream is(line);
-            std::string ver, bid, root, why; unsigned long long h = 0, amt = 0;
-            if (!(is >> ver >> bid >> h >> root >> amt >> why) || ver != "1") continue;
-            bool dup = false; for (const auto& s : m_suspense) if (s.bid == bid) dup = true;
-            if (dup) continue;
-            SuspenseRec r; r.height = h; r.bid = bid; r.root_hex = root == "-" ? "" : root; r.amount_pico = amt; r.why = why;
-            m_suspense.push_back(r);
-            ++m_stats.refused_unattributed; m_stats.refused_unattributed_pico += amt;
+        std::size_t n0 = m_liability.size();
+        {
+            std::ifstream in(m_o.sidecar_path + ".liability");
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream is(line);
+                std::string ver, bid, root, pm, why; unsigned long long h = 0, tot = 0, un = 0;
+                if (!(is >> ver >> bid >> h >> root >> tot >> un >> pm >> why) || ver != "2") continue;
+                LiabilityRec r; r.height = h; r.bid = bid; r.root_hex = root == "-" ? "" : root;
+                r.total_pico = tot; r.unattributed_pico = un;
+                if (!map_parse(pm, r.payout)) continue;
+                add_liability(r, why, /*persist=*/false);
+            }
         }
-        if (!m_suspense.empty())
-            say("boot: suspense reloaded: " + std::to_string(m_suspense.size()) + " refused block(s), " +
-                std::to_string(m_stats.refused_unattributed_pico) + " piconero unattributed");
+        {
+            std::ifstream in(m_o.sidecar_path + ".suspense");   // rework-2 legacy
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream is(line);
+                std::string ver, bid, root, why; unsigned long long h = 0, amt = 0;
+                if (!(is >> ver >> bid >> h >> root >> amt >> why) || ver != "1") continue;
+                LiabilityRec r; r.height = h; r.bid = bid; r.root_hex = root == "-" ? "" : root; r.unattributed_pico = amt;
+                add_liability(r, why, /*persist=*/false);
+            }
+        }
+        if (m_liability.size() > n0)
+            say("boot: LIABILITY reloaded: " + std::to_string(m_liability.size()) + " refused block(s), " +
+                std::to_string(m_stats.liability_pico) + " piconero (" + std::to_string(m_stats.liability_attributed_pico) +
+                " attributed, " + std::to_string(m_stats.liability_unattributed_pico) + " unattributed)");
     }
 
     void enter_held(std::uint64_t h, const std::string& bid, const std::string& why, bool root_unknown) {
@@ -1121,7 +1210,7 @@ private:
                 (root_unknown ? "lane-root-unknown (this node is not yet decidable for it)" : "unfetchable/unparseable") +
                 " after " + std::to_string(m_retry_n[bid]) + " attempts (" + why.substr(0, 80) + "). HELD, NOT dropped: "
                 "it keeps holding the finalize gate, is re-tried every " + std::to_string(m_o.held_retry_every) +
-                " ticks, and books / is refused-with-debit the moment it resolves. held_now=" + std::to_string(m_held.size()));
+                " ticks, and books / is refused (liability) the moment it resolves. held_now=" + std::to_string(m_held.size()));
     }
     // R4: the booking gate the finalize driver consults before stepping onto a
     // coin-height. false => STALL: a still-canonical lane block at height <= h is
@@ -1222,10 +1311,9 @@ private:
     // ── R-C (rework-2): a SYNCED receiver's unmatched-root lane block ────────
     // main tagged it "lane-root-refused:<roothex>:". REFUSE-not-credit it -- do
     // NOT book its credit, do NOT hold the finalize gate for it (the cursor is
-    // never held hostage by one participant), raise a LOUD alarm, DEBIT its
-    // on-chain payout when main could attribute it (wire descriptor) or put it
-    // in suspense, and record ONE observation for the lineage vote. It never
-    // halts by itself (see FinalizeConnectOptions: lineage vote).
+    // never held hostage by one participant), raise a LOUD alarm, record its
+    // on-chain payout as NODE-LOCAL LIABILITY (rework-3 (b): never a ledger
+    // mutation), and record ONE observation for the lineage vote.
     void note_refused_frontier(std::uint64_t h, const std::string& bid, const FinalizeConnectOptions::ChainBooking& bk) {
         const std::string& why = bk.why;
         std::string roothex = bk.onchain_root_hex;
@@ -1242,17 +1330,20 @@ private:
         ++m_stats.refused_not_credited;
         say("cba-ALARM lane-root-refused: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) +
             " root=" + roothex.substr(0, 12) + " is SYNCED-but-unmatched -> REFUSED (not credited), gate released, "
-            "payout side " + std::string(bk.payout_decoded && !bk.payout.empty() ? "DEBITED" : "-> suspense") +
-            "; lineage vote state " + vote_state_name(m_vote) + ". A refused block never halts by itself.");
-        FinalizeConnectOptions::ChainBooking m = bk;
-        if (!m.payout_decoded && m.unattributed_pico == 0) m.unattributed_pico = m.total_pico;   // root unknown: the whole reward is unattributable
-        refuse_money(h, bid, m, why);
+            "payout -> node-local LIABILITY (" + std::string(bk.payout_decoded && !bk.payout.empty() ? "per payee" : "whole reward") +
+            ", ledger untouched); lineage vote state " + vote_state_name(m_vote) + ".");
+        refuse_money(h, bid, bk, why);
         observe_frontier(h, bid, roothex, /*booked=*/false);
     }
 
     // ── R-C rework-2: THE LINEAGE VOTE ──────────────────────────────────────
-    struct Obs { std::uint64_t h = 0; std::string bid, root; bool booked = false;
-                 std::chrono::steady_clock::time_point t; };
+    // R-C rework-3 (D3): `t` is WALL-CLOCK unix seconds (persisted in
+    // <sidecar>.obs; a steady_clock point does not survive a restart).
+    struct Obs { std::uint64_t h = 0; std::string bid, root; bool booked = false; std::uint64_t t = 0; };
+    static std::uint64_t now_unix() {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
     char attribute(const Obs& o) const {
         if (o.booked) return 'm';
         if (!o.root.empty() && m_counter_roots.count(o.root)) return 'p';
@@ -1260,17 +1351,74 @@ private:
     }
     void observe_frontier(std::uint64_t h, const std::string& bid, const std::string& roothex, bool booked) {
         for (const auto& o : m_obs) if (o.bid == bid) return;   // once per block (re-entry across ticks)
-        Obs o; o.h = h; o.bid = bid; o.root = lower_hex(roothex); o.booked = booked; o.t = std::chrono::steady_clock::now();
+        Obs o; o.h = h; o.bid = bid; o.root = lower_hex(roothex); o.booked = booked; o.t = now_unix();
         const bool attributed = attribute(o) != 'u';
+        persist_obs(o);
         m_obs.push_back(std::move(o));
-        const std::size_t cap = 4 * std::max(m_o.vote_obs_window, m_o.vote_window) + 64;
-        while (m_obs.size() > cap) m_obs.pop_front();
+        while (m_obs.size() > obs_cap()) m_obs.pop_front();
         evaluate_vote(attributed);
+    }
+    std::size_t obs_cap() const { return 4 * std::max(m_o.vote_obs_window, m_o.vote_window) + 64; }
+
+    // ── R-C rework-3 (D3): the observation window survives a restart ────────
+    // rework-2 kept the window in memory only: a node rebooted into "CONVERGED
+    // (0 observations)" while its peers -- and it -- were forked, and warmed up
+    // from scratch. Now every observation is appended to <sidecar>.obs
+    // ("1 h bid root|- booked t_unix") before it counts; the file is rewritten
+    // (tmp+fsync+rename) once it holds more than 2x the in-memory cap; boot
+    // reloads it (stale entries dropped by vote_stale_s) and re-evaluates the
+    // vote, so the state -- and its suspension -- is restored, not re-warmed.
+    std::string obs_path() const { return m_o.sidecar_path.empty() ? std::string() : m_o.sidecar_path + ".obs"; }
+    static std::string obs_line(const Obs& o) {
+        return "1 " + std::to_string(o.h) + " " + o.bid + " " + (o.root.empty() ? std::string("-") : o.root) + " " +
+               (o.booked ? "1" : "0") + " " + std::to_string(o.t) + "\n";
+    }
+    void persist_obs(const Obs& o) {
+        if (!m_o.persist_vote_obs || obs_path().empty()) return;
+        if (m_obs_file_lines + 1 > 2 * obs_cap()) {   // compact: current window + this one
+            std::string body;
+            for (const auto& x : m_obs) body += obs_line(x);
+            body += obs_line(o);
+            if (atomic_write(obs_path(), body)) { m_obs_file_lines = m_obs.size() + 1; return; }
+            ++m_stats.obs_persist_failures;
+            return;
+        }
+        std::ofstream f(obs_path(), std::ios::app);
+        if (!f) { ++m_stats.obs_persist_failures; return; }
+        f << obs_line(o);
+        f.flush();
+        if (!f) { ++m_stats.obs_persist_failures; return; }
+        ++m_obs_file_lines;
+    }
+    void load_obs() {
+        if (!m_o.persist_vote_obs || obs_path().empty()) return;
+        std::ifstream in(obs_path());
+        if (!in) return;
+        std::string line;
+        std::size_t n = 0;
+        while (std::getline(in, line)) {
+            std::istringstream is(line);
+            std::string ver, bid, root; unsigned long long h = 0, t = 0; int booked = 0;
+            if (!(is >> ver >> h >> bid >> root >> booked >> t) || ver != "1") continue;
+            ++n;
+            bool dup = false; for (const auto& x : m_obs) if (x.bid == bid) { dup = true; break; }
+            if (dup) continue;
+            Obs o; o.h = h; o.bid = bid; o.root = root == "-" ? "" : root; o.booked = booked != 0; o.t = t;
+            m_obs.push_back(std::move(o));
+            while (m_obs.size() > obs_cap()) m_obs.pop_front();
+        }
+        m_obs_file_lines = n;
+        m_stats.obs_restored = m_obs.size();
+        if (m_obs.empty()) return;
+        evaluate_vote();
+        say("boot: lineage-vote window RESTORED from " + obs_path() + ": " + std::to_string(m_obs.size()) +
+            " observation(s) -> vote " + vote_state_name(m_vote) + " (window " + std::to_string(m_stats.obs_refused) + "/" +
+            std::to_string(m_stats.obs_n) + " refused) -- not re-warmed from zero");
     }
     void evaluate_vote(bool new_attributed_obs = false) {
         if (m_o.vote_stale_s) {
-            const auto now = std::chrono::steady_clock::now();
-            while (!m_obs.empty() && now - m_obs.front().t > std::chrono::seconds(m_o.vote_stale_s)) m_obs.pop_front();
+            const std::uint64_t now = now_unix();
+            while (!m_obs.empty() && m_obs.front().t + m_o.vote_stale_s < now) m_obs.pop_front();
         }
         // (a) the observation window: refused fraction over the last W_obs frontier lane blocks.
         std::size_t n = 0, refused = 0, unattr = 0;
@@ -1317,11 +1465,28 @@ private:
                                   std::to_string(unattr) + " unattributed), vote me=" + std::to_string(am) +
                                   " counter=" + std::to_string(ap) + " (k_min " + std::to_string(m_o.vote_k_min) + ", iso " +
                                   std::to_string(m_o.vote_iso_num) + "/" + std::to_string(m_o.vote_iso_den) + ")";
+        // R-C rework-3: CONTESTED -> lane-suspend edge (interim default), fired
+        // synchronously before this tick returns. Leaving CONTESTED (to CONVERGED,
+        // or to ISOLATED -- whose own hook then holds the suspension) releases it.
+        const bool was_c = (prev == VoteState::Contested), now_c = (m_vote == VoteState::Contested);
+        if (m_o.contested_suspends && was_c != now_c) {
+            if (now_c) ++m_stats.contested_suspend_edges; else ++m_stats.contested_resume_edges;
+            if (m_contested_hook)
+                m_contested_hook(now_c, now_c ? "CONTESTED (" + tally + ")"
+                                              : std::string("left CONTESTED -> ") + vote_state_name(m_vote) + " (" + tally + ")");
+        }
         if (m_vote == VoteState::Contested && prev == VoteState::Converged) {
             ++m_stats.contested_entered;
-            say("cba-ALARM CONTESTED: " + tally + " -- this node keeps building and keeps refusing-not-crediting "
-                "(payout side debited); it does NOT halt: refused blocks without a VERIFIED counter-lineage are "
-                "indistinguishable from outsider tags. Operator: compare peers' owed_digest; W6 verified resync supplies the evidence.");
+            say("cba-ALARM CONTESTED: " + tally + " -- " +
+                (m_o.contested_suspends
+                     ? std::string("lane template production SUSPENDED (cause=contested; interim default, --contested-suspend) "
+                                   "until the vote returns to CONVERGED; booking and refusing-not-crediting continue")
+                     : std::string("contested-suspend OFF: this node keeps building")) +
+                ". Refused blocks without a VERIFIED counter-lineage are indistinguishable from outsider tags: never a "
+                "halt. Operator: compare peers' owed_digest; W6 verified resync supplies the evidence.");
+        } else if (m_vote == VoteState::Converged && prev == VoteState::Contested) {
+            say("cba: lineage vote CONTESTED -> CONVERGED (" + tally + ")" +
+                (m_o.contested_suspends ? std::string(" -- the contested lane suspension is released") : std::string()));
         } else if (m_vote == VoteState::Isolated) {
             const std::string banner = "cba-ALARM ISOLATED (lineage vote, NON-terminal): a VERIFIED counter-lineage holds " + tally +
                 " of the attributed lane blocks since its fork height " + std::to_string(m_counter_fork_h) +
@@ -1350,7 +1515,7 @@ private:
     // root-unknown/HELD block pending, declare HELD-LAG -- one LOUD banner,
     // counted, main's lag-gate suspends the builder -- and keep holding (nothing
     // is dropped, nothing is credited around the held block). It CLEARS the
-    // moment the held block resolves (books, or is refused-with-debit once
+    // moment the held block resolves (books, or is refused (liability) once
     // decidable). Recovery for a real finality-boundary split: W6 verified resync.
     void divergence_check() {
         const std::uint64_t d = m_cfg.d_conf;
@@ -1688,7 +1853,9 @@ private:
     std::map<std::string, std::uint64_t> m_deferred;         //  R6: bid -> height, chain blocks above cursor+1+D_conf awaiting the cursor
     // R-C rework-2
     std::map<std::string, std::uint64_t> m_held;             //  bid -> height: transient failures past the retry bound (HELD, never dropped)
-    std::vector<SuspenseRec>          m_suspense;            //  M2: unattributable on-chain value (node-local)
+    std::vector<LiabilityRec>         m_liability;           //  rework-3 (b): refused blocks' on-chain value (node-local)
+    std::map<::v37::bytes32, long long> m_liability_by_payee; //  rework-3 (b): attributed liability per payee
+    std::size_t                       m_obs_file_lines = 0;  //  rework-3 (D3): lines in <sidecar>.obs
     std::deque<Obs>                   m_obs;                 //  lineage vote: frontier lane block observations (bounded)
     std::set<std::string>             m_counter_roots;       //  lineage vote: VERIFIED counter-lineage roots (hex)
     std::uint64_t                     m_counter_fork_h = 0;  //  lineage vote: fork height F
@@ -1696,6 +1863,7 @@ private:
     std::size_t                       m_iso_below = 0;       //  ISOLATED exit hysteresis
     bool                              m_held_lag = false;    //  HELD-LAG (non-terminal)
     std::function<void(bool, const std::string&)> m_iso_hook;
+    std::function<void(bool, const std::string&)> m_contested_hook;   // rework-3: CONTESTED -> lane suspend
     std::uint64_t                     m_tick = 0;
     std::uint64_t                     m_cba_chain_booked = 0;
     std::map<std::string, PendingRec> m_unrecoverable;  // kept in the sidecar so the boot warning repeats
@@ -1721,6 +1889,7 @@ private:
 // ===========================================================================
 #include "xmr_node_smoke.hpp"   // smoke::Report, apply_row, blk_id, key_of, test_point_check
 #include "impl/xmr/node/monerod_transport.hpp"   // MockMonerodTransport
+#include "xmr_recon_ring.hpp"                     // R-C rework-3 (D7): FC29
 
 namespace c2pool::v37n::xmr::o2 {
 
@@ -2134,15 +2303,17 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         (void)fc.drain_before_stop();
     }
 
-    // ── phase 6: F-MONEY -- DEBIT-ON-REFUSE (+ conservation I1/I2, restart) ─
+    // ── phase 6: rework-3 (b) -- REFUSE-SIDE MONEY IS NODE-LOCAL LIABILITY ──
     // Seeded owed: B = 2000 (through the EVENT LOG -- F1). Chain lane blocks:
     //   5  credited      credit {A:1000}  payout {A:1000}
-    //   6  lane-root-refused, payout attributed (wire descriptor)  {B:700}
+    //   6  lane-root-refused, payout decoded {B:700} (total 5700)
     //   7  refused cut_absent (credit unreproducible), payout decoded {C:300}
-    //   8  lane-root-refused, payout NOT attributable, total 5000 -> suspense
-    // Restart inside the D_conf window (6 and 7 pending as DEBIT records).
+    //   8  lane-root-refused, payout NOT attributable, total 5000
+    // The refused blocks NEVER touch the ledger (no FOUND, no debit): they are
+    // recorded as node-local LIABILITY (per payee when decoded, else the whole
+    // reward). Restart: the liability tally reloads, the ledger is unchanged.
     {
-        XmrNodeConfig c8 = store_of("store-debit");
+        XmrNodeConfig c8 = store_of("store-liability");
         auto cb8 = [&](std::uint64_t h, const std::string&, CB& bk) -> bool {
             if (h == 5) { bk.credit[kA] = 1000; bk.payout[kA] = 1000; bk.payout_decoded = true; return true; }
             if (h == 6) { bk.why = "lane-root-refused:" + roothex_of(6) + ": unmatched (test)"; bk.payout[kB] = 700;
@@ -2154,20 +2325,20 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
             bk.why = "not-lane: test"; return false;
         };
         long long eoB_after6 = 0, eoB_before6 = 0;
-        std::size_t dlines = 0;
+        std::uint64_t seq_before6 = 0, seq_after6 = 0;
+        std::size_t dlines = 0, llines = 0;
         bool seeded_fresh = false;
         {
             MockMonerodTransport mock;
             XmrNode node(c8, mock, &smoke::test_point_check);
-            try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC20 bring_up (node DEBIT)", false, e.what()); return rep; }
+            try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC20 bring_up (node LIABILITY)", false, e.what()); return rep; }
             Amounts sB; sB[kB] = 2000;
             seeded_fresh = node.seed_settled_owed("fixture-seed-0", sB, 1);
             FinalizeConnectOptions o8 = opts_for(c8); o8.book_from_chain_ex = cb8;
             FoundBlockQueue q8; FinalizeConnect fc(node, c8, q8, o8);
             (void)fc.reseed_after_bring_up();
-            // an OWN win reported by the submit path (stratum / cpu miner) with the
-            // coinbase-authority callback armed: NOT booked on submit-OK (monerod also
-            // says OK for an alternative block) -- deferred to the chain view.
+            // an OWN win reported by the submit path with the coinbase-authority
+            // callback armed: NOT booked on submit-OK -- deferred to the chain view.
             FoundBlockEvent own; own.height = 5; own.block_id_hex = hex_of(smoke::blk_id(5)); own.payee = payee; own.reward_piconero = REWARD;
             q8.push(own); (void)fc.tick();
             const bool own_deferred = fc.pending().empty() && !node.ledger().is_pending(hex_of(smoke::blk_id(5)));
@@ -2176,90 +2347,131 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
             rep.add("FC20e with the RICH callback armed an own win is deferred to the chain (not booked {payee: reward} on submit-OK), then booked from the chain as kind=c with the on-chain maps",
                     own_deferred && p5 != fc.pending().end() && p5->second.kind == 'c' && p5->second.credit.count(kA) &&
                     !p5->second.payout.count(payee), "own_deferred=" + std::to_string(own_deferred));
-            eoB_before6 = node.ledger().effective_owed(kB);
+            eoB_before6 = node.ledger().effective_owed(kB); seq_before6 = node.ledger().ledger_seq();
             chain(node, 6, 6); (void)fc.tick();
-            eoB_after6 = node.ledger().effective_owed(kB);
+            eoB_after6 = node.ledger().effective_owed(kB); seq_after6 = node.ledger().ledger_seq();
             chain(node, 7, 8); (void)fc.tick();
             {
                 std::ifstream f(o8.sidecar_path); std::string l;
                 while (std::getline(f, l)) if (l.rfind("2 ", 0) == 0 && l.find(" d ") != std::string::npos) ++dlines;
             }
-            rep.add("FC20a a refused block with an attributable payout is DEBITED at its chain-ordered booking point: eo(B) 2000 -> 1300 at once (the next K_fair coinbase cannot pay B again)",
-                    seeded_fresh && eoB_before6 == 2000 && eoB_after6 == 1300 && fc.stats().refused_debited == 2 &&
-                    fc.stats().refused_debited_pico == 1000 && node.ledger().is_pending(hex_of(smoke::blk_id(6))),
-                    "eoB " + std::to_string(eoB_before6) + "->" + std::to_string(eoB_after6) + " debited=" +
-                    std::to_string(fc.stats().refused_debited) + "/" + std::to_string(fc.stats().refused_debited_pico));
-            rep.add("FC20b an UNATTRIBUTABLE refused block goes to node-local SUSPENSE (5000), never a ledger key; pending DEBIT records carry kind=d in the v2 sidecar",
-                    fc.stats().refused_unattributed == 1 && fc.stats().refused_unattributed_pico == 5000 &&
-                    !node.ledger().is_pending(hex_of(smoke::blk_id(8))) && dlines == 2,
-                    "unattr=" + std::to_string(fc.stats().refused_unattributed_pico) + " dlines=" + std::to_string(dlines));
+            llines = count_lines(o8.sidecar_path + ".liability");
+            rep.add("FC20a rework-3 (b): a refused block with a decoded payout does NOT touch the ledger: eo(B) stays 2000, ledger_seq unchanged, no FOUND/pending for 6 or 7, invariant counter ledger_mutations_on_refuse = 0",
+                    seeded_fresh && eoB_before6 == 2000 && eoB_after6 == 2000 && seq_after6 == seq_before6 &&
+                    !node.ledger().is_pending(hex_of(smoke::blk_id(6))) && !node.ledger().is_pending(hex_of(smoke::blk_id(7))) &&
+                    !node.ledger().is_settled(hex_of(smoke::blk_id(6))) && fc.stats().ledger_mutations_on_refuse == 0,
+                    "eoB " + std::to_string(eoB_before6) + "->" + std::to_string(eoB_after6) + " seq " + std::to_string(seq_before6) +
+                    "->" + std::to_string(seq_after6));
+            const auto& by = fc.liability_by_payee();
+            auto byv = [&](const ::v37::bytes32& k) { auto it = by.find(k); return it == by.end() ? 0LL : it->second; };
+            rep.add("FC20b the refused blocks are NODE-LOCAL LIABILITY: 3 blocks, attributed {B:700, C:300} (per payee, on-chain decode), unattributed 5000 (whole reward, undecodable), persisted (3 lines), no debit record (kind=d) in the sidecar",
+                    fc.stats().liability_blocks == 3 && fc.stats().liability_attributed_pico == 1000 &&
+                    fc.stats().liability_unattributed_pico == 5000 && fc.stats().liability_pico == 6000 &&
+                    byv(kB) == 700 && byv(kC) == 300 && fc.stats().liability_payees == 2 && llines == 3 && dlines == 0,
+                    "blocks=" + std::to_string(fc.stats().liability_blocks) + " att=" + std::to_string(fc.stats().liability_attributed_pico) +
+                    " unatt=" + std::to_string(fc.stats().liability_unattributed_pico) + " lines=" + std::to_string(llines) +
+                    " dlines=" + std::to_string(dlines));
             (void)fc.drain_before_stop();
         }
-        {   // restart inside the window: 6 and 7 pending (debit), 5 settled at hw 8
+        {   // restart: 5 settled at hw 8; nothing of 6/7/8 is in the ledger
             MockMonerodTransport mock;
             const int serve = 0;
             mock.set_responder(header_responder([](std::uint64_t h) { return smoke::blk_id(static_cast<std::uint8_t>(h)); }, &serve));
             XmrNode node(c8, mock, &smoke::test_point_check);
-            try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC20 bring_up (node DEBIT restart)", false, e.what()); return rep; }
+            try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC20 bring_up (node LIABILITY restart)", false, e.what()); return rep; }
             Amounts sB; sB[kB] = 2000;
             const bool reseeded_again = node.seed_settled_owed("fixture-seed-0", sB, 1);
             FinalizeConnectOptions o8 = opts_for(c8); o8.book_from_chain_ex = cb8;
             FoundBlockQueue q8; FinalizeConnect fc(node, c8, q8, o8);
             const auto boot = fc.reseed_after_bring_up();
-            bool kinds_d = fc.pending().size() == 2;
-            for (const auto& [b, r] : fc.pending()) if (r.kind != 'd') kinds_d = false;
-            rep.add("FC20c restart: the seed is NOT re-applied (it is in the replayed log), the two DEBIT records re-drive with their exact maps (kind=d), suspense reloaded",
-                    !reseeded_again && boot.reseeded == 2 && kinds_d && fc.stats().refused_unattributed_pico == 5000 &&
-                    node.ledger().effective_owed(kB) == 1300,
-                    "reseeded=" + std::to_string(boot.reseeded) + " eoB=" + std::to_string(node.ledger().effective_owed(kB)));
+            rep.add("FC20c restart: the seed is NOT re-applied, no pending record to re-drive (refusals never booked), the LIABILITY tally reloads (3 blocks, 6000), eo(B) still 2000",
+                    !reseeded_again && boot.reseeded == 0 && fc.pending().empty() && fc.stats().liability_blocks == 3 &&
+                    fc.stats().liability_pico == 6000 && node.ledger().effective_owed(kB) == 2000,
+                    "reseeded=" + std::to_string(boot.reseeded) + " liab=" + std::to_string(fc.stats().liability_pico) +
+                    " eoB=" + std::to_string(node.ledger().effective_owed(kB)));
             chain(node, 9, 11); (void)fc.tick();
             const auto& fw = node.ledger().finalW();
             auto fwv = [&](const ::v37::bytes32& k) { auto it = fw.find(k); return it == fw.end() ? 0LL : it->second; };
-            rep.add("FC20d FINALIZE of the debits at h+D_conf: finalW(B) = 2000-700 = 1300, finalW(C) = -300 (over-paid netted forward, never clawed back), A nets 0",
-                    node.ledger().is_settled(hex_of(smoke::blk_id(6))) && node.ledger().is_settled(hex_of(smoke::blk_id(7))) &&
-                    fwv(kB) == 1300 && fwv(kC) == -300 && fwv(kA) == 0 && fc.pending().empty(),
+            rep.add("FC20d the ledger holds ONLY the credited block: finalW(A) nets 0, finalW(B) = 2000 (NOT debited by the refused payout), finalW(C) = 0 (no negative finalW from a refusal)",
+                    node.ledger().is_settled(hex_of(smoke::blk_id(5))) && !node.ledger().is_settled(hex_of(smoke::blk_id(6))) &&
+                    !node.ledger().is_settled(hex_of(smoke::blk_id(7))) && fwv(kA) == 0 && fwv(kB) == 2000 && fwv(kC) == 0,
                     "finalW A/B/C=" + std::to_string(fwv(kA)) + "/" + std::to_string(fwv(kB)) + "/" + std::to_string(fwv(kC)));
-            // I1: finalW(k) = C(k) - P(k) over settled; eo(k) = finalW(k) - Q(k) (Q = 0 now).
-            // I2: sum of decoded owed outputs over the canonical lane blocks == sum P + U.
-            const long long C_A = 1000, C_B = 2000, P_A = 1000, P_B = 700, P_C = 300;
-            const bool i1 = fwv(kA) == C_A - P_A && fwv(kB) == C_B - P_B && fwv(kC) == 0 - P_C &&
-                            node.ledger().effective_owed(kA) == fwv(kA) && node.ledger().effective_owed(kB) == fwv(kB) &&
-                            node.ledger().effective_owed(kC) == fwv(kC);
-            const long long onchain_owed = 1000 + 700 + 300 + 5000;   // block 8 undecodable: its whole total is the suspense bound
-            const long long covered = (P_A + P_B + P_C) + static_cast<long long>(fc.stats().refused_unattributed_pico);
-            rep.add("FC21 conservation: I1 finalW(k) == C(k) - P(k) and eo == finalW - Q for every key; I2 on-chain owed outputs == P + U exactly (nothing refused is unrecorded)",
-                    i1 && onchain_owed == covered,
-                    "onchain=" + std::to_string(onchain_owed) + " covered=" + std::to_string(covered));
+            // I1': finalW(k) = C(k) - P(k) over SETTLED (credited) blocks only.
+            // I2': on-chain owed outputs over the canonical lane blocks == P(settled) + LIABILITY (nothing unrecorded).
+            const long long C_A = 1000, C_B = 2000, P_A = 1000;
+            const bool i1 = fwv(kA) == C_A - P_A && fwv(kB) == C_B && fwv(kC) == 0 &&
+                            node.ledger().effective_owed(kA) == fwv(kA) && node.ledger().effective_owed(kB) == fwv(kB);
+            const long long onchain_owed = 1000 + 700 + 300 + 5000;   // block 8 undecodable: its whole total bounds it
+            const long long covered = P_A + static_cast<long long>(fc.stats().liability_pico);
+            rep.add("FC21 conservation: I1' finalW(k) == C(k) - P(k) over the SETTLED blocks; I2' on-chain owed outputs == P(settled) + node-local LIABILITY exactly (every refused piconero is on the liability tally, none in the ledger)",
+                    i1 && onchain_owed == covered, "onchain=" + std::to_string(onchain_owed) + " covered=" + std::to_string(covered));
             (void)fc.drain_before_stop();
         }
     }
 
-    // ── phase 7: two nodes, one credits b, the other refuses b (I4) ─────────
+    // ── phase 7: D1 -- two honest nodes refuse the SAME block with DIFFERENT
+    // wire-arrival order / attribution, and end BYTE-IDENTICAL ───────────────
+    // Both nodes: seed B=2000; 5 credited {A:1000}/{A:600}; 6 the forker's
+    // block (refused by both); 9 credited {A:200}/{B:50}. X attributes 6's payout at once
+    // (the shape of "the wire descriptor arrived before booking" in rework-2);
+    // Y sees 6 root-UNKNOWN for its first 3 attempts (holding its finalize gate),
+    // then refuses it with NO attribution (whole reward). rework-2 debited on X
+    // and suspended on Y -> two digests. rework-3: identical digest sequence at
+    // every ledger event, identical ledger_seq / finalW / settled set; the only
+    // difference is the node-local liability's granularity.
     {
-        long long fwX = 0, fwY = 0, eoX = 0, eoY = 0;
+        struct Out { std::vector<std::pair<std::uint64_t, ::v37::bytes32>> seq; ::v37::bytes32 fin{}; std::uint64_t lseq = 0;
+                     std::map<::v37::bytes32, long long> fw; bool r6_pending = true; std::uint64_t att = 0, unatt = 0, mut = 1, ref = 0, unk = 0; };
+        Out out[2];
         for (int side = 0; side < 2; ++side) {
-            XmrNodeConfig c9 = store_of(side == 0 ? "store-2n-X" : "store-2n-Y");
+            XmrNodeConfig c9 = store_of(side == 0 ? "store-d1-X" : "store-d1-Y");
             MockMonerodTransport mock;
             XmrNode node(c9, mock, &smoke::test_point_check);
             try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC22 bring_up", false, e.what()); return rep; }
+            Out& O = out[side];
+            node.finalize_driver().set_ledger_event_observer([&]() {
+                const auto d = node.ledger().owed_digest();
+                if (O.seq.empty() || !(O.seq.back().second == d)) O.seq.emplace_back(node.finalize_driver().digest_since(), d);
+            });
             Amounts sB; sB[kB] = 2000; (void)node.seed_settled_owed("fixture-seed-0", sB, 1);
             FinalizeConnectOptions o9 = opts_for(c9);
+            int y_attempts = 0;
             o9.book_from_chain_ex = [&, side](std::uint64_t h, const std::string&, CB& bk) -> bool {
+                // credit != payout so every FINALIZE moves the digest (the sequence has content)
+                if (h == 5) { bk.credit[kA] = 1000; bk.payout[kA] = 600; bk.payout_decoded = true; return true; }
+                if (h == 9) { bk.credit[kA] = 200; bk.payout[kB] = 50; bk.payout_decoded = true; return true; }
                 if (h != 6) { bk.why = "not-lane: test"; return false; }
-                bk.payout[kB] = 700; bk.payout_decoded = true;
-                if (side == 0) { bk.credit[kB] = 900; return true; }
-                bk.why = "lane-root-refused:" + roothex_of(6) + ": Y cannot reproduce the root (test)"; return false;
+                bk.total_pico = 5700; bk.onchain_root_hex = roothex_of(606);
+                if (side == 0) {   // X: attributed at once
+                    bk.why = "lane-root-refused:" + roothex_of(606) + ": forker (test, attributed)";
+                    bk.payout[kB] = 700; bk.payout_decoded = true; return false;
+                }
+                if (++y_attempts <= 3) { bk.why = "lane-root-unknown: 03 root matches none (test: Y not yet decidable)"; return false; }
+                bk.why = "lane-root-refused:" + roothex_of(606) + ": forker (test, unattributed)";
+                return false;
             };
             FoundBlockQueue q9; FinalizeConnect fc(node, c9, q9, o9);
-            for (std::uint64_t h = 1; h <= 10; ++h) { chain(node, h, h); (void)fc.tick(); }
-            auto it = node.ledger().finalW().find(kB);
-            (side == 0 ? fwX : fwY) = it == node.ledger().finalW().end() ? 0 : it->second;
-            (side == 0 ? eoX : eoY) = node.ledger().effective_owed(kB);
+            for (std::uint64_t h = 1; h <= 14; ++h) { chain(node, h, h); (void)fc.tick(); if (side == 1 && h >= 6) (void)fc.tick(); }
+            for (int i = 0; i < 4; ++i) (void)fc.tick();
+            O.fin = node.ledger().owed_digest(); O.lseq = node.ledger().ledger_seq(); O.fw = node.ledger().finalW();
+            O.r6_pending = node.ledger().is_pending(hex_of(smoke::blk_id(6))) || node.ledger().is_settled(hex_of(smoke::blk_id(6)));
+            O.att = fc.stats().liability_attributed_pico; O.unatt = fc.stats().liability_unattributed_pico;
+            O.mut = fc.stats().ledger_mutations_on_refuse; O.ref = fc.stats().refused_not_credited;
+            O.unk = fc.stats().lane_root_unknown_retries;
             (void)fc.drain_before_stop();
         }
-        rep.add("FC22 I4 two honest nodes: X credits b, Y refuses b -> the payout side is IDENTICAL (both debit 700); they differ by EXACTLY the refused credit (900), never by a double-counted payout",
-                fwX == 2000 + 900 - 700 && fwY == 2000 - 700 && fwX - fwY == 900 && eoX == fwX && eoY == fwY,
-                "finalW X=" + std::to_string(fwX) + " Y=" + std::to_string(fwY));
+        const bool same = out[0].seq == out[1].seq && out[0].fin == out[1].fin && out[0].lseq == out[1].lseq && out[0].fw == out[1].fw;
+        rep.add("FC22 D1: X (payout attributed at once) and Y (root-unknown x3, holding its gate, then refused UNATTRIBUTED) refuse the same block and end BYTE-IDENTICAL -- same owed_digest at every ledger event (" +
+                std::to_string(out[0].seq.size()) + " states, with since-heights), same final digest, ledger_seq and finalW",
+                same && out[0].seq.size() >= 4 && !out[0].r6_pending && !out[1].r6_pending && out[0].ref == 1 && out[1].ref == 1 &&
+                out[0].mut == 0 && out[1].mut == 0 && out[0].unk == 0 && out[1].unk == 3,
+                "Y root-unknown retries=" + std::to_string(out[1].unk) + " states X/Y=" + std::to_string(out[0].seq.size()) + "/" + std::to_string(out[1].seq.size()) + " lseq X/Y=" +
+                std::to_string(out[0].lseq) + "/" + std::to_string(out[1].lseq) + " digest " + hex_of(out[0].fin).substr(0, 12) + "/" +
+                hex_of(out[1].fin).substr(0, 12));
+        rep.add("FC22b the ONLY difference is node-local: X's liability is per payee {B:700}, Y's is the whole reward 5700 unattributed",
+                out[0].att == 700 && out[0].unatt == 0 && out[1].att == 0 && out[1].unatt == 5700,
+                "X att/unatt=" + std::to_string(out[0].att) + "/" + std::to_string(out[0].unatt) + " Y=" +
+                std::to_string(out[1].att) + "/" + std::to_string(out[1].unatt));
     }
 
     // ── phase 8: F1 -- restart digest-history diff KAT ──────────────────────
@@ -2400,6 +2612,155 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         }
         (void)fc.drain_before_stop();
     }
+
+    // ── phase 11: D3 -- the vote's observation window survives a restart ────
+    // rework-2 verify: B rebooted into "CONVERGED" while forked (the window was
+    // memory-only). Refuse 8 frontier blocks -> CONTESTED; restart on the same
+    // store: the vote is CONTESTED straight out of reseed_after_bring_up (no
+    // tick, no new block). FC27n = the rework-2 behaviour (persistence off).
+    for (int persisted = 1; persisted >= 0; --persisted) {
+        XmrNodeConfig c13 = store_of(persisted ? "store-obs" : "store-obs-ctl");
+        auto cb13 = [&](std::uint64_t h, const std::string&, CB& bk) -> bool {
+            if (h >= 5) { bk.why = "lane-root-refused:" + roothex_of(700 + h) + ": unmatched (test)"; bk.total_pico = 100;
+                          bk.onchain_root_hex = roothex_of(700 + h); return false; }
+            bk.why = "not-lane: test"; return false;
+        };
+        std::uint64_t n_before = 0; FinalizeConnect::VoteState st_before = FinalizeConnect::VoteState::Converged;
+        {
+            MockMonerodTransport mock;
+            XmrNode node(c13, mock, &smoke::test_point_check);
+            try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC27 bring_up", false, e.what()); return rep; }
+            FinalizeConnectOptions o = opts_for(c13); o.book_from_chain_ex = cb13; o.persist_vote_obs = persisted != 0;
+            FoundBlockQueue q; FinalizeConnect fc(node, c13, q, o);
+            (void)fc.reseed_after_bring_up();
+            for (std::uint64_t h = 1; h <= 12; ++h) { chain(node, h, h); (void)fc.tick(); }
+            n_before = fc.stats().obs_n; st_before = fc.vote_state();
+            (void)fc.drain_before_stop();
+        }
+        MockMonerodTransport mock;
+        XmrNode node(c13, mock, &smoke::test_point_check);
+        try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC27 bring_up (restart)", false, e.what()); return rep; }
+        FinalizeConnectOptions o = opts_for(c13); o.book_from_chain_ex = cb13; o.persist_vote_obs = persisted != 0;
+        FoundBlockQueue q; FinalizeConnect fc(node, c13, q, o);
+        int hook_on = 0; fc.set_contested_hook([&](bool on, const std::string&) { if (on) ++hook_on; });
+        (void)fc.reseed_after_bring_up();
+        if (persisted)
+            rep.add("FC27 D3: after a restart the lineage-vote window is RESTORED from <sidecar>.obs -- CONTESTED (8/8 refused) straight out of the boot, not re-warmed from zero",
+                    st_before == FinalizeConnect::VoteState::Contested && n_before == 8 &&
+                    fc.vote_state() == FinalizeConnect::VoteState::Contested && fc.stats().obs_n == 8 &&
+                    fc.stats().obs_restored == 8 && hook_on == 1,
+                    "before=" + std::string(FinalizeConnect::vote_state_name(st_before)) + "/" + std::to_string(n_before) +
+                    " after=" + FinalizeConnect::vote_state_name(fc.vote_state()) + "/" + std::to_string(fc.stats().obs_n) +
+                    " hook_on=" + std::to_string(hook_on));
+        else
+            rep.add("FC27n control (window NOT persisted, the rework-2 behaviour): the restarted node reports CONVERGED with 0 observations while nothing changed on-chain",
+                    st_before == FinalizeConnect::VoteState::Contested &&
+                    fc.vote_state() == FinalizeConnect::VoteState::Converged && fc.stats().obs_n == 0,
+                    "after=" + std::string(FinalizeConnect::vote_state_name(fc.vote_state())));
+        (void)fc.drain_before_stop();
+    }
+
+    // ── phase 12: CONTESTED -> lane suspend (interim default), auto-resume ──
+    // 6 refused frontier blocks -> CONTESTED: the contested hook fires ONCE,
+    // synchronously inside that tick. Then honest (booked) blocks until the
+    // refused fraction over the 24-block window drops below 1/3 -> CONVERGED:
+    // the hook fires (false) ONCE. With contested_suspends=false it never fires.
+    for (int armed = 1; armed >= 0; --armed) {
+        XmrNodeConfig c14 = store_of(armed ? "store-contested" : "store-contested-off");
+        FinalizeConnectOptions o = opts_for(c14); o.contested_suspends = armed != 0;
+        o.book_from_chain_ex = [&](std::uint64_t h, const std::string&, CB& bk) -> bool {
+            if (h >= 5 && h <= 10) { bk.why = "lane-root-refused:" + roothex_of(800 + h) + ": forker (test)"; bk.total_pico = 100;
+                                     bk.onchain_root_hex = roothex_of(800 + h); return false; }
+            if (h > 10) { bk.credit[kA] = 10; bk.payout[kA] = 10; bk.payout_decoded = true; return true; }
+            bk.why = "not-lane: test"; return false;
+        };
+        MockMonerodTransport mock;
+        XmrNode node(c14, mock, &smoke::test_point_check);
+        try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC28 bring_up", false, e.what()); return rep; }
+        FoundBlockQueue q; FinalizeConnect fc(node, c14, q, o);
+        int on = 0, off = 0; std::uint64_t on_at = 0, off_at = 0; std::uint64_t cur_h = 0;
+        fc.set_contested_hook([&](bool v, const std::string&) { if (v) { ++on; on_at = cur_h; } else { ++off; off_at = cur_h; } });
+        for (std::uint64_t h = 1; h <= 40; ++h) { cur_h = h; chain(node, h, h); (void)fc.tick(); }
+        if (armed)
+            rep.add("FC28 CONTESTED -> lane suspend: the contested hook fires once (h=10, the 6th refused frontier block, inside that tick) and releases once when the window returns below 1/3 -> CONVERGED (auto-resume); no halt, the cursor walked to the frontier",
+                    on == 1 && off == 1 && on_at == 10 && off_at > 10 && fc.vote_state() == FinalizeConnect::VoteState::Converged &&
+                    fc.stats().contested_suspend_edges == 1 && fc.stats().contested_resume_edges == 1 &&
+                    node.finalize_driver().cursor_height() == 37,
+                    "on=" + std::to_string(on) + "@" + std::to_string(on_at) + " off=" + std::to_string(off) + "@" + std::to_string(off_at) +
+                    " cursor=" + std::to_string(node.finalize_driver().cursor_height()));
+        else
+            rep.add("FC28n --contested-suspend off: the vote still goes CONTESTED -> CONVERGED but the hook never fires (the rework-2 keep-building posture)",
+                    on == 0 && off == 0 && fc.stats().contested_entered == 1, "on=" + std::to_string(on));
+        (void)fc.drain_before_stop();
+    }
+
+    // ── phase 13: D7 -- the RECON root-age bound ────────────────────────────
+    // (a) the ring's since-heights are the same live and after a restart (the
+    //     boot replay derives them from the Finalize events' bin_height);
+    // (b) a block committing a HISTORICAL root older than 4*D_conf (relative to
+    //     its builder cut) is refused -- the forker-commits-the-genesis-seed-state
+    //     shape -- while an honest builder at the lag-suspend bound, a recent
+    //     stale root and a long-idle CURRENT root are all accepted.
+    {
+        namespace rc = c2pool::v37n::xmr::recon;
+        XmrNodeConfig c15 = store_of("store-recon-age");
+        std::vector<std::pair<::v37::bytes32, std::uint64_t>> live;
+        {
+            MockMonerodTransport mock;
+            XmrNode node(c15, mock, &smoke::test_point_check);
+            try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC29 bring_up", false, e.what()); return rep; }
+            live.emplace_back(node.ledger().owed_digest(), node.finalize_driver().digest_since());
+            node.finalize_driver().set_ledger_event_observer([&]() {
+                const auto d = node.ledger().owed_digest();
+                if (!(live.back().first == d)) live.emplace_back(d, node.finalize_driver().digest_since());
+            });
+            Amounts s0; s0[kB] = 5000; (void)node.seed_settled_owed("fixture-seed-0", s0, 1);   // the genesis-seed state
+            for (std::uint64_t h = 1; h <= 30; ++h) {
+                chain(node, h, h);
+                if (h == 10 || h == 14 || h == 17 || h == 20) {
+                    Amounts cr; cr[kA] = static_cast<long long>(100 + h);   // credit only: every FINALIZE moves finalW(A)
+                    node.on_network_block_won(h, smoke::blk_id(static_cast<std::uint8_t>(h)), cr, Amounts{});
+                }
+            }
+        }
+        MockMonerodTransport mock;
+        XmrNode node(c15, mock, &smoke::test_point_check);
+        try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC29 bring_up (restart)", false, e.what()); return rep; }
+        const auto& bd = node.boot_digest_history(); const auto& bs = node.boot_digest_since();
+        bool eq = bd.size() == live.size() && bs.size() == live.size();
+        for (std::size_t i = 0; eq && i < live.size(); ++i) eq = bd[i] == live[i].first && bs[i] == live[i].second;
+        std::string sinces; for (auto v : bs) sinces += std::to_string(v) + ",";
+        auto last_with = [&](std::uint64_t since) -> long {
+            long r = -1; for (std::size_t i = 0; i < bs.size(); ++i) if (bs[i] == since) r = static_cast<long>(i); return r; };
+        rep.add("FC29a D7: the (digest, since-height) pairs a node lives through EQUAL the boot replay's after a restart (seed at 0, FINALIZE(h) at h: 10,14,17,20)",
+                eq && live.size() >= 6 && last_with(10) > 0 && last_with(14) > last_with(10) && last_with(17) > last_with(14) &&
+                last_with(20) == static_cast<long>(bs.size()) - 1 && node.finalize_driver().digest_since() == 20,
+                "live=" + std::to_string(live.size()) + " boot=" + std::to_string(bd.size()) + " since=" + sinces);
+        rc::ReconRing ring; ring.seed(bd, bs);
+        std::vector<::v37::bytes32> cands; std::vector<std::uint64_t> sup;
+        ring.candidates(node.ledger().owed_digest(), cands, sup);
+        const std::uint64_t D = D_CONF, maxage = rc::default_max_root_age(D);
+        auto age_of = [&](const ::v37::bytes32& d, std::uint64_t h) -> std::uint64_t {
+            for (std::size_t i = 0; i < cands.size(); ++i) if (cands[i] == d) return rc::root_age(sup[i], rc::builder_cut(h, D));
+            return ~std::uint64_t{0};
+        };
+        if (!eq || last_with(0) < 1 || last_with(14) < 0 || last_with(17) < 0) { rep.add("FC29b precondition (ring layout)", false, sinces); return rep; }
+        const ::v37::bytes32 seed_state = bd[static_cast<std::size_t>(last_with(0))], st14 = bd[static_cast<std::size_t>(last_with(14))],
+                             st17 = bd[static_cast<std::size_t>(last_with(17))], cur = bd.back();
+        // the forker, freshly booted with the same genesis seed, builds at h=40 (bcut 36): seed state superseded at 10 -> age 26 > 12
+        const std::uint64_t a_forker = age_of(seed_state, 40);
+        // an honest builder at the lag-suspend bound (cursor = bcut - 2*D_conf) commits the state current at that cursor
+        const std::uint64_t a_honest_lag = age_of(st17, 20 + 1 + D + 2 * D);        // st17 superseded at 20, bcut = 26 -> age 6
+        const std::uint64_t a_recent = age_of(st14, 24);                             // superseded at 17, bcut 20 -> age 3
+        const std::uint64_t a_idle   = age_of(cur, 5000);                            // still CURRENT: age 0 however old
+        const std::uint64_t a_seed_early = age_of(seed_state, 22);                   // bcut 18, superseded 10 -> age 8 (within 12)
+        rep.add("FC29b D7 bound = 4*D_conf = 12: a block at h=40 committing the GENESIS-SEED state (superseded at h=10) has age 26 -> REFUSED as stale (the rework-2 credit), while an honest builder at the 2*D_conf lag bound (age 6), a recent stale root (3), the seed state while still young (8) and a long-idle CURRENT root (0) are all accepted",
+                maxage == 12 && a_forker == 26 && a_forker > maxage && a_honest_lag == 6 && a_honest_lag <= maxage &&
+                a_recent == 3 && a_idle == 0 && a_seed_early == 8 && a_seed_early <= maxage,
+                "forker=" + std::to_string(a_forker) + " honest_lag=" + std::to_string(a_honest_lag) + " recent=" +
+                std::to_string(a_recent) + " idle=" + std::to_string(a_idle) + " seed_early=" + std::to_string(a_seed_early));
+    }
+
     return rep;
 }
 
