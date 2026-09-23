@@ -17,6 +17,7 @@
 #include "header_chain.hpp"
 #include "mempool.hpp"
 #include "fill_budget.hpp"
+#include "fill_budget_runtime.hpp"
 #include "mweb_builder.hpp"
 #include "rpc_data.hpp"
 #include "transaction.hpp"
@@ -469,6 +470,7 @@ public:
         auto t1 = std::chrono::steady_clock::now();
         auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         rpc::WorkData wd{std::move(data), std::move(tx_objects), std::move(tx_hashes), latency_ms};
+        wd.m_newtx_bytes = budget_gate.spent();
         if (refusal) {
             if (refused)
                 *refused = std::move(wd);
@@ -505,11 +507,16 @@ public:
                      << m_chain.height() << ")";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
         }
+        // G2: one grant per work event (one getwork() == one refresh_work()),
+        // after the lazy block reset when the parent tip moved.
+        std::optional<int64_t> grant;
+        if (auto tip = m_chain.tip())
+            grant = m_fill_budget.begin_work(tip->block_hash);
         std::optional<rpc::WorkData> refused;
         auto result = TemplateBuilder::build_template(
             m_chain, m_pool, m_testnet, m_mweb_tracker,
             TemplateBuilder::MAX_BLOCK_WEIGHT - TemplateBuilder::COINBASE_RESERVE, &refused,
-            m_template_tx_check_strict.load(std::memory_order_relaxed));
+            m_template_tx_check_strict.load(std::memory_order_relaxed), grant);
         if (!result && refused) {
             // MWEB is active but there is no MWEB state for the next block yet,
             // the mempool is not cleaned for the tip yet, or the template fails
@@ -518,15 +525,33 @@ public:
             // which keeps the previous valid template (HOLD) or, with none,
             // serves this one degraded. Without MWEB state its rules name
             // "mweb" and it has no mweb data, so block assembly refuses every
-            // LTC block from it.
+            // LTC block from it. Recorded like a served template so a share
+            // found on it settles its grant.
+            m_fill_budget.record(refused->m_hashes, refused->m_newtx_bytes);
             return std::move(*refused);
         }
         if (!result) {
             LOG_WARNING << "[EMB-LTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
         }
+        m_fill_budget.record(result->m_hashes, result->m_newtx_bytes);
         return *result;
     }
+
+    /// G2 settle: a local share was FOUND on the job whose coinbase merkle
+    /// branch is `branch` (ShareCreationParams::merkle_branches). The one
+    /// debit; also advances the ramp. Call for DOA/orphan shares too.
+    ParentFillBudget::Settled settle_found_share(const std::vector<uint256>& branch) {
+        auto s = m_fill_budget.settle_found(branch);
+        LOG_INFO << "[EMB-LTC] G2 settle: " << s.bytes << "B"
+                 << (s.matched ? "" : " (template not recent, held grant)")
+                 << " cap=" << m_fill_budget.current_cap()
+                 << " ramp=" << m_fill_budget.shares_since_reset()
+                 << " tokens=" << static_cast<int64_t>(m_fill_budget.tokens());
+        return s;
+    }
+
+    const ParentFillBudget& fill_budget() const { return m_fill_budget; }
 
     /// Block relay in embedded mode is handled by CoinBroadcaster via
     /// MiningInterface::on_block_relay, not through this interface.
@@ -579,6 +604,7 @@ private:
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
     std::atomic<bool> m_template_tx_check_strict{true};
+    ParentFillBudget m_fill_budget = ParentFillBudget::ltc();  // G2 LTC bucket
 };
 
 } // namespace coin
