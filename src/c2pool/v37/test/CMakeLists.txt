@@ -821,4 +821,11 @@ if (BUILD_TESTING)
     # BOTH build.yml --target lists.
     add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/roundabout/test
                      ${CMAKE_CURRENT_BINARY_DIR}/roundabout)
+
+    # V37 payout economics (NEW standalone modules under src/c2pool/v37/payout/):
+    # KATs beside the headers, pulled in with an explicit binary dir. SAME
+    # HOLLOW-GREEN GUARD: every v37_payout_* target is ALSO on BOTH build.yml
+    # --target lists.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/payout/test
+                     ${CMAKE_CURRENT_BINARY_DIR}/payout)
 endif()
