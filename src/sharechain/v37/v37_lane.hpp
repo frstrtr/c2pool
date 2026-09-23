@@ -377,6 +377,28 @@ struct NrGate {
     bool allow_digit_repeat = false;                // ND-R4 closure; default = strict golden subset
 };
 
+// Fee-model gate (the v36 fee model on the XMR lane, rulings S1-S4;
+// consumer: src/c2pool/v37/xmr/xmr_fee_model.hpp). ADD-ONLY and, like the
+// gates above, NOT part of the digested lane geometry: it changes nothing the
+// lane folds by itself. What it changes is WHAT the consumer builds and pushes:
+// the lane coinbase carries the mandatory donation output (1 + residual), the
+// residual sink IS the donation address, and every PoW-committed receipt is
+// pushed at weight 65535 split by its own give-author u16. enabled == false
+// (the default) => master-identical coinbase and credit. Two nodes whose gates
+// differ fold different lanes from identical receipts, so the gate is folded
+// into every peer-facing lane tag (the XMR relay's lane_params_digest), and a
+// mixed fleet refuses EXPLICITLY at HELLO -- never a silent divergence.
+struct FeeModelGate {
+    bool enabled = false;          // ★ DEFAULT OFF (flip = consensus change)
+    std::uint32_t version = 0;     // 0 = off; 1 = v36 fee model (S1-S4)
+
+    static FeeModelGate for_version(std::uint32_t v) {
+        FeeModelGate g{};          // unknown version => OFF (fail-safe)
+        if (v == 1) { g.enabled = true; g.version = 1; }
+        return g;
+    }
+};
+
 struct LaneParams {
     u64 window = 8640;          // W   (OQ-5 default)
     u64 c0 = 4096;              // C0, power of two; also E (epoch length)
@@ -398,6 +420,9 @@ struct LaneParams {
     // native-ridge gate, default OFF (nr_version 0, UINT64_MAX) =>
     // byte-identical to the p1+p2 lane on every schedule.
     NrGate nr{};
+    // ADD-ONLY, digest-neutral by construction (see FeeModelGate): the v36
+    // fee model on the XMR lane, default OFF => master-identical.
+    FeeModelGate fee{};
 
     u64 epoch_len() const { return c0; }
     std::size_t levels() const { return 1 + level_caps.size(); }

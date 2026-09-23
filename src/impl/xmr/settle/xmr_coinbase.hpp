@@ -197,7 +197,7 @@ enum class BuildError : std::uint8_t {
     CarrotFence,        // major_version > W5_PRECARROT_MAX_MAJOR_VERSION
     ZeroBudget,         // base_reward + fees == 0 (impossible on XMR tail emission)
     FixedExceedsBudget, // Sum(fixed) > budget
-    CapTooSmall,        // output_cap < fixed.size() + 1 (no room for the sink)
+    CapTooSmall,        // output_cap < fixed.size() + 1 (no room for the sink; + 0 when it folds, S1)
     BadSinkDescriptor,  // residual_sink is not a valid XMR ref
     BadPayeeDescriptor, // an owed/fixed pay is not a valid XMR ref
     DerivationFailed,   // r*G or an ECDH derivation failed (bad point)
@@ -243,7 +243,14 @@ struct ReceivedCoinbase {
 //
 // Canonical output order (consensus):
 //     [ K_fair owed outputs ]  ++  [ fixed outputs ]  ++  [ residual sink? ]
-// The sink is present iff the residual is > 0. Invariant on success:
+// The sink is present iff the residual is > 0 -- EXCEPT when the LAST fixed
+// output IS the residual sink (same ref + identity: residual_folds_into_fixed(), the fee model's
+// single donation output, rulings S1/S2): then there is never a separate sink
+// output and no sink slot is reserved; that last fixed output pays
+// max(declared amount, residual), i.e. it absorbs the whole residual, and its
+// declared amount is a MINIMUM taken from the residual first and, only when
+// the owed pass exhausted the budget, from the LARGEST owed output (ties: the
+// earliest in K_fair order; the shortfall stays owed). Invariant on success:
 //     Sum(result.amount) == in.budget()      (exact-sum, no burn)
 // and every result.amount > 0, and result.size() >= 1, and result.size() <=
 // in.output_cap.
@@ -253,6 +260,12 @@ struct ReceivedCoinbase {
 // ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err = nullptr);
+
+// S1: true iff the last fixed output IS the residual sink -- it pays
+// `residual_sink` (ScriptRef equality) under `residual_sink_identity` -- i.e.
+// the residual folds into it and no separate sink output / slot exists.
+// Callers that pre-check the output cap must use the same slot rule.
+bool residual_folds_into_fixed(const CoinbaseInputs& in);
 
 // ---------------------------------------------------------------------------
 // Deterministic tx secret key r = H_s(domain || major || chain_id ||

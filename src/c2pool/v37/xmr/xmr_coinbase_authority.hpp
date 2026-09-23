@@ -149,9 +149,12 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
 // ---------------------------------------------------------------------------
 // fee model (xmr_fee_model.hpp): the every-node REFUSE-IF-ABSENT booking rule.
 // The residual sink IS the donation address, so every vout to it was tallied
-// as coverage above; this locates the mandatory 1-piconero marker at the
-// canonical tail (refusing the coinbase when it is absent) and re-books the
-// donation's pre-marker outputs (give-author credit) as owed deductions.
+// as coverage above; this locates the ONE mandatory donation output (last,
+// >= 1 piconero = the V36 marker + the folded residual, ruling S1), refusing
+// the coinbase when it is absent, and re-books the donation's earlier outputs
+// (give-author credit, paid as ordinary K_fair owed) as owed deductions.
+// Only a FeeModelGate-ON node calls this; gate OFF books with
+// decode_lane_coinbase() against its configured sink, exactly as master.
 // ---------------------------------------------------------------------------
 template <class PayOf>
 inline CoinbaseBooking decode_lane_coinbase_fee(const std::vector<std::uint8_t>& blob,

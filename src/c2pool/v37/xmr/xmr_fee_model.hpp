@@ -13,64 +13,48 @@
 // 2011-06-11, and the V36 fork frstrtr/p2pool-merged-v36). It is NOT the
 // Monero p2pool model: SChernykh's p2pool has no fee and no donation at all.
 //
-//   1. DONATION OUTPUT = MANDATORY. Every lane coinbase carries the donation
-//      output to the protocol donation address. In p2pool it is structural
-//      (the donation script sits in the hashed gentx tail, so a gentx without
-//      it fails the share PoW); V36 adds the ">= 1 satoshi" marker rule
-//      (data.py: final_donation < 1 -> take 1 from the largest payee). Here:
-//        * a FixedOutput of EXACTLY kDonationDustPico (1 piconero) to the
-//          donation ref, on every node, from a compiled-in constant -- no
-//          node can omit it (there is no knob);
+// GATED: everything here is live only under LaneParams::fee (FeeModelGate,
+// sharechain/v37/v37_lane.hpp), default OFF => master-identical coinbase and
+// credit. The gate is folded into the relay's lane_params_digest, so a mixed
+// fleet refuses at HELLO instead of diverging (ruling S4).
+//
+//   1. DONATION OUTPUT = MANDATORY, ONE OUTPUT = 1 + RESIDUAL (ruling S1).
+//      p2pool data.py: amounts[DONATION] += subsidy - sum(amounts), and V36
+//      requires the donation output to be >= 1 atomic unit. Here the lane
+//      coinbase carries ONE donation output, LAST: a FixedOutput to the
+//      donation ref whose declared amount kDonationDustPico (1 piconero) is a
+//      MINIMUM, and the residual sink IS the donation address, so X6
+//      (allocate_exact_sum, residual_folds_into_fixed) folds the whole
+//      exact-sum residual into that output -- there is never a separate sink.
 //        * serve side: inspect_donation_marker() refuses a template whose
-//          canonical coinbase does not end in the marker (+ optional sink);
+//          canonical coinbase does not end in that one output;
 //        * receive side: apply_donation_rule() refuses to book a lane
-//          coinbase that does not carry the marker (REFUSE-IF-ABSENT).
-//   2. DONATION = THE RESIDUAL SINK. The exact-sum remainder (p2pool data.py:
-//      amounts[DONATION] += subsidy - sum(amounts)) goes to the donation
-//      address: residual_sink := donation ref. With the unchanged X6
-//      allocator this is a SECOND output to the same address, emitted only
-//      when residual > 0 (folding it INTO the marker output is the X6
-//      allocator edit handed to the operator, see the seam notes below).
-//   3. GIVE-AUTHOR = a u16 CARRIED IN THE RECEIPT. v36: share_data.donation =
-//      perfect_round(65535*pct/100); weights miner att*(65535-d), donation
-//      att*d. Every node folds every receipt with the receipt's OWN u16, so
-//      two nodes with different give-author % still build the same coinbase.
-//      Here: the minted receipt carries d; ingest splits ONE receipt of weight
-//      w into two lane pushes, (miner, w - floor(w*d/65535)) and (donation,
-//      floor(w*d/65535)). The lane / fold_eb code is untouched; d = 0 is a
-//      single push, byte-identical to the pre-fee receipt stream.
-//   4. NODE-OWNER FEE = PROBABILISTIC IDENTITY SUBSTITUTION AT MINT (v36
+//          coinbase whose last output is not a >= 1 piconero donation output
+//          (REFUSE-IF-ABSENT).
+//   2. THE 1-PICONERO DUST COMES FROM THE LARGEST PAYEE (ruling S2, V36
+//      data.py "take 1 from the largest"). Only when the owed pass exhausts
+//      the budget (residual 0) does X6 deduct the minimum, from the LARGEST
+//      owed output (ties: earliest in K_fair order); the piconero stays owed.
+//   3. GIVE-AUTHOR = A u16 INSIDE THE PoW-COMMITTED RECEIPT (ruling S3). The
+//      Family-B receipt's side_data_v2 carries give_author; its info_digest
+//      commits it and, with --relay-bind rbind, the coinbase 0x02 region
+//      [extra_nonce 4 | rbind 32] binds (payee, give_author) to the share's
+//      RandomX PoW (SEAM-1). The relay ingest and the repair replay read the
+//      u16 from THERE -- never from a feed line. Every receipt is pushed at
+//      weight kFeeReceiptWeight (65535) split v36-style: (payee, 65535 - d),
+//      then (donation, d) iff d > 0. Every node folds every receipt with the
+//      receipt's OWN u16, so nodes with different give-author % build the
+//      same coinbase. (Family-A: WorkEvent::donation, w2_receipt.hpp.)
+//   4. NODE-OWNER FEE = PROBABILISTIC PAYEE SUBSTITUTION AT JOB ISSUE (v36
 //      work.py: random.uniform(0,100) < node_owner_fee -> pubkey_hash =
-//      my_pubkey_hash). The roll happens when the RECEIPT is minted; the
-//      substituted payee rides in the receipt and peers admit it as ordinary
-//      work. Never a post-FOUND payee swap.
+//      my_pubkey_hash, decided when the WORK is handed out). The roll picks
+//      the payee that the job's rbind commits to, so the substituted payee is
+//      PoW-bound in the share the miner then finds; peers admit it as
+//      ordinary work. Never a post-FOUND payee swap.
 //   5. NO FINDER BONUS (V36 dropped forrestv's 0.5% finder output).
 //
 // Everything here is a pure function of its arguments (the owner-fee roll
 // takes its random word as an argument) so it is KAT-able.
-//
-// CONSENSUS SEAMS HANDED TO THE OPERATOR (not edited here; master 4345baf68):
-//   S1 single donation output (the exact p2pool shape): xmr_coinbase.cpp:160-170
-//      emits the residual as a SEPARATE Sink iff > 0; fold it into the last
-//      fixed output when that output pays residual_sink (marker := 1+residual),
-//      drop the sink slot from CapTooSmall (:109-114). Then the tail is ONE
-//      donation output >= 1 and locate_donation_marker() simplifies to "last
-//      output pays D, amount >= 1" (removes the 1-piconero S/N ambiguity).
-//      Moves the X6 coinbase goldens that set fixed == sink.
-//   S2 the V36 ">= 1 from the LARGEST payee": here the marker is deducted
-//      before the owed pass, so the 1 piconero comes out of the LAST K_fair
-//      paid entry and is CARRIED as owed (lossless). Ruling owed.
-//   S3 the give-author u16 in the PoW-committed receipt: Family-A
-//      w2_receipt.hpp:206-234 (field + preimage after nonce), w3_wire_freeze
-//      .hpp:195-215 (v0x03, 114-byte fixed prefix, F-5 dual-accept),
-//      w3_relay.hpp:393-403/504-515 (put/get_u16 after nonce); Family-B
-//      xmr_receipt.hpp:211-216 (ReceiptSideData) + xmr_receipt_verify.cpp:
-//      139-148 (side_data_digest appends le16). Until then the u16 rides the
-//      regtest R1 feed line only (not PoW-bound).
-//   S4 coordinated activation: +1 marker output, sink := donation, and the
-//      donation pushes change coinbase bytes and the lane record stream on
-//      every node together; this branch applies them unconditionally (no
-//      activation height) -- the v37.0x subversion gate is the operator's.
 // ===========================================================================
 #pragma once
 
@@ -87,6 +71,7 @@
 #include <sharechain/v37/v37_descriptor.hpp>
 #include <sharechain/v37/v37_descriptor_xmr.hpp>
 #include <sharechain/v37/v37_hash.hpp>
+#include <sharechain/v37/v37_lane.hpp>             // LaneParams::fee (FeeModelGate)
 
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"   // xmr::coin::keccak256 (cn_fast_hash)
 #include "impl/xmr/settle/xmr_coinbase.hpp"        // FixedOutput, CoinbaseOutput
@@ -110,6 +95,16 @@ inline constexpr char kDonationViewHex[]  = "b3157741ab68969aeb7fe9ebd4fa3ec5ce4
 inline constexpr std::uint64_t kDonationDustPico = 1;
 // The give-author scale (v36 share_data.donation is a u16 over 65535).
 inline constexpr std::uint32_t kGiveAuthorScale = 65535;
+// Under the gate every PoW-committed receipt is pushed at this lane weight,
+// split by its u16 (v36: miner att*(65535-d), donation att*d). Uniform across
+// receipts, so relative credit is unchanged versus the gate-OFF weight 1.
+inline constexpr std::uint64_t kFeeReceiptWeight = kGiveAuthorScale;
+// The gate's version the code below implements (FeeModelGate::version).
+inline constexpr std::uint32_t kFeeModelVersion = 1;
+
+inline bool fee_model_on(const ::v37::LaneParams& p) {
+    return p.fee.enabled && p.fee.version == kFeeModelVersion;
+}
 
 // Monero address network bytes (cryptonote_config.h).
 inline constexpr std::uint64_t kPrefixMainnetStd = 18, kPrefixMainnetInt = 19, kPrefixMainnetSub = 42;
@@ -221,8 +216,9 @@ inline ::v37::ScriptRef donation_ref() {
 }
 inline ::v37::bytes32 donation_identity() { return ::v37::xmr::xmr_identity_key(donation_ref()); }
 
-// The mandatory marker output (declared LAST among the fixed outputs so the
-// canonical tail is [ ... owed ][ marker ][ sink? ]).
+// The mandatory donation output (declared LAST among the fixed outputs, and
+// paying the residual sink, so X6 folds the residual into it: the canonical
+// tail is [ ... owed ][ donation: max(1, residual) ], one output -- S1).
 inline x6::FixedOutput donation_marker() {
     x6::FixedOutput f;
     f.pay = donation_ref();
@@ -259,7 +255,24 @@ inline SplitWeight split_receipt_weight(std::uint64_t w, std::uint16_t d) {
 }
 
 // ---------------------------------------------------------------------------
-// Node-owner fee (roll at receipt mint)
+// The lane pushes of ONE PoW-committed receipt (every node, same order).
+//   gate OFF: (payee, off_weight)                 -- byte-identical to master
+//   gate ON : (payee, 65535 - d) [+ (donation, d) iff d > 0], d = the receipt's
+//             OWN give_author u16 (side_data_v2), never the folding node's.
+// ---------------------------------------------------------------------------
+inline std::vector<std::pair<::v37::ScriptRef, std::uint64_t>>
+receipt_lane_pushes(const ::v37::ScriptRef& payee, std::uint16_t give_author, bool fee_on,
+                    std::uint64_t off_weight = 1) {
+    std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> v;
+    if (!fee_on) { v.emplace_back(payee, off_weight); return v; }
+    const SplitWeight s = split_receipt_weight(kFeeReceiptWeight, give_author);
+    if (s.miner) v.emplace_back(payee, s.miner);
+    if (s.donation) v.emplace_back(donation_ref(), s.donation);
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Node-owner fee (roll at JOB ISSUE: the payee the job's rbind commits to)
 // ---------------------------------------------------------------------------
 // fee in basis points of a percent-of-100 (1% = 100 bp, 100% = 10000 bp).
 inline std::uint32_t pct_to_bp(double pct) {
@@ -272,121 +285,69 @@ inline std::uint32_t pct_to_bp(double pct) {
 inline bool owner_fee_hit(std::uint64_t roll, std::uint32_t fee_bp) {
     return fee_bp != 0 && (roll % 10000u) < fee_bp;
 }
-
-// ---------------------------------------------------------------------------
-// The minted receipt (XMR regtest carrier stand-in wire, one line):
-//   "R1 <kind:u8> <payload:128hex> <w:u64> <d:u16>\n"
-// The payee IS the receipt's identity (owner-fee substitution already
-// applied), d IS the give-author u16. Every node that reads the line folds it
-// the same way. Legacy "idx w" lines stay valid (d = 0).
-// ---------------------------------------------------------------------------
-struct MintedReceipt {
-    ::v37::ScriptRef payee;
-    std::uint64_t    w = 0;
-    std::uint16_t    d = 0;
-    bool             owner_substituted = false;   // mint-side bookkeeping only (not on the wire)
-};
-
-inline MintedReceipt mint_receipt(const ::v37::ScriptRef& miner,
-                                  const std::optional<::v37::ScriptRef>& owner,
-                                  std::uint32_t owner_fee_bp, std::uint16_t give_author,
-                                  std::uint64_t w, std::uint64_t roll) {
-    MintedReceipt r;
-    r.w = w;
-    r.d = give_author;
-    if (owner && owner_fee_hit(roll, owner_fee_bp)) { r.payee = *owner; r.owner_substituted = true; }
-    else r.payee = miner;
-    return r;
-}
-
-inline std::string encode_receipt_line(const MintedReceipt& r) {
-    static const char* hx = "0123456789abcdef";
-    std::string s = "R1 " + std::to_string(static_cast<unsigned>(r.payee.kind)) + " ";
-    for (std::uint8_t b : r.payee.payload) { s += hx[b >> 4]; s += hx[b & 15]; }
-    s += " " + std::to_string(r.w) + " " + std::to_string(r.d) + "\n";
-    return s;
-}
-
-inline std::optional<MintedReceipt> parse_receipt_line(const std::string& ln) {
-    if (ln.size() < 3 || ln.compare(0, 3, "R1 ") != 0) return std::nullopt;
-    unsigned kind = 0; char pay[129] = {0}; unsigned long long w = 0; unsigned d = 0;
-    if (std::sscanf(ln.c_str(), "R1 %u %128s %llu %u", &kind, pay, &w, &d) != 4) return std::nullopt;
-    if (std::strlen(pay) != 128 || w == 0 || d > kGiveAuthorScale || kind > 255) return std::nullopt;
-    MintedReceipt r;
-    r.payee.kind = static_cast<::v37::ScriptKind>(kind);
-    if (!::v37::xmr::is_xmr_kind(r.payee.kind)) return std::nullopt;
-    std::array<std::uint8_t, 32> a{}, b{};
-    const std::string ps(pay);
-    if (!hex32_of(ps.substr(0, 64).c_str(), a) || !hex32_of(ps.substr(64, 64).c_str(), b)) return std::nullopt;
-    r.payee = r.payee.kind == ::v37::xmr::XMR_SUB ? ::v37::xmr::make_xmr_sub(a, b) : ::v37::xmr::make_xmr_std(a, b);
-    r.w = w;
-    r.d = static_cast<std::uint16_t>(d);
-    return r;
-}
-
-// The lane pushes ONE receipt becomes (every node, same order): the miner
-// push first, then the donation push iff its share is non-zero.
-inline std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> receipt_pushes(const MintedReceipt& r) {
-    std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> v;
-    const SplitWeight s = split_receipt_weight(r.w, r.d);
-    if (s.miner) v.emplace_back(r.payee, s.miner);
-    if (s.donation) v.emplace_back(donation_ref(), s.donation);
-    return v;
+// The payee a job commits to: the owner on a hit (when one is configured),
+// else the miner. *substituted reports which (bookkeeping only).
+inline ::v37::ScriptRef choose_payee(const ::v37::ScriptRef& miner,
+                                     const std::optional<::v37::ScriptRef>& owner,
+                                     std::uint32_t owner_fee_bp, std::uint64_t roll,
+                                     bool* substituted = nullptr) {
+    const bool hit = owner && owner_fee_hit(roll, owner_fee_bp);
+    if (substituted) *substituted = hit;
+    return hit ? *owner : miner;
 }
 
 // ---------------------------------------------------------------------------
-// The marker rule over a coinbase's output list, identity-mapped.
+// The donation rule over a coinbase's output list, identity-mapped (S1).
 //
-// Canonical tail (X6 order [owed] ++ [fixed] ++ [sink?], marker LAST fixed,
-// sink := donation):   ... owed | D:1 (marker) | D:residual (sink, iff > 0)
+// Canonical tail (X6 order [owed] ++ [fixed], the residual FOLDED into the
+// last fixed output because it pays the sink):  ... owed | D:max(1, residual)
 //
-// Deterministic location, identical on every node:
-//   S: ids[n-1]==D && ids[n-2]==D && amt[n-2]==DUST -> marker n-2, sink n-1
-//   N: ids[n-1]==D && amt[n-1]==DUST                -> marker n-1, no sink
-//   otherwise: the marker is ABSENT -> REFUSE.
-// (S wins the one 1-piconero ambiguity [D-owed:1][marker:1] vs [marker:1]
-// [sink:1]; both nodes pick S, so the booking stays identical.)
-// Outputs to D BEFORE the marker are ordinary OWED outputs (give-author
-// credit) and are booked as ledger deductions; the marker and the sink are
-// coverage only (D1).
+// Deterministic location, identical on every node: the LAST output pays the
+// donation identity D with amount >= kDonationDustPico -> it is the donation
+// output; otherwise the donation output is ABSENT -> REFUSE. Outputs to D
+// BEFORE it are ordinary OWED outputs (give-author credit) and are booked as
+// ledger deductions; the donation output itself is coverage only (D1).
 // ---------------------------------------------------------------------------
 struct MarkerLocation {
     bool        ok = false;
     std::string why;
     std::size_t marker = 0;
-    bool        has_sink = false;
 };
 inline MarkerLocation locate_donation_marker(const std::vector<::v37::bytes32>& ids,
                                              const std::vector<std::uint64_t>& amounts,
                                              const ::v37::bytes32& D) {
     MarkerLocation m;
     const std::size_t n = ids.size();
-    if (n == 0 || amounts.size() != n) { m.why = "donation marker absent: no outputs"; return m; }
-    if (!(ids[n - 1] == D)) { m.why = "donation marker absent: the last output does not pay the donation address"; return m; }
-    if (n >= 2 && ids[n - 2] == D && amounts[n - 2] == kDonationDustPico) { m.ok = true; m.marker = n - 2; m.has_sink = true; return m; }
-    if (amounts[n - 1] == kDonationDustPico) { m.ok = true; m.marker = n - 1; m.has_sink = false; return m; }
-    m.why = "donation marker absent: no " + std::to_string(kDonationDustPico) +
-            "-piconero donation output at the canonical tail (last donation output = " + std::to_string(amounts[n - 1]) + ")";
+    if (n == 0 || amounts.size() != n) { m.why = "donation output absent: no outputs"; return m; }
+    if (!(ids[n - 1] == D)) { m.why = "donation output absent: the last output does not pay the donation address"; return m; }
+    if (amounts[n - 1] < kDonationDustPico) {
+        m.why = "donation output absent: the last donation output pays " + std::to_string(amounts[n - 1]) +
+                " < " + std::to_string(kDonationDustPico) + " piconero";
+        return m;
+    }
+    m.ok = true; m.marker = n - 1;
     return m;
 }
 
-// Serve-side property over the builder's canonical output list (roles known).
+// Serve-side property over the builder's canonical output list (roles known):
+// exactly ONE donation output, last, Fixed, >= 1 piconero, and NO separate
+// residual sink (the residual must have folded into it).
 inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutput>& outs,
                                               const ::v37::bytes32& D) {
     MarkerLocation m;
     const std::size_t n = outs.size();
-    std::size_t k = n;
-    if (n && outs[n - 1].role == x6::CoinbaseOutput::Role::Sink) {
-        if (!(outs[n - 1].identity == D)) { m.why = "the residual sink is not the donation address"; return m; }
-        k = n - 1; m.has_sink = true;
-    }
-    if (k == 0 || outs[k - 1].role != x6::CoinbaseOutput::Role::Fixed || !(outs[k - 1].identity == D) ||
-        outs[k - 1].amount != kDonationDustPico || !(outs[k - 1].pay == donation_ref())) {
-        m.why = "donation marker absent: the canonical coinbase does not end in the " +
-                std::to_string(kDonationDustPico) + "-piconero donation output (+ optional donation sink)";
+    for (const auto& o : outs)
+        if (o.role == x6::CoinbaseOutput::Role::Sink) {
+            m.why = "a separate residual-sink output is present: the residual must fold into the donation output (S1)";
+            return m;
+        }
+    if (n == 0 || outs[n - 1].role != x6::CoinbaseOutput::Role::Fixed || !(outs[n - 1].identity == D) ||
+        outs[n - 1].amount < kDonationDustPico || !(outs[n - 1].pay == donation_ref())) {
+        m.why = "donation output absent: the canonical coinbase does not end in the >= " +
+                std::to_string(kDonationDustPico) + "-piconero donation output (1 + residual)";
         return m;
     }
-    m.ok = true; m.marker = k - 1;
+    m.ok = true; m.marker = n - 1;
     return m;
 }
 

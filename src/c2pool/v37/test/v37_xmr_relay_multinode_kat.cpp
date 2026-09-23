@@ -90,8 +90,8 @@ struct TNode {
                 next_after = s->next_pos; dig = s->digest;
                 return true;
             },
-            [this](const Admitted& a, u64 pos, u64 next_after, const bytes32& dig) {
-                relay->on_pushed(a.id, pos, 1, a.raw, next_after, dig);
+            [this](const Admitted& a, u64 pos, u32 n_pushes, u64 next_after, const bytes32& dig) {
+                relay->on_pushed(a.id, pos, n_pushes, a.raw, next_after, dig);
             });
     }
     ~TNode() { relay->stop(); engine->stop(); }

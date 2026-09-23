@@ -191,7 +191,7 @@ struct XmrCoinbaseContext {
     // --- lane parameters (consensus once tapped; explicit flags until then) ---
     ::v37::ScriptRef      residual_sink;              // mandated absorber, XMR ref (REQUIRED, torsion-checked)
     ::v37::bytes32        residual_sink_identity{};   // its ledger identity_key (payout-map key)
-    std::vector<x6::FixedOutput> fixed;               // mandated fixed outputs: the protocol donation marker (fee model; NO finder output)
+    std::vector<x6::FixedOutput> fixed;               // mandated fixed outputs: empty, or the ONE donation output (fee model ON; NO finder output)
     std::uint64_t         h_min = 0;                  // piconero floor per owed output (dust = 0 on XMR)
     std::uint32_t         output_cap = 0;             // TOTAL outputs cap C (weight_aware_output_cap(...))
 
@@ -246,7 +246,12 @@ public:
             if (!::v37::xmr::xmr_ref_valid(f.pay))
                 return refuse("refused: a fixed output is not a valid XMR ref");
         }
-        if (ctx.output_cap < ctx.fixed.size() + 1)
+        // fee model S1: when the last fixed output pays the sink it absorbs the
+        // residual itself (x6::residual_folds_into_fixed) -- no sink slot.
+        const bool sink_folds = !ctx.fixed.empty() && ctx.fixed.back().pay == ctx.residual_sink &&
+                                ctx.fixed.back().identity == ctx.residual_sink_identity;
+        const std::size_t sink_slots = sink_folds ? 0 : 1;
+        if (ctx.output_cap < ctx.fixed.size() + sink_slots)
             return refuse(std::string("refused: ") + x6::to_string(x6::BuildError::CapTooSmall));
         if (reward_hint == 0)
             return refuse(std::string("refused: ") + x6::to_string(x6::BuildError::ZeroBudget));
@@ -294,12 +299,16 @@ public:
         };
 
         const unsigned cap_owed = static_cast<unsigned>(
-            std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - 1,
+            std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - sink_slots,
                                   std::numeric_limits<unsigned>::max()));
 
         if (source == KFairSource::W4Propose) {
             // W4 canon picks the set over budget - Σfixed with C = cap - fixed - sink.
-            const std::uint64_t owed_budget = reward_hint - fixed_sum;
+            // fee model S2: a folded donation output's minimum is NOT reserved
+            // here -- X6 sources it from the residual, else from the LARGEST
+            // owed output (allocate_exact_sum), so W4 proposes over it too.
+            const std::uint64_t owed_budget =
+                reward_hint - fixed_sum + (sink_folds ? ctx.fixed.back().amount : 0);
             auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
                 return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
                                                   : std::numeric_limits<std::uint64_t>::max();

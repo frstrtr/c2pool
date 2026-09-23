@@ -308,9 +308,20 @@ public:
     void set_extra_nonce_tail(std::vector<std::uint8_t> t) { m_tail = std::move(t); }
     [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override { return m_tail; }
 
+    // SEAM-1 (GAP-2 rbind): the per-job binding the template writes after the
+    // worker nonce. size 0 / no function => none (byte-identical template).
+    using ExtraNonceBindFn = std::function<bool(std::uint32_t extra_nonce, std::uint8_t* out)>;
+    void set_extra_nonce_bind(std::size_t size, ExtraNonceBindFn fn) { m_bind_size = fn ? size : 0; m_bind = std::move(fn); }
+    [[nodiscard]] std::size_t extra_nonce_bind_size() const override { return m_bind_size; }
+    [[nodiscard]] bool extra_nonce_bind(std::uint32_t extra_nonce, std::uint8_t* out) const override {
+        return m_bind_size && m_bind && m_bind(extra_nonce, out);
+    }
+
 private:
     X6SettlementSource() = default;
     std::vector<std::uint8_t> m_tail;   // recon(A+B credit)
+    std::size_t      m_bind_size = 0;   // SEAM-1
+    ExtraNonceBindFn m_bind;            // SEAM-1
 
     void fill_amounts(std::vector<std::uint64_t>& rewards) const {
         rewards.resize(m_cb.outputs.size());
@@ -347,7 +358,7 @@ struct BlockBytes {
     std::size_t nonce_offset = 0;            // 4-B header nonce, same offset in BOTH blobs (39 for v16 / 5-B timestamp varint)
     std::size_t miner_tx_offset = 0;         // == header size
     std::size_t extra_nonce_offset = 0;      // in full_blob: first byte of the 0x02 payload
-    std::size_t extra_nonce_size = 0;        // 4..14 (padded)
+    std::size_t extra_nonce_size = 0;        // 4..14 (padded) [+32 SEAM-1 rbind] [+44 credit-cut tail]
     std::size_t merkle_root_offset = 0;      // in full_blob: the 32-B root inside the 0x03 tag
     std::size_t miner_tx_size = 0;           // incl. trailing rct_type byte
     ::xmr::coin::Hash256 merkle_root{};      // MM commitment root patched at merkle_root_offset (== X6 mm_root)
@@ -524,6 +535,11 @@ struct AssemblyInputs {
     // recon(A+B credit): bytes appended to the 0x02 payload after the padded worker
     // nonce (the on-chain credit cut). Empty => byte-identical templates.
     std::vector<std::uint8_t>     extra_nonce_tail;
+    // SEAM-1 (GAP-2 rbind): bytes written right after the 4-byte worker nonce,
+    // per extra_nonce ([extra_nonce 4 | bind | padding | tail]). 0 / empty =>
+    // byte-identical templates. Size <= EXTRA_NONCE_BIND_MAX.
+    std::size_t                   extra_nonce_bind_size = 0;
+    X6SettlementSource::ExtraNonceBindFn extra_nonce_bind;
 };
 
 class XmrBlockAssembler {
@@ -608,6 +624,10 @@ public:
             std::unique_ptr<X6SettlementSource> seam = X6SettlementSource::build(in, subsidy, &sub);
             if (!seam) return fail("pass " + std::to_string(pass) + ": " + sub);
             seam->set_extra_nonce_tail(a.extra_nonce_tail);   // recon(A+B credit)
+            if (a.extra_nonce_bind_size > EXTRA_NONCE_BIND_MAX)
+                return fail("SEAM-1: extra_nonce_bind_size " + std::to_string(a.extra_nonce_bind_size) +
+                            " > EXTRA_NONCE_BIND_MAX " + std::to_string(EXTRA_NONCE_BIND_MAX));
+            seam->set_extra_nonce_bind(a.extra_nonce_bind_size, a.extra_nonce_bind);   // SEAM-1
 
             std::unique_ptr<XmrBlockTemplate> tpl(new XmrBlockTemplate(seam.get()));
             seam->begin_update();
@@ -679,7 +699,8 @@ private:
             return false;
         }
         rec.m_extra_nonce_size = full[eo - 1];
-        if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE || rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail
+        if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }
@@ -899,6 +920,21 @@ inline bool selfcheck(std::string& log) {
             C(t->outputs()[0].identity == id_of(0x45) && t->outputs()[5].identity == id_of(0x40), "K2 K_fair oldest-owed-first order preserved through the template");
             for (std::uint32_t en : {0u, 1u, 0xFFFFFFFFu}) check_template(C, *t, en, "K2");
         }
+        // K2b (fee-model S1): the SAME inputs with the fixed output BEING the
+        // residual sink (its ref AND identity) -> the residual folds into it:
+        // 7 outputs, no Sink role, the last (Fixed) output = its 5000000
+        // minimum + the residual.
+        AssemblyInputs b = a; b.settle.fixed[0].pay = b.settle.residual_sink; b.settle.fixed[0].identity = b.settle.residual_sink_identity;
+        auto tb = XmrBlockAssembler::build(b, &why);
+        if (C(tb != nullptr, "K2b build (6 owed + fixed-that-pays-the-sink) " + why) && t) {
+            const auto& ob = tb->outputs();
+            bool no_sink = true; for (const auto& o : ob) no_sink &= (o.role != CoinbaseOutput::Role::Sink);
+            C(ob.size() == 7 && no_sink && ob.back().role == CoinbaseOutput::Role::Fixed,
+              "K2b S1: 7 outputs (6 owed + ONE fixed), no separate sink output");
+            C(ob.back().amount == t->outputs()[6].amount + t->outputs()[7].amount && ob.back().amount > 5000000ull,
+              "K2b S1: the fixed output = its minimum + the residual (== K2's fixed + sink)");
+            for (std::uint32_t en : {0u, 7u}) check_template(C, *tb, en, "K2b");
+        }
     }
 
     // ---- K3: penalty zone, payee set CHANGES with the final reward -> fixpoint --
@@ -951,6 +987,11 @@ inline bool selfcheck(std::string& log) {
         AssemblyInputs c; c.miner = miner(1, 300000, 0); c.settle = lane_ctx(); c.settle.output_cap = 1;
         ::v37::xmr::settle::FixedOutput f; f.pay = std_ref(); f.amount = 1; f.identity = id_of(0x77); c.settle.fixed.push_back(f);
         C(XmrBlockAssembler::build(c, &why) == nullptr, "K6' output_cap too small for fixed + sink refused: " + why);
+        // K6'' (fee-model S1): a fixed output that IS the sink needs NO sink slot.
+        AssemblyInputs d = c; d.settle.fixed[0].identity = d.settle.residual_sink_identity;
+        auto td = XmrBlockAssembler::build(d, &why);
+        C(td != nullptr && td->outputs().size() == 1 && td->outputs()[0].role == CoinbaseOutput::Role::Fixed &&
+          td->outputs()[0].amount == td->reward(), "K6'' S1: output_cap 1 + a fixed output paying the sink -> ONE output = the whole reward " + why);
     }
 
     // ---- K7: GOOD-CITIZEN take_mempool_as_given (native arm) ------------------

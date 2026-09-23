@@ -465,6 +465,36 @@ if (BUILD_TESTING)
         target_link_libraries(${_gap2_kat} PRIVATE xmr_coin Threads::Threads)
         add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
     endforeach()
+    # ------------------------------------------------------------------
+    # SEAM-1 (rbind in the coinbase 0x02 region) + fee-model rulings S3/S4.
+    #
+    #   v37_xmr_fee_rbind_kat
+    #     real assembled templates with a per-job binder: payload =
+    #     [extra_nonce | rbind 32 | pad | tail], canonical re-derivation, the
+    #     patched Keccak fast path == a full re-hash, no binder => byte-
+    #     identical; relay mint -> check_structural(rbind) accepts, every
+    #     payee / give-author / cross-job swap refused at Bind; S3 ingest
+    #     (different give-author % -> identical lanes, donation == sum of the
+    #     receipts' u16, gate OFF = master, durable reload); S4 digest fold
+    #     (OFF keeps master's golden, ON refuses at HELLO); Family-A
+    #     WorkEvent::donation PoW-committed. Listed in BOTH build.yml
+    #     --target lists.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_fee_rbind_kat
+        v37_xmr_fee_rbind_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_fee_rbind_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_fee_rbind_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_fee_rbind_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_fee_rbind_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_fee_rbind_kat COMMAND v37_xmr_fee_rbind_kat)
+
     if (XMR_BUILD_RANDOMX AND TARGET randomx)
         target_link_libraries(xmr_receipt_bind_v2_kat PRIVATE randomx)
         target_include_directories(xmr_receipt_bind_v2_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
