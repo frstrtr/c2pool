@@ -896,6 +896,68 @@ void test_broadcast_reaches_a_link_opened_late() {
 }
 
 // -----------------------------------------------------------------------
+// THE QUIET NETWORK. relay_silent() is a proxy for "the peer holds us in
+// state_normal": it looks at whether the peer has relayed anything to us
+// lately. On a network where nobody relayed anything for a window -- a small
+// chain between blocks, a regtest, every link just re-dialled -- every healthy
+// peer looks silent, and a found block reached NOBODY. A block broadcast whose
+// proxy leaves no target now goes to every handshaked link; anything that is
+// not a block keeps the strict rule.
+void test_block_broadcast_falls_back_when_every_peer_is_silent() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    cfg.relay_silent_window_ms = 1'000;
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "quiet: peer up");
+    // One last push from the peer (its chain request, served), then silence.
+    // The link's silence clock starts at a stamp that is not its own first
+    // millisecond, so the window below is measured from a real event.
+    rig.pump(50);
+    daemon.request_chain({hash_of_byte(static_cast<std::uint8_t>(2'204'010 & 0xff))});
+    kat::check(rig.wait_for([&] {
+                   return daemon.count(levin::CMD_RESPONSE_CHAIN_ENTRY) == 1; }),
+               "quiet: the peer was served (it holds us in state_normal)");
+    rig.pump(1'500);                                   // nobody relays anything
+    rig.pump(100);                                     // one maintenance tick
+    kat::checkf(rig.pool->telemetry().relay_silent_peers == 1,
+                "quiet: the healthy peer is counted relay-silent (%zu)",
+                rig.pool->telemetry().relay_silent_peers);
+
+    auto broadcast = [&](std::uint32_t cmd) {
+        std::vector<std::uint8_t> frame(16, 0xee);
+        std::size_t       written = 99;
+        std::atomic<bool> done{false};
+        std::thread caller([&] {
+            written = rig.pool->broadcast_notify(cmd, frame);
+            done.store(true);
+        });
+        rig.wait_for([&] { return done.load(); }, 3000);
+        caller.join();
+        return written;
+    };
+
+    const std::size_t tx_written = broadcast(levin::CMD_NEW_TRANSACTIONS);
+    kat::checkf(tx_written == 0,
+                "quiet: a NON-block broadcast keeps the strict state_normal rule (%zu)",
+                tx_written);
+    const std::size_t written = broadcast(levin::CMD_NEW_FLUFFY_BLOCK);
+    kat::checkf(written == 1,
+                "quiet: a found block still reaches the one healthy peer (%zu)", written);
+    kat::check(rig.wait_for([&] { return daemon.count(levin::CMD_NEW_FLUFFY_BLOCK) >= 1; }),
+               "quiet: the 2008 arrived at the peer");
+    kat::check(daemon.count(levin::CMD_NEW_TRANSACTIONS) == 0,
+               "quiet: and the transaction frame did not");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
 void test_broadcast_with_no_peers_is_zero() {
     // The never-silent-drop rule: a found block that reached nobody must report
     // zero loudly, not shrug.
@@ -1102,6 +1164,7 @@ int main(int argc, char** argv) {
     test_serving_no_common_block_closes();
     test_push_traffic_and_broadcast();
     test_broadcast_reaches_a_link_opened_late();
+    test_block_broadcast_falls_back_when_every_peer_is_silent();
     test_broadcast_with_no_peers_is_zero();
     test_refill_across_several_daemons();
     test_unreachable_address_backs_off();
