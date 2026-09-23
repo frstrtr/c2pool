@@ -47,10 +47,13 @@
 #     table (8+4 bytes per slot, ~3 GB at mainnet scale) plus a few in-flight
 #     RPC batches -- it no longer grows with the output count.
 #   * CHECKPOINT + --resume. Every --checkpoint-blocks / --checkpoint-secs a
-#     small JSON checkpoint (height, frontier, file sizes, both MMR peak sets)
-#     is written atomically (temp + fsync + rename). --resume truncates the
-#     record files back to the checkpoint and continues; H_a is pinned by the
-#     checkpoint, so a resumed run commits to the same anchor block.
+#     small JSON checkpoint (height, frontier, file sizes, both MMR peak sets,
+#     a sha256 per record file and a digest over itself) is written atomically
+#     (temp + fsync + rename). --resume truncates the record files back to the
+#     checkpoint, re-hashes them against it, re-derives the peaks from the leaf
+#     files and continues; H_a is pinned by the checkpoint, so a resumed run
+#     commits to the same anchor block. Anything that does not add up is
+#     refused -- a damaged state never becomes a different anchor.
 #   * STREAMED SNAPSHOT. The ChainOutputSet snapshot is the header followed by
 #     the four record files, each prefixed with its count, so it is copied to
 #     disk in fixed-size chunks rather than assembled in memory.
@@ -596,7 +599,7 @@ def self_check(b):
 # report the block's height and the tx's own output key, no tx may be missed,
 # and prev_id must chain block to block from genesis to H_a.
 
-WALK_STATE_VERSION = 1
+WALK_STATE_VERSION = 2   # 2: checkpoint carries per-file sha256 + its own digest
 REC_OUTPUT = 80        # pubkey32 | commitment32 | u64 unlock_time | u64 height
 REC_OUT_LEAF = 40      # leaf32 | u64 first_output_index
 REC_KI_LEAF = 32
@@ -765,7 +768,12 @@ def fetch_batch(rpc, a, b, tx_chunk=1000, out_chunk=5000):
 
 class RecFile:
     """Append-only file of fixed-size records with its own write buffer, so a
-    record can be read back (read_at) whether or not it has reached the disk."""
+    record can be read back (read_at) whether or not it has reached the disk.
+    A running sha256 over everything appended (digest()) goes into each
+    checkpoint; --resume re-hashes the truncated file against it, and the
+    snapshot writer re-hashes what it streams, so a record file that changed
+    under the walk (bit rot, a hand edit, a wrong truncation) is refused
+    instead of becoming a different snapshot."""
 
     FLUSH_AT = 8 << 20
 
@@ -778,6 +786,7 @@ class RecFile:
             raise RuntimeError("%s: size %d is not a multiple of %d" % (path, size, rec))
         self.flushed = size
         self.buf = bytearray()
+        self.hasher = hashlib.sha256()      # valid only after truncate()/rehash()
 
     @property
     def nbytes(self):
@@ -795,9 +804,22 @@ class RecFile:
                                "damaged, cannot resume" % (self.path, self.flushed, want))
         os.ftruncate(self.fd, want)
         self.flushed = want
+        self.rehash()
+
+    def rehash(self):
+        """Recompute the running sha256 from the file's current bytes."""
+        h = hashlib.sha256()
+        for blob in self.iter_chunks(self.flushed):
+            h.update(blob)
+        self.hasher = h
+        return h.hexdigest()
+
+    def digest(self):
+        return self.hasher.hexdigest()
 
     def append(self, b):
         self.buf += b
+        self.hasher.update(b)
         if len(self.buf) >= self.FLUSH_AT:
             self.flush()
 
@@ -821,8 +843,11 @@ class RecFile:
             return bytes(self.buf[o:o + self.rec])
         return os.pread(self.fd, self.rec, off)
 
-    def iter_chunks(self, nbytes, chunk=16 << 20):
-        """Yield the first `nbytes` bytes of the file (flush first)."""
+    def iter_chunks(self, nbytes, chunk=0):
+        """Yield the first `nbytes` bytes of the file (flush first), in chunks
+        that hold whole records (default ~16 MB)."""
+        if chunk <= 0:
+            chunk = max(self.rec, (16 << 20) // self.rec * self.rec)
         off = 0
         while off < nbytes:
             b = os.pread(self.fd, min(chunk, nbytes - off), off)
@@ -899,6 +924,28 @@ class KiSet:
 
 def _mmr_to_json(m):
     return {"leaf_count": m.leaf_count, "peaks": [p.hex() for p in m.peaks]}
+
+
+def _checkpoint_digest(cp):
+    """sha256 over the checkpoint's other fields, canonically encoded, so a
+    checkpoint whose bytes changed after it was written is refused rather than
+    resumed (a wrong peak or count would otherwise walk on into a different
+    anchor or snapshot)."""
+    body = {k: v for k, v in cp.items() if k != "digest"}
+    return hashlib.sha256(json.dumps(body, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def _mmr_from_leaf_file(rf):
+    """Re-derive the MMR peaks from a leaf record file (leaf = first 32 bytes
+    of each record); the resume check that the checkpoint's peaks are the
+    peaks of the leaves that will be streamed into the snapshot."""
+    m = Mmr()
+    rec = rf.rec
+    for blob in rf.iter_chunks(rf.count * rec):
+        for o in range(0, len(blob), rec):
+            m.append(blob[o:o + 32])
+    return m
 
 
 def _mmr_from_json(j):
@@ -1026,6 +1073,9 @@ class WalkState:
         if int(cp.get("version", 0)) != WALK_STATE_VERSION:
             raise SystemExit("checkpoint version %s != %d" % (cp.get("version"),
                                                                WALK_STATE_VERSION))
+        if cp.get("digest") != _checkpoint_digest(cp):
+            raise SystemExit("%s: digest mismatch -- the checkpoint was altered "
+                             "after it was written; cannot resume" % self.cp_path)
         for k, want in (("net", self.net), ("h_a", self.h_a),
                         ("h_a_id", self.h_a_id), ("genesis_id", self.genesis_id)):
             if cp.get(k) != want:
@@ -1039,14 +1089,33 @@ class WalkState:
         self.ki_mmr = _mmr_from_json(cp["ki_mmr"])
         self.complete = bool(cp.get("complete"))
         counts = cp["counts"]
-        for key, _, _ in self.FILES:
-            self.files[key].truncate(int(counts[key]))
+        hashes = cp["hashes"]
+        t0 = time.time()
+        for key, name, _ in self.FILES:
+            rf = self.files[key]
+            rf.truncate(int(counts[key]))       # re-hashes the kept bytes
+            if rf.digest() != hashes[key]:
+                raise SystemExit("%s: sha256 of the %d checkpointed bytes does not "
+                                 "match the checkpoint -- the record file changed "
+                                 "after the checkpoint was written; cannot resume"
+                                 % (rf.path, rf.nbytes))
+        log("resume: %d record files re-hashed against the checkpoint in %.1fs"
+            % (len(self.FILES), time.time() - t0))
         if (self.files["outputs"].count != self.frontier
                 or self.files["out_leaves"].count != self.height
                 or self.files["ki_leaves"].count != self.height
                 or self.out_mmr.leaf_count != self.height
                 or self.ki_mmr.leaf_count != self.height):
             raise SystemExit("checkpoint is internally inconsistent; cannot resume")
+        # the checkpoint's peaks must be the peaks of the leaf files themselves
+        t0 = time.time()
+        for key, mmr in (("out_leaves", self.out_mmr), ("ki_leaves", self.ki_mmr)):
+            got = _mmr_from_leaf_file(self.files[key])
+            if got.leaf_count != mmr.leaf_count or got.peaks != mmr.peaks:
+                raise SystemExit("checkpoint %s MMR peaks are not the peaks of %s; "
+                                 "cannot resume" % (key, self.files[key].path))
+        log("resume: MMR peaks re-derived from %d leaves per tree in %.1fs"
+            % (self.height, time.time() - t0))
         # rebuild the key-image dedupe from the spent file (sized up front)
         s = self.files["spent"].count
         bits = 20
@@ -1111,11 +1180,13 @@ class WalkState:
             "last_id": self.last_id.hex(),
             "frontier": self.frontier,
             "counts": {k: self.files[k].count for k, _, _ in self.FILES},
+            "hashes": {k: self.files[k].digest() for k, _, _ in self.FILES},
             "out_mmr": _mmr_to_json(self.out_mmr),
             "ki_mmr": _mmr_to_json(self.ki_mmr),
             "complete": complete,
             "written": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
+        cp["digest"] = _checkpoint_digest(cp)
         _atomic_write(self.cp_path, (json.dumps(cp, indent=1) + "\n").encode())
 
     def write_snapshot(self, path, tip_id):
@@ -1145,9 +1216,17 @@ class WalkState:
                 cnt = rf.count
                 out.write(_u64le(cnt))
                 total += 8
+                h = hashlib.sha256()
                 for blob in rf.iter_chunks(cnt * rec):
+                    h.update(blob)
                     out.write(blob)
                     total += len(blob)
+                if h.hexdigest() != rf.digest():
+                    out.close()
+                    os.unlink(tmp)
+                    raise RuntimeError("%s: bytes read back for the snapshot do not "
+                                       "hash to what was appended; snapshot not "
+                                       "written" % rf.path)
             out.flush()
             os.fsync(out.fileno())
         if os.path.getsize(tmp) != total:
