@@ -53,6 +53,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace v37 {
 namespace xmr {
@@ -96,6 +97,23 @@ static bool xmr_ref_shape_ok(const ::v37::ScriptRef& r) {
 bool residual_folds_into_fixed(const CoinbaseInputs& in) {
     return !in.fixed.empty() && in.fixed.back().pay == in.residual_sink &&
            in.fixed.back().identity == in.residual_sink_identity;
+}
+
+// ---------------------------------------------------------------------------
+// MERGE: the owed the input set holds for the fold identity (owed_in).
+static bool is_fold_payee(const CoinbaseInputs& in, const ::v37::ScriptRef& pay,
+                          const ::v37::bytes32& id) {
+    return id == in.residual_sink_identity && pay == in.residual_sink;
+}
+std::uint64_t fold_identity_owed(const CoinbaseInputs& in) {
+    if (!residual_folds_into_fixed(in)) return 0;
+    std::uint64_t s = 0;
+    for (const auto& e : in.owed) {
+        if (!is_fold_payee(in, e.pay, e.identity)) continue;
+        constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+        s = (e.owed > kMax - s) ? kMax : s + e.owed;
+    }
+    return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,8 +169,16 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
     // the K_fair pass runs over budget - (fixed_sum - that minimum).
     const std::uint64_t fold_min = fold ? in.fixed.back().amount : 0;
     std::uint64_t remaining = budget - (fixed_sum - fold_min);
+    // MERGE: the fold identity's own owed entry is paid here at its K_fair
+    // position like any payee, but takes no output slot: its payout is moved
+    // into the folded output after S2 (one output per fold identity).
+    std::size_t n_slots = 0;
     for (const auto& e : sorted) {
-        if (res.size() >= cap_owed) break;   // cap reached -> rest carries
+        const bool merge = fold && is_fold_payee(in, e.pay, e.identity);
+        if (!merge && n_slots >= cap_owed) {  // cap reached -> rest carries
+            if (fold) continue;               // (a later merge entry still needs no slot)
+            break;
+        }
         if (remaining == 0) break;           // budget exhausted -> rest carries
         if (e.owed < in.h_min) continue;     // below payout floor -> carry, no output
         std::uint64_t amt = std::min(e.owed, remaining);
@@ -165,6 +191,7 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
         o.amount = amt;
         o.role = CoinbaseOutput::Role::Owed;
         res.push_back(std::move(o));
+        if (!merge) ++n_slots;
         remaining -= amt;
     }
 
@@ -185,6 +212,20 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
         if (res[big].amount == 0) res.erase(res.begin() + static_cast<std::ptrdiff_t>(big));
     }
 
+    // ---- MERGE: move the fold identity's K_fair payout (after S2) into the
+    // folded output -- exactly one output pays it, the last one.
+    std::uint64_t merged_owed = 0;
+    if (fold) {
+        for (std::size_t i = 0; i < res.size();) {
+            if (is_fold_payee(in, res[i].pay, res[i].identity)) {
+                merged_owed += res[i].amount;
+                res.erase(res.begin() + static_cast<std::ptrdiff_t>(i));
+            } else {
+                ++i;
+            }
+        }
+    }
+
     // ---- fixed mandated outputs (declared order) ----
     for (std::size_t i = 0; i < in.fixed.size(); ++i) {
         const auto& f = in.fixed[i];
@@ -195,7 +236,14 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
         o.role = CoinbaseOutput::Role::Fixed;
         // S1: the folded (last) fixed output IS the residual absorber: it pays
         // max(minimum, residual) == everything the owed pass left.
-        if (fold && i + 1 == in.fixed.size()) { o.amount = remaining; remaining = 0; }
+        // MERGE: plus the fold identity's K_fair payout; owed_part books what it
+        // receives against what it is owed first (see the header).
+        if (fold && i + 1 == in.fixed.size()) {
+            o.amount = merged_owed + remaining;
+            remaining = 0;
+            const std::uint64_t over_min = o.amount > fold_min ? o.amount - fold_min : 0;
+            o.owed_part = std::min(fold_identity_owed(in), over_min);
+        }
         res.push_back(std::move(o));
     }
 

@@ -1222,7 +1222,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
         for (const auto& k : cba_fx->keys()) keys.push_back(k);
         // fee model ON (S1/S4): the residual sink IS the donation address, and a lane coinbase
-        // without the one mandatory donation output (1 + residual) is REFUSED here (every node,
+        // without the one mandatory donation output (owed + 1 + residual) is REFUSED here (every node,
         // own wins included). OFF: master's booking against the configured residual sink.
         if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))
             return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, cba_fx->pay_of());
@@ -1653,7 +1653,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     // RandomX gate / live submitter / finalize-connect through serve_and_run.
     if (cfg.coinbase == CoinbaseMode::V37Settlement) {
         // fee model (xmr/xmr_fee_model.hpp, LaneParams::fee). ON: the residual sink IS
-        // the protocol donation address and the ONE donation output (1 + residual, S1) is a
+        // the protocol donation address and the ONE donation output (owed + 1 + residual, S1 + merge) is a
         // mandated fixed output, both from compiled-in constants -- no node can omit or
         // redirect them. OFF (default): master's per-node residual sink, byte-identical.
         namespace fee = ::c2pool::v37n::xmr::fee;

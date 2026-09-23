@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,6 +57,9 @@ struct CoinbaseBooking {
     // recon(A+B credit): the ON-CHAIN CREDIT CUT (0x02 tail), if the coinbase carries one.
     bool           has_credit_cut = false;
     credit::CreditCut credit_cut;
+    // fee model: the donation owed_in commitment (0x02 tail "V37D"), if any.
+    // Read by decode_lane_coinbase_fee only; gate OFF coinbases carry none.
+    std::optional<std::uint64_t> donation_owed_in;
 };
 
 // candidates: newest first. keys: every identity this node can resolve via pay_of.
@@ -107,6 +111,7 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     if (!matched) { b.why = "lane-root-unknown: 03 root matches none of " + std::to_string(candidates.size()) + " candidate digests (other lane, or this node's ledger history does not (yet) contain the winner's build digest -- retried as the ring advances)"; return b; }
     b.is_lane = true;
     if (const auto cc = credit::parse_from_tx_extra(got.tx_extra)) { b.has_credit_cut = true; b.credit_cut = *cc; }   // recon(A+B credit)
+    b.donation_owed_in = fee::parse_donation_owed(got.tx_extra);   // fee model (used by the gate-ON booking only)
 
     // --- r and R ---
     set_::CoinbaseInputs in;
@@ -150,9 +155,11 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
 // fee model (xmr_fee_model.hpp): the every-node REFUSE-IF-ABSENT booking rule.
 // The residual sink IS the donation address, so every vout to it was tallied
 // as coverage above; this locates the ONE mandatory donation output (last,
-// >= 1 piconero = the V36 marker + the folded residual, ruling S1), refusing
-// the coinbase when it is absent, and re-books the donation's earlier outputs
-// (give-author credit, paid as ordinary K_fair owed) as owed deductions.
+// >= 1 piconero; the donation's K_fair payout + the V36 marker + the folded
+// residual, rulings S1 + 09-23), refusing the coinbase when it is absent,
+// when an earlier output also pays the donation, or when the owed_in tail is
+// missing, and books min(owed_in, amount - 1) of it as the donation's payout
+// (give-author credit settled, an owed deduction); the rest stays coverage.
 // Only a FeeModelGate-ON node calls this; gate OFF books with
 // decode_lane_coinbase() against its configured sink, exactly as master.
 // ---------------------------------------------------------------------------
@@ -167,7 +174,8 @@ inline CoinbaseBooking decode_lane_coinbase_fee(const std::vector<std::uint8_t>&
                                              fee::donation_identity(), std::forward<PayOf>(pay_of));
     if (!b.ok) return b;
     std::string w;
-    if (!fee::apply_donation_rule(b.out_identity, b.out_amount, fee::donation_identity(), b.payout, b.sink_total, &w)) {
+    if (!fee::apply_donation_rule(b.out_identity, b.out_amount, fee::donation_identity(), b.donation_owed_in,
+                                  b.payout, b.sink_total, &w)) {
         b.ok = false;
         b.why = "donation-refused: " + w + " (the lane coinbase must carry the mandatory donation output)";
         b.payout.clear();

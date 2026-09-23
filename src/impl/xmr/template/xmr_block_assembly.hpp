@@ -108,6 +108,11 @@ namespace c2pool::xmr::assembly {
 // consumer-tree KAT v37_xmr_credit_cut_kat (which may include both headers;
 // the impl tree must not include the consumer tree).
 inline constexpr std::size_t CREDIT_CUT_TAIL_BYTES = 44;  // 4 magic + 8 u64 P + 32 spine
+// fee model (donation-output merge): the donation owed_in commitment rides
+// just before the credit cut (consumer tree xmr_fee_model.hpp,
+// fee::kDonationOwedTailBytes == 12, "V37D" || u64le; mirrored and
+// static_asserted in v37_xmr_fee_model_kat). Present only under the gate.
+inline constexpr std::size_t DONATION_OWED_TAIL_BYTES = 12;  // 4 magic + 8 u64 owed_in
 
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
@@ -276,7 +281,7 @@ public:
             m_wanted = reward;
             return false;   // template falls back; the assembler rebuilds at `reward`
         }
-        for (std::size_t i = 0; i < alt.size(); ++i) m_cb.outputs[i].amount = alt[i].amount;
+        for (std::size_t i = 0; i < alt.size(); ++i) { m_cb.outputs[i].amount = alt[i].amount; m_cb.outputs[i].owed_part = alt[i].owed_part; }
         set_budget(m_in, m_subsidy, reward);
         m_cb.budget = reward;
         fill_amounts(rewards);
@@ -700,7 +705,7 @@ private:
         }
         rec.m_extra_nonce_size = full[eo - 1];
         if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
-            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + DONATION_OWED_TAIL_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }

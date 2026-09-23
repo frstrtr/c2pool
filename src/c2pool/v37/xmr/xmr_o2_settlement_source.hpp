@@ -108,6 +108,7 @@
 #include <sharechain/v37/v37_descriptor_xmr.hpp>    // xmr_ref_valid, is_xmr_kind, xmr_precarrot_ok
 #include <sharechain/v37/v37_hash.hpp>              // bytes32
 #include <c2pool/v37/xmr/xmr_credit_cut.hpp>         // recon(A+B credit): the on-chain credit cut tail
+#include <c2pool/v37/xmr/xmr_fee_model.hpp>          // fee model: the donation owed_in tail (V37D)
 
 #include "impl/xmr/coin/xmr_crypto_types.hpp"       // Bytes32, PublicKey, SecretKey, Hash256
 #include "impl/xmr/settle/xmr_coinbase.hpp"         // X6: CoinbaseInputs, build_coinbase, allocate_exact_sum, ...
@@ -422,8 +423,20 @@ public:
     [[nodiscard]] std::uint64_t merkle_tree_data() const override { return 0; }
 
     // recon(A+B credit): the credit cut as the 0x02 tail (empty when the ctx has none).
+    // fee model: when the residual folds into the donation output (gate ON
+    // only), the donation owed_in commitment "V37D" u64le goes first, so the
+    // receive side splits the ONE donation output without the ledger
+    // (xmr_fee_model.hpp). owed_in is reward-independent (the snapshot's
+    // input set), so the tail is fixed for the snapshot's life.
     [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
-        return m_ctx.has_credit_cut ? credit::encode_tail(m_ctx.credit_cut) : std::vector<std::uint8_t>{};
+        std::vector<std::uint8_t> t;
+        if (x6::residual_folds_into_fixed(m_inputs))
+            t = fee::encode_donation_owed_tail(x6::fold_identity_owed(m_inputs));
+        if (m_ctx.has_credit_cut) {
+            const std::vector<std::uint8_t> c = credit::encode_tail(m_ctx.credit_cut);
+            t.insert(t.end(), c.begin(), c.end());
+        }
+        return t;
     }
 
     // =====================================================================

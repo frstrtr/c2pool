@@ -70,7 +70,7 @@ inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 //     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
 //     without a valid sink the daemon refuses to serve. Under --fee-model v1
 //     (LaneParams::fee) the ONE mandated fixed output is the protocol donation
-//     output (1 + residual) and the residual sink IS the donation address
+//     output (owed + 1 + residual) and the residual sink IS the donation address
 //     (xmr_fee_model.hpp, compiled-in -- no per-node knob).
 enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
 
