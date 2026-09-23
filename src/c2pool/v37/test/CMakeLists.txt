@@ -828,4 +828,10 @@ if (BUILD_TESTING)
     # --target lists.
     add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/payout/test
                      ${CMAKE_CURRENT_BINARY_DIR}/payout)
+
+    # V37 payout economics — CarriageGate + FeeFloorGate KAT (its own test dir
+    # beside the header, src/c2pool/v37/payout/carriage.hpp). SAME HOLLOW-GREEN
+    # GUARD: v37_payout_carriage_kat is ALSO on BOTH build.yml --target lists.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/payout/carriage/test
+                     ${CMAKE_CURRENT_BINARY_DIR}/payout_carriage)
 endif()
