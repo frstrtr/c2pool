@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 
 #include <core/target_utils.hpp>   // chain::bits_to_target / target_to_average_attempts
 #include <core/uint256.hpp>        // uint256 / uint288
@@ -165,14 +166,26 @@ struct WorkTargetInputs {
     uint64_t subsidy                 = 0;     ///< block subsidy (coinbasevalue)
     uint32_t block_bits              = 0;     ///< dashd block target bits
     double   donation_percentage     = 0.0;   ///< dev-donation % (Cap-2 payout adjust)
+    /// Miner-supplied share target (oracle username "ADDR/<difficulty>",
+    /// work.py:204-207 get_user_details). Set => BOTH caps are skipped (#865).
+    std::optional<uint256> miner_share_target;
 };
 
 // Full modulation: start from the unconstrained target (2**256-1) and apply
 // both caps in oracle order. The result is the per-miner desired_share_target
 // the job is built with. Faithful to work.py:308-326: desired starts at
 // 2**256-1, Cap 1 always considered, Cap 2 only when `dust_gate` is set.
+//
+// MINER OVERRIDE (#865): the oracle's whole modulation block sits under
+// `if desired_share_target is None:` (work.py:312), so a miner-supplied target
+// is used AS-IS — not min()'d against Cap 1, and Cap 2 never runs. The caller's
+// band clip (compute_share_target, [pre_target3//30, pre_target3]) still
+// applies afterwards, so an override can never leave the range peers accept.
 inline uint256 modulate_desired_share_target(const WorkTargetInputs& in)
 {
+    if (in.miner_share_target)
+        return *in.miner_share_target;
+
     uint256 desired;
     desired.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
