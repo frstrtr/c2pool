@@ -19,17 +19,19 @@ on:
       - ".github/workflows/xmr-anchor-gen-selftest.yml"
 
 env:
-  GIT_HTTP_LOW_SPEED_LIMIT: 1000
-  GIT_HTTP_LOW_SPEED_TIME: 20
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '20'
 
 jobs:
   selftest:
     name: XMR anchor-gen --selftest
     # Route to self-hosted for trusted events; fork PRs fall back to
     # GitHub-hosted ubuntu-24.04 (never run untrusted fork code self-hosted).
-    runs-on: ${{ (github.event_name != pull_request || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON([self-hosted,Linux,X64,c2pool-build]) || ubuntu-24.04 }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Run the anchor-gen selftest
-        run: python3 tools/xmr-anchor-gen/xmr_anchor_gen.py --selftest
+        run: |
+          python3 tools/xmr-anchor-gen/xmr_anchor_gen.py --selftest
+          echo "anchor-gen selftest rc=$?"
