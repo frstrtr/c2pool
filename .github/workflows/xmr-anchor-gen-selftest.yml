@@ -1,0 +1,37 @@
+name: XMR anchor-gen selftest
+
+# The anchor generator (tools/xmr-anchor-gen) is a Python tool that no other
+# workflow executes. This job runs its built-in selftest on every change to
+# it: pinned MMR roots that the C++ loader also checks, and the streamed
+# output-set snapshot compared against the in-memory serializer (with forced
+# key-image prefix collisions). It does not talk to a daemon.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "tools/xmr-anchor-gen/**"
+      - ".github/workflows/xmr-anchor-gen-selftest.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "tools/xmr-anchor-gen/**"
+      - ".github/workflows/xmr-anchor-gen-selftest.yml"
+
+env:
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '20'
+
+jobs:
+  selftest:
+    name: XMR anchor-gen --selftest
+    # Route to self-hosted for trusted events; fork PRs fall back to
+    # GitHub-hosted ubuntu-24.04 (never run untrusted fork code self-hosted).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run the anchor-gen selftest
+        run: |
+          python3 tools/xmr-anchor-gen/xmr_anchor_gen.py --selftest
+          echo "anchor-gen selftest rc=$?"
