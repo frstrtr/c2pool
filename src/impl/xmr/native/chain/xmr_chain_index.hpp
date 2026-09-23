@@ -351,15 +351,33 @@ public:
             ++chain_entries_accepted_;
             // Everything after the splice point that we do not already have is
             // what we want fetched. The SCHEDULE is the sync driver's business;
-            // the index only says what is missing and in what order.
+            // the index only says what is missing and in what order -- through
+            // refetch_wanted(), which hands out the part of this list that fits
+            // the fetch window above our tip.
+            //
+            // The index used to put the WHOLE list (up to 2048 ids) on the wire
+            // here as one span. The pool delivers a span only when all of its
+            // ~21 chunks are in, so nothing connected for the minutes that took;
+            // a peer drop lost all of it silently; every 20 s the driver asked
+            // another peer for a chain and a fresh 2048-span went out, until
+            // the span caps were full of redundant copies of the same blocks
+            // and the batches the driver could still get through landed far
+            // from the tip and parked. That was the mainnet catch-up livelock.
+            //
+            // Heights come from OUR row of the splice point, not the peer's
+            // start_height claim.
+            std::uint64_t base = e.start_height;
+            if (const auto h = rows_.height_of(e.ids[0])) base = *h;
+            else if (const AltBlock* a = alt_.find(e.ids[0])) base = a->height;
             wanted_.clear();
+            wanted_heights_.clear();
             for (std::size_t i = 1; i < e.ids.size(); ++i) {
                 if (rows_.contains(e.ids[i]) || alt_.contains(e.ids[i])) continue;
                 wanted_.push_back(e.ids[i]);
+                wanted_heights_.push_back(base + i);
                 if (wanted_.size() >= MAX_SPAN_IDS) break;
             }
-            if (fetcher_ && !wanted_.empty())
-                fetcher_->request_objects(p, wanted_, /*prune=*/true);
+            (void)p;
         }
         flush_events_();
     }
@@ -507,6 +525,7 @@ public:
         s.rows      = static_cast<std::uint64_t>(rows_.size());
         s.alt_rows  = static_cast<std::uint64_t>(alt_.size());
         s.orphans   = orphans_;
+        s.chain_entries = chain_entries_accepted_;
         s.reorgs    = journal_.committed();
         s.pow_verified = gate_.verified();
         s.pow_failed   = gate_.failed();
@@ -673,12 +692,25 @@ public:
     // answering". Membership is not enough: a bodiless fluffy announcement and
     // a row whose body has been evicted are both "known" and both still need
     // fetching, so the test is whether we have bytes we could re-apply.
+    //
+    // THE FETCH WINDOW. Only the part of `wanted_` within fetch_window_() of
+    // our tip is handed out: whatever we fetch beyond what the alt pool can
+    // hold while the gap below it fills is fetched to be evicted, and the
+    // eviction takes the blocks nearest the tip (the ones we asked for first).
+    // As the tip moves, the window moves with it.
     std::vector<Hash> refetch_wanted() const {
         std::lock_guard<std::mutex> lk(mu_);
         std::vector<Hash> out;
         out.reserve(wanted_.size() + refetch_.size());
-        for (const Hash& id : wanted_)
-            if (!have_body_locked_(id)) out.push_back(id);
+        // An entry id that has since connected is done with, whether or not
+        // its body is still cached (the entry cache is smaller than a 2048-id
+        // entry); one below the retained rows can no longer be used at all.
+        const std::uint64_t limit = rows_.tip_height() + fetch_window_();
+        for (std::size_t k = 0; k < wanted_.size(); ++k) {
+            if (wanted_heights_[k] > limit) break;
+            if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
+            if (!have_body_locked_(wanted_[k])) out.push_back(wanted_[k]);
+        }
         for (const Hash& id : refetch_)
             if (!have_body_locked_(id) && !contains_hash_(out, id)) out.push_back(id);
         return out;
@@ -802,6 +834,12 @@ private:
         // is what bodies_wanted() lists and what the switch refuses on, so it
         // has to be true for EVERY bodiless park, not only the fast-path one.
         const bool bodiless = !ev.input.bodies_complete;
+        // It arrived with its bodies: whatever becomes of it now, asking for it
+        // again is pointless. Without this the standing refetch list kept every
+        // parent it ever named, and once a connected block's body left the
+        // entry cache (and its row the retained window) the driver fetched it
+        // AGAIN -- to be parked as an orphan below the window.
+        if (!bodiless) erase_hash_(refetch_, r.id);
 
         const Hash prev = ev.input.parsed.header.prev_id;
         const std::uint8_t major = static_cast<std::uint8_t>(ev.input.parsed.header.major_version);
@@ -836,6 +874,32 @@ private:
                 r.why     = "parent is not in the index yet (park completed)";
                 return r;
             }
+            // monerod's "Received new block while syncing, ignored": while we
+            // are behind, a block claiming a height further above our tip than
+            // the alt pool can hold is not parked. Parking it evicts a block we
+            // need next, and its unknown parent starts a backward walk of
+            // one GET_OBJECTS per round trip from the network tip -- the refetch
+            // storm behind 45k-76k orphans on the mainnet dry run. The chain
+            // entry fetch reaches it in order; once synced, pushes park as
+            // before.
+            if (!synced_ && !own_mined && opts_.alt_max_blocks && !rows_.empty()
+                && ev.input.coinbase.height > rows_.tip_height() + opts_.alt_max_blocks) {
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "received a block far above our tip while syncing; ignored";
+                return r;
+            }
+            // Nor, ever, one claiming a height below the retained rows: no
+            // branch through it can be adopted (the switch refuses a fork point
+            // older than the window as OutOfWindow), so holding it only takes a
+            // slot from a block that can.
+            if (!own_mined && !rows_.empty()
+                && ev.input.coinbase.height < rows_.oldest_height()) {
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "parent unknown and below the retained window; ignored";
+                return r;
+            }
             AltBlock b;
             b.id             = r.id;
             b.prev_id        = prev;
@@ -852,7 +916,7 @@ private:
             r.outcome = OfferOutcome::ParkedOrphan;
             r.height  = ev.input.coinbase.height;
             r.why     = "parent is not in the index yet";
-            if (!contains_hash_(refetch_, prev)) refetch_.push_back(prev);
+            remember_refetch_(prev);   // bounded, like every other refetch entry
             return r;
         }
 
@@ -1730,9 +1794,20 @@ private:
              ? pb.tx_hashes.size() - b->entry.txs.size() : 0;
     }
 
+    // How far above our tip the chain-entry want list is handed out: half the
+    // alt pool, so the blocks in flight plus whatever parks meanwhile fit in it.
+    std::uint64_t fetch_window_() const {
+        if (!opts_.alt_max_blocks) return MAX_SPAN_IDS;
+        return opts_.alt_max_blocks >= 2 ? opts_.alt_max_blocks / 2 : 1;
+    }
+
     void remember_refetch_(const Hash& id) {
         if (!contains_hash_(refetch_, id)) refetch_.push_back(id);
         while (refetch_.size() > 256) refetch_.erase(refetch_.begin());
+    }
+
+    static void erase_hash_(std::vector<Hash>& v, const Hash& h) {
+        v.erase(std::remove(v.begin(), v.end(), h), v.end());
     }
 
     static bool contains_hash_(const std::vector<Hash>& v, const Hash& h) {
@@ -2186,6 +2261,7 @@ private:
         lt_mirror_.clear();
         lt_undo_.clear();
         wanted_.clear();
+        wanted_heights_.clear();
         refetch_.clear();
         queued_events_.clear();
         queued_tx_events_.clear();
@@ -2235,6 +2311,7 @@ private:
 
     std::map<std::string, PeerSyncData> peers_;   // keyed by peer_key_()
     std::vector<Hash> wanted_;
+    std::vector<std::uint64_t> wanted_heights_;   // parallel to wanted_
     std::vector<Hash> refetch_;
 
     std::vector<node::MainchainEvent> queued_events_;

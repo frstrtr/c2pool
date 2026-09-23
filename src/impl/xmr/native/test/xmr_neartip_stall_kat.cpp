@@ -73,6 +73,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -89,6 +90,7 @@
 #include "impl/xmr/native/consensus/xmr_block_parse.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
 #include "impl/xmr/native/node/xmr_chain_boot.hpp"
+#include "impl/xmr/native/node/xmr_sync_driver.hpp"
 #include "impl/xmr/native/p2p/chain_seeds.hpp"
 #include "xmr_input_consensus_golden.hpp"
 #include "xmr_p2p_kat_util.hpp"
@@ -720,11 +722,318 @@ void test_cohort_ignores_peers_behind_us() {
                 (unsigned long long)s2.cohort_height);
 }
 
+// ===========================================================================
+// D. the catch-up livelock (> alt-pool-size blocks outstanding)
+// ===========================================================================
+// Mainnet, format-2 anchor, ~2650 blocks behind: the tip sat at anchor+64/+128
+// for 6-25+ minutes (a whole run on the dry run), alt=512, orphans 45k-76k,
+// refetch climbing ~2/s with ~95% of chain requests "timing out". Four parts,
+// asserted on their own (D1, D2 here; D3 in xmr_chain_index_kat's wire test,
+// the silent span drop in xmr_peer_pool_kat) and then together in D4:
+//   D1 the alt pool evicted the OLDEST unresolved block -- the one nearest the
+//      tip, asked for first;
+//   D2 every push far above the tip was parked while behind, and its parent
+//      went onto an UNBOUNDED refetch list (one GET_OBJECTS per round trip,
+//      walking down from the network tip);
+//   D3 the index put a whole chain entry (up to 2048 ids) on the wire as ONE
+//      span, which the pool delivers only when all of its chunks are in, and
+//      the pool dropped a span over its caps silently after the driver had
+//      booked its ids as asked;
+//   D4 end to end, against a model of the pool (D-3 caps, a span delivered
+//      whole when its last <=100-id chunk lands, a peer dropping now and then
+//      and taking its spans with it) and the REAL SyncDriver.
+
+// D1 ---------------------------------------------------------------------
+void test_evict_far_unresolved_first() {
+    native::AltPool pool;
+    pool.set_caps(4, 0);
+    std::uint64_t seq = 0;
+    auto park = [&](std::uint64_t height) {
+        native::AltBlock b;
+        b.id             = tag_hash(height, 0x70);
+        b.prev_id        = tag_hash(height - 1, 0x71);   // unknown parent: unresolved
+        b.height         = height;
+        b.resolved       = false;
+        b.first_seen_seq = ++seq;
+        pool.insert(std::move(b));
+    };
+    park(101);                        // the next block we need: asked (and arrived) first
+    park(105);
+    park(104);
+    park(103);
+    park(102);                        // pool full: somebody goes
+    kat::check(pool.contains(tag_hash(101, 0x70)),
+               "D1: the unresolved block nearest the tip survives eviction "
+               "(on master the oldest arrival -- this one -- was the victim)");
+    kat::check(!pool.contains(tag_hash(105, 0x70)),
+               "D1: the farthest unresolved block is the one evicted");
+    kat::check(pool.size() == 4, "D1: the cap holds");
+}
+
+// D2 ---------------------------------------------------------------------
+void test_far_pushes_not_parked_while_behind() {
+    Rig rig;
+    if (!rig.ok) return;
+    const std::uint64_t N = 900;
+    for (std::uint64_t k = 0; k < N; ++k) rig.grow(false);
+    rig.advertise();
+    kat::check(!rig.idx->sync_state().synced, "D2: behind the cohort");
+
+    // 300 pushes of blocks 600..899 above the anchor: every one of them farther
+    // above our tip than the 512-block pool.
+    for (std::uint64_t h = kAnchorHeight + 600; h < kAnchorHeight + N; ++h) rig.push_full(h);
+    const std::size_t alt = rig.idx->alt_size();
+    const std::size_t rf  = rig.idx->refetch_wanted().size();
+    kat::checkf(alt == 0, "D2: far pushes are not parked while behind (alt %zu)", alt);
+    kat::checkf(rf == 0, "D2: and ask for no parents (refetch %zu)", rf);
+    kat::checkf(rig.idx->orphans_parked() == 0, "D2: none counted as parked (%llu)",
+                (unsigned long long)rig.idx->orphans_parked());
+
+    // A push NEAR the tip still parks (it is what a chain entry is about to
+    // explain), and its parent is asked for.
+    rig.push_full(kAnchorHeight + 10);
+    kat::check(rig.idx->have_block(rig.at(kAnchorHeight + 10).id), "D2: a near push still parks");
+
+    // And the refetch list is bounded on this path too. Synced (so pushes park
+    // wherever they claim to be), 450 parks with distinct unknown parents name
+    // at most 256 of them; on master the list grew by one per park, unbounded.
+    Rig r2;
+    if (!r2.ok) return;
+    r2.idx->force_synced(true);
+    for (std::uint64_t k = 0; k < 900; ++k) r2.grow(false);
+    for (std::uint64_t h = kAnchorHeight + 3; h < kAnchorHeight + 900; h += 2) r2.push_full(h);
+    kat::checkf(r2.idx->refetch_wanted().size() <= 256,
+                "D2: the refetch list stays bounded (%zu)", r2.idx->refetch_wanted().size());
+}
+
+// D4: the pool model ------------------------------------------------------
+class PoolModel final : public native::IChainFetcher {
+public:
+    explicit PoolModel(Rig& rig) : rig_(rig) {}
+
+    std::uint64_t kWireSteps = 3;   // steps (500 ms each) one wire round takes
+
+    struct Link {
+        PeerRef       ref;
+        bool          up = true;
+        std::uint64_t clock = 0;
+        struct Span { std::vector<Hash> ids; std::size_t done = 0; };
+        std::deque<Span>                 spans;
+        std::deque<std::vector<Hash>>    chain_asks;
+    };
+    std::vector<Link> links;
+
+    std::uint64_t spans_accepted = 0, spans_refused = 0, spans_lost = 0, chains = 0;
+
+    bool request_chain(const PeerRef& p, std::vector<Hash> locator, bool) override {
+        Link* l = find_(p);
+        if (!l || !l->up) return false;
+        l->chain_asks.push_back(std::move(locator));
+        ++chains;
+        return true;
+    }
+    bool request_objects(const PeerRef& p, std::vector<Hash> ids, bool) override {
+        Link* l = find_(p);
+        if (!l || !l->up || ids.empty() || ids.size() > native::MAX_SPAN_IDS) return false;
+        std::size_t total = 0;
+        for (const Link& x : links) total += x.spans.size();
+        if (l->spans.size() >= native::MAX_SPANS_PER_PEER || total >= native::MAX_SPANS_TOTAL) {
+            ++spans_refused;
+            return false;
+        }
+        l->spans.push_back({std::move(ids), 0});
+        ++spans_accepted;
+        return true;
+    }
+    bool request_fluffy_missing(const PeerRef&, const Hash&, std::uint64_t,
+                                std::vector<std::uint64_t>) override { return true; }
+    void penalize(const PeerRef&, native::PeerFault, const std::string&) override {}
+    std::vector<std::pair<PeerRef, PeerSyncData>> peers() const override {
+        std::vector<std::pair<PeerRef, PeerSyncData>> out;
+        for (const Link& l : links) if (l.up) out.emplace_back(l.ref, sync_());
+        return out;
+    }
+
+    // One wire round per link every kWireSteps: a chain answer if one is
+    // queued (it shares the wire with the span chunks), else one <=100-id
+    // chunk of the head span; the span reaches the index only when its LAST
+    // chunk is in.
+    void step() {
+        for (Link& l : links) {
+            if (!l.up) continue;
+            if (++l.clock % kWireSteps != 0) continue;
+            if (!l.chain_asks.empty()) {
+                answer_chain_(l, l.chain_asks.front());
+                l.chain_asks.pop_front();
+                continue;
+            }
+            if (l.spans.empty()) continue;
+            Link::Span& sp = l.spans.front();
+            sp.done = std::min(sp.ids.size(), sp.done + native::MAX_OBJECT_REQUEST_IDS);
+            if (sp.done < sp.ids.size()) continue;
+            std::vector<BlockEntry> blocks;
+            std::vector<Hash>       missed;
+            for (const Hash& h : sp.ids) {
+                const auto it = rig_.net_by_id.find(Rig::key(h));
+                if (it == rig_.net_by_id.end()) missed.push_back(h);
+                else blocks.push_back(rig_.net[it->second].full);
+            }
+            l.spans.pop_front();
+            rig_.boot->on_objects(l.ref, std::move(blocks), std::move(missed), rig_.net_top() + 1);
+        }
+    }
+
+    // close_peer(): the link and everything queued on it are gone.
+    void drop(std::size_t i) {
+        Link& l = links[i];
+        spans_lost += l.spans.size();
+        l.spans.clear();
+        l.chain_asks.clear();
+        l.up = false;
+        rig_.boot->on_peer_gone(l.ref);
+    }
+    void reconnect(std::size_t i) {
+        links[i].up = true;
+        rig_.boot->on_peer_sync_data(links[i].ref, sync_());
+    }
+
+private:
+    Link* find_(const PeerRef& p) {
+        for (Link& l : links) if (l.ref.addr == p.addr) return &l;
+        return nullptr;
+    }
+    PeerSyncData sync_() const {
+        PeerSyncData d;
+        d.current_height        = rig_.net_top() + 1;
+        d.top_id                = rig_.net.empty() ? rig_.anchor_id : rig_.net.back().id;
+        d.top_version           = 16;
+        d.cumulative_difficulty = U128{0, 1};
+        d.support_flags         = 1;
+        return d;
+    }
+    // monerod's find_blockchain_supplement, on the network's chain.
+    void answer_chain_(Link& l, const std::vector<Hash>& locator) {
+        std::uint64_t splice = 0;
+        Hash          splice_id{};
+        for (const Hash& h : locator) {
+            if (h == rig_.anchor_id) { splice = kAnchorHeight; splice_id = h; break; }
+            const auto it = rig_.net_by_id.find(Rig::key(h));
+            if (it != rig_.net_by_id.end()) { splice = rig_.net[it->second].height; splice_id = h; break; }
+        }
+        if (splice == 0) return;
+        native::ChainEntry e;
+        e.start_height = splice;
+        e.total_height = rig_.net_top() + 1;
+        e.ids.push_back(splice_id);
+        for (std::uint64_t h = splice + 1; h <= rig_.net_top() && e.ids.size() < 2001; ++h)
+            e.ids.push_back(rig_.at(h).id);
+        rig_.boot->on_chain_entry(l.ref, std::move(e));
+    }
+
+    Rig& rig_;
+};
+
+struct CatchUp {
+    std::uint64_t steps_to_tip  = 0;     // 0 = never reached
+    std::uint64_t longest_flat  = 0;     // steps without the tip moving, while behind
+    std::size_t   alt_max       = 0;
+    std::uint64_t orphans       = 0;
+    std::uint64_t spans_refused = 0, spans_lost = 0, chains = 0;
+    std::uint64_t chain_timeouts = 0;
+};
+
+// The live shape: the network 2600 blocks ahead of the anchor (the mainnet gap;
+// > the 512-block alt pool and > one 2048-id chain entry), three peers, one
+// wire round (a chain answer or a <=100-id chunk) every 3 s, a peer dropping
+// every 20 s and back 1 s later, and the network finding a block every 30 s
+// that every peer pushes to us. Steps are the driver's 500 ms ticks.
+//
+// On d24844b5 this reproduces the mainnet signature: the tip freezes at
+// anchor+128..+320 for the rest of the budget, alt=512, orphans in the tens of
+// thousands, a chain "timeout" roughly every 20 s.
+CatchUp run_catch_up(std::uint64_t budget_steps) {
+    CatchUp out;
+    Rig rig;
+    if (!rig.ok) return out;
+    const std::uint64_t GAP = 2600, WIRE = 6, DROP = 40, PUSH = 60;
+    for (std::uint64_t k = 0; k < GAP; ++k) rig.grow(false);
+
+    PoolModel pool(rig);
+    pool.kWireSteps = WIRE;
+    for (int i = 0; i < 3; ++i) {
+        PoolModel::Link l;
+        l.ref = peer(i == 0 ? "198.51.100.31:18080" : i == 1 ? "198.51.100.32:18080"
+                                                              : "198.51.100.33:18080",
+                     static_cast<std::uint64_t>(3100 + i));
+        pool.links.push_back(std::move(l));
+    }
+    for (std::size_t i = 0; i < pool.links.size(); ++i) pool.reconnect(i);
+
+    rt::SyncDriver driver(pool, *rig.boot, *rig.idx,
+                          native::p2p::genesis_id(native::p2p::XmrNet::Stagenet),
+                          [&] { return rig.boot->booted(); },
+                          [&] { return rig.idx->refetch_wanted(); },
+                          [&] { return rig.idx->bodies_wanted(); });
+
+    std::uint64_t now = 1'000'000, last_tip = rig.tip_height(), flat = 0;
+    std::size_t   dropped = SIZE_MAX;
+    for (std::uint64_t step = 1; step <= budget_steps; ++step) {
+        now += 500;
+        if (step % PUSH == 0) {                                // the network finds a block
+            rig.grow(false);
+            for (std::size_t i = 0; i < pool.links.size(); ++i)
+                if (pool.links[i].up)
+                    rig.boot->on_new_block(pool.links[i].ref, BlockEntry(rig.at(rig.net_top()).full),
+                                           rig.net_top() + 1, /*fluffy=*/false);
+        }
+        if (step % DROP == 0) { dropped = (step / DROP) % pool.links.size(); pool.drop(dropped); }
+        if (dropped != SIZE_MAX && step % DROP == 2) { pool.reconnect(dropped); dropped = SIZE_MAX; }
+
+        driver.tick(now);
+        pool.step();
+
+        out.alt_max = std::max(out.alt_max, rig.idx->alt_size());
+        const std::uint64_t tip = rig.tip_height();
+        if (tip == rig.net_top()) { out.steps_to_tip = step; break; }
+        if (tip == last_tip) out.longest_flat = std::max(out.longest_flat, ++flat);
+        else { flat = 0; last_tip = tip; }
+    }
+    out.orphans        = rig.idx->orphans_parked();
+    out.spans_refused  = pool.spans_refused;
+    out.spans_lost     = pool.spans_lost;
+    out.chains         = pool.chains;
+    out.chain_timeouts = driver.stats().chain_timeouts;
+    std::printf("  D4: steps_to_tip=%llu longest_flat=%llu alt_max=%zu orphans=%llu "
+                "chains=%llu chain_timeouts=%llu spans_refused=%llu spans_lost=%llu "
+                "(tip %llu / network %llu)\n",
+                (unsigned long long)out.steps_to_tip, (unsigned long long)out.longest_flat,
+                out.alt_max, (unsigned long long)out.orphans, (unsigned long long)out.chains,
+                (unsigned long long)out.chain_timeouts, (unsigned long long)out.spans_refused,
+                (unsigned long long)out.spans_lost, (unsigned long long)rig.tip_height(),
+                (unsigned long long)rig.net_top());
+    return out;
+}
+
+void test_catch_up_is_bounded() {
+    // 1200 steps = 10 simulated minutes for 2600 blocks.
+    const CatchUp c = run_catch_up(1200);
+    kat::checkf(c.steps_to_tip != 0,
+                "D4: catch-up across > alt-pool-size blocks reaches the network tip within "
+                "10 simulated minutes (on master the tip plateaus at anchor+64/+128)");
+    kat::checkf(c.longest_flat <= 60,
+                "D4: no plateau longer than 30 s while behind (longest %llu steps)",
+                (unsigned long long)c.longest_flat);
+    kat::checkf(c.alt_max <= 512, "D4: the alt pool never overflows (max %zu)", c.alt_max);
+}
+
 } // namespace
 
 int main() {
     test_strand_after_gap();
     test_held_parent_drains_child();
     test_cohort_ignores_peers_behind_us();
+    test_evict_far_unresolved_first();
+    test_far_pushes_not_parked_while_behind();
+    test_catch_up_is_bounded();
     return kat::report("xmr_neartip_stall_kat");
 }

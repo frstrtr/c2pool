@@ -374,17 +374,33 @@ static void test_wire_validation() {
     idx.on_chain_entry(p, entry_with({fake_id(777), fake_id(778)}, 10, 1000, {}));
     checkf(idx.chain_entries_refused() == 5, "wire: unknown splice point was not refused");
 
-    // 6. A well-formed entry is accepted, and what we do not have becomes a
-    //    fetch request -- chunked to monerod's 100-id request cap by the fetcher.
+    // 6. A well-formed entry is accepted, and what we do not have becomes the
+    //    want list the sync driver fetches from (refetch_wanted()). The index
+    //    itself puts nothing on the wire: a whole entry sent as one span was
+    //    the mainnet catch-up livelock (nothing connects until all ~21 chunks
+    //    of a 2048-id span are in, and a peer drop loses all of it).
     std::vector<Hash> ids{known};
     for (std::uint64_t i = 0; i < 250; ++i) ids.push_back(fake_id(1000 + i));
     idx.on_chain_entry(p, entry_with(ids, G::TEST_FIRST - 1, G::TEST_FIRST + 400, {}));
     checkf(idx.chain_entries_accepted() == 1, "wire: a well-formed chain entry was refused");
     checkf(idx.refetch_wanted().size() == 250,
            "wire: expected 250 wanted ids, got %zu", idx.refetch_wanted().size());
-    checkf(fetcher.chunking_ok(), "wire: an objects request broke the 100-id cap");
-    checkf(fetcher.object_requests.size() == 3,
-           "wire: 250 ids should chunk into 3 requests, got %zu", fetcher.object_requests.size());
+    checkf(fetcher.object_requests.empty(),
+           "wire: the index put %zu objects requests on the wire itself",
+           fetcher.object_requests.size());
+    checkf(idx.sync_state().chain_entries == 1, "wire: SyncState does not count the entry");
+
+    // 7. THE FETCH WINDOW: of a 2000-id entry only the part within half the alt
+    //    pool above our tip is handed out, in order -- fetching further ahead
+    //    than the pool can hold only feeds its eviction.
+    std::vector<Hash> big{known};
+    for (std::uint64_t i = 0; i < 2000; ++i) big.push_back(fake_id(5000 + i));
+    idx.on_chain_entry(p, entry_with(big, G::TEST_FIRST - 1, G::TEST_FIRST + 4000, {}));
+    const std::vector<Hash> win = idx.refetch_wanted();
+    checkf(win.size() == o.alt_max_blocks / 2,
+           "wire: a 2000-id entry hands out %zu ids, expected the %zu-id window",
+           win.size(), o.alt_max_blocks / 2);
+    checkf(!win.empty() && win.front() == big[1], "wire: the window does not start at the tip");
 }
 
 // =============================================================================

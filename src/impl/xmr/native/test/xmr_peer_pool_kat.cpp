@@ -520,6 +520,58 @@ void test_object_chunking_and_span_reassembly() {
 }
 
 // -----------------------------------------------------------------------
+// D-3 back-pressure is VISIBLE. A span over MAX_SPANS_PER_PEER used to be
+// accepted (true) and then dropped on the io thread; the sync driver had
+// already booked its ids as asked and sat out the 15 s re-ask interval with
+// nothing fetching them -- half of the mainnet catch-up livelock. Now the
+// refusal is the return value, and the slot comes back when the span lands.
+void test_span_caps_refuse_visibly() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "caps: peer up");
+
+    native::PeerRef ref;
+    ref.addr = daemon.key();
+    auto span = [](std::uint8_t tag) {
+        std::vector<Hash> ids;
+        for (int i = 0; i < 10; ++i) ids.push_back(hash_of_byte(static_cast<std::uint8_t>(tag + i)));
+        return ids;
+    };
+    const bool a = rig.pool->request_objects(ref, span(0x10), true);
+    const bool b = rig.pool->request_objects(ref, span(0x30), true);
+    const bool c = rig.pool->request_objects(ref, span(0x50), true);
+    kat::check(a && b, "caps: two spans fit the per-peer cap");
+    kat::check(!c, "caps: a third span on the same peer is REFUSED, not silently dropped");
+
+    kat::check(rig.wait_for([&] { return rig.chain.objects_calls.size() == 2; }),
+               "caps: both accepted spans complete");
+    const bool d = rig.pool->request_objects(ref, span(0x70), true);
+    kat::check(d, "caps: a completed span hands its slot back");
+    kat::check(rig.wait_for([&] { return rig.chain.objects_calls.size() == 3; }),
+               "caps: and the next span is fetched");
+
+    // A peer we do not have takes no slot: the refusal of its span must not
+    // leak a booking that would starve the total cap later.
+    native::PeerRef ghost;
+    ghost.addr = "127.0.0.1:1";
+    for (int i = 0; i < 8; ++i) (void)rig.pool->request_objects(ghost, span(0x90), true);
+    rig.pump(100);
+    kat::check(rig.pool->request_objects(ref, span(0xa0), true),
+               "caps: spans queued for a peer we do not have give their slots back");
+    kat::check(rig.wait_for([&] { return rig.chain.objects_calls.size() == 4; }),
+               "caps: and the real peer is still served");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
 // THE POST-ANCHOR CATCH-UP STALL (mainnet, 2026-09-23), on loopback.
 //
 // A node booted from a mainnet anchor ~2.6 K blocks behind asked for 100-block
@@ -993,6 +1045,7 @@ int main(int argc, char** argv) {
     test_primary_elected_without_maintenance_tick();
     test_object_chunking_and_span_reassembly();
     test_dense_mainnet_span_is_accepted_not_banned();
+    test_span_caps_refuse_visibly();
     test_request_chain_forces_genesis_terminus();
     test_serving_obligation();
     test_serving_no_common_block_closes();
