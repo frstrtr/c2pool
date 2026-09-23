@@ -460,8 +460,15 @@ if (BUILD_TESTING)
     #                               backfill (GETORDER/GETFRAMES), winner-order
     #                               repair, DoS (unknown opcodes kept, structural
     #                               strike without RandomX, ban on invalid PoW).
+    #   v37_xmr_relay_repair_ctx_kat the relay-repair defect: a winner-side
+    #                               order holding receipts mined on an ORPHANED
+    #                               Monero block the repairing node never saw
+    #                               (never Ready pre-fix); FB_GETCTX/FB_CTX
+    #                               codec, verify_block_ctx, bounded retries +
+    #                               failover, reconnect, recursive resolution,
+    #                               a lying context rejected.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp

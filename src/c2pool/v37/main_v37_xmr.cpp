@@ -749,11 +749,12 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             // stall_timeout MUST read 0 in a converged run; root_unknown retries
             // are normal (a receiver one ledger event behind the winner), terminal
             // must be 0.
-            std::printf("  r4/r5: late_unbooked=%llu (post_finalize=%llu) stall_timeout=%llu gate_stalls=%llu "
+            std::printf("  r4/r5: late_unbooked=%llu (post_finalize=%llu) stall_timeout=%llu (relay_repair_stall=%llu) gate_stalls=%llu "
                         "| lane_root_unknown retries=%llu resolved=%llu terminal=%llu\n",
                         static_cast<unsigned long long>(fs.late_unbooked),
                         static_cast<unsigned long long>(fs.late_booked_post_finalize),
                         static_cast<unsigned long long>(fs.booking_stall_timeout),
+                        static_cast<unsigned long long>(fs.relay_repair_stall_timeout),
                         static_cast<unsigned long long>(node.finalize_driver().booking_stalls()),
                         static_cast<unsigned long long>(fs.lane_root_unknown_retries),
                         static_cast<unsigned long long>(fs.lane_root_unknown_resolved),
@@ -1494,9 +1495,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         const auto st = relay_node->repair_poll(P, spine, hint, &ids);
         if (st != relay::XmrRelayNode::RepairState::Ready) {
             ++cut_pending;
+            // the stuck stage in words (FinalizeConnect prints it; past the retry
+            // bound it is the REFUSED reason -- a relay-repair stall, named as one)
             why = std::string("cut-pending: relay repair of P=") + std::to_string(P) + " spine=" + hex_of(spine).substr(0, 12) +
                   (st == relay::XmrRelayNode::RepairState::Exhausted ? " (no connected peer serves that order yet; retry)"
-                                                                     : " in flight (fetching the winner-side order + missing receipts)");
+                                                                     : " in flight (fetching the winner-side order + missing receipts)") +
+                  " [" + relay_node->repair_status(P, spine) + "]";
             return nullptr;
         }
         std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;
@@ -2214,6 +2218,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::function<void()> relay_tick;
         std::uint64_t relay_index_best = 0;
         std::map<std::uint64_t, node::Hash> relay_hdr_by_height;   // GAP-2: height -> block id (header cache)
+        std::map<std::string, std::vector<std::uint8_t>> relay_ctx_blobs;   // receipt context: block id hex -> monerod blob (bounded)
         if (relay_enabled()) {
             if (!serving) {
                 std::printf("REFUSED: the receipt relay needs a served template (--residual-sink-spend-hex/--residual-sink-view-hex)\n");
@@ -2450,6 +2455,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                         ::v37::bytes32 prev{}, seed{};
                         std::memcpy(prev.data(), t.prev_id.data(), 32); std::memcpy(seed.data(), t.seed_hash.data(), 32);
                         relay_chain.note(prev, t.height, seed);
+                        relay_chain.note_seed(::xmr::coin::rx_seedheight(t.height), seed);
                         relay_chain.set_tip(t.height);
                     }
                 }
@@ -2485,9 +2491,48 @@ static int run_live(const XmrNodeConfig& cfg) {
                             ::v37::bytes32 prev{}, seed{};
                             std::memcpy(prev.data(), b.id.data(), 32); std::memcpy(seed.data(), sit->second.data(), 32);
                             relay_chain.note(prev, b.height + 1, seed);
+                            relay_chain.note_seed(sh, seed);
                         }
                         while (relay_hdr_by_height.size() > 4096) relay_hdr_by_height.erase(relay_hdr_by_height.begin());
                     }
+                    // Receipt CONTEXT (the relay-repair fix): a block a receipt was
+                    // mined on that this node never saw (an orphaned sibling). ONE
+                    // monerod get_block by hash serves both sides: (1) OUR wants --
+                    // our monerod may hold it as an alternative block; (2) a PEER's
+                    // FB_GETCTX -- the minter's monerod had it as its tip. The blob
+                    // is verified by the relay (id recomputed, height from the
+                    // coinbase, parent-linked), never trusted. Bounded per tick.
+                    auto get_block_blob = [&](const ::v37::bytes32& id) -> std::vector<std::uint8_t> {
+                        const std::string hx = hex_of(id);
+                        if (auto it = relay_ctx_blobs.find(hx); it != relay_ctx_blobs.end()) return it->second;
+                        std::string body, err;
+                        transport.rpc_post(node::MoneroDaemonRpc::body_get_block(0, hx),
+                                           [&](const node::RpcResponse& r) { if (!r.ok()) err = r.error; else body.assign(r.body.begin(), r.body.end()); });
+                        std::vector<std::uint8_t> blob;
+                        if (!err.empty()) return blob;
+                        node::minijson::Value v;
+                        if (!node::minijson::parse(body, v)) return blob;
+                        const std::string bh = v["result"]["blob"].as_string();
+                        if (bh.empty() || !sub::from_hex(bh, blob) || blob.size() > relay::kCtxMaxBlob) { blob.clear(); return blob; }
+                        relay_ctx_blobs[hx] = blob;
+                        while (relay_ctx_blobs.size() > 128) relay_ctx_blobs.erase(relay_ctx_blobs.begin());
+                        return blob;
+                    };
+                    std::size_t budget = 16;
+                    for (const auto& id : relay_node->ctx_wants_local()) {
+                        if (!budget--) break;
+                        const auto blob = get_block_blob(id);
+                        if (!blob.empty()) relay_node->offer_ctx(id, blob, 0);
+                    }
+                    for (const auto& [pid, ids] : relay_node->drain_ctx_requests())
+                        for (const auto& id : ids) {
+                            if (!budget) { relay_node->send_ctx(pid, id, {}); continue; }   // over budget: "unknown" -> the asker fails over at once
+                            --budget;
+                            relay_node->send_ctx(pid, id, get_block_blob(id));
+                        }
+                } else {
+                    for (const auto& [pid, ids] : relay_node->drain_ctx_requests())   // P2P-first arm: no monerod RPC to serve from
+                        for (const auto& id : ids) relay_node->send_ctx(pid, id, {});
                 }
                 {
                     std::vector<std::string> ls;

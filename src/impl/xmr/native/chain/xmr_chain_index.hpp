@@ -689,11 +689,19 @@ public:
     // on every non-empty block (which would double inbound block bytes on
     // mainnet, where every non-empty fluffy block parks once). The park is
     // erased on connect, so this list empties itself.
+    //
+    // Every bodiless park carries the flag, including a push parked before its
+    // parent was known (the near-tip stall: such a park used to be resolved on
+    // the parent's arrival WITHOUT the flag and was then invisible to every
+    // re-ask path). Only RESOLVED parks are listed: an orphan whose parent we
+    // have never seen has not been through the proof-of-work gate, so asking
+    // for its bytes would let anyone who can push a bogus blob make us issue
+    // GET_OBJECTS on a timer. It is listed the moment its parent lands.
     std::vector<Hash> bodies_wanted() const {
         std::lock_guard<std::mutex> lk(mu_);
         std::vector<Hash> out;
         alt_.for_each([&out](const AltBlock& b) {
-            if (b.bodies_missing) out.push_back(b.id);
+            if (b.bodies_missing && b.resolved) out.push_back(b.id);
         });
         return out;
     }
@@ -766,6 +774,28 @@ private:
             return r;
         }
 
+        // A bodiless re-announcement (a fluffy push) of a block we already hold
+        // WITH its transactions must not replace the complete copy: every path
+        // below re-inserts, and trading bodies for a bare blob is how a block
+        // that could connect becomes one that cannot. Carry on with the copy
+        // we hold, so a re-push still gets the chance to connect it.
+        if (!ev.input.bodies_complete) {
+            if (const AltBlock* have = alt_.find(r.id);
+                have && have->has_entry && !have->bodies_missing) {
+                BlockEntry     held = have->entry;
+                EvaluatedBlock hev;
+                std::string    hw;
+                if (evaluate_block(held, hev, hw) == EvalStatus::Ok && hev.input.bodies_complete) {
+                    entry = std::move(held);
+                    ev    = std::move(hev);
+                }
+            }
+        }
+        // Every park below records whether it holds the transactions. The flag
+        // is what bodies_wanted() lists and what the switch refuses on, so it
+        // has to be true for EVERY bodiless park, not only the fast-path one.
+        const bool bodiless = !ev.input.bodies_complete;
+
         const Hash prev = ev.input.parsed.header.prev_id;
         const std::uint8_t major = static_cast<std::uint8_t>(ev.input.parsed.header.major_version);
         const std::uint8_t rules = hf_rules_version(major);
@@ -778,9 +808,25 @@ private:
             // Unknown parent. Park it: it may be the tip of a branch we cannot
             // see yet, and throwing it away would mean re-fetching it after the
             // chain entry that explains it arrives.
-            if (alt_.contains(r.id)) {
-                r.outcome = OfferOutcome::Duplicate;
-                r.why     = "already parked";
+            if (const AltBlock* have = alt_.find(r.id)) {
+                // Already parked. A copy that ADDS the bodies we were missing
+                // (or bytes we never had) replaces the park in place, keeping
+                // everything already learned about it; anything else is a
+                // duplicate. Dropping the complete copy here would leave the
+                // park bodiless for good.
+                if (have->has_entry && !(have->bodies_missing && !bodiless)) {
+                    r.outcome = OfferOutcome::Duplicate;
+                    r.why     = "already parked";
+                    return r;
+                }
+                AltBlock up       = *have;
+                up.entry          = std::move(entry);
+                up.has_entry      = true;
+                up.bodies_missing = bodiless;
+                alt_.insert(std::move(up));
+                r.outcome = OfferOutcome::ParkedOrphan;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "parent is not in the index yet (park completed)";
                 return r;
             }
             AltBlock b;
@@ -791,6 +837,7 @@ private:
             b.own_mined      = own_mined;
             b.entry          = std::move(entry);
             b.has_entry      = true;
+            b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
             if (peer) b.source = *peer;
             alt_.insert(std::move(b));
@@ -829,7 +876,8 @@ private:
             // difficulty on its branch, heaviest() skips it, and the fail-closed
             // bound in the switch refuses any branch containing it. Holding
             // bytes is the whole of what happens here.
-            if (const AltBlock* have = alt_.find(r.id); have && have->has_entry) {
+            if (const AltBlock* have = alt_.find(r.id);
+                have && have->has_entry && !(have->bodies_missing && !bodiless)) {
                 r.outcome = OfferOutcome::Duplicate;
                 r.why     = "already parked, unjudgeable: " + why;
                 return r;
@@ -844,6 +892,7 @@ private:
             b.own_mined      = own_mined;
             b.entry          = std::move(entry);
             b.has_entry      = true;
+            b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
             if (peer) b.source = *peer;
             alt_.insert(std::move(b));
@@ -880,6 +929,7 @@ private:
             b.adoptable      = false;   // the gate has not passed it
             b.entry          = std::move(entry);
             b.has_entry      = true;
+            b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
             if (peer) b.source = *peer;
             alt_.insert(std::move(b));
@@ -970,6 +1020,7 @@ private:
         b.own_mined      = own_mined;
         b.entry          = std::move(entry);
         b.has_entry      = true;
+        b.bodies_missing = bodiless;   // listed by bodies_wanted(); the switch refuses it
         b.first_seen_seq = ++seq_;
         if (peer) b.source = *peer;
         alt_.insert(std::move(b));
@@ -1146,6 +1197,15 @@ private:
                 }
                 c.pow_verified = pow_verdict_is_verified(pw.verdict);
                 c.adoptable    = c.pow_verified || pw.verdict == PowVerdict::Skipped;
+                // Resolved and adoptable is not connectable: a fluffy push parked
+                // before its parent landed holds the blob and NOT the
+                // transactions. Flag it here, where it first becomes a candidate,
+                // or nothing ever asks for them -- bodies_wanted() lists only
+                // flagged parks, refetch_wanted() skips ids whose blob we hold,
+                // and a chain entry skips ids already in the pool -- and the tip
+                // freezes one block below it (the mainnet format-2 dry run,
+                // h=3768570, fluffy_req=0 for the whole stall).
+                c.bodies_missing = !ev.input.bodies_complete;
 
                 alt_.insert(std::move(c));
                 stack.push_back(child_id);
@@ -1168,8 +1228,13 @@ private:
             // Copied out of the pool before anything is connected: connecting
             // mutates the caches a live pointer into the pool would outlive.
             std::optional<AltBlock> pick;
+            // A bodiless park is skipped, not picked: it cannot connect, and
+            // picking it first would hide a complete sibling behind it.
             for (const AltBlock* c : alt_.children_of(tip_id)) {
-                if (c->resolved && c->adoptable && c->has_entry) { pick = *c; break; }
+                if (c->resolved && c->adoptable && c->has_entry && !c->bodies_missing) {
+                    pick = *c;
+                    break;
+                }
             }
             if (!pick) return;
 
@@ -1182,7 +1247,14 @@ private:
             const ConnectOutcomeLocal co =
                 connect_to_tip_locked_(pick->entry, ev, pick->pow_verified, Hash{},
                                        pick->own_mined, why);
-            if (co.status != ConnectStatus::Ok) return;   // leave it parked, and say nothing new
+            if (co.status != ConnectStatus::Ok) {
+                // Leave it parked, and say nothing new -- but if what it lacks is
+                // its bodies, say so to bodies_wanted(), which is the only path
+                // that will ever ask for them.
+                if (co.status == ConnectStatus::BodiesMissing)
+                    if (AltBlock* p = alt_.find_mut(pick->id)) p->bodies_missing = true;
+                return;
+            }
             alt_.erase(pick->id);
         }
     }
@@ -1351,6 +1423,8 @@ private:
 
         // --- apply --------------------------------------------------------------------
         bool ok = true;
+        bool lacked_bodies = false;   // the failure was OUR missing bytes, not bad data
+        Hash lacked_id{};
         std::vector<Hash> applied;
         for (const AltBlock& b : branch) {
             EvaluatedBlock ev;
@@ -1359,7 +1433,15 @@ private:
             const std::uint64_t now = clock_ ? clock_() : 0;
             const ChainStateView::ConnectOutcome co =
                 view_.connect(b.entry, b.pow_verified, now, b.own_mined, w);
-            if (!co.ok) { ok = false; why = w; break; }
+            if (!co.ok) {
+                ok = false;
+                why = w;
+                if (co.connect == ConnectStatus::BodiesMissing) {
+                    lacked_bodies = true;
+                    lacked_id     = b.id;
+                }
+                break;
+            }
             // The difficulty the state computed from the rolled-back windows MUST
             // equal the one the branch walk computed, or one of the two is wrong
             // and neither may be trusted with a chain switch.
@@ -1398,11 +1480,23 @@ private:
                 push_long_mirror_(co.row.long_term_weight);
                 alt_.erase(co.row.id);
             }
-            alt_.erase_branch(cand_id);
-            journal_.close_rolled_back(seq, ReorgRefusal::ValidationFailed, why);
             // Nothing happened, so nothing is announced.
             queued_events_.resize(ev_mark);
             queued_tx_events_.resize(tx_mark);
+            if (lacked_bodies) {
+                // Not a consensus failure: a block on the branch is a bodiless
+                // park the pre-check above did not know about. Keep the branch
+                // (erasing only its top, as the ValidationFailed path does, left
+                // the bodiless block in place and peeled one pushed block per
+                // arrival, forever), flag the block so bodies_wanted() asks for
+                // it, and charge nobody.
+                if (AltBlock* p = alt_.find_mut(lacked_id)) p->bodies_missing = true;
+                journal_.close_rolled_back(seq, ReorgRefusal::MissingBodies, why);
+                ++chain_refusals_;
+                return false;
+            }
+            alt_.erase_branch(cand_id);
+            journal_.close_rolled_back(seq, ReorgRefusal::ValidationFailed, why);
             // A branch that fails consensus after passing proof of work is bad
             // data from whoever proposed it.
             if (cand_source.peer_id != 0 || !cand_source.addr.empty())

@@ -119,6 +119,42 @@ inline ::xmr::coin::Hash256 to_h(const bytes32& b) { ::xmr::coin::Hash256 h; std
 inline bytes32 from_h(const ::xmr::coin::Hash256& h) { bytes32 b; std::memcpy(b.data(), h.data(), 32); return b; }
 } // namespace detail
 
+// ── a receipt's Monero CONTEXT from a peer-served block blob (FB_CTX) ───────
+// `blob` must be monerod's block_to_blob of the block whose id is `want`
+// (header | miner_tx | varint n | n tx hashes). Checked from the bytes alone:
+// the miner_tx hash + the tx hashes rebuild tree_root, header | tree_root |
+// varint(n+1) is get_block_hashing_blob, and keccak256(varint(len) | that) must
+// be `want` -- so a peer cannot hand us a block other than the one asked for,
+// nor a coinbase height other than the one that block commits to. The CALLER
+// then requires `parent` to be a block it already knows at exactly `height`
+// (the chain link) and takes the RandomX seed from its OWN chain.
+struct BlockCtx {
+    bytes32       id{};
+    bytes32       parent{};
+    std::uint64_t height = 0;   // the block's own height (txin_gen); receipts on it are bin height + 1
+};
+inline bool verify_block_ctx(const bytes32& want, const std::vector<u8>& blob, BlockCtx& out, std::string* why = nullptr) {
+    auto bad = [&](const std::string& m) { if (why) *why = "ctx: " + m; return false; };
+    BlockLayout L; std::string w;
+    if (!parse_block_layout(blob, L, &w)) return bad(w);
+    const std::vector<u8> prefix(blob.begin() + static_cast<std::ptrdiff_t>(L.miner_tx_offset),
+                                 blob.begin() + static_cast<std::ptrdiff_t>(L.miner_tx_offset + L.prefix_size));
+    std::vector<::xmr::coin::Hash256> leaves;
+    leaves.push_back(::xmr::coin::coinbase_tx_hash(::xmr::coin::tx_prefix_hash(prefix)));
+    for (const auto& t : L.tx_hashes) leaves.push_back(detail::to_h(t));
+    const ::xmr::coin::Hash256 root = ::xmr::coin::tree_root(leaves);
+    std::vector<u8> hb(blob.begin(), blob.begin() + static_cast<std::ptrdiff_t>(L.header_size));
+    hb.insert(hb.end(), root.data(), root.data() + 32);
+    for (std::uint64_t v = leaves.size(); ; ) { const u8 c = static_cast<u8>(v & 0x7f); v >>= 7; hb.push_back(v ? (c | 0x80) : c); if (!v) break; }
+    std::vector<u8> pre;
+    for (std::uint64_t v = hb.size(); ; ) { const u8 c = static_cast<u8>(v & 0x7f); v >>= 7; pre.push_back(v ? (c | 0x80) : c); if (!v) break; }
+    pre.insert(pre.end(), hb.begin(), hb.end());
+    const bytes32 id = keccak_bytes(pre);
+    if (id != want) return bad("block id of the served blob != the id asked for");
+    out.id = id; out.parent = L.prev_id; out.height = L.height;
+    return true;
+}
+
 // Build the receipt for one share. `hashing_blob` must be the blob served for
 // (template_id, extra_nonce) WITH the share's nonce patched at nonce_offset.
 inline bool mint_receipt(const std::vector<u8>& full_blob, const std::vector<u8>& hashing_blob,
