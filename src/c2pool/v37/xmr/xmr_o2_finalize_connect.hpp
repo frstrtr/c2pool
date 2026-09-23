@@ -477,6 +477,11 @@ public:
         //                                old gate bound (hh <= h) let (b) through
         //                                silently: the alarm read 0 on a real fork.
         std::uint64_t late_unbooked = 0, booking_stall_timeout = 0;
+        // the subset of booking_stall_timeout whose cut-pending was a GAP-2 relay
+        // REPAIR still in flight (the winner-side order / its receipts / their
+        // Monero context never completed): a relay-repair STALL, named as one --
+        // never an anonymous "cut-pending" refusal of an honest block.
+        std::uint64_t relay_repair_stall_timeout = 0;
         std::uint64_t late_booked_post_finalize = 0;
         // R5: lane blocks whose 03 root matched no candidate digest, kept in the
         // retry set (never memoized) and re-decoded as the candidate ring advances;
@@ -898,9 +903,22 @@ public:
             if (why.rfind("not-lane:", 0) == 0) return;   // a stranger's block: nothing to book
             if (cut_pend) {      // R4: the receiver's lane never reached P within the retry bound
                 ++m_stats.booking_stall_timeout;
-                say("cba-ALARM booking_stall_timeout: chain lane block " + short_bid(bid) + " h=" +
-                    std::to_string(h) + " exhausted its booking retry bound still cut-pending (" + why +
-                    ") — releasing the finalize gate; credit for this height is REFUSED (payout -> node-local LIABILITY)");
+                if (why.find("relay repair of P=") != std::string::npos) {
+                    // GAP-2: the view at the winner's cut was being REPAIRED over the
+                    // relay and the repair did not complete. Refusing here is a
+                    // RELAY-REPAIR STALL of THIS node (its stuck stage is in `why`),
+                    // not evidence that the winner's block is dishonest.
+                    ++m_stats.relay_repair_stall_timeout;
+                    say("cba-ALARM relay_repair_stall_timeout: chain lane block " + short_bid(bid) + " h=" +
+                        std::to_string(h) + " -- the GAP-2 relay REPAIR of the winner's cut did NOT complete within the booking retry bound (" +
+                        std::to_string(m_o.retry_bound) + " attempts): " + why +
+                        " — this is a RELAY-REPAIR STALL on this node, NOT a lane divergence or a dishonest winner; releasing the finalize gate; "
+                        "credit for this height is REFUSED (payout -> node-local LIABILITY); operator's eyes needed on the relay");
+                } else {
+                    say("cba-ALARM booking_stall_timeout: chain lane block " + short_bid(bid) + " h=" +
+                        std::to_string(h) + " exhausted its booking retry bound still cut-pending (" + why +
+                        ") — releasing the finalize gate; credit for this height is REFUSED (payout -> node-local LIABILITY)");
+                }
             }
             m_root_unknown_bids.erase(bid);
             ++m_stats.refused;
