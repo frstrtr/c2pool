@@ -5084,7 +5084,7 @@ int main(int argc, char* argv[]) {
             // Wire the share creation hook so mining_submit() creates a real
             // V36 share in the tracker and broadcasts it to peers.
             web_server.get_mining_interface()->set_create_share_fn(
-                [&p2p_node, dev_donation, &share_creation_ready](const core::MiningInterface::ShareCreationParams& p) {
+                [&p2p_node, dev_donation, &share_creation_ready, &embedded_node](const core::MiningInterface::ShareCreationParams& p) {
                 // Counters for periodic status reporting
                 static std::atomic<uint64_t> s_call_count{0};
                 static std::atomic<uint64_t> s_guard_blocked{0};
@@ -5278,6 +5278,13 @@ int main(int argc, char* argv[]) {
                     // Mirrors the release-order fix in main_btc.cpp. All chain
                     // reads/mutations above are complete at this point.
                     tracker_lock.unlock();
+
+                    // G2 fill-budget settle: the one debit, when a share is
+                    // FOUND (DOA/orphan too). Before notify_local_share() so
+                    // the refresh it triggers already sees the advanced ramp.
+                    // Embedded only; RPC mode has no budget (deferred).
+                    if (embedded_node)
+                        embedded_node->settle_found_share(p.merkle_branches);
 
                     // Broadcast to all connected peers
                     try {
