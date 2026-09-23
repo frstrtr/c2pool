@@ -2051,7 +2051,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                             rxp->describe().c_str());
                 if (bind == relay::BindMode::None)
                     std::printf("relay: NOTE bind=none -- receipts are PoW-verified (opening -> tree_root -> RandomX >= share_diff) "
-                                "but the payee/give-author are NOT PoW-bound until SEAM-1 puts rbind in the coinbase 0x02 region\n");
+                                "but the payee/give-author are NOT PoW-bound (run --relay-bind rbind: SEAM-1 writes rbind into the coinbase 0x02 region)\n");
                 std::fflush(stdout);
             }
             // SEAM-1 (--relay-bind rbind): the per-JOB binding. The stratum server calls the
