@@ -117,6 +117,23 @@ int main() {
         p = lp; p.win.win_version = 1;                        C(moved(p, 2000, BindMode::None), "W4 win gate moves it");
         p = lp; p.nr.nr_version = 1;                          C(moved(p, 2000, BindMode::None), "W4 nr gate moves it");
         p = lp; p.mrr.activation_pos = 0;                     C(moved(p, 2000, BindMode::None), "W4 mrr gate moves it");
+        // STEP-0 hotfix: LaneParams::k_floor (the coinbase no-dust floor) is
+        // folded iff non-zero, so the XMR default (0) keeps the golden above
+        // and any node that sets a floor is refused at HELLO.
+        p = lp; p.k_floor = 1;                                C(moved(p, 2000, BindMode::None), "W4 k_floor 1 moves it");
+        p = lp; p.k_floor = ::v37::K_FLOOR_F_REF;             C(moved(p, 2000, BindMode::None), "W4 k_floor 10 moves it");
+        golden(C, "W4 lane_params_digest(family_a, 2000, none)",
+               hex(lane_params_digest(::v37::LaneParams::family_a(), 2000, BindMode::None)), "bef300a00a350c1ab405c6c002d2ef3dc217e02e7dbb7a50cface332303f5ba1");
+        {
+            Hello a; a.network = 3; a.chain_id = 7; a.share_diff = 2000; a.node_nonce = 1;
+            a.lane_params_digest = d0;
+            Hello b = a; b.node_nonce = 2;
+            b.lane_params_digest = lane_params_digest(::v37::LaneParams::family_a(), 2000, BindMode::None);
+            C(hello_mismatch(a, b).find("lane_params_digest") != std::string::npos,
+              "W4 a peer on another k_floor is REFUSED at HELLO, by name");
+            b.lane_params_digest = d0;
+            C(hello_mismatch(a, b).empty(), "W4 ...and the same k_floor is compatible");
+        }
         C(moved(lp, 2001, BindMode::None), "W4 share_diff moves it");
         C(moved(lp, 2000, BindMode::Rbind), "W4 bind mode moves it");
     }
