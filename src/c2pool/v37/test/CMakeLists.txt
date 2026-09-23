@@ -415,6 +415,45 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_credit_cut_kat COMMAND v37_xmr_credit_cut_kat)
 
     # ------------------------------------------------------------------
+    # GAP-2 stage 1 -- the real c2pool-to-c2pool XMR receipt relay
+    # (src/c2pool/v37/xmr/relay/, docs/xmr-lane/gap2-sharechain-relay-design.md).
+    #
+    #   xmr_relay_wire_kat          FB_HELLO/FB_RECEIPTS/FB_BLOCK_WON goldens,
+    #                               total/bounded decoders, namespace pins,
+    #                               side_data_v2 / rbind / lane_params_digest
+    #                               goldens, base58 address decode.
+    #   xmr_receipt_bind_v2_kat     mint -> structural check; every tamper is
+    #                               caught before RandomX; the exact PoW rule;
+    #                               REAL RandomX grind + verify under
+    #                               XMR_BUILD_RANDOMX (skipped otherwise).
+    #   v37_xmr_relay_multinode_kat three nodes over loopback TCP: HELLO gate,
+    #                               flood + dedup, canonical digests, reconnect
+    #                               backfill (GETORDER/GETFRAMES), winner-order
+    #                               repair, DoS (unknown opcodes kept, structural
+    #                               strike without RandomX, ban on invalid PoW).
+    # ------------------------------------------------------------------
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat)
+        add_executable(${_gap2_kat}
+            ${_gap2_kat}.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+        target_compile_features(${_gap2_kat} PRIVATE cxx_std_20)
+        target_include_directories(${_gap2_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+        target_compile_definitions(${_gap2_kat} PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+        target_link_libraries(${_gap2_kat} PRIVATE xmr_coin Threads::Threads)
+        add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
+    endforeach()
+    if (XMR_BUILD_RANDOMX AND TARGET randomx)
+        target_link_libraries(xmr_receipt_bind_v2_kat PRIVATE randomx)
+        target_include_directories(xmr_receipt_bind_v2_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+        target_compile_definitions(xmr_receipt_bind_v2_kat PRIVATE GAP2_WITH_RANDOMX)
+    endif()
+
+    # ------------------------------------------------------------------
     # M3 — R-ARMORDER, the switchable FIND path.
     #
     #   v37_xmr_m3_arm_order_kat
