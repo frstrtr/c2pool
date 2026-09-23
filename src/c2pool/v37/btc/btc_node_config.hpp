@@ -128,8 +128,12 @@ struct BtcNodeConfig {
     ::v37::ChainId  lane_chain = 0;
 
     // The digest-committed lane geometry. Defaults to the OQ-5 ratified default
-    // (LaneParams{}), the only geometry W4's geometry_is_ratified() admits.
-    ::v37::LaneParams lane_params{};
+    // geometry, the only geometry W4's geometry_is_ratified() admits, with the
+    // Family-A coinbase no-dust floor k_floor = f_ref = 10 (LaneParams::family_a,
+    // STEP-0 hotfix). k_floor is consensus (it decides the canonical coinbase)
+    // and is committed in the lane digest, so a node that runs a different
+    // value is refused at the cut, never silently forked.
+    ::v37::LaneParams lane_params = ::v37::LaneParams::family_a();
 
     // --- settlement finality (F1 driver) ------------------------------------
     // D_conf: blocks a found (coinbase-carrying) BTC-family block must be buried

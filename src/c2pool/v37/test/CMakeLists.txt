@@ -717,6 +717,22 @@ if (BUILD_TESTING)
     target_link_libraries(v37_s1c_convergence_kat Threads::Threads)
     add_test(NAME v37_s1c_convergence_kat COMMAND v37_s1c_convergence_kat)
 
+    # STEP-0 hotfix -- k_floor is a LaneParam (src/sharechain/v37/v37_lane.hpp
+    # LaneParams::k_floor). The W5 no-dust floor decides the canonical coinbase,
+    # so it is consensus: it used to be a node-code literal in btc_node.hpp (a
+    # silent owed_digest fork vector). The KAT pins: the constants (f_ref = 10,
+    # neutral 0), the digest-neutral-at-zero lane digest against the PRE-hotfix
+    # golden, the KFL1 commitment in the lane digest and the roundabout lane
+    # tag, the explicit S-1c refusal (cut_digest_mismatch) of a peer on another
+    # floor, identical coinbases on the same floor, and the floor being
+    # load-bearing over one ledger. Stdlib + Threads, MockCoinBackend +
+    # MemSettleStore. ALSO on BOTH build.yml --target lists (hollow-green rule).
+    add_executable(v37_kfloor_laneparam_kat v37_kfloor_laneparam_kat.cpp)
+    target_compile_features(v37_kfloor_laneparam_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_kfloor_laneparam_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_kfloor_laneparam_kat Threads::Threads)
+    add_test(NAME v37_kfloor_laneparam_kat COMMAND v37_kfloor_laneparam_kat)
+
     # Track A2 / W4-W6 — the OWED-EVENT MMR: an append-only authenticated record
     # log (src/c2pool/v37/record_log.hpp, instanced by owed_event_log.hpp) built
     # on the SHIPPED ::v37::Lane MMR statics, maintained inside OwedLedger, made
