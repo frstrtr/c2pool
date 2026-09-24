@@ -327,6 +327,11 @@ public:
                 [[fallthrough]];
             case levin::CMD_NEW_BLOCK:
                 if (!bucket_take(blocks_, 1.0, t)) return exhausted(fault_out, now);
+                // Remember the charge so a verdict of "known valid block" can
+                // hand exactly this token back (D3a); bounded by the capacity,
+                // because a refund can never lift the bucket above it anyway.
+                if (static_cast<double>(block_charges_open_) < cfg_.block_capacity)
+                    ++block_charges_open_;
                 break;
             case levin::CMD_NEW_TRANSACTIONS:
                 if (!bucket_take(txs_, static_cast<double>(units == 0 ? 1 : units), t))
@@ -374,6 +379,27 @@ public:
         while (credits_.size() > cfg_.max_solicited_credits) credits_.pop_front();
     }
 
+    // -----------------------------------------------------------------------
+    // Hand back the block token a push cost, because the index found the block
+    // is one it HAS -- connected, already on the best chain, or a valid alt
+    // candidate (D3a; IChainFetcher::credit_known_block). Honest relay at a fast
+    // cadence is one connecting copy plus a duplicate from every other peer; all
+    // of them are valid blocks and none of them is a flood.
+    //
+    // Refunds never outnumber charges: only a push that actually spent a block
+    // token can be refunded, so a 2008 admitted on a solicited-reply credit,
+    // or a verdict for a frame that was dropped, returns nothing it did not
+    // take. The bucket stays capped at its capacity (TokenBucket::refund).
+    // Returns whether a token was returned.
+    // -----------------------------------------------------------------------
+    bool refund_block_token(Millis now) {
+        if (block_charges_open_ == 0) return false;
+        --block_charges_open_;
+        blocks_.refund(ms_to_ns(now));
+        ++block_refunds_;
+        return true;
+    }
+
     // --- observation --------------------------------------------------------
     std::uint32_t score() const noexcept { return score_; }
     std::uint64_t faults() const noexcept { return faults_; }
@@ -381,6 +407,7 @@ public:
     std::uint32_t exhaustions() const noexcept { return exhaustions_; }
     std::uint64_t solicited_credits_used() const noexcept { return credits_used_; }
     std::size_t   solicited_credits_open() const noexcept { return credits_.size(); }
+    std::uint64_t block_refunds() const noexcept { return block_refunds_; }
 
     double bytes_level(Millis now)  { return bytes_.level(ms_to_ns(now)); }
     double blocks_level(Millis now) { return blocks_.level(ms_to_ns(now)); }
@@ -438,6 +465,11 @@ private:
     // cfg_.max_solicited_credits.
     std::deque<Millis> credits_;
     std::uint64_t      credits_used_ = 0;
+
+    // Block tokens spent on pushes and not yet handed back (D3a), and how many
+    // have been handed back in total.
+    std::uint32_t block_charges_open_ = 0;
+    std::uint64_t block_refunds_      = 0;
 };
 
 } // namespace c2pool::xmr::native::p2p

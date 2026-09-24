@@ -123,6 +123,7 @@ struct PoolTelemetry {
     std::uint64_t frames_dropped_dos = 0;
     std::uint64_t fluffy_requests_out    = 0;   // 2009s we sent (credits minted)
     std::uint64_t frames_credited_fluffy = 0;   // 2008 replies that spent a credit
+    std::uint64_t block_tokens_refunded  = 0;   // D3a: pushes of known valid blocks refunded
     std::uint64_t blocks_in     = 0;
     std::uint64_t txs_in        = 0;
     std::uint64_t chain_entries_in = 0;
@@ -337,6 +338,20 @@ public:
             ++self->tel_.fluffy_requests_out;
         });
         return true;
+    }
+
+    // D3a: the index found the block this peer pushed is one it HAS (connected,
+    // already on the best chain, or a valid alt candidate): hand back the block
+    // token the push cost. Called on the verify thread under the index lock, so
+    // it only posts; the guard lives on the io thread.
+    void credit_known_block(const PeerRef& ref) override {
+        auto self = shared_from_this();
+        const std::string key = ref.addr;
+        boost::asio::post(ex_, [self, key]() {
+            Peer* p = self->find(key);
+            if (!p) return;
+            if (p->dos.refund_block_token(self->now_ms())) ++self->tel_.block_tokens_refunded;
+        });
     }
 
     void penalize(const PeerRef& ref, PeerFault f, const std::string& why) override {
