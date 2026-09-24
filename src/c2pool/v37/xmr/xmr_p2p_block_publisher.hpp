@@ -234,6 +234,13 @@ public:
                                   std::to_string(retry_policy().max_attempts) + " attempts");
                     return;
                 }
+                // Not retained means the relay REFUSED it before any arm fired
+                // (an invalid own block -- a tx already mined in the chain it
+                // extends, a spent key image, a duplicate -- or a structural
+                // fault): not relayed, not parked, not adopted, not booked.
+                // Said out loud, never only in the status line.
+                say(true, "FOUND block " + hex_of(v.block_id) + " h=" + std::to_string(c.height) +
+                              " DROPPED (not relayed, not adopted, not booked): " + why);
                 set_error("relay: block reached NO peer: " + why);
                 return;
             }

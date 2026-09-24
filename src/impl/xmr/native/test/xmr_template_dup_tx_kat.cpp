@@ -27,6 +27,10 @@
 //
 //   A  ORACLE    -- probe_mined() answers "mined / spent in the chain ending at
 //                   this parent", and forgets on disconnect.
+//   B  OWN BLOCK -- submit_own_block() refuses an own block that carries a tx
+//                   already mined in its parent's chain, a key image already
+//                   spent there (a tx_extra twin), or a duplicate; a clean own
+//                   block still connects.
 //   C  REORG     -- the Disconnected event carries the rolled-back bodies (the
 //                   pool re-admits them; before: always empty), and the oracle
 //                   follows the switch.
@@ -35,7 +39,7 @@
 //                   spending a mined key image are left out, the valid one is
 //                   still served (good citizen).
 //
-// All three are RED on 00bb77c0 (with the test surfaces stubbed in) and GREEN
+// All four are RED on 00bb77c0 (with the test surfaces stubbed in) and GREEN
 // with the fix. Registered in BOTH `--target` lists in
 // .github/workflows/build.yml (the #1539 lesson).
 // ---------------------------------------------------------------------------
@@ -349,6 +353,51 @@ void test_a_oracle() {
 }
 
 // ===========================================================================
+// B. our own block
+// ===========================================================================
+void test_b_own_block() {
+    std::printf("== B. own block hygiene (submit_own_block) ==\n");
+    Chain c;
+    if (!c.ok) return;
+    const Tx t0 = golden_tx(0), t1 = golden_tx(1), t2 = golden_tx(2);
+    const Tx tw = twin_of(t2);
+    kat::check(!(tw.id == t2.id) && tw.kis == t2.kis && !tw.kis.empty(),
+               "B0 (fixture) the twin has a new id and the same key images");
+
+    const std::uint64_t h1 = kAnchorHeight + 1;
+    (void)c.offer(c.make(c.anchor_id, h1, {&t0, &t2}, 0x22), c.pa);
+    const Hash b1 = c.tip_id();
+    kat::check(c.tip_height() == h1, "B: the peer block mining t0 and t2 is the tip");
+
+    std::string why;
+    // 1) the observed failure: our template still carried t0 after it was mined.
+    const bool dup_mined = c.idx->submit_own_block(c.make(b1, h1 + 1, {&t0, &t1}, 0x33), why);
+    kat::checkf(!dup_mined, "B1 an own block re-mining t0 is REFUSED (%s)",
+                dup_mined ? "adopted" : why.c_str());
+    kat::check(c.tip_id() == b1, "B2 ...and the tip did not move onto it");
+
+    // 2) a key image already spent in the chain (t2's twin).
+    const bool dup_ki = c.idx->submit_own_block(c.make(b1, h1 + 1, {&tw}, 0x34), why);
+    kat::checkf(!dup_ki, "B3 an own block spending a key image the chain already spent is REFUSED "
+                "(%s)", dup_ki ? "adopted" : why.c_str());
+
+    // 3) the same tx twice in one block.
+    const bool dup_in = c.idx->submit_own_block(c.make(b1, h1 + 1, {&t1, &t1}, 0x35), why);
+    kat::checkf(!dup_in, "B4 an own block carrying t1 twice is REFUSED (%s)",
+                dup_in ? "adopted" : why.c_str());
+    kat::check(c.tip_id() == b1, "B5 the tip is still the peer block");
+    kat::checkf(c.idx->own_blocks_refused_invalid() == 3,
+                "B6 three own blocks counted as refused-invalid (%llu)",
+                (unsigned long long)c.idx->own_blocks_refused_invalid());
+
+    // 4) control: a clean own block (t1 once) is adopted.
+    const BlockEntry good = c.make(b1, h1 + 1, {&t1}, 0x36);
+    const bool ok = c.idx->submit_own_block(good, why);
+    kat::checkf(ok && c.tip_id() == id_of_blob(good.block_blob),
+                "B7 a clean own block carrying t1 still connects (%s)", why.c_str());
+}
+
+// ===========================================================================
 // C. the reorg returns the bodies, and the oracle follows it
 // ===========================================================================
 void test_c_reorg() {
@@ -446,6 +495,7 @@ void test_d_template() {
 int main() {
     std::printf("=== xmr_template_dup_tx_kat ===\n");
     test_a_oracle();
+    test_b_own_block();
     test_c_reorg();
     test_d_template();
     return kat::report("xmr_template_dup_tx_kat");

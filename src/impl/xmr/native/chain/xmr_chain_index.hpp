@@ -64,6 +64,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -556,6 +557,9 @@ public:
         return true;
     }
 
+    // Own blocks refused at submit because they carry a tx already mined, a key
+    // image already spent, or a duplicate within the block.
+    std::uint64_t own_blocks_refused_invalid() const { std::lock_guard<std::mutex> lk(mu_); return own_invalid_refused_; }
     // How many tx ids / key images the mined oracle currently covers.
     std::size_t mined_tx_count() const { std::lock_guard<std::mutex> lk(mu_); return mined_tx_.size(); }
 
@@ -840,6 +844,26 @@ private:
             r.height  = rows_.height_of(r.id).value_or(0);
             r.why     = "already on the best chain";
             return r;
+        }
+
+        // OUR OWN block: never adopt one every monerod would refuse. A block
+        // carrying a tx already mined in the chain it extends, a key image
+        // already spent there, or the same tx / key image twice, is invalid on
+        // every node that has the history -- and a levin-only node cannot hear
+        // their refusal, so PREFER-OWN would build on it forever (the
+        // publish-arm verify, 8b2efacf at h=513). Hygiene on our own output,
+        // not a rule applied to anyone else's blocks.
+        if (own_mined) {
+            std::string bad;
+            const RowRecord* mp = rows_.by_id(ev.input.parsed.header.prev_id);
+            if (!own_block_hygiene_locked_(ev, mp ? std::optional<std::uint64_t>(mp->row.height)
+                                                  : std::nullopt, bad)) {
+                ++own_invalid_refused_;
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = mp ? mp->row.height + 1 : ev.input.coinbase.height;
+                r.why     = "own block refused: " + bad;
+                return r;
+            }
         }
 
         // A bodiless re-announcement (a fluffy push) of a block we already hold
@@ -1724,6 +1748,44 @@ private:
         }
     }
 
+    // Our own block's tx set, judged against the chain it extends (when that
+    // parent is on the best chain; a block on a side branch is judged for
+    // internal duplicates only -- the oracle answers for the best chain).
+    bool own_block_hygiene_locked_(const EvaluatedBlock& ev,
+                                   std::optional<std::uint64_t> parent_height,
+                                   std::string& why) const {
+        const std::vector<Hash>& ids = ev.input.parsed.tx_hashes;
+        {
+            std::set<Key> seen;
+            for (const Hash& id : ids)
+                if (!seen.insert(key_(id)).second) {
+                    why = "tx " + hex_(id) + " appears twice in the block";
+                    return false;
+                }
+        }
+        {
+            std::set<Key> seen;
+            for (const Hash& ki : ev.key_images)
+                if (!seen.insert(key_(ki)).second) {
+                    why = "key image " + hex_(ki) + " is spent twice in the block";
+                    return false;
+                }
+        }
+        if (!parent_height) return true;
+        std::vector<Hash> mined, spent;
+        probe_mined_locked_(*parent_height, ids, ev.key_images, mined, spent);
+        if (!mined.empty()) {
+            why = "tx " + hex_(mined.front()) + " is already in the chain it extends (height "
+                + std::to_string(mined_tx_.at(key_(mined.front()))) + ")";
+            return false;
+        }
+        if (!spent.empty()) {
+            why = "key image " + hex_(spent.front()) + " is already spent in the chain it extends";
+            return false;
+        }
+        return true;
+    }
+
     static std::vector<std::vector<std::uint8_t>> blobs_of_(const BlockEntry& e) {
         std::vector<std::vector<std::uint8_t>> out;
         out.reserve(e.txs.size());
@@ -1732,6 +1794,14 @@ private:
             out.push_back(t.blob);
         }
         return out;
+    }
+
+    static std::string hex_(const Hash& h) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        s.reserve(64);
+        for (const std::uint8_t b : h) { s.push_back(d[b >> 4]); s.push_back(d[b & 15]); }
+        return s;
     }
 
     // =====================================================================================
@@ -2450,6 +2520,7 @@ private:
     std::deque<MinedRec>          mined_stack_;
     std::map<Key, std::uint64_t>  mined_tx_;   // tx id -> height mined at
     std::map<Key, std::uint64_t>  mined_ki_;   // key image -> height spent at
+    std::uint64_t own_invalid_refused_ = 0;
 };
 
 } // namespace c2pool::xmr::native
