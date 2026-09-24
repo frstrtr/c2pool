@@ -2791,6 +2791,77 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
                 std::to_string(a_recent) + " idle=" + std::to_string(a_idle) + " seed_early=" + std::to_string(a_seed_early));
     }
 
+    // ── phase 14: D2-0 -- a Reorg's re-applied blocks reach the booking observer ─
+    // p2p-first (the evidence arm): the native index emits Orphan(s) + ONE Reorg
+    // carrying only the new tip. shape 0 (fix2 evidence): this node's own block
+    // at 9 is replaced by the peer's 9 and 10 -- the peer's 9 must be BOOKED and
+    // SETTLED here exactly as on the node that followed the peer directly.
+    // shape 1 (base evidence): the peer's 9 is booked, replaced by our own 9,
+    // then re-established under the peer's 10 -- it must be RE-BOOKED
+    // ("canonical AGAIN") and settled; our own 9 never settles.
+    for (int shape = 0; shape < 2; ++shape) {
+        using c2pool::xmr::node::MainchainEvent;
+        using c2pool::xmr::node::MainchainEventKind;
+        XmrNodeConfig c16 = store_of(shape == 0 ? "store-d20-fix2" : "store-d20-base");
+        c16.arm_order = ArmOrderMode::P2PFirst;
+        std::map<std::uint64_t, c2pool::xmr::node::Hash> canon;
+        MockMonerodTransport mock;
+        XmrNode node(c16, mock, &smoke::test_point_check);
+        node.set_native_chain_presence([&](std::uint64_t h, const std::string& bid) {
+            const auto it = canon.find(h); return it != canon.end() && hex_of(it->second) == bid; });
+        node.set_native_row_lookup([&](std::uint64_t h) -> std::optional<std::string> {
+            const auto it = canon.find(h); if (it == canon.end()) return std::nullopt; return hex_of(it->second); });
+        try { node.bring_up(); } catch (const std::exception& e) { rep.add("FC30 bring_up", false, e.what()); return rep; }
+        FinalizeConnectOptions o = opts_for(c16);
+        o.book_from_chain_ex = [&](std::uint64_t h, const std::string&, CB& bk) -> bool {
+            if (h < 5) { bk.why = "not-lane: test"; return false; }
+            bk.credit[kA] = static_cast<long long>(100 + h); bk.payout_decoded = true; return true;
+        };
+        FoundBlockQueue q; FinalizeConnect fc(node, c16, q, o);
+        (void)fc.reseed_after_bring_up();
+        auto own  = [](std::uint64_t h) { return smoke::blk_id(static_cast<std::uint8_t>(h)); };
+        auto peer = [](std::uint64_t h) { return smoke::blk_id(static_cast<std::uint8_t>(100 + h)); };
+        auto send = [&](MainchainEventKind k, std::uint64_t h, const c2pool::xmr::node::Hash& id, std::uint64_t depth,
+                        const c2pool::xmr::node::Hash& orphaned) {
+            MainchainEvent ev; ev.kind = k; ev.block.height = h; ev.block.id = id; ev.depth = depth; ev.orphaned_id = orphaned;
+            node.pump_mainchain_event(ev);
+        };
+        auto extend = [&](std::uint64_t h, const c2pool::xmr::node::Hash& id) {
+            canon[h] = id; send(MainchainEventKind::Extend, h, id, 0, {}); (void)fc.tick();
+        };
+        for (std::uint64_t h = 1; h <= 8; ++h) extend(h, own(h));
+        if (shape == 0) {
+            extend(9, own(9));                                   // our own 9 (the stale-template find), booked
+            canon[9] = peer(9); canon[10] = peer(10);            // the peer's branch 9, 10 arrives
+            send(MainchainEventKind::Orphan, 9, own(9), 0, own(9));
+            send(MainchainEventKind::Reorg, 10, peer(10), 1, {});
+            (void)fc.tick();
+        } else {
+            extend(9, peer(9));                                  // the peer's 9 arrives first: booked
+            canon[9] = own(9);                                   // our own 9 on a stale template replaces it
+            send(MainchainEventKind::Orphan, 9, peer(9), 0, peer(9));
+            send(MainchainEventKind::Reorg, 9, own(9), 1, {});
+            (void)fc.tick();
+            canon[9] = peer(9); canon[10] = peer(10);            // the peer's 10 (built on its 9) re-establishes it
+            send(MainchainEventKind::Orphan, 9, own(9), 0, own(9));
+            send(MainchainEventKind::Reorg, 10, peer(10), 1, {});
+            (void)fc.tick();
+        }
+        for (std::uint64_t h = 11; h <= 16; ++h) extend(h, peer(h));
+        for (int i = 0; i < 3; ++i) (void)fc.tick();
+        const bool p9 = node.ledger().is_settled(hex_of(peer(9))), o9 = node.ledger().is_settled(hex_of(own(9))) ||
+                                                                         node.ledger().is_pending(hex_of(own(9)));
+        rep.add(shape == 0
+                    ? "FC30 D2-0 (fix2 shape): our own 9 replaced by the peer's 9+10 in ONE Reorg -> the re-applied peer 9 is delivered to the booking observer before the tip, BOOKED and SETTLED (not left unattempted); our 9 never settles; late_unbooked = 0"
+                    : "FC30b D2-0 (base shape): the peer's 9 booked, orphaned by our stale 9, re-established under the peer's 10 -> RE-BOOKED (canonical again) and SETTLED; our 9 never settles; late_unbooked = 0",
+                p9 && !o9 && node.reorg_redelivered() >= 1 && fc.stats().late_unbooked == 0 &&
+                node.finalize_driver().cursor_height() == 13,
+                "peer9_settled=" + std::to_string(p9) + " own9=" + std::to_string(o9) + " redelivered=" +
+                std::to_string(node.reorg_redelivered()) + " late=" + std::to_string(fc.stats().late_unbooked) +
+                " cursor=" + std::to_string(node.finalize_driver().cursor_height()));
+        (void)fc.drain_before_stop();
+    }
+
     return rep;
 }
 

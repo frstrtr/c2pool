@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -112,6 +113,31 @@ public:
     // without it rather than starting into a window where the answer is wrong.
     using ChainPresenceFn = std::function<bool(std::uint64_t height, const std::string& bid_hex)>;
     void set_native_chain_presence(ChainPresenceFn fn) { m_native_presence = std::move(fn); }
+
+    // D2-0: "which block does the best chain carry at height h" (lowercase hex),
+    // from the native index in p2p-first. Used to deliver the REORG-IN blocks
+    // below a Reorg tip to the booking observer (on_mainchain_event) and by the
+    // D2 minority re-derivation (chain_bid_at). Unset = nullopt (daemon-first
+    // answers from the adapter's mirror instead).
+    using RowLookupFn = std::function<std::optional<std::string>(std::uint64_t height)>;
+    void set_native_row_lookup(RowLookupFn fn) { m_native_row = std::move(fn); }
+
+    // The block id (lowercase hex) the best chain carries at `height`, or nullopt
+    // (above the tip / outside the retention window / header fetch failed).
+    std::optional<std::string> chain_bid_at(std::uint64_t height) {
+        if (m_adapter) {
+            auto b = m_adapter->index().by_height(height);
+            if (!b || is_zero_id(b->id)) {
+                bool fetch_failed = false;
+                b = m_adapter->ensure_row(height, fetch_failed);
+            }
+            if (!b || is_zero_id(b->id)) return std::nullopt;
+            return hex_of(b->id);
+        }
+        if (m_native_row) return m_native_row(height);
+        return std::nullopt;
+    }
+    std::uint64_t reorg_redelivered() const noexcept { return m_reorg_redelivered; }
 
     // Feed ONE mainchain event from the native index. Same body the adapter's
     // event sink runs, called from the consumer's main loop instead of from a
@@ -514,6 +540,29 @@ private:
         return n;
     }
 
+    // D2-0: deliver the heights a Reorg re-applied below its tip. The lowest
+    // re-applied height is the lowest height an Orphan event of this switch
+    // vacated (disconnect_to raises one Orphan per block it rolls back, before
+    // the Reorg); without one, tip - depth. Bounded (a switch deeper than 64
+    // is far past the finality boundary; the F2 gap re-drive / W6 own that).
+    void redeliver_reorg_interior(const c2pool::xmr::node::MainchainEvent& ev) {
+        const std::uint64_t H = ev.block.height;
+        std::uint64_t lo = m_reorg_lo ? *m_reorg_lo : (ev.depth && H > ev.depth ? H - ev.depth : H);
+        if (lo == 0) lo = 1;
+        if (H > lo + 64) lo = H - 64;
+        std::size_t n = 0;
+        for (std::uint64_t h = lo; h < H; ++h) {
+            const auto bid = chain_bid_at(h);
+            if (!bid || bid->size() != 64) continue;
+            if (m_cba_extend_observer) m_cba_extend_observer(h, *bid);
+            if (m_chain_observer) m_chain_observer(h, *bid);
+            ++n; ++m_reorg_redelivered;
+        }
+        if (n) log("reorg-in: delivered " + std::to_string(n) + " re-applied height(s) [" + std::to_string(lo) + ".." +
+                   std::to_string(H - 1) + "] below the Reorg tip h=" + std::to_string(H) + " (depth " +
+                   std::to_string(ev.depth) + ") to the booking observer BEFORE the tip (D2-0)");
+    }
+
     void on_mainchain_event(const c2pool::xmr::node::MainchainEvent& ev) {
         using K = c2pool::xmr::node::MainchainEventKind;
         // F2: re-drive the interior of a forward gap BEFORE the tip event (so
@@ -524,6 +573,22 @@ private:
             const std::uint64_t H = ev.block.height;
             if (m_scan_h != 0 && H > m_scan_h + 1) (void)redrive_range(m_scan_h + 1, H - 1);
         }
+        // D2-0: a Reorg event carries only the NEW TIP. The blocks the switch
+        // re-applied BELOW it (the chain index drops their per-block Extends,
+        // xmr_chain_index.hpp drop_queued_extends_after_) never reached the
+        // booking observer: a same-height replace (our own h, then the peer's h
+        // and h+1) left the peer's block at h unbooked on this node while every
+        // node that followed the peer's branch directly booked it -- the fix2 /
+        // base D2 evidence fork (docs/xmr-lane/d2-minority-converge.md §1.3).
+        // Deliver the re-applied heights [lowest orphaned height, tip - 1]
+        // ascending through the SAME observers, BEFORE the tip. book_chain_block
+        // dedups on ledger state and re-books a block that is canonical again.
+        if (ev.kind == K::Orphan) {
+            if (!m_reorg_lo || ev.block.height < *m_reorg_lo) m_reorg_lo = ev.block.height;
+        } else if (ev.kind == K::Reorg && m_cba_extend_observer) {
+            redeliver_reorg_interior(ev);
+        }
+        if (ev.kind != K::Orphan) m_reorg_lo.reset();
         // c2pool#1551: announce the block BEFORE settlement moves on it, so a
         // rival that arrives in the same event is already in the race book when
         // the finalize driver reaches the height.
@@ -582,6 +647,9 @@ private:
     // M3: the p2p-first tip driver. Null adapter + this predicate is the
     // daemonless posture; an adapter and no predicate is the default one.
     ChainPresenceFn                        m_native_presence;
+    RowLookupFn                            m_native_row;             // D2-0: best-chain block at h (p2p-first)
+    std::optional<std::uint64_t>           m_reorg_lo;               // D2-0: lowest height vacated by this switch's Orphans
+    std::uint64_t                          m_reorg_redelivered = 0;  // D2-0: re-applied heights delivered below a Reorg tip
     std::uint64_t                          m_tip_height = 0;
 
     // c2pool#1551: installed by the accounting layer (FinalizeConnect).
