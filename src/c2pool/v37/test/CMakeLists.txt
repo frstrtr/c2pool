@@ -305,6 +305,16 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_o2_finalize_connect_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_o2_finalize_connect_selfcheck PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_o2_finalize_connect_selfcheck COMMAND v37_xmr_o2_finalize_connect_selfcheck)
+    # v37_xmr_minority_converge_selfcheck (D2, operator ruling D2 = A): the PURE
+    # pieces of xmr/xmr_minority_converge.hpp -- the builder key, the minority
+    # detection rule, the refold (re-derivation) driven through the production
+    # XmrFinalizeDriver + OwedLedger + MemSettleStore, the marker/observation
+    # codecs. No node, no network. Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_minority_converge_selfcheck v37_xmr_minority_converge_selfcheck.cpp)
+    target_compile_features(v37_xmr_minority_converge_selfcheck PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_minority_converge_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_minority_converge_selfcheck PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_minority_converge_selfcheck COMMAND v37_xmr_minority_converge_selfcheck)
     # v37_xmr_lane_suspend_selfcheck (R-C rework-2): the stratum side of LANE
     # SUSPEND over a loopback socket -- the suspend EDGE withdraws the job
     # (sessions dropped), a login while suspended is PARKED, the resume edge

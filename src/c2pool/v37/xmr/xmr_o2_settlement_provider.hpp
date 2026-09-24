@@ -225,6 +225,15 @@ public:
     }
     std::size_t extra_nonce_bind_size() const { return m_bind_size; }
 
+    // D2 (minority converges to majority): the owed ledger was re-lineaged in
+    // place. refresh() re-keys on (height, prev_id, backlog) only, so the cached
+    // template would keep committing the ABANDONED owed_digest until the next
+    // tip; drop it so the next refresh() assembles against the converged ledger.
+    void invalidate() {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_cur.valid = false;
+    }
+
     XmrSettlementTemplateProvider(const XmrSettlementTemplateProvider&) = delete;
     XmrSettlementTemplateProvider& operator=(const XmrSettlementTemplateProvider&) = delete;
 
