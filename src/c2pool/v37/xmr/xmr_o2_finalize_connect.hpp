@@ -477,11 +477,16 @@ public:
         //                                old gate bound (hh <= h) let (b) through
         //                                silently: the alarm read 0 on a real fork.
         std::uint64_t late_unbooked = 0, booking_stall_timeout = 0;
-        // the subset of booking_stall_timeout whose cut-pending was a GAP-2 relay
-        // REPAIR still in flight (the winner-side order / its receipts / their
-        // Monero context never completed): a relay-repair STALL, named as one --
-        // never an anonymous "cut-pending" refusal of an honest block.
+        // RC-HOLD: a GAP-2 relay REPAIR of the winner's cut still in flight (the
+        // winner-side order / its receipts / their Monero context not complete)
+        // when the booking retry bound is reached. It is UNDECIDED, so it is
+        // HELD (never refused, never counted in booking_stall_timeout): a local
+        // timeout must not decide booking. `relay_repair_stall_timeout` counts
+        // the blocks that reached the bound this way (one per block), the
+        // `relay_repair_held*` counters track the hold: entered / resolved (booked,
+        // or refused on a DECIDED outcome) / held now.
         std::uint64_t relay_repair_stall_timeout = 0;
+        std::uint64_t relay_repair_held = 0, relay_repair_held_resolved = 0, relay_repair_held_now = 0;
         std::uint64_t late_booked_post_finalize = 0;
         // R5: lane blocks whose 03 root matched no candidate digest, kept in the
         // retry set (never memoized) and re-decoded as the candidate ring advances;
@@ -899,30 +904,29 @@ public:
                 // booking_stall_timeout(lane_root_unknown) -> REFUSED + memoized,
                 // which silently dropped the credit and released the gate.
                 if (root_unknown || fetch_fail) { enter_held(h, bid, why, root_unknown); return; }
-                // cut-pending past the bound: the loud release below (its payout is
-                // decoded, so it is DEBITED -- conservation-neutral on the payout side).
+                // RC-HOLD: a GAP-2 relay repair still in flight is UNDECIDED (this
+                // node has not yet obtained the winner-side order + receipts that
+                // reproduce the on-chain spine). Refusing it on a retry count made
+                // each racing node refuse a DIFFERENT set of canonical heights ->
+                // finalized subsets and owed_digest diverged for good. HELD instead:
+                // it keeps holding the R4 gate and repairing; it books when the
+                // repair completes, and is refused only on a DECIDED outcome (the
+                // callback's non-cut-pending reasons: credit-cut MISMATCH,
+                // lane-root-refused, fold_eb refused, ...), exactly like before.
+                if (cut_pend && is_relay_repair_pending(why)) { enter_held(h, bid, why, false, /*relay_repair=*/true); return; }
+                // other cut-pending past the bound: the loud release below (its payout
+                // is decoded, so it is DEBITED -- conservation-neutral on the payout side).
             }
             m_chain_seen[bid] = true; m_first_cursor.erase(bid);
             if (m_held.erase(bid)) { ++m_stats.held_resolved; m_stats.held_now = m_held.size(); }
+            note_relay_held_resolved(bid, "refused on a decided outcome");
             if (why.rfind("not-lane:", 0) == 0) return;   // a stranger's block: nothing to book
             if (cut_pend) {      // R4: the receiver's lane never reached P within the retry bound
+                // (a GAP-2 relay repair in flight never gets here: RC-HOLD holds it above)
                 ++m_stats.booking_stall_timeout;
-                if (why.find("relay repair of P=") != std::string::npos) {
-                    // GAP-2: the view at the winner's cut was being REPAIRED over the
-                    // relay and the repair did not complete. Refusing here is a
-                    // RELAY-REPAIR STALL of THIS node (its stuck stage is in `why`),
-                    // not evidence that the winner's block is dishonest.
-                    ++m_stats.relay_repair_stall_timeout;
-                    say("cba-ALARM relay_repair_stall_timeout: chain lane block " + short_bid(bid) + " h=" +
-                        std::to_string(h) + " -- the GAP-2 relay REPAIR of the winner's cut did NOT complete within the booking retry bound (" +
-                        std::to_string(m_o.retry_bound) + " attempts): " + why +
-                        " — this is a RELAY-REPAIR STALL on this node, NOT a lane divergence or a dishonest winner; releasing the finalize gate; "
-                        "credit for this height is REFUSED (payout -> node-local LIABILITY); operator's eyes needed on the relay");
-                } else {
-                    say("cba-ALARM booking_stall_timeout: chain lane block " + short_bid(bid) + " h=" +
-                        std::to_string(h) + " exhausted its booking retry bound still cut-pending (" + why +
-                        ") — releasing the finalize gate; credit for this height is REFUSED (payout -> node-local LIABILITY)");
-                }
+                say("cba-ALARM booking_stall_timeout: chain lane block " + short_bid(bid) + " h=" +
+                    std::to_string(h) + " exhausted its booking retry bound still cut-pending (" + why +
+                    ") — releasing the finalize gate; credit for this height is REFUSED (payout -> node-local LIABILITY)");
             }
             m_root_unknown_bids.erase(bid);
             ++m_stats.refused;
@@ -937,6 +941,7 @@ public:
                 std::to_string(m_retry_n[bid]) + " retries (the candidate ring reached the winner's ledger state)");
         }
         if (m_held.erase(bid)) { ++m_stats.held_resolved; m_stats.held_now = m_held.size(); say("cba: HELD lane block " + short_bid(bid) + " h=" + std::to_string(h) + " RESOLVED -> booked"); }
+        note_relay_held_resolved(bid, "booked (the relay repair completed)");
         if (late_post_finalize) {
             ++m_stats.late_unbooked; ++m_stats.late_booked_post_finalize;
             say("cba-ALARM late_unbooked(post-finalize): chain lane block " + short_bid(bid) + " h=" + std::to_string(h) +
@@ -1222,7 +1227,25 @@ private:
                 " attributed, " + std::to_string(m_stats.liability_unattributed_pico) + " unattributed)");
     }
 
-    void enter_held(std::uint64_t h, const std::string& bid, const std::string& why, bool root_unknown) {
+    // RC-HOLD: the GAP-2 relay-repair family of cut-pending reasons (main's
+    // relay_view): the repair in flight / no peer serves the order yet, a
+    // repaired receipt left the verified cache, a served order that did not
+    // reproduce the spine (that PEER is set aside -- it says nothing about the
+    // block). All undecided.
+    static bool is_relay_repair_pending(const std::string& why) {
+        return why.rfind("cut-pending:", 0) == 0 &&
+               (why.find("relay repair of P=") != std::string::npos ||
+                why.find("repaired receipt") != std::string::npos ||
+                why.find("repaired order") != std::string::npos);
+    }
+    void note_relay_held_resolved(const std::string& bid, const char* how) {
+        if (!m_relay_held.erase(bid)) return;
+        ++m_stats.relay_repair_held_resolved; m_stats.relay_repair_held_now = m_relay_held.size();
+        say(std::string("cba: relay-repair HOLD of lane block ") + short_bid(bid) + " RESOLVED: " + how +
+            " (relay_repair_held_now=" + std::to_string(m_relay_held.size()) + ")");
+    }
+    void enter_held(std::uint64_t h, const std::string& bid, const std::string& why, bool root_unknown,
+                    bool relay_repair = false) {
         m_retry[bid] = h;   // stays in the retry set: keeps holding the R4 gate
         if (root_unknown) m_root_unknown_bids.insert(bid);
         const bool fresh = !m_held.count(bid);
@@ -1230,9 +1253,22 @@ private:
         m_stats.held_now = m_held.size();
         if (fresh) ++m_stats.held_entered;
         ++m_stats.held_alarms;
+        if (relay_repair && m_relay_held.insert(bid).second) {
+            ++m_stats.relay_repair_stall_timeout; ++m_stats.relay_repair_held;
+            m_stats.relay_repair_held_now = m_relay_held.size();
+            say("cba-ALARM relay_repair_stall_timeout: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) +
+                " -- the GAP-2 relay REPAIR of the winner's cut did NOT complete within the booking retry bound (" +
+                std::to_string(m_o.retry_bound) + " attempts): " + why +
+                " — UNDECIDED (a relay-repair stall on this node, not a mismatch): HELD, NOT refused; the finalize gate "
+                "stays held, the repair continues, the lane may lag (lag suspension applies); it books when the repair "
+                "completes, and is refused only on a decided mismatch. relay_repair_held_now=" +
+                std::to_string(m_relay_held.size()));
+        }
         if (fresh || m_stats.held_alarms % 10 == 0)
             say("cba-ALARM HELD: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " is still " +
-                (root_unknown ? "lane-root-unknown (this node is not yet decidable for it)" : "unfetchable/unparseable") +
+                (root_unknown ? "lane-root-unknown (this node is not yet decidable for it)"
+                              : relay_repair ? "relay-repair pending (the winner's cut is not reconstructed here yet)"
+                                             : "unfetchable/unparseable") +
                 " after " + std::to_string(m_retry_n[bid]) + " attempts (" + why.substr(0, 80) + "). HELD, NOT dropped: "
                 "it keeps holding the finalize gate, is re-tried every " + std::to_string(m_o.held_retry_every) +
                 " ticks, and books / is refused (liability) the moment it resolves. held_now=" + std::to_string(m_held.size()));
@@ -1328,6 +1364,7 @@ private:
             else {                                                    // an orphan: drop
                 m_root_unknown_bids.erase(bid); m_first_cursor.erase(bid);
                 if (m_held.erase(bid)) { ++m_stats.held_resolved; m_stats.held_now = m_held.size(); }
+                note_relay_held_resolved(bid, "orphaned (no longer canonical)");
             }
         }
         return reached;
@@ -1351,6 +1388,7 @@ private:
         m_retry.erase(bid); m_retry_n.erase(bid); m_deferred.erase(bid);
         m_root_unknown_bids.erase(bid); m_first_cursor.erase(bid);
         if (m_held.erase(bid)) { ++m_stats.held_resolved; m_stats.held_now = m_held.size(); }
+        note_relay_held_resolved(bid, "refused on a decided outcome (lane-root-refused)");
         m_chain_seen[bid] = true;
         ++m_stats.refused_not_credited;
         say("cba-ALARM lane-root-refused: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) +
@@ -1888,6 +1926,7 @@ private:
     VoteState                         m_vote = VoteState::Converged;
     std::size_t                       m_iso_below = 0;       //  ISOLATED exit hysteresis
     bool                              m_held_lag = false;    //  HELD-LAG (non-terminal)
+    std::set<std::string>             m_relay_held;          // RC-HOLD: held bids whose cause is a relay repair in flight
     std::function<void(bool, const std::string&)> m_iso_hook;
     std::function<void(bool, const std::string&)> m_contested_hook;   // rework-3: CONTESTED -> lane suspend
     std::uint64_t                     m_tick = 0;

@@ -317,6 +317,19 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_cba_native_booking_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_cba_native_booking_kat PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_cba_native_booking_kat COMMAND v37_xmr_cba_native_booking_kat)
+    # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
+    # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
+    # (R4 gate kept, repair continues), never refused on a retry count; two nodes
+    # whose repairs finish at different attempts end byte-identical; a DECIDED
+    # mismatch (credit-cut MISMATCH / lane-root-refused) is still refused. Same
+    # monerod-STUB shape. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml
+    # --target lists.
+    add_executable(v37_xmr_relay_repair_hold_kat v37_xmr_relay_repair_hold_kat.cpp)
+    target_compile_features(v37_xmr_relay_repair_hold_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_relay_repair_hold_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_relay_repair_hold_kat PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_relay_repair_hold_kat COMMAND v37_xmr_relay_repair_hold_kat)
+
     # v37_xmr_relay_native_feed_kat (D6b): under --arm-order p2p-first the receipt
     # relay's chain view (headers, tip, reorgs) is fed from the NATIVE chain
     # index (xmr/relay/xmr_relay_chain_feed.hpp), not monerod
