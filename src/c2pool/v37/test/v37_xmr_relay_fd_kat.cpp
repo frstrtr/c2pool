@@ -19,7 +19,8 @@
 //       reader threads of unwound connections are reaped
 //   F2  relay partition: B keeps redialing a partitioned A; the fd count stays
 //       bounded during the partition and returns to the baseline after it, and
-//       the relay HEALS (a fresh HELLO on both sides) once it ends
+//       the relay HEALS (a fresh HELLO on both sides) once it ends, with no
+//       ghost peer entry left behind by a refused dial
 //   F3  EMFILE: with the descriptor table full and a connection queued, the
 //       accept loop backs off (process CPU < 10% of one core, exhaustion
 //       notices rate-limited to <= 1 per 5 s) and accepts the queued connection
@@ -184,6 +185,16 @@ int main() {
         C(healed, "F2 relay healed after the partition (fresh HELLO ok on A and B)");
         C(A.relay->n_connections() == 1 && B.relay->n_connections() == 1,
           "F2 exactly one live A<->B link after the heal");
+        // A dial the partitioned A refused at once must not leave a GHOST peer
+        // entry on B (its down event raced ahead of its up event): a ghost is
+        // re-counted as a HELLO timeout every maintenance tick and holds a
+        // max_peers slot forever. Past the HELLO timeout, the counter is flat.
+        std::this_thread::sleep_for(3500ms);
+        const u64 t1 = B.relay->stats().hello_timeout.load() + A.relay->stats().hello_timeout.load();
+        std::this_thread::sleep_for(2000ms);
+        const u64 t2 = B.relay->stats().hello_timeout.load() + A.relay->stats().hello_timeout.load();
+        std::printf("    HELLO timeouts after the heal: %llu -> %llu over 2 s\n", (unsigned long long)t1, (unsigned long long)t2);
+        C(t2 == t1, "F2 no ghost peer entries after the partition (HELLO-timeout counter flat)");
     }
 
     // ── F3 EMFILE: accept loop backs off, heals once descriptors are free ──

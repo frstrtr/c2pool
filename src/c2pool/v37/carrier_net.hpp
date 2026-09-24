@@ -223,6 +223,12 @@ public:
         return false;
     }
 
+    // Is this connection still live (not yet dropped)?
+    bool has_peer(PeerId id) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_conns.count(id) != 0;
+    }
+
     // The id of the connection a fd belongs to (test/diagnostic helper).
     std::vector<PeerId> peer_ids() const {
         std::lock_guard<std::mutex> lk(m_mtx);
