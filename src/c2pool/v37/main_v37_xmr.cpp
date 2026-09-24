@@ -1263,6 +1263,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             return 2;
         }
         node.set_native_chain_presence(chain_src.is_canonical);
+        node.set_native_row_lookup(chain_src.bid_at);   // D2-0: reorg-in blocks below a Reorg tip reach the booking observer
     }
     // R-C rework-2 (F2): daemon-first re-drives every chain gap (downtime / a ZMQ
     // gap wider than the reconcile walk) through the booking path.

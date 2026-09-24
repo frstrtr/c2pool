@@ -46,6 +46,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,12 @@ struct NativeChainSource {
     // dropped answers false, which is the fail-closed direction (a settlement
     // is refused, never wrongly finalized).
     std::function<bool(std::uint64_t height, const std::string& bid_hex)> is_canonical;
+
+    // D2-0: the block the best chain carries at `height` (lowercase hex), or
+    // nullopt (above the tip / outside the retention window). Lets XmrNode
+    // deliver the blocks a Reorg re-applied BELOW its tip to the booking
+    // observer (the Reorg event itself carries only the tip).
+    std::function<std::optional<std::string>(std::uint64_t height)> bid_at;
 
     // Events produced since start, drained or not. A tip driver that produced
     // nothing and a consumer that dropped everything are indistinguishable
@@ -120,6 +127,12 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
     src.is_canonical = [n](std::uint64_t height, const std::string& bid_hex) {
         const auto b = n->index().by_height(height);
         return b.has_value() && chain_id_hex(b->id) == bid_hex;
+    };
+
+    src.bid_at = [n](std::uint64_t height) -> std::optional<std::string> {
+        const auto b = n->index().by_height(height);
+        if (!b.has_value()) return std::nullopt;
+        return chain_id_hex(b->id);
     };
 
     src.events_seen = [n] { return n->mainchain_events_seen(); };
