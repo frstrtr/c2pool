@@ -502,15 +502,17 @@ public:
                           "format-2 anchor (nothing to verify the snapshot against)";
                     return false;
                 }
-                std::ifstream f(cfg_.output_set_path, std::ios::binary);
-                if (!f) {
-                    why = "cannot open output-set snapshot '" + cfg_.output_set_path + "'";
-                    return false;
+                {
+                    std::ifstream f(cfg_.output_set_path, std::ios::binary);
+                    if (!f) {
+                        why = "cannot open output-set snapshot '" + cfg_.output_set_path + "'";
+                        return false;
+                    }
                 }
-                const std::string blob((std::istreambuf_iterator<char>(f)),
-                                       std::istreambuf_iterator<char>());
+                // Mapped read-only and served in place (no heap copy of the
+                // anchor snapshot); only post-anchor state lives in the heap.
                 std::string seed_why;
-                if (!outputs_.seed_from_snapshot(blob, *ab, seed_why)) {
+                if (!outputs_.seed_from_snapshot_file(cfg_.output_set_path, *ab, seed_why)) {
                     why = "output-set snapshot rejected: " + seed_why;
                     return false;
                 }
