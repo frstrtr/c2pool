@@ -740,6 +740,33 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME v37_xmr_mainnet_readiness_kat COMMAND v37_xmr_mainnet_readiness_kat)
 
+    # D6d -- v37_xmr_d6d_native_seed_tip_kat
+    #   Under --arm-order p2p-first the embedded native node is the tip, the
+    #   RandomX seed (hash + height, 2048-block epochs, 64-block lag) and the
+    #   difficulty/height source, so it is handed NO monerod endpoint unless
+    #   --native-parity-monerod opts the C6 parity judge back in as a
+    #   compare-only oracle. Pins the forward (native_template_config_of), the
+    #   wire (a started NativeTemplateBackend driven through the status cadence
+    #   against a counting fake monerod: p2p-first = 0 requests; daemon-first and
+    #   the explicit judge = the get_miner_data/get_info/get_last_block_header
+    #   trio every tick) and the seed-epoch arithmetic the index keys on. No
+    #   hashing, no real daemon, no peers; listed in both build.yml --target lists.
+    add_executable(v37_xmr_d6d_native_seed_tip_kat v37_xmr_d6d_native_seed_tip_kat.cpp)
+    target_compile_features(v37_xmr_d6d_native_seed_tip_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_d6d_native_seed_tip_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_d6d_native_seed_tip_kat PRIVATE xmr_node xmr_native_txpool xmr_coin Threads::Threads)
+    if (TARGET Boost::headers)
+        target_link_libraries(v37_xmr_d6d_native_seed_tip_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(v37_xmr_d6d_native_seed_tip_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(v37_xmr_d6d_native_seed_tip_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME v37_xmr_d6d_native_seed_tip_kat COMMAND v37_xmr_d6d_native_seed_tip_kat)
+
     # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.
     # Proves the gap the Phase-B single-node daemon had: node B accounts node A's
     # shares. Wires the SAME production consumer code the daemon does — the W3

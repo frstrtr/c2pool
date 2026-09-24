@@ -410,6 +410,17 @@ struct XmrNodeConfig {
     // one line). The C6 parity oracle then has no judge and scores its samples
     // VOID, which is the honest cost and is exactly why this is not the default.
     bool            no_daemon_rpc = false;
+    // D6d: --native-parity-monerod. Under p2p-first the embedded node is the
+    // tip, the RandomX seed (hash + height, switching at every 2048-block epoch
+    // with the 64-block lag) and the difficulty/height source, all read off its
+    // own chain index -- so by DEFAULT it is handed no monerod endpoint at all,
+    // and the C6 parity judge's status-cadence round trips (get_miner_data for
+    // the shadow arm, get_info + get_last_block_header for the tip) are gone.
+    // This flag opts the judge back in as a COMPARE-ONLY oracle: it is read on
+    // the status cadence, never on the find path, and never decides anything.
+    // Daemon-first is unaffected (the daemon is its parity judge and submit arm
+    // either way); --no-daemon-rpc still wins over it.
+    bool            native_parity_monerod = false;
 
     // --- the SOLO (fully self-contained, peerless) configuration ------------
     //
@@ -608,6 +619,7 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
     if (a == "--native-force-synced")          { c.native_force_synced = true; return 1; }
     if (a == "--native-allow-unverified-pow")  { c.native_allow_unverified_pow = true; return 1; }
     if (a == "--native-seeds" || a == "--seeds") { c.native_use_seeds = true; return 1; }
+    if (a == "--native-parity-monerod")        { c.native_parity_monerod = true; return 1; }   // D6d
     if (a == "--native-snapshot-path") {
         if (!have_value || v.empty()) { err = "--native-snapshot-path wants <file>"; return -1; }
         c.native_snapshot_path = v;

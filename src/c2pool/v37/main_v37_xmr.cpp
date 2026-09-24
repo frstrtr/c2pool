@@ -1102,6 +1102,16 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
                                 "(--arm-order p2p-first): monerod is not on the find path"
                               : "; monerod stays the parity judge and the submit arm, and is NOT "
                                 "on the template path");
+    // D6d: say which of the two p2p-first postures this is, so a run's wire count
+    // can be read against the configuration that produced it.
+    if (p2p_first && !cfg.native_solo)
+        std::printf("  parity judge (monerod): %s\n",
+                    ncfg.monerod_rpc_port == 0
+                        ? "OFF -- tip, RandomX seed and difficulty/height come from the native "
+                          "chain index; no monerod RPC is made (--native-parity-monerod opts the "
+                          "compare-only judge back in)"
+                        : "ON, compare-only (--native-parity-monerod): get_miner_data + get_info + "
+                          "get_last_block_header on the status cadence, never on the find path");
     if (ncfg.boot == ::c2pool::xmr::native::rt::BootMode::Anchor) {
         // GATE 4 is not optional and has no off switch, so the operator is told
         // what window it will run in rather than left to infer it from a
@@ -3425,7 +3435,13 @@ int main(int argc, char** argv) {
                 "  --no-daemon-rpc              give the embedded node NO monerod RPC endpoint at\n"
                 "                               all. With p2p-first this makes the claim a packet\n"
                 "                               capture can settle in one line, at the cost of the\n"
-                "                               C6 parity judge (its samples become VOID).\n");
+                "                               C6 parity judge (its samples become VOID).\n"
+                "                               Under p2p-first this is now the DEFAULT posture\n"
+                "                               (D6d): the endpoint is withheld unless\n"
+                "  --native-parity-monerod      p2p-first: ALSO hand the embedded node the monerod\n"
+                "                               endpoint as the C6 parity judge (compare-only oracle:\n"
+                "                               get_miner_data + get_info + get_last_block_header per\n"
+                "                               status tick; never on the find path, never decides).\n");
             return 0;
         }
     }
