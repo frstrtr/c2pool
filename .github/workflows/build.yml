@@ -190,7 +190,12 @@ jobs:
         # target that builds the ~2080 MiB RandomX dataset (that is the thing it
         # tests -- FULL_MEM hashes must equal light hashes), and it SKIPS itself
         # with a printed note rather than failing if the allocation is refused.
-        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON
+        #
+        # -DXMR_BUILD_OPTION_B_KATS=ON: register + build the two option-B XMR
+        # KATs (xmr_template_primitives_kat, xmr_block_assembly_kat) so they get
+        # RUN coverage on this non-sanitizer leg. They are logic/byte-identity
+        # KATs (no RandomX JIT); the ASan leg leaves the option OFF. #1543.
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON -DXMR_BUILD_OPTION_B_KATS=ON
 
       # Boost header-integrity + version gate: a torn/mixed Boost tree or apt-Boost
       # fallback fails HERE (fast, one TU), not deep in the coin build.
@@ -245,6 +250,7 @@ jobs:
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke c2pool-v37-xmr \
                     v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck v37_xmr_lane_suspend_selfcheck \
                     xmr_randomx_verify_kat v37_xmr_o2_randomx_kat xmr_cpu_miner_kat \
+                    xmr_template_primitives_kat xmr_block_assembly_kat \
                     xmr_fast_mode_kat xmr_msr_boost_kat \
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
