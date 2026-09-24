@@ -209,7 +209,10 @@ public:
         // One sink into the state view; it queues rather than dispatches, so no
         // consumer callback ever runs with our mutex held.
         view_.subscribe([this](const node::MainchainEvent& e) { queued_events_.push_back(e); });
-        view_.subscribe_txs([this](const BlockTxEvent& e) { queued_tx_events_.push_back(e); });
+        view_.subscribe_txs([this](const BlockTxEvent& e) {
+            note_mined_locked_(e);
+            queued_tx_events_.push_back(e);
+        });
     }
 
     ChainIndex(const ChainIndex&)            = delete;
@@ -538,6 +541,24 @@ public:
         return s;
     }
 
+    // Template / own-block hygiene oracle (IChainView::probe_mined). Answered
+    // from the mined-tx and spent-key-image maps the index keeps for the
+    // retained window, bounded to the chain ending at `parent_id`.
+    bool probe_mined(const Hash& parent_id, const std::vector<Hash>& tx_ids,
+                     const std::vector<Hash>& key_images, std::vector<Hash>& mined_txs,
+                     std::vector<Hash>& spent_key_images) const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        mined_txs.clear();
+        spent_key_images.clear();
+        const auto ph = rows_.height_of(parent_id);
+        if (!ph) return false;
+        probe_mined_locked_(*ph, tx_ids, key_images, mined_txs, spent_key_images);
+        return true;
+    }
+
+    // How many tx ids / key images the mined oracle currently covers.
+    std::size_t mined_tx_count() const { std::lock_guard<std::mutex> lk(mu_); return mined_tx_.size(); }
+
     // --- IChainServing -------------------------------------------------------------------
     PeerSyncData our_sync_data() const override {
         std::lock_guard<std::mutex> lk(mu_);
@@ -784,6 +805,14 @@ private:
         BlockEntry        entry;
         std::vector<Hash> tx_hashes;
         std::uint64_t     bytes = 0;
+    };
+
+    // One connected best-chain block's contribution to the mined oracle.
+    struct MinedRec {
+        std::uint64_t    height = 0;
+        Hash             block_id{};
+        std::vector<Key> txs;
+        std::vector<Key> kis;
     };
 
     // =====================================================================================
@@ -1491,7 +1520,11 @@ private:
             const RowRecord* rr = rows_.by_height(h);
             if (!rr) break;
             const CachedEntry ce = entries_[key_(rr->row.id)];
-            if (!view_.disconnect_tip(ce.tx_hashes, {})) break;
+            // The bodies go back with the event, so the pool can re-admit the
+            // transactions the losing branch had mined (good citizen): they are
+            // valid again on the new branch unless it mined them too, which the
+            // pool checks against probe_mined() on re-admission.
+            if (!view_.disconnect_tip(ce.tx_hashes, blobs_of_(ce.entry))) break;
             RowRecord popped;
             rows_.pop(popped);
             pop_long_mirror_();
@@ -1624,6 +1657,81 @@ private:
             if (queued_events_[i].kind != node::MainchainEventKind::Extend)
                 keep.push_back(queued_events_[i]);
         queued_events_.swap(keep);
+    }
+
+    // =====================================================================================
+    // the mined oracle: which txs / key images the best chain already carries
+    // =====================================================================================
+    // Fed from the state view's own tx events (under mu_, in chain order), so
+    // it moves in lock-step with the chain on every path that connects or
+    // disconnects a block -- extend, switch, failed-switch restore, snapshot
+    // replay -- with no path having to remember it.
+    void note_mined_locked_(const BlockTxEvent& e) {
+        if (e.kind == BlockTxEvent::Kind::Connected) {
+            MinedRec rec;
+            rec.height   = e.height;
+            rec.block_id = e.block_id;
+            rec.txs.reserve(e.tx_hashes.size());
+            for (const Hash& id : e.tx_hashes) {
+                rec.txs.push_back(key_(id));
+                mined_tx_[rec.txs.back()] = e.height;
+            }
+            rec.kis.reserve(e.key_images.size());
+            for (const Hash& ki : e.key_images) {
+                rec.kis.push_back(key_(ki));
+                mined_ki_[rec.kis.back()] = e.height;
+            }
+            mined_stack_.push_back(std::move(rec));
+            const std::size_t cap = opts_.row_retention ? opts_.row_retention : 2048;
+            while (mined_stack_.size() > cap) {
+                forget_mined_locked_(mined_stack_.front());
+                mined_stack_.pop_front();
+            }
+            return;
+        }
+        // Disconnected: LIFO, so it is the newest record -- searched from the
+        // back only as a guard against a disconnect of a block the oracle never
+        // saw connect (below the window it was seeded with).
+        for (auto it = mined_stack_.rbegin(); it != mined_stack_.rend(); ++it) {
+            if (!(it->block_id == e.block_id)) continue;
+            forget_mined_locked_(*it);
+            mined_stack_.erase(std::next(it).base());
+            return;
+        }
+    }
+
+    void forget_mined_locked_(const MinedRec& rec) {
+        for (const Key& k : rec.txs) {
+            const auto it = mined_tx_.find(k);
+            if (it != mined_tx_.end() && it->second == rec.height) mined_tx_.erase(it);
+        }
+        for (const Key& k : rec.kis) {
+            const auto it = mined_ki_.find(k);
+            if (it != mined_ki_.end() && it->second == rec.height) mined_ki_.erase(it);
+        }
+    }
+
+    void probe_mined_locked_(std::uint64_t parent_height, const std::vector<Hash>& tx_ids,
+                             const std::vector<Hash>& key_images, std::vector<Hash>& mined,
+                             std::vector<Hash>& spent) const {
+        for (const Hash& id : tx_ids) {
+            const auto it = mined_tx_.find(key_(id));
+            if (it != mined_tx_.end() && it->second <= parent_height) mined.push_back(id);
+        }
+        for (const Hash& ki : key_images) {
+            const auto it = mined_ki_.find(key_(ki));
+            if (it != mined_ki_.end() && it->second <= parent_height) spent.push_back(ki);
+        }
+    }
+
+    static std::vector<std::vector<std::uint8_t>> blobs_of_(const BlockEntry& e) {
+        std::vector<std::vector<std::uint8_t>> out;
+        out.reserve(e.txs.size());
+        for (const TxBlobEntry& t : e.txs) {
+            if (t.pruned) return {};   // a pruned body cannot be re-admitted: let relay re-teach it
+            out.push_back(t.blob);
+        }
+        return out;
     }
 
     // =====================================================================================
@@ -2265,6 +2373,9 @@ private:
         refetch_.clear();
         queued_events_.clear();
         queued_tx_events_.clear();
+        mined_stack_.clear();
+        mined_tx_.clear();
+        mined_ki_.clear();
     }
 
     void flush_events_() {
@@ -2331,6 +2442,14 @@ private:
     bool          synced_             = false;
     bool          forced_synced_      = false;
     bool          synced_forced_ever_ = false;
+
+    // --- the mined oracle (template / own-block hygiene) ----------------------
+    // One record per connected best-chain block, LIFO like the chain itself, so
+    // a disconnect removes exactly what its connect added. Bounded to the
+    // retained row window.
+    std::deque<MinedRec>          mined_stack_;
+    std::map<Key, std::uint64_t>  mined_tx_;   // tx id -> height mined at
+    std::map<Key, std::uint64_t>  mined_ki_;   // key image -> height spent at
 };
 
 } // namespace c2pool::xmr::native

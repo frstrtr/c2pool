@@ -176,6 +176,22 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
         return verdict(Reason::UnlockNotZero, false, d.id);
     }
 
+    // 3b) Already MINED? The chain index's oracle, asked at its current tip.
+    //     Not a consensus judgement of the sender (no drop): a tx the chain
+    //     carries is simply not a pool transaction any more, and holding it
+    //     would put it in the next template -- a block every monerod refuses.
+    if (mined_oracle_ != nullptr) {
+        if (const auto t = mined_oracle_->tip()) {
+            std::vector<Hash> mined, spent;
+            if (mined_oracle_->probe_mined(t->id, {d.id}, d.rct.key_images, mined, spent)
+                && (!mined.empty() || !spent.empty())) {
+                ++stats_.rejected;
+                ++stats_.rejected_already_mined;
+                return verdict(Reason::AlreadyMined, false, d.id);
+            }
+        }
+    }
+
     // 4) Already held? Bump the sighting bookkeeping and say so. Re-sighting
     //    never resets time_received (the 5-second template gate is measured
     //    from the FIRST sighting) and never un-fluffs a transaction.
@@ -549,6 +565,13 @@ std::vector<node::TxBacklogEntry> RelayedTxPool::selectable_backlog(
     return snapshot_locked(p);
 }
 
+std::vector<Hash> RelayedTxPool::key_images_of(const Hash& id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = by_id_.find(id);
+    if (it == by_id_.end()) return {};
+    return it->second.key_images;
+}
+
 TxpoolSelectPolicy RelayedTxPool::policy() const {
     std::lock_guard<std::mutex> lk(mu_);
     return cfg_.policy;
@@ -627,11 +650,17 @@ void RelayedTxPool::on_block_connected(const BlockTxEvent& ev) {
 }
 
 void RelayedTxPool::on_block_disconnected(const BlockTxEvent& ev) {
+    note_block_disconnected(ev);
+    readmit_disconnected(ev);
+}
+
+void RelayedTxPool::note_block_disconnected(const BlockTxEvent& ev) {
     // The disconnected block is no longer the tip; the new tip is one lower.
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (ev.height > 0) tip_height_ = ev.height - 1;
-    }
+    std::lock_guard<std::mutex> lk(mu_);
+    if (ev.height > 0) tip_height_ = ev.height - 1;
+}
+
+void RelayedTxPool::readmit_disconnected(const BlockTxEvent& ev) {
 
     // Bodies returned by the index are BEST EFFORT and carry no authority
     // (contracts/types.hpp must-fix d), so they go back through the SAME
@@ -645,6 +674,11 @@ void RelayedTxPool::on_block_disconnected(const BlockTxEvent& ev) {
     std::vector<std::vector<std::uint8_t>> blobs = ev.tx_blobs;
     // A transaction that was in a block was, by definition, publicly fluffed.
     on_relayed(self, std::move(blobs), /*dandelionpp_fluff=*/true);
+}
+
+void RelayedTxPool::set_mined_oracle(const IChainView* chain) {
+    std::lock_guard<std::mutex> lk(mu_);
+    mined_oracle_ = chain;
 }
 
 void RelayedTxPool::set_synced(bool synced) {

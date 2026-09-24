@@ -534,24 +534,40 @@ public:
         }
 
         txpool_.set_input_consensus_sources(&outputs_, &outputs_);
+        // The chain's mined oracle: no path (a reorg re-admit racing the new
+        // branch, a late relay) can put a tx the best chain already carries
+        // back into the pool.
+        txpool_.set_mined_oracle(&index_);
 
         index_.subscribe_txs([this](const BlockTxEvent& ev) {
-            // C2 -> C3: drop mined ids, evict key-image conflicts, re-admit on a
-            // rollback. Posted to the pool thread for the same reason the relay
-            // path is: it re-decodes bodies.
+            // C2 -> C3, SYNCHRONOUSLY, on the thread that moved the tip and
+            // before the index returns to it. Evicting mined ids / spent key
+            // images on the pool thread LATER let the template refresh race
+            // it: a template built on the new tip in that window still carried
+            // a tx the new tip had mined, and a share on it was a block every
+            // monerod refused ("transaction already in blockchain") -- the
+            // publish-arm verify, 8b2efacf at h=513. The template path also
+            // filters against the chain itself (NativeMinerDataSource), so this
+            // is the pool keeping itself honest, not the only guard.
+            //
+            // The output set is fed FIRST: the spent-key-image set must reflect
+            // this block before the pool judges (or re-admits) anything against
+            // it. on_block_connected also carries the block's RCT outputs when
+            // the producer captured them (below-anchor history excepted); with
+            // none captured it still advances key images. Both are set updates
+            // under their own mutexes, and flush_events_ holds no index lock.
+            if (ev.kind == BlockTxEvent::Kind::Connected) {
+                outputs_.on_block_connected(ev);
+                txpool_.on_block_connected(ev);
+            } else {
+                outputs_.on_block_disconnected(ev);
+                txpool_.note_block_disconnected(ev);
+            }
+            // Only the re-admission of a rolled-back block's bodies (a full
+            // decode + verify each) and the inject upkeep go to the pool thread.
             pool_loop_.post([this, ev] {
-                // Feed the output set FIRST: the spent-key-image set must reflect
-                // this block before the pool judges (or re-admits) anything
-                // against it. on_block_connected also carries the block's RCT
-                // outputs when the producer captured them (below-anchor history
-                // excepted); with none captured it still advances key images.
-                if (ev.kind == BlockTxEvent::Kind::Connected) {
-                    outputs_.on_block_connected(ev);
-                    txpool_.on_block_connected(ev);
-                } else {
-                    outputs_.on_block_disconnected(ev);
-                    txpool_.on_block_disconnected(ev);
-                }
+                if (ev.kind == BlockTxEvent::Kind::Disconnected)
+                    txpool_.readmit_disconnected(ev);
                 // OPERATOR INJECT upkeep on a connected block: an inject that was
                 // mined leaves C3 (so it would silently stop being offered), but
                 // its ledger entry and pin must go too. Forget the mined ids,
