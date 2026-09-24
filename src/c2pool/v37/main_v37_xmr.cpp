@@ -115,6 +115,7 @@
 #include "xmr/relay/xmr_relay_native_ctx.hpp"   // RC-CTX: receipt contexts from the native node + the own-template journal
 #include "xmr/relay/xmr_address.hpp"           // login address (base58) -> payee ref
 #include "xmr/relay/xmr_rbind_registry.hpp"    // SEAM-1: per-job rbind (payee + give-author) the template writes
+#include "xmr/relay/xmr_relay_chain_feed.hpp"  // D6b: the relay chain view fed from the native index (p2p-first)
 
 // The in-process RandomX CPU miner (--mine). Header-only, and only compilable
 // when librandomx is in the build -- so it is gated on exactly the macro that
@@ -171,6 +172,7 @@ static bool          g_no_book_deferral = false;         // --no-book-deferral: 
 // D6a (xmr/xmr_cba_block_source.hpp): p2p-first books from the native index; monerod is opt-in only.
 static bool          g_cba_monerod_compare = false;      // --cba-monerod-compare: compare-only oracle (counts, never decides)
 static bool          g_cba_monerod_fallback = false;     // --cba-monerod-fallback: a native miss asks monerod instead of HOLDING
+static bool          g_relay_feed_monerod_compare = false;   // --relay-feed-monerod-compare: D6b compare-only oracle (counts, never decides)
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
 static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
 static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
@@ -2259,6 +2261,18 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::uint64_t relay_index_best = 0;
         std::map<std::uint64_t, node::Hash> relay_hdr_by_height;   // GAP-2: height -> block id (header cache)
         std::map<std::string, std::vector<std::uint8_t>> relay_ctx_blobs;   // receipt context: block id hex -> monerod blob (bounded)
+        // D6b: under p2p-first the relay chain view (headers, tip, reorgs) is fed
+        // from the native index -- no monerod RPC on this path. Context blobs are
+        // RC-CTX's (relay_native_ctx.block_blob -> relay_ctx_feeder.serve).
+        relay::NativeRelayChainFeed relay_native_feed;
+        relay::NativeFeedSource     relay_native_src;
+        relay::FeedCompare          relay_feed_cmp;           // compare-only oracle totals
+        std::uint64_t               relay_feed_cmp_rpc = 0, relay_feed_cmp_rpc_failed = 0;
+        if (p2p_first && chain_src.tip_block && chain_src.id_at && chain_src.seed_for) {
+            relay_native_src.tip      = chain_src.tip_block;
+            relay_native_src.id_at    = chain_src.id_at;
+            relay_native_src.seed_for = chain_src.seed_for;
+        }
         if (relay_enabled()) {
             if (!serving) {
                 std::printf("REFUSED: the receipt relay needs a served template (--residual-sink-spend-hex/--residual-sink-view-hex)\n");
@@ -2348,7 +2362,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             // RC-CTX (1)+(2): the embedded native node's verified chain index is a
             // context source on every arm it runs on (rows -> ChainView; retained
-            // bodies -> own wants + peers' FB_GETCTX).
+            // bodies -> own wants + peers' FB_GETCTX). On p2p-first the rows come
+            // from D6b's NativeRelayChainFeed instead of (1); (2) serves on every arm.
             if (native && native->node()) {
                 auto* nn = native->node();
                 relay_native_ctx.best_height = [nn]() -> std::optional<std::uint64_t> {
@@ -2531,7 +2546,51 @@ static int run_live(const XmrNodeConfig& cfg) {
                         relay_ctx_journal.note(prev, t.height, seed);   // RC-CTX (3)
                     }
                 }
-                if (relay_native_ctx) relay_ctx_feeder.feed(relay_chain, relay_native_ctx);   // RC-CTX (1)
+                if (p2p_first && relay_native_src) {
+                    // D6b: under p2p-first the relay chain view is fed from the chain
+                    // this node verified itself -- the daemon arm's body (same 128
+                    // window, same seed rule, same notes) once per new tip (a tip-ID
+                    // change, so a same-height reorg re-notes too). It is the ONE row
+                    // feed on this arm; RC-CTX (1) (else-branch) feeds the arms it does
+                    // not run on (daemon-first with a native node), unchanged.
+                    // monerod is only ever the opt-in compare oracle: it counts, it
+                    // never decides. Receipt CONTEXT is not served here: own wants and
+                    // peers' FB_GETCTX go through RC-CTX's feeder (2) below.
+                    relay::FeedSink sink;
+                    sink.note = [&](const relay::FeedId& p, std::uint64_t h, const relay::FeedId& sd) {
+                        ::v37::bytes32 prev{}, seed{};
+                        std::memcpy(prev.data(), p.data(), 32); std::memcpy(seed.data(), sd.data(), 32);
+                        relay_chain.note(prev, h, seed);
+                    };
+                    sink.note_seed = [&](std::uint64_t sh, const relay::FeedId& sd) {
+                        ::v37::bytes32 seed{}; std::memcpy(seed.data(), sd.data(), 32);
+                        relay_chain.note_seed(sh, seed);
+                    };
+                    if (relay_native_feed.tick(relay_native_src, sink) && g_relay_feed_monerod_compare && !cfg.no_daemon_rpc) {
+                        const std::uint64_t best = relay_native_feed.best();
+                        const std::uint64_t lo = best > relay::NativeRelayChainFeed::kWindow ? best - relay::NativeRelayChainFeed::kWindow : 0;
+                        std::map<std::uint64_t, relay::FeedId> nat, mon;
+                        for (std::uint64_t h = lo; h <= best; ++h)
+                            if (const auto id = relay_native_src.id_at(h)) nat[h] = *id;
+                        bool ok = false;
+                        ++relay_feed_cmp_rpc;
+                        transport.rpc_post(node::MoneroDaemonRpc::body_get_block_headers_range(lo, best), [&](const node::RpcResponse& r) {
+                            if (!r.ok()) return;
+                            if (auto v = node::MoneroDaemonRpc::parse_block_headers_range(r.body)) {
+                                ok = true;
+                                for (const auto& b : *v) mon[b.height] = b.id;
+                            }
+                        });
+                        if (!ok) ++relay_feed_cmp_rpc_failed;
+                        else {
+                            const relay::FeedCompare c = relay::compare_windows(nat, mon);
+                            relay_feed_cmp.equal += c.equal; relay_feed_cmp.mismatch += c.mismatch;
+                            relay_feed_cmp.native_only += c.native_only; relay_feed_cmp.monerod_only += c.monerod_only;
+                        }
+                    }
+                } else if (relay_native_ctx) {
+                    relay_ctx_feeder.feed(relay_chain, relay_native_ctx);   // RC-CTX (1)
+                }
                 if (!p2p_first && !cfg.no_daemon_rpc) {
                     // The daemon arm: once per new tip, ONE get_block_headers_range over the
                     // last 128 blocks (+ the RandomX seed block, cached) so a peer receipt built
@@ -2706,6 +2765,17 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)relay_own_replay, (unsigned long long)relay_cut_repaired, (unsigned long long)relay_repair_rejected,
                             relay_chain.size(), (unsigned long long)relay_chain.tip(),
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
+                if (relay_native_src) {   // D6b
+                    const auto& fs = relay_native_feed.stats();
+                    std::printf("  relay-feed: src=native tips=%llu reorg_tips=%llu headers=%llu seed_miss=%llu row_miss=%llu | "
+                                "monerod compare %s rpc=%llu failed=%llu equal=%llu MISMATCH=%llu native_only=%llu monerod_only=%llu\n",
+                                (unsigned long long)fs.tips, (unsigned long long)fs.reorg_tips, (unsigned long long)fs.headers,
+                                (unsigned long long)fs.seed_miss, (unsigned long long)fs.row_miss,
+                                g_relay_feed_monerod_compare ? "ON" : "off",
+                                (unsigned long long)relay_feed_cmp_rpc, (unsigned long long)relay_feed_cmp_rpc_failed,
+                                (unsigned long long)relay_feed_cmp.equal, (unsigned long long)relay_feed_cmp.mismatch,
+                                (unsigned long long)relay_feed_cmp.native_only, (unsigned long long)relay_feed_cmp.monerod_only);
+                }
             }
             {   // recon(A+B credit)
                 auto s = node.engine().snapshot(cfg.lane_chain);
@@ -3071,6 +3141,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-book-deferral")        g_no_book_deferral = true;
         else if (a == "--cba-monerod-compare")     g_cba_monerod_compare = true;
         else if (a == "--cba-monerod-fallback")    g_cba_monerod_fallback = true;
+        else if (a == "--relay-feed-monerod-compare") g_relay_feed_monerod_compare = true;
         // GAP-2 relay knobs
         else if (a == "--relay-listen")             g_relay_listen = next("");
         else if (a == "--relay-peer")               g_relay_peers.push_back(next(""));
@@ -3187,6 +3258,8 @@ int main(int argc, char** argv) {
                 "                               count equal/mismatch (compare-only oracle; never decides)\n"
                 "  --cba-monerod-fallback       p2p-first: a block the native index no longer holds is read\n"
                 "                               from monerod instead of HELD (explicit opt-in; default HOLD)\n"
+                "  --relay-feed-monerod-compare p2p-first: ALSO fetch the relay chain-view window from monerod\n"
+                "                               per new tip and count equal/mismatch (compare-only oracle)\n"
                 "  --same-height-tiebreak <prefer-own|first-seen>   same-height race policy\n"
                 "  --own-fork-bound-s <n>   abandon an own-mined tip no peer adopts after n s (0=off, 240)\n"
                 "                               (default prefer-own; drives BOTH the D-14 fork\n"

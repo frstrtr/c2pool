@@ -329,6 +329,19 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_relay_repair_hold_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_relay_repair_hold_kat PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_relay_repair_hold_kat COMMAND v37_xmr_relay_repair_hold_kat)
+
+    # v37_xmr_relay_native_feed_kat (D6b): under --arm-order p2p-first the receipt
+    # relay's chain view (headers, tip, reorgs) is fed from the NATIVE chain
+    # index (xmr/relay/xmr_relay_chain_feed.hpp), not monerod
+    # get_block_headers_range / get_block_header_by_height: the notes
+    # equal the daemon arm's over the same chain (across an epoch edge), a
+    # same-height reorg re-notes at once, a missing seed/row is a counted skip,
+    # and the compare oracle only counts. Header-only. SAME HOLLOW-GREEN GUARD:
+    # listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_relay_native_feed_kat v37_xmr_relay_native_feed_kat.cpp)
+    target_compile_features(v37_xmr_relay_native_feed_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_relay_native_feed_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME v37_xmr_relay_native_feed_kat COMMAND v37_xmr_relay_native_feed_kat)
     # v37_xmr_lane_suspend_selfcheck (R-C rework-2): the stratum side of LANE
     # SUSPEND over a loopback socket -- the suspend EDGE withdraws the job
     # (sessions dropped), a login while suspended is PARKED, the resume edge

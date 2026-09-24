@@ -101,6 +101,18 @@ struct NativeChainSource {
     // The id is the hash of the blob, so a hit is byte-identical to get_block.
     std::function<bool(const std::string& bid_hex, std::vector<std::uint8_t>& blob)> block_blob;
 
+    // D6b: the receipt relay's chain-view feed (relay/xmr_relay_chain_feed.hpp)
+    // -- the headers and tip the daemon arm fetches from monerod
+    // (get_block_headers_range / get_block_header_by_height). Context blobs
+    // are RC-CTX's (ChainIndex::block_blob_of, bound in main).
+    //   tip_block: (height, id) of the best-chain tip;
+    //   id_at:     the id the best chain carries at a height;
+    //   seed_for:  the RandomX seed id for a block AT a height (epoch ids are
+    //              kept beyond the row window as seed anchors).
+    std::function<std::optional<std::pair<std::uint64_t, ::c2pool::xmr::node::Hash>>()> tip_block;
+    std::function<std::optional<::c2pool::xmr::node::Hash>(std::uint64_t height)> id_at;
+    std::function<std::optional<::c2pool::xmr::node::Hash>(std::uint64_t height)> seed_for;
+
     explicit operator bool() const noexcept {
         return static_cast<bool>(drain) && static_cast<bool>(is_canonical);
     }
@@ -181,6 +193,18 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
         blob = e->block_blob;
         return true;
     };
+
+    src.tip_block = [n]() -> std::optional<std::pair<std::uint64_t, ::c2pool::xmr::node::Hash>> {
+        const auto t = n->index().tip();
+        if (!t) return std::nullopt;
+        return std::make_pair(t->height, t->id);
+    };
+    src.id_at = [n](std::uint64_t height) -> std::optional<::c2pool::xmr::node::Hash> {
+        const auto b = n->index().by_height(height);
+        if (!b) return std::nullopt;
+        return b->id;
+    };
+    src.seed_for = [n](std::uint64_t height) { return n->index().seed_hash_for_height(height); };
     return src;
 }
 
