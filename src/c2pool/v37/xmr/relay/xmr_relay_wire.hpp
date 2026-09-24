@@ -48,11 +48,12 @@
 //   info_digest == side_digest_v2(side) (self-consistency), identity ==
 //   xmr_identity_key(payee). The PoW BINDING of side_data_v2 (payee, give-
 //   author) is rbind_v1(chain_id, side) inside the coinbase 0x02 region
-//   [extra_nonce 4 | rbind 32] -- SEAM-1 (template/coinbase bytes, operator's
-//   hand). BindMode::Rbind enforces it; BindMode::None (the only mode a
-//   pre-SEAM-1 template can serve) relays PoW-verified receipts whose payee is
-//   carried, dedup-keyed on the blob, but NOT PoW-bound. HELLO pins the mode so
-//   two nodes can never disagree on it silently.
+//   [extra_nonce 4 | rbind 32] -- SEAM-1: the template writes it per job
+//   (IXmrSettlementSource::extra_nonce_bind, xmr_rbind_registry.hpp) when the
+//   node runs --relay-bind rbind. BindMode::Rbind enforces it; BindMode::None
+//   relays PoW-verified receipts whose payee is carried, dedup-keyed on the
+//   blob, but NOT PoW-bound. HELLO pins the mode so two nodes can never
+//   disagree on it silently.
 //
 // This header defines NO consensus digest and includes nothing from
 // src/sharechain/v37 beyond the descriptor / lane-param TYPES it reads.
@@ -74,6 +75,7 @@
 #include "impl/xmr/receipt/xmr_receipt.hpp"        // ::v37::xmr::MoneroReceipt
 #include "impl/xmr/wire/xmr_carrier_wire.hpp"      // encode_receipt / decode_receipt (the ratified codec)
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"   // ::xmr::coin::keccak256
+#include "../xmr_fee_model.hpp"                    // S4: the fee-model gate folded into lane_params_digest
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -146,7 +148,7 @@ struct SideDataV2 {
     u64     t_lo = 0, t_hi = 0;      // T_origin (R-1: == the lane share difficulty)
     bytes32 identity{};              // xmr_identity_key(payee)
     u32     chain_id = 0;            // lane ChainId
-    u16     give_author = 0;         // PR c2pool#1710's receipt-carried donation u16 (SEAM-3)
+    u16     give_author = 0;         // the receipt-carried give-author u16 (fee model S3; folded only under FeeModelGate)
     u16     reserved = 0;            // must be 0
 
     std::vector<u8> bytes() const {
@@ -492,6 +494,19 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
     le::put64(b, share_diff);
     b.push_back(static_cast<u8>(bind));
     le::put64(b, kReceiptWeight);
+    // S4 (fee model): the FeeModelGate is folded ONLY when it is ON, so a
+    // gate-OFF node's digest stays byte-identical to master's (the W4 golden
+    // does not move) while a gate-ON node differs from BOTH a gate-OFF node
+    // and a master node -> a mixed fleet refuses at HELLO, never diverges.
+    // Folds the version, the per-receipt weight rule and the compiled-in
+    // donation identity (a node with another donation address refuses too).
+    if (p.fee.enabled) {
+        static constexpr char kFeeTag[] = "FEE1";
+        b.insert(b.end(), kFeeTag, kFeeTag + 4);
+        le::put32(b, p.fee.version);
+        le::put64(b, ::c2pool::v37n::xmr::fee::kFeeReceiptWeight);
+        le::putb(b, ::c2pool::v37n::xmr::fee::donation_identity());
+    }
     return keccak_bytes(b);
 }
 

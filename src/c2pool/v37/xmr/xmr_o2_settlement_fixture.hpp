@@ -65,7 +65,8 @@
 //   * residual_sink MUST be a well-formed XMR ref (kind XMR_STD/XMR_SUB, 64-B
 //     payload) here, AND torsion-valid under the installed ed25519 point-check
 //     backend at build() — no backend => build() refuses (BadSinkDescriptor).
-//   * output_cap must leave room for fixed + the sink (>= fixed.size() + 1).
+//   * output_cap must leave room for fixed + the sink (>= fixed.size() + 1;
+//     >= fixed.size() when the last fixed output pays the sink -- S1 fold).
 //   * ctx.chain_id must equal ledger.chain(); CARROT fence major_version <= 16.
 //   * every fixed output must be a well-formed XMR ref.
 //   None of these throw: every entry point returns std::nullopt / nullptr with
@@ -153,7 +154,7 @@ struct XmrSettlementConfig {
     ::v37::ScriptRef residual_sink;                    // XMR_STD/XMR_SUB, 64-B payload
     ::v37::bytes32   residual_sink_identity{};         // its ledger identity_key (payout-map key)
 
-    // --- mandated fixed outputs (dev / donation / finder), usually empty ---
+    // --- mandated fixed outputs: empty (fee model OFF), or the ONE protocol donation output (fee model ON, xmr_fee_model.hpp; the residual folds into it, S1; V36 has NO finder output) ---
     std::vector<x6::FixedOutput> fixed;
 
     // --- rulings (operator-tap DRAFT once multi-node; explicit flags here) ---
@@ -208,9 +209,13 @@ struct XmrSettlementConfig {
             if (!::v37::xmr::xmr_ref_well_formed(f.pay))
                 return no("XmrSettlementConfig: a fixed output is not a well-formed XMR ref");
         const std::uint32_t cap = resolved_output_cap();
-        if (cap < fixed.size() + 1)
+        // fee model S1: a last fixed output that pays the sink absorbs the
+        // residual itself (x6::residual_folds_into_fixed) -- no sink slot.
+        const bool sink_folds = !fixed.empty() && fixed.back().pay == residual_sink &&
+                                fixed.back().identity == residual_sink_identity;
+        if (cap < fixed.size() + (sink_folds ? 0 : 1))
             return no("XmrSettlementConfig: output_cap leaves no room for fixed + sink "
-                      "(need >= fixed.size() + 1)");
+                      "(need >= fixed.size() + 1, or fixed.size() when the last fixed output pays the sink)");
         if (lc_source == LaneCommitmentSource::Explicit &&
             lane_commitment_explicit == ::v37::bytes32{})
             return no("XmrSettlementConfig: lc_source == Explicit but lane_commitment_explicit is zero");
@@ -484,9 +489,18 @@ inline bool run(std::string* why = nullptr) {
     {
         XmrSettlementConfig bad = cfg;
         bad.output_cap = 1;                       // room for exactly 1 = the sink
-        bad.fixed.push_back(x6::FixedOutput{sample_wellformed_ref(), 1, {}});
+        bad.fixed.push_back(x6::FixedOutput{sample_wellformed_ref(), 1, {}});   // another identity: not the sink
         std::string w;
         if (bad.validate_structural(&w)) return fail("S3: cap-too-small (fixed+sink) accepted");
+    }
+    {
+        // (S3b, fee model S1) the same cap with the fixed output paying the sink:
+        // it absorbs the residual, no sink slot is needed -> valid.
+        XmrSettlementConfig fold = cfg;
+        fold.output_cap = 1;
+        fold.fixed.push_back(x6::FixedOutput{cfg.residual_sink, 1, cfg.residual_sink_identity});
+        std::string w;
+        if (!fold.validate_structural(&w)) return fail("S3b: a fixed output paying the sink (S1 fold) refused at cap 1: " + w);
     }
     // (S4) make_xmr_coinbase_context copies every field through and defaults the
     //      lane commitment to the empty ledger's owed_digest.

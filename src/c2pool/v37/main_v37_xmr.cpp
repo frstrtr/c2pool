@@ -63,6 +63,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -89,6 +90,7 @@
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
 #include "xmr/xmr_coinbase_authority.hpp"  //  coinbase-authority booking
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
+#include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
 #include "impl/xmr/node/minijson.hpp"
@@ -110,6 +112,7 @@
 #include "xmr/relay/xmr_relay_node.hpp"        // TCP relay: HELLO gate, verify worker (RandomX LAST), flood, backfill, repair
 #include "xmr/relay/xmr_receipt_ingest.hpp"    // admitted receipts -> the lane (ordering policy + durable log)
 #include "xmr/relay/xmr_address.hpp"           // login address (base58) -> payee ref
+#include "xmr/relay/xmr_rbind_registry.hpp"    // SEAM-1: per-job rbind (payee + give-author) the template writes
 
 // The in-process RandomX CPU miner (--mine). Header-only, and only compilable
 // when librandomx is in the build -- so it is gated on exactly the macro that
@@ -166,6 +169,14 @@ static bool          g_no_book_deferral = false;         // --no-book-deferral: 
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
 static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
 static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
+// fee model (xmr/xmr_fee_model.hpp), gated by LaneParams::fee (--fee-model v1;
+// default OFF => master-identical coinbase and credit). The two knobs below are
+// node-local JOB policy under the gate: they decide only what THIS node's jobs
+// commit to (the payee + the give-author u16 in the PoW-bound receipt), never
+// how any receipt is folded. The donation output itself has NO knob.
+static double        g_give_author_pct = 0.0;            // --give-author-pct P: the u16 this node's receipts carry (default 0)
+static double        g_owner_fee_pct = 0.0;              // --node-owner-fee-pct P: probability (%) a job commits to the owner
+static std::string   g_owner_address;                    // --node-owner-address ADDR: the owner's standard address
 // R-C rework-3 ruled defaults (docs/xmr-lane/r-c-rework-3.md).
 static bool          g_contested_suspend = false;        // --contested-suspend on|off (default off): CONTESTED suspends lane production
 static std::uint64_t g_recon_max_root_age = ~std::uint64_t{0};   // --recon-max-root-age N (default kReconMaxRootAgeDconf*D_conf; 0 = unbounded)
@@ -379,6 +390,11 @@ struct ServeHooks {
     // GAP-2: the node-chosen base of the stratum extra_nonce counter (and the
     // in-process miner's slot just below it). Unset = the counter starts at 0.
     std::optional<std::uint32_t> extra_nonce_base;
+    // SEAM-1 (--relay-bind rbind): bind a job's extra_nonce (payee + give-author,
+    // owner-fee roll at job issue) right before its blob is built. Called on the
+    // listener thread for stratum jobs, and once on the main thread for the
+    // in-process miner's fixed slot (address ""). Unset = no binding.
+    std::function<void(std::uint32_t, const std::string&)> job_binder;
 };
 
 // ---------------------------------------------------------------------------
@@ -434,6 +450,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     lo.bind_port = cfg.stratum_bind_port;
     o2::StratumListener listener(template_source, rx, sink, lo);
     if (hooks.extra_nonce_base) listener.seed_extra_nonce(*hooks.extra_nonce_base);   // GAP-2
+    if (hooks.job_binder) listener.set_job_binder(hooks.job_binder);                     // SEAM-1
     // Seed prefetch on the LISTENER thread, before jobs are pushed (Argon2d
     // cache init never lands inside a miner's submit).
     listener.set_template_hook([&](const strat::TemplateJob& peek) { rx.on_template(peek); });
@@ -528,6 +545,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             const std::uint32_t n = template_source.max_extra_nonces();
             mine_extra_nonce = n ? (n - 1) : 0;
             if (hooks.extra_nonce_base) mine_extra_nonce = *hooks.extra_nonce_base - 1;   // GAP-2: node-private slot
+            if (hooks.job_binder) hooks.job_binder(mine_extra_nonce, std::string());        // SEAM-1: the miner's fixed slot
             std::printf("cpu-miner: ENABLED threads=%u mode=%s huge-pages=%s affinity=%s "
                         "extra_nonce=%u (in-process; no external miner)\n",
                         cpu_miner->threads_wanted(),
@@ -1130,9 +1148,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                         "(its file stand-ins) are mutually exclusive\n");
             return 2;
         }
-        if (cfg.network == MoneroNetwork::Mainnet) {
-            std::printf("REFUSED: the stage-1 receipt relay is regtest/stagenet/testnet only: the payee/give-author PoW "
-                        "binding (SEAM-1, coinbase 0x02 [extra_nonce|rbind]) is not in the template yet\n");
+        if (g_relay_bind != "none" && g_relay_bind != "rbind") {
+            std::printf("REFUSED: --relay-bind takes none|rbind\n");
+            return 2;
+        }
+        // SEAM-1: the template now writes rbind into the coinbase 0x02 region, so
+        // the relay may run on mainnet -- but ONLY with the payee/give-author PoW
+        // binding active (--relay-bind rbind). bind=none stays regtest/stagenet/testnet.
+        if (cfg.network == MoneroNetwork::Mainnet && g_relay_bind != "rbind") {
+            std::printf("REFUSED: the receipt relay on mainnet requires --relay-bind rbind (the payee/give-author PoW "
+                        "binding, SEAM-1, coinbase 0x02 [extra_nonce|rbind]); bind=none is regtest/stagenet/testnet only\n");
             return 2;
         }
         if (cfg.coinbase != CoinbaseMode::V37Settlement) {
@@ -1143,14 +1168,36 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::printf("REFUSED: the receipt relay needs a fixed --share-diff (the R-1 target every node must share)\n");
             return 2;
         }
-        if (g_relay_bind != "none" && g_relay_bind != "rbind") {
-            std::printf("REFUSED: --relay-bind takes none|rbind\n");
-            return 2;
-        }
         if (g_relay_order != "canonical" && g_relay_order != "arrival") {
             std::printf("REFUSED: --relay-order takes canonical|arrival\n");
             return 2;
         }
+    }
+    // fee model (S4): LaneParams::fee. OFF (default) => master-identical; ON is a
+    // lane-level consensus choice every peer must share (folded into the relay's
+    // lane_params_digest, so a mixed fleet refuses at HELLO).
+    if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params)) {
+        if (cfg.coinbase != CoinbaseMode::V37Settlement) {
+            std::printf("REFUSED: --fee-model v1 shapes the v37 settlement coinbase; it needs --coinbase v37\n");
+            return 2;
+        }
+        if (relay_enabled() && g_relay_bind != "rbind") {
+            std::printf("REFUSED: --fee-model v1 with the receipt relay needs --relay-bind rbind: the give-author u16 and "
+                        "the owner-fee payee must be PoW-bound in the receipt (S3), not merely carried\n");
+            return 2;
+        }
+        if (!g_credit_feed.empty()) {
+            std::printf("REFUSED: --fee-model v1 reads give-author only from the PoW-committed relay receipt (S3), never "
+                        "from a feed line; drop --credit-feed (use --relay-listen/--relay-peer with --relay-bind rbind)\n");
+            return 2;
+        }
+    } else if (cfg.lane_params.fee.enabled) {
+        std::printf("REFUSED: unknown fee-model version %u\n", cfg.lane_params.fee.version);
+        return 2;
+    } else if (g_give_author_pct != 0.0 || g_owner_fee_pct != 0.0 || !g_owner_address.empty()) {
+        std::printf("REFUSED: --give-author-pct / --node-owner-fee-pct / --node-owner-address need --fee-model v1 "
+                    "(the fee model is OFF: this node is master-identical)\n");
+        return 2;
     }
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
@@ -1329,6 +1376,9 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::mutex    relay_log_mtx;
     std::vector<std::string> relay_log_q;
     std::atomic<std::uint64_t> mint_ok{0}, mint_fail{0}, mint_below{0}, mint_nopayee{0};
+    std::atomic<std::uint64_t> bind_jobs{0}, bind_owner{0}, bind_nopayee{0};   // SEAM-1 job bindings (owner-fee hits)
+    std::mt19937_64 bind_rng{std::random_device{}()};                          // SEAM-1 owner-fee roll (under mint_mtx)
+    std::shared_ptr<relay::RbindRegistry> rbind_reg;                           // SEAM-1 (null unless --relay-bind rbind)
     std::mutex    mint_mtx;                                   // payee cache + last error (listener + main thread)
     std::string   mint_last_err;
     std::map<std::string, std::optional<::v37::ScriptRef>> mint_payee_cache;
@@ -1355,6 +1405,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::vector<::v37::bytes32> keys;
         for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
         for (const auto& k : cba_fx->keys()) keys.push_back(k);
+        // fee model ON (S1/S4): the residual sink IS the donation address, and a lane coinbase
+        // without the one mandatory donation output (owed + 1 + residual) is REFUSED here (every node,
+        // own wins included). OFF: master's booking against the configured residual sink.
+        if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))
+            return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, cba_fx->pay_of());
         return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
                             cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
     };
@@ -1450,10 +1505,13 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;
         pushes.reserve(ids.size());
+        const bool fee_on = c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params);
         for (const auto& id : ids) {
-            ::v37::ScriptRef payee;
-            if (!relay_node->cached(id, &payee)) { ++cut_pending; why = "cut-pending: a repaired receipt left the verified cache (retry)"; return nullptr; }
-            pushes.emplace_back(payee, relay::kReceiptWeight);
+            ::v37::ScriptRef payee; std::uint16_t give_author = 0;
+            if (!relay_node->cached(id, &payee, &give_author)) { ++cut_pending; why = "cut-pending: a repaired receipt left the verified cache (retry)"; return nullptr; }
+            // fee model S3: the SAME split the live ingest applies, by the receipt's OWN PoW-committed u16.
+            for (const auto& pr : c2pool::v37n::xmr::fee::receipt_lane_pushes(payee, give_author, fee_on, relay::kReceiptWeight))
+                pushes.push_back(pr);
         }
         c2pool::v37n::V37Engine scratch;
         scratch.start();
@@ -1875,26 +1933,78 @@ static int run_live(const XmrNodeConfig& cfg) {
     // to PR #1534; option B (v37 settlement coinbase) drives the SAME listener /
     // RandomX gate / live submitter / finalize-connect through serve_and_run.
     if (cfg.coinbase == CoinbaseMode::V37Settlement) {
-        // fail-closed: v37 mode serves only with a torsion-valid residual sink.
-        const bool serving =
-            !cfg.residual_sink_spend_hex.empty() && !cfg.residual_sink_view_hex.empty();
-
+        // fee model (xmr/xmr_fee_model.hpp, LaneParams::fee). ON: the residual sink IS
+        // the protocol donation address and the ONE donation output (owed + 1 + residual, S1 + merge) is a
+        // mandated fixed output, both from compiled-in constants -- no node can omit or
+        // redirect them. OFF (default): master's per-node residual sink, byte-identical.
+        namespace fee = ::c2pool::v37n::xmr::fee;
+        const bool fee_on = fee::fee_model_on(cfg.lane_params);
         o2::XmrSettlementConfig scfg;
         scfg.chain_id   = cfg.lane_chain;
         scfg.h_min      = cfg.settle_h_min;
         scfg.output_cap = cfg.settle_output_cap;
-        std::array<std::uint8_t, 32> sink_B{}, sink_A{};
-        if (serving) {
-            if (!o2::hex32(cfg.residual_sink_spend_hex, sink_B) ||
-                !o2::hex32(cfg.residual_sink_view_hex, sink_A) ||
-                !scfg.set_residual_sink_hex(cfg.residual_sink_spend_hex, cfg.residual_sink_view_hex,
-                                            cfg.residual_sink_subaddress)) {
-                std::printf("REFUSED: --residual-sink-spend-hex/--residual-sink-view-hex must both be "
-                            "64 hex chars (the XMR wallet the exact-sum residual is paid to)\n");
+        bool serving = false;
+        if (fee_on) {
+            if (!cfg.residual_sink_spend_hex.empty() || !cfg.residual_sink_view_hex.empty() || cfg.residual_sink_subaddress) {
+                std::printf("REFUSED: --fee-model v1: the exact-sum residual is the mandatory protocol donation output "
+                            "(xmr_fee_model.hpp), not a per-node --residual-sink-* setting\n");
                 node.stop();
                 return 2;
             }
+            scfg.residual_sink          = fee::donation_ref();
+            scfg.residual_sink_identity = fee::donation_identity();
+            scfg.fixed                  = {fee::donation_marker()};
+            if (!::v37::xmr::xmr_ref_valid(scfg.residual_sink)) {
+                std::printf("REFUSED: the compiled-in donation address does not torsion-check as an XMR "
+                            "payout ref (ed25519 point-check backend missing?)\n");
+                node.stop();
+                return 2;
+            }
+            serving = true;
+        } else {
+            // fail-closed: v37 mode serves only with a torsion-valid residual sink.
+            serving = !cfg.residual_sink_spend_hex.empty() && !cfg.residual_sink_view_hex.empty();
+            std::array<std::uint8_t, 32> sink_B{}, sink_A{};
+            if (serving) {
+                if (!o2::hex32(cfg.residual_sink_spend_hex, sink_B) ||
+                    !o2::hex32(cfg.residual_sink_view_hex, sink_A) ||
+                    !scfg.set_residual_sink_hex(cfg.residual_sink_spend_hex, cfg.residual_sink_view_hex,
+                                                cfg.residual_sink_subaddress)) {
+                    std::printf("REFUSED: --residual-sink-spend-hex/--residual-sink-view-hex must both be "
+                                "64 hex chars (the XMR wallet the exact-sum residual is paid to)\n");
+                    node.stop();
+                    return 2;
+                }
+            }
         }
+
+        // fee model: node-local JOB policy (the payee + give-author a job's rbind commits to).
+        std::optional<::v37::ScriptRef> owner_ref;
+        const std::uint32_t owner_bp = fee_on ? fee::pct_to_bp(g_owner_fee_pct) : 0;
+        const std::uint16_t my_give_author = fee_on ? fee::give_author_u16(g_give_author_pct) : 0;
+        if (fee_on && !g_owner_address.empty()) {
+            const fee::DecodedAddress da = fee::decode_xmr_address(g_owner_address);
+            if (!da.ok || da.subaddress || !::v37::xmr::xmr_ref_valid(da.ref())) {
+                std::printf("REFUSED: --node-owner-address is not a valid standard Monero address (%s)\n",
+                            da.ok ? (da.subaddress ? "subaddress not supported as a payee" : "point check failed") : da.why.c_str());
+                node.stop();
+                return 2;
+            }
+            owner_ref = da.ref();
+        }
+        if (owner_bp && !owner_ref) {
+            std::printf("REFUSED: --node-owner-fee-pct > 0 needs --node-owner-address\n");
+            node.stop();
+            return 2;
+        }
+        if (fee_on)
+            std::printf("fee-model: v%u ON | donation=%s… (identity %s…) ONE mandatory output = max(%llu, residual) "
+                        "(residual folds in, S1; dust from the LARGEST payee, S2) | give-author %.4f%% (u16=%u, PoW-bound "
+                        "in this node's receipts, S3) | node-owner fee %.4f%% -> %s (rolled at job issue) | finder bonus: NONE\n",
+                        cfg.lane_params.fee.version, std::string(fee::kDonationAddress).substr(0, 12).c_str(),
+                        hex_of(fee::donation_identity()).substr(0, 12).c_str(),
+                        static_cast<unsigned long long>(fee::kDonationDustPico), g_give_author_pct, (unsigned)my_give_author,
+                        g_owner_fee_pct, g_owner_address.empty() ? "-" : g_owner_address.substr(0, 12).c_str());
 
         // The proof ledger (no live S-1 emission yet). Empty => the whole reward
         // flows to the residual sink (one v37 output). --owed-demo-amount seeds a
@@ -1917,6 +2027,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
         if (cba_payee_ref) ledger.learn_ref(*cba_payee_ref);
+        if (fee_on) ledger.learn_ref(fee::donation_ref());   // fee model: give-author credit is paid as an ordinary owed output to the donation
+        if (owner_ref) ledger.learn_ref(*owner_ref);          // fee model: owner-fee receipts pay the owner
         std::printf("cba: coinbase-authority booking ARMED (lane_chain=%u, payee %s, sink identity %s…)\n", cfg.lane_chain,
                     cba_payee ? "learned" : "none", hex_of(scfg.residual_sink_identity).substr(0, 12).c_str());
         if (serving && cfg.owed_demo_amount) {
@@ -1979,6 +2091,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // mattered.
         std::uint64_t shape_ok = 0, shape_refused = 0;
         std::string   last_shape;
+        std::string   last_fee_tpl_key;   // fee model: one fee-tpl line per (height, parent, owed_digest, EffectiveOwed) state
         // n_tx of the block the gate judged -- the SELECTED count, which is not
         // the same number as the backlog the arm OFFERED. The assembler applies
         // monerod's own 5-second age gate (xmr_block_template.cpp), so a
@@ -1998,6 +2111,54 @@ static int run_live(const XmrNodeConfig& cfg) {
                     if (w) *w = sh.why;
                     return false;
                 }
+                // fee model (gate ON only): the serve-side REFUSE-IF-ABSENT property. The
+                // canonical coinbase (already byte-matched against the parsed block above) must
+                // end in the ONE donation output (>= 1 piconero, the residual folded in, S1).
+                if (fee_on) {
+                const fee::MarkerLocation dm = fee::inspect_donation_marker(t.outputs(), fee::donation_identity());
+                if (!dm.ok) {
+                    ++shape_refused;
+                    last_shape += " | " + dm.why;
+                    if (w) *w = dm.why;
+                    return false;
+                }
+                // fee model evidence: a digest of the payout vector (amount + one-time key per vout,
+                // canonical order) -- equal on two nodes at the same input state (key below) iff
+                // they built byte-identical coinbase outputs, whatever their give-author %.
+                {
+                    std::vector<std::uint8_t> pv;
+                    for (const auto& o : t.outputs()) {
+                        for (int b = 0; b < 8; ++b) pv.push_back(static_cast<std::uint8_t>(o.amount >> (8 * b)));
+                        pv.insert(pv.end(), o.one_time_key.data(), o.one_time_key.data() + 32);
+                    }
+                    const auto od = ::xmr::coin::keccak256(pv.data(), pv.size());
+                    std::uint64_t don_total = 0, sum = 0;
+                    for (const auto& o : t.outputs()) { sum += o.amount; if (o.identity == fee::donation_identity()) don_total += o.amount; }
+                    // the full input state the outputs are a function of: height, parent, the
+                    // owed_digest (finalized partition) AND the pending-netted EffectiveOwed map
+                    // (a pending payout moves the owed set without moving owed_digest).
+                    std::vector<std::uint8_t> eb;
+                    for (const auto& [k, v] : ledger.ledger().effective_owed_all()) {
+                        eb.insert(eb.end(), k.begin(), k.end());
+                        for (int b = 0; b < 8; ++b) eb.push_back(static_cast<std::uint8_t>(static_cast<unsigned long long>(v) >> (8 * b)));
+                    }
+                    const auto eoh = ::xmr::coin::keccak256(eb.data(), eb.size());
+                    const std::string prev12 = sub::to_hex(t.prev_id().data(), t.prev_id().size()).substr(0, 12);
+                    std::string key = std::to_string(t.height()) + ":" + prev12 + ":" + hex_of(ledger.ledger().owed_digest()).substr(0, 12) +
+                                      ":" + sub::to_hex(eoh.data(), eoh.size()).substr(0, 12);
+                    if (key != last_fee_tpl_key) {
+                        last_fee_tpl_key = key;
+                        std::printf("fee-tpl: h=%llu prev=%s owed_digest=%s… eo=%s outs=%zu outputs_digest=%s donation_output=%llu@%zu donation_total=%llu sum=%llu reward=%llu exact_sum=%s\n",
+                                    static_cast<unsigned long long>(t.height()), prev12.c_str(), hex_of(ledger.ledger().owed_digest()).substr(0, 12).c_str(),
+                                    sub::to_hex(eoh.data(), eoh.size()).substr(0, 12).c_str(),
+                                    t.outputs().size(), sub::to_hex(od.data(), od.size()).substr(0, 16).c_str(),
+                                    static_cast<unsigned long long>(t.outputs()[dm.marker].amount), dm.marker,
+                                    static_cast<unsigned long long>(don_total), static_cast<unsigned long long>(sum),
+                                    static_cast<unsigned long long>(t.reward()), sum == t.reward() ? "YES" : "NO");
+                        std::fflush(stdout);
+                    }
+                }
+                }   // fee_on
                 ++shape_ok;
                 return true;
             });
@@ -2053,6 +2214,7 @@ static int run_live(const XmrNodeConfig& cfg) {
 
         // ── GAP-2: the real sharechain relay (replaces --credit-feed / --wire-*) ──
         std::function<void(const strat::AcceptedShare&)> relay_on_share;
+        std::function<void(std::uint32_t, const std::string&)> job_binder;   // SEAM-1
         std::function<void()> relay_tick;
         std::uint64_t relay_index_best = 0;
         std::map<std::uint64_t, node::Hash> relay_hdr_by_height;   // GAP-2: height -> block id (header cache)
@@ -2083,7 +2245,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.chain = cfg.lane_chain;
             ro.share_diff = cfg.stratum_share_diff;
             ro.bind = bind;
-            ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind);
+            ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind);   // S4: + FeeModelGate iff ON
+            ro.max_pushes_per_receipt = fee_on ? 2 : 1;   // fee model S3: (payee, donation) split
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -2138,6 +2301,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
                 io.durable_path = cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain) + ".receipts";
             }
+            io.fee_model = fee_on;   // fee model S3: push split by the receipt's own PoW-committed give_author
             relay_ingest = std::make_unique<relay::XmrReceiptIngest>(
                 io,
                 [&](const ::v37::ScriptRef& payee, std::uint64_t w, std::uint64_t& next_after, ::v37::bytes32& dig) -> bool {
@@ -2151,8 +2315,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                     if (s) dig = s->digest;
                     return true;
                 },
-                [&](const relay::Admitted& a, std::uint64_t pos_first, std::uint64_t next_after, const ::v37::bytes32& dig) {
-                    relay_node->on_pushed(a.id, pos_first, 1, a.raw, next_after, dig);
+                [&](const relay::Admitted& a, std::uint64_t pos_first, std::uint32_t n_pushes, std::uint64_t next_after, const ::v37::bytes32& dig) {
+                    relay_node->on_pushed(a.id, pos_first, n_pushes, a.raw, next_after, dig);
                     ledger.learn_ref(a.r.payee);   // every node can resolve every credited payee's output
                 });
             const std::size_t reloaded = relay_ingest->reload([&](const relay::Admitted& a) {
@@ -2177,8 +2341,55 @@ static int run_live(const XmrNodeConfig& cfg) {
                             rxp->describe().c_str());
                 if (bind == relay::BindMode::None)
                     std::printf("relay: NOTE bind=none -- receipts are PoW-verified (opening -> tree_root -> RandomX >= share_diff) "
-                                "but the payee/give-author are NOT PoW-bound until SEAM-1 puts rbind in the coinbase 0x02 region\n");
+                                "but the payee/give-author are NOT PoW-bound (run --relay-bind rbind: SEAM-1 writes rbind into the coinbase 0x02 region)\n");
                 std::fflush(stdout);
+            }
+            // SEAM-1 (--relay-bind rbind): the per-JOB binding. The stratum server calls the
+            // binder with (extra_nonce, login address) right before the job's blob is built;
+            // the payee is decided HERE -- the node-owner fee roll happens at job issue (v36
+            // work.py) -- together with this node's give-author u16, and the template writes
+            // rbind_v1(chain, side) into coinbase 0x02[4..36). The share the miner finds on
+            // that job is RandomX-bound to (payee, give-author); the mint reads the SAME entry.
+            if (bind == relay::BindMode::Rbind) {
+                rbind_reg = std::make_shared<relay::RbindRegistry>();
+                std::shared_ptr<relay::RbindRegistry> reg = rbind_reg;
+                provider.set_extra_nonce_bind(relay::RbindRegistry::kBindBytes,
+                    [reg](std::uint32_t en, std::uint8_t* out) { return reg->bind_bytes(en, out); });
+                const std::uint64_t share_diff = cfg.stratum_share_diff;
+                const std::uint32_t lane = cfg.lane_chain;
+                job_binder = [&, reg, share_diff, lane, owner_bp, my_give_author](std::uint32_t en, const std::string& address) {
+                    std::optional<::v37::ScriptRef> miner;
+                    if (!address.empty()) {
+                        std::lock_guard<std::mutex> lk(mint_mtx);
+                        auto it = mint_payee_cache.find(address);
+                        if (it == mint_payee_cache.end()) {
+                            std::optional<::v37::ScriptRef> r;
+                            if (const auto da = relay::decode_address(address)) {
+                                const ::v37::ScriptRef ref = da->ref();
+                                if (::v37::xmr::xmr_ref_valid(ref)) r = ref;
+                            }
+                            if (!r && cba_payee_ref) r = *cba_payee_ref;
+                            it = mint_payee_cache.emplace(address, r).first;
+                            if (mint_payee_cache.size() > 4096) mint_payee_cache.clear();
+                        }
+                        miner = it->second;
+                    } else if (cba_payee_ref) {
+                        miner = *cba_payee_ref;   // the in-process miner's slot: the node's own payee
+                    }
+                    if (!miner) { ++bind_nopayee; return; }   // unbound job: its shares cannot mint (fail-closed)
+                    std::uint64_t roll = 0;
+                    { std::lock_guard<std::mutex> lk(mint_mtx); roll = bind_rng(); }
+                    bool owner_hit = false;
+                    const ::v37::ScriptRef payee = address.empty() ? *miner
+                        : fee::choose_payee(*miner, owner_ref, owner_bp, roll, &owner_hit);
+                    if (reg->put(en, relay::make_job_binding(lane, share_diff, payee, my_give_author, owner_hit))) {
+                        ++bind_jobs;
+                        if (owner_hit) ++bind_owner;
+                    }
+                };
+                std::printf("relay: SEAM-1 rbind ACTIVE -- coinbase 0x02 = [extra_nonce 4 | rbind 32 | pad | tail]; payee + "
+                            "give-author (u16=%u) PoW-bound per job; node-owner fee %.4f%% rolled at job issue\n",
+                            (unsigned)my_give_author, fee_on ? g_owner_fee_pct : 0.0);
             }
             // MINT (stratum listener thread, or the main thread for --mine hits).
             const std::uint64_t share_diff = cfg.stratum_share_diff;
@@ -2192,7 +2403,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                 ::v37::bytes32 pow{}; std::memcpy(pow.data(), acc.pow_hash.data(), 32);
                 if (!relay::meets_share_diff(pow, share_diff)) { ++mint_below; return; }   // lax top-64 accept, exact rule refuses
                 std::optional<::v37::ScriptRef> payee;
-                {
+                relay::SideDataV2 side;
+                if (bind == relay::BindMode::Rbind) {
+                    // SEAM-1: the job's binding IS the receipt's (payee, side) -- the coinbase
+                    // the share hashed commits to exactly these bytes.
+                    const auto jb = rbind_reg ? rbind_reg->get(acc.extra_nonce) : std::nullopt;
+                    if (!jb) { ++mint_nopayee; return; }
+                    payee = jb->payee;
+                    side = jb->side;
+                } else {
                     std::lock_guard<std::mutex> lk(mint_mtx);
                     auto it = mint_payee_cache.find(acc.address);
                     if (it == mint_payee_cache.end()) {
@@ -2206,15 +2425,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                         if (mint_payee_cache.size() > 4096) mint_payee_cache.clear();
                     }
                     payee = it->second;
+                    if (payee) {
+                        side.t_lo = share_diff; side.identity = ::v37::xmr::xmr_identity_key(*payee); side.chain_id = lane;
+                        side.give_author = 0;   // bind=none: never PoW-bound, so never a give-author (the fee model needs rbind)
+                    }
                 }
                 if (!payee) { ++mint_nopayee; return; }
                 sub::BlockCandidate c; std::string w;
                 if (!provider.candidate_by_id(acc.template_id, acc.extra_nonce, c, &w)) { fail("candidate: " + w); return; }
                 std::vector<std::uint8_t> hb = c.hashing_blob;
                 if (!sub::patch_u32_le(hb, c.nonce_offset, acc.nonce)) { fail("nonce patch"); return; }
-                relay::SideDataV2 side;
-                side.t_lo = share_diff; side.identity = ::v37::xmr::xmr_identity_key(*payee); side.chain_id = lane;
-                side.give_author = 0;   // SEAM-3: PR c2pool#1710 carries the node's give-author here
                 relay::FbReceipt fb;
                 if (!relay::mint_receipt(c.full_blob, hb, side, *payee, fb, &w)) { fail(w); return; }
                 relay::CheckCtx cc; cc.lane_chain = lane; cc.share_diff = share_diff; cc.bind = bind; cc.check_payee_point = false;
@@ -2330,6 +2550,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         ServeHooks hooks;
         hooks.cba_tick = [&]() { cba_ring_push(); feed_pump(); wire_pump(); if (relay_tick) relay_tick(); };   // recon(A+B credit): + receipt feed + v0x02 fast path (+ GAP-2 relay)
         hooks.on_share = relay_on_share;
+        hooks.job_binder = job_binder;   // SEAM-1 (unset unless --relay-bind rbind)
         if (relay_node) {
             // GAP-2: disjoint per-node miner search spaces (see XmrStratumServer::seed_extra_nonce).
             std::random_device rd;
@@ -2390,13 +2611,14 @@ static int run_live(const XmrNodeConfig& cfg) {
                 { std::lock_guard<std::mutex> lk(mint_mtx); le = mint_last_err; }
                 const std::string lr = relay_node->last_reject();
                 std::printf("  relay-ingest: order=%s pushed=%llu late=%llu bins_closed=%llu pending=%zu(bins=%zu) reloaded=%llu durable=%llu | "
-                            "mint ok=%llu fail=%llu below=%llu nopayee=%llu | cut via relay: own-replay=%llu repaired=%llu repair-rejected=%llu | chain_view=%zu tip=%llu%s%s%s%s\n",
+                            "mint ok=%llu fail=%llu below=%llu nopayee=%llu | rbind jobs=%llu owner-fee=%llu unbound=%llu | cut via relay: own-replay=%llu repaired=%llu repair-rejected=%llu | chain_view=%zu tip=%llu%s%s%s%s\n",
                             relay_ingest->options().order == relay::XmrReceiptIngest::Order::Canonical ? "canonical" : "arrival",
                             (unsigned long long)is.pushed, (unsigned long long)is.late, (unsigned long long)is.bins_closed,
                             relay_ingest->pending_receipts(), relay_ingest->pending_bins(),
                             (unsigned long long)is.reloaded, (unsigned long long)is.durable_writes,
                             (unsigned long long)mint_ok.load(), (unsigned long long)mint_fail.load(),
                             (unsigned long long)mint_below.load(), (unsigned long long)mint_nopayee.load(),
+                            (unsigned long long)bind_jobs.load(), (unsigned long long)bind_owner.load(), (unsigned long long)bind_nopayee.load(),
                             (unsigned long long)relay_own_replay, (unsigned long long)relay_cut_repaired, (unsigned long long)relay_repair_rejected,
                             relay_chain.size(), (unsigned long long)relay_chain.tip(),
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
@@ -2716,6 +2938,17 @@ int main(int argc, char** argv) {
         else if (a == "--residual-sink-spend-hex") cfg.residual_sink_spend_hex = next("");
         else if (a == "--residual-sink-view-hex")  cfg.residual_sink_view_hex = next("");
         else if (a == "--residual-sink-subaddress") cfg.residual_sink_subaddress = true;
+        // fee model (LaneParams::fee, S4): off (default, master-identical) | v1
+        else if (a == "--fee-model") {
+            const std::string m = next("off");
+            if (m == "off" || m == "0") cfg.lane_params.fee = ::v37::FeeModelGate{};
+            else if (m == "v1" || m == "1") cfg.lane_params.fee = ::v37::FeeModelGate::for_version(1);
+            else { std::printf("REFUSED: --fee-model takes off|v1, got \"%s\"\n", m.c_str()); return 2; }
+        }
+        // fee model: node-local JOB policy under the gate (see xmr/xmr_fee_model.hpp)
+        else if (a == "--give-author-pct")    g_give_author_pct = std::stod(next("0"));
+        else if (a == "--node-owner-fee-pct") g_owner_fee_pct = std::stod(next("0"));
+        else if (a == "--node-owner-address") g_owner_address = next("");
         else if (a == "--settle-h-min") cfg.settle_h_min = std::stoull(next("0"));
         else if (a == "--settle-output-cap") cfg.settle_output_cap =
                      static_cast<std::uint32_t>(std::stoul(next("0")));
@@ -2845,14 +3078,16 @@ int main(int argc, char** argv) {
                 "  --same-height-journal <path|off>   per-height verdict journal\n"
                 "                               (default: race.log next to the settle store)\n"
                 "  --data-dir <path>            override the settlement store dir\n"
-                " GAP-2 receipt relay (c2pool<->c2pool over TCP; OFF by default; --coinbase v37, regtest/stagenet/testnet):\n"
+                " GAP-2 receipt relay (c2pool<->c2pool over TCP; OFF by default; --coinbase v37; mainnet only with rbind):\n"
                 "  --relay-listen HOST:PORT     bind the receipt relay\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
                 "  --relay-vault-entries N --relay-vault-bytes N --relay-vault-horizon N  --no-relay-serve\n"
-                "  --relay-bind none|rbind      rbind = require the SEAM-1 payee binding in the coinbase\n"
+                "  --relay-bind none|rbind      rbind = write + require the SEAM-1 payee/give-author\n"
+                "                               binding (coinbase 0x02 [extra_nonce|rbind]); mainnet\n"
+                "                               and --fee-model v1 relays need it\n"
                 "                               (mutually exclusive with --credit-feed / --wire-in / --wire-out)\n"
                 "  --no-found-sidecar           do not persist pending FOUNDs across restarts\n"
                 "  --i-understand-mainnet       required to settle a mainnet block\n"
@@ -2886,9 +3121,21 @@ int main(int argc, char** argv) {
                 " option B (X9): the v37 K_fair SETTLEMENT coinbase (not monerod's template):\n"
                 "  --coinbase <monerod|v37>     monerod (default, option A) | v37 (option B)\n"
                 "  --residual-sink-spend-hex <64hex> --residual-sink-view-hex <64hex>\n"
-                "                               REQUIRED for v37 mode: the XMR wallet the exact-sum\n"
-                "                               residual is paid to (torsion-checked at build)\n"
+                "                               REQUIRED for v37 mode with the fee model OFF: the XMR\n"
+                "                               wallet the exact-sum residual is paid to\n"
                 "  --residual-sink-subaddress   the sink keys are a subaddress (D_i, A_main)\n"
+                "  --fee-model <off|v1>         the v36 fee model (LaneParams::fee; default off =\n"
+                "                               master-identical). v1: ONE mandatory donation output\n"
+                "                               = max(1 pico, residual) (compiled-in address, the\n"
+                "                               residual sink; --residual-sink-* refused), the dust\n"
+                "                               from the LARGEST payee, receipts pushed at 65535 split\n"
+                "                               by their PoW-bound give-author u16. Every peer must\n"
+                "                               agree (folded into the relay HELLO digest)\n"
+                "  --give-author-pct <p>        (v1) give-author %% carried as a u16 in the receipts\n"
+                "                               THIS node's jobs bind (default 0; folded everywhere)\n"
+                "  --node-owner-fee-pct <p>     (v1) probability %% that a job commits to the node\n"
+                "                               owner instead of the miner (default 0; job issue)\n"
+                "  --node-owner-address <addr>  (v1) the node owner's standard address\n"
                 "  --settle-h-min <pico>        owed-output floor (0 on XMR)\n"
                 "  --settle-output-cap <n>      TOTAL outputs cap (0 = weight-aware default)\n"
                 "  --owed-demo-amount <pico>    seed one K_fair OWED payee into the proof ledger\n"

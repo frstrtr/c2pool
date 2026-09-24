@@ -68,7 +68,10 @@ inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 //     mandated fixed outputs ++ exact-sum residual sink), assembled from
 //     get_miner_data over the W4 OwedLedger. Requires a torsion-valid residual
 //     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
-//     without a valid sink the daemon refuses to serve.
+//     without a valid sink the daemon refuses to serve. Under --fee-model v1
+//     (LaneParams::fee) the ONE mandated fixed output is the protocol donation
+//     output (owed + 1 + residual) and the residual sink IS the donation address
+//     (xmr_fee_model.hpp, compiled-in -- no per-node knob).
 enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
 
 // M2: which miner-data source the option-B assembler is fed from.
@@ -247,10 +250,12 @@ struct XmrNodeConfig {
     // the coinbase bytes (it may stay empty; the serve port opens when the
     // residual sink is set, mirroring option A's payout_address gate).
     CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
-    // The mandated residual sink (REQUIRED for v37 mode): the raw public spend
-    // (B) + view (A) keys, 64 hex each, of the XMR wallet the exact-sum residual
-    // is paid to. Torsion-checked at build; the daemon REFUSES v37 mode without
-    // a valid sink. --residual-sink-subaddress builds an XMR_SUB (D_i, A_main).
+    // The mandated residual sink (REQUIRED for v37 mode with the fee model OFF):
+    // the raw public spend (B) + view (A) keys, 64 hex each, of the XMR wallet
+    // the exact-sum residual is paid to. Torsion-checked at build; the daemon
+    // REFUSES v37 mode without a valid sink. --residual-sink-subaddress builds
+    // an XMR_SUB (D_i, A_main). With --fee-model v1 (LaneParams::fee) the sink
+    // IS the protocol donation address (xmr_fee_model.hpp) and these are refused.
     std::string     residual_sink_spend_hex;
     std::string     residual_sink_view_hex;
     bool            residual_sink_subaddress = false;

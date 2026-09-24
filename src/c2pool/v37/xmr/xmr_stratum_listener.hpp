@@ -160,6 +160,8 @@ public:
     // GAP-2: a node-chosen extra_nonce base (see XmrStratumServer::seed_extra_nonce).
     // Call before start().
     void seed_extra_nonce(std::uint32_t base) { m_server.seed_extra_nonce(base); }
+    // SEAM-1: per-job binding hook (see XmrStratumServer::set_job_binder). Call before start().
+    void set_job_binder(::v37::xmr::stratum::XmrStratumServer::JobBinder f) { m_server.set_job_binder(std::move(f)); }
 
     ~StratumListener() override { stop(); }
 
