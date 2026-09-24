@@ -112,6 +112,7 @@
 #include "xmr/relay/xmr_receipt_mint.hpp"      // share -> PoW-carrying receipt; the structural check
 #include "xmr/relay/xmr_relay_node.hpp"        // TCP relay: HELLO gate, verify worker (RandomX LAST), flood, backfill, repair
 #include "xmr/relay/xmr_receipt_ingest.hpp"    // admitted receipts -> the lane (ordering policy + durable log)
+#include "xmr/relay/xmr_relay_native_ctx.hpp"   // RC-CTX: receipt contexts from the native node + the own-template journal
 #include "xmr/relay/xmr_address.hpp"           // login address (base58) -> payee ref
 #include "xmr/relay/xmr_rbind_registry.hpp"    // SEAM-1: per-job rbind (payee + give-author) the template writes
 
@@ -1402,6 +1403,9 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::string   mint_last_err;
     std::map<std::string, std::optional<::v37::ScriptRef>> mint_payee_cache;
     relay::ChainView                          relay_chain;
+    relay::NativeCtxSource                    relay_native_ctx;   // RC-CTX: unset unless a native node runs
+    relay::NativeCtxFeeder                    relay_ctx_feeder;
+    relay::CtxJournal                         relay_ctx_journal;
     std::unique_ptr<o2::O2RandomXVerifier>    relay_rx;       // the verify worker's own light VM (+256 MiB)
     std::unique_ptr<relay::XmrRelayNode>      relay_node;
     std::unique_ptr<relay::XmrReceiptIngest>  relay_ingest;
@@ -2333,6 +2337,37 @@ static int run_live(const XmrNodeConfig& cfg) {
             {
                 std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
                 io.durable_path = cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain) + ".receipts";
+                // RC-CTX (3): the contexts of the templates this node issued survive a restart
+                relay_ctx_journal = relay::CtxJournal(cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain) + ".ctx");
+                const std::size_t nctx = relay_ctx_journal.load(relay_chain);
+                std::printf("relay: receipt-context journal %s reloaded=%zu%s\n", relay_ctx_journal.path().c_str(), nctx,
+                            relay_ctx_journal.bad_tail() ? " (a torn tail record was dropped)" : "");
+            }
+            // RC-CTX (1)+(2): the embedded native node's verified chain index is a
+            // context source on every arm it runs on (rows -> ChainView; retained
+            // bodies -> own wants + peers' FB_GETCTX).
+            if (native && native->node()) {
+                auto* nn = native->node();
+                relay_native_ctx.best_height = [nn]() -> std::optional<std::uint64_t> {
+                    const auto t = nn->index().tip();
+                    if (!t) return std::nullopt;
+                    return t->height;
+                };
+                relay_native_ctx.id_at = [nn](std::uint64_t h) -> std::optional<::v37::bytes32> {
+                    const auto b = nn->index().by_height(h);
+                    if (!b) return std::nullopt;
+                    ::v37::bytes32 id{}; std::memcpy(id.data(), b->id.data(), 32); return id;
+                };
+                relay_native_ctx.seed_for_bin = [nn](std::uint64_t bin) -> std::optional<::v37::bytes32> {
+                    const auto sd = nn->index().seed_hash_for_height(bin);
+                    if (!sd) return std::nullopt;
+                    ::v37::bytes32 s{}; std::memcpy(s.data(), sd->data(), 32); return s;
+                };
+                relay_native_ctx.block_blob = [nn](const ::v37::bytes32& id, std::vector<std::uint8_t>& blob) {
+                    node::Hash h{}; std::memcpy(h.data(), id.data(), 32);
+                    return nn->index().block_blob_of(h, blob);
+                };
+                std::printf("relay: receipt contexts from the native node (best-chain rows + retained bodies; FB_GETCTX served natively)\n");
             }
             io.fee_model = fee_on;   // fee model S3: push split by the receipt's own PoW-committed give_author
             relay_ingest = std::make_unique<relay::XmrReceiptIngest>(
@@ -2490,8 +2525,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                         relay_chain.note(prev, t.height, seed);
                         relay_chain.note_seed(::xmr::coin::rx_seedheight(t.height), seed);
                         relay_chain.set_tip(t.height);
+                        relay_ctx_journal.note(prev, t.height, seed);   // RC-CTX (3)
                     }
                 }
+                if (relay_native_ctx) relay_ctx_feeder.feed(relay_chain, relay_native_ctx);   // RC-CTX (1)
                 if (!p2p_first && !cfg.no_daemon_rpc) {
                     // The daemon arm: once per new tip, ONE get_block_headers_range over the
                     // last 128 blocks (+ the RandomX seed block, cached) so a peer receipt built
@@ -2538,6 +2575,11 @@ static int run_live(const XmrNodeConfig& cfg) {
                     auto get_block_blob = [&](const ::v37::bytes32& id) -> std::vector<std::uint8_t> {
                         const std::string hx = hex_of(id);
                         if (auto it = relay_ctx_blobs.find(hx); it != relay_ctx_blobs.end()) return it->second;
+                        {   // RC-CTX (2): the native node's retained body first -- no RPC
+                            std::vector<std::uint8_t> nb;
+                            if (relay_native_ctx.block_blob && relay_native_ctx.block_blob(id, nb) && !nb.empty() && nb.size() <= relay::kCtxMaxBlob)
+                                return nb;
+                        }
                         std::string body, err;
                         transport.rpc_post(node::MoneroDaemonRpc::body_get_block(0, hx),
                                            [&](const node::RpcResponse& r) { if (!r.ok()) err = r.error; else body.assign(r.body.begin(), r.body.end()); });
@@ -2563,8 +2605,11 @@ static int run_live(const XmrNodeConfig& cfg) {
                             --budget;
                             relay_node->send_ctx(pid, id, get_block_blob(id));
                         }
+                } else if (relay_native_ctx) {
+                    // RC-CTX (2), P2P-first arm: own wants + peers' FB_GETCTX from the native node's bodies
+                    relay_ctx_feeder.serve(*relay_node, relay_native_ctx);
                 } else {
-                    for (const auto& [pid, ids] : relay_node->drain_ctx_requests())   // P2P-first arm: no monerod RPC to serve from
+                    for (const auto& [pid, ids] : relay_node->drain_ctx_requests())   // no monerod RPC and no native node to serve from
                         for (const auto& id : ids) relay_node->send_ctx(pid, id, {});
                 }
                 {
@@ -2639,6 +2684,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         hooks.status_extra = [&]() {
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());
+                if (relay_native_ctx || relay_ctx_journal.written())
+                    std::printf("  %s | ctx-journal size=%zu written=%llu\n", relay_ctx_feeder.describe().c_str(),
+                                relay_ctx_journal.size(), (unsigned long long)relay_ctx_journal.written());
                 const auto& is = relay_ingest->stats();
                 std::string le;
                 { std::lock_guard<std::mutex> lk(mint_mtx); le = mint_last_err; }

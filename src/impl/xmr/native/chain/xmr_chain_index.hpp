@@ -674,6 +674,19 @@ public:
         return it->second.entry;
     }
 
+    // RC-CTX: the block blob of `id` from the bodies this index retains -- the
+    // entry cache (connected blocks, including ones a reorg disconnected) or a
+    // held alternative block's entry. Read-only; false when neither holds it.
+    // The relay serves a receipt's Monero context (FB_GETCTX) from here, and
+    // re-verifies every byte (id recomputed) before it uses one.
+    bool block_blob_of(const Hash& id, std::vector<std::uint8_t>& out) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = entries_.find(key_(id));
+        if (it != entries_.end() && !it->second.entry.block_blob.empty()) { out = it->second.entry.block_blob; return true; }
+        if (const AltBlock* a = alt_.find(id); a && a->has_entry && !a->entry.block_blob.empty()) { out = a->entry.block_blob; return true; }
+        return false;
+    }
+
     // --- the settlement clock ------------------------------------------------------------
     Burial burial_of(const Hash& id) const {
         std::lock_guard<std::mutex> lk(mu_);

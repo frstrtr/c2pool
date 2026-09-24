@@ -542,8 +542,9 @@ public:
 
     // ── receipt CONTEXT (FB_GETCTX / FB_CTX) ──────────────────────────────────
     // Main thread, the SERVING side: GETCTX requests peers sent us. The daemon
-    // answers each id with send_ctx() (its monerod's get_block blob, or empty =
-    // unknown here). Bounded; a daemon that never drains simply never serves.
+    // answers each id with send_ctx() (the block blob from its native node's
+    // retained bodies -- xmr_relay_native_ctx.hpp -- or, on the daemon arm, its
+    // monerod's get_block; empty = unknown here). Bounded; a daemon that never drains simply never serves.
     std::vector<std::pair<PeerId, std::vector<bytes32>>> drain_ctx_requests() {
         std::lock_guard<std::mutex> lk(m_cmtx);
         std::vector<std::pair<PeerId, std::vector<bytes32>>> out(m_ctx_serve.begin(), m_ctx_serve.end());
@@ -1021,6 +1022,11 @@ private:
                     continue;
                 }
                 if (w.have_proof) { retry_proofs.push_back(it->first); ++it; continue; }
+                if (m_chain.lookup(it->first)) {   // RC-CTX: resolved meanwhile by the ChainView's feeder (native index / journal)
+                    m_st.ctx_resolved++;
+                    it = m_ctx_want.erase(it);
+                    continue;
+                }
                 if (w.last_ask != Clock::time_point{} && now - w.last_ask < std::chrono::milliseconds(m_o.ctx_retry_ms)) { ++it; continue; }
                 PeerId pick = 0;
                 if (w.from && !w.asked.count(w.from) && std::find(ready.begin(), ready.end(), w.from) != ready.end()) pick = w.from;

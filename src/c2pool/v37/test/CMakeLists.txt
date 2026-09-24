@@ -479,8 +479,14 @@ if (BUILD_TESTING)
     #                               codec, verify_block_ctx, bounded retries +
     #                               failover, reconnect, recursive resolution,
     #                               a lying context rejected.
+    #   v37_xmr_relay_native_ctx_kat RC-CTX: on the P2P-first arm a receipt's
+    #                               Monero context resolves from the embedded
+    #                               native node (best-chain rows, retained and
+    #                               alternative bodies), FB_GETCTX is served
+    #                               from native bodies, and issued-template
+    #                               contexts survive a restart (journal).
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
