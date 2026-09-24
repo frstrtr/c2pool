@@ -489,6 +489,33 @@ if (BUILD_TESTING)
     # never unbounded.
     set_tests_properties(xmr_native_peer_pool_kat PROPERTIES TIMEOUT 300)
 
+    # D3a: the block DoS bucket against honest relay of VALID blocks. The REAL
+    # pool and the REAL chain index (the reorg-follow KAT's from-genesis regtest
+    # boot, model RandomX verifier) wired as the node wires them, against
+    # loopback monerod stand-ins: 3 links x 40 valid blocks must cost no frame,
+    # no ban and no link, while floods of unknown blocks, unparseable blocks and
+    # invalid blocks on the tip are dropped / banned at exactly the pre-fix
+    # message counts. Links xmr_coin for the block ids (keccak, tree hash), like
+    # the other C2 targets. Added to BOTH --target lists in build.yml.
+    add_executable(xmr_native_dos_dup_block_kat xmr_dos_dup_block_kat.cpp)
+    target_include_directories(xmr_native_dos_dup_block_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_dos_dup_block_kat PRIVATE xmr_coin)
+    target_compile_features(xmr_native_dos_dup_block_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_dos_dup_block_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_dos_dup_block_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_dos_dup_block_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_dos_dup_block_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_dos_dup_block_kat COMMAND xmr_native_dos_dup_block_kat)
+    set_tests_properties(xmr_native_dos_dup_block_kat PROPERTIES TIMEOUT 300)
+
     add_executable(xmr_native_template_kat xmr_native_template_kat.cpp)
     target_include_directories(xmr_native_template_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src

@@ -2751,11 +2751,15 @@ static int run_live(const XmrNodeConfig& cfg) {
             // token; body_refetch = whole-block GET_OBJECTS fallbacks the driver
             // fired for a stranded bodiless fluffy park. A healthy fixed node
             // keeps dropped at 0 and credited climbing with fluffy_req.
-            std::printf("  dos: dropped=%llu fluffy_req=%llu credited=%llu body_refetch=%llu\n",
+            // refunded = block pushes whose token came back because the index
+            // found the block is one it HAS (connected, or a valid alt candidate;
+            // D3a) -- under honest relay it climbs with every copy of every block.
+            std::printf("  dos: dropped=%llu fluffy_req=%llu credited=%llu body_refetch=%llu refunded=%llu\n",
                         static_cast<unsigned long long>(ns.pool.frames_dropped_dos),
                         static_cast<unsigned long long>(ns.pool.fluffy_requests_out),
                         static_cast<unsigned long long>(ns.pool.frames_credited_fluffy),
-                        static_cast<unsigned long long>(ns.driver.bodies_refetch_requests));
+                        static_cast<unsigned long long>(ns.driver.bodies_refetch_requests),
+                        static_cast<unsigned long long>(ns.pool.block_tokens_refunded));
 
             // THE WIRE LINE. Two independent sockets reach the same daemon: the
             // embedded node's own transport (parity judge + submit arm) and the

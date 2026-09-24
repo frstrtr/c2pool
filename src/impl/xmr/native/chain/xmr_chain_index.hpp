@@ -417,6 +417,9 @@ public:
             if (peer_height > cohort_max_) cohort_max_ = peer_height;
             bytes_in_ += block.block_blob.size();
             const OfferResult r = offer_locked_(&p, std::move(block), /*own_mined=*/false);
+            // D3a: a push of a block we HAVE (connected, already on the best
+            // chain, or a valid alt candidate) hands its DoS block token back.
+            if (fetcher_ && pushed_block_is_known_valid_locked_(r)) fetcher_->credit_known_block(p);
             if (r.outcome == OfferOutcome::NeedsBodies && fluffy && fetcher_) {
                 // D-5: ask the announcer for exactly the bodies we are missing.
                 // Which indices those are is the txpool's answer (it may hold
@@ -2169,6 +2172,29 @@ private:
         if (entries_.find(key_(id)) != entries_.end()) return true;
         const AltBlock* b = alt_.find(id);
         return b && b->has_entry;
+    }
+
+    // D3a: is the block a peer just pushed one this index HAS as a valid block?
+    // On the best chain (it connected, reorged in, or was already there), or held
+    // in the alt pool as a RESOLVED, ADOPTABLE candidate with its bodies. A parked
+    // orphan, an unjudgeable park, a bodiless announcement, a block whose proof of
+    // work could not be checked yet, and every rejection answer false: those are
+    // exactly the pushes the block DoS bucket exists to rate-limit.
+    bool pushed_block_is_known_valid_locked_(const OfferResult& r) const {
+        switch (r.outcome) {
+            case OfferOutcome::Connected:
+            case OfferOutcome::Reorged:
+            case OfferOutcome::Duplicate:
+            case OfferOutcome::StoredAsAlt:
+                break;
+            case OfferOutcome::ParkedOrphan:
+            case OfferOutcome::NeedsBodies:
+            case OfferOutcome::Rejected:
+                return false;
+        }
+        if (rows_.contains(r.id)) return true;
+        const AltBlock* a = alt_.find(r.id);
+        return a && a->resolved && a->adoptable && a->has_entry && !a->bodies_missing;
     }
 
     void penalize_locked_(const PeerRef* p, PeerFault f, const std::string& why) {
