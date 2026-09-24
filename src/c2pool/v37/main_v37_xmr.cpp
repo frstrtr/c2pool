@@ -760,12 +760,15 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             // stall_timeout MUST read 0 in a converged run; root_unknown retries
             // are normal (a receiver one ledger event behind the winner), terminal
             // must be 0.
-            std::printf("  r4/r5: late_unbooked=%llu (post_finalize=%llu) stall_timeout=%llu (relay_repair_stall=%llu) gate_stalls=%llu "
+            std::printf("  r4/r5: late_unbooked=%llu (post_finalize=%llu) stall_timeout=%llu (relay_repair_stall=%llu held=%llu resolved=%llu now=%llu) gate_stalls=%llu "
                         "| lane_root_unknown retries=%llu resolved=%llu terminal=%llu\n",
                         static_cast<unsigned long long>(fs.late_unbooked),
                         static_cast<unsigned long long>(fs.late_booked_post_finalize),
                         static_cast<unsigned long long>(fs.booking_stall_timeout),
                         static_cast<unsigned long long>(fs.relay_repair_stall_timeout),
+                        static_cast<unsigned long long>(fs.relay_repair_held),
+                        static_cast<unsigned long long>(fs.relay_repair_held_resolved),
+                        static_cast<unsigned long long>(fs.relay_repair_held_now),
                         static_cast<unsigned long long>(node.finalize_driver().booking_stalls()),
                         static_cast<unsigned long long>(fs.lane_root_unknown_retries),
                         static_cast<unsigned long long>(fs.lane_root_unknown_resolved),
@@ -1533,7 +1536,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (st != relay::XmrRelayNode::RepairState::Ready) {
             ++cut_pending;
             // the stuck stage in words (FinalizeConnect prints it; past the retry
-            // bound it is the REFUSED reason -- a relay-repair stall, named as one)
+            // bound the block is HELD (RC-HOLD) -- an undecided repair never refuses)
             why = std::string("cut-pending: relay repair of P=") + std::to_string(P) + " spine=" + hex_of(spine).substr(0, 12) +
                   (st == relay::XmrRelayNode::RepairState::Exhausted ? " (no connected peer serves that order yet; retry)"
                                                                      : " in flight (fetching the winner-side order + missing receipts)") +
