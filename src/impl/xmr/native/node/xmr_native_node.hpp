@@ -299,6 +299,11 @@ struct NativeNodeConfig {
     // settlement accounting reads, so the two can never disagree.
     TieBreak                 fork_tie = TieBreak::PreferOwn;
 
+    // The own-fork liveness guard (ChainIndexOptions::own_fork_bound_ms): how
+    // long an own-mined tip may go unadopted by every peer before the node
+    // abandons it and follows the peers' chain. 0 disables.
+    std::uint64_t            own_fork_bound_ms = 240'000;
+
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
     // SyncDriverConfig::probe_only.
@@ -389,6 +394,15 @@ struct NodeStatus {
     std::size_t                  citizen_pool_n = 0;
     std::size_t                  citizen_chosen_n = 0;
     std::uint64_t                good_citizen_violations = 0;
+    // Template dup-tx hygiene: selectable txs the template left out because
+    // the chain it extends already mined them (the race, caught); own blocks
+    // the index refused as invalid (a tx already mined / key image spent /
+    // duplicate); own forks the liveness guard abandoned; txs the pool refused
+    // at admission because the chain already carries them.
+    std::uint64_t                tmpl_dropped_mined = 0;
+    std::uint64_t                own_invalid_refused = 0;
+    std::uint64_t                own_forks_abandoned = 0;
+    std::uint64_t                pool_already_mined = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -534,24 +548,40 @@ public:
         }
 
         txpool_.set_input_consensus_sources(&outputs_, &outputs_);
+        // The chain's mined oracle: no path (a reorg re-admit racing the new
+        // branch, a late relay) can put a tx the best chain already carries
+        // back into the pool.
+        txpool_.set_mined_oracle(&index_);
 
         index_.subscribe_txs([this](const BlockTxEvent& ev) {
-            // C2 -> C3: drop mined ids, evict key-image conflicts, re-admit on a
-            // rollback. Posted to the pool thread for the same reason the relay
-            // path is: it re-decodes bodies.
+            // C2 -> C3, SYNCHRONOUSLY, on the thread that moved the tip and
+            // before the index returns to it. Evicting mined ids / spent key
+            // images on the pool thread LATER let the template refresh race
+            // it: a template built on the new tip in that window still carried
+            // a tx the new tip had mined, and a share on it was a block every
+            // monerod refused ("transaction already in blockchain") -- the
+            // publish-arm verify, 8b2efacf at h=513. The template path also
+            // filters against the chain itself (NativeMinerDataSource), so this
+            // is the pool keeping itself honest, not the only guard.
+            //
+            // The output set is fed FIRST: the spent-key-image set must reflect
+            // this block before the pool judges (or re-admits) anything against
+            // it. on_block_connected also carries the block's RCT outputs when
+            // the producer captured them (below-anchor history excepted); with
+            // none captured it still advances key images. Both are set updates
+            // under their own mutexes, and flush_events_ holds no index lock.
+            if (ev.kind == BlockTxEvent::Kind::Connected) {
+                outputs_.on_block_connected(ev);
+                txpool_.on_block_connected(ev);
+            } else {
+                outputs_.on_block_disconnected(ev);
+                txpool_.note_block_disconnected(ev);
+            }
+            // Only the re-admission of a rolled-back block's bodies (a full
+            // decode + verify each) and the inject upkeep go to the pool thread.
             pool_loop_.post([this, ev] {
-                // Feed the output set FIRST: the spent-key-image set must reflect
-                // this block before the pool judges (or re-admits) anything
-                // against it. on_block_connected also carries the block's RCT
-                // outputs when the producer captured them (below-anchor history
-                // excepted); with none captured it still advances key images.
-                if (ev.kind == BlockTxEvent::Kind::Connected) {
-                    outputs_.on_block_connected(ev);
-                    txpool_.on_block_connected(ev);
-                } else {
-                    outputs_.on_block_disconnected(ev);
-                    txpool_.on_block_disconnected(ev);
-                }
+                if (ev.kind == BlockTxEvent::Kind::Disconnected)
+                    txpool_.readmit_disconnected(ev);
                 // OPERATOR INJECT upkeep on a connected block: an inject that was
                 // mined leaves C3 (so it would silently stop being offered), but
                 // its ledger entry and pin must go too. Forget the mined ids,
@@ -813,6 +843,10 @@ public:
         s.citizen_pool_n          = native_src_.last_pool_n();
         s.citizen_chosen_n        = native_src_.last_chosen_n();
         s.good_citizen_violations = native_src_.good_citizen_violations();
+        s.tmpl_dropped_mined      = native_src_.dropped_mined();
+        s.own_invalid_refused     = index_.own_blocks_refused_invalid();
+        s.own_forks_abandoned     = index_.own_forks_abandoned();
+        s.pool_already_mined      = s.txpool.rejected_already_mined;
         return s;
     }
 
@@ -1223,6 +1257,7 @@ private:
         ChainIndexOptions o;
         o.net = nets_.consensus;
         o.tie = cfg_.fork_tie;          // D-14, driven by --same-height-tiebreak
+        o.own_fork_bound_ms = cfg_.own_fork_bound_ms;
         return o;
     }
 
@@ -1316,6 +1351,19 @@ private:
             const std::uint64_t now = now_ms_();
             verify_loop_.post([this, now] {
                                   if (driver_) driver_->tick(now);
+                                  // Own-fork liveness guard: an own-mined
+                                  // tip no peer adopts past the bound is
+                                  // abandoned (ChainIndex::check_own_fork).
+                                  {
+                                      std::string ofw;
+                                      if (index_.check_own_fork(now, &ofw)) {
+                                          const std::string line =
+                                              "[own-fork] LIVENESS GUARD: " + ofw
+                                              + " -- following the peers' chain";
+                                          note_(line);
+                                          std::fprintf(stderr, "%s\n", line.c_str());
+                                      }
+                                  }
                                   publish_tx_gate_();
                                   // GOOD-CITIZEN: feed the wall clock (unix
                                   // seconds) to the miner-data source so the

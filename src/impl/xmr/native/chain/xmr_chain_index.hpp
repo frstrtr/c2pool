@@ -64,6 +64,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,6 +110,15 @@ struct ChainIndexOptions {
     // chain. Replays of recorded history (parity, KATs) turn it off explicitly
     // and get rows with pow_verified == false, which never advance the frontier.
     bool          require_pow     = true;
+    // OWN-FORK LIVENESS GUARD (fork-choice policy on our OWN blocks, not a
+    // Monero rule). When the best chain ends in blocks WE mined and, for longer
+    // than this, no connected peer advertises a top on that fork -- every peer
+    // is on some other tip, or every peer dropped us -- the index leaves its own
+    // fork: the own-mined suffix is disconnected and abandoned, and the node
+    // follows the peers' chain. A levin-only node cannot see WHY a monerod
+    // refused our block; "nobody adopted it" is the evidence it does have.
+    // 0 disables. Default: two target block times.
+    std::uint64_t own_fork_bound_ms = 240'000;
 };
 
 // --- what happened to an offered block ---------------------------------------------
@@ -209,7 +219,10 @@ public:
         // One sink into the state view; it queues rather than dispatches, so no
         // consumer callback ever runs with our mutex held.
         view_.subscribe([this](const node::MainchainEvent& e) { queued_events_.push_back(e); });
-        view_.subscribe_txs([this](const BlockTxEvent& e) { queued_tx_events_.push_back(e); });
+        view_.subscribe_txs([this](const BlockTxEvent& e) {
+            note_mined_locked_(e);
+            queued_tx_events_.push_back(e);
+        });
     }
 
     ChainIndex(const ChainIndex&)            = delete;
@@ -424,6 +437,7 @@ public:
         {
             std::lock_guard<std::mutex> lk(mu_);
             peers_.erase(peer_key_(p));
+            ++peer_losses_;
             update_synced_locked_();
         }
         flush_events_();
@@ -537,6 +551,44 @@ public:
         s.synced        = synced_;
         return s;
     }
+
+    // Template / own-block hygiene oracle (IChainView::probe_mined). Answered
+    // from the mined-tx and spent-key-image maps the index keeps for the
+    // retained window, bounded to the chain ending at `parent_id`.
+    bool probe_mined(const Hash& parent_id, const std::vector<Hash>& tx_ids,
+                     const std::vector<Hash>& key_images, std::vector<Hash>& mined_txs,
+                     std::vector<Hash>& spent_key_images) const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        mined_txs.clear();
+        spent_key_images.clear();
+        const auto ph = rows_.height_of(parent_id);
+        if (!ph) return false;
+        probe_mined_locked_(*ph, tx_ids, key_images, mined_txs, spent_key_images);
+        return true;
+    }
+
+    // The own-fork liveness guard (ChainIndexOptions::own_fork_bound_ms). Driven
+    // from the verify thread's periodic tick with a monotone millisecond clock.
+    // Returns true when it abandoned our own fork on this call; `why` says what
+    // it saw either way when something is being tracked.
+    bool check_own_fork(std::uint64_t now_ms, std::string* why = nullptr) {
+        bool abandoned = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            abandoned = check_own_fork_locked_(now_ms, why);
+        }
+        flush_events_();
+        return abandoned;
+    }
+
+    // Is the best tip an own-mined fork nobody has adopted (yet)? Telemetry.
+    bool own_fork_tracking() const { std::lock_guard<std::mutex> lk(mu_); return own_fork_tracking_; }
+    std::uint64_t own_forks_abandoned() const { std::lock_guard<std::mutex> lk(mu_); return own_forks_abandoned_; }
+    // Own blocks refused at submit because they carry a tx already mined, a key
+    // image already spent, or a duplicate within the block.
+    std::uint64_t own_blocks_refused_invalid() const { std::lock_guard<std::mutex> lk(mu_); return own_invalid_refused_; }
+    // How many tx ids / key images the mined oracle currently covers.
+    std::size_t mined_tx_count() const { std::lock_guard<std::mutex> lk(mu_); return mined_tx_.size(); }
 
     // --- IChainServing -------------------------------------------------------------------
     PeerSyncData our_sync_data() const override {
@@ -786,6 +838,14 @@ private:
         std::uint64_t     bytes = 0;
     };
 
+    // One connected best-chain block's contribution to the mined oracle.
+    struct MinedRec {
+        std::uint64_t    height = 0;
+        Hash             block_id{};
+        std::vector<Key> txs;
+        std::vector<Key> kis;
+    };
+
     // =====================================================================================
     // offering a block
     // =====================================================================================
@@ -811,6 +871,31 @@ private:
             r.height  = rows_.height_of(r.id).value_or(0);
             r.why     = "already on the best chain";
             return r;
+        }
+
+        // OUR OWN block: never adopt one every monerod would refuse. A block
+        // carrying a tx already mined in the chain it extends, a key image
+        // already spent there, or the same tx / key image twice, is invalid on
+        // every node that has the history -- and a levin-only node cannot hear
+        // their refusal, so PREFER-OWN would build on it forever (the
+        // publish-arm verify, 8b2efacf at h=513). Hygiene on our own output,
+        // not a rule applied to anyone else's blocks.
+        if (own_mined) {
+            if (abandoned_own_.count(key_(r.id))) {
+                r.outcome = OfferOutcome::Rejected;
+                r.why     = "own block was abandoned by the own-fork liveness guard";
+                return r;
+            }
+            std::string bad;
+            const RowRecord* mp = rows_.by_id(ev.input.parsed.header.prev_id);
+            if (!own_block_hygiene_locked_(ev, mp ? std::optional<std::uint64_t>(mp->row.height)
+                                                  : std::nullopt, bad)) {
+                ++own_invalid_refused_;
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = mp ? mp->row.height + 1 : ev.input.coinbase.height;
+                r.why     = "own block refused: " + bad;
+                return r;
+            }
         }
 
         // A bodiless re-announcement (a fluffy push) of a block we already hold
@@ -1491,7 +1576,11 @@ private:
             const RowRecord* rr = rows_.by_height(h);
             if (!rr) break;
             const CachedEntry ce = entries_[key_(rr->row.id)];
-            if (!view_.disconnect_tip(ce.tx_hashes, {})) break;
+            // The bodies go back with the event, so the pool can re-admit the
+            // transactions the losing branch had mined (good citizen): they are
+            // valid again on the new branch unless it mined them too, which the
+            // pool checks against probe_mined() on re-admission.
+            if (!view_.disconnect_tip(ce.tx_hashes, blobs_of_(ce.entry))) break;
             RowRecord popped;
             rows_.pop(popped);
             pop_long_mirror_();
@@ -1624,6 +1713,262 @@ private:
             if (queued_events_[i].kind != node::MainchainEventKind::Extend)
                 keep.push_back(queued_events_[i]);
         queued_events_.swap(keep);
+    }
+
+    // =====================================================================================
+    // the mined oracle: which txs / key images the best chain already carries
+    // =====================================================================================
+    // Fed from the state view's own tx events (under mu_, in chain order), so
+    // it moves in lock-step with the chain on every path that connects or
+    // disconnects a block -- extend, switch, failed-switch restore, snapshot
+    // replay, own-fork abandonment -- with no path having to remember it.
+    void note_mined_locked_(const BlockTxEvent& e) {
+        if (e.kind == BlockTxEvent::Kind::Connected) {
+            MinedRec rec;
+            rec.height   = e.height;
+            rec.block_id = e.block_id;
+            rec.txs.reserve(e.tx_hashes.size());
+            for (const Hash& id : e.tx_hashes) {
+                rec.txs.push_back(key_(id));
+                mined_tx_[rec.txs.back()] = e.height;
+            }
+            rec.kis.reserve(e.key_images.size());
+            for (const Hash& ki : e.key_images) {
+                rec.kis.push_back(key_(ki));
+                mined_ki_[rec.kis.back()] = e.height;
+            }
+            mined_stack_.push_back(std::move(rec));
+            const std::size_t cap = opts_.row_retention ? opts_.row_retention : 2048;
+            while (mined_stack_.size() > cap) {
+                forget_mined_locked_(mined_stack_.front());
+                mined_stack_.pop_front();
+            }
+            return;
+        }
+        // Disconnected: LIFO, so it is the newest record -- searched from the
+        // back only as a guard against a disconnect of a block the oracle never
+        // saw connect (below the window it was seeded with).
+        for (auto it = mined_stack_.rbegin(); it != mined_stack_.rend(); ++it) {
+            if (!(it->block_id == e.block_id)) continue;
+            forget_mined_locked_(*it);
+            mined_stack_.erase(std::next(it).base());
+            return;
+        }
+    }
+
+    void forget_mined_locked_(const MinedRec& rec) {
+        for (const Key& k : rec.txs) {
+            const auto it = mined_tx_.find(k);
+            if (it != mined_tx_.end() && it->second == rec.height) mined_tx_.erase(it);
+        }
+        for (const Key& k : rec.kis) {
+            const auto it = mined_ki_.find(k);
+            if (it != mined_ki_.end() && it->second == rec.height) mined_ki_.erase(it);
+        }
+    }
+
+    void probe_mined_locked_(std::uint64_t parent_height, const std::vector<Hash>& tx_ids,
+                             const std::vector<Hash>& key_images, std::vector<Hash>& mined,
+                             std::vector<Hash>& spent) const {
+        for (const Hash& id : tx_ids) {
+            const auto it = mined_tx_.find(key_(id));
+            if (it != mined_tx_.end() && it->second <= parent_height) mined.push_back(id);
+        }
+        for (const Hash& ki : key_images) {
+            const auto it = mined_ki_.find(key_(ki));
+            if (it != mined_ki_.end() && it->second <= parent_height) spent.push_back(ki);
+        }
+    }
+
+    // Our own block's tx set, judged against the chain it extends (when that
+    // parent is on the best chain; a block on a side branch is judged for
+    // internal duplicates only -- the oracle answers for the best chain).
+    bool own_block_hygiene_locked_(const EvaluatedBlock& ev,
+                                   std::optional<std::uint64_t> parent_height,
+                                   std::string& why) const {
+        const std::vector<Hash>& ids = ev.input.parsed.tx_hashes;
+        {
+            std::set<Key> seen;
+            for (const Hash& id : ids)
+                if (!seen.insert(key_(id)).second) {
+                    why = "tx " + hex_(id) + " appears twice in the block";
+                    return false;
+                }
+        }
+        {
+            std::set<Key> seen;
+            for (const Hash& ki : ev.key_images)
+                if (!seen.insert(key_(ki)).second) {
+                    why = "key image " + hex_(ki) + " is spent twice in the block";
+                    return false;
+                }
+        }
+        if (!parent_height) return true;
+        std::vector<Hash> mined, spent;
+        probe_mined_locked_(*parent_height, ids, ev.key_images, mined, spent);
+        if (!mined.empty()) {
+            why = "tx " + hex_(mined.front()) + " is already in the chain it extends (height "
+                + std::to_string(mined_tx_.at(key_(mined.front()))) + ")";
+            return false;
+        }
+        if (!spent.empty()) {
+            why = "key image " + hex_(spent.front()) + " is already spent in the chain it extends";
+            return false;
+        }
+        return true;
+    }
+
+    static std::vector<std::vector<std::uint8_t>> blobs_of_(const BlockEntry& e) {
+        std::vector<std::vector<std::uint8_t>> out;
+        out.reserve(e.txs.size());
+        for (const TxBlobEntry& t : e.txs) {
+            if (t.pruned) return {};   // a pruned body cannot be re-admitted: let relay re-teach it
+            out.push_back(t.blob);
+        }
+        return out;
+    }
+
+    static std::string hex_(const Hash& h) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        s.reserve(64);
+        for (const std::uint8_t b : h) { s.push_back(d[b >> 4]); s.push_back(d[b & 15]); }
+        return s;
+    }
+
+    // =====================================================================================
+    // the own-fork liveness guard
+    // =====================================================================================
+    bool check_own_fork_locked_(std::uint64_t now_ms, std::string* why) {
+        const std::uint64_t losses_prev = losses_at_prev_check_;
+        losses_at_prev_check_           = peer_losses_;
+
+        const RowRecord* tip = rows_.tip();
+        if (opts_.own_fork_bound_ms == 0 || !tip || !tip->own_mined) {
+            own_fork_tracking_ = false;
+            return false;
+        }
+        // The fork base: the lowest block of the own-mined suffix of the chain.
+        const RowRecord* base = tip;
+        for (std::uint64_t h = tip->row.height; h > rows_.oldest_height(); --h) {
+            const RowRecord* below = rows_.by_height(h - 1);
+            if (!below || !below->own_mined) break;
+            base = below;
+        }
+        const std::uint64_t base_h = base->row.height;
+        if (!own_fork_tracking_ || !(own_fork_base_ == base->row.id)) {
+            own_fork_tracking_    = true;
+            own_fork_base_        = base->row.id;
+            own_fork_since_ms_    = now_ms;
+            // Counted from the previous tick: a peer that dropped us right after
+            // the block went out did so before this tick could start tracking.
+            own_fork_losses_base_ = losses_prev;
+            return false;
+        }
+        // Adopted? A peer whose advertised top is on our chain at or above the
+        // fork base has taken our block; the fork is not suspect.
+        for (const auto& kv : peers_) {
+            const auto ph = rows_.height_of(kv.second.top_id);
+            if (ph && *ph >= base_h) {
+                own_fork_since_ms_    = now_ms;
+                own_fork_losses_base_ = peer_losses_;
+                return false;
+            }
+        }
+        // Somebody must have been there to disagree: a node that never had a
+        // peer (a solo regtest miner) is not abandoned by anyone.
+        const bool lost_peers = peer_losses_ > own_fork_losses_base_;
+        if (peers_.empty() && !lost_peers) return false;
+        const std::uint64_t age = now_ms >= own_fork_since_ms_ ? now_ms - own_fork_since_ms_ : 0;
+        if (why)
+            *why = "own fork from h=" + std::to_string(base_h) + " (" + hex_(base->row.id)
+                 + ") unadopted for " + std::to_string(age) + " ms, peers="
+                 + std::to_string(peers_.size()) + " lost="
+                 + std::to_string(peer_losses_ - own_fork_losses_base_);
+        if (age < opts_.own_fork_bound_ms) return false;
+        return abandon_own_fork_locked_(base_h, why);
+    }
+
+    // Disconnect the own-mined suffix down to (not including) its parent,
+    // abandon those blocks, and let whatever we hold of the peers' chain in.
+    bool abandon_own_fork_locked_(std::uint64_t base_h, std::string* why) {
+        const RowRecord* tip = rows_.tip();
+        if (!tip || base_h == 0 || base_h > tip->row.height) return false;
+        const std::uint64_t tip_h       = tip->row.height;
+        const std::uint64_t fork_height = base_h - 1;
+        const std::uint64_t depth       = tip_h - fork_height;
+        const RowRecord*    fork_row    = rows_.by_height(fork_height);
+
+        ReorgRecord rec;
+        rec.old_tip    = tip->row.id;
+        rec.old_height = tip_h;
+        rec.old_cumulative_difficulty = tip->row.cumulative_difficulty;
+        rec.fork_height = fork_height;
+        rec.depth       = depth;
+        if (fork_row) {
+            rec.new_tip    = fork_row->row.id;
+            rec.new_height = fork_height;
+            rec.new_cumulative_difficulty = fork_row->row.cumulative_difficulty;
+        }
+        const char* refuse = nullptr;
+        ReorgRefusal code  = ReorgRefusal::OutOfWindow;
+        if (!fork_row || fork_height < rows_.oldest_height()) refuse = "the fork parent is not retained";
+        else if (fork_height < view_.anchor_height()) { refuse = "the fork parent is below the anchor"; code = ReorgRefusal::BelowAnchor; }
+        else if (depth > opts_.max_reorg_depth) { refuse = "the own fork is deeper than the reorg horizon"; code = ReorgRefusal::TooDeep; }
+        if (refuse) {
+            journal_.refuse(rec, code, std::string("own-fork guard: ") + refuse);
+            ++chain_refusals_;
+            own_fork_tracking_ = false;   // re-armed (and re-timed) by the next check
+            if (why) *why += std::string(" -- NOT abandoned: ") + refuse;
+            return false;
+        }
+
+        const std::uint64_t seq = journal_.plan(rec);
+        std::uint64_t n = 0;
+        for (std::uint64_t h = tip_h; h > fork_height; --h) {
+            const RowRecord* rr = rows_.by_height(h);
+            if (!rr) break;
+            const auto ce = entries_.find(key_(rr->row.id));
+            const bool have = ce != entries_.end();
+            if (!view_.disconnect_tip(have ? ce->second.tx_hashes : std::vector<Hash>{},
+                                      have ? blobs_of_(ce->second.entry)
+                                           : std::vector<std::vector<std::uint8_t>>{}))
+                break;
+            RowRecord popped;
+            rows_.pop(popped);
+            pop_long_mirror_();
+            if (ReorgRecord* jr = journal_.find(seq)) jr->disconnected.push_back(popped.row.id);
+            alt_.erase_branch(popped.row.id);
+            remember_abandoned_(popped.row.id);
+            ++n;
+        }
+        journal_.set_phase(seq, ReorgPhase::Disconnected);
+        journal_.set_phase(seq, ReorgPhase::Applied);
+        view_.emit_reorg(n);
+        journal_.close_committed(seq);
+        ++own_forks_abandoned_;
+        own_fork_tracking_ = false;
+        if (why)
+            *why += " -- ABANDONED " + std::to_string(n) + " own block(s), tip back to h="
+                  + std::to_string(fork_height);
+
+        // Whatever we already hold of the peers' chain goes in now: the
+        // children of the fork parent, and any branch that outweighs it.
+        if (const RowRecord* t = rows_.tip()) resolve_descendants_locked_(t->row.id);
+        connect_parked_children_locked_();
+        (void)maybe_switch_locked_();
+        update_synced_locked_();
+        return n > 0;
+    }
+
+    void remember_abandoned_(const Hash& id) {
+        const Key k = key_(id);
+        if (!abandoned_own_.insert(k).second) return;
+        abandoned_order_.push_back(k);
+        while (abandoned_order_.size() > 256) {
+            abandoned_own_.erase(abandoned_order_.front());
+            abandoned_order_.pop_front();
+        }
     }
 
     // =====================================================================================
@@ -2265,6 +2610,10 @@ private:
         refetch_.clear();
         queued_events_.clear();
         queued_tx_events_.clear();
+        mined_stack_.clear();
+        mined_tx_.clear();
+        mined_ki_.clear();
+        own_fork_tracking_ = false;
     }
 
     void flush_events_() {
@@ -2331,6 +2680,26 @@ private:
     bool          synced_             = false;
     bool          forced_synced_      = false;
     bool          synced_forced_ever_ = false;
+
+    // --- the mined oracle (template / own-block hygiene) ----------------------
+    // One record per connected best-chain block, LIFO like the chain itself, so
+    // a disconnect removes exactly what its connect added. Bounded to the
+    // retained row window.
+    std::deque<MinedRec>          mined_stack_;
+    std::map<Key, std::uint64_t>  mined_tx_;   // tx id -> height mined at
+    std::map<Key, std::uint64_t>  mined_ki_;   // key image -> height spent at
+    std::uint64_t own_invalid_refused_ = 0;
+
+    // --- the own-fork liveness guard --------------------------------------------
+    bool          own_fork_tracking_    = false;
+    Hash          own_fork_base_{};
+    std::uint64_t own_fork_since_ms_    = 0;
+    std::uint64_t own_fork_losses_base_ = 0;
+    std::uint64_t peer_losses_          = 0;
+    std::uint64_t losses_at_prev_check_ = 0;
+    std::uint64_t own_forks_abandoned_  = 0;
+    std::set<Key>   abandoned_own_;
+    std::deque<Key> abandoned_order_;
 };
 
 } // namespace c2pool::xmr::native

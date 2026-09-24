@@ -2707,6 +2707,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                         (native && !cfg.no_good_citizen) ? "on" : "off",
                         ns.citizen_pool_n, ns.citizen_chosen_n,
                         static_cast<unsigned long long>(ns.good_citizen_violations));
+            // Template dup-tx hygiene: mined txs kept out of templates (the
+            // connect/refresh race, caught), own blocks refused as invalid,
+            // own forks abandoned by the liveness guard, relays refused as
+            // already mined. The last three stay 0 on a healthy node.
+            std::printf("  chain-hygiene: tmpl_dropped_mined=%llu own_invalid=%llu "
+                        "own_fork_abandoned=%llu pool_already_mined=%llu\n",
+                        static_cast<unsigned long long>(ns.tmpl_dropped_mined),
+                        static_cast<unsigned long long>(ns.own_invalid_refused),
+                        static_cast<unsigned long long>(ns.own_forks_abandoned),
+                        static_cast<unsigned long long>(ns.pool_already_mined));
 
             // #1680 observability: the block-DoS bucket accounting for the
             // solicited fluffy missing-tx (2009) reply. dropped = frames the DoS
@@ -3045,6 +3055,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s =
+                     static_cast<std::uint32_t>(std::stoul(next("240")));
         else if (a == "--same-height-renotify") cfg.same_height_renotify =
                      static_cast<std::uint32_t>(std::stoul(next("3")));
         else if (a == "--same-height-journal") cfg.same_height_journal = next("");
@@ -3089,6 +3101,7 @@ int main(int argc, char** argv) {
                 "  --no-book-deferral           A/B escape hatch: book chain blocks as they arrive\n"
                 "                               (pre-R6; a lagging receiver then FORKS owed_digest)\n"
                 "  --same-height-tiebreak <prefer-own|first-seen>   same-height race policy\n"
+                "  --own-fork-bound-s <n>   abandon an own-mined tip no peer adopts after n s (0=off, 240)\n"
                 "                               (default prefer-own; drives BOTH the D-14 fork\n"
                 "                               choice and the settlement nomination)\n"
                 "  --same-height-renotify <n>   bounded re-announce of our own block on a\n"

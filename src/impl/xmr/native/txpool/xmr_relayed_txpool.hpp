@@ -87,6 +87,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "impl/xmr/native/contracts/chain_index.hpp"
 #include "impl/xmr/native/contracts/outputs.hpp"
 #include "impl/xmr/native/contracts/txpool.hpp"
 #include "impl/xmr/native/contracts/types.hpp"
@@ -239,6 +240,8 @@ struct TxpoolStats {
     std::uint64_t rejected_key_image_spent = 0;
     std::uint64_t unresolved_ring          = 0;
     std::uint64_t rejected_member_locked   = 0;
+    // Refused because the chain already mined it / spent one of its key images.
+    std::uint64_t rejected_already_mined   = 0;
 
     // Entries a snapshot LEFT OUT because their ring was unresolved and the
     // select policy is Exclude (the default). This distinguishes "the block was
@@ -270,6 +273,7 @@ public:
     std::vector<node::TxBacklogEntry> selectable_backlog(const TxpoolSelectPolicy&) const override;
     TxpoolSelectPolicy policy() const override;
     std::uint64_t      backlog_version() const override;
+    std::vector<Hash>  key_images_of(const Hash& id) const override;
 
     // --- ITxSource (C3 -> C2) ----------------------------------------------
     bool get_tx(const Hash& id, std::vector<std::uint8_t>& full_blob) override;
@@ -288,6 +292,21 @@ public:
     // never trust them for validity -- they are re-decoded and re-verified.
     void on_block_connected(const BlockTxEvent& ev);
     void on_block_disconnected(const BlockTxEvent& ev);
+    // on_block_disconnected in its two halves, so a caller can apply the cheap
+    // tip bookkeeping synchronously (in chain order) and post the re-admission
+    // (a full decode + verify per body) to the pool thread. The mined oracle
+    // (set_mined_oracle) keeps a late re-admit from putting back a tx the NEW
+    // branch mined.
+    void note_block_disconnected(const BlockTxEvent& ev);
+    void readmit_disconnected(const BlockTxEvent& ev);
+
+    // The chain index's mined oracle (IChainView::probe_mined against the
+    // current tip): consulted at admission, so a transaction already in the
+    // best chain -- or spending a key image the chain already spent -- is
+    // refused as AlreadyMined whatever path it arrives by (a reorg re-admit
+    // racing the new branch's connect, a peer relaying a mined tx late).
+    // Borrowed; nullptr disables. Must never call back into the pool.
+    void set_mined_oracle(const IChainView* chain);
 
     // Fail-closed relay gate: no transaction is admitted before C2 says the
     // index is at the tip, mirroring monerod's is_synchronized() gate.
@@ -351,6 +370,7 @@ private:
     // Input-consensus wiring (borrowed; null until set_input_consensus_sources).
     const IRingMemberSource*  ring_src_   = nullptr;
     const ISpentKeyImageView* spent_view_ = nullptr;
+    const IChainView*         mined_oracle_ = nullptr;
     // The height of the last connected block, i.e. the tip. A transaction is
     // judged against the block we would mine next, tip_height_ + 1, for the
     // spendable-age and unlock-time rules. Set in on_block_connected.

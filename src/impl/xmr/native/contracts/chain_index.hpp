@@ -117,6 +117,34 @@ public:
 
     // --- telemetry -----------------------------------------------------------
     virtual SyncState sync_state() const = 0;
+
+    // --- template / own-block hygiene (NOT a consensus rule) -----------------
+    // Which of `tx_ids` are already mined, and which of `key_images` are
+    // already spent, on the best chain UP TO AND INCLUDING `parent_id` -- i.e.
+    // in the chain a block built on `parent_id` extends. A template, or a block
+    // we found, that carries one of them is a block every monerod refuses
+    // ("transaction already in blockchain" / "key image already spent").
+    //
+    // Returns false -- unanswered, the out-vectors cleared -- when `parent_id`
+    // is not on the best chain (a tip that moved under the caller onto another
+    // branch). The answer is bounded by what the index retains: a tx mined
+    // below the retained window reads as not mined.
+    //
+    // The default knows nothing about mined txs; it answers (with nothing) only
+    // when `parent_id` is the tip, so a view without the oracle still detects a
+    // tip that moved away from the caller.
+    virtual bool probe_mined(const Hash&              parent_id,
+                             const std::vector<Hash>& tx_ids,
+                             const std::vector<Hash>& key_images,
+                             std::vector<Hash>&       mined_txs,
+                             std::vector<Hash>&       spent_key_images) const {
+        (void)tx_ids;
+        (void)key_images;
+        mined_txs.clear();
+        spent_key_images.clear();
+        const auto t = tip();
+        return t && t->id == parent_id;
+    }
 };
 
 // The plan's C2 component is named "chain index"; D-2 pinned IChainView as the

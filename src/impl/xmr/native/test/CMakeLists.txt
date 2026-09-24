@@ -882,6 +882,39 @@ if (BUILD_TESTING)
     add_test(NAME xmr_native_neartip_stall_kat COMMAND xmr_native_neartip_stall_kat)
     set_tests_properties(xmr_native_neartip_stall_kat PROPERTIES TIMEOUT 300)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #   xmr_native_template_dup_tx_kat -- template / own-block hygiene on the
+    #   REAL chain index: a template on a new tip never carries a tx the chain
+    #   it extends already mined (or a tx spending a key image spent there),
+    #   even when the pool has not been told yet; our own found block is
+    #   refused before PREFER-OWN adopts it when it carries one; a reorg hands
+    #   the rolled-back bodies back to the pool; and an own fork no peer adopts
+    #   is abandoned after a bound. Pins the publish-arm verify's 8b2efacf at
+    #   h=513 (tx 86f666b7 mined in 512, re-mined in A's template id=35). RED
+    #   on 00bb77c0. Links xmr_native_txpool for the tx decoder; no RandomX,
+    #   no sockets.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml (the #1539 lesson).
+    add_executable(xmr_native_template_dup_tx_kat xmr_template_dup_tx_kat.cpp)
+    target_include_directories(xmr_native_template_dup_tx_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_template_dup_tx_kat PRIVATE xmr_native_txpool)
+    target_compile_features(xmr_native_template_dup_tx_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_template_dup_tx_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_template_dup_tx_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_template_dup_tx_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_template_dup_tx_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_template_dup_tx_kat COMMAND xmr_native_template_dup_tx_kat)
+    set_tests_properties(xmr_native_template_dup_tx_kat PROPERTIES TIMEOUT 300)
+
     add_executable(xmr_native_m4_ptpl_backlog_gate_kat xmr_m4_ptpl_backlog_gate_kat.cpp)
     target_include_directories(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src
