@@ -299,6 +299,11 @@ struct NativeNodeConfig {
     // settlement accounting reads, so the two can never disagree.
     TieBreak                 fork_tie = TieBreak::PreferOwn;
 
+    // The own-fork liveness guard (ChainIndexOptions::own_fork_bound_ms): how
+    // long an own-mined tip may go unadopted by every peer before the node
+    // abandons it and follows the peers' chain. 0 disables.
+    std::uint64_t            own_fork_bound_ms = 240'000;
+
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
     // SyncDriverConfig::probe_only.
@@ -1239,6 +1244,7 @@ private:
         ChainIndexOptions o;
         o.net = nets_.consensus;
         o.tie = cfg_.fork_tie;          // D-14, driven by --same-height-tiebreak
+        o.own_fork_bound_ms = cfg_.own_fork_bound_ms;
         return o;
     }
 
@@ -1332,6 +1338,19 @@ private:
             const std::uint64_t now = now_ms_();
             verify_loop_.post([this, now] {
                                   if (driver_) driver_->tick(now);
+                                  // Own-fork liveness guard: an own-mined
+                                  // tip no peer adopts past the bound is
+                                  // abandoned (ChainIndex::check_own_fork).
+                                  {
+                                      std::string ofw;
+                                      if (index_.check_own_fork(now, &ofw)) {
+                                          const std::string line =
+                                              "[own-fork] LIVENESS GUARD: " + ofw
+                                              + " -- following the peers' chain";
+                                          note_(line);
+                                          std::fprintf(stderr, "%s\n", line.c_str());
+                                      }
+                                  }
                                   publish_tx_gate_();
                                   // GOOD-CITIZEN: feed the wall clock (unix
                                   // seconds) to the miner-data source so the

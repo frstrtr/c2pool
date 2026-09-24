@@ -38,8 +38,12 @@
 //                   was NOT told about the block: the mined tx and the tx
 //                   spending a mined key image are left out, the valid one is
 //                   still served (good citizen).
+//   E  GUARD     -- the own-fork liveness guard: adopted -> kept; unadopted
+//                   with a peer on a rival -> abandoned after the bound (and
+//                   not before), the rival followed; solo -> never; every peer
+//                   lost -> abandoned.
 //
-// All four are RED on 00bb77c0 (with the test surfaces stubbed in) and GREEN
+// All five are RED on 00bb77c0 (with the test surfaces stubbed in) and GREEN
 // with the fix. Registered in BOTH `--target` lists in
 // .github/workflows/build.yml (the #1539 lesson).
 // ---------------------------------------------------------------------------
@@ -251,7 +255,7 @@ struct Chain {
         anchor_id = id_of_blob(anchor_blob);
         native::ChainIndexOptions o;
         o.net               = native::XmrNet::Stagenet;
-        (void)bound_ms;   // the own-fork guard arrives with goal 3
+        o.own_fork_bound_ms = bound_ms;
         idx = new native::ChainIndex(o, src);
         idx->set_fetcher(&fetcher);
         std::string why;
@@ -490,6 +494,92 @@ void test_d_template() {
     kat::check(src.good_citizen_violations() == 0, "D7 no good-citizen violation");
 }
 
+// ===========================================================================
+// E. the own-fork liveness guard
+// ===========================================================================
+void test_e_guard() {
+    std::printf("== E. own-fork liveness guard ==\n");
+    const std::uint64_t h1 = kAnchorHeight + 1;
+
+    // E1: adopted -- a peer advertises our block as its top. Never abandoned.
+    {
+        Chain c;
+        if (!c.ok) return;
+        std::string why;
+        const BlockEntry own = c.make(c.anchor_id, h1, {}, 0x51);
+        kat::check(c.idx->submit_own_block(own, why), "E1 setup: our own block connects");
+        const Hash own_id = c.tip_id();
+        c.advertise(c.pa, own_id, h1);
+        bool ab = c.idx->check_own_fork(0);
+        ab = ab || c.idx->check_own_fork(kBoundMs * 5);
+        kat::check(!ab && c.tip_id() == own_id,
+                   "E1 an own block a peer has ADOPTED is kept past the bound");
+    }
+
+    // E2: a peer sits on a rival at our height; nobody adopts ours.
+    {
+        Chain c;
+        if (!c.ok) return;
+        std::string why;
+        const BlockEntry rival = c.make(c.anchor_id, h1, {}, 0x61);
+        const Hash rival_id = id_of_blob(rival.block_blob);
+        (void)c.offer(rival, c.pa);
+        const BlockEntry own = c.make(c.anchor_id, h1, {}, 0x62);
+        const Hash own_id = id_of_blob(own.block_blob);
+        kat::check(c.idx->submit_own_block(own, why) && c.tip_id() == own_id,
+                   "E2 setup: PREFER-OWN adopts our equal-work block over the rival");
+        c.advertise(c.pa, rival_id, h1);
+        c.advertise(c.pb, rival_id, h1);
+        (void)c.idx->check_own_fork(1000);                  // tracking starts
+        const bool early = c.idx->check_own_fork(1000 + kBoundMs - 1);
+        kat::check(!early && c.tip_id() == own_id, "E2a below the bound our block is kept (D-14)");
+        std::string gwhy;
+        const bool late = c.idx->check_own_fork(1000 + kBoundMs + 1, &gwhy);
+        kat::checkf(late, "E2b past the bound the unadopted own fork is ABANDONED (%s)",
+                    gwhy.c_str());
+        kat::checkf(c.tip_id() == rival_id,
+                    "E2c ...and the node follows the peers' block %s (tip %s)",
+                    hex8(rival_id).c_str(), hex8(c.tip_id()).c_str());
+        kat::check(c.idx->own_forks_abandoned() == 1, "E2d one abandonment counted");
+        const bool back = c.idx->submit_own_block(own, why);
+        kat::checkf(!back && c.tip_id() == rival_id,
+                    "E2e the abandoned own block is not re-adopted on a re-submit (%s)",
+                    why.c_str());
+    }
+
+    // E3: solo -- nobody ever connected. Never abandoned.
+    {
+        Chain c;
+        if (!c.ok) return;
+        std::string why;
+        kat::check(c.idx->submit_own_block(c.make(c.anchor_id, h1, {}, 0x71), why),
+                   "E3 setup: our own block connects");
+        const Hash own_id = c.tip_id();
+        bool ab = c.idx->check_own_fork(0);
+        ab = ab || c.idx->check_own_fork(kBoundMs * 100);
+        kat::check(!ab && c.tip_id() == own_id,
+                   "E3 a solo node (no peer ever) keeps mining on its own chain");
+    }
+
+    // E4: every peer dropped us after our block went out.
+    {
+        Chain c;
+        if (!c.ok) return;
+        std::string why;
+        c.advertise(c.pa, c.anchor_id, kAnchorHeight);
+        kat::check(c.idx->submit_own_block(c.make(c.anchor_id, h1, {}, 0x81), why),
+                   "E4 setup: our own block connects");
+        (void)c.idx->check_own_fork(0);
+        c.idx->on_peer_gone(c.pa);          // the monerod dropped the link on our block
+        const bool early = c.idx->check_own_fork(kBoundMs / 2);
+        kat::check(!early, "E4a below the bound nothing happens");
+        const bool late = c.idx->check_own_fork(kBoundMs + 1);
+        kat::check(late && c.tip_id() == c.anchor_id,
+                   "E4b every peer lost past the bound: the own block is abandoned, tip back on "
+                   "the parent (the driver then syncs from whoever redials)");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -498,5 +588,6 @@ int main() {
     test_b_own_block();
     test_c_reorg();
     test_d_template();
+    test_e_guard();
     return kat::report("xmr_template_dup_tx_kat");
 }

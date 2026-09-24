@@ -3045,6 +3045,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s =
+                     static_cast<std::uint32_t>(std::stoul(next("240")));
         else if (a == "--same-height-renotify") cfg.same_height_renotify =
                      static_cast<std::uint32_t>(std::stoul(next("3")));
         else if (a == "--same-height-journal") cfg.same_height_journal = next("");
@@ -3089,6 +3091,7 @@ int main(int argc, char** argv) {
                 "  --no-book-deferral           A/B escape hatch: book chain blocks as they arrive\n"
                 "                               (pre-R6; a lagging receiver then FORKS owed_digest)\n"
                 "  --same-height-tiebreak <prefer-own|first-seen>   same-height race policy\n"
+                "  --own-fork-bound-s <n>   abandon an own-mined tip no peer adopts after n s (0=off, 240)\n"
                 "                               (default prefer-own; drives BOTH the D-14 fork\n"
                 "                               choice and the settlement nomination)\n"
                 "  --same-height-renotify <n>   bounded re-announce of our own block on a\n"

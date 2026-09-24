@@ -187,6 +187,10 @@ struct XmrNodeConfig {
     //   --same-height-renotify <n>   (0 disables the bounded re-announce)
     SameHeightTieBreak same_height_tiebreak = SameHeightTieBreak::PreferOwn;
     std::uint32_t      same_height_renotify = 3;
+    //   --own-fork-bound-s <n>  the native index's own-fork liveness guard: an
+    //   own-mined tip that no peer adopts for this long is abandoned and the
+    //   node follows the peers' chain (0 disables). Default 2 x target.
+    std::uint32_t      own_fork_bound_s = 240;
     // Per-height verdict journal. "" = race.log next to settle.img; "off" =
     // none. Two nodes that watched the same race must agree on every height
     // either of them credited, and a journal is what turns that claim into a
