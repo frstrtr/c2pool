@@ -585,3 +585,40 @@ flags, hooks, status line `minority:`). Where the build differs from the text:
   isolation is stopping m1 (A dials only m1). `ledger_dump.py` replays every
   node's `settle.img` independently (the R-A digest rules) and compares
   FINALIZED sets, full digest sequences and the liability files.
+
+## 12. Rig result (`~/mc-rig`, vm905, regtest, binary sha 14039dc2…)
+
+Three p2p-first nodes, D_conf 3, GAP-2 relay. Blocks are found in ROUNDS (one
+miner at a time, a fresh stratum login per find): with free-running miners the
+same-height races leave receipts minted on orphaned templates, whose Monero
+context a p2p-first receiver cannot resolve, and the honest nodes split on
+their own (the D3 class, see below). Isolation of A = relay partition (SIGUSR1,
+600 s) + m1 stopped; A finds alone, m1 restarts, the parked blocks late-relay.
+
+| episode | isolated finds | majority refused (relay-repair stall) | detection on A | adoption | after quiesce (all 3 nodes, independent replay of settle.img) |
+|---|---|---|---|---|---|
+| E1 | 3 (313-315) | 315 on B and C (313, 314 credited: their cuts held no isolated receipt) | run 320/321/322, builders 2 | R1 = {315}, F = 314, attempt 1 | FINALIZED sets, digest sequences (23 states), liability (1 block) EQUAL |
+| E2 | 4 (329-332) | all 4 on B and C | run 338/339/340 | R1 = {329..332} | EQUAL (37 states, 5 liability blocks) |
+| E3 | 3 (347-349) + SIGINT of A while CONVERGING, reboot, and again after DONE | all 3 | run 356/357/358, re-detected from `<sidecar>.mobs` at boot | first attempt undecidable (relay repair), then R1 = {347..349}; second boot `CONVERGED ... informational` | EQUAL (52 states, 8 liability blocks, 281295383492701 pico attributed on every node) |
+
+B and C never detected (0 runs), never suspended for D2, `ledger_mutations_on_refuse = 0`
+everywhere, `late_unbooked = 0` on B and C. A's post-convergence template
+commits the majority root (B: `owed_at_win KNOWN-to-our-ledger-history`).
+
+Pre-existing issues seen, NOT changed here:
+* **Receipt contexts (D3 class).** A p2p-first node learns receipt contexts only
+  from its own templates' prev ids; blocks that arrive in a batch (a late
+  re-announce) never become one, so receipts minted on them are never admitted
+  (`context ... GIVEN UP (no peer's monerod holds that block)`). Consequence
+  here: every later cut of the formerly isolated node that carries those
+  receipts is refused by the majority (relay-repair stall, 600 ticks each, the
+  majority lag-suspends meanwhile) and that node converges again. The rig keeps
+  A off the lane outside isolation to keep episodes separable.
+* **Relay sockets.** Under the partition knob the relay transport leaks
+  sockets on both sides (refused inbound on the partitioned node, CLOSE-WAIT on
+  the dialers); the first run hit the 1024 fd limit (`socket() failed`). The rig
+  raises `ulimit -n`.
+* **p2p-first restart alarms.** On every restart the native index re-pumps the
+  whole chain; each height at/below the cursor raises `cba-ALARM late_unbooked`
+  (308 on one restart). The base-era binary does the same (checked on the same
+  store); ledger-neutral.
