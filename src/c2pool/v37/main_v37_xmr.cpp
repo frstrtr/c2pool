@@ -437,6 +437,12 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         // is booked on our own index's acceptance instead -- opt-in, counted
         // apart from relayed(), and refused everywhere else.
         publisher->enable_solo_own_index(cfg.native_solo);
+        // A find that reached no peer is parked and re-announced on a bounded
+        // backoff (tick() below); every step of that is logged, never silent.
+        publisher->set_log([](bool err, const std::string& line) {
+            std::printf("  [publish]%s %s\n", err ? " ERROR" : "", line.c_str());
+            std::fflush(stdout);
+        });
     }
     submitter.enable_network_submit(!p2p_publish && rx.network_blocks_allowed());
     strat::IShareSink& publish_sink =
@@ -850,13 +856,20 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         if (!g.empty()) std::printf("  gate: last=%s\n", g.c_str());
         if (p2p_publish) {
             std::printf("  p2p publish: calls=%llu relayed=%llu peers_written=%llu refused=%llu "
-                        "reached_nobody=%llu stale=%llu | solo_own_index=%s landed=%llu\n",
+                        "reached_nobody=%llu stale=%llu | parked=%zu late_reached=%llu "
+                        "abandoned=%llu orphaned_unreached=%llu dup_found=%llu "
+                        "| solo_own_index=%s landed=%llu\n",
                         static_cast<unsigned long long>(publisher->calls()),
                         static_cast<unsigned long long>(publisher->relayed()),
                         static_cast<unsigned long long>(publisher->peers()),
                         static_cast<unsigned long long>(publisher->refused()),
                         static_cast<unsigned long long>(publisher->failed()),
                         static_cast<unsigned long long>(publisher->stale()),
+                        publisher->parked(),
+                        static_cast<unsigned long long>(publisher->late_reached()),
+                        static_cast<unsigned long long>(publisher->abandoned()),
+                        static_cast<unsigned long long>(publisher->orphaned_unreached()),
+                        static_cast<unsigned long long>(publisher->duplicate_found()),
                         publisher->solo_own_index_enabled() ? "ON" : "off",
                         static_cast<unsigned long long>(publisher->solo_landed()));
             const std::string pe = publisher->last_error();
@@ -964,6 +977,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     while (!g_stop.load()) {
         pump_miner();       // --mine: hits first, so a find is bridged the same pass
         if (hooks.inject_pump) hooks.inject_pump();  // --native-inject-dir scan
+        if (publisher) publisher->tick();   // parked (reached-nobody) blocks: bounded re-announce
         bridge_found();
         fc.tick();
         const bool lane_suspend = apply_suspension();   // right after the tick that may have decided it
@@ -2669,7 +2683,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             std::printf("  native: arm=%s resolves=%llu (native=%llu daemon=%llu) "
                         "template-path get_miner_data=%llu "
-                        "| verified_frontier=%llu peers=%zu txpool_accepted=%llu "
+                        "| verified_frontier=%llu peers=%zu silent=%zu bcast_fallbacks=%llu "
+                        "request_kicks=%llu txpool_accepted=%llu "
                         "backlog offered=%zu selected=%zu\n",
                         native->arms()->describe().c_str(),
                         static_cast<unsigned long long>(native->source().resolves()),
@@ -2678,6 +2693,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                         static_cast<unsigned long long>(native->source().daemon_pumps()),
                         static_cast<unsigned long long>(ns.sync.verified_frontier),
                         ns.pool.peers_handshaked,
+                        ns.pool.relay_silent_peers,
+                        static_cast<unsigned long long>(ns.pool.broadcast_fallbacks),
+                        static_cast<unsigned long long>(ns.pool.request_kicks),
                         static_cast<unsigned long long>(ns.txpool.accepted),
                         served_backlog_n, last_selected_tx);
 

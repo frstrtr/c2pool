@@ -572,6 +572,56 @@ void test_span_caps_refuse_visibly() {
 }
 
 // -----------------------------------------------------------------------
+// A PEER THAT NEVER ANSWERS GET_OBJECTS GIVES ITS SPAN BACK AT
+// NON_RESPONSIVE_PEER_KICK_TIME, not at the 240 s IDLE_PEER_KICK_TIME.
+// Hardening verify, mainnet catch-up: such peers held span slots for four
+// minutes each. Real deadline (20 s, the production default), one span slot
+// per peer so the slot coming back is directly observable.
+void test_unanswered_get_objects_releases_span() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+    daemon.answer_objects = false;
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    cfg.max_spans_per_peer = 1;
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "kick: peer up");
+
+    native::PeerRef ref;
+    ref.addr = daemon.key();
+    std::vector<Hash> ids;
+    for (int i = 0; i < 10; ++i) ids.push_back(hash_of_byte(static_cast<std::uint8_t>(0x20 + i)));
+    kat::check(rig.pool->request_objects(ref, ids, true), "kick: the span is accepted");
+    kat::check(rig.wait_for([&] {
+                   return daemon.count(levin::CMD_REQUEST_GET_OBJECTS) >= 1; }),
+               "kick: the 2003 reached the peer");
+    kat::check(!rig.pool->request_objects(ref, ids, true),
+               "kick: while it is unanswered the peer's only span slot is taken");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool kicked = rig.wait_for([&] {
+        return rig.pool->telemetry().last_close_why.find("NON_RESPONSIVE_PEER_KICK_TIME")
+               != std::string::npos; }, 26'000);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    kat::checkf(kicked, "kick: the silent peer is dropped at NON_RESPONSIVE_PEER_KICK_TIME "
+                        "(%.1f s after the request)", secs);
+    kat::checkf(secs < 24.0, "kick: well before IDLE_PEER_KICK_TIME (%.1f s)", secs);
+    kat::check(rig.chain.objects_calls.empty(), "kick: no span was fabricated");
+    kat::check(!rig.chain.peer_gone_calls.empty(),
+               "kick: the index is told the peer is gone (it re-plans the span)");
+    // The slot came back: a reservation against that key succeeds again. (The
+    // peer itself is gone, so the io thread hands this one back at once.)
+    kat::check(rig.pool->request_objects(ref, ids, true),
+               "kick: the kicked peer's span slot was released");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
 // THE POST-ANCHOR CATCH-UP STALL (mainnet, 2026-09-23), on loopback.
 //
 // A node booted from a mainnet anchor ~2.6 K blocks behind asked for 100-block
@@ -846,6 +896,68 @@ void test_broadcast_reaches_a_link_opened_late() {
 }
 
 // -----------------------------------------------------------------------
+// THE QUIET NETWORK. relay_silent() is a proxy for "the peer holds us in
+// state_normal": it looks at whether the peer has relayed anything to us
+// lately. On a network where nobody relayed anything for a window -- a small
+// chain between blocks, a regtest, every link just re-dialled -- every healthy
+// peer looks silent, and a found block reached NOBODY. A block broadcast whose
+// proxy leaves no target now goes to every handshaked link; anything that is
+// not a block keeps the strict rule.
+void test_block_broadcast_falls_back_when_every_peer_is_silent() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    cfg.relay_silent_window_ms = 1'000;
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "quiet: peer up");
+    // One last push from the peer (its chain request, served), then silence.
+    // The link's silence clock starts at a stamp that is not its own first
+    // millisecond, so the window below is measured from a real event.
+    rig.pump(50);
+    daemon.request_chain({hash_of_byte(static_cast<std::uint8_t>(2'204'010 & 0xff))});
+    kat::check(rig.wait_for([&] {
+                   return daemon.count(levin::CMD_RESPONSE_CHAIN_ENTRY) == 1; }),
+               "quiet: the peer was served (it holds us in state_normal)");
+    rig.pump(1'500);                                   // nobody relays anything
+    rig.pump(100);                                     // one maintenance tick
+    kat::checkf(rig.pool->telemetry().relay_silent_peers == 1,
+                "quiet: the healthy peer is counted relay-silent (%zu)",
+                rig.pool->telemetry().relay_silent_peers);
+
+    auto broadcast = [&](std::uint32_t cmd) {
+        std::vector<std::uint8_t> frame(16, 0xee);
+        std::size_t       written = 99;
+        std::atomic<bool> done{false};
+        std::thread caller([&] {
+            written = rig.pool->broadcast_notify(cmd, frame);
+            done.store(true);
+        });
+        rig.wait_for([&] { return done.load(); }, 3000);
+        caller.join();
+        return written;
+    };
+
+    const std::size_t tx_written = broadcast(levin::CMD_NEW_TRANSACTIONS);
+    kat::checkf(tx_written == 0,
+                "quiet: a NON-block broadcast keeps the strict state_normal rule (%zu)",
+                tx_written);
+    const std::size_t written = broadcast(levin::CMD_NEW_FLUFFY_BLOCK);
+    kat::checkf(written == 1,
+                "quiet: a found block still reaches the one healthy peer (%zu)", written);
+    kat::check(rig.wait_for([&] { return daemon.count(levin::CMD_NEW_FLUFFY_BLOCK) >= 1; }),
+               "quiet: the 2008 arrived at the peer");
+    kat::check(daemon.count(levin::CMD_NEW_TRANSACTIONS) == 0,
+               "quiet: and the transaction frame did not");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
 void test_broadcast_with_no_peers_is_zero() {
     // The never-silent-drop rule: a found block that reached nobody must report
     // zero loudly, not shrug.
@@ -1046,11 +1158,13 @@ int main(int argc, char** argv) {
     test_object_chunking_and_span_reassembly();
     test_dense_mainnet_span_is_accepted_not_banned();
     test_span_caps_refuse_visibly();
+    test_unanswered_get_objects_releases_span();
     test_request_chain_forces_genesis_terminus();
     test_serving_obligation();
     test_serving_no_common_block_closes();
     test_push_traffic_and_broadcast();
     test_broadcast_reaches_a_link_opened_late();
+    test_block_broadcast_falls_back_when_every_peer_is_silent();
     test_broadcast_with_no_peers_is_zero();
     test_refill_across_several_daemons();
     test_unreachable_address_backs_off();

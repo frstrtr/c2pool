@@ -588,6 +588,33 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_daemonless_selfmine_kat COMMAND v37_xmr_daemonless_selfmine_kat)
 
     # ------------------------------------------------------------------
+    # The daemonless publish arm when the first push reaches NOBODY.
+    #
+    #   v37_xmr_p2p_publish_retry_kat
+    #     A found block whose 2008 reached no peer used to be counted and
+    #     dropped. It is now parked and re-announced on a bounded backoff from
+    #     the relay's retained book: the first re-announce that reaches a peer
+    #     pushes THE FoundBlockEvent (exactly once), a block our own best chain
+    #     no longer carries is dropped without another frame, and one that runs
+    #     out of attempts or window is ABANDONED at ERROR -- never booked. Solo,
+    #     refused blocks and first-time deliveries are pinned unchanged.
+    #
+    #     Injected clock; no sockets, no daemon, no RandomX, no threads.
+    #
+    #     SAME HOLLOW-GREEN GUARD: ALSO listed in BOTH build.yml `--target`
+    #     lists (Linux x86_64 and ASan+UBSan), or ctest reports "***Not Run".
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_p2p_publish_retry_kat v37_xmr_p2p_publish_retry_kat.cpp)
+    target_compile_features(v37_xmr_p2p_publish_retry_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_p2p_publish_retry_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_p2p_publish_retry_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_p2p_publish_retry_kat COMMAND v37_xmr_p2p_publish_retry_kat)
+
+    # ------------------------------------------------------------------
     # c2pool#1551 -- the SAME-HEIGHT double-block refusal, decided prefer-own
     # within bounds.
     #

@@ -136,6 +136,14 @@ struct PoolTelemetry {
     std::uint64_t broadcasts      = 0;
     std::uint64_t broadcast_peers = 0;
 
+    // Block broadcasts that found every handshaked link relay-silent and fell
+    // back to writing all of them rather than reaching nobody.
+    std::uint64_t broadcast_fallbacks = 0;
+
+    // Links closed because a 2003/2006 went unanswered past
+    // NON_RESPONSIVE_PEER_KICK_TIME; their spans are released by the close.
+    std::uint64_t request_kicks   = 0;
+
     // Per-command inbound tally and the last close reason. These are the two
     // numbers that answer "I am connected and receiving nothing, why?" without
     // a debugger -- the exact question the X9 stagenet bring-up could not
@@ -1015,7 +1023,10 @@ private:
 
     // --- broadcast ----------------------------------------------------------
     std::size_t do_broadcast(std::uint32_t cmd, const std::vector<std::uint8_t>& frame) {
-        std::size_t written = 0;
+        // Targets are collected FIRST and written second: a refused write
+        // closes its link synchronously, and the close erases that peer from
+        // peers_ -- which must not happen under a live iterator of the map.
+        std::vector<std::shared_ptr<levinns::LevinLink>> normal, silent;
         for (auto& [key, p] : peers_) {
             if (!p.handshaked || !p.link) continue;
             // "state_normal peers only": we cannot read the peer's own state, so
@@ -1026,8 +1037,28 @@ private:
             // are link-epoch milliseconds, and comparing them with the pool's
             // now_ms() made every link opened >= 240 s after the pool started
             // permanently "silent" -- broadcast then reached nobody.
-            if (p.link->relay_silent(cfg_.relay_silent_window_ms)) continue;
-            if (p.link->send_notify(cmd, frame)) ++written;
+            (p.link->relay_silent(cfg_.relay_silent_window_ms) ? silent : normal)
+                .push_back(p.link);
+        }
+        std::size_t written = 0;
+        for (const auto& l : normal)
+            if (l->send_notify(cmd, frame)) ++written;
+
+        // THE QUIET-NETWORK FALLBACK, blocks only. relay_silent() is a proxy:
+        // on a network where nobody has relayed anything for a window (a small
+        // chain between blocks, a regtest, a pool whose peers were all just
+        // re-dialled) EVERY healthy peer looks silent, and a found block would
+        // reach nobody while peers sit in state_normal. So when the proxy
+        // leaves no target at all, a block goes to every handshaked link
+        // instead. It costs nothing when the proxy was right: monerod ignores
+        // an unsolicited 2001/2008 on a connection it does not hold in
+        // state_normal (it returns before touching the block, no drop, no ban).
+        const bool is_block = cmd == levinns::CMD_NEW_FLUFFY_BLOCK
+                           || cmd == levinns::CMD_NEW_BLOCK;
+        if (written == 0 && is_block && !silent.empty()) {
+            ++tel_.broadcast_fallbacks;
+            for (const auto& l : silent)
+                if (l->send_notify(cmd, frame)) ++written;
         }
         ++tel_.broadcasts;
         tel_.broadcast_peers += written;
@@ -1079,6 +1110,7 @@ private:
 
         const bool was_handshaked = p.handshaked;
         const PeerRef ref = p.ref;
+        if (p.link && p.link->request_kicked()) ++tel_.request_kicks;
         tel_.last_close_peer = key;
         tel_.last_close_why  = why;
         if (p.link) p.link->stop(why);

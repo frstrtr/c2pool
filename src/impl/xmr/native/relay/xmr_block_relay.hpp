@@ -528,6 +528,13 @@ public:
         return find_locked(block_id) != nullptr;
     }
 
+    // Our own index has a DIFFERENT block on its best chain than this one: the
+    // height was lost (or the index never took it). False when no chain is
+    // wired -- "unknown" is never read as "lost".
+    bool own_chain_disowns(const Hash& block_id) const {
+        return m_chain != nullptr && !m_chain->is_on_best_chain(block_id);
+    }
+
     std::size_t retained_count() const {
         std::lock_guard<std::mutex> lk(m_mx);
         return m_book.size();
@@ -547,16 +554,32 @@ public:
     // caller can tell "pushed" from "had nothing to push" -- which are different
     // stories and have different fixes.
     bool renotify(const Hash& block_id, std::size_t* peers_sent = nullptr) {
+        if (peers_sent) *peers_sent = 0;
         std::vector<std::uint8_t> blob;
         std::vector<TxBlobEntry>  bodies;
+        std::vector<Hash>         tx_hashes;
         std::uint64_t             height = 0;
         {
             std::lock_guard<std::mutex> lk(m_mx);
             const Retained* r = find_locked(block_id);
             if (!r) return false;
-            blob   = r->block_blob;
-            bodies = r->bodies;
-            height = r->height;
+            blob      = r->block_blob;
+            bodies    = r->bodies;
+            tx_hashes = r->tx_hashes;
+            height    = r->height;
+        }
+        // A block retained without every body (the first relay was suppressed
+        // as partial) is re-collected now, and is NOT re-announced partial:
+        // the same fail-loud rule as the first push.
+        if (m_cfg.policy.include_all_tx_bodies && bodies.size() != tx_hashes.size()) {
+            std::string bwhy;
+            if (!collect_bodies(tx_hashes, bodies, bwhy)) {
+                say(true, "renotify: block " + hex(block_id) + " is still incomplete: " + bwhy);
+                return false;
+            }
+            std::lock_guard<std::mutex> lk(m_mx);
+            for (Retained& r : m_book)
+                if (r.id == block_id) r.bodies = bodies;
         }
         std::vector<std::uint8_t> body;
         std::string why;
