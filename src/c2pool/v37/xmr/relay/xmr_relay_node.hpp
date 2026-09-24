@@ -284,6 +284,7 @@ public:
             m_fetch->on_control(p, f);
         });
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
+        m_net.set_log([this](const std::string& s) { log("relay: " + s); });
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
@@ -748,6 +749,20 @@ private:
                 std::lock_guard<std::mutex> lk(m_pmtx);
                 m_peers[p] = PeerSt{};
                 over = m_peers.size() > m_o.max_peers;
+            }
+            // RELAY-FD: the up event runs on the dialing/accepting thread AFTER
+            // the connection's reader started. A peer that closes at once (a
+            // partitioned node refusing us) can unwind that reader and fire the
+            // DOWN event before this line ran; no second down event follows, so
+            // the entry just made would be a ghost: never HELLO'd, re-counted
+            // as a HELLO timeout every tick, and counted against max_peers
+            // forever -- enough of them and every new link is over_cap, so the
+            // relay never heals. Re-check the transport after inserting: a down
+            // event that lands after this check erases the entry itself.
+            if (!m_net.has_peer(p)) {
+                std::lock_guard<std::mutex> lk(m_pmtx);
+                m_peers.erase(p);
+                return;
             }
             if (over) { m_st.over_cap++; m_net.disconnect(p); return; }
             const auto f = encode_hello(our_hello());
@@ -1516,7 +1531,12 @@ private:
                     if (!s.hello_ok && Clock::now() - s.connected > std::chrono::milliseconds(m_o.hello_timeout_ms))
                         stale.push_back(p);
             }
-            for (PeerId p : stale) { m_st.hello_timeout++; m_net.disconnect(p); }
+            for (PeerId p : stale) {
+                m_st.hello_timeout++;
+                if (m_net.has_peer(p)) { m_net.disconnect(p); continue; }
+                std::lock_guard<std::mutex> lk(m_pmtx);   // transport already dropped it: no down event will come
+                m_peers.erase(p);
+            }
             if (m_partitioned.load() && Clock::now().time_since_epoch().count() >= m_partition_until.load()) {
                 m_partitioned = false;
                 m_dialing = true;
