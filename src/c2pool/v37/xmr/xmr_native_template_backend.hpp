@@ -231,7 +231,15 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     // of the parity judge.
     // Solo implies no daemon: there is no endpoint to configure, and leaving one
     // wired would have the C6 parity judge dial a dead port every status tick.
-    if (!cfg.no_daemon_rpc && !cfg.native_solo) {
+    //
+    // D6d: p2p-first withholds it too unless --native-parity-monerod asks for the
+    // judge. The native chain index already answers everything that judge read
+    // (tip, RandomX seed hash/height, difficulty/height), so leaving it wired by
+    // default kept a get_miner_data + get_info + get_last_block_header trio on
+    // the wire every status tick for nothing but a comparison. The judge is now
+    // an explicit, compare-only oracle under p2p-first; daemon-first is unchanged.
+    const bool want_daemon_judge = !p2p_first || cfg.native_parity_monerod;
+    if (!cfg.no_daemon_rpc && !cfg.native_solo && want_daemon_judge) {
         n.monerod_rpc_host = cfg.monerod.rpc_host;
         n.monerod_rpc_port = cfg.monerod.rpc_port;
     }
