@@ -305,6 +305,18 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_o2_finalize_connect_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_o2_finalize_connect_selfcheck PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_o2_finalize_connect_selfcheck COMMAND v37_xmr_o2_finalize_connect_selfcheck)
+    # v37_xmr_cba_native_booking_kat (D6a): the coinbase-authority booking reads
+    # lane blocks from the NATIVE chain index (xmr/xmr_cba_block_source.hpp), not
+    # monerod get_block -- a native hit makes 0 RPCs, a miss HOLDS (never a silent
+    # monerod fallback), the compare oracle counts but never decides -- and, end to
+    # end through FinalizeConnect, a not-yet-held block is retried then HELD, never
+    # refused. Same monerod-STUB shape as the finalize-connect selfcheck. SAME
+    # HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_cba_native_booking_kat v37_xmr_cba_native_booking_kat.cpp)
+    target_compile_features(v37_xmr_cba_native_booking_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_cba_native_booking_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_cba_native_booking_kat PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_cba_native_booking_kat COMMAND v37_xmr_cba_native_booking_kat)
     # v37_xmr_lane_suspend_selfcheck (R-C rework-2): the stratum side of LANE
     # SUSPEND over a loopback socket -- the suspend EDGE withdraws the job
     # (sessions dropped), a login while suspended is PARKED, the resume edge

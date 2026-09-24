@@ -874,7 +874,11 @@ public:
             // one OBSERVATION for the lineage vote -- never by itself a halt.
             if (why.rfind("lane-root-refused:", 0) == 0) { note_refused_frontier(h, bid, bk); return; }
             const bool root_unknown = (why.rfind("lane-root-unknown:", 0) == 0);   // R5
-            const bool fetch_fail   = (why.rfind("get_block", 0) == 0 || why.find("does not parse") != std::string::npos);
+            // D6a: "native-hold:" = the native chain index does not hold the block body
+            // (p2p-first booking reads it there, not from monerod) -- a transient fetch
+            // failure like get_block's: retried, then HELD past the bound, never refused.
+            const bool fetch_fail   = (why.rfind("get_block", 0) == 0 || why.rfind("native-hold:", 0) == 0 ||
+                                       why.find("does not parse") != std::string::npos);
             const bool cut_pend     = (why.rfind("cut-pending:", 0) == 0);
             if (fetch_fail || cut_pend || root_unknown) {   //  fix 4: transient (recon(A+B credit): + receiver's lane not yet at P; R5: + ring not yet at the winner's state)
                 const std::uint64_t n = static_cast<std::uint64_t>(++m_retry_n[bid]);

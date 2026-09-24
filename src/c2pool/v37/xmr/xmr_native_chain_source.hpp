@@ -87,6 +87,13 @@ struct NativeChainSource {
     };
     std::function<std::vector<AltCandidate>()> alt_candidates;
 
+    // D6a: the block blob of `bid_hex` from the index's retained bodies (the
+    // coinbase-authority booking reads it here instead of monerod get_block).
+    // false when the index does not hold the body (never connected, or aged
+    // out of the entry cache); the caller HOLDS, it does not ask a daemon.
+    // The id is the hash of the blob, so a hit is byte-identical to get_block.
+    std::function<bool(const std::string& bid_hex, std::vector<std::uint8_t>& blob)> block_blob;
+
     explicit operator bool() const noexcept {
         return static_cast<bool>(drain) && static_cast<bool>(is_canonical);
     }
@@ -104,6 +111,23 @@ inline std::string chain_id_hex(const ::c2pool::xmr::node::Hash& h) {
         s.push_back(k[b & 0xf]);
     }
     return s;
+}
+
+// Inverse of chain_id_hex: 64 hex digits (either case) -> 32 bytes.
+inline bool block_id_of_hex(const std::string& hex, ::c2pool::xmr::node::Hash& out) {
+    if (hex.size() != 64) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < 32; ++i) {
+        const int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return true;
 }
 
 // Bind the source to a STARTED backend. The node must be up: both closures
@@ -134,6 +158,15 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
             out.push_back(std::move(c));
         }
         return out;
+    };
+
+    src.block_blob = [n](const std::string& bid_hex, std::vector<std::uint8_t>& blob) {
+        ::c2pool::xmr::node::Hash id{};
+        if (!block_id_of_hex(bid_hex, id)) return false;
+        const auto e = n->index().get_block_entry(id, /*prune=*/false);
+        if (!e || e->block_blob.empty()) return false;
+        blob = e->block_blob;
+        return true;
     };
     return src;
 }

@@ -102,6 +102,7 @@
 #include "xmr/xmr_settlement_coinbase_shape.hpp"  // M2: the K_fair shape gate, read off the assembled block bytes
 #include "xmr/xmr_native_template_backend.hpp"    // M2: the native-minimal Monero node as the miner-data source
 #include "xmr/xmr_native_chain_source.hpp"        // M3: the native levin chain as the tip + canonical test
+#include "xmr/xmr_cba_block_source.hpp"           // D6a: the booking's block blob from the native index
 #include "xmr/xmr_p2p_block_publisher.hpp"        // M3: found block -> levin 2008 (no submit_block)
 #include "xmr/xmr_recon_ring.hpp"                 // R-C rework-3 (D7): the RECON ring + root-age bound
 #include "xmr/xmr_lane_suspend_state.hpp"         // R-C rework-3 (D5 + contested): the lane-suspend causes
@@ -166,6 +167,9 @@ static std::string   g_wire_out, g_wire_in;    // --wire-out DIR / --wire-in DIR
 static long long     g_credit_mutate = 0;      // --credit-mutate N: +N piconero on one E_b row (the amount-sensitivity falsifier)
 // R6 knobs (all networks). See xmr/xmr_o2_finalize_connect.hpp (R6) + docs/xmr-lane/finality-boundary.md.
 static bool          g_no_book_deferral = false;         // --no-book-deferral: A/B escape hatch (reintroduces the lagging-receiver fork)
+// D6a (xmr/xmr_cba_block_source.hpp): p2p-first books from the native index; monerod is opt-in only.
+static bool          g_cba_monerod_compare = false;      // --cba-monerod-compare: compare-only oracle (counts, never decides)
+static bool          g_cba_monerod_fallback = false;     // --cba-monerod-fallback: a native miss asks monerod instead of HOLDING
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
 static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
 static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
@@ -1428,17 +1432,31 @@ static int run_live(const XmrNodeConfig& cfg) {
                             cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
     };
     // fetch + decode one block's coinbase under coinbase authority (shared by the chain path and the fast path)
+    // D6a: WHERE the blob comes from. p2p-first + native templates: the native chain
+    // index's retained bodies (a miss HOLDS; monerod only as the opt-in compare oracle or
+    // the explicit fallback). Otherwise: monerod get_block, the pre-D6a path verbatim.
+    o2::CbaBlockSource cba_src(
+        (p2p_first && chain_src.block_blob) ? o2::CbaBlockSource::NativeFn(chain_src.block_blob) : o2::CbaBlockSource::NativeFn{},
+        [&](const std::string& bid, std::vector<std::uint8_t>& blob, std::string& why) -> bool {
+            std::string body, err;
+            transport.rpc_post(c2pool::xmr::node::MoneroDaemonRpc::body_get_block(0, bid),
+                               [&](const c2pool::xmr::node::RpcResponse& r) { if (!r.ok()) err = r.error; else body.assign(r.body.begin(), r.body.end()); });
+            if (!err.empty()) { why = "get_block(" + bid.substr(0, 12) + "): " + err; return false; }
+            c2pool::xmr::node::minijson::Value v;
+            if (!c2pool::xmr::node::minijson::parse(body, v)) { why = "get_block: JSON parse failed"; return false; }
+            const std::string blob_hex = v["result"]["blob"].as_string();
+            if (blob_hex.empty() || !sub::from_hex(blob_hex, blob)) { why = "get_block: no/invalid result.blob"; return false; }
+            return true;
+        },
+        o2::CbaBlockSourceOptions{g_cba_monerod_compare, g_cba_monerod_fallback},
+        [](const std::string& line) { std::printf("%s\n", line.c_str()); std::fflush(stdout); });
+    std::printf("cba: booking block source = %s (monerod compare oracle %s, monerod fallback %s)\n",
+                cba_src.native_mode() ? "NATIVE chain index (no get_block)" : "monerod get_block",
+                g_cba_monerod_compare ? "ON" : "off", g_cba_monerod_fallback ? "ON" : "off");
     auto fetch_decode = [&](const std::string& bid, c2pool::v37n::xmr::authority::CoinbaseBooking& bk, std::string& why,
                             std::vector<std::uint8_t>* blob_out = nullptr, std::vector<std::uint64_t>* superseded_out = nullptr) -> bool {
-        std::string body, err;
-        transport.rpc_post(c2pool::xmr::node::MoneroDaemonRpc::body_get_block(0, bid),
-                           [&](const c2pool::xmr::node::RpcResponse& r) { if (!r.ok()) err = r.error; else body.assign(r.body.begin(), r.body.end()); });
-        if (!err.empty()) { why = "get_block(" + bid.substr(0, 12) + "): " + err; return false; }
-        c2pool::xmr::node::minijson::Value v;
-        if (!c2pool::xmr::node::minijson::parse(body, v)) { why = "get_block: JSON parse failed"; return false; }
-        const std::string blob_hex = v["result"]["blob"].as_string();
         std::vector<std::uint8_t> blob;
-        if (blob_hex.empty() || !sub::from_hex(blob_hex, blob)) { why = "get_block: no/invalid result.blob"; return false; }
+        if (!cba_src.fetch(bid, blob, why)) return false;
         if (blob_out) *blob_out = blob;
         bk = decode_blob(blob, superseded_out);
         if (!bk.ok) why = bk.why;
@@ -2650,6 +2668,13 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cba_fetch_failed, (unsigned long long)cba_stale_root,
                             cba_lane_root_unknown, cba_ring.size(), (unsigned long long)cba_max_root_age,
                             (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch);
+                const auto& cs = cba_src.stats();
+                std::printf("  cba-src: %s native_hits=%llu native_hold=%llu holding=%zu get_block_rpc=%llu rpc_failed=%llu | compare equal=%llu MISMATCH=%llu unavailable=%llu | fallback_used=%llu\n",
+                            cba_src.native_mode() ? "native" : "monerod",
+                            (unsigned long long)cs.native_hits, (unsigned long long)cs.native_hold, cba_src.holding_now(),
+                            (unsigned long long)cs.rpc_calls, (unsigned long long)cs.rpc_failed,
+                            (unsigned long long)cs.compare_equal, (unsigned long long)cs.compare_mismatch, (unsigned long long)cs.compare_unavailable,
+                            (unsigned long long)cs.fallback_used);
             }
             if (!last_shape.empty())
                 std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
@@ -2988,6 +3013,8 @@ int main(int argc, char** argv) {
         else if (a == "--wire-in")            g_wire_in = next("");
         else if (a == "--credit-mutate")      g_credit_mutate = std::stoll(next("0"));
         else if (a == "--no-book-deferral")        g_no_book_deferral = true;
+        else if (a == "--cba-monerod-compare")     g_cba_monerod_compare = true;
+        else if (a == "--cba-monerod-fallback")    g_cba_monerod_fallback = true;
         // GAP-2 relay knobs
         else if (a == "--relay-listen")             g_relay_listen = next("");
         else if (a == "--relay-peer")               g_relay_peers.push_back(next(""));
@@ -3100,6 +3127,10 @@ int main(int argc, char** argv) {
                 "                               (default 4*D_conf; 0 = unbounded, the rework-2 behaviour)\n"
                 "  --no-book-deferral           A/B escape hatch: book chain blocks as they arrive\n"
                 "                               (pre-R6; a lagging receiver then FORKS owed_digest)\n"
+                "  --cba-monerod-compare        p2p-first: ALSO fetch each booked block from monerod and\n"
+                "                               count equal/mismatch (compare-only oracle; never decides)\n"
+                "  --cba-monerod-fallback       p2p-first: a block the native index no longer holds is read\n"
+                "                               from monerod instead of HELD (explicit opt-in; default HOLD)\n"
                 "  --same-height-tiebreak <prefer-own|first-seen>   same-height race policy\n"
                 "  --own-fork-bound-s <n>   abandon an own-mined tip no peer adopts after n s (0=off, 240)\n"
                 "                               (default prefer-own; drives BOTH the D-14 fork\n"
