@@ -201,6 +201,9 @@ struct RelayOptions {
     u32         unresolved_patience_ms = 30000;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
     u32         repair_state_timeout_ms = 20000;
+    // Lane positions one receipt may span (fee model S3: 2 = (payee, donation)
+    // split; 1 = the gate-OFF / master rule). Bounds the repair density check.
+    u32         max_pushes_per_receipt = 1;
     // repair context + refetch (see REPAIR CONTEXT above)
     u32         solicited_unresolved_patience_ms = 120000;   // a solicited receipt waits this long for its context
     u32         ctx_retry_ms = 2000;                         // re-ask an unanswered GETCTX (next peer) after this
@@ -362,11 +365,14 @@ public:
     }
 
     // ── verified cache lookup (main thread, for a repair replay) ────────────
-    bool cached(const bytes32& id, ::v37::ScriptRef* payee = nullptr) const {
+    // `give_author` = the u16 the receipt carries in its PoW-committed
+    // side_data_v2 (fee model S3: the repair replay splits by it).
+    bool cached(const bytes32& id, ::v37::ScriptRef* payee = nullptr, u16* give_author = nullptr) const {
         std::lock_guard<std::mutex> lk(m_mtx);
         auto it = m_cache.find(id);
         if (it == m_cache.end()) return false;
         if (payee) *payee = it->second.payee;
+        if (give_author) *give_author = it->second.give_author;
         return true;
     }
     bool known(const bytes32& id) const {
@@ -673,7 +679,7 @@ private:
         Clock::time_point enq = Clock::now();
         Clock::time_point not_before = Clock::now();
     };
-    struct CacheEntry { ::v37::ScriptRef payee; std::vector<u8> raw; u64 bin = 0; };
+    struct CacheEntry { ::v37::ScriptRef payee; std::vector<u8> raw; u64 bin = 0; u16 give_author = 0; };
     struct Job {
         enum class Kind { Order, Frames } kind = Kind::Order;
         bool repair = false;
@@ -722,7 +728,7 @@ private:
     void log(const std::string& s) { if (m_log) m_log(s); }
 
     void cache_put_locked(const Admitted& a) {
-        CacheEntry e; e.payee = a.r.payee; e.raw = a.raw; e.bin = a.bin;
+        CacheEntry e; e.payee = a.r.payee; e.raw = a.raw; e.bin = a.bin; e.give_author = a.r.side.give_author;
         m_cache.emplace(a.id, std::move(e));
         m_cache_order.push_back(a.id);
         while (m_cache_order.size() > m_o.cache_max) { m_cache.erase(m_cache_order.front()); m_cache_order.pop_front(); }
@@ -1329,9 +1335,20 @@ private:
             if (it == m_repairs.end()) return;
             Repair& r = it->second;
             if (r.st != Repair::St::Ordering || r.cur != p) return;
+            // Dense = every lane position in [cursor, p_served) is covered by
+            // the served receipts. One receipt spans 1..max_pushes_per_receipt
+            // positions (1 with the fee model OFF -- exactly the master rule --
+            // 1 or 2 under it), so consecutive starts step by 1..max.
+            const u64 mp = m_o.max_pushes_per_receipt ? m_o.max_pushes_per_receipt : 1;
             bool dense = (o.a == r.cursor);
-            for (std::size_t i = 0; dense && i < o.ids.size(); ++i) dense = (o.ids[i].pos == r.cursor + i);
-            dense = dense && (o.p_served == r.cursor + o.ids.size());
+            u64 prev = 0;
+            for (std::size_t i = 0; dense && i < o.ids.size(); ++i) {
+                const u64 pos = o.ids[i].pos;
+                dense = (i == 0) ? (pos == r.cursor) : (pos >= prev + 1 && pos <= prev + mp);
+                prev = pos;
+            }
+            dense = dense && (o.ids.empty() ? (o.p_served == r.cursor)
+                                            : (o.p_served >= prev + 1 && o.p_served <= prev + mp));
             if (!dense) { m_st.repair_peer_fail++; r.tried.insert(p); r.reset(); return; }
             for (const auto& e : o.ids) r.ids.push_back(e.id);
             r.cursor = o.p_served;

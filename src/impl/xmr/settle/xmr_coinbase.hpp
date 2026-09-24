@@ -187,6 +187,11 @@ struct CoinbaseOutput {
     ::v37::bytes32   identity{};
     std::uint64_t    amount = 0;     // piconero
     Role             role = Role::Owed;
+    // Only on the folded (last) fixed output when the residual folds into it
+    // (residual_folds_into_fixed): the part of `amount` that settles OWED to
+    // its identity (a ledger deduction); amount - owed_part is the minimum +
+    // residual (coverage). 0 everywhere else. See allocate_exact_sum.
+    std::uint64_t    owed_part = 0;
     // filled by the crypto pass:
     PublicKey        one_time_key{}; // P_i
     ViewTag          view_tag{};     // vt_i
@@ -197,7 +202,7 @@ enum class BuildError : std::uint8_t {
     CarrotFence,        // major_version > W5_PRECARROT_MAX_MAJOR_VERSION
     ZeroBudget,         // base_reward + fees == 0 (impossible on XMR tail emission)
     FixedExceedsBudget, // Sum(fixed) > budget
-    CapTooSmall,        // output_cap < fixed.size() + 1 (no room for the sink)
+    CapTooSmall,        // output_cap < fixed.size() + 1 (no room for the sink; + 0 when it folds, S1)
     BadSinkDescriptor,  // residual_sink is not a valid XMR ref
     BadPayeeDescriptor, // an owed/fixed pay is not a valid XMR ref
     DerivationFailed,   // r*G or an ECDH derivation failed (bad point)
@@ -243,7 +248,29 @@ struct ReceivedCoinbase {
 //
 // Canonical output order (consensus):
 //     [ K_fair owed outputs ]  ++  [ fixed outputs ]  ++  [ residual sink? ]
-// The sink is present iff the residual is > 0. Invariant on success:
+// The sink is present iff the residual is > 0 -- EXCEPT when the LAST fixed
+// output IS the residual sink (same ref + identity: residual_folds_into_fixed(), the fee model's
+// single donation output, rulings S1/S2): then there is never a separate sink
+// output and no sink slot is reserved; that last fixed output pays
+// max(declared amount, residual), i.e. it absorbs the whole residual, and its
+// declared amount is a MINIMUM taken from the residual first and, only when
+// the owed pass exhausted the budget, from the LARGEST owed output (ties: the
+// earliest in K_fair order; the shortfall stays owed).
+//
+// MERGE (one output per fold identity, operator ruling 09-23): when the fold
+// identity is ALSO in the owed set (the donation holding give-author credit),
+// it is paid in the K_fair pass at its own age position exactly like any other
+// payee (budget, h_min, the S2 dust candidates), but it takes NO output slot
+// of its own: its payout is added into the folded output, which is then
+//     amount    = owed_paid + minimum + residual        (ONE output, last)
+//     owed_part = min(owed_in, amount - minimum)
+// where owed_in is fold_identity_owed(in). owed_part is the K_fair payout
+// plus, when the pass left residual, the rest of owed_in out of that residual
+// (the output pays the fold identity either way; this books what it
+// receives against what it is owed first). The rule depends only on owed_in
+// and the on-chain amount, so a receiver that knows owed_in (committed in the
+// coinbase by the fee model) re-derives owed_part without the ledger.
+// Invariant on success:
 //     Sum(result.amount) == in.budget()      (exact-sum, no burn)
 // and every result.amount > 0, and result.size() >= 1, and result.size() <=
 // in.output_cap.
@@ -253,6 +280,17 @@ struct ReceivedCoinbase {
 // ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err = nullptr);
+
+// S1: true iff the last fixed output IS the residual sink -- it pays
+// `residual_sink` (ScriptRef equality) under `residual_sink_identity` -- i.e.
+// the residual folds into it and no separate sink output / slot exists.
+// Callers that pre-check the output cap must use the same slot rule.
+bool residual_folds_into_fixed(const CoinbaseInputs& in);
+
+// The owed the input set holds for the fold identity (sum over owed entries
+// with that identity and ref; 0 when the residual does not fold or the
+// identity holds no owed). This is the owed_in of the MERGE rule above.
+std::uint64_t fold_identity_owed(const CoinbaseInputs& in);
 
 // ---------------------------------------------------------------------------
 // Deterministic tx secret key r = H_s(domain || major || chain_id ||

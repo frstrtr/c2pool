@@ -217,6 +217,13 @@ public:
     // the penalty-zone greedy). Applied ONLY when the answering arm is the
     // native one -- the daemon arm keeps its exact byte-identical legacy path.
     void set_take_mempool_as_given(bool on) { m_take_mempool_as_given = on; }
+    // SEAM-1 (GAP-2 rbind): every template this provider assembles writes
+    // `fn(extra_nonce)` (size bytes) right after the worker nonce in the 0x02
+    // payload. Set once before serving; unset => byte-identical templates.
+    void set_extra_nonce_bind(std::size_t size, asm_::X6SettlementSource::ExtraNonceBindFn fn) {
+        m_bind_size = fn ? size : 0; m_bind = std::move(fn);
+    }
+    std::size_t extra_nonce_bind_size() const { return m_bind_size; }
 
     XmrSettlementTemplateProvider(const XmrSettlementTemplateProvider&) = delete;
     XmrSettlementTemplateProvider& operator=(const XmrSettlementTemplateProvider&) = delete;
@@ -457,6 +464,8 @@ private:
         a.mempool = asm_::from_backlog(md.tx_backlog);       // empty on regtest => n_tx == 0
         a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
         a.extra_nonce_tail = src->extra_nonce_tail();   // recon(A+B credit): the on-chain credit cut (0x02 tail)
+        a.extra_nonce_bind_size = m_bind_size;          // SEAM-1: [extra_nonce 4 | rbind 32] (0 = none)
+        a.extra_nonce_bind = m_bind;
         // GOOD-CITIZEN: mine the (already good-citizen-selected) set VERBATIM,
         // but only when the NATIVE arm answered. name() reports the arm that
         // actually served this snapshot (the resolved source can fall back to
@@ -507,6 +516,8 @@ private:
     native::IMinerDataSource*                 m_src = nullptr;
     RefreshPump                               m_pump;
     ShapeGate                                 m_shape_gate;
+    std::size_t                               m_bind_size = 0;   // SEAM-1
+    asm_::X6SettlementSource::ExtraNonceBindFn m_bind;           // SEAM-1
     bool                                      m_take_mempool_as_given = false;
 
     XmrOwedFixture&          m_ledger;
