@@ -284,6 +284,7 @@ public:
             m_fetch->on_control(p, f);
         });
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
+        m_net.set_log([this](const std::string& s) { log("relay: " + s); });
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
