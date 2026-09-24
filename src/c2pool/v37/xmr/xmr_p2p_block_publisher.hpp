@@ -76,6 +76,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -341,6 +342,12 @@ public:
     // other three are how each parked block ended.
     std::size_t   parked() const { std::lock_guard<std::mutex> lk(m_park_mx); return m_parked.size(); }
     std::uint64_t parked_total()       const { return m_parked_total.load(); }
+    // D2: was this own block ever PARKED (published while no relay peer took
+    // it)? The minority re-derivation's first candidate refuse set. Thread-safe.
+    bool was_parked(const std::string& bid_hex) const {
+        std::lock_guard<std::mutex> lk(m_park_mx);
+        return m_parked_ever.count(bid_hex) != 0;
+    }
     std::uint64_t late_reached()       const { return m_late_reached.load(); }
     std::uint64_t abandoned()          const { return m_abandoned.load(); }
     std::uint64_t orphaned_unreached() const { return m_orphaned_unreached.load(); }
@@ -402,6 +409,7 @@ private:
                           ") and it is the oldest");
             m_parked.pop_front();
         }
+        m_parked_ever.insert(hex_of(ev.block_id));   // D2: isolation mark (was_parked)
         Parked p;
         p.ev      = std::move(ev);
         p.t0      = now;
@@ -463,6 +471,7 @@ private:
     RetryPolicy                m_retry{};
     std::deque<Parked>         m_parked;
     std::deque<sub::Hash>    m_delivered;
+    std::set<std::string>      m_parked_ever;   // D2: every block id ever parked (guarded by m_park_mx)
     std::atomic<std::uint64_t> m_parked_total{0}, m_late_reached{0}, m_abandoned{0},
                                m_orphaned_unreached{0}, m_dup_found{0};
 };

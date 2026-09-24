@@ -528,3 +528,60 @@ forwarders killed, `ss -ltnp` shows every rig port free.
 * A fork deeper than `4 * D_conf` is not re-derived: HALT + W6.
 * `--minority-converge off` keeps today's behaviour exactly (refuse +
   alarm; no detection).
+
+## 11. As built (implementation notes, deviations from §2-§9)
+
+Code: `xmr_minority_converge.hpp` (pure: builder key, `evaluate_run`,
+`refold`, marker/observation codecs), `xmr_o2_finalize_connect.hpp`
+(observations, CONVERGING/DIVERGED state machine, adoption, boot marker
+handling), `xmr_node.hpp` (`relineage()`, `chain_bid_at()`, D2-0),
+`xmr_finalize_driver.hpp` (`rebase()`), `main_v37_xmr.cpp` (`book_scratch`,
+flags, hooks, status line `minority:`). Where the build differs from the text:
+
+* **Fork depth (§3.2).** The bound is applied to `bcut(first run block) - F`,
+  not `cursor - F`: the cursor keeps walking while an attempt is undecidable
+  (a relay repair of a majority cut in flight), which would turn a shallow fork
+  into a "deep" one by waiting. Default bound `4 * D_conf`
+  (`FinalizeConnectOptions::converge_max_depth`).
+* **Candidate refuse sets (§3.2).** R1 (isolation-marked own blocks above F),
+  R2 (every own block above F), then R0 (none forced) and every other subset of
+  the own blocks above F, smallest first, bounded to 6 own blocks (64 sets).
+  None is a guess: a set is adopted only when its refold books every block of
+  the run, i.e. reproduces each of the majority's M on-chain commitments
+  (sha256d). The subset search covers "isolated but credited by the majority"
+  (the first isolated find's cut carries no isolated receipt, so the majority
+  can reproduce it) when F lies below it (KAT FC31d).
+* **Own blocks built on the minority lineage** need no forcing: their 0x03 root
+  does not match the scratch ring, so the refold refuses them exactly as the
+  majority did (`lane-root-refused`, whole reward unattributed, KAT FC31c).
+* **Isolation marks (§3.2).** `P2pBlockPublisher::was_parked(bid)` (every block
+  ever parked) is asked when the own win is registered; a yes is persisted in
+  `<sidecar>.isolated`. No callback from the listener thread.
+* **Refold decoding.** A block booked in the log being re-derived is only
+  root-checked against the scratch ring (`ScratchQuery::root_only`) and keeps
+  its booked maps (no second credit fold, no relay repair); a block not booked
+  there is decoded in full (`book_scratch`, the same authority as
+  `book_from_chain_ex`, D7 age on the scratch ring). Under the scratch lineage
+  an unmatched root is a refusal (the scratch is synced by construction).
+* **Adoption files (§3.4).** The new sidecar and liability bodies are written to
+  `<sidecar>.converge.pfound` / `.converge.liab` with the `proposed` marker,
+  before the store is touched; the boot tells an old from a rewritten store by
+  (replayed owed_digest, event count) == the marker's. `applied` (or `proposed`
+  with the rewritten store) is finished at boot before the sidecar is read; a
+  `proposed` marker with the old store is renamed `*.dropped-<utc>`. The
+  observation file `<sidecar>.mobs` is truncated at adoption and a floor height
+  (in the marker) keeps consumed observations out of later runs.
+* **Hooks.** `set_converge_hook` fires (true) on entry to CONVERGING (or to
+  DIVERGED from CONVERGED), (false) on the return to CONVERGED;
+  `set_relineage_hook` re-seeds main's RECON ring; main invalidates the
+  settlement template cache on `relineage_seq()` change (the provider re-keys on
+  the tip only, so a cached template would keep committing the abandoned root).
+* **Test knobs.** `--converge-hold-ticks n` (rig: a window to restart the node
+  while CONVERGING) and `FinalizeConnectOptions::converge_crash_after` (KAT-only
+  failpoints after `proposed` / `applied`).
+* **Rig (§9).** The relay cut is the existing rig knob
+  `--relay-test-partition-seconds` + SIGUSR1 on A (drops every relay link,
+  refuses inbound, no redial for the window), not TCP forwarders; the levin
+  isolation is stopping m1 (A dials only m1). `ledger_dump.py` replays every
+  node's `settle.img` independently (the R-A digest rules) and compares
+  FINALIZED sets, full digest sequences and the liability files.

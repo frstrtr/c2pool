@@ -320,6 +320,20 @@ public:
     std::uint64_t cursor_height() const { return m_cursor_h; }
     std::uint64_t event_seq()     const { return m_seq; }
 
+    // D2 (minority converges to majority): the event log was REWRITTEN to the
+    // re-derived lineage and the ledger replayed from it (XmrNode::relineage).
+    // Forget every found block this driver tracked (the consumer re-drives the
+    // new pending set through on_block_found, as the boot sidecar re-drive
+    // does), continue the write-ahead sequence after the rewritten log and the
+    // since-height of its last FINALIZE. The cursor, the high-water and every
+    // installed observer / gate / probe are unchanged.
+    void rebase(std::uint64_t event_seq, std::uint64_t digest_since) {
+        m_found.clear();
+        m_by_height.clear();
+        m_seq = event_seq;
+        m_last_since = digest_since;
+    }
+
 private:
     void write_event(const SettleEvent& ev) {
         auto b = m_store.batch();
