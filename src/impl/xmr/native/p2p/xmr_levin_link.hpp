@@ -276,6 +276,16 @@ public:
     const InvokeQueue&    invokes()   const noexcept { return invokes_; }
     const ExpectResponse& expect()    const noexcept { return expect_; }
     const InboundLiveness& liveness() const noexcept { return live_; }
+
+    // relay_silent() measured on THIS link's clock. InboundLiveness stores
+    // stamps taken from now_ms() below, whose origin is this link's own
+    // construction; a caller comparing them against any other clock (the
+    // pool's, which starts when the pool does) sees every link created more
+    // than `window_ms` after that other origin as permanently silent. So the
+    // comparison lives here, where both sides of it share one epoch.
+    bool relay_silent(Millis window_ms = 240'000) const {
+        return live_.relay_silent(now_ms(), window_ms);
+    }
     std::uint64_t timed_syncs_sent()     const noexcept { return timed_syncs_sent_; }
     std::uint64_t timed_syncs_answered() const noexcept { return timed_syncs_answered_; }
     LinkClose     close_reason()  const noexcept { return close_reason_; }

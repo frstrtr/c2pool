@@ -185,6 +185,11 @@ public:
         // D-3 back-pressure.
         std::size_t max_spans_per_peer = MAX_SPANS_PER_PEER;
         std::size_t max_spans_total    = MAX_SPANS_TOTAL;
+
+        // How long a handshaked link may go without a relay frame before
+        // broadcast skips it and telemetry counts it silent (design 2.3: two
+        // block intervals). Measured on each link's own clock.
+        Millis relay_silent_window_ms = 240'000;
     };
 
     struct Deps {
@@ -229,8 +234,10 @@ public:
             // the loop's own iterator on the first peer. Empty the map first.
             std::map<std::string, Peer> going = std::move(self->peers_);
             self->peers_.clear();
-            for (auto& [k, p] : going)
+            for (auto& [k, p] : going) {
+                self->release_spans_(k, p.spans.size());
                 if (p.link) p.link->stop("pool shutdown");
+            }
             self->publish_snapshot();
         });
     }
@@ -268,17 +275,22 @@ public:
     // a 2003 carrying more than CURRENCY_PROTOCOL_MAX_OBJECT_REQUEST_COUNT
     // (100) ids -- and reassemble the answers back into one on_objects() per
     // span, so C2 sees the span it planned rather than our chunking.
+    //
+    // The D-3 caps are enforced HERE, on the caller's thread, and a span over
+    // them is REFUSED (false) rather than accepted and then dropped on the io
+    // thread. The silent drop was half of the catch-up livelock: the sync
+    // driver had already booked the ids as asked, so every refused batch sat
+    // out the 15 s re-ask interval while nothing was fetching it.
     bool request_objects(const PeerRef& ref, std::vector<Hash> ids, bool prune) override {
         if (ids.empty()) return false;
         if (ids.size() > MAX_SPAN_IDS) return false;
 
-        auto self = shared_from_this();
         const std::string key = ref.addr;
+        if (!reserve_span_(key)) return false;
+        auto self = shared_from_this();
         boost::asio::post(ex_, [self, key, ids = std::move(ids), prune]() mutable {
             Peer* p = self->find(key);
-            if (!p || !p->handshaked) return;
-            if (p->spans.size() >= self->cfg_.max_spans_per_peer) return;
-            if (self->spans_outstanding() >= self->cfg_.max_spans_total) return;
+            if (!p || !p->handshaked) { self->release_spans_(key, 1); return; }
             Span s;
             s.ids   = std::move(ids);
             s.prune = prune;
@@ -833,6 +845,7 @@ private:
         p->spans.erase(it);
         p->span_order.erase(std::remove(p->span_order.begin(), p->span_order.end(), span_id),
                             p->span_order.end());
+        release_spans_(key, 1);
         if (deps_.index)
             deps_.index->on_objects(ref, std::move(blocks), std::move(missed), height);
         pump(*p);
@@ -973,10 +986,31 @@ private:
         p.pending.push_back(Pending{levinns::CMD_REQUEST_GET_OBJECTS, std::move(body), span_id});
     }
 
-    std::size_t spans_outstanding() const {
-        std::size_t n = 0;
-        for (const auto& [k, p] : peers_) n += p.spans.size();
-        return n;
+    // Span slots, booked on the CALLER's thread by request_objects() so the
+    // answer to "is there room?" is synchronous, and handed back on the io
+    // thread when the span completes, when the peer it was queued on goes, or
+    // when it never found its peer. Keyed like peers_, so a reconnect under the
+    // same key inherits exactly the bookings its queued requests will land on.
+    bool reserve_span_(const std::string& key) {
+        std::lock_guard<std::mutex> lk(span_mu_);
+        const auto it = span_res_.find(key);
+        const std::size_t mine = it == span_res_.end() ? 0 : it->second;
+        if (mine >= cfg_.max_spans_per_peer || span_res_total_ >= cfg_.max_spans_total)
+            return false;
+        ++span_res_[key];
+        ++span_res_total_;
+        return true;
+    }
+
+    void release_spans_(const std::string& key, std::size_t n) {
+        if (n == 0) return;
+        std::lock_guard<std::mutex> lk(span_mu_);
+        const auto it = span_res_.find(key);
+        if (it == span_res_.end()) return;
+        const std::size_t d = std::min(n, it->second);
+        it->second      -= d;
+        span_res_total_ -= d;
+        if (it->second == 0) span_res_.erase(it);
     }
 
     // --- broadcast ----------------------------------------------------------
@@ -988,7 +1022,11 @@ private:
             // the observable proxy is whether it has ever relayed to us on this
             // connection. A peer that holds us in state_synchronizing sends no
             // relay traffic, which is exactly what relay_silent() measures.
-            if (p.link->liveness().relay_silent(now_ms())) continue;
+            // Asked of the LINK, on the link's own clock: the liveness stamps
+            // are link-epoch milliseconds, and comparing them with the pool's
+            // now_ms() made every link opened >= 240 s after the pool started
+            // permanently "silent" -- broadcast then reached nobody.
+            if (p.link->relay_silent(cfg_.relay_silent_window_ms)) continue;
             if (p.link->send_notify(cmd, frame)) ++written;
         }
         ++tel_.broadcasts;
@@ -1037,6 +1075,7 @@ private:
         if (it == peers_.end()) return;
         Peer p = std::move(it->second);
         peers_.erase(it);
+        release_spans_(key, p.spans.size());
 
         const bool was_handshaked = p.handshaked;
         const PeerRef ref = p.ref;
@@ -1102,7 +1141,7 @@ private:
                 ++handshaked;
                 snap.emplace_back(p.ref, p.sync);
                 ++groups[p.netgroup];
-                if (p.link && p.link->liveness().relay_silent(now)) ++silent;
+                if (p.link && p.link->relay_silent(cfg_.relay_silent_window_ms)) ++silent;
             } else {
                 ++dialing;
             }
@@ -1132,6 +1171,10 @@ private:
     std::uint64_t next_span_id_ = 1;
     std::string   primary_;
     bool          running_ = false;
+
+    std::mutex                          span_mu_;
+    std::map<std::string, std::size_t>  span_res_;         // booked span slots per peer key
+    std::size_t                         span_res_total_ = 0;
 
     mutable std::mutex snap_mu_;
     std::vector<std::pair<PeerRef, PeerSyncData>> snapshot_;
