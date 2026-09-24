@@ -2707,6 +2707,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                         (native && !cfg.no_good_citizen) ? "on" : "off",
                         ns.citizen_pool_n, ns.citizen_chosen_n,
                         static_cast<unsigned long long>(ns.good_citizen_violations));
+            // Template dup-tx hygiene: mined txs kept out of templates (the
+            // connect/refresh race, caught), own blocks refused as invalid,
+            // own forks abandoned by the liveness guard, relays refused as
+            // already mined. The last three stay 0 on a healthy node.
+            std::printf("  chain-hygiene: tmpl_dropped_mined=%llu own_invalid=%llu "
+                        "own_fork_abandoned=%llu pool_already_mined=%llu\n",
+                        static_cast<unsigned long long>(ns.tmpl_dropped_mined),
+                        static_cast<unsigned long long>(ns.own_invalid_refused),
+                        static_cast<unsigned long long>(ns.own_forks_abandoned),
+                        static_cast<unsigned long long>(ns.pool_already_mined));
 
             // #1680 observability: the block-DoS bucket accounting for the
             // solicited fluffy missing-tx (2009) reply. dropped = frames the DoS

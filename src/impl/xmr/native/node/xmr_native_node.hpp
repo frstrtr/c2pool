@@ -394,6 +394,15 @@ struct NodeStatus {
     std::size_t                  citizen_pool_n = 0;
     std::size_t                  citizen_chosen_n = 0;
     std::uint64_t                good_citizen_violations = 0;
+    // Template dup-tx hygiene: selectable txs the template left out because
+    // the chain it extends already mined them (the race, caught); own blocks
+    // the index refused as invalid (a tx already mined / key image spent /
+    // duplicate); own forks the liveness guard abandoned; txs the pool refused
+    // at admission because the chain already carries them.
+    std::uint64_t                tmpl_dropped_mined = 0;
+    std::uint64_t                own_invalid_refused = 0;
+    std::uint64_t                own_forks_abandoned = 0;
+    std::uint64_t                pool_already_mined = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -834,6 +843,10 @@ public:
         s.citizen_pool_n          = native_src_.last_pool_n();
         s.citizen_chosen_n        = native_src_.last_chosen_n();
         s.good_citizen_violations = native_src_.good_citizen_violations();
+        s.tmpl_dropped_mined      = native_src_.dropped_mined();
+        s.own_invalid_refused     = index_.own_blocks_refused_invalid();
+        s.own_forks_abandoned     = index_.own_forks_abandoned();
+        s.pool_already_mined      = s.txpool.rejected_already_mined;
         return s;
     }
 
