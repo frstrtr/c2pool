@@ -187,6 +187,13 @@ static double        g_owner_fee_pct = 0.0;              // --node-owner-fee-pct
 static std::string   g_owner_address;                    // --node-owner-address ADDR: the owner's standard address
 // R-C rework-3 ruled defaults (docs/xmr-lane/r-c-rework-3.md).
 static bool          g_contested_suspend = false;        // --contested-suspend on|off (default off): CONTESTED suspends lane production
+// D2 (operator ruling D2 = A): minority converges to majority.
+static int           g_minority_mode = 1;                // --minority-converge on|off|halt-only (1 = on, 0 = off, 2 = halt-only)
+// Operator ruling D-1 = C: the minority trigger is work-weighted; D2 never halts.
+static std::size_t   g_minority_window = 8;              // --minority-window W (decided lane blocks in the detection window)
+static std::size_t   g_minority_min_blocks = 3;          // --minority-min-blocks (no decision on fewer)
+static std::uint64_t g_converge_retry_bound = 600;       // --converge-retry-bound
+static std::uint64_t g_converge_hold_ticks = 0;          // --converge-hold-ticks (TEST knob)
 static std::uint64_t g_recon_max_root_age = ~std::uint64_t{0};   // --recon-max-root-age N (default kReconMaxRootAgeDconf*D_conf; 0 = unbounded)
 static bool g_lane_suspended_now = false;                  // R-C rework-2: main-thread view of the lane-suspend state (pump_miner reads it)
 // GAP-2 relay knobs (design §6). All default OFF: with neither --relay-listen nor
@@ -840,13 +847,38 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                             static_cast<unsigned long long>(node.scan_height()), static_cast<unsigned long long>(gs.redriven_heights),
                             static_cast<unsigned long long>(gs.redrive_calls), static_cast<unsigned long long>(gs.fetch_failed),
                             static_cast<unsigned long long>(gs.truncated), static_cast<unsigned long long>(gs.gate_holds));
+                {
+                    const auto& rs2 = fc.minority_run_status();
+                    const auto mode = fc.options().minority_mode;
+                    std::printf("  minority: mode=%s state=%s window=%llu/%zu share=%llu.%llu%% (>50%% = minority) alarms=%llu suspect=%llu "
+                                "run=%llu builders=%llu detected=%llu converged=%llu diverged=%llu "
+                                "cleared=%llu own_refused=%llu released=%llu attempts=%llu undecidable=%llu failed=%llu isolated_marked=%llu "
+                                "obs=%llu relineages=%llu reorg_in=%llu%s\n",
+                                mode == o2::FinalizeConnectOptions::MinorityMode::Off ? "off"
+                                    : mode == o2::FinalizeConnectOptions::MinorityMode::HaltOnly ? "halt-only(alarm)" : "on",
+                                o2::FinalizeConnect::converge_state_name(fc.converge_state()),
+                                static_cast<unsigned long long>(fs.minority_window_n), fc.options().minority_window,
+                                static_cast<unsigned long long>(fs.minority_share_permille / 10),
+                                static_cast<unsigned long long>(fs.minority_share_permille % 10),
+                                static_cast<unsigned long long>(fs.minority_alarms), static_cast<unsigned long long>(fs.minority_suspect),
+                                static_cast<unsigned long long>(fs.minority_run_len), static_cast<unsigned long long>(fs.minority_run_builders),
+                                static_cast<unsigned long long>(fs.minority_runs_detected), static_cast<unsigned long long>(fs.converged),
+                                static_cast<unsigned long long>(fs.diverged_entered), static_cast<unsigned long long>(fs.diverged_cleared),
+                                static_cast<unsigned long long>(fs.own_refused_on_converge), static_cast<unsigned long long>(fs.liability_released),
+                                static_cast<unsigned long long>(fs.converge_attempts), static_cast<unsigned long long>(fs.converge_undecidable),
+                                static_cast<unsigned long long>(fs.converge_failed), static_cast<unsigned long long>(fs.isolated_marked),
+                                static_cast<unsigned long long>(fs.mobs_n), static_cast<unsigned long long>(node.relineages()),
+                                static_cast<unsigned long long>(node.reorg_redelivered()),
+                                rs2.run.empty() ? "" : " (run open)");
+                }
                 std::printf("  suspend: lane_suspended=%s (job %s) causes=%s | suspend lag=%llu isolated=%llu held=%llu contested=%llu "
-                            "edges=%llu resume=%llu | stratum edges=%llu disconnects=%llu sink_refused=%llu push_refused=%llu\n",
+                            "converging=%llu diverged=%llu edges=%llu resume=%llu | stratum edges=%llu disconnects=%llu sink_refused=%llu push_refused=%llu\n",
                             listener.lane_suspended() ? "YES" : "no",
                             listener.lane_suspended() ? "WITHDRAWN, sessions dropped, logins parked" : "served",
                             c2pool::v37n::xmr::LaneSuspendState::names(lane_state.causes).c_str(),
                             static_cast<unsigned long long>(lane_state.n_lag), static_cast<unsigned long long>(lane_state.n_isolated),
                             static_cast<unsigned long long>(lane_state.n_held), static_cast<unsigned long long>(lane_state.n_contested),
+                            static_cast<unsigned long long>(lane_state.n_converging), static_cast<unsigned long long>(lane_state.n_diverged),
                             static_cast<unsigned long long>(lane_state.n_suspend), static_cast<unsigned long long>(lane_state.n_resume),
                             static_cast<unsigned long long>(ls2.suspend_edges), static_cast<unsigned long long>(ls2.suspend_disconnects),
                             static_cast<unsigned long long>(ls2.suspended_sink_refused), static_cast<unsigned long long>(ls2.suspended_push_refused));
@@ -935,7 +967,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         const std::uint64_t frontier = hw_now >= cfg.d_conf ? hw_now - cfg.d_conf : 0;
         const std::uint64_t lag = frontier > cursor ? frontier - cursor : 0;
         const bool contested = fc.options().contested_suspends && fc.contested();
-        const auto e = lane_state.update(lag, fc.isolated(), fc.held_lag(), contested);
+        const auto e = lane_state.update(lag, fc.isolated(), fc.held_lag(), contested, fc.converging(), fc.diverged_halt());
         const bool lane_suspend = lane_state.suspended();
         listener.set_lane_suspended(lane_suspend);   // edge-triggered inside (disconnect + park), gated (D4)
         g_lane_suspended_now = lane_suspend;
@@ -948,6 +980,17 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             if (c & LS::kLag)       t += " LAG (finalize cursor behind the buried frontier);";
             return t;
         };
+        // D2 under ruling D-1 = C: CONVERGING / DIVERGED are ALARMS -- named and
+        // counted here, never a suspension cause (lane_state keeps them out of causes).
+        if (e.alarm_added & LS::kConverging)
+            std::printf("cba-ALARM: D2 CONVERGING (this node is the work-weighted minority; re-deriving its ledger onto the majority "
+                        "lineage) -- lane template production and the stratum job CONTINUE (ruling D-1 = C)\n");
+        if (e.alarm_added & LS::kDiverged)
+            std::printf("cba-ALARM: D2 DIVERGED (the re-derivation does not reproduce the majority; nothing guessed, nothing mutated) "
+                        "-- ALARM ONLY: lane template production and the stratum job CONTINUE on this node's own ledger; retrying "
+                        "(ruling D-1 = C)\n");
+        if (e.alarm_cleared) std::printf("cba: D2 alarm cleared (%s)\n", LS::names(e.alarm_cleared).c_str());
+        if (e.alarm_added || e.alarm_cleared) std::fflush(stdout);
         if (e.suspend_edge) {
             miner_suspend();
             std::printf("cba-ALARM: lane template production SUSPENDED + stratum job WITHDRAWN (sessions dropped, logins parked) "
@@ -993,6 +1036,18 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         g_lane_suspended_now = true;
         miner_suspend();
     });
+    // D2 under operator ruling D-1 = C: CONVERGING / DIVERGED are ALARM edges.
+    // Nothing here suspends lane production, withdraws the stratum job or stops
+    // the miner -- the node keeps building templates on its own ledger.
+    fc.set_converge_hook([&](bool on, const std::string&) {
+        std::printf("d2: minority alarm edge %s (alarm only, ruling D-1 = C: lane production and the stratum job continue)\n",
+                    on ? "RAISED" : "cleared");
+        std::fflush(stdout);
+    });
+    // D2: an own win published while the publisher had no relay peer (parked)
+    // is ISOLATION-MARKED -- the first candidate refuse set of a re-derivation.
+    if (publisher) fc.set_isolated_probe([p = publisher.get()](const std::string& bid) { return p->was_parked(bid); });
+    std::uint64_t seen_relineage = fc.relineage_seq();
     while (!g_stop.load()) {
         pump_miner();       // --mine: hits first, so a find is bridged the same pass
         if (hooks.inject_pump) hooks.inject_pump();  // --native-inject-dir scan
@@ -1011,6 +1066,13 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             node.adapter().ensure_seed_reach();
         }
         if (serving) {
+            // D2: an adoption re-lineaged the ledger: the cached template commits
+            // the abandoned root -- rebuild it (the provider re-keys on the tip only).
+            if (fc.relineage_seq() != seen_relineage) {
+                seen_relineage = fc.relineage_seq();
+                if constexpr (requires { provider.invalidate(); }) provider.invalidate();
+                std::printf("template: invalidated after the D2 relineage (the next template commits the converged owed_digest)\n");
+            }
 
             const bool refreshed = lane_suspend ? false : provider.refresh();
             bool new_template = false;
@@ -1050,6 +1112,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
 
     fc.set_isolation_hook({});   // R-C rework-2: the hook captures loop-scope state; detach before teardown
     fc.set_contested_hook({});
+    fc.set_converge_hook({});
+    fc.set_isolated_probe({});
     std::printf("\nstopping…\n");
 #if defined(V37_XMR_O2_WITH_RANDOMX)
     if (cpu_miner) { cpu_miner->stop(); pump_miner(); }   // drain anything already found
@@ -1317,6 +1381,19 @@ static int run_live(const XmrNodeConfig& cfg) {
     fo.divergence_cap_ticks    = g_divergence_cap_ticks;
     fo.divergence_cap_terminal = g_divergence_cap_terminal;
     fo.contested_suspends      = g_contested_suspend;   // R-C rework-3 ruled default OFF (opt-in)
+    // D2 (operator ruling D2 = A): minority converges to majority.
+    fo.minority_mode        = g_minority_mode == 0 ? o2::FinalizeConnectOptions::MinorityMode::Off
+                            : g_minority_mode == 2 ? o2::FinalizeConnectOptions::MinorityMode::HaltOnly
+                                                   : o2::FinalizeConnectOptions::MinorityMode::On;
+    fo.minority_window      = g_minority_window;
+    fo.minority_min_blocks  = g_minority_min_blocks;
+    fo.converge_retry_bound = g_converge_retry_bound;
+    fo.converge_hold_ticks  = g_converge_hold_ticks;
+    std::printf("d2: minority-converge=%s (ruling D-1 = C: minority = unmatched foreign lane blocks carry > 50%% of the work of the "
+                "last W=%zu decided lane blocks, min %zu; CONVERGING/DIVERGED are alarm-only, never a halt; retry bound %llu%s)\n",
+                g_minority_mode == 0 ? "off" : g_minority_mode == 2 ? "halt-only(alarm)" : "on", fo.minority_window, fo.minority_min_blocks,
+                static_cast<unsigned long long>(fo.converge_retry_bound),
+                g_converge_hold_ticks ? (", TEST hold " + std::to_string(g_converge_hold_ticks) + " ticks").c_str() : "");
     std::printf("r-c rework-3: refuse-side money = NODE-LOCAL LIABILITY (never a ledger mutation) | contested-suspend=%s | "
                 "vote window persisted=%s\n", fo.contested_suspends ? "ON" : "off", fo.persist_vote_obs ? "yes" : "no");
     std::printf("r6: book_deferral=%s divergence cap: heights=%llu (0 = 2*D_conf = %llu) ticks=%llu terminal=%llu\n",
@@ -1457,11 +1534,17 @@ static int run_live(const XmrNodeConfig& cfg) {
     // through is a candidate -- newest first, the live digest at index 0)
     // R-C rework-3 (D7): `superseded_out` (optional) receives, per candidate, the
     // coin height at which that state stopped being current (the root-age bound).
-    auto decode_blob = [&](const std::vector<std::uint8_t>& blob, std::vector<std::uint64_t>* superseded_out = nullptr)
+    // D2: `cands_override` = a SCRATCH candidate ring (the minority re-derivation
+    // decodes under the lineage it is re-deriving, never under the live ring).
+    auto decode_blob = [&](const std::vector<std::uint8_t>& blob, std::vector<std::uint64_t>* superseded_out = nullptr,
+                           const std::vector<::v37::bytes32>* cands_override = nullptr)
             -> c2pool::v37n::xmr::authority::CoinbaseBooking {
         std::vector<::v37::bytes32> cands; std::vector<std::uint64_t> sup;
-        cba_ring.candidates(node.ledger().owed_digest(), cands, sup);
-        if (superseded_out) *superseded_out = std::move(sup);
+        if (cands_override) cands = *cands_override;
+        else {
+            cba_ring.candidates(node.ledger().owed_digest(), cands, sup);
+            if (superseded_out) *superseded_out = std::move(sup);
+        }
         std::vector<::v37::bytes32> keys;
         for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
         for (const auto& k : cba_fx->keys()) keys.push_back(k);
@@ -1497,11 +1580,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                 cba_src.native_mode() ? "NATIVE chain index (no get_block)" : "monerod get_block",
                 g_cba_monerod_compare ? "ON" : "off", g_cba_monerod_fallback ? "ON" : "off");
     auto fetch_decode = [&](const std::string& bid, c2pool::v37n::xmr::authority::CoinbaseBooking& bk, std::string& why,
-                            std::vector<std::uint8_t>* blob_out = nullptr, std::vector<std::uint64_t>* superseded_out = nullptr) -> bool {
+                            std::vector<std::uint8_t>* blob_out = nullptr, std::vector<std::uint64_t>* superseded_out = nullptr,
+                            const std::vector<::v37::bytes32>* cands_override = nullptr) -> bool {
         std::vector<std::uint8_t> blob;
         if (!cba_src.fetch(bid, blob, why)) return false;
         if (blob_out) *blob_out = blob;
-        bk = decode_blob(blob, superseded_out);
+        bk = decode_blob(blob, superseded_out, cands_override);
         if (!bk.ok) why = bk.why;
         return bk.ok;
     };
@@ -1679,6 +1763,13 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         out.total_pico = bk.total;
         if (bk.has_onchain_root) out.onchain_root_hex = root_hex32(bk.onchain_root);
+        // D2: the builder datum (0x02 extra-nonce) and, for a matched root, the
+        // since-height of the ring state it committed (the fork-point evidence).
+        out.has_extra_nonce = bk.has_extra_nonce; out.extra_nonce = bk.extra_nonce;
+        if (bk.is_lane) {
+            if (const auto ms = cba_ring.since_of(bk.lane_commitment)) { out.has_matched_since = true; out.matched_since = *ms; }
+            else if (bk.lane_commitment == node.ledger().owed_digest()) { out.has_matched_since = true; out.matched_since = node.finalize_driver().digest_since(); }
+        }
         // R-C rework-3 (D7): THE ROOT-AGE BOUND. The ring holds every state this
         // ledger lived through, so a forker committing a state honest nodes left
         // long ago (a fresh node on the genesis owed-demo seed) matched and was
@@ -1824,6 +1915,60 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::fflush(stdout);
         return true;
     };
+    // D2 (minority converges to majority): the re-derivation's decoder. The
+    // SAME authority as book_from_chain_ex (coinbase decode, D7 root age, the
+    // on-chain credit cut folded at ITS prefix), but the 0x03 root is matched
+    // against the SCRATCH lineage FinalizeConnect is re-deriving. Under that
+    // lineage the node is synced by construction, so an unmatched root is a
+    // refusal (never "not yet decidable"). root_only: the block was booked in
+    // the log being re-derived -- only the root match is asked (its booked maps
+    // are reused, no second credit fold / relay repair).
+    fo.book_scratch = [&](std::uint64_t h, const std::string& bid, const o2::FinalizeConnectOptions::ScratchQuery& q,
+                          o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
+        Amounts& payout = out.payout; std::string& why = out.why;
+        if (!cba_fx || !cba_scfg) {
+            if (cfg.coinbase == CoinbaseMode::V37Settlement) { why = "cut-pending: settlement ledger not bound yet (boot)"; return false; }
+            why = "not-lane: no v37 settlement ledger bound (option A)"; return false;
+        }
+        if (!q.cands || !q.superseded) { why = "cut-pending: no scratch ring (internal)"; return false; }
+        c2pool::v37n::xmr::authority::CoinbaseBooking bk;
+        if (!fetch_decode(bid, bk, why, nullptr, nullptr, q.cands) && !bk.is_lane && bk.why.empty()) return false;   // transport: undecidable
+        out.total_pico = bk.total;
+        if (bk.has_onchain_root) out.onchain_root_hex = root_hex32(bk.onchain_root);
+        out.has_extra_nonce = bk.has_extra_nonce; out.extra_nonce = bk.extra_nonce;
+        if (bk.is_lane && cba_max_root_age && bk.digest_index < q.superseded->size()) {
+            const std::uint64_t bcut = c2pool::v37n::xmr::recon::builder_cut(h, cfg.d_conf);
+            const std::uint64_t age  = c2pool::v37n::xmr::recon::root_age((*q.superseded)[bk.digest_index], bcut);
+            if (age > cba_max_root_age) {
+                why = "lane-root-refused:" + (bk.has_onchain_root ? root_hex32(bk.onchain_root) : std::string(64, '0')) +
+                      ":stale-root: a historical state of the scratch lineage (age " + std::to_string(age) + " > " +
+                      std::to_string(cba_max_root_age) + ")";
+                if (bk.ok || bk.payout_partial) { payout = bk.payout; out.payout_decoded = true; out.unattributed_pico = bk.unmapped_total; }
+                else out.unattributed_pico = bk.total;
+                return false;
+            }
+        }
+        if (q.root_only && bk.is_lane) { why = "root-ok (booked maps reused)"; return true; }
+        if (!bk.ok) {
+            why = bk.why;
+            if (why.rfind("lane-root-unknown:", 0) == 0) {
+                if (bk.has_onchain_root) why = "lane-root-refused:" + root_hex32(bk.onchain_root) + ":" + why.substr(std::string("lane-root-unknown:").size());
+                out.unattributed_pico = bk.total;
+                return false;
+            }
+            if (bk.is_lane && bk.payout_partial) { payout = bk.payout; out.payout_decoded = true; out.unattributed_pico = bk.unmapped_total; }
+            return false;
+        }
+        payout = bk.payout; out.payout_decoded = true;
+        if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); return false; }
+        if (!bk.has_credit_cut) { why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; return false; }
+        if (!fold_at_cut(bk.total, bk.credit_cut, out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
+        std::printf("converge-decode: h=%llu bid=%s… booked under the SCRATCH lineage (candidate #%zu) P=%llu credit{ %s} payout{ %s}\n",
+                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), bk.digest_index,
+                    static_cast<unsigned long long>(bk.credit_cut.next_pos), amounts_str(out.credit).c_str(), amounts_str(payout).c_str());
+        std::fflush(stdout);
+        return true;
+    };
     // (A) THE FAST PATH, send side: our own win leaves as a REAL S-1c v0x02 frame (CarrierWire::encode, 122-byte trailer).
     fo.on_own_win_deferred = [&](std::uint64_t h, const std::string& bid, std::uint32_t tid, std::uint32_t en) {
         // recompute capture: the bytes we assembled for (tid, en), off the provider ring
@@ -1957,6 +2102,18 @@ static int run_live(const XmrNodeConfig& cfg) {
     // h44) skipped the intermediate owed_digest, and a peer block committed to exactly that
     // state was memoized not-lane -> the h=48 SETTLED fork. Every state is now present.
     node.finalize_driver().set_ledger_event_observer([&]() { cba_ring_push(); });
+    // D2: an adoption re-lineaged the ledger -> the RECON candidate ring is
+    // re-seeded from the replayed (converged) history; the root-unknown memo is
+    // forgotten (those roots are re-judged under the new lineage).
+    fc.set_relineage_hook([&]() {
+        cba_ring = c2pool::v37n::xmr::recon::ReconRing(4096);
+        cba_ring.seed(node.boot_digest_history(), node.boot_digest_since());
+        cba_root_unknown_seen.clear();
+        std::printf("cba-ring: RE-SEEDED after the D2 relineage: %zu canonical owed_digest state(s) (newest since h=%llu) owed_digest=%s\n",
+                    cba_ring.size(), static_cast<unsigned long long>(cba_ring.empty() ? 0 : cba_ring.back().since),
+                    hex_of(node.ledger().owed_digest()).c_str());
+        std::fflush(stdout);
+    });
     std::printf("same-height policy: tiebreak=%s D_conf=%llu renotify<=%u journal=%s "
                 "| credit requires burial: YES  orphan-credit: NEVER  double-credit: BLOCKED\n",
                 to_string(cfg.same_height_tiebreak),
@@ -2867,6 +3024,12 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::random_device rd;
             hooks.extra_nonce_base = (1u << 24) + (static_cast<std::uint32_t>(rd()) % ((1u << 31) - (1u << 24)));
             std::printf("relay: stratum extra_nonce base = %u (node-private miner search space)\n", *hooks.extra_nonce_base);
+            // D2: this node's builder keys (stratum sessions count up from the base,
+            // the in-process miner takes base - 1): a lane block carrying one is OWN.
+            fc.set_own_builder_keys({c2pool::v37n::xmr::minority::builder_key(*hooks.extra_nonce_base),
+                                     c2pool::v37n::xmr::minority::builder_key(*hooks.extra_nonce_base - 1)});
+            std::printf("d2: own builder key %u (extra_nonce >> %u)\n", c2pool::v37n::xmr::minority::builder_key(*hooks.extra_nonce_base),
+                        c2pool::v37n::xmr::minority::kBuilderShift);
         }
         if (p2p_first) {
             if (!native->node()->block_relay()) {
@@ -3353,6 +3516,11 @@ int main(int argc, char** argv) {
         else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = std::stoull(next("20"));
         else if (a == "--divergence-cap-terminal") g_divergence_cap_terminal = std::stoull(next("2"));
         else if (a == "--contested-suspend") { const std::string v = next("on"); g_contested_suspend = !(v == "off" || v == "0" || v == "false"); }
+        else if (a == "--minority-converge") { const std::string v = next("on"); g_minority_mode = (v == "off" || v == "0" || v == "false") ? 0 : v == "halt-only" ? 2 : 1; }
+        else if (a == "--minority-window")       g_minority_window = static_cast<std::size_t>(std::stoull(next("8")));
+        else if (a == "--minority-min-blocks")   g_minority_min_blocks = static_cast<std::size_t>(std::stoull(next("3")));
+        else if (a == "--converge-retry-bound")  g_converge_retry_bound = std::stoull(next("600"));
+        else if (a == "--converge-hold-ticks")   g_converge_hold_ticks = std::stoull(next("0"));
         else if (a == "--recon-max-root-age")      g_recon_max_root_age = std::stoull(next("0"));
         else if (a == "--xmr-template-source") {
             const std::string m = next("monerod");
@@ -3438,6 +3606,17 @@ int main(int argc, char** argv) {
                 "  --contested-suspend <on|off> default off: a CONTESTED lineage vote is a loud alarm +\n"
                 "                               counters and the node keeps building; on = suspend lane\n"
                 "                               template production until CONVERGED (operator opt-in)\n"
+                "  --minority-converge <on|off|halt-only>  D2 (rulings D2 = A, D-1 = C; default on): this node is\n"
+                "                               the minority only when unmatched foreign lane blocks carry > 50%\n"
+                "                               of the work of the detection window -> re-derive the ledger with\n"
+                "                               its own unverifiable blocks refused (liability), adopt it only if\n"
+                "                               it reproduces the majority's commitments, else DIVERGED = ALARM\n"
+                "                               only (never a halt: templates + stratum continue). <= 50%: alarm.\n"
+                "                               off = refuse + alarm only; halt-only = detect -> DIVERGED alarm\n"
+                "  --minority-window <W>        D2 detection window, decided lane blocks (default 8)\n"
+                "  --minority-min-blocks <n>    D2 no decision on fewer decided lane blocks (default 3)\n"
+                "  --converge-retry-bound <n>   D2 undecidable re-derivation attempts before DIVERGED (600)\n"
+                "  --converge-hold-ticks <n>    TEST knob: CONVERGING holds n ticks before the first attempt\n"
                 "  --recon-max-root-age <n>     R-C rework-3 (D7): never credit a matched historical root\n"
                 "                               older than n heights from the block's builder cut\n"
                 "                               (default 4*D_conf; 0 = unbounded, the rework-2 behaviour)\n"
