@@ -472,6 +472,39 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_credit_cut_kat COMMAND v37_xmr_credit_cut_kat)
 
     # ------------------------------------------------------------------
+    # POOL-LINEAGE -- the block-level pool id (operator ruling 2026-09-25).
+    #
+    #   v37_xmr_pool_lineage_kat
+    #     pool_tag = sha256d('V37PT' || lane_tag || pool_genesis_id) (formula,
+    #     S1 lane_tag input, per-network default genesis, --pool-genesis
+    #     parse); the V37C tail's versioned "V37P" field (37 B, before V37C,
+    #     V37C/V37D still parse, strict version); classify own -> lane block,
+    #     other tag / untagged tail -> ordinary, malformed -> strict reject;
+    #     REAL assembled blocks: the coinbase delta vs the untagged shape is
+    #     exactly the field, the coinbase-authority decoder books OUR block and
+    #     answers "not-lane:" for another pool's and a pre-lineage block (the
+    #     ungated decoder reproduces the D-1 cross-pool match); the widest
+    #     payload (two-byte 0x02 varint) assembles; the relay HELLO carries the
+    #     genesis (+32 B) and refuses another as TAG_MISMATCH field=pool_genesis.
+    #     Listed in BOTH build.yml --target lists.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_pool_lineage_kat
+        v37_xmr_pool_lineage_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_pool_lineage_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_pool_lineage_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_pool_lineage_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_pool_lineage_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_pool_lineage_kat COMMAND v37_xmr_pool_lineage_kat)
+
+    # ------------------------------------------------------------------
     # The v36 fee model on the XMR lane (xmr/xmr_fee_model.hpp).
     #
     #   v37_xmr_fee_model_kat
