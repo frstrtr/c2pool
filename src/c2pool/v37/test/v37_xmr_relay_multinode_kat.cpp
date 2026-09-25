@@ -29,12 +29,16 @@
 //       strike -- and NO RandomX evaluation -- for a tampered receipt, (c)
 //       BANNED and disconnected after one confirmed invalid PoW
 //   M7  refused ORDER: a peer whose frame vault has evicted lane position 0
-//       answers GETORDER [0,P) with BELOW_HORIZON. The relay repair sets that
-//       peer aside (repair_peer_fail) and reports Exhausted; it never takes
-//       the empty refused order for progress and never re-asks the same peer
-//       (exactly ONE GETORDER reaches it). SupplyRequester hands a non-OK
-//       ORDER to the order callback as well as to on_fail; the relay must act
-//       on the failure only.
+//       answers GETORDER [0,P) with BELOW_HORIZON. The relay never takes the
+//       empty refused order for progress. REPAIR-HORIZON (capstone 09-26)
+//       changed what follows: the refusal carries the peer's lowest_retained
+//       a0, so the repair RE-ASKS that peer from a0 instead of setting it aside
+//       (setting it aside made every repair of a lane longer than the vault
+//       horizon Exhausted forever): exactly THREE GETORDERs reach it -- [0,P)
+//       refused, the zero-length prefix probe [a0,a0) (its digest at a0 equals
+//       ours), and the suffix [a0,P) -- and, since this spine is one X never
+//       held, the suffix fails the spine check at P: X is set aside, the repair
+//       is Exhausted and never Ready, and no further GETORDER follows.
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -289,7 +293,7 @@ int main() {
         evil.stop();
     }
 
-    // ── M7 a refused (BELOW_HORIZON) ORDER sets the serving peer aside ──────
+    // ── M7 a refused (BELOW_HORIZON) ORDER is re-asked from the peer's horizon ──
     {
         RelayOptions xo = opts(true, {});
         xo.vault.horizon_positions = 2;           // X keeps only its newest positions
@@ -309,6 +313,7 @@ int main() {
         bytes32 spineX = X.digest(); spineX[1] ^= 0x33;   // a cut Y does not hold: Y must repair it from X
         const auto& ys = Y.relay->stats();
         const u64 fail0 = ys.repair_peer_fail.load();
+        const u64 mis0 = ys.repair_spine_mismatch.load();
         const u64 ord0 = Y.relay->requester()->stats().orders_requested;
         XmrRelayNode::RepairState st = XmrRelayNode::RepairState::Pending;
         const bool exhausted = wait_for([&] {
@@ -319,13 +324,17 @@ int main() {
         std::this_thread::sleep_for(300ms);
         for (int i = 0; i < 10; ++i) { (void)Y.relay->repair_poll(PX, spineX, 0, nullptr); X.pump(); Y.pump(); std::this_thread::sleep_for(20ms); }
         const u64 orders_after = Y.relay->requester()->stats().orders_requested - ord0;
-        C(exhausted, "M7 the repair against a peer below its horizon ends Exhausted (every ready peer tried)");
-        C(fails >= 1 && ys.repair_ready.load() == 0,
-          "M7 the BELOW_HORIZON answer set X aside (repair_peer_fail +" + std::to_string(fails) + "), never Ready");
-        C(orders == 1 && orders_after == 1,
-          "M7 X was asked for the order exactly once (" + std::to_string(orders) + ", then " +
-          std::to_string(orders_after) + " after more polls): the empty refused order is not taken for progress "
-          "and re-asked");
+        const u64 lowX = X.relay->vault().lowest_position();
+        C(exhausted, "M7 the repair of a spine X never held ends Exhausted (every ready peer tried)");
+        C(fails >= 1 && ys.repair_ready.load() == 0 && ys.repair_order_ok.load() == 0,
+          "M7 the BELOW_HORIZON answer is a failed ask (repair_peer_fail +" + std::to_string(fails) + "), never an order, never Ready");
+        C(ys.repair_horizon_rearm.load() == 1 && ys.repair_prefix_ok.load() == 1 && ys.repair_spine_mismatch.load() - mis0 == 1,
+          "M7 REPAIR-HORIZON: the refusal re-armed the repair from X's lowest_retained (" + std::to_string(lowX) +
+          "), the prefix probe matched, the suffix order failed the spine check at P (rearm=" +
+          std::to_string(ys.repair_horizon_rearm.load()) + " prefix_ok=" + std::to_string(ys.repair_prefix_ok.load()) + ")");
+        C(orders == 3 && orders_after == 3,
+          "M7 X was asked exactly three times -- [0,P) refused, probe [a0,a0), suffix [a0,P) (" + std::to_string(orders) +
+          ", then " + std::to_string(orders_after) + " after more polls): the empty refused order is not taken for progress");
         X.relay->set_dialing(false); Y.relay->set_dialing(false);
     }
 

@@ -799,8 +799,18 @@ if (BUILD_TESTING)
     #                               and equal after a partition heal and after
     #                               a durable-log restart (the lane digest is
     #                               node-local order by design).
+    #   v37_xmr_relay_repair_horizon_kat REPAIR-HORIZON (capstone 09-26): a
+    #                               relay repair of a lane longer than every
+    #                               peer's vault horizon was Exhausted forever
+    #                               (GETORDER [0,P) -> BELOW_HORIZON). Now it
+    #                               re-asks from the peer's lowest_retained
+    #                               (prefix probe, suffix [a0,P), own [0,a0)
+    #                               replayed) and is Ready; a divergence below
+    #                               every horizon is named DEEP-DIVERGENCE; an
+    #                               open bin is re-offered on reconnect. ALSO
+    #                               on BOTH build.yml --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_relay_repair_horizon_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
