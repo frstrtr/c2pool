@@ -3,6 +3,10 @@ project(c2pool C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Reproducible builds: remap source/build/Conan-cache absolute paths in compiled
+# output (docs/xmr-lane/REPRODUCIBLE-BUILD.md). Before any add_subdirectory().
+include(${CMAKE_SOURCE_DIR}/cmake/ReproducibleBuild.cmake)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
 endif()
