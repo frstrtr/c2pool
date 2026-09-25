@@ -1154,6 +1154,21 @@ if (BUILD_TESTING)
     target_link_libraries(v37_drops_step2_wiring_kat Threads::Threads)
     add_test(NAME v37_drops_step2_wiring_kat COMMAND v37_drops_step2_wiring_kat)
 
+    # ★ DROPS on the XMR lane — v37_xmr_drops_wiring_kat. main_v37_xmr.cpp built
+    # no DropsWiring and called none of XmrNode's T3 seams, so a flipped XMR node
+    # was gate-ON and DORMANT. Pins the shell's wiring (X-SHELL: RED on the base),
+    # gate-OFF dormancy, the ★ enrolment clock = the NATIVE TIP (never the burial
+    # frontier), the exact Monero-difficulty -> lz normalisation, the rescaled
+    # R1 price, and the end-to-end composed credit. Stdlib-only, ~1 s. ALSO on
+    # BOTH build.yml --target lists (hollow-green guard).
+    add_executable(v37_xmr_drops_wiring_kat v37_xmr_drops_wiring_kat.cpp)
+    target_compile_features(v37_xmr_drops_wiring_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_drops_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(v37_xmr_drops_wiring_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
+    target_link_libraries(v37_xmr_drops_wiring_kat Threads::Threads)
+    add_test(NAME v37_xmr_drops_wiring_kat COMMAND v37_xmr_drops_wiring_kat)
+
     # ★ DROPS ACTIVATION AT ARITY 1 — the gate-ON owed_digest a DECOUPLED fleet
     # actually reproduces, minted and pinned BESIDE the arity-2 golden above.
     #
