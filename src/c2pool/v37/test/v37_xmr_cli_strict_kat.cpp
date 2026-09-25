@@ -23,7 +23,10 @@
 //   H  --help exits 0 and lists --version;
 //   C  every flag the daemon accepts (and every flag the repo's rig scripts
 //      and docs pass it) still parses: `<flag> [value] --version` exits 0
-//      with the version line, which is only reached once the flag was taken.
+//      with the version line, which is only reached once the flag was taken;
+//   F  FORK-FUSE-2's test-only --test-unknown-fork-stall-s is parsed by the
+//      strict helpers (C and B rows) and is still REFUSED on mainnet: exit 2
+//      naming the flag, before any file is created.
 //
 // NETWORK SAFETY. Every invocation that a broken build could turn into a live
 // run carries `--network regtest --rpc-host 127.0.0.1 --rpc-port 1 --zmq-port 1`
@@ -192,6 +195,10 @@ void bad_rows() {
         {{"--native-snapshot-every", "12abc"}, "--native-snapshot-every", "a native-node number with junk"},
         {{"--native-template-fallback", "of"}, "--native-template-fallback", "a native-node on/off typo"},
         {{"--mine", "4x"},                     "--mine",                "a thread count with junk"},
+        // FORK-FUSE-2's test knob, parsed by the strict helpers.
+        {{"--test-unknwon-fork-stall-s", "5"}, "--test-unknwon-fork-stall-s", "a typo of --test-unknown-fork-stall-s"},
+        {{"--test-unknown-fork-stall-s"},      "--test-unknown-fork-stall-s", "the fuse stall knob with no value (last)"},
+        {{"--test-unknown-fork-stall-s", "12abc"}, "--test-unknown-fork-stall-s", "the fuse stall knob with junk"},
     };
     for (const Bad& b : rows) {
         const auto args = safe(b.tail);
@@ -294,6 +301,7 @@ void compat_rows() {
         {"--no-daemon-rpc"}, {"--lane-chain", "7"}, {"--d-conf", "3"},
         {"--same-height-tiebreak", "prefer-own"}, {"--same-height-tiebreak", "first-seen"},
         {"--own-fork-bound-s", "240"}, {"--same-height-renotify", "3"}, {"--same-height-journal", "off"},
+        {"--test-unknown-fork-stall-s", "120"}, {"--test-unknown-fork-stall-s", "0"},   // FORK-FUSE-2 test knob
         {"--data-dir", "settle"}, {"--i-understand-mainnet"}, {"--randomx"}, {"--randomx-large-pages"},
         {"--mine"}, {"--mine", "2"}, {"--mine-threads", "2"}, {"--mine-fast"}, {"--mine-msr"},
         {"--mine-no-huge-pages"}, {"--mine-no-affinity"},
@@ -347,6 +355,24 @@ void compat_rows() {
     check(rr.files == 0, "C: the xmr-race-rig node.sh line created files");
 }
 
+// ---------------------------------------------------------------------------
+// F -- FORK-FUSE-2's test-only stall knob is refused on mainnet. The row
+// carries --i-understand-mainnet so the prototype gate passes and the fuse's
+// own refusal is what answers; the endpoint is loopback port 1.
+// ---------------------------------------------------------------------------
+void fuse_rows() {
+    const std::vector<std::string> args = {
+        "--network", "mainnet", "--i-understand-mainnet", "--rpc-host", "127.0.0.1", "--rpc-port", "1",
+        "--zmq-port", "1", "--test-unknown-fork-stall-s", "120"};
+    const Run r = run(args, 5000);
+    const std::string tag = "F: [" + join(args) + "]";
+    check(!r.timed_out, tag + ": did not exit (live mode) within 5 s");
+    check(r.rc == 2, tag + ": exit " + std::to_string(r.rc) + ", want 2");
+    check(r.out.find("REFUSED: --test-unknown-fork-stall-s") != std::string::npos,
+          tag + ": no fuse-knob refusal line: " + first_line(r.out));
+    check(r.files == 0, tag + ": created " + std::to_string(r.files) + " file(s)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -363,8 +389,8 @@ int main(int argc, char** argv) {
     const bool knows_version = help_rows();
     version_rows();
     bad_rows();
-    if (knows_version) compat_rows();
-    else std::printf("C rows SKIPPED: this binary does not list --version, so a flag row could start it live\n");
+    if (knows_version) { compat_rows(); fuse_rows(); }
+    else std::printf("C/F rows SKIPPED: this binary does not list --version, so a flag row could start it live\n");
 
     std::printf("v37_xmr_cli_strict_kat: %d passed, %d failed\n", g_pass, g_fail);
     if (g_fail != 0) { std::printf("RESULT: FAIL\n"); return 1; }
