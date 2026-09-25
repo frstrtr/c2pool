@@ -113,6 +113,10 @@ inline constexpr std::size_t CREDIT_CUT_TAIL_BYTES = 44;  // 4 magic + 8 u64 P +
 // fee::kDonationOwedTailBytes == 12, "V37D" || u64le; mirrored and
 // static_asserted in v37_xmr_fee_model_kat). Present only under the gate.
 inline constexpr std::size_t DONATION_OWED_TAIL_BYTES = 12;  // 4 magic + 8 u64 owed_in
+// SAME-BLOCK PAY-NOW: the committed base B rides first ("V37N" || u64le,
+// consumer tree c2pool/v37/xmr/xmr_paynow.hpp paynow::kPayNowTailBytes == 12,
+// static_asserted in v37_xmr_paynow_kat). Present only when pay-now is armed.
+inline constexpr std::size_t PAYNOW_TAIL_BYTES = 12;  // 4 magic + 8 u64 base
 
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
@@ -595,7 +599,7 @@ public:
             // capped at wire_cap. Reserve enough that weight_aware_output_cap
             // keeps room for them AND the block stays reward-positive.
             const std::uint64_t req_outputs =
-                std::min<std::uint64_t>(a.settle.owed.size() + a.settle.fixed.size() + 1, a.wire_cap);
+                std::min<std::uint64_t>(a.settle.owed.size() + a.settle.paynow_n + a.settle.fixed.size() + 1, a.wire_cap);
             const std::uint64_t cb_ub = 128 + req_outputs * ::v37::xmr::settle::XMR_OUTPUT_SIZE_BYTES;
             // reward-positive ceiling (2*median_raw) intersected with the
             // penalty-free zone that weight_aware_output_cap caps payees against.
@@ -705,7 +709,7 @@ private:
         }
         rec.m_extra_nonce_size = full[eo - 1];
         if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
-            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + DONATION_OWED_TAIL_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }

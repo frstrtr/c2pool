@@ -72,6 +72,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -149,6 +150,26 @@ struct FixedOutput {
 
 // Everything W5 needs, all consensus-derived so the coinbase is a pure function
 // of these bytes. budget := base_reward + fees (the exact-sum target).
+// SAME-BLOCK PAY-NOW (operator ruling 09-25). One payee whose work THIS block
+// credits at its on-chain credit cut, with its E_b at the block's exact-sum
+// budget (the same fold_eb split every node books at finalization). The
+// provider hands X6 the list per budget (paynow_at), sorted by identity ASC,
+// eb > 0 only -- exactly the key order of the fold's credit map.
+struct PayNowEntry {
+    ::v37::ScriptRef pay;                 // payout target (XMR kind)
+    ::v37::bytes32   identity{};          // ledger identity_key (== fold_eb key)
+    std::uint64_t    eb = 0;              // E_b at this block's budget, piconero
+};
+
+// The pay-now split: `pool` over the entries in proportion to eb, exact-sum
+// (Σ result == min(pool, Σ eb)), each result <= its own eb. floor(pool*eb/Σeb)
+// per entry, then the leftover (< n) one piconero each by LARGEST remainder,
+// ties by entry order (identity ASC). A pure function of (pool, eb vector):
+// the receive side re-derives it from the on-chain cut and the committed
+// V37N base (see c2pool/v37/xmr/xmr_paynow.hpp).
+std::vector<std::uint64_t> paynow_split(std::uint64_t pool,
+                                        const std::vector<std::uint64_t>& eb);
+
 struct CoinbaseInputs {
     // --- FENCE key ---
     std::uint8_t   monero_major_version = 0;
@@ -173,6 +194,17 @@ struct CoinbaseInputs {
     std::uint64_t  h_min = 0;             // min owed to emit an output (piconero); dust=0
     std::uint32_t  output_cap = 0;        // weight-aware cap C (TOTAL outputs)
 
+    // --- SAME-BLOCK PAY-NOW (empty => off; master behaviour) ---
+    // When set, whatever the owed pass leaves above the folded donation
+    // minimum (or, with a separate sink, the whole residual) pays the entries
+    // paynow_at(budget()) returns via paynow_split, each merged into its owed
+    // output when it has one, else a new output after the owed outputs
+    // (identity ASC). The residual-sink identity's share stays in the
+    // residual (it lands in the sink / folded donation output). paynow_n is an
+    // upper bound on the entry count (the assembler's weight reserve).
+    std::function<std::vector<PayNowEntry>(std::uint64_t budget)> paynow_at;
+    std::size_t    paynow_n = 0;
+
     // --- tx_extra ---
     std::vector<unsigned char> extra_nonce; // 0x02 padded per-worker extranonce
 
@@ -182,7 +214,9 @@ struct CoinbaseInputs {
 // One resolved coinbase output. `identity` records whose owed this settles
 // (or the sink/fixed identity) for auditing the CONS-2 delta.
 struct CoinbaseOutput {
-    enum class Role : std::uint8_t { Owed = 0, Fixed = 1, Sink = 2 };
+    // PayNow: a SAME-BLOCK PAY-NOW output for a payee with no owed output in
+    // this coinbase (a payee that has one gets its pay-now merged there, Owed).
+    enum class Role : std::uint8_t { Owed = 0, Fixed = 1, Sink = 2, PayNow = 3 };
     ::v37::ScriptRef pay;
     ::v37::bytes32   identity{};
     std::uint64_t    amount = 0;     // piconero

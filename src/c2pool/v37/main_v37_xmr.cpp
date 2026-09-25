@@ -90,6 +90,7 @@
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
 #include "xmr/xmr_coinbase_authority.hpp"  //  coinbase-authority booking
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
+#include "xmr/xmr_paynow.hpp"               // SAME-BLOCK PAY-NOW: V37N base + net-at-FOUND booking
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
@@ -750,6 +751,16 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     static_cast<unsigned long long>(fs.orphaned),
                     static_cast<unsigned long long>(fs.refused),
                     fc.pending().size());
+        // SAME-BLOCK PAY-NOW audit line: the finalized partition and EffectiveOwed per
+        // key, so a run can reconcile paid on-chain == credited - outstanding owed.
+        {
+            const auto& L = node.ledger();
+            std::string fw, eo; long long eo_min = 0;
+            for (const auto& [k, v] : L.finalW()) fw += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " ";
+            for (const auto& [k, v] : L.effective_owed_all()) { eo += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " "; if (v < eo_min) eo_min = v; }
+            std::printf("  ledger: seq=%llu owed_digest=%s eo_min=%lld finalW{ %s} eo{ %s}\n",
+                        static_cast<unsigned long long>(L.ledger_seq()), hex_of(L.owed_digest()).c_str(), eo_min, fw.c_str(), eo.c_str());
+        }
         // c2pool#1551. r7=0 is the claim that matters: it counts settlements the
         // same-height gate did not authorise, which is the only shape an
         // orphan-credit or a double-credit can take.
@@ -1696,6 +1707,40 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::fflush(stdout);
         return rv;
     };
+    // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): book the block NET of what its coinbase
+    // already paid each payee out of THIS block's E_b. A pure function of the on-chain
+    // bytes (V37N base, outputs) and the fold at the on-chain cut: every node nets the
+    // same amounts. A coinbase that under-pays its own commitment is REFUSED.
+    std::uint64_t paynow_booked = 0, paynow_refused = 0;
+    unsigned long long paynow_netted_total = 0;
+    auto paynow_net = [&](std::uint64_t h, const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
+                          Amounts& credit, Amounts& payout, std::string& why) -> bool {
+        namespace fee = ::c2pool::v37n::xmr::fee;
+        const bool fee_on = fee::fee_model_on(cfg.lane_params);
+        const ::v37::bytes32 sink_id = fee_on ? fee::donation_identity(donation_net_of(cfg.network)) : cba_scfg->residual_sink_identity;
+        const Amounts gross_credit = credit, gross_payout = payout;
+        const auto r = c2pool::v37n::xmr::paynow::net_booking(bk.paynow_base, bk.total, credit, payout, bk.sink_total, sink_id,
+                                                              fee_on ? static_cast<long long>(fee::kDonationDustPico) : 0);
+        if (!r.ok) {
+            ++paynow_refused; why = r.why;
+            std::printf("paynow-ALARM refused: h=%llu bid=%s… %s\n", static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), r.why.c_str());
+            std::fflush(stdout);
+            return false;
+        }
+        if (bk.paynow_base) {
+            ++paynow_booked; paynow_netted_total += static_cast<unsigned long long>(r.netted);
+            std::string al, gc, gp;
+            for (const auto& [k, v] : r.alloc) al += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " ";
+            for (const auto& [k, v] : gross_credit) gc += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " ";
+            for (const auto& [k, v] : gross_payout) gp += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " ";
+            std::printf("paynow-book: h=%llu bid=%s… total=%llu base=%llu pool=%llu netted=%lld sink_total=%lld alloc{ %s} gross_credit{ %s} gross_payout{ %s}\n",
+                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), static_cast<unsigned long long>(bk.total),
+                        static_cast<unsigned long long>(*bk.paynow_base), static_cast<unsigned long long>(r.pool),
+                        r.netted, bk.sink_total, al.c_str(), gc.c_str(), gp.c_str());
+            std::fflush(stdout);
+        }
+        return true;
+    };
     // (B) THE AUTHORITY: fold E_b at the ON-CHAIN cut, read back from OUR OWN ring. Never at a neighbouring prefix.
     auto fold_at_cut = [&](std::uint64_t reward, const c2pool::v37n::xmr::credit::CreditCut& cc, Amounts& credit, std::string& why,
                            std::uint64_t relay_hint_pid = 0) -> bool {
@@ -1900,6 +1945,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (chk_ok) booking_price = drops_fold_price;
             if (chk_ok && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
         }
+        if (!paynow_net(h, bid, bk, credit, payout, why)) { ++cba_refused; return false; }   // SAME-BLOCK PAY-NOW: book net
         // ★ DROPS: hand the node the price at THIS cut; XmrNode::on_network_block_won
         // (called by FinalizeConnect right after this returns) takes it, one-shot.
         if (drops_live) drops->set_cut_price(booking_price);
@@ -1963,6 +2009,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); return false; }
         if (!bk.has_credit_cut) { why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; return false; }
         if (!fold_at_cut(bk.total, bk.credit_cut, out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
+        if (!paynow_net(h, bid, bk, out.credit, payout, why)) return false;   // SAME-BLOCK PAY-NOW: the same net booking
         std::printf("converge-decode: h=%llu bid=%s… booked under the SCRATCH lineage (candidate #%zu) P=%llu credit{ %s} payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), bk.digest_index,
                     static_cast<unsigned long long>(bk.credit_cut.next_pos), amounts_str(out.credit).c_str(), amounts_str(payout).c_str());
@@ -2269,6 +2316,17 @@ static int run_live(const XmrNodeConfig& cfg) {
         // recon(A+B credit): the template commits THIS node's receipt-lane cut (P, spine) on-chain (0x02 tail)
         scfg.credit_cut_source = [&](std::uint64_t& P, ::v37::bytes32& dg) -> bool {
             auto s = node.engine().snapshot(cfg.lane_chain); if (!s) return false; P = s->next_pos; dg = s->digest; return true; };
+        // SAME-BLOCK PAY-NOW (operator ruling 09-25, fee model ON and OFF): the projected
+        // payees of the SAME view fold_at_cut folds E_b at, so the builder pays exactly the
+        // E_b split every node books. No view at the cut / unratified geometry => no pay-now.
+        scfg.paynow_source = [&](std::uint64_t P, const ::v37::bytes32& dg, std::vector<settle::WeightedPayee>& out) -> bool {
+            bool mism = false;
+            auto view = node.engine().settlement_view_by_cut(cfg.lane_chain, P, dg, &mism);
+            if (!view || !settle::assert_ratified_geometry(*view, /*strict=*/true)) return false;
+            std::size_t unresolved = 0;
+            out = settle::project(*view, &unresolved);
+            return !out.empty();
+        };
         std::printf("ab: on-chain credit cut ARMED (0x02 tail V37C|P|spine); feed=%s lag=%llums wire-out=%s wire-in=%s mutate=%lld\n",
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
