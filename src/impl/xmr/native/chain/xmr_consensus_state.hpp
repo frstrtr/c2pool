@@ -462,6 +462,15 @@ public:
     // the telemetry surface.
     bool allows(HfCapability c) const noexcept { return fuse_.allows(c); }
 
+    // The chain has moved to a fork this build cannot even PARSE (the index
+    // saw a block above MAX_IMPLEMENTED_HF_VERSION attach to a block it holds).
+    // Such a block never reaches connect(), so the fuse is tripped here. Same
+    // latch, same capability withdrawal (no template, no tx admission). Returns
+    // true the first time the fuse trips.
+    bool trip_unknown_fork(std::uint64_t height, std::uint8_t version) noexcept {
+        return fuse_.trip(height, version);
+    }
+
 private:
     void trim_rows_() {
         while (rows_.size() > row_retention_) rows_.pop_front();

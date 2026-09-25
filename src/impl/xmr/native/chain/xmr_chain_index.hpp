@@ -59,6 +59,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <map>
@@ -722,6 +723,13 @@ public:
     std::uint64_t orphans_parked() const { std::lock_guard<std::mutex> lk(mu_); return orphans_; }
     std::size_t   alt_size() const { std::lock_guard<std::mutex> lk(mu_); return alt_.size(); }
 
+    // Unknown-fork fuse: blocks refused because their major_version is above
+    // MAX_IMPLEMENTED_HF_VERSION (never charged to the sender), how many of
+    // those did not attach to a block we hold, and a copy of the fuse itself.
+    std::uint64_t unknown_fork_blocks() const { std::lock_guard<std::mutex> lk(mu_); return unknown_fork_blocks_; }
+    std::uint64_t unknown_fork_unattached() const { std::lock_guard<std::mutex> lk(mu_); return unknown_fork_unattached_; }
+    HfFuse        hf_fuse() const { std::lock_guard<std::mutex> lk(mu_); return view_.state().fuse(); }
+
     // c2pool#1551: the same-height candidates this node HOLDS but has not
     // adopted. The settlement accounting above needs them to see a race at all
     // -- in the branch where our own block stays best, the rival produces no
@@ -879,6 +887,7 @@ private:
         EvaluatedBlock ev;
         std::string    why;
         r.eval = evaluate_block(entry, ev, why);
+        if (r.eval == EvalStatus::UnknownFork) return unknown_fork_locked_(peer, ev, std::move(why));
         if (r.eval != EvalStatus::Ok) {
             r.outcome    = OfferOutcome::Rejected;
             r.peer_fault = true;
@@ -2224,6 +2233,68 @@ private:
     }
 
     // =====================================================================================
+    // a block from a fork above the implemented range (unknown-fork fuse)
+    // =====================================================================================
+    // evaluate_block() read the header first and stopped: the major_version is
+    // above MAX_IMPLEMENTED_HF_VERSION, so the body, the id and the PoW all
+    // belong to rules this build does not have. The block is refused, never
+    // parked, and NEVER charged to the sender: an honest peer that upgraded is
+    // exactly who sends it.
+    //
+    // When it attaches to a block we hold (best chain or alt pool), it is
+    // evidence that the chain we follow is forking away from our rules: the
+    // fuse trips (the same latch connect() uses for a rolled version), which
+    // withdraws the template and tx-admission capabilities, and the node says
+    // so on stderr. A block whose parent we do not hold is only counted: it
+    // places nothing.
+    OfferResult unknown_fork_locked_(const PeerRef* peer, const EvaluatedBlock& ev,
+                                     std::string why) {
+        OfferResult r;
+        r.outcome    = OfferOutcome::Rejected;
+        r.eval       = EvalStatus::UnknownFork;
+        r.peer_fault = false;
+        ++unknown_fork_blocks_;
+
+        const std::uint64_t major = ev.input.parsed.header.major_version;
+        const Hash&         prev  = ev.input.parsed.header.prev_id;
+        std::optional<std::uint64_t> parent_h;
+        if (const RowRecord* mp = rows_.by_id(prev)) parent_h = mp->row.height;
+        else if (const AltBlock* ap = alt_.find(prev); ap && ap->resolved) parent_h = ap->height;
+
+        const std::string src = peer ? peer->addr : std::string("local");
+        if (!parent_h) {
+            ++unknown_fork_unattached_;
+            r.height = ev.input.coinbase.height;
+            r.why    = why + "; parent unknown, not placed";
+            return r;
+        }
+        r.height = *parent_h + 1;
+        const std::uint8_t v = static_cast<std::uint8_t>(major);
+        const std::uint8_t before = view_.state().fuse().highest_version();
+        const bool first = view_.state().trip_unknown_fork(r.height, v);
+        if (first || v > before) {
+            std::fprintf(stderr,
+                "[HF-FUSE] UNKNOWN FORK: block major_version %u at height %llu (prev %s) from %s "
+                "is above the highest fork this build implements (%u). The peer is NOT "
+                "penalised. Fuse TRIPPED: templates and tx admission withdrawn on this chain; "
+                "roll the code forward.\n",
+                static_cast<unsigned>(v), static_cast<unsigned long long>(r.height),
+                hex_prefix_(prev).c_str(), src.c_str(),
+                static_cast<unsigned>(MAX_IMPLEMENTED_HF_VERSION));
+            std::fflush(stderr);
+        }
+        r.why = why + "; unknown-fork fuse tripped";
+        return r;
+    }
+
+    static std::string hex_prefix_(const Hash& h) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        for (std::size_t i = 0; i < 8; ++i) { s.push_back(d[h[i] >> 4]); s.push_back(d[h[i] & 15]); }
+        return s;
+    }
+
+    // =====================================================================================
     // the long-term weight mirror
     // =====================================================================================
     // The 100 000-entry long-term window lives inside the consensus state, which
@@ -2724,6 +2795,8 @@ private:
     std::uint64_t chain_entries_accepted_ = 0;
     std::uint64_t chain_entries_refused_  = 0;
     std::uint64_t chain_refusals_         = 0;
+    std::uint64_t unknown_fork_blocks_     = 0;   // above-version blocks refused, never charged
+    std::uint64_t unknown_fork_unattached_ = 0;   // ... of which the parent was unknown
     bool          synced_             = false;
     bool          forced_synced_      = false;
     bool          synced_forced_ever_ = false;

@@ -60,6 +60,24 @@
 // below the fork, because no rule in this tree is expressed as "the value at
 // the newest version" (the hf_table header is built that way on purpose).
 //
+// CORRECTION (FCMP++/Carrot, v17): the "following is version-agnostic" premise
+// above does NOT hold for the next fork. v17 changes the block blob (two tree
+// fields after tx_hashes), the block-id inputs (content-hash leaves), the PoW
+// (RandomX v2 plus a commitment), the coinbase output type and the reward
+// penalty zone. A v16 build cannot parse, identify or PoW-check a v17 block,
+// and rolling the rules forward cannot follow it. So a block whose header
+// major_version is above MAX_IMPLEMENTED_HF_VERSION is read HEADER FIRST
+// (peek_block_header) and never body-parsed (EvalStatus::UnknownFork): the
+// index refuses it WITHOUT charging the peer, and when it attaches to a block
+// we hold it trips this same fuse through ConsensusState::trip_unknown_fork
+// (template and tx admission withdrawn, one loud "[HF-FUSE] UNKNOWN FORK" line
+// on stderr). The relay txpool likewise refuses a transaction whose format is
+// above the implemented one (tx version > 2, rct type > 6) as NotUnderstood,
+// never as a drop offence. Blocks and transactions at or below the implemented
+// version are judged exactly as before. The rolled path in
+// hf_policy_check_block() below stays for a fork that changes rules but not
+// the block format.
+//
 // THE FUSE IS A LATCH AND IT IS LOUD. Tripping records the first height and
 // version that tripped it and counts every subsequent one. It never un-trips by
 // itself: the only thing that clears it is a build whose MAX_IMPLEMENTED_HF_VERSION

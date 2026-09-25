@@ -125,6 +125,14 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     const TxDecodeStatus st = decode_relayed_tx(blob.data(), blob.size(), d);
     if (st != TxDecodeStatus::Ok) {
         ++stats_.rejected;
+        // A format from a fork above the implemented range is not understood,
+        // and not understanding it is not the sender's fault: an upgraded
+        // honest peer relays exactly these. Refused without a drop offence.
+        // A malformed transaction of a known format is judged as before.
+        if (tx_format_above_implemented(blob.data(), blob.size())) {
+            ++stats_.rejected_not_understood;
+            return verdict(Reason::NotUnderstood, false);
+        }
         switch (st) {
             case TxDecodeStatus::UnsupportedRctType:
                 return verdict(Reason::BadVersion, true);

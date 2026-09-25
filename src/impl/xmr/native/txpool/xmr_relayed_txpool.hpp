@@ -242,6 +242,9 @@ struct TxpoolStats {
     std::uint64_t rejected_member_locked   = 0;
     // Refused because the chain already mined it / spent one of its key images.
     std::uint64_t rejected_already_mined   = 0;
+    // Refused as NOT UNDERSTOOD: a format above the implemented fork (tx
+    // version > 2, or rct type > 6). Never a drop offence.
+    std::uint64_t rejected_not_understood  = 0;
 
     // Entries a snapshot LEFT OUT because their ring was unresolved and the
     // select policy is Exclude (the default). This distinguishes "the block was
