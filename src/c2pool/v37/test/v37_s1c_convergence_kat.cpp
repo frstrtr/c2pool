@@ -9,13 +9,13 @@
 // v37_s1c_convergence_kat.cpp — S-1c: TWO NODES, ONE owed_digest.
 //
 // THE DEFECT THIS KAT PINS. After the S-1 live fold-wiring, the node that MINED
-// a block credits E_b and its owed_digest leaves the empty sha256d("V37O")
-// anchor b4db1ded…. Its PEERS do not. A peer decodes the block-winning carrier,
+// a block credits E_b and its owed_digest leaves the empty sha256d("V37Q")
+// anchor 66078202…. Its PEERS do not. A peer decodes the block-winning carrier,
 // admits it as an ordinary share, and learns nothing at all about the block —
 // so its finalW never moves and it stays at the anchor. Two nodes that ingested
 // the byte-identical carrier stream therefore commit to DIFFERENT owed ledgers:
 //
-//     owed_digest(A) = <non-empty>      owed_digest(B) = b4db1ded…
+//     owed_digest(A) = <non-empty>      owed_digest(B) = 66078202…
 //
 // That is a settlement fork. Case 3 below reproduces it exactly, so this KAT
 // goes red the moment the S-1c receive path is reverted.
@@ -118,10 +118,10 @@ static std::string hex32(const ::v37::bytes32& d) {
     return s;
 }
 
-// The empty-fold anchor: sha256d("V37O") — what owed_digest() returns when the
+// The empty-fold anchor: sha256d("V37Q") — what owed_digest() returns when the
 // FINALIZED partition is empty. The S-1/S-1c defect's shared fingerprint.
 static const char* kEmptyAnchor =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 
 // PINNED GOLDEN — the owed_digest BOTH nodes commit to after the fixed stream of
 // case 2. A change here is a CONSENSUS-VISIBLE change to what the pool commits
@@ -130,7 +130,7 @@ static const char* kEmptyAnchor =
 // same fixed stream — which is the point: the receiver does not reach "a"
 // convergent digest, it reaches THE winner's digest.
 static const char* kOwedGolden =
-    "4e13dd3f7472dae166e0d99ab778a296b8308afd6c2f55595747628800bdf0a4";
+    "dac7d311e521ede9f5a7b0439510b9f4d15c6fc935778324c2c15d82ba94aeda";
 
 static ::v37::PayoutDescriptor p2pkh_desc(std::uint8_t tag) {
     std::vector<std::uint8_t> s = {0x76, 0xa9, 0x14};
@@ -306,7 +306,7 @@ int main() {
     {
         settle::OwedLedger fresh(CH);
         check(hex32(fresh.owed_digest()) == kEmptyAnchor,
-              "1 empty ledger owed_digest == the sha256d(\"V37O\") anchor " +
+              "1 empty ledger owed_digest == the sha256d(\"V37Q\") anchor " +
                   std::string(kEmptyAnchor).substr(0, 8));
     }
 

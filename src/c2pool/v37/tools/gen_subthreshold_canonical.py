@@ -14,7 +14,7 @@ Monte-Carlo approximation:
   combined      Hhat_comb   = (S + K - 1) * 2^256 // (h_K + 1)     (sybil-neutral)
   censoring     corrected   = (K-1) * 2^256 // (h_K + 1 - h_T)     (receipts-only)
   straddle      ratio        = 1 + (K-1)/(2K-1)  (exact rational; naive-straddle infl.)
-  gate digests  owed_digest  = sha256d("V37O" || key || i64 finalW || u64 fe), gate OFF vs ON
+  gate digests  owed_digest  = sha256d("V37Q" || key || i64 finalW || u64 fe), gate OFF vs ON
 
 Cross-check oracle (the proto goldens, read but not byte-reproduced — a different
 PRNG): proto/subthreshold-estimator mc_estimator_v1.json stamp
@@ -78,8 +78,8 @@ def low63(x):
 # ------------------------------------------------------------------ owed_digest
 def owed_digest(finalW, first_eligible):
     """Faithful w4_settlement owed_digest: sha256d, sorted by key, skip zero rows,
-    'V37O' || key(32) || i64 finalW (LE) || u64 first_eligible (LE)."""
-    pre = bytearray(b"V37O")
+    'V37Q' || key(32) || i64 finalW (LE) || u64 first_eligible (LE)."""
+    pre = bytearray(b"V37Q")
     for k in sorted(finalW):
         w = finalW[k]
         if w == 0:

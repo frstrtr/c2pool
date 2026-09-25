@@ -52,7 +52,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     # processing_shares_phase2 to pin share OWNERSHIP: a dropped/duplicate/
     # verify-failed/late-reply share is freed, an adopted one is not. Same
     # folding rule: into the existing allowlisted target.
-    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp auto_ratchet_blocked_by_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp share_remove_owns_data_test.cpp share_message_unpack_bounds_test.cpp restart_reorg_supersede_test.cpp peer_block_pow_carry_test.cpp head_retention_test.cpp share_fetch_failover_test.cpp desired_request_pacer_test.cpp build_stops_test.cpp pool_rate_head_select_test.cpp template_topology_spend_test.cpp ingest_bounds_test.cpp ingest_ownership_test.cpp ingest_convergence_test.cpp chain_topology_endpoints_kat_test.cpp)
+    #
+    # per_peer_ingest_test.cpp: #1600 per-peer ingest-budget fairness — one peer
+    # cannot exceed its per-peer slice while others still admit, releases
+    # decrement the per-peer counters, and the global ceiling is never exceeded.
+    # invalid_pow_score_test.cpp: #1601 conservative invalid-PoW misbehavior
+    # scoring — only a sustained genuine PoW-target-miss flood crosses the high,
+    # time-decayed threshold; honest/stale/duplicate peers are never penalized.
+    # Same folding rule: into the existing allowlisted target (the #769 trap).
+    #
+    # legacy_addrme_self_probe_test.cpp (#1716, sibling half of #882): drives the
+    # REAL ltc::Legacy / ltc::Actual addrme handlers over a REAL loopback socket.
+    # Needs NodeImpl + protocol_legacy.cpp from the `ltc` lib already on this
+    # target. Same folding rule (the #769 trap).
+    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp auto_ratchet_blocked_by_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp share_remove_owns_data_test.cpp share_message_unpack_bounds_test.cpp restart_reorg_supersede_test.cpp peer_block_pow_carry_test.cpp head_retention_test.cpp share_fetch_failover_test.cpp desired_request_pacer_test.cpp build_stops_test.cpp pool_rate_head_select_test.cpp template_topology_spend_test.cpp ingest_bounds_test.cpp ingest_ownership_test.cpp ingest_convergence_test.cpp chain_topology_endpoints_kat_test.cpp per_peer_ingest_test.cpp invalid_pow_score_test.cpp legacy_addrme_self_probe_test.cpp)
     target_link_libraries(share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc

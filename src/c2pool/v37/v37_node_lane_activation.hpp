@@ -102,6 +102,18 @@ inline ::v37::LaneParams node_lane_params(::v37::LaneKind lane) {
     }
 }
 
+// The Family-A (BTC-family parent) lane a live node builds: node_lane_params()
+// with the STEP-0 coinbase no-dust floor k_floor = f_ref (LaneParams::family_a).
+// k_floor is its own consensus field, committed in the lane digest and
+// independent of the V37.1 flip, so the flip never drops it.
+//   OFF (default) => exactly ::v37::LaneParams::family_a(), identical to master.
+//   ON            => node_lane_params(lane) with the same k_floor.
+inline ::v37::LaneParams node_lane_params_family_a(::v37::LaneKind lane) {
+    ::v37::LaneParams p = node_lane_params(lane);
+    p.k_floor = ::v37::K_FLOOR_F_REF;
+    return p;
+}
+
 // The lane geometry for a lane with NO ratified LaneKind row (XMR). Carries the
 // consensus version WITHOUT ridge dimensions, because there are none to carry.
 inline ::v37::LaneParams node_lane_params_no_kind() {

@@ -62,6 +62,19 @@ C2P_PARAM("meta.ack_money_settings", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, L
   C2P_ALIAS("meta.ack_money_settings", BIN_DGB, "--ack-money-settings", FLAG)
   C2P_ALIAS("meta.ack_money_settings", BIN_BCH, "--ack-money-settings", FLAG)
 
+// Control-plane apply token file (#157 Slice 3). DORMANT launch seam: pointing
+// this at a 0600 owner-only file whose contents are a 32-128 char token loads
+// that token via config_endpoint::set_control_token() at startup, which is the
+// ONLY production caller that arms POST /api/config[/apply]. Absent (the
+// default) => no token => the apply endpoint stays fail-closed (503 armed:false)
+// exactly as on master. MONEY_RESTART: it is money-adjacent (it is what makes
+// runtime money-key arming reachable at all), so setting it from a settings
+// file requires the money-ack ceremony; changing it needs a restart. It is
+// never a runtime-appliable key (no ParamApplier setter), so the apply path's
+// runtime-setter precondition refuses any attempt to set it over HTTP.
+C2P_PARAM("control.token_file", Gate, PATH, MONEY_RESTART, C_DASH, LIT, "", NONE, "control-plane apply token file (0600, owner-only, 32-128 char token; DORMANT, arms POST /api/config/apply when present)")
+  C2P_ALIAS("control.token_file", BIN_DASH, "--control-plane-token-file", VALUE)
+
 C2P_PARAM("meta.run", Meta, BOOL, RESTART, C_DASH|C_DGB, LIT, "false", NONE, "run the node")
   C2P_ALIAS("meta.run", BIN_DASH, "--run", FLAG)
   C2P_ALIAS("meta.run", BIN_DGB, "--run", FLAG)
@@ -548,7 +561,7 @@ C2P_PARAM("embedded.fold_live_expect", Embedded, HEX, RESTART, C_DASH, LIT, "", 
 C2P_PARAM("embedded.fold_checkscripts", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "consensus-exact input-script check")
   C2P_ALIAS("embedded.fold_checkscripts", BIN_DASH, "--embedded-fold-checkscripts", FLAG)
 
-C2P_PARAM("embedded.tx_inject", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "#157 miner/user tx-injection (opt-in, default OFF, reward-neutral)")
+C2P_PARAM("embedded.tx_inject", Embedded, BOOL, MONEY_LIVE, C_DASH, LIT, "false", NONE, "#157 miner/user tx-injection arm (opt-in, default OFF, reward-neutral; MONEY-path: arming changes mined-block body -> the full two-phase money-nonce + M0 tripwire gate, Slice B)")
   C2P_ALIAS("embedded.tx_inject", BIN_DASH, "--embedded-tx-inject", FLAG)
 
 C2P_PARAM("embedded.tx_inject_hex", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "#157 local tx-inject submit file (raw tx hex per line)")
@@ -664,6 +677,9 @@ C2P_PARAM("utility.dump_mn_checkpoint", Meta, STRING, RESTART, C_DASH, LIT, "", 
 
 C2P_PARAM("utility.max_nonce", Meta, INT64, RESTART, C_DASH, LIT, "4294967295", NONE, "mine-block max nonce")
   C2P_ALIAS("utility.max_nonce", BIN_DASH, "--max-nonce", VALUE)
+
+C2P_PARAM("bls.allow_stub", Gate, BOOL, RESTART, C_DASH, LIT, "false", NONE, "knowingly run a bls=stub (BLS-dark) build in a BLS-relying config")
+  C2P_ALIAS("bls.allow_stub", BIN_DASH, "--allow-stub-bls", FLAG)
 
 #undef C2P_PARAM
 #undef C2P_ALIAS

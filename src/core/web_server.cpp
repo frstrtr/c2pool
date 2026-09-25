@@ -4663,6 +4663,25 @@ nlohmann::json MiningInterface::rest_local_stats()
     {
         auto warnings = nlohmann::json::array();
 
+        // #940 D-EMB.940: coin-P2P dial-reachability snapshot, taken ONCE and
+        // used both as a top-level node-state field (result["coin_p2p"]) and for
+        // the always-on dial-failure banner below. The DASH coin-sync provider
+        // derives s["coin_p2p"]; surfacing it makes "0 peers because every dial
+        // failed" DISTINCT from "connected but empty" and from "idle". Display /
+        // observability only -- no dial or scoring behaviour changes.
+        bool coin_dial_failing = false;
+        uint64_t coin_dial_failures = 0;
+        if (m_coin_sync_status_fn) {
+            auto css = m_coin_sync_status_fn();
+            if (css.is_object() && css.contains("coin_p2p") && css["coin_p2p"].is_object()) {
+                const auto& cp2p = css["coin_p2p"];
+                result["coin_p2p"] = cp2p;
+                coin_dial_failures = cp2p.value("dial_failures", static_cast<uint64_t>(0));
+                coin_dial_failing = !cp2p.value("network_reachable", true)
+                                    && coin_dial_failures > 0;
+            }
+        }
+
         // 1. Coin block-source contact check (issue #1482).
         // The threshold is >=3x the coin block_period (from the same source as
         // /web/currency_info), NEVER the old hardcoded 60 s: at LTC's 150 s
@@ -4741,6 +4760,20 @@ nlohmann::json MiningInterface::rest_local_stats()
                     + std::to_string(now_s - m_last_work_update_time)
                     + "s; no new blocks can arrive until a peer connects.");
             }
+        }
+
+        // 1b. #940 D-EMB.940: coin-P2P dial FAILURE banner -- ALWAYS-ON, not
+        // gated on tip_stalled. A node that never dialed a peer never advanced
+        // work (m_last_work_update_time==0), so warning #1's tip-stall gate can
+        // NEVER catch the "healthy-looking node, silently empty" failure #940 is
+        // about. This makes 0-reachable-peers-with-dial-failures LOUD and DISTINCT
+        // from connected-but-empty and from idle.
+        if (coin_dial_failing) {
+            warnings.push_back("COIN P2P DIAL FAILING -- the embedded coin node "
+                "has 0 reachable (handshaked) parent-chain peers after "
+                + std::to_string(coin_dial_failures) + " failed dial attempt(s); "
+                "it CANNOT reach the coin network, so any empty/zero node state is "
+                "a FAULT, not idle. (dashd RPC fallback, if configured, still applies.)");
         }
 
         // 2. No work template yet
@@ -5684,6 +5717,38 @@ nlohmann::json MiningInterface::rest_config_schema()
             return j;
     }
     return nlohmann::json{{"error", "config schema endpoint not wired"}};
+}
+
+nlohmann::json MiningInterface::rest_config_apply(const std::string& body)
+{
+    // Slice A (#157): route the POST body through the installed gated-apply fn
+    // (control token + two-phase money nonce + AddressValidator + tripwire).
+    // Unwired => the caller (http_session) never reaches here; it answers 503.
+    if (m_config_apply_fn) {
+        auto j = m_config_apply_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"armed", false},
+        {"error", "config-apply not armed; runtime mutation is operator-gated"},
+        {"http_status", 503}};
+}
+
+nlohmann::json MiningInterface::rest_tx_inject_submit(const std::string& body)
+{
+    // Slice B (#157): route the POST body through the installed submit fn, which
+    // (in main_dash) deserializes the raw tx and calls the armed
+    // NodeCoinState::submit_inject on the node io_context (via thread_safe_wrap,
+    // so the IO-confined inject state is never touched from the WEB thread).
+    // Unwired => the caller (http_session) answers 503 before reaching here.
+    if (m_tx_inject_submit_fn) {
+        auto j = m_tx_inject_submit_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"armed", false},
+        {"error", "tx-inject submit not wired"},
+        {"http_status", 503}};
 }
 
 nlohmann::json MiningInterface::rest_node_topology()
@@ -6740,6 +6805,16 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         }
     }
 
+    // #940 D-EMB.940: coin-P2P dial-reachability, so a node whose embedded coin
+    // arm cannot dial ANY peer is DISTINGUISHABLE from one that connected but
+    // holds an empty state. Derived DASH-side; passed through verbatim (display
+    // only). Harmless for coins that do not emit it.
+    if (m_coin_sync_status_fn) {
+        auto ss = m_coin_sync_status_fn();
+        if (ss.is_object() && ss.contains("coin_p2p") && ss["coin_p2p"].is_object())
+            result["coin_p2p"] = ss["coin_p2p"];
+    }
+
     return result;
 }
 
@@ -6819,6 +6894,18 @@ nlohmann::json MiningInterface::rest_v36_status()
         {"v36_shares", v36_shares},
         {"v36_percentage", v36_pct}
     };
+
+    // #940 D-EMB.940: surface coin-P2P dial-reachability in /v36_status too, so
+    // the V36 diagnostic distinguishes a node that cannot dial ANY peer from one
+    // that connected but holds empty state. Same verbatim pass-through as
+    // rest_version_signaling()/rest_local_stats(); harmless for coins that do
+    // not emit it.
+    if (m_coin_sync_status_fn) {
+        auto ss = m_coin_sync_status_fn();
+        if (ss.is_object() && ss.contains("coin_p2p") && ss["coin_p2p"].is_object())
+            result["coin_p2p"] = ss["coin_p2p"];
+    }
+
     return result;
 }
 

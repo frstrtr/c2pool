@@ -73,11 +73,23 @@ if [ "$RC" -ne 0 ]; then
 fi
 echo "[$GATE] PASS (CI arm) — $NA populated-block LTC-parent + DOGE-aux production assertions green"
 
-# 4. Optional live regtest arm — only when an isolated litecoind+dogecoind is wired.
-if [ -n "${LTC_RPC_PASS:-}" ] && [ -n "${DOGE_RPC_PASS:-}" ]; then
-  echo "[$GATE] live arm: driving scripts/ltc_g3a_populated_block_regtest.sh"
-  "$REPO_ROOT/scripts/ltc_g3a_populated_block_regtest.sh"
-  echo "[$GATE] PASS (live arm) — real populated regtest block proven (LTC submitblock + DOGE submitauxblock)"
+# 4. Optional live regtest arm — LTC parent populated block against an isolated
+# litecoind. Fail-closed invariant: the live-arm script this gate promises to
+# drive MUST exist on the branch, whether or not creds are wired. A missing arm
+# is a gate-integrity failure (a per-coin gate that cannot fail), NOT a silent
+# skip — this is the exact hole that let LTC G3a report green with no arm.
+LIVE_ARM="$REPO_ROOT/scripts/ltc_g3a_populated_block_regtest.sh"
+if [ ! -f "$LIVE_ARM" ]; then
+  echo "[$GATE] FAIL — live-arm script missing: ${LIVE_ARM#"$REPO_ROOT"/} (gate cannot fake-green)" >&2
+  exit 3
+fi
+if [ -n "${LTC_RPC_PASS:-}" ]; then
+  echo "[$GATE] live arm: driving scripts/ltc_g3a_populated_block_regtest.sh (LTC parent)"
+  "$LIVE_ARM"
+  echo "[$GATE] PASS (live arm) — real populated regtest block proven (LTC parent: segwit round-trip + submitblock)"
+  if [ -n "${DOGE_RPC_PASS:-}" ]; then
+    echo "[$GATE] NOTE: DOGE merged-aux (submitauxblock) is a pending extension of this arm — parent proven above; aux gated on dogecoind live-testbed standup."
+  fi
 else
-  echo "[$GATE] live regtest arm SKIPPED (set LTC_RPC_PASS + DOGE_RPC_PASS to enable)"
+  echo "[$GATE] live regtest arm SKIPPED (set LTC_RPC_PASS to enable the litecoind parent arm)"
 fi

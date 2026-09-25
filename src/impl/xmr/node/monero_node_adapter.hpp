@@ -104,12 +104,80 @@ public:
             tip.height  = md.height - 1;
             tip.id      = md.prev_id;
             // prev_id intentionally zero (unknown parent on this feed).
-            index_.apply(tip);
+            reconcile_then_apply(tip);   //  fix: see reconcile_then_apply()
         }
 
         // (d) keep seed reach satisfied.
         ensure_seed_reach();
     }
+
+    //  fix (adversarial re-verify 2026-09-20): the miner_data feed has no parent id, so a
+    // same-height swap seen only through its CHILD was a clean extend (no Orphan; stale mirror row;
+    // chain_carries() said the loser was canonical; F1 finalized it). Reconcile the mirror against
+    // the daemon whenever the tip moves: walk down from tip-1 while the mirror disagrees with the
+    // daemon's header, apply the replacements oldest-first (apply()'s reorg branch emits
+    // Orphan(loser) + Reorg(winner)), then the tip.
+    void reconcile_then_apply(const ChainMainBlock& tip) {
+        // ctest#933 (xmr_x2_node_kat §[4]): a seed-anchor row fills by_height_ WITHOUT
+        // setting best_id_, so empty() is false while best_id() is all-zero. Without the
+        // is_zero guard the FIRST real tip enters the reconcile walk (header fetch below the
+        // tip -> can ABORT) instead of a direct apply. Direct-apply the first tip.
+        if (index_.empty() || is_zero(index_.best_id()) || tip.id == index_.best_id()) { index_.apply(tip); return; }
+        std::vector<ChainMainBlock> repl;
+        std::uint64_t h = tip.height;
+        const std::uint64_t best = index_.best_height();
+        while (h > 0 && repl.size() < 64) {
+            const std::uint64_t ph = h - 1;
+            auto mirror = index_.by_height(ph);
+            if (ph > best) mirror.reset();                        //  fix 5: never trust a row above the tip
+            if (ph <= best && !mirror) break;                     // below the retained window
+            std::optional<ChainMainBlock> d;
+            rpc_.get_block_header_by_height(ph, [&](std::optional<ChainMainBlock> b, const std::string&) { d = b; });
+            if (!d) { ++reconcile_aborted_; return; }             // fix: header fetch failed -> ABORT the whole reconcile, apply NOTHING, retry next poll (never apply a partial replacement list)
+            if (mirror && mirror->id == d->id) break;             // agreement from here down
+            repl.push_back(*d); h = ph;                           //  fix 3: gap rows (ph > best) are filled too
+        }
+        for (auto it = repl.rbegin(); it != repl.rend(); ++it) { ++reconciled_; index_.apply(*it); }
+        index_.apply(tip);
+    }
+    std::uint64_t reconciled() const noexcept { return reconciled_; }
+    std::uint64_t reconcile_aborted() const noexcept { return reconcile_aborted_; }
+
+    // Restart-liveness fix (adversarial re-verify 2026-09-22): the F1 finalize driver's
+    // canonical test (XmrNode::chain_carries) answers from THIS mirror, and
+    // initial_sync() seeds ONLY the tip row. After a clean restart every row below the
+    // tip is absent, and an absent row read as "not canonical" -> the driver ORPHANED the
+    // node's own pending, perfectly canonical blocks at maturity (undoing settled
+    // payouts; the owed_digest diverged; the majority-shaped halt then fired correctly
+    // on a self-inflicted divergence). Fill ONE settled header synchronously from the
+    // daemon (same synchronous header round-trip reconcile_then_apply() already relies
+    // on). Never moves the tip, never emits an event; refuses to fetch above the tip
+    // (fix 5: never trust a row above the tip). Returns the row now resident, if any.
+    std::optional<ChainMainBlock> ensure_row(std::uint64_t height) {
+        bool fetch_failed = false;
+        return ensure_row(height, fetch_failed);
+    }
+    // R-C rework-2 (O3.5 false-orphan fix): the same backfill, but it tells the
+    // caller WHY no row came back. `fetch_failed` = the daemon header round-trip
+    // itself failed (transport error / unparseable body) -- that is "UNKNOWN",
+    // never evidence the block left the chain; the caller must HOLD rather than
+    // orphan. An empty index also reports fetch_failed (nothing to compare
+    // against yet). A height above the tip is answered absent with
+    // fetch_failed == false (fix 5: never trust a row above the tip; the chain
+    // genuinely does not carry anything there right now).
+    std::optional<ChainMainBlock> ensure_row(std::uint64_t height, bool& fetch_failed) {
+        fetch_failed = false;
+        if (auto r = index_.by_height(height); r && !is_zero(r->id)) return r;
+        if (index_.empty()) { fetch_failed = true; return std::nullopt; }
+        if (height > index_.best_height()) return std::nullopt;
+        std::optional<ChainMainBlock> d;
+        rpc_.get_block_header_by_height(height, [&](std::optional<ChainMainBlock> b, const std::string&) { d = b; });
+        if (!d) { ++row_backfill_failed_; fetch_failed = true; return std::nullopt; }
+        index_.backfill(*d); ++row_backfilled_;
+        return d;
+    }
+    std::uint64_t row_backfilled()      const noexcept { return row_backfilled_; }
+    std::uint64_t row_backfill_failed() const noexcept { return row_backfill_failed_; }
 
     void on_txpool_add(std::vector<TxBacklogEntry> txs) {
         for (auto& t : txs) index_.add_backlog_tx(t);
@@ -155,6 +223,10 @@ private:
     MoneroDaemonRpc rpc_;
     ZmqSubscriber   zmq_;
     MainchainIndex  index_;
+    std::uint64_t   reconciled_ = 0;   //  fix: replacement rows applied by reconcile_then_apply
+    std::uint64_t   reconcile_aborted_ = 0;   // reconcile walks aborted on a header-fetch failure (retried next poll)
+    std::uint64_t   row_backfilled_ = 0;      // restart-liveness: mirror rows filled on demand by ensure_row()
+    std::uint64_t   row_backfill_failed_ = 0; // restart-liveness: ensure_row() header fetches that failed (answer stayed absent)
     std::optional<MinerData> latest_miner_data_;
     std::unordered_set<std::uint64_t> seed_reqs_inflight_;
 };

@@ -213,16 +213,26 @@ struct CoinbaseFields {
     std::uint64_t height      = 0;   // the height in txin_gen
     std::uint64_t output_sum  = 0;   // sum of vout amounts == money_in_use
     std::size_t   n_outputs   = 0;
+
+    // INPUT-consensus capture (ADD-ONLY). The coinbase's version decides whether
+    // its outputs enter the amount-0 RCT global table at all: only a version-2
+    // coinbase (from HF_VERSION_MIN_V2_COINBASE_TX = 12) does. `unlock_time` is
+    // the spendable-age bound a ring member inherits. `outputs` are the (public
+    // amount, one-time key) pairs, in output order; the downstream set turns the
+    // cleartext amount into the stored commitment via rct::zero_commit(amount),
+    // because a coinbase carries no outPk. Populated only when capture is asked.
+    std::uint64_t version     = 0;
+    std::uint64_t unlock_time = 0;
+    std::vector<std::pair<std::uint64_t, std::array<std::uint8_t, 32>>> outputs;
 };
 
 inline bool parse_coinbase_fields(const std::uint8_t* block_blob, const ParsedBlock& pb,
-                                  CoinbaseFields& out) {
+                                  CoinbaseFields& out, bool capture = false) {
     out = CoinbaseFields{};
     BlobReader r(block_blob + pb.miner_tx_offset, pb.miner_tx_size);
 
-    std::uint64_t version = 0, unlock_time = 0;
-    if (!r.read_varint(version)) return false;
-    if (!r.read_varint(unlock_time)) return false;
+    if (!r.read_varint(out.version)) return false;
+    if (!r.read_varint(out.unlock_time)) return false;
 
     std::uint64_t n_in = 0;
     if (!r.read_varint(n_in) || n_in != 1) return false;
@@ -233,6 +243,7 @@ inline bool parse_coinbase_fields(const std::uint8_t* block_blob, const ParsedBl
     std::uint64_t n_out = 0;
     if (!r.read_varint(n_out)) return false;
     out.n_outputs = static_cast<std::size_t>(n_out);
+    if (capture) out.outputs.reserve(out.n_outputs);
     for (std::uint64_t i = 0; i < n_out; ++i) {
         std::uint64_t amount = 0;
         if (!r.read_varint(amount)) return false;
@@ -240,9 +251,17 @@ inline bool parse_coinbase_fields(const std::uint8_t* block_blob, const ParsedBl
         out.output_sum += amount;
         std::uint8_t otag = 0;
         if (!r.read_byte(otag)) return false;
-        if (otag == TX_OUT_TO_KEY)             { if (!r.skip(32)) return false; }
-        else if (otag == TX_OUT_TO_TAGGED_KEY) { if (!r.skip(33)) return false; }
-        else                                   { return false; }
+        std::array<std::uint8_t, 32> pk{};
+        if (otag == TX_OUT_TO_KEY) {
+            if (capture) { if (!r.read_bytes(pk.data(), 32)) return false; }
+            else         { if (!r.skip(32)) return false; }
+        } else if (otag == TX_OUT_TO_TAGGED_KEY) {
+            if (capture) { if (!r.read_bytes(pk.data(), 32)) return false; if (!r.skip(1)) return false; }
+            else         { if (!r.skip(33)) return false; }
+        } else {
+            return false;
+        }
+        if (capture) out.outputs.emplace_back(amount, pk);
     }
     return true;
 }

@@ -92,6 +92,21 @@ struct SyncDriverConfig {
     // answered. Whether the index should prune the list is a C2c question; that
     // the SCHEDULE must not be a busy loop is this file's.
     std::uint64_t refetch_reask_ms          = 15'000;
+    // Batches of refetch_batch ids the driver may put on the wire per tick.
+    // Each batch goes to the first peer that has a span slot free (the best
+    // peer first); a batch no peer can take is not booked as asked, so it is
+    // offered again on the next tick instead of sitting out refetch_reask_ms.
+    std::size_t   refetch_batches_per_tick  = 4;
+
+    // #1680: how long a bodiless fluffy park (ChainIndex::bodies_wanted) may sit
+    // before the driver re-asks for the whole block via GET_OBJECTS. A park is
+    // created the instant we send its announcer a REQUEST_FLUFFY_MISSING_TX
+    // (2009); this grace lets that reply arrive normally before we fall back.
+    // 5 s is ten driver ticks at driver_tick_ms=500 -- generous for a LAN reply,
+    // short enough that a reply lost to the DoS bucket or a disconnect self-heals
+    // long before the next found share submits at a taken height. Re-asked every
+    // timeout until the block connects (which erases the park).
+    std::uint64_t fluffy_reply_timeout_ms   = 5'000;
 
     // READ-ONLY PROBE. Ask one NOTIFY_REQUEST_CHAIN from a genesis-terminated
     // locator, record the answer, and never ask for a block. This is what a
@@ -109,6 +124,8 @@ public:
         std::uint64_t chain_requests   = 0;
         std::uint64_t chain_timeouts   = 0;
         std::uint64_t refetch_requests = 0;
+        std::uint64_t refetch_refused  = 0;   // a batch no peer had a span slot for (not booked)
+        std::uint64_t bodies_refetch_requests = 0;   // #1680: whole-block fallback for a stranded fluffy park
         std::uint64_t no_peer_ticks    = 0;
         std::uint64_t our_height       = 0;
         std::uint64_t best_peer_height = 0;
@@ -125,6 +142,7 @@ public:
 
     SyncDriver(IChainFetcher& fetcher, IChainServing& serving, IChainView& view,
                Hash genesis_id, BootedFn booted, RefetchFn refetch,
+               RefetchFn bodies = {},
                SyncDriverConfig cfg = {})
         : fetcher_(fetcher),
           serving_(serving),
@@ -132,6 +150,7 @@ public:
           genesis_id_(genesis_id),
           booted_(std::move(booted)),
           refetch_(std::move(refetch)),
+          bodies_(std::move(bodies)),
           cfg_(cfg) {}
 
     // One pass. MUST be called on the verify thread: it reads the index and
@@ -192,30 +211,99 @@ public:
         const SyncState st = view_.sync_state();
         stats_.our_height  = st.header_frontier;
 
-        // Our height moved since the request went out: it was answered, and the
-        // index is already fetching what it named.
-        if (in_flight_ && st.header_frontier != height_at_request_) in_flight_ = false;
+        // Progress is the height moving, or a chain entry being accepted (the
+        // index now holds a want list to work through).
+        const bool answered = st.chain_entries != entries_at_request_;
+        if (st.header_frontier != last_frontier_ || st.chain_entries != last_entries_) {
+            last_frontier_    = st.header_frontier;
+            last_entries_     = st.chain_entries;
+            last_progress_ms_ = now_ms;
+        }
 
-        // --- the parked parents ---------------------------------------------
+        // Our height moved since the request went out, or its answer was
+        // accepted: it was answered, and the want list says what to fetch.
+        if (in_flight_ && (st.header_frontier != height_at_request_ || answered))
+            in_flight_ = false;
+
+        // --- the want list: the chain entry's window, and parked parents ----
         // Done before the height comparison: an orphan's parent is missing
-        // whether or not the cohort is ahead of us.
+        // whether or not the cohort is ahead of us. An id is booked as asked
+        // only when a peer ACCEPTED the batch carrying it: booking it first
+        // and then losing the batch to a full span slot was half of the
+        // catch-up livelock (the whole want list frozen for refetch_reask_ms
+        // while nothing was fetching it).
         const std::vector<Hash> want = refetch_ ? refetch_() : std::vector<Hash>{};
         if (!want.empty()) {
+            std::size_t       sent = 0;
+            bool              refused = false;
             std::vector<Hash> ask;
+            auto flush = [&]() {
+                if (ask.empty()) return;
+                if (!ask_objects_(peers, best, st.header_frontier, ask)) {
+                    refused = true;
+                    ++stats_.refetch_refused;
+                } else {
+                    for (const Hash& id : ask)
+                        asked_[std::string(reinterpret_cast<const char*>(id.data()), id.size())] = now_ms;
+                    ++stats_.refetch_requests;
+                    ++sent;
+                }
+                ask.clear();
+            };
             for (const Hash& id : want) {
-                if (ask.size() >= cfg_.refetch_batch) break;
+                if (refused || sent >= cfg_.refetch_batches_per_tick) break;
                 if (view_.by_id(id)) continue;          // it arrived; stop asking
                 const std::string key(reinterpret_cast<const char*>(id.data()), id.size());
                 const auto it = asked_.find(key);
                 if (it != asked_.end() && now_ms - it->second < cfg_.refetch_reask_ms) continue;
-                asked_[key] = now_ms;
                 ask.push_back(id);
+                if (ask.size() >= cfg_.refetch_batch) flush();
             }
-            if (!ask.empty() && fetcher_.request_objects(peer, std::move(ask), /*prune=*/true))
-                ++stats_.refetch_requests;
+            if (!refused && sent < cfg_.refetch_batches_per_tick) flush();
             // The ask-book is a rate limiter, not a record: a bounded forget is
             // better than an unbounded memory of every id we ever wanted.
             if (asked_.size() > 4096) asked_.clear();
+        }
+
+        // --- the stranded fluffy parks (#1680) -------------------------------
+        // A block announced fluffy and parked WITH a body blob but WITHOUT its
+        // transactions is invisible to refetch_wanted() (have_body_locked_ sees
+        // the blob) and to on_chain_entry (skips ids in alt_). If the missing-tx
+        // reply we asked for is lost -- dropped by the block DoS bucket, or by a
+        // disconnect -- nothing re-asks and the node freezes one block behind.
+        // We give each park a grace window (its own in-flight 2009 gets to
+        // answer) and then re-ask for the WHOLE block via GET_OBJECTS, which
+        // works from any peer and rides the existing span machinery. Kept as a
+        // list separate from refetch above so a healthy fluffy reply is never
+        // raced by a duplicate whole-block fetch.
+        const std::vector<Hash> parks = bodies_ ? bodies_() : std::vector<Hash>{};
+        if (!parks.empty()) {
+            std::vector<Hash> ask;
+            for (const Hash& id : parks) {
+                if (ask.size() >= cfg_.refetch_batch) break;
+                const std::string key(reinterpret_cast<const char*>(id.data()), id.size());
+                const auto it = bodies_seen_.find(key);
+                if (it == bodies_seen_.end()) {   // first sighting: let the 2009 reply land
+                    bodies_seen_[key] = now_ms;
+                    continue;
+                }
+                if (now_ms - it->second < cfg_.fluffy_reply_timeout_ms) continue;
+                it->second = now_ms;              // re-ask every timeout until it connects
+                ask.push_back(id);
+            }
+            if (!ask.empty() && fetcher_.request_objects(peer, std::move(ask), /*prune=*/true))
+                ++stats_.bodies_refetch_requests;
+            // Forget parks that have connected (no longer in the wanted list), so
+            // the book does not grow without bound.
+            if (bodies_seen_.size() > parks.size() + 256) {
+                std::map<std::string, std::uint64_t> live;
+                for (const Hash& id : parks)
+                    live[std::string(reinterpret_cast<const char*>(id.data()), id.size())] =
+                        bodies_seen_[std::string(reinterpret_cast<const char*>(id.data()), id.size())];
+                bodies_seen_.swap(live);
+            }
+        } else if (!bodies_seen_.empty()) {
+            bodies_seen_.clear();
         }
 
         // --- the chain ask ---------------------------------------------------
@@ -231,6 +319,13 @@ public:
             // Re-ask somebody else where there is somebody else: a peer that
             // answered nothing twice is not going to answer the third time.
             avoid_ = peer.addr;
+        } else if (chain_asked_ && !want.empty()
+                   && now_ms - last_progress_ms_ < cfg_.chain_request_timeout_ms) {
+            // The last entry's want list is still being worked through and it
+            // is moving: another chain request now would only re-state it (and
+            // queue behind the span chunks on the same wire). Ask again once
+            // it runs out, or once it has stopped moving for a timeout.
+            return;
         }
 
         const PeerRef* ask = &peer;
@@ -248,6 +343,8 @@ public:
         in_flight_          = fetcher_.request_chain(*ask, std::move(locator), /*prune=*/true);
         sent_at_ms_         = now_ms;
         height_at_request_  = st.header_frontier;
+        entries_at_request_ = st.chain_entries;
+        chain_asked_        = chain_asked_ || in_flight_;
         if (in_flight_) {
             ++stats_.chain_requests;
             stats_.target = ask->addr;
@@ -257,20 +354,41 @@ public:
     const Stats& stats() const noexcept { return stats_; }
 
 private:
+    // One batch, to the first peer with a span slot for it: the chosen best
+    // peer, then every other peer at least level with us. False when none
+    // accepted (the fetcher refuses a span over its D-3 caps).
+    bool ask_objects_(const std::vector<std::pair<PeerRef, PeerSyncData>>& peers,
+                      std::size_t best, std::uint64_t our_height,
+                      const std::vector<Hash>& ids) {
+        if (fetcher_.request_objects(peers[best].first, ids, /*prune=*/true)) return true;
+        for (std::size_t i = 0; i < peers.size(); ++i) {
+            if (i == best || peers[i].second.current_height < our_height + 1) continue;
+            if (fetcher_.request_objects(peers[i].first, ids, /*prune=*/true)) return true;
+        }
+        return false;
+    }
+
     IChainFetcher& fetcher_;
     IChainServing& serving_;
     IChainView&    view_;
     Hash           genesis_id_;
     BootedFn       booted_;
     RefetchFn      refetch_;
+    RefetchFn      bodies_;      // #1680: bodiless fluffy parks; {} disables the fallback
     SyncDriverConfig cfg_;
 
     std::map<std::string, std::uint64_t> asked_;   // refetch id -> when we last asked
+    std::map<std::string, std::uint64_t> bodies_seen_;  // #1680: park id -> when first noticed / last re-asked
     bool          was_booted_        = false;
     bool          probe_sent_        = false;
     bool          in_flight_         = false;
     std::uint64_t sent_at_ms_        = 0;
     std::uint64_t height_at_request_ = 0;
+    std::uint64_t entries_at_request_ = 0;
+    std::uint64_t last_frontier_     = 0;
+    std::uint64_t last_entries_      = 0;
+    std::uint64_t last_progress_ms_  = 0;
+    bool          chain_asked_       = false;
     std::string   avoid_;
     Stats         stats_{};
 };

@@ -13,9 +13,9 @@
 // driver callers; the live FOUND site (XbtcNode::on_block_won) built BOTH the
 // credit and the payout out of the W5 coinbase assembly, which a FRESH win
 // (confirmations == 0) WITHHOLDS. So credit was EMPTY, FINALIZE did
-// finalW += {} — and owed_digest stayed at the empty "V37O" anchor
+// finalW += {} — and owed_digest stayed at the empty "V37Q" anchor
 //
-//     b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339
+//     66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3
 //
 // forever, on every live node, no matter how many blocks the pool won. Case 5
 // below reproduces that exact shape and asserts the anchor, so this KAT fails
@@ -73,16 +73,16 @@ static std::string hex32(const ::v37::bytes32& d) {
     return s;
 }
 
-// The empty-fold anchor: sha256d("V37O") — what owed_digest() returns when the
+// The empty-fold anchor: sha256d("V37Q") — what owed_digest() returns when the
 // FINALIZED partition is empty. The S-1 defect's fingerprint.
 static const char* kEmptyAnchor =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 
 // PINNED GOLDEN — the owed_digest the fixed stream of case 2 produces. A change
 // here is a CONSENSUS-VISIBLE change to what the pool commits it owes; it may
 // only move with a ruling, never with a refactor.
 static const char* kOwedGolden =
-    "4e13dd3f7472dae166e0d99ab778a296b8308afd6c2f55595747628800bdf0a4";
+    "dac7d311e521ede9f5a7b0439510b9f4d15c6fc935778324c2c15d82ba94aeda";
 
 static ::v37::PayoutDescriptor p2pkh_desc(std::uint8_t tag) {
     std::vector<std::uint8_t> s = {0x76, 0xa9, 0x14};
@@ -162,7 +162,7 @@ int main() {
     {
         settle::OwedLedger fresh(CH);
         check(hex32(fresh.owed_digest()) == kEmptyAnchor,
-              "1 empty ledger owed_digest == the sha256d(\"V37O\") anchor " +
+              "1 empty ledger owed_digest == the sha256d(\"V37Q\") anchor " +
                   std::string(kEmptyAnchor).substr(0, 8));
     }
 

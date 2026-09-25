@@ -89,6 +89,13 @@ struct EvaluatedBlock {
     BlockConnectInput        input{};
     std::vector<EvaluatedTx> txs;
     std::vector<Hash>        key_images;   // every input of every body, for D-12
+
+    // INPUT-consensus feed: every RCT (amount-0) output this block created, in
+    // monerod's GLOBAL-INDEX order -- the version-2 coinbase's outputs first (a
+    // version-1 coinbase creates NONE in the amount-0 table), then each
+    // non-coinbase version-2 body's outputs in block order. Empty when the
+    // bodies were not present (a fluffy announce) or nothing captured them.
+    std::vector<OutputRecord> outputs;
 };
 
 inline EvalStatus evaluate_block(const BlockEntry& entry, EvaluatedBlock& out,
@@ -103,7 +110,8 @@ inline EvalStatus evaluate_block(const BlockEntry& entry, EvaluatedBlock& out,
     }
     out.input.identity = block_identity(entry.block_blob.data(), out.input.parsed);
 
-    if (!parse_coinbase_fields(entry.block_blob.data(), out.input.parsed, out.input.coinbase)) {
+    if (!parse_coinbase_fields(entry.block_blob.data(), out.input.parsed,
+                               out.input.coinbase, /*capture=*/true)) {
         why = "coinbase fields do not read back";
         return EvalStatus::BadCoinbase;
     }
@@ -130,8 +138,8 @@ inline EvalStatus evaluate_block(const BlockEntry& entry, EvaluatedBlock& out,
         EvaluatedTx et;
 
         const TxParseStatus ps = te.pruned
-            ? parse_tx_pruned(te.blob, et.info)
-            : parse_tx_full(te.blob, et.info);
+            ? parse_tx_pruned(te.blob, et.info, /*capture=*/true)
+            : parse_tx_full(te.blob, et.info, /*capture=*/true);
         if (ps != TxParseStatus::Ok) {
             why = "transaction " + std::to_string(i) + " does not parse: " + to_string(ps);
             return EvalStatus::BadTxBlob;
@@ -159,6 +167,22 @@ inline EvalStatus evaluate_block(const BlockEntry& entry, EvaluatedBlock& out,
         fee_sum += et.info.fee;
 
         for (const KeyImage& ki : et.info.key_images) out.key_images.push_back(ki);
+
+        // NON-coinbase output capture: a version-2 body's outputs enter the
+        // amount-0 global table, in output order, right after this block's
+        // coinbase outputs. The commitment is the outPk mask the rct base
+        // carried (no curve code); the height is the block's own height, the
+        // unlock_time the tx's. A version-1 body (still seen on mainnet when
+        // it spends unmixable pre-RingCT outputs) carries clear amounts and
+        // creates no amount-0 outputs. out_pubkeys / out_commitments were
+        // captured only because evaluate_block asked (capture=true).
+        if (et.info.version >= 2
+            && et.info.out_pubkeys.size() == et.info.out_commitments.size()) {
+            for (std::size_t j = 0; j < et.info.out_pubkeys.size(); ++j)
+                out.outputs.push_back(OutputRecord{
+                    et.info.out_pubkeys[j], et.info.out_commitments[j],
+                    et.info.unlock_time, out.input.coinbase.height});
+        }
         out.txs.push_back(std::move(et));
     }
 

@@ -27,6 +27,15 @@
 //   Keccak-midstate opening, and the tree_hash main branch is unchanged from
 //   upstream; only p2pool's SideChain calls were rerouted to IXmrSettlementSource
 //   and the sidechain-id / aux-slot machinery was removed.
+//
+//   c2pool modification (2026-09, GPLv3 s.5(a) notice): update() and
+//   select_mempool_transactions() gained a `take_mempool_as_given` parameter.
+//   When set, the AGPL good-citizen selector on the c2pool side has already
+//   chosen the FINAL transaction set, so this file bypasses the p2pool 5-second
+//   mempool age gate and the penalty-zone greedy re-selection and mines the
+//   given set verbatim (only the 128 KB carrier-size safeguard still applies).
+//   No p2pool code was copied out of this file; the knob's VALUE originates on
+//   the AGPL side, this file merely honours it. Default false = upstream path.
 // =============================================================================
 
 #include "xmr_block_template.hpp"
@@ -129,6 +138,7 @@ XmrBlockTemplate& XmrBlockTemplate::operator=(const XmrBlockTemplate& b)
     m_majorVersion               = b.m_majorVersion;
     m_finalReward                = b.m_finalReward.load();
     m_extraNonceSize             = b.m_extraNonceSize;
+    m_extraNonceBindSize         = b.m_extraNonceBindSize;
     m_merkleTreeData             = b.m_merkleTreeData;
     m_merkleTreeDataSize         = b.m_merkleTreeDataSize;
     m_minerTxKeccakState         = b.m_minerTxKeccakState;
@@ -151,14 +161,17 @@ void XmrBlockTemplate::shuffle_tx_order()
 // select_mempool_transactions  (upstream, with p2pool sidechain serialisation
 // replaced by a conservative fixed template-overhead estimate).
 // ---------------------------------------------------------------------------
-void XmrBlockTemplate::select_mempool_transactions(const std::vector<XmrTxMempoolData>& mempool)
+void XmrBlockTemplate::select_mempool_transactions(const std::vector<XmrTxMempoolData>& mempool, bool take_as_given)
 {
     m_mempoolTxs.clear();
 
     const uint64_t cur_time = seconds_since_epoch();
     for (const XmrTxMempoolData& tx : mempool) {
-        // take only txs seen >= 5 s ago, or high-fee txs immediately
-        if ((cur_time > tx.time_received + 5) || (tx.fee >= HIGH_FEE_VALUE)) {
+        // GOOD-CITIZEN (c2pool): take_as_given means the AGPL good-citizen
+        // selector already chose this FINAL set -- include every tx verbatim,
+        // no age gate, no high-fee bypass. Otherwise upstream p2pool rule:
+        // take only txs seen >= 5 s ago, or high-fee txs immediately.
+        if (take_as_given || (cur_time > tx.time_received + 5) || (tx.fee >= HIGH_FEE_VALUE)) {
             m_mempoolTxs.emplace_back(tx);
         }
     }
@@ -261,11 +274,25 @@ int XmrBlockTemplate::create_miner_tx(const XmrMinerData& data,
     if (corrected_extra_nonce_size > EXTRA_NONCE_MAX_SIZE) {
         return -3;  // caller re-solves the reward with a smaller budget (see update())
     }
-    writeVarint(corrected_extra_nonce_size, m_minerTxExtra);
+    // recon(A+B credit): the on-chain credit cut rides as a constant-size TAIL of the
+    // 0x02 payload (after the worker nonce + weight padding): the weight
+    // invariance trick above is untouched and the per-extra_nonce patch (first
+    // EXTRA_NONCE_SIZE bytes only) never touches it.
+    const std::vector<uint8_t> nonce_tail = m_settle->extra_nonce_tail();
+    // SEAM-1: the per-job binding region sits right after the 4-byte worker
+    // nonce ([extra_nonce 4 | bind N | padding | tail]); constant size, so the
+    // weight-invariance padding above is untouched. N = 0 => byte-identical.
+    const size_t bind_size = m_settle->extra_nonce_bind_size();
+    if (bind_size > EXTRA_NONCE_BIND_MAX) {
+        return -1;  // fail closed: the per-job patch buffers are sized for EXTRA_NONCE_BIND_MAX
+    }
+    m_extraNonceBindSize = static_cast<uint32_t>(bind_size);
+    writeVarint(corrected_extra_nonce_size + bind_size + nonce_tail.size(), m_minerTxExtra);
 
     uint64_t extraNonceOffsetInMinerTx = m_minerTxExtra.size();
-    m_minerTxExtra.insert(m_minerTxExtra.end(), corrected_extra_nonce_size, 0);
-    m_extraNonceSize = static_cast<uint32_t>(corrected_extra_nonce_size);
+    m_minerTxExtra.insert(m_minerTxExtra.end(), corrected_extra_nonce_size + bind_size, 0);
+    m_minerTxExtra.insert(m_minerTxExtra.end(), nonce_tail.begin(), nonce_tail.end());
+    m_extraNonceSize = static_cast<uint32_t>(corrected_extra_nonce_size + bind_size + nonce_tail.size());
 
     // 0x03 : merge-mining tag. v37 commitment (owed_digest/info_digest) rides
     // here as the single MM-tree leaf (root == leaf for a 1-leaf tree).
@@ -298,12 +325,16 @@ hash XmrBlockTemplate::calc_miner_tx_hash(uint32_t extra_nonce) const
     const uint8_t* data = m_blockTemplateBlob.data() + m_minerTxOffsetInTemplate;
 
     const size_t extra_nonce_offset = m_extraNonceOffsetInTemplate - m_minerTxOffsetInTemplate;
-    const uint8_t extra_nonce_buf[EXTRA_NONCE_SIZE] = {
+    // The per-job mutable head of the 0x02 payload: the 4-byte worker nonce,
+    // then the SEAM-1 binding region (m_extraNonceBindSize bytes, 0 = none).
+    uint8_t extra_nonce_buf[EXTRA_NONCE_SIZE + EXTRA_NONCE_BIND_MAX] = {
         static_cast<uint8_t>(extra_nonce >> 0),
         static_cast<uint8_t>(extra_nonce >> 8),
         static_cast<uint8_t>(extra_nonce >> 16),
         static_cast<uint8_t>(extra_nonce >> 24),
     };
+    const size_t en_len = EXTRA_NONCE_SIZE + m_extraNonceBindSize;
+    if (m_extraNonceBindSize) (void)m_settle->extra_nonce_bind(extra_nonce, extra_nonce_buf + EXTRA_NONCE_SIZE);
 
     // v37: single MM-tree leaf, so the tag's 32-B root IS the commitment leaf.
     const hash merge_mining_root = m_settle->commitment_leaf(extra_nonce);
@@ -315,16 +346,16 @@ hash XmrBlockTemplate::calc_miner_tx_hash(uint32_t extra_nonce) const
     const size_t tx_size = m_minerTxSize - 1;
 
     hash full_hash;
-    uint8_t tx_buf[288];
+    uint8_t tx_buf[288 + EXTRA_NONCE_BIND_MAX];
 
     const size_t N = m_minerTxKeccakStateInputLength;
     const bool fast = N && (N <= extra_nonce_offset) && (N < tx_size) && (tx_size - N <= sizeof(tx_buf));
 
     if (!fast) {
         // slow path O(N): stream the prefix, substituting the mutated regions
-        keccak_custom([data, extra_nonce_offset, &extra_nonce_buf, merkle_root_offset, &merge_mining_root](int offset) -> uint8_t {
+        keccak_custom([data, extra_nonce_offset, &extra_nonce_buf, en_len, merkle_root_offset, &merge_mining_root](int offset) -> uint8_t {
             uint32_t k = static_cast<uint32_t>(offset - static_cast<int>(extra_nonce_offset));
-            if (k < EXTRA_NONCE_SIZE) return extra_nonce_buf[k];
+            if (k < en_len) return extra_nonce_buf[k];
             k = static_cast<uint32_t>(offset - static_cast<int>(merkle_root_offset));
             if (k < HASH_SIZE) return merge_mining_root.h[k];
             return data[offset];
@@ -336,7 +367,7 @@ hash XmrBlockTemplate::calc_miner_tx_hash(uint32_t extra_nonce) const
         // (which contain extra_nonce + MM root) are absorbed fresh
         const int inlen = static_cast<int>(tx_size - N);
         std::memcpy(tx_buf, data + N, inlen);
-        std::memcpy(tx_buf + extra_nonce_offset - N, extra_nonce_buf, EXTRA_NONCE_SIZE);
+        std::memcpy(tx_buf + extra_nonce_offset - N, extra_nonce_buf, en_len);
         std::memcpy(tx_buf + merkle_root_offset - N, merge_mining_root.h, HASH_SIZE);
 
         std::array<uint64_t, 25> st = m_minerTxKeccakState;
@@ -438,7 +469,7 @@ uint32_t XmrBlockTemplate::get_hashing_blob_nolock(uint32_t extra_nonce, uint8_t
 // ---------------------------------------------------------------------------
 // update  (upstream orchestration; SideChain calls -> IXmrSettlementSource).
 // ---------------------------------------------------------------------------
-void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxMempoolData>& mempool)
+void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxMempoolData>& mempool, bool take_as_given)
 {
     if (data.major_version > HARDFORK_SUPPORTED_VERSION) {
         return; // unknown fork: refuse to build, pin HARDFORK_SUPPORTED_VERSION per fork
@@ -485,7 +516,7 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
     m_merkleTreeDataSize = 0;
     writeVarint(m_merkleTreeData, [this](uint8_t) { ++m_merkleTreeDataSize; });
 
-    select_mempool_transactions(mempool);
+    select_mempool_transactions(mempool, take_as_given);
 
     const uint64_t base_reward = get_base_reward(data.already_generated_coins);
 
@@ -514,11 +545,16 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
     m_mempoolTxsOrder.resize(m_mempoolTxs.size());
     for (size_t i = 0; i < m_mempoolTxs.size(); ++i) m_mempoolTxsOrder[i] = static_cast<int>(i);
 
-    if (total_tx_weight + miner_tx_weight <= data.median_weight) {
-        // below the penalty zone: take everything
+    if (take_as_given || total_tx_weight + miner_tx_weight <= data.median_weight) {
+        // Below the penalty zone: take everything. GOOD-CITIZEN (c2pool): under
+        // take_as_given the AGPL selector has already chosen the FINAL set and
+        // capped it below the consensus ceiling, so this branch mines it
+        // verbatim EVEN when it reaches the penalty zone -- no greedy re-drop.
         final_fees = 0;
         final_weight = miner_tx_weight;
-        shuffle_tx_order();
+        // Keep selector order deterministic (== block order) under take_as_given
+        // so the served/mined set is KAT-comparable; monerod accepts any order.
+        if (!take_as_given) shuffle_tx_order();
 
         m_numTransactionHashes = m_mempoolTxsOrder.size();
         m_transactionHashes.assign(HASH_SIZE, 0);
@@ -530,7 +566,12 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
             final_fees += tx.fee;
             final_weight += tx.weight;
         }
-        final_reward = base_reward + final_fees;
+        // get_block_reward == base_reward + final_fees below the median, and
+        // applies the correct penalty above it (0 above 2*median, which the
+        // AGPL coinbase-aware trim in XmrBlockAssembler::build guarantees we
+        // never reach). Under the pure sub-median case this is identical to the
+        // upstream `base_reward + final_fees`.
+        final_reward = get_block_reward(base_reward, data.median_weight, final_fees, final_weight);
     }
     else {
         // penalty zone: greedy fee-per-byte pick with 100-deep replacement,
@@ -727,12 +768,13 @@ std::vector<uint8_t> XmrBlockTemplate::get_block_template_blob(uint32_t template
     extra_nonce_offset = t->m_extraNonceOffsetInTemplate;
     merkle_root_offset = t->m_extraNonceOffsetInTemplate + t->m_extraNonceSize + 2 + t->m_merkleTreeDataSize;
 
-    // patch this worker's extra nonce
-    const uint8_t en[EXTRA_NONCE_SIZE] = {
+    // patch this worker's extra nonce (+ the SEAM-1 binding region, if any)
+    uint8_t en[EXTRA_NONCE_SIZE + EXTRA_NONCE_BIND_MAX] = {
         static_cast<uint8_t>(extra_nonce >> 0), static_cast<uint8_t>(extra_nonce >> 8),
         static_cast<uint8_t>(extra_nonce >> 16), static_cast<uint8_t>(extra_nonce >> 24),
     };
-    std::memcpy(blob.data() + extra_nonce_offset, en, EXTRA_NONCE_SIZE);
+    if (t->m_extraNonceBindSize) (void)t->m_settle->extra_nonce_bind(extra_nonce, en + EXTRA_NONCE_SIZE);
+    std::memcpy(blob.data() + extra_nonce_offset, en, EXTRA_NONCE_SIZE + t->m_extraNonceBindSize);
 
     // patch the MM commitment root for this extra nonce
     merkle_root = t->m_settle->commitment_leaf(extra_nonce);

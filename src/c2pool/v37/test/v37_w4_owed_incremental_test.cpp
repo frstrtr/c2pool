@@ -104,8 +104,9 @@ struct Shadow {
         return out;
     }
     void rearm(u64 bin_height) {
-        for (const auto& [k, e] : eo_all()) {
-            if (e > 0) { if (!first_eligible.count(k)) first_eligible[k] = bin_height; }
+        // R-A: arm on finalW alone (mirror of the shipped OwedLedger).
+        for (const auto& [k, w] : finalW) {
+            if (w > 0) { if (!first_eligible.count(k)) first_eligible[k] = bin_height; }
             else first_eligible.erase(k);
         }
     }
@@ -128,7 +129,7 @@ struct Shadow {
         std::sort(rows.begin(), rows.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
         std::vector<std::uint8_t> pre;
-        const char tag[4] = {'V', '3', '7', 'O'};
+        const char tag[4] = {'V', '3', '7', 'Q'};   // R-A
         pre.insert(pre.end(), tag, tag + 4);
         for (const auto& [k, w] : rows) {
             if (w == 0) continue;

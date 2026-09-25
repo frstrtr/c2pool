@@ -294,6 +294,16 @@ Key amount_to_scalar(std::uint64_t amount) noexcept {
     return out;
 }
 
+Key zero_commit(std::uint64_t amount) noexcept {
+    // C = G + amount*H. add_keys over {G, amount*H} decodes and sums the two
+    // points; both are valid encodings, so it never fails, but we fall back to
+    // G on the impossible decode failure rather than return an uninitialised key.
+    Key out{};
+    if (!add_keys(KeyV{generator_G(), scalarmult_H(amount_to_scalar(amount))}, out))
+        out = generator_G();
+    return out;
+}
+
 // --- randomness --------------------------------------------------------------
 Key random_scalar_nonzero() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};

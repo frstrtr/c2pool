@@ -39,6 +39,7 @@ public:
         bool                      conflicted = false;
         std::uint32_t             seen_from_peers = 1;
         bool                      stem       = false;   // still in the Dandelion++ stem
+        std::vector<Hash>         key_images;           // what key_images_of() answers
     };
 
     // The configured selection policy, standing in for the real pool's config.
@@ -101,6 +102,12 @@ public:
     TxpoolSelectPolicy policy() const override { return configured; }
 
     std::uint64_t backlog_version() const override { return version_; }
+
+    std::vector<Hash> key_images_of(const Hash& id) const override {
+        const auto it = entries.find(key_of(id));
+        if (it == entries.end()) return {};
+        return it->second.key_images;
+    }
 
     // --- ITxSource -----------------------------------------------------------
     bool get_tx(const Hash& id, std::vector<std::uint8_t>& full_blob) override {

@@ -297,7 +297,66 @@ if (BUILD_TESTING)
         # --engine runs suites (A) RandomX vectors + (C) the real block 3,000,000
         # end-to-end verify; suite (B) arithmetic runs always.
         add_test(NAME xmr_randomx_verify_kat COMMAND xmr_randomx_verify_kat --engine)
+
+        # 10b) cpu-miner: the in-process RandomX CPU miner (../pow/xmr_cpu_miner.hpp).
+        #      Header-only, ORIGINAL c2pool code over the PUBLIC librandomx C API
+        #      (BSD-3) -- no xmrig / p2pool / monerod source is involved. The KAT
+        #      mines at an easy lane target in LIGHT mode and re-computes every
+        #      reported hash through the production LightVerifier, which is the
+        #      property that matters: the miner is a client of librandomx, not a
+        #      second implementation of it. Same RandomX gate as (10) -- a 256 MiB
+        #      cache for the miner plus the verifier's two, JIT/asm -- so it lives
+        #      inside XMR_BUILD_RANDOMX and is NOT built on the sanitizer leg.
+        add_executable(xmr_cpu_miner_kat
+            ${CMAKE_CURRENT_SOURCE_DIR}/xmr_cpu_miner_kat.cpp)
+        find_package(Threads REQUIRED)
+        target_link_libraries(xmr_cpu_miner_kat PRIVATE randomx Threads::Threads)
+        target_include_directories(xmr_cpu_miner_kat PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../pow
+            ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx)
+        target_compile_features(xmr_cpu_miner_kat PRIVATE cxx_std_20)
+        add_test(NAME xmr_cpu_miner_kat COMMAND xmr_cpu_miner_kat)
+
+        # 10c) fast-mode: --mine-fast (RANDOMX_FLAG_FULL_MEM + the ~2080 MiB
+        #      dataset) must produce the SAME hash as the light path for a fixed
+        #      input. Kept OUT of xmr_cpu_miner_kat deliberately: that one is a
+        #      256 MiB test that finishes in seconds, while this one allocates
+        #      ~2080 MiB and spends seconds building the dataset, so a host that
+        #      cannot afford it can drop this target without losing the light
+        #      coverage. The KAT degrades honestly -- if randomx_alloc_dataset()
+        #      returns null it prints SKIP and says in as many words that the
+        #      fast path was not exercised, rather than passing silently.
+        #      Non-sanitizer leg only, same as every other RandomX target.
+        add_executable(xmr_fast_mode_kat
+            ${CMAKE_CURRENT_SOURCE_DIR}/xmr_fast_mode_kat.cpp)
+        target_link_libraries(xmr_fast_mode_kat PRIVATE randomx Threads::Threads)
+        target_include_directories(xmr_fast_mode_kat PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../pow
+            ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/randomx)
+        target_compile_features(xmr_fast_mode_kat PRIVATE cxx_std_20)
+        add_test(NAME xmr_fast_mode_kat COMMAND xmr_fast_mode_kat)
+        # The dataset build dominates the runtime: give it room on a slow,
+        # shared runner rather than flaking on the default 1500 s ctest timeout.
+        set_tests_properties(xmr_fast_mode_kat PROPERTIES TIMEOUT 1800)
     endif()
+
+    # =========================================================================
+    # 11) msr-boost: the opt-in, root-gated MSR tuning (../pow/xmr_msr_boost.hpp).
+    #     OUTSIDE the XMR_BUILD_RANDOMX gate on purpose -- it links nothing, needs
+    #     no cache and no dataset, and the property it pins is a NEGATIVE: every
+    #     path that is not "an operator, as root, asked for this by name" writes
+    #     zero registers. That makes it cheap enough for BOTH build.yml legs, the
+    #     sanitizer one included, which is where a stray write would show up
+    #     loudest. The KAT never calls a path that could write an MSR, even if the
+    #     runner happens to be root -- it uses the dry-run door for anything that
+    #     would otherwise reach a device.
+    # =========================================================================
+    add_executable(xmr_msr_boost_kat
+        ${CMAKE_CURRENT_SOURCE_DIR}/xmr_msr_boost_kat.cpp)
+    target_include_directories(xmr_msr_boost_kat PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../pow)
+    target_compile_features(xmr_msr_boost_kat PRIVATE cxx_std_20)
+    add_test(NAME xmr_msr_boost_kat COMMAND xmr_msr_boost_kat)
 
     # =========================================================================
     # X9 OPTION B — whole-block settlement coinbase (consumer-tree; no consensus
@@ -306,18 +365,15 @@ if (BUILD_TESTING)
     # provided ONCE by the library and neither TU defines
     # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES (the ODR rule).
     #
-    # ci-allowlist-exempt: xmr_template_primitives_kat  -- heavy option-B leg (pulls the whole template port); NOT built in build.yml this wave, so it is guarded behind the OFF-by-default XMR_BUILD_OPTION_B_KATS option below. Library compile-coverage is still had at PR time via the c2pool-v37-xmr daemon target (which links xmr_template) on the non-san Linux leg; a later wave flips this option ON in build.yml.
-    # ci-allowlist-exempt: xmr_block_assembly_kat  -- heavy option-B leg (template + X6 settle + ref10 point-check); same gating as above.
-    #
-    # Both add_executable/add_test are gated behind XMR_BUILD_OPTION_B_KATS
-    # (default OFF, run locally with -DXMR_BUILD_OPTION_B_KATS=ON). Without this
-    # guard the add_test() below registers in every BUILD_TESTING build while the
-    # binaries are (deliberately) absent from build.yml's --target list, so ctest
-    # reports them ***Not Run and CTest exits 8 -- a red that is NOT a test
-    # failure. This mirrors the ltc_embedded_bootstrap_gate exempt idiom: exempt
-    # from the allowlist AND unregistered unless its own option is set.
+    # RUN-COVERAGE (#1543): both KATs are built + registered on the
+    # non-sanitizer Linux leg, which configures with -DXMR_BUILD_OPTION_B_KATS=ON
+    # and lists xmr_template_primitives_kat + xmr_block_assembly_kat in its
+    # `cmake --build --target` allowlist, so they are allowlisted, not exempt.
+    # The option still defaults OFF so a minimal local build (or the ASan leg,
+    # which leaves it OFF) does not register an add_test whose binary is
+    # absent -- that combination makes ctest report ***Not Run and exit 8.
     option(XMR_BUILD_OPTION_B_KATS
-           "Build the heavy X9 option-B XMR KATs (local; not in the CI --target allowlist)" OFF)
+           "Build the heavy X9 option-B XMR KATs (CI non-san leg passes this ON; default OFF for minimal local builds)" OFF)
     if (XMR_BUILD_OPTION_B_KATS)
         # (1) primitive seam byte-identity + template in-situ (component 1 + the leg).
         add_executable(xmr_template_primitives_kat xmr_template_primitives_kat.cpp)

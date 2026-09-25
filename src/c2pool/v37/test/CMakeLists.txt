@@ -305,6 +305,54 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_o2_finalize_connect_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_o2_finalize_connect_selfcheck PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_o2_finalize_connect_selfcheck COMMAND v37_xmr_o2_finalize_connect_selfcheck)
+    # v37_xmr_cba_native_booking_kat (D6a): the coinbase-authority booking reads
+    # lane blocks from the NATIVE chain index (xmr/xmr_cba_block_source.hpp), not
+    # monerod get_block -- a native hit makes 0 RPCs, a miss HOLDS (never a silent
+    # monerod fallback), the compare oracle counts but never decides -- and, end to
+    # end through FinalizeConnect, a not-yet-held block is retried then HELD, never
+    # refused. Same monerod-STUB shape as the finalize-connect selfcheck. SAME
+    # HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_cba_native_booking_kat v37_xmr_cba_native_booking_kat.cpp)
+    target_compile_features(v37_xmr_cba_native_booking_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_cba_native_booking_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_cba_native_booking_kat PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_cba_native_booking_kat COMMAND v37_xmr_cba_native_booking_kat)
+    # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
+    # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
+    # (R4 gate kept, repair continues), never refused on a retry count; two nodes
+    # whose repairs finish at different attempts end byte-identical; a DECIDED
+    # mismatch (credit-cut MISMATCH / lane-root-refused) is still refused. Same
+    # monerod-STUB shape. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml
+    # --target lists.
+    add_executable(v37_xmr_relay_repair_hold_kat v37_xmr_relay_repair_hold_kat.cpp)
+    target_compile_features(v37_xmr_relay_repair_hold_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_relay_repair_hold_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_relay_repair_hold_kat PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_relay_repair_hold_kat COMMAND v37_xmr_relay_repair_hold_kat)
+
+    # v37_xmr_relay_native_feed_kat (D6b): under --arm-order p2p-first the receipt
+    # relay's chain view (headers, tip, reorgs) is fed from the NATIVE chain
+    # index (xmr/relay/xmr_relay_chain_feed.hpp), not monerod
+    # get_block_headers_range / get_block_header_by_height: the notes
+    # equal the daemon arm's over the same chain (across an epoch edge), a
+    # same-height reorg re-notes at once, a missing seed/row is a counted skip,
+    # and the compare oracle only counts. Header-only. SAME HOLLOW-GREEN GUARD:
+    # listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_relay_native_feed_kat v37_xmr_relay_native_feed_kat.cpp)
+    target_compile_features(v37_xmr_relay_native_feed_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_relay_native_feed_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME v37_xmr_relay_native_feed_kat COMMAND v37_xmr_relay_native_feed_kat)
+    # v37_xmr_lane_suspend_selfcheck (R-C rework-2): the stratum side of LANE
+    # SUSPEND over a loopback socket -- the suspend EDGE withdraws the job
+    # (sessions dropped), a login while suspended is PARKED, the resume edge
+    # serves it. Stub template source + verifier: no RandomX, no monerod.
+    add_executable(v37_xmr_lane_suspend_selfcheck
+        v37_xmr_lane_suspend_selfcheck.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_lane_suspend_selfcheck PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_lane_suspend_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_lane_suspend_selfcheck PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_lane_suspend_selfcheck COMMAND v37_xmr_lane_suspend_selfcheck)
     # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
@@ -372,6 +420,155 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_m2_native_settlement_kat COMMAND v37_xmr_m2_native_settlement_kat)
 
     # ------------------------------------------------------------------
+    # R1 -- the on-chain credit cut (armed coinbase shape).
+    #
+    #   v37_xmr_credit_cut_kat
+    #     The consumer-tree KAT xmr_block_assembly.hpp names: static_asserts the
+    #     impl-tree parse bound CREDIT_CUT_TAIL_BYTES against credit::kTailBytes,
+    #     pins the 44-byte "V37C"|P|spine tail format, and builds the ARMED and
+    #     the UNARMED settlement coinbase from ONE fixture (monerod arm over the
+    #     captured C4 get_miner_data, no backlog => deterministic bytes): +44
+    #     exactly, one-byte 0x02 varint, r/R + 0x03 root + every vout byte-
+    #     identical, the cut reads back through the coinbase-authority decoder,
+    #     the K_fair shape gate accepts both, the per-extra_nonce patch never
+    #     touches the tail -- and the two miner_tx prefixes against a FROZEN
+    #     golden (the R1 coinbase-shape golden bump, operator-approved
+    #     2026-09-21; regenerate with V37_XMR_CREDIT_CUT_KAT_PRINT=1).
+    #     Same link shape + the same HOLLOW-GREEN GUARD as M2 above (listed in
+    #     BOTH build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_credit_cut_kat
+        v37_xmr_credit_cut_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_credit_cut_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_credit_cut_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_credit_cut_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_credit_cut_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_credit_cut_kat COMMAND v37_xmr_credit_cut_kat)
+
+    # ------------------------------------------------------------------
+    # The v36 fee model on the XMR lane (xmr/xmr_fee_model.hpp).
+    #
+    #   v37_xmr_fee_model_kat
+    #     The donation address (CN base58 + keccak checksum) == the pinned
+    #     (B, A) constants; give-author as a receipt-carried u16 folded by an
+    #     exact two-push weight split (two nodes with different give-author %
+    #     fold a shared stream identically -> byte-identical miner_tx); the
+    #     node-owner fee as identity substitution at receipt mint; the
+    #     MANDATORY 1-piconero donation marker + donation residual sink on real
+    #     assembled blocks (C4 capture), exact-sum, and REFUSE-IF-ABSENT on both
+    #     the serve property and the receive-side booking. No finder output.
+    #     Same link shape + HOLLOW-GREEN GUARD as the credit-cut KAT above
+    #     (listed in BOTH build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_fee_model_kat
+        v37_xmr_fee_model_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_fee_model_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_fee_model_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_fee_model_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_fee_model_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_fee_model_kat COMMAND v37_xmr_fee_model_kat)
+
+    # ------------------------------------------------------------------
+    # GAP-2 stage 1 -- the real c2pool-to-c2pool XMR receipt relay
+    # (src/c2pool/v37/xmr/relay/, docs/xmr-lane/gap2-sharechain-relay-design.md).
+    #
+    #   xmr_relay_wire_kat          FB_HELLO/FB_RECEIPTS/FB_BLOCK_WON goldens,
+    #                               total/bounded decoders, namespace pins,
+    #                               side_data_v2 / rbind / lane_params_digest
+    #                               goldens, base58 address decode.
+    #   xmr_receipt_bind_v2_kat     mint -> structural check; every tamper is
+    #                               caught before RandomX; the exact PoW rule;
+    #                               REAL RandomX grind + verify under
+    #                               XMR_BUILD_RANDOMX (skipped otherwise).
+    #   v37_xmr_relay_multinode_kat three nodes over loopback TCP: HELLO gate,
+    #                               flood + dedup, canonical digests, reconnect
+    #                               backfill (GETORDER/GETFRAMES), winner-order
+    #                               repair, DoS (unknown opcodes kept, structural
+    #                               strike without RandomX, ban on invalid PoW).
+    #   v37_xmr_relay_repair_ctx_kat the relay-repair defect: a winner-side
+    #                               order holding receipts mined on an ORPHANED
+    #                               Monero block the repairing node never saw
+    #                               (never Ready pre-fix); FB_GETCTX/FB_CTX
+    #                               codec, verify_block_ctx, bounded retries +
+    #                               failover, reconnect, recursive resolution,
+    #                               a lying context rejected.
+    #   v37_xmr_relay_native_ctx_kat RC-CTX: on the P2P-first arm a receipt's
+    #                               Monero context resolves from the embedded
+    #                               native node (best-chain rows, retained and
+    #                               alternative bodies), FB_GETCTX is served
+    #                               from native bodies, and issued-template
+    #                               contexts survive a restart (journal).
+    #   v37_xmr_relay_fd_kat        RELAY-FD: a dropped relay connection
+    #                               releases its descriptor (a partition no
+    #                               longer leaks one per redial), unwound
+    #                               readers are reaped, the accept loop backs
+    #                               off on EMFILE and the relay heals after a
+    #                               partition_for().
+    # ------------------------------------------------------------------
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat)
+        add_executable(${_gap2_kat}
+            ${_gap2_kat}.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+        target_compile_features(${_gap2_kat} PRIVATE cxx_std_20)
+        target_include_directories(${_gap2_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+        target_compile_definitions(${_gap2_kat} PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+        target_link_libraries(${_gap2_kat} PRIVATE xmr_coin Threads::Threads)
+        add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
+    endforeach()
+    # ------------------------------------------------------------------
+    # SEAM-1 (rbind in the coinbase 0x02 region) + fee-model rulings S3/S4.
+    #
+    #   v37_xmr_fee_rbind_kat
+    #     real assembled templates with a per-job binder: payload =
+    #     [extra_nonce | rbind 32 | pad | tail], canonical re-derivation, the
+    #     patched Keccak fast path == a full re-hash, no binder => byte-
+    #     identical; relay mint -> check_structural(rbind) accepts, every
+    #     payee / give-author / cross-job swap refused at Bind; S3 ingest
+    #     (different give-author % -> identical lanes, donation == sum of the
+    #     receipts' u16, gate OFF = master, durable reload); S4 digest fold
+    #     (OFF keeps master's golden, ON refuses at HELLO); Family-A
+    #     WorkEvent::donation PoW-committed. Listed in BOTH build.yml
+    #     --target lists.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_fee_rbind_kat
+        v37_xmr_fee_rbind_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_fee_rbind_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_fee_rbind_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_fee_rbind_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_fee_rbind_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_fee_rbind_kat COMMAND v37_xmr_fee_rbind_kat)
+
+    if (XMR_BUILD_RANDOMX AND TARGET randomx)
+        target_link_libraries(xmr_receipt_bind_v2_kat PRIVATE randomx)
+        target_include_directories(xmr_receipt_bind_v2_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+        target_compile_definitions(xmr_receipt_bind_v2_kat PRIVATE GAP2_WITH_RANDOMX)
+    endif()
+
+    # ------------------------------------------------------------------
     # M3 — R-ARMORDER, the switchable FIND path.
     #
     #   v37_xmr_m3_arm_order_kat
@@ -403,6 +600,68 @@ if (BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
     target_link_libraries(v37_xmr_m3_arm_order_kat PRIVATE xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_m3_arm_order_kat COMMAND v37_xmr_m3_arm_order_kat)
+
+    # ------------------------------------------------------------------
+    # --native-solo -- the FULLY self-contained (peerless, daemonless) find.
+    #
+    #   v37_xmr_daemonless_selfmine_kat
+    #     M3 removed the daemon from the find path but not the NETWORK: the
+    #     genesis blob was asked for over levin, and a found block was booked
+    #     only once a peer had received it. This pins the two seams that remove
+    #     the last peer -- the locally assembled genesis blob (checked by the
+    #     SAME id gate the wire path uses, against monerod's own captured bytes)
+    #     and the publisher's opt-in own-index booking -- together with every
+    #     place they must still refuse: a flipped nonce byte, a foreign genesis,
+    #     an index that said no, a disabled RandomX gate, and solo on any
+    #     network but regtest.
+    #
+    #     The load-bearing NEGATIVE is that solo OFF is unchanged: zero peers
+    #     still books nothing, whatever our own index did. Without that case,
+    #     turning solo on would be indistinguishable from removing the gate.
+    #
+    #     No sockets, no daemon, no RandomX, no threads.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_daemonless_selfmine_kat v37_xmr_daemonless_selfmine_kat.cpp)
+    target_compile_features(v37_xmr_daemonless_selfmine_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_daemonless_selfmine_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_daemonless_selfmine_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_daemonless_selfmine_kat COMMAND v37_xmr_daemonless_selfmine_kat)
+
+    # ------------------------------------------------------------------
+    # The daemonless publish arm when the first push reaches NOBODY.
+    #
+    #   v37_xmr_p2p_publish_retry_kat
+    #     A found block whose 2008 reached no peer used to be counted and
+    #     dropped. It is now parked and re-announced on a bounded backoff from
+    #     the relay's retained book: the first re-announce that reaches a peer
+    #     pushes THE FoundBlockEvent (exactly once), a block our own best chain
+    #     no longer carries is dropped without another frame, and one that runs
+    #     out of attempts or window is ABANDONED at ERROR -- never booked. Solo,
+    #     refused blocks and first-time deliveries are pinned unchanged.
+    #
+    #     Injected clock; no sockets, no daemon, no RandomX, no threads.
+    #
+    #     SAME HOLLOW-GREEN GUARD: ALSO listed in BOTH build.yml `--target`
+    #     lists (Linux x86_64 and ASan+UBSan), or ctest reports "***Not Run".
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_p2p_publish_retry_kat v37_xmr_p2p_publish_retry_kat.cpp)
+    target_compile_features(v37_xmr_p2p_publish_retry_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_p2p_publish_retry_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_p2p_publish_retry_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_p2p_publish_retry_kat COMMAND v37_xmr_p2p_publish_retry_kat)
 
     # ------------------------------------------------------------------
     # c2pool#1551 -- the SAME-HEIGHT double-block refusal, decided prefer-own
@@ -438,6 +697,94 @@ if (BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
     target_link_libraries(v37_xmr_prefer_own_race_kat PRIVATE xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_prefer_own_race_kat COMMAND v37_xmr_prefer_own_race_kat)
+
+    # ------------------------------------------------------------------
+    # MAINNET READINESS -- the pool binary's own native-node plumbing.
+    #
+    #   v37_xmr_mainnet_readiness_kat
+    #     Three knobs the embedded node has always had were unreachable from
+    #     c2pool-v37-xmr, each in the same way: the node field existed, the
+    #     standalone xmr_native_node tool exposed it, and the pool binary's argv
+    #     loop had no arm for it -- so the flag was not a flag and the default
+    #     happened instead. This KAT pins the PARSE and the FORWARD as the one
+    #     code path the daemon actually runs on:
+    #
+    #       A  apply_native_node_flag(): the three gate 4 window flags,
+    #          --native-seeds/--seeds and the snapshot pair parse; absent flags
+    #          leave the node's own defaults; a malformed one (no value, not a
+    #          number, or a zero that would disarm gate 4) REFUSES.
+    #       B  native_template_config_of(): every parsed knob arrives in
+    #          NativeTemplateConfig, the defaults are equal to
+    #          AnchorConfirmConfig's own so the two sets cannot drift, and NO
+    #          configuration -- including a hand-zeroed one built in code --
+    #          forwards a confirm config that is not sane().
+    #       C  the mainnet seed sets: four DNS seed hosts on 18080 (monerod
+    #          guards them with `if MAINNET`, and so do we), the two test
+    #          networks correctly with none, and --seeds accepted as an address
+    #          source for the p2p-first precondition.
+    #       D  the snapshot's DISK half (node/xmr_chain_snapshot_store.hpp):
+    #          save -> envelope -> temp+rename write -> read -> decode -> load
+    #          round-trips an index to the same tip, frontier and template
+    #          inputs, and every corruption -- short, tampered, truncated,
+    #          foreign network, foreign anchor, wrong magic, wrong version,
+    #          lying length -- is REFUSED so the node stays on its anchor boot.
+    #       E  gate 4 is STILL fail-closed through that config: a tampered
+    #          anchor id cannot be confirmed by the genuine block, the forwarded
+    #          peer bound is the bound that is enforced, and the deadline
+    #          refuses. There is no flag that turns the gate off.
+    #
+    #     The index codec itself is xmr_native_chain_index_kat's and gate 4's
+    #     blob-level judgement is xmr_native_anchor_gate4_kat's; this file is
+    #     about the wiring between them and the pool binary. No sockets, no
+    #     daemon, no RandomX.
+    #
+    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
+    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
+    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
+    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_mainnet_readiness_kat v37_xmr_mainnet_readiness_kat.cpp)
+    target_compile_features(v37_xmr_mainnet_readiness_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_mainnet_readiness_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_mainnet_readiness_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    if (TARGET Boost::headers)
+        target_link_libraries(v37_xmr_mainnet_readiness_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(v37_xmr_mainnet_readiness_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(v37_xmr_mainnet_readiness_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME v37_xmr_mainnet_readiness_kat COMMAND v37_xmr_mainnet_readiness_kat)
+
+    # D6d -- v37_xmr_d6d_native_seed_tip_kat
+    #   Under --arm-order p2p-first the embedded native node is the tip, the
+    #   RandomX seed (hash + height, 2048-block epochs, 64-block lag) and the
+    #   difficulty/height source, so it is handed NO monerod endpoint unless
+    #   --native-parity-monerod opts the C6 parity judge back in as a
+    #   compare-only oracle. Pins the forward (native_template_config_of), the
+    #   wire (a started NativeTemplateBackend driven through the status cadence
+    #   against a counting fake monerod: p2p-first = 0 requests; daemon-first and
+    #   the explicit judge = the get_miner_data/get_info/get_last_block_header
+    #   trio every tick) and the seed-epoch arithmetic the index keys on. No
+    #   hashing, no real daemon, no peers; listed in both build.yml --target lists.
+    add_executable(v37_xmr_d6d_native_seed_tip_kat v37_xmr_d6d_native_seed_tip_kat.cpp)
+    target_compile_features(v37_xmr_d6d_native_seed_tip_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_d6d_native_seed_tip_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_d6d_native_seed_tip_kat PRIVATE xmr_node xmr_native_txpool xmr_coin Threads::Threads)
+    if (TARGET Boost::headers)
+        target_link_libraries(v37_xmr_d6d_native_seed_tip_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(v37_xmr_d6d_native_seed_tip_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(v37_xmr_d6d_native_seed_tip_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME v37_xmr_d6d_native_seed_tip_kat COMMAND v37_xmr_d6d_native_seed_tip_kat)
 
     # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.
     # Proves the gap the Phase-B single-node daemon had: node B accounts node A's
@@ -550,6 +897,22 @@ if (BUILD_TESTING)
     target_link_libraries(v37_s1c_convergence_kat Threads::Threads)
     add_test(NAME v37_s1c_convergence_kat COMMAND v37_s1c_convergence_kat)
 
+    # STEP-0 hotfix -- k_floor is a LaneParam (src/sharechain/v37/v37_lane.hpp
+    # LaneParams::k_floor). The W5 no-dust floor decides the canonical coinbase,
+    # so it is consensus: it used to be a node-code literal in btc_node.hpp (a
+    # silent owed_digest fork vector). The KAT pins: the constants (f_ref = 10,
+    # neutral 0), the digest-neutral-at-zero lane digest against the PRE-hotfix
+    # golden, the KFL1 commitment in the lane digest and the roundabout lane
+    # tag, the explicit S-1c refusal (cut_digest_mismatch) of a peer on another
+    # floor, identical coinbases on the same floor, and the floor being
+    # load-bearing over one ledger. Stdlib + Threads, MockCoinBackend +
+    # MemSettleStore. ALSO on BOTH build.yml --target lists (hollow-green rule).
+    add_executable(v37_kfloor_laneparam_kat v37_kfloor_laneparam_kat.cpp)
+    target_compile_features(v37_kfloor_laneparam_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_kfloor_laneparam_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_kfloor_laneparam_kat Threads::Threads)
+    add_test(NAME v37_kfloor_laneparam_kat COMMAND v37_kfloor_laneparam_kat)
+
     # Track A2 / W4-W6 — the OWED-EVENT MMR: an append-only authenticated record
     # log (src/c2pool/v37/record_log.hpp, instanced by owed_event_log.hpp) built
     # on the SHIPPED ::v37::Lane MMR statics, maintained inside OwedLedger, made
@@ -567,6 +930,80 @@ if (BUILD_TESTING)
     # Stdlib + Threads (w4 pulls in v37_engine). SAME HOLLOW-GREEN GUARD as the
     # sibling suites: ALSO listed on BOTH build.yml --target lists so CI compiles
     # + runs it, not a NOT_BUILT CTest sentinel.
+    # Track A2 CONSUMER-tree relay ROBUSTNESS — the bounded carrier RE-OFFER
+    # (a carrier that reached no peer is re-offered when a peer (re)connects, and
+    # is admitted EXACTLY ONCE because W2's dedup window refuses the duplicate:
+    # REJECT_DEDUP, zero pushes, next_pos / raw_total / lane digest / owed_digest
+    # byte-identical) and the PER-DESCRIPTOR write lock in carrier_net.hpp (a peer
+    # that stopped reading no longer stalls the send to every other peer, and
+    # concurrent writers never interleave a frame on one connection). Both halves
+    # are DELIVERY-side: no PoW, no descriptor, no lane order, no digest, and no
+    # wire-version change. It also pins the horizon bound that keeps a re-offer
+    # inside the W2 dedup window — the only way a re-offer could ever become a
+    # second credit. stdlib + POSIX sockets + Threads. SAME HOLLOW-GREEN GUARD as
+    # the sibling suites: ALSO listed on BOTH build.yml --target lists (the Linux
+    # x86_64 leg and the ASan+UBSan leg) so CI compiles + RUNS it instead of
+    # registering a NOT_BUILT CTest sentinel (the DGB #137 / #769 / c2pool#1539
+    # unregistered-KAT class), and audited by the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_carrier_relay_robustness_kat v37_carrier_relay_robustness_kat.cpp)
+    target_compile_features(v37_carrier_relay_robustness_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_carrier_relay_robustness_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_carrier_relay_robustness_kat Threads::Threads)
+    add_test(NAME v37_carrier_relay_robustness_kat COMMAND v37_carrier_relay_robustness_kat)
+
+    # Track A2 / STAGE 1 SUPPLY - the unified bounded FrameVault (ONE store of
+    # verbatim carrier frames, indexed by lane POSITION and by carrier hash,
+    # retained to the lane WINDOW horizon, with the c2pool#1655 re-offer riding
+    # it as a shallow recent sub-view) plus the >= 0x80 CONTROL OPCODE channel
+    # (GETORDER-at-cut / ORDER / GETFRAMES / FRAMES) demuxed in carrier_net.hpp
+    # BEFORE handle_inbound. It pins: the (chain, pos) -> carrier-hash index that
+    # exists nowhere else in the tree; a serve -> fetch -> verify round-trip over
+    # real sockets returning the exact ordered ids and the exact bytes; a LYING
+    # peer (right id, wrong bytes) fail-closed on the recomputed hash; a MISSING
+    # id fail-closed; a silent peer bounded by request_timeout; the vault entry /
+    # byte / window-horizon caps and the per-peer token bucket; a flapping peer
+    # that cannot evict another peer's retained bytes; and backward tolerance in
+    # BOTH directions - an OLD peer (the verbatim pre-Stage-1 reader loop,
+    # reproduced over a raw socket) meets an opcode, answers REJECT_BAD_VERSION,
+    # KEEPS the socket and admits the very next carrier. It also proves ZERO
+    # consensus movement: the opcodes are absent from kAcceptedVersions, the
+    # frozen v0x01 / v0x02 encodings are byte-identical, and a full round-trip
+    # moves neither lane digest nor owed_digest. SUPPLY ONLY - nothing here
+    # admits a fetched frame or folds (that is Stage 2). stdlib + POSIX sockets
+    # + Threads. SAME HOLLOW-GREEN GUARD as the sibling suites: ALSO listed on
+    # BOTH build.yml --target lists (the Linux x86_64 leg and the ASan+UBSan leg)
+    # so CI compiles + RUNS it instead of registering a NOT_BUILT CTest sentinel
+    # (the DGB #137 / #769 / c2pool#1539 unregistered-KAT class), and audited by
+    # the src/c2pool/**/test/ drift-guard.
+    add_executable(v37_convergence_supply_kat v37_convergence_supply_kat.cpp)
+    target_compile_features(v37_convergence_supply_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_convergence_supply_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_convergence_supply_kat Threads::Threads)
+    add_test(NAME v37_convergence_supply_kat COMMAND v37_convergence_supply_kat)
+
+    # ── Track A2 / Stage 2 APPLY: the repair at the cut-miss arm ────────────
+    # v37_convergence_apply_kat stands up TWO in-process nodes on a real socket
+    # transport, drops ONE of the winner's shares on the second node, and proves
+    # (a) the pre-Stage-2 DEFECT (cut_miss -> REFUSED -> owed(A) != owed(B)),
+    # (b) that a REPLAY of the winner's own ordered records, fetched over the
+    #     Stage-1 supply channel and gated on the winner's own cut_spine_digest,
+    #     lets the S3 re-drive fold E_b at that exact prefix so the two
+    #     owed_digests become BYTE-EQUAL across the settling block, and
+    # (c) that a repair which cannot verify still REFUSES and moves owed by zero,
+    #     and (d, CA-9) that a SECOND distinct refused win armed while a repair is
+    #     in flight against the ONE peer that can serve it neither orphans nor
+    #     zombies that repair: the live job keeps its peer binding, the second cut
+    #     is QUEUED and re-armed when the peer falls free, and BOTH blocks credit.
+    # Consumer tree only: settle::fold_eb and OwedLedger::owed_digest() are
+    # untouched and no frozen wire golden moves. stdlib + POSIX sockets +
+    # Threads. SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed on BOTH
+    # build.yml --target lists so CI compiles AND runs it.
+    add_executable(v37_convergence_apply_kat v37_convergence_apply_kat.cpp)
+    target_compile_features(v37_convergence_apply_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_convergence_apply_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_convergence_apply_kat Threads::Threads)
+    add_test(NAME v37_convergence_apply_kat COMMAND v37_convergence_apply_kat)
+
     add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)
     target_compile_features(v37_owed_event_mmr_kat PRIVATE cxx_std_20)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -766,4 +1203,25 @@ if (BUILD_TESTING)
     target_link_libraries(v37_drops_arity1_activation_kat_livegeom Threads::Threads)
     add_test(NAME v37_drops_arity1_activation_kat_livegeom
              COMMAND v37_drops_arity1_activation_kat_livegeom)
+
+    # V37 roundabout split S1-S5 (NEW standalone modules under
+    # src/c2pool/v37/roundabout/): their KATs live beside the headers and are
+    # pulled in here with an explicit binary dir, so src/c2pool/CMakeLists.txt
+    # stays untouched. SAME HOLLOW-GREEN GUARD: every v37_rb_* target is ALSO on
+    # BOTH build.yml --target lists.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/roundabout/test
+                     ${CMAKE_CURRENT_BINARY_DIR}/roundabout)
+
+    # V37 payout economics (NEW standalone modules under src/c2pool/v37/payout/):
+    # KATs beside the headers, pulled in with an explicit binary dir. SAME
+    # HOLLOW-GREEN GUARD: every v37_payout_* target is ALSO on BOTH build.yml
+    # --target lists.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/payout/test
+                     ${CMAKE_CURRENT_BINARY_DIR}/payout)
+
+    # V37 payout economics — CarriageGate + FeeFloorGate KAT (its own test dir
+    # beside the header, src/c2pool/v37/payout/carriage.hpp). SAME HOLLOW-GREEN
+    # GUARD: v37_payout_carriage_kat is ALSO on BOTH build.yml --target lists.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/payout/carriage/test
+                     ${CMAKE_CURRENT_BINARY_DIR}/payout_carriage)
 endif()

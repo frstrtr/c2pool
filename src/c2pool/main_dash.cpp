@@ -493,6 +493,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
         << "           [--embedded-fold-checkscripts]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
+        << "           [--control-plane-token-file FILE]\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -1379,11 +1380,32 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // ── Control-plane M1 (SAFE): install the READ-ONLY config endpoints.
         // The lambdas read the immutable snapshot published in main() (before
         // run_node) at request time, so install order is irrelevant. No node
-        // state is touched. POST /api/config/apply stays inert (503) in
-        // http_session.cpp — runtime mutation is operator-gated, not armed.
+        // state is touched. POST /api/config/apply is WIRED just below (Slice
+        // A/B) but stays fail-closed: it answers 503 {"armed":false} until an
+        // operator registers a loopback control token (none is registered here),
+        // and money-path keys additionally require the two-phase money nonce.
         mi->set_config_fns(
             []() { return c2pool::config_endpoint::resolved_config_json(); },
             []() { return c2pool::config_endpoint::catalog_schema_json(); });
+
+        // #157 Slice A/B: wire the LIVE gated-apply path for POST
+        // /api/config/apply. This installs the plumbing ONLY -- the endpoint
+        // stays fail-closed: config_endpoint::apply_config() answers 503
+        // {"armed":false} until an operator registers a loopback control token
+        // (nothing here registers one). Money-path keys (Mut::MONEY_*, which now
+        // includes embedded.tx_inject -- the tx-injection arm) additionally
+        // require the two-phase money nonce bound to the exact diff + the M0
+        // tripwire. The lambda is capture-free (apply_config is process-global);
+        // the runtime setter that actually flips node state is registered on the
+        // ParamApplier next to the node_coin_state arm (Slice B, below).
+        mi->set_config_apply_fn(
+            [](const std::string& body) -> nlohmann::json {
+                auto req  = c2pool::config_endpoint::parse_apply_request(body);
+                auto resp = c2pool::config_endpoint::apply_config(req);
+                auto j    = resp.to_json();
+                j["http_status"] = resp.http_status;   // http_session maps to wire status
+                return j;
+            });
 
         // ── Peer-info liveness: serialize the HTTP-cache rebuild onto the
         // io_context thread (main_ltc.cpp parity). Once the io_context is wired,
@@ -2748,36 +2770,144 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // transaction, which is exactly the case that costs a whole block.
     node_coin_state.set_serve_mempool_txs(embedded_serve_mempool_txs);
     // #157 (--embedded-tx-inject): arm the opt-in miner/user tx-injection lane.
-    // Default OFF; the actual local submits happen after the mempool + the
-    // consensus-exact script check are wired (see --embedded-tx-inject-hex).
-    node_coin_state.set_tx_inject_enabled(embedded_tx_inject);
-    // #157 M2 (peer tx-injection over the sharechain p2p): install the sink the
-    // tx_inject HANDLER routes a peer's tx through. It MUST target THIS
-    // node_coin_state (the armed one) — NodeImpl::m_coin_state is a different
-    // object that main_dash never arms, so a handler calling m_coin_state would
-    // fail-closed forever. Flag OFF ⇒ a NULL sink ⇒ the handler ignores every
-    // tx_inject (belt), and submit_inject would refuse anyway (suspenders).
+    // Slice B routes the ARM through TWO places that MUST move together, so a
+    // runtime arm (via POST /api/config/apply -> the ParamApplier setter below)
+    // behaves exactly like a startup arm:
+    //   (1) node_coin_state.set_tx_inject_enabled() -- the M1 submit gate; and
+    //   (2) p2p_node.set_tx_inject_sink() -- the sink the peer tx_inject HANDLER
+    //       routes a peer tx through. It MUST target THIS node_coin_state (the
+    //       armed one); NodeImpl::m_coin_state is a different object main_dash
+    //       never arms, so a handler calling it would fail-closed forever. If a
+    //       runtime arm flipped only (1) and not (2), peer tx_inject frames
+    //       would be SILENTLY ignored (review finding). So arm/disarm is a
+    //       single closure that always moves both, and disarm clears the sink.
     // node_coin_state and p2p_node both live in run_node scope; node_coin_state
     // (declared later) is destroyed first, but only AFTER ioc.run() returns, so
     // no dispatch can reach a dangling ref. Reward-safe: transport only.
+    auto arm_tx_inject = [&node_coin_state, &p2p_node](bool on) {
+        node_coin_state.set_tx_inject_enabled(on);
+        if (on) {
+            // #157 M3: peer-origin sink -- charges the aggregate-PEER rate budget
+            // so a peer flood can never starve the operator's own local inject
+            // (M3 anti-starvation split preserved). Built through the SHARED
+            // make_peer_inject_sink helper so the KAT guards this exact shape --
+            // a dropped Peer origin arg fails the test, not just review.
+            p2p_node.set_tx_inject_sink(
+                dash::coin::make_peer_inject_sink(node_coin_state));
+        } else {
+            p2p_node.set_tx_inject_sink(nullptr);   // disarm clears the sink too
+        }
+    };
+    arm_tx_inject(embedded_tx_inject);
+    // #157 Slice B (design F13): warn (log-only, never blocks) when the arm is
+    // ON while the web dashboard binds a non-loopback address. The tx-inject
+    // control-plane stays loopback-only, but the operator should SEE the
+    // combination and review the reverse-proxy/firewall posture off-box.
+    if (embedded_tx_inject && web_port != 0 &&
+        web_host != "127.0.0.1" && web_host != "localhost" && web_host != "::1") {
+        LOG_WARNING << "[run] #157 embedded-tx-inject ARMED while the web "
+                       "dashboard binds a non-loopback address (" << web_host
+                    << ":" << web_port << "). The tx-inject control-plane stays "
+                       "loopback-only; review your reverse-proxy/firewall so "
+                       "/api/tx-inject/* and /api/config/apply are never exposed "
+                       "off-box.";
+    }
     if (embedded_tx_inject) {
-        p2p_node.set_tx_inject_sink(
-            [&node_coin_state](const dash::coin::MutableTransaction& tx,
-                               uint32_t flags, int32_t expiry_height) {
-                // #157 M3: peer-origin — charge the aggregate-PEER rate budget so
-                // a peer flood cannot starve the local operator's own inject.
-                return node_coin_state.submit_inject(
-                    tx, flags, expiry_height,
-                    dash::coin::NodeCoinState::InjectOrigin::Peer);
-            });
         std::cout << "[run] embedded-tx-inject ARMED (#157): miner/user tx-injection "
-                     "ON — submitted txs ride the block with priority through the "
+                     "ON -- submitted txs ride the block with priority through the "
                      "SAME validity gate; reward path byte-unchanged. Requires "
                      "--embedded-fold-checkscripts + the served-body posture. M2 "
                      "peer tx_inject transport is live (first-see fan-out, "
                      "per-peer DoS guard).\n";
-    } else {
-        p2p_node.set_tx_inject_sink(nullptr);   // explicit: feature dormant
+    }
+
+    // #157 Slice B: register the runtime ARM setter on the process-global
+    // ParamApplier. embedded.tx_inject is a MONEY-path key (param_catalog.inc),
+    // so apply_config admits a change to it ONLY behind the loopback control
+    // token + the two-phase money nonce (bound to the exact diff) + the M0
+    // tripwire, then invokes THIS setter to flip the runtime arm (both the M1
+    // gate AND the p2p sink, via arm_tx_inject). The setter runs on the node
+    // io_context (apply_config is dispatched there by thread_safe_wrap), so the
+    // IO-confined arm/sink state is mutated only on the strand the node runs on.
+    // Reward path untouched: arming only changes WHICH consensus-valid body txs
+    // may be offered, never the coinbase/subsidy/PPLNS/payee computation.
+    c2pool::config_endpoint::applier().register_setter(
+        "embedded.tx_inject",
+        [arm_tx_inject](const std::string& value) -> bool {
+            std::string v;
+            for (char c : value) v.push_back(static_cast<char>(std::tolower(
+                static_cast<unsigned char>(c))));
+            const bool on = (v == "true" || v == "1" || v == "on" || v == "yes");
+            arm_tx_inject(on);
+            return true;
+        });
+
+    // #157 Slice B: POST /api/tx-inject/submit -- loopback-only raw-tx submit to
+    // the armed M1 gate. thread_safe_wrap posts this onto the node io_context
+    // (review finding: submit_inject / m_inject_pool are IO-thread-confined
+    // and lock-free, so the submit MUST NOT run on the WEB thread). submit_inject
+    // itself refuses ("inject-disabled") while the arm is OFF, so a disarmed node
+    // never injects. It does NOT modify the submit_inject validity gate -- it
+    // only calls it. Reward-safe: an inject is an ordinary block-body tx.
+    if (web_server) {
+        // #157 Slice B (brief item 6): the submit fn marshals onto the node
+        // io_context via thread_safe_wrap, so set_io_context() MUST already have
+        // run -- it does, at web-server standup above, before web_server->start().
+        // HARD runtime check (NOT assert): were the io_context ever unwired when
+        // the submit fn installs, thread_safe_wrap would run submit_inject INLINE
+        // on the web thread -> a data race on the IO-confined m_inject_pool. Fail
+        // loudly in release too rather than silently racing under NDEBUG.
+        if (!web_server->get_mining_interface()->has_io_context())
+            throw std::runtime_error(
+                "tx-inject submit fn installed before io_context wired: "
+                "set_io_context() must precede web_server->start() so the submit "
+                "marshals onto the node strand and never races m_inject_pool");
+        web_server->get_mining_interface()->set_tx_inject_submit_fn(
+            [&node_coin_state](const std::string& body) -> nlohmann::json {
+                nlohmann::json req = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+                if (!req.is_object() || !req.contains("raw_tx") || !req["raw_tx"].is_string())
+                    return nlohmann::json{{"ok", false}, {"cause", "missing raw_tx hex"},
+                                          {"http_status", 400}};
+                std::string hex = req["raw_tx"].get<std::string>();
+                hex.erase(std::remove_if(hex.begin(), hex.end(),
+                              [](unsigned char c) { return std::isspace(c); }), hex.end());
+                if (hex.empty() || hex.size() % 2 != 0 ||
+                    !std::all_of(hex.begin(), hex.end(),
+                                 [](unsigned char c) { return std::isxdigit(c) != 0; }))
+                    return nlohmann::json{{"ok", false}, {"cause", "raw_tx must be even-length hex"},
+                                          {"http_status", 400}};
+                uint32_t flags  = 0;
+                int32_t  expiry = 0;
+                if (req.contains("flags") && req["flags"].is_number_unsigned())
+                    flags = req["flags"].get<uint32_t>();
+                if (req.contains("expiry_height") && req["expiry_height"].is_number_integer())
+                    expiry = req["expiry_height"].get<int32_t>();
+                dash::coin::MutableTransaction tx;
+                try {
+                    auto raw = ParseHex(hex);
+                    PackStream ps(raw);
+                    ps >> tx;
+                } catch (const std::exception& e) {
+                    return nlohmann::json{{"ok", false},
+                                          {"cause", std::string("tx parse failed: ") + e.what()},
+                                          {"http_status", 400}};
+                }
+                // #157 Slice B: an operator's own loopback submit draws on the
+                // LOCAL inject budget (InjectOrigin::Local) -- its own reserved
+                // rate, never the aggregate-peer budget a flood can exhaust.
+                auto r = node_coin_state.submit_inject(
+                    tx, flags, expiry,
+                    dash::coin::NodeCoinState::InjectOrigin::Local);
+                // inject-disabled (arm OFF) -> 409; other named refusals -> 422.
+                const int http = r.ok ? 200 : (r.cause == "inject-disabled" ? 409 : 422);
+                return nlohmann::json{
+                    {"ok",          r.ok},
+                    {"cause",       r.cause},
+                    {"txid",        r.txid.GetHex()},
+                    {"armed",       node_coin_state.tx_inject_enabled()},
+                    {"http_status", http},
+                };
+            });
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
     // dashd's miner refuses any not-yet-islocked tx with vins younger than 10
@@ -4968,6 +5098,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     s["header_height"] = hh;
                     s["target_height"] = th;
                     s["peers"] = std::move(peers);
+                    // #940 D-EMB.940: dial-reachability block. Distinguishes
+                    // connected (>=1 handshaked peer -- empty view = just
+                    // started), dial_failing (0 reachable + dial failures = the
+                    // embedded arm cannot reach the Dash network), and idle (no
+                    // dials attempted). Derived DASH-side so core/web_server
+                    // stays coin-agnostic; core passes s["coin_p2p"] through.
+                    {
+                        const int connected  = cp ? static_cast<int>(cp->connected_peer_count()) : 0;
+                        const int handshaked = cp ? static_cast<int>(cp->handshaked_peer_count()) : 0;
+                        const int dialing    = cp ? static_cast<int>(cp->dialing_count()) : 0;
+                        const uint64_t failures = cp ? cp->dial_failures() : 0;
+                        const bool reachable = handshaked > 0;
+                        std::string state;
+                        if (!cp)                               state = "disabled";
+                        else if (reachable)                    state = "connected";
+                        else if (failures > 0)                 state = "dial_failing";
+                        else if (connected > 0 || dialing > 0) state = "connecting";
+                        else                                   state = "idle";
+                        s["coin_p2p"] = {
+                            {"state", state},
+                            {"network_reachable", reachable},
+                            {"connected_peers", connected},
+                            {"handshaked_peers", handshaked},
+                            {"dialing", dialing},
+                            {"dial_failures", failures},
+                            {"last_dial_failed_unix", cp ? cp->last_dial_failed_unix() : (int64_t)0},
+                            {"last_dial_ok_unix", cp ? cp->last_dial_ok_unix() : (int64_t)0},
+                        };
+                        // Satisfy rest_local_stats's existing numeric
+                        // connected_peers check (it already looks for this key).
+                        s["connected_peers"] = connected;
+                    }
                     return s;
                 });
         }
@@ -7554,6 +7716,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     auto e = hc->get_header_by_height(h);
                     if (!e) return std::nullopt;
                     return e->hash;
+                });
+            // dashd nStallingSince (net_processing.cpp FindNextBlocksToDownload +
+            // the SendMessages 2s adaptive disconnect-on-stall). Tag the
+            // FRONT-OF-ORDERED-WINDOW block (the fold cursor's next height) as the
+            // head-of-line body so the fetch layer disconnects its slow carrier on
+            // the FIRST stall and re-homes JUST that block to the fastest-
+            // delivering NODE_NETWORK peer — instead of leaving it as one of
+            // kWindow equal round-robin slots that competes with the buffered-ahead
+            // bodies for re-request attention. This lets the ordered fold cursor
+            // track buffer-arrival rate rather than the round-robin's luck.
+            // Reward-safe: getdata routing only — no served MN/quorum/subsidy bytes
+            // and no publish() hold is touched, and the fold still validates every
+            // block. Same header-by-height lookup the block-request seam uses.
+            mn_ckpt_lane->set_hol_request_fn(
+                [cp = coin_p2p.get(), hc = header_chain.get()](uint32_t h) {
+                    auto e = hc->get_header_by_height(h);
+                    if (!e) return false;
+                    return cp->request_head_of_line(e->hash);
                 });
             // SML validity attestation — the ONLY carrier of a post-anchor
             // PoSe ban. dashd applies those from consensus, never as a special
@@ -10935,6 +11115,7 @@ int main(int argc, char** argv)
     // UNCHANGED. Explicit opt-out: --embedded-superblock=false.
     bool embedded_superblock = false;
     bool embedded_superblock_off = false;      // --embedded-superblock=false
+    bool allow_stub_bls = false;               // --allow-stub-bls (#1671): run a bls=stub build knowingly in a BLS-relying config
     bool embedded_govsync = false;             // --embedded-govsync: OBSERVE-ONLY arm of the governance sourcing lane (inv 17/18 pull + store populate); default OFF; does NOT arm serving (that is --embedded-superblock)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
@@ -10979,6 +11160,7 @@ int main(int argc, char** argv)
     // be an explicit operator decision. Reward path is byte-unchanged.
     bool embedded_tx_inject = false;
     std::string embedded_tx_inject_hex_path;   // --embedded-tx-inject-hex FILE (local M1 submit)
+    std::string control_token_file_path;       // --control-plane-token-file FILE (#157 Slice 3 arming seam; DORMANT)
     // #107 PHASE 2 (--embedded-accrue-asset-locks): type-8 asset-lock accrual.
     // DAEMONLESS DEFAULT ON (good_citizen_defaults.hpp): body membership and the
     // CbTx creditPool accrual are the SAME bit (embedded_gbt.hpp allow_locks ==
@@ -11106,7 +11288,12 @@ int main(int argc, char** argv)
     std::string embedded_utxo_fold_expect;    // --embedded-utxo-fold-expect HEX
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
-            std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
+            // Name the BLS backend on the version line (issue #1671): a stub
+            // (BLS-dark) binary is otherwise indistinguishable here, and this is
+            // the surface operators and scripts read. bls= is the last token so
+            // an inventory can match it with `--version | grep -oE 'bls=[a-z]+'`.
+            std::cout << "c2pool-dash " << C2POOL_VERSION
+                      << " bls=" << dash::coin::vendor::bls_backend_name() << "\n";
             return 0;
         }
         else if (std::strcmp(argv[i], "--help") == 0)    want_help = true;
@@ -11163,6 +11350,8 @@ int main(int argc, char** argv)
             embedded_superblock = true;
         else if (std::strcmp(argv[i], "--embedded-superblock=false") == 0)
             embedded_superblock_off = true;         // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--allow-stub-bls") == 0)
+            allow_stub_bls = true;                  // #1671: run bls=stub knowingly (see the refuse-to-start gate before run_node)
         else if (std::strcmp(argv[i], "--embedded-govsync") == 0)
             embedded_govsync = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
@@ -11264,6 +11453,8 @@ int main(int argc, char** argv)
             embedded_tx_inject = true;   // #157: opt-in miner/user tx-injection (default OFF)
         else if (std::strcmp(argv[i], "--embedded-tx-inject-hex") == 0 && i + 1 < argc)
             embedded_tx_inject_hex_path = argv[++i];   // #157 local M1 submit file
+        else if (std::strcmp(argv[i], "--control-plane-token-file") == 0 && i + 1 < argc)
+            control_token_file_path = argv[++i];       // #157 Slice 3: control-plane apply token file (DORMANT arming seam)
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
@@ -11493,6 +11684,40 @@ int main(int argc, char** argv)
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        // #157 Slice 3: control-plane apply token file. A settings-file value is
+        // honored (CLI wins) exactly like the overlays above; because the row is
+        // money-class it already passed the money-ack gate to reach here.
+        if (rc.file_set("control.token_file") && control_token_file_path.empty())
+            control_token_file_path = rc.get_string("control.token_file").value_or(control_token_file_path);
+
+        // ── #157 Slice 3: DORMANT control-plane arming seam ──────────────────
+        // If (and ONLY if) an operator points --control-plane-token-file at a
+        // 0600 owner-only file holding a 32-128 char token, load it and register
+        // it via config_endpoint::set_control_token(). This is the SOLE
+        // production caller that arms POST /api/config[/apply]; absent, the
+        // endpoint stays fail-closed (503 armed:false) exactly as on master.
+        // Fail-closed on any problem: an invalid/unsafe file arms NOTHING and
+        // warns by name (PATH logged, token NEVER logged). Arming the token is
+        // still only half the money path — MONEY_LIVE keys (embedded.tx_inject)
+        // additionally require the two-phase money-nonce + AddressValidator + M0
+        // tripwire inside apply_config(); this seam does not weaken any of that.
+        if (!control_token_file_path.empty()) {
+            std::string why;
+            auto tok = c2pool::config_endpoint::load_control_token_file(
+                control_token_file_path, &why);
+            if (tok) {
+                c2pool::config_endpoint::set_control_token(*tok);
+                LOG_WARNING << "[#157] control-plane apply armed via token file "
+                            << control_token_file_path
+                            << " (POST /api/config/apply is now reachable on "
+                               "loopback with this token; money-key arming still "
+                               "requires the two-phase money-nonce gate)";
+            } else {
+                LOG_WARNING << "[#157] control-plane token file refused ("
+                            << why << ") path=" << control_token_file_path
+                            << " -- NOT arming; config-apply stays fail-closed";
+            }
+        }
     }
 
     // ── FULL-HISTORY REPLAY W3: --replay-utxo-* standalone utility ──────────
@@ -11642,6 +11867,15 @@ int main(int argc, char** argv)
                       << (stratum_port + 1) << "\n";
             web_port = static_cast<uint16_t>(stratum_port + 1);
         }
+        // ── DAEMONLESS POSTURE (single source of truth) ──
+        // No dashd arm requested (--coin-rpc / --coin-rpc-auth / --submit-block
+        // all absent) => the embedded builder is the only template source.
+        // Computed ONCE here and read by BOTH the good-citizen resolver below
+        // and the BLS-stub refuse-to-start gate before run_node — never
+        // recomputed, so the two consumers can never silently diverge.
+        const bool daemonless_posture = rpc_endpoint.empty()
+                                     && rpc_conf_path.empty()
+                                     && submit_hex.empty();
         // ── GOOD-CITIZEN DEFAULT: daemonless nodes SERVE THE FULL MEMPOOL ──
         // The operator-declared posture decides: with no dashd arm requested
         // (--coin-rpc / --coin-rpc-auth / --submit-block all absent) the
@@ -11654,9 +11888,6 @@ int main(int argc, char** argv)
         // armed TOGETHER, never apart); dashd-armed => byte-identical to the
         // requested flags. --<flag>=false is the explicit opt-out either way.
         {
-            const bool daemonless_posture = rpc_endpoint.empty()
-                                         && rpc_conf_path.empty()
-                                         && submit_hex.empty();
             const dash::coin::TxServeResolution txr =
                 dash::coin::resolve_good_citizen_tx_serve(
                     daemonless_posture,
@@ -11724,6 +11955,44 @@ int main(int argc, char** argv)
                              " templates will serve with no serve-time"
                              " cross-check. Not a supported production"
                              " configuration.\n";
+        }
+        // #1671: refuse to start a bls=stub (BLS-dark) binary in any config that
+        // RELIES on BLS verification — the daemonless cut (no dashd fallback to
+        // fall closed to), or an explicit opt-in to a BLS-consuming arm. Such a
+        // node cannot verify quorum commitments / ChainLocks / isdlocks /
+        // governance votes / asset-unlocks; running it BLS-dark and then citing
+        // it for verification is exactly the defect this issue closes. rpc-armed
+        // mode is NOT refused (there the stub fails closed to dashd, and only the
+        // loud identity surfaces apply). Evaluated on the FINALISED flags (after
+        // the good-citizen resolver above may have armed them in daemonless mode)
+        // and on the pure daemonless_posture — before run_node opens any store.
+        {
+            const bool bls_claim_config = daemonless_posture
+                || embedded_null_arm || embedded_superblock
+                || embedded_ingest_isdlock || embedded_accrue_asset_unlocks;
+            if (bls_claim_config
+                && !dash::coin::vendor::bls_backend_available()
+                && !allow_stub_bls) {
+                std::cout
+                    << "[BLS-STUB] refusing to start: this c2pool-dash was built"
+                       " WITHOUT dashbls (bls=stub) and the requested configuration"
+                       " (" << (daemonless_posture      ? "daemonless cut"
+                               : embedded_null_arm       ? "--embedded-null-arm"
+                               : embedded_superblock     ? "--embedded-superblock"
+                               : embedded_ingest_isdlock ? "--embedded-ingest-isdlock"
+                               :                           "--embedded-accrue-asset-unlocks")
+                    << ") relies on BLS verification this build cannot perform."
+                       " Rebuild with -DC2POOL_DASH_BLS=ON -DDASHBLS_ROOT=<prefix>"
+                       " (scripts/build_dashbls.sh), or pass --allow-stub-bls to run"
+                       " it knowingly (never in production).\n";
+                return 2;
+            }
+            if (!dash::coin::vendor::bls_backend_available() && allow_stub_bls)
+                std::cout
+                    << "[BLS-STUB] running BLS-dark by --allow-stub-bls: quorum /"
+                       " ChainLock / isdlock / govvote / asset-unlock verification"
+                       " is INERT (fail-closed). Do not cite this node for"
+                       " verification, reward-parity or won-block-validity claims.\n";
         }
         return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
                         stratum_host, stratum_port, web_host, web_port,

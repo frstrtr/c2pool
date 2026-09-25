@@ -99,6 +99,21 @@
 
 namespace c2pool::xmr::assembly {
 
+// R1 (operator-approved 2026-09-21): the on-chain credit cut rides as a
+// constant-size TAIL of the coinbase 0x02 extra-nonce payload, after the
+// per-worker nonce + weight padding. The byte format lives in the consumer
+// tree at c2pool/v37/xmr/xmr_credit_cut.hpp (credit::kTailBytes == 44); this
+// impl-tree constant mirrors it so the parse bound is named, not a literal.
+// A static_assert(CREDIT_CUT_TAIL_BYTES == credit::kTailBytes) lives in the
+// consumer-tree KAT v37_xmr_credit_cut_kat (which may include both headers;
+// the impl tree must not include the consumer tree).
+inline constexpr std::size_t CREDIT_CUT_TAIL_BYTES = 44;  // 4 magic + 8 u64 P + 32 spine
+// fee model (donation-output merge): the donation owed_in commitment rides
+// just before the credit cut (consumer tree xmr_fee_model.hpp,
+// fee::kDonationOwedTailBytes == 12, "V37D" || u64le; mirrored and
+// static_asserted in v37_xmr_fee_model_kat). Present only under the gate.
+inline constexpr std::size_t DONATION_OWED_TAIL_BYTES = 12;  // 4 magic + 8 u64 owed_in
+
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
 using ::v37::xmr::settle::CoinbaseInputs;
@@ -266,7 +281,7 @@ public:
             m_wanted = reward;
             return false;   // template falls back; the assembler rebuilds at `reward`
         }
-        for (std::size_t i = 0; i < alt.size(); ++i) m_cb.outputs[i].amount = alt[i].amount;
+        for (std::size_t i = 0; i < alt.size(); ++i) { m_cb.outputs[i].amount = alt[i].amount; m_cb.outputs[i].owed_part = alt[i].owed_part; }
         set_budget(m_in, m_subsidy, reward);
         m_cb.budget = reward;
         fill_amounts(rewards);
@@ -294,8 +309,24 @@ public:
     [[nodiscard]] const BuiltCoinbase& built() const { return m_cb; }
     [[nodiscard]] std::uint64_t subsidy() const { return m_subsidy; }
 
+    // recon(A+B credit): the on-chain credit cut tail the template appends to the 0x02 payload.
+    void set_extra_nonce_tail(std::vector<std::uint8_t> t) { m_tail = std::move(t); }
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override { return m_tail; }
+
+    // SEAM-1 (GAP-2 rbind): the per-job binding the template writes after the
+    // worker nonce. size 0 / no function => none (byte-identical template).
+    using ExtraNonceBindFn = std::function<bool(std::uint32_t extra_nonce, std::uint8_t* out)>;
+    void set_extra_nonce_bind(std::size_t size, ExtraNonceBindFn fn) { m_bind_size = fn ? size : 0; m_bind = std::move(fn); }
+    [[nodiscard]] std::size_t extra_nonce_bind_size() const override { return m_bind_size; }
+    [[nodiscard]] bool extra_nonce_bind(std::uint32_t extra_nonce, std::uint8_t* out) const override {
+        return m_bind_size && m_bind && m_bind(extra_nonce, out);
+    }
+
 private:
     X6SettlementSource() = default;
+    std::vector<std::uint8_t> m_tail;   // recon(A+B credit)
+    std::size_t      m_bind_size = 0;   // SEAM-1
+    ExtraNonceBindFn m_bind;            // SEAM-1
 
     void fill_amounts(std::vector<std::uint64_t>& rewards) const {
         rewards.resize(m_cb.outputs.size());
@@ -332,7 +363,7 @@ struct BlockBytes {
     std::size_t nonce_offset = 0;            // 4-B header nonce, same offset in BOTH blobs (39 for v16 / 5-B timestamp varint)
     std::size_t miner_tx_offset = 0;         // == header size
     std::size_t extra_nonce_offset = 0;      // in full_blob: first byte of the 0x02 payload
-    std::size_t extra_nonce_size = 0;        // 4..14 (padded)
+    std::size_t extra_nonce_size = 0;        // 4..14 (padded) [+32 SEAM-1 rbind] [+44 credit-cut tail]
     std::size_t merkle_root_offset = 0;      // in full_blob: the 32-B root inside the 0x03 tag
     std::size_t miner_tx_size = 0;           // incl. trailing rct_type byte
     ::xmr::coin::Hash256 merkle_root{};      // MM commitment root patched at merkle_root_offset (== X6 mm_root)
@@ -497,6 +528,23 @@ struct AssemblyInputs {
     CoinbaseInputs                settle;
     std::uint32_t                 wire_cap = 2700;   // output cap ceiling when output_cap == 0
     int                           max_passes = 6;    // fixpoint bound (fail closed beyond)
+
+    // GOOD-CITIZEN (native arm). When true, `mempool` is the FINAL set the AGPL
+    // good-citizen selector already chose: the template mines it VERBATIM (no
+    // p2pool 5-s age gate, no penalty-zone greedy re-select). This file still
+    // enforces a coinbase-aware hard trim so the block never crosses 2*median
+    // (which would zero the reward and refuse the block) -- the trim only ever
+    // pops from the fee-rate TAIL and never the first entry, so a non-empty
+    // selection always yields a non-empty block (good-citizen invariant D).
+    bool                          take_mempool_as_given = false;
+    // recon(A+B credit): bytes appended to the 0x02 payload after the padded worker
+    // nonce (the on-chain credit cut). Empty => byte-identical templates.
+    std::vector<std::uint8_t>     extra_nonce_tail;
+    // SEAM-1 (GAP-2 rbind): bytes written right after the 4-byte worker nonce,
+    // per extra_nonce ([extra_nonce 4 | bind | padding | tail]). 0 / empty =>
+    // byte-identical templates. Size <= EXTRA_NONCE_BIND_MAX.
+    std::size_t                   extra_nonce_bind_size = 0;
+    X6SettlementSource::ExtraNonceBindFn extra_nonce_bind;
 };
 
 class XmrBlockAssembler {
@@ -517,13 +565,56 @@ public:
                         " > HARDFORK_SUPPORTED_VERSION " + std::to_string(HARDFORK_SUPPORTED_VERSION));
 
         const std::uint64_t subsidy = xmr_base_reward(a.miner.already_generated_coins);
-        std::uint64_t fees_all = 0, weight_all = 0;
-        for (const auto& t : a.mempool) { fees_all += t.fee; weight_all += t.weight; }
 
         CoinbaseInputs base = a.settle;
         base.monero_major_version = a.miner.major_version;
         base.height  = a.miner.height;
         base.prev_id = to_hash256(a.miner.prev_id);
+
+        // GOOD-CITIZEN coinbase-aware trim (native arm). The good-citizen
+        // selector sized its set against a 600 B coinbase reserve, but a v37
+        // K_fair coinbase with many payees is far larger. Two independent limits
+        // can EMPTY the block if the tx set is heavy, and this trim defends both
+        // by capping tx weight from the fee-rate TAIL (never the first entry, so
+        // a non-empty pool always yields a non-empty block -- invariant D):
+        //   (1) get_block_reward returns 0 above 2*median_raw (block too big) --
+        //       the template refuses and serves the previous/empty template;
+        //   (2) weight_aware_output_cap shrinks the payee set as tx weight grows;
+        //       if it collapses below the coinbase's REQUIRED outputs (fixed +
+        //       sink) the assembler refuses (see K6'). The trim reserves cb_ub
+        //       against the zone so the cap keeps >= required outputs.
+        // Budget uses the RAW median (matching the template's own penalty math,
+        // which does not clamp) intersected with the weight_aware zone.
+        std::vector<XmrTxMempoolData> trimmed;
+        const std::vector<XmrTxMempoolData>* mp = &a.mempool;
+        if (a.take_mempool_as_given && !a.mempool.empty()) {
+            constexpr std::uint64_t ZONE_MIN = 300000;   // CRYPTONOTE reward zone
+            const std::uint64_t median = a.miner.median_weight;
+            const std::uint64_t zone   = median < ZONE_MIN ? ZONE_MIN : median;   // weight_aware floor
+            // required coinbase outputs (upper bound): owed + fixed + sink,
+            // capped at wire_cap. Reserve enough that weight_aware_output_cap
+            // keeps room for them AND the block stays reward-positive.
+            const std::uint64_t req_outputs =
+                std::min<std::uint64_t>(a.settle.owed.size() + a.settle.fixed.size() + 1, a.wire_cap);
+            const std::uint64_t cb_ub = 128 + req_outputs * ::v37::xmr::settle::XMR_OUTPUT_SIZE_BYTES;
+            // reward-positive ceiling (2*median_raw) intersected with the
+            // penalty-free zone that weight_aware_output_cap caps payees against.
+            const std::uint64_t eff_ceiling = std::min<std::uint64_t>(median ? 2 * median : ZONE_MIN, zone);
+            const std::uint64_t budget = eff_ceiling > cb_ub ? eff_ceiling - cb_ub : 0;
+            std::uint64_t wsum = 0;
+            trimmed.reserve(a.mempool.size());
+            for (const auto& t : a.mempool) {
+                if (trimmed.empty()) { trimmed.push_back(t); wsum += t.weight; continue; }  // R-CIT-1: first always
+                if (wsum + t.weight > budget) break;   // fee-rate desc => drop the tail
+                trimmed.push_back(t); wsum += t.weight;
+            }
+            mp = &trimmed;
+        }
+        const std::vector<XmrTxMempoolData>& mempool = *mp;
+
+        std::uint64_t fees_all = 0, weight_all = 0;
+        for (const auto& t : mempool) { fees_all += t.fee; weight_all += t.weight; }
+
         if (base.output_cap == 0)
             base.output_cap = ::v37::xmr::settle::weight_aware_output_cap(a.miner.median_weight, weight_all, a.wire_cap);
 
@@ -537,10 +628,15 @@ public:
 
             std::unique_ptr<X6SettlementSource> seam = X6SettlementSource::build(in, subsidy, &sub);
             if (!seam) return fail("pass " + std::to_string(pass) + ": " + sub);
+            seam->set_extra_nonce_tail(a.extra_nonce_tail);   // recon(A+B credit)
+            if (a.extra_nonce_bind_size > EXTRA_NONCE_BIND_MAX)
+                return fail("SEAM-1: extra_nonce_bind_size " + std::to_string(a.extra_nonce_bind_size) +
+                            " > EXTRA_NONCE_BIND_MAX " + std::to_string(EXTRA_NONCE_BIND_MAX));
+            seam->set_extra_nonce_bind(a.extra_nonce_bind_size, a.extra_nonce_bind);   // SEAM-1
 
             std::unique_ptr<XmrBlockTemplate> tpl(new XmrBlockTemplate(seam.get()));
             seam->begin_update();
-            tpl->update(a.miner, a.mempool);
+            tpl->update(a.miner, mempool, a.take_mempool_as_given);
 
             const bool ok = tpl->last_updated() != 0 && tpl->get_height() == a.miner.height && tpl->get_reward() != 0;
             if (ok) {
@@ -608,7 +704,8 @@ private:
             return false;
         }
         rec.m_extra_nonce_size = full[eo - 1];
-        if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE || rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE) {
+        if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + DONATION_OWED_TAIL_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }
@@ -828,6 +925,21 @@ inline bool selfcheck(std::string& log) {
             C(t->outputs()[0].identity == id_of(0x45) && t->outputs()[5].identity == id_of(0x40), "K2 K_fair oldest-owed-first order preserved through the template");
             for (std::uint32_t en : {0u, 1u, 0xFFFFFFFFu}) check_template(C, *t, en, "K2");
         }
+        // K2b (fee-model S1): the SAME inputs with the fixed output BEING the
+        // residual sink (its ref AND identity) -> the residual folds into it:
+        // 7 outputs, no Sink role, the last (Fixed) output = its 5000000
+        // minimum + the residual.
+        AssemblyInputs b = a; b.settle.fixed[0].pay = b.settle.residual_sink; b.settle.fixed[0].identity = b.settle.residual_sink_identity;
+        auto tb = XmrBlockAssembler::build(b, &why);
+        if (C(tb != nullptr, "K2b build (6 owed + fixed-that-pays-the-sink) " + why) && t) {
+            const auto& ob = tb->outputs();
+            bool no_sink = true; for (const auto& o : ob) no_sink &= (o.role != CoinbaseOutput::Role::Sink);
+            C(ob.size() == 7 && no_sink && ob.back().role == CoinbaseOutput::Role::Fixed,
+              "K2b S1: 7 outputs (6 owed + ONE fixed), no separate sink output");
+            C(ob.back().amount == t->outputs()[6].amount + t->outputs()[7].amount && ob.back().amount > 5000000ull,
+              "K2b S1: the fixed output = its minimum + the residual (== K2's fixed + sink)");
+            for (std::uint32_t en : {0u, 7u}) check_template(C, *tb, en, "K2b");
+        }
     }
 
     // ---- K3: penalty zone, payee set CHANGES with the final reward -> fixpoint --
@@ -880,6 +992,91 @@ inline bool selfcheck(std::string& log) {
         AssemblyInputs c; c.miner = miner(1, 300000, 0); c.settle = lane_ctx(); c.settle.output_cap = 1;
         ::v37::xmr::settle::FixedOutput f; f.pay = std_ref(); f.amount = 1; f.identity = id_of(0x77); c.settle.fixed.push_back(f);
         C(XmrBlockAssembler::build(c, &why) == nullptr, "K6' output_cap too small for fixed + sink refused: " + why);
+        // K6'' (fee-model S1): a fixed output that IS the sink needs NO sink slot.
+        AssemblyInputs d = c; d.settle.fixed[0].identity = d.settle.residual_sink_identity;
+        auto td = XmrBlockAssembler::build(d, &why);
+        C(td != nullptr && td->outputs().size() == 1 && td->outputs()[0].role == CoinbaseOutput::Role::Fixed &&
+          td->outputs()[0].amount == td->reward(), "K6'' S1: output_cap 1 + a fixed output paying the sink -> ONE output = the whole reward " + why);
+    }
+
+    // ---- K7: GOOD-CITIZEN take_mempool_as_given (native arm) ------------------
+    // The operator hard rule: a mined block ALWAYS carries the pool's valid txs
+    // when the pool has any. take_mempool_as_given bypasses the p2pool 5-s age
+    // gate and the penalty-zone greedy re-selection so the selected set is mined
+    // verbatim, capped only by the coinbase-aware trim (never empties the block).
+    {
+        // K7a: median 3000, 10 txs of 500 B / 1e9 fee = 5000 B, under 2*median
+        // (6000). take_mempool_as_given mines ALL 10; the greedy control keeps
+        // only the ~6 penalty-free ones (proves the knob is load-bearing -- this
+        // is the "187 -> 5" reproduction the prior FOF found).
+        auto mk = [](std::uint64_t median, bool take) {
+            AssemblyInputs a; a.miner = miner(3000000, median, 18000000000000000000ull); a.settle = lane_ctx();
+            ::v37::xmr::settle::OwedEntry A; A.pay = std_ref(); A.owed = 1000000000ull; A.first_eligible = 1; A.identity = id_of(0x41);
+            a.settle.owed = {A};
+            a.take_mempool_as_given = take;
+            return a;
+        };
+        {
+            AssemblyInputs a = mk(3000, true);
+            a.mempool = txs(10, 500, 1000000000ull);
+            std::string why; auto t = XmrBlockAssembler::build(a, &why);
+            if (C(t != nullptr, "K7a build (take_mempool_as_given, 10 txs) " + why)) {
+                C(t->n_tx() == 10, "K7a good-citizen mines ALL 10 txs verbatim (got " + std::to_string(t->n_tx()) + ")");
+                C(t->reward() != 0, "K7a reward != 0 (block not refused)");
+                for (std::uint32_t en : {0u, 3u}) check_template(C, *t, en, "K7a");
+            }
+        }
+        {
+            // control: same set, good-citizen OFF -> the greedy drops into the
+            // penalty-free zone (fewer than 10). Proves take_mempool_as_given is
+            // what puts the dropped txs back.
+            AssemblyInputs a = mk(3000, false);
+            a.mempool = txs(10, 500, 1000000000ull);
+            std::string why; auto t = XmrBlockAssembler::build(a, &why);
+            if (C(t != nullptr, "K7b control build (good-citizen OFF) " + why))
+                C(t->n_tx() < 10 && t->n_tx() >= 1, "K7b greedy control keeps fewer than 10 (got " + std::to_string(t->n_tx()) + ")");
+        }
+        {
+            // K7c: empty pool -> empty block (empty IFF pool empty).
+            AssemblyInputs a = mk(3000, true);   // no mempool
+            std::string why; auto t = XmrBlockAssembler::build(a, &why);
+            if (C(t != nullptr, "K7c build (empty pool) " + why))
+                C(t->n_tx() == 0, "K7c empty pool => coinbase-only (n_tx == 0)");
+        }
+        {
+            // K7d: coinbase-aware trim. 20 txs of 500 B = 10000 B > 2*median
+            // (6000): without the trim get_block_reward would return 0 and the
+            // block would be refused (emptied). The trim drops the fee-rate tail
+            // so the block is reward-positive, the first tx always survives.
+            AssemblyInputs a = mk(3000, true);
+            a.mempool = txs(20, 500, 1000000000ull);
+            std::string why; auto t = XmrBlockAssembler::build(a, &why);
+            if (C(t != nullptr, "K7d build (heavy pool, coinbase-aware trim) " + why)) {
+                C(t->n_tx() >= 1 && t->n_tx() < 20, "K7d trim keeps 1..19 txs, never empty (got " + std::to_string(t->n_tx()) + ")");
+                C(t->reward() != 0, "K7d reward != 0 (trim kept the block reward-positive, not refused)");
+            }
+        }
+        {
+            // K7e: age-gate negation. One RECENT (< 5 s old) low-fee tx. With the
+            // good-citizen path OFF the p2pool 5-s age gate drops it and the block
+            // is coinbase-only (exactly the failure the task describes); ON, it is
+            // mined.
+            std::vector<XmrTxMempoolData> recent(1);
+            recent[0].id = hash_of(0x90); recent[0].weight = 500; recent[0].fee = 1000;  // << HIGH_FEE_VALUE
+            recent[0].time_received = seconds_since_epoch();                              // just now
+            {
+                AssemblyInputs a = mk(3000, true); a.mempool = recent;
+                std::string why; auto t = XmrBlockAssembler::build(a, &why);
+                if (C(t != nullptr, "K7e build (recent low-fee tx, good-citizen ON) " + why))
+                    C(t->n_tx() == 1, "K7e recent low-fee tx is MINED under good-citizen (age gate bypassed)");
+            }
+            {
+                AssemblyInputs a = mk(3000, false); a.mempool = recent;
+                std::string why; auto t = XmrBlockAssembler::build(a, &why);
+                if (C(t != nullptr, "K7e control build (good-citizen OFF) " + why))
+                    C(t->n_tx() == 0, "K7e control: the 5-s age gate drops the recent low-fee tx (coinbase-only)");
+            }
+        }
     }
 
     log += "summary: " + std::to_string(C.pass) + " passed, " + std::to_string(C.fail) + " failed\n";

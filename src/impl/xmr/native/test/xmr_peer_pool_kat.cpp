@@ -88,6 +88,10 @@ public:
     // Scripted behaviour.
     bool answer_chain   = true;
     bool answer_objects = true;
+    // Pruned bodies per block in a 2004 answer (0: header-only blocks, the
+    // shape the older tests use). Non-zero reproduces a real mainnet span.
+    std::size_t txs_per_block = 0;
+    std::size_t tx_blob_bytes = 0;
     std::vector<levin::PeerlistEntry> peerlist;
     native::PeerSyncData sync = default_sync();
 
@@ -259,6 +263,10 @@ private:
                 native::BlockEntry b;
                 b.block_blob.assign(32, id[0]);
                 b.pruned = m.prune;
+                for (std::size_t t = 0; t < txs_per_block; ++t)
+                    b.txs.push_back(native::TxBlobEntry{
+                        std::vector<std::uint8_t>(tx_blob_bytes, static_cast<std::uint8_t>(t)),
+                        hash_of_byte(static_cast<std::uint8_t>(t)), true});
                 r.blocks.push_back(std::move(b));
             }
             std::vector<std::uint8_t> out;
@@ -404,6 +412,54 @@ void test_dial_handshake_and_learn() {
 }
 
 // -----------------------------------------------------------------------
+// Regression: primary must be elected in the SAME snapshot that first reveals
+// the handshaked peer, WITHOUT waiting for a maintenance tick.
+//
+// This pins the publish-ordering race that reddened this KAT on master. The
+// pool used to elect the primary ONLY on the maintenance tick, while
+// on_handshaked() published the snapshot (peer_count()/peers_handshaked) the
+// moment the handshake completed -- leaving a window, up to maintenance_tick_ms
+// wide, where a handshaked peer was visible but tel_.primary was still the
+// stale pre-handshake "". test_dial_handshake_and_learn read primary right
+// after peer_count()==1 and so occasionally landed in that gap (more often
+// under ASan/UBSan, where scheduling stretches the interval).
+//
+// Here the maintenance tick is set so far out that it NEVER fires during the
+// test: the initial dial is fired by start()'s one-shot maintain(), so the
+// peer still comes up, but the ONLY path that can elect the primary is the
+// handshake-completion publish. Pre-fix, primary stayed empty here forever --
+// a deterministic failure. Post-fix (election folded into publish_snapshot),
+// it names the sole peer the instant the handshake lands.
+void test_primary_elected_without_maintenance_tick() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    cfg.maintenance_tick_ms = 3'600'000;   // no tick will fire during the test
+
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg,
+                                        {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }),
+               "the sole peer handshakes (initial dial comes from start(), not the tick)");
+
+    // The instant peer_count()==1 is visible, primary must already name it --
+    // no extra pump, no maintenance tick. This is the exact assertion that flaked.
+    const p2p::PoolTelemetry t = rig.pool->telemetry();
+    kat::check(t.peers_handshaked == 1, "the snapshot shows the handshaked peer");
+    kat::check(t.primary == daemon.key(),
+               "primary is elected atomically with peer_count, without a maintenance tick");
+    kat::check(!(t.peers_handshaked >= 1 && t.primary.empty()),
+               "no published snapshot shows handshaked>=1 with an empty primary");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
 void test_object_chunking_and_span_reassembly() {
     Rig rig;
     seed_chain(rig.chain);
@@ -458,6 +514,161 @@ void test_object_chunking_and_span_reassembly() {
     std::vector<Hash> huge(native::MAX_SPAN_IDS + 1, hash_of_byte(0x77));
     kat::check(!rig.pool->request_objects(ref, huge, true),
                "a span over MAX_SPAN_IDS is refused");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
+// D-3 back-pressure is VISIBLE. A span over MAX_SPANS_PER_PEER used to be
+// accepted (true) and then dropped on the io thread; the sync driver had
+// already booked its ids as asked and sat out the 15 s re-ask interval with
+// nothing fetching them -- half of the mainnet catch-up livelock. Now the
+// refusal is the return value, and the slot comes back when the span lands.
+void test_span_caps_refuse_visibly() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "caps: peer up");
+
+    native::PeerRef ref;
+    ref.addr = daemon.key();
+    auto span = [](std::uint8_t tag) {
+        std::vector<Hash> ids;
+        for (int i = 0; i < 10; ++i) ids.push_back(hash_of_byte(static_cast<std::uint8_t>(tag + i)));
+        return ids;
+    };
+    const bool a = rig.pool->request_objects(ref, span(0x10), true);
+    const bool b = rig.pool->request_objects(ref, span(0x30), true);
+    const bool c = rig.pool->request_objects(ref, span(0x50), true);
+    kat::check(a && b, "caps: two spans fit the per-peer cap");
+    kat::check(!c, "caps: a third span on the same peer is REFUSED, not silently dropped");
+
+    kat::check(rig.wait_for([&] { return rig.chain.objects_calls.size() == 2; }),
+               "caps: both accepted spans complete");
+    const bool d = rig.pool->request_objects(ref, span(0x70), true);
+    kat::check(d, "caps: a completed span hands its slot back");
+    kat::check(rig.wait_for([&] { return rig.chain.objects_calls.size() == 3; }),
+               "caps: and the next span is fetched");
+
+    // A peer we do not have takes no slot: the refusal of its span must not
+    // leak a booking that would starve the total cap later.
+    native::PeerRef ghost;
+    ghost.addr = "127.0.0.1:1";
+    for (int i = 0; i < 8; ++i) (void)rig.pool->request_objects(ghost, span(0x90), true);
+    rig.pump(100);
+    kat::check(rig.pool->request_objects(ref, span(0xa0), true),
+               "caps: spans queued for a peer we do not have give their slots back");
+    kat::check(rig.wait_for([&] { return rig.chain.objects_calls.size() == 4; }),
+               "caps: and the real peer is still served");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
+// A PEER THAT NEVER ANSWERS GET_OBJECTS GIVES ITS SPAN BACK AT
+// NON_RESPONSIVE_PEER_KICK_TIME, not at the 240 s IDLE_PEER_KICK_TIME.
+// Hardening verify, mainnet catch-up: such peers held span slots for four
+// minutes each. Real deadline (20 s, the production default), one span slot
+// per peer so the slot coming back is directly observable.
+void test_unanswered_get_objects_releases_span() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+    daemon.answer_objects = false;
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    cfg.max_spans_per_peer = 1;
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "kick: peer up");
+
+    native::PeerRef ref;
+    ref.addr = daemon.key();
+    std::vector<Hash> ids;
+    for (int i = 0; i < 10; ++i) ids.push_back(hash_of_byte(static_cast<std::uint8_t>(0x20 + i)));
+    kat::check(rig.pool->request_objects(ref, ids, true), "kick: the span is accepted");
+    kat::check(rig.wait_for([&] {
+                   return daemon.count(levin::CMD_REQUEST_GET_OBJECTS) >= 1; }),
+               "kick: the 2003 reached the peer");
+    kat::check(!rig.pool->request_objects(ref, ids, true),
+               "kick: while it is unanswered the peer's only span slot is taken");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool kicked = rig.wait_for([&] {
+        return rig.pool->telemetry().last_close_why.find("NON_RESPONSIVE_PEER_KICK_TIME")
+               != std::string::npos; }, 26'000);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    kat::checkf(kicked, "kick: the silent peer is dropped at NON_RESPONSIVE_PEER_KICK_TIME "
+                        "(%.1f s after the request)", secs);
+    kat::checkf(secs < 24.0, "kick: well before IDLE_PEER_KICK_TIME (%.1f s)", secs);
+    kat::check(rig.chain.objects_calls.empty(), "kick: no span was fabricated");
+    kat::check(!rig.chain.peer_gone_calls.empty(),
+               "kick: the index is told the peer is gone (it re-plans the span)");
+    // The slot came back: a reservation against that key succeeds again. (The
+    // peer itself is gone, so the io thread hands this one back at once.)
+    kat::check(rig.pool->request_objects(ref, ids, true),
+               "kick: the kicked peer's span slot was released");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
+// THE POST-ANCHOR CATCH-UP STALL (mainnet, 2026-09-23), on loopback.
+//
+// A node booted from a mainnet anchor ~2.6 K blocks behind asked for 100-block
+// pruned spans; every honest answer (1.4-2.0 MB, ~20-60 tx/block) overflowed
+// the generic epee budget of the 2004 decoder, was refused as a malformed
+// body, and the peer that served it was BANNED -- one peer per 20 s chain
+// timeout, until the pool was empty and the index had not moved off the
+// anchor. Here one stand-in serves exactly that shape: the span must arrive
+// whole and the peer must still be connected and unbanned afterwards.
+void test_dense_mainnet_span_is_accepted_not_banned() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+    daemon.txs_per_block = 40;     // mainnet-typical density
+    daemon.tx_blob_bytes = 400;    // a small pruned CLSAG/BP+ body
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }),
+               "peer up before the dense span");
+
+    std::vector<Hash> ids;
+    for (int i = 0; i < static_cast<int>(native::MAX_OBJECT_REQUEST_IDS); ++i)
+        ids.push_back(hash_of_byte(static_cast<std::uint8_t>(i)));
+    native::PeerRef ref;
+    ref.addr = daemon.key();
+    kat::check(rig.pool->request_objects(ref, ids, /*prune=*/true),
+               "the 100-block span is accepted for fetch");
+
+    const bool done = rig.wait_for([&] { return !rig.chain.objects_calls.empty(); }, 6000);
+    kat::check(done, "a dense honest 2004 reaches the index");
+    if (!rig.chain.objects_calls.empty()) {
+        std::size_t n_tx = 0;
+        for (const native::BlockEntry& b : rig.chain.objects_calls[0].blocks) n_tx += b.txs.size();
+        kat::checkf(rig.chain.objects_calls[0].blocks.size() == ids.size() && n_tx == ids.size() * 40,
+                    "the whole span arrives (%zu blocks, %zu bodies)",
+                    rig.chain.objects_calls[0].blocks.size(), n_tx);
+    }
+
+    rig.pump(200);
+    const p2p::PoolTelemetry t = rig.pool->telemetry();
+    kat::checkf(t.bans == 0, "the peer that served an honest span is not banned (bans=%llu, last close: %s)",
+                static_cast<unsigned long long>(t.bans), t.last_close_why.c_str());
+    kat::checkf(rig.pool->peer_count() == 1, "and it is still connected (%zu peers)",
+                rig.pool->peer_count());
 
     rig.pool->stop();
     rig.pump(100);
@@ -633,6 +844,114 @@ void test_push_traffic_and_broadcast() {
     kat::checkf(written == 1, "broadcast_notify reports the peer it reached (%zu)", written);
     kat::check(rig.wait_for([&] { return daemon.count(levin::CMD_NEW_FLUFFY_BLOCK) >= 1; }),
                "the broadcast frame arrived at the peer");
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
+// relay_silent is measured on ONE clock. The link stamps its liveness with its
+// own now_ms(), whose origin is the link's construction; the pool used to
+// compare those stamps against ITS now_ms(), whose origin is the pool's. So a
+// link opened more than the silence window after the pool started was always
+// "silent": broadcast skipped it and telemetry counted it -- on mainnet that
+// was silent=8 of 8 after a few hours, and a daemonless found block would have
+// reached nobody. Scaled down: a 2 s window, and the link opened 4 s after the
+// pool, which relays to us and is then broadcast to within the window.
+void test_broadcast_reaches_a_link_opened_late() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.relay_silent_window_ms = 2'000;
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    rig.pump(4'000);                                   // the pool's clock runs ahead
+    rig.pool->dial_now(daemon.key());
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "late: peer up");
+
+    daemon.push_fluffy_block(hash_of_byte(0x78), 2'204'102);
+    kat::check(rig.wait_for([&] { return !rig.chain.new_block_calls.empty(); }),
+               "late: the peer relayed a block to us");
+
+    std::vector<std::uint8_t> frame(16, 0xcd);
+    std::size_t       written = 0;
+    std::atomic<bool> done{false};
+    std::thread caller([&] {
+        written = rig.pool->broadcast_notify(levin::CMD_NEW_FLUFFY_BLOCK, frame);
+        done.store(true);
+    });
+    rig.wait_for([&] { return done.load(); }, 3000);
+    caller.join();
+    kat::checkf(written == 1,
+                "late: a link opened after the pool's silence window, that has just relayed "
+                "to us, is NOT relay-silent -- broadcast reaches it (%zu)", written);
+    rig.pump(100);                                     // one maintenance tick
+    const std::size_t silent = rig.pool->telemetry().relay_silent_peers;
+    kat::checkf(silent == 0, "late: telemetry does not count it silent (%zu)", silent);
+
+    rig.pool->stop();
+    rig.pump(100);
+}
+
+// -----------------------------------------------------------------------
+// THE QUIET NETWORK. relay_silent() is a proxy for "the peer holds us in
+// state_normal": it looks at whether the peer has relayed anything to us
+// lately. On a network where nobody relayed anything for a window -- a small
+// chain between blocks, a regtest, every link just re-dialled -- every healthy
+// peer looks silent, and a found block reached NOBODY. A block broadcast whose
+// proxy leaves no target now goes to every handshaked link; anything that is
+// not a block keeps the strict rule.
+void test_block_broadcast_falls_back_when_every_peer_is_silent() {
+    Rig rig;
+    seed_chain(rig.chain);
+    StandinDaemon daemon(rig.io);
+
+    auto cfg = fast_config();
+    cfg.manual_peers.push_back(daemon.key());
+    cfg.relay_silent_window_ms = 1'000;
+    rig.pool = p2p::XmrPeerPool::create(rig.io, cfg, {&rig.chain, &rig.chain, &rig.txpool});
+    rig.pool->start();
+    kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }), "quiet: peer up");
+    // One last push from the peer (its chain request, served), then silence.
+    // The link's silence clock starts at a stamp that is not its own first
+    // millisecond, so the window below is measured from a real event.
+    rig.pump(50);
+    daemon.request_chain({hash_of_byte(static_cast<std::uint8_t>(2'204'010 & 0xff))});
+    kat::check(rig.wait_for([&] {
+                   return daemon.count(levin::CMD_RESPONSE_CHAIN_ENTRY) == 1; }),
+               "quiet: the peer was served (it holds us in state_normal)");
+    rig.pump(1'500);                                   // nobody relays anything
+    rig.pump(100);                                     // one maintenance tick
+    kat::checkf(rig.pool->telemetry().relay_silent_peers == 1,
+                "quiet: the healthy peer is counted relay-silent (%zu)",
+                rig.pool->telemetry().relay_silent_peers);
+
+    auto broadcast = [&](std::uint32_t cmd) {
+        std::vector<std::uint8_t> frame(16, 0xee);
+        std::size_t       written = 99;
+        std::atomic<bool> done{false};
+        std::thread caller([&] {
+            written = rig.pool->broadcast_notify(cmd, frame);
+            done.store(true);
+        });
+        rig.wait_for([&] { return done.load(); }, 3000);
+        caller.join();
+        return written;
+    };
+
+    const std::size_t tx_written = broadcast(levin::CMD_NEW_TRANSACTIONS);
+    kat::checkf(tx_written == 0,
+                "quiet: a NON-block broadcast keeps the strict state_normal rule (%zu)",
+                tx_written);
+    const std::size_t written = broadcast(levin::CMD_NEW_FLUFFY_BLOCK);
+    kat::checkf(written == 1,
+                "quiet: a found block still reaches the one healthy peer (%zu)", written);
+    kat::check(rig.wait_for([&] { return daemon.count(levin::CMD_NEW_FLUFFY_BLOCK) >= 1; }),
+               "quiet: the 2008 arrived at the peer");
+    kat::check(daemon.count(levin::CMD_NEW_TRANSACTIONS) == 0,
+               "quiet: and the transaction frame did not");
 
     rig.pool->stop();
     rig.pump(100);
@@ -835,11 +1154,17 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--live") == 0) return run_live(argv[i + 1]);
 
     test_dial_handshake_and_learn();
+    test_primary_elected_without_maintenance_tick();
     test_object_chunking_and_span_reassembly();
+    test_dense_mainnet_span_is_accepted_not_banned();
+    test_span_caps_refuse_visibly();
+    test_unanswered_get_objects_releases_span();
     test_request_chain_forces_genesis_terminus();
     test_serving_obligation();
     test_serving_no_common_block_closes();
     test_push_traffic_and_broadcast();
+    test_broadcast_reaches_a_link_opened_late();
+    test_block_broadcast_falls_back_when_every_peer_is_silent();
     test_broadcast_with_no_peers_is_zero();
     test_refill_across_several_daemons();
     test_unreachable_address_backs_off();

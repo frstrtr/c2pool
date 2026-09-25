@@ -13,9 +13,9 @@
     ],
     "bin_height": 100
   },
-  "owed_digest_gate_off_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
-  "owed_digest_master_style_hex": "3ba6481a99a1e3db15b0b6034f950343daaf6c4dfc31934919bd64867a4010ae",
-  "owed_digest_gate_on_hex": "2a84c4f58629ad4c39ca258ff9516cf08300b0c2b46cbd7d4332020deeb5f395",
+  "owed_digest_gate_off_hex": "6c85fd89bb1218ce6e25b607f6cbf19ada17abaab26f62dddfeec4846712e071",
+  "owed_digest_master_style_hex": "6c85fd89bb1218ce6e25b607f6cbf19ada17abaab26f62dddfeec4846712e071",
+  "owed_digest_gate_on_hex": "b2ddf948eb83a28014d8275341081973e5d458b13c00e0876ea3fab5c4844cce",
   "lane_digest_hex": "37756e9fa59be4aa30acfa6a18b0e1c131c9601cfceec802f19133a1ecde1a50",
   "c_credit_dec": "374999",
   "d_credit_dec": "-3074457345617633603",

@@ -165,6 +165,12 @@ static void test_primitives() {
           "the order-8 test point is NOT in the prime-order subgroup (the domain "
           "check has something to catch)");
 
+    // D-1: the identity point l*I == I PASSES the raw subgroup check, which is
+    // exactly why verify_non_input_consensus must reject it explicitly first.
+    check(R::in_main_subgroup(R::identity()),
+          "the identity point passes the raw subgroup check -- so verify must "
+          "reject it explicitly (D-1)");
+
     // Scalar inversion, single and batched, against each other.
     const R::Key a = R::hash_to_scalar("c2pool-rct-kat-a", 16);
     const R::Key b = R::hash_to_scalar("c2pool-rct-kat-b", 16);
@@ -356,6 +362,20 @@ static void test_mutations() {
             checkf(vs == R::RctVerifyStatus::KeyImageDomain,
                    "a key image outside the prime-order subgroup is refused (got %s)",
                    R::to_string(vs));
+        }
+
+        // -- an IDENTITY key image fails the domain check (D-1, M5) ------------
+        // The identity point satisfies l*I == I, so it passes the raw subgroup
+        // (toPointCheckOrder) check; monerod rejects it explicitly first, and so
+        // must we, or a forged identity key image would be admitted.
+        {
+            DecodedTx d;
+            check(decode_relayed_tx(t.blob, d) == TxDecodeStatus::Ok, "control decode");
+            R::RctNonInput in = d.rct;
+            in.key_images[0] = R::identity();
+            const R::RctVerifyStatus vs = R::verify_non_input_consensus(in);
+            checkf(vs == R::RctVerifyStatus::KeyImageDomain,
+                   "an identity key image is refused (got %s)", R::to_string(vs));
         }
 
         // -- a changed PROOF ELEMENT fails the range proof ---------------------

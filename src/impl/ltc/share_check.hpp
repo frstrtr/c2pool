@@ -32,6 +32,34 @@
 namespace ltc
 {
 
+// Thrown by share_init_verify() ONLY when a share's proof-of-work hash does not
+// meet its own claimed target -- i.e. a genuine CRYPTOGRAPHIC PoW failure, as
+// distinct from every structural reject (bad coinbase size, over-long merkle
+// branch, zero/too-easy target) which throws a plain std::invalid_argument.
+// The ingest path (issue #1601) catches THIS type specifically to score the
+// sending peer for invalid-PoW misbehaviour, and lets all other failures pass
+// unscored so honest stale/duplicate/orphan/losing shares are never penalised.
+// Derives from std::invalid_argument so existing catch(std::exception&) /
+// catch(std::invalid_argument&) sites keep treating it as a verify failure.
+struct SharePoWTargetMiss : std::invalid_argument
+{
+    using std::invalid_argument::invalid_argument;
+};
+
+// Catch-site CLASSIFICATION for #1601, shared by the production ingest catch
+// (NodeImpl::processing_shares phase 1) and its KAT so both agree on exactly one
+// rule: a caught verify exception scores the sending peer for invalid-PoW
+// misbehaviour IFF it is a genuine cryptographic PoW-target miss. Every other
+// verify failure — a structural std::invalid_argument (bad coinbase size,
+// over-long merkle, zero/too-easy target) or any other std::exception — returns
+// false and is NOT scored. Centralising it here means a regression that
+// broadened the rule (e.g. scoring every std::exception) would flip this
+// predicate and fail the classification KAT.
+inline bool is_scorable_invalid_pow(const std::exception& e)
+{
+    return dynamic_cast<const SharePoWTargetMiss*>(&e) != nullptr;
+}
+
 // P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
 // Used for witness commitment: SHA256d(wtxid_merkle_root || P2POOL_WITNESS_NONCE)
 static const unsigned char P2POOL_WITNESS_NONCE[32] = {
@@ -746,7 +774,7 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
             LOG_TRACE << "PoW below share target: bits=" << share.m_bits
                       << " target=" << target.GetHex().substr(0,32)
                       << " pow_hash=" << pow_hash.GetHex().substr(0,32);
-            throw std::invalid_argument("share PoW hash does not meet target");
+            throw SharePoWTargetMiss("share PoW hash does not meet target");
         }
 
         // Block detection: check if share's scrypt hash also meets the BLOCK target.

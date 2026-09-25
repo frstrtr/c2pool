@@ -15,7 +15,7 @@
 //   So a meaningful activation golden must be a SCHEDULE golden: a share stream
 //   that crosses the activation position with carrier bins, at least one block
 //   found AND finalized after the crossing, and the digest cut taken after that
-//   finalize. An empty or pre-crossing ledger produces sha256d("V37O") no matter
+//   finalize. An empty or pre-crossing ledger produces sha256d("V37Q") no matter
 //   what the lane gate says, and pins nothing.
 //
 // HOW THE FIXTURE IS BUILT (important)
@@ -33,7 +33,7 @@
 //   so the width stays at the lane default and never enters the owed value.
 //
 // CHECKS
-//   RIDGE-OWED-EMPTY     a fresh ledger is sha256d("V37O"), the anchor
+//   RIDGE-OWED-EMPTY     a fresh ledger is sha256d("V37Q"), the anchor
 //   RIDGE-OWED-OFF       the gate-OFF control digest over the SAME schedule
 //   RIDGE-OWED-ON        the gate-ON golden at the pinned cut  <-- the value
 //   RIDGE-OWED-LIVE      the golden is NON-VACUOUS: ON != OFF
@@ -93,9 +93,9 @@ static const char* GOLDEN_OWED_ON =
 // gate-ON golden non-vacuous rather than a restatement of the status quo.
 static const char* GOLDEN_OWED_OFF =
     "9cfaf97de7c58a7727ff5cc1203f445fc301559fb702938a3dd61ad32d6b338e";
-// The empty-ledger anchor, sha256d("V37O").
+// The empty-ledger anchor, sha256d("V37Q").
 static const char* GOLDEN_OWED_EMPTY =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 // The gate-ON BTC lane digest at the same cut. REPORTED, NOT PINNED: the NRG1
 // preimage commits nr.coverage_blocks, which is the one ND-R6 number still
 // OWED, so pinning this hex would hold the KAT hostage to a policy value the
@@ -296,7 +296,7 @@ int main() {
         settle::OwedLedger e(7);
         std::printf("   empty owed_digest      = %s\n", hex(e.owed_digest()).c_str());
         check(hex(e.owed_digest()) == GOLDEN_OWED_EMPTY,
-              "empty ledger owed_digest == sha256d(\"V37O\")");
+              "empty ledger owed_digest == sha256d(\"V37Q\")");
         check(e.ledger_seq() == 0, "a fresh ledger is at seq 0");
     }
 

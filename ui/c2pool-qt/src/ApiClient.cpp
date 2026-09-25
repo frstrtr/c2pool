@@ -122,6 +122,53 @@ void ApiClient::getText(const QString& path, TextSuccess onSuccess, Failure onFa
     (*doRequest)();
 }
 
+void ApiClient::postJson(const QString& path, const QJsonObject& body,
+                         JsonStatusSuccess onSuccess, Failure onFailure)
+{
+    QNetworkRequest req(QUrl(makeUrl(path)));
+    req.setHeader(QNetworkRequest::ContentTypeHeader,
+                  QStringLiteral("application/json"));
+    req.setTransferTimeout(4000);
+    const QByteArray bytes = QJsonDocument(body).toJson(QJsonDocument::Compact);
+
+    // NO retry: unlike getJson there is no *attempts re-dispatch. A money
+    // POST (arm confirm / submit) that is transparently resent is a replay,
+    // which the server's single-use nonce would reject anyway — but the UI
+    // must not initiate it in the first place.
+    auto* reply = manager_.post(req, bytes);
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, onSuccess, onFailure]() {
+        const auto err = reply->error();
+        const QVariant codeVar =
+            reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+        const int httpStatus = codeVar.isValid() ? codeVar.toInt() : 0;
+        const QByteArray payload = reply->readAll();
+        reply->deleteLater();
+
+        // A transport-level failure (no HTTP response reached us: timeout,
+        // connection refused, DNS) has no status code.
+        if (httpStatus == 0) {
+            const QString message =
+                QString("HTTP error: %1").arg(reply->errorString());
+            emit connectionStateChanged("offline");
+            emit requestFailed(message);
+            onFailure(message);
+            return;
+        }
+        (void)err;  // a non-2xx sets err too, but it IS a real response we surface
+
+        // Parse the body if it is JSON; otherwise hand back an empty doc so
+        // the caller still sees the status code.
+        QJsonParseError parseErr;
+        QJsonDocument doc = QJsonDocument::fromJson(payload, &parseErr);
+        if (parseErr.error != QJsonParseError::NoError)
+            doc = QJsonDocument();
+
+        emit connectionStateChanged("online");
+        onSuccess(httpStatus, doc);
+    });
+}
+
 void ApiClient::download(const QString& path, const QString& outputPath, TextSuccess onSuccess, Failure onFailure)
 {
     QNetworkRequest req(QUrl(makeUrl(path)));

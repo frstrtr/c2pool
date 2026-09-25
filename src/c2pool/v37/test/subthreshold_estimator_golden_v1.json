@@ -130,8 +130,8 @@
  ],
  "gate": {
   "byte_identical_off_vs_master": true,
-  "owed_digest_gate_off_hex": "fc97e47d65f86cb1b36f064dc82b1af1884b233f4a67e5613e2dc465e1177670",
-  "owed_digest_gate_on_hex": "7e0efdb1f2a1eecf41d328ee31f24a3f00b9214f044643992be15cef1fcdec8a",
+  "owed_digest_gate_off_hex": "8bbcd5bda9d5b167d2ddddfdea379ee858464b43313763744cdb704a1ec54c00",
+  "owed_digest_gate_on_hex": "86c9c810203c0bf605b007ecafc1d32bb9f61752b9338ac7e743402e464bc7c4",
   "payeeB_credit_low63_dec": "874999"
  },
  "h_T_hex": "000008637bd05af6c69b5a63f9a49c2c1b10fd7e45803cd141a6937d1fe64f54",

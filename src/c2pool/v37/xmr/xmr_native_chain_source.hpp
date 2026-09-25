@@ -46,6 +46,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,12 @@ struct NativeChainSource {
     // is refused, never wrongly finalized).
     std::function<bool(std::uint64_t height, const std::string& bid_hex)> is_canonical;
 
+    // D2-0: the block the best chain carries at `height` (lowercase hex), or
+    // nullopt (above the tip / outside the retention window). Lets XmrNode
+    // deliver the blocks a Reorg re-applied BELOW its tip to the booking
+    // observer (the Reorg event itself carries only the tip).
+    std::function<std::optional<std::string>(std::uint64_t height)> bid_at;
+
     // Events produced since start, drained or not. A tip driver that produced
     // nothing and a consumer that dropped everything are indistinguishable
     // without this, and they have opposite fixes.
@@ -86,6 +93,25 @@ struct NativeChainSource {
         bool          own_mined = false;
     };
     std::function<std::vector<AltCandidate>()> alt_candidates;
+
+    // D6a: the block blob of `bid_hex` from the index's retained bodies (the
+    // coinbase-authority booking reads it here instead of monerod get_block).
+    // false when the index does not hold the body (never connected, or aged
+    // out of the entry cache); the caller HOLDS, it does not ask a daemon.
+    // The id is the hash of the blob, so a hit is byte-identical to get_block.
+    std::function<bool(const std::string& bid_hex, std::vector<std::uint8_t>& blob)> block_blob;
+
+    // D6b: the receipt relay's chain-view feed (relay/xmr_relay_chain_feed.hpp)
+    // -- the headers and tip the daemon arm fetches from monerod
+    // (get_block_headers_range / get_block_header_by_height). Context blobs
+    // are RC-CTX's (ChainIndex::block_blob_of, bound in main).
+    //   tip_block: (height, id) of the best-chain tip;
+    //   id_at:     the id the best chain carries at a height;
+    //   seed_for:  the RandomX seed id for a block AT a height (epoch ids are
+    //              kept beyond the row window as seed anchors).
+    std::function<std::optional<std::pair<std::uint64_t, ::c2pool::xmr::node::Hash>>()> tip_block;
+    std::function<std::optional<::c2pool::xmr::node::Hash>(std::uint64_t height)> id_at;
+    std::function<std::optional<::c2pool::xmr::node::Hash>(std::uint64_t height)> seed_for;
 
     explicit operator bool() const noexcept {
         return static_cast<bool>(drain) && static_cast<bool>(is_canonical);
@@ -106,6 +132,23 @@ inline std::string chain_id_hex(const ::c2pool::xmr::node::Hash& h) {
     return s;
 }
 
+// Inverse of chain_id_hex: 64 hex digits (either case) -> 32 bytes.
+inline bool block_id_of_hex(const std::string& hex, ::c2pool::xmr::node::Hash& out) {
+    if (hex.size() != 64) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < 32; ++i) {
+        const int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
 // Bind the source to a STARTED backend. The node must be up: both closures
 // capture it by pointer and are called for the life of the daemon, which ends
 // before the backend is stopped (main stops the listener, then the node, then
@@ -122,6 +165,12 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
         return b.has_value() && chain_id_hex(b->id) == bid_hex;
     };
 
+    src.bid_at = [n](std::uint64_t height) -> std::optional<std::string> {
+        const auto b = n->index().by_height(height);
+        if (!b.has_value()) return std::nullopt;
+        return chain_id_hex(b->id);
+    };
+
     src.events_seen = [n] { return n->mainchain_events_seen(); };
 
     src.alt_candidates = [n] {
@@ -135,6 +184,27 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
         }
         return out;
     };
+
+    src.block_blob = [n](const std::string& bid_hex, std::vector<std::uint8_t>& blob) {
+        ::c2pool::xmr::node::Hash id{};
+        if (!block_id_of_hex(bid_hex, id)) return false;
+        const auto e = n->index().get_block_entry(id, /*prune=*/false);
+        if (!e || e->block_blob.empty()) return false;
+        blob = e->block_blob;
+        return true;
+    };
+
+    src.tip_block = [n]() -> std::optional<std::pair<std::uint64_t, ::c2pool::xmr::node::Hash>> {
+        const auto t = n->index().tip();
+        if (!t) return std::nullopt;
+        return std::make_pair(t->height, t->id);
+    };
+    src.id_at = [n](std::uint64_t height) -> std::optional<::c2pool::xmr::node::Hash> {
+        const auto b = n->index().by_height(height);
+        if (!b) return std::nullopt;
+        return b->id;
+    };
+    src.seed_for = [n](std::uint64_t height) { return n->index().seed_hash_for_height(height); };
     return src;
 }
 

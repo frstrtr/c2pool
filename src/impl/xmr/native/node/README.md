@@ -10,6 +10,7 @@ numbers rather than a debugging session.
 |---|---|
 | `xmr_worker_loops.hpp` | the threads — `WorkerLoop` (one thread, one bounded queue, a blocking `call()` for the control path), `VerifyInbound` and `TxSinkLoop` (the enqueue-and-return adapters between the io thread and the components), and `ThreadWitnessPowSource` (the io-thread fence, as a counter) |
 | `xmr_chain_boot.hpp` | where history starts: the anchor path, the genesis path, and the pre-boot serving answers that keep a peer from closing us before the trust root lands |
+| `xmr_anchor_confirm.hpp` | GATE 4 — the anchor, confirmed against the live network before the node serves: fetch `bundle.id` over levin `NOTIFY_REQUEST_GET_OBJECTS`, recompute the id from the bytes, read the block's own height out of its coinbase, and refuse to start on a mismatch, an exhausted peer set or an expired deadline |
 | `xmr_sync_driver.hpp` | the half of chain sync no component owns — who to ask, when, and what else |
 | `xmr_monerod_http.hpp` | the parity/backup arm's transport, and nothing else's |
 | `xmr_native_node.hpp` | `NativeNode`: the wiring, the two networks, the status surface |
@@ -222,6 +223,25 @@ C2c question; that the SCHEDULE must not be a busy loop is this file's.
   anchor format can describe (`generate_anchor` refuses any height below the
   100 000-block long-term weight window). The embedded stagenet bundle is not
   exercised live here.
+
+  **GATE 4 (the network confirm) is now wired** and is not optional.
+  `load_anchor()`'s own banner has always said that gates 1..3 judge a bundle
+  against ITSELF and that the caller still owes the fourth — fetch the block at
+  `bundle.height` from peers and refuse to start unless it hashes to
+  `bundle.id`. Until it was wired, an anchor was trusted by PROVENANCE alone:
+  survivable for a release-pinned bundle this project minted, a real gap for a
+  mainnet bundle handed to an operator on `--native-anchor-path`.
+
+  `ChainBoot::boot_from_anchor()` now installs the bundle AND arms
+  `AnchorNetworkConfirm`; `NativeNode::start()` drives it against handshaked
+  peers and does not return true until it settles. While it is pending the node
+  forwards nothing to the index and serves no block and no chain splice — only
+  `our_sync_data()` stays live, because a handshake is a precondition of the
+  fetch. Bounded by `--anchor-confirm-peers` / `--anchor-confirm-peer-ms` /
+  `--anchor-confirm-timeout-ms`; every failure (mismatch, exhaustion, deadline)
+  is a loud refusal, never a shrug. `test/xmr_anchor_gate4_kat.cpp`
+  (`ctest -R xmr_native_anchor_gate4_kat`) pins all four cases against a mock
+  levin GET_OBJECTS peer.
 
 Each of those is wired to its seam and left unexercised ON PURPOSE, so the
 milestone that owns it has something to prove rather than something to discover.

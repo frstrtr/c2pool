@@ -55,6 +55,16 @@ enum class AdmissionEvidence : std::uint8_t {
     // daemon is armed, unobtainable once the daemon is demoted (M5), which is
     // exactly why it cannot be a rung on a ladder with the other three.
     DaemonConfirmed   = 1u << 3,
+    // INPUT consensus passed: every CLSAG ring signature verified against ring
+    // members resolved from the connected chain, and no key image is already
+    // spent on that chain, and every member is unlocked and old enough. This is
+    // the leg that needs the global output set (contracts/outputs.hpp
+    // IRingMemberSource / ISpentKeyImageView); it turns a non-input-only "bad
+    // value is rejected" into a full "a forged-ring or on-chain-double-spent
+    // transaction is rejected". Obtainable only where the ring source's window
+    // covers the ring (regtest-from-genesis, a mainnet ring above the anchor,
+    // or a daemon-assisted get_outs).
+    InputConsensus    = 1u << 4,
 };
 
 inline constexpr AdmissionEvidence operator|(AdmissionEvidence a, AdmissionEvidence b) noexcept {
@@ -100,6 +110,21 @@ struct TxRelayVerdict {
         ProofFail,
         PoolFull,
         NotSynced,
+        // INPUT-consensus refusals (need the resolved ring / chain spent set).
+        RingSigFail,       // a CLSAG did not verify over its ring members
+                           //   (monerod m_invalid_input) -- a drop offence.
+        KeyImageSpent,     // a key image is already spent ON THE CHAIN
+                           //   (monerod m_double_spend vs the chain) -- no drop,
+                           //   distinct from the pool-local KeyImageConflict.
+        RingUnresolved,    // a ring member is not in our output set and no
+                           //   daemon was asked -- fail-closed, never admitted
+                           //   with InputConsensus. No drop.
+        RingMemberLocked,  // a ring member is not yet unlocked / younger than
+                           //   the spendable age. No drop.
+        AlreadyMined,      // the tx is already in the best chain (or one of
+                           //   its key images is spent there) per the chain
+                           //   index's mined oracle -- a reorg re-admit or a
+                           //   late relay of a mined tx. No drop.
     };
 
     Reason reason = Reason::Accepted;
@@ -127,6 +152,11 @@ inline const char* to_string(TxRelayVerdict::Reason r) noexcept {
         case TxRelayVerdict::Reason::ProofFail:        return "ProofFail";
         case TxRelayVerdict::Reason::PoolFull:         return "PoolFull";
         case TxRelayVerdict::Reason::NotSynced:        return "NotSynced";
+        case TxRelayVerdict::Reason::RingSigFail:      return "RingSigFail";
+        case TxRelayVerdict::Reason::KeyImageSpent:    return "KeyImageSpent";
+        case TxRelayVerdict::Reason::RingUnresolved:   return "RingUnresolved";
+        case TxRelayVerdict::Reason::RingMemberLocked: return "RingMemberLocked";
+        case TxRelayVerdict::Reason::AlreadyMined:     return "AlreadyMined";
     }
     return "?";
 }
@@ -169,6 +199,23 @@ public:
 // collides with the chain or with another pool entry is never selectable, at
 // any policy.
 // ---------------------------------------------------------------------------
+// What to do with a pool entry whose ring is UNRESOLVED -- a member below the
+// output set's anchor / beyond its frontier, so input consensus (CLSAG + not-
+// spent) could not be run on it and the entry carries no InputConsensus
+// evidence. A RESOLVABLE ring is never in this state: it was either verified
+// (InputConsensus granted) or REJECTED at admission (RingSigFail / KeyImageSpent
+// / RingMemberLocked, never pooled). So "require InputConsensus when the ring
+// resolves" is exactly "exclude the ring-unresolved from selection".
+//
+//   * Exclude (default, the recommended daemonless rule): NEVER mine a ring we
+//     could not verify. On a regtest-from-genesis / fully-covered node every
+//     honest ring resolves, so blocks stay non-empty (good-citizen preserved)
+//     and only forged / unverifiable rings are dropped.
+//   * Include: mine an unresolved ring on its non-input evidence -- the pre-
+//     input-consensus behaviour, which a mainnet node pre-O-backfill needs to
+//     produce non-empty blocks at all. This is the OPERATOR ruling owed (R2).
+enum class UnresolvedRingPolicy : std::uint8_t { Exclude = 0, Include = 1 };
+
 struct TxpoolSelectPolicy {
     // Every flag here must be present on an entry for it to be selectable.
     // Defaults to the daemonless recommendation of ruling R-VAL.
@@ -180,10 +227,14 @@ struct TxpoolSelectPolicy {
     // a stem transaction has not been publicly fluffed and mining it leaks the
     // path back to its origin.
     bool allow_stem = false;
+    // Ring-unresolved entries: excluded by default so a forged-ring or
+    // otherwise-unverifiable transaction is never selectable/mined.
+    UnresolvedRingPolicy unresolved_rings = UnresolvedRingPolicy::Exclude;
 
     friend bool operator==(const TxpoolSelectPolicy& a, const TxpoolSelectPolicy& b) noexcept {
         return a.required == b.required && a.min_peers == b.min_peers
-            && a.allow_stem == b.allow_stem;
+            && a.allow_stem == b.allow_stem
+            && a.unresolved_rings == b.unresolved_rings;
     }
     friend bool operator!=(const TxpoolSelectPolicy& a, const TxpoolSelectPolicy& b) noexcept {
         return !(a == b);
@@ -216,6 +267,14 @@ public:
 
     // Monotone; bumps whenever selectable_backlog() could differ.
     virtual std::uint64_t backlog_version() const = 0;
+
+    // The key images a pooled transaction spends, so the template can check
+    // them against the chain it extends (IChainView::probe_mined). Empty when
+    // the id is not pooled, or the pool does not track key images.
+    virtual std::vector<Hash> key_images_of(const Hash& id) const {
+        (void)id;
+        return {};
+    }
 };
 
 // ---------------------------------------------------------------------------

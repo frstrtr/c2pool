@@ -84,6 +84,7 @@ add_library(xmr_native_txpool STATIC
     rct/xmr_multiexp.cpp            # Straus multi-scalar multiplication
     rct/xmr_bulletproofs_plus.cpp   # the Bulletproof+ VERIFIER (no prover)
     rct/xmr_rct_verify.cpp          # balance + range proofs + key-image domain
+    rct/xmr_clsag_verify.cpp        # CLSAG ring-signature verify (input consensus)
     txpool/xmr_tx_decode.cpp        # relay-side transaction decoder + identity
     txpool/xmr_relayed_txpool.cpp   # the pool itself
 )

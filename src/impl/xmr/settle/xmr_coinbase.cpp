@@ -53,6 +53,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace v37 {
 namespace xmr {
@@ -87,6 +88,35 @@ static bool xmr_ref_shape_ok(const ::v37::ScriptRef& r) {
 }
 
 // ---------------------------------------------------------------------------
+// fee model S1/S2: IS the LAST fixed output the residual sink (same payout
+// ref AND same identity)? Then it is the single donation output of the p2pool shape (data.py: amounts[DONATION]
+// += subsidy - sum(amounts)): it absorbs the residual (no separate Sink output,
+// no sink slot) and its declared amount is a MINIMUM (the V36 >= 1 marker),
+// sourced from the residual first and, only when the owed pass exhausted the
+// budget, from the LARGEST owed output (V36: "take 1 from the largest payee").
+bool residual_folds_into_fixed(const CoinbaseInputs& in) {
+    return !in.fixed.empty() && in.fixed.back().pay == in.residual_sink &&
+           in.fixed.back().identity == in.residual_sink_identity;
+}
+
+// ---------------------------------------------------------------------------
+// MERGE: the owed the input set holds for the fold identity (owed_in).
+static bool is_fold_payee(const CoinbaseInputs& in, const ::v37::ScriptRef& pay,
+                          const ::v37::bytes32& id) {
+    return id == in.residual_sink_identity && pay == in.residual_sink;
+}
+std::uint64_t fold_identity_owed(const CoinbaseInputs& in) {
+    if (!residual_folds_into_fixed(in)) return 0;
+    std::uint64_t s = 0;
+    for (const auto& e : in.owed) {
+        if (!is_fold_payee(in, e.pay, e.identity)) continue;
+        constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+        s = (e.owed > kMax - s) ? kMax : s + e.owed;
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err) {
     auto fail = [&](BuildError e) -> std::vector<CoinbaseOutput> {
@@ -106,12 +136,17 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
         fixed_sum += f.amount;
     }
 
-    // Need room for every fixed output plus at least the sink slot.
-    if (in.fixed.size() + 1 > static_cast<std::size_t>(in.output_cap))
+    // S1: when the last fixed output pays the sink it IS the residual absorber,
+    // so no separate sink slot is reserved (and none is ever emitted).
+    const bool fold = residual_folds_into_fixed(in);
+    const std::size_t sink_slots = fold ? 0 : 1;
+
+    // Need room for every fixed output plus the sink slot (if any).
+    if (in.fixed.size() + sink_slots > static_cast<std::size_t>(in.output_cap))
         return fail(BuildError::CapTooSmall);
 
     const std::size_t cap_owed =
-        static_cast<std::size_t>(in.output_cap) - in.fixed.size() - 1;
+        static_cast<std::size_t>(in.output_cap) - in.fixed.size() - sink_slots;
 
     // K_fair order: oldest-owed-first (first_eligible asc), then identity_key asc
     // as a total, deterministic tiebreak. stable_sort so equal keys keep input
@@ -128,10 +163,22 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
     std::vector<CoinbaseOutput> res;
     res.reserve(sorted.size() + in.fixed.size() + 1);
 
-    // ---- owed pass: pay oldest-owed-first out of (budget - fixed) ----
-    std::uint64_t remaining = budget - fixed_sum;
+    // ---- owed pass: pay oldest-owed-first out of (budget - reserved fixed) ----
+    // S2: the folded donation output's minimum is NOT reserved up front (it is
+    // sourced from the residual, else from the largest owed output below), so
+    // the K_fair pass runs over budget - (fixed_sum - that minimum).
+    const std::uint64_t fold_min = fold ? in.fixed.back().amount : 0;
+    std::uint64_t remaining = budget - (fixed_sum - fold_min);
+    // MERGE: the fold identity's own owed entry is paid here at its K_fair
+    // position like any payee, but takes no output slot: its payout is moved
+    // into the folded output after S2 (one output per fold identity).
+    std::size_t n_slots = 0;
     for (const auto& e : sorted) {
-        if (res.size() >= cap_owed) break;   // cap reached -> rest carries
+        const bool merge = fold && is_fold_payee(in, e.pay, e.identity);
+        if (!merge && n_slots >= cap_owed) {  // cap reached -> rest carries
+            if (fold) continue;               // (a later merge entry still needs no slot)
+            break;
+        }
         if (remaining == 0) break;           // budget exhausted -> rest carries
         if (e.owed < in.h_min) continue;     // below payout floor -> carry, no output
         std::uint64_t amt = std::min(e.owed, remaining);
@@ -144,21 +191,65 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
         o.amount = amt;
         o.role = CoinbaseOutput::Role::Owed;
         res.push_back(std::move(o));
+        if (!merge) ++n_slots;
         remaining -= amt;
     }
 
+    // ---- S2: the folded donation minimum, when the residual cannot cover it,
+    // is deducted from the LARGEST owed output (ties: the earliest in K_fair
+    // order); an output driven to 0 is dropped (its owed simply carries). The
+    // deducted piconero stay OWED in the ledger (the on-chain booking pays the
+    // payee less), so nothing is lost -- exactly V36's dust rule.
+    std::uint64_t need = (fold && remaining < fold_min) ? fold_min - remaining : 0;
+    while (need > 0 && !res.empty()) {
+        std::size_t big = 0;
+        for (std::size_t i = 1; i < res.size(); ++i)
+            if (res[i].amount > res[big].amount) big = i;
+        const std::uint64_t take = std::min(need, res[big].amount);
+        res[big].amount -= take;
+        remaining += take;
+        need -= take;
+        if (res[big].amount == 0) res.erase(res.begin() + static_cast<std::ptrdiff_t>(big));
+    }
+
+    // ---- MERGE: move the fold identity's K_fair payout (after S2) into the
+    // folded output -- exactly one output pays it, the last one.
+    std::uint64_t merged_owed = 0;
+    if (fold) {
+        for (std::size_t i = 0; i < res.size();) {
+            if (is_fold_payee(in, res[i].pay, res[i].identity)) {
+                merged_owed += res[i].amount;
+                res.erase(res.begin() + static_cast<std::ptrdiff_t>(i));
+            } else {
+                ++i;
+            }
+        }
+    }
+
     // ---- fixed mandated outputs (declared order) ----
-    for (const auto& f : in.fixed) {
+    for (std::size_t i = 0; i < in.fixed.size(); ++i) {
+        const auto& f = in.fixed[i];
         CoinbaseOutput o;
         o.pay = f.pay;
         o.identity = f.identity;
         o.amount = f.amount;
         o.role = CoinbaseOutput::Role::Fixed;
+        // S1: the folded (last) fixed output IS the residual absorber: it pays
+        // max(minimum, residual) == everything the owed pass left.
+        // MERGE: plus the fold identity's K_fair payout; owed_part books what it
+        // receives against what it is owed first (see the header).
+        if (fold && i + 1 == in.fixed.size()) {
+            o.amount = merged_owed + remaining;
+            remaining = 0;
+            const std::uint64_t over_min = o.amount > fold_min ? o.amount - fold_min : 0;
+            o.owed_part = std::min(fold_identity_owed(in), over_min);
+        }
         res.push_back(std::move(o));
     }
 
     // ---- residual sink: absorbs unallocated budget + any rounding. NO BURN.
-    // residual == budget - fixed_sum - Sum(owed paid) == `remaining`.
+    // residual == budget - fixed_sum - Sum(owed paid) == `remaining` (always 0
+    // here when the residual folded into the last fixed output).
     const std::uint64_t residual = remaining;
     if (residual > 0) {
         CoinbaseOutput s;
@@ -172,7 +263,7 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
     // Invariants: non-empty, and exact-sum (this is CONS-1 for the XMR lane).
     // (residual==0 only when owed/fixed already consume the full budget, so res
     // is still non-empty; residual==budget when nothing else pays, so the sink
-    // carries it.)
+    // -- or the folded fixed output -- carries it.)
     if (err) *err = BuildError::None;
     return res;
 }

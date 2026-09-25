@@ -107,6 +107,8 @@
 #include <sharechain/v37/v37_descriptor.hpp>        // ScriptRef, ScriptKind (read-only canon)
 #include <sharechain/v37/v37_descriptor_xmr.hpp>    // xmr_ref_valid, is_xmr_kind, xmr_precarrot_ok
 #include <sharechain/v37/v37_hash.hpp>              // bytes32
+#include <c2pool/v37/xmr/xmr_credit_cut.hpp>         // recon(A+B credit): the on-chain credit cut tail
+#include <c2pool/v37/xmr/xmr_fee_model.hpp>          // fee model: the donation owed_in tail (V37D)
 
 #include "impl/xmr/coin/xmr_crypto_types.hpp"       // Bytes32, PublicKey, SecretKey, Hash256
 #include "impl/xmr/settle/xmr_coinbase.hpp"         // X6: CoinbaseInputs, build_coinbase, allocate_exact_sum, ...
@@ -190,9 +192,14 @@ struct XmrCoinbaseContext {
     // --- lane parameters (consensus once tapped; explicit flags until then) ---
     ::v37::ScriptRef      residual_sink;              // mandated absorber, XMR ref (REQUIRED, torsion-checked)
     ::v37::bytes32        residual_sink_identity{};   // its ledger identity_key (payout-map key)
-    std::vector<x6::FixedOutput> fixed;               // mandated dev/donation/finder outputs (optional)
+    std::vector<x6::FixedOutput> fixed;               // mandated fixed outputs: empty, or the ONE donation output (fee model ON; NO finder output)
     std::uint64_t         h_min = 0;                  // piconero floor per owed output (dust = 0 on XMR)
     std::uint32_t         output_cap = 0;             // TOTAL outputs cap C (weight_aware_output_cap(...))
+
+    // recon(A+B credit): the ON-CHAIN CREDIT CUT — the lane prefix P (+ its digest) the
+    // winner folds E_b at. Carried as the 0x02 tail (xmr_credit_cut.hpp).
+    bool                  has_credit_cut = false;
+    credit::CreditCut     credit_cut;
 
     std::uint64_t budget() const { return base_reward + fees; }
 };
@@ -240,7 +247,12 @@ public:
             if (!::v37::xmr::xmr_ref_valid(f.pay))
                 return refuse("refused: a fixed output is not a valid XMR ref");
         }
-        if (ctx.output_cap < ctx.fixed.size() + 1)
+        // fee model S1: when the last fixed output pays the sink it absorbs the
+        // residual itself (x6::residual_folds_into_fixed) -- no sink slot.
+        const bool sink_folds = !ctx.fixed.empty() && ctx.fixed.back().pay == ctx.residual_sink &&
+                                ctx.fixed.back().identity == ctx.residual_sink_identity;
+        const std::size_t sink_slots = sink_folds ? 0 : 1;
+        if (ctx.output_cap < ctx.fixed.size() + sink_slots)
             return refuse(std::string("refused: ") + x6::to_string(x6::BuildError::CapTooSmall));
         if (reward_hint == 0)
             return refuse(std::string("refused: ") + x6::to_string(x6::BuildError::ZeroBudget));
@@ -288,12 +300,16 @@ public:
         };
 
         const unsigned cap_owed = static_cast<unsigned>(
-            std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - 1,
+            std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - sink_slots,
                                   std::numeric_limits<unsigned>::max()));
 
         if (source == KFairSource::W4Propose) {
             // W4 canon picks the set over budget - Σfixed with C = cap - fixed - sink.
-            const std::uint64_t owed_budget = reward_hint - fixed_sum;
+            // fee model S2: a folded donation output's minimum is NOT reserved
+            // here -- X6 sources it from the residual, else from the LARGEST
+            // owed output (allocate_exact_sum), so W4 proposes over it too.
+            const std::uint64_t owed_budget =
+                reward_hint - fixed_sum + (sink_folds ? ctx.fixed.back().amount : 0);
             auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
                 return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
                                                   : std::numeric_limits<std::uint64_t>::max();
@@ -405,6 +421,23 @@ public:
     // depth 0 => the template emits [0x03][1+32][varint(0)][root], byte-equal
     // to X6 assemble_tx_extra's { varint(33) || 0x00 || root }.
     [[nodiscard]] std::uint64_t merkle_tree_data() const override { return 0; }
+
+    // recon(A+B credit): the credit cut as the 0x02 tail (empty when the ctx has none).
+    // fee model: when the residual folds into the donation output (gate ON
+    // only), the donation owed_in commitment "V37D" u64le goes first, so the
+    // receive side splits the ONE donation output without the ledger
+    // (xmr_fee_model.hpp). owed_in is reward-independent (the snapshot's
+    // input set), so the tail is fixed for the snapshot's life.
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
+        std::vector<std::uint8_t> t;
+        if (x6::residual_folds_into_fixed(m_inputs))
+            t = fee::encode_donation_owed_tail(x6::fold_identity_owed(m_inputs));
+        if (m_ctx.has_credit_cut) {
+            const std::vector<std::uint8_t> c = credit::encode_tail(m_ctx.credit_cut);
+            t.insert(t.end(), c.begin(), c.end());
+        }
+        return t;
+    }
 
     // =====================================================================
     // Value accessors (provider ring / FOUND record / KATs / ACCEPT check)

@@ -67,6 +67,7 @@ inline constexpr uint8_t  MINER_REWARD_UNLOCK_TIME   = 60;    // CRYPTONOTE_MINE
 inline constexpr uint8_t  NONCE_SIZE                 = 4;     // header miner nonce
 inline constexpr uint8_t  EXTRA_NONCE_SIZE           = 4;     // per-worker extra nonce (min)
 inline constexpr uint8_t  EXTRA_NONCE_MAX_SIZE       = EXTRA_NONCE_SIZE + 10; // padded to keep miner-tx weight invariant
+inline constexpr uint8_t  EXTRA_NONCE_BIND_MAX       = 32;    // SEAM-1: max per-job binding bytes after the nonce (rbind_v1)
 inline constexpr uint8_t  TX_VERSION                 = 2;
 inline constexpr uint8_t  TXIN_GEN                   = 0xFF;  // gen (coinbase) input tag
 inline constexpr uint8_t  TXOUT_TO_TAGGED_KEY        = 3;     // output target since view-tags (HF15)
@@ -170,6 +171,29 @@ public:
     // Foundation: a 1-leaf tree (encodes n_chains=1). A later leg widens this
     // to re-admit Tari-style aux mining without touching the builder.
     [[nodiscard]] virtual uint64_t merkle_tree_data() const = 0;
+
+    // recon(A+B credit): bytes appended to the 0x02 extra-nonce payload AFTER the
+    // per-worker nonce + weight padding (the ON-CHAIN CREDIT CUT, see
+    // c2pool/v37/xmr/xmr_credit_cut.hpp). Default empty => the template bytes
+    // are byte-identical for every implementer that does not override.
+    [[nodiscard]] virtual std::vector<uint8_t> extra_nonce_tail() const { return {}; }
+
+    // SEAM-1 (GAP-2 rbind): a per-extra_nonce BINDING region written right
+    // after the 4-byte worker nonce inside the 0x02 payload:
+    //     0x02 payload = [extra_nonce 4 | bind N | weight padding | tail]
+    // The relay binds a receipt's side_data_v2 (payee, give-author) to the
+    // share's RandomX PoW by putting rbind_v1(chain, side) here (N = 32);
+    // check_structural(BindMode::Rbind) reads payload[4..36). Default N = 0
+    // => the template bytes are byte-identical for every implementer that
+    // does not override (the gate-OFF / --relay-bind none case).
+    [[nodiscard]] virtual size_t extra_nonce_bind_size() const { return 0; }
+    // Fill `out` (extra_nonce_bind_size() bytes) for one extra_nonce. MUST be
+    // a pure function of extra_nonce for the life of the template (a job's
+    // blob is rebuilt at submit). false => the region stays zero (an unbound
+    // job: its receipts cannot pass BindMode::Rbind).
+    [[nodiscard]] virtual bool extra_nonce_bind(uint32_t extra_nonce, uint8_t* out) const {
+        (void)extra_nonce; (void)out; return false;
+    }
 };
 
 // ===========================================================================
@@ -188,7 +212,13 @@ public:
     XmrBlockTemplate& operator=(const XmrBlockTemplate& b);
 
     // Rebuild the template from fresh miner data + mempool backlog.
-    void update(const XmrMinerData& data, const std::vector<XmrTxMempoolData>& mempool);
+    // take_as_given (c2pool, GPLv3 s.5(a) notice): when true, `mempool` is the
+    // FINAL set already chosen by the AGPL good-citizen selector -- the 5-s age
+    // gate and the penalty-zone greedy re-selection are bypassed and the set is
+    // mined verbatim (only the 128 KB carrier cap still applies). Default false
+    // preserves the exact upstream p2pool selection path.
+    void update(const XmrMinerData& data, const std::vector<XmrTxMempoolData>& mempool,
+                bool take_as_given = false);
 
     [[nodiscard]] uint64_t last_updated() const { return m_lastUpdated.load(); }
     [[nodiscard]] uint64_t get_height()   const { return m_height.load(); }
@@ -244,8 +274,9 @@ private:
                                        bool dry_run);
 
     // Mempool -> m_mempoolTxs, with the 5-s age gate / high-fee bypass and the
-    // 128 KB carrier-size safeguard.
-    void select_mempool_transactions(const std::vector<XmrTxMempoolData>& mempool);
+    // 128 KB carrier-size safeguard. take_as_given bypasses the age gate/high-fee
+    // bypass (the carrier cap still applies) -- see update()'s notice.
+    void select_mempool_transactions(const std::vector<XmrTxMempoolData>& mempool, bool take_as_given);
 
     // v2 tx hash of the coinbase for a given extra_nonce, with extra_nonce and
     // the MM commitment root patched in-place (Keccak-midstate fast path).
@@ -292,6 +323,7 @@ private:
 
     std::atomic<uint64_t> m_finalReward{0};
     uint32_t        m_extraNonceSize = 0;
+    uint32_t        m_extraNonceBindSize = 0;   // SEAM-1: bytes after the worker nonce patched per extra_nonce
     uint64_t        m_merkleTreeData = 0;
     size_t          m_merkleTreeDataSize = 0;
 

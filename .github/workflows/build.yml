@@ -92,6 +92,12 @@ jobs:
       # so concurrent jobs can never tear each other's ~/.conan2 (root cause of the
       # 1.90.0 torn-header flakes). RUNNER_TEMP is only valid at step scope, so
       # export it via $GITHUB_ENV -- a job-level `env: runner.temp` fails to parse.
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.
@@ -179,9 +185,17 @@ jobs:
         # tevador/RandomX source (third_party/randomx, consensus pin 12f2c2ff)
         # and the xmr_randomx_verify_kat target. Non-sanitizer leg ONLY — the
         # RandomX JIT/asm + intentional unaligned reads do not survive
-        # -fsanitize, so the ASAN leg deliberately leaves it OFF. Light mode:
-        # the KAT never allocates the 2 GiB dataset (256 MiB cache only).
-        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON
+        # -fsanitize, so the ASAN leg deliberately leaves it OFF. Memory: the
+        # light KATs allocate a 256 MiB cache only; xmr_fast_mode_kat is the one
+        # target that builds the ~2080 MiB RandomX dataset (that is the thing it
+        # tests -- FULL_MEM hashes must equal light hashes), and it SKIPS itself
+        # with a printed note rather than failing if the allocation is refused.
+        #
+        # -DXMR_BUILD_OPTION_B_KATS=ON: register + build the two option-B XMR
+        # KATs (xmr_template_primitives_kat, xmr_block_assembly_kat) so they get
+        # RUN coverage on this non-sanitizer leg. They are logic/byte-identity
+        # KATs (no RandomX JIT); the ASan leg leaves the option OFF. #1543.
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DXMR_BUILD_RANDOMX=ON -DXMR_BUILD_OPTION_B_KATS=ON
 
       # Boost header-integrity + version gate: a torn/mixed Boost tree or apt-Boost
       # fallback fails HERE (fast, one TU), not deep in the coin build.
@@ -226,32 +240,50 @@ jobs:
                     dgb_gentx_coinbase_test dgb_connection_coinbase_test dgb_won_block_serialize_test dgb_pplns_payout_split_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_underfill_guard_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test nmc_mempool_name_test nmc_block_broadcast_test nmc_host_dualpath_test nmc_fallback_path_conformance_test nmc_header_sync_golden_test dgb_gentx_share_path_test dgb_conn_pplns_producer_test dgb_other_tx_resolver_test \
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_live_node_status_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test dgb_aux_doge_submit_test dgb_aux_doge_embed_livewire_test dgb_aux_doge_dc_layout_verifier_test dgb_aux_doge_coinbase_commit_test dgb_aux_doge_residency_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test multishield_v4_kat_test header_chain_test \
-                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_target_retarget_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_auto_ratchet_sim_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_min_protocol_ratchet_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test dgb_emergency_decay_saturation_test dgb_arith256_muldiv_kat_test dgb_share_tx_relay_refs_test dgb_coin_peer_rearm_test v37_test v37_executor_test v37_scaffold_test v37_w2_ingestion_test v37_w4_prereq_test v37_w4_settlement_test v37_w5_coinbase_test v37_r1_coinbase_budget_test v37_w3_relay_test v37_subthreshold_estimator_test v37_w6_persistence_test c2pool-v37-w6-leveldb-compile-check v37_w4_estimator_wiring_test v37_xmr_node_smoke v37_1_activation_test v37_a2_multinode_test v37_w3_wire_freeze_kat v37_a2_live_index_test v37_a2_sendside_test v37_w4_owed_incremental_test v37_s1_live_wiring_kat v37_s1c_convergence_kat v37_owed_event_mmr_kat v37_1_ridge_activation_test v37_drops_activation_kat v37_drops_step2_wiring_kat v37_drops_arity1_activation_kat v37_drops_arity1_activation_kat_livegeom \
+                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_target_retarget_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_auto_ratchet_sim_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_min_protocol_ratchet_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test dgb_emergency_decay_saturation_test dgb_arith256_muldiv_kat_test dgb_share_tx_relay_refs_test dgb_coin_peer_rearm_test v37_test v37_executor_test v37_scaffold_test v37_w2_ingestion_test v37_w4_prereq_test v37_w4_settlement_test v37_w5_coinbase_test v37_r1_coinbase_budget_test v37_w3_relay_test v37_subthreshold_estimator_test v37_w6_persistence_test c2pool-v37-w6-leveldb-compile-check v37_w4_estimator_wiring_test v37_xmr_node_smoke v37_1_activation_test v37_a2_multinode_test v37_w3_wire_freeze_kat v37_a2_live_index_test v37_a2_sendside_test v37_w4_owed_incremental_test v37_s1_live_wiring_kat v37_s1c_convergence_kat v37_kfloor_laneparam_kat v37_owed_event_mmr_kat v37_carrier_relay_robustness_kat v37_convergence_supply_kat v37_convergence_apply_kat v37_rb_stripe_kat v37_rb_map_churn_kat v37_rb_lane_tag_kat v37_rb_cb_class_kat v37_rb_checkpoint_kat v37_rb_gate_off_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_1_ridge_activation_test v37_drops_activation_kat v37_drops_step2_wiring_kat v37_drops_arity1_activation_kat v37_drops_arity1_activation_kat_livegeom \
                     v37_descriptor_xmr_test \
                     v37_xmr_canon_p1_kat \
+                    v37_payout_carriage_kat \
+                    v37_payout_rule_l_kat \
                     c2pool-v37-btc v37_btc_node_smoke v37_btc_digest_drift_kat f1_finalize_kat_btc c2pool-v37-btc-dash \
                     xmr_primitives_selfcheck xmr_x2_node_kat xmr_receipt_kat xmr_torsion_kat xmr_wire_dos_check xmr_stratum_selftest xmr_provenance_gate \
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke c2pool-v37-xmr \
-                    v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck \
-                    xmr_randomx_verify_kat v37_xmr_o2_randomx_kat \
+                    v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck v37_xmr_cba_native_booking_kat v37_xmr_relay_native_feed_kat v37_xmr_lane_suspend_selfcheck v37_xmr_relay_repair_hold_kat \
+                    xmr_randomx_verify_kat v37_xmr_o2_randomx_kat xmr_cpu_miner_kat \
+                    xmr_template_primitives_kat xmr_block_assembly_kat \
+                    xmr_fast_mode_kat xmr_msr_boost_kat \
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
                     xmr_native_block_id_kat xmr_native_consensus_state_kat \
-                    xmr_native_anchor_self_check_kat xmr_native_chain_index_kat \
+                    xmr_native_anchor_self_check_kat xmr_native_anchor_gate4_kat xmr_native_chain_index_kat \
                     xmr_native_reorg_follow_kat \
                     xmr_levin_socket_kat xmr_levin_link_kat \
                     xmr_native_rct_verify_kat xmr_native_txpool_kat \
+                    xmr_native_clsag_verify_kat xmr_native_output_set_kat xmr_native_output_set_mmap_kat \
                     xmr_native_chain_locator_kat xmr_native_peer_store_kat \
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
+                    xmr_native_dos_dup_block_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
+                    xmr_native_citizen_select_kat \
+                    xmr_native_inject_select_kat xmr_native_inject_pool_kat \
                     xmr_native_block_relay_kat xmr_c5_regtest_push \
                     xmr_native_parity_kat xmr_native_txpool_parity_kat \
                     xmr_native_backlog_famine_kat \
                     xmr_native_m4_soak_kat \
                     xmr_native_m4_ptpl_backlog_gate_kat \
                     xmr_native_node_kat xmr_native_node \
+                    xmr_native_snapshot_resume_kat xmr_native_neartip_stall_kat \
+                    xmr_native_template_dup_tx_kat \
                     v37_xmr_m2_native_settlement_kat \
+                    v37_xmr_credit_cut_kat \
+                    v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
+                    v37_xmr_daemonless_selfmine_kat \
+                    v37_xmr_p2p_publish_retry_kat \
+                    v37_xmr_mainnet_readiness_kat \
+                    v37_xmr_d6d_native_seed_tip_kat \
+                    xmr_native_anchor_gate4_kat \
+                    xmr_native_snapshot_resume_kat \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
 
       - name: Run tests
@@ -264,6 +296,16 @@ jobs:
           ctest --output-on-failure --no-tests=error --output-junit "${GITHUB_WORKSPACE}/ci-logs/ctest-linux.xml" -j8 --exclude-regex "LiveTest\." 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/run-tests.log"
           # Suspenders: reject a hollow green where the report has < floor cases.
           bash "${GITHUB_WORKSPACE}/scripts/ci/test_floor_guard.sh" linux "${GITHUB_WORKSPACE}/ci-logs/ctest-linux.xml"
+
+      # #1671: the default (BLS-OFF/stub) c2pool-dash must be HONEST about being
+      # BLS-dark — `--version` says bls=stub, and it REFUSES a BLS-relying config
+      # (--run --embedded-null-arm; the refuse-to-start gate lives on the --run
+      # dispatch) naming the --allow-stub-bls exit command, flipping to a loud
+      # BLS-dark self-ID under that override. The script self-classifies
+      # from the artefact, so it validates whichever backend this build produced;
+      # the real-BLS side is covered by the linux-dash-bls job.
+      - name: BLS honesty — stub binary refuses BLS-relying configs (#1671)
+        run: bash scripts/ci/dash_bls_stub_honesty.sh build_ci/src/c2pool/c2pool-dash
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -402,6 +444,18 @@ jobs:
           TTL="${HEAVY_LEG_TTL:-14400}"
           SWEEP="${HEAVY_LEG_SWEEP:-1}"
           SLOTS="${HEAVY_LEG_SLOTS:-2}"
+          # Host-memory-aware clamp: never run more concurrent heavy legs than the
+          # runner RAM can hold (~20 GB budgeted per ASan/CodeQL leg). On the
+          # 62 GB VM905 build host this is a NO-OP (2 kept, since 62/20 >= 2); on a
+          # 31 GB runner (e.g. .198, 0 swap) it clamps to 1 so two heavy legs cannot
+          # co-OOM the box. The HEAVY_LEG_SLOTS test override still wins (clamp skipped).
+          if [ -z "${HEAVY_LEG_SLOTS:-}" ]; then
+            _mem_gb=$(( $(awk "/^MemTotal:/{print \$2}" /proc/meminfo) / 1024 / 1024 ))
+            _mem_cap=$(( _mem_gb / 20 ))
+            [ "$_mem_cap" -lt 1 ] && _mem_cap=1
+            [ "$SLOTS" -gt "$_mem_cap" ] && SLOTS="$_mem_cap"
+            echo "heavy-leg: host RAM ${_mem_gb}G -> memory cap ${_mem_cap} slot(s); using SLOTS=$SLOTS"
+          fi
           ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
 
           # Slot files are ${LOCK}.1 .. ${LOCK}.SLOTS; each slot's live holder records a
@@ -672,31 +726,48 @@ jobs:
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_live_node_status_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test dgb_aux_doge_submit_test dgb_aux_doge_embed_livewire_test dgb_aux_doge_dc_layout_verifier_test dgb_aux_doge_coinbase_commit_test dgb_aux_doge_residency_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test multishield_v4_kat_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_target_retarget_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_auto_ratchet_sim_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_min_protocol_ratchet_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test dgb_emergency_decay_saturation_test dgb_arith256_muldiv_kat_test dgb_share_tx_relay_refs_test dgb_coin_peer_rearm_test test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
-                    v37_test v37_executor_test v37_scaffold_test v37_w2_ingestion_test v37_w4_prereq_test v37_w4_settlement_test v37_w5_coinbase_test v37_r1_coinbase_budget_test v37_w3_relay_test v37_subthreshold_estimator_test v37_w6_persistence_test c2pool-v37-w6-leveldb-compile-check v37_w4_estimator_wiring_test v37_xmr_node_smoke v37_1_activation_test v37_a2_multinode_test v37_w3_wire_freeze_kat v37_a2_live_index_test v37_a2_sendside_test v37_w4_owed_incremental_test v37_s1_live_wiring_kat v37_s1c_convergence_kat v37_owed_event_mmr_kat v37_1_ridge_activation_test v37_drops_activation_kat v37_drops_step2_wiring_kat v37_drops_arity1_activation_kat v37_drops_arity1_activation_kat_livegeom \
+                    v37_test v37_executor_test v37_scaffold_test v37_w2_ingestion_test v37_w4_prereq_test v37_w4_settlement_test v37_w5_coinbase_test v37_r1_coinbase_budget_test v37_w3_relay_test v37_subthreshold_estimator_test v37_w6_persistence_test c2pool-v37-w6-leveldb-compile-check v37_w4_estimator_wiring_test v37_xmr_node_smoke v37_1_activation_test v37_a2_multinode_test v37_w3_wire_freeze_kat v37_a2_live_index_test v37_a2_sendside_test v37_w4_owed_incremental_test v37_s1_live_wiring_kat v37_s1c_convergence_kat v37_kfloor_laneparam_kat v37_owed_event_mmr_kat v37_carrier_relay_robustness_kat v37_convergence_supply_kat v37_convergence_apply_kat v37_rb_stripe_kat v37_rb_map_churn_kat v37_rb_lane_tag_kat v37_rb_cb_class_kat v37_rb_checkpoint_kat v37_rb_gate_off_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_1_ridge_activation_test v37_drops_activation_kat v37_drops_step2_wiring_kat v37_drops_arity1_activation_kat v37_drops_arity1_activation_kat_livegeom \
                     v37_descriptor_xmr_test \
                     v37_xmr_canon_p1_kat \
+                    v37_payout_carriage_kat \
+                    v37_payout_rule_l_kat \
                     c2pool-v37-btc v37_btc_node_smoke v37_btc_digest_drift_kat f1_finalize_kat_btc \
-                    v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck \
+                    v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck v37_xmr_cba_native_booking_kat v37_xmr_relay_native_feed_kat v37_xmr_lane_suspend_selfcheck v37_xmr_relay_repair_hold_kat \
                     xmr_primitives_selfcheck xmr_x2_node_kat xmr_receipt_kat xmr_torsion_kat xmr_wire_dos_check xmr_stratum_selftest xmr_provenance_gate \
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke \
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
                     xmr_native_block_id_kat xmr_native_consensus_state_kat \
-                    xmr_native_anchor_self_check_kat xmr_native_chain_index_kat \
+                    xmr_native_anchor_self_check_kat xmr_native_anchor_gate4_kat xmr_native_chain_index_kat \
                     xmr_native_reorg_follow_kat \
                     xmr_levin_socket_kat xmr_levin_link_kat \
                     xmr_native_rct_verify_kat xmr_native_txpool_kat \
+                    xmr_native_clsag_verify_kat xmr_native_output_set_kat xmr_native_output_set_mmap_kat \
                     xmr_native_chain_locator_kat xmr_native_peer_store_kat \
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
+                    xmr_native_dos_dup_block_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
+                    xmr_native_citizen_select_kat \
+                    xmr_native_inject_select_kat xmr_native_inject_pool_kat \
                     xmr_native_block_relay_kat xmr_c5_regtest_push \
                     xmr_native_parity_kat xmr_native_txpool_parity_kat \
                     xmr_native_backlog_famine_kat \
                     xmr_native_m4_soak_kat \
                     xmr_native_m4_ptpl_backlog_gate_kat \
                     xmr_native_node_kat xmr_native_node \
+                    xmr_native_snapshot_resume_kat xmr_native_neartip_stall_kat \
+                    xmr_native_template_dup_tx_kat \
                     v37_xmr_m2_native_settlement_kat \
+                    v37_xmr_credit_cut_kat \
+                    v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
+                    v37_xmr_daemonless_selfmine_kat \
+                    v37_xmr_p2p_publish_retry_kat \
+                    xmr_msr_boost_kat \
+                    v37_xmr_mainnet_readiness_kat \
+                    v37_xmr_d6d_native_seed_tip_kat \
+                    xmr_native_anchor_gate4_kat \
+                    xmr_native_snapshot_resume_kat \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.
                  # xmr_provenance_gate: previously omitted here because
                  # -fsanitize=undefined rejected its constexpr pointer comparison
@@ -765,6 +836,12 @@ jobs:
       # self-hosted host never tear each other's cache (root of the boost
       # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
       # fails to parse.
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           # github-hosted: ephemeral per-job home, warmed by actions/cache below.
@@ -1121,6 +1198,12 @@ jobs:
       # For an observability defect the check IS the fix: fail closed if the
       # checked-out HEAD is ever not the head we asked for, and force the full
       # working tree back onto disk before any consumer reads it.
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Assert head + materialize tree + guard cache path (fail closed)
         working-directory: ${{ github.workspace }}
         run: |
@@ -1157,8 +1240,44 @@ jobs:
           # (Node 20 requires the shell to pre-expand the quoted glob,
           # which fails on CI's bash + JSON-quoted package.json script).
           node-version: '22'
-          cache: npm
-          cache-dependency-path: web-static/sharechain-explorer/package-lock.json
+          # setup-node's built-in `cache: npm` is deliberately NOT used. It runs
+          # @actions/glob over cache-dependency-path, which canonicalizes the
+          # lockfile to this runner's _work realpath
+          # (/mnt/ci/runners/heavy-1/...) and then rejects it as "not under
+          # GITHUB_WORKSPACE" because GITHUB_WORKSPACE is the un-canonicalized
+          # symlink path (/home/user0/actions-runner-heavy-1/_work/...). The file
+          # IS present (guard above passes); the realpath-vs-symlink prefix
+          # compare is what fails (run 35620528834; H-A path-root mismatch). A
+          # `run:` step follows the symlink transparently, so we cache npm
+          # explicitly below with a shell-hashed key — immune on every runner.
+          # (Durable infra fix: re-point the runner workDir to its realpath so no
+          # symlink exists; operator-owned, tracked separately.)
+
+      - name: Compute npm cache key (symlink-safe; no @actions/glob)
+        working-directory: ${{ github.workspace }}
+        id: npmcache
+        run: |
+          lock="web-static/sharechain-explorer/package-lock.json"
+          # Regression guard (standing rule: assertion ships in the fixing PR).
+          # Hash the lockfile via the shell — exactly the path setup-node's
+          # @actions/glob choked on. If a future runner reintroduces a
+          # workspace-root mismatch this step still succeeds (shell follows the
+          # symlink), proving the fix is topology-independent; a genuinely
+          # absent/moved lockfile fails loudly here instead of as an opaque red.
+          if [ ! -f "$lock" ]; then
+            echo "::error title=cache-dependency-path unresolved::${lock} absent on disk. Fix the path or the checkout, NOT the cache step." >&2
+            exit 1
+          fi
+          h="$(sha256sum "$lock" | cut -d' ' -f1)"
+          echo "key=npm-web-static-${h}" >> "$GITHUB_OUTPUT"
+          echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+          echo "npm cache key npm-web-static-${h}; lockfile hashed via shell (symlink-safe)"
+
+      - uses: actions/cache@v5
+        with:
+          path: ${{ steps.npmcache.outputs.dir }}
+          key: ${{ steps.npmcache.outputs.key }}
+          restore-keys: npm-web-static-
 
       - name: Install dependencies
         run: npm ci
@@ -1769,6 +1888,12 @@ jobs:
       # self-hosted host never tear each other's cache (root of the boost
       # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
       # fails to parse.
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Set per-job Conan home
         run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
 
@@ -1897,6 +2022,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Acquire VM905 build-host heavy-leg semaphore
+        uses: ./.github/actions/heavy-leg-lock
+        with:
+          lock-file: /tmp/c2pool-build-heavy-leg.lock
+          holder-file: /tmp/c2pool-build-heavy-leg.holder
+          slots: "3"
       - name: Set per-job Conan home
         run: |
           if [ "${{ runner.environment }}" = "github-hosted" ]; then
@@ -1979,6 +2110,15 @@ jobs:
       # LEG 2: the artefact itself carries the dashbls backend.
       - name: BLS link guard (binary carries dashbls)
         run: bash scripts/ci/dash_bls_linked_guard.sh build_dash_bls/src/c2pool/c2pool-dash
+
+      # LEG 2b (#1671): the RUNTIME surfaces are honest — `--version` self-report
+      # agrees with the linked backend, and this REAL binary does NOT refuse a
+      # BLS-relying config (--run --embedded-null-arm; the refuse-to-start gate
+      # lives on the --run dispatch and must be transparent on a capable build).
+      # Complements the artefact leg above with behaviour. The
+      # stub side of the same script runs in the main `linux` job.
+      - name: BLS honesty — real binary (self-report + no false refusal)
+        run: bash scripts/ci/dash_bls_stub_honesty.sh build_dash_bls/src/c2pool/c2pool-dash
 
       - name: Run BLS KATs
         working-directory: build_dash_bls

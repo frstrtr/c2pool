@@ -21,6 +21,8 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -67,7 +69,10 @@ inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 //     mandated fixed outputs ++ exact-sum residual sink), assembled from
 //     get_miner_data over the W4 OwedLedger. Requires a torsion-valid residual
 //     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
-//     without a valid sink the daemon refuses to serve.
+//     without a valid sink the daemon refuses to serve. Under --fee-model v1
+//     (LaneParams::fee) the ONE mandated fixed output is the protocol donation
+//     output (owed + 1 + residual) and the residual sink IS the donation address
+//     (xmr_fee_model.hpp, compiled-in -- no per-node knob).
 enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
 
 // M2: which miner-data source the option-B assembler is fed from.
@@ -187,6 +192,10 @@ struct XmrNodeConfig {
     //   --same-height-renotify <n>   (0 disables the bounded re-announce)
     SameHeightTieBreak same_height_tiebreak = SameHeightTieBreak::PreferOwn;
     std::uint32_t      same_height_renotify = 3;
+    //   --own-fork-bound-s <n>  the native index's own-fork liveness guard: an
+    //   own-mined tip that no peer adopts for this long is abandoned and the
+    //   node follows the peers' chain (0 disables). Default 2 x target.
+    std::uint32_t      own_fork_bound_s = 240;
     // Per-height verdict journal. "" = race.log next to settle.img; "off" =
     // none. Two nodes that watched the same race must agree on every height
     // either of them credited, and a journal is what turns that claim into a
@@ -250,14 +259,31 @@ struct XmrNodeConfig {
     // the coinbase bytes (it may stay empty; the serve port opens when the
     // residual sink is set, mirroring option A's payout_address gate).
     CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
-    // The mandated residual sink (REQUIRED for v37 mode): the raw public spend
-    // (B) + view (A) keys, 64 hex each, of the XMR wallet the exact-sum residual
-    // is paid to. Torsion-checked at build; the daemon REFUSES v37 mode without
-    // a valid sink. --residual-sink-subaddress builds an XMR_SUB (D_i, A_main).
+    // The mandated residual sink (REQUIRED for v37 mode with the fee model OFF):
+    // the raw public spend (B) + view (A) keys, 64 hex each, of the XMR wallet
+    // the exact-sum residual is paid to. Torsion-checked at build; the daemon
+    // REFUSES v37 mode without a valid sink. --residual-sink-subaddress builds
+    // an XMR_SUB (D_i, A_main). With --fee-model v1 (LaneParams::fee) the sink
+    // IS the protocol donation address (xmr_fee_model.hpp) and these are refused.
     std::string     residual_sink_spend_hex;
     std::string     residual_sink_view_hex;
     bool            residual_sink_subaddress = false;
     // The v37 lane parameters (consensus once multi-node; explicit here).
+    //
+    // STEP-0 k_floor hotfix — why the XMR floor is NOT moved into LaneParams
+    // (unlike Family A, where btc_node.hpp's coinbase_budget() now reads the
+    // digest-committed LaneParams::k_floor): the XMR lane settles under
+    // COINBASE AUTHORITY (xmr_coinbase_authority.hpp, RECON ruling "read from
+    // block"). Every node books the winner's ON-CHAIN coinbase — payout =
+    // CoinbaseBooking::payout decoded from the block — and never deducts a
+    // locally rebuilt coinbase, so a node running a different settle_h_min
+    // (or settle_output_cap) mines a different but VALID coinbase that every
+    // peer books identically; the K_fair recompute is a cross-check alarm only.
+    // A differing floor therefore cannot fork owed_digest here. The XMR lane
+    // keeps LaneParams::k_floor = 0 (Monero has no dust rule; the lane digest,
+    // the lane tag and the relay HELLO lane_params_digest stay byte-identical).
+    // If XMR ever settles by rebuild instead of by reading the block, this
+    // floor must move into LaneParams exactly as Family A's did.
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
@@ -285,6 +311,47 @@ struct XmrNodeConfig {
     bool            native_allow_unverified_pow = false;
     // Trust-anchor bundle for a cold start above genesis ("" => embedded).
     std::string     native_anchor_path;
+    // Format-2 O-backfill: an output-set snapshot (ChainOutputSet::serialize()
+    // form) re-derived to a format-2 anchor's committed output/spent roots, so a
+    // node booting that anchor resolves pre-anchor (below-base) rings. Requires
+    // --native-anchor to name a format-2 bundle. Rejected under --native-solo.
+    std::string     native_output_set_path;
+    // GATE 4 (the anchor's NETWORK confirm) and its bound. The embedded node
+    // refuses to start until the block the bundle pins has been fetched from
+    // live peers and re-hashed to the pinned id -- at most `peers` distinct
+    // handshaked peers are asked, each gets `peer_ms`, and the whole gate
+    // expires after `timeout_ms` AS A REFUSAL.
+    //
+    // These three widen the window for an operator on a slow or heavily
+    // filtered link. The standalone xmr_native_node tool has exposed them since
+    // the gate landed and the pool binary did not, which left a mainnet
+    // operator whose only reachable peer takes fifteen seconds to answer with
+    // no way to say so -- and a refusal that looks like a broken build. There
+    // is deliberately NO knob here that turns the gate off.
+    //
+    // The defaults are AnchorConfirmConfig's own; the mainnet-readiness KAT
+    // pins the two sets equal so they cannot drift apart silently.
+    std::uint32_t   anchor_confirm_peers      = 4;
+    std::uint64_t   anchor_confirm_timeout_ms = 60000;
+    std::uint64_t   anchor_confirm_peer_ms    = 12000;
+    // --native-seeds (alias --seeds): let the embedded node bootstrap from the
+    // network's own seed sets instead of only from pinned --native-connect
+    // peers. On MAINNET that is four DNS seed hosts (monerod guards them with
+    // `if (m_nettype == MAINNET)`, and so does p2p::dns_seeds) plus six
+    // compiled-in IP seeds; testnet and stagenet correctly have no DNS seeds
+    // and fall through to five IP seeds each. OFF by default -- a private or
+    // regtest rig must dial only what it was told to.
+    bool            native_use_seeds = false;
+    // Where the embedded node's chain-index snapshot lives. Empty (the default)
+    // = no persistence, and a restart re-walks the chain from the anchor. When
+    // set, the image is read after gate 4 confirms and written on a clean stop
+    // and on a cadence. It is NOT a second trust root: the file is bound to the
+    // anchor identity the network vouched for, and any mismatch -- absent,
+    // corrupt, foreign network, different anchor -- falls back to the anchor
+    // boot rather than to a weaker check.
+    std::string     native_snapshot_path;
+    // Seconds between periodic saves. 0 = only on a clean stop.
+    std::uint64_t   native_snapshot_every_s = 300;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
     // production posture; OFF is what makes "the template path made no daemon
     // call" falsifiable rather than merely asserted.
@@ -292,14 +359,48 @@ struct XmrNodeConfig {
     // How long the daemon waits for the native arm to become ready before it
     // refuses to start (fail-closed: it never serves a half-built window).
     std::uint32_t   native_ready_timeout_s = 120;
-    // Rebuild the served template when the native POOL moves, not only when the
-    // parent tip does, at most once per this many seconds. 0 (the default, and
-    // what M0..M2 shipped) is TIP-ONLY. A block consumes the pool, so a
+    // Rebuild the served template when the POOL moves, not only when the parent
+    // tip does, at most once per this many seconds. Applies to BOTH template
+    // arms: the native arm keys on its pool's backlog_version, the daemon
+    // (monerod get_miner_data) arm on the fingerprint of the offered tx_backlog
+    // (--backlog-refresh is the arm-neutral spelling of --native-backlog-refresh).
+    // Default 3 s. 0 is the legacy TIP-ONLY posture (what M0..M2 shipped, and
+    // what the daemon arm ran until 2026-09-22). A block consumes the pool, so a
     // tip-only arm serves the empty template built at the start of every block
-    // interval and collects almost none of the fees that arrive during it. The
-    // cost of turning it on is a restamped header under miners mid-grind, which
-    // is why the default does not move.
-    std::uint64_t   native_backlog_refresh_s = 0;
+    // interval and collects almost none of the fees that arrive during it,
+    // which violates the good-citizen hard rule; hence the default is on. The
+    // cost of turning it on is a restamped header under miners mid-grind,
+    // absorbed by the retained-epoch job ring.
+    std::uint64_t   native_backlog_refresh_s = 3;
+
+    // #1680 lever. Cap on outstanding solicited-reply DoS credits (DosConfig::
+    // max_solicited_credits). Default 8 = fix #1 armed: a NEW_FLUFFY_BLOCK (2008)
+    // that answers our own REQUEST_FLUFFY_MISSING_TX (2009) spends a credit
+    // instead of a block token. Set 0 to DISABLE fix #1 (pre-#1680 behaviour)
+    // while leaving fix #2 -- the GET_OBJECTS fallback for a stranded park -- in
+    // place; the live fix-2 proof leans on this.
+    std::uint32_t   native_dos_solicited_credits = 8;
+
+    // --no-good-citizen: disable the good-citizen path (the CONTROL switch for
+    // the live proof -- reproduces the old coinbase-only-with-a-full-pool
+    // failure). Native arm: no take-mempool-as-given. Daemon arm: legacy
+    // tip-only rebuild (backlog_refresh_s forced to 0). Default false = ON.
+    bool            no_good_citizen = false;
+
+    // --- OPERATOR TX-INJECTION (2026-09-19 ruling) --------------------------
+    // --native-inject: ARM the operator-inject path (default OFF, money-live,
+    // mirrors Dash --embedded-tx-inject). When on, operator-submitted signed
+    // txs are placed FIRST at highest priority in the served template (mined
+    // even at 0 fee), with first claim on the block-weight cap.
+    bool            native_inject = false;
+    // --native-inject-dir <dir>: poll <dir>/*.hex (one signed raw tx hex each),
+    // routing each through submit_operator_inject and renaming it .done.
+    std::string     native_inject_dir;
+    // --native-inject-hex <file>: one signed raw tx hex per line, loaded once at
+    // startup (all-or-nothing), mirrors Dash --embedded-tx-inject-hex.
+    std::string     native_inject_hex;
+    // TTL (blocks) for an inject submitted with no explicit expiry.
+    std::uint64_t   native_inject_ttl_blocks = 720;
 
     // --- M3: the arm order on the FIND path ---------------------------------
     // --arm-order daemon-first (default) | p2p-first. See ArmOrderMode above.
@@ -314,6 +415,43 @@ struct XmrNodeConfig {
     // one line). The C6 parity oracle then has no judge and scores its samples
     // VOID, which is the honest cost and is exactly why this is not the default.
     bool            no_daemon_rpc = false;
+    // D6d: --native-parity-monerod. Under p2p-first the embedded node is the
+    // tip, the RandomX seed (hash + height, switching at every 2048-block epoch
+    // with the 64-block lag) and the difficulty/height source, all read off its
+    // own chain index -- so by DEFAULT it is handed no monerod endpoint at all,
+    // and the C6 parity judge's status-cadence round trips (get_miner_data for
+    // the shadow arm, get_info + get_last_block_header for the tip) are gone.
+    // This flag opts the judge back in as a COMPARE-ONLY oracle: it is read on
+    // the status cadence, never on the find path, and never decides anything.
+    // Daemon-first is unaffected (the daemon is its parity judge and submit arm
+    // either way); --no-daemon-rpc still wins over it.
+    bool            native_parity_monerod = false;
+
+    // --- the SOLO (fully self-contained, peerless) configuration ------------
+    //
+    // --native-solo. p2p-first already removes the daemon from the find path;
+    // this removes the NETWORK from it as well. One process, its own chain from
+    // the locally assembled genesis block, its own template, its own hashing
+    // (--mine), its own find, its own finalize -- with nothing else running on
+    // the machine and nothing on the wire.
+    //
+    // It is a STRICT EXTENSION of p2p-first and turns three things on together,
+    // because any one of them without the others is a broken configuration
+    // rather than a weaker one:
+    //   (1) zero --native-connect peers becomes legal (and the genesis blob is
+    //       assembled locally: BootMode::LocalGenesis, since there is nobody to
+    //       ask for it);
+    //   (2) the node is force-synced -- "synced" is defined against a peer
+    //       cohort and there is no cohort, so without this the template arm's
+    //       readiness gate never opens;
+    //   (3) a found block that reached no peer but that our OWN chain index
+    //       accepted is booked as found (P2pBlockPublisher::enable_solo_own_index).
+    //
+    // WHAT IT COSTS, stated rather than hidden: a solo find is attested by our
+    // own index and by nothing else. That is the correct and only available
+    // claim on a private chain -- we ARE the network there -- and it is why
+    // this mode refuses mainnet outright below.
+    bool            native_solo = false;
 
     // --- storage ------------------------------------------------------------
     // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).
@@ -327,6 +465,40 @@ struct XmrNodeConfig {
     // a network block (fail-closed — no unverified block is ever submitted).
     bool            randomx_enabled = false;
     bool            randomx_large_pages = false;
+
+    // --- in-process RandomX CPU miner (--mine) ------------------------------
+    // OFF BY DEFAULT, and that is a hard property, not a preference: every
+    // existing deployment of this daemon must keep behaving exactly as it did,
+    // and a node that starts eating cores because it was launched is a bad
+    // neighbour to its own event loop. --mine [threads] turns it on.
+    //
+    // The miner is an ADDITIVE worker (src/impl/xmr/pow/xmr_cpu_miner.hpp). It
+    // produces nothing the node does not already validate: a hit re-enters
+    // through the SAME (template_id, nonce, extra_nonce) triple a stratum
+    // client would submit, and the exact 128-bit RandomX gate in front of the
+    // publish arm makes the same decision it makes for an external miner.
+    bool            mine_enabled = false;
+    // 0 = auto: half of hardware_concurrency (one thread per physical core on a
+    // 2-way SMT box). RandomX gains little from SMT siblings.
+    unsigned        mine_threads = 0;
+    // --mine-fast: RANDOMX_FLAG_FULL_MEM + a ~2080 MiB dataset. Opt-in, because
+    // the allocation and the multi-second init are not something a node should
+    // do behind its operator's back. Default is LIGHT (256 MiB cache).
+    bool            mine_fast = false;
+    // Huge pages are ASKED FOR by default and fall back to 4 KiB pages silently
+    // when the host has none configured (--mine-no-huge-pages forces 4 KiB).
+    bool            mine_large_pages = true;
+    // One worker pinned per CPU, physical cores first (--mine-no-affinity off).
+    bool            mine_pin = true;
+    // --mine-msr: the per-microarchitecture MSR tuning ("randomx_boost"), worth
+    // roughly 5-15 % on the parts it covers. DEFAULT OFF and deliberately hard
+    // to switch on by accident: it needs root, it writes model-specific
+    // registers that are MACHINE-WIDE and outlive this process, and it only
+    // knows a handful of families. Without it, and on every path where it
+    // declines (not root, no msr module, unknown CPU), the node prints one line
+    // and mines exactly as before. See src/impl/xmr/pow/xmr_msr_boost.hpp for
+    // the register-value provenance and the restore-on-exit contract.
+    bool            mine_msr = false;
 
     // Resolve the on-disk settlement-store directory (settle_db_path override or
     // config_path()/<net>/v37_settle_db). Declared here, defined in xmr_node.hpp
@@ -354,10 +526,153 @@ inline std::string arm_order_refusal(const XmrNodeConfig& c) {
     if (c.template_source != TemplateSourceMode::Native)
         return "--arm-order p2p-first requires --xmr-template-source native: a find path whose "
                "template came from get_miner_data is not daemonless";
-    if (c.native_connect.empty())
-        return "--arm-order p2p-first requires at least one --native-connect <ip:port> levin peer: "
-               "with no peer there is no chain to find on and nowhere to relay a found block";
+    if (c.native_connect.empty() && !c.native_solo && !c.native_use_seeds)
+        return "--arm-order p2p-first requires at least one --native-connect <ip:port> levin peer "
+               "or --native-seeds: with no address source there is no chain to find on and "
+               "nowhere to relay a found block "
+               "(--native-solo is the deliberate exception: a private chain of our own, with no "
+               "network to relay to)";
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// --native-solo's OWN preconditions, kept as a pure function for the same
+// reason arm_order_refusal() is: the thing the daemon refuses on and the thing
+// the KAT pins must be one piece of code.
+//
+// Solo is fail-closed on its network. A node that mines a chain nobody else
+// has, and books the proceeds on the strength of its own index alone, is a
+// correct regtest rig and a catastrophic mainnet one -- and on testnet or
+// stagenet it would silently fork away from the real chain at the genesis
+// block, which is a confusing way to waste a day rather than a danger. So the
+// mode is regtest-only, by refusal and not by documentation.
+// ---------------------------------------------------------------------------
+inline std::string solo_refusal(const XmrNodeConfig& c) {
+    if (!c.native_solo) return {};
+    if (c.arm_order != ArmOrderMode::P2PFirst)
+        return "--native-solo requires --arm-order p2p-first: a solo node has no daemon to fall "
+               "back to, so the daemon-first find path has nothing to be first";
+    if (c.network != MoneroNetwork::Regtest)
+        return "--native-solo is regtest-only: a peerless node builds a chain of its own from the "
+               "genesis block, which on a real network is a private fork nobody else will ever "
+               "see and whose blocks are worth nothing";
+    if (!c.native_connect.empty())
+        return "--native-solo takes no --native-connect peers: 'solo' and 'dial these peers' are "
+               "two different runs, and silently ignoring one of them would make the evidence "
+               "unreadable";
+    if (!c.native_anchor_path.empty())
+        return "--native-solo boots from the locally assembled genesis block, so --native-anchor "
+               "has nothing to do: pick one trust root";
+    if (!c.native_output_set_path.empty())
+        return "--native-solo boots from genesis and builds the output set from block 0, so "
+               "--native-output-set (an anchor-committed snapshot) has nothing to seed against";
+    if (c.native_use_seeds)
+        return "--native-solo builds a private chain of its own with no network to relay to, so "
+               "--native-seeds (bootstrap from the network's seed nodes) contradicts it: pick one";
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// The embedded node's operator flags, parsed as a PURE function of an argv
+// slice.
+//
+// It lives here rather than inside main's parse loop for the same reason
+// arm_order_refusal() does: the thing the daemon does with a flag and the thing
+// a KAT pins have to be the same code. Everything the native backend is
+// configured by is in one place, so a new node knob cannot become a flag the
+// pool binary quietly fails to forward -- which is exactly how the gate 4
+// confirm knobs came to exist on the standalone tool and nowhere else.
+//
+// Returns the number of argv tokens consumed (1 or 2), 0 when `argv[i]` is not
+// one of these flags, and -1 with `err` set when one of them is malformed. The
+// caller advances i by (returned - 1) and continues.
+// ---------------------------------------------------------------------------
+inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const* argv,
+                                  int i, std::string& err) {
+    const std::string a = argv[i];
+    const bool have_value = (i + 1 < argc);
+    const std::string v = have_value ? argv[i + 1] : std::string();
+
+    // A value flag with nothing after it is an ERROR, not a silent default: an
+    // operator who typed `--native-snapshot-path` last on the line meant a path.
+    auto need = [&](std::uint64_t& out) -> int {
+        if (!have_value) { err = a + " wants a value"; return -1; }
+        try {
+            out = std::stoull(v);
+        } catch (const std::exception&) {
+            err = a + " wants a number, got '" + v + "'";
+            return -1;
+        }
+        return 2;
+    };
+
+    if (a == "--native-connect") {
+        if (!have_value || v.empty()) { err = "--native-connect wants <ip:port>"; return -1; }
+        c.native_connect.push_back(v);
+        return 2;
+    }
+    if (a == "--native-p2p-bind") {
+        if (!have_value) { err = "--native-p2p-bind wants <ip>"; return -1; }
+        c.native_p2p_bind_ip = v;
+        return 2;
+    }
+    if (a == "--native-anchor") {
+        if (!have_value) { err = "--native-anchor wants <path>"; return -1; }
+        c.native_anchor_path = v;
+        return 2;
+    }
+    if (a == "--native-force-synced")          { c.native_force_synced = true; return 1; }
+    if (a == "--native-allow-unverified-pow")  { c.native_allow_unverified_pow = true; return 1; }
+    if (a == "--native-seeds" || a == "--seeds") { c.native_use_seeds = true; return 1; }
+    if (a == "--native-parity-monerod")        { c.native_parity_monerod = true; return 1; }   // D6d
+    if (a == "--native-snapshot-path") {
+        if (!have_value || v.empty()) { err = "--native-snapshot-path wants <file>"; return -1; }
+        c.native_snapshot_path = v;
+        return 2;
+    }
+    if (a == "--native-snapshot-every")  return need(c.native_snapshot_every_s);
+    if (a == "--native-backlog-refresh" || a == "--backlog-refresh")
+        return need(c.native_backlog_refresh_s);
+    if (a == "--anchor-confirm-peers") {
+        std::uint64_t n = 0;
+        const int used = need(n);
+        if (used < 0) return used;
+        if (n == 0) { err = "--anchor-confirm-peers must be at least 1: gate 4 asking nobody "
+                            "would be the switch that turns it off"; return -1; }
+        c.anchor_confirm_peers = static_cast<std::uint32_t>(n);
+        return used;
+    }
+    if (a == "--anchor-confirm-timeout-ms") {
+        const int used = need(c.anchor_confirm_timeout_ms);
+        if (used < 0) return used;
+        if (c.anchor_confirm_timeout_ms == 0) {
+            err = "--anchor-confirm-timeout-ms must be at least 1";
+            return -1;
+        }
+        return used;
+    }
+    if (a == "--anchor-confirm-peer-ms") {
+        const int used = need(c.anchor_confirm_peer_ms);
+        if (used < 0) return used;
+        if (c.anchor_confirm_peer_ms == 0) {
+            err = "--anchor-confirm-peer-ms must be at least 1";
+            return -1;
+        }
+        return used;
+    }
+    if (a == "--native-ready-timeout") {
+        std::uint64_t n = 0;
+        const int used = need(n);
+        if (used < 0) return used;
+        c.native_ready_timeout_s = static_cast<std::uint32_t>(n);
+        return used;
+    }
+    if (a == "--native-template-fallback") {
+        if (!have_value) { err = "--native-template-fallback wants on|off"; return -1; }
+        c.native_template_fallback = !(v == "off" || v == "0" || v == "false");
+        return 2;
+    }
+    return 0;
 }
 
 } // namespace c2pool::v37n::xmr

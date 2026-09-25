@@ -263,4 +263,81 @@ inline P2PMessageStats& p2p_stats()
     return stats;
 }
 
+// ── #157 tx-inject status — read-only observability ──────────────────────────
+//
+// Process-global snapshot of the DASH miner/user tx-injection lane
+// (--embedded-tx-inject, default OFF), published by the ARMED
+// dash::coin::NodeCoinState (main_dash's standalone instance) and read by the
+// loopback-only /api/tx-inject-status endpoint. Same one-node-per-process
+// rationale as p2p_stats(): a process-global is exactly per-node scope, so no
+// node -> web-server plumbing is needed.
+//
+// REWARD-SAFE / read-only: every member is a plain flag/counter. Nothing here
+// changes what lands in a block, arms a flag, or writes config — it only
+// MIRRORS state the node already owns so a panel can DISPLAY it.
+// `updated_at == 0` means the lane has never published (flag-OFF build, or a
+// coin with no injection lane) — the endpoint reports "wired": false.
+//
+// The M3 (#1606) rate-limiter / sandbox counters ARE now published here (Slice 2,
+// #157): the node's submit_inject gate stores the per-scope refusal tallies and
+// window/cap state below, and the endpoint renders them as the `rate_limit` /
+// `sandbox` objects. They stay a pure MIRROR — plain relaxed-atomic counters the
+// node already owns; nothing here changes a gate decision or the accept-set.
+// While the lane has never published (updated_at == 0) the endpoint still renders
+// both objects null (dormant), never 0-as-"unknown".
+struct InjectStatus
+{
+    std::atomic<bool>          enabled{false};        // --embedded-tx-inject armed?
+    std::atomic<std::uint64_t> pool_entries{0};       // inflight tracked injects
+    std::atomic<std::uint64_t> pool_bytes{0};         // cumulative tracked bytes
+    std::atomic<std::uint64_t> max_entries{0};        // TxInjectPool entry cap (0 = unpublished)
+    std::atomic<std::uint64_t> max_total_bytes{0};    // TxInjectPool cumulative byte cap
+    std::atomic<std::uint64_t> max_tx_bytes{0};       // per-tx size cap
+    std::atomic<std::int64_t>  updated_at{0};         // unix seconds, 0 = never published
+
+    // ── #157 M3 rate limiter (node-wide count + byte window, split Local/Peers) ─
+    // Cumulative refusal tallies, incremented on the submit_inject rate-limit
+    // branch by SCOPE (which budget) + VERDICT (count vs bytes). A refused
+    // attempt mutates nothing else, so a tally is the only trace it leaves.
+    // These tallies are cumulative for the process lifetime and are not reset
+    // on disarm/re-arm.
+    std::atomic<std::uint64_t> rl_local_count_refused{0};   // Local budget, count cap tripped
+    std::atomic<std::uint64_t> rl_local_bytes_refused{0};   // Local budget, byte cap tripped
+    std::atomic<std::uint64_t> rl_peer_count_refused{0};    // Peer budget, count cap tripped
+    std::atomic<std::uint64_t> rl_peer_bytes_refused{0};    // Peer budget, byte cap tripped
+    // Occupancy as of updated_at (mirror is refreshed on arm/accept/reconcile,
+    // not on every refusal or on wall-clock aging) — not a live read of the window.
+    std::atomic<std::uint64_t> rl_local_in_window{0};       // Local injects in the window
+    std::atomic<std::uint64_t> rl_peer_in_window{0};        // Peer injects in the window
+    std::atomic<std::uint64_t> rl_local_bytes_in_window{0}; // Local bytes in the window
+    std::atomic<std::uint64_t> rl_peer_bytes_in_window{0};  // Peer bytes in the window
+    // Caps (constants, published so a panel need not hard-code them).
+    std::atomic<std::uint64_t> rl_max_per_window{0};        // kMaxInjectsPerWindow (0 = unpublished)
+    std::atomic<std::uint64_t> rl_max_bytes_per_window{0};  // kMaxBytesPerWindow
+    std::atomic<std::uint64_t> rl_window_sec{0};            // kWindowSeconds
+
+    // ── #157 M3 sandbox (bounded-work script-verify guard) ──────────────────────
+    // Cumulative refusal tallies, incremented on the submit_inject sandbox branch
+    // by VERDICT (which bound tripped). `sb_refused_total` sums the by-cause tallies.
+    std::atomic<std::uint64_t> sb_refused_total{0};          // any sandbox refusal
+    std::atomic<std::uint64_t> sb_refused_inputs{0};         // TooManyInputs
+    std::atomic<std::uint64_t> sb_refused_outputs{0};        // TooManyOutputs
+    std::atomic<std::uint64_t> sb_refused_scriptsig{0};      // ScriptSigTooLarge
+    std::atomic<std::uint64_t> sb_refused_total_scriptsig{0};// TotalScriptSigTooLarge
+    std::atomic<std::uint64_t> sb_refused_sigops{0};         // TooManySigOps
+    // Caps (constants).
+    std::atomic<std::uint64_t> sb_max_inputs{0};            // kMaxInputs (0 = unpublished)
+    std::atomic<std::uint64_t> sb_max_outputs{0};           // kMaxOutputs
+    std::atomic<std::uint64_t> sb_max_scriptsig{0};         // kMaxScriptSigBytes
+    std::atomic<std::uint64_t> sb_max_total_scriptsig{0};   // kMaxTotalScriptSigBytes
+    std::atomic<std::uint64_t> sb_max_sigops{0};            // kMaxLegacySigOps
+};
+
+/// Process-wide instance. Same rationale as p2p_stats() above.
+inline InjectStatus& inject_status()
+{
+    static InjectStatus s;
+    return s;
+}
+
 } // namespace core::obs

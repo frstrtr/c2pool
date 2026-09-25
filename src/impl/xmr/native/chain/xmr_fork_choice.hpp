@@ -119,6 +119,15 @@ struct AltBlock {
     BlockEntry entry{};
     bool       has_entry = false;
 
+    // A fluffy block whose body we do not yet have: has_entry is TRUE (it holds
+    // the bodiless block blob) but the transactions are still missing, so it
+    // cannot connect. We asked its announcer for the missing txs (a 2009); if
+    // that reply is lost -- e.g. dropped by the block DoS bucket, #1680 -- the
+    // park would otherwise strand forever, because on_chain_entry skips ids we
+    // already hold and refetch_wanted() filters by has_entry. The sync driver
+    // watches for this flag and re-asks via GET_OBJECTS after a grace period.
+    bool       bodies_missing = false;
+
     // Who gave it to us, so a branch that turns out to be consensus-invalid can
     // be charged to the connection that proposed it rather than to whoever
     // happened to be talking when the switch was attempted.
@@ -308,13 +317,29 @@ private:
             if (ch->second.empty()) children_.erase(ch);
         }
         blocks_.erase(it);
-        children_.erase(k);
+        // The erased block's OWN children list is kept. It is keyed by id, not
+        // owned by the entry: the usual reason a block leaves the pool is that it
+        // just CONNECTED (or was evicted and may come back), and its parked
+        // children are exactly what resolve_descendants_locked_() and
+        // connect_parked_children_locked_() must find next. Dropping the list
+        // here stranded them -- a parent held in the pool before it connected
+        // took its children's edges with it, and the tip stopped one block below
+        // them until eviction happened to clear the pool. Each child removes
+        // itself from the list when it is erased, and an empty list is dropped,
+        // so the map stays bounded by the pool.
         return true;
     }
 
     // Evict the lightest branch first: an unresolved block (no work proven at
     // all) before any resolved one, then the smallest cumulative difficulty,
     // then the oldest arrival.
+    //
+    // Among UNRESOLVED blocks there is no work to compare (all read zero), and
+    // "oldest arrival" was exactly wrong while catching up: the block that
+    // arrived first is the one nearest our tip -- asked for first -- so a full
+    // pool evicted the next block we needed and kept the far ones it could not
+    // use yet. Unresolved blocks go farthest claimed height first, newest
+    // arrival breaking a tie. Resolved ordering is unchanged.
     void evict_() {
         while ((max_blocks_ && blocks_.size() > max_blocks_)
                || (max_bytes_ && bytes_ > max_bytes_)) {
@@ -324,6 +349,12 @@ private:
                 if (!victim) { victim = &b; continue; }
                 if (victim->resolved && !b.resolved) { victim = &b; continue; }
                 if (victim->resolved != b.resolved) continue;
+                if (!b.resolved) {
+                    if (b.height > victim->height
+                        || (b.height == victim->height && b.first_seen_seq > victim->first_seen_seq))
+                        victim = &b;
+                    continue;
+                }
                 if (u128_less(b.cumulative_difficulty, victim->cumulative_difficulty))
                     victim = &b;
                 else if (!u128_greater(b.cumulative_difficulty, victim->cumulative_difficulty)

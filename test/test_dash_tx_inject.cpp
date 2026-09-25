@@ -1043,3 +1043,196 @@ TEST(DashTxInject, PeerFloodDoesNotStarveLocalInject)
     EXPECT_EQ(st.inject_rate_count(), 1u)
         << "only the single local attempt is charged to the LOCAL budget";
 }
+
+
+// ── Slice B (#157): the arm closure's PEER sink charges the PEER budget ──────
+// Regression guard for the Slice-B re-land conflict resolution. main_dash's
+// arm_tx_inject installs the p2p tx_inject sink as a closure that calls
+// submit_inject with InjectOrigin::Peer. The stale orphan branch installed it
+// with the DEFAULT origin (Local), which would re-merge the peer budget into
+// the operator's local one and undo M3's anti-starvation split. This KAT builds
+// the EXACT sink-closure shape main_dash installs and floods through IT (not a
+// bare submit_inject with an explicit origin), proving the peer path charges the
+// PEER budget and leaves the LOCAL budget untouched.
+TEST(DashTxInject, SliceBArmSinkChargesPeerBudgetNotLocal)
+{
+    using Origin = NodeCoinState::InjectOrigin;
+    UTXOViewCache utxo(nullptr);            // empty view: injects fail post-charge
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    // The peer sink EXACTLY as main_dash's arm_tx_inject installs it -- built
+    // through the SAME shared helper, so if main_dash's sink ever drops the
+    // Origin::Peer arg (re-merging the budgets) this KAT builds the regressed
+    // shape too and fails, instead of exercising a divergent test-local copy.
+    auto peer_sink = dash::coin::make_peer_inject_sink(st);
+
+    const std::size_t cap = InjectRateLimiter::kMaxInjectsPerWindow;
+    for (std::size_t i = 0; i < cap; ++i) {
+        MutableTransaction tx = minimal_tx(0x01);
+        tx.vin[0].prevout.index = static_cast<uint32_t>(i);   // unique txid
+        auto r = peer_sink(tx, 0, 0);
+        EXPECT_NE(r.cause, "inject-rate-limited-peers-count")
+            << "under the peer cap the sink must not be rate-limited at i=" << i;
+    }
+    EXPECT_EQ(st.inject_rate_count_peer(), cap)
+        << "the peer sink must charge every attempt to the PEER budget";
+    EXPECT_EQ(st.inject_rate_count(), 0u)
+        << "the peer sink must NOT touch the LOCAL budget";
+
+    // The (cap+1)th through the sink is throttled on the PEER budget by name.
+    {
+        MutableTransaction over = minimal_tx(0x01);
+        over.vin[0].prevout.index = static_cast<uint32_t>(cap);
+        auto r = peer_sink(over, 0, 0);
+        EXPECT_FALSE(r.ok);
+        EXPECT_EQ(r.cause, "inject-rate-limited-peers-count");
+    }
+
+    // A LOCAL operator inject still clears the rate gate despite the peer flood
+    // (fails later on the empty view, never on the rate limiter).
+    MutableTransaction local = minimal_tx(0x02);
+    auto rl = st.submit_inject(local, 0, 0, Origin::Local);
+    EXPECT_FALSE(rl.ok);
+    EXPECT_EQ(rl.cause, "inject-unpriceable")
+        << "a local inject must clear the rate gate despite a peer flood";
+    EXPECT_EQ(st.inject_rate_count(), 1u)
+        << "only the single local attempt is charged to the LOCAL budget";
+}
+
+
+// ── Slice 2 (#157 M3 status telemetry): submit_inject's rate-limit / sandbox ──
+// refusal branches also TALLY the refusal into the read-only status snapshot
+// (core::obs::inject_status()), the one the /api/tx-inject-status endpoint reads.
+// The snapshot is process-global (shared across the whole test binary), so these
+// KATs assert DELTAS from a baseline, never absolute values.
+
+// (S2-1) A rate refusal increments the counter for the RIGHT scope+verdict and
+//        NO other; the gate's refuse-by-name verdict is unchanged by the tally.
+TEST(DashTxInject, RateLimitRefusalIncrementsStatusCounter)
+{
+    auto& obs = core::obs::inject_status();
+
+    // ---- LOCAL scope, COUNT verdict ----
+    {
+        UTXOViewCache utxo(nullptr);
+        NodeCoinState st; arm_ncs(st, utxo);
+
+        const std::size_t cap = InjectRateLimiter::kMaxInjectsPerWindow;
+        for (std::size_t i = 0; i < cap; ++i) {          // fill the LOCAL window to cap
+            MutableTransaction tx = minimal_tx(0x01);
+            tx.vin[0].prevout.index = static_cast<uint32_t>(i);
+            st.submit_inject(tx);                        // Local origin (default)
+        }
+        const auto local_before  = obs.rl_local_count_refused.load();
+        const auto peer_before   = obs.rl_peer_count_refused.load();
+        const auto lbytes_before = obs.rl_local_bytes_refused.load();
+
+        MutableTransaction over = minimal_tx(0x01);
+        over.vin[0].prevout.index = static_cast<uint32_t>(cap);
+        auto r = st.submit_inject(over);
+        EXPECT_FALSE(r.ok);
+        EXPECT_EQ(r.cause, "inject-rate-limited-count")   // gate verdict UNCHANGED
+            << "the tally must not alter the refuse-by-name verdict";
+        EXPECT_EQ(obs.rl_local_count_refused.load(), local_before + 1)
+            << "a Local count refusal must bump rl_local_count_refused";
+        EXPECT_EQ(obs.rl_peer_count_refused.load(), peer_before)
+            << "a Local refusal must not touch the Peer tally";
+        EXPECT_EQ(obs.rl_local_bytes_refused.load(), lbytes_before)
+            << "a COUNT refusal must not touch the BYTES tally";
+    }
+
+    // ---- PEER scope, COUNT verdict ----
+    {
+        UTXOViewCache utxo(nullptr);
+        NodeCoinState st; arm_ncs(st, utxo);
+        using Origin = NodeCoinState::InjectOrigin;
+
+        const std::size_t cap = InjectRateLimiter::kMaxInjectsPerWindow;
+        for (std::size_t i = 0; i < cap; ++i) {          // fill the PEER window to cap
+            MutableTransaction tx = minimal_tx(0x02);
+            tx.vin[0].prevout.index = static_cast<uint32_t>(i);
+            st.submit_inject(tx, 0, 0, Origin::Peer);
+        }
+        const auto peer_before  = obs.rl_peer_count_refused.load();
+        const auto local_before = obs.rl_local_count_refused.load();
+
+        MutableTransaction over = minimal_tx(0x02);
+        over.vin[0].prevout.index = static_cast<uint32_t>(cap);
+        auto r = st.submit_inject(over, 0, 0, Origin::Peer);
+        EXPECT_FALSE(r.ok);
+        EXPECT_EQ(r.cause, "inject-rate-limited-peers-count");
+        EXPECT_EQ(obs.rl_peer_count_refused.load(), peer_before + 1)
+            << "a Peer count refusal must bump rl_peer_count_refused";
+        EXPECT_EQ(obs.rl_local_count_refused.load(), local_before)
+            << "a Peer refusal must not touch the Local tally";
+    }
+}
+
+// (S2-2) A sandbox refusal increments sb_refused_total + the by-cause counter
+//        for the tripped bound, and NO other cause; the refuse-by-name verdict
+//        is unchanged and the inject never enters the pool.
+TEST(DashTxInject, SandboxRefusalIncrementsStatusCounter)
+{
+    auto& obs = core::obs::inject_status();
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    const auto total_before   = obs.sb_refused_total.load();
+    const auto inputs_before  = obs.sb_refused_inputs.load();
+    const auto outputs_before = obs.sb_refused_outputs.load();
+
+    auto bad = tx_with_inputs(InjectSandbox::kMaxInputs + 1);   // too-many-inputs
+    auto r = st.submit_inject(bad);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.cause, "inject-sandbox-too-many-inputs")        // gate verdict UNCHANGED
+        << "the tally must not alter the refuse-by-name verdict";
+    EXPECT_EQ(st.inject_pool_size(), 0u)
+        << "a sandbox-refused inject must never enter the pool";
+    EXPECT_EQ(obs.sb_refused_total.load(), total_before + 1)
+        << "any sandbox refusal must bump the running total";
+    EXPECT_EQ(obs.sb_refused_inputs.load(), inputs_before + 1)
+        << "a too-many-inputs refusal must bump sb_refused_inputs";
+    EXPECT_EQ(obs.sb_refused_outputs.load(), outputs_before)
+        << "the too-many-inputs cause must not bump a different by-cause tally";
+}
+
+// (S2-3) The added tallies do NOT change the gate's ACCEPT verdict: a green-path
+//        inject still succeeds and leaves EVERY refusal tally flat (a success is
+//        never counted as a refusal).
+TEST(DashTxInject, StatusCountersLeaveAcceptVerdictUnchanged)
+{
+    auto& obs = core::obs::inject_status();
+    Key k(0xa1);
+    uint256 prev = prevhash(0x77);
+    auto tx = make_signed_spend(k, prev, 100'000);   // fee 0 (injected)
+
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+
+    const auto rl_local_c = obs.rl_local_count_refused.load();
+    const auto rl_local_b = obs.rl_local_bytes_refused.load();
+    const auto rl_peer_c  = obs.rl_peer_count_refused.load();
+    const auto rl_peer_b  = obs.rl_peer_bytes_refused.load();
+    const auto sb_total   = obs.sb_refused_total.load();
+
+    auto r = st.submit_inject(tx);
+    EXPECT_TRUE(r.ok) << "a valid inject must still be ACCEPTED (cause=" << r.cause << ")";
+    EXPECT_EQ(r.cause, "ok");
+    EXPECT_EQ(st.inject_pool_size(), 1u);
+
+    // Not one refusal tally moved — the accept path stores none.
+    EXPECT_EQ(obs.rl_local_count_refused.load(), rl_local_c);
+    EXPECT_EQ(obs.rl_local_bytes_refused.load(), rl_local_b);
+    EXPECT_EQ(obs.rl_peer_count_refused.load(),  rl_peer_c);
+    EXPECT_EQ(obs.rl_peer_bytes_refused.load(),  rl_peer_b);
+    EXPECT_EQ(obs.sb_refused_total.load(),       sb_total);
+
+    // The accept also PUBLISHED the window + caps mirror (updated_at != 0 => the
+    // endpoint renders rate_limit/sandbox rather than null), with the caps set.
+    EXPECT_NE(obs.updated_at.load(), 0);
+    EXPECT_EQ(obs.rl_max_per_window.load(), InjectRateLimiter::kMaxInjectsPerWindow);
+    EXPECT_EQ(obs.sb_max_inputs.load(), InjectSandbox::kMaxInputs);
+    EXPECT_GE(obs.rl_local_in_window.load(), 1u)
+        << "the accepted local inject must show in the mirrored window occupancy";
+}

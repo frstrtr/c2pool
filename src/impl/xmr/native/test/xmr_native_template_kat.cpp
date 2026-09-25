@@ -1006,7 +1006,7 @@ void suite_pin_same_tip() {
 // BOTH oracles: the pre-seam rule and the size-derived rule that regressed it.
 // ---------------------------------------------------------------------------
 std::string miner_data_json(const char* prev_id_hex, std::uint64_t height,
-                            std::size_t n_backlog) {
+                            std::size_t n_backlog, std::size_t id_base = 0) {
     std::string s =
         "{\"id\":\"0\",\"jsonrpc\":\"2.0\",\"result\":{"
         "\"already_generated_coins\":18164488901536847281,"
@@ -1022,16 +1022,22 @@ std::string miner_data_json(const char* prev_id_hex, std::uint64_t height,
     for (std::size_t i = 0; i < n_backlog; ++i) {
         if (i) s += ",";
         std::string id_hex(64, '0');
-        id_hex[0] = d[(i >> 4) & 0xf];
-        id_hex[1] = d[i & 0xf];
+        id_hex[0] = d[((i + id_base) >> 4) & 0xf];
+        id_hex[1] = d[(i + id_base) & 0xf];
         s += "{\"id\":\"" + id_hex + "\",\"weight\":2000,\"fee\":30000,\"blob_size\":2000}";
     }
     s += "],\"status\":\"OK\",\"untrusted\":false}}";
     return s;
 }
 
+// 2026-09-22 (good-citizen on the daemon arm): the tip-only rule this suite
+// pins is now the LEGACY posture, selected by MonerodArmConfig::backlog_refresh_s
+// == 0 (--no-good-citizen / --backlog-refresh 0). The production default (3 s)
+// admits the offered backlog under an unchanged tip -- suite K pins that. What
+// this suite still guards is that the legacy setting is exactly the pre-seam
+// rule, so a CONTROL run reproduces the 09-21 coinbase-only breach on purpose.
 void suite_daemon_arm_rebuild_identity() {
-    std::printf("== J. R-C4-3: the production (monerod) arm rebuilds on the tip, only ==\n");
+    std::printf("== J. R-C4-3: the LEGACY (backlog_refresh_s = 0) daemon arm rebuilds on the tip, only ==\n");
 
     const char* TIP_A = "a1a18db281797fb6c9651a95500725a22f51e293b814bb62606607c76877a035";
     const char* TIP_B = "b2b28dc392890fc7da762ba6611836b33f62f3a4c925cc73717718d87988b146";
@@ -1052,7 +1058,9 @@ void suite_daemon_arm_rebuild_identity() {
     };
 
     CannedTransport            tx(miner_data_json(TIP_A, 2204960, 0));
-    tmpl::MonerodMinerDataSource daemon(tx);
+    tmpl::MonerodArmConfig     legacy;
+    legacy.backlog_refresh_s = 0;                // the tip-only rule, by explicit configuration
+    tmpl::MonerodMinerDataSource daemon(tx, legacy);
 
     MinerDataEpoch prev_epoch{};
     std::uint64_t  prev_height  = 0;
@@ -1131,6 +1139,178 @@ void suite_daemon_arm_rebuild_identity() {
 }
 
 // ---------------------------------------------------------------------------
+// Suite K -- GC-D: GOOD-CITIZEN on the daemon arm. The offered backlog moves
+// the epoch under an unchanged tip, rate-limited, frozen in between.
+//
+// THE DEFECT (soak w5e80f0se, 2026-09-21, 3 daemon-arm nodes on regtest):
+// five blocks (h=122,132,137,139,145) were mined coinbase-only off a template
+// with n_tx=0 while the winner's OWN monerod offered 3-5 transactions in
+// get_miner_data.tx_backlog for the preceding 20-75 s. The template was built
+// the instant the parent tip moved -- when the pool is emptiest, the block
+// that just landed having swept it -- and then served unchanged for the whole
+// interval, because this arm froze backlog_seq at 0 (suite J). That breaks
+// the operator hard rule: a c2pool block ALWAYS carries the available
+// transactions; coinbase-only ONLY when the pool is truly empty.
+//
+// THE CURE is the native arm's bargain (xmr_native_miner_data.hpp), not a
+// size rule: admit the OFFERED set when it moved, at most once per
+// backlog_refresh_s, and freeze it in between so jobs stay byte-stable. Each
+// admission is a new template id (a new job), never a restamp. This suite
+// pins, with a scripted daemon and an injected clock:
+//   (a) the first template on a tip is built from whatever is on offer;
+//   (b) a change inside the refresh window does NOT move the epoch;
+//   (c) once the window elapses a changed set DOES, on the SAME tip, and the
+//       snapshot carries the new set;
+//   (d) an unchanged set never moves the epoch, however long the window;
+//   (e) a set that changed at constant size (one mined, one arrived) counts;
+//   (f) a tip move re-opens the backlog without waiting, and starts the
+//       window over;
+//   (g) backlog_refresh_s == 0 is the legacy tip-only rule, exactly;
+//   (h) THE SOAK SHAPE end to end at the 400 ms poll cadence: empty at the
+//       tip, a tx every 10 s -- the served set must catch every offered tx
+//       within one refresh window + one poll (the good-citizen invariant on
+//       this arm).
+// ---------------------------------------------------------------------------
+void suite_daemon_arm_good_citizen() {
+    std::printf("== K. GC-D: the daemon arm admits the offered backlog under an unchanged tip ==\n");
+
+    const char* TIP_A = "a1a18db281797fb6c9651a95500725a22f51e293b814bb62606607c76877a035";
+    const char* TIP_B = "b2b28dc392890fc7da762ba6611836b33f62f3a4c925cc73717718d87988b146";
+
+    CannedTransport tx(miner_data_json(TIP_A, 2204960, 0));
+    std::uint64_t   now_ms = 1000 * 1000;
+    tmpl::MonerodArmConfig cfg;
+    cfg.backlog_refresh_s = 3;
+    tmpl::MonerodMinerDataSource daemon(tx, cfg, [&now_ms] { return now_ms; });
+    std::string why;
+
+    // (a) the tip lands with the pool swept: the first template is empty.
+    CHECK(daemon.poll(&why), "poll #1: the tip lands, nothing on offer (%s)", why.empty() ? "ok" : why.c_str());
+    const MinerDataEpoch e0 = daemon.epoch();
+    CHECK(e0.height == 2204960 && e0.backlog_seq == 0, "(a) first epoch on TIP_A, backlog_seq 0");
+
+    // (b) three txs arrive 1 s later: inside the window => frozen.
+    now_ms += 1000;
+    tx.set_body(miner_data_json(TIP_A, 2204960, 3));
+    CHECK(daemon.poll(&why), "poll #2: three txs offered, 1 s after the tip");
+    CHECK(daemon.epoch() == e0, "(b) inside the refresh window: the epoch is frozen");
+    CHECK(daemon.backlog_admits() == 0, "(b) no admission yet");
+    CHECK(daemon.last_backlog_n() == 3, "(b) ...though the arm saw the three offered txs");
+
+    // (c) the window elapses (3 s since the tip re-open): admitted.
+    now_ms += 2000;
+    CHECK(daemon.poll(&why), "poll #3: same set, 3 s after the tip");
+    const MinerDataEpoch e1 = daemon.epoch();
+    CHECK(!(e1 == e0), "(c) window elapsed and the set moved => a new epoch");
+    CHECK(e1.height == e0.height && e1.prev_id == e0.prev_id && e1.backlog_seq == 1,
+          "(c) ...on the SAME tip: backlog_seq 0 -> 1");
+    auto md = daemon.snapshot(&why);
+    CHECK(md.has_value() && md->tx_backlog.size() == 3, "(c) the snapshot carries the three offered txs");
+    CHECK(daemon.backlog_admits() == 1, "(c) one admission");
+
+    // (d) unchanged set, long after: never moves.
+    now_ms += 60 * 1000;
+    CHECK(daemon.poll(&why), "poll #4: unchanged set, 60 s later");
+    CHECK(daemon.epoch() == e1, "(d) unchanged set => no new epoch, however long the window");
+
+    // (e) constant size, different set (one mined, one arrived): a new job.
+    tx.set_body(miner_data_json(TIP_A, 2204960, 3, /*id_base=*/1));
+    CHECK(daemon.poll(&why), "poll #5: same SIZE, different set");
+    const MinerDataEpoch e2 = daemon.epoch();
+    CHECK(e2.backlog_seq == 2 && e2.height == e1.height,
+          "(e) a set change at constant size IS an admission (seq 1 -> 2)");
+
+    // (b') a change right after an admission waits for the window again.
+    now_ms += 1000;
+    tx.set_body(miner_data_json(TIP_A, 2204960, 5, 1));
+    CHECK(daemon.poll(&why), "poll #6: two more txs, 1 s after the last admission");
+    CHECK(daemon.epoch() == e2, "(b') rate-limited: no admission inside the window");
+    now_ms += 2000;
+    CHECK(daemon.poll(&why), "poll #7: 3 s after the last admission");
+    CHECK(daemon.epoch().backlog_seq == 3, "(c') ...admitted once the window elapsed (seq 2 -> 3)");
+
+    // (f) the tip moves 0.5 s after the last admission with a fresh set on
+    //     offer: no wait, and the window restarts from the tip move.
+    now_ms += 500;
+    tx.set_body(miner_data_json(TIP_B, 2204961, 2, 40));
+    CHECK(daemon.poll(&why), "poll #8: THE TIP MOVED, two txs on offer");
+    const MinerDataEpoch e3 = daemon.epoch();
+    CHECK(e3.height == 2204961 && !(e3.prev_id == e2.prev_id) && e3.backlog_seq == 3,
+          "(f) tip move: the epoch names the new tip; the sequence does not bump");
+    md = daemon.snapshot(&why);
+    CHECK(md.has_value() && md->tx_backlog.size() == 2,
+          "(f) ...and the set on offer is the one the template is built from");
+    now_ms += 1000;
+    tx.set_body(miner_data_json(TIP_B, 2204961, 4, 40));
+    CHECK(daemon.poll(&why), "poll #9: the pool grew 1 s after the tip move");
+    CHECK(daemon.epoch() == e3, "(f) frozen inside the window after a tip re-open");
+    now_ms += 2000;
+    CHECK(daemon.poll(&why), "poll #10: 3 s after the tip move");
+    CHECK(daemon.epoch().backlog_seq == 4, "(f) ...admitted (seq 3 -> 4)");
+
+    // (g) backlog_refresh_s == 0: the legacy rule, exactly.
+    {
+        CannedTransport tx0(miner_data_json(TIP_A, 2204960, 0));
+        tmpl::MonerodArmConfig legacy;
+        legacy.backlog_refresh_s = 0;
+        std::uint64_t t = 5000;
+        tmpl::MonerodMinerDataSource d0(tx0, legacy, [&t] { return t; });
+        CHECK(d0.poll(&why), "legacy: first poll");
+        const MinerDataEpoch l0 = d0.epoch();
+        for (int i = 1; i <= 5; ++i) {
+            t += 10 * 1000;
+            tx0.set_body(miner_data_json(TIP_A, 2204960, static_cast<std::size_t>(i * 3), static_cast<std::size_t>(i)));
+            CHECK(d0.poll(&why), "legacy: poll with %d txs offered, 10 s apart", i * 3);
+        }
+        CHECK(d0.epoch() == l0 && d0.epoch().backlog_seq == 0 && d0.backlog_admits() == 0,
+              "(g) backlog_refresh_s == 0: the offered set never moves the epoch (tip-only, R-C4-3)");
+    }
+
+    // (h) THE SOAK SHAPE at the production cadence: 400 ms polls, the pool
+    //     swept at the tip, one tx every 10 s for 60 s. Every offered tx must
+    //     reach the served set within one refresh window + one poll.
+    {
+        CannedTransport txs(miner_data_json(TIP_A, 3000, 0));
+        tmpl::MonerodArmConfig c3;
+        c3.backlog_refresh_s = 3;
+        std::uint64_t t = 100 * 1000;
+        tmpl::MonerodMinerDataSource arm(txs, c3, [&t] { return t; });
+        CHECK(arm.poll(&why), "soak shape: the tip lands, pool swept (0 offered)");
+        const MinerDataEpoch tip_epoch = arm.epoch();
+        std::size_t   offered = 0;
+        std::uint64_t worst_lag_ms = 0, last_arrival_ms = 0;
+        std::uint64_t last_seq = tip_epoch.backlog_seq;
+        int rebuilds = 0;
+        for (int tick = 1; tick <= 150; ++tick) {              // 60 s of 400 ms polls
+            t += 400;
+            if (tick % 25 == 0) {                              // a tx every 10 s
+                ++offered;
+                txs.set_body(miner_data_json(TIP_A, 3000, offered));
+                last_arrival_ms = t;
+            }
+            (void)arm.poll(&why);
+            const std::uint64_t seq = arm.epoch().backlog_seq;
+            if (seq != last_seq) {
+                ++rebuilds;
+                last_seq = seq;
+                const std::uint64_t lag = t - last_arrival_ms;
+                if (lag > worst_lag_ms) worst_lag_ms = lag;
+            }
+        }
+        CHECK(offered == 6 && rebuilds == 6,
+              "soak shape: 6 txs offered over 60 s => 6 admissions (got %d)", rebuilds);
+        CHECK(worst_lag_ms <= 3000 + 400,
+              "soak shape: every offered tx reached the served set within refresh + one poll (worst %llu ms)",
+              static_cast<unsigned long long>(worst_lag_ms));
+        const auto m = arm.snapshot(&why);
+        CHECK(m.has_value() && m->tx_backlog.size() == offered,
+              "soak shape: the served set at the end is the full offered set (%zu)", offered);
+        CHECK(arm.epoch().height == tip_epoch.height && arm.epoch().prev_id == tip_epoch.prev_id,
+              "soak shape: all of it on the SAME tip (no tip move was needed)");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // --parity-json: swap the embedded capture for a fresh one.
 // ---------------------------------------------------------------------------
 bool load_parity_json(const std::string& path, ParityExpectation& exp) {
@@ -1179,6 +1359,249 @@ bool load_parity_json(const std::string& path, ParityExpectation& exp) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Suite GC -- GOOD-CITIZEN selection wiring (operator hard rule).
+//
+//   (i)   a populated pool => a NON-EMPTY served template whose backlog IS the
+//         select_good_citizen() selection, id-for-id, and whose bodies pin.
+//   (i')  good_citizen == false serves the RAW selectable backlog (shadow arm /
+//         regression), proving the selector is what the default now runs.
+//   (ii)  a tx arriving mid-interval enters the served template after the
+//         backlog-refresh window elapses (fees that arrive during a block).
+//   (D)   good_citizen_violations() stays 0: a non-empty pool never yields an
+//         empty selection.
+// ---------------------------------------------------------------------------
+void suite_good_citizen() {
+    std::printf("== GC. good-citizen selection wiring ==\n");
+
+    fakes::FakeChain chain;
+    chain.state.synced = true;
+    node::ChainMainBlock tip;
+    tip.height = 3000; tip.id = synthetic_id(3000);
+    tip.timestamp = 1700000000; tip.difficulty = u128_of(1000000, 0);
+    chain.rows.push_back(tip);
+    TemplateInputs t;
+    t.major_version = 16; t.minor_version = 16;
+    t.height = 3001; t.prev_id = tip.id; t.seed_hash = synthetic_id(9);
+    t.difficulty = u128_of(1000000, 0);
+    t.median_weight = 300000; t.block_weight_limit = 600000;
+    t.already_generated_coins = 18000000000000000000ull;
+    t.median_timestamp = 1699999000; t.synced = true;
+    chain.inputs = t;
+
+    // (i) populated pool => non-empty template == select_good_citizen().chosen
+    {
+        fakes::FakeTxpool pool;
+        for (unsigned i = 0; i < 5; ++i)
+            pool.add(synthetic_id(60 + i), 2000, 30000 + i, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+
+        tmpl::NativeMinerDataSource src(chain, pool, {}, &pool);   // default policy => good_citizen ON
+        std::string why;
+        const auto md = src.snapshot(&why);
+        CHECK(md.has_value(), "GC snapshot with a populated pool (%s)", why.c_str());
+        if (!md) return;
+        CHECK(!md->tx_backlog.empty(), "good citizen: a populated pool yields a NON-EMPTY template (n=%zu)",
+              md->tx_backlog.size());
+
+        const auto raw    = pool.selectable_backlog();
+        const auto chosen = ::c2pool::xmr::native::select_good_citizen(
+                                raw, t.median_weight, t.already_generated_coins, t.major_version).chosen;
+        CHECK(md->tx_backlog.size() == chosen.size(),
+              "served backlog size == select_good_citizen().chosen (%zu vs %zu)",
+              md->tx_backlog.size(), chosen.size());
+        bool id_for_id = md->tx_backlog.size() == chosen.size();
+        for (std::size_t i = 0; id_for_id && i < chosen.size(); ++i)
+            id_for_id = md->tx_backlog[i].id == chosen[i].id;
+        CHECK(id_for_id, "served backlog == select_good_citizen().chosen id-for-id");
+
+        bool bodies_ok = true;
+        for (const auto& e : md->tx_backlog) bodies_ok = bodies_ok && (src.tx_body(e.id) != nullptr);
+        CHECK(bodies_ok, "every chosen tx has a resolvable body (C5 can relay the block)");
+        CHECK(pool.pins.size() == 1, "exactly one pin generation held");
+        CHECK(src.good_citizen_violations() == 0, "good_citizen_violations == 0 (invariant D)");
+        CHECK(src.last_pool_n() == 5 && src.last_chosen_n() == md->tx_backlog.size(),
+              "sensors: pool=%zu chosen=%zu", src.last_pool_n(), src.last_chosen_n());
+    }
+
+    // (i') good_citizen == false => the raw selectable backlog (shadow arm)
+    {
+        fakes::FakeTxpool pool;
+        for (unsigned i = 0; i < 5; ++i)
+            pool.add(synthetic_id(70 + i), 2000, 30000 + i, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+        tmpl::NativeTemplatePolicy pol;
+        pol.good_citizen = false;
+        tmpl::NativeMinerDataSource src(chain, pool, pol);
+        std::string why;
+        const auto md = src.snapshot(&why);
+        CHECK(md.has_value() && md->tx_backlog.size() == pool.selectable_backlog().size(),
+              "good_citizen=false serves the raw selectable backlog (%zu)",
+              md ? md->tx_backlog.size() : 0);
+    }
+
+    // (ii) a tx arriving mid-interval enters the served template after refresh
+    {
+        fakes::FakeChain c2;
+        c2.state.synced = true;
+        c2.rows.push_back(tip);
+        c2.inputs = t;
+        fakes::FakeTxpool p2;
+        p2.add(synthetic_id(80), 2000, 30000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+
+        tmpl::NativeTemplatePolicy pol;
+        pol.backlog_refresh_s = 3;      // good-citizen default cadence
+        tmpl::NativeMinerDataSource src(c2, p2, pol, &p2);
+        src.set_now(1000);
+        std::string why;
+        auto md0 = src.snapshot(&why);
+        CHECK(md0.has_value() && md0->tx_backlog.size() == 1, "GC/ii initial served backlog = 1");
+        const MinerDataEpoch e0 = src.epoch();
+
+        // a new tx arrives DURING the interval
+        src.set_now(1001);
+        p2.add(synthetic_id(81), 2000, 40000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+        CHECK(src.epoch() == e0, "GC/ii inside the refresh window: no new epoch yet");
+
+        // the window elapses => the arrival is admitted and served
+        src.set_now(1000 + 3);
+        const MinerDataEpoch e1 = src.epoch();
+        CHECK(!(e1 == e0), "GC/ii window elapsed => a new epoch (the arrival triggers a rebuild)");
+        auto md1 = src.snapshot(&why);
+        CHECK(md1.has_value() && md1->tx_backlog.size() == 2,
+              "GC/ii the mid-interval tx ENTERS the served template (n=%zu)",
+              md1 ? md1->tx_backlog.size() : 0);
+        CHECK(src.good_citizen_violations() == 0, "GC/ii good_citizen_violations == 0");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite PW -- provider-poll-in-window regression (R-CIT-2).
+//
+// The live template provider polls snapshot() every ~1 s AND drives its rebuild
+// decision off epoch(). Before the fix, snapshot() advanced served_pool_seq_ to
+// the POLLED pool version even when the refresh rate-limiter admitted nothing.
+// A tx arriving inside the refresh window was then swallowed: the very next
+// epoch() saw seq == served_pool_seq_ and reported the OLD backlog_seq forever,
+// so the provider never rebuilt and the block was mined EMPTY while the pool
+// held valid admitted txs (live symptom: h=282, "good-citizen: on pool=2
+// chosen=2" alongside "coinbase: n_tx=0" for the whole interval; the template
+// only rebuilt on the next tip move). The fix advances served_pool_seq_ only to
+// the version actually ADMITTED, so a rate-limited poll leaves the pending pool
+// change visible to the next epoch() once the window elapses.
+//
+// The pivotal check in each subcase -- epoch() advances once the window elapses
+// -- FAILS on the pre-fix head and PASSES after the one-line fix, so the suite
+// is non-vacuous: it exists only because the defect existed. Note that
+// snapshot() always assembles from the CURRENT pool, so the harm is not in the
+// bytes a forced snapshot would carry; it is that epoch() -- the provider's
+// rebuild trigger -- never moves, so the provider never CALLS snapshot() and the
+// arrival sits unserved for the whole block interval.
+// ---------------------------------------------------------------------------
+void suite_provider_poll_in_window() {
+    std::printf("== PW. provider poll-in-window: a quiet-moment tx is never swallowed (R-CIT-2) ==\n");
+
+    auto make_chain = [](fakes::FakeChain& chain) {
+        chain.state.synced = true;
+        node::ChainMainBlock tip;
+        tip.height = 4000; tip.id = synthetic_id(4000);
+        tip.timestamp = 1700000000; tip.difficulty = u128_of(1000000, 0);
+        chain.rows.push_back(tip);
+        TemplateInputs t;
+        t.major_version = 16; t.minor_version = 16;
+        t.height = 4001; t.prev_id = tip.id; t.seed_hash = synthetic_id(9);
+        t.difficulty = u128_of(1000000, 0);
+        t.median_weight = 300000; t.block_weight_limit = 600000;
+        t.already_generated_coins = 18000000000000000000ull;
+        t.median_timestamp = 1699999000; t.synced = true;
+        chain.inputs = t;
+    };
+
+    // --- (a) a SINGLE tx arriving at a quiet moment (no tip move) ------------
+    {
+        fakes::FakeChain chain; make_chain(chain);
+        fakes::FakeTxpool pool;                       // starts EMPTY (a quiet pool)
+        tmpl::NativeTemplatePolicy pol;
+        pol.backlog_refresh_s = 3;                    // the good-citizen cadence
+        tmpl::NativeMinerDataSource src(chain, pool, pol, &pool);
+
+        src.set_now(1000);
+        std::string why;
+        auto md0 = src.snapshot(&why);
+        CHECK(md0.has_value() && md0->tx_backlog.empty(),
+              "PW/a t=1000 genuinely empty pool => empty template (n=%zu)",
+              md0 ? md0->tx_backlog.size() : 0);
+        const MinerDataEpoch e0 = src.epoch();
+
+        // A single tx arrives at t=1001; the tip does not move.
+        src.set_now(1001);
+        pool.add(synthetic_id(91), 2000, 30000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+
+        // THE LIVE PROVIDER PATTERN: it polls snapshot() every second. These
+        // mid-interval polls must NOT swallow the pending pool change.
+        (void)src.snapshot(&why);                     // t=1001 poll (admit rate-limited)
+        CHECK(src.epoch() == e0, "PW/a t=1001 inside the refresh window: no rebuild yet");
+        src.set_now(1002);
+        (void)src.snapshot(&why);                     // t=1002 poll (still rate-limited)
+        CHECK(src.epoch() == e0, "PW/a t=1002 inside the refresh window: still no rebuild");
+
+        // The window elapses. epoch() MUST now advance -- THIS is the check that
+        // FAILS on the pre-fix head (served_pool_seq_ had swallowed the seq).
+        src.set_now(1004);
+        const MinerDataEpoch e1 = src.epoch();
+        CHECK(!(e1 == e0),
+              "PW/a t=1004 window elapsed => epoch ADVANCES (the quiet-moment tx is not swallowed)");
+        CHECK(e1.height == e0.height && e1.prev_id == e0.prev_id,
+              "PW/a ...on the SAME tip: it is the backlog sequence that moved");
+
+        // The provider rebuilds: the tx is served, and stays served.
+        auto md1 = src.snapshot(&why);
+        CHECK(md1.has_value() && md1->tx_backlog.size() == 1,
+              "PW/a the quiet-moment tx ENTERS the served template within the interval (n=%zu)",
+              md1 ? md1->tx_backlog.size() : 0);
+        src.set_now(1030);
+        (void)src.epoch();
+        auto md2 = src.snapshot(&why);
+        CHECK(md2.has_value() && md2->tx_backlog.size() == 1,
+              "PW/a t=1030 the tx is STILL served (n=%zu)", md2 ? md2->tx_backlog.size() : 0);
+        CHECK(src.good_citizen_violations() == 0, "PW/a good_citizen_violations == 0");
+    }
+
+    // --- (b) TWO txs at a quiet moment (the live h=282 shape: pool=2) --------
+    {
+        fakes::FakeChain chain; make_chain(chain);
+        fakes::FakeTxpool pool;
+        tmpl::NativeTemplatePolicy pol;
+        pol.backlog_refresh_s = 3;
+        tmpl::NativeMinerDataSource src(chain, pool, pol, &pool);
+
+        src.set_now(2000);
+        std::string why;
+        (void)src.snapshot(&why);
+        const MinerDataEpoch e0 = src.epoch();
+
+        // Two txs arrive during the same quiet window; the tip does not move.
+        src.set_now(2001);
+        pool.add(synthetic_id(92), 2000, 30000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+        pool.add(synthetic_id(93), 2000, 31000, EVIDENCE_DAEMONLESS_DEFAULT, /*peers=*/2);
+        (void)src.snapshot(&why);                     // provider poll inside the window
+        src.set_now(2002);
+        (void)src.snapshot(&why);                     // provider poll inside the window
+        CHECK(src.epoch() == e0, "PW/b inside the refresh window: no rebuild yet (pool=2)");
+
+        src.set_now(2004);
+        const MinerDataEpoch e1 = src.epoch();
+        CHECK(!(e1 == e0),
+              "PW/b t=2004 window elapsed => epoch ADVANCES (the pool=2 arrival is not swallowed)");
+        auto md1 = src.snapshot(&why);
+        CHECK(md1.has_value() && md1->tx_backlog.size() == 2,
+              "PW/b both quiet-moment txs are MINED -- never an empty block over a non-empty pool (n=%zu)",
+              md1 ? md1->tx_backlog.size() : 0);
+        CHECK(src.last_pool_n() == 2 && src.last_chosen_n() == 2,
+              "PW/b sensors: pool=2 chosen=2 (the status line becomes n_tx=2, not n_tx=0)");
+        CHECK(src.good_citizen_violations() == 0, "PW/b good_citizen_violations == 0");
+    }
+}
+
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1211,6 +1634,9 @@ int main(int argc, char** argv) {
     suite_body_id_alignment();
     suite_pin_same_tip();
     suite_daemon_arm_rebuild_identity();
+    suite_daemon_arm_good_citizen();
+    suite_good_citizen();
+    suite_provider_poll_in_window();
 
     std::printf("=== %d checks, %d failed ===\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

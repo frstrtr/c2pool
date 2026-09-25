@@ -260,6 +260,8 @@ void test_defaults_are_the_design_numbers() {
     kat::check(d.bytes_capacity == 16.0 * 1024 * 1024, "16 MiB burst");
     kat::check(d.block_capacity == 8.0 && d.block_refill == 0.1,
                "the block bucket is 8 / 0.1 per second");
+    kat::check(d.solicited_reply_ttl_ms == 30'000, "a solicited-reply credit lives 30 s");
+    kat::check(d.max_solicited_credits == 8, "at most eight outstanding solicited credits");
     kat::check(d.tx_capacity == 512.0 && d.tx_refill == 64.0,
                "the transaction bucket is 512 / 64 per second");
     kat::check(d.fails_before_ban == 10, "P2P_IP_FAILS_BEFORE_BLOCK");
@@ -276,6 +278,170 @@ void test_defaults_are_the_design_numbers() {
     kat::check(all_accepted, "fifty blocks at the honest cadence never trip the budget");
 }
 
+
+// -----------------------------------------------------------------------
+// #1680. monerod answers our own REQUEST_FLUFFY_MISSING_TX (2009) with the SAME
+// NEW_FLUFFY_BLOCK (2008) command it uses for an unsolicited push -- no request
+// id, no way to tell them apart at the frame. So a non-empty block costs TWO
+// block tokens (the bodiless push + the solicited reply), draining the 8-token
+// bucket in four blocks; the dropped 2008 is then the reply we asked for, and
+// the block strands forever. A solicited reply is not a DoS vector: we mint a
+// short-lived single-use credit the instant we send a 2009, and the next 2008
+// spends the credit instead of a block token. This proves the credit path AND
+// that a genuine unsolicited flood is still bucketed exactly as before.
+// -----------------------------------------------------------------------
+void test_solicited_fluffy_reply_is_not_a_push() {
+    const DosConfig d;   // for the ttl / cap defaults
+
+    // 1) A solicited reply spends a credit, not a block token.
+    {
+        PeerDosGuard g(tiny());   // block cap 3, refill 1/s
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 3; ++i)
+            kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Accept,
+                       "the block bucket admits its burst");
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Drop,
+                   "the bucket is drained: an unsolicited 2008 is dropped");
+        const double lvl = g.blocks_level(0);
+        g.note_fluffy_solicited(0);   // we just sent this peer a 2009
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Accept,
+                   "the solicited reply is admitted on a drained bucket");
+        kat::check(g.blocks_level(0) == lvl, "... and it spent NO block token");
+        kat::check(g.solicited_credits_used() == 1, "... exactly one credit was consumed");
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Drop,
+                   "the credit is single-use: the next 2008 is dropped again");
+    }
+
+    // 2) A NEW_BLOCK (2001) is never solicited this way and never spends a credit.
+    {
+        PeerDosGuard g(tiny());
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 3; ++i) g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);
+        g.note_fluffy_solicited(0);
+        kat::check(g.on_frame(levin::CMD_NEW_BLOCK, 100, 1, 0, f) == DosAction::Drop,
+                   "a 2001 push never claims a solicited credit");
+        kat::check(g.solicited_credits_used() == 0, "... the credit is left untouched");
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Accept,
+                   "... and the 2008 reply can still claim it");
+    }
+
+    // 3) A credit expires: a reply that never comes cannot hoard budget.
+    {
+        DosConfig nr = tiny();
+        nr.block_refill = 0;   // freeze the bucket so only the credit could rescue a 2008
+        PeerDosGuard g(nr);
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 3; ++i) g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);
+        g.note_fluffy_solicited(0);
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1,
+                              d.solicited_reply_ttl_ms + 1, f) == DosAction::Drop,
+                   "an expired solicited credit does not rescue a 2008");
+        kat::check(g.solicited_credits_used() == 0, "... and it was never spent");
+    }
+
+    // 4) Outstanding credits are capped: a burst of 2009s cannot mint unbounded budget.
+    {
+        PeerDosGuard g(tiny());
+        for (int i = 0; i < 20; ++i) g.note_fluffy_solicited(0);
+        kat::check(g.solicited_credits_open() == d.max_solicited_credits,
+                   "outstanding solicited credits are capped at the config maximum");
+    }
+
+    // 5) THE CONTROL: a genuine unsolicited flood (no outstanding 2009) is still
+    //    bucketed exactly as before -- the DoS protection is intact.
+    {
+        PeerDosGuard g(tiny());
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 3; ++i)
+            kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Accept,
+                       "the burst is admitted");
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Drop,
+                   "an unsolicited flood with no outstanding request is still dropped");
+        kat::check(f == DosFault::BucketExhausted, "... as an exhaustion");
+        kat::check(g.solicited_credits_used() == 0, "... and no credit was involved");
+    }
+
+    // 6) A disabled credit path (cap 0) is the pre-#1680 behaviour.
+    {
+        DosConfig off = tiny();
+        off.max_solicited_credits = 0;
+        PeerDosGuard g(off);
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 3; ++i) g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);
+        g.note_fluffy_solicited(0);   // no-op when the cap is zero
+        kat::check(g.solicited_credits_open() == 0, "cap 0 mints no credits");
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Drop,
+                   "with the credit path off, a drained bucket drops the reply (pre-#1680)");
+    }
+}
+
+// -----------------------------------------------------------------------
+// D3a: a push of a block the index HAS (connected, or a valid alt candidate)
+// hands its block token back -- and ONLY a token a push actually spent.
+// -----------------------------------------------------------------------
+void test_known_block_refund() {
+    // 1) Honest relay at a fast cadence: every push is refunded once the index
+    //    takes it, so the bucket never drains however many blocks arrive.
+    {
+        DosConfig nr = tiny();
+        nr.block_refill = 0;   // frozen: only refunds can put tokens back
+        PeerDosGuard g(nr);
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 50; ++i) {
+            kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Accept,
+                       "a push of a block the index then takes as valid is admitted");
+            kat::check(g.refund_block_token(0), "... and its token comes back");
+        }
+        kat::check(g.blocks_level(0) == nr.block_capacity, "50 refunded pushes leave the bucket full");
+        kat::check(g.block_refunds() == 50, "... 50 refunds counted");
+        kat::check(g.score() == 0, "... and no fault point");
+    }
+
+    // 2) Refunds never outnumber charges, and never lift the bucket past its
+    //    capacity: a verdict with no outstanding charge returns nothing.
+    {
+        PeerDosGuard g(tiny());
+        kat::check(!g.refund_block_token(0), "no push, no refund");
+        kat::check(g.blocks_level(0) == 3, "the bucket is not lifted past its capacity");
+        DosFault f = DosFault::None;
+        g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);
+        kat::check(g.refund_block_token(0), "one push, one refund");
+        kat::check(!g.refund_block_token(0), "... and never two");
+    }
+
+    // 3) A 2008 admitted on a solicited-reply credit spent no block token, so a
+    //    verdict on it refunds the PUSH it answers, not a token out of thin air.
+    {
+        DosConfig nr = tiny();
+        nr.block_refill = 0;
+        PeerDosGuard g(nr);
+        DosFault f = DosFault::None;
+        g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);   // the bodiless push: 1 token
+        g.note_fluffy_solicited(0);                              // we asked for its bodies
+        g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);   // the reply: a credit
+        kat::check(g.solicited_credits_used() == 1, "the reply spent the credit");
+        kat::check(g.refund_block_token(0), "the block connects: the push's token comes back");
+        kat::check(!g.refund_block_token(0), "... once, not once per frame");
+        kat::check(g.blocks_level(0) == 3, "the bucket is back to full, not above it");
+    }
+
+    // 4) A dropped push spent nothing and is refunded nothing; pushes the index
+    //    could not take as valid keep their charge -- the flood control is intact.
+    {
+        DosConfig nr = tiny();
+        nr.block_refill = 0;
+        PeerDosGuard g(nr);
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 3; ++i) g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Drop,
+                   "unrefunded pushes (unknown blocks) still drain the bucket");
+        kat::check(f == DosFault::BucketExhausted, "... and the overflow is still scored");
+        int refunds = 0;
+        while (g.refund_block_token(0)) ++refunds;
+        kat::check(refunds == 3, "only the three admitted pushes are refundable, not the dropped one");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -283,6 +449,8 @@ int main() {
     test_one_fault_bans();
     test_byte_bucket();
     test_block_bucket();
+    test_solicited_fluffy_reply_is_not_a_push();
+    test_known_block_refund();
     test_tx_bucket_counts_transactions();
     test_serving_bucket();
     test_sustained_exhaustion_disconnects();
