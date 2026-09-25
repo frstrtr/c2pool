@@ -411,7 +411,9 @@ public:
     // TXPOOL-RESUME: the node's relay gate opened, so the pool can now judge
     // transactions against the synced tip: ask up to cfg_.complement_peers
     // handshaked peers (pinned first) for every tx we do not hold -- now, and
-    // on each later handshake until the quota is spent. Relayed txs are only
+    // on each later handshake until the quota is spent. TXPOOL-RESUME-2: every
+    // call opens a NEW round (the node calls it on each gate opening, so a sync
+    // loss/regain back-fills what was refused while the gate was shut). Relayed txs are only
     // ever pushed ONCE, so without this a node that (re)starts keeps none of
     // the backlog the network already holds until those txs are mined.
     // Every peer this pool talks to is one it dialed (outbound), and monerod
@@ -420,7 +422,7 @@ public:
     void arm_txpool_complement() {
         auto self = shared_from_this();
         boost::asio::post(ex_, [self]() {
-            self->complement_armed_ = true;
+            self->complement_rounds_.arm();
             self->ask_complements_();
         });
     }
@@ -511,7 +513,7 @@ private:
         std::deque<std::uint64_t>          span_order;
         std::uint64_t                      in_flight_span = kNoSpan;
         bool                               wire_busy = false;
-        bool                               complement_asked = false;   // TXPOOL-RESUME
+        std::uint64_t                      complement_round = 0;   // TXPOOL-RESUME(-2): round last asked in
 
         explicit Peer(const DosConfig& c) : dos(c) {}
     };
@@ -685,25 +687,25 @@ private:
         store_.on_handshaked(key, ref.peer_id, now);
         ++tel_.handshakes;
         publish_snapshot();
-        if (complement_armed_) ask_complements_();
+        if (complement_rounds_.armed()) ask_complements_();
     }
 
     // TXPOOL-RESUME (io thread). Pinned peers first, then the rest; each link
-    // is asked at most once, and at most cfg_.complement_peers in total.
+    // is asked at most once per round, and at most cfg_.complement_peers per
+    // round (TXPOOL-RESUME-2: rounds, see ComplementRounds).
     void ask_complements_() {
-        if (!complement_armed_ || !deps_.txpool) return;
+        if (!complement_rounds_.armed() || !deps_.txpool) return;
         for (int pass = 0; pass < 2; ++pass) {
             for (auto& [k, p] : peers_) {
-                if (complement_asked_ >= cfg_.complement_peers) return;
-                if (!p.handshaked || !p.link || p.complement_asked) continue;
+                if (complement_rounds_.quota_spent()) return;
+                if (!p.handshaked || !p.link || !complement_rounds_.may_ask(p.complement_round)) continue;
                 if ((pass == 0) != p.is_protected) continue;
                 levinns::GetTxpoolComplement m;
                 m.hashes = deps_.txpool->complement_request_ids();
                 std::vector<std::uint8_t> body;
                 levinns::MessageError err = levinns::MessageError::None;
                 if (!levinns::encode_get_txpool_complement(m, body, err)) return;
-                p.complement_asked = true;
-                ++complement_asked_;
+                p.complement_round = complement_rounds_.note_asked();
                 p.dos.note_complement_solicited(now_ms());
                 p.link->send_notify(levinns::CMD_GET_TXPOOL_COMPLEMENT, body);
                 std::lock_guard<std::mutex> lk(snap_mu_);
@@ -770,7 +772,11 @@ private:
         DosFault fault = DosFault::None;
         const std::uint64_t credits_before = p->dos.solicited_credits_used();
         const std::uint64_t complement_before = p->dos.complement_credits_used();
-        const DosAction act = p->dos.on_frame(h.command, n, units, now, fault);
+        // TXPOOL-RESUME-2: only a 2002 with the complement answer's wire shape
+        // (dandelionpp_fluff=false, see PeerDosGuard::on_frame) may spend the
+        // 2010 credit, so a fluffed relay racing the answer cannot take it.
+        const bool complement_shaped = is_tx && !txm.dandelionpp_fluff;
+        const DosAction act = p->dos.on_frame(h.command, n, units, now, fault, complement_shaped);
         if (p->dos.solicited_credits_used() != credits_before) ++tel_.frames_credited_fluffy;
         const bool complement = p->dos.complement_credits_used() != complement_before;
         if (act != DosAction::Accept) {
@@ -1286,8 +1292,7 @@ private:
     std::uint64_t next_span_id_ = 1;
     std::string   primary_;
     bool          running_ = false;
-    bool          complement_armed_ = false;   // TXPOOL-RESUME (io thread)
-    std::size_t   complement_asked_ = 0;
+    ComplementRounds complement_rounds_{cfg_.complement_peers};   // TXPOOL-RESUME(-2) (io thread)
 
     std::mutex                          span_mu_;
     std::map<std::string, std::size_t>  span_res_;         // booked span slots per peer key

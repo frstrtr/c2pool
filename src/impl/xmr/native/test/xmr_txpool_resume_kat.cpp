@@ -29,6 +29,24 @@
 // feature probes are C++20 requires-expressions, so the same source builds
 // on both trees and the base failures are runtime FAILs, not a compile error.
 // No sockets, no RandomX, no monerod.
+//
+// TXPOOL-RESUME-2 (the 09-25 verify of the above), three more seams:
+//
+//   D  CREDIT    The 2010 DoS credit was spent by the FIRST 2002 from the peer
+//                after our 2010, answer or not: a fluffed relay racing the
+//                answer took it, and the real answer (a whole pool) was then
+//                charged to the 512-tx flood bucket. The credit is now bound to
+//                the answer's wire shape (dandelionpp_fluff=false: monerod
+//                struct_init's the answer; relays on our links are fluffed).
+//   E  REGAIN    The back-fill was once per process: a sync loss/regain re-
+//                opened the gate with no new round. Every opening is a round.
+//   F  HOLD      On a fresh boot the gate opened (and the 2010 went out) on the
+//                first MainchainEvent of the batch that closed the sync, before
+//                that batch's BlockTxEvents fed the output set: 76 of 77 rings
+//                of the answer UNRESOLVED. The gate now opens only once the
+//                output set holds the index tip.
+//
+// D/E/F are RED on 826898d2 (TXPOOL-RESUME) and GREEN on the fix.
 
 #include <atomic>
 #include <cstdint>
@@ -47,6 +65,9 @@
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
 #include "impl/xmr/native/p2p/levin_messages.hpp"
 #include "impl/xmr/native/p2p/xmr_p2p_dos.hpp"
+#if __has_include("impl/xmr/native/node/xmr_tx_relay_gate.hpp")
+#include "impl/xmr/native/node/xmr_tx_relay_gate.hpp"
+#endif
 #include "impl/xmr/native/template/xmr_native_miner_data.hpp"
 #include "impl/xmr/native/txpool/xmr_relayed_txpool.hpp"
 #include "impl/xmr/native/txpool/xmr_tx_decode.hpp"
@@ -81,6 +102,16 @@ std::optional<std::vector<TxRelayVerdict>> complement_(P& p, const PeerRef& r,
 template <class G> bool solicit_(G& g, native::p2p::Millis now) {
     if constexpr (requires { g.note_complement_solicited(now); }) { g.note_complement_solicited(now); return true; }
     else { (void)g; (void)now; return false; }
+}
+// TXPOOL-RESUME-2: charge a 2002 with its wire shape (absent on 826898d2: the
+// 5-argument call, which any 2002 can spend the credit through).
+template <class G>
+native::p2p::DosAction frame_(G& g, std::size_t bytes, std::size_t units, native::p2p::Millis now,
+                              bool complement_shaped) {
+    native::p2p::DosFault f = native::p2p::DosFault::None;
+    if constexpr (requires { g.on_frame(lv::CMD_NEW_TRANSACTIONS, bytes, units, now, f, complement_shaped); })
+        return g.on_frame(lv::CMD_NEW_TRANSACTIONS, bytes, units, now, f, complement_shaped);
+    else { (void)complement_shaped; return g.on_frame(lv::CMD_NEW_TRANSACTIONS, bytes, units, now, f); }
 }
 template <class S> bool warm_gate_(S& s, const std::atomic<bool>* w) {
     if constexpr (requires { s.set_warm_gate(w); }) { s.set_warm_gate(w); return true; }
@@ -341,15 +372,15 @@ void test_b_backfill(Golden& g) {
 
     // The answer is solicited: a 600-tx answer must not trip the 512-tx flood
     // bucket (an honest peer with a busy pool would be scored as a flooder).
+    // (The answer carries its wire shape, dandelionpp_fluff=false: see D.)
     native::p2p::PeerDosGuard guard;
     const bool minted = solicit_(guard, 1000);
-    native::p2p::DosFault f = native::p2p::DosFault::None;
-    const auto act = guard.on_frame(lv::CMD_NEW_TRANSACTIONS, 600 * 2500, 600, 1000, f);
+    const auto act = frame_(guard, 600 * 2500, 600, 1000, /*complement_shaped=*/true);
     kat::checkf(minted && act == native::p2p::DosAction::Accept,
                 "B2 a 600-tx complement answer is accepted on its solicited credit (minted=%d, action=%d)",
                 minted ? 1 : 0, (int)act);
     native::p2p::PeerDosGuard unsolicited;
-    const auto act2 = unsolicited.on_frame(lv::CMD_NEW_TRANSACTIONS, 600 * 2500, 600, 1000, f);
+    const auto act2 = frame_(unsolicited, 600 * 2500, 600, 1000, /*complement_shaped=*/true);
     kat::checkf(act2 != native::p2p::DosAction::Accept,
                 "B3 (control) the same 600-tx frame UNSOLICITED is still refused by the flood bucket");
 
@@ -420,6 +451,152 @@ void test_c_warm(Golden& g) {
     kat::check(gated.good_citizen_violations() == 0, "C5 no good-citizen violation");
 }
 
+
+// ===========================================================================
+void test_d_credit() {
+    std::printf("== D. credit: the 2010 credit is spent by the answer, not by a relay racing it ==\n");
+    // The answer's wire shape, straight from the codec: monerod's answer is a
+    // struct_init'd NOTIFY_NEW_TRANSACTIONS, so dandelionpp_fluff=false is on
+    // the wire; a relay is fluffed (and the KV default, when absent, is fluff).
+    {
+        lv::NewTransactions ans; ans.txs.push_back({0x01, 0x02}); ans.dandelionpp_fluff = false;
+        lv::NewTransactions rel; rel.txs.push_back({0x03, 0x04}); rel.dandelionpp_fluff = true;
+        std::vector<std::uint8_t> ba, br;
+        lv::MessageError err = lv::MessageError::None;
+        lv::NewTransactions da, dr;
+        const bool ok = lv::encode_new_transactions(ans, ba, err) && lv::encode_new_transactions(rel, br, err)
+                     && lv::decode_new_transactions(ba.data(), ba.size(), da, err)
+                     && lv::decode_new_transactions(br.data(), br.size(), dr, err);
+        kat::checkf(ok && !da.dandelionpp_fluff && dr.dandelionpp_fluff,
+                    "D0 rig: the answer decodes stem-flagged (fluff=%d), a relay fluffed (fluff=%d)",
+                    ok ? (int)da.dandelionpp_fluff : -1, ok ? (int)dr.dandelionpp_fluff : -1);
+    }
+    native::p2p::PeerDosGuard g;
+    const bool minted = solicit_(g, 1000);
+    kat::check(minted, "D1 rig: our 2010 mints the complement credit");
+    // A regular fluffed relay (3 txs) lands between our 2010 and the answer.
+    const auto a1 = frame_(g, 3 * 2500, 3, 1001, /*complement_shaped=*/false);
+    kat::checkf(a1 == native::p2p::DosAction::Accept && g.complement_credits_used() == 0,
+                "D2 a fluffed relay racing the answer is charged to the flood bucket and does NOT spend "
+                "the credit (action=%d, credits used=%llu; base: 1)",
+                (int)a1, (unsigned long long)g.complement_credits_used());
+    // The real answer: the peer's whole pool, 600 txs (> the 512-tx bucket).
+    const auto a2 = frame_(g, 600 * 2500, 600, 1002, /*complement_shaped=*/true);
+    kat::checkf(a2 == native::p2p::DosAction::Accept && g.complement_credits_used() == 1,
+                "D3 the real answer spends the credit and is NOT charged to the flood bucket "
+                "(action=%d, credits used=%llu; base: refused by the bucket)",
+                (int)a2, (unsigned long long)g.complement_credits_used());
+    // Single use: a second answer-shaped frame is charged like any 2002.
+    const auto a3 = frame_(g, 600 * 2500, 600, 1003, /*complement_shaped=*/true);
+    kat::checkf(a3 != native::p2p::DosAction::Accept && g.complement_credits_used() == 1,
+                "D4 (control) the credit is single-use: a second 600-tx answer-shaped frame is refused (action=%d)",
+                (int)a3);
+    // Unsolicited: an answer-shaped frame with no 2010 outstanding mints nothing.
+    native::p2p::PeerDosGuard cold;
+    const auto a4 = frame_(cold, 600 * 2500, 600, 1000, /*complement_shaped=*/true);
+    kat::checkf(a4 != native::p2p::DosAction::Accept && cold.complement_credits_used() == 0,
+                "D5 (control) an answer-shaped 600-tx frame with no 2010 outstanding is refused (action=%d)", (int)a4);
+}
+
+// ===========================================================================
+void test_e_regain() {
+    std::printf("== E. regain: every relay-gate opening is a new complement round ==\n");
+#if defined(XMR_P2P_HAVE_COMPLEMENT_ROUNDS) && defined(XMR_NATIVE_HAVE_TX_RELAY_GATE_LATCH)
+    native::TxRelayGateLatch gate;
+    native::p2p::ComplementRounds rounds(2);
+    std::map<std::string, std::uint64_t> asked_in;   // link -> round it was last asked in
+    auto ask_all = [&] {
+        std::size_t n = 0;
+        for (const char* k : {"mac", "p1", "p2"})
+            if (rounds.may_ask(asked_in[k])) { asked_in[k] = rounds.note_asked(); ++n; }
+        return n;
+    };
+    auto st = gate.evaluate(true);
+    if (st.arm_complement) rounds.arm();
+    const std::size_t n1 = ask_all();
+    kat::checkf(st.open && st.arm_complement && rounds.round() == 1 && n1 == 2,
+                "E1 boot: the gate opens, round 1 asks 2 links (quota) (open=%d arm=%d asked=%zu)",
+                st.open ? 1 : 0, st.arm_complement ? 1 : 0, n1);
+    kat::checkf(ask_all() == 0, "E2 no link is asked twice in one round");
+    st = gate.evaluate(false);
+    kat::check(st.changed && !st.open && !st.arm_complement, "E3 sync loss closes the gate (no round)");
+    st = gate.evaluate(true);
+    if (st.arm_complement) rounds.arm();
+    const std::size_t n2 = ask_all();
+    kat::checkf(st.open && st.arm_complement && rounds.round() == 2 && n2 == 2 && asked_in["mac"] == 2,
+                "E4 sync REGAIN re-opens the gate and starts round 2: the same links are asked again (%zu)", n2);
+    st = gate.evaluate(true);
+    kat::check(!st.changed && !st.arm_complement, "E5 a steady open gate starts no round");
+    kat::checkf(gate.opens() == 2 && gate.closes() == 1, "E6 opens=%llu closes=%llu",
+                (unsigned long long)gate.opens(), (unsigned long long)gate.closes());
+#else
+    kat::check(false, "E1 complement rounds + relay-gate latch exist (absent: the back-fill is once per process)");
+#endif
+}
+
+// ===========================================================================
+void test_f_hold(Golden& g) {
+    std::printf("== F. hold: the gate opens only once the output set holds the index tip ==\n");
+    // Control (both trees): what an answer admitted against a LAGGING output
+    // set becomes -- ring unresolved, excluded from every template.
+    {
+        RingSource lag;   // the output set before the batch's BlockTxEvents: no members yet
+        RelayedTxPool pool;
+        pool.set_input_consensus_sources(&lag, &lag);
+        (void)seat_tip_(pool, kAnchorHeight);
+        pool.set_synced(true);
+        const auto v = complement_(pool, peer(3), g.blobs);
+        const std::size_t sel = pool.selectable_backlog().size();
+        kat::checkf(v && pool.stats().unresolved_ring == g.blobs.size() && sel == 0,
+                    "F0 (control) a back-fill admitted while the output set lags: %llu of %zu rings unresolved, "
+                    "%zu selectable -- the fresh-boot defect", (unsigned long long)pool.stats().unresolved_ring,
+                    g.blobs.size(), sel);
+    }
+#if defined(XMR_NATIVE_HAVE_TX_RELAY_GATE_LATCH)
+    native::TxRelayGateLatch gate;
+    // The catch-up batch that closes the sync: its MainchainEvents come first.
+    gate.note_chain_events_pending();
+    auto st = gate.evaluate(/*index synced=*/true);
+    kat::checkf(!st.open && st.held && !st.arm_complement,
+                "F1 index synced but the batch's BlockTxEvents not yet fed: the gate is HELD, no 2010 (open=%d)",
+                st.open ? 1 : 0);
+    st = gate.evaluate(true);
+    kat::check(!st.open, "F2 ...still held on the next MainchainEvent of the same flush");
+    // The tx sink fed the index tip's outputs.
+    gate.note_outset_at_tip();
+    st = gate.evaluate(true);
+    kat::checkf(st.open && st.changed && st.arm_complement && gate.held_before_last_open() == 2,
+                "F3 the output set holds the tip: the gate OPENS and the 2010 round starts (held %llu evaluations)",
+                (unsigned long long)gate.held_before_last_open());
+    // The answer now resolves against the whole output set.
+    RelayedTxPool pool;
+    pool.set_input_consensus_sources(&g.rings, &g.rings);
+    (void)seat_tip_(pool, kAnchorHeight);
+    pool.set_synced(st.open);
+    const auto v = complement_(pool, peer(3), g.blobs);
+    kat::checkf(v && pool.stats().unresolved_ring == 0 && pool.selectable_backlog().size() == g.blobs.size(),
+                "F4 the answer admitted after the hold: 0 unresolved, %zu of %zu selectable",
+                pool.selectable_backlog().size(), g.blobs.size());
+    // Steady state: a new block's flush lags the output set by one event, but an
+    // OPEN gate is not closed by it (no refusal window, no spurious round).
+    gate.note_chain_events_pending();
+    st = gate.evaluate(true);
+    kat::check(st.open && !st.changed && !st.arm_complement,
+               "F5 steady state: an open gate stays open through a block's flush (no new round)");
+    // A sync loss still closes it; a regain waits for the output set again.
+    st = gate.evaluate(false);
+    kat::check(!st.open && st.changed, "F6 sync loss closes the gate");
+    gate.note_chain_events_pending();
+    st = gate.evaluate(true);
+    kat::check(!st.open && st.held, "F7 regain inside a catch-up flush is held for the output set too");
+    gate.note_outset_at_tip();
+    st = gate.evaluate(true);
+    kat::check(st.open && st.arm_complement, "F8 ...and opens with a new round once the output set holds the tip");
+#else
+    kat::check(false, "F1 the relay gate waits for the output set (absent: it opens on the first MainchainEvent)");
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -429,6 +606,9 @@ int main() {
         test_a_gate(g);
         test_b_backfill(g);
         test_c_warm(g);
+        test_d_credit();
+        test_e_regain();
+        test_f_hold(g);
     }
     return kat::report("xmr_native_txpool_resume_kat");
 }
