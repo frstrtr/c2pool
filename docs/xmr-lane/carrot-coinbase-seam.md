@@ -95,7 +95,7 @@ height `h`:
 2. `anchor_norm` = 16 bytes, **must be non-zero**. Sender-chosen; `monerod` uses
    random (`gen_janus_anchor()`).
 3. `d_e = ScalarDerive( tr("Carrot sending key normal", anchor_norm[16],
-   input_context[33], K_s[32], pid[8] = 0) )` (unkeyed; `pid` must be null).
+   input_context[33], K_s[32], K_v[32], pid[8] = 0) )` (unkeyed; `pid` must be null).
 4. `D_e = d_e * B` (X25519, unclamped; 32-byte x-coordinate, carried in
    `tx_extra`). The subaddress form `d_e * ConvertPointE(K_s^j)` is **forbidden**
    for a coinbase (the reference throws `bad_address_type`).
