@@ -389,6 +389,27 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_race_rebook_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_race_rebook_kat PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_race_rebook_kat COMMAND v37_xmr_race_rebook_kat)
+
+    # v37_xmr_coldboot_resume_kat (COLD-BOOT-4): every anchor boot (pinned or
+    # explicit) is paced by one predicate; a restart re-drives from its finalize
+    # cursor (a cursor in the pre-anchor span starts the scan at the f2 anchor; a
+    # cursor below the retained rows is served by the snapshotted booking tail);
+    # a resume whose cursor lags the snapshot tip stays paced until it catches up.
+    # REAL ChainIndex + XmrNode + FinalizeConnect. Builds on the pre-fix tree and
+    # FAILS there. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_coldboot_resume_kat v37_xmr_coldboot_resume_kat.cpp)
+    target_compile_features(v37_xmr_coldboot_resume_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_coldboot_resume_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE xmr_node xmr_native_txpool xmr_coin Threads::Threads)
+    if (TARGET Boost::headers)
+        target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(v37_xmr_coldboot_resume_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME v37_xmr_coldboot_resume_kat COMMAND v37_xmr_coldboot_resume_kat)
+    set_tests_properties(v37_xmr_coldboot_resume_kat PROPERTIES TIMEOUT 900)
     # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
     # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
     # (R4 gate kept, repair continues), never refused on a retry count; two nodes

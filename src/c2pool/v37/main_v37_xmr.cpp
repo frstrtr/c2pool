@@ -1498,6 +1498,11 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::printf("cold-boot: %s; index base %llu -> finalize cursor %s\n", origin.c_str(), static_cast<unsigned long long>(ha),
                         seeded ? ("SEEDED at " + std::to_string(ha - cfg.d_conf) + " (fresh store)").c_str()
                                : ("kept at " + std::to_string(node.finalize_driver().cursor_height()) + " (resumed store)").c_str());
+            // COLD-BOOT-4: a resumed cursor in the pre-anchor span re-drives from the f2 anchor.
+            if (!seeded && node.floor_resumed_scan(bo.boot_anchor_height))
+                std::printf("cold-boot-4: resumed cursor %llu is in the pre-anchor span of the f2 anchor %llu -> native scan starts at the anchor\n",
+                            static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
+                            static_cast<unsigned long long>(bo.boot_anchor_height));
         }
     }
 
@@ -3482,6 +3487,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 lifted.empty() ? (nn->index().consumer_ceiling() ? "ACTIVE" : "off") : ("LIFTED (" + lifted + ")").c_str(),
                                 (unsigned long long)qs.dropped, (unsigned long long)qs.redriven, (unsigned long long)qs.unrecoverable,
                                 qs.high_water, (unsigned long long)qs.backpressure_engaged);
+                    const auto bt = nn->index().booking_tail_stats();   // COLD-BOOT-4
+                    std::printf("  cold-boot-4: booking tail kept=%zu lowest=%llu dropped=%llu%s\n", bt.kept, (unsigned long long)bt.lowest,
+                                (unsigned long long)bt.dropped,
+                                bt.dropped ? " | ALARM booking tail overflowed: the dropped heights are held (Unknown), never skipped" : "");
                     std::printf("  cold-boot-2: cursor=%llu owed_digest=%s scan=%llu native_tip=%llu catchup_ceiling=%llu held=%d | snapshot ok=%llu FAILED=%llu%s%s | "
                                 "native_unknown=%llu replayed_below_boot_cursor=%llu late_unbooked=%llu\n",
                                 (unsigned long long)node.finalize_driver().cursor_height(),
