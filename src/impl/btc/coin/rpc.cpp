@@ -164,8 +164,8 @@ void NodeRPC::apply_socket_timeouts()
 	if (ec)
 		LOG_WARNING << "CoindRPC: could not set blocking mode: " << ec.message();
 	struct timeval tv;
-	tv.tv_sec  = RPC_IO_TIMEOUT_SECONDS;
-	tv.tv_usec = 0;
+	tv.tv_sec  = static_cast<time_t>(m_io_timeout.count() / 1000);
+	tv.tv_usec = static_cast<suseconds_t>((m_io_timeout.count() % 1000) * 1000);
 	const int fd = m_stream.socket().native_handle();
 	::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));

@@ -5,6 +5,7 @@
 #include "rpc_data.hpp"
 #include "node_interface.hpp"
 
+#include <chrono>
 #include <iostream>
 
 #include <core/uint256.hpp>
@@ -56,6 +57,7 @@ private:
     // return an error after RPC_IO_TIMEOUT_SECONDS instead of hanging forever.
     // Mirrors the DASH #781 pattern. Called after each (re)connect.
     static constexpr int RPC_IO_TIMEOUT_SECONDS = 30;
+    std::chrono::milliseconds m_io_timeout{std::chrono::seconds(RPC_IO_TIMEOUT_SECONDS)};
     void apply_socket_timeouts();
 
     std::string Send(const std::string &request) override;
@@ -64,6 +66,10 @@ private:
 public:
     NodeRPC(io::io_context* context, btc::interfaces::Node* coin, bool testnet);
     ~NodeRPC();
+
+    // Per-call RPC deadline, default RPC_IO_TIMEOUT_SECONDS. Test seam: the
+    // deadline KATs shorten it to keep the suite fast.
+    void set_io_timeout(std::chrono::milliseconds timeout) { m_io_timeout = timeout; }
 
     void connect(NetService address, std::string userpass);
     void reconnect();
