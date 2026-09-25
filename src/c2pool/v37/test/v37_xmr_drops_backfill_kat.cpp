@@ -39,7 +39,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <map>
+#include <optional>
 #include <random>
+#include <set>
 #include <thread>
 
 #include "xmr_relay_test_util.hpp"
@@ -187,6 +189,16 @@ struct Harness {
         w->attach(node);
 #if defined(C2POOL_XMR_RAIN_BACKFILL)
         w->attach_chain_order(node, kD);
+#endif
+#if defined(C2POOL_XMR_HARVEST_CHAIN_PURE)
+        // RAIN-BACKFILL-2: the canonical chain of H1/H2 carries lane blocks at
+        // 1030, 1033, 1034, 1038 (the shell answers this from the best chain)
+        w->set_prev_lane_fn([](std::uint64_t h) -> std::optional<std::uint64_t> {
+            static const std::set<std::uint64_t> lanes = {1030, 1033, 1034, 1038};
+            auto it = lanes.lower_bound(h);
+            if (it == lanes.begin()) return dx::ChainOrderedHarvest::kNoPrevLane;
+            return *std::prev(it);
+        });
 #endif
         w->observe_native_tip(1000);
         for (const auto& p : enrol) w->enroll_at_tip(p);

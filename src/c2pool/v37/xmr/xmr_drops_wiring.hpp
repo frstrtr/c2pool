@@ -73,9 +73,11 @@
 //     as "late" on that node alone. ChainOrderedHarvest below RETAINS the
 //     raindrops + share counts (bounded) and composes the harvest of a lane
 //     block won at h as a PURE function of the retained set over
-//     [frontier(previous lane block booked below h), h - D_conf): a re-booking at
-//     h (the sibling replaced) or below re-derives exactly what a node that only
-//     ever booked the canonical chain derives. The shell attaches it with
+//     [frontier(prev_lane(h)), h - D_conf), prev_lane(h) = the lane block the
+//     CANONICAL chain carries nearest below h (RAIN-BACKFILL-2: never a mark
+//     this node set or erased while booking, so an out-of-order booking -- h+1
+//     before h in a reorg -- or a replaced sibling derives exactly the ranges of
+//     a node that only ever booked the canonical chain, in order). The shell attaches it with
 //     attach_chain_order(); the composition HOLDs on the relay's drops_sync()
 //     over range_for(h) until the set is complete (xmr_relay_node.hpp).
 //
@@ -222,11 +224,33 @@ inline std::string verify_carry(const DropsCarry& c, bool binds) {
     return "";
 }
 // ── (6) RAIN-BACKFILL: the retained, chain-ordered harvest ───────────────────
+// Feature marker (the harvest-order KAT switches on it: absent on the base).
+#define C2POOL_XMR_HARVEST_CHAIN_PURE 1
+
+// THE HARVEST RANGE IS A PURE FUNCTION OF THE CANONICAL CHAIN (RAIN-BACKFILL-2).
+// The lane block won at h settles the intervals
+//
+//     range(h) = [ frontier(prev_lane(h)), frontier(h) ),  frontier(x) = x - D_conf
+//
+// where prev_lane(h) is the height of the lane block the CANONICAL chain carries
+// nearest below h (a PrevLaneFn the shell answers from the chain itself: the
+// block id at each height and whether its coinbase is a lane block). Nothing on
+// this path reads what THIS node booked, in which order, or what it booked and
+// then replaced: an out-of-order booking (h+1 before h during a reorg) or a
+// sibling booked and replaced composes exactly the ranges of a node that booked
+// the canonical chain in order, so consecutive canonical lane blocks tile the
+// intervals once each -- never an interval twice, never a gap.
 class ChainOrderedHarvest {
 public:
     using Rows = std::vector<::c2pool::v37n::settle::HarvestedReceipt>;
     using CoversFn = std::function<bool(std::uint64_t)>;
-    static constexpr std::size_t kMarksKept = 256;   // booked lane blocks remembered (>> D_conf: a reorg is shallower)
+    // prev_lane(h): the canonical lane block below h; kNoPrevLane = none on the
+    // chain below h (the first lane block: everything retained below its
+    // frontier); nullopt = UNDECIDABLE now (the shell HOLDs the composition).
+    using PrevLaneFn = std::function<std::optional<std::uint64_t>(std::uint64_t)>;
+    static constexpr std::uint64_t kNoPrevLane = 0;        // chain heights are >= 1
+    static constexpr std::uint64_t kReorgMargin = 64;      // intervals kept below the top range (>> any reorg depth)
+    static constexpr std::size_t   kBookedKept = 256;      // diagnostic range log
 
     ChainOrderedHarvest(std::uint32_t K, unsigned lz, std::uint64_t d_conf) : m_K(K), m_lz(lz), m_d_conf(d_conf) {}
     void set_d_conf(std::uint64_t d) { m_d_conf = d; }
@@ -245,25 +269,19 @@ public:
     std::uint64_t frontier_of(std::uint64_t won_height) const {
         return won_height > m_d_conf ? won_height - m_d_conf : 0;
     }
-    // [lo, hi): the intervals the composition of a lane block won at `won_height`
-    // settles, given the lane blocks booked strictly below it. Pure.
-    std::pair<std::uint64_t, std::uint64_t> range_for(std::uint64_t won_height) const {
+    // THE range: a pure function of (h, the canonical prev_lane(h)). nullopt = undecidable.
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> range_with(std::uint64_t won_height,
+                                                                      std::optional<std::uint64_t> prev_lane) const {
+        if (!prev_lane) return std::nullopt;
         const std::uint64_t hi = frontier_of(won_height);
-        std::uint64_t lo = m_floor;
-        auto it = m_marks.lower_bound(won_height);
-        if (it != m_marks.begin()) lo = std::max(lo, std::prev(it)->second);
-        return {std::min(lo, hi), hi};
+        const std::uint64_t lo = (*prev_lane == kNoPrevLane || *prev_lane >= won_height) ? 0 : frontier_of(*prev_lane);
+        return std::make_pair(std::min(lo, hi), hi);
     }
 
-    // Book a lane block won at `won_height`: every mark at or above it is a
-    // superseded booking (the chain now carries this block there), so it is
-    // forgotten; the rows are re-derived from the retained set.
-    Rows take(std::uint64_t won_height, const CoversFn& covers,
-              const ::c2pool::v37n::EnrollmentBook* enrollment) {
-        m_marks.erase(m_marks.lower_bound(won_height), m_marks.end());
-        const auto [lo, hi] = range_for(won_height);
-        m_marks[won_height] = hi;
-        m_last_lo = lo; m_last_hi = hi;
+    // The rows over [lo, hi) from the retained set (pure; `withheld` counts the
+    // rows whose share count S is not covered here -- never credited).
+    Rows rows_over(std::uint64_t lo, std::uint64_t hi, const CoversFn& covers,
+                   const ::c2pool::v37n::EnrollmentBook* enrollment, std::uint64_t* withheld = nullptr) const {
         std::map<std::pair<bytes32, std::uint64_t>, std::vector<bytes32>> keys;   // (payee, interval) -> hashes
         for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it)
             for (const auto& [payee, h] : it->second) keys[std::make_pair(payee, it->first)].push_back(h);
@@ -276,7 +294,7 @@ public:
         }
         Rows out;
         for (auto& [k, hashes] : keys) {
-            if (!covers || !covers(k.second)) { ++m_withheld; continue; }   // S UNKNOWN here: withheld, never credited
+            if (!covers || !covers(k.second)) { if (withheld) ++*withheld; continue; }   // S UNKNOWN here: withheld
             ::c2pool::v37::subthreshold::ReceiptCollector rc(m_K, ::c2pool::v37n::drops_detail::h_t_of_lz(m_lz));
             std::sort(hashes.begin(), hashes.end());
             for (const auto& h : hashes) rc.observe(::c2pool::v37n::drops_detail::u256_of(h));
@@ -284,9 +302,43 @@ public:
             rc.set_shares(si == m_shares.end() ? 0 : si->second);
             out.push_back(::c2pool::v37n::settle::HarvestedReceipt{k.first, k.second, rc});
         }
-        while (m_marks.size() > kMarksKept) {   // bounded: forget the oldest booking and everything below it
-            m_floor = std::max(m_floor, m_marks.begin()->second);
-            m_marks.erase(m_marks.begin());
+        return out;
+    }
+    // A short digest of the retained inputs of [lo, hi) (payee, interval, hashes,
+    // S): what the rig compares across nodes per canonical block. Diagnostic.
+    std::uint64_t inputs_digest(std::uint64_t lo, std::uint64_t hi) const {
+        std::uint64_t x = 1469598103934665603ULL;
+        auto mix = [&x](const unsigned char* p, std::size_t n) { for (std::size_t i = 0; i < n; ++i) { x ^= p[i]; x *= 1099511628211ULL; } };
+        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it) {
+            mix(reinterpret_cast<const unsigned char*>(&it->first), sizeof(it->first));
+            for (const auto& [payee, h] : it->second) { mix(payee.data(), payee.size()); mix(h.data(), h.size()); }
+        }
+        for (const auto& [k, s] : m_shares) {
+            if (k.second < lo || k.second >= hi) continue;
+            mix(k.first.data(), k.first.size());
+            mix(reinterpret_cast<const unsigned char*>(&k.second), sizeof(k.second));
+            mix(reinterpret_cast<const unsigned char*>(&s), sizeof(s));
+        }
+        return x;
+    }
+
+    // Book a lane block won at `won_height` whose canonical predecessor lane
+    // block is `prev_lane`: the rows of range_with(won_height, prev_lane). The
+    // retained set is NOT consumed (a later booking at the same or a lower
+    // height -- a reorg -- re-derives from it); it is pruned only below the top
+    // range minus kReorgMargin.
+    Rows take(std::uint64_t won_height, std::optional<std::uint64_t> prev_lane, const CoversFn& covers,
+              const ::c2pool::v37n::EnrollmentBook* enrollment) {
+        const auto rg = range_with(won_height, prev_lane);
+        if (!rg) { ++m_undecided; return {}; }
+        const auto [lo, hi] = *rg;
+        m_last_lo = lo; m_last_hi = hi;
+        m_booked[won_height] = *rg;
+        while (m_booked.size() > kBookedKept) m_booked.erase(m_booked.begin());
+        Rows out = rows_over(lo, hi, covers, enrollment, &m_withheld);
+        if (won_height >= m_top) {   // bounded retention: keep kReorgMargin intervals below the top range
+            m_top = won_height;
+            if (lo > kReorgMargin) m_floor = std::max(m_floor, lo - kReorgMargin);
         }
         m_drops.erase(m_drops.begin(), m_drops.lower_bound(m_floor));
         for (auto it = m_shares.begin(); it != m_shares.end();) it = it->first.second < m_floor ? m_shares.erase(it) : std::next(it);
@@ -296,7 +348,9 @@ public:
     std::uint64_t observed() const { return m_observed; }
     std::uint64_t late() const { return m_late; }
     std::uint64_t withheld() const { return m_withheld; }
-    std::size_t marks() const { return m_marks.size(); }
+    std::uint64_t undecided() const { return m_undecided; }
+    std::uint64_t floor() const { return m_floor; }
+    std::size_t marks() const { return m_booked.size(); }
     std::size_t retained_intervals() const { return m_drops.size(); }
     std::pair<std::uint64_t, std::uint64_t> last_range() const { return {m_last_lo, m_last_hi}; }
 
@@ -306,8 +360,8 @@ private:
     std::uint64_t m_d_conf;
     std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>> m_drops;          // interval -> {(payee, N)}
     std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t> m_shares;            // (payee, interval) -> S
-    std::map<std::uint64_t, std::uint64_t> m_marks;                                  // booked won height -> its frontier
-    std::uint64_t m_floor = 0, m_observed = 0, m_late = 0, m_withheld = 0, m_last_lo = 0, m_last_hi = 0;
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> m_booked;       // diagnostic: h -> the range it composed
+    std::uint64_t m_floor = 0, m_top = 0, m_observed = 0, m_late = 0, m_withheld = 0, m_undecided = 0, m_last_lo = 0, m_last_hi = 0;
 };
 
 // ── THE XMR BUNDLE: one per lane, owned by the shell ────────────────────────
@@ -358,7 +412,7 @@ public:
         if constexpr (requires { node.set_drops_carried_fn({}); })
             node.set_drops_carried_fn([this]() { return take_carried(); });   // ENROL-REPL
     }
-    // ★ RAIN-BACKFILL: compose from the retained, chain-ordered harvest (5)
+    // ★ RAIN-BACKFILL: compose from the retained, chain-ordered harvest (6)
     // instead of the destructive take_buried(). Called by the shell right after
     // attach(); a node without it keeps the take_buried() body.
     template <class Node>
@@ -371,21 +425,45 @@ public:
         node.set_harvest_range_fn([this](std::uint64_t won_height) { return take_chain_ordered(won_height); });
     }
     bool chain_ordered() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_chain_order; }
-    // the interval range the composition of a lane block won at h settles (the HOLD's range)
-    std::pair<std::uint64_t, std::uint64_t> range_for(std::uint64_t won_height) const {
+    // ★ RAIN-BACKFILL-2: the canonical chain's answer to "which lane block is
+    // nearest below h" (ChainOrderedHarvest::PrevLaneFn). Unset => every height
+    // is taken to be a lane block (prev_lane(h) = h - 1).
+    void set_prev_lane_fn(ChainOrderedHarvest::PrevLaneFn f) {
         std::lock_guard<std::mutex> lk(m_hmtx);
-        return m_coh.range_for(won_height);
+        m_prev_lane = std::move(f);
+    }
+    std::optional<std::uint64_t> prev_lane(std::uint64_t won_height) const {
+        ChainOrderedHarvest::PrevLaneFn f;
+        { std::lock_guard<std::mutex> lk(m_hmtx); f = m_prev_lane; }   // asked OUTSIDE the lock (it may read the chain)
+        if (f) return f(won_height);
+        return won_height > 1 ? won_height - 1 : ChainOrderedHarvest::kNoPrevLane;
+    }
+    // the interval range the composition of a lane block won at h settles (the
+    // HOLD's range); nullopt = the canonical predecessor is undecidable now
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> range_for(std::uint64_t won_height) const {
+        const auto pl = prev_lane(won_height);
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        return m_coh.range_with(won_height, pl);
     }
     ChainOrderedHarvest::Rows take_chain_ordered(std::uint64_t won_height) {
+        const auto pl = prev_lane(won_height);
         std::lock_guard<std::mutex> lk(m_hmtx);
         const auto& book = m_core.shares();
-        return m_coh.take(won_height, [&book](std::uint64_t iv) { return book.covers(iv); }, &m_core.enrollment());
+        return m_coh.take(won_height, pl, [&book](std::uint64_t iv) { return book.covers(iv); }, &m_core.enrollment());
     }
-    struct ChainStats { std::uint64_t observed = 0, late = 0, withheld = 0; std::size_t marks = 0, intervals = 0; std::uint64_t lo = 0, hi = 0; };
+    // diagnostic: (rows, inputs digest) of [lo, hi) as the retained set stands now (pure)
+    std::pair<std::size_t, std::uint64_t> peek_rows(std::uint64_t lo, std::uint64_t hi) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        const auto& book = m_core.shares();
+        const auto rows = m_coh.rows_over(lo, hi, [&book](std::uint64_t iv) { return book.covers(iv); }, &m_core.enrollment());
+        return {rows.size(), m_coh.inputs_digest(lo, hi)};
+    }
+    struct ChainStats { std::uint64_t observed = 0, late = 0, withheld = 0, undecided = 0, floor = 0; std::size_t marks = 0, intervals = 0; std::uint64_t lo = 0, hi = 0; };
     ChainStats chain_stats() const {
         std::lock_guard<std::mutex> lk(m_hmtx);
         ChainStats c;
         c.observed = m_coh.observed(); c.late = m_coh.late(); c.withheld = m_coh.withheld();
+        c.undecided = m_coh.undecided(); c.floor = m_coh.floor();
         c.marks = m_coh.marks(); c.intervals = m_coh.retained_intervals();
         c.lo = m_coh.last_range().first; c.hi = m_coh.last_range().second;
         return c;
@@ -501,6 +579,7 @@ private:
     mutable std::mutex m_hmtx;          // ★ RAIN-BACKFILL
     bool m_chain_order = false;
     ChainOrderedHarvest m_coh;
+    ChainOrderedHarvest::PrevLaneFn m_prev_lane{};   // ★ RAIN-BACKFILL-2
 };
 
 }  // namespace c2pool::v37n::xmr::drops

@@ -1640,6 +1640,11 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::map<std::string, std::chrono::steady_clock::time_point> drops_hold_since;
     std::uint64_t drops_hold_entered = 0, drops_hold_resolved = 0;
     long long drops_hold_max_ms = 0;
+    // ★ RAIN-BACKFILL-2: is the block the canonical chain carries at a height a
+    // LANE block? A pure function of the block's bytes (the coinbase lane tag),
+    // memoised per block id; it answers the harvest's prev_lane(h).
+    std::map<std::string, bool> drops_lane_memo;
+    std::uint64_t drops_prev_asked = 0, drops_prev_decoded = 0, drops_prev_none = 0, drops_prev_undecided = 0;
     std::map<std::string, WireCache> wire_cache;   // bid -> the v0x02 descriptor (+ its early fold)
     // ★ ENROL-REPL (gate ON only): our own wins whose FB_BLOCK_WON leaves at BOOKING
     // time, carrying the delta composed there (bid -> the frame without its delta).
@@ -1960,6 +1965,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             ++cba_fetch_failed;   // R-C rework-3 (D6): a transport/JSON failure is a transient retry, NOT a refusal
             return false;
         }
+        if (drops_live) drops_lane_memo[bid] = bk.is_lane;   // ★ RAIN-BACKFILL-2 (decoded from the bytes: deterministic)
         out.total_pico = bk.total;
         if (bk.has_onchain_root) out.onchain_root_hex = root_hex32(bk.onchain_root);
         // D2: the builder datum (0x02 extra-nonce) and, for a matched root, the
@@ -2114,8 +2120,22 @@ static int run_live(const XmrNodeConfig& cfg) {
         // holds for the interval range this lane block's harvest settles; then
         // the relay's admitted raindrops are drained into the harvest HERE, so
         // XmrNode::on_network_block_won composes from the complete set.
+        std::pair<std::uint64_t, std::uint64_t> drops_rg{0, 0};
+        long long drops_held_ms = 0;
         if (drops_live && relay_node) {
-            const auto rg = drops->range_for(h);
+            // ★ RAIN-BACKFILL-2: the range is a pure function of the CANONICAL
+            // chain (the lane block it carries nearest below h), never of this
+            // node's booking order; undecidable now (the chain row or the
+            // predecessor's bytes not readable yet) => HOLD, same family.
+            const auto rgo = drops->range_for(h);
+            if (!rgo) {
+                if (!drops_hold_since.count(bid)) { drops_hold_since[bid] = std::chrono::steady_clock::now(); ++drops_hold_entered; }
+                why = "cut-pending: drops backfill of intervals below h=" + std::to_string(h) +
+                      " undecidable (the canonical predecessor lane block is not readable yet)";
+                return false;
+            }
+            const auto rg = *rgo;
+            drops_rg = rg;
             if (rg.second > rg.first) {
                 const auto ds = relay_node->drops_sync(rg.first, rg.second);
                 if (!ds.complete) {
@@ -2127,15 +2147,11 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             for (auto& a : relay_node->drain_drops())
                 drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
-            long long held_ms = 0;
             if (auto hit = drops_hold_since.find(bid); hit != drops_hold_since.end()) {
-                held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hit->second).count();
+                drops_held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hit->second).count();
                 drops_hold_since.erase(hit); ++drops_hold_resolved;
-                if (held_ms > drops_hold_max_ms) drops_hold_max_ms = held_ms;
+                if (drops_held_ms > drops_hold_max_ms) drops_hold_max_ms = drops_held_ms;
             }
-            std::printf("drops-sync: h=%llu bid=%s… range=[%llu,%llu) held_ms=%lld raindrops_held=%zu -> composing\n",
-                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), (unsigned long long)rg.first,
-                        (unsigned long long)rg.second, held_ms, relay_node->drops_held(rg.first, rg.second).size());
         }
         // ★ ENROL-REPL (gate ON only): the DROPS delta this block books is the
         // WINNER's, carried on FB_BLOCK_WON v0x02 -- never a composition from
@@ -2188,6 +2204,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                         hex_of(drops->core().enrollment().book_digest()).substr(0, 12).c_str(), rej.empty() ? "" : (" -- " + rej).c_str());
         }
         if (!paynow_net(h, bid, bk, credit, payout, why)) { ++cba_refused; return false; }   // SAME-BLOCK PAY-NOW: book net
+        if (drops_live && relay_node) {   // ★ RAIN-BACKFILL(-2): once per booking that proceeds
+            const auto [prow, pdig] = drops->peek_rows(drops_rg.first, drops_rg.second);
+            std::printf("drops-sync: h=%llu bid=%s… range=[%llu,%llu) held_ms=%lld raindrops_held=%zu -> composing\n",
+                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), (unsigned long long)drops_rg.first,
+                        (unsigned long long)drops_rg.second, drops_held_ms, relay_node->drops_held(drops_rg.first, drops_rg.second).size());
+            std::printf("drops-harvest: h=%llu bid=%s… range=[%llu,%llu) rows=%zu inputs=%016llx\n",
+                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), (unsigned long long)drops_rg.first,
+                        (unsigned long long)drops_rg.second, prow, (unsigned long long)pdig);
+        }
         // ★ DROPS: hand the node the price at THIS cut; XmrNode::on_network_block_won
         // (called by FinalizeConnect right after this returns) takes it, one-shot.
         if (drops_live) drops->set_cut_price(booking_price);
@@ -2841,6 +2866,29 @@ static int run_live(const XmrNodeConfig& cfg) {
             // both once the native tip has caught up with the template served.
             drops->attach(node);
             drops->attach_chain_order(node, cfg.d_conf);   // ★ RAIN-BACKFILL: harvest consumption follows the chain
+            // ★ RAIN-BACKFILL-2: prev_lane(h) from the CANONICAL chain: walk down
+            // from h-1 over the best chain's block ids; the first whose coinbase
+            // is a lane block is the predecessor. A height the native index no
+            // longer holds (or the walk bound) => none below; a block whose bytes
+            // are not readable now => undecidable (the booking HOLDs).
+            drops->set_prev_lane_fn([&](std::uint64_t won_height) -> std::optional<std::uint64_t> {
+                static constexpr std::uint64_t kWalk = 1024;
+                ++drops_prev_asked;
+                for (std::uint64_t x = won_height; x-- > 1 && won_height - x <= kWalk;) {
+                    const auto b = node.chain_bid_at(x);
+                    if (!b) break;
+                    auto it = drops_lane_memo.find(*b);
+                    if (it == drops_lane_memo.end()) {
+                        c2pool::v37n::xmr::authority::CoinbaseBooking pbk; std::string pwhy;
+                        if (!fetch_decode(*b, pbk, pwhy) && !pbk.is_lane && pbk.why.empty()) { ++drops_prev_undecided; return std::nullopt; }
+                        ++drops_prev_decoded;
+                        it = drops_lane_memo.emplace(*b, pbk.is_lane).first;
+                    }
+                    if (it->second) return x;
+                }
+                ++drops_prev_none;
+                return c2pool::v37n::xmr::drops::ChainOrderedHarvest::kNoPrevLane;
+            });
             drops_live = true;
             std::printf("DROPS: ★ ACTIVE (V37_ACTIVATE_CONSENSUS_V1, K=%u, lz=%u, share_diff=%llu, raindrop floor diff=%llu, "
                         "receipt weight=%llu, to enrol=%zu at the native tip): every lane block composes the sub-threshold "
@@ -3446,10 +3494,13 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)drops_carry_refused, (unsigned long long)drops_carry_wait,
                             (unsigned long long)node.drops_booked_carried(), (unsigned long long)node.drops_booked_local());
                 const auto cs = drops->chain_stats();   // ★ RAIN-BACKFILL
-                std::printf("  drops-chain: retained=%llu late=%llu withheld=%llu marks=%zu intervals=%zu last_range=[%llu,%llu) | "
+                std::printf("  drops-chain: retained=%llu late=%llu withheld=%llu marks=%zu intervals=%zu last_range=[%llu,%llu) "
+                            "floor=%llu undecided=%llu prev_lane asked=%llu decoded=%llu none=%llu undecidable=%llu | "
                             "hold entered=%llu resolved=%llu now=%zu max_ms=%lld | %s\n",
                             (unsigned long long)cs.observed, (unsigned long long)cs.late, (unsigned long long)cs.withheld, cs.marks,
                             cs.intervals, (unsigned long long)cs.lo, (unsigned long long)cs.hi,
+                            (unsigned long long)cs.floor, (unsigned long long)cs.undecided, (unsigned long long)drops_prev_asked,
+                            (unsigned long long)drops_prev_decoded, (unsigned long long)drops_prev_none, (unsigned long long)drops_prev_undecided,
                             (unsigned long long)drops_hold_entered, (unsigned long long)drops_hold_resolved, drops_hold_since.size(),
                             drops_hold_max_ms, relay_node->describe_drops().c_str());
             }
