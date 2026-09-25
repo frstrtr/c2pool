@@ -1435,6 +1435,16 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::printf("REFUSED: mainnet requires --i-understand-mainnet (prototype safety)\n");
         return 2;
     }
+    // FORK-FUSE-2: the unknown-fork stall period is 30 min for a reason (see
+    // UnknownForkWatch); shortening it makes one natural block gap plus two
+    // lying peers enough to withdraw templates. Test rigs only.
+    if (cfg.test_unknown_fork_stall_s != 0 && cfg.network == MoneroNetwork::Mainnet) {
+        std::printf("REFUSED: --test-unknown-fork-stall-s is a test-only knob and is refused on mainnet\n");
+        return 2;
+    }
+    if (cfg.test_unknown_fork_stall_s != 0)
+        std::printf("TEST KNOB: unknown-fork stall period shortened to %u s (default 1800 s)\n",
+                    cfg.test_unknown_fork_stall_s);
 
     // ── M3: p2p-first is fail-closed on its own preconditions ───────────────
     // The rules live in the config header as a pure function, so the thing the
@@ -3575,6 +3585,34 @@ static int run_live(const XmrNodeConfig& cfg) {
                         static_cast<unsigned long long>(ns.own_invalid_refused),
                         static_cast<unsigned long long>(ns.own_forks_abandoned),
                         static_cast<unsigned long long>(ns.pool_already_mined));
+            // FORK-FUSE-2: the unknown-fork watch. state=normal|suspect|tripped;
+            // a lone above-version block is only a suspect alarm.
+            std::printf("  hf-fuse: unknown_fork=%s unknown_fork_blocks=%llu distinct_peers=%zu/%zu "
+                        "suspect_alarms=%llu trips=%llu clears=%llu stalled=%llu/%llus "
+                        "held_ids=%zu refetch_held=%llu rejected_not_understood=%llu tx_gate=%d\n",
+                        ::c2pool::xmr::native::to_string(ns.uf_state), static_cast<unsigned long long>(ns.uf_blocks),
+                        ns.uf_peers, ::c2pool::xmr::native::UNKNOWN_FORK_QUORUM_PEERS,
+                        static_cast<unsigned long long>(ns.uf_alarms),
+                        static_cast<unsigned long long>(ns.uf_trips),
+                        static_cast<unsigned long long>(ns.uf_clears),
+                        static_cast<unsigned long long>(ns.uf_stalled_s),
+                        static_cast<unsigned long long>(ns.uf_stall_s), ns.uf_ids,
+                        static_cast<unsigned long long>(ns.uf_held),
+                        static_cast<unsigned long long>(ns.uf_not_understood),
+                        ns.txpool_gate_open ? 1 : 0);
+            // FORK-FUSE-3: the sync driver's side of it. flagged = peers that
+            // sent an above-version block and no connecting v16 block since;
+            // they get no want-list batch and a chain request only on a
+            // back-off (to_flagged = those requests, backoff_skips = ticks one
+            // was passed over). chain_requests is the driver's total.
+            std::printf("  hf-fuse-sync: flagged_peers=%zu chain_requests=%llu to_flagged=%llu "
+                        "backoff_skips=%llu chain_timeouts=%llu refetch_requests=%llu\n",
+                        ns.driver.unproductive_peers,
+                        static_cast<unsigned long long>(ns.driver.chain_requests),
+                        static_cast<unsigned long long>(ns.driver.chain_requests_unproductive),
+                        static_cast<unsigned long long>(ns.driver.unproductive_backoff_skips),
+                        static_cast<unsigned long long>(ns.driver.chain_timeouts),
+                        static_cast<unsigned long long>(ns.driver.refetch_requests));
 
             // #1680 observability: the block-DoS bucket accounting for the
             // solicited fluffy missing-tx (2009) reply. dropped = frames the DoS
@@ -4039,6 +4077,7 @@ int main(int argc, char** argv) {
                                      "' (refusing rather than picking a side for you)");
         }
         else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s = u32();
+        else if (a == "--test-unknown-fork-stall-s") cfg.test_unknown_fork_stall_s = u32();
         else if (a == "--same-height-renotify") cfg.same_height_renotify = u32();
         else if (a == "--same-height-journal") cfg.same_height_journal = value();
         else if (a == "--data-dir") cfg.settle_db_path = value();

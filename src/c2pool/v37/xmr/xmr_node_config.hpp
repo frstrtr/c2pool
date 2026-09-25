@@ -196,6 +196,10 @@ struct XmrNodeConfig {
     //   own-mined tip that no peer adopts for this long is abandoned and the
     //   node follows the peers' chain (0 disables). Default 2 x target.
     std::uint32_t      own_fork_bound_s = 240;
+    //   --test-unknown-fork-stall-s <n>  TEST-ONLY: shorten the unknown-fork
+    //   watch's stall period (FORK-FUSE-2; default 30 min) so a regtest rig can
+    //   watch a trip and a clear. REFUSED on mainnet. 0 = the default.
+    std::uint32_t      test_unknown_fork_stall_s = 0;
     // Per-height verdict journal. "" = race.log next to settle.img; "off" =
     // none. Two nodes that watched the same race must agree on every height
     // either of them credited, and a journal is what turns that claim into a

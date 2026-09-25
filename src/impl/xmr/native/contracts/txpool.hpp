@@ -125,6 +125,9 @@ struct TxRelayVerdict {
                            //   its key images is spent there) per the chain
                            //   index's mined oracle -- a reorg re-admit or a
                            //   late relay of a mined tx. No drop.
+        NotUnderstood,     // the tx declares a format above the implemented
+                           //   fork (tx version > 2, or rct type > 6, e.g.
+                           //   FCMP++): not judged, never admitted. No drop.
     };
 
     Reason reason = Reason::Accepted;
@@ -157,6 +160,7 @@ inline const char* to_string(TxRelayVerdict::Reason r) noexcept {
         case TxRelayVerdict::Reason::RingUnresolved:   return "RingUnresolved";
         case TxRelayVerdict::Reason::RingMemberLocked: return "RingMemberLocked";
         case TxRelayVerdict::Reason::AlreadyMined:     return "AlreadyMined";
+        case TxRelayVerdict::Reason::NotUnderstood:    return "NotUnderstood";
     }
     return "?";
 }
