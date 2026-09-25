@@ -100,7 +100,8 @@ namespace x6 = ::v37::xmr::settle;
 // Constants (consensus once activated; compiled in, never a CLI knob)
 // ---------------------------------------------------------------------------
 // The protocol donation / author address (Monero mainnet standard address,
-// public keys only).
+// public keys only). MAINNET only: the other networks' identities are in
+// donation_info() below, selected by the node's --network (DON-NET).
 inline constexpr char kDonationAddress[] =
     "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF";
 // Its decoded public spend (B) and view (A) keys. Pinned against the decoder
@@ -126,6 +127,58 @@ inline bool fee_model_on(const ::v37::LaneParams& p) {
 inline constexpr std::uint64_t kPrefixMainnetStd = 18, kPrefixMainnetInt = 19, kPrefixMainnetSub = 42;
 inline constexpr std::uint64_t kPrefixTestnetStd = 53, kPrefixTestnetInt = 54, kPrefixTestnetSub = 63;
 inline constexpr std::uint64_t kPrefixStagenetStd = 24, kPrefixStagenetInt = 25, kPrefixStagenetSub = 36;
+
+// ---------------------------------------------------------------------------
+// Per-network donation identity (DON-NET)
+// ---------------------------------------------------------------------------
+// The donation identity is chosen by the node's Monero network (--network),
+// never by a knob. MAINNET is kDonationAddress above, byte-for-byte; the
+// other networks carry project-controlled wallets generated offline (public
+// addresses only here; keys are held off-tree). Regtest (monerod --regtest,
+// FAKECHAIN) encodes addresses with the MAINNET network byte, so its address
+// has prefix 18 but distinct keys. The values of DonationNet are the relay
+// HELLO network byte (0 mainnet, 1 testnet, 2 stagenet, 3 regtest).
+#define C2POOL_V37_XMR_DONATION_PER_NETWORK 1
+enum class DonationNet : std::uint8_t { Mainnet = 0, Testnet = 1, Stagenet = 2, Regtest = 3 };
+
+struct DonationIdentity {
+    const char*   address;     // standard address (public keys only)
+    const char*   spend_hex;   // its decoded public spend key B
+    const char*   view_hex;    // its decoded public view key A
+    std::uint64_t prefix;      // its network byte
+};
+inline constexpr char kDonationAddressTestnet[] =
+    "9yWhJcSRcNFhfrZJAkgh5N4swx92cHLP79hYbP8YJwJKYSCcdKXpgrvYxFHZ5kvfUERtXjvwNTJN4EuW7FypyDZ3114t5rG";
+inline constexpr char kDonationSpendHexTestnet[] = "a7731abbe9bb2cf3264395231a8645172ffd7f08c6097e3402197f3f1c6ffcbb";
+inline constexpr char kDonationViewHexTestnet[]  = "ef3c9a659a67c3bf081a352e7cfbfb94cc5e11921a3e8953223fca1ed14e2200";
+inline constexpr char kDonationAddressStagenet[] =
+    "56eN1fax2baeK1WQtCassh9dpgnWbnzTPTgoPQ7wbWPmBszKeTHwa5ji1wuqZnxERNc284ESw3xoDd76uzEtwjge9gesBUp";
+inline constexpr char kDonationSpendHexStagenet[] = "7f095705904be1df109bdf44b0027c339fde3ece7d85069f8bdfb19fd8c16c41";
+inline constexpr char kDonationViewHexStagenet[]  = "0abca326ba53a6f5387785822296c1d15df03e6c51cd44d7dbe270667b5fe34c";
+inline constexpr char kDonationAddressRegtest[] =
+    "43TryRMP6jdJP9h1CSgskqAFX6dA4h76rXfs7x5wvfGZAVmVBBUxRHjfJ9tfgnBtsJ4D75rdz9gVe8pU4SxA2rJhNrx87oD";
+inline constexpr char kDonationSpendHexRegtest[] = "3091e80a51918c67eb67b6fefaf77e374dd898240953bbb75d47b82b8615c638";
+inline constexpr char kDonationViewHexRegtest[]  = "c5d453f0d54332e4f48f12abab2551132f00037f0c51892ebe3b41928ab5bec1";
+
+inline constexpr DonationIdentity donation_info(DonationNet n) {
+    switch (n) {
+        case DonationNet::Testnet:  return {kDonationAddressTestnet, kDonationSpendHexTestnet, kDonationViewHexTestnet, kPrefixTestnetStd};
+        case DonationNet::Stagenet: return {kDonationAddressStagenet, kDonationSpendHexStagenet, kDonationViewHexStagenet, kPrefixStagenetStd};
+        case DonationNet::Regtest:  return {kDonationAddressRegtest, kDonationSpendHexRegtest, kDonationViewHexRegtest, kPrefixMainnetStd};
+        case DonationNet::Mainnet:  break;
+    }
+    return {kDonationAddress, kDonationSpendHex, kDonationViewHex, kPrefixMainnetStd};
+}
+inline constexpr const char* donation_address(DonationNet n) { return donation_info(n).address; }
+inline constexpr const char* to_string(DonationNet n) {
+    switch (n) {
+        case DonationNet::Testnet:  return "testnet";
+        case DonationNet::Stagenet: return "stagenet";
+        case DonationNet::Regtest:  return "regtest";
+        case DonationNet::Mainnet:  break;
+    }
+    return "mainnet";
+}
 
 // ---------------------------------------------------------------------------
 // CryptoNote base58 (block-wise: 8 bytes <-> 11 chars, tail per kEncSizes)
@@ -224,25 +277,31 @@ inline bool hex32_of(const char* hx, std::array<std::uint8_t, 32>& out) {
     }
     return true;
 }
-inline ::v37::ScriptRef donation_ref() {
+// The donation payee of network `n`. The no-argument forms are MAINNET (the
+// historical single identity); every daemon call site passes its --network.
+inline ::v37::ScriptRef donation_ref(DonationNet n) {
+    const DonationIdentity di = donation_info(n);
     std::array<std::uint8_t, 32> B{}, A{};
-    hex32_of(kDonationSpendHex, B);
-    hex32_of(kDonationViewHex, A);
+    hex32_of(di.spend_hex, B);
+    hex32_of(di.view_hex, A);
     return ::v37::xmr::make_xmr_std(B, A);
 }
-inline ::v37::bytes32 donation_identity() { return ::v37::xmr::xmr_identity_key(donation_ref()); }
+inline ::v37::ScriptRef donation_ref() { return donation_ref(DonationNet::Mainnet); }
+inline ::v37::bytes32 donation_identity(DonationNet n) { return ::v37::xmr::xmr_identity_key(donation_ref(n)); }
+inline ::v37::bytes32 donation_identity() { return donation_identity(DonationNet::Mainnet); }
 
 // The mandatory donation output (declared LAST among the fixed outputs, and
 // paying the residual sink, so X6 folds the residual AND the donation's own
 // K_fair payout into it: the canonical tail is
 // [ ... owed ][ donation: owed_paid + 1 + residual ], one output).
-inline x6::FixedOutput donation_marker() {
+inline x6::FixedOutput donation_marker(DonationNet n) {
     x6::FixedOutput f;
-    f.pay = donation_ref();
+    f.pay = donation_ref(n);
     f.amount = kDonationDustPico;
-    f.identity = donation_identity();
+    f.identity = donation_identity(n);
     return f;
 }
+inline x6::FixedOutput donation_marker() { return donation_marker(DonationNet::Mainnet); }
 
 // ---------------------------------------------------------------------------
 // Give-author (receipt-carried u16)
@@ -279,12 +338,12 @@ inline SplitWeight split_receipt_weight(std::uint64_t w, std::uint16_t d) {
 // ---------------------------------------------------------------------------
 inline std::vector<std::pair<::v37::ScriptRef, std::uint64_t>>
 receipt_lane_pushes(const ::v37::ScriptRef& payee, std::uint16_t give_author, bool fee_on,
-                    std::uint64_t off_weight = 1) {
+                    std::uint64_t off_weight = 1, DonationNet net = DonationNet::Mainnet) {
     std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> v;
     if (!fee_on) { v.emplace_back(payee, off_weight); return v; }
     const SplitWeight s = split_receipt_weight(kFeeReceiptWeight, give_author);
     if (s.miner) v.emplace_back(payee, s.miner);
-    if (s.donation) v.emplace_back(donation_ref(), s.donation);
+    if (s.donation) v.emplace_back(donation_ref(net), s.donation);
     return v;
 }
 
@@ -399,7 +458,7 @@ inline MarkerLocation locate_donation_marker(const std::vector<::v37::bytes32>& 
 // exactly ONE output to D, last, Fixed, >= 1 piconero, its owed_part leaving
 // the minimum, and NO separate residual sink (the residual must have folded).
 inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutput>& outs,
-                                              const ::v37::bytes32& D) {
+                                              const ::v37::bytes32& D, const ::v37::ScriptRef& Dref) {
     MarkerLocation m;
     const std::size_t n = outs.size();
     for (const auto& o : outs)
@@ -408,13 +467,13 @@ inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutp
             return m;
         }
     if (n == 0 || outs[n - 1].role != x6::CoinbaseOutput::Role::Fixed || !(outs[n - 1].identity == D) ||
-        outs[n - 1].amount < kDonationDustPico || !(outs[n - 1].pay == donation_ref())) {
+        outs[n - 1].amount < kDonationDustPico || !(outs[n - 1].pay == Dref)) {
         m.why = "donation output absent: the canonical coinbase does not end in the >= " +
                 std::to_string(kDonationDustPico) + "-piconero donation output (owed + 1 + residual)";
         return m;
     }
     for (std::size_t i = 0; i + 1 < n; ++i)
-        if (outs[i].identity == D || outs[i].pay == donation_ref()) {
+        if (outs[i].identity == D || outs[i].pay == Dref) {
             m.why = "more than one donation output: output " + std::to_string(i) +
                     " also pays the donation address (its owed payout must merge into the last one)";
             return m;
@@ -426,6 +485,14 @@ inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutp
     }
     m.ok = true; m.marker = n - 1;
     return m;
+}
+// Mainnet form (D = the mainnet donation identity) and the per-network form.
+inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutput>& outs,
+                                              const ::v37::bytes32& D) {
+    return inspect_donation_marker(outs, D, donation_ref());
+}
+inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutput>& outs, DonationNet n) {
+    return inspect_donation_marker(outs, donation_identity(n), donation_ref(n));
 }
 
 // Receive-side booking rule. `ids`/`amounts` are the per-vout identities and

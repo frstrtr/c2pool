@@ -70,6 +70,7 @@ public:
         u32         grace_ms = 4000;      // in-flight window after the tip moved
         std::string durable_path;         // "" = no durable log
         bool        fee_model = false;    // LaneParams::fee ON: split by the receipt's give_author u16
+        u8          network = 0;          // HELLO network byte == fee::DonationNet: the donation payee (DON-NET)
     };
     struct Stats {
         u64 pushed = 0, push_failed = 0, late = 0, bins_closed = 0, reloaded = 0, reload_torn = 0, durable_writes = 0;
@@ -153,7 +154,8 @@ private:
     bool push_one(const Admitted& a, bool durable) {
         u64 next_after = 0; bytes32 dig{};
         const auto pushes = ::c2pool::v37n::xmr::fee::receipt_lane_pushes(a.r.payee, a.r.side.give_author,
-                                                                         m_o.fee_model, kReceiptWeight);
+                                                                         m_o.fee_model, kReceiptWeight,
+                                                                         static_cast<::c2pool::v37n::xmr::fee::DonationNet>(m_o.network));
         u32 n = 0;
         for (const auto& [ref, w] : pushes) {
             if (!m_push(ref, w, next_after, dig)) { ++m_st.push_failed; return false; }

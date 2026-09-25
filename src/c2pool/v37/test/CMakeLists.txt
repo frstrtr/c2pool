@@ -562,6 +562,34 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_fee_rbind_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_fee_rbind_kat COMMAND v37_xmr_fee_rbind_kat)
 
+    # ------------------------------------------------------------------
+    # DON-NET: one fee-model donation identity per Monero network.
+    #
+    #   v37_xmr_fee_network_kat
+    #     per network (mainnet / testnet / stagenet / regtest) the donation
+    #     address decodes to its pinned keys and network byte, the four
+    #     identities are distinct and mainnet is unchanged; the HELLO
+    #     lane_params_digest is network-independent with the gate OFF, the
+    #     mainnet gate-ON digest is unchanged and a node folding another
+    #     network's identity is refused at HELLO; give-author pushes and the
+    #     one donation output use this network's identity and are refused
+    #     against another's. Listed in BOTH build.yml --target lists.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_fee_network_kat
+        v37_xmr_fee_network_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_fee_network_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_fee_network_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_fee_network_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_fee_network_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_fee_network_kat COMMAND v37_xmr_fee_network_kat)
+
     if (XMR_BUILD_RANDOMX AND TARGET randomx)
         target_link_libraries(xmr_receipt_bind_v2_kat PRIVATE randomx)
         target_include_directories(xmr_receipt_bind_v2_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
