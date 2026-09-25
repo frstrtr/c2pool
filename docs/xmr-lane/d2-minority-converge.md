@@ -622,3 +622,52 @@ Pre-existing issues seen, NOT changed here:
   whole chain; each height at/below the cursor raises `cba-ALARM late_unbooked`
   (308 on one restart). The base-era binary does the same (checked on the same
   store); ledger-neutral.
+
+## 13. Operator ruling D-1 = C (2026-09-25): alarm-only DIVERGED, work-weighted trigger
+
+The DRAFT #1754 verify found the blocker D-1: a byzantine PAIR with two
+attacker-chosen builder keys mining 3 consecutive fake-digest lane blocks made
+every honest node detect "minority" (M = 3 from B_min = 2 builders), fail the
+re-derivation, go DIVERGED and withdraw stratum -- the whole pool halted for the
+cost of 3 lane blocks and never recovered. Ruling D-1 = C replaces two things:
+
+**(A) DIVERGED is alarm-only.** Nothing in D2 withdraws stratum or halts the
+node. CONVERGING and DIVERGED are ALARM bits of `LaneSuspendState` (`alarms`,
+edges counted in `n_converging` / `n_diverged`, named), never suspension
+`causes`; main's converge hook only logs. A node that detects it is the
+minority and cannot re-derive keeps building templates on its own ledger, keeps
+the stratum job up, raises a loud alarm (log line + `minority_alarms` in the
+`minority:` status line) and keeps retrying (every new unmatched foreign lane
+block, and every `converge_retry_every` ticks). DIVERGED clears as soon as the
+window no longer shows a work-weighted minority. `--minority-converge
+halt-only` keeps its name but only detects + alarms (never adopts).
+
+**(B) The trigger is work-weighted.** Observations are unchanged. The
+detection window is the last `--minority-window` W (default 8) DECIDED lane
+blocks above the adoption floor -- own and foreign, matched and unmatched;
+undecided ones are excluded -- each weighted by its work (`Observation::work`,
+one unit per block at one lane difficulty; blocks of different difficulty are
+weighed, not counted). The node is the minority ONLY when the unmatched foreign
+blocks carry strictly MORE than 50% of the window's work, the window holds at
+least `--minority-min-blocks` (default 3) decided blocks, and there is a run to
+reproduce (the unmatched foreign blocks since the last matched foreign one --
+the same run and fork point F the re-derivation always used). At or below 50%
+the node stays on its own ledger and raises `cba-ALARM MINORITY-SUSPECT`
+(counted in `minority_suspect` and `minority_alarms`). The builder key stays in
+the observation (informational); B_min is gone (`--minority-run` /
+`--minority-builders` are replaced by `--minority-window` /
+`--minority-min-blocks`). A byzantine pair must now hold > 50% of the pool's
+lane work in the window to trigger even an attempt, and an attempt still adopts
+only a re-derivation that reproduces every run commitment exactly -- a fake
+digest never does, so the worst case is an alarm.
+
+Unchanged: the refold, the candidate refuse sets, the adoption marker and its
+restart phases, ledger_mutations_on_refuse = 0, and every consensus byte (the
+detection rule is consumer-side; no digest, coinbase byte or golden moves).
+
+KATs: `v37_xmr_minority_workweight_kat` (new; the same source is red on the D2-A
+port and green here) -- WW1 byzantine pair vs 3 honest nodes, WW2 40% no
+re-seed / 60% re-seed, WW3 DIVERGED alarm-only; `minority_converge_selfcheck`
+MC2 (the work-weighted rule) and MC6 (weights); `finalize_connect_selfcheck`
+FC32p/FC32/FC32c/FC32b rewritten for the ruling, FC31/FC34 detect at the height
+the work-weighted window crosses 50%; `lane_suspend_selfcheck` LS11.

@@ -188,8 +188,9 @@ static std::string   g_owner_address;                    // --node-owner-address
 static bool          g_contested_suspend = false;        // --contested-suspend on|off (default off): CONTESTED suspends lane production
 // D2 (operator ruling D2 = A): minority converges to majority.
 static int           g_minority_mode = 1;                // --minority-converge on|off|halt-only (1 = on, 0 = off, 2 = halt-only)
-static std::size_t   g_minority_run = 3;                 // --minority-run M
-static std::size_t   g_minority_builders = 2;            // --minority-builders B_min
+// Operator ruling D-1 = C: the minority trigger is work-weighted; D2 never halts.
+static std::size_t   g_minority_window = 8;              // --minority-window W (decided lane blocks in the detection window)
+static std::size_t   g_minority_min_blocks = 3;          // --minority-min-blocks (no decision on fewer)
 static std::uint64_t g_converge_retry_bound = 600;       // --converge-retry-bound
 static std::uint64_t g_converge_hold_ticks = 0;          // --converge-hold-ticks (TEST knob)
 static std::uint64_t g_recon_max_root_age = ~std::uint64_t{0};   // --recon-max-root-age N (default kReconMaxRootAgeDconf*D_conf; 0 = unbounded)
@@ -847,16 +848,20 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                 {
                     const auto& rs2 = fc.minority_run_status();
                     const auto mode = fc.options().minority_mode;
-                    std::printf("  minority: mode=%s state=%s run=%llu/%zu builders=%llu/%zu detected=%llu converged=%llu halted=%llu "
+                    std::printf("  minority: mode=%s state=%s window=%llu/%zu share=%llu.%llu%% (>50%% = minority) alarms=%llu suspect=%llu "
+                                "run=%llu builders=%llu detected=%llu converged=%llu diverged=%llu "
                                 "cleared=%llu own_refused=%llu released=%llu attempts=%llu undecidable=%llu failed=%llu isolated_marked=%llu "
                                 "obs=%llu relineages=%llu reorg_in=%llu%s\n",
                                 mode == o2::FinalizeConnectOptions::MinorityMode::Off ? "off"
-                                    : mode == o2::FinalizeConnectOptions::MinorityMode::HaltOnly ? "halt-only" : "on",
+                                    : mode == o2::FinalizeConnectOptions::MinorityMode::HaltOnly ? "halt-only(alarm)" : "on",
                                 o2::FinalizeConnect::converge_state_name(fc.converge_state()),
-                                static_cast<unsigned long long>(fs.minority_run_len), fc.options().minority_run,
-                                static_cast<unsigned long long>(fs.minority_run_builders), fc.options().minority_builders,
+                                static_cast<unsigned long long>(fs.minority_window_n), fc.options().minority_window,
+                                static_cast<unsigned long long>(fs.minority_share_permille / 10),
+                                static_cast<unsigned long long>(fs.minority_share_permille % 10),
+                                static_cast<unsigned long long>(fs.minority_alarms), static_cast<unsigned long long>(fs.minority_suspect),
+                                static_cast<unsigned long long>(fs.minority_run_len), static_cast<unsigned long long>(fs.minority_run_builders),
                                 static_cast<unsigned long long>(fs.minority_runs_detected), static_cast<unsigned long long>(fs.converged),
-                                static_cast<unsigned long long>(fs.diverged_halts), static_cast<unsigned long long>(fs.diverged_cleared),
+                                static_cast<unsigned long long>(fs.diverged_entered), static_cast<unsigned long long>(fs.diverged_cleared),
                                 static_cast<unsigned long long>(fs.own_refused_on_converge), static_cast<unsigned long long>(fs.liability_released),
                                 static_cast<unsigned long long>(fs.converge_attempts), static_cast<unsigned long long>(fs.converge_undecidable),
                                 static_cast<unsigned long long>(fs.converge_failed), static_cast<unsigned long long>(fs.isolated_marked),
@@ -971,10 +976,19 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             if (c & LS::kContested) t += " CONTESTED (>= 1/3 of the recent frontier lane blocks refused; operator opt-in --contested-suspend on);";
             if (c & LS::kHeld)      t += " HELD-LAG (an undecided lane block holds the cursor);";
             if (c & LS::kLag)       t += " LAG (finalize cursor behind the buried frontier);";
-            if (c & LS::kConverging) t += " CONVERGING (D2: this node is the minority; re-deriving its ledger onto the majority lineage);";
-            if (c & LS::kDiverged)   t += " DIVERGED (D2 halt: the minority re-derivation does not reproduce the majority; nothing guessed);";
             return t;
         };
+        // D2 under ruling D-1 = C: CONVERGING / DIVERGED are ALARMS -- named and
+        // counted here, never a suspension cause (lane_state keeps them out of causes).
+        if (e.alarm_added & LS::kConverging)
+            std::printf("cba-ALARM: D2 CONVERGING (this node is the work-weighted minority; re-deriving its ledger onto the majority "
+                        "lineage) -- lane template production and the stratum job CONTINUE (ruling D-1 = C)\n");
+        if (e.alarm_added & LS::kDiverged)
+            std::printf("cba-ALARM: D2 DIVERGED (the re-derivation does not reproduce the majority; nothing guessed, nothing mutated) "
+                        "-- ALARM ONLY: lane template production and the stratum job CONTINUE on this node's own ledger; retrying "
+                        "(ruling D-1 = C)\n");
+        if (e.alarm_cleared) std::printf("cba: D2 alarm cleared (%s)\n", LS::names(e.alarm_cleared).c_str());
+        if (e.alarm_added || e.alarm_cleared) std::fflush(stdout);
         if (e.suspend_edge) {
             miner_suspend();
             std::printf("cba-ALARM: lane template production SUSPENDED + stratum job WITHDRAWN (sessions dropped, logins parked) "
@@ -1020,13 +1034,13 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         g_lane_suspended_now = true;
         miner_suspend();
     });
-    // D2: CONVERGING / DIVERGED suspend synchronously (inside the tick or the
-    // booking that decided it); the release is apply_suspension's.
+    // D2 under operator ruling D-1 = C: CONVERGING / DIVERGED are ALARM edges.
+    // Nothing here suspends lane production, withdraws the stratum job or stops
+    // the miner -- the node keeps building templates on its own ledger.
     fc.set_converge_hook([&](bool on, const std::string&) {
-        if (!on || !serving) return;
-        listener.set_lane_suspended(true);
-        g_lane_suspended_now = true;
-        miner_suspend();
+        std::printf("d2: minority alarm edge %s (alarm only, ruling D-1 = C: lane production and the stratum job continue)\n",
+                    on ? "RAISED" : "cleared");
+        std::fflush(stdout);
     });
     // D2: an own win published while the publisher had no relay peer (parked)
     // is ISOLATION-MARKED -- the first candidate refuse set of a re-derivation.
@@ -1369,12 +1383,13 @@ static int run_live(const XmrNodeConfig& cfg) {
     fo.minority_mode        = g_minority_mode == 0 ? o2::FinalizeConnectOptions::MinorityMode::Off
                             : g_minority_mode == 2 ? o2::FinalizeConnectOptions::MinorityMode::HaltOnly
                                                    : o2::FinalizeConnectOptions::MinorityMode::On;
-    fo.minority_run         = g_minority_run;
-    fo.minority_builders    = g_minority_builders;
+    fo.minority_window      = g_minority_window;
+    fo.minority_min_blocks  = g_minority_min_blocks;
     fo.converge_retry_bound = g_converge_retry_bound;
     fo.converge_hold_ticks  = g_converge_hold_ticks;
-    std::printf("d2: minority-converge=%s (M=%zu consecutive unmatched foreign lane blocks from >= %zu builders; retry bound %llu%s)\n",
-                g_minority_mode == 0 ? "off" : g_minority_mode == 2 ? "halt-only" : "on", fo.minority_run, fo.minority_builders,
+    std::printf("d2: minority-converge=%s (ruling D-1 = C: minority = unmatched foreign lane blocks carry > 50%% of the work of the "
+                "last W=%zu decided lane blocks, min %zu; CONVERGING/DIVERGED are alarm-only, never a halt; retry bound %llu%s)\n",
+                g_minority_mode == 0 ? "off" : g_minority_mode == 2 ? "halt-only(alarm)" : "on", fo.minority_window, fo.minority_min_blocks,
                 static_cast<unsigned long long>(fo.converge_retry_bound),
                 g_converge_hold_ticks ? (", TEST hold " + std::to_string(g_converge_hold_ticks) + " ticks").c_str() : "");
     std::printf("r-c rework-3: refuse-side money = NODE-LOCAL LIABILITY (never a ledger mutation) | contested-suspend=%s | "
@@ -3336,8 +3351,8 @@ int main(int argc, char** argv) {
         else if (a == "--divergence-cap-terminal") g_divergence_cap_terminal = std::stoull(next("2"));
         else if (a == "--contested-suspend") { const std::string v = next("on"); g_contested_suspend = !(v == "off" || v == "0" || v == "false"); }
         else if (a == "--minority-converge") { const std::string v = next("on"); g_minority_mode = (v == "off" || v == "0" || v == "false") ? 0 : v == "halt-only" ? 2 : 1; }
-        else if (a == "--minority-run")          g_minority_run = static_cast<std::size_t>(std::stoull(next("3")));
-        else if (a == "--minority-builders")     g_minority_builders = static_cast<std::size_t>(std::stoull(next("2")));
+        else if (a == "--minority-window")       g_minority_window = static_cast<std::size_t>(std::stoull(next("8")));
+        else if (a == "--minority-min-blocks")   g_minority_min_blocks = static_cast<std::size_t>(std::stoull(next("3")));
         else if (a == "--converge-retry-bound")  g_converge_retry_bound = std::stoull(next("600"));
         else if (a == "--converge-hold-ticks")   g_converge_hold_ticks = std::stoull(next("0"));
         else if (a == "--recon-max-root-age")      g_recon_max_root_age = std::stoull(next("0"));
@@ -3425,14 +3440,15 @@ int main(int argc, char** argv) {
                 "  --contested-suspend <on|off> default off: a CONTESTED lineage vote is a loud alarm +\n"
                 "                               counters and the node keeps building; on = suspend lane\n"
                 "                               template production until CONVERGED (operator opt-in)\n"
-                "  --minority-converge <on|off|halt-only>  D2 (ruling D2 = A, default on): M consecutive\n"
-                "                               unmatched foreign lane blocks from >= B_min builders = this\n"
-                "                               node is the minority -> suspend, re-derive the ledger with its\n"
-                "                               own unverifiable blocks refused (liability), adopt it only if\n"
-                "                               it reproduces the majority's commitments, else HALT (DIVERGED).\n"
-                "                               off = refuse + alarm only; halt-only = detect -> DIVERGED\n"
-                "  --minority-run <M>           D2 run length (default 3)\n"
-                "  --minority-builders <n>      D2 distinct builder keys in the run (default 2)\n"
+                "  --minority-converge <on|off|halt-only>  D2 (rulings D2 = A, D-1 = C; default on): this node is\n"
+                "                               the minority only when unmatched foreign lane blocks carry > 50%\n"
+                "                               of the work of the detection window -> re-derive the ledger with\n"
+                "                               its own unverifiable blocks refused (liability), adopt it only if\n"
+                "                               it reproduces the majority's commitments, else DIVERGED = ALARM\n"
+                "                               only (never a halt: templates + stratum continue). <= 50%: alarm.\n"
+                "                               off = refuse + alarm only; halt-only = detect -> DIVERGED alarm\n"
+                "  --minority-window <W>        D2 detection window, decided lane blocks (default 8)\n"
+                "  --minority-min-blocks <n>    D2 no decision on fewer decided lane blocks (default 3)\n"
                 "  --converge-retry-bound <n>   D2 undecidable re-derivation attempts before DIVERGED (600)\n"
                 "  --converge-hold-ticks <n>    TEST knob: CONVERGING holds n ticks before the first attempt\n"
                 "  --recon-max-root-age <n>     R-C rework-3 (D7): never credit a matched historical root\n"

@@ -28,8 +28,9 @@
 // Stub template source + stub verifier (no RandomX). Port 5771 (loopback;
 // falls back to an ephemeral port if taken).
 // Nonzero exit on any failure.
-//   LS11 (D2) CONVERGING and DIVERGED suspend on their own rising edges and
-//        the lane resumes only when every cause is clear.
+//   LS11 (D2, ruling D-1 = C) CONVERGING and DIVERGED are ALARMS: their edges
+//        are counted and named, they never suspend the lane, never hold it
+//        suspended, and never delay a resume of the real causes.
 // ===========================================================================
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -285,19 +286,24 @@ int main() {
     {
         using S = c2pool::v37n::xmr::LaneSuspendState;
         S st(3);
-        auto e1 = st.update(0, false, false, false, true, false);    // minority detected -> CONVERGING suspends
-        auto e2 = st.update(8, false, false, false, true, false);    // lag joins
-        auto e3 = st.update(8, false, false, false, false, true);    // no candidate reproduces -> DIVERGED (converging clears)
-        auto e4 = st.update(2, false, false, false, false, true);    // lag clears, the halt still holds the lane
-        auto e5 = st.update(0, false, false, false, false, false);   // cleared -> RESUME
+        auto e1 = st.update(0, false, false, false, true, false);    // minority detected -> CONVERGING: alarm, lane stays served
+        auto e2 = st.update(8, false, false, false, true, false);    // lag (a real cause) suspends
+        auto e3 = st.update(8, false, false, false, false, true);    // no candidate reproduces -> DIVERGED: alarm only
+        auto e4 = st.update(2, false, false, false, false, true);    // lag clears -> RESUME although DIVERGED persists
+        auto e5 = st.update(0, false, false, false, false, false);   // DIVERGED cleared: no edge on the lane
         auto e6 = st.update(0, false, false, false, true, false);    // a later run
-        auto e7 = st.update(0, false, false, false, false, false);   // adopted -> RESUME
-        check("LS11 D2: CONVERGING and DIVERGED suspend on their own rising edges, are named, and the lane resumes only when every cause (incl. both) is clear",
-              e1.suspend_edge && e1.causes == S::kConverging && (e2.added & S::kLag) && !e2.suspend_edge &&
-              (e3.added & S::kDiverged) && (e3.cleared & S::kConverging) && !e3.resume_edge && !e4.resume_edge && e4.causes == S::kDiverged &&
-              e5.resume_edge && e6.suspend_edge && e7.resume_edge && st.n_converging == 2 && st.n_diverged == 1 && st.n_resume == 2 &&
-              S::names(S::kConverging | S::kDiverged) == "converging+diverged" && S::names(e2.causes) == "lag+converging",
-              "n converging/diverged/resume=" + std::to_string(st.n_converging) + "/" + std::to_string(st.n_diverged) + "/" + std::to_string(st.n_resume));
+        auto e7 = st.update(0, false, false, false, false, false);   // adopted
+        check("LS11 D2 (D-1 = C): CONVERGING and DIVERGED are ALARM-ONLY -- counted + named, never a suspend edge, never in causes, never hold the lane (lag resumes while DIVERGED persists)",
+              !e1.suspend_edge && e1.causes == 0 && e1.alarm_added == S::kConverging && !st.suspended() &&
+              (e2.added & S::kLag) && e2.suspend_edge && e2.causes == S::kLag &&
+              e3.alarm_added == S::kDiverged && e3.alarm_cleared == S::kConverging && e3.causes == S::kLag &&
+              e4.resume_edge && e4.causes == 0 && e4.alarm_added == 0 && e4.alarm_cleared == 0 &&
+              !e5.resume_edge && !e5.suspend_edge && e5.alarm_cleared == S::kDiverged &&
+              !e6.suspend_edge && e6.alarm_added == S::kConverging && !e7.resume_edge && !e7.suspend_edge &&
+              st.n_converging == 2 && st.n_diverged == 1 && st.n_suspend == 1 && st.n_resume == 1 &&
+              S::names(S::kConverging | S::kDiverged) == "converging+diverged",
+              "n converging/diverged/suspend/resume=" + std::to_string(st.n_converging) + "/" + std::to_string(st.n_diverged) + "/" +
+              std::to_string(st.n_suspend) + "/" + std::to_string(st.n_resume));
     }
     std::printf("== %s (%d/%d passed) ==\n", fails ? "FAIL" : "OK", n - fails, n);
     return fails ? 1 : 0;

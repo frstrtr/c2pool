@@ -12,10 +12,14 @@
 // The PURE pieces of xmr/xmr_minority_converge.hpp, no node, no network:
 //   MC1  builder_key: one GAP-2 base -> one key; two bases -> two keys; no
 //        relay (counter from 0) -> every node on key 0 (detection unavailable);
-//   MC2  the detection rule: one unmatched foreign block, or M from ONE
-//        builder, never detects; M from 2 builders with own blocks
-//        interleaved does; a matched foreign block resets the run; undecided
-//        never counts; the trailing-matched exit;
+//   MC2  the detection rule (operator ruling D-1 = C, WORK-WEIGHTED): the
+//        node is the minority only when unmatched foreign lane blocks carry
+//        > 50% of the work of ALL decided lane blocks in the window (own +
+//        foreign); 40% -> no, exactly 50% -> no, 60% -> yes; a byzantine pair's
+//        3 consecutive blocks in a window of 8 -> no; fewer decided blocks than
+//        the minimum -> no; one builder with the majority of the work -> yes;
+//        a matched foreign block resets the RUN (nothing left to reproduce);
+//        undecided never counts; the adoption floor consumes observations;
 //   MC3  refold is EXACT: a node that credited its own isolated block X and a
 //        control that refused it; refold(prefix, R = {X}) reproduces the
 //        control's (digest, since) sequence at EVERY state -- driven through
@@ -25,7 +29,10 @@
 //        minority's own later block (its root is minority-only), reproduces
 //        the majority exactly; a cut-pending decode makes the attempt
 //        UNDECIDABLE (no partial result);
-//   MC5  the marker / observation codecs round-trip.
+//   MC5  the marker / observation codecs round-trip (incl. the work field;
+//        a pre-D-1=C line without it reads as work 1);
+//   MC6  work weighting: blocks carrying different difficulties are weighed by
+//        their work, not counted (2 heavy unmatched vs 4 light own/matched).
 // ===========================================================================
 #include <cstdio>
 #include <functional>
@@ -93,37 +100,85 @@ int main() {
         std::vector<mc::Observation> obs;
         for (std::uint64_t h = 10; h < 13; ++h) { mc::Observation o; o.h = h; o.bid = bid_of(h); o.verdict = mc::Verdict::Unmatched;
                                                    o.has_builder = true; o.builder = mc::builder_key(static_cast<std::uint32_t>(h % 2)); obs.push_back(o); }
-        const auto st = mc::evaluate_run(obs, 3, 2, 0);
-        check("MC1 builder_key: one GAP-2 base (stratum sessions + the miner slot) -> ONE key; bases 5*2^20 apart -> two keys; no relay (counter from 0) -> key 0 on every node, so M unmatched blocks from two no-relay nodes are ONE builder: detection unavailable",
-              one && two && none && !st.detected && st.run.size() == 3 && st.builders == 1,
+        const auto st = mc::evaluate_run(obs, mc::WindowRule{8, 3}, 0);
+        check("MC1 builder_key: one GAP-2 base (stratum sessions + the miner slot) -> ONE key; bases 5*2^20 apart -> two keys; no relay (counter from 0) -> key 0 on every node, so unmatched blocks from two no-relay nodes count as ONE builder (informational only: D-1 = C weighs work, not builders)",
+              one && two && none && st.run.size() == 3 && st.builders == 1,
               "keyA=" + std::to_string(mc::builder_key(baseA)) + " keyB=" + std::to_string(mc::builder_key(baseB)) +
               " norelay_builders=" + std::to_string(st.builders));
     }
-    // ── MC2 the detection rule ──────────────────────────────────────────────
+    // ── MC2 the detection rule (work-weighted, D-1 = C) ──────────────────────
     {
-        auto mk = [](std::uint64_t h, mc::Verdict v, std::uint32_t b, bool own = false) {
-            mc::Observation o; o.h = h; o.bid = bid_of(h); o.verdict = v; o.has_builder = true; o.builder = b; o.own = own; return o; };
+        auto mk = [](std::uint64_t h, mc::Verdict v, std::uint32_t b, bool own = false, std::uint64_t work = 1) {
+            mc::Observation o; o.h = h; o.bid = bid_of(h); o.verdict = v; o.has_builder = true; o.builder = b; o.own = own; o.work = work; return o; };
         using V = mc::Verdict;
-        const auto one = mc::evaluate_run({mk(10, V::Matched, 1), mk(11, V::Unmatched, 2)}, 3, 2, 0);
-        const auto onebuilder = mc::evaluate_run({mk(10, V::Unmatched, 2), mk(11, V::Unmatched, 2), mk(12, V::Unmatched, 2), mk(13, V::Unmatched, 2)}, 3, 2, 0);
-        const auto interleaved = mc::evaluate_run({mk(9, V::Matched, 1, false), mk(10, V::Unmatched, 2), mk(11, V::Matched, 7, true),
-                                                   mk(12, V::Unmatched, 3), mk(13, V::Matched, 7, true), mk(14, V::Unmatched, 2)}, 3, 2, 0);
-        const auto reset = mc::evaluate_run({mk(10, V::Unmatched, 2), mk(11, V::Unmatched, 3), mk(12, V::Matched, 2), mk(13, V::Unmatched, 3)}, 3, 2, 0);
-        const auto undecided = mc::evaluate_run({mk(10, V::Unmatched, 2), mk(11, V::Undecided, 9), mk(12, V::Undecided, 9), mk(13, V::Unmatched, 3)}, 3, 2, 0);
-        const auto floor = mc::evaluate_run({mk(10, V::Unmatched, 2), mk(11, V::Unmatched, 3), mk(12, V::Unmatched, 2)}, 3, 2, 11);
-        const auto clear = mc::evaluate_run({mk(10, V::Unmatched, 2), mk(11, V::Unmatched, 3), mk(12, V::Unmatched, 2),
-                                             mk(13, V::Matched, 2), mk(14, V::Matched, 3), mk(15, V::Matched, 2)}, 3, 2, 0);
-        check("MC2a a single unmatched foreign block is refuse + alarm only: no detection", !one.detected && one.run.size() == 1);
-        check("MC2b M (=4) unmatched from ONE builder: no detection (a lone stuck/forked node never looks like a majority)",
-              !onebuilder.detected && onebuilder.run.size() == 4 && onebuilder.builders == 1);
-        check("MC2c 3 unmatched from 2 builders with this node's OWN blocks interleaved (own skipped, never 'matched'): DETECTED; the last matched foreign obs before the run is h=9",
-              interleaved.detected && interleaved.run.size() == 3 && interleaved.builders == 2 &&
-              interleaved.last_matched_before && interleaved.last_matched_before->h == 9,
-              "run=" + std::to_string(interleaved.run.size()) + " builders=" + std::to_string(interleaved.builders));
-        check("MC2d a matched foreign block inside the run resets it; undecided never counts and never resets; observations at/below the adoption floor are consumed",
-              !reset.detected && reset.run.size() == 1 && !undecided.detected && undecided.run.size() == 2 && !floor.detected && floor.run.size() == 1);
-        check("MC2e exit (DIVERGED cleared): M matched foreign blocks from >= B_min builders after the run",
-              clear.trailing_clear && clear.trailing_matched == 3 && clear.trailing_matched_builders == 2 && !clear.detected);
+        const mc::WindowRule W10{10, 3}, W8{8, 3};
+        // a window of 10: 6 own/matched then k unmatched foreign (k = 4 -> 40%, 6 -> 60%)
+        auto window_of = [&](std::size_t k) {
+            std::vector<mc::Observation> v;
+            std::uint64_t h = 10;
+            for (std::size_t i = 0; i < 10 - k; ++i, ++h) v.push_back(mk(h, i % 2 ? V::Matched : V::Matched, i % 2 ? 7 : 1, i % 2 == 1));
+            for (std::size_t i = 0; i < k; ++i, ++h) v.push_back(mk(h, V::Unmatched, 2 + (i % 2)));
+            return v;
+        };
+        const auto p40 = mc::evaluate_run(window_of(4), W10, 0);
+        const auto p50 = mc::evaluate_run(window_of(5), W10, 0);
+        const auto p60 = mc::evaluate_run(window_of(6), W10, 0);
+        check("MC2a 40% of the window's work unmatched foreign (4 of 10): NOT the minority -- stay on the own ledger, alarm only",
+              !p40.detected && !p40.majority && p40.share_permille == 400 && p40.window_n == 10 && p40.run.size() == 4,
+              "share=" + std::to_string(p40.share_permille));
+        check("MC2b exactly 50% (5 of 10): NOT the minority (strictly more than half is required)",
+              !p50.detected && !p50.majority && p50.share_permille == 500);
+        check("MC2c 60% (6 of 10): the WORK-WEIGHTED minority -> detected; the run to reproduce is the 6 unmatched blocks, the last matched foreign obs before it is h=12",
+              p60.detected && p60.majority && p60.share_permille == 600 && p60.run.size() == 6 &&
+              p60.last_matched_before && p60.last_matched_before->h == 12,
+              "share=" + std::to_string(p60.share_permille) + " run=" + std::to_string(p60.run.size()) + " lmb=" +
+              (p60.last_matched_before ? std::to_string(p60.last_matched_before->h) : std::string("-")));
+        // the D-1 blocker shape: 5 honest blocks (own + matched) then a byzantine PAIR's 3 consecutive fake-digest blocks
+        std::vector<mc::Observation> byz;
+        for (std::uint64_t h = 20; h < 25; ++h) byz.push_back(mk(h, V::Matched, h % 2 ? 7 : 1, h % 2 == 1));
+        for (std::uint64_t h = 25; h < 28; ++h) byz.push_back(mk(h, V::Unmatched, h % 2 ? 0x55 : 0x66));
+        const auto pair = mc::evaluate_run(byz, W8, 0);
+        check("MC2d a byzantine PAIR (2 builder keys) with 3 consecutive fake-digest blocks = 3/8 = 37.5% of the window: NEVER a detection (before D-1 = C: M=3 from 2 builders -> every honest node detected and halted)",
+              !pair.detected && pair.run.size() == 3 && pair.builders == 2 && pair.share_permille == 375);
+        const auto one = mc::evaluate_run({mk(11, V::Unmatched, 2)}, W8, 0);
+        const auto two = mc::evaluate_run({mk(10, V::Unmatched, 2), mk(11, V::Unmatched, 3)}, W8, 0);
+        check("MC2e fewer decided lane blocks than the minimum (1, 2 < 3): no decision, however lopsided",
+              !one.detected && one.majority && !two.detected && two.majority);
+        const auto onebuilder = mc::evaluate_run({mk(10, V::Matched, 1), mk(11, V::Unmatched, 2), mk(12, V::Unmatched, 2), mk(13, V::Unmatched, 2)}, W8, 0);
+        check("MC2f ONE builder holding the majority of the window's work (3 of 4) IS the work-weighted majority (the builder count no longer matters)",
+              onebuilder.detected && onebuilder.builders == 1 && onebuilder.share_permille == 750);
+        const auto reset = mc::evaluate_run({mk(10, V::Unmatched, 2), mk(11, V::Unmatched, 3), mk(12, V::Unmatched, 2), mk(13, V::Matched, 2)}, W8, 0);
+        const auto undecided = mc::evaluate_run({mk(9, V::Matched, 1), mk(10, V::Unmatched, 2), mk(11, V::Undecided, 9), mk(12, V::Undecided, 9), mk(13, V::Unmatched, 3)}, W8, 0);
+        const auto floor = mc::evaluate_run({mk(10, V::Unmatched, 2), mk(11, V::Unmatched, 3), mk(12, V::Unmatched, 2)}, W8, 11);
+        check("MC2g a matched foreign block after the run resets it (share 75% but nothing to reproduce: not detected); undecided never counts (3 decided, 2 unmatched = 66.7%); the adoption floor consumes observations",
+              !reset.detected && reset.run.empty() && reset.share_permille == 750 &&
+              undecided.detected && undecided.window_n == 3 && undecided.run.size() == 2 && undecided.share_permille == 666 &&
+              !floor.detected && floor.window_n == 1 && floor.run.size() == 1,
+              "undecided n=" + std::to_string(undecided.window_n) + " share=" + std::to_string(undecided.share_permille));
+        std::vector<mc::Observation> slide;   // 10 old unmatched, then 8 own/matched: only the last W count
+        for (std::uint64_t h = 1; h <= 10; ++h) slide.push_back(mk(h, V::Unmatched, 2));
+        for (std::uint64_t h = 11; h <= 18; ++h) slide.push_back(mk(h, V::Matched, 1, h % 2 == 0));
+        const auto sl = mc::evaluate_run(slide, W8, 0);
+        check("MC2h the window SLIDES: only the last W decided lane blocks count (10 old unmatched fall out of an 8-block window)",
+              !sl.detected && sl.window_n == 8 && sl.share_permille == 0);
+    }
+    // ── MC6 work weighting ──────────────────────────────────────────────────
+    {
+        auto mk = [](std::uint64_t h, mc::Verdict v, bool own, std::uint64_t work) {
+            mc::Observation o; o.h = h; o.bid = bid_of(h); o.verdict = v; o.has_builder = true; o.builder = own ? 1 : 2; o.own = own; o.work = work; return o; };
+        using V = mc::Verdict;
+        const mc::WindowRule W8{8, 3};
+        // 4 light own/matched blocks (work 100 each) + 2 heavy unmatched (work 300 each): 600/1000 by work, 2/6 by count
+        const auto heavy = mc::evaluate_run({mk(1, V::Matched, true, 100), mk(2, V::Matched, false, 100), mk(3, V::Matched, true, 100),
+                                             mk(4, V::Matched, false, 100), mk(5, V::Unmatched, false, 300), mk(6, V::Unmatched, false, 300)}, W8, 0);
+        // the mirror: 2 heavy own/matched + 4 light unmatched: 400/1000 by work, 4/6 by count
+        const auto light = mc::evaluate_run({mk(1, V::Matched, true, 300), mk(2, V::Matched, false, 300), mk(3, V::Unmatched, false, 100),
+                                             mk(4, V::Unmatched, false, 100), mk(5, V::Unmatched, false, 100), mk(6, V::Unmatched, false, 100)}, W8, 0);
+        const auto zero = mc::evaluate_run({mk(1, V::Matched, true, 0), mk(2, V::Unmatched, false, 0), mk(3, V::Unmatched, false, 0)}, W8, 0);
+        check("MC6 blocks carrying different difficulties are WEIGHED by work, not counted: 2 heavy unmatched of 6 (60% of the work) -> minority; 4 light unmatched of 6 (40% of the work) -> not; work 0 reads as one unit",
+              heavy.detected && heavy.share_permille == 600 && heavy.window_work == 1000 && !light.detected && light.share_permille == 400 &&
+              zero.detected && zero.window_work == 3,
+              "heavy=" + std::to_string(heavy.share_permille) + " light=" + std::to_string(light.share_permille));
     }
     // ── MC3 / MC4 refold exactness through the production driver ────────────
     // D = 3. Lane blocks at 5..20; X = the minority's own isolated block at 8
@@ -194,12 +249,15 @@ int main() {
         m.forced = {bid_of(8)}; m.refused = {bid_of(8), bid_of(13)}; m.released = {};
         mc::Marker b; const bool okm = mc::marker_parse(mc::marker_str(m), b);
         mc::Observation o; o.h = 15; o.bid = bid_of(15); o.root = std::string(64, 'c'); o.own = false; o.has_builder = true; o.builder = 34;
-        o.verdict = mc::Verdict::Unmatched; o.has_matched_since = false; o.t = 99;
+        o.verdict = mc::Verdict::Unmatched; o.has_matched_since = false; o.t = 99; o.work = 123456789012ull;
         mc::Observation p; const bool oko = mc::obs_parse(mc::obs_line(o), p);
+        mc::Observation old; std::string l = mc::obs_line(o); l = l.substr(0, l.rfind(' ')) + "\n";   // a line written before D-1 = C
+        const bool oko_old = mc::obs_parse(l, old);
         check("MC5 the adoption marker and the observation line round-trip",
               okm && b.phase == "applied" && b.fork_h == 7 && b.cursor == 12 && b.new_seq == 44 && b.new_events == 40 && b.floor_h == 16 &&
               b.new_digest_hex == m.new_digest_hex && b.forced == m.forced && b.refused == m.refused && b.released.empty() &&
-              oko && p.h == 15 && p.bid == o.bid && p.root == o.root && p.verdict == o.verdict && p.builder == 34 && p.has_builder && !p.own);
+              oko && p.h == 15 && p.bid == o.bid && p.root == o.root && p.verdict == o.verdict && p.builder == 34 && p.has_builder && !p.own &&
+              p.work == 123456789012ull && oko_old && old.work == 1 && old.t == 99);
     }
     std::printf("== %s (%d/%d passed) ==\n", g_fail ? "FAIL" : "OK", g_n - g_fail, g_n);
     return g_fail ? 1 : 0;

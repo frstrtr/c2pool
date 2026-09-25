@@ -399,22 +399,29 @@ struct FinalizeConnectOptions {
     // ── D2 (operator ruling D2 = A, 2026-09-24): MINORITY CONVERGES TO MAJORITY ─
     // docs/xmr-lane/d2-minority-converge.md. Every canonical lane block this
     // node decides is one OBSERVATION (matched / unmatched / undecided, own or
-    // foreign, the builder key off its 0x02 extra-nonce). M consecutive
-    // UNMATCHED foreign blocks from >= B_min distinct builders = this node is
-    // the MINORITY (a single foreign block, or M from one builder, is refuse +
-    // alarm only -- never a halt). Then: CONVERGING (lane production suspended),
+    // foreign, the builder key off its 0x02 extra-nonce).
+    // Operator ruling D-1 = C (2026-09-25): the minority trigger is WORK-WEIGHTED
+    // -- this node is the MINORITY only when the unmatched foreign lane blocks
+    // carry MORE THAN 50% of the work of ALL the pool's decided lane blocks in
+    // the detection window (the last minority_window decided lane blocks, own +
+    // foreign; at least minority_min_blocks of them). At or below 50% the node
+    // stays on its own ledger and only ALARMS (a byzantine pair with a minority
+    // of the work can no longer make an honest node act). Then: CONVERGING,
     // re-derive the ledger with this node's own unverifiable blocks on the
     // refuse/liability path, CHECK that the re-derived owed_digest history
     // reproduces the majority's commitments; adopt it (store rewritten, ledger
-    // re-lineaged, ring re-seeded, production resumed) or HALT (DIVERGED: lane
-    // production withdrawn, loud, nothing mutated, never a guess).
-    //   Off      -- today's behaviour exactly (refuse + alarm; no detection)
-    //   On       -- detect, converge or halt (default)
-    //   HaltOnly -- detect -> DIVERGED; never adopts (observe-only posture)
+    // re-lineaged, ring re-seeded) or DIVERGED. D-1 = C: CONVERGING and
+    // DIVERGED are ALARM-ONLY -- lane production and the stratum job continue
+    // on this node's own ledger, nothing in D2 withdraws stratum or halts the
+    // node; DIVERGED keeps retrying and clears when the window no longer shows
+    // a work-weighted minority. Never a guess, nothing mutated on a refusal.
+    //   Off      -- refuse + alarm only; no detection
+    //   On       -- detect, converge or alarm (default)
+    //   HaltOnly -- (historical name) detect -> DIVERGED alarm; never adopts
     enum class MinorityMode : int { Off = 0, On = 1, HaltOnly = 2 };
     MinorityMode  minority_mode        = MinorityMode::On;
-    std::size_t   minority_run         = 3;     // M
-    std::size_t   minority_builders    = 2;     // B_min
+    std::size_t   minority_window      = 8;     // W: decided lane blocks in the detection window
+    std::size_t   minority_min_blocks  = 3;     // no decision on fewer decided lane blocks in the window
     std::uint64_t converge_retry_bound = 600;   // undecidable attempts (one per tick) before DIVERGED
     std::uint64_t converge_retry_every = 50;    // DIVERGED: re-attempt cadence (ticks) + banner repeat
     std::uint64_t converge_max_depth   = 0;     // 0 = 4 * D_conf: a fork deeper than this is never re-derived (W6)
@@ -583,12 +590,17 @@ public:
                       obs_restored = 0, obs_persist_failures = 0;
         // D2 (minority converges to majority). minority_state = 0/1/2
         // (CONVERGED/CONVERGING/DIVERGED); run_len/run_builders = the current
-        // unmatched-foreign run; converged = adoptions; diverged_halts = entries
-        // into the halt; own_refused_on_converge = own blocks moved to the
-        // refuse/liability path by an adoption; liability_released = refused
-        // majority blocks credited by an adoption.
+        // unmatched-foreign run; converged = adoptions; diverged_entered =
+        // entries into DIVERGED (alarm-only, D-1 = C); own_refused_on_converge =
+        // own blocks moved to the refuse/liability path by an adoption;
+        // liability_released = refused majority blocks credited by an adoption.
+        // D-1 = C: window_n / share_permille = the detection window (decided lane
+        // blocks, unmatched foreign work per mille); minority_alarms = every D2
+        // alarm raised (suspect below the threshold, detection, DIVERGED entry and
+        // its periodic repeat) -- the counter the status surface shows.
+        std::uint64_t minority_window_n = 0, minority_share_permille = 0, minority_alarms = 0, minority_suspect = 0;
         std::uint64_t minority_state = 0, minority_run_len = 0, minority_run_builders = 0, minority_runs_detected = 0,
-                      converged = 0, diverged_halts = 0, diverged_cleared = 0, own_refused_on_converge = 0,
+                      converged = 0, diverged_entered = 0, diverged_cleared = 0, own_refused_on_converge = 0,
                       liability_released = 0, converge_attempts = 0, converge_undecidable = 0, converge_failed = 0,
                       isolated_marked = 0, mobs_n = 0, mobs_restored = 0, converge_boot_finished = 0,
                       converge_boot_dropped = 0, converge_check_mismatch = 0;
@@ -1177,10 +1189,12 @@ public:
     }
     ConvergeState converge_state() const { return m_cstate; }
     bool converging()    const { return m_cstate == ConvergeState::Converging; }
+    // D-1 = C: DIVERGED is an ALARM state, never a halt (the name is historical).
     bool diverged_halt() const { return m_cstate == ConvergeState::Diverged; }
-    // (true, why) the moment the node enters CONVERGING or DIVERGED (main: suspend
-    // lane production synchronously, like the isolation hook), (false, why) when
-    // it is CONVERGED again (main releases through apply_suspension).
+    bool diverged_alarm() const { return m_cstate == ConvergeState::Diverged; }
+    // (true, why) the moment the node enters CONVERGING or DIVERGED, (false, why)
+    // when it is CONVERGED again. D-1 = C: an ALARM edge only -- main logs it and
+    // never suspends lane production or withdraws the stratum job on it.
     void set_converge_hook(std::function<void(bool, const std::string&)> f) { m_converge_hook = std::move(f); }
     // Fired synchronously right after an adoption re-lineaged the node (main:
     // re-seed the RECON candidate ring from boot_digest_history(), forget its
@@ -1782,9 +1796,14 @@ private:
             roots += (roots.empty() ? "" : ",") + (o.root.empty() ? std::string("?") : o.root.substr(0, 12));
             hs += (hs.empty() ? "" : ",") + std::to_string(o.h) + (o.has_builder ? "/b" + std::to_string(o.builder) : std::string("/b?"));
         }
-        return "run k=" + std::to_string(st.run.size()) + "/" + std::to_string(m_o.minority_run) + " builders=" +
-               std::to_string(st.builders) + "/" + std::to_string(m_o.minority_builders) + " heights=[" + hs + "] roots=[" + roots + "]";
+        return "window unmatched-foreign work " + std::to_string(st.unmatched_work) + "/" + std::to_string(st.window_work) + " = " +
+               std::to_string(st.share_permille / 10) + "." + std::to_string(st.share_permille % 10) + "% over " +
+               std::to_string(st.window_n) + " decided lane block(s) (W=" + std::to_string(m_o.minority_window) + ", > 50% = minority)" +
+               " run k=" + std::to_string(st.run.size()) + " builders=" + std::to_string(st.builders) +
+               " heights=[" + hs + "] roots=[" + roots + "]";
     }
+
+    minority::WindowRule window_rule() const { return minority::WindowRule{m_o.minority_window, m_o.minority_min_blocks}; }
 
     void evaluate_minority(bool new_unmatched_foreign) {
         if (!d2_on()) return;
@@ -1793,24 +1812,33 @@ private:
             m_mobs.erase(std::remove_if(m_mobs.begin(), m_mobs.end(),
                                         [&](const minority::Observation& o) { return o.t + m_o.vote_stale_s < now; }), m_mobs.end());
         }
-        m_last_run = minority::evaluate_run(m_mobs, m_o.minority_run, m_o.minority_builders, m_floor_h);
+        m_last_run = minority::evaluate_run(m_mobs, window_rule(), m_floor_h);
         m_stats.minority_run_len = m_last_run.run.size();
         m_stats.minority_run_builders = m_last_run.builders;
+        m_stats.minority_window_n = m_last_run.window_n;
+        m_stats.minority_share_permille = m_last_run.share_permille;
         m_stats.mobs_n = m_mobs.size();
         if (m_cstate == ConvergeState::Converged) {
             if (m_last_run.detected) enter_converging();
+            else if (new_unmatched_foreign) {
+                // D-1 = C: an unmatched foreign lane block with NO work-weighted
+                // majority behind it. This node stays on its own ledger; loud + counted.
+                ++m_stats.minority_suspect; ++m_stats.minority_alarms;
+                say("cba-ALARM MINORITY-SUSPECT (alarm only, ruling D-1 = C): " + run_text(m_last_run) +
+                    " -- the unmatched foreign lane blocks do NOT carry more than 50% of the window's work: this node stays on "
+                    "its own ledger, lane production and the stratum job continue; minority_alarms=" + std::to_string(m_stats.minority_alarms));
+            }
         } else if (m_cstate == ConvergeState::Diverged) {
             if (new_unmatched_foreign) m_converge_retry_now = true;
-            if (m_last_run.trailing_clear)
-                leave_to_converged(false, "cba: minority DIVERGED -> CLEARED: " + std::to_string(m_last_run.trailing_matched) +
-                                          " matched foreign lane blocks from " + std::to_string(m_last_run.trailing_matched_builders) +
-                                          " builders since the last unmatched one -- the majority is demonstrably on this node's "
-                                          "lineage; nothing was mutated; lane production may resume");
+            if (!m_last_run.detected)
+                leave_to_converged(false, "cba: minority DIVERGED -> CLEARED: " + run_text(m_last_run) +
+                                          " -- no work-weighted minority any more (<= 50% of the window's work unmatched); "
+                                          "nothing was mutated");
         }
     }
 
     void enter_converging() {
-        ++m_stats.minority_runs_detected;
+        ++m_stats.minority_runs_detected; ++m_stats.minority_alarms;
         const std::string rt = run_text(m_last_run);
         if (m_o.minority_mode == FinalizeConnectOptions::MinorityMode::HaltOnly) {
             say("cba-ALARM MINORITY DETECTED: " + rt + " (--minority-converge halt-only: never adopts)");
@@ -1819,10 +1847,10 @@ private:
         }
         m_cstate = ConvergeState::Converging; m_stats.minority_state = 1;
         m_converge_attempts_run = 0; m_hold = m_o.converge_hold_ticks;
-        const std::string msg = "cba-ALARM MINORITY DETECTED: " + rt + " -- M consecutive foreign lane blocks from >= " +
-            std::to_string(m_o.minority_builders) + " distinct builders commit roots this node's ledger history cannot reproduce: "
-            "this node is the MINORITY. Lane production SUSPENDED (cause=converging); re-deriving the ledger with this node's own "
-            "unverifiable blocks on the refuse/liability path (ruling D2 = A)";
+        const std::string msg = "cba-ALARM MINORITY DETECTED: " + rt + " -- foreign lane blocks carrying MORE THAN 50% of the "
+            "window's work commit roots this node's ledger history cannot reproduce: this node is the WORK-WEIGHTED MINORITY. "
+            "Re-deriving the ledger with this node's own unverifiable blocks on the refuse/liability path (ruling D2 = A); "
+            "lane production and the stratum job CONTINUE meanwhile (ruling D-1 = C: alarm, never a halt)";
         say(msg);
         if (m_o.out) { std::fprintf(stderr, "%s [stderr copy] %s\n", m_o.tag.c_str(), msg.c_str()); std::fflush(stderr); }
         if (m_converge_hook) m_converge_hook(true, msg);
@@ -1830,15 +1858,17 @@ private:
 
     void enter_diverged(const std::string& why) {
         const bool fresh = m_cstate != ConvergeState::Diverged;
-        const bool was_serving = m_cstate == ConvergeState::Converged;   // CONVERGING already suspended the lane
+        const bool was_serving = m_cstate == ConvergeState::Converged;   // CONVERGING already raised the alarm edge
         m_cstate = ConvergeState::Diverged; m_stats.minority_state = 2;
         m_last_diverged_why = why;
-        if (!fresh) { say("cba-ALARM DIVERGED (halt) persists: " + why); return; }
-        ++m_stats.diverged_halts;
-        const std::string banner = "cba-ALARM DIVERGED (halt): " + why + " -- lane production HALTED, stratum WITHDRAWN, "
-            "in-process miner stopped; booking/refusing continue; NOTHING guessed, NOTHING mutated. Exits: a later re-derivation "
-            "that reproduces the majority, >= " + std::to_string(m_o.minority_run) + " matched foreign lane blocks from >= " +
-            std::to_string(m_o.minority_builders) + " builders, or the operator (W6 verified adoption + restart).";
+        ++m_stats.minority_alarms;
+        if (!fresh) { say("cba-ALARM DIVERGED (alarm only) persists: " + why); return; }
+        ++m_stats.diverged_entered;
+        const std::string banner = "cba-ALARM DIVERGED (alarm only, ruling D-1 = C): " + why + " -- this node keeps its OWN "
+            "ledger: lane template production, the stratum job and the in-process miner CONTINUE; booking/refusing continue; "
+            "NOTHING guessed, NOTHING mutated; the re-derivation is retried. Exits: a later re-derivation that reproduces the "
+            "majority, the window no longer showing a work-weighted minority (<= 50% unmatched), or the operator (W6 verified "
+            "adoption + restart). minority_alarms=" + std::to_string(m_stats.minority_alarms);
         say(banner);
         if (m_o.out) { std::fprintf(stderr, "%s [stderr copy] %s\n", m_o.tag.c_str(), banner.c_str()); std::fflush(stderr); }
         if (was_serving && m_converge_hook) m_converge_hook(true, banner);
@@ -1861,7 +1891,9 @@ private:
             const std::uint64_t every = m_o.converge_retry_every ? m_o.converge_retry_every : 50;
             const bool slot = (m_tick % every) == 0;
             if (slot) {
-                const std::string b = "cba-ALARM DIVERGED (halt) persists: " + m_last_diverged_why;
+                ++m_stats.minority_alarms;
+                const std::string b = "cba-ALARM DIVERGED (alarm only) persists: " + m_last_diverged_why +
+                                      " (minority_alarms=" + std::to_string(m_stats.minority_alarms) + ")";
                 say(b);
                 if (m_o.out) { std::fprintf(stderr, "%s [stderr copy] %s\n", m_o.tag.c_str(), b.c_str()); std::fflush(stderr); }
             }
@@ -1892,11 +1924,11 @@ private:
     // unmatched foreign block and every converge_retry_every ticks).
     void converge_attempt() {
         ++m_stats.converge_attempts; ++m_converge_attempts_run;
-        const minority::RunStatus st = minority::evaluate_run(m_mobs, m_o.minority_run, m_o.minority_builders, m_floor_h);
+        const minority::RunStatus st = minority::evaluate_run(m_mobs, window_rule(), m_floor_h);
         if (!st.detected) {
             if (m_cstate == ConvergeState::Converging)
-                leave_to_converged(false, "cba: minority run no longer stands (a matched foreign block arrived) -> CONVERGED "
-                                          "without adoption; lane production may resume");
+                leave_to_converged(false, "cba: the work-weighted minority no longer stands (" + run_text(st) + ") -> CONVERGED "
+                                          "without adoption");
             return;
         }
         const std::uint64_t D = m_cfg.d_conf ? m_cfg.d_conf : 1;
@@ -3738,8 +3770,10 @@ inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::pat
     // the SHARED state -> credited everywhere. 13 = Y: A's own block on the
     // minority lineage (commits a digest containing X) -> refused by the
     // majority as lane-root-refused. 14..: majority, committing states A's
-    // history cannot hold -> A refuses them; 14, 15, 16 from builders B and C
-    // complete the run on A.
+    // history cannot hold -> A refuses them. Ruling D-1 = C (work-weighted):
+    // A's detection window (the last 8 decided lane blocks) holds X, W, Y as
+    // own blocks and 9, 10, 12 as matched; the unmatched majority blocks 14..18
+    // cross 50% of it at h=18 (5 of 8) -- 14..17 alone are 50% (alarm only).
     auto layout = [&](D2Rig& R, Node& A, Node& B, bool mark, bool with_w, std::uint64_t from, std::uint64_t to) {
         for (std::uint64_t h = from; h <= to; ++h) {
             if (h <= 4) { R.apply(h); continue; }
@@ -3765,14 +3799,14 @@ inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::pat
         Node& B2 = R.add("B2", true, 'B', cB2, opts_of(cB2, true));   // FC33 control: A's X and Y are strangers' blocks to it
         B2.not_lane_h = {8, 13};
         if (!R.boot(A) || !R.boot(B) || !R.boot(B2)) { rep.add("FC31 boot", false, A.boot_error + B.boot_error + B2.boot_error); return; }
-        layout(R, A, B, true, true, 1, 16);
+        layout(R, A, B, true, true, 1, 18);
         const auto st16 = A.fc->stats();
         const bool eq16 = A.node->ledger().owed_digest() == B.node->ledger().owed_digest();
         bool eq_after = eq16;
-        for (std::uint64_t h = 17; h <= 22; ++h) { layout(R, A, B, true, true, h, h); eq_after = eq_after && A.node->ledger().owed_digest() == B.node->ledger().owed_digest(); }
+        for (std::uint64_t h = 19; h <= 24; ++h) { layout(R, A, B, true, true, h, h); eq_after = eq_after && A.node->ledger().owed_digest() == B.node->ledger().owed_digest(); }
         const auto& sa = A.fc->stats(); const auto& sb = B.fc->stats();
         if (mode) {
-            rep.add("FC31 D2 end to end: A's own isolated X credited by A, refused by the majority (a DECIDED credit-cut mismatch; RC-HOLD holds an undecided repair); 3 majority blocks from 2 builders then commit roots A cannot reproduce -> MINORITY DETECTED (hook on), R1 = {X} reproduces 3/3, store rewritten + archived, A re-lineaged INSIDE the same step: owed_digest == the majority's from that step on (and at every later step), FINALIZED sets equal, hook off, cursor unchanged",
+            rep.add("FC31 D2 end to end: A's own isolated X credited by A, refused by the majority (a DECIDED credit-cut mismatch; RC-HOLD holds an undecided repair); the majority's blocks then commit roots A cannot reproduce; once they carry > 50% of A's window (h=18, 5 of 8) -> MINORITY DETECTED (alarm edge), R1 = {X} reproduces 5/5, store rewritten + archived, A re-lineaged INSIDE the same step: owed_digest == the majority's from that step on (and at every later step), FINALIZED sets equal, hook off, cursor unchanged",
                     st16.minority_runs_detected == 1 && st16.converged == 1 && A.hook_on == 1 && A.hook_off == 1 && eq16 && eq_after &&
                     A.fc->converge_state() == FinalizeConnect::ConvergeState::Converged && archived(cA) && marker_of(cA).phase == "done" &&
                     marker_of(cA).candidate == "R1" && D2Rig::same_settled(R, A, B) && !A.node->ledger().is_settled(X) &&
@@ -3782,8 +3816,8 @@ inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::pat
                     " hooks=" + std::to_string(A.hook_on) + "/" + std::to_string(A.hook_off) + " eq16=" + std::to_string(eq16) +
                     " eq_after=" + std::to_string(eq_after) + " A=" + hx(A.node->ledger().owed_digest()) + " B=" + hx(B.node->ledger().owed_digest()) +
                     " marker=" + marker_of(cA).phase + "/" + marker_of(cA).candidate);
-            rep.add("FC31c liability after the adoption is IDENTICAL on A and the majority: X per payee (on A from its booked payout, on B from the refused decode), Y whole reward unattributed; A released its 3 refusals of the run blocks (now credited); the refuse path never mutated a ledger; late_unbooked = 0",
-                    D2Rig::same_liability(A, B) && sa.liability_released == 3 && sa.own_refused_on_converge == 2 &&
+            rep.add("FC31c liability after the adoption is IDENTICAL on A and the majority: X per payee (on A from its booked payout, on B from the refused decode), Y whole reward unattributed; A released its 5 refusals of the run blocks (now credited); the refuse path never mutated a ledger; late_unbooked = 0",
+                    D2Rig::same_liability(A, B) && sa.liability_released == 5 && sa.own_refused_on_converge == 2 &&
                     sa.ledger_mutations_on_refuse == 0 && sb.ledger_mutations_on_refuse == 0 && sa.late_unbooked == 0 && sb.late_unbooked == 0 &&
                     sb.refused >= 1 && sb.relay_repair_stall_timeout == 0,
                     "liab A/B blocks=" + std::to_string(sa.liability_blocks) + "/" + std::to_string(sb.liability_blocks) + " att=" +
@@ -3850,45 +3884,77 @@ inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::pat
         for (auto& n : R.nodes) R.shutdown(n);
     }
 
-    // ── FC32 / FC32b: a run nothing reproduces -> HALT (DIVERGED), then cleared ─
-    for (int deep = 0; deep < 2; ++deep) {
+    // ── FC32p / FC32 / FC32c / FC32b (operator ruling D-1 = C) ───────────────
+    // FC32p: a forker PAIR (two builder keys) commits 3 consecutive roots no
+    //   ledger holds while carrying < 50% of the window's work (3 of 8) -> refuse
+    //   + ALARM only: no detection, no re-derivation, no alarm edge, CONVERGED,
+    //   nothing mutated (the D-1 blocker: before, every honest node halted).
+    // FC32: a forker set carrying > 50% of the window's work (6 of the last 8)
+    //   -> detected, no candidate reproduces -> DIVERGED, ALARM-ONLY: nothing
+    //   mutated, booking continues; FC32c: matched blocks bring the unmatched
+    //   share to <= 50% -> CLEARED.
+    // FC32b: a fork point deeper than the bound -> DIVERGED without a re-derivation.
+    for (int variant = 0; variant < 3; ++variant) {
         D2Rig R;
-        auto cA = cfg_of(deep ? "d2-fc32b-A" : "d2-fc32-A");
+        auto cA = cfg_of(variant == 0 ? "d2-fc32p-A" : variant == 1 ? "d2-fc32-A" : "d2-fc32b-A");
         FinalizeConnectOptions oA = opts_of(cA, false);
-        if (deep) oA.converge_max_depth = 2;
+        if (variant == 2) oA.converge_max_depth = 2;
         Node& A = R.add("A", false, 'A', cA, oA);
         if (!R.boot(A)) { rep.add("FC32 boot", false, A.boot_error); return; }
-        std::uint64_t events_before = 0; ::v37::bytes32 dg_before{};
-        for (std::uint64_t h = 1; h <= 18; ++h) {
-            if (h >= 5 && !(deep && h >= 10 && h <= 12)) {
-                const bool forker = h >= 13 && h <= 15;   // a forker PAIR (two builder keys) committing roots no ledger holds
+        auto forker_at = [variant](std::uint64_t h) {
+            if (variant == 0) return h >= 13 && h <= 15;   // 3 of the 8-block window (5..12 honest before)
+            if (variant == 1) return h >= 10 && h <= 15;   // 6 of 8
+            return h >= 13 && h <= 18;                      // deep: 10..12 empty
+        };
+        const std::uint64_t stop = variant == 2 ? 18 : 15;
+        std::uint64_t events_before = 0;
+        for (std::uint64_t h = 1; h <= stop; ++h) {
+            if (h >= 5 && !(variant == 2 && h >= 10 && h <= 12)) {
+                const bool forker = forker_at(h);
                 R.mine(h, (h % 2) ? 'B' : 'C', &A, forker);
+                if (forker) R.spec[h].en = ((h % 2) ? 0x05500000u : 0x06600000u) + static_cast<std::uint32_t>(h);   // two builder keys
             }
-            if (h == 13) { events_before = A.node->finalize_driver().event_seq(); dg_before = A.node->ledger().owed_digest(); }
+            if (h == 10) events_before = A.node->finalize_driver().event_seq();
             R.apply(h);
-            if (h == 15) break;
         }
-        const auto s15 = A.fc->stats();
-        const std::string state15 = FinalizeConnect::converge_state_name(A.fc->converge_state());
-        const bool halted = A.fc->converge_state() == FinalizeConnect::ConvergeState::Diverged && A.hook_on == 1;
-        const bool untouched = !archived(cA) && marker_of(cA).phase == "-" && A.node->relineages() == 0 && s15.converged == 0;
-        if (!deep) {
-            for (std::uint64_t h = 16; h <= 18; ++h) { R.mine(h, (h % 2) ? 'B' : 'C', &A); R.apply(h); }
-            rep.add("FC32 3 unmatched foreign blocks from 2 builders whose roots NO candidate refuse set reproduces (R0 reproduced 0/3) -> DIVERGED (halt): hook on, nothing mutated (no archive, no marker, no relineage), booking continued",
-                    halted && untouched && s15.diverged_halts == 1 && s15.converge_failed >= 1 && A.scratch_calls > 0 &&
-                    A.node->finalize_driver().event_seq() >= events_before,
-                    "state@15=" + state15 + " halts=" +
-                    std::to_string(s15.diverged_halts) + " failed=" + std::to_string(s15.converge_failed) + " scratch_calls=" + std::to_string(A.scratch_calls));
-            rep.add("FC32c then 3 MATCHED foreign blocks from 2 builders -> DIVERGED CLEARED (the majority is demonstrably on this lineage): hook off, state CONVERGED, still no mutation",
+        const auto s1 = A.fc->stats();
+        const std::string state1 = FinalizeConnect::converge_state_name(A.fc->converge_state());
+        const bool untouched = !archived(cA) && marker_of(cA).phase == "-" && A.node->relineages() == 0 && s1.converged == 0;
+        const std::string det = "state=" + state1 + " detected=" + std::to_string(s1.minority_runs_detected) + " entered=" +
+            std::to_string(s1.diverged_entered) + " failed=" + std::to_string(s1.converge_failed) + " alarms=" +
+            std::to_string(s1.minority_alarms) + " suspect=" + std::to_string(s1.minority_suspect) + " share=" +
+            std::to_string(s1.minority_share_permille) + "/1000 n=" + std::to_string(s1.minority_window_n) + " scratch_calls=" +
+            std::to_string(A.scratch_calls) + " hooks=" + std::to_string(A.hook_on) + "/" + std::to_string(A.hook_off) +
+            " refused=" + std::to_string(s1.refused_not_credited);
+        if (variant == 0) {
+            bool forker_settled = false;
+            for (std::uint64_t h = 13; h <= 15; ++h) forker_settled = forker_settled || A.node->ledger().is_settled(R.spec[h].bid) ||
+                                                                      A.node->ledger().is_pending(R.spec[h].bid);
+            rep.add("FC32p D-1 = C: a byzantine PAIR (2 builder keys) mines 3 consecutive fake-digest lane blocks holding 3/8 = 37.5% of the window's work -> refused + ALARMED (minority_alarms >= 3), NO detection, no re-derivation, no alarm edge, CONVERGED, nothing mutated, the pair's blocks never credited",
+                    A.fc->converge_state() == FinalizeConnect::ConvergeState::Converged && s1.minority_runs_detected == 0 &&
+                    s1.converge_attempts == 0 && A.scratch_calls == 0 && A.hook_on == 0 && untouched && s1.minority_alarms >= 3 &&
+                    s1.minority_suspect >= 3 && s1.refused_not_credited == 3 && s1.ledger_mutations_on_refuse == 0 && !forker_settled &&
+                    s1.minority_share_permille == 375 && A.node->finalize_driver().event_seq() >= events_before,
+                    det);
+        } else if (variant == 1) {
+            rep.add("FC32 D-1 = C: forker blocks holding 6/8 of the window's work, whose roots NO candidate refuse set reproduces -> detected, re-derivation fails -> DIVERGED as an ALARM (entered once, alarms counted): nothing mutated (no archive, no marker, no relineage), booking continued",
+                    A.fc->converge_state() == FinalizeConnect::ConvergeState::Diverged && A.fc->diverged_alarm() && A.hook_on == 1 &&
+                    untouched && s1.diverged_entered == 1 && s1.converge_failed >= 1 && A.scratch_calls > 0 && s1.minority_alarms >= 2 &&
+                    s1.ledger_mutations_on_refuse == 0 && A.node->finalize_driver().event_seq() >= events_before,
+                    det);
+            for (std::uint64_t h = 16; h <= 19; ++h) { R.mine(h, (h % 2) ? 'B' : 'C', &A); R.apply(h); }
+            const auto s2 = A.fc->stats();
+            rep.add("FC32c then matched foreign blocks bring the unmatched share of the window to <= 50% (4/8 at h=19) -> DIVERGED CLEARED: alarm edge off, state CONVERGED, still no mutation",
                     A.fc->converge_state() == FinalizeConnect::ConvergeState::Converged && A.hook_off == 1 &&
-                    A.fc->stats().diverged_cleared == 1 && A.node->relineages() == 0 && !archived(cA),
-                    "state=" + std::string(FinalizeConnect::converge_state_name(A.fc->converge_state())) + " cleared=" + std::to_string(A.fc->stats().diverged_cleared));
+                    s2.diverged_cleared == 1 && A.node->relineages() == 0 && !archived(cA) && s2.converged == 0,
+                    "state=" + std::string(FinalizeConnect::converge_state_name(A.fc->converge_state())) + " cleared=" +
+                    std::to_string(s2.diverged_cleared) + " share=" + std::to_string(s2.minority_share_permille));
         } else {
-            rep.add("FC32b a fork point deeper than the bound (F from h=9's commitment, 4 heights below the run's builder cut; bound 2) -> DIVERGED WITHOUT a re-derivation (no scratch decode), nothing mutated (W6 territory)",
-                    halted && untouched && A.scratch_calls == 0 && s15.converge_failed == 1,
-                    "state=" + std::string(FinalizeConnect::converge_state_name(A.fc->converge_state())) + " scratch_calls=" + std::to_string(A.scratch_calls));
+            rep.add("FC32b a fork point deeper than the bound (F from h=9's commitment, 4 heights below the run's builder cut; bound 2) -> DIVERGED (alarm) WITHOUT a re-derivation (no scratch decode), nothing mutated (W6 territory)",
+                    A.fc->converge_state() == FinalizeConnect::ConvergeState::Diverged && untouched && A.scratch_calls == 0 &&
+                    s1.converge_failed >= 1 && s1.diverged_entered == 1,
+                    det);
         }
-        (void)dg_before;
         for (auto& n : R.nodes) R.shutdown(n);
     }
 
@@ -3902,7 +3968,7 @@ inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::pat
         Node& A = R.add("A", false, 'A', cA, oA);
         Node& B = R.add("B", true, 'B', cB, opts_of(cB, true));
         if (!R.boot(A) || !R.boot(B)) { rep.add("FC34 boot", false, A.boot_error + B.boot_error); return; }
-        layout(R, A, B, true, true, 1, 16);
+        layout(R, A, B, true, true, 1, 18);
         const std::string phase_at_crash = marker_of(cA).phase;
         const auto hist_before = A.node->boot_digest_history();
         const auto dg_before = A.node->ledger().owed_digest();
@@ -3915,7 +3981,7 @@ inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::pat
         const bool eq_boot = dg_boot == B.node->ledger().owed_digest();
         std::vector<::v37::bytes32> b_ring; std::vector<std::uint64_t> b_since;
         for (const auto& e : B.ring.entries()) { b_ring.push_back(e.digest); b_since.push_back(e.since); }
-        for (std::uint64_t h = 17; h <= 20; ++h) layout(R, A, B, true, true, h, h);
+        for (std::uint64_t h = 19; h <= 22; ++h) layout(R, A, B, true, true, h, h);
         const bool eq_end = A.node->ledger().owed_digest() == B.node->ledger().owed_digest() && D2Rig::same_settled(R, A, B);
         if (variant == 0)
             rep.add("FC34a crash right after the 'proposed' marker (old store): the boot DROPS the marker (nothing was mutated), the restored observations re-detect, the next tick converges: digest == the majority's, FINALIZED sets equal",
@@ -3953,7 +4019,7 @@ inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::pat
         if (!R.boot(A) || !R.boot(B)) { rep.add("FC35 boot", false, A.boot_error + B.boot_error); return; }
         layout(R, A, B, true, true, 1, 20);
         const auto& s = A.fc->stats();
-        rep.add("FC35 --minority-converge halt-only: the same detection -> DIVERGED (halt, hook on), NEVER adopts (no attempt, no archive, no marker, the ledger keeps its own lineage)",
+        rep.add("FC35 --minority-converge halt-only: the same detection -> DIVERGED (alarm edge; D-1 = C: never a halt), NEVER adopts (no attempt, no archive, no marker, the ledger keeps its own lineage)",
                 s.minority_runs_detected == 1 && A.fc->converge_state() == FinalizeConnect::ConvergeState::Diverged && A.hook_on == 1 &&
                 s.converge_attempts == 0 && s.converged == 0 && !archived(cA) && marker_of(cA).phase == "-" && A.node->ledger().is_settled(X),
                 "state=" + std::string(FinalizeConnect::converge_state_name(A.fc->converge_state())) + " attempts=" + std::to_string(s.converge_attempts));

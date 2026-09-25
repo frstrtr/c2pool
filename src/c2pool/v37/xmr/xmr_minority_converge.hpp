@@ -17,11 +17,17 @@
 //                           it defends the accidental case (one stuck/forked
 //                           node cannot look like a majority), not a sybil.
 //   * evaluate_run()     -- the minority-detection rule over the per-block
-//                           observations, in chain order: M consecutive
-//                           UNMATCHED foreign lane blocks from >= B_min distinct
-//                           builders (own blocks and undecided ones skipped, a
-//                           matched foreign block resets the run). One foreign
-//                           block, or M from one builder, is NEVER a detection.
+//                           observations, in chain order (operator ruling
+//                           D-1 = C, WORK-WEIGHTED): this node is the minority
+//                           ONLY when the unmatched foreign lane blocks carry
+//                           MORE THAN 50% of the work of ALL the pool's decided
+//                           lane blocks in the detection window (the last W
+//                           decided lane blocks: own + foreign, matched +
+//                           unmatched; each weighted by its work, 1 unit per
+//                           block at one lane difficulty). At or below 50% the
+//                           node stays on its own ledger and only alarms. The
+//                           RUN (unmatched foreign blocks since the last matched
+//                           foreign one) is what a re-derivation must reproduce.
 //   * refold()           -- the re-derivation: replay the settled prefix up to
 //                           the fork point F into a scratch OwedLedger, then the
 //                           synced node's sequence book(h + D_conf) -> FINALIZE(h)
@@ -38,6 +44,7 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -74,40 +81,65 @@ struct Observation {
     bool          has_matched_since = false; // matched: the since-height of the state it committed
     std::uint64_t matched_since = 0;
     std::uint64_t t = 0;                     // wall clock unix s (staleness only)
+    std::uint64_t work = 1;                  // D-1 = C: the block's work (its difficulty; 1 = one unit at the lane difficulty)
+};
+
+// D-1 = C: the detection window. W = the last W DECIDED lane blocks (above the
+// adoption floor, undecided ones excluded); no decision on fewer than
+// min_blocks of them (a lone foreign block is never "a majority").
+struct WindowRule {
+    std::size_t window = 8;
+    std::size_t min_blocks = 3;
 };
 
 struct RunStatus {
     std::vector<Observation> run;                    // the current unmatched-foreign run, chain order
-    std::size_t builders = 0;                        // distinct builder keys in it (parsed only)
-    bool        detected = false;
+    std::size_t builders = 0;                        // distinct builder keys in it (parsed only; informational)
+    bool        detected = false;                    // work-weighted minority AND a run to reproduce
     std::optional<Observation> last_matched_before;  // the last matched foreign obs before the run
     std::size_t trailing_matched = 0;                // matched foreign obs since the last unmatched one
-    std::size_t trailing_matched_builders = 0;
-    bool        trailing_clear = false;              // trailing_matched >= M from >= B_min builders
+    // D-1 = C: the work-weighted detection window
+    std::size_t   window_n = 0, window_unmatched_n = 0;   // decided lane blocks in the window / unmatched foreign among them
+    std::uint64_t window_work = 0, unmatched_work = 0;    // their work
+    std::uint64_t share_permille = 0;                     // unmatched foreign work / window work, per mille
+    bool          majority = false;                       // unmatched foreign work > 50% of the window's work (strict)
 };
 
 // `floor_h`: observations at or below it are ignored (consumed by an adoption).
-inline RunStatus evaluate_run(std::vector<Observation> obs, std::size_t M, std::size_t B_min, std::uint64_t floor_h) {
+inline RunStatus evaluate_run(std::vector<Observation> obs, const WindowRule& rule, std::uint64_t floor_h) {
     std::stable_sort(obs.begin(), obs.end(), [](const Observation& a, const Observation& b) { return a.h < b.h; });
     RunStatus st;
-    std::set<std::uint32_t> run_b, trail_b;
+    std::set<std::uint32_t> run_b;
+    std::vector<const Observation*> decided;
     for (const auto& o : obs) {
-        if (o.h <= floor_h || o.own || o.verdict == Verdict::Undecided) continue;
+        if (o.h <= floor_h || o.verdict == Verdict::Undecided) continue;
+        decided.push_back(&o);
+        if (o.own) continue;              // own blocks never extend or reset the run
         if (o.verdict == Verdict::Unmatched) {
             st.run.push_back(o);
             if (o.has_builder) run_b.insert(o.builder);
-            st.trailing_matched = 0; trail_b.clear();
+            st.trailing_matched = 0;
         } else {
             st.last_matched_before = o;   // a matched obs always precedes the (reset) run
             st.run.clear(); run_b.clear();
             ++st.trailing_matched;
-            if (o.has_builder) trail_b.insert(o.builder);
         }
     }
     st.builders = run_b.size();
-    st.detected = M > 0 && st.run.size() >= M && st.builders >= std::max<std::size_t>(B_min, 1);
-    st.trailing_matched_builders = trail_b.size();
-    st.trailing_clear = M > 0 && st.trailing_matched >= M && st.trailing_matched_builders >= std::max<std::size_t>(B_min, 1);
+    const std::size_t W = rule.window;
+    const std::size_t first = decided.size() > W ? decided.size() - W : 0;
+    unsigned __int128 tot = 0, unm = 0;
+    for (std::size_t i = first; i < decided.size(); ++i) {
+        const Observation& o = *decided[i];
+        const std::uint64_t w = o.work ? o.work : 1;
+        ++st.window_n; tot += w;
+        if (!o.own && o.verdict == Verdict::Unmatched) { ++st.window_unmatched_n; unm += w; }
+    }
+    auto sat = [](unsigned __int128 v) { return v > UINT64_MAX ? UINT64_MAX : static_cast<std::uint64_t>(v); };
+    st.window_work = sat(tot); st.unmatched_work = sat(unm);
+    st.share_permille = tot ? sat(unm * 1000 / tot) : 0;
+    st.majority = tot > 0 && unm * 2 > tot;
+    st.detected = W > 0 && st.window_n >= std::max<std::size_t>(rule.min_blocks, 1) && st.majority && !st.run.empty();
     return st;
 }
 
@@ -332,12 +364,13 @@ inline bool marker_parse(const std::string& s, Marker& m) {
 }
 
 // ── the observation codec (<sidecar>.mobs, append-only) ─────────────────────
-//   "1 h bid root|- verdict(0/1/2) own(0/1) has_builder builder has_since since t"
+//   "1 h bid root|- verdict(0/1/2) own(0/1) has_builder builder has_since since t [work]"
+//   (work: D-1 = C; absent on lines written before it -> 1)
 inline std::string obs_line(const Observation& o) {
     std::ostringstream s;
     s << "1 " << o.h << ' ' << o.bid << ' ' << (o.root.empty() ? "-" : o.root) << ' ' << static_cast<int>(o.verdict) << ' '
       << (o.own ? 1 : 0) << ' ' << (o.has_builder ? 1 : 0) << ' ' << o.builder << ' ' << (o.has_matched_since ? 1 : 0) << ' '
-      << o.matched_since << ' ' << o.t << '\n';
+      << o.matched_since << ' ' << o.t << ' ' << (o.work ? o.work : 1) << '\n';
     return s.str();
 }
 inline bool obs_parse(const std::string& line, Observation& o) {
@@ -347,6 +380,8 @@ inline bool obs_parse(const std::string& line, Observation& o) {
     if (v < 0 || v > 2) return false;
     o.h = h; o.root = root == "-" ? "" : root; o.verdict = static_cast<Verdict>(v); o.own = own != 0;
     o.has_builder = hb != 0; o.builder = static_cast<std::uint32_t>(b); o.has_matched_since = hs != 0; o.matched_since = ms; o.t = t;
+    unsigned long long w = 1;
+    o.work = (is >> w && w) ? w : 1;
     return true;
 }
 
