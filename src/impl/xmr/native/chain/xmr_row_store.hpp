@@ -38,6 +38,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -74,6 +75,9 @@ public:
         trim_();
     }
     std::size_t retention() const noexcept { return retention_; }
+    // COLD-BOOT-4: told about every row the retention trims (the index keeps the
+    // ids of the ones its consumer has not booked yet: the booking tail).
+    void set_trim_observer(std::function<void(const RowRecord&)> fn) { on_trim_ = std::move(fn); }
 
     bool          empty()         const noexcept { return rows_.empty(); }
     std::size_t   size()          const noexcept { return rows_.size(); }
@@ -257,6 +261,7 @@ private:
 
     void trim_() {
         while (rows_.size() > retention_) {
+            if (on_trim_) on_trim_(rows_.front());
             by_id_.erase(key_(rows_.front().row.id));
             // The seed anchor deliberately survives: see the header comment.
             rows_.pop_front();
@@ -270,6 +275,7 @@ private:
     std::uint64_t                 pre_begin_ = 0;
     std::uint64_t                 pre_end_   = 0;
     std::size_t                   retention_ = 2048;   // D-9
+    std::function<void(const RowRecord&)> on_trim_;    // COLD-BOOT-4
 };
 
 } // namespace c2pool::xmr::native

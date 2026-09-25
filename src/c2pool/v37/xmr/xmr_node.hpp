@@ -339,6 +339,32 @@ public:
         return ok;
     }
 
+    // COLD-BOOT-4: a RESUMED p2p-first store whose finalize cursor lies in the
+    // span a FRESH boot from this f2 anchor seeds past, (H_a - D_conf, H_a]:
+    // pre-anchor heights that no index booted from H_a holds a row for, and
+    // that no process booted from H_a ever delivered (seed_fresh_cursor starts
+    // the scan AT the anchor). The resumed scan used to start at the cursor, so
+    // the re-drive stopped at cursor + 1 ("not held by the native index") for
+    // the life of the process. It now starts at the anchor, exactly as the
+    // fresh boot did. A cursor BELOW H_a - D_conf (a store from an older
+    // anchor) is NOT floored: those heights may carry unbooked lane blocks, so
+    // the walk HOLDS there, loudly. Call after bring_up(), before the re-drive.
+    bool floor_resumed_scan(std::uint64_t anchor_h) {
+        if (!m_native_scan || !m_finalize || m_adapter || anchor_h == 0 || m_scan_h >= anchor_h) return false;
+        const std::uint64_t c = m_finalize->cursor_height();
+        if (c + m_cfg.d_conf < anchor_h) {
+            log("cold-boot ALARM: resumed finalize cursor " + std::to_string(c) + " is below the f2 anchor " + std::to_string(anchor_h) +
+                " - D_conf: heights (" + std::to_string(c) + ", " + std::to_string(anchor_h - m_cfg.d_conf) + "] may carry unbooked lane"
+                " blocks this index cannot serve -> the finalize walk HOLDS at " + std::to_string(c) + " (never skipped)");
+            return false;
+        }
+        log("cold-boot: resumed finalize cursor " + std::to_string(c) + " lies in the pre-anchor span (" +
+            std::to_string(anchor_h - m_cfg.d_conf) + ", " + std::to_string(anchor_h) + "] a fresh boot from this anchor seeds past"
+            " -> native scan starts at the anchor " + std::to_string(anchor_h) + " (was " + std::to_string(m_scan_h) + ")");
+        m_scan_h = anchor_h;
+        return true;
+    }
+
     // The consumer's booking gate (FinalizeConnect R4/R6). The node composes it
     // with its own gap gate; install through here, not on the driver directly.
     void set_booking_gate(XmrFinalizeDriver::BookingGateFn g) { m_consumer_gate = std::move(g); }

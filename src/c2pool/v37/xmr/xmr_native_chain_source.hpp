@@ -172,15 +172,18 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
 
     src.drain = [n] { return n->drain_mainchain_events(); };
 
+    // COLD-BOOT-4: the retained rows, and below them the booking tail (trimmed
+    // best-chain rows the settlement has not booked yet), so a held / lagging
+    // finalize cursor is re-driven from its own height, never stranded.
     src.is_canonical = [n](std::uint64_t height, const std::string& bid_hex) {
-        const auto b = n->index().by_height(height);
-        return b.has_value() && chain_id_hex(b->id) == bid_hex;
+        const auto id = n->index().canonical_id_at(height);
+        return id.has_value() && chain_id_hex(*id) == bid_hex;
     };
 
     src.bid_at = [n](std::uint64_t height) -> std::optional<std::string> {
-        const auto b = n->index().by_height(height);
-        if (!b.has_value()) return std::nullopt;
-        return chain_id_hex(b->id);
+        const auto id = n->index().canonical_id_at(height);
+        if (!id.has_value()) return std::nullopt;
+        return chain_id_hex(*id);
     };
 
     src.events_seen = [n] { return n->mainchain_events_seen(); };

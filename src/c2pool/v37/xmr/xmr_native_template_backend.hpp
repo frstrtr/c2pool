@@ -231,7 +231,11 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     n.snapshot_path    = cfg.native_snapshot_path;
     n.snapshot_every_s = cfg.native_snapshot_every_s;
     // COLD-BOOT-2: the settlement paces the catch-up download (p2p-first anchor boot only).
-    n.consumer_window  = (p2p_first && !cfg.native_solo && !cfg.native_anchor_path.empty()) ? cfg.native_catchup_window : 0;
+    // COLD-BOOT-4: ONE predicate, the boot mode -- an explicit --native-anchor and the
+    // compiled-in PINNED snapshot (no anchor path) are the same anchor boot. The old
+    // path test left the pinned default unpaced: the whole post-anchor gap was
+    // downloaded before booking and its rows were trimmed before they were booked.
+    n.consumer_window  = (p2p_first && n.boot == nrt::BootMode::Anchor) ? cfg.native_catchup_window : 0;
     // COLD-BOOT-3: the p2p-first serve loop drains the node's event queue every
     // pass, so the bulk download may wait on it (never a silent overflow).
     n.chain_event_backpressure = p2p_first;
