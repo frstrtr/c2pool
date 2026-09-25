@@ -971,7 +971,13 @@ public:
             // D6a: "native-hold:" = the native chain index does not hold the block body
             // (p2p-first booking reads it there, not from monerod) -- a transient fetch
             // failure like get_block's: retried, then HELD past the bound, never refused.
-            const bool fetch_fail   = (why.rfind("get_block", 0) == 0 || why.rfind("native-hold:", 0) == 0 ||
+            // "not-lane:" is DECIDED from bytes that are present (a stranger's coinbase,
+            // including one whose miner_tx / tx_extra this node cannot read): never a
+            // transient fetch failure, whatever words its reason carries -- it is
+            // memoized below and the cursor moves on, identically on every node.
+            const bool not_lane     = (why.rfind("not-lane:", 0) == 0);
+            const bool fetch_fail   = !not_lane &&
+                                      (why.rfind("get_block", 0) == 0 || why.rfind("native-hold:", 0) == 0 ||
                                        why.find("does not parse") != std::string::npos);
             const bool cut_pend     = (why.rfind("cut-pending:", 0) == 0);
             if (fetch_fail || cut_pend || root_unknown) {   //  fix 4: transient (recon(A+B credit): + receiver's lane not yet at P; R5: + ring not yet at the winner's state)

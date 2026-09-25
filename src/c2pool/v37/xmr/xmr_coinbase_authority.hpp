@@ -110,9 +110,15 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     }
     set_::ReceivedCoinbase got;
     std::uint64_t height = 0; std::size_t used = 0;
+    // The block bytes ARE here and parsed: whatever the coinbase prefix holds is a
+    // pure function of them, so a coinbase this parser cannot read is decided
+    // (every node reads the same bytes the same way) -- deterministically NOT a
+    // lane coinbase (ours always parses), never a transient retry. A tx_extra
+    // that does not walk is not a prefix failure at all (parse_coinbase_prefix
+    // keeps it as opaque bytes); the "not-lane:" tail check below then decides.
     if (!::c2pool::xmr::assembly::parse_coinbase_prefix(blob.data() + pb.miner_tx_offset,
                                                          pb.miner_tx_size, got, &height, &used)) {
-        b.why = "miner_tx prefix does not parse"; return b;
+        b.why = "not-lane: miner_tx prefix is not a v2 txin_gen coinbase with tagged-key outputs"; return b;
     }
     b.height = height;
     b.major  = static_cast<std::uint8_t>(pb.header.major_version);
