@@ -57,6 +57,11 @@ struct CoinbaseBooking {
     // proxy so a single stuck/forked builder cannot halt the honest majority.
     ::xmr::coin::Hash256 onchain_root{};
     bool           has_onchain_root = false;
+    // D2 (minority converges to majority): the first 4 bytes (LE) of the 0x02
+    // extra-nonce payload -- the stratum extra_nonce the block was mined under
+    // (builder_key = >> 20 under GAP-2). Read with the root, before the match.
+    bool           has_extra_nonce = false;
+    std::uint32_t  extra_nonce = 0;
     std::map<::v37::bytes32, long long> payout;   // identity -> piconero, the on-chain truth
     // fee model: the per-vout identity + amount (canonical order), so the
     // donation-marker rule (xmr_fee_model.hpp apply_donation_rule) can locate
@@ -114,6 +119,11 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     if (tag[0] != 0x03 || tag[1] != 0x21 || tag[2] != 0x00) { b.why = "not-lane: no 03 21 00 tail"; return b; }
     ::xmr::coin::Hash256 root; std::memcpy(root.data(), tag + 3, 32);
     b.onchain_root = root; b.has_onchain_root = true;   // R-C: fingerprint available even when no candidate matches
+    if (const auto en = credit::extra_nonce_field(got.tx_extra); en && en->size() >= 4) {   // D2: the builder datum
+        b.has_extra_nonce = true;
+        b.extra_nonce = static_cast<std::uint32_t>((*en)[0]) | (static_cast<std::uint32_t>((*en)[1]) << 8) |
+                        (static_cast<std::uint32_t>((*en)[2]) << 16) | (static_cast<std::uint32_t>((*en)[3]) << 24);
+    }
     bool matched = false;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         if (set_::mm_commitment_root(chain_id, candidates[i]) == root) {

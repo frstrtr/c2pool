@@ -123,6 +123,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -143,6 +144,7 @@
 #include "xmr_node.hpp"                            // XmrNode, hex_of, Amounts (via xmr_settle_store.hpp)
 #include "xmr_node_config.hpp"                     // XmrNodeConfig, MoneroNetwork
 #include "xmr_same_height_race.hpp"                // SameHeightRaceLedger (c2pool#1551)
+#include "xmr_minority_converge.hpp"               // D2: detection rule, refold, marker
 
 namespace c2pool::v37n::xmr::o2 {
 
@@ -308,6 +310,12 @@ struct FinalizeConnectOptions {
                                                 // the whole reward incl. sink; unmapped outputs: their sum)
         std::uint64_t total_pico = 0;           // the block's coinbase total (diagnostics)
         std::string   onchain_root_hex;         // 0x03 root, when parsed
+        // D2 (minority converges to majority): the builder datum and the lineage
+        // point of a matched commitment, for the minority-detection observation.
+        bool          has_extra_nonce = false;  // the 0x02 extra-nonce payload was parsed
+        std::uint32_t extra_nonce = 0;          // its first 4 bytes, LE (builder_key = >> 20)
+        bool          has_matched_since = false;// the 0x03 root matched a ring state ...
+        std::uint64_t matched_since = 0;        // ... that became current at this coin height
     };
     std::function<bool(std::uint64_t, const std::string&, ChainBooking&)> book_from_chain_ex;
 
@@ -387,6 +395,48 @@ struct FinalizeConnectOptions {
     // D3: the vote's observation window survives a restart (<sidecar>.obs,
     // append-only, compacted). Needs sidecar_path.
     bool          persist_vote_obs   = true;
+
+    // ── D2 (operator ruling D2 = A, 2026-09-24): MINORITY CONVERGES TO MAJORITY ─
+    // docs/xmr-lane/d2-minority-converge.md. Every canonical lane block this
+    // node decides is one OBSERVATION (matched / unmatched / undecided, own or
+    // foreign, the builder key off its 0x02 extra-nonce).
+    // Operator ruling D-1 = C (2026-09-25): the minority trigger is WORK-WEIGHTED
+    // -- this node is the MINORITY only when the unmatched foreign lane blocks
+    // carry MORE THAN 50% of the work of ALL the pool's decided lane blocks in
+    // the detection window (the last minority_window decided lane blocks, own +
+    // foreign; at least minority_min_blocks of them). At or below 50% the node
+    // stays on its own ledger and only ALARMS (a byzantine pair with a minority
+    // of the work can no longer make an honest node act). Then: CONVERGING,
+    // re-derive the ledger with this node's own unverifiable blocks on the
+    // refuse/liability path, CHECK that the re-derived owed_digest history
+    // reproduces the majority's commitments; adopt it (store rewritten, ledger
+    // re-lineaged, ring re-seeded) or DIVERGED. D-1 = C: CONVERGING and
+    // DIVERGED are ALARM-ONLY -- lane production and the stratum job continue
+    // on this node's own ledger, nothing in D2 withdraws stratum or halts the
+    // node; DIVERGED keeps retrying and clears when the window no longer shows
+    // a work-weighted minority. Never a guess, nothing mutated on a refusal.
+    //   Off      -- refuse + alarm only; no detection
+    //   On       -- detect, converge or alarm (default)
+    //   HaltOnly -- (historical name) detect -> DIVERGED alarm; never adopts
+    enum class MinorityMode : int { Off = 0, On = 1, HaltOnly = 2 };
+    MinorityMode  minority_mode        = MinorityMode::On;
+    std::size_t   minority_window      = 8;     // W: decided lane blocks in the detection window
+    std::size_t   minority_min_blocks  = 3;     // no decision on fewer decided lane blocks in the window
+    std::uint64_t converge_retry_bound = 600;   // undecidable attempts (one per tick) before DIVERGED
+    std::uint64_t converge_retry_every = 50;    // DIVERGED: re-attempt cadence (ticks) + banner repeat
+    std::uint64_t converge_max_depth   = 0;     // 0 = 4 * D_conf: a fork deeper than this is never re-derived (W6)
+    std::uint64_t converge_hold_ticks  = 0;     // TEST knob: ticks CONVERGING holds before the first attempt
+    int           converge_crash_after = 0;     // TEST (KAT) failpoint: stop after phase 1 'proposed' / 2 'applied'
+    // The re-derivation's decoder: book (h, bid) against the SCRATCH candidate
+    // ring (cands/superseded as ReconRing::candidates() yields them). Same
+    // contract as book_from_chain_ex; root_only = the caller already holds the
+    // block's booked maps, only the 0x03 root match (age-bounded) is asked.
+    struct ScratchQuery {
+        const std::vector<::v37::bytes32>* cands = nullptr;
+        const std::vector<std::uint64_t>*  superseded = nullptr;
+        bool root_only = false;
+    };
+    std::function<bool(std::uint64_t, const std::string&, const ScratchQuery&, ChainBooking&)> book_scratch;
 };
 
 // ── the glue ────────────────────────────────────────────────────────────────
@@ -538,6 +588,22 @@ public:
         // observation window restored from <sidecar>.obs at boot.
         std::uint64_t contested_suspend_edges = 0, contested_resume_edges = 0,
                       obs_restored = 0, obs_persist_failures = 0;
+        // D2 (minority converges to majority). minority_state = 0/1/2
+        // (CONVERGED/CONVERGING/DIVERGED); run_len/run_builders = the current
+        // unmatched-foreign run; converged = adoptions; diverged_entered =
+        // entries into DIVERGED (alarm-only, D-1 = C); own_refused_on_converge =
+        // own blocks moved to the refuse/liability path by an adoption;
+        // liability_released = refused majority blocks credited by an adoption.
+        // D-1 = C: window_n / share_permille = the detection window (decided lane
+        // blocks, unmatched foreign work per mille); minority_alarms = every D2
+        // alarm raised (suspect below the threshold, detection, DIVERGED entry and
+        // its periodic repeat) -- the counter the status surface shows.
+        std::uint64_t minority_window_n = 0, minority_share_permille = 0, minority_alarms = 0, minority_suspect = 0;
+        std::uint64_t minority_state = 0, minority_run_len = 0, minority_run_builders = 0, minority_runs_detected = 0,
+                      converged = 0, diverged_entered = 0, diverged_cleared = 0, own_refused_on_converge = 0,
+                      liability_released = 0, converge_attempts = 0, converge_undecidable = 0, converge_failed = 0,
+                      isolated_marked = 0, mobs_n = 0, mobs_restored = 0, converge_boot_finished = 0,
+                      converge_boot_dropped = 0, converge_check_mismatch = 0;
     };
 
     // Construct AFTER node.bring_up() (the finalize driver exists) and AFTER
@@ -577,9 +643,13 @@ public:
     //    Call BEFORE the stratum listener starts and BEFORE the first pump_poll
     //    (so the driver's maps are rebuilt before any Extend can step past H_b).
     BootReport reseed_after_bring_up() {
+        const bool finish = converge_boot_pre();   // D2: a marker left by an adoption (before the sidecar is read)
         BootReport rep = reseed_sidecar();
         load_liability();
         load_obs();   // R-C rework-3 (D3): the vote window survives a restart
+        if (finish) converge_boot_post();          // D2: an 'applied' adoption is finished here
+        load_isolated();                           // D2: isolation marks survive a restart
+        load_mobs();                               // D2: the minority observations survive a restart (re-detects)
         // R-C rework-2 (F2): the boot GAP RE-DRIVE (every canonical height between
         // the recovered finalize cursor and the tip -- the boot tip initial_sync
         // applied before our observers existed, every lane block mined while this
@@ -728,6 +798,7 @@ public:
         }
         divergence_check();
         evaluate_vote();
+        converge_tick();   // D2: CONVERGING -> attempt / DIVERGED -> banner + retry
         if (!m_liability.empty() && (m_tick % 50 == 1)) {
             ++m_stats.liability_alarms;
             say("cba-ALARM LIABILITY: " + std::to_string(m_stats.liability_blocks) + " refused lane block(s) paid " +
@@ -933,6 +1004,10 @@ public:
             say("cba: REFUSED chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + ": " + why);
             refuse_money(h, bid, bk, why);
             observe_frontier(h, bid, bk.onchain_root_hex, /*booked=*/false);
+            // D2: the 0x03 root matched this node's ring (refused for a non-root
+            // reason: cut stall, unmapped output, donation rule, cut mismatch):
+            // the block is on OUR lineage.
+            if (!bk.onchain_root_hex.empty()) observe_d2(h, bid, bk, minority::Verdict::Matched);
             return;
         }
         if (m_root_unknown_bids.erase(bid)) {   // R5: a lane-root-unknown block resolved once the ring caught up
@@ -964,6 +1039,7 @@ public:
         // fraction, so a forker's own booked blocks cannot launder its refusals.
         observe_frontier(h, bid, bk.onchain_root_hex, /*booked=*/true);
         m_race.observe_own(h, bid);   // a LANE block is 'own' for the race book (multi-node: own == lane)
+        observe_d2(h, bid, bk, minority::Verdict::Matched);   // D2: our lineage (own or foreign)
         say("cba: CHAIN FOUND booked " + short_bid(bid) + " h=" + std::to_string(h) + " payout_keys=" + std::to_string(bk.payout.size()) + " total=" + std::to_string(rec.reward) + " -> finalizes when hw >= " + std::to_string(h + m_cfg.d_conf));
     }
     std::uint64_t cba_chain_booked() const { return m_cba_chain_booked; }
@@ -984,6 +1060,11 @@ public:
                                   "get_block_header_by_height cross-check)");
         if (ev.height == 0)
             return refuse(r, bid, "refusing H_b == 0 (unknown height is not a height)");
+        // D2: this node mined it (own for the minority rule); published while the
+        // publisher had no relay peer -> isolation-marked (the R1 candidate set).
+        m_own_bids.insert(bid);
+        if (m_isolated_probe && m_isolated_probe(bid))
+            mark_isolated_own(bid, ev.height, "published while no relay peer (parked, late re-announce)");
         if (m_pending.count(bid)) { r.registered = true; r.duplicate = true; return r; }
         if (m_node.ledger().is_settled(bid))
             return refuse(r, bid, "already SETTLED");
@@ -1099,6 +1180,50 @@ public:
     void set_contested_hook(std::function<void(bool, const std::string&)> f) { m_contested_hook = std::move(f); }
     bool contested() const { return m_vote == VoteState::Contested; }
 
+    // ── D2 (minority converges to majority): the public seams ───────────────
+    enum class ConvergeState : int { Converged = 0, Converging = 1, Diverged = 2 };
+    static const char* converge_state_name(ConvergeState s) {
+        switch (s) { case ConvergeState::Converged: return "CONVERGED"; case ConvergeState::Converging: return "CONVERGING";
+                     case ConvergeState::Diverged: return "DIVERGED"; }
+        return "?";
+    }
+    ConvergeState converge_state() const { return m_cstate; }
+    bool converging()    const { return m_cstate == ConvergeState::Converging; }
+    // D-1 = C: DIVERGED is an ALARM state, never a halt (the name is historical).
+    bool diverged_halt() const { return m_cstate == ConvergeState::Diverged; }
+    bool diverged_alarm() const { return m_cstate == ConvergeState::Diverged; }
+    // (true, why) the moment the node enters CONVERGING or DIVERGED, (false, why)
+    // when it is CONVERGED again. D-1 = C: an ALARM edge only -- main logs it and
+    // never suspends lane production or withdraws the stratum job on it.
+    void set_converge_hook(std::function<void(bool, const std::string&)> f) { m_converge_hook = std::move(f); }
+    // Fired synchronously right after an adoption re-lineaged the node (main:
+    // re-seed the RECON candidate ring from boot_digest_history(), forget its
+    // root-unknown alarm memo, force a template rebuild).
+    void set_relineage_hook(std::function<void()> f) { m_relineage_hook = std::move(f); }
+    std::uint64_t relineage_seq() const { return m_relineage_seq; }
+    // This node's own builder keys (builder_key of the GAP-2 extra-nonce base and
+    // of the in-process miner's slot): a lane block carrying one is OWN.
+    void set_own_builder_keys(std::set<std::uint32_t> k) { m_own_keys = std::move(k); }
+    // "Was this own block published while the publisher had no relay peer"
+    // (P2pBlockPublisher: parked for re-announce). Asked when the own win is
+    // registered; a yes is persisted in <sidecar>.isolated.
+    void set_isolated_probe(std::function<bool(const std::string&)> f) { m_isolated_probe = std::move(f); }
+    void mark_isolated_own(const std::string& bid_hex, std::uint64_t h, const std::string& why) {
+        const std::string bid = lower_hex(bid_hex);
+        if (bid.size() != 64 || m_isolated.count(bid)) return;
+        m_isolated[bid] = h; ++m_stats.isolated_marked;
+        if (!m_o.sidecar_path.empty()) {
+            std::ofstream f(m_o.sidecar_path + ".isolated", std::ios::app);
+            std::string w = why.substr(0, 60); for (char& c : w) if (c == ' ' || c == '\t' || c == '\n') c = '_';
+            if (f) f << "1 " << bid << ' ' << h << ' ' << now_unix() << ' ' << (w.empty() ? "-" : w) << '\n';
+        }
+        say("minority: own block " + short_bid(bid) + " h=" + std::to_string(h) + " ISOLATION-MARKED (" + why +
+            "): if the majority cannot reproduce its credit cut it is the first candidate for the refuse/liability path");
+    }
+    const std::vector<minority::Observation>& minority_observations() const { return m_mobs; }
+    const minority::RunStatus& minority_run_status() const { return m_last_run; }
+    const std::map<std::string, std::uint64_t>& isolated_own() const { return m_isolated; }
+
     // R-C rework-2: register a VERIFIED counter-lineage L' (the set of 0x03
     // roots its verified snapshot can produce, and the height of its fork point
     // F with this node's lineage). CONTRACT: the caller has VERIFIED it against
@@ -1179,8 +1304,7 @@ private:
         m_stats.liability_payees = m_liability_by_payee.size();
         if (persist && !m_o.sidecar_path.empty()) {
             std::ofstream f(m_o.sidecar_path + ".liability", std::ios::app);
-            if (f) f << "2 " << r.bid << ' ' << r.height << ' ' << (r.root_hex.empty() ? "-" : r.root_hex) << ' '
-                     << r.total_pico << ' ' << r.unattributed_pico << ' ' << map_str(r.payout) << ' ' << r.why << '\n';
+            if (f) f << liability_line(r);
         }
         if (!persist) return;
         std::string pm;
@@ -1397,6 +1521,10 @@ private:
             ", ledger untouched); lineage vote state " + vote_state_name(m_vote) + ".");
         refuse_money(h, bid, bk, why);
         observe_frontier(h, bid, roothex, /*booked=*/false);
+        // D2: a D7 stale root is a HISTORICAL state of our own lineage (matched);
+        // anything else is a commitment this node's history cannot reproduce.
+        observe_d2(h, bid, bk, why.find(":stale-root:") != std::string::npos ? minority::Verdict::Matched
+                                                                             : minority::Verdict::Unmatched);
     }
 
     // ── R-C rework-2: THE LINEAGE VOTE ──────────────────────────────────────
@@ -1613,6 +1741,547 @@ private:
         } else if (m_held_lag && m_tick % 50 == 0) {
             say("cba-ALARM HELD-LAG persists: cursor " + std::to_string(cursor) + " lag " + std::to_string(lag) +
                 " held=" + std::to_string(m_held.size()) + " root_unknown=" + std::to_string(m_root_unknown_bids.size()));
+        }
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // D2 -- MINORITY CONVERGES TO MAJORITY (docs/xmr-lane/d2-minority-converge.md)
+    // ════════════════════════════════════════════════════════════════════════
+    static std::string liability_line(const LiabilityRec& r) {
+        return "2 " + r.bid + " " + std::to_string(r.height) + " " + (r.root_hex.empty() ? std::string("-") : r.root_hex) + " " +
+               std::to_string(r.total_pico) + " " + std::to_string(r.unattributed_pico) + " " + map_str(r.payout) + " " +
+               (r.why.empty() ? std::string("-") : r.why) + "\n";
+    }
+    static std::string sanitize_why(const std::string& w0) {
+        std::string w = w0.substr(0, 60);
+        for (char& c : w) if (c == ' ' || c == '\t' || c == '\n') c = '_';
+        return w.empty() ? std::string("-") : w;
+    }
+    static std::string utc_stamp() {
+        const std::time_t t = std::time(nullptr);
+        std::tm g{};
+        ::gmtime_r(&t, &g);
+        char b[32]; std::strftime(b, sizeof b, "%Y%m%dT%H%M%SZ", &g);
+        return b;
+    }
+    bool d2_on() const { return m_o.minority_mode != FinalizeConnectOptions::MinorityMode::Off; }
+    std::string mobs_path()   const { return m_o.sidecar_path.empty() ? std::string() : m_o.sidecar_path + ".mobs"; }
+    std::string marker_path() const { return m_o.sidecar_path.empty() ? std::string() : m_o.sidecar_path + ".converge"; }
+
+    bool is_own_block(const std::string& bid, const FinalizeConnectOptions::ChainBooking& bk) const {
+        if (m_own_bids.count(bid) || m_isolated.count(bid)) return true;
+        return bk.has_extra_nonce && m_own_keys.count(minority::builder_key(bk.extra_nonce)) != 0;
+    }
+
+    // One observation per decided canonical lane block (booked / refused), chain
+    // order via the R6 booking order; persisted append-only in <sidecar>.mobs.
+    void observe_d2(std::uint64_t h, const std::string& bid, const FinalizeConnectOptions::ChainBooking& bk, minority::Verdict v) {
+        if (!d2_on()) return;
+        for (const auto& o : m_mobs) if (o.bid == bid) return;   // once per block
+        minority::Observation o;
+        o.h = h; o.bid = bid; o.root = lower_hex(bk.onchain_root_hex); o.own = is_own_block(bid, bk);
+        o.has_builder = bk.has_extra_nonce; o.builder = bk.has_extra_nonce ? minority::builder_key(bk.extra_nonce) : 0;
+        o.verdict = v; o.has_matched_since = bk.has_matched_since; o.matched_since = bk.matched_since; o.t = now_unix();
+        if (!mobs_path().empty()) { std::ofstream f(mobs_path(), std::ios::app); if (f) f << minority::obs_line(o); }
+        m_mobs.push_back(o);
+        if (m_mobs.size() > 512) m_mobs.erase(m_mobs.begin(), m_mobs.begin() + static_cast<std::ptrdiff_t>(m_mobs.size() - 512));
+        m_stats.mobs_n = m_mobs.size();
+        evaluate_minority(v == minority::Verdict::Unmatched && !o.own);
+    }
+
+    std::string run_text(const minority::RunStatus& st) const {
+        std::string roots, hs;
+        for (const auto& o : st.run) {
+            roots += (roots.empty() ? "" : ",") + (o.root.empty() ? std::string("?") : o.root.substr(0, 12));
+            hs += (hs.empty() ? "" : ",") + std::to_string(o.h) + (o.has_builder ? "/b" + std::to_string(o.builder) : std::string("/b?"));
+        }
+        return "window unmatched-foreign work " + std::to_string(st.unmatched_work) + "/" + std::to_string(st.window_work) + " = " +
+               std::to_string(st.share_permille / 10) + "." + std::to_string(st.share_permille % 10) + "% over " +
+               std::to_string(st.window_n) + " decided lane block(s) (W=" + std::to_string(m_o.minority_window) + ", > 50% = minority)" +
+               " run k=" + std::to_string(st.run.size()) + " builders=" + std::to_string(st.builders) +
+               " heights=[" + hs + "] roots=[" + roots + "]";
+    }
+
+    minority::WindowRule window_rule() const { return minority::WindowRule{m_o.minority_window, m_o.minority_min_blocks}; }
+
+    void evaluate_minority(bool new_unmatched_foreign) {
+        if (!d2_on()) return;
+        if (m_o.vote_stale_s) {
+            const std::uint64_t now = now_unix();
+            m_mobs.erase(std::remove_if(m_mobs.begin(), m_mobs.end(),
+                                        [&](const minority::Observation& o) { return o.t + m_o.vote_stale_s < now; }), m_mobs.end());
+        }
+        m_last_run = minority::evaluate_run(m_mobs, window_rule(), m_floor_h);
+        m_stats.minority_run_len = m_last_run.run.size();
+        m_stats.minority_run_builders = m_last_run.builders;
+        m_stats.minority_window_n = m_last_run.window_n;
+        m_stats.minority_share_permille = m_last_run.share_permille;
+        m_stats.mobs_n = m_mobs.size();
+        if (m_cstate == ConvergeState::Converged) {
+            if (m_last_run.detected) enter_converging();
+            else if (new_unmatched_foreign) {
+                // D-1 = C: an unmatched foreign lane block with NO work-weighted
+                // majority behind it. This node stays on its own ledger; loud + counted.
+                ++m_stats.minority_suspect; ++m_stats.minority_alarms;
+                say("cba-ALARM MINORITY-SUSPECT (alarm only, ruling D-1 = C): " + run_text(m_last_run) +
+                    " -- the unmatched foreign lane blocks do NOT carry more than 50% of the window's work: this node stays on "
+                    "its own ledger, lane production and the stratum job continue; minority_alarms=" + std::to_string(m_stats.minority_alarms));
+            }
+        } else if (m_cstate == ConvergeState::Diverged) {
+            if (new_unmatched_foreign) m_converge_retry_now = true;
+            if (!m_last_run.detected)
+                leave_to_converged(false, "cba: minority DIVERGED -> CLEARED: " + run_text(m_last_run) +
+                                          " -- no work-weighted minority any more (<= 50% of the window's work unmatched); "
+                                          "nothing was mutated");
+        }
+    }
+
+    void enter_converging() {
+        ++m_stats.minority_runs_detected; ++m_stats.minority_alarms;
+        const std::string rt = run_text(m_last_run);
+        if (m_o.minority_mode == FinalizeConnectOptions::MinorityMode::HaltOnly) {
+            say("cba-ALARM MINORITY DETECTED: " + rt + " (--minority-converge halt-only: never adopts)");
+            enter_diverged("--minority-converge halt-only: the minority is detected and the node halts; the re-derivation is never adopted (" + rt + ")");
+            return;
+        }
+        m_cstate = ConvergeState::Converging; m_stats.minority_state = 1;
+        m_converge_attempts_run = 0; m_hold = m_o.converge_hold_ticks;
+        const std::string msg = "cba-ALARM MINORITY DETECTED: " + rt + " -- foreign lane blocks carrying MORE THAN 50% of the "
+            "window's work commit roots this node's ledger history cannot reproduce: this node is the WORK-WEIGHTED MINORITY. "
+            "Re-deriving the ledger with this node's own unverifiable blocks on the refuse/liability path (ruling D2 = A); "
+            "lane production and the stratum job CONTINUE meanwhile (ruling D-1 = C: alarm, never a halt)";
+        say(msg);
+        if (m_o.out) { std::fprintf(stderr, "%s [stderr copy] %s\n", m_o.tag.c_str(), msg.c_str()); std::fflush(stderr); }
+        if (m_converge_hook) m_converge_hook(true, msg);
+    }
+
+    void enter_diverged(const std::string& why) {
+        const bool fresh = m_cstate != ConvergeState::Diverged;
+        const bool was_serving = m_cstate == ConvergeState::Converged;   // CONVERGING already raised the alarm edge
+        m_cstate = ConvergeState::Diverged; m_stats.minority_state = 2;
+        m_last_diverged_why = why;
+        ++m_stats.minority_alarms;
+        if (!fresh) { say("cba-ALARM DIVERGED (alarm only) persists: " + why); return; }
+        ++m_stats.diverged_entered;
+        const std::string banner = "cba-ALARM DIVERGED (alarm only, ruling D-1 = C): " + why + " -- this node keeps its OWN "
+            "ledger: lane template production, the stratum job and the in-process miner CONTINUE; booking/refusing continue; "
+            "NOTHING guessed, NOTHING mutated; the re-derivation is retried. Exits: a later re-derivation that reproduces the "
+            "majority, the window no longer showing a work-weighted minority (<= 50% unmatched), or the operator (W6 verified "
+            "adoption + restart). minority_alarms=" + std::to_string(m_stats.minority_alarms);
+        say(banner);
+        if (m_o.out) { std::fprintf(stderr, "%s [stderr copy] %s\n", m_o.tag.c_str(), banner.c_str()); std::fflush(stderr); }
+        if (was_serving && m_converge_hook) m_converge_hook(true, banner);
+    }
+
+    void leave_to_converged(bool adopted, const std::string& msg) {
+        const bool was_diverged = m_cstate == ConvergeState::Diverged;
+        m_cstate = ConvergeState::Converged; m_stats.minority_state = 0;
+        if (!adopted && was_diverged) ++m_stats.diverged_cleared;
+        say(msg);
+        if (m_converge_hook) m_converge_hook(false, msg);
+    }
+
+    void converge_tick() {
+        if (!d2_on() || m_converge_crashed) return;
+        if (m_cstate == ConvergeState::Converging) {
+            if (m_hold) { --m_hold; return; }
+            converge_attempt();
+        } else if (m_cstate == ConvergeState::Diverged) {
+            const std::uint64_t every = m_o.converge_retry_every ? m_o.converge_retry_every : 50;
+            const bool slot = (m_tick % every) == 0;
+            if (slot) {
+                ++m_stats.minority_alarms;
+                const std::string b = "cba-ALARM DIVERGED (alarm only) persists: " + m_last_diverged_why +
+                                      " (minority_alarms=" + std::to_string(m_stats.minority_alarms) + ")";
+                say(b);
+                if (m_o.out) { std::fprintf(stderr, "%s [stderr copy] %s\n", m_o.tag.c_str(), b.c_str()); std::fflush(stderr); }
+            }
+            if (m_o.minority_mode == FinalizeConnectOptions::MinorityMode::On && (m_converge_retry_now || slot)) {
+                m_converge_retry_now = false;
+                converge_attempt();
+            }
+        }
+    }
+
+    minority::DecodeResult scratch_decode(std::uint64_t h, const std::string& bid, const std::vector<::v37::bytes32>& cands,
+                                          const std::vector<std::uint64_t>& sup, bool root_only) {
+        minority::DecodeResult r;
+        FinalizeConnectOptions::ChainBooking bk;
+        FinalizeConnectOptions::ScratchQuery q; q.cands = &cands; q.superseded = &sup; q.root_only = root_only;
+        const bool ok = m_o.book_scratch(h, bid, q, bk);
+        r.credit = bk.credit; r.payout = bk.payout; r.why = bk.why; r.payout_decoded = bk.payout_decoded;
+        r.unattributed_pico = bk.unattributed_pico; r.total_pico = bk.total_pico; r.root_hex = lower_hex(bk.onchain_root_hex);
+        if (ok) r.outcome = minority::DecodeOutcome::Booked;
+        else if (bk.why.rfind("not-lane:", 0) == 0) r.outcome = minority::DecodeOutcome::NotLane;
+        else if (bk.why.rfind("cut-pending:", 0) == 0 || bk.why.rfind("get_block", 0) == 0 ||
+                 bk.why.find("does not parse") != std::string::npos) r.outcome = minority::DecodeOutcome::Undecidable;
+        else r.outcome = minority::DecodeOutcome::Refused;
+        return r;
+    }
+
+    // One re-derivation attempt (CONVERGING every tick; DIVERGED on a new
+    // unmatched foreign block and every converge_retry_every ticks).
+    void converge_attempt() {
+        ++m_stats.converge_attempts; ++m_converge_attempts_run;
+        const minority::RunStatus st = minority::evaluate_run(m_mobs, window_rule(), m_floor_h);
+        if (!st.detected) {
+            if (m_cstate == ConvergeState::Converging)
+                leave_to_converged(false, "cba: the work-weighted minority no longer stands (" + run_text(st) + ") -> CONVERGED "
+                                          "without adoption");
+            return;
+        }
+        const std::uint64_t D = m_cfg.d_conf ? m_cfg.d_conf : 1;
+        const std::uint64_t c = m_node.finalize_driver().cursor_height();
+        std::uint64_t F = c >= 4 * D ? c - 4 * D : 0;
+        std::string f_src = "no matched foreign block before the run: cursor - 4*D_conf";
+        if (st.last_matched_before && st.last_matched_before->has_matched_since) {
+            F = st.last_matched_before->matched_since;
+            f_src = "the since-height of the state the last matched foreign block (h=" + std::to_string(st.last_matched_before->h) +
+                    ") committed";
+        }
+        if (F > c) F = c;
+        const std::uint64_t bcut0 = recon::builder_cut(st.run.front().h, D);
+        const std::uint64_t depth = bcut0 > F ? bcut0 - F : 0;
+        const std::uint64_t maxd = m_o.converge_max_depth ? m_o.converge_max_depth : 4 * D;
+        if (depth > maxd) {
+            ++m_stats.converge_failed;
+            enter_diverged("the fork point F=" + std::to_string(F) + " lies " + std::to_string(depth) + " heights below the run's first "
+                           "builder cut " + std::to_string(bcut0) + " (bound " + std::to_string(maxd) + " = the RECON root-age bound): "
+                           "not re-derived (W6 verified resync territory)");
+            return;
+        }
+        if (!m_o.book_scratch) { ++m_stats.converge_failed; enter_diverged("no re-derivation decoder is installed (book_scratch)"); return; }
+        minority::RefoldInput in;
+        in.chain = m_cfg.lane_chain; in.d_conf = D; in.fork_h = F; in.cursor = c;
+        try {
+            m_node.store().for_each_prefix(store_codec::k_evt_prefix(m_cfg.lane_chain), [&](const std::string&, const std::string& v) {
+                in.events.push_back(SettleEvent::deserialize(v)); return true; });
+        } catch (const std::exception& e) {
+            ++m_stats.converge_failed; enter_diverged(std::string("the event log does not read back: ") + e.what()); return;
+        }
+        const std::uint64_t top = c + 1 + D, tip = m_node.best_height();
+        for (std::uint64_t h = F + 1; h <= top && h <= tip; ++h) {
+            const auto b = m_node.chain_bid_at(h);
+            if (!b) { converge_undecidable("the chain row at h=" + std::to_string(h) + " is not available yet"); return; }
+            in.chain_blocks[h] = *b;
+        }
+        std::set<std::string> r1, r2;
+        for (const auto& [b, hh] : m_isolated) if (hh > F) r1.insert(b);
+        for (const auto& o : m_mobs) if (o.own && o.h > F) r2.insert(o.bid);
+        for (const auto& [h, b] : in.chain_blocks) if (m_own_bids.count(b)) r2.insert(b);
+        for (const auto& b : r1) r2.insert(b);
+        std::vector<std::pair<std::string, std::set<std::string>>> tries;
+        if (!r1.empty()) tries.emplace_back("R1 (isolation-marked own blocks)", r1);
+        if (!r2.empty() && r2 != r1) tries.emplace_back("R2 (every own block since F)", r2);
+        if (tries.empty()) tries.emplace_back("R0 (no own block since F)", std::set<std::string>{});
+        // Then every other subset of the own blocks since F (bounded: <= 6 own
+        // blocks, smallest first). Not a guess: the CHECK below is exact -- a
+        // candidate is adopted only if its re-derived history reproduces every one
+        // of the majority's M on-chain commitments (sha256d digests), which only
+        // the majority's actual refuse set can do.
+        if (r2.size() <= 6) {
+            const std::vector<std::string> own(r2.begin(), r2.end());
+            std::vector<std::set<std::string>> subs;
+            for (std::uint32_t m = 1; m + 1 < (1u << own.size()); ++m) {
+                std::set<std::string> sub;
+                for (std::size_t i = 0; i < own.size(); ++i) if (m & (1u << i)) sub.insert(own[i]);
+                if (sub != r1) subs.push_back(std::move(sub));
+            }
+            std::stable_sort(subs.begin(), subs.end(), [](const auto& a, const auto& b) { return a.size() < b.size(); });
+            if (!r2.empty()) tries.emplace_back("R0 (no own block forced)", std::set<std::string>{});
+            for (auto& sub : subs) tries.emplace_back("Rs (own subset)", std::move(sub));
+        }
+        auto decode = [this](std::uint64_t h, const std::string& bid, const std::vector<::v37::bytes32>& cands,
+                             const std::vector<std::uint64_t>& sup, bool root_only) {
+            return scratch_decode(h, bid, cands, sup, root_only);
+        };
+        std::string tried;
+        std::size_t idx = 0;
+        for (const auto& [name, R] : tries) {
+            in.refuse = R;
+            minority::RefoldResult res = minority::refold(in, decode);
+            if (res.undecidable) { converge_undecidable(res.why); return; }
+            const std::size_t k = minority::reproduced(res, st.run);
+            if (idx++ < 3) tried += " " + name + " reproduced " + std::to_string(k) + "/" + std::to_string(st.run.size()) + ";";
+            if (idx > 3 && k != st.run.size()) continue;   // the subset search logs only its hit
+            say("minority: re-derivation with " + name + " {" + [&] { std::string x; for (const auto& b : R) x += " " + short_bid(b); return x; }() +
+                " } F=" + std::to_string(F) + " (" + f_src + ") cursor=" + std::to_string(c) + ": reproduces " + std::to_string(k) + "/" +
+                std::to_string(st.run.size()) + " of the run's commitments (" + std::to_string(res.finalized) + " FINALIZE re-derived, " +
+                std::to_string(res.booked.size()) + " booked, " + std::to_string(res.refused.size()) + " refused, " +
+                std::to_string(res.reused_maps) + " booked maps reused, digest " + hex_of(res.digest).substr(0, 12) + ")");
+            if (res.ok && k == st.run.size()) { adopt(res, in, name, st); return; }
+        }
+        ++m_stats.converge_failed;
+        if (tries.size() > 3) tried += " +" + std::to_string(tries.size() - 3) + " own-block subset(s) reproduced fewer;";
+        enter_diverged(std::to_string(st.run.size()) + " unmatched from " + std::to_string(st.builders) + " builders; re-derivation with" +
+                       tried + " -- this ledger can NOT be brought onto the majority lineage by refusing its own blocks");
+    }
+
+    void converge_undecidable(const std::string& why) {
+        ++m_stats.converge_undecidable;
+        if (m_converge_attempts_run == 1 || m_converge_attempts_run % 50 == 0)
+            say("minority: re-derivation UNDECIDABLE (" + why + ") -- attempt #" + std::to_string(m_converge_attempts_run) +
+                ", retried (bound " + std::to_string(m_o.converge_retry_bound) + "); nothing adopted, nothing guessed");
+        if (m_cstate == ConvergeState::Converging && m_o.converge_retry_bound && m_converge_attempts_run >= m_o.converge_retry_bound)
+            enter_diverged("the re-derivation stayed UNDECIDABLE for " + std::to_string(m_converge_attempts_run) + " attempts: " + why);
+    }
+
+    void reset_liability_state() {
+        m_liability.clear(); m_liability_by_payee.clear();
+        m_stats.liability_blocks = m_stats.liability_pico = m_stats.liability_attributed_pico = 0;
+        m_stats.liability_unattributed_pico = m_stats.liability_payees = 0;
+    }
+    void clean_booking_state(const std::string& bid) {
+        m_retry.erase(bid); m_retry_n.erase(bid); m_deferred.erase(bid); m_root_unknown_bids.erase(bid); m_first_cursor.erase(bid);
+        if (m_held.erase(bid)) { ++m_stats.held_resolved; m_stats.held_now = m_held.size(); }
+    }
+    void archive_for_converge(const std::string& utc) {
+        std::vector<std::string> files = { m_node.store_dir() + "/settle.img" };
+        if (!m_o.sidecar_path.empty())
+            for (const char* sfx : {"", ".liability", ".obs", ".mobs", ".isolated"}) files.push_back(m_o.sidecar_path + sfx);
+        for (const auto& f : files) {
+            std::error_code ec;
+            if (!std::filesystem::exists(f, ec)) continue;
+            std::filesystem::copy_file(f, f + ".pre-converge-" + utc, std::filesystem::copy_options::skip_existing, ec);
+        }
+    }
+
+    // THE ADOPTION (docs §3.4). Every step is ordered for restart safety: the
+    // new sidecar + liability bodies and the marker ('proposed') are durable
+    // BEFORE the store is touched; the store rewrite is ONE atomic image
+    // replace (old or new, never torn); 'applied' is written after it; a boot
+    // that finds 'proposed' + the OLD store drops the marker (nothing mutated),
+    // 'applied' (or 'proposed' + the NEW store) finishes the in-memory steps.
+    void adopt(const minority::RefoldResult& res, const minority::RefoldInput& in, const std::string& cand,
+               const minority::RunStatus& st) {
+        const std::string utc = utc_stamp();
+        std::map<std::string, PendingRec> newp;
+        for (const auto& p : res.pending) {
+            PendingRec r; r.height = p.h; r.kind = 'c'; r.credit = p.credit; r.payout = p.payout; r.found_unix_s = now_unix();
+            for (const auto& [k, v] : p.payout) { (void)k; if (v > 0) r.reward += static_cast<std::uint64_t>(v); }
+            newp[p.bid] = r;
+        }
+        std::string pbody;
+        for (const auto& [b, r] : newp) pbody += sidecar_line(b, r);
+        for (const auto& [b, r] : m_unrecoverable) pbody += sidecar_line(b, r);
+        std::vector<LiabilityRec> newl;
+        std::vector<std::string> released, refused_all, forced;
+        for (const auto& x : m_liability) { if (res.booked.count(x.bid)) released.push_back(x.bid); else newl.push_back(x); }
+        for (const auto& rb : res.refused) {
+            refused_all.push_back(rb.bid);
+            if (rb.forced) forced.push_back(rb.bid);
+            bool have = false; for (const auto& x : newl) if (x.bid == rb.bid) { have = true; break; }
+            if (have) continue;
+            LiabilityRec L; L.height = rb.h; L.bid = rb.bid;
+            if (rb.forced || (rb.had_old && !rb.r.payout_decoded && rb.r.unattributed_pico == 0 && rb.r.total_pico == 0)) {
+                for (const auto& [k, v] : rb.old_payout) if (v > 0) L.payout[k] = v;
+                L.why = sanitize_why(rb.forced ? "converge:own-block-refused(majority-cannot-reproduce)" : "converge:refused");
+            } else {
+                L.root_hex = rb.r.root_hex; L.total_pico = rb.r.total_pico;
+                if (rb.r.payout_decoded) { for (const auto& [k, v] : rb.r.payout) if (v > 0) L.payout[k] = v; L.unattributed_pico = rb.r.unattributed_pico; }
+                else L.unattributed_pico = rb.r.unattributed_pico ? rb.r.unattributed_pico : rb.r.total_pico;
+                L.why = sanitize_why(rb.r.why);
+            }
+            if (L.payout.empty() && L.unattributed_pico == 0) continue;
+            newl.push_back(L);
+        }
+        std::string lbody; for (const auto& x : newl) lbody += liability_line(x);
+        std::uint64_t floor_h = m_floor_h;
+        for (const auto& o : m_mobs) floor_h = std::max(floor_h, o.h);
+        minority::Marker mk;
+        mk.phase = "proposed"; mk.fork_h = in.fork_h; mk.cursor = in.cursor; mk.new_seq = res.ledger_seq;
+        mk.new_events = res.events.size(); mk.old_events = in.events.size(); mk.floor_h = floor_h;
+        mk.new_digest_hex = hex_of(res.digest); mk.utc = utc; mk.candidate = cand.substr(0, 2);
+        mk.forced = forced; mk.refused = refused_all; mk.released = released;
+        const std::string sc = m_o.sidecar_path;
+        if (!sc.empty() && (!atomic_write(sc + ".converge.pfound", pbody) || !atomic_write(sc + ".converge.liab", lbody) ||
+                            !atomic_write(marker_path(), minority::marker_str(mk)))) {
+            ++m_stats.converge_failed;
+            enter_diverged("the adoption files could not be written (" + std::string(std::strerror(errno)) + "); nothing was mutated");
+            return;
+        }
+        say("converge: " + cand + " reproduces " + std::to_string(st.run.size()) + "/" + std::to_string(st.run.size()) +
+            " of the majority's commitments -> ADOPTING (F=" + std::to_string(in.fork_h) + ", cursor=" + std::to_string(in.cursor) +
+            ", new digest " + hex_of(res.digest).substr(0, 12) + ", marker 'proposed')");
+        if (m_o.converge_crash_after == 1) { m_converge_crashed = true; say("TEST failpoint: stopped after phase 'proposed'"); return; }
+        archive_for_converge(utc);
+        {
+            std::vector<std::string> keys;
+            m_node.store().for_each_prefix(store_codec::k_evt_prefix(m_cfg.lane_chain),
+                                           [&](const std::string& k, const std::string&) { keys.push_back(k); return true; });
+            auto b = m_node.store().batch();
+            for (const auto& k : keys) b->remove(k);
+            std::uint64_t seq = 0;
+            for (const auto& e : res.events) b->put(store_codec::k_evt(m_cfg.lane_chain, ++seq), e.serialize());
+            if (!b->commit_sync()) {
+                ++m_stats.converge_failed;
+                enter_diverged("the store rewrite FAILED (atomic image replace): the old store stands; marker left 'proposed' (a boot drops it)");
+                return;
+            }
+        }
+        say("converge: store rewritten (" + std::to_string(in.events.size()) + " events -> " + std::to_string(res.events.size()) +
+            "), archived *.pre-converge-" + utc);
+        mk.phase = "applied";
+        if (!sc.empty()) (void)atomic_write(marker_path(), minority::marker_str(mk));
+        if (m_o.converge_crash_after == 2) { m_converge_crashed = true; say("TEST failpoint: stopped after phase 'applied'"); return; }
+        std::set<std::string> own_now(m_own_bids.begin(), m_own_bids.end());
+        for (const auto& [b, hh] : m_isolated) { (void)hh; own_now.insert(b); }
+        for (const auto& o : m_mobs) if (o.own) own_now.insert(o.bid);
+        for (const auto& b : forced) own_now.insert(b);
+        if (!finish_applied(mk, /*live=*/true)) return;
+        for (const auto& rb : res.refused) {
+            const bool own = own_now.count(rb.bid) != 0;
+            if (!own && !rb.had_old) continue;
+            std::string pm; for (const auto& [k, v] : (rb.forced || !rb.r.payout_decoded ? rb.old_payout : rb.r.payout)) pm += " " + hex_of(k).substr(0, 8) + "=" + std::to_string(v);
+            if (own) ++m_stats.own_refused_on_converge;
+            say("converge: " + std::string(own ? "own" : "previously credited") + " block " + short_bid(rb.bid) + " h=" + std::to_string(rb.h) +
+                " moved to refuse/LIABILITY (payout {" + pm + " }" + (rb.forced ? ", " + cand.substr(0, 2) : std::string(", ") + rb.r.why.substr(0, 60)) +
+                "); the receipts its miners minted while this node was isolated receive NO lane credit through it -- they did not reach the "
+                "majority through the relay within the booking window (they are credited only if a later majority cut carries them)");
+        }
+        for (const auto& b : released) {
+            ++m_stats.liability_released;
+            say("converge: majority block " + short_bid(b) + " h=" + std::to_string(res.booked.count(b) ? res.booked.at(b) : 0) +
+                " now CREDITED (liability released)");
+        }
+        ++m_stats.converged;
+        leave_to_converged(true, "converge: DONE ring=" + std::to_string(m_node.boot_digest_history().size()) + " cursor=" +
+                                 std::to_string(m_node.finalize_driver().cursor_height()) + " digest=" +
+                                 hex_of(m_node.ledger().owed_digest()).substr(0, 16) + " ledger_seq=" +
+                                 std::to_string(m_node.ledger().ledger_seq()) + "; lane production resumes");
+    }
+
+    // The in-memory half of an adoption (live, right after the store rewrite) or
+    // of a boot that found an 'applied' marker (the boot replay already used the
+    // rewritten store; the sidecar/liability were renamed in converge_boot_pre).
+    bool finish_applied(minority::Marker mk, bool live) {
+        const std::string sc = m_o.sidecar_path;
+        if (!sc.empty()) {
+            std::error_code ec;
+            if (std::filesystem::exists(sc + ".converge.pfound", ec)) std::filesystem::rename(sc + ".converge.pfound", sc, ec);
+            if (std::filesystem::exists(sc + ".converge.liab", ec)) std::filesystem::rename(sc + ".converge.liab", sc + ".liability", ec);
+        }
+        if (live) {
+            std::string why;
+            if (!m_node.relineage(&why)) {
+                ++m_stats.converge_failed;
+                enter_diverged("the in-process relineage FAILED (" + why + "); the store IS rewritten (marker 'applied'): restart the node to finish");
+                return false;
+            }
+            m_pending.clear();
+            reset_liability_state();
+            if (!sc.empty()) { (void)reseed_sidecar(); load_liability(); }
+        }
+        const std::set<std::string> refused(mk.refused.begin(), mk.refused.end()), released(mk.released.begin(), mk.released.end());
+        for (const auto& b : refused)  { m_chain_seen[b] = true; clean_booking_state(b); m_pending.erase(b); }
+        for (const auto& b : released) { m_chain_seen.erase(b); clean_booking_state(b); }
+        for (const auto& [b, r] : m_pending) { (void)r; m_chain_seen.erase(b); clean_booking_state(b); }
+        // the lineage vote window follows the adopted lineage
+        bool obs_changed = false;
+        for (auto& o : m_obs) {
+            const bool now_booked = !refused.count(o.bid) && (released.count(o.bid) || m_pending.count(o.bid) || m_node.ledger().is_settled(o.bid));
+            if (o.booked != now_booked) { o.booked = now_booked; obs_changed = true; }
+        }
+        if (obs_changed && m_o.persist_vote_obs && !obs_path().empty()) {
+            std::string body; for (const auto& x : m_obs) body += obs_line(x);
+            if (atomic_write(obs_path(), body)) m_obs_file_lines = m_obs.size();
+        }
+        if (obs_changed) evaluate_vote();
+        // the D2 observations up to the adoption are consumed
+        m_floor_h = std::max(m_floor_h, mk.floor_h);
+        m_mobs.clear(); m_last_run = minority::RunStatus{};
+        m_stats.mobs_n = 0; m_stats.minority_run_len = 0; m_stats.minority_run_builders = 0;
+        if (!mobs_path().empty()) (void)atomic_write(mobs_path(), "");
+        ++m_relineage_seq;
+        if (m_relineage_hook) m_relineage_hook();
+        const bool digest_ok = mk.new_digest_hex.empty() || hex_of(m_node.ledger().owed_digest()) == mk.new_digest_hex;
+        if (!digest_ok) {
+            ++m_stats.converge_check_mismatch;
+            say("cba-ALARM converge: the replayed ledger digest " + hex_of(m_node.ledger().owed_digest()).substr(0, 16) +
+                " != the re-derived " + mk.new_digest_hex.substr(0, 16) + " -- must never happen; operator's eyes needed");
+        }
+        mk.phase = "done";
+        if (!sc.empty()) (void)atomic_write(marker_path(), minority::marker_str(mk));
+        echo_node_log();
+        return true;
+    }
+
+    // Boot, BEFORE the sidecar is read: act on a marker left by an adoption.
+    // Returns true when an 'applied' adoption must be finished after the
+    // sidecar/liability/vote loads (converge_boot_post).
+    bool converge_boot_pre() {
+        m_boot_marker.reset();
+        if (marker_path().empty()) return false;
+        std::ifstream in(marker_path());
+        if (!in) return false;
+        const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        minority::Marker mk;
+        if (!minority::marker_parse(body, mk)) { say("boot: MALFORMED converge marker at " + marker_path() + " ignored"); return false; }
+        if (mk.phase == "done") {
+            m_floor_h = std::max(m_floor_h, mk.floor_h);
+            say("boot: this node CONVERGED to the majority lineage at " + mk.utc + " (F=" + std::to_string(mk.fork_h) + ", " +
+                std::to_string(mk.forced.size()) + " own block(s) forced to liability, " + std::to_string(mk.released.size()) +
+                " majority block(s) released) -- informational");
+            return false;
+        }
+        const bool store_is_new = hex_of(m_node.ledger().owed_digest()) == mk.new_digest_hex &&
+                                  m_node.recovered().max_event_seq == mk.new_events;
+        if (mk.phase == "proposed" && !store_is_new) {
+            ++m_stats.converge_boot_dropped;
+            std::error_code ec;
+            const std::string sc = m_o.sidecar_path;
+            std::filesystem::rename(marker_path(), marker_path() + ".dropped-" + utc_stamp(), ec);
+            std::filesystem::remove(sc + ".converge.pfound", ec);
+            std::filesystem::remove(sc + ".converge.liab", ec);
+            say("boot: converge marker 'proposed' found with the OLD store (nothing was mutated) -> dropped; live detection runs again");
+            return false;
+        }
+        m_floor_h = std::max(m_floor_h, mk.floor_h);
+        mk.phase = "applied";
+        const std::string sc = m_o.sidecar_path;
+        std::error_code ec;
+        if (std::filesystem::exists(sc + ".converge.pfound", ec)) std::filesystem::rename(sc + ".converge.pfound", sc, ec);
+        if (std::filesystem::exists(sc + ".converge.liab", ec)) std::filesystem::rename(sc + ".converge.liab", sc + ".liability", ec);
+        m_boot_marker = mk;
+        say("boot: converge marker 'applied' (the store is the re-derived lineage: digest " + mk.new_digest_hex.substr(0, 16) +
+            ", " + std::to_string(mk.new_events) + " events) -> finishing the adoption");
+        return true;
+    }
+    void converge_boot_post() {
+        if (!m_boot_marker) return;
+        ++m_stats.converge_boot_finished;
+        (void)finish_applied(*m_boot_marker, /*live=*/false);
+        m_boot_marker.reset();
+    }
+    void load_isolated() {
+        if (m_o.sidecar_path.empty()) return;
+        std::ifstream in(m_o.sidecar_path + ".isolated");
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream is(line); std::string ver, bid; unsigned long long h = 0;
+            if (!(is >> ver >> bid >> h) || ver != "1" || bid.size() != 64) continue;
+            m_isolated[lower_hex(bid)] = h; m_own_bids.insert(lower_hex(bid));
+        }
+    }
+    void load_mobs() {
+        if (!d2_on() || mobs_path().empty()) return;
+        std::ifstream in(mobs_path());
+        std::string line;
+        std::size_t n = 0;
+        while (std::getline(in, line)) {
+            minority::Observation o;
+            if (!minority::obs_parse(line, o)) continue;
+            bool dup = false; for (const auto& x : m_mobs) if (x.bid == o.bid) { dup = true; break; }
+            if (dup) continue;
+            if (o.own) m_own_bids.insert(o.bid);
+            m_mobs.push_back(o); ++n;
+        }
+        if (m_mobs.size() > 512) m_mobs.erase(m_mobs.begin(), m_mobs.begin() + static_cast<std::ptrdiff_t>(m_mobs.size() - 512));
+        m_stats.mobs_restored = n;
+        if (n) {
+            say("boot: minority observations RESTORED from " + mobs_path() + ": " + std::to_string(n));
+            evaluate_minority(false);
         }
     }
 
@@ -1940,6 +2609,22 @@ private:
     // quiet loop stays quiet and the journal records transitions, not ticks).
     SameHeightRaceLedger                    m_race;
     std::map<std::uint64_t, RaceVerdict>    m_last_verdict;
+
+    // D2 (minority converges to majority)
+    ConvergeState                           m_cstate = ConvergeState::Converged;
+    std::vector<minority::Observation>      m_mobs;                 // decided lane-block observations (bounded)
+    minority::RunStatus                     m_last_run;
+    std::uint64_t                           m_floor_h = 0;          // observations at/below it were consumed by an adoption
+    std::set<std::string>                   m_own_bids;             // mined by this node
+    std::map<std::string, std::uint64_t>    m_isolated;             // own bid -> h, published with no relay peer
+    std::set<std::uint32_t>                 m_own_keys;             // this node's builder keys
+    std::function<bool(const std::string&)> m_isolated_probe;
+    std::function<void(bool, const std::string&)> m_converge_hook;
+    std::function<void()>                   m_relineage_hook;
+    std::uint64_t                           m_relineage_seq = 0, m_converge_attempts_run = 0, m_hold = 0;
+    bool                                    m_converge_retry_now = false, m_converge_crashed = false;
+    std::string                             m_last_diverged_why;
+    std::optional<minority::Marker>         m_boot_marker;
 };
 
 } // namespace c2pool::v37n::xmr::o2
@@ -1957,6 +2642,8 @@ private:
 #include "xmr_recon_ring.hpp"                     // R-C rework-3 (D7): FC29
 
 namespace c2pool::v37n::xmr::o2 {
+
+inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::path& tmp_root);   // D2 phases (below)
 
 inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp_root) {
     using c2pool::xmr::node::MockMonerodTransport;
@@ -2901,7 +3588,443 @@ inline smoke::Report finalize_connect_selfcheck(const std::filesystem::path& tmp
         (void)fc.drain_before_stop();
     }
 
+    minority_fc_selfcheck(rep, tmp_root);
     return rep;
+}
+
+// ===========================================================================
+// D2 KATs (FC31..FC35): N FinalizeConnect nodes in LOCKSTEP over one mock chain.
+// Every lane block carries the owed_digest its builder held at its builder cut
+// (the "0x03 root", here the digest itself) and the builder's extra-nonce; each
+// node decodes it against its OWN candidate ring exactly like main's
+// book_from_chain_ex (unmatched + synced = lane-root-refused, D7 omitted), and
+// the scratch decoder (book_scratch) against the ring the re-derivation hands it.
+// ===========================================================================
+struct D2Rig {
+    using CB = FinalizeConnectOptions::ChainBooking;
+    using Hash = c2pool::xmr::node::Hash;
+    struct Blk {
+        std::string bid; char who = 'B'; ::v37::bytes32 commit{}; Amounts credit, payout; std::uint32_t en = 0;
+        bool stall_majority = false;   // the majority cannot reproduce its credit cut (a DECIDED refusal: its credit cut does not reproduce there)
+    };
+    struct Node {
+        std::string name; bool majority = false; char who = 'B';
+        XmrNodeConfig cfg; FinalizeConnectOptions base_opts;
+        std::unique_ptr<c2pool::xmr::node::MockMonerodTransport> mock;
+        std::unique_ptr<XmrNode> node; std::unique_ptr<FoundBlockQueue> q; std::unique_ptr<FinalizeConnect> fc;
+        recon::ReconRing ring{4096};
+        int hook_on = 0, hook_off = 0; std::uint64_t scratch_calls = 0;
+        std::set<std::uint64_t> not_lane_h;          // control nodes: heights they treat as strangers' blocks
+        std::vector<::v37::bytes32> dseq;            // distinct digest states lived through
+        std::string boot_error;
+    };
+    std::uint64_t D = 3;
+    std::map<std::uint64_t, Blk> spec;
+    std::deque<Node> nodes;
+    std::uint64_t top = 0;
+
+    static std::uint32_t en_of(char who) {
+        switch (who) { case 'A': return 0x01100000u; case 'B': return 0x02200000u; case 'C': return 0x03300000u; default: return 0x04400000u; }
+    }
+    static Hash id(std::uint64_t h) { return smoke::blk_id(static_cast<std::uint8_t>(h)); }
+
+    Node& add(const std::string& name, bool majority, char who, const XmrNodeConfig& cfg, FinalizeConnectOptions o) {
+        nodes.emplace_back();
+        Node& n = nodes.back();
+        n.name = name; n.majority = majority; n.who = who; n.cfg = cfg; n.base_opts = std::move(o);
+        return n;
+    }
+    bool boot(Node& n) {
+        n.mock = std::make_unique<c2pool::xmr::node::MockMonerodTransport>();
+        n.node = std::make_unique<XmrNode>(n.cfg, *n.mock, &smoke::test_point_check);
+        try { n.node->bring_up(); } catch (const std::exception& e) { n.boot_error = e.what(); return false; }
+        for (std::uint64_t h = 1; h <= top; ++h) smoke::apply_row(*n.node, h, id(h), id(h - 1));   // before the observers exist
+        n.ring = recon::ReconRing(4096);
+        n.ring.seed(n.node->boot_digest_history(), n.node->boot_digest_since());
+        Node* np = &n;
+        n.node->finalize_driver().set_ledger_event_observer([np] {
+            const auto d = np->node->ledger().owed_digest();
+            np->ring.push(d, np->node->finalize_driver().digest_since());
+            if (np->dseq.empty() || !(np->dseq.back() == d)) np->dseq.push_back(d);
+        });
+        FinalizeConnectOptions o = n.base_opts;
+        o.book_from_chain_ex = [this, np](std::uint64_t h, const std::string& bid, CB& bk) { return book(*np, h, bid, bk, nullptr); };
+        o.book_scratch = [this, np](std::uint64_t h, const std::string& bid, const FinalizeConnectOptions::ScratchQuery& q, CB& bk) {
+            ++np->scratch_calls; return book(*np, h, bid, bk, &q); };
+        n.q = std::make_unique<FoundBlockQueue>();
+        n.fc = std::make_unique<FinalizeConnect>(*n.node, n.cfg, *n.q, o);
+        n.fc->set_own_builder_keys({minority::builder_key(en_of(n.who))});
+        n.fc->set_converge_hook([np](bool on, const std::string&) { if (on) ++np->hook_on; else ++np->hook_off; });
+        n.fc->set_relineage_hook([np] {
+            np->ring = recon::ReconRing(4096);
+            np->ring.seed(np->node->boot_digest_history(), np->node->boot_digest_since());
+        });
+        (void)n.fc->reseed_after_bring_up();
+        const auto d = n.node->ledger().owed_digest();
+        if (n.dseq.empty() || !(n.dseq.back() == d)) n.dseq.push_back(d);
+        return true;
+    }
+    void shutdown(Node& n, bool drain = true) {   // drain = false: a simulated crash (nothing more is written)
+        if (n.fc && drain) (void)n.fc->drain_before_stop();
+        n.fc.reset(); n.q.reset(); n.node.reset(); n.mock.reset();
+    }
+    // The block at h, built by `who` on `builder`'s ledger (its owed_digest now,
+    // i.e. at the builder cut h - 1 - D of a lockstep node); garbage = a root no
+    // honest ledger ever held (a forker's commitment).
+    void mine(std::uint64_t h, char who, Node* builder, bool garbage = false, bool stall = false) {
+        Blk b; b.bid = hex_of(id(h)); b.who = who; b.en = en_of(who) + static_cast<std::uint32_t>(h);
+        b.credit[smoke::key_of(static_cast<std::uint8_t>(0x40 + (who - 'A')))] = static_cast<long long>(1000 + 17 * h);
+        b.payout[smoke::key_of(static_cast<std::uint8_t>(0x60 + h % 3))] = static_cast<long long>(200 + h);
+        if (garbage) { b.commit = smoke::key_of(static_cast<std::uint8_t>(0xE0 + h)); b.commit[7] = 0x77; }
+        else b.commit = builder->node->ledger().owed_digest();
+        b.stall_majority = stall;
+        spec[h] = b;
+    }
+    void apply(std::uint64_t h) {
+        top = std::max(top, h);
+        for (auto& n : nodes) if (n.node) smoke::apply_row(*n.node, h, id(h), id(h - 1));
+        for (int i = 0; i < 2; ++i) for (auto& n : nodes) if (n.fc) (void)n.fc->tick();
+    }
+    bool book(Node& n, std::uint64_t h, const std::string& bid, CB& bk, const FinalizeConnectOptions::ScratchQuery* q) {
+        const auto it = spec.find(h);
+        if (it == spec.end() || it->second.bid != bid || n.not_lane_h.count(h)) { bk.why = "not-lane: test"; return false; }
+        const Blk& b = it->second;
+        bk.has_extra_nonce = true; bk.extra_nonce = b.en; bk.onchain_root_hex = hex_of(b.commit);
+        std::uint64_t tot = 1000; for (const auto& [k, v] : b.payout) { (void)k; tot += static_cast<std::uint64_t>(v); }
+        bk.total_pico = tot;
+        std::vector<::v37::bytes32> cands; std::vector<std::uint64_t> sup;
+        if (q) { cands = *q->cands; sup = *q->superseded; }
+        else n.ring.candidates(n.node->ledger().owed_digest(), cands, sup);
+        bool m = false; for (const auto& d : cands) if (d == b.commit) { m = true; break; }
+        if (!m) {
+            const bool decidable = q || n.node->finalize_driver().cursor_height() >= recon::builder_cut(h, D);
+            bk.why = decidable ? "lane-root-refused:" + bk.onchain_root_hex + ": unmatched (test)" : "lane-root-unknown: not yet decidable (test)";
+            bk.unattributed_pico = tot;
+            return false;
+        }
+        if (!q) {
+            bk.has_matched_since = true;
+            const auto s = n.ring.since_of(b.commit);
+            bk.matched_since = s ? *s : n.node->finalize_driver().digest_since();
+        }
+        if (q && q->root_only) { bk.why = "root-ok"; return true; }
+        bk.payout = b.payout; bk.payout_decoded = true;
+        if (!q && n.majority && b.stall_majority) {
+            // RC-HOLD (#1758): an UNDECIDED relay repair is HELD, never refused on a
+            // retry count -- so the shape "the majority refuses the isolated block"
+            // is a DECIDED refusal: the on-chain credit cut does not reproduce here.
+            bk.why = "credit-cut MISMATCH: we published P=1 with a DIFFERENT lane digest (test: the winner's isolated receipts are not the ones this node holds)";
+            return false;
+        }
+        bk.credit = b.credit;
+        return true;
+    }
+    // FINALIZED-set equality over every lane block of the chain.
+    static bool same_settled(D2Rig& R, Node& a, Node& b) {
+        for (const auto& [h, blk] : R.spec) { (void)h; if (a.node->ledger().is_settled(blk.bid) != b.node->ledger().is_settled(blk.bid)) return false; }
+        return true;
+    }
+    static bool same_liability(Node& a, Node& b) {
+        const auto& sa = a.fc->stats(); const auto& sb = b.fc->stats();
+        std::set<std::string> ba, bb;
+        for (const auto& x : a.fc->liability()) ba.insert(x.bid);
+        for (const auto& x : b.fc->liability()) bb.insert(x.bid);
+        return ba == bb && a.fc->liability_by_payee() == b.fc->liability_by_payee() &&
+               sa.liability_attributed_pico == sb.liability_attributed_pico && sa.liability_unattributed_pico == sb.liability_unattributed_pico;
+    }
+};
+
+inline void minority_fc_selfcheck(smoke::Report& rep, const std::filesystem::path& tmp_root) {
+    using Node = D2Rig::Node;
+    const ::v37::ChainId CHAIN = 7;
+    auto cfg_of = [&](const std::string& name) {
+        XmrNodeConfig c; c.network = MoneroNetwork::Stagenet; c.lane_chain = CHAIN; c.d_conf = 3;
+        c.settle_db_path = (tmp_root / name).string();
+        std::filesystem::create_directories(c.settle_db_path);
+        return c;
+    };
+    auto opts_of = [&](const XmrNodeConfig& c, bool majority) {
+        FinalizeConnectOptions o; o.out = nullptr;
+        o.sidecar_path = (std::filesystem::path(c.settle_db_path) / "pfound.tsv").string();
+        if (majority) o.retry_bound = 1;   // the relay-repair stall on X resolves inside one tick pair
+        return o;
+    };
+    auto archived = [](const XmrNodeConfig& c) {
+        for (const auto& e : std::filesystem::directory_iterator(c.settle_db_path))
+            if (e.path().filename().string().rfind("settle.img.pre-converge-", 0) == 0) return true;
+        return false;
+    };
+    auto marker_of = [](const XmrNodeConfig& c) {
+        std::ifstream in((std::filesystem::path(c.settle_db_path) / "pfound.tsv.converge").string());
+        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        minority::Marker m; if (!minority::marker_parse(body, m)) m.phase = "-";
+        return m;
+    };
+    auto hx = [](const ::v37::bytes32& d) { return hex_of(d).substr(0, 12); };
+    const std::string X = hex_of(D2Rig::id(8)), W = hex_of(D2Rig::id(11)), Y = hex_of(D2Rig::id(13));
+
+    // The FC31 layout. Heights 1..4: no lane block. 5..7: majority (B, C
+    // alternating). 8 = X, the minority A's own ISOLATED find: A credits it,
+    // the majority cannot reproduce its credit cut (a decided mismatch) and refuses it
+    // (liability). 9, 10, 12: majority. 11 = W (with_w): A's own block built on
+    // the SHARED state -> credited everywhere. 13 = Y: A's own block on the
+    // minority lineage (commits a digest containing X) -> refused by the
+    // majority as lane-root-refused. 14..: majority, committing states A's
+    // history cannot hold -> A refuses them. Ruling D-1 = C (work-weighted):
+    // A's detection window (the last 8 decided lane blocks) holds X, W, Y as
+    // own blocks and 9, 10, 12 as matched; the unmatched majority blocks 14..18
+    // cross 50% of it at h=18 (5 of 8) -- 14..17 alone are 50% (alarm only).
+    auto layout = [&](D2Rig& R, Node& A, Node& B, bool mark, bool with_w, std::uint64_t from, std::uint64_t to) {
+        for (std::uint64_t h = from; h <= to; ++h) {
+            if (h <= 4) { R.apply(h); continue; }
+            if (h == 8) {
+                R.mine(8, 'A', &A, false, /*stall=*/true);
+                if (mark && A.fc) A.fc->mark_isolated_own(X, 8, "test: parked, no relay peer");
+            } else if (h == 11 && with_w) R.mine(11, 'A', &A);
+            else if (h == 13) R.mine(13, 'A', &A);
+            else R.mine(h, (h % 2) ? 'B' : 'C', &B);
+            R.apply(h);
+        }
+    };
+
+    // ── FC31 / FC33 / FC31n: the D2 case end to end ─────────────────────────
+    for (int mode = 1; mode >= 0; --mode) {
+        D2Rig R;
+        auto cA = cfg_of(mode ? "d2-fc31-A" : "d2-fc31n-A"), cB = cfg_of(mode ? "d2-fc31-B" : "d2-fc31n-B"),
+             cB2 = cfg_of(mode ? "d2-fc31-B2" : "d2-fc31n-B2");
+        FinalizeConnectOptions oA = opts_of(cA, false);
+        if (!mode) oA.minority_mode = FinalizeConnectOptions::MinorityMode::Off;   // today's behaviour exactly
+        Node& A = R.add("A", false, 'A', cA, oA);
+        Node& B = R.add("B", true, 'B', cB, opts_of(cB, true));
+        Node& B2 = R.add("B2", true, 'B', cB2, opts_of(cB2, true));   // FC33 control: A's X and Y are strangers' blocks to it
+        B2.not_lane_h = {8, 13};
+        if (!R.boot(A) || !R.boot(B) || !R.boot(B2)) { rep.add("FC31 boot", false, A.boot_error + B.boot_error + B2.boot_error); return; }
+        layout(R, A, B, true, true, 1, 18);
+        const auto st16 = A.fc->stats();
+        const bool eq16 = A.node->ledger().owed_digest() == B.node->ledger().owed_digest();
+        bool eq_after = eq16;
+        for (std::uint64_t h = 19; h <= 24; ++h) { layout(R, A, B, true, true, h, h); eq_after = eq_after && A.node->ledger().owed_digest() == B.node->ledger().owed_digest(); }
+        const auto& sa = A.fc->stats(); const auto& sb = B.fc->stats();
+        if (mode) {
+            rep.add("FC31 D2 end to end: A's own isolated X credited by A, refused by the majority (a DECIDED credit-cut mismatch; RC-HOLD holds an undecided repair); the majority's blocks then commit roots A cannot reproduce; once they carry > 50% of A's window (h=18, 5 of 8) -> MINORITY DETECTED (alarm edge), R1 = {X} reproduces 5/5, store rewritten + archived, A re-lineaged INSIDE the same step: owed_digest == the majority's from that step on (and at every later step), FINALIZED sets equal, hook off, cursor unchanged",
+                    st16.minority_runs_detected == 1 && st16.converged == 1 && A.hook_on == 1 && A.hook_off == 1 && eq16 && eq_after &&
+                    A.fc->converge_state() == FinalizeConnect::ConvergeState::Converged && archived(cA) && marker_of(cA).phase == "done" &&
+                    marker_of(cA).candidate == "R1" && D2Rig::same_settled(R, A, B) && !A.node->ledger().is_settled(X) &&
+                    A.node->ledger().is_settled(W) && A.node->finalize_driver().cursor_height() == B.node->finalize_driver().cursor_height() &&
+                    A.node->relineages() == 1,
+                    "detected=" + std::to_string(st16.minority_runs_detected) + " converged=" + std::to_string(st16.converged) +
+                    " hooks=" + std::to_string(A.hook_on) + "/" + std::to_string(A.hook_off) + " eq16=" + std::to_string(eq16) +
+                    " eq_after=" + std::to_string(eq_after) + " A=" + hx(A.node->ledger().owed_digest()) + " B=" + hx(B.node->ledger().owed_digest()) +
+                    " marker=" + marker_of(cA).phase + "/" + marker_of(cA).candidate);
+            rep.add("FC31c liability after the adoption is IDENTICAL on A and the majority: X per payee (on A from its booked payout, on B from the refused decode), Y whole reward unattributed; A released its 5 refusals of the run blocks (now credited); the refuse path never mutated a ledger; late_unbooked = 0",
+                    D2Rig::same_liability(A, B) && sa.liability_released == 5 && sa.own_refused_on_converge == 2 &&
+                    sa.ledger_mutations_on_refuse == 0 && sb.ledger_mutations_on_refuse == 0 && sa.late_unbooked == 0 && sb.late_unbooked == 0 &&
+                    sb.refused >= 1 && sb.relay_repair_stall_timeout == 0,
+                    "liab A/B blocks=" + std::to_string(sa.liability_blocks) + "/" + std::to_string(sb.liability_blocks) + " att=" +
+                    std::to_string(sa.liability_attributed_pico) + "/" + std::to_string(sb.liability_attributed_pico) + " unatt=" +
+                    std::to_string(sa.liability_unattributed_pico) + "/" + std::to_string(sb.liability_unattributed_pico) +
+                    " released=" + std::to_string(sa.liability_released) + " own_refused=" + std::to_string(sa.own_refused_on_converge));
+            rep.add("FC33 the MAJORITY is unaffected: B saw A's X (refused, stall), W (matched) and Y (unmatched, ONE builder) -> never detects, never suspends, and its digest sequence EQUALS a control that never saw X / Y as lane blocks; ledger_mutations_on_refuse = 0",
+                    sb.minority_runs_detected == 0 && B.hook_on == 0 && B.fc->converge_state() == FinalizeConnect::ConvergeState::Converged &&
+                    B.dseq == B2.dseq && B.node->ledger().owed_digest() == B2.node->ledger().owed_digest() && sb.refused_not_credited == 1,
+                    "B states=" + std::to_string(B.dseq.size()) + " control=" + std::to_string(B2.dseq.size()) +
+                    " B run=" + std::to_string(sb.minority_run_len));
+        } else {
+            rep.add("FC31n control (--minority-converge off == the base behaviour): the same partition leaves A and the majority FORKED for good (A credits X, refuses every majority block after it; no detection, no convergence)",
+                    !eq_after && sa.minority_runs_detected == 0 && sa.converged == 0 && A.node->ledger().is_settled(X) &&
+                    !D2Rig::same_settled(R, A, B),
+                    "A=" + hx(A.node->ledger().owed_digest()) + " B=" + hx(B.node->ledger().owed_digest()));
+        }
+        for (auto& n : R.nodes) R.shutdown(n);
+    }
+
+    // ── FC31b: no isolation mark -> R1 empty -> R2 (every own block since F) ─
+    {
+        D2Rig R;
+        auto cA = cfg_of("d2-fc31b-A"), cB = cfg_of("d2-fc31b-B");
+        Node& A = R.add("A", false, 'A', cA, opts_of(cA, false));
+        Node& B = R.add("B", true, 'B', cB, opts_of(cB, true));
+        if (!R.boot(A) || !R.boot(B)) { rep.add("FC31b boot", false, A.boot_error + B.boot_error); return; }
+        layout(R, A, B, /*mark=*/false, /*with_w=*/false, 1, 20);
+        rep.add("FC31b without an isolation mark R1 is empty: R2 = every own block since F ({X, Y}) reproduces the run -> converged; digests and FINALIZED sets equal",
+                A.fc->stats().converged == 1 && marker_of(cA).candidate == "R2" &&
+                A.node->ledger().owed_digest() == B.node->ledger().owed_digest() && D2Rig::same_settled(R, A, B),
+                "converged=" + std::to_string(A.fc->stats().converged) + " candidate=" + marker_of(cA).candidate);
+        for (auto& n : R.nodes) R.shutdown(n);
+    }
+
+    // ── FC31d: the forced refuse set is neither R1 nor R2 -> the bounded own-subset search ─
+    // X1 (8, isolation-marked) is credited by the majority, X2 (9, NOT marked) is
+    // refused by it (credit-cut stall), W (11) is credited everywhere. F = 8 (the
+    // last matched foreign block commits D(8)), so R1 = {} and R2 = {X2, W}
+    // (fails: W was credited), R0 = {} fails (X2 was refused); the subset {X2}
+    // reproduces the majority's commitments exactly.
+    {
+        D2Rig R;
+        auto cA = cfg_of("d2-fc31d-A"), cB = cfg_of("d2-fc31d-B");
+        Node& A = R.add("A", false, 'A', cA, opts_of(cA, false));
+        Node& B = R.add("B", true, 'B', cB, opts_of(cB, true));
+        if (!R.boot(A) || !R.boot(B)) { rep.add("FC31d boot", false, A.boot_error + B.boot_error); return; }
+        for (std::uint64_t h = 1; h <= 22; ++h) {
+            if (h >= 5) {
+                if (h == 8) { R.mine(8, 'A', &A); A.fc->mark_isolated_own(X, 8, "test: parked, no relay peer"); }
+                else if (h == 9) R.mine(9, 'A', &A, false, /*stall=*/true);
+                else if (h == 11) R.mine(11, 'A', &A);
+                else R.mine(h, (h % 2) ? 'B' : 'C', &B);
+            }
+            R.apply(h);
+        }
+        const std::string X2 = hex_of(D2Rig::id(9));
+        rep.add("FC31d the refuse set is neither R1 nor R2 (X1 isolated but credited by the majority, X2 unmarked but refused, W credited): the bounded own-subset search finds {X2} -- adopted only because it reproduces every run commitment; digests and FINALIZED sets equal",
+                A.fc->stats().converged == 1 && marker_of(cA).candidate == "Rs" && marker_of(cA).forced == std::vector<std::string>{X2} &&
+                A.node->ledger().owed_digest() == B.node->ledger().owed_digest() && D2Rig::same_settled(R, A, B) &&
+                A.node->ledger().is_settled(X) && !A.node->ledger().is_settled(X2),
+                "converged=" + std::to_string(A.fc->stats().converged) + " candidate=" + marker_of(cA).candidate + " forced=" +
+                std::to_string(marker_of(cA).forced.size()));
+        for (auto& n : R.nodes) R.shutdown(n);
+    }
+
+    // ── FC32p / FC32 / FC32c / FC32b (operator ruling D-1 = C) ───────────────
+    // FC32p: a forker PAIR (two builder keys) commits 3 consecutive roots no
+    //   ledger holds while carrying < 50% of the window's work (3 of 8) -> refuse
+    //   + ALARM only: no detection, no re-derivation, no alarm edge, CONVERGED,
+    //   nothing mutated (the D-1 blocker: before, every honest node halted).
+    // FC32: a forker set carrying > 50% of the window's work (6 of the last 8)
+    //   -> detected, no candidate reproduces -> DIVERGED, ALARM-ONLY: nothing
+    //   mutated, booking continues; FC32c: matched blocks bring the unmatched
+    //   share to <= 50% -> CLEARED.
+    // FC32b: a fork point deeper than the bound -> DIVERGED without a re-derivation.
+    for (int variant = 0; variant < 3; ++variant) {
+        D2Rig R;
+        auto cA = cfg_of(variant == 0 ? "d2-fc32p-A" : variant == 1 ? "d2-fc32-A" : "d2-fc32b-A");
+        FinalizeConnectOptions oA = opts_of(cA, false);
+        if (variant == 2) oA.converge_max_depth = 2;
+        Node& A = R.add("A", false, 'A', cA, oA);
+        if (!R.boot(A)) { rep.add("FC32 boot", false, A.boot_error); return; }
+        auto forker_at = [variant](std::uint64_t h) {
+            if (variant == 0) return h >= 13 && h <= 15;   // 3 of the 8-block window (5..12 honest before)
+            if (variant == 1) return h >= 10 && h <= 15;   // 6 of 8
+            return h >= 13 && h <= 18;                      // deep: 10..12 empty
+        };
+        const std::uint64_t stop = variant == 2 ? 18 : 15;
+        std::uint64_t events_before = 0;
+        for (std::uint64_t h = 1; h <= stop; ++h) {
+            if (h >= 5 && !(variant == 2 && h >= 10 && h <= 12)) {
+                const bool forker = forker_at(h);
+                R.mine(h, (h % 2) ? 'B' : 'C', &A, forker);
+                if (forker) R.spec[h].en = ((h % 2) ? 0x05500000u : 0x06600000u) + static_cast<std::uint32_t>(h);   // two builder keys
+            }
+            if (h == 10) events_before = A.node->finalize_driver().event_seq();
+            R.apply(h);
+        }
+        const auto s1 = A.fc->stats();
+        const std::string state1 = FinalizeConnect::converge_state_name(A.fc->converge_state());
+        const bool untouched = !archived(cA) && marker_of(cA).phase == "-" && A.node->relineages() == 0 && s1.converged == 0;
+        const std::string det = "state=" + state1 + " detected=" + std::to_string(s1.minority_runs_detected) + " entered=" +
+            std::to_string(s1.diverged_entered) + " failed=" + std::to_string(s1.converge_failed) + " alarms=" +
+            std::to_string(s1.minority_alarms) + " suspect=" + std::to_string(s1.minority_suspect) + " share=" +
+            std::to_string(s1.minority_share_permille) + "/1000 n=" + std::to_string(s1.minority_window_n) + " scratch_calls=" +
+            std::to_string(A.scratch_calls) + " hooks=" + std::to_string(A.hook_on) + "/" + std::to_string(A.hook_off) +
+            " refused=" + std::to_string(s1.refused_not_credited);
+        if (variant == 0) {
+            bool forker_settled = false;
+            for (std::uint64_t h = 13; h <= 15; ++h) forker_settled = forker_settled || A.node->ledger().is_settled(R.spec[h].bid) ||
+                                                                      A.node->ledger().is_pending(R.spec[h].bid);
+            rep.add("FC32p D-1 = C: a byzantine PAIR (2 builder keys) mines 3 consecutive fake-digest lane blocks holding 3/8 = 37.5% of the window's work -> refused + ALARMED (minority_alarms >= 3), NO detection, no re-derivation, no alarm edge, CONVERGED, nothing mutated, the pair's blocks never credited",
+                    A.fc->converge_state() == FinalizeConnect::ConvergeState::Converged && s1.minority_runs_detected == 0 &&
+                    s1.converge_attempts == 0 && A.scratch_calls == 0 && A.hook_on == 0 && untouched && s1.minority_alarms >= 3 &&
+                    s1.minority_suspect >= 3 && s1.refused_not_credited == 3 && s1.ledger_mutations_on_refuse == 0 && !forker_settled &&
+                    s1.minority_share_permille == 375 && A.node->finalize_driver().event_seq() >= events_before,
+                    det);
+        } else if (variant == 1) {
+            rep.add("FC32 D-1 = C: forker blocks holding 6/8 of the window's work, whose roots NO candidate refuse set reproduces -> detected, re-derivation fails -> DIVERGED as an ALARM (entered once, alarms counted): nothing mutated (no archive, no marker, no relineage), booking continued",
+                    A.fc->converge_state() == FinalizeConnect::ConvergeState::Diverged && A.fc->diverged_alarm() && A.hook_on == 1 &&
+                    untouched && s1.diverged_entered == 1 && s1.converge_failed >= 1 && A.scratch_calls > 0 && s1.minority_alarms >= 2 &&
+                    s1.ledger_mutations_on_refuse == 0 && A.node->finalize_driver().event_seq() >= events_before,
+                    det);
+            for (std::uint64_t h = 16; h <= 19; ++h) { R.mine(h, (h % 2) ? 'B' : 'C', &A); R.apply(h); }
+            const auto s2 = A.fc->stats();
+            rep.add("FC32c then matched foreign blocks bring the unmatched share of the window to <= 50% (4/8 at h=19) -> DIVERGED CLEARED: alarm edge off, state CONVERGED, still no mutation",
+                    A.fc->converge_state() == FinalizeConnect::ConvergeState::Converged && A.hook_off == 1 &&
+                    s2.diverged_cleared == 1 && A.node->relineages() == 0 && !archived(cA) && s2.converged == 0,
+                    "state=" + std::string(FinalizeConnect::converge_state_name(A.fc->converge_state())) + " cleared=" +
+                    std::to_string(s2.diverged_cleared) + " share=" + std::to_string(s2.minority_share_permille));
+        } else {
+            rep.add("FC32b a fork point deeper than the bound (F from h=9's commitment, 4 heights below the run's builder cut; bound 2) -> DIVERGED (alarm) WITHOUT a re-derivation (no scratch decode), nothing mutated (W6 territory)",
+                    A.fc->converge_state() == FinalizeConnect::ConvergeState::Diverged && untouched && A.scratch_calls == 0 &&
+                    s1.converge_failed >= 1 && s1.diverged_entered == 1,
+                    det);
+        }
+        for (auto& n : R.nodes) R.shutdown(n);
+    }
+
+    // ── FC34: restarts during and after the convergence ─────────────────────
+    for (int variant = 0; variant < 3; ++variant) {   // 0: crash after 'proposed', 1: after 'applied', 2: restart after 'done'
+        D2Rig R;
+        const std::string sfx = variant == 0 ? "a" : variant == 1 ? "b" : "c";
+        auto cA = cfg_of("d2-fc34" + sfx + "-A"), cB = cfg_of("d2-fc34" + sfx + "-B");
+        FinalizeConnectOptions oA = opts_of(cA, false);
+        oA.converge_crash_after = variant < 2 ? variant + 1 : 0;
+        Node& A = R.add("A", false, 'A', cA, oA);
+        Node& B = R.add("B", true, 'B', cB, opts_of(cB, true));
+        if (!R.boot(A) || !R.boot(B)) { rep.add("FC34 boot", false, A.boot_error + B.boot_error); return; }
+        layout(R, A, B, true, true, 1, 18);
+        const std::string phase_at_crash = marker_of(cA).phase;
+        const auto hist_before = A.node->boot_digest_history();
+        const auto dg_before = A.node->ledger().owed_digest();
+        R.shutdown(A, /*drain=*/variant == 2);
+        A.base_opts.converge_crash_after = 0;
+        A.hook_on = A.hook_off = 0;
+        if (!R.boot(A)) { rep.add("FC34 reboot", false, A.boot_error); return; }
+        const auto sb = A.fc->stats();
+        const auto dg_boot = A.node->ledger().owed_digest();
+        const bool eq_boot = dg_boot == B.node->ledger().owed_digest();
+        std::vector<::v37::bytes32> b_ring; std::vector<std::uint64_t> b_since;
+        for (const auto& e : B.ring.entries()) { b_ring.push_back(e.digest); b_since.push_back(e.since); }
+        for (std::uint64_t h = 19; h <= 22; ++h) layout(R, A, B, true, true, h, h);
+        const bool eq_end = A.node->ledger().owed_digest() == B.node->ledger().owed_digest() && D2Rig::same_settled(R, A, B);
+        if (variant == 0)
+            rep.add("FC34a crash right after the 'proposed' marker (old store): the boot DROPS the marker (nothing was mutated), the restored observations re-detect, the next tick converges: digest == the majority's, FINALIZED sets equal",
+                    phase_at_crash == "proposed" && sb.converge_boot_dropped == 1 && !eq_boot && A.fc->stats().converged == 1 && eq_end &&
+                    A.fc->stats().late_unbooked == 0,
+                    "phase=" + phase_at_crash + " dropped=" + std::to_string(sb.converge_boot_dropped) + " converged=" + std::to_string(A.fc->stats().converged));
+        else if (variant == 1)
+            rep.add("FC34b crash right after the store rewrite ('applied'): the boot replays the REWRITTEN store and finishes the adoption from the marker: digest == the majority's straight out of the boot, boot_digest_history() (digest, since) == the majority's lived sequence, liability identical, no re-detection",
+                    phase_at_crash == "applied" && sb.converge_boot_finished == 1 && eq_boot && eq_end &&
+                    A.node->boot_digest_history() == b_ring && A.node->boot_digest_since() == b_since && D2Rig::same_liability(A, B) &&
+                    A.fc->stats().minority_runs_detected == 0 && marker_of(cA).phase == "done",
+                    "phase=" + phase_at_crash + " finished=" + std::to_string(sb.converge_boot_finished) + " eq_boot=" + std::to_string(eq_boot) +
+                    " hist=" + std::to_string(A.node->boot_digest_history().size()) + "/" + std::to_string(b_ring.size()));
+        else
+            rep.add("FC34c restart AFTER the adoption ('done'): the F1 replay is identical (same digest, same boot history as before the restart), the pending set is re-driven, no re-detection; the chain then runs on with digests equal and late_unbooked = 0",
+                    phase_at_crash == "done" && A.node->boot_digest_history() == hist_before && eq_boot && dg_before == dg_boot &&
+                    A.fc->stats().minority_runs_detected == 0 && A.fc->converge_state() == FinalizeConnect::ConvergeState::Converged &&
+                    A.fc->pending().size() == B.fc->pending().size() && eq_end && A.fc->stats().late_unbooked == 0,
+                    "phase=" + phase_at_crash + " pending A/B=" + std::to_string(A.fc->pending().size()) + "/" + std::to_string(B.fc->pending().size()) +
+                    " hist=" + std::to_string(A.node->boot_digest_history() == hist_before) + " eq_boot=" + std::to_string(eq_boot) +
+                    " dg=" + std::to_string(dg_before == dg_boot) + " det=" + std::to_string(A.fc->stats().minority_runs_detected) +
+                    " state=" + FinalizeConnect::converge_state_name(A.fc->converge_state()) + " eq_end=" + std::to_string(eq_end) +
+                    " late=" + std::to_string(A.fc->stats().late_unbooked));
+        for (auto& n : R.nodes) R.shutdown(n);
+    }
+
+    // ── FC35: --minority-converge halt-only ─────────────────────────────────
+    {
+        D2Rig R;
+        auto cA = cfg_of("d2-fc35-A"), cB = cfg_of("d2-fc35-B");
+        FinalizeConnectOptions oA = opts_of(cA, false);
+        oA.minority_mode = FinalizeConnectOptions::MinorityMode::HaltOnly;
+        Node& A = R.add("A", false, 'A', cA, oA);
+        Node& B = R.add("B", true, 'B', cB, opts_of(cB, true));
+        if (!R.boot(A) || !R.boot(B)) { rep.add("FC35 boot", false, A.boot_error + B.boot_error); return; }
+        layout(R, A, B, true, true, 1, 20);
+        const auto& s = A.fc->stats();
+        rep.add("FC35 --minority-converge halt-only: the same detection -> DIVERGED (alarm edge; D-1 = C: never a halt), NEVER adopts (no attempt, no archive, no marker, the ledger keeps its own lineage)",
+                s.minority_runs_detected == 1 && A.fc->converge_state() == FinalizeConnect::ConvergeState::Diverged && A.hook_on == 1 &&
+                s.converge_attempts == 0 && s.converged == 0 && !archived(cA) && marker_of(cA).phase == "-" && A.node->ledger().is_settled(X),
+                "state=" + std::string(FinalizeConnect::converge_state_name(A.fc->converge_state())) + " attempts=" + std::to_string(s.converge_attempts));
+        for (auto& n : R.nodes) R.shutdown(n);
+    }
 }
 
 } // namespace c2pool::v37n::xmr::o2

@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include <sharechain/v37/v37_hash.hpp>   // ::v37::bytes32
@@ -94,6 +95,12 @@ public:
     bool contains(const ::v37::bytes32& d) const {
         for (const auto& e : m_e) if (e.digest == d) return true;
         return false;
+    }
+    // D2: the coin height at which `d` became current (its NEWEST occurrence),
+    // nullopt when the ring does not hold it.
+    std::optional<std::uint64_t> since_of(const ::v37::bytes32& d) const {
+        for (std::size_t k = m_e.size(); k-- > 0;) if (m_e[k].digest == d) return m_e[k].since;
+        return std::nullopt;
     }
 
     // The decode candidates, newest first: the LIVE digest at index 0 (still
