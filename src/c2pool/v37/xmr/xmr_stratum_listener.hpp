@@ -42,9 +42,16 @@
 //     (drain_log()) — the listener never prints; all stdout stays on main.
 //
 // Startup race handled: a miner that logs in BEFORE the daemon has its first
-// template is PARKED (no reply) and answered with a real login_ok the moment
-// notify_new_template() delivers one (bounded by parked_login_ttl_ms, then it
-// gets "No job available" and xmrig's own retry takes over).
+// template (or while the lane is SUSPENDED) is PARKED (no reply) and answered
+// with a real login_ok the moment a template is available again:
+// notify_new_template(), the lane RESUME edge, or -- if neither signal comes --
+// the idle tick re-probing the template source. A parked login is NEVER answered
+// "No job available" (STRATUM-RESUME, cold-boot smoke D3): with a single pool,
+// xmrig treats a login error as non-fatal, keeps the connection open and idles
+// on it forever -- it never logs in again, so nothing could reach it after the
+// lane resumed. xmrig 6.22 closes a connection whose login got no reply for
+// 20 s, but ANY line it receives resets that timer: a parked login is sent a
+// benign keepalive every parked_keepalive_ms, so it stays connected and parked.
 //
 // THREADING CONTRACT (see the O-2 survey §E):
 //   listener thread: sockets, sessions, XmrStratumServer, ITemplateSource reads
@@ -107,8 +114,15 @@ struct StratumListenerOptions {
     std::size_t   max_clients = 256;         // beyond this, accept() + close immediately
     std::size_t   max_line_bytes = 64 * 1024;      // one JSON request line
     std::size_t   max_write_backlog = 1u << 20;    // pending bytes per slow client before drop
-    int           poll_timeout_ms = 250;     // idle tick (parked-login expiry granularity)
-    int           parked_login_ttl_ms = 15000;     // xmrig's login response timeout is 20 s
+    int           poll_timeout_ms = 250;     // idle tick (parked-login re-probe granularity)
+    // STRATUM-RESUME: a parked login is kept open until a template exists (never
+    // expired into a "No job available" dead end); this only paces the
+    // "login still PARKED" log line (0 = never log it).
+    int           parked_login_ttl_ms = 15000;
+    // STRATUM-RESUME: while parked, a benign line ({"id":0,...,"result":{"status":
+    // "KEEPALIVED"}}: an unknown-id response every miner ignores) is sent this
+    // often; it resets xmrig's 20 s login-response timer (0 = never send).
+    int           parked_keepalive_ms = 10000;
     int           max_json_depth = 8;        // login/submit are depth-3 objects; guards the recursive parser
     std::size_t   max_log_lines = 2048;      // bounded log (oldest dropped)
 };
@@ -388,6 +402,8 @@ private:
         std::string   login;
         std::string   agent;
         std::chrono::steady_clock::time_point since;
+        std::chrono::steady_clock::time_point noted;   // last "still PARKED" log line
+        std::chrono::steady_clock::time_point pinged;  // last parked keepalive sent
     };
 
     struct Client {
@@ -400,6 +416,11 @@ private:
         std::unique_ptr<strat::XmrStratumSession> session;
         bool        last_reply_error = false;
         std::string last_reply_msg;
+        // STRATUM-RESUME: template id of the last job this session was handed
+        // (login result or push; 0 = unknown). A template signal for the SAME id
+        // is not re-pushed -- a parked login served by the idle-tick re-probe just
+        // before the pending notify lands must not get the same template twice.
+        std::uint32_t served_tid = 0;
     };
 
     struct AtomicStats {
@@ -619,7 +640,7 @@ private:
                     if (re & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) do_read(cid);
                 }
             }
-            expire_parked();
+            service_parked();
             reap();
         }
     }
@@ -739,14 +760,17 @@ private:
                 return;
             }
             strat::TemplateJob peek;
-            if (m_lane_suspended.load(std::memory_order_acquire) || !m_templates.get_job(0, peek)) {
+            const bool suspended = m_lane_suspended.load(std::memory_order_acquire);
+            if (suspended || !m_templates.get_job(0, peek)) {
                 // No template yet (or the lane is SUSPENDED -- R-C rework-2: the
                 // withdrawn job must not be handed out on a reconnect): park,
-                // answer when notify_new_template() lands (the resume edge fires it).
-                c->parked = ParkedLogin{req_id, login, agent, std::chrono::steady_clock::now()};
+                // answer when a template is available again (notify_new_template(),
+                // the resume edge, or the idle-tick re-probe in service_parked()).
+                const auto now = std::chrono::steady_clock::now();
+                c->parked = ParkedLogin{req_id, login, agent, now, now, now};
                 m_stats.parked_logins.fetch_add(1, std::memory_order_relaxed);
-                log("client " + std::to_string(cid) + " login PARKED (no template yet) agent='" +
-                    agent + "'");
+                log("client " + std::to_string(cid) + " login PARKED (" +
+                    (suspended ? "lane suspended" : "no template yet") + ") agent='" + agent + "'");
                 return;
             }
             do_login(cid, req_id, login, agent);
@@ -819,15 +843,25 @@ private:
         if (!c) return;
         strat::XmrStratumSession& s = *c->session;
         bool ok = false;
+        strat::TemplateJob probe;
         {
             // R-C rework-3 (D4): the first job a login hands out is a job push --
             // re-check under the suspend gate; a login that lost the race is
             // PARKED again (served on the resume edge), never handed the job.
             std::lock_guard<std::mutex> g(m_gate_mtx);
+            const auto now = std::chrono::steady_clock::now();
             if (m_lane_suspended.load(std::memory_order_acquire)) {
-                c->parked = ParkedLogin{req_id, login, agent, std::chrono::steady_clock::now()};
+                c->parked = ParkedLogin{req_id, login, agent, now, now, now};
                 m_stats.suspended_push_refused.fetch_add(1, std::memory_order_relaxed);
                 log("client " + std::to_string(cid) + " login RE-PARKED: lane suspended at the gate (no job handed out)");
+                return;
+            }
+            // STRATUM-RESUME: never let handle_login answer "No job available" --
+            // that reply leaves xmrig idle on an open connection for good. A login
+            // whose template vanished since the peek is parked again instead.
+            if (!m_templates.get_job(0, probe)) {
+                c->parked = ParkedLogin{req_id, login, agent, now, now, now};
+                log("client " + std::to_string(cid) + " login RE-PARKED: the template source has no job right now");
                 return;
             }
             ok = m_server.handle_login(s, req_id, login);
@@ -837,6 +871,7 @@ private:
             return;
         }
         if (s.logged_in()) {
+            if (Client* cl = live(cid)) cl->served_tid = probe.template_id;
             m_stats.logins.fetch_add(1, std::memory_order_relaxed);
             const strat::LoginString& ls = s.login();
             log("client " + std::to_string(cid) + " LOGIN OK address=" + ls.address +
@@ -861,18 +896,47 @@ private:
         for (auto& [cid, rid, login, agent] : todo) do_login(cid, rid, login, agent);
     }
 
-    void expire_parked() {
+    // STRATUM-RESUME (idle tick, listener thread). A parked login is kept open
+    // -- the pre-fix TTL answered it "No job available", which xmrig (single
+    // pool) logs and then idles on the open connection forever, so a miner that
+    // logged in during a lane suspension never mined again after the resume.
+    // Here: (a) a periodic "still PARKED" note (parked_login_ttl_ms) and a
+    // keepalive line (parked_keepalive_ms) so the miner's login-response timer
+    // never drops the connection, and (b) if
+    // the lane is not suspended and the template source has a job again, the
+    // parked logins are completed now (login_ok + job), even when no
+    // notify_new_template() arrives (a transient template gap that ends on the
+    // SAME template id is never signalled). Only parked logins are served here:
+    // logged-in sessions are never re-pushed by the tick (no job storm).
+    void service_parked() {
         const auto now = std::chrono::steady_clock::now();
-        const auto ttl = std::chrono::milliseconds(m_opts.parked_login_ttl_ms);
+        const auto every = std::chrono::milliseconds(m_opts.parked_login_ttl_ms);
+        const auto ping_every = std::chrono::milliseconds(m_opts.parked_keepalive_ms);
+        static constexpr std::string_view kParkedKeepalive =
+            "{\"id\":0,\"jsonrpc\":\"2.0\",\"error\":null,\"result\":{\"status\":\"KEEPALIVED\"}}\n";
+        std::size_t parked = 0;
         for (auto& [cid, c] : m_clients) {
             if (c.dead || !c.parked) continue;
-            if (now - c.parked->since < ttl) continue;
-            const std::uint32_t rid = c.parked->req_id;
-            c.parked.reset();
-            send_line(cid, strat::StratumDialect::build_error(rid, "No job available"));
-            log("client " + std::to_string(cid) + " parked login EXPIRED (no template within " +
-                std::to_string(m_opts.parked_login_ttl_ms) + " ms)");
+            if (m_opts.parked_keepalive_ms > 0 && now - c.parked->pinged >= ping_every) {
+                c.parked->pinged = now;
+                if (!send_line(cid, kParkedKeepalive) || c.dead || !c.parked) continue;   // closed on a send failure
+            }
+            ++parked;
+            if (m_opts.parked_login_ttl_ms > 0 && now - c.parked->noted >= every) {
+                c.parked->noted = now;
+                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(now - c.parked->since).count();
+                log("client " + std::to_string(cid) + " login still PARKED after " + std::to_string(waited) + " ms (" +
+                    (m_lane_suspended.load(std::memory_order_acquire) ? "lane suspended" : "no template") +
+                    "): kept open, served on the first template");
+            }
         }
+        if (parked == 0 || m_lane_suspended.load(std::memory_order_acquire)) return;
+        strat::TemplateJob peek;
+        if (!m_templates.get_job(0, peek)) return;
+        if (m_hook) m_hook(peek);   // seed prefetch before the first job, as on the template push
+        log("template available again (template " + std::to_string(peek.template_id) + "): serving " +
+            std::to_string(parked) + " parked login(s)");
+        flush_parked();
     }
 
     // R-C rework-2: the SUSPEND edge, on the listener thread. Withdraw the job:
@@ -915,21 +979,27 @@ private:
 
         flush_parked();
 
-        std::size_t pushed = 0;
+        std::size_t pushed = 0, current = 0;
         for (std::uint64_t cid : already) {
             Client* c = live(cid);
             if (!c) continue;
-            if (push_job(*c->session)) ++pushed;   // R-C rework-3 (D4): gated per push
+            bool holds = false;
+            if (push_job(*c, peek.template_id, &holds)) ++pushed;   // R-C rework-3 (D4): gated per push
+            else if (holds) ++current;
         }
         m_stats.job_pushes.fetch_add(pushed, std::memory_order_relaxed);
         log("template " + std::to_string(peek.template_id) + " height=" + std::to_string(peek.height) +
-            " -> job pushed to " + std::to_string(pushed) + " session(s)");
+            " -> job pushed to " + std::to_string(pushed) + " session(s)" +
+            (current ? " (" + std::to_string(current) + " already on it)" : ""));
     }
 
     // R-C rework-3 (D4): ONE lane-job push, gated: the suspend flag is re-checked
     // under m_gate_mtx right before the push (set_lane_suspended flips it under
     // the same lock). The template push can run a seed-prefetch hook for seconds
     // between its entry check and the pushes -- the rework-2 window.
+    //
+    // STRATUM-RESUME: the template push passes its template id; a session that
+    // already holds that template (served_tid) is not pushed it again (*holds).
     bool push_job(strat::XmrStratumSession& s) {
         std::lock_guard<std::mutex> g(m_gate_mtx);
         if (m_lane_suspended.load(std::memory_order_acquire)) {
@@ -937,6 +1007,19 @@ private:
             return false;
         }
         m_server.broadcast_job(s);
+        return true;
+    }
+    bool push_job(Client& c, std::uint32_t tid, bool* holds) {
+        {
+            std::lock_guard<std::mutex> g(m_gate_mtx);
+            if (m_lane_suspended.load(std::memory_order_acquire)) {
+                m_stats.suspended_push_refused.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            if (tid != 0 && c.served_tid == tid) { *holds = true; return false; }
+            m_server.broadcast_job(*c.session);
+        }
+        c.served_tid = tid;
         return true;
     }
 

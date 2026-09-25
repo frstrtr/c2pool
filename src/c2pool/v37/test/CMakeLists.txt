@@ -373,6 +373,20 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_lane_suspend_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_lane_suspend_selfcheck PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_lane_suspend_selfcheck COMMAND v37_xmr_lane_suspend_selfcheck)
+    # v37_xmr_stratum_resume_kat (STRATUM-RESUME, cold-boot smoke D3): a login
+    # parked while there is no template / the lane is SUSPENDED is kept open and
+    # completed with a login result + job on the first template (notify, resume
+    # edge, or the idle-tick re-probe) -- never expired into "No job available",
+    # which leaves xmrig idle on an open connection for good. Fake template
+    # provider (unavailable -> available) + stub verifier over loopback: no
+    # RandomX, no monerod. Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_stratum_resume_kat
+        v37_xmr_stratum_resume_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_resume_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_resume_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_resume_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_resume_kat COMMAND v37_xmr_stratum_resume_kat)
     # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
