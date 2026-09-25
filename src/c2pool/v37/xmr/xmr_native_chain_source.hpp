@@ -101,6 +101,18 @@ struct NativeChainSource {
     // The id is the hash of the blob, so a hit is byte-identical to get_block.
     std::function<bool(const std::string& bid_hex, std::vector<std::uint8_t>& blob)> block_blob;
 
+    // COLD-BOOT: ask the native node to fetch the body of `bid_hex` again over
+    // levin (and the next missing best-chain bodies above it), for a booking
+    // whose body was evicted before it was booked. Returns the ids newly asked.
+    std::function<std::size_t(const std::string& bid_hex)> want_body;
+
+    // COLD-BOOT-2: report the settlement's booked frontier (its finalize
+    // cursor) to the index, which paces the catch-up download at frontier +
+    // window (ChainIndex::set_consumer_frontier); and whether the download is
+    // paused there right now (the consumer should book, and poll fast).
+    std::function<void(std::uint64_t booked_frontier)> set_booking_frontier;
+    std::function<bool()>                              catchup_held;
+
     // D6b: the receipt relay's chain-view feed (relay/xmr_relay_chain_feed.hpp)
     // -- the headers and tip the daemon arm fetches from monerod
     // (get_block_headers_range / get_block_header_by_height). Context blobs
@@ -193,6 +205,15 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
         blob = e->block_blob;
         return true;
     };
+
+    src.want_body = [n](const std::string& bid_hex) -> std::size_t {
+        ::c2pool::xmr::node::Hash id{};
+        if (!block_id_of_hex(bid_hex, id)) return 0;
+        return n->index().want_body_for_booking(id);
+    };
+
+    src.set_booking_frontier = [n](std::uint64_t h) { n->index().set_consumer_frontier(h); };
+    src.catchup_held = [n] { return n->index().consumer_held() || n->chain_events_backpressured(); };   // COLD-BOOT-3: + queue backpressure
 
     src.tip_block = [n]() -> std::optional<std::pair<std::uint64_t, ::c2pool::xmr::node::Hash>> {
         const auto t = n->index().tip();

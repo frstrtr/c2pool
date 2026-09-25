@@ -172,6 +172,7 @@ static long long     g_credit_mutate = 0;      // --credit-mutate N: +N piconero
 static bool          g_no_book_deferral = false;         // --no-book-deferral: A/B escape hatch (reintroduces the lagging-receiver fork)
 // D6a (xmr/xmr_cba_block_source.hpp): p2p-first books from the native index; monerod is opt-in only.
 static bool          g_cba_monerod_compare = false;      // --cba-monerod-compare: compare-only oracle (counts, never decides)
+static std::uint64_t g_cba_refetch_bound = 120;          // --cba-refetch-bound: COLD-BOOT body refetch requests per block (0 = off)
 static bool          g_cba_monerod_fallback = false;     // --cba-monerod-fallback: a native miss asks monerod instead of HOLDING
 static bool          g_relay_feed_monerod_compare = false;   // --relay-feed-monerod-compare: D6b compare-only oracle (counts, never decides)
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
@@ -408,6 +409,10 @@ struct ServeHooks {
     // good-citizen path.
     std::function<void()> inject_pump;
     std::function<void()> cba_tick;   //  per-loop digest ring + log
+    // COLD-BOOT-2: true while the settlement is booking a catch-up gap (the
+    // native download is paced by it): the loop then polls fast instead of
+    // every poll_ms, so the paced download is not throttled by the idle cadence.
+    std::function<bool()> catching_up;
     // GAP-2: every accepted share (stratum listener thread, or the main thread
     // for --mine hits), AFTER the publish sink saw it. Unset = no relay.
     std::function<void(const strat::AcceptedShare&)> on_share;
@@ -1108,7 +1113,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             last_status = std::chrono::steady_clock::now();
         }
         std::fflush(stdout);
-        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+        const bool fast = hooks.catching_up && hooks.catching_up();   // COLD-BOOT-2
+        std::this_thread::sleep_for(std::chrono::milliseconds(fast ? std::min<std::uint32_t>(poll_ms, 200) : poll_ms));
     }
 
     fc.set_isolation_hook({});   // R-C rework-2: the hook captures loop-scope state; detach before teardown
@@ -1226,6 +1232,10 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
             std::fprintf(stderr, "  node: %s\n", l.c_str());
         return nullptr;
     }
+    if (!why.empty())   // COLD-BOOT-2: start_and_wait proceeded with the catch-up paused at the settlement ceiling
+        std::printf("  native: %s -- proceeding: the serve loop books the post-anchor gap as it downloads "
+                    "(bounded batches, chain order); miners are parked until the arm is ready\n", why.c_str());
+    else
     std::printf("  native: template arm READY, fallback %s\n",
                 native->config().fallback
                     ? "ON (the daemon arm may serve if the native one loses a window)"
@@ -1358,6 +1368,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         node.set_native_chain_presence(chain_src.is_canonical);
         node.set_native_row_lookup(chain_src.bid_at);   // D2-0: reorg-in blocks below a Reorg tip reach the booking observer
+        // COLD-BOOT-2: the native tip (trimmed-row Unknown vs above-tip No; the native gap re-drive's reach)
+        node.set_native_tip_lookup([&chain_src]() -> std::uint64_t {
+            const auto t = chain_src.tip_block ? chain_src.tip_block() : std::nullopt;
+            return t ? t->first : 0;
+        });
     }
     // R-C rework-2 (F2): daemon-first re-drives every chain gap (downtime / a ZMQ
     // gap wider than the reconcile walk) through the booking path.
@@ -1369,6 +1384,28 @@ static int run_live(const XmrNodeConfig& cfg) {
         return 1;
     }
     for (const auto& line : node.construction_log()) std::printf("  %s\n", line.c_str());
+    // COLD-BOOT (1): a FRESH settlement store booting from an anchor starts its
+    // finalize cursor at H_a - D_conf (the value its first walk reaches anyway),
+    // BEFORE the first post-anchor block is pumped, so every post-anchor block is
+    // booked as it is pumped instead of DEFERRED behind a cursor at 0. A resumed
+    // store (#1767 restart, any cursor/event) is left exactly as recovered.
+    if (p2p_first && native && native->node()) {
+        // The index's anchor row: the f2 anchor on a fresh boot, the snapshot's
+        // base row after a snapshot resume (the seed basis either way: nothing at
+        // or below it is bookable in this process).
+        const std::uint64_t ha = native->node()->index().anchor_height();
+        const auto bo = native->node()->boot_origin();   // COLD-BOOT-3: print the two separately
+        const std::string origin = bo.resumed
+            ? "f2 anchor H_a=" + std::to_string(bo.boot_anchor_height) + ", snapshot resume base=" + std::to_string(bo.base) +
+              " tip=" + std::to_string(bo.tip)
+            : "f2 anchor H_a=" + std::to_string(bo.boot_anchor_height) + " (no snapshot resume)";
+        if (ha > cfg.d_conf) {
+            const bool seeded = node.seed_fresh_cursor(ha - cfg.d_conf);
+            std::printf("cold-boot: %s; index base %llu -> finalize cursor %s\n", origin.c_str(), static_cast<unsigned long long>(ha),
+                        seeded ? ("SEEDED at " + std::to_string(ha - cfg.d_conf) + " (fresh store)").c_str()
+                               : ("kept at " + std::to_string(node.finalize_driver().cursor_height()) + " (resumed store)").c_str());
+        }
+    }
 
     // ── wire 4: finalize connect (main thread) — BEFORE the listener and BEFORE
     //    the first pump_poll, so a pending FOUND from the sidecar is re-driven
@@ -1582,6 +1619,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         },
         o2::CbaBlockSourceOptions{g_cba_monerod_compare, g_cba_monerod_fallback},
         [](const std::string& line) { std::printf("%s\n", line.c_str()); std::fflush(stdout); });
+    // COLD-BOOT (2): the safety net. A body the index connected but evicted before
+    // it was booked is fetched again over levin (bounded), never read from monerod.
+    if (cba_src.native_mode() && chain_src.want_body && g_cba_refetch_bound)
+        cba_src.set_refetch([&chain_src](const std::string& bid) { (void)chain_src.want_body(bid); }, g_cba_refetch_bound);
+    std::printf("cba: booking body refetch (levin) %s\n",
+                cba_src.refetch_armed() ? ("ARMED, bound " + std::to_string(g_cba_refetch_bound) + " requests/block").c_str() : "off");
     std::printf("cba: booking block source = %s (monerod compare oracle %s, monerod fallback %s)\n",
                 cba_src.native_mode() ? "NATIVE chain index (no get_block)" : "monerod get_block",
                 g_cba_monerod_compare ? "ON" : "off", g_cba_monerod_fallback ? "ON" : "off");
@@ -2545,6 +2588,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // Tip-feed bookkeeping, main-thread-owned: what the native chain told
         // us, and what we did with it.
         std::uint64_t tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, tip_best = 0;
+        std::size_t   pumped_last = 0;   // COLD-BOOT-2: events drained on the last pump (catch-up fast poll)
 
         // ── GAP-2: the real sharechain relay (replaces --credit-feed / --wire-*) ──
         std::function<void(const strat::AcceptedShare&)> relay_on_share;
@@ -3115,13 +3159,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return 2;
             }
             hooks.p2p_relay = native->node()->block_relay();
+            hooks.catching_up = [&]() { return pumped_last > 0 || (chain_src.catchup_held && chain_src.catchup_held()); };   // COLD-BOOT-2
 
             // THE TIP, from the chain we verified ourselves. Drained here, on
             // the main thread, at exactly the point in the loop where
             // pump_poll() used to issue get_miner_data -- one substitution, in
             // one place, so the RPC that is gone is gone by construction.
             hooks.pump_tip = [&]() {
-                for (const auto& ev : chain_src.drain()) {
+                // COLD-BOOT-2: the settlement's booked frontier paces the catch-up
+                // download (the index hands out at most frontier + window above it).
+                if (chain_src.set_booking_frontier) chain_src.set_booking_frontier(node.finalize_driver().cursor_height());
+                const auto evs = chain_src.drain();
+                pumped_last = evs.size();
+                for (const auto& ev : evs) {
                     using K = node::MainchainEventKind;
                     if (ev.kind == K::Orphan) ++tip_orphans;
                     else {
@@ -3130,6 +3180,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     }
                     node.pump_mainchain_event(ev);
                 }
+                if (chain_src.set_booking_frontier) chain_src.set_booking_frontier(node.finalize_driver().cursor_height());
                 // ★ DROPS: THE EX-ANTE CLOCK, from the SAME native tip, in the same
                 // place -- never the burial frontier, never a monerod poll.
                 if (drops_live && tip_best) { drops->observe_native_tip(tip_best); drops_try_enrol(); }
@@ -3229,6 +3280,36 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cs.rpc_calls, (unsigned long long)cs.rpc_failed,
                             (unsigned long long)cs.compare_equal, (unsigned long long)cs.compare_mismatch, (unsigned long long)cs.compare_unavailable,
                             (unsigned long long)cs.fallback_used);
+                if (cba_src.refetch_armed()) {   // COLD-BOOT: evicted-body refetch (levin)
+                    std::uint64_t ia = 0, ir = 0; std::size_t io = 0;
+                    if (p2p_first && native && native->node()) {
+                        const auto bs = native->node()->index().booking_refetch_stats();
+                        ia = bs.asked; ir = bs.restored; io = bs.outstanding;
+                    }
+                    std::printf("  cba-refetch: requested=%llu restored_booked=%llu exhausted=%llu | index asked=%llu restored=%llu outstanding=%zu\n",
+                                (unsigned long long)cs.refetch_requested, (unsigned long long)cs.refetch_restored,
+                                (unsigned long long)cs.refetch_exhausted, (unsigned long long)ia, (unsigned long long)ir, io);
+                }
+                if (p2p_first && native && native->node()) {   // COLD-BOOT-2: pacing, snapshot, restart evidence
+                    auto* nn = native->node();
+                    const auto ss = nn->snapshot_stats();
+                    const auto t = nn->index().tip();
+                    const auto qs = nn->chain_event_queue_stats();   // COLD-BOOT-3
+                    const std::string lifted = nn->index().consumer_pacing_lifted_why();
+                    std::printf("  cold-boot-3: pacing %s | event queue dropped=%llu redriven=%llu unrecoverable=%llu high_water=%zu backpressure_engaged=%llu\n",
+                                lifted.empty() ? (nn->index().consumer_ceiling() ? "ACTIVE" : "off") : ("LIFTED (" + lifted + ")").c_str(),
+                                (unsigned long long)qs.dropped, (unsigned long long)qs.redriven, (unsigned long long)qs.unrecoverable,
+                                qs.high_water, (unsigned long long)qs.backpressure_engaged);
+                    std::printf("  cold-boot-2: cursor=%llu owed_digest=%s scan=%llu native_tip=%llu catchup_ceiling=%llu held=%d | snapshot ok=%llu FAILED=%llu%s%s | "
+                                "native_unknown=%llu replayed_below_boot_cursor=%llu late_unbooked=%llu\n",
+                                (unsigned long long)node.finalize_driver().cursor_height(),
+                                hex_of(node.ledger().owed_digest()).substr(0, 16).c_str(), (unsigned long long)node.scan_height(),
+                                (unsigned long long)(t ? t->height : 0), (unsigned long long)nn->index().consumer_ceiling(),
+                                nn->index().consumer_held() ? 1 : 0, (unsigned long long)ss.ok, (unsigned long long)ss.failed,
+                                ss.failed ? " last=" : "", ss.failed ? ss.last_failure.c_str() : "",
+                                (unsigned long long)node.gap_stats().native_unknown,
+                                (unsigned long long)fc.stats().replayed_below_boot_cursor, (unsigned long long)fc.stats().late_unbooked);
+                }
             }
             if (!last_shape.empty())
                 std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
@@ -3573,6 +3654,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-book-deferral")        g_no_book_deferral = true;
         else if (a == "--cba-monerod-compare")     g_cba_monerod_compare = true;
         else if (a == "--cba-monerod-fallback")    g_cba_monerod_fallback = true;
+        else if (a == "--cba-refetch-bound")      g_cba_refetch_bound = std::stoull(next("120"));
         else if (a == "--relay-feed-monerod-compare") g_relay_feed_monerod_compare = true;
         // GAP-2 relay knobs
         else if (a == "--relay-listen")             g_relay_listen = next("");
@@ -3706,6 +3788,9 @@ int main(int argc, char** argv) {
                 "                               (pre-R6; a lagging receiver then FORKS owed_digest)\n"
                 "  --cba-monerod-compare        p2p-first: ALSO fetch each booked block from monerod and\n"
                 "                               count equal/mismatch (compare-only oracle; never decides)\n"
+                "  --cba-refetch-bound <n>      p2p-first: a booking whose body the native index evicted asks the\n"
+                "                               node to refetch it over levin, up to <n> requests per block\n"
+                "                               (default 120; 0 = off: the block HOLDS as before)\n"
                 "  --cba-monerod-fallback       p2p-first: a block the native index no longer holds is read\n"
                 "                               from monerod instead of HELD (explicit opt-in; default HOLD)\n"
                 "  --relay-feed-monerod-compare p2p-first: ALSO fetch the relay chain-view window from monerod\n"
@@ -3822,6 +3907,10 @@ int main(int argc, char** argv) {
                 "                               boot. Default: no persistence.\n"
                 "  --native-snapshot-every <s>  periodic save cadence (default 300; 0 = only on a\n"
                 "                               clean stop)\n"
+                "  --native-catchup-window <n>  p2p-first anchor boot: download the catch-up gap at most <n>\n"
+                "                               heights above the settlement's finalize cursor, so the gap is\n"
+                "                               booked as it downloads (default 256; 0 = off: the whole gap is\n"
+                "                               downloaded first and rows past the 2048 retention are lost)\n"
                 "  --native-force-synced        set the publication gate on a private chain (OR-C2-8)\n"
                 "  --native-solo                FULLY SELF-CONTAINED (regtest only): no peers, no\n"
                 "                               daemon, no anchor. The chain starts at the locally\n"

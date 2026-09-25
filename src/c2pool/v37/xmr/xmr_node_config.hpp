@@ -352,6 +352,13 @@ struct XmrNodeConfig {
     std::string     native_snapshot_path;
     // Seconds between periodic saves. 0 = only on a clean stop.
     std::uint64_t   native_snapshot_every_s = 300;
+    // COLD-BOOT-2: the native node downloads the catch-up gap at most this many
+    // heights above the settlement's booked frontier (its finalize cursor), so
+    // the gap is booked while it downloads, in bounded chain-ordered batches,
+    // and no unbooked block leaves the index's row retention (2048) or body
+    // cache (1024) first. p2p-first anchor boots only. 0 = off (pre-fix shape:
+    // the whole gap is downloaded before the settlement books any of it).
+    std::uint64_t   native_catchup_window = 256;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
     // production posture; OFF is what makes "the template path made no daemon
     // call" falsifiable rather than merely asserted.
@@ -631,6 +638,7 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
         return 2;
     }
     if (a == "--native-snapshot-every")  return need(c.native_snapshot_every_s);
+    if (a == "--native-catchup-window")  return need(c.native_catchup_window);   // COLD-BOOT-2
     if (a == "--native-backlog-refresh" || a == "--backlog-refresh")
         return need(c.native_backlog_refresh_s);
     if (a == "--anchor-confirm-peers") {
