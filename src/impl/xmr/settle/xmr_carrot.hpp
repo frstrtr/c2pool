@@ -214,7 +214,10 @@ inline const char* to_string(CarrotError e) {
 //                   randomness" || input_context || K_s || K_v || u32le(nonce))
 //        with nonce incremented until the result is non-zero.
 //     3. d_e   = ScalarDerive( tr(DS_SENDING_KEY_NORMAL, anchor_norm[16],
-//                                 input_context[33], K_s[32], pid[8] = 0) )
+//                                 input_context[33], K_s[32], K_v[32],
+//                                 pid[8] = 0) )
+//                (K_v IS in the transcript: carrot_core enote_utils.cpp
+//                make_carrot_enote_ephemeral_privkey, fcmp++-stage)
 //                (unkeyed; the payment id MUST be null for a coinbase)
 //     4. D_e   = d_e * B    (X25519, unclamped; 32-byte x-coordinate; carried in
 //                tx_extra as a 32-byte pubkey). The subaddress form
