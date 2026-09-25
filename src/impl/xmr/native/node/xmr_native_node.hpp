@@ -228,6 +228,15 @@ struct NativeNodeConfig {
     // COLD-BOOT-2: ChainIndexOptions::consumer_window (the catch-up download is
     // paced by the settlement's booked frontier). 0 = off.
     std::uint64_t            consumer_window = 0;
+    // COLD-BOOT-3: the mainchain-event queue the pool daemon drains
+    // (drain_mainchain_events). `chain_event_cap` is its hard bound; with
+    // `chain_event_backpressure` (set by a consumer that drains it: the p2p-first
+    // pool daemon) the bulk download waits while the queue holds cap / 2 or more
+    // undrained events, so a catch-up burst cannot reach the cap. If it is
+    // reached anyway (pushes, reorgs), the overflow is an ALARM, counted, and the
+    // dropped heights are re-driven from the index's rows on the next drain.
+    std::size_t              chain_event_cap = 8192;
+    bool                     chain_event_backpressure = false;
 
     // A build without librandomx cannot check proof of work: the gate answers
     // Skipped, and the index connects blocks it never verified. That is a
@@ -470,6 +479,11 @@ public:
         // after releasing its own lock), which is what makes the native
         // observation the oracle takes later safe to read.
         index_.subscribe([this](const node::MainchainEvent& ev) { on_mainchain_(ev); });
+        // COLD-BOOT-3: backpressure from the consumer's event queue onto the bulk
+        // download (never onto the verify thread: nothing blocks, the index just
+        // hands out no more chain-entry blocks until the queue drains).
+        if (cfg_.chain_event_backpressure)
+            index_.set_download_hold([this] { return chain_events_backpressured(); });
 
         // The txpool's INPUT-consensus step resolves rings and rejects on-chain
         // double-spends against `outputs_`. Wire it before the block stream can
@@ -1236,10 +1250,63 @@ public:
     // The C5 relay's PREFER-OWN submit_to_own_index feeds this same queue for
     // our OWN found block: we do not wait to hear our block back from a peer.
     std::vector<node::MainchainEvent> drain_mainchain_events() {
-        std::lock_guard<std::mutex> lk(rec_mu_);
         std::vector<node::MainchainEvent> out;
-        out.swap(chain_events_);
-        return out;
+        std::uint64_t lo = 0, hi = 0;
+        bool redrive = false;
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            out.swap(chain_events_);
+            chain_events_n_.store(0, std::memory_order_relaxed);
+            if (ev_overflow_pending_) {
+                redrive = true; lo = ev_overflow_lo_; hi = ev_overflow_hi_;
+                ev_overflow_pending_ = false; ev_overflow_lo_ = ev_overflow_hi_ = 0;
+            }
+        }
+        if (!redrive) return out;
+        // COLD-BOOT-3: the queue overflowed since the last drain. The dropped
+        // events' heights are re-driven from the index's CURRENT best chain (the
+        // index lock only; rec_mu_ is not held), as Extend events ahead of the
+        // retained ones, in ascending height. A height the index no longer
+        // retains cannot be re-driven: it is counted and alarmed (the consumer's
+        // tri-state canonical test then HOLDS it as Unknown -- never a drop).
+        std::vector<node::MainchainEvent> re;
+        std::uint64_t lost = 0;
+        for (std::uint64_t h = lo; h <= hi; ++h) {
+            const auto b = index_.by_height(h);
+            if (!b) { ++lost; continue; }
+            node::MainchainEvent ev;
+            ev.kind  = node::MainchainEventKind::Extend;
+            ev.block = *b;
+            re.push_back(ev);
+        }
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            ev_redriven_ += re.size();
+            ev_unrecoverable_ += lost;
+        }
+        std::fprintf(stderr, "[native] ALARM chain-event queue overflow: heights [%llu, %llu] re-driven from the index "
+                             "(%zu events, %llu no longer retained -> HELD by the consumer as Unknown)\n",
+                     (unsigned long long)lo, (unsigned long long)hi, re.size(), (unsigned long long)lost);
+        std::fflush(stderr);
+        re.insert(re.end(), std::make_move_iterator(out.begin()), std::make_move_iterator(out.end()));
+        return re;
+    }
+
+    // COLD-BOOT-3: the event queue's overflow evidence. `dropped` events left the
+    // queue at the hard cap (each one ALARMED, never silent); `redriven` of their
+    // heights were delivered again from the index, `unrecoverable` were not.
+    struct ChainEventQueueStats {
+        std::uint64_t dropped = 0, redriven = 0, unrecoverable = 0, backpressure_engaged = 0;
+        std::size_t   high_water = 0;
+    };
+    ChainEventQueueStats chain_event_queue_stats() const {
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        return ChainEventQueueStats{ev_dropped_, ev_redriven_, ev_unrecoverable_, ev_bp_engaged_, ev_high_water_};
+    }
+    // True while the queue holds cap / 2 or more undrained events.
+    bool chain_events_backpressured() const noexcept {
+        const std::size_t cap = cfg_.chain_event_cap ? cfg_.chain_event_cap : 8192;
+        return chain_events_n_.load(std::memory_order_relaxed) >= cap / 2;
     }
 
     // How many events the feed has produced since start, whether or not anyone
@@ -1255,6 +1322,20 @@ public:
     std::uint64_t mainchain_events_seen() const {
         std::lock_guard<std::mutex> lk(rec_mu_);
         return chain_events_seen_;
+    }
+
+    // COLD-BOOT-3: what this process booted from, for the operator's cold-boot
+    // line. `boot_anchor_height` is the anchor bundle gate 4 confirmed (0 on a
+    // genesis boot) -- NOT index().anchor_height(), which after a snapshot
+    // resume is the snapshot's base row. `resumed` is set when a snapshot was
+    // installed; `base` / `tip` are the resumed index's base row and tip.
+    struct BootOrigin { std::uint64_t boot_anchor_height = 0; bool resumed = false; std::uint64_t base = 0, tip = 0; };
+    BootOrigin boot_origin() const {
+        BootOrigin o;
+        o.boot_anchor_height = cfg_.boot == BootMode::Anchor ? snapshot_key_().anchor_height : 0;
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        o.resumed = resumed_; o.base = resumed_base_; o.tip = resumed_tip_;
+        return o;
     }
 
     // C5, for the consumer that actually found a block. Null before start().
@@ -1500,10 +1581,29 @@ private:
             std::lock_guard<std::mutex> lk(rec_mu_);
             ++chain_events_seen_;
             chain_events_.push_back(ev);
+            const std::size_t cap = cfg_.chain_event_cap ? cfg_.chain_event_cap : 8192;
+            if (chain_events_.size() == cap / 2) ++ev_bp_engaged_;
             // Bounded like tips_. A consumer that stopped draining is a bug, and
             // dropping the OLDEST is the right failure: the newest events are
             // the ones a finalize cursor still needs.
-            if (chain_events_.size() > 8192) chain_events_.erase(chain_events_.begin());
+            // COLD-BOOT-3: but never SILENTLY. Each drop is counted and alarmed,
+            // and its height is re-driven from the index on the next drain.
+            if (chain_events_.size() > cap) {
+                const node::MainchainEvent& old = chain_events_.front();
+                const std::uint64_t h = old.block.height;
+                if (!ev_overflow_pending_) { ev_overflow_pending_ = true; ev_overflow_lo_ = ev_overflow_hi_ = h; }
+                else { if (h < ev_overflow_lo_) ev_overflow_lo_ = h; if (h > ev_overflow_hi_) ev_overflow_hi_ = h; }
+                if (ev_dropped_++ % 1024 == 0) {
+                    std::fprintf(stderr, "[native] ALARM chain-event queue full (%zu undrained): the oldest event (h=%llu) "
+                                         "leaves the queue -- dropped so far %llu; its height is re-driven from the index "
+                                         "on the next drain\n",
+                                 chain_events_.size(), (unsigned long long)h, (unsigned long long)ev_dropped_);
+                    std::fflush(stderr);
+                }
+                chain_events_.erase(chain_events_.begin());
+            }
+            if (chain_events_.size() > ev_high_water_) ev_high_water_ = chain_events_.size();
+            chain_events_n_.store(chain_events_.size(), std::memory_order_relaxed);
         }
         if (ev.kind == node::MainchainEventKind::Orphan) return;
         TipRecord r;
@@ -1726,6 +1826,7 @@ private:
             outputs_.disable_resolution();
         });
         const SyncState st = index_.sync_state();
+        note_resumed_(st.header_frontier);   // COLD-BOOT-3
         note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
             + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
             + " bytes); no re-IBD from the anchor -- ring resolution disabled "
@@ -1896,6 +1997,7 @@ private:
             return;
         }
         const SyncState st = index_.sync_state();
+        note_resumed_(st.header_frontier);   // COLD-BOOT-3
         note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
             + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
             + " bytes) + output-set overlay (" + std::to_string(outputs_.overlay_block_count())
@@ -1908,6 +2010,12 @@ private:
         std::lock_guard<std::mutex> lk(rec_mu_);
         log_.push_back(line);
         if (log_.size() > 4096) log_.erase(log_.begin());
+    }
+
+    void note_resumed_(std::uint64_t tip) {
+        const std::uint64_t base = index_.anchor_height();   // the resumed view's base row
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        resumed_ = true; resumed_base_ = base; resumed_tip_ = tip;
     }
 
     // COLD-BOOT-2 (D4a): a snapshot save is reported where the operator reads,
@@ -2004,6 +2112,15 @@ private:
     std::vector<node::MainchainEvent> chain_events_;
     std::uint64_t                     chain_events_seen_ = 0;
     std::uint64_t                     snap_ok_ = 0, snap_failed_ = 0;   // COLD-BOOT-2: snapshot saves (rec_mu_)
+    // COLD-BOOT-3: event-queue overflow / backpressure evidence (rec_mu_; the
+    // atomic mirrors the queue size for the index's download hold).
+    std::atomic<std::size_t>          chain_events_n_{0};
+    bool                              resumed_ = false;                 // COLD-BOOT-3: boot origin (rec_mu_)
+    std::uint64_t                     resumed_base_ = 0, resumed_tip_ = 0;
+    std::uint64_t                     ev_dropped_ = 0, ev_redriven_ = 0, ev_unrecoverable_ = 0, ev_bp_engaged_ = 0;
+    std::size_t                       ev_high_water_ = 0;
+    bool                              ev_overflow_pending_ = false;
+    std::uint64_t                     ev_overflow_lo_ = 0, ev_overflow_hi_ = 0;
     std::string                       snap_last_fail_;
 };
 

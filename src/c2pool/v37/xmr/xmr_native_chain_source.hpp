@@ -213,7 +213,7 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
     };
 
     src.set_booking_frontier = [n](std::uint64_t h) { n->index().set_consumer_frontier(h); };
-    src.catchup_held = [n] { return n->index().consumer_held(); };
+    src.catchup_held = [n] { return n->index().consumer_held() || n->chain_events_backpressured(); };   // COLD-BOOT-3: + queue backpressure
 
     src.tip_block = [n]() -> std::optional<std::pair<std::uint64_t, ::c2pool::xmr::node::Hash>> {
         const auto t = n->index().tip();

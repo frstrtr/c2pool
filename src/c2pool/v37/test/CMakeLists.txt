@@ -345,6 +345,38 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_coldboot_gap_kat PRIVATE xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_coldboot_gap_kat COMMAND v37_xmr_coldboot_gap_kat)
     set_tests_properties(v37_xmr_coldboot_gap_kat PROPERTIES TIMEOUT 900)
+    # v37_xmr_coldboot_follow_kat (COLD-BOOT-3): the catch-up pacing is a
+    # catch-up device, never a standing limit -- a HELD finalize cursor (an
+    # undecidable block) with the tip > 2 x window past it keeps FOLLOWING the
+    # chain after a snapshot restart and on a fresh boot (pacing lifted: synced
+    # latch / resume latch / stall bound), the cursor stays held, 0 late, 0
+    # undecided; an unheld cold boot is still paced. Builds on the pre-fix tree
+    # and FAILS there. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_coldboot_follow_kat v37_xmr_coldboot_follow_kat.cpp)
+    target_compile_features(v37_xmr_coldboot_follow_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_coldboot_follow_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_coldboot_follow_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_coldboot_follow_kat COMMAND v37_xmr_coldboot_follow_kat)
+    set_tests_properties(v37_xmr_coldboot_follow_kat PROPERTIES TIMEOUT 900)
+    # v37_xmr_coldboot_evq_kat (COLD-BOOT-3): the REAL NativeNode's mainchain-event
+    # queue never drops silently -- a 9000-block download burst is back-pressured
+    # below the 8192 cap (0 dropped, sequence identical to a no-burst reference);
+    # a push burst past the cap is alarmed, counted and re-driven from the index
+    # (dropped == redriven + unrecoverable). Builds on the pre-fix tree and FAILS
+    # there. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_coldboot_evq_kat v37_xmr_coldboot_evq_kat.cpp)
+    target_compile_features(v37_xmr_coldboot_evq_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_coldboot_evq_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_coldboot_evq_kat PRIVATE xmr_node xmr_native_txpool xmr_coin Threads::Threads)
+    if (TARGET Boost::headers)
+        target_link_libraries(v37_xmr_coldboot_evq_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(v37_xmr_coldboot_evq_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(v37_xmr_coldboot_evq_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME v37_xmr_coldboot_evq_kat COMMAND v37_xmr_coldboot_evq_kat)
+    set_tests_properties(v37_xmr_coldboot_evq_kat PROPERTIES TIMEOUT 900)
     # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
     # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
     # (R4 gate kept, repair continues), never refused on a retry count; two nodes

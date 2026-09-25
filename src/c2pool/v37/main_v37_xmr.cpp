@@ -1389,10 +1389,18 @@ static int run_live(const XmrNodeConfig& cfg) {
     // booked as it is pumped instead of DEFERRED behind a cursor at 0. A resumed
     // store (#1767 restart, any cursor/event) is left exactly as recovered.
     if (p2p_first && native && native->node()) {
+        // The index's anchor row: the f2 anchor on a fresh boot, the snapshot's
+        // base row after a snapshot resume (the seed basis either way: nothing at
+        // or below it is bookable in this process).
         const std::uint64_t ha = native->node()->index().anchor_height();
+        const auto bo = native->node()->boot_origin();   // COLD-BOOT-3: print the two separately
+        const std::string origin = bo.resumed
+            ? "f2 anchor H_a=" + std::to_string(bo.boot_anchor_height) + ", snapshot resume base=" + std::to_string(bo.base) +
+              " tip=" + std::to_string(bo.tip)
+            : "f2 anchor H_a=" + std::to_string(bo.boot_anchor_height) + " (no snapshot resume)";
         if (ha > cfg.d_conf) {
             const bool seeded = node.seed_fresh_cursor(ha - cfg.d_conf);
-            std::printf("cold-boot: anchor H_a=%llu -> finalize cursor %s\n", static_cast<unsigned long long>(ha),
+            std::printf("cold-boot: %s; index base %llu -> finalize cursor %s\n", origin.c_str(), static_cast<unsigned long long>(ha),
                         seeded ? ("SEEDED at " + std::to_string(ha - cfg.d_conf) + " (fresh store)").c_str()
                                : ("kept at " + std::to_string(node.finalize_driver().cursor_height()) + " (resumed store)").c_str());
         }
@@ -3215,6 +3223,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                     auto* nn = native->node();
                     const auto ss = nn->snapshot_stats();
                     const auto t = nn->index().tip();
+                    const auto qs = nn->chain_event_queue_stats();   // COLD-BOOT-3
+                    const std::string lifted = nn->index().consumer_pacing_lifted_why();
+                    std::printf("  cold-boot-3: pacing %s | event queue dropped=%llu redriven=%llu unrecoverable=%llu high_water=%zu backpressure_engaged=%llu\n",
+                                lifted.empty() ? (nn->index().consumer_ceiling() ? "ACTIVE" : "off") : ("LIFTED (" + lifted + ")").c_str(),
+                                (unsigned long long)qs.dropped, (unsigned long long)qs.redriven, (unsigned long long)qs.unrecoverable,
+                                qs.high_water, (unsigned long long)qs.backpressure_engaged);
                     std::printf("  cold-boot-2: cursor=%llu owed_digest=%s scan=%llu native_tip=%llu catchup_ceiling=%llu held=%d | snapshot ok=%llu FAILED=%llu%s%s | "
                                 "native_unknown=%llu replayed_below_boot_cursor=%llu late_unbooked=%llu\n",
                                 (unsigned long long)node.finalize_driver().cursor_height(),

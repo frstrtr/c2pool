@@ -111,6 +111,17 @@ struct ChainIndexOptions {
     // the row retention / entry cache first. 0 = off (the index downloads as
     // far as its fetch window allows, the pre-COLD-BOOT-2 shape).
     std::uint64_t consumer_window = 0;
+    // COLD-BOOT-3: the pacing ceiling is a CATCH-UP device, never a standing
+    // limit. It is lifted for the rest of the process (loudly) the first time
+    // the index is synced, when a snapshot resume is already past it (the
+    // previous process followed the chain past a held cursor), or when the
+    // consumer's frontier has not moved for this many consecutive reports while
+    // the download is held at the ceiling (a HELD cursor: an undecidable block,
+    // a relay repair no peer can serve). Lifted, the index follows the chain as
+    // before COLD-BOOT-2; a block whose row then leaves the retention unbooked
+    // is HELD by the consumer's tri-state canonical test (Unknown), never
+    // dropped. 0 = no stall bound (the synced / resume latches still apply).
+    std::uint64_t consumer_stall_reports = 1200;
     TieBreak      tie            = TieBreak::PreferOwn;   // D-14
     VerificationLevel level        = VerificationLevel::L4PrunedAuthenticated;
     // Fail-closed: a block whose PoW we could not check does not join the best
@@ -783,6 +794,10 @@ public:
         std::uint64_t limit = rows_.tip_height() + fetch_window_();
         // COLD-BOOT-2: never download past the consumer's booked frontier + window.
         if (const std::uint64_t ceil = consumer_ceiling_locked_(); ceil != 0 && ceil < limit) limit = ceil;
+        // COLD-BOOT-3: the consumer's mainchain-event queue is full enough that
+        // more bulk download would overflow it -- hand out nothing above the tip
+        // until it drains (backpressure without blocking the verify thread).
+        if (download_hold_ && download_hold_()) limit = rows_.tip_height();
         for (std::size_t k = 0; k < wanted_.size(); ++k) {
             if (wanted_heights_[k] > limit) break;
             if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
@@ -891,8 +906,37 @@ public:
     // unchanged.
     void set_consumer_frontier(std::uint64_t h) {
         std::lock_guard<std::mutex> lk(mu_);
+        const bool first = !consumer_frontier_set_;
+        // COLD-BOOT-3 (stall latch): a frontier that does not move while the
+        // download is held at the ceiling is a HELD cursor, not a slow booking.
+        if (!first && h == consumer_frontier_ && consumer_held_locked_()) ++consumer_stall_n_;
+        else consumer_stall_n_ = 0;
         consumer_frontier_ = h;
         consumer_frontier_set_ = true;
+        if (pacing_lifted_ || opts_.consumer_window == 0) return;
+        // (resume latch) the snapshot this process resumed from is already past
+        // the ceiling: the previous process followed the chain past a held
+        // cursor. Pacing it again would freeze the node below its own snapshot.
+        if (first && resumed_tip_ != 0 && resumed_tip_ > h + opts_.consumer_window) {
+            lift_pacing_locked_("snapshot resume at " + std::to_string(resumed_tip_) + " is already past the ceiling " +
+                                std::to_string(h + opts_.consumer_window) + " (frontier " + std::to_string(h) + ")");
+            return;
+        }
+        if (opts_.consumer_stall_reports && consumer_stall_n_ >= opts_.consumer_stall_reports)
+            lift_pacing_locked_("the consumer frontier is HELD at " + std::to_string(h) + " (" + std::to_string(consumer_stall_n_) +
+                                " reports without progress while the download waited at the ceiling " +
+                                std::to_string(h + opts_.consumer_window) + ")");
+    }
+    // COLD-BOOT-3: the catch-up pacing was lifted for the rest of this process
+    // (why; empty = still pacing, or pacing off). Once lifted it never re-arms.
+    bool consumer_pacing_lifted() const { std::lock_guard<std::mutex> lk(mu_); return pacing_lifted_; }
+    std::string consumer_pacing_lifted_why() const { std::lock_guard<std::mutex> lk(mu_); return pacing_lifted_why_; }
+    // COLD-BOOT-3: the consumer's event queue asks the bulk download to wait
+    // (refetch_wanted hands out nothing above the tip while this answers true).
+    // Called under the index lock: it must not take the index lock itself.
+    void set_download_hold(std::function<bool()> fn) {
+        std::lock_guard<std::mutex> lk(mu_);
+        download_hold_ = std::move(fn);
     }
     std::uint64_t consumer_ceiling() const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -902,8 +946,7 @@ public:
     // the index is not yet synced): the consumer must book before more arrives.
     bool consumer_held() const {
         std::lock_guard<std::mutex> lk(mu_);
-        const std::uint64_t ceil = consumer_ceiling_locked_();
-        return ceil != 0 && !synced_ && !rows_.empty() && rows_.tip_height() >= ceil;
+        return consumer_held_locked_();
     }
 
     // The state view, for consumers that need the consensus numbers themselves
@@ -2220,7 +2263,11 @@ private:
     }
 
     void update_synced_locked_() {
-        if (forced_synced_) { synced_ = true; view_.set_synced(true); return; }
+        if (forced_synced_) {
+            synced_ = true; view_.set_synced(true);
+            if (opts_.consumer_window && !pacing_lifted_) lift_pacing_locked_("synced (forced)");
+            return;
+        }
         const std::uint64_t cohort = cohort_height_locked_();
         const std::uint64_t frontier = view_.verified_frontier();
         // OR-C2-8: publish only when the verified frontier has reached the
@@ -2228,6 +2275,10 @@ private:
         // and claiming it would be the fail-open answer.
         synced_ = cohort > 0 && frontier + 1 >= cohort;
         view_.set_synced(synced_);
+        // COLD-BOOT-3 (synced latch): the catch-up is over for this process; a
+        // later missed-push gap is followed at full speed, never re-paced.
+        if (synced_ && opts_.consumer_window && !pacing_lifted_)
+            lift_pacing_locked_("synced at " + std::to_string(frontier) + " (the initial catch-up is over)");
         view_.set_cohort_height(cohort);
     }
 
@@ -2288,9 +2339,20 @@ private:
         return h && *h + pin > rows_.tip_height();
     }
 
+    bool consumer_held_locked_() const {
+        const std::uint64_t ceil = consumer_ceiling_locked_();
+        return ceil != 0 && !synced_ && !rows_.empty() && rows_.tip_height() >= ceil;
+    }
+    void lift_pacing_locked_(const std::string& why) {
+        if (pacing_lifted_) return;
+        pacing_lifted_ = true;
+        pacing_lifted_why_ = why;
+    }
+
     // COLD-BOOT-2: frontier + window, or 0 when pacing is off.
+    // COLD-BOOT-3: and 0 once the pacing was lifted for this process.
     std::uint64_t consumer_ceiling_locked_() const {
-        if (opts_.consumer_window == 0) return 0;
+        if (opts_.consumer_window == 0 || pacing_lifted_) return 0;
         const std::uint64_t base = consumer_frontier_set_ ? consumer_frontier_ : view_.anchor_height();
         return base + opts_.consumer_window;
     }
@@ -2775,6 +2837,8 @@ private:
             push_long_mirror_(co.row.long_term_weight);
             cache_entry_locked_(co.row.id, a.entry, ev.input.parsed.tx_hashes);
         }
+        // COLD-BOOT-3: where this process resumed (the resume latch of the pacing).
+        resumed_tip_ = rows_.tip_height();
         // A resume is not a re-verification: the events it would raise describe a
         // chain the consumers already saw before the restart.
         queued_events_.clear();
@@ -2856,6 +2920,11 @@ private:
     std::uint64_t     booking_bodies_restored_ = 0;
     std::uint64_t     consumer_frontier_       = 0;       // COLD-BOOT-2: the consumer's booked frontier
     bool              consumer_frontier_set_   = false;   // COLD-BOOT-2: false = the anchor until the first report
+    std::uint64_t     consumer_stall_n_        = 0;       // COLD-BOOT-3: reports held at the ceiling without progress
+    std::uint64_t     resumed_tip_             = 0;       // COLD-BOOT-3: tip a snapshot resume installed (0 = none)
+    bool              pacing_lifted_           = false;   // COLD-BOOT-3: latched for the process
+    std::string       pacing_lifted_why_;
+    std::function<bool()> download_hold_;                 // COLD-BOOT-3: event-queue backpressure
 
     std::vector<node::MainchainEvent> queued_events_;
     std::vector<BlockTxEvent>         queued_tx_events_;
