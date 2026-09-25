@@ -72,6 +72,15 @@ enum class Disposition {
     REJECT_CHAIN,         // step 3c: chain_id mismatch
     REJECT_EXPIRED,       // step 4: unresolvable / future / older than N_CTX
     REJECT_DEDUP,         // step 5: header.hash already in the window
+    // ★ DROPS T2 — APPENDED, so every value above keeps its number.
+    // A RAINDROP: a work event that meets its OWN, strictly WEAKER target but not
+    // the consensus target for its bin. Reachable ONLY with the sub-threshold
+    // gate ON (set_drop_harvest); with the gate OFF such an event is
+    // REJECT_R1_TARGET exactly as before, so the disposition sequence of a
+    // default node is byte-identical to master. It is NOT an accepted receipt:
+    // it emits NO push, carries NO work into the lane, and advances NO position.
+    // It is admitted FOR MEASUREMENT ONLY, into the DROPS estimator.
+    OK_SUBTARGET_DROP,
 };
 
 enum class CarrierStatus {
@@ -135,6 +144,26 @@ struct EmittedPush {
 // tuple AND forwards to a real engine).
 using RecordSink = std::function<void(const EmittedPush&)>;
 
+// ── ★ DROPS T2: one harvested raindrop ────────────────────────────────────
+// A below-consensus-target work event, admitted for MEASUREMENT ONLY. It never
+// becomes an EmittedPush and never touches the lane; it is a sample handed to
+// the estimator. `payee` is the carrier's identity key (self-carriage: the same
+// key the carrier's own pushes and the OwedLedger use). `interval` is the
+// receipt's ORIGIN bin, which is the F1 monotone bin_height the estimator's
+// per-(payee, interval) dedup is keyed on. `consensus_lz` is the bin's consensus
+// target, from which the estimator's h_T boundary is derived — carried here so
+// the harvester never has to re-resolve the bin.
+struct HarvestedDrop {
+    bytes32  payee{};
+    u64      interval = 0;
+    bytes32  hash{};              // the event's own PoW hash: a near-miss sample
+    unsigned consensus_lz = 0;    // consensus leading-zero target at `interval`
+    unsigned own_lz = 0;          // the (weaker) target it was actually mined at
+};
+
+// Where harvested raindrops go. Default-empty: no sink, no harvest.
+using DropSink = std::function<void(const HarvestedDrop&)>;
+
 // ── the admitter / emitter (spec §3-§4) ────────────────────────────────────
 class ReceiptAdmitter {
 public:
@@ -153,10 +182,26 @@ public:
         m_raw_total = 0;
     }
 
+    // ── ★ DROPS T2: arm the sub-threshold harvest ─────────────────────────
+    // OFF by default. With it OFF this admitter is byte-for-byte the master
+    // admitter: the branch below collapses to the original REJECT_R1_TARGET and
+    // no drop can exist. Arm it ONLY when the lane's SubthresholdGate is ON —
+    // harvesting drops a gated-off settlement will never credit just wastes
+    // memory. `sink` receives every harvested raindrop in wire order.
+    void set_drop_harvest(bool enabled, DropSink sink = {}) {
+        m_drops_enabled = enabled;
+        m_drop_sink = std::move(sink);
+    }
+    bool drop_harvest_enabled() const { return m_drops_enabled; }
+    u64 drops_harvested() const { return m_drops_harvested; }
+
     struct Result {
         CarrierStatus carrier_status = CarrierStatus::OK;
         std::vector<std::pair<std::string, Disposition>> receipts;  // (tag, disp)
         std::vector<EmittedPush> pushes;   // in emission order (also -> sink)
+        // ★ DROPS T2: how many of `receipts` were raindrops. Always 0 with the
+        // harvest off. Drops are NOT in `pushes` — that is the whole point.
+        std::size_t drops = 0;
     };
 
     // Per-receipt stateless validation, in the fixed consensus order (spec §3.1).
@@ -167,8 +212,27 @@ public:
         // 2. R-1 pinning: T_origin == consensus target for bin(receipt). Only
         //    when the bin resolves (an unresolvable bin is caught at step 4).
         std::optional<u64> rb = m_index.height_of(r.prev_block_hash);
-        if (rb.has_value() && r.lz_bits != consensus_lz(*rb))
-            return Disposition::REJECT_R1_TARGET;
+        bool is_drop = false;
+        if (rb.has_value() && r.lz_bits != consensus_lz(*rb)) {
+            // ★ DROPS T2. With the harvest ARMED, an event mined against a
+            // STRICTLY WEAKER target than its bin's consensus target is not a
+            // malformed receipt — it is a raindrop, and refusing it here is
+            // exactly what made the DROPS gate unreachable on a live node. It is
+            // reclassified, and then held to EVERY remaining binding check
+            // below: a drop with a foreign identity, an unchained prev-own, a
+            // wrong chain, an expired bin or a replayed hash is still rejected
+            // on that ground, with the SAME first-failure ordering. Measuring
+            // unbound work would be an invitation to fabricate hashrate.
+            //
+            // An event mined against a STRONGER target stays REJECT_R1_TARGET:
+            // it is out of consensus either way and DROPS has no opinion about
+            // over-strength work.
+            //
+            // HARVEST OFF => this is the original single line, unchanged.
+            if (!(m_drops_enabled && r.lz_bits < consensus_lz(*rb)))
+                return Disposition::REJECT_R1_TARGET;
+            is_drop = true;
+        }
         // 3a. self-carriage: payout identity == the carrier's.
         if (!(r.identity == carrier.identity)) return Disposition::REJECT_IDENTITY;
         // 3b. prev-own-share on the miner's chain (durable tracker, not lane).
@@ -181,7 +245,7 @@ public:
             return Disposition::REJECT_EXPIRED;
         // 5. dedup (the single window dedup).
         if (m_window.contains(r.hash())) return Disposition::REJECT_DEDUP;
-        return Disposition::OK;
+        return is_drop ? Disposition::OK_SUBTARGET_DROP : Disposition::OK;
     }
 
     // Whole-carrier admission (W2 owns steps 4-6 of share-format §8). Emits the
@@ -222,6 +286,30 @@ public:
         for (const WorkEvent& r : receipts) {
             Disposition disp = validate_receipt(r, carrier, *carrier_bin);
             out.receipts.emplace_back(r.tag, disp);
+            if (disp == Disposition::OK_SUBTARGET_DROP) {
+                // ★ DROPS T2 — MEASUREMENT ONLY. No emit(): no push, no w_raw,
+                // no lane position, no raw_total. A raindrop must never inflate
+                // the sharechain; its ONLY effect is on the estimator.
+                //
+                // It IS entered into the dedup window, for the same reason an
+                // accepted receipt is: a replayed carrier must not re-measure
+                // the same raindrop. That is the per-EVENT dedup; the
+                // estimator's own per-(payee, interval) straddle dedup sits
+                // above it, and the two are independent.
+                ++out.drops;
+                ++m_drops_harvested;
+                if (m_drop_sink) {
+                    HarvestedDrop d;
+                    d.payee        = carrier.identity;   // self-carriage
+                    d.interval     = *m_index.height_of(r.prev_block_hash);
+                    d.hash         = r.hash();
+                    d.consensus_lz = consensus_lz(d.interval);
+                    d.own_lz       = r.lz_bits;
+                    m_drop_sink(d);
+                }
+                m_window.add(r.hash(), *carrier_bin);
+                continue;
+            }
             if (disp != Disposition::OK) continue;
             u64 origin_bin = *m_index.height_of(r.prev_block_hash);
             emit(out, sink, carrier.identity, carrier.descriptor, r.work(),
@@ -265,6 +353,10 @@ private:
     u64 m_incarnation;
     u64 m_next_pos = 0;
     ::v37::u128 m_raw_total = 0;
+    // ★ DROPS T2 — node-local, never digested, DEFAULT OFF.
+    bool m_drops_enabled = false;
+    DropSink m_drop_sink{};
+    u64 m_drops_harvested = 0;
 };
 
 } // namespace c2pool::v37n

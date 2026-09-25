@@ -54,6 +54,19 @@ struct FoundBlock {
     Amounts       credit;       // per-key entitlement E_b at b's burial-gated prefix
     Amounts       payout;       // the coinbase outputs broadcast in b (K_fair)
     bool          canonical = true;
+    // ── ★ DROPS T3 (XMR arm) ─────────────────────────────────────────────
+    // Same shape as the BTC-family driver: the lane's gate plus the BURIED
+    // sub-threshold harvest this cut settles. Both default INERT. The XMR lane
+    // can only carry the NO-LaneKind gate (no ratified ridge row — see
+    // v37_node_lane_activation.hpp); that is a fact about the RIDGE, not about
+    // DROPS, whose gate is lane-independent.
+    ::v37::LaneParams                     params{};
+    std::vector<settle::HarvestedReceipt> harvested{};
+    // ★ DROPS-R1 + R-SYBIL: how work becomes coin at this cut, and who is
+    // enrolled. ★ DROPS-R3: the composed delta map to fold as-is.
+    settle::DropsCompose                  drops{};
+    bool                                  has_carried_drops = false;
+    Amounts                               carried_drops{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -169,16 +182,28 @@ public:
     // Register a settlement-carrying block we just found. Write-ahead the FOUND
     // event (durable BEFORE the block is announced, W6 §5.2), enter the merged
     // ledger's pending set, and remember it for maturity. Idempotent per bid.
+    //
+    // ★ DROPS T3 — COMPOSE ONCE, HERE, AND PERSIST THE COMPOSED MAP (same rule
+    // as the BTC-family driver): the FOUND event carries the COMPOSED credit, so
+    // a restart replays it verbatim and no replay path re-derives the estimate
+    // against a harvest the node no longer holds.
     void on_block_found(const FoundBlock& b) {
+        // DROPS T3: the composed credit. Gate OFF (default) => byte for byte
+        // b.credit (compose_credit_* return the base map when the delta is empty).
+        const Amounts credit =
+            b.has_carried_drops
+                ? settle::compose_credit_from_delta(b.credit, b.carried_drops)
+                : settle::compose_credit_replace(b.params, b.credit, b.harvested,
+                                                 b.drops);
         //  fix 2: a record left non-canonical by an ORPHAN may be re-FOUND when the block
         // becomes canonical again (branch flip-flop). The OwedLedger already admits it (the
         // pre-SETTLED orphan was a pure pending removal); only this per-bid idempotency stood in the way.
         if (auto it = m_found.find(b.bid); it != m_found.end()) {
             if (it->second.canonical || m_ledger.is_settled(b.bid) || m_ledger.is_pending(b.bid)) return;
             SettleEvent ev;
-            ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = b.credit; ev.payout = b.payout;
+            ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = credit; ev.payout = b.payout;
             write_event(ev);
-            m_ledger.on_block_found(b.bid, b.credit, b.payout);
+            m_ledger.on_block_found(b.bid, credit, b.payout);
             ledger_event();   // R5
             it->second.credit = b.credit; it->second.payout = b.payout; it->second.canonical = true;
             return;   // m_by_height already lists it
@@ -186,10 +211,10 @@ public:
         SettleEvent ev;
         ev.kind = SettleEvKind::Found;
         ev.bid = b.bid;
-        ev.credit = b.credit;
+        ev.credit = credit;
         ev.payout = b.payout;
         write_event(ev);
-        m_ledger.on_block_found(b.bid, b.credit, b.payout);
+        m_ledger.on_block_found(b.bid, credit, b.payout);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
         ledger_event();   // R5
