@@ -141,6 +141,12 @@ struct PoolTelemetry {
     // back to writing all of them rather than reaching nobody.
     std::uint64_t broadcast_fallbacks = 0;
 
+    // TXPOOL-RESUME: NOTIFY_GET_TXPOOL_COMPLEMENT (2010) requests we sent, and
+    // the 2002 answers (and their txs) that spent the solicited credit.
+    std::uint64_t complement_requests_out = 0;
+    std::uint64_t complement_answers_in   = 0;
+    std::uint64_t complement_txs_in       = 0;
+
     // Links closed because a 2003/2006 went unanswered past
     // NON_RESPONSIVE_PEER_KICK_TIME; their spans are released by the close.
     std::uint64_t request_kicks   = 0;
@@ -190,6 +196,12 @@ public:
         // live-push tool's C5_SRC_IP. On a real network it is the multi-homed /
         // egress-selection control.
         std::string bind_ip;
+
+        // TXPOOL-RESUME: how many peers are asked for their txpool complement
+        // (2010) once the node's relay gate opens -- once per process, pinned
+        // (protected) peers first. monerod asks one; two survive one peer that
+        // does not answer. 0 disables the back-fill.
+        std::size_t complement_peers = 2;
 
         // D-3 back-pressure.
         std::size_t max_spans_per_peer = MAX_SPANS_PER_PEER;
@@ -396,6 +408,23 @@ public:
         return true;
     }
 
+    // TXPOOL-RESUME: the node's relay gate opened, so the pool can now judge
+    // transactions against the synced tip: ask up to cfg_.complement_peers
+    // handshaked peers (pinned first) for every tx we do not hold -- now, and
+    // on each later handshake until the quota is spent. Relayed txs are only
+    // ever pushed ONCE, so without this a node that (re)starts keeps none of
+    // the backlog the network already holds until those txs are mined.
+    // Every peer this pool talks to is one it dialed (outbound), and monerod
+    // routes Dandelion++ stems only over its OWN outbound links, so no stem
+    // can arrive on these links to be mistaken for part of the answer.
+    void arm_txpool_complement() {
+        auto self = shared_from_this();
+        boost::asio::post(ex_, [self]() {
+            self->complement_armed_ = true;
+            self->ask_complements_();
+        });
+    }
+
     void set_fluffy_missing_handler(FluffyMissingHandler h) override {
         std::lock_guard<std::mutex> lk(snap_mu_);
         fluffy_handler_ = std::move(h);
@@ -482,6 +511,7 @@ private:
         std::deque<std::uint64_t>          span_order;
         std::uint64_t                      in_flight_span = kNoSpan;
         bool                               wire_busy = false;
+        bool                               complement_asked = false;   // TXPOOL-RESUME
 
         explicit Peer(const DosConfig& c) : dos(c) {}
     };
@@ -655,6 +685,31 @@ private:
         store_.on_handshaked(key, ref.peer_id, now);
         ++tel_.handshakes;
         publish_snapshot();
+        if (complement_armed_) ask_complements_();
+    }
+
+    // TXPOOL-RESUME (io thread). Pinned peers first, then the rest; each link
+    // is asked at most once, and at most cfg_.complement_peers in total.
+    void ask_complements_() {
+        if (!complement_armed_ || !deps_.txpool) return;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (auto& [k, p] : peers_) {
+                if (complement_asked_ >= cfg_.complement_peers) return;
+                if (!p.handshaked || !p.link || p.complement_asked) continue;
+                if ((pass == 0) != p.is_protected) continue;
+                levinns::GetTxpoolComplement m;
+                m.hashes = deps_.txpool->complement_request_ids();
+                std::vector<std::uint8_t> body;
+                levinns::MessageError err = levinns::MessageError::None;
+                if (!levinns::encode_get_txpool_complement(m, body, err)) return;
+                p.complement_asked = true;
+                ++complement_asked_;
+                p.dos.note_complement_solicited(now_ms());
+                p.link->send_notify(levinns::CMD_GET_TXPOOL_COMPLEMENT, body);
+                std::lock_guard<std::mutex> lk(snap_mu_);
+                ++tel_.complement_requests_out;
+            }
+        }
     }
 
     void on_peer_sync(const std::string& key, const PeerRef& ref, const PeerSyncData& d) {
@@ -714,8 +769,10 @@ private:
 
         DosFault fault = DosFault::None;
         const std::uint64_t credits_before = p->dos.solicited_credits_used();
+        const std::uint64_t complement_before = p->dos.complement_credits_used();
         const DosAction act = p->dos.on_frame(h.command, n, units, now, fault);
         if (p->dos.solicited_credits_used() != credits_before) ++tel_.frames_credited_fluffy;
+        const bool complement = p->dos.complement_credits_used() != complement_before;
         if (act != DosAction::Accept) {
             ++tel_.frames_dropped_dos;
             apply_action(key, act, fault, "inbound budget");
@@ -725,7 +782,7 @@ private:
         switch (h.command) {
             case levinns::CMD_NEW_BLOCK:
             case levinns::CMD_NEW_FLUFFY_BLOCK: handle_new_block(key, ref, h, body, n); return;
-            case levinns::CMD_NEW_TRANSACTIONS: handle_transactions(key, ref, txm);      return;
+            case levinns::CMD_NEW_TRANSACTIONS: handle_transactions(key, ref, txm, complement); return;
             case levinns::CMD_RESPONSE_CHAIN_ENTRY:  handle_chain_entry(key, ref, body, n); return;
             case levinns::CMD_RESPONSE_GET_OBJECTS:  handle_objects(key, ref, body, n);     return;
             case levinns::CMD_REQUEST_CHAIN:         serve_chain(key, body, n);             return;
@@ -782,8 +839,18 @@ private:
     }
 
     void handle_transactions(const std::string& key, const PeerRef& ref,
-                             levinns::NewTransactions& m) {
+                             levinns::NewTransactions& m, bool complement = false) {
         if (Peer* p = find(key)) p->last_relay_ms = now_ms();
+        if (complement) {
+            std::lock_guard<std::mutex> lk(snap_mu_);
+            ++tel_.complement_answers_in;
+            tel_.complement_txs_in += m.txs.size();
+        }
+        // An EMPTY answer still finishes the back-fill round (nothing to fill).
+        if (complement && m.txs.empty()) {
+            if (deps_.txpool) deps_.txpool->on_complement(ref, {});
+            return;
+        }
         if (m.txs.empty()) return;
 
         // In-batch duplicate blobs are dropped BEFORE the pool sees them: the
@@ -803,7 +870,8 @@ private:
         tel_.txs_in += uniq.size();
         if (!deps_.txpool) return;
         const std::vector<TxRelayVerdict> verdicts =
-            deps_.txpool->on_relayed(ref, std::move(uniq), m.dandelionpp_fluff);
+            complement ? deps_.txpool->on_complement(ref, std::move(uniq))
+                       : deps_.txpool->on_relayed(ref, std::move(uniq), m.dandelionpp_fluff);
         for (const TxRelayVerdict& v : verdicts)
             if (v.drop_offense) { raise_fault(key, DosFault::MalformedBody, "relayed tx offence"); break; }
     }
@@ -1218,6 +1286,8 @@ private:
     std::uint64_t next_span_id_ = 1;
     std::string   primary_;
     bool          running_ = false;
+    bool          complement_armed_ = false;   // TXPOOL-RESUME (io thread)
+    std::size_t   complement_asked_ = 0;
 
     std::mutex                          span_mu_;
     std::map<std::string, std::size_t>  span_res_;         // booked span slots per peer key

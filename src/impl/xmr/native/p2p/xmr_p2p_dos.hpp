@@ -334,6 +334,12 @@ public:
                     ++block_charges_open_;
                 break;
             case levin::CMD_NEW_TRANSACTIONS:
+                // TXPOOL-RESUME: the 2002 that answers OUR 2010 is a solicited
+                // back-fill, sized by the peer's whole pool: charging it to the
+                // per-tx flood bucket (512) would score an honest peer with a
+                // busy pool as a flooder. One credit per 2010 we sent, single
+                // use, TTL-bound; the byte bucket above still applies.
+                if (take_complement_credit_(now)) break;
                 if (!bucket_take(txs_, static_cast<double>(units == 0 ? 1 : units), t))
                     return exhausted(fault_out, now);
                 break;
@@ -379,6 +385,14 @@ public:
         while (credits_.size() > cfg_.max_solicited_credits) credits_.pop_front();
     }
 
+    // TXPOOL-RESUME: mint the credit for the answer to a 2010 we just sent.
+    // At most ONE is outstanding per peer (a second request replaces it).
+    void note_complement_solicited(Millis now) {
+        complement_credit_ms_ = now;
+        complement_credit_open_ = true;
+    }
+    std::uint64_t complement_credits_used() const noexcept { return complement_credits_used_; }
+
     // -----------------------------------------------------------------------
     // Hand back the block token a push cost, because the index found the block
     // is one it HAS -- connected, already on the best chain, or a valid alt
@@ -420,6 +434,14 @@ private:
     void prune_expired_credits_(Millis now) {
         while (!credits_.empty() && now - credits_.front() > cfg_.solicited_reply_ttl_ms)
             credits_.pop_front();
+    }
+
+    bool take_complement_credit_(Millis now) {
+        if (!complement_credit_open_) return false;
+        complement_credit_open_ = false;
+        if (now - complement_credit_ms_ > cfg_.solicited_reply_ttl_ms) return false;
+        ++complement_credits_used_;
+        return true;
     }
 
     // Spend one live credit if any remains. Single-use: a credit consumed here
@@ -465,6 +487,11 @@ private:
     // cfg_.max_solicited_credits.
     std::deque<Millis> credits_;
     std::uint64_t      credits_used_ = 0;
+
+    // TXPOOL-RESUME: the one outstanding 2010-answer credit.
+    bool          complement_credit_open_  = false;
+    Millis        complement_credit_ms_    = 0;
+    std::uint64_t complement_credits_used_ = 0;
 
     // Block tokens spent on pushes and not yet handed back (D3a), and how many
     // have been handed back in total.
