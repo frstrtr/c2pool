@@ -109,6 +109,7 @@
 #include "xmr/xmr_recon_ring.hpp"                 // R-C rework-3 (D7): the RECON ring + root-age bound
 #include "xmr/xmr_lane_suspend_state.hpp"         // R-C rework-3 (D5 + contested): the lane-suspend causes
 #include "xmr/xmr_test_suspend_knob.hpp"          // FAULT-KNOB (TEST-ONLY): SIGUSR2 forces a lane suspension
+#include "xmr/xmr_lane_resume_fresh.hpp"         // RESUME-FRESH: the resume edge refreshes the template before the gate opens
 // GAP-2: the real c2pool-to-c2pool receipt relay (docs/xmr-lane/gap2-sharechain-relay-design.md).
 // OFF unless --relay-listen / --relay-peer is given; off = this daemon byte-identical to before.
 #include "xmr/relay/xmr_relay_wire.hpp"        // FB_HELLO / FB_RECEIPTS / FB_BLOCK_WON, side_data_v2, lane_params_digest
@@ -997,6 +998,27 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         }
 #endif
     };
+    // RESUME-FRESH (xmr/xmr_lane_resume_fresh.hpp): the template is not refreshed while the
+    // lane is suspended, so on the resume edge the cached one still sits on the tip the
+    // suspension started at, and the listener serves parked logins the moment its gate
+    // opens. Rebuild it on the current tip FIRST (invalidate: a fresh assembly, the ledger
+    // may have moved too); the loop below reports it as the new template. A failed build
+    // HOLDS the gate closed and is retried every pass: no stale job is handed out.
+    bool resume_held_logged = false;
+    auto resume_refresh = [&]() -> bool {
+        if constexpr (requires { provider.invalidate(); }) provider.invalidate();
+        if (!provider.refresh()) {
+            if (!resume_held_logged)
+                std::printf("cba-ALARM: lane RESUME HELD: the template rebuild on the current tip failed (%s) -- the stratum "
+                            "gate stays closed until it succeeds (retried every pass; no stale job is handed out)\n",
+                            provider.last_error().c_str());
+            resume_held_logged = true;
+            return false;
+        }
+        if (resume_held_logged) std::printf("cba: lane RESUME no longer held: template rebuilt on the current tip\n");
+        resume_held_logged = false;
+        return true;
+    };
     auto apply_suspension = [&]() -> bool {
         if (!serving) return false;
         const std::uint64_t hw_now = node.hw().hw_height;
@@ -1006,8 +1028,10 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         const bool contested = fc.options().contested_suspends && fc.contested();
         const auto e = lane_state.update(lag, fc.isolated(), fc.held_lag(), contested, fc.converging(), fc.diverged_halt());
         const bool lane_suspend = lane_state.suspended();
-        listener.set_lane_suspended(lane_suspend);   // edge-triggered inside (disconnect + park), gated (D4)
-        g_lane_suspended_now = lane_suspend;
+        // edge-triggered inside (disconnect + park), gated (D4); RESUME-FRESH: the resume edge
+        // opens the gate only after the template was rebuilt on the current tip.
+        const bool gate_closed = c2pool::v37n::xmr::apply_lane_gate(listener, lane_suspend, resume_refresh);
+        g_lane_suspended_now = gate_closed;
         using LS = c2pool::v37n::xmr::LaneSuspendState;
         auto cause_text = [](unsigned c) -> std::string {
             std::string t;
@@ -1058,7 +1082,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         LS::names(e.cleared).c_str(), LS::names(e.causes).c_str());
             std::fflush(stdout);
         }
-        return lane_suspend;
+        return gate_closed;
     };
     fc.set_isolation_hook([&](bool on, const std::string&) {
         if (!on || !serving) return;

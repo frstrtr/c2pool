@@ -24,7 +24,16 @@
 //   FK6  end to end through the SAME StratumListener::set_lane_suspended()
 //        path the daemon uses: the fire edge drops a mining session, a login
 //        during the forced suspension is parked (no error), and the release
-//        edge hands BOTH miners a login result + job.
+//        edge hands BOTH miners a login result + job;
+//   FK7  RESUME-FRESH (xmr/xmr_lane_resume_fresh.hpp): the chain advances
+//        while the lane is suspended (the daemon does not refresh its template
+//        then); the FIRST job the parked login gets after the release is at the
+//        CURRENT tip, never the cached pre-suspension template -- asserted
+//        before the rest of the loop pass runs, i.e. from what the listener
+//        serves the moment its gate opens (RC2 smoke 09-25: h=187 at tip 190);
+//   FK8  a resume whose template rebuild fails is HELD: the gate stays closed
+//        and the parked login gets nothing until a template on the current tip
+//        is built on a later pass; that is its first job.
 // Stub template source + verifier over loopback: no RandomX, no monerod.
 // Nonzero exit on any failure.
 // ===========================================================================
@@ -38,10 +47,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 
+#include "c2pool/v37/xmr/xmr_lane_resume_fresh.hpp"
 #include "c2pool/v37/xmr/xmr_lane_suspend_state.hpp"
 #include "c2pool/v37/xmr/xmr_stratum_listener.hpp"
 #include "c2pool/v37/xmr/xmr_test_suspend_knob.hpp"
@@ -61,6 +74,42 @@ struct Templates final : strat::ITemplateSource {
         out.blob[70] = static_cast<std::uint8_t>(extra_nonce);
         out.template_id = tid.load();
         out.height = 100 + tid.load();
+        out.mainchain_target = 1;
+        out.lane_target = 1;
+        out.monero_major_version = 16;
+        return true;
+    }
+    bool rebuild_blob(std::uint32_t, std::uint32_t en, strat::TemplateJob& out) override { return get_job(en, out); }
+    std::uint32_t max_extra_nonces() const override { return 64; }
+};
+// FK7/FK8: the daemon's template cache over an advancing chain. refresh() (main
+// thread) re-keys on the tip like the settlement provider: a new template id only
+// when the tip moved or the cache was invalidated. The listener thread reads one
+// packed (template_id << 32 | height) word, so a job is never torn.
+struct TipTemplates final : strat::ITemplateSource {
+    std::atomic<std::uint64_t> tip{186};        // chain tip height; the next block is tip + 1
+    std::atomic<std::uint64_t> cur{0};          // (template_id << 32) | template height; 0 = none
+    std::atomic<bool> fail{false};              // FK8: the rebuild fails
+    bool valid = false;
+    std::uint32_t next_id = 0;
+    void invalidate() { valid = false; }
+    bool refresh() {
+        if (fail.load()) return false;
+        const std::uint64_t h = tip.load() + 1;
+        if (valid && (cur.load() & 0xffffffffULL) == h) return true;
+        cur.store((static_cast<std::uint64_t>(++next_id) << 32) | h);
+        valid = true;
+        return true;
+    }
+    std::uint32_t template_id() const { return static_cast<std::uint32_t>(cur.load() >> 32); }
+    bool get_job(std::uint32_t extra_nonce, strat::TemplateJob& out) override {
+        const std::uint64_t c = cur.load();
+        if (c == 0) return false;
+        out.blob.assign(76, 0);
+        out.blob[0] = 16;
+        out.blob[70] = static_cast<std::uint8_t>(extra_nonce);
+        out.template_id = static_cast<std::uint32_t>(c >> 32);
+        out.height = c & 0xffffffffULL;
         out.mainchain_target = 1;
         out.lane_target = 1;
         out.monero_major_version = 16;
@@ -117,6 +166,11 @@ bool is_login_result(const std::string& l) {
            l.find("\"job\"") != std::string::npos && l.find("\"error\":{") == std::string::npos;
 }
 std::string first_line(const std::string& s) { return s.substr(0, std::min<std::size_t>(s.find('\n'), 80)); }
+long job_height(const std::string& l) {   // the "height" of the job in a login result / job push; -1 if none
+    const auto p = l.find("\"height\":");
+    if (p == std::string::npos) return -1;
+    return std::strtol(l.c_str() + p + 9, nullptr, 10);
+}
 
 } // namespace
 
@@ -254,6 +308,96 @@ int main() {
               "drop='" + first_line(dropA) + "' parked a2='" + first_line(waitA2) + "' b='" + first_line(waitB) +
                   "' | after release a2 " + std::to_string(dA2) + " ms, b " + std::to_string(dB) + " ms");
         ::close(a2); ::close(b);
+        L.stop();
+    }
+
+    // ── FK7 + FK8: RESUME-FRESH -- the first job after a release is at the current tip ──
+    {
+        TipTemplates tpl; StubVerifier ver; NullSink sink;
+        c2pool::v37n::xmr::o2::StratumListenerOptions lo;
+        lo.bind_host = "127.0.0.1"; lo.bind_port = 0;
+        c2pool::v37n::xmr::o2::StratumListener L(tpl, ver, sink, lo);
+        if (std::string e = L.bind(); !e.empty()) { std::printf("  [FAIL] bind: %s\n", e.c_str()); return 1; }
+        tpl.refresh();
+        std::uint32_t last_tid = tpl.template_id();
+        L.notify_new_template();
+        L.start();
+        TestSuspendKnob k(1);
+        LaneSuspendState ls(3);
+        const auto t_origin = Clock::now();
+        auto now_ms = [&] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t_origin).count()); };
+        // The daemon's per-pass order (main_v37_xmr.cpp serve_and_run): knob step, lane_state.update,
+        // the stratum gate (apply_lane_gate: on the resume edge the template is rebuilt BEFORE the gate
+        // opens), then -- later in the pass -- the loop's own refresh + new-template notify, skipped while
+        // the gate is closed. `mid_pass` runs between the two: what the listener hands out the moment the
+        // gate opens is observed there, before the loop's refresh could mask a stale job.
+        auto pass = [&](bool fire_req, const std::function<void()>& mid_pass) {
+            const auto s = k.step(fire_req, now_ms(), ls);
+            const auto e = ls.update(kLagOk, false, false, false);
+            const bool gate_closed = c2pool::v37n::xmr::apply_lane_gate(L, ls.suspended(), [&] { tpl.invalidate(); return tpl.refresh(); });
+            if (mid_pass) mid_pass();
+            if (!gate_closed && tpl.refresh() && tpl.template_id() != last_tid) { last_tid = tpl.template_id(); L.notify_new_template(); }
+            return std::make_tuple(s, e, gate_closed);
+        };
+        const int a = connect_to(L.bound_port());
+        send_line(a, kLogin);
+        const std::string loginA = read_line(a, 3000);
+        const long h_before = job_height(loginA);
+        pass(true, {});                                    // SIGUSR2: suspend, the session is dropped
+        const std::string dropA = read_all(a, 800);
+        ::close(a);
+        const int a2 = connect_to(L.bound_port());         // the dropped miner reconnects: parked
+        send_line(a2, kLogin);
+        const std::string waitA2 = read_all(a2, 400);
+        tpl.tip.store(190);                                // three blocks + ours arrive while suspended; no refresh
+        std::string first; long first_ms = -1; bool released = false;
+        while (!released && now_ms() < 8000) {
+            Clock::time_point t_rel{};
+            const auto [s, e, gate] = pass(false, [&] {
+                if (!L.lane_suspended()) { t_rel = Clock::now(); first = read_line(a2, 1500);
+                    first_ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t_rel).count()); }
+            });
+            if (s.released) released = true;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        const std::string more = read_all(a2, 300);       // anything else pushed in the rest of that pass
+        const long h_first = job_height(first);
+        const long h_tip_next = static_cast<long>(tpl.tip.load() + 1);
+        check("FK7 RESUME-FRESH: the chain advanced under the suspension; the FIRST job the parked login gets after the "
+              "release is at the current tip (never the cached pre-suspension template)",
+              is_login_result(loginA) && h_before == 187 && dropA.find("<EOF>") != std::string::npos && waitA2.empty() &&
+                  released && is_login_result(first) && h_first == h_tip_next && more.find("\"height\":187") == std::string::npos,
+              "before=" + std::to_string(h_before) + " tip+1=" + std::to_string(h_tip_next) + " first job h=" +
+                  std::to_string(h_first) + " after " + std::to_string(first_ms) + " ms");
+
+        // FK8: a resume whose rebuild fails is HELD (gate closed), served at the tip once the rebuild succeeds.
+        pass(true, {});                                    // the knob re-fires
+        const std::string drop2 = read_all(a2, 800);
+        ::close(a2);
+        const int a3 = connect_to(L.bound_port());
+        send_line(a3, kLogin);
+        const std::string wait3 = read_all(a3, 400);
+        tpl.tip.store(193);
+        tpl.fail.store(true);
+        bool rel2 = false, held_closed = false; std::string during_hold;
+        while (!rel2 && now_ms() < 16000) {
+            const auto [s, e, gate] = pass(false, {});
+            if (s.released) { rel2 = true; held_closed = gate && L.lane_suspended() && e.resume_edge; }
+            else std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        const auto [s2, e2, gate2] = pass(false, [&] { during_hold = read_all(a3, 500); });   // still failing: still held
+        tpl.tip.store(194);
+        tpl.fail.store(false);
+        std::string first3;
+        const auto [s3, e3, gate3] = pass(false, [&] { first3 = read_line(a3, 1500); });
+        check("FK8 a resume whose rebuild fails is HELD (gate closed, the parked login gets nothing); the next pass that "
+              "builds a template on the current tip opens the gate and that is the first job",
+              drop2.find("<EOF>") != std::string::npos && wait3.find("\"height\"") == std::string::npos && rel2 && held_closed &&
+                  gate2 && during_hold.find("\"height\"") == std::string::npos && !gate3 && is_login_result(first3) &&
+                  job_height(first3) == 195,
+              "held=" + std::to_string(held_closed) + " during_hold='" + first_line(during_hold) + "' first job h=" +
+                  std::to_string(job_height(first3)) + " (tip+1=195)");
+        ::close(a3);
         L.stop();
     }
 

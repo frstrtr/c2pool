@@ -452,6 +452,8 @@ if (BUILD_TESTING)
     # on a live node -- off by default, refused on mainnet, arm/fire/release
     # through LaneSuspendState (cause `test`), and end to end through the real
     # StratumListener::set_lane_suspended() (parked login served on release).
+    # RESUME-FRESH (FK7/FK8): the first job after a release is at the current tip
+    # (xmr/xmr_lane_resume_fresh.hpp), and a failed rebuild holds the gate.
     # Stub template source + verifier over loopback: no RandomX, no monerod.
     # Listed in BOTH build.yml --target lists.
     add_executable(v37_xmr_test_suspend_knob_kat
