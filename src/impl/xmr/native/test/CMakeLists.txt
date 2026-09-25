@@ -233,7 +233,12 @@ if (BUILD_TESTING)
             # output-set RAM: the format-2 anchor snapshot is served in place
             # from a read-only mapping (heap growth, equivalence, overlay/reorg,
             # fail-closed); also the load/equivalence harness of the smoke.
-            xmr_native_output_set_mmap_kat)
+            xmr_native_output_set_mmap_kat
+            # restart cost: the post-anchor overlay persisted beside the chain
+            # snapshot and replayed onto the seeded set (round trip, continue +
+            # reorg below the resume point, fail-closed); also the live smoke's
+            # --compare harness (two nodes' overlays, ring + spent lookups).
+            xmr_native_output_set_overlay_kat)
         # The sources are named after the component, not the target prefix.
         string(REPLACE "xmr_native_" "xmr_" _c3_src ${_c3_kat})
         add_executable(${_c3_kat} ${_c3_src}.cpp)
