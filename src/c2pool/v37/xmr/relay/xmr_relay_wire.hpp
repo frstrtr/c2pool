@@ -24,6 +24,8 @@
 //         0x42 FB_BLOCK_WON  the block-winner cut descriptor (fast path A)
 //         0x43 FB_GETCTX     repair: ask for the Monero block a receipt was mined on
 //         0x44 FB_CTX        the answer: that block's full blob (or "unknown here")
+//         0x45 FB_GETDROPS   ★ DROPS (gate ON only): raindrop inventory / fetch for [lo, hi)
+//         0x46 FB_DROPINV    ★ DROPS (gate ON only): the raindrop ids a peer holds for [lo, hi)
 //       (a pre-0x43 node counts 0x43/0x44 as fb_unknown and KEEPS the socket)
 //     0x80..0x83   carrier_supply.hpp GETORDER/ORDER/GETFRAMES/FRAMES (reused)
 //
@@ -100,6 +102,8 @@ inline constexpr u8  FB_RECEIPTS  = 0x41;
 inline constexpr u8  FB_BLOCK_WON = 0x42;
 inline constexpr u8  FB_GETCTX    = 0x43;
 inline constexpr u8  FB_CTX       = 0x44;
+inline constexpr u8  FB_GETDROPS  = 0x45;   // ★ DROPS backfill (gate ON only; never sent with the flip at 0)
+inline constexpr u8  FB_DROPINV   = 0x46;   // ★ DROPS backfill: the raindrop ids a peer holds for [lo, hi)
 inline constexpr u8  kFbVersion   = 0x01;
 inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
@@ -605,6 +609,73 @@ inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std
     if (len > kCtxMaxBlob) return bad("ctx: blob over 512 KiB");
     if (f.size() != kCtxHeader + len) return bad("ctx: wrong length");
     blob.assign(f.begin() + static_cast<std::ptrdiff_t>(kCtxHeader), f.end());
+    return true;
+}
+
+// ── ★ FB_GETDROPS (0x45) / FB_DROPINV (0x46): RAINDROP BACKFILL (gate ON only) ─
+// A raindrop is flooded once; a node that was partitioned, joined late or
+// restarted never sees the flood, harvests a different set and composes a
+// different delta (owed_digest forks under the flip). These two frames give
+// raindrops the receipts' recovery: the composing node asks each ready peer
+// for its INVENTORY of raindrop ids over the interval range the composition
+// needs, then FETCHES the ids it lacks; the answer is ordinary FB_RECEIPTS
+// frames, verified (RandomX, the drops floor) exactly like a flood.
+//   GETDROPS : u8 0x45 ; u8 ver ; u32 chain_id ; u64 lo ; u64 hi ; u16 n ; n x id(32)
+//              n == 0: "send me your inventory of [lo, hi)"; 1..256: "send me these"
+//   DROPINV  : u8 0x46 ; u8 ver ; u32 chain_id ; u64 lo ; u64 hi ; u32 n (<= 16384) ; n x id(32)
+// Both are sent ONLY with drops_floor_diff != 0; a gate-OFF node counts them as
+// an unknown Family-B opcode (fb_unknown) and keeps the socket, as before.
+inline constexpr std::size_t kDropsGetHeader  = 1 + 1 + 4 + 8 + 8 + 2;
+inline constexpr std::size_t kDropsInvHeader  = 1 + 1 + 4 + 8 + 8 + 4;
+inline constexpr std::size_t kDropsGetMaxIds  = 256;
+inline constexpr std::size_t kDropsInvMaxIds  = 16384;   // 512 KiB of ids: under the 1 MiB carrier ceiling
+inline constexpr u64         kDropsMaxSpan    = 4096;    // intervals one request may cover
+inline std::vector<u8> encode_getdrops(u32 chain_id, u64 lo, u64 hi, const std::vector<bytes32>& ids) {
+    if (hi <= lo || hi - lo > kDropsMaxSpan || ids.size() > kDropsGetMaxIds) return {};
+    std::vector<u8> f; f.reserve(kDropsGetHeader + 32 * ids.size());
+    f.push_back(FB_GETDROPS); f.push_back(kFbVersion); le::put32(f, chain_id);
+    le::put64(f, lo); le::put64(f, hi); le::put16(f, static_cast<u16>(ids.size()));
+    for (const auto& id : ids) le::putb(f, id);
+    return f;
+}
+inline bool decode_getdrops(const std::vector<u8>& f, u32& chain_id, u64& lo, u64& hi, std::vector<bytes32>& ids,
+                            std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() < kDropsGetHeader) return bad("getdrops: short");
+    if (f[0] != FB_GETDROPS) return bad("getdrops: wrong opcode");
+    if (f[1] != kFbVersion) return bad("getdrops: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    lo = le::get64(f.data() + 6); hi = le::get64(f.data() + 14);
+    const std::size_t n = le::get16(f.data() + 22);
+    if (hi <= lo || hi - lo > kDropsMaxSpan) return bad("getdrops: range empty or over kDropsMaxSpan");
+    if (n > kDropsGetMaxIds) return bad("getdrops: n over 256");
+    if (f.size() != kDropsGetHeader + 32 * n) return bad("getdrops: wrong length");
+    ids.clear();
+    for (std::size_t i = 0; i < n; ++i) ids.push_back(le::getb(f.data() + kDropsGetHeader + 32 * i));
+    return true;
+}
+inline std::vector<u8> encode_dropinv(u32 chain_id, u64 lo, u64 hi, const std::vector<bytes32>& ids) {
+    if (hi <= lo || hi - lo > kDropsMaxSpan || ids.size() > kDropsInvMaxIds) return {};
+    std::vector<u8> f; f.reserve(kDropsInvHeader + 32 * ids.size());
+    f.push_back(FB_DROPINV); f.push_back(kFbVersion); le::put32(f, chain_id);
+    le::put64(f, lo); le::put64(f, hi); le::put32(f, static_cast<u32>(ids.size()));
+    for (const auto& id : ids) le::putb(f, id);
+    return f;
+}
+inline bool decode_dropinv(const std::vector<u8>& f, u32& chain_id, u64& lo, u64& hi, std::vector<bytes32>& ids,
+                           std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() < kDropsInvHeader) return bad("dropinv: short");
+    if (f[0] != FB_DROPINV) return bad("dropinv: wrong opcode");
+    if (f[1] != kFbVersion) return bad("dropinv: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    lo = le::get64(f.data() + 6); hi = le::get64(f.data() + 14);
+    const std::size_t n = le::get32(f.data() + 22);
+    if (hi <= lo || hi - lo > kDropsMaxSpan) return bad("dropinv: range empty or over kDropsMaxSpan");
+    if (n > kDropsInvMaxIds) return bad("dropinv: n over 16384");
+    if (f.size() != kDropsInvHeader + 32 * n) return bad("dropinv: wrong length");
+    ids.clear();
+    for (std::size_t i = 0; i < n; ++i) ids.push_back(le::getb(f.data() + kDropsInvHeader + 32 * i));
     return true;
 }
 

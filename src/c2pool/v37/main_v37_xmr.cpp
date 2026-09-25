@@ -70,6 +70,7 @@
 #include <atomic>
 #include <functional>
 #include <chrono>
+#include <map>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -1635,6 +1636,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     bool drops_live = false;
     c2pool::v37n::settle::WorkPrice drops_fold_price{};   // the price of the LAST successful fold_at_cut (gate ON only)
     std::atomic<std::uint64_t> drops_mint_ok{0}, drops_mint_below_floor{0};
+    // ★ RAIN-BACKFILL: the composition's HOLD on an incomplete raindrop set (gate ON only)
+    std::map<std::string, std::chrono::steady_clock::time_point> drops_hold_since;
+    std::uint64_t drops_hold_entered = 0, drops_hold_resolved = 0;
+    long long drops_hold_max_ms = 0;
     std::map<std::string, WireCache> wire_cache;   // bid -> the v0x02 descriptor (+ its early fold)
     // ★ ENROL-REPL (gate ON only): our own wins whose FB_BLOCK_WON leaves at BOOKING
     // time, carrying the delta composed there (bid -> the frame without its delta).
@@ -2102,6 +2107,35 @@ static int run_live(const XmrNodeConfig& cfg) {
             const bool chk_ok = fold_at_cut(bk.total, bk.credit_cut, chk, w2, relay_hint(bid));
             if (chk_ok) booking_price = drops_fold_price;
             if (chk_ok && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
+        }
+        // ★ RAIN-BACKFILL: the composition HOLDs (cut-pending, retried; past the
+        // booking retry bound it is HELD like an undecided relay repair, never
+        // refused) until this node holds every raindrop every ready relay peer
+        // holds for the interval range this lane block's harvest settles; then
+        // the relay's admitted raindrops are drained into the harvest HERE, so
+        // XmrNode::on_network_block_won composes from the complete set.
+        if (drops_live && relay_node) {
+            const auto rg = drops->range_for(h);
+            if (rg.second > rg.first) {
+                const auto ds = relay_node->drops_sync(rg.first, rg.second);
+                if (!ds.complete) {
+                    if (!drops_hold_since.count(bid)) { drops_hold_since[bid] = std::chrono::steady_clock::now(); ++drops_hold_entered; }
+                    why = "cut-pending: drops backfill of intervals [" + std::to_string(rg.first) + "," + std::to_string(rg.second) +
+                          ") incomplete (" + ds.why + ")";
+                    return false;
+                }
+            }
+            for (auto& a : relay_node->drain_drops())
+                drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
+            long long held_ms = 0;
+            if (auto hit = drops_hold_since.find(bid); hit != drops_hold_since.end()) {
+                held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hit->second).count();
+                drops_hold_since.erase(hit); ++drops_hold_resolved;
+                if (held_ms > drops_hold_max_ms) drops_hold_max_ms = held_ms;
+            }
+            std::printf("drops-sync: h=%llu bid=%s… range=[%llu,%llu) held_ms=%lld raindrops_held=%zu -> composing\n",
+                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), (unsigned long long)rg.first,
+                        (unsigned long long)rg.second, held_ms, relay_node->drops_held(rg.first, rg.second).size());
         }
         // ★ ENROL-REPL (gate ON only): the DROPS delta this block books is the
         // WINNER's, carried on FB_BLOCK_WON v0x02 -- never a composition from
@@ -2806,6 +2840,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             // shape itself. drops_try_enrol() (below, from the height watch) does
             // both once the native tip has caught up with the template served.
             drops->attach(node);
+            drops->attach_chain_order(node, cfg.d_conf);   // ★ RAIN-BACKFILL: harvest consumption follows the chain
             drops_live = true;
             std::printf("DROPS: ★ ACTIVE (V37_ACTIVATE_CONSENSUS_V1, K=%u, lz=%u, share_diff=%llu, raindrop floor diff=%llu, "
                         "receipt weight=%llu, to enrol=%zu at the native tip): every lane block composes the sub-threshold "
@@ -3410,6 +3445,13 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)drops_carry_tx, (unsigned long long)drops_carry_rx, (unsigned long long)drops_carry_ok,
                             (unsigned long long)drops_carry_refused, (unsigned long long)drops_carry_wait,
                             (unsigned long long)node.drops_booked_carried(), (unsigned long long)node.drops_booked_local());
+                const auto cs = drops->chain_stats();   // ★ RAIN-BACKFILL
+                std::printf("  drops-chain: retained=%llu late=%llu withheld=%llu marks=%zu intervals=%zu last_range=[%llu,%llu) | "
+                            "hold entered=%llu resolved=%llu now=%zu max_ms=%lld | %s\n",
+                            (unsigned long long)cs.observed, (unsigned long long)cs.late, (unsigned long long)cs.withheld, cs.marks,
+                            cs.intervals, (unsigned long long)cs.lo, (unsigned long long)cs.hi,
+                            (unsigned long long)drops_hold_entered, (unsigned long long)drops_hold_resolved, drops_hold_since.size(),
+                            drops_hold_max_ms, relay_node->describe_drops().c_str());
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());

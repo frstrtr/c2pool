@@ -64,6 +64,20 @@
 //     node -- the winner included -- books the CARRIED map for that block after
 //     the same deterministic check (verify_carry), and only advances (discards)
 //     its own buried harvest at the same frontier.
+// (6) RAIN-BACKFILL: CONSUMPTION FOLLOWS THE CHAIN, NOT THE BOOKING ORDER.
+//     DropHarvester::take_buried() RELEASES every interval below the frontier
+//     for good. A node that books its own sibling Y at h, then (1-deep reorg)
+//     the canonical X at h, composes X from an EMPTY harvest while every other
+//     node composed it from the full one -- owed_digest forks. And a raindrop
+//     that reaches a node after the release (partition, late join) is dropped
+//     as "late" on that node alone. ChainOrderedHarvest below RETAINS the
+//     raindrops + share counts (bounded) and composes the harvest of a lane
+//     block won at h as a PURE function of the retained set over
+//     [frontier(previous lane block booked below h), h - D_conf): a re-booking at
+//     h (the sibling replaced) or below re-derives exactly what a node that only
+//     ever booked the canonical chain derives. The shell attaches it with
+//     attach_chain_order(); the composition HOLDs on the relay's drops_sync()
+//     over range_for(h) until the set is complete (xmr_relay_node.hpp).
 //
 // GATE OFF (the shipped default): make() returns nullptr, the shell constructs
 // nothing, attaches nothing, and every path below is unreachable.
@@ -71,9 +85,14 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <vector>
 #include <optional>
 #include <string>
 #include <utility>
@@ -202,6 +221,94 @@ inline std::string verify_carry(const DropsCarry& c, bool binds) {
         return "a non-empty delta composed under an EMPTY enrolment book (nobody enrolled => no delta)";
     return "";
 }
+// ── (6) RAIN-BACKFILL: the retained, chain-ordered harvest ───────────────────
+class ChainOrderedHarvest {
+public:
+    using Rows = std::vector<::c2pool::v37n::settle::HarvestedReceipt>;
+    using CoversFn = std::function<bool(std::uint64_t)>;
+    static constexpr std::size_t kMarksKept = 256;   // booked lane blocks remembered (>> D_conf: a reorg is shallower)
+
+    ChainOrderedHarvest(std::uint32_t K, unsigned lz, std::uint64_t d_conf) : m_K(K), m_lz(lz), m_d_conf(d_conf) {}
+    void set_d_conf(std::uint64_t d) { m_d_conf = d; }
+    std::uint64_t d_conf() const { return m_d_conf; }
+
+    // idempotent: the same (payee, normalised hash) at the same interval counts once
+    void observe_drop(const bytes32& payee, std::uint64_t interval, const bytes32& nhash) {
+        if (interval < m_floor) { ++m_late; return; }
+        if (m_drops[interval].insert(std::make_pair(payee, nhash)).second) ++m_observed;
+    }
+    void observe_share(const bytes32& payee, std::uint64_t interval) {
+        if (interval < m_floor) return;
+        ++m_shares[std::make_pair(payee, interval)];
+    }
+
+    std::uint64_t frontier_of(std::uint64_t won_height) const {
+        return won_height > m_d_conf ? won_height - m_d_conf : 0;
+    }
+    // [lo, hi): the intervals the composition of a lane block won at `won_height`
+    // settles, given the lane blocks booked strictly below it. Pure.
+    std::pair<std::uint64_t, std::uint64_t> range_for(std::uint64_t won_height) const {
+        const std::uint64_t hi = frontier_of(won_height);
+        std::uint64_t lo = m_floor;
+        auto it = m_marks.lower_bound(won_height);
+        if (it != m_marks.begin()) lo = std::max(lo, std::prev(it)->second);
+        return {std::min(lo, hi), hi};
+    }
+
+    // Book a lane block won at `won_height`: every mark at or above it is a
+    // superseded booking (the chain now carries this block there), so it is
+    // forgotten; the rows are re-derived from the retained set.
+    Rows take(std::uint64_t won_height, const CoversFn& covers,
+              const ::c2pool::v37n::EnrollmentBook* enrollment) {
+        m_marks.erase(m_marks.lower_bound(won_height), m_marks.end());
+        const auto [lo, hi] = range_for(won_height);
+        m_marks[won_height] = hi;
+        m_last_lo = lo; m_last_hi = hi;
+        std::map<std::pair<bytes32, std::uint64_t>, std::vector<bytes32>> keys;   // (payee, interval) -> hashes
+        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it)
+            for (const auto& [payee, h] : it->second) keys[std::make_pair(payee, it->first)].push_back(h);
+        for (auto it = m_shares.begin(); it != m_shares.end(); ++it) {
+            const auto iv = it->first.second;
+            if (iv < lo || iv >= hi) continue;
+            if (keys.count(it->first)) continue;
+            if (!enrollment || !enrollment->enrolled(it->first.first, iv)) continue;   // share-only rows: enrolled payees
+            keys[it->first];
+        }
+        Rows out;
+        for (auto& [k, hashes] : keys) {
+            if (!covers || !covers(k.second)) { ++m_withheld; continue; }   // S UNKNOWN here: withheld, never credited
+            ::c2pool::v37::subthreshold::ReceiptCollector rc(m_K, ::c2pool::v37n::drops_detail::h_t_of_lz(m_lz));
+            std::sort(hashes.begin(), hashes.end());
+            for (const auto& h : hashes) rc.observe(::c2pool::v37n::drops_detail::u256_of(h));
+            auto si = m_shares.find(k);
+            rc.set_shares(si == m_shares.end() ? 0 : si->second);
+            out.push_back(::c2pool::v37n::settle::HarvestedReceipt{k.first, k.second, rc});
+        }
+        while (m_marks.size() > kMarksKept) {   // bounded: forget the oldest booking and everything below it
+            m_floor = std::max(m_floor, m_marks.begin()->second);
+            m_marks.erase(m_marks.begin());
+        }
+        m_drops.erase(m_drops.begin(), m_drops.lower_bound(m_floor));
+        for (auto it = m_shares.begin(); it != m_shares.end();) it = it->first.second < m_floor ? m_shares.erase(it) : std::next(it);
+        return out;
+    }
+
+    std::uint64_t observed() const { return m_observed; }
+    std::uint64_t late() const { return m_late; }
+    std::uint64_t withheld() const { return m_withheld; }
+    std::size_t marks() const { return m_marks.size(); }
+    std::size_t retained_intervals() const { return m_drops.size(); }
+    std::pair<std::uint64_t, std::uint64_t> last_range() const { return {m_last_lo, m_last_hi}; }
+
+private:
+    std::uint32_t m_K;
+    unsigned m_lz;
+    std::uint64_t m_d_conf;
+    std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>> m_drops;          // interval -> {(payee, N)}
+    std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t> m_shares;            // (payee, interval) -> S
+    std::map<std::uint64_t, std::uint64_t> m_marks;                                  // booked won height -> its frontier
+    std::uint64_t m_floor = 0, m_observed = 0, m_late = 0, m_withheld = 0, m_last_lo = 0, m_last_hi = 0;
+};
 
 // ── THE XMR BUNDLE: one per lane, owned by the shell ────────────────────────
 class XmrDropsWiring {
@@ -251,6 +358,39 @@ public:
         if constexpr (requires { node.set_drops_carried_fn({}); })
             node.set_drops_carried_fn([this]() { return take_carried(); });   // ENROL-REPL
     }
+    // ★ RAIN-BACKFILL: compose from the retained, chain-ordered harvest (5)
+    // instead of the destructive take_buried(). Called by the shell right after
+    // attach(); a node without it keeps the take_buried() body.
+    template <class Node>
+    void attach_chain_order(Node& node, std::uint64_t d_conf) {
+        {
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            m_chain_order = true;
+            m_coh.set_d_conf(d_conf);
+        }
+        node.set_harvest_range_fn([this](std::uint64_t won_height) { return take_chain_ordered(won_height); });
+    }
+    bool chain_ordered() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_chain_order; }
+    // the interval range the composition of a lane block won at h settles (the HOLD's range)
+    std::pair<std::uint64_t, std::uint64_t> range_for(std::uint64_t won_height) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        return m_coh.range_for(won_height);
+    }
+    ChainOrderedHarvest::Rows take_chain_ordered(std::uint64_t won_height) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        const auto& book = m_core.shares();
+        return m_coh.take(won_height, [&book](std::uint64_t iv) { return book.covers(iv); }, &m_core.enrollment());
+    }
+    struct ChainStats { std::uint64_t observed = 0, late = 0, withheld = 0; std::size_t marks = 0, intervals = 0; std::uint64_t lo = 0, hi = 0; };
+    ChainStats chain_stats() const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        ChainStats c;
+        c.observed = m_coh.observed(); c.late = m_coh.late(); c.withheld = m_coh.withheld();
+        c.marks = m_coh.marks(); c.intervals = m_coh.retained_intervals();
+        c.lo = m_coh.last_range().first; c.hi = m_coh.last_range().second;
+        return c;
+    }
+
     template <class Node>
     static void detach(Node& node) {
         node.set_drop_harvester(nullptr);
@@ -313,6 +453,10 @@ public:
         d.hash = n;
         d.consensus_lz = kXmrDropsLz;
         d.own_lz = lz;
+        {
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            if (m_chain_order) { m_coh.observe_drop(payee_identity, bin, n); return true; }   // ★ RAIN-BACKFILL
+        }
         m_drop_sink(d);
         return true;
     }
@@ -323,6 +467,10 @@ public:
         p.origin_bin = bin;
         p.carrier_bin = bin;
         p.w_raw = m_receipt_weight;
+        {
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            if (m_chain_order) { m_coh.observe_share(payee_identity, bin); return; }   // ★ RAIN-BACKFILL
+        }
         m_share_tee(p);
     }
 
@@ -336,7 +484,7 @@ public:
 private:
     XmrDropsWiring(std::uint32_t K, std::uint64_t share_diff, std::uint64_t receipt_weight)
         : m_core(K, [](std::uint64_t) { return kXmrDropsLz; }),
-          m_share_diff(share_diff), m_receipt_weight(receipt_weight) {
+          m_share_diff(share_diff), m_receipt_weight(receipt_weight), m_coh(K, kXmrDropsLz, 0) {
         m_drop_sink = m_core.drop_sink();
         m_share_tee = m_core.sink_filter()(::c2pool::v37n::RecordSink{});
     }
@@ -350,6 +498,9 @@ private:
     ::c2pool::v37n::settle::WorkPrice m_price{};
     std::optional<std::map<bytes32, long long>> m_carried{};   // ENROL-REPL one-shot
     std::uint64_t m_priced = 0, m_unpriced = 0, m_refused_share = 0;
+    mutable std::mutex m_hmtx;          // ★ RAIN-BACKFILL
+    bool m_chain_order = false;
+    ChainOrderedHarvest m_coh;
 };
 
 }  // namespace c2pool::v37n::xmr::drops

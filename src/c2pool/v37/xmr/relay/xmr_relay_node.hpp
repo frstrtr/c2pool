@@ -72,6 +72,20 @@
 // (d) reports WHICH stage is stuck (repair_status) so a stall that does reach
 // the booking retry bound is refused with a loud, distinct reason.
 //
+// ★ RAINDROP BACKFILL (RAIN-BACKFILL; gate ON only -- every piece below is
+// unreachable with drops_floor_diff == 0, and a gate-OFF node counts the two
+// new frames as an unknown Family-B opcode exactly as before). A raindrop is
+// flooded once and never cached as a receipt, so a node that was partitioned,
+// joined late or restarted never saw it and would harvest a different set. Now
+// every admitted raindrop is also kept in a BOUNDED servable store (by interval,
+// --drops-retain window); on HELLO each side pulls the other's inventory of its
+// recent intervals (FB_GETDROPS n=0 -> FB_DROPINV) and fetches the ids it lacks
+// (FB_GETDROPS n>0 -> FB_RECEIPTS, verified like a flood under the solicited
+// credit); and drops_sync(lo, hi) -- called by the composition before it books
+// a lane block -- asks every ready peer for its inventory of exactly [lo, hi),
+// fetches what is missing and answers complete only when this node holds every
+// raindrop every ready peer holds there (the composition HOLDs until then).
+//
 // BACKFILL on (re)connect: the sender RE-OFFERS its last --relay-reoffer-seconds
 // of admitted receipts; the receiver asks GETORDER over the peer's last
 // --relay-backfill-positions lane positions and GETFRAMES for every id it has
@@ -95,6 +109,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -111,6 +126,8 @@
 // UP-GATE: a remote HELLO read before our own up event ran for that link waits
 // for it (on_hello), and XmrRelayNode::set_test_up_delay_ms() exists.
 #define C2POOL_XMR_RELAY_UP_GATE 1
+// ★ RAIN-BACKFILL feature marker (drops_sync / drops_held / FB_GETDROPS + FB_DROPINV)
+#define C2POOL_XMR_RAIN_BACKFILL 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -231,6 +248,13 @@ struct RelayOptions {
     // flooded on like a share so every node harvests the same set.
     u64         drops_floor_diff = 0;
     std::size_t drops_seen_max = 65536;                      // raindrop dedup set bound
+    // ★ RAIN-BACKFILL (gate ON only; inert with drops_floor_diff == 0)
+    u64         drops_retain_bins = 512;                     // intervals below the tip kept servable
+    std::size_t drops_store_max = 65536;                     // raindrops kept servable (bounded)
+    u64         drops_hello_bins = 64;                       // HELLO: pull the peer's inventory of [tip - this, tip + 2)
+    u32         drops_inv_retry_ms = 2000;                   // re-ask an unanswered inventory after this
+    u32         drops_fetch_retry_ms = 2000;                 // re-ask still-missing ids after this
+    u32         drops_fetch_max_asks = 8;                    // asks of one peer for its missing ids before it is set aside
 };
 
 struct RelayStats {
@@ -251,6 +275,17 @@ struct RelayStats {
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
+    // ★ RAIN-BACKFILL (gate ON only; all stay 0 with drops_floor_diff == 0)
+    std::atomic<u64> drops_inv_tx{0}, drops_inv_rx{0}, drops_invreq_tx{0}, drops_invreq_rx{0};
+    std::atomic<u64> drops_fetch_tx{0}, drops_ids_asked{0}, drops_fetchreq_rx{0}, drops_served{0}, drops_backfilled{0};
+    std::atomic<u64> drops_sync_calls{0}, drops_sync_pending{0}, drops_sync_complete{0}, drops_peer_setaside{0};
+};
+
+// ★ RAIN-BACKFILL: the composition's view of one interval range.
+struct DropsSync {
+    bool        complete = true;
+    std::size_t peers = 0, peers_ok = 0, missing = 0, set_aside = 0;
+    std::string why;
 };
 
 class XmrRelayNode {
@@ -364,6 +399,7 @@ public:
         a.own = true; a.drop = true;
         if (!drop_note_new(a.id)) { m_st.drops_dup++; return; }
         m_st.drops_own++;
+        drop_store_put(a.id, a.bin, a.raw);   // ★ RAIN-BACKFILL: servable
         flood(a.raw, 0);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
@@ -374,6 +410,99 @@ public:
         std::vector<Admitted> out;
         out.swap(m_drops);
         return out;
+    }
+
+    // ── ★ RAIN-BACKFILL: is this node's raindrop set for [lo, hi) complete? ──
+    // Main thread (the composition, before it books a lane block whose harvest
+    // settles [lo, hi)). Asks every ready peer for its inventory of exactly this
+    // range (once, re-asked if unanswered), fetches every id a peer holds that
+    // this node does not, and answers complete ONLY when, for every ready peer,
+    // every id of its inventory is held here (or that peer failed to serve its
+    // own inventory drops_fetch_max_asks times: set aside, counted, logged). No
+    // ready peer: complete only for a node that never had one and dials nobody
+    // (a lone node); a partitioned node HOLDs. Gate OFF: always complete, no I/O.
+    DropsSync drops_sync(u64 lo, u64 hi) {
+        DropsSync out;
+        if (!m_o.drops_floor_diff || hi <= lo) return out;
+        if (hi - lo > kDropsMaxSpan) lo = hi - kDropsMaxSpan;
+        m_st.drops_sync_calls++;
+        const auto peers = ready_peers();
+        out.peers = peers.size();
+        if (peers.empty()) {
+            if (m_drop_had_peer.load() || !m_o.peers.empty()) {
+                out.complete = false; out.why = "no ready relay peer to confirm the raindrop set";
+                m_st.drops_sync_pending++;
+            } else m_st.drops_sync_complete++;
+            return out;
+        }
+        const auto now = Clock::now();
+        std::vector<std::pair<PeerId, std::vector<bytes32>>> fetch;
+        std::vector<PeerId> ask_inv;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            for (PeerId p : peers) {
+                PeerInv& inv = m_drop_inv[InvKey{p, lo, hi}];
+                inv.touched = now;
+                if (!inv.answered) {
+                    if (inv.asked == Clock::time_point{} || now - inv.asked >= std::chrono::milliseconds(m_o.drops_inv_retry_ms)) {
+                        inv.asked = now; ask_inv.push_back(p);
+                    }
+                    continue;
+                }
+                if (inv.set_aside) { ++out.peers_ok; ++out.set_aside; continue; }
+                std::vector<bytes32> miss;
+                for (const auto& id : inv.ids) if (!drop_held_locked(id)) miss.push_back(id);
+                if (miss.empty()) { ++out.peers_ok; continue; }
+                out.missing += miss.size();
+                if (inv.fetched == Clock::time_point{} || now - inv.fetched >= std::chrono::milliseconds(m_o.drops_fetch_retry_ms)) {
+                    if (inv.asks >= m_o.drops_fetch_max_asks) {
+                        inv.set_aside = true; ++out.peers_ok; ++out.set_aside; m_st.drops_peer_setaside++;
+                        log("relay: drops backfill: peer " + std::to_string(p) + " did not serve " + std::to_string(miss.size()) +
+                            " raindrop(s) of its own inventory of [" + std::to_string(lo) + "," + std::to_string(hi) + ") after " +
+                            std::to_string(inv.asks) + " asks -> set aside for this range");
+                        continue;
+                    }
+                    ++inv.asks; inv.fetched = now;
+                    for (const auto& id : miss) m_drop_want[id] = now;
+                    fetch.emplace_back(p, std::move(miss));
+                }
+            }
+        }
+        for (PeerId p : ask_inv) send_drop_invreq(p, lo, hi);
+        for (auto& [p, ids] : fetch) send_drop_fetch(p, lo, hi, ids);
+        out.complete = (out.peers_ok == out.peers);
+        if (!out.complete) {
+            m_st.drops_sync_pending++;
+            out.why = std::to_string(out.peers - out.peers_ok) + "/" + std::to_string(out.peers) + " peer(s) unconfirmed, " +
+                      std::to_string(out.missing) + " raindrop(s) missing";
+        } else m_st.drops_sync_complete++;
+        return out;
+    }
+    std::size_t drops_store_size() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_store_id.size(); }
+    // The raindrop ids this node holds (servable) for [lo, hi), sorted (diagnostic / KAT).
+    std::vector<bytes32> drops_held(u64 lo, u64 hi) const {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        std::vector<bytes32> v;
+        for (auto it = m_drop_store.lower_bound(lo); it != m_drop_store.end() && it->first < hi; ++it)
+            for (const auto& [id, raw] : it->second) { (void)raw; v.push_back(id); }
+        std::sort(v.begin(), v.end());
+        return v;
+    }
+    std::string describe_drops() const {
+        const auto& s = m_st;
+        char b[600];
+        std::snprintf(b, sizeof b,
+            "drops-backfill: store=%zu invreq tx=%llu rx=%llu inv tx=%llu rx=%llu | fetch tx=%llu ids_asked=%llu fetchreq_rx=%llu served=%llu "
+            "backfilled=%llu | sync calls=%llu pending=%llu complete=%llu set_aside=%llu",
+            drops_store_size(),
+            (unsigned long long)s.drops_invreq_tx.load(), (unsigned long long)s.drops_invreq_rx.load(),
+            (unsigned long long)s.drops_inv_tx.load(), (unsigned long long)s.drops_inv_rx.load(),
+            (unsigned long long)s.drops_fetch_tx.load(), (unsigned long long)s.drops_ids_asked.load(),
+            (unsigned long long)s.drops_fetchreq_rx.load(), (unsigned long long)s.drops_served.load(),
+            (unsigned long long)s.drops_backfilled.load(), (unsigned long long)s.drops_sync_calls.load(),
+            (unsigned long long)s.drops_sync_pending.load(), (unsigned long long)s.drops_sync_complete.load(),
+            (unsigned long long)s.drops_peer_setaside.load());
+        return b;
     }
 
     // ── main thread: drain what was admitted since the last call ────────────
@@ -792,6 +921,17 @@ private:
         BlockCtx proof{};
         PeerId proof_from = 0;
     };
+    // ★ RAIN-BACKFILL: one peer's inventory of one interval range.
+    struct InvKey {
+        PeerId p = 0; u64 lo = 0, hi = 0;
+        bool operator<(const InvKey& o) const { return std::tie(p, lo, hi) < std::tie(o.p, o.lo, o.hi); }
+    };
+    struct PeerInv {
+        bool answered = false, set_aside = false;
+        std::vector<bytes32> ids;
+        u32 asks = 0;
+        Clock::time_point asked{}, fetched{}, touched{};
+    };
     static std::string hex_short(const bytes32& b) {
         static const char* d = "0123456789abcdef";
         std::string s; for (int i = 0; i < 6; ++i) { s.push_back(d[b[i] >> 4]); s.push_back(d[b[i] & 15]); } return s + "…";
@@ -917,6 +1057,10 @@ private:
         }
         if (m_fetch) m_fetch->forget_peer(p);
         if (m_serve) m_serve->forget_peer(p);
+        if (m_o.drops_floor_diff) {   // ★ RAIN-BACKFILL: a dropped peer's inventories say nothing any more
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();) it = (it->first.p == p) ? m_drop_inv.erase(it) : std::next(it);
+        }
         {
             std::lock_guard<std::mutex> lk(m_rmtx);
             for (auto& [k, r] : m_repairs) {
@@ -947,6 +1091,8 @@ private:
         if (op == FB_BLOCK_WON) { on_block_won(p, f); return; }
         if (op == FB_GETCTX) { on_getctx(p, f); return; }
         if (op == FB_CTX) { on_ctx(p, f); return; }
+        if (m_o.drops_floor_diff && op == FB_GETDROPS) { on_getdrops(p, f); return; }   // ★ RAIN-BACKFILL (gate ON only)
+        if (m_o.drops_floor_diff && op == FB_DROPINV) { on_dropinv(p, f); return; }
         m_st.fb_unknown++;                                            // a future 0x45..0x4f: count, keep socket
     }
 
@@ -993,6 +1139,19 @@ private:
             " listen=" + std::to_string(h.listen_port) + ")");
         reoffer_to(p);
         reoffer_won_to(p);   // ENROL-REPL (DROPS only; a no-op at flip 0)
+        if (m_o.drops_floor_diff) {   // ★ RAIN-BACKFILL: pull the peer's recent raindrops (both sides do this)
+            m_drop_had_peer = true;
+            const u64 tip = m_chain.tip();
+            if (tip) {
+                const u64 hi = tip + 2, lo = tip > m_o.drops_hello_bins ? tip - m_o.drops_hello_bins : 0;
+                {
+                    std::lock_guard<std::mutex> lk(m_dsmtx);
+                    PeerInv& inv = m_drop_inv[InvKey{p, lo, hi}];
+                    inv.asked = Clock::now(); inv.touched = inv.asked;
+                }
+                send_drop_invreq(p, lo, hi);
+            }
+        }
         if (h.lane_next_pos > 0) {
             Job j; j.kind = Job::Kind::Order; j.repair = false;
             j.p = h.lane_next_pos;
@@ -1039,6 +1198,7 @@ private:
             Item it;
             it.from = p; it.r = std::move(rf.receipts[i]); it.raw = std::move(rf.raw[i]);
             it.id = receipt_id(it.r);
+            if (m_o.drops_floor_diff && drop_wanted(it.id)) it.solicited = true;   // ★ RAIN-BACKFILL: a fetched raindrop
             enqueue(std::move(it));
         }
     }
@@ -1470,9 +1630,110 @@ private:
         a.id = it.id; a.r = std::move(it.r); a.raw = std::move(it.raw); a.bin = bin; a.own = false;
         a.drop = true; a.pow = pow;
         m_st.drops_foreign++;
+        if (it.solicited && drop_unwant(a.id)) m_st.drops_backfilled++;   // ★ RAIN-BACKFILL
+        drop_store_put(a.id, bin, a.raw);
         flood(a.raw, it.from);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
+    }
+
+    // ── ★ RAIN-BACKFILL: the servable raindrop store + the two frames ────────
+    void drop_store_put(const bytes32& id, u64 bin, const std::vector<u8>& raw) {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        if (!m_drop_store_id.emplace(id, bin).second) return;
+        m_drop_store[bin].emplace(id, raw);
+        // bounded: intervals older than the retain window, then the oldest interval
+        const u64 tip = m_chain.tip();
+        const u64 keep_from = tip > m_o.drops_retain_bins ? tip - m_o.drops_retain_bins : 0;
+        while (!m_drop_store.empty() &&
+               (m_drop_store.begin()->first < keep_from || m_drop_store_id.size() > m_o.drops_store_max)) {
+            if (m_drop_store.begin()->first == bin && m_drop_store.size() == 1) break;   // never evict the one just stored
+            for (const auto& [x, r] : m_drop_store.begin()->second) { (void)r; m_drop_store_id.erase(x); }
+            m_drop_store.erase(m_drop_store.begin());
+        }
+    }
+    // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
+    bool drop_held_locked(const bytes32& id) const {
+        if (m_drop_store_id.count(id)) return true;
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_drop_seen.count(id) != 0;
+    }
+    bool drop_wanted(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.count(id) != 0; }
+    bool drop_unwant(const bytes32& id) { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.erase(id) != 0; }
+    void send_drop_invreq(PeerId p, u64 lo, u64 hi) {
+        const auto f = encode_getdrops(m_o.chain, lo, hi, {});
+        if (!f.empty() && m_net.send_to(p, f)) m_st.drops_invreq_tx++;
+    }
+    void send_drop_fetch(PeerId p, u64 lo, u64 hi, const std::vector<bytes32>& ids) {
+        for (std::size_t i = 0; i < ids.size(); i += kDropsGetMaxIds) {
+            std::vector<bytes32> part(ids.begin() + static_cast<std::ptrdiff_t>(i),
+                                      ids.begin() + static_cast<std::ptrdiff_t>(std::min(ids.size(), i + kDropsGetMaxIds)));
+            const auto f = encode_getdrops(m_o.chain, lo, hi, part);
+            if (!f.empty() && m_net.send_to(p, f)) { m_st.drops_fetch_tx++; m_st.drops_ids_asked += part.size(); }
+        }
+    }
+    void on_getdrops(PeerId p, const std::vector<u8>& f) {
+        u32 chain = 0; u64 lo = 0, hi = 0; std::vector<bytes32> ids; std::string why;
+        if (!decode_getdrops(f, chain, lo, hi, ids, &why)) { m_st.malformed++; strike(p, why); return; }
+        if (chain != m_o.chain) { m_st.wrong_chain++; return; }
+        if (ids.empty()) {                                   // inventory
+            m_st.drops_invreq_rx++;
+            std::vector<bytes32> inv;
+            {
+                std::lock_guard<std::mutex> lk(m_dsmtx);
+                for (auto it = m_drop_store.lower_bound(lo); it != m_drop_store.end() && it->first < hi; ++it)
+                    for (const auto& [id, raw] : it->second) { (void)raw; if (inv.size() < kDropsInvMaxIds) inv.push_back(id); }
+            }
+            std::sort(inv.begin(), inv.end());
+            const auto out = encode_dropinv(m_o.chain, lo, hi, inv);
+            if (!out.empty() && m_net.send_to(p, out)) m_st.drops_inv_tx++;
+            return;
+        }
+        m_st.drops_fetchreq_rx++;                            // fetch: answer with FB_RECEIPTS frames
+        std::vector<std::vector<u8>> raws;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            for (const auto& id : ids) {
+                auto bi = m_drop_store_id.find(id);
+                if (bi == m_drop_store_id.end()) continue;
+                auto si = m_drop_store.find(bi->second);
+                if (si == m_drop_store.end()) continue;
+                auto ri = si->second.find(id);
+                if (ri != si->second.end()) raws.push_back(ri->second);
+            }
+        }
+        for (std::size_t i = 0; i < raws.size(); i += kFbMaxReceiptsPerFrame) {
+            std::vector<const std::vector<u8>*> v;
+            for (std::size_t k = i; k < raws.size() && k < i + kFbMaxReceiptsPerFrame; ++k) v.push_back(&raws[k]);
+            const auto fr = encode_receipts_frame(m_o.chain, v);
+            if (!fr.empty() && m_net.send_to(p, fr)) m_st.drops_served += v.size();
+        }
+    }
+    void on_dropinv(PeerId p, const std::vector<u8>& f) {
+        u32 chain = 0; u64 lo = 0, hi = 0; std::vector<bytes32> ids; std::string why;
+        if (!decode_dropinv(f, chain, lo, hi, ids, &why)) { m_st.malformed++; strike(p, why); return; }
+        if (chain != m_o.chain) { m_st.wrong_chain++; return; }
+        m_st.drops_inv_rx++;
+        std::vector<bytes32> miss;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            auto it = m_drop_inv.find(InvKey{p, lo, hi});
+            if (it == m_drop_inv.end()) return;              // unsolicited: ignored
+            PeerInv& inv = it->second;
+            inv.answered = true; inv.ids = std::move(ids);
+            const auto now = Clock::now();
+            for (const auto& id : inv.ids) if (!drop_held_locked(id)) { miss.push_back(id); m_drop_want[id] = now; }
+            if (!miss.empty()) { ++inv.asks; inv.fetched = now; }
+        }
+        if (!miss.empty()) send_drop_fetch(p, lo, hi, miss);   // fetch at once (drops_sync re-asks)
+    }
+    void drops_maint() {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        const auto now = Clock::now();
+        for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();)
+            it = (now - it->second.touched > std::chrono::minutes(10)) ? m_drop_inv.erase(it) : std::next(it);
+        for (auto it = m_drop_want.begin(); it != m_drop_want.end();)
+            it = (now - it->second > std::chrono::minutes(10)) ? m_drop_want.erase(it) : std::next(it);
     }
 
     void flood(const std::vector<u8>& raw, PeerId except) {
@@ -1819,6 +2080,7 @@ private:
             }
             pump_jobs();
             drive_repairs();
+            if (m_o.drops_floor_diff) drops_maint();   // ★ RAIN-BACKFILL
             drive_ctx();
         }
     }
@@ -1859,6 +2121,13 @@ private:
     std::vector<Admitted> m_drops;   // ★ DROPS: admitted raindrops (m_amtx)
     std::unordered_set<bytes32, Bytes32Hash> m_drop_seen;   // ★ DROPS dedup (m_mtx)
     std::deque<bytes32> m_drop_order;
+    // ★ RAIN-BACKFILL (m_dsmtx; gate ON only)
+    mutable std::mutex m_dsmtx;
+    std::map<u64, std::map<bytes32, std::vector<u8>>> m_drop_store;        // bin -> id -> raw (servable)
+    std::unordered_map<bytes32, u64, Bytes32Hash> m_drop_store_id;          // id -> bin
+    std::map<InvKey, PeerInv> m_drop_inv;
+    std::unordered_map<bytes32, Clock::time_point, Bytes32Hash> m_drop_want; // fetched ids in flight (solicited)
+    std::atomic<bool> m_drop_had_peer{false};
 
     mutable std::mutex m_pmtx;         // peers
     std::map<PeerId, PeerSt> m_peers;

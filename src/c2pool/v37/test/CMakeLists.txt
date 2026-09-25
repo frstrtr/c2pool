@@ -799,8 +799,17 @@ if (BUILD_TESTING)
     #                               and equal after a partition heal and after
     #                               a durable-log restart (the lane digest is
     #                               node-local order by design).
+    #   v37_xmr_drops_backfill_kat  ★ RAIN-BACKFILL (DROPS defect 3): a
+    #                               late joiner / partitioned node backfills
+    #                               the raindrops it missed (FB_GETDROPS /
+    #                               FB_DROPINV), a partitioned node HOLDs, the
+    #                               flip-0 relay sends no new frame, and the
+    #                               harvest of a canonical block is the same
+    #                               after a 1-deep reorg (chain-ordered
+    #                               consumption). RED on the base. ALSO on
+    #                               BOTH build.yml --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
