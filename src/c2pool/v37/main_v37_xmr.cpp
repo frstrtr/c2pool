@@ -91,6 +91,7 @@
 #include "xmr/xmr_coinbase_authority.hpp"  //  coinbase-authority booking
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
+#include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
 #include "impl/xmr/node/minijson.hpp"
@@ -200,6 +201,7 @@ static bool g_lane_suspended_now = false;                  // R-C rework-2: main
 // GAP-2 relay knobs (design §6). All default OFF: with neither --relay-listen nor
 // --relay-peer the daemon is byte-identical to the stand-in build.
 static std::string   g_relay_listen;                    // --relay-listen HOST:PORT
+static std::optional<::v37::bytes32> g_pool_genesis;    // POOL-LINEAGE: --pool-genesis <hex64> (unset = the network default)
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (enrol + arm only once the native tip >= H)
@@ -218,6 +220,18 @@ static bool          g_no_relay_serve = false;          // --no-relay-serve
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 static std::string   g_relay_bind = "none";             // --relay-bind none|rbind (rbind needs SEAM-1 in the template)
 static bool relay_enabled() { return !g_relay_listen.empty() || !g_relay_peers.empty(); }
+// POOL-LINEAGE: the pool genesis id (--pool-genesis, else the per-network
+// default) and the block-level pool_tag every lane coinbase commits.
+static std::uint8_t lineage_network_byte(MoneroNetwork n) {
+    return n == MoneroNetwork::Mainnet ? 0 : n == MoneroNetwork::Testnet ? 1 : n == MoneroNetwork::Stagenet ? 2 : 3;
+}
+static ::v37::bytes32 pool_genesis_of(const XmrNodeConfig& cfg) {
+    return g_pool_genesis ? *g_pool_genesis
+                          : c2pool::v37n::xmr::lineage::default_pool_genesis(lineage_network_byte(cfg.network));
+}
+static ::v37::bytes32 pool_tag_of(const XmrNodeConfig& cfg) {
+    return c2pool::v37n::xmr::lineage::pool_tag_for(cfg.lane_chain, cfg.lane_params, pool_genesis_of(cfg));
+}
 static bool split_hostport(const std::string& s, std::string& host, std::uint16_t& port) {
     const auto c = s.rfind(':');
     if (c == std::string::npos || c == 0 || c + 1 >= s.size()) return false;
@@ -1482,6 +1496,8 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::uint64_t recompute_captured = 0, recompute_unavailable = 0, recompute_ok = 0, recompute_mismatch = 0;
     std::optional<::v37::ScriptRef> cba_payee_ref;
     std::uint64_t cba_fetches = 0, cba_booked = 0, cba_not_lane = 0, cba_refused = 0;
+    std::uint64_t cba_lineage_other[4] = {0, 0, 0, 0};   // POOL-LINEAGE: not-lane by class (own unused / foreign / untagged / malformed)
+    std::set<std::string> cba_lineage_seen;              // POOL-LINEAGE: bids logged once
     std::uint64_t cba_fetch_failed = 0;   // R-C rework-3 (D6): get_block transport/JSON failures -- transient, NOT refusals
     std::uint64_t cba_stale_root = 0;     // R-C rework-3 (D7): matched a historical root older than the age bound -> refused
 
@@ -1594,11 +1610,14 @@ static int run_live(const XmrNodeConfig& cfg) {
         // fee model ON (S1/S4): the residual sink IS the donation address, and a lane coinbase
         // without the one mandatory donation output (owed + 1 + residual) is REFUSED here (every node,
         // own wins included). OFF: master's booking against the configured residual sink.
+        // POOL-LINEAGE: only a block carrying OUR pool_tag is a lane block; any
+        // other is "not-lane:" (an ordinary Monero block for this pool).
+        const ::v37::bytes32* ptag = cba_scfg->pool_tag ? &*cba_scfg->pool_tag : nullptr;
         if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))
             return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, cba_fx->pay_of(),
-                                                                          donation_net_of(cfg.network));
+                                                                          donation_net_of(cfg.network), ptag);
         return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
-                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
+                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of(), ptag);
     };
     // fetch + decode one block's coinbase under coinbase authority (shared by the chain path and the fast path)
     // D6a: WHERE the blob comes from. p2p-first + native templates: the native chain
@@ -1893,7 +1912,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                 // matched root but fail-closed on an output (unmapped payee): the
                 // mapped part is liability per payee, the unmapped sum unattributed.
                 if (bk.payout_partial) { payout = bk.payout; out.payout_decoded = true; out.unattributed_pico = bk.unmapped_total; }
-            } else ++cba_not_lane;
+            } else {
+                ++cba_not_lane;
+                if (bk.lineage_gated && bk.lineage != c2pool::v37n::xmr::credit::BlockLineage::Own) {   // POOL-LINEAGE
+                    ++cba_lineage_other[static_cast<std::size_t>(bk.lineage)];
+                    if (cba_lineage_seen.insert(bid).second)
+                        std::printf("cba: lineage h=%llu bid=%s… %s -> ordinary block (not booked, not held)\n",
+                                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(),
+                                    c2pool::v37n::xmr::credit::to_string(bk.lineage));
+                }
+            }
             return false;
         }
         // from here the payout side is fully decoded (proven coinbase authority, deterministic r)
@@ -2378,6 +2406,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         // recon(A+B credit): the template commits THIS node's receipt-lane cut (P, spine) on-chain (0x02 tail)
         scfg.credit_cut_source = [&](std::uint64_t& P, ::v37::bytes32& dg) -> bool {
             auto s = node.engine().snapshot(cfg.lane_chain); if (!s) return false; P = s->next_pos; dg = s->digest; return true; };
+        // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
+        // and only blocks carrying it are booked as lane blocks here.
+        scfg.pool_tag = pool_tag_of(cfg);
+        std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
+                    hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
+                    hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);
         std::printf("ab: on-chain credit cut ARMED (0x02 tail V37C|P|spine); feed=%s lag=%llums wire-out=%s wire-in=%s mutate=%lld\n",
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
@@ -2731,6 +2765,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             // map_epoch/rb_index/stripe 0), carried in HELLO; a peer of another
             // pool is refused at HELLO as TAG_MISMATCH.
             ro.pool_id = relay::pool_id_of(cfg.lane_chain, cfg.lane_params);
+            ro.pool_id->genesis = pool_genesis_of(cfg);   // POOL-LINEAGE: another genesis = TAG_MISMATCH field=pool_genesis
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -2861,7 +2896,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                             relay::hex32(ro.pool_id->lane_tag).c_str(), static_cast<unsigned>(cfg.lane_chain),
                             ro.pool_id->version, ro.pool_id->authority,
                             relay::hex32(::c2pool::v37n::rb::geometry_digest(cfg.lane_params)).c_str(),
-                            relay::kHelloBytesPoolId);
+                            relay::encode_hello(relay_node->our_hello()).size());
+                std::printf("relay: POOL-LINEAGE pool_genesis=%s in HELLO (+%zu B)\n",
+                            relay::hex32(*ro.pool_id->genesis).c_str(), relay::kHelloPoolGenesisBytes);
                 if (bind == relay::BindMode::None)
                     std::printf("relay: NOTE bind=none -- receipts are PoW-verified (opening -> tree_root -> RandomX >= share_diff) "
                                 "but the payee/give-author are NOT PoW-bound (run --relay-bind rbind: SEAM-1 writes rbind into the coinbase 0x02 region)\n");
@@ -3268,11 +3305,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cut_ok, (unsigned long long)cut_pending, (unsigned long long)cut_miss, (unsigned long long)cut_repaired, (unsigned long long)cut_mismatch, (unsigned long long)cut_absent, (unsigned long long)cut_fold_refused,
                             (unsigned long long)wire_tx, (unsigned long long)wire_rx, (unsigned long long)wire_prefold, (unsigned long long)wire_pending, (unsigned long long)wire_hit, (unsigned long long)wire_mismatch, (unsigned long long)wire_diverged,
                             last_credit_line.c_str());
-                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu fetch_failed=%llu stale_root=%llu root_unknown_bids=%llu ring=%zu max_root_age=%llu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu\n",
+                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu fetch_failed=%llu stale_root=%llu root_unknown_bids=%llu ring=%zu max_root_age=%llu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu | lineage foreign=%llu untagged=%llu malformed=%llu\n",
                             (unsigned long long)cba_fetches, (unsigned long long)cba_booked, (unsigned long long)cba_not_lane, (unsigned long long)cba_refused,
                             (unsigned long long)cba_fetch_failed, (unsigned long long)cba_stale_root,
                             cba_lane_root_unknown, cba_ring.size(), (unsigned long long)cba_max_root_age,
-                            (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch);
+                            (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch,
+                            (unsigned long long)cba_lineage_other[1], (unsigned long long)cba_lineage_other[2], (unsigned long long)cba_lineage_other[3]);
                 const auto& cs = cba_src.stats();
                 std::printf("  cba-src: %s native_hits=%llu native_hold=%llu holding=%zu get_block_rpc=%llu rpc_failed=%llu | compare equal=%llu MISMATCH=%llu unavailable=%llu | fallback_used=%llu\n",
                             cba_src.native_mode() ? "native" : "monerod",
@@ -3658,6 +3696,15 @@ int main(int argc, char** argv) {
         else if (a == "--relay-feed-monerod-compare") g_relay_feed_monerod_compare = true;
         // GAP-2 relay knobs
         else if (a == "--relay-listen")             g_relay_listen = next("");
+        else if (a == "--pool-genesis") {           // POOL-LINEAGE
+            const std::string h = next("");
+            ::v37::bytes32 g{};
+            if (!c2pool::v37n::xmr::lineage::parse_genesis_hex(h, g)) {
+                std::printf("REFUSED: --pool-genesis wants 64 hex digits (the pool's 32-byte genesis id), got \"%s\"\n", h.c_str());
+                return 2;
+            }
+            g_pool_genesis = g;
+        }
         else if (a == "--relay-peer")               g_relay_peers.push_back(next(""));
         else if (a == "--drops-enrol")              g_drops_enrol.push_back(next(""));
         else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = std::stoull(next("0"));
@@ -3806,6 +3853,10 @@ int main(int argc, char** argv) {
                 "  --data-dir <path>            override the settlement store dir\n"
                 " GAP-2 receipt relay (c2pool<->c2pool over TCP; OFF by default; --coinbase v37; mainnet only with rbind):\n"
                 "  --relay-listen HOST:PORT     bind the receipt relay\n"
+                "  --pool-genesis <hex64>       POOL-LINEAGE: this pool's 32-byte genesis id (default: the fixed per-network\n"
+                "                               id = the ONE default pool); every node of a pool runs the same id, a new pool\n"
+                "                               picks a random one (openssl rand -hex 32). pool_tag = sha256d('V37PT'||lane_tag||id)\n"
+                "                               is committed in every lane coinbase; blocks without OUR tag are ordinary blocks\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
                 "  --drops-enrol ID|ADDR        DROPS (only in a V37_ACTIVATE_CONSENSUS_V1 build): enrol this payee (64-hex identity\n"
                 "                               key or XMR address) ex ante at the native TIP (repeatable); ignored when dormant\n"

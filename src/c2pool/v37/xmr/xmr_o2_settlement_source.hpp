@@ -200,6 +200,10 @@ struct XmrCoinbaseContext {
     // winner folds E_b at. Carried as the 0x02 tail (xmr_credit_cut.hpp).
     bool                  has_credit_cut = false;
     credit::CreditCut     credit_cut;
+    // POOL-LINEAGE: the pool_tag this pool commits in the V37C tail (the V37P
+    // field, xmr_credit_cut.hpp). Unset => no field (master's bytes).
+    bool                  has_pool_tag = false;
+    ::v37::bytes32        pool_tag{};
 
     std::uint64_t budget() const { return base_reward + fees; }
 };
@@ -432,6 +436,10 @@ public:
         std::vector<std::uint8_t> t;
         if (x6::residual_folds_into_fixed(m_inputs))
             t = fee::encode_donation_owed_tail(x6::fold_identity_owed(m_inputs));
+        if (m_ctx.has_pool_tag) {   // POOL-LINEAGE: V37P just before the credit cut
+            const std::vector<std::uint8_t> f = credit::encode_pool_tag_field(m_ctx.pool_tag);
+            t.insert(t.end(), f.begin(), f.end());
+        }
         if (m_ctx.has_credit_cut) {
             const std::vector<std::uint8_t> c = credit::encode_tail(m_ctx.credit_cut);
             t.insert(t.end(), c.begin(), c.end());

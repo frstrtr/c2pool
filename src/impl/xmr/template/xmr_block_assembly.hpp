@@ -113,6 +113,12 @@ inline constexpr std::size_t CREDIT_CUT_TAIL_BYTES = 44;  // 4 magic + 8 u64 P +
 // fee::kDonationOwedTailBytes == 12, "V37D" || u64le; mirrored and
 // static_asserted in v37_xmr_fee_model_kat). Present only under the gate.
 inline constexpr std::size_t DONATION_OWED_TAIL_BYTES = 12;  // 4 magic + 8 u64 owed_in
+// POOL-LINEAGE: the V37C tail's versioned pool-tag field ("V37P" | u8 ver |
+// b32 pool_tag, consumer tree xmr_credit_cut.hpp credit::kPoolTagFieldBytes;
+// static_asserted in v37_xmr_pool_lineage_kat), just before the credit cut.
+// With it the 0x02 payload can exceed 127 B (rbind + V37D + V37P + V37C), so
+// the length is a TWO-byte varint there: the probe below reads it as a varint.
+inline constexpr std::size_t POOL_TAG_FIELD_BYTES = 37;      // 4 magic + 1 version + 32 pool_tag
 
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
@@ -363,7 +369,7 @@ struct BlockBytes {
     std::size_t nonce_offset = 0;            // 4-B header nonce, same offset in BOTH blobs (39 for v16 / 5-B timestamp varint)
     std::size_t miner_tx_offset = 0;         // == header size
     std::size_t extra_nonce_offset = 0;      // in full_blob: first byte of the 0x02 payload
-    std::size_t extra_nonce_size = 0;        // 4..14 (padded) [+32 SEAM-1 rbind] [+44 credit-cut tail]
+    std::size_t extra_nonce_size = 0;        // 4..14 (padded) [+32 SEAM-1 rbind] [+12 V37D] [+37 V37P pool tag] [+44 credit-cut tail]
     std::size_t merkle_root_offset = 0;      // in full_blob: the 32-B root inside the 0x03 tag
     std::size_t miner_tx_size = 0;           // incl. trailing rct_type byte
     ::xmr::coin::Hash256 merkle_root{};      // MM commitment root patched at merkle_root_offset (== X6 mm_root)
@@ -698,14 +704,23 @@ private:
         std::size_t no = 0, eo = 0, ro = 0; hash root;
         const std::vector<std::uint8_t> full = rec.m_tpl->get_block_template_blob(rec.m_internal_tid, 0, no, eo, ro, root);
         const std::size_t header = no + NONCE_SIZE;
-        // 0x02 tag layout: 02 | varint(len) | payload ; len < 0x80 so one byte
-        if (eo < 2 || eo > full.size() || full[eo - 2] != TX_EXTRA_NONCE) {
+        // 0x02 tag layout: 02 | varint(len) | payload. len < 0x80 is one byte;
+        // POOL-LINEAGE: with rbind + V37D + V37P + V37C it can reach 0x80..0xff
+        // (two bytes: lo|0x80, 0x01).
+        if (eo < 2 || eo > full.size()) {
             if (why) *why = "internal: extra-nonce tag layout";
             return false;
         }
-        rec.m_extra_nonce_size = full[eo - 1];
+        if (full[eo - 2] == TX_EXTRA_NONCE && full[eo - 1] < 0x80) {
+            rec.m_extra_nonce_size = full[eo - 1];
+        } else if (eo >= 3 && full[eo - 3] == TX_EXTRA_NONCE && (full[eo - 2] & 0x80) && full[eo - 1] == 0x01) {
+            rec.m_extra_nonce_size = static_cast<std::size_t>(full[eo - 2] & 0x7f) | 0x80;
+        } else {
+            if (why) *why = "internal: extra-nonce tag layout";
+            return false;
+        }
         if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
-            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + DONATION_OWED_TAIL_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; POOL-LINEAGE: +37 V37P
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }
