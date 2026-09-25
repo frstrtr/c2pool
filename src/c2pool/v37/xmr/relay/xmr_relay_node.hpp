@@ -83,8 +83,14 @@
 // GETORDER [a0, a0) whose spine answer is the peer's digest at a0, compared
 // with ours -- equal (or unknown) -> GETORDER [a0, P) and the caller replays
 // its OWN order over [0, a0) followed by the served [a0, P) (repair_a0()); the
-// digest gate at P decides exactly as before. A peer whose digest at a0
-// DIFFERS from ours (or whose [a0, P) replay does not reach the spine) proves
+// digest gate at P decides exactly as before. The caller may instead replay
+// the last winner-side order it reconstructed (the SHADOW,
+// xmr_repair_replay.hpp) as that prefix and registers its digests
+// (note_alt_digests) so the probe accepts them too: lane orders never
+// re-converge after a divergence, so the shadow CHAINS the winner-side order
+// from repair to repair past the horizon. A peer whose digest at a0 DIFFERS
+// from ours and the shadow's (or whose [a0, P) replay reaches the spine from
+// neither) proves
 // the divergence lies below its horizon: that peer is set aside as DEEP and,
 // when every ready peer is, the repair reports a loud DEEP-DIVERGENCE status
 // (repair_deep_divergence()) instead of a silent "none serves" -- still
@@ -434,6 +440,24 @@ public:
         while (!m_pos_digest.empty() && m_pos_digest.begin()->first + horizon + 1 < next_after)
             m_pos_digest.erase(m_pos_digest.begin());
     }
+    // REPAIR-HORIZON: the digests of the last winner-side order this node
+    // reconstructed (RepairReplayer's SHADOW, xmr_repair_replay.hpp) -- a
+    // prefix probe also accepts a peer whose digest at a0 equals one of these,
+    // so the winner-side order chains from repair to repair past the horizon.
+    void note_alt_digests(const std::multimap<u64, bytes32>& d) {
+        std::lock_guard<std::mutex> lk(m_dmtx);
+        m_alt_digest = d;
+    }
+    bool alt_digest_is(u64 pos, const bytes32& d) const {
+        std::lock_guard<std::mutex> lk(m_dmtx);
+        auto [b, e] = m_alt_digest.equal_range(pos);
+        for (auto it = b; it != e; ++it) if (it->second == d) return true;
+        return false;
+    }
+    bool alt_digest_known(u64 pos) const {
+        std::lock_guard<std::mutex> lk(m_dmtx);
+        return m_alt_digest.count(pos) != 0;
+    }
     // Our recorded lane digest at position `pos` (the spine probe's answer).
     std::optional<bytes32> digest_at(u64 pos) const {
         std::lock_guard<std::mutex> lk(m_dmtx);
@@ -578,10 +602,12 @@ public:
     // horizon: ids cover [a0, P) and the caller replays its OWN first a0 lane
     // pushes before them (the peer's digest at a0 matched ours, or was unknown;
     // the digest gate at P decides either way).
-    u64 repair_a0(u64 P, const bytes32& spine) const {
+    u64 repair_a0(u64 P, const bytes32& spine, std::optional<bytes32>* peer_digest_at_a0 = nullptr) const {
         std::lock_guard<std::mutex> lk(m_rmtx);
         auto it = m_repairs.find(std::make_pair(P, spine));
-        return (it == m_repairs.end() || it->second.st == Repair::St::Idle) ? 0 : it->second.a0;
+        if (it == m_repairs.end() || it->second.st == Repair::St::Idle) return 0;
+        if (peer_digest_at_a0 && it->second.has_a0_digest) *peer_digest_at_a0 = it->second.a0_digest;
+        return it->second.a0;
     }
     // REPAIR-HORIZON: every ready peer was tried and at least one of them
     // proved (prefix probe or a failed [a0, P) replay) that our order diverges
@@ -854,6 +880,7 @@ private:
         std::map<PeerId, u64> a0_of;
         u64 a0 = 0;
         bool probing = false;
+        bytes32 a0_digest{}; bool has_a0_digest = false;   // the serving peer's digest at a0 (probe answer)
         PeerId rearm = 0, prefer = 0;
         std::map<PeerId, u64> deep;
         Clock::time_point since = Clock::now();
@@ -864,7 +891,7 @@ private:
         u32 refetches = 0;
         void reset() {
             st = St::Idle; ids.clear(); cursor = 0; cur = 0; served_by = 0; since = Clock::now();
-            a0 = 0; probing = false;
+            a0 = 0; probing = false; has_a0_digest = false;
             cached_seen = 0; fetch_tried.clear(); refetches = 0;
         }
     };
@@ -1695,6 +1722,8 @@ private:
         // REPAIR
         if (j->probe) {   // REPAIR-HORIZON: the peer's digest at a0 vs ours
             const auto ours = digest_at(j->a);
+            const bool alt_known = alt_digest_known(j->a);   // the shadows (reconstructed winner-side orders)
+            const bool alt_eq = o.have_spine && alt_digest_is(j->a, o.spine_digest);
             bool go = false; std::string alarm;
             {
                 std::lock_guard<std::mutex> lk(m_rmtx);
@@ -1703,15 +1732,17 @@ private:
                 Repair& r = it->second;
                 if (r.st != Repair::St::Ordering || r.cur != p || !r.probing || r.a0 != j->a) return;
                 r.probing = false;
-                if (o.p_served == j->a && o.have_spine && ours && o.spine_digest != *ours) {
+                if (o.p_served == j->a && o.have_spine && (ours || alt_known) && !(ours && o.spine_digest == *ours) && !alt_eq) {
+                    const bool fresh = r.deep.emplace(p, j->a).second;   // log a peer's DEEP once per repair
                     r.deep[p] = j->a;
                     m_st.repair_deep++;
                     r.tried.insert(p); r.reset();
-                    alarm = "relay: REPAIR-HORIZON repair of P=" + std::to_string(r.P) + ": peer " + std::to_string(p) +
+                    if (fresh) alarm = "relay: REPAIR-HORIZON repair of P=" + std::to_string(r.P) + ": peer " + std::to_string(p) +
                             " retains only positions >= " + std::to_string(j->a) + " and its lane digest there DIFFERS from ours -- "
                             "our order diverges from the winner's below that peer's vault horizon (peer set aside as DEEP)";
                 } else {
-                    if (o.have_spine && ours) m_st.repair_prefix_ok++; else m_st.repair_prefix_unknown++;
+                    if (o.have_spine && (ours || alt_known)) m_st.repair_prefix_ok++; else m_st.repair_prefix_unknown++;
+                    if (o.p_served == j->a && o.have_spine) { r.a0_digest = o.spine_digest; r.has_a0_digest = true; }
                     r.since = Clock::now();
                     go = true;
                 }
@@ -2078,6 +2109,7 @@ private:
 
     mutable std::mutex m_dmtx;         // pos -> lane digest (the spine probe)
     std::map<u64, bytes32> m_pos_digest;
+    std::multimap<u64, bytes32> m_alt_digest;   // REPAIR-HORIZON: the shadows' digests (note_alt_digests)
 
     ::c2pool::v37n::FrameVault m_vault;
 
