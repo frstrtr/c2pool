@@ -521,6 +521,34 @@ if (BUILD_TESTING)
     add_test(NAME xmr_native_dos_dup_block_kat COMMAND xmr_native_dos_dup_block_kat)
     set_tests_properties(xmr_native_dos_dup_block_kat PROPERTIES TIMEOUT 300)
 
+    # FORK-FUSE: the node must survive an unknown Monero hard fork safely. A
+    # block whose header major_version is above MAX_IMPLEMENTED_HF_VERSION is
+    # refused WITHOUT a peer penalty and trips the unknown-fork fuse (templates
+    # and tx admission withdrawn); a relayed tx of a format above the
+    # implemented one is NotUnderstood, never a drop offence; malformed v16
+    # blocks and txs keep their exact verdicts. Real index + real txpool, and a
+    # live levin leg over loopback with the real peer pool. Builds against the
+    # pre-fix tree too (and fails there). Added to BOTH --target lists in
+    # build.yml.
+    add_executable(xmr_native_unknown_fork_fuse_kat xmr_unknown_fork_fuse_kat.cpp)
+    target_include_directories(xmr_native_unknown_fork_fuse_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_unknown_fork_fuse_kat PRIVATE xmr_native_txpool xmr_coin)
+    target_compile_features(xmr_native_unknown_fork_fuse_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_unknown_fork_fuse_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_unknown_fork_fuse_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_unknown_fork_fuse_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_unknown_fork_fuse_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_unknown_fork_fuse_kat COMMAND xmr_native_unknown_fork_fuse_kat)
+    set_tests_properties(xmr_native_unknown_fork_fuse_kat PROPERTIES TIMEOUT 300)
+
     add_executable(xmr_native_template_kat xmr_native_template_kat.cpp)
     target_include_directories(xmr_native_template_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src

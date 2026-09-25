@@ -48,6 +48,10 @@
 #include "impl/xmr/native/consensus/xmr_weight.hpp"
 #include "impl/xmr/native/contracts/types.hpp"
 
+// Feature marker: EvalStatus::UnknownFork, peek_block_header() and the index's
+// unknown-fork counters exist (the fork-fuse KAT builds against trees without them).
+#define C2POOL_XMR_UNKNOWN_FORK_FUSE 1
+
 namespace c2pool::xmr::native {
 
 enum class EvalStatus : std::uint8_t {
@@ -58,6 +62,10 @@ enum class EvalStatus : std::uint8_t {
     TxIdMismatch,     // a body does not hash to the id the block commits to
     BadCoinbase,      // the coinbase fields did not read back
     WeightOverflow,   // the weight sum does not fit
+    // The header's major_version is above MAX_IMPLEMENTED_HF_VERSION. The body
+    // was NOT parsed: its layout belongs to a fork this build does not have
+    // rules for, so nothing about it can be judged. NOT the sender's fault.
+    UnknownFork,
 };
 
 inline const char* to_string(EvalStatus s) noexcept {
@@ -69,13 +77,15 @@ inline const char* to_string(EvalStatus s) noexcept {
         case EvalStatus::TxIdMismatch:    return "TxIdMismatch";
         case EvalStatus::BadCoinbase:     return "BadCoinbase";
         case EvalStatus::WeightOverflow:  return "WeightOverflow";
+        case EvalStatus::UnknownFork:     return "UnknownFork";
     }
     return "?";
 }
 
-// Every one of these is the sender's fault: the bytes are self-inconsistent.
+// Every one of these but UnknownFork is the sender's fault: the bytes are
+// self-inconsistent. UnknownFork means "not understood", never "invalid".
 inline constexpr bool eval_status_is_peer_fault(EvalStatus s) noexcept {
-    return s != EvalStatus::Ok;
+    return s != EvalStatus::Ok && s != EvalStatus::UnknownFork;
 }
 
 // The per-transaction results, kept because the txpool (C3) and the tx-event
@@ -102,6 +112,28 @@ inline EvalStatus evaluate_block(const BlockEntry& entry, EvaluatedBlock& out,
                                  std::string& why) {
     out = EvaluatedBlock{};
     why.clear();
+
+    // HEADER FIRST. A block from a fork above the implemented range is not
+    // parsed at all: its body layout, its id and its PoW are the next fork's,
+    // and judging them by this build's rules would call an honest upgraded
+    // peer a liar. The header fields and the coinbase height are handed back
+    // (parsed.header, coinbase.height) so the caller can place the block and
+    // trip the fuse. A header that does not read falls through to parse_block,
+    // which reports the same failure as before.
+    {
+        BlockHeaderPeek pk;
+        if (peek_block_header(entry.block_blob, pk)
+            && pk.header.major_version > MAX_IMPLEMENTED_HF_VERSION) {
+            out.input.parsed.header      = pk.header;
+            out.input.parsed.header_size = pk.header_size;
+            if (pk.height_known) out.input.coinbase.height = pk.coinbase_height;
+            why = "block major_version " + std::to_string(pk.header.major_version)
+                + " is above the highest fork this build implements ("
+                + std::to_string(MAX_IMPLEMENTED_HF_VERSION)
+                + "): not understood, not judged";
+            return EvalStatus::UnknownFork;
+        }
+    }
 
     const BlockParseStatus bs = parse_block(entry.block_blob, out.input.parsed);
     if (bs != BlockParseStatus::Ok) {

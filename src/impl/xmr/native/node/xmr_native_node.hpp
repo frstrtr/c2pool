@@ -316,6 +316,9 @@ struct NativeNodeConfig {
     // long an own-mined tip may go unadopted by every peer before the node
     // abandons it and follows the peers' chain. 0 disables.
     std::uint64_t            own_fork_bound_ms = 240'000;
+    // FORK-FUSE-2: the unknown-fork watch's stall period
+    // (ChainIndexOptions::unknown_fork_stall_ms). 0 = the 30 min default.
+    std::uint64_t            unknown_fork_stall_ms = 0;
 
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
@@ -416,6 +419,23 @@ struct NodeStatus {
     std::uint64_t                own_invalid_refused = 0;
     std::uint64_t                own_forks_abandoned = 0;
     std::uint64_t                pool_already_mined = 0;
+    // FORK-FUSE-2: the unknown-fork watch. state = normal / suspect / tripped;
+    // blocks = above-version blocks refused (never charged); peers = distinct
+    // peer groups that sent one since the tip last extended; alarms = SUSPECT
+    // alarms raised; trips / clears; ids = above-version ids held back from the
+    // want list, held = how often the want list held one back; not_understood
+    // = relayed txs of a format above the implemented one.
+    UnknownForkState             uf_state = UnknownForkState::Normal;
+    std::uint64_t                uf_blocks = 0;
+    std::size_t                  uf_peers = 0;
+    std::uint64_t                uf_alarms = 0;
+    std::uint64_t                uf_trips = 0;
+    std::uint64_t                uf_clears = 0;
+    std::uint64_t                uf_stalled_s = 0;
+    std::uint64_t                uf_stall_s = 0;
+    std::size_t                  uf_ids = 0;
+    std::uint64_t                uf_held = 0;
+    std::uint64_t                uf_not_understood = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -909,6 +929,20 @@ public:
         s.own_invalid_refused     = index_.own_blocks_refused_invalid();
         s.own_forks_abandoned     = index_.own_forks_abandoned();
         s.pool_already_mined      = s.txpool.rejected_already_mined;
+        {
+            const UnknownForkWatch w = index_.unknown_fork_watch();
+            s.uf_state          = w.state();
+            s.uf_blocks         = index_.unknown_fork_blocks();
+            s.uf_peers          = w.distinct_peers();
+            s.uf_alarms         = w.suspect_alarms();
+            s.uf_trips          = w.trips();
+            s.uf_clears         = w.clears();
+            s.uf_stalled_s      = w.stalled_ms() / 1000;
+            s.uf_stall_s        = w.stall_ms() / 1000;
+            s.uf_ids            = index_.unknown_fork_ids();
+            s.uf_held           = index_.unknown_fork_refetch_held();
+            s.uf_not_understood = s.txpool.rejected_not_understood;
+        }
         return s;
     }
 
@@ -1395,6 +1429,7 @@ private:
         o.tie = cfg_.fork_tie;          // D-14, driven by --same-height-tiebreak
         o.own_fork_bound_ms = cfg_.own_fork_bound_ms;
         o.consumer_window = cfg_.consumer_window;   // COLD-BOOT-2
+        if (cfg_.unknown_fork_stall_ms) o.unknown_fork_stall_ms = cfg_.unknown_fork_stall_ms;
         return o;
     }
 
@@ -1500,6 +1535,17 @@ private:
                                           note_(line);
                                           std::fprintf(stderr, "%s\n", line.c_str());
                                       }
+                                  }
+                                  // FORK-FUSE-2: the unknown-fork watch
+                                  // trips on quorum + stall and clears on a
+                                  // 2-block v16 extension; it prints its own
+                                  // loud line. The tx gate below follows it.
+                                  {
+                                      const auto ufe = index_.check_unknown_fork(now);
+                                      if (ufe == UnknownForkWatch::Event::Tripped)
+                                          note_("[HF-FUSE] unknown-fork TRIPPED: templates and tx admission withdrawn");
+                                      else if (ufe == UnknownForkWatch::Event::Cleared)
+                                          note_("[HF-FUSE] unknown-fork CLEARED: templates and tx admission resumed");
                                   }
                                   publish_tx_gate_();
                                   // GOOD-CITIZEN: feed the wall clock (unix
