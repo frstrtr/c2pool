@@ -145,6 +145,15 @@ public:
     // the K the fold will later ask for.
     explicit DropsWiring(std::uint32_t K) : m_harvester(K) {}
 
+    // A lane whose share target is NOT the W2 leading-zero schedule (the XMR
+    // lane: a Monero difficulty, normalised onto a fixed leading-zero geometry
+    // by xmr/xmr_drops_wiring.hpp) supplies its own interval -> lz map, so the
+    // share-only rows declare_into synthesises carry the SAME h_T as the rows
+    // its raindrops opened. The one-argument constructor keeps the W2 schedule
+    // (consensus_lz), so the BTC/DASH shell is unchanged.
+    DropsWiring(std::uint32_t K, ShareCountBook::LzOfInterval lz_of)
+        : m_harvester(K), m_lz_of(std::move(lz_of)) {}
+
     DropsWiring(const DropsWiring&) = delete;
     DropsWiring& operator=(const DropsWiring&) = delete;
 
@@ -221,7 +230,7 @@ public:
         std::lock_guard<std::recursive_mutex> lk(m_mtx);
         const std::size_t n = m_shares.declare_into(
             m_harvester, bury_before,
-            [](u64 bin) { return consensus_lz(bin); },
+            m_lz_of ? m_lz_of : ShareCountBook::LzOfInterval([](u64 bin) { return consensus_lz(bin); }),
             &m_enroll);
         m_declared += n;
         return n;
@@ -278,6 +287,7 @@ private:
     DropHarvester   m_harvester;
     EnrollmentBook  m_enroll;
     ShareCountBook  m_shares;
+    ShareCountBook::LzOfInterval m_lz_of{};   // empty => the W2 schedule
     std::uint64_t   m_declared = 0;
 };
 

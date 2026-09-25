@@ -304,6 +304,14 @@ public:
     // boot. Seeded from the anchor's rct_output_count, 0 on a genesis chain.
     std::uint64_t rct_output_count() const noexcept { return rct_output_counter_; }
 
+    // A snapshot resume (seed_direct) does not carry the counter, so after one
+    // it restarts from 0 plus the replayed tail. A caller that restored the
+    // output set to the SAME tip (NativeNode with a persisted output-set
+    // overlay) re-seats it to that sets frontier, so the next blocks first
+    // output is numbered where the set expects it. Disconnects of the replayed
+    // tail keep subtracting their recorded counts, so the value stays exact.
+    void reseat_rct_output_count(std::uint64_t n) noexcept { rct_output_counter_ = n; }
+
 private:
     using Key = std::string;   // 32 raw bytes; std::array has no hash by default
 

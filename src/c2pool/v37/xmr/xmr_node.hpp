@@ -303,25 +303,8 @@ public:
 
         // 3) RecoveryDriver BEFORE engine.start() — rebuild ledger + hw + cursor.
         {
-            RecoveryDriver rec(*m_store, m_cfg.lane_chain);
             bool ok = false;
-            m_boot_digests.clear(); m_boot_since.clear();
-            m_boot_digests.push_back(m_ledger.owed_digest());   // the empty anchor / anchor-boot state
-            m_boot_since.push_back(0);
-            // R-C rework-3 (D7): pair every replayed digest state with the coin
-            // height it became current at (Finalize: bin_height - D_conf; the
-            // formula XmrFinalizeDriver::since_of_bin applies live).
-            std::uint64_t since = 0;
-            m_recovered = rec.recover(m_ledger, ok, {}, [this, &since](const OwedLedger& l, const SettleEvent& e) {
-                if (e.kind == SettleEvKind::Finalize)
-                    since = e.bin_height >= m_cfg.d_conf ? e.bin_height - m_cfg.d_conf : 0;
-                const ::v37::bytes32 d = l.owed_digest();
-                if (!(m_boot_digests.back() == d)) {   // R-B(i) follow-up: canonical D(c) history
-                    m_boot_digests.push_back(d);
-                    m_boot_since.push_back(since);
-                }
-            });
-            m_boot_last_since = since;
+            m_recovered = replay_store(m_ledger, m_boot_digests, m_boot_since, m_boot_last_since, ok);
             if (!ok)
                 throw std::runtime_error(
                     "XmrNode: settlement store is torn (F2 fail-closed) — refusing to start");
@@ -403,6 +386,39 @@ public:
         log("bring_up: complete");
     }
 
+    // ── D2 (minority converges to majority): the in-process LINEAGE SWITCH ──
+    // FinalizeConnect has REWRITTEN the event log to the re-derived (majority)
+    // lineage in one atomic store batch. Replay it into a fresh OwedLedger
+    // exactly as bring_up does (same RecoveryDriver, same (digest, since) boot
+    // history), move it INTO m_ledger (the settlement provider and the fixture
+    // hold the ledger by reference: the object must stay the same), rebase the
+    // finalize driver (found-block maps cleared, write-ahead seq and since
+    // continued; cursor, high-water, observers and gates untouched). The caller
+    // re-drives the new pending set and re-seeds its candidate ring from
+    // boot_digest_history(). Returns false (nothing changed) on a torn store.
+    bool relineage(std::string* why = nullptr) {
+        if (!m_store || !m_finalize) { if (why) *why = "node not up"; return false; }
+        OwedLedger fresh(m_cfg.lane_chain);
+        std::vector<::v37::bytes32> ds; std::vector<std::uint64_t> ss; std::uint64_t last = 0;
+        bool ok = false;
+        const RecoveredState st = replay_store(fresh, ds, ss, last, ok);
+        if (!ok) { if (why) *why = "the rewritten store does not replay (torn)"; return false; }
+        m_ledger = std::move(fresh);
+        m_boot_digests = std::move(ds); m_boot_since = std::move(ss); m_boot_last_since = last;
+        m_recovered.max_event_seq = st.max_event_seq;
+        m_finalize->rebase(st.max_event_seq, last);
+        m_hw.ledger_seq = m_ledger.ledger_seq();
+        ++m_relineages;
+        log("relineage: ledger replayed from the rewritten event log (" + std::to_string(st.max_event_seq) +
+            " events, ledger_seq=" + std::to_string(m_ledger.ledger_seq()) + ", " + std::to_string(m_boot_digests.size()) +
+            " digest states, since=" + std::to_string(last) + "); finalize cursor " +
+            std::to_string(m_finalize->cursor_height()) + " unchanged");
+        return true;
+    }
+    std::uint64_t relineages() const noexcept { return m_relineages; }
+    ISettleStore& store() { return *m_store; }
+    std::string   store_dir() const { return XmrNodeConfig_resolved(m_cfg); }
+
     // Teardown in donor order: network first, then drain-and-join the engine.
     void stop() {
         if (!m_up) { m_engine.stop(); return; }
@@ -467,6 +483,7 @@ public:
         log("win: FOUND block " + fb.bid.substr(0, 12) + "… at height " +
             std::to_string(monero_height) + " registered (awaiting D_conf=" +
             std::to_string(m_cfg.d_conf) + ")");
+        if (m_drops) log_drops_found(fb, monero_height);   // ★ DROPS: attached only under the flip
         return true;
     }
 
@@ -498,6 +515,36 @@ public:
 
     // How many harvest rows the last FOUND folded (diagnostic; 0 when detached).
     std::size_t last_harvest_rows() const { return m_last_harvest_rows; }
+
+    // ★ DROPS diagnostic (never consensus): the delta the finalize driver just
+    // composed into this FOUND, re-derived by the SAME pure function it calls,
+    // plus the lowest credited interval per payee (the ex-ante witness: it must
+    // be >= that payee's effective_from). Only reachable with a harvester
+    // attached, i.e. only under the flip.
+    void log_drops_found(const FoundBlock& fb, std::uint64_t monero_height) {
+        const auto delta = ::c2pool::v37n::settle::subthreshold_credit(fb.params, fb.harvested, fb.drops);
+        long long sum = 0;
+        std::string rows;
+        auto hex_of_key = [](const ::v37::bytes32& b) {
+            static constexpr char kHex[] = "0123456789abcdef";
+            std::string h;
+            for (const auto x : b) { h.push_back(kHex[x >> 4]); h.push_back(kHex[x & 0x0f]); }
+            return h;
+        };
+        for (const auto& [k, v] : delta) {
+            sum += v;
+            std::uint64_t lo = ~0ull, eff = 0;
+            for (const auto& hr : fb.harvested)
+                if (hr.payee == k && fb.drops.enrolled(hr.payee, hr.interval) && hr.interval < lo) lo = hr.interval;
+            if (m_enroll) if (const auto* r = m_enroll->find(k)) eff = r->effective_from;
+            rows += " " + hex_of_key(k).substr(0, 12) + "=" + std::to_string(v) +
+                    "(min_iv=" + std::to_string(lo) + ",eff=" + std::to_string(eff) + ")";
+        }
+        log("drops: FOUND h=" + std::to_string(monero_height) + " bid=" + fb.bid.substr(0, 12) +
+            " harvest_rows=" + std::to_string(fb.harvested.size()) +
+            " price=" + (fb.drops.price.valid ? "valid" : "INVALID") +
+            " delta_payees=" + std::to_string(delta.size()) + " delta_sum=" + std::to_string(sum) + rows);
+    }
 
     // ── accessors (for the smoke / a dashboard) ────────────────────────────
     OwedLedger&        ledger()            { return m_ledger; }
@@ -701,6 +748,31 @@ private:
         }
     }
 
+    // RecoveryDriver replay + the canonical (digest, since) history (R-B(i)
+    // follow-up + R-C rework-3 D7): shared by bring_up and relineage.
+    RecoveredState replay_store(OwedLedger& ledger, std::vector<::v37::bytes32>& ds, std::vector<std::uint64_t>& ss,
+                                std::uint64_t& last_since, bool& ok) {
+        RecoveryDriver rec(*m_store, m_cfg.lane_chain);
+        ds.clear(); ss.clear();
+        ds.push_back(ledger.owed_digest());   // the empty anchor / anchor-boot state
+        ss.push_back(0);
+        // R-C rework-3 (D7): pair every replayed digest state with the coin
+        // height it became current at (Finalize: bin_height - D_conf; the
+        // formula XmrFinalizeDriver::since_of_bin applies live).
+        std::uint64_t since = 0;
+        RecoveredState st = rec.recover(ledger, ok, {}, [this, &since, &ds, &ss](const OwedLedger& l, const SettleEvent& e) {
+            if (e.kind == SettleEvKind::Finalize)
+                since = e.bin_height >= m_cfg.d_conf ? e.bin_height - m_cfg.d_conf : 0;
+            const ::v37::bytes32 d = l.owed_digest();
+            if (!(ds.back() == d)) {   // R-B(i) follow-up: canonical D(c) history
+                ds.push_back(d);
+                ss.push_back(since);
+            }
+        });
+        last_since = since;
+        return st;
+    }
+
     void log(const std::string& s) { m_log.push_back(s); }
 
     // ★ DROPS T3 (XMR arm): all four detached by default — see the seams above.
@@ -734,6 +806,7 @@ private:
     RowLookupFn                            m_native_row;             // D2-0: best-chain block at h (p2p-first)
     std::optional<std::uint64_t>           m_reorg_lo;               // D2-0: lowest height vacated by this switch's Orphans
     std::uint64_t                          m_reorg_redelivered = 0;  // D2-0: re-applied heights delivered below a Reorg tip
+    std::uint64_t                          m_relineages = 0;         // D2: in-process lineage switches
     std::uint64_t                          m_tip_height = 0;
 
     // c2pool#1551: installed by the accounting layer (FinalizeConnect).

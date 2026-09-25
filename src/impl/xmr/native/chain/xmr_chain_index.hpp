@@ -817,6 +817,14 @@ public:
     // (the parity oracle compares them field by field). Read-only by intent.
     const ChainStateView& view() const noexcept { return view_; }
 
+    // See ChainStateView::reseat_rct_output_count. Under the index lock; the
+    // node calls it on the verify thread right after a resume, before any
+    // block can connect.
+    void reseat_rct_output_count(std::uint64_t n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        view_.reseat_rct_output_count(n);
+    }
+
     // --- persistence ------------------------------------------------------------------------
     // A snapshot is taken `snapshot_depth` blocks BELOW the tip, and carries the
     // bodies of the blocks above it. Resume therefore re-applies those few

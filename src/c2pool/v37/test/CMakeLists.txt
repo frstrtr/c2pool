@@ -342,6 +342,26 @@ if (BUILD_TESTING)
     target_compile_features(v37_xmr_relay_native_feed_kat PRIVATE cxx_std_20)
     target_include_directories(v37_xmr_relay_native_feed_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME v37_xmr_relay_native_feed_kat COMMAND v37_xmr_relay_native_feed_kat)
+    # v37_xmr_minority_converge_selfcheck (D2, operator ruling D2 = A): the PURE
+    # pieces of xmr/xmr_minority_converge.hpp -- the builder key, the minority
+    # detection rule, the refold (re-derivation) driven through the production
+    # XmrFinalizeDriver + OwedLedger + MemSettleStore, the marker/observation
+    # codecs. No node, no network. Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_minority_converge_selfcheck v37_xmr_minority_converge_selfcheck.cpp)
+    target_compile_features(v37_xmr_minority_converge_selfcheck PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_minority_converge_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_minority_converge_selfcheck PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_minority_converge_selfcheck COMMAND v37_xmr_minority_converge_selfcheck)
+    # v37_xmr_minority_workweight_kat (D2, operator ruling D-1 = C): production
+    # FinalizeConnect nodes in lockstep (the D2Rig) + the production
+    # LaneSuspendState -- a byzantine PAIR with < 50% of the window's work never
+    # halts an honest node, the minority trigger is work-weighted (40% no, 60%
+    # yes), DIVERGED is alarm-only. Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_minority_workweight_kat v37_xmr_minority_workweight_kat.cpp)
+    target_compile_features(v37_xmr_minority_workweight_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_minority_workweight_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_minority_workweight_kat PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_minority_workweight_kat COMMAND v37_xmr_minority_workweight_kat)
     # v37_xmr_lane_suspend_selfcheck (R-C rework-2): the stratum side of LANE
     # SUSPEND over a loopback socket -- the suspend EDGE withdraws the job
     # (sessions dropped), a login while suspended is PARKED, the resume edge
@@ -1158,6 +1178,21 @@ if (BUILD_TESTING)
     target_include_directories(v37_drops_step2_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_drops_step2_wiring_kat Threads::Threads)
     add_test(NAME v37_drops_step2_wiring_kat COMMAND v37_drops_step2_wiring_kat)
+
+    # ★ DROPS on the XMR lane — v37_xmr_drops_wiring_kat. main_v37_xmr.cpp built
+    # no DropsWiring and called none of XmrNode's T3 seams, so a flipped XMR node
+    # was gate-ON and DORMANT. Pins the shell's wiring (X-SHELL: RED on the base),
+    # gate-OFF dormancy, the ★ enrolment clock = the NATIVE TIP (never the burial
+    # frontier), the exact Monero-difficulty -> lz normalisation, the rescaled
+    # R1 price, and the end-to-end composed credit. Stdlib-only, ~1 s. ALSO on
+    # BOTH build.yml --target lists (hollow-green guard).
+    add_executable(v37_xmr_drops_wiring_kat v37_xmr_drops_wiring_kat.cpp)
+    target_compile_features(v37_xmr_drops_wiring_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_drops_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(v37_xmr_drops_wiring_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
+    target_link_libraries(v37_xmr_drops_wiring_kat Threads::Threads)
+    add_test(NAME v37_xmr_drops_wiring_kat COMMAND v37_xmr_drops_wiring_kat)
 
     # ★ DROPS ACTIVATION AT ARITY 1 — the gate-ON owed_digest a DECOUPLED fleet
     # actually reproduces, minted and pinned BESIDE the arity-2 golden above.

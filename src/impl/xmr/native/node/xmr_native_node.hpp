@@ -1645,20 +1645,24 @@ private:
         return k;
     }
 
+    // The post-anchor output-set overlay lives NEXT TO the chain snapshot, in
+    // its own file: the anchor snapshot (--output-set) is a read-only, pinned
+    // input and is never written, and the index envelope keeps its format.
+    std::string overlay_path_() const { return cfg_.snapshot_path + ".outset"; }
+
     void load_snapshot_() {
         std::vector<std::uint8_t> file;
         std::string why;
-        // The v1 snapshot image restores the chain INDEX but not outputs_ (the
-        // global output-set / spent-key-image view). When an output-set was
-        // seeded (--native-output-set), that set is numbered from the anchor's
-        // base and CANNOT be re-seated to a resumed (higher) tip, so resume and
-        // an output-set backfill are mutually exclusive: keep the freshly seeded
-        // set and boot from the confirmed anchor rather than run a mis-numbered
-        // one. (A future snapshot v2 that persists outputs_ lifts this.)
+        // When an output-set was seeded (--native-output-set), that set is
+        // numbered from the anchor's base and cannot be re-seated to a resumed
+        // (higher) tip. The chain image alone therefore cannot resume it: the
+        // post-anchor OVERLAY (outputs, key images, per-block leaves and undo
+        // frames the chain added since the anchor) is persisted beside it and
+        // replayed onto the seeded snapshot, bound to the same image and
+        // verified against its recorded roots. Anything that does not match
+        // falls back to the from-anchor re-walk, exactly as before.
         if (outputs_.output_count() > 0) {
-            note_("[snapshot] resume skipped: an output-set was seeded "
-                  "(--native-output-set) and pins outputs_ to the anchor base; "
-                  "booting from the confirmed anchor");
+            load_snapshot_with_output_set_();
             return;
         }
         if (!read_snapshot_file(cfg_.snapshot_path, file, why)) {
@@ -1722,6 +1726,10 @@ private:
     void save_snapshot_(const char* occasion) {
         std::vector<std::uint8_t> image;
         std::string why;
+        if (outputs_.has_anchor_snapshot()) {
+            save_snapshot_with_output_set_(occasion);
+            return;
+        }
         if (!index_.save_snapshot(image, why)) {
             note_(std::string("[snapshot] not written (") + occasion + "): " + why);
             return;
@@ -1734,6 +1742,155 @@ private:
         }
         note_(std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
             + cfg_.snapshot_path + " (" + occasion + ")");
+    }
+
+    // sha256 of the decoded chain image: what the overlay file is bound to.
+    static Hash image_digest_(const std::vector<std::uint8_t>& image) {
+        anchor_hash::Sha256 h;
+        h.update(image.data(), image.size());
+        const std::array<std::uint8_t, 32> d = h.finish();
+        Hash out{};
+        std::copy(d.begin(), d.end(), out.begin());
+        return out;
+    }
+
+    // The output-set flavour of save_snapshot_(). The chain image and the
+    // overlay are captured TOGETHER on the verify thread -- the thread that
+    // connects blocks and feeds outputs_ synchronously -- so both describe the
+    // same tip; the save is refused (the previous pair kept) if they do not.
+    // The overlay file is written FIRST and carries sha256(image): a crash
+    // between the two writes leaves an overlay bound to an image that is not
+    // on disk, which the load refuses (re-walk), never a mismatched pair.
+    void save_snapshot_with_output_set_(const char* occasion) {
+        std::vector<std::uint8_t> image, ovl;
+        std::string why;
+        bool ok = false;
+        std::uint64_t idx_h = 0, set_h = 0;
+        verify_loop_.call([&] {
+            if (!index_.save_snapshot(image, why)) return;
+            const auto t = index_.tip();
+            if (!t) { why = "the index has no tip"; return; }
+            idx_h = t->height;
+            set_h = outputs_.tip_height();
+            if (t->height != set_h || t->id != outputs_.tip_id()) {
+                why = "output-set overlay tip does not match the index tip";
+                return;
+            }
+            ok = outputs_.serialize_overlay(ovl, why);
+        });
+        if (!ok) {
+            note_(std::string("[snapshot] not written (") + occasion + "): " + why
+                + " (index tip " + std::to_string(idx_h) + ", output-set tip "
+                + std::to_string(set_h) + ")");
+            return;
+        }
+        const Hash bind = image_digest_(image);
+        std::vector<std::uint8_t> ofile;
+        ofile.reserve(ovl.size() + 32);
+        ofile.insert(ofile.end(), bind.begin(), bind.end());
+        ofile.insert(ofile.end(), ovl.begin(), ovl.end());
+        if (!write_snapshot_file(overlay_path_(), ofile, why)) {
+            note_(std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            return;
+        }
+        const std::vector<std::uint8_t> file =
+            encode_snapshot_envelope(snapshot_key_(), image);
+        if (!write_snapshot_file(cfg_.snapshot_path, file, why)) {
+            note_(std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            return;
+        }
+        note_(std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
+            + cfg_.snapshot_path + " + " + std::to_string(ofile.size())
+            + " bytes output-set overlay (" + std::to_string(outputs_.overlay_block_count())
+            + " post-anchor blocks, tip " + std::to_string(set_h) + ") (" + occasion + ")");
+    }
+
+    // The output-set flavour of load_snapshot_(). Fail-closed at every step:
+    // any refusal leaves outputs_ at the bare anchor snapshot and the index at
+    // the confirmed anchor, and the node re-walks from the anchor as before.
+    void load_snapshot_with_output_set_() {
+        const std::string fallback = "; booting from the confirmed anchor (re-walk)";
+        std::vector<std::uint8_t> file, image;
+        std::string why;
+        if (!read_snapshot_file(cfg_.snapshot_path, file, why)) {
+            note_("[snapshot] no resume (" + why + ")" + fallback);
+            return;
+        }
+        if (!decode_snapshot_envelope(file, snapshot_key_(), image, why)) {
+            note_("[snapshot] REFUSED: " + why + fallback);
+            return;
+        }
+        std::vector<std::uint8_t> ofile;
+        {
+            std::ifstream f(overlay_path_(), std::ios::binary);
+            if (!f) {
+                note_("[snapshot] resume REFUSED: no output-set overlay at " + overlay_path_()
+                    + " (an output-set was seeded; the chain image alone cannot resume it)"
+                    + fallback);
+                return;
+            }
+            ofile.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        if (ofile.size() < 32) {
+            note_("[snapshot] resume REFUSED: output-set overlay is truncated" + fallback);
+            return;
+        }
+        const Hash bind = image_digest_(image);
+        if (!std::equal(bind.begin(), bind.end(), ofile.begin())) {
+            note_("[snapshot] resume REFUSED: output-set overlay is bound to a different chain "
+                  "image (a stale or foreign overlay)" + fallback);
+            return;
+        }
+        const std::vector<std::uint8_t> ovl(ofile.begin() + 32, ofile.end());
+        bool ok = false;
+        std::string load_why;
+        verify_loop_.call([&] { ok = outputs_.load_overlay(ovl, load_why); });
+        if (!ok) {
+            note_("[snapshot] resume REFUSED: output-set overlay does not verify: " + load_why
+                + fallback);
+            return;
+        }
+        // Then the chain image, through the boot, on the verify thread (see the
+        // plain load_snapshot_() path for why both) -- and, in the SAME hop so
+        // no block can connect in between, the tip check and the re-seat of the
+        // index's output counter. The index image does not carry that counter
+        // (seed_direct restarts it from 0 plus the replayed tail); without the
+        // re-seat the next block's first_output_index would not be the set's
+        // frontier and the set would refuse every new block with outputs.
+        bool tip_ok = false;
+        std::uint64_t idx_h = 0, set_h = 0;
+        verify_loop_.call([&] {
+            ok = boot_.resume_from_snapshot(image, load_why);
+            if (!ok) { outputs_.drop_overlay(); return; }
+            const auto t = index_.tip();
+            idx_h  = t ? t->height : 0;
+            set_h  = outputs_.tip_height();
+            tip_ok = t && t->height == set_h && t->id == outputs_.tip_id();
+            if (tip_ok) index_.reseat_rct_output_count(outputs_.frontier());
+            else        outputs_.disable_resolution();
+        });
+        if (!ok) {
+            note_("[snapshot] REFUSED: " + load_why + fallback);
+            return;
+        }
+        // The pair was captured at one tip and bound by digest, so the resumed
+        // index tip must be the overlay's. If it somehow is not, the index can
+        // no longer be un-resumed: ring resolution was disabled above (every
+        // ring RingUnresolved) rather than resolve against a set at another
+        // height.
+        if (!tip_ok) {
+            note_("[snapshot] ALARM: resumed index tip " + std::to_string(idx_h)
+                + " != output-set overlay tip " + std::to_string(set_h)
+                + "; ring resolution DISABLED (fail-closed)");
+            return;
+        }
+        const SyncState st = index_.sync_state();
+        note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
+            + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
+            + " bytes) + output-set overlay (" + std::to_string(outputs_.overlay_block_count())
+            + " post-anchor blocks, frontier " + std::to_string(outputs_.frontier())
+            + ", spent " + std::to_string(outputs_.spent_count())
+            + "); no re-walk from the anchor -- ring resolution intact");
     }
 
     void note_(const std::string& line) {
