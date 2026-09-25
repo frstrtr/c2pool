@@ -37,6 +37,11 @@
 //         key for key. A refused win moves owed_digest by zero bytes.
 //   SK-B  CONVERGENCE AT MATCHED CUTS: any two nodes holding the SAME settled
 //         block set hold the SAME owed_digest, byte for byte.
+//   SK-B2 AGREEMENT, finely sampled: for every block a PAIR of nodes BOTH
+//         settled, the E_b map each put into its own ledger is identical key
+//         for key. Whole settled SETS match rarely once coverage drops, so SK-B
+//         alone is a thin sample; this one runs thousands of times per soak and
+//         is the earliest sight of a real divergence.
 //   SK-C  NO ZOMBIE: at every quiescence checkpoint — the wire drained and the
 //         requester's tick() driven past its deadlines, which is what the
 //         daemon does on the carrier_send idle cadence — no RepairDriver holds
@@ -330,6 +335,7 @@ struct Node {
     // harness bookkeeping
     std::uint64_t fed = 0;                       // carriers handed to this node
     std::map<std::string, long long> credit_of;  // bid -> Σ E_b we registered
+    std::map<std::string, Amounts>   credit_map; // bid -> the E_b map we registered
     std::set<std::string> settled;               // bids this node FINALIZED
 
     Node(int i, std::shared_ptr<MockCoinBackend> c, const LaneParams& p,
@@ -465,6 +471,8 @@ struct Metrics {
     std::uint64_t forced_ticks = 0, tick_timeouts = 0;
     std::uint64_t matched_cuts = 0, matched_equal = 0, divergences = 0;
     std::uint64_t unmatched_pairs = 0;
+    // the finely-sampled half of SK-B: every block a PAIR of nodes both settled
+    std::uint64_t common_blocks = 0, common_equal = 0, common_disagreed = 0;
     // liveness bounds, measured
     u64 max_pos_repaired = 0;
     u64 min_pos_refused  = ~u64(0);
@@ -730,6 +738,7 @@ int main() {
             long long win_credit = 0;
             for (const auto& [k, v] : won.cut.credit) { (void)k; win_credit += v; }
             N[w]->credit_of[bid] = win_credit;
+            N[w]->credit_map[bid] = won.cut.credit;
 
             const PeerWin pw = peer_win_of(bid, h, won.cut, won.emitted, owed_at_win);
             if (cfg.verbose)
@@ -759,6 +768,7 @@ int main() {
                     long long s = 0;
                     for (const auto& [k, v] : pc.credit) { (void)k; s += v; }
                     N[i]->credit_of[bid] = s;
+                    N[i]->credit_map[bid] = pc.credit;
                 } else {
                     ++M.refused_first_pass;
                     // ★ SK-A (the other half): a refusal moves owed by ZERO.
@@ -831,6 +841,7 @@ int main() {
                     long long s = 0;
                     for (const auto& [k, v] : pc.credit) { (void)k; s += v; }
                     N[i]->credit_of[bid] = s;
+                    N[i]->credit_map[bid] = pc.credit;
                 }
             }
             if (safety_broken) break;
@@ -912,6 +923,39 @@ int main() {
                     break;
                 }
             }
+            if (safety_broken) break;
+            // ── SK-B2 the FINELY SAMPLED half of convergence ─────────────────
+            // A whole settled SET matches rarely once coverage drops, so the
+            // set-level comparison below is a thin sample. This one is not: for
+            // every block a PAIR of nodes BOTH settled, the E_b map each of them
+            // put into its own ledger must be identical, key for key. Two
+            // ledgers that agree on every block they share and are built by the
+            // same fold cannot disagree on owed_digest over that shared set — so
+            // a break here is the earliest possible sight of a real divergence,
+            // thousands of samples per run instead of a handful.
+            for (int i = 0; i < cfg.nodes && !safety_broken; ++i)
+                for (int j = i + 1; j < cfg.nodes && !safety_broken; ++j) {
+                    const Node& a = *N[i];
+                    const Node& b = *N[j];
+                    const Node& small = a.settled.size() <= b.settled.size() ? a : b;
+                    const Node& big   = a.settled.size() <= b.settled.size() ? b : a;
+                    for (const auto& bid : small.settled) {
+                        if (!big.settled.count(bid)) continue;
+                        auto ia = small.credit_map.find(bid);
+                        auto ib = big.credit_map.find(bid);
+                        if (ia == small.credit_map.end() || ib == big.credit_map.end()) continue;
+                        ++M.common_blocks;
+                        if (ia->second == ib->second) ++M.common_equal;
+                        else {
+                            ++M.common_disagreed;
+                            note_break(round,
+                                       "SK-B2 two nodes SETTLED the same block with DIFFERENT "
+                                       "E_b maps (bid " + bid + ")");
+                            safety_broken = true;
+                            break;
+                        }
+                    }
+                }
             if (safety_broken) break;
             // SK-B convergence at MATCHED cuts
             for (int i = 0; i < cfg.nodes; ++i)
@@ -1072,6 +1116,10 @@ int main() {
                 M.max_in_flight, M.max_bindings, M.max_cached_views);
     std::printf("   MEMORY    : RSS %ld kB -> %ld kB (delta %ld kB)\n",
                 M.rss_kb_start, M.rss_kb_end, M.rss_kb_end - M.rss_kb_start);
+    std::printf("   AGREEMENT : blocks settled by BOTH nodes of a pair=%llu ; E_b identical "
+                "key-for-key=%llu ; DISAGREED=%llu\n",
+                (unsigned long long)M.common_blocks, (unsigned long long)M.common_equal,
+                (unsigned long long)M.common_disagreed);
     std::printf("   CONVERGE  : matched cuts=%llu byte-equal=%llu DIVERGENT=%llu "
                 "(pairs whose settled sets differed: %llu)\n",
                 (unsigned long long)M.matched_cuts, (unsigned long long)M.matched_equal,
@@ -1170,6 +1218,9 @@ int main() {
     check(M.max_pos_repaired <= p_bound || p_bound == 0,
           "SK-A1 every repair that CREDITED was inside the serve-side request "
           "budget the transport constants allow (measured <= derived bound)");
+    check(M.common_disagreed == 0 && M.common_blocks > 0,
+          "SK-B2 ★ AGREEMENT: every block two nodes BOTH settled was settled with the "
+          "SAME E_b map, key for key");
     check(M.divergences == 0 || !cfg.strict,
           "SK-7 ★ CONVERGENCE at matched cuts (SOAK_STRICT makes a divergence fatal)");
     if (M.divergences != 0)
