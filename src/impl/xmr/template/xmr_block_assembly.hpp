@@ -387,10 +387,112 @@ inline ::xmr::coin::Hash256 block_id_of(const std::vector<std::uint8_t>& hashing
     return ::xmr::coin::keccak256(w.bytes());
 }
 
+// ---------------------------------------------------------------------------
+// walk_tx_extra -- the tx_extra TLV walk, field by field IN ANY ORDER, with the
+// field grammar monerod's parse_tx_extra (cryptonote_basic/tx_extra.h) reads:
+//   0x00 padding           zero bytes to the END of tx_extra, <= 255 bytes incl. the tag
+//   0x01 tx pubkey         32 bytes
+//   0x02 extra nonce       varint(len <= 255) + len bytes
+//   0x03 merge-mining tag  varint(len) + len bytes, which hold varint(depth) + root[32]
+//   0x04 additional keys   varint(count) + 32 * count bytes
+//   0xDE minergate         varint(len) + len bytes
+// Anything else (an unknown tag, a truncated or malformed field) STOPS the walk
+// there: monerod's parse_tx_extra fails at the same byte and keeps the fields
+// read before it. The walk never throws and never rejects the transaction --
+// Monero consensus does not require a coinbase tx_extra to parse, so a valid
+// block can carry any bytes here (merge-mined blocks put 0x03 FIRST; see block
+// 3765869). A pure function of the bytes: every node walks it identically.
+// ---------------------------------------------------------------------------
+#define C2POOL_XMR_TX_EXTRA_WALK 1   // walk_tx_extra() present (v37_xmr_coinbase_extra_kat keys on it)
+struct TxExtraField {
+    std::uint8_t tag = 0;
+    std::size_t  offset = 0;        // of the tag byte
+    std::size_t  size = 0;          // whole field incl. the tag
+    std::size_t  data_offset = 0;   // first payload byte (after the tag and any length varint)
+    std::size_t  data_size = 0;
+};
+struct TxExtraWalk {
+    std::vector<TxExtraField> fields;   // in the order found
+    bool        complete = false;       // true: every byte belongs to a well-formed field
+    std::size_t stop_offset = 0;        // == size when complete; else where the walk stopped
+    const char* stop_why = "";          // why it stopped early ("" when complete)
+    [[nodiscard]] const TxExtraField* first(std::uint8_t tag) const {
+        for (const TxExtraField& f : fields) if (f.tag == tag) return &f;
+        return nullptr;
+    }
+};
+inline TxExtraWalk walk_tx_extra(const std::uint8_t* x, std::size_t n) {
+    TxExtraWalk w;
+    std::size_t i = 0;
+    auto varint_at = [&](std::size_t& pos, std::uint64_t& v) -> bool {
+        const std::uint8_t* it = x + pos;
+        const std::uint8_t* end = x + n;
+        if (tools::read_varint(it, end, v) <= 0) return false;
+        pos = static_cast<std::size_t>(it - x);
+        return true;
+    };
+    auto stop = [&](const char* why) { w.stop_offset = i; w.stop_why = why; return w; };
+    while (i < n) {
+        TxExtraField f; f.tag = x[i]; f.offset = i;
+        std::size_t pos = i + 1;
+        switch (f.tag) {
+            case 0x00: {   // padding: zeros to the end, <= 255 bytes incl. the tag
+                if (n - i > 255) return stop("padding longer than 255 bytes");
+                for (std::size_t k = pos; k < n; ++k) if (x[k] != 0) return stop("non-zero byte inside padding");
+                f.data_offset = pos; f.data_size = n - pos; pos = n;
+                break;
+            }
+            case 0x01: {   // tx pubkey
+                if (n - pos < 32) return stop("truncated 0x01 pubkey");
+                f.data_offset = pos; f.data_size = 32; pos += 32;
+                break;
+            }
+            case 0x04: {   // additional pubkeys: varint count + 32 * count
+                std::uint64_t cnt = 0;
+                if (!varint_at(pos, cnt)) return stop("bad 0x04 count varint");
+                if (cnt > (n - pos) / 32) return stop("truncated 0x04 additional pubkeys");
+                f.data_offset = pos; f.data_size = static_cast<std::size_t>(cnt) * 32; pos += f.data_size;
+                break;
+            }
+            case 0x02: case 0x03: case 0xDE: {   // length-prefixed blobs
+                std::uint64_t len = 0;
+                if (!varint_at(pos, len)) return stop("bad length varint");
+                if (len > n - pos) return stop("truncated length-prefixed field");
+                if (f.tag == 0x02 && len > 255) return stop("0x02 nonce longer than 255 bytes");
+                if (f.tag == 0x03) {   // the blob must hold varint(depth) + root[32]
+                    std::size_t in = pos; std::uint64_t depth = 0;
+                    const std::size_t lim = pos + static_cast<std::size_t>(len);
+                    const std::uint8_t* it = x + in; const std::uint8_t* end = x + lim;
+                    if (tools::read_varint(it, end, depth) <= 0) return stop("bad 0x03 depth varint");
+                    in = static_cast<std::size_t>(it - x);
+                    if (lim - in < 32) return stop("truncated 0x03 merkle root");
+                }
+                f.data_offset = pos; f.data_size = static_cast<std::size_t>(len); pos += f.data_size;
+                break;
+            }
+            default:
+                return stop("unknown tx_extra tag");
+        }
+        f.size = pos - i;
+        w.fields.push_back(f);
+        i = pos;
+    }
+    w.complete = true; w.stop_offset = n;
+    return w;
+}
+
 // Parse a serialised coinbase PREFIX (version .. tx_extra) into X6's
 // ReceivedCoinbase for canonical_coinbase_matches(). Accepts the miner_tx as
 // found in a block blob (the rct_type byte after the prefix is ignored). Returns
-// false on any structural error. *consumed = prefix length on success.
+// false on a structural error of the prefix itself (version, unlock, txin_gen,
+// outputs, the tx_extra LENGTH). tx_extra is NOT required to parse (Monero
+// consensus does not require it): it is kept verbatim as opaque bytes and R is
+// the FIRST 0x01 pubkey the walk_tx_extra() field walk reaches, in any field
+// order (zero when there is none). Every prefix the pre-walk parser accepted
+// (tx_extra[0] == 0x01) yields byte-identical output here. Recognising a LANE
+// coinbase stays with the callers (canonical_coinbase_matches byte-compares the
+// whole tx_extra; the coinbase authority needs our 03 21 00 tail + the matched
+// root + r*G == R). *consumed = prefix length on success.
 inline bool parse_coinbase_prefix(const std::uint8_t* p, std::size_t n,
                                   ReceivedCoinbase& out, std::uint64_t* height_out = nullptr,
                                   std::size_t* consumed = nullptr) {
@@ -418,9 +520,12 @@ inline bool parse_coinbase_prefix(const std::uint8_t* p, std::size_t n,
     if (!rd(xlen) || static_cast<std::size_t>(end - it) < xlen) return false;
     out.tx_extra.assign(it, it + xlen);
     it += xlen;
-    // tx pubkey: tag 0x01 must be the first extra field (X6 layout)
-    if (out.tx_extra.size() < 1 + HASH_SIZE || out.tx_extra[0] != TX_EXTRA_TAG_PUBKEY) return false;
-    std::memcpy(out.R.data(), out.tx_extra.data() + 1, HASH_SIZE);
+    // tx pubkey: the first 0x01 field in any order (X6 puts it first). A tx_extra
+    // that does not walk (or holds no 0x01) is opaque bytes, R stays zero.
+    out.R = decltype(out.R){};
+    const TxExtraWalk w = walk_tx_extra(out.tx_extra.data(), out.tx_extra.size());
+    if (const TxExtraField* pk = w.first(TX_EXTRA_TAG_PUBKEY))
+        std::memcpy(out.R.data(), out.tx_extra.data() + pk->data_offset, HASH_SIZE);
     if (height_out) *height_out = height;
     if (consumed) *consumed = static_cast<std::size_t>(it - p);
     return true;
