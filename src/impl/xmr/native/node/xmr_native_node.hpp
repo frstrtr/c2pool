@@ -1851,10 +1851,23 @@ private:
             return;
         }
         // Then the chain image, through the boot, on the verify thread (see the
-        // plain load_snapshot_() path for why both).
+        // plain load_snapshot_() path for why both) -- and, in the SAME hop so
+        // no block can connect in between, the tip check and the re-seat of the
+        // index's output counter. The index image does not carry that counter
+        // (seed_direct restarts it from 0 plus the replayed tail); without the
+        // re-seat the next block's first_output_index would not be the set's
+        // frontier and the set would refuse every new block with outputs.
+        bool tip_ok = false;
+        std::uint64_t idx_h = 0, set_h = 0;
         verify_loop_.call([&] {
             ok = boot_.resume_from_snapshot(image, load_why);
-            if (!ok) outputs_.drop_overlay();
+            if (!ok) { outputs_.drop_overlay(); return; }
+            const auto t = index_.tip();
+            idx_h  = t ? t->height : 0;
+            set_h  = outputs_.tip_height();
+            tip_ok = t && t->height == set_h && t->id == outputs_.tip_id();
+            if (tip_ok) index_.reseat_rct_output_count(outputs_.frontier());
+            else        outputs_.disable_resolution();
         });
         if (!ok) {
             note_("[snapshot] REFUSED: " + load_why + fallback);
@@ -1862,13 +1875,11 @@ private:
         }
         // The pair was captured at one tip and bound by digest, so the resumed
         // index tip must be the overlay's. If it somehow is not, the index can
-        // no longer be un-resumed: fail closed on ring resolution (every ring
-        // RingUnresolved) rather than resolve against a set at another height.
-        const auto t = index_.tip();
-        const std::uint64_t set_h = outputs_.tip_height();
-        if (!t || t->height != set_h || t->id != outputs_.tip_id()) {
-            outputs_.disable_resolution();
-            note_("[snapshot] ALARM: resumed index tip " + std::to_string(t ? t->height : 0)
+        // no longer be un-resumed: ring resolution was disabled above (every
+        // ring RingUnresolved) rather than resolve against a set at another
+        // height.
+        if (!tip_ok) {
+            note_("[snapshot] ALARM: resumed index tip " + std::to_string(idx_h)
                 + " != output-set overlay tip " + std::to_string(set_h)
                 + "; ring resolution DISABLED (fail-closed)");
             return;

@@ -213,7 +213,8 @@ static bool seed(ChainOutputSet& s, const std::string& path, const AnchorBundle&
 // Every question a consumer can ask, n ring lookups and n spent checks.
 static std::size_t compare_sets(const ChainOutputSet& a, const ChainOutputSet& b,
                                 const std::vector<Hash>& kis, std::mt19937_64& r,
-                                std::size_t n, const char* stage, bool verbose = false) {
+                                std::size_t n, const char* stage, bool verbose = false,
+                                int member_proofs = 200) {
     std::size_t mism = 0;
     auto eq = [&](bool c, const char* what) { checkf(c, "%s: %s", stage, what); if (!c) ++mism; };
     eq(a.frontier() == b.frontier(), "frontier");
@@ -261,7 +262,9 @@ static std::size_t compare_sets(const ChainOutputSet& a, const ChainOutputSet& b
         hits += sa;
     }
     checkf(ki_bad == 0, "%s: %zu of %zu key-image spent checks differ", stage, ki_bad, n);
-    for (int t = 0; t < 200 && fr > base; ++t) {
+    // Each membership proof re-hashes the whole leaf log (O(leaves)), so the
+    // live compare (millions of leaves) asks for only a few.
+    for (int t = 0; t < member_proofs && fr > base; ++t) {
         const std::uint64_t gi = base + r() % (fr - base);
         const bool va = a.verify_member(gi), vb = b.verify_member(gi);
         if (va != vb) ++mism;
@@ -608,7 +611,7 @@ static int run_compare(const std::string& snap, const std::string& anc, const st
         checkf(same_tip, "compare: the two overlays are not at the same tip");
     }
     std::mt19937_64 r(0xc0de'0000'0000'0002ULL);
-    const std::size_t mism = compare_sets(a, c, kis, r, n, "compare A vs B", true);
+    const std::size_t mism = compare_sets(a, c, kis, r, n, "compare A vs B", true, 4);
     std::printf("[compare] roots: output=%s spent=%s | total mismatches=%zu | checks=%d failures=%d\n",
                 a.output_root() == c.output_root() ? "equal" : "DIFFER",
                 a.spent_root() == c.spent_root() ? "equal" : "DIFFER", mism, g_checks, g_fail);
@@ -627,6 +630,7 @@ static int run_compare(const std::string& snap, const std::string& anc, const st
 }
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     if (argc >= 6 && std::strcmp(argv[1], "--compare") == 0) {
         const std::size_t n = argc >= 7 ? std::strtoull(argv[6], nullptr, 10) : 100000;
         return run_compare(argv[2], argv[3], argv[4], argv[5], n, argc >= 8 ? argv[7] : "");
