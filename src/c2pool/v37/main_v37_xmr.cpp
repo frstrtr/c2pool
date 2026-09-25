@@ -107,6 +107,7 @@
 #include "xmr/xmr_p2p_block_publisher.hpp"        // M3: found block -> levin 2008 (no submit_block)
 #include "xmr/xmr_recon_ring.hpp"                 // R-C rework-3 (D7): the RECON ring + root-age bound
 #include "xmr/xmr_lane_suspend_state.hpp"         // R-C rework-3 (D5 + contested): the lane-suspend causes
+#include "xmr/xmr_test_suspend_knob.hpp"          // FAULT-KNOB (TEST-ONLY): SIGUSR2 forces a lane suspension
 // GAP-2: the real c2pool-to-c2pool receipt relay (docs/xmr-lane/gap2-sharechain-relay-design.md).
 // OFF unless --relay-listen / --relay-peer is given; off = this daemon byte-identical to before.
 #include "xmr/relay/xmr_relay_wire.hpp"        // FB_HELLO / FB_RECEIPTS / FB_BLOCK_WON, side_data_v2, lane_params_digest
@@ -162,6 +163,11 @@ namespace node  = ::c2pool::xmr::node;
 static std::atomic<bool> g_stop{false};
 static std::atomic<bool> g_relay_partition_req{false};   // GAP-2 rig: SIGUSR1 -> relay partition
 static void on_sigusr1(int) { g_relay_partition_req.store(true); }
+// FAULT-KNOB (TEST-ONLY, xmr/xmr_test_suspend_knob.hpp): --test-suspend-lane-seconds S
+// arms SIGUSR2 -> force the lane-suspend state for S s. 0 (default) = OFF: no handler.
+static std::uint32_t g_test_suspend_s = 0;
+static std::atomic<bool> g_test_suspend_req{false};
+static void on_sigusr2(int) { g_test_suspend_req.store(true); }
 static void on_sigint(int) { g_stop.store(true); }
 
 // recon(A+B credit) knobs (regtest-only; parsed in main). See xmr/xmr_credit_cut.hpp.
@@ -998,6 +1004,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             if (c & LS::kContested) t += " CONTESTED (>= 1/3 of the recent frontier lane blocks refused; operator opt-in --contested-suspend on);";
             if (c & LS::kHeld)      t += " HELD-LAG (an undecided lane block holds the cursor);";
             if (c & LS::kLag)       t += " LAG (finalize cursor behind the buried frontier);";
+            if (c & LS::kTest)      t += " TEST (FAULT-KNOB --test-suspend-lane-seconds, forced by SIGUSR2);";
             return t;
         };
         // D2 under ruling D-1 = C: CONVERGING / DIVERGED are ALARMS -- named and
@@ -1067,6 +1074,24 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     // D2: an own win published while the publisher had no relay peer (parked)
     // is ISOLATION-MARKED -- the first candidate refuse set of a re-derivation.
     if (publisher) fc.set_isolated_probe([p = publisher.get()](const std::string& bid) { return p->was_parked(bid); });
+    // FAULT-KNOB (TEST-ONLY): OFF unless --test-suspend-lane-seconds S > 0 (run_live
+    // refuses it on mainnet). Armed, SIGUSR2 raises the `test` cause for S s; the
+    // suspend and resume edges then go through apply_suspension() like any other cause.
+    c2pool::v37n::xmr::TestSuspendKnob test_knob(serving ? g_test_suspend_s : 0);
+    const auto knob_t0 = std::chrono::steady_clock::now();
+    auto knob_now_ms = [&]() {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - knob_t0).count());
+    };
+    if (test_knob.armed()) {
+        std::signal(SIGUSR2, on_sigusr2);
+        std::printf("lane: TEST knob ARMED: SIGUSR2 forces a lane suspension (cause=test) for %u s (--test-suspend-lane-seconds; "
+                    "test-only, refused on mainnet)\n", test_knob.seconds);
+        std::fflush(stdout);
+    } else if (g_test_suspend_s) {
+        std::printf("lane: TEST knob NOT armed: --test-suspend-lane-seconds needs a serving pool (%s)\n", not_served_reason);
+        std::fflush(stdout);
+    }
     std::uint64_t seen_relineage = fc.relineage_seq();
     while (!g_stop.load()) {
         pump_miner();       // --mine: hits first, so a find is bridged the same pass
@@ -1074,6 +1099,20 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         if (publisher) publisher->tick();   // parked (reached-nobody) blocks: bounded re-announce
         bridge_found();
         fc.tick();
+        if (test_knob.armed()) {   // FAULT-KNOB: never runs unless --test-suspend-lane-seconds S > 0
+            const std::uint64_t now_ms = knob_now_ms();
+            const auto ks = test_knob.step(g_test_suspend_req.exchange(false), now_ms, lane_state);
+            if (ks.fired)
+                std::printf("lane: TEST knob FIRED (SIGUSR2): forcing lane suspension cause=test for %u s (fire #%llu)\n",
+                            test_knob.seconds, static_cast<unsigned long long>(test_knob.n_fired));
+            if (ks.ignored)
+                std::printf("lane: TEST knob SIGUSR2 IGNORED: already forcing (%llu ms left; a fire never extends)\n",
+                            static_cast<unsigned long long>(test_knob.remaining_ms(now_ms)));
+            if (ks.released)
+                std::printf("lane: TEST knob RELEASED after %u s: cause=test cleared (release #%llu)\n",
+                            test_knob.seconds, static_cast<unsigned long long>(test_knob.n_released));
+            if (ks.fired || ks.ignored || ks.released) std::fflush(stdout);
+        }
         const bool lane_suspend = apply_suspension();   // right after the tick that may have decided it
         if (hooks.cba_tick) hooks.cba_tick();   // 
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
@@ -1260,6 +1299,12 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
 }
 
 static int run_live(const XmrNodeConfig& cfg) {
+    // FAULT-KNOB (TEST-ONLY): refused outright on mainnet, before anything starts.
+    if (const std::string r = c2pool::v37n::xmr::TestSuspendKnob::refusal(cfg.network == MoneroNetwork::Mainnet, g_test_suspend_s);
+        !r.empty()) {
+        std::printf("REFUSED: %s\n", r.c_str());
+        return 2;
+    }
     // REGTEST-ONLY rig knobs (the receipt-feed carrier stand-in, the v0x02
     // fast-path file relay, and the amount-sensitivity falsifier) are fenced OFF
     // on mainnet: they simulate the not-yet-landed S-1 carrier relay and must
@@ -3722,6 +3767,7 @@ int main(int argc, char** argv) {
         else if (a == "--relay-vault-horizon")      g_relay_vault_horizon = std::stoull(next("0"));
         else if (a == "--no-relay-serve")           g_no_relay_serve = true;
         else if (a == "--relay-test-partition-seconds") g_relay_partition_s = static_cast<std::uint32_t>(std::stoul(next("0")));
+        else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = static_cast<std::uint32_t>(std::stoul(next("0")));
         else if (a == "--relay-bind")               g_relay_bind = next("none");
         else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = std::stoull(next("0"));
         else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = std::stoull(next("20"));
@@ -3828,6 +3874,9 @@ int main(int argc, char** argv) {
                 "  --minority-min-blocks <n>    D2 no decision on fewer decided lane blocks (default 3)\n"
                 "  --converge-retry-bound <n>   D2 undecidable re-derivation attempts before DIVERGED (600)\n"
                 "  --converge-hold-ticks <n>    TEST knob: CONVERGING holds n ticks before the first attempt\n"
+                "  --test-suspend-lane-seconds <S>  TEST-ONLY fault knob (default 0 = off, no handler): SIGUSR2\n"
+                "                               forces a lane suspension (cause=test) for S s, then releases\n"
+                "                               it (same suspend/resume path as lag/held); refused on mainnet\n"
                 "  --recon-max-root-age <n>     R-C rework-3 (D7): never credit a matched historical root\n"
                 "                               older than n heights from the block's builder cut\n"
                 "                               (default 4*D_conf; 0 = unbounded, the rework-2 behaviour)\n"
