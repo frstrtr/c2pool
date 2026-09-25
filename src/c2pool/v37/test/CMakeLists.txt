@@ -387,6 +387,20 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_stratum_resume_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_stratum_resume_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_stratum_resume_kat COMMAND v37_xmr_stratum_resume_kat)
+    # v37_xmr_test_suspend_knob_kat (FAULT-KNOB, TEST-ONLY): the
+    # --test-suspend-lane-seconds / SIGUSR2 knob that forces a lane suspension
+    # on a live node -- off by default, refused on mainnet, arm/fire/release
+    # through LaneSuspendState (cause `test`), and end to end through the real
+    # StratumListener::set_lane_suspended() (parked login served on release).
+    # Stub template source + verifier over loopback: no RandomX, no monerod.
+    # Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_test_suspend_knob_kat
+        v37_xmr_test_suspend_knob_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_test_suspend_knob_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_test_suspend_knob_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_test_suspend_knob_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_test_suspend_knob_kat COMMAND v37_xmr_test_suspend_knob_kat)
     # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
