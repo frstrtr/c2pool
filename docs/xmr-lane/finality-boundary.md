@@ -128,43 +128,59 @@ problem: every subsequent peer lane block carries a `03` root (the winner's
 (~19 heights in RUN1) with nothing but a per-block "retry #n" line to show for
 it.
 
-`FinalizeConnect::divergence_check()` (once per tick) declares the lane
-**DIVERGED** when either
-
-* the cursor is more than `divergence_cap_heights` (default `2 * D_conf`)
-  behind the buried frontier `hw - D_conf` **while** a canonical lane block is
-  `lane-root-unknown`, for `divergence_cap_ticks` (default 20) **consecutive**
-  ticks — bounded heights *and* bounded time; or
-* `divergence_cap_terminal` (default 2) lane blocks have exhausted the
-  root-unknown retry bound.
-
-Honest catch-up does not trip it: a receiver one ledger event behind the winner
-resolves `lane-root-unknown` within a few events (`lane_root_unknown_resolved`
-counts them), which resets the persistence window; a feed-lagged receiver is
-`cut-pending`, not root-unknown, and does not count.
+`FinalizeConnect::divergence_check()` (once per tick) declares **HELD-LAG**
+(R-C rework-2; it used to declare a *terminal* DIVERGED) when the cursor is
+more than `divergence_cap_heights` (default `2 * D_conf`) behind the buried
+frontier `hw - D_conf` **while** a canonical lane block is `lane-root-unknown`
+or HELD, for `divergence_cap_ticks` (default 20) **consecutive** ticks.
 
 When it fires:
 
-* **one** terminal alarm `cba-ALARM DIVERGENCE (TERMINAL): …` on stdout *and*
-  stderr, naming the lag, the cap, the held blocks and the action;
-* the finalize gate holds **for good** (cursor frozen at its current height);
-* no chain block is booked from then on (`divergence_dropped` counts them,
-  logged every 50th) and no retry runs — the 600-per-block retry loop is gone;
-* the status line reports `r6: … DIVERGED=1 alarms=1 dropped=N` on every
-  status interval.
+* **one** banner `cba-ALARM HELD-LAG (non-terminal): …` on stdout *and*
+  stderr, naming the lag, the cap and the held blocks; a reminder every 50
+  ticks while it persists;
+* **nothing is dropped and nothing is credited around the held block**: the
+  block stays in the retry set (it keeps holding the R4 gate), is re-tried
+  every `held_retry_every` ticks once past the `retry_bound`, and books -- or,
+  once this node is decidable for it, is REFUSED-not-credited with its payout
+  DEBITED (debit-on-refuse) -- the moment it resolves;
+* main's single lag definition (`(hw - D_conf) - cursor`, suspend `> 2*D_conf`,
+  resume `<= D_conf`) and the HELD-LAG cause suspend lane template production,
+  stop the in-process miner and withdraw the stratum job (sessions dropped,
+  logins parked); the status line reports `hold: … held_lag=1` and
+  `suspend: … held=N`;
+* it CLEARS by itself when the held block resolves (`held_lag_cleared`).
 
-The node keeps serving templates; its coinbase is built from the frozen
-ledger. **Operator action:** stop the node and re-seed its settlement store
-from a converged peer (or from a known-good `settle.img` snapshot taken before
-the boundary). There is no in-band recovery by design: the alternative — a
-ledger that rewinds a FINALIZE — would make `owed_digest` non-monotone and is
-exactly what O3.5 rules out.
+`divergence_cap_terminal` is retired (no retry bound exhausts into a drop any
+more; the flag still parses). The pre-rework 600-attempt cap fell into
+`booking_stall_timeout(lane_root_unknown)` -> REFUSED, memoized, credit
+dropped -- the silent drop the rework-2 verify flagged.
 
-Knobs: `--divergence-cap-heights <n>` (0 = `2 * D_conf`),
-`--divergence-cap-ticks <n>`, `--divergence-cap-terminal <n>` (0 = off).
 Self-check: `v37_xmr_o2_finalize_connect_selfcheck` FC17 (chain-ordered
-deferral, both sides) and FC18 (the cap: not before the window, once at the
-window, halted after it).
+deferral, both sides) and FC18a-d (not before the window; HELD-LAG at it,
+non-terminal; HELD past the retry bound with nothing dropped; refused-with-
+the-gate-released once decidable, HELD-LAG cleared).
+
+## 4b. Recovery: VERIFIED resync (W6) -- design, not yet implemented
+
+The old contract ("stop the node and copy `settle.img` from a converged peer")
+is ACCEPT-not-VERIFY: `RecoveryDriver::recover` only detects torn records, so a
+wrong or forged store is adopted silently, and a `settle.img` copied WITHOUT
+its `pfound.tsv` sidecar loses every pending FOUND (a snapshot is the
+directory: `settle.img` + `pfound.tsv` + `pfound.tsv.suspense` + a
+`snapshot.meta`). There is still no REWIND (a ledger that rewinds a FINALIZE
+would make `owed_digest` non-monotone -- exactly what O3.5 rules out); an
+adoption is a *verified lineage switch*. The verifier design (operator tool
+`--resync-verify <dir>` and the in-process verifier the lineage vote needs)
+is in `docs/xmr-lane/r-c-rework-2.md` §3: replay the candidate into a
+throwaway ledger collecting its digest sequence, check lane params, re-decode
+every FOUND's block from the daemon under the candidate's own prior digests
+(payout must equal, credit cut must fold to the event's credit), check every
+FINALIZE's `bin_height = h + D_conf` and every ORPHAN's non-canonicality,
+check completeness against on-chain lane blocks, then report the fork point
+and the lineage vote. Only a VERIFIED snapshot may be registered as a
+counter-lineage (`FinalizeConnect::register_counter_lineage`) or adopted
+(archive the current store with a `.pre-resync-<utc>` suffix -- never delete).
 
 ## 5. Verify recipe (2-daemon regtest, multiple payees, real E_b)
 

@@ -30,6 +30,7 @@
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
 #include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
+#include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
 
 namespace c2pool::v37n::xmr {
 
@@ -68,7 +69,10 @@ inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 //     mandated fixed outputs ++ exact-sum residual sink), assembled from
 //     get_miner_data over the W4 OwedLedger. Requires a torsion-valid residual
 //     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
-//     without a valid sink the daemon refuses to serve.
+//     without a valid sink the daemon refuses to serve. Under --fee-model v1
+//     (LaneParams::fee) the ONE mandated fixed output is the protocol donation
+//     output (owed + 1 + residual) and the residual sink IS the donation address
+//     (xmr_fee_model.hpp, compiled-in -- no per-node knob).
 enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
 
 // M2: which miner-data source the option-B assembler is fed from.
@@ -155,9 +159,13 @@ struct XmrNodeConfig {
     // is issued for exactly this chain at start (single-node, single lane).
     ::v37::ChainId  lane_chain = 0;
 
-    // The digest-committed lane geometry. Defaults to the OQ-5 ratified default
-    // (LaneParams{}), the only geometry W4's geometry_is_ratified() admits.
-    ::v37::LaneParams lane_params{};
+    // The digest-committed lane geometry. ★ T1 seam, XMR arm: XMR has NO
+    // ratified LaneKind row (nr_ladder.hpp declares BTC/LTC/DASH/DOGE only), so
+    // it takes node_lane_params_no_kind() — the OQ-5 ratified default
+    // (LaneParams{}) today, and, if the build takes the V37.1 activation, the
+    // consensus version WITHOUT ridge dimensions. An XMR ridge row is a canon
+    // edit (ND-R6) with non-derivable constants: an operator ruling, not a port.
+    ::v37::LaneParams lane_params = ::c2pool::v37n::node_lane_params_no_kind();
 
     // --- settlement finality (F1 driver) ------------------------------------
     // D_conf: blocks a found (coinbase-carrying) Monero block must be buried on
@@ -184,6 +192,10 @@ struct XmrNodeConfig {
     //   --same-height-renotify <n>   (0 disables the bounded re-announce)
     SameHeightTieBreak same_height_tiebreak = SameHeightTieBreak::PreferOwn;
     std::uint32_t      same_height_renotify = 3;
+    //   --own-fork-bound-s <n>  the native index's own-fork liveness guard: an
+    //   own-mined tip that no peer adopts for this long is abandoned and the
+    //   node follows the peers' chain (0 disables). Default 2 x target.
+    std::uint32_t      own_fork_bound_s = 240;
     // Per-height verdict journal. "" = race.log next to settle.img; "off" =
     // none. Two nodes that watched the same race must agree on every height
     // either of them credited, and a journal is what turns that claim into a
@@ -247,10 +259,12 @@ struct XmrNodeConfig {
     // the coinbase bytes (it may stay empty; the serve port opens when the
     // residual sink is set, mirroring option A's payout_address gate).
     CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
-    // The mandated residual sink (REQUIRED for v37 mode): the raw public spend
-    // (B) + view (A) keys, 64 hex each, of the XMR wallet the exact-sum residual
-    // is paid to. Torsion-checked at build; the daemon REFUSES v37 mode without
-    // a valid sink. --residual-sink-subaddress builds an XMR_SUB (D_i, A_main).
+    // The mandated residual sink (REQUIRED for v37 mode with the fee model OFF):
+    // the raw public spend (B) + view (A) keys, 64 hex each, of the XMR wallet
+    // the exact-sum residual is paid to. Torsion-checked at build; the daemon
+    // REFUSES v37 mode without a valid sink. --residual-sink-subaddress builds
+    // an XMR_SUB (D_i, A_main). With --fee-model v1 (LaneParams::fee) the sink
+    // IS the protocol donation address (xmr_fee_model.hpp) and these are refused.
     std::string     residual_sink_spend_hex;
     std::string     residual_sink_view_hex;
     bool            residual_sink_subaddress = false;
@@ -401,6 +415,17 @@ struct XmrNodeConfig {
     // one line). The C6 parity oracle then has no judge and scores its samples
     // VOID, which is the honest cost and is exactly why this is not the default.
     bool            no_daemon_rpc = false;
+    // D6d: --native-parity-monerod. Under p2p-first the embedded node is the
+    // tip, the RandomX seed (hash + height, switching at every 2048-block epoch
+    // with the 64-block lag) and the difficulty/height source, all read off its
+    // own chain index -- so by DEFAULT it is handed no monerod endpoint at all,
+    // and the C6 parity judge's status-cadence round trips (get_miner_data for
+    // the shadow arm, get_info + get_last_block_header for the tip) are gone.
+    // This flag opts the judge back in as a COMPARE-ONLY oracle: it is read on
+    // the status cadence, never on the find path, and never decides anything.
+    // Daemon-first is unaffected (the daemon is its parity judge and submit arm
+    // either way); --no-daemon-rpc still wins over it.
+    bool            native_parity_monerod = false;
 
     // --- the SOLO (fully self-contained, peerless) configuration ------------
     //
@@ -599,6 +624,7 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
     if (a == "--native-force-synced")          { c.native_force_synced = true; return 1; }
     if (a == "--native-allow-unverified-pow")  { c.native_allow_unverified_pow = true; return 1; }
     if (a == "--native-seeds" || a == "--seeds") { c.native_use_seeds = true; return 1; }
+    if (a == "--native-parity-monerod")        { c.native_parity_monerod = true; return 1; }   // D6d
     if (a == "--native-snapshot-path") {
         if (!have_value || v.empty()) { err = "--native-snapshot-path wants <file>"; return -1; }
         c.native_snapshot_path = v;

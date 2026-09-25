@@ -64,6 +64,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,6 +110,15 @@ struct ChainIndexOptions {
     // chain. Replays of recorded history (parity, KATs) turn it off explicitly
     // and get rows with pow_verified == false, which never advance the frontier.
     bool          require_pow     = true;
+    // OWN-FORK LIVENESS GUARD (fork-choice policy on our OWN blocks, not a
+    // Monero rule). When the best chain ends in blocks WE mined and, for longer
+    // than this, no connected peer advertises a top on that fork -- every peer
+    // is on some other tip, or every peer dropped us -- the index leaves its own
+    // fork: the own-mined suffix is disconnected and abandoned, and the node
+    // follows the peers' chain. A levin-only node cannot see WHY a monerod
+    // refused our block; "nobody adopted it" is the evidence it does have.
+    // 0 disables. Default: two target block times.
+    std::uint64_t own_fork_bound_ms = 240'000;
 };
 
 // --- what happened to an offered block ---------------------------------------------
@@ -209,7 +219,10 @@ public:
         // One sink into the state view; it queues rather than dispatches, so no
         // consumer callback ever runs with our mutex held.
         view_.subscribe([this](const node::MainchainEvent& e) { queued_events_.push_back(e); });
-        view_.subscribe_txs([this](const BlockTxEvent& e) { queued_tx_events_.push_back(e); });
+        view_.subscribe_txs([this](const BlockTxEvent& e) {
+            note_mined_locked_(e);
+            queued_tx_events_.push_back(e);
+        });
     }
 
     ChainIndex(const ChainIndex&)            = delete;
@@ -307,6 +320,13 @@ public:
         return r;
     }
 
+    // The monerod checkpoints fencing reorgs, as boot_from_anchor() installs
+    // them from the bundle. Exposed for rigs that seed without a bundle.
+    void set_monerod_checkpoints(std::vector<std::pair<std::uint64_t, Hash>> cps) {
+        std::lock_guard<std::mutex> lk(mu_);
+        checkpoints_ = std::move(cps);
+    }
+
     // --- IChainIndexInbound ---------------------------------------------------------
     void on_peer_sync_data(const PeerRef& p, const PeerSyncData& d) override {
         {
@@ -318,7 +338,7 @@ public:
                 const std::uint8_t want =
                     hf_version_for_height(opts_.net, d.current_height - 1);
                 if (d.top_version != 0 && d.top_version < want) {
-                    peers_.erase(p.peer_id);
+                    peers_.erase(peer_key_(p));
                     penalize_locked_(&p, PeerFault::VersionMismatch,
                                      "advertised top_version " + std::to_string(d.top_version)
                                      + " is below the " + std::to_string(want)
@@ -327,7 +347,7 @@ public:
                     return;
                 }
             }
-            peers_[p.peer_id] = d;
+            peers_[peer_key_(p)] = d;
             update_synced_locked_();
         }
         flush_events_();
@@ -344,15 +364,33 @@ public:
             ++chain_entries_accepted_;
             // Everything after the splice point that we do not already have is
             // what we want fetched. The SCHEDULE is the sync driver's business;
-            // the index only says what is missing and in what order.
+            // the index only says what is missing and in what order -- through
+            // refetch_wanted(), which hands out the part of this list that fits
+            // the fetch window above our tip.
+            //
+            // The index used to put the WHOLE list (up to 2048 ids) on the wire
+            // here as one span. The pool delivers a span only when all of its
+            // ~21 chunks are in, so nothing connected for the minutes that took;
+            // a peer drop lost all of it silently; every 20 s the driver asked
+            // another peer for a chain and a fresh 2048-span went out, until
+            // the span caps were full of redundant copies of the same blocks
+            // and the batches the driver could still get through landed far
+            // from the tip and parked. That was the mainnet catch-up livelock.
+            //
+            // Heights come from OUR row of the splice point, not the peer's
+            // start_height claim.
+            std::uint64_t base = e.start_height;
+            if (const auto h = rows_.height_of(e.ids[0])) base = *h;
+            else if (const AltBlock* a = alt_.find(e.ids[0])) base = a->height;
             wanted_.clear();
+            wanted_heights_.clear();
             for (std::size_t i = 1; i < e.ids.size(); ++i) {
                 if (rows_.contains(e.ids[i]) || alt_.contains(e.ids[i])) continue;
                 wanted_.push_back(e.ids[i]);
+                wanted_heights_.push_back(base + i);
                 if (wanted_.size() >= MAX_SPAN_IDS) break;
             }
-            if (fetcher_ && !wanted_.empty())
-                fetcher_->request_objects(p, wanted_, /*prune=*/true);
+            (void)p;
         }
         flush_events_();
     }
@@ -379,6 +417,9 @@ public:
             if (peer_height > cohort_max_) cohort_max_ = peer_height;
             bytes_in_ += block.block_blob.size();
             const OfferResult r = offer_locked_(&p, std::move(block), /*own_mined=*/false);
+            // D3a: a push of a block we HAVE (connected, already on the best
+            // chain, or a valid alt candidate) hands its DoS block token back.
+            if (fetcher_ && pushed_block_is_known_valid_locked_(r)) fetcher_->credit_known_block(p);
             if (r.outcome == OfferOutcome::NeedsBodies && fluffy && fetcher_) {
                 // D-5: ask the announcer for exactly the bodies we are missing.
                 // Which indices those are is the txpool's answer (it may hold
@@ -398,7 +439,8 @@ public:
     void on_peer_gone(const PeerRef& p) override {
         {
             std::lock_guard<std::mutex> lk(mu_);
-            peers_.erase(p.peer_id);
+            peers_.erase(peer_key_(p));
+            ++peer_losses_;
             update_synced_locked_();
         }
         flush_events_();
@@ -500,6 +542,7 @@ public:
         s.rows      = static_cast<std::uint64_t>(rows_.size());
         s.alt_rows  = static_cast<std::uint64_t>(alt_.size());
         s.orphans   = orphans_;
+        s.chain_entries = chain_entries_accepted_;
         s.reorgs    = journal_.committed();
         s.pow_verified = gate_.verified();
         s.pow_failed   = gate_.failed();
@@ -511,6 +554,44 @@ public:
         s.synced        = synced_;
         return s;
     }
+
+    // Template / own-block hygiene oracle (IChainView::probe_mined). Answered
+    // from the mined-tx and spent-key-image maps the index keeps for the
+    // retained window, bounded to the chain ending at `parent_id`.
+    bool probe_mined(const Hash& parent_id, const std::vector<Hash>& tx_ids,
+                     const std::vector<Hash>& key_images, std::vector<Hash>& mined_txs,
+                     std::vector<Hash>& spent_key_images) const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        mined_txs.clear();
+        spent_key_images.clear();
+        const auto ph = rows_.height_of(parent_id);
+        if (!ph) return false;
+        probe_mined_locked_(*ph, tx_ids, key_images, mined_txs, spent_key_images);
+        return true;
+    }
+
+    // The own-fork liveness guard (ChainIndexOptions::own_fork_bound_ms). Driven
+    // from the verify thread's periodic tick with a monotone millisecond clock.
+    // Returns true when it abandoned our own fork on this call; `why` says what
+    // it saw either way when something is being tracked.
+    bool check_own_fork(std::uint64_t now_ms, std::string* why = nullptr) {
+        bool abandoned = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            abandoned = check_own_fork_locked_(now_ms, why);
+        }
+        flush_events_();
+        return abandoned;
+    }
+
+    // Is the best tip an own-mined fork nobody has adopted (yet)? Telemetry.
+    bool own_fork_tracking() const { std::lock_guard<std::mutex> lk(mu_); return own_fork_tracking_; }
+    std::uint64_t own_forks_abandoned() const { std::lock_guard<std::mutex> lk(mu_); return own_forks_abandoned_; }
+    // Own blocks refused at submit because they carry a tx already mined, a key
+    // image already spent, or a duplicate within the block.
+    std::uint64_t own_blocks_refused_invalid() const { std::lock_guard<std::mutex> lk(mu_); return own_invalid_refused_; }
+    // How many tx ids / key images the mined oracle currently covers.
+    std::size_t mined_tx_count() const { std::lock_guard<std::mutex> lk(mu_); return mined_tx_.size(); }
 
     // --- IChainServing -------------------------------------------------------------------
     PeerSyncData our_sync_data() const override {
@@ -593,6 +674,19 @@ public:
         return it->second.entry;
     }
 
+    // RC-CTX: the block blob of `id` from the bodies this index retains -- the
+    // entry cache (connected blocks, including ones a reorg disconnected) or a
+    // held alternative block's entry. Read-only; false when neither holds it.
+    // The relay serves a receipt's Monero context (FB_GETCTX) from here, and
+    // re-verifies every byte (id recomputed) before it uses one.
+    bool block_blob_of(const Hash& id, std::vector<std::uint8_t>& out) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = entries_.find(key_(id));
+        if (it != entries_.end() && !it->second.entry.block_blob.empty()) { out = it->second.entry.block_blob; return true; }
+        if (const AltBlock* a = alt_.find(id); a && a->has_entry && !a->entry.block_blob.empty()) { out = a->entry.block_blob; return true; }
+        return false;
+    }
+
     // --- the settlement clock ------------------------------------------------------------
     Burial burial_of(const Hash& id) const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -666,12 +760,25 @@ public:
     // answering". Membership is not enough: a bodiless fluffy announcement and
     // a row whose body has been evicted are both "known" and both still need
     // fetching, so the test is whether we have bytes we could re-apply.
+    //
+    // THE FETCH WINDOW. Only the part of `wanted_` within fetch_window_() of
+    // our tip is handed out: whatever we fetch beyond what the alt pool can
+    // hold while the gap below it fills is fetched to be evicted, and the
+    // eviction takes the blocks nearest the tip (the ones we asked for first).
+    // As the tip moves, the window moves with it.
     std::vector<Hash> refetch_wanted() const {
         std::lock_guard<std::mutex> lk(mu_);
         std::vector<Hash> out;
         out.reserve(wanted_.size() + refetch_.size());
-        for (const Hash& id : wanted_)
-            if (!have_body_locked_(id)) out.push_back(id);
+        // An entry id that has since connected is done with, whether or not
+        // its body is still cached (the entry cache is smaller than a 2048-id
+        // entry); one below the retained rows can no longer be used at all.
+        const std::uint64_t limit = rows_.tip_height() + fetch_window_();
+        for (std::size_t k = 0; k < wanted_.size(); ++k) {
+            if (wanted_heights_[k] > limit) break;
+            if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
+            if (!have_body_locked_(wanted_[k])) out.push_back(wanted_[k]);
+        }
         for (const Hash& id : refetch_)
             if (!have_body_locked_(id) && !contains_hash_(out, id)) out.push_back(id);
         return out;
@@ -689,11 +796,19 @@ public:
     // on every non-empty block (which would double inbound block bytes on
     // mainnet, where every non-empty fluffy block parks once). The park is
     // erased on connect, so this list empties itself.
+    //
+    // Every bodiless park carries the flag, including a push parked before its
+    // parent was known (the near-tip stall: such a park used to be resolved on
+    // the parent's arrival WITHOUT the flag and was then invisible to every
+    // re-ask path). Only RESOLVED parks are listed: an orphan whose parent we
+    // have never seen has not been through the proof-of-work gate, so asking
+    // for its bytes would let anyone who can push a bogus blob make us issue
+    // GET_OBJECTS on a timer. It is listed the moment its parent lands.
     std::vector<Hash> bodies_wanted() const {
         std::lock_guard<std::mutex> lk(mu_);
         std::vector<Hash> out;
         alt_.for_each([&out](const AltBlock& b) {
-            if (b.bodies_missing) out.push_back(b.id);
+            if (b.bodies_missing && b.resolved) out.push_back(b.id);
         });
         return out;
     }
@@ -739,6 +854,14 @@ private:
         std::uint64_t     bytes = 0;
     };
 
+    // One connected best-chain block's contribution to the mined oracle.
+    struct MinedRec {
+        std::uint64_t    height = 0;
+        Hash             block_id{};
+        std::vector<Key> txs;
+        std::vector<Key> kis;
+    };
+
     // =====================================================================================
     // offering a block
     // =====================================================================================
@@ -766,6 +889,59 @@ private:
             return r;
         }
 
+        // OUR OWN block: never adopt one every monerod would refuse. A block
+        // carrying a tx already mined in the chain it extends, a key image
+        // already spent there, or the same tx / key image twice, is invalid on
+        // every node that has the history -- and a levin-only node cannot hear
+        // their refusal, so PREFER-OWN would build on it forever (the
+        // publish-arm verify, 8b2efacf at h=513). Hygiene on our own output,
+        // not a rule applied to anyone else's blocks.
+        if (own_mined) {
+            if (abandoned_own_.count(key_(r.id))) {
+                r.outcome = OfferOutcome::Rejected;
+                r.why     = "own block was abandoned by the own-fork liveness guard";
+                return r;
+            }
+            std::string bad;
+            const RowRecord* mp = rows_.by_id(ev.input.parsed.header.prev_id);
+            if (!own_block_hygiene_locked_(ev, mp ? std::optional<std::uint64_t>(mp->row.height)
+                                                  : std::nullopt, bad)) {
+                ++own_invalid_refused_;
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = mp ? mp->row.height + 1 : ev.input.coinbase.height;
+                r.why     = "own block refused: " + bad;
+                return r;
+            }
+        }
+
+        // A bodiless re-announcement (a fluffy push) of a block we already hold
+        // WITH its transactions must not replace the complete copy: every path
+        // below re-inserts, and trading bodies for a bare blob is how a block
+        // that could connect becomes one that cannot. Carry on with the copy
+        // we hold, so a re-push still gets the chance to connect it.
+        if (!ev.input.bodies_complete) {
+            if (const AltBlock* have = alt_.find(r.id);
+                have && have->has_entry && !have->bodies_missing) {
+                BlockEntry     held = have->entry;
+                EvaluatedBlock hev;
+                std::string    hw;
+                if (evaluate_block(held, hev, hw) == EvalStatus::Ok && hev.input.bodies_complete) {
+                    entry = std::move(held);
+                    ev    = std::move(hev);
+                }
+            }
+        }
+        // Every park below records whether it holds the transactions. The flag
+        // is what bodies_wanted() lists and what the switch refuses on, so it
+        // has to be true for EVERY bodiless park, not only the fast-path one.
+        const bool bodiless = !ev.input.bodies_complete;
+        // It arrived with its bodies: whatever becomes of it now, asking for it
+        // again is pointless. Without this the standing refetch list kept every
+        // parent it ever named, and once a connected block's body left the
+        // entry cache (and its row the retained window) the driver fetched it
+        // AGAIN -- to be parked as an orphan below the window.
+        if (!bodiless) erase_hash_(refetch_, r.id);
+
         const Hash prev = ev.input.parsed.header.prev_id;
         const std::uint8_t major = static_cast<std::uint8_t>(ev.input.parsed.header.major_version);
         const std::uint8_t rules = hf_rules_version(major);
@@ -778,9 +954,51 @@ private:
             // Unknown parent. Park it: it may be the tip of a branch we cannot
             // see yet, and throwing it away would mean re-fetching it after the
             // chain entry that explains it arrives.
-            if (alt_.contains(r.id)) {
-                r.outcome = OfferOutcome::Duplicate;
-                r.why     = "already parked";
+            if (const AltBlock* have = alt_.find(r.id)) {
+                // Already parked. A copy that ADDS the bodies we were missing
+                // (or bytes we never had) replaces the park in place, keeping
+                // everything already learned about it; anything else is a
+                // duplicate. Dropping the complete copy here would leave the
+                // park bodiless for good.
+                if (have->has_entry && !(have->bodies_missing && !bodiless)) {
+                    r.outcome = OfferOutcome::Duplicate;
+                    r.why     = "already parked";
+                    return r;
+                }
+                AltBlock up       = *have;
+                up.entry          = std::move(entry);
+                up.has_entry      = true;
+                up.bodies_missing = bodiless;
+                alt_.insert(std::move(up));
+                r.outcome = OfferOutcome::ParkedOrphan;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "parent is not in the index yet (park completed)";
+                return r;
+            }
+            // monerod's "Received new block while syncing, ignored": while we
+            // are behind, a block claiming a height further above our tip than
+            // the alt pool can hold is not parked. Parking it evicts a block we
+            // need next, and its unknown parent starts a backward walk of
+            // one GET_OBJECTS per round trip from the network tip -- the refetch
+            // storm behind 45k-76k orphans on the mainnet dry run. The chain
+            // entry fetch reaches it in order; once synced, pushes park as
+            // before.
+            if (!synced_ && !own_mined && opts_.alt_max_blocks && !rows_.empty()
+                && ev.input.coinbase.height > rows_.tip_height() + opts_.alt_max_blocks) {
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "received a block far above our tip while syncing; ignored";
+                return r;
+            }
+            // Nor, ever, one claiming a height below the retained rows: no
+            // branch through it can be adopted (the switch refuses a fork point
+            // older than the window as OutOfWindow), so holding it only takes a
+            // slot from a block that can.
+            if (!own_mined && !rows_.empty()
+                && ev.input.coinbase.height < rows_.oldest_height()) {
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "parent unknown and below the retained window; ignored";
                 return r;
             }
             AltBlock b;
@@ -791,6 +1009,7 @@ private:
             b.own_mined      = own_mined;
             b.entry          = std::move(entry);
             b.has_entry      = true;
+            b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
             if (peer) b.source = *peer;
             alt_.insert(std::move(b));
@@ -798,7 +1017,7 @@ private:
             r.outcome = OfferOutcome::ParkedOrphan;
             r.height  = ev.input.coinbase.height;
             r.why     = "parent is not in the index yet";
-            if (!contains_hash_(refetch_, prev)) refetch_.push_back(prev);
+            remember_refetch_(prev);   // bounded, like every other refetch entry
             return r;
         }
 
@@ -829,7 +1048,8 @@ private:
             // difficulty on its branch, heaviest() skips it, and the fail-closed
             // bound in the switch refuses any branch containing it. Holding
             // bytes is the whole of what happens here.
-            if (const AltBlock* have = alt_.find(r.id); have && have->has_entry) {
+            if (const AltBlock* have = alt_.find(r.id);
+                have && have->has_entry && !(have->bodies_missing && !bodiless)) {
                 r.outcome = OfferOutcome::Duplicate;
                 r.why     = "already parked, unjudgeable: " + why;
                 return r;
@@ -844,6 +1064,7 @@ private:
             b.own_mined      = own_mined;
             b.entry          = std::move(entry);
             b.has_entry      = true;
+            b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
             if (peer) b.source = *peer;
             alt_.insert(std::move(b));
@@ -880,6 +1101,7 @@ private:
             b.adoptable      = false;   // the gate has not passed it
             b.entry          = std::move(entry);
             b.has_entry      = true;
+            b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
             if (peer) b.source = *peer;
             alt_.insert(std::move(b));
@@ -970,6 +1192,7 @@ private:
         b.own_mined      = own_mined;
         b.entry          = std::move(entry);
         b.has_entry      = true;
+        b.bodies_missing = bodiless;   // listed by bodies_wanted(); the switch refuses it
         b.first_seen_seq = ++seq_;
         if (peer) b.source = *peer;
         alt_.insert(std::move(b));
@@ -1146,6 +1369,15 @@ private:
                 }
                 c.pow_verified = pow_verdict_is_verified(pw.verdict);
                 c.adoptable    = c.pow_verified || pw.verdict == PowVerdict::Skipped;
+                // Resolved and adoptable is not connectable: a fluffy push parked
+                // before its parent landed holds the blob and NOT the
+                // transactions. Flag it here, where it first becomes a candidate,
+                // or nothing ever asks for them -- bodies_wanted() lists only
+                // flagged parks, refetch_wanted() skips ids whose blob we hold,
+                // and a chain entry skips ids already in the pool -- and the tip
+                // freezes one block below it (the mainnet format-2 dry run,
+                // h=3768570, fluffy_req=0 for the whole stall).
+                c.bodies_missing = !ev.input.bodies_complete;
 
                 alt_.insert(std::move(c));
                 stack.push_back(child_id);
@@ -1168,8 +1400,13 @@ private:
             // Copied out of the pool before anything is connected: connecting
             // mutates the caches a live pointer into the pool would outlive.
             std::optional<AltBlock> pick;
+            // A bodiless park is skipped, not picked: it cannot connect, and
+            // picking it first would hide a complete sibling behind it.
             for (const AltBlock* c : alt_.children_of(tip_id)) {
-                if (c->resolved && c->adoptable && c->has_entry) { pick = *c; break; }
+                if (c->resolved && c->adoptable && c->has_entry && !c->bodies_missing) {
+                    pick = *c;
+                    break;
+                }
             }
             if (!pick) return;
 
@@ -1182,7 +1419,14 @@ private:
             const ConnectOutcomeLocal co =
                 connect_to_tip_locked_(pick->entry, ev, pick->pow_verified, Hash{},
                                        pick->own_mined, why);
-            if (co.status != ConnectStatus::Ok) return;   // leave it parked, and say nothing new
+            if (co.status != ConnectStatus::Ok) {
+                // Leave it parked, and say nothing new -- but if what it lacks is
+                // its bodies, say so to bodies_wanted(), which is the only path
+                // that will ever ask for them.
+                if (co.status == ConnectStatus::BodiesMissing)
+                    if (AltBlock* p = alt_.find_mut(pick->id)) p->bodies_missing = true;
+                return;
+            }
             alt_.erase(pick->id);
         }
     }
@@ -1275,7 +1519,17 @@ private:
             ++chain_refusals_;
             return false;
         }
+        // monerod's rule (checkpoints::is_alternative_block_allowed): only the
+        // highest checkpoint at or below the chain's HEIGHT (block count, i.e.
+        // tip + 1) fences alternatives, and it fences blocks at or below it --
+        // a branch whose first block sits at fork_height + 1 is allowed iff
+        // that checkpoint < fork_height + 1. A checkpoint ABOVE our chain says
+        // nothing yet about a fork beneath it; comparing against every
+        // checkpoint refused every reorg, a one-block sibling race at the tip
+        // included, whenever a bundle carried one above the anchor (which
+        // checkpoints_at_or_above() keeps by construction).
         for (const auto& cp : checkpoints_) {
+            if (cp.first > best.height + 1) continue;   // not reached yet
             if (fork_height < cp.first) {
                 journal_.refuse(rec, ReorgRefusal::BelowCheckpoint,
                                 "the fork point is below the pinned checkpoint at "
@@ -1338,7 +1592,11 @@ private:
             const RowRecord* rr = rows_.by_height(h);
             if (!rr) break;
             const CachedEntry ce = entries_[key_(rr->row.id)];
-            if (!view_.disconnect_tip(ce.tx_hashes, {})) break;
+            // The bodies go back with the event, so the pool can re-admit the
+            // transactions the losing branch had mined (good citizen): they are
+            // valid again on the new branch unless it mined them too, which the
+            // pool checks against probe_mined() on re-admission.
+            if (!view_.disconnect_tip(ce.tx_hashes, blobs_of_(ce.entry))) break;
             RowRecord popped;
             rows_.pop(popped);
             pop_long_mirror_();
@@ -1351,6 +1609,8 @@ private:
 
         // --- apply --------------------------------------------------------------------
         bool ok = true;
+        bool lacked_bodies = false;   // the failure was OUR missing bytes, not bad data
+        Hash lacked_id{};
         std::vector<Hash> applied;
         for (const AltBlock& b : branch) {
             EvaluatedBlock ev;
@@ -1359,7 +1619,15 @@ private:
             const std::uint64_t now = clock_ ? clock_() : 0;
             const ChainStateView::ConnectOutcome co =
                 view_.connect(b.entry, b.pow_verified, now, b.own_mined, w);
-            if (!co.ok) { ok = false; why = w; break; }
+            if (!co.ok) {
+                ok = false;
+                why = w;
+                if (co.connect == ConnectStatus::BodiesMissing) {
+                    lacked_bodies = true;
+                    lacked_id     = b.id;
+                }
+                break;
+            }
             // The difficulty the state computed from the rolled-back windows MUST
             // equal the one the branch walk computed, or one of the two is wrong
             // and neither may be trusted with a chain switch.
@@ -1398,11 +1666,23 @@ private:
                 push_long_mirror_(co.row.long_term_weight);
                 alt_.erase(co.row.id);
             }
-            alt_.erase_branch(cand_id);
-            journal_.close_rolled_back(seq, ReorgRefusal::ValidationFailed, why);
             // Nothing happened, so nothing is announced.
             queued_events_.resize(ev_mark);
             queued_tx_events_.resize(tx_mark);
+            if (lacked_bodies) {
+                // Not a consensus failure: a block on the branch is a bodiless
+                // park the pre-check above did not know about. Keep the branch
+                // (erasing only its top, as the ValidationFailed path does, left
+                // the bodiless block in place and peeled one pushed block per
+                // arrival, forever), flag the block so bodies_wanted() asks for
+                // it, and charge nobody.
+                if (AltBlock* p = alt_.find_mut(lacked_id)) p->bodies_missing = true;
+                journal_.close_rolled_back(seq, ReorgRefusal::MissingBodies, why);
+                ++chain_refusals_;
+                return false;
+            }
+            alt_.erase_branch(cand_id);
+            journal_.close_rolled_back(seq, ReorgRefusal::ValidationFailed, why);
             // A branch that fails consensus after passing proof of work is bad
             // data from whoever proposed it.
             if (cand_source.peer_id != 0 || !cand_source.addr.empty())
@@ -1449,6 +1729,262 @@ private:
             if (queued_events_[i].kind != node::MainchainEventKind::Extend)
                 keep.push_back(queued_events_[i]);
         queued_events_.swap(keep);
+    }
+
+    // =====================================================================================
+    // the mined oracle: which txs / key images the best chain already carries
+    // =====================================================================================
+    // Fed from the state view's own tx events (under mu_, in chain order), so
+    // it moves in lock-step with the chain on every path that connects or
+    // disconnects a block -- extend, switch, failed-switch restore, snapshot
+    // replay, own-fork abandonment -- with no path having to remember it.
+    void note_mined_locked_(const BlockTxEvent& e) {
+        if (e.kind == BlockTxEvent::Kind::Connected) {
+            MinedRec rec;
+            rec.height   = e.height;
+            rec.block_id = e.block_id;
+            rec.txs.reserve(e.tx_hashes.size());
+            for (const Hash& id : e.tx_hashes) {
+                rec.txs.push_back(key_(id));
+                mined_tx_[rec.txs.back()] = e.height;
+            }
+            rec.kis.reserve(e.key_images.size());
+            for (const Hash& ki : e.key_images) {
+                rec.kis.push_back(key_(ki));
+                mined_ki_[rec.kis.back()] = e.height;
+            }
+            mined_stack_.push_back(std::move(rec));
+            const std::size_t cap = opts_.row_retention ? opts_.row_retention : 2048;
+            while (mined_stack_.size() > cap) {
+                forget_mined_locked_(mined_stack_.front());
+                mined_stack_.pop_front();
+            }
+            return;
+        }
+        // Disconnected: LIFO, so it is the newest record -- searched from the
+        // back only as a guard against a disconnect of a block the oracle never
+        // saw connect (below the window it was seeded with).
+        for (auto it = mined_stack_.rbegin(); it != mined_stack_.rend(); ++it) {
+            if (!(it->block_id == e.block_id)) continue;
+            forget_mined_locked_(*it);
+            mined_stack_.erase(std::next(it).base());
+            return;
+        }
+    }
+
+    void forget_mined_locked_(const MinedRec& rec) {
+        for (const Key& k : rec.txs) {
+            const auto it = mined_tx_.find(k);
+            if (it != mined_tx_.end() && it->second == rec.height) mined_tx_.erase(it);
+        }
+        for (const Key& k : rec.kis) {
+            const auto it = mined_ki_.find(k);
+            if (it != mined_ki_.end() && it->second == rec.height) mined_ki_.erase(it);
+        }
+    }
+
+    void probe_mined_locked_(std::uint64_t parent_height, const std::vector<Hash>& tx_ids,
+                             const std::vector<Hash>& key_images, std::vector<Hash>& mined,
+                             std::vector<Hash>& spent) const {
+        for (const Hash& id : tx_ids) {
+            const auto it = mined_tx_.find(key_(id));
+            if (it != mined_tx_.end() && it->second <= parent_height) mined.push_back(id);
+        }
+        for (const Hash& ki : key_images) {
+            const auto it = mined_ki_.find(key_(ki));
+            if (it != mined_ki_.end() && it->second <= parent_height) spent.push_back(ki);
+        }
+    }
+
+    // Our own block's tx set, judged against the chain it extends (when that
+    // parent is on the best chain; a block on a side branch is judged for
+    // internal duplicates only -- the oracle answers for the best chain).
+    bool own_block_hygiene_locked_(const EvaluatedBlock& ev,
+                                   std::optional<std::uint64_t> parent_height,
+                                   std::string& why) const {
+        const std::vector<Hash>& ids = ev.input.parsed.tx_hashes;
+        {
+            std::set<Key> seen;
+            for (const Hash& id : ids)
+                if (!seen.insert(key_(id)).second) {
+                    why = "tx " + hex_(id) + " appears twice in the block";
+                    return false;
+                }
+        }
+        {
+            std::set<Key> seen;
+            for (const Hash& ki : ev.key_images)
+                if (!seen.insert(key_(ki)).second) {
+                    why = "key image " + hex_(ki) + " is spent twice in the block";
+                    return false;
+                }
+        }
+        if (!parent_height) return true;
+        std::vector<Hash> mined, spent;
+        probe_mined_locked_(*parent_height, ids, ev.key_images, mined, spent);
+        if (!mined.empty()) {
+            why = "tx " + hex_(mined.front()) + " is already in the chain it extends (height "
+                + std::to_string(mined_tx_.at(key_(mined.front()))) + ")";
+            return false;
+        }
+        if (!spent.empty()) {
+            why = "key image " + hex_(spent.front()) + " is already spent in the chain it extends";
+            return false;
+        }
+        return true;
+    }
+
+    static std::vector<std::vector<std::uint8_t>> blobs_of_(const BlockEntry& e) {
+        std::vector<std::vector<std::uint8_t>> out;
+        out.reserve(e.txs.size());
+        for (const TxBlobEntry& t : e.txs) {
+            if (t.pruned) return {};   // a pruned body cannot be re-admitted: let relay re-teach it
+            out.push_back(t.blob);
+        }
+        return out;
+    }
+
+    static std::string hex_(const Hash& h) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        s.reserve(64);
+        for (const std::uint8_t b : h) { s.push_back(d[b >> 4]); s.push_back(d[b & 15]); }
+        return s;
+    }
+
+    // =====================================================================================
+    // the own-fork liveness guard
+    // =====================================================================================
+    bool check_own_fork_locked_(std::uint64_t now_ms, std::string* why) {
+        const std::uint64_t losses_prev = losses_at_prev_check_;
+        losses_at_prev_check_           = peer_losses_;
+
+        const RowRecord* tip = rows_.tip();
+        if (opts_.own_fork_bound_ms == 0 || !tip || !tip->own_mined) {
+            own_fork_tracking_ = false;
+            return false;
+        }
+        // The fork base: the lowest block of the own-mined suffix of the chain.
+        const RowRecord* base = tip;
+        for (std::uint64_t h = tip->row.height; h > rows_.oldest_height(); --h) {
+            const RowRecord* below = rows_.by_height(h - 1);
+            if (!below || !below->own_mined) break;
+            base = below;
+        }
+        const std::uint64_t base_h = base->row.height;
+        if (!own_fork_tracking_ || !(own_fork_base_ == base->row.id)) {
+            own_fork_tracking_    = true;
+            own_fork_base_        = base->row.id;
+            own_fork_since_ms_    = now_ms;
+            // Counted from the previous tick: a peer that dropped us right after
+            // the block went out did so before this tick could start tracking.
+            own_fork_losses_base_ = losses_prev;
+            return false;
+        }
+        // Adopted? A peer whose advertised top is on our chain at or above the
+        // fork base has taken our block; the fork is not suspect.
+        for (const auto& kv : peers_) {
+            const auto ph = rows_.height_of(kv.second.top_id);
+            if (ph && *ph >= base_h) {
+                own_fork_since_ms_    = now_ms;
+                own_fork_losses_base_ = peer_losses_;
+                return false;
+            }
+        }
+        // Somebody must have been there to disagree: a node that never had a
+        // peer (a solo regtest miner) is not abandoned by anyone.
+        const bool lost_peers = peer_losses_ > own_fork_losses_base_;
+        if (peers_.empty() && !lost_peers) return false;
+        const std::uint64_t age = now_ms >= own_fork_since_ms_ ? now_ms - own_fork_since_ms_ : 0;
+        if (why)
+            *why = "own fork from h=" + std::to_string(base_h) + " (" + hex_(base->row.id)
+                 + ") unadopted for " + std::to_string(age) + " ms, peers="
+                 + std::to_string(peers_.size()) + " lost="
+                 + std::to_string(peer_losses_ - own_fork_losses_base_);
+        if (age < opts_.own_fork_bound_ms) return false;
+        return abandon_own_fork_locked_(base_h, why);
+    }
+
+    // Disconnect the own-mined suffix down to (not including) its parent,
+    // abandon those blocks, and let whatever we hold of the peers' chain in.
+    bool abandon_own_fork_locked_(std::uint64_t base_h, std::string* why) {
+        const RowRecord* tip = rows_.tip();
+        if (!tip || base_h == 0 || base_h > tip->row.height) return false;
+        const std::uint64_t tip_h       = tip->row.height;
+        const std::uint64_t fork_height = base_h - 1;
+        const std::uint64_t depth       = tip_h - fork_height;
+        const RowRecord*    fork_row    = rows_.by_height(fork_height);
+
+        ReorgRecord rec;
+        rec.old_tip    = tip->row.id;
+        rec.old_height = tip_h;
+        rec.old_cumulative_difficulty = tip->row.cumulative_difficulty;
+        rec.fork_height = fork_height;
+        rec.depth       = depth;
+        if (fork_row) {
+            rec.new_tip    = fork_row->row.id;
+            rec.new_height = fork_height;
+            rec.new_cumulative_difficulty = fork_row->row.cumulative_difficulty;
+        }
+        const char* refuse = nullptr;
+        ReorgRefusal code  = ReorgRefusal::OutOfWindow;
+        if (!fork_row || fork_height < rows_.oldest_height()) refuse = "the fork parent is not retained";
+        else if (fork_height < view_.anchor_height()) { refuse = "the fork parent is below the anchor"; code = ReorgRefusal::BelowAnchor; }
+        else if (depth > opts_.max_reorg_depth) { refuse = "the own fork is deeper than the reorg horizon"; code = ReorgRefusal::TooDeep; }
+        if (refuse) {
+            journal_.refuse(rec, code, std::string("own-fork guard: ") + refuse);
+            ++chain_refusals_;
+            own_fork_tracking_ = false;   // re-armed (and re-timed) by the next check
+            if (why) *why += std::string(" -- NOT abandoned: ") + refuse;
+            return false;
+        }
+
+        const std::uint64_t seq = journal_.plan(rec);
+        std::uint64_t n = 0;
+        for (std::uint64_t h = tip_h; h > fork_height; --h) {
+            const RowRecord* rr = rows_.by_height(h);
+            if (!rr) break;
+            const auto ce = entries_.find(key_(rr->row.id));
+            const bool have = ce != entries_.end();
+            if (!view_.disconnect_tip(have ? ce->second.tx_hashes : std::vector<Hash>{},
+                                      have ? blobs_of_(ce->second.entry)
+                                           : std::vector<std::vector<std::uint8_t>>{}))
+                break;
+            RowRecord popped;
+            rows_.pop(popped);
+            pop_long_mirror_();
+            if (ReorgRecord* jr = journal_.find(seq)) jr->disconnected.push_back(popped.row.id);
+            alt_.erase_branch(popped.row.id);
+            remember_abandoned_(popped.row.id);
+            ++n;
+        }
+        journal_.set_phase(seq, ReorgPhase::Disconnected);
+        journal_.set_phase(seq, ReorgPhase::Applied);
+        view_.emit_reorg(n);
+        journal_.close_committed(seq);
+        ++own_forks_abandoned_;
+        own_fork_tracking_ = false;
+        if (why)
+            *why += " -- ABANDONED " + std::to_string(n) + " own block(s), tip back to h="
+                  + std::to_string(fork_height);
+
+        // Whatever we already hold of the peers' chain goes in now: the
+        // children of the fork parent, and any branch that outweighs it.
+        if (const RowRecord* t = rows_.tip()) resolve_descendants_locked_(t->row.id);
+        connect_parked_children_locked_();
+        (void)maybe_switch_locked_();
+        update_synced_locked_();
+        return n > 0;
+    }
+
+    void remember_abandoned_(const Hash& id) {
+        const Key k = key_(id);
+        if (!abandoned_own_.insert(k).second) return;
+        abandoned_order_.push_back(k);
+        while (abandoned_order_.size() > 256) {
+            abandoned_own_.erase(abandoned_order_.front());
+            abandoned_order_.pop_front();
+        }
     }
 
     // =====================================================================================
@@ -1536,14 +2072,35 @@ private:
         return b;
     }
 
+    // One vote per CONNECTION. The levin peer_id is the remote's own claim and
+    // is not unique (anonymity-network peers all send 0), so keying the cohort
+    // by it collapsed honest peers into one vote -- and let on_peer_gone for
+    // one of them erase the others'.
+    static std::string peer_key_(const PeerRef& p) {
+        return p.addr.empty() ? "#" + std::to_string(p.peer_id) : p.addr;
+    }
+
     std::uint64_t cohort_height_locked_() const {
         // The cohort is the peers that agree with the heaviest claim. We take
         // the MEDIAN of their advertised heights rather than the maximum, so one
         // peer shouting a huge height cannot hold `synced` false forever.
+        //
+        // Only PLAUSIBLE votes count: a peer advertising a height below our own
+        // verified chain (current_height is one past its tip) is behind us and
+        // says nothing about whether WE are synced. A fresh-from-genesis
+        // monerod advertises ~1, and such peers are a normal fraction of the
+        // dialable population: with them in the median, a stale node reported
+        // synced=1 and served templates 30+ blocks behind the network. If
+        // every peer is level with or behind us, we are at the cohort's tip.
         if (peers_.empty()) return cohort_max_;
+        const std::uint64_t frontier = view_.verified_frontier();
+        const std::uint64_t anchor   = view_.anchor_height();
+        const std::uint64_t level    = (frontier > anchor ? frontier : anchor) + 1;
         std::vector<std::uint64_t> hs;
         hs.reserve(peers_.size());
-        for (const auto& kv : peers_) hs.push_back(kv.second.current_height);
+        for (const auto& kv : peers_)
+            if (kv.second.current_height >= level) hs.push_back(kv.second.current_height);
+        if (hs.empty()) return level;
         std::sort(hs.begin(), hs.end());
         return hs[hs.size() / 2];
     }
@@ -1598,9 +2155,20 @@ private:
              ? pb.tx_hashes.size() - b->entry.txs.size() : 0;
     }
 
+    // How far above our tip the chain-entry want list is handed out: half the
+    // alt pool, so the blocks in flight plus whatever parks meanwhile fit in it.
+    std::uint64_t fetch_window_() const {
+        if (!opts_.alt_max_blocks) return MAX_SPAN_IDS;
+        return opts_.alt_max_blocks >= 2 ? opts_.alt_max_blocks / 2 : 1;
+    }
+
     void remember_refetch_(const Hash& id) {
         if (!contains_hash_(refetch_, id)) refetch_.push_back(id);
         while (refetch_.size() > 256) refetch_.erase(refetch_.begin());
+    }
+
+    static void erase_hash_(std::vector<Hash>& v, const Hash& h) {
+        v.erase(std::remove(v.begin(), v.end(), h), v.end());
     }
 
     static bool contains_hash_(const std::vector<Hash>& v, const Hash& h) {
@@ -1617,6 +2185,29 @@ private:
         if (entries_.find(key_(id)) != entries_.end()) return true;
         const AltBlock* b = alt_.find(id);
         return b && b->has_entry;
+    }
+
+    // D3a: is the block a peer just pushed one this index HAS as a valid block?
+    // On the best chain (it connected, reorged in, or was already there), or held
+    // in the alt pool as a RESOLVED, ADOPTABLE candidate with its bodies. A parked
+    // orphan, an unjudgeable park, a bodiless announcement, a block whose proof of
+    // work could not be checked yet, and every rejection answer false: those are
+    // exactly the pushes the block DoS bucket exists to rate-limit.
+    bool pushed_block_is_known_valid_locked_(const OfferResult& r) const {
+        switch (r.outcome) {
+            case OfferOutcome::Connected:
+            case OfferOutcome::Reorged:
+            case OfferOutcome::Duplicate:
+            case OfferOutcome::StoredAsAlt:
+                break;
+            case OfferOutcome::ParkedOrphan:
+            case OfferOutcome::NeedsBodies:
+            case OfferOutcome::Rejected:
+                return false;
+        }
+        if (rows_.contains(r.id)) return true;
+        const AltBlock* a = alt_.find(r.id);
+        return a && a->resolved && a->adoptable && a->has_entry && !a->bodies_missing;
     }
 
     void penalize_locked_(const PeerRef* p, PeerFault f, const std::string& why) {
@@ -2054,9 +2645,14 @@ private:
         lt_mirror_.clear();
         lt_undo_.clear();
         wanted_.clear();
+        wanted_heights_.clear();
         refetch_.clear();
         queued_events_.clear();
         queued_tx_events_.clear();
+        mined_stack_.clear();
+        mined_tx_.clear();
+        mined_ki_.clear();
+        own_fork_tracking_ = false;
     }
 
     void flush_events_() {
@@ -2101,8 +2697,9 @@ private:
     std::deque<std::uint64_t>                   lt_mirror_;
     std::deque<std::pair<bool, std::uint64_t>>  lt_undo_;
 
-    std::map<std::uint64_t, PeerSyncData> peers_;
+    std::map<std::string, PeerSyncData> peers_;   // keyed by peer_key_()
     std::vector<Hash> wanted_;
+    std::vector<std::uint64_t> wanted_heights_;   // parallel to wanted_
     std::vector<Hash> refetch_;
 
     std::vector<node::MainchainEvent> queued_events_;
@@ -2122,6 +2719,26 @@ private:
     bool          synced_             = false;
     bool          forced_synced_      = false;
     bool          synced_forced_ever_ = false;
+
+    // --- the mined oracle (template / own-block hygiene) ----------------------
+    // One record per connected best-chain block, LIFO like the chain itself, so
+    // a disconnect removes exactly what its connect added. Bounded to the
+    // retained row window.
+    std::deque<MinedRec>          mined_stack_;
+    std::map<Key, std::uint64_t>  mined_tx_;   // tx id -> height mined at
+    std::map<Key, std::uint64_t>  mined_ki_;   // key image -> height spent at
+    std::uint64_t own_invalid_refused_ = 0;
+
+    // --- the own-fork liveness guard --------------------------------------------
+    bool          own_fork_tracking_    = false;
+    Hash          own_fork_base_{};
+    std::uint64_t own_fork_since_ms_    = 0;
+    std::uint64_t own_fork_losses_base_ = 0;
+    std::uint64_t peer_losses_          = 0;
+    std::uint64_t losses_at_prev_check_ = 0;
+    std::uint64_t own_forks_abandoned_  = 0;
+    std::set<Key>   abandoned_own_;
+    std::deque<Key> abandoned_order_;
 };
 
 } // namespace c2pool::xmr::native

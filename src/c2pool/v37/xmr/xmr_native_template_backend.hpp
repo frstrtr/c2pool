@@ -156,6 +156,8 @@ struct NativeTemplateConfig {
     // settlement accounting reads, so "what we build on" and "what we nominate"
     // cannot be configured apart.
     native::TieBreak         fork_tie = native::TieBreak::PreferOwn;
+    // Own-fork liveness guard bound (--own-fork-bound-s); 0 disables.
+    std::uint64_t            own_fork_bound_ms = 240'000;
 
     // OPERATOR TX-INJECTION (2026-09-19 ruling), default OFF. When on, the node
     // accepts operator-submitted signed txs through submit_operator_inject() and
@@ -229,7 +231,15 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     // of the parity judge.
     // Solo implies no daemon: there is no endpoint to configure, and leaving one
     // wired would have the C6 parity judge dial a dead port every status tick.
-    if (!cfg.no_daemon_rpc && !cfg.native_solo) {
+    //
+    // D6d: p2p-first withholds it too unless --native-parity-monerod asks for the
+    // judge. The native chain index already answers everything that judge read
+    // (tip, RandomX seed hash/height, difficulty/height), so leaving it wired by
+    // default kept a get_miner_data + get_info + get_last_block_header trio on
+    // the wire every status tick for nothing but a comparison. The judge is now
+    // an explicit, compare-only oracle under p2p-first; daemon-first is unchanged.
+    const bool want_daemon_judge = !p2p_first || cfg.native_parity_monerod;
+    if (!cfg.no_daemon_rpc && !cfg.native_solo && want_daemon_judge) {
         n.monerod_rpc_host = cfg.monerod.rpc_host;
         n.monerod_rpc_port = cfg.monerod.rpc_port;
     }
@@ -256,6 +266,7 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     n.fork_tie = (cfg.same_height_tiebreak == SameHeightTieBreak::PreferOwn)
                      ? native::TieBreak::PreferOwn
                      : native::TieBreak::FirstSeen;
+    n.own_fork_bound_ms = static_cast<std::uint64_t>(cfg.own_fork_bound_s) * 1000;
     // #1680 lever, and OPERATOR TX-INJECTION (default OFF): forwarded here so a
     // consumer that builds its config through this function -- main and the
     // mainnet-readiness KAT -- does not silently drop them on the way to the node.
@@ -300,6 +311,7 @@ public:
         nc.backlog_refresh_s    = cfg_.backlog_refresh_s;
         nc.dos_solicited_credits = cfg_.dos_solicited_credits;   // #1680 lever
         nc.fork_tie             = cfg_.fork_tie;
+        nc.own_fork_bound_ms    = cfg_.own_fork_bound_ms;
         nc.operator_inject            = cfg_.operator_inject;
         nc.operator_inject_ttl_blocks = cfg_.operator_inject_ttl_blocks;
 

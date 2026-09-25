@@ -27,11 +27,14 @@
 //                        the tail -- the residual case the repair covers.
 //   arrival:             push on admit (the btc-dash Stage-1 semantics).
 //
-// Each receipt is ONE lane push {payee, kReceiptWeight, flags 0} -- the record
-// shape the credit-feed stand-in wrote, so for a given order the lane is
-// byte-identical to the stand-in's. (PR c2pool#1710's {miner, donation} split
-// driven by give_author is SEAM-3: the u16 already travels PoW-carried in
-// side_data_v2; the split lands with #1710.)
+// FeeModelGate OFF (the default): each receipt is ONE lane push {payee,
+// kReceiptWeight, flags 0} -- the record shape the credit-feed stand-in wrote,
+// so for a given order the lane is byte-identical to the stand-in's (master).
+// FeeModelGate ON (Options::fee_model, ruling S3): each receipt is pushed at
+// fee::kFeeReceiptWeight split by the give-author u16 it CARRIES in its
+// PoW-committed side_data_v2 -- (payee, 65535 - d) then (donation, d) iff
+// d > 0 (fee::receipt_lane_pushes) -- so one receipt spans 1 or 2 lane
+// positions, recorded as (pos_first, n_pushes) for the vault / repair.
 //
 // DURABILITY: every pushed receipt is appended to <data-dir>/lane<chain>.receipts
 // as [u32 LE len][fb_receipt]. At boot the file is replayed IN ITS OWN ORDER
@@ -53,6 +56,7 @@
 #include <vector>
 
 #include "xmr_relay_node.hpp"
+#include "../xmr_fee_model.hpp"     // receipt_lane_pushes (fee model S3)
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -65,15 +69,19 @@ public:
         u64         bin_lag = 1;          // L
         u32         grace_ms = 4000;      // in-flight window after the tip moved
         std::string durable_path;         // "" = no durable log
+        bool        fee_model = false;    // LaneParams::fee ON: split by the receipt's give_author u16
+        u8          network = 0;          // HELLO network byte == fee::DonationNet: the donation payee (DON-NET)
     };
     struct Stats {
         u64 pushed = 0, push_failed = 0, late = 0, bins_closed = 0, reloaded = 0, reload_torn = 0, durable_writes = 0;
+        u64 lane_pushes = 0;   // lane records written (== pushed with the fee model OFF)
     };
     // Engine push, done by the daemon (it owns the engine + the replay log).
     // Returns false if the record was not applied; fills the lane tip after it.
     using PushFn = std::function<bool(const ::v37::ScriptRef& payee, u64 w, u64& next_after, bytes32& digest_after)>;
-    // After a successful push (vault + spine probe + ledger learn_ref).
-    using AfterFn = std::function<void(const Admitted&, u64 pos_first, u64 next_after, const bytes32& digest_after)>;
+    // After a successful receipt push (vault + spine probe + ledger learn_ref):
+    // the receipt occupies lane positions [pos_first, pos_first + n_pushes).
+    using AfterFn = std::function<void(const Admitted&, u64 pos_first, u32 n_pushes, u64 next_after, const bytes32& digest_after)>;
 
     XmrReceiptIngest(Options o, PushFn push, AfterFn after)
         : m_o(std::move(o)), m_push(std::move(push)), m_after(std::move(after)) {}
@@ -145,8 +153,17 @@ public:
 private:
     bool push_one(const Admitted& a, bool durable) {
         u64 next_after = 0; bytes32 dig{};
-        if (!m_push(a.r.payee, kReceiptWeight, next_after, dig)) { ++m_st.push_failed; return false; }
+        const auto pushes = ::c2pool::v37n::xmr::fee::receipt_lane_pushes(a.r.payee, a.r.side.give_author,
+                                                                         m_o.fee_model, kReceiptWeight,
+                                                                         static_cast<::c2pool::v37n::xmr::fee::DonationNet>(m_o.network));
+        u32 n = 0;
+        for (const auto& [ref, w] : pushes) {
+            if (!m_push(ref, w, next_after, dig)) { ++m_st.push_failed; return false; }
+            ++n;
+        }
+        if (n == 0) { ++m_st.push_failed; return false; }
         ++m_st.pushed;
+        m_st.lane_pushes += n;
         if (durable && !m_o.durable_path.empty()) {
             std::ofstream o(m_o.durable_path, std::ios::binary | std::ios::app);
             std::vector<u8> hdr; le::put32(hdr, static_cast<u32>(a.raw.size()));
@@ -155,7 +172,7 @@ private:
             o.flush();
             ++m_st.durable_writes;
         }
-        if (m_after) m_after(a, next_after - 1, next_after, dig);
+        if (m_after) m_after(a, next_after - n, n, next_after, dig);
         return true;
     }
 

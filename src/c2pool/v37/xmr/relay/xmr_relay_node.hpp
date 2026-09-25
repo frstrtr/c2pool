@@ -52,6 +52,26 @@
 // same digest gate, the same fold (carrier_repair.hpp's argument, re-typed for
 // Family-B).
 //
+// REPAIR CONTEXT (the fix for the stuck "relay repair ... in flight"): a
+// winner-side order can hold receipts mined on a Monero block this node never
+// saw -- a sibling that lost a same-height race on the winner's monerod. Our
+// monerod never received it (Monero does not relay alternative blocks), so the
+// receipt's prev_id resolves in no ChainView here, the verify worker parks it
+// and drops it "unresolved", and before this fix the repair re-asked the same
+// frames forever (and FinalizeConnect finally REFUSED an honest block at its
+// retry bound). Now a SOLICITED receipt whose context is unresolved puts its
+// prev_id on a bounded WANT list: the daemon asks its own monerod first (it may
+// hold the block as an alternative), then the relay peers over FB_GETCTX with
+// failover (each peer once per round, bounded rounds). A served block is
+// verified from its bytes (verify_block_ctx: id recomputed, height from the
+// coinbase) and linked to a parent this node already knows AT that height
+// (recursively for a chain of up to ctx_max_depth unknown blocks); the seed is
+// taken from our own chain. The repair then (a) keeps its order while it
+// fetches, (b) re-asks idle missing frames with peer failover instead of
+// discarding the order, (c) re-asks at once when the serving peer drops, and
+// (d) reports WHICH stage is stuck (repair_status) so a stall that does reach
+// the booking retry bound is refused with a loud, distinct reason.
+//
 // BACKFILL on (re)connect: the sender RE-OFFERS its last --relay-reoffer-seconds
 // of admitted receipts; the receiver asks GETORDER over the peer's last
 // --relay-backfill-positions lane positions and GETFRAMES for every id it has
@@ -84,6 +104,7 @@
 #include <c2pool/v37/carrier_supply.hpp>
 #include <c2pool/v37/frame_vault.hpp>
 #include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"
+#include "impl/xmr/coin/xmr_seedheight.hpp"
 #include "xmr_relay_wire.hpp"
 #include "xmr_receipt_mint.hpp"
 
@@ -125,10 +146,25 @@ public:
     }
     u64 tip() const { return m_tip.load(); }
     std::size_t size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_map.size(); }
+    // RandomX seed blocks by SEED height (mainchain, >= 64 deep): what a
+    // resolved foreign context takes its seed from when its bin crosses an
+    // epoch edge (never from the peer that served the block).
+    void note_seed(u64 seed_height, const bytes32& seed) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_seeds[seed_height] = seed;
+        while (m_seeds.size() > 16) m_seeds.erase(m_seeds.begin());
+    }
+    std::optional<bytes32> seed_for(u64 height) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto it = m_seeds.find(::xmr::coin::rx_seedheight(height));
+        if (it == m_seeds.end()) return std::nullopt;
+        return it->second;
+    }
 private:
     static constexpr std::size_t kMax = 8192;
     mutable std::mutex m_mtx;
     std::unordered_map<bytes32, Ctx, Bytes32Hash> m_map;
+    std::map<u64, bytes32> m_seeds;
     std::deque<bytes32> m_order;
     std::atomic<u64> m_tip{0};
 };
@@ -165,6 +201,16 @@ struct RelayOptions {
     u32         unresolved_patience_ms = 30000;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
     u32         repair_state_timeout_ms = 20000;
+    // Lane positions one receipt may span (fee model S3: 2 = (payee, donation)
+    // split; 1 = the gate-OFF / master rule). Bounds the repair density check.
+    u32         max_pushes_per_receipt = 1;
+    // repair context + refetch (see REPAIR CONTEXT above)
+    u32         solicited_unresolved_patience_ms = 120000;   // a solicited receipt waits this long for its context
+    u32         ctx_retry_ms = 2000;                         // re-ask an unanswered GETCTX (next peer) after this
+    u32         ctx_max_rounds = 30;                         // rounds over every ready peer before a want is dropped
+    u32         ctx_max_depth = 8;                           // unknown blocks chained above a known parent
+    std::size_t ctx_want_max = 128;
+    u32         repair_refetch_ms = 3000;                    // re-ask idle missing frames of a Fetching repair
 };
 
 struct RelayStats {
@@ -178,6 +224,9 @@ struct RelayStats {
     std::atomic<u64> block_won_rx{0}, block_won_tx{0};
     std::atomic<u64> dials{0}, dial_fail{0}, over_cap{0};
     std::atomic<u64> repair_started{0}, repair_order_ok{0}, repair_spine_mismatch{0}, repair_peer_fail{0}, repair_ids_asked{0}, repair_ready{0}, repair_rejected{0};
+    std::atomic<u64> repair_refetch{0}, repair_evicted{0}, upgraded_solicited{0}, unresolved_solicited_dropped{0};
+    std::atomic<u64> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0},
+                     ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_req_dropped{0};
 };
 
 class XmrRelayNode {
@@ -235,6 +284,7 @@ public:
             m_fetch->on_control(p, f);
         });
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
+        m_net.set_log([this](const std::string& s) { log("relay: " + s); });
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
@@ -316,11 +366,14 @@ public:
     }
 
     // ── verified cache lookup (main thread, for a repair replay) ────────────
-    bool cached(const bytes32& id, ::v37::ScriptRef* payee = nullptr) const {
+    // `give_author` = the u16 the receipt carries in its PoW-committed
+    // side_data_v2 (fee model S3: the repair replay splits by it).
+    bool cached(const bytes32& id, ::v37::ScriptRef* payee = nullptr, u16* give_author = nullptr) const {
         std::lock_guard<std::mutex> lk(m_mtx);
         auto it = m_cache.find(id);
         if (it == m_cache.end()) return false;
         if (payee) *payee = it->second.payee;
+        if (give_author) *give_author = it->second.give_author;
         return true;
     }
     bool known(const bytes32& id) const {
@@ -394,11 +447,22 @@ public:
             Repair r; r.P = P; r.spine = spine; r.hint = hint; r.since = Clock::now();
             it = m_repairs.emplace(key, std::move(r)).first;
             m_st.repair_started++;
-            while (m_repairs.size() > 64) m_repairs.erase(m_repairs.begin());
+            // bounded: evict the LEAST RECENTLY POLLED repair (the pre-fix code
+            // evicted the smallest P -- the oldest, still-needed booking)
+            while (m_repairs.size() > 64) {
+                auto victim = m_repairs.end();
+                for (auto vi = m_repairs.begin(); vi != m_repairs.end(); ++vi)
+                    if (vi->first != key && (victim == m_repairs.end() || vi->second.polled < victim->second.polled)) victim = vi;
+                if (victim == m_repairs.end()) break;
+                m_repairs.erase(victim);
+                m_st.repair_evicted++;
+            }
             it = m_repairs.find(key);
             if (it == m_repairs.end()) return RepairState::Pending;
         }
         Repair& r = it->second;
+        r.polled = Clock::now();
+        if (hint && !r.hint) r.hint = hint;
         if (r.st == Repair::St::Fetching) {
             std::size_t missing = 0;
             {
@@ -426,15 +490,130 @@ public:
     }
     std::size_t repairs_open() const { std::lock_guard<std::mutex> lk(m_rmtx); return m_repairs.size(); }
 
+    // What a repair is waiting on, in words (the caller's cut-pending reason, so
+    // a stall that reaches the booking retry bound names its stuck stage).
+    std::string repair_status(u64 P, const bytes32& spine) const {
+        std::string s;
+        std::vector<bytes32> idle_ids;
+        {
+            std::lock_guard<std::mutex> lk(m_rmtx);
+            auto it = m_repairs.find(std::make_pair(P, spine));
+            if (it == m_repairs.end()) return "not started";
+            const Repair& r = it->second;
+            const auto age = [&](Clock::time_point t) { return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t).count()) + "s"; };
+            switch (r.st) {
+                case Repair::St::Idle:
+                    s = r.exhausted ? "idle: every ready peer tried (" + std::to_string(r.tried.size()) + "), none serves an order reaching this spine"
+                                    : "idle: waiting for a ready peer";
+                    break;
+                case Repair::St::Ordering:
+                    s = "ordering from peer " + std::to_string(r.cur) + " (" + std::to_string(r.cursor) + "/" + std::to_string(P) + " ids, " + age(r.since) + ")";
+                    break;
+                case Repair::St::Ready: s = "ready"; break;
+                case Repair::St::Fetching: {
+                    std::size_t missing = 0, verifying = 0;
+                    std::lock_guard<std::mutex> ck(m_mtx);
+                    for (const auto& id : r.ids) {
+                        if (m_cache.count(id)) continue;
+                        ++missing;
+                        if (m_inflight.count(id)) ++verifying; else idle_ids.push_back(id);
+                    }
+                    s = "fetching: " + std::to_string(missing) + "/" + std::to_string(r.ids.size()) + " receipts missing (" +
+                        std::to_string(verifying) + " in verify, " + std::to_string(idle_ids.size()) + " to re-ask; order from peer " +
+                        std::to_string(r.served_by) + ", refetches=" + std::to_string(r.refetches) + ", last progress " + age(r.last_progress) + " ago)";
+                    break;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_cmtx);
+            std::size_t pending = 0; std::string first;
+            for (const auto& [id, w] : m_ctx_want) {
+                if (w.have_proof) continue;
+                ++pending;
+                if (first.empty()) first = hex_short(id) + " asked of " + std::to_string(w.asked_total) + " peer(s), round " + std::to_string(w.rounds);
+            }
+            if (pending)
+                s += "; " + std::to_string(pending) + " Monero context(s) unresolved (prev_id " + first + ")";
+        }
+        const std::string lu = last_unresolved();
+        if (!lu.empty()) s += "; last unresolved: " + lu;
+        return s;
+    }
+
+    // ── receipt CONTEXT (FB_GETCTX / FB_CTX) ──────────────────────────────────
+    // Main thread, the SERVING side: GETCTX requests peers sent us. The daemon
+    // answers each id with send_ctx() (the block blob from its native node's
+    // retained bodies -- xmr_relay_native_ctx.hpp -- or, on the daemon arm, its
+    // monerod's get_block; empty = unknown here). Bounded; a daemon that never drains simply never serves.
+    std::vector<std::pair<PeerId, std::vector<bytes32>>> drain_ctx_requests() {
+        std::lock_guard<std::mutex> lk(m_cmtx);
+        std::vector<std::pair<PeerId, std::vector<bytes32>>> out(m_ctx_serve.begin(), m_ctx_serve.end());
+        m_ctx_serve.clear();
+        return out;
+    }
+    bool send_ctx(PeerId p, const bytes32& id, const std::vector<u8>& blob) {
+        const auto f = encode_ctx(m_o.chain, id, blob);
+        if (f.empty() || !m_net.send_to(p, f)) return false;
+        if (blob.empty()) m_st.ctx_unknown_tx++; else m_st.ctx_served++;
+        return true;
+    }
+    // Main thread, the ASKING side: prev_ids we want that our OWN monerod has
+    // not been asked for yet (it may hold the block as an alternative). Each id
+    // is handed out once per 10 s.
+    std::vector<bytes32> ctx_wants_local() {
+        std::lock_guard<std::mutex> lk(m_cmtx);
+        std::vector<bytes32> out;
+        const auto now = Clock::now();
+        for (auto& [id, w] : m_ctx_want) {
+            if (w.have_proof) continue;
+            if (w.local_tried != Clock::time_point{} && now - w.local_tried < std::chrono::seconds(10)) continue;
+            w.local_tried = now;
+            out.push_back(id);
+        }
+        return out;
+    }
+    // A block blob for a wanted id, from a peer (FB_CTX) or our own monerod
+    // (from == 0). Verified here; never trusted.
+    void offer_ctx(const bytes32& id, const std::vector<u8>& blob, PeerId from) {
+        {
+            std::lock_guard<std::mutex> lk(m_cmtx);
+            auto it = m_ctx_want.find(id);
+            if (it == m_ctx_want.end() || it->second.have_proof) return;   // not ours to resolve (or already have it)
+            if (blob.empty()) {
+                if (from) { m_st.ctx_unknown_rx++; it->second.last_ask = Clock::time_point{}; }   // "unknown here": ask the next peer now
+                return;
+            }
+        }
+        BlockCtx bc; std::string why;
+        if (!verify_block_ctx(id, blob, bc, &why)) {
+            m_st.ctx_bad++;
+            log("relay: context for " + hex_short(id) + " from " + (from ? "peer " + std::to_string(from) : std::string("own monerod")) +
+                " REJECTED: " + why);
+            if (from) strike(from, why);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_cmtx);
+            auto it = m_ctx_want.find(id);
+            if (it == m_ctx_want.end()) return;
+            it->second.have_proof = true; it->second.proof = bc; it->second.proof_from = from;
+        }
+        resolve_ctx_chain(id);
+    }
+    std::size_t ctx_wants_open() const { std::lock_guard<std::mutex> lk(m_cmtx); return m_ctx_want.size(); }
+
     std::string describe() const {
         const auto& s = m_st;
-        char b[1400];
+        char b[2000];
         std::snprintf(b, sizeof b,
             "relay: conns=%zu ready=%zu hello ok=%llu rej=%llu tmo=%llu | rx recv=%llu dup=%llu struct=%llu "
             "rx_evals=%llu valid=%llu invalid=%llu deferred=%llu unavail=%llu bans=%llu unresolved=%llu expired=%llu qdrop=%llu | "
             "admitted own=%llu foreign=%llu solicited=%llu cache=%zu | flood=%llu reoffer=%llu backfill orders=%llu ids=%llu | "
             "won tx=%llu rx=%llu | repair start=%llu order_ok=%llu spine_mis=%llu peer_fail=%llu ids=%llu ready=%llu rejected=%llu open=%zu | "
-            "fa_ignored=%llu fb_unknown=%llu malformed=%llu pre_hello=%llu",
+            "fa_ignored=%llu fb_unknown=%llu malformed=%llu pre_hello=%llu | "
+            "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
+            "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu",
             m_net.n_peers(), ready_peers().size(),
             (unsigned long long)s.hello_ok.load(), (unsigned long long)s.hello_rejected.load(), (unsigned long long)s.hello_timeout.load(),
             (unsigned long long)s.rx_receipts.load(), (unsigned long long)s.dup.load(), (unsigned long long)s.structural.load(),
@@ -451,10 +630,17 @@ public:
             (unsigned long long)s.repair_ids_asked.load(), (unsigned long long)s.repair_ready.load(),
             (unsigned long long)s.repair_rejected.load(), repairs_open(),
             (unsigned long long)s.fa_ignored.load(), (unsigned long long)s.fb_unknown.load(),
-            (unsigned long long)s.malformed.load(), (unsigned long long)s.pre_hello_dropped.load());
+            (unsigned long long)s.malformed.load(), (unsigned long long)s.pre_hello_dropped.load(),
+            ctx_wants_open(), (unsigned long long)s.ctx_wanted.load(), (unsigned long long)s.ctx_asked.load(),
+            (unsigned long long)s.ctx_rx.load(), (unsigned long long)s.ctx_resolved.load(), (unsigned long long)s.ctx_bad.load(),
+            (unsigned long long)s.ctx_unknown_rx.load(), (unsigned long long)s.ctx_gave_up.load(),
+            (unsigned long long)s.ctx_served.load(), (unsigned long long)s.ctx_unknown_tx.load(),
+            (unsigned long long)s.repair_refetch.load(), (unsigned long long)s.repair_evicted.load(),
+            (unsigned long long)s.upgraded_solicited.load(), (unsigned long long)s.unresolved_solicited_dropped.load());
         return b;
     }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
+    std::string last_unresolved() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_unresolved; }
 
     // Test hook: disconnect one peer (the KAT's "B drops off the network").
     void drop_peer(PeerId p) { m_net.disconnect(p); }
@@ -495,7 +681,7 @@ private:
         Clock::time_point enq = Clock::now();
         Clock::time_point not_before = Clock::now();
     };
-    struct CacheEntry { ::v37::ScriptRef payee; std::vector<u8> raw; u64 bin = 0; };
+    struct CacheEntry { ::v37::ScriptRef payee; std::vector<u8> raw; u64 bin = 0; u16 give_author = 0; };
     struct Job {
         enum class Kind { Order, Frames } kind = Kind::Order;
         bool repair = false;
@@ -513,8 +699,30 @@ private:
         u64 cursor = 0;
         bool exhausted = false;
         Clock::time_point since = Clock::now();
-        void reset() { st = St::Idle; ids.clear(); cursor = 0; cur = 0; served_by = 0; since = Clock::now(); }
+        // Fetching: progress + refetch bookkeeping
+        Clock::time_point last_progress = Clock::now(), last_fetch = Clock::now(), polled = Clock::now();
+        std::size_t cached_seen = 0;
+        std::set<PeerId> fetch_tried;
+        u32 refetches = 0;
+        void reset() {
+            st = St::Idle; ids.clear(); cursor = 0; cur = 0; served_by = 0; since = Clock::now();
+            cached_seen = 0; fetch_tried.clear(); refetches = 0;
+        }
     };
+    struct CtxWant {
+        PeerId from = 0;                   // the peer whose receipt needs it (asked first)
+        u32 depth = 0;                     // 0 = a receipt's prev_id; n = n-th unknown ancestor
+        std::set<PeerId> asked;            // this round
+        u32 asked_total = 0, rounds = 0;
+        Clock::time_point since = Clock::now(), last_ask{}, local_tried{};
+        bool have_proof = false;
+        BlockCtx proof{};
+        PeerId proof_from = 0;
+    };
+    static std::string hex_short(const bytes32& b) {
+        static const char* d = "0123456789abcdef";
+        std::string s; for (int i = 0; i < 6; ++i) { s.push_back(d[b[i] >> 4]); s.push_back(d[b[i] & 15]); } return s + "…";
+    }
 
     static ::c2pool::xmr::nanos_t now_ns() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
@@ -522,7 +730,7 @@ private:
     void log(const std::string& s) { if (m_log) m_log(s); }
 
     void cache_put_locked(const Admitted& a) {
-        CacheEntry e; e.payee = a.r.payee; e.raw = a.raw; e.bin = a.bin;
+        CacheEntry e; e.payee = a.r.payee; e.raw = a.raw; e.bin = a.bin; e.give_author = a.r.side.give_author;
         m_cache.emplace(a.id, std::move(e));
         m_cache_order.push_back(a.id);
         while (m_cache_order.size() > m_o.cache_max) { m_cache.erase(m_cache_order.front()); m_cache_order.pop_front(); }
@@ -541,6 +749,20 @@ private:
                 std::lock_guard<std::mutex> lk(m_pmtx);
                 m_peers[p] = PeerSt{};
                 over = m_peers.size() > m_o.max_peers;
+            }
+            // RELAY-FD: the up event runs on the dialing/accepting thread AFTER
+            // the connection's reader started. A peer that closes at once (a
+            // partitioned node refusing us) can unwind that reader and fire the
+            // DOWN event before this line ran; no second down event follows, so
+            // the entry just made would be a ghost: never HELLO'd, re-counted
+            // as a HELLO timeout every tick, and counted against max_peers
+            // forever -- enough of them and every new link is over_cap, so the
+            // relay never heals. Re-check the transport after inserting: a down
+            // event that lands after this check erases the entry itself.
+            if (!m_net.has_peer(p)) {
+                std::lock_guard<std::mutex> lk(m_pmtx);
+                m_peers.erase(p);
+                return;
             }
             if (over) { m_st.over_cap++; m_net.disconnect(p); return; }
             const auto f = encode_hello(our_hello());
@@ -569,8 +791,13 @@ private:
         if (m_serve) m_serve->forget_peer(p);
         {
             std::lock_guard<std::mutex> lk(m_rmtx);
-            for (auto& [k, r] : m_repairs)
+            for (auto& [k, r] : m_repairs) {
+                (void)k;
                 if (r.st == Repair::St::Ordering && r.cur == p) { r.tried.insert(p); r.reset(); }
+                // Fetching keeps its order; frames asked of the dropped peer are
+                // re-asked of another peer on the next maintenance tick.
+                if (r.st == Repair::St::Fetching) { r.fetch_tried.insert(p); r.last_fetch = Clock::time_point{}; }
+            }
         }
         {
             std::lock_guard<std::mutex> lk(m_tmtx);
@@ -586,7 +813,9 @@ private:
         if (!hello_ok(p)) { m_st.pre_hello_dropped++; return; }
         if (op == FB_RECEIPTS) { on_receipts(p, f); return; }
         if (op == FB_BLOCK_WON) { on_block_won(p, f); return; }
-        m_st.fb_unknown++;                                              // a future 0x43..0x4f: count, keep socket
+        if (op == FB_GETCTX) { on_getctx(p, f); return; }
+        if (op == FB_CTX) { on_ctx(p, f); return; }
+        m_st.fb_unknown++;                                            // a future 0x45..0x4f: count, keep socket
     }
 
     void on_hello(PeerId p, const std::vector<u8>& f) {
@@ -694,10 +923,179 @@ private:
         for (PeerId q : ready_peers()) if (q != p) m_net.send_to(q, f);   // forward once (dedup by bid)
     }
 
+    // ── receipt context: serve (queue for the daemon's monerod) / receive ────
+    void on_getctx(PeerId p, const std::vector<u8>& f) {
+        u32 chain = 0; std::vector<bytes32> ids; std::string why;
+        if (!decode_getctx(f, chain, ids, &why)) { m_st.malformed++; strike(p, why); return; }
+        if (chain != m_o.chain) { m_st.wrong_chain++; return; }
+        std::lock_guard<std::mutex> lk(m_cmtx);
+        std::size_t from_p = 0;
+        for (const auto& [q, v] : m_ctx_serve) { (void)v; if (q == p) ++from_p; }
+        if (from_p >= 4 || m_ctx_serve.size() >= 64) { m_st.ctx_req_dropped++; return; }   // bounded, per peer and total
+        m_ctx_serve.emplace_back(p, std::move(ids));
+    }
+    void on_ctx(PeerId p, const std::vector<u8>& f) {
+        u32 chain = 0; bytes32 id{}; std::vector<u8> blob; std::string why;
+        if (!decode_ctx(f, chain, id, blob, &why)) { m_st.malformed++; strike(p, why); return; }
+        if (chain != m_o.chain) { m_st.wrong_chain++; return; }
+        m_st.ctx_rx++;
+        offer_ctx(id, blob, p);
+    }
+
+    // A SOLICITED receipt's prev_id is unknown here: put it on the want list.
+    void want_ctx(const bytes32& prev, PeerId from, u32 depth = 0) {
+        std::lock_guard<std::mutex> lk(m_cmtx);
+        auto it = m_ctx_want.find(prev);
+        if (it != m_ctx_want.end()) { if (!it->second.from && from) it->second.from = from; return; }
+        if (m_ctx_want.size() >= m_o.ctx_want_max) return;   // bounded; the repair's refetch re-adds it later
+        CtxWant w; w.from = from; w.depth = depth;
+        m_ctx_want.emplace(prev, std::move(w));
+        m_st.ctx_wanted++;
+    }
+
+    // Link verified block proofs to our chain: a proof whose parent we know at
+    // exactly its height becomes a ChainView entry (bin = height + 1, seed from
+    // OUR chain), which may in turn resolve a child proof waiting on it.
+    void resolve_ctx_chain(bytes32 id) {
+        for (int guard = 0; guard < 64; ++guard) {
+            CtxWant w;
+            {
+                std::lock_guard<std::mutex> lk(m_cmtx);
+                auto it = m_ctx_want.find(id);
+                if (it == m_ctx_want.end() || !it->second.have_proof) return;
+                w = it->second;
+            }
+            const auto par = m_chain.lookup(w.proof.parent);
+            if (!par) {
+                if (w.depth + 1 >= m_o.ctx_max_depth) {
+                    {
+                        std::lock_guard<std::mutex> lk(m_cmtx);
+                        m_ctx_want.erase(id);
+                    }
+                    m_st.ctx_gave_up++;
+                    log("relay: context for " + hex_short(id) + " GIVEN UP: " + std::to_string(m_o.ctx_max_depth) +
+                        " unknown ancestors above any block this node knows");
+                    return;
+                }
+                want_ctx(w.proof.parent, w.proof_from ? w.proof_from : w.from, w.depth + 1);   // an unknown ancestor: fetch it too
+                return;
+            }
+            if (par->height != w.proof.height) {
+                m_st.ctx_bad++;
+                log("relay: context for " + hex_short(id) + " REJECTED: block claims height " + std::to_string(w.proof.height) +
+                    " but its parent " + hex_short(w.proof.parent) + " is at bin " + std::to_string(par->height) + " here");
+                std::lock_guard<std::mutex> lk(m_cmtx);
+                auto it = m_ctx_want.find(id);
+                if (it != m_ctx_want.end()) { it->second.have_proof = false; it->second.last_ask = Clock::time_point{}; }
+                return;
+            }
+            const u64 bin = w.proof.height + 1;
+            bytes32 seed = par->seed;
+            if (::xmr::coin::rx_seedheight(bin) != ::xmr::coin::rx_seedheight(w.proof.height)) {
+                const auto s = m_chain.seed_for(bin);
+                if (!s) {
+                    log("relay: context for " + hex_short(id) + " waits for the RandomX seed of bin " + std::to_string(bin) + " (epoch edge)");
+                    return;   // the proof is kept; retried by drive_ctx once the seed is noted
+                }
+                seed = *s;
+            }
+            m_chain.note(id, bin, seed);
+            m_st.ctx_resolved++;
+            log("relay: receipt context RESOLVED: block " + hex_short(id) + " h=" + std::to_string(w.proof.height) +
+                " (parent " + hex_short(w.proof.parent) + " known here) via " +
+                (w.proof_from ? "peer " + std::to_string(w.proof_from) : std::string("own monerod")) +
+                " -> receipts mined on it verify at bin " + std::to_string(bin));
+            // a child proof that waited for this block
+            bytes32 child{}; bool has_child = false;
+            {
+                std::lock_guard<std::mutex> lk(m_cmtx);
+                m_ctx_want.erase(id);
+                for (const auto& [cid, cw] : m_ctx_want)
+                    if (cw.have_proof && cw.proof.parent == id) { child = cid; has_child = true; break; }
+            }
+            if (!has_child) return;
+            id = child;
+        }
+    }
+
+    // Maintenance: ask for wanted contexts (source peer first, then every
+    // other ready peer, each once per round; bounded rounds), retry kept proofs.
+    void drive_ctx() {
+        const auto ready = ready_peers();
+        const auto now = Clock::now();
+        std::map<PeerId, std::vector<bytes32>> ask;
+        std::vector<bytes32> retry_proofs;
+        std::vector<std::string> gave_up;
+        {
+            std::lock_guard<std::mutex> lk(m_cmtx);
+            for (auto it = m_ctx_want.begin(); it != m_ctx_want.end();) {
+                CtxWant& w = it->second;
+                if (now - w.since > std::chrono::minutes(10)) {   // TTL (a repair that still needs it re-adds it)
+                    m_st.ctx_gave_up++;
+                    gave_up.push_back(hex_short(it->first) + " after 10 min");
+                    it = m_ctx_want.erase(it);
+                    continue;
+                }
+                if (w.have_proof) { retry_proofs.push_back(it->first); ++it; continue; }
+                if (m_chain.lookup(it->first)) {   // RC-CTX: resolved meanwhile by the ChainView's feeder (native index / journal)
+                    m_st.ctx_resolved++;
+                    it = m_ctx_want.erase(it);
+                    continue;
+                }
+                if (w.last_ask != Clock::time_point{} && now - w.last_ask < std::chrono::milliseconds(m_o.ctx_retry_ms)) { ++it; continue; }
+                PeerId pick = 0;
+                if (w.from && !w.asked.count(w.from) && std::find(ready.begin(), ready.end(), w.from) != ready.end()) pick = w.from;
+                for (PeerId p : ready) if (!pick && !w.asked.count(p)) pick = p;
+                if (!pick) {
+                    if (!ready.empty() && !w.asked.empty()) { w.asked.clear(); ++w.rounds; w.last_ask = now; }
+                    if (w.rounds >= m_o.ctx_max_rounds) {
+                        m_st.ctx_gave_up++;
+                        gave_up.push_back(hex_short(it->first) + " after " + std::to_string(w.rounds) + " rounds");
+                        it = m_ctx_want.erase(it);
+                        continue;
+                    }
+                    ++it; continue;
+                }
+                auto& v = ask[pick];
+                if (v.size() >= kCtxMaxIds) { ++it; continue; }
+                v.push_back(it->first);
+                w.asked.insert(pick); ++w.asked_total; w.last_ask = now;
+                ++it;
+            }
+        }
+        for (const auto& g : gave_up)
+            log("relay: context for " + g + " over every ready peer GIVEN UP (no peer's monerod holds that block)");
+        for (const auto& [p, ids] : ask) {
+            const auto f = encode_getctx(m_o.chain, ids);
+            if (!f.empty() && m_net.send_to(p, f)) m_st.ctx_asked += ids.size();
+        }
+        for (const auto& id : retry_proofs) resolve_ctx_chain(id);
+    }
+
     // ── the verify queue ────────────────────────────────────────────────────
     void enqueue(Item it) {
         std::lock_guard<std::mutex> lk(m_mtx);
-        if (m_cache.count(it.id) || m_inflight.count(it.id)) { m_st.dup++; return; }
+        if (m_cache.count(it.id)) { m_st.dup++; return; }
+        if (m_inflight.count(it.id)) {
+            // a SOLICITED copy (repair / backfill GETFRAMES) of a receipt that is
+            // already queued or parked as an unsolicited flood: upgrade that item
+            // (solicited credit, horizon-exempt, and -- if its context is unknown --
+            // the context fetch + the longer patience). Pre-fix the solicited copy
+            // was dropped as a dup and the flood copy was dropped "unresolved".
+            if (it.solicited) {
+                auto upg = [&](std::deque<Item>& q) {
+                    for (auto& x : q) if (x.id == it.id && !x.solicited) {
+                        x.solicited = true; x.from = it.from; x.enq = Clock::now(); x.not_before = Clock::now();
+                        m_st.upgraded_solicited++;
+                        return true;
+                    }
+                    return false;
+                };
+                if (!upg(m_q)) upg(m_parked);
+            }
+            m_st.dup++;
+            return;
+        }
         if (m_q.size() >= m_o.verify_queue_max) {
             m_inflight.erase(m_q.front().id);
             m_q.pop_front();
@@ -757,10 +1155,28 @@ private:
         }
         const auto ctx = m_chain.lookup(pb.prev_id);
         if (!ctx) {
-            if (now - it.enq < std::chrono::milliseconds(m_o.unresolved_patience_ms)) {
+            // A SOLICITED receipt (a repair / backfill answer) mined on a block we
+            // never saw: fetch that block's context (own monerod, then peers).
+            // An unsolicited flood keeps the strict rule (known prev or dropped);
+            // if a repair needs it, the solicited copy upgrades it (enqueue).
+            if (it.solicited) want_ctx(pb.prev_id, it.from);
+            const u32 patience = it.solicited ? m_o.solicited_unresolved_patience_ms : m_o.unresolved_patience_ms;
+            if (now - it.enq < std::chrono::milliseconds(patience)) {
                 park(std::move(it), std::chrono::milliseconds(1000));
             } else {
-                m_st.unresolved_dropped++; forget_inflight(it.id);
+                m_st.unresolved_dropped++;
+                const std::string why = "receipt " + hex_short(it.id) + " from peer " + std::to_string(it.from) +
+                                        (it.solicited ? " (solicited)" : "") + ": Monero context prev_id " + hex_short(pb.prev_id) +
+                                        " unknown here after " + std::to_string(patience / 1000) + " s";
+                {
+                    std::lock_guard<std::mutex> lk(m_mtx);
+                    m_inflight.erase(it.id);
+                    m_last_unresolved = why;
+                }
+                if (it.solicited) {
+                    m_st.unresolved_solicited_dropped++;
+                    log("relay: DROPPED " + why + " (the repair re-asks it; the context fetch continues)");
+                }
             }
             return;
         }
@@ -940,9 +1356,20 @@ private:
             if (it == m_repairs.end()) return;
             Repair& r = it->second;
             if (r.st != Repair::St::Ordering || r.cur != p) return;
+            // Dense = every lane position in [cursor, p_served) is covered by
+            // the served receipts. One receipt spans 1..max_pushes_per_receipt
+            // positions (1 with the fee model OFF -- exactly the master rule --
+            // 1 or 2 under it), so consecutive starts step by 1..max.
+            const u64 mp = m_o.max_pushes_per_receipt ? m_o.max_pushes_per_receipt : 1;
             bool dense = (o.a == r.cursor);
-            for (std::size_t i = 0; dense && i < o.ids.size(); ++i) dense = (o.ids[i].pos == r.cursor + i);
-            dense = dense && (o.p_served == r.cursor + o.ids.size());
+            u64 prev = 0;
+            for (std::size_t i = 0; dense && i < o.ids.size(); ++i) {
+                const u64 pos = o.ids[i].pos;
+                dense = (i == 0) ? (pos == r.cursor) : (pos >= prev + 1 && pos <= prev + mp);
+                prev = pos;
+            }
+            dense = dense && (o.ids.empty() ? (o.p_served == r.cursor)
+                                            : (o.p_served >= prev + 1 && o.p_served <= prev + mp));
             if (!dense) { m_st.repair_peer_fail++; r.tried.insert(p); r.reset(); return; }
             for (const auto& e : o.ids) r.ids.push_back(e.id);
             r.cursor = o.p_served;
@@ -958,9 +1385,13 @@ private:
             m_st.repair_order_ok++;
             r.served_by = p;
             r.st = Repair::St::Fetching;
-            r.since = Clock::now();
+            r.since = r.last_progress = r.last_fetch = Clock::now();
+            r.fetch_tried.clear(); r.fetch_tried.insert(p);
             std::lock_guard<std::mutex> ck(m_mtx);
-            for (const auto& id : r.ids) if (!m_cache.count(id) && !m_inflight.count(id)) need.push_back(id);
+            // ids still in verify are asked too: the solicited copy upgrades a
+            // parked unsolicited flood of the same receipt (context fetch,
+            // longer patience) instead of letting it expire as "unresolved"
+            for (const auto& id : r.ids) if (!m_cache.count(id)) need.push_back(id);
         }
         for (std::size_t i = 0; i < need.size(); i += kCtrlMaxIdsPerFetch) {
             Job f; f.kind = Job::Kind::Frames; f.repair = true; f.key = j->key;
@@ -992,7 +1423,11 @@ private:
             auto it = m_repairs.find(j->key);
             if (it != m_repairs.end()) {
                 Repair& r = it->second;
-                if (r.st != Repair::St::Ready) { r.tried.insert(p); r.reset(); }
+                if (r.st == Repair::St::Fetching && j->kind == Job::Kind::Frames) {
+                    // a frames fetch failed (unservable / timeout): keep the order,
+                    // re-ask the missing frames of ANOTHER peer now
+                    r.fetch_tried.insert(p); r.last_fetch = Clock::time_point{};
+                } else if (r.st != Repair::St::Ready) { r.tried.insert(p); r.reset(); }
             }
         }
         pump_jobs();
@@ -1003,13 +1438,58 @@ private:
         std::vector<std::pair<PeerId, Job>> issue;
         {
             std::lock_guard<std::mutex> lk(m_rmtx);
+            const auto now = Clock::now();
+            const auto timeout = std::chrono::milliseconds(m_o.repair_state_timeout_ms);
             for (auto& [k, r] : m_repairs) {
-                if (r.st != Repair::St::Idle &&
-                    Clock::now() - r.since > std::chrono::milliseconds(m_o.repair_state_timeout_ms) &&
-                    r.st != Repair::St::Ready) {
-                    PeerId who = r.cur ? r.cur : r.served_by;
-                    if (who) r.tried.insert(who);
+                if (r.st == Repair::St::Ordering && now - r.since > timeout) {
+                    if (r.cur) r.tried.insert(r.cur);
                     r.reset();
+                }
+                if (r.st == Repair::St::Fetching) {
+                    // The order is known; only frames are missing. Pre-fix this
+                    // state just waited for the 20 s timeout and then DISCARDED the
+                    // order (re-asking the same frames, which failed the same way,
+                    // forever). Now: progress resets the clock; idle missing frames
+                    // (neither cached nor in verify) are re-asked with peer failover.
+                    std::vector<bytes32> idle;
+                    std::size_t cached = 0;
+                    {
+                        std::lock_guard<std::mutex> ck(m_mtx);
+                        for (const auto& id : r.ids) {
+                            if (m_cache.count(id)) { ++cached; continue; }
+                            if (!m_inflight.count(id)) idle.push_back(id);
+                        }
+                    }
+                    if (cached > r.cached_seen) { r.cached_seen = cached; r.last_progress = now; }
+                    if (!idle.empty() && now - r.last_fetch >= std::chrono::milliseconds(m_o.repair_refetch_ms)) {
+                        PeerId pick = 0;
+                        const bool sb_ready = r.served_by && std::find(ready.begin(), ready.end(), r.served_by) != ready.end();
+                        if (sb_ready && !r.fetch_tried.count(r.served_by)) pick = r.served_by;
+                        for (PeerId p : ready) if (!pick && !r.fetch_tried.count(p)) pick = p;
+                        if (!pick) {                       // every ready peer asked this round: start a new round
+                            r.fetch_tried.clear();
+                            pick = sb_ready ? r.served_by : (ready.empty() ? 0 : ready.front());
+                        }
+                        if (pick) {
+                            r.fetch_tried.insert(pick);
+                            r.last_fetch = now;
+                            ++r.refetches;
+                            m_st.repair_refetch++;
+                            for (std::size_t i = 0; i < idle.size(); i += kCtrlMaxIdsPerFetch) {
+                                Job f; f.kind = Job::Kind::Frames; f.repair = true; f.key = k;
+                                f.ids.assign(idle.begin() + static_cast<std::ptrdiff_t>(i),
+                                             idle.begin() + static_cast<std::ptrdiff_t>(std::min(idle.size(), i + kCtrlMaxIdsPerFetch)));
+                                m_st.repair_ids_asked += f.ids.size();
+                                issue.emplace_back(pick, std::move(f));
+                            }
+                        }
+                    }
+                    // no progress for a long time with frames nobody serves: the
+                    // order itself may be unfetchable here -> ask another peer for it
+                    if (!idle.empty() && now - r.last_progress > timeout * 6) {
+                        if (r.served_by) r.tried.insert(r.served_by);
+                        r.reset();
+                    }
                 }
                 if (r.st != Repair::St::Idle) continue;
                 PeerId pick = 0;
@@ -1051,7 +1531,12 @@ private:
                     if (!s.hello_ok && Clock::now() - s.connected > std::chrono::milliseconds(m_o.hello_timeout_ms))
                         stale.push_back(p);
             }
-            for (PeerId p : stale) { m_st.hello_timeout++; m_net.disconnect(p); }
+            for (PeerId p : stale) {
+                m_st.hello_timeout++;
+                if (m_net.has_peer(p)) { m_net.disconnect(p); continue; }
+                std::lock_guard<std::mutex> lk(m_pmtx);   // transport already dropped it: no down event will come
+                m_peers.erase(p);
+            }
             if (m_partitioned.load() && Clock::now().time_since_epoch().count() >= m_partition_until.load()) {
                 m_partitioned = false;
                 m_dialing = true;
@@ -1115,6 +1600,7 @@ private:
             }
             pump_jobs();
             drive_repairs();
+            drive_ctx();
         }
     }
 
@@ -1143,8 +1629,13 @@ private:
     double m_solicited = 0;
     Clock::time_point m_solicited_at = Clock::now();
     std::string m_last_reject;
+    std::string m_last_unresolved;
 
-    std::mutex m_amtx;                 // admitted queue
+    mutable std::mutex m_cmtx;         // receipt-context wants + serve requests
+    std::map<bytes32, CtxWant> m_ctx_want;
+    std::deque<std::pair<PeerId, std::vector<bytes32>>> m_ctx_serve;
+
+    std::mutex m_amtx;               // admitted queue
     std::vector<Admitted> m_admitted;
 
     mutable std::mutex m_pmtx;         // peers

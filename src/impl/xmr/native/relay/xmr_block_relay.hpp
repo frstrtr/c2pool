@@ -78,6 +78,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -225,6 +226,11 @@ enum class RelayReject : std::uint8_t {
     NonceMismatch,       // the winning nonce is not patched into the blob
     HeightMismatch,      // the coinbase height is not the caller's height
     PowNotAccepted,      // THE gate: no attestation, or not Accept
+    // Own-block hygiene (not a consensus rule applied to anyone else): a block
+    // every monerod would refuse is never published and never adopted.
+    DuplicateTxInBlock,  // the same tx id, or the same key image, twice in the block
+    TxAlreadyMined,      // a tx is already in the chain the block extends
+    KeyImageSpent,       // a key image is already spent in the chain the block extends
 };
 
 inline const char* to_string(RelayReject r) noexcept {
@@ -237,6 +243,9 @@ inline const char* to_string(RelayReject r) noexcept {
         case RelayReject::NonceMismatch:  return "NonceMismatch";
         case RelayReject::HeightMismatch: return "HeightMismatch";
         case RelayReject::PowNotAccepted: return "PowNotAccepted";
+        case RelayReject::DuplicateTxInBlock: return "DuplicateTxInBlock";
+        case RelayReject::TxAlreadyMined:     return "TxAlreadyMined";
+        case RelayReject::KeyImageSpent:      return "KeyImageSpent";
     }
     return "?";
 }
@@ -245,6 +254,7 @@ struct RelayStats {
     std::uint64_t relays_attempted     = 0;
     std::uint64_t relays_refused       = 0;   // never reached an arm
     std::uint64_t pow_refused          = 0;
+    std::uint64_t invalid_own_refused  = 0;   // DuplicateTxInBlock / TxAlreadyMined / KeyImageSpent
     std::uint64_t structural_refused   = 0;
     std::uint64_t partial_block        = 0;   // ARM A suppressed, bodies missing
     std::uint64_t reached_nobody       = 0;   // the loud failure
@@ -378,6 +388,29 @@ public:
             ++m_stats.partial_block;
         }
 
+        // --- 3b. own-block hygiene ------------------------------------------
+        // The block must not carry a tx the chain it extends already mined, a
+        // key image already spent there, or anything twice. Every monerod
+        // refuses such a block and drops the connection that sent it -- and a
+        // levin-only node cannot hear why, so without this check PREFER-OWN
+        // adopted it and the node mined on it alone, peerless, for the rest of
+        // the run (the publish-arm verify, 8b2efacf at h=513). Refused here,
+        // BEFORE any arm fires, the book is written or the own index is
+        // offered it: not relayed, not parked, not adopted, not booked.
+        {
+            RelayReject hr = RelayReject::None;
+            std::string hwhy;
+            if (!own_block_hygiene(pb, bodies, bodies_complete, hr, hwhy)) {
+                {
+                    std::lock_guard<std::mutex> lk(m_mx);
+                    ++m_stats.invalid_own_refused;
+                }
+                return refuse(v, hr, "INVALID OWN BLOCK " + hex(v.block_id) + " at height " +
+                                         std::to_string(height) + " dropped: " + hwhy,
+                              /*structural=*/false);
+            }
+        }
+
         // --- 4. the 2008 frame --------------------------------------------
         std::vector<std::uint8_t> body2008;
         if (!p2p_suppressed) {
@@ -428,7 +461,15 @@ public:
         // own_index_accepted) instead of only logging the refusal. It does not
         // change reached_network(), which stays a statement about the wire; it
         // gives a solo caller a fact it previously had no way to read.
-        if (m_cfg.submit_to_own_index && m_chain) {
+        // Under DaemonFirst a daemon that REJECTED the block has just told us it
+        // is invalid (rule 2 above kept it off P2P for that reason); building on
+        // it would be the daemon-first form of the same fork.
+        const bool daemon_vetoed =
+            m_cfg.policy.order == ArmOrder::DaemonFirst && v.daemon_rejected;
+        if (daemon_vetoed && m_cfg.submit_to_own_index && m_chain)
+            say(true, "own index NOT offered block " + hex(v.block_id) +
+                          ": the daemon arm rejected it");
+        if (m_cfg.submit_to_own_index && m_chain && !daemon_vetoed) {
             v.own_index_attempted = true;
             BlockEntry be;
             be.block_blob = req.block_blob;
@@ -528,6 +569,13 @@ public:
         return find_locked(block_id) != nullptr;
     }
 
+    // Our own index has a DIFFERENT block on its best chain than this one: the
+    // height was lost (or the index never took it). False when no chain is
+    // wired -- "unknown" is never read as "lost".
+    bool own_chain_disowns(const Hash& block_id) const {
+        return m_chain != nullptr && !m_chain->is_on_best_chain(block_id);
+    }
+
     std::size_t retained_count() const {
         std::lock_guard<std::mutex> lk(m_mx);
         return m_book.size();
@@ -547,16 +595,32 @@ public:
     // caller can tell "pushed" from "had nothing to push" -- which are different
     // stories and have different fixes.
     bool renotify(const Hash& block_id, std::size_t* peers_sent = nullptr) {
+        if (peers_sent) *peers_sent = 0;
         std::vector<std::uint8_t> blob;
         std::vector<TxBlobEntry>  bodies;
+        std::vector<Hash>         tx_hashes;
         std::uint64_t             height = 0;
         {
             std::lock_guard<std::mutex> lk(m_mx);
             const Retained* r = find_locked(block_id);
             if (!r) return false;
-            blob   = r->block_blob;
-            bodies = r->bodies;
-            height = r->height;
+            blob      = r->block_blob;
+            bodies    = r->bodies;
+            tx_hashes = r->tx_hashes;
+            height    = r->height;
+        }
+        // A block retained without every body (the first relay was suppressed
+        // as partial) is re-collected now, and is NOT re-announced partial:
+        // the same fail-loud rule as the first push.
+        if (m_cfg.policy.include_all_tx_bodies && bodies.size() != tx_hashes.size()) {
+            std::string bwhy;
+            if (!collect_bodies(tx_hashes, bodies, bwhy)) {
+                say(true, "renotify: block " + hex(block_id) + " is still incomplete: " + bwhy);
+                return false;
+            }
+            std::lock_guard<std::mutex> lk(m_mx);
+            for (Retained& r : m_book)
+                if (r.id == block_id) r.bodies = bodies;
         }
         std::vector<std::uint8_t> body;
         std::string why;
@@ -639,6 +703,66 @@ private:
     bool decline_locked() {   // caller holds m_mx
         ++m_stats.missing_tx_declined;
         return false;
+    }
+
+    // Own-block hygiene: duplicates within the block, then (when a chain view
+    // is wired and the parent is on its best chain) txs already mined and key
+    // images already spent in the chain the block extends. Key images come
+    // from the (verified) bodies; a block whose bodies are incomplete is judged
+    // on its ids only (it cannot go out self-contained anyway).
+    bool own_block_hygiene(const ParsedBlock& pb, const std::vector<TxBlobEntry>& bodies,
+                           bool bodies_complete, RelayReject& r, std::string& why) const {
+        std::vector<Hash> kis;
+        {
+            std::set<Hash> seen;
+            for (const Hash& id : pb.tx_hashes)
+                if (!seen.insert(id).second) {
+                    r   = RelayReject::DuplicateTxInBlock;
+                    why = "tx " + hex(id) + " appears twice in the block";
+                    return false;
+                }
+        }
+        // Key images are read from the bodies only when the bodies were
+        // verified to hash to the ids the block commits to: a body source that
+        // filed the wrong bytes under an id would otherwise have us judge key
+        // images the block does not actually spend.
+        if (bodies_complete && m_cfg.verify_tx_bodies) {
+            std::set<Hash> seen;
+            for (const TxBlobEntry& b : bodies) {
+                TxWeightInfo info;
+                if (parse_tx_full(b.blob, info) != TxParseStatus::Ok) continue;   // collect_bodies judged it
+                for (const KeyImage& ki : info.key_images) {
+                    Hash h;
+                    std::copy(ki.begin(), ki.end(), h.begin());
+                    if (!seen.insert(h).second) {
+                        r   = RelayReject::DuplicateTxInBlock;
+                        why = "key image " + hex(h) + " is spent twice in the block";
+                        return false;
+                    }
+                    kis.push_back(h);
+                }
+            }
+        }
+        if (!m_chain) return true;
+        std::vector<Hash> mined, spent;
+        if (!m_chain->probe_mined(pb.header.prev_id, pb.tx_hashes, kis, mined, spent)) {
+            // The parent is not on our best chain (a block on a side branch):
+            // the oracle answers for the best chain only. Not refused -- the
+            // index's own fork choice decides what becomes of it.
+            return true;
+        }
+        if (!mined.empty()) {
+            r   = RelayReject::TxAlreadyMined;
+            why = "tx " + hex(mined.front()) + " is already in the chain it extends (parent " +
+                  hex(pb.header.prev_id) + ")";
+            return false;
+        }
+        if (!spent.empty()) {
+            r   = RelayReject::KeyImageSpent;
+            why = "key image " + hex(spent.front()) + " is already spent in the chain it extends";
+            return false;
+        }
+        return true;
     }
 
     // Bodies for every transaction the block commits to, in block order. False

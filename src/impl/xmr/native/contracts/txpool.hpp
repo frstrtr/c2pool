@@ -121,6 +121,10 @@ struct TxRelayVerdict {
                            //   with InputConsensus. No drop.
         RingMemberLocked,  // a ring member is not yet unlocked / younger than
                            //   the spendable age. No drop.
+        AlreadyMined,      // the tx is already in the best chain (or one of
+                           //   its key images is spent there) per the chain
+                           //   index's mined oracle -- a reorg re-admit or a
+                           //   late relay of a mined tx. No drop.
     };
 
     Reason reason = Reason::Accepted;
@@ -152,6 +156,7 @@ inline const char* to_string(TxRelayVerdict::Reason r) noexcept {
         case TxRelayVerdict::Reason::KeyImageSpent:    return "KeyImageSpent";
         case TxRelayVerdict::Reason::RingUnresolved:   return "RingUnresolved";
         case TxRelayVerdict::Reason::RingMemberLocked: return "RingMemberLocked";
+        case TxRelayVerdict::Reason::AlreadyMined:     return "AlreadyMined";
     }
     return "?";
 }
@@ -262,6 +267,14 @@ public:
 
     // Monotone; bumps whenever selectable_backlog() could differ.
     virtual std::uint64_t backlog_version() const = 0;
+
+    // The key images a pooled transaction spends, so the template can check
+    // them against the chain it extends (IChainView::probe_mined). Empty when
+    // the id is not pooled, or the pool does not track key images.
+    virtual std::vector<Hash> key_images_of(const Hash& id) const {
+        (void)id;
+        return {};
+    }
 };
 
 // ---------------------------------------------------------------------------
