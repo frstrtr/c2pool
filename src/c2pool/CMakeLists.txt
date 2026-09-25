@@ -898,6 +898,12 @@ target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
 # include path, not a new runtime dependency.
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_template xmr_node xmr_coin
                                              xmr_native_txpool Threads::Threads)
+# Reproducible release (docs/xmr-lane/REPRODUCIBLE-BUILD.md): the daemon links
+# only static archives, Boost headers and system libs, so the build RUNPATH CMake
+# derives from the Conan link dirs (<CONAN_HOME>/p/boost.../p/lib, which holds no
+# shared object) is never used to resolve anything -- but it bakes the builder's
+# $CONAN_HOME into .dynamic. Do not emit it.
+set_target_properties(c2pool-v37-xmr PROPERTIES SKIP_BUILD_RPATH ON)
 if (TARGET Boost::headers)
     target_link_libraries(c2pool-v37-xmr PRIVATE Boost::headers)
 elseif (TARGET Boost::boost)
