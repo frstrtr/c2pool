@@ -485,6 +485,27 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_credit_cut_kat PRIVATE xmr_template xmr_node xmr_coin)
     add_test(NAME v37_xmr_credit_cut_kat COMMAND v37_xmr_credit_cut_kat)
 
+    # v37_xmr_coinbase_extra_kat (MM-PARSE): a valid mainnet coinbase whose
+    # tx_extra does not start with 0x01 (block 3765869: 03 merge-mining tag
+    # first) parses (any-order field walk, opaque tx_extra kept), the coinbase
+    # authority decides it NOT-LANE from the bytes, and FinalizeConnect passes
+    # it instead of HOLDING the finalize gate for ever; our own lane coinbase
+    # parses byte-identically and still books; a missing body is still HELD.
+    # SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_coinbase_extra_kat
+        v37_xmr_coinbase_extra_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_coinbase_extra_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_coinbase_extra_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_coinbase_extra_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_coinbase_extra_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_coinbase_extra_kat COMMAND v37_xmr_coinbase_extra_kat)
+
     # ------------------------------------------------------------------
     # The v36 fee model on the XMR lane (xmr/xmr_fee_model.hpp).
     #
