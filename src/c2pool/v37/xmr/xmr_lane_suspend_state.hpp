@@ -9,7 +9,7 @@
 // src/c2pool/v37/xmr/xmr_lane_suspend_state.hpp   (R-C rework-3)
 //
 // THE LANE-SUSPEND STATE MACHINE, factored out of main so it can be tested.
-// One place, four causes, per-cause edge counters:
+// One place, six causes, per-cause edge counters:
 //   lag        (hw - D_conf) - cursor > 2*D_conf suspends, <= D_conf releases
 //              (hysteresis; the ONE lag definition, rework-2);
 //   isolated   the lineage vote: a VERIFIED counter-lineage outvotes us;
@@ -35,7 +35,10 @@
 namespace c2pool::v37n::xmr {
 
 struct LaneSuspendState {
-    enum Cause : unsigned { kLag = 1u, kIsolated = 2u, kHeld = 4u, kContested = 8u };
+    // D2 (minority converges to majority): kConverging while the minority node
+    // re-derives its ledger, kDiverged while it HALTS (the re-derivation does not
+    // reproduce the majority) -- both synchronous (FinalizeConnect converge hook).
+    enum Cause : unsigned { kLag = 1u, kIsolated = 2u, kHeld = 4u, kContested = 8u, kConverging = 16u, kDiverged = 32u };
 
     struct Edge {
         bool     suspend_edge = false;   // the lane went from served to suspended
@@ -49,6 +52,7 @@ struct LaneSuspendState {
     bool          lag_latched = false;
     unsigned      causes = 0;
     std::uint64_t n_lag = 0, n_isolated = 0, n_held = 0, n_contested = 0, n_resume = 0, n_suspend = 0;
+    std::uint64_t n_converging = 0, n_diverged = 0;
 
     explicit LaneSuspendState(std::uint64_t d = 1) : d_conf(d ? d : 1) {}
 
@@ -57,6 +61,9 @@ struct LaneSuspendState {
     bool suspended() const { return causes != 0; }
 
     Edge update(std::uint64_t lag, bool isolated, bool held, bool contested) {
+        return update(lag, isolated, held, contested, false, false);
+    }
+    Edge update(std::uint64_t lag, bool isolated, bool held, bool contested, bool converging, bool diverged) {
         if (!lag_latched && lag > suspend_above()) lag_latched = true;
         else if (lag_latched && lag <= resume_at()) lag_latched = false;
         unsigned now = 0;
@@ -64,6 +71,8 @@ struct LaneSuspendState {
         if (isolated)    now |= kIsolated;
         if (held)        now |= kHeld;
         if (contested)   now |= kContested;
+        if (converging)  now |= kConverging;
+        if (diverged)    now |= kDiverged;
         Edge e;
         e.added   = now & ~causes;
         e.cleared = causes & ~now;
@@ -73,6 +82,8 @@ struct LaneSuspendState {
         if (e.added & kIsolated)  ++n_isolated;
         if (e.added & kHeld)      ++n_held;
         if (e.added & kContested) ++n_contested;
+        if (e.added & kConverging) ++n_converging;
+        if (e.added & kDiverged)  ++n_diverged;
         if (e.suspend_edge) ++n_suspend;
         if (e.resume_edge)  ++n_resume;
         causes = now;
@@ -87,6 +98,8 @@ struct LaneSuspendState {
         if (c & kIsolated)  add("isolated");
         if (c & kHeld)      add("held");
         if (c & kContested) add("contested");
+        if (c & kConverging) add("converging");
+        if (c & kDiverged)  add("diverged");
         return s.empty() ? "-" : s;
     }
 };
