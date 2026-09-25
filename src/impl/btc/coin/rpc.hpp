@@ -52,10 +52,11 @@ private:
 
     // #744/#787 M2: a hung bitcoind (accepts TCP, never responds) must not freeze
     // the whole single-threaded ioc (stratum + sharechain P2P + header sync all
-    // run on it) mid-won-block. apply_socket_timeouts() forces the socket to
-    // blocking mode and sets kernel SO_SND/RCVTIMEO so Send()'s sync write/read
-    // return an error after RPC_IO_TIMEOUT_SECONDS instead of hanging forever.
-    // Mirrors the DASH #781 pattern. Called after each (re)connect.
+    // run on it) mid-won-block. Send() bounds each call, write + read + its one
+    // retry, by a single RPC_IO_TIMEOUT_SECONDS deadline (P0-SUBMIT-CSMAIN: the
+    // old SO_SND/RCVTIMEO lever never fired on Linux, see rpc.cpp).
+    // apply_socket_timeouts() puts the socket in the non-blocking mode that
+    // deadline relies on. Called after each (re)connect.
     static constexpr int RPC_IO_TIMEOUT_SECONDS = 30;
     std::chrono::milliseconds m_io_timeout{std::chrono::seconds(RPC_IO_TIMEOUT_SECONDS)};
     void apply_socket_timeouts();
