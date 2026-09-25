@@ -176,6 +176,12 @@ struct Admitted {
     std::vector<u8>  raw;     // its exact fb_receipt bytes (vault / durable log / GETFRAMES)
     u64              bin = 0; // origin bin = height of the block the share was mined on
     bool             own = false;
+    // ★ DROPS (gate ON only): a RAINDROP — RandomX work that met the drops
+    // floor but NOT share_diff. Never pushed to the lane, never cached, never
+    // in a repair order; carried only to the node's DROPS harvester. `pow` is
+    // the verified RandomX hash (little-endian, as meets_share_diff reads it).
+    bool             drop = false;
+    bytes32          pow{};
 };
 
 struct RelayOptions {
@@ -211,6 +217,13 @@ struct RelayOptions {
     u32         ctx_max_depth = 8;                           // unknown blocks chained above a known parent
     std::size_t ctx_want_max = 128;
     u32         repair_refetch_ms = 3000;                    // re-ask idle missing frames of a Fetching repair
+    // ★ DROPS (gate ON only). 0 = OFF, the shipped default: a receipt below
+    // share_diff is invalid PoW exactly as before (rx_invalid + DoS strike).
+    // Non-zero: a receipt whose RandomX hash meets THIS difficulty but not
+    // share_diff is a RAINDROP — admitted for measurement only (drain_drops),
+    // flooded on like a share so every node harvests the same set.
+    u64         drops_floor_diff = 0;
+    std::size_t drops_seen_max = 65536;                      // raindrop dedup set bound
 };
 
 struct RelayStats {
@@ -227,6 +240,8 @@ struct RelayStats {
     std::atomic<u64> repair_refetch{0}, repair_evicted{0}, upgraded_solicited{0}, unresolved_solicited_dropped{0};
     std::atomic<u64> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0},
                      ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_req_dropped{0};
+    // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
+    std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
 };
 
 class XmrRelayNode {
@@ -330,6 +345,26 @@ public:
         flood(a.raw, 0);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_admitted.push_back(std::move(a));
+    }
+
+    // ── ★ DROPS: an own RAINDROP (any thread; the minter already ran
+    // check_structural and knows the RandomX hash). Flooded like a share, queued
+    // for drain_drops(), never cached / pushed / served in a repair order.
+    void submit_own_drop(Admitted a) {
+        if (!m_o.drops_floor_diff) return;               // gate OFF: unreachable
+        a.own = true; a.drop = true;
+        if (!drop_note_new(a.id)) { m_st.drops_dup++; return; }
+        m_st.drops_own++;
+        flood(a.raw, 0);
+        std::lock_guard<std::mutex> lk(m_amtx);
+        m_drops.push_back(std::move(a));
+    }
+    // ── main thread: the raindrops admitted since the last call ─────────────
+    std::vector<Admitted> drain_drops() {
+        std::lock_guard<std::mutex> lk(m_amtx);
+        std::vector<Admitted> out;
+        out.swap(m_drops);
+        return out;
     }
 
     // ── main thread: drain what was admitted since the last call ────────────
@@ -1076,6 +1111,7 @@ private:
     void enqueue(Item it) {
         std::lock_guard<std::mutex> lk(m_mtx);
         if (m_cache.count(it.id)) { m_st.dup++; return; }
+        if (m_o.drops_floor_diff && drop_seen_locked(it.id)) { m_st.drops_dup++; return; }   // ★ DROPS
         if (m_inflight.count(it.id)) {
             // a SOLICITED copy (repair / backfill GETFRAMES) of a receipt that is
             // already queued or parked as an unsolicited flood: upgrade that item
@@ -1222,6 +1258,18 @@ private:
             admit(std::move(it), ctx->height);
             return;
         }
+        // ★ DROPS (gate ON only): real work below share_diff but at/above the
+        // floor is a RAINDROP, not invalid PoW. With drops_floor_diff == 0 this
+        // branch does not exist and the invalid path below is master's.
+        if (m_o.drops_floor_diff && meets_share_diff(pow, m_o.drops_floor_diff)) {
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());
+                m_inflight.erase(it.id);
+            }
+            admit_drop(std::move(it), ctx->height, pow);
+            return;
+        }
         // invalid: re-hash (the p2pool unstable-hardware guard) before any ban
         bytes32 pow2{};
         const bool again = m_rx(it.r.receipt.hashing_blob.bytes, ctx->seed, pow2);
@@ -1278,6 +1326,27 @@ private:
         flood(a.raw, it.from);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_admitted.push_back(std::move(a));
+    }
+
+    // ★ DROPS: raindrop dedup (a bounded FIFO set, separate from the receipt
+    // cache so a raindrop can never enter a lane order or a repair answer).
+    bool drop_seen_locked(const bytes32& id) const { return m_drop_seen.count(id) != 0; }
+    bool drop_note_new(const bytes32& id) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (!m_drop_seen.insert(id).second) return false;
+        m_drop_order.push_back(id);
+        while (m_drop_order.size() > m_o.drops_seen_max) { m_drop_seen.erase(m_drop_order.front()); m_drop_order.pop_front(); }
+        return true;
+    }
+    void admit_drop(Item it, u64 bin, const bytes32& pow) {
+        if (!drop_note_new(it.id)) { m_st.drops_dup++; return; }
+        Admitted a;
+        a.id = it.id; a.r = std::move(it.r); a.raw = std::move(it.raw); a.bin = bin; a.own = false;
+        a.drop = true; a.pow = pow;
+        m_st.drops_foreign++;
+        flood(a.raw, it.from);
+        std::lock_guard<std::mutex> lk(m_amtx);
+        m_drops.push_back(std::move(a));
     }
 
     void flood(const std::vector<u8>& raw, PeerId except) {
@@ -1637,6 +1706,9 @@ private:
 
     std::mutex m_amtx;               // admitted queue
     std::vector<Admitted> m_admitted;
+    std::vector<Admitted> m_drops;   // ★ DROPS: admitted raindrops (m_amtx)
+    std::unordered_set<bytes32, Bytes32Hash> m_drop_seen;   // ★ DROPS dedup (m_mtx)
+    std::deque<bytes32> m_drop_order;
 
     mutable std::mutex m_pmtx;         // peers
     std::map<PeerId, PeerSt> m_peers;

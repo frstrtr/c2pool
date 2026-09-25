@@ -467,6 +467,7 @@ public:
         log("win: FOUND block " + fb.bid.substr(0, 12) + "… at height " +
             std::to_string(monero_height) + " registered (awaiting D_conf=" +
             std::to_string(m_cfg.d_conf) + ")");
+        if (m_drops) log_drops_found(fb, monero_height);   // ★ DROPS: attached only under the flip
         return true;
     }
 
@@ -498,6 +499,36 @@ public:
 
     // How many harvest rows the last FOUND folded (diagnostic; 0 when detached).
     std::size_t last_harvest_rows() const { return m_last_harvest_rows; }
+
+    // ★ DROPS diagnostic (never consensus): the delta the finalize driver just
+    // composed into this FOUND, re-derived by the SAME pure function it calls,
+    // plus the lowest credited interval per payee (the ex-ante witness: it must
+    // be >= that payee's effective_from). Only reachable with a harvester
+    // attached, i.e. only under the flip.
+    void log_drops_found(const FoundBlock& fb, std::uint64_t monero_height) {
+        const auto delta = ::c2pool::v37n::settle::subthreshold_credit(fb.params, fb.harvested, fb.drops);
+        long long sum = 0;
+        std::string rows;
+        auto hex_of_key = [](const ::v37::bytes32& b) {
+            static constexpr char kHex[] = "0123456789abcdef";
+            std::string h;
+            for (const auto x : b) { h.push_back(kHex[x >> 4]); h.push_back(kHex[x & 0x0f]); }
+            return h;
+        };
+        for (const auto& [k, v] : delta) {
+            sum += v;
+            std::uint64_t lo = ~0ull, eff = 0;
+            for (const auto& hr : fb.harvested)
+                if (hr.payee == k && fb.drops.enrolled(hr.payee, hr.interval) && hr.interval < lo) lo = hr.interval;
+            if (m_enroll) if (const auto* r = m_enroll->find(k)) eff = r->effective_from;
+            rows += " " + hex_of_key(k).substr(0, 12) + "=" + std::to_string(v) +
+                    "(min_iv=" + std::to_string(lo) + ",eff=" + std::to_string(eff) + ")";
+        }
+        log("drops: FOUND h=" + std::to_string(monero_height) + " bid=" + fb.bid.substr(0, 12) +
+            " harvest_rows=" + std::to_string(fb.harvested.size()) +
+            " price=" + (fb.drops.price.valid ? "valid" : "INVALID") +
+            " delta_payees=" + std::to_string(delta.size()) + " delta_sum=" + std::to_string(sum) + rows);
+    }
 
     // ── accessors (for the smoke / a dashboard) ────────────────────────────
     OwedLedger&        ledger()            { return m_ledger; }
